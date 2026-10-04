@@ -9,9 +9,11 @@ package workload
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 
@@ -38,7 +40,9 @@ const (
 	ActionRestart ActionKind = "Restart"
 	// ActionMigrateExpiry consumes expired Manual migration records.
 	ActionMigrateExpiry ActionKind = "MigrateExpiry"
-	// ActionMigrate drives the selected Manual migration record.
+	// ActionMigrate runs the migrate pass over its selection: the
+	// records parked on their source teardown, tended in place, then the
+	// head record it drives.
 	ActionMigrate ActionKind = "Migrate"
 	// ActionUpdate runs the update pass over the selected Instances.
 	ActionUpdate ActionKind = "Update"
@@ -53,19 +57,44 @@ type RestartSelection struct {
 	Instance types.InstancePlan
 	Reason   string
 
-	// OpensUnavailability marks a selection that takes serving capacity
-	// offline rather than recovering capacity already lost: a fresh
-	// crash-loop repair. The executor puts exactly those to the
-	// unavailability budget and the coordination gate before they open,
-	// so a wedge shared by the whole Component repairs at the
-	// operator's pace instead of recycling every Instance at once.
+	// OpensRepair marks a selection that opens a fresh crash-loop repair
+	// this pass rather than driving one already in flight or recovering
+	// capacity already lost. The executor opens at most
+	// input.RepairBatchSize of them per pass.
+	OpensRepair bool
+
+	// OpensUnavailability marks the fresh repairs that take serving
+	// capacity offline: a crash-loop repair of a pod set that still
+	// serves. The executor puts exactly those to the per-Component
+	// unavailability budget before they open, so a wedge shared by the
+	// whole Component repairs at the operator's pace instead of recycling
+	// every serving Instance at once.
 	OpensUnavailability bool
+
+	// LadderRevision names the revision whose retry ladder admits the
+	// rebuild this selection opens, "" for an open the ladder does not
+	// pace. The ladder authorizes one attempt at a revision at a time, so
+	// the executor opens one such rebuild per revision per pass.
+	LadderRevision string
 }
 
-// MigrationSelection is the Manual migration record the migrate pass
-// drives this reconcile (a copy of the ObservedState record).
+// MigrationSelection is the migrate pass's work for one reconcile
+// (copies of the ObservedState records), in the order the pass runs it.
 type MigrationSelection struct {
-	Record types.MigrationRecord
+	// Parked are the Draining records whose every live source pod is
+	// Terminating past its own deletion deadline, oldest first. The
+	// drive has issued every delete it owns for such a record and can
+	// only wait for the kubelet, a finalizer owner or the force-delete
+	// escalation to remove the pods, so the pass tends it — re-reads the
+	// pair, runs the escalation it is configured for, completes it once
+	// the pods are gone — ahead of the head instead of letting it be the
+	// head.
+	Parked []types.MigrationRecord
+
+	// Head is the record the pass drives: the oldest one that is not
+	// parked. Nil when every record is parked, or when the oldest one
+	// is a fresh record the surge gate holds back.
+	Head *types.MigrationRecord
 }
 
 // UpdateItem is one Instance the update pass touches, in plan order.
@@ -79,13 +108,24 @@ type UpdateItem struct {
 	// continuing one (!types.UpdateContinuation), so it is admitted and charged.
 	StartingFresh bool
 	// CoordGateExempt: the fresh start skips the coordination gate consult
-	// (types.RecreateOfDarkFailedRow); the per-Component budget still applies.
+	// because it takes nothing further out of the gate's serving count
+	// (types.RecreateOfDarkRow, a Ready row whose pod set is provably out
+	// of service — evidence.PodSetServesNothing — or one the count already
+	// excludes on a parked member — evidence.PodSetUnavailableOnParkedMember);
+	// the per-Component budget still applies.
 	CoordGateExempt bool
+	// ReplacesDarkPodSet: the fresh start replaces an Instance that serves
+	// nothing (replacesDarkPodSet). Such starts restore capacity rather
+	// than spend it, so they are listed ahead of the rest and the budget
+	// reaches them before any serving Instance is taken offline.
+	ReplacesDarkPodSet bool
 	// RecreateFallback: the Component's in-place strategy runs as a
-	// recreate on this Instance (ops.InPlaceFallsBackToRecreate), so the
-	// fresh start is consulted with the coordination gate as a RecreatePod
-	// start: it takes the pods out of rotation before anything returns,
-	// which is the capacity loss the gate waives only for a same-pod patch.
+	// recreate on this Instance (ops.InPlaceFallsBackToRecreate: a gang, or
+	// a single-pod diff beyond container images), so the fresh start is
+	// consulted with the coordination gate as a RecreatePod start: it takes
+	// the pods out of rotation before anything returns, which is the
+	// capacity loss the gate waives only for a same-pod patch. Decided for
+	// fresh starts only; a continuation is neither admitted nor consulted.
 	RecreateFallback bool
 	// CleanupOnly: the update trigger declined (zero revision distance —
 	// the corrective roll-back — or a third-party-revision leftover) but
@@ -102,8 +142,10 @@ type UpdateItem struct {
 // plus the pure budget inputs the executor's within-pass counters
 // project against.
 type UpdateSelection struct {
-	// Items in plan order. Instances held by the effective partition
-	// (canary) and Instances with no trigger are not listed.
+	// Items in the order the executor admits them: the fresh starts that
+	// replace a dark Instance first, then plan order. Instances held by
+	// the effective partition (canary) and Instances with no trigger are
+	// not listed.
 	Items []UpdateItem
 	// Strategy is the resolved update strategy (empty Type defaults to
 	// SurgeThenDrain — matches workload.BuildPlan's defaulting).
@@ -125,6 +167,31 @@ type UpdateSelection struct {
 	// the same Instance.
 	PriorSurgeInFlight   int32
 	PriorUnavailInFlight int32
+	// ExtraPodSurge is what the Component's extra pods hold against the
+	// surge budget — Terminating inside their grace, or alive beyond an
+	// Instance's own count — computed for a capped SurgeThenDrain budget
+	// (escalation.ExtraPodSurgeInFlight).
+	ExtraPodSurge escalation.ExtraPodSurge
+	// RolledNotServing lists, in plan order, the Instances already on the
+	// target revision that do not serve it (ops.RolledInstanceNotServing).
+	// They are the roll's open work: each holds a slot in the budget of
+	// the strategy's arm ahead of any fresh start, and under
+	// SurgeThenDrain no source leaves rotation while they exceed the
+	// unavailability budget.
+	RolledNotServing []int32
+	// RetryBlockDenied lists, in plan order, the Instances the target's
+	// RetryBlock denied a fresh start at the trigger stage: a Held
+	// ladder, an attempt already in flight, or a Backoff not yet due.
+	// They never reach the pass's admission, so the block is the denial
+	// the pass reports when nothing else progressed.
+	RetryBlockDenied []int32
+	// LadderHold is the hold the target's RetryBlock stands for when it
+	// denies a fresh start this pass, nil when it denies none. One reading
+	// serves the update pass, which reports it for the starts in
+	// RetryBlockDenied, and the idle verdict, which yields to it: a ladder
+	// that gave up on the revision is reported even when no candidate
+	// reaches the trigger.
+	LadderHold *types.RolloutHold
 }
 
 // PlannedAction is one pass-level action selected for this reconcile.
@@ -142,7 +209,7 @@ type PlannedAction struct {
 	// (ActionRestart).
 	Restarts []RestartSelection
 
-	// Migration is the record the migrate pass drives (ActionMigrate).
+	// Migration is the migrate pass's selection (ActionMigrate).
 	Migration *MigrationSelection
 
 	// Update is the update pass's selection (ActionUpdate).
@@ -180,6 +247,14 @@ type Decision struct {
 	// (foldRetryAfter) so the gate is re-evaluated on time; it only
 	// ever ADDS a wake-up, never delays one an op scheduled.
 	RequeueAfter time.Duration
+
+	// UpdateIdle reports that the update selection ran for an unpaused
+	// Component and found nothing: no Instance to drive and no
+	// same-target RetryBlock that still denies a start. Execute reports a
+	// nil rollout hold at the update pass's position, so a hold a prior
+	// pass recorded does not outlive the roll it paced, while a ladder
+	// that gave up on the revision stays reported.
+	UpdateIdle bool
 
 	// Owned is the pass's rows grouped by the owner that may advance
 	// them. Built once here, from the ownership table; Execute hands it
@@ -232,7 +307,7 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 	// finish.
 	var restarts []RestartSelection
 	if !plan.PauseFreeze || anyRestartContinuation(input) {
-		selected, err := planRestartSelections(ctx, input, plan, snapshot)
+		selected, err := planRestartSelections(ctx, input, plan, target, snapshot)
 		if err != nil {
 			return Decision{}, err
 		}
@@ -266,9 +341,11 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 
 	// Paused is an operator circuit breaker over WHAT MAY BEGIN:
 	// scale-down above still releases capacity, the restart pass below
-	// keeps repairing existing Instances at their current revision
-	// (RunningRevision — repair can never advance a rollout), and an
-	// attempt already in flight still runs the step it is on to that
+	// keeps repairing existing Instances at their current revision (the
+	// pause withholds the roll, so a rebuild under it never follows the
+	// target, and an Instance whose revision is not the roll target is the
+	// roll's), and an attempt already in flight still runs the step it is
+	// on to that
 	// step's boundary. What a pause withholds is the next operation and
 	// the next step, so a pause never leaves an Instance mid-step — dark
 	// between a delete and its recreate, or half-materialized — for the
@@ -295,18 +372,18 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 		}
 
 		// Migration drive selection. Work comes from the owner's
-		// status.migrations records: the oldest non-terminal Manual record
-		// is driven, one per pass. Terminal records and Auto records (born
-		// terminal) are excluded structurally — records, never work. Skip
-		// when mode is Never.
+		// status.migrations records, oldest first: the records parked on
+		// their source teardown are tended, and the oldest record that is
+		// not parked is the head the pass drives. Terminal records and
+		// Auto records (born terminal) are excluded structurally —
+		// records, never work. Skip when mode is Never.
 		if plan.MigrationMode != types.MigrationModeNever {
-			if record := types.NextManualMigration(input.ObservedState.Migrations); record != nil {
-				// A fresh migration adds one surge Instance. Let an existing update
-				// surge finish first so the two operations do not stack extra capacity.
-				// Allocated migrations always resume from their durable record.
-				if record.SurgeAllocated() || escalation.CurrentSurgeInFlight(input.ObservedState.InstanceStatuses) == 0 {
-					decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionMigrate, Migration: &MigrationSelection{Record: *record}})
-				}
+			selection, err := planMigrationDrive(ctx, input, snapshot)
+			if err != nil {
+				return Decision{}, err
+			}
+			if selection != nil {
+				decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionMigrate, Migration: selection})
 			}
 		}
 	}
@@ -327,6 +404,10 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 			selection.Items = pausedUpdateContinuations(input, selection.Items)
 		} else {
 			decision.RequeueAfter = retryBlockWait
+			// A roll with nothing left to do holds nothing: no Instance to
+			// drive, and no ladder that still holds the target, whether a
+			// candidate reached its gate or a partition kept every one back.
+			decision.UpdateIdle = len(selection.Items) == 0 && len(selection.RetryBlockDenied) == 0 && selection.LadderHold == nil
 		}
 		if len(selection.Items) > 0 {
 			decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionUpdate, Update: &selection})
@@ -429,18 +510,27 @@ func restartContinuations(input types.ReconcileInput, restarts []RestartSelectio
 // evaluated against the LIVE pod read — restart is destructive and must
 // not select from a stale cache.
 //
+// A repair is opened only while the revision the Instance runs is still
+// the Component's target. An Instance off the target belongs to the pass
+// that rebuilds it AT the target (workloadops.RepairYieldsToTarget): its
+// outage is one the roll crosses anyway, and a repair would rebuild what
+// the roll is about to tear down. An open Restart is driven on regardless
+// — a rebuild that has created no pod yet follows the target itself — and
+// a paused Component keeps every repair, because the roll it would yield
+// to is the very thing the pause withholds.
+//
 // The live read is unconditional only under the policy whose triggers
 // fire on ordinary pod churn. The two policy-independent triggers are
 // rare, so for every other policy the cached view screens for a
 // candidate first and the live read confirms it; a healthy Component
 // therefore costs no extra live List per reconcile.
-func planRestartSelections(ctx context.Context, input types.ReconcileInput, plan types.ComponentPlan, snapshot *ObservedSnapshot) ([]RestartSelection, error) {
+func planRestartSelections(ctx context.Context, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, snapshot *ObservedSnapshot) ([]RestartSelection, error) {
 	if plan.RestartPolicy != types.RestartPolicyRecreateInstance {
 		cachedByInstance, err := snapshot.CachedPods(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("workload.Reconcile: list pods to screen the restart pass (component=%s): %w", plan.Component, err)
 		}
-		if !anyRestartTrigger(input, plan, cachedByInstance) {
+		if !anyRestartTrigger(input, plan, target, cachedByInstance) {
 			return nil, nil
 		}
 	}
@@ -450,24 +540,36 @@ func planRestartSelections(ctx context.Context, input types.ReconcileInput, plan
 	}
 	var restarts []RestartSelection
 	for _, inst := range plan.Instances {
-		needs, reason := workloadops.DetectRestartTriggerWithPods(input, plan, inst, liveByInstance[inst.Index])
+		needs, reason := restartTrigger(input, plan, inst, target, liveByInstance[inst.Index])
 		if !needs {
 			continue
 		}
 		restarts = append(restarts, RestartSelection{
 			Instance:            inst,
 			Reason:              reason,
+			OpensRepair:         workloadops.RestartOpensRepair(input, inst, liveByInstance[inst.Index]),
 			OpensUnavailability: workloadops.RestartOpensUnavailability(input, inst, liveByInstance[inst.Index]),
+			LadderRevision:      workloadops.RestartOpensLadderAttempt(input, plan, inst, liveByInstance[inst.Index]),
 		})
 	}
 	return restarts, nil
 }
 
+// restartTrigger is the restart pass's selection for one Instance: the
+// trigger, bounded by the roll target.
+func restartTrigger(input types.ReconcileInput, plan types.ComponentPlan, inst types.InstancePlan, target *appsv1.ControllerRevision, pods []*corev1.Pod) (bool, string) {
+	needs, reason := workloadops.DetectRestartTriggerWithPods(input, plan, inst, pods)
+	if !needs || workloadops.RepairYieldsToTarget(input, plan, inst, target, pods) {
+		return false, ""
+	}
+	return true, reason
+}
+
 // anyRestartTrigger reports whether any planned Instance would be
 // selected against the supplied pod buckets.
-func anyRestartTrigger(input types.ReconcileInput, plan types.ComponentPlan, byInstance map[int32][]*corev1.Pod) bool {
+func anyRestartTrigger(input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, byInstance map[int32][]*corev1.Pod) bool {
 	for _, inst := range plan.Instances {
-		if needs, _ := workloadops.DetectRestartTriggerWithPods(input, plan, inst, byInstance[inst.Index]); needs {
+		if needs, _ := restartTrigger(input, plan, inst, target, byInstance[inst.Index]); needs {
 			return true
 		}
 	}
@@ -570,6 +672,10 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 	// or plan-gate hold), then the user's rollingUpdate partition.
 	partition := escalation.EffectivePartition(input.DesiredSpec.Pacing, rollingUpdate)
 	heldIndices := escalation.PartitionHeldIndices(partition, input, plan.Instances, target.Name)
+	// The window a promoted pod that restarted must serve again before
+	// the roll reads it as serving: minReadySeconds floored by the
+	// stuck-pod grace.
+	provenWindow := workloadops.ProvenWindowSeconds(plan.MinReadySeconds, input.StuckPodGrace)
 	var retryBlockWait time.Duration
 	for _, inst := range plan.Instances {
 		// Partition hold (canary): hold the selected Instances on their
@@ -582,6 +688,16 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 				"component", plan.Component, "instance", inst.Index, "target", target.Name)
 			continue
 		}
+		if notServing, wait, why := workloadops.RolledInstanceNotServing(input.ObservedState.Instance(inst.Index), target.Name, target.CreationTimestamp.Time, updateByInstance[inst.Index], inst.TotalPods(), provenWindow, input.Now()); notServing {
+			selection.RolledNotServing = append(selection.RolledNotServing, inst.Index)
+			logf.FromContext(ctx).V(1).Info("rolled Instance not serving",
+				"component", plan.Component, "instance", inst.Index, "target", target.Name, "reason", why, "wait", wait)
+			// A pod Ready again inside its window raises no watch event
+			// when the window elapses; the pass comes back for it.
+			if wait > 0 {
+				input.PassWake.Observe(wait)
+			}
+		}
 		decision := workloadops.EvaluateUpdateTrigger(input, inst, target, updateByInstance[inst.Index])
 		if decision.AdoptRevision {
 			logf.FromContext(ctx).V(1).Info("update not selected: adopting revision in place",
@@ -590,6 +706,9 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 			continue
 		}
 		if !decision.Trigger {
+			if decision.RetryBlockDenied {
+				selection.RetryBlockDenied = append(selection.RetryBlockDenied, inst.Index)
+			}
 			// Denied by a not-yet-due Backoff RetryBlock — keep the
 			// earliest re-evaluation time across Instances.
 			if decision.RetryAfter > 0 && (retryBlockWait == 0 || decision.RetryAfter < retryBlockWait) {
@@ -625,12 +744,57 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 		}
 		row := input.ObservedState.Instance(inst.Index)
 		startingFresh := !types.UpdateContinuation(row)
-		gateExempt := types.RecreateOfDarkFailedRow(row, strategy)
-		recreateFallback := workloadops.InPlaceFallsBackToRecreate(strategy, inst.TotalPods() > 1)
+		pods := updateByInstance[inst.Index]
+		// The mechanism the start runs on: the shared rules the update op
+		// dispatches on, judged against the same target and the same
+		// recorded running revision (a snapshot read, memoized per revision).
+		recreateFallback := false
+		if startingFresh {
+			fallback, ferr := workloadops.InPlaceFallsBackToRecreate(strategy, inst.TotalPods() > 1, input.DesiredSpec.PodSpec,
+				func() (*corev1.PodSpec, error) { return snapshot.RunningRevisionPodSpec(ctx, inst.Index) })
+			if ferr != nil {
+				return UpdateSelection{}, 0, fmt.Errorf("workload.Reconcile: resolve update mechanism (instance=%d): %w", inst.Index, ferr)
+			}
+			recreateFallback = fallback || workloadops.SurgeHasNoSource(row)
+		}
+		mechanism := strategy
+		if recreateFallback {
+			mechanism = types.UpdateStrategyRecreatePod
+		}
+		// The gate's serving count needs every pod of an Instance in
+		// rotation, so a Ready Instance with a member parked is already
+		// inside the gate's unavailability, and a drain-first start on it
+		// skips the consult for its own outage; the per-Component budget
+		// still charges the start when a routed member serves.
+		gateExempt := types.RecreateOfDarkRow(row, mechanism) ||
+			(startingFresh && mechanism != types.UpdateStrategySurgeThenDrain &&
+				row != nil && row.Phase == types.InstancePhaseReady &&
+				(evidence.PodSetServesNothing(pods) || evidence.PodSetUnavailableOnParkedMember(pods, inst.TotalPods())))
+		dark := startingFresh && replacesDarkPodSet(row, pods)
 		logf.FromContext(ctx).V(1).Info("update selected",
 			"component", plan.Component, "instance", inst.Index, "target", target.Name,
-			"startingFresh", startingFresh, "coordGateExempt", gateExempt, "recreateFallback", recreateFallback)
-		selection.Items = append(selection.Items, UpdateItem{Instance: inst, StartingFresh: startingFresh, CoordGateExempt: gateExempt, RecreateFallback: recreateFallback})
+			"startingFresh", startingFresh, "coordGateExempt", gateExempt, "recreateFallback", recreateFallback,
+			"replacesDarkPodSet", dark)
+		selection.Items = append(selection.Items, UpdateItem{Instance: inst, StartingFresh: startingFresh, CoordGateExempt: gateExempt, ReplacesDarkPodSet: dark, RecreateFallback: recreateFallback})
+	}
+	// A start that replaces a dark Instance restores capacity while every
+	// other start spends it, so the budget is offered to the dark ones
+	// first; within each group plan order stands. The order is all this
+	// decides: the budgets and the gate admit or deny each start on their
+	// own terms, and the partition has already chosen who is listed.
+	sort.SliceStable(selection.Items, func(i, j int) bool {
+		return selection.Items[i].ReplacesDarkPodSet && !selection.Items[j].ReplacesDarkPodSet
+	})
+	// An extra pod the API still lists holds a surge slot: a Terminating
+	// one until it exits or passes its deletion deadline, which raises no
+	// watch event, so a pass with a fresh start to admit wakes for it; a
+	// live one until a start on its Instance replaces it.
+	if selection.Strategy == types.UpdateStrategySurgeThenDrain && selection.SurgeBudget != escalation.BudgetNoLimit {
+		now := input.Now()
+		selection.ExtraPodSurge = escalation.ExtraPodSurgeInFlight(plan, input.ObservedState.InstanceStatuses, updateByInstance, selection.RolledNotServing, now)
+		if !selection.ExtraPodSurge.NextRelease.IsZero() && anyFreshStart(selection.Items) {
+			input.PassWake.Observe(selection.ExtraPodSurge.NextRelease.Sub(now))
+		}
 	}
 	// Budgets are decided here but spent in Execute, so record them with the
 	// selection they apply to: a selection that is non-empty yet starts
@@ -641,6 +805,85 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 		"strategy", selection.Strategy, "surgeBudget", selection.SurgeBudget,
 		"unavailBudget", selection.UnavailBudget,
 		"priorSurgeInFlight", selection.PriorSurgeInFlight,
-		"priorUnavailInFlight", selection.PriorUnavailInFlight)
+		"priorUnavailInFlight", selection.PriorUnavailInFlight,
+		"extraPodSurge", selection.ExtraPodSurge.Slots,
+		"terminatingPods", selection.ExtraPodSurge.Terminating,
+		"liveExtraPods", selection.ExtraPodSurge.Live,
+		"rolledNotServing", selection.RolledNotServing,
+		"retryBlockDenied", selection.RetryBlockDenied)
+	selection.LadderHold = ladderHold(input, target, selection.RolledNotServing)
 	return selection, retryBlockWait, nil
+}
+
+// anyFreshStart reports whether the selection carries a start the pass
+// would admit against the budget.
+func anyFreshStart(items []UpdateItem) bool {
+	for _, item := range items {
+		if item.StartingFresh {
+			return true
+		}
+	}
+	return false
+}
+
+// replacesDarkPodSet reports whether a fresh start on row replaces an
+// Instance that serves nothing: a Failed row with no serving pod (the
+// counter types.RecreateOfDarkRow reads), or a pod set provably out of
+// service (evidence.PodSetServesNothing, the reading a Ready row is dark
+// on). Replacing such an Instance takes no capacity out of rotation.
+func replacesDarkPodSet(row *types.InstanceStatus, pods []*corev1.Pod) bool {
+	if row != nil && row.Phase == types.InstancePhaseFailed && row.ServingPodCount == 0 {
+		return true
+	}
+	return evidence.PodSetServesNothing(pods)
+}
+
+// planMigrationDrive selects the migrate pass's work in dispatch order:
+// every record parked on its source teardown (oldest first, each tended
+// in place), then the head — the oldest record that is not parked. One
+// head per pass keeps migrations serial; a parked record is excluded
+// from that seriality because the drive has nothing left to do for it
+// but wait, and a wait on a kubelet that missed its own deadline has no
+// bound of its own — held at the head it would starve every later
+// request for as long as the pod stays. The pods are read from the
+// snapshot's cache view: a stale reading costs a pass either way, since
+// the parked record's own drive re-lists live pods and the head is
+// re-selected on the next reconcile. Nil when there is no work.
+func planMigrationDrive(ctx context.Context, input types.ReconcileInput, snapshot *ObservedSnapshot) (*MigrationSelection, error) {
+	var selection MigrationSelection
+	var pods map[int32][]*corev1.Pod
+	for _, record := range types.ManualMigrationsOldestFirst(input.ObservedState.Migrations) {
+		if migrationInSourceTeardown(record) {
+			if pods == nil {
+				var err error
+				if pods, err = snapshot.CachedPods(ctx); err != nil {
+					return nil, fmt.Errorf("workload.Plan: observe pods for migration dispatch: %w", err)
+				}
+			}
+			if evidence.AllPodsTerminatingOverdue(pods[record.SourceInstance], input.Now()) {
+				selection.Parked = append(selection.Parked, record)
+				continue
+			}
+		}
+		// A fresh migration adds one surge Instance. Let an existing update
+		// surge finish first so the two operations do not stack extra capacity.
+		// Allocated migrations always resume from their durable record.
+		if record.SurgeAllocated() || escalation.CurrentSurgeInFlight(input.ObservedState.InstanceStatuses) == 0 {
+			head := record
+			selection.Head = &head
+		}
+		break
+	}
+	if len(selection.Parked) == 0 && selection.Head == nil {
+		return nil, nil
+	}
+	return &selection, nil
+}
+
+// migrationInSourceTeardown reports whether a record is in its source
+// teardown — Draining with its surge allocated — the one phase the
+// drive's delete loop runs in, so the only one in which every source
+// pod can be a pod the drive already deleted.
+func migrationInSourceTeardown(record types.MigrationRecord) bool {
+	return record.Phase == types.MigrationPhaseDraining && record.SurgeAllocated()
 }

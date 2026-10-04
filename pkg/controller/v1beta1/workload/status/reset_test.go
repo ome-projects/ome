@@ -3,6 +3,9 @@ package status_test
 // ClearFailedInstanceOperation: the operator-reset release of a parked
 // attempt clears only a repair-owned Operation (Create / Restart) of a
 // Failed Instance and writes nothing for every other shape.
+// CloseSpentRepair: the restart pass's close of a parked repair with no
+// live pod left clears only the Restart operation the pass read, and
+// writes nothing for a row that has moved on.
 
 import (
 	"context"
@@ -135,4 +138,61 @@ func TestClearFailedInstanceOperation_SeamErrorPropagates(t *testing.T) {
 	if cleared {
 		t.Fatalf("a failed write must not report cleared")
 	}
+}
+
+func TestCloseSpentRepair(t *testing.T) {
+	now := metav1.Now()
+	failure := &types.InstanceTermination{PodName: "engine-3-0", Reason: "CrashLoopBackOff", Time: now}
+	parked := func(typ types.InstanceOperationType, id string, phase types.InstancePhase) types.InstanceStatus {
+		return types.InstanceStatus{
+			Index: 3, Incarnation: 2, Phase: phase, RunningRevision: "engine-rev",
+			Operation:   &types.InstanceOperation{ID: id, Type: typ, Step: "Drain", StartedAt: now, Deadline: now, RetryCount: 1},
+			LastFailure: failure,
+		}
+	}
+	cases := []struct {
+		name       string
+		status     types.InstanceStatus
+		wantClosed bool
+	}{
+		{"spent repair the pass read", parked(types.InstanceOperationRestart, "restart-3-1", types.InstancePhaseFailed), true},
+		{"repair re-armed since: another attempt", parked(types.InstanceOperationRestart, "restart-3-2", types.InstancePhaseFailed), false},
+		{"repair re-armed since: in flight", parked(types.InstanceOperationRestart, "restart-3-1", types.InstancePhaseRestarting), false},
+		{"parked Create attempt", parked(types.InstanceOperationCreate, "restart-3-1", types.InstancePhaseFailed), false},
+		{"already a fresh start", types.InstanceStatus{Index: 3, Incarnation: 2, Phase: types.InstancePhaseFailed, LastFailure: failure}, false},
+		{"slot deleted underneath", types.InstanceStatus{Index: 3}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.status
+			before := s
+			mutate, wrote := recordingMutate(&s)
+			closed, err := status.CloseSpentRepair(context.Background(), types.ReconcileInput{MutateInstance: mutate}, 3, "restart-3-1")
+			if err != nil {
+				t.Fatalf("CloseSpentRepair: %v", err)
+			}
+			if closed != tc.wantClosed || *wrote != tc.wantClosed {
+				t.Fatalf("closed=%v wrote=%v, want %v", closed, *wrote, tc.wantClosed)
+			}
+			if !tc.wantClosed {
+				if s.Operation != before.Operation || s.Phase != before.Phase {
+					t.Fatalf("row changed without a close: %+v", s)
+				}
+				return
+			}
+			if s.Operation != nil {
+				t.Errorf("operation = %+v, want cleared", s.Operation)
+			}
+			if s.Phase != types.InstancePhaseFailed || s.Incarnation != 2 || s.RunningRevision != "engine-rev" || s.LastFailure != failure {
+				t.Errorf("row = %+v, want phase, incarnation, revision and failure record kept", s)
+			}
+		})
+	}
+	t.Run("seam error propagates", func(t *testing.T) {
+		want := errors.New("status write refused")
+		mutate := func(context.Context, int32, func(*types.InstanceStatus) bool) error { return want }
+		if _, err := status.CloseSpentRepair(context.Background(), types.ReconcileInput{MutateInstance: mutate}, 3, "restart-3-1"); !errors.Is(err, want) {
+			t.Fatalf("err = %v, want %v", err, want)
+		}
+	})
 }

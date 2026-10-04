@@ -180,6 +180,9 @@ func (g *GangPack) forgetReservationBlocked(pod *v1.Pod) {
 	g.blockedMu.Unlock()
 }
 
+// activateReservationBlocked wakes every pod parked on a reservation, once. A
+// pod that still finds its domain reserved re-registers on its next attempt, so
+// each activation corresponds to one reservation draining or being released.
 func (g *GangPack) activateReservationBlocked() {
 	if g.handle == nil {
 		return
@@ -189,6 +192,7 @@ func (g *GangPack) activateReservationBlocked() {
 	g.reservationBlocked = make(map[string]*v1.Pod)
 	g.blockedMu.Unlock()
 	if len(pods) > 0 {
+		gangActivationTotal.WithLabelValues(activationTriggerReservationReleased).Inc()
 		g.handle.Activate(klog.Background(), pods)
 	}
 }

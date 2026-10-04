@@ -332,17 +332,17 @@ func TestAssumedWaitersDoNotOpenPermitGate(t *testing.T) {
 }
 
 // TestIncompleteGangTimesOutThenRecovers is the failure-cleanup guarantee: a
-// gang that cannot form must time out and unwind cleanly — releasing its pin and
-// never leaving a member partially bound — and must still schedule once it
-// becomes completable. This exercises the Permit-timeout -> Unreserve path that
-// the gate test deliberately avoids (it raises the timeout).
+// gang that cannot form must stay unbound — never a member partially bound —
+// and must still schedule once it becomes completable.
 //
-// A 2-member PodGroup with a short gate timeout, but only one pod. The lone
-// member best-fits, pins, gates, and repeatedly times out; across that churn it
-// stays unbound (proving no half-scheduled strand and that Unreserve releases the
-// pin each cycle). Then the gang is made completable by dropping minMember to 1 —
-// a single-pod recovery, so there is no fragile two-pod realignment to race — and
-// the member binds.
+// A 2-member PodGroup with a short gate timeout, but only one pod. PreFilter
+// parks the lone member because the live member set is short of minMember, so
+// it never reaches the gate, and it stays unbound across a window of several
+// gate timeouts. Then the gang is made completable by dropping minMember to 1 —
+// a single-pod recovery, so there is no two-pod realignment to race — and the
+// member binds. The edit is ordered after the member is observed parked, so what
+// is exercised is the requeue of a parked member on a PodGroup change, not a
+// race with its first attempt.
 func TestIncompleteGangTimesOutThenRecovers(t *testing.T) {
 	tc := startScheduler(t, globalKubeConfig, gangPackOptions(t)...)
 	defer tc.teardown(t)
@@ -358,9 +358,9 @@ func TestIncompleteGangTimesOutThenRecovers(t *testing.T) {
 
 	pg := schedutil.MakePG("gang", ns, 2, nil, nil)
 	pg.Annotations = map[string]string{topologyKeyAnnotation: domainLabelKey}
-	// Short gate timeout so the lone member cycles through gate -> timeout ->
-	// unwind several times within the hold window below.
+	// Short gate timeout: the hold window below spans several of them.
 	shortTimeout := int32(3)
+	gate := time.Duration(shortTimeout) * time.Second
 	pg.Spec.ScheduleTimeoutSeconds = &shortTimeout
 	if _, err := tc.SchedClient.SchedulingV1alpha1().PodGroups(ns).Create(tc.Ctx, pg, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create podgroup: %v", err)
@@ -369,14 +369,16 @@ func TestIncompleteGangTimesOutThenRecovers(t *testing.T) {
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, makeGangPod("gp-0", ns, "gang"), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create pod gp-0: %v", err)
 	}
-	// Over ~2 timeout cycles the lone member must never bind — the gate times it
-	// out and Unreserve releases the pin each round rather than stranding it.
-	ensureNotBound(t, tc, ns, "gp-0", 7*time.Second)
+	// The lone member is parked short of minMember; the edit below is ordered
+	// after that.
+	waitForPodRejected(t, tc, ns, "gp-0", "waiting for all PodGroup member templates", 10*time.Second)
+	// Across two gate timeouts it must never bind.
+	ensureNotBound(t, tc, ns, "gp-0", 2*gate)
 
-	// Make the gang completable by the lone member: minMember 2 -> 1. The plugin
-	// re-reads the PodGroup each cycle, and its EnqueueExtensions register the
-	// PodGroup Update event — so this edit requeues the rejected member promptly,
-	// then its gate opens and it binds.
+	// Make the gang completable by the lone member: minMember 2 -> 1. The
+	// scheduler requeues the member on the PodGroup change, and the plugin wakes
+	// it again once its own PodGroup informer holds the edit, so a retry that
+	// reads the new minMember happens whichever watch delivers first.
 	cur, err := tc.SchedClient.SchedulingV1alpha1().PodGroups(ns).Get(tc.Ctx, "gang", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get podgroup: %v", err)
@@ -386,6 +388,9 @@ func TestIncompleteGangTimesOutThenRecovers(t *testing.T) {
 		t.Fatalf("shrink podgroup minMember: %v", err)
 	}
 
+	// The retry runs on the queue's cadence: at once when the member's backoff
+	// has lapsed, else after at most the queue's maximum backoff; the budget
+	// covers several of those, never the periodic unschedulable flush.
 	node := waitForPodBound(t, tc, ns, "gp-0", 30*time.Second)
 	if node != "t1" && node != "t2" {
 		t.Errorf("pod gp-0 bound to %s, want t1/t2", node)

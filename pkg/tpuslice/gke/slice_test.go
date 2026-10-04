@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -130,6 +131,7 @@ func TestBuildRejects(t *testing.T) {
 		{name: "uppercase name", mutate: func(s *Spec) { s.Name = "Ns-svc" }, wantErr: "slice name"},
 		{name: "dotted name", mutate: func(s *Spec) { s.Name = "ns.svc" }, wantErr: "slice name"},
 		{name: "name over 63", mutate: func(s *Spec) { s.Name = strings.Repeat("a", 64) }, wantErr: "slice name"},
+		{name: "name over the webhook limit", mutate: func(s *Spec) { s.Name = strings.Repeat("a", MaxNameLength+1) }, wantErr: "slice name"},
 		{name: "no type", mutate: func(s *Spec) { s.Type = "" }, wantErr: "type and topology"},
 		{name: "no topology", mutate: func(s *Spec) { s.Topology = "" }, wantErr: "type and topology"},
 		{name: "no owner", mutate: func(s *Spec) { s.Owner = nil }, wantErr: "owner labels"},
@@ -147,6 +149,14 @@ func TestBuildRejects(t *testing.T) {
 				t.Fatalf("Build error = %v, want containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestBuildAllowsLongestName(t *testing.T) {
+	spec := testSpec()
+	spec.Name = strings.Repeat("a", MaxNameLength)
+	if _, err := Build(spec); err != nil {
+		t.Fatalf("Build: %v", err)
 	}
 }
 
@@ -175,6 +185,7 @@ func TestParse(t *testing.T) {
 		Topology:     "2x2x1",
 		Terminating:  true,
 		State:        "ACTIVE",
+		ReadyStatus:  "True",
 		Message:      "provisioned",
 		PartitionIDs: []string{"p-1", "p-2"},
 	}
@@ -510,5 +521,35 @@ func TestGetPropagatesErrors(t *testing.T) {
 	}
 	if _, err := slices.List(ctx, labels.SelectorFromSet(ownerA)); !errors.Is(err, boom) {
 		t.Fatalf("List error = %v, want boom", err)
+	}
+}
+
+func TestParseReadyTimes(t *testing.T) {
+	created := metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	u := stored(t, testSpec(), "uid-1", func(u *unstructured.Unstructured) {
+		u.SetCreationTimestamp(created)
+		u.Object["status"] = map[string]interface{}{"conditions": []interface{}{
+			map[string]interface{}{"type": "Ready", "status": "False", "reason": "ACTIVATING", "lastTransitionTime": "2026-01-02T03:05:00Z"},
+		}}
+	})
+	got, err := Parse(u)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !got.Created.Equal(created.Time) || !got.StateSince.Equal(time.Date(2026, 1, 2, 3, 5, 0, 0, time.UTC)) || got.ReadyStatus != "False" {
+		t.Fatalf("Parse = created %v, state since %v, status %q", got.Created, got.StateSince, got.ReadyStatus)
+	}
+}
+
+// A provider that reports a ready state but unknown readiness is not trusted.
+func TestReadyRequiresKnownReadiness(t *testing.T) {
+	for _, tt := range []struct {
+		status string
+		want   bool
+	}{{"True", true}, {"Unknown", false}, {"", true}} {
+		s := Slice{State: "ACTIVE", ReadyStatus: tt.status}
+		if got := s.Ready([]string{"ACTIVE"}); got != tt.want {
+			t.Errorf("Ready with status %q = %v, want %v", tt.status, got, tt.want)
+		}
 	}
 }

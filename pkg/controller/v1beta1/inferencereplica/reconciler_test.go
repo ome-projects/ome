@@ -20,6 +20,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
@@ -294,6 +296,196 @@ func TestReconcile_TerminatingPodGroupHoldsWithoutPods(t *testing.T) {
 	op := got.Status.InstanceStatuses[0].Operation
 	if op == nil || op.Waiting != workloadtypes.WaitingReasonPodGroupTerminating {
 		t.Fatalf("Operation.Waiting: got %+v want %q", op, workloadtypes.WaitingReasonPodGroupTerminating)
+	}
+}
+
+// heldRollIR is the Component the hold stories roll: two single-pod
+// Instances under SurgeThenDrain with maxSurge 1. Instance 0 already runs
+// the target revision, in the phase the story names, on a pod that is not
+// Ready, so it holds the one surge slot; Instance 1 runs the prior
+// revision on a Ready pod, in rotation or not as the story names, and its
+// start is denied at the budget. The returned target is the revision name
+// the reconciler derives for the spec.
+func heldRollIR(t *testing.T, rolledPhase v1beta1.OMENativeInstancePhase, priorInRotation bool) (*v1beta1.InferenceReplica, []client.Object, string) {
+	t.Helper()
+	ir := baselineIR("llama-engine", "prod", 2)
+	ir.Spec.Lifecycle = &v1beta1.LifecycleSpec{
+		UpdateStrategy: &v1beta1.UpdateStrategy{
+			Type:          v1beta1.UpdateStrategySurgeThenDrain,
+			RollingUpdate: &v1beta1.RollingUpdate{MaxSurge: ptr.To(intstr.FromInt32(1))},
+		},
+	}
+	target := targetRevisionNameFor(t, ir)
+	ir.Status.CurrentRevision = "llama-engine-prior"
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: rolledPhase, RunningRevision: target},
+		{Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "llama-engine-prior"},
+	}
+	dark := podForIR(ir, 0, "default", 0, false, false)
+	prior := podForIR(ir, 1, "default", 0, true, priorInRotation)
+	objs := []client.Object{dark, prior}
+	if priorInRotation {
+		objs = append(objs, sliceForIRPod(ir, prior, true))
+	}
+	return ir, objs, target
+}
+
+// reconcileIR runs one pass and reads the InferenceReplica back.
+func reconcileIR(t *testing.T, r *Reconciler, c client.Client, key client.ObjectKey, pass string) *v1beta1.InferenceReplica {
+	t.Helper()
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("%s: %v", pass, err)
+	}
+	got := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), key, got); err != nil {
+		t.Fatalf("%s: get InferenceReplica: %v", pass, err)
+	}
+	return got
+}
+
+// editIRSpec applies edit to the live spec, the way the operator's write
+// lands between two passes.
+func editIRSpec(t *testing.T, c client.Client, key client.ObjectKey, edit func(*v1beta1.InferenceReplicaSpec)) {
+	t.Helper()
+	live := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), key, live); err != nil {
+		t.Fatalf("get InferenceReplica to edit its spec: %v", err)
+	}
+	edit(&live.Spec)
+	if err := c.Update(context.Background(), live); err != nil {
+		t.Fatalf("update InferenceReplica spec: %v", err)
+	}
+}
+
+// sameRolloutHold reports whether got is want as written: Gate, Reason,
+// Target and Since.
+func sameRolloutHold(got, want *v1beta1.RolloutHold) bool {
+	return got != nil && want != nil && got.Gate == want.Gate && got.Reason == want.Reason && got.Target == want.Target && got.Since.Equal(&want.Since)
+}
+
+// requireBudgetHoldNaming asserts the recorded hold is the Budget hold on
+// target that names the Instance on the target revision that is not
+// serving, and returns it.
+func requireBudgetHoldNaming(t *testing.T, ir *v1beta1.InferenceReplica, target string, instance string) *v1beta1.RolloutHold {
+	t.Helper()
+	held := ir.Status.RolloutHold
+	if held == nil || held.Gate != v1beta1.RolloutHoldGateBudget || held.Target != target {
+		t.Fatalf("the Update pass must record a Budget hold on %s, got %+v", target, held)
+	}
+	if !strings.Contains(held.Reason, instance) || !strings.Contains(held.Reason, "not serving") {
+		t.Fatalf("the Budget hold must name the Instance on the target revision that is not serving, got %q", held.Reason)
+	}
+	if held.Since.IsZero() {
+		t.Fatal("the recorded hold must carry Since")
+	}
+	return held
+}
+
+// TestReconcile_HeldRollKeepsItsHoldAcrossAPassWithoutTheUpdatePass: the
+// held roll of heldRollIR records a Budget hold naming Instance 0 and the
+// revision. The reconciles that follow never reach the Update pass: the
+// Component is paused, and Plan selects no update while a pause stands
+// with nothing in flight. The hold must stand through them as written,
+// Since included, the way it stands through any pass that ends before the
+// Update pass. Unpausing runs the Update pass again, and the same denial
+// keeps the same Since.
+func TestReconcile_HeldRollKeepsItsHoldAcrossAPassWithoutTheUpdatePass(t *testing.T) {
+	ir, objs, target := heldRollIR(t, v1beta1.OMENativeInstanceReady, true)
+	r, c := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	key := client.ObjectKeyFromObject(ir)
+
+	held := requireBudgetHoldNaming(t, reconcileIR(t, r, c, key, "the pass that denies the start"), target, "Instance 0")
+
+	editIRSpec(t, c, key, func(spec *v1beta1.InferenceReplicaSpec) { spec.Paused = true })
+	for _, pass := range []string{"the first paused pass", "the second paused pass"} {
+		got := reconcileIR(t, r, c, key, pass).Status.RolloutHold
+		if got == nil {
+			t.Fatalf("%s ran no Update pass and cleared the Budget hold; the hold must stand until the Update pass replaces or clears it", pass)
+		}
+		if !sameRolloutHold(got, held) {
+			t.Fatalf("%s changed the hold: got %+v want %+v", pass, got, held)
+		}
+	}
+
+	editIRSpec(t, c, key, func(spec *v1beta1.InferenceReplicaSpec) { spec.Paused = false })
+	if got := reconcileIR(t, r, c, key, "the pass after the unpause").Status.RolloutHold; !sameRolloutHold(got, held) {
+		t.Fatalf("the Update pass reporting the same denial must keep the hold and its Since: got %+v want %+v", got, held)
+	}
+}
+
+// TestReconcile_HoldClearsWhenTheRollHasNothingLeftToDo: the held roll of
+// heldRollIR with Instance 0 parked Failed on the target revision, which
+// holds the surge slot the same way, so the Budget hold names it, and
+// Instance 1's pod out of rotation, so neither row is a replica the plan
+// prefers to keep and a scale-down retires the higher index. The
+// Component is then scaled to one replica. Instance 1 leaves through the
+// scale-down wave, whose every pass ends before the Update pass, so the
+// hold stands through the wave. Once the row is gone every remaining
+// Instance runs the target with nothing in flight and nothing the ladder
+// denies: the roll has nothing left to do, and the next pass clears the
+// hold rather than leave a denial standing that names an Instance the
+// scale-down removed.
+func TestReconcile_HoldClearsWhenTheRollHasNothingLeftToDo(t *testing.T) {
+	ir, objs, target := heldRollIR(t, v1beta1.OMENativeInstanceFailed, false)
+	r, c := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	key := client.ObjectKeyFromObject(ir)
+
+	held := requireBudgetHoldNaming(t, reconcileIR(t, r, c, key, "the pass that denies the start"), target, "Instance 0")
+
+	editIRSpec(t, c, key, func(spec *v1beta1.InferenceReplicaSpec) { spec.Replicas = ptr.To(int32(1)) })
+	removed := false
+	for pass := 0; pass < 12 && !removed; pass++ {
+		got := reconcileIR(t, r, c, key, "a pass of the scale-down wave")
+		if statusByIndex(got.Status.InstanceStatuses, 1) == nil {
+			removed = true
+			break
+		}
+		if !sameRolloutHold(got.Status.RolloutHold, held) {
+			t.Fatalf("a pass of the scale-down wave ends before the Update pass and must leave the hold standing: got %+v want %+v", got.Status.RolloutHold, held)
+		}
+	}
+	if !removed {
+		t.Fatal("Instance 1 never left through the scale-down wave")
+	}
+
+	if got := reconcileIR(t, r, c, key, "the pass after the scale-down").Status.RolloutHold; got != nil {
+		t.Fatalf("every remaining Instance runs the target with nothing in flight, so the roll has nothing left to do; the hold must clear, got %+v", got)
+	}
+}
+
+// TestReconcile_PartitionHeldRollReportsTheLadder: two single-pod
+// Instances Ready on the prior revision, held there by a partition equal
+// to the replica count, under a same-target RetryBlock the ladder holds.
+// No candidate reaches the trigger, so the update selection is empty and
+// the pass plans no update; the roll is still not idle, because the
+// ladder gave up on the revision and the rollout hold is where an
+// operator reads that. The pass must report the Held hold on the target,
+// never no hold beside a status.retryBlocks entry that says Held.
+func TestReconcile_PartitionHeldRollReportsTheLadder(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 2)
+	ir.Spec.Lifecycle = &v1beta1.LifecycleSpec{
+		UpdateStrategy: &v1beta1.UpdateStrategy{
+			Type:          v1beta1.UpdateStrategySurgeThenDrain,
+			RollingUpdate: &v1beta1.RollingUpdate{Partition: ptr.To(int32(2))},
+		},
+	}
+	target := targetRevisionNameFor(t, ir)
+	ir.Status.CurrentRevision = "llama-engine-prior"
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "llama-engine-prior"},
+		{Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "llama-engine-prior"},
+	}
+	ir.Status.RetryBlocks = []v1beta1.RetryBlock{
+		{TargetRevision: target, State: v1beta1.RetryBlockHeld, AttemptsStarted: 2, Reason: "ImagePullBackOff"},
+	}
+	pod0 := podForIR(ir, 0, "default", 0, true, true)
+	pod1 := podForIR(ir, 1, "default", 0, true, true)
+	r, c := newReconciler(t, ir, pod0, pod1, sliceForIRPod(ir, pod0, true), sliceForIRPod(ir, pod1, true))
+	key := client.ObjectKeyFromObject(ir)
+
+	got := reconcileIR(t, r, c, key, "the pass under the partition and the Held block")
+	if hold := got.Status.RolloutHold; hold == nil || hold.Gate != v1beta1.RolloutHoldGateHeld || hold.Target != target {
+		t.Fatalf("a roll the ladder holds must report the Held hold on %s even when a partition keeps every candidate from the trigger, got %+v", target, hold)
 	}
 }
 
@@ -2555,6 +2747,10 @@ func TestReconcile_GangMigrationCompletesAfterSourcePlanRelease(t *testing.T) {
 	}
 }
 
+// directiveRevision is the revision the test directives were recorded
+// for; an exclusion binds rebuilds at that revision only.
+const directiveRevision = "llama-engine-rev1"
+
 // directiveEntry builds one terminal relocation-directive ledger row.
 func directiveEntry(uid, component string, idx int32, node string) audit.Entry {
 	return audit.Entry{
@@ -2565,8 +2761,18 @@ func directiveEntry(uid, component string, idx int32, node string) audit.Entry {
 		Reason:         audit.ReasonAutoRecover,
 		Outcome:        audit.OutcomeRelocateRecreate,
 		FromNode:       node,
+		Revision:       directiveRevision,
 		StartedAt:      time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC).Format(time.RFC3339),
 	}
+}
+
+// excludedNodeNames flattens a projected exclusion list to its node names.
+func excludedNodeNames(exclusions []workloadtypes.NodeExclusion) []string {
+	var nodes []string
+	for _, exclusion := range exclusions {
+		nodes = append(nodes, exclusion.Node)
+	}
+	return nodes
 }
 
 // reconcileRelocationDirectives projects the exclusion map from the
@@ -2601,9 +2807,14 @@ func TestReconcileRelocationDirectives_BuildsBoundedExclusionMap(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("map: got %v want exactly instance 0", got)
 	}
-	nodes := got[0]
+	nodes := excludedNodeNames(got[0])
 	if len(nodes) != 3 || nodes[0] != "n2" || nodes[1] != "n3" || nodes[2] != "n4" {
 		t.Errorf("instance 0 exclusions: got %v want [n2 n3 n4] (last 3 distinct nodes)", nodes)
+	}
+	for _, exclusion := range got[0] {
+		if exclusion.Revision != directiveRevision {
+			t.Errorf("exclusion %v: want the directive's revision %q", exclusion, directiveRevision)
+		}
 	}
 
 	// Budget 0 (unconfigured) → no exclusions at all.
@@ -2633,7 +2844,7 @@ func TestReconcileRelocationDirectives_PrunesOnReady(t *testing.T) {
 	}
 
 	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
-	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n2" {
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0].Node != "n2" {
 		t.Fatalf("map: got %v want only instance 1 → [n2] (instance 0 pruned on Ready)", got)
 	}
 
@@ -2682,7 +2893,7 @@ func TestReconcileRelocationDirectives_PrunePersistsFromLiveSnapshot(t *testing.
 	r.APIReader = readerClient
 
 	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
-	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n2" {
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0].Node != "n2" {
 		t.Fatalf("map: got %v want only instance 1 → [n2]", got)
 	}
 
@@ -2730,7 +2941,7 @@ func TestReconcileRelocationDirectives_LiveReloadFailureSkipsPersist(t *testing.
 	r.APIReader = failingGetReader{}
 
 	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
-	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n2" {
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0].Node != "n2" {
 		t.Fatalf("map: got %v want only instance 1 → [n2] (cache-pruned view)", got)
 	}
 
@@ -2792,7 +3003,7 @@ func TestReconcileRelocationDirectives_SuccessTouchStampsNewestAutoRecord(t *tes
 	}
 
 	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
-	if len(got) != 1 || len(got[1]) != 1 || got[1][0] != "n3" {
+	if len(got) != 1 || len(got[1]) != 1 || got[1][0].Node != "n3" {
 		t.Fatalf("exclusion map: got %v want only instance 1 → [n3]", got)
 	}
 
@@ -2909,8 +3120,69 @@ func TestReconcileRelocationDirectives_ReadyWithOpNotPruned(t *testing.T) {
 	}
 
 	got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3)
-	if len(got) != 1 || len(got[0]) != 1 || got[0][0] != "n1" {
+	if len(got) != 1 || len(got[0]) != 1 || got[0][0].Node != "n1" {
 		t.Fatalf("map: got %v want instance 0 → [n1] (no prune while op in flight)", got)
+	}
+}
+
+// A directive that carries no revision keeps its place in the Instance's
+// relocation budget but projects no exclusion: a rebuild at any revision
+// is free to land where there is room.
+func TestReconcileRelocationDirectives_RevisionlessDirectiveExcludesNothing(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceUpdating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate}},
+	}
+	r, c := newReconciler(t, ir)
+	ledger := &audit.Ledger{}
+	legacy := directiveEntry("u0", "engine", 0, "n1")
+	legacy.Revision = ""
+	ledger.UpsertEntry(legacy)
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, ledger); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+
+	if got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3); got != nil {
+		t.Fatalf("map: got %v want nil (a directive with no revision excludes nothing)", got)
+	}
+	after, err := audit.LoadLedgerForOwner(context.Background(), c, ir)
+	if err != nil {
+		t.Fatalf("reload ledger: %v", err)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 0) != 1 {
+		t.Errorf("budget: got %d want 1 (the directive still counts)", audit.CountAutoRecoverAttempts(after, "engine", 0))
+	}
+}
+
+// A released directive — its rebuild found no node with room — projects
+// no exclusion, while the budget it spent stays spent.
+func TestReconcileRelocationDirectives_ReleasedDirectiveExcludesNothing(t *testing.T) {
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceCreating,
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationCreate}},
+	}
+	r, c := newReconciler(t, ir)
+	ledger := &audit.Ledger{}
+	ledger.UpsertEntry(directiveEntry("u0", "engine", 0, "n1"))
+	ledger.UpsertEntry(directiveEntry("u1", "engine", 0, "n2"))
+	if released := audit.ReleaseAutoRecoverExclusions(ledger, "engine", 0, directiveRevision); len(released) != 2 {
+		t.Fatalf("release: got %v want both nodes", released)
+	}
+	if err := audit.PersistLedgerForOwner(context.Background(), c, ir, irGVK, ledger); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+
+	if got := r.reconcileRelocationDirectives(context.Background(), logf.Log.WithName("test"), ir, nil, 3); got != nil {
+		t.Fatalf("map: got %v want nil (released directives exclude nothing)", got)
+	}
+	after, err := audit.LoadLedgerForOwner(context.Background(), c, ir)
+	if err != nil {
+		t.Fatalf("reload ledger: %v", err)
+	}
+	if audit.CountAutoRecoverAttempts(after, "engine", 0) != 2 {
+		t.Errorf("budget: got %d want 2 (released directives still count)", audit.CountAutoRecoverAttempts(after, "engine", 0))
 	}
 }
 
@@ -3195,6 +3467,14 @@ func TestReconcile_TPUSlices_WithholdsPodsUntilTheirSliceIsReady(t *testing.T) {
 		t.Fatalf("Instance 0 operation = %+v, want it waiting on %s", row.Operation, workloadtypes.WaitingReasonCapacityProvisioning)
 	}
 
+	// The provider labels the slice's host as it activates the slice.
+	host := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "slice-host", Labels: map[string]string{sliceKeySlice: name}},
+		Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+	}
+	if err := c.Create(ctx, host); err != nil {
+		t.Fatalf("create slice host: %v", err)
+	}
 	setSliceState(t, c, name, sliceStateReady)
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("ready pass: %v", err)
@@ -3323,6 +3603,304 @@ func TestReconcile_TPUSlices_ReleasesUnusedSlicesOfAnOptedOutOwner(t *testing.T)
 	}
 	if pods := listPods(t, c, ir.Namespace); len(pods) != 1 {
 		t.Fatalf("pods = %v, want the opted-out pod created unconfined", podNames(pods))
+	}
+}
+
+// TestReconcile_TPUSlices_RebuildsAnInstanceWhoseSliceIsLost pins the
+// recovery from a slice deleted under a running pod: the pod is deleted and
+// reported, its Instance is rebuilt on a new slice of the same name, and the
+// other Instance keeps its pod.
+func TestReconcile_TPUSlices_RebuildsAnInstanceWhoseSliceIsLost(t *testing.T) {
+	ctx := context.Background()
+	ir := optedInIR("llama-engine", "prod", 2)
+	r, c := newSliceReconciler(t, ir)
+	rec := &capturingRecorder{}
+	r.Recorder = rec
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	reconcile := func(stage string, passes int) {
+		t.Helper()
+		for pass := 0; pass < passes; pass++ {
+			// The pod watch observes every create and delete.
+			r.Expectations = workloadtypes.NewExpectations()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("%s pass %d: %v", stage, pass, err)
+			}
+		}
+	}
+	// run reports every pod running and serving.
+	run := func() {
+		t.Helper()
+		for _, pod := range listPods(t, c, ir.Namespace) {
+			now := metav1.Now()
+			pod.Status.Phase = corev1.PodRunning
+			pod.Status.Conditions = []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: now},
+				{Type: query.ServingConditionType, Status: corev1.ConditionTrue, LastTransitionTime: now},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: now},
+			}
+			if err := c.Status().Update(ctx, &pod); err != nil {
+				t.Fatalf("report pod %s running: %v", pod.Name, err)
+			}
+		}
+	}
+	p, err := r.sliceProvisioner(ir)
+	if err != nil {
+		t.Fatalf("sliceProvisioner: %v", err)
+	}
+	lost, kept := p.Name(sliceprovision.Slot{Instance: 0}), p.Name(sliceprovision.Slot{Instance: 1})
+	// podOn returns the pod confined to slice, or nil when there is none.
+	podOn := func(slice string) *corev1.Pod {
+		t.Helper()
+		var found *corev1.Pod
+		for _, pod := range listPods(t, c, ir.Namespace) {
+			if pod.Spec.NodeSelector[sliceKeySlice] == slice {
+				if found != nil {
+					t.Fatalf("pods %s and %s are both confined to slice %s", found.Name, pod.Name, slice)
+				}
+				found = pod.DeepCopy()
+			}
+		}
+		return found
+	}
+
+	reconcile("provision", 2)
+	// The provider labels each slice's host as it activates the slice.
+	for i, name := range []string{lost, kept} {
+		host := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("slice-host-%d", i), Labels: map[string]string{sliceKeySlice: name}},
+			Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+		}
+		if err := c.Create(ctx, host); err != nil {
+			t.Fatalf("create slice host: %v", err)
+		}
+		setSliceState(t, c, name, sliceStateReady)
+	}
+	reconcile("ready", 2)
+	lostPod, keptPod := podOn(lost), podOn(kept)
+	if lostPod == nil || keptPod == nil {
+		t.Fatalf("pods = %v, want one on each slice", podNames(listPods(t, c, ir.Namespace)))
+	}
+	run()
+	reconcile("running", 2)
+	got := &v1beta1.InferenceReplica{}
+	if err := c.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	for _, idx := range []int32{0, 1} {
+		if row := instanceStatusAt(t, got, idx); row.Phase != v1beta1.OMENativeInstanceReady {
+			t.Fatalf("Instance %d phase = %s, want %s", idx, row.Phase, v1beta1.OMENativeInstanceReady)
+		}
+	}
+	lostSlice := getSlice(t, c, lost)
+
+	// The slice is deleted from outside while its pod runs on it.
+	if err := c.Delete(ctx, lostSlice); err != nil {
+		t.Fatalf("delete slice: %v", err)
+	}
+	reconcile("lost", 1)
+	if err := c.Get(ctx, client.ObjectKeyFromObject(lostPod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get the pod on the lost slice: %v; want it deleted", err)
+	}
+	if got := podOn(kept); got == nil || got.UID != keptPod.UID {
+		t.Fatalf("pod on the intact slice = %+v, want %s kept", got, keptPod.Name)
+	}
+	var reported []capturedEvent
+	for _, e := range rec.events {
+		if e.reason == string(sliceprovision.EventReasonSliceLost) {
+			reported = append(reported, e)
+		}
+	}
+	if len(reported) != 1 || reported[0].kind != corev1.EventTypeWarning ||
+		!strings.Contains(reported[0].message, lost) || !strings.Contains(reported[0].message, lostPod.Name) {
+		t.Fatalf("%s events = %+v, want one warning naming %s and %s", sliceprovision.EventReasonSliceLost, reported, lost, lostPod.Name)
+	}
+
+	reconcile("rebuild", 3)
+	rebuilt := getSlice(t, c, lost)
+	if rebuilt == nil || rebuilt.GetUID() == lostSlice.GetUID() {
+		t.Fatalf("slices = %v, want a new slice named %s", sliceNames(t, c), lost)
+	}
+	if got := podOn(lost); got != nil {
+		t.Fatalf("pod %s must wait for the new slice", got.Name)
+	}
+	if err := c.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	if row := instanceStatusAt(t, got, 0); row.Operation == nil || row.Operation.Waiting != workloadtypes.WaitingReasonCapacityProvisioning {
+		t.Fatalf("Instance 0 operation = %+v, want it waiting on %s", row.Operation, workloadtypes.WaitingReasonCapacityProvisioning)
+	}
+
+	setSliceState(t, c, lost, sliceStateReady)
+	reconcile("rebuilt", 2)
+	if got := podOn(lost); got == nil || got.UID == lostPod.UID {
+		t.Fatalf("pods = %v, want a new pod on the new slice", podNames(listPods(t, c, ir.Namespace)))
+	}
+	if len(reported) != 1 {
+		t.Fatalf("the lost slice must be reported once; events %+v", rec.events)
+	}
+}
+
+// TestReconcile_TPUSlices_RebuildsAnInstanceWhoseSliceMoved pins the
+// recovery from a slice moved off its running pod's node: the pod is deleted
+// and reported, and its Instance is rebuilt on the same slice once the
+// slice's new host is visible.
+func TestReconcile_TPUSlices_RebuildsAnInstanceWhoseSliceMoved(t *testing.T) {
+	ctx := context.Background()
+	ir := optedInIR("llama-engine", "prod", 1)
+	r, c := newSliceReconciler(t, ir)
+	rec := &capturingRecorder{}
+	r.Recorder = rec
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	reconcile := func(stage string, passes int) {
+		t.Helper()
+		for pass := 0; pass < passes; pass++ {
+			// The pod watch observes every create and delete.
+			r.Expectations = workloadtypes.NewExpectations()
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("%s pass %d: %v", stage, pass, err)
+			}
+		}
+	}
+	p, err := r.sliceProvisioner(ir)
+	if err != nil {
+		t.Fatalf("sliceProvisioner: %v", err)
+	}
+	name := p.Name(sliceprovision.Slot{Instance: 0})
+	// host labels a ready node as a host of slice, or of none when slice is
+	// empty, as the provider does as it activates and deactivates slices.
+	host := func(node, slice string) {
+		t.Helper()
+		labels := map[string]string{}
+		if slice != "" {
+			labels[sliceKeySlice] = slice
+		}
+		n := &corev1.Node{}
+		err := c.Get(ctx, client.ObjectKey{Name: node}, n)
+		switch {
+		case apierrors.IsNotFound(err):
+			n = &corev1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: node, Labels: labels},
+				Status:     corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}},
+			}
+			err = c.Create(ctx, n)
+		case err == nil:
+			n.Labels = labels
+			err = c.Update(ctx, n)
+		}
+		if err != nil {
+			t.Fatalf("label node %s: %v", node, err)
+		}
+	}
+	// podOnSlice returns the pod confined to the slice, or nil when there is
+	// none.
+	podOnSlice := func() *corev1.Pod {
+		t.Helper()
+		for _, pod := range listPods(t, c, ir.Namespace) {
+			if pod.Spec.NodeSelector[sliceKeySlice] == name {
+				return pod.DeepCopy()
+			}
+		}
+		return nil
+	}
+
+	reconcile("provision", 2)
+	setSlicePartitions(t, c, name, "partition-a")
+	host("slice-host-a", name)
+	setSliceState(t, c, name, sliceStateReady)
+	reconcile("ready", 2)
+	pod := podOnSlice()
+	if pod == nil {
+		t.Fatalf("pods = %v, want one on slice %s", podNames(listPods(t, c, ir.Namespace)), name)
+	}
+	// The scheduler binds the pod to the slice's host, where it runs.
+	pod.Spec.NodeName = "slice-host-a"
+	if err := c.Update(ctx, pod); err != nil {
+		t.Fatalf("bind pod: %v", err)
+	}
+	now := metav1.Now()
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: now},
+		{Type: query.ServingConditionType, Status: corev1.ConditionTrue, LastTransitionTime: now},
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: now},
+	}
+	if err := c.Status().Update(ctx, pod); err != nil {
+		t.Fatalf("report pod running: %v", err)
+	}
+	reconcile("running", 2)
+	if got := podOnSlice(); got == nil || got.UID != pod.UID {
+		t.Fatalf("pod on a slice that holds its node = %+v, want %s kept", got, pod.Name)
+	}
+	moved := getSlice(t, c, name)
+
+	// The slice moves to a new partition: its old host leaves it, and its
+	// new host is not visible yet.
+	setSlicePartitions(t, c, name, "partition-b")
+	host("slice-host-a", "")
+	reconcile("moved", 1)
+	if err := c.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("get the pod the slice moved off: %v; want it deleted", err)
+	}
+	var reported []capturedEvent
+	for _, e := range rec.events {
+		if e.reason == string(sliceprovision.EventReasonSliceLost) {
+			reported = append(reported, e)
+		}
+	}
+	if len(reported) != 1 || reported[0].kind != corev1.EventTypeWarning ||
+		!strings.Contains(reported[0].message, name) || !strings.Contains(reported[0].message, "moved off node slice-host-a") ||
+		!strings.Contains(reported[0].message, pod.Name) {
+		t.Fatalf("%s events = %+v, want one warning saying %s moved off node slice-host-a under %s",
+			sliceprovision.EventReasonSliceLost, reported, name, pod.Name)
+	}
+	reconcile("rebuild", 2)
+	if got := podOnSlice(); got != nil {
+		t.Fatalf("pod %s must wait until the slice's new host is visible", got.Name)
+	}
+
+	host("slice-host-b", name)
+	reconcile("rebuilt", 2)
+	if got := podOnSlice(); got == nil || got.UID == pod.UID {
+		t.Fatalf("pods = %v, want a new pod on slice %s", podNames(listPods(t, c, ir.Namespace)), name)
+	}
+	if got := getSlice(t, c, name); got == nil || got.GetUID() != moved.GetUID() {
+		t.Fatalf("slices = %v, want slice %s kept", sliceNames(t, c), name)
+	}
+	if len(reported) != 1 {
+		t.Fatalf("the move must be reported once; events %+v", rec.events)
+	}
+}
+
+// TestReconcile_TPUSlices_FailedRecoveryFailsThePass pins that a pod on a
+// lost slice that cannot be deleted fails the pass.
+func TestReconcile_TPUSlices_FailedRecoveryFailsThePass(t *testing.T) {
+	ctx := context.Background()
+	ir := optedInIR("llama-engine", "prod", 1)
+	r, c := newSliceReconciler(t, ir)
+	name := seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+	pod := podForIR(ir, 0, string(v1beta1.RunnerNameDefault), 0, true, true)
+	pod.Spec.NodeSelector = map[string]string{sliceKeyAccelerator: "tpu-a", sliceKeyTopology: "2x2x1", sliceKeySlice: name}
+	if err := c.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+	if err := c.Delete(ctx, getSlice(t, c, name)); err != nil {
+		t.Fatalf("delete slice: %v", err)
+	}
+	r.Client = interceptor.NewClient(c, interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if _, ok := obj.(*corev1.Pod); ok {
+				return errors.New("injected pod delete failure")
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+
+	_, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)})
+	if err == nil || !strings.Contains(err.Error(), "recover lost TPU slices") || !strings.Contains(err.Error(), "injected") {
+		t.Fatalf("Reconcile error = %v, want the recovery failure", err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+		t.Fatalf("get pod: %v; want it kept", err)
 	}
 }
 
@@ -3521,5 +4099,311 @@ func TestRollbackRevisionMustBeControlledByTheReplica(t *testing.T) {
 	cr, err = r.rollbackRevision(context.Background(), ir, ir)
 	if !errors.Is(err, injected) || cr != nil {
 		t.Fatalf("read failure: cr=%v err=%v, want the injected error", cr, err)
+	}
+}
+
+// A gang whose owner name is long enough that its per-revision headless
+// Service name must be bounded reaches Ready with the running revision the
+// same way a short-named one does: every reader of a derived Service name
+// goes through the shared helper, so the bounded name is found exactly as
+// it was written.
+func TestReconcile_LongOwnerNameGangReachesReadyLikeAShortOne(t *testing.T) {
+	const long = "long-gang-owner-name-past-label-limit"
+	engine := workloadtypes.ComponentEngine
+	// Premise: the long owner's per-revision headless name does not fit the
+	// label limit and is bounded; the short owner's fits as written.
+	if raw := long + "-engine-rev-abcd1234-headless"; len(raw) <= validation.DNS1035LabelMaxLength ||
+		query.PerRevisionHeadlessServiceName(long, engine, "abcd1234") == raw {
+		t.Fatalf("premise: %q must be bounded by the per-revision headless Service name helper", raw)
+	}
+	for _, owner := range []string{"short-owner", long} {
+		t.Run(owner, func(t *testing.T) {
+			ctx := context.Background()
+			ir := baselineIR(owner+"-engine", "default", 1)
+			ir.Spec.ParentRef.Name = owner
+			ir.OwnerReferences[0].Name = owner
+			ir.Spec.Runners = []v1beta1.Runner{
+				{Name: v1beta1.RunnerNameLeader, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "ome-container", Image: "sgl:1.0"}},
+				}}},
+				{Name: v1beta1.RunnerNameWorker, Size: 1, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "ome-container", Image: "sgl:1.0"}},
+				}}},
+			}
+			r, c := newReconciler(t, ir)
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+
+			// Pass 1 materializes the gang under the owner's name.
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("create pass: %v", err)
+			}
+			pods := listPods(t, c, ir.Namespace)
+			if len(pods) != 2 {
+				t.Fatalf("want the leader and the worker, got %v", podNames(pods))
+			}
+			for _, pod := range pods {
+				if pod.Spec.Subdomain != query.HeadlessServiceName(owner, engine) {
+					t.Fatalf("pod %s subdomain %q is not the owner's headless Service", pod.Name, pod.Spec.Subdomain)
+				}
+			}
+			now := metav1.Now()
+			for i := range pods {
+				pods[i].Status.Phase = corev1.PodRunning
+				pods[i].Status.Conditions = append(pods[i].Status.Conditions, corev1.PodCondition{
+					Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: now,
+				})
+				if err := c.Status().Update(ctx, &pods[i]); err != nil {
+					t.Fatalf("containers ready: %v", err)
+				}
+			}
+
+			// Pass 2 writes the serving gate on every ContainersReady pod.
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("serving pass: %v", err)
+			}
+			pods = listPods(t, c, ir.Namespace)
+			for i := range pods {
+				if !podreadiness.IsServing(&pods[i]) {
+					t.Fatalf("pod %s was not marked serving", pods[i].Name)
+				}
+				pods[i].Status.Conditions = append(pods[i].Status.Conditions, corev1.PodCondition{
+					Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: now,
+				})
+				if err := c.Status().Update(ctx, &pods[i]); err != nil {
+					t.Fatalf("pod ready: %v", err)
+				}
+			}
+
+			// Pass 3 promotes the row onto the revision its pods carry.
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("promote pass: %v", err)
+			}
+			row := instanceRow(t, c, ir)
+			if row.Phase != v1beta1.OMENativeInstanceReady || row.Operation != nil {
+				t.Fatalf("row must be Ready with no operation, got %+v (op %+v)", row, row.Operation)
+			}
+			fresh := &v1beta1.InferenceReplica{}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(ir), fresh); err != nil {
+				t.Fatal(err)
+			}
+			if row.RunningRevision == "" || row.RunningRevision != fresh.Status.UpdateRevision {
+				t.Fatalf("row runs %q, want the target revision %q", row.RunningRevision, fresh.Status.UpdateRevision)
+			}
+			if query.RevisionFromName(row.RunningRevision).Hash() != pods[0].Labels[query.LabelRevisionHash] {
+				t.Fatalf("row runs %q but its pods carry revision hash %q", row.RunningRevision, pods[0].Labels[query.LabelRevisionHash])
+			}
+		})
+	}
+}
+
+// TestReconcile_GangServingCountFollowsALeavingMember drives a whole
+// leader+worker gang through losing a member, under
+// RecreateInstanceOnPodRestart, and reads the published serving count on
+// every pass: two while both members serve, one on the pass that sees the
+// worker deleted (it keeps its conditions while it terminates, but it is
+// already out of rotation), and none once the row is Restarting and the
+// survivor is drained for the rebuild.
+func TestReconcile_GangServingCountFollowsALeavingMember(t *testing.T) {
+	ir := gangLossIR("llama-engine", "prod")
+	target := targetRevisionNameFor(t, ir)
+	ir.Status.CurrentRevision = target
+	ir.Status.UpdateRevision = target
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+		RunningRevision: target, PodCount: 2, ServingPodCount: 2,
+	}}
+	leader := podForIR(ir, 0, string(v1beta1.RunnerNameLeader), 0, true, true)
+	worker := podForIR(ir, 0, string(v1beta1.RunnerNameWorker), 0, true, true)
+	// The hold keeps the deleted worker visible as Terminating, the way a
+	// pod stays listed until its containers stop.
+	worker.Finalizers = []string{"example.com/hold"}
+	r, c := newReconciler(t, ir, leader, worker)
+	r.Recorder = record.NewFakeRecorder(32)
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}}
+
+	published := func(pass string) (v1beta1.OMENativeInstanceStatus, int32) {
+		t.Helper()
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("%s: %v", pass, err)
+		}
+		fresh := &v1beta1.InferenceReplica{}
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh); err != nil {
+			t.Fatalf("%s: get IR: %v", pass, err)
+		}
+		if len(fresh.Status.InstanceStatuses) != 1 {
+			t.Fatalf("%s: instance statuses: %+v", pass, fresh.Status.InstanceStatuses)
+		}
+		return fresh.Status.InstanceStatuses[0], fresh.Status.ServingReplicas
+	}
+
+	row, servingReplicas := published("whole gang")
+	if row.Phase != v1beta1.OMENativeInstanceReady || row.PodCount != 2 || row.ServingPodCount != 2 || servingReplicas != 1 {
+		t.Fatalf("whole gang: phase=%s pods=%d serving=%d servingReplicas=%d, want Ready 2 2 1",
+			row.Phase, row.PodCount, row.ServingPodCount, servingReplicas)
+	}
+
+	if err := c.Delete(context.Background(), worker); err != nil {
+		t.Fatalf("delete the worker: %v", err)
+	}
+	r.Expectations = workloadtypes.NewExpectations()
+	row, servingReplicas = published("worker leaving")
+	if row.PodCount != 2 {
+		t.Fatalf("worker leaving: pods=%d, want 2 while the worker terminates", row.PodCount)
+	}
+	if row.ServingPodCount != 1 || servingReplicas != 0 {
+		t.Fatalf("worker leaving: serving=%d servingReplicas=%d, want 1 and 0: a member out of rotation is not serving",
+			row.ServingPodCount, servingReplicas)
+	}
+
+	// The worker's containers stop: the hold lifts and the pod is gone.
+	gone := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(worker), gone); err != nil {
+		t.Fatalf("get the terminating worker: %v", err)
+	}
+	gone.Finalizers = nil
+	if err := c.Update(context.Background(), gone); err != nil {
+		t.Fatalf("release the worker: %v", err)
+	}
+	r.Expectations = workloadtypes.NewExpectations()
+	row, servingReplicas = published("worker gone")
+	if row.Phase != v1beta1.OMENativeInstanceRestarting || row.Operation == nil || row.Operation.Type != v1beta1.InstanceOperationRestart {
+		t.Fatalf("worker gone: the gang must be rebuilt as a whole, got phase=%s op=%+v", row.Phase, row.Operation)
+	}
+	if row.ServingPodCount != 0 || servingReplicas != 0 {
+		t.Fatalf("worker gone: serving=%d servingReplicas=%d, want 0 and 0 while the survivor drains for the rebuild",
+			row.ServingPodCount, servingReplicas)
+	}
+}
+
+// rollingSingletonIR is one single-pod Instance Ready on the revision of
+// its stored spec, with the spec then edited to a second image so the next
+// pass opens a SurgeThenDrain roll onto a new revision. Returns the IR, the
+// objects backing its Instance, and the prior and next revision names.
+func rollingSingletonIR(t *testing.T) (*v1beta1.InferenceReplica, []client.Object, string, string) {
+	t.Helper()
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Spec.Lifecycle = &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{
+		Type:          v1beta1.UpdateStrategySurgeThenDrain,
+		RollingUpdate: &v1beta1.RollingUpdate{MaxSurge: ptr.To(intstr.FromInt32(1))},
+	}}
+	prior := targetRevisionNameFor(t, ir)
+	ir.Spec.Runners[0].Template.Spec.Containers[0].Image = "sgl:2.0"
+	ir.Generation = 2
+	next := targetRevisionNameFor(t, ir)
+	if next == prior {
+		t.Fatalf("the image edit must cut a new revision; both resolve to %s", prior)
+	}
+	ir.Status.CurrentRevision = prior
+	ir.Status.UpdateRevision = prior
+	ir.Status.ObservedGeneration = 1
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+		RunningRevision: prior, PodCount: 1, ServingPodCount: 1,
+	}}
+	pod := podForIR(ir, 0, "default", 0, true, true)
+	pod.Labels[query.LabelRevisionHash] = query.RevisionFromName(prior).Hash()
+	return ir, []client.Object{pod, sliceForIRPod(ir, pod, true)}, prior, next
+}
+
+// podsOnRevision counts the stored pods carrying the revision's hash label.
+func podsOnRevision(t *testing.T, c client.Client, namespace, revisionName string) int {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace(namespace)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	want := query.RevisionFromName(revisionName).Hash()
+	n := 0
+	for i := range pods.Items {
+		if pods.Items[i].Labels[query.LabelRevisionHash] == want {
+			n++
+		}
+	}
+	return n
+}
+
+// TestReconcile_TargetRevisionIsRecordedBeforeItsFirstPod pins the order of
+// the two writes a roll begins with: the status names the new target before
+// any pod renders it. A pass cut between creating a pod and publishing the
+// status, as a manager stop mid-pass cuts it, then leaves pods of the new
+// revision beside a status that already names it, never beside one that
+// still reports the previous revision as current and done.
+func TestReconcile_TargetRevisionIsRecordedBeforeItsFirstPod(t *testing.T) {
+	ir, objs, prior, next := rollingSingletonIR(t)
+	r, base := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.Recorder = record.NewFakeRecorder(64)
+	var recordedAtCreate []string
+	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod {
+				stored := &v1beta1.InferenceReplica{}
+				if err := base.Get(ctx, client.ObjectKeyFromObject(ir), stored); err != nil {
+					return err
+				}
+				recordedAtCreate = append(recordedAtCreate, stored.Status.UpdateRevision)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+
+	for pass := 0; pass < 6 && len(recordedAtCreate) == 0; pass++ {
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if len(recordedAtCreate) == 0 {
+		t.Fatalf("the spec edit never opened a roll: no pod was created")
+	}
+	if recordedAtCreate[0] != next {
+		t.Fatalf("the first pod of revision %s was created while status.updateRevision named %q (prior %s); the target must be recorded before any pod renders it",
+			next, recordedAtCreate[0], prior)
+	}
+}
+
+// TestReconcile_TargetRevisionFollowsTheSpecBackToThePriorRevision is the
+// exit of the early record: it is not a ratchet. Once a roll onto a new
+// revision is open, a spec that returns to the prior template moves the
+// recorded target back with it on the next pass.
+func TestReconcile_TargetRevisionFollowsTheSpecBackToThePriorRevision(t *testing.T) {
+	ir, objs, prior, next := rollingSingletonIR(t)
+	r, c := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.Recorder = record.NewFakeRecorder(64)
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+
+	for pass := 0; pass < 6 && podsOnRevision(t, c, ir.Namespace, next) == 0; pass++ {
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("roll pass %d: %v", pass, err)
+		}
+	}
+	if podsOnRevision(t, c, ir.Namespace, next) == 0 {
+		t.Fatalf("the spec edit never opened a roll: no pod of %s exists", next)
+	}
+	rolling := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), rolling); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	if rolling.Status.UpdateRevision != next {
+		t.Fatalf("an open roll must record its target: updateRevision=%q want %s", rolling.Status.UpdateRevision, next)
+	}
+
+	rolling.Spec.Runners[0].Template.Spec.Containers[0].Image = "sgl:1.0"
+	rolling.Generation = 3
+	if err := c.Update(context.Background(), rolling); err != nil {
+		t.Fatalf("roll the spec back: %v", err)
+	}
+	r.Expectations = workloadtypes.NewExpectations()
+	if _, err := r.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("rollback pass: %v", err)
+	}
+	after := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), after); err != nil {
+		t.Fatalf("get IR after the rollback: %v", err)
+	}
+	if after.Status.UpdateRevision != prior {
+		t.Fatalf("a spec back on the prior template must move the target back with it: updateRevision=%q want %s", after.Status.UpdateRevision, prior)
+	}
+	if after.Status.CurrentRevision != prior {
+		t.Fatalf("currentRevision=%q want %s: the prior revision is what the Instance runs", after.Status.CurrentRevision, prior)
 	}
 }

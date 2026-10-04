@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -16,6 +17,66 @@ import (
 func fdUnknownPod(pod *corev1.Pod) *corev1.Pod {
 	pod.Status.Phase = corev1.PodUnknown
 	return pod
+}
+
+// fdWithdrawnPod turns a force-delete fixture pod into one the control
+// plane marked not Ready while its own last report still says Ready: not
+// Terminating, Running, ContainersReady and the serving gate True,
+// PodReady False — a serving pod whose node stopped heartbeating.
+func fdWithdrawnPod(pod *corev1.Pod) *corev1.Pod {
+	pod.DeletionTimestamp = nil
+	pod.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: query.ServingConditionType}}
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+			{Type: query.ServingConditionType, Status: corev1.ConditionTrue},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+		},
+	}
+	return pod
+}
+
+// A serving pod whose Ready the control plane withdrew is swept like a
+// phase-Unknown one: on a node unreachable past the threshold the sweep
+// force-deletes it and the step withholds for the pass; on a node posting
+// Ready the shape is the kubelet's lag behind the gate write, nothing is
+// deleted, and the step is not withheld at all.
+func TestRecoverUnknownPhaseTargets_WithdrawnReadyFollowsTheNode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		node    *corev1.Node
+		holding bool
+		deletes int
+	}{
+		{"node unreachable past the threshold", fdNodeUnreachable("node-a", 10*time.Minute), true, 1},
+		{"node unreachable inside the threshold", fdNodeUnreachable("node-a", time.Minute), true, 0},
+		{"node posting Ready", fdNodeReady("node-a"), false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var deletes []recordedDeleteOpts
+			funcs := fdDeleteRecorder(&deletes)
+			pod := fdWithdrawnPod(fdTerminatingPod("engine-0-default-0", "node-a", overdueTS))
+			isvc := fdISVC("llama")
+			c := fdFakeClient(t, &funcs, isvc, pod, tc.node)
+			deps := workload.Deps{Client: c, Recorder: record.NewFakeRecorder(16)}
+
+			holding, _, err := recoverUnknownPhaseTargets(context.Background(), deps, fdInput(isvc, fdPolicy()), 0,
+				[]*corev1.Pod{pod}, []podTarget{{Name: pod.Name}})
+			if err != nil {
+				t.Fatalf("recoverUnknownPhaseTargets: %v", err)
+			}
+			if holding != tc.holding {
+				t.Errorf("holding = %v, want %v", holding, tc.holding)
+			}
+			if len(deletes) != tc.deletes {
+				t.Fatalf("deletes: got %+v want %d", deletes, tc.deletes)
+			}
+			if tc.deletes == 1 && (deletes[0].grace == nil || *deletes[0].grace != 0) {
+				t.Errorf("GracePeriodSeconds: got %v want 0", deletes[0].grace)
+			}
+		})
+	}
 }
 
 // A pod that is Terminating AND Unknown on a dead node reaches the

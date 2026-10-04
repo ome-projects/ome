@@ -21,7 +21,8 @@ const (
 	// CanaryStateDraining: the final step serves 100%; the stable revision
 	// drains until the window elapses.
 	CanaryStateDraining CanaryState = "Draining"
-	// CanaryStateDone: the done sentinel; the canary revision is stable.
+	// CanaryStateDone: the done sentinel; the held floor is released, and the
+	// unit reads Stable once every instance serves the canary revision.
 	CanaryStateDone CanaryState = "Done"
 	// CanaryStateRollingBack: a rejected revision is draining back to stable.
 	CanaryStateRollingBack CanaryState = "RollingBack"

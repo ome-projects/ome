@@ -627,6 +627,12 @@ type LifecycleConfig struct {
 	// force-delete and teardown deadlines still schedule their exact wake-ups.
 	// There is intentionally no in-code default.
 	ScaleDownRequeueInterval *string `json:"scaleDownRequeueInterval,omitempty"`
+	// RepairBatchSize bounds how many crash-loop repairs the restart pass
+	// opens per Component in one pass, in Instance units: a leader/worker
+	// gang counts as one. A repair already in flight and the recovery of
+	// pods already gone do not count. Nil preserves this field's unbounded
+	// compatibility behavior.
+	RepairBatchSize *int32 `json:"repairBatchSize,omitempty"`
 	// RevisionHistoryLimit is the operator-level cap on non-live
 	// ControllerRevisions retained per InferenceReplica when the parent
 	// InferenceService does not set the ome.io/revision-history-limit
@@ -655,6 +661,7 @@ type PodBatchSizes struct {
 	ScaleUp                  *int32
 	ScaleDown                *int32
 	ScaleDownRequeueInterval time.Duration
+	Repair                   *int32
 }
 
 // UpdateRetryConfig is the same-target update retry policy: a failed rollout
@@ -1039,6 +1046,17 @@ func (c *LifecycleConfig) ToScaleDownPodBatchSize() (*int32, error) {
 	return positiveInt32Field("scaleDownPodBatchSize", c.ScaleDownPodBatchSize)
 }
 
+// ToRepairBatchSize validates the configured per-pass crash-loop repair batch
+// size. A nil LifecycleConfig or absent field preserves unbounded repair
+// selection. Explicit zero or negative values are invalid so manager startup
+// can reject bad configuration.
+func (c *LifecycleConfig) ToRepairBatchSize() (*int32, error) {
+	if c == nil {
+		return nil, nil
+	}
+	return positiveInt32Field("repairBatchSize", c.RepairBatchSize)
+}
+
 // ToScaleDownRequeueInterval validates the configured destructive-work polling
 // cadence. A nil LifecycleConfig or absent field disables periodic polling
 // without disabling exact configured lifecycle-deadline wake-ups or fabricating
@@ -1117,10 +1135,15 @@ func LoadPodBatchSizes(clientset kubernetes.Interface) (PodBatchSizes, error) {
 	if err != nil {
 		return PodBatchSizes{}, fmt.Errorf("validate lifecycle.scaleDownRequeueInterval: %w", err)
 	}
+	repair, err := lifecycleConfig.ToRepairBatchSize()
+	if err != nil {
+		return PodBatchSizes{}, fmt.Errorf("validate lifecycle.repairBatchSize: %w", err)
+	}
 	return PodBatchSizes{
 		ScaleUp:                  scaleUp,
 		ScaleDown:                scaleDown,
 		ScaleDownRequeueInterval: scaleDownRequeueInterval,
+		Repair:                   repair,
 	}, nil
 }
 

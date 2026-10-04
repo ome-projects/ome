@@ -95,6 +95,16 @@ type Entry struct {
 	Phase          string `json:"phase"`
 	Reason         string `json:"reason,omitempty"`
 	FromNode       string `json:"fromNode,omitempty"`
+	// Revision is the ControllerRevision an AutoRecover directive's
+	// attempt was converging toward. The node exclusion the directive
+	// projects binds rebuilds at that revision only; a directive with no
+	// revision keeps its place in the budget and the audit trail but
+	// excludes nothing.
+	Revision string `json:"revision,omitempty"`
+	// Released marks an AutoRecover directive whose exclusion was let go:
+	// a rebuild rendered with it found no node with room. The entry keeps
+	// its place in the budget and the audit trail but excludes nothing.
+	Released bool `json:"released,omitempty"`
 	// HintTargetNodes carries the request's preferred placement targets
 	// so a Started row imported after an upgrade resumes with the
 	// requester's hints intact (unknown to older builds — additive).

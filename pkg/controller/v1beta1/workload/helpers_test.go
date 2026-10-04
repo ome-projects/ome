@@ -26,6 +26,27 @@ func SnapshotWithPodsForTest(input types.ReconcileInput, byIdx map[int32][]*core
 	return SnapshotWithDistinctPodsForTest(input, byIdx, byIdx)
 }
 
+// SnapshotWithRevisionsForTest is SnapshotWithPodsForTest with the
+// running revisions' recorded PodSpecs pre-materialized by revision name,
+// so a plan that judges a single-pod in-place start's diff needs no
+// client either. A revision absent from specs reads as gone.
+func SnapshotWithRevisionsForTest(input types.ReconcileInput, byIdx map[int32][]*corev1.Pod, specs map[string]*corev1.PodSpec) *ObservedSnapshot {
+	snapshot := SnapshotWithPodsForTest(input, byIdx)
+	snapshot.runningSpecs = make(map[string]memoPodSpec, len(specs))
+	for name, spec := range specs {
+		snapshot.runningSpecs[name] = memoPodSpec{spec: spec}
+	}
+	for _, row := range input.ObservedState.InstanceStatuses {
+		if row.RunningRevision == "" {
+			continue
+		}
+		if _, ok := snapshot.runningSpecs[row.RunningRevision]; !ok {
+			snapshot.runningSpecs[row.RunningRevision] = memoPodSpec{}
+		}
+	}
+	return snapshot
+}
+
 // SnapshotWithDistinctPodsForTest keeps the API-reader and cache views
 // separate so tests can model informer lag.
 func SnapshotWithDistinctPodsForTest(input types.ReconcileInput, liveByIdx, cachedByIdx map[int32][]*corev1.Pod) *ObservedSnapshot {

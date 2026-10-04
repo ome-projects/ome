@@ -185,6 +185,7 @@ func TestDispatch_SecondaryConvergesWithThePromotion(t *testing.T) {
 	// The final step's capacity: every instance of every member on its target.
 	f.movePod("engine", "engold", "engnew", "0")
 	f.movePod("decoder", "decold", "decnew", "0")
+	f.dispatch("shift") // 100% traffic moves; the release reads the next pass's count
 	f.dispatch("cut over")
 	cs := rollout.CanaryStatusFor(&f.isvc.Status, v1beta1.EngineComponent)
 	if cs == nil || cs.CurrentStep != 2 || f.phase() != v1beta1.RolloutPhaseStable {
@@ -293,6 +294,7 @@ func TestReconcile_SecondaryTrafficFollowsTheLadder(t *testing.T) {
 	})
 
 	in.PerRevisionPods = map[string]int32{"new": 4}
+	mustReconcile(t, isvc, in) // 100% traffic moves; the release reads the next pass's count
 	if res := mustReconcile(t, isvc, in); !res.Complete {
 		t.Fatalf("the ungated final step completes at 100%%, got %+v", res)
 	}
@@ -348,21 +350,58 @@ func TestReconcile_UnbumpedSecondaryKeepsItsRevision(t *testing.T) {
 	})
 }
 
+// The remainder of a split rests on the stable revision while it serves; a
+// stable revision whose instances rolled onto another revision hands the
+// remainder to that revision, under no protocol; a pod loss with nothing
+// serving in the stable's place, an unknown pod view, no stable identity and
+// a single-revision pair all leave the stable revision where it is.
+func TestServingStable(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		stable       string
+		canary       string
+		pods         map[string]int32
+		want         string
+		wantProtocol string
+	}{
+		{"the stable revision serves", "old", "new", map[string]int32{"old": 1, "new": 1}, "old", "p-old"},
+		{"another revision serves in the stable's place", "old", "newer", map[string]int32{"new": 2, "newer": 1}, "new", ""},
+		{"the most-serving revision takes the remainder", "old", "newer", map[string]int32{"a": 1, "new": 2, "newer": 3}, "new", ""},
+		{"ties go to the lowest hash", "old", "newer", map[string]int32{"b": 1, "a": 1}, "a", ""},
+		{"nothing serves in the stable's place", "old", "new", map[string]int32{"new": 2, "old": 0}, "old", "p-old"},
+		{"the pod view is unknown", "old", "new", nil, "old", "p-old"},
+		{"no stable identity", "", "new", map[string]int32{"new": 1, "other": 1}, "", "p-old"},
+		{"a single-revision pair", "same", "same", map[string]int32{"other": 1}, "same", "p-old"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, protocol := servingStable(tc.stable, "p-old", tc.canary, tc.pods)
+			if got != tc.want || protocol != tc.wantProtocol {
+				t.Fatalf("servingStable = %q under %q, want %q under %q", got, protocol, tc.want, tc.wantProtocol)
+			}
+		})
+	}
+}
+
 func TestMemberWeights(t *testing.T) {
 	bumped := bumpedDecoder()
-	if w := memberWeights(bumped, 30); len(w) != 2 ||
+	if w := memberWeights(bumped, 30, true, nil); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 30 || !w[0].LatestRevision || w[0].PairingProtocol != pdCanaryProtocol ||
 		w[1].RevisionHash != "decold" || w[1].Percent != 70 || w[1].LatestRevision || w[1].PairingProtocol != pdStableProtocol {
 		t.Fatalf("a bumped member splits like the primary, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "d", StableRevisionHash: "d", CanaryPairingProtocol: "p"}, 30); len(w) != 1 ||
+	if w := memberWeights(bumped, 30, true, map[string]int32{"decnew": 1, "decmid": 1}); len(w) != 2 ||
+		w[0].RevisionHash != "decnew" || w[0].Percent != 30 ||
+		w[1].RevisionHash != "decmid" || w[1].Percent != 70 || w[1].LatestRevision || w[1].PairingProtocol != "" {
+		t.Fatalf("a member whose stable revision serves nothing splits onto the revision serving in its place, got %+v", w)
+	}
+	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "d", StableRevisionHash: "d", CanaryPairingProtocol: "p"}, 30, true, nil); len(w) != 1 ||
 		w[0].RevisionHash != "d" || w[0].Percent != 100 || !w[0].LatestRevision || w[0].PairingProtocol != "p" {
 		t.Fatalf("an unbumped member serves its revision alone, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "decnew"}, 30); len(w) != 1 || w[0].RevisionHash != "decnew" || w[0].Percent != 100 {
+	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "decnew"}, 30, true, nil); len(w) != 1 || w[0].RevisionHash != "decnew" || w[0].Percent != 100 {
 		t.Fatalf("a member with no stable revision serves its target alone, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{StableRevisionHash: "decold"}, 30); w != nil {
+	if w := memberWeights(MemberRevisions{StableRevisionHash: "decold"}, 30, true, nil); w != nil {
 		t.Fatalf("a member with no target has no weights, got %+v", w)
 	}
 	if w := memberStableWeights(bumped); len(w) != 1 || w[0].RevisionHash != "decold" || w[0].Percent != 100 || w[0].LatestRevision || w[0].PairingProtocol != pdStableProtocol {

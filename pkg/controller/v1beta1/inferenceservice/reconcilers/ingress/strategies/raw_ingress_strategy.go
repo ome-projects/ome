@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/builders"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/interfaces"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 )
 
@@ -104,7 +105,7 @@ func (k *KubernetesIngressStrategy) Reconcile(ctx context.Context, isvc *v1beta1
 	}
 
 	// Get the service port
-	servicePort, err := isvcutils.GetTargetServicePort(ctx, k.client, isvc)
+	servicePort, err := isvcutils.TargetServicePort(ctx, k.client, isvc, irprojector.RoleDeclared(isvc, v1beta1.RouterComponent))
 	if err != nil {
 		klog.Warning("Failed to get target service port, using default", "error", err)
 		servicePort = constants.CommonISVCPort
@@ -145,7 +146,7 @@ func (k *KubernetesIngressStrategy) createRawURL(isvc *v1beta1.InferenceService)
 }
 
 func (k *KubernetesIngressStrategy) getRawServiceHost(isvc *v1beta1.InferenceService) string {
-	if isvc.Spec.Router != nil {
+	if irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) {
 		return constants.RouterServiceName(isvc.Name) + "." + isvc.Namespace + ".svc.cluster.local"
 	}
 	// Engine Service is named "<isvc>-engine" (constants.EngineServiceName) —

@@ -3,6 +3,8 @@ package analysis
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -370,4 +372,39 @@ func TestEvaluateHTTP_EndToEnd(t *testing.T) {
 			t.Fatalf("broken metric must carry the query error, got %+v", res.Metrics[1])
 		}
 	})
+}
+
+// TestQuerierHTTP_EachQueryDialsAnew pins that no connection is carried from
+// one query to the next: every query dials the server address afresh and so
+// reaches whatever that address resolves to now, not a peer connected before
+// the address was re-aimed. One Querier per query, as the sampler builds them.
+func TestQuerierHTTP_EachQueryDialsAnew(t *testing.T) {
+	var mu sync.Mutex
+	conns := 0
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, vectorBody("1"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			mu.Lock()
+			conns++
+			mu.Unlock()
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+
+	for i := 1; i <= 3; i++ {
+		q := mustQuerier(t, srv.URL, "", nil)
+		if _, err := q.Query(context.Background(), "up"); err != nil {
+			t.Fatalf("query %d: %v", i, err)
+		}
+		mu.Lock()
+		got := conns
+		mu.Unlock()
+		if got != i {
+			t.Fatalf("after query %d the server has seen %d connection(s), want one per query", i, got)
+		}
+	}
 }

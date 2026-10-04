@@ -258,6 +258,27 @@ func NodeDeath(ctx context.Context, reader client.Reader, pod *corev1.Pod, polic
 	}
 }
 
+// AllPodsTerminatingOverdue reports whether pods is non-empty and every
+// pod in it is Terminating past its own DeletionTimestamp — the deadline
+// the pod itself declared (its deletion request plus its own grace),
+// which a live kubelet meets within moments of it. A set in that state
+// is a teardown no further delete can move: the pods are already
+// deleted, and only their kubelet, a finalizer owner or the force-delete
+// escalation can remove them. No slack is applied, because nothing
+// destructive hangs on the reading — a teardown grazing its deadline on
+// a slow node reads as stalled for a pass and then completes.
+func AllPodsTerminatingOverdue(pods []*corev1.Pod, now time.Time) bool {
+	if len(pods) == 0 {
+		return false
+	}
+	for _, pod := range pods {
+		if pod == nil || pod.DeletionTimestamp == nil || !now.After(pod.DeletionTimestamp.Time) {
+			return false
+		}
+	}
+	return true
+}
+
 // SingleLiveNode returns the one node name hosting every pod of the
 // instance (single-pod, or a single-host gang), or "" when there are no
 // pods, any pod is unscheduled, or pods span multiple nodes — a
@@ -302,17 +323,48 @@ func AttemptSuspectNode(pods []*corev1.Pod, attemptRev string) string {
 	return SingleLiveNode(own)
 }
 
-// UnknownPhaseTargetPods returns the pods in phase Unknown occupying one
-// of the target names, lowest name first. Name order — not the
-// informer's map iteration order — decides which pod a hold's evidence
-// names, so re-observing the same wait writes the same record.
-func UnknownPhaseTargetPods(pods []*corev1.Pod, targets map[string]struct{}) []*corev1.Pod {
+// podReadyWithdrawn reports the second shape of a pod its kubelet has
+// stopped reporting, beside phase Unknown: a Running pod whose Ready
+// condition is False while everything its kubelet last wrote says Ready
+// — ContainersReady True and every readiness gate it declares satisfied.
+// The kubelet derives Ready from exactly those inputs, so the combination
+// has one other writer, the node lifecycle controller withdrawing Ready
+// from every pod of a node that stopped heartbeating, and one innocent
+// cause, the kubelet's own lag between a readiness-gate write and the
+// Ready it folds it into. A draining pod is excluded by its gate and a
+// probe failure by ContainersReady; the live Node read tells the two
+// remaining cases apart.
+func podReadyWithdrawn(pod *corev1.Pod) bool {
+	if pod == nil || pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	containersReady, podReady := false, false
+	for _, cond := range pod.Status.Conditions {
+		switch cond.Type {
+		case corev1.ContainersReady:
+			containersReady = cond.Status == corev1.ConditionTrue
+		case corev1.PodReady:
+			podReady = cond.Status == corev1.ConditionTrue
+		}
+	}
+	return containersReady && !podReady && len(unsatisfiedReadinessGates(pod)) == 0
+}
+
+// SilentKubeletTargetPods returns the pods occupying one of the target
+// names whose kubelet has stopped reporting them, lowest name first. A
+// phase-Unknown pod always qualifies. A pod silent only by its withdrawn
+// Ready (podReadyWithdrawn) qualifies only under a force-delete policy:
+// without one no Node is ever read, and only that read separates a dead
+// node from the kubelet's lag behind a readiness-gate write. Name order —
+// not the informer's map iteration order — decides which pod a hold's
+// evidence names, so re-observing the same wait writes the same record.
+func SilentKubeletTargetPods(pods []*corev1.Pod, targets map[string]struct{}, policy *types.ForceDeletePolicy) []*corev1.Pod {
 	if len(pods) == 0 || len(targets) == 0 {
 		return nil
 	}
 	var quiet []*corev1.Pod
 	for _, pod := range pods {
-		if !types.PodPhaseUnknown(pod) {
+		if !types.PodPhaseUnknown(pod) && (policy == nil || !podReadyWithdrawn(pod)) {
 			continue
 		}
 		if _, ok := targets[pod.Name]; ok {
@@ -323,16 +375,16 @@ func UnknownPhaseTargetPods(pods []*corev1.Pod, targets map[string]struct{}) []*
 	return quiet
 }
 
-// SweepFreesUnknownPod reports whether the force-delete sweep will free
-// the name a phase-Unknown pod holds on this pass. It is the sweep's own
-// reading — node death for a pod nobody has asked to delete, the
-// stuck-Terminating classification for one already on its way out — so
-// a hold recorded ahead of the sweep names only the pods the sweep
-// leaves behind. A read error is returned rather than read as "kept":
-// the sweep fails the pass on it too.
-func SweepFreesUnknownPod(ctx context.Context, reader client.Reader, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time) (bool, error) {
+// ReadSilentPod is the force-delete sweep's reading of a pod its kubelet
+// has stopped reporting, taken by the hold ahead of the sweep so a hold
+// names only the pods the sweep leaves behind: node death for a pod
+// nobody has asked to delete, the stuck-Terminating classification for
+// one already on its way out, NotConfigured when there is no policy to
+// read a Node under. A read error is returned rather than read as
+// "kept": the sweep fails the pass on it too.
+func ReadSilentPod(ctx context.Context, reader client.Reader, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time) (TerminatingClass, error) {
 	if policy == nil || pod == nil {
-		return false, nil
+		return NotConfigured, nil
 	}
 	var res TerminatingResult
 	if pod.DeletionTimestamp == nil {
@@ -341,7 +393,28 @@ func SweepFreesUnknownPod(ctx context.Context, reader client.Reader, pod *corev1
 		res = StuckTerminating(ctx, reader, pod, policy, now)
 	}
 	if res.Kind == NodeReadError {
-		return false, fmt.Errorf("node-death evidence for pod %s: node %s read: %w", pod.Name, res.NodeName, res.NodeReadErr)
+		return res.Kind, fmt.Errorf("node-death evidence for pod %s: node %s read: %w", pod.Name, res.NodeName, res.NodeReadErr)
 	}
-	return res.Kind.Actionable(), nil
+	return res.Kind, nil
+}
+
+// SilentPodHeld reports whether a pod the sweep does not free on this
+// reading still holds its name against the rebuild. A phase-Unknown pod
+// does whatever its node says: the kubelet itself stopped vouching for
+// it. A pod silent only by its withdrawn Ready holds the name while its
+// node shows unreachable evidence or is on its way out; on a node posting
+// Ready, or with no node at all, the shape is the kubelet's lag behind a
+// readiness-gate write, and nothing waits on it.
+func SilentPodHeld(pod *corev1.Pod, kind TerminatingClass) bool {
+	if kind.Actionable() {
+		return false
+	}
+	if types.PodPhaseUnknown(pod) {
+		return true
+	}
+	switch kind {
+	case NodeHealthy, Unscheduled:
+		return false
+	}
+	return true
 }

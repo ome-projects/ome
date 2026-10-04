@@ -11,12 +11,14 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// nodeUnknownHold is a name a silent node still holds. Phase Unknown is
-// not terminal — the node stopped reporting and the container may still
-// be running — so recycling the name the way a Failed or Succeeded
-// occupant is recycled would risk two pods of one identity. The name is
-// freed only by the force-delete sweep, on proven node death; until then
-// the row reports the wait instead of spending its deadline in silence.
+// nodeUnknownHold is a name a silent node still holds: a pod in phase
+// Unknown, or one whose Ready the control plane withdrew because its
+// kubelet stopped heartbeating (evidence.SilentKubeletTargetPods). Neither is
+// terminal — the node stopped reporting and the container may still be
+// running — so recycling the name the way a Failed or Succeeded occupant
+// is recycled would risk two pods of one identity. The name is freed only
+// by the force-delete sweep, on proven node death; until then the row
+// reports the wait instead of spending its deadline in silence.
 var nodeUnknownHold = authority{
 	token:  types.WaitingReasonNodeUnknown,
 	mayOwn: anyAttemptOwner,
@@ -32,19 +34,20 @@ var nodeUnknownHold = authority{
 // asks the sweep's own question of every held pod and reports only the
 // names the sweep will leave: a pod force-deleted this pass is a name
 // freed, not a wait, and recording it would park the attempt's deadline
-// for one pass and restart it on the next.
+// for one pass and restart it on the next. A pod whose node posts Ready
+// is the kubelet's own lag, not a wait either.
 func reportNodeUnknown(ctx context.Context, in PassInput, row Row) (reading, error) {
 	own, _, err := in.rowPods(ctx, row)
 	if err != nil {
 		return reading{}, err
 	}
 	var held []*corev1.Pod
-	for _, pod := range evidence.UnknownPhaseTargetPods(own, targetPodNames(in, row)) {
-		frees, err := evidence.SweepFreesUnknownPod(ctx, in.Deps.Reader(), pod, in.Input.ForceDelete, in.Input.Now())
+	for _, pod := range evidence.SilentKubeletTargetPods(own, targetPodNames(in, row), in.Input.ForceDelete) {
+		kind, err := evidence.ReadSilentPod(ctx, in.Deps.Reader(), pod, in.Input.ForceDelete, in.Input.Now())
 		if err != nil {
 			return reading{}, err
 		}
-		if !frees {
+		if evidence.SilentPodHeld(pod, kind) {
 			held = append(held, pod)
 		}
 	}

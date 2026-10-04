@@ -1727,19 +1727,23 @@ func hostnameNotInValues(pod *corev1.Pod) []string {
 
 // Relocation-directive exclusions ride the same required NotIn
 // machinery as the migration overlay: every node on
-// InstancePlan.ExcludedNodes lands as a required hostname NotIn on the
-// rendered pod, so a disposed instance's rebuild is steered off its
-// recorded suspect nodes. An empty list changes nothing.
+// InstancePlan.ExcludedNodes recorded for the revision being rendered
+// lands as a required hostname NotIn on the rendered pod, so a disposed
+// instance's rebuild is steered off its recorded suspect nodes. An empty
+// list changes nothing.
 func TestRender_AppliesExcludedNodes(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
 	runner := workload.RunnerPlan{Name: "default", Size: 1}
 
 	inst := workload.InstancePlan{
 		Index: 0, Incarnation: 1,
-		Runners:       []workload.RunnerPlan{runner},
-		ExcludedNodes: []string{"node-bad-1", "node-bad-2"},
+		Runners: []workload.RunnerPlan{runner},
+		ExcludedNodes: []workload.NodeExclusion{
+			{Node: "node-bad-1", Revision: "svc-engine-abc12345"},
+			{Node: "node-bad-2", Revision: "svc-engine-abc12345"},
+		},
 	}
-	pod, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runner, 0)
+	pod, err := testRenderWithRevision(basicISVC(), basicPodSpec(), nil, plan, inst, runner, 0, "abc12345")
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -1764,6 +1768,52 @@ func TestRender_AppliesExcludedNodes(t *testing.T) {
 	}
 	if vals := hostnameNotInValues(pod); len(vals) != 0 {
 		t.Errorf("no-exclusion render must not add NotIn terms: got %v", vals)
+	}
+}
+
+// TestRender_ExclusionBindsOnlyItsRevision pins the scope of a recorded
+// exclusion: it was evidence about one revision on one node, so a rebuild
+// at that revision renders the NotIn term and a rebuild at any other
+// revision — the fix the operator pushes next — renders none and lands
+// wherever there is room, the blamed node included. An exclusion with no
+// revision, or a render with none, binds nothing.
+func TestRender_ExclusionBindsOnlyItsRevision(t *testing.T) {
+	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
+	runner := workload.RunnerPlan{Name: "default", Size: 1}
+	inst := workload.InstancePlan{
+		Index: 0, Incarnation: 1,
+		Runners:       []workload.RunnerPlan{runner},
+		ExcludedNodes: []workload.NodeExclusion{{Node: "node-a", Revision: "svc-engine-11111111"}},
+	}
+	for _, tc := range []struct {
+		name         string
+		revisionHash string
+		wantExcluded bool
+	}{
+		{"the revision the exclusion was recorded for", "11111111", true},
+		{"the corrected revision pushed after it", "22222222", false},
+		{"a render with no revision", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod, err := testRenderWithRevision(basicISVC(), basicPodSpec(), nil, plan, inst, runner, 0, tc.revisionHash)
+			if err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			got := hostnameNotInValues(pod)
+			if excluded := len(got) == 1 && got[0] == "node-a"; excluded != tc.wantExcluded {
+				t.Errorf("NotIn values: got %v want excluded=%v", got, tc.wantExcluded)
+			}
+		})
+	}
+
+	legacy := inst
+	legacy.ExcludedNodes = []workload.NodeExclusion{{Node: "node-a"}}
+	pod, err := testRenderWithRevision(basicISVC(), basicPodSpec(), nil, plan, legacy, runner, 0, "11111111")
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := hostnameNotInValues(pod); len(got) != 0 {
+		t.Errorf("an exclusion recorded for no revision must bind nothing: got %v", got)
 	}
 }
 

@@ -1,5 +1,5 @@
 // Internal-package tests for workload.Migrate's private helpers
-// (validateFromNode, etc.) that aren't reachable from outside the
+// (resolveSourceNode, etc.) that aren't reachable from outside the
 // workload/ops package. The end-to-end TestMigrate_* lifecycle tests
 // (status.migrations-driven, single-pod + gang) live below.
 
@@ -18,6 +18,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -56,10 +57,10 @@ func (r *countingPodReader) List(ctx context.Context, list client.ObjectList, op
 	return r.Reader.List(ctx, list, opts...)
 }
 
-// vfnFixture builds the input + deps + plan a validateFromNode test
-// reads — a single-pod engine workload selecting pods labelled with
-// the canonical ISVC pod-label-key seed.
-func vfnFixture(t *testing.T, pods ...*corev1.Pod) (workload.Deps, workload.ReconcileInput, workload.ComponentPlan) {
+// sourceNodeFixture builds the input + deps + plan a resolveSourceNode
+// test reads — a single-pod engine workload selecting pods labelled
+// with the canonical ISVC pod-label-key seed.
+func sourceNodeFixture(t *testing.T, pods ...*corev1.Pod) (workload.Deps, workload.ReconcileInput, workload.ComponentPlan) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -85,10 +86,10 @@ func vfnFixture(t *testing.T, pods ...*corev1.Pod) (workload.Deps, workload.Reco
 	return workload.Deps{Client: c}, input, plan
 }
 
-// vfnPod fabricates a pod under the validateFromNode selector with the
-// given NodeName. Always Instance idx=0 — every validateFromNode test
-// drives source index 0.
-func vfnPod(nodeName string) *corev1.Pod {
+// sourceNodePod fabricates a pod under the resolveSourceNode selector
+// with the given NodeName. Always Instance idx=0 — every
+// resolveSourceNode test drives source index 0.
+func sourceNodePod(nodeName string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "llama-70b-engine-0-default-0",
@@ -110,43 +111,46 @@ func vfnPod(nodeName string) *corev1.Pod {
 	}
 }
 
-func TestValidateFromNode_MatchOK(t *testing.T) {
-	deps, input, plan := vfnFixture(t, vfnPod("node5"))
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+func TestResolveSourceNode_MatchKeepsTheRequestedNode(t *testing.T) {
+	deps, input, plan := sourceNodeFixture(t, sourceNodePod("node5"))
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
-	if defer_ || mismatch != "" {
-		t.Errorf("expected pass; got mismatch=%q defer=%v", mismatch, defer_)
+	if defer_ || rejection != "" || node != "node5" {
+		t.Errorf("expected the requested node; got node=%q rejection=%q defer=%v", node, rejection, defer_)
 	}
 }
 
-func TestValidateFromNode_MismatchRejected(t *testing.T) {
-	deps, input, plan := vfnFixture(t, vfnPod("node7"))
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+// The Instance was rebuilt on node7 since the requester saw it on
+// node5: the move leaves node7, so the surge is kept off the node the
+// Instance occupies rather than one it already left.
+func TestResolveSourceNode_MismatchAnchorsToTheObservedNode(t *testing.T) {
+	deps, input, plan := sourceNodeFixture(t, sourceNodePod("node7"))
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
-	if defer_ {
-		t.Errorf("scheduled pod on different node must be a rejection, not a defer")
+	if defer_ || rejection != "" {
+		t.Errorf("a scheduled pod on another node is neither a defer nor a rejection; got rejection=%q defer=%v", rejection, defer_)
 	}
-	if mismatch == "" {
-		t.Errorf("expected mismatch reason")
+	if node != "node7" {
+		t.Errorf("node = %q, want the observed node7", node)
 	}
 }
 
-func TestValidateFromNodeUsesAuthoritativePodsAndFailsClosed(t *testing.T) {
-	deps, input, plan := vfnFixture(t, vfnPod("stale-node"))
-	liveDeps, _, _ := vfnFixture(t, vfnPod("live-node"))
+func TestResolveSourceNodeUsesAuthoritativePodsAndFailsClosed(t *testing.T) {
+	deps, input, plan := sourceNodeFixture(t, sourceNodePod("stale-node"))
+	liveDeps, _, _ := sourceNodeFixture(t, sourceNodePod("live-node"))
 	reader := &countingPodReader{Reader: liveDeps.Client}
 	deps.APIReader = reader
 	input.ObservedState.InstanceStatuses = []workload.InstanceStatus{{
 		Index: 0, NodesOccupied: []string{"persisted-node"},
 	}}
 
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "live-node")
-	if err != nil || defer_ || mismatch != "" {
-		t.Fatalf("authoritative Pod node should pass: mismatch=%q defer=%v err=%v", mismatch, defer_, err)
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "live-node")
+	if err != nil || defer_ || rejection != "" || node != "live-node" {
+		t.Fatalf("authoritative Pod node should pass: node=%q rejection=%q defer=%v err=%v", node, rejection, defer_, err)
 	}
 	if reader.lists != 1 {
 		t.Fatalf("authoritative Pod lists: got %d want 1", reader.lists)
@@ -155,52 +159,52 @@ func TestValidateFromNodeUsesAuthoritativePodsAndFailsClosed(t *testing.T) {
 	failure := errors.New("list failed")
 	reader = &countingPodReader{Reader: liveDeps.Client, err: failure}
 	deps.APIReader = reader
-	mismatch, defer_, err = validateFromNode(context.Background(), deps, input, plan, 0, "live-node")
-	if !errors.Is(err, failure) || defer_ || mismatch != "" {
-		t.Fatalf("authoritative read failure must fail closed: mismatch=%q defer=%v err=%v", mismatch, defer_, err)
+	node, defer_, rejection, err = resolveSourceNode(context.Background(), deps, input, plan, 0, "live-node")
+	if !errors.Is(err, failure) || defer_ || rejection != "" || node != "" {
+		t.Fatalf("authoritative read failure must fail closed: node=%q rejection=%q defer=%v err=%v", node, rejection, defer_, err)
 	}
 	if reader.lists != 1 {
 		t.Fatalf("failed authoritative Pod lists: got %d want 1", reader.lists)
 	}
 }
 
-func TestValidateFromNode_UnscheduledDefers(t *testing.T) {
-	// Pod exists but Spec.NodeName is empty. Defer rather than reject —
+func TestResolveSourceNode_UnscheduledDefers(t *testing.T) {
+	// Pod exists but Spec.NodeName is empty. Defer rather than decide —
 	// the next reconcile re-polls.
-	deps, input, plan := vfnFixture(t, vfnPod(""))
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+	deps, input, plan := sourceNodeFixture(t, sourceNodePod(""))
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
 	if !defer_ {
-		t.Errorf("unscheduled pod must defer; got mismatch=%q defer=%v", mismatch, defer_)
+		t.Errorf("unscheduled pod must defer; got node=%q rejection=%q defer=%v", node, rejection, defer_)
 	}
-	if mismatch != "" {
-		t.Errorf("defer must not carry a rejection reason; got %q", mismatch)
+	if rejection != "" || node != "" {
+		t.Errorf("a defer carries neither a node nor a rejection; got node=%q rejection=%q", node, rejection)
 	}
 }
 
-func TestValidateFromNode_NoLivePodsRejects(t *testing.T) {
-	// Source instance has no pods at all — a rejection (the migration
-	// requester can't legitimately request a migration of a
-	// non-existent instance).
-	deps, input, plan := vfnFixture(t)
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+func TestResolveSourceNode_NoLivePodsRejects(t *testing.T) {
+	// Source instance has no pods at all — a rejection (there is no
+	// node to leave).
+	deps, input, plan := sourceNodeFixture(t)
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
 	if defer_ {
 		t.Errorf("no live pods must reject, not defer")
 	}
-	if mismatch == "" {
-		t.Errorf("expected mismatch reason for no-live-pods")
+	if rejection == "" || node != "" {
+		t.Errorf("expected a rejection and no node for no-live-pods; got node=%q rejection=%q", node, rejection)
 	}
 }
 
-// vfnTerminatingPod is vfnPod pinned Terminating (finalizer so the
-// fake client stores the DeletionTimestamp) under a distinct name.
-func vfnTerminatingPod(name, nodeName string) *corev1.Pod {
-	pod := vfnPod(nodeName)
+// sourceNodeTerminatingPod is sourceNodePod pinned Terminating
+// (finalizer so the fake client stores the DeletionTimestamp) under a
+// distinct name.
+func sourceNodeTerminatingPod(name, nodeName string) *corev1.Pod {
+	pod := sourceNodePod(nodeName)
 	pod.Name = name
 	dt := metav1.NewTime(time.Now())
 	pod.DeletionTimestamp = &dt
@@ -208,43 +212,43 @@ func vfnTerminatingPod(name, nodeName string) *corev1.Pod {
 	return pod
 }
 
-func TestValidateFromNode_TerminatingPodIgnored(t *testing.T) {
+func TestResolveSourceNode_TerminatingPodIgnored(t *testing.T) {
 	// Recreate churn leaves the old pod Terminating on another node
 	// beside the live replacement — only the live pod decides. Counting
 	// the Terminating pod would reject with "span multiple nodes".
-	deps, input, plan := vfnFixture(t, vfnPod("node5"), vfnTerminatingPod("llama-70b-engine-0-default-0-prev", "node7"))
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+	deps, input, plan := sourceNodeFixture(t, sourceNodePod("node5"), sourceNodeTerminatingPod("llama-70b-engine-0-default-0-prev", "node7"))
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
-	if defer_ || mismatch != "" {
-		t.Errorf("Terminating pod must be ignored; got mismatch=%q defer=%v", mismatch, defer_)
+	if defer_ || rejection != "" || node != "node5" {
+		t.Errorf("Terminating pod must be ignored; got node=%q rejection=%q defer=%v", node, rejection, defer_)
 	}
 }
 
-func TestValidateFromNode_AllTerminatingDefers(t *testing.T) {
+func TestResolveSourceNode_AllTerminatingDefers(t *testing.T) {
 	// Every pod Terminating is transient (replacements pending) —
 	// defer, never a permanent rejection.
-	deps, input, plan := vfnFixture(t, vfnTerminatingPod("llama-70b-engine-0-default-0", "node5"))
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+	deps, input, plan := sourceNodeFixture(t, sourceNodeTerminatingPod("llama-70b-engine-0-default-0", "node5"))
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
 	if !defer_ {
-		t.Errorf("all-Terminating source must defer; got mismatch=%q defer=%v", mismatch, defer_)
+		t.Errorf("all-Terminating source must defer; got node=%q rejection=%q defer=%v", node, rejection, defer_)
 	}
-	if mismatch != "" {
-		t.Errorf("defer must not carry a rejection reason; got %q", mismatch)
+	if rejection != "" || node != "" {
+		t.Errorf("a defer carries neither a node nor a rejection; got node=%q rejection=%q", node, rejection)
 	}
 }
 
-// vfnGangFixture is vfnFixture for a multi-node (gang) Instance: the
-// plan carries an InstancePlan at idx=0 with leader + worker Runners so
-// isMultiPodInstance(plan, 0) is true and validateFromNode takes the
-// gang-aware branch.
-func vfnGangFixture(t *testing.T, pods ...*corev1.Pod) (workload.Deps, workload.ReconcileInput, workload.ComponentPlan) {
+// sourceNodeGangFixture is sourceNodeFixture for a multi-node (gang)
+// Instance: the plan carries an InstancePlan at idx=0 with leader +
+// worker Runners so isMultiPodInstance(plan, 0) is true and
+// resolveSourceNode takes the gang-aware branch.
+func sourceNodeGangFixture(t *testing.T, pods ...*corev1.Pod) (workload.Deps, workload.ReconcileInput, workload.ComponentPlan) {
 	t.Helper()
-	deps, input, plan := vfnFixture(t, pods...)
+	deps, input, plan := sourceNodeFixture(t, pods...)
 	plan.Instances = []workload.InstancePlan{{
 		Index:       0,
 		Incarnation: 1,
@@ -256,91 +260,81 @@ func vfnGangFixture(t *testing.T, pods ...*corev1.Pod) (workload.Deps, workload.
 	return deps, input, plan
 }
 
-// vfnGangPod fabricates a gang member pod (leader/worker) for Instance
-// idx=0 on the given node. Pod listing is purely label-based on
-// instance-index, so leader + worker share idx=0 and are returned
+// sourceNodeGangPod fabricates a gang member pod (leader/worker) for
+// Instance idx=0 on the given node. Pod listing is purely label-based
+// on instance-index, so leader + worker share idx=0 and are returned
 // together by LiveListPodsForInstance even when scheduled to different
 // nodes.
-func vfnGangPod(runner, nodeName string) *corev1.Pod {
-	p := vfnPod(nodeName)
+func sourceNodeGangPod(runner, nodeName string) *corev1.Pod {
+	p := sourceNodePod(nodeName)
 	p.Name = "llama-70b-engine-0-" + runner + "-0"
 	p.Labels[query.LabelRunner] = runner
 	return p
 }
 
-// TestValidateFromNode_GangSpanningNodesNotRejected pins that a
-// multi-node gang Instance's pods span nodes BY DESIGN (leader + worker
-// land on different nodes), so a migration whose FromNode hosts one of
-// them must NOT be rejected. Rejecting any source whose pods span nodes
-// would wrongly fail every gang migration that isn't co-located on a
-// single node.
-func TestValidateFromNode_GangSpanningNodesNotRejected(t *testing.T) {
-	deps, input, plan := vfnGangFixture(t,
-		vfnGangPod("leader", "node5"),
-		vfnGangPod("worker", "node8"),
+// A multi-node gang Instance's pods span nodes BY DESIGN (leader +
+// worker land on different nodes), so a request whose FromNode hosts
+// one of them keeps that node: either member's node is a valid
+// evacuation target for the whole-gang surge.
+func TestResolveSourceNode_GangSpanningNodesKeepsTheRequestedMember(t *testing.T) {
+	deps, input, plan := sourceNodeGangFixture(t,
+		sourceNodeGangPod("leader", "node5"),
+		sourceNodeGangPod("worker", "node8"),
 	)
-	// FromNode = the leader's node; the gang spans node5 + node8.
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
-	if defer_ {
-		t.Errorf("gang with a scheduled pod on FromNode must not defer")
-	}
-	if mismatch != "" {
-		t.Errorf("gang spanning nodes with a pod on FromNode must pass; got mismatch=%q", mismatch)
+	if defer_ || rejection != "" || node != "node5" {
+		t.Errorf("FromNode=leader node must be kept; got node=%q rejection=%q defer=%v", node, rejection, defer_)
 	}
 
-	// FromNode = the worker's node also passes — either member's node is a
-	// valid evacuation target for the whole-gang surge.
-	mismatch, defer_, err = validateFromNode(context.Background(), deps, input, plan, 0, "node8")
+	node, defer_, rejection, err = resolveSourceNode(context.Background(), deps, input, plan, 0, "node8")
 	if err != nil {
-		t.Fatalf("validateFromNode (worker node): %v", err)
+		t.Fatalf("resolveSourceNode (worker node): %v", err)
 	}
-	if defer_ || mismatch != "" {
-		t.Errorf("FromNode=worker node must pass; got mismatch=%q defer=%v", mismatch, defer_)
+	if defer_ || rejection != "" || node != "node8" {
+		t.Errorf("FromNode=worker node must be kept; got node=%q rejection=%q defer=%v", node, rejection, defer_)
 	}
 }
 
-// TestValidateFromNode_GangFromNodeAbsentRejected pins that a stale
-// request — FromNode hosting none of the gang's pods (the gang has since
-// moved off that node) — is still a rejection, so the surge's
-// NotIn[FromNode] can't silently no-op against a node the gang no longer
-// occupies.
-func TestValidateFromNode_GangFromNodeAbsentRejected(t *testing.T) {
-	deps, input, plan := vfnGangFixture(t,
-		vfnGangPod("leader", "node5"),
-		vfnGangPod("worker", "node8"),
+// The gang has moved off node99 since the request. The whole gang moves
+// anyway, so the move leaves the routable member's node, whichever
+// order the pods list in.
+func TestResolveSourceNode_GangOffTheRequestedNodeAnchorsToTheLeader(t *testing.T) {
+	deps, input, plan := sourceNodeGangFixture(t,
+		sourceNodeGangPod("worker", "node8"),
+		sourceNodeGangPod("leader", "node5"),
 	)
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node99")
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node99")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
-	if defer_ {
-		t.Errorf("FromNode absent from a fully-scheduled gang must reject, not defer")
+	if defer_ || rejection != "" {
+		t.Errorf("FromNode absent from a fully-scheduled gang is neither a defer nor a rejection; got rejection=%q defer=%v", rejection, defer_)
 	}
-	if mismatch == "" {
-		t.Errorf("expected a rejection reason when FromNode hosts no gang pod")
+	if node != "node5" {
+		t.Errorf("node = %q, want the leader's node5", node)
 	}
 }
 
-// TestValidateFromNode_GangUnscheduledDefers pins that the fresh-request
-// defer guard survives in the gang branch: an unscheduled gang member
-// defers (re-validated next reconcile) rather than rejecting.
-func TestValidateFromNode_GangUnscheduledDefers(t *testing.T) {
-	deps, input, plan := vfnGangFixture(t,
-		vfnGangPod("leader", "node5"),
-		vfnGangPod("worker", ""), // worker not scheduled yet
+// The fresh-request defer guard survives in the gang branch: an
+// unscheduled gang member defers (re-resolved next reconcile) rather
+// than deciding.
+func TestResolveSourceNode_GangUnscheduledDefers(t *testing.T) {
+	deps, input, plan := sourceNodeGangFixture(t,
+		sourceNodeGangPod("leader", "node5"),
+		sourceNodeGangPod("worker", ""), // worker not scheduled yet
 	)
-	mismatch, defer_, err := validateFromNode(context.Background(), deps, input, plan, 0, "node5")
+	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
 	if err != nil {
-		t.Fatalf("validateFromNode: %v", err)
+		t.Fatalf("resolveSourceNode: %v", err)
 	}
 	if !defer_ {
-		t.Errorf("unscheduled gang member must defer; got mismatch=%q defer=%v", mismatch, defer_)
+		t.Errorf("unscheduled gang member must defer; got node=%q rejection=%q defer=%v", node, rejection, defer_)
 	}
-	if mismatch != "" {
-		t.Errorf("defer must not carry a rejection reason; got %q", mismatch)
+	if rejection != "" || node != "" {
+		t.Errorf("a defer carries neither a node nor a rejection; got node=%q rejection=%q", node, rejection)
 	}
 }
 
@@ -372,13 +366,14 @@ func TestSurgeRevisionAndSpec_ReturnsGangWorkerSpec(t *testing.T) {
 	}
 
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
-	gotCR, gotLeader, gotWorker, err := surgeRevisionAndSpec(context.Background(), legacyTestDeps(c), input, 0)
+	gotCR, gotPayload, err := surgeRevisionAndSpec(context.Background(), legacyTestDeps(c), input, 0)
 	if err != nil {
 		t.Fatalf("surgeRevisionAndSpec: %v", err)
 	}
-	if gotCR == nil || gotLeader == nil {
-		t.Fatalf("expected CR + leader spec, got cr=%v leader=%v", gotCR, gotLeader)
+	if gotCR == nil || gotPayload == nil || gotPayload.PodSpec == nil {
+		t.Fatalf("expected CR + leader spec, got cr=%v payload=%+v", gotCR, gotPayload)
 	}
+	gotWorker := gotPayload.WorkerPodSpec
 	if gotWorker == nil {
 		t.Fatalf("expected a worker spec for a gang revision, got nil")
 	}
@@ -467,6 +462,13 @@ type migFixture struct {
 	// finalizeInstanceResources models per-Instance cleanup owned by the IR
 	// adapter. When set, the fixture also wires the guarded batch status writer.
 	finalizeInstanceResources func(context.Context, int32) (bool, error)
+	// target is the roll target the pass runs under. nil is a Component
+	// whose template has not moved since the source's revision was minted.
+	target *appsv1.ControllerRevision
+	// desiredPodSpec and desiredPodMeta, when set, are the current template
+	// the roll target renders: a push in flight while the migration runs.
+	desiredPodSpec *corev1.PodSpec
+	desiredPodMeta *metav1.ObjectMeta
 }
 
 // deps builds the fixture's workload.Deps (clock and recorder included
@@ -613,6 +615,15 @@ func (f *migFixture) input(t *testing.T) workload.ReconcileInput {
 	in.MutateInstance = f.mutateInstance()
 	in.RemoveInstance = legacyRemoveInstance(f.c, f.isvc, f.component)
 	in.DesiredSpec.GangSchedulingAvailable = f.gangSched
+	if f.desiredPodSpec != nil {
+		in.DesiredSpec.PodSpec = f.desiredPodSpec
+	}
+	if f.desiredPodMeta != nil {
+		in.DesiredSpec.PodTemplateObjectMeta = f.desiredPodMeta
+	}
+	if f.target != nil {
+		in.ObservedState.UpdateRevision = f.target.Name
+	}
 	in.Clock = f.clk
 	in.ForceDelete = f.forceDelete
 	in.StuckPodGrace = f.stuckPodGrace
@@ -805,7 +816,7 @@ func (f *migFixture) passResult(t *testing.T, uuid string) (done, accepted bool,
 		Reason:          rec.Reason,
 	}
 	in := f.input(t)
-	return Migrate(context.Background(), f.deps(), in, f.plan, rec.SourceInstance, uuid, req)
+	return Migrate(context.Background(), f.deps(), in, f.plan, f.target, rec.SourceInstance, uuid, req)
 }
 
 func (f *migFixture) listPods(t *testing.T) []*corev1.Pod {
@@ -1639,7 +1650,7 @@ func TestMigrate_CompletionTailRecoveryRechecksAuthoritativeAbsence(t *testing.T
 		FromNode:      record.FromNode,
 		Reason:        record.Reason,
 	}
-	done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, record.SourceInstance, uuid, req)
+	done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, f.target, record.SourceInstance, uuid, req)
 	if err != nil || done || !accepted {
 		t.Fatalf("drift pass: done=%v accepted=%v err=%v", done, accepted, err)
 	}
@@ -1670,7 +1681,7 @@ func TestMigrate_CompletionTailRecoveryRechecksAuthoritativeAbsence(t *testing.T
 func TestMigrate_EntryLifecycle_Gang(t *testing.T) {
 	f := newGangMigFixture(t)
 	const uuid = "mig-gang-1"
-	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-b")} // a worker's node — gang-aware validateFromNode accepts any member's node
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-b")} // a worker's node — gang-aware resolveSourceNode keeps any member's node
 
 	// Pass 1: allocation + stamps, then the gang PodGroup requeue —
 	// NO surge pods yet (EnsurePodGroups must see the pinned index
@@ -1830,17 +1841,6 @@ func TestMigrate_ResumeAfterCrash_Draining(t *testing.T) {
 // rejection path and asserts the record lands Phase=Failed with the
 // rejection reason and CompletedAt, plus the terminal ledger row.
 func TestMigrate_Rejections_RecordFailed(t *testing.T) {
-	t.Run("from-node-mismatch", func(t *testing.T) {
-		f := newSinglePodMigFixture(t)
-		const uuid = "mig-reject-node"
-		f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-WRONG")}
-		done, accepted := f.pass(t, uuid)
-		if !done || !accepted {
-			t.Fatalf("rejection must be terminal: done=%v accepted=%v", done, accepted)
-		}
-		assertRecordFailed(t, f, uuid, "does not match observed source node")
-	})
-
 	t.Run("source-missing", func(t *testing.T) {
 		f := newSinglePodMigFixture(t)
 		const uuid = "mig-reject-missing"
@@ -2316,7 +2316,7 @@ func migPassWithRejectedCreates(t *testing.T, f *migFixture, uuid string, reject
 	for i := 0; i < 5; i++ {
 		var accepted bool
 		var err error
-		done, accepted, err = Migrate(context.Background(), deps, in, f.plan, rec.SourceInstance, uuid, req)
+		done, accepted, err = Migrate(context.Background(), deps, in, f.plan, f.target, rec.SourceInstance, uuid, req)
 		if err != nil {
 			t.Fatalf("Migrate over a rejected create: %v", err)
 		}
@@ -2485,6 +2485,95 @@ func TestMigrate_RevisionRetargetIsDeclinedWhileTheRecordDrives(t *testing.T) {
 	}
 }
 
+// TestMigrate_SurgeRendersTheSourceRevisionWhileTheTemplateHasMoved: a
+// migration moves an Instance, never its revision. Filed while a roll is
+// rotating the Component — the current template is already the new
+// revision's, with an image and a pod-template annotation the source's
+// revision never carried — the surge renders the source revision's stored
+// template and stamps its hash, so the per-revision Service selecting on
+// that hash routes to a pod running that revision, and the roll takes the
+// moved Instance to the new revision afterwards like any other row. The
+// promoted surge records the source revision.
+func TestMigrate_SurgeRendersTheSourceRevisionWhileTheTemplateHasMoved(t *testing.T) {
+	f := newMultiInstanceMigFixture(t, 3)
+	f.recorder = record.NewFakeRecorder(64)
+	source := findInstanceStatusOnIRForFixture(t, f, 2)
+	sourceRevision := &appsv1.ControllerRevision{}
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: source.RunningRevision}, sourceRevision); err != nil {
+		t.Fatalf("get the source revision: %v", err)
+	}
+
+	// The operator pushes a new revision while every Instance still runs
+	// the source's: a new image and a pod-template annotation the source
+	// revision never carried.
+	const releaseAnnotation = "example.com/release"
+	nextSpec := legacyTargetSpecImage("llama:v2")
+	nextMeta := &metav1.ObjectMeta{Annotations: map[string]string{releaseAnnotation: "v2"}}
+	f.target = legacyEnsureTargetCRWithMeta(t, f.c, f.isvc, nextSpec, nextMeta)
+	f.desiredPodSpec = nextSpec
+	f.desiredPodMeta = nextMeta
+
+	const uuid = "mig-mid-roll"
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 2, "node-a")}
+
+	if done, accepted := f.pass(t, uuid); done || !accepted {
+		t.Fatalf("pass 1: got done=%v accepted=%v, want the surge in flight", done, accepted)
+	}
+	surgePod := &corev1.Pod{}
+	surgePodName := query.PodName(f.isvc.Name, f.component, 3, "default", 0)
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: surgePodName}, surgePod); err != nil {
+		t.Fatalf("the surge pod must exist after pass 1: %v", err)
+	}
+	requirePodRendersRevision(t, surgePod, sourceRevision)
+	if got, ok := surgePod.Annotations[releaseAnnotation]; ok {
+		t.Fatalf("surge pod carries %s=%q, an annotation the new revision added, while labelled with the source revision %s",
+			releaseAnnotation, got, sourceRevision.Name)
+	}
+
+	f.react(t)
+	f.drive(t, uuid, 10)
+	surge := findInstanceStatusOnIRForFixture(t, f, 3)
+	if surge == nil || surge.Phase != v1beta1.OMENativeInstanceReady || surge.RunningRevision != sourceRevision.Name {
+		t.Fatalf("promoted surge = %+v, want Ready on the source revision %s", surge, sourceRevision.Name)
+	}
+	events := drainEvents(f.recorder)
+	if want := fmt.Sprintf("instance=3 (revision=%s)", sourceRevision.Name); !anyContains(events, want) {
+		t.Fatalf("no MigrationCompleted event naming the source revision; events = %v", events)
+	}
+}
+
+// requirePodRendersRevision asserts pod is revision rev end to end: rev's
+// hash on its revision label, rev's image in its runner container, and
+// every label and annotation rev records. A pod whose label and template
+// name different revisions is routed, counted and drained as one revision
+// while running another.
+func requirePodRendersRevision(t *testing.T, pod *corev1.Pod, rev *appsv1.ControllerRevision) {
+	t.Helper()
+	payload, err := revision.PayloadFromControllerRevision(rev)
+	if err != nil || payload == nil || payload.PodSpec == nil {
+		t.Fatalf("revision %s records no pod template: %v", rev.Name, err)
+	}
+	if got, want := pod.Labels[query.LabelRevisionHash], query.RevisionOf(rev).Hash(); got != want {
+		t.Fatalf("pod %s revision label = %q, want %q", pod.Name, got, want)
+	}
+	if got, want := pod.Spec.Containers[0].Image, payload.PodSpec.Containers[0].Image; got != want {
+		t.Fatalf("pod %s labelled %s runs image %q, want %q", pod.Name, rev.Name, got, want)
+	}
+	if payload.PodMeta == nil {
+		return
+	}
+	for key, want := range payload.PodMeta.Labels {
+		if got := pod.Labels[key]; got != want {
+			t.Fatalf("pod %s label %s=%q, want %q as revision %s records", pod.Name, key, got, want, rev.Name)
+		}
+	}
+	for key, want := range payload.PodMeta.Annotations {
+		if got := pod.Annotations[key]; got != want {
+			t.Fatalf("pod %s annotation %s=%q, want %q as revision %s records", pod.Name, key, got, want, rev.Name)
+		}
+	}
+}
+
 // TestMigrate_SecondRequestQueuesBehindTheInFlightPair: dispatch is
 // serial and oldest-first, so a second request that arrives while a pair
 // is in flight sits in status.migrations as a queued Accepted record. It
@@ -2557,7 +2646,7 @@ func TestMigrate_StatusConflictCostsAPassAndReDerives(t *testing.T) {
 		FromNode:      rec.FromNode,
 		Reason:        rec.Reason,
 	}
-	_, _, _ = Migrate(context.Background(), f.deps(), in, f.plan, rec.SourceInstance, uuid, req)
+	_, _, _ = Migrate(context.Background(), f.deps(), in, f.plan, f.target, rec.SourceInstance, uuid, req)
 
 	if got := f.record(t, uuid); got.Phase.Terminal() {
 		t.Fatalf("a conflict closed the record: %+v", *got)
@@ -2757,7 +2846,7 @@ func TestMigrate_DrainRejectsAuthoritativePairDrift(t *testing.T) {
 			})
 			wantEffects := snapshotMigrationEffects(t, f)
 
-			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, 0, uuid, migrationRequest(t, f, uuid))
+			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, f.target, 0, uuid, migrationRequest(t, f, uuid))
 			if err != nil || done || !accepted {
 				t.Fatalf("guarded drain: done=%v accepted=%v err=%v", done, accepted, err)
 			}
@@ -2826,7 +2915,7 @@ func TestMigrate_InitialPairStampRejectsAuthoritativeDrift(t *testing.T) {
 				return nil
 			}
 
-			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, 0, uuid, migrationRequest(t, f, uuid))
+			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, f.target, 0, uuid, migrationRequest(t, f, uuid))
 			if err != nil || done || !accepted {
 				t.Fatalf("guarded initial stamp: done=%v accepted=%v err=%v", done, accepted, err)
 			}
@@ -2901,7 +2990,7 @@ func TestMigrate_PromotionRejectsPairDriftAfterDrainClaim(t *testing.T) {
 				return err
 			}
 
-			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, 0, uuid, migrationRequest(t, f, uuid))
+			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, f.target, 0, uuid, migrationRequest(t, f, uuid))
 			if err != nil || done || !accepted {
 				t.Fatalf("guarded promotion: done=%v accepted=%v err=%v", done, accepted, err)
 			}
@@ -2961,7 +3050,7 @@ func TestMigrate_CompletionRecoveryRejectsAuthoritativeTargetDrift(t *testing.T)
 			})
 			wantEffects := snapshotMigrationEffects(t, f)
 
-			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, 0, uuid, migrationRequest(t, f, uuid))
+			done, accepted, err := Migrate(context.Background(), f.deps(), input, f.plan, f.target, 0, uuid, migrationRequest(t, f, uuid))
 			if err != nil || done || !accepted {
 				t.Fatalf("guarded completion recovery: done=%v accepted=%v err=%v", done, accepted, err)
 			}
@@ -3605,6 +3694,84 @@ func TestMigrate_WedgedSourcePodLeavesTheMigrationDriving(t *testing.T) {
 	}
 }
 
+// TestMigrate_SourceTeardownStalled_ParksThenCompletesOnRemoval: once
+// the drive has deleted the source pods, a kubelet that does not remove
+// them past their own deadline parks the migration. The record keeps its
+// Draining phase and its serving surge, carries the reason once, and one
+// Warning names the pod; a pod still inside its own grace parks nothing.
+// The wait is tended, not abandoned: the same drive completes the move
+// as soon as the pod is gone.
+func TestMigrate_SourceTeardownStalled_ParksThenCompletesOnRemoval(t *testing.T) {
+	f := newSinglePodMigFixture(t)
+	clk := f.withFakeClock()
+	f.recorder = record.NewFakeRecorder(16)
+	const uuid = "mig-parked-teardown"
+	f.records = []workload.MigrationRecord{
+		mkMigRecordWithDeadline(uuid, 0, "node-a", clk.Now().Add(4*time.Hour)),
+	}
+	driveToDrainingDrainIncomplete(t, f, uuid)
+	f.react(t) // drain settles — the tail is one delete away
+	migWedgeEvents(t, f)
+
+	// The source pod wedges Terminating (finalizer-pinned so the fake
+	// client keeps the object, as a dead node's kubelet would). The
+	// fixture clock is set inside the pod's own grace first.
+	srcPod := terminatingPod(t, f.c, migPodsForInstance(t, f, 0)[0])
+	clk.SetTime(srcPod.DeletionTimestamp.Add(-30 * time.Second))
+	before := f.record(t, uuid).Message
+	if done, accepted := f.pass(t, uuid); done || !accepted {
+		t.Fatalf("inside the grace: got done=%v accepted=%v, want in-flight", done, accepted)
+	}
+	if got := f.record(t, uuid); got.Message != before {
+		t.Fatalf("a pod inside its own grace parks nothing; message went from %q to %q", before, got.Message)
+	}
+	if events := migWedgeEvents(t, f); len(events) != 0 {
+		t.Fatalf("a pod inside its own grace raises no event; got %v", events)
+	}
+
+	// Past the pod's deadline the record parks: reason stamped, one
+	// Warning, phase and surge untouched — and the next pass adds nothing.
+	clk.Step(time.Minute)
+	for i := 0; i < 2; i++ {
+		if done, accepted := f.pass(t, uuid); done || !accepted {
+			t.Fatalf("parked pass %d: got done=%v accepted=%v, want in-flight", i+1, done, accepted)
+		}
+	}
+	rec := f.record(t, uuid)
+	if rec.Phase != workload.MigrationPhaseDraining {
+		t.Fatalf("a parked record keeps its phase; got %+v", *rec)
+	}
+	for _, want := range []string{"parked on source teardown", srcPod.Name, "no forceDelete policy"} {
+		if !strings.Contains(rec.Message, want) {
+			t.Errorf("record message %q must name %q", rec.Message, want)
+		}
+	}
+	events := migWedgeEvents(t, f)
+	if n := countEventsWithReason(events, workload.EventReasonMigrationParked); n != 1 || len(events) != 1 {
+		t.Fatalf("parking announces itself exactly once; got %v", events)
+	}
+	if surge := findInstanceStatusOnIRForFixture(t, f, 1); surge == nil || surge.Operation == nil || surge.Operation.RequestUUID != uuid {
+		t.Fatalf("the serving surge stays pinned to the parked migration; got %+v", surge)
+	}
+	if len(migPodsForInstance(t, f, 1)) != 1 {
+		t.Fatalf("the serving surge pod must survive the park")
+	}
+
+	// The kubelet finally removes the pod: the same drive completes.
+	live := &corev1.Pod{}
+	if err := f.c.Get(context.Background(), client.ObjectKeyFromObject(srcPod), live); err != nil {
+		t.Fatalf("re-read the parked source pod: %v", err)
+	}
+	live.Finalizers = nil
+	if err := f.c.Update(context.Background(), live); err != nil {
+		t.Fatalf("release the parked source pod: %v", err)
+	}
+	f.drive(t, uuid, 6)
+	if rec := f.record(t, uuid); rec.Phase != workload.MigrationPhaseCompleted {
+		t.Fatalf("the parked migration completes once its source pod is gone; got %+v", *rec)
+	}
+}
+
 // One wedged member is enough for a gang surge: the whole replacement
 // can never be admitted, so the record closes on that member's evidence
 // and the gang source goes back to serving intact.
@@ -3693,39 +3860,62 @@ func TestMigrate_SurgeWedgedWhileDraining_RestoresRotation(t *testing.T) {
 	}
 }
 
-// A source that is already drained and deleted has nothing to restore
-// to rotation, so the evidence does not close the record from here: the
-// pair stays as it is and the record's Deadline remains the backstop.
-func TestMigrate_SurgeWedgedAfterSourceGone_LeavesTheDeadline(t *testing.T) {
-	f := newSinglePodMigFixture(t)
-	const uuid = "mig-wedge-postdrain"
-	clk := armWedgeFixture(t, f, uuid, 0, "node-a")
-	driveToDrainingDrainIncomplete(t, f, uuid)
-
-	for _, pod := range migPodsForInstance(t, f, 0) {
-		if err := f.c.Delete(context.Background(), pod); err != nil {
-			t.Fatalf("delete source pod %s: %v", pod.Name, err)
+// Once the source is drained and deleted the handover is done: the surge
+// is the Instance, whatever its pods do next. A surge that breaks after
+// that point does not hold the record in Draining. The completion tail
+// promotes it on the source's revision and closes the record Completed,
+// and the broken pod set is the repair's to rebuild, as any Instance's
+// is. Inside the stuck-pod grace and past it alike: with nothing left to
+// restore, a wedge is not the move's evidence.
+func TestMigrate_SurgeBreaksAfterSourceGone_CompletesTheHandover(t *testing.T) {
+	for _, pastGrace := range []bool{false, true} {
+		name := "inside the grace"
+		if pastGrace {
+			name = "past the grace"
 		}
-	}
-	wedgePod(t, f, migPodsForInstance(t, f, 1)[0], "CrashLoopBackOff")
-	clk.Step(wedgeGrace + time.Second)
-	migWedgeEvents(t, f)
+		t.Run(name, func(t *testing.T) {
+			f := newSinglePodMigFixture(t)
+			const uuid = "mig-break-postdrain"
+			clk := armWedgeFixture(t, f, uuid, 0, "node-a")
+			driveToDrainingDrainIncomplete(t, f, uuid)
+			sourceRevision := findInstanceStatusOnIRForFixture(t, f, 0).RunningRevision
 
-	if done, accepted := f.pass(t, uuid); done || !accepted {
-		t.Fatalf("post-drain wedge: got done=%v accepted=%v, want the migration still in flight", done, accepted)
-	}
-	if rec := f.record(t, uuid); rec.Phase != workload.MigrationPhaseDraining {
-		t.Fatalf("the record must stay Draining for its Deadline; got %+v", *rec)
-	}
-	src := findInstanceStatusOnIRForFixture(t, f, 0)
-	if src == nil || src.Phase != v1beta1.OMENativeInstanceMigrating || src.Operation == nil {
-		t.Fatalf("a source with no pods is not restored; got %+v", src)
-	}
-	if src.LastFailure != nil {
-		t.Errorf("a source with no pods is not stamped Failed either; got %+v", src.LastFailure)
-	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
-		t.Errorf("nothing is announced when the evidence does not apply; got %v", events)
+			for _, pod := range migPodsForInstance(t, f, 0) {
+				if err := f.c.Delete(context.Background(), pod); err != nil {
+					t.Fatalf("delete source pod %s: %v", pod.Name, err)
+				}
+			}
+			surgePod := migPodsForInstance(t, f, 1)[0]
+			wedgePod(t, f, surgePod, "CrashLoopBackOff")
+			if pastGrace {
+				clk.Step(wedgeGrace + time.Second)
+			}
+			migWedgeEvents(t, f) // drop the accept event
+
+			if done, accepted := f.pass(t, uuid); !done || !accepted {
+				t.Fatalf("post-drain break: got done=%v accepted=%v, want the handover completed", done, accepted)
+			}
+			rec := f.record(t, uuid)
+			if rec.Phase != workload.MigrationPhaseCompleted || rec.CompletedAt == nil {
+				t.Fatalf("the record must close Completed once the source is gone; got %+v", *rec)
+			}
+			if src := findInstanceStatusOnIRForFixture(t, f, 0); src != nil {
+				t.Errorf("the source status must be removed; got %+v", src)
+			}
+			surge := findInstanceStatusOnIRForFixture(t, f, 1)
+			if surge == nil || surge.Phase != v1beta1.OMENativeInstanceReady ||
+				surge.RunningRevision != sourceRevision || surge.Operation != nil {
+				t.Fatalf("the surge must be promoted on the source revision with its pin cleared; got %+v", surge)
+			}
+			if pods := migPodsForInstance(t, f, 1); len(pods) != 1 || pods[0].Name != surgePod.Name {
+				t.Errorf("the broken surge pod is left to the repair, not torn down by the move; got %d pod(s)", len(pods))
+			}
+			events := migWedgeEvents(t, f)
+			if len(events) != 1 || !strings.Contains(events[0], string(workload.EventReasonMigrationCompleted)) {
+				t.Errorf("want exactly the completion event; got %v", events)
+			}
+			assertNoRetryBlocks(t, f)
+		})
 	}
 }
 
@@ -3878,20 +4068,24 @@ func TestMigrateSurge_UnknownTargetHeldWithoutForceDeletePolicy(t *testing.T) {
 	assertMigrationSourceUntouched(t, f, before)
 }
 
-// An Accepted v1 record retains instance/node intent, not the requesting
-// caller's source Pod UID. Keep that limitation distinct from the existing
-// authoritative FromNode guard: changing only the UID does not reject a move.
+// An Accepted record binds to the Instance, not to the source pod the
+// requester looked at: a successor pod on the same node is migrated as
+// the original would have been, and a successor rebuilt on another node
+// since the request (a roll, a repair, a node loss) is moved off the
+// node it runs on, with the record, the overlay and the ledger naming
+// that node and one event naming both.
 func TestMigrate_SourcePodRecreatedAfterAcceptance(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		node string
 	}{
 		{name: "same node migrates successor", node: "node-a"},
-		{name: "different node rejects stale request", node: "node-b"},
+		{name: "different node moves the successor off the node it runs on", node: "node-b"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			f := newSinglePodMigFixture(t)
+			f.recorder = record.NewFakeRecorder(16)
 			pods := f.listPods(t)
 			if len(pods) != 1 {
 				t.Fatalf("fixture pods = %d, want one source", len(pods))
@@ -3915,20 +4109,25 @@ func TestMigrate_SourcePodRecreatedAfterAcceptance(t *testing.T) {
 				t.Fatalf("unexpected successor source after first pass: UID=%q node=%q deletion=%v", current.UID, current.Spec.NodeName, current.DeletionTimestamp)
 			}
 			sourceStatus := findInstanceStatusOnIRForFixture(t, f, 0)
-			if test.node != "node-a" {
-				if !done {
-					t.Fatal("changed source node must terminally reject the stale request")
-				}
-				assertRecordFailed(t, f, uuid, "does not match observed source node")
-				if f.record(t, uuid).SurgeInstance != nil || len(f.listPods(t)) != 1 || sourceStatus == nil || sourceStatus.Phase != v1beta1.OMENativeInstanceReady || sourceStatus.Operation != nil {
-					t.Fatalf("node mismatch must not allocate a surge or take source ownership: record=%+v source=%+v", f.record(t, uuid), sourceStatus)
-				}
-				return
-			}
-
 			rec := f.record(t, uuid)
 			if done || rec.Phase != workload.MigrationPhaseSurgePending || rec.SurgeInstance == nil || *rec.SurgeInstance != 1 {
-				t.Fatalf("same-node successor must start migration: done=%v record=%+v", done, rec)
+				t.Fatalf("the successor must start the migration: done=%v record=%+v", done, rec)
+			}
+			if rec.FromNode != test.node {
+				t.Fatalf("the record must name the node the Instance leaves: FromNode=%q want %q", rec.FromNode, test.node)
+			}
+			events := migWedgeEvents(t, f)
+			renamed := 0
+			for _, event := range events {
+				if strings.Contains(event, string(workload.EventReasonMigrationFromNodeMismatch)) {
+					renamed++
+					if !strings.HasPrefix(event, corev1.EventTypeNormal) || !strings.Contains(event, "node-a") || !strings.Contains(event, "node-b") {
+						t.Errorf("the re-anchor is a Normal event naming the requested and the observed node; got %q", event)
+					}
+				}
+			}
+			if want := map[bool]int{true: 1, false: 0}[test.node != "node-a"]; renamed != want {
+				t.Errorf("re-anchor events = %d, want %d; events=%v", renamed, want, events)
 			}
 			if sourceStatus == nil || sourceStatus.Phase != v1beta1.OMENativeInstanceMigrating || sourceStatus.Operation == nil || sourceStatus.Operation.RequestUUID != uuid {
 				t.Fatalf("source instance must be owned by the original request: %+v", sourceStatus)
@@ -3937,6 +4136,9 @@ func TestMigrate_SourcePodRecreatedAfterAcceptance(t *testing.T) {
 			surgeKey := types.NamespacedName{Namespace: f.isvc.Namespace, Name: query.PodName(f.isvc.Name, f.component, 1, "default", 0)}
 			if err := f.c.Get(ctx, surgeKey, surge); err != nil {
 				t.Fatalf("migration must create the surge Pod: %v", err)
+			}
+			if got := hostnameNotInValues(surge); len(got) != 1 || got[0] != test.node {
+				t.Fatalf("the surge must be kept off the node the Instance leaves: NotIn=%v want [%s]", got, test.node)
 			}
 
 			// Once readiness converges, the same original request drains
@@ -3956,7 +4158,43 @@ func TestMigrate_SourcePodRecreatedAfterAcceptance(t *testing.T) {
 			if len(ledger.Entries) != 1 || ledger.Entries[0].RequestUUID != uuid || ledger.Entries[0].Phase != audit.PhaseCompleted {
 				t.Fatalf("terminal ledger = %+v, want original request Completed", ledger.Entries)
 			}
+			if ledger.Entries[0].FromNode != test.node {
+				t.Errorf("the ledger must record the node the Instance left: FromNode=%q want %q", ledger.Entries[0].FromNode, test.node)
+			}
 		})
+	}
+}
+
+// A gang whose members have all left the requested node since the
+// request is moved off the node its routable member runs on: the whole
+// gang moves anyway, and that is the node the surge must not land on.
+func TestMigrate_GangOffTheRequestedNode_LeavesTheLeadersNode(t *testing.T) {
+	f := newGangMigFixture(t)
+	f.recorder = record.NewFakeRecorder(16)
+	const uuid = "mig-gang-rebuilt"
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-gone")}
+
+	surgePods := driveToSurgePods(t, f, uuid, 1)
+	rec := f.record(t, uuid)
+	if rec.FromNode != "node-a" {
+		t.Fatalf("the record must name the leader's node: FromNode=%q", rec.FromNode)
+	}
+	for _, pod := range surgePods {
+		if got := hostnameNotInValues(pod); len(got) != 1 || got[0] != "node-a" {
+			t.Errorf("surge pod %s must be kept off the leader's node: NotIn=%v", pod.Name, got)
+		}
+	}
+	renamed := 0
+	for _, event := range migWedgeEvents(t, f) {
+		if strings.Contains(event, string(workload.EventReasonMigrationFromNodeMismatch)) {
+			renamed++
+			if !strings.HasPrefix(event, corev1.EventTypeNormal) || !strings.Contains(event, "node-gone") || !strings.Contains(event, "node-a") {
+				t.Errorf("the re-anchor names the requested and the observed node; got %q", event)
+			}
+		}
+	}
+	if renamed != 1 {
+		t.Errorf("re-anchor events = %d, want 1", renamed)
 	}
 }
 
@@ -4006,7 +4244,7 @@ func TestPlacementPauseMigrationSurge(t *testing.T) {
 				in := f.input(t)
 				in.PauseNewSurge = true
 				req := &audit.MigrationRequest{SchemaVersion: audit.SchemaV1, Component: string(f.component), Instance: 0, FromNode: "node-a"}
-				done, accepted, err := Migrate(context.Background(), f.deps(), in, f.plan, 0, uuid, req)
+				done, accepted, err := Migrate(context.Background(), f.deps(), in, f.plan, f.target, 0, uuid, req)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -4040,5 +4278,56 @@ func TestPlacementPauseMigrationSurge(t *testing.T) {
 				t.Errorf("physical pod count after cleanup (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// A fresh record whose source index is still another row's pinned
+// replacement waits without taking ownership: the handoff that promoted
+// the row owns it until its own source is removed, so the record stays
+// Accepted with no surge and neither row is stamped. Once the pinning
+// source is gone the same record allocates its surge.
+func TestMigrate_FreshRecordWaitsWhileAHandoffStillPinsItsSource(t *testing.T) {
+	f := newSinglePodMigFixture(t)
+	const uuid = "mig-pinned-source"
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-a")}
+
+	ir := f.getIR(t)
+	replacement := int32(0)
+	ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, v1beta1.OMENativeInstanceStatus{
+		Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceUpdating,
+		RunningRevision: "llama-70b-engine-prior", TargetRevision: ir.Status.InstanceStatuses[0].RunningRevision,
+		Operation: legacyToV1beta1Op(&workload.InstanceOperation{
+			Type:           workload.InstanceOperationUpdate,
+			Step:           workload.UpdateStepSurgeDrain,
+			SurgeIndex:     &replacement,
+			TargetRevision: ir.Status.InstanceStatuses[0].RunningRevision,
+		}),
+	})
+	if err := f.c.Status().Update(context.Background(), ir); err != nil {
+		t.Fatalf("seed the pinning source: %v", err)
+	}
+
+	done, accepted := f.pass(t, uuid)
+	if done || accepted {
+		t.Fatalf("a source another handoff still pins must defer without ownership: done=%v accepted=%v", done, accepted)
+	}
+	rec := f.record(t, uuid)
+	if rec.Phase != workload.MigrationPhaseAccepted || rec.SurgeInstance != nil {
+		t.Fatalf("deferred record must stay Accepted with no surge; got %+v", *rec)
+	}
+	if row := findInstanceStatusOnIRForFixture(t, f, 0); row.Operation != nil || row.Phase != v1beta1.OMENativeInstanceReady {
+		t.Fatalf("the pinned row must not be stamped while the handoff owns it; got %+v", row)
+	}
+
+	ir = f.getIR(t)
+	ir.Status.InstanceStatuses = ir.Status.InstanceStatuses[:1]
+	if err := f.c.Status().Update(context.Background(), ir); err != nil {
+		t.Fatalf("remove the pinning source: %v", err)
+	}
+	if done, accepted := f.pass(t, uuid); done || !accepted {
+		t.Fatalf("once the pin is gone the record must allocate: done=%v accepted=%v", done, accepted)
+	}
+	if rec := f.record(t, uuid); !rec.SurgeAllocated() || rec.Phase != workload.MigrationPhaseSurgePending {
+		t.Fatalf("record must be SurgePending with a surge index; got %+v", *rec)
 	}
 }

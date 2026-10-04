@@ -42,7 +42,7 @@ func hpaPolicy(name string) *v1beta1.AutoscalerPolicy {
 }
 
 // maxConsumingPolicy derives its fallback replicas from the component's
-// MaxReplicas, which trips the Split hard gate.
+// MaxReplicas, which requires a bounded member ceiling.
 func maxConsumingPolicy(name string) *v1beta1.AutoscalerPolicy {
 	return &v1beta1.AutoscalerPolicy{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: name},

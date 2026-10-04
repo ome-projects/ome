@@ -2,13 +2,19 @@ package workload_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clocktesting "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -189,5 +195,185 @@ func TestReconcile_FreshMigrateOnNonReadySource_FallsThroughToUpdate(t *testing.
 	// would leave mutateCount at 0.
 	if mutateCount == 0 {
 		t.Errorf("expected dispatcher to fall through to Update after Migrate deferred; MutateInstance was never called (silent Migrate-defer deadlock)")
+	}
+}
+
+// parkedDrainFixture wires a Reconcile input whose Manual record u-parked
+// is Draining on a source pod the kubelet is not removing: the pod is
+// Terminating (finalizer-pinned so the fake client keeps the object) and
+// the fixture clock runs an hour past its deletion, so the pod is well
+// past its own deadline. Its serving surge sits at index 1. withQueued
+// adds u-queued, a fresh Manual request for the steady Instance at index
+// 2, whose recorded revision the fake client carries so the request can
+// allocate its surge.
+type parkedDrainFixture struct {
+	client       client.Client
+	deps         types.Deps
+	input        types.ReconcileInput
+	plan         types.ComponentPlan
+	records      []types.MigrationRecord
+	parkedSource *corev1.Pod
+}
+
+func newParkedDrainFixture(t *testing.T, withQueued bool) *parkedDrainFixture {
+	t.Helper()
+	const parked, queued = "u-parked", "u-queued"
+	const queuedRevision = "llama-70b-engine-revb"
+	scheme := makeScheme(t)
+
+	parkedSource := enginePod("llama-70b", "prod", 0)
+	parkedSource.Spec.NodeName = "node-a"
+	parkedSource.Finalizers = []string{"example.com/hold"}
+	parkedSurge := enginePod("llama-70b", "prod", 1)
+	parkedSurge.Spec.NodeName = "node-c"
+	queuedSource := enginePod("llama-70b", "prod", 2)
+	queuedSource.Spec.NodeName = "node-b"
+	queuedSource.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+	}
+	raw, err := json.Marshal(revision.DataPayload{PodSpec: &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "main", Image: "test:v1"}},
+	}})
+	if err != nil {
+		t.Fatalf("marshal revision payload: %v", err)
+	}
+	queuedCR := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: queuedRevision, Namespace: "prod"}}
+	queuedCR.Data.Raw = raw
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(parkedSource, parkedSurge, queuedSource, queuedCR).Build()
+	if err := c.Delete(context.Background(), parkedSource); err != nil {
+		t.Fatalf("delete the parked source pod: %v", err)
+	}
+	clk := clocktesting.NewFakeClock(time.Now().Add(time.Hour))
+	now := clk.Now()
+
+	f := &parkedDrainFixture{
+		client:       c,
+		deps:         types.Deps{Client: c, Clock: clk, Expectations: types.NewExpectations()},
+		parkedSource: parkedSource,
+	}
+	surgeIdx := int32(1)
+	f.records = []types.MigrationRecord{{
+		RequestUUID: parked, Trigger: types.MigrationTriggerManual,
+		Phase: types.MigrationPhaseDraining, SourceInstance: 0, SurgeInstance: &surgeIdx, FromNode: "node-a",
+		StartedAt: metav1.NewTime(now.Add(-time.Hour)), Deadline: metav1.NewTime(now.Add(time.Hour)),
+	}}
+	if withQueued {
+		f.records = append(f.records, types.MigrationRecord{
+			RequestUUID: queued, Trigger: types.MigrationTriggerManual,
+			Phase: types.MigrationPhaseAccepted, SourceInstance: 2, FromNode: "node-b",
+			StartedAt: metav1.NewTime(now.Add(-time.Minute)), Deadline: metav1.NewTime(now.Add(time.Hour)),
+		})
+	}
+
+	in := minimalInput(t)
+	in.Clock = clk
+	in.MigrationAudit = &types.MigrationAuditPolicy{MaxInFlight: 3, MaxPerWindow: 10, Window: time.Hour}
+	migratePin := func(uuid string) *types.InstanceOperation {
+		return &types.InstanceOperation{Type: types.InstanceOperationMigrate, Step: "CreateSurge", RequestUUID: uuid}
+	}
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseMigrating, RunningRevision: "llama-70b-engine-reva", Operation: migratePin(parked)},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseCreating, Operation: migratePin(parked)},
+		{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: queuedRevision},
+	}
+	in.ObservedState.Migrations = append([]types.MigrationRecord(nil), f.records...)
+	in.MutateMigration = func(_ context.Context, uuid string, mutate func(*types.MigrationRecord) bool) error {
+		for i := range f.records {
+			if f.records[i].RequestUUID == uuid {
+				r := f.records[i]
+				if mutate(&r) {
+					f.records[i] = r
+				}
+				return nil
+			}
+		}
+		return nil
+	}
+	f.input = in
+	f.plan = types.ComponentPlan{
+		Component:     types.ComponentEngine,
+		Replicas:      2,
+		MigrationMode: types.MigrationModeAuto,
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 2, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+		},
+	}
+	return f
+}
+
+func (f *parkedDrainFixture) record(t *testing.T, uuid string) types.MigrationRecord {
+	t.Helper()
+	for _, r := range f.records {
+		if r.RequestUUID == uuid {
+			return r
+		}
+	}
+	t.Fatalf("record %s missing", uuid)
+	return types.MigrationRecord{}
+}
+
+// TestReconcile_ParkedDrainTendsTheRecordAndDispatchesTheNext pins the
+// dispatch-head rule at the dispatcher: a Draining record whose source
+// pod is Terminating past its own deletion deadline is parked on a
+// kubelet that is not removing the pod, and a parked record must not
+// hold the head. The pass still tends it — the drive re-reads the pair
+// and runs the escalation it is configured for — but the queued Manual
+// request behind it is dispatched in the same pass: its surge index is
+// allocated while the parked record keeps its Draining phase and its
+// pods untouched.
+func TestReconcile_ParkedDrainTendsTheRecordAndDispatchesTheNext(t *testing.T) {
+	f := newParkedDrainFixture(t, true)
+	if _, err := workload.Reconcile(context.Background(), f.deps, f.input, f.plan, nil); err != nil {
+		// The queued request's surge materialization runs against a
+		// minimal fake client; the contract pinned here is the dispatch
+		// that precedes it.
+		t.Logf("Reconcile op error (tolerated against the minimal fake client): %v", err)
+	}
+
+	if got := f.record(t, "u-queued"); !got.SurgeAllocated() || got.Phase != types.MigrationPhaseSurgePending {
+		t.Fatalf("the queued request must dispatch behind the parked record; got %+v", got)
+	}
+	if got := f.record(t, "u-parked"); got.Phase != types.MigrationPhaseDraining {
+		t.Fatalf("the parked record keeps its Draining phase; got %+v", got)
+	}
+	live := &corev1.Pod{}
+	if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(f.parkedSource), live); err != nil {
+		t.Fatalf("the parked source pod is left to its kubelet, never force-deleted without a policy: %v", err)
+	}
+}
+
+// TestReconcile_ParkedDrainAlonePacesThePass: a parked record with
+// nothing queued behind it is still a migration in flight. It paces the
+// pass at the Migrate interval and ends it there — the Update and Create
+// passes do not run against the pair it still owns — exactly as a record
+// at the head does; only the head is what it gives up.
+func TestReconcile_ParkedDrainAlonePacesThePass(t *testing.T) {
+	f := newParkedDrainFixture(t, false)
+	createReached := false
+	f.input.MutateInstance = func(_ context.Context, idx int32, _ func(*types.InstanceStatus) bool) error {
+		if idx == 2 {
+			createReached = true
+		}
+		return nil
+	}
+	// Index 2 has no row in the observed state, so a Create pass that ran
+	// would materialize it.
+	f.input.ObservedState.InstanceStatuses = f.input.ObservedState.InstanceStatuses[:2]
+	res, err := workload.Reconcile(context.Background(), f.deps, f.input, f.plan, nil)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if res.RequeueAfter != testRequeueIntervals.Operation {
+		t.Fatalf("a parked record paces the pass at the Migrate interval; got %+v", res)
+	}
+	if createReached {
+		t.Fatalf("a migration in flight ends the pass ahead of the Create pass, parked or not")
+	}
+	if got := f.record(t, "u-parked"); got.Phase != types.MigrationPhaseDraining {
+		t.Fatalf("the parked record keeps its Draining phase; got %+v", got)
 	}
 }

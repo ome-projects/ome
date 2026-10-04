@@ -2,9 +2,12 @@ package gangpack
 
 import (
 	"context"
+	"maps"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	schedv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 	schedclient "sigs.k8s.io/scheduler-plugins/pkg/generated/clientset/versioned"
 	schedinformers "sigs.k8s.io/scheduler-plugins/pkg/generated/informers/externalversions"
@@ -17,6 +20,9 @@ type informerReader struct {
 	// func rather than the lister interface so the read path is unit-testable
 	// without standing up an informer.
 	getPG func(namespace, name string) (*schedv1alpha1.PodGroup, error)
+	// informer is the PodGroup informer behind getPG; nil for a reader built
+	// around a bare getPG. onChange registers its change handler on it.
+	informer cache.SharedIndexInformer
 	// defaultPermitTimeout is supplied by plugin configuration. Zero means no
 	// fallback; the PodGroup must then declare ScheduleTimeoutSeconds itself.
 	defaultPermitTimeout  time.Duration
@@ -85,7 +91,9 @@ func newInformerReader(ctx context.Context, cfg *rest.Config, topologyKeyAnnotat
 		return nil, err
 	}
 	factory := schedinformers.NewSharedInformerFactory(client, 0)
-	lister := factory.Scheduling().V1alpha1().PodGroups().Lister()
+	podGroups := factory.Scheduling().V1alpha1().PodGroups()
+	informer := podGroups.Informer()
+	lister := podGroups.Lister()
 	factory.Start(ctx.Done())
 
 	if syncTimeout > 0 {
@@ -95,6 +103,7 @@ func newInformerReader(ctx context.Context, cfg *rest.Config, topologyKeyAnnotat
 	}
 
 	return &informerReader{
+		informer:              informer,
 		defaultPermitTimeout:  defaultPermitTimeout,
 		topologyKeyAnnotation: topologyKeyAnnotation,
 		placementGroupLabel:   placementGroupLabel,
@@ -102,4 +111,44 @@ func newInformerReader(ctx context.Context, cfg *rest.Config, topologyKeyAnnotat
 			return lister.PodGroups(namespace).Get(name)
 		},
 	}, nil
+}
+
+// placementChanged reports whether a PodGroup update touched the facts
+// placement reads: the spec (minMember, gate timeout), the annotations (topology
+// key) or the labels (placement group). Status and metadata-only writes do not
+// count, so a controller refreshing status cannot wake parked members through
+// the backoff-bypassing activation.
+func placementChanged(oldPG, newPG *schedv1alpha1.PodGroup) bool {
+	if oldPG == nil || newPG == nil {
+		return oldPG != newPG
+	}
+	return !equality.Semantic.DeepEqual(oldPG.Spec, newPG.Spec) ||
+		!maps.Equal(oldPG.Labels, newPG.Labels) ||
+		!maps.Equal(oldPG.Annotations, newPG.Annotations)
+}
+
+// onChange runs fn with a PodGroup's namespace and name whenever the reader's
+// informer stores a new PodGroup or one whose placement facts changed. The
+// informer updates its store before notifying, so a get issued by fn, or by the
+// scheduling work fn triggers, returns the version that caused the report. A
+// reader without an informer accepts fn and never calls it.
+func (r *informerReader) onChange(fn func(namespace, name string)) error {
+	if r.informer == nil || fn == nil {
+		return nil
+	}
+	_, err := r.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if pg, ok := obj.(*schedv1alpha1.PodGroup); ok {
+				fn(pg.Namespace, pg.Name)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPG, _ := oldObj.(*schedv1alpha1.PodGroup)
+			newPG, ok := newObj.(*schedv1alpha1.PodGroup)
+			if ok && placementChanged(oldPG, newPG) {
+				fn(newPG.Namespace, newPG.Name)
+			}
+		},
+	})
+	return err
 }

@@ -17,9 +17,12 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -515,8 +518,8 @@ func TestEscalation_UnschedulableGraceWarnsAfterAHoldWasRecorded(t *testing.T) {
 	}
 }
 
-// TestEscalation_UnschedulableGangPastGraceKeepsItsOperation: a gang is
-// not a disposable attempt — the abandon path consumes its
+// TestEscalation_UnschedulableGangPastGraceKeepsItsOperation: a gang
+// surge is not a disposable attempt — the abandon path consumes its
 // Failed-with-Operation continuation — so the grace escalation takes the
 // plain stamp instead of the disposition. The revision is still
 // blameless: a gang with nowhere to land says nothing about its pod
@@ -1022,4 +1025,65 @@ func TestEscalation_UnschedulableDrainHoldsThenFailsPastGrace(t *testing.T) {
 			t.Errorf("RetryBlock: got %v want none (environment-caused)", rec.blocks)
 		}
 	})
+}
+
+// TestEscalation_UnschedulablePastGraceReleasesTheExclusion drives the
+// hold arm end to end: an Instance holds a node exclusion for the
+// revision it is rebuilding, the rebuild outlasts the grace with no
+// placement, and the pass releases the exclusion through the disposition
+// — the ledger projects nothing for it, the budget it spent stays spent,
+// and one Normal event names the freed node — before the row goes
+// Failed with the scheduler's verdict and no RetryBlock.
+func TestEscalation_UnschedulablePastGraceReleasesTheExclusion(t *testing.T) {
+	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
+	fc := clocktesting.NewFakeClock(now)
+	c := fakeLedgerClient(t)
+	owner := ledgerOwnerCM()
+	seeded := &audit.Ledger{}
+	seeded.UpsertEntry(audit.Entry{
+		RequestUUID: "u-directive", Component: "engine", SourceInstance: 0,
+		Phase: audit.PhaseCompleted, Reason: audit.ReasonAutoRecover,
+		Outcome: audit.OutcomeRelocateRecreate, FromNode: "node-a", Revision: "own-engine-newhash",
+		StartedAt:   now.Add(-time.Hour).UTC().Format(time.RFC3339),
+		CompletedAt: now.Add(-time.Hour).UTC().Format(time.RFC3339),
+	})
+	if err := audit.PersistLedgerForOwner(context.Background(), c, owner, corev1.SchemeGroupVersion.WithKind("ConfigMap"), seeded); err != nil {
+		t.Fatalf("seed ledger: %v", err)
+	}
+	insts := creatingInstance(now.Add(30 * time.Minute))
+	insts[0].Operation.TargetRevision = "own-engine-newhash"
+	insts[0].RunningRevision = "own-engine-newhash"
+	input, rec := dispositionFixtureInput(fc, &insts, "own-engine-newhash", nil, owner)
+	input.UnschedulableGrace = 10 * time.Minute
+	input.Disposition = types.DispositionDeps{AutoMigrateMaxAttempts: 3}
+	recorder := record.NewFakeRecorder(8)
+	plan := singleInstancePlan(0, 1)
+	plan.MigrationMode = types.MigrationModeAuto
+	pod := unschedulableRebuild("engine-0-default-0", "node-a",
+		"0/2 nodes are available: 1 node(s) didn't match Pod's node affinity/selector, 1 Insufficient nvidia.com/gpu", now.Add(-time.Hour))
+
+	if err := runEscalationPass(t, types.Deps{Client: c, Clock: fc, Recorder: recorder}, input, plan,
+		map[int32][]*corev1.Pod{0: {pod}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	ledger := loadLedger(t, c)
+	if exclusions := audit.RecentAutoRecoverExclusions(ledger, "engine", 0, 3); len(exclusions) != 0 {
+		t.Errorf("exclusions: got %v want none after the release", exclusions)
+	}
+	if got := audit.CountAutoRecoverAttempts(ledger, "engine", 0); got != 1 {
+		t.Errorf("budget: got %d want 1 (the released directive still counts)", got)
+	}
+	if events := drainEvents(recorder); countEventsWithReason(events, types.EventReasonNodeExclusionReleased) != 1 {
+		t.Errorf("events: got %v want one %s", events, types.EventReasonNodeExclusionReleased)
+	}
+	if insts[0].Phase != types.InstancePhaseFailed || insts[0].Operation != nil {
+		t.Errorf("instance: got Phase=%q Operation=%+v want Failed with no operation", insts[0].Phase, insts[0].Operation)
+	}
+	if insts[0].LastFailure == nil || insts[0].LastFailure.Reason != types.WaitingReasonUnschedulable {
+		t.Errorf("LastFailure: got %+v want the scheduler's verdict", insts[0].LastFailure)
+	}
+	if len(rec.blockCalls) != 0 {
+		t.Errorf("RetryBlock calls: got %+v want none (no placement is not the revision's fault)", rec.blockCalls)
+	}
 }

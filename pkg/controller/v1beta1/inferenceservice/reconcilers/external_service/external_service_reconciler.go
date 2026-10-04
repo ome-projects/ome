@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 )
 
@@ -107,23 +108,24 @@ func (r *ExternalServiceReconciler) shouldCreateExternalService(isvc *v1beta1.In
 	}
 
 	// Only create if there are components that can serve traffic
-	return isvc.Spec.Router != nil || isvc.Spec.Engine != nil
+	return irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) || irprojector.RoleDeclared(isvc, v1beta1.EngineComponent)
 }
 
-// determineTargetSelector determines which component should be the target for the external service
+// determineTargetSelector determines which component should be the target
+// for the external service. The pods are labeled with their replica's name
+// prefix, which is the referenced replica's own name for a referenced role.
 func (r *ExternalServiceReconciler) determineTargetSelector(isvc *v1beta1.InferenceService) map[string]string {
 	baseSelector := map[string]string{
 		constants.InferenceServicePodLabelKey: isvc.Name,
 	}
 
 	// Priority: Router > Engine
-	if isvc.Spec.Router != nil {
-		baseSelector[constants.OMEComponentLabel] = string(v1beta1.RouterComponent)
-		return baseSelector
-	}
-	if isvc.Spec.Engine != nil {
-		baseSelector[constants.OMEComponentLabel] = string(v1beta1.EngineComponent)
-		return baseSelector
+	for _, c := range []v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.EngineComponent} {
+		if irprojector.RoleDeclared(isvc, c) {
+			baseSelector[constants.InferenceServicePodLabelKey] = irprojector.RoleReplicaPrefix(isvc, c)
+			baseSelector[constants.OMEComponentLabel] = string(c)
+			return baseSelector
+		}
 	}
 	return baseSelector
 }
@@ -133,7 +135,7 @@ func (r *ExternalServiceReconciler) buildExternalService(ctx context.Context, is
 	selector := r.determineTargetSelector(isvc)
 
 	// Get the target port from the internal service
-	targetPort, err := isvcutils.GetTargetServicePort(ctx, r.client, isvc)
+	targetPort, err := isvcutils.TargetServicePort(ctx, r.client, isvc, irprojector.RoleDeclared(isvc, v1beta1.RouterComponent))
 	if err != nil {
 		targetPort = constants.CommonISVCPort
 	}

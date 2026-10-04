@@ -29,6 +29,7 @@ func SetupEnvTest() *envtest.Environment {
 		},
 		UseExistingCluster: proto.Bool(false),
 	}
+	EtcdForBusyHosts(t)
 
 	if err := netv1.SchemeBuilder.AddToScheme(scheme.Scheme); err != nil {
 		log.Error(err, "Failed to add networking v1 scheme")
@@ -38,6 +39,22 @@ func SetupEnvTest() *envtest.Environment {
 		log.Error(err, "Failed to add istio scheme")
 	}
 	return t
+}
+
+// EtcdForBusyHosts widens the raft timing of the envtest etcd. etcd fails a
+// write with "etcdserver: request timed out" when a proposal is not committed
+// within five seconds plus twice the election timeout, and on a shared host
+// several test control planes starting at once starve one another of CPU for
+// longer than the default one-second window. A single-member cluster still
+// elects itself immediately because etcd advances the initial election tick.
+func EtcdForBusyHosts(env *envtest.Environment) *envtest.Environment {
+	if env.ControlPlane.Etcd == nil {
+		env.ControlPlane.Etcd = &envtest.Etcd{}
+	}
+	args := env.ControlPlane.Etcd.Configure()
+	args.Append("heartbeat-interval", "500")
+	args.Append("election-timeout", "5000")
+	return env
 }
 
 // StartTestManager adds recFn

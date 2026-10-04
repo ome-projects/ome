@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,6 +34,13 @@ const (
 	// ownerRefDenial is the denial for a controller owner reference only the
 	// InferenceService controller may set.
 	ownerRefDenial = "only the InferenceService controller may set an InferenceService controller owner reference or change a projected replica's"
+	// composerDenial is the denial for a controller write to a user field of
+	// a replica it does not project; it lists the fields the controller may
+	// write.
+	composerDenial = "the InferenceService controller writes only rollout-control fields (pacing.partition, paused, pauseMode, pacing.rollbackToRevision, pairingProtocol) on a replica it does not project"
+	// composedFieldsDenial is the denial for a non-controller write to the
+	// composed-fields annotation.
+	composedFieldsDenial = "the ome.io/composed-fields annotation is written by the InferenceService controller"
 )
 
 // inferenceReplicaConfigMap is the inferenceservice-config ConfigMap holding
@@ -144,6 +152,43 @@ func withLifecycleMinReady(ir *v1beta1.InferenceReplica, seconds int32) *v1beta1
 	return out
 }
 
+func withPaused(ir *v1beta1.InferenceReplica, mode v1beta1.PauseMode) *v1beta1.InferenceReplica {
+	out := ir.DeepCopy()
+	out.Spec.Paused = true
+	out.Spec.PauseMode = mode
+	return out
+}
+
+func withRollbackToRevision(ir *v1beta1.InferenceReplica, revision string) *v1beta1.InferenceReplica {
+	out := ir.DeepCopy()
+	if out.Spec.Pacing == nil {
+		out.Spec.Pacing = &v1beta1.InferenceReplicaPacing{}
+	}
+	out.Spec.Pacing.RollbackToRevision = &revision
+	return out
+}
+
+func withPacingMaxUnavailable(ir *v1beta1.InferenceReplica, n int32) *v1beta1.InferenceReplica {
+	out := ir.DeepCopy()
+	if out.Spec.Pacing == nil {
+		out.Spec.Pacing = &v1beta1.InferenceReplicaPacing{}
+	}
+	out.Spec.Pacing.MaxUnavailable = ptr.To(intstr.FromInt32(n))
+	return out
+}
+
+func withPairingProtocol(ir *v1beta1.InferenceReplica, token string) *v1beta1.InferenceReplica {
+	out := ir.DeepCopy()
+	out.Spec.PairingProtocol = &token
+	return out
+}
+
+// withComposedFields returns a copy of ir carrying the composed-fields
+// annotation with the given value.
+func withComposedFields(ir *v1beta1.InferenceReplica, value string) *v1beta1.InferenceReplica {
+	return withAnnotation(ir, constants.InferenceReplicaComposedFieldsAnnotationKey, value)
+}
+
 // refsIR is a standalone replica of component c that renders from the
 // ClusterServingRuntime runtime-a instead of stored runners.
 func refsIR(c v1beta1.ComponentType) *v1beta1.InferenceReplica {
@@ -234,8 +279,15 @@ func TestOwnershipByIdentity(t *testing.T) {
 			}, false, "written only by the InferenceService controller"},
 		{"the controller may set placement fields on a standalone replica", nil,
 			func(t *testing.T) admission.Request {
-				return asUser(createReq(t, withPlacementLimit(standaloneIR())), controllerUser)
+				return asUser(updateReq(t, standaloneIR(), withPlacementLimit(standaloneIR())), controllerUser)
 			}, true, ""},
+		{"the controller cannot create a standalone replica", nil,
+			func(t *testing.T) admission.Request { return asUser(createReq(t, standaloneIR()), controllerUser) },
+			false, "creates only the replicas it projects"},
+		{"the controller cannot create a standalone replica with placement fields", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(createReq(t, withPlacementLimit(standaloneIR())), controllerUser)
+			}, false, "creates only the replicas it projects"},
 		{"a standalone replica may not take an InferenceService name", []client.Object{collidingISVC},
 			func(t *testing.T) admission.Request { return asUser(createReq(t, standaloneIR()), plainUser) }, false, "would share pod and Service names"},
 		{"a user cannot change a projected replica's spec", nil,
@@ -451,7 +503,99 @@ func TestOwnershipByIdentity(t *testing.T) {
 			}, false, noDecoderPiece},
 		{"the controller may set placement fields on a refs replica", []client.Object{engineRuntime},
 			func(t *testing.T) admission.Request {
-				return asUser(createReq(t, withPlacementLimit(refsIR(v1beta1.EngineComponent))), controllerUser)
+				refs := refsIR(v1beta1.EngineComponent)
+				return asUser(updateReq(t, refs, withPlacementLimit(refs)), controllerUser)
+			}, true, ""},
+		// On a replica it does not project the controller writes only the
+		// rollout-control fields and the composed-fields annotation.
+		{"the controller may set the partition on a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withPacingPartition(standaloneIR(), 1)), controllerUser)
+			}, true, ""},
+		{"the controller may pause a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withPaused(standaloneIR(), v1beta1.PauseModeFreeze)), controllerUser)
+			}, true, ""},
+		{"the controller may set the rollback target and pairing protocol on a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				steered := withPairingProtocol(withRollbackToRevision(standaloneIR(), "pool-a-0f3a"), "v2")
+				return asUser(updateReq(t, standaloneIR(), steered), controllerUser)
+			}, true, ""},
+		{"the controller may clear the fields it held on a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				held := withComposedFields(withPacingPartition(withPaused(standaloneIR(), v1beta1.PauseModeRecover), 1), "svc:paused,pacing.partition")
+				return asUser(updateReq(t, held, standaloneIR()), controllerUser)
+			}, true, ""},
+		{"the controller cannot scale a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withReplicas(standaloneIR(), 3)), controllerUser)
+			}, false, composerDenial},
+		{"the controller cannot change a standalone replica's runners", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withImage(standaloneIR(), "sgl:1.1")), controllerUser)
+			}, false, composerDenial},
+		{"the controller cannot set pacing.maxUnavailable on a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withPacingMaxUnavailable(standaloneIR(), 1)), controllerUser)
+			}, false, composerDenial},
+		{"the controller cannot drop a user's pacing.maxUnavailable while setting the partition", nil,
+			func(t *testing.T) admission.Request {
+				budgeted := withPacingMaxUnavailable(standaloneIR(), 1)
+				return asUser(updateReq(t, budgeted, withPacingPartition(standaloneIR(), 1)), controllerUser)
+			}, false, composerDenial},
+		{"the controller cannot scale a standalone replica while pausing it", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withReplicas(withPaused(standaloneIR(), v1beta1.PauseModeFreeze), 3)), controllerUser)
+			}, false, composerDenial},
+		{"a user may set the partition on a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withPacingPartition(standaloneIR(), 1)), plainUser)
+			}, true, ""},
+		{"a user cannot pause a projected replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, projectedIR(), withPaused(projectedIR(), v1beta1.PauseModeFreeze)), plainUser)
+			}, false, "projected by InferenceService"},
+		// Only the controller adds, changes or removes the composed-fields
+		// annotation; any other annotation edit stays a metadata-only update.
+		{"a user cannot add the composed-fields annotation to a standalone replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withComposedFields(standaloneIR(), "svc:paused")), plainUser)
+			}, false, composedFieldsDenial},
+		{"a user cannot change the composed-fields annotation", nil,
+			func(t *testing.T) admission.Request {
+				held := withComposedFields(standaloneIR(), "svc:paused")
+				return asUser(updateReq(t, held, withComposedFields(held, "svc:pacing.partition")), plainUser)
+			}, false, composedFieldsDenial},
+		{"a user cannot remove the composed-fields annotation", nil,
+			func(t *testing.T) admission.Request {
+				held := withComposedFields(standaloneIR(), "svc:paused")
+				return asUser(updateReq(t, held, withoutAnnotation(held, constants.InferenceReplicaComposedFieldsAnnotationKey)), plainUser)
+			}, false, composedFieldsDenial},
+		{"a user cannot create a standalone replica carrying the composed-fields annotation", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(createReq(t, withComposedFields(standaloneIR(), "svc:paused")), plainUser)
+			}, false, composedFieldsDenial},
+		{"a user cannot add the composed-fields annotation to a projected replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, projectedIR(), withComposedFields(projectedIR(), "svc:paused")), plainUser)
+			}, false, composedFieldsDenial},
+		{"a user may change another annotation beside the composed-fields annotation", nil,
+			func(t *testing.T) admission.Request {
+				held := withComposedFields(standaloneIR(), "svc:paused")
+				return asUser(updateReq(t, held, withAnnotation(held, "example.com/note", "keep")), plainUser)
+			}, true, "metadata-only update"},
+		{"the controller may add the composed-fields annotation with no spec change", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, standaloneIR(), withComposedFields(standaloneIR(), "svc:paused")), controllerUser)
+			}, true, ""},
+		{"the controller may remove the composed-fields annotation with no spec change", nil,
+			func(t *testing.T) admission.Request {
+				held := withComposedFields(standaloneIR(), "svc:paused")
+				return asUser(updateReq(t, held, withoutAnnotation(held, constants.InferenceReplicaComposedFieldsAnnotationKey)), controllerUser)
+			}, true, ""},
+		{"the controller may write the composed-fields annotation on a projected replica", nil,
+			func(t *testing.T) admission.Request {
+				return asUser(updateReq(t, projectedIR(), withComposedFields(projectedIR(), "svc:paused")), controllerUser)
 			}, true, ""},
 	}
 	for _, tc := range cases {
@@ -494,6 +638,11 @@ func TestTemplateSourceReadsTheRuntimeOnlyWhenNamed(t *testing.T) {
 	if resp := v.Handle(context.Background(), asUser(updateReq(t, refs, withReplicas(refs, 3)), plainUser)); !resp.Allowed {
 		t.Fatalf("scale of a refs replica denied: %s", resp.Result.Message)
 	}
+	// The controller's rollout-control writes on a replica it does not
+	// project read no runtime either.
+	if resp := v.Handle(context.Background(), asUser(updateReq(t, refs, withPacingPartition(refs, 1)), controllerUser)); !resp.Allowed {
+		t.Fatalf("partition of a refs replica by the controller denied: %s", resp.Result.Message)
+	}
 }
 
 func TestOwnershipWithoutIdentityKeepsTheAnnotationConvention(t *testing.T) {
@@ -528,16 +677,19 @@ func TestOwnershipConfigErrorSparesMetadataOnlyUpdates(t *testing.T) {
 		name string
 		req  admission.Request
 	}
+	held := withComposedFields(standaloneIR(), "svc:paused")
 	spared := []request{
 		{"finalizer-only update", asUser(updateReq(t, old, withFinalizers(old)), plainUser)},
 		{"label-only update", asUser(updateReq(t, old, withLabel(old, "team", "team-a")), plainUser)},
 		{"mailbox annotation removal", asUser(updateReq(t, old, withoutAnnotation(old, constants.ResetInstancesAnnotationKey)), plainUser)},
 		{"blockOwnerDeletion cleared", asUser(updateReq(t, old, withBlockOwnerDeletion(old, false)), garbageCollectorUser)},
 		{"owner reference removal", asUser(updateReq(t, old, withOwners(old)), garbageCollectorUser)},
+		{"label edit beside an unchanged composed-fields annotation", asUser(updateReq(t, held, withLabel(held, "team", "team-a")), plainUser)},
 	}
 	failing := []request{
 		{"create", asUser(createReq(t, standaloneIR()), plainUser)},
 		{"spec change", asUser(updateReq(t, old, withReplicas(old, 3)), plainUser)},
+		{"composed-fields annotation change", asUser(updateReq(t, standaloneIR(), held), plainUser)},
 	}
 	configs := []struct {
 		name      string

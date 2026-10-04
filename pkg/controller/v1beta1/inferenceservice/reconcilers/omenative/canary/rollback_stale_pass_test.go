@@ -37,6 +37,8 @@ type passSim struct {
 	history    []*v1beta1.InferenceService
 	readAt     int
 	specWrites map[v1beta1.ComponentType]int
+	// members are the Components whose partition the pass projects.
+	members []v1beta1.ComponentType
 }
 
 const (
@@ -88,7 +90,14 @@ func newPassSim(t *testing.T, name string) *passSim {
 		pairedRevision(ns, name, "decoder", simDecoderStable, 1, pdStableProtocol),
 		pairedRevision(ns, name, "decoder", simDecoderCanary, 2, pdCanaryProtocol),
 	}
-	s := &passSim{t: t, ns: ns, name: name, now: time.Unix(1000, 0), specWrites: map[v1beta1.ComponentType]int{}}
+	return newPassSimWith(t, ns, name, []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}, objs)
+}
+
+// newPassSimWith builds the simulation over seeded objects for the given
+// group members.
+func newPassSimWith(t *testing.T, ns, name string, members []v1beta1.ComponentType, objs []runtime.Object) *passSim {
+	t.Helper()
+	s := &passSim{t: t, ns: ns, name: name, now: time.Unix(1000, 0), specWrites: map[v1beta1.ComponentType]int{}, members: members}
 	base := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).
 		WithStatusSubresource(&v1beta1.InferenceService{}).Build()
 	s.c = interceptor.NewClient(base, interceptor.Funcs{Update: s.bumpGeneration})
@@ -268,7 +277,7 @@ func (s *passSim) pass(name string, stale bool) {
 			return
 		}
 	}
-	for _, comp := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
+	for _, comp := range s.members {
 		s.project(working, comp)
 	}
 	res, err := Dispatch(ctx, DispatchDeps{

@@ -7,6 +7,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -18,11 +19,13 @@ import (
 func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 	for _, tt := range []struct {
 		name                                        string
+		ceiling                                     int32
 		template, hardware                          bool
 		growth, collision, newerPolicy, staleSource bool
 		wantErr                                     bool
 	}{
 		{name: "unchanged inputs"},
+		{name: "explicit local ceiling", ceiling: 4},
 		{name: "new source template", template: true},
 		{name: "outgoing hardware changed", hardware: true},
 		{name: "cannot grow retiring floor", growth: true, wantErr: true},
@@ -44,16 +47,21 @@ func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			setPlannedReplicas(member, 2, 0)
+			setPlannedReplicas(member, 2, tt.ceiling)
 			worker := f.workers["member-a"]
 			if err := worker.Create(t.Context(), member); err != nil {
 				t.Fatal(err)
 			}
 			want := member.DeepCopy()
 			if !tt.wantErr {
-				setPlannedReplicas(want, 1, 0)
+				want.Spec.Engine.MinReplicas = ptr.To(1)
+				want.Spec.Engine.MaxReplicas = 1
+				if tt.ceiling > 0 {
+					want.Spec.Engine.MaxReplicas = int(tt.ceiling)
+				}
 			}
 			source := f.source.DeepCopy()
+			source.Spec.Placement.Split.MaxReplicasPerCluster = tt.ceiling
 			if tt.template {
 				source.Spec.Engine.Runner = &v1beta1.RunnerSpec{Container: corev1.Container{Image: "example.com/serving:v2"}}
 			}

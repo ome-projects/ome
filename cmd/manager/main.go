@@ -111,6 +111,13 @@ func loadPodBatchSizes(clientset kubernetes.Interface) (controllerconfig.PodBatc
 	return controllerconfig.LoadPodBatchSizes(clientset)
 }
 
+// newEventBroadcaster builds a broadcaster whose spam filter grants every
+// object the configured event budget; unconfigured settings leave client-go's
+// own defaults in place.
+func newEventBroadcaster(settings controllerconfig.EventRecorderSettings) record.EventBroadcaster {
+	return record.NewBroadcasterWithCorrelatorOptions(settings.CorrelatorOptions())
+}
+
 func managerProbeChecker(enableWebhook bool, webhookServer func() webhook.Server) healthz.Checker {
 	if !enableWebhook {
 		return healthz.Ping
@@ -385,6 +392,15 @@ func main() {
 	}
 	omePodSelector := labels.NewSelector().Add(*omePodReq)
 
+	// The per-object event budget is read once, before the manager exists,
+	// so every recorder in the process shares it: the controllers' own
+	// broadcasters below and the one controller-runtime hands out.
+	eventRecorderSettings, err := controllerconfig.LoadEventRecorderSettings(clientSet)
+	if err != nil {
+		setupLog.Error(err, "Failed to initialize event recorder configuration")
+		os.Exit(1)
+	}
+
 	mgrOpts := manager.Options{
 		Scheme: scheme,
 		Cache: cache.Options{
@@ -411,6 +427,8 @@ func main() {
 		LeaderElectionID:        LeaderLockName,
 		LeaderElectionNamespace: options.leaderElectionNamespace,
 		HealthProbeBindAddress:  options.probeAddr,
+		// Recorders handed out by the manager share the configured budget.
+		EventBroadcaster: newEventBroadcaster(eventRecorderSettings), //nolint:staticcheck // the manager-owned recorders must share the configured per-object event budget
 	}
 	options.leaderElectionTiming.Apply(&mgrOpts)
 
@@ -543,7 +561,7 @@ func main() {
 		}
 	}
 
-	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster := newEventBroadcaster(eventRecorderSettings)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientSet.CoreV1().Events("")})
 	if isControlPlane {
 		setupLog.Info("control-plane role: local InferenceService reconciler disabled; placement controller owns ISVCs")
@@ -644,7 +662,7 @@ func main() {
 
 		// Single inheritance reconciler that handles both CSR and
 		// SR via one source per GVK. Reconcile branches on req.Namespace.
-		servingRuntimeEventBroadcaster := record.NewBroadcaster()
+		servingRuntimeEventBroadcaster := newEventBroadcaster(eventRecorderSettings)
 		servingRuntimeEventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientSet.CoreV1().Events("")})
 		setupLog.Info("Setting up ServingRuntime inheritance controller")
 		if err = (&v1beta1servingruntimecontroller.InheritanceReconciler{
@@ -696,6 +714,7 @@ func main() {
 			ScaleUpPodBatchSize:      podBatchSizes.ScaleUp,
 			ScaleDownPodBatchSize:    podBatchSizes.ScaleDown,
 			ScaleDownRequeueInterval: podBatchSizes.ScaleDownRequeueInterval,
+			RepairBatchSize:          podBatchSizes.Repair,
 			TPUSliceProvisioning:     tpuSliceConfig,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create InferenceReplica controller")
@@ -725,7 +744,7 @@ func main() {
 	if isControlPlane {
 		setupLog.Info("control-plane role: AcceleratorClass controller disabled")
 	} else {
-		acceleratorClassEventBroadcaster := record.NewBroadcaster()
+		acceleratorClassEventBroadcaster := newEventBroadcaster(eventRecorderSettings)
 		setupLog.Info("Setting up AcceleratorClass controller")
 		acceleratorClassEventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: clientSet.CoreV1().Events("")})
 		if err = (&v1beta1acceleratorclasscontroller.AcceleratorClassReconciler{

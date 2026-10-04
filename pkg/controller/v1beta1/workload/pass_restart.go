@@ -22,13 +22,15 @@ import (
 // a whole (joined error) only after every selection has run. A repair
 // that opens a new outage is admitted like an update start; one that
 // recovers capacity already lost, or drives an open repair, is not held
-// by anything.
+// by anything. Fresh crash-loop repairs, budgeted or not, open at most
+// input.RepairBatchSize per pass; the rest wait for the next pass.
 //
-// stop=true means the pass consumed the reconcile: a repair opened or
-// held owns the wake-up, because nothing in the cluster changes while a
-// denial stands and no watch event is coming. When a Create follows in
-// the action list the pass materializes the surge-free indices itself
-// before ending, so a stalled repair does not starve a scale-up.
+// stop=true means the pass consumed the reconcile: a repair opened, held
+// or left for the next pass owns the wake-up, because nothing in the
+// cluster changes while a denial stands and no watch event is coming.
+// When a Create follows in the action list the pass materializes the
+// surge-free indices itself before ending, so a stalled repair does not
+// starve a scale-up.
 func executeRestartPass(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, restarts []RestartSelection, createFollows bool) (res ctrl.Result, stop bool, err error) {
 	anyRestarting := false
 	var restartErrs []error
@@ -37,7 +39,29 @@ func executeRestartPass(ctx context.Context, deps types.Deps, input types.Reconc
 	// still reports which layer is holding it.
 	var firstDenial *types.RolloutHold
 	var firstDeniedIndex int32
+	// Fresh crash-loop repairs opened this pass, against the repair batch;
+	// batchFull marks a selection left for the next pass.
+	opened := int32(0)
+	batchFull := false
+	// Revisions whose retry ladder admitted a rebuild this pass: the
+	// ladder authorizes one attempt at a revision at a time.
+	ladderOpened := map[string]struct{}{}
 	for _, selection := range restarts {
+		if selection.OpensRepair && input.RepairBatchSize != nil && opened >= *input.RepairBatchSize {
+			logf.FromContext(ctx).V(1).Info("crash-loop repair waits for the next pass: repair batch full",
+				"component", plan.Component, "instance", selection.Instance.Index, "repairBatchSize", *input.RepairBatchSize)
+			batchFull = true
+			continue
+		}
+		if rev := selection.LadderRevision; rev != "" {
+			if _, taken := ladderOpened[rev]; taken {
+				logf.FromContext(ctx).V(1).Info("crash-loop repair waits for the next pass: the revision's retry ladder admits one attempt at a time",
+					"component", plan.Component, "instance", selection.Instance.Index, "revision", rev)
+				batchFull = true
+				continue
+			}
+			ladderOpened[rev] = struct{}{}
+		}
 		if selection.OpensUnavailability {
 			allowed, denial := admission.admit(ctx, plan, selection.Instance.Index)
 			if !allowed {
@@ -47,7 +71,10 @@ func executeRestartPass(ctx context.Context, deps types.Deps, input types.Reconc
 				continue
 			}
 		}
-		done, restartErr := workloadops.Restart(ctx, deps, input, plan, selection.Instance, selection.Reason)
+		if selection.OpensRepair {
+			opened++
+		}
+		done, restartErr := workloadops.Restart(ctx, deps, input, plan, selection.Instance, target, selection.Reason)
 		if restartErr != nil {
 			logf.FromContext(ctx).Error(restartErr, "restart pass: instance failed",
 				"component", plan.Component, "instance", selection.Instance.Index)
@@ -58,8 +85,9 @@ func executeRestartPass(ctx context.Context, deps types.Deps, input types.Reconc
 			anyRestarting = true
 		}
 	}
-	// A held repair consumes the pass exactly as an in-flight one does.
-	if anyRestarting || firstDenial != nil {
+	// A held repair, or one left for the next pass, consumes the pass
+	// exactly as an in-flight one does.
+	if anyRestarting || firstDenial != nil || batchFull {
 		interval := workloadops.RestartRequeueInterval(input)
 		if !anyRestarting {
 			interval = input.Requeue.Gate
@@ -116,24 +144,27 @@ func planExcludingRestartSelections(plan types.ComponentPlan, restarts []Restart
 }
 
 // repairAdmission paces the restart repairs that OPEN a new
-// unavailability. A wedge is usually a property of the revision, not of
-// one Instance, so without pacing a bad image or a bad argument
-// qualifies every Ready Instance in the same pass and the Component
-// recycles itself whole. The two layers an update start answers to
-// answer here too, in the same order and against the same numbers: the
-// per-Component MaxUnavailable budget, then the cross-Component
-// coordination gate. Selections denied by either wait for a later pass;
-// a repair already in flight is anchored in prior, so the pace holds
-// across passes and not merely within one.
+// unavailability: rebuilds of a pod set that still serves. A wedge is
+// usually a property of the revision, not of one Instance, so without
+// pacing a bad image or a bad argument qualifies every Ready Instance in
+// the same pass and the Component takes every serving pod offline at
+// once. The per-Component MaxUnavailable budget answers here as it does
+// for an update start, against the same numbers: selections it denies
+// wait for a later pass, and a repair already in flight is anchored in
+// prior, so the pace holds across passes and not merely within one. A
+// pod set that serves nothing never reaches this admission
+// (ops.RestartOpensUnavailability): its rebuild removes no serving
+// capacity and is not charged.
 //
-// Lives at the executor's position, not the plan's: the coordination
-// gate reads live peer state, so it must be consulted where the pass's
-// earlier effects have already landed.
+// The cross-Component coordination gate is not consulted. Its serving
+// count needs every pod of an Instance in rotation, and the parked
+// member that makes a crash-loop wedge already takes the Instance out of
+// that count, so a consult would charge the repair for the outage it
+// ends and, under a group budget of one, hold it for good.
 type repairAdmission struct {
 	budget   int32
 	prior    int32
 	inFlight int32
-	gate     func(strategy types.UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (bool, types.RolloutHoldGate, string)
 }
 
 func newRepairAdmission(input types.ReconcileInput, plan types.ComponentPlan) *repairAdmission {
@@ -141,17 +172,16 @@ func newRepairAdmission(input types.ReconcileInput, plan types.ComponentPlan) *r
 	return &repairAdmission{
 		budget: escalation.PerComponentMaxUnavailableBudget(plan.UpdateStrategy.RollingUpdate, plan.Replicas),
 		prior:  escalation.CurrentUnavailableInFlight(statuses) + escalation.CurrentRestartingInFlight(statuses),
-		gate:   input.UpdateGate,
 	}
 }
 
 // admit reports whether one more repair may open this pass, charging
 // the pass's counter when it may. A repair recreates pods in place, so
-// both layers are consulted on the unavailability arm whatever the
-// Component's update strategy is: nothing about a rebuild surges.
+// the budget is the unavailability one whatever the Component's update
+// strategy is: nothing about a rebuild surges.
 //
 // A denial is returned as the hold that produced it, so the caller can
-// report which layer is holding the Component back.
+// report what is holding the Component back.
 func (a *repairAdmission) admit(ctx context.Context, plan types.ComponentPlan, index int32) (bool, *types.RolloutHold) {
 	if projected, denied := escalation.BudgetDenies(a.budget, a.prior, a.inFlight); denied {
 		logf.FromContext(ctx).V(1).Info("crash-loop repair denied by the unavailability budget",
@@ -162,22 +192,14 @@ func (a *repairAdmission) admit(ctx context.Context, plan types.ComponentPlan, i
 			Reason: fmt.Sprintf("per-Component unavailability budget %d exhausted (would become %d)", a.budget, projected),
 		}
 	}
-	if a.gate != nil {
-		if allowed, gate, reason := a.gate(types.UpdateStrategyRecreatePod, 0, a.inFlight); !allowed {
-			logf.FromContext(ctx).V(1).Info("crash-loop repair denied by the coordination gate",
-				"component", plan.Component, "instance", index, "gate", gate, "reason", reason)
-			return false, &types.RolloutHold{Gate: gate, Reason: reason}
-		}
-	}
 	a.inFlight++
 	return true, nil
 }
 
 // announceRepairHeld announces that a Component wedged on a crash loop
-// opened no repair this pass. The Instance and the layer both go in the
-// message: which layer decides whether the operator waits for a peer
-// Component, raises MaxUnavailable, or intervenes. Announced once per
-// episode on the held Instance's own row.
+// opened no repair this pass. The Instance and the budget both go in the
+// message, so the operator knows whether to raise MaxUnavailable or
+// intervene. Announced once per episode on the held Instance's own row.
 func announceRepairHeld(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, index int32, held *types.RolloutHold) error {
 	if deps.Recorder == nil || held == nil {
 		return nil

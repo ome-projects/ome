@@ -110,6 +110,9 @@ func (v *InferenceServiceValidator) ValidateCreate(ctx context.Context, isvc *v1
 	if err := v.validateNoStandaloneReplicaCollision(ctx, isvc); err != nil {
 		return nil, err
 	}
+	if err := v.validateReplicaRefs(ctx, nil, isvc); err != nil {
+		return nil, err
+	}
 	warnings, err := v.validateInferenceService(ctx, isvc)
 	if err != nil {
 		return warnings, err
@@ -145,6 +148,9 @@ func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc,
 		return nil, err
 	}
 	if err := validation.ValidatePairingProtocolUpdate(&oldIsvc.Spec, &isvc.Spec); err != nil {
+		return nil, err
+	}
+	if err := v.validateReplicaRefs(ctx, oldIsvc, isvc); err != nil {
 		return nil, err
 	}
 	// Ratchet: only a newly-set or changed scaling policy is validated,
@@ -459,10 +465,11 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 	// At least one of spec.model or spec.runtime must be set. When
 	// spec.model is omitted (lean path), spec.runtime must name the
 	// runtime to use — the controller skips model-fetch and runtime
-	// auto-selection in that mode.
+	// auto-selection in that mode. A service over referenced replicas
+	// renders nothing and needs neither.
 	modelSet := isvc.Spec.Model != nil && isvc.Spec.Model.Name != ""
 	runtimeSet := isvc.Spec.Runtime != nil && isvc.Spec.Runtime.Name != ""
-	if !modelSet && !runtimeSet {
+	if !modelSet && !runtimeSet && validation.ReferencedReplica(&isvc.Spec, v1beta1.EngineComponent) == "" {
 		return allWarnings, fmt.Errorf("at least one of spec.model or spec.runtime must be set")
 	}
 

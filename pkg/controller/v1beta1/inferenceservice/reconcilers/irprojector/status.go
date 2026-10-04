@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	knapis "knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -110,8 +109,8 @@ func AggregateIRStatus(ctx context.Context, c client.Client, reads client.Reader
 // On apierrors.IsNotFound for the ISVC Update: returns nil so a
 // race with ISVC deletion drops cleanly.
 func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Reader, isvc *v1beta1.InferenceService, component v1beta1.ComponentType) error {
-	name := InferenceReplicaName(isvc.Name, component)
-	key := types.NamespacedName{Namespace: isvc.Namespace, Name: name}
+	key := RoleReplicaKey(isvc, component)
+	name := key.Name
 	ir := &v1beta1.InferenceReplica{}
 	if err := c.Get(ctx, key, ir); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -181,7 +180,7 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 		// The carried generation must come from this attempt's read of the
 		// live ISVC, not from the caller's snapshot, so a conflict retry
 		// never rolls it back.
-		desired.ObservedGeneration = lifecycleObservedGeneration(ir, cs.Lifecycle)
+		desired.ObservedGeneration = lifecycleObservedGeneration(ir, cs.Lifecycle, fresh.Generation)
 		cs.Lifecycle = desired.DeepCopy()
 		fresh.Status.Components[component] = cs
 		// Emit the top-level component-ready condition in the same
@@ -253,7 +252,7 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 // boundary as load-bearing.
 func IRStatusToComponentStatus(ir *v1beta1.InferenceReplica, live *v1beta1.LifecycleStatus) *v1beta1.LifecycleStatus {
 	out := &v1beta1.LifecycleStatus{
-		ObservedGeneration:   lifecycleObservedGeneration(ir, live),
+		ObservedGeneration:   lifecycleObservedGeneration(ir, live, 0),
 		Replicas:             ir.Status.Replicas,
 		ReadyReplicas:        ir.Status.ReadyReplicas,
 		ServingReplicas:      ir.Status.ServingReplicas,
@@ -285,12 +284,15 @@ func IRStatusToComponentStatus(ir *v1beta1.InferenceReplica, live *v1beta1.Lifec
 // IR with every projection, so once the IR has reconciled its current
 // spec the stamp is the generation this block reflects. Until then the
 // value already live on the ISVC is carried (zero when there is none).
-// The IR's own generation is never reported: it also moves on IR-only
-// spec changes (migration mailbox annotations, pause/unpause, canary
-// steps, autoscaler replica edits) that leave the ISVC generation
-// untouched, which would strand consumers comparing this field against
-// ISVC.metadata.generation.
-func lifecycleObservedGeneration(ir *v1beta1.InferenceReplica, live *v1beta1.LifecycleStatus) int64 {
+// A replica no projector stamps (one the service fronts by reference)
+// reports isvcGeneration, the live generation of the service, once it has
+// reconciled its own spec; a caller without the live service passes 0 and
+// gets the carried value. The IR's own generation is never reported: it
+// also moves on IR-only spec changes (migration mailbox annotations,
+// pause/unpause, canary steps, autoscaler replica edits) that leave the
+// ISVC generation untouched, which would strand consumers comparing this
+// field against ISVC.metadata.generation.
+func lifecycleObservedGeneration(ir *v1beta1.InferenceReplica, live *v1beta1.LifecycleStatus, isvcGeneration int64) int64 {
 	var carried int64
 	if live != nil {
 		carried = live.ObservedGeneration
@@ -300,6 +302,9 @@ func lifecycleObservedGeneration(ir *v1beta1.InferenceReplica, live *v1beta1.Lif
 	}
 	raw, ok := ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]
 	if !ok {
+		if isvcGeneration > 0 {
+			return isvcGeneration
+		}
 		return carried
 	}
 	stamp, err := strconv.ParseInt(raw, 10, 64)
@@ -310,11 +315,14 @@ func lifecycleObservedGeneration(ir *v1beta1.InferenceReplica, live *v1beta1.Lif
 }
 
 // allDeclaredComponents returns the ComponentTypes that have a
-// non-nil spec on the ISVC. Used by AggregateIRStatus to decide
-// which IRs to look up. Components whose specs are nil are not
-// reconciled by anything — including IR-managed paths — so we skip
-// them.
+// non-nil spec on the ISVC, or the roles it serves through referenced
+// replicas. Used by AggregateIRStatus to decide which IRs to look up.
+// Components whose specs are nil are not reconciled by anything —
+// including IR-managed paths — so we skip them.
 func allDeclaredComponents(isvc *v1beta1.InferenceService) []v1beta1.ComponentType {
+	if ReferencesReplicas(isvc) {
+		return ReferencedRoles(isvc)
+	}
 	var out []v1beta1.ComponentType
 	if isvc.Spec.Engine != nil {
 		out = append(out, v1beta1.EngineComponent)

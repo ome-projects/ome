@@ -386,7 +386,7 @@ func TestResetGangSurgeSourceAndRemoveMarker_CommitsBothOrNeither(t *testing.T) 
 	finalizes := 0
 	input := gangSurgeRecoveryInput("owner-a", "abandon", "test-ns", drifted, cloneTerminalStatus(source), cloneTerminalStatus(marker))
 	input.FinalizeInstanceResources = func(context.Context, int32) (bool, error) { finalizes++; return true, nil }
-	reset, err := ResetGangSurgeSourceAndRemoveMarker(context.Background(), deps, input, &source, &marker, surgeIndex, source.RunningRevision, targetRevision, "Stuck", true)
+	reset, err := ResetGangSurgeSourceAndRemoveMarker(context.Background(), deps, input, &source, &marker, surgeIndex, source.RunningRevision, targetRevision, "Stuck", types.CauseWorkload)
 	if err != nil || reset || drifted.writes != 0 || finalizes != 0 {
 		t.Fatalf("reset with drift: reset=%v writes=%d finalizes=%d err=%v", reset, drifted.writes, finalizes, err)
 	}
@@ -396,7 +396,7 @@ func TestResetGangSurgeSourceAndRemoveMarker_CommitsBothOrNeither(t *testing.T) 
 	}}
 	input = gangSurgeRecoveryInput("owner-a", "abandon", "test-ns", store, cloneTerminalStatus(source), cloneTerminalStatus(marker))
 	input.FinalizeInstanceResources = func(context.Context, int32) (bool, error) { finalizes++; return true, nil }
-	reset, err = ResetGangSurgeSourceAndRemoveMarker(context.Background(), deps, input, &source, &marker, surgeIndex, source.RunningRevision, targetRevision, "Stuck", true)
+	reset, err = ResetGangSurgeSourceAndRemoveMarker(context.Background(), deps, input, &source, &marker, surgeIndex, source.RunningRevision, targetRevision, "Stuck", types.CauseWorkload)
 	if err != nil || !reset || store.writes != 1 || finalizes != 1 {
 		t.Fatalf("reset: reset=%v writes=%d finalizes=%d err=%v", reset, store.writes, finalizes, err)
 	}

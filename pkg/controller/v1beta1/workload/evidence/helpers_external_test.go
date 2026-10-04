@@ -29,6 +29,7 @@ func servingPod(name string) *corev1.Pod {
 			Conditions: []corev1.PodCondition{
 				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
 				{Type: "ome.io/serving", Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 			},
 			ContainerStatuses: []corev1.ContainerStatus{{
 				Name:  "main",

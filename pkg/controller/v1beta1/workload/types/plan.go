@@ -134,6 +134,15 @@ type DemotionSelection struct {
 	Reason string
 }
 
+// NodeExclusion is one node an Instance's rebuild must not land on, and
+// the revision the exclusion was recorded for. A relocation directive is
+// evidence about one revision on one node; a rebuild at any other
+// revision is a different workload and lands wherever there is room.
+type NodeExclusion struct {
+	Node     string
+	Revision string
+}
+
 // InstancePlan is the desired state for one Instance — the atomic
 // unit of gang scheduling, restart, and migration.
 type InstancePlan struct {
@@ -163,9 +172,9 @@ type InstancePlan struct {
 	// the relocation-directive memory (AutoRecover ledger entries)
 	// projected through WorkloadObservedState.ExcludedNodesByInstance.
 	// Render materializes each entry as the same required NotIn
-	// hostname term the migration overlay uses. Empty for normal
-	// Instances.
-	ExcludedNodes []string
+	// hostname term the migration overlay uses, on a pod of the
+	// revision the entry was recorded for. Empty for normal Instances.
+	ExcludedNodes []NodeExclusion
 
 	// PeerHostnames is an optional render-time cache of the Instance's
 	// ordered peer-DNS host list (one entry per pod, flat gang-rank

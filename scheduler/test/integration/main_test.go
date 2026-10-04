@@ -35,6 +35,12 @@ func TestMain(m *testing.M) {
 	apiServerArgs := testEnv.ControlPlane.GetAPIServer().Configure()
 	apiServerArgs.Append("disable-admission-plugins", "TaintNodesByCondition", "Priority")
 	apiServerArgs.Append("runtime-config", "api/all=true")
+	// Widen etcd's raft timing so a busy host does not turn a slow proposal
+	// into "request timed out"; the single member still elects itself at once.
+	testEnv.ControlPlane.Etcd = &envtest.Etcd{}
+	etcdArgs := testEnv.ControlPlane.Etcd.Configure()
+	etcdArgs.Append("heartbeat-interval", "500")
+	etcdArgs.Append("election-timeout", "5000")
 
 	cfg, err := testEnv.Start()
 	if err != nil {

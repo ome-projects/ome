@@ -191,7 +191,9 @@ func advanceTransition(in Transition, wholeHomes bool) (Step, error) {
 		if home.Drained {
 			unbacked = current
 		} else if !home.Routable || home.Ready == 0 {
-			unbacked = max(int32(0), current-original)
+			// Ready replicas back the floor while the home awaits publication;
+			// only replicas that never came up are cancellable surplus.
+			unbacked = max(int32(0), current-max(original, home.Ready))
 		} else if wholeHomes {
 			// Unready surplus backs neither the original floor nor a serving
 			// replacement. It can leave with the rest of an abandoned home.

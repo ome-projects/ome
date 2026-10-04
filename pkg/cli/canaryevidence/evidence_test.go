@@ -101,7 +101,6 @@ func TestProjectPhaseAndBindingsAreClosed(t *testing.T) {
 	}{
 		{omev1beta1.RolloutPhaseStable, reportv1alpha1.RolloutPhaseStable, false, false, false},
 		{omev1beta1.RolloutPhaseCanarying, reportv1alpha1.RolloutPhaseCanarying, true, true, true},
-		{omev1beta1.RolloutPhaseBlueGreenStandby, reportv1alpha1.RolloutPhaseBlueGreenStandby, false, false, false},
 		{omev1beta1.RolloutPhasePending, reportv1alpha1.RolloutPhasePending, true, false, false},
 		{omev1beta1.RolloutPhasePaused, reportv1alpha1.RolloutPhasePaused, true, true, true},
 		{omev1beta1.RolloutPhasePromoting, reportv1alpha1.RolloutPhasePromoting, true, true, true},

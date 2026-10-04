@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -110,6 +111,10 @@ func HandleModelDeletion(ctx context.Context, kubeClient client.Client, nodeRead
 		// All entries are either cleared or marked for deletion, safe to remove finalizer
 		controllerutil.RemoveFinalizer(obj, finalizer)
 		if err := kubeClient.Update(ctx, obj); err != nil {
+			// Repeat the deletion checks from fresh state after concurrent writes.
+			if apierrors.IsConflict(err) {
+				return ctrl.Result{Requeue: true}, nil
+			}
 			log.Error(err, "Failed to remove finalizer", "model", modelInfo)
 			return ctrl.Result{}, err
 		}

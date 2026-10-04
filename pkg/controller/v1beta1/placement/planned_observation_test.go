@@ -187,6 +187,16 @@ func TestObservePlannedHome(t *testing.T) {
 				return c.List(ctx, list, opts...)
 			}
 		}, wantErr: true},
+		{name: "unreadable inventory keeps the acknowledged plan", edit: func(f *plannedObservationFixture) {
+			f.source.Status.Placement.Candidates[0].AppliedPlanID = "plan-a"
+			f.source.Status.Placement.Candidates[0].ReadyReplicas = 1
+			f.intercept.List = func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, components := list.(*v1beta1.InferenceReplicaList); components {
+					return fmt.Errorf("member inventory unavailable")
+				}
+				return c.List(ctx, list, opts...)
+			}
+		}, wantErr: true},
 		{name: "racing component version is unknown", edit: func(f *plannedObservationFixture) {
 			f.source.Status.Placement.Candidates[0].ReadyReplicas = 1
 			f.intercept.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
@@ -247,9 +257,11 @@ func TestObservePlannedHome(t *testing.T) {
 					AppliedPlan                       string
 					Ready                             int32
 				}
+				// An unverified pass grants no credit and keeps the plan it last acknowledged.
+				want := evidence{AppliedPlan: fixture.source.Status.Placement.Candidates[0].AppliedPlanID}
 				got := evidence{observation.Home.Known, observation.Candidate.ObservationKnown, observation.Candidate.AppliedPlanID, observation.Candidate.ReadyReplicas}
-				if diff := cmp.Diff(evidence{}, got); diff != "" {
-					t.Errorf("unverified inventory grants readiness or movement credit (-want +got):\n%s", diff)
+				if diff := cmp.Diff(want, got); diff != "" {
+					t.Errorf("unverified inventory evidence (-want +got):\n%s", diff)
 				}
 				return
 			}

@@ -67,7 +67,7 @@ type Sampler struct {
 
 type sampleEntry struct {
 	result analysis.Result
-	at     time.Time
+	at     time.Time // whole seconds: see Get
 }
 
 // NewPrometheusSampler builds the production Sampler: the Prometheus-backed eval
@@ -99,9 +99,11 @@ func NewSampler(eval evalFunc, events chan<- event.GenericEvent, maxConcurrency 
 
 // Get returns the cached result for req.Key when one was produced strictly after
 // `since` — i.e. a sample the caller has not already consumed (the caller passes
-// its last-consumed time and stores the returned producedAt). On a miss it ensures
-// a background query is in flight (deduped per key) and returns ok=false. It never
-// blocks on the query.
+// its last-consumed time and stores the returned producedAt). producedAt is at
+// whole seconds, the precision of the metav1.Time status field the caller keeps
+// it in; a finer stamp would read as newer than its own stored copy and be
+// served again. On a miss it ensures a background query is in flight (deduped
+// per key) and returns ok=false. It never blocks on the query.
 func (s *Sampler) Get(req SampleRequest, since time.Time) (result analysis.Result, producedAt time.Time, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -144,7 +146,7 @@ func (s *Sampler) run(req SampleRequest) {
 	res := s.eval(ctx, req)
 
 	s.mu.Lock()
-	s.cache[req.Key] = sampleEntry{result: res, at: s.now()}
+	s.cache[req.Key] = sampleEntry{result: res, at: s.now().Truncate(time.Second)}
 	delete(s.inflight, req.Key)
 	s.mu.Unlock()
 

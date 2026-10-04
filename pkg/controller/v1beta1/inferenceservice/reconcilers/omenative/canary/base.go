@@ -8,15 +8,28 @@ import (
 )
 
 // unitState is what the executor projects for one Component: the canary
-// record and the phase and traffic derived from it.
+// record, the phase and traffic derived from it, and the rolled-out revision
+// fields it publishes at the ladder's edges.
 type unitState struct {
-	canary  *v1beta1.CanaryStatus
-	phase   v1beta1.RolloutPhase
-	traffic []v1beta1.ComponentTrafficTarget
+	canary    *v1beta1.CanaryStatus
+	phase     v1beta1.RolloutPhase
+	traffic   []v1beta1.ComponentTrafficTarget
+	revisions rolledOutRevisions
+}
+
+// rolledOutRevisions is the executor-published revision triple of one
+// Component.
+type rolledOutRevisions struct {
+	ready, latest, previous string
 }
 
 func unitStateOf(cs v1beta1.ComponentStatusSpec) unitState {
-	return unitState{canary: cs.Canary.DeepCopy(), phase: cs.RolloutPhase, traffic: copyTraffic(cs.Traffic)}
+	return unitState{
+		canary:    cs.Canary.DeepCopy(),
+		phase:     cs.RolloutPhase,
+		traffic:   copyTraffic(cs.Traffic),
+		revisions: rolledOutRevisions{ready: cs.LatestReadyRevision, latest: cs.LatestRolledoutRevision, previous: cs.PreviousRolledoutRevision},
+	}
 }
 
 func copyTraffic(in []v1beta1.ComponentTrafficTarget) []v1beta1.ComponentTrafficTarget {
@@ -31,7 +44,7 @@ func copyTraffic(in []v1beta1.ComponentTrafficTarget) []v1beta1.ComponentTraffic
 }
 
 func (u unitState) equal(o unitState) bool {
-	return u.phase == o.phase &&
+	return u.phase == o.phase && u.revisions == o.revisions &&
 		equality.Semantic.DeepEqual(u.canary, o.canary) &&
 		equality.Semantic.DeepEqual(u.traffic, o.traffic)
 }
@@ -43,8 +56,9 @@ func (u unitState) equal(o unitState) bool {
 // what tells the two apart. A nil Base guards nothing.
 type Base struct {
 	// owned is every Component a canary group governs. The executor writes
-	// each one's traffic, and the primary's record and phase, so a secondary
-	// is guarded like the primary although it carries no record of its own.
+	// each one's traffic and rolled-out revision fields, and the primary's
+	// record and phase, so a secondary is guarded like the primary although
+	// it carries no record of its own.
 	owned map[v1beta1.ComponentType]struct{}
 	units map[v1beta1.ComponentType]unitState
 	alias *v1beta1.CanaryStatus
@@ -126,6 +140,9 @@ func (b *Base) PreserveFresh(dst, live *v1beta1.InferenceServiceStatus) bool {
 		entry.Canary = u.canary.DeepCopy()
 		entry.RolloutPhase = u.phase
 		entry.Traffic = copyTraffic(u.traffic)
+		entry.LatestReadyRevision = u.revisions.ready
+		entry.LatestRolledoutRevision = u.revisions.latest
+		entry.PreviousRolledoutRevision = u.revisions.previous
 		dst.Components[c] = entry
 	}
 	dst.Canary = current.alias.DeepCopy()

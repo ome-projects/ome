@@ -203,7 +203,7 @@ func TestCreate_RetryBlockHeld_DeniesFreshStart(t *testing.T) {
 	input.WarnRetryHeld = func(rev string, attempts int32, reason string) {
 		*warns = append(*warns, retryHeldWarning{rev: rev, attempts: attempts, reason: reason})
 	}
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, tcr.Name, "ImagePullBackOff", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, tcr.Name, "ImagePullBackOff", workload.CauseWorkload); err != nil {
 		t.Fatalf("seed Held block: %v", err)
 	}
 	if len(*warns) != 1 {
@@ -719,7 +719,7 @@ func TestRestartPhaseB_QuotaExceeded_WaitsWithoutFailing(t *testing.T) {
 	input := legacyTestInput(isvc, base, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	done, err := Restart(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], "pod lost")
+	done, err := Restart(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], nil, "pod lost")
 	if err != nil {
 		t.Fatalf("Restart: %v (a quota refusal is a wait, not an error)", err)
 	}
@@ -1096,7 +1096,7 @@ func TestMigrateSurge_InvalidPodSpec_FailsTheMigration(t *testing.T) {
 		return nil
 	}
 
-	done, accepted, err := Migrate(context.Background(), f.deps(), in, f.plan, record.SourceInstance, uuid, req)
+	done, accepted, err := Migrate(context.Background(), f.deps(), in, f.plan, f.target, record.SourceInstance, uuid, req)
 	if err != nil {
 		t.Fatalf("migrate pass: %v", err)
 	}
@@ -1201,7 +1201,7 @@ func TestRestartPhaseB_RejectionDispositions(t *testing.T) {
 			}
 			plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-			if _, err := Restart(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], "pod lost"); err != nil {
+			if _, err := Restart(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], nil, "pod lost"); err != nil {
 				t.Fatalf("Restart: %v (a classified rejection is disposed, not returned)", err)
 			}
 

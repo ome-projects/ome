@@ -262,6 +262,24 @@ spec:
                 - message: replacementTimeout requires ClusterAffinity Single placement
                   rule: '!has(self.replacementTimeout) || (has(self.policy) && self.policy
                     == ''ClusterAffinity'' && has(self.mode) && self.mode == ''Single'')'
+              replicaRefs:
+                properties:
+                  decoder:
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  engine:
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                  router:
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                type: object
               rollout:
                 properties:
                   groupOrdering:
@@ -1422,7 +1440,6 @@ spec:
                       enum:
                       - Stable
                       - Canarying
-                      - BlueGreenStandby
                       - Pending
                       - Paused
                       - Promoting

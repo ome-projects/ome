@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/builders"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/interfaces"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic"
 )
 
@@ -79,14 +80,14 @@ func (g *GatewayAPIStrategy) Reconcile(ctx context.Context, isvc *v1beta1.Infere
 			return err
 		}
 		ingressReady = ingressReady && ready
-		if isvc.Spec.Router != nil {
+		if irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) {
 			ready, err = g.reconcileComponentHTTPRoute(ctx, isvc, builders.RouterComponent)
 			if err != nil {
 				return err
 			}
 			ingressReady = ingressReady && ready
 		}
-		if isvc.Spec.Decoder != nil {
+		if irprojector.RoleDeclared(isvc, v1beta1.DecoderComponent) {
 			ready, err = g.reconcileComponentHTTPRoute(ctx, isvc, builders.DecoderComponent)
 			if err != nil {
 				return err
@@ -323,10 +324,10 @@ func (g *GatewayAPIStrategy) checkHTTPRouteStatuses(ctx context.Context, isvc *v
 		name      string
 		condition func() bool
 	}{
-		{constants.EngineServiceName(isvc.Name), func() bool { return true }},     // Engine: "<isvc>-engine"
-		{isvc.Name + "-router", func() bool { return isvc.Spec.Router != nil }},   // Router
-		{isvc.Name + "-decoder", func() bool { return isvc.Spec.Decoder != nil }}, // Decoder
-		{isvc.Name, func() bool { return true }},                                  // Top level: "<isvc>"
+		{constants.EngineServiceName(isvc.Name), func() bool { return true }},                                     // Engine: "<isvc>-engine"
+		{isvc.Name + "-router", func() bool { return irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) }},   // Router
+		{isvc.Name + "-decoder", func() bool { return irprojector.RoleDeclared(isvc, v1beta1.DecoderComponent) }}, // Decoder
+		{isvc.Name, func() bool { return true }},                                                                  // Top level: "<isvc>"
 	}
 
 	for _, comp := range components {
@@ -408,7 +409,7 @@ func (g *GatewayAPIStrategy) checkBackendTrafficPolicyStatus(ctx context.Context
 }
 
 func (g *GatewayAPIStrategy) getRawServiceHost(isvc *v1beta1.InferenceService) string {
-	if isvc.Spec.Router != nil {
+	if irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) {
 		routerName := isvc.Name + "-router" // Actual router service name
 		return routerName + "." + isvc.Namespace + ".svc.cluster.local"
 	}

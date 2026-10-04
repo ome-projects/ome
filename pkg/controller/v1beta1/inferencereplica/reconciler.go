@@ -119,6 +119,11 @@ type Reconciler struct {
 	// active delete wave. Zero disables cadence polling; watches and configured
 	// lifecycle deadlines still schedule progress.
 	ScaleDownRequeueInterval time.Duration
+	// RepairBatchSize is the startup-validated bound on the crash-loop repairs
+	// opened per Component in one pass, in Instance units. It is immutable for
+	// the manager process lifetime; nil preserves unbounded repair when the
+	// field is absent.
+	RepairBatchSize *int32
 
 	// APIReader is the live (uncached) API reader. Used for the
 	// correctness-critical reads in revision bookkeeping and immutable topology
@@ -423,6 +428,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	input.ScaleUpPodBatchSize = r.ScaleUpPodBatchSize
 	input.ScaleDownPodBatchSize = r.ScaleDownPodBatchSize
 	input.ScaleDownRequeueInterval = r.ScaleDownRequeueInterval
+	input.RepairBatchSize = r.RepairBatchSize
 
 	// Capture the update pass's rollout-hold verdict (if any) for the
 	// deferred status write below. execHoldObserved distinguishes "the
@@ -566,12 +572,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		if skipDeferredEffects {
 			return
 		}
-		// CurrentRevision promotion: component-level revision rollup against
+		// CurrentRevision rollup: component-level revision pair against
 		// the SPEC target (paired with the aggregator's UpdateRevision stamp;
 		// coordination reads their skew as RolloutInFlight, and canary
 		// rollback resolves stable revisions assuming CurrentRevision names
 		// the last fully-rolled-forward revision). Runs before the aggregator
-		// so the Ready condition below observes the promoted value. Conflict
+		// so the Ready condition below observes the rolled-up value. Conflict
 		// tolerance matches the aggregator: requeue, don't error.
 		if specTarget != nil {
 			if perr := buildPromoteCurrentRevision(r.statusWriter(), r.liveReader(), ir)(ctx, specTarget.Name); perr != nil {
@@ -604,10 +610,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// next pass, so a failed write must not skip it (symmetric with
 		// the non-nil-primary-error path).
 		r.sweepRevisions(ctx, ir)
-		if priorCurrentRevision != ir.Status.CurrentRevision && ir.Status.CurrentRevision != "" {
+		switch {
+		case priorCurrentRevision != ir.Status.CurrentRevision && ir.Status.CurrentRevision != "":
 			log.Info("Rollout complete; CurrentRevision promoted",
 				"previousCurrentRevision", priorCurrentRevision,
 				"currentRevision", ir.Status.CurrentRevision)
+		case priorCurrentRevision != "" && ir.Status.CurrentRevision == "":
+			log.Info("Rollout reopened; CurrentRevision withdrawn while an Instance still runs another revision",
+				"previousCurrentRevision", priorCurrentRevision,
+				"updateRevision", ir.Status.UpdateRevision)
 		}
 		if !priorAnyFailed && hasFailedInstance(ir.Status.InstanceStatuses) {
 			log.Info("Instance escalation observed; at least one Instance reached Phase=Failed")
@@ -654,6 +665,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// Past every fail-closed guard, so a pass that refuses to act writes
 	// nothing at all: report whether this Component has a readiness window.
 	r.reportInstanceReadyTimeout(ctx, log, ir, input, plan.InstanceReadyTimeout)
+
+	// The spec target is recorded in status before any pod renders it. A
+	// pass that ends between creating a pod and the deferred publication
+	// then leaves pods of the new revision beside a status that already
+	// names it, never beside one still reporting the previous revision as
+	// current and done.
+	if specTarget != nil && ir.Status.UpdateRevision != specTarget.Name {
+		if rerr := buildRecordUpdateRevision(r.statusWriter(), r.liveReader(), ir)(ctx, specTarget.Name); rerr != nil {
+			if errors.Is(rerr, workloadtypes.ErrStatusOwnerGone) {
+				return ctrl.Result{}, nil
+			}
+			if errors.Is(rerr, workloadtypes.ErrStatusMutationPrecondition) || apierrors.IsConflict(rerr) {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("InferenceReplica reconciler: record update revision (ir=%s/%s): %w",
+				ir.Namespace, ir.Name, rerr)
+		}
+		input.ObservedState.UpdateRevision = ir.Status.UpdateRevision
+	}
 
 	// Peer revision pairing for every pod rendered this pass: resolve each
 	// serving peer's roll-target revision and create that revision's
@@ -748,7 +778,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 	result, err = workload.Reconcile(ctx, deps, input, plan, rollTarget)
 	if err == nil {
-		if sweepErr := slices.sweep(ctx, input, plan); sweepErr != nil {
+		if lostErr := r.recoverLostSlices(ctx, ir, input, slices); lostErr != nil {
+			result = ctrl.Result{}
+			err = fmt.Errorf("InferenceReplica reconciler: recover lost TPU slices (component=%s): %w", ir.Spec.Component, lostErr)
+		} else if sweepErr := slices.sweep(ctx, input, plan); sweepErr != nil {
 			result = ctrl.Result{}
 			err = fmt.Errorf("InferenceReplica reconciler: sweep TPU slices (component=%s): %w", ir.Spec.Component, sweepErr)
 		}
@@ -1307,11 +1340,12 @@ func (r *Reconciler) resolveTeardownDeadline(log logr.Logger) (*time.Duration, s
 //     the live reader is touched only when a prune must persist).
 //  2. Projection: build the Instance-index → excluded-nodes map from
 //     the remaining AutoRecover entries, each list bounded to the most
-//     recent autoMigrateBudget entries.
+//     recent autoMigrateBudget entries and each node tagged with the
+//     revision its directive was recorded for.
 //
 // All errors fail open with a V(1) log: the overlay is a placement
 // steer, not a correctness gate, and the next pass re-derives it.
-func (r *Reconciler) reconcileRelocationDirectives(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, autoMigrateBudget int32) map[int32][]string {
+func (r *Reconciler) reconcileRelocationDirectives(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, autoMigrateBudget int32) map[int32][]workloadtypes.NodeExclusion {
 	if r.Client == nil || ir == nil {
 		return nil
 	}
@@ -1382,17 +1416,17 @@ func (r *Reconciler) reconcileRelocationDirectives(ctx context.Context, log logr
 	if autoMigrateBudget <= 0 {
 		return nil
 	}
-	var out map[int32][]string
+	var out map[int32][]workloadtypes.NodeExclusion
 	for i := range ir.Status.InstanceStatuses {
 		idx := ir.Status.InstanceStatuses[i].Index
-		nodes := audit.RecentAutoRecoverFromNodes(ledger, component, idx, autoMigrateBudget)
-		if len(nodes) == 0 {
+		exclusions := audit.RecentAutoRecoverExclusions(ledger, component, idx, autoMigrateBudget)
+		if len(exclusions) == 0 {
 			continue
 		}
 		if out == nil {
-			out = map[int32][]string{}
+			out = map[int32][]workloadtypes.NodeExclusion{}
 		}
-		out[idx] = nodes
+		out[idx] = exclusions
 	}
 	return out
 }

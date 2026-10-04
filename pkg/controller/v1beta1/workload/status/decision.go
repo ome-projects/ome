@@ -82,12 +82,22 @@ func StampFailedKeepingOperation(termination *types.InstanceTermination) func(*t
 // LastFailure in the same write so the wedged pod's diagnostics survive
 // the recreate or teardown that follows; nil leaves LastFailure alone.
 //
+// blamedIncarnation is the incarnation label of the pod the stamp blames,
+// zero when it carries none. The stamp is decided on the pass's
+// observation and applied to the fresh row, and only a Restart bumps a
+// row's incarnation: a blamed pod below the fresh row's incarnation is
+// the set a repair claimed since the observation. The repair owns that
+// set until its replacement runs, so the stamp is withheld.
+//
 // A fresh-empty slot (Phase=="") from the writer's append path is a
 // sentinel for a slot deleted out from under us — don't resurrect. An
 // already-Failed slot is a no-op.
-func StampFailedOnStuckPod(termination *types.InstanceTermination) func(*types.InstanceStatus) bool {
+func StampFailedOnStuckPod(termination *types.InstanceTermination, blamedIncarnation int64) func(*types.InstanceStatus) bool {
 	return func(s *types.InstanceStatus) bool {
 		if s.Phase == "" || s.Phase == types.InstancePhaseFailed {
+			return false
+		}
+		if blamedIncarnation > 0 && s.Incarnation > blamedIncarnation {
 			return false
 		}
 		s.Phase = types.InstancePhaseFailed
@@ -97,6 +107,19 @@ func StampFailedOnStuckPod(termination *types.InstanceTermination) func(*types.I
 		}
 		return true
 	}
+}
+
+// ApplyStamp runs one stamp through the single-row seam and reports
+// whether it changed the row. The seam consumes the stamp's own answer,
+// and a caller that announces the stamp has nothing to announce for one
+// the fresh row withheld.
+func ApplyStamp(ctx context.Context, input types.ReconcileInput, idx int32, stamp func(*types.InstanceStatus) bool) (bool, error) {
+	committed := false
+	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		committed = stamp(s)
+		return committed
+	})
+	return committed, err
 }
 
 // EnterReady flips s into Ready and stamps ReadySince when this is an
@@ -132,6 +155,22 @@ func DemoteUnbacked(ctx context.Context, input types.ReconcileInput, idx int32) 
 		return true
 	})
 	return demoted, err
+}
+
+// UnparkServing returns a crash-loop park, a Failed row with no operation
+// whose promoted set serves again, to Ready. ReadySince and the failure
+// record keep their times; note, when given, is appended to the message.
+func UnparkServing(ctx context.Context, input types.ReconcileInput, idx int32, note string) error {
+	return input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		if s.Phase != types.InstancePhaseFailed || s.Operation != nil || s.LastFailure == nil {
+			return false
+		}
+		s.Phase = types.InstancePhaseReady
+		if note != "" {
+			noteFailure(s, note)
+		}
+		return true
+	})
 }
 
 // StampDeadline writes Operation.Deadline and nothing else. A zero
@@ -253,7 +292,18 @@ func StampRecreating(ctx context.Context, input types.ReconcileInput, idx int32,
 // An Instance that never ran a revision has only the revision its
 // interrupted attempt pinned; the rebuilt pods carry it so the
 // per-revision Service selects them.
-func StampRestarting(ctx context.Context, input types.ReconcileInput, idx int32, reason string, timeout time.Duration) (int64, error) {
+//
+// A Restart stamped over a Failed row that already carries a Restart is
+// that repair's next attempt: the new operation's RetryCount continues
+// the spent one's, which is what the retry ladder is indexed by.
+//
+// failure, when given, is the termination of the pod set the restart
+// drains, captured into LastFailure in the same write, dated as
+// captured: the drain deletes the pod and its record with it, and a
+// rebuilt pod that keeps its name and dies the same way is a new failure
+// a reader anchored on the time must see. A stored record that differs
+// in nothing is left as it is.
+func StampRestarting(ctx context.Context, input types.ReconcileInput, idx int32, reason string, timeout time.Duration, failure *types.InstanceTermination) (int64, error) {
 	var observedIncarnation int64
 	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
 		if s.Phase == types.InstancePhaseRestarting &&
@@ -261,9 +311,19 @@ func StampRestarting(ctx context.Context, input types.ReconcileInput, idx int32,
 			observedIncarnation = s.Incarnation
 			return false
 		}
+		if failure != nil && !(sameFailureIdentity(s.LastFailure, failure) && s.LastFailure.Time.Equal(&failure.Time)) {
+			captured := *failure
+			s.LastFailure = &captured
+		}
 		pinned := ""
-		if s.RunningRevision == "" && s.TargetRevision == "" && s.Operation != nil {
-			pinned = s.Operation.TargetRevision
+		retries := int32(0)
+		if s.Operation != nil {
+			if s.RunningRevision == "" && s.TargetRevision == "" {
+				pinned = s.Operation.TargetRevision
+			}
+			if s.Phase == types.InstancePhaseFailed && s.Operation.Type == types.InstanceOperationRestart {
+				retries = s.Operation.RetryCount + 1
+			}
 		}
 		if s.Incarnation == 0 {
 			s.Incarnation = 1
@@ -280,11 +340,29 @@ func StampRestarting(ctx context.Context, input types.ReconcileInput, idx int32,
 			StartedAt:      now,
 			LastProgressAt: now,
 			Deadline:       types.DeadlineAt(now, timeout),
+			RetryCount:     retries,
 			TargetRevision: pinned,
 		}
 		return true
 	})
 	return observedIncarnation, err
+}
+
+// StampRestartRevision records rev as the revision an open repair rebuilds
+// at: RunningRevision on a Restarting row, written before the first pod of
+// the rebuild is created, so the row's revision names the pod set the
+// repair builds and every later pass renders and promotes that revision.
+// Any other row is left alone: the repair ended, or another pass owns the
+// row.
+func StampRestartRevision(ctx context.Context, input types.ReconcileInput, idx int32, rev string) error {
+	return input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		if s.Phase != types.InstancePhaseRestarting || s.Operation == nil ||
+			s.Operation.Type != types.InstanceOperationRestart || s.RunningRevision == rev {
+			return false
+		}
+		s.RunningRevision = rev
+		return true
+	})
 }
 
 // StampRecreateFromInPlace converts an in-flight in-place roll into
@@ -558,14 +636,36 @@ func RetryBlockStartAttempt(rb *types.RetryBlock) types.RetryBlockDisposition {
 	return types.RetryBlockPersist
 }
 
+// RowRemembersCrashOn reports whether a row Ready on rev records a
+// failure of its current promoted pod set (types.RemembersCrash).
+func RowRemembersCrashOn(rows []types.InstanceStatus, rev string) bool {
+	for i := range rows {
+		row := &rows[i]
+		if row.Phase == types.InstancePhaseReady && row.RunningRevision == rev && types.RemembersCrash(row) {
+			return true
+		}
+	}
+	return false
+}
+
 // RetryBlockPruneOnPromote removes the RetryBlock for rev once the
 // subject converges there: a converged subject leaves no active block.
+// A subject has not converged while a row Ready on rev remembers a crash
+// of its promoted pod set (RowRemembersCrashOn): the block counts that
+// crash and paces its rebuild, and the prune of a block its rows outlived
+// clears it once they do. A Held block is never pruned here: one row
+// converging on a revision whose ladder holds, on an attempt admitted
+// before the hold, does not make the revision sound, and the hold lasts
+// until a different target revision arrives or an operator releases it.
 // No-op when the adapter did not wire MutateRetryBlock, or rev is empty.
 func RetryBlockPruneOnPromote(ctx context.Context, input types.ReconcileInput, rev string) error {
-	if input.MutateRetryBlock == nil || rev == "" {
+	if input.MutateRetryBlock == nil || rev == "" || RowRemembersCrashOn(input.ObservedState.InstanceStatuses, rev) {
 		return nil
 	}
-	if err := input.MutateRetryBlock(ctx, rev, func(_ *types.RetryBlock) types.RetryBlockDisposition {
+	if err := input.MutateRetryBlock(ctx, rev, func(b *types.RetryBlock) types.RetryBlockDisposition {
+		if b.State == types.RetryBlockHeld {
+			return types.RetryBlockUnchanged
+		}
 		return types.RetryBlockRemove
 	}); err != nil {
 		return fmt.Errorf("prune retry block (rev=%s): %w", rev, err)

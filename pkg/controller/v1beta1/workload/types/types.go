@@ -184,7 +184,9 @@ type InstanceOperation struct {
 	LastProgressAt metav1.Time
 	// Deadline is the hard timeout for the current Step.
 	Deadline metav1.Time
-	// RetryCount is the per-step escalation counter.
+	// RetryCount counts the retries the operation has spent: the
+	// terminal-pod recycles inside an attempt and, for a Restart, the
+	// re-arms after it parked at Failed. The retry ladder indexes by it.
 	RetryCount int32
 
 	// TargetRevision is the ControllerRevision the operation is
@@ -258,8 +260,8 @@ type InstanceStatus struct {
 	PodCount int32
 	// ReadyPodCount counts pods reporting Ready=True.
 	ReadyPodCount int32
-	// ServingPodCount counts pods that are BOTH ContainersReady AND
-	// have serving=True on the controller-managed readiness gate.
+	// ServingPodCount counts pods in rotation: Ready by the control plane
+	// AND serving=True on the controller-managed readiness gate.
 	ServingPodCount int32
 	// AvailablePodCount counts pods in rotation on the Component's
 	// headless Service that, when MinReadySeconds is set, have been Ready

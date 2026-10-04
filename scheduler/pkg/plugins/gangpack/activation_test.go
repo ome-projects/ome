@@ -385,3 +385,56 @@ func TestGCPrunesTemplatesIncomplete(t *testing.T) {
 		t.Fatal("record for a gang with no live pods must be pruned by GC")
 	}
 }
+
+// TestPodGroupChangeActivatesParkedMembers: a PodGroup change stored by the
+// plugin's own informer wakes the gang's parked members, and the retry it
+// triggers reads the changed PodGroup. The scheduler requeues members on its own
+// PodGroup watch, which can run ahead of this informer; a member retried against
+// the older PodGroup parks again, so this is the wake-up tied to the cache
+// PreFilter actually reads.
+func TestPodGroupChangeActivatesParkedMembers(t *testing.T) {
+	ctx := context.Background()
+	leader := namedMember("leader")
+	g, h, nodes := twoMemberGang(leader)
+
+	// Lone member of a 2-member gang: parked short of minMember.
+	if _, st := g.PreFilter(ctx, newCycleState(), leader, nodes); st.Code() != framework.Unschedulable {
+		t.Fatalf("lone leader PreFilter = %v, want Unschedulable (templates incomplete)", st)
+	}
+	if h.activateCalls != 0 {
+		t.Fatalf("activate calls after lone leader = %d, want 0", h.activateCalls)
+	}
+
+	// minMember shrinks to 1; the plugin's informer stores the edit and reports it.
+	g.pgReader = fakeReader{"team/pf": {min: 1, topo: testKey, to: time.Minute}}
+	before := counterValue(t, gangActivationTotal.WithLabelValues(activationTriggerPodGroupChange))
+	g.podGroupChanged("team", "pf")
+	if h.activateCalls != 1 {
+		t.Fatalf("activate calls after PodGroup change = %d, want 1", h.activateCalls)
+	}
+	if _, ok := h.activated["team/leader"]; !ok {
+		t.Fatalf("activated = %v, want the parked leader", h.activated)
+	}
+	if d := counterValue(t, gangActivationTotal.WithLabelValues(activationTriggerPodGroupChange)) - before; d != 1 {
+		t.Fatalf("podgroup_change activation counter delta = %v, want 1", d)
+	}
+
+	// The retry reads the changed PodGroup: the gang is complete and proceeds,
+	// and the in-flight member wakes nobody else.
+	if _, st := g.PreFilter(ctx, newCycleState(), leader, nodes); !st.IsSuccess() {
+		t.Fatalf("leader PreFilter after minMember shrink = %v, want Success", st)
+	}
+	if h.activateCalls != 1 {
+		t.Fatalf("activate calls after the retry = %d, want still 1", h.activateCalls)
+	}
+}
+
+// TestPodGroupChangeWithoutMembersActivatesNobody: a PodGroup change for a gang
+// with no live pods is a no-op wake-up.
+func TestPodGroupChangeWithoutMembersActivatesNobody(t *testing.T) {
+	g, h, _ := twoMemberGang()
+	g.podGroupChanged("team", "pf")
+	if h.activateCalls != 0 {
+		t.Fatalf("activate calls for a gang with no pods = %d, want 0", h.activateCalls)
+	}
+}

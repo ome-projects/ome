@@ -74,10 +74,10 @@ func TestEvidenceFor_Deadline(t *testing.T) {
 		},
 	}
 
-	if ev := evidenceFor(insts, nil, 0, now, 30*time.Second); !ev.DeadlinePassed || ev.StuckPod != nil {
+	if ev := evidenceFor(insts, nil, 0, now, 30*time.Second, ""); !ev.DeadlinePassed || ev.StuckPod != nil {
 		t.Errorf("instance 0: got DeadlinePassed=%v StuckPod=%v, want true/nil", ev.DeadlinePassed, ev.StuckPod)
 	}
-	if ev := evidenceFor(insts, nil, 1, now, 30*time.Second); ev.DeadlinePassed {
+	if ev := evidenceFor(insts, nil, 1, now, 30*time.Second, ""); ev.DeadlinePassed {
 		t.Errorf("instance 1: future deadline must not be passed")
 	}
 }

@@ -424,6 +424,7 @@ func newReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Cli
 		WithStatusSubresource(&v1beta1.InferenceReplica{}).
 		WithIndex(&schedulingv1alpha1.PodGroup{}, workloadgang.PodGroupControllerUIDIndexField, workloadgang.PodGroupControllerUIDIndexExtractor).
 		WithIndex(&v1beta1.InferenceReplica{}, irUIDIndexField, irUIDIndexExtractor).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(o client.Object) []string { return []string{o.(*corev1.Pod).Spec.NodeName} }).
 		Build()
 	return &Reconciler{
 		Client:                   c,
@@ -493,6 +494,14 @@ func podForIR(ir *v1beta1.InferenceReplica, instanceIdx int32, runnerName string
 	if serving {
 		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
 			Type:               query.ServingConditionType,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: now,
+		})
+	}
+	if ready && serving {
+		// The kubelet folds a satisfied gate into the pod's Ready condition.
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type:               corev1.PodReady,
 			Status:             corev1.ConditionTrue,
 			LastTransitionTime: now,
 		})
@@ -1041,6 +1050,22 @@ func setSliceState(t *testing.T, c client.Client, name, state string) {
 		"conditions": []interface{}{
 			map[string]interface{}{"type": "Ready", "status": "True", "reason": state},
 		},
+	}
+	if err := c.Update(context.Background(), u); err != nil {
+		t.Fatalf("update slice %s: %v", name, err)
+	}
+}
+
+// setSlicePartitions assigns the slice the partitions ids, as the provider's
+// scheduler does.
+func setSlicePartitions(t *testing.T, c client.Client, name string, ids ...string) {
+	t.Helper()
+	u := getSlice(t, c, name)
+	if u == nil {
+		t.Fatalf("slice %s not found", name)
+	}
+	if err := unstructured.SetNestedStringSlice(u.Object, ids, "spec", "partitionIds"); err != nil {
+		t.Fatalf("set the partitions of slice %s: %v", name, err)
 	}
 	if err := c.Update(context.Background(), u); err != nil {
 		t.Fatalf("update slice %s: %v", name, err)

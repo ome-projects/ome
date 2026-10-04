@@ -90,14 +90,28 @@ var transitionWriteAllowlist = []allowedTransitionWrite{
 	},
 	{
 		file: "inferencereplica/convert.go", fn: "buildPromoteCurrentRevision", field: "CurrentRevision", count: 2,
-		why: "the ONE promotion decision site: stamps CurrentRevision = spec target iff " +
-			"RolloutComplete (persisted write), then mirrors the committed value onto the " +
+		why: "the ONE rollup decision site: stamps CurrentRevision from status.CurrentRevisionFor " +
+			"(the spec target once every Instance is Ready on it, withdrawn while an Instance still " +
+			"runs another revision; persisted write), then mirrors the committed value onto the " +
 			"caller's in-memory IR (second assignment) so the deferred aggregator observes it",
 	},
 	{
+		file: "inferencereplica/convert.go", fn: "buildRecordUpdateRevision", field: "UpdateRevision", count: 2,
+		why: "the UpdateRevision record ahead of dispatch: names the spec target on the component " +
+			"pair before any pod renders it (persisted write), then mirrors the committed name onto " +
+			"the caller's in-memory IR (second assignment); the aggregator restates the same name",
+	},
+	{
+		file: "inferencereplica/reconciler.go", fn: "Reconcile", field: "UpdateRevision", count: 1,
+		why: "copies the just-recorded target onto the pass's LOCAL ReconcileInput copy " +
+			"(pass-by-value) so the engine reads the spec target the status now names; never " +
+			"persisted — not a component-pair decision",
+	},
+	{
 		file: "inferencereplica/status.go", fn: "aggregateAndWriteStatus", field: "UpdateRevision", count: 1,
-		why: "the ONE UpdateRevision stamp: the aggregator names the spec/canary target on the " +
-			"component pair; per-instance transition fields stay untouched",
+		why: "the publication's UpdateRevision stamp: restates the spec/canary target the record " +
+			"ahead of dispatch named on the component pair, and names it when that record did not " +
+			"run; per-instance transition fields stay untouched",
 	},
 	{
 		file: "inferencereplica/status.go", fn: "aggregateAndWriteStatus", field: "Phase", count: 1,

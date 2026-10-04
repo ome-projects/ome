@@ -3,12 +3,13 @@ package types
 import "time"
 
 // PassWake is the pass-scoped sink for a wake-up an op pass owes but has
-// no result of its own to carry: a row held on operator configuration
-// that no watch event will announce — nothing in the cluster changes
-// when a ConfigMap key finally appears. The op deposits the wake-up here
-// and the dispatcher merges it into the pass result, so the hold is
-// re-consulted instead of waiting for an unrelated event or the resync.
-// All methods are nil-safe.
+// no result of its own to carry: a wait that no watch event will
+// announce, such as a row held on operator configuration — nothing in
+// the cluster changes when a ConfigMap key finally appears — or a pod
+// read inside the stuck-pod grace, whose grace ends with no status
+// change. The op deposits the wake-up here and the dispatcher merges it
+// into the pass result, so the wait is re-consulted instead of waiting
+// for an unrelated event or the resync. All methods are nil-safe.
 type PassWake struct {
 	pending time.Duration
 	bare    bool

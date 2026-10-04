@@ -85,7 +85,7 @@ func (r *Reconciler) resolvePeerRevisions(ctx context.Context, ir *v1beta1.Infer
 	}
 	ownGeneration := ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]
 	for _, peer := range coordination.ServingPeers(parent, ir.Spec.Component) {
-		peerIR, err := irprojector.ComponentIR(ctx, r.Client, ir.Namespace, ir.ParentName(), peer)
+		peerIR, err := irprojector.ComponentIRFor(ctx, r.Client, parent, peer)
 		if err != nil {
 			return nil, "", err
 		}

@@ -108,6 +108,10 @@ func podHasServingCondition(pod *corev1.Pod) bool {
 //     only; otherwise fall through to recreate.
 //   - InPlaceOnly: image-patch when eligible; error otherwise.
 //
+// Under either in-place strategy, a recreate already in flight on the
+// Instance completes as a recreate whatever the diff against the target
+// now says (recreateInFlight).
+//
 // done=true once Phase=Ready with RunningRevision=target.Name.
 //
 // Self-lists the Component's pods (cached) then filters to this Instance.
@@ -181,13 +185,37 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 	// the chooser compares against the workload constants directly. It is
 	// the attempt's pinned strategy once one is in flight.
 	strategy := plan.UpdateStrategy.Type
-	mode, err := chooseUpdateModeForInstance(strategy, runningSpec, targetSpec, multiPod)
-	if err != nil {
-		// InPlaceOnly + ineligible diff is the only error path here.
-		workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonInPlaceUpdateNotPossible,
-			"OMENative %s rejected update: %v",
-			workload.InstanceKey(input.Key.Component, inst.Index), err)
-		return false, fmt.Errorf("choose update mode (instance=%d): %w", inst.Index, err)
+	var mode updateMode
+	if inPlaceStrategy(strategy) && recreateInFlight(observed) {
+		// An in-place strategy resolves its mechanism from the diff between
+		// the running revision and the target, and a recreate it fell back
+		// to leaves that diff stale: the pod set was rendered from the
+		// revision the attempt opened for, so the running revision's PodSpec
+		// describes none of the live pods and offers nothing to patch from.
+		// The attempt completes as the recreate it is. A target that
+		// moves meanwhile, back onto the running revision included, is
+		// reached by tearing that set down and rebuilding it at the target,
+		// which the recreate stamp does on a retarget.
+		mode = updateModeRecreate
+	} else {
+		mode, err = chooseUpdateModeForInstance(strategy, runningSpec, targetSpec, multiPod)
+		if err != nil {
+			// InPlaceOnly + ineligible diff is the only error path here.
+			workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonInPlaceUpdateNotPossible,
+				"OMENative %s rejected update: %v",
+				workload.InstanceKey(input.Key.Component, inst.Index), err)
+			return false, fmt.Errorf("choose update mode (instance=%d): %w", inst.Index, err)
+		}
+	}
+
+	// A surge keeps the serving source in rotation while its replacement
+	// comes up. An Instance that was never promoted has no such source, and
+	// a surge beside the pod set its disposed attempt left behind would only
+	// add a second replacement; its re-drive rebuilds the set in place. The
+	// recreate stamp pins that mechanism on the attempt.
+	if mode == updateModeSurge && SurgeHasNoSource(observed) {
+		mode = updateModeRecreate
+		plan.UpdateStrategy.Type = workload.UpdateStrategyRecreatePod
 	}
 
 	// Status stamping is per-mode: recreate bumps Incarnation atomically
@@ -229,29 +257,75 @@ const (
 	updateModeSurge
 )
 
-// InPlaceFallsBackToRecreate reports whether an in-place strategy runs as
-// a recreate on this Instance. inPlaceEligible compares only the leader's
-// PodSpec, so a multi-pod Instance always rebuilds: a worker-only image
-// bump patched in place would leave the workers on the old image
-// (split-brain). Both in-place variants fall back the same way, whatever
-// the diff; InPlaceOnly's strict rejection applies to single-pod
-// Instances only. The update pass reads this ahead of the coordination
-// gate consult, since a fallback recreate takes capacity out of rotation
-// the way any drain-first start does.
-func InPlaceFallsBackToRecreate(strategy workload.UpdateStrategyType, multiPod bool) bool {
-	return multiPod && (strategy == workload.UpdateStrategyInPlaceIfPossible ||
-		strategy == workload.UpdateStrategyInPlaceOnly)
+// RunningPodSpecFunc loads the PodSpec recorded by an Instance's running
+// revision on demand. nil with no error is no recorded baseline.
+type RunningPodSpecFunc func() (*corev1.PodSpec, error)
+
+// recreateInFlight reports whether the row carries a recreate attempt: an
+// Update on its Drain step, which tears the pod set down and rebuilds it
+// at a bumped Incarnation.
+func recreateInFlight(s *workload.InstanceStatus) bool {
+	return workload.StateOf(s) == workload.StateUpdateDrain
 }
 
-// chooseUpdateModeForInstance is chooseUpdateMode with the multi-pod
-// adjustment layered on top: in-place modes route to recreate for a gang
-// (InPlaceFallsBackToRecreate). SurgeThenDrain keeps updateModeSurge for
-// gangs — surgeUpdate performs a per-gang index surge (a whole
-// replacement gang at a fresh instance index, gang-scheduled via its own
-// PodGroup, then the source gang is drained). RecreatePod is already
-// recreate; multiPod has no additional effect on it.
+// inPlaceStrategy reports whether strategy is one of the two that patch
+// pods where they run and resolve a recreate from the diff instead.
+func inPlaceStrategy(strategy workload.UpdateStrategyType) bool {
+	return strategy == workload.UpdateStrategyInPlaceIfPossible || strategy == workload.UpdateStrategyInPlaceOnly
+}
+
+// SurgeHasNoSource reports whether a fresh start on the row has nothing a
+// surge could keep in rotation: the Instance was never promoted, so no pod
+// of its is a serving source, and the attempt that built its pod set has
+// been disposed. Such a start runs as a recreate under every strategy, so
+// the update pass reads it here to consult the admission gate for a
+// rebuild rather than a surge.
+func SurgeHasNoSource(s *workload.InstanceStatus) bool {
+	return s != nil && s.RunningRevision == "" && s.Phase == workload.InstancePhaseFailed && s.Operation == nil
+}
+
+// InPlaceFallsBackToRecreate reports whether an in-place strategy runs as
+// a recreate on this Instance. A multi-pod Instance always rebuilds under
+// either in-place variant: inPlaceEligible compares only the leader's
+// PodSpec, so a worker-only image bump patched in place would leave the
+// workers on the old image (split-brain). A single-pod InPlaceIfPossible
+// start rebuilds when its diff against the running revision's PodSpec
+// exceeds regular-container images, or when no baseline is recorded; the
+// running PodSpec is loaded only for that case. InPlaceOnly's strict
+// rejection of such a diff on a single-pod Instance is not a fallback:
+// nothing starts. The update pass reads this ahead of the coordination
+// gate consult, since a fallback recreate takes capacity out of rotation
+// the way any drain-first start does.
+func InPlaceFallsBackToRecreate(strategy workload.UpdateStrategyType, multiPod bool, target *corev1.PodSpec, running RunningPodSpecFunc) (bool, error) {
+	switch strategy {
+	case workload.UpdateStrategyInPlaceOnly:
+		return multiPod, nil
+	case workload.UpdateStrategyInPlaceIfPossible:
+		if multiPod {
+			return true, nil
+		}
+		runningSpec, err := running()
+		if err != nil {
+			return false, err
+		}
+		return !inPlaceEligible(runningSpec, target), nil
+	}
+	return false, nil
+}
+
+// chooseUpdateModeForInstance is chooseUpdateMode with the fallback rule
+// layered on top: an in-place strategy routes to recreate wherever
+// InPlaceFallsBackToRecreate says it rebuilds. SurgeThenDrain keeps
+// updateModeSurge for gangs — surgeUpdate performs a per-gang index surge
+// (a whole replacement gang at a fresh instance index, gang-scheduled via
+// its own PodGroup, then the source gang is drained). RecreatePod is
+// already recreate; multiPod has no additional effect on it.
 func chooseUpdateModeForInstance(strategy workload.UpdateStrategyType, running, target *corev1.PodSpec, multiPod bool) (updateMode, error) {
-	if InPlaceFallsBackToRecreate(strategy, multiPod) {
+	fallback, err := InPlaceFallsBackToRecreate(strategy, multiPod, target, func() (*corev1.PodSpec, error) { return running, nil })
+	if err != nil {
+		return 0, err
+	}
+	if fallback {
 		return updateModeRecreate, nil
 	}
 	return chooseUpdateMode(strategy, running, target)
@@ -328,17 +402,34 @@ func loadRunningRevisionPayload(ctx context.Context, reads client.Reader, input 
 	if s == nil || s.RunningRevision == "" {
 		return nil, nil
 	}
+	return loadRevisionPayload(ctx, reads, input.Key.Namespace, s.RunningRevision)
+}
+
+// RevisionPodSpec returns the PodSpec the named ControllerRevision records,
+// read through reads: the baseline a single-pod in-place start's diff is
+// judged against. (nil, nil) when the revision is gone — no baseline,
+// which the mode choice reads as a recreate.
+func RevisionPodSpec(ctx context.Context, reads client.Reader, namespace, name string) (*corev1.PodSpec, error) {
+	payload, err := loadRevisionPayload(ctx, reads, namespace, name)
+	if err != nil || payload == nil {
+		return nil, err
+	}
+	return payload.PodSpec, nil
+}
+
+// loadRevisionPayload reads the named ControllerRevision through reads and
+// decodes its payload. (nil, nil) when the revision is gone.
+func loadRevisionPayload(ctx context.Context, reads client.Reader, namespace, name string) (*revision.DataPayload, error) {
 	cr := &appsv1.ControllerRevision{}
-	key := client.ObjectKey{Namespace: input.Key.Namespace, Name: s.RunningRevision}
-	if err := reads.Get(ctx, key, cr); err != nil {
+	if err := reads.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cr); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("get running CR %s: %w", s.RunningRevision, err)
+		return nil, fmt.Errorf("get running CR %s: %w", name, err)
 	}
 	var payload revision.DataPayload
 	if err := json.Unmarshal(cr.Data.Raw, &payload); err != nil {
-		return nil, fmt.Errorf("unmarshal running CR %s data: %w", s.RunningRevision, err)
+		return nil, fmt.Errorf("unmarshal running CR %s data: %w", name, err)
 	}
 	return &payload, nil
 }
@@ -432,6 +523,10 @@ type UpdateTriggerDecision struct {
 	// Backoff RetryBlock for the current target; re-evaluate then. 0
 	// otherwise (including Held, which has no time bound).
 	RetryAfter time.Duration
+	// RetryBlockDenied: fresh re-triggering was denied by the current
+	// target's RetryBlock — Held, an attempt already in flight, or a
+	// Backoff not yet due (RetryAfter carries its wake-up).
+	RetryBlockDenied bool
 	// AdoptRevision: RunningRevision is empty but the Instance's
 	// runtime-ready pods already match the target — stamp
 	// Ready-on-target (BackfillRunningRevision) so future evaluations
@@ -497,7 +592,7 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 		denied, retryAfter := evaluateRetryBlockGate(b, input.Now(),
 			anyInFlightUpdateAt(input.ObservedState.InstanceStatuses, target.Name))
 		if denied {
-			return UpdateTriggerDecision{RetryAfter: retryAfter}, false
+			return UpdateTriggerDecision{RetryAfter: retryAfter, RetryBlockDenied: true}, false
 		}
 	}
 
@@ -641,6 +736,27 @@ func isGangSurgeTargetMarker(s *workload.InstanceStatus) bool {
 			s.Operation.Step == workload.UpdateStepGangSurgeTargetCleanup)
 }
 
+// RetryBlockDenyingFreshStart returns the target's RetryBlock when it
+// denies a fresh start this pass — a Held ladder, an attempt already in
+// flight under RetryInProgress, or a Backoff not yet due — and nil when
+// the target carries no block or one that admits a start. It is the
+// trigger gate's own reading (evaluateRetryBlockGate), so a caller that
+// asks about the Component as a whole, rather than one Instance that
+// reached the trigger, agrees with the trigger's per-Instance verdict.
+func RetryBlockDenyingFreshStart(input workload.ReconcileInput, target *appsv1.ControllerRevision) *workload.RetryBlock {
+	if target == nil {
+		return nil
+	}
+	b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, target.Name)
+	if b == nil {
+		return nil
+	}
+	if denied, _ := evaluateRetryBlockGate(b, input.Now(), anyInFlightUpdateAt(input.ObservedState.InstanceStatuses, target.Name)); !denied {
+		return nil
+	}
+	return b
+}
+
 // anyInFlightUpdateAt reports whether any Instance carries an in-flight
 // Update Operation targeting rev. Used by the retry gate to distinguish
 // a live RetryInProgress authorization from one leaked by a superseded
@@ -653,6 +769,135 @@ func anyInFlightUpdateAt(statuses []workload.InstanceStatus, rev string) bool {
 		}
 	}
 	return false
+}
+
+// ProvenWindowSeconds is how long, in whole seconds, a promoted pod that
+// restarted since its Instance entered Ready must hold Ready again
+// before the roll reads it as serving: the Component's minReadySeconds
+// floored by the stuck-pod grace, the span the workload already grants
+// a pod to prove it is not crash-looping. With neither configured, Ready
+// is Available, as it is for a pod that never restarted.
+func ProvenWindowSeconds(minReadySeconds int32, stuckPodGrace time.Duration) int32 {
+	grace := math.Ceil(stuckPodGrace.Seconds())
+	if grace > math.MaxInt32 {
+		grace = math.MaxInt32
+	}
+	return max(minReadySeconds, int32(grace))
+}
+
+// RebuiltAfterFailure reports whether pod is the rebuild answering a death
+// of the set the roll is landing: the Instance's recorded failure names a
+// container of the set that died or wedged, it is younger than the
+// revision being rolled, and pod was created no earlier than it and
+// inside the proven window of it. The failure outlives the pod that
+// failed, so such a pod is the set's comeback, and the roll reads it as
+// serving only once it has held Ready for the window since its readiness
+// moved, exactly as a pod the kubelet restarted in place. The window is
+// measured from the recorded failure, so every rebuild created inside it
+// is bounded by it, however many answer the same record.
+//
+// A failure older than the revision being rolled belongs to a set of a
+// superseded revision, so a push that corrects a crashing revision rolls
+// its fresh sets unheld; a revision whose creation is not known cannot
+// be placed and does not exclude. A record with no container names a
+// wait the pod never served through, not a death of the set. A pod
+// created with no such failure recorded, or past the window of one, is a
+// fresh start, read by its serving state alone.
+func RebuiltAfterFailure(pod *corev1.Pod, failure *workload.InstanceTermination, revisionBorn time.Time, window int32) bool {
+	if pod == nil || failure == nil || failure.Time.IsZero() || failure.ContainerName == "" ||
+		pod.CreationTimestamp.IsZero() || window <= 0 {
+		return false
+	}
+	failedAt := failure.Time.Time
+	if !revisionBorn.IsZero() && !failedAt.After(revisionBorn) {
+		return false
+	}
+	created := pod.CreationTimestamp.Time
+	return !created.Before(failedAt) && created.Before(failedAt.Add(time.Duration(window)*time.Second))
+}
+
+// RolledInstanceNotServing reports whether row is an Instance the roll
+// already moved onto target that does not serve it: its pod set on that
+// revision is short of fully serving, or its runner container restarted
+// since the row entered Ready and has not served since. Nothing is left
+// to retry for such an Instance and nothing but a repair or a corrected
+// revision changes it, so it is the roll's open work: the update pass
+// counts it against the budget of the strategy's arm ahead of any fresh
+// start, and under SurgeThenDrain keeps every further source in
+// rotation while the count exceeds the unavailability budget. A row with
+// an attempt in flight is anchored by the in-flight counts instead, and
+// a row a migration owns is the record's.
+//
+// A restart after Ready holds the slot while the container is down, and
+// while it is Ready again but has not held Ready for window seconds:
+// the Component's minReadySeconds floored by the stuck-pod grace
+// (ProvenWindowSeconds). A comeback shorter than the span the workload
+// grants a pod to prove it is not crash-looping proves nothing, so the
+// set stays unproven and the roll starts nothing further on its
+// account. The kubelet moves the Ready condition's transition time when
+// a pod leaves and re-enters Ready across a restart, so Available on
+// the pod (podreadiness.IsPodAvailable) reads "Ready again and held it
+// for the window" off that clock. The duration is how long until a pod
+// Ready again clears the window, zero when only a watch event changes
+// the verdict. A rebuild is the set's restart as much as a restart in
+// place: the failure that opened it outlives the pod that failed, on
+// the row's LastFailure, and a pod created inside the window after a
+// death of the set on the revision being rolled is the rebuild answering
+// it (RebuiltAfterFailure), unproven until it has held Ready for the
+// window since its readiness moved. The hold belongs to sets of the
+// revision being rolled alone: a failure of the set the Instance ran on
+// a superseded revision never holds the new roll, so a corrected push
+// lands as a fresh roll. A pod that never restarted since Ready and
+// answers no such failure is read off its serving state alone:
+// minReadySeconds already paced its promotion. A container that has
+// restarted more than once since Ready (RunnerRestartedAgainSinceReady)
+// keeps restarting: it is up only between its crashes, so it keeps the
+// slot through those windows whatever their length, and the roll never
+// creeps forward on them. The reason names what holds the slot, for the
+// pass to log; it is empty when nothing does.
+func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revisionBorn time.Time, pods []*corev1.Pod, desired, window int32, now time.Time) (bool, time.Duration, string) {
+	if row == nil || target == "" || row.RunningRevision != target {
+		return false, 0, ""
+	}
+	if workload.UpdateContinuation(row) || isMigrateOwnedStatus(row) {
+		return false, 0, ""
+	}
+	targetRev := query.RevisionFromName(target)
+	own := make([]*corev1.Pod, 0, len(pods))
+	held, wait, reason := false, time.Duration(0), ""
+	for _, pod := range pods {
+		if pod == nil || pod.DeletionTimestamp != nil {
+			continue
+		}
+		if podRev := query.RevisionFromPod(pod); !podRev.IsZero() && !podRev.Same(targetRev) {
+			continue
+		}
+		comeback := ""
+		if RebuiltAfterFailure(pod, row.LastFailure, revisionBorn, window) {
+			comeback = fmt.Sprintf("pod %s rebuilt after the failure recorded at %s", pod.Name, row.LastFailure.Time.UTC().Format(time.RFC3339))
+		}
+		if _, restarted := RunnerRestartedSinceReady(pod, row.ReadySince); restarted {
+			if RunnerRestartedAgainSinceReady(pod, row.ReadySince) {
+				return true, 0, fmt.Sprintf("pod %s restarted again since Ready", pod.Name)
+			}
+			comeback = fmt.Sprintf("pod %s restarted since Ready", pod.Name)
+		}
+		if comeback != "" {
+			if available, remaining := podreadiness.IsPodAvailable(pod, window, now); !available {
+				held = true
+				wait = max(wait, remaining)
+				reason = fmt.Sprintf("%s, Ready again for less than the %ds window (%s left)", comeback, window, remaining.Round(time.Second))
+			}
+		}
+		own = append(own, pod)
+	}
+	if held {
+		return true, wait, reason
+	}
+	if !query.PodSetFullyServing(own, desired) {
+		return true, 0, fmt.Sprintf("pod set not fully serving (%d of %d pods on the revision)", len(own), desired)
+	}
+	return false, 0, ""
 }
 
 // Wreckage is per-instance rollout debris keyed to a SUPERSEDED
@@ -775,7 +1020,7 @@ func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.Rec
 	if failedGangSurgeContinuation(s, target.Name) {
 		return abandonFailedGangSurge(ctx, deps, input, plan, inst.Index, *s.Operation.SurgeIndex,
 			s.RunningRevision, s.Operation.TargetRevision,
-			instanceFailureReason(s, "gang surge abandoned after a corrective edit"), instanceFailureWorkloadCaused(s))
+			instanceFailureReason(s, "gang surge abandoned after a corrective edit"), instanceFailureCause(s))
 	}
 
 	aliens := alienRevisionPods(s, target.Name, instancePods)

@@ -11,18 +11,32 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
-// ComponentIR returns the authoritative InferenceReplica for one Component of
-// an ISVC. Returns (nil, nil) when the IR does not exist yet. Any other read
-// failure is returned as a wrapped error so safety gates can distinguish a
-// missing observation from an unreliable read.
+// ComponentIR returns the InferenceReplica an ISVC projects for one
+// Component, by its projected name. Returns (nil, nil) when the IR does not
+// exist yet. Any other read failure is returned as a wrapped error so safety
+// gates can distinguish a missing observation from an unreliable read.
 func ComponentIR(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, error) {
+	return componentIRAt(ctx, reads, types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)})
+}
+
+// ComponentIRFor is ComponentIR for whichever replica serves role c on the
+// service, projected or referenced. Returns (nil, nil) for a nil service.
+func ComponentIRFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, error) {
+	if isvc == nil {
+		return nil, nil
+	}
+	return componentIRAt(ctx, reads, RoleReplicaKey(isvc, c))
+}
+
+// componentIRAt reads the InferenceReplica at key. (nil, nil) when it does
+// not exist; any other read failure is wrapped with the key.
+func componentIRAt(ctx context.Context, reads client.Reader, key types.NamespacedName) (*v1beta1.InferenceReplica, error) {
 	// A nil reader degrades to "no authoritative status" rather than
 	// panicking a reconcile — same result callers get for a missing IR.
 	if reads == nil {
 		return nil, nil
 	}
 	ir := &v1beta1.InferenceReplica{}
-	key := types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)}
 	if err := reads.Get(ctx, key, ir); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil
@@ -50,7 +64,7 @@ func EffectivePartition(lifecycle *v1beta1.LifecycleSpec, pacing *v1beta1.Infere
 	return lifecycle.UpdateStrategy.RollingUpdate.Partition
 }
 
-// IRPartition returns the effective partition carried on a projected
+// IRPartition returns the effective partition carried on an
 // InferenceReplica spec (see EffectivePartition), or 0 (the API-defined
 // "update every Instance" value) when the IR is nil or no partition is
 // set. Shared by ComponentIRPartition and callers that already hold the
@@ -71,7 +85,18 @@ func IRPartition(ir *v1beta1.InferenceReplica) int32 {
 // owns missing and error semantics so status-only consumers share the same
 // behavior as consumers that also need desired spec state.
 func ComponentIRStatus(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
-	ir, err := ComponentIR(ctx, reads, namespace, isvcName, c)
+	return statusOf(ComponentIR(ctx, reads, namespace, isvcName, c))
+}
+
+// ComponentIRStatusFor is ComponentIRStatus for whichever replica serves
+// role c on the service, projected or referenced.
+func ComponentIRStatusFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
+	return statusOf(ComponentIRFor(ctx, reads, isvc, c))
+}
+
+// statusOf projects a full-object read onto its status, preserving the
+// (nil, nil) missing case and the error case.
+func statusOf(ir *v1beta1.InferenceReplica, err error) (*v1beta1.InferenceReplicaStatus, error) {
 	if err != nil || ir == nil {
 		return nil, err
 	}
@@ -85,11 +110,27 @@ func ComponentIRStatus(ctx context.Context, reads client.Reader, namespace, isvc
 // is an error, never an empty row set. ComponentIR and ComponentIRStatus stay
 // raw for callers that read only spec, metadata, or top-level status.
 func DecodedComponentIR(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
+	return decodedComponentIRAt(ctx, reads, types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)})
+}
+
+// DecodedComponentIRFor is DecodedComponentIR for whichever replica serves
+// role c on the service, projected or referenced. Returns (nil, "", nil)
+// for a nil service.
+func DecodedComponentIRFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
+	if isvc == nil {
+		return nil, "", nil
+	}
+	return decodedComponentIRAt(ctx, reads, RoleReplicaKey(isvc, c))
+}
+
+// decodedComponentIRAt reads and decodes the InferenceReplica at key.
+// (nil, "", nil) when it does not exist; any other read or decode failure
+// is wrapped with the key.
+func decodedComponentIRAt(ctx context.Context, reads client.Reader, key types.NamespacedName) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
 	if reads == nil {
 		return nil, "", nil
 	}
 	ir := &v1beta1.InferenceReplica{}
-	key := types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)}
 	encoding, err := irstatus.GetDecoded(ctx, reads, key, ir)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -104,10 +145,14 @@ func DecodedComponentIR(ctx context.Context, reads client.Reader, namespace, isv
 // InferenceReplica, or nil when the IR does not exist yet.
 func DecodedComponentIRStatus(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
 	ir, _, err := DecodedComponentIR(ctx, reads, namespace, isvcName, c)
-	if err != nil || ir == nil {
-		return nil, err
-	}
-	return &ir.Status, nil
+	return statusOf(ir, err)
+}
+
+// DecodedComponentIRStatusFor is DecodedComponentIRStatus for whichever
+// replica serves role c on the service, projected or referenced.
+func DecodedComponentIRStatusFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
+	ir, _, err := DecodedComponentIRFor(ctx, reads, isvc, c)
+	return statusOf(ir, err)
 }
 
 // ComponentIRPartition returns the effective partition for one Component
@@ -126,7 +171,18 @@ func DecodedComponentIRStatus(ctx context.Context, reads client.Reader, namespac
 // returned as a wrapped error so safety gates can fail closed instead of
 // mistaking a flaky read for "no partition".
 func ComponentIRPartition(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (int32, error) {
-	ir, err := ComponentIR(ctx, reads, namespace, isvcName, c)
+	return partitionOf(ComponentIR(ctx, reads, namespace, isvcName, c))
+}
+
+// ComponentIRPartitionFor is ComponentIRPartition for whichever replica
+// serves role c on the service, projected or referenced.
+func ComponentIRPartitionFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (int32, error) {
+	return partitionOf(ComponentIRFor(ctx, reads, isvc, c))
+}
+
+// partitionOf projects a full-object read onto its effective partition,
+// propagating a read error and mapping a missing IR to 0.
+func partitionOf(ir *v1beta1.InferenceReplica, err error) (int32, error) {
 	if err != nil {
 		return 0, err
 	}

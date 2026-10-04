@@ -37,8 +37,8 @@ func TestForceDeleteEntries_InertForAutoRecoverReaders(t *testing.T) {
 	if n := CountAutoRecoverAttempts(ledger, "engine", 0); n != 0 {
 		t.Errorf("CountAutoRecoverAttempts: got %d want 0 (force-deletes must not burn relocation budget)", n)
 	}
-	if nodes := RecentAutoRecoverFromNodes(ledger, "engine", 0, 5); len(nodes) != 0 {
-		t.Errorf("RecentAutoRecoverFromNodes: got %v want none (force-deletes must not steer placement)", nodes)
+	if exclusions := RecentAutoRecoverExclusions(ledger, "engine", 0, 5); len(exclusions) != 0 {
+		t.Errorf("RecentAutoRecoverExclusions: got %v want none (force-deletes must not steer placement)", exclusions)
 	}
 	if e := NewestAutoRecoverEntry(ledger, "engine", 0); e != nil {
 		t.Errorf("NewestAutoRecoverEntry: got %+v want nil", e)

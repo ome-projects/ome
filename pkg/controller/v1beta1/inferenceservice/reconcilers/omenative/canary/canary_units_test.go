@@ -136,16 +136,18 @@ func TestEffectivePartition(t *testing.T) {
 		t.Fatalf("step0: want partition 2, got %v ok=%v", p, ok)
 	}
 
-	// Advance to the final step → 100% new → partition 0.
+	// Advance to the final step → 100% new, less the held floor: the last
+	// stable instance stays until the cutover completes → partition 1.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: 1}
 	p, ok = EffectivePartition(isvc, v1beta1.EngineComponent, 4)
-	if !ok || p == nil || *p != 0 {
-		t.Fatalf("final: want partition 0, got %v ok=%v", p, ok)
+	if !ok || p == nil || *p != 1 {
+		t.Fatalf("final: want partition 1, got %v ok=%v", p, ok)
 	}
 
 	// Done sentinel (CurrentStep == len(steps)) → partition 0 (all on the canary
-	// revision, old drains). A finished canary must NOT re-default to step 0's
-	// partition, which would hold instances on the old revision after completion.
+	// revision, the held instance rolls). A finished canary must NOT re-default
+	// to a step's partition, which would hold instances on the old revision
+	// after completion.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: 2}
 	p, ok = EffectivePartition(isvc, v1beta1.EngineComponent, 4)
 	if !ok || p == nil || *p != 0 {
@@ -391,5 +393,30 @@ func TestReconcileRollback_HoldsForMemberStragglers(t *testing.T) {
 	if !res.RolledBack || isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase != v1beta1.RolloutPhaseRolledBack {
 		t.Fatalf("stable-only members must complete the rollback, got phase %q",
 			isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase)
+	}
+}
+
+// A referenced role's traffic targets name per-revision Services under the
+// replica's own prefix, which is where the Services exist; a projected role
+// keeps the service name.
+func TestApplyTraffic_ReferencedRoleNamesTheReplicaPrefix(t *testing.T) {
+	isvc := &v1beta1.InferenceService{}
+	isvc.Name = "svc"
+	isvc.Spec.ReplicaRefs = &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}}
+	isvc.Status.Canary = &v1beta1.CanaryStatus{}
+
+	applyTraffic(isvc, v1beta1.EngineComponent, "new", "old", "", "", 10)
+	got := map[string]int32{}
+	for _, x := range isvc.Status.Components[v1beta1.EngineComponent].Traffic {
+		got[x.RevisionName] = x.Percent
+	}
+	if got["pool-a-engine-rev-new"] != 10 || got["pool-a-engine-rev-old"] != 90 {
+		t.Fatalf("referenced engine targets must carry the replica prefix: %+v", got)
+	}
+
+	applyMemberTraffic(isvc, v1beta1.DecoderComponent, []coordination.RevisionWeight{{RevisionHash: "new", Percent: 100}})
+	tr := isvc.Status.Components[v1beta1.DecoderComponent].Traffic
+	if len(tr) != 1 || tr[0].RevisionName != "svc-decoder-rev-new" {
+		t.Fatalf("projected decoder targets keep the service name: %+v", tr)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
@@ -228,6 +229,7 @@ func TestPlaceGivesAGangOnePlacementPerPass(t *testing.T) {
 
 	pl := f.placer()
 	place(t, pl, input, inst, workload.RunnerLeader, 0)
+	f.addNodes(t, sliceNode("host-a", f.p.Name(Slot{})), sliceNode("host-b", f.p.Name(Slot{})))
 	f.update(t, f.p.Name(Slot{}), withState("ACTIVE", ""))
 	if _, placed := place(t, pl, input, inst, workload.RunnerWorker, 0); placed {
 		t.Fatal("a member was placed on a slice its peer was withheld from in the same pass")
@@ -396,6 +398,7 @@ func TestPlacerSweep(t *testing.T) {
 	for _, u := range seed {
 		f.seed(t, u)
 	}
+	f.addNodes(t, sliceNode("host-9", seed["placed this pass"].GetName()))
 
 	pl := f.placer()
 	if _, placed := place(t, pl, input, singlePod(9), workload.RunnerDefault, 0); !placed {
@@ -679,5 +682,122 @@ func TestPlaceRetriesFailedPodReads(t *testing.T) {
 	}
 	if got := f.events(); len(got) != 1 || !strings.Contains(got[0], string(EventReasonSliceHostUnavailable)) {
 		t.Fatalf("events = %v, want the retried vet reported once", got)
+	}
+}
+
+// withReadiness sets the Ready condition's reason, status and last transition.
+func withReadiness(reason, status string, since time.Time) func(*unstructured.Unstructured) {
+	return func(u *unstructured.Unstructured) {
+		u.Object["status"] = map[string]interface{}{"conditions": []interface{}{map[string]interface{}{
+			"type": "Ready", "status": status, "reason": reason, "lastTransitionTime": since.UTC().Format(time.RFC3339),
+		}}}
+	}
+}
+
+// A ready slice's hosts are found by a label the provider adds as it
+// activates. The slot's pods wait, unwarned and with the slice kept, until
+// every host the slice needs is visible.
+func TestPlaceWaitsForEveryHost(t *testing.T) {
+	f := provisioning(t)
+	name := f.p.Name(Slot{})
+	f.seed(t, stored(t, f.p, demand(t, "2x2x2"), Slot{}, withState("ACTIVE", "")))
+	f.addNodes(t, sliceNode("host-a", name))
+	spec := podSpec("tpu-a", "2x2x2", 4)
+	input := placerInput(spec, spec.DeepCopy())
+	inst := leaderWorkers(0, 1)
+
+	pl := f.placer()
+	if selector, placed := place(t, pl, input, inst, workload.RunnerLeader, 0); placed || selector != nil {
+		t.Fatalf("Place = %v, %v; want the gang held until both hosts are visible", selector, placed)
+	}
+	if reason, held := pending(t, pl, input, inst, 0); !held || !strings.Contains(reason, "only 1 of its 2 hosts are visible") {
+		t.Fatalf("Pending = %q, %v; want the missing host reported", reason, held)
+	}
+	if err := pl.Sweep(context.Background(), input, workload.ComponentPlan{Instances: []workload.InstancePlan{inst}}); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, found := getSlice(t, f.slices, name); !found {
+		t.Fatal("Sweep released a slice whose hosts are still being labeled")
+	}
+	if got := f.events(); len(got) != 0 {
+		t.Fatalf("events = %v, want none while hosts are labeled", got)
+	}
+
+	f.addNodes(t, sliceNode("host-b", name))
+	if _, placed := place(t, f.placer(), input, inst, workload.RunnerLeader, 0); !placed {
+		t.Fatal("Place withheld the gang once both hosts were visible")
+	}
+}
+
+// A provider that reports a ready state with unknown readiness is not trusted
+// with pods.
+func TestPlaceWithholdsFromUnknownReadiness(t *testing.T) {
+	f := provisioning(t)
+	name := f.p.Name(Slot{})
+	f.seed(t, stored(t, f.p, demand(t, "2x2x1"), Slot{}, withReadiness("ACTIVE", "Unknown", time.Now())))
+	f.addNodes(t, sliceNode("host-a", name))
+	input := placerInput(podSpec("tpu-a", "2x2x1", 4), nil)
+	if _, placed := place(t, f.placer(), input, singlePod(0), workload.RunnerDefault, 0); placed {
+		t.Fatal("Place placed a pod on a slice whose readiness is unknown")
+	}
+	if reason, held := pending(t, f.placer(), input, singlePod(0), 0); !held || !strings.Contains(reason, "readiness is unknown") {
+		t.Fatalf("Pending = %q, %v; want the unknown readiness reported", reason, held)
+	}
+}
+
+// A slice that has partitions but stays out of a ready state past the ready
+// timeout is released, so the slot gets a new partition, unless a pod holds
+// it. A slice waiting for a partition is waiting for capacity and is kept.
+func TestPlaceReprovisionsAStuckSlice(t *testing.T) {
+	now := time.Now()
+	for _, tt := range []struct {
+		name     string
+		timeout  string
+		since    time.Duration
+		parts    bool
+		holder   bool
+		released bool
+	}{
+		{name: "stuck past the timeout", timeout: "10m", since: 15 * time.Minute, parts: true, released: true},
+		{name: "within the timeout", timeout: "10m", since: 5 * time.Minute, parts: true},
+		{name: "waiting for a partition", timeout: "10m", since: 15 * time.Minute},
+		{name: "a pod holds it", timeout: "10m", since: 15 * time.Minute, parts: true, holder: true},
+		{name: "no ready timeout", since: 15 * time.Minute, parts: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := provisioning(t)
+			cfg := testConfig()
+			cfg.Slice.ReadyTimeout = tt.timeout
+			p, err := New(cfg, f.slices, f.slices, f.slices, testOwner)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			f.p = p
+			name := f.p.Name(Slot{})
+			mutate := []func(*unstructured.Unstructured){withReadiness("ACTIVATING", "False", now.Add(-tt.since))}
+			if tt.parts {
+				mutate = append(mutate, withPartitions("p-1"))
+			}
+			f.seed(t, stored(t, f.p, demand(t, "2x2x1"), Slot{}, mutate...))
+			if tt.holder {
+				f.own(onSlice("holder", name))
+			}
+			input := placerInput(podSpec("tpu-a", "2x2x1", 4), nil)
+			pl := f.placer()
+			if _, placed := place(t, pl, input, singlePod(0), workload.RunnerDefault, 0); placed {
+				t.Fatal("Place placed a pod on a slice that is not ready")
+			}
+			if err := pl.Sweep(context.Background(), input, workload.ComponentPlan{Instances: []workload.InstancePlan{singlePod(0)}}); err != nil {
+				t.Fatalf("Sweep: %v", err)
+			}
+			if _, found := getSlice(t, f.slices, name); found == tt.released {
+				t.Fatalf("slice present = %v, want released %v", found, tt.released)
+			}
+			got := f.events()
+			warned := len(got) == 1 && strings.Contains(got[0], string(EventReasonSliceReadyTimeout)) && strings.Contains(got[0], "ready timeout")
+			if warned != tt.released || (!tt.released && len(got) != 0) {
+				t.Fatalf("events = %v, want a %s warning only when the slice is released", got, EventReasonSliceReadyTimeout)
+			}
+		})
 	}
 }

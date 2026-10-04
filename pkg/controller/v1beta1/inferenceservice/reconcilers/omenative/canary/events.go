@@ -15,9 +15,9 @@ const (
 	// cannot be honored: a stale hash, no pinned run, or a value that
 	// addresses no canary of the InferenceService.
 	EventReasonRolloutResumeRejected = "RolloutResumeRejected"
-	// EventReasonCanaryRollbackIgnored is recorded when a rollback request
-	// finds no canary in flight and is removed rather than left to fire on
-	// the next canary's first pass.
+	// EventReasonCanaryRollbackIgnored is recorded when a rollback request is
+	// removed without a revert: it finds no canary in flight, or a canary
+	// already parked because its stable revision is not retained.
 	EventReasonCanaryRollbackIgnored = "CanaryRollbackIgnored"
 	// EventReasonCanaryRunLost is recorded while a live canary has no pinned
 	// rollout run and holds in place until the run layer reopens or adopts it.
@@ -26,4 +26,8 @@ const (
 	// no retained ControllerRevision for the stable revision and parks Failed
 	// instead of reporting a revert that cannot happen.
 	EventReasonCanaryStableRevisionMissing = "CanaryStableRevisionMissing"
+	// EventReasonCanaryPodCrashed is recorded when a canary pod keeps dying
+	// after its Instance was serving, a crash loop rather than a single
+	// restart, and the ladder parks at its step, naming the pod.
+	EventReasonCanaryPodCrashed = "CanaryPodCrashed"
 )

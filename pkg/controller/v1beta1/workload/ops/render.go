@@ -172,10 +172,13 @@ func RenderWithRevision(
 	injectTopologySpread(pod, plan, inst, runner, isvcName)
 	applyMigrationOverlay(pod, inst.MigrationOverlay)
 	// Relocation-directive exclusions: same required NotIn machinery
-	// as the migration overlay's FromNode, one term per recorded node.
-	// Empty list is a no-op for normal Instances.
-	for _, node := range inst.ExcludedNodes {
-		applyRequiredNodeExclusion(pod, node)
+	// as the migration overlay's FromNode, one term per node recorded
+	// for the revision being rendered. Empty list is a no-op for normal
+	// Instances.
+	for _, exclusion := range inst.ExcludedNodes {
+		if exclusionBindsRevision(exclusion, revisionHash) {
+			applyRequiredNodeExclusion(pod, exclusion.Node)
+		}
 	}
 
 	// Adapter-supplied hook: peer-env injection. The IR reconciler
@@ -308,6 +311,14 @@ func applyMigrationOverlay(pod *corev1.Pod, overlay *workload.MigrationOverlay) 
 // preferred affinity. Set mid-range so the nudge stacks with — rather
 // than competes against — operator-supplied preferences.
 const overlayPreferredHintWeight int32 = 50
+
+// exclusionBindsRevision reports whether a recorded exclusion applies to
+// the pod being rendered: only a rebuild at the revision the directive
+// was recorded for. A render with no revision, or an exclusion with none,
+// binds nothing.
+func exclusionBindsRevision(exclusion workload.NodeExclusion, revisionHash string) bool {
+	return query.RevisionFromName(exclusion.Revision).Same(query.RevisionFromHash(revisionHash))
+}
 
 // applyRequiredNodeExclusion appends a required NotIn[node] hostname
 // term to the pod's NodeAffinity — the pod MUST schedule somewhere

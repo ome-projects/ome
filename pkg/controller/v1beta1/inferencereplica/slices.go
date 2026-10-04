@@ -3,8 +3,10 @@ package inferencereplica
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,25 +27,43 @@ func (r *Reconciler) sliceProvisioner(ir *v1beta1.InferenceReplica) (*sliceprovi
 	if r.TPUSliceProvisioning == nil || r.sliceReader == nil {
 		return nil, nil
 	}
-	return sliceprovision.New(r.TPUSliceProvisioning, r.sliceReader, r.APIReader, r.Client, sliceprovision.Owner{
+	p, err := sliceprovision.New(r.TPUSliceProvisioning, r.sliceReader, r.APIReader, r.Client, sliceprovision.Owner{
 		Kind:      irKind,
 		Namespace: ir.Namespace,
 		Name:      ir.Name,
 		UID:       ir.UID,
 	})
+	if err != nil {
+		return nil, err
+	}
+	p.SetPodAnnotations(podTemplateAnnotations(ir))
+	p.OnReleaseDeferred(func(s gke.Slice, holders []string) {
+		if r.Recorder == nil {
+			return
+		}
+		r.Recorder.Eventf(ir, corev1.EventTypeWarning, string(sliceprovision.EventReasonSliceReleaseDeferred),
+			"TPU slice %s is kept: pods of other workloads hold chips on its hosts (%s); it is released once they are gone",
+			s.Name, strings.Join(holders, ", "))
+	})
+	return p, nil
 }
 
-// slicesOptedIn reports whether ir's pods run on provisioned slices. It reads
-// ir's own pod template: a rollback renders pods from a stored template that
-// lacks the annotations ir inherits from its parent.
+// slicesOptedIn reports whether ir's pods run on provisioned slices.
 func slicesOptedIn(ir *v1beta1.InferenceReplica) bool {
+	return podTemplateAnnotations(ir)[constants.TPUSliceProvisioningAnnotationKey] == "true"
+}
+
+// podTemplateAnnotations returns the annotations of ir's own default or
+// leader pod template: a rollback renders pods from a stored template that
+// lacks the annotations ir inherits from its parent.
+func podTemplateAnnotations(ir *v1beta1.InferenceReplica) map[string]string {
 	for i := range ir.Spec.Runners {
 		runner := &ir.Spec.Runners[i]
 		if runner.Name == v1beta1.RunnerNameDefault || runner.Name == v1beta1.RunnerNameLeader {
-			return runner.Template.Annotations[constants.TPUSliceProvisioningAnnotationKey] == "true"
+			return runner.Template.Annotations
 		}
 	}
-	return false
+	return nil
 }
 
 // slicesInUse reports whether ir's slices must be provisioned or released:
@@ -140,6 +160,47 @@ func (s *slicePass) sweep(ctx context.Context, input workloadtypes.ReconcileInpu
 		return s.placer.Sweep(ctx, input, plan)
 	}
 	return s.p.Sweep(ctx, nil, s.pinned)
+}
+
+// recoverLostSlices deletes ir's pods that run on a slice deleted, or moved
+// off their nodes, from outside, so that their Instance is rebuilt. A cached
+// read of the pods finds them and a live read confirms them before any is
+// deleted. A nil pass recovers nothing.
+func (r *Reconciler) recoverLostSlices(ctx context.Context, ir *v1beta1.InferenceReplica, input workloadtypes.ReconcileInput, s *slicePass) error {
+	if s == nil {
+		return nil
+	}
+	cached, err := query.ListOMENativePodsByName(ctx, r.Client, ir.Namespace, ir.NamePrefix(),
+		v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component), true)
+	if err != nil {
+		return err
+	}
+	if lost, err := s.p.Lost(ctx, cached); err != nil || len(lost) == 0 {
+		return err
+	}
+	pods, err := r.componentPods(ir)(ctx)
+	if err != nil {
+		return err
+	}
+	lost, err := s.p.Lost(ctx, pods)
+	if err != nil {
+		return err
+	}
+	for _, l := range lost {
+		names := make([]string, 0, len(l.Pods))
+		for _, pod := range l.Pods {
+			uid := pod.UID
+			if err := r.Client.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+				return fmt.Errorf("delete pod %s on lost slice %s: %w", pod.Name, l.Name, err)
+			}
+			names = append(names, pod.Name)
+		}
+		s.p.Recovered(l)
+		workloadtypes.RecordWarning(r.Recorder, workloadtypes.EventTarget(input), sliceprovision.EventReasonSliceLost,
+			"TPU slice %s %s while pods %s ran on it; they are deleted so that their Instance is rebuilt",
+			l.Name, l.Why, strings.Join(names, ", "))
+	}
+	return nil
 }
 
 // releaseSlicesPastDeadline releases every slice ir holds, pods or not. Once

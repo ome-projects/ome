@@ -169,9 +169,9 @@ func TestSetPlannedReplicas(t *testing.T) {
 		maximum, wantMaximum int
 	}{
 		{name: "explicit cap", floor: 1, cap: 2, maximum: 9, wantMaximum: 2},
-		{name: "component maximum", floor: 2, maximum: 5, wantMaximum: 5},
+		{name: "source maximum is bounded by allocation", floor: 2, maximum: 5, wantMaximum: 2},
 		{name: "floor exceeds explicit maximum", floor: 3, maximum: 1, wantMaximum: 3},
-		{name: "omitted maximum permits runtime inheritance", floor: 2},
+		{name: "omitted source maximum is bounded by allocation", floor: 2, wantMaximum: 2},
 		{name: "retained floor exceeds reduced cap", floor: 3, cap: 1, maximum: 5, wantMaximum: 3},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -191,15 +191,13 @@ func TestSetPlannedReplicas(t *testing.T) {
 			if diff := cmp.Diff(router, member.Spec.Router); diff != "" {
 				t.Error(diff)
 			}
-			if tt.maximum == 0 {
-				runtime := &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MaxReplicas: 9}}
-				merged, err := isvcutils.MergeEngineSpec(member.Spec.Engine, runtime)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if diff := cmp.Diff(9, merged.MaxReplicas); diff != "" {
-					t.Error(diff)
-				}
+			runtime := &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MaxReplicas: 9}}
+			merged, err := isvcutils.MergeEngineSpec(runtime, member.Spec.Engine)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tt.wantMaximum, merged.MaxReplicas); diff != "" {
+				t.Error(diff)
 			}
 		})
 	}

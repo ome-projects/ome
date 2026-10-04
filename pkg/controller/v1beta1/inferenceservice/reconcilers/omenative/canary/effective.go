@@ -16,7 +16,12 @@ import (
 // an operator-set lifecycle partition. Returns (nil, false) when no canary
 // plan is set for the InferenceService.
 //
-//   - The current step's Capacity resolved against desired.
+//   - The current step's Capacity resolved against desired, never below the
+//     held floor: the stable revision keeps its last instance until the done
+//     sentinel, because it carries traffic until the final write lands and
+//     drains through the window after it. A step's capacity is staged on the
+//     remaining instances, and the 100% write moves traffic onto the canary
+//     capacity that is Ready before the stable instance is released.
 //
 // Rollback (ome.io/rollout-rollback) is special-cased: when the status records
 // a rolled-back revision, this returns Partition 0 (hold nothing). Partition
@@ -54,18 +59,18 @@ func EffectivePartition(isvc *v1beta1.InferenceService, component v1beta1.Compon
 	if idx < 0 {
 		idx = 0
 	}
-	// Done sentinel (CurrentStep past the last step): the canary finished — hold
-	// NOTHING, the component runs entirely on the canary revision (partition 0).
-	// Don't clamp to the final step and recompute: if that step's Capacity were
-	// < 100% (admission allows it — only final Traffic==100 is enforced),
-	// the recompute would strand (desired-newCount) instances on the stable
-	// revision permanently after completion.
+	// Done sentinel (CurrentStep past the last step): hold NOTHING, the
+	// component rolls entirely onto the canary revision (partition 0). This
+	// is the release of the held floor: the final traffic write landed and
+	// the drain window elapsed, so the last stable instance rolls now and the
+	// unit reads Stable once it has. Don't clamp to the final step and
+	// recompute: the floor would strand that instance on the stable revision
+	// permanently after completion.
 	if int(idx) >= len(plan.Steps) {
 		zero := int32(0)
 		return &zero, true
 	}
-	newCount := resolveStepNewCount(plan.Steps[idx], desiredReplicas)
-	p := partitionForNewCount(desiredReplicas, newCount)
+	p := stepPartition(plan.Steps[idx], desiredReplicas)
 	return &p, true
 }
 

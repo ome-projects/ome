@@ -427,3 +427,43 @@ func TestPinGangWaitsForMissingMemberTemplates(t *testing.T) {
 		t.Fatalf("pinGang = %v, want Unschedulable until all templates are visible", status)
 	}
 }
+
+// TestPinGangRebuildsGangIntoRoomOnOneNode: in a packed pool the only room is
+// the two slots a two-member gang vacated on one node. The rebuilt gang pins
+// that domain and both members are steered to that node, the worker once the
+// leader is assumed there.
+func TestPinGangRebuildsGangIntoRoomOnOneNode(t *testing.T) {
+	leader := gangGPUPod("team", "pf", "1")
+	leader.Name = "leader"
+	worker := gangGPUPod("team", "pf", "1")
+	worker.Name = "worker"
+	g := &GangPack{pins: placement.New(), podLister: fakeGangPodLister{pods: []*v1.Pod{leader, worker}}}
+	gang := gangInfo{key: "team/pf", minMember: 2, topologyKey: testKey}
+	packed := []framework.NodeInfo{
+		nodeInfo(gpuNode("a1", "a", "2")),              // the vacated room: two slots on one node
+		nodeInfo(gpuNode("a2", "a", "1"), gpuPod("1")), // full
+		nodeInfo(gpuNode("b1", "b", "1"), gpuPod("1")), // full
+	}
+
+	result, status := g.pinGang(newCycleState(), packed, gang, leader)
+	if !status.IsSuccess() {
+		t.Fatalf("pinGang(leader) = %v, want Success: a1 has room for both members", status)
+	}
+	if !result.NodeNames.Equal(sets.New("a1")) {
+		t.Fatalf("leader candidates = %v, want a1 only", result.NodeNames)
+	}
+	if domain, _ := g.pins.Get("team/pf"); domain != "a" {
+		t.Fatalf("pin = %q, want a", domain)
+	}
+
+	assumedLeader := leader.DeepCopy()
+	assumedLeader.Spec.NodeName = "a1"
+	packed[0] = nodeInfo(gpuNode("a1", "a", "2"), assumedLeader)
+	result, status = g.pinGang(newCycleState(), packed, gang, worker)
+	if !status.IsSuccess() {
+		t.Fatalf("pinGang(worker) = %v, want Success beside the assumed leader", status)
+	}
+	if !result.NodeNames.Equal(sets.New("a1")) {
+		t.Fatalf("worker candidates = %v, want a1 only", result.NodeNames)
+	}
+}

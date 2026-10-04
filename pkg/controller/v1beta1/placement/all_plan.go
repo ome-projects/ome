@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -27,6 +28,17 @@ func (r *Reconciler) reconcileAllPlanned(ctx context.Context, source *v1beta1.In
 	proposal, err := r.allProposal(ctx, source, clusters, eligible)
 	if err != nil {
 		return r.writeSplitHold(ctx, source, standing, "HomePolicyUnresolved", err)
+	}
+	refresh, err := r.prepareAllZeroFloors(ctx, source, &proposal)
+	if err != nil {
+		reason := "HomePolicyUnresolved"
+		if errors.Is(err, errPositiveMovementFloor) {
+			reason = "PositiveFloorRequired"
+		}
+		return r.writeSplitHold(ctx, source, standing, reason, err)
+	}
+	if refresh {
+		return r.applyAllMovementFloors(ctx, source, eligible, standing, proposal)
 	}
 	return r.executePlannedAllocation(ctx, source, eligible, standing, proposal)
 }
@@ -137,7 +149,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 		// homes as initial additive provisioning rather than a replacement move.
 		additive := true
 		for name, a := range out.Assignments {
-			if matched[name] == "" && (a.InventoryPending || a.CurrentReplicas > 0) {
+			if matched[name] == "" && (a.InventoryPending || a.CurrentHome != nil) {
 				additive = false
 			}
 			if a.CurrentReplicas > a.DesiredReplicas {
@@ -172,11 +184,6 @@ func (r *Reconciler) resolveFullHome(ctx context.Context, source, desired *v1bet
 	_, floors, err := (resolution.Resolver{Client: cl, OperatorNamespace: r.MemberOperatorNamespace}).ResolveHome(ctx, desired, member)
 	if err != nil {
 		return nil, err
-	}
-	if placementMode(source) != v1beta1.PlacementModeSingle {
-		if _, err := protocol.ValidatePositiveReplicaFloors(floors); err != nil {
-			return nil, err
-		}
 	}
 	return &v1beta1.PlacementHomePolicy{InputDigest: digest, ReplicaFloors: floors}, nil
 }

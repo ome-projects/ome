@@ -125,12 +125,21 @@ func TestUnavailableHosts(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			nodes := fake.NewClientBuilder().WithObjects(tt.nodes...).Build()
-			got, err := unavailableHosts(context.Background(), nodes, keySlice, "s", tt.pods)
+			got, found, err := unavailableHosts(context.Background(), nodes, keySlice, "s", tt.pods)
 			if err != nil {
 				t.Fatalf("unavailableHosts: %v", err)
 			}
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatalf("unavailableHosts mismatch (-want +got):\n%s", diff)
+			}
+			want := 0
+			for _, n := range tt.nodes {
+				if n.GetLabels()[keySlice] == "s" {
+					want++
+				}
+			}
+			if found != want {
+				t.Fatalf("unavailableHosts found %d hosts, want %d", found, want)
 			}
 		})
 	}
@@ -141,7 +150,7 @@ func TestUnavailableHostsListError(t *testing.T) {
 	nodes := fake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
 		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error { return boom },
 	}).Build()
-	if _, err := unavailableHosts(context.Background(), nodes, keySlice, "s", []*corev1.PodSpec{podSpec("tpu-a", "2x2x1", 4)}); !errors.Is(err, boom) {
+	if _, _, err := unavailableHosts(context.Background(), nodes, keySlice, "s", []*corev1.PodSpec{podSpec("tpu-a", "2x2x1", 4)}); !errors.Is(err, boom) {
 		t.Fatalf("unavailableHosts error = %v, want the node read's", err)
 	}
 }

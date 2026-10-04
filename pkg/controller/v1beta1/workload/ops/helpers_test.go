@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -537,6 +538,21 @@ func legacyEnsureTargetCRWithMeta(t *testing.T, c client.Client, isvc *v1beta1.I
 		t.Fatalf("revision.EnsureControllerRevision: %v", err)
 	}
 	return cr
+}
+
+// legacyStoredRevision is the ControllerRevision named name whose payload
+// records spec and workerSpec as its template, for a fixture row that
+// names a revision by a literal name rather than minting it.
+func legacyStoredRevision(t *testing.T, namespace, name string, spec, workerSpec *corev1.PodSpec) *appsv1.ControllerRevision {
+	t.Helper()
+	raw, err := json.Marshal(revision.DataPayload{PodSpec: spec, WorkerPodSpec: workerSpec})
+	if err != nil {
+		t.Fatalf("marshal revision payload: %v", err)
+	}
+	return &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Data:       runtime.RawExtension{Raw: raw},
+	}
 }
 
 // legacySeedRunningRevision creates a ControllerRevision capturing

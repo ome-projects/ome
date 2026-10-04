@@ -44,7 +44,7 @@ func TestNewLifecycleConfig(t *testing.T) {
 		{
 			name: "valid scale settings",
 			configMapData: map[string]string{
-				LifecycleConfigName: `{"scaleUpPodBatchSize":100,"scaleDownPodBatchSize":75,"scaleDownRequeueInterval":"7s"}`,
+				LifecycleConfigName: `{"scaleUpPodBatchSize":100,"scaleDownPodBatchSize":75,"scaleDownRequeueInterval":"7s","repairBatchSize":10}`,
 			},
 			validate: func(t *testing.T, cfg *LifecycleConfig) {
 				require.NotNil(t, cfg.ScaleUpPodBatchSize)
@@ -53,6 +53,8 @@ func TestNewLifecycleConfig(t *testing.T) {
 				assert.Equal(t, int32(75), *cfg.ScaleDownPodBatchSize)
 				require.NotNil(t, cfg.ScaleDownRequeueInterval)
 				assert.Equal(t, "7s", *cfg.ScaleDownRequeueInterval)
+				require.NotNil(t, cfg.RepairBatchSize)
+				assert.Equal(t, int32(10), *cfg.RepairBatchSize)
 			},
 		},
 		{
@@ -149,6 +151,44 @@ func TestLifecycleConfig_ToScaleDownPodBatchSize(t *testing.T) {
 	}
 }
 
+func TestLifecycleConfig_ToRepairBatchSize(t *testing.T) {
+	t.Run("nil config is unconfigured", func(t *testing.T) {
+		var cfg *LifecycleConfig
+		size, err := cfg.ToRepairBatchSize()
+		require.NoError(t, err)
+		assert.Nil(t, size)
+	})
+
+	t.Run("absent field is unconfigured", func(t *testing.T) {
+		cfg := &LifecycleConfig{}
+		size, err := cfg.ToRepairBatchSize()
+		require.NoError(t, err)
+		assert.Nil(t, size)
+	})
+
+	t.Run("positive value passes through as a copy", func(t *testing.T) {
+		configured := int32(10)
+		cfg := &LifecycleConfig{RepairBatchSize: &configured}
+		size, err := cfg.ToRepairBatchSize()
+		require.NoError(t, err)
+		require.NotNil(t, size)
+		assert.Equal(t, int32(10), *size)
+
+		configured = 20
+		assert.Equal(t, int32(10), *size)
+	})
+
+	for _, configured := range []int32{0, -1} {
+		configured := configured
+		t.Run(fmt.Sprintf("rejects %d", configured), func(t *testing.T) {
+			cfg := &LifecycleConfig{RepairBatchSize: &configured}
+			size, err := cfg.ToRepairBatchSize()
+			require.ErrorContains(t, err, "lifecycle.repairBatchSize")
+			assert.Nil(t, size)
+		})
+	}
+}
+
 func TestLifecycleConfig_ToScaleDownRequeueInterval(t *testing.T) {
 	t.Run("nil config disables periodic polling", func(t *testing.T) {
 		var cfg *LifecycleConfig
@@ -189,15 +229,22 @@ func TestLoadPodBatchSizes(t *testing.T) {
 		omitConfigMap bool
 		wantScaleUp   *int32
 		wantScaleDown *int32
+		wantRepair    *int32
 		wantInterval  time.Duration
 		wantError     string
 	}{
 		{
 			name:          "scale settings come from one snapshot",
-			lifecycle:     stringPointer(`{"scaleUpPodBatchSize":37,"scaleDownPodBatchSize":41,"scaleDownRequeueInterval":"7s"}`),
+			lifecycle:     stringPointer(`{"scaleUpPodBatchSize":37,"scaleDownPodBatchSize":41,"scaleDownRequeueInterval":"7s","repairBatchSize":5}`),
 			wantScaleUp:   int32Pointer(37),
 			wantScaleDown: int32Pointer(41),
+			wantRepair:    int32Pointer(5),
 			wantInterval:  7 * time.Second,
+		},
+		{
+			name:       "repair alone leaves both scale directions unbounded",
+			lifecycle:  stringPointer(`{"repairBatchSize":5}`),
+			wantRepair: int32Pointer(5),
 		},
 		{
 			name:        "scale-up alone leaves scale-down unbounded",
@@ -276,6 +323,16 @@ func TestLoadPodBatchSizes(t *testing.T) {
 			lifecycle: stringPointer(`{"scaleUpPodBatchSize":37,"scaleDownPodBatchSize":-1}`),
 			wantError: "lifecycle.scaleDownPodBatchSize: must be > 0, got -1",
 		},
+		{
+			name:      "zero repair is rejected",
+			lifecycle: stringPointer(`{"scaleUpPodBatchSize":37,"repairBatchSize":0}`),
+			wantError: "lifecycle.repairBatchSize: must be > 0, got 0",
+		},
+		{
+			name:      "negative repair is rejected",
+			lifecycle: stringPointer(`{"scaleUpPodBatchSize":37,"repairBatchSize":-1}`),
+			wantError: "lifecycle.repairBatchSize: must be > 0, got -1",
+		},
 	}
 
 	for _, tt := range tests {
@@ -310,6 +367,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, tt.wantScaleUp, got.ScaleUp)
 				assert.Equal(t, tt.wantScaleDown, got.ScaleDown)
+				assert.Equal(t, tt.wantRepair, got.Repair)
 				assert.Equal(t, tt.wantInterval, got.ScaleDownRequeueInterval)
 			}
 

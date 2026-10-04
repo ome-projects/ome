@@ -9,9 +9,12 @@ package escalation_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
@@ -90,6 +93,43 @@ func TestPruneSupersededRetryBlocks_MultiStaleBatch(t *testing.T) {
 		if (*removed)[i] != rev {
 			t.Fatalf("removed: got %v want %v", *removed, want)
 		}
+	}
+}
+
+// TestPruneRetryBlocks_HeldBlockOfTheCurrentRevisionSurvivesACrashLoop
+// pins that neither end-of-pass prune removes a Held block whose revision
+// the status now names as current while its rows remember a crash of
+// their promoted set: the supersede-prune keeps every revision still in
+// play and the outlived-prune never touches a Held ladder, which only a
+// corrective revision or an operator release ends.
+func TestPruneRetryBlocks_HeldBlockOfTheCurrentRevisionSurvivesACrashLoop(t *testing.T) {
+	const rev = "own-engine-current1"
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	readySince := metav1.NewTime(now.Add(-10 * time.Minute))
+	crashed := metav1.NewTime(now.Add(-time.Minute))
+	input := minimalInput(t)
+	input.Clock = clocktesting.NewFakeClock(now)
+	removed := recordRetryBlockRemovals(&input)
+	input.ObservedState.CurrentRevision = rev
+	input.ObservedState.UpdateRevision = rev
+	input.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: rev, PodCount: 1, ServingPodCount: 1, ReadySince: &readySince,
+			LastFailure: &types.InstanceTermination{PodName: "llama-70b-engine-0-default-0", Reason: "CrashLoopBackOff", Time: crashed}},
+	}
+	input.ObservedState.RetryBlocks = []types.RetryBlock{{TargetRevision: rev, State: types.RetryBlockHeld, AttemptsStarted: 3}}
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: rev}}
+	pods := func(context.Context) (map[int32][]*corev1.Pod, error) {
+		return map[int32][]*corev1.Pod{0: {enginePod("llama-70b", "prod", 0)}}, nil
+	}
+
+	if err := escalation.PruneSupersededRetryBlocks(context.Background(), input, target); err != nil {
+		t.Fatalf("supersede prune: %v", err)
+	}
+	if err := escalation.PruneOutlivedRetryBlocks(context.Background(), input, minimalPlan(), target, pods); err != nil {
+		t.Fatalf("outlived prune: %v", err)
+	}
+	if len(*removed) != 0 {
+		t.Fatalf("the Held block of the current revision must survive while its rows remember a crash, removed %v", *removed)
 	}
 }
 

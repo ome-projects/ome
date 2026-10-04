@@ -75,6 +75,14 @@ const (
 	// parked until quota frees up.
 	EventReasonInstanceQuotaBlocked EventReason = "InstanceQuotaBlocked"
 
+	// EventReasonInstanceAdmissionUnavailable fires once per episode
+	// when the apiserver refuses an Instance's pod create or patch
+	// because it cannot reach an admission webhook. The attempt is NOT
+	// failed: it waits with its InstanceReadyTimeout clock parked until
+	// admission answers again. Carries the apiserver's own words so the
+	// operator can see which webhook is unreachable.
+	EventReasonInstanceAdmissionUnavailable EventReason = "InstanceAdmissionUnavailable"
+
 	// EventReasonCreateAttemptSuperseded fires when the target revision
 	// moves while a Create attempt is still building: the attempt is
 	// replaced by a fresh one pinned to the new target. Normal, not a
@@ -128,6 +136,14 @@ const (
 	// an instance reaching Ready, which prunes its records) is required
 	// before relocation resumes.
 	EventReasonAutoMigrationCapReached EventReason = "AutoMigrationCapReached"
+
+	// EventReasonNodeExclusionReleased fires when the deadline disposition
+	// lets go of an Instance's recorded node exclusions because the rebuild
+	// rendered with them found no node with room: the scheduler's own
+	// Unschedulable verdict outlasted the operator's grace. The next
+	// rebuild may land on the blamed node again; the relocation budget the
+	// directives spent stays spent.
+	EventReasonNodeExclusionReleased EventReason = "NodeExclusionReleased"
 
 	// EventReasonInstanceFailed fires when an escalation backstop (the
 	// stuck-pod fast path or the deadline disposition) stamps an
@@ -192,6 +208,14 @@ const (
 	// waits on.
 	EventReasonRepairHeld EventReason = "RepairHeld"
 
+	// EventReasonRepairRevisionGone fires once per attempt when a rebuild
+	// cannot render the revision it stamps because that revision's
+	// ControllerRevision no longer exists. The pods are not recreated from
+	// the current template under the missing revision's label; the
+	// attempt runs to its deadline instead, and the event names the
+	// Instance and the revision so the hold is not silent.
+	EventReasonRepairRevisionGone EventReason = "RepairRevisionGone"
+
 	// EventReasonDrainOverdue fires once per overdue episode when a
 	// Deleting Instance's operation deadline elapses with pods still on
 	// their way out. Visibility only: the delete wave keeps the index,
@@ -230,7 +254,14 @@ const (
 	// surge unpinned for the scale-down pipeline, source restored from
 	// observation — so the event names the pod and the reason.
 	EventReasonMigrationSurgeWedged EventReason = "MigrationSurgeWedged"
-	EventReasonRateLimited          EventReason = "RateLimited"
+	// EventReasonMigrationParked is a Warning fired once when a Draining
+	// migration's source pods are all Terminating past their own deletion
+	// deadlines: the drive has issued every delete it owns and only the
+	// kubelet, a finalizer owner or the force-delete escalation can
+	// finish the teardown. The record keeps its phase and its serving
+	// surge, and later Manual requests dispatch ahead of it.
+	EventReasonMigrationParked EventReason = "MigrationParked"
+	EventReasonRateLimited     EventReason = "RateLimited"
 	// EventReasonMigrationPolicyUnconfigured is a Warning fired when a
 	// migration request is held because the operator configured no
 	// migration capacity policy. Distinct from RateLimited: no cap was
@@ -244,9 +275,36 @@ const (
 	// lifecycle.instanceReadyTimeout is set. Nothing is failed: an Instance
 	// that never becomes Ready waits for an operator instead.
 	EventReasonInstanceReadyTimeoutUnconfigured EventReason = "InstanceReadyTimeoutUnconfigured"
-	EventReasonMigrationSurgeCreateBlocked      EventReason = "MigrationSurgeCreateBlocked"
-	EventReasonMigrationFromNodeMismatch        EventReason = "MigrationFromNodeMismatch"
-	EventReasonMigrationNodeAffinityConflict    EventReason = "MigrationNodeAffinityConflict"
+	// EventReasonRepairRetriesExhausted is a Warning fired once per parked
+	// attempt when a repair has spent every re-arm the operator's retry
+	// ladder (lifecycle.updateRetry) allows and its pods are still wedged.
+	// The row stays Failed until an operator resets it or a new revision
+	// arrives.
+	EventReasonRepairRetriesExhausted EventReason = "RepairRetriesExhausted"
+	// EventReasonRepairWaitingOnWorkload is a Warning fired once per parked
+	// attempt when a repair is parked on a cause the kubelet retries in
+	// place and a fresh pod set cannot clear: a container config or image
+	// the pod template names (IsWorkloadCausedReason). The retry ladder
+	// owes the park no re-arm; the row stays Failed with its reason until
+	// the configuration or image is fixed and resumes on its own once the
+	// kubelet starts the pod.
+	EventReasonRepairWaitingOnWorkload EventReason = "RepairWaitingOnWorkload"
+	// EventReasonRepairClosed is a Normal fired when a repair parked at
+	// Failed has no live pod left to resume or rebuild: every pod of its
+	// set is gone or in a terminal phase. The spent operation is cleared
+	// and the Create pass rebuilds the row as a fresh start.
+	EventReasonRepairClosed                EventReason = "RepairClosed"
+	EventReasonMigrationSurgeCreateBlocked EventReason = "MigrationSurgeCreateBlocked"
+	// EventReasonMigrationFromNodeMismatch fires when a request's
+	// FromNode is not where the source runs. Normal when the move binds
+	// to the node the Instance occupies instead, naming both nodes;
+	// Warning when the source names no node to leave and the request is
+	// rejected.
+	EventReasonMigrationFromNodeMismatch     EventReason = "MigrationFromNodeMismatch"
+	EventReasonMigrationNodeAffinityConflict EventReason = "MigrationNodeAffinityConflict"
+	// EventReasonMigrationSourceRebuilt is a Normal fired when a pending
+	// move follows its Instance to the index a gang roll rebuilt it under.
+	EventReasonMigrationSourceRebuilt EventReason = "MigrationSourceRebuilt"
 
 	// EventReasonPodGroupReset is a Warning fired when an Instance's
 	// PodGroup is deleted so a fresh one can be built, because the gang

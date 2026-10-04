@@ -62,7 +62,7 @@ func escalateSchedulerHold(ctx context.Context, deps types.Deps, input types.Rec
 			input.WarnInstanceFailed(idx, podName, reason)
 		}
 	}
-	if disposableAttempt(&row, desired) {
+	if disposableAttempt(&row) {
 		// The disposition's writes are write-ahead-ordered; land the
 		// pending plain stamps first.
 		if err := stamps.flush(ctx); err != nil {

@@ -927,6 +927,71 @@ func TestHandle(t *testing.T) {
 			},
 			wantAllowed: true,
 		},
+		// With no identity configured, a request on a standalone replica that
+		// carries the controller-write annotation is the controller's: it
+		// writes only the rollout-control fields and the composed-fields
+		// annotation, and it creates no standalone replica. A request without
+		// the annotation is a user's, who may not touch that annotation.
+		{
+			name: "standalone create with the controller-write annotation → denied, naming the annotation",
+			req: func(t *testing.T) admission.Request {
+				return createReq(t, withAnnotation(standaloneIR(), constants.InferenceReplicaControllerWriteAnnotationKey, constants.InferenceReplicaControllerWriteAnnotationVal))
+			},
+			wantContains: []string{"creates only the replicas it projects", constants.InferenceReplicaControllerWriteAnnotationKey + "=" + constants.InferenceReplicaControllerWriteAnnotationVal, "without it"},
+		},
+		{
+			name: "controller-write update setting the partition on a standalone replica → allowed",
+			req: func(t *testing.T) admission.Request {
+				stamped := withAnnotation(standaloneIR(), constants.InferenceReplicaControllerWriteAnnotationKey, constants.InferenceReplicaControllerWriteAnnotationVal)
+				return updateReq(t, standaloneIR(), withPacingPartition(stamped, 1))
+			},
+			wantAllowed: true,
+		},
+		{
+			name: "controller-write update scaling a standalone replica → denied",
+			req: func(t *testing.T) admission.Request {
+				stamped := withAnnotation(standaloneIR(), constants.InferenceReplicaControllerWriteAnnotationKey, constants.InferenceReplicaControllerWriteAnnotationVal)
+				return updateReq(t, standaloneIR(), withReplicas(stamped, 3))
+			},
+			wantContains: []string{composerDenial},
+		},
+		{
+			name: "controller-write update adding the composed-fields annotation → allowed",
+			req: func(t *testing.T) admission.Request {
+				stamped := withAnnotation(standaloneIR(), constants.InferenceReplicaControllerWriteAnnotationKey, constants.InferenceReplicaControllerWriteAnnotationVal)
+				return updateReq(t, standaloneIR(), withComposedFields(stamped, "svc:paused"))
+			},
+			wantAllowed: true,
+		},
+		{
+			name: "standalone update adding the composed-fields annotation without the controller-write annotation → denied",
+			req: func(t *testing.T) admission.Request {
+				return updateReq(t, standaloneIR(), withComposedFields(standaloneIR(), "svc:paused"))
+			},
+			wantContains: []string{composedFieldsDenial},
+		},
+		{
+			name: "projected update adding the composed-fields annotation without the controller-write annotation → denied",
+			req: func(t *testing.T) admission.Request {
+				return updateReq(t, baselineIR(nil), withComposedFields(baselineIR(nil), "svc:paused"))
+			},
+			wantContains: []string{composedFieldsDenial},
+		},
+		{
+			name: "standalone update changing another annotation → allowed (metadata only)",
+			req: func(t *testing.T) admission.Request {
+				return updateReq(t, standaloneIR(), withAnnotation(standaloneIR(), "example.com/note", "keep"))
+			},
+			wantAllowed:  true,
+			wantContains: []string{"metadata-only update"},
+		},
+		{
+			name: "standalone update setting the partition without the controller-write annotation → allowed",
+			req: func(t *testing.T) admission.Request {
+				return updateReq(t, standaloneIR(), withPacingPartition(standaloneIR(), 1))
+			},
+			wantAllowed: true,
+		},
 	}
 
 	for _, tc := range tests {

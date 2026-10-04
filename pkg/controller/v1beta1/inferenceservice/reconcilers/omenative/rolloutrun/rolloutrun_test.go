@@ -1206,3 +1206,168 @@ func TestRollingBackRunStaysOpen(t *testing.T) {
 		t.Fatalf("a rollback still in progress must keep its run pinned, got lastRun=%+v", isvc.Status.Rollout.LastRun)
 	}
 }
+
+// A canary run at the done sentinel stays open while its unit still reads
+// Promoting: the sentinel released the last held instance, and the unit
+// reports Stable only once that instance has rolled. The run closes Completed
+// on that report, so a plan resolved only through the pin keeps driving the
+// unit until then.
+func TestCanaryRunClosesOnceTheUnitReadsStable(t *testing.T) {
+	isvc := isvcFixture(v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		Canary:     canaryBody(10, 100),
+	})
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.EngineComponent: {
+			RolloutPhase: v1beta1.RolloutPhasePromoting,
+			Canary: &v1beta1.CanaryStatus{
+				CanaryRevisionHash:    hashOf(t, newRev),
+				StableRevisionHash:    hashOf(t, oldRev),
+				CurrentStep:           2,
+				ObservedTrafficWeight: 100,
+			},
+		},
+	}
+	isvc.Status.Rollout = &v1beta1.RolloutStatus{
+		ActiveRun: &v1beta1.RolloutRun{
+			RunID: "llm-a-run",
+			TargetRevisions: []v1beta1.RolloutRunTarget{
+				{Component: v1beta1.EngineComponent, Revision: hashOf(t, newRev), StableRevision: hashOf(t, oldRev)},
+			},
+			Plan: v1beta1.RolloutRunPlan{Groups: []v1beta1.RolloutRunGroup{{
+				Group: v1beta1.RolloutGroup{
+					Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+					Canary:     canaryBody(10, 100),
+				},
+			}}},
+		},
+	}
+	converged := namedIR("llm-a-engine", newRev, newRev)
+	converged.Status.Replicas, converged.Status.UpdatedReplicas = 4, 4
+	in := testInputs(t, isvc, converged)
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if isvc.Status.Rollout.ActiveRun == nil {
+		t.Fatalf("a unit still Promoting at the done sentinel must keep its run pinned, got lastRun=%+v", isvc.Status.Rollout.LastRun)
+	}
+
+	engine := isvc.Status.Components[v1beta1.EngineComponent]
+	engine.RolloutPhase = v1beta1.RolloutPhaseStable
+	isvc.Status.Components[v1beta1.EngineComponent] = engine
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if isvc.Status.Rollout.ActiveRun != nil {
+		t.Fatalf("a unit that reads Stable on a converged workload must close its run, still active: %+v", isvc.Status.Rollout.ActiveRun)
+	}
+	if last := isvc.Status.Rollout.LastRun; last == nil || last.Outcome != v1beta1.RolloutRunCompleted {
+		t.Fatalf("lastRun = %+v, want Completed", last)
+	}
+}
+
+// A run adopted around an in-flight canary finds the IRs already advanced
+// to their targets, so the current revision names no stable. The unit's
+// record may carry none either, and a secondary has no record at all; each
+// Component's LatestRolledoutRevision, the revision that last owned its
+// traffic, is what the pin then records as its stable revision.
+func TestAdoptedRunPinsStableFromTheRolledOutRevision(t *testing.T) {
+	isvc := isvcFixture(v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},
+		Canary:     canaryBody(10, 100),
+	})
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.EngineComponent: {
+			Canary:                  &v1beta1.CanaryStatus{CanaryRevisionHash: "bbbbbbbb", CurrentStep: 0},
+			RolloutPhase:            v1beta1.RolloutPhasePending,
+			LatestRolledoutRevision: "llm-a-engine-rev-aaaaaaaa",
+		},
+		v1beta1.DecoderComponent: {LatestRolledoutRevision: "llm-a-decoder-rev-cccccccc"},
+	}
+	in := testInputs(t, isvc, irFixture(newRev, newRev), namedIR("llm-a-decoder", "llm-a-decoder-dddddddd", "llm-a-decoder-dddddddd"))
+
+	out, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Opened || !out.Adopted {
+		t.Fatalf("run boundary = %+v, want adopted open", out)
+	}
+	engine := pinnedTargetFor(t, isvc.Status.Rollout.ActiveRun, v1beta1.EngineComponent)
+	if engine.Revision != "bbbbbbbb" || engine.StableRevision != "aaaaaaaa" {
+		t.Fatalf("engine pin = %+v, want stable aaaaaaaa from its rolled-out revision", engine)
+	}
+	decoder := pinnedTargetFor(t, isvc.Status.Rollout.ActiveRun, v1beta1.DecoderComponent)
+	if decoder.Revision != "dddddddd" || decoder.StableRevision != "cccccccc" {
+		t.Fatalf("decoder pin = %+v, want stable cccccccc from its rolled-out revision", decoder)
+	}
+}
+
+// refCanaryAtStep is a ref-sourced canary group whose unit reads Stable at
+// the given step of the policy's two-step ladder, on converged IRs with no
+// run pinned.
+func refCanaryAtStep(t *testing.T, step int32) (*v1beta1.InferenceService, Inputs) {
+	t.Helper()
+	body := canaryBody(10, 100)
+	body.Prometheus = &v1beta1.AnalysisPrometheus{ProviderRef: &v1beta1.MetricProviderRef{Name: "cluster-prometheus"}}
+	policy := &v1beta1.RolloutPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "canary-std-v1", Namespace: "ns", Generation: 1},
+		Spec:       v1beta1.RolloutPolicySpec{Canary: body},
+	}
+	isvc := isvcFixture(v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "canary-std-v1", Progression: v1beta1.RolloutProgressionCanary},
+	})
+	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
+		v1beta1.EngineComponent: {
+			RolloutPhase: v1beta1.RolloutPhaseStable,
+			Canary: &v1beta1.CanaryStatus{
+				CanaryRevisionHash:    hashOf(t, newRev),
+				StableRevisionHash:    hashOf(t, oldRev),
+				CurrentStep:           step,
+				ObservedTrafficWeight: 100,
+			},
+		},
+	}
+	converged := namedIR("llm-a-engine", newRev, newRev)
+	converged.Status.Replicas, converged.Status.UpdatedReplicas = 4, 4
+	return isvc, testInputs(t, isvc, converged, policy)
+}
+
+// A finished ref-sourced ladder is judged against the composed policy body,
+// as an inline one is against its own: no run opens, so none closes and
+// reopens on alternate passes.
+func TestFinishedRefCanaryOpensNoRun(t *testing.T) {
+	isvc, in := refCanaryAtStep(t, 2)
+	for pass := 0; pass < 4; pass++ {
+		out, err := Reconcile(context.Background(), in)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if out.Opened {
+			t.Fatalf("pass %d opened run %s around a finished ref-sourced canary", pass, isvc.Status.Rollout.ActiveRun.RunID)
+		}
+		if isvc.Status.Rollout != nil && isvc.Status.Rollout.ActiveRun != nil {
+			t.Fatalf("pass %d left a run pinned: %+v", pass, isvc.Status.Rollout.ActiveRun)
+		}
+	}
+	if c := planReady(isvc); c == nil || c.Reason != v1beta1.RolloutPlanReasonNoRun {
+		t.Fatalf("RolloutPlanReady = %+v, want reason %s", c, v1beta1.RolloutPlanReasonNoRun)
+	}
+}
+
+// A ref-sourced ladder short of the composed body's last step is still
+// in flight and is adopted in place.
+func TestMidLadderRefCanaryIsAdopted(t *testing.T) {
+	isvc, in := refCanaryAtStep(t, 1)
+	out, err := Reconcile(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Opened || !out.Adopted {
+		t.Fatalf("outcome = %+v, want an adopted run", out)
+	}
+	if isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
+		t.Fatal("run not pinned")
+	}
+}

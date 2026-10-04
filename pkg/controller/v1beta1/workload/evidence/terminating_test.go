@@ -187,6 +187,36 @@ func TestStuckTerminating_Branches(t *testing.T) {
 	}
 }
 
+// TestAllPodsTerminatingOverdue: a teardown reads as stalled only when
+// every pod in it is deleted and past the deadline the pod itself
+// declared. One live pod, one pod inside its grace, or no pods at all
+// is a teardown the drive still owns or has finished.
+func TestAllPodsTerminatingOverdue(t *testing.T) {
+	overdue := tTerminatingPod("node-a", tNow.Add(-time.Minute))
+	inGrace := tTerminatingPod("node-a", tNow.Add(time.Minute))
+	atDeadline := tTerminatingPod("node-a", tNow)
+	live := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "live"}, Spec: corev1.PodSpec{NodeName: "node-a"}}
+	for _, tc := range []struct {
+		name string
+		pods []*corev1.Pod
+		want bool
+	}{
+		{name: "no pods", pods: nil, want: false},
+		{name: "one pod past its deadline", pods: []*corev1.Pod{overdue}, want: true},
+		{name: "every pod past its deadline", pods: []*corev1.Pod{overdue, overdue}, want: true},
+		{name: "a pod inside its grace", pods: []*corev1.Pod{overdue, inGrace}, want: false},
+		{name: "a pod exactly at its deadline", pods: []*corev1.Pod{atDeadline}, want: false},
+		{name: "a pod not Terminating", pods: []*corev1.Pod{overdue, live}, want: false},
+		{name: "a nil entry", pods: []*corev1.Pod{overdue, nil}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := evidence.AllPodsTerminatingOverdue(tc.pods, tNow); got != tc.want {
+				t.Fatalf("AllPodsTerminatingOverdue = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestNodeDeath_Branches walks the node half: a current Ready=True vetoes
 // every death branch including a stale unreachable taint, evidence
 // younger than the threshold is a blip, and only a gone, long-tainted or
@@ -285,18 +315,24 @@ func TestSingleLiveNode(t *testing.T) {
 	}
 }
 
-// TestSweepFreesUnknownPod holds the pre-sweep reading to the sweep's own
-// arms: no policy frees nothing; a pod nobody asked to delete is freed on
-// node death alone; a Terminating pod is freed only past its overdue
-// window and never while a finalizer pins it; a live node frees nothing.
-func TestSweepFreesUnknownPod(t *testing.T) {
+// TestReadSilentPod holds the pre-sweep reading to the sweep's own arms
+// and to what each reading means for the name: no policy reads nothing
+// and holds; a pod nobody asked to delete is freed on node death alone;
+// a Terminating pod is freed only past its overdue window and never while
+// a finalizer pins it; a live node frees nothing — and holds nothing
+// either unless the pod's own phase says Unknown, because a pod silent
+// only by its withdrawn Ready on a node posting Ready is the kubelet's
+// lag behind a readiness-gate write.
+func TestReadSilentPod(t *testing.T) {
 	policy := &types.ForceDeletePolicy{OverdueSlack: time.Minute, NodeUnreachableThreshold: 5 * time.Minute}
-	reader := tReader(t, tNode("live", corev1.ConditionTrue, 10*time.Second, false))
-	quiet := func(node string, deleted *metav1.Time, finalizers ...string) *corev1.Pod {
+	reader := tReader(t,
+		tNode("live", corev1.ConditionTrue, 10*time.Second, false),
+		tNode("dying", corev1.ConditionUnknown, time.Minute, false))
+	quiet := func(phase corev1.PodPhase, node string, deleted *metav1.Time, finalizers ...string) *corev1.Pod {
 		return &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "engine-0-default-0", DeletionTimestamp: deleted, Finalizers: finalizers},
 			Spec:       corev1.PodSpec{NodeName: node},
-			Status:     corev1.PodStatus{Phase: corev1.PodUnknown},
+			Status:     corev1.PodStatus{Phase: phase},
 		}
 	}
 	overdue := metav1.NewTime(tNow.Add(-10 * time.Minute))
@@ -304,22 +340,29 @@ func TestSweepFreesUnknownPod(t *testing.T) {
 		name   string
 		pod    *corev1.Pod
 		policy *types.ForceDeletePolicy
-		want   bool
+		want   evidence.TerminatingClass
+		held   bool
 	}{
-		{"no policy", quiet("gone", nil), nil, false},
-		{"node gone", quiet("gone", nil), policy, true},
-		{"node live", quiet("live", nil), policy, false},
-		{"terminating, node gone, overdue", quiet("gone", &overdue), policy, true},
-		{"terminating, node gone, pinned", quiet("gone", &overdue, "example.com/keep"), policy, false},
-		{"terminating, node gone, within grace", quiet("gone", ptrTime(tNow)), policy, false},
+		{"no policy", quiet(corev1.PodUnknown, "gone", nil), nil, evidence.NotConfigured, true},
+		{"node gone", quiet(corev1.PodUnknown, "gone", nil), policy, evidence.NodeGone, false},
+		{"node live, phase Unknown", quiet(corev1.PodUnknown, "live", nil), policy, evidence.NodeHealthy, true},
+		{"node live, Ready withdrawn", quiet(corev1.PodRunning, "live", nil), policy, evidence.NodeHealthy, false},
+		{"node dying, Ready withdrawn", quiet(corev1.PodRunning, "dying", nil), policy, evidence.NodeNotDeadLongEnough, true},
+		{"unscheduled, Ready withdrawn", quiet(corev1.PodRunning, "", nil), policy, evidence.Unscheduled, false},
+		{"terminating, node gone, overdue", quiet(corev1.PodUnknown, "gone", &overdue), policy, evidence.NodeGone, false},
+		{"terminating, node gone, pinned", quiet(corev1.PodUnknown, "gone", &overdue, "example.com/keep"), policy, evidence.ForeignFinalizers, true},
+		{"terminating, node gone, within grace", quiet(corev1.PodRunning, "gone", ptrTime(tNow)), policy, evidence.WithinGrace, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := evidence.SweepFreesUnknownPod(context.Background(), reader, tc.pod, tc.policy, tNow)
+			got, err := evidence.ReadSilentPod(context.Background(), reader, tc.pod, tc.policy, tNow)
 			if err != nil {
-				t.Fatalf("SweepFreesUnknownPod: %v", err)
+				t.Fatalf("ReadSilentPod: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("SweepFreesUnknownPod = %v, want %v", got, tc.want)
+				t.Errorf("ReadSilentPod = %s, want %s", got, tc.want)
+			}
+			if held := evidence.SilentPodHeld(tc.pod, got); held != tc.held {
+				t.Errorf("SilentPodHeld = %v, want %v", held, tc.held)
 			}
 		})
 	}
@@ -330,12 +373,37 @@ func ptrTime(at time.Time) *metav1.Time {
 	return &t
 }
 
-func TestUnknownPhaseTargetPods(t *testing.T) {
+// TestSilentKubeletTargetPods: the targets whose kubelet has stopped
+// reporting them, in name order. Phase Unknown counts with or without a
+// policy. A Running pod whose Ready is False while its own report says
+// Ready — ContainersReady True, every gate satisfied — counts only under
+// a policy, which is what allows the Node read that separates a dead node
+// from the kubelet's lag; a pod whose gate is unsatisfied, whose
+// containers are not ready, or which is PodReady never counts.
+func TestSilentKubeletTargetPods(t *testing.T) {
+	policy := &types.ForceDeletePolicy{OverdueSlack: time.Minute, NodeUnreachableThreshold: 5 * time.Minute}
+	const gate = corev1.PodConditionType("example.com/serving")
 	pod := func(name string, phase corev1.PodPhase) *corev1.Pod {
 		return &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Status:     corev1.PodStatus{Phase: phase},
 		}
+	}
+	withdrawn := func(name string, containersReady, podReady, gateSatisfied bool) *corev1.Pod {
+		status := func(ok bool) corev1.ConditionStatus {
+			if ok {
+				return corev1.ConditionTrue
+			}
+			return corev1.ConditionFalse
+		}
+		p := pod(name, corev1.PodRunning)
+		p.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: gate}}
+		p.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: status(containersReady)},
+			{Type: corev1.PodReady, Status: status(podReady)},
+			{Type: gate, Status: status(gateSatisfied)},
+		}
+		return p
 	}
 	names := func(targets ...string) map[string]struct{} {
 		set := make(map[string]struct{}, len(targets))
@@ -344,22 +412,37 @@ func TestUnknownPhaseTargetPods(t *testing.T) {
 		}
 		return set
 	}
-	got := evidence.UnknownPhaseTargetPods(
+	got := evidence.SilentKubeletTargetPods(
 		[]*corev1.Pod{
 			pod("c", corev1.PodUnknown),
 			pod("a", corev1.PodUnknown),
 			pod("b", corev1.PodRunning),
 			pod("d", corev1.PodUnknown),
 		},
-		names("a", "b", "c"),
+		names("a", "b", "c"), nil,
 	)
 	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
 		t.Fatalf("want the Unknown targets in name order [a c], got %v", got)
 	}
-	if evidence.UnknownPhaseTargetPods(nil, names("a")) != nil {
+	if evidence.SilentKubeletTargetPods(nil, names("a"), nil) != nil {
 		t.Error("no pods: want nil")
 	}
-	if evidence.UnknownPhaseTargetPods([]*corev1.Pod{pod("a", corev1.PodUnknown)}, nil) != nil {
+	if evidence.SilentKubeletTargetPods([]*corev1.Pod{pod("a", corev1.PodUnknown)}, nil, nil) != nil {
 		t.Error("no targets: want nil")
+	}
+
+	shapes := []*corev1.Pod{
+		withdrawn("withdrawn", true, false, true),
+		withdrawn("draining", true, false, false),
+		withdrawn("probe-failing", false, false, true),
+		withdrawn("ready", true, true, true),
+	}
+	all := names("withdrawn", "draining", "probe-failing", "ready")
+	if got := evidence.SilentKubeletTargetPods(shapes, all, nil); got != nil {
+		t.Errorf("without a policy no Running pod is read as silent, got %v", got)
+	}
+	got = evidence.SilentKubeletTargetPods(shapes, all, policy)
+	if len(got) != 1 || got[0].Name != "withdrawn" {
+		t.Fatalf("under a policy only the withdrawn-Ready shape is silent, got %v", got)
 	}
 }

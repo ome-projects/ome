@@ -93,6 +93,49 @@ func specChanged(oldSpec, newSpec v1beta1.InferenceReplicaSpec) bool {
 	return !equality.Semantic.DeepEqual(oldSpec, newSpec)
 }
 
+// rolloutControlFieldList names, for denial messages, the spec fields an
+// InferenceService writes on a replica it references without projecting it;
+// withoutComposerFields zeroes exactly these and the controller-only fields.
+var rolloutControlFieldList = strings.Join(constants.InferenceReplicaComposedFieldNames(), ", ")
+
+// withoutComposerFields returns s with every field the InferenceService
+// controller may write on a replica it does not project zeroed: the
+// rollout-control fields and the controller-only fields. A pacing block
+// left empty collapses to nil, so writing the first knob into a replica
+// without one is not a user-field change. pacing.maxUnavailable stays: it
+// is a user field.
+func withoutComposerFields(s v1beta1.InferenceReplicaSpec) v1beta1.InferenceReplicaSpec {
+	out := *s.DeepCopy()
+	out.Paused, out.PauseMode, out.PairingProtocol = false, "", nil
+	if out.Pacing != nil {
+		out.Pacing.Partition, out.Pacing.RollbackToRevision = nil, nil
+		if equality.Semantic.DeepEqual(*out.Pacing, v1beta1.InferenceReplicaPacing{}) {
+			out.Pacing = nil
+		}
+	}
+	out.ParentRef, out.PlacementExecution, out.PlacementReplicaLimit = nil, nil, nil
+	return out
+}
+
+// userFieldsChanged reports whether a spec change touches a field the
+// InferenceService controller may not write on a replica it does not
+// project.
+func userFieldsChanged(oldSpec, newSpec v1beta1.InferenceReplicaSpec) bool {
+	return !equality.Semantic.DeepEqual(withoutComposerFields(oldSpec), withoutComposerFields(newSpec))
+}
+
+// composedFieldsChanged reports whether newObj adds, changes or removes the
+// composed-fields annotation relative to oldObj, which is nil on create.
+func composedFieldsChanged(oldObj, newObj *v1beta1.InferenceReplica) bool {
+	var was string
+	var had bool
+	if oldObj != nil {
+		was, had = oldObj.Annotations[constants.InferenceReplicaComposedFieldsAnnotationKey]
+	}
+	now, has := newObj.Annotations[constants.InferenceReplicaComposedFieldsAnnotationKey]
+	return had != has || was != now
+}
+
 // standaloneSpecError rejects a standalone spec that renders from more or
 // fewer than one template source or pins its runtime, and settings a
 // standalone replica accepts in shape but nothing acts on: only the

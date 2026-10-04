@@ -34,6 +34,9 @@ package escalation
 
 import (
 	"sort"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -271,4 +274,153 @@ func BudgetDenies(budget, prior, inFlight int32) (int32, bool) {
 	}
 	projected := prior + inFlight + 1
 	return projected, projected > budget
+}
+
+// ExtraPodSurge is what a Component's extra pods hold against its surge
+// budget: every pod the API lists for an Instance beyond the Instance's
+// own pod count, whether the pod is Terminating inside its deletion grace
+// or a replacement a disposed attempt left alive. The Component never
+// carries more than replicas plus maxSurge live pods, so a slot such a
+// pod holds is not a slot a fresh start may take.
+type ExtraPodSurge struct {
+	Slots int32
+	// Terminating lists the Terminating pods counted, in name order.
+	Terminating []string
+	// Live lists the extra pods counted that no deletion has been
+	// requested for, in name order.
+	Live []string
+	// LiveSlotsByInstance is, per Instance, the slots its live extra pods
+	// hold. A fresh start on that Instance evicts them before it creates
+	// anything, so the slot it takes is the slot they held.
+	LiveSlotsByInstance map[int32]int32
+	// NextRelease is the earliest deletion deadline among the Terminating
+	// pods counted; zero when none is.
+	NextRelease time.Time
+}
+
+// ExtraPodSurgeInFlight counts, in surge slots, the pods beyond an
+// Instance's own pod count that the API still lists: a Terminating pod
+// until its DeletionTimestamp (the request time plus the pod's grace),
+// after which it stops counting, and a live extra pod for as long as it
+// exists. Buckets another anchor charges — a surge step, the index it
+// pins, a rolled-not-serving row — are never charged again. A bucket the
+// plan does not own is charged for its Terminating pods only: its live
+// pods are the scale-down's to retire.
+func ExtraPodSurgeInFlight(plan types.ComponentPlan, statuses []types.InstanceStatus, byInstance map[int32][]*corev1.Pod, rolled []int32, now time.Time) ExtraPodSurge {
+	charged := make(map[int32]struct{}, len(statuses))
+	runningRevision := make(map[int32]query.RevisionID, len(statuses))
+	for i := range statuses {
+		runningRevision[statuses[i].Index] = query.RevisionFromName(statuses[i].RunningRevision)
+		op := statuses[i].Operation
+		if op == nil {
+			continue
+		}
+		switch op.Step {
+		case types.UpdateStepSurge, types.UpdateStepSurgeDrain, types.UpdateStepSurgeDrainSettle:
+			charged[statuses[i].Index] = struct{}{}
+			if op.SurgeIndex != nil {
+				charged[*op.SurgeIndex] = struct{}{}
+			}
+		}
+	}
+	for _, idx := range rolled {
+		charged[idx] = struct{}{}
+	}
+	share := make(map[int32]int32, len(plan.Instances))
+	podsPerInstance := int32(1)
+	for _, inst := range plan.Instances {
+		share[inst.Index] = inst.TotalPods()
+		if inst.TotalPods() > podsPerInstance {
+			podsPerInstance = inst.TotalPods()
+		}
+	}
+	slotsOf := func(pods int32) int32 { return (pods + podsPerInstance - 1) / podsPerInstance }
+	indices := make([]int32, 0, len(byInstance))
+	for idx := range byInstance {
+		indices = append(indices, idx)
+	}
+	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
+
+	out := ExtraPodSurge{LiveSlotsByInstance: map[int32]int32{}}
+	for _, idx := range indices {
+		if _, skip := charged[idx]; skip {
+			continue
+		}
+		var listed, terminating int32
+		var terminatingNames []string
+		var live []*corev1.Pod
+		var release time.Time
+		for _, pod := range byInstance[idx] {
+			if pod == nil {
+				continue
+			}
+			if pod.DeletionTimestamp != nil {
+				deadline := pod.DeletionTimestamp.Time
+				if now.After(deadline) {
+					continue
+				}
+				terminating++
+				terminatingNames = append(terminatingNames, pod.Name)
+				if release.IsZero() || deadline.Before(release) {
+					release = deadline
+				}
+			} else {
+				live = append(live, pod)
+			}
+			listed++
+		}
+		extra := listed - share[idx]
+		if extra <= 0 {
+			continue
+		}
+		terminatingCounted := min(extra, terminating)
+		liveCounted := extra - terminatingCounted
+		if _, planned := share[idx]; !planned {
+			liveCounted = 0
+		}
+		if terminatingCounted+liveCounted <= 0 {
+			continue
+		}
+		out.Slots += slotsOf(terminatingCounted + liveCounted)
+		if terminatingCounted > 0 {
+			sort.Strings(terminatingNames)
+			out.Terminating = append(out.Terminating, terminatingNames...)
+			if out.NextRelease.IsZero() || release.Before(out.NextRelease) {
+				out.NextRelease = release
+			}
+		}
+		if liveCounted > 0 {
+			out.LiveSlotsByInstance[idx] = slotsOf(liveCounted)
+			out.Live = append(out.Live, liveExtraPodNames(live, runningRevision[idx], liveCounted)...)
+		}
+	}
+	return out
+}
+
+// liveExtraPodNames names, in name order, the n live pods of a bucket
+// that are the extra ones: those off the row's running revision first,
+// since a replacement a disposed attempt left behind carries the revision
+// it was built for, then the rest from the highest name down. A bucket
+// with no pod on the running revision is read by name order alone.
+func liveExtraPodNames(pods []*corev1.Pod, running query.RevisionID, n int32) []string {
+	var off, on []string
+	for _, pod := range pods {
+		rev := query.RevisionFromPod(pod)
+		if !running.IsZero() && !rev.IsZero() && !rev.Same(running) {
+			off = append(off, pod.Name)
+			continue
+		}
+		on = append(on, pod.Name)
+	}
+	if len(on) == 0 {
+		on, off = off, nil
+	}
+	sort.Strings(off)
+	sort.Sort(sort.Reverse(sort.StringSlice(on)))
+	names := append(off, on...)
+	if int32(len(names)) > n {
+		names = names[:n]
+	}
+	sort.Strings(names)
+	return names
 }

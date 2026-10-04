@@ -9,7 +9,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -114,14 +113,19 @@ func (r *Reconciler) resolveBackendTargets(ctx context.Context, source, desired 
 }
 
 func (r *Reconciler) resolveMemberBackend(ctx context.Context, cl client.Client, source, desired *v1beta1.InferenceService) (*resolution.Runtime, error) {
-	standing := &v1beta1.InferenceService{}
-	if err := cl.Get(ctx, client.ObjectKeyFromObject(desired), standing); apierrors.IsNotFound(err) {
-		standing = nil
-	} else if err != nil {
+	standing, err := getMemberService(ctx, cl, client.ObjectKeyFromObject(desired))
+	if err != nil {
 		return nil, err
-	} else if !isOurDerived(standing, source) {
+	}
+	if standing != nil && !isOurDerived(standing, source) {
 		return nil, fmt.Errorf("backend target is not owned by this placement source")
 	}
+	return r.resolveStandingBackend(ctx, cl, desired, standing)
+}
+
+// resolveStandingBackend resolves the member runtime for desired against the
+// owned member service standing, or against its absence when standing is nil.
+func (r *Reconciler) resolveStandingBackend(ctx context.Context, cl client.Client, desired, standing *v1beta1.InferenceService) (*resolution.Runtime, error) {
 	resolver := resolution.Resolver{Client: cl, OperatorNamespace: r.MemberOperatorNamespace}
 	policy, err := protocol.FromDerived(desired)
 	if err != nil {

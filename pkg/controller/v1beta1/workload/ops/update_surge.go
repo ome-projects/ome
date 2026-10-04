@@ -3,7 +3,6 @@ package ops
 import (
 	"context"
 	"fmt"
-	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -16,6 +15,18 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
+
+// exclusionCoversPod reports whether one of the Instance's recorded
+// exclusions names the node pod sits on, for the revision pod carries.
+func exclusionCoversPod(exclusions []workload.NodeExclusion, pod *corev1.Pod) bool {
+	podRev := query.RevisionFromPod(pod)
+	for _, exclusion := range exclusions {
+		if exclusion.Node == pod.Spec.NodeName && query.RevisionFromName(exclusion.Revision).Same(podRev) {
+			return true
+		}
+	}
+	return false
+}
 
 // surgeDrainKey identifies a SurgeThenDrain drain writer entry on the
 // old pod's ome.io/serving gate. Indexed by (instance, surge ordinal)
@@ -59,7 +70,7 @@ func recycleFailedCreateContainerTarget(
 	// Cleanup is safe only while the canonical source is still healthy and in
 	// rotation. A missing or unhealthy source requires operator attention rather
 	// than another automatic target recycle.
-	if liveSource.DeletionTimestamp != nil || !podreadiness.IsContainersReady(liveSource) || !podreadiness.IsServing(liveSource) {
+	if liveSource.DeletionTimestamp != nil || !podreadiness.ReadyAndServing(liveSource) {
 		return true, nil
 	}
 	sourceRev := query.RevisionFromName(row.RunningRevision)
@@ -103,10 +114,11 @@ func recycleFailedCreateContainerTarget(
 	}
 
 	// ExcludedNodes is projected from persisted AutoRecover directives. The
-	// failed pod's node appearing here proves that disposition authorized this
-	// relocation attempt. Once the configured budget is exhausted, a new node is
-	// not recorded and this branch parks the Instance instead of churning pods.
-	if pod.Spec.NodeName == "" || !slices.Contains(inst.ExcludedNodes, pod.Spec.NodeName) {
+	// failed pod's node appearing here, recorded for the pod's own revision,
+	// proves that disposition authorized this relocation attempt. Once the
+	// configured budget is exhausted, a new node is not recorded and this
+	// branch parks the Instance instead of churning pods.
+	if pod.Spec.NodeName == "" || !exclusionCoversPod(inst.ExcludedNodes, pod) {
 		return true, nil
 	}
 	if pod.UID == "" {
@@ -393,7 +405,16 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index) {
 			return false, nil
 		}
-		if _, err := createMissingPods(ctx, deps, input, plan, inst, inst.Index, targets, query.RevisionFromName(surgeTargetName)); err != nil {
+		// A pin that is the roll target renders the current template; a
+		// pin the target has moved away from renders its stored one.
+		tmpl, found, err := pinnedTemplate(ctx, deps.Reader(), input, plan, target, surgeTargetName)
+		if err != nil {
+			return false, fmt.Errorf("resolve surge template (instance=%d): %w", inst.Index, err)
+		}
+		if !found {
+			return false, announceRevisionGone(ctx, deps, input, inst.Index, surgeTargetName)
+		}
+		if _, err := createMissingPods(ctx, deps, input, plan, inst, inst.Index, targets, tmpl); err != nil {
 			if createRejectionHandled(err) {
 				return false, nil
 			}

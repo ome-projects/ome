@@ -12,14 +12,14 @@ import (
 )
 
 // unavailableHosts returns, sorted, why each node of slice name cannot take
-// any of the pods. Only a node's health counts, as the scheduler judges it: a
-// cordoned node by the unschedulable taint, a node that is not ready by the
-// not-ready or unreachable taint its Ready condition maps to. A pod may
-// tolerate each of them.
-func unavailableHosts(ctx context.Context, nodes client.Reader, sliceLabel, name string, pods []*corev1.PodSpec) ([]string, error) {
+// any of the pods, and how many nodes the slice has. Only a node's health
+// counts, as the scheduler judges it: a cordoned node by the unschedulable
+// taint, a node that is not ready by the not-ready or unreachable taint its
+// Ready condition maps to. A pod may tolerate each of them.
+func unavailableHosts(ctx context.Context, nodes client.Reader, sliceLabel, name string, pods []*corev1.PodSpec) ([]string, int, error) {
 	list := &corev1.NodeList{}
 	if err := nodes.List(ctx, list, client.MatchingLabels{sliceLabel: name}); err != nil {
-		return nil, fmt.Errorf("list the nodes of slice %s: %w", name, err)
+		return nil, 0, fmt.Errorf("list the nodes of slice %s: %w", name, err)
 	}
 	var out []string
 	for i := range list.Items {
@@ -28,7 +28,7 @@ func unavailableHosts(ctx context.Context, nodes client.Reader, sliceLabel, name
 		}
 	}
 	sort.Strings(out)
-	return out, nil
+	return out, len(list.Items), nil
 }
 
 // unavailable is why none of the pods can be scheduled on node, or empty when

@@ -3,10 +3,13 @@ package canary
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -1688,15 +1692,16 @@ func TestComponentReplicas(t *testing.T) {
 	}
 }
 
-// A rollback whose stable revision has no retained ControllerRevision cannot
-// be carried out: the IR gets no rollback target, and the canary parks Failed
-// with the reason instead of reporting a revert that never completes.
-func TestDispatch_RollbackWithoutStableRevisionParksFailed(t *testing.T) {
+// missingStableFixture seeds a single-engine canary serving its first step
+// whose stable revision has no retained ControllerRevision: only the canary
+// revision's is present. It returns the working copy and the store.
+func missingStableFixture(t *testing.T, name string) (*v1beta1.InferenceService, client.Client) {
+	t.Helper()
 	ns := "default"
 	n4 := 4
 	isvc := canaryISVC(twoStep(), nil)
 	isvc.Namespace = ns
-	isvc.Name = "no-stable"
+	isvc.Name = name
 	isvc.Spec.Engine = &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &n4}}
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", CurrentStep: 0, ObservedTrafficWeight: 50}
 	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
@@ -1706,17 +1711,41 @@ func TestDispatch_RollbackWithoutStableRevisionParksFailed(t *testing.T) {
 	isvc.Status.Rollout.ActiveRun.TargetRevisions = []v1beta1.RolloutRunTarget{
 		{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: "old"},
 	}
-	engineIR := ir(ns, isvc.Name, v1beta1.EngineComponent, "new")
-	engineIR.Status.CurrentRevision = isvc.Name + "-engine-old"
+	engineIR := ir(ns, name, v1beta1.EngineComponent, "new")
+	engineIR.Status.CurrentRevision = name + "-engine-old"
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(
 		isvc, engineIR,
-		canaryPod(ns, isvc.Name, "engine", "old", "old-0"),
-		canaryPod(ns, isvc.Name, "engine", "old", "old-1"),
-		canaryPod(ns, isvc.Name, "engine", "new", "new-2"),
-		canaryPod(ns, isvc.Name, "engine", "new", "new-3"),
+		canaryPod(ns, name, "engine", "old", "old-0"),
+		canaryPod(ns, name, "engine", "old", "old-1"),
+		canaryPod(ns, name, "engine", "new", "new-2"),
+		canaryPod(ns, name, "engine", "new", "new-3"),
 		// Only the canary revision is retained; the stable one was pruned.
-		canaryControllerRevision(ns, isvc.Name, "engine", "new", 2),
+		canaryControllerRevision(ns, name, "engine", "new", 2),
 	).Build()
+	return isvc, c
+}
+
+// manualRollbacks reads the engine unit's manual rollback counter.
+func manualRollbacks(isvc *v1beta1.InferenceService) float64 {
+	return testutil.ToFloat64(canaryRollbackTotal.WithLabelValues(isvc.Namespace, isvc.Name, string(v1beta1.EngineComponent), "manual"))
+}
+
+// countEvents drains the recorder and counts the events carrying reason.
+func countEvents(rec *record.FakeRecorder, reason string) int {
+	n := 0
+	for _, e := range eventsFrom(rec) {
+		if strings.Contains(e, reason) {
+			n++
+		}
+	}
+	return n
+}
+
+// A rollback whose stable revision has no retained ControllerRevision cannot
+// be carried out: the IR gets no rollback target, and the canary parks Failed
+// with the reason instead of reporting a revert that never completes.
+func TestDispatch_RollbackWithoutStableRevisionParksFailed(t *testing.T) {
+	isvc, c := missingStableFixture(t, "no-stable")
 	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
 
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
@@ -1732,11 +1761,161 @@ func TestDispatch_RollbackWithoutStableRevisionParksFailed(t *testing.T) {
 			t.Fatalf("pass %d: phase %q, want Failed", pass, got)
 		}
 		got := &v1beta1.InferenceReplica{}
-		if err := c.Get(context.Background(), types.NamespacedName{Namespace: ns, Name: isvc.Name + "-engine"}, got); err != nil {
+		if err := c.Get(context.Background(), types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name + "-engine"}, got); err != nil {
 			t.Fatal(err)
 		}
 		if got.Spec.Pacing != nil && got.Spec.Pacing.RollbackToRevision != nil {
 			t.Fatalf("pass %d: no rollback target must be signaled when the stable revision is gone: %+v", pass, got.Spec.Pacing)
+		}
+	}
+}
+
+// A rollback request is applied once. The pass that finds no stable revision
+// to return to records the rejected hash and parks; while the copy each later
+// pass reads still carries the request, the park stays as it was: its clock
+// is not re-stamped, the manual rollback counter does not move and the event
+// is not repeated. Every pass hands the request back for removal after the
+// flush.
+func TestDispatch_MissingStableParkAppliesTheRollbackOnce(t *testing.T) {
+	isvc, c := missingStableFixture(t, "park-once")
+	rec := record.NewFakeRecorder(16)
+	start := time.Unix(1000, 0)
+	deps := DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, Now: start, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+
+	rollbacksBefore := manualRollbacks(isvc)
+	parkEvents := 0
+	var parkedAt *metav1.Time
+	for pass := 0; pass < 4; pass++ {
+		annotate(isvc, constants.RolloutRollbackAnnotation, "true")
+		deps.Now = start.Add(time.Duration(pass) * time.Minute)
+		out, err := Dispatch(context.Background(), deps)
+		if err != nil {
+			t.Fatalf("Dispatch pass %d: %v", pass, err)
+		}
+		parkEvents += countEvents(rec, EventReasonCanaryStableRevisionMissing)
+		cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
+		if cs == nil || cs.Failed == nil || cs.Failed.Reason != v1beta1.CanaryFailureStableRevisionMissing || cs.Failed.Time == nil {
+			t.Fatalf("pass %d: expected a StableRevisionMissing park, got %+v", pass, cs)
+		}
+		if parkedAt == nil {
+			parkedAt = cs.Failed.Time.DeepCopy()
+		} else if !cs.Failed.Time.Equal(parkedAt) {
+			t.Errorf("pass %d re-stamped the park: %v -> %v", pass, parkedAt.Time, cs.Failed.Time.Time)
+		}
+		if cs.RolledBackRevisionHash != "new" {
+			t.Errorf("pass %d: the rejected hash must stay recorded, got %+v", pass, cs)
+		}
+		if got := manualRollbacks(isvc) - rollbacksBefore; got != 1 {
+			t.Errorf("pass %d: manual rollbacks %v, want 1", pass, got)
+		}
+		if parkEvents != 1 {
+			t.Errorf("pass %d: %d %s events, want 1", pass, parkEvents, EventReasonCanaryStableRevisionMissing)
+		}
+		if phaseOf(isvc) != v1beta1.RolloutPhaseFailed {
+			t.Errorf("pass %d: phase %q, want Failed", pass, phaseOf(isvc))
+		}
+		if !slices.Contains(out.Consume, constants.RolloutRollbackAnnotation) {
+			t.Errorf("pass %d: the park must hand the request back for removal, got %v", pass, out.Consume)
+		}
+	}
+}
+
+// The controller removes the request once the flush that carries the park
+// has landed. A request applied again finds the park and is refused the same
+// way, without moving it; a new target re-arms the unit, and a copy of the
+// request still stored at that moment leaves with the rejected hash instead
+// of following the new canary.
+func TestDispatch_MissingStableParkRefusesARepeatAndRearms(t *testing.T) {
+	isvc, c := missingStableFixture(t, "park-repeat")
+	rec := record.NewFakeRecorder(16)
+	ctx := context.Background()
+	deps := DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, Now: time.Unix(1000, 0), ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	dispatch := func(pass string) Outcome {
+		t.Helper()
+		out, err := Dispatch(ctx, deps)
+		if err != nil {
+			t.Fatalf("Dispatch (%s): %v", pass, err)
+		}
+		return out
+	}
+	status := func() *v1beta1.CanaryStatus { return rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent) }
+	requestStored := func() bool {
+		_, ok := storedAnnotations(t, c, isvc)[constants.RolloutRollbackAnnotation]
+		return ok
+	}
+	// The controller's removal after the status flush; the next pass reads
+	// the object as the store then has it.
+	removeTaken := func(out Outcome) {
+		t.Helper()
+		if err := ConsumeAnnotations(ctx, c, isvc, out.Consume); err != nil {
+			t.Fatal(err)
+		}
+		isvc.Annotations = storedAnnotations(t, c, isvc)
+	}
+
+	annotateStored(t, c, isvc, constants.RolloutRollbackAnnotation, "true")
+	rollbacksBefore := manualRollbacks(isvc)
+	out := dispatch("park")
+	cs := status()
+	if cs == nil || cs.Failed == nil || cs.Failed.Reason != v1beta1.CanaryFailureStableRevisionMissing || cs.Failed.Time == nil {
+		t.Fatalf("expected a StableRevisionMissing park, got %+v", cs)
+	}
+	parkedAt := cs.Failed.Time.DeepCopy()
+	if got := countEvents(rec, EventReasonCanaryStableRevisionMissing); got != 1 {
+		t.Fatalf("%d %s events, want 1", got, EventReasonCanaryStableRevisionMissing)
+	}
+	removeTaken(out)
+	if requestStored() {
+		t.Fatal("the request must be removed once the park is persisted")
+	}
+
+	out = dispatch("hold")
+	if len(out.Consume) != 0 {
+		t.Fatalf("a pass that reads no request takes nothing, got %v", out.Consume)
+	}
+
+	// The operator applies the verb again: refused, the park unmoved.
+	annotateStored(t, c, isvc, constants.RolloutRollbackAnnotation, "true")
+	out = dispatch("repeat")
+	cs = status()
+	if cs.Failed == nil || !cs.Failed.Time.Equal(parkedAt) || cs.RolledBackRevisionHash != "new" || phaseOf(isvc) != v1beta1.RolloutPhaseFailed {
+		t.Fatalf("a repeated request must not move the park, got %+v phase=%q", cs, phaseOf(isvc))
+	}
+	if got := manualRollbacks(isvc) - rollbacksBefore; got != 1 {
+		t.Fatalf("manual rollbacks %v, want 1", got)
+	}
+	if got := countEvents(rec, EventReasonCanaryStableRevisionMissing); got != 0 {
+		t.Fatalf("the park event must not repeat, got %d", got)
+	}
+	if !slices.Contains(out.Consume, constants.RolloutRollbackAnnotation) {
+		t.Fatalf("the repeated request must be handed back for removal, got %v", out.Consume)
+	}
+
+	// A new target arrives while the repeated request is still stored: the
+	// run is retargeted toward it and the executor re-arms the unit. The
+	// request leaves with the rejected hash, stored and in memory.
+	isvc.Annotations = storedAnnotations(t, c, isvc)
+	if !requestStored() {
+		t.Fatal("setup: the repeated request must still be stored")
+	}
+	isvc.Status.Rollout.ActiveRun.TargetRevisions[0].Revision = "v3"
+	irKey := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name + "-engine"}
+	updateIR(t, c, irKey, func(ir *v1beta1.InferenceReplica) { ir.Status.UpdateRevision = isvc.Name + "-engine-v3" })
+	if err := c.Create(ctx, canaryControllerRevision(isvc.Namespace, isvc.Name, "engine", "v3", 3)); err != nil {
+		t.Fatal(err)
+	}
+	dispatch("retarget")
+	cs = status()
+	if cs.RolledBackRevisionHash != "" || cs.Failed != nil || cs.CanaryRevisionHash != "v3" || cs.CurrentStep != 0 {
+		t.Fatalf("the new target must arm a fresh canary at step 0, got %+v", cs)
+	}
+	if _, ok := isvc.Annotations[constants.RolloutRollbackAnnotation]; ok || requestStored() {
+		t.Fatal("the request must leave with the rejected hash")
+	}
+	for _, pass := range []string{"stage", "stage again"} {
+		dispatch(pass)
+		if cs := status(); cs.RolledBackRevisionHash != "" || phaseOf(isvc) != v1beta1.RolloutPhasePending {
+			t.Fatalf("%s: a later pass rolled the new target back: %+v phase=%q", pass, cs, phaseOf(isvc))
 		}
 	}
 }

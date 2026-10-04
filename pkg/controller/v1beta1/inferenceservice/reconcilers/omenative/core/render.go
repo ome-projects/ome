@@ -110,7 +110,7 @@ func isvcRenderHook(isvc *v1beta1.InferenceService, peerRevision coordination.Pe
 				return peerRevision(peer, revisionHash)
 			}
 		}
-		coordination.InjectPeerEnv(pod, isvc.Name, isvc.Namespace, peers, revisionHashFor)
+		coordination.InjectPeerEnv(pod, isvc, peers, revisionHashFor)
 	}
 }
 

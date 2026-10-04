@@ -52,8 +52,14 @@ func ReconcileOMENativePDB(
 }
 
 func omeNativeComponentSelector(isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType) map[string]string {
+	return omeNativePodSelector(isvc.Name, componentType)
+}
+
+// omeNativePodSelector selects the OMENative pods of one pod set by its
+// replica's name prefix (the ome.io/inferenceservice label value) and role.
+func omeNativePodSelector(podPrefix string, componentType v1beta1.ComponentType) map[string]string {
 	return map[string]string{
-		constants.InferenceServicePodLabelKey: isvc.Name,
+		constants.InferenceServicePodLabelKey: podPrefix,
 		constants.OMEComponentLabel:           string(componentType),
 		query.LabelManagedBy:                  query.ManagedByOMENative,
 	}

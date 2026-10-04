@@ -12,6 +12,7 @@ func TestRejectionClassPermanence(t *testing.T) {
 		{APIRejectionTransient, false},
 		{APIRejectionThrottled, false},
 		{APIRejectionCapacityBlocked, false},
+		{APIRejectionAdmissionUnavailable, false},
 		{APIRejectionPermanentWorkload, true},
 		{APIRejectionPermanentEnvironment, true},
 	} {
@@ -33,5 +34,17 @@ func TestInvalidPodSpecIsWorkloadCaused(t *testing.T) {
 	}
 	if IsWorkloadCausedReason(RejectionReasonQuotaExceeded) {
 		t.Errorf("%s: got workload-caused want not workload-caused", RejectionReasonQuotaExceeded)
+	}
+}
+
+// TestAdmissionUnavailableIsEnvironmentCaused: an apiserver that cannot
+// reach its admission webhook says nothing about the revision, so the
+// reason the wait leaves on LastFailure never charges a retry ladder.
+func TestAdmissionUnavailableIsEnvironmentCaused(t *testing.T) {
+	if IsWorkloadCausedReason(RejectionReasonAdmissionUnavailable) {
+		t.Errorf("%s: got workload-caused want environment-caused", RejectionReasonAdmissionUnavailable)
+	}
+	if got := FailureCauseOf(RejectionReasonAdmissionUnavailable); got != CauseEnvironment {
+		t.Errorf("FailureCauseOf(%s): got %v want CauseEnvironment", RejectionReasonAdmissionUnavailable, got)
 	}
 }

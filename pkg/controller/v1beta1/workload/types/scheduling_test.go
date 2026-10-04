@@ -100,3 +100,17 @@ func TestPodAdmissionGated(t *testing.T) {
 		t.Errorf("nil pod: got true want false")
 	}
 }
+
+// TestOperationExternallyHeld_AdmissionUnavailable: an operation whose
+// write the apiserver could not take to admission is parked on an
+// authority outside the workload, so the InstanceReadyTimeout clock must
+// not run through it.
+func TestOperationExternallyHeld_AdmissionUnavailable(t *testing.T) {
+	op := &InstanceOperation{Type: InstanceOperationCreate, Waiting: RejectionReasonAdmissionUnavailable}
+	if !OperationAdmissionHeld(op) || !OperationExternallyHeld(op) {
+		t.Errorf("an admission wait must park the clock: admission=%v external=%v", OperationAdmissionHeld(op), OperationExternallyHeld(op))
+	}
+	if OperationAdmissionHeld(&InstanceOperation{Type: InstanceOperationCreate}) {
+		t.Error("an unheld operation must not read as an admission wait")
+	}
+}

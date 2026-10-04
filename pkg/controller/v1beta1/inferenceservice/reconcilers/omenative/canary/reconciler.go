@@ -4,9 +4,11 @@ import (
 	"context"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
@@ -57,6 +59,23 @@ type ReconcileInputs struct {
 	// keyed by Component; the primary's is the identity the executor resolves
 	// itself. A member with none recorded is not waited on.
 	GroupStableRevisionHashes map[v1beta1.ComponentType]string
+	// GroupReadyPerRevisionPods counts each member's ready serving pods per
+	// revision hash, keyed by Component. A rollback moves a member's traffic
+	// onto its stable revision only when that revision has serving capacity;
+	// a member absent here is written on the primary's view alone.
+	GroupReadyPerRevisionPods map[v1beta1.ComponentType]map[string]int32
+	// Crash is a canary pod in a crash loop after its Instance was serving, on
+	// any member of the unit; nil when none is. A single restart is a capacity
+	// dip, not a crash. The dispatcher reads it from the pods and the Instance
+	// rows; a live ladder parks on it.
+	Crash *CanaryCrash
+	// CanaryRestartedAt is the newest moment a canary pod of the unit died or
+	// came back, on any member; zero when none has. The dispatcher reads it
+	// from the pods and the Instance rows beside Crash. A timed soak measures
+	// from the later of the split first serving and this instant: a single
+	// restart keeps the step, and the step moves only once a full soak has
+	// passed since it.
+	CanaryRestartedAt time.Time
 	// SecondaryCapacityReady is true when every NON-primary component's canary
 	// Instances have reached that component's step newCount. The primary uses its
 	// exact complete-PodReady target Instance count. Single-component canaries
@@ -109,13 +128,21 @@ type ReconcileInputs struct {
 
 // MemberRevisions is one secondary's revision pair: the target its capacity
 // gate verified and its persisted stable revision, with the pairing protocol
-// each was minted under. A member that was not bumped names the same revision
-// twice; a member with no stable revision leaves it empty.
+// each was minted under, and the Ready capacity the gate counted on the
+// target. A member that was not bumped names the same revision twice; a
+// member with no stable revision leaves it empty.
 type MemberRevisions struct {
 	CanaryRevisionHash    string
 	StableRevisionHash    string
 	CanaryPairingProtocol string
 	StablePairingProtocol string
+	// ReadyCanaryCapacity is the member's Ready capacity on its target
+	// revision, as the capacity gate counts it; above zero, the target's
+	// pods have reached Ready.
+	ReadyCanaryCapacity int32
+	// DesiredReplicas is the member's steady instance count, the capacity
+	// its target must reach before the cutover is complete.
+	DesiredReplicas int32
 }
 
 // The ready Pod count bounds the exact ready Instance count and remains the
@@ -210,8 +237,9 @@ type Result struct {
 	Requeue bool
 	// Consume lists the operator annotations this pass applied. The controller
 	// removes them after the status write that carries their effect has
-	// landed; each applied verb leaves a record in status (PromotedThrough)
-	// that keeps the still-visible annotation inert until then.
+	// landed; each applied verb leaves a record in status (PromotedThrough,
+	// the rejected revision of a rollback) that keeps the still-visible
+	// annotation inert until then.
 	Consume []string
 }
 
@@ -229,7 +257,10 @@ func (r *Result) wake(d time.Duration) *Result {
 // Reconcile advances the canary toward the declared plan, mutating isvc.Status
 // in-memory. No-op (Active=false) when spec.rollout.canary is unset. Per step it
 // performs capacity → traffic → pause, advancing on promotion; the final step
-// (TrafficWeight 100) drains and scales the stable revision down.
+// (TrafficWeight 100) shifts traffic off the stable revision, drains it,
+// releases its last instance to roll on a later pass that has counted the
+// canary capacity itself, and reads Stable once every instance serves the
+// canary revision.
 func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	// Operator annotations are applied in status first and removed by the
 	// controller after the flush; the pass only records which ones it took,
@@ -319,44 +350,73 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 		cs.StableRevisionHash = in.StableRevisionHash
 	}
 
+	// A canary pod that served and keeps dying is the canary's verdict on the
+	// revision, read before any gate so no count can argue with it: the
+	// ladder parks where it stands and the broken revision serves nothing.
+	if in.Crash != nil {
+		return parkOnCrash(in, cs, plan), nil
+	}
+
 	// Finish any promotion whose advance already persisted: hand the applied
 	// promote annotation back for removal and, once it is gone, clear the
 	// durable record so manual promotion re-arms for later steps.
 	syncPromotedThrough(in, cs, take)
 	step := plan.Steps[cs.CurrentStep]
 
-	newCount := resolveStepNewCount(step, in.DesiredReplicas)
-	partition := partitionForNewCount(in.DesiredReplicas, newCount)
+	// The step's partition keeps the stable revision's last instance (the
+	// held floor) for as long as the canary is in flight, so the capacity a
+	// step stages, and its gate waits for, is what the remaining instances can
+	// reach.
+	partition := stepPartition(step, in.DesiredReplicas)
+	newCount := in.DesiredReplicas - partition
 
 	// Capacity gate: don't shift traffic until the canary pods are Ready — the
 	// primary's own newCount AND every secondary component's canary capacity (PD,
 	// so a Ready router can't advance the step while the engine/decoder canary
 	// pods behind it are still coming up). The wait is timed from when it
 	// began, never from the step's soak anchor, so a long bake cannot spend the
-	// budget and a dip cannot restart the soak; past the ready timeout the
+	// budget and a dip cannot restart the soak (a canary pod's restart does,
+	// through the soak's own reading of the pods); past the ready timeout the
 	// canary parks Failed with the stable revision still serving.
 	readyCanary := readyCanaryCapacity(in)
+	// A target with Ready pods is the member's latest ready revision whether
+	// or not the step's capacity is met yet.
+	publishReadyRevisions(in)
 	state := rollout.StateOf(cs, in.ISVC.Status.Components[in.Component].RolloutPhase, len(plan.Steps))
-	if (readyCanary < newCount || !in.SecondaryCapacityReady) && state != rollout.CanaryStateDraining {
-		// A drain is exempt: the final traffic write has landed, and capacity
-		// lost after cutover is the workload engine's repair, not a canary
-		// state.
-		if cs.CapacityWaitSince == nil {
-			cs.CapacityWaitSince = &metav1.Time{Time: in.Now}
+	capacityShort := readyCanary < newCount || !in.SecondaryCapacityReady
+	if capacityShort && cs.CapacityWaitSince == nil {
+		cs.CapacityWaitSince = &metav1.Time{Time: in.Now}
+	}
+	if capacityShort && state != rollout.CanaryStateDraining {
+		// The held split names the canary revision only while a pod of it
+		// serves; its share rests on the stable revision otherwise and
+		// returns on the pass that sees a canary pod serve again.
+		holdGroupTraffic(in)
+	}
+	if capacityShort && capacityGateExpired(cs, resolveReadyTimeout(in, plan), in.Now) {
+		// A drain's split names the canary revision alone, so its park hands
+		// the traffic back to the held stable instance, as a crash park does.
+		if state == rollout.CanaryStateDraining {
+			returnTrafficToStable(in)
 		}
-		if capacityGateExpired(cs, resolveReadyTimeout(in, plan), in.Now) {
-			parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureCapacityTimeout, in.Now)
-			return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
-		}
+		parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureCapacityTimeout, in.Now)
+		return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
+	}
+	if capacityShort && state != rollout.CanaryStateDraining {
+		// A drain is exempt from this hold: capacity lost after the final
+		// traffic write is the workload engine's repair, and the drain's own
+		// release waits on it below, inside the same timeout.
 		if state == rollout.CanaryStateServing || state == rollout.CanaryStatePreHold {
-			// A split that was serving keeps its phase and its programmed
+			// A split that was serving keeps its phase and its recorded
 			// weight through a dip; the gate only keeps the step from moving.
 			return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 		}
 		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePending)
 		return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 	}
-	cs.CapacityWaitSince = nil
+	if !capacityShort {
+		cs.CapacityWaitSince = nil
+	}
 
 	// Pre-step hold (repin clamp): the pinned plan was replaced mid-run and
 	// the clamped step would raise exposure, so the traffic raise waits for
@@ -373,6 +433,9 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 			cs.PromotedThrough = cs.CanaryRevisionHash
 			take(constants.RolloutPromoteAnnotation)
 		} else {
+			// The held split follows the pods like any held split: its
+			// share is back on the canary revision as soon as one serves.
+			holdGroupTraffic(in)
 			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePaused)
 			return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 		}
@@ -383,14 +446,18 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	weightBefore := cs.ObservedTrafficWeight
 	applyGroupTraffic(in, step.Traffic)
 
-	// Final step (TrafficWeight 100): drain the stable revision, then complete.
+	// Final step (TrafficWeight 100): shift traffic off the stable revision,
+	// hold its last instance through the drain window, then release it: the
+	// done sentinel drops the floor, the held instance rolls, and the unit
+	// reads Stable once nothing serves the stable revision.
 	if int(cs.CurrentStep) == len(plan.Steps)-1 {
 		// Anchor the drain window and the final gate to the moment 100%
 		// traffic actually shifts, not to step entry: on slow capacity the
 		// final step is entered well before traffic moves, so measuring from
 		// step entry could consume the whole window before cutover. The pass
 		// whose traffic write moved the weight to 100 is that moment.
-		if weightBefore != 100 {
+		shifted := weightBefore != 100
+		if shifted {
 			cs.StepEnteredTime = &metav1.Time{Time: in.Now}
 		}
 		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePromoting)
@@ -407,15 +474,21 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 				return reconcileRollback(in, cs), nil
 			case decFailed:
 				parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureAnalysisStalled, in.Now)
-				return (&Result{Active: true, Partition: 0}).wake(in.ParkedRequeue), nil
+				return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
 			case decHold:
 				// A held gate reads Paused on every step: the phase names the
 				// wait, and Promoting is the drain that follows the gate.
 				setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePaused)
-				return (&Result{Active: true, Partition: 0}).wake(stepWake(in, step)), nil
+				return (&Result{Active: true, Partition: partition}).wake(stepWake(in, step)), nil
 			case decAdvance:
 				// gate passed at 100% — fall through to the drain window + completion.
 			}
+		}
+		// The release cannot be undone, so it is decided on a count taken
+		// after the 100% write landed: the pass that moved traffic ends here,
+		// and a drain short of canary capacity holds it until it is back.
+		if shifted || capacityShort {
+			return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 		}
 		if drainElapsed(cs, plan, in.Now) {
 			// A promote that opens the final gate stays live through the drain
@@ -427,18 +500,17 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 				cs.PromotedThrough = v
 				take(constants.RolloutPromoteAnnotation)
 			}
-			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
-			// Mark done (sentinel), don't clear: keeps EffectivePartition at
-			// partition 0 so the old revision drains instead of being re-held by
-			// a step-0 partition. ObservedTrafficWeight stays 100 (all on canary).
+			// Mark done (sentinel), don't clear: EffectivePartition reads the
+			// sentinel as partition 0, which releases the held stable instance
+			// now that traffic has left it and drained, instead of re-holding
+			// it under a step-0 partition. The release is projected on the next
+			// pass, so the roll it starts is finished by finishCutover from
+			// here on; the cutover names the target alone, whatever serves.
 			cs.CurrentStep = int32(len(plan.Steps))
-			cs.ObservedTrafficWeight = 100
-			// The canary revision is the stable revision now: drop the pre-canary
-			// identity so it cannot leak into a later rollout's rollback target.
-			cs.StableRevisionHash = ""
-			return &Result{Active: true, Complete: true, Partition: 0}, nil
+			applyCutoverTraffic(in)
+			return finishCutover(in, cs), nil
 		}
-		return (&Result{Active: true, Partition: 0}).wake(in.Requeue), nil
+		return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 	}
 
 	// Intermediate step: serving a split. Anchor the pause to the moment the split
@@ -471,6 +543,24 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	return (&Result{Active: true, Stepped: true, Partition: partition}).wake(in.Requeue), nil
 }
 
+// parkOnCrash parks a live ladder at its current step because a canary pod
+// keeps dying after it was serving. A capacity dip, a single restart among
+// them, keeps the step's split while the workload repairs it; a crash loop
+// returns the split to the stable revision, because the capacity is there
+// and cannot be trusted with traffic. The park
+// is the capacity gate's: the step's canary capacity did not hold, and the
+// pod that broke it is named in the event. Stable keeps serving until the
+// operator rolls back, resumes or pushes a new revision.
+func parkOnCrash(in ReconcileInputs, cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary) *Result {
+	partition := stepPartition(plan.Steps[cs.CurrentStep], in.DesiredReplicas)
+	returnTrafficToStable(in)
+	parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureCapacityTimeout, in.Now)
+	emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonCanaryPodCrashed,
+		"%s canary pod %s keeps dying after it was serving (%s); the ladder is parked at step %d and the step's traffic is back on the stable revision",
+		in.Crash.Component, in.Crash.PodName, in.Crash.Detail, cs.CurrentStep)
+	return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue)
+}
+
 // pausedResult reports a globally-paused canary's state without mutating it.
 // The rollback signal echoes persisted status so the controller neither arms
 // nor clears the IR's RollbackToRevision while paused, and the partition
@@ -485,9 +575,64 @@ func pausedResult(in ReconcileInputs, cs *v1beta1.CanaryStatus, plan *v1beta1.Gr
 	if cs.RolledBackRevisionHash != "" {
 		return (&Result{Active: true, RolledBack: true}).wake(in.Requeue)
 	}
-	step := plan.Steps[cs.CurrentStep]
-	partition := partitionForNewCount(in.DesiredReplicas, resolveStepNewCount(step, in.DesiredReplicas))
+	partition := stepPartition(plan.Steps[cs.CurrentStep], in.DesiredReplicas)
 	return (&Result{Active: true, Partition: partition}).wake(in.Requeue)
+}
+
+// finishCutover runs a unit whose done sentinel is set. The sentinel released
+// the held floor, so the last stable instance is rolling; until every member
+// serves on its target revision alone the unit stays Promoting at partition 0
+// and comes back at the step cadence, because the roll it waits on moves no
+// annotation and no step. Once the cutover has landed the promoted revisions
+// are recorded, the pre-canary identity is dropped (the canary revision is
+// the stable revision now, so it cannot leak into a later rollout's rollback
+// target), and the unit reads Stable; that transition is the one Complete
+// pass. A unit with no pre-canary identity on record has nothing left to
+// roll and reads Stable at once, which also keeps a canary pod lost after
+// completion a workload repair, not a canary state.
+func finishCutover(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
+	if cs.StableRevisionHash == "" {
+		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
+		return &Result{Active: false}
+	}
+	if !cutoverComplete(in) {
+		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePromoting)
+		return (&Result{Active: true, Partition: 0}).wake(in.Requeue)
+	}
+	// Every member's target owns its traffic now; the pre-canary stable is
+	// the revision each superseded.
+	recordPromotedRevisions(in, cs.StableRevisionHash)
+	cs.StableRevisionHash = ""
+	setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
+	return &Result{Active: true, Complete: true, Partition: 0}
+}
+
+// cutoverComplete reports whether the released cutover has landed on every
+// member of the unit: the target revision has its full capacity Ready and no
+// ready pod serves another revision, so the held stable instance has rolled
+// and drained. The primary is read from its own ready counts; each secondary
+// from the pair the dispatcher resolved for it.
+func cutoverComplete(in ReconcileInputs) bool {
+	if readyCanaryCapacity(in) < in.DesiredReplicas || servesOtherRevision(in.PerRevisionPods, in.CanaryRevisionHash) {
+		return false
+	}
+	for c, m := range in.Secondaries {
+		if m.ReadyCanaryCapacity < m.DesiredReplicas || servesOtherRevision(in.GroupReadyPerRevisionPods[c], m.CanaryRevisionHash) {
+			return false
+		}
+	}
+	return true
+}
+
+// servesOtherRevision reports whether any ready pod runs a revision other
+// than hash.
+func servesOtherRevision(readyPods map[string]int32, hash string) bool {
+	for h, n := range readyPods {
+		if h != "" && h != hash && n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // resetCanaryStatus re-arms the state machine at step 0 toward a new target,
@@ -526,11 +671,12 @@ func stableHashFor(cs *v1beta1.CanaryStatus, pods map[string]int32, rejectedHash
 }
 
 // reconcileRollback drives the component back to the stable revision and holds
-// there, rejecting cs.RolledBackRevisionHash. Traffic goes 100% to stable; the
-// controller reads cs.RolledBackRevisionHash and makes the IR roll every Instance
-// back to the stable ControllerRevision, so the rejected-revision pods drain.
-// While they drain → RollingBack; once gone → RolledBack (held until a different
-// target appears).
+// there, rejecting cs.RolledBackRevisionHash. Traffic goes 100% to stable once
+// stable has serving capacity to take it; the controller reads
+// cs.RolledBackRevisionHash and makes the IR roll every Instance back to the
+// stable ControllerRevision, so the rejected-revision pods drain. While they
+// drain → RollingBack; once gone → RolledBack (held until a different target
+// appears).
 func reconcileRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
 	stableHash := stableHashFor(cs, in.PerRevisionPods, cs.RolledBackRevisionHash)
 	// The rejected entry is written at 0% (dropped), so only the stable
@@ -541,7 +687,12 @@ func reconcileRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
 	if stableHash == in.StableRevisionHash {
 		stableProtocol = in.StablePairingProtocol
 	}
-	applyTraffic(in.ISVC, in.Component, cs.RolledBackRevisionHash, stableHash, "", stableProtocol, 0)
+	// Traffic moves only onto capacity that serves: a stable revision with
+	// no ready pod keeps the programmed split until the revert brings one
+	// back, rather than being handed traffic it cannot carry.
+	if in.PerRevisionPods[stableHash] > 0 {
+		applyTraffic(in.ISVC, in.Component, cs.RolledBackRevisionHash, stableHash, "", stableProtocol, 0)
+	}
 	applyGroupStableTraffic(in)
 	// RolledBack is the revert-COMPLETE phase, so it must wait out every
 	// non-stable revision — not just the rejected one. A retargeted canary
@@ -572,6 +723,9 @@ func reconcileRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
 		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseRollingBack)
 		return (&Result{Active: true, RolledBack: true}).wake(in.Requeue)
 	}
+	// The revert is complete: every member's stable revision owns its
+	// traffic again.
+	recordRolledBackRevisions(in, stableHash)
 	setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseRolledBack)
 	return &Result{Active: true, RolledBack: true}
 }

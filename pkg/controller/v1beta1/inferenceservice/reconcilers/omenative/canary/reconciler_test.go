@@ -133,7 +133,8 @@ func TestReconcile_CapacityUsesReadyInstanceCount(t *testing.T) {
 		readyInstances int32
 	}{
 		{name: "half-capacity-instance-shortfall", step: 0, readyPods: 16, readyInstances: 3},
-		{name: "full-capacity-instance-shortfall", step: 1, readyPods: 16, readyInstances: 7},
+		// The final step stages every instance but the held stable one: 7 of 8.
+		{name: "full-capacity-instance-shortfall", step: 1, readyPods: 16, readyInstances: 6},
 		{name: "pod-readiness-shortfall", step: 0, readyPods: 3, readyInstances: 8},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -327,6 +328,11 @@ func TestReconcile_FinalStepCompletes(t *testing.T) {
 	// converged is the "already done" case, not a completion (see
 	// TestReconcile_AlreadyConvergedNoRestart).
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CanaryRevisionHash: "new", CurrentStep: 0, StepEnteredTime: &metav1.Time{Time: time.Unix(1000, 0)}}
+	// The pass that moves traffic to 100% leaves the release to the next
+	// pass, which counts the canary capacity again before completing.
+	if res, _ := Reconcile(context.Background(), baseInputs(isvc, map[string]int32{"new": 4})); res.Complete || phaseOf(isvc) != v1beta1.RolloutPhasePromoting {
+		t.Fatalf("expected Promoting on the traffic shift, got phase=%q res=%+v", phaseOf(isvc), res)
+	}
 	res, _ := Reconcile(context.Background(), baseInputs(isvc, map[string]int32{"new": 4}))
 	if phaseOf(isvc) != v1beta1.RolloutPhaseStable {
 		t.Fatalf("expected Stable on completion, got %q", phaseOf(isvc))
@@ -351,12 +357,11 @@ func TestReconcile_FinalStepCompletes(t *testing.T) {
 	}
 }
 
-// TestReconcile_AlreadyConvergedNoRestart guards completion idempotency: once a
-// canary finishes it clears Status.Canary, but the canary spec stays on the
-// ISVC. A reconcile that then sees a nil status alongside a component already
-// fully on the target revision must NOT re-initialize a fresh canary — otherwise
-// the rollout loops forever (verified on KIND). A canary only starts when there
-// is an actual revision change still to roll out.
+// TestReconcile_AlreadyConvergedNoRestart guards arming idempotency: the canary
+// spec stays on the ISVC after a rollout, so a reconcile that sees no canary
+// status alongside a component already fully on the target revision must NOT
+// initialize a fresh canary — otherwise the rollout loops forever. A canary
+// only starts when there is an actual revision change still to roll out.
 func TestReconcile_AlreadyConvergedNoRestart(t *testing.T) {
 	isvc := canaryISVC(twoStep(), nil)
 	res, _ := Reconcile(context.Background(), baseInputs(isvc, map[string]int32{"new": 4}))
@@ -1005,20 +1010,23 @@ func TestReconcile_CompletionClearsPromotedThrough(t *testing.T) {
 		t.Fatal("the applied promote must be removed on the apiserver after the flush")
 	}
 
-	// Pass 2: the final step completes (capacity already converged, no drain
-	// window) and the record, its annotation observed gone, clears with it.
-	res, err = Reconcile(context.Background(), in)
-	if err != nil {
-		t.Fatalf("Reconcile: %v", err)
+	// Pass 2: the final step moves traffic to 100% (capacity already
+	// converged) and the record, its annotation observed gone, clears with
+	// it. Pass 3: the release counts the capacity again and completes.
+	for pass := 2; pass <= 3; pass++ {
+		res, err = Reconcile(context.Background(), in)
+		if err != nil {
+			t.Fatalf("Reconcile pass %d: %v", pass, err)
+		}
+		if isvc.Status.Canary.PromotedThrough != "" {
+			t.Fatalf("pass %d must leave no durable promote record, got %q", pass, isvc.Status.Canary.PromotedThrough)
+		}
 	}
 	if !res.Complete || isvc.Status.Canary.CurrentStep != 3 {
 		t.Fatalf("expected completion, got res=%+v status=%+v", res, isvc.Status.Canary)
 	}
-	if isvc.Status.Canary.PromotedThrough != "" {
-		t.Fatalf("completion must leave no durable promote record, got %q", isvc.Status.Canary.PromotedThrough)
-	}
 
-	// Pass 3: the done sentinel holds — inactive, no residue reappears.
+	// Pass 4: the done sentinel holds — inactive, no residue reappears.
 	res, err = Reconcile(context.Background(), in)
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1404,6 +1412,7 @@ func TestReconcile_CompleteClearsStableIdentity(t *testing.T) {
 	in := baseInputs(isvc, map[string]int32{"revB": 4})
 	in.CanaryRevisionHash = "revB"
 	in.StableRevisionHash = "" // A fully drained; nothing left to observe
+	mustReconcile(t, isvc, in) // 100% traffic moves; the release reads the next pass's count
 	res, _ := Reconcile(context.Background(), in)
 	if !res.Complete {
 		t.Fatalf("expected completion, got %+v", res)

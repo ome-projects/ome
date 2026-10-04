@@ -49,7 +49,7 @@ func observeGroupTargets(ctx context.Context, reads client.Reader, isvc *v1beta1
 				continue
 			}
 			ir := &v1beta1.InferenceReplica{}
-			key := types.NamespacedName{Namespace: isvc.Namespace, Name: irprojector.InferenceReplicaName(isvc.Name, comp)}
+			key := irprojector.RoleReplicaKey(isvc, comp)
 			if err := reads.Get(ctx, key, ir); err != nil {
 				if apierrors.IsNotFound(err) {
 					out[comp] = targetPair{}
@@ -57,7 +57,7 @@ func observeGroupTargets(ctx context.Context, reads client.Reader, isvc *v1beta1
 				}
 				return nil, false, err
 			}
-			if ir.Status.ObservedGeneration != ir.Generation {
+			if ir.Status.ObservedGeneration != ir.Generation || projectionTrails(isvc, ir) {
 				fresh = false
 			}
 			current := query.RevisionFromName(ir.Status.CurrentRevision).Hash()
@@ -77,6 +77,24 @@ func observeGroupTargets(ctx context.Context, reads client.Reader, isvc *v1beta1
 }
 
 // groupKind is the progression kind a spec group declares, ref included.
+// projectionTrails reports whether ir was last projected from an older
+// generation of the service than the one it carries now: the projector
+// stamps the parent generation on every pass, and until it stamps this
+// one the member's revisions still describe the spec the service had
+// before. A run judged against them would close on a roll the service
+// has already withdrawn. A member with no stamp is read as current.
+func projectionTrails(isvc *v1beta1.InferenceService, ir *v1beta1.InferenceReplica) bool {
+	stamp, ok := ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]
+	if !ok {
+		return false
+	}
+	projected, err := strconv.ParseInt(stamp, 10, 64)
+	if err != nil {
+		return false
+	}
+	return projected < isvc.Generation
+}
+
 func groupKind(g *v1beta1.RolloutGroup) v1beta1.RolloutProgressionKind {
 	return g.DeclaredProgression()
 }
@@ -259,11 +277,13 @@ func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.Componen
 // convergence). A revert still draining counts: the rejected target opens
 // no run of its own, and the plan gate admits the roll back to stable only
 // under a pinned run. A settled rolled-back hold is terminal, not
-// in-progress. With an inline canary body the done sentinel is exact; for a
-// ref-sourced canary the body is not resolvable here, so any non-terminal
-// state counts (a run that opens around an already-done canary just closes
-// Completed on the next pass — harmless).
-func canaryMidFlight(isvc *v1beta1.InferenceService) bool {
+// in-progress. The done sentinel is exact against an inline canary body, or
+// against the composed body in composed (index-aligned with the spec groups)
+// for a ref-sourced canary. Without either, any non-terminal state counts, so
+// a caller must compose before acting on a true for a ref-sourced group: a
+// run opened around an already-done canary closes Completed on the next pass
+// and the following pass would open it again.
+func canaryMidFlight(isvc *v1beta1.InferenceService, composed []v1beta1.RolloutRunGroup) bool {
 	if isvc == nil || isvc.Spec.Rollout == nil {
 		return false
 	}
@@ -279,8 +299,12 @@ func canaryMidFlight(isvc *v1beta1.InferenceService) bool {
 		if cs.RolledBackRevisionHash != "" {
 			return revertInFlight(isvc, g)
 		}
-		if g.Canary != nil {
-			return int(cs.CurrentStep) < len(g.Canary.Steps)
+		body := g.Canary
+		if body == nil && gi < len(composed) {
+			body = composed[gi].Group.Canary
+		}
+		if body != nil {
+			return int(cs.CurrentStep) < len(body.Steps)
 		}
 		return true
 	}

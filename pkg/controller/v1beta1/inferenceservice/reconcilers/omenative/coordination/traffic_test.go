@@ -402,3 +402,42 @@ func TestBuildTrafficTargets_DoesNotMergeDistinctRevisions(t *testing.T) {
 		t.Fatalf("distinct revisions: got %d entries want 2: %+v", len(got), got)
 	}
 }
+
+func TestRecordRolledOutRevision(t *testing.T) {
+	cs := v1beta1.ComponentStatusSpec{}
+	if RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "", "") {
+		t.Fatal("no revision writes nothing")
+	}
+	if !RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "a", "") ||
+		cs.LatestRolledoutRevision != "svc-engine-rev-a" || cs.PreviousRolledoutRevision != "" {
+		t.Fatalf("the first record has nothing to demote: %+v", cs)
+	}
+	if RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "a", "") || cs.PreviousRolledoutRevision != "" {
+		t.Fatalf("re-recording the current revision changes nothing: %+v", cs)
+	}
+	if !RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "b", "") ||
+		cs.LatestRolledoutRevision != "svc-engine-rev-b" || cs.PreviousRolledoutRevision != "svc-engine-rev-a" {
+		t.Fatalf("an advance demotes the prior revision: %+v", cs)
+	}
+	if !RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "c", "z") ||
+		cs.LatestRolledoutRevision != "svc-engine-rev-c" || cs.PreviousRolledoutRevision != "svc-engine-rev-z" {
+		t.Fatalf("a known superseded revision is the one demoted: %+v", cs)
+	}
+	if !RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "d", "d") ||
+		cs.LatestRolledoutRevision != "svc-engine-rev-d" || cs.PreviousRolledoutRevision != "svc-engine-rev-z" {
+		t.Fatalf("a revision superseding itself demotes nothing: %+v", cs)
+	}
+}
+
+func TestSetLatestReadyRevision(t *testing.T) {
+	cs := v1beta1.ComponentStatusSpec{}
+	if SetLatestReadyRevision(&cs, "svc", v1beta1.EngineComponent, "") || cs.LatestReadyRevision != "" {
+		t.Fatalf("no revision writes nothing: %+v", cs)
+	}
+	if !SetLatestReadyRevision(&cs, "svc", v1beta1.EngineComponent, "a") || cs.LatestReadyRevision != "svc-engine-rev-a" {
+		t.Fatalf("the ready revision is published by its Service name: %+v", cs)
+	}
+	if SetLatestReadyRevision(&cs, "svc", v1beta1.EngineComponent, "a") {
+		t.Fatal("re-publishing the same revision changes nothing")
+	}
+}

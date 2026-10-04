@@ -2171,6 +2171,130 @@ func TestPromoteCurrentRevision_FullConvergePromotes(t *testing.T) {
 		"full convergence must persist the promoted CurrentRevision")
 }
 
+// TestPromoteCurrentRevision_HeldRevisionDoesNotLandByAttrition: every
+// Instance is Ready on the pushed revision whose retry ladder holds, each
+// row remembering a crash of its promoted set, the pause between crashes
+// of a crash loop. The push has not landed: CurrentRevision keeps the
+// prior revision, so the hold the ladder stands for keeps being reported
+// and nothing reads the fleet as converged. The landing follows the
+// block, not the rows: once an operator releases it the same rows land.
+func TestPromoteCurrentRevision_HeldRevisionDoesNotLandByAttrition(t *testing.T) {
+	g := gomega.NewWithT(t)
+	readySince := metav1.NewTime(time.Unix(9000, 0))
+	crashed := metav1.NewTime(readySince.Add(20 * time.Second))
+	rows := []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: promoteTargetRev, ReadySince: &readySince,
+			LastFailure: &v1beta1.InstanceTermination{PodName: "llama-engine-0-default-0", Reason: "CrashLoopBackOff", Time: crashed}},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: promoteTargetRev, ReadySince: &readySince,
+			LastFailure: &v1beta1.InstanceTermination{PodName: "llama-engine-1-default-0", Reason: "CrashLoopBackOff", Time: crashed}},
+	}
+	ir := baselineIR("llama-engine", "prod", 2)
+	ir.Status.CurrentRevision = promotePriorRev
+	ir.Status.UpdateRevision = promoteTargetRev
+	ir.Status.InstanceStatuses = rows
+	ir.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: promoteTargetRev, State: v1beta1.RetryBlockHeld, AttemptsStarted: 3, Reason: "CrashLoopBackOff"}}
+
+	r, _ := newReconciler(t, ir)
+	before := getFreshIR(t, r, ir).ResourceVersion
+	promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
+	g.Expect(promote(context.Background(), promoteTargetRev)).To(gomega.Succeed())
+	g.Expect(ir.Status.CurrentRevision).To(gomega.Equal(promotePriorRev),
+		"a revision whose ladder holds must not land while its rows read Ready between crashes")
+	g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.Equal(promotePriorRev))
+	g.Expect(getFreshIR(t, r, ir).ResourceVersion).To(gomega.Equal(before), "no write while the push has not landed")
+
+	// The hold the ladder stands for is still what the status reports.
+	fresh := getFreshIR(t, r, ir)
+	hold := effectiveRolloutHold(false, nil, &fresh.Status, crashed.Time)
+	g.Expect(hold).NotTo(gomega.BeNil(), "the Held hold must be reported while the push has not landed")
+	g.Expect(hold.Gate).To(gomega.Equal(v1beta1.RolloutHoldGateHeld))
+
+	// The operator releases the block: the same rows land the push.
+	released := getFreshIR(t, r, ir)
+	released.Status.RetryBlocks = nil
+	g.Expect(r.Client.Status().Update(context.Background(), released)).To(gomega.Succeed())
+	g.Expect(promote(context.Background(), promoteTargetRev)).To(gomega.Succeed())
+	g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.Equal(promoteTargetRev),
+		"once the ladder records no failure, every Instance Ready on the revision lands it")
+}
+
+// TestPromoteCurrentRevision_RollbackOntoCurrentWithdrawsIt: the spec rolled
+// back onto the revision CurrentRevision already names while Instances still
+// run the revision being rolled back from. Current equal to update is what
+// every reader takes for "no rollout in flight", so the callback withdraws
+// CurrentRevision until every Instance is Ready on the target again, and
+// promotes it once they are.
+func TestPromoteCurrentRevision_RollbackOntoCurrentWithdrawsIt(t *testing.T) {
+	rolledBackTo, superseded := promotePriorRev, promoteTargetRev
+	rolledBack := func(rows ...v1beta1.OMENativeInstanceStatus) *v1beta1.InferenceReplica {
+		ir := baselineIR("llama-engine", "prod", int32(len(rows)))
+		ir.Status.CurrentRevision = rolledBackTo
+		ir.Status.UpdateRevision = rolledBackTo
+		ir.Status.InstanceStatuses = rows
+		return ir
+	}
+
+	t.Run("every Instance still on the superseded revision", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		ir := rolledBack(
+			v1beta1.OMENativeInstanceStatus{Index: 0, Phase: v1beta1.OMENativeInstanceUpdating, RunningRevision: superseded},
+			v1beta1.OMENativeInstanceStatus{Index: 1, Phase: v1beta1.OMENativeInstanceUpdating, RunningRevision: superseded},
+			v1beta1.OMENativeInstanceStatus{Index: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: superseded},
+			v1beta1.OMENativeInstanceStatus{Index: 3, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: superseded},
+		)
+		r, _ := newReconciler(t, ir)
+		promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
+		g.Expect(promote(context.Background(), rolledBackTo)).To(gomega.Succeed())
+		g.Expect(ir.Status.CurrentRevision).To(gomega.BeEmpty(),
+			"a rollback onto the current revision must withdraw it while every Instance runs the superseded one")
+		g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.BeEmpty(),
+			"the withdrawal must be persisted, not only mirrored")
+	})
+
+	t.Run("the last Instance never left the target", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		ir := rolledBack(
+			v1beta1.OMENativeInstanceStatus{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: superseded},
+			v1beta1.OMENativeInstanceStatus{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: superseded},
+			v1beta1.OMENativeInstanceStatus{Index: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: rolledBackTo},
+		)
+		r, _ := newReconciler(t, ir)
+		promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
+		g.Expect(promote(context.Background(), rolledBackTo)).To(gomega.Succeed())
+		g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.BeEmpty(),
+			"one Instance on the target does not make the fleet converged while others run the superseded revision")
+	})
+
+	t.Run("a restart on the target is not a superseded Instance", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		ir := rolledBack(
+			v1beta1.OMENativeInstanceStatus{Index: 0, Phase: v1beta1.OMENativeInstanceRestarting, RunningRevision: rolledBackTo},
+			v1beta1.OMENativeInstanceStatus{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: rolledBackTo},
+		)
+		r, _ := newReconciler(t, ir)
+		before := getFreshIR(t, r, ir).ResourceVersion
+		promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
+		g.Expect(promote(context.Background(), rolledBackTo)).To(gomega.Succeed())
+		g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.Equal(rolledBackTo),
+			"a repair on the current revision is not a rollout; CurrentRevision stays")
+		g.Expect(getFreshIR(t, r, ir).ResourceVersion).To(gomega.Equal(before), "no write on a steady fleet")
+	})
+
+	t.Run("promoted again once every Instance is back", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		ir := rolledBack(
+			v1beta1.OMENativeInstanceStatus{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: rolledBackTo},
+			v1beta1.OMENativeInstanceStatus{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: rolledBackTo},
+		)
+		ir.Status.CurrentRevision = ""
+		r, _ := newReconciler(t, ir)
+		promote := buildPromoteCurrentRevision(r.statusWriter(), r.Client, ir)
+		g.Expect(promote(context.Background(), rolledBackTo)).To(gomega.Succeed())
+		g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.Equal(rolledBackTo),
+			"the rollback reports done only once every Instance is Ready on its target")
+	})
+}
+
 // TestPromoteCurrentRevision_AlreadyEqualNoWrite pins the no-op-write
 // discipline: a converged IR already on the target performs ZERO writes
 // (ResourceVersion unchanged), so a steady-state reconcile stays silent.
@@ -2719,4 +2843,48 @@ func TestProjectedReplicaDerivesNamesFromItsParent(t *testing.T) {
 	if rk := irRevisionKey(ir); rk.Name != "svc-engine" {
 		t.Fatalf("revision key name = %q, want svc-engine", rk.Name)
 	}
+}
+
+// TestComposedFieldsAnnotationIsHashNeutral locks that the composed-fields
+// annotation, which the referencing InferenceService writes on the replica
+// object, never mints a revision in either replica form: a runners-based
+// replica takes its pod-template metadata from its runners, and a
+// refs-based replica, whose render inherits its object annotations, excludes
+// every one of them from the hash.
+func TestComposedFieldsAnnotationIsHashNeutral(t *testing.T) {
+	const held = "svc:paused"
+
+	t.Run("runners-based", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		ir := baselineIR("pool-a", "team-a", 3)
+		ir.OwnerReferences, ir.Spec.ParentRef, ir.Annotations = nil, nil, nil
+		plain := desiredFromIR(ir, ir.Spec.Runners)
+
+		annotated := ir.DeepCopy()
+		annotated.Annotations = map[string]string{constants.InferenceReplicaComposedFieldsAnnotationKey: held}
+		withHolding := desiredFromIR(annotated, annotated.Spec.Runners)
+		g.Expect(withHolding.PodTemplateObjectMeta).To(gomega.Equal(plain.PodTemplateObjectMeta),
+			"the annotation on the replica object must not reach the pod template")
+
+		plainHash, _, err := (&Reconciler{}).revisionHash(ir, workloadtypes.ReconcileInput{DesiredSpec: plain}, nil, "scope-uid")
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		heldHash, _, err := (&Reconciler{}).revisionHash(annotated, workloadtypes.ReconcileInput{DesiredSpec: withHolding}, nil, "scope-uid")
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+		g.Expect(heldHash).To(gomega.Equal(plainHash), "the annotation must not move the revision hash")
+	})
+
+	t.Run("refs-based", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		ir := refsReplica()
+		ir.Annotations = map[string]string{constants.InferenceReplicaComposedFieldsAnnotationKey: held}
+		excluded := hashExcludedAnnotationKeys(ir)
+		g.Expect(excluded).To(gomega.HaveKey(constants.InferenceReplicaComposedFieldsAnnotationKey))
+
+		inherited := &metav1.ObjectMeta{Annotations: map[string]string{
+			constants.InferenceReplicaComposedFieldsAnnotationKey: held,
+			"ome.io/declared": "1",
+		}}
+		g.Expect(stripExcludedAnnotations(inherited, excluded).Annotations).To(gomega.Equal(map[string]string{"ome.io/declared": "1"}),
+			"the inherited annotation is stripped before hashing while declared template annotations stay")
+	})
 }

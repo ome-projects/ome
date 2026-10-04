@@ -66,6 +66,21 @@ type InferenceServiceSpec struct {
 	// +optional
 	Router *RouterSpec `json:"router,omitempty"`
 
+	// ReplicaRefs names, per role, the standalone InferenceReplicas this
+	// service fronts instead of rendering the role itself. The service
+	// creates the role's stable Service (<name>-engine, -decoder, -router)
+	// and the route in front of their pods and writes nothing on the
+	// replicas: their specs, rollouts and scaling stay with their owner. A
+	// service references either all of its roles this way or none, so
+	// spec.engine, spec.decoder and spec.router are unset with it, as are
+	// spec.model and spec.runtime (the replicas carry their own); engine is
+	// required. Fixed at create. A
+	// replica that needs a peer's address (an engine its decoder, a router
+	// its engine and decoder) is configured by its owner with the stable
+	// Service names, which exist once the service does.
+	// +optional
+	ReplicaRefs *ReplicaRefs `json:"replicaRefs,omitempty"`
+
 	// AcceleratorSelector specifies accelerator selection preferences
 	// +optional
 	AcceleratorSelector *AcceleratorSelector `json:"acceleratorSelector,omitempty"`
@@ -152,6 +167,24 @@ func (s *InferenceServiceSpec) GetCanaryGroup() *RolloutGroup {
 		}
 	}
 	return nil
+}
+
+// ReplicaRefs names the standalone InferenceReplicas an InferenceService
+// fronts, per role. Each list names one replica of that component in the
+// service's namespace.
+type ReplicaRefs struct {
+	// Engine names the replicas that serve the engine role.
+	// +optional
+	// +listType=set
+	Engine []string `json:"engine,omitempty"`
+	// Decoder names the replicas that serve the decoder role.
+	// +optional
+	// +listType=set
+	Decoder []string `json:"decoder,omitempty"`
+	// Router names the replicas that serve the router role.
+	// +optional
+	// +listType=set
+	Router []string `json:"router,omitempty"`
 }
 
 // AcceleratorSelector defines how to select accelerators for the InferenceService

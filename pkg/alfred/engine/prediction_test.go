@@ -129,9 +129,18 @@ func predictionScenario(t *testing.T, gang bool) (*snapshot.ClusterSnapshot, *pr
 	pod.OwnerReferences = []metav1.OwnerReference{{APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceReplica", Name: ir.Name, UID: ir.UID, Controller: ptr.To(true)}}
 	objects := []client.Object{isvc, ir, pod, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "prod", UID: "ns-uid"}}}
 	if gang {
+		// Gang members of one engine never share a host: the plugin lets members
+		// co-locate on a node with room unless a required anti-affinity keeps them
+		// apart, and these scenarios count distinct nodes.
+		apart := &corev1.PodAntiAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+			TopologyKey: corev1.LabelHostname, LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				"ome.io/inferenceservice": "a", "component": "engine",
+			}},
+		}}}
 		ir.Spec.TopologyKey = ptr.To("topology.kubernetes.io/zone")
 		ir.Spec.Runners[0].Name = v1beta1.RunnerNameLeader
 		ir.Spec.Runners[0].Template.Spec.SchedulerName = "ome-scheduler"
+		ir.Spec.Runners[0].Template.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: apart.DeepCopy()}
 		workerRunner := ir.Spec.Runners[0].DeepCopy()
 		workerRunner.Name = v1beta1.RunnerNameWorker
 		ir.Spec.Runners = append(ir.Spec.Runners, *workerRunner)
@@ -140,11 +149,12 @@ func predictionScenario(t *testing.T, gang bool) (*snapshot.ClusterSnapshot, *pr
 		pod.Spec.SchedulerName = "ome-scheduler"
 		pod.Labels["ome.io/runner"] = "leader"
 		pod.Labels["scheduling.x-k8s.io/pod-group"] = "a-engine-0"
+		pod.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: apart.DeepCopy()}
 		worker := pod.DeepCopy()
 		worker.Name, worker.UID = "source-worker", "worker-uid"
 		worker.Spec.NodeName = "source-worker"
 		worker.Labels["ome.io/runner"] = "worker"
-		worker.Spec.Affinity = &corev1.Affinity{PodAffinity: &corev1.PodAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+		worker.Spec.Affinity = &corev1.Affinity{PodAntiAffinity: apart.DeepCopy(), PodAffinity: &corev1.PodAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
 			TopologyKey: "topology.kubernetes.io/zone", LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 				"ome.io/inferenceservice": "a", "component": "engine", "ome.io/instance-index": "0", "ome.io/runner": "leader",
 			}},

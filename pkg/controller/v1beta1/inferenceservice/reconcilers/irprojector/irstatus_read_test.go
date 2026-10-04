@@ -9,7 +9,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
 func TestComponentIRStatus_ReturnsAuthoritativeStatus(t *testing.T) {
@@ -199,5 +201,77 @@ func TestComponentIRPartition_ReadsPacingFirst(t *testing.T) {
 	}
 	if got != 3 {
 		t.Fatalf("partition: got %d want 3 (the projected pacing partition)", got)
+	}
+}
+
+// TestReadersFor_ResolveThroughRoleReplica pins that every role reader keys
+// its read on the role's replica: a referenced role reads the replica the
+// spec names, a projected role reads the projected name, a missing replica
+// of either form is (nil, nil), a nil service reads nothing, and a read
+// error names the key it failed on.
+func TestReadersFor_ResolveThroughRoleReplica(t *testing.T) {
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "svc"},
+		Spec: v1beta1.InferenceServiceSpec{
+			ReplicaRefs: &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}, Decoder: []string{"pool-d"}},
+		},
+	}
+	partition := int32(2)
+	referenced := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "pool-d"},
+		Spec:       v1beta1.InferenceReplicaSpec{Pacing: &v1beta1.InferenceReplicaPacing{Partition: &partition}},
+		Status:     v1beta1.InferenceReplicaStatus{Replicas: 5},
+	}
+	projected := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "svc-router"},
+		Status:     v1beta1.InferenceReplicaStatus{Replicas: 3},
+	}
+	ctx := context.Background()
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(referenced, projected).Build()
+	reads := irstatus.NewReader(c, irstatus.NewDecoder(4))
+
+	decoder, err := ComponentIRFor(ctx, reads, isvc, v1beta1.DecoderComponent)
+	if err != nil || decoder == nil || decoder.Name != "pool-d" {
+		t.Fatalf("referenced decoder: got (%v, %v), want pool-d", decoder, err)
+	}
+	router, err := ComponentIRFor(ctx, reads, isvc, v1beta1.RouterComponent)
+	if err != nil || router == nil || router.Name != "svc-router" {
+		t.Fatalf("projected router: got (%v, %v), want svc-router", router, err)
+	}
+	if st, err := ComponentIRStatusFor(ctx, reads, isvc, v1beta1.DecoderComponent); err != nil || st == nil || st.Replicas != 5 {
+		t.Fatalf("referenced decoder status: got (%+v, %v), want 5 replicas", st, err)
+	}
+	if ir, _, err := DecodedComponentIRFor(ctx, reads, isvc, v1beta1.DecoderComponent); err != nil || ir == nil || ir.Name != "pool-d" {
+		t.Fatalf("decoded referenced decoder: got (%v, %v), want pool-d", ir, err)
+	}
+	if st, err := DecodedComponentIRStatusFor(ctx, reads, isvc, v1beta1.RouterComponent); err != nil || st == nil || st.Replicas != 3 {
+		t.Fatalf("decoded projected router status: got (%+v, %v), want 3 replicas", st, err)
+	}
+	if p, err := ComponentIRPartitionFor(ctx, reads, isvc, v1beta1.DecoderComponent); err != nil || p != 2 {
+		t.Fatalf("referenced decoder partition: got (%d, %v), want 2", p, err)
+	}
+	if p, err := ComponentIRPartitionFor(ctx, reads, isvc, v1beta1.RouterComponent); err != nil || p != 0 {
+		t.Fatalf("projected router partition: got (%d, %v), want 0", p, err)
+	}
+
+	// The referenced engine does not exist: a missing replica is not an error.
+	if ir, err := ComponentIRFor(ctx, reads, isvc, v1beta1.EngineComponent); err != nil || ir != nil {
+		t.Fatalf("missing referenced engine: got (%v, %v), want (nil, nil)", ir, err)
+	}
+	if ir, enc, err := DecodedComponentIRFor(ctx, reads, isvc, v1beta1.EngineComponent); err != nil || ir != nil || enc != "" {
+		t.Fatalf("missing referenced engine (decoded): got (%v, %q, %v), want (nil, \"\", nil)", ir, enc, err)
+	}
+	if p, err := ComponentIRPartitionFor(ctx, reads, isvc, v1beta1.EngineComponent); err != nil || p != 0 {
+		t.Fatalf("missing referenced engine partition: got (%d, %v), want (0, nil)", p, err)
+	}
+
+	if ir, err := ComponentIRFor(ctx, reads, nil, v1beta1.EngineComponent); err != nil || ir != nil {
+		t.Fatalf("nil service: got (%v, %v), want (nil, nil)", ir, err)
+	}
+	if ir, enc, err := DecodedComponentIRFor(ctx, reads, nil, v1beta1.EngineComponent); err != nil || ir != nil || enc != "" {
+		t.Fatalf("nil service (decoded): got (%v, %q, %v), want (nil, \"\", nil)", ir, enc, err)
+	}
+	if _, err := ComponentIRStatusFor(ctx, erroringReader{}, isvc, v1beta1.DecoderComponent); err == nil || !strings.Contains(err.Error(), "get InferenceReplica team-a/pool-d") {
+		t.Fatalf("read error must wrap the referenced replica's key; got %v", err)
 	}
 }

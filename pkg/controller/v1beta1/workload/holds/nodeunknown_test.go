@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -22,6 +23,40 @@ func quietPod(name, node string) *corev1.Pod {
 		Spec:       corev1.PodSpec{NodeName: node},
 		Status:     corev1.PodStatus{Phase: corev1.PodUnknown},
 	}
+}
+
+// withdrawnPod is a pod the control plane marked not Ready while its own
+// last report still says Ready: Running, ContainersReady and the serving
+// gate True, PodReady False.
+func withdrawnPod(name, node string) *corev1.Pod {
+	pod := quietPod(name, node)
+	pod.Spec.ReadinessGates = []corev1.PodReadinessGate{{ConditionType: query.ServingConditionType}}
+	pod.Status = corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		Conditions: []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+			{Type: query.ServingConditionType, Status: corev1.ConditionTrue},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+		},
+	}
+	return pod
+}
+
+// nodeReader is a reader holding one Node whose Ready condition has had
+// status for age.
+func nodeReader(t *testing.T, name string, ready corev1.ConditionStatus, age time.Duration) types.Deps {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+			Type: corev1.NodeReady, Status: ready, LastTransitionTime: metav1.NewTime(time.Now().Add(-age)),
+		}}},
+	}
+	return types.Deps{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()}
 }
 
 // singlePodPlan is the plan entry for a one-Runner Instance.
@@ -98,6 +133,37 @@ func TestNodeUnknown_HoldsATargetNameASilentNodeKeeps(t *testing.T) {
 		}
 		if store.writes != 0 {
 			t.Errorf("writes = %d, want 0", store.writes)
+		}
+	})
+
+	t.Run("a withdrawn Ready on a node that stopped reporting is a wait", func(t *testing.T) {
+		policy := &types.ForceDeletePolicy{OverdueSlack: time.Minute, NodeUnreachableThreshold: 5 * time.Minute}
+		store, _ := newStore(creatingRow(""))
+		applyPlannedUnder(t, store, map[int32][]*corev1.Pod{0: {withdrawnPod(target, "node-dying")}},
+			nodeReader(t, "node-dying", corev1.ConditionUnknown, time.Minute), policy)
+		if got := store.waiting(0); got != types.WaitingReasonNodeUnknown {
+			t.Errorf("waiting = %q, want %q", got, types.WaitingReasonNodeUnknown)
+		}
+	})
+
+	t.Run("a withdrawn Ready on a node posting Ready is the kubelet's lag, not a wait", func(t *testing.T) {
+		policy := &types.ForceDeletePolicy{OverdueSlack: time.Minute, NodeUnreachableThreshold: 5 * time.Minute}
+		store, _ := newStore(creatingRow(""))
+		applyPlannedUnder(t, store, map[int32][]*corev1.Pod{0: {withdrawnPod(target, "node-live")}},
+			nodeReader(t, "node-live", corev1.ConditionTrue, time.Hour), policy)
+		if got := store.waiting(0); got != "" {
+			t.Errorf("waiting = %q, want none: the node is live and the kubelet is late folding the gate", got)
+		}
+		if store.writes != 0 {
+			t.Errorf("writes = %d, want 0", store.writes)
+		}
+	})
+
+	t.Run("a withdrawn Ready is not read without a policy", func(t *testing.T) {
+		store, _ := newStore(creatingRow(""))
+		applyPlanned(t, store, map[int32][]*corev1.Pod{0: {withdrawnPod(target, "node-a")}})
+		if got := store.waiting(0); got != "" {
+			t.Errorf("waiting = %q, want none: without a policy no Node is read, so the shape is not evidence", got)
 		}
 	})
 

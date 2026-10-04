@@ -135,3 +135,63 @@ func TestRecordCapacityRefusal_ReportsOnlyTheFirstRefusal(t *testing.T) {
 		t.Fatal("clearing an absent record must write nothing")
 	}
 }
+
+// The note writes: recorded once on a Ready, operation-free row, cleared
+// exactly on a row of any phase with the record's time kept; others stay.
+func TestCrashLoopNote_RecordedOnceAndCleared(t *testing.T) {
+	at := metav1.NewTime(time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC))
+	const note = "crash loop on a held revision"
+	rows := map[int32]*types.InstanceStatus{
+		0: {Index: 0, Phase: types.InstancePhaseReady, LastFailure: &types.InstanceTermination{PodName: "p-0", Reason: "Error", Message: "back-off", Time: at}},
+		1: {Index: 1, Phase: types.InstancePhaseReady, LastFailure: &types.InstanceTermination{PodName: "p-1", Reason: "Error", Time: at}},
+		2: {Index: 2, Phase: types.InstancePhaseFailed, LastFailure: &types.InstanceTermination{PodName: "p-2", Reason: "Error", Message: "back-off; " + note, Time: at}},
+		3: {Index: 3, Phase: types.InstancePhaseReady, LastFailure: &types.InstanceTermination{PodName: "p-3", Reason: "Error", Message: "back-off", Time: at},
+			Operation: &types.InstanceOperation{ID: "u-1", Type: types.InstanceOperationUpdate}},
+		4: {Index: 4, Phase: types.InstancePhaseReady},
+	}
+	writes := 0
+	input := types.ReconcileInput{
+		MutateInstance: func(_ context.Context, idx int32, mutate func(*types.InstanceStatus) bool) error {
+			if mutate(rows[idx]) {
+				writes++
+			}
+			return nil
+		},
+	}
+	ctx := context.Background()
+	for _, idx := range []int32{0, 0, 1, 3, 4} {
+		if err := RecordCrashLoopNote(ctx, input, idx, note); err != nil {
+			t.Fatalf("RecordCrashLoopNote(%d): %v", idx, err)
+		}
+	}
+	if writes != 2 {
+		t.Fatalf("writes = %d, want one per row that takes the note", writes)
+	}
+	if rows[0].LastFailure.Message != "back-off; "+note || !FailureNoted(rows[0], note) {
+		t.Fatalf("row 0 = %+v, want the note appended once", rows[0].LastFailure)
+	}
+	if rows[1].LastFailure.Message != note {
+		t.Fatalf("row 1 = %+v, want the note as the whole message", rows[1].LastFailure)
+	}
+	if rows[3].LastFailure.Message != "back-off" || rows[4].LastFailure != nil {
+		t.Fatalf("a row an operation claims, or with no record, must be untouched: %+v %+v", rows[3], rows[4])
+	}
+
+	writes = 0
+	for _, idx := range []int32{0, 0, 1, 2, 3, 4} {
+		if err := ClearCrashLoopNote(ctx, input, idx, note); err != nil {
+			t.Fatalf("ClearCrashLoopNote(%d): %v", idx, err)
+		}
+	}
+	if writes != 3 {
+		t.Fatalf("writes = %d, want one per row that carried the note", writes)
+	}
+	for idx, want := range map[int32]string{0: "back-off", 1: "", 2: "back-off"} {
+		if got := rows[idx].LastFailure; got.Message != want || !got.Time.Equal(&at) || FailureNoted(rows[idx], note) {
+			t.Fatalf("row %d after the clear = %+v, want message %q with the time kept", idx, got, want)
+		}
+	}
+	if rows[2].Phase != types.InstancePhaseFailed {
+		t.Fatalf("the clear touches nothing but the message; row 2 = %+v", rows[2])
+	}
+}

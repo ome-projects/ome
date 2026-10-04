@@ -169,16 +169,17 @@ func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.Inf
 	return r.applyDerived(ctx, candidate.Cluster, cl, source, desired, existingOnly)
 }
 
-// setPlannedReplicas preserves an omitted maximum for member runtime inheritance.
-// A retained floor can exceed a newly reduced cap until its replacement serves.
+// setPlannedReplicas fixes member bounds at the allocation unless an explicit
+// local ceiling permits autoscaling. A retained floor can exceed a reduced cap
+// until its replacement serves.
 func setPlannedReplicas(member *v1beta1.InferenceService, replicas, ceiling int32) {
 	apply := func(component *v1beta1.ComponentExtensionSpec) {
 		floor := int(replicas)
 		component.MinReplicas = &floor
 		if ceiling > 0 {
 			component.MaxReplicas = int(max(ceiling, replicas))
-		} else if component.MaxReplicas > 0 {
-			component.MaxReplicas = max(component.MaxReplicas, floor)
+		} else {
+			component.MaxReplicas = floor
 		}
 	}
 	if member.Spec.Engine != nil {

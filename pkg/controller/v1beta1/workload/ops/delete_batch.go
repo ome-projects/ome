@@ -16,6 +16,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
@@ -264,7 +265,108 @@ func selectDeleteBatch(
 }
 
 func admitDeleteBatch(ctx context.Context, input workload.ReconcileInput, plan workload.ComponentPlan, candidates []deleteBatchCandidate) (bool, error) {
-	return status.StampDeletingBatch(ctx, input, plan.InstanceReadyTimeout, candidateStatuses(candidates))
+	failure := retiredAttemptFailure(candidates)
+	committed, heldAttempts, err := status.StampDeletingBatch(ctx, input, plan.InstanceReadyTimeout, candidateStatuses(candidates), failure)
+	if committed && heldAttempts > 0 && input.WarnRetryHeld != nil {
+		input.WarnRetryHeld(failure.TargetRevision, heldAttempts, failure.Reason)
+	}
+	return committed, err
+}
+
+// retiredAttemptFailure is the failed wave a scale-down owes the ladder
+// for an attempt it retires. A candidate carrying a single-Instance
+// update attempt — a recreate, an in-place patch or a single-pod surge —
+// whose pods on the attempt's revision show a workload-caused failure is
+// an attempt failing on its own; the wave is what ends it, so the wave
+// records it the way the escalation would, with the pod's reason. A
+// failed gang surge pair the plan let go is read through its source
+// (retiredGangSurgeFailure). One record per wave: the ladder counts
+// waves, not rows. nil when the wave retires no such attempt — an attempt
+// that showed no failure is left to the gate, which reads an
+// authorization with no attempt behind it as interrupted and lets the
+// roll reopen it.
+func retiredAttemptFailure(candidates []deleteBatchCandidate) *status.AttemptFailure {
+	for _, candidate := range candidates {
+		row := candidate.status
+		if failure := retiredGangSurgeFailure(&row, candidates); failure != nil {
+			return failure
+		}
+		if !retiresUpdateAttempt(&row) {
+			continue
+		}
+		pods := evidence.AttemptStuckPods(row, candidate.pods, row.Operation.TargetRevision)
+		pod, reason := evidence.FirstWorkloadCausedPod(pods)
+		if pod == nil {
+			continue
+		}
+		return &status.AttemptFailure{
+			TargetRevision: row.Operation.TargetRevision,
+			Reason:         reason,
+			Cause:          workload.FailureCauseOf(reason),
+		}
+	}
+	return nil
+}
+
+// retiresUpdateAttempt reports whether a wave candidate carries an
+// in-flight single-Instance update attempt at a pinned revision. A gang
+// surge source names its replacement through SurgeIndex and is read by
+// retiredGangSurgeFailure; a surge target marker carries the gang-target
+// steps and records nothing on its own — its attempt is its source's.
+func retiresUpdateAttempt(row *workload.InstanceStatus) bool {
+	if !workload.UpdateContinuation(row) || row.Operation == nil {
+		return false
+	}
+	op := row.Operation
+	return op.Type == workload.InstanceOperationUpdate && op.TargetRevision != "" &&
+		op.SurgeIndex == nil && !isGangSurgeTargetMarker(row)
+}
+
+// retiresGangSurgeAttempt reports whether a wave candidate is the source
+// of a gang surge attempt at a pinned revision: an update continuation
+// that names its replacement through SurgeIndex. The plan pins the pair
+// while the source rolls, so the wave meets one once the attempt has
+// failed and the pair is retired together in place of the gang abandon.
+func retiresGangSurgeAttempt(row *workload.InstanceStatus) bool {
+	if !workload.UpdateContinuation(row) || row.Operation == nil {
+		return false
+	}
+	op := row.Operation
+	return op.Type == workload.InstanceOperationUpdate && op.TargetRevision != "" && op.SurgeIndex != nil
+}
+
+// retiredGangSurgeFailure is the record a wave owes for a gang surge
+// source it retires. The attempt's pods live under the replacement's
+// index: the marker in the same wave whose pods show a workload-caused
+// failure gives the reason; otherwise the failure the escalation
+// recorded on the source's row does, classified the way the gang abandon
+// classifies it. nil when neither says anything.
+func retiredGangSurgeFailure(row *workload.InstanceStatus, candidates []deleteBatchCandidate) *status.AttemptFailure {
+	if !retiresGangSurgeAttempt(row) {
+		return nil
+	}
+	target := row.Operation.TargetRevision
+	for _, candidate := range candidates {
+		if candidate.status.Index != *row.Operation.SurgeIndex || !isGangSurgeTargetMarker(&candidate.status) {
+			continue
+		}
+		pods := evidence.AttemptStuckPods(candidate.status, candidate.pods, target)
+		if _, reason := evidence.FirstWorkloadCausedPod(pods); reason != "" {
+			return &status.AttemptFailure{TargetRevision: target, Reason: reason, Cause: workload.CauseWorkload}
+		}
+	}
+	if row.LastFailure == nil || row.LastFailure.Reason == "" {
+		return nil
+	}
+	// The record must be this attempt's: a failure dated before the
+	// attempt started belongs to an attempt the row made at a revision
+	// since withdrawn, and charging it here would hold the revision the
+	// row is moving to for a failure it never had.
+	if row.LastFailure.Time.Before(&row.Operation.StartedAt) {
+		return nil
+	}
+	reason := row.LastFailure.Reason
+	return &status.AttemptFailure{TargetRevision: target, Reason: reason, Cause: workload.FailureCauseOf(reason)}
 }
 
 // candidateStatuses is the rows of a wave, in selection order.

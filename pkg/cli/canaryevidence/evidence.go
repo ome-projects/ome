@@ -54,8 +54,6 @@ func ProjectPhase(phase omev1beta1.RolloutPhase) reportv1alpha1.RolloutPhase {
 		return reportv1alpha1.RolloutPhaseStable
 	case omev1beta1.RolloutPhaseCanarying:
 		return reportv1alpha1.RolloutPhaseCanarying
-	case omev1beta1.RolloutPhaseBlueGreenStandby:
-		return reportv1alpha1.RolloutPhaseBlueGreenStandby
 	case omev1beta1.RolloutPhasePending:
 		return reportv1alpha1.RolloutPhasePending
 	case omev1beta1.RolloutPhasePaused:

@@ -159,11 +159,13 @@ const (
 // holdObserved/hold carry this pass's Update-pass rollout-hold verdict
 // (ReconcileInput.RecordRolloutHold): holdObserved is true when the Update
 // pass ran at all this reconcile, and hold is its verdict (nil clears).
-// When the Update pass did not run (holdObserved is false — nothing needed
-// updating this pass, or Plan selected no target), the RetryBlock/Held
-// state persisted in status is the only signal available, since a
-// RetryBlock-denied Instance never reaches the Update pass to be gated
-// there — see computeRetryBlockRolloutHold.
+// When the Update pass did not run (holdObserved is false — the pass ended
+// before it, nothing needed updating, or Plan selected no target), the
+// persisted hold stands until a pass that runs the Update pass replaces or
+// clears it, behind the same-target RetryBlock/Held state persisted in
+// status: a RetryBlock-denied Instance is never selected for the Update
+// pass and the pass reports the block only when it runs for other
+// Instances — see effectiveRolloutHold.
 //
 // The returned duration is how long until the earliest in-rotation pod still
 // inside the spec.minReadySeconds window becomes Available (0 when none is
@@ -670,10 +672,14 @@ func summarizeFailureReasons(reasons map[string]int) string {
 // authoritative: a RetryBlock-denied Instance never reaches the Update
 // pass (see workloadops.evaluateUpdateTriggerFast), so a nil verdict here
 // means genuine forward progress or nothing needed updating. When the
-// Update pass did NOT run — Plan selected no ActionUpdate because every
+// Update pass did NOT run — the pass ended before it on a repair, a scale
+// wave or a dispatch hold, or Plan selected no ActionUpdate because every
 // candidate Instance was denied before reaching it, most commonly a
-// same-target RetryBlock — the persisted RetryBlock/Held state is the
-// only available signal.
+// same-target RetryBlock — the hold is a wait that has not ended: a
+// same-target RetryBlock in Held or not-yet-due Backoff denies every
+// fresh start and is the hold that stands; otherwise the persisted hold
+// stands as written until a pass that runs the Update pass replaces or
+// clears it.
 func effectiveRolloutHold(holdObserved bool, hold *workloadtypes.RolloutHold, status *v1beta1.InferenceReplicaStatus, now time.Time) *v1beta1.RolloutHold {
 	if status.UpdateRevision == "" || status.CurrentRevision == status.UpdateRevision {
 		return nil
@@ -688,7 +694,10 @@ func effectiveRolloutHold(holdObserved bool, hold *workloadtypes.RolloutHold, st
 			Target: hold.Target,
 		}
 	}
-	return computeRetryBlockRolloutHold(status, now)
+	if blocked := computeRetryBlockRolloutHold(status, now); blocked != nil {
+		return blocked
+	}
+	return status.RolloutHold
 }
 
 // computeRetryBlockRolloutHold derives a RolloutHold from a same-target

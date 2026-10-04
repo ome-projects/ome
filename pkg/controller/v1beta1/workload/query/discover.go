@@ -458,7 +458,11 @@ func PodSetPromotable(pods []*corev1.Pod, minReadySeconds int32, now time.Time, 
 
 // PodSetFullyServing reports whether the pod set is fully healthy in
 // the rotation: at least `desired` live (non-deleting) pods, every one
-// of them ContainersReady AND carrying the serving gate. Deleting pods
+// of them ContainersReady AND carrying the serving gate. The bar is the
+// gate rather than the pod's Ready condition because the gate is written
+// in the same pass as the guards that read this, and the kubelet folds it
+// into Ready afterwards: a set admitted this pass is already healthy
+// capacity that no deadline or wedge check may punish. Deleting pods
 // are excluded rather than disqualifying — a completed surge leaves the
 // old pod draining next to the serving replacement. A terminal pod is
 // never live and disqualifies the set outright: it is failure evidence

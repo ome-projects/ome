@@ -720,6 +720,28 @@ func (d *driver) podsByInstance(ctx context.Context) (map[int32][]*corev1.Pod, e
 	return byIndex, nil
 }
 
+// retryPolicyOf converts the scenario's retry ladder to the engine's
+// policy; an unset ladder is nil, which the engine reads as unconfigured.
+func retryPolicyOf(field string, spec *RetrySpec) (*types.RetryPolicy, error) {
+	if spec == nil {
+		return nil, nil
+	}
+	initial, err := ParseDuration(field+".initialDelay", spec.InitialDelay)
+	if err != nil {
+		return nil, err
+	}
+	maxDelay, err := ParseDuration(field+".maxDelay", spec.MaxDelay)
+	if err != nil {
+		return nil, err
+	}
+	return &types.RetryPolicy{
+		MaxAttempts:  spec.MaxAttempts,
+		InitialDelay: initial,
+		MaxDelay:     maxDelay,
+		Multiplier:   spec.Multiplier,
+	}, nil
+}
+
 func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.WorkloadObservedState) (types.ReconcileInput, error) {
 	requeueOperation, err := ParseDuration("config.requeueOperation", d.cfg.RequeueOperation)
 	if err != nil {
@@ -759,6 +781,7 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 		AbandonedReplacementGrace: abandonedReplacementGrace,
 		Requeue:                   types.RequeueIntervals{Operation: requeueOperation, Gate: requeueGate},
 		Gangs:                     types.NewGangObservations(),
+		DrainHolds:                &types.DrainHolds{},
 		Teardown:                  d.teardown,
 		Clock:                     d.clock,
 		Disposition: types.DispositionDeps{
@@ -766,21 +789,8 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 			AutoMigrateMaxAttempts: d.cfg.AutoMigrateBudget,
 		},
 	}
-	if policy := d.cfg.UpdateRetry; policy != nil {
-		initial, err := ParseDuration("config.updateRetry.initialDelay", policy.InitialDelay)
-		if err != nil {
-			return types.ReconcileInput{}, err
-		}
-		maxDelay, err := ParseDuration("config.updateRetry.maxDelay", policy.MaxDelay)
-		if err != nil {
-			return types.ReconcileInput{}, err
-		}
-		input.UpdateRetryPolicy = &types.RetryPolicy{
-			MaxAttempts:  policy.MaxAttempts,
-			InitialDelay: initial,
-			MaxDelay:     maxDelay,
-			Multiplier:   policy.Multiplier,
-		}
+	if input.UpdateRetryPolicy, err = retryPolicyOf("config.updateRetry", d.cfg.UpdateRetry); err != nil {
+		return types.ReconcileInput{}, err
 	}
 	if policy := d.cfg.ForceDelete; policy != nil {
 		slack, err := ParseDuration("config.forceDelete.overdueSlack", policy.OverdueSlack)

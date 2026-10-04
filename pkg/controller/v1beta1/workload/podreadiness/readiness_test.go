@@ -306,6 +306,27 @@ func TestIsServing(t *testing.T) {
 	}
 }
 
+func TestHeldNotServing(t *testing.T) {
+	if HeldNotServing(nil) {
+		t.Errorf("nil pod is not held")
+	}
+	pod := newReadinessTestPod("p")
+	if HeldNotServing(pod) {
+		t.Errorf("a pod without the condition is not held")
+	}
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type:   ConditionType,
+		Status: corev1.ConditionFalse,
+	}}
+	if !HeldNotServing(pod) {
+		t.Errorf("Status=False holds the pod out of rotation")
+	}
+	pod.Status.Conditions[0].Status = corev1.ConditionTrue
+	if HeldNotServing(pod) {
+		t.Errorf("Status=True does not hold the pod")
+	}
+}
+
 func TestAddRemove_PreservesKubeletConditions(t *testing.T) {
 	// Patches must NOT clobber kubelet-managed conditions like
 	// ContainersReady — the strategic-merge patch keyed by `type` leaves

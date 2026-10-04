@@ -473,8 +473,8 @@ func TestInferenceReplicaStatusUpdatesUseWriterBoundary(t *testing.T) {
 		}
 	}
 
-	if len(writerCalls) != 12 {
-		t.Fatalf("production status writes through %s = %d, want 12: %v", writer, len(writerCalls), writerCalls)
+	if len(writerCalls) != 13 {
+		t.Fatalf("production status writes through %s = %d, want 13: %v", writer, len(writerCalls), writerCalls)
 	}
 	if len(conversionCalls) != 1 || !strings.Contains(conversionCalls[0], "status_transition.go") {
 		t.Fatalf("conversion writes through %s must come from the transition gate alone: %v", conversion, conversionCalls)
@@ -734,6 +734,9 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "GateContext.CheckSurge", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/sequential_gate.go", "observeSequentialComponentsForGate", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/reconciler.go", "buildComponentObservation", read(2), decodedObjectRows, rows)
+	// The canary dispatcher reads each member's rows through the decoded
+	// accessor to anchor a canary pod's death at its Instance's entry into Ready.
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/dispatch.go", "observeCanaryRevisions", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/admission.go", "admittedReplicaCount", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/admission.go", "componentHasAdmittedInstance", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/member_admission.go", "verifiedMemberAdmission", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows+" (filters admission on a deep copy; never persists rows)", rows)
@@ -813,17 +816,18 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/workload/replay/driver.go", "driver.bumpGeneration", "Get", 1, passThroughSpecMetadata+" (replay owner generation bump)")
 
 	// ISVC-side raw accessors and their callers.
-	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/irstatus_read.go", "ComponentIR", "Get", 1, passThroughTopLevelStatus+" (raw accessor for callers that inspect no rows)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/irstatus_read.go", "componentIRAt", "Get", 1, passThroughTopLevelStatus+" (raw accessor behind ComponentIR and ComponentIRFor, for callers that inspect no rows)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/status.go", "aggregateOneComponent", "Get", 1, passThroughTopLevelStatus+" (counters, revisions, RolloutHold, Conditions mirrored onto the ISVC)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/projector.go", "EnsureInferenceReplica", "Get", 1, passThroughSpecMetadata+" (spec projection)")
-	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/dispatch.go", "observeCanaryRevisions", "Get", 1, passThroughTopLevelStatus+" (revision pointers)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/dispatch.go", "reconcileRollbackSignal", "Get", 1, passThroughTopLevelStatus+" (revision pointers and observedGeneration)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun/observe.go", "observeGroupTargets", "Get", 1, passThroughTopLevelStatus+" (revision pointers and replica counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/pdb/cutover.go", "OMENativeCutoverReady", "Get", 1, passThroughTopLevelStatus+" (ready and available counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler/dispatch.go", "controlledByVerifiedModeBridge", "Get", 1, passThroughSpecMetadata+" (ownership: UID, labels, parentRef)")
+	approve("pkg/controller/v1beta1/inferenceservice/replica_refs.go", "InferenceServiceReconciler.frontReferencedReplica", "Get", 1, passThroughTopLevelStatus+" (referenced replica: component, parentRef, runners, revision pointers)")
 
 	// Admission pass-through reads.
 	approve("pkg/webhook/admission/isvc/inference_service_validation.go", "InferenceServiceValidator.validateNoStandaloneReplicaCollision", "Get", 1, passThroughSpecMetadata+" (standalone-name collision: parentRef)")
+	approve("pkg/webhook/admission/isvc/replica_refs.go", "InferenceServiceValidator.validateReferencedReplica", "Get", 1, passThroughSpecMetadata+" (referenced replica: component, parentRef, owner)")
 
 	// Placement discovers identities before fetching bounded decoded rows.
 	approve("pkg/controller/v1beta1/placement/planned_observation.go", "Reconciler.observePlannedHome", "List", 1, passThroughSpecMetadata+" (inventory identities; each object is fetched through GetDecoded before resource accounting)")
@@ -882,7 +886,7 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 func TestInferenceReplicaDecodedReadsCarryADecoder(t *testing.T) {
 	decodedAccessors := map[string]map[string]bool{
 		codecPackagePath:     {decodedAccessor: true},
-		projectorPackagePath: {"DecodedComponentIR": true, "DecodedComponentIRStatus": true},
+		projectorPackagePath: {"DecodedComponentIR": true, "DecodedComponentIRStatus": true, "DecodedComponentIRFor": true, "DecodedComponentIRStatusFor": true, "decodedComponentIRAt": true},
 	}
 	inv := loadStatusInventory(t)
 	calls := 0

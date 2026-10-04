@@ -483,10 +483,26 @@ func (d *driver) createDetail(obj client.Object) string {
 	if !ok {
 		return ""
 	}
-	return fmt.Sprintf("revision=%s incarnation=%s ordinal=%s",
+	detail := fmt.Sprintf("revision=%s incarnation=%s ordinal=%s",
 		orNil(pod.Labels[query.LabelRevisionHash]),
 		orNil(pod.Labels[query.LabelInstanceIncarnation]),
 		orNil(pod.Labels[query.LabelPodOrdinal]))
+	// A pod rendered from a stored revision is the one case where the
+	// revision label alone does not say what the pod runs, so the image
+	// is printed when it is not the one the spec currently renders.
+	if len(pod.Spec.Containers) > 0 && pod.Spec.Containers[0].Image != d.renderedImage() {
+		detail += " image=" + pod.Spec.Containers[0].Image
+	}
+	return detail
+}
+
+// renderedImage is the image the spec currently renders: the pinned
+// rollback revision's while a rollback is in force, else the spec's.
+func (d *driver) renderedImage() string {
+	if d.rollbackImage != "" {
+		return d.rollbackImage
+	}
+	return d.podTemplate(d.spec.Image).Containers[0].Image
 }
 
 func deleteDetail(opts []client.DeleteOption) string {

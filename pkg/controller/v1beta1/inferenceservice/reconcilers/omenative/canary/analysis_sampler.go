@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 )
@@ -49,6 +50,9 @@ func buildSampleRequest(ctx context.Context, in ReconcileInputs, a *v1beta1.Roll
 			token = t
 		}
 	}
+	// The per-revision Services the queries name carry the Component's
+	// replica prefix, like every per-revision object of the Component.
+	prefix := irprojector.RoleReplicaPrefix(in.ISVC, in.Component)
 	return SampleRequest{
 		Key: SampleKey{
 			Namespace: in.ISVC.Namespace,
@@ -65,8 +69,8 @@ func buildSampleRequest(ctx context.Context, in ReconcileInputs, a *v1beta1.Roll
 			Namespace:      in.ISVC.Namespace,
 			ISVCName:       in.ISVC.Name,
 			Component:      string(in.Component),
-			CanaryService:  coordination.PerRevisionServiceName(in.ISVC.Name, in.Component, in.CanaryRevisionHash),
-			StableService:  coordination.PerRevisionServiceName(in.ISVC.Name, in.Component, in.StableRevisionHash),
+			CanaryService:  coordination.PerRevisionServiceName(prefix, in.Component, in.CanaryRevisionHash),
+			StableService:  coordination.PerRevisionServiceName(prefix, in.Component, in.StableRevisionHash),
 			CanaryRevision: in.CanaryRevisionHash,
 			StableRevision: in.StableRevisionHash,
 		},

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
@@ -154,6 +155,30 @@ func TestSampler_FreshnessSince(t *testing.T) {
 	}
 	if _, _, ok := s.Get(req, t0); ok {
 		t.Fatal("Get(since==producedAt) should miss — that sample was already consumed")
+	}
+}
+
+// TestSampler_ProducedAtSurvivesStatus: the caller keeps producedAt in a
+// metav1.Time status field, which stores whole seconds, and passes that stored
+// value back as `since`. A sample consumed under a wall clock with sub-second
+// detail must then read as consumed, not as newer than its own record.
+func TestSampler_ProducedAtSurvivesStatus(t *testing.T) {
+	events := make(chan event.GenericEvent, 4)
+	s := NewSampler(passEval(nil), events, 4, time.Minute)
+	s.now = func() time.Time { return time.Unix(1000, int64(350*time.Millisecond)) }
+
+	req := SampleRequest{Key: SampleKey{ISVCName: "svc"}}
+	if _, _, ok := s.Get(req, time.Time{}); ok {
+		t.Fatal("first Get should miss")
+	}
+	<-events
+	_, producedAt, ok := s.Get(req, time.Time{})
+	if !ok {
+		t.Fatal("the landed sample should be served")
+	}
+	stored := metav1.NewTime(producedAt).Rfc3339Copy().Time
+	if _, _, ok := s.Get(req, stored); ok {
+		t.Fatalf("Get(since = producedAt as status stores it, %v) served the consumed sample produced at %v again", stored, producedAt)
 	}
 }
 

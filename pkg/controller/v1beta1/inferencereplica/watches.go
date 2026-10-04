@@ -22,6 +22,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/sliceprovision"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
@@ -34,10 +35,10 @@ import (
 const irKind = "InferenceReplica"
 
 // perRevisionServiceInfix is the segment PerRevisionServiceName inserts
-// between the <isvc>-<component> prefix and the revision hash suffix
-// (`<isvc>-<component>-rev-<hash>`). The EndpointSlice mapper strips it
-// to recover the projected replica name; the InferenceService owns the
-// per-revision Services, so their owner reference does not name a replica.
+// between the <namePrefix>-<component> prefix and the revision hash suffix
+// (`<namePrefix>-<component>-rev-<hash>`). The EndpointSlice mapper strips
+// it to recover the role; the InferenceService owns the per-revision
+// Services, so their owner reference does not name a replica.
 const perRevisionServiceInfix = "-rev-"
 
 // headlessServiceSuffix is the trailing segment of the per-Component
@@ -85,9 +86,11 @@ func podGroupVerdictChanged(oldObj, newObj client.Object) bool {
 // created names the replica as its controller owner, which is authoritative
 // for every naming form; the owner is matched by group and kind, so a
 // same-kind owner from another API group does not count. Per-revision
-// Services are owned by the InferenceService instead, so they fall back to
-// the `<namePrefix>-<component>` name parse, which is the replica name for a
-// projected replica. Slices of any other Service map to nothing.
+// Services are owned by the InferenceService instead: the name parse yields
+// the role, and the owning service resolves the role's replica, projected
+// or referenced. Without a readable owner the parse alone names the
+// projected replica (`<namePrefix>-<component>`). Slices of any other
+// Service map to nothing.
 func (r *Reconciler) endpointSliceToIR(ctx context.Context, obj client.Object) []reconcile.Request {
 	slice, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
@@ -97,50 +100,58 @@ func (r *Reconciler) endpointSliceToIR(ctx context.Context, obj client.Object) [
 	if serviceName == "" {
 		return nil
 	}
+	var owner *metav1.OwnerReference
 	svc := &corev1.Service{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: serviceName}, svc); err == nil {
-		if ref := metav1.GetControllerOf(svc); ref != nil &&
-			schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind).GroupKind() == irGVK.GroupKind() {
-			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: slice.Namespace, Name: ref.Name}}}
-		}
+		owner = metav1.GetControllerOf(svc)
 	}
-	irName, ok := irNameFromDrainServiceName(serviceName)
+	if owner != nil && schema.FromAPIVersionAndKind(owner.APIVersion, owner.Kind).GroupKind() == irGVK.GroupKind() {
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: slice.Namespace, Name: owner.Name}}}
+	}
+	namePrefix, component, ok := drainServiceRole(serviceName)
 	if !ok {
 		return nil
 	}
-	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: slice.Namespace, Name: irName}}}
+	if owner != nil && schema.FromAPIVersionAndKind(owner.APIVersion, owner.Kind).GroupKind() == isvcGVK.GroupKind() {
+		isvc := &v1beta1.InferenceService{}
+		if err := r.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: owner.Name}, isvc); err == nil {
+			return []reconcile.Request{{NamespacedName: irprojector.RoleReplicaKey(isvc, component)}}
+		}
+	}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: slice.Namespace, Name: irprojector.InferenceReplicaName(namePrefix, component)}}}
 }
 
-// irNameFromDrainServiceName parses an OMENative drain Service name into
-// the projected replica name (`<inferenceservice>-<component>`), or
-// ok=false when the name isn't a recognized OMENative drain Service.
+// drainServiceRole parses an OMENative drain Service name into the name
+// prefix and the component it serves, or ok=false when the name isn't a
+// recognized OMENative drain Service.
 //
 // Two shapes are recognized (query.HeadlessServiceName /
 // query.PerRevisionServiceName):
-//   - `<inferenceservice>-<component>-headless`
-//   - `<inferenceservice>-<component>-rev-<hash>`
+//   - `<namePrefix>-<component>-headless`
+//   - `<namePrefix>-<component>-rev-<hash>`
 //
-// The parse names the projected replica (irprojector.InferenceReplicaName);
-// a standalone replica is resolved through its headless Service's owner
-// reference instead. The `-<component>` suffix is matched against the known
-// component-type set so an arbitrary `-headless` Service doesn't masquerade
-// as OMENative-owned.
-func irNameFromDrainServiceName(name string) (string, bool) {
+// The name prefix is the InferenceService name for a projected replica and
+// the replica's own name for a standalone one, so the pair names the
+// projected replica (irprojector.InferenceReplicaName) unless the Service's
+// owner says otherwise. The `-<component>` suffix is matched against the
+// known component-type set so an arbitrary `-headless` Service doesn't
+// masquerade as OMENative-owned.
+func drainServiceRole(name string) (string, v1beta1.ComponentType, bool) {
 	if name == "" {
-		return "", false
+		return "", "", false
 	}
 	var prefix string
 	switch {
 	case strings.HasSuffix(name, headlessServiceSuffix):
 		prefix = strings.TrimSuffix(name, headlessServiceSuffix)
 	case strings.Contains(name, perRevisionServiceInfix):
-		// Revision hashes are hex (no `-rev-` token) while an
-		// InferenceService name may contain one, so the LAST occurrence
-		// bounds the <isvc>-<component> prefix. The component-suffix
-		// match below rejects any false positive.
+		// Revision hashes are hex (no `-rev-` token) while a name prefix
+		// may contain one, so the LAST occurrence bounds the
+		// <namePrefix>-<component> prefix. The component-suffix match
+		// below rejects any false positive.
 		prefix = name[:strings.LastIndex(name, perRevisionServiceInfix)]
 	default:
-		return "", false
+		return "", "", false
 	}
 	for _, component := range []v1beta1.ComponentType{
 		v1beta1.RouterComponent,
@@ -151,15 +162,13 @@ func irNameFromDrainServiceName(name string) (string, bool) {
 		if !strings.HasSuffix(prefix, suffix) {
 			continue
 		}
-		// prefix is already `<inferenceservice>-<component>`, the projected
-		// replica name; the component-suffix match only validates it's
-		// OMENative-owned and guards against an empty prefix segment.
-		if strings.TrimSuffix(prefix, suffix) == "" {
-			return "", false
+		namePrefix := strings.TrimSuffix(prefix, suffix)
+		if namePrefix == "" {
+			return "", "", false
 		}
-		return prefix, true
+		return namePrefix, component, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // tpuSliceToIR maps a TPU slice event to the InferenceReplica the slice was
@@ -252,9 +261,11 @@ func managedByOMENativePredicate() predicate.Predicate {
 //   - Status.Phase — Instance phase aggregation.
 //   - ContainersReady condition — CountReadyPods / AllPodsRuntimeReady.
 //   - PodReady condition — the bar every path stamps Ready on
-//     (query.PodSetPromotable). Kubelet folds the serving gate into it in a
+//     (query.PodSetPromotable) and half of the serving count
+//     (CountServingPods). Kubelet folds the serving gate into it in a
 //     status write that touches nothing else, so without this the promote
-//     waits for the next poll instead of the observation.
+//     waits for the next poll instead of the observation; the node
+//     lifecycle controller revokes it on a lost node the same way.
 //   - ome.io/serving condition — CountServingPods / RatioBalanced gate.
 //   - ContainerStatuses / InitContainerStatuses — terminal-failure
 //     detection (CrashLoopBackOff / ImagePullBackOff escalation).

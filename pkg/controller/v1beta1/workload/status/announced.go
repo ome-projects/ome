@@ -159,3 +159,45 @@ func Announce(ctx context.Context, input types.ReconcileInput, idx int32, reason
 	}
 	return recorded, nil
 }
+
+// AnnounceRepairWaiting is the announcement a repair parked on a cause
+// the kubelet retries in place earns (types.RepairWaitsOnWorkload): the
+// once-only marker that lets the caller emit its Warning exactly once
+// per parked attempt, and note appended to the row's failure message so
+// a reader of the status sees what the park waits for beside the
+// kubelet's own message. Reports whether this call recorded it.
+//
+// Eligibility is re-tested against the row the write lands on: a row
+// that is not such a park, or has already said so for this attempt, is
+// left untouched. The observation short-circuits the write the same way
+// Announce does.
+func AnnounceRepairWaiting(ctx context.Context, input types.ReconcileInput, idx int32, note string) (bool, error) {
+	if input.MutateInstance == nil {
+		return true, nil
+	}
+	if row := input.ObservedState.Instance(idx); row != nil && Announced(*row, types.EventReasonRepairWaitingOnWorkload) {
+		return false, nil
+	}
+	recorded := false
+	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		if !types.RepairWaitsOnWorkload(s) {
+			return false
+		}
+		if !markAnnounced(s, types.EventReasonRepairWaitingOnWorkload) {
+			return false
+		}
+		failure := *s.LastFailure
+		if failure.Message == "" {
+			failure.Message = note
+		} else {
+			failure.Message += "; " + note
+		}
+		s.LastFailure = &failure
+		recorded = true
+		return true
+	})
+	if err != nil {
+		return false, err
+	}
+	return recorded, nil
+}

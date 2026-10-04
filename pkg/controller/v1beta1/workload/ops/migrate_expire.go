@@ -265,6 +265,17 @@ func failMigrationThroughRecord(
 // the record parks non-terminal rather than failing a migration whose
 // surge is serving.
 func migrationTailReady(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, sourceIdx, surgeIdx int32) (bool, error) {
+	sourcePods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), input.Key.Namespace, input.Key.OwnerName, plan.Component, sourceIdx)
+	if err != nil {
+		return false, fmt.Errorf("list source pods: %w", err)
+	}
+	// No source pod left: the handover is done and the drive's tail
+	// promotes the surge whatever its pods do, so the surge gates are not
+	// asked here either. Failing the record instead would tear down the
+	// Instance's only pod set and rebuild the source the move retired.
+	if len(sourcePods) == 0 {
+		return true, nil
+	}
 	surgePods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), input.Key.Namespace, input.Key.OwnerName, plan.Component, surgeIdx)
 	if err != nil {
 		return false, fmt.Errorf("list surge pods: %w", err)
@@ -274,10 +285,6 @@ func migrationTailReady(ctx context.Context, deps workload.Deps, input workload.
 	}
 	if ok, gerr := surgeTailGatesPassed(ctx, deps, input, plan, surgeIdx, surgePods); gerr != nil || !ok {
 		return false, gerr
-	}
-	sourcePods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), input.Key.Namespace, input.Key.OwnerName, plan.Component, sourceIdx)
-	if err != nil {
-		return false, fmt.Errorf("list source pods: %w", err)
 	}
 	for _, pod := range sourcePods {
 		// A source pod wedged past its own deletion deadline (dead

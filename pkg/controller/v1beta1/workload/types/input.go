@@ -116,6 +116,17 @@ type ReconcileInput struct {
 	// polling; watched resources and exact force-delete deadlines still wake it.
 	ScaleDownRequeueInterval time.Duration
 
+	// RepairBatchSize bounds how many crash-loop repairs the restart pass
+	// OPENS in one pass, in Instance units: a gang counts as one. Every
+	// fresh crash-loop repair counts, whether or not it goes through the
+	// unavailability budget; a Restart already in flight is driven
+	// regardless and does not count, and the pod-loss and lost-member
+	// triggers that recover capacity already gone are not crash-loop
+	// repairs and do not count. Selections past the bound wait for the
+	// next pass, which the pass requeues for. A nil pointer preserves the
+	// unbounded behavior.
+	RepairBatchSize *int32
+
 	// AuthoritativePods is a live Component-wide Pod observation shared by
 	// every destructive consumer in one reconcile pass. Nil means the caller
 	// did not preload an observation; a non-nil snapshot is authoritative even
@@ -187,10 +198,11 @@ type ReconcileInput struct {
 	//
 	// strategy is the mechanism the start runs on, not merely the
 	// Component's declared strategy: a start that rebuilds its pods under
-	// another declaration — a crash-loop repair, a gang whose in-place
-	// strategy resolves to a recreate — is consulted as RecreatePod. A
-	// gate that waives its capacity checks for an in-place start therefore
-	// waives them only for a start that returns the same pod.
+	// another declaration — a crash-loop repair, an in-place strategy that
+	// resolves to a recreate on the Instance (a gang, or a single-pod diff
+	// beyond container images) — is consulted as RecreatePod. A gate that
+	// waives its capacity checks for an in-place start therefore waives
+	// them only for a start that returns the same pod.
 	//
 	// allowed=false skips this Instance for this reconcile pass; the
 	// dispatcher emits a short requeue. inFlightSurge / inFlightUnavail
@@ -225,13 +237,16 @@ type ReconcileInput struct {
 	PauseNewSurge bool
 
 	// RecordRolloutHold, when non-nil, is called at most once per Update
-	// pass with the pass's verdict: non-nil when a StartingFresh Instance
-	// was denied by the per-Component budget or UpdateGate and nothing
-	// else progressed this pass, nil when the pass observed no denial or
-	// an Update was admitted (forward progress clears any prior hold).
-	// The adapter's status writer merges this against the same-target
-	// RetryBlock/Held state it reads directly from persisted status, so
-	// workload code never needs to know about RetryBlock semantics.
+	// pass with the pass's verdict: non-nil when a fresh start was denied
+	// — by the per-Component budget or UpdateGate at admission, or by the
+	// target's RetryBlock at the trigger stage — and nothing else
+	// progressed this pass, nil when the pass observed no denial or an
+	// Update was admitted (forward progress clears any prior hold). A
+	// roll with nothing left to do plans no Update pass and reports nil at
+	// the pass's position instead. When the pass is not reached at all,
+	// the adapter's status writer reads the same-target RetryBlock/Held
+	// state from persisted status and otherwise keeps the hold it last
+	// persisted.
 	RecordRolloutHold func(hold *RolloutHold)
 
 	// MutateRetryBlock reads-modifies-writes the owner's persisted
@@ -242,8 +257,12 @@ type ReconcileInput struct {
 	// in ObservedState.RetryBlocks.
 	MutateRetryBlock func(ctx context.Context, targetRevision string, mutate func(*RetryBlock) RetryBlockDisposition) error
 
-	// UpdateRetryPolicy bounds automatic same-target update retries.
-	// nil = unconfigured → fail-safe: first failure Holds.
+	// UpdateRetryPolicy is the operator's retry ladder
+	// (lifecycle.updateRetry). It bounds automatic same-target update
+	// retries and paces the re-arms of a repair parked at Failed, measured
+	// from the recorded failure and counted on the operation.
+	// nil = unconfigured → fail-safe: first failure Holds, and a parked
+	// repair never re-arms.
 	UpdateRetryPolicy *RetryPolicy
 
 	// ForceDelete gates the stuck-Terminating force-delete escalation
@@ -259,6 +278,10 @@ type ReconcileInput struct {
 	// (lifecycle.stuckPodGracePeriod); zero or negative disables fast
 	// escalation (the InstanceReadyTimeout backstop still fires).
 	StuckPodGrace time.Duration
+	// RevisionBorn is when the revision being rolled was created, zero
+	// when the pass has no target. A failure dated before it belongs to
+	// a set of a superseded revision and never reads as this revision's.
+	RevisionBorn time.Time
 
 	// UnschedulableGrace is how long a pod may carry
 	// PodScheduled=False/Unschedulable — or an Instance's PodGroup report
@@ -291,10 +314,16 @@ type ReconcileInput struct {
 	// backoff.
 	Requeue RequeueIntervals
 
-	// PassWake collects a wake-up an op pass owes for work held on
-	// operator configuration, which raises no watch event of its own.
-	// The dispatcher allocates it per pass and folds it into the result.
+	// PassWake collects a wake-up an op pass owes for a wait that raises
+	// no watch event of its own: work held on operator configuration, or
+	// a pod read inside the stuck-pod grace. The dispatcher allocates it
+	// per pass and folds it into the result.
 	PassWake *PassWake
+
+	// Swept records the pods the force-delete sweep removed this pass, so
+	// an operation that reaches one of them on the same observation issues
+	// no second delete. The dispatcher allocates it per pass.
+	Swept *SweptPods
 
 	// Gangs carries what each multi-pod Instance's PodGroup says about
 	// its gang, recorded by the PodGroup pass that runs ahead of the

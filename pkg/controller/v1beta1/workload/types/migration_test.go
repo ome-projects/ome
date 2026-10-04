@@ -1,6 +1,7 @@
 package types
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,37 @@ func TestNextManualMigrationPicksTheOldestInFlight(t *testing.T) {
 	}
 	if got := NextManualMigration(records[:2]); got != nil {
 		t.Errorf("an Auto record and a terminal one are no work: got %+v", got)
+	}
+}
+
+// The dispatch order is every non-terminal Manual record, oldest first;
+// Auto and terminal records never enter it, and records started at the
+// same instant keep their status order.
+func TestManualMigrationsOldestFirstOrdersTheWork(t *testing.T) {
+	at := func(min int) metav1.Time {
+		return metav1.NewTime(time.Date(2026, 1, 1, 0, min, 0, 0, time.UTC))
+	}
+	records := []MigrationRecord{
+		{RequestUUID: "auto", Trigger: MigrationTriggerAuto, StartedAt: at(0)},
+		{RequestUUID: "new", Trigger: MigrationTriggerManual, Phase: MigrationPhaseAccepted, StartedAt: at(5)},
+		{RequestUUID: "done", Trigger: MigrationTriggerManual, Phase: MigrationPhaseCompleted, StartedAt: at(1)},
+		{RequestUUID: "old", Trigger: MigrationTriggerManual, Phase: MigrationPhaseDraining, StartedAt: at(2)},
+		{RequestUUID: "tie-b", Trigger: MigrationTriggerManual, Phase: MigrationPhaseAccepted, StartedAt: at(3)},
+		{RequestUUID: "tie-a", Trigger: MigrationTriggerManual, Phase: MigrationPhaseSurgePending, StartedAt: at(3)},
+	}
+	var got []string
+	for _, r := range ManualMigrationsOldestFirst(records) {
+		got = append(got, r.RequestUUID)
+	}
+	want := []string{"old", "tie-b", "tie-a", "new"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("dispatch order = %v, want %v", got, want)
+	}
+	if picked := NextManualMigration(records); picked == nil || picked.RequestUUID != "old" || picked != &records[3] {
+		t.Fatalf("the head aliases the oldest in-flight record: got %+v", picked)
+	}
+	if ManualMigrationsOldestFirst(records[:1]) != nil {
+		t.Error("an Auto record alone is no work")
 	}
 }
 

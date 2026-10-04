@@ -530,7 +530,6 @@ func TestProjectAllowsMissingCanaryStatusOutsideRequiredPhases(t *testing.T) {
 	for _, phase := range []omev1beta1.RolloutPhase{
 		"",
 		omev1beta1.RolloutPhaseStable,
-		omev1beta1.RolloutPhaseBlueGreenStandby,
 	} {
 		t.Run(string(phase), func(t *testing.T) {
 			isvc := currentTrafficISVC(t)
@@ -732,14 +731,6 @@ func TestProjectRejectsContradictoryCanaryEpochEvidence(t *testing.T) {
 				status.RolloutPhase = omev1beta1.RolloutPhasePaused
 				isvc.Status.Components[omev1beta1.EngineComponent] = status
 				isvc.Status.Canary.ObservedTrafficWeight = 35
-			},
-		},
-		{
-			name: "canary status under a blue green phase",
-			mutate: func(isvc *omev1beta1.InferenceService) {
-				status := isvc.Status.Components[omev1beta1.EngineComponent]
-				status.RolloutPhase = omev1beta1.RolloutPhaseBlueGreenStandby
-				isvc.Status.Components[omev1beta1.EngineComponent] = status
 			},
 		},
 		{

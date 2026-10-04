@@ -1022,7 +1022,7 @@ func mirrorInstanceStatuses(ir *v1beta1.InferenceReplica, statuses []v1beta1.OME
 	}
 }
 
-// buildPromoteCurrentRevision returns the CurrentRevision promotion step.
+// buildPromoteCurrentRevision returns the CurrentRevision rollup step.
 // The IR controller owns the component-level revision pair: CurrentRevision
 // and UpdateRevision are both stamped against the SPEC target (never the
 // roll target — during a canary rollback the two diverge, and coordination
@@ -1030,21 +1030,25 @@ func mirrorInstanceStatuses(ir *v1beta1.InferenceReplica, statuses []v1beta1.OME
 // would fabricate a permanent phantom-rollout skew; the canary rollback
 // machinery also load-bears on "CurrentRevision names the last revision
 // fully rolled forward onto"). The reconciler calls this from its deferred
-// status tail on every return path, so promotion timing is uniform across
-// success, early-requeue, and paused reconciles.
+// status tail on every return path, so the rollup's timing is uniform
+// across success, early-requeue, and paused reconciles.
 //
-//   - authoritative Get the IR so RolloutComplete observes per-Instance
+//   - authoritative Get the IR so the rollup observes per-Instance
 //     updates committed earlier in the same reconcile;
-//   - promote CurrentRevision = targetName IFF status.RolloutComplete
-//     (every Instance Ready on targetName at partition 0). Partition>0
-//     never satisfies RolloutComplete, so a staged rollout does not
-//     promote — the Staged Ready reason derives downstream from the
-//     CurrentRevision != UpdateRevision skew;
-//   - already-equal short-circuits with no write (a converged steady
+//   - CurrentRevision follows status.CurrentRevisionFor: promoted to
+//     targetName once every Instance is Ready on it and no RetryBlock
+//     names it (a partition > 0 never satisfies that, so a staged rollout
+//     does not promote — the Staged Ready reason derives downstream from
+//     the CurrentRevision != UpdateRevision skew; a revision whose ladder
+//     still records a failure has not landed, whatever the rows read
+//     between crashes), and withdrawn while it names targetName but an
+//     Instance still runs another revision, the shape a rollback onto the
+//     last promoted revision leaves behind;
+//   - an unchanged value short-circuits with no write (a converged steady
 //     state performs ZERO writes);
 //   - retry.RetryOnConflict mirrors buildMutateInstance.
 //
-// On a committed promotion the new CurrentRevision is mirrored onto the
+// On a committed write the new CurrentRevision is mirrored onto the
 // caller's in-memory IR so the deferred aggregator's Ready computation and
 // the reconciler's promotion log observe the post-write value.
 func buildPromoteCurrentRevision(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, targetName string) error {
@@ -1056,8 +1060,9 @@ func buildPromoteCurrentRevision(writer statusWriter, reads client.Reader, ir *v
 			return nil
 		}
 		var committed string
+		wrote := false
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			committed = ""
+			committed, wrote = "", false
 			fresh := &v1beta1.InferenceReplica{}
 			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
 			if err != nil {
@@ -1073,24 +1078,75 @@ func buildPromoteCurrentRevision(writer statusWriter, reads client.Reader, ir *v
 				return workloadtypes.ErrStatusMutationPrecondition
 			}
 			insts := v1beta1convert.InstanceStatusSliceToWorkload(fresh.Status.InstanceStatuses)
-			if fresh.Status.CurrentRevision == targetName || !workloadstatus.RolloutComplete(insts, targetName) {
+			want := workloadstatus.CurrentRevisionFor(insts, fresh.Status.CurrentRevision, targetName, retryBlocksFromIR(fresh))
+			if want == fresh.Status.CurrentRevision {
 				return nil
 			}
-			fresh.Status.CurrentRevision = targetName
+			fresh.Status.CurrentRevision = want
 			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
 				if apierrors.IsNotFound(err) {
 					return workloadtypes.ErrStatusOwnerGone
 				}
 				return fmt.Errorf("update IR status: %w", err)
 			}
-			committed = targetName
+			committed, wrote = want, true
 			return nil
 		})
 		if err != nil {
 			return err
 		}
-		if committed != "" && ir != nil {
+		if wrote && ir != nil {
 			ir.Status.CurrentRevision = committed
+		}
+		return nil
+	}
+}
+
+// buildRecordUpdateRevision writes status.updateRevision ahead of the pass
+// that first renders a revision: re-read under retry.RetryOnConflict,
+// refuse a generation the pass did not plan against, write, and mirror the
+// committed name onto the caller's in-memory IR. The publication at the end
+// of the pass restates the same name beside the counters.
+func buildRecordUpdateRevision(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, targetName string) error {
+	key := client.ObjectKeyFromObject(ir)
+	ownerUID := ir.UID
+	ownerGeneration := ir.Generation
+	return func(ctx context.Context, targetName string) error {
+		if targetName == "" {
+			return nil
+		}
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			fresh := &v1beta1.InferenceReplica{}
+			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return workloadtypes.ErrStatusOwnerGone
+				}
+				return fmt.Errorf("re-read IR: %w", err)
+			}
+			if ownerUID == "" || fresh.UID != ownerUID {
+				return workloadtypes.ErrStatusOwnerGone
+			}
+			if fresh.Generation != ownerGeneration {
+				return workloadtypes.ErrStatusMutationPrecondition
+			}
+			if fresh.Status.UpdateRevision == targetName {
+				return nil
+			}
+			fresh.Status.UpdateRevision = targetName
+			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
+				if apierrors.IsNotFound(err) {
+					return workloadtypes.ErrStatusOwnerGone
+				}
+				return fmt.Errorf("update IR status: %w", err)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if ir != nil {
+			ir.Status.UpdateRevision = targetName
 		}
 		return nil
 	}

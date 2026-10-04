@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/interfaces"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/utils"
 )
@@ -366,7 +367,7 @@ func (b *HTTPRouteBuilder) buildRouterHTTPRoute(ctx context.Context, isvc *v1bet
 	filters := b.componentFilters(isvc)
 
 	timeout := b.defaultTimeout()
-	if isvc.Spec.Router.TimeoutSeconds != nil {
+	if isvc.Spec.Router != nil && isvc.Spec.Router.TimeoutSeconds != nil {
 		timeout = toGatewayAPIDuration(*isvc.Spec.Router.TimeoutSeconds)
 	}
 
@@ -394,7 +395,7 @@ func (b *HTTPRouteBuilder) buildDecoderHTTPRoute(ctx context.Context, isvc *v1be
 	filters := b.componentFilters(isvc)
 
 	timeout := b.defaultTimeout()
-	if isvc.Spec.Decoder.TimeoutSeconds != nil {
+	if isvc.Spec.Decoder != nil && isvc.Spec.Decoder.TimeoutSeconds != nil {
 		timeout = toGatewayAPIDuration(*isvc.Spec.Decoder.TimeoutSeconds)
 	}
 
@@ -414,11 +415,11 @@ func (b *HTTPRouteBuilder) buildTopLevelHTTPRoute(ctx context.Context, isvc *v1b
 	var port int32
 	var timeout *gatewayapiv1.Duration
 
-	if isvc.Spec.Router != nil {
+	if irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) {
 		serviceName = constants.RouterServiceName(isvc.Name)
 		port = b.resolveServicePort(ctx, isvc.Namespace, serviceName, RouterDefaultPort)
 		timeout = b.defaultTimeout()
-		if isvc.Spec.Router.TimeoutSeconds != nil {
+		if isvc.Spec.Router != nil && isvc.Spec.Router.TimeoutSeconds != nil {
 			timeout = toGatewayAPIDuration(*isvc.Spec.Router.TimeoutSeconds)
 		}
 	} else {

@@ -58,36 +58,39 @@ func EvaluatePairingDrain(ctx context.Context, reads client.Reader, isvc *v1beta
 		return true, "", "target revision declares no pairing protocol"
 	}
 
-	pods := &corev1.PodList{}
-	if err := reads.List(ctx, pods, client.InNamespace(isvc.Namespace), client.MatchingLabels{
-		constants.InferenceServicePodLabelKey: isvc.Name,
-		query.LabelManagedBy:                  query.ManagedByOMENative,
-	}); err != nil {
-		return false, v1beta1.RolloutHoldGatePairing, fmt.Sprintf("pairing drain gate: cannot list pods, failing closed: %v", err)
-	}
+	// Each pairing Component's pods are listed under its own replica prefix:
+	// a referenced peer's pods carry the peer replica's name, not the
+	// service's.
 	serving := map[v1beta1.ComponentType]map[string]int32{
 		v1beta1.EngineComponent:  {},
 		v1beta1.DecoderComponent: {},
 	}
 	protoByPod := map[string]string{}
 	transition := false
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		comp := v1beta1.ComponentType(pod.Labels[constants.OMEComponentLabel])
-		if _, pairs := serving[comp]; !pairs {
-			continue
+	for _, comp := range pairingComponents {
+		prefix := prefixFor(isvc, comp)
+		pods := &corev1.PodList{}
+		if err := reads.List(ctx, pods, client.InNamespace(isvc.Namespace), client.MatchingLabels{
+			constants.InferenceServicePodLabelKey: prefix,
+			constants.OMEComponentLabel:           string(comp),
+			query.LabelManagedBy:                  query.ManagedByOMENative,
+		}); err != nil {
+			return false, v1beta1.RolloutHoldGatePairing, fmt.Sprintf("pairing drain gate: cannot list %s pods, failing closed: %v", comp, err)
 		}
-		if pod.DeletionTimestamp != nil || !podreadiness.IsPodReady(pod) {
-			continue
-		}
-		if query.RoutedServiceForPod(isvc.Name, workloadtypes.ComponentType(comp), pod) == "" {
-			continue
-		}
-		proto := pod.Labels[query.LabelPairingProtocol]
-		serving[comp][proto]++
-		protoByPod[pod.Name] = proto
-		if proto != "" && proto != target {
-			transition = true
+		for i := range pods.Items {
+			pod := &pods.Items[i]
+			if pod.DeletionTimestamp != nil || !podreadiness.IsPodReady(pod) {
+				continue
+			}
+			if query.RoutedServiceForPod(prefix, workloadtypes.ComponentType(comp), pod) == "" {
+				continue
+			}
+			proto := pod.Labels[query.LabelPairingProtocol]
+			serving[comp][proto]++
+			protoByPod[pod.Name] = proto
+			if proto != "" && proto != target {
+				transition = true
+			}
 		}
 	}
 	if !transition {

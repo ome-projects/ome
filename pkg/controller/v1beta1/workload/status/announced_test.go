@@ -2,6 +2,7 @@ package status
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -190,5 +191,87 @@ func TestAnnounce_DeliversWithoutARowWriter(t *testing.T) {
 	announced, err := Announce(context.Background(), types.ReconcileInput{}, 0, standingReason)
 	if err != nil || !announced {
 		t.Fatalf("announce = %v, %v", announced, err)
+	}
+}
+
+// A repair parked on a cause the kubelet retries in place records once,
+// per parked attempt, what it waits for: the once-only marker and the
+// note on the failure message land in one write, beside the kubelet's
+// own message. A row that is not such a park — Ready, parked on another
+// cause, Failed with no attempt or under another operation — is left
+// untouched.
+func TestAnnounceRepairWaiting_RecordsOncePerParkedAttempt(t *testing.T) {
+	const note = "waiting for the configuration or image the pod needs; the kubelet retries in place"
+	parked := func(reason, message string) types.InstanceStatus {
+		return types.InstanceStatus{
+			Index: 0, Phase: types.InstancePhaseFailed,
+			Operation:   &types.InstanceOperation{ID: "restart-0-1", Type: types.InstanceOperationRestart},
+			LastFailure: &types.InstanceTermination{Reason: reason, Message: message},
+		}
+	}
+	rows := map[int32]types.InstanceStatus{0: parked("CreateContainerConfigError", "couldn't find key mode in ConfigMap")}
+	calls := 0
+	input := types.ReconcileInput{
+		MutateInstance: func(_ context.Context, idx int32, mutate func(*types.InstanceStatus) bool) error {
+			calls++
+			row := rows[idx]
+			if mutate(&row) {
+				rows[idx] = row
+			}
+			return nil
+		},
+	}
+	first, err := AnnounceRepairWaiting(context.Background(), input, 0, note)
+	if err != nil || !first {
+		t.Fatalf("first announce = %v, %v", first, err)
+	}
+	if got := rows[0].LastFailure.Message; got != "couldn't find key mode in ConfigMap; "+note {
+		t.Fatalf("message = %q, want the kubelet's message followed by the note", got)
+	}
+	if !Announced(rows[0], types.EventReasonRepairWaitingOnWorkload) {
+		t.Fatal("the row must report the message as delivered")
+	}
+	second, err := AnnounceRepairWaiting(context.Background(), input, 0, note)
+	if err != nil || second {
+		t.Fatalf("second announce = %v, %v", second, err)
+	}
+	if got := rows[0].LastFailure.Message; strings.Count(got, note) != 1 {
+		t.Fatalf("message = %q, want the note once", got)
+	}
+
+	// The observation short-circuits the write once the marker is on the
+	// row.
+	input.ObservedState = types.WorkloadObservedState{InstanceStatuses: []types.InstanceStatus{rows[0]}}
+	calls = 0
+	if announced, err := AnnounceRepairWaiting(context.Background(), input, 0, note); err != nil || announced || calls != 0 {
+		t.Fatalf("announce against the carrying observation = %v, mutations=%d, err=%v", announced, calls, err)
+	}
+
+	// Not such a park: nothing is written.
+	for name, row := range map[string]types.InstanceStatus{
+		"crash loop":        parked("CrashLoopBackOff", "back-off restarting"),
+		"no failure":        {Index: 0, Phase: types.InstancePhaseFailed, Operation: &types.InstanceOperation{ID: "restart-0-1", Type: types.InstanceOperationRestart}},
+		"no attempt":        {Index: 0, Phase: types.InstancePhaseFailed, LastFailure: &types.InstanceTermination{Reason: "CreateContainerConfigError"}},
+		"not parked":        {Index: 0, Phase: types.InstancePhaseRestarting, Operation: &types.InstanceOperation{ID: "restart-0-1", Type: types.InstanceOperationRestart}, LastFailure: &types.InstanceTermination{Reason: "CreateContainerConfigError"}},
+		"another operation": {Index: 0, Phase: types.InstancePhaseFailed, Operation: &types.InstanceOperation{ID: "update-0-1", Type: types.InstanceOperationUpdate}, LastFailure: &types.InstanceTermination{Reason: "CreateContainerConfigError"}},
+	} {
+		rows = map[int32]types.InstanceStatus{0: row}
+		input.ObservedState = types.WorkloadObservedState{}
+		announced, err := AnnounceRepairWaiting(context.Background(), input, 0, note)
+		if err != nil || announced {
+			t.Errorf("%s: announce = %v, %v, want nothing recorded", name, announced, err)
+		}
+		if got := rows[0]; len(got.Announced) != 0 || (got.LastFailure != nil && strings.Contains(got.LastFailure.Message, note)) {
+			t.Errorf("%s: row = %+v, want it untouched", name, got)
+		}
+	}
+
+	// An empty kubelet message carries the note alone.
+	rows = map[int32]types.InstanceStatus{0: parked("ImagePullBackOff", "")}
+	if announced, err := AnnounceRepairWaiting(context.Background(), input, 0, note); err != nil || !announced {
+		t.Fatalf("announce = %v, %v", announced, err)
+	}
+	if got := rows[0].LastFailure.Message; got != note {
+		t.Errorf("message = %q, want the note alone", got)
 	}
 }

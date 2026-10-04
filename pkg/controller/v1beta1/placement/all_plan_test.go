@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -83,6 +84,30 @@ func TestAllPlanInitialApplication(t *testing.T) {
 		want map[string]int32
 	}{
 		{name: "full source policy on every home", want: map[string]int32{"member-a": 3, "member-b": 3}},
+		{name: "zero floor retains every full home", edit: func(_ *testing.T, f *backendFixture) {
+			f.source.Spec.Engine.MinReplicas = ptr.To(0)
+		}, want: map[string]int32{"member-a": 0, "member-b": 0}},
+		{name: "zero floor progresses independently of an unreachable peer", edit: func(_ *testing.T, f *backendFixture) {
+			f.source.Spec.Engine.MinReplicas = ptr.To(0)
+			delete(f.connections.m, "member-b")
+		}, want: map[string]int32{"member-a": 0}},
+		{name: "mixed inherited floors retain the full per-home policy", edit: func(t *testing.T, f *backendFixture) {
+			f.source.Spec.Engine.MinReplicas = nil
+			for name, cl := range f.workers {
+				rt := backendTestRuntime()
+				if err := cl.Get(t.Context(), client.ObjectKeyFromObject(rt), rt); err != nil {
+					t.Fatal(err)
+				}
+				floor := 0
+				if name == "member-b" {
+					floor = 3
+				}
+				rt.Spec.EngineConfig = &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(floor)}}
+				if err := cl.Update(t.Context(), rt); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}, want: map[string]int32{"member-a": 0, "member-b": 3}},
 		{name: "unreachable matched peer permits independent provisioning", edit: func(_ *testing.T, f *backendFixture) { delete(f.connections.m, "member-b") }, want: map[string]int32{"member-a": 3}},
 		{name: "runtime floor remains inherited", edit: func(t *testing.T, f *backendFixture) {
 			f.source.Spec.Engine.MinReplicas = nil
@@ -418,5 +443,93 @@ func TestAllUnknownRuntimeRetainsDesiredAuthority(t *testing.T) {
 	}
 	if diff := cmp.Diff(before.OriginalReplicas, got.OriginalReplicas); diff != "" {
 		t.Fatalf("migration baseline changed: %s", diff)
+	}
+}
+
+// TestAllUnreadableObservationKeepsAcknowledgedCandidate settles two serving
+// homes, then fails one home's inventory read for a single pass. That pass
+// reports the gap through the observation flag alone: the home keeps its
+// acknowledged plan, endpoint and admission, every decision holds, and the
+// next readable pass restores the known observation.
+func TestAllUnreadableObservationKeepsAcknowledgedCandidate(t *testing.T) {
+	const replicas = 3
+	names := []string{"member-a", "member-b"}
+	f := newBackendFixture(t, v1beta1.PlacementModeAll)
+	if err := f.reconciler.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {
+		t.Fatal(err)
+	}
+	f.source.Spec.Engine.MinReplicas = ptr.To(replicas)
+	if err := f.reconciler.Update(t.Context(), f.source); err != nil {
+		t.Fatal(err)
+	}
+	f.reconcile(t)
+	for _, name := range names {
+		projectAllHome(t, f, name, replicas)
+		serveAllHome(t, f, name, replicas)
+	}
+	weights := map[string]int32{"member-a": replicas, "member-b": replicas}
+	var settled *v1beta1.InferenceService
+	for range 8 {
+		for _, name := range names {
+			projectAllHome(t, f, name, replicas)
+		}
+		publishAllRouting(t, f, weights)
+		settled = f.reconcile(t)
+		if condition := settled.Status.GetCondition(v1beta1.PlacementConverged); condition != nil && condition.Status == corev1.ConditionTrue {
+			break
+		}
+	}
+	if condition := settled.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Status != corev1.ConditionTrue {
+		t.Fatalf("serving homes did not settle: %+v", condition)
+	}
+	before := candidateOf(t, settled, "member-a")
+	if !before.ObservationKnown || before.AppliedPlanID != settled.Status.Placement.Plan.ID || before.ReadyReplicas != replicas || before.Endpoint == nil {
+		t.Fatalf("settled home is not serving its acknowledged plan: %+v", before)
+	}
+
+	f.connections.m["member-a"] = unreadableAllMember(f, "member-a")
+	unknown := f.reconcile(t)
+	f.connections.m["member-a"] = workloadcluster.NewNeverCachingClient(f.workers["member-a"])
+	if diff := cmp.Diff(settled.Status.Placement.Plan, unknown.Status.Placement.Plan); diff != "" {
+		t.Fatalf("unreadable observation changed the accepted plan (-want +got):\n%s", diff)
+	}
+	type carried struct {
+		Known         bool
+		AppliedPlanID string
+		Endpoint      string
+		Phase         v1beta1.CandidatePlacementPhase
+		Admitted      int32
+		Ready         int32
+	}
+	report := func(candidate v1beta1.CandidatePlacement) carried {
+		return carried{Known: candidate.ObservationKnown, AppliedPlanID: candidate.AppliedPlanID, Endpoint: candidate.Endpoint.String(), Phase: candidate.Phase, Admitted: candidate.AdmittedReplicas, Ready: candidate.ReadyReplicas}
+	}
+	// Unverified ready capacity is the routing weight and is withheld; every
+	// other field the pass could not read stays as last known.
+	want := report(before)
+	want.Known, want.Ready = false, 0
+	got := candidateOf(t, unknown, "member-a")
+	if diff := cmp.Diff(want, report(got)); diff != "" {
+		t.Fatalf("unreadable observation rewrote the candidate (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(before.Allocation, got.Allocation); diff != "" {
+		t.Fatalf("unreadable observation changed the allocation (-want +got):\n%s", diff)
+	}
+	if condition := unknown.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Status != corev1.ConditionFalse || condition.Reason != "ObservationUnknown" {
+		t.Fatalf("kept acknowledgement did not hold the allocation: %+v", condition)
+	}
+	if condition := unknown.Status.GetCondition(v1beta1.PlacementSatisfied); condition == nil || condition.Status == corev1.ConditionTrue {
+		t.Fatalf("kept acknowledgement satisfied the plan: %+v", condition)
+	}
+	if _, present := allMemberOn(t, f, "member-a"); !present {
+		t.Fatal("unreadable observation removed the serving member")
+	}
+
+	recovered := f.reconcile(t)
+	if diff := cmp.Diff(report(before), report(candidateOf(t, recovered, "member-a"))); diff != "" {
+		t.Fatalf("readable observation did not restore the candidate (-want +got):\n%s", diff)
+	}
+	if condition := recovered.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Status != corev1.ConditionTrue {
+		t.Fatalf("readable observation did not reconverge: %+v", condition)
 	}
 }

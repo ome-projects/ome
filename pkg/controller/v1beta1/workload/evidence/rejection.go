@@ -18,6 +18,27 @@ import (
 // the kubelet waiting reasons — not a tunable.
 const quotaExceededMarker = "exceeded quota"
 
+// webhookCallFailedMarker is the phrase the apiserver's webhook
+// dispatcher puts in the error it fails closed with when it cannot call
+// an admission webhook. Fixed upstream wording, like the quota marker.
+const webhookCallFailedMarker = "failed calling webhook"
+
+// AdmissionUnavailable reports whether err is the apiserver failing to
+// consult an admission webhook, as opposed to any answer admission gave
+// about the object. The dispatcher carries that failure on an
+// InternalError, a Timeout or a ServiceUnavailable whose message names
+// the webhook it could not call; the same codes without that phrase are
+// the apiserver's own trouble and stay unclassified.
+func AdmissionUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if !apierrors.IsInternalError(err) && !apierrors.IsTimeout(err) && !apierrors.IsServiceUnavailable(err) {
+		return false
+	}
+	return strings.Contains(apiErrorMessage(err), webhookCallFailedMarker)
+}
+
 // ClassifyAPIError reads one apiserver error into the policy the
 // workload engine applies to it. Pure: every branch is a statement about
 // Kubernetes API semantics, so the same error classifies identically on
@@ -25,7 +46,8 @@ const quotaExceededMarker = "exceeded quota"
 //
 // Order matters. A namespace-terminating refusal is also a 403 Forbidden,
 // so it is recognized by its status cause before the quota-message match
-// can claim it.
+// can claim it, and an unreachable webhook can arrive as a 503, so it is
+// recognized by its message before the throttled reading can claim it.
 func ClassifyAPIError(err error) types.APIRejection {
 	if err == nil {
 		return types.APIRejection{}
@@ -48,6 +70,12 @@ func ClassifyAPIError(err error) types.APIRejection {
 		return types.APIRejection{
 			Class:   types.APIRejectionCapacityBlocked,
 			Reason:  types.RejectionReasonQuotaExceeded,
+			Message: message,
+		}
+	case AdmissionUnavailable(err):
+		return types.APIRejection{
+			Class:   types.APIRejectionAdmissionUnavailable,
+			Reason:  types.RejectionReasonAdmissionUnavailable,
 			Message: message,
 		}
 	case apierrors.IsTooManyRequests(err) || apierrors.IsServiceUnavailable(err):

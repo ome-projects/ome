@@ -206,3 +206,27 @@ func TestBuildSampleRequest_ReadsSecretViaReader(t *testing.T) {
 		t.Fatalf("token should resolve via Reader, got %q", req.BearerToken)
 	}
 }
+
+// The Services the analysis queries name carry the Component's replica
+// prefix; the service name still identifies the InferenceService.
+func TestBuildSampleRequest_ServicesCarryTheReplicaPrefix(t *testing.T) {
+	in := ReconcileInputs{
+		ISVC: &v1beta1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"},
+			Spec:       v1beta1.InferenceServiceSpec{ReplicaRefs: &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}}},
+		},
+		Component:          v1beta1.EngineComponent,
+		CanaryRevisionHash: "new1",
+		StableRevisionHash: "old1",
+	}
+	req, err := buildSampleRequest(context.Background(), in, &v1beta1.RolloutAnalysis{}, 0)
+	if err != nil {
+		t.Fatalf("buildSampleRequest: %v", err)
+	}
+	if req.TemplateContext.CanaryService != "pool-a-engine-rev-new1" || req.TemplateContext.StableService != "pool-a-engine-rev-old1" {
+		t.Fatalf("services must carry the replica prefix: canary=%q stable=%q", req.TemplateContext.CanaryService, req.TemplateContext.StableService)
+	}
+	if req.TemplateContext.ISVCName != "svc" || req.Key.ISVCName != "svc" {
+		t.Fatalf("the service name identifies the InferenceService: template=%q key=%q", req.TemplateContext.ISVCName, req.Key.ISVCName)
+	}
+}

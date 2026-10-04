@@ -398,11 +398,11 @@ func TestReconcile_WakesWhenMinReadyWindowElapses(t *testing.T) {
 		// trigger rolls the row and the wake under test never applies.
 		pod0.Labels[query.LabelRevisionHash] =
 			query.RevisionHashFromControllerRevisionName(targetRevisionNameFor(t, ir))
-		pod0.Status.Conditions = append(pod0.Status.Conditions, corev1.PodCondition{
-			Type:               corev1.PodReady,
-			Status:             corev1.ConditionTrue,
-			LastTransitionTime: metav1.NewTime(readyAt),
-		})
+		for i := range pod0.Status.Conditions {
+			if pod0.Status.Conditions[i].Type == corev1.PodReady {
+				pod0.Status.Conditions[i].LastTransitionTime = metav1.NewTime(readyAt)
+			}
+		}
 		slice0 := sliceForIRPod(ir, pod0, true)
 		r, c := newReconciler(t, ir, pod0, slice0)
 		r.Clock = clocktesting.NewFakeClock(now)
@@ -1186,10 +1186,10 @@ func TestAggregateAndWriteStatus_GenerationChangeAborts(t *testing.T) {
 
 // liveReadsThroughPromotion is how many InferenceReplica reads reach the
 // authoritative reader up to and including the CurrentRevision promotion:
-// the migration-entry sync, the aggregate-condition write, then promotion.
-// Every conflict-retry closure re-reads its base live, so promotion is not
-// the first live read.
-const liveReadsThroughPromotion = 3
+// the migration-entry sync, the aggregate-condition write, the update
+// revision record, then promotion. Every conflict-retry closure re-reads
+// its base live, so promotion is not the first live read.
+const liveReadsThroughPromotion = 4
 
 type firstIRGenerationReader struct {
 	client.Reader
@@ -2007,6 +2007,30 @@ func TestEffectiveRolloutHold(t *testing.T) {
 	if h := effectiveRolloutHold(false, nil, inFlight, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
 		t.Errorf("Update pass not run must fall back to the persisted RetryBlock/Held state: got %+v", h)
 	}
+
+	// Update pass did NOT run and the target carries no block -> the
+	// persisted hold stands as written, Since included: the pass that
+	// could replace or clear it never ran.
+	persisted := &v1beta1.InferenceReplicaStatus{
+		CurrentRevision: "rev-a", UpdateRevision: "rev-b",
+		RolloutHold: &v1beta1.RolloutHold{
+			Gate: v1beta1.RolloutHoldGateBudget, Reason: "per-Component surge budget 1 exhausted (would become 2)", Target: "rev-b",
+			Since: metav1.NewTime(now.Add(-time.Minute)),
+		},
+	}
+	if h := effectiveRolloutHold(false, nil, persisted, now); h == nil || h.Gate != v1beta1.RolloutHoldGateBudget || h.Reason != persisted.RolloutHold.Reason || !h.Since.Equal(&persisted.RolloutHold.Since) {
+		t.Errorf("Update pass not run must keep the persisted hold as written: got %+v", h)
+	}
+
+	// Update pass did NOT run and a same-target block holds every fresh
+	// start at the trigger stage -> the block is the hold that stands,
+	// ahead of the persisted one.
+	persisted.RetryBlocks = []v1beta1.RetryBlock{
+		{TargetRevision: "rev-b", State: v1beta1.RetryBlockHeld, AttemptsStarted: 2, Reason: "ImagePullBackOff"},
+	}
+	if h := effectiveRolloutHold(false, nil, persisted, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
+		t.Errorf("a same-target Held block must stand ahead of the persisted hold when the Update pass did not run: got %+v", h)
+	}
 }
 
 // TestAggregateAndWriteStatus_RolloutHold_ChurnSafeAcrossReconciles proves
@@ -2195,6 +2219,76 @@ func TestAggregateAndWriteStatus_RolloutHold_PausedRetryBlockFallbackChurnSafe(t
 			"paused reconcile %d must not fabricate a fresh Since", i+2)
 		live = next
 	}
+}
+
+// TestAggregateAndWriteStatus_RolloutHold_StandsAcrossAPassWithoutTheUpdatePass
+// pins the hold's lifetime across reconciles that never reach the Update
+// pass: a pass that ends on a repair, a scale wave or a dispatch hold,
+// or one Plan gates before update selection. The Update pass of one
+// reconcile records a Budget hold; the next two reconciles report no
+// verdict at all (holdObserved=false) and the target carries no
+// RetryBlock to read. The persisted hold must stand as written — Gate,
+// Reason, Target and Since — with ZERO writes, and only a pass that runs
+// the Update pass and observes progress clears it.
+func TestAggregateAndWriteStatus_RolloutHold_StandsAcrossAPassWithoutTheUpdatePass(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ir := baselineIR("llama-engine", "prod", 1)
+	ir.Status.CurrentRevision = "rev-prior"
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-prior"},
+	}
+	pod0 := podForIR(ir, 0, "default", 0, true, true)
+	slice0 := sliceForIRPod(ir, pod0, true)
+	r, c := newReconciler(t, ir, pod0, slice0)
+
+	plan := workloadtypes.ComponentPlan{
+		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
+		Replicas:  1,
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
+		},
+	}
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "rev-target"}}
+	key := client.ObjectKeyFromObject(ir)
+
+	budgetHold := &workloadtypes.RolloutHold{
+		Gate:   workloadtypes.RolloutHoldGateBudget,
+		Reason: "per-Component surge budget 1 exhausted (would become 2); Instance 1 on revision rev-target not serving",
+		Target: target.Name,
+	}
+
+	// The Update pass ran and denied a fresh start: the hold is recorded.
+	g.Expect(writeStatus(r, ir, plan, target, true, budgetHold)).To(gomega.Succeed())
+	held := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), key, held)).To(gomega.Succeed())
+	g.Expect(held.Status.RolloutHold).NotTo(gomega.BeNil())
+	g.Expect(held.Status.RolloutHold.Gate).To(gomega.Equal(v1beta1.RolloutHoldGateBudget))
+	rv := held.ResourceVersion
+	since := held.Status.RolloutHold.Since
+	g.Expect(since.IsZero()).To(gomega.BeFalse())
+
+	// Two reconciles that never reach the Update pass: no verdict, and no
+	// RetryBlock to read. The persisted hold stands as written.
+	live := held
+	for _, pass := range []string{"the first pass without the Update pass", "the second pass without the Update pass"} {
+		g.Expect(writeStatus(r, live.DeepCopy(), plan, target, false, nil)).To(gomega.Succeed())
+		next := &v1beta1.InferenceReplica{}
+		g.Expect(c.Get(context.Background(), key, next)).To(gomega.Succeed())
+		g.Expect(next.Status.RolloutHold).NotTo(gomega.BeNil(),
+			"%s must not clear the Budget hold: the pass that could replace it never ran", pass)
+		g.Expect(next.Status.RolloutHold.Gate).To(gomega.Equal(v1beta1.RolloutHoldGateBudget), pass)
+		g.Expect(next.Status.RolloutHold.Reason).To(gomega.Equal(budgetHold.Reason), pass)
+		g.Expect(next.Status.RolloutHold.Target).To(gomega.Equal(target.Name), pass)
+		g.Expect(next.Status.RolloutHold.Since.Equal(&since)).To(gomega.BeTrue(), "%s must not move Since", pass)
+		g.Expect(next.ResourceVersion).To(gomega.Equal(rv), "%s must perform ZERO writes", pass)
+		live = next
+	}
+
+	// The Update pass runs again and observes progress: the hold clears.
+	g.Expect(writeStatus(r, live.DeepCopy(), plan, target, true, nil)).To(gomega.Succeed())
+	cleared := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), key, cleared)).To(gomega.Succeed())
+	g.Expect(cleared.Status.RolloutHold).To(gomega.BeNil(), "progress observed by the Update pass must clear the hold")
 }
 
 // TestAggregateStatus_PreservesMigrations pins the status aggregator

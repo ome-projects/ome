@@ -24,3 +24,34 @@ func partitionForNewCount(desired, newCount int32) int32 {
 	}
 	return p
 }
+
+// heldFloor is the least number of instances a step keeps on the stable
+// revision while the canary is in flight. The stable revision carries traffic
+// until the final 100% write lands and drains in-flight requests through the
+// drain window after it, so its last serving instance is not released by a
+// step; the done sentinel releases it, and the unit reads Stable once that
+// instance has rolled. A Component with a single instance has no instance to
+// spare and stages in place.
+func heldFloor(desired int32) int32 {
+	if desired > 1 {
+		return 1
+	}
+	return 0
+}
+
+// stepPartition is the partition a step projects while the canary is in
+// flight: the complement of its resolved new count, never below the held
+// floor.
+func stepPartition(step v1beta1.RolloutGroupStep, desired int32) int32 {
+	p := partitionForNewCount(desired, resolveStepNewCount(step, desired))
+	if floor := heldFloor(desired); p < floor {
+		p = floor
+	}
+	return p
+}
+
+// stepStagedCount is the new-revision instance count a step can reach under
+// its partition, the count its capacity gate waits for.
+func stepStagedCount(step v1beta1.RolloutGroupStep, desired int32) int32 {
+	return desired - stepPartition(step, desired)
+}

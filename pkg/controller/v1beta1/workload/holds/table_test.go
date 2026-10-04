@@ -17,6 +17,7 @@ import (
 func TestTable_OneOrderedPair(t *testing.T) {
 	facts := []string{
 		types.RejectionReasonQuotaExceeded,
+		types.RejectionReasonAdmissionUnavailable,
 		types.WaitingReasonUnschedulable,
 		types.WaitingReasonPodGroupTerminating,
 		types.WaitingReasonNodeUnknown,
@@ -48,7 +49,7 @@ func TestTable_OneOrderedPair(t *testing.T) {
 }
 
 // TestTable_EveryTokenIsWrittenByExactlyOneAuthority: the table is the
-// one home for the seven tokens, so a duplicate row — two authorities
+// one home for the eight tokens, so a duplicate row — two authorities
 // writing one token — is a precedence nobody decides.
 func TestTable_EveryTokenIsWrittenByExactlyOneAuthority(t *testing.T) {
 	seen := make(map[string]int, len(table))
@@ -85,6 +86,12 @@ func TestTable_FactHoldsRefuseATeardown(t *testing.T) {
 		// Admission can refuse a create on any row, so the refusal is
 		// recorded wherever the create site left it.
 		types.RejectionReasonQuotaExceeded: {
+			types.OwnerNone: true, types.OwnerCreate: true, types.OwnerUpdate: true,
+			types.OwnerRestart: true, types.OwnerMigrate: true, types.OwnerDelete: true,
+		},
+		// Admission can be unreachable for any write, so the wait is
+		// recorded wherever the write site left it.
+		types.RejectionReasonAdmissionUnavailable: {
 			types.OwnerNone: true, types.OwnerCreate: true, types.OwnerUpdate: true,
 			types.OwnerRestart: true, types.OwnerMigrate: true, types.OwnerDelete: true,
 		},

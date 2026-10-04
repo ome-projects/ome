@@ -30,26 +30,56 @@ func CanonicalImage(img string) string {
 // PodImagesMatch's spec check: spec.image flips immediately on patch but
 // kubelet may not have rolled the container yet, leaving the old image
 // in Status.ContainerStatuses[*].Image. Only after both match has the
-// in-place update actually taken effect.
+// in-place update actually taken effect. Statuses for containers absent
+// from target (webhook-injected sidecars) are not OMENative-owned and
+// are ignored — comparing them would block convergence forever.
 func podRuntimeImagesMatch(pod *corev1.Pod, target *corev1.PodSpec) bool {
 	if pod == nil || target == nil {
 		return false
 	}
-	got := make(map[string]string, len(pod.Status.ContainerStatuses))
-	for _, cs := range pod.Status.ContainerStatuses {
-		got[cs.Name] = CanonicalImage(cs.Image)
-	}
-	// Every target container needs a matching status before declaring
-	// done. Statuses for containers absent from target (webhook-injected
-	// sidecars) are not OMENative-owned and are ignored — comparing them
-	// would block convergence forever.
 	for _, c := range target.Containers {
-		img, ok := got[c.Name]
-		if !ok || img != CanonicalImage(c.Image) {
+		if !ContainerRuntimeImageIs(pod, c.Name, c.Image) {
 			return false
 		}
 	}
 	return true
+}
+
+// ChangedContainerImages lists, by container name, the target images that
+// differ from the running revision's. With no running revision every
+// target container counts: nothing proves which images already run.
+func ChangedContainerImages(running, target *corev1.PodSpec) map[string]string {
+	if target == nil {
+		return nil
+	}
+	runningImages := map[string]string{}
+	if running != nil {
+		for _, c := range running.Containers {
+			runningImages[c.Name] = c.Image
+		}
+	}
+	changed := make(map[string]string, len(target.Containers))
+	for _, c := range target.Containers {
+		if image, ok := runningImages[c.Name]; ok && image == c.Image {
+			continue
+		}
+		changed[c.Name] = c.Image
+	}
+	return changed
+}
+
+// ContainerRuntimeImageIs reports whether the kubelet reports image for
+// the named container, compared in canonical form.
+func ContainerRuntimeImageIs(pod *corev1.Pod, name, image string) bool {
+	if pod == nil {
+		return false
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == name {
+			return CanonicalImage(cs.Image) == CanonicalImage(image)
+		}
+	}
+	return false
 }
 
 // PodRuntimeImageChangesMatch requires runtime confirmation only for
@@ -60,21 +90,12 @@ func PodRuntimeImageChangesMatch(pod *corev1.Pod, running, target *corev1.PodSpe
 	if pod == nil || target == nil {
 		return false
 	}
-	if running == nil {
-		return podRuntimeImagesMatch(pod, target)
-	}
-	runningImages := make(map[string]string, len(running.Containers))
-	for _, c := range running.Containers {
-		runningImages[c.Name] = c.Image
-	}
-	changed := corev1.PodSpec{}
-	for _, c := range target.Containers {
-		if image, ok := runningImages[c.Name]; ok && image == c.Image {
-			continue
+	for name, image := range ChangedContainerImages(running, target) {
+		if !ContainerRuntimeImageIs(pod, name, image) {
+			return false
 		}
-		changed.Containers = append(changed.Containers, corev1.Container{Name: c.Name, Image: c.Image})
 	}
-	return len(changed.Containers) == 0 || podRuntimeImagesMatch(pod, &changed)
+	return true
 }
 
 // PodImagesMatch returns true when every container in target has a

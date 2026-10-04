@@ -144,7 +144,7 @@ func TestAbandonFailedGangSurge_DeletesStalePodsFirst(t *testing.T) {
 	blockCalls := recordRetryBlockCalls(&input, nil)
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 2, src.RunningRevision, "gang-a-engine-badrev", "pod stuck", true)
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 2, src.RunningRevision, "gang-a-engine-badrev", "pod stuck", workload.CauseWorkload)
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestAbandonFailedGangSurge_ResetsSourceAfterPodsGone(t *testing.T) {
 	blockCalls := recordRetryBlockCalls(&input, nil)
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx, src.RunningRevision, src.TargetRevision, "pod stuck", true)
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx, src.RunningRevision, src.TargetRevision, "pod stuck", workload.CauseWorkload)
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -288,7 +288,7 @@ func TestAbandonFailedGangSurge_RecordsRetryBlockWithPolicy(t *testing.T) {
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
 	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx,
-		src.RunningRevision, src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned"), instanceFailureWorkloadCaused(src))
+		src.RunningRevision, src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned"), instanceFailureCause(src))
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -325,6 +325,13 @@ func TestAbandonFailedGangSurge_RecordsRetryBlockWithPolicy(t *testing.T) {
 // MutateRetryBlock calls and WarnRetryHeld invocations.
 func gangAbandonWave(t *testing.T, t0 time.Time, failure *workload.InstanceTermination, persisted []workload.RetryBlock) (*[]retryBlockCall, *[]retryHeldWarning) {
 	t.Helper()
+	return gangAbandonWaveUnderPolicy(t, t0, failure, persisted, retryTestPolicy())
+}
+
+// gangAbandonWaveUnderPolicy is gangAbandonWave under an explicit retry
+// policy.
+func gangAbandonWaveUnderPolicy(t *testing.T, t0 time.Time, failure *workload.InstanceTermination, persisted []workload.RetryBlock, policy *workload.RetryPolicy) (*[]retryBlockCall, *[]retryHeldWarning) {
+	t.Helper()
 	legacyResetExpectations(t)
 	const isvc, ns = "gang-a", "test-ns"
 	c := legacyNewFakeClient(t) // surge pods already deleted
@@ -345,7 +352,7 @@ func gangAbandonWave(t *testing.T, t0 time.Time, failure *workload.InstanceTermi
 	var removed []int32
 	input := gangAbandonInput(isvc, ns, src, &removed)
 	input.Clock = clocktesting.NewFakeClock(t0)
-	input.UpdateRetryPolicy = retryTestPolicy()
+	input.UpdateRetryPolicy = policy
 	calls := recordRetryBlockCalls(&input, persisted)
 	warns := &[]retryHeldWarning{}
 	input.WarnRetryHeld = func(rev string, attempts int32, reason string) {
@@ -355,7 +362,7 @@ func gangAbandonWave(t *testing.T, t0 time.Time, failure *workload.InstanceTermi
 
 	if _, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx,
 		src.RunningRevision, src.Operation.TargetRevision,
-		instanceFailureReason(src, "gang surge abandoned"), instanceFailureWorkloadCaused(src)); err != nil {
+		instanceFailureReason(src, "gang surge abandoned"), instanceFailureCause(src)); err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
 	if src.Operation != nil || src.Phase != workload.InstancePhaseReady {
@@ -434,42 +441,95 @@ func TestAbandonFailedGangSurge_WorkloadCausedWavesHold(t *testing.T) {
 	}
 }
 
-// TestAbandonFailedGangSurge_EnvironmentCausedWavesNeverHold:
-// DeadlineExceeded evidence (no workload-caused pod) never charges the
-// ladder — however many waves are abandoned, AttemptsStarted stays 0, the
-// block never Holds and no Held warning fires — while each wave still
-// paces the next attempt with the policy's first-rung delay, after which
-// the gate admits it.
-func TestAbandonFailedGangSurge_EnvironmentCausedWavesNeverHold(t *testing.T) {
+// TestAbandonFailedGangSurge_WavesHoldAtMaxAttempts: a wave the
+// revision is not blamed for — DeadlineExceeded evidence with no
+// workload-caused pod, or a crash-looping replacement gang — counts on
+// the one ladder exactly as a workload-caused wave does: AttemptsStarted
+// advances on every abandon, each wave paces the next attempt at its
+// rung and the gate admits it when due, and the wave that reaches
+// MaxAttempts Holds with WarnRetryHeld exactly once. The block records
+// the evidence the abandon carried.
+func TestAbandonFailedGangSurge_WavesHoldAtMaxAttempts(t *testing.T) {
+	cases := []struct {
+		name     string
+		evidence *workload.InstanceTermination
+	}{
+		{"deadline", &workload.InstanceTermination{
+			Reason:  "DeadlineExceeded",
+			Message: "DeadlineExceeded: Update/Surge exceeded InstanceReadyTimeout",
+		}},
+		{"crash loop", &workload.InstanceTermination{PodName: "gang-a-engine-2-leader-0", Reason: "CrashLoopBackOff"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t0 := time.Now()
+			policy := retryTestPolicy()
+			wantReason := instanceFailureReason(&workload.InstanceStatus{LastFailure: tc.evidence}, "")
+			var persisted []workload.RetryBlock
+			for wave := int32(1); wave <= policy.MaxAttempts; wave++ {
+				calls, warns := gangAbandonWave(t, t0, tc.evidence, persisted)
+				if len(*calls) == 0 {
+					t.Fatalf("wave %d: no MutateRetryBlock call", wave)
+				}
+				rec := (*calls)[0]
+				if rec.rev != "gang-a-engine-badrev" || rec.disposition != workload.RetryBlockPersist {
+					t.Fatalf("wave %d: record call got (rev=%q, disposition=%v) want (gang-a-engine-badrev, Persist)", wave, rec.rev, rec.disposition)
+				}
+				if rec.block.AttemptsStarted != wave {
+					t.Errorf("wave %d: AttemptsStarted got %d want %d (every failed attempt counts)", wave, rec.block.AttemptsStarted, wave)
+				}
+				if rec.block.Reason != wantReason {
+					t.Errorf("wave %d: Reason got %q want %q", wave, rec.block.Reason, wantReason)
+				}
+				if wave < policy.MaxAttempts {
+					if rec.block.State != workload.RetryBlockBackoff {
+						t.Fatalf("wave %d: state got %q want Backoff", wave, rec.block.State)
+					}
+					if want := t0.Add(policy.NextRetryDelay(wave)); rec.block.NextRetryAt == nil || !rec.block.NextRetryAt.Time.Equal(want) {
+						t.Errorf("wave %d: NextRetryAt got %v want %v", wave, rec.block.NextRetryAt, want)
+					}
+					if len(*warns) != 0 {
+						t.Errorf("wave %d: WarnRetryHeld got %d calls want 0", wave, len(*warns))
+					}
+					persisted = nextGangAbandonWave(t, rec.block, t0)
+					continue
+				}
+				if rec.block.State != workload.RetryBlockHeld || rec.block.NextRetryAt != nil {
+					t.Errorf("wave %d: got (state=%q, next=%v) want (Held, nil)", wave, rec.block.State, rec.block.NextRetryAt)
+				}
+				if len(*warns) != 1 || (*warns)[0].attempts != policy.MaxAttempts {
+					t.Errorf("wave %d: WarnRetryHeld got %+v want exactly one call with attempts=%d", wave, *warns, policy.MaxAttempts)
+				}
+			}
+		})
+	}
+}
+
+// TestAbandonFailedGangSurge_SchedulerHoldRecordsNoBlock: a replacement
+// gang the scheduler never placed is the environment's failure, not an
+// attempt at the revision. However many such waves are abandoned, no
+// block is persisted, nothing counts and no Held warning fires; the
+// source is still reset for a fresh surge.
+func TestAbandonFailedGangSurge_SchedulerHoldRecordsNoBlock(t *testing.T) {
 	t0 := time.Now()
 	policy := retryTestPolicy()
 	evidence := &workload.InstanceTermination{
-		Reason:  "DeadlineExceeded",
-		Message: "DeadlineExceeded: Update/Surge exceeded InstanceReadyTimeout",
+		PodName: "gang-a-engine-2-leader-0",
+		Reason:  workload.WaitingReasonUnschedulable,
+		Message: workload.WaitingReasonUnschedulable + ": 0/3 nodes are available",
 	}
-	var persisted []workload.RetryBlock
-	for wave := int32(1); wave <= 2*policy.MaxAttempts; wave++ {
-		calls, warns := gangAbandonWave(t, t0, evidence, persisted)
-		if len(*calls) == 0 {
-			t.Fatalf("wave %d: no MutateRetryBlock call", wave)
-		}
-		rec := (*calls)[0]
-		if rec.rev != "gang-a-engine-badrev" || rec.disposition != workload.RetryBlockPersist {
-			t.Fatalf("wave %d: record call got (rev=%q, disposition=%v) want (gang-a-engine-badrev, Persist)", wave, rec.rev, rec.disposition)
-		}
-		if rec.block.State != workload.RetryBlockBackoff || rec.block.AttemptsStarted != 0 {
-			t.Fatalf("wave %d: got (state=%q, attempts=%d) want (Backoff, 0) — environment faults never count toward Held", wave, rec.block.State, rec.block.AttemptsStarted)
-		}
-		if want := t0.Add(policy.InitialDelay); rec.block.NextRetryAt == nil || !rec.block.NextRetryAt.Time.Equal(want) {
-			t.Errorf("wave %d: NextRetryAt got %v want %v (first-rung pacing)", wave, rec.block.NextRetryAt, want)
-		}
-		if rec.block.Reason != evidence.Message {
-			t.Errorf("wave %d: Reason got %q want the deadline evidence", wave, rec.block.Reason)
+	for wave := int32(1); wave <= policy.MaxAttempts+1; wave++ {
+		calls, warns := gangAbandonWave(t, t0, evidence, nil)
+		for _, rec := range *calls {
+			// The reset prunes the source revision's own block; only the
+			// failed target's block is the hold's to leave alone.
+			if rec.rev == "gang-a-engine-badrev" && rec.disposition != workload.RetryBlockUnchanged {
+				t.Fatalf("wave %d: a scheduler hold persisted a block: %+v", wave, rec)
+			}
 		}
 		if len(*warns) != 0 {
-			t.Errorf("wave %d: WarnRetryHeld got %d calls want 0", wave, len(*warns))
+			t.Fatalf("wave %d: WarnRetryHeld got %+v want none", wave, *warns)
 		}
-		persisted = nextGangAbandonWave(t, rec.block, t0)
 	}
 }
 
@@ -586,7 +646,7 @@ func TestAbandonFailedGangSurge_EventReasons(t *testing.T) {
 		plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
 		if _, err := abandonFailedGangSurge(context.Background(), deps, input, plan, 0, surgeIdx,
-			src.RunningRevision, failedTargetRev, "pod stuck", true); err != nil {
+			src.RunningRevision, failedTargetRev, "pod stuck", workload.CauseWorkload); err != nil {
 			t.Fatalf("abandonFailedGangSurge: %v", err)
 		}
 		events := drainRecorderEvents(rec)
@@ -653,7 +713,10 @@ func TestGangSurge_InheritsExcludedNodes(t *testing.T) {
 
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
-	plan.Instances[0].ExcludedNodes = []string{"node-bad-1", "node-bad-2"}
+	plan.Instances[0].ExcludedNodes = []workload.NodeExclusion{
+		{Node: "node-bad-1", Revision: tcr.Name},
+		{Node: "node-bad-2", Revision: tcr.Name},
+	}
 
 	done, err := gangSurgeUpdate(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
 	if err != nil {
@@ -726,14 +789,20 @@ func TestMigrateSurge_InheritsExcludedNodes(t *testing.T) {
 		return nil
 	}
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
-	plan.Instances[0].ExcludedNodes = []string{"node-bad-1", "node-bad-2"}
+	// A migration surge renders the source's running revision, which is
+	// the revision the exclusions were recorded for.
+	runningRevision := ir.Status.InstanceStatuses[0].RunningRevision
+	plan.Instances[0].ExcludedNodes = []workload.NodeExclusion{
+		{Node: "node-bad-1", Revision: runningRevision},
+		{Node: "node-bad-2", Revision: runningRevision},
+	}
 	req := &audit.MigrationRequest{
 		Component: string(workload.ComponentEngine),
 		Instance:  0,
 		FromNode:  "node-from",
 	}
 
-	done, accepted, err := Migrate(context.Background(), legacyTestDeps(c), input, plan, 0, "uuid-mig-1", req)
+	done, accepted, err := Migrate(context.Background(), legacyTestDeps(c), input, plan, nil, 0, "uuid-mig-1", req)
 	if err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
@@ -1276,6 +1345,7 @@ func TestGangSurge_PromotedPinnedTargetRecreatesMissingPodsBeforeNewerRevision(t
 	}
 	c := legacyNewFakeClient(t,
 		gangSurgeReadyRecoveryPod(isvcName, namespace, surgeIndex, "leader", "v1hash"),
+		legacyStoredRevision(t, namespace, committedRevision, input.DesiredSpec.PodSpec, input.DesiredSpec.WorkerPodSpec),
 	)
 	ensureCalls := 0
 	deps := legacyTestDeps(c)
@@ -1704,7 +1774,7 @@ func TestAbandonFailedGangSurge_PersistsCleanupMarkerAcrossRemovalFailure(t *tes
 
 	done, err := abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(c), input, plan, source.Index, surgeIndex,
-		source.RunningRevision, targetRevision, "pod stuck", true,
+		source.RunningRevision, targetRevision, "pod stuck", workload.CauseWorkload,
 	)
 	if !errors.Is(err, statusFailure) || done {
 		t.Fatalf("first pass: done=%v err=%v", done, err)
@@ -1732,7 +1802,7 @@ func TestAbandonFailedGangSurge_PersistsCleanupMarkerAcrossRemovalFailure(t *tes
 	}
 	done, err = abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(c), input, plan, source.Index, surgeIndex,
-		source.RunningRevision, targetRevision, "pod stuck", true,
+		source.RunningRevision, targetRevision, "pod stuck", workload.CauseWorkload,
 	)
 	if err != nil || done {
 		t.Fatalf("retry pass: done=%v err=%v", done, err)
@@ -1783,7 +1853,7 @@ func TestAbandonFailedGangSurge_AbandonGraceBoundsUnservedMembers(t *testing.T) 
 	input := gangInputWithRemove(isvc, c)
 	input.AbandonedReplacementGrace = 7 * time.Second
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 1, v1Name, v2Name, "", false)
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 1, v1Name, v2Name, "", workload.CauseUnattributed)
 	if err != nil || done {
 		t.Fatalf("abandon pass: done=%v err=%v", done, err)
 	}
@@ -1893,7 +1963,7 @@ func TestAbandonFailedGangSurge_AtomicallyRemovesMarkerAndResetsSource(t *testin
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 	done, err := abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(legacyNewFakeClient(t)), input, plan,
-		source.Index, surgeIndex, runningRevision, "", "", false,
+		source.Index, surgeIndex, runningRevision, "", "", workload.CauseUnattributed,
 	)
 	if err != nil || done {
 		t.Fatalf("abandon: done=%v err=%v", done, err)
@@ -2160,7 +2230,7 @@ func atomicAbandonWave(t *testing.T, store *terminalMutationStore, t0 time.Time,
 
 	done, err := abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(legacyNewFakeClient(t)), input, plan, source.Index, surgeIndex,
-		runningRevision, targetRevision, instanceFailureReason(&source, "gang surge abandoned"), instanceFailureWorkloadCaused(&source),
+		runningRevision, targetRevision, instanceFailureReason(&source, "gang surge abandoned"), instanceFailureCause(&source),
 	)
 	if err != nil || done {
 		t.Fatalf("abandon: done=%v err=%v", done, err)
@@ -2176,9 +2246,9 @@ func atomicAbandonWave(t *testing.T, store *terminalMutationStore, t0 time.Time,
 
 // TestAbandonFailedGangSurge_AtomicTailClassifiesFailureCause: the atomic
 // abandon tail applies the same cause attribution as the standalone one.
-// Workload-caused waves charge the ladder inside the atomic write until
-// Held; environment-caused waves pace the next attempt without ever
-// counting, and without a policy leave no block at all.
+// Workload-caused and unattributed waves alike count on the one ladder
+// inside the atomic write until Held; a scheduler hold touches no block;
+// and without a policy an unattributed wave leaves no block at all.
 func TestAbandonFailedGangSurge_AtomicTailClassifiesFailureCause(t *testing.T) {
 	const targetRevision = "gang-abandon-cause-engine-badrev"
 	t0 := time.Now()
@@ -2186,6 +2256,11 @@ func TestAbandonFailedGangSurge_AtomicTailClassifiesFailureCause(t *testing.T) {
 	deadline := &workload.InstanceTermination{
 		Reason:  "DeadlineExceeded",
 		Message: "DeadlineExceeded: Update/Surge exceeded InstanceReadyTimeout",
+	}
+	unschedulable := &workload.InstanceTermination{
+		PodName: "gang-abandon-cause-engine-2-leader-0",
+		Reason:  workload.WaitingReasonUnschedulable,
+		Message: workload.WaitingReasonUnschedulable + ": 0/3 nodes are available",
 	}
 
 	// flipForNextWave models the attempt stamp between waves: the gate
@@ -2228,26 +2303,45 @@ func TestAbandonFailedGangSurge_AtomicTailClassifiesFailureCause(t *testing.T) {
 		}
 	})
 
-	t.Run("environment-caused waves pace without ever holding", func(t *testing.T) {
+	t.Run("unattributed waves hold at MaxAttempts", func(t *testing.T) {
 		store := &terminalMutationStore{ownerUID: "owner-a"}
-		for wave := int32(1); wave <= 2*policy.MaxAttempts; wave++ {
+		for wave := int32(1); wave <= policy.MaxAttempts; wave++ {
 			warnings := atomicAbandonWave(t, store, t0, policy, deadline)
 			block, found := store.retryBlock[targetRevision]
-			if !found || block.State != workload.RetryBlockBackoff || block.AttemptsStarted != 0 || len(warnings) != 0 {
-				t.Fatalf("wave %d: block=%+v found=%v warnings=%d want (Backoff, 0 attempts, no warning)", wave, block, found, len(warnings))
+			if !found || block.AttemptsStarted != wave || block.Reason != deadline.Message {
+				t.Fatalf("wave %d: block=%+v found=%v want AttemptsStarted=%d with the deadline evidence", wave, block, found, wave)
 			}
-			if want := t0.Add(policy.InitialDelay); block.NextRetryAt == nil || !block.NextRetryAt.Time.Equal(want) {
-				t.Fatalf("wave %d: NextRetryAt got %v want %v", wave, block.NextRetryAt, want)
+			if wave < policy.MaxAttempts {
+				if block.State != workload.RetryBlockBackoff || len(warnings) != 0 {
+					t.Fatalf("wave %d: got (state=%q, warnings=%d) want (Backoff, 0)", wave, block.State, len(warnings))
+				}
+				if want := t0.Add(policy.NextRetryDelay(wave)); block.NextRetryAt == nil || !block.NextRetryAt.Time.Equal(want) {
+					t.Fatalf("wave %d: NextRetryAt got %v want %v", wave, block.NextRetryAt, want)
+				}
+				flipForNextWave(t, store)
+				continue
 			}
-			flipForNextWave(t, store)
+			if block.State != workload.RetryBlockHeld || len(warnings) != 1 || warnings[0].attempts != policy.MaxAttempts {
+				t.Fatalf("wave %d: got (state=%q, warnings=%+v) want (Held, one warning with attempts=%d)", wave, block.State, warnings, policy.MaxAttempts)
+			}
 		}
 	})
 
-	t.Run("environment-caused wave without a policy leaves no block", func(t *testing.T) {
+	t.Run("scheduler hold leaves no block", func(t *testing.T) {
+		store := &terminalMutationStore{ownerUID: "owner-a"}
+		for wave := int32(1); wave <= policy.MaxAttempts+1; wave++ {
+			warnings := atomicAbandonWave(t, store, t0, policy, unschedulable)
+			if _, found := store.retryBlock[targetRevision]; found || len(warnings) != 0 {
+				t.Fatalf("wave %d: a scheduler hold must leave no block: blocks=%v warnings=%d", wave, store.retryBlock, len(warnings))
+			}
+		}
+	})
+
+	t.Run("unattributed wave without a policy leaves no block", func(t *testing.T) {
 		store := &terminalMutationStore{ownerUID: "owner-a"}
 		warnings := atomicAbandonWave(t, store, t0, nil, deadline)
 		if _, found := store.retryBlock[targetRevision]; found || len(warnings) != 0 {
-			t.Fatalf("unconfigured policy must not Hold an environment fault: blocks=%v warnings=%d", store.retryBlock, len(warnings))
+			t.Fatalf("unconfigured policy must not Hold an attempt the revision is not blamed for: blocks=%v warnings=%d", store.retryBlock, len(warnings))
 		}
 	})
 }
@@ -2915,5 +3009,118 @@ func TestGangSurgeUpdate_DrainGateHoldsTheSourceGang(t *testing.T) {
 	}
 	if present, serving := srcServing("admitted"); present > 0 && serving > 0 {
 		t.Errorf("an admitted drain must take the source gang out of rotation (present=%d serving=%d)", present, serving)
+	}
+}
+
+// A gang surge that promotes its replacement rebinds every move still
+// pending on its source to the replacement's index before the source is
+// removed, and says so once per move. A move already executing, a
+// terminal one and a move of another Instance are left as they are.
+func TestGangSurge_PromotionRebindsPendingMovesToTheReplacement(t *testing.T) {
+	legacyResetExpectations(t)
+	const isvcName, ns = "gang-c", "test-ns"
+	surgeIdx := int32(2)
+	mkReadyPod := func(runner string) *corev1.Pod {
+		pod := gangSurgePod(isvcName, ns, surgeIdx, runner, "newrev")
+		pod.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()},
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()},
+		}
+		return pod
+	}
+	c := legacyNewFakeClient(t, mkReadyPod("leader"), mkReadyPod("worker"))
+
+	src := &workload.InstanceStatus{
+		Index:           0,
+		Phase:           workload.InstancePhaseUpdating,
+		RunningRevision: "gang-c-engine-oldrev",
+		Operation: &workload.InstanceOperation{
+			Type:           workload.InstanceOperationUpdate,
+			Step:           workload.UpdateStepSurge,
+			SurgeIndex:     &surgeIdx,
+			TargetRevision: "gang-c-engine-newrev",
+		},
+	}
+	var removed []int32
+	input := gangAbandonInput(isvcName, ns, src, &removed)
+	input.ObservedState.InstanceStatuses = []workload.InstanceStatus{
+		*src,
+		{
+			Index:          surgeIdx,
+			Incarnation:    1,
+			Phase:          workload.InstancePhaseCreating,
+			TargetRevision: "gang-c-engine-newrev",
+			Operation: &workload.InstanceOperation{
+				Type:           workload.InstanceOperationUpdate,
+				Step:           workload.UpdateStepGangSurgeTarget,
+				TargetRevision: "gang-c-engine-newrev",
+			},
+		},
+	}
+	executingSurge := int32(1)
+	records := []workload.MigrationRecord{
+		{RequestUUID: "pending", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 0, FromNode: "node-a"},
+		{RequestUUID: "executing", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseSurgePending, SourceInstance: 0, SurgeInstance: &executingSurge},
+		{RequestUUID: "done", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseCompleted, SourceInstance: 0},
+		{RequestUUID: "other", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 1},
+	}
+	input.ObservedState.Migrations = append([]workload.MigrationRecord(nil), records...)
+	removedAtRebind := -1
+	input.MutateMigration = func(_ context.Context, uuid string, mutate func(*workload.MigrationRecord) bool) error {
+		for i := range records {
+			if records[i].RequestUUID != uuid {
+				continue
+			}
+			r := records[i]
+			if mutate(&r) {
+				records[i] = r
+				removedAtRebind = len(removed)
+			}
+			return nil
+		}
+		return nil
+	}
+	input.EventTarget = legacyMinimalISVC(isvcName, ns, 1)
+	rec := record.NewFakeRecorder(16)
+	deps := legacyTestDeps(c)
+	deps.Recorder = rec
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "gang-c-engine-newrev"}}
+
+	done, err := gangSurgeUpdate(context.Background(), deps, input, plan, plan.Instances[0], target)
+	if err != nil {
+		t.Fatalf("gangSurgeUpdate: %v", err)
+	}
+	if !done || len(removed) != 1 || removed[0] != 0 {
+		t.Fatalf("expected the promote pass to finish and remove the source: done=%v removed=%v", done, removed)
+	}
+	if removedAtRebind != 0 {
+		t.Fatalf("the pending move must be rebound before the source is removed; removed %d rows at the time", removedAtRebind)
+	}
+	byUUID := map[string]workload.MigrationRecord{}
+	for _, r := range records {
+		byUUID[r.RequestUUID] = r
+	}
+	if got := byUUID["pending"]; got.SourceInstance != surgeIdx || got.Phase != workload.MigrationPhaseAccepted || got.SurgeInstance != nil || got.FromNode != "node-a" {
+		t.Errorf("the pending move must follow the Instance to index %d, otherwise untouched; got %+v", surgeIdx, got)
+	}
+	if got := byUUID["executing"]; got.SourceInstance != 0 || got.SurgeInstance == nil || *got.SurgeInstance != executingSurge {
+		t.Errorf("a move already executing keeps its source; got %+v", got)
+	}
+	if got := byUUID["done"]; got.SourceInstance != 0 {
+		t.Errorf("a terminal record is left as it is; got %+v", got)
+	}
+	if got := byUUID["other"]; got.SourceInstance != 1 {
+		t.Errorf("a move of another Instance is left as it is; got %+v", got)
+	}
+	events := drainRecorderEvents(rec)
+	rebound := 0
+	for _, e := range events {
+		if strings.Contains(e, string(workload.EventReasonMigrationSourceRebuilt)) {
+			rebound++
+		}
+	}
+	if rebound != 1 {
+		t.Errorf("one event names the rebound move; got %d in %v", rebound, events)
 	}
 }

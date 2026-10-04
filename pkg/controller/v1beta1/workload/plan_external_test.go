@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -103,6 +104,76 @@ func TestPlan_MigrationRequestWaitsForASurgeCycleToResolve(t *testing.T) {
 
 			if a := findAction(d, workload.ActionMigrate); a != nil {
 				t.Fatalf("a migration was driven while the surge is in flight: %+v", a.Migration)
+			}
+		})
+	}
+}
+
+// A scale-down keeps the rows on a sound revision ahead of the rows on a
+// revision the retry ladder reads as failing, whatever the phases say: a
+// Ready row there is the pause between crashes, and keeping it over the
+// running revision's row would land the push by attrition and leave the
+// Component on a revision the ladder has given up on. Within each class
+// the serving rows are kept first, then the oldest index.
+func TestBuildPlan_ScaleDownKeepsARunningRevisionRowOverAFailingRevisionOne(t *testing.T) {
+	const running, pushed = "svc-engine-aaaaaaaa", "svc-engine-bbbbbbbb"
+	now := metav1.Now()
+	earlier := metav1.NewTime(now.Add(-time.Minute))
+	held := []types.RetryBlock{{TargetRevision: pushed, State: types.RetryBlockHeld}}
+	backoff := []types.RetryBlock{{TargetRevision: pushed, State: types.RetryBlockBackoff, NextRetryAt: &now}}
+	readyOn := func(idx int32, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, RunningRevision: rev, PodCount: 1, ServingPodCount: 1, ReadySince: &earlier}
+	}
+	restartingOn := func(idx int32, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseRestarting, RunningRevision: rev, PodCount: 1,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationRestart, Step: types.RestartStepDrain}}
+	}
+	remembering := func(idx int32, rev string) types.InstanceStatus {
+		row := readyOn(idx, rev)
+		row.LastFailure = &types.InstanceTermination{Reason: "CrashLoopBackOff", Time: now}
+		return row
+	}
+	failedToward := func(idx int32, from, to string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseFailed, RunningRevision: from, TargetRevision: to, PodCount: 1}
+	}
+	cases := []struct {
+		name   string
+		rows   []types.InstanceStatus
+		blocks []types.RetryBlock
+		want   []int32
+	}{
+		{"a Ready row on a Held revision leaves before a Restarting row on the running revision",
+			[]types.InstanceStatus{readyOn(0, pushed), restartingOn(1, running)}, held, []int32{1}},
+		{"a Ready row on a Held revision leaves before a Ready row on the running revision whatever the index order",
+			[]types.InstanceStatus{readyOn(0, pushed), readyOn(1, running)}, held, []int32{1}},
+		{"a Backoff block reads the revision the same way",
+			[]types.InstanceStatus{readyOn(0, pushed), restartingOn(1, running)}, backoff, []int32{1}},
+		{"a Ready row remembering the crash a retry in flight answers leaves before one that does not",
+			[]types.InstanceStatus{remembering(0, running), readyOn(1, running)}, []types.RetryBlock{{TargetRevision: running, State: types.RetryBlockRetryInProgress}}, []int32{1}},
+		{"a failure record on a revision with no block does not rank the row down",
+			[]types.InstanceStatus{remembering(0, running), readyOn(1, running)}, nil, []int32{0}},
+		{"a Failed row pinned to the failing revision leaves before a serving row on it",
+			[]types.InstanceStatus{failedToward(0, running, pushed), readyOn(1, pushed)}, held, []int32{1}},
+		{"with every row on the failing revision the serving row is kept",
+			[]types.InstanceStatus{readyOn(0, pushed), restartingOn(1, pushed)}, held, []int32{0}},
+		{"rows on a sound revision keep the oldest index",
+			[]types.InstanceStatus{readyOn(0, running), readyOn(1, running)}, held, []int32{0}},
+		{"an attempt in flight on the revision does not read it as failing",
+			[]types.InstanceStatus{readyOn(0, pushed), readyOn(1, running)}, []types.RetryBlock{{TargetRevision: pushed, State: types.RetryBlockRetryInProgress}}, []int32{0}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			observed := types.WorkloadObservedState{InstanceStatuses: tc.rows, RetryBlocks: tc.blocks}
+			plan, err := workload.BuildPlan(types.ComponentEngine, types.WorkloadDesiredSpec{Replicas: 1}, observed)
+			if err != nil {
+				t.Fatalf("BuildPlan: %v", err)
+			}
+			got := make([]int32, 0, len(plan.Instances))
+			for _, inst := range plan.Instances {
+				got = append(got, inst.Index)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatalf("the plan must keep the running revision's row over a failing revision's (-want +got):\n%s", diff)
 			}
 		})
 	}

@@ -149,6 +149,9 @@ func TestAnalysisLifecycle_FailureAccrualAndPacing(t *testing.T) {
 	s := NewPrometheusSampler(events, 2, time.Hour)
 
 	in, cs := lifecycleInputs(t, s)
+	// The sampler stamps samples from the clock the gate paces by, as in
+	// production; the passes below move that clock across the interval.
+	s.now = func() time.Time { return in.Now }
 	in.Reader = reader
 	in.Prometheus = &v1beta1.AnalysisPrometheus{
 		ServerAddress: prom.srv.URL,

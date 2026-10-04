@@ -35,17 +35,21 @@ func shouldAdvanceManual(isvc *v1beta1.InferenceService, cs *v1beta1.CanaryStatu
 	return v == cs.CanaryRevisionHash && v != cs.PromotedThrough
 }
 
-// shouldAdvanceAuto reports whether a paused step's Pause.Duration has elapsed
-// since the step was entered. A step with no Pause, or a Pause with no Duration,
-// advances immediately.
-func shouldAdvanceAuto(cs *v1beta1.CanaryStatus, step v1beta1.RolloutGroupStep, now time.Time) bool {
+// shouldAdvanceAuto reports whether a timed step's Pause.Duration has
+// elapsed since its soak began: the later of the split first serving and
+// restartedAt, the newest moment a canary pod of the unit died or came back.
+// A canary pod the kubelet or the restart policy brought back has served
+// only since then, so the step moves once that pod has served a full soak;
+// a restart dated before the step is not this step's. A step with no Pause,
+// or a Pause with no Duration, advances immediately.
+func shouldAdvanceAuto(cs *v1beta1.CanaryStatus, step v1beta1.RolloutGroupStep, restartedAt, now time.Time) bool {
 	if step.Pause == nil || step.Pause.Duration == nil {
 		return true
 	}
 	if cs == nil || cs.StepEnteredTime == nil {
 		return false
 	}
-	return !now.Before(cs.StepEnteredTime.Time.Add(step.Pause.Duration.Duration))
+	return !now.Before(laterOf(cs.StepEnteredTime.Time, restartedAt).Add(step.Pause.Duration.Duration))
 }
 
 // stepDecision is the verdict for whether a gated step may move. Manual and Auto
@@ -99,7 +103,7 @@ func evaluateStep(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 	case stepIsAnalysis(step):
 		return evaluateAnalysisStep(ctx, in, step.Analysis, cs, step)
 	case step.Pause != nil && step.Pause.Duration != nil:
-		if shouldAdvanceAuto(cs, step, in.Now) {
+		if shouldAdvanceAuto(cs, step, in.CanaryRestartedAt, in.Now) {
 			return decAdvance
 		}
 		return decHold
@@ -177,7 +181,7 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 		}
 	case analysis.Pass:
 		cs.LastConclusiveEvaluationTime = &metav1.Time{Time: at}
-		if shouldAdvanceAuto(cs, step, in.Now) { // bake window (Pause.Duration) elapsed
+		if shouldAdvanceAuto(cs, step, in.CanaryRestartedAt, in.Now) { // bake window (Pause.Duration) elapsed
 			dec = decAdvance
 		}
 	default: // analysis.Inconclusive

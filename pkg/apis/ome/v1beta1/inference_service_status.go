@@ -66,8 +66,11 @@ type InferenceServiceStatus struct {
 	// +ome:since=v1.3
 	Traffic *TrafficStatus `json:"traffic,omitempty"`
 
-	// Canary tracks an in-progress spec.rollout.canary rollout (the step
-	// state machine). Absent when no canary is running.
+	// Canary mirrors the canary run of the unit that owns the ISVC
+	// entrypoint (the router's when it has one, else the engine's); the
+	// per-unit copy on ComponentStatusSpec.Canary is authoritative. Absent
+	// until a canary first arms; afterwards it carries that unit's most
+	// recent run, a finished one included (see CanaryStatus).
 	// +optional
 	// +ome:since=v1.3
 	Canary *CanaryStatus `json:"canary,omitempty"`
@@ -144,14 +147,17 @@ type ComponentStatusSpec struct {
 	// +ome:since=v1.3
 	Lifecycle *LifecycleStatus `json:"lifecycle,omitempty"`
 
-	// RolloutPhase reflects the current rollout state for this
-	// Component. One of Stable, Canarying,
-	// BlueGreenStandby, Pending, Paused, Promoting, RollingBack,
-	// RolledBack, Failed. Empty when no rollout is in flight on this
-	// Component (also empty for Components on deployment modes without
-	// the rollout contract — e.g. RawDeployment).
+	// RolloutPhase is the canary step machine's state for this Component
+	// when a spec.rollout canary group governs it. One of Stable, Canarying,
+	// Pending, Paused, Promoting, RollingBack, RolledBack, Failed. Written
+	// on the Component the step machine drives (the unit's entrypoint) and
+	// never cleared: it reads Stable between runs, a completed canary
+	// included. Empty for Components no canary group governs
+	// (blueGreen/rollingUpdate groups report under
+	// status.rolloutCoordination) and on deployment modes without the
+	// rollout contract — e.g. RawDeployment.
 	// +optional
-	// +kubebuilder:validation:Enum=Stable;Canarying;BlueGreenStandby;Pending;Paused;Promoting;RollingBack;RolledBack;Failed
+	// +kubebuilder:validation:Enum=Stable;Canarying;Pending;Paused;Promoting;RollingBack;RolledBack;Failed
 	// +ome:since=v1.3
 	RolloutPhase RolloutPhase `json:"rolloutPhase,omitempty"`
 
@@ -195,7 +201,8 @@ type ComponentStatusSpec struct {
 	// belongs to — the router alone, or engine+decoder together. It is
 	// written on the unit's entrypoint Component (the router, or the engine)
 	// and is absent on a secondary, so a reader never sees two copies of one
-	// run. Absent when the unit has no canary running.
+	// run. Absent until the unit's first canary arms; afterwards it carries
+	// the unit's most recent run, a finished one included (see CanaryStatus).
 	//
 	// Units advance independently, which is why the state cannot live in the
 	// single InferenceServiceStatus.Canary: two runs would overwrite each

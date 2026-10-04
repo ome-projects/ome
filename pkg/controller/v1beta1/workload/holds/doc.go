@@ -4,7 +4,8 @@
 //
 // Several authorities outside the workload can stall an operation
 // without anything being wrong with it — admission refusing a create for
-// lack of quota, the scheduler finding no placement, a PodGroup name
+// lack of quota, the apiserver unable to reach an admission webhook for
+// a pod write, the scheduler finding no placement, a PodGroup name
 // still being collected, a node that stopped reporting a pod whose name
 // the operation needs, capacity a provisioner has not readied for a pod
 // the operation withholds, a surge whose source left the rotation, an
@@ -14,9 +15,12 @@
 // carrier: the refusal is an apiserver answer the create site records
 // on the operation, the token is written from that record on the next
 // pass, and the deadline parks on either — so the clock stops on the
-// pass admission said no and stays stopped while the token lingers.
+// pass admission said no and stays stopped while the token lingers. The
+// admission wait is the other answer no later pass can re-ask for: the
+// write site records it as the token itself, with the apiserver's words
+// as evidence, and releases it once a write goes through.
 //
-// Two rules make that safe with seven writers:
+// Two rules make that safe with eight writers:
 //
 //   - RECORD EARLY. The pass runs once per observed row at the top of the
 //     pass, before any verb pass: every token is written as soon as its
@@ -31,5 +35,6 @@
 //     (types.Interruptible), never this package's.
 //
 // The verb passes and the escalation pass READ holds. Nothing outside
-// this package writes one.
+// this package writes one; the write sites that learn of a wait before
+// the pass can report it go through this package's record and release.
 package holds

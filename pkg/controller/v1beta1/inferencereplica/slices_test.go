@@ -9,13 +9,17 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -594,5 +598,231 @@ func TestReportSliceStates_InformerFails(t *testing.T) {
 	awaitReturn(t, startReportSliceStates(ctx, r, informers, c))
 	if got := reportedSliceStates(t); len(got) != 0 {
 		t.Fatalf("reported %v without synced informers, want nothing", got)
+	}
+}
+
+// TestSlicesCarryPodAnnotations pins that the slices provisioned for an
+// InferenceReplica carry the annotations of its own pod template whose keys
+// the configuration lists, and no others.
+func TestSlicesCarryPodAnnotations(t *testing.T) {
+	ctx := context.Background()
+	ir := optedInIR("llama-engine", "prod", 1)
+	ir.Spec.Runners[0].Template.Annotations["example.com/priority"] = "7"
+	ir.Spec.Runners[0].Template.Annotations["example.com/unlisted"] = "x"
+	r, c := newSliceReconciler(t, ir)
+	r.TPUSliceProvisioning.Slice.PodAnnotations = []string{"example.com/priority", "example.com/absent"}
+	for pass := 0; pass < 2; pass++ {
+		r.Expectations = workloadtypes.NewExpectations()
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	p, err := r.sliceProvisioner(ir)
+	if err != nil {
+		t.Fatalf("sliceProvisioner: %v", err)
+	}
+	slice := getSlice(t, c, p.Name(sliceprovision.Slot{Instance: 0}))
+	if slice == nil {
+		t.Fatalf("slices = %v, want the Instance's slice provisioned", sliceNames(t, c))
+	}
+	got := slice.GetAnnotations()
+	if got["example.com/priority"] != "7" {
+		t.Fatalf("slice annotations = %v, want example.com/priority=7 from the pod template", got)
+	}
+	for _, key := range []string{"example.com/unlisted", "example.com/absent"} {
+		if _, ok := got[key]; ok {
+			t.Fatalf("slice annotations = %v, want no %s", got, key)
+		}
+	}
+}
+
+// TestSliceReleaseDeferredIsReported pins that a release kept back by another
+// workload's pods on the slice's hosts is reported on the InferenceReplica,
+// and that the slice survives it.
+func TestSliceReleaseDeferredIsReported(t *testing.T) {
+	ctx := context.Background()
+	ir := optedInIR("llama-engine", "prod", 1)
+	r, c := newSliceReconciler(t, ir)
+	rec := &capturingRecorder{}
+	r.Recorder = rec
+	name := seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+	host := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "host-a", Labels: map[string]string{sliceKeySlice: name}}}
+	holder := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "holder", Namespace: "other"},
+		Spec: corev1.PodSpec{NodeName: "host-a", Containers: []corev1.Container{{
+			Name:      "main",
+			Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{sliceChipResource: resource.MustParse("4")}},
+		}}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	for _, o := range []client.Object{host, holder} {
+		if err := c.Create(ctx, o); err != nil {
+			t.Fatalf("create %s: %v", o.GetName(), err)
+		}
+	}
+	p, err := r.sliceProvisioner(ir)
+	if err != nil {
+		t.Fatalf("sliceProvisioner: %v", err)
+	}
+	complete, err := p.ReleaseAll(ctx)
+	if err != nil || complete {
+		t.Fatalf("ReleaseAll = %v, %v; want the slice kept", complete, err)
+	}
+	if getSlice(t, c, name) == nil {
+		t.Fatal("a slice another workload holds chips on must be kept")
+	}
+	if len(rec.events) != 1 || rec.events[0].reason != string(sliceprovision.EventReasonSliceReleaseDeferred) ||
+		rec.events[0].kind != corev1.EventTypeWarning || !strings.Contains(rec.events[0].message, "other/holder") || rec.events[0].object != ir {
+		t.Fatalf("events = %+v, want one %s warning on the InferenceReplica naming other/holder", rec.events, sliceprovision.EventReasonSliceReleaseDeferred)
+	}
+}
+
+// TestRecoverLostSlices pins the recovery of pods on a slice deleted, or
+// moved off their node, from outside: they are deleted and reported once a
+// live read confirms the cached one, a pod already gone is not an error, and
+// a failed delete is.
+func TestRecoverLostSlices(t *testing.T) {
+	ctx := context.Background()
+	if err := (&Reconciler{}).recoverLostSlices(ctx, nil, workloadtypes.ReconcileInput{}, nil); err != nil {
+		t.Fatalf("a nil pass must recover nothing: %v", err)
+	}
+	failPodDeletes := func(err error) func(*Reconciler, client.WithWatch) {
+		return func(r *Reconciler, c client.WithWatch) {
+			r.Client = interceptor.NewClient(c, interceptor.Funcs{
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if _, ok := obj.(*corev1.Pod); ok {
+						return err
+					}
+					return c.Delete(ctx, obj, opts...)
+				},
+			})
+		}
+	}
+	lostSeries := map[string]string{"slice_type": "type-a", "topology": "2x2x1"}
+	for _, tc := range []struct {
+		name string
+		// lose deletes the slice from outside.
+		lose bool
+		// bound binds the pod to node host-a, which carries the slice's
+		// label when holds is set; partitioned gives the slice partitions.
+		bound, holds, partitioned bool
+		// wire adapts the reconciler, whose reads and writes all serve c.
+		wire      func(*Reconciler, client.WithWatch)
+		wantErr   string
+		wantGone  bool
+		wantEvent bool
+		// wantWhy is how the event says the slice was lost.
+		wantWhy string
+	}{
+		{name: "slice intact"},
+		{name: "slice lost", lose: true, wantGone: true, wantEvent: true, wantWhy: "was deleted"},
+		{name: "slice holds the bound pod's node", bound: true, holds: true, partitioned: true},
+		{
+			name: "slice without partitions under a bound pod", bound: true, holds: true,
+			wantGone: true, wantEvent: true, wantWhy: "lost its partitions",
+		},
+		{
+			name: "slice moved off the bound pod's node", bound: true, partitioned: true,
+			wantGone: true, wantEvent: true, wantWhy: "moved off node host-a",
+		},
+		{
+			name: "cache lags the live slice",
+			wire: func(r *Reconciler, _ client.WithWatch) { r.sliceReader = fake.NewClientBuilder().Build() },
+		},
+		{
+			name: "pod being deleted per the live read",
+			lose: true,
+			wire: func(r *Reconciler, c client.WithWatch) {
+				r.APIReader = interceptor.NewClient(c, interceptor.Funcs{
+					List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+						if err := c.List(ctx, list, opts...); err != nil {
+							return err
+						}
+						if pods, ok := list.(*corev1.PodList); ok {
+							for i := range pods.Items {
+								pods.Items[i].DeletionTimestamp = &metav1.Time{Time: time.Now()}
+							}
+						}
+						return nil
+					},
+				})
+			},
+		},
+		{
+			name:      "pod already gone",
+			lose:      true,
+			wire:      failPodDeletes(apierrors.NewNotFound(corev1.Resource("pods"), "gone")),
+			wantEvent: true,
+		},
+		{
+			name:    "pod delete fails",
+			lose:    true,
+			wire:    failPodDeletes(errors.New("injected pod delete failure")),
+			wantErr: "injected pod delete failure",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ir := optedInIR("llama-engine", "prod", 1)
+			r, c := newSliceReconciler(t, ir)
+			rec := &capturingRecorder{}
+			r.Recorder = rec
+			name := seedSlice(t, r, c, ir, sliceprovision.Slot{Instance: 0}, sliceStateReady)
+			pod := podForIR(ir, 0, "default", 0, true, true)
+			pod.Spec.NodeSelector = map[string]string{sliceKeyAccelerator: "tpu-a", sliceKeyTopology: "2x2x1", sliceKeySlice: name}
+			if tc.bound {
+				pod.Spec.NodeName = "host-a"
+				host := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "host-a", Labels: map[string]string{}}}
+				if tc.holds {
+					host.Labels[sliceKeySlice] = name
+				}
+				if err := c.Create(ctx, host); err != nil {
+					t.Fatalf("create host: %v", err)
+				}
+			}
+			if tc.partitioned {
+				setSlicePartitions(t, c, name, "partition-a")
+			}
+			if err := c.Create(ctx, pod); err != nil {
+				t.Fatalf("create pod: %v", err)
+			}
+			if tc.lose {
+				if err := c.Delete(ctx, getSlice(t, c, name)); err != nil {
+					t.Fatalf("delete slice: %v", err)
+				}
+			}
+			if tc.wire != nil {
+				tc.wire(r, c)
+			}
+			p, err := r.sliceProvisioner(ir)
+			if err != nil {
+				t.Fatalf("sliceProvisioner: %v", err)
+			}
+			before := irStatusMetric(t, "ome_tpu_slice_lost_total", lostSeries)
+
+			err = r.recoverLostSlices(ctx, ir, workloadtypes.ReconcileInput{OwnerObject: ir}, &slicePass{p: p})
+			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("recoverLostSlices error = %v, want %q", err, tc.wantErr)
+			}
+			getErr := c.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{})
+			if gone := apierrors.IsNotFound(getErr); gone != tc.wantGone {
+				t.Fatalf("pod gone = %v (get error %v), want %v", gone, getErr, tc.wantGone)
+			}
+			wantCount := 0.0
+			if tc.wantEvent {
+				wantCount = 1
+				if len(rec.events) != 1 || rec.events[0].reason != string(sliceprovision.EventReasonSliceLost) ||
+					rec.events[0].kind != corev1.EventTypeWarning || rec.events[0].object != ir ||
+					!strings.Contains(rec.events[0].message, name) || !strings.Contains(rec.events[0].message, pod.Name) ||
+					!strings.Contains(rec.events[0].message, tc.wantWhy) {
+					t.Fatalf("events = %+v, want one %s warning on the InferenceReplica naming %s and %s, saying it %s",
+						rec.events, sliceprovision.EventReasonSliceLost, name, pod.Name, tc.wantWhy)
+				}
+			} else if len(rec.events) != 0 {
+				t.Fatalf("events = %+v, want none", rec.events)
+			}
+			if got := irStatusMetric(t, "ome_tpu_slice_lost_total", lostSeries) - before; got != wantCount {
+				t.Fatalf("lost slices counted = %v, want %v", got, wantCount)
+			}
+		})
 	}
 }

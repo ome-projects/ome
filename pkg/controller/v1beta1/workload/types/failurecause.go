@@ -12,10 +12,12 @@ package types
 // cannot self-recover, adding an ambiguous entry pins workloads to
 // dead hardware).
 //
-// This is the one evidence set that charges a revision's RetryBlock
-// ladder toward Held — for the single-attempt disposition (workload
-// root) and the gang-surge abandon (workload/ops) alike. Every other
-// failure reason paces the next attempt without blaming the revision.
+// This is the evidence set that blames the revision outright — for the
+// single-attempt disposition (workload root) and the gang-surge abandon
+// (workload/ops) alike. It does not decide whether a failed attempt
+// counts on the revision's retry ladder (every attempt does, see
+// FailureCause); it decides that no node would do better, so with no
+// ladder configured such a failure Holds the revision at once.
 //
 // Contract table (reason → what it means → why relocation cannot help):
 //
@@ -53,15 +55,19 @@ package types
 // (ReasonContainersNotReady). A repeated process exit or a runtime start
 // rejection can equally be a broken binary (revision fault) or a dead
 // GPU / broken driver / node-local runtime damage (placement fault).
-// For those, a wrong suppression (holding the revision) is an
-// UNBOUNDED loop on dead hardware — the revision is fine, the block
-// never lifts, and nothing relocates the pod — while a wrong migration
-// is RELOCATION-bounded by the operator's autoMigrate.maxAttempts.
-// Operation-specific recovery may retry only when the persisted
-// relocation evidence authorizes it; otherwise it leaves the Instance
-// Failed for operator action. An instance that reaches Ready prunes its
-// AutoRecover records and resets the budget. Ambiguous reasons therefore
-// route to bounded relocation, never to revision blame.
+// Holding the revision on the first such failure would wedge a sound
+// revision on dead hardware — the block never lifts and nothing
+// relocates the pod — so these reasons route to relocation first,
+// bounded by the operator's autoMigrate.maxAttempts. An attempt that
+// ends without a relocation directive is still a failed attempt at the
+// revision and counts on its retry ladder like any other, so a revision
+// that crashes on every start ends Held at updateRetry.maxAttempts
+// rather than retried forever; a wave the relocation directive claimed
+// is not counted a second time. An instance that reaches Ready prunes
+// its AutoRecover records and its block. A revision held for a failure
+// that was the node's after all is released by the operator through the
+// release annotation; a revision that fails on several nodes in a row
+// was not the node's fault.
 var workloadCausedWaitingReasons = map[string]struct{}{
 	"ImagePullBackOff":            {},
 	"ErrImagePull":                {},
@@ -72,9 +78,74 @@ var workloadCausedWaitingReasons = map[string]struct{}{
 
 // IsWorkloadCausedReason reports whether reason — a kubelet waiting
 // reason, or the Reason an escalator recorded on InstanceTermination —
-// is in the workload-caused set. Only such evidence may charge a
-// revision's retry ladder.
+// is in the workload-caused set.
 func IsWorkloadCausedReason(reason string) bool {
 	_, ok := workloadCausedWaitingReasons[reason]
 	return ok
+}
+
+// RepairWaitsOnWorkload reports whether the row is a Restart parked at
+// Failed on a workload-caused failure. The kubelet retries such a cause
+// in place and a fresh pod set would wedge on it identically, so the
+// retry ladder owes the park no re-arm: the row stays Failed with its
+// reason until the configuration or image is fixed, and resumes on its
+// own once the kubelet starts the pod.
+func RepairWaitsOnWorkload(s *InstanceStatus) bool {
+	return s != nil && s.Phase == InstancePhaseFailed &&
+		s.Operation != nil && s.Operation.Type == InstanceOperationRestart &&
+		s.LastFailure != nil && IsWorkloadCausedReason(s.LastFailure.Reason)
+}
+
+// environmentCausedReasons are the failure reasons under which the
+// cluster refused to run the attempt at all: the scheduler found no
+// placement, the gang's deterministic PodGroup name belongs to another
+// controller, or the apiserver could not reach its admission webhook.
+// None says anything about the pod template, and no corrected revision
+// changes any of them, so such a wave never reaches a revision's retry
+// ladder.
+var environmentCausedReasons = map[string]struct{}{
+	WaitingReasonUnschedulable:          {},
+	PodGroupOwnershipConflictReason:     {},
+	RejectionReasonAdmissionUnavailable: {},
+}
+
+// IsEnvironmentCausedReason reports whether reason is one the
+// environment, not the attempt, is responsible for.
+func IsEnvironmentCausedReason(reason string) bool {
+	_, ok := environmentCausedReasons[reason]
+	return ok
+}
+
+// FailureCause is what a failed attempt's evidence says about who is at
+// fault, and so how the wave reaches the target revision's retry ladder
+// (ApplyUpdateFailureToRetryBlock).
+type FailureCause int
+
+const (
+	// CauseUnattributed: the failure could equally be the revision or the
+	// node it ran on — a crash loop, a runtime start rejection, readiness
+	// never reached, a bare elapsed deadline. It is a failed attempt at
+	// the revision and counts on the ladder like any other; with no
+	// ladder configured it is left unrecorded.
+	CauseUnattributed FailureCause = iota
+	// CauseWorkload: the failure travels with the pod template
+	// (IsWorkloadCausedReason), so no node would do better. It counts on
+	// the ladder, and with no ladder configured it Holds at once.
+	CauseWorkload
+	// CauseEnvironment: the cluster refused to run the attempt
+	// (IsEnvironmentCausedReason). It says nothing about the revision and
+	// is never counted.
+	CauseEnvironment
+)
+
+// FailureCauseOf classifies a recorded failure reason — a kubelet waiting
+// reason, or the Reason an escalator stamped on LastFailure.
+func FailureCauseOf(reason string) FailureCause {
+	switch {
+	case IsWorkloadCausedReason(reason):
+		return CauseWorkload
+	case IsEnvironmentCausedReason(reason):
+		return CauseEnvironment
+	}
+	return CauseUnattributed
 }

@@ -7,15 +7,15 @@ package topology
 
 import "sort"
 
-// FreeByDomain maps a domain (the value of the configured topology label) to its
-// count of free whole nodes. Whole-node accounting is the model: a gang pod
-// occupies an entire node, so capacity is just a node count and any free node in
-// a domain is interchangeable (true for an NVLink clique; true for a TPU slice
-// when the gang uses the whole slice).
+// FreeByDomain maps a domain (the value of the configured topology label) to the
+// room it offers a gang, counted in members. A whole-node member takes a node, so
+// for such gangs this is a count of free nodes and any free node in a domain is
+// interchangeable (true for an NVLink clique; true for a TPU slice when the gang
+// uses the whole slice); members that use part of a node may share one.
 type FreeByDomain map[string]int
 
-// BestFit returns the domain that best fits a gang of gangSize whole nodes: the
-// domain with the FEWEST free nodes that still has at least gangSize free. This
+// BestFit returns the domain that best fits a gang of gangSize members: the
+// domain with the LEAST room that still has at least gangSize. This
 // is the packing rule — concentrate work into already-busy domains and keep
 // empty domains whole for future large gangs. Ties (equal free counts) break on
 // domain name so the choice is deterministic and explainable.

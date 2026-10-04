@@ -248,9 +248,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// this manager was down -- loses its series here rather than reporting a
 	// deleted tenant's accelerators forever.
 	sweepBudgets(inTree)
+	retryFleetCapacity := false
 	if r.Project.Enabled() && built.Root != nil {
 		if err := r.reconcileFleetCapacity(ctx, built.Root.Quota.UID); err != nil {
-			errs = append(errs, fmt.Errorf("collecting fleet capacity: %w", err))
+			if apierrors.IsConflict(err) {
+				// Re-read the root and members instead of retrying an aggregate
+				// computed against a stale root version.
+				retryFleetCapacity = true
+			} else {
+				errs = append(errs, fmt.Errorf("collecting fleet capacity: %w", err))
+			}
 		}
 	}
 	if len(errs) > 0 {
@@ -301,6 +308,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if err := r.reconcileCapacity(ctx, built.Root.Quota); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if retryFleetCapacity {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	return ctrl.Result{RequeueAfter: r.nextResync()}, nil
 }

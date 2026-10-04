@@ -553,7 +553,7 @@ func ResetGangSurgeSourceAndRemoveMarker(
 	sourceRunningRev string,
 	failedTargetRev string,
 	failureReason string,
-	workloadCaused bool,
+	cause types.FailureCause,
 ) (bool, error) {
 	if err := RequireOwner(input); err != nil {
 		return false, err
@@ -630,7 +630,7 @@ func ResetGangSurgeSourceAndRemoveMarker(
 		mutateRetryBlock = func(block *types.RetryBlock) types.RetryBlockDisposition {
 			var disposition types.RetryBlockDisposition
 			disposition, heldAttempts = types.ApplyUpdateFailureToRetryBlock(
-				block, input.UpdateRetryPolicy, now, failureReason, workloadCaused,
+				block, input.UpdateRetryPolicy, now, failureReason, cause,
 			)
 			return disposition
 		}

@@ -5,7 +5,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -37,10 +36,7 @@ func (r *Reconciler) peerReplicasOf(ctx context.Context, obj client.Object) []re
 	peers := coordination.ServingPeers(parent, ir.Spec.Component)
 	reqs := make([]reconcile.Request, 0, len(peers))
 	for _, peer := range peers {
-		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
-			Namespace: ir.Namespace,
-			Name:      irprojector.InferenceReplicaName(parent.Name, peer),
-		}})
+		reqs = append(reqs, reconcile.Request{NamespacedName: irprojector.RoleReplicaKey(parent, peer)})
 	}
 	return reqs
 }
@@ -105,7 +101,7 @@ func (r *Reconciler) heldPeerReplicasOf(ctx context.Context, obj client.Object) 
 	}
 	var reqs []reconcile.Request
 	for _, peer := range coordination.ServingPeers(parent, ir.Spec.Component) {
-		key := types.NamespacedName{Namespace: ir.Namespace, Name: irprojector.InferenceReplicaName(parent.Name, peer)}
+		key := irprojector.RoleReplicaKey(parent, peer)
 		sibling := &v1beta1.InferenceReplica{}
 		if err := r.Client.Get(ctx, key, sibling); err != nil {
 			if apierrors.IsNotFound(err) {

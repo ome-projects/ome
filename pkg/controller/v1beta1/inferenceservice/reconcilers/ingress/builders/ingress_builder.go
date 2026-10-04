@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/interfaces"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/utils"
 )
@@ -64,7 +65,7 @@ func (b *IngressBuilder) BuildIngress(ctx context.Context, isvc *v1beta1.Inferen
 	var rules []netv1.IngressRule
 
 	switch {
-	case isvc.Spec.Router != nil:
+	case irprojector.RoleDeclared(isvc, v1beta1.RouterComponent):
 		if !isvc.Status.IsConditionReady(v1beta1.RouterReady) {
 			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
 				Type:   v1beta1.IngressReady,
@@ -79,7 +80,7 @@ func (b *IngressBuilder) BuildIngress(ctx context.Context, isvc *v1beta1.Inferen
 		}
 		rules = append(rules, routerRules...)
 
-	case isvc.Spec.Decoder != nil:
+	case irprojector.RoleDeclared(isvc, v1beta1.DecoderComponent):
 		if !isvc.Status.IsConditionReady(v1beta1.DecoderReady) {
 			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
 				Type:   v1beta1.IngressReady,
@@ -161,7 +162,7 @@ func (b *IngressBuilder) buildRouterRules(ctx context.Context, isvc *v1beta1.Inf
 	rules = append(rules, b.generateRule(engineHost, engineName, "/", enginePort))
 
 	// 4. Component-specific rule for decoder (if decoder exists)
-	if isvc.Spec.Decoder != nil {
+	if irprojector.RoleDeclared(isvc, v1beta1.DecoderComponent) {
 		decoderHost, err := b.generateIngressHost(string(constants.Decoder), false, decoderName, isvc)
 		if err != nil {
 			return nil, fmt.Errorf("failed creating decoder ingress host: %w", err)

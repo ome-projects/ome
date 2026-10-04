@@ -16,18 +16,19 @@ import (
 
 // PairingProtocolForRevision resolves the P/D pairing protocol one revision of
 // one Component was minted under, by reading the annotation (or stored
-// payload) of the ControllerRevision named `<isvc>-<component>-<hash>`.
+// payload) of the ControllerRevision named `<prefix>-<component>-<hash>`,
+// where prefix is the Component's replica prefix (prefixFor).
 //
 // found=false reports a NotFound CR. Callers choose the degrade: traffic /
 // Service-label producers treat it as "" (a swept or pre-pairing revision
 // pairs with anything), while the pair-floor gate fails closed — retention
 // protects every live revision, so a missing CR behind a SERVING instance is
 // an anomaly the gate must not guess about.
-func PairingProtocolForRevision(ctx context.Context, reads client.Reader, namespace, isvcName string, component v1beta1.ComponentType, hash string) (protocol string, found bool, err error) {
+func PairingProtocolForRevision(ctx context.Context, reads client.Reader, namespace, prefix string, component v1beta1.ComponentType, hash string) (protocol string, found bool, err error) {
 	if hash == "" {
 		return "", false, nil
 	}
-	return pairingProtocolForRevisionName(ctx, reads, namespace, fmt.Sprintf("%s-%s-%s", isvcName, component, hash))
+	return pairingProtocolForRevisionName(ctx, reads, namespace, fmt.Sprintf("%s-%s-%s", prefix, component, hash))
 }
 
 // pairingProtocolForRevisionName is PairingProtocolForRevision keyed by the
@@ -48,12 +49,13 @@ func pairingProtocolForRevisionName(ctx context.Context, reads client.Reader, na
 }
 
 // AttachPairingProtocols fills RevisionWeight.PairingProtocol on each weight
-// from its revision's ControllerRevision, so BuildTrafficTargets publishes
-// the cohort token routing consumers pair on. A missing CR yields "" (a swept
-// or pre-pairing revision pairs with anything); read errors propagate.
-func AttachPairingProtocols(ctx context.Context, reads client.Reader, namespace, isvcName string, component v1beta1.ComponentType, weights []RevisionWeight) error {
+// from its revision's ControllerRevision under the Component's replica
+// prefix, so BuildTrafficTargets publishes the cohort token routing
+// consumers pair on. A missing CR yields "" (a swept or pre-pairing revision
+// pairs with anything); read errors propagate.
+func AttachPairingProtocols(ctx context.Context, reads client.Reader, namespace, prefix string, component v1beta1.ComponentType, weights []RevisionWeight) error {
 	for i := range weights {
-		proto, _, err := PairingProtocolForRevision(ctx, reads, namespace, isvcName, component, weights[i].RevisionHash)
+		proto, _, err := PairingProtocolForRevision(ctx, reads, namespace, prefix, component, weights[i].RevisionHash)
 		if err != nil {
 			return err
 		}
@@ -150,7 +152,7 @@ func (ctx GateContext) CheckPairing(strategy workloadtypes.UpdateStrategyType, i
 	transition := false
 	for _, comp := range pairingComponents {
 		serving[comp] = map[string]int32{}
-		ir, _, err := irprojector.DecodedComponentIR(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, ctx.ISVC.Name, comp)
+		ir, _, err := irprojector.DecodedComponentIRFor(ctx.Ctx, ctx.Reads, ctx.ISVC, comp)
 		if err != nil {
 			return false, fmt.Sprintf("pairing gate: cannot read %s IR status, failing closed: %v", comp, err)
 		}

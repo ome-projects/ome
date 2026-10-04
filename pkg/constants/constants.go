@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/types"
@@ -233,7 +234,29 @@ var (
 	// the IR's generation, which only moves when the projected spec
 	// itself changes.
 	InferenceReplicaParentGenerationAnnotationKey = OMEAPIGroupName + "/parent-generation"
+
+	// InferenceReplicaComposedFieldsAnnotationKey records the rollout-control
+	// fields an InferenceService holds on a replica it references without
+	// projecting it. The admission webhook lets only the configured
+	// controller identity add, change or remove it. With no identity
+	// configured the webhook recognizes the controller by the
+	// controller-write annotation, which the projector stamps only on the
+	// replicas it projects, so in that mode no InferenceService can take or
+	// release rollout control on a referenced replica.
+	InferenceReplicaComposedFieldsAnnotationKey = OMEAPIGroupName + "/composed-fields"
 )
+
+// inferenceReplicaComposedFieldNames are the rollout-control fields an
+// InferenceService may write on a replica it references, spelled as the
+// composed-fields annotation value and admission messages list them.
+var inferenceReplicaComposedFieldNames = []string{"pacing.partition", "paused", "pauseMode", "pacing.rollbackToRevision", "pairingProtocol"}
+
+// InferenceReplicaComposedFieldNames returns a copy of the rollout-control
+// field names an InferenceService may write on a replica it references, so
+// no caller can edit the shared list.
+func InferenceReplicaComposedFieldNames() []string {
+	return slices.Clone(inferenceReplicaComposedFieldNames)
+}
 
 // Label Constants
 var (

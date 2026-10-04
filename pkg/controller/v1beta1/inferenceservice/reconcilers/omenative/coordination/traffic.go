@@ -46,8 +46,9 @@ type RevisionWeight struct {
 // BuildTrafficTargets converts a sorted weight list into the
 // Status.Components.<c>.Traffic[] entries the HTTPRoute weighted-
 // backendRef consumer reads. The writer fills RevisionName with the
-// per-revision Service name (`<isvc>-<component>-rev-<hash>`) so the
-// consumer can use it directly as a backend reference.
+// per-revision Service name (`<prefix>-<component>-rev-<hash>`, prefix
+// being the Component's replica prefix) so the consumer can use it
+// directly as a backend reference.
 //
 // Weights naming the same revision are merged into one target, summing
 // their percent. That list is +listType=map +listMapKey=revisionName, so
@@ -63,7 +64,7 @@ type RevisionWeight struct {
 // already serving, so canary and stable carry the same hash while the step
 // weight is still strictly between 0 and 100 and neither entry is dropped by
 // the Percent<=0 filter below.
-func BuildTrafficTargets(isvcName string, component v1beta1.ComponentType, weights []RevisionWeight) []v1beta1.ComponentTrafficTarget {
+func BuildTrafficTargets(prefix string, component v1beta1.ComponentType, weights []RevisionWeight) []v1beta1.ComponentTrafficTarget {
 	if len(weights) == 0 {
 		return nil
 	}
@@ -73,7 +74,7 @@ func BuildTrafficTargets(isvcName string, component v1beta1.ComponentType, weigh
 		if w.Percent <= 0 || w.RevisionHash == "" {
 			continue
 		}
-		name := PerRevisionServiceName(isvcName, component, w.RevisionHash)
+		name := PerRevisionServiceName(prefix, component, w.RevisionHash)
 		if i, ok := at[name]; ok {
 			out[i].Percent += w.Percent
 			// The latest-revision weight owns the merged target's cosmetic
@@ -318,4 +319,51 @@ func absInt32(v int32) int32 {
 		return -v
 	}
 	return v
+}
+
+// SetLatestReadyRevision publishes revisionHash's per-revision Service name
+// under the Component's replica prefix as the Component's
+// LatestReadyRevision: the most recent revision whose pods reached Ready.
+// It leads LatestRolledoutRevision while a rollout is in flight and equals
+// it once the rollout completes. Reports whether the status changed.
+func SetLatestReadyRevision(cs *v1beta1.ComponentStatusSpec, prefix string, component v1beta1.ComponentType, revisionHash string) bool {
+	if revisionHash == "" {
+		return false
+	}
+	name := PerRevisionServiceName(prefix, component, revisionHash)
+	if cs.LatestReadyRevision == name {
+		return false
+	}
+	cs.LatestReadyRevision = name
+	return true
+}
+
+// RecordRolledOutRevision publishes revisionHash's per-revision Service name
+// under the Component's replica prefix as the Component's
+// LatestRolledoutRevision, the revision that fully owns its traffic, and
+// demotes the revision it supersedes to PreviousRolledoutRevision:
+// supersededHash when the writer knows which revision owned the traffic
+// before, else the prior LatestRolledoutRevision. Recording the current
+// LatestRolledoutRevision again changes nothing, so Previous never collapses
+// onto Latest. Every OMENative writer of these fields goes through here,
+// coordination for the Components it owns and the canary executor for the
+// members of its groups, so one Component has one writer and both writers
+// keep one meaning. Reports whether the status changed.
+func RecordRolledOutRevision(cs *v1beta1.ComponentStatusSpec, prefix string, component v1beta1.ComponentType, revisionHash, supersededHash string) bool {
+	if revisionHash == "" {
+		return false
+	}
+	name := PerRevisionServiceName(prefix, component, revisionHash)
+	if cs.LatestRolledoutRevision == name {
+		return false
+	}
+	previous := cs.LatestRolledoutRevision
+	if supersededHash != "" {
+		previous = PerRevisionServiceName(prefix, component, supersededHash)
+	}
+	if previous != "" && previous != name {
+		cs.PreviousRolledoutRevision = previous
+	}
+	cs.LatestRolledoutRevision = name
+	return true
 }

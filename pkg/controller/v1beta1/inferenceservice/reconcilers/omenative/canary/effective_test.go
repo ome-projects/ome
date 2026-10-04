@@ -26,7 +26,8 @@ func mixedUnitCanaryISVC(steps []v1beta1.RolloutGroupStep) *v1beta1.InferenceSer
 // The group's run state lives under its primary. Every member's partition
 // must follow that state, or the members of the other unit stay at step 0's
 // capacity while the primary advances and the next step's capacity gate never
-// passes.
+// passes. At the 100% step each member holds its last stable instance, the
+// held floor, until the sentinel releases it.
 func TestEffectivePartition_MembersFollowTheGroupPrimaryStep(t *testing.T) {
 	isvc := mixedUnitCanaryISVC(twoStep())
 	rollout.SetCanaryStatusFor(&isvc.Status, v1beta1.RouterComponent, &v1beta1.CanaryStatus{
@@ -39,8 +40,8 @@ func TestEffectivePartition_MembersFollowTheGroupPrimaryStep(t *testing.T) {
 		if !ok || p == nil {
 			t.Fatalf("%s: expected a canary partition", c)
 		}
-		if *p != 0 {
-			t.Errorf("%s: partition %d at the 100%% step, want 0; the member is held at step 0's capacity", c, *p)
+		if *p != 1 {
+			t.Errorf("%s: partition %d at the 100%% step, want 1; the member is held at step 0's capacity", c, *p)
 		}
 	}
 }

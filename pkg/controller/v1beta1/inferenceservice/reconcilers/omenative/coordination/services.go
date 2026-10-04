@@ -15,9 +15,19 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
+
+// prefixFor is the name prefix of the replica serving role c: the service
+// name for a projected role, the replica name for a referenced one. The
+// role's pods carry it in the ome.io/inferenceservice label, and its
+// per-revision Services and ControllerRevisions derive their names from it,
+// so every per-revision object coordination names or selects is keyed on it.
+func prefixFor(isvc *v1beta1.InferenceService, c v1beta1.ComponentType) string {
+	return irprojector.RoleReplicaPrefix(isvc, c)
+}
 
 // servingPortName is the container-port NAME a runtime uses to mark its
 // customer-traffic listener. It is a Kubernetes naming convention, not a
@@ -43,17 +53,19 @@ var isvcGroupVersionKind = v1beta1.SchemeGroupVersion.WithKind("InferenceService
 
 // PerRevisionService describes the routing + headless pair OMENative creates
 // per (component, revisionHash). Both share the revision selector; routing may
-// add leader and ordinal filters.
+// add leader and ordinal filters. Names start with the Component's replica
+// prefix (prefixFor), which is the InferenceService name for a projected
+// role and the replica name for a referenced one.
 type PerRevisionService struct {
 	// RoutingName is the ClusterIP Service name —
-	// `<isvc>-<component>-rev-<hash>`. Used as the backend target by
+	// `<prefix>-<component>-rev-<hash>`. Used as the backend target by
 	// the HTTPRoute weighted-backendRef consumer. Empty when
 	// EnsurePerRevisionServices skipped the routing Service because the
 	// Component's serving template declares no container port.
 	RoutingName string
 
 	// HeadlessName is the headless Service name —
-	// `<isvc>-<component>-rev-<hash>-headless`. Used for pod-level
+	// `<prefix>-<component>-rev-<hash>-headless`. Used for pod-level
 	// DNS within the revision (multi-node tensor-parallel groups need
 	// per-pod addressability among one revision's pods).
 	HeadlessName string
@@ -67,27 +79,28 @@ type RevisionRoutingSelector struct {
 }
 
 // PerRevisionServiceName returns the per-revision Service name for one
-// (component, revisionHash) pair. Format: `<isvc>-<component>-rev-<hash>`,
-// bounded to the DNS1035 label limit. Delegates to the workload/query
-// copy so the coordination-created name and the dispatch-path lookup
-// (workload/ops) are always byte-identical.
-func PerRevisionServiceName(isvcName string, component v1beta1.ComponentType, revisionHash string) string {
-	return query.PerRevisionServiceName(isvcName, workload.ComponentType(component), revisionHash)
+// (component, revisionHash) pair. Format: `<prefix>-<component>-rev-<hash>`,
+// bounded to the DNS1035 label limit; prefix is the Component's replica
+// prefix (prefixFor). Delegates to the workload/query copy so the
+// coordination-created name and the dispatch-path lookup (workload/ops)
+// are always byte-identical.
+func PerRevisionServiceName(prefix string, component v1beta1.ComponentType, revisionHash string) string {
+	return query.PerRevisionServiceName(prefix, workload.ComponentType(component), revisionHash)
 }
 
 // PerRevisionHeadlessServiceName returns the per-revision headless
-// Service name. Format: `<isvc>-<component>-rev-<hash>-headless`, bounded
-// to the DNS1035 label limit.
-func PerRevisionHeadlessServiceName(isvcName string, component v1beta1.ComponentType, revisionHash string) string {
-	return query.PerRevisionHeadlessServiceName(isvcName, workload.ComponentType(component), revisionHash)
+// Service name. Format: `<prefix>-<component>-rev-<hash>-headless`,
+// bounded to the DNS1035 label limit.
+func PerRevisionHeadlessServiceName(prefix string, component v1beta1.ComponentType, revisionHash string) string {
+	return query.PerRevisionHeadlessServiceName(prefix, workload.ComponentType(component), revisionHash)
 }
 
 // PerRevisionServiceNames returns the routing + headless names for a
 // (component, revisionHash) pair.
-func PerRevisionServiceNames(isvcName string, component v1beta1.ComponentType, revisionHash string) PerRevisionService {
+func PerRevisionServiceNames(prefix string, component v1beta1.ComponentType, revisionHash string) PerRevisionService {
 	return PerRevisionService{
-		RoutingName:  PerRevisionServiceName(isvcName, component, revisionHash),
-		HeadlessName: PerRevisionHeadlessServiceName(isvcName, component, revisionHash),
+		RoutingName:  PerRevisionServiceName(prefix, component, revisionHash),
+		HeadlessName: PerRevisionHeadlessServiceName(prefix, component, revisionHash),
 	}
 }
 
@@ -116,7 +129,8 @@ func BuildPerRevisionRoutingService(isvc *v1beta1.InferenceService, component v1
 	if err != nil {
 		return nil, err
 	}
-	labels := perRevisionServiceSelector(isvc.Name, component, revisionHash)
+	prefix := prefixFor(isvc, component)
+	labels := perRevisionServiceSelector(prefix, component, revisionHash)
 	selector := labels
 	if routing.LeaderOnly {
 		selector = make(map[string]string, len(labels)+2)
@@ -132,7 +146,7 @@ func BuildPerRevisionRoutingService(isvc *v1beta1.InferenceService, component v1
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      PerRevisionServiceName(isvc.Name, component, revisionHash),
+			Name:      PerRevisionServiceName(prefix, component, revisionHash),
 			Namespace: isvc.Namespace,
 			Labels:    labels,
 			OwnerReferences: []metav1.OwnerReference{
@@ -217,10 +231,11 @@ func BuildPerRevisionHeadlessService(isvc *v1beta1.InferenceService, component v
 	if revisionHash == "" {
 		return nil, fmt.Errorf("empty revisionHash")
 	}
-	selector := perRevisionServiceSelector(isvc.Name, component, revisionHash)
+	prefix := prefixFor(isvc, component)
+	selector := perRevisionServiceSelector(prefix, component, revisionHash)
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      PerRevisionHeadlessServiceName(isvc.Name, component, revisionHash),
+			Name:      PerRevisionHeadlessServiceName(prefix, component, revisionHash),
 			Namespace: isvc.Namespace,
 			Labels:    selector,
 			OwnerReferences: []metav1.OwnerReference{
@@ -237,13 +252,14 @@ func BuildPerRevisionHeadlessService(isvc *v1beta1.InferenceService, component v
 }
 
 // perRevisionServiceSelector is the label set per-revision Services
-// use as their .spec.selector. The revision-hash label narrows the
-// selector to one ControllerRevision's pods; the OMENative-managed
-// label keeps the selector from picking up legacy pods on the
-// same Component.
-func perRevisionServiceSelector(isvcName string, component v1beta1.ComponentType, revisionHash string) map[string]string {
+// use as their .spec.selector. The inferenceservice label carries the
+// Component's replica prefix, which is what its pods are labelled with;
+// the revision-hash label narrows the selector to one ControllerRevision's
+// pods; the OMENative-managed label keeps the selector from picking up
+// legacy pods on the same Component.
+func perRevisionServiceSelector(prefix string, component v1beta1.ComponentType, revisionHash string) map[string]string {
 	return map[string]string{
-		constants.InferenceServicePodLabelKey: isvcName,
+		constants.InferenceServicePodLabelKey: prefix,
 		constants.OMEComponentLabel:           string(component),
 		query.LabelRevisionHash:               revisionHash,
 		query.LabelManagedBy:                  query.ManagedByOMENative,
@@ -269,7 +285,8 @@ func perRevisionServiceSelector(isvcName string, component v1beta1.ComponentType
 // one Component's missing port declaration must not wedge the rest of the
 // InferenceService.
 func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort) (PerRevisionService, error) {
-	out := PerRevisionServiceNames(isvc.Name, component, revisionHash)
+	prefix := prefixFor(isvc, component)
+	out := PerRevisionServiceNames(prefix, component, revisionHash)
 	if c == nil {
 		return out, fmt.Errorf("EnsurePerRevisionServices: nil client")
 	}
@@ -279,16 +296,16 @@ func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1bet
 	// based) so routing consumers can pair engine/decoder Services without
 	// decoding revisions. A missing CR degrades to no label (pairs with
 	// anything); the label is drift-corrected on every ensure.
-	protocol, _, perr := PairingProtocolForRevision(ctx, c, isvc.Namespace, isvc.Name, component, revisionHash)
+	protocol, _, perr := PairingProtocolForRevision(ctx, c, isvc.Namespace, prefix, component, revisionHash)
 	if perr != nil {
 		return out, perr
 	}
 	routingBuild := perRevisionRoutingBuilder(protocol, routing, runnerPorts)
 	switch err := ensureService(ctx, c, isvc, routingBuild, component, revisionHash, out.RoutingName, false); {
 	case errors.Is(err, ErrNoServingPort):
-		out.RoutingName = ""
 		log.FromContext(ctx).Info("Skipping per-revision routing Service: component serving template declares no container port",
-			"component", component, "revisionHash", revisionHash, "service", PerRevisionServiceName(isvc.Name, component, revisionHash))
+			"component", component, "revisionHash", revisionHash, "service", out.RoutingName)
+		out.RoutingName = ""
 	case err != nil:
 		return out, err
 	}
@@ -315,11 +332,12 @@ func CreatePerRevisionServicesIfAbsent(ctx context.Context, c client.Client, isv
 	if isvc == nil || revisionHash == "" {
 		return nil
 	}
-	protocol, _, perr := PairingProtocolForRevision(ctx, c, isvc.Namespace, isvc.Name, component, revisionHash)
+	prefix := prefixFor(isvc, component)
+	protocol, _, perr := PairingProtocolForRevision(ctx, c, isvc.Namespace, prefix, component, revisionHash)
 	if perr != nil {
 		return perr
 	}
-	names := PerRevisionServiceNames(isvc.Name, component, revisionHash)
+	names := PerRevisionServiceNames(prefix, component, revisionHash)
 	routingBuild := perRevisionRoutingBuilder(protocol, routing, runnerPorts)
 	if err := createServiceIfAbsent(ctx, c, isvc, routingBuild, component, revisionHash, names.RoutingName); err != nil && !errors.Is(err, ErrNoServingPort) {
 		return err
@@ -473,14 +491,15 @@ func isNamespaceTerminating(err error) bool {
 }
 
 // GCPerRevisionServices deletes both per-revision Services for one
-// (component, revisionHash). Called when the revision is past
-// retention AND no live pod carries the hash. NotFound is treated as
-// success — the caller may invoke GC on stale entries.
-func GCPerRevisionServices(ctx context.Context, c client.Client, namespace, isvcName string, component v1beta1.ComponentType, revisionHash string) error {
+// (component, revisionHash) under the Component's replica prefix. Called
+// when the revision is past retention AND no live pod carries the hash.
+// NotFound is treated as success — the caller may invoke GC on stale
+// entries.
+func GCPerRevisionServices(ctx context.Context, c client.Client, namespace, prefix string, component v1beta1.ComponentType, revisionHash string) error {
 	if c == nil {
 		return fmt.Errorf("GCPerRevisionServices: nil client")
 	}
-	names := PerRevisionServiceNames(isvcName, component, revisionHash)
+	names := PerRevisionServiceNames(prefix, component, revisionHash)
 	for _, name := range []string{names.RoutingName, names.HeadlessName} {
 		svc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{

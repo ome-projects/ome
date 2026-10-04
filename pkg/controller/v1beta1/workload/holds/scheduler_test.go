@@ -102,3 +102,29 @@ func TestScheduler_RecordsAndReleasesTheHold(t *testing.T) {
 		}
 	})
 }
+
+// TestScheduler_HoldsTheRecreateWhoseReplacementHasNoPlacement: a roll
+// that deleted an Instance's pod and cannot place the replacement — the
+// room went to a higher-priority pod in between — waits on the scheduler
+// exactly like a first create: the Update row reports the token with the
+// scheduler's message in the pass that observes the pod.
+func TestScheduler_HoldsTheRecreateWhoseReplacementHasNoPlacement(t *testing.T) {
+	since := metav1.NewTime(time.Now().Add(-time.Minute))
+	pod := unschedulablePod("svc-a-engine-1-default-0", schedulerMessage, since)
+	row := types.InstanceStatus{
+		Index:           1,
+		Phase:           types.InstancePhaseUpdating,
+		PodCount:        1,
+		RunningRevision: "svc-a-engine-aaaaaaaa",
+		Operation:       operation("update-1", types.InstanceOperationUpdate, "Drain", ""),
+	}
+	store, in := newStore(row)
+	apply(t, in, types.ComponentPlan{}, map[int32][]*corev1.Pod{1: {pod}})
+	if got := store.waiting(1); got != types.WaitingReasonUnschedulable {
+		t.Errorf("waiting = %q, want %q on the recreate row", got, types.WaitingReasonUnschedulable)
+	}
+	lf := store.lastFailure(1)
+	if lf == nil || lf.Message != schedulerMessage || lf.PodName != pod.Name {
+		t.Errorf("lastFailure = %+v, want the scheduler's message on the unplaceable replacement", lf)
+	}
+}

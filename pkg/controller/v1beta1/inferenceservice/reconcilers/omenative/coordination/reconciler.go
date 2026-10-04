@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/rollout"
@@ -425,7 +426,7 @@ func observePerRevisionPods(ctx context.Context, reads client.Reader, isvc *v1be
 		return total, ready, routing, observedPods, nil
 	}
 	for _, c := range components {
-		pods, err := query.ListOMENativePodsByName(ctx, reads, isvc.Namespace, isvc.Name, v1beta1convert.ComponentTypeToWorkload(c), useIndex)
+		pods, err := query.ListOMENativePodsByName(ctx, reads, isvc.Namespace, prefixFor(isvc, c), v1beta1convert.ComponentTypeToWorkload(c), useIndex)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("list pods for %s/%s: %w", isvc.Namespace, c, err)
 		}
@@ -463,11 +464,20 @@ func observePerRevisionPods(ctx context.Context, reads client.Reader, isvc *v1be
 }
 
 // podReadyAndServing reports whether a pod is currently serving traffic: Running,
-// not being deleted, and reporting the PodReady condition True. Pods without a
-// readiness probe are marked Ready by the kubelet once their containers start, so
-// this holds for both real runtimes and probe-less test fixtures.
+// not being deleted, not held out of rotation by the controller's serving gate,
+// and reporting the PodReady condition True. Pods without a readiness probe are
+// marked Ready by the kubelet once their containers start, so this holds for
+// both real runtimes and probe-less test fixtures.
+//
+// The gate is read in its own right, not only through PodReady: every drain
+// holds it False first, kubelet folds the hold into PodReady asynchronously,
+// and the pass that observes the hold must already stop publishing the
+// drained revision as live traffic.
 func podReadyAndServing(pod *corev1.Pod) bool {
 	if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	if podreadiness.HeldNotServing(pod) {
 		return false
 	}
 	for _, cond := range pod.Status.Conditions {
@@ -480,8 +490,9 @@ func podReadyAndServing(pod *corev1.Pod) bool {
 
 // dropCanaryOwned removes Components driven by a canary group from comps. Those
 // Components, the group's primary and its secondaries alike, belong to the
-// canary engine (canary.Dispatch), which owns their per-revision Services and
-// traffic status; coordination must not touch them.
+// canary engine (canary.Dispatch), which owns their per-revision Services,
+// traffic status and rolled-out revision fields; coordination must not touch
+// them.
 func dropCanaryOwned(comps []v1beta1.ComponentType, isvc *v1beta1.InferenceService) []v1beta1.ComponentType {
 	owned := rollout.CanaryOwnedComponents(isvc)
 	if len(owned) == 0 {
@@ -513,15 +524,16 @@ func updateTrafficStatus(ctx context.Context, reads client.Reader, isvc *v1beta1
 		for _, n := range hashes {
 			total += n
 		}
-		latestHash, err := latestRevisionHashChecked(ctx, reads, isvc.Namespace, isvc.Name, c)
+		latestHash, err := latestRevisionHashChecked(ctx, reads, isvc, c)
 		if err != nil {
 			return err
 		}
 		weights := ComputeWeightsFromPods(hashes, total, latestHash)
-		if err := AttachPairingProtocols(ctx, reads, isvc.Namespace, isvc.Name, c, weights); err != nil {
+		prefix := prefixFor(isvc, c)
+		if err := AttachPairingProtocols(ctx, reads, isvc.Namespace, prefix, c, weights); err != nil {
 			return err
 		}
-		traffic := BuildTrafficTargets(isvc.Name, c, weights)
+		traffic := BuildTrafficTargets(prefix, c, weights)
 		cs := isvc.Status.Components[c]
 		changed := false
 		// The deadband suppresses pod-count jitter without suppressing
@@ -533,26 +545,15 @@ func updateTrafficStatus(ctx context.Context, reads client.Reader, isvc *v1beta1
 		}
 		// Revision metadata is reconciled independently from traffic weights so
 		// an already-correct traffic split cannot strand stale companion fields.
-		if latestHash != "" && hashes[latestHash] > 0 {
-			latestReady := PerRevisionServiceName(isvc.Name, c, latestHash)
-			if cs.LatestReadyRevision != latestReady {
-				cs.LatestReadyRevision = latestReady
-				changed = true
-			}
+		if latestHash != "" && hashes[latestHash] > 0 && SetLatestReadyRevision(&cs, prefix, c, latestHash) {
+			changed = true
 		}
-		// LatestRolledoutRevision advances to the per-revision Service
-		// name once the rollout is at 100% on a single revision. The
-		// prior value is demoted to PreviousRolledoutRevision on a real
-		// advance so consumers can identify the immediately-prior
-		// rolled-out revision during diagnosis and partial rollbacks.
+		// LatestRolledoutRevision advances once the rollout is at 100% on a
+		// single revision; the pod view knows no superseded revision, so the
+		// prior value is the one demoted to PreviousRolledoutRevision.
 		if len(hashes) == 1 {
 			for hash := range hashes {
-				rolledOut := PerRevisionServiceName(isvc.Name, c, hash)
-				if cs.LatestRolledoutRevision != rolledOut {
-					if cs.LatestRolledoutRevision != "" {
-						cs.PreviousRolledoutRevision = cs.LatestRolledoutRevision
-					}
-					cs.LatestRolledoutRevision = rolledOut
+				if RecordRolledOutRevision(&cs, prefix, c, hash, "") {
 					changed = true
 				}
 			}
@@ -569,8 +570,8 @@ func updateTrafficStatus(ctx context.Context, reads client.Reader, isvc *v1beta1
 // status UpdateRevision; falls back to CurrentRevision. A read error
 // propagates — writing traffic with a fabricated empty latest hash
 // would flip LatestRevision flags on the HTTPRoute consumer.
-func latestRevisionHashChecked(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (string, error) {
-	summary, err := irprojector.ComponentIRStatus(ctx, reads, namespace, isvcName, c)
+func latestRevisionHashChecked(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (string, error) {
+	summary, err := irprojector.ComponentIRStatusFor(ctx, reads, isvc, c)
 	if err != nil {
 		return "", err
 	}
@@ -598,7 +599,7 @@ func buildGroupObservation(ctx context.Context, reads client.Reader, isvc *v1bet
 		Components: make(map[v1beta1.ComponentType]ComponentObservation, len(g.Components)),
 	}
 	for _, c := range g.Components {
-		summary, err := irprojector.DecodedComponentIRStatus(ctx, reads, isvc.Namespace, isvc.Name, c)
+		summary, err := irprojector.DecodedComponentIRStatusFor(ctx, reads, isvc, c)
 		if err != nil {
 			return GroupObservation{}, err
 		}
@@ -611,7 +612,7 @@ func buildGroupObservation(ctx context.Context, reads client.Reader, isvc *v1bet
 		// Canary-owned Components never reach this loop (their hold is the
 		// projected pacing partition, driven by the canary reconciler's own
 		// EffectivePartition path).
-		partition, err := irprojector.ComponentIRPartition(ctx, reads, isvc.Namespace, isvc.Name, c)
+		partition, err := irprojector.ComponentIRPartitionFor(ctx, reads, isvc, c)
 		if err != nil {
 			return GroupObservation{}, err
 		}
@@ -709,7 +710,7 @@ func sumPodCounts(in map[string]int32) int32 {
 // ahead of the pods that name them. Returns liveHashes as-is when the IR
 // reports no target yet.
 func retainedRevisionHashes(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, liveHashes map[string]int32) (map[string]int32, error) {
-	target, err := latestRevisionHashChecked(ctx, reads, isvc.Namespace, isvc.Name, component)
+	target, err := latestRevisionHashChecked(ctx, reads, isvc, component)
 	if err != nil {
 		return nil, err
 	}
@@ -731,8 +732,9 @@ func retainedRevisionHashes(ctx context.Context, reads client.Reader, isvc *v1be
 // whose revision-hash is not in `liveHashes` for `component`.
 //
 // The sweep lists Services in the ISVC's namespace that carry the
-// (inferenceservice + component + revision-hash) selector keys, then
-// drops every pair whose revision-hash isn't in `liveHashes`.
+// (inferenceservice + component + revision-hash) selector keys under the
+// Component's replica prefix, then drops every pair whose revision-hash
+// isn't in `liveHashes`.
 //
 // Idempotent: deleting an already-deleted Service is a NotFound
 // success per GCPerRevisionServices.
@@ -747,11 +749,12 @@ func gcOrphanedPerRevisionServices(ctx context.Context, c client.Client, isvc *v
 		}
 		live[h] = struct{}{}
 	}
+	prefix := prefixFor(isvc, component)
 	svcs := &corev1.ServiceList{}
 	if err := c.List(ctx, svcs,
 		client.InNamespace(isvc.Namespace),
 		client.MatchingLabels{
-			constants.InferenceServicePodLabelKey: isvc.Name,
+			constants.InferenceServicePodLabelKey: prefix,
 			constants.OMEComponentLabel:           string(component),
 		},
 	); err != nil {
@@ -768,11 +771,11 @@ func gcOrphanedPerRevisionServices(ctx context.Context, c client.Client, isvc *v
 		// Skip headless variant — GCPerRevisionServices already
 		// handles both halves of the pair when called with the
 		// routing hash. The routing variant's name is the bare
-		// `<isvc>-<c>-rev-<hash>` shape; headless adds `-headless`.
-		if svcs.Items[i].Name != PerRevisionServiceName(isvc.Name, component, hash) {
+		// `<prefix>-<c>-rev-<hash>` shape; headless adds `-headless`.
+		if svcs.Items[i].Name != PerRevisionServiceName(prefix, component, hash) {
 			continue
 		}
-		if err := GCPerRevisionServices(ctx, c, isvc.Namespace, isvc.Name, component, hash); err != nil {
+		if err := GCPerRevisionServices(ctx, c, isvc.Namespace, prefix, component, hash); err != nil {
 			return fmt.Errorf("gc service for %s/%s: %w", component, hash, err)
 		}
 	}

@@ -35,10 +35,14 @@ type Querier interface {
 // request (e.g. "X-Scope-OrgID" for a multi-tenant Cortex/Thanos/Mimir
 // front-end). With neither, requests are unauthenticated (the bundled
 // Prometheus). TLS/mTLS is not yet supported.
+//
+// Every query dials serverAddress afresh. A connection kept from an earlier
+// query would still reach the peer the address led to when it was opened, so
+// a source that has since moved or gone away would keep reading as healthy.
 func NewQuerier(serverAddress, bearerToken string, headers map[string]string) (Querier, error) {
-	cfg := promapi.Config{Address: serverAddress}
+	cfg := promapi.Config{Address: serverAddress, RoundTripper: dialPerQueryTransport()}
 	if bearerToken != "" || len(headers) > 0 {
-		cfg.RoundTripper = &headerRoundTripper{token: bearerToken, headers: headers, base: promapi.DefaultRoundTripper}
+		cfg.RoundTripper = &headerRoundTripper{token: bearerToken, headers: headers, base: cfg.RoundTripper}
 	}
 	client, err := promapi.NewClient(cfg)
 	if err != nil {
@@ -50,6 +54,19 @@ func NewQuerier(serverAddress, bearerToken string, headers map[string]string) (Q
 type promQuerier struct {
 	api   promv1.API
 	clock clock.Clock
+}
+
+// dialPerQueryTransport is the default HTTP transport with connection reuse
+// off: a query never rides a connection an earlier query opened.
+func dialPerQueryTransport() *http.Transport {
+	t, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		t = t.Clone()
+	} else {
+		t = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	t.DisableKeepAlives = true
+	return t
 }
 
 // Query runs an instant query at the current time and extracts the usable

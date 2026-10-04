@@ -37,9 +37,11 @@ const (
 	RetryBlockRemove                                 // delete the block (success prune)
 )
 
-// RetryPolicy bounds automatic same-target update retries. Config-driven
-// (chart values → inferenceservice-config); nil means unconfigured and
-// fails safe: Exhausted is always true, so the first failure Holds.
+// RetryPolicy is the operator's retry ladder: it bounds automatic
+// same-target update retries and paces a parked repair's re-arms.
+// Config-driven (chart values → inferenceservice-config); nil means
+// unconfigured and fails safe: Exhausted is always true, so the first
+// failure Holds and no parked repair re-arms.
 type RetryPolicy struct {
 	MaxAttempts  int32
 	InitialDelay time.Duration

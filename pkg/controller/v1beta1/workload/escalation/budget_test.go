@@ -2,15 +2,21 @@ package escalation_test
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"slices"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -874,4 +880,243 @@ func findObserved(in *types.ReconcileInput, idx int32) *types.InstanceStatus {
 		}
 	}
 	return nil
+}
+
+// terminatingSurgePod is one pod of Instance idx at ordinal, Terminating
+// until deadline when deadline is non-zero and live otherwise.
+func terminatingSurgePod(idx, ordinal int32, deadline time.Time) *corev1.Pod {
+	pod := enginePod("llama-70b", "prod", idx)
+	pod.Name = fmt.Sprintf("%s-%d", pod.Name, ordinal)
+	pod.Labels[query.LabelPodOrdinal] = fmt.Sprintf("%d", ordinal)
+	if !deadline.IsZero() {
+		stamp := metav1.NewTime(deadline)
+		pod.DeletionTimestamp = &stamp
+	}
+	return pod
+}
+
+// liveSurgePod is one live pod of Instance idx at ordinal carrying the
+// revision hash rev: the shape a replacement a disposed attempt left
+// behind has.
+func liveSurgePod(idx, ordinal int32, rev string) *corev1.Pod {
+	pod := terminatingSurgePod(idx, ordinal, time.Time{})
+	pod.Labels[query.LabelRevisionHash] = rev
+	return pod
+}
+
+// gangPods returns n pods of Instance idx, Terminating until deadline when
+// deadline is non-zero.
+func gangPods(idx, n int32, deadline time.Time) []*corev1.Pod {
+	pods := make([]*corev1.Pod, 0, n)
+	for i := int32(0); i < n; i++ {
+		pods = append(pods, terminatingSurgePod(idx, i, deadline))
+	}
+	return pods
+}
+
+// TestTerminatingSurgeInFlight pins what a Component's extra pods hold
+// against its surge budget: a pod the API still lists beyond its
+// Instance's pod count holds the slot its surge took — a Terminating pod
+// inside its own deletion grace, and a live pod a disposed attempt left
+// behind for as long as it exists. The deadline is the pod's
+// DeletionTimestamp, which the API stamps at the request time plus the
+// pod's grace, so a pod past it stops counting however long its kubelet
+// takes to reap it. A live extra pod is attributed to its Instance, whose
+// next start replaces it.
+func TestTerminatingSurgeInFlight(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	within := now.Add(30 * time.Second)
+	elapsed := now.Add(-time.Second)
+	singlePod := []types.RunnerPlan{{Name: "default", Size: 1}}
+	gang := []types.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 7}}
+	planOf := func(runners []types.RunnerPlan, indices ...int32) types.ComponentPlan {
+		plan := types.ComponentPlan{Component: types.ComponentEngine, Replicas: int32(len(indices))}
+		for _, idx := range indices {
+			plan.Instances = append(plan.Instances, types.InstancePlan{Index: idx, Incarnation: 1, Runners: runners})
+		}
+		return plan
+	}
+	ready := func(idx int32) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev"}
+	}
+	surgeStep := func(idx int32, step string, surgeIndex *int32) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Incarnation: 1, Phase: types.InstancePhaseUpdating, RunningRevision: "prior-rev",
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: step, SurgeIndex: surgeIndex}}
+	}
+	// A disposed row names its revision in full, as the adapter records
+	// it, so its pods' revision hashes read against it.
+	failed := func(idx int32) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "llama-70b-engine-priorrev"}
+	}
+	cases := []struct {
+		name       string
+		plan       types.ComponentPlan
+		statuses   []types.InstanceStatus
+		pods       map[int32][]*corev1.Pod
+		rolled     []int32
+		wantSlots  int32
+		wantPods   []string
+		wantLive   []string
+		wantByInst map[int32]int32
+		wantWakeAt time.Time
+	}{
+		{
+			name:     "an abandoned replacement draining beside its serving source holds one slot",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), {Index: 1, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev"}},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, time.Time{}), terminatingSurgePod(1, 1, within)},
+			},
+			wantSlots:  1,
+			wantPods:   []string{"llama-70b-engine-1-default-0-1"},
+			wantWakeAt: within,
+		},
+		{
+			name:     "a replacement past its deletion deadline stops counting",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), ready(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, time.Time{}), terminatingSurgePod(1, 1, elapsed)},
+			},
+		},
+		{
+			name:     "a replacement a disposed attempt left alive beside its source holds one slot, attributed to its Instance",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), failed(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, time.Time{}), liveSurgePod(1, 1, "crash-rev")},
+			},
+			wantSlots:  1,
+			wantLive:   []string{"llama-70b-engine-1-default-0-1"},
+			wantByInst: map[int32]int32{1: 1},
+		},
+		{
+			name:     "a live extra pod beside a Terminating one counts with it, and only the Terminating one sets the wake",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), failed(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, time.Time{}), terminatingSurgePod(1, 1, within), liveSurgePod(1, 2, "crash-rev")},
+			},
+			wantSlots:  2,
+			wantPods:   []string{"llama-70b-engine-1-default-0-1"},
+			wantLive:   []string{"llama-70b-engine-1-default-0-2"},
+			wantByInst: map[int32]int32{1: 1},
+			wantWakeAt: within,
+		},
+		{
+			name:     "the live pods of an index the plan does not own are the scale-down's, not the budget's",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), ready(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, time.Time{})},
+				5: {terminatingSurgePod(5, 0, time.Time{})},
+			},
+		},
+		{
+			name:     "a gang's live extra pods count in whole Instances",
+			plan:     planOf(gang, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), failed(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: gangPods(0, 8, time.Time{}),
+				1: append(gangPods(1, 8, time.Time{}), liveSurgePod(1, 8, "crash-rev"), liveSurgePod(1, 9, "crash-rev")),
+			},
+			wantSlots:  1,
+			wantLive:   []string{"llama-70b-engine-1-default-0-8", "llama-70b-engine-1-default-0-9"},
+			wantByInst: map[int32]int32{1: 1},
+		},
+		{
+			name:     "a source draining under its own surge step is charged by the step, not again here",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), surgeStep(1, types.UpdateStepSurgeDrain, nil)},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, within), terminatingSurgePod(1, 1, time.Time{})},
+			},
+		},
+		{
+			name:     "a gang source's pinned replacement index is charged by the source's step",
+			plan:     planOf(gang, 0, 1),
+			statuses: []types.InstanceStatus{surgeStep(0, types.UpdateStepSurge, func() *int32 { i := int32(2); return &i }()), ready(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: gangPods(0, 8, time.Time{}),
+				1: gangPods(1, 8, time.Time{}),
+				2: gangPods(2, 8, within),
+			},
+		},
+		{
+			name:     "an Instance already charged as rolled but not serving is not charged again",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), {Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "target-rev"}},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, time.Time{}), terminatingSurgePod(1, 1, within)},
+			},
+			rolled: []int32{1},
+		},
+		{
+			name:     "a pod set torn down in place holds nothing",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), {Index: 1, Incarnation: 1, Phase: types.InstancePhaseRestarting, RunningRevision: "prior-rev"}},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, within)},
+			},
+		},
+		{
+			name:     "every pod of an index the plan does not own is extra while it drains",
+			plan:     planOf(singlePod, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), ready(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: {terminatingSurgePod(0, 0, time.Time{})},
+				1: {terminatingSurgePod(1, 0, time.Time{})},
+				5: {terminatingSurgePod(5, 0, within)},
+			},
+			wantSlots:  1,
+			wantPods:   []string{"llama-70b-engine-5-default-0-0"},
+			wantWakeAt: within,
+		},
+		{
+			name:     "a gang's extra pods count in whole Instances, and the first deadline is the wake",
+			plan:     planOf(gang, 0, 1),
+			statuses: []types.InstanceStatus{ready(0), ready(1)},
+			pods: map[int32][]*corev1.Pod{
+				0: append(gangPods(0, 8, time.Time{}), gangPods(0, 8, within.Add(time.Minute))[7]),
+				1: gangPods(1, 8, time.Time{}),
+				3: gangPods(3, 3, within),
+			},
+			wantSlots: 2,
+			wantPods: []string{"llama-70b-engine-0-default-0-7",
+				"llama-70b-engine-3-default-0-0", "llama-70b-engine-3-default-0-1", "llama-70b-engine-3-default-0-2"},
+			wantWakeAt: within,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := escalation.ExtraPodSurgeInFlight(tc.plan, tc.statuses, tc.pods, tc.rolled, now)
+			if got.Slots != tc.wantSlots {
+				t.Errorf("slots = %d, want %d", got.Slots, tc.wantSlots)
+			}
+			if !slices.Equal(got.Terminating, tc.wantPods) {
+				t.Errorf("terminating pods = %v, want %v", got.Terminating, tc.wantPods)
+			}
+			if !slices.Equal(got.Live, tc.wantLive) {
+				t.Errorf("live extra pods = %v, want %v", got.Live, tc.wantLive)
+			}
+			wantByInst := tc.wantByInst
+			if wantByInst == nil {
+				wantByInst = map[int32]int32{}
+			}
+			if !maps.Equal(got.LiveSlotsByInstance, wantByInst) {
+				t.Errorf("live slots by Instance = %v, want %v", got.LiveSlotsByInstance, wantByInst)
+			}
+			if !got.NextRelease.Equal(tc.wantWakeAt) {
+				t.Errorf("next release = %v, want %v", got.NextRelease, tc.wantWakeAt)
+			}
+		})
+	}
 }

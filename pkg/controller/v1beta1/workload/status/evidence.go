@@ -2,6 +2,7 @@ package status
 
 import (
 	"context"
+	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -104,6 +105,94 @@ func RecordLastFailure(ctx context.Context, input types.ReconcileInput, idx int3
 		s.LastFailure = &captured
 		return true
 	})
+}
+
+// RecordDatedFailure stamps the row's LastFailure with the captured
+// termination, dated as captured: a stored record that differs only in
+// its time is rewritten, so a reader anchored on the time (a crash of
+// the row's promoted pod set remembered against the row's Ready and the
+// block's first failure) reads this sighting. Idempotent within a pass:
+// the same record at the same time writes once.
+func RecordDatedFailure(ctx context.Context, input types.ReconcileInput, idx int32, t *types.InstanceTermination) error {
+	if t == nil {
+		return nil
+	}
+	return input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		if sameFailureIdentity(s.LastFailure, t) && s.LastFailure.Time.Equal(&t.Time) {
+			return false
+		}
+		captured := *t
+		s.LastFailure = &captured
+		return true
+	})
+}
+
+// RecordCrashLoopNote appends note once to the failure message of a
+// Ready, operation-free row, beside the kubelet's own message; a row
+// already carrying it, or in any other shape, is left untouched.
+func RecordCrashLoopNote(ctx context.Context, input types.ReconcileInput, idx int32, note string) error {
+	return input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		if s.Phase != types.InstancePhaseReady || s.Operation != nil || s.LastFailure == nil || note == "" {
+			return false
+		}
+		return noteFailure(s, note)
+	})
+}
+
+// ClearCrashLoopNote removes note from the row's failure message and
+// touches nothing else: the record stays as the history of the crash,
+// dated as it was. A row that does not carry the note is left untouched.
+func ClearCrashLoopNote(ctx context.Context, input types.ReconcileInput, idx int32, note string) error {
+	return input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		if s.LastFailure == nil || note == "" {
+			return false
+		}
+		return unnoteFailure(s, note)
+	})
+}
+
+// FailureNoted reports whether the row's failure message carries note.
+func FailureNoted(s *types.InstanceStatus, note string) bool {
+	return s != nil && s.LastFailure != nil && note != "" && strings.Contains(s.LastFailure.Message, note)
+}
+
+// noteFailure appends note to the row's failure message on a copy of the
+// record, so the observed row the pass decided from is not aliased.
+// Reports whether it changed the row.
+func noteFailure(s *types.InstanceStatus, note string) bool {
+	if FailureNoted(s, note) {
+		return false
+	}
+	failure := *s.LastFailure
+	if failure.Message == "" {
+		failure.Message = note
+	} else {
+		failure.Message += "; " + note
+	}
+	s.LastFailure = &failure
+	return true
+}
+
+// unnoteFailure removes note, and the separator that joined it, from the
+// row's failure message on a copy of the record. Reports whether it
+// changed the row.
+func unnoteFailure(s *types.InstanceStatus, note string) bool {
+	if !FailureNoted(s, note) {
+		return false
+	}
+	failure := *s.LastFailure
+	switch {
+	case failure.Message == note:
+		failure.Message = ""
+	case strings.HasSuffix(failure.Message, "; "+note):
+		failure.Message = strings.TrimSuffix(failure.Message, "; "+note)
+	case strings.HasPrefix(failure.Message, note+"; "):
+		failure.Message = strings.TrimPrefix(failure.Message, note+"; ")
+	default:
+		failure.Message = strings.Replace(failure.Message, "; "+note, "", 1)
+	}
+	s.LastFailure = &failure
+	return true
 }
 
 // RecordRefreshedFailure replaces a Failed row's LastFailure with

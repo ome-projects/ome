@@ -20,13 +20,29 @@ import (
 // that moved under the selection admits nothing; the completion on the
 // rows still carrying the wave's own operation.
 
+// AttemptFailure is the ladder record a scale-down wave commits with its
+// admission. The wave retires a row carrying an in-flight update attempt
+// whose own pods already show a workload-caused failure; the attempt ends
+// with its row, so the revision's RetryBlock takes the failed wave in the
+// same write — once the pods are gone the evidence is too, and a block
+// left RetryInProgress with no attempt behind it would admit the next
+// start on a survivor as the same attempt.
+type AttemptFailure struct {
+	TargetRevision string
+	Reason         string
+	Cause          types.FailureCause
+}
+
 // StampDeletingBatch admits one scale-down wave: every row goes to
 // Phase=Deleting with a fresh Delete operation at Step=Drain and the
 // deadline timeout gives, committed together or not at all. The guard is
 // the whole observed table as the pass planned from it — owner UID and
 // generation, the same row set, and every row still the row it was. A
-// partial commit is an error. Reports whether the wave was committed.
-func StampDeletingBatch(ctx context.Context, input types.ReconcileInput, timeout time.Duration, rows []types.InstanceStatus) (bool, error) {
+// partial commit is an error. A non-nil failure is applied to its
+// revision's RetryBlock in the same write, one failed wave on the ladder.
+// Reports whether the wave was committed and, when it was, the attempt
+// count a new transition into Held carries (zero otherwise).
+func StampDeletingBatch(ctx context.Context, input types.ReconcileInput, timeout time.Duration, rows []types.InstanceStatus, failure *AttemptFailure) (bool, int32, error) {
 	mutations := make([]types.InstanceMutation, 0, len(rows))
 	expected := make(map[int32]types.InstanceStatus, len(rows))
 	for _, row := range rows {
@@ -58,7 +74,21 @@ func StampDeletingBatch(ctx context.Context, input types.ReconcileInput, timeout
 		mutations = append(mutations, mutation)
 	}
 	mutations[0].BatchPrecondition = deleteAdmissionGuard(input, expected, input.ObservedState.InstanceStatuses)
-	return applyDeleteBatch(ctx, input, mutations)
+	if failure == nil {
+		committed, err := applyDeleteBatch(ctx, input, mutations, "", nil)
+		return committed, 0, err
+	}
+	now := metav1.NewTime(input.Now())
+	var heldAttempts int32
+	committed, err := applyDeleteBatch(ctx, input, mutations, failure.TargetRevision, func(b *types.RetryBlock) types.RetryBlockDisposition {
+		disposition, held := types.ApplyUpdateFailureToRetryBlock(b, input.UpdateRetryPolicy, now, failure.Reason, failure.Cause)
+		heldAttempts = held
+		return disposition
+	})
+	if !committed {
+		heldAttempts = 0
+	}
+	return committed, heldAttempts, err
 }
 
 // RemoveDeletedBatch completes one scale-down wave: every row is removed,
@@ -86,13 +116,14 @@ func RemoveDeletedBatch(ctx context.Context, deps types.Deps, input types.Reconc
 		})
 	}
 	mutations[0].BatchPrecondition = deleteCompletionGuard(input, expected)
-	return applyDeleteBatch(ctx, input, mutations)
+	return applyDeleteBatch(ctx, input, mutations, "", nil)
 }
 
-// applyDeleteBatch commits a wave's mutations and requires every one of
-// them to commit: a wave is gang-atomic, so an adapter that confirmed
+// applyDeleteBatch commits a wave's mutations, with the RetryBlock
+// mutation for targetRevision when one is given, and requires every row
+// mutation to commit: a wave is gang-atomic, so an adapter that confirmed
 // only part of it has broken the contract, not partially succeeded.
-func applyDeleteBatch(ctx context.Context, input types.ReconcileInput, mutations []types.InstanceMutation) (bool, error) {
+func applyDeleteBatch(ctx context.Context, input types.ReconcileInput, mutations []types.InstanceMutation, targetRevision string, mutateRetryBlock func(*types.RetryBlock) types.RetryBlockDisposition) (bool, error) {
 	if len(mutations) == 0 {
 		return false, nil
 	}
@@ -109,7 +140,7 @@ func applyDeleteBatch(ctx context.Context, input types.ReconcileInput, mutations
 			}
 		}
 	}
-	if err := input.ApplyInstanceMutationsWithRetryBlock(ctx, mutations, "", nil); err != nil {
+	if err := input.ApplyInstanceMutationsWithRetryBlock(ctx, mutations, targetRevision, mutateRetryBlock); err != nil {
 		return false, err
 	}
 	if committed != len(mutations) {

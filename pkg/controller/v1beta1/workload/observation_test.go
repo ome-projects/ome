@@ -372,6 +372,12 @@ func observationPod(name, node string, ready, serving, gated bool) *corev1.Pod {
 			Type: podreadiness.ConditionType, Status: corev1.ConditionTrue,
 		})
 	}
+	if ready && serving {
+		// The kubelet folds a satisfied gate into the pod's Ready condition.
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue,
+		})
+	}
 	if gated {
 		pod.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example-gate"}}
 	}

@@ -13,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
+	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	types "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -54,13 +56,16 @@ func init() {
 		"spec.teardown":           applyTeardown,
 		"spec.gangWidth":          applyGangWidth,
 		"spec.rollbackTarget":     applyRollbackTarget,
+		"spec.policyTuning":       applyPolicyTuning,
 		"spec.migrateRequest":     applyMigrateRequest,
 		"gang.podGroup":           applyPodGroup,
 		"timer.operationDeadline": applyOperationDeadline,
 		"timer.stuckPodGrace":     applyStuckPodGrace,
 		"timer.retryAt":           applyRetryAt,
+		"timer.repairRetry":       applyRepairRetry,
 		"timer.migrationDeadline": applyMigrationDeadline,
 		"timer.forceDelete":       applyForceDelete,
+		"ctrl.crash":              applyCtrlCrash,
 	}
 }
 
@@ -265,7 +270,14 @@ func applyPodWaiting(ctx context.Context, d *driver, ev TimelineEvent) (string, 
 	name := d.podName(ref)
 	return "pod=" + name + " reason=" + ev.Variant, d.patchPod(ctx, name, func(pod *corev1.Pod) {
 		pod.Status.Phase = corev1.PodPending
-		setPodCondition(pod, corev1.ContainersReady, corev1.ConditionFalse, d.clock.Now())
+		// A kubelet reports ContainersReady=False with a pod's first status,
+		// so a pod that never served has held it since its creation; only a
+		// pod that served transitions now.
+		notReadySince := d.clock.Now()
+		if !hasPodCondition(pod, corev1.ContainersReady) && !pod.CreationTimestamp.IsZero() {
+			notReadySince = pod.CreationTimestamp.Time
+		}
+		setPodCondition(pod, corev1.ContainersReady, corev1.ConditionFalse, notReadySince)
 		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
 			Name:  container,
 			Image: podImage(pod, container),
@@ -275,6 +287,17 @@ func applyPodWaiting(ctx context.Context, d *driver, ev TimelineEvent) (string, 
 			}},
 		}}
 	})
+}
+
+// hasPodCondition reports whether the pod carries a condition of the
+// named type, whatever its status.
+func hasPodCondition(pod *corev1.Pod, condType corev1.PodConditionType) bool {
+	for i := range pod.Status.Conditions {
+		if pod.Status.Conditions[i].Type == condType {
+			return true
+		}
+	}
+	return false
 }
 
 // applyContainerRestart is the kubelet restarting a container in place:
@@ -517,6 +540,42 @@ func applyRollbackTarget(ctx context.Context, d *driver, ev TimelineEvent) (stri
 	return fmt.Sprintf("rollbackTo=%s generation=%d", orNil(d.rollbackImage), d.owner.Generation), nil
 }
 
+// applyPolicyTuning rewrites one lifecycle knob outside the pod template.
+// Only the restart policy is modelled: it is the knob whose edit changes
+// which pass owns a row that already has pods, so a scenario can land it
+// against a roll in flight. The edit retargets nothing, as no lifecycle
+// knob feeds the revision payload.
+func applyPolicyTuning(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
+	switch ev.Variant {
+	case "restartPolicy":
+		if ev.Args.Value == "" {
+			return "", fmt.Errorf("replay: spec.policyTuning[restartPolicy] needs the new policy as value")
+		}
+		d.spec.RestartPolicy = ev.Args.Value
+	case "":
+		return "", fmt.Errorf("replay: spec.policyTuning needs a variant naming the knob")
+	default:
+		return "", fmt.Errorf("replay: spec.policyTuning[%s] is not modelled; the driver rewrites restartPolicy", ev.Variant)
+	}
+	if err := d.bumpGeneration(ctx); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("restartPolicy=%s generation=%d", d.spec.RestartPolicy, d.owner.Generation), nil
+}
+
+// applyCtrlCrash is the controller process restarting. The cluster and the
+// owner status are durable and stay as they are; what the restarted engine
+// loses is the expectations cache, the one thing it keeps in memory between
+// passes, so its first pass reads every pending create and delete as
+// satisfied and re-derives the row's step from status and the pods alone.
+func applyCtrlCrash(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	if ev.Variant != "" {
+		return "", fmt.Errorf("replay: ctrl.crash takes no variant")
+	}
+	d.expectations = types.NewExpectationsWithClock(d.clock)
+	return "expectations=dropped", nil
+}
+
 // applyMigrateRequest is the operator's migration mailbox, consumed: the
 // adapter answers a request annotation by appending an Accepted record to
 // the owner's status, and that record is the only thing the engine's
@@ -587,8 +646,9 @@ func applyOperationDeadline(_ context.Context, d *driver, ev TimelineEvent) (str
 
 // applyStuckPodGrace advances the clock onto the earliest instant at which
 // a pod wedged in a terminal waiting reason has held it for the configured
-// stuck-pod grace. The deadline is the pod's own creationTimestamp plus the
-// configured grace, so the scenario names neither.
+// stuck-pod grace. The deadline is the start of the pod's own waiting
+// episode (evidence.WaitingEpisodeStart) plus the configured grace, so the
+// scenario names neither.
 func applyStuckPodGrace(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
 	grace, err := ParseDuration("config.stuckPodGrace", d.cfg.StuckPodGrace)
 	if err != nil {
@@ -603,10 +663,11 @@ func applyStuckPodGrace(ctx context.Context, d *driver, ev TimelineEvent) (strin
 	}
 	var earliest time.Time
 	for _, pod := range pods {
-		if !waitingTerminally(pod) || pod.CreationTimestamp.IsZero() {
+		since := evidence.WaitingEpisodeStart(pod)
+		if !waitingTerminally(pod) || since.IsZero() {
 			continue
 		}
-		due := pod.CreationTimestamp.Time.Add(grace)
+		due := since.Add(grace)
 		if earliest.IsZero() || due.Before(earliest) {
 			earliest = due
 		}
@@ -633,6 +694,35 @@ func applyRetryAt(_ context.Context, d *driver, ev TimelineEvent) (string, error
 		return "", fmt.Errorf("replay: timer.retryAt: no RetryBlock carries a nextRetryAt")
 	}
 	return d.advanceOnto("timer.retryAt", earliest, ev)
+}
+
+// applyRepairRetry advances the clock onto the earliest instant a repair
+// parked at Failed may re-arm: the recorded failure plus the configured
+// ladder's delay for its next attempt.
+func applyRepairRetry(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	policy, err := retryPolicyOf("config.updateRetry", d.cfg.UpdateRetry)
+	if err != nil {
+		return "", err
+	}
+	if policy == nil {
+		return "", fmt.Errorf("replay: timer.repairRetry: config.updateRetry is not set, so no retry ladder runs")
+	}
+	input := types.ReconcileInput{UpdateRetryPolicy: policy, Clock: d.clock}
+	var earliest time.Time
+	for _, row := range d.store.Rows() {
+		row := row
+		at, owed := workloadops.RepairRetryAt(input, &row)
+		if !owed {
+			continue
+		}
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	if earliest.IsZero() {
+		return "", fmt.Errorf("replay: timer.repairRetry: no repair parked at Failed owes a re-arm")
+	}
+	return d.advanceOnto("timer.repairRetry", earliest, ev)
 }
 
 // applyMigrationDeadline advances the clock onto the earliest deadline a

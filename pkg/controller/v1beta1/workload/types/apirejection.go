@@ -24,6 +24,13 @@ const (
 	// it is waiting on capacity an operator or another workload
 	// controls, so the operation's deadline parks while it waits.
 	APIRejectionCapacityBlocked
+	// APIRejectionAdmissionUnavailable — the apiserver could not consult
+	// an admission webhook on the write (the dispatcher failed closed on
+	// a webhook it could not call). Admission gave no answer about the
+	// object, so the workload is correct and the attempt is intact; it
+	// waits for the webhook to come back, with its deadline parked, and
+	// the wait is reported with the apiserver's own words.
+	APIRejectionAdmissionUnavailable
 	// APIRejectionPermanentWorkload — the pod template itself is
 	// unacceptable (422 Invalid). Retrying the same revision reproduces
 	// the rejection byte for byte, so the attempt ends and the revision
@@ -65,6 +72,13 @@ const (
 	// RejectionReasonThrottled marks a 429 / 503. Diagnostic only — the
 	// throttled class writes no status.
 	RejectionReasonThrottled = "Throttled"
+	// RejectionReasonAdmissionUnavailable marks a write the apiserver
+	// could not take to its admission webhook. Recorded as the
+	// operation's Waiting token, with the apiserver's message as the
+	// LastFailure evidence under the same reason, never as a failure.
+	// ENVIRONMENT-CAUSED: no revision can reach a webhook the apiserver
+	// cannot, so it never charges a retry ladder.
+	RejectionReasonAdmissionUnavailable = "AdmissionUnavailable"
 )
 
 // APIRejection is the classified form of one apiserver rejection.

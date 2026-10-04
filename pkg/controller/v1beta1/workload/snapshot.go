@@ -5,6 +5,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -22,6 +23,10 @@ type ObservedSnapshot struct {
 
 	live   memoObservation
 	cached memoObservation
+
+	// runningSpecs memoizes the PodSpec each running revision records, by
+	// ControllerRevision name: a Component's Instances mostly share one.
+	runningSpecs map[string]memoPodSpec
 }
 
 // memoObservation memoizes one Pod observation and its read result.
@@ -29,6 +34,12 @@ type memoObservation struct {
 	done        bool
 	observation ComponentObservation
 	err         error
+}
+
+// memoPodSpec memoizes one revision's recorded PodSpec and its read result.
+type memoPodSpec struct {
+	spec *corev1.PodSpec
+	err  error
 }
 
 // NewObservedSnapshot builds the snapshot; pods are materialized lazily on
@@ -98,6 +109,28 @@ func (s *ObservedSnapshot) CachedPods(ctx context.Context) (map[int32][]*corev1.
 		return nil, err
 	}
 	return observation.pods.byInstance, nil
+}
+
+// RunningRevisionPodSpec returns the PodSpec recorded by the ControllerRevision
+// an Instance's status names as its running revision: the baseline a
+// single-pod in-place start's diff is judged against, read through the
+// revision-bookkeeping role the update op reads it with. nil with no error
+// when the row names no revision or the revision is gone (no baseline).
+// Memoized: at most one Get per revision name per reconcile.
+func (s *ObservedSnapshot) RunningRevisionPodSpec(ctx context.Context, idx int32) (*corev1.PodSpec, error) {
+	row := s.input.ObservedState.Instance(idx)
+	if row == nil || row.RunningRevision == "" {
+		return nil, nil
+	}
+	if memo, ok := s.runningSpecs[row.RunningRevision]; ok {
+		return memo.spec, memo.err
+	}
+	spec, err := workloadops.RevisionPodSpec(ctx, s.deps.Reader(), s.input.Key.Namespace, row.RunningRevision)
+	if s.runningSpecs == nil {
+		s.runningSpecs = make(map[string]memoPodSpec)
+	}
+	s.runningSpecs[row.RunningRevision] = memoPodSpec{spec: spec, err: err}
+	return spec, err
 }
 
 // observePodsLive performs the selector-scoped live-role List.

@@ -53,3 +53,27 @@ func ClearFailedInstanceOperation(ctx context.Context, mutate func(context.Conte
 	}
 	return cleared, nil
 }
+
+// CloseSpentRepair drops the Restart operation a Failed Instance kept once
+// the repair has no live pod left to resume or rebuild, returning the row
+// to the fresh-start shape the Create pass rebuilds. Phase, Incarnation
+// and LastFailure stay. opID names the attempt the caller read: a row
+// whose operation has moved on since — re-armed, reset, or taken by
+// another pass — is left alone. Reports whether a write happened.
+func CloseSpentRepair(ctx context.Context, input types.ReconcileInput, idx int32, opID string) (bool, error) {
+	closed := false
+	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		closed = false
+		if s.Phase != types.InstancePhaseFailed || s.Operation == nil ||
+			s.Operation.Type != types.InstanceOperationRestart || s.Operation.ID != opID {
+			return false
+		}
+		s.Operation = nil
+		closed = true
+		return true
+	})
+	if err != nil {
+		return false, err
+	}
+	return closed, nil
+}

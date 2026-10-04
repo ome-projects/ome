@@ -62,9 +62,11 @@ func (in PassInput) rowPods(ctx context.Context, row Row) (own, attributed []*co
 }
 
 // serving reports whether the row is already in rotation at its desired
-// count, which retires every fact-bearing hold: the bookkeeping an
-// authority judged on may be stale, but a stray unplaceable pod or a
-// group reading cannot stop a workload that is already serving.
+// count, which retires every hold re-read from the cluster: the
+// bookkeeping an authority judged on may be stale, but a stray
+// unplaceable pod or a group reading cannot stop a workload that is
+// already serving. The admission wait is not one of them: it answers for
+// a write a serving row's roll still needs, so its write site releases it.
 func (in PassInput) serving(ctx context.Context, row Row) (bool, error) {
 	_, attributed, err := in.rowPods(ctx, row)
 	if err != nil {

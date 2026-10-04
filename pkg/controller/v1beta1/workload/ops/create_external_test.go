@@ -2,6 +2,7 @@ package ops_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -118,6 +120,38 @@ func minimalISVC(name, ns string, replicas int) *v1beta1.InferenceService {
 // pods (matches what production Render emits via ome.io/revision-hash).
 const testRevisionHash = "testrev1"
 
+// fixtureTemplate is the pod template buildTestInput renders.
+func fixtureTemplate() *corev1.PodSpec {
+	return &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "test:v1"}}}
+}
+
+// storedRevision is the ControllerRevision named name whose payload records
+// spec (and workerSpec, for a gang) as its template. A rebuild renders the
+// template of the revision it stamps, so a fixture row naming a revision
+// seeds it for the engine to read.
+func storedRevision(t *testing.T, isvc *v1beta1.InferenceService, name string, spec, workerSpec *corev1.PodSpec) *appsv1.ControllerRevision {
+	t.Helper()
+	raw, err := json.Marshal(revision.DataPayload{PodSpec: spec, WorkerPodSpec: workerSpec})
+	if err != nil {
+		t.Fatalf("marshal revision payload: %v", err)
+	}
+	return &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       isvc.Namespace,
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(isvc, v1beta1.SchemeGroupVersion.WithKind("InferenceService"))},
+		},
+		Data: runtime.RawExtension{Raw: raw},
+	}
+}
+
+// fixtureRevision is the engine revision the fixture rows name by default
+// (testRevisionHash), recording the template buildTestInput renders.
+func fixtureRevision(t *testing.T, isvc *v1beta1.InferenceService) *appsv1.ControllerRevision {
+	t.Helper()
+	return storedRevision(t, isvc, isvc.Name+"-"+string(workload.ComponentEngine)+"-"+testRevisionHash, fixtureTemplate(), nil)
+}
+
 // testPodLabels reproduces the label set workload/ops.Render stamps
 // on every emitted pod. Duplicated here because Render's helper is
 // private to ops/; tests in ops_test fabricate pods directly.
@@ -198,35 +232,17 @@ func testMutateInstance(c client.Client, isvc *v1beta1.InferenceService, compone
 				break
 			}
 		}
-		var w workload.InstanceStatus
-		if pos == -1 {
-			w = workload.InstanceStatus{Index: idx}
-		} else {
-			s := ir.Status.InstanceStatuses[pos]
-			w = workload.InstanceStatus{
-				Index:           s.Index,
-				Incarnation:     s.Incarnation,
-				Phase:           workload.InstancePhase(s.Phase),
-				RunningRevision: s.RunningRevision,
-				TargetRevision:  s.TargetRevision,
-				ActiveOrdinal:   s.ActiveOrdinal,
-				Operation:       fromV1beta1Op(s.Operation),
-				LastFailure:     fromV1beta1Termination(s.LastFailure),
-			}
+		// The production converters carry every field the engine reads
+		// and writes; a hand-listed copy that forgot one would hide a
+		// stamp the engine relies on across passes.
+		w := workload.InstanceStatus{Index: idx}
+		if pos != -1 {
+			w = v1beta1convert.InstanceStatusToWorkload(ir.Status.InstanceStatuses[pos])
 		}
 		if !mutate(&w) {
 			return nil
 		}
-		updated := v1beta1.OMENativeInstanceStatus{
-			Index:           w.Index,
-			Incarnation:     w.Incarnation,
-			Phase:           v1beta1.OMENativeInstancePhase(w.Phase),
-			RunningRevision: w.RunningRevision,
-			TargetRevision:  w.TargetRevision,
-			ActiveOrdinal:   w.ActiveOrdinal,
-			Operation:       toV1beta1Op(w.Operation),
-			LastFailure:     toV1beta1Termination(w.LastFailure),
-		}
+		updated := v1beta1convert.InstanceStatusFromWorkload(w)
 		if pos == -1 {
 			ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, updated)
 		} else {
@@ -244,51 +260,11 @@ func testMutateInstance(c client.Client, isvc *v1beta1.InferenceService, compone
 	}
 }
 
-// fromV1beta1Op / toV1beta1Op delegate to the production converters for
-// the reason buildTestInput does: a field the reconciler writes but a
-// hand-listed helper forgets to copy is a silently-passing test.
+// fromV1beta1Op delegates to the production converter for the reason
+// buildTestInput does: a field the reconciler writes but a hand-listed
+// helper forgets to copy is a silently-passing test.
 func fromV1beta1Op(op *v1beta1.InstanceOperation) *workload.InstanceOperation {
 	return v1beta1convert.InstanceOperationToWorkload(op)
-}
-
-func toV1beta1Op(op *workload.InstanceOperation) *v1beta1.InstanceOperation {
-	return v1beta1convert.InstanceOperationFromWorkload(op)
-}
-
-func fromV1beta1Termination(t *v1beta1.InstanceTermination) *workload.InstanceTermination {
-	if t == nil {
-		return nil
-	}
-	out := &workload.InstanceTermination{
-		PodName:       t.PodName,
-		ContainerName: t.ContainerName,
-		Reason:        t.Reason,
-		Message:       t.Message,
-		Time:          t.Time,
-	}
-	if t.ExitCode != nil {
-		e := *t.ExitCode
-		out.ExitCode = &e
-	}
-	return out
-}
-
-func toV1beta1Termination(t *workload.InstanceTermination) *v1beta1.InstanceTermination {
-	if t == nil {
-		return nil
-	}
-	out := &v1beta1.InstanceTermination{
-		PodName:       t.PodName,
-		ContainerName: t.ContainerName,
-		Reason:        t.Reason,
-		Message:       t.Message,
-		Time:          t.Time,
-	}
-	if t.ExitCode != nil {
-		e := *t.ExitCode
-		out.ExitCode = &e
-	}
-	return out
 }
 
 // findInstanceStatusOnIR looks up the InstanceStatus by (component, idx) on the
@@ -2974,7 +2950,7 @@ func TestCreate_BatchedReadyOnRevisionPromotesAndPrunesOnce(t *testing.T) {
 	}
 	input.ObservedState.RetryBlocks = []workload.RetryBlock{{
 		TargetRevision: target.Name,
-		State:          workload.RetryBlockHeld,
+		State:          workload.RetryBlockRetryInProgress,
 	}}
 	pruneCalls := 0
 	var pruneDisposition workload.RetryBlockDisposition
@@ -2983,7 +2959,7 @@ func TestCreate_BatchedReadyOnRevisionPromotesAndPrunesOnce(t *testing.T) {
 			return fmt.Errorf("prune revision: got %q, want %q", revision, target.Name)
 		}
 		pruneCalls++
-		block := workload.RetryBlock{TargetRevision: revision, State: workload.RetryBlockHeld}
+		block := workload.RetryBlock{TargetRevision: revision, State: workload.RetryBlockRetryInProgress}
 		pruneDisposition = mutate(&block)
 		return nil
 	}
@@ -3108,7 +3084,7 @@ func TestCreate_BatchedRetryBlockPruneFailureRestoresFailFastPrefix(t *testing.T
 	pruneCalls := 0
 	input.MutateRetryBlock = func(_ context.Context, _ string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
 		pruneCalls++
-		block := workload.RetryBlock{TargetRevision: target.Name, State: workload.RetryBlockHeld}
+		block := workload.RetryBlock{TargetRevision: target.Name, State: workload.RetryBlockRetryInProgress}
 		if got := mutate(&block); got != workload.RetryBlockRemove {
 			return fmt.Errorf("prune disposition: got %v, want Remove", got)
 		}
@@ -4173,7 +4149,7 @@ func TestRestart_UnknownPhasePodHoldsWithoutForceDeletePolicy(t *testing.T) {
 
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
-	done, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], "pod lost")
+	done, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], nil, "pod lost")
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -4208,7 +4184,7 @@ func TestRestart_UnknownPhasePodForceDeletedOnProvenNodeDeath(t *testing.T) {
 		NodeUnreachableThreshold: 5 * time.Minute,
 	}
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
-	if _, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], "pod lost"); err != nil {
+	if _, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], nil, "pod lost"); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
 	if podExists(c, quiet) {
@@ -4221,7 +4197,7 @@ func TestRestart_UnknownPhasePodForceDeletedOnProvenNodeDeath(t *testing.T) {
 	workload.DefaultExpectations.Forget("prod", "llama-70b", workload.ComponentEngine, 0)
 	input = buildTestInput(isvc, c, workload.ComponentEngine)
 	plan = buildPlanSinglePodEngineForRestart(c, isvc)
-	if _, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], "pod lost"); err != nil {
+	if _, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], nil, "pod lost"); err != nil {
 		t.Fatalf("Restart pass 2: %v", err)
 	}
 	got := listPods(t, c, "prod")
@@ -4248,7 +4224,7 @@ func TestRestart_UnknownPhasePodOnLiveNodeIsNeverDeleted(t *testing.T) {
 		NodeUnreachableThreshold: 5 * time.Minute,
 	}
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
-	if _, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], "pod lost"); err != nil {
+	if _, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], nil, "pod lost"); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
 	if !podExists(c, quiet) {
@@ -4349,5 +4325,284 @@ func TestCreate_RecreateInstance_DefersDemotedGangToRestart(t *testing.T) {
 	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
 	if s == nil || s.Phase != v1beta1.OMENativeInstancePending || s.Operation != nil {
 		t.Fatalf("the demoted row must stay Pending with no operation (Create must not stamp Creating): got %+v", s)
+	}
+}
+
+// webhookUnreachablePodError is the apiserver failing closed on an
+// admission webhook it could not call: an InternalError whose message is
+// the dispatcher's phrase, the webhook's name and the transport error.
+// The pod name is not part of the apiserver's wording; detail lets a
+// test vary the transport error between passes.
+func webhookUnreachablePodError(detail string) error {
+	return apierrors.NewInternalError(fmt.Errorf(
+		`failed calling webhook "pod-mutator.example.com": failed to call webhook: Post "https://ome-webhook.example.svc:443/mutate-pods?timeout=10s": %s`, detail))
+}
+
+// TestCreate_AdmissionUnavailable_SaysWhyTheRollWaits: a pod create the
+// apiserver refuses because it cannot reach an admission webhook is a
+// wait, not a failure, and the wait is not silent. The attempt keeps its
+// operation, the row carries the wait token with the apiserver's own
+// words on LastFailure, one event names the webhook, and the pass retries
+// on the ordinary create interval. The outage says something different
+// on every pass — connection refused, then a deadline — yet the episode
+// writes status once and announces once; when the webhook is back the
+// create lands and the token is released.
+func TestCreate_AdmissionUnavailable_SaysWhyTheRollWaits(t *testing.T) {
+	detail := "dial tcp 10.0.0.1:443: connect: connection refused"
+	blocked := true
+	c, isvc, input, plan, target, recorder, writes := rejectionFixture(t, 1, func(podName string) error {
+		if blocked {
+			return webhookUnreachablePodError(detail)
+		}
+		return nil
+	})
+
+	result, err := ops.Create(context.Background(), workload.Deps{Client: c, Recorder: recorder}, input, plan, target)
+	if err != nil {
+		t.Fatalf("Create: %v (an admission outage is a wait, not an error)", err)
+	}
+	if result.RequeueAfter != testRequeueIntervals.Operation {
+		t.Errorf("RequeueAfter: got %v want %v", result.RequeueAfter, testRequeueIntervals.Operation)
+	}
+
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceCreating || s.Operation == nil {
+		t.Fatalf("instance 0: got %+v want Creating with its operation intact", s)
+	}
+	if s.Operation.Waiting != workload.RejectionReasonAdmissionUnavailable {
+		t.Errorf("Operation.Waiting: got %q want %q", s.Operation.Waiting, workload.RejectionReasonAdmissionUnavailable)
+	}
+	if s.Operation.Reason != "" {
+		t.Errorf("Operation.Reason: got %q want untouched — Reason names why the operation exists", s.Operation.Reason)
+	}
+	if s.LastFailure == nil || s.LastFailure.Reason != workload.RejectionReasonAdmissionUnavailable {
+		t.Fatalf("LastFailure: got %+v want the wait recorded under %s", s.LastFailure, workload.RejectionReasonAdmissionUnavailable)
+	}
+	if !strings.Contains(s.LastFailure.Message, "failed calling webhook") || !strings.Contains(s.LastFailure.Message, "pod-mutator.example.com") {
+		t.Errorf("LastFailure.Message: got %q want the apiserver's own words naming the webhook", s.LastFailure.Message)
+	}
+	if s.LastFailure.PodName != "llama-70b-engine-0-default-0" {
+		t.Errorf("LastFailure.PodName: got %q want the refused pod", s.LastFailure.PodName)
+	}
+	if len(*writes) != 0 {
+		t.Errorf("RetryBlock writes: got %+v want none (no revision is blamed)", *writes)
+	}
+	if names := rejectionPodNames(t, c); len(names) != 0 {
+		t.Errorf("pods: got %v want none while admission is unreachable", names)
+	}
+	events := rejectionEvents(recorder)
+	if got := countRejectionEvents(events, workload.EventReasonInstanceAdmissionUnavailable); got != 1 {
+		t.Fatalf("admission events after the first pass: got %d want 1 (%v)", got, events)
+	}
+	if !anyEventContains(events, "failed calling webhook") || !anyEventContains(events, "pod-mutator.example.com") {
+		t.Errorf("the event must carry the apiserver's words naming the webhook; got %v", events)
+	}
+	if countRejectionEvents(events, workload.EventReasonInstanceRejected) != 0 || countRejectionEvents(events, workload.EventReasonInstanceQuotaBlocked) != 0 {
+		t.Errorf("an admission outage is neither a rejection nor a quota wait; got %v", events)
+	}
+	rvAfterRefusal := irResourceVersion(t, c, isvc)
+
+	// Two more passes under the outage, each refused with a different
+	// transport error: no second event and no further status write.
+	detail = "context deadline exceeded"
+	for i := 0; i < 2; i++ {
+		resetExpectations(t)
+		next := buildTestInput(isvc, c, workload.ComponentEngine)
+		next.ObservedState.UpdateRevision = target.Name
+		next.Pacing = &workload.APIPacing{}
+		next.MutateRetryBlock = input.MutateRetryBlock
+		if _, err := ops.Create(context.Background(), workload.Deps{Client: c, Recorder: recorder}, next, plan, target); err != nil {
+			t.Fatalf("Create (refused pass %d): %v", i+2, err)
+		}
+	}
+	if got := countRejectionEvents(rejectionEvents(recorder), workload.EventReasonInstanceAdmissionUnavailable); got != 0 {
+		t.Errorf("admission events on repeat refused passes: got %d want 0 (one per episode)", got)
+	}
+	if rv := irResourceVersion(t, c, isvc); rv != rvAfterRefusal {
+		t.Errorf("status resourceVersion moved on repeat refused passes: %s -> %s (the episode must write once)", rvAfterRefusal, rv)
+	}
+
+	// The webhook is back: the create lands and the wait is released.
+	blocked = false
+	resetExpectations(t)
+	next := buildTestInput(isvc, c, workload.ComponentEngine)
+	next.ObservedState.UpdateRevision = target.Name
+	next.Pacing = &workload.APIPacing{}
+	next.MutateRetryBlock = input.MutateRetryBlock
+	if _, err := ops.Create(context.Background(), workload.Deps{Client: c, Recorder: recorder}, next, plan, target); err != nil {
+		t.Fatalf("Create (admission back): %v", err)
+	}
+	s = findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Operation == nil {
+		t.Fatalf("instance 0: got %+v want a live operation", s)
+	}
+	if s.Operation.Waiting != "" {
+		t.Errorf("Operation.Waiting: got %q want released once the create went through admission", s.Operation.Waiting)
+	}
+	if names := rejectionPodNames(t, c); len(names) != 1 {
+		t.Errorf("pods: got %v want the create to have landed", names)
+	}
+}
+
+// TestCreateFreshIndices_AdmissionUnavailable_OnScaleUpSaysWhy: the same
+// outage met by a scale-up. The added index opens its Create, its pod
+// create is refused, and the new row — not the serving one — carries the
+// wait with the apiserver's words while one event names the webhook. The
+// Ready index is left exactly as it was.
+func TestCreateFreshIndices_AdmissionUnavailable_OnScaleUpSaysWhy(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 2)
+	ir := seedInstanceStatuses(isvc, v1beta1.OMENativeInstanceStatus{
+		Index:           0,
+		Incarnation:     3,
+		Phase:           v1beta1.OMENativeInstanceReady,
+		RunningRevision: "llama-70b-engine-currentrev",
+	})
+	pod0 := podForInstance(isvc, 0, true /* ready */, true /* serving */)
+	target := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-currentrev", Namespace: "prod"},
+	}
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, v1beta1.AddToScheme} {
+		if err := add(scheme); err != nil {
+			t.Fatalf("build scheme: %v", err)
+		}
+	}
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}).
+		WithObjects(isvc, ir, pod0, target).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.Pod); ok {
+					return webhookUnreachablePodError("dial tcp 10.0.0.1:443: connect: connection refused")
+				}
+				return cl.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.ObservedState.UpdateRevision = target.Name
+	input.Pacing = &workload.APIPacing{}
+	recorder := record.NewFakeRecorder(16)
+
+	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c, Recorder: recorder}, input, buildPlanSinglePodEngine(2), target); err != nil {
+		t.Fatalf("CreateFreshIndices: %v (an admission outage is a wait, not an error)", err)
+	}
+
+	before := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if before == nil || before.Phase != v1beta1.OMENativeInstanceReady || before.Incarnation != 3 || before.Operation != nil {
+		t.Fatalf("the Ready index must be left exactly as it was, got %+v", before)
+	}
+	added := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 1)
+	if added == nil || added.Operation == nil || added.Operation.Type != v1beta1.InstanceOperationCreate {
+		t.Fatalf("the added index must keep its Create open, got %+v", added)
+	}
+	if added.Phase == v1beta1.OMENativeInstanceFailed {
+		t.Errorf("the added index: got Failed want the attempt kept while admission is unreachable")
+	}
+	if added.Operation.Waiting != workload.RejectionReasonAdmissionUnavailable {
+		t.Errorf("added index Operation.Waiting: got %q want %q", added.Operation.Waiting, workload.RejectionReasonAdmissionUnavailable)
+	}
+	if added.LastFailure == nil || !strings.Contains(added.LastFailure.Message, "failed calling webhook") {
+		t.Errorf("added index LastFailure: got %+v want the apiserver's own words", added.LastFailure)
+	}
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 1 || pods.Items[0].Name != pod0.Name {
+		t.Errorf("pods: got %d want only the serving pod while admission is unreachable", len(pods.Items))
+	}
+	events := rejectionEvents(recorder)
+	if got := countRejectionEvents(events, workload.EventReasonInstanceAdmissionUnavailable); got != 1 {
+		t.Fatalf("admission events: got %d want 1 (%v)", got, events)
+	}
+	if !anyEventContains(events, "failed calling webhook") {
+		t.Errorf("the event must carry the apiserver's words; got %v", events)
+	}
+}
+
+// TestCreate_InvalidPodSpec_IsNotAnAdmissionOutage: a 422 is admission
+// answering, not admission missing. The rejected Instance is disposed
+// Failed under its own reason, no wait token is recorded and no event
+// claims the webhook was unreachable.
+func TestCreate_InvalidPodSpec_IsNotAnAdmissionOutage(t *testing.T) {
+	c, isvc, input, plan, target, recorder, _ := rejectionFixture(t, 1, invalidPodError)
+
+	if _, err := ops.Create(context.Background(), workload.Deps{Client: c, Recorder: recorder}, input, plan, target); err != nil {
+		t.Fatalf("Create: %v (a permanent rejection is disposed, not returned)", err)
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed || s.Operation != nil {
+		t.Fatalf("instance 0: got %+v want Failed with the operation cleared", s)
+	}
+	if s.LastFailure == nil || s.LastFailure.Reason != workload.RejectionReasonInvalidPodSpec {
+		t.Errorf("LastFailure: got %+v want reason=%s", s.LastFailure, workload.RejectionReasonInvalidPodSpec)
+	}
+	events := rejectionEvents(recorder)
+	if got := countRejectionEvents(events, workload.EventReasonInstanceAdmissionUnavailable); got != 0 {
+		t.Errorf("admission events on an Invalid rejection: got %d want 0 (%v)", got, events)
+	}
+	if got := countRejectionEvents(events, workload.EventReasonInstanceRejected); got != 1 {
+		t.Errorf("rejection events: got %d want 1 (%v)", got, events)
+	}
+}
+
+// A Ready row demoted to Pending for losing every pod — no operation, the
+// revision it ran still recorded — is the Create pass's to rebuild, and
+// the fresh scope rebuilds it as the full pass would: no in-flight
+// operation owns the row, so neither hazard the scope exists to avoid —
+// an ordinal an Update just flipped, a running revision a promote would
+// mis-stamp — can arise on it. The row opens a Create at its own
+// incarnation, keeps the revision it records, and its missing pod is
+// created; the Ready peer beside it is left exactly as it was.
+func TestCreateFreshIndices_RebuildsADemotedPodlessRow(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 2)
+	ir := seedInstanceStatuses(isvc,
+		v1beta1.OMENativeInstanceStatus{
+			Index: 0, Incarnation: 3,
+			Phase:           v1beta1.OMENativeInstanceReady,
+			RunningRevision: "llama-70b-engine-priorrev",
+		},
+		v1beta1.OMENativeInstanceStatus{
+			Index: 1, Incarnation: 2,
+			Phase:           v1beta1.OMENativeInstancePending,
+			RunningRevision: "llama-70b-engine-" + testRevisionHash,
+		},
+	)
+	pod0 := podForInstance(isvc, 0, true /* ready */, true /* serving */)
+	c := newFakeClient(t, isvc, ir, pod0)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	plan := buildPlanSinglePodEngine(2)
+	target := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-" + testRevisionHash, Namespace: "prod"},
+	}
+
+	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
+		t.Fatalf("CreateFreshIndices: %v", err)
+	}
+
+	rebuilt := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 1)
+	if rebuilt == nil || rebuilt.Phase != v1beta1.OMENativeInstanceCreating || rebuilt.Operation == nil ||
+		rebuilt.Operation.Type != v1beta1.InstanceOperationCreate || rebuilt.Incarnation != 2 ||
+		rebuilt.RunningRevision != "llama-70b-engine-"+testRevisionHash {
+		t.Fatalf("the demoted row must open a Create at its own incarnation and keep the revision it records, got %+v", rebuilt)
+	}
+	peer := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if peer == nil || peer.Phase != v1beta1.OMENativeInstanceReady || peer.Operation != nil || peer.Incarnation != 3 {
+		t.Fatalf("the Ready peer must be left exactly as it was, got %+v", peer)
+	}
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	got := map[string]bool{}
+	for _, p := range pods.Items {
+		got[p.Name] = true
+	}
+	if len(pods.Items) != 2 || !got[pod0.Name] || !got["llama-70b-engine-1-default-0"] {
+		t.Fatalf("expected the peer's pod plus the rebuilt pod, got %v", got)
 	}
 }

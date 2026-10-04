@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -87,7 +88,7 @@ func TestRestart_NilClient(t *testing.T) {
 	resetExpectations(t)
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
 	inst := workload.InstancePlan{Index: 0, Incarnation: 1}
-	if _, err := ops.Restart(context.Background(), workload.Deps{}, workload.ReconcileInput{}, plan, inst, ""); err == nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{}, workload.ReconcileInput{}, plan, inst, nil, ""); err == nil {
 		t.Fatal("expected error for nil client")
 	}
 }
@@ -100,7 +101,7 @@ func TestRestart_FirstPassBumpsIncarnationAndPatchesStatus(t *testing.T) {
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 
-	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "test trigger")
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "test trigger")
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -147,7 +148,7 @@ func TestRestart_DrainOldPod_FlipsServingFalse(t *testing.T) {
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 
-	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "trigger")
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "trigger")
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -179,7 +180,7 @@ func TestRestart_DeletesOldPodOnceDrained(t *testing.T) {
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 
-	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "trigger")
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "trigger")
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -211,7 +212,7 @@ func TestRestart_RefusesToDeleteOrphanPod(t *testing.T) {
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 
-	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "trigger")
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "trigger")
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -243,11 +244,11 @@ func TestRestart_CreatesNewPodAtBumpedIncarnation(t *testing.T) {
 			Type: v1beta1.InstanceOperationRestart, Step: "Drain", Reason: "x",
 		},
 	}
-	c := newFakeClient(t, isvc, ir)
+	c := newFakeClient(t, isvc, ir, fixtureRevision(t, isvc))
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 
-	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "trigger")
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "trigger")
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -276,7 +277,7 @@ func TestRestart_ConvergesAcrossPasses(t *testing.T) {
 	failed := podAtIncarnation(isvc, 0, 1, true, true)
 	failed.Status.Phase = corev1.PodFailed
 	slice := sliceWithEndpoint("prod", "engine-svc-1", "llama-70b-engine-rev-"+testRevisionHash, failed, false /* drained */)
-	c := newFakeClient(t, isvc, ir, failed, slice)
+	c := newFakeClient(t, isvc, ir, failed, slice, fixtureRevision(t, isvc))
 
 	const maxPasses = 8
 	for pass := 0; pass < maxPasses; pass++ {
@@ -295,7 +296,7 @@ func TestRestart_ConvergesAcrossPasses(t *testing.T) {
 		// previous pass created — the fake client doesn't run kubelet.
 		makeNewPodReady(t, c, "prod", "llama-70b-engine-0-default-0", plan.Instances[0].Incarnation)
 
-		done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod Failed")
+		done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "pod Failed")
 		if err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
@@ -388,7 +389,7 @@ func TestRestart_CapturesLastFailureBeforeDrain(t *testing.T) {
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 
-	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod Failed"); err != nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "pod Failed"); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
 
@@ -429,7 +430,7 @@ func TestRestart_PodVanished_PreservesPriorLastFailure(t *testing.T) {
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 
-	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod count 0 below desired 1"); err != nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "pod count 0 below desired 1"); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
 
@@ -478,7 +479,7 @@ func TestRestart_EmitsRichRestartTriggeredEvent(t *testing.T) {
 
 	// Pass the rich reason (as the dispatcher would, via DetectRestartTrigger).
 	_, reason, _ := ops.DetectRestartTrigger(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0])
-	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c, Recorder: rec}, input, plan, plan.Instances[0], reason); err != nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c, Recorder: rec}, input, plan, plan.Instances[0], nil, reason); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
 
@@ -994,7 +995,7 @@ func TestRestart_PromotionWaitsForPodReadyAndWindow(t *testing.T) {
 		input.Clock = clk
 		window := &workload.PromoteWindow{}
 		input.PromoteWindow = window
-		done, err := ops.Restart(context.Background(), workload.Deps{Client: c, Clock: clk}, input, plan, plan.Instances[0], "pod Failed")
+		done, err := ops.Restart(context.Background(), workload.Deps{Client: c, Clock: clk}, input, plan, plan.Instances[0], nil, "pod Failed")
 		if err != nil {
 			t.Fatalf("Restart: %v", err)
 		}
@@ -1053,41 +1054,557 @@ func TestRestart_PromotionWaitsForPodReadyAndWindow(t *testing.T) {
 	}
 }
 
-// TestRestart_DeadlineFailedRowIsNotPromotedByAHealthyPodSet: past the
-// deadline the row reads Failed with the Restart operation preserved,
-// and nothing promotes from there — a healthy set on a spent attempt
-// raises no rebuild trigger, so the restart pass never runs on the row
-// and no Ready stamp is written. Recovery is the Failed machine's
-// business: a corrective revision or a due block.
-func TestRestart_DeadlineFailedRowIsNotPromotedByAHealthyPodSet(t *testing.T) {
+// A repair whose attempt the deadline ended keeps its two exits: the
+// rebuilt set coming up resumes the promote at the incarnation the pods
+// carry, with no new attempt and no operator action.
+func TestRestart_DeadlineFailedRowResumesItsPromote(t *testing.T) {
 	resetExpectations(t)
+	now := time.Now()
 	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 2)
-	spent := v1beta1.OMENativeInstanceStatus{
+	ir.Status.InstanceStatuses[0] = spentRepairRow(now, 0)
+	// The rebuild came up after the deadline had already ended the attempt.
+	pod := promotableRebuiltPod(isvc, 2, now)
+	c := newFakeClient(t, isvc, ir, pod)
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.Clock = clocktesting.NewFakeClock(now)
+
+	needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod})
+	if !needs || reason != "" {
+		t.Fatalf("restart trigger: got (%v, %q) want a resume with no new reason", needs, reason)
+	}
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, reason)
+	if err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if !done {
+		t.Fatalf("Restart: done=false, want the promote to land on a set that is already PodReady")
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceReady || s.Operation != nil {
+		t.Fatalf("row = %+v, want Ready with the spent operation cleared", s)
+	}
+	if s.Incarnation != 2 {
+		t.Errorf("incarnation = %d, want 2: a set that came up is promoted, not rebuilt", s.Incarnation)
+	}
+}
+
+// spentRepairRow is a Restart parked at Failed an hour ago, with retries
+// re-arms already spent and the failure that parked it recorded: a crash
+// loop, a cause outside the set the kubelet retries in place, so the
+// ladder owes it a re-arm.
+func spentRepairRow(now time.Time, retries int32) v1beta1.OMENativeInstanceStatus {
+	return spentRepairRowOn(now, retries, "CrashLoopBackOff")
+}
+
+// spentRepairRowOn is spentRepairRow with the recorded failure's reason
+// chosen by the test.
+func spentRepairRowOn(now time.Time, retries int32, reason string) v1beta1.OMENativeInstanceStatus {
+	return v1beta1.OMENativeInstanceStatus{
 		Index:       0,
 		Incarnation: 2,
 		Phase:       v1beta1.OMENativeInstanceFailed,
 		Operation: &v1beta1.InstanceOperation{
 			ID: "restart-0-1", Type: v1beta1.InstanceOperationRestart, Step: "Drain", Reason: "pod lost",
-			StartedAt: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
-			Deadline:  metav1.NewTime(time.Now().Add(-time.Hour)),
+			StartedAt:  metav1.NewTime(now.Add(-2 * time.Hour)),
+			Deadline:   metav1.NewTime(now.Add(-time.Hour)),
+			RetryCount: retries,
+		},
+		LastFailure: &v1beta1.InstanceTermination{
+			PodName: "llama-70b-engine-0-default-0", Reason: reason,
+			Time: metav1.NewTime(now.Add(-time.Hour)),
 		},
 	}
-	ir.Status.InstanceStatuses[0] = spent
-	// The rebuild came up after the deadline had already ended the attempt.
-	pod := podAtIncarnation(isvc, 0, 2, true /* ready */, true /* serving */)
+}
+
+// promotableRebuiltPod is a rebuilt pod at incarnation that cleared the
+// promote bar: ContainersReady, serving, and PodReady folded by kubelet.
+func promotableRebuiltPod(isvc *v1beta1.InferenceService, incarnation int64, now time.Time) *corev1.Pod {
+	pod := podAtIncarnation(isvc, 0, incarnation, true /* ready */, true /* serving */)
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+		Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+	})
+	return pod
+}
+
+// wedgedRebuiltPod is a rebuilt pod at incarnation parked in a terminal
+// waiting reason since created.
+func wedgedRebuiltPod(isvc *v1beta1.InferenceService, incarnation int64, reason string, created time.Time) *corev1.Pod {
+	pod := podAtIncarnation(isvc, 0, incarnation, false, false)
+	pod.CreationTimestamp = metav1.NewTime(created)
+	pod.Status.Phase = corev1.PodPending
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "main",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+	}}
+	return pod
+}
+
+// evictedRebuiltPod is a rebuilt pod at incarnation the kubelet evicted
+// after it parked: phase Failed with the eviction on the pod-level
+// reason, its container terminated, readiness withdrawn. It holds the
+// row's stable name and will never run again.
+func evictedRebuiltPod(isvc *v1beta1.InferenceService, incarnation int64, now time.Time) *corev1.Pod {
+	pod := podAtIncarnation(isvc, 0, incarnation, false, false)
+	pod.CreationTimestamp = metav1.NewTime(now.Add(-time.Hour))
+	pod.Status.Phase = corev1.PodFailed
+	pod.Status.Reason = "Evicted"
+	pod.Status.Message = "The node was low on resource: memory."
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "main",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 137, Reason: "Error", FinishedAt: metav1.NewTime(now.Add(-time.Minute)),
+		}},
+	}}
+	return pod
+}
+
+// retryLadder is a lifecycle.updateRetry ladder for the trigger tests.
+func retryLadder(maxAttempts int32, initial time.Duration) *workload.RetryPolicy {
+	return &workload.RetryPolicy{MaxAttempts: maxAttempts, InitialDelay: initial, MaxDelay: 10 * time.Minute, Multiplier: 2}
+}
+
+// spentRepairFixture is a parked repair whose rebuilt pod is still
+// wedged in a crash loop, with the ladder and the failure age the test
+// names.
+//
+// now must be whole seconds: status timestamps round-trip at second
+// precision, and the ladder is measured from the stored failure time.
+func spentRepairFixture(t *testing.T, now time.Time, retries int32, failedAgo time.Duration, ladder *workload.RetryPolicy) (workload.ReconcileInput, workload.ComponentPlan, *corev1.Pod, client.Client, *v1beta1.InferenceService) {
+	t.Helper()
+	return spentRepairFixtureOn(t, now, retries, failedAgo, ladder, "CrashLoopBackOff")
+}
+
+// spentRepairFixtureOn is spentRepairFixture with the wedge's reason,
+// recorded on the row and shown by the pod, chosen by the test.
+func spentRepairFixtureOn(t *testing.T, now time.Time, retries int32, failedAgo time.Duration, ladder *workload.RetryPolicy, reason string) (workload.ReconcileInput, workload.ComponentPlan, *corev1.Pod, client.Client, *v1beta1.InferenceService) {
+	t.Helper()
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 2)
+	row := spentRepairRowOn(now, retries, reason)
+	row.LastFailure.Time = metav1.NewTime(now.Add(-failedAgo))
+	ir.Status.InstanceStatuses[0] = row
+	pod := wedgedRebuiltPod(isvc, 2, reason, now.Add(-failedAgo-time.Minute))
 	c := newFakeClient(t, isvc, ir, pod)
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	input.Clock = clocktesting.NewFakeClock(now)
+	input.UpdateRetryPolicy = ladder
+	input.PassWake = &workload.PassWake{}
+	return input, plan, pod, c, isvc
+}
 
-	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
-		t.Fatalf("restart trigger: got true (%q) want false; the set is complete and healthy", reason)
+// A parked repair whose set stays wedged re-arms once the ladder's delay
+// has elapsed since the recorded failure: a whole rebuild at the next
+// incarnation whose operation counts the re-arm, and the wedged pod
+// deleted for it. Once the re-arm has landed the row is an open repair,
+// which the trigger drives without counting a second one.
+func TestDetectRestartTrigger_SpentRepairReArmsWhenTheLadderIsDue(t *testing.T) {
+	now := time.Now()
+	input, plan, pod, c, isvc := spentRepairFixture(t, now, 0, 2*time.Minute, retryLadder(3, time.Minute))
+
+	needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod})
+	if !needs {
+		t.Fatalf("restart trigger: got false, want the re-arm now that the ladder is due")
+	}
+	if !strings.Contains(reason, "repair re-armed (attempt 1)") || !strings.Contains(reason, "CrashLoopBackOff") {
+		t.Errorf("reason = %q, want the attempt number and the failure that parked the last one", reason)
+	}
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, reason); err != nil {
+		t.Fatalf("Restart: %v", err)
 	}
 	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
-	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed {
-		t.Fatalf("Phase: got %+v want Failed; nothing promotes a spent attempt", s)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceRestarting || s.Incarnation != 3 {
+		t.Fatalf("row = %+v, want Restarting at incarnation 3", s)
 	}
-	if s.Operation == nil || s.Operation.Type != v1beta1.InstanceOperationRestart {
-		t.Errorf("Operation: got %+v want the Restart preserved for the Failed machine", s.Operation)
+	if s.Operation == nil || s.Operation.Type != v1beta1.InstanceOperationRestart || s.Operation.RetryCount != 1 || s.Operation.Reason != reason {
+		t.Errorf("operation = %+v, want a fresh Restart counting one re-arm under the trigger's reason", s.Operation)
+	}
+	stored := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), stored); err == nil {
+		t.Errorf("the wedged pod must be deleted by the re-armed drain")
+	}
+
+	input = buildTestInput(isvc, c, workload.ComponentEngine)
+	input.UpdateRetryPolicy = retryLadder(3, time.Minute)
+	needs, reason = ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil)
+	if !needs || reason != "" {
+		t.Errorf("open repair: got (%v, %q) want it driven on with no second re-arm", needs, reason)
+	}
+}
+
+// Before the ladder's delay has elapsed the repair stays parked, and the
+// pass is told when to come back: nothing in the cluster will wake it.
+func TestDetectRestartTrigger_SpentRepairWaitsForTheLadder(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	input, plan, pod, _, _ := spentRepairFixture(t, now, 0, 20*time.Second, retryLadder(3, time.Minute))
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("restart trigger: got true (%q) want false 20s into a 1m delay", reason)
+	}
+	if got := input.PassWake.Pending(); got != 40*time.Second {
+		t.Errorf("wake-up = %v, want the 40s left on the ladder", got)
+	}
+}
+
+// The second re-arm waits out the ladder's second rung, not its first.
+func TestDetectRestartTrigger_SpentRepairLadderGrows(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	input, plan, pod, _, _ := spentRepairFixture(t, now, 1, 90*time.Second, retryLadder(3, time.Minute))
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("restart trigger: got true (%q) want false 90s into the 2m second rung", reason)
+	}
+	if got := input.PassWake.Pending(); got != 30*time.Second {
+		t.Errorf("wake-up = %v, want the 30s left on the second rung", got)
+	}
+}
+
+// No ladder configured is the fail-safe: the parked repair is left as it
+// is, with no wake-up, and a Restart pass that reaches the row writes
+// nothing.
+func TestDetectRestartTrigger_SpentRepairWithoutALadderStaysParked(t *testing.T) {
+	now := time.Now()
+	input, plan, pod, c, isvc := spentRepairFixture(t, now, 0, time.Hour, nil)
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("restart trigger: got true (%q) want false with no ladder configured", reason)
+	}
+	if got := input.PassWake.Pending(); got != 0 {
+		t.Errorf("wake-up = %v, want none: nothing is coming due", got)
+	}
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "")
+	if err != nil || done {
+		t.Fatalf("Restart on a parked row: done=%v err=%v, want (false, nil)", done, err)
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed || s.Incarnation != 2 || s.Operation == nil || s.Operation.ID != "restart-0-1" {
+		t.Fatalf("row = %+v, want the parked repair untouched", s)
+	}
+}
+
+// A ladder spent to its last rung re-arms nothing more.
+func TestDetectRestartTrigger_SpentRepairStopsAtMaxAttempts(t *testing.T) {
+	now := time.Now()
+	input, plan, pod, _, _ := spentRepairFixture(t, now, 3, time.Hour, retryLadder(3, time.Minute))
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("restart trigger: got true (%q) want false with every re-arm spent", reason)
+	}
+	if got := input.PassWake.Pending(); got != 0 {
+		t.Errorf("wake-up = %v, want none: the ladder is spent", got)
+	}
+}
+
+// A Held block against the revision the repair rebuilds denies the
+// re-arm, exactly as it denies every other rebuild of that revision.
+func TestDetectRestartTrigger_SpentRepairHeldRevisionDeniesTheReArm(t *testing.T) {
+	now := time.Now()
+	input, plan, pod, _, _ := spentRepairFixture(t, now, 0, time.Hour, retryLadder(3, time.Minute))
+	input.ObservedState.InstanceStatuses[0].RunningRevision = "llama-70b-engine-abc12345"
+	input.ObservedState.RetryBlocks = []workload.RetryBlock{{TargetRevision: "llama-70b-engine-abc12345", State: workload.RetryBlockHeld}}
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+		t.Fatalf("restart trigger: got true (%q) want false under a Held block", reason)
+	}
+}
+
+// A set still carrying the incarnation the attempt meant to drain is not
+// a set that came up: it is rebuilt on the ladder like a wedged one.
+func TestDetectRestartTrigger_SpentRepairOldIncarnationSetReArms(t *testing.T) {
+	now := time.Now()
+	input, plan, wedged, c, isvc := spentRepairFixture(t, now, 0, time.Hour, retryLadder(3, time.Minute))
+	// The row's stable name is held by the incarnation the attempt never
+	// drained, healthy and serving, instead of by a rebuilt pod.
+	if err := c.Delete(context.Background(), wedged); err != nil {
+		t.Fatalf("delete rebuilt pod: %v", err)
+	}
+	old := promotableRebuiltPod(isvc, 1, now)
+	if err := c.Create(context.Background(), old); err != nil {
+		t.Fatalf("create old pod: %v", err)
+	}
+
+	needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{old})
+	if !needs || !strings.Contains(reason, "repair re-armed") {
+		t.Fatalf("restart trigger: got (%v, %q) want a re-arm, not a resume", needs, reason)
+	}
+}
+
+// spentRepairCloseCases are the parks a close is owed to once no live
+// pod is left: whatever cause parked the repair, whether or not a ladder
+// is configured, and however many re-arms the ladder has spent.
+var spentRepairCloseCases = []struct {
+	name    string
+	reason  string
+	retries int32
+	ladder  *workload.RetryPolicy
+}{
+	{"crash loop/ladder configured", "CrashLoopBackOff", 0, retryLadder(3, time.Minute)},
+	{"crash loop/no ladder", "CrashLoopBackOff", 0, nil},
+	{"crash loop/ladder spent", "CrashLoopBackOff", 3, retryLadder(3, time.Minute)},
+	{"kubelet-retried cause/ladder configured", "ImagePullBackOff", 0, retryLadder(3, time.Minute)},
+	{"kubelet-retried cause/no ladder", "CreateContainerConfigError", 0, nil},
+}
+
+// assertSpentRepairClosed drives the close of a spent repair whose set
+// is gone: the trigger fires with the close and wakes nothing, the
+// Restart pass clears the spent operation and asks for the pass after,
+// the row keeps its phase, incarnation and failure record, and the
+// restart pass has nothing further to decide on the fresh start.
+func assertSpentRepairClosed(t *testing.T, input workload.ReconcileInput, plan workload.ComponentPlan, c client.Client, isvc *v1beta1.InferenceService, pods []*corev1.Pod, failureReason string, ladder *workload.RetryPolicy) {
+	t.Helper()
+	needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], pods)
+	if !needs || !strings.Contains(reason, "closed") {
+		t.Fatalf("restart trigger: got (%v, %q) want the close of a repair with no live pod left", needs, reason)
+	}
+	if got := input.PassWake.Pending(); got != 0 {
+		t.Errorf("wake-up = %v, want none: the close is owed now", got)
+	}
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, reason)
+	if err != nil || done {
+		t.Fatalf("Restart on the parked row: done=%v err=%v, want (false, nil): the Create pass rebuilds the row on the pass after", done, err)
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed || s.Operation != nil || s.Incarnation != 2 {
+		t.Fatalf("row = %+v, want Failed with the spent operation cleared and the incarnation kept", s)
+	}
+	if s.LastFailure == nil || s.LastFailure.Reason != failureReason {
+		t.Errorf("lastFailure = %+v, want the reason %s kept on the row", s.LastFailure, failureReason)
+	}
+	after := buildTestInput(isvc, c, workload.ComponentEngine)
+	after.UpdateRetryPolicy = ladder
+	after.PassWake = &workload.PassWake{}
+	if needs, reason := ops.DetectRestartTriggerWithPods(after, plan, plan.Instances[0], pods); needs {
+		t.Fatalf("restart trigger after the close: got true (%q) want false: the fresh start is the Create pass's", reason)
+	}
+}
+
+// A parked repair with no pod left has nothing to resume or re-arm, so
+// the trigger closes it: the spent operation is cleared and the row is
+// the fresh start the Create pass rebuilds, whatever parked the repair
+// and whether or not a ladder is configured.
+func TestDetectRestartTrigger_SpentRepairWithNoPodsCloses(t *testing.T) {
+	for _, tc := range spentRepairCloseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			input, plan, wedged, c, isvc := spentRepairFixtureOn(t, now, tc.retries, time.Hour, tc.ladder, tc.reason)
+			if err := c.Delete(context.Background(), wedged); err != nil {
+				t.Fatalf("delete the parked pod: %v", err)
+			}
+			assertSpentRepairClosed(t, input, plan, c, isvc, nil, tc.reason, tc.ladder)
+		})
+	}
+}
+
+// A parked repair whose only pod is in a terminal phase — evicted after
+// the park — has no live pod to resume or re-arm either: the trigger
+// closes it, and the dead occupant is left where it is for the Create
+// pass's recycle, which frees the name before the rebuild.
+func TestDetectRestartTrigger_SpentRepairWithOnlyATerminalPodCloses(t *testing.T) {
+	for _, tc := range spentRepairCloseCases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			input, plan, wedged, c, isvc := spentRepairFixtureOn(t, now, tc.retries, time.Hour, tc.ladder, tc.reason)
+			if err := c.Delete(context.Background(), wedged); err != nil {
+				t.Fatalf("delete the parked pod: %v", err)
+			}
+			evicted := evictedRebuiltPod(isvc, 2, now)
+			if err := c.Create(context.Background(), evicted); err != nil {
+				t.Fatalf("create the evicted pod: %v", err)
+			}
+			assertSpentRepairClosed(t, input, plan, c, isvc, []*corev1.Pod{evicted}, tc.reason, tc.ladder)
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(evicted), &corev1.Pod{}); err != nil {
+				t.Errorf("the evicted pod must stay for the Create pass's recycle: %v", err)
+			}
+		})
+	}
+}
+
+// A parked repair whose pod is still live keeps its exits exactly: a set
+// that came up resumes, a wedged set re-arms on the ladder, and a pod
+// still terminating holds its name until it is gone, so neither the
+// close nor a re-arm is decided on it.
+func TestDetectRestartTrigger_SpentRepairWithALivePodIsNotClosed(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	t.Run("a set that came up resumes", func(t *testing.T) {
+		input, plan, wedged, c, isvc := spentRepairFixture(t, now, 0, time.Hour, retryLadder(3, time.Minute))
+		if err := c.Delete(context.Background(), wedged); err != nil {
+			t.Fatalf("delete the parked pod: %v", err)
+		}
+		up := promotableRebuiltPod(isvc, 2, now)
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{up}); !needs || reason != "" {
+			t.Fatalf("restart trigger: got (%v, %q) want the resume, which carries no reason", needs, reason)
+		}
+	})
+	t.Run("a wedged set re-arms on the ladder", func(t *testing.T) {
+		input, plan, pod, _, _ := spentRepairFixture(t, now, 0, 2*time.Minute, retryLadder(3, time.Minute))
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); !needs || !strings.Contains(reason, "repair re-armed") {
+			t.Fatalf("restart trigger: got (%v, %q) want the ladder's re-arm", needs, reason)
+		}
+	})
+	t.Run("a terminating pod holds its name", func(t *testing.T) {
+		input, plan, pod, _, _ := spentRepairFixture(t, now, 0, time.Hour, retryLadder(3, time.Minute))
+		terminating := pod.DeepCopy()
+		terminating.DeletionTimestamp = &metav1.Time{Time: now}
+		terminating.Finalizers = []string{"example.com/termination"}
+		if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{terminating}); needs {
+			t.Fatalf("restart trigger: got true (%q) want false while the pod still terminates", reason)
+		}
+		if got := input.PassWake.Pending(); got != 0 {
+			t.Errorf("wake-up = %v, want none: the pod leaving is the next event", got)
+		}
+	})
+}
+
+// kubeletRetriedReasons are the waiting reasons the kubelet retries in
+// place and a fresh pod set cannot clear: the workload-caused set. A
+// repair parked on one waits for the configuration or image instead of
+// re-arming on the ladder.
+var kubeletRetriedReasons = []string{"CreateContainerConfigError", "ErrImagePull", "ImagePullBackOff", "InvalidImageName"}
+
+// A repair parked on a cause the kubelet retries in place owes no re-arm:
+// past the ladder's first delay and past its whole span alike, the row
+// stays Failed with its reason, no wake-up is deposited, no Restarting
+// stamp lands and the wedged pod is left where the kubelet retries it.
+func TestDetectRestartTrigger_SpentRepairOnAKubeletRetriedCauseOwesNoReArm(t *testing.T) {
+	for _, reason := range kubeletRetriedReasons {
+		for _, failedAgo := range []time.Duration{2 * time.Minute, time.Hour} {
+			t.Run(fmt.Sprintf("%s/%s", reason, failedAgo), func(t *testing.T) {
+				now := time.Now()
+				input, plan, pod, c, isvc := spentRepairFixtureOn(t, now, 0, failedAgo, retryLadder(3, time.Minute), reason)
+
+				if needs, got := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); needs {
+					t.Fatalf("restart trigger: got true (%q) want false: the kubelet retries %s in place", got, reason)
+				}
+				if got := input.PassWake.Pending(); got != 0 {
+					t.Errorf("wake-up = %v, want none: no re-arm is coming due", got)
+				}
+				done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "")
+				if err != nil || done {
+					t.Fatalf("Restart on the parked row: done=%v err=%v, want (false, nil)", done, err)
+				}
+				s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+				if s == nil || s.Phase != v1beta1.OMENativeInstanceFailed || s.Incarnation != 2 ||
+					s.Operation == nil || s.Operation.ID != "restart-0-1" || s.Operation.RetryCount != 0 {
+					t.Fatalf("row = %+v, want the parked repair untouched", s)
+				}
+				if s.LastFailure == nil || s.LastFailure.Reason != reason {
+					t.Errorf("lastFailure = %+v, want the reason %s kept on the row", s.LastFailure, reason)
+				}
+				if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); err != nil {
+					t.Errorf("the wedged pod must stay for the kubelet to retry: %v", err)
+				}
+			})
+		}
+	}
+}
+
+// RepairRetryAt owes a re-arm to every parked cause but the ones the
+// kubelet retries in place, and to a park that recorded no failure at
+// all, which is measured from the operation's own timestamps.
+func TestRepairRetryAt_OwesNoReArmToAKubeletRetriedCause(t *testing.T) {
+	now := time.Now()
+	input := workload.ReconcileInput{UpdateRetryPolicy: retryLadder(3, time.Minute), Clock: clocktesting.NewFakeClock(now)}
+	parked := func(reason string) *workload.InstanceStatus {
+		return &workload.InstanceStatus{
+			Index: 0, Incarnation: 2, Phase: workload.InstancePhaseFailed,
+			Operation: &workload.InstanceOperation{
+				ID: "restart-0-1", Type: workload.InstanceOperationRestart, Step: "Drain",
+				StartedAt: metav1.NewTime(now.Add(-2 * time.Hour)), LastProgressAt: metav1.NewTime(now.Add(-90 * time.Minute)),
+			},
+			LastFailure: &workload.InstanceTermination{PodName: "llama-70b-engine-0-default-0", Reason: reason, Time: metav1.NewTime(now.Add(-time.Hour))},
+		}
+	}
+	for _, reason := range kubeletRetriedReasons {
+		if at, owed := ops.RepairRetryAt(input, parked(reason)); owed {
+			t.Errorf("%s: owed a re-arm at %v, want none: the kubelet retries it in place", reason, at)
+		}
+	}
+	for _, reason := range []string{"CrashLoopBackOff", "RunContainerError", "CreateContainerError", "DeadlineExceeded", ""} {
+		row := parked(reason)
+		at, owed := ops.RepairRetryAt(input, row)
+		if !owed {
+			t.Errorf("%q: owed no re-arm, want one on the ladder", reason)
+			continue
+		}
+		if want := row.LastFailure.Time.Add(time.Minute); !at.Equal(want) {
+			t.Errorf("%q: re-arm at %v, want %v, the ladder's first delay from the recorded failure", reason, at, want)
+		}
+	}
+	row := parked("CrashLoopBackOff")
+	row.LastFailure = nil
+	if at, owed := ops.RepairRetryAt(input, row); !owed || !at.Equal(row.Operation.LastProgressAt.Add(time.Minute)) {
+		t.Errorf("no failure recorded: (%v, %v), want a re-arm measured from the operation's last progress", at, owed)
+	}
+}
+
+// A ladder spent on a cause the kubelet retries in place is not what
+// holds the row: the park waits for the configuration or image and
+// resumes on its own, so it is not read as exhausted.
+func TestRepairRetriesExhausted_SkipsAKubeletRetriedCause(t *testing.T) {
+	now := time.Now()
+	input := workload.ReconcileInput{UpdateRetryPolicy: retryLadder(3, time.Minute)}
+	spent := func(reason string) *workload.InstanceStatus {
+		return &workload.InstanceStatus{
+			Phase:       workload.InstancePhaseFailed,
+			Operation:   &workload.InstanceOperation{ID: "restart-0-4", Type: workload.InstanceOperationRestart, RetryCount: 3},
+			LastFailure: &workload.InstanceTermination{Reason: reason, Time: metav1.NewTime(now.Add(-time.Hour))},
+		}
+	}
+	for _, reason := range kubeletRetriedReasons {
+		if ops.RepairRetriesExhausted(input, spent(reason)) {
+			t.Errorf("%s: read as exhausted, want a park that waits for the fix", reason)
+		}
+	}
+	if !ops.RepairRetriesExhausted(input, spent("CrashLoopBackOff")) {
+		t.Errorf("CrashLoopBackOff: a spent ladder must still read as exhausted")
+	}
+}
+
+// A re-arm already in flight is driven on whatever the recorded failure
+// says: the exclusion reads a parked row only, and the open repair runs
+// to its own park.
+func TestDetectRestartTrigger_OpenRepairOnAKubeletRetriedCauseIsDrivenOn(t *testing.T) {
+	now := time.Now()
+	input, plan, _, _, _ := spentRepairFixtureOn(t, now, 1, time.Minute, retryLadder(3, time.Minute), "CreateContainerConfigError")
+	input.ObservedState.InstanceStatuses[0].Phase = workload.InstancePhaseRestarting
+
+	if needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], nil); !needs || reason != "" {
+		t.Fatalf("open repair: got (%v, %q) want it driven on with no second re-arm", needs, reason)
+	}
+}
+
+// The recovery from such a park is the kubelet's: once the pod it left
+// in place comes up, the repair resumes its promote at the incarnation
+// the pod carries, with no re-arm in between and whether or not a ladder
+// is configured.
+func TestRestart_KubeletRetriedCauseClearedResumesThePromote(t *testing.T) {
+	for _, ladder := range []*workload.RetryPolicy{retryLadder(3, time.Minute), nil} {
+		resetExpectations(t)
+		now := time.Now()
+		isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 2)
+		ir.Status.InstanceStatuses[0] = spentRepairRowOn(now, 0, "ImagePullBackOff")
+		pod := promotableRebuiltPod(isvc, 2, now)
+		c := newFakeClient(t, isvc, ir, pod)
+		plan := buildPlanSinglePodEngineForRestart(c, isvc)
+		input := buildTestInput(isvc, c, workload.ComponentEngine)
+		input.Clock = clocktesting.NewFakeClock(now)
+		input.UpdateRetryPolicy = ladder
+		input.PassWake = &workload.PassWake{}
+
+		needs, reason := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod})
+		if !needs || reason != "" {
+			t.Fatalf("restart trigger: got (%v, %q) want a resume with no new reason", needs, reason)
+		}
+		done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, reason)
+		if err != nil || !done {
+			t.Fatalf("Restart: done=%v err=%v, want the promote to land", done, err)
+		}
+		s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+		if s == nil || s.Phase != v1beta1.OMENativeInstanceReady || s.Operation != nil || s.Incarnation != 2 {
+			t.Fatalf("row = %+v, want Ready at incarnation 2 with the spent operation cleared", s)
+		}
 	}
 }
 
@@ -1134,7 +1651,7 @@ func TestRestart_OperatorConfigChangesDoNotChangeWhatItDecides(t *testing.T) {
 			change(&input, &plan)
 		}
 
-		done, err := ops.Restart(context.Background(), workload.Deps{Client: c, Clock: clk}, input, plan, plan.Instances[0], "pod lost")
+		done, err := ops.Restart(context.Background(), workload.Deps{Client: c, Clock: clk}, input, plan, plan.Instances[0], nil, "pod lost")
 		if err != nil {
 			t.Fatalf("Restart: %v", err)
 		}
@@ -1434,7 +1951,7 @@ func TestRestart_ReObservedCrashLoopArmsNothingASecondTime(t *testing.T) {
 	plan.RestartPolicy = workload.RestartPolicyNone
 
 	// The stamp lands: the row leaves Ready at a bumped incarnation.
-	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "pod CrashLoopBackOff"); err != nil {
 		t.Fatalf("Restart (stamp): %v", err)
 	}
 	armed := instanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
@@ -1449,7 +1966,7 @@ func TestRestart_ReObservedCrashLoopArmsNothingASecondTime(t *testing.T) {
 	input.ObservedState.CurrentRevision = crashLoopRevision
 	plan = buildPlanSinglePodEngineForRestart(c, isvc)
 	plan.RestartPolicy = workload.RestartPolicyNone
-	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "pod CrashLoopBackOff"); err != nil {
 		t.Fatalf("Restart (re-observation): %v", err)
 	}
 
@@ -1477,14 +1994,14 @@ func TestRestart_PodLostAsTheRepairStampCommitsStillDrains(t *testing.T) {
 	ir.Status.InstanceStatuses[0].RunningRevision = crashLoopRevision
 	// The pod the crash-loop trigger read is gone by the time the stamp
 	// commits, so the pass sees the index with no pods at all.
-	c := newFakeClient(t, isvc, ir)
+	c := newFakeClient(t, isvc, ir, fixtureRevision(t, isvc))
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
 	input.StuckPodGrace = time.Minute
 	input.ObservedState.CurrentRevision = crashLoopRevision
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
 	plan.RestartPolicy = workload.RestartPolicyNone
 
-	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "pod CrashLoopBackOff"); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
 
@@ -1507,7 +2024,7 @@ func TestRestart_PodLostAsTheRepairStampCommitsStillDrains(t *testing.T) {
 	input.ObservedState.CurrentRevision = crashLoopRevision
 	plan = buildPlanSinglePodEngineForRestart(c, isvc)
 	plan.RestartPolicy = workload.RestartPolicyNone
-	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod CrashLoopBackOff"); err != nil {
+	if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], nil, "pod CrashLoopBackOff"); err != nil {
 		t.Fatalf("Restart (rebuild): %v", err)
 	}
 
@@ -1523,47 +2040,55 @@ func TestRestart_PodLostAsTheRepairStampCommitsStillDrains(t *testing.T) {
 	}
 }
 
-// A new target revision arriving while the repair is stamped or open
-// waits for it: the update trigger declines any row below Ready, so the
-// roll re-enters from Ready — or from Failed — once the repair resolves.
-func TestDetectUpdateTrigger_NewTargetWaitsForAnOpenCrashLoopRepair(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		step string
-	}{
-		{name: "stamp landing", step: ""},
-		{name: "repair open", step: "Drain"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			resetExpectations(t)
-			isvc := minimalISVC("llama-70b", "prod", 1)
-			op := &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationRestart, Reason: "pod CrashLoopBackOff"}
-			op.Step = tc.step
-			ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
-				Index:           0,
-				Incarnation:     2,
-				Phase:           v1beta1.OMENativeInstanceRestarting,
-				RunningRevision: crashLoopRevision,
-				Operation:       op,
-			})
-			c := newFakeClient(t, isvc, ir)
-			input := buildTestInput(isvc, c, workload.ComponentEngine)
-			input.ObservedState.CurrentRevision = crashLoopRevision
-			plan := buildPlanSinglePodEngineForRestart(c, isvc)
+// A new target revision meets a crash-loop repair in one of two windows.
+// While the repair is open the target waits: the update trigger declines
+// a row below Ready, and the roll re-enters from Ready or from Failed once
+// the repair resolves. Before the repair has opened, the row is a Ready
+// row off the target, so the trigger fires and the roll takes the row —
+// the repair never opens on it.
+func TestDetectUpdateTrigger_NewTargetAgainstACrashLoopRepair(t *testing.T) {
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "prod", Name: "llama-70b-engine-newtarget",
+	}}
 
-			target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
-				Namespace: "prod", Name: "llama-70b-engine-newtarget",
-			}}
-			trigger, _, err := ops.DetectUpdateTriggerWithPods(context.Background(), workload.Deps{Client: c},
-				input, plan, plan.Instances[0], target, nil)
-			if err != nil {
-				t.Fatalf("DetectUpdateTriggerWithPods: %v", err)
-			}
-			if trigger {
-				t.Fatalf("a row below Ready must not be rolled; the new target waits for the repair")
-			}
+	t.Run("repair open: the target waits", func(t *testing.T) {
+		resetExpectations(t)
+		isvc := minimalISVC("llama-70b", "prod", 1)
+		ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
+			Index:           0,
+			Incarnation:     2,
+			Phase:           v1beta1.OMENativeInstanceRestarting,
+			RunningRevision: crashLoopRevision,
+			Operation:       &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationRestart, Step: "Drain", Reason: "pod CrashLoopBackOff"},
 		})
-	}
+		c := newFakeClient(t, isvc, ir)
+		input := buildTestInput(isvc, c, workload.ComponentEngine)
+		input.ObservedState.CurrentRevision = crashLoopRevision
+		plan := buildPlanSinglePodEngineForRestart(c, isvc)
+
+		trigger, _, err := ops.DetectUpdateTriggerWithPods(context.Background(), workload.Deps{Client: c},
+			input, plan, plan.Instances[0], target, nil)
+		if err != nil {
+			t.Fatalf("DetectUpdateTriggerWithPods: %v", err)
+		}
+		if trigger {
+			t.Fatalf("a row below Ready must not be rolled; the new target waits for the open repair")
+		}
+	})
+
+	t.Run("repair not yet open: the roll takes the row", func(t *testing.T) {
+		input, plan, pod := crashLoopInput(t, time.Minute)
+		if needs, _ := ops.DetectRestartTriggerWithPods(input, plan, plan.Instances[0], []*corev1.Pod{pod}); !needs {
+			t.Fatalf("the fixture must hold a crash loop the repair would otherwise open on")
+		}
+		if !ops.RepairYieldsToTarget(input, plan, plan.Instances[0], target, []*corev1.Pod{pod}) {
+			t.Fatalf("a Ready row off the target must be yielded to the roll")
+		}
+		dec := ops.EvaluateUpdateTrigger(input, plan.Instances[0], target, []*corev1.Pod{pod})
+		if !dec.Trigger {
+			t.Fatalf("the update trigger must take the off-target row; decision = %+v", dec)
+		}
+	})
 }
 
 // gangMarkerRevision is the replacement gang's target.
@@ -1780,19 +2305,24 @@ func TestDetectRestartTrigger_DemotedRowRepairsAtRunningRevision(t *testing.T) {
 
 // The repair of a demoted row is the ordinary Restart: the incarnation is
 // bumped, the row moves to Restarting, and the pod set is recreated at the
-// revision the row records rather than at the Component's target.
+// revision the row records rather than at the Component's target, which
+// the pause withholds.
 func TestRestart_DemotedRowRebuildsAtRunningRevision(t *testing.T) {
 	resetExpectations(t)
 	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
 	running := "llama-70b-engine-" + testRevisionHash
 	ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstancePending
 	ir.Status.InstanceStatuses[0].RunningRevision = running
-	c := newFakeClient(t, isvc, ir)
+	c := newFakeClient(t, isvc, ir, fixtureRevision(t, isvc))
 	input := buildTestInput(isvc, c, workload.ComponentEngine)
-	input.ObservedState.UpdateRevision = "llama-70b-engine-0000target"
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-0000target", Namespace: "prod"}}
+	input.ObservedState.UpdateRevision = target.Name
 	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	// A demoted row off an open target is the Create pass's; the repair
+	// reaches it under a pause, which withholds the roll.
+	plan.Paused = true
 
-	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], "pod count 0 below desired 1")
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], target, "pod count 0 below desired 1")
 	if err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
@@ -1817,5 +2347,624 @@ func TestRestart_DemotedRowRebuildsAtRunningRevision(t *testing.T) {
 	}
 	if want := query.RevisionFromName(running).Hash(); labels[query.LabelRevisionHash] != want {
 		t.Errorf("rebuilt pod revision label = %q, want the running revision %q, never the target", labels[query.LabelRevisionHash], want)
+	}
+}
+
+// The restart pass repairs an Instance only at a revision the Component
+// still wants. RepairYieldsToTarget is the selection's question: a row
+// whose rebuild revision is not the roll target is left to the pass that
+// rebuilds it AT the target — the update pass for a Ready or Failed row,
+// the Create pass for a superseded first materialization and for a
+// demoted row with no pod left. An open Restart, a Migrate-owned row and
+// a demoted row that holds pods again are never yielded.
+func TestRepairYieldsToTarget(t *testing.T) {
+	const running = "llama-70b-engine-" + testRevisionHash
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-0000next", Namespace: "prod"}}
+	sameTarget := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: running, Namespace: "prod"}}
+	survivor := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "survivor"}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	dead := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "dead"}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	inst := workload.InstancePlan{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}}
+
+	cases := []struct {
+		name   string
+		row    *workload.InstanceStatus
+		target *appsv1.ControllerRevision
+		pods   []*corev1.Pod
+		paused bool
+		blocks []workload.RetryBlock
+		want   bool
+	}{
+		{name: "Ready on the target is repaired", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: sameTarget, want: false},
+		{name: "Ready off the target yields", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, want: true},
+		{name: "a paused Component keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, paused: true, want: false},
+		{name: "a target the RetryBlock holds keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target,
+			blocks: []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockHeld}}, want: false},
+		{name: "a target in Backoff only paces the roll and yields", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target,
+			blocks: []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockBackoff}}, want: true},
+		{name: "Failed off the target yields", row: &workload.InstanceStatus{Phase: workload.InstancePhaseFailed, RunningRevision: running}, target: target, want: true},
+		{name: "a superseded first materialization yields to its retirement", row: &workload.InstanceStatus{
+			Phase:     workload.InstancePhaseCreating,
+			Operation: &workload.InstanceOperation{Type: workload.InstanceOperationCreate, Step: "CreatePods", TargetRevision: running},
+		}, target: target, pods: []*corev1.Pod{survivor}, want: true},
+		{name: "an open Restart is driven whatever the target", row: &workload.InstanceStatus{
+			Phase: workload.InstancePhaseRestarting, RunningRevision: running,
+			Operation: &workload.InstanceOperation{Type: workload.InstanceOperationRestart, Step: workload.RestartStepDrain},
+		}, target: target, want: false},
+		{name: "a Migrate-owned row is its record's", row: &workload.InstanceStatus{Phase: workload.InstancePhaseMigrating, RunningRevision: running}, target: target, want: false},
+		{name: "a demoted row with no pod left yields to Create", row: &workload.InstanceStatus{Phase: workload.InstancePhasePending, RunningRevision: running}, target: target, want: true},
+		{name: "a demoted row whose only pod is terminal yields to Create", row: &workload.InstanceStatus{Phase: workload.InstancePhasePending, RunningRevision: running}, target: target, pods: []*corev1.Pod{dead}, want: true},
+		{name: "a demoted row holding a survivor keeps its repair", row: &workload.InstanceStatus{Phase: workload.InstancePhasePending, RunningRevision: running}, target: target, pods: []*corev1.Pod{survivor}, want: false},
+		{name: "a row recording no revision has nothing to compare", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady}, target: target, want: false},
+		{name: "no target, nothing to yield to", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: nil, want: false},
+		{name: "no row", row: nil, target: target, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := workload.ReconcileInput{}
+			input.ObservedState.RetryBlocks = tc.blocks
+			if tc.row != nil {
+				row := *tc.row
+				row.Index = 0
+				input.ObservedState.InstanceStatuses = []workload.InstanceStatus{row}
+			}
+			plan := workload.ComponentPlan{Component: workload.ComponentEngine, Paused: tc.paused}
+			if got := ops.RepairYieldsToTarget(input, plan, inst, tc.target, tc.pods); got != tc.want {
+				t.Fatalf("RepairYieldsToTarget = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// mintEngineRevision stores spec (and workerSpec, for a gang) as an engine
+// ControllerRevision through the production revision machinery, so the
+// name, the hash and the stored payload are what the adapter writes.
+func mintEngineRevision(t *testing.T, c client.Client, isvc *v1beta1.InferenceService, spec, workerSpec *corev1.PodSpec) *appsv1.ControllerRevision {
+	t.Helper()
+	key := revision.Key{Namespace: isvc.Namespace, Name: isvc.Name + "-" + string(workload.ComponentEngine)}
+	cr, _, err := revision.EnsureControllerRevisionWithWorker(context.Background(), c, c, isvc,
+		v1beta1.SchemeGroupVersion.WithKind("InferenceService"), key, spec, workerSpec, nil, nil, isvc.UID)
+	if err != nil {
+		t.Fatalf("mint revision: %v", err)
+	}
+	return cr
+}
+
+// restartingRow rewrites the engine Instance 0 row as an open Restart at
+// incarnation 2 running rev, with the old pods already gone: the shape
+// Phase B of the repair rebuilds from.
+func restartingRow(t *testing.T, c client.Client, isvc *v1beta1.InferenceService, rev string) {
+	t.Helper()
+	ir := &v1beta1.InferenceReplica{}
+	key := client.ObjectKey{Namespace: isvc.Namespace, Name: irName(isvc, workload.ComponentEngine)}
+	if err := c.Get(context.Background(), key, ir); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+		Index:           0,
+		Incarnation:     2,
+		Phase:           v1beta1.OMENativeInstanceRestarting,
+		RunningRevision: rev,
+		Operation:       &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationRestart, Step: "Drain", Reason: "pod count 0 below desired 1"},
+	}}
+	if err := c.Status().Update(context.Background(), ir); err != nil {
+		t.Fatalf("stamp Restarting row: %v", err)
+	}
+}
+
+// TestRestart_RendersTheStampedRevisionTemplate: the rebuild renders the
+// template the stamped revision stores, not the Component's current one.
+// The running revision was minted with one image and the desired
+// template has moved to another under a pause, which withholds the roll
+// the rebuild would otherwise follow, so a pod rendered from the wrong
+// source is visible by its image: it must carry the running revision's
+// image under the running revision's label, for a single pod and for
+// both members of a gang.
+func TestRestart_RendersTheStampedRevisionTemplate(t *testing.T) {
+	const (
+		runningImage       = "registry.example.com/runtime:v1"
+		runningWorkerImage = "registry.example.com/runtime-worker:v1"
+		movedImage         = "registry.example.com/runtime:v2"
+		movedWorkerImage   = "registry.example.com/runtime-worker:v2"
+	)
+	cases := []struct {
+		name string
+		gang bool
+	}{
+		{name: "single pod"},
+		{name: "gang", gang: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetExpectations(t)
+			isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+			c := newFakeClient(t, isvc, ir)
+			var workerSpec *corev1.PodSpec
+			if tc.gang {
+				workerSpec = &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: runningWorkerImage}}}
+			}
+			running := mintEngineRevision(t, c, isvc, &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: runningImage}}}, workerSpec)
+			restartingRow(t, c, isvc, running.Name)
+
+			input := buildTestInput(isvc, c, workload.ComponentEngine)
+			input.DesiredSpec.PodSpec = &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: movedImage}}}
+			var plan workload.ComponentPlan
+			if tc.gang {
+				input.DesiredSpec.WorkerPodSpec = &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: movedWorkerImage}}}
+				plan = buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
+			} else {
+				plan = buildPlanSinglePodEngineForRestart(c, isvc)
+			}
+			target := mintEngineRevision(t, c, isvc, input.DesiredSpec.PodSpec, input.DesiredSpec.WorkerPodSpec)
+			input.ObservedState.UpdateRevision = target.Name
+			plan.Paused = true
+
+			done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], target, "pod count 0 below desired 1")
+			if err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			if done {
+				t.Fatalf("expected done=false while the rebuilt pods are not yet Ready")
+			}
+			pods := &corev1.PodList{}
+			if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+				t.Fatalf("list pods: %v", err)
+			}
+			want := 1
+			if tc.gang {
+				want = 2
+			}
+			if len(pods.Items) != want {
+				t.Fatalf("pods: got %d want %d", len(pods.Items), want)
+			}
+			for _, pod := range pods.Items {
+				if got := pod.Labels[query.LabelRevisionHash]; got != query.RevisionOf(running).Hash() {
+					t.Errorf("pod %s revision label = %q, want the running revision %q", pod.Name, got, query.RevisionOf(running).Hash())
+				}
+				wantImage := runningImage
+				if pod.Labels[query.LabelRunner] == "worker" {
+					wantImage = runningWorkerImage
+				}
+				if got := pod.Spec.Containers[0].Image; got != wantImage {
+					t.Errorf("pod %s image = %q, want %q: the rebuild must render the stamped revision's template, not the current one", pod.Name, got, wantImage)
+				}
+			}
+		})
+	}
+}
+
+// TestRestart_RebuildWithNoPodYetFollowsTheTarget: an open repair whose
+// rebuild has created no pod yet renders the roll target when the row is
+// off it, and the row records the target first: the pods come back on the
+// target's image under the target's label and the row's running revision
+// names it, for a single pod and for both members of a gang. The rebuild
+// keeps the revision it stamped once a pod of its own exists, and when the
+// RetryBlock holds the target.
+func TestRestart_RebuildWithNoPodYetFollowsTheTarget(t *testing.T) {
+	const (
+		runningImage = "registry.example.com/runtime:v1"
+		movedImage   = "registry.example.com/runtime:v2"
+	)
+	cases := []struct {
+		name string
+		gang bool
+		// leaderRebuilt seeds a pod of the rebuild before the pass.
+		leaderRebuilt bool
+		// held puts the target under a Held RetryBlock.
+		held    bool
+		follows bool
+	}{
+		{name: "single pod", follows: true},
+		{name: "gang", gang: true, follows: true},
+		{name: "gang whose leader is already rebuilt", gang: true, leaderRebuilt: true},
+		{name: "target the RetryBlock holds", held: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetExpectations(t)
+			isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+			c := newFakeClient(t, isvc, ir)
+			spec := func(image string) *corev1.PodSpec {
+				return &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: image}}}
+			}
+			var runningWorker, movedWorker *corev1.PodSpec
+			if tc.gang {
+				runningWorker, movedWorker = spec(runningImage), spec(movedImage)
+			}
+			running := mintEngineRevision(t, c, isvc, spec(runningImage), runningWorker)
+			target := mintEngineRevision(t, c, isvc, spec(movedImage), movedWorker)
+			restartingRow(t, c, isvc, running.Name)
+			if tc.leaderRebuilt {
+				leader := gangPod(isvc, 0, "leader", 0, 2, false, false)
+				leader.Labels[query.LabelRevisionHash] = query.RevisionOf(running).Hash()
+				if err := c.Create(context.Background(), leader); err != nil {
+					t.Fatalf("seed the rebuilt leader: %v", err)
+				}
+			}
+
+			input := buildTestInput(isvc, c, workload.ComponentEngine)
+			input.DesiredSpec.PodSpec = spec(movedImage)
+			input.DesiredSpec.WorkerPodSpec = movedWorker
+			input.ObservedState.UpdateRevision = target.Name
+			if tc.held {
+				input.ObservedState.RetryBlocks = []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockHeld}}
+			}
+			plan := buildPlanSinglePodEngineForRestart(c, isvc)
+			if tc.gang {
+				plan = buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
+			}
+
+			done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], target, "pod count 0 below desired 1")
+			if err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			if done {
+				t.Fatalf("expected done=false while the rebuilt pods are not yet Ready")
+			}
+
+			wantRevision, wantImage := running, runningImage
+			if tc.follows {
+				wantRevision, wantImage = target, movedImage
+			}
+			pods := &corev1.PodList{}
+			if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+				t.Fatalf("list pods: %v", err)
+			}
+			if want := len(plan.Instances[0].Runners); len(pods.Items) != want {
+				t.Fatalf("pods: got %d want %d", len(pods.Items), want)
+			}
+			for _, pod := range pods.Items {
+				if tc.leaderRebuilt && pod.Labels[query.LabelRunner] == "leader" {
+					continue
+				}
+				if got := pod.Labels[query.LabelRevisionHash]; got != query.RevisionOf(wantRevision).Hash() {
+					t.Errorf("pod %s revision label = %q, want %s", pod.Name, got, wantRevision.Name)
+				}
+				if got := pod.Spec.Containers[0].Image; got != wantImage {
+					t.Errorf("pod %s image = %q, want %q", pod.Name, got, wantImage)
+				}
+			}
+			row := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+			if row == nil || row.Phase != v1beta1.OMENativeInstanceRestarting || row.RunningRevision != wantRevision.Name {
+				t.Fatalf("row = %+v, want Restarting recording %s", row, wantRevision.Name)
+			}
+		})
+	}
+}
+
+// TestRestart_HoldsWhenTheStampedRevisionIsGone: a rebuild whose stamped
+// revision has no ControllerRevision left creates nothing rather than
+// rendering the current template under that revision's label. It says so
+// once per attempt and leaves the attempt open for its deadline.
+func TestRestart_HoldsWhenTheStampedRevisionIsGone(t *testing.T) {
+	resetExpectations(t)
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	c := newFakeClient(t, isvc, ir)
+	const gone = "llama-70b-engine-0000gone"
+	restartingRow(t, c, isvc, gone)
+	plan := buildPlanSinglePodEngineForRestart(c, isvc)
+	rec := record.NewFakeRecorder(8)
+	deps := workload.Deps{Client: c, Recorder: rec}
+
+	for pass := 0; pass < 2; pass++ {
+		fresh := &v1beta1.InferenceService{}
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(isvc), fresh); err != nil {
+			t.Fatalf("get isvc: %v", err)
+		}
+		input := buildTestInput(fresh, c, workload.ComponentEngine)
+		done, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], nil, "pod count 0 below desired 1")
+		if err != nil {
+			t.Fatalf("pass %d: Restart: %v", pass, err)
+		}
+		if done {
+			t.Fatalf("pass %d: a rebuild with no template to render from cannot be done", pass)
+		}
+	}
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods.Items) != 0 {
+		t.Fatalf("the rebuild created %d pod(s) from the current template under the gone revision's label", len(pods.Items))
+	}
+	s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if s == nil || s.Phase != v1beta1.OMENativeInstanceRestarting || s.Operation == nil || s.RunningRevision != gone {
+		t.Fatalf("row = %+v, want the Restart left open on %s", s, gone)
+	}
+	var warnings []string
+	for {
+		select {
+		case e := <-rec.Events:
+			if strings.Contains(e, string(workload.EventReasonRepairRevisionGone)) {
+				warnings = append(warnings, e)
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("%s events = %v, want exactly one across two passes", workload.EventReasonRepairRevisionGone, warnings)
+	}
+	if !strings.Contains(warnings[0], gone) || !strings.HasPrefix(warnings[0], "Warning ") {
+		t.Fatalf("event %q must be a Warning naming the revision %s", warnings[0], gone)
+	}
+}
+
+// A crash loop the running revision's ladder holds, on a single-pod
+// Instance whose runner keeps dying after serving and coming back: the
+// hold parks the row while the pod is down and names the loop while it serves.
+
+// crashLoopWindow is the proven window of these stories: the stuck-pod
+// grace with no minReadySeconds configured.
+const crashLoopWindow = 90 * time.Second
+
+// heldCrashLoop is such an Instance: an operation-free row on
+// crashLoopRevision remembering its set's crash, and that set's pod, back
+// up (Ready for readyFor) when serving, else parked in CrashLoopBackOff.
+type heldCrashLoop struct {
+	t          *testing.T
+	isvc       *v1beta1.InferenceService
+	c          client.Client
+	clk        *clocktesting.FakeClock
+	pod        *corev1.Pod
+	plan       workload.ComponentPlan
+	readySince metav1.Time
+	crashedAt  metav1.Time
+	warnings   []string
+}
+
+func newHeldCrashLoop(t *testing.T, phase v1beta1.OMENativeInstancePhase, serving bool, readyFor time.Duration) *heldCrashLoop {
+	t.Helper()
+	resetExpectations(t)
+	now := time.Now().Truncate(time.Second)
+	readySince := metav1.NewTime(now.Add(-time.Hour))
+	crashedAt := metav1.NewTime(readySince.Add(20 * time.Minute))
+	isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+	pod := podAtIncarnation(isvc, 0, 1, serving, true /* serving gate */)
+	pod.Spec.Containers[0].Name = constants.MainContainerName
+	pod.CreationTimestamp = metav1.NewTime(readySince.Add(-5 * time.Minute))
+	pod.Status.Phase = corev1.PodRunning
+	exit := int32(1)
+	crashed := &corev1.ContainerStateTerminated{
+		Reason: "Error", ExitCode: exit,
+		StartedAt:  metav1.NewTime(readySince.Add(5 * time.Minute)),
+		FinishedAt: crashedAt,
+	}
+	if serving {
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{runnerStatus(constants.MainContainerName, crashedAt.Add(time.Minute), crashed)}
+		pod.Status.ContainerStatuses[0].Ready = true
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now.Add(-readyFor)),
+		})
+	} else {
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:                 constants.MainContainerName,
+			RestartCount:         2,
+			State:                corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "back-off restarting failed container"}},
+			LastTerminationState: corev1.ContainerState{Terminated: crashed},
+		}}
+		down := metav1.NewTime(now.Add(-time.Minute))
+		pod.Status.Conditions = append(pod.Status.Conditions,
+			corev1.PodCondition{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, LastTransitionTime: down},
+			corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionFalse, LastTransitionTime: down})
+	}
+	row := &ir.Status.InstanceStatuses[0]
+	row.Phase = phase
+	row.ReadySince = &readySince
+	row.RunningRevision = crashLoopRevision
+	row.LastFailure = &v1beta1.InstanceTermination{
+		PodName: pod.Name, ContainerName: constants.MainContainerName, Reason: "Error", ExitCode: &exit,
+		Message: "back-off restarting failed container",
+		Time:    crashedAt,
+	}
+	c := newFakeClient(t, isvc, ir, pod)
+	h := &heldCrashLoop{t: t, isvc: isvc, c: c, clk: clocktesting.NewFakeClock(now), pod: pod, readySince: readySince, crashedAt: crashedAt}
+	h.plan = buildPlanSinglePodEngineForRestart(c, isvc)
+	return h
+}
+
+// input is a pass's view of the row as persisted. held puts the running
+// revision's ladder in Held, with the row's crash counted on it.
+func (h *heldCrashLoop) input(held bool) workload.ReconcileInput {
+	h.t.Helper()
+	in := buildTestInput(h.isvc, h.c, workload.ComponentEngine)
+	in.Clock = h.clk
+	in.StuckPodGrace = crashLoopWindow
+	in.ObservedState.UpdateRevision = crashLoopRevision
+	in.ObservedState.CurrentRevision = crashLoopRevision
+	in.DesiredSpec.PodSpec = &corev1.PodSpec{Containers: []corev1.Container{{Name: constants.MainContainerName, Image: "test:v1"}}}
+	if held {
+		first := metav1.NewTime(h.readySince.Add(10 * time.Minute))
+		last := h.crashedAt
+		in.ObservedState.RetryBlocks = []workload.RetryBlock{{
+			TargetRevision: crashLoopRevision, State: workload.RetryBlockHeld, AttemptsStarted: 3,
+			FirstFailureAt: &first, LastFailureAt: &last, Reason: "Error",
+		}}
+	}
+	in.WarnInstanceFailed = func(idx int32, podName, reason string) {
+		h.warnings = append(h.warnings, fmt.Sprintf("instance=%d pod=%s %s", idx, podName, reason))
+	}
+	return in
+}
+
+// pass runs the restart pass's selection and, when it selects the row,
+// its Restart, returning whether the row was selected and whether the
+// Restart reported done.
+func (h *heldCrashLoop) pass(in workload.ReconcileInput) (selected, done bool) {
+	h.t.Helper()
+	needs, reason := ops.DetectRestartTriggerWithPods(in, h.plan, h.plan.Instances[0], []*corev1.Pod{h.pod})
+	if !needs {
+		return false, false
+	}
+	done, err := ops.Restart(context.Background(), workload.Deps{Client: h.c}, in, h.plan, h.plan.Instances[0], nil, reason)
+	if err != nil {
+		h.t.Fatalf("Restart: %v", err)
+	}
+	return true, done
+}
+
+func (h *heldCrashLoop) row() v1beta1.OMENativeInstanceStatus {
+	h.t.Helper()
+	rows := instanceStatusesOnIR(h.c, h.isvc, workload.ComponentEngine)
+	if len(rows) != 1 {
+		h.t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	return rows[0]
+}
+
+// namesCrashLoop reports whether the row's failure record names the
+// crash loop beside the kubelet's own message.
+func namesCrashLoop(row v1beta1.OMENativeInstanceStatus) bool {
+	return row.LastFailure != nil && strings.Contains(row.LastFailure.Message, "crash loop")
+}
+
+// A held ladder parks nothing a serving set sits on: the row stays Ready
+// naming the crash loop, no warning fires, and it is not selected again.
+func TestRestart_HeldLadderKeepsAServingSetReadyAndNamesTheLoop(t *testing.T) {
+	h := newHeldCrashLoop(t, v1beta1.OMENativeInstanceReady, true /* serving */, 30*time.Second)
+
+	selected, done := h.pass(h.input(true))
+	if !selected {
+		t.Fatalf("the hold must take the row once, to name the crash loop on it")
+	}
+	row := h.row()
+	if row.Phase != v1beta1.OMENativeInstanceReady {
+		t.Fatalf("row reads %s while its only pod is Ready and serving; an Instance whose only pod serves is not Failed (warnings=%v)", row.Phase, h.warnings)
+	}
+	if !done {
+		t.Fatalf("naming the loop leaves nothing in flight; got done=false")
+	}
+	if !namesCrashLoop(row) {
+		t.Fatalf("the row must name the crash loop on its failure record; got %+v", row.LastFailure)
+	}
+	if row.ReadySince == nil || !row.ReadySince.Time.Equal(h.readySince.Time) {
+		t.Fatalf("ReadySince must stay at the promotion the crash is measured from; got %v want %v", row.ReadySince, h.readySince)
+	}
+	if len(h.warnings) != 0 {
+		t.Fatalf("no InstanceFailed warning while the set serves; got %v", h.warnings)
+	}
+	if selected, _ := h.pass(h.input(true)); selected {
+		t.Fatalf("a named serving set must not be selected on every pass")
+	}
+}
+
+// Once the set is out of serving the hold parks the row:
+// Failed, no operation, the crash recorded, one warning naming the hold.
+func TestRestart_HeldLadderParksTheSetOnceItLeavesServing(t *testing.T) {
+	h := newHeldCrashLoop(t, v1beta1.OMENativeInstanceReady, false /* down */, 0)
+
+	selected, done := h.pass(h.input(true))
+	if !selected {
+		t.Fatalf("a held ladder must park a set that is down")
+	}
+	if done {
+		t.Fatalf("a park is not a repair that finished; got done=true")
+	}
+	row := h.row()
+	if row.Phase != v1beta1.OMENativeInstanceFailed || row.Operation != nil {
+		t.Fatalf("row = %s with operation %+v, want Failed with none", row.Phase, row.Operation)
+	}
+	if row.LastFailure == nil || row.LastFailure.PodName != h.pod.Name {
+		t.Fatalf("the park must record the crashed pod; got %+v", row.LastFailure)
+	}
+	if len(h.warnings) != 1 || !strings.Contains(h.warnings[0], "held after 3 failed attempts") {
+		t.Fatalf("one InstanceFailed warning naming the hold; got %v", h.warnings)
+	}
+}
+
+// A park whose only pod is Ready and serving returns to Ready, named under
+// the hold and plain after a release, anchors kept; a down pod stays parked.
+func TestRestart_CrashLoopParkReturnsToReadyWhileItsSetServes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		held  bool
+		named bool
+	}{
+		{name: "under the held ladder, naming the loop", held: true, named: true},
+		{name: "after the hold is released, as plain Ready", held: false, named: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHeldCrashLoop(t, v1beta1.OMENativeInstanceFailed, true /* serving */, 30*time.Second)
+
+			selected, done := h.pass(h.input(tc.held))
+			if !selected {
+				t.Fatalf("a crash-loop park whose only pod is Ready and serving must return to Ready; the restart pass left it Failed")
+			}
+			row := h.row()
+			if row.Phase != v1beta1.OMENativeInstanceReady || row.Operation != nil {
+				t.Fatalf("row = %s with operation %+v, want Ready with none", row.Phase, row.Operation)
+			}
+			if !done {
+				t.Fatalf("the unpark leaves nothing in flight; got done=false")
+			}
+			if named := namesCrashLoop(row); named != tc.named {
+				t.Fatalf("names the crash loop = %v, want %v; record %+v", named, tc.named, row.LastFailure)
+			}
+			if row.ReadySince == nil || !row.ReadySince.Time.Equal(h.readySince.Time) {
+				t.Fatalf("ReadySince must stay at the promotion; got %v want %v", row.ReadySince, h.readySince)
+			}
+			if row.LastFailure == nil || !row.LastFailure.Time.Equal(&h.crashedAt) {
+				t.Fatalf("the failure record keeps its time; got %+v", row.LastFailure)
+			}
+			if len(h.warnings) != 0 {
+				t.Fatalf("no InstanceFailed warning on the unpark; got %v", h.warnings)
+			}
+		})
+	}
+	t.Run("while the pod is down it stays parked", func(t *testing.T) {
+		h := newHeldCrashLoop(t, v1beta1.OMENativeInstanceFailed, false /* down */, 0)
+		if selected, _ := h.pass(h.input(true)); selected {
+			t.Fatalf("a park whose pod is down is not selected")
+		}
+		if row := h.row(); row.Phase != v1beta1.OMENativeInstanceFailed {
+			t.Fatalf("row = %s, want Failed", row.Phase)
+		}
+	})
+}
+
+// The naming leaves on its own: a set that holds Ready for the proven
+// window, or a released hold, clears the note and leaves plain Ready.
+func TestRestart_ProvenSetClearsTheCrashLoopNote(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		held    bool
+		advance time.Duration
+	}{
+		{name: "the set holds Ready for the window", held: true, advance: crashLoopWindow},
+		{name: "the hold is released", held: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHeldCrashLoop(t, v1beta1.OMENativeInstanceReady, true /* serving */, 30*time.Second)
+			if selected, _ := h.pass(h.input(true)); !selected {
+				t.Fatalf("the hold must take the row once, to name the crash loop on it")
+			}
+			if row := h.row(); row.Phase != v1beta1.OMENativeInstanceReady || !namesCrashLoop(row) {
+				t.Fatalf("row = %s record %+v, want Ready naming the crash loop", row.Phase, row.LastFailure)
+			}
+
+			h.clk.Step(tc.advance)
+			selected, done := h.pass(h.input(tc.held))
+			if !selected || !done {
+				t.Fatalf("the stale note must be cleared in one pass; selected=%v done=%v", selected, done)
+			}
+			row := h.row()
+			if row.Phase != v1beta1.OMENativeInstanceReady || namesCrashLoop(row) {
+				t.Fatalf("row = %s record %+v, want plain Ready with the note cleared", row.Phase, row.LastFailure)
+			}
+			if row.LastFailure == nil || row.LastFailure.Message != "back-off restarting failed container" {
+				t.Fatalf("the kubelet's own message stays as history; got %+v", row.LastFailure)
+			}
+			if len(h.warnings) != 0 {
+				t.Fatalf("no InstanceFailed warning; got %v", h.warnings)
+			}
+			if tc.held {
+				// Proven under the hold, the row is left alone; after a
+				// release the running revision's ladder reads the row
+				// afresh, which is its own story.
+				if selected, _ := h.pass(h.input(true)); selected {
+					t.Fatalf("a plain Ready row under the hold is not selected")
+				}
+			}
+		})
 	}
 }

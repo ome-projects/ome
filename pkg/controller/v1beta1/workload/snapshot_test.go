@@ -2,9 +2,11 @@ package workload_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -15,6 +17,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -255,4 +258,75 @@ func snapshotPod(name, index string) *corev1.Pod {
 			query.LabelInstanceIdx:                index,
 		},
 	}}
+}
+
+// revisionGetCounter counts the ControllerRevision Gets a reader serves,
+// so a test can assert how many times the snapshot read a revision.
+type revisionGetCounter struct {
+	client.Client
+	gets int
+}
+
+func (c *revisionGetCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*appsv1.ControllerRevision); ok {
+		c.gets++
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestObservedSnapshot_RunningRevisionPodSpecMemoizedByRevision: the
+// running revision an Instance names is read once per revision name,
+// however many Instances share it and however many times Plan asks,
+// through the revision-bookkeeping role (the live reader); a row that
+// names no revision or a revision that is gone is no baseline and no
+// error.
+func TestObservedSnapshot_RunningRevisionPodSpecMemoizedByRevision(t *testing.T) {
+	scheme := snapshotScheme(t)
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add appsv1: %v", err)
+	}
+	spec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "test:v1"}}}
+	raw, err := json.Marshal(revision.DataPayload{PodSpec: spec})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	shared := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "svc-engine-shared", Namespace: "ns"}}
+	shared.Data.Raw = raw
+	// The revision lives only behind the live reader: the cached client
+	// must not be the one answering.
+	live := &revisionGetCounter{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(shared).Build()}
+	cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+	deps := types.Deps{Client: cached, APIReader: live}
+	input := types.ReconcileInput{
+		Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "svc"},
+		ObservedState: types.WorkloadObservedState{InstanceStatuses: []types.InstanceStatus{
+			{Index: 0, RunningRevision: "svc-engine-shared"},
+			{Index: 1, RunningRevision: "svc-engine-shared"},
+			{Index: 2, RunningRevision: "svc-engine-gone"},
+			{Index: 3},
+		}},
+	}
+	snap := workload.NewObservedSnapshot(deps, input, types.ComponentEngine, input.ObservedState.InstanceStatuses)
+
+	for _, idx := range []int32{0, 1, 0, 1} {
+		got, err := snap.RunningRevisionPodSpec(context.Background(), idx)
+		if err != nil {
+			t.Fatalf("RunningRevisionPodSpec(%d): %v", idx, err)
+		}
+		if got == nil || got.Containers[0].Image != "test:v1" {
+			t.Errorf("RunningRevisionPodSpec(%d) = %+v, want the recorded spec", idx, got)
+		}
+	}
+	if live.gets != 1 {
+		t.Errorf("shared revision read %d times across two Instances and repeated calls, want 1 (memoized)", live.gets)
+	}
+	for _, idx := range []int32{2, 3} {
+		got, err := snap.RunningRevisionPodSpec(context.Background(), idx)
+		if err != nil || got != nil {
+			t.Errorf("RunningRevisionPodSpec(%d) = (%+v, %v), want no baseline and no error", idx, got, err)
+		}
+	}
+	if live.gets != 2 {
+		t.Errorf("a gone revision costs one read and a row without a revision none: got %d reads, want 2", live.gets)
+	}
 }

@@ -56,9 +56,11 @@ type GangPack struct {
 	// newer retry of the same PodGroup.
 	attemptMu    sync.RWMutex
 	attemptByPod map[string]uint64
-	// reservationBlocked holds ordinary pods rejected only because a forming gang
-	// owns their candidate domain. They are explicitly activated when that
-	// in-memory reservation drains; no Kubernetes object event represents it.
+	// reservationBlocked holds pods rejected only because a forming gang owns the
+	// domain they would fit: ordinary pods turned away by Filter, and gang members
+	// whose planning found room only in reserved domains. They are explicitly
+	// activated when a reservation drains or is released; no Kubernetes object
+	// event represents either transition.
 	blockedMu          sync.Mutex
 	reservationBlocked map[string]*v1.Pod
 	// templatesIncomplete records gangs that parked a member because the live
@@ -86,7 +88,8 @@ var (
 
 // New is the plugin factory registered via app.WithPlugin. It stands up the
 // PodGroup informer from the scheduler's shared kubeconfig (so PreFilter can
-// resolve gang facts), wires a gang-pod lister from the scheduler's shared
+// resolve gang facts, and so a PodGroup change wakes the gang's members once
+// that informer holds it), wires a gang-pod lister from the scheduler's shared
 // informer, and starts the pin garbage collector.
 func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 	args, err := decodeArgs(obj)
@@ -112,6 +115,9 @@ func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework
 		pins:                           placement.New(),
 		pgReader:                       reader,
 		podLister:                      podLister,
+	}
+	if err := reader.onChange(g.podGroupChanged); err != nil {
+		return nil, err
 	}
 	go g.runPinGC(ctx)
 	return g, nil
@@ -277,10 +283,14 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 	}
 
 	// A stale pin must be dropped and re-planned, else the gang wedges on it
-	// forever. Releasing also returns the pin's leaked capacity reservation. Only
-	// safe when no member has landed in the domain yet (see pinStale).
+	// forever. Releasing also returns the pin's leaked capacity reservation, which
+	// may be what kept other pods out of the domain, so they are woken like on
+	// any other release. Only safe when no member has landed in the domain yet
+	// (see pinStale).
 	if pinned && pinStale(len(planningNodes), placement.count, free, need, domain) {
-		g.pins.ReleaseIf(gang.key, commitment, nil)
+		if g.pins.ReleaseIf(gang.key, commitment, nil) {
+			g.activateReservationBlocked()
+		}
 		gangPinTotal.WithLabelValues("stale_replan").Inc()
 		pinnedGroups.Set(float64(g.pins.Len()))
 		pinned = false
@@ -296,7 +306,7 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 	}
 
 	if !pinned {
-		d, id, status := g.planDomain(nodes, gang, placement, free, need)
+		d, id, status := g.planDomain(nodes, gang, placement, free, need, pod)
 		if status != nil {
 			klog.V(4).InfoS("gangpack.pinGang.no_fit", "gang", gang.key, "status", status.Message())
 			return nil, status
@@ -319,7 +329,13 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 // already-placed members (failover / lost pin), else best-fits a fresh one. It
 // records the pin and the placement metric. status is non-nil (Unschedulable)
 // only when the gang fits in no domain.
-func (g *GangPack) planDomain(nodes []framework.NodeInfo, gang gangInfo, bound boundGangPlacement, free topology.FreeByDomain, need int) (string, uint64, *framework.Status) {
+//
+// Room the snapshot has but Choose withholds belongs to another gang's
+// outstanding reservation. That reservation draining or unwinding produces no
+// cluster event, so pod is remembered and woken with the reservation's other
+// blocked pods; a gang short of capacity everywhere is left to the registered
+// pod and node events.
+func (g *GangPack) planDomain(nodes []framework.NodeInfo, gang gangInfo, bound boundGangPlacement, free topology.FreeByDomain, need int, pod *v1.Pod) (string, uint64, *framework.Status) {
 	if bound.split {
 		return "", 0, framework.NewStatus(framework.UnschedulableAndUnresolvable,
 			"gang "+gang.key+" already has members in multiple topology domains")
@@ -346,6 +362,12 @@ func (g *GangPack) planDomain(nodes []framework.NodeInfo, gang gangInfo, bound b
 			nodeNamesByDomain(nodes, gang.topologyKey), need)
 	}
 	if !fits {
+		if _, room := topology.BestFit(free, need); room {
+			g.rememberReservationBlocked(pod)
+			gangPinTotal.WithLabelValues("reserved").Inc()
+			return "", 0, framework.NewStatus(framework.Unschedulable,
+				"no domain has room for gang "+gang.key+": every fitting domain is reserved for a forming gang")
+		}
 		gangPinTotal.WithLabelValues("no_fit").Inc()
 		return "", 0, framework.NewStatus(framework.Unschedulable, "no domain has room for gang "+gang.key)
 	}
@@ -429,38 +451,13 @@ func nodeInfosInDomain(nodes []framework.NodeInfo, topologyKey, domain string) [
 	return out
 }
 
-// matchingCandidateNodes restricts the current member to nodes that leave a
-// complete matching for every remaining heterogeneous member. Proving that a
-// domain has some matching is insufficient: placing a flexible member on the
-// only node usable by a constrained sibling would destroy that matching.
-func matchingCandidateNodes(nodes []framework.NodeInfo, topologyKey, domain string, templates []*v1.Pod) sets.Set[string] {
-	return matchingCandidateNodesForNeed(nodes, topologyKey, domain, templates, len(templates))
-}
-
+// matchingCandidateNodesForNeed restricts the current member to the domain's
+// nodes that leave room for the need-1 remaining members it brings along.
 func matchingCandidateNodesForNeed(nodes []framework.NodeInfo, topologyKey, domain string, templates []*v1.Pod, need int) sets.Set[string] {
-	out := sets.New[string]()
 	if len(templates) == 0 {
-		return out
+		return sets.New[string]()
 	}
-	current, remaining := templates[0], templates[1:]
-	domainNodes := make([]framework.NodeInfo, 0)
-	for _, node := range nodes {
-		if domainOf(node.Node(), topologyKey) == domain {
-			domainNodes = append(domainNodes, node)
-		}
-	}
-	for candidateIndex, candidate := range domainNodes {
-		if !nodeFitsPod(candidate, current) {
-			continue
-		}
-		left := make([]framework.NodeInfo, 0, len(domainNodes)-1)
-		left = append(left, domainNodes[:candidateIndex]...)
-		left = append(left, domainNodes[candidateIndex+1:]...)
-		if maxGangMatching(remaining, left, need-1) >= need-1 {
-			out.Insert(candidate.Node().Name)
-		}
-	}
-	return out
+	return newGangRoom(nodeInfosInDomain(nodes, topologyKey, domain), templates, need).candidates(need - 1)
 }
 
 func nodeNamesByDomain(nodes []framework.NodeInfo, topologyKey string) map[string][]string {
@@ -478,19 +475,6 @@ func nodeNamesByDomain(nodes []framework.NodeInfo, topologyKey string) map[strin
 
 func nodeNamesInDomain(nodes []framework.NodeInfo, topologyKey, domain string) []string {
 	return nodeNamesByDomain(nodes, topologyKey)[domain]
-}
-
-// nodesInDomain returns the names of nodes whose domain matches — the candidate
-// set PreFilter narrows to.
-func nodesInDomain(nodes []framework.NodeInfo, topologyKey, domain string) sets.Set[string] {
-	out := sets.New[string]()
-	for _, ni := range nodes {
-		n := ni.Node()
-		if n != nil && domainOf(n, topologyKey) == domain {
-			out.Insert(n.Name)
-		}
-	}
-	return out
 }
 
 // gangTemplates returns the concrete remaining members used for simultaneous

@@ -37,7 +37,7 @@ func gpuPod(req string) *v1.Pod {
 }
 
 // gangGPUPod is a gpuPod that is also a gang member (namespace + pod-group label),
-// so placement's boundGangMembers can match it while free-ness still comes from its
+// so placement's inspectBoundGangMembers can match it while free-ness still comes from its
 // gpu request.
 func gangGPUPod(ns, pg, req string) *v1.Pod {
 	p := gpuPod(req)
@@ -243,5 +243,98 @@ func TestPlacedInDomain(t *testing.T) {
 	}
 	if got := placedInDomain(nodes, "team", "absent", testKey, "a"); got != 0 {
 		t.Fatalf("placedInDomain(team/absent, a) = %d want 0", got)
+	}
+}
+
+// TestGangRoomIsCountedInMembers: the feasibility reading measures a node's room
+// in gang members, the way placement fills it, not in nodes. A two-member gang
+// fits one node with room for two just as it fits two nodes with room for one
+// each; it does not fit one node with room for one.
+func TestGangRoomIsCountedInMembers(t *testing.T) {
+	leader := gangGPUPod("team", "pf", "1")
+	leader.Name = "leader"
+	worker := gangGPUPod("team", "pf", "1")
+	worker.Name = "worker"
+	gang := []*v1.Pod{leader, worker}
+	cases := []struct {
+		name       string
+		nodes      []framework.NodeInfo
+		feasible   bool
+		candidates sets.Set[string]
+	}{
+		{
+			name:       "one node with room for two",
+			nodes:      []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "2"))},
+			feasible:   true,
+			candidates: sets.New("a1"),
+		},
+		{
+			name:       "one node with room for one",
+			nodes:      []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "1"))},
+			feasible:   false,
+			candidates: sets.New[string](),
+		},
+		{
+			name:       "two nodes with room for one each",
+			nodes:      []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "1")), nodeInfo(gpuNode("a2", "a", "1"))},
+			feasible:   true,
+			candidates: sets.New("a1", "a2"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			free := feasibleAtLeastByDomain(tc.nodes, testKey, gang, len(gang))
+			if fits := free["a"] >= len(gang); fits != tc.feasible {
+				t.Fatalf("free = %v, want domain a feasible=%v for a gang of %d", free, tc.feasible, len(gang))
+			}
+			candidates := matchingCandidateNodesForNeed(tc.nodes, testKey, "a", gang, len(gang))
+			if !candidates.Equal(tc.candidates) {
+				t.Fatalf("candidates = %v, want %v", candidates, tc.candidates)
+			}
+		})
+	}
+}
+
+// TestFeasibleByDomainReadsSharedRoomPerDomain: a domain fits a gang when its
+// members can share one node with room for them, exactly as when each member
+// has a node of its own; a domain whose nodes hold one member only does not.
+func TestFeasibleByDomainReadsSharedRoomPerDomain(t *testing.T) {
+	gang := []*v1.Pod{gangGPUPod("team", "pf", "1"), gangGPUPod("team", "pf", "1")}
+	nodes := []framework.NodeInfo{
+		nodeInfo(gpuNode("a1", "a", "2")),                                    // a: one node, room for two
+		nodeInfo(gpuNode("b1", "b", "1")), nodeInfo(gpuNode("b2", "b", "1")), // b: two nodes, room for one each
+		nodeInfo(gpuNode("c1", "c", "1")),              // c: one node, room for one
+		nodeInfo(gpuNode("d1", "d", "2"), gpuPod("1")), // d: one node, one slot taken
+	}
+	got := feasibleByDomain(nodes, testKey, gang)
+	want := topology.FreeByDomain{"a": 2, "b": 2, "c": 0, "d": 0}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("feasibleByDomain = %v want %v", got, want)
+	}
+}
+
+// TestMembersThatMustStayApartKeepOneNodeEach: a gang whose members carry a
+// required anti-affinity against each other is never read as sharing a node,
+// however much room the node has.
+func TestMembersThatMustStayApartKeepOneNodeEach(t *testing.T) {
+	apart := func(name string) *v1.Pod {
+		p := gangGPUPod("team", "pf", "1")
+		p.Name = name
+		p.Spec.Affinity = &v1.Affinity{PodAntiAffinity: &v1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{{
+				TopologyKey:   v1.LabelHostname,
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{podGroupLabel: "pf"}},
+			}},
+		}}
+		return p
+	}
+	gang := []*v1.Pod{apart("leader"), apart("worker")}
+	oneNode := []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "2"))}
+	if free := feasibleByDomain(oneNode, testKey, gang); free["a"] != 0 {
+		t.Fatalf("free = %v, want a:0 (members that must stay apart cannot share a1)", free)
+	}
+	twoNodes := []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "2")), nodeInfo(gpuNode("a2", "a", "1"))}
+	if free := feasibleByDomain(twoNodes, testKey, gang); free["a"] != 2 {
+		t.Fatalf("free = %v, want a:2 (one member per node)", free)
 	}
 }

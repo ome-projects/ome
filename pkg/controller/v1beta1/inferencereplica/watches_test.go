@@ -434,23 +434,24 @@ func TestManagedByOMENativePredicate_UpdateFieldDiff(t *testing.T) {
 	}
 }
 
-// TestIRNameFromDrainServiceName covers the drain Service name ->
-// projected replica name parse for both OMENative drain Service shapes plus
-// the reject cases the unfiltered watch relies on the mapper to screen out.
-func TestIRNameFromDrainServiceName(t *testing.T) {
+// TestDrainServiceRole covers the drain Service name -> (name prefix,
+// component) parse for both OMENative drain Service shapes plus the reject
+// cases the unfiltered watch relies on the mapper to screen out.
+func TestDrainServiceRole(t *testing.T) {
 	tests := []struct {
-		name    string
-		service string
-		wantIR  string
-		wantOK  bool
+		name          string
+		service       string
+		wantPrefix    string
+		wantComponent v1beta1.ComponentType
+		wantOK        bool
 	}{
-		{name: "headless engine", service: "my-isvc-engine-headless", wantIR: "my-isvc-engine", wantOK: true},
-		{name: "headless decoder", service: "my-isvc-decoder-headless", wantIR: "my-isvc-decoder", wantOK: true},
-		{name: "headless router", service: "my-isvc-router-headless", wantIR: "my-isvc-router", wantOK: true},
-		{name: "per-revision engine", service: "my-isvc-engine-rev-abcdef", wantIR: "my-isvc-engine", wantOK: true},
-		{name: "per-revision hex hash", service: "my-isvc-decoder-rev-5f7c9a", wantIR: "my-isvc-decoder", wantOK: true},
-		{name: "isvc name with dashes", service: "a-b-c-engine-headless", wantIR: "a-b-c-engine", wantOK: true},
-		{name: "isvc name containing the revision marker", service: "llama-rev-2-engine-rev-5f7c9a", wantIR: "llama-rev-2-engine", wantOK: true},
+		{name: "headless engine", service: "my-isvc-engine-headless", wantPrefix: "my-isvc", wantComponent: v1beta1.EngineComponent, wantOK: true},
+		{name: "headless decoder", service: "my-isvc-decoder-headless", wantPrefix: "my-isvc", wantComponent: v1beta1.DecoderComponent, wantOK: true},
+		{name: "headless router", service: "my-isvc-router-headless", wantPrefix: "my-isvc", wantComponent: v1beta1.RouterComponent, wantOK: true},
+		{name: "per-revision engine", service: "my-isvc-engine-rev-abcdef", wantPrefix: "my-isvc", wantComponent: v1beta1.EngineComponent, wantOK: true},
+		{name: "per-revision hex hash", service: "my-isvc-decoder-rev-5f7c9a", wantPrefix: "my-isvc", wantComponent: v1beta1.DecoderComponent, wantOK: true},
+		{name: "isvc name with dashes", service: "a-b-c-engine-headless", wantPrefix: "a-b-c", wantComponent: v1beta1.EngineComponent, wantOK: true},
+		{name: "isvc name containing the revision marker", service: "llama-rev-2-engine-rev-5f7c9a", wantPrefix: "llama-rev-2", wantComponent: v1beta1.EngineComponent, wantOK: true},
 		{name: "empty", service: "", wantOK: false},
 		{name: "unrelated headless (unknown component)", service: "kubernetes-headless", wantOK: false},
 		{name: "unrelated service", service: "some-random-service", wantOK: false},
@@ -459,12 +460,12 @@ func TestIRNameFromDrainServiceName(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			gotIR, gotOK := irNameFromDrainServiceName(tc.service)
+			gotPrefix, gotComponent, gotOK := drainServiceRole(tc.service)
 			if gotOK != tc.wantOK {
-				t.Fatalf("irNameFromDrainServiceName(%q) ok = %v, want %v", tc.service, gotOK, tc.wantOK)
+				t.Fatalf("drainServiceRole(%q) ok = %v, want %v", tc.service, gotOK, tc.wantOK)
 			}
-			if gotOK && gotIR != tc.wantIR {
-				t.Errorf("irNameFromDrainServiceName(%q) = %q, want %q", tc.service, gotIR, tc.wantIR)
+			if gotOK && (gotPrefix != tc.wantPrefix || gotComponent != tc.wantComponent) {
+				t.Errorf("drainServiceRole(%q) = (%q, %s), want (%q, %s)", tc.service, gotPrefix, gotComponent, tc.wantPrefix, tc.wantComponent)
 			}
 		})
 	}
@@ -696,6 +697,52 @@ func TestEndpointSliceToIRParsesTheNameWhenTheInferenceServiceOwnsTheService(t *
 	want := []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "team-a", Name: "my-isvc-engine"}}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("endpointSliceToIR = %v, want %v", got, want)
+	}
+}
+
+// A per-revision Service of a referenced replica is owned by the fronting
+// InferenceService and named with the replica's own prefix; the owner
+// resolves the role to the replica it names, while a projected role of
+// another service still resolves to the projected replica.
+func TestEndpointSliceToIRResolvesAReferencedReplicaThroughTheOwningService(t *testing.T) {
+	isController := true
+	referencing := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "team-a", UID: "svc-uid"},
+		Spec: v1beta1.InferenceServiceSpec{
+			ReplicaRefs: &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}, Decoder: []string{"pool-d"}},
+		},
+	}
+	projecting := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-isvc", Namespace: "team-a", UID: "my-isvc-uid"},
+		Spec:       v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}},
+	}
+	ownedBy := func(name, owner string) *corev1.Service {
+		return &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "team-a",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceService",
+				Name: owner, UID: types.UID(owner + "-uid"), Controller: &isController,
+			}},
+		}}
+	}
+	r := &Reconciler{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(
+		referencing, projecting, ownedBy("pool-d-decoder-rev-5f7c9a", "svc"), ownedBy("my-isvc-engine-rev-5f7c9a", "my-isvc"),
+	).Build()}
+	slice := func(service string) *discoveryv1.EndpointSlice {
+		return &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
+			Name: service + "-q4m8d", Namespace: "team-a",
+			Labels: map[string]string{discoveryv1.LabelServiceName: service},
+		}}
+	}
+	got := r.endpointSliceToIR(context.Background(), slice("pool-d-decoder-rev-5f7c9a"))
+	want := []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "team-a", Name: "pool-d"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("referenced decoder: endpointSliceToIR = %v, want %v", got, want)
+	}
+	got = r.endpointSliceToIR(context.Background(), slice("my-isvc-engine-rev-5f7c9a"))
+	want = []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: "team-a", Name: "my-isvc-engine"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("projected engine: endpointSliceToIR = %v, want %v", got, want)
 	}
 }
 

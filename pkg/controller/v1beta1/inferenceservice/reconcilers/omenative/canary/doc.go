@@ -12,5 +12,6 @@
 // multi-Component (PD) group the primary Component carries the step machine
 // while every other bumped Component stages its own canary capacity, and
 // every member publishes the step's traffic weights on its own revisions
-// (see dispatch.go).
+// (see dispatch.go) and its rolled-out revision fields at the ladder's
+// edges (see revisions.go).
 package canary

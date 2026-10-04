@@ -13,6 +13,18 @@
 // lifecycle.minReadySeconds, manual migration requests), which are
 // rejected rather than silently ignored.
 //
+// On a replica it does not project, the InferenceService controller is a
+// composer, not the owner: it may not create the replica, and it may change
+// only the rollout-control fields pacing.partition, paused, pauseMode,
+// pacing.rollbackToRevision and pairingProtocol, the controller-only fields,
+// and the ome.io/composed-fields annotation that records the fields it
+// holds; a change to any other spec field is rejected, and
+// pacing.maxUnavailable is a user field to it. Only the controller adds,
+// changes or removes that annotation, on either form; anyone may keep it.
+// The rule is by identity and field group, not by whether an
+// InferenceService names the replica at that moment: the write that clears
+// the held fields arrives after the reference is gone.
+//
 // spec.parentRef is set only by the InferenceService controller on the
 // replicas it projects and is rejected on a standalone create, one without
 // the InferenceService controller owner reference. Because parentRef is
@@ -28,9 +40,12 @@
 // inferenceReplica block of inferenceservice-config (a ServiceAccount
 // username or a group). With no identity configured the webhook falls back
 // to the ome.io/controller-write=true annotation the projector stamps,
-// which is a convention rather than a boundary. An update that keeps the
-// spec and installs no controller owner reference is decided without the
-// identity, so an unreadable config never refuses one.
+// which is a convention rather than a boundary; a composer's write on a
+// replica it does not project carries no such stamp, so in that mode no
+// InferenceService takes or releases rollout control on a referenced
+// replica. An update that keeps the spec, installs no controller owner
+// reference and leaves ome.io/composed-fields unchanged is decided without
+// the identity, so an unreadable config never refuses one.
 //
 // A standalone replica renders from exactly one template source:
 // spec.runners, or spec.modelRef and/or spec.runtimeRef; a runtime pin is
@@ -157,6 +172,34 @@ func denyStandaloneMigration(req admission.Request) admission.Response {
 		req.Namespace, req.Name))
 }
 
+func denyControllerUserFieldWrite(req admission.Request) admission.Response {
+	return admission.Denied(fmt.Sprintf(
+		"InferenceReplica %s/%s: the InferenceService controller writes only rollout-control fields (%s) on a replica it does not project; the replica's owner writes its other fields",
+		req.Namespace, req.Name, rolloutControlFieldList))
+}
+
+// denyControllerStandaloneCreate refuses a standalone create by the
+// controller. With no identity configured the controller is recognized by
+// the controller-write annotation, which a manifest copied from a projected
+// replica carries, so the denial names it as the thing to drop.
+func denyControllerStandaloneCreate(req admission.Request, who actor) admission.Response {
+	if who.identityConfigured {
+		return admission.Denied(fmt.Sprintf(
+			"InferenceReplica %s/%s: the InferenceService controller creates only the replicas it projects; create a standalone replica as a user",
+			req.Namespace, req.Name))
+	}
+	return admission.Denied(fmt.Sprintf(
+		"InferenceReplica %s/%s carries the %s=%s annotation, which marks a write by the InferenceService controller, and the controller creates only the replicas it projects; create a standalone replica without it",
+		req.Namespace, req.Name,
+		constants.InferenceReplicaControllerWriteAnnotationKey, constants.InferenceReplicaControllerWriteAnnotationVal))
+}
+
+func denyComposedFieldsWrite(req admission.Request) admission.Response {
+	return admission.Denied(fmt.Sprintf(
+		"InferenceReplica %s/%s: the %s annotation is written by the InferenceService controller; to release the fields it names, remove the reference on the InferenceService instead",
+		req.Namespace, req.Name, constants.InferenceReplicaComposedFieldsAnnotationKey))
+}
+
 // admitCreate applies the create rows of the ownership table; shape checks
 // run afterwards in Handle.
 func (v *Validator) admitCreate(ctx context.Context, obj *v1beta1.InferenceReplica, who actor, req admission.Request) admission.Response {
@@ -167,13 +210,21 @@ func (v *Validator) admitCreate(ctx context.Context, obj *v1beta1.InferenceRepli
 			"InferenceReplica %s/%s: spec.parentRef is set by the InferenceService controller on the replicas it projects; omit it on a standalone InferenceReplica",
 			req.Namespace, req.Name))
 	}
+	if !who.controller && composedFieldsChanged(nil, obj) {
+		return denyComposedFieldsWrite(req)
+	}
 	if parent, projected := projectedForm(obj); projected {
 		if !who.controller {
 			return denyProjectedWrite(req, parent, who)
 		}
 		return admission.Allowed("")
 	}
-	if placementFieldsSet(obj.Spec) && !who.controller {
+	// The controller creates only the replicas it projects, so a standalone
+	// create comes from a user, who may not set the placement fields.
+	if who.controller {
+		return denyControllerStandaloneCreate(req, who)
+	}
+	if placementFieldsSet(obj.Spec) {
 		return denyControllerOnlyFields(req)
 	}
 	if err := standaloneSpecError(obj.Spec); err != nil {
@@ -221,6 +272,11 @@ func (v *Validator) admitUpdate(ctx context.Context, oldObj, newObj *v1beta1.Inf
 			"InferenceReplica %s/%s: only the InferenceService controller may set an InferenceService controller owner reference or change a projected replica's",
 			req.Namespace, req.Name))
 	}
+	// The composed-fields annotation records the fields the controller holds
+	// on a replica, so on either form only the controller changes it.
+	if !who.controller && composedFieldsChanged(oldObj, newObj) {
+		return denyComposedFieldsWrite(req)
+	}
 	if projected {
 		if !who.controller && specChanged(oldObj.Spec, newObj.Spec) {
 			return denyProjectedWrite(req, parent, who)
@@ -229,6 +285,12 @@ func (v *Validator) admitUpdate(ctx context.Context, oldObj, newObj *v1beta1.Inf
 	}
 	if !who.controller && controllerOnlyChanged(oldObj.Spec, newObj.Spec) {
 		return denyControllerOnlyFields(req)
+	}
+	// On a replica it does not project the controller is a composer, not the
+	// owner: it steers the rollout through the rollout-control fields and
+	// leaves every user field alone.
+	if who.controller && userFieldsChanged(oldObj.Spec, newObj.Spec) {
+		return denyControllerUserFieldWrite(req)
 	}
 	if err := standaloneSpecError(newObj.Spec); err != nil {
 		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", req.Namespace, req.Name, err))
@@ -298,8 +360,9 @@ func (v *Validator) runtimePieceMissing(ctx context.Context, namespace string, s
 // Handle applies, in order: the immutability of spec.parentRef and
 // spec.component, the metadata-only exemption, the ownership table for the
 // replica's form and the requester's identity, then the shape checks that
-// hold for every writer. An update that keeps the spec and installs no
-// controller owner reference is decided without the identity.
+// hold for every writer. An update that keeps the spec, installs no
+// controller owner reference and leaves the composed-fields annotation
+// unchanged is decided without the identity.
 func (v *Validator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	switch req.Operation {
 	case admissionv1.Create, admissionv1.Update:
@@ -332,12 +395,13 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 				"InferenceReplica %s/%s: spec.component is immutable",
 				req.Namespace, req.Name))
 		}
-		// An update that keeps the spec and installs no controller owner
-		// reference is decided without the identity: a finalizer change, a
-		// label or annotation edit and the garbage collector's owner
-		// reference patches must pass this fail-closed webhook even when the
-		// config is unreadable. The unchanged spec is not re-checked.
-		if !specChanged(oldObj.Spec, newObj.Spec) && !controllerRefInstalled(oldObj, newObj) {
+		// An update that keeps the spec, installs no controller owner
+		// reference and leaves the composed-fields annotation unchanged is
+		// decided without the identity: a finalizer change, a label or
+		// annotation edit and the garbage collector's owner reference patches
+		// must pass this fail-closed webhook even when the config is
+		// unreadable. The unchanged spec is not re-checked.
+		if !specChanged(oldObj.Spec, newObj.Spec) && !controllerRefInstalled(oldObj, newObj) && !composedFieldsChanged(oldObj, newObj) {
 			if _, projected := projectedForm(oldObj); !projected && migrationRequested(oldObj, newObj) {
 				return denyStandaloneMigration(req)
 			}
@@ -345,8 +409,9 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 		}
 	}
 
-	// Only creates and the updates that change the spec or install a
-	// controller owner reference need the identity.
+	// Only creates and the updates that change the spec, install a
+	// controller owner reference or touch the composed-fields annotation
+	// need the identity.
 	identity, err := v.controllerIdentity()
 	if err != nil {
 		log.Error(err, "Failed to load the InferenceReplica controller identity",

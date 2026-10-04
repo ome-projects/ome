@@ -2657,6 +2657,7 @@ func newFailedCreateContainerSurgeFixture(t *testing.T, excludedNodes []string) 
 	})
 
 	source := surgePodAtOrdinal(isvc, 0, 1, 0, true, true)
+	source.Status.Conditions = append(source.Status.Conditions, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue})
 	source.UID = k8stypes.UID("source-uid")
 	source.Spec.NodeName = "node-source"
 	source.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(sourceRevision)
@@ -2683,7 +2684,9 @@ func newFailedCreateContainerSurgeFixture(t *testing.T, excludedNodes []string) 
 		Reason:  createContainerErrorReason,
 	}
 	plan := surgePlan()
-	plan.Instances[0].ExcludedNodes = append([]string(nil), excludedNodes...)
+	for _, node := range excludedNodes {
+		plan.Instances[0].ExcludedNodes = append(plan.Instances[0].ExcludedNodes, workload.NodeExclusion{Node: node, Revision: targetRevision})
+	}
 
 	return failedCreateContainerSurgeFixture{
 		isvc:         isvc,
@@ -2803,6 +2806,38 @@ func TestSurgeUpdate_FailedCreateContainerTargetRequiresServingSource(t *testing
 	}
 	if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(f.failed), &corev1.Pod{}); err != nil {
 		t.Fatalf("failed target was removed without a serving source: %v", err)
+	}
+}
+
+// TestSurgeUpdate_FailedCreateContainerTargetRequiresAReadySource: a source
+// whose Ready condition the control plane revoked, as on a node whose
+// kubelet stopped, carries no traffic whatever its container statuses and
+// serving gate still say, so the authorized relocation is not spent on a
+// recycle and the Instance parks for operator attention.
+func TestSurgeUpdate_FailedCreateContainerTargetRequiresAReadySource(t *testing.T) {
+	f := newFailedCreateContainerSurgeFixture(t, []string{"node-target"})
+	liveSource := &corev1.Pod{}
+	if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(f.source), liveSource); err != nil {
+		t.Fatalf("get source: %v", err)
+	}
+	for i := range liveSource.Status.Conditions {
+		if liveSource.Status.Conditions[i].Type == corev1.PodReady {
+			liveSource.Status.Conditions[i].Status = corev1.ConditionFalse
+		}
+	}
+	if err := f.client.Status().Update(context.Background(), liveSource); err != nil {
+		t.Fatalf("revoke the source's Ready condition: %v", err)
+	}
+
+	if _, err := surgeUpdate(context.Background(), f.deps(), f.input, f.plan, f.plan.Instances[0], f.target,
+		[]*corev1.Pod{liveSource, f.failed}); err != nil {
+		t.Fatalf("park without a Ready source: %v", err)
+	}
+	if f.recording.deleteCalls != 0 {
+		t.Fatalf("delete calls = %d, want zero while the source is not Ready", f.recording.deleteCalls)
+	}
+	if err := f.client.Get(context.Background(), client.ObjectKeyFromObject(f.failed), &corev1.Pod{}); err != nil {
+		t.Fatalf("failed target was removed without a Ready source: %v", err)
 	}
 }
 

@@ -70,7 +70,8 @@ producer metadata prefix nor a fabric value. A rejected gang member re-attempts 
 precise requeue hints for its siblings, PodGroup, and relevant capacity changes
 rather than the scheduler's slow periodic flush; gang-internal transitions that
 no cluster event represents (a member set reaching `minMember`, a member
-reaching the gate) are turned into explicit activations. `NodeResourcesFit` supplies
+reaching the gate, a forming gang's domain reservation draining or unwinding)
+are turned into explicit activations. `NodeResourcesFit` supplies
 node-level `MostAllocated` packing. Placement
 decisions, gate outcomes, unwinds, and the count of pinned groups are exported as
 `ome_scheduler_*` metrics on the

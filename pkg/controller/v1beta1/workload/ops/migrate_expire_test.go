@@ -794,6 +794,44 @@ func TestMigrateExpiry_DrainingComplete_DrivenToCompleted(t *testing.T) {
 	}
 }
 
+// A Draining record whose source pods are gone is one idempotent drive
+// tail away from Completed whatever the surge's pods do: the handover
+// happened when the source was drained and deleted, and nothing is left
+// to restore. Past the Deadline the expiry pass defers to the drive
+// instead of failing the record, which would tear down the Instance's
+// only pod set and rebuild the source the move retired.
+func TestMigrateExpiry_SourceGoneSurgeBroken_DrivenToCompleted(t *testing.T) {
+	f := newSinglePodMigFixture(t)
+	clk := f.withFakeClock()
+	const uuid = "mig-postdrain-broken"
+	f.records = []workload.MigrationRecord{
+		mkMigRecordWithDeadline(uuid, 0, "node-a", clk.Now().Add(30*time.Minute)),
+	}
+	driveToDrainingDrainIncomplete(t, f, uuid)
+	for _, pod := range migPodsForInstance(t, f, 0) {
+		if err := f.c.Delete(context.Background(), pod); err != nil {
+			t.Fatalf("delete source pod %s: %v", pod.Name, err)
+		}
+	}
+	wedgePod(t, f, migPodsForInstance(t, f, 1)[0], "CrashLoopBackOff")
+
+	clk.Step(31 * time.Minute)
+	if n := f.expire(t); n != 0 {
+		t.Fatalf("a Draining record with no source pods must be driven, not expired: got %d expiries", n)
+	}
+	f.drive(t, uuid, 4)
+	rec := f.record(t, uuid)
+	if rec.Phase != workload.MigrationPhaseCompleted || rec.CompletedAt == nil {
+		t.Fatalf("the handover must complete; got %+v", *rec)
+	}
+	if src := findInstanceStatusOnIRForFixture(t, f, 0); src != nil {
+		t.Errorf("the source status must be removed on completion; got %+v", src)
+	}
+	if surge := findInstanceStatusOnIRForFixture(t, f, 1); surge == nil || surge.Phase != v1beta1.OMENativeInstanceReady || surge.Operation != nil {
+		t.Errorf("the surge must be promoted with its pin cleared; got %+v", surge)
+	}
+}
+
 // TestMigrateExpiry_CompletedTailCrash_ClosedCompleted pins the
 // completed-tail crash edge: the completion tail already promoted the
 // surge (Phase=Ready, op cleared) and removed the source status, but

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -44,11 +45,15 @@ func (r *Reconciler) retireCapacityFloor(ctx context.Context, cl client.Client, 
 	if err != nil {
 		return err
 	}
-	if floor == assignment.CurrentReplicas && member.Annotations[constants.PlacementExecution] == raw {
+	base := member.DeepCopy()
+	var ceiling int32
+	if source.Spec.Placement.Split != nil {
+		ceiling = source.Spec.Placement.Split.MaxReplicasPerCluster
+	}
+	setPlannedReplicas(member, assignment.CurrentReplicas, ceiling)
+	if equality.Semantic.DeepEqual(base.Spec, member.Spec) && member.Annotations[constants.PlacementExecution] == raw {
 		return nil
 	}
-	base := member.DeepCopy()
-	setPlannedReplicas(member, assignment.CurrentReplicas, 0)
 	if member.Annotations == nil {
 		member.Annotations = map[string]string{}
 	}

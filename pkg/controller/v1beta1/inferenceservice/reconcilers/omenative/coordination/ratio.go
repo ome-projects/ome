@@ -630,7 +630,7 @@ func (ctx GateContext) CheckRatio(inFlightSurge, inFlightUnavail, projDelta int3
 		// transient apiserver blip feeds a phantom zero-serving peer into
 		// EvaluateSurge and disables the ratio band exactly when the
 		// cluster is unhealthy.
-		ir, _, err := irprojector.DecodedComponentIR(ctx.Ctx, ctx.Reads, isvc.Namespace, isvc.Name, c)
+		ir, _, err := irprojector.DecodedComponentIRFor(ctx.Ctx, ctx.Reads, isvc, c)
 		if err != nil {
 			return false, fmt.Sprintf("cannot read %s IR status, failing closed: %v", c, err)
 		}
@@ -748,7 +748,7 @@ func (ctx GateContext) CheckUnavailability(inFlightDelta int32) (allowed bool, r
 	// "no observation yet" (allow); a read error fails closed so a
 	// transient apiserver blip can't disable the unavailability budget
 	// and authorize a mass drain.
-	summary, err := irprojector.ComponentIRStatus(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, ctx.ISVC.Name, ctx.Component)
+	summary, err := irprojector.ComponentIRStatusFor(ctx.Ctx, ctx.Reads, ctx.ISVC, ctx.Component)
 	if err != nil {
 		return false, fmt.Sprintf("cannot read %s IR status, failing closed: %v", ctx.Component, err)
 	}
@@ -814,7 +814,7 @@ func (ctx GateContext) CheckSurge(inFlightDelta int32) (allowed bool, reason str
 	// "no observation yet" (allow); a read error fails closed so a
 	// transient apiserver blip can't erase the in-flight surge count and
 	// blow the surge budget.
-	summary, err := irprojector.DecodedComponentIRStatus(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, ctx.ISVC.Name, ctx.Component)
+	summary, err := irprojector.DecodedComponentIRStatusFor(ctx.Ctx, ctx.Reads, ctx.ISVC, ctx.Component)
 	if err != nil {
 		return false, fmt.Sprintf("cannot read %s IR status, failing closed: %v", ctx.Component, err)
 	}

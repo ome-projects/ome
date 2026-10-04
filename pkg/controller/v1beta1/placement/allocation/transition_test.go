@@ -302,6 +302,47 @@ func TestTransitionResumedHomeRequiresServingEvidence(t *testing.T) {
 	}
 }
 
+func TestTransitionUnpublishedReadyHomeIsNotSurplus(t *testing.T) {
+	for _, planner := range []struct {
+		name    string
+		advance func(Transition) (Step, error)
+	}{
+		{name: "replica steps", advance: Advance},
+		{name: "whole homes", advance: AdvanceWholeHomes},
+	} {
+		t.Run(planner.name, func(t *testing.T) {
+			// The first plan never completed, so the serving home has no original
+			// floor. Losing its publication must not turn it into surplus.
+			in := Transition{
+				Current: map[string]int32{"a": 3, "b": 3}, Desired: Plan{Targets: map[string]int32{"b": 3}}, MaxSurge: ptr.To[int32](3),
+				Homes: map[string]Home{
+					"a": {Known: true, Applied: true, Ready: 3, Occupied: 3},
+					"b": {Known: true, Eligible: true, Applied: true, Occupied: 3},
+				},
+			}
+			got, err := planner.advance(in)
+			require.NoError(t, err)
+			want := Step{Targets: map[string]int32{"a": 3, "b": 3}, Reason: "ReplacementNotReady"}
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Fatalf("unpublished home (-want +got):\n%s", diff)
+			}
+			in.Homes["b"] = serving(3)
+			got, err = planner.advance(in)
+			require.NoError(t, err)
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Fatalf("serving replacement cannot retire an unpublished home (-want +got):\n%s", diff)
+			}
+			in.Homes["a"] = serving(3)
+			got, err = planner.advance(in)
+			require.NoError(t, err)
+			want.Drain, want.Reason = []string{"a"}, "AwaitingMemberConvergence"
+			if diff := cmp.Diff(want, got); diff != "" {
+				t.Fatalf("published serving replacement (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestTransitionAccountsForUnplannedOccupancy(t *testing.T) {
 	in := moving()
 	in.Homes["c"] = serving(1)

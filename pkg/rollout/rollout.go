@@ -112,10 +112,11 @@ func GroupCanaryStatusFor(isvc *v1beta1.InferenceService, component v1beta1.Comp
 // CanaryOwnedComponents returns every Component a canary group governs: the
 // members of each group the spec declares as canary (inline or by policyRef)
 // and of each canary group the pinned plan carries. The canary executor is
-// the sole producer of their per-revision Services and traffic targets, the
-// primary's and every secondary's alike; coordination's pod-proportional
-// writer leaves them alone, so a canary weight is never overwritten and a
-// group edited out of the spec mid-run stays with the run that pins it.
+// the sole producer of their per-revision Services, traffic targets and
+// rolled-out revision fields, the primary's and every secondary's alike;
+// coordination's pod-proportional writer leaves them alone, so a canary
+// weight is never overwritten and a group edited out of the spec mid-run
+// stays with the run that pins it.
 func CanaryOwnedComponents(isvc *v1beta1.InferenceService) map[v1beta1.ComponentType]struct{} {
 	owned := map[v1beta1.ComponentType]struct{}{}
 	if isvc == nil {

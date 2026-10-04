@@ -22,6 +22,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/holds"
+	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -122,9 +123,9 @@ type PassInput struct {
 // coordination layer would amplify it into a group-level failure. Such
 // an Instance is skipped untouched.
 //
-// Instances with a disposable in-flight attempt (single-pod-updateable
-// Create/Update Operations — see disposableAttempt) route through
-// DisposeExpiredAttempt; gang Update attempts keep the
+// Instances with a disposable in-flight attempt (Create, recreate and
+// in-place Update Operations — see disposableAttempt) route through
+// DisposeExpiredAttempt; gang surge attempts keep the
 // Failed-preserving-Operation stamp (the gang abandon path consumes the
 // continuation), and everything else takes the plain stamp for its path.
 //
@@ -169,13 +170,19 @@ func Run(ctx context.Context, in PassInput) error {
 		// operator-facing event fires exactly once per escalation. Its
 		// recorded evidence still gets one refresh, which takes no edge.
 		if row.Phase == types.InstancePhaseFailed {
-			rowEvidence := evidenceFor(input.ObservedState.InstanceStatuses, byIdx, row.Index, now, input.StuckPodGrace)
+			rowEvidence := evidenceFor(input.ObservedState.InstanceStatuses, byIdx, row.Index, now, input.StuckPodGrace, attemptTargetRevision(input, row))
 			if t := refreshedFailureEvidence(row, rowEvidence); t != nil {
 				stamps.add(row.Index, status.RecordRefreshedFailure(t, DeadlineExceededReason), nil)
 			}
+			if err := announceRepairExhausted(ctx, deps, input, plan, row); err != nil {
+				return fmt.Errorf("announce exhausted repair (instance=%d): %w", row.Index, err)
+			}
+			if err := announceRepairWaiting(ctx, deps, input, plan, row); err != nil {
+				return fmt.Errorf("announce waiting repair (instance=%d): %w", row.Index, err)
+			}
 			continue
 		}
-		rowEvidence := evidenceFor(input.ObservedState.InstanceStatuses, byIdx, row.Index, now, input.StuckPodGrace)
+		rowEvidence := evidenceFor(input.ObservedState.InstanceStatuses, byIdx, row.Index, now, input.StuckPodGrace, attemptTargetRevision(input, row))
 		pods := evidence.PodsForStuckCheck(row, byIdx)
 		desired := status.DesiredFor(desiredByIdx, row.Index, row.PodCount)
 		gang := types.GangReadingFor(input, row)
@@ -241,7 +248,7 @@ func Run(ctx context.Context, in PassInput) error {
 		}
 		// FAST path.
 		if stuckInterrupts && rowEvidence.StuckPod != nil && ShouldCheckForStuckPods(&row, pods, currentHash, query.LabelRevisionHash) {
-			if disposableAttempt(&row, desired) {
+			if disposableAttempt(&row) {
 				// The disposition's writes are write-ahead-ordered; land
 				// the pending plain stamps first so the overall write +
 				// event order matches the unbatched pass.
@@ -269,7 +276,11 @@ func Run(ctx context.Context, in PassInput) error {
 			// bare reason.
 			termination := types.PodTerminationWithReason(rowEvidence.StuckPod, rowEvidence.StuckReason, metav1.NewTime(now))
 			idx, podName, reason := row.Index, rowEvidence.StuckPod.Name, rowEvidence.StuckReason
-			stamps.add(idx, status.StampFailedOnStuckPod(termination), func() {
+			// The stamp lands on the fresh row and names the pod it blames
+			// by incarnation, so a repair that claimed the pod set since
+			// this observation keeps it.
+			blamed, _ := query.InstanceIncarnationFromLabels(rowEvidence.StuckPod)
+			stamps.add(idx, status.StampFailedOnStuckPod(termination, blamed), func() {
 				input.WarnInstanceFailed(idx, podName, reason)
 			})
 			continue
@@ -299,7 +310,7 @@ func Run(ctx context.Context, in PassInput) error {
 			continue
 		}
 		op := row.Operation
-		if disposableAttempt(&row, desired) {
+		if disposableAttempt(&row) {
 			if err := stamps.flush(ctx); err != nil {
 				return fmt.Errorf("flush escalation stamps (component=%s): %w", plan.Component, err)
 			}
@@ -309,6 +320,18 @@ func Run(ctx context.Context, in PassInput) error {
 			continue
 		}
 		idx := row.Index
+		if op.Type == types.InstanceOperationRestart {
+			// A set the repair's drain has already deleted is not one a
+			// park can stand on: the stamp waits for the pass that observes
+			// the rebuilt set.
+			gone, err := repairSetGone(ctx, deps, input, plan, idx)
+			if err != nil {
+				return fmt.Errorf("read the repair's pod set (instance=%d): %w", idx, err)
+			}
+			if gone {
+				continue
+			}
+		}
 		// The teardown that follows deletes the blamed pods, so revision-scoped
 		// evidence must survive on LastFailure: a workload-caused waiting reason
 		// — or a pod that ran every container yet never reported ready — names
@@ -338,6 +361,48 @@ func Run(ctx context.Context, in PassInput) error {
 	if err := stamps.flush(ctx); err != nil {
 		return fmt.Errorf("flush escalation stamps (component=%s): %w", plan.Component, err)
 	}
+	return nil
+}
+
+// announceRepairExhausted warns once per parked attempt that a repair has
+// spent every re-arm the operator's ladder allows: the row stays Failed
+// until an operator resets it or a new revision arrives, and nothing else
+// in the cluster is going to say so.
+func announceRepairExhausted(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, row types.InstanceStatus) error {
+	if deps.Recorder == nil || !workloadops.RepairRetriesExhausted(input, &row) {
+		return nil
+	}
+	target := types.EventTarget(input)
+	if target == nil {
+		return nil
+	}
+	announced, err := status.Announce(ctx, input, row.Index, types.EventReasonRepairRetriesExhausted)
+	if err != nil || !announced {
+		return err
+	}
+	deps.Recorder.Eventf(target, corev1.EventTypeWarning, string(types.EventReasonRepairRetriesExhausted),
+		"OMENative component=%s instance=%d repair parked at Failed after %d re-arm(s): %s; reset the Instance or publish a corrected revision",
+		plan.Component, row.Index, row.Operation.RetryCount, workloadops.RepairFailureSummary(&row))
+	return nil
+}
+
+// announceRepairWaiting records once per parked attempt that a repair is
+// parked on a cause the kubelet retries in place — the configuration or
+// image the pod template names — so the retry ladder owes it no re-arm:
+// the note lands on the row's failure message, and the Warning fires on
+// the write that recorded it. Nothing here moves the row; it resumes on
+// its own once the kubelet starts the pod (ops.RepairResumes).
+func announceRepairWaiting(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, row types.InstanceStatus) error {
+	if !types.RepairWaitsOnWorkload(&row) {
+		return nil
+	}
+	recorded, err := status.AnnounceRepairWaiting(ctx, input, row.Index, workloadops.RepairWaitingNote)
+	if err != nil || !recorded {
+		return err
+	}
+	types.RecordWarning(deps.Recorder, types.EventTarget(input), types.EventReasonRepairWaitingOnWorkload,
+		"OMENative %s repair parked at Failed on %s: %s, and the Instance resumes on its own once the pod starts",
+		types.InstanceKey(plan.Component, row.Index), workloadops.RepairFailureSummary(&row), workloadops.RepairWaitingNote)
 	return nil
 }
 
@@ -382,10 +447,14 @@ type InstanceEvidence struct {
 // only — no Phase write. Stuck detection attributes pods the same way the
 // pass blames them (evidence.PodsForStuckCheck: a gang Update surge is
 // inspected through its replacement gang, a Migrate pair through
-// own-plus-sibling). A non-positive grace disables stuck-pod evidence
-// entirely (fast escalation off; the deadline backstop and the scheduler
-// hold still report). now/grace are supplied by the caller (clock seam).
-func evidenceFor(insts []types.InstanceStatus, byIdx map[int32][]*corev1.Pod, idx int32, now time.Time, grace time.Duration) InstanceEvidence {
+// own-plus-sibling), and an Update attempt only through the pods on the
+// revision it converges toward (evidence.AttemptStuckPods): the pod it is
+// replacing may be the broken workload the roll corrects. A non-positive
+// grace disables stuck-pod evidence entirely (fast escalation off; the
+// deadline backstop and the scheduler hold still report). now/grace are
+// supplied by the caller (clock seam); attemptRev is the attempt's
+// resolved target revision.
+func evidenceFor(insts []types.InstanceStatus, byIdx map[int32][]*corev1.Pod, idx int32, now time.Time, grace time.Duration, attemptRev string) InstanceEvidence {
 	var ev InstanceEvidence
 	var inst *types.InstanceStatus
 	for i := range insts {
@@ -400,7 +469,7 @@ func evidenceFor(insts []types.InstanceStatus, byIdx map[int32][]*corev1.Pod, id
 	ev.Unschedulable, ev.UnschedulableMessage, ev.UnschedulableSince = types.FirstUnschedulablePod(byIdx[idx])
 	pods := byIdx[idx]
 	if inst != nil {
-		pods = evidence.PodsForStuckCheck(*inst, byIdx)
+		pods = evidence.AttemptStuckPods(*inst, evidence.PodsForStuckCheck(*inst, byIdx), attemptRev)
 	}
 	if grace <= 0 {
 		return ev
@@ -418,52 +487,88 @@ func singlePodSurgeAttempt(row *types.InstanceStatus, desiredPods int32) bool {
 		row.Operation.Step == types.UpdateStepSurge && row.Operation.SurgeIndex == nil
 }
 
+// repairSetGone reports whether every pod of the Instance is deleting or
+// gone on a live read: the repair's drain has deleted the set it replaces
+// and the rebuild has not run yet. The deadline was judged on the pass's
+// pod observation, which predates that delete, and a spent repair's exits
+// are read off its pods, so a park with no set behind it has none. The
+// repair owns the set until the rebuilt one exists; the elapsed deadline
+// parks that one. A set still live on the read — a drain not finished, or
+// a rebuilt set in any state — parks as the deadline says.
+func repairSetGone(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, idx int32) (bool, error) {
+	pods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), input.Key.Namespace, input.Key.OwnerName, plan.Component, idx)
+	if err != nil {
+		return false, err
+	}
+	for _, pod := range pods {
+		if pod.DeletionTimestamp == nil {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // failureStampBuffer coalesces the escalation pass's plain Failed
 // stamps into one batched status write. Buffer only standalone stamps:
 // mutations nothing later in the reconcile depends on being persisted
-// first. Each buffered warn fires only after its stamp's write
-// succeeded, matching the immediate path (a failed write emits nothing;
-// the evidence re-escalates next reconcile). A nil warn is a mutation
-// that carries no operator-facing event of its own.
+// first. Each buffered warn fires only after its stamp changed the row
+// and the write succeeded, matching the immediate path: a failed write
+// emits nothing and the evidence re-escalates next reconcile, and a
+// stamp the fresh row withheld announces nothing. A nil warn is a
+// mutation that carries no operator-facing event of its own.
 type failureStampBuffer struct {
-	input types.ReconcileInput
-	muts  []types.InstanceMutation
-	warns []func()
+	input  types.ReconcileInput
+	stamps []bufferedStamp
+}
+
+// bufferedStamp is one stamp with the warning it owes once it commits.
+type bufferedStamp struct {
+	mutation  types.InstanceMutation
+	warn      func()
+	committed bool
 }
 
 func (b *failureStampBuffer) add(idx int32, mutate func(*types.InstanceStatus) bool, warn func()) {
-	b.muts = append(b.muts, types.InstanceMutation{Index: idx, Mutate: mutate})
-	b.warns = append(b.warns, warn)
+	b.stamps = append(b.stamps, bufferedStamp{mutation: types.InstanceMutation{Index: idx, Mutate: mutate}, warn: warn})
 }
 
 // flush persists the buffered stamps — one batched write when the
-// adapter provides ApplyInstanceMutations, one MutateInstance call per
-// stamp otherwise — then fires the deferred warnings. Empty buffer =
-// zero writes. The buffer resets whichever path ran.
+// adapter provides ApplyInstanceMutations, one single-row write per
+// stamp otherwise — then fires the warnings of the stamps that
+// committed. Empty buffer = zero writes. The buffer resets whichever
+// path ran.
 func (b *failureStampBuffer) flush(ctx context.Context) error {
-	if len(b.muts) == 0 {
+	if len(b.stamps) == 0 {
 		return nil
 	}
 	if b.input.ApplyInstanceMutations != nil {
-		if err := b.input.ApplyInstanceMutations(ctx, b.muts); err != nil {
+		muts := make([]types.InstanceMutation, len(b.stamps))
+		for i := range b.stamps {
+			stamp := &b.stamps[i]
+			muts[i] = stamp.mutation
+			muts[i].OnCommit = func(_, _ *types.InstanceStatus) { stamp.committed = true }
+		}
+		if err := b.input.ApplyInstanceMutations(ctx, muts); err != nil {
 			return err
 		}
-		for _, warn := range b.warns {
-			if warn != nil {
-				warn()
+		for _, stamp := range b.stamps {
+			if stamp.committed && stamp.warn != nil {
+				stamp.warn()
 			}
 		}
 	} else {
-		for i, m := range b.muts {
-			if err := b.input.MutateInstance(ctx, m.Index, m.Mutate); err != nil {
+		for i := range b.stamps {
+			stamp := &b.stamps[i]
+			committed, err := status.ApplyStamp(ctx, b.input, stamp.mutation.Index, stamp.mutation.Mutate)
+			if err != nil {
 				return err
 			}
-			if b.warns[i] != nil {
-				b.warns[i]()
+			if committed && stamp.warn != nil {
+				stamp.warn()
 			}
 		}
 	}
-	b.muts, b.warns = nil, nil
+	b.stamps = nil
 	return nil
 }
 

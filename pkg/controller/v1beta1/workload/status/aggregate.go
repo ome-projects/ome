@@ -60,17 +60,23 @@ func CountReadyPods(pods []*corev1.Pod) int32 {
 	return n
 }
 
-// CountServingPods counts pods that are BOTH ContainersReady AND have
-// the controller's serving gate set to True — i.e., pods actually in
-// the load-balancer rotation. This is the count MaxUnavailable budgets
-// in coordination/ratio.go gate against; ContainersReady alone misses
-// the case where the controller has flipped serving=False (in-place
-// update drain, recreate Phase A) while containers technically remain
-// Ready.
+// CountServingPods counts pods in their Service's rotation: Ready by the
+// control plane, carrying the controller's serving gate
+// (podreadiness.ReadyAndServing), and not terminating. This is the count
+// MaxUnavailable budgets in coordination/ratio.go gate against; it drops
+// when the controller takes a pod out of rotation (in-place update drain,
+// recreate Phase A), when the node under a pod stops reporting, whatever
+// the stale container statuses say, and when a pod is deleted: a
+// terminating pod keeps its conditions until its containers stop, but the
+// EndpointSlice controller has already taken it out of every Service's
+// ready endpoints, so it serves nothing new.
 func CountServingPods(pods []*corev1.Pod) int32 {
 	var n int32
 	for _, p := range pods {
-		if podreadiness.IsContainersReady(p) && podreadiness.IsServing(p) {
+		if p == nil || p.DeletionTimestamp != nil {
+			continue
+		}
+		if podreadiness.ReadyAndServing(p) {
 			n++
 		}
 	}
@@ -209,7 +215,7 @@ func InstanceMeetsThreshold(observedPodCount, observedSatisfying, desired int32)
 }
 
 // CountServingInstances counts Instances whose desired-many pods are
-// BOTH ContainersReady AND serving=True. This is the count the
+// Ready and serving (podreadiness.ReadyAndServing). This is the count the
 // coordination unavailability gate (GateContext.CheckUnavailability)
 // works from — "instances actually in the load balancer rotation
 // right now."
@@ -283,6 +289,50 @@ func ReachedDesiredShape(insts []types.InstanceStatus, targetRevName string, par
 // gate without converting back to a v1beta1 shape.
 func RolloutComplete(insts []types.InstanceStatus, targetRevName string) bool {
 	return ReachedDesiredShape(insts, targetRevName, 0, int32(len(insts)))
+}
+
+// CurrentRevisionFor is the component-level revision rollup: what
+// status.currentRevision should name given the Instance rows and the
+// Component's retry ladder. It is the update revision once every Instance
+// is Ready on it and no RetryBlock names it: a block records a failure
+// of the revision no later attempt has answered — a crash of a promoted
+// set included, whose row reads Ready between crashes — and is removed
+// once the rows outlive it, a corrective revision supersedes it or an
+// operator releases a Held one, so the push reads landed only when the
+// revision has proven itself rather than by attrition. It is withdrawn
+// (empty) when it already names the update revision while some Instance
+// still runs another: a fleet rolled back onto its last promoted revision
+// is in flight until the last superseded Instance returns, and current
+// equal to update is what every reader takes for "no rollout in flight".
+// Any other row shape leaves current as recorded, so a repair on the
+// current revision never moves it.
+func CurrentRevisionFor(insts []types.InstanceStatus, current, update string, blocks []types.RetryBlock) string {
+	if update == "" {
+		return current
+	}
+	if RolloutComplete(insts, update) && types.FindRetryBlock(blocks, update) == nil {
+		return update
+	}
+	if current == update && anyInstanceRunsAnother(insts, update) {
+		return ""
+	}
+	return current
+}
+
+// anyInstanceRunsAnother reports whether some Instance records a running
+// revision other than rev. A row that has not run anything yet names no
+// revision and does not count.
+func anyInstanceRunsAnother(insts []types.InstanceStatus, rev string) bool {
+	want := query.RevisionFromName(rev)
+	for _, inst := range insts {
+		if inst.RunningRevision == "" {
+			continue
+		}
+		if !query.RevisionFromName(inst.RunningRevision).Same(want) {
+			return true
+		}
+	}
+	return false
 }
 
 // CountersForInstance computes the per-Instance counter set from the

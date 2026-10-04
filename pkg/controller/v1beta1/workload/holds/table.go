@@ -42,12 +42,13 @@ type reading struct {
 	release bool
 }
 
-// table is the seven holds in the order they are consulted within one
+// table is the eight holds in the order they are consulted within one
 // pass. Order decides only who reaches an unheld row first when two
 // facts arrive on it in the same pass — an incumbent token is never taken
 // except by the one ordered pair in takesRowFrom. The order follows where
-// each fact arises: the quota refusal, the silent node and the unready
-// capacity where a create is attempted, the source out of rotation where
+// each fact arises: the quota refusal and the unreachable admission
+// webhook, the silent node and the unready capacity where a create is
+// attempted, the source out of rotation where
 // a surge is driven, and the scheduler and the PodGroup at the end of the
 // pass. A fact that
 // reaches an operator first on one build must reach them first on the
@@ -59,6 +60,10 @@ var table = []authority{
 	// that creates a pod can be refused, so the wait is true of every
 	// row, a teardown and an unowned row included.
 	quotaHold,
+	// Admission unavailable: the apiserver could not take the operation's
+	// pod write to its webhook. Any write can meet it, so the wait is
+	// true of every row, like the quota refusal.
+	admissionHold,
 	// Node unknown: a silent node still holds a name the rebuild needs.
 	// Refused on a teardown — a pod on its way out occupies no name
 	// anyone is waiting to rebuild — and on a row with no attempt.

@@ -32,7 +32,7 @@ func componentCanBackRoute(
 	return ok && status.ScaleTargetRef != nil &&
 		status.ScaleTargetRef.APIVersion == v1beta1.SchemeGroupVersion.String() &&
 		status.ScaleTargetRef.Kind == inferenceReplicaScaleTargetKind &&
-		status.ScaleTargetRef.Name == irprojector.InferenceReplicaName(isvc.Name, component) &&
+		status.ScaleTargetRef.Name == irprojector.RoleReplicaName(isvc, component) &&
 		status.Lifecycle != nil &&
 		status.Lifecycle.ReadyReplicas > 0 && status.Lifecycle.ServingReplicas > 0
 }

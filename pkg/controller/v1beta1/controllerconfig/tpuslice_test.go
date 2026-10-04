@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
@@ -77,6 +78,8 @@ func validTPUSliceConfig() *TPUSliceProvisioningConfig {
 func TestParseTPUSliceProvisioningConfig(t *testing.T) {
 	noAnnotations := validTPUSliceConfig()
 	noAnnotations.Slice.Annotations = map[string]string{}
+	withPodAnnotations := validTPUSliceConfig()
+	withPodAnnotations.Slice.PodAnnotations = []string{"example.com/priority", "example.com/tolerance"}
 
 	tests := []struct {
 		name string
@@ -104,6 +107,13 @@ func TestParseTPUSliceProvisioningConfig(t *testing.T) {
 				field(b, "slice")["annotations"] = map[string]any{}
 			})),
 			want: noAnnotations,
+		},
+		{
+			name: "pod annotations",
+			raw: ptr.To(tpuSliceBlock(t, func(b map[string]any) {
+				field(b, "slice")["podAnnotations"] = []any{"example.com/priority", "example.com/tolerance"}
+			})),
+			want: withPodAnnotations,
 		},
 		{
 			name:    "empty object names every required field",
@@ -256,6 +266,23 @@ func TestParseTPUSliceProvisioningConfig(t *testing.T) {
 			wantErr: []string{`slice.annotations: "managed by" is not a qualified name`},
 		},
 		{
+			name:    "pod annotation key is not a qualified name",
+			raw:     ptr.To(tpuSliceBlock(t, func(b map[string]any) { field(b, "slice")["podAnnotations"] = []any{"example.com/priority", ""} })),
+			wantErr: []string{"slice.podAnnotations[1]: required"},
+		},
+		{
+			name: "pod annotation listed twice",
+			raw: ptr.To(tpuSliceBlock(t, func(b map[string]any) {
+				field(b, "slice")["podAnnotations"] = []any{"example.com/priority", "example.com/priority"}
+			})),
+			wantErr: []string{`slice.podAnnotations[1]: "example.com/priority" is listed twice`},
+		},
+		{
+			name:    "pod annotation the configured annotations set",
+			raw:     ptr.To(tpuSliceBlock(t, func(b map[string]any) { field(b, "slice")["podAnnotations"] = []any{"example.com/managed-by"} })),
+			wantErr: []string{`slice.podAnnotations[0]: "example.com/managed-by" is already set by slice.annotations`},
+		},
+		{
 			name:    "no ready states",
 			raw:     ptr.To(tpuSliceBlock(t, func(b map[string]any) { field(b, "slice")["readyStates"] = []any{} })),
 			wantErr: []string{"slice.readyStates: at least one state is required"},
@@ -269,6 +296,16 @@ func TestParseTPUSliceProvisioningConfig(t *testing.T) {
 			name:    "ready state listed twice",
 			raw:     ptr.To(tpuSliceBlock(t, func(b map[string]any) { field(b, "slice")["readyStates"] = []any{"ACTIVE", "ACTIVE"} })),
 			wantErr: []string{`slice.readyStates[1]: "ACTIVE" is listed twice`},
+		},
+		{
+			name:    "ready timeout that does not parse",
+			raw:     ptr.To(tpuSliceBlock(t, func(b map[string]any) { field(b, "slice")["readyTimeout"] = "soon" })),
+			wantErr: []string{`slice.readyTimeout: "soon" must be a positive duration`},
+		},
+		{
+			name:    "ready timeout that is not positive",
+			raw:     ptr.To(tpuSliceBlock(t, func(b map[string]any) { field(b, "slice")["readyTimeout"] = "0s" })),
+			wantErr: []string{`slice.readyTimeout: "0s" must be a positive duration`},
 		},
 	}
 	for _, tt := range tests {
@@ -365,5 +402,18 @@ func TestTPUSliceProvisioningConfigShapeKeys(t *testing.T) {
 	want := tpuslice.Keys{Accelerator: "example.com/accelerator", Topology: "example.com/topology"}
 	if got != want {
 		t.Fatalf("ShapeKeys() = %+v, want %+v", got, want)
+	}
+}
+
+func TestReadyTimeoutDuration(t *testing.T) {
+	for raw, want := range map[string]time.Duration{"": 0, "10m": 10 * time.Minute, "90s": 90 * time.Second} {
+		if got := (TPUSliceObject{ReadyTimeout: raw}).ReadyTimeoutDuration(); got != want {
+			t.Errorf("ReadyTimeoutDuration(%q) = %v, want %v", raw, got, want)
+		}
+	}
+	raw := tpuSliceBlock(t, func(b map[string]any) { field(b, "slice")["readyTimeout"] = "10m" })
+	got, err := ParseTPUSliceProvisioningConfig(&v1.ConfigMap{Data: map[string]string{TPUSliceProvisioningConfigName: raw}})
+	if err != nil || got.Slice.ReadyTimeoutDuration() != 10*time.Minute {
+		t.Fatalf("Parse = %+v, %v; want a 10m ready timeout", got, err)
 	}
 }

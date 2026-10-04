@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -26,12 +27,16 @@ const (
 	// withheld from a ready slice with a host that cannot take them, and the
 	// slice is provisioned again.
 	EventReasonSliceHostUnavailable workload.EventReason = "SliceHostUnavailable"
+	// EventReasonSliceReadyTimeout is recorded when an Instance's pods are
+	// withheld from a slice that has stayed out of a ready state for longer
+	// than the ready timeout, and the slice is provisioned again.
+	EventReasonSliceReadyTimeout workload.EventReason = "SliceReadyTimeout"
 )
 
 // Placer places the workload engine's pods on provisioned slices. It serves
 // one reconcile pass: each Instance's demand is resolved, each slot's slice
-// ensured, and each ready slice's hosts vetted, at most once per pass, and
-// Sweep keeps every slice the pass placed pods on.
+// ensured, and each slice vetted, at most once per pass, and Sweep keeps
+// every slice the pass placed pods on.
 type Placer struct {
 	p        *Provisioner
 	nodes    client.Reader
@@ -39,9 +44,18 @@ type Placer struct {
 	recorder record.EventRecorder
 	demands  map[demandKey]*resolution
 	ensured  map[placedSlot]*ensureResult
-	// vetted holds, by UID, why hosts of each ready slice the pass vetted
-	// cannot take its pods. Sweep releases a slice with any.
-	vetted map[types.UID][]string
+	// vetted holds, by UID, each slice the pass vetted. Sweep releases the
+	// slices whose vetting says so.
+	vetted map[types.UID]vetting
+}
+
+// vetting is a slice's vetting in one pass. A non-empty reason withholds its
+// slot's pods; release has Sweep release the slice so the slot is provisioned
+// again; event is the warning a withholding Place records, empty for none.
+type vetting struct {
+	reason  string
+	release bool
+	event   workload.EventReason
 }
 
 var _ workload.Provisioner = (*Placer)(nil)
@@ -71,14 +85,13 @@ type placedSlot struct {
 	demand Demand
 }
 
-// ensureResult is an ensured slot. err is set only for
-// gke.ErrOwnershipConflict; unavailable reports a placement withheld because
-// a host of the slice cannot take the slot's pods.
+// ensureResult is an ensured slot and its slice's vetting. err is set only
+// for gke.ErrOwnershipConflict.
 type ensureResult struct {
-	placement   Placement
-	err         error
-	unavailable bool
-	warned      bool
+	placement Placement
+	err       error
+	vetting   vetting
+	warned    bool
 }
 
 // NewPlacer returns a Placer for one reconcile pass of p's owner. nodes
@@ -93,7 +106,7 @@ func NewPlacer(p *Provisioner, nodes client.Reader, pods func(context.Context) (
 		recorder: recorder,
 		demands:  map[demandKey]*resolution{},
 		ensured:  map[placedSlot]*ensureResult{},
-		vetted:   map[types.UID][]string{},
+		vetted:   map[types.UID]vetting{},
 	}
 }
 
@@ -101,9 +114,11 @@ func NewPlacer(p *Provisioner, nodes client.Reader, pods func(context.Context) (
 // the slice is ready. A pod on no provision-only pool is placed unconfined.
 // A pod whose Instance cannot fill a provisionable slice, or whose slot's
 // name is taken by a slice the owner does not hold, is withheld and a
-// warning is recorded. So is a pod whose slice is ready, held by no pod, and
-// has a host that cannot take the slot's pods; Sweep releases that slice, and
-// a later pass provisions the slot again.
+// warning is recorded. So is a pod whose slice no pod holds and either has a
+// host that cannot take the slot's pods or has stayed out of a ready state
+// past the ready timeout; Sweep releases that slice, and a later pass
+// provisions the slot again. A pod waits, with no warning, until every host
+// its ready slice needs is visible.
 func (pl *Placer) Place(ctx context.Context, input workload.ReconcileInput, _ workload.ComponentPlan, inst workload.InstancePlan, _ workload.RunnerPlan, ordinal int32) (map[string]string, bool, error) {
 	r, err := pl.resolve(ctx, input, inst)
 	if err != nil {
@@ -120,7 +135,7 @@ func (pl *Placer) Place(ctx context.Context, input workload.ReconcileInput, _ wo
 	if !r.needed {
 		return nil, true, nil
 	}
-	e, err := pl.ensure(ctx, r, SlotFor(inst, ordinal))
+	e, err := pl.ensure(ctx, r, SlotFor(inst, ordinal), input.Now())
 	if err != nil {
 		return nil, false, err
 	}
@@ -132,9 +147,9 @@ func (pl *Placer) Place(ctx context.Context, input workload.ReconcileInput, _ wo
 		}
 		return nil, false, nil
 	}
-	if e.unavailable && !e.warned {
+	if e.vetting.event != "" && !e.warned {
 		e.warned = true
-		workload.RecordWarning(pl.recorder, workload.EventTarget(input), EventReasonSliceHostUnavailable,
+		workload.RecordWarning(pl.recorder, workload.EventTarget(input), e.vetting.event,
 			"OMENative %s withheld: %s", workload.InstanceKey(input.Key.Component, inst.Index), e.placement.Reason)
 	}
 	if !e.placement.Ready {
@@ -165,7 +180,7 @@ func (pl *Placer) Pending(ctx context.Context, input workload.ReconcileInput, _ 
 	if err != nil {
 		return "", false, err
 	}
-	if placement, _, err = pl.vet(ctx, placement, r.pods); err != nil {
+	if placement, _, err = pl.vet(ctx, placement, r, input.Now()); err != nil {
 		return "", false, err
 	}
 	return placement.Reason, !placement.Ready, nil
@@ -174,8 +189,8 @@ func (pl *Placer) Pending(ctx context.Context, input workload.ReconcileInput, _ 
 // Sweep releases the owner's slices that no pod is pinned to and on which no
 // pod may be created. A slice is kept for a slot the pass placed pods on, or
 // a slot a planned Instance or the target of a row's surge may create a pod
-// at, while it has the shape that slot's pods ask for, unless the pass
-// withheld pods from it because a host cannot take them.
+// at, while it has the shape that slot's pods ask for, unless the pass's
+// vetting releases it.
 func (pl *Placer) Sweep(ctx context.Context, input workload.ReconcileInput, plan workload.ComponentPlan) error {
 	wanted := map[Slot][]Demand{}
 	for placed := range pl.ensured {
@@ -195,7 +210,7 @@ func (pl *Placer) Sweep(ctx context.Context, input workload.ReconcileInput, plan
 		}
 	}
 	return pl.p.Sweep(ctx, func(slot Slot, s gke.Slice) bool {
-		if len(pl.vetted[s.UID]) > 0 {
+		if pl.vetted[s.UID].release {
 			return false
 		}
 		for _, d := range wanted[slot] {
@@ -243,10 +258,10 @@ func (pl *Placer) resolve(ctx context.Context, input workload.ReconcileInput, in
 	return r, nil
 }
 
-// ensure runs Ensure, and vets a ready slice, once per slot and demand. Only
-// a placement or an ownership conflict is remembered: a failed read or write
-// is retried.
-func (pl *Placer) ensure(ctx context.Context, r *resolution, slot Slot) (*ensureResult, error) {
+// ensure runs Ensure, and vets the slice, once per slot and demand. Only a
+// placement or an ownership conflict is remembered: a failed read or write is
+// retried.
+func (pl *Placer) ensure(ctx context.Context, r *resolution, slot Slot, now time.Time) (*ensureResult, error) {
 	key := placedSlot{slot: slot, demand: r.demand}
 	if e, ok := pl.ensured[key]; ok {
 		return e, nil
@@ -257,7 +272,7 @@ func (pl *Placer) ensure(ctx context.Context, r *resolution, slot Slot) (*ensure
 	}
 	e := &ensureResult{placement: placement, err: err}
 	if err == nil {
-		if e.placement, e.unavailable, err = pl.vet(ctx, placement, r.pods); err != nil {
+		if e.placement, e.vetting, err = pl.vet(ctx, placement, r, now); err != nil {
 			return nil, err
 		}
 	}
@@ -265,51 +280,106 @@ func (pl *Placer) ensure(ctx context.Context, r *resolution, slot Slot) (*ensure
 	return e, nil
 }
 
-// vet withholds a ready placement when no pod holds its slice and a host of
-// the slice cannot take any of the pods: every host takes one of the slot's
-// pods, so the slot cannot start there. A slice a pod holds is left to the
-// scheduler, since the pods it still needs may fit on the hosts that can take
-// them. withheld reports a placement vet withheld. Each slice is vetted once
-// per pass.
-func (pl *Placer) vet(ctx context.Context, placement Placement, pods []*corev1.PodSpec) (_ Placement, withheld bool, _ error) {
-	if !placement.Ready {
-		return placement, false, nil
-	}
+// vet applies the slice's vetting to its placement: a ready slice's hosts are
+// vetted, a slice that is not ready is vetted against the ready timeout. Each
+// slice is vetted once per pass.
+func (pl *Placer) vet(ctx context.Context, placement Placement, r *resolution, now time.Time) (Placement, vetting, error) {
 	s := placement.Slice
-	hosts, ok := pl.vetted[s.UID]
+	if s.Terminating {
+		return placement, vetting{}, nil
+	}
+	v, ok := pl.vetted[s.UID]
 	if !ok {
 		var err error
-		if hosts, err = pl.vetHosts(ctx, s, pods); err != nil {
-			return Placement{}, false, err
+		if placement.Ready {
+			v, err = pl.vetHosts(ctx, s, r)
+		} else {
+			v, err = pl.vetStuck(ctx, s, r, now)
 		}
-		pl.vetted[s.UID] = hosts
+		if err != nil {
+			return Placement{}, vetting{}, err
+		}
+		pl.vetted[s.UID] = v
 	}
-	if len(hosts) == 0 {
-		return placement, false, nil
+	if v.reason == "" {
+		return placement, v, nil
 	}
-	return Placement{
-		Slice: s,
-		Reason: fmt.Sprintf("slice %s is %s, but %s; it is released and provisioned again once no pod holds it",
-			s.Name, s.State, strings.Join(hosts, ", ")),
-	}, true, nil
+	return Placement{Slice: s, Reason: v.reason}, v, nil
 }
 
-// vetHosts returns why hosts of s cannot take any of the pods, or nothing
-// when every host can or a pod holds s. The pods are read only when a host
-// cannot.
-func (pl *Placer) vetHosts(ctx context.Context, s gke.Slice, pods []*corev1.PodSpec) ([]string, error) {
-	hosts, err := unavailableHosts(ctx, pl.nodes, pl.p.cfg.NodeLabels.Slice, s.Name, pods)
-	if err != nil || len(hosts) == 0 {
-		return nil, err
+// vetHosts vets a ready slice's hosts. A host that cannot take any of the
+// pods, while no pod holds the slice, withholds the pods and releases the
+// slice: every host takes one of the slot's pods, so the slot cannot start
+// there. A slice a pod holds is left to the scheduler, since the pods it
+// still needs may fit on the hosts that can take them. Until every host the
+// slice needs is visible the pods wait: hosts are found by a label the
+// provider adds as the slice activates, which may lag its state.
+func (pl *Placer) vetHosts(ctx context.Context, s gke.Slice, r *resolution) (vetting, error) {
+	hosts, found, err := unavailableHosts(ctx, pl.nodes, pl.p.cfg.NodeLabels.Slice, s.Name, r.pods)
+	if err != nil {
+		return vetting{}, err
 	}
+	if len(hosts) > 0 {
+		held, err := pl.held(ctx, s)
+		if err != nil {
+			return vetting{}, err
+		}
+		if !held {
+			return vetting{
+				reason: fmt.Sprintf("slice %s is %s, but %s; it is released and provisioned again once no pod holds it",
+					s.Name, s.State, strings.Join(hosts, ", ")),
+				release: true,
+				event:   EventReasonSliceHostUnavailable,
+			}, nil
+		}
+	}
+	need, err := r.demand.Shape.Topology.Hosts(pl.p.cfg.Accelerators[r.demand.Shape.Accelerator].ChipsPerHost)
+	if err != nil {
+		return vetting{}, fmt.Errorf("hosts of slice %s: %w", s.Name, err)
+	}
+	if int64(found) < need {
+		return vetting{reason: fmt.Sprintf("slice %s is %s, but only %d of its %d hosts are visible yet", s.Name, s.State, found, need)}, nil
+	}
+	return vetting{}, nil
+}
+
+// vetStuck releases a slice that has partitions but has stayed out of a ready
+// state for longer than the ready timeout, while no pod holds it: a new slice
+// gets a new partition. A slice still waiting for a partition is waiting for
+// capacity, which a new slice would wait for too.
+func (pl *Placer) vetStuck(ctx context.Context, s gke.Slice, r *resolution, now time.Time) (vetting, error) {
+	timeout := pl.p.cfg.Slice.ReadyTimeoutDuration()
+	if timeout <= 0 || len(s.PartitionIDs) == 0 || s.Type != r.demand.SliceType || s.Topology != r.demand.Shape.Topology.String() {
+		return vetting{}, nil
+	}
+	since := s.StateSince
+	if since.IsZero() {
+		since = s.Created
+	}
+	waited := now.Sub(since)
+	if since.IsZero() || waited <= timeout {
+		return vetting{}, nil
+	}
+	held, err := pl.held(ctx, s)
+	if err != nil || held {
+		return vetting{}, err
+	}
+	return vetting{
+		reason: fmt.Sprintf("%s for %s, longer than the %s ready timeout; it is released and provisioned again once no pod holds it",
+			notReadyReason(s), waited.Round(time.Second), timeout),
+		release: true,
+		event:   EventReasonSliceReadyTimeout,
+	}, nil
+}
+
+// held reports whether a live read finds a pod of the owner that holds s.
+func (pl *Placer) held(ctx context.Context, s gke.Slice) (bool, error) {
 	owned, err := pl.ownerPods(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("read the pods that hold slice %s: %w", s.Name, err)
+		return false, fmt.Errorf("read the pods that hold slice %s: %w", s.Name, err)
 	}
-	if _, held := pl.p.Held(owned)[s.Name]; held {
-		return nil, nil
-	}
-	return hosts, nil
+	_, held := pl.p.Held(owned)[s.Name]
+	return held, nil
 }
 
 // podSpecs are the templates of inst's pods, one per pod: a worker renders

@@ -2,15 +2,32 @@ package workload_test
 
 import (
 	"context"
+	"encoding/json"
+	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
+
+// revisionWithPodSpec is a ControllerRevision whose payload records spec as
+// its pod template: the baseline an in-place start's diff is judged against.
+func revisionWithPodSpec(t *testing.T, name, ns string, spec *corev1.PodSpec) *appsv1.ControllerRevision {
+	t.Helper()
+	raw, err := json.Marshal(revision.DataPayload{PodSpec: spec})
+	if err != nil {
+		t.Fatalf("marshal revision payload: %v", err)
+	}
+	cr := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
+	cr.Data.Raw = raw
+	return cr
+}
 
 // Fixtures shared with the escalation package's tests.
 
@@ -104,6 +121,7 @@ func servingPod(name string) *corev1.Pod {
 			Conditions: []corev1.PodCondition{
 				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
 				{Type: "ome.io/serving", Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
 			},
 			ContainerStatuses: []corev1.ContainerStatus{{
 				Name:  "main",
@@ -232,4 +250,19 @@ func unschedulablePod(name string, since time.Time) *corev1.Pod {
 			}},
 		},
 	}
+}
+
+// neverReadyPath is a readiness path the kubelet model never serves: a
+// pod whose runner probes it runs without ever turning Ready.
+const neverReadyPath = "/never-ready"
+
+// probesNeverReadyPath reports whether a container of pod aims its
+// readiness probe at neverReadyPath.
+func probesNeverReadyPath(pod *corev1.Pod) bool {
+	for _, c := range pod.Spec.Containers {
+		if p := c.ReadinessProbe; p != nil && p.HTTPGet != nil && p.HTTPGet.Path == neverReadyPath {
+			return true
+		}
+	}
+	return false
 }

@@ -142,13 +142,15 @@ type WorkloadObservedState struct {
 	Migrations []MigrationRecord
 
 	// ExcludedNodesByInstance maps Instance index → nodes its rebuild
-	// must avoid, projected per reconcile by the adapter from the
-	// audit ledger's AutoRecover relocation directives (bounded to the
-	// operator's autoMigrate.maxAttempts most recent entries). BuildPlan
-	// copies it onto InstancePlan.ExcludedNodes; Render materializes it
-	// as a required NodeAffinity NotIn overlay. Nil / missing index =
-	// no exclusion (zero change for normal instances).
-	ExcludedNodesByInstance map[int32][]string
+	// must avoid, each with the revision it was recorded for, projected
+	// per reconcile by the adapter from the audit ledger's AutoRecover
+	// relocation directives (bounded to the operator's
+	// autoMigrate.maxAttempts most recent entries). BuildPlan copies it
+	// onto InstancePlan.ExcludedNodes; Render materializes the entries
+	// recorded for the revision it renders as a required NodeAffinity
+	// NotIn overlay. Nil / missing index = no exclusion (zero change for
+	// normal instances).
+	ExcludedNodesByInstance map[int32][]NodeExclusion
 }
 
 // Instance returns the observed row at idx, or nil when the observation

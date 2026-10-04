@@ -87,6 +87,9 @@ func TestReconcileCapacityInitialPlacement(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if diff := cmp.Diff(*member.Spec.Engine.MinReplicas, member.Spec.Engine.MaxReplicas); diff != "" {
+					t.Errorf("member %s bounds differ: %s", name, diff)
+				}
 				policy, err := protocol.FromDerived(member)
 				if err != nil {
 					t.Fatal(err)

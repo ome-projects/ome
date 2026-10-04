@@ -1013,3 +1013,113 @@ func TestUpdateWithPods_MarkerPodsAreOutsideTheSourcesSweep(t *testing.T) {
 		t.Fatalf("the marker's wedged pod must survive the source's sweep; get returned %v", err)
 	}
 }
+
+// The Component-wide sweep visits every bucket the pass observed,
+// Terminating pods only, in index then name order, and records each pod
+// under its own index; a pod on a Ready node and one still inside the
+// slack are left in place, and the earliest of their boundaries is what
+// the pass wakes on.
+func TestSweepStuckTerminatingPods_VisitsEveryBucketInOrderAndWakesOnTheEarliestBoundary(t *testing.T) {
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+
+	later := fdTerminatingPod("wedge-b", "dead-node", overdueTS)
+	later.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001")
+	first := fdTerminatingPod("wedge-a", "dead-node", overdueTS)
+	first.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0002")
+	slow := fdTerminatingPod("slow", "live-node", overdueTS)
+	slow.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0003")
+	fresh := fdTerminatingPod("fresh", "dead-node", fdNow.Add(-time.Minute))
+	fresh.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0004")
+	live := fdTerminatingPod("live", "dead-node", overdueTS)
+	live.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0005")
+	live.DeletionTimestamp = nil
+
+	c := fdFakeClient(t, &funcs,
+		fdStoredCopy(later), fdStoredCopy(first), fdStoredCopy(slow), fdStoredCopy(fresh), fdStoredCopy(live),
+		fdNodeUnreachable("dead-node", 10*time.Minute), fdNodeReady("live-node"))
+	rec := record.NewFakeRecorder(16)
+	byInstance := map[int32][]*corev1.Pod{
+		2: {later, first},
+		0: {slow, live},
+		1: {fresh},
+	}
+
+	at, err := SweepStuckTerminatingPods(context.Background(), workload.Deps{Client: c, Recorder: rec}, fdInput(fdISVC("llama"), fdPolicy()), byInstance)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(deletes) != 2 || deletes[0].name != "wedge-a" || deletes[1].name != "wedge-b" {
+		t.Fatalf("deletes: got %+v want wedge-a then wedge-b, in name order within the index", deletes)
+	}
+	for _, d := range deletes {
+		if d.grace == nil || *d.grace != 0 || d.uid == nil {
+			t.Errorf("delete %s: grace=%v uid=%v, want grace 0 under a UID precondition", d.name, d.grace, d.uid)
+		}
+	}
+	events := fdDrainEvents(rec)
+	if fdCountEvents(events, workload.EventReasonPodForceDeleted) != 2 {
+		t.Fatalf("events: %v, want two PodForceDeleted", events)
+	}
+	for _, e := range events {
+		if !strings.Contains(e, "instance=2") {
+			t.Errorf("event %q must record the pod's own index 2", e)
+		}
+	}
+	// fresh turns actionable one nanosecond past its deadline plus the
+	// slack; slow, on a Ready node, is re-read a threshold from now.
+	if want := fdNow.Add(-time.Minute).Add(fdPolicy().OverdueSlack).Add(time.Nanosecond); !at.Equal(want) {
+		t.Fatalf("boundary: got %v want %v", at, want)
+	}
+}
+
+// Without a policy the sweep is not there: no node is read for any pod
+// and nothing is deleted, whatever the buckets hold.
+func TestSweepStuckTerminatingPods_NilPolicyReadsNothing(t *testing.T) {
+	nodeGets := 0
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Node); ok {
+			nodeGets++
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	pod := fdTerminatingPod("wedge-0", "gone-node", overdueTS)
+	c := fdFakeClient(t, &funcs, fdStoredCopy(pod))
+
+	at, err := SweepStuckTerminatingPods(context.Background(), workload.Deps{Client: c}, fdInput(fdISVC("llama"), nil), map[int32][]*corev1.Pod{0: {pod}})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if nodeGets != 0 || len(deletes) != 0 || !at.IsZero() {
+		t.Fatalf("nil policy: nodeGets=%d deletes=%d boundary=%v, want none", nodeGets, len(deletes), at)
+	}
+}
+
+// One pod whose node cannot be read neither stops the sweep nor hides
+// the failure: the other pods are still judged and the error names it.
+func TestSweepStuckTerminatingPods_OneUnreadableNodeDoesNotShieldTheRest(t *testing.T) {
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Node); ok && key.Name == "broken-node" {
+			return apierrors.NewServiceUnavailable("apiserver down")
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	unreadable := fdTerminatingPod("unreadable", "broken-node", overdueTS)
+	unreadable.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001")
+	wedged := fdTerminatingPod("wedged", "dead-node", overdueTS)
+	wedged.UID = k8stypes.UID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0002")
+	c := fdFakeClient(t, &funcs, fdStoredCopy(unreadable), fdStoredCopy(wedged), fdNodeUnreachable("dead-node", 10*time.Minute))
+
+	_, err := SweepStuckTerminatingPods(context.Background(), workload.Deps{Client: c}, fdInput(fdISVC("llama"), fdPolicy()),
+		map[int32][]*corev1.Pod{0: {unreadable}, 1: {wedged}})
+	if err == nil || !strings.Contains(err.Error(), "unreadable") {
+		t.Fatalf("error must name the pod whose node could not be read, got %v", err)
+	}
+	if len(deletes) != 1 || deletes[0].name != "wedged" {
+		t.Fatalf("deletes: got %+v want wedged alone", deletes)
+	}
+}

@@ -27,7 +27,6 @@ func TestComponentPhaseProjectionIsExhaustiveAndClosed(t *testing.T) {
 	}{
 		{omev1beta1.RolloutPhaseStable, reportv1alpha1.RolloutPhaseStable},
 		{omev1beta1.RolloutPhaseCanarying, reportv1alpha1.RolloutPhaseCanarying},
-		{omev1beta1.RolloutPhaseBlueGreenStandby, reportv1alpha1.RolloutPhaseBlueGreenStandby},
 		{omev1beta1.RolloutPhasePending, reportv1alpha1.RolloutPhasePending},
 		{omev1beta1.RolloutPhasePaused, reportv1alpha1.RolloutPhasePaused},
 		{omev1beta1.RolloutPhasePromoting, reportv1alpha1.RolloutPhasePromoting},

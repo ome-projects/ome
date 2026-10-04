@@ -36,9 +36,10 @@ import (
 // RatioBalanced groups.
 //
 // strategy is the mechanism the start runs on, as the workload reports it
-// (ReconcileInput.UpdateGate): a gang whose in-place strategy resolves to
-// a recreate arrives as RecreatePod, so an in-place value here is a
-// single-pod start. In-place starts (InPlaceIfPossible / InPlaceOnly) skip
+// (ReconcileInput.UpdateGate): an in-place strategy that resolves to a
+// recreate on the Instance (a gang, or a single-pod diff beyond container
+// images) arrives as RecreatePod, so an in-place value here is a start
+// that patches the same pod. In-place starts (InPlaceIfPossible / InPlaceOnly) skip
 // CheckRatio entirely. For in-place the drain is paired 1:1 with a
 // same-pod return (mark-not-ready -> patch -> mark-ready), so the net
 // capacity change is ~0; running the gate would project a -1 loss that

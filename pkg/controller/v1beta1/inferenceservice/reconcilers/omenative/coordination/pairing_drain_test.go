@@ -86,6 +86,31 @@ func TestEvaluatePairingDrain_HoldsTheLastPartnerUntilThePeerServesTarget(t *tes
 	}
 }
 
+// A referenced peer's pods carry the peer replica's own name prefix; the
+// gate finds them there, so the same hold-then-allow sequence plays out
+// with both roles served by referenced replicas.
+func TestEvaluatePairingDrain_ReferencedPeerPodsAreFoundUnderTheirOwnPrefix(t *testing.T) {
+	isvc := pairingISVC("v2")
+	isvc.Spec.ReplicaRefs = &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}, Decoder: []string{"pool-d"}}
+	oldEngine := drainPod("pool-a", v1beta1.EngineComponent, "pool-a-engine-0-default-0", "default", "v1", true)
+	oldDecoder := drainPod("pool-d", v1beta1.DecoderComponent, "pool-d-decoder-0-default-0", "default", "v1", true)
+	newDecoder := drainPod("pool-d", v1beta1.DecoderComponent, "pool-d-decoder-0-default-1", "default", "v2", true)
+	// Pods labelled with the service name are not the referenced roles' pods.
+	strayEngine := drainPod("llama", v1beta1.EngineComponent, "llama-engine-0-default-1", "default", "v2", true)
+
+	allowed, gate, _ := drainGate(t, isvc, v1beta1.DecoderComponent, []string{oldDecoder.Name}, oldEngine, oldDecoder, newDecoder, strayEngine)
+	if allowed || gate != v1beta1.RolloutHoldGatePairing {
+		t.Fatalf("draining the last v1 decoder of the referenced replica while the referenced engine serves only v1 must be held: allowed=%v gate=%q", allowed, gate)
+	}
+	newEngine := drainPod("pool-a", v1beta1.EngineComponent, "pool-a-engine-0-default-1", "default", "v2", true)
+	if allowed, _, reason := drainGate(t, isvc, v1beta1.DecoderComponent, []string{oldDecoder.Name}, oldEngine, oldDecoder, newDecoder, newEngine); !allowed {
+		t.Fatalf("with a v2 engine serving the v2 decoder pairs; the drain must proceed: %s", reason)
+	}
+	if allowed, _, reason := drainGate(t, isvc, v1beta1.EngineComponent, []string{oldEngine.Name}, oldEngine, oldDecoder, newDecoder, newEngine); !allowed {
+		t.Fatalf("the v2 engine pairs with the referenced v2 decoder; the engine drain must proceed: %s", reason)
+	}
+}
+
 func TestEvaluatePairingDrain_ReplacementNotYetReadyIsNotCapacity(t *testing.T) {
 	isvc := pairingISVC("v2")
 	oldEngine := drainPod("llama", v1beta1.EngineComponent, "llama-engine-0-default-0", "default", "v1", true)

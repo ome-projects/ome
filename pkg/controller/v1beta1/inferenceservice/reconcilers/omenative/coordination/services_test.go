@@ -60,6 +60,70 @@ func TestBuildPerRevisionRoutingService_Properties(t *testing.T) {
 	checkOwnerRef(t, svc, isvc)
 }
 
+// A referenced role's per-revision Services are named with the replica's
+// own prefix and select its labels, while the InferenceService still owns
+// them; a projected role keeps the service name.
+func TestBuildPerRevisionServices_ReferencedRole(t *testing.T) {
+	isvc := testISVC()
+	isvc.Spec.ReplicaRefs = &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}, Decoder: []string{"pool-d"}}
+
+	routing, err := BuildPerRevisionRoutingService(isvc, v1beta1.DecoderComponent, "abc", RevisionRoutingSelector{}, runnerPorts())
+	if err != nil {
+		t.Fatalf("routing: %v", err)
+	}
+	if routing.Name != "pool-d-decoder-rev-abc" {
+		t.Errorf("routing name: got %q want pool-d-decoder-rev-abc", routing.Name)
+	}
+	checkSelector(t, routing.Spec.Selector, "pool-d", "decoder", "abc")
+	checkOwnerRef(t, routing, isvc)
+
+	headless, err := BuildPerRevisionHeadlessService(isvc, v1beta1.DecoderComponent, "abc")
+	if err != nil {
+		t.Fatalf("headless: %v", err)
+	}
+	if headless.Name != "pool-d-decoder-rev-abc-headless" {
+		t.Errorf("headless name: got %q want pool-d-decoder-rev-abc-headless", headless.Name)
+	}
+	checkSelector(t, headless.Spec.Selector, "pool-d", "decoder", "abc")
+	checkOwnerRef(t, headless, isvc)
+
+	projected, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "abc", RevisionRoutingSelector{}, runnerPorts())
+	if err != nil {
+		t.Fatalf("projected routing: %v", err)
+	}
+	if projected.Name != "llama-70b-engine-rev-abc" {
+		t.Errorf("projected routing name: got %q want llama-70b-engine-rev-abc", projected.Name)
+	}
+	checkSelector(t, projected.Spec.Selector, "llama-70b", "engine", "abc")
+}
+
+func TestEnsurePerRevisionServices_ReferencedRole(t *testing.T) {
+	c := fakeClient()
+	isvc := testISVC()
+	isvc.Spec.ReplicaRefs = &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}, Decoder: []string{"pool-d"}}
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.DecoderComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	if out.RoutingName != "pool-d-decoder-rev-hash1" || out.HeadlessName != "pool-d-decoder-rev-hash1-headless" {
+		t.Errorf("names: got %+v", out)
+	}
+	for _, name := range []string{out.RoutingName, out.HeadlessName} {
+		svc := &corev1.Service{}
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: name}, svc); err != nil {
+			t.Fatalf("service %s missing: %v", name, err)
+		}
+		checkSelector(t, svc.Spec.Selector, "pool-d", "decoder", "hash1")
+		checkOwnerRef(t, svc, isvc)
+	}
+	if err := GCPerRevisionServices(context.Background(), c, isvc.Namespace, "pool-d", v1beta1.DecoderComponent, "hash1"); err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: out.RoutingName}, &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Errorf("routing service after gc: err=%v want NotFound", err)
+	}
+}
+
 func TestBuildPerRevisionRoutingService_LeaderAndOrdinalFilters(t *testing.T) {
 	isvc := testISVC()
 	svc, err := BuildPerRevisionRoutingService(isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts())

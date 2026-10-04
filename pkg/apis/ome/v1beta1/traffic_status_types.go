@@ -95,32 +95,35 @@ const (
 	TrafficReasonTranslationFailed = "TranslationFailed"
 )
 
-// RolloutPhase reflects the current rollout state for a Component.
-// Operators read it to understand which rollout strategy is active and
-// whether it has succeeded. Lives on ComponentStatusSpec.RolloutPhase.
+// RolloutPhase is the canary step machine's projected state for a Component
+// that a spec.rollout canary group governs. The canary executor writes it on
+// the Component it drives (the unit's entrypoint) and nothing clears it, so
+// it persists between runs. Lives on ComponentStatusSpec.RolloutPhase.
+// Components that blueGreen/rollingUpdate groups drive carry no phase; their
+// state is under status.rolloutCoordination.
 type RolloutPhase string
 
 const (
-	// RolloutPhaseStable indicates one revision is live serving 100%
-	// of traffic and no rollout is in flight.
+	// RolloutPhaseStable indicates one revision owns the Component's traffic
+	// and no canary is in flight: the Component before its first canary and
+	// after a completed one (status.canary then records the finished run).
 	RolloutPhaseStable RolloutPhase = "Stable"
-	// RolloutPhaseCanarying indicates two revisions are live, with the
-	// canary at 1-99% traffic and canary pods Ready.
+	// RolloutPhaseCanarying indicates two revisions are live: the step's
+	// canary capacity is Ready, its traffic weight (0-99%) is programmed and
+	// no gate holds the step. A step at 0% traffic is the capacity-ahead
+	// warm-up, where the canary is validated in-cluster before it takes
+	// traffic.
 	RolloutPhaseCanarying RolloutPhase = "Canarying"
-	// RolloutPhaseBlueGreenStandby indicates two revisions are live,
-	// with the canary at 0% traffic and canary pods Ready (ready for
-	// in-cluster validation before cutover).
-	RolloutPhaseBlueGreenStandby RolloutPhase = "BlueGreenStandby"
 	// RolloutPhasePending indicates a new revision is being
 	// materialized; canary pods are not yet Ready. Transient.
 	RolloutPhasePending RolloutPhase = "Pending"
-	// RolloutPhasePaused indicates a step-based rollout is paused at
-	// a step boundary, waiting for either the
-	// ome.io/rollout-promote annotation (Manual policy) or for
-	// the step's Pause.Duration to elapse (Auto policy).
+	// RolloutPhasePaused indicates a step's split is programmed and its gate
+	// holds: waiting for the ome.io/rollout-promote annotation (manual
+	// promotion, or a pre-step hold after a repin), for the step's
+	// Pause.Duration to elapse, or for its analysis window to pass.
 	RolloutPhasePaused RolloutPhase = "Paused"
-	// RolloutPhasePromoting indicates the canary is scaling up to
-	// full replicas and the stable revision is draining. Transient.
+	// RolloutPhasePromoting indicates the final step has shifted 100% of the
+	// traffic to the canary and the stable revision is draining. Transient.
 	RolloutPhasePromoting RolloutPhase = "Promoting"
 	// RolloutPhaseRollingBack indicates the canary is scaling down
 	// and the stable revision is scaling back to full. Transient.
@@ -130,8 +133,11 @@ const (
 	// rejecting the rolled-back revision. The rollout re-arms only when a
 	// new (different) target revision appears. Terminal until then.
 	RolloutPhaseRolledBack RolloutPhase = "RolledBack"
-	// RolloutPhaseFailed indicates the canary pods failed to reach
-	// Ready within the configured timeout. The canary is preserved
-	// for diagnosis; operator must roll back or recover explicitly.
+	// RolloutPhaseFailed indicates the canary is parked at its current step
+	// with the stable revision still serving: the capacity gate stayed unmet
+	// past the ready timeout, analysis stayed inconclusive past the stall
+	// timeout, or a rollback found no stable revision to return to
+	// (status.canary.failed names the reason). The canary is preserved for
+	// diagnosis; the operator must roll back or resume explicitly.
 	RolloutPhaseFailed RolloutPhase = "Failed"
 )

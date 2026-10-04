@@ -182,9 +182,9 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 	if !fresh {
 		return Outcome{RequeueAfter: shortRequeue}, nil
 	}
-	if !divergedMember(isvc, targets) && !canaryMidFlight(isvc) {
-		setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonNoRun, "no rollout in progress", now)
-		setPlanDrift(isvc, false, v1beta1.RolloutPlanDriftReasonInSync, "", now)
+	diverged := divergedMember(isvc, targets)
+	if !diverged && !canaryMidFlight(isvc, nil) {
+		settleNoRun(isvc, now)
 		return Outcome{}, nil
 	}
 
@@ -200,8 +200,14 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		}
 		return Outcome{Parked: true, RequeueAfter: parkRequeue}, nil
 	}
+	// A ref-sourced canary's done sentinel is only exact against the composed
+	// body; a finished ladder with nothing diverged needs no run.
+	if !diverged && !canaryMidFlight(isvc, plan.groups) {
+		settleNoRun(isvc, now)
+		return Outcome{}, nil
+	}
 
-	adopting := !retargeting && canaryMidFlight(isvc)
+	adopting := !retargeting && canaryMidFlight(isvc, plan.groups)
 	openRun(isvc, plan, targets, stableOverrides, adopting, now)
 	recordRunOpened(isvc, plan, adopting)
 	setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonPinned,
@@ -215,6 +221,12 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 			"run %s opened (%s)", isvc.Status.Rollout.ActiveRun.RunID, combinedPlanDigest(plan.digests))
 	}
 	return Outcome{StateChanged: true, RequeueAfter: shortRequeue, Opened: true, Adopted: adopting}, nil
+}
+
+// settleNoRun records the idle state: no run is pinned and none is needed.
+func settleNoRun(isvc *v1beta1.InferenceService, now metav1.Time) {
+	setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonNoRun, "no rollout in progress", now)
+	setPlanDrift(isvc, false, v1beta1.RolloutPlanDriftReasonInSync, "", now)
 }
 
 func activeRun(isvc *v1beta1.InferenceService) *v1beta1.RolloutRun {
@@ -401,9 +413,14 @@ func closeRun(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, outcom
 }
 
 // componentStableRevision resolves the last promoted revision for a Component.
-// A distinct IR current revision is authoritative at run open. The scalar
-// primary and per-Component rollout status cover adoption of an older run that
-// has already advanced CurrentRevision to its target.
+// A distinct IR current revision is authoritative at run open. When the IR has
+// already advanced CurrentRevision to its target (a run adopted mid-flight),
+// the unit's canary record names the stable it shifts from, and the
+// Component's LatestRolledoutRevision names the revision that last owned its
+// traffic: the durable identity every OMENative writer keeps, coordination
+// for its Components and the canary executor at each completed promotion and
+// rollback for its members, so a secondary with no record of its own still
+// resolves.
 func componentStableRevision(isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, pinnedRevision string, target targetPair, adopting bool) string {
 	if target.current != "" && target.current != pinnedRevision {
 		return target.current
@@ -448,9 +465,10 @@ func retargeted(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, targ
 
 // closedOutcome decides whether the run reached a terminal state: RolledBack
 // (the canary's sticky hold settled) or Completed — every pinned group's
-// members converged to the pinned target, or the group rests Staged (a
-// lifecycle partition deliberately holds mixed revisions; keying completion
-// on full convergence alone would pin such a run's plan forever).
+// members converged to the pinned target (a canary unit also reports Stable),
+// or the group rests Staged (a lifecycle partition deliberately holds mixed
+// revisions; keying completion on full convergence alone would pin such a
+// run's plan forever).
 func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, targets map[v1beta1.ComponentType]targetPair) (v1beta1.RolloutRunOutcome, bool) {
 	pinnedFor := map[v1beta1.ComponentType]string{}
 	for _, t := range active.TargetRevisions {
@@ -494,6 +512,13 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 				return "", false
 			}
 			if int(cs.CurrentStep) < len(g.Canary.Steps) {
+				return "", false
+			}
+			// The done sentinel releases the last held instance; the unit
+			// reads Stable once that instance has rolled. The run stays
+			// pinned until then, because a plan resolved only through the pin
+			// must still drive the unit to report it.
+			if primaryPhase(isvc, g) != v1beta1.RolloutPhaseStable {
 				return "", false
 			}
 			// The done sentinel can lead the IR counters by a pass; closing

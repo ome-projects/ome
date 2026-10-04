@@ -24,7 +24,7 @@ func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1
 		// The predicates below inspect per-Instance rows, so the status is
 		// read through the decoded accessor; a payload that cannot be decoded
 		// is a read error and holds the placement like any other read failure.
-		ir, _, err := irprojector.DecodedComponentIR(ctx, reads, isvc.Namespace, isvc.Name, c)
+		ir, _, err := irprojector.DecodedComponentIRFor(ctx, reads, isvc, c)
 		if err != nil {
 			return nil, err
 		}

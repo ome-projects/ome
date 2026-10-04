@@ -311,23 +311,23 @@ func TestUpdateContinuation_PhaseUpdatingOrFailedWithAnUpdateClaim(t *testing.T)
 
 // Only a fresh start of a Failed row serving nothing, on a strategy that
 // recreates in place, skips the coordination gate.
-func TestRecreateOfDarkFailedRow_OnlyANonSurgeFreshStartServingNothing(t *testing.T) {
+func TestRecreateOfDarkRow_OnlyANonSurgeFreshStartServingNothing(t *testing.T) {
 	dark := &InstanceStatus{Phase: InstancePhaseFailed, ServingPodCount: 0}
-	if !RecreateOfDarkFailedRow(dark, UpdateStrategyRecreatePod) {
+	if !RecreateOfDarkRow(dark, UpdateStrategyRecreatePod) {
 		t.Error("a dark Failed row recreated in place skips the gate")
 	}
-	if RecreateOfDarkFailedRow(dark, UpdateStrategySurgeThenDrain) {
+	if RecreateOfDarkRow(dark, UpdateStrategySurgeThenDrain) {
 		t.Error("a surge strategy keeps the consult: its gate counts surge pods")
 	}
 	serving := &InstanceStatus{Phase: InstancePhaseFailed, ServingPodCount: 1}
-	if RecreateOfDarkFailedRow(serving, UpdateStrategyRecreatePod) {
+	if RecreateOfDarkRow(serving, UpdateStrategyRecreatePod) {
 		t.Error("a row still serving takes capacity offline and is gated")
 	}
 	continuation := &InstanceStatus{Phase: InstancePhaseFailed, Operation: &InstanceOperation{Type: InstanceOperationUpdate}}
-	if RecreateOfDarkFailedRow(continuation, UpdateStrategyRecreatePod) {
+	if RecreateOfDarkRow(continuation, UpdateStrategyRecreatePod) {
 		t.Error("a continuation is not a fresh start")
 	}
-	if RecreateOfDarkFailedRow(nil, UpdateStrategyRecreatePod) {
+	if RecreateOfDarkRow(nil, UpdateStrategyRecreatePod) {
 		t.Error("no row, no start")
 	}
 }

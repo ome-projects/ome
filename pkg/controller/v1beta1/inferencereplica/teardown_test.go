@@ -1253,15 +1253,13 @@ func TestTeardown_ForceDeleteEscalation_UnwedgesDeadNodePod(t *testing.T) {
 	rec := record.NewFakeRecorder(32)
 	r.Recorder = rec
 
+	// The admission pass commits the Delete operation and, with the
+	// evidence already actionable, the Component-wide sweep force-deletes
+	// the wedged pod in the same pass.
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
 	}); err != nil {
 		t.Fatalf("admission Reconcile: %v", err)
-	}
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
-	}); err != nil {
-		t.Fatalf("effect Reconcile: %v", err)
 	}
 
 	// The escalation must have grace-0 force-deleted the wedged pod.
@@ -1308,7 +1306,7 @@ func TestTeardown_ForceDeleteEscalation_UnwedgesDeadNodePod(t *testing.T) {
 		t.Errorf("ledger ConfigMap must be owned by the IR when the parent is gone")
 	}
 
-	// A fresh authoritative pass observes the Pod absent and commits
+	// The next authoritative pass observes the Pod absent and commits
 	// InstanceStatus removal. Finalizer completion follows from the next
 	// authoritative snapshot.
 	result, err := r.Reconcile(context.Background(), ctrl.Request{

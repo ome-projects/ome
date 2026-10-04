@@ -1,6 +1,8 @@
 package types
 
 import (
+	"sort"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -140,20 +142,47 @@ func FindMigrationRecord(records []MigrationRecord, requestUUID string) *Migrati
 	return nil
 }
 
-// NextManualMigration selects the migration the dispatcher should drive
-// this pass: the oldest-StartedAt Manual record whose phase is
-// non-terminal. Auto records are excluded structurally — born terminal,
-// they never rank. Returns nil when no work exists.
-func NextManualMigration(records []MigrationRecord) *MigrationRecord {
-	var picked *MigrationRecord
+// manualMigrationOrder returns the positions of the migration work in
+// dispatch order: every Manual record whose phase is non-terminal,
+// oldest StartedAt first (ties keep their status order). Auto records
+// are excluded structurally — born terminal, they never rank.
+func manualMigrationOrder(records []MigrationRecord) []int {
+	var order []int
 	for i := range records {
-		r := &records[i]
-		if r.Trigger != MigrationTriggerManual || r.Phase.Terminal() {
+		if records[i].Trigger != MigrationTriggerManual || records[i].Phase.Terminal() {
 			continue
 		}
-		if picked == nil || r.StartedAt.Time.Before(picked.StartedAt.Time) {
-			picked = r
-		}
+		order = append(order, i)
 	}
-	return picked
+	sort.SliceStable(order, func(i, j int) bool {
+		return records[order[i]].StartedAt.Time.Before(records[order[j]].StartedAt.Time)
+	})
+	return order
+}
+
+// ManualMigrationsOldestFirst returns copies of the migration work in
+// dispatch order. The dispatcher walks this order: a record parked on
+// its source teardown is tended in place, and the first record that is
+// not parked is the head it drives. Returns nil when no work exists.
+func ManualMigrationsOldestFirst(records []MigrationRecord) []MigrationRecord {
+	order := manualMigrationOrder(records)
+	if len(order) == 0 {
+		return nil
+	}
+	work := make([]MigrationRecord, 0, len(order))
+	for _, i := range order {
+		work = append(work, records[i])
+	}
+	return work
+}
+
+// NextManualMigration selects the migration the dispatcher would drive
+// first — the head of the dispatch order — aliasing the slice element.
+// Returns nil when no work exists.
+func NextManualMigration(records []MigrationRecord) *MigrationRecord {
+	order := manualMigrationOrder(records)
+	if len(order) == 0 {
+		return nil
+	}
+	return &records[order[0]]
 }

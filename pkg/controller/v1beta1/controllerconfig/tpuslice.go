@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -102,9 +103,28 @@ type TPUSliceObject struct {
 	// annotation that hands a slice to its scheduler. Required; {} for none.
 	Annotations map[string]string `json:"annotations"`
 
+	// PodAnnotations, when set, are annotation keys copied from a workload's
+	// pod template onto each slice the controller creates for it, such as the
+	// annotation that sets a slice's scheduling priority. A key the template
+	// does not set is left off the slice, and a slice keeps the values it was
+	// created with. A key may not also be in Annotations.
+	PodAnnotations []string `json:"podAnnotations,omitempty"`
+
 	// ReadyStates are the ready-condition reasons of a slice whose chips can
 	// be bound.
 	ReadyStates []string `json:"readyStates"`
+
+	// ReadyTimeout, when set, is how long a slice that has partitions may stay
+	// out of a ready state before it is released and provisioned again, while
+	// no pod holds it. Unset never times a slice out.
+	ReadyTimeout string `json:"readyTimeout,omitempty"`
+}
+
+// ReadyTimeoutDuration is ReadyTimeout as a duration, zero when unset.
+// Validate rejects a value that does not parse.
+func (o TPUSliceObject) ReadyTimeoutDuration() time.Duration {
+	d, _ := time.ParseDuration(o.ReadyTimeout)
+	return d
 }
 
 // ShapeKeys are the node label keys a workload's slice shape is read from.
@@ -196,6 +216,18 @@ func (c *TPUSliceProvisioningConfig) Validate() error {
 	for _, key := range slices.Sorted(maps.Keys(c.Slice.Annotations)) {
 		errs = append(errs, qualifiedName("slice.annotations", key)...)
 	}
+	podKeys := map[string]struct{}{}
+	for i, key := range c.Slice.PodAnnotations {
+		path := fmt.Sprintf("slice.podAnnotations[%d]", i)
+		errs = append(errs, qualifiedName(path, key)...)
+		if _, dup := podKeys[key]; dup {
+			errs = append(errs, fmt.Errorf("%s: %q is listed twice", path, key))
+		}
+		podKeys[key] = struct{}{}
+		if _, set := c.Slice.Annotations[key]; set {
+			errs = append(errs, fmt.Errorf("%s: %q is already set by slice.annotations", path, key))
+		}
+	}
 	if len(c.Slice.ReadyStates) == 0 {
 		errs = append(errs, errors.New("slice.readyStates: at least one state is required"))
 	}
@@ -210,6 +242,11 @@ func (c *TPUSliceProvisioningConfig) Validate() error {
 			errs = append(errs, fmt.Errorf("%s: %q is listed twice", path, s))
 		}
 		states[s] = struct{}{}
+	}
+	if c.Slice.ReadyTimeout != "" {
+		if d, err := time.ParseDuration(c.Slice.ReadyTimeout); err != nil || d <= 0 {
+			errs = append(errs, fmt.Errorf("slice.readyTimeout: %q must be a positive duration", c.Slice.ReadyTimeout))
+		}
 	}
 	return errors.Join(errs...)
 }

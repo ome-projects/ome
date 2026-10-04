@@ -41,7 +41,7 @@ func TestStampDeletingBatch_AdmitsTheWaveOnlyAgainstThePlannedTable(t *testing.T
 	store := &terminalMutationStore{ownerUID: "owner-a"}
 	rows, input := deleteWave(store)
 
-	committed, err := StampDeletingBatch(context.Background(), input, time.Hour, rows[1:])
+	committed, _, err := StampDeletingBatch(context.Background(), input, time.Hour, rows[1:], nil)
 	if err != nil || !committed || store.writes != 1 {
 		t.Fatalf("admit = %v, %v (writes=%d), want the wave committed once", committed, err, store.writes)
 	}
@@ -59,7 +59,7 @@ func TestStampDeletingBatch_AdmitsTheWaveOnlyAgainstThePlannedTable(t *testing.T
 	changed := moved.statuses[0]
 	changed.Incarnation++
 	moved.statuses[0] = changed
-	committed, err = StampDeletingBatch(context.Background(), input, time.Hour, rows[1:])
+	committed, _, err = StampDeletingBatch(context.Background(), input, time.Hour, rows[1:], nil)
 	if !errors.Is(err, types.ErrStatusMutationPrecondition) || committed || moved.writes != 0 {
 		t.Fatalf("admit against a moved table = %v, %v (writes=%d), want the precondition refused", committed, err, moved.writes)
 	}
@@ -67,7 +67,7 @@ func TestStampDeletingBatch_AdmitsTheWaveOnlyAgainstThePlannedTable(t *testing.T
 	grown := &terminalMutationStore{ownerUID: "owner-a"}
 	rows, input = deleteWave(grown)
 	grown.statuses[2] = types.InstanceStatus{Index: 2, Phase: types.InstancePhaseCreating}
-	committed, err = StampDeletingBatch(context.Background(), input, time.Hour, rows[1:])
+	committed, _, err = StampDeletingBatch(context.Background(), input, time.Hour, rows[1:], nil)
 	if !errors.Is(err, types.ErrStatusMutationPrecondition) || committed || grown.writes != 0 {
 		t.Fatalf("admit against a grown table = %v, %v (writes=%d), want the precondition refused", committed, err, grown.writes)
 	}
@@ -79,7 +79,7 @@ func TestStampDeletingBatch_AdmitsTheWaveOnlyAgainstThePlannedTable(t *testing.T
 func TestRemoveDeletedBatch_RemovesTheWaveOnlyWhileItOwnsEveryRow(t *testing.T) {
 	store := &terminalMutationStore{ownerUID: "owner-a"}
 	rows, input := deleteWave(store)
-	if _, err := StampDeletingBatch(context.Background(), input, time.Hour, rows); err != nil {
+	if _, _, err := StampDeletingBatch(context.Background(), input, time.Hour, rows, nil); err != nil {
 		t.Fatal(err)
 	}
 	admitted := []types.InstanceStatus{store.statuses[0], store.statuses[1]}
@@ -110,7 +110,7 @@ func TestRemoveDeletedBatch_RemovesTheWaveOnlyWhileItOwnsEveryRow(t *testing.T) 
 func TestRemoveDeletedBatch_PartialConfirmationIsAnError(t *testing.T) {
 	store := &terminalMutationStore{ownerUID: "owner-a"}
 	rows, input := deleteWave(store)
-	if _, err := StampDeletingBatch(context.Background(), input, time.Hour, rows); err != nil {
+	if _, _, err := StampDeletingBatch(context.Background(), input, time.Hour, rows, nil); err != nil {
 		t.Fatal(err)
 	}
 	admitted := []types.InstanceStatus{store.statuses[0], store.statuses[1]}

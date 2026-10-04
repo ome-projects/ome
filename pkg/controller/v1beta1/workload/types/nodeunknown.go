@@ -50,7 +50,7 @@ func NodeUnknownTermination(pod *corev1.Pod) *InstanceTermination {
 	return &InstanceTermination{
 		PodName: pod.Name,
 		Reason:  WaitingReasonNodeUnknown,
-		Message: fmt.Sprintf("%s: pod %s is in phase Unknown on node %s; its kubelet has stopped reporting, so the name is held rather than recycled",
+		Message: fmt.Sprintf("%s: pod %s on node %s is not reported by its kubelet, so the name is held rather than recycled",
 			WaitingReasonNodeUnknown, pod.Name, node),
 		Time: pod.CreationTimestamp,
 	}

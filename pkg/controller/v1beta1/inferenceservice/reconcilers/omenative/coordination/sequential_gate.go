@@ -204,7 +204,7 @@ func observeSequentialComponentsForGate(ctx context.Context, reads client.Reader
 		// fails closed: fabricating a zero-valued observation for the
 		// rolling peer would admit a second Component and break
 		// at-most-one-rolling.
-		ir, _, err := irprojector.DecodedComponentIR(ctx, reads, isvc.Namespace, isvc.Name, c)
+		ir, _, err := irprojector.DecodedComponentIRFor(ctx, reads, isvc, c)
 		if err != nil {
 			return nil, err
 		}
@@ -323,7 +323,7 @@ func previousCompletedComponentForGate(order []v1beta1.ComponentType, observatio
 // moment because `apimeta.SetStatusCondition` only updates
 // LastTransitionTime on real status transitions (Unknown→True).
 func previousComponentReadyAt(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, prev v1beta1.ComponentType) (time.Time, error) {
-	summary, err := irprojector.ComponentIRStatus(ctx, reads, isvc.Namespace, isvc.Name, prev)
+	summary, err := irprojector.ComponentIRStatusFor(ctx, reads, isvc, prev)
 	if err != nil {
 		return time.Time{}, err
 	}

@@ -69,10 +69,12 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 	observations := r.observeSplitMembers(ctx, accepted, eligible)
 	if proposal.Mode == v1beta1.PlacementModeAll {
 		for name, observed := range observations {
+			// The standing read still describes an unreadable planned home. It keeps
+			// the plan it last acknowledged; only unverified ready capacity is withheld.
 			if home, exists := standing.get(name); exists && !observed.Candidate.ObservationKnown {
 				candidate := *home.candidate.DeepCopy()
-				candidate.Allocation = observed.Candidate.Allocation
-				candidate.ObservationKnown, candidate.AppliedPlanID, candidate.ReadyReplicas = false, "", 0
+				candidate.Allocation, candidate.AppliedPlanID = observed.Candidate.Allocation, observed.Candidate.AppliedPlanID
+				candidate.ObservationKnown, candidate.ReadyReplicas = false, 0
 				observed.Candidate = candidate
 				observations[name] = observed
 			}
@@ -106,7 +108,7 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 		if slices.Contains(step.Resume, name) {
 			assignment.DrainRequested = false
 		}
-		if target == 0 && observations[name].Home.Absent {
+		if target == 0 && assignment.DesiredHome == nil && observations[name].Home.Absent {
 			assignment.CurrentHome, assignment.DrainRequested = nil, false
 		}
 		proposal.Assignments[name] = assignment
@@ -121,7 +123,7 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 		for name, assignment := range proposal.Assignments {
 			assignment.OriginalReplicas = assignment.CurrentReplicas
 			assignment.ReplacementStartedAt = nil
-			if assignment.CurrentReplicas == 0 && observations[name].Home.Absent {
+			if assignment.CurrentReplicas == 0 && assignment.DesiredHome == nil && observations[name].Home.Absent {
 				assignment.DrainRequested = false
 				assignment.CurrentHome = nil
 				if proposal.Mode == v1beta1.PlacementModeSingle {
@@ -166,7 +168,7 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 		switch {
 		case next.Status.Placement.Plan.SingleMove != nil && next.Status.Placement.Plan.SingleMove.Selected == "" && assignment.RaceCandidate && assignment.CurrentReplicas == 0 && assignment.DesiredReplicas == 0 && assignment.DrainRequested:
 			err = r.deletePlannedRaceLoser(cctx, next, candidate)
-		case assignment.CurrentReplicas > 0 && observed.Home.Eligible:
+		case (assignment.CurrentReplicas > 0 || (assignment.CurrentHome != nil && !assignment.DrainRequested)) && observed.Home.Eligible:
 			err = r.placePlannedOn(cctx, next, candidate)
 		case assignment.CurrentReplicas == 0 && assignment.DrainRequested && observed.Home.Drained && !changed:
 			err = r.deletePlannedOn(cctx, next, candidate, true)
@@ -309,7 +311,8 @@ func (r *Reconciler) observeSplitMembers(ctx context.Context, source *v1beta1.In
 		// Settled positive floors can release their pause without routing. Any
 		// movement or zero-floor cleanup requires current routing intent so a
 		// stale table cannot authorize retiring a serving home.
-		if !known && !observed.Home.Absent && (!settled || candidate.Allocation.CurrentReplicas == 0) {
+		activeZero := source.Status.Placement.Plan.Mode == v1beta1.PlacementModeAll && !source.Status.Placement.Plan.PauseSurge && candidate.Allocation.CurrentHome != nil && candidate.Allocation.DesiredHome != nil && !candidate.Allocation.DrainRequested
+		if !known && !observed.Home.Absent && (!settled || (candidate.Allocation.CurrentReplicas == 0 && !activeZero)) {
 			observed.Home.Known = false
 		}
 		out[candidate.Cluster] = observed
@@ -346,11 +349,16 @@ func advanceSplitPlan(source *v1beta1.InferenceService, observations map[string]
 		return allocation.Step{Targets: input.Current, Reason: "AwaitingSurgePause"}, nil
 	}
 	if accepted.Mode == v1beta1.PlacementModeAll {
+		zeroFloor := false
 		for _, candidate := range source.Status.Placement.Candidates {
 			a := candidate.Allocation
+			zeroFloor = zeroFloor || zeroHomeFloor(a.CurrentHome) || zeroHomeFloor(a.DesiredHome)
 			if a.InventoryPending || a.HomeInputsPending || (a.Matched && (a.DesiredHome == nil || a.DesiredHome.InputDigest != accepted.InputDigest)) {
 				return allocation.Step{Targets: input.Current, Reason: "AwaitingHomeInputs"}, nil
 			}
+		}
+		if zeroFloor {
+			return advanceAllZeroFloors(source, observations), nil
 		}
 	}
 	if accepted.SingleMove != nil {
@@ -410,10 +418,10 @@ func (r *Reconciler) writeSplitObservations(ctx context.Context, source *v1beta1
 			candidate = retainedUnknownCandidate(source, previous)
 		}
 		res.candidates = append(res.candidates, candidate)
-		if previous.Allocation.CurrentReplicas > 0 && res.phase == v1beta1.PlacementPhasePending {
+		if (previous.Allocation.CurrentReplicas > 0 || previous.Allocation.CurrentHome != nil) && res.phase == v1beta1.PlacementPhasePending {
 			res.phase = v1beta1.PlacementPhaseAdmitting
 		}
-		if candidate.AdmittedReplicas > 0 {
+		if candidate.AdmittedReplicas > 0 || observed.IdleZeroFloor {
 			res.phase = v1beta1.PlacementPhasePlaced
 		}
 		res.ready = res.ready || (candidate.ObservationKnown && candidate.ReadyReplicas > 0 && candidate.Endpoint != nil)

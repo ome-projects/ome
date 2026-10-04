@@ -13,21 +13,23 @@ import (
 )
 
 // headlessServiceSuffix is the trailing component of the per-Component
-// headless Service name (`<isvc>-<component>-headless`). The
+// headless Service name (`<prefix>-<component>-headless`). The
 // EndpointSlice mapper uses it to recognise an OMENative-owned slice
-// and reverse-lookup the parent ISVC.
+// and reverse-lookup the name prefix.
 const headlessServiceSuffix = "-headless"
 
-// EndpointSliceToISVC maps an EndpointSlice for an OMENative
-// headless Service back to its parent InferenceService reconcile
-// key. Returns an empty slice for any event that doesn't target an
-// OMENative-managed Service — the EndpointSlice watch is
-// unfiltered, so the mapper does all the filtering.
+// EndpointSliceToISVC maps an EndpointSlice for an OMENative headless
+// Service to the InferenceService reconcile key its name prefix spells.
+// Returns an empty slice for any event that doesn't target an
+// OMENative-managed Service — the EndpointSlice watch is unfiltered, so
+// the mapper does all the filtering.
 //
-// EndpointSlice carries the `kubernetes.io/service-name` label
-// pointing at its parent Service. OMENative headless Services are
-// named `<isvc>-<component>-headless`, so a name parse is enough
-// to identify them and recover the ISVC name.
+// EndpointSlice carries the `kubernetes.io/service-name` label pointing
+// at its parent Service. OMENative headless Services are named
+// `<prefix>-<component>-headless`, prefix being the replica's name
+// prefix: the InferenceService name for a projected replica, which is
+// what the parse recovers. The controller's mapper refines the result
+// through the Service's owner when an InferenceService controls it.
 func EndpointSliceToISVC(ctx context.Context, obj client.Object) []reconcile.Request {
 	slice, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {

@@ -29,11 +29,13 @@ func TestMetricNames(t *testing.T) {
 	slicesReleased.WithLabelValues("type-a", "2x2x1")
 	sliceCreateFailures.WithLabelValues("type-a", "2x2x1", "Forbidden")
 	sliceProvisionSeconds.WithLabelValues("type-a", "2x2x1")
+	slicesLost.WithLabelValues("type-a", "2x2x1")
 	for _, name := range []string{
 		"ome_tpu_slice_created_total",
 		"ome_tpu_slice_released_total",
 		"ome_tpu_slice_create_failures_total",
 		"ome_tpu_slice_provision_duration_seconds",
+		"ome_tpu_slice_lost_total",
 	} {
 		if got, err := testutil.GatherAndCount(ctrlmetrics.Registry, name); err != nil || got == 0 {
 			t.Errorf("%s: %d series (err %v), want it registered", name, got, err)
@@ -283,6 +285,32 @@ func TestInitSeries(t *testing.T) {
 	want.Provisioning["type-a/2x2x1"] = provisionTimes{Count: 1, Sum: 30}
 	if diff := cmp.Diff(want, collect()); diff != "" {
 		t.Fatalf("series after a 2x2x1 slice (-want +got):\n%s", diff)
+	}
+}
+
+// TestRecovered pins that a lost slice counts once, under the slice type and
+// topology its pods select, on a series that exists from startup.
+func TestRecovered(t *testing.T) {
+	slicesLost.Reset()
+	InitSeries(testConfig())
+	want := map[string]float64{"type-a/2x2x1": 0, "type-a/2x2x2": 0}
+	if diff := cmp.Diff(want, collectCounts(t, slicesLost)); diff != "" {
+		t.Fatalf("series at startup (-want +got):\n%s", diff)
+	}
+
+	p := newProvisioner(t, newFakeClient(), testOwner)
+	name := p.Name(Slot{})
+	p.Recovered(LostSlice{Name: name, Pods: []*corev1.Pod{confined("leader", name, time.Time{}), confined("worker", name, time.Time{})}})
+	unselected := confined("unselected", name, time.Time{})
+	delete(unselected.Spec.NodeSelector, keyTopology)
+	unconfigured := confined("unconfigured", name, time.Time{})
+	unconfigured.Spec.NodeSelector[keyAccelerator] = "tpu-z"
+	for _, l := range []LostSlice{{Name: name}, {Name: name, Pods: []*corev1.Pod{unselected}}, {Name: name, Pods: []*corev1.Pod{unconfigured}}} {
+		p.Recovered(l)
+	}
+	want["type-a/2x2x1"] = 1
+	if diff := cmp.Diff(want, collectCounts(t, slicesLost)); diff != "" {
+		t.Fatalf("series after a lost 2x2x1 slice (-want +got):\n%s", diff)
 	}
 }
 

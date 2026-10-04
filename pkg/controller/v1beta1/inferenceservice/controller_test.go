@@ -1487,6 +1487,7 @@ func TestUpdateStatusKeepsTheLiveCanaryRecordOverAStalePass(t *testing.T) {
 		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "v3", StableRevisionHash: "old", RolledBackRevisionHash: "v3"}, v1beta1.RolloutPhaseRollingBack)
 		entry := engine(working)
 		entry.LatestReadyRevision = "rev-new"
+		entry.ScaleTargetRef = &v1beta1.ScaleTargetRef{APIVersion: "ome.io/v1beta1", Kind: "InferenceReplica", Name: nn.Name + "-engine"}
 		working.Status.Components[v1beta1.EngineComponent] = entry
 
 		g.Expect(reconciler.updateStatus(working, constants.OMENative, base)).NotTo(gomega.HaveOccurred())
@@ -1496,7 +1497,8 @@ func TestUpdateStatusKeepsTheLiveCanaryRecordOverAStalePass(t *testing.T) {
 		g.Expect(engine(got).Canary.RolledBackRevisionHash).To(gomega.Equal("new"))
 		g.Expect(engine(got).RolloutPhase).To(gomega.Equal(v1beta1.RolloutPhaseRollingBack))
 		g.Expect(got.Status.Canary.RolledBackRevisionHash).To(gomega.Equal("new"))
-		g.Expect(engine(got).LatestReadyRevision).To(gomega.Equal("rev-new"), "state the executor does not own is still written")
+		g.Expect(engine(got).LatestReadyRevision).To(gomega.BeEmpty(), "the rolled-out revision fields are the executor's; a stale pass keeps the live value")
+		g.Expect(engine(got).ScaleTargetRef).NotTo(gomega.BeNil(), "state the executor does not own is still written")
 		g.Expect(engine(working).Canary.RolledBackRevisionHash).To(gomega.Equal("new"), "the working copy is re-synced to the live record")
 	})
 

@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -817,29 +819,61 @@ func TestChooseUpdateMode_MultiPodInPlaceFallsBackToRecreate(t *testing.T) {
 	}
 }
 
-// TestInPlaceFallsBackToRecreate pins the one fallback the plan can
-// classify without a revision read: a multi-pod Instance under either
-// in-place variant rebuilds, while a single-pod Instance and every
+// TestInPlaceFallsBackToRecreate pins the fallbacks the plan classifies
+// ahead of the gate consult: a multi-pod Instance under either in-place
+// variant rebuilds without a revision read; a single-pod InPlaceIfPossible
+// start rebuilds when its diff against the running revision exceeds
+// regular-container images or no baseline is recorded, and only then is
+// the running PodSpec loaded; a single-pod InPlaceOnly start and every
 // non-in-place strategy keep their declared mechanism.
 func TestInPlaceFallsBackToRecreate(t *testing.T) {
+	target := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "v2"}}}
+	imageOnly := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "v1"}}}
+	envDiff := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "v1", Env: []corev1.EnvVar{{Name: "X"}}}}}
 	cases := []struct {
+		name     string
 		strategy workload.UpdateStrategyType
 		multiPod bool
+		running  *corev1.PodSpec
 		want     bool
+		wantRead bool
 	}{
-		{workload.UpdateStrategyInPlaceIfPossible, true, true},
-		{workload.UpdateStrategyInPlaceOnly, true, true},
-		{workload.UpdateStrategyInPlaceIfPossible, false, false},
-		{workload.UpdateStrategyInPlaceOnly, false, false},
-		{workload.UpdateStrategyRecreatePod, true, false},
-		{workload.UpdateStrategySurgeThenDrain, true, false},
-		{"", true, false},
+		{"gang InPlaceIfPossible", workload.UpdateStrategyInPlaceIfPossible, true, imageOnly, true, false},
+		{"gang InPlaceOnly", workload.UpdateStrategyInPlaceOnly, true, imageOnly, true, false},
+		{"single-pod InPlaceIfPossible image-only diff", workload.UpdateStrategyInPlaceIfPossible, false, imageOnly, false, true},
+		{"single-pod InPlaceIfPossible diff beyond images", workload.UpdateStrategyInPlaceIfPossible, false, envDiff, true, true},
+		{"single-pod InPlaceIfPossible no baseline", workload.UpdateStrategyInPlaceIfPossible, false, nil, true, true},
+		{"single-pod InPlaceOnly diff beyond images rejects, no fallback", workload.UpdateStrategyInPlaceOnly, false, envDiff, false, false},
+		{"gang RecreatePod", workload.UpdateStrategyRecreatePod, true, envDiff, false, false},
+		{"gang SurgeThenDrain", workload.UpdateStrategySurgeThenDrain, true, envDiff, false, false},
+		{"single-pod unset strategy", "", false, envDiff, false, false},
 	}
 	for _, tc := range cases {
-		if got := InPlaceFallsBackToRecreate(tc.strategy, tc.multiPod); got != tc.want {
-			t.Errorf("InPlaceFallsBackToRecreate(%q, multiPod=%v) = %v, want %v", tc.strategy, tc.multiPod, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			read := false
+			got, err := InPlaceFallsBackToRecreate(tc.strategy, tc.multiPod, target, func() (*corev1.PodSpec, error) {
+				read = true
+				return tc.running, nil
+			})
+			if err != nil {
+				t.Fatalf("InPlaceFallsBackToRecreate: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("InPlaceFallsBackToRecreate(%q, multiPod=%v) = %v, want %v", tc.strategy, tc.multiPod, got, tc.want)
+			}
+			if read != tc.wantRead {
+				t.Errorf("running PodSpec read = %v, want %v", read, tc.wantRead)
+			}
+		})
 	}
+	t.Run("a failed baseline read is the caller's error", func(t *testing.T) {
+		wantErr := fmt.Errorf("revision read failed")
+		if _, err := InPlaceFallsBackToRecreate(workload.UpdateStrategyInPlaceIfPossible, false, target, func() (*corev1.PodSpec, error) {
+			return nil, wantErr
+		}); !errors.Is(err, wantErr) {
+			t.Errorf("error = %v, want %v", err, wantErr)
+		}
+	})
 }
 
 // TestInPlaceEligible_OnlyImageDiff confirms image-only diff is
@@ -2095,7 +2129,7 @@ func TestRecordUpdateFailure_FirstFailureBacksOff(t *testing.T) {
 	t0 := time.Now()
 	input, calls, warns := retryWriterInput(t0, nil, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "ImagePullBackOff", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "ImagePullBackOff", workload.CauseWorkload); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -2143,7 +2177,7 @@ func TestRecordUpdateFailure_SecondWaveCounts(t *testing.T) {
 		Reason:          "old evidence",
 	}}, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "still ImagePullBackOff", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "still ImagePullBackOff", workload.CauseWorkload); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -2186,7 +2220,7 @@ func TestRecordUpdateFailure_SameWaveRefreshOnly(t *testing.T) {
 		Reason:          "first instance failed",
 	}}, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "second instance failed", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "second instance failed", workload.CauseWorkload); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -2225,7 +2259,7 @@ func TestRecordUpdateFailure_ExhaustionHolds(t *testing.T) {
 		AttemptsStarted: 2,
 	}}, retryTestPolicy())
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "third strike", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "third strike", workload.CauseWorkload); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -2250,7 +2284,7 @@ func TestRecordUpdateFailure_ExhaustionHolds(t *testing.T) {
 
 	// A subsequent failure against the persisted Held block: refresh only.
 	input.ObservedState.RetryBlocks = []workload.RetryBlock{b}
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "post-hold noise", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "post-hold noise", workload.CauseWorkload); err != nil {
 		t.Fatalf("record on Held: %v", err)
 	}
 	held := (*calls)[1].block
@@ -2271,7 +2305,7 @@ func TestRecordUpdateFailure_NilPolicyHoldsFirstFailure(t *testing.T) {
 	t0 := time.Now()
 	input, calls, warns := retryWriterInput(t0, nil, nil)
 
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "no policy configured", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "rev-bad", "no policy configured", workload.CauseWorkload); err != nil {
 		t.Fatalf("record: %v", err)
 	}
 	if len(*calls) != 1 {
@@ -2298,12 +2332,12 @@ func TestRecordUpdateFailure_UnwiredNoOp(t *testing.T) {
 	t0 := time.Now()
 
 	unwired := &workload.ReconcileInput{Clock: clocktesting.NewFakeClock(t0)}
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *unwired, "rev-bad", "x", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *unwired, "rev-bad", "x", workload.CauseWorkload); err != nil {
 		t.Fatalf("nil closure must no-op: %v", err)
 	}
 
 	input, calls, _ := retryWriterInput(t0, nil, retryTestPolicy())
-	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "", "x", true); err != nil {
+	if err := recordUpdateFailureInRetryBlock(context.Background(), *input, "", "x", workload.CauseWorkload); err != nil {
 		t.Fatalf("empty targetRev must no-op: %v", err)
 	}
 	if len(*calls) != 0 {
@@ -2333,30 +2367,33 @@ func TestInstanceFailureReason(t *testing.T) {
 	}
 }
 
-// TestInstanceFailureWorkloadCaused pins the call-site cause attribution:
-// only a LastFailure whose Reason is in the workload-caused set charges
-// the ladder; an elapsed deadline, an ambiguous kubelet reason, and
-// missing evidence do not.
-func TestInstanceFailureWorkloadCaused(t *testing.T) {
-	if instanceFailureWorkloadCaused(nil) {
-		t.Error("nil status must not be workload-caused")
+// TestInstanceFailureCause pins the call-site cause attribution: a
+// LastFailure whose Reason is in the workload-caused set blames the
+// revision, a scheduler hold or a gang name conflict names the
+// environment, and an elapsed deadline, an ambiguous kubelet reason or
+// missing evidence is a failed attempt the revision is not blamed for.
+func TestInstanceFailureCause(t *testing.T) {
+	if got := instanceFailureCause(nil); got != workload.CauseUnattributed {
+		t.Errorf("nil status: got %v want CauseUnattributed", got)
 	}
 	s := &workload.InstanceStatus{}
-	if instanceFailureWorkloadCaused(s) {
-		t.Error("nil LastFailure must not be workload-caused")
+	if got := instanceFailureCause(s); got != workload.CauseUnattributed {
+		t.Errorf("nil LastFailure: got %v want CauseUnattributed", got)
 	}
-	for reason, want := range map[string]bool{
-		"ImagePullBackOff":           true,
-		"ErrImagePull":               true,
-		"InvalidImageName":           true,
-		"CreateContainerConfigError": true,
-		"DeadlineExceeded":           false,
-		"CrashLoopBackOff":           false,
-		"RunContainerError":          false,
-		"":                           false,
+	for reason, want := range map[string]workload.FailureCause{
+		"ImagePullBackOff":                       workload.CauseWorkload,
+		"ErrImagePull":                           workload.CauseWorkload,
+		"InvalidImageName":                       workload.CauseWorkload,
+		"CreateContainerConfigError":             workload.CauseWorkload,
+		workload.WaitingReasonUnschedulable:      workload.CauseEnvironment,
+		workload.PodGroupOwnershipConflictReason: workload.CauseEnvironment,
+		"DeadlineExceeded":                       workload.CauseUnattributed,
+		"CrashLoopBackOff":                       workload.CauseUnattributed,
+		"RunContainerError":                      workload.CauseUnattributed,
+		"":                                       workload.CauseUnattributed,
 	} {
 		s.LastFailure = &workload.InstanceTermination{PodName: "p-0", Reason: reason}
-		if got := instanceFailureWorkloadCaused(s); got != want {
+		if got := instanceFailureCause(s); got != want {
 			t.Errorf("reason %q: got %v want %v", reason, got, want)
 		}
 	}
@@ -2512,7 +2549,7 @@ func TestDetectUpdate_WedgedPodsReachHeld(t *testing.T) {
 		// The attempt wedges on the same bad image: the disposition charges
 		// the revision's ladder and disposes the row back to Failed with the
 		// Operation cleared.
-		if err := recordUpdateFailureInRetryBlock(ctx, *input, tcr.Name, "ImagePullBackOff", true /* workloadCaused */); err != nil {
+		if err := recordUpdateFailureInRetryBlock(ctx, *input, tcr.Name, "ImagePullBackOff", workload.CauseWorkload); err != nil {
 			t.Fatalf("record failure %d: %v", attempt, err)
 		}
 		if err := input.MutateInstance(ctx, 0, func(s *workload.InstanceStatus) bool {
@@ -2623,7 +2660,7 @@ func TestDetectUpdate_StuckPodOnTargetRelocates(t *testing.T) {
 	pod.Spec.NodeName = suspectNode
 	pod.Labels[query.LabelInstanceIncarnation] = "1"
 	plan.UpdateStrategy.Type = workload.UpdateStrategyRecreatePod
-	plan.Instances[0].ExcludedNodes = []string{suspectNode}
+	plan.Instances[0].ExcludedNodes = []workload.NodeExclusion{{Node: suspectNode, Revision: tcr.Name}}
 
 	ctx := context.Background()
 	trigger, _, err := DetectUpdateTriggerWithPods(ctx, legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, []*corev1.Pod{pod})
@@ -3003,5 +3040,103 @@ func TestEffectiveUpdateStrategy_GangSurgePairStaysOnThePinnedStrategy(t *testin
 	idle := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady}
 	if got := effectiveUpdateStrategy(idle, workload.UpdateStrategyRecreatePod); got != workload.UpdateStrategyRecreatePod {
 		t.Errorf("idle row effective strategy: got %q want the edited RecreatePod", got)
+	}
+}
+
+// TestUpdateWithPods_RecreateFallbackRetargetedToTheRunningRevisionStaysARecreate:
+// an InPlaceIfPossible roll whose diff reached past the container images
+// rebuilt its pod at the new revision, and that pod has not turned Ready
+// when the target returns to the revision the row records as running.
+// The running revision's PodSpec equals the target's, but the live pod
+// was rendered from the superseded revision, so the roll is not an
+// in-place patch: the attempt stays on the recreate, its Incarnation is
+// bumped again and the superseded pod is taken down for a rebuild at the
+// target, never relabeled onto a revision it does not run.
+func TestUpdateWithPods_RecreateFallbackRetargetedToTheRunningRevisionStaysARecreate(t *testing.T) {
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 2)
+	isvc.Spec.Engine.ComponentExtensionSpec.Lifecycle = &v1beta1.LifecycleSpec{
+		UpdateStrategy: &v1beta1.UpdateStrategy{Type: v1beta1.UpdateStrategyInPlaceIfPossible},
+	}
+	v1Spec := legacyTargetSpecImage("llama:v1")
+	probedSpec := legacyTargetSpecImage("llama:v1")
+	probedSpec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+		HTTPGet: &corev1.HTTPGetAction{Path: "/never-ready", Port: intstr.FromInt32(8080)},
+	}}
+	c := legacyNewFakeClient(t, isvc, ir)
+	legacySeedRunningRevision(t, c, isvc, workload.ComponentEngine, 0, v1Spec)
+	v1CR := legacyEnsureTargetCR(t, c, isvc, v1Spec)
+	probedCR := legacyEnsureTargetCR(t, c, isvc, probedSpec)
+
+	// The row mid-recreate toward the probed revision: Incarnation bumped
+	// to 2, the attempt on its Drain step, and its rebuilt pod running at
+	// that Incarnation without readiness.
+	stamped := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)
+	if len(stamped) != 1 || stamped[0].RunningRevision != v1CR.Name {
+		t.Fatalf("fixture: want one row running %s, got %+v", v1CR.Name, stamped)
+	}
+	live := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: legacyIRName(isvc, workload.ComponentEngine)}, live); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	now := metav1.NewTime(time.Now().Add(-time.Minute))
+	live.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceUpdating
+	live.Status.InstanceStatuses[0].TargetRevision = probedCR.Name
+	live.Status.InstanceStatuses[0].Operation = &v1beta1.InstanceOperation{
+		ID:             "update-0-1",
+		Type:           v1beta1.InstanceOperationUpdate,
+		Step:           workload.UpdateStepDrain,
+		TargetRevision: probedCR.Name,
+		Strategy:       string(v1beta1.UpdateStrategyInPlaceIfPossible),
+		Reason:         "revision " + v1CR.Name + " -> " + probedCR.Name,
+		StartedAt:      now,
+		LastProgressAt: now,
+	}
+	if err := c.Status().Update(context.Background(), live); err != nil {
+		t.Fatalf("stamp the recreate in flight: %v", err)
+	}
+	rebuilt := legacyPodAtIncarnation(isvc, 0, 2, false, false)
+	rebuilt.Spec = *probedSpec.DeepCopy()
+	rebuilt.Labels[query.LabelRevisionHash] = query.RevisionOf(probedCR).Hash()
+	rebuilt.Status.Phase = corev1.PodRunning
+	rebuilt.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "main", Image: "llama:v1", Ready: false,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}}
+	if err := c.Create(context.Background(), rebuilt); err != nil {
+		t.Fatalf("create the rebuilt pod: %v", err)
+	}
+
+	// The target returns to the running revision.
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	input.DesiredSpec.PodSpec = v1Spec
+	input.ObservedState.UpdateRevision = v1CR.Name
+	plan := legacyComponentPlan(workload.UpdateStrategyInPlaceIfPossible, nil)
+	plan.Instances[0].Incarnation = 2
+	done, err := UpdateWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], v1CR, v1Spec, []*corev1.Pod{rebuilt})
+	if err != nil {
+		t.Fatalf("UpdateWithPods: %v", err)
+	}
+	if done {
+		t.Fatal("a retarget of a recreate in flight must not complete the roll")
+	}
+
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain {
+		t.Fatalf("Operation: got %+v want the recreate still owning the row (Step=%s)", s.Operation, workload.UpdateStepDrain)
+	}
+	if s.Operation.TargetRevision != v1CR.Name || s.TargetRevision != v1CR.Name {
+		t.Errorf("target: operation %q row %q, want both %q", s.Operation.TargetRevision, s.TargetRevision, v1CR.Name)
+	}
+	if s.Incarnation <= 2 {
+		t.Errorf("Incarnation: got %d want a bump past 2 (the superseded pod is torn down for a rebuild)", s.Incarnation)
+	}
+	after := &corev1.Pod{}
+	switch err := c.Get(context.Background(), client.ObjectKeyFromObject(rebuilt), after); {
+	case apierrors.IsNotFound(err):
+	case err != nil:
+		t.Fatalf("get the rebuilt pod: %v", err)
+	case after.Labels[query.LabelRevisionHash] != query.RevisionOf(probedCR).Hash():
+		t.Errorf("the superseded pod was relabeled to %q; a pod rendered from %s never carries another revision", after.Labels[query.LabelRevisionHash], probedCR.Name)
 	}
 }

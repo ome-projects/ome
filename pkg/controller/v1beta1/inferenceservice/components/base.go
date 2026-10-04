@@ -461,15 +461,15 @@ func writeComponentAutoscalerStatus(b *BaseComponentFields, isvc *v1beta1.Infere
 		resolved, source, hold = autoscaler.ResolveComponentAutoscalerWithPolicy(b.Runtime, isvc, componentType, outcome)
 	}
 
-	scaleTargetRef := canonicalScaleTargetRef(b.DeploymentMode, isvc.Name, objectMeta.Name, componentType)
+	scaleTargetRef := canonicalScaleTargetRef(b.DeploymentMode, isvc, objectMeta.Name, componentType)
 
 	// For OMENative-managed Components the dispatch names the HPA /
-	// ScaledObject after the InferenceReplica; for RawDeployment it uses
-	// the legacy component metadata Name. The writer matches that lookup
-	// pattern so the live mirror finds the right object.
+	// ScaledObject after the role's InferenceReplica; for RawDeployment it
+	// uses the legacy component metadata Name. The writer matches that
+	// lookup pattern so the live mirror finds the right object.
 	objectName := objectMeta.Name
 	if irprojector.IsIRManagedComponent(b.DeploymentMode) {
-		objectName = irprojector.InferenceReplicaName(isvc.Name, componentType)
+		objectName = irprojector.RoleReplicaName(isvc, componentType)
 	}
 
 	if isvc.Status.Components == nil {
@@ -580,20 +580,21 @@ func applyPolicyProvenance(asStatus *v1beta1.ComponentAutoscalerStatus, prev *v1
 }
 
 // canonicalScaleTargetRef returns the scale target an external scaler should
-// point at for the given Component. OMENative-managed (default + IR-projected)
-// → InferenceReplica's /scale subresource; everything else → the underlying
-// Deployment via the legacy component metadata Name.
+// point at for the given Component. OMENative-managed (default + IR-managed)
+// → the /scale subresource of the InferenceReplica serving the role;
+// everything else → the underlying Deployment via the legacy component
+// metadata Name.
 //
 // Empty values are returned when the deployment mode isn't recognized so the
 // status writer can surface "no published target" cleanly (the writer drops
 // an all-empty ScaleTargetRef rather than emitting an obviously-broken
 // `{apiVersion:"",kind:"",name:""}` block).
-func canonicalScaleTargetRef(mode constants.DeploymentModeType, isvcName, componentMetaName string, componentType v1beta1.ComponentType) v1beta1.ScaleTargetRef {
+func canonicalScaleTargetRef(mode constants.DeploymentModeType, isvc *v1beta1.InferenceService, componentMetaName string, componentType v1beta1.ComponentType) v1beta1.ScaleTargetRef {
 	if irprojector.IsIRManagedComponent(mode) {
 		return v1beta1.ScaleTargetRef{
 			APIVersion: v1beta1.SchemeGroupVersion.String(),
 			Kind:       "InferenceReplica",
-			Name:       irprojector.InferenceReplicaName(isvcName, componentType),
+			Name:       irprojector.RoleReplicaName(isvc, componentType),
 		}
 	}
 	switch mode {
@@ -666,13 +667,33 @@ func ReconcileOMENativeSubresources(
 	if podSpec == nil {
 		return nil
 	}
+	return ReconcileStableSubresources(ctx, b, isvc, componentType, isvc.Name, isvcutils.IsMultiPodComponent(isvc, componentType), componentExt, objectMeta, podSpec)
+}
+
+// ReconcileStableSubresources is ReconcileOMENativeSubresources with the pod
+// set spelled out, for a role whose pods a replica of another name runs:
+// podPrefix is the ome.io/inferenceservice label value of the role's pods
+// (the service's name for a projected replica, the replica's own name for a
+// referenced one) and leaderOnly says whether each Instance has a leader the
+// stable Service selects.
+func ReconcileStableSubresources(
+	ctx context.Context,
+	b *BaseComponentFields,
+	isvc *v1beta1.InferenceService,
+	componentType v1beta1.ComponentType,
+	podPrefix string,
+	leaderOnly bool,
+	componentExt *v1beta1.ComponentExtensionSpec,
+	objectMeta metav1.ObjectMeta,
+	podSpec *corev1.PodSpec,
+) error {
 	// Base selector — narrows to OMENative-managed pods of this (ISVC,
 	// Component) pair. Used as-is for PodMonitor; augmented with a
 	// `runner=leader` + `pod-ordinal=0` filter when the ISVC declares a
 	// multi-pod shape (see function-level docstring for rationale).
-	baseSelector := omeNativeComponentSelector(isvc, componentType)
+	baseSelector := omeNativePodSelector(podPrefix, componentType)
 	stableSelector := baseSelector
-	if isvcutils.IsMultiPodComponent(isvc, componentType) {
+	if leaderOnly {
 		stableSelector = make(map[string]string, len(baseSelector)+2)
 		for k, v := range baseSelector {
 			stableSelector[k] = v

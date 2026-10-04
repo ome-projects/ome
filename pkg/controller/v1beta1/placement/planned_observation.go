@@ -35,8 +35,10 @@ type plannedHomeObservation struct {
 // observePlannedHome reads a direct, identity-checked member inventory. Component
 // requirements include every declared component, even before its IR exists.
 func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.InferenceService, previous v1beta1.CandidatePlacement, components []v1beta1.ComponentType) (plannedHomeObservation, error) {
+	// An unreadable member keeps the plan it last acknowledged behind an unknown
+	// observation; unverified ready capacity is withheld because it routes traffic.
 	out := plannedHomeObservation{Candidate: retainedUnknownCandidate(source, previous)}
-	out.Candidate.ObservationKnown, out.Candidate.AppliedPlanID = false, ""
+	out.Candidate.ObservationKnown = false
 	if previous.Allocation == nil || source.Status.Placement == nil || source.Status.Placement.Plan == nil || len(components) == 0 {
 		return out, fmt.Errorf("planned observation requires allocation authority and resolved components")
 	}

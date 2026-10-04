@@ -155,3 +155,29 @@ func TestBaseKeepsALiveSecondaryTrafficOverAStalePass(t *testing.T) {
 		t.Fatalf("the pass's own write to an unowned Component was dropped: %+v", got)
 	}
 }
+
+// The rolled-out revision fields of an owned Component are the executor's:
+// a live record of a completed promotion is kept over a stale pass, and a
+// pass whose read differs from the live object in those fields alone read a
+// stale copy.
+func TestBaseKeepsTheLiveRolledOutRevisionsOverAStalePass(t *testing.T) {
+	read := statusWithRecord(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", CurrentStep: 1}, v1beta1.RolloutPhasePromoting)
+	base := NewBase(isvcWith(read))
+	live := read.DeepCopy()
+	entry := live.Components[v1beta1.EngineComponent]
+	entry.LatestReadyRevision, entry.LatestRolledoutRevision, entry.PreviousRolledoutRevision = "e-new", "e-new", "e-old"
+	live.Components[v1beta1.EngineComponent] = entry
+	desired := read.DeepCopy()
+	entry = desired.Components[v1beta1.EngineComponent]
+	entry.LatestReadyRevision = "e-stale"
+	desired.Components[v1beta1.EngineComponent] = entry
+
+	if !base.PreserveFresh(desired, live) || !base.Stale() {
+		t.Fatal("a live record that differs in the rolled-out revisions alone was not detected")
+	}
+	got := desired.Components[v1beta1.EngineComponent]
+	if got.LatestReadyRevision != "e-new" || got.LatestRolledoutRevision != "e-new" || got.PreviousRolledoutRevision != "e-old" {
+		t.Fatalf("the live rolled-out revisions were not kept: ready %q latest %q previous %q",
+			got.LatestReadyRevision, got.LatestRolledoutRevision, got.PreviousRolledoutRevision)
+	}
+}

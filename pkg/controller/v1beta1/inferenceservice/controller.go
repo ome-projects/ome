@@ -322,9 +322,10 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, nil
 	}
 
-	// Handle VirtualDeployment without actual reconciliation
+	// A VirtualDeployment selects no backend: the status reports the virtual
+	// endpoint, and whatever a backend projected before is removed.
 	if deploymentMode == constants.VirtualDeployment {
-		return r.handleVirtualDeployment(isvc)
+		return r.handleVirtualDeployment(ctx, isvc)
 	}
 
 	// The canary executor's state as this pass read it: the records, and the
@@ -346,6 +347,12 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	isvcConfig, err := controllerconfig.NewInferenceServicesConfigCached(r.ConfigCache, r.Clientset)
 	if err != nil {
 		return reconcile.Result{}, errors.Wrapf(err, "fails to create InferenceServicesConfig")
+	}
+
+	// A service over referenced replicas renders and projects nothing; its
+	// pass is the fronting alone.
+	if irprojector.ReferencesReplicas(isvc) {
+		return r.reconcileReferencedReplicas(ctx, isvc, deploymentMode, isvcConfig, base)
 	}
 
 	modelConfigReconciler := multimodelconfig.NewModelConfigReconciler(r.Client, r.Clientset, r.Scheme)
@@ -704,6 +711,18 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
+	// A Component runs under exactly one backend, the one its resolved mode
+	// selects. The objects of a backend it left are removed in the pass that
+	// projects the selected one, and before any requeue: the two backends
+	// share the Component's Service, disruption budget, autoscaler and
+	// accelerator capacity, so a rollout that waited for the new backend's
+	// pods would wait on capacity the replaced backend still holds.
+	if err := r.cleanupReplacedBackends(ctx, isvc, componentDeploymentModes); err != nil {
+		log.Error(err, "Failed to remove the objects of a replaced backend")
+		r.Recorder.Event(isvc, v1.EventTypeWarning, "DeploymentModeChangeError", err.Error())
+		return reconcile.Result{}, err
+	}
+
 	// Step 6a: Run cross-Component coordination once every Component
 	// reconciler has finished. The coordination layer reads observed
 	// per-revision pod counts, ensures per-revision Services, writes
@@ -749,9 +768,11 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		// pace of the slower one.
 		for _, g := range canaryGroups {
 			out, err := canary.Dispatch(ctx, canary.DispatchDeps{
-				ISVC:                     isvc,
-				Client:                   r.Client,
-				Reader:                   r.APIReader,
+				ISVC:   isvc,
+				Client: r.Client,
+				// The crash reading decodes per-Instance rows, so the live
+				// reader carries the configured row decoder.
+				Reader:                   irstatus.NewReader(r.APIReader, r.InstanceStatusDecoder),
 				Recorder:                 r.Recorder,
 				Sampler:                  r.CanarySampler,
 				BundledPrometheusAddress: analysisConfig.BundledPrometheusAddress,
@@ -1079,7 +1100,15 @@ func (r *InferenceServiceReconciler) reportResolveError(isvc *v1beta1.InferenceS
 	return reconcile.Result{}, err
 }
 
-func (r *InferenceServiceReconciler) handleVirtualDeployment(isvc *v1beta1.InferenceService) (ctrl.Result, error) {
+func (r *InferenceServiceReconciler) handleVirtualDeployment(ctx context.Context, isvc *v1beta1.InferenceService) (ctrl.Result, error) {
+	// A VirtualDeployment runs no workload: every object a backend projected
+	// for this InferenceService is removed before its status is written.
+	if err := r.cleanupVirtualDeployment(ctx, isvc); err != nil {
+		r.Log.Error(err, "Failed to remove the objects of a VirtualDeployment", "Name", isvc.Name)
+		r.Recorder.Event(isvc, v1.EventTypeWarning, "DeploymentModeChangeError", err.Error())
+		return reconcile.Result{}, err
+	}
+
 	// We directly set URL and inference service status to Ready in VirtualDeployment mode
 
 	// Honor the configured urlScheme rather than hardcoding http.
@@ -1537,14 +1566,21 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// lets the ISVC status aggregator pick up IR-side counter
 		// updates without polling.
 		Owns(&v1beta1.InferenceReplica{}).
+		// A standalone replica a service fronts through spec.replicaRefs
+		// carries no owner reference to it; its events reach the service
+		// through this mapping.
+		Watches(
+			&v1beta1.InferenceReplica{},
+			handler.EnqueueRequestsFromMapFunc(r.servicesReferencingReplica),
+		).
 		// EndpointSlice events for OMENative headless Services enqueue
-		// the parent ISVC so drain checks (IsPodDrained / IsPodInRotation)
-		// react to kube-proxy convergence without waiting on the periodic
-		// requeue. The mapper rejects slices that don't target an
-		// OMENative-managed Service.
+		// the ISVC the Service belongs to so drain checks (IsPodDrained /
+		// IsPodInRotation) react to kube-proxy convergence without waiting
+		// on the periodic requeue. The mapper rejects slices that don't
+		// target an OMENative-managed Service.
 		Watches(
 			&discoveryv1.EndpointSlice{},
-			handler.EnqueueRequestsFromMapFunc(omenative.EndpointSliceToISVC),
+			handler.EnqueueRequestsFromMapFunc(r.endpointSliceToISVC),
 		)
 
 	// Owned only when the CRD is present; ignore status-only churn like the HPA.

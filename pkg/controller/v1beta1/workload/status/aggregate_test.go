@@ -7,6 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -100,6 +101,66 @@ func TestRolloutComplete(t *testing.T) {
 	}
 	if status.RolloutComplete(nil, "isvc-engine-aaaaaaaa") {
 		t.Errorf("empty instance list should not be complete")
+	}
+}
+
+// TestCurrentRevisionFor pins the rollup both ways: promoted once every
+// Instance is Ready on the update revision and its retry ladder records
+// no failure; withdrawn when current already names the update revision
+// while an Instance still runs another; left as recorded on every other
+// shape, a repair on the current revision included. A revision whose
+// block still stands has not landed, whatever its rows read between
+// crashes, so a push never lands by attrition.
+func TestCurrentRevisionFor(t *testing.T) {
+	const prior, next = "isvc-engine-aaaaaaaa", "isvc-engine-bbbbbbbb"
+	row := func(phase types.InstancePhase, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Phase: phase, RunningRevision: rev}
+	}
+	block := func(state types.RetryBlockState) []types.RetryBlock {
+		return []types.RetryBlock{{TargetRevision: next, State: state, AttemptsStarted: 1}}
+	}
+	cases := []struct {
+		name            string
+		rows            []types.InstanceStatus
+		current, update string
+		blocks          []types.RetryBlock
+		want            string
+	}{
+		{"every Instance Ready on the update revision promotes it",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, nil, next},
+		{"every Instance Ready on a Held revision does not land it",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockHeld), prior},
+		{"every Instance Ready on a revision in backoff does not land it",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockBackoff), prior},
+		{"every Instance Ready on a revision with an attempt in flight does not land it",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockRetryInProgress), prior},
+		{"a block on another revision does not withhold the landing",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next,
+			[]types.RetryBlock{{TargetRevision: prior, State: types.RetryBlockHeld}}, next},
+		{"a withdrawn current stays withdrawn while the update revision's block stands",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, "", next, block(types.RetryBlockHeld), ""},
+		{"a forward roll in flight keeps the prior revision",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseUpdating, prior)}, prior, next, nil, prior},
+		{"a rollback onto the current revision withdraws it while every Instance runs the superseded one",
+			[]types.InstanceStatus{row(types.InstancePhaseUpdating, next), row(types.InstancePhaseReady, next)}, prior, prior, nil, ""},
+		{"one Instance still on the superseded revision is enough to withdraw",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, next)}, prior, prior, nil, ""},
+		{"a repair on the current revision keeps it",
+			[]types.InstanceStatus{row(types.InstancePhaseRestarting, prior), row(types.InstancePhaseReady, prior)}, prior, prior, nil, prior},
+		{"an Instance that has not run anything yet decides nothing",
+			[]types.InstanceStatus{row(types.InstancePhaseCreating, ""), row(types.InstancePhaseReady, prior)}, prior, prior, nil, prior},
+		{"withdrawn stays withdrawn until every Instance is Ready on the update revision",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseUpdating, next)}, "", prior, nil, ""},
+		{"no update revision leaves current alone",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior)}, prior, "", nil, prior},
+		{"no Instances leave current alone", nil, prior, prior, nil, prior},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.CurrentRevisionFor(tc.rows, tc.current, tc.update, tc.blocks); got != tc.want {
+				t.Errorf("CurrentRevisionFor(current=%q, update=%q) = %q, want %q", tc.current, tc.update, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -201,5 +262,102 @@ func TestDemotableReady(t *testing.T) {
 	}
 	if status.DemotableReady(nil) {
 		t.Errorf("a nil row is the Empty slot, never a demotion candidate")
+	}
+}
+
+// TestCountServingPods_RequiresThePodReadyCondition: a pod is serving only
+// when the pod's Ready condition and the serving gate are both True.
+// ContainersReady and the gate are the kubelet's and the controller's last
+// writes; on a node whose kubelet stopped both keep their values while the
+// node lifecycle controller sets Ready False, and such a pod is in no
+// Service's endpoints. The same shape is a gate the kubelet has not folded
+// into Ready yet, and that pod is not in the endpoints either.
+func TestCountServingPods_RequiresThePodReadyCondition(t *testing.T) {
+	condition := func(conditionType corev1.PodConditionType, value corev1.ConditionStatus) corev1.PodCondition {
+		return corev1.PodCondition{Type: conditionType, Status: value}
+	}
+	pod := func(conditions ...corev1.PodCondition) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "engine-0-default-0"},
+			Status:     corev1.PodStatus{Conditions: conditions},
+		}
+	}
+	containersReady := condition(corev1.ContainersReady, corev1.ConditionTrue)
+	ready := condition(corev1.PodReady, corev1.ConditionTrue)
+	readyRevoked := condition(corev1.PodReady, corev1.ConditionFalse)
+	gateOn := condition(podreadiness.ConditionType, corev1.ConditionTrue)
+	gateOff := condition(podreadiness.ConditionType, corev1.ConditionFalse)
+
+	for _, tc := range []struct {
+		name string
+		pod  *corev1.Pod
+		want int32
+	}{
+		{name: "Ready with the gate on", pod: pod(containersReady, ready, gateOn), want: 1},
+		{name: "Ready revoked by the control plane, containers and gate unchanged", pod: pod(containersReady, readyRevoked, gateOn), want: 0},
+		{name: "gate off, Ready not yet folded", pod: pod(containersReady, ready, gateOff), want: 0},
+		{name: "gate on, Ready never reported", pod: pod(containersReady, gateOn), want: 0},
+		{name: "no conditions", pod: pod(), want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.CountServingPods([]*corev1.Pod{tc.pod}); got != tc.want {
+				t.Fatalf("CountServingPods = %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	lost := pod(containersReady, readyRevoked, gateOn)
+	counters := status.CountersForInstance([]*corev1.Pod{lost}, map[string]struct{}{}, status.AvailabilityWindow{})
+	if counters.PodCount != 1 || counters.ServingPodCount != 0 {
+		t.Fatalf("counters under a revoked Ready: pods=%d serving=%d, want pods=1 serving=0", counters.PodCount, counters.ServingPodCount)
+	}
+}
+
+// A deleted pod keeps its Ready condition and its serving gate until its
+// containers stop, but the EndpointSlice controller has already taken it out
+// of every Service's ready endpoints, so it serves nothing new. The serving
+// count follows the rotation: a gang that is losing a member stops counting
+// as whole on the pass that sees the deletion, not on the one that sees the
+// pod gone.
+func TestCountServingPods_ExcludesAMemberLeavingTheGang(t *testing.T) {
+	servingPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+				{Type: podreadiness.ConditionType, Status: corev1.ConditionTrue},
+			}},
+		}
+	}
+	leader := servingPod("engine-0-leader-0")
+	worker := servingPod("engine-0-worker-0")
+	gang := []*corev1.Pod{leader, worker}
+	desired := map[int32]int32{0: 2}
+
+	whole := status.CountersForInstance(gang, map[string]struct{}{leader.Name: {}, worker.Name: {}}, status.AvailabilityWindow{})
+	if whole.PodCount != 2 || whole.ServingPodCount != 2 || whole.AvailablePodCount != 2 {
+		t.Fatalf("whole gang: %s, want pods=2 serving=2 available=2", whole)
+	}
+	if got := status.CountServingInstances([]types.InstanceStatus{{Index: 0, PodCount: whole.PodCount, ServingPodCount: whole.ServingPodCount}}, desired); got != 1 {
+		t.Fatalf("serving Instances with the whole gang = %d, want 1", got)
+	}
+
+	// The worker is deleted: still Ready, still gated on, already out of
+	// the endpoints. Its conditions do not change until its containers stop.
+	now := metav1.Now()
+	worker.DeletionTimestamp = &now
+	leaving := status.CountersForInstance(gang, map[string]struct{}{leader.Name: {}}, status.AvailabilityWindow{})
+	if leaving.PodCount != 2 {
+		t.Fatalf("PodCount = %d, want 2: the leaving member is still a pod of the Instance", leaving.PodCount)
+	}
+	if leaving.ServingPodCount != 1 {
+		t.Fatalf("ServingPodCount = %d, want 1: a member leaving the gang is out of rotation", leaving.ServingPodCount)
+	}
+	if leaving.AvailablePodCount != 1 {
+		t.Fatalf("AvailablePodCount = %d, want 1", leaving.AvailablePodCount)
+	}
+	if got := status.CountServingInstances([]types.InstanceStatus{{Index: 0, PodCount: leaving.PodCount, ServingPodCount: leaving.ServingPodCount}}, desired); got != 0 {
+		t.Fatalf("serving Instances with a member leaving = %d, want 0", got)
 	}
 }

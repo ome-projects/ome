@@ -71,8 +71,15 @@ func GetValueFromRawExtension(raw runtime.RawExtension, key string) (interface{}
 // For raw deployment mode, it uses RouterServiceName/EngineServiceName.
 // Returns the port from the service, or constants.CommonISVCPort as default if service lookup fails.
 func GetTargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService) (int32, error) {
+	return TargetServicePort(ctx, c, isvc, isvc.Spec.Router != nil)
+}
+
+// TargetServicePort is GetTargetServicePort with the entrypoint spelled out:
+// the router's Service when hasRouter, else the engine's. Callers that serve
+// a role through a referenced replica have no spec.router to test.
+func TargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, hasRouter bool) (int32, error) {
 	var serviceName string
-	if isvc.Spec.Router != nil {
+	if hasRouter {
 		serviceName = constants.RouterServiceName(isvc.Name)
 	} else {
 		serviceName = constants.EngineServiceName(isvc.Name)

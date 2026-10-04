@@ -8,6 +8,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/holds"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -42,6 +43,9 @@ func (e *podCreateError) Unwrap() error {
 //   - capacity-blocked: the refusal is recorded on the Instance's
 //     operation, which is still in flight. The caller keeps going with
 //     the other Instances and retries on the ordinary create interval.
+//   - admission-unavailable: the wait is recorded on the Instance's
+//     operation with the apiserver's words, which is still in flight.
+//     Same retry as capacity-blocked.
 //   - throttled: nothing was written. The caller stops creating this pass
 //     and wakes after the server's suggested delay, already deposited on
 //     the pass pacing.
@@ -81,6 +85,9 @@ func asPodRejection(err error) (*podRejectionError, bool) {
 //   - capacity-blocked: the quota refusal is recorded on the Operation
 //     and its deadline parks; the operation's own requeue interval
 //     retries.
+//   - admission-unavailable: the wait is recorded on the Operation with
+//     the apiserver's words and its deadline parks; the operation's own
+//     requeue interval retries.
 //   - throttled: the server's delay is on the pass pacing, which floors
 //     that requeue.
 //
@@ -131,6 +138,30 @@ func disposeRejectedAttempt(ctx context.Context, deps workload.Deps, input workl
 		"OMENative %s: apiserver rejected pod %s (%s: %s); %s",
 		workload.InstanceKey(input.Key.Component, idx), podName, rejection.Reason, rejection.Message, detail)
 	return nil
+}
+
+// recordAdmissionWait records that the apiserver could not take podName's
+// write to admission and announces it on the transition into the wait:
+// one Warning per episode carrying the apiserver's own words, so the
+// operator sees which webhook is unreachable, and none while the row
+// keeps reporting the same wait or another authority's.
+func recordAdmissionWait(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, idx int32, podName string, rejection workload.APIRejection) error {
+	entered, err := holds.RecordAdmissionRefusal(ctx, input, plan, idx, podName, rejection.Message)
+	if err != nil {
+		return err
+	}
+	if entered {
+		workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonInstanceAdmissionUnavailable,
+			"OMENative %s waiting on admission: %s", workload.InstanceKey(input.Key.Component, idx), rejection.Message)
+	}
+	return nil
+}
+
+// releaseAdmissionWait retires the wait once a write of the row's pods
+// went through admission. Edge-triggered off the observation inside the
+// hold package, so a row that was never held costs no mutation.
+func releaseAdmissionWait(ctx context.Context, input workload.ReconcileInput, idx int32) error {
+	return holds.ReleaseAdmissionRefusal(ctx, input, idx)
 }
 
 // clearCapacityRefusal retires the record once the create path completes
@@ -190,7 +221,7 @@ func disposeAPIRejection(ctx context.Context, input workload.ReconcileInput, ins
 	if rejection.Class == workload.APIRejectionPermanentWorkload && blameRevision {
 		heldRevision = rejectionTargetRevision(input, inst)
 		if heldRevision != "" {
-			if err := workload.RecordUpdateFailureInRetryBlock(ctx, input, heldRevision, rejection.Reason, true); err != nil {
+			if err := workload.RecordUpdateFailureInRetryBlock(ctx, input, heldRevision, rejection.Reason, workload.CauseWorkload); err != nil {
 				return "", fmt.Errorf("record retry block for rejected attempt (instance=%d rev=%s): %w", inst.Index, heldRevision, err)
 			}
 		}
@@ -285,8 +316,8 @@ func anyInFlightCreateAttempt(input workload.ReconcileInput, except int32) bool 
 // implementation for the gang abandon here and the workload-root
 // deadline disposition, under the package-local name the ops-side call
 // sites and invariant tests use.
-func recordUpdateFailureInRetryBlock(ctx context.Context, input workload.ReconcileInput, targetRev, reason string, workloadCaused bool) error {
-	return workload.RecordUpdateFailureInRetryBlock(ctx, input, targetRev, reason, workloadCaused)
+func recordUpdateFailureInRetryBlock(ctx context.Context, input workload.ReconcileInput, targetRev, reason string, cause workload.FailureCause) error {
+	return workload.RecordUpdateFailureInRetryBlock(ctx, input, targetRev, reason, cause)
 }
 
 // instanceFailureReason summarizes the failure evidence the escalators
@@ -306,11 +337,13 @@ func instanceFailureReason(s *workload.InstanceStatus, fallback string) string {
 	return fallback
 }
 
-// instanceFailureWorkloadCaused reports whether the failure evidence the
-// escalators stamped on the instance (LastFailure.Reason) blames the
-// revision itself. Only that evidence charges the revision's retry
-// ladder; an elapsed deadline or an ambiguous kubelet reason paces the
-// next attempt without counting toward Held.
-func instanceFailureWorkloadCaused(s *workload.InstanceStatus) bool {
-	return s != nil && s.LastFailure != nil && workload.IsWorkloadCausedReason(s.LastFailure.Reason)
+// instanceFailureCause classifies the failure evidence the escalators
+// stamped on the instance (LastFailure.Reason): whether it blames the
+// revision itself, says nothing about it, or names the environment. An
+// instance with no evidence is read as a failed attempt at the revision.
+func instanceFailureCause(s *workload.InstanceStatus) workload.FailureCause {
+	if s == nil || s.LastFailure == nil {
+		return workload.CauseUnattributed
+	}
+	return workload.FailureCauseOf(s.LastFailure.Reason)
 }

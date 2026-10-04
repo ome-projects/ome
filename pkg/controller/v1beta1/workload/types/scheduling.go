@@ -26,7 +26,8 @@ func OperationUnschedulable(op *InstanceOperation) bool {
 
 // OperationExternallyHeld reports whether an operation is parked on any
 // wait outside the workload's control: admission having refused its
-// create for lack of quota, the scheduler finding no placement for its
+// create for lack of quota, the apiserver unable to reach an admission
+// webhook for its write, the scheduler finding no placement for its
 // pods, the gang scheduler unable to admit its PodGroup, a node that
 // stopped reporting a pod whose name the operation needs, capacity a
 // provisioner has not readied for a pod the operation withholds, or an
@@ -40,9 +41,17 @@ func OperationUnschedulable(op *InstanceOperation) bool {
 // pass once a create lands; the clock stays parked for as long as the
 // row reports the wait either way.
 func OperationExternallyHeld(op *InstanceOperation) bool {
-	return OperationCapacityRefused(op) || OperationQuotaHeld(op) || OperationUnschedulable(op) ||
-		OperationGangHeld(op) || OperationNodeUnknown(op) || OperationCapacityProvisioning(op) ||
-		OperationPaused(op)
+	return OperationCapacityRefused(op) || OperationQuotaHeld(op) || OperationAdmissionHeld(op) ||
+		OperationUnschedulable(op) || OperationGangHeld(op) || OperationNodeUnknown(op) ||
+		OperationCapacityProvisioning(op) || OperationPaused(op)
+}
+
+// OperationAdmissionHeld reports whether the operation carries the
+// admission authority's token: the apiserver could not take one of its
+// pod writes to an admission webhook, and the write site recorded the
+// wait.
+func OperationAdmissionHeld(op *InstanceOperation) bool {
+	return op != nil && op.Waiting == RejectionReasonAdmissionUnavailable
 }
 
 // OperationQuotaHeld reports whether the operation carries the quota
