@@ -71,6 +71,7 @@ import (
 	"sigs.k8s.io/ome/pkg/runtimerevision"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	"sigs.k8s.io/ome/pkg/utils"
+	"sigs.k8s.io/ome/pkg/validation"
 )
 
 // +kubebuilder:rbac:groups=ome.io,resources=inferenceservices;inferenceservices/finalizers,verbs=get;list;watch;create;update;patch;delete
@@ -248,8 +249,15 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Unsupported member authority must hold before any reconciliation writes.
 	// Deletion still follows finalizer cleanup regardless of the stored policy.
 	if isvc.DeletionTimestamp.IsZero() {
-		if _, err := protocol.FromDerived(isvc); err != nil {
+		if err := validation.ValidatePlacementIntent(isvc); err != nil {
 			return ctrl.Result{}, err
+		}
+		policy, err := protocol.FromDerived(isvc)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if protocol.IsMember(isvc) && policy == nil {
+			return ctrl.Result{}, fmt.Errorf("placement-owned services require an execution policy")
 		}
 	}
 	deployConfig, err := controllerconfig.NewDeployConfigCached(r.ConfigCache, r.Clientset)
@@ -261,7 +269,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// per-Component dispatch is resolved from the merged specs below.
 	deploymentMode := isvcutils.InferenceServiceDeploymentMode(isvc, constants.DeploymentModeType(deployConfig.DefaultDeploymentMode))
 	log.V(1).Info("InferenceService deployment mode resolved", "deploymentMode", deploymentMode)
-	placementMember := protocol.IsAffinityMember(isvc)
+	placementMember := protocol.IsMember(isvc)
 	if placementMember && isvc.DeletionTimestamp.IsZero() && deploymentMode == constants.VirtualDeployment {
 		return r.holdPlacementBackend(ctx, isvc, fmt.Errorf("multicluster placement requires OMENative; VirtualDeployment has no member admission or surge accounting"))
 	}

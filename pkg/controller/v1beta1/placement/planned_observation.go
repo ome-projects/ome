@@ -257,8 +257,8 @@ func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.Inf
 	return out, nil
 }
 
-// plannedTrafficEvidence accepts only an exact publication of this allocation.
-// Missing publication is unknown; it cannot prove that old traffic has drained.
+// plannedTrafficEvidence reads routing intent for the exact accepted allocation.
+// Publisher acknowledgement describes external realization, not member authority.
 func plannedTrafficEvidence(source *v1beta1.InferenceService, trafficMap *v1beta1.TrafficMap, candidate v1beta1.CandidatePlacement) (known, routable, drained bool) {
 	if source == nil || source.Status.Placement == nil || source.Status.Placement.Plan == nil || candidate.Allocation == nil || trafficMap == nil || !trafficMap.DeletionTimestamp.IsZero() || !TrafficMapHasExactController(trafficMap, source) {
 		return false, false, false
@@ -267,7 +267,7 @@ func plannedTrafficEvidence(source *v1beta1.InferenceService, trafficMap *v1beta
 	if accepted.ID == "" || accepted.Revision <= 0 || accepted.SourceUID != source.UID || accepted.ObservedGeneration != source.Generation {
 		return false, false, false
 	}
-	if trafficMap.Status.SourceUID != source.UID || trafficMap.Spec.PlacementPlanID != source.Status.Placement.Plan.ID || trafficMap.Spec.ObservedISVCGeneration != source.Generation || trafficMap.Generation <= 0 || !trafficMap.Status.Published || trafficMap.Status.ObservedTrafficMapGeneration != trafficMap.Generation {
+	if trafficMap.Status.SourceUID != source.UID || trafficMap.Spec.PlacementPlanID != source.Status.Placement.Plan.ID || trafficMap.Spec.ObservedISVCGeneration != source.Generation || trafficMap.Generation <= 0 {
 		return false, false, false
 	}
 	var entry *v1beta1.TrafficMapEntry

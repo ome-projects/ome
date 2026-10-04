@@ -1,7 +1,6 @@
 package v1beta1
 
 import (
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -21,8 +20,7 @@ const (
 	// redundancy / serve-everywhere.
 	PlacementModeAll PlacementMode = "All"
 
-	// PlacementModeSplit distributes the requested floor. ClusterAffinity uses
-	// exact weighted shares; Legacy uses admission-driven Packed or spread targets.
+	// PlacementModeSplit distributes the requested floor in exact weighted shares.
 	PlacementModeSplit PlacementMode = "Split"
 
 	// PlacementModeSplitByCapacity apportions the floor using verified nominal
@@ -31,30 +29,24 @@ const (
 )
 
 // PlacementPolicy selects the matching and allocation contract.
-// +kubebuilder:validation:Enum=Legacy;ClusterAffinity
+// +kubebuilder:validation:Enum=ClusterAffinity
 type PlacementPolicy string
 
 const (
-	// PlacementPolicyLegacy uses selector strings and admission-driven allocation.
-	PlacementPolicyLegacy PlacementPolicy = "Legacy"
 	// PlacementPolicyClusterAffinity uses affinity and persisted allocation plans.
 	PlacementPolicyClusterAffinity PlacementPolicy = "ClusterAffinity"
 )
 
-// PlacementSpec declares multi-cluster intent. Policy omission preserves the
-// legacy selector and allocation contract, including its mode defaults.
-// +kubebuilder:validation:XValidation:rule="!has(self.policy) || self.policy != 'ClusterAffinity' || has(self.mode)",message="ClusterAffinity requires an explicit mode"
+// PlacementSpec declares explicit multi-cluster matching and allocation intent.
 // +kubebuilder:validation:XValidation:rule="!has(self.replacementTimeout) || (has(self.policy) && self.policy == 'ClusterAffinity' && has(self.mode) && self.mode == 'Single')",message="replacementTimeout requires ClusterAffinity Single placement"
 type PlacementSpec struct {
-	// Policy explicitly opts into ClusterAffinity semantics. Omission is Legacy.
-	// ClusterAffinity cannot be removed from an existing service; migrating back
-	// requires draining and recreating the source and its derived workloads.
-	// +optional
-	Policy PlacementPolicy `json:"policy,omitempty"`
+	// Policy selects ClusterAffinity matching and persisted allocation plans.
+	// +required
+	Policy PlacementPolicy `json:"policy"`
 
-	// Mode is required for ClusterAffinity. Legacy omission means Single.
-	// +optional
-	Mode PlacementMode `json:"mode,omitempty"`
+	// Mode selects the placement cardinality and replica allocation strategy.
+	// +required
+	Mode PlacementMode `json:"mode"`
 
 	// ClusterAffinity ORs terms whose requirements are ANDed. Requires the
 	// ClusterAffinity policy; omission then matches every registration.
@@ -78,41 +70,15 @@ type PlacementSpec struct {
 	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="replacementTimeout must be a positive duration"
 	ReplacementTimeout *metav1.Duration `json:"replacementTimeout,omitempty"`
 
-	// LegacyFields retains explicit zero-valued obsolete fields during JSON round trips.
-	// It is serialization bookkeeping and is not a wire field.
-	LegacyFields PlacementLegacyFields `json:"-"`
-
-	// Requirements is a Legacy label selector, ANDed with ClusterSelector.
-	// Deprecated: opt into ClusterAffinity and use clusterAffinity.
-	// +optional
-	// +nullable
-	Requirements string `json:"requirements,omitempty"`
-
-	// ClusterSelector is a Legacy selector over labels and virtual metadata.name.
-	// Deprecated: opt into ClusterAffinity and use clusterAffinity.
-	// +optional
-	// +nullable
-	ClusterSelector string `json:"clusterSelector,omitempty"`
-
 	// Split provides the requested floor and optional per-home ceiling for
 	// Split and SplitByCapacity. ClusterAffinity rejects it in other modes.
 	// +optional
 	Split *SplitSpec `json:"split,omitempty"`
-
-	// CapacityFactors is the Legacy alias for routing capacity factors.
-	// Deprecated: use spec.routing.capacityFactors.
-	// +optional
-	// +nullable
-	CapacityFactors map[string]resource.Quantity `json:"capacityFactors,omitempty"`
 }
 
 // SplitSpec declares the fleet floor and optional local ceiling. The floor
 // falls back only to an explicitly declared positive engine.minReplicas.
 type SplitSpec struct {
-	// LegacyFields retains explicit zero-valued obsolete fields during JSON round trips.
-	// It is serialization bookkeeping and is not a wire field.
-	LegacyFields SplitLegacyFields `json:"-"`
-
 	// Replicas is the fleet-wide desired replica count to distribute across homes.
 	// Unset falls back to the engine component's minReplicas (the guaranteed
 	// floor) — the count OME actually guarantees running and thus the one worth
@@ -122,37 +88,15 @@ type SplitSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// Spread requests ceil(replicas/candidates) on each Legacy candidate.
-	// False uses admission-driven packing in candidate name order.
-	// Deprecated: ClusterAffinity uses exact shares and optional affinity weights.
-	// +optional
-	// +nullable
-	Spread bool `json:"spread,omitempty"`
-
-	// MaxReplicasPerCluster is an optional local ceiling. ClusterAffinity holds
-	// plans exceeding it; Legacy clips requests to it. Zero leaves it uncapped.
+	// MaxReplicasPerCluster is an optional local ceiling. Plans exceeding it
+	// are held; zero follows the assigned allocation without an extra ceiling.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxReplicasPerCluster int32 `json:"maxReplicasPerCluster,omitempty"`
-
-	// MinReplicasPerCluster discards Legacy homes admitted below this count.
-	// Deprecated: ClusterAffinity exact shares cannot discard a small admission.
-	// +optional
-	// +nullable
-	MinReplicasPerCluster int32 `json:"minReplicasPerCluster,omitempty"`
 }
 
 // UsesClusterAffinity reports the explicit opt-in, without inferring policy
 // from selector presence, mode, or member state.
 func (p *PlacementSpec) UsesClusterAffinity() bool {
 	return p != nil && p.Policy == PlacementPolicyClusterAffinity
-}
-
-// EffectiveMode resolves only the Legacy default. ClusterAffinity requires an
-// explicit mode so missing intent cannot acquire allocation authority.
-func (p *PlacementSpec) EffectiveMode() PlacementMode {
-	if p == nil || (!p.UsesClusterAffinity() && p.Mode == "") {
-		return PlacementModeSingle
-	}
-	return p.Mode
 }

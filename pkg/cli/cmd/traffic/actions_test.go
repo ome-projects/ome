@@ -255,7 +255,7 @@ func TestTrafficActionRefusesUnsafeExistingStateBeforePreview(t *testing.T) {
 
 func TestTrafficActionRefusesIneligibleServiceBeforePreviewOrPatch(t *testing.T) {
 	service := trafficActionService(nil)
-	service.Spec.Placement = &omev1beta1.PlacementSpec{Mode: omev1beta1.PlacementModeAll}
+	service.Spec.Placement = nil
 	client := omefake.NewSimpleClientset(service)
 	var gets atomic.Int32
 	client.PrependReactor("get", "inferenceservices", func(action clienttesting.Action) (bool, runtime.Object, error) {
@@ -428,7 +428,7 @@ func trafficActionService(annotations map[string]string) *omev1beta1.InferenceSe
 			Annotations: annotations,
 		},
 		Spec: omev1beta1.InferenceServiceSpec{Placement: &omev1beta1.PlacementSpec{
-			Mode: omev1beta1.PlacementModeAll, Requirements: "accelerator=test",
+			Mode: omev1beta1.PlacementModeAll,
 		}},
 	}
 }

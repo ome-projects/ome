@@ -8,27 +8,9 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// ValidateRouting validates the per-InferenceService routing policy and its
-// compatibility with the deprecated placement capacity-factor field.
+// ValidateRouting validates the per-InferenceService routing policy.
 func ValidateRouting(spec *v1beta1.InferenceServiceSpec) error {
-	if spec == nil {
-		return nil
-	}
-
-	var routingFactorsSet bool
-	if spec.Routing != nil {
-		routingFactorsSet = spec.Routing.CapacityFactors != nil
-	}
-	var placementFactorsSet bool
-	if spec.Placement != nil {
-		// The deprecated field remains readable during the compatibility window.
-		placementFactorsSet = spec.Placement.CapacityFactors != nil //nolint:staticcheck
-	}
-	if routingFactorsSet && placementFactorsSet {
-		return fmt.Errorf("spec.routing.capacityFactors and deprecated spec.placement.capacityFactors must not both be set")
-	}
-
-	if spec.Routing == nil {
+	if spec == nil || spec.Routing == nil {
 		return nil
 	}
 	for cluster, factor := range spec.Routing.CapacityFactors {

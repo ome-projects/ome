@@ -39,28 +39,12 @@ func projectRoutingIntent(parent *ome.InferenceService) v.PlacementRoutingIntent
 	}
 
 	routing := parent.Spec.Routing
-	var legacyFactorsPresent bool
-	var legacyFactorCount int
-	if parent.Spec.Placement != nil {
-		// The legacy field remains observable during its API compatibility window.
-		legacyFactorsPresent = parent.Spec.Placement.CapacityFactors != nil //nolint:staticcheck
-		legacyFactorCount = len(parent.Spec.Placement.CapacityFactors)      //nolint:staticcheck
-	}
-	routingFactorsPresent := routing != nil && routing.CapacityFactors != nil
-
-	switch {
-	case routingFactorsPresent && legacyFactorsPresent:
-		out.CapacityFactors.Source = "Conflict"
-		out.CapacityFactors.Count = len(routing.CapacityFactors) + legacyFactorCount
-	case routingFactorsPresent:
+	if routing != nil && routing.CapacityFactors != nil {
 		out.CapacityFactors.Source = "Routing"
 		out.CapacityFactors.Count = len(routing.CapacityFactors)
-	case legacyFactorsPresent:
-		out.CapacityFactors.Source = "LegacyPlacement"
-		out.CapacityFactors.Count = legacyFactorCount
 	}
 
-	if routing == nil && !legacyFactorsPresent {
+	if routing == nil {
 		return out
 	}
 	out.State = "Declared"
@@ -71,7 +55,7 @@ func projectRoutingIntent(parent *ome.InferenceService) v.PlacementRoutingIntent
 		out.Publisher = routingPublisherIntent(routing.Publisher)
 	}
 
-	if routingIntentExceedsBudget(routing, legacyFactorCount) {
+	if routingIntentExceedsBudget(routing) {
 		out.State = "BudgetExceeded"
 		return out
 	}
@@ -170,9 +154,9 @@ func routingMethod(method string) v.PlacementValue {
 	}
 }
 
-func routingIntentExceedsBudget(routing *ome.RoutingSpec, legacyFactorCount int) bool {
-	if legacyFactorCount > routingFactorScanLimit || routing == nil {
-		return legacyFactorCount > routingFactorScanLimit
+func routingIntentExceedsBudget(routing *ome.RoutingSpec) bool {
+	if routing == nil {
+		return false
 	}
 	if len(routing.CapacityFactors) > routingFactorScanLimit {
 		return true

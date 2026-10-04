@@ -397,7 +397,7 @@ func TestGatewayAPITrafficMapLegacyDuplicateRoutesBothReportCollision(t *testing
 				Annotations: map[string]string{GlobalHostAnnotation: hostname},
 			},
 			Spec: v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{
-				Mode: v1beta1.PlacementModeSingle, Requirements: "accelerator=test",
+				Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle,
 			}},
 		},
 		{
@@ -406,7 +406,7 @@ func TestGatewayAPITrafficMapLegacyDuplicateRoutesBothReportCollision(t *testing
 				Annotations: map[string]string{GlobalHostAnnotation: hostname},
 			},
 			Spec: v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{
-				Mode: v1beta1.PlacementModeSingle, Requirements: "accelerator=test",
+				Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle,
 			}},
 		},
 	}

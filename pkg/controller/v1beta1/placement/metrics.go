@@ -1,8 +1,6 @@
 package placement
 
 import (
-	"strconv"
-
 	"github.com/prometheus/client_golang/prometheus"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -44,12 +42,10 @@ var (
 
 	// Policy is spec-derived, not status-derived: it answers "what was asked
 	// for" so it can be compared against where the workload actually landed.
-	// The selector strings are free-form, but they vary per ISVC rather than per
-	// scrape, so the series count still tracks the live ISVC count.
 	placementPolicyInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ome_isvc_placement_policy_info",
-		Help: "Always 1, labelled with the InferenceService's declared placement policy: mode, accelerator requirements, cluster selector, and Split spread. Exactly one series per ISVC that declares a placement.",
-	}, []string{"namespace", "isvc", "mode", "requirements", "cluster_selector", "spread"})
+		Help: "Always 1, labelled with the InferenceService's declared placement policy: policy and mode. Exactly one series per ISVC that declares a placement.",
+	}, []string{"namespace", "isvc", "policy", "mode"})
 
 	placementSplitReplicas = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ome_isvc_placement_split_replicas",
@@ -60,11 +56,6 @@ var (
 		Name: "ome_isvc_placement_split_max_replicas_per_cluster",
 		Help: "Per-cluster replica ceiling from spec.placement.split.maxReplicasPerCluster (0 = uncapped).",
 	}, []string{"namespace", "isvc"})
-
-	placementSplitMinPerCluster = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "ome_isvc_placement_split_min_replicas_per_cluster",
-		Help: "Per-cluster replica floor from spec.placement.split.minReplicasPerCluster (0 = unset).",
-	}, []string{"namespace", "isvc"})
 )
 
 func init() {
@@ -72,7 +63,7 @@ func init() {
 		placementPhase, placementWinner, placementCandidate,
 		placementCandidateAdmitted, placementCandidateReady,
 		placementPolicyInfo, placementSplitReplicas,
-		placementSplitMaxPerCluster, placementSplitMinPerCluster,
+		placementSplitMaxPerCluster,
 	)
 }
 
@@ -127,20 +118,13 @@ func recordPolicy(isvc *v1beta1.InferenceService) {
 	placementPolicyInfo.DeletePartialMatch(match)
 	placementSplitReplicas.DeletePartialMatch(match)
 	placementSplitMaxPerCluster.DeletePartialMatch(match)
-	placementSplitMinPerCluster.DeletePartialMatch(match)
 
 	p := isvc.Spec.Placement
 	if p == nil {
 		return
 	}
 
-	spread := false
-	if p.Split != nil {
-		spread = p.Split.Spread
-	}
-	placementPolicyInfo.WithLabelValues(
-		ns, name, string(p.Mode), p.Requirements, p.ClusterSelector, strconv.FormatBool(spread),
-	).Set(1)
+	placementPolicyInfo.WithLabelValues(ns, name, string(p.Policy), string(p.Mode)).Set(1)
 
 	if p.Split == nil {
 		return
@@ -149,7 +133,6 @@ func recordPolicy(isvc *v1beta1.InferenceService) {
 		placementSplitReplicas.WithLabelValues(ns, name).Set(float64(*p.Split.Replicas))
 	}
 	placementSplitMaxPerCluster.WithLabelValues(ns, name).Set(float64(p.Split.MaxReplicasPerCluster))
-	placementSplitMinPerCluster.WithLabelValues(ns, name).Set(float64(p.Split.MinReplicasPerCluster))
 }
 
 // DeleteForISVC drops every placement series for an ISVC. Called on teardown so
@@ -167,5 +150,4 @@ func DeleteForISVC(namespace, isvc string) {
 	placementPolicyInfo.DeletePartialMatch(match)
 	placementSplitReplicas.DeletePartialMatch(match)
 	placementSplitMaxPerCluster.DeletePartialMatch(match)
-	placementSplitMinPerCluster.DeletePartialMatch(match)
 }

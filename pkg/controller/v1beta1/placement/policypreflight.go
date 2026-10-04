@@ -374,14 +374,6 @@ func distinctPolicyNames(refs []componentPolicyRef) []string {
 	return names
 }
 
-// splitCeilingUnset reports whether Split placement lacks a per-cluster
-// replica ceiling. Callers check the mode first (Split implies spec.placement
-// is set).
-func splitCeilingUnset(isvc *v1beta1.InferenceService) bool {
-	sp := isvc.Spec.Placement.Split
-	return sp == nil || sp.MaxReplicasPerCluster <= 0
-}
-
 // controlPlaneName names this control plane in operator-facing messages.
 func (r *Reconciler) controlPlaneName() string {
 	if r.ControlPlaneID != "" {
@@ -479,7 +471,6 @@ func (r *Reconciler) preflightPolicies(ctx context.Context, isvc *v1beta1.Infere
 	// object surfaces immediately. A missing/unreadable anchor holds placement
 	// outright — no candidate can be verified against nothing.
 	anchorDigests := make(map[string]string, len(names))
-	anchorSpecs := make(map[string]*v1beta1.AutoscalerPolicySpec, len(names))
 	for _, name := range names {
 		pol := &v1beta1.AutoscalerPolicy{}
 		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: name}, pol); err != nil {
@@ -515,27 +506,6 @@ func (r *Reconciler) preflightPolicies(ctx context.Context, isvc *v1beta1.Infere
 			return &policyPreflightOutcome{hold: true}
 		}
 		anchorDigests[name] = digest
-		anchorSpecs[name] = &pol.Spec
-	}
-
-	// Split hard gate: with no per-cluster ceiling, every home renders the
-	// GLOBAL MaxReplicas, so a fleet-wide metric outage would drive each home
-	// to the full budget (N x max). Hold loudly; the fix is one spec field.
-	if mode := placementMode(isvc); (mode == v1beta1.PlacementModeSplit || mode == v1beta1.PlacementModeSplitByCapacity) && splitCeilingUnset(isvc) {
-		for _, name := range names {
-			consumes, err := render.ConsumesMaxReplicas(anchorSpecs[name])
-			if err != nil || consumes {
-				detail := "the policy derives from the component's MaxReplicas"
-				if err != nil {
-					detail = fmt.Sprintf("the policy template could not be proven MaxReplicas-free (%v)", err)
-				}
-				pp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse,
-					v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling,
-					fmt.Sprintf("Split placement with AutoscalerPolicy %s/%s held: %s and spec.placement.split.maxReplicasPerCluster is unset, so every home would keep the global replica ceiling",
-						isvc.Namespace, name, detail)))
-				return &policyPreflightOutcome{hold: true}
-			}
-		}
 	}
 
 	labelsFor := make(map[string]map[string]string, len(clusters))

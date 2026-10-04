@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	placementcontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/placement"
+	"sigs.k8s.io/ome/pkg/validation"
 )
 
 const (
@@ -514,7 +515,7 @@ func (r *TrafficMapPublisherReconciler) readTrafficMapOwner(
 
 func publisherOwnerActive(owner *v1beta1.InferenceService) bool {
 	return owner != nil && owner.DeletionTimestamp.IsZero() &&
-		placementcontroller.IsPlacementEligible(owner) && !routingOptedOut(owner)
+		placementcontroller.IsPlacementEligible(owner) && validation.ValidatePlacementIntent(owner) == nil && !routingOptedOut(owner)
 }
 
 func (r *TrafficMapPublisherReconciler) validateLivePublisherOwner(
@@ -1719,6 +1720,13 @@ func (r *TrafficMapPublisherReconciler) patchPublisherStatus(
 		(live.Status.GatewayRef != nil && desired.Status.GatewayRef == nil) || clearsLastPositive {
 		narrowed := live.DeepCopy()
 		narrowed.Status.Published = desired.Status.Published
+		// The boolean and its conditions form one acknowledgement. Readers must
+		// never observe a cleared boolean with a successful Published condition.
+		for _, conditionType := range []string{v1beta1.TrafficMapPublished, v1beta1.TrafficMapPublicationFallback} {
+			if condition := apimeta.FindStatusCondition(desired.Status.Conditions, conditionType); condition != nil {
+				apimeta.SetStatusCondition(&narrowed.Status.Conditions, *condition)
+			}
+		}
 		narrowed.Status.GatewayRef = copyTrafficMapGatewayRef(desired.Status.GatewayRef)
 		if clearsLastPositive && narrowed.Status.Publisher != nil {
 			narrowed.Status.Publisher.LastPositive = nil
@@ -1848,7 +1856,7 @@ func (r *TrafficMapPublisherReconciler) SetupWithManager(mgr ctrl.Manager) error
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(TrafficMapPublisherControllerName).
-		For(&v1beta1.TrafficMap{}).
+		For(&v1beta1.TrafficMap{}, builder.WithPredicates(trafficMapPublicationChange)).
 		Watches(&v1beta1.InferenceService{},
 			handler.EnqueueRequestsFromMapFunc(enqueueOwnedTrafficMap),
 			builder.WithPredicates(trafficMapPublisherOwnerChange)).
@@ -1890,6 +1898,24 @@ func enqueueOwnedTrafficMap(_ context.Context, object client.Object) []ctrlrecon
 		return nil
 	}
 	return []ctrlreconcile.Request{{NamespacedName: client.ObjectKeyFromObject(object)}}
+}
+
+var trafficMapPublicationChange = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldMap, oldOK := e.ObjectOld.(*v1beta1.TrafficMap)
+		newMap, newOK := e.ObjectNew.(*v1beta1.TrafficMap)
+		if !oldOK || !newOK || placementcontroller.TrafficMapInputsChanged(oldMap, newMap) {
+			return true
+		}
+		// Routing verdicts govern fallback eligibility. Publisher-owned status
+		// is an output; the configured resync repairs external drift.
+		for _, conditionType := range []string{v1beta1.TrafficMapRoutable, v1beta1.TrafficMapCapacityFallback, v1beta1.TrafficMapOverrideActive} {
+			if !equality.Semantic.DeepEqual(apimeta.FindStatusCondition(oldMap.Status.Conditions, conditionType), apimeta.FindStatusCondition(newMap.Status.Conditions, conditionType)) {
+				return true
+			}
+		}
+		return false
+	},
 }
 
 var trafficMapPublisherOwnerChange = predicate.Funcs{

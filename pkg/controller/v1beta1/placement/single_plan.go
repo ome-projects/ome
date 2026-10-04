@@ -167,7 +167,7 @@ func (r *Reconciler) singleProposal(ctx context.Context, source *v1beta1.Inferen
 			out.Assignments[candidate.Cluster] = *candidate.Allocation.DeepCopy()
 		}
 	}
-	// Every registered legacy copy is accounted for before winner cleanup. An
+	// Every registered copy is accounted for before winner cleanup. An
 	// unobserved registration grants no positive workload authority.
 	for name, uid := range registered {
 		if _, exists := out.Assignments[name]; !exists {

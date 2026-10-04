@@ -367,6 +367,75 @@ func TestReconcile_NonPlacementISVCDoesNotCreateTrafficMap(t *testing.T) {
 	assert.False(t, exists)
 }
 
+func TestReconcileModeOnlyPlacement(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		policy v1beta1.PlacementPolicy
+		mode   v1beta1.PlacementMode
+		want   bool
+	}{
+		{name: "single", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSingle, want: true},
+		{name: "all", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeAll, want: true},
+		{name: "split", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSplit, want: true},
+		{name: "capacity", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSplitByCapacity, want: true},
+		{name: "legacy", policy: v1beta1.PlacementPolicy("Legacy"), mode: v1beta1.PlacementModeAll},
+		{name: "omitted policy", mode: v1beta1.PlacementModeSingle},
+		{name: "local"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := splitISVC([]string{"member-a"}, []int32{3}, []int32{3})
+			source.Spec.Placement = nil
+			if tt.mode != "" {
+				source.Spec.Placement = &v1beta1.PlacementSpec{Policy: tt.policy, Mode: tt.mode}
+			}
+			r, c := newReconciler(t, controllerTestConfig(), source)
+			for _, stage := range []struct {
+				name    string
+				ready   int32
+				weight  int32
+				healthy bool
+			}{
+				{name: "ready", ready: 3, weight: 1, healthy: true},
+				{name: "unready"},
+			} {
+				t.Run(stage.name, func(t *testing.T) {
+					source.Status.Placement.Candidates[0].ReadyReplicas = stage.ready
+					if err := c.Status().Update(t.Context(), source); err != nil {
+						t.Fatal(err)
+					}
+					_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(source)})
+					if source.Spec.Placement != nil && !tt.want {
+						require.ErrorContains(t, err, "ClusterAffinity")
+					} else {
+						require.NoError(t, err)
+					}
+					tm, exists := getTrafficMap(t, c)
+					if diff := cmp.Diff(tt.want, exists); diff != "" {
+						t.Fatalf("TrafficMap existence (-want +got):\n%s", diff)
+					}
+					if !exists {
+						return
+					}
+					want := v1beta1.TrafficMapSpec{
+						Service: source.Name, Mode: tt.mode, ObservedISVCGeneration: source.Generation,
+						Entries: []v1beta1.TrafficMapEntry{{
+							Cluster: "member-a", Endpoint: apis.HTTPS("member-a.example"),
+							Weight: stage.weight, Healthy: stage.healthy,
+							Capacity: &v1beta1.TrafficMapCapacity{Allocated: 3, Ready: stage.ready, Source: v1beta1.CapacitySourceControlPlane},
+						}},
+					}
+					if diff := cmp.Diff(want, tm.Spec); diff != "" {
+						t.Fatalf("TrafficMap spec (-want +got):\n%s", diff)
+					}
+					if diff := cmp.Diff(source.UID, tm.Status.SourceUID); diff != "" {
+						t.Fatalf("source identity (-want +got):\n%s", diff)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestReconcile_ObsoletePlacementIntentPreservesTrafficMap(t *testing.T) {
 	for _, tt := range []struct {
 		name string
@@ -377,9 +446,6 @@ func TestReconcile_ObsoletePlacementIntentPreservesTrafficMap(t *testing.T) {
 		}},
 		{name: "empty legacy annotation", edit: func(source *v1beta1.InferenceService) {
 			source.Annotations = map[string]string{"ome.io/cluster-selector": ""}
-		}},
-		{name: "legacy traffic factors", edit: func(source *v1beta1.InferenceService) {
-			source.Spec.Placement.CapacityFactors = map[string]resource.Quantity{"a": resource.MustParse("2")}
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1700,17 +1766,6 @@ func TestReconcile_ValidatesCompleteRoutingPolicyBeforeObservation(t *testing.T)
 		wantErr string
 	}{
 		{
-			name: "duplicate capacity-factor sources",
-			mutate: func(isvc *v1beta1.InferenceService) {
-				isvc.Spec.Routing = &v1beta1.RoutingSpec{
-					CapacityFactors: map[string]resource.Quantity{"a": resource.MustParse("1")},
-				}
-				//nolint:staticcheck // exercises rejection of the deprecated compatibility field
-				isvc.Spec.Placement.CapacityFactors = map[string]resource.Quantity{"a": resource.MustParse("1")}
-			},
-			wantErr: "capacityFactors are unsupported",
-		},
-		{
 			name: "non-positive routing capacity factor",
 			mutate: func(isvc *v1beta1.InferenceService) {
 				isvc.Spec.Routing = &v1beta1.RoutingSpec{
@@ -2183,13 +2238,6 @@ func TestRoutingTableChangePredicate(t *testing.T) {
 		now := metav1.Now()
 		nw.DeletionTimestamp = &now
 		assert.True(t, routingTableChange.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: nw}))
-	})
-
-	t.Run("obsolete factors do not change traffic", func(t *testing.T) {
-		nw := base.DeepCopy()
-		//nolint:staticcheck // compatibility coverage for deprecated spec.placement.capacityFactors
-		nw.Spec.Placement.CapacityFactors = map[string]resource.Quantity{"a": resource.MustParse("2")}
-		assert.False(t, routingTableChange.Update(event.UpdateEvent{ObjectOld: base, ObjectNew: nw}))
 	})
 
 	t.Run("routing capacity factor change is admitted", func(t *testing.T) {

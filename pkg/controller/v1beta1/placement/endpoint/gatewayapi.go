@@ -15,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -705,10 +706,13 @@ func (p *GatewayAPIPublisher) buildExternalNameService(isvc *v1beta1.InferenceSe
 			Labels:    p.serviceLabels(isvc, home.Cluster),
 		},
 		Spec: corev1.ServiceSpec{
-			Type:         corev1.ServiceTypeExternalName,
-			ExternalName: home.BackendHost,
+			Type:            corev1.ServiceTypeExternalName,
+			ExternalName:    home.BackendHost,
+			SessionAffinity: corev1.ServiceAffinityNone,
 			Ports: []corev1.ServicePort{{
-				Port: p.config.BackendPort,
+				Port:       p.config.BackendPort,
+				Protocol:   corev1.ProtocolTCP,
+				TargetPort: intstr.FromInt32(p.config.BackendPort),
 			}},
 		},
 	}
@@ -755,6 +759,7 @@ func (p *GatewayAPIPublisher) buildHTTPRoute(isvc *v1beta1.InferenceService, tar
 		ref := gatewayapiv1.HTTPBackendRef{
 			BackendRef: gatewayapiv1.BackendRef{
 				BackendObjectReference: gatewayapiv1.BackendObjectReference{
+					Group:     ptr.To(gatewayapiv1.Group(corev1.GroupName)),
 					Kind:      ptr.To(gatewayapiv1.Kind(constants.ServiceKind)),
 					Name:      gatewayapiv1.ObjectName(p.serviceName(isvc, h.Cluster)),
 					Namespace: (*gatewayapiv1.Namespace)(&backendNS),

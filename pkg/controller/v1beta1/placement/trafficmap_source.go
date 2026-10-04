@@ -1,11 +1,28 @@
 package placement
 
 import (
+	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
+
+// TrafficMapInputsChanged excludes publisher acknowledgements from routing
+// inputs. Metadata changes remain visible for ownership repair and finalization.
+func TrafficMapInputsChanged(oldMap, newMap *v1beta1.TrafficMap) bool {
+	if oldMap == nil || newMap == nil {
+		return true
+	}
+	return oldMap.UID != newMap.UID || oldMap.Generation != newMap.Generation ||
+		!equality.Semantic.DeepEqual(oldMap.Spec, newMap.Spec) ||
+		!equality.Semantic.DeepEqual(oldMap.DeletionTimestamp, newMap.DeletionTimestamp) ||
+		!equality.Semantic.DeepEqual(oldMap.OwnerReferences, newMap.OwnerReferences) ||
+		!equality.Semantic.DeepEqual(oldMap.Finalizers, newMap.Finalizers) ||
+		!equality.Semantic.DeepEqual(oldMap.Labels, newMap.Labels) ||
+		!equality.Semantic.DeepEqual(oldMap.Annotations, newMap.Annotations) ||
+		oldMap.Status.SourceUID != newMap.Status.SourceUID
+}
 
 const (
 	// TrafficMapPublisherFinalizer preserves a TrafficMap and its durable

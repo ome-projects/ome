@@ -17,7 +17,7 @@ func TestDeriveISVCPlacementIntentStaysOnSource(t *testing.T) {
 	} {
 		t.Run(string(mode), func(t *testing.T) {
 			src := srcISVCMode(mode, "accelerator=test")
-			src.Spec.Placement.ClusterSelector = "metadata.name=cluster-a"
+			src.Spec.Placement.ClusterAffinity = testAffinity("accelerator=test,metadata.name=cluster-a")
 			src.Spec.Placement.Split = &v1beta1.SplitSpec{Replicas: ptr.To(int32(4)), MaxReplicasPerCluster: 3}
 			before := src.DeepCopy()
 			derived := DeriveISVC(src, "control-plane", "serving")

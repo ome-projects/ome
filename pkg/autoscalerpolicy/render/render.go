@@ -60,25 +60,6 @@ func IsEndpointTriggerType(triggerType string) bool {
 	return strings.EqualFold(triggerType, "prometheus")
 }
 
-// ConsumesMaxReplicas reports whether any part of the template derives from
-// the component's MaxReplicas — the input the multi-cluster Split preflight
-// gate needs (an uncapped Split home would render the source's global
-// ceiling).
-func ConsumesMaxReplicas(spec *v1beta1.AutoscalerPolicySpec) (bool, error) {
-	if spec.Keda == nil {
-		return false, nil
-	}
-	if fb := spec.Keda.Fallback; fb != nil && fb.Replicas.FromComponent != nil &&
-		*fb.Replicas.FromComponent == v1beta1.BoundsFieldMaxReplicas {
-		return true, nil
-	}
-	compiled, err := compileSpec(spec)
-	if err != nil {
-		return false, err
-	}
-	return compiled.variables["MaxReplicas"], nil
-}
-
 // Render materializes one component's ComponentAutoscaler from a policy.
 // Pure and deterministic: same policy generation + context + providers →
 // same output. Errors are fail-closed signals — the caller must keep the

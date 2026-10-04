@@ -8,8 +8,7 @@ import (
 )
 
 // InferenceServiceSpec is the desired state of an InferenceService.
-// +kubebuilder:validation:XValidation:rule="!(has(self.routing) && has(self.routing.capacityFactors) && has(self.placement) && has(self.placement.capacityFactors))",message="spec.routing.capacityFactors and deprecated spec.placement.capacityFactors must not both be set"
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.placement) || !has(oldSelf.placement.policy) || oldSelf.placement.policy != 'ClusterAffinity' || (has(self.placement) && has(self.placement.policy) && self.placement.policy == 'ClusterAffinity')",message="ClusterAffinity placement policy cannot be removed; drain and recreate the service to use Legacy"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.placement) || !has(oldSelf.placement.policy) || oldSelf.placement.policy != 'ClusterAffinity' || (has(self.placement) && has(self.placement.policy) && self.placement.policy == 'ClusterAffinity')",message="ClusterAffinity placement policy cannot be removed; drain and recreate the service to change placement ownership"
 type InferenceServiceSpec struct {
 	// DeploymentMode selects the dispatch backend that drives every
 	// Component on this InferenceService. When set, it propagates to
@@ -95,12 +94,9 @@ type InferenceServiceSpec struct {
 	// +ome:since=v1.3
 	ScalingPolicy *ScalingPolicy `json:"scalingPolicy,omitempty"`
 
-	// Placement declares how the multi-cluster control plane selects and orders
-	// the workload clusters this InferenceService is placed onto. When nil, the
-	// control plane falls back to the ome.io/accelerator-requirements and
-	// ome.io/cluster-selector annotations (unchanged legacy behavior). Only
-	// consulted on the control-plane cluster; ignored in single-cluster
-	// deployments. Alpha; the API may change without notice.
+	// Placement declares how the multi-cluster control plane selects workload
+	// clusters and allocates replicas. An absent block declares no placement
+	// intent. Derived member services carry allocation authority in metadata.
 	// +optional
 	// +ome:since=v1.3
 	Placement *PlacementSpec `json:"placement,omitempty"`

@@ -288,6 +288,12 @@ func TestPlannedTrafficEvidence(t *testing.T) {
 			c.Allocation.DrainRequested = true
 			tm.Spec.Entries = nil
 		}, want: [3]bool{true, false, true}},
+		{name: "unpublished zero acknowledges requested drain", edit: func(tm *v1beta1.TrafficMap, c *v1beta1.CandidatePlacement) {
+			c.Allocation.DrainRequested = true
+			tm.Spec.Entries[0].Weight = 0
+			tm.Status.Published = false
+			tm.Status.ObservedTrafficMapGeneration = 0
+		}, want: [3]bool{true, false, true}},
 		{name: "automatic zero is not a removal instruction", edit: func(tm *v1beta1.TrafficMap, _ *v1beta1.CandidatePlacement) { tm.Spec.Entries[0].Weight = 0 }, want: [3]bool{true, false, false}},
 		{name: "previous plan cannot acknowledge drain", edit: func(tm *v1beta1.TrafficMap, c *v1beta1.CandidatePlacement) {
 			tm.Spec.PlacementPlanID = "older"
@@ -295,8 +301,8 @@ func TestPlannedTrafficEvidence(t *testing.T) {
 			tm.Spec.Entries = nil
 		}},
 		{name: "previous source generation cannot grant credit", edit: func(tm *v1beta1.TrafficMap, _ *v1beta1.CandidatePlacement) { tm.Spec.ObservedISVCGeneration-- }},
-		{name: "pending publication is unknown", edit: func(tm *v1beta1.TrafficMap, _ *v1beta1.CandidatePlacement) { tm.Status.Published = false }},
-		{name: "stale publication is unknown", edit: func(tm *v1beta1.TrafficMap, _ *v1beta1.CandidatePlacement) { tm.Status.ObservedTrafficMapGeneration-- }},
+		{name: "publisher acknowledgement is independent", edit: func(tm *v1beta1.TrafficMap, _ *v1beta1.CandidatePlacement) { tm.Status.Published = false }, want: [3]bool{true, true, false}},
+		{name: "publisher generation is independent", edit: func(tm *v1beta1.TrafficMap, _ *v1beta1.CandidatePlacement) { tm.Status.ObservedTrafficMapGeneration-- }, want: [3]bool{true, true, false}},
 		{name: "different source provenance is unknown", edit: func(tm *v1beta1.TrafficMap, _ *v1beta1.CandidatePlacement) {
 			tm.Status.SourceUID = types.UID("other-source")
 		}},

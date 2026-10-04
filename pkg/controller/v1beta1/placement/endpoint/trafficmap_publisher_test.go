@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -163,6 +164,54 @@ func TestTrafficMapPublisherAddsFinalizerBeforeEffects(t *testing.T) {
 	current := getPublisherTrafficMap(t, kubeClient, trafficMap)
 	assert.Contains(t, current.Finalizers, TrafficMapPublisherFinalizer)
 	assert.Nil(t, current.Status.Publisher)
+}
+
+func TestTrafficMapPublisherModeOnlyPlacement(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		policy v1beta1.PlacementPolicy
+		mode   v1beta1.PlacementMode
+		want   bool
+	}{
+		{name: "single", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSingle, want: true},
+		{name: "all", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeAll, want: true},
+		{name: "split", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSplit, want: true},
+		{name: "capacity", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSplitByCapacity, want: true},
+		{name: "legacy", policy: v1beta1.PlacementPolicy("Legacy"), mode: v1beta1.PlacementModeAll},
+		{name: "omitted policy", mode: v1beta1.PlacementModeSingle},
+		{name: "local"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			owner, trafficMap := publisherTestObjects()
+			owner.Spec.Placement = nil
+			if tt.mode != "" {
+				owner.Spec.Placement = &v1beta1.PlacementSpec{Policy: tt.policy, Mode: tt.mode}
+			}
+			trafficMap.Spec.Mode = tt.mode
+			trafficMap.Finalizers = []string{TrafficMapPublisherFinalizer}
+			publisher := &recordingTrafficMapPublisher{
+				name: "example-publisher", stateful: true, claims: []string{"target-a"},
+			}
+			r, c := newTrafficMapPublisherReconciler(t, publisher, owner, trafficMap)
+			if _, err := reconcileTrafficMapPublisher(t, r, trafficMap); err != nil {
+				t.Fatal(err)
+			}
+			var wantEvents []string
+			if tt.want {
+				wantEvents = []string{"apply"}
+			}
+			if diff := cmp.Diff(wantEvents, publisher.events); diff != "" {
+				t.Fatalf("publication effects (-want +got):\n%s", diff)
+			}
+			current := getPublisherTrafficMap(t, c, trafficMap)
+			if diff := cmp.Diff(tt.want, current.Status.Published); diff != "" {
+				t.Fatalf("publication status (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(owner.UID, current.Status.SourceUID); diff != "" {
+				t.Fatalf("source identity (-want +got):\n%s", diff)
+			}
+		})
+	}
 }
 
 func TestTrafficMapPublisherRequiresMatchingSourceUIDBeforePlanning(t *testing.T) {
@@ -3588,7 +3637,7 @@ func publisherTestObjects() (*v1beta1.InferenceService, *v1beta1.TrafficMap) {
 	owner := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
 		Name: "model", Namespace: "team-a", UID: types.UID("owner-uid"), Generation: 2,
 	}, Spec: v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{
-		Mode: v1beta1.PlacementModeSingle, Requirements: "accelerator=test",
+		Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle,
 	}}}
 	trafficMap := &v1beta1.TrafficMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3962,4 +4011,20 @@ func (w *conflictOnceStatusWriter) Patch(
 		)
 	}
 	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
+
+func TestTrafficMapPublicationWatchFiltersAcknowledgements(t *testing.T) {
+	_, old := publisherTestObjects()
+	current := old.DeepCopy()
+	current.Status.Published = true
+	current.Status.ObservedTrafficMapGeneration = current.Generation
+	current.Status.Conditions = []metav1.Condition{{Type: v1beta1.TrafficMapPublished, Status: metav1.ConditionTrue}}
+	require.False(t, trafficMapPublicationChange.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: current}))
+	for _, kind := range []string{v1beta1.TrafficMapRoutable, v1beta1.TrafficMapCapacityFallback, v1beta1.TrafficMapOverrideActive} {
+		current = old.DeepCopy()
+		current.Status.Conditions = []metav1.Condition{{Type: kind, Status: metav1.ConditionFalse}}
+		require.True(t, trafficMapPublicationChange.Update(event.UpdateEvent{ObjectOld: old, ObjectNew: current}), kind)
+	}
+	require.True(t, trafficMapPublicationChange.Create(event.CreateEvent{Object: old}))
+	require.True(t, trafficMapPublicationChange.Delete(event.DeleteEvent{Object: old}))
 }

@@ -294,10 +294,6 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return ctrl.Result{}, nil
 	}
 	isvc = current
-	if !isvc.Spec.Placement.UsesClusterAffinity() {
-		r.forgetCapacity(request.NamespacedName)
-		return r.reconcileLegacy(ctx, isvc)
-	}
 	ctx = unverifiedBackend(ctx, isvc)
 	if placementMode(isvc) != v1beta1.PlacementModeSplitByCapacity {
 		r.forgetCapacity(request.NamespacedName)
@@ -425,9 +421,12 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 	return res, err
 }
 
-// placementMode resolves the default only for Legacy placement.
+// placementMode returns explicit source intent without a mode default.
 func placementMode(isvc *v1beta1.InferenceService) v1beta1.PlacementMode {
-	return isvc.Spec.Placement.EffectiveMode()
+	if isvc.Spec.Placement == nil {
+		return ""
+	}
+	return isvc.Spec.Placement.Mode
 }
 
 // splitDesiredReplicas is the Split desired replica count: spec.placement.split.
@@ -1149,9 +1148,8 @@ const placementEligibleIndexValue = "true"
 
 // placementEligibleIndexExtractor is the cache IndexerFunc for
 // placementEligibleIndexField. It returns the truthy token for an ISVC that
-// declares an accelerator-requirements or cluster-selector annotation (the same
-// signal MatchCandidates uses to decide fan-out eligibility), and nil otherwise
-// so non-placement ISVCs stay out of the index.
+// declares placement intent, including invalid input that needs a condition.
+// Ordinary local services stay out of the index.
 func placementEligibleIndexExtractor(obj client.Object) []string {
 	isvc, ok := obj.(*v1beta1.InferenceService)
 	if !ok {
@@ -1163,16 +1161,6 @@ func placementEligibleIndexExtractor(obj client.Object) []string {
 	return []string{placementEligibleIndexValue}
 }
 
-// declaresPlacementRequirement preserves Legacy's no-selector/local boundary.
-// Explicit new-policy fields remain eligible so invalid opt-in is observable.
-func declaresPlacementRequirement(isvc *v1beta1.InferenceService) bool {
-	if p := isvc.Spec.Placement; p != nil && (p.Policy != "" && p.Policy != v1beta1.PlacementPolicyLegacy || p.ClusterAffinity != nil || p.MaxSurge != nil || p.ReplacementTimeout != nil || p.Mode == v1beta1.PlacementModeSplitByCapacity) {
-		return true
-	}
-	requirements, selector := placementInputs(isvc)
-	return requirements != "" || selector != ""
-}
-
 // IsPlacementEligible reports whether an InferenceService participates in the
 // multi-cluster placement flow. Consumers of status.placement use this same
 // predicate so ordinary, single-cluster InferenceServices do not accidentally
@@ -1181,7 +1169,13 @@ func IsPlacementEligible(isvc *v1beta1.InferenceService) bool {
 	if isvc == nil || isvc.Labels[PlacementOriginLabel] != "" || isvc.Annotations[PlacementOriginUIDAnnotation] != "" {
 		return false
 	}
-	return declaresPlacementRequirement(isvc)
+	if isvc.Spec.Placement != nil {
+		return true
+	}
+	// Obsolete annotations must surface as invalid intent, never local work.
+	_, requirements := isvc.Annotations[AcceleratorRequirementsAnnotation]
+	_, selector := isvc.Annotations[ClusterSelectorAnnotation]
+	return requirements || selector
 }
 
 // registerPlacementEligibleIndex installs placementEligibleIndexField on the

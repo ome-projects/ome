@@ -471,9 +471,6 @@ func (r *Reconciler) writeObservedMulti(
 			continue
 		}
 		candidate := home.candidate
-		if !isvc.Spec.Placement.UsesClusterAffinity() && heldSplitSliver(isvc, candidate) {
-			candidate = identityCandidate(cluster)
-		}
 		candidates = append(candidates, candidate)
 		unknown = unknown || home.state == homeUnknown
 		if candidate.Phase == v1beta1.CandidatePhaseAdmitted {
@@ -506,12 +503,4 @@ func observedCandidateResult(home homeObservation) placementResult {
 		url:        home.candidate.Endpoint, ready: home.serving,
 		readinessUnknown: home.state == homeUnknown,
 	}
-}
-
-func heldSplitSliver(isvc *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) bool {
-	if placementMode(isvc) != v1beta1.PlacementModeSplit || isvc.Spec.Placement == nil || isvc.Spec.Placement.Split == nil {
-		return false
-	}
-	minimum := isvc.Spec.Placement.Split.MinReplicasPerCluster
-	return minimum > 0 && candidate.AdmittedReplicas > 0 && candidate.AdmittedReplicas < minimum
 }

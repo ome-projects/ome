@@ -10,8 +10,6 @@ import (
 )
 
 const (
-	routingCapacityFactorsRule = "!(has(self.routing) && has(self.routing.capacityFactors) && has(self.placement) && has(self.placement.capacityFactors))"
-
 	routingProbeDisabledRule   = "!(has(self.disabled) && self.disabled) || (!has(self.path) && !has(self.method) && !has(self.acceptStatuses) && !has(self.gateStatuses) && !has(self.period) && !has(self.timeout) && !has(self.failureThreshold) && !has(self.successThreshold) && !has(self.allFailedPolicy))"
 	routingProbeCompleteRule   = "(has(self.disabled) && self.disabled) || (has(self.path) && has(self.method) && has(self.acceptStatuses) && has(self.gateStatuses) && has(self.period) && has(self.timeout) && has(self.failureThreshold) && has(self.successThreshold) && has(self.allFailedPolicy))"
 	routingPeriodPositiveRule  = "!has(self.period) || duration(self.period) > duration('0s')"
@@ -47,7 +45,6 @@ func loadInferenceServiceCRDSchema(t *testing.T) apiextensionsv1.JSONSchemaProps
 func TestInferenceServiceCRD_RoutingValidationRules(t *testing.T) {
 	root := loadInferenceServiceCRDSchema(t)
 	spec := requireSchemaProperty(t, root, "spec")
-	requireSchemaRules(t, "spec", spec, routingCapacityFactorsRule)
 
 	routing := requireSchemaProperty(t, spec, "routing")
 	probe := requireSchemaProperty(t, routing, "probe")

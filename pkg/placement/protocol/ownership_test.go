@@ -9,7 +9,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
-func TestAffinityMemberBoundary(t *testing.T) {
+func TestMemberOwnershipBoundary(t *testing.T) {
 	for _, tt := range []struct {
 		name                        string
 		origin, selected, execution bool
@@ -17,7 +17,7 @@ func TestAffinityMemberBoundary(t *testing.T) {
 	}{
 		{name: "local"},
 		{name: "local with similarly named metadata", selected: true, execution: true},
-		{name: "legacy member", origin: true},
+		{name: "owned member awaiting policy", origin: true, want: true},
 		{name: "opt-in member before allocation", origin: true, selected: true, want: true},
 		{name: "planned member", origin: true, execution: true, want: true},
 	} {
@@ -32,7 +32,7 @@ func TestAffinityMemberBoundary(t *testing.T) {
 			if tt.execution {
 				service.Annotations[constants.PlacementExecution] = "{}"
 			}
-			if diff := cmp.Diff(tt.want, IsAffinityMember(service)); diff != "" {
+			if diff := cmp.Diff(tt.want, IsMember(service)); diff != "" {
 				t.Fatal(diff)
 			}
 		})

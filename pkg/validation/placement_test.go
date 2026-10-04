@@ -34,13 +34,6 @@ func TestValidatePlacement(t *testing.T) {
 		{name: "split settings for single", placement: `{"mode":"Single","split":{}}`, wantError: "permitted only"},
 		{name: "zero requested floor", placement: `{"mode":"Split","split":{"replicas":0}}`, wantError: "replicas"},
 		{name: "negative per-home ceiling", placement: `{"mode":"Split","split":{"maxReplicasPerCluster":-1}}`, wantError: "maxReplicasPerCluster"},
-		{name: "legacy requirements", placement: `{"mode":"Single","requirements":"accelerator=gpu-a"}`, wantError: "migrate"},
-		{name: "empty legacy requirements", placement: `{"mode":"Single","requirements":""}`, wantError: "migrate"},
-		{name: "null legacy requirements", placement: `{"mode":"Single","requirements":null}`, wantError: "migrate"},
-		{name: "empty legacy selector", placement: `{"mode":"Single","clusterSelector":""}`, wantError: "migrate"},
-		{name: "empty legacy capacity factors", placement: `{"mode":"Single","capacityFactors":{}}`, wantError: "migrate"},
-		{name: "explicit packed", placement: `{"mode":"Split","split":{"spread":false}}`, wantError: "unsupported"},
-		{name: "zero anti-sliver", placement: `{"mode":"Split","split":{"minReplicasPerCluster":0}}`, wantError: "unsupported"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var placement *v1beta1.PlacementSpec
@@ -74,9 +67,6 @@ func TestValidatePlacementIntent(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: tt.annotations}}
-			if tt.invalid {
-				source.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle}
-			}
 			before := source.DeepCopy()
 			err := ValidatePlacementIntent(source)
 			if diff := cmp.Diff(tt.invalid, err != nil); diff != "" {

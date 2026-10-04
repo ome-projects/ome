@@ -22,7 +22,6 @@ func resetPlacementMetrics() {
 	placementPolicyInfo.Reset()
 	placementSplitReplicas.Reset()
 	placementSplitMaxPerCluster.Reset()
-	placementSplitMinPerCluster.Reset()
 }
 
 func splitISVC(ns, name string, replicas int32) *v1beta1.InferenceService {
@@ -30,14 +29,10 @@ func splitISVC(ns, name string, replicas int32) *v1beta1.InferenceService {
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
 		Spec: v1beta1.InferenceServiceSpec{
 			Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
-				Mode:            v1beta1.PlacementModeSplit,
-				Requirements:    "accelerator=tpu7x",
-				ClusterSelector: "region=us-east",
+				Mode: v1beta1.PlacementModeSplit,
 				Split: &v1beta1.SplitSpec{
 					Replicas:              &replicas,
-					Spread:                true,
 					MaxReplicasPerCluster: 4,
-					MinReplicasPerCluster: 1,
 				},
 			},
 		},
@@ -127,7 +122,7 @@ func TestRecordPolicy_SplitFieldsAndModeChange(t *testing.T) {
 	recordPolicy(isvc)
 
 	if got := testutil.ToFloat64(placementPolicyInfo.WithLabelValues(
-		"ns", "svc", "Split", "accelerator=tpu7x", "region=us-east", "true")); got != 1 {
+		"ns", "svc", "ClusterAffinity", "Split")); got != 1 {
 		t.Errorf("policy_info = %v, want 1", got)
 	}
 	if got := testutil.ToFloat64(placementSplitReplicas.WithLabelValues("ns", "svc")); got != 8 {
@@ -183,7 +178,6 @@ func TestDeleteForISVC_DropsEverything(t *testing.T) {
 		"policy_info":     testutil.CollectAndCount(placementPolicyInfo),
 		"split_replicas":  testutil.CollectAndCount(placementSplitReplicas),
 		"max_per_cluster": testutil.CollectAndCount(placementSplitMaxPerCluster),
-		"min_per_cluster": testutil.CollectAndCount(placementSplitMinPerCluster),
 	} {
 		if n != 0 {
 			t.Errorf("%s series = %d, want 0 after DeleteForISVC", name, n)

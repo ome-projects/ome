@@ -14,17 +14,6 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
-// IsAffinityMember distinguishes opt-in members from ordinary local services
-// and legacy derived copies. An execution envelope also establishes opt-in.
-func IsAffinityMember(service *v1beta1.InferenceService) bool {
-	if service == nil || (service.Annotations[constants.PlacementOriginUID] == "" && service.Labels[constants.PlacementOrigin] == "") {
-		return false
-	}
-	_, selected := service.Annotations[constants.PlacementPolicy]
-	_, planned := service.Annotations[constants.PlacementExecution]
-	return selected || planned
-}
-
 // executionVersion identifies the annotation wire format. An envelope keeps
 // readers that only understand flat policies from accepting partial authority.
 const (

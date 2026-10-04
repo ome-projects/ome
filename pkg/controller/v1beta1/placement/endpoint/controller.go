@@ -211,9 +211,7 @@ func applyTrafficMapWeights(homes []Home, weights map[string]int32) bool {
 // homesFromPlacement extracts the serving homes — admitted candidates that
 // report an addressable endpoint — from a placement status, sorted by cluster
 // for a deterministic route. This is the uniform source for both Single (one
-// winner candidate) and All/Split (one per serving cluster). It falls back to
-// the top-level cluster/endpoint for a status that predates per-candidate
-// endpoints, so a legacy Single placement still publishes.
+// winner candidate) and All/Split (one per serving cluster).
 func homesFromPlacement(pl *v1beta1.PlacementStatus) []Home {
 	var homes []Home
 	for i := range pl.Candidates {
@@ -224,11 +222,6 @@ func homesFromPlacement(pl *v1beta1.PlacementStatus) []Home {
 				BackendHost: hostOnly(c.Endpoint.Host), Weight: c.ReadyReplicas,
 			})
 		}
-	}
-	if len(homes) == 0 && pl.Cluster != "" && pl.Endpoint != nil && pl.Endpoint.Host != "" {
-		homes = append(homes, Home{
-			Cluster: pl.Cluster, Endpoint: pl.Endpoint.String(), BackendHost: hostOnly(pl.Endpoint.Host),
-		})
 	}
 	sort.Slice(homes, func(i, j int) bool { return homes[i].Cluster < homes[j].Cluster })
 	return homes

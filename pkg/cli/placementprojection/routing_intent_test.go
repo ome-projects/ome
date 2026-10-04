@@ -147,29 +147,6 @@ func TestProjectExplainRoutingIntentStates(t *testing.T) {
 			wantState: "Declared", wantEnablement: "OptOut", wantSource: "Inherited",
 			wantProbe: "Disabled", wantCap: "Disabled", wantPub: "Configured",
 		},
-		{
-			name: "legacy capacity factors",
-			configure: func(parent *ome.InferenceService) {
-				parent.Spec.Placement.CapacityFactors = map[string]resource.Quantity{ //nolint:staticcheck
-					"west": resource.MustParse("2"),
-				}
-			},
-			wantState: "Declared", wantEnablement: "Inherited", wantSource: "LegacyPlacement",
-			wantProbe: "Inherited", wantCap: "Inherited", wantPub: "Inherited",
-		},
-		{
-			name: "conflicting factor sources are invalid",
-			configure: func(parent *ome.InferenceService) {
-				parent.Spec.Placement.CapacityFactors = map[string]resource.Quantity{ //nolint:staticcheck
-					"west": resource.MustParse("2"),
-				}
-				parent.Spec.Routing = &ome.RoutingSpec{CapacityFactors: map[string]resource.Quantity{
-					"east": resource.MustParse("3"),
-				}}
-			},
-			wantState: "Invalid", wantEnablement: "Inherited", wantSource: "Conflict",
-			wantProbe: "Inherited", wantCap: "Inherited", wantPub: "Inherited",
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -360,13 +337,10 @@ func TestRoutingIntentBudgetBoundaries(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		routing     *ome.RoutingSpec
-		legacyCount int
-		want        bool
+		name    string
+		routing *ome.RoutingSpec
+		want    bool
 	}{
-		{name: "legacy factors exact", legacyCount: routingFactorScanLimit},
-		{name: "legacy factors over", legacyCount: routingFactorScanLimit + 1, want: true},
 		{name: "routing factors exact", routing: &ome.RoutingSpec{CapacityFactors: factors(routingFactorScanLimit)}},
 		{name: "routing factors over", routing: &ome.RoutingSpec{CapacityFactors: factors(routingFactorScanLimit + 1)}, want: true},
 		{name: "probe statuses exact", routing: &ome.RoutingSpec{Probe: &ome.RoutingProbeSpec{
@@ -394,7 +368,7 @@ func TestRoutingIntentBudgetBoundaries(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, test.want, routingIntentExceedsBudget(test.routing, test.legacyCount))
+			assert.Equal(t, test.want, routingIntentExceedsBudget(test.routing))
 		})
 	}
 }

@@ -770,6 +770,11 @@ func servingCandidates(isvc *v1beta1.InferenceService) []*v1beta1.CandidatePlace
 	var cs []*v1beta1.CandidatePlacement
 	for i := range pl.Candidates {
 		c := &pl.Candidates[i]
+		// Allocation retirement can precede the observation refresh. An absent
+		// home cannot regain traffic from its last admitted endpoint.
+		if a := c.Allocation; pl.Plan != nil && a != nil && a.CurrentReplicas == 0 && a.DesiredReplicas == 0 && a.CurrentHome == nil && a.DesiredHome == nil {
+			continue
+		}
 		if pl.Plan != nil && pl.Plan.Mode == v1beta1.PlacementModeSingle && (pl.Plan.Winner == "" || c.Cluster != pl.Plan.Winner) {
 			if pl.Plan.Winner == "" {
 				continue
@@ -785,18 +790,6 @@ func servingCandidates(isvc *v1beta1.InferenceService) []*v1beta1.CandidatePlace
 			cs = append(cs, c)
 		}
 	}
-	// Annotation-based Single placement can carry only its top-level winner and
-	// endpoint. Treat it as one serving candidate.
-	if !isvc.Spec.Placement.UsesClusterAffinity() && len(cs) == 0 && placementMode(isvc) == v1beta1.PlacementModeSingle &&
-		pl.Cluster != "" && pl.Endpoint != nil && pl.Endpoint.Host != "" {
-		cs = append(cs, &v1beta1.CandidatePlacement{
-			Cluster:          pl.Cluster,
-			Phase:            v1beta1.CandidatePhaseAdmitted,
-			Endpoint:         pl.Endpoint.DeepCopy(),
-			AdmittedReplicas: 1,
-			ReadyReplicas:    1,
-		})
-	}
 	sort.Slice(cs, func(i, j int) bool { return cs[i].Cluster < cs[j].Cluster })
 	return cs
 }
@@ -808,8 +801,6 @@ func capacityFactor(isvc *v1beta1.InferenceService, cluster string) *resource.Qu
 	var factors map[string]resource.Quantity
 	if isvc.Spec.Routing != nil && isvc.Spec.Routing.CapacityFactors != nil {
 		factors = isvc.Spec.Routing.CapacityFactors
-	} else if isvc.Spec.Placement != nil && !isvc.Spec.Placement.UsesClusterAffinity() {
-		factors = isvc.Spec.Placement.CapacityFactors
 	}
 	if factors == nil {
 		return nil
@@ -821,9 +812,12 @@ func capacityFactor(isvc *v1beta1.InferenceService, cluster string) *resource.Qu
 	return nil
 }
 
-// placementMode preserves the Legacy Single default.
+// placementMode returns explicit source intent without a mode default.
 func placementMode(isvc *v1beta1.InferenceService) v1beta1.PlacementMode {
-	return isvc.Spec.Placement.EffectiveMode()
+	if isvc.Spec.Placement == nil {
+		return ""
+	}
+	return isvc.Spec.Placement.Mode
 }
 
 // SetupWithManager wires the controller: reconcile ISVCs, reacting only to
@@ -840,7 +834,8 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		Named(RoutingControllerName).
 		For(&v1beta1.InferenceService{}, builder.WithPredicates(routingTableChange)).
-		Watches(&v1beta1.TrafficMap{}, handler.EnqueueRequestsFromMapFunc(enqueueTrafficMapSource))
+		Watches(&v1beta1.TrafficMap{}, handler.EnqueueRequestsFromMapFunc(enqueueTrafficMapSource),
+			builder.WithPredicates(trafficMapRoutingChange))
 	if r.Config.Observer.MaxConcurrentReconciles > 0 {
 		b = b.WithOptions(controller.Options{
 			MaxConcurrentReconciles: r.Config.Observer.MaxConcurrentReconciles,
@@ -905,6 +900,14 @@ var routingTableChange = predicate.Funcs{
 			return true
 		}
 		return !equality.Semantic.DeepEqual(oldSpec, newSpec)
+	},
+}
+
+var trafficMapRoutingChange = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		oldMap, oldOK := e.ObjectOld.(*v1beta1.TrafficMap)
+		newMap, newOK := e.ObjectNew.(*v1beta1.TrafficMap)
+		return !oldOK || !newOK || placementcontroller.TrafficMapInputsChanged(oldMap, newMap)
 	},
 }
 

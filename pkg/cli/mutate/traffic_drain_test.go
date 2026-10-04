@@ -231,7 +231,7 @@ func TestPrepareTrafficDrainRequiresEligibleSourceAndRejectsDerived(t *testing.T
 	modeOnly := trafficDrainTarget(nil)
 	modeOnly.Spec.Placement = &omev1beta1.PlacementSpec{Mode: omev1beta1.PlacementModeAll}
 	_, err = PrepareTrafficDrain(modeOnly, request)
-	require.ErrorIs(t, err, ErrTrafficDrainIneligible)
+	require.NoError(t, err, "a placement source with a mode but no policy is eligible; validation holds it, not the CLI")
 
 	for _, marker := range []struct {
 		annotation bool
@@ -312,7 +312,7 @@ func trafficDrainTarget(annotations map[string]string) *omev1beta1.InferenceServ
 			Name: "chat", Namespace: "prod", UID: types.UID("uid-chat"), ResourceVersion: "42", Generation: 3,
 			Annotations: annotations,
 		},
-		Spec: omev1beta1.InferenceServiceSpec{Placement: &omev1beta1.PlacementSpec{Requirements: "accelerator=test"}},
+		Spec: omev1beta1.InferenceServiceSpec{Placement: &omev1beta1.PlacementSpec{}},
 	}
 }
 

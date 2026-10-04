@@ -43,15 +43,7 @@ func TestValidateRouting(t *testing.T) {
 		require.NoError(t, ValidateRouting(routingSpec(routing)))
 	})
 
-	t.Run("new and deprecated capacity factors conflict", func(t *testing.T) {
-		spec := routingSpec(&v1beta1.RoutingSpec{CapacityFactors: map[string]resource.Quantity{}})
-		spec.Placement = &v1beta1.PlacementSpec{CapacityFactors: map[string]resource.Quantity{}}
-		err := ValidateRouting(spec)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "must not both be set")
-	})
-
-	t.Run("new capacity factors must be positive", func(t *testing.T) {
+	t.Run("capacity factors must be positive", func(t *testing.T) {
 		for name, quantity := range map[string]string{
 			"zero":     "0",
 			"negative": "-500m",
@@ -66,12 +58,6 @@ func TestValidateRouting(t *testing.T) {
 		}
 	})
 
-	t.Run("deprecated capacity factors retain legacy admission behavior", func(t *testing.T) {
-		spec := &v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{
-			CapacityFactors: map[string]resource.Quantity{"cluster-a": resource.MustParse("0")},
-		}}
-		require.NoError(t, ValidateRouting(spec))
-	})
 }
 
 func TestValidateRoutingProbe(t *testing.T) {

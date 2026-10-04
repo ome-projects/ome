@@ -19,17 +19,14 @@ func projectInputs(parent *ome.InferenceService) (v.PlacementInputs, labels.Sele
 	in := v.PlacementInputs{Source: "LegacyAnnotations", Mode: "Single", ModeEvidence: "Defaulted", LegacyRequirementsPresent: requirements != "", LegacyClusterSelectorPresent: selector != ""}
 	if p := parent.Spec.Placement; p != nil {
 		in.Source = "Structured"
-		requirements = p.Requirements
-		selector = p.ClusterSelector
+		// Structured placement carries no selectors; the legacy annotations do not apply to it.
+		requirements, selector = "", ""
 		if p.Mode != "" {
 			in.Mode = modeValue(p.Mode)
 			in.ModeEvidence = "Declared"
 		}
 		if p.Split != nil {
-			in.Split = &v.PlacementSplit{Replicas: pointerCount(p.Split.Replicas), Spread: "UnknownOrDefaultedPacked", MaxReplicasPerCluster: count(p.Split.MaxReplicasPerCluster, true), MinReplicasPerCluster: count(p.Split.MinReplicasPerCluster, true)}
-			if p.Split.Spread {
-				in.Split.Spread = "DeclaredBalanced"
-			}
+			in.Split = &v.PlacementSplit{Replicas: pointerCount(p.Split.Replicas), Spread: "UnknownOrDefaultedPacked", MaxReplicasPerCluster: count(p.Split.MaxReplicasPerCluster, true), MinReplicasPerCluster: count(0, false)}
 		}
 	}
 	in.Requirements = v.PlacementSelector{Present: requirements != "", State: "Absent"}

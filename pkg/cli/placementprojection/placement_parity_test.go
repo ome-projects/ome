@@ -20,9 +20,7 @@ func TestProjectExplainMatchesAuthoritativeClusterName(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshot := fixture(t)
-			snapshot.InferenceService.Spec.Placement = &ome.PlacementSpec{
-				ClusterSelector: tc.selector,
-			}
+			withLegacySelectors(snapshot.InferenceService, "", tc.selector)
 
 			got, err := ProjectExplain(snapshot, fixtureClock)
 			if err != nil {
@@ -52,9 +50,7 @@ func TestProjectExplainClusterNameOverridesSpoofedLabelWithoutMutation(t *testin
 		{name: "spoofed-name", selector: "metadata.name=spoofed", want: "False"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			snapshot.InferenceService.Spec.Placement = &ome.PlacementSpec{
-				ClusterSelector: tc.selector,
-			}
+			withLegacySelectors(snapshot.InferenceService, "", tc.selector)
 			got, err := ProjectExplain(snapshot, fixtureClock)
 			if err != nil {
 				t.Fatal(err)
@@ -82,10 +78,7 @@ func TestProjectExplainANDComposesRequirementsAndClusterSelector(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			snapshot := fixture(t)
-			snapshot.InferenceService.Spec.Placement = &ome.PlacementSpec{
-				Requirements:    tc.requirements,
-				ClusterSelector: tc.selector,
-			}
+			withLegacySelectors(snapshot.InferenceService, tc.requirements, tc.selector)
 
 			got, err := ProjectExplain(snapshot, fixtureClock)
 			if err != nil {
@@ -96,6 +89,17 @@ func TestProjectExplainANDComposesRequirementsAndClusterSelector(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withLegacySelectors drives selector evaluation through the annotations, the
+// only place a placement selector is declared.
+func withLegacySelectors(isvc *ome.InferenceService, requirements, selector string) {
+	isvc.Spec.Placement = nil
+	if isvc.Annotations == nil {
+		isvc.Annotations = map[string]string{}
+	}
+	isvc.Annotations["ome.io/accelerator-requirements"] = requirements
+	isvc.Annotations["ome.io/cluster-selector"] = selector
 }
 
 func TestProjectStatusReportsCandidateCountsForRecognizedModes(t *testing.T) {

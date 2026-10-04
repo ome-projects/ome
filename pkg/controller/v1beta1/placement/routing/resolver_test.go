@@ -8,7 +8,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -345,19 +344,6 @@ func TestResolveConfigRunsSharedRoutingValidation(t *testing.T) {
 				}},
 			}),
 			wantContain: "byte value limit",
-		},
-		{
-			name: "new and deprecated capacity factors conflict",
-			spec: &v1beta1.InferenceServiceSpec{
-				Routing: &v1beta1.RoutingSpec{
-					CapacityFactors: map[string]resource.Quantity{},
-				},
-				Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
-					//nolint:staticcheck // compatibility coverage for deprecated spec.placement.capacityFactors
-					CapacityFactors: map[string]resource.Quantity{},
-				},
-			},
-			wantContain: "must not both be set",
 		},
 	}
 

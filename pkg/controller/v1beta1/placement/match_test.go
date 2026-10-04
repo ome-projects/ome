@@ -121,7 +121,7 @@ func TestPlacementEligibilityIncludesInvalidIntent(t *testing.T) {
 		{name: "local", source: isvcPlacement(nil)},
 		{name: "unconstrained", source: isvcReq("", ""), eligible: true},
 		{name: "empty block", source: isvcPlacement(&v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity}), eligible: true, invalid: true},
-		{name: "legacy empty annotation", source: &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{ClusterSelectorAnnotation: ""}}}},
+		{name: "legacy empty annotation", source: &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{ClusterSelectorAnnotation: ""}}}, eligible: true, invalid: true},
 		{name: "legacy annotation beside typed intent", source: &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{AcceleratorRequirementsAnnotation: "accelerator=gpu-a"}}, Spec: v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle}}}, eligible: true, invalid: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

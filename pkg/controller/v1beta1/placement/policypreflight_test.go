@@ -315,36 +315,37 @@ func TestPreflightPolicies_DisconnectedCandidateStaysEligible(t *testing.T) {
 	assert.Equal(t, []string{"a"}, out.eligible)
 }
 
-func TestPreflightPolicies_SplitHardGate(t *testing.T) {
-	for _, mode := range []v1beta1.PlacementMode{v1beta1.PlacementModeSplit, v1beta1.PlacementModeSplitByCapacity} {
-		t.Run(string(mode), func(t *testing.T) {
+func TestPreflightPolicies_SplitCeilings(t *testing.T) {
+	for _, placement := range []struct {
+		name   string
+		mode   v1beta1.PlacementMode
+		policy v1beta1.PlacementPolicy
+	}{
+		{name: "static split", mode: v1beta1.PlacementModeSplit, policy: v1beta1.PlacementPolicyClusterAffinity},
+		{name: "capacity split", mode: v1beta1.PlacementModeSplitByCapacity, policy: v1beta1.PlacementPolicyClusterAffinity},
+	} {
+		t.Run(placement.name, func(t *testing.T) {
 			for _, tc := range []struct {
-				name     string
-				cap      int32
-				wantHold bool
+				name string
+				cap  int32
 			}{
-				{name: "unset ceiling holds", wantHold: true},
+				{name: "unset ceiling"},
 				{name: "explicit ceiling permits placement", cap: 45},
 			} {
 				t.Run(tc.name, func(t *testing.T) {
 					s := testScheme(t)
 					isvc := srcISVCWithRef("")
-					isvc.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: mode, Split: &v1beta1.SplitSpec{MaxReplicasPerCluster: tc.cap}}
+					isvc.Spec.Placement = &v1beta1.PlacementSpec{Policy: placement.policy, Mode: placement.mode, Split: &v1beta1.SplitSpec{MaxReplicasPerCluster: tc.cap}}
 					clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"a": memberWith(s, maxConsumingPolicy(testPolicyName))}}
 					r, _ := newPlacer(s, clusters, isvc, maxConsumingPolicy(testPolicyName))
 					out := r.preflightPolicies(t.Context(), isvc, []string{"a"}, []v1beta1.WorkloadCluster{*readyWC("a", capabilityLabels())})
 					if out == nil {
 						t.Fatal("missing preflight result")
 					}
-					if diff := cmp.Diff(tc.wantHold, out.hold); diff != "" {
+					if diff := cmp.Diff(false, out.hold); diff != "" {
 						t.Error(diff)
 					}
-					cond := stagedPreflight(t, r, isvc.UID)
-					if tc.wantHold {
-						if diff := cmp.Diff(v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling, cond.Reason); diff != "" {
-							t.Error(diff)
-						}
-					} else if diff := cmp.Diff([]string{"a"}, out.eligible); diff != "" {
+					if diff := cmp.Diff([]string{"a"}, out.eligible); diff != "" {
 						t.Error(diff)
 					}
 				})

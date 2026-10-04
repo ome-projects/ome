@@ -143,12 +143,10 @@ func TestDeriveISVC_StripsRoutingDirectives(t *testing.T) {
 			Engine: &v1beta1.EngineSpec{},
 			Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
 				Mode: v1beta1.PlacementModeAll,
-				CapacityFactors: map[string]resource.Quantity{ //nolint:staticcheck // Exercise the supported legacy alias.
-					"cluster-a": resource.MustParse("2"),
-				},
 			},
 			Routing: &v1beta1.RoutingSpec{
-				Enabled: &enabled,
+				Enabled:         &enabled,
+				CapacityFactors: map[string]resource.Quantity{"cluster-a": resource.MustParse("2")},
 				Publisher: &v1beta1.RoutingPublisherSpec{
 					Options: map[string]string{"routingClass": "premium"},
 				},

@@ -7253,7 +7253,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 					},
 					"placement": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Placement declares how the multi-cluster control plane selects and orders the workload clusters this InferenceService is placed onto. When nil, the control plane falls back to the ome.io/accelerator-requirements and ome.io/cluster-selector annotations (unchanged legacy behavior). Only consulted on the control-plane cluster; ignored in single-cluster deployments. Alpha; the API may change without notice.",
+							Description: "Placement declares how the multi-cluster control plane selects workload clusters and allocates replicas. An absent block declares no placement intent. Derived member services carry allocation authority in metadata.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec"),
 						},
 					},
@@ -10643,19 +10643,21 @@ func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) com
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "PlacementSpec declares multi-cluster intent. Policy omission preserves the legacy selector and allocation contract, including its mode defaults.",
+				Description: "PlacementSpec declares explicit multi-cluster matching and allocation intent.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"policy": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Policy explicitly opts into ClusterAffinity semantics. Omission is Legacy. ClusterAffinity cannot be removed from an existing service; migrating back requires draining and recreating the source and its derived workloads.",
+							Description: "Policy selects ClusterAffinity matching and persisted allocation plans.",
+							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
 						},
 					},
 					"mode": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Mode is required for ClusterAffinity. Legacy omission means Single.",
+							Description: "Mode selects the placement cardinality and replica allocation strategy.",
+							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -10692,45 +10694,18 @@ func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) com
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
 						},
 					},
-					"requirements": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Requirements is a Legacy label selector, ANDed with ClusterSelector. Deprecated: opt into ClusterAffinity and use clusterAffinity.",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
-					"clusterSelector": {
-						SchemaProps: spec.SchemaProps{
-							Description: "ClusterSelector is a Legacy selector over labels and virtual metadata.name. Deprecated: opt into ClusterAffinity and use clusterAffinity.",
-							Type:        []string{"string"},
-							Format:      "",
-						},
-					},
 					"split": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Split provides the requested floor and optional per-home ceiling for Split and SplitByCapacity. ClusterAffinity rejects it in other modes.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitSpec"),
 						},
 					},
-					"capacityFactors": {
-						SchemaProps: spec.SchemaProps{
-							Description: "CapacityFactors is the Legacy alias for routing capacity factors. Deprecated: use spec.routing.capacityFactors.",
-							Type:        []string{"object"},
-							AdditionalProperties: &spec.SchemaOrBool{
-								Allows: true,
-								Schema: &spec.Schema{
-									SchemaProps: spec.SchemaProps{
-										Ref: ref("k8s.io/apimachinery/pkg/api/resource.Quantity"),
-									},
-								},
-							},
-						},
-					},
 				},
+				Required: []string{"policy", "mode"},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/apis/meta/v1.Duration", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterAffinityTerm", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitSpec"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Duration", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterAffinityTerm", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitSpec"},
 	}
 }
 
@@ -14977,23 +14952,9 @@ func schema_pkg_apis_ome_v1beta1_SplitSpec(ref common.ReferenceCallback) common.
 							Format:      "int32",
 						},
 					},
-					"spread": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Spread requests ceil(replicas/candidates) on each Legacy candidate. False uses admission-driven packing in candidate name order. Deprecated: ClusterAffinity uses exact shares and optional affinity weights.",
-							Type:        []string{"boolean"},
-							Format:      "",
-						},
-					},
 					"maxReplicasPerCluster": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxReplicasPerCluster is an optional local ceiling. ClusterAffinity holds plans exceeding it; Legacy clips requests to it. Zero leaves it uncapped.",
-							Type:        []string{"integer"},
-							Format:      "int32",
-						},
-					},
-					"minReplicasPerCluster": {
-						SchemaProps: spec.SchemaProps{
-							Description: "MinReplicasPerCluster discards Legacy homes admitted below this count. Deprecated: ClusterAffinity exact shares cannot discard a small admission.",
+							Description: "MaxReplicasPerCluster is an optional local ceiling. Plans exceeding it are held; zero follows the assigned allocation without an extra ceiling.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},

@@ -1868,6 +1868,55 @@ func TestPlacementEligibleIndexExtractor(t *testing.T) {
 	assert.Nil(t, placementEligibleIndexExtractor(&v1beta1.WorkloadCluster{}))
 }
 
+func TestModeOnlyPlacementClusterEvents(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		policy v1beta1.PlacementPolicy
+		mode   v1beta1.PlacementMode
+		want   bool
+	}{
+		{name: "single", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSingle, want: true},
+		{name: "all", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeAll, want: true},
+		{name: "split", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSplit, want: true},
+		{name: "capacity", policy: v1beta1.PlacementPolicyClusterAffinity, mode: v1beta1.PlacementModeSplitByCapacity, want: true},
+		{name: "retired policy requeues for validation", policy: v1beta1.PlacementPolicy("Legacy"), mode: v1beta1.PlacementModeAll, want: true},
+		{name: "omitted policy requeues for validation", mode: v1beta1.PlacementModeSingle, want: true},
+		{name: "local"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source := srcISVCNamed("source")
+			source.Namespace = "team-a"
+			if tt.mode != "" {
+				source.Spec.Placement = &v1beta1.PlacementSpec{Policy: tt.policy, Mode: tt.mode}
+			}
+			var wantIndex []string
+			wantRequests := []ctrl.Request{}
+			if source.Spec.Placement != nil {
+				wantIndex = []string{placementEligibleIndexValue}
+			}
+			if tt.want {
+				wantRequests = append(wantRequests, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(source)})
+			}
+			if diff := cmp.Diff(wantIndex, placementEligibleIndexExtractor(source)); diff != "" {
+				t.Fatalf("index (-want +got):\n%s", diff)
+			}
+			scheme := testScheme(t)
+			r := &Reconciler{Client: indexedPlacementClient(t, scheme, source), Scheme: scheme, Log: log.Log}
+			for _, cluster := range []*v1beta1.WorkloadCluster{
+				readyWC("member-a", map[string]string{"region": "east"}),
+				{ObjectMeta: metav1.ObjectMeta{Name: "member-b"}},
+			} {
+				t.Run(cluster.Name, func(t *testing.T) {
+					got := r.isvcsForClusterChange(t.Context(), cluster)
+					if diff := cmp.Diff(wantRequests, got); diff != "" {
+						t.Fatalf("cluster event requests (-want +got):\n%s", diff)
+					}
+				})
+			}
+		})
+	}
+}
+
 // srcISVCNamed builds a named source; omitted selectors produce a local service.
 func srcISVCNamed(name string, selectors ...string) *v1beta1.InferenceService {
 	source := srcISVC("")

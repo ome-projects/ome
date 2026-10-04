@@ -222,19 +222,6 @@ func TestPortableDigestDefaultingEquivalence(t *testing.T) {
 	}
 }
 
-func TestConsumesMaxReplicas(t *testing.T) {
-	policy := standardPolicy()
-	if got, err := ConsumesMaxReplicas(&policy.Spec); err != nil || !got {
-		t.Errorf("standard policy consumes MaxReplicas twice: got %v, %v", got, err)
-	}
-	fixed := standardPolicy()
-	fixed.Spec.Keda.Fallback.Replicas = v1beta1.ReplicaValueSource{Value: ptr.To(int32(2))}
-	fixed.Spec.Keda.Triggers[0].Metadata["query"] = `sum({namespace="{{ .Namespace }}"})`
-	if got, err := ConsumesMaxReplicas(&fixed.Spec); err != nil || got {
-		t.Errorf("bounded-free policy: got %v, %v", got, err)
-	}
-}
-
 func TestTemplateCacheInvalidation(t *testing.T) {
 	cache := NewCache()
 	policy := standardPolicy()

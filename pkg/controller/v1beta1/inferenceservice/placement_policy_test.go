@@ -49,7 +49,7 @@ func TestPlacementPolicyPreflight(t *testing.T) {
 				{name: "local malformed annotation ignored", policy: "{"},
 				{name: "local future policy ignored", policy: `{"version":4}`},
 				{name: "local ignores demand inventory", policy: demand},
-				{name: "derived without policy", origin: "source-a"},
+				{name: "derived without policy", origin: "source-a", wantBlock: true},
 				{name: "supported policy", origin: "source-a", policy: policy},
 				{name: "malformed policy", origin: "source-a", policy: "{", wantBlock: true},
 				{name: "unknown version", origin: "source-a", policy: `{"version":4}`, wantBlock: true},
@@ -57,6 +57,7 @@ func TestPlacementPolicyPreflight(t *testing.T) {
 				{name: "undeclared demand component", origin: "source-a", policy: demand, wantBlock: true},
 				{name: "wrong origin", origin: "source-b", policy: policy, wantBlock: true},
 				{name: "deletion permits cleanup", origin: "source-a", policy: "{", deleting: true},
+				{name: "missing execution permits cleanup", origin: "source-a", deleting: true},
 			} {
 				t.Run(tt.name, func(t *testing.T) {
 					scheme := runtime.NewScheme()

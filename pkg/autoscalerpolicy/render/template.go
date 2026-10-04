@@ -99,32 +99,11 @@ func checkActionNode(action *parse.ActionNode) error {
 	return nil
 }
 
-// templateVariables returns the variable names a parsed template references.
-func templateVariables(tmpl *template.Template, into map[string]bool) {
-	if tmpl.Root == nil {
-		return
-	}
-	for _, n := range tmpl.Root.Nodes {
-		action, ok := n.(*parse.ActionNode)
-		if !ok || action.Pipe == nil {
-			continue
-		}
-		for _, cmd := range action.Pipe.Cmds {
-			for _, arg := range cmd.Args {
-				if field, ok := arg.(*parse.FieldNode); ok && len(field.Ident) == 1 {
-					into[field.Ident[0]] = true
-				}
-			}
-		}
-	}
-}
-
 // compiledPolicy is one policy generation's parsed metadata templates, keyed
 // by trigger index + metadata key.
 type compiledPolicy struct {
 	generation int64
 	templates  map[string]*template.Template
-	variables  map[string]bool
 }
 
 func templateKey(triggerIndex int, metadataKey string) string {
@@ -135,7 +114,6 @@ func templateKey(triggerIndex int, metadataKey string) string {
 func compileSpec(spec *v1beta1.AutoscalerPolicySpec) (*compiledPolicy, error) {
 	compiled := &compiledPolicy{
 		templates: map[string]*template.Template{},
-		variables: map[string]bool{},
 	}
 	if spec.Keda == nil {
 		return compiled, nil
@@ -147,7 +125,6 @@ func compileSpec(spec *v1beta1.AutoscalerPolicySpec) (*compiledPolicy, error) {
 				return nil, fmt.Errorf("trigger %d metadata %q: %w", i, key, err)
 			}
 			compiled.templates[templateKey(i, key)] = tmpl
-			templateVariables(tmpl, compiled.variables)
 		}
 	}
 	return compiled, nil

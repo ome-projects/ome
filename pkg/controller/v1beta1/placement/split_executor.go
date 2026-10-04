@@ -141,9 +141,21 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 	if err != nil {
 		return r.writeSplitObservations(ctx, accepted, observations, "PlanNotPersisted", err.Error())
 	}
-	// A drain proof belongs to the exact published plan. A revision change
+	// A drain acknowledgement belongs to the exact routing plan. A revision change
 	// invalidates it, even when the next plan retains the same zero floor.
 	changed := next.Status.Placement.Plan.ID != accepted.Status.Placement.Plan.ID
+	// Completing a transition can release the pause in a new execution policy.
+	// Observe that policy on members before declaring the accepted plan settled.
+	if step.Complete && step.Reason == "" {
+		for _, candidate := range next.Status.Placement.Candidates {
+			observed := observations[candidate.Cluster].Candidate
+			if (candidate.Allocation.DesiredReplicas > 0 || candidate.Allocation.DesiredHome != nil) &&
+				(!observed.ObservationKnown || observed.AppliedPlanID != next.Status.Placement.Plan.ID) {
+				step.Reason = "AwaitingMemberConvergence"
+				break
+			}
+		}
+	}
 	for _, candidate := range next.Status.Placement.Candidates {
 		observed := observations[candidate.Cluster]
 		assignment := candidate.Allocation
@@ -295,8 +307,8 @@ func (r *Reconciler) observeSplitMembers(ctx context.Context, source *v1beta1.In
 		known, routable, drained := plannedTrafficEvidence(source, trafficMap, observed.Candidate)
 		observed.Home.Routable, observed.Home.Drained = routable, drained
 		// Settled positive floors can release their pause without routing. Any
-		// movement or zero-floor cleanup requires verified publication because
-		// unknown traffic cannot prove that a serving home is safe to retire.
+		// movement or zero-floor cleanup requires current routing intent so a
+		// stale table cannot authorize retiring a serving home.
 		if !known && !observed.Home.Absent && (!settled || candidate.Allocation.CurrentReplicas == 0) {
 			observed.Home.Known = false
 		}

@@ -41,7 +41,7 @@ func TestRootTrafficDrainPreservesKubernetesClusterSelection(t *testing.T) {
 			service := &v1beta1.InferenceService{
 				TypeMeta:   metav1.TypeMeta{APIVersion: "ome.io/v1beta1", Kind: "InferenceService"},
 				ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "selected-namespace", UID: "uid-chat", ResourceVersion: "42", Generation: 1},
-				Spec:       v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{ClusterSelector: "region=west"}},
+				Spec:       v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{}},
 			}
 			selectedServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				assert.Equal(t, "/apis/ome.io/v1beta1/namespaces/selected-namespace/inferenceservices/chat", r.URL.Path)

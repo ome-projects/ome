@@ -32,9 +32,10 @@ func placedISVC(cluster, backendHost string) *v1beta1.InferenceService {
 		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "uid-1"},
 		Status: v1beta1.InferenceServiceStatus{
 			Placement: &v1beta1.PlacementStatus{
-				Phase:    v1beta1.PlacementPhasePlaced,
-				Cluster:  cluster,
-				Endpoint: apis.HTTPS(backendHost),
+				Phase:      v1beta1.PlacementPhasePlaced,
+				Cluster:    cluster,
+				Endpoint:   apis.HTTPS(backendHost),
+				Candidates: []v1beta1.CandidatePlacement{{Cluster: cluster, Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: apis.HTTPS(backendHost), ReadyReplicas: 1}},
 			},
 		},
 	}
@@ -178,6 +179,7 @@ func TestReconcile_RepointsOnReplacement(t *testing.T) {
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: "svc", Namespace: "prod"}, cur))
 	cur.Status.Placement.Cluster = "cluster-b"
 	cur.Status.Placement.Endpoint = apis.HTTPS("svc.prod.cloud-b.example")
+	cur.Status.Placement.Candidates = []v1beta1.CandidatePlacement{{Cluster: "cluster-b", Phase: v1beta1.CandidatePhaseAdmitted, Endpoint: cur.Status.Placement.Endpoint, ReadyReplicas: 1}}
 	require.NoError(t, c.Status().Update(context.Background(), cur))
 
 	reconcile(t, r)
@@ -580,6 +582,14 @@ func TestResolveTarget(t *testing.T) {
 		assert.False(t, ok)
 	})
 
+	t.Run("top-level winner without admitted candidates is not publishable", func(t *testing.T) {
+		isvc := placedISVC("cluster-a", "a.example.com")
+		isvc.Status.Placement.Candidates = nil
+		_, ok, err := r.resolveTarget(isvc, nil)
+		require.NoError(t, err)
+		assert.False(t, ok)
+	})
+
 	t.Run("All: admitted candidates -> one home each, sorted", func(t *testing.T) {
 		isvc := &v1beta1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"},
@@ -742,7 +752,7 @@ func TestPlacementPublishChange(t *testing.T) {
 
 	t.Run("routing opt-out transition passes", func(t *testing.T) {
 		old := base.DeepCopy()
-		old.Spec.Placement = &v1beta1.PlacementSpec{Requirements: "gpu=tpu"}
+		old.Spec.Placement = &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSingle}
 		nw := old.DeepCopy()
 		disabled := false
 		nw.Spec.Routing = &v1beta1.RoutingSpec{Enabled: &disabled}

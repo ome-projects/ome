@@ -118,6 +118,7 @@ func TestFleetMalformedLabelsDuplicatesAndPartialUncertainty(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := fixture(t)
+			withLegacySelectors(s.InferenceService, "accelerator=cpu", "provider=demo")
 			tc.mutate(&s)
 			r, _ := ProjectExplain(s, fixtureClock)
 			if string(r.Content.Fleet.State) != tc.wantState {
@@ -220,7 +221,6 @@ func TestAbsentAndUnknownEvidenceNeverSuccessfulDefaults(t *testing.T) {
 	s.InferenceService.Status.Placement.Cluster = "private-sk-proj-0123456789abcdefghijklmnopqrstuvwxyz"
 	s.InferenceService.Status.Placement.Candidates[0].Phase = "Future"
 	s.InferenceService.Spec.Placement.Split.Replicas = nil
-	s.InferenceService.Spec.Placement.Split.Spread = false
 	r, _ := ProjectStatus(s, nil)
 	if r.Content.Placement.Phase != "Unknown" || r.Content.Placement.Homes[0].Phase != "Unknown" || r.Content.Placement.ReportedCluster != "" {
 		t.Fatal("unknown success or name leak")

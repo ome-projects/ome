@@ -23889,15 +23889,6 @@ spec:
                   type: object
                 placement:
                   properties:
-                    capacityFactors:
-                      additionalProperties:
-                        anyOf:
-                          - type: integer
-                          - type: string
-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                        x-kubernetes-int-or-string: true
-                      nullable: true
-                      type: object
                     clusterAffinity:
                       items:
                         properties:
@@ -23971,9 +23962,6 @@ spec:
                       nullable: true
                       type: array
                       x-kubernetes-list-type: atomic
-                    clusterSelector:
-                      nullable: true
-                      type: string
                     maxSurge:
                       format: int32
                       minimum: 0
@@ -23987,7 +23975,6 @@ spec:
                       type: string
                     policy:
                       enum:
-                        - Legacy
                         - ClusterAffinity
                       type: string
                     replacementTimeout:
@@ -23995,31 +23982,22 @@ spec:
                       x-kubernetes-validations:
                         - message: replacementTimeout must be a positive duration
                           rule: duration(self) > duration('0s')
-                    requirements:
-                      nullable: true
-                      type: string
                     split:
                       properties:
                         maxReplicasPerCluster:
                           format: int32
                           minimum: 0
                           type: integer
-                        minReplicasPerCluster:
-                          format: int32
-                          nullable: true
-                          type: integer
                         replicas:
                           format: int32
                           minimum: 1
                           type: integer
-                        spread:
-                          nullable: true
-                          type: boolean
                       type: object
+                  required:
+                    - mode
+                    - policy
                   type: object
                   x-kubernetes-validations:
-                    - message: ClusterAffinity requires an explicit mode
-                      rule: '!has(self.policy) || self.policy != ''ClusterAffinity'' || has(self.mode)'
                     - message: replacementTimeout requires ClusterAffinity Single placement
                       rule: '!has(self.replacementTimeout) || (has(self.policy) && self.policy == ''ClusterAffinity'' && has(self.mode) && self.mode == ''Single'')'
                 rollout:
@@ -28833,9 +28811,7 @@ spec:
                   type: object
               type: object
               x-kubernetes-validations:
-                - message: spec.routing.capacityFactors and deprecated spec.placement.capacityFactors must not both be set
-                  rule: '!(has(self.routing) && has(self.routing.capacityFactors) && has(self.placement) && has(self.placement.capacityFactors))'
-                - message: ClusterAffinity placement policy cannot be removed; drain and recreate the service to use Legacy
+                - message: ClusterAffinity placement policy cannot be removed; drain and recreate the service to change placement ownership
                   rule: '!has(oldSelf.placement) || !has(oldSelf.placement.policy) || oldSelf.placement.policy != ''ClusterAffinity'' || (has(self.placement) && has(self.placement.policy) && self.placement.policy == ''ClusterAffinity'')'
             status:
               properties:

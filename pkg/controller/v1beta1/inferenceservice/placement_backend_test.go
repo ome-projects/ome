@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -48,13 +49,14 @@ func TestPlacementBackendReconcile(t *testing.T) {
 		wantHold      bool
 		wantFloorHold bool
 		wantVirtual   bool
+		wantError     string
 	}{
 		{name: "native proceeds"},
-		{name: "legacy member retains raw deployment", change: func(f *fixture) {
+		{name: "member without policy marker holds raw deployment", wantHold: true, change: func(f *fixture) {
 			delete(f.service.Annotations, constants.PlacementPolicy)
 			f.service.Spec.DeploymentMode = ptr.To(constants.RawDeployment)
 		}},
-		{name: "legacy member retains multi-node deployment", change: func(f *fixture) {
+		{name: "member without policy marker holds multi-node deployment", wantHold: true, change: func(f *fixture) {
 			delete(f.service.Annotations, constants.PlacementPolicy)
 			f.service.Spec.DeploymentMode = ptr.To(constants.MultiNode)
 		}},
@@ -116,9 +118,22 @@ func TestPlacementBackendReconcile(t *testing.T) {
 			delete(f.service.Annotations, constants.PlacementOriginUID)
 			f.service.Spec.DeploymentMode = ptr.To(constants.RawDeployment)
 		}},
-		{name: "legacy member label", change: func(f *fixture) {
+		{name: "origin label without execution holds", wantError: "require an execution policy", change: func(f *fixture) {
 			f.service.Annotations = nil
 			f.service.Labels = map[string]string{constants.PlacementOrigin: "source-a"}
+		}},
+		{name: "origin annotation without execution holds", wantError: "require an execution policy", change: func(f *fixture) {
+			delete(f.service.Annotations, constants.PlacementExecution)
+			f.service.Finalizers = nil
+		}},
+		{name: "placement without the ClusterAffinity policy holds", wantError: "ClusterAffinity", change: func(f *fixture) {
+			f.service.Annotations = nil
+			f.service.Spec.Placement = &v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeAll}
+			f.service.Finalizers = nil
+		}},
+		{name: "selector annotation holds", wantError: "unsupported", change: func(f *fixture) {
+			f.service.Annotations = map[string]string{constants.ClusterSelector: "region=east"}
+			f.service.Finalizers = nil
 		}},
 		{name: "raw engine", wantHold: true, change: func(f *fixture) { f.service.Spec.DeploymentMode = ptr.To(constants.RawDeployment) }},
 		{name: "multinode engine", wantHold: true, change: func(f *fixture) { f.service.Spec.DeploymentMode = ptr.To(constants.MultiNode) }},
@@ -173,6 +188,11 @@ func TestPlacementBackendReconcile(t *testing.T) {
 				runtime: &v1beta1.ClusterServingRuntime{ObjectMeta: metav1.ObjectMeta{Name: "runtime-a"}, Spec: v1beta1.ServingRuntimeSpec{EngineConfig: &v1beta1.EngineSpec{Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Name: "runner", Image: "example:v1"}}}}},
 			}
 			f.service.Status.Conditions = append(f.service.Status.Conditions, apis.Condition{Type: apis.ConditionReady, Status: corev1.ConditionTrue, Reason: "Serving"})
+			execution, err := protocol.Encode(&v1beta1.PlacementExecutionPolicy{PlanID: "plan-a", Revision: 1, SourceUID: "source-a", ClusterUID: "cluster-a"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.service.Annotations[constants.PlacementExecution] = execution
 			f.service.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{v1beta1.EngineComponent: {}}
 			if tt.change != nil {
 				tt.change(&f)
@@ -195,9 +215,14 @@ func TestPlacementBackendReconcile(t *testing.T) {
 				t.Fatal(err)
 			}
 			r := &InferenceServiceReconciler{Client: cl, APIReader: cl, Scheme: s, Log: logr.Discard(), Recorder: record.NewFakeRecorder(20), RuntimeSelector: runtimeselector.New(cl), Clientset: fake.NewClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: constants.InferenceServiceConfigMapName, Namespace: constants.OMENamespace}, Data: map[string]string{"deploy": f.deploy}})}
-			_, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key})
+			_, err = r.Reconcile(t.Context(), ctrl.Request{NamespacedName: key})
 			wantWrites := 1
-			if tt.wantHold || tt.wantFloorHold || tt.wantVirtual {
+			if tt.wantError != "" {
+				wantWrites = 0
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("error = %v, want %q", err, tt.wantError)
+				}
+			} else if tt.wantHold || tt.wantFloorHold || tt.wantVirtual {
 				wantWrites = 0
 				if err != nil {
 					t.Fatal(err)

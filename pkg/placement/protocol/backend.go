@@ -9,7 +9,7 @@ import (
 )
 
 // IsMember identifies a placement-owned service independently of its execution
-// envelope, including Single and All members without an allocation policy.
+// envelope, including an ownership handoff awaiting its first allocation.
 func IsMember(service *v1beta1.InferenceService) bool {
 	return service != nil && (service.Annotations[constants.PlacementOriginUID] != "" || service.Labels[constants.PlacementOrigin] != "")
 }

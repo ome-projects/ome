@@ -216,22 +216,25 @@ func TestAdvanceSplitPlanPauseAndCleanup(t *testing.T) {
 	}
 }
 
-func TestReconcileMoveRequiresPublishedDrain(t *testing.T) {
+func TestReconcileMoveUsesRoutingIntent(t *testing.T) {
 	for _, tt := range []struct {
 		name           string
 		mode           v1beta1.PlacementMode
 		cancel, absent bool
 	}{
+		{name: "All", mode: v1beta1.PlacementModeAll},
 		{name: "Split", mode: v1beta1.PlacementModeSplit},
 		{name: "Single", mode: v1beta1.PlacementModeSingle},
 		{name: "Single cancellation", mode: v1beta1.PlacementModeSingle, cancel: true},
 		{name: "Single cancellation after original loss", mode: v1beta1.PlacementModeSingle, cancel: true, absent: true},
 	} {
-		t.Run(tt.name, func(t *testing.T) { testMoveRequiresPublishedDrain(t, tt.mode, tt.cancel, tt.absent) })
+		for _, published := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/published=%t", tt.name, published), func(t *testing.T) { testMoveUsesRoutingIntent(t, tt.mode, tt.cancel, tt.absent, published) })
+		}
 	}
 }
 
-func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, cancelMove, absentOriginal bool) {
+func testMoveUsesRoutingIntent(t *testing.T, mode v1beta1.PlacementMode, cancelMove, absentOriginal, published bool) {
 	fixture := observationFixture(t)
 	source := fixture.source
 	source.Namespace = "prod"
@@ -242,6 +245,14 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 	source.Status.Placement.Candidates[0].Cluster = "a"
 	source.Status.Placement.Candidates[0].Allocation.ClusterUID = "a-uid"
 	source.Status.Placement.Candidates[0].Allocation.OriginalReplicas = 1
+	if mode == v1beta1.PlacementModeAll {
+		source.Spec.Placement.Mode, source.Spec.Placement.Split = mode, nil
+		source.Spec.Engine.MinReplicas = ptr.To(1)
+		source.Status.Placement.Plan.Mode = mode
+		home := &v1beta1.PlacementHomePolicy{InputDigest: "initial-intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: 1}}}
+		source.Status.Placement.Candidates[0].Allocation.CurrentHome = home.DeepCopy()
+		source.Status.Placement.Candidates[0].Allocation.DesiredHome = home.DeepCopy()
+	}
 	if mode == v1beta1.PlacementModeSingle {
 		source.Spec.Placement.Mode, source.Spec.Placement.Split = mode, nil
 		source.Spec.Engine.MinReplicas = ptr.To(1)
@@ -356,8 +367,10 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 				tm.Spec.Entries = append(tm.Spec.Entries, v1beta1.TrafficMapEntry{Cluster: name, Weight: weight, Endpoint: fixture.member.Status.URL})
 			}
 		}
-		tm.Status.Published, tm.Status.SourceUID = true, source.UID
-		tm.Status.ObservedTrafficMapGeneration = tm.Generation
+		tm.Status.Published, tm.Status.SourceUID = published, source.UID
+		if published {
+			tm.Status.ObservedTrafficMapGeneration = tm.Generation
+		}
 		if fresh {
 			err = root.Create(t.Context(), tm)
 		} else {
@@ -380,7 +393,7 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 		{name: "acknowledged pause permits replacement", before: func() { acknowledge("a", false); publish(map[string]int32{"a": 1}) }, current: map[string]int32{"a": 1, "b": 1}, pause: true, memberA: true},
 		{name: "unready replacement retains original", before: func() { acknowledge("a", false); publish(map[string]int32{"a": 1}) }, current: map[string]int32{"a": 1, "b": 1}, pause: true, memberA: true},
 		{name: "ready routable replacement requests drain", before: func() { acknowledge("b", true); publish(map[string]int32{"a": 1, "b": 1}) }, current: map[string]int32{"a": 1, "b": 1}, drain: true, pause: true, memberA: true},
-		{name: "published drain authorizes zero floor", before: func() { acknowledge("a", false); acknowledge("b", false); publish(map[string]int32{"a": 0, "b": 1}) }, current: map[string]int32{"a": 0, "b": 1}, drain: true, pause: true, memberA: true},
+		{name: "routing drain authorizes zero floor", before: func() { acknowledge("a", false); acknowledge("b", false); publish(map[string]int32{"a": 0, "b": 1}) }, current: map[string]int32{"a": 0, "b": 1}, drain: true, pause: true, memberA: true},
 		{name: "failed delete retains the original member", before: func() {
 			acknowledge("a", false)
 			acknowledge("b", false)
@@ -389,7 +402,7 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 				return fmt.Errorf("member delete unavailable")
 			}}))
 		}, current: map[string]int32{"a": 0, "b": 1}, drain: true, pause: true, memberA: true},
-		{name: "current zero plan publication permits deletion", before: func() {
+		{name: "current zero routing plan permits deletion", before: func() {
 			connections.m["a"] = workloadcluster.NewNeverCachingClient(workers["a"])
 			acknowledge("a", false)
 			acknowledge("b", false)
@@ -425,7 +438,7 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 				publish(map[string]int32{"a": 1, "b": 1})
 			}, current: map[string]int32{"a": 1, "b": 1}, pause: true, memberA: true},
 			{name: "acknowledged cancellation requests replacement drain", before: func() { acknowledge("a", false); acknowledge("b", false); publish(map[string]int32{"a": 1, "b": 1}) }, current: map[string]int32{"a": 1, "b": 1}, pause: true, memberA: true},
-			{name: "replacement drain must be published", before: func() { acknowledge("a", false); acknowledge("b", false); publish(map[string]int32{"a": 1, "b": 0}) }, current: map[string]int32{"a": 1, "b": 0}, pause: true, memberA: true},
+			{name: "replacement drain must be in current routing intent", before: func() { acknowledge("a", false); acknowledge("b", false); publish(map[string]int32{"a": 1, "b": 0}) }, current: map[string]int32{"a": 1, "b": 0}, pause: true, memberA: true},
 			{name: "replacement deletion retains pause", before: func() { acknowledge("a", false); acknowledge("b", false); publish(map[string]int32{"a": 1, "b": 0}) }, current: map[string]int32{"a": 1, "b": 0}, pause: true, memberA: true},
 			{name: "replacement physical cleanup completes cancellation", before: func() {
 				for _, obj := range []client.Object{&v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: fixture.resources.ir.Name, Namespace: source.Namespace}}, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fixture.resources.pods[0].Name, Namespace: source.Namespace}}} {
@@ -460,10 +473,19 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 			if stage.before != nil {
 				stage.before()
 			}
-			if _, err := r.Reconcile(t.Context(), req()); err != nil {
+			result, err := r.Reconcile(t.Context(), req())
+			if err != nil {
 				t.Fatal(err)
 			}
 			live := readSource()
+			if stage.name == "physical cleanup releases pause" {
+				if result.RequeueAfter <= 0 {
+					t.Fatal("final policy must schedule an acknowledgement observation")
+				}
+				if c := live.Status.GetCondition(v1beta1.PlacementConverged); c == nil || c.Status == corev1.ConditionTrue {
+					t.Fatalf("unobserved final policy reported convergence: %+v", c)
+				}
+			}
 			if mode == v1beta1.PlacementModeSingle {
 				winner := "a"
 				if !cancelMove && (stage.drain || stage.current["a"] == 0) {
@@ -494,7 +516,7 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 				t.Error(diff)
 			}
 			member := &v1beta1.InferenceService{}
-			err := workers["a"].Get(t.Context(), client.ObjectKeyFromObject(source), member)
+			err = workers["a"].Get(t.Context(), client.ObjectKeyFromObject(source), member)
 			if diff := cmp.Diff(stage.memberA, err == nil); diff != "" {
 				t.Errorf("original member existence (-want +got):\n%s", diff)
 			}
@@ -502,6 +524,33 @@ func testMoveRequiresPublishedDrain(t *testing.T, mode v1beta1.PlacementMode, ca
 			return
 		}
 	}
+	if !cancelMove {
+		for attempt := 0; attempt < 3; attempt++ {
+			acknowledge("b", false)
+			publish(map[string]int32{"b": 1})
+			result, err := r.Reconcile(t.Context(), req())
+			if err != nil {
+				t.Fatal(err)
+			}
+			live := readSource()
+			if c := live.Status.GetCondition(v1beta1.PlacementConverged); c != nil && c.Status == corev1.ConditionTrue {
+				for _, c := range live.Status.Placement.Candidates {
+					if c.Allocation.DesiredReplicas > 0 && c.AppliedPlanID != live.Status.Placement.Plan.ID {
+						t.Fatal("final member acknowledgement is stale")
+					}
+				}
+				if c := live.Status.GetCondition(v1beta1.PlacementSatisfied); c == nil || c.Status != corev1.ConditionTrue {
+					t.Fatalf("final plan not satisfied: %+v", c)
+				}
+				return
+			}
+			if result.RequeueAfter <= 0 {
+				t.Fatal("unacknowledged plan stopped reconciling")
+			}
+		}
+		t.Fatal("final member policy did not converge")
+	}
+
 }
 
 func TestAdoptSplitMembers(t *testing.T) {
