@@ -356,8 +356,8 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 	newBaseModel := new.(*v1beta1.BaseModel)
 
 	if !newBaseModel.ObjectMeta.DeletionTimestamp.IsZero() {
-		w.logger.Infof("Resource has deletion timestamp: BaseModel '%s', processing delete", newBaseModel.Name)
-		w.deleteBaseModel(newBaseModel)
+		w.logger.Infof("Resource has deletion timestamp: BaseModel '%s/%s', processing delete", newBaseModel.Namespace, newBaseModel.Name)
+		w.enqueueBaseModelDelete(newBaseModel)
 		return
 	}
 
@@ -491,6 +491,11 @@ func (w *Scout) deleteBaseModel(obj interface{}) {
 		return
 	}
 
+	w.logger.Infof("BaseModel delete event received: %s/%s", baseModel.Namespace, baseModel.Name)
+	w.enqueueBaseModelDelete(baseModel)
+}
+
+func (w *Scout) enqueueBaseModelDelete(baseModel *v1beta1.BaseModel) {
 	w.logger.Infof("Deleting BaseModel: %s in namespace %s", baseModel.Name, baseModel.Namespace)
 
 	gopherTask := &GopherTask{
@@ -498,7 +503,10 @@ func (w *Scout) deleteBaseModel(obj interface{}) {
 		BaseModel: baseModel,
 	}
 
+	w.logger.Infof("Delete task enqueue start: %s/%s", baseModel.Namespace, baseModel.Name)
 	w.gopherChan <- gopherTask
+	// Completion means the channel receiver accepted the task, not that cleanup finished.
+	w.logger.Infof("Delete task enqueue complete: %s/%s", baseModel.Namespace, baseModel.Name)
 }
 
 func (w *Scout) deleteClusterBaseModel(obj interface{}) {
@@ -532,7 +540,7 @@ func (w *Scout) reconcilePendingDeletions() {
 			if !baseModel.ObjectMeta.DeletionTimestamp.IsZero() {
 				w.logger.Infof("Found BaseModel with deletion timestamp during startup: %s in namespace %s",
 					baseModel.Name, baseModel.Namespace)
-				w.deleteBaseModel(baseModel)
+				w.enqueueBaseModelDelete(baseModel)
 			}
 		}
 	}
