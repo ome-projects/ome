@@ -1,0 +1,23 @@
+title: Optional Dragonfly Model Download Transport
+oep-number: "0012"
+authors:
+  - "@heymrbox"
+status: provisional
+creation-date: 2026-10-02
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+# The target maturity stage in the current dev cycle for this OEP.
+stage: alpha
+
+# OME can disable this feature by selecting the direct transport. Dragonfly is
+# never required to run OME.
+disable-supported: true
+
+metrics:
+  - model_agent_download_transport_requests_total
+  - model_agent_download_transport_fallbacks_total
+  - model_agent_download_transport_duration_seconds
+  - model_agent_download_transport_available
