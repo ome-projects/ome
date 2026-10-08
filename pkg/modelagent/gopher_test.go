@@ -332,8 +332,7 @@ func (m *mockClusterBaseModelLister) Get(name string) (*v1beta1.ClusterBaseModel
 	return nil, apierrors.NewNotFound(schema.GroupResource{Group: "ome.io", Resource: "clusterbasemodels"}, name)
 }
 
-// TestIsPathReferencedByOtherModels tests the isPathReferencedByOtherModels method
-func TestIsPathReferencedByOtherModels(t *testing.T) {
+func TestCollectReferencedPaths(t *testing.T) {
 	// Create a test logger
 	logger, _ := zap.NewDevelopment()
 	sugaredLogger := logger.Sugar()
@@ -567,7 +566,8 @@ func TestIsPathReferencedByOtherModels(t *testing.T) {
 			}
 
 			// Call the method under test
-			result, err := gopher.isPathReferencedByOtherModels(targetPath, tc.excludeBaseModel, tc.excludeClusterBaseModel)
+			paths, err := gopher.collectReferencedPaths(targetPath, tc.excludeBaseModel, tc.excludeClusterBaseModel)
+			result := len(paths) != 0
 
 			// Check error conditions
 			if tc.expectedError {

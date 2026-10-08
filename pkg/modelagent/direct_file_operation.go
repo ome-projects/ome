@@ -3,7 +3,6 @@ package modelagent
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/gofrs/flock"
@@ -58,25 +57,12 @@ func usesArtifactTaskCoordinator(task *GopherTask) bool {
 
 func (s *Gopher) tryLockDirectModelPath(ctx context.Context, path string) (bool, error) {
 	locks := ctx.Value(directFileOperationKey{}).(map[string]*flock.Flock)
-	path, err := filepath.Abs(path)
+	path, err := canonicalModelPath(path)
 	if err != nil {
 		return false, err
 	}
 	if path == string(filepath.Separator) {
 		return false, fmt.Errorf("direct model destination cannot be the filesystem root")
-	}
-	// Resolve directory aliases, including an ordinary symlinked model root.
-	// Keep the leaf unresolved: deleting a legacy child removes its link.
-	for ancestor := filepath.Dir(path); ; ancestor = filepath.Dir(ancestor) {
-		resolved, err := filepath.EvalSymlinks(ancestor)
-		if err == nil {
-			relative, _ := filepath.Rel(ancestor, path)
-			path = filepath.Join(resolved, relative)
-			break
-		}
-		if !os.IsNotExist(err) || ancestor == filepath.Dir(ancestor) {
-			return false, err
-		}
 	}
 	if locks[path] != nil {
 		return true, nil

@@ -694,7 +694,7 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 				// check if it needs to skip artifact deletion
 				isSkippingDeletion, _, _, _ := s.isSkippingArtifactDeletion(ctx, task, destPath, false)
 				if !isSkippingDeletion {
-					err = s.deleteModel(destPath, task)
+					err = s.deleteModel(ctx, destPath, task)
 					if err != nil {
 						s.logger.Errorf("Failed to delete model %s: %v", modelInfo, err)
 						return err
@@ -720,7 +720,7 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 				isSkippingDeletion, isRemoveParent, parentName, parentDir := s.isSkippingArtifactDeletion(ctx, task, destPath, true)
 
 				if !isSkippingDeletion {
-					err = s.deleteModel(destPath, task)
+					err = s.deleteModel(ctx, destPath, task)
 					if err != nil {
 						s.logger.Errorf("Failed to delete Hugging Face model %s: %v", modelInfo, err)
 						return err
@@ -739,15 +739,6 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 						keepDeleteBarrier = err == nil
 						return err
 					}
-					// A parent writer may have completed since the first lookup.
-					referenced, err := s.isPathReferencedByOtherModels(parentDir, nil, nil)
-					if err != nil {
-						s.logger.Warnf("Cannot check references for parent model artifact directory %s: %v", parentDir, err)
-						break
-					}
-					if referenced {
-						break
-					}
 					if !s.isRemoveParentArtifactDirectory(ctx, false, parentName, parentDir) {
 						break
 					}
@@ -759,11 +750,11 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 					}
 					s.logger.Infof("parent %s:%s has other directory points to: %v", parentName, parentDir, isParentHasSymbolicLinkPointedTo)
 					if !isParentHasSymbolicLinkPointedTo {
-						err = s.deleteModel(parentDir, nil)
+						err = s.deleteModel(ctx, parentDir, nil)
 						if err != nil {
-							s.logger.Errorf("fail to delete parent model artifact directory %s: %s", parentName, parentDir)
+							return fmt.Errorf("clean up parent model artifact directory %s: %w", parentDir, err)
 						}
-						s.logger.Infof("Successfully delete parent model artifact directory %s: %s", parentName, parentDir)
+						s.logger.Infof("Completed parent model artifact cleanup %s: %s", parentName, parentDir)
 					}
 				} else {
 					s.logger.Infof("no need to delete parent model artifact directory %s: %s", parentName, parentDir)
@@ -928,50 +919,6 @@ func (s *Gopher) shouldSkipStaleDownloadTask(task *GopherTask) (bool, bool) {
 	}
 
 	return false, false
-}
-
-// isPathReferencedByOtherModels checks if the given path is still referenced by other BaseModel or ClusterBaseModel resources
-// excluding the model being deleted
-func (s *Gopher) isPathReferencedByOtherModels(targetPath string, excludeBaseModel *v1beta1.BaseModel, excludeClusterBaseModel *v1beta1.ClusterBaseModel) (bool, error) {
-	// Check BaseModels
-	baseModels, err := s.baseModelLister.List(labels.Everything())
-	if err != nil {
-		return false, fmt.Errorf("failed to list BaseModels: %w", err)
-	}
-
-	for _, baseModel := range baseModels {
-		// Skip the model being deleted
-		if excludeBaseModel != nil && baseModel.Namespace == excludeBaseModel.Namespace && baseModel.Name == excludeBaseModel.Name {
-			continue
-		}
-
-		// Check if this BaseModel references the same path
-		if baseModel.Spec.Storage.Path != nil && *baseModel.Spec.Storage.Path == targetPath {
-			s.logger.Infof("Path %s is still referenced by BaseModel %s/%s", targetPath, baseModel.Namespace, baseModel.Name)
-			return true, nil
-		}
-	}
-
-	// Check ClusterBaseModels
-	clusterBaseModels, err := s.clusterBaseModelLister.List(labels.Everything())
-	if err != nil {
-		return false, fmt.Errorf("failed to list ClusterBaseModels: %w", err)
-	}
-
-	for _, clusterBaseModel := range clusterBaseModels {
-		// Skip the model being deleted
-		if excludeClusterBaseModel != nil && clusterBaseModel.Name == excludeClusterBaseModel.Name {
-			continue
-		}
-
-		// Check if this ClusterBaseModel references the same path
-		if clusterBaseModel.Spec.Storage.Path != nil && *clusterBaseModel.Spec.Storage.Path == targetPath {
-			s.logger.Infof("Path %s is still referenced by ClusterBaseModel %s", targetPath, clusterBaseModel.Name)
-			return true, nil
-		}
-	}
-
-	return false, nil
 }
 
 // isLinkedByOtherModel reports whether another model's path is a symlink to the
@@ -1662,10 +1609,28 @@ func (s *Gopher) verifyDownloadedFilesWithValidator(ctx context.Context, uris []
 	return errors
 }
 
-func (s *Gopher) deleteModel(destPath string, task *GopherTask) error {
+func (s *Gopher) deleteModel(ctx context.Context, destPath string, task *GopherTask) error {
 	startTime := time.Now()
-
-	err := os.RemoveAll(destPath)
+	path, err := canonicalModelPath(destPath)
+	if err != nil {
+		return err
+	}
+	if path == string(filepath.Separator) {
+		return fmt.Errorf("model deletion target cannot be the filesystem root")
+	}
+	var baseModel *v1beta1.BaseModel
+	var clusterBaseModel *v1beta1.ClusterBaseModel
+	if task != nil {
+		baseModel, clusterBaseModel = task.BaseModel, task.ClusterBaseModel
+	}
+	protectedPaths, err := s.collectReferencedPaths(destPath, baseModel, clusterBaseModel)
+	if err != nil {
+		return err
+	}
+	retained, err := removeUnreferencedFiles(ctx, path, protectedPaths)
+	if retained && err == nil {
+		s.logger.Infof("Preserved model directory %s after cleanup; referenced paths: %v", destPath, protectedPaths)
+	}
 
 	// Log deletion time regardless of success or failure
 	deleteTime := time.Since(startTime)
@@ -1676,7 +1641,7 @@ func (s *Gopher) deleteModel(destPath string, task *GopherTask) error {
 		modelType, namespace, name := GetModelTypeNamespaceAndName(task)
 		// We could add a dedicated deletion metric in the future
 		// For now just log with context
-		s.logger.Infof("Completed deletion of %s model %s/%s in %v",
+		s.logger.Infof("Completed artifact cleanup of %s model %s/%s in %v",
 			modelType, namespace, name, deleteTime.Round(time.Millisecond))
 	}
 
@@ -1794,7 +1759,7 @@ func (s *Gopher) processLocalStorageModel(ctx context.Context, task *GopherTask,
 isSkippingArtifactDeletion decides whether to preserve a model artifact directory during deletion.
 
 Consider 3 aspects:
-1) If the path is still referenced by other BaseModel/ClusterBaseModel objects (excluding the current task's model),
+1) If the exact path is still referenced by another BaseModel/ClusterBaseModel (descendants allow selective cleanup),
 2) If the model resource (BaseModel or ClusterBaseModel) carries the reserve label (models.ome/reserve-model-artifact=true),
 3) If it needs to consider children path, inspect the node-scoped ConfigMap entry for this model for existence of children paths, and whether another model's path is still a symlink to it
 
@@ -1812,15 +1777,23 @@ Returns:
 */
 func (s *Gopher) isSkippingArtifactDeletion(ctx context.Context, task *GopherTask, destPath string, needsConsiderChildrenPath bool) (bool, bool, string, string) {
 	// Double-check if the path is still referenced by other models
-	isReferenced, err := s.isPathReferencedByOtherModels(destPath, task.BaseModel, task.ClusterBaseModel)
+	protectedPaths, err := s.collectReferencedPaths(destPath, task.BaseModel, task.ClusterBaseModel)
 	if err != nil {
 		// Cannot determine if the path is referenced; skip deletion to be safe
 		s.logger.Errorf("Failed to check if path %s is referenced by other models, skip the path deletion: %v", destPath, err)
 		return true, false, "", ""
 	}
-	if isReferenced {
+	target, err := canonicalModelPath(destPath)
+	if err != nil {
+		s.logger.Errorf("Cannot resolve artifact deletion path %s: %v", destPath, err)
 		return true, false, "", ""
 	}
+	for _, path := range protectedPaths {
+		if path == target {
+			return true, false, "", ""
+		}
+	}
+	// Descendant references allow selective cleanup in deleteModel.
 
 	// check whether the model CR has reserved label
 	hasReserveLabel := s.isReservingModelArtifact(task)
