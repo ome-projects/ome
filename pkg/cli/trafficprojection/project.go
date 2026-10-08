@@ -379,7 +379,7 @@ func (b *projector) projectEndpoints() {
 }
 
 func (b *projector) projectCanary() {
-	groups := omerollout.CanaryGroups(b.isvc)
+	groups := omerollout.CanaryGroups(b.isvc, omerollout.Policies{})
 	if len(groups) == 0 {
 		if b.isvc.Status.Canary != nil {
 			b.addIssue(reportv1alpha1.TrafficIssueCanaryInvalid, "", true)

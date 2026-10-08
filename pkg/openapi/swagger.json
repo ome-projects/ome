@@ -2020,7 +2020,7 @@
           "x-kubernetes-list-type": "atomic"
         },
         "weight": {
-          "description": "Weight is permitted only for static Split. If any term has an explicit weight, matching term weights add and omitted weights contribute one. Omission must be preserved to distinguish unweighted overlapping terms.",
+          "description": "Weight is permitted only for static Split. If any term has an explicit weight, matching term weights add and omitted weights contribute one. Omission must be preserved to distinguish unweighted overlapping terms. Weights are replica ratios, so they have no upper bound.",
           "type": "integer",
           "format": "int32"
         }
@@ -4042,6 +4042,11 @@
         "traffic": {
           "description": "Traffic configures the load-balancing policy applied to all HTTPRoutes OME emits for this InferenceService. See the TrafficSpec doc for details.",
           "$ref": "#/definitions/v1beta1.TrafficSpec"
+        },
+        "ttlSecondsAfterCreation": {
+          "description": "TTLSecondsAfterCreation limits how long this InferenceService lives. Once that many seconds have passed since its creationTimestamp, the controller deletes it, and garbage collection removes everything it owns. Unset means it lives until deleted. The deadline is computed from creationTimestamp on every reconcile, so changing or clearing the field moves or cancels it. Placement member copies ignore it; the source InferenceService's TTL governs them.",
+          "type": "integer",
+          "format": "int64"
         }
       }
     },
@@ -6045,7 +6050,7 @@
           "x-kubernetes-list-type": "atomic"
         },
         "maxSurge": {
-          "description": "MaxSurge is the whole-replica allowance shared by placement transitions and local rollout surge. Omission blocks disruptive movement between homes.",
+          "description": "Deprecated: MaxSurge is ignored. A placement move may hold one extra full copy of the desired allocation; admission warns when this is set.",
           "type": "integer",
           "format": "int32"
         },

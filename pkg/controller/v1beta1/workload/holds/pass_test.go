@@ -70,6 +70,18 @@ func TestRun_SkipsRowsNoFactMayTouch(t *testing.T) {
 		}
 	})
 
+	t.Run("a parked attempt in either phase", func(t *testing.T) {
+		for _, phase := range []types.InstancePhase{types.InstancePhaseUpdating, types.InstancePhaseFailed} {
+			row := types.InstanceStatus{Index: 0, Phase: phase, Operation: &types.InstanceOperation{
+				Type: types.InstanceOperationUpdate, Step: types.UpdateStepParked, TargetRevision: "rev-b",
+				Waiting: string(types.RolloutHoldGateRetryBlock),
+			}}
+			if got := run(t, row, false).waiting(0); got != string(types.RolloutHoldGateRetryBlock) {
+				t.Errorf("%s: waiting = %q, want the parked attempt's own wait left alone", phase, got)
+			}
+		}
+	})
+
 	t.Run("the pause releases on both", func(t *testing.T) {
 		row := creatingRow(types.WaitingReasonPaused)
 		row.Phase = types.InstancePhaseFailed

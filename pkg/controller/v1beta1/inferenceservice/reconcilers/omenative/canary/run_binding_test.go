@@ -46,18 +46,18 @@ func bindRun(t *testing.T, isvc *v1beta1.InferenceService, g *v1beta1.RolloutGro
 
 func TestActiveCanaryTargetIDIsGroupScoped(t *testing.T) {
 	isvc := canaryRunFixture()
-	want := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc))
+	want := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc, rollout.Policies{}))
 	if want == "" {
 		t.Fatal("target ID must be populated")
 	}
 
 	isvc.Status.Rollout.ActiveRun.TargetRevisions[2].Revision = "decoder-b"
-	if got := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc)); got != want {
+	if got := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc, rollout.Policies{})); got != want {
 		t.Fatalf("unrelated target changed canary identity: %q -> %q", want, got)
 	}
 
 	isvc.Status.Rollout.ActiveRun.TargetRevisions[1].Revision = "engine-c"
-	if got := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc)); got == want {
+	if got := activeCanaryTargetID(isvc, rollout.CanaryGroup(isvc, rollout.Policies{})); got == want {
 		t.Fatalf("canary-group target change did not change identity: %q", got)
 	}
 }
@@ -72,7 +72,7 @@ func TestBindRunAtomicallyResetsFreshRun(t *testing.T) {
 		RolledBackRevisionHash: "router-rejected",
 	}
 
-	bindRun(t, isvc, rollout.CanaryGroup(isvc), false)
+	bindRun(t, isvc, rollout.CanaryGroup(isvc, rollout.Policies{}), false)
 	cs := isvc.Status.Canary
 	if cs.TargetID == "" || cs.TargetID == "old-target" {
 		t.Fatalf("fresh run target ID was not bound: %+v", cs)
@@ -96,7 +96,7 @@ func TestBindRunAdoptsWithoutRestart(t *testing.T) {
 		CurrentStep:        1,
 	}
 
-	bindRun(t, isvc, rollout.CanaryGroup(isvc), true)
+	bindRun(t, isvc, rollout.CanaryGroup(isvc, rollout.Policies{}), true)
 	cs := isvc.Status.Canary
 	if cs.TargetID == "" {
 		t.Fatal("adopted state must be bound to the canary target set")
@@ -140,7 +140,7 @@ func twoUnitRunFixture() *v1beta1.InferenceService {
 // happened.
 func TestBindRunLeavesAnIdleUnitWithoutState(t *testing.T) {
 	isvc := twoUnitRunFixture()
-	for _, g := range rollout.CanaryGroups(isvc) {
+	for _, g := range rollout.CanaryGroups(isvc, rollout.Policies{}) {
 		bindRun(t, isvc, g, false)
 	}
 	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent); cs != nil {
@@ -158,7 +158,7 @@ func TestBindRunLeavesAnIdleUnitWithoutState(t *testing.T) {
 func TestBindRunSkipsAUnitWithoutAStableRevision(t *testing.T) {
 	isvc := twoUnitRunFixture()
 	isvc.Status.Rollout.ActiveRun.TargetRevisions[0].StableRevision = ""
-	bindRun(t, isvc, rollout.CanaryGroups(isvc)[0], false)
+	bindRun(t, isvc, rollout.CanaryGroups(isvc, rollout.Policies{})[0], false)
 	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.RouterComponent); cs != nil {
 		t.Fatalf("a unit with no stable revision was handed run state: %+v", cs)
 	}
@@ -180,7 +180,7 @@ func TestBindRunRemovesTheRequestOfTheRolledBackTarget(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithObjects(isvc).Build()
 
-	if err := BindRun(context.Background(), c, isvc, rollout.CanaryGroup(isvc), false); err != nil {
+	if err := BindRun(context.Background(), c, isvc, rollout.CanaryGroup(isvc, rollout.Policies{}), false); err != nil {
 		t.Fatal(err)
 	}
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.RouterComponent)
@@ -204,7 +204,7 @@ func TestBindRunKeepsAnUnappliedRollbackRequest(t *testing.T) {
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithObjects(isvc).Build()
 
-	if err := BindRun(context.Background(), c, isvc, rollout.CanaryGroup(isvc), false); err != nil {
+	if err := BindRun(context.Background(), c, isvc, rollout.CanaryGroup(isvc, rollout.Policies{}), false); err != nil {
 		t.Fatal(err)
 	}
 	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.RouterComponent); cs == nil || cs.CanaryRevisionHash != "router-a" {

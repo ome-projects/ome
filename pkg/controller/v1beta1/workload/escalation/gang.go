@@ -48,12 +48,13 @@ func gangRowOwnedElsewhere(op *types.InstanceOperation) bool {
 }
 
 // gangVerdictActionable reports whether a terminal PodGroup verdict may
-// end this row. There must be an attempt in flight to end — the Failed
-// stamp is a no-op without one, so announcing it would re-fire the same
-// event every pass — and the row's owner must be one this arm may take
-// it from.
-func gangVerdictActionable(op *types.InstanceOperation) bool {
-	return op != nil && !gangRowOwnedElsewhere(op)
+// end this row. There must be an operation in flight to end — a settled
+// row, a parked attempt included, has none, and a Migrating row pinned by
+// its phase alone carries none for the Failed stamp to keep, so either
+// would re-fire the same event every pass — and the row's owner must be
+// one this arm may take it from.
+func gangVerdictActionable(row *types.InstanceStatus) bool {
+	return row.Operation != nil && types.InFlight(row) && !gangRowOwnedElsewhere(row.Operation)
 }
 
 // gangFailureSummary is the operator-facing reason for a terminal gang
@@ -69,7 +70,9 @@ func gangFailureSummary(reason, message string) string {
 // escalateGangFailure ends an attempt whose PodGroup name belongs to
 // another controller. ENVIRONMENT-CAUSED: no corrected pod template
 // frees a name someone else owns, so the revision keeps a clean retry
-// ladder, and the Operation is preserved for the gang abandon path.
+// ladder. The Operation is kept: it records the attempt the verdict ended,
+// which no pass re-drives at the revision it pinned, and a gang surge's
+// continuation drives the abandon path.
 //
 // Idempotent announcement: the stamp is a no-op on a row already Failed
 // for this reason, so the warning is withheld there too. Nothing clears

@@ -3,14 +3,18 @@ package placement
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
@@ -136,20 +140,57 @@ func TestVerifiedMemberAdmission(t *testing.T) {
 	}
 }
 
+// busyMemberReads matches the reads of a member whose service and components
+// are rewritten between any two reads of them.
+func busyMemberReads(obj client.Object) bool {
+	switch obj.(type) {
+	case *v1beta1.InferenceReplica, *metav1.PartialObjectMetadata, *v1beta1.InferenceService:
+		return true
+	}
+	return false
+}
+
 func TestObserveHomeWholeGangAdmission(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
 		edit     func(*plannedObservationFixture)
 		admitted int32
 		unknown  bool
+		errText  string
 	}{
 		{name: "complete gang", admitted: 1},
 		{name: "missing worker", edit: func(f *plannedObservationFixture) { f.resources.pods = f.resources.pods[:1] }},
 		{name: "gated worker", edit: func(f *plannedObservationFixture) {
 			f.resources.pods[1].Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "example.com/admission"}}
 		}},
-		{name: "foreign component", edit: func(f *plannedObservationFixture) { f.resources.ir.OwnerReferences[0].UID = "foreign" }, unknown: true},
+		{name: "busy component is observed", edit: func(f *plannedObservationFixture) {
+			f.intercept = busyReads(0, busyMemberReads)
+		}, admitted: 1},
+		{name: "worker created after the component snapshot completes the gang", edit: func(f *plannedObservationFixture) {
+			worker := f.resources.pods[1].DeepCopy()
+			f.resources.pods = f.resources.pods[:1]
+			f.afterFirstComponentRead(func(ctx context.Context, c client.WithWatch) error { return c.Create(ctx, worker) })
+		}, admitted: 1},
+		{name: "worker gone before the pod list withholds credit", edit: func(f *plannedObservationFixture) {
+			gone := client.ObjectKeyFromObject(&f.resources.pods[1])
+			f.afterFirstComponentRead(func(ctx context.Context, c client.WithWatch) error {
+				return c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: gone.Name, Namespace: gone.Namespace}})
+			})
+		}},
+		{name: "foreign component", edit: func(f *plannedObservationFixture) { f.resources.ir.OwnerReferences[0].UID = "foreign" }, unknown: true, errText: "has unverified service ownership"},
+		{name: "busy foreign component stays unknown", edit: func(f *plannedObservationFixture) {
+			f.resources.ir.OwnerReferences[0].UID = "foreign"
+			f.intercept = busyReads(0, busyMemberReads)
+		}, unknown: true, errText: "has unverified service ownership"},
+		{name: "pod owned through another kind", edit: func(f *plannedObservationFixture) { f.resources.pods[1].OwnerReferences[0].Kind = "Deployment" }, unknown: true, errText: "has unverified component ownership"},
 		{name: "unverified gang", edit: func(f *plannedObservationFixture) { f.extraObjects = nil }, unknown: true},
+		{name: "gang owned by another component", edit: func(f *plannedObservationFixture) {
+			group := testMemberPodGroup(f.resources.ir)
+			owner := group.GetOwnerReferences()
+			owner[0].UID = "foreign"
+			group.SetOwnerReferences(owner)
+			f.extraObjects = []client.Object{group}
+		}, unknown: true, errText: "has unverified component identity"},
 		{name: "unreadable pod inventory", edit: func(f *plannedObservationFixture) {
 			f.intercept.List = func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
 				return fmt.Errorf("pod inventory unavailable")
@@ -163,18 +204,7 @@ func TestObserveHomeWholeGangAdmission(t *testing.T) {
 				list.SetContinue("more")
 				return nil
 			}
-		}, unknown: true},
-		{name: "changing component", edit: func(f *plannedObservationFixture) {
-			f.intercept.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if err := c.Get(ctx, key, obj, opts...); err != nil {
-					return err
-				}
-				if _, ok := obj.(*metav1.PartialObjectMetadata); ok {
-					obj.SetResourceVersion("changed")
-				}
-				return nil
-			}
-		}, unknown: true},
+		}, unknown: true, errText: "member pod inventory is incomplete"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			f := observationFixture(t)
@@ -199,6 +229,9 @@ func TestObserveHomeWholeGangAdmission(t *testing.T) {
 			if diff := cmp.Diff(tt.unknown, got.state == homeUnknown); diff != "" {
 				t.Fatalf("observation (-want +got):\n%s; %v", diff, got.err)
 			}
+			if tt.errText != "" && (got.err == nil || !strings.Contains(got.err.Error(), tt.errText)) {
+				t.Fatalf("observation error = %v, want %q", got.err, tt.errText)
+			}
 			if diff := cmp.Diff(tt.admitted, got.candidate.AdmittedReplicas); diff != "" {
 				t.Errorf("admission (-want +got):\n%s", diff)
 			}
@@ -206,6 +239,110 @@ func TestObserveHomeWholeGangAdmission(t *testing.T) {
 				t.Errorf("readiness (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// TestComponentIRStatusesListsPodsAfterEveryComponentRead pins the read order
+// admission is verified in: one read per component, then one Pod list, so the
+// cohort is at least as current as every status that claims admission.
+func TestComponentIRStatusesListsPodsAfterEveryComponentRead(t *testing.T) {
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "svc", UID: "member-uid"}}
+	declareComponent(isvc, v1beta1.EngineComponent)
+	declareComponent(isvc, v1beta1.DecoderComponent)
+	engine := placementIR(v1beta1.EngineComponent, v1beta1.OMENativeInstanceReady, true)
+	decoder := placementIR(v1beta1.DecoderComponent, v1beta1.OMENativeInstanceReady, true)
+	var reads []string
+	record := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			reads = append(reads, fmt.Sprintf("%T %s", obj, key.Name))
+			return c.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			reads = append(reads, fmt.Sprintf("%T", list))
+			return c.List(ctx, list, opts...)
+		},
+	}
+	worker := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(observedWorkerObjects(isvc, engine, decoder)...).WithInterceptorFuncs(record).Build()
+	statuses, err := componentIRStatuses(t.Context(), (&Reconciler{}).instanceStatusReader(worker), isvc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !AllComponentsAdmitted(isvc, statuses) {
+		t.Fatal("fixture does not exercise admission verification")
+	}
+	want := []string{"*v1beta1.InferenceReplica svc-engine", "*v1beta1.InferenceReplica svc-decoder", "*v1.PodList"}
+	if diff := cmp.Diff(want, reads); diff != "" {
+		t.Errorf("member reads (-want +got):\n%s", diff)
+	}
+}
+
+// TestStandingObservationOfBusyMembers runs the standing pass over members
+// whose service and every component are rewritten between any two reads of
+// them. Every home is present and admitted, and the source renders Ready.
+func TestStandingObservationOfBusyMembers(t *testing.T) {
+	f := observationFixture(t)
+	container := corev1.Container{Name: "ome-container", Image: "img"}
+	f.source.Spec.Decoder = &v1beta1.DecoderSpec{PodSpec: v1beta1.PodSpec{Containers: []corev1.Container{container}}}
+	f.source.Spec.Router = &v1beta1.RouterSpec{PodSpec: v1beta1.PodSpec{Containers: []corev1.Container{container}}}
+	members := []string{"member-a", "member-b", "member-c"}
+	f.source.Status.Placement.Candidates = nil
+	for _, name := range members {
+		f.source.Status.Placement.Candidates = append(f.source.Status.Placement.Candidates, v1beta1.CandidatePlacement{
+			Cluster: name, Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: types.UID(name + "-uid"), CurrentReplicas: 1, DesiredReplicas: 1},
+		})
+	}
+	scheme := testScheme(t)
+	connections := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}
+	controlPlane := []client.Object{f.source}
+	var registrations []v1beta1.WorkloadCluster
+	for _, name := range members {
+		member := DeriveISVC(f.source, "", "")
+		member.UID, member.Generation = types.UID(name+"-service"), 3
+		member.Status.URL = &apis.URL{Scheme: "https", Host: name + ".example.com"}
+		member.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{Status: corev1.ConditionTrue})
+		objects := []client.Object{member}
+		for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+			ir := f.resources.ir.DeepCopy()
+			ir.Name, ir.UID, ir.Spec.Component = fmt.Sprintf("%s-%s", member.Name, component), types.UID(fmt.Sprintf("%s-%s", name, component)), component
+			ir.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(member, v1beta1.SchemeGroupVersion.WithKind("InferenceService"))}
+			pod := f.resources.pods[0].DeepCopy()
+			pod.Name, pod.UID = fmt.Sprintf("%s-0", component), types.UID(fmt.Sprintf("%s-%s-pod", name, component))
+			pod.OwnerReferences[0].Name, pod.OwnerReferences[0].UID = ir.Name, ir.UID
+			objects = append(objects, ir, pod)
+		}
+		worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithInterceptorFuncs(busyReads(0, busyMemberReads)).Build()
+		connections.m[name] = workloadcluster.NewNeverCachingClient(worker)
+		registration := readyWC(name, nil)
+		controlPlane = append(controlPlane, registration)
+		registrations = append(registrations, *registration)
+	}
+	r, root := newPlacer(scheme, connections, controlPlane...)
+	observations := r.observeStandingHomes(t.Context(), f.source, registrations)
+	for _, name := range members {
+		type home struct {
+			Present, Serving bool
+			Phase            v1beta1.CandidatePlacementPhase
+			Admitted, Ready  int32
+		}
+		observed := observations.homes[name]
+		got := home{observed.state == homePresent, observed.serving, observed.candidate.Phase, observed.candidate.AdmittedReplicas, observed.candidate.ReadyReplicas}
+		if diff := cmp.Diff(home{Present: true, Serving: true, Phase: v1beta1.CandidatePhaseAdmitted, Admitted: 1, Ready: 1}, got); diff != "" {
+			t.Errorf("%s (-want +got):\n%s; %v", name, diff, observed.err)
+		}
+	}
+	source := &v1beta1.InferenceService{}
+	if err := root.Get(t.Context(), client.ObjectKeyFromObject(f.source), source); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.writeObservedPlacement(t.Context(), source, observations); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Get(t.Context(), client.ObjectKeyFromObject(f.source), source); err != nil {
+		t.Fatal(err)
+	}
+	ready := source.Status.GetCondition(apis.ConditionReady)
+	if ready == nil || ready.Status != corev1.ConditionTrue {
+		t.Errorf("source readiness = %+v, want True", ready)
 	}
 }
 

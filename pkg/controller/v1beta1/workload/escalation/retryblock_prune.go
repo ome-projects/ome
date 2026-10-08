@@ -54,9 +54,14 @@ func PruneSupersededRetryBlocks(ctx context.Context, input types.ReconcileInput,
 	if target != nil {
 		keep(target.Name)
 	}
+	// Only an operation that still claims its verb references its
+	// revision. A parked attempt's pin is history: its next attempt is the
+	// roll's at the target, so the block it stood behind goes with the
+	// revision it names once that revision is superseded.
 	for i := range input.ObservedState.InstanceStatuses {
-		if op := input.ObservedState.InstanceStatuses[i].Operation; op != nil {
-			keep(op.TargetRevision)
+		row := &input.ObservedState.InstanceStatuses[i]
+		if types.ClaimOf(row) != types.OwnerNone {
+			keep(row.Operation.TargetRevision)
 		}
 	}
 	var pruned []string

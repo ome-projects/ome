@@ -76,7 +76,7 @@ func (g *GangPack) gcPins() {
 			domain: domain.Name, topologyKey: domain.TopologyKey,
 			gang: gangInfo{key: group, uid: owner}, commitment: token,
 		}
-		if g.releaseAttempt(pin, nil, false) {
+		if released, _ := g.releaseAttempt(pin, nil, false); released {
 			g.clearFailedDomains(pin.gang)
 		}
 	}

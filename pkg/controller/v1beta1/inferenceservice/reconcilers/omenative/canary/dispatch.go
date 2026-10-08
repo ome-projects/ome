@@ -33,6 +33,10 @@ type DispatchDeps struct {
 	Reader   client.Reader
 	Recorder record.EventRecorder
 	ISVC     *v1beta1.InferenceService
+	// Policies is the set of RolloutPolicy objects the run layer observed
+	// for this pass; the effective view resolves the spec's references
+	// through it outside a pinned run.
+	Policies rollout.Policies
 	// Now is the wall-clock used for LastTransitionTime; callers may
 	// override for tests. Zero defaults to time.Now().
 	// Already an injected-time seam; kept as time.Time (single snapshot per pass).
@@ -239,6 +243,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 		Reader:                    d.Reader,
 		Recorder:                  d.Recorder,
 		ISVC:                      d.ISVC,
+		Policies:                  d.Policies,
 		Group:                     d.Group,
 		Component:                 primary,
 		CanaryRevisionHash:        canaryHash,
@@ -268,6 +273,13 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 	})
 	if err != nil {
 		return Outcome{}, err
+	}
+
+	// With no ladder active on the unit the rolled-out records are not the
+	// memory of a traffic shift: each member's record follows the revision
+	// its InferenceReplica has settled on.
+	if !res.Active {
+		recordSettledRevisions(d.ISVC, d.Group, primary, revisions, secondaryObserved, perRev, readyRev)
 	}
 
 	// Rollback signal: when the executor is rolling back, point EVERY group

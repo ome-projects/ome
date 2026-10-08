@@ -51,6 +51,13 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name: "valid forced promote target revision hash",
+			annotations: map[string]string{
+				constants.RolloutPromoteForceAnnotation: "e5d6f79d",
+			},
+			wantOK: true,
+		},
+		{
 			name: "valid rollback bool",
 			annotations: map[string]string{
 				constants.RolloutRollbackAnnotation: "true",
@@ -160,6 +167,14 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 			wantContains: "InvalidRolloutPromoteTarget",
 		},
 		{
+			// The forced promote carries the same hash token as the promote.
+			name: "forced promote target garbage",
+			annotations: map[string]string{
+				constants.RolloutPromoteForceAnnotation: "now",
+			},
+			wantContains: "InvalidRolloutPromoteTarget",
+		},
+		{
 			// The executor only ever matches the exact canary revision hash, so a
 			// "full" promotion could never take effect — reject it at admission
 			// instead of accepting a command that silently does nothing.
@@ -254,6 +269,12 @@ func TestValidateTrafficAnnotations_DidYouMean(t *testing.T) {
 			name:        "far-away key gets no suggestion (ignored)",
 			key:         constants.OMEAPIGroupName + "/this-is-not-related-at-all",
 			expectError: false, // > Levenshtein 2 from every known key → silently ignored
+		},
+		{
+			name:        "misspelled forced promote key gets the force as its suggestion",
+			key:         constants.OMEAPIGroupName + "/rollout-promote-forc", // missing e
+			expectError: true,
+			expectHint:  constants.RolloutPromoteForceAnnotation,
 		},
 		{
 			name:        "non-ome.io annotation is ignored entirely",

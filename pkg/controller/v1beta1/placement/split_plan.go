@@ -98,6 +98,13 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 	if err != nil {
 		return plan.Proposal{}, err
 	}
+	minimums, err := splitComponentMinimums(source)
+	if err != nil {
+		return plan.Proposal{}, err
+	}
+	if _, err := protocol.ApportionReplicaFloors(minimums.primary, minimums.floors[minimums.primary], desired.Targets, minimums.secondaries()); err != nil {
+		return plan.Proposal{}, err
+	}
 	proposal.UnassignedReplicas = desired.Unassigned
 	for name, replicas := range desired.Targets {
 		assignment := proposal.Assignments[name]

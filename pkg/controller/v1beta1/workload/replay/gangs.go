@@ -8,6 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferencereplica"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	types "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -23,8 +24,10 @@ const podGroupFinalizer = "replay.workload.ome.io/podgroup-lifecycle"
 // it observes the owner's PodGroups once, announces the group of every
 // multi-pod Instance in the plan before any member is created, records
 // what each group says into input.Gangs, and wires the inline surge
-// prerequisite the gang-surge op reaches back through. A single-pod
-// Component has no gangs and the whole pass is inert.
+// prerequisite the gang-surge op reaches back through. An index a
+// terminal owner finalizes itself is skipped, as the adapter skips it, so
+// a retiring marker's group is neither re-created nor judged. A
+// single-pod Component has no gangs and the whole pass is inert.
 func (d *driver) reconcileGangs(ctx context.Context, deps *types.Deps, input types.ReconcileInput, plan types.ComponentPlan) error {
 	if !d.spec.GangScheduling {
 		return nil
@@ -33,7 +36,10 @@ func (d *driver) reconcileGangs(ctx context.Context, deps *types.Deps, input typ
 	if err != nil {
 		return fmt.Errorf("replay: observe podgroups: %w", err)
 	}
-	state := workloadgang.PodGroupReconcileState{Inventory: inventory}
+	state := workloadgang.PodGroupReconcileState{
+		Inventory:     inventory,
+		TerminalOwned: inferencereplica.TerminalFinalizationOwned(input.ObservedState),
+	}
 	deps.EnsureGangPodGroup = workloadgang.EnsureSurgePodGroupWithState(*deps, state)
 	if _, err := workloadgang.EnsurePodGroupsWithState(ctx, *deps, input, plan, state); err != nil {
 		return fmt.Errorf("replay: ensure podgroups: %w", err)
@@ -92,10 +98,12 @@ func applyPodGroup(ctx context.Context, d *driver, ev TimelineEvent) (string, er
 			return "", fmt.Errorf("replay: reassign podgroup %s: %w", name, err)
 		}
 	case "PhaseFailed":
+		// The fake apiserver serves no status subresource for PodGroups, so
+		// the phase is written through the object itself.
 		if err := d.staging(func() error {
 			group.Status.Phase = schedulingv1alpha1.PodGroupFailed
 			group.Status.Failed = group.Spec.MinMember
-			return d.cli.Status().Update(ctx, group)
+			return d.cli.Update(ctx, group)
 		}); err != nil {
 			return "", fmt.Errorf("replay: fail podgroup %s: %w", name, err)
 		}

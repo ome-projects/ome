@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -2944,6 +2945,25 @@ func TestDeploymentStrategyWarnings(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Len(t, deploymentStrategyWarnings(tt.isvc), tt.wantLen)
+		})
+	}
+}
+
+func TestPlacementMaxSurgeWarnings(t *testing.T) {
+	tests := []struct {
+		name      string
+		placement *v1beta1.PlacementSpec
+		wantLen   int
+	}{
+		{name: "no placement does not warn"},
+		{name: "placement without maxSurge does not warn", placement: &v1beta1.PlacementSpec{}},
+		{name: "maxSurge warns", placement: &v1beta1.PlacementSpec{MaxSurge: ptr.To[int32](20)}, wantLen: 1},
+		{name: "zero maxSurge warns", placement: &v1beta1.PlacementSpec{MaxSurge: ptr.To[int32](0)}, wantLen: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{Placement: tt.placement}}
+			assert.Len(t, placementMaxSurgeWarnings(isvc), tt.wantLen)
 		})
 	}
 }

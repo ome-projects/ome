@@ -123,6 +123,18 @@ type InferenceServiceSpec struct {
 	// +optional
 	// +ome:since=v1.3
 	Routing *RoutingSpec `json:"routing,omitempty"`
+
+	// TTLSecondsAfterCreation limits how long this InferenceService lives.
+	// Once that many seconds have passed since its creationTimestamp, the
+	// controller deletes it, and garbage collection removes everything it
+	// owns. Unset means it lives until deleted. The deadline is computed from
+	// creationTimestamp on every reconcile, so changing or clearing the field
+	// moves or cancels it. Placement member copies ignore it; the source
+	// InferenceService's TTL governs them.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	// +ome:since=v1.3
+	TTLSecondsAfterCreation *int64 `json:"ttlSecondsAfterCreation,omitempty"`
 }
 
 // GetRolloutGroups returns the ordered rollout groups (spec.rollout.groups), or

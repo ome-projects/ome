@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ktypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,15 +25,63 @@ func isRollbackRequested(isvc *v1beta1.InferenceService) bool {
 	return isvc.Annotations[constants.RolloutRollbackAnnotation] == "true"
 }
 
-// shouldAdvanceManual reports whether the operator promoted THIS canary revision
-// via ome.io/rollout-promote=<canaryHash>. The hash guard prevents a stale
-// promote (left over from a prior rollout) from advancing a new one. A value
-// already recorded in cs.PromotedThrough is inert: annotation removal is
-// best-effort after the advance persists, so a lingering annotation must not
-// re-apply a promotion that already advanced a step (one promote, one step).
+// promoteKeys are the operator verbs that open a step's gate: the promote
+// and its forced form. Both carry the canary revision hash and are recorded
+// in PromotedThrough when applied.
+var promoteKeys = []string{constants.RolloutPromoteAnnotation, constants.RolloutPromoteForceAnnotation}
+
+// promoteMatches reports whether key names THIS canary revision. The hash
+// guard prevents a stale value (left over from a prior rollout) from
+// advancing a new one. A value already recorded in cs.PromotedThrough is
+// inert: annotation removal is best-effort after the advance persists, so a
+// lingering annotation must not re-apply a promotion that already advanced
+// a step (one verb, one step).
+func promoteMatches(isvc *v1beta1.InferenceService, cs *v1beta1.CanaryStatus, key string) bool {
+	v, ok := isvc.Annotations[key]
+	return ok && v == cs.CanaryRevisionHash && v != cs.PromotedThrough
+}
+
+// shouldAdvanceManual reports whether the operator promoted THIS canary
+// revision, via ome.io/rollout-promote=<canaryHash> or its forced form.
 func shouldAdvanceManual(isvc *v1beta1.InferenceService, cs *v1beta1.CanaryStatus) bool {
-	v := isvc.Annotations[constants.RolloutPromoteAnnotation]
-	return v == cs.CanaryRevisionHash && v != cs.PromotedThrough
+	return promoteMatches(isvc, cs, constants.RolloutPromoteAnnotation) ||
+		promoteMatches(isvc, cs, constants.RolloutPromoteForceAnnotation)
+}
+
+// forceRequested reports whether the operator forced THIS canary revision
+// past its step's capacity wait via ome.io/rollout-promote-force=<canaryHash>,
+// under the promote's guards.
+func forceRequested(isvc *v1beta1.InferenceService, cs *v1beta1.CanaryStatus) bool {
+	return promoteMatches(isvc, cs, constants.RolloutPromoteForceAnnotation)
+}
+
+// recordPromotes records the pending promote value in PromotedThrough and
+// hands every present key back for removal after the status flush. The value
+// naming the live canary revision is the one recorded whenever a key carries
+// it: a stale value beside it must not leave the applied verb unrecorded.
+func recordPromotes(in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(string)) {
+	live := false
+	for _, key := range promoteKeys {
+		v, ok := in.ISVC.Annotations[key]
+		if !ok {
+			continue
+		}
+		if v == cs.CanaryRevisionHash {
+			cs.PromotedThrough, live = v, true
+		} else if !live {
+			cs.PromotedThrough = v
+		}
+		take(key)
+	}
+}
+
+// announceForce records a forced advance on the InferenceService: the step,
+// the canary revision and the Ready canary capacity the operator advanced
+// over.
+func announceForce(in ReconcileInputs, cs *v1beta1.CanaryStatus, ready, staged int32) {
+	emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonCanaryStepForced,
+		"%s canary step %d forced: advancing on revision %s with %d of %d canary instances Ready; the step's capacity converges in the background and traffic follows the pods that serve",
+		in.Component, cs.CurrentStep, cs.CanaryRevisionHash, ready, staged)
 }
 
 // shouldAdvanceAuto reports whether a timed step's Pause.Duration has
@@ -187,7 +236,7 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 	default: // analysis.Inconclusive
 		if a.OnInconclusive != nil && *a.OnInconclusive == v1beta1.OnInconclusiveRollback {
 			dec = decRollback
-		} else if analysisStalled(cs, resolveReadyTimeout(in, effectiveCanaryPlan(in.ISVC, in.Component)), in.Now) {
+		} else if analysisStalled(cs, resolveReadyTimeout(in, effectiveCanaryPlan(in)), in.Now) {
 			// A stall is terminal either way; RollbackOnStall reverts instead of
 			// parking, so an unreadable gate cannot leave the fleet split.
 			dec = decFailed
@@ -255,10 +304,7 @@ func toStatusMetricResults(mrs []analysis.MetricResult, now time.Time) []v1beta1
 // shouldAdvanceManual).
 func advanceStep(in ReconcileInputs, take func(string)) {
 	cs := rollout.CanaryStatusFor(&in.ISVC.Status, in.Component)
-	if v, ok := in.ISVC.Annotations[constants.RolloutPromoteAnnotation]; ok {
-		cs.PromotedThrough = v
-		take(constants.RolloutPromoteAnnotation)
-	}
+	recordPromotes(in, cs, take)
 	cs.CurrentStep++
 	cs.StepEnteredTime = &metav1.Time{Time: in.Now}
 	cs.CapacityWaitSince = nil
@@ -277,24 +323,27 @@ func advanceStep(in ReconcileInputs, take func(string)) {
 }
 
 // syncPromotedThrough converges the durable promote record with the live
-// annotation, on passes AFTER the advance it records has persisted. While the
-// applied annotation lingers, hand it back for removal again; until it is
-// gone it stays inert (it matches PromotedThrough). Once the annotation is
-// observed gone, clear the record so a later promote of the same revision is
+// annotations, on passes AFTER the advance it records has persisted. While a
+// key still carries the applied value, hand it back for removal again; until
+// it is gone it stays inert (it matches PromotedThrough). Once no key carries
+// the value, clear the record so a later promote of the same revision is
 // honored again. The clear waits for observed absence because a stale cache
 // can re-show the annotation after removal; clearing while it is still
-// visible would re-apply the promotion.
+// visible would re-apply the promotion. A key carrying another value is not
+// the applied verb: it neither keeps the record nor is taken here.
 func syncPromotedThrough(in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(string)) {
 	if cs.PromotedThrough == "" {
 		return
 	}
-	v, ok := in.ISVC.Annotations[constants.RolloutPromoteAnnotation]
-	if !ok {
-		cs.PromotedThrough = ""
-		return
+	lingering := false
+	for _, key := range promoteKeys {
+		if v, ok := in.ISVC.Annotations[key]; ok && v == cs.PromotedThrough {
+			lingering = true
+			take(key)
+		}
 	}
-	if v == cs.PromotedThrough {
-		take(constants.RolloutPromoteAnnotation)
+	if !lingering {
+		cs.PromotedThrough = ""
 	}
 }
 

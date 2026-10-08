@@ -690,6 +690,7 @@ func TestRevisionHash_CanaryVerbAnnotationsDoNotDriftHash(t *testing.T) {
 	}
 	for _, verb := range []struct{ key, val string }{
 		{"ome.io/rollout-promote", "abc12345"},
+		{"ome.io/rollout-promote-force", "abc12345"},
 		{"ome.io/rollout-rollback", "true"},
 	} {
 		withVerb := &metav1.ObjectMeta{

@@ -81,7 +81,8 @@ func ReconcileGatedDeadlines(ctx context.Context, input types.ReconcileInput, in
 	now := input.Now()
 	for i := range instances {
 		s := &instances[i]
-		if s.Operation == nil || !isTransientPhase(s.Phase) {
+		// A parked attempt runs no clock, whichever phase its pods give it.
+		if s.Operation == nil || !isTransientPhase(s.Phase) || types.StateOf(s) == types.StateUpdateParked {
 			continue
 		}
 		held := gated[s.Index] || instanceHeldExternally(s, instances)

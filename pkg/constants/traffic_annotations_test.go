@@ -33,6 +33,7 @@ func TestTrafficAnnotations_Prefix(t *testing.T) {
 		{"RolloutReadyTimeoutAnnotation", RolloutReadyTimeoutAnnotation},
 		{"RevisionHistoryLimitAnnotation", RevisionHistoryLimitAnnotation},
 		{"RolloutPromoteAnnotation", RolloutPromoteAnnotation},
+		{"RolloutPromoteForceAnnotation", RolloutPromoteForceAnnotation},
 		{"RolloutRollbackAnnotation", RolloutRollbackAnnotation},
 	}
 	wantPrefix := OMEAPIGroupName + "/"
@@ -70,6 +71,7 @@ func TestTrafficAnnotations_Unique(t *testing.T) {
 		RolloutReadyTimeoutAnnotation,
 		RevisionHistoryLimitAnnotation,
 		RolloutPromoteAnnotation,
+		RolloutPromoteForceAnnotation,
 		RolloutRollbackAnnotation,
 	}
 	seen := make(map[string]string, len(all))
@@ -121,6 +123,7 @@ func TestKnownAnnotation_NoCollisionWithPassthrough(t *testing.T) {
 		RolloutReadyTimeoutAnnotation,
 		RevisionHistoryLimitAnnotation,
 		RolloutPromoteAnnotation,
+		RolloutPromoteForceAnnotation,
 		RolloutRollbackAnnotation,
 	}
 	for _, k := range known {

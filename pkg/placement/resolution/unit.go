@@ -107,7 +107,7 @@ func (r Resolver) ResolveUnit(ctx context.Context, desired, standing *v1beta1.In
 		return nil, err
 	}
 	out.Engine = components.ReplicaTemplatesFrom(engineRendered.Templates)
-	unit := capacity.ReplicaUnit{}
+	unit := capacity.ReplicaUnit{Units: maps.Clone(r.ComponentUnits)}
 	unit.Engine, err = out.Engine.PodSets(engineMode, engine.Leader != nil, engine.Worker != nil)
 	if err != nil {
 		return nil, fmt.Errorf("engine demand: %w", err)

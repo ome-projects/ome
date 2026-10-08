@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -208,4 +209,41 @@ func TestConsumeReleaseHeld_ParentIsEventTarget(t *testing.T) {
 
 	assertAnnotationConsumed(t, g, c, ir)
 	g.Expect(eventsContaining(drainEvents(rec), string(workloadtypes.EventReasonRetryBlockReleased))).To(gomega.HaveLen(1))
+}
+
+// TestConsumeReleaseHeld_LeavesInstanceRowsUntouched pins that the release
+// mailbox rewrites the Component's RetryBlock and nothing else: a Failed
+// row with no operation, an attempt parked after its disposition in either
+// phase its set gives it, and a Create attempt kept by the gang verdict all
+// keep their phase, operation and failure record. What the release changes
+// for them is the gate the next pass consults.
+func TestConsumeReleaseHeld_LeavesInstanceRowsUntouched(t *testing.T) {
+	g := gomega.NewWithT(t)
+	seed := releaseIR("llama-engine-aaaaaaaa")
+	now := metav1.Now()
+	seed.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceFailed, TargetRevision: "llama-engine-aaaaaaaa", Incarnation: 1,
+			LastFailure: &v1beta1.InstanceTermination{PodName: "llama-engine-0-default-0", Reason: "ImagePullBackOff", Time: now}},
+		parkedAttemptRow(1, v1beta1.OMENativeInstanceUpdating),
+		parkedAttemptRow(2, v1beta1.OMENativeInstanceFailed),
+		{Index: 3, Phase: v1beta1.OMENativeInstanceFailed, Incarnation: 1,
+			Operation: &v1beta1.InstanceOperation{
+				ID: "create-3-1", Type: v1beta1.InstanceOperationCreate, Step: "CreatePods",
+				StartedAt: now, LastProgressAt: now, Deadline: now, TargetRevision: "llama-engine-aaaaaaaa",
+			},
+			LastFailure: &v1beta1.InstanceTermination{Reason: "PodGroupOwnershipConflict", Time: now}},
+	}
+	r, c, _, ir := newReleaseFixture(t, seed)
+	before := ir.Status.DeepCopy().InstanceStatuses
+
+	requeue, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(requeue).To(gomega.BeFalse())
+
+	fresh := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}, fresh)).To(gomega.Succeed())
+	g.Expect(fresh.Status.RetryBlocks).To(gomega.HaveLen(1), "the Held block is removed")
+	g.Expect(fresh.Status.InstanceStatuses).To(gomega.Equal(before), "no Instance row is written by the release")
+	g.Expect(ir.Status.InstanceStatuses).To(gomega.Equal(before), "the in-memory mirror keeps every row as it was")
+	assertAnnotationConsumed(t, g, c, ir)
 }

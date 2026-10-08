@@ -306,14 +306,14 @@ func TestSingleRetainedWinnerHolds(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{name: "healthy affinity change requires bounded move", reason: "MigrationBlocked", edit: func(t *testing.T, f *backendFixture, s *v1beta1.InferenceService) {
+		{name: "affinity change keeps the winner until routing is known", edit: func(t *testing.T, f *backendFixture, s *v1beta1.InferenceService) {
 			s.Spec.Placement.ClusterAffinity = testAffinity("metadata.name=member-b")
 			s.Generation++
 			if err := f.reconciler.Update(t.Context(), s); err != nil {
 				t.Fatal(err)
 			}
 		}},
-		{name: "no matching peers retains healthy winner", reason: "MigrationBlocked", edit: func(t *testing.T, f *backendFixture, s *v1beta1.InferenceService) {
+		{name: "no matching peers retains healthy winner", edit: func(t *testing.T, f *backendFixture, s *v1beta1.InferenceService) {
 			s.Spec.Placement.ClusterAffinity = testAffinity("metadata.name=member-c")
 			s.Generation++
 			if err := f.reconciler.Update(t.Context(), s); err != nil {
@@ -401,6 +401,70 @@ func TestSingleModeChangeReportsOnlyWinnerHealth(t *testing.T) {
 			}
 			if diff := cmp.Diff(tt.want, got.Status.GetCondition(apis.ConditionReady).Status); diff != "" {
 				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+// TestSingleUnreadableWinnerKeepsAppliedPlan converges a Single winner, then
+// makes one pass unable to read it: once through a lost connection, once with
+// only its component inventory unreadable. The pass keeps the plan the winner
+// last acknowledged and holds convergence instead of deciding on the kept
+// value; the next readable pass reconverges.
+func TestSingleUnreadableWinnerKeepsAppliedPlan(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		unread func(*backendFixture)
+		known  bool
+	}{
+		{name: "lost connection", unread: func(f *backendFixture) { delete(f.connections.m, "member-a") }},
+		{name: "unreadable component inventory", known: true, unread: func(f *backendFixture) { f.connections.m["member-a"] = unreadableAllMember(f, "member-a") }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := singleFixture(t, false)
+			f.reconcile(t)
+			seedSingleAdmission(t, f, "member-a", v1beta1.EngineComponent)
+			f.reconcile(t)
+			f.reconcile(t)
+			acknowledgeSingleFloor(t, f, "member-a", 3)
+			settled := f.reconcile(t)
+			if condition := settled.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Status != corev1.ConditionTrue {
+				t.Fatalf("winner did not converge: %+v", condition)
+			}
+			before := candidateOf(t, settled, "member-a")
+			if !before.ObservationKnown || before.AppliedPlanID != settled.Status.Placement.Plan.ID {
+				t.Fatalf("winner has not acknowledged the accepted plan: %+v", before)
+			}
+
+			readable := f.connections.m["member-a"]
+			tt.unread(f)
+			unknown := f.reconcile(t)
+			f.connections.m["member-a"] = readable
+			if diff := cmp.Diff(settled.Status.Placement.Plan, unknown.Status.Placement.Plan); diff != "" {
+				t.Fatalf("unreadable pass changed the accepted plan (-want +got):\n%s", diff)
+			}
+			got := candidateOf(t, unknown, "member-a")
+			if diff := cmp.Diff(before.AppliedPlanID, got.AppliedPlanID); diff != "" {
+				t.Fatalf("unreadable pass blanked the winner's acknowledged plan (-want +got):\n%s", diff)
+			}
+			// The observation flag follows the standing read; the kept
+			// acknowledgement never satisfies the winner-applied decision.
+			if diff := cmp.Diff(tt.known, got.ObservationKnown); diff != "" {
+				t.Fatalf("observation flag (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff("AwaitingMemberConvergence", unknown.Status.GetCondition(v1beta1.PlacementConverged).Reason); diff != "" {
+				t.Fatalf("unreadable pass decided on the kept acknowledgement (-want +got):\n%s", diff)
+			}
+			if err := f.workers["member-b"].Get(t.Context(), client.ObjectKeyFromObject(f.source), &v1beta1.InferenceService{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("unreadable pass reopened the race: %v", err)
+			}
+
+			recovered := f.reconcile(t)
+			if condition := recovered.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Status != corev1.ConditionTrue {
+				t.Fatalf("readable pass did not reconverge: %+v", condition)
+			}
+			if diff := cmp.Diff(before, candidateOf(t, recovered, "member-a")); diff != "" {
+				t.Fatalf("readable pass did not restore the candidate (-want +got):\n%s", diff)
 			}
 		})
 	}

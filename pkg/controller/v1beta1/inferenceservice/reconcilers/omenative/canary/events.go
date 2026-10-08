@@ -26,8 +26,22 @@ const (
 	// no retained ControllerRevision for the stable revision and parks Failed
 	// instead of reporting a revert that cannot happen.
 	EventReasonCanaryStableRevisionMissing = "CanaryStableRevisionMissing"
+	// EventReasonCanaryStableRevisionEmpty is recorded when a rollback's
+	// target, a member's stable revision, runs no live Instance while the
+	// ladder holds a floor for it: a rollback the controller decided parks
+	// instead, and one the operator requested proceeds. The event names the
+	// revision and the Component.
+	EventReasonCanaryStableRevisionEmpty = "CanaryStableRevisionEmpty"
 	// EventReasonCanaryPodCrashed is recorded when a canary pod keeps dying
 	// after its Instance was serving, a crash loop rather than a single
 	// restart, and the ladder parks at its step, naming the pod.
 	EventReasonCanaryPodCrashed = "CanaryPodCrashed"
+	// EventReasonCanaryStepForced is recorded when ome.io/rollout-promote-force
+	// opens a step's gate without its capacity: it names the step, the canary
+	// revision and the Ready canary capacity at that moment.
+	EventReasonCanaryStepForced = "CanaryStepForced"
+	// EventReasonCanaryForceIgnored is recorded when a forced promote is
+	// removed without effect: the rollout is paused or frozen, or the canary
+	// is parked Failed, rolling back or held rolled back.
+	EventReasonCanaryForceIgnored = "CanaryForceIgnored"
 )

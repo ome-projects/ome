@@ -16,10 +16,12 @@ import (
 
 // componentIRStatuses reads decoded member status and verifies positive
 // admission against live Pods. Missing components have no admission credit;
-// unreadable or changing inventories hold placement as unknown.
+// unreadable inventories hold placement as unknown.
 func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService) (map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, error) {
 	out := make(map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus)
-	var pods *corev1.PodList
+	// Each component is read once; that snapshot carries the ownership and
+	// rows its admission is verified from.
+	claims := map[v1beta1.ComponentType]*v1beta1.InferenceReplica{}
 	for _, c := range declaredComponents(isvc) {
 		// The predicates below inspect per-Instance rows, so the status is
 		// read through the decoded accessor; a payload that cannot be decoded
@@ -40,14 +42,24 @@ func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1
 		if isvc.UID == "" || owner == nil || owner.UID != isvc.UID || owner.Kind != "InferenceService" || owner.APIVersion != v1beta1.SchemeGroupVersion.String() {
 			return nil, fmt.Errorf("component %q has unverified service ownership", ir.Name)
 		}
-		if pods == nil {
-			pods = &corev1.PodList{}
-			if err := reads.List(ctx, pods, client.InNamespace(isvc.Namespace), client.MatchingLabels{constants.InferenceServicePodLabelKey: isvc.Name}); err != nil {
-				return nil, err
-			}
-			if pods.Continue != "" {
-				return nil, fmt.Errorf("member pod inventory is incomplete")
-			}
+		claims[c] = ir
+	}
+	if len(claims) == 0 {
+		return out, nil
+	}
+	// Pods are listed after every component snapshot, so a claimed cohort is
+	// verified against an inventory at least as current as the claim.
+	pods := &corev1.PodList{}
+	if err := reads.List(ctx, pods, client.InNamespace(isvc.Namespace), client.MatchingLabels{constants.InferenceServicePodLabelKey: isvc.Name}); err != nil {
+		return nil, err
+	}
+	if pods.Continue != "" {
+		return nil, fmt.Errorf("member pod inventory is incomplete")
+	}
+	for _, c := range declaredComponents(isvc) {
+		ir, claimed := claims[c]
+		if !claimed {
+			continue
 		}
 		owned := []corev1.Pod{}
 		for _, pod := range pods.Items {
@@ -62,14 +74,6 @@ func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1
 		out[c], err = verifiedMemberAdmission(ir, owned, gangSizes)
 		if err != nil {
 			return nil, err
-		}
-		live := &metav1.PartialObjectMetadata{}
-		live.SetGroupVersionKind(v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"))
-		if err := reads.Get(ctx, client.ObjectKeyFromObject(ir), live); err != nil {
-			return nil, err
-		}
-		if ir.ResourceVersion == "" || live.UID != ir.UID || live.ResourceVersion != ir.ResourceVersion {
-			return nil, fmt.Errorf("component %q changed during admission observation", ir.Name)
 		}
 	}
 	return out, nil

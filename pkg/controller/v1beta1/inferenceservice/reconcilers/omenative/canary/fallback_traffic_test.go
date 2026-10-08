@@ -626,6 +626,14 @@ func TestServedWeight(t *testing.T) {
 		{"a substitute for the stable revision carries the share", 30, false, "mid", map[string]int32{"mid": 2}, 0},
 		{"the final step falls back like any other", 100, false, "old", map[string]int32{"old": 1}, 0},
 		{"a step with no share has none to move", 0, false, "old", map[string]int32{"old": 1}, 0},
+		// The rule is symmetric: a stable side with no serving pod carries no
+		// weight while the canary path serves, and the target carries the rest.
+		{"the path serves and the stable side has no pod", 30, true, "old", map[string]int32{"new": 1, "old": 0}, 100},
+		{"the path serves and the stable side is absent from the pod view", 30, true, "old", map[string]int32{"new": 1}, 100},
+		{"the path serves with no pod view", 30, true, "old", nil, 30},
+		{"the path serves with no stable side", 30, true, "", map[string]int32{"new": 1}, 30},
+		{"a substitute serving in the stable's place keeps the step's share", 30, true, "mid", map[string]int32{"new": 1, "mid": 1}, 30},
+		{"a step with no share hands it all to the only serving side", 0, true, "old", map[string]int32{"new": 1, "old": 0}, 100},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := servedWeight(tc.weight, tc.pathServes, tc.stable, tc.pods); got != tc.want {
@@ -690,6 +698,10 @@ func TestMemberWeightsFallBack(t *testing.T) {
 	if w := memberWeights(bumped, 30, false, map[string]int32{"decmid": 1}); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 0 || w[1].RevisionHash != "decmid" || w[1].Percent != 100 {
 		t.Fatalf("a broken path rests the member's share on the revision serving in its stable's place, got %+v", w)
+	}
+	if w := memberWeights(bumped, 30, true, map[string]int32{"decnew": 1, "decold": 0}); len(w) != 2 ||
+		w[0].RevisionHash != "decnew" || w[0].Percent != 100 || w[1].RevisionHash != "decold" || w[1].Percent != 0 {
+		t.Fatalf("a stable revision with no pod while the target serves hands the member's share to the target, got %+v", w)
 	}
 	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "d", StableRevisionHash: "d"}, 30, false, map[string]int32{"d": 1}); len(w) != 1 || w[0].Percent != 100 {
 		t.Fatalf("an unbumped member serves its revision alone, got %+v", w)

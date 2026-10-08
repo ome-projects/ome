@@ -5,6 +5,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 	"k8s.io/kube-scheduler/framework"
 
 	"sigs.k8s.io/ome/scheduler/pkg/placement"
@@ -16,11 +17,19 @@ import (
 // other framework filters (for example volumes, ports, and inter-pod affinity)
 // may still reject the domain. Without this hook no Reserve/Unreserve callback
 // runs and the pin's exclusive reservation could persist indefinitely.
+//
+// A member vetoed in a domain new to its gang is activated here while another
+// domain is untried: the vetoing filters register no event for a retry that only
+// the plugin's failed-domain memory changes, and parked siblings cannot plan for it.
 func (g *GangPack) PostFilter(ctx context.Context, state framework.CycleState, pod *v1.Pod, _ framework.NodeToStatusReader) (*framework.PostFilterResult, *framework.Status) {
-	if readPin(state) == nil {
+	pin := readPin(state)
+	if pin == nil {
 		return nil, framework.NewStatus(framework.Unschedulable)
 	}
-	g.releaseAttempt(readPin(state), pod, true)
+	if _, newDomain := g.releaseAttempt(pin, pod, true); newDomain && !pin.soleFit && g.handle != nil {
+		gangActivationTotal.WithLabelValues(activationTriggerDomainFailed).Inc()
+		g.handle.Activate(klog.Background(), map[string]*v1.Pod{pod.Namespace + "/" + pod.Name: pod})
+	}
 	return nil, framework.NewStatus(framework.Unschedulable, "gang reservation released after all candidate nodes were filtered")
 }
 
@@ -28,7 +37,9 @@ func failedDomainKey(gang gangInfo) string {
 	return gang.key + "\x00" + gang.uid
 }
 
-func (g *GangPack) markFailedDomain(gang gangInfo, domain placement.Domain) {
+// markFailedDomain records a domain whose candidates all failed another Filter
+// and reports whether the gang had not failed it before.
+func (g *GangPack) markFailedDomain(gang gangInfo, domain placement.Domain) bool {
 	g.failedMu.Lock()
 	defer g.failedMu.Unlock()
 	if g.failedDomains == nil {
@@ -38,7 +49,11 @@ func (g *GangPack) markFailedDomain(gang gangInfo, domain placement.Domain) {
 	if g.failedDomains[key] == nil {
 		g.failedDomains[key] = sets.New[placement.Domain]()
 	}
+	if g.failedDomains[key].Has(domain) {
+		return false
+	}
 	g.failedDomains[key].Insert(domain)
+	return true
 }
 
 func (g *GangPack) clearFailedDomains(gang gangInfo) {

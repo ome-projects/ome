@@ -5,6 +5,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -37,9 +38,21 @@ import (
 // ImagePulling window. A pod with no creation stamp cannot prove any
 // duration and is never stuck.
 func PodStuckInTerminalWaiting(pod *corev1.Pod, now time.Time, grace time.Duration) (string, bool) {
+	return PodStuckInTerminalWaitingSince(pod, now, grace, time.Time{})
+}
+
+// PodStuckInTerminalWaitingSince is PodStuckInTerminalWaiting with the
+// waiting episode's start floored at floor: a reason the pod already held
+// when an attempt began acting on it is that attempt's reason, not yet its
+// failure, so the grace runs from the attempt's own start. A zero floor
+// measures from the episode alone.
+func PodStuckInTerminalWaitingSince(pod *corev1.Pod, now time.Time, grace time.Duration, floor time.Time) (string, bool) {
 	since := WaitingEpisodeStart(pod)
 	if since.IsZero() {
 		return "", false
+	}
+	if floor.After(since) {
+		since = floor
 	}
 	if now.Sub(since) < grace {
 		return "", false
@@ -77,6 +90,76 @@ func TerminalWaitingGraceLeft(pod *corev1.Pod, now time.Time, grace time.Duratio
 		return left
 	}
 	return 0
+}
+
+// PodUnreadyPastGrace reports whether a promoted pod has failed its readiness
+// for at least grace (unreadySince): out of its Service for longer than a pod
+// gets to come up, it is dark. No grace configured means no such window.
+func PodUnreadyPastGrace(pod *corev1.Pod, now time.Time, grace time.Duration) bool {
+	if grace <= 0 {
+		return false
+	}
+	since, unready := unreadySince(pod)
+	return unready && now.Sub(since) >= grace
+}
+
+// ContainersUnreadyPastGrace reports whether a live Running pod's kubelet
+// readiness has been failing for at least grace: ContainersReady False
+// since then, whatever the serving gate reads. A pass that drains a pod
+// turns its gate off, so this is how a drained pod's break is still told
+// from the drain. No grace configured means no such window.
+func ContainersUnreadyPastGrace(pod *corev1.Pod, now time.Time, grace time.Duration) bool {
+	if grace <= 0 || pod == nil || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type != corev1.ContainersReady {
+			continue
+		}
+		return cond.Status == corev1.ConditionFalse && !cond.LastTransitionTime.IsZero() &&
+			now.Sub(cond.LastTransitionTime.Time) >= grace
+	}
+	return false
+}
+
+// UnreadyGraceLeft is how much of grace a promoted unready pod has left before
+// PodUnreadyPastGrace reads it as dark, zero once past or for any other pod.
+// The grace ending raises no event, so a pass that read it owes itself the wait.
+func UnreadyGraceLeft(pod *corev1.Pod, now time.Time, grace time.Duration) time.Duration {
+	if grace <= 0 {
+		return 0
+	}
+	since, unready := unreadySince(pod)
+	if !unready {
+		return 0
+	}
+	if left := grace - now.Sub(since); left > 0 {
+		return left
+	}
+	return 0
+}
+
+// unreadySince is when a live Running pod's containers last stopped being
+// ready, and whether it served first: the serving gate written at promotion is
+// True while the kubelet's own ContainersReady is False (a withdrawn Ready alone
+// is the node-loss shape, not this one).
+func unreadySince(pod *corev1.Pod) (time.Time, bool) {
+	if pod == nil || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+		return time.Time{}, false
+	}
+	if !podreadiness.IsServing(pod) || podreadiness.IsPodReady(pod) {
+		return time.Time{}, false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type != corev1.ContainersReady {
+			continue
+		}
+		if cond.Status == corev1.ConditionTrue || cond.LastTransitionTime.IsZero() {
+			return time.Time{}, false
+		}
+		return cond.LastTransitionTime.Time, true
+	}
+	return time.Time{}, false
 }
 
 // WaitingEpisodeStart is when the pod's current waiting episode began,
@@ -124,6 +207,12 @@ func terminalWaitingReason(pod *corev1.Pod) (string, bool) {
 // a stable index should sort pods before calling. For event emission
 // the order doesn't matter (the message names the specific pod).
 func FirstStuckPodForInstance(pods []*corev1.Pod, now time.Time, grace time.Duration) (*corev1.Pod, string) {
+	return FirstStuckPodForInstanceSince(pods, now, grace, time.Time{})
+}
+
+// FirstStuckPodForInstanceSince is FirstStuckPodForInstance with each
+// pod's waiting episode floored at floor (PodStuckInTerminalWaitingSince).
+func FirstStuckPodForInstanceSince(pods []*corev1.Pod, now time.Time, grace time.Duration, floor time.Time) (*corev1.Pod, string) {
 	for _, pod := range pods {
 		if pod == nil {
 			continue
@@ -134,7 +223,7 @@ func FirstStuckPodForInstance(pods []*corev1.Pod, now time.Time, grace time.Dura
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		if reason, stuck := PodStuckInTerminalWaiting(pod, now, grace); stuck {
+		if reason, stuck := PodStuckInTerminalWaitingSince(pod, now, grace, floor); stuck {
 			return pod, reason
 		}
 	}

@@ -52,6 +52,12 @@ const (
 	// (UpdateItem.CleanupOnly → ops.CleanupWreckage) when no revision diff
 	// exists to trigger one.
 	DispositionSkippedSuperseded
+	// DispositionWithheld — the fresh row does not carry the attempt
+	// the pass observed, so its end was not written and nothing was
+	// announced. A row that concluded the attempt (a promote got there
+	// first) recorded nothing at all; a row re-opened under another
+	// attempt keeps the ladder wave the ended attempt earned.
+	DispositionWithheld
 )
 
 // DisposeExpiredAttempt classifies one expired / stuck Create-or-Update
@@ -69,10 +75,12 @@ const (
 //     resolvable revision → there is nothing to hold; fall through to
 //     the terminal branch rather than report a held revision with no
 //     block.
-//  2. RELOCATABLE — no workload-caused reason, MigrationMode=Auto,
+//  2. RELOCATABLE — no workload-caused reason, no crash loop among the
+//     attempt's pods (attemptCrashLooping), MigrationMode=Auto,
 //     relocation budget (operator config) not exhausted, the target
-//     revision has served on some Instance (revisionHasServed), and the
-//     attempt's OWN pods occupy exactly ONE resolvable node (single-pod
+//     revision has served on some Instance (revisionHasServed) and is
+//     not Held by the retry ladder (revisionHeld), and the attempt's OWN
+//     pods occupy exactly ONE resolvable node (single-pod
 //     instances and single-host gangs; multi-node attempts fall
 //     through). A live pod of another revision in the same bucket — the
 //     serving source of a single-pod surge — is not the attempt's and
@@ -107,17 +115,19 @@ const (
 // Failed-with-Operation continuation drives the gang abandon path.
 // Callers keep the plain Failed-preserving-Operation stamp for those.
 func DisposeExpiredAttempt(ctx context.Context, deps types.Deps, input types.ReconcileInput, dd types.DispositionDeps, inst types.InstanceStatus, pods []*corev1.Pod, reason string) (DispositionOutcome, error) {
+	if inst.Operation == nil {
+		return DispositionWithheld, nil
+	}
 	now := metav1.NewTime(input.Now())
 	causePod, matched := evidence.FirstWorkloadCausedPod(pods)
 
-	// Branch 1: workload-caused with a resolvable target revision.
+	// Branch 1: workload-caused with a resolvable target revision. Only
+	// the classification happens here; heldRev names the revision the
+	// branch holds, "" when it does not apply.
+	heldRev := ""
 	if pod := causePod; pod != nil {
-		targetRev := ""
-		unpinnedCreate := false
-		if inst.Operation != nil {
-			targetRev = inst.Operation.TargetRevision
-			unpinnedCreate = inst.Operation.Type == types.InstanceOperationCreate && targetRev == ""
-		}
+		targetRev := inst.Operation.TargetRevision
+		unpinnedCreate := inst.Operation.Type == types.InstanceOperationCreate && targetRev == ""
 		if targetRev == "" {
 			// An empty target is a supported persisted state. The pod label
 			// below decides whether the live rollout target can own its failure.
@@ -145,29 +155,49 @@ func DisposeExpiredAttempt(ctx context.Context, deps types.Deps, input types.Rec
 			// Clear the attempt without charging either revision below.
 			targetRev = ""
 		}
-		if targetRev != "" {
-			// Writer ordering: RetryBlock upsert lands BEFORE the mutation
-			// that clears the failed attempt's Operation. Crash-safe: a
-			// re-entered disposition (block landed, clear didn't) refreshes
-			// the block via the writer's wave dedup without recounting.
-			// The wave's cause is read off the matched reason rather than
-			// asserted here, so this branch and the gang abandon classify it
-			// from the same set.
-			if err := types.RecordUpdateFailureInRetryBlock(ctx, input, targetRev, matched, types.FailureCauseOf(matched)); err != nil {
-				return DispositionHeldRevision, fmt.Errorf("record retry block for disposed attempt (instance=%d rev=%s): %w", inst.Index, targetRev, err)
-			}
-			termination := types.PodTerminationWithReason(pod, matched, now)
-			if err := status.StampFailed(ctx, input, inst.Index, termination); err != nil {
-				return DispositionHeldRevision, fmt.Errorf("clear operation + stamp Failed (instance=%d): %w", inst.Index, err)
-			}
-			if input.WarnInstanceFailed != nil {
-				input.WarnInstanceFailed(inst.Index, pod.Name,
-					fmt.Sprintf("%s: workload-caused failure; revision %s held for retry — fix the image/config and publish a corrected revision", matched, targetRev))
-			}
-			return DispositionHeldRevision, nil
-		}
 		// No resolvable revision (degenerate: no op target AND empty
-		// UpdateRevision) — nothing to hold; dispose terminal below.
+		// UpdateRevision) leaves heldRev empty — nothing to hold; dispose
+		// terminal below.
+		heldRev = targetRev
+	}
+
+	// Every write from here on is the observed attempt's: the ladder wave
+	// and the directive recorded ahead of the end, and the end itself. A
+	// fresh row that concluded the attempt records nothing — it may have
+	// succeeded. One re-opened under another attempt keeps the wave the
+	// ended attempt earned; the stamps withhold the end themselves.
+	standing, err := status.AttemptStandingOnFreshRow(ctx, input, inst.Index, *inst.Operation)
+	if err != nil {
+		return DispositionWithheld, fmt.Errorf("read the row before disposing its attempt (instance=%d): %w", inst.Index, err)
+	}
+	if standing == status.AttemptConcluded {
+		return DispositionWithheld, nil
+	}
+
+	if heldRev != "" {
+		// Writer ordering: RetryBlock upsert lands BEFORE the mutation
+		// that clears the failed attempt's Operation. Crash-safe: a
+		// re-entered disposition (block landed, clear didn't) refreshes
+		// the block via the writer's wave dedup without recounting.
+		// The wave's cause is read off the matched reason rather than
+		// asserted here, so this branch and the gang abandon classify it
+		// from the same set.
+		if err := types.RecordUpdateFailureInRetryBlock(ctx, input, heldRev, matched, types.FailureCauseOf(matched)); err != nil {
+			return DispositionHeldRevision, fmt.Errorf("record retry block for disposed attempt (instance=%d rev=%s): %w", inst.Index, heldRev, err)
+		}
+		termination := types.PodTerminationWithReason(causePod, matched, now)
+		ended, err := endAttempt(ctx, input, inst, pods, termination, parkedWaitAfterWave(input, heldRev, matched, types.FailureCauseOf(matched), now))
+		if err != nil {
+			return DispositionHeldRevision, fmt.Errorf("clear operation + stamp Failed (instance=%d): %w", inst.Index, err)
+		}
+		if !ended {
+			return DispositionWithheld, nil
+		}
+		if input.WarnInstanceFailed != nil {
+			input.WarnInstanceFailed(inst.Index, causePod.Name,
+				fmt.Sprintf("%s: workload-caused failure; revision %s held for retry — fix the image/config and publish a corrected revision", matched, heldRev))
+		}
+		return DispositionHeldRevision, nil
 	}
 
 	// Branch 2: relocatable — the attempt's own pods occupy exactly one
@@ -177,33 +207,42 @@ func DisposeExpiredAttempt(ctx context.Context, deps types.Deps, input types.Rec
 	// once the evidence the backstop derives is available to travel with
 	// it.
 	//
-	// The node is blamed only when the revision is known to work: some
-	// Instance has run the target revision to Ready — a sibling serving
-	// it now, or this Instance before the attempt — and the failure is
-	// one a node can cause (a crash loop, a runtime start rejection, a pod
-	// that never reports ready; the workload-caused reasons took branch 1
-	// and an unplaced pod names no node). A crash loop or a never-Ready
-	// pod on a revision nobody has served is the revision's own failure
-	// until proven otherwise: it takes the ladder below with no node
-	// blame, so a bad push leaves no exclusion behind for its fix to
-	// inherit.
-	relocationNode := ""
-	targetRev := attemptTargetRevision(input, inst)
-	if causePod == nil &&
-		migrationModeAllowsRelocation(dd.MigrationMode) && dd.AutoMigrateMaxAttempts > 0 &&
-		revisionHasServed(input.ObservedState.InstanceStatuses, inst, targetRev) {
-		relocationNode = evidence.AttemptSuspectNode(pods, targetRev)
-	}
-
-	// Terminal backstop (branches 2 and 3): clear the Operation + stamp
-	// Phase=Failed unconditionally. Preserve the caller's short reason
-	// token ("DeadlineExceeded: ..." → "DeadlineExceeded"; a bare
-	// kubelet reason passes through) so LastFailure.Reason stays
+	// The caller's short reason token ("DeadlineExceeded: ..." →
+	// "DeadlineExceeded"; a bare kubelet reason passes through) names the
+	// class the escalator matched and keeps LastFailure.Reason
 	// grep-stable.
 	shortReason := reason
 	if i := strings.IndexByte(reason, ':'); i > 0 {
 		shortReason = reason[:i]
 	}
+	// The node is blamed only when the revision is known to work: some
+	// Instance has run the target revision to Ready — a sibling serving
+	// it now, or this Instance before the attempt — and the failure is
+	// one a node can cause (a runtime start rejection, a pod that never
+	// reports ready, a pod whose node stopped reporting it; the
+	// workload-caused reasons took branch 1 and an unplaced pod names no
+	// node). A crash loop is never one: a container that keeps exiting
+	// does so on any node, so under either face of the loop the attempt
+	// takes the ladder below with no node blame, wherever the revision
+	// serves. A never-Ready pod on a revision nobody has served is the
+	// revision's own failure until proven otherwise and takes the ladder
+	// the same way, so a bad push leaves no exclusion behind for its fix
+	// to inherit. A revision the ladder has Held is not known to
+	// work either: the hold is the ladder's verdict that the revision
+	// itself fails, so a further attempt at it blames no node and records
+	// no exclusion — a directive would steer a rebuild the hold never
+	// runs.
+	relocationNode := ""
+	targetRev := attemptTargetRevision(input, inst)
+	if causePod == nil && !attemptCrashLooping(pods, targetRev, shortReason) &&
+		migrationModeAllowsRelocation(dd.MigrationMode) && dd.AutoMigrateMaxAttempts > 0 &&
+		revisionHasServed(input.ObservedState.InstanceStatuses, inst, targetRev) &&
+		!revisionHeld(input, targetRev) {
+		relocationNode = evidence.AttemptSuspectNode(pods, targetRev)
+	}
+
+	// Terminal backstop (branches 2 and 3): clear the Operation + stamp
+	// Phase=Failed unconditionally.
 	// A rebuild the scheduler could not place outlasted the operator's
 	// grace. If this Instance holds node exclusions for the revision it
 	// rendered, they are what stands between the pod and the room the
@@ -265,6 +304,9 @@ func DisposeExpiredAttempt(ctx context.Context, deps types.Deps, input types.Rec
 	}
 	outcome := DispositionTerminal
 	detail := "attempt disposed terminal (no workload-caused evidence, relocation unavailable); operation-specific recovery decides whether another attempt is safe"
+	// The wait a parked attempt names, empty when no ladder counts the
+	// wave: an uncounted attempt is cleared and re-opened at once.
+	parkedWait := ""
 	if directiveRecorded {
 		outcome = DispositionRelocationDirective
 		detail = "attempt disposed with relocation directive; the rebuild is steered off the recorded node"
@@ -273,13 +315,19 @@ func DisposeExpiredAttempt(ctx context.Context, deps types.Deps, input types.Rec
 		// the revision's ladder takes this one. Written ahead of the
 		// op-clear so a crash between the two re-enters here and the
 		// writer's wave dedup refreshes without recounting.
-		if err := types.RecordUpdateFailureInRetryBlock(ctx, input, chargeRev, terminalWaveReason(shortReason, termination), types.CauseUnattributed); err != nil {
+		waveReason := terminalWaveReason(shortReason, termination)
+		if err := types.RecordUpdateFailureInRetryBlock(ctx, input, chargeRev, waveReason, types.CauseUnattributed); err != nil {
 			return DispositionTerminal, fmt.Errorf("record retry block for disposed attempt (instance=%d rev=%s): %w", inst.Index, chargeRev, err)
 		}
+		parkedWait = parkedWaitAfterWave(input, chargeRev, waveReason, types.CauseUnattributed, now)
 		detail = "attempt disposed terminal (no workload-caused evidence, relocation unavailable) and counted on the revision's retry ladder"
 	}
-	if err := status.StampFailed(ctx, input, inst.Index, termination); err != nil {
+	ended, err := endAttempt(ctx, input, inst, pods, termination, parkedWait)
+	if err != nil {
 		return outcome, fmt.Errorf("clear operation + stamp Failed (instance=%d): %w", inst.Index, err)
+	}
+	if !ended {
+		return DispositionWithheld, nil
 	}
 	// Suppress the per-reconcile warn+event storm when an instance is stuck
 	// oscillating on the SAME unresolved failure — e.g. a same-target update
@@ -293,6 +341,59 @@ func DisposeExpiredAttempt(ctx context.Context, deps types.Deps, input types.Rec
 		input.WarnInstanceFailed(inst.Index, "", fmt.Sprintf("%s: %s", reason, detail))
 	}
 	return outcome, nil
+}
+
+// endAttempt writes the disposed attempt's end in one row write. An
+// attempt the ladder counted whose own pod set is still alive is parked:
+// the row keeps the operation with the wait named on it, so the roll's next
+// attempt is visible on the row and the phase can follow a set the
+// kubelet goes on retrying — a runner restarted in place serves between
+// its crashes, a wedged pod comes up once its cause is gone. An attempt
+// whose pods are gone, or that no ladder counted, is cleared. Either
+// stamp lands only while the fresh row still carries the observed
+// attempt; it reports whether the row changed, and a withheld stamp
+// announces nothing.
+func endAttempt(ctx context.Context, input types.ReconcileInput, inst types.InstanceStatus, pods []*corev1.Pod, termination *types.InstanceTermination, wait string) (bool, error) {
+	if wait != "" && attemptParkable(inst, pods) {
+		return status.StampFailedParkingAttempt(ctx, input, inst.Index, *inst.Operation, termination, wait)
+	}
+	return status.StampFailedEndingAttempt(ctx, input, inst.Index, *inst.Operation, termination)
+}
+
+// attemptParkable reports whether a disposed attempt leaves a pod set the
+// row can follow: a recreate or in-place Update, single-pod or gang, with
+// a live pod of its own revision. A surge keeps a serving source beside
+// its replacement and is not parked.
+func attemptParkable(inst types.InstanceStatus, pods []*corev1.Pod) bool {
+	op := inst.Operation
+	if op == nil || op.Type != types.InstanceOperationUpdate || op.SurgeIndex != nil {
+		return false
+	}
+	if op.Step != types.UpdateStepDrain && op.Step != types.UpdateStepInPlace {
+		return false
+	}
+	for _, pod := range evidence.AttemptStuckPods(inst, pods, op.TargetRevision) {
+		if pod != nil && pod.DeletionTimestamp == nil && !query.IsTerminalPod(pod) {
+			return true
+		}
+	}
+	return false
+}
+
+// parkedWaitAfterWave names the wait a parked attempt stands behind once
+// this wave is counted: the hold when the ladder holds at it, else the
+// ladder's pacing. It is read off the same transition the block writer
+// applies, since the pass's observation predates the write.
+func parkedWaitAfterWave(input types.ReconcileInput, rev, reason string, cause types.FailureCause, now metav1.Time) string {
+	block := types.RetryBlock{TargetRevision: rev}
+	if cur := types.FindRetryBlock(input.ObservedState.RetryBlocks, rev); cur != nil {
+		block = *cur
+	}
+	types.ApplyUpdateFailureToRetryBlock(&block, input.UpdateRetryPolicy, now, reason, cause)
+	if block.State == types.RetryBlockHeld {
+		return string(types.RolloutHoldGateHeld)
+	}
+	return string(types.RolloutHoldGateRetryBlock)
 }
 
 // terminalChargeRevision names the revision a terminal wave counts
@@ -337,6 +438,18 @@ func sameTerminalFailure(inst types.InstanceStatus, reason string) bool {
 	return inst.LastFailure != nil && inst.LastFailure.Reason == reason
 }
 
+// attemptCrashLooping reports whether the attempt's failure is a crash
+// loop: the escalator classified CrashLoopBackOff, or a live pod of the
+// attempt shows either face of one. A container that keeps exiting does
+// so on any node, so the rebuild is never steered off the node it ran on.
+func attemptCrashLooping(pods []*corev1.Pod, targetRev, shortReason string) bool {
+	if shortReason == evidence.ReasonCrashLoop {
+		return true
+	}
+	pod, _ := evidence.FirstCrashLoopingPod(pods, targetRev)
+	return pod != nil
+}
+
 // migrationModeAllowsRelocation gates branch 2 on the effective
 // migration mode. Only the explicit Auto intent (Surge is its spelling
 // alias) enables controller-filed relocation; Never and the zero value
@@ -362,6 +475,14 @@ func revisionHasServed(rows []types.InstanceStatus, own types.InstanceStatus, re
 		}
 	}
 	return false
+}
+
+// revisionHeld reports whether the retry ladder has Held rev: the
+// ladder's verdict that the revision itself is the failure, which no
+// node is blamed for.
+func revisionHeld(input types.ReconcileInput, rev string) bool {
+	block := types.FindRetryBlock(input.ObservedState.RetryBlocks, rev)
+	return block != nil && block.State == types.RetryBlockHeld
 }
 
 // attemptTargetRevision resolves the revision an attempt is converging

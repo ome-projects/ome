@@ -33,6 +33,11 @@ type ReconcileInputs struct {
 	// Status.Components.<c>.Traffic.
 	ISVC *v1beta1.InferenceService
 
+	// Policies is the set of RolloutPolicy objects the run layer observed
+	// for this pass; the effective view resolves the spec's references
+	// through it outside a pinned run.
+	Policies rollout.Policies
+
 	// Client is the cached controller-runtime client. Used for
 	// per-revision Service ensure/GC and the coordination layer's own
 	// per-revision pod reads. The manager cache scopes the Pod informer
@@ -134,7 +139,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	groups := ResolveGroups(rollout.Effective(in.ISVC), GroupDefaults{RatioTolerancePercent: in.DefaultRatioTolerancePercent})
+	groups := ResolveGroups(rollout.Effective(in.ISVC, in.Policies), GroupDefaults{RatioTolerancePercent: in.DefaultRatioTolerancePercent})
 	result := &Result{}
 
 	// Bind a logger keyed to the ISVC so every downstream V(1)

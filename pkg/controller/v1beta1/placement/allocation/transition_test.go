@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
-	"k8s.io/utils/ptr"
 )
 
 func serving(count int32) Home {
@@ -19,7 +18,7 @@ func moving() Transition {
 	budget := int32(1)
 	return Transition{
 		From: Plan{Targets: map[string]int32{"a": 4}}, Current: map[string]int32{"a": 4},
-		Desired: Plan{Targets: map[string]int32{"b": 4}}, MaxSurge: &budget,
+		Desired: Plan{Targets: map[string]int32{"b": 4}}, Surge: int64(budget),
 		Homes: map[string]Home{"a": serving(4), "b": {Known: true, Eligible: true}},
 	}
 }
@@ -89,23 +88,21 @@ func TestTransitionWaitsForReadyRoutableReplacementAndRemoval(t *testing.T) {
 func TestTransitionSurgeIsSharedWithRollout(t *testing.T) {
 	tests := []struct {
 		name      string
-		allowance *int32
+		allowance int64
 		rollout   int32
 		want      Step
 	}{
-		{name: "rollout consumes allowance", allowance: ptr.To(int32(1)), rollout: 1,
+		{name: "rollout consumes allowance", allowance: 1, rollout: 1,
 			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "SurgeBudgetExhausted"}},
-		{name: "released allowance permits growth", allowance: ptr.To(int32(1)),
+		{name: "released allowance permits growth", allowance: 1,
 			want: Step{Targets: map[string]int32{"a": 4, "b": 1}, Reason: "AwaitingMemberConvergence"}},
-		{name: "unset blocks migration",
-			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "MigrationBlocked"}},
-		{name: "zero forbids excess", allowance: ptr.To(int32(0)),
+		{name: "zero forbids excess", allowance: 0,
 			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "SurgeBudgetExhausted"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			in := moving()
-			in.MaxSurge, in.RolloutReserved = tt.allowance, tt.rollout
+			in.Surge, in.RolloutReserved = tt.allowance, tt.rollout
 			got := advance(t, in)
 			if diff := cmp.Diff(tt.want, got); diff != "" {
 				t.Fatalf("step mismatch (-want +got):\n%s", diff)
@@ -237,7 +234,7 @@ func TestTransitionDrainCreditCannotBeSpentTwice(t *testing.T) {
 	in := Transition{
 		From:    Plan{Targets: map[string]int32{"a": 1, "b": 1}},
 		Current: map[string]int32{"a": 1, "b": 1, "c": 1},
-		Desired: Plan{Targets: map[string]int32{"c": 2}}, MaxSurge: &budget,
+		Desired: Plan{Targets: map[string]int32{"c": 2}}, Surge: int64(budget),
 		Homes: map[string]Home{"a": serving(1), "b": serving(1), "c": serving(1)},
 	}
 	step := advance(t, in)
@@ -314,7 +311,7 @@ func TestTransitionUnpublishedReadyHomeIsNotSurplus(t *testing.T) {
 			// The first plan never completed, so the serving home has no original
 			// floor. Losing its publication must not turn it into surplus.
 			in := Transition{
-				Current: map[string]int32{"a": 3, "b": 3}, Desired: Plan{Targets: map[string]int32{"b": 3}}, MaxSurge: ptr.To[int32](3),
+				Current: map[string]int32{"a": 3, "b": 3}, Desired: Plan{Targets: map[string]int32{"b": 3}}, Surge: 3,
 				Homes: map[string]Home{
 					"a": {Known: true, Applied: true, Ready: 3, Occupied: 3},
 					"b": {Known: true, Eligible: true, Applied: true, Occupied: 3},
@@ -394,7 +391,7 @@ func TestTransitionRejectsInvalidAccounting(t *testing.T) {
 		{"negative desired", func(in *Transition) { in.Desired.Targets["b"] = -1 }},
 		{"negative current", func(in *Transition) { in.Current["a"] = -1 }},
 		{"empty target name", func(in *Transition) { in.Current[""] = 1 }},
-		{"negative allowance", func(in *Transition) { *in.MaxSurge = -1 }},
+		{"negative allowance", func(in *Transition) { in.Surge = -1 }},
 		{"negative rollout reservation", func(in *Transition) { in.RolloutReserved = -1 }},
 		{"ready exceeds occupied", func(in *Transition) { in.Homes["a"] = Home{Known: true, Ready: 5, Occupied: 4} }},
 		{"absent but occupied", func(in *Transition) { in.Homes["a"] = Home{Known: true, Absent: true, Occupied: 1} }},
@@ -438,7 +435,7 @@ func TestTransitionsConvergeWithinSharedBudget(t *testing.T) {
 			}
 			floor := int32(1 + rng.IntN(30))
 			budget := int32(1 + rng.IntN(5))
-			in := Transition{From: partition(floor), Desired: partition(floor), MaxSurge: &budget,
+			in := Transition{From: partition(floor), Desired: partition(floor), Surge: int64(budget),
 				RolloutReserved: int32(rng.IntN(int(budget))), Homes: map[string]Home{}}
 			in.Current = maps.Clone(in.From.Targets)
 			if scenario%2 == 0 {

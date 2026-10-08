@@ -796,6 +796,35 @@ func TestRetargetKeepsUnmovedComponentStableKnown(t *testing.T) {
 	}
 }
 
+// A known pinned stable is carried through a retarget for a Component that
+// stayed on its pinned revision as much as for one that moved; the fresh run
+// resolves a stable afresh only where the pin recorded none.
+func TestRetargetCarriesAKnownStableForAnUnmovedComponent(t *testing.T) {
+	isvc := isvcFixture(v1beta1.RolloutGroup{})
+	isvc.Spec.Router = &v1beta1.RouterSpec{}
+	twoUnitRun(isvc, "rrrrrrrr", "aaaaaaaa")
+	isvc.Status.Rollout.ActiveRun.TargetRevisions[1].StableRevision = "zzzzzzzz"
+	in := testInputs(t, isvc, routerIR("llm-a-router-rrrrrrrr", "llm-a-router-ssssssss"), irFixture(oldRev, oldRev))
+
+	if _, err := Reconcile(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	active := isvc.Status.Rollout.ActiveRun
+	if active == nil || active.RunID == "creation" {
+		t.Fatalf("the router retarget must open a fresh run, got %+v", active)
+	}
+	for _, target := range active.TargetRevisions {
+		if target.Component != v1beta1.EngineComponent {
+			continue
+		}
+		if target.Revision != "aaaaaaaa" || target.StableRevision != "zzzzzzzz" {
+			t.Fatalf("unmoved engine must carry its pinned stable: %+v", target)
+		}
+		return
+	}
+	t.Fatal("the fresh run pins no engine target")
+}
+
 // A run opened with no stable revision (creation) whose canary unit never
 // armed must still close once the unit converges; otherwise the creation
 // plan stays pinned and later spec edits are ignored.

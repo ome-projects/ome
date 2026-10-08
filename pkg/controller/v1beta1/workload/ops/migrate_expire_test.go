@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -21,6 +23,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1034,6 +1037,73 @@ func TestMigrateExpiry_AcceptedNeverAllocated(t *testing.T) {
 	}
 	if !ledger.HasCompletedOrFailedRequest(uuid) {
 		t.Errorf("ledger must mirror the terminal Failed row")
+	}
+}
+
+// An Accepted record that expires names the cause it last waited on,
+// not the surge it never allocated: the pause or the parked repair the
+// drive wrote on it is the expiry's outcome on the record, in the ledger
+// and in the event.
+func TestMigrateExpiry_AcceptedRecordNamesTheCauseItWaitedOn(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(t *testing.T, f *migFixture)
+		want string
+	}{
+		{
+			name: "placement pause",
+			seed: func(_ *testing.T, f *migFixture) { f.pauseNewSurge = true },
+			want: "placement pause",
+		},
+		{
+			name: "parked repair",
+			seed: func(t *testing.T, f *migFixture) {
+				seedSourceFailedAtRunningRevision(t, f, 0, "CrashLoopBackOff", true, 0)
+			},
+			want: "repair is parked",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSinglePodMigFixture(t)
+			clk := f.withFakeClock()
+			f.recorder = record.NewFakeRecorder(16)
+			const uuid = "mig-waited"
+			f.records = []workload.MigrationRecord{mkMigRecordWithDeadline(uuid, 0, "node-a", clk.Now().Add(time.Hour))}
+			tc.seed(t, f)
+
+			if done, accepted := f.pass(t, uuid); done || accepted {
+				t.Fatalf("the move must defer without ownership: done=%v accepted=%v", done, accepted)
+			}
+			waited := f.record(t, uuid).Message
+			if !strings.Contains(waited, tc.want) {
+				t.Fatalf("record Message = %q, want the cause %q named", waited, tc.want)
+			}
+			migWedgeEvents(t, f)
+			sourceBefore := *findInstanceStatusOnIRForFixture(t, f, 0)
+
+			clk.SetTime(clk.Now().Add(2 * time.Hour))
+			if n := f.expire(t); n != 1 {
+				t.Fatalf("expiry: got %d, want 1", n)
+			}
+			rec := f.record(t, uuid)
+			if rec.Phase != workload.MigrationPhaseFailed || rec.CompletedAt == nil || rec.SurgeInstance != nil {
+				t.Fatalf("the queued record must close Failed with no surge; got %+v", *rec)
+			}
+			if want := "deadline exceeded in phase Accepted while " + waited; rec.Message != want {
+				t.Errorf("record Message = %q, want %q", rec.Message, want)
+			}
+			if row := ledgerRow(t, f, uuid); row.Phase != audit.PhaseFailed || row.Outcome != rec.Message {
+				t.Errorf("the ledger row must carry the same outcome; got %+v", row)
+			}
+			events := migWedgeEvents(t, f)
+			if countEventsWithReason(events, workload.EventReasonMigrationExpired) != 1 || !strings.Contains(events[0], waited) {
+				t.Errorf("want one %s event naming the cause; got %v", workload.EventReasonMigrationExpired, events)
+			}
+			if diff := cmp.Diff(sourceBefore, *findInstanceStatusOnIRForFixture(t, f, 0)); diff != "" {
+				t.Errorf("an Accepted-phase expiry must leave the source alone (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 

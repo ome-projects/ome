@@ -327,6 +327,37 @@ func TestHeldNotServing(t *testing.T) {
 	}
 }
 
+func TestHeldNotServingBy(t *testing.T) {
+	if HeldNotServingBy(nil, WriterUpdateSurgeDrain) {
+		t.Errorf("nil pod is held by nobody")
+	}
+	pod := newReadinessTestPod("p")
+	if HeldNotServingBy(pod, WriterUpdateSurgeDrain) {
+		t.Errorf("a pod without the condition is held by nobody")
+	}
+	held := messageList{{UserAgent: WriterDeleteDrain, Key: "0"}, {UserAgent: WriterUpdateSurgeDrain, Key: "update-surge-drain-0-1"}}
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type:    ConditionType,
+		Status:  corev1.ConditionFalse,
+		Message: held.dump(),
+	}}
+	if !HeldNotServingBy(pod, WriterUpdateSurgeDrain) || !HeldNotServingBy(pod, WriterDeleteDrain) {
+		t.Errorf("each listed writer holds the pod")
+	}
+	if HeldNotServingBy(pod, WriterUpdateInPlace) {
+		t.Errorf("a writer not on the list holds nothing")
+	}
+	pod.Status.Conditions[0].Status = corev1.ConditionTrue
+	if HeldNotServingBy(pod, WriterUpdateSurgeDrain) {
+		t.Errorf("a stale entry under Status=True is not a hold")
+	}
+	pod.Status.Conditions[0].Status = corev1.ConditionFalse
+	pod.Status.Conditions[0].Message = "not a list"
+	if HeldNotServingBy(pod, WriterUpdateSurgeDrain) {
+		t.Errorf("an unreadable writer list names nobody")
+	}
+}
+
 func TestAddRemove_PreservesKubeletConditions(t *testing.T) {
 	// Patches must NOT clobber kubelet-managed conditions like
 	// ContainersReady — the strategic-merge patch keyed by `type` leaves

@@ -9,12 +9,11 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"k8s.io/utils/ptr"
 )
 
 func wholeHomeMove() Transition {
 	in := moving()
-	in.MaxSurge = ptr.To[int32](4)
+	in.Surge = 4
 	return in
 }
 
@@ -23,10 +22,7 @@ func advanceWholeHomes(t *testing.T, in Transition) Step {
 	before := Transition{
 		From:    Plan{Targets: maps.Clone(in.From.Targets), Unassigned: in.From.Unassigned},
 		Current: maps.Clone(in.Current), Desired: Plan{Targets: maps.Clone(in.Desired.Targets), Unassigned: in.Desired.Unassigned},
-		Homes: maps.Clone(in.Homes), RolloutReserved: in.RolloutReserved,
-	}
-	if in.MaxSurge != nil {
-		before.MaxSurge = ptr.To(*in.MaxSurge)
+		Homes: maps.Clone(in.Homes), Surge: in.Surge, RolloutReserved: in.RolloutReserved,
 	}
 	got, err := AdvanceWholeHomes(in)
 	if err != nil {
@@ -45,18 +41,16 @@ func TestWholeHomeTransitionBudget(t *testing.T) {
 		want   Step
 	}{
 		{name: "full destination fits", want: Step{Targets: map[string]int32{"a": 4, "b": 4}, Reason: "AwaitingMemberConvergence"}},
-		{name: "unset allowance", change: func(in *Transition) { in.MaxSurge = nil },
-			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "MigrationBlocked"}},
-		{name: "zero allowance", change: func(in *Transition) { in.MaxSurge = ptr.To[int32](0) },
+		{name: "zero allowance", change: func(in *Transition) { in.Surge = 0 },
 			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "SurgeBudgetExhausted"}},
-		{name: "partial destination cannot fit", change: func(in *Transition) { in.MaxSurge = ptr.To[int32](3) },
+		{name: "partial destination cannot fit", change: func(in *Transition) { in.Surge = 3 },
 			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "SurgeBudgetExhausted"}},
 		{name: "pending rollout shares allowance", change: func(in *Transition) { in.RolloutReserved = 1 },
 			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "SurgeBudgetExhausted"}},
 		{name: "physical surplus shares allowance", change: func(in *Transition) { in.Homes["a"] = serving(5) },
 			want: Step{Targets: map[string]int32{"a": 4, "b": 0}, Reason: "SurgeBudgetExhausted"}},
 		{name: "rollout and physical surplus both fit", change: func(in *Transition) {
-			in.RolloutReserved, in.MaxSurge = 1, ptr.To[int32](6)
+			in.RolloutReserved, in.Surge = 1, 6
 			in.Homes["a"] = serving(5)
 		}, want: Step{Targets: map[string]int32{"a": 4, "b": 4}, Reason: "AwaitingMemberConvergence"}},
 		{name: "unknown destination", change: func(in *Transition) { in.Homes["b"] = Home{} },
@@ -69,7 +63,7 @@ func TestWholeHomeTransitionBudget(t *testing.T) {
 			want: Step{Targets: map[string]int32{"a": 0, "b": 0}, Reason: "AwaitingMemberConvergence"}},
 		{name: "wide totals", change: func(in *Transition) {
 			in.From.Targets["a"], in.Current["a"], in.Desired.Targets["b"] = math.MaxInt32, math.MaxInt32, math.MaxInt32
-			in.MaxSurge, in.Homes["a"] = ptr.To[int32](math.MaxInt32), serving(math.MaxInt32)
+			in.Surge, in.Homes["a"] = math.MaxInt32, serving(math.MaxInt32)
 		}, want: Step{Targets: map[string]int32{"a": math.MaxInt32, "b": math.MaxInt32}, Reason: "AwaitingMemberConvergence"}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -196,12 +190,12 @@ func TestWholeHomeTransitionIndependentTargets(t *testing.T) {
 		}, want: Step{Targets: map[string]int32{"a": 4, "b": 0, "c": 4}, Reason: "AwaitingMemberConvergence"}},
 		{name: "later smaller home fits remaining allowance", in: Transition{
 			From: Plan{Targets: map[string]int32{"a": 4}}, Current: map[string]int32{"a": 4},
-			Desired: Plan{Targets: map[string]int32{"b": 3, "c": 1}}, MaxSurge: ptr.To[int32](1),
+			Desired: Plan{Targets: map[string]int32{"b": 3, "c": 1}}, Surge: 1,
 			Homes: map[string]Home{"a": serving(4), "b": {Known: true, Eligible: true}, "c": {Known: true, Eligible: true}},
 		}, want: Step{Targets: map[string]int32{"a": 4, "b": 0, "c": 1}, Reason: "AwaitingMemberConvergence"}},
 		{name: "one replacement cannot drain two homes", in: Transition{
 			From: Plan{Targets: map[string]int32{"a": 2, "b": 2}}, Current: map[string]int32{"a": 2, "b": 2, "c": 4},
-			Desired: Plan{Targets: map[string]int32{"c": 4}}, MaxSurge: ptr.To[int32](4),
+			Desired: Plan{Targets: map[string]int32{"c": 4}}, Surge: 4,
 			Homes: map[string]Home{"a": serving(2), "b": serving(2), "c": {Known: true, Applied: true, Routable: true, Ready: 3, Occupied: 4}},
 		}, want: Step{Targets: map[string]int32{"a": 2, "b": 2, "c": 4}, Drain: []string{"a"}, Reason: "AwaitingMemberConvergence"}},
 		{name: "explicit lower policy applies in full", in: Transition{
@@ -232,7 +226,7 @@ func TestWholeHomeTransitionsConvergeWithinSharedBudget(t *testing.T) {
 				return Plan{Targets: map[string]int32{names[order[0]]: floor, names[order[1]]: floor}}
 			}
 			reserved := int32(rng.IntN(3))
-			in := Transition{From: partition(), Desired: partition(), MaxSurge: ptr.To(floor + reserved), RolloutReserved: reserved, Homes: map[string]Home{}}
+			in := Transition{From: partition(), Desired: partition(), Surge: int64(floor + reserved), RolloutReserved: reserved, Homes: map[string]Home{}}
 			in.Current = maps.Clone(in.From.Targets)
 			for _, name := range names {
 				home := serving(in.Current[name])
@@ -256,7 +250,7 @@ func TestWholeHomeTransitionsConvergeWithinSharedBudget(t *testing.T) {
 						ready += int64(min(target, home.Ready))
 					}
 				}
-				if limit := int64(2*floor + *in.MaxSurge); occupied > limit {
+				if limit := int64(2*floor) + in.Surge; occupied > limit {
 					t.Fatalf("occupied %d exceeds allowance %d at iteration %d: input %+v step %+v", occupied, limit, iteration, in, step)
 				}
 				if ready < int64(2*floor) {

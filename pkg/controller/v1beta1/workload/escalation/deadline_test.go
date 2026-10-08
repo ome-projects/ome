@@ -798,3 +798,26 @@ func TestGangSurgeSource_HeldWhileItsSurgeWaitsOnQuota(t *testing.T) {
 		t.Errorf("event count: got %d want 0", event.count)
 	}
 }
+
+// A parked attempt holds no clock: its deadline stays parked whether or
+// not another authority holds the row, so the pass that re-arms released
+// deadlines leaves it alone.
+func TestReconcileGatedDeadlines_ParkedAttemptKeepsItsDeadlineParked(t *testing.T) {
+	parked := []workloadtypes.InstanceStatus{{
+		Index: 0,
+		Phase: workloadtypes.InstancePhaseUpdating,
+		Operation: &workloadtypes.InstanceOperation{
+			Type:           workloadtypes.InstanceOperationUpdate,
+			Step:           workloadtypes.UpdateStepParked,
+			TargetRevision: "own-engine-newhash",
+			Waiting:        string(workloadtypes.RolloutHoldGateRetryBlock),
+		},
+	}}
+	input, store, _ := expireFixture(parked)
+	if err := escalation.ReconcileGatedDeadlines(context.Background(), input, parked, nil, 30*time.Minute); err != nil {
+		t.Fatalf("ReconcileGatedDeadlines: %v", err)
+	}
+	if d := (*store)[0].Operation.Deadline; !d.IsZero() {
+		t.Errorf("Deadline: got %v want parked (zero) for an attempt its ladder paces", d)
+	}
+}

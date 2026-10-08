@@ -336,6 +336,25 @@ func HeldNotServing(pod *corev1.Pod) bool {
 	return cond != nil && cond.Status != corev1.ConditionTrue
 }
 
+// HeldNotServingBy reports whether the named writer is among those
+// currently holding the pod out of rotation: the condition exists with
+// Status != True and its writer list carries an entry under userAgent.
+func HeldNotServingBy(pod *corev1.Pod, userAgent string) bool {
+	if !HeldNotServing(pod) {
+		return false
+	}
+	list, err := parseList(findCondition(pod, ConditionType).Message)
+	if err != nil {
+		return false
+	}
+	for _, m := range list {
+		if m.UserAgent == userAgent {
+			return true
+		}
+	}
+	return false
+}
+
 // ReadyAndServing reports whether the pod is serving: its Ready condition
 // and the serving gate are both True. The gate is read on its own because
 // a drain flips it before the kubelet folds it into Ready; Ready is read on

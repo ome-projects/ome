@@ -9,6 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -105,11 +106,12 @@ type ReconcileInput struct {
 	ScaleUpPodBatchSize *int32
 
 	// ScaleDownPodBatchSize bounds active delete work in Pod-equivalent units.
+	// Percentages resolve against the current Component footprint, rounding up.
 	// Selection remains atomic at the Instance boundary, so a gang is either
 	// selected in full or deferred. The first eligible Instance may exceed a
 	// positive budget and proceeds alone. A nil pointer preserves unbounded
 	// candidate selection. A non-nil zero value fails closed.
-	ScaleDownPodBatchSize *int32
+	ScaleDownPodBatchSize *intstr.IntOrString
 
 	// ScaleDownRequeueInterval is the configured poll cadence while a delete
 	// wave is waiting on drain or resource disappearance. Zero disables cadence
@@ -215,6 +217,14 @@ type ReconcileInput struct {
 	// Nil is treated as always-allowed.
 	UpdateGate func(strategy UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (allowed bool, gate RolloutHoldGate, denyReason string)
 
+	// PlanGate, when non-nil, is asked before every fresh Update start, the
+	// starts that skip UpdateGate included: it is the adapter's precondition
+	// that the roll executes a pinned plan, which no outage of the Instance
+	// being replaced can waive. allowed=false denies the start with the hold
+	// it names, ahead of the budget and the capacity gates. Nil is treated
+	// as always-allowed.
+	PlanGate func() (allowed bool, gate RolloutHoldGate, denyReason string)
+
 	// DrainGate, when non-nil, is asked by a surge update right before it
 	// takes its source out of rotation, with the replacement already
 	// serving. It is the drain-time half of a cross-Component gate that
@@ -239,14 +249,16 @@ type ReconcileInput struct {
 	// RecordRolloutHold, when non-nil, is called at most once per Update
 	// pass with the pass's verdict: non-nil when a fresh start was denied
 	// — by the per-Component budget or UpdateGate at admission, or by the
-	// target's RetryBlock at the trigger stage — and nothing else
-	// progressed this pass, nil when the pass observed no denial or an
-	// Update was admitted (forward progress clears any prior hold). A
-	// roll with nothing left to do plans no Update pass and reports nil at
-	// the pass's position instead. When the pass is not reached at all,
-	// the adapter's status writer reads the same-target RetryBlock/Held
-	// state from persisted status and otherwise keeps the hold it last
-	// persisted.
+	// target's RetryBlock at the trigger stage — or when the Instances
+	// already on the target that do not serve it hold the roll, and
+	// nothing else progressed this pass; nil when the pass observed no
+	// denial or an Update was admitted (forward progress clears any prior
+	// hold). A roll with nothing left to do plans no Update pass and
+	// reports nil at the pass's position instead, and a pass the restart
+	// pass consumed reports the hold its parked Instances stand behind at
+	// that position. When the pass is not reached at all, the adapter's
+	// status writer reads the same-target RetryBlock/Held state from
+	// persisted status and otherwise keeps the hold it last persisted.
 	RecordRolloutHold func(hold *RolloutHold)
 
 	// MutateRetryBlock reads-modifies-writes the owner's persisted

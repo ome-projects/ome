@@ -116,6 +116,41 @@ func (d *driver) takeRejection(verb string, obj client.Object) (error, string) {
 	return nil, ""
 }
 
+// createRejectionEffect applies what a refused create says about the
+// cluster: an AlreadyExists answer means the name is taken, so the pod
+// the engine rendered lands as the earlier writer's object, observed by
+// the watch like any create. Every other refusal leaves the cluster alone.
+func (d *driver) createRejectionEffect(ctx context.Context, c client.WithWatch, obj client.Object, err error) error {
+	pod, isPod := obj.(*corev1.Pod)
+	if !isPod || !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	if cerr := c.Create(ctx, pod); cerr != nil {
+		return fmt.Errorf("replay: land pod %s behind an already-exists refusal: %w", pod.Name, cerr)
+	}
+	index, ierr := instanceIndexOf(pod)
+	if ierr != nil {
+		return ierr
+	}
+	d.expectations.ObservedCreate(d.opts.Namespace, d.opts.OwnerName, d.opts.Component, index)
+	return err
+}
+
+// rejectionEffect applies what a refusal says about the cluster before it
+// is returned: a NotFound answer means the object is gone, so a pod the
+// engine was writing to leaves the apiserver as if the scenario had
+// deleted it. Every other refusal leaves the cluster as it was.
+func (d *driver) rejectionEffect(ctx context.Context, obj client.Object, err error) error {
+	pod, isPod := obj.(*corev1.Pod)
+	if !isPod || !apierrors.IsNotFound(err) {
+		return err
+	}
+	if rerr := d.removePod(ctx, pod.Name); rerr != nil && !apierrors.IsNotFound(rerr) {
+		return fmt.Errorf("replay: remove pod %s behind a not-found refusal: %w", pod.Name, rerr)
+	}
+	return err
+}
+
 // resourceOf names the resource a scenario arms a rejection against. It is
 // derived from the Go type rather than from TypeMeta, which controller-
 // runtime leaves empty on typed objects, so every kind the driver can see
@@ -180,10 +215,12 @@ func (d *driver) staging(write func() error) error {
 	return write()
 }
 
-// deleteObject performs one delete against the fake apiserver. A pod held
-// Terminating by a dead kubelet is held by the driver rather than by a
-// finalizer, so only a grace-zero delete — the escalation's own — takes
-// the object out; a graceful delete on it changes nothing, exactly as it
+// deleteObject performs one delete against the fake apiserver. A grace-zero
+// delete — the escalation's own — removes a pod at once, as the apiserver
+// removes an object it does not wait for a kubelet to release; the
+// driver's finalizer stands in for that kubelet and does not survive it. A
+// pod held Terminating by a dead kubelet is held by the driver rather than
+// by a finalizer, so a graceful delete on it changes nothing, exactly as it
 // changes nothing on a real cluster where the object is already on its way
 // out. Every other delete goes to the client untouched, and a pod that
 // survives it has the instant it began terminating recorded.
@@ -192,11 +229,11 @@ func (d *driver) deleteObject(ctx context.Context, c client.WithWatch, obj clien
 	if !isPod {
 		return c.Delete(ctx, obj, opts...)
 	}
-	if hold := d.terminating[pod.Name]; hold != nil && hold.kubeletStuck {
-		if !zeroGrace(opts) {
-			return nil
-		}
+	if zeroGrace(opts) {
 		return d.reapStuckPod(ctx, pod.Name)
+	}
+	if hold := d.terminating[pod.Name]; hold != nil && hold.kubeletStuck {
+		return nil
 	}
 	if err := c.Delete(ctx, obj, opts...); err != nil {
 		return err
@@ -225,10 +262,10 @@ func (d *driver) recordTeardown(ctx context.Context, c client.WithWatch, name st
 	return nil
 }
 
-// reapStuckPod completes the removal of a wedged pod: the escalation's
-// grace-zero delete is what a real apiserver honors past a dead kubelet,
-// so the object leaves exactly as the scenario's own pod.deleted would
-// take it out.
+// reapStuckPod completes the removal of a pod on a grace-zero delete: the
+// escalation's delete is what a real apiserver honors without waiting for
+// a kubelet, so the object leaves exactly as the scenario's own
+// pod.deleted would take it out.
 func (d *driver) reapStuckPod(ctx context.Context, name string) error {
 	delete(d.terminating, name)
 	return d.staging(func() error { return d.removePodNow(ctx, name) })
@@ -368,7 +405,7 @@ func (d *driver) interceptors() interceptor.Funcs {
 				if d.traced(obj) {
 					d.trace.object(kindOf(obj), "create-rejected", obj.GetName(), "rejection="+label)
 				}
-				return err
+				return d.createRejectionEffect(ctx, c, obj, err)
 			}
 			if err := c.Create(ctx, obj, opts...); err != nil {
 				if d.traced(obj) {
@@ -396,7 +433,7 @@ func (d *driver) interceptors() interceptor.Funcs {
 				if d.traced(obj) {
 					d.trace.object(kindOf(obj), "delete-rejected", obj.GetName(), "rejection="+label)
 				}
-				return err
+				return d.rejectionEffect(ctx, obj, err)
 			}
 			if err := d.deleteObject(ctx, c, obj, opts...); err != nil {
 				if d.traced(obj) {
@@ -449,7 +486,7 @@ func (d *driver) recordWrite(ctx context.Context, obj client.Object, verb, baseV
 		if traced {
 			d.trace.object(kindOf(obj), verb+"-rejected", obj.GetName(), "rejection="+label)
 		}
-		return err
+		return d.rejectionEffect(ctx, obj, err)
 	}
 	if err := write(); err != nil {
 		if traced {

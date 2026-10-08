@@ -287,7 +287,7 @@ func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]in
 			counters.AvailableReplicas++
 		}
 		counters.NextAvailableIn = status.EarliestPending(counters.NextAvailableIn, current.NextAvailableIn)
-		if targetRevName != "" && rowOnTargetRevision(row, target) {
+		if targetRevName != "" && status.RowOnRevision(row, target) {
 			counters.UpdatedReplicas++
 			if status.InstanceMeetsThreshold(current.PodCount, current.ReadyPodCount, desired) {
 				counters.UpdatedReadyReplicas++
@@ -304,26 +304,4 @@ func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]in
 	}
 	counters.Replicas = int32(len(statuses))
 	return statuses, counters, nil
-}
-
-// rowOnTargetRevision reports whether a row counts toward UpdatedReplicas:
-// it runs the Component's UpdateRevision and has no roll left to do.
-//
-// Running the target is necessary but not sufficient. An Update operation
-// pins the revision it opened against, and a retarget while that operation
-// is in flight leaves the pin behind the Component: the row still owes a
-// roll to the new target, and a surge already under way will promote its
-// replacement onto the pinned revision first. Counting such a row as
-// updated publishes a convergence the Component has not reached, which
-// reads to consumers as an idle Component and closes a rollout that is
-// still moving.
-func rowOnTargetRevision(row *types.InstanceStatus, target query.RevisionID) bool {
-	if !query.RevisionFromName(row.RunningRevision).Same(target) {
-		return false
-	}
-	op := row.Operation
-	if op == nil || op.Type != types.InstanceOperationUpdate || op.TargetRevision == "" {
-		return true
-	}
-	return query.RevisionFromName(op.TargetRevision).Same(target)
 }

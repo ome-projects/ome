@@ -118,13 +118,30 @@ type driver struct {
 	terminating map[string]*podTeardown
 	// migrations is the owner's persisted status.migrations list.
 	migrations []types.MigrationRecord
+	// published is the pod count per row the status publication wrote from
+	// the previous pass's observation; the engine reads it as PodCount at
+	// the start of the next pass.
+	published map[int32]int32
 	// migrationRequests counts the requests the scenario has made, so an
 	// unnamed one gets a stable identity.
 	migrationRequests int
 	// teardown marks every pass from the owner's deletion onward: the
 	// planned index set reads as empty and every Instance is a
-	// scale-down extra.
-	teardown bool
+	// scale-down extra. teardownAt is the owner's deletion instant, the
+	// anchor of its teardown deadline.
+	teardown   bool
+	teardownAt time.Time
+	// ownerGone marks the owner purged past its teardown deadline: no
+	// object is left for a pass to act on.
+	ownerGone bool
+	// usesStaleReads marks a scenario that stages ctrl.staleRead, which is
+	// what makes the driver snapshot the cluster at the end of every tick;
+	// staleCache is that snapshot, staleCacheTick the tick it closed, and
+	// stalePass marks the pass reading its cache from it.
+	usesStaleReads bool
+	staleCache     client.Reader
+	staleCacheTick int
+	stalePass      bool
 	// rollbackImage pins the roll to the stored revision that image's
 	// template minted. Empty rolls toward the rendered template.
 	rollbackImage string
@@ -196,6 +213,9 @@ func newDriver(ctx context.Context, s *Scenario, opts Options) (*driver, error) 
 		return nil, fmt.Errorf("replay: reconcile headless service: %w", err)
 	}
 
+	if err := d.seedMigrations(s.Initial.Migrations); err != nil {
+		return nil, err
+	}
 	rows, err := d.seedRows(ctx, s.Initial.Rows)
 	if err != nil {
 		return nil, err
@@ -207,7 +227,20 @@ func newDriver(ctx context.Context, s *Scenario, opts Options) (*driver, error) 
 	d.store = NewRowStore(rows, blocks, d.trace)
 	d.store.SetOwner(d.owner.UID, d.owner.Generation)
 
+	if d.currentRevision, err = d.revisionFor(ctx, s.Initial.CurrentRevision); err != nil {
+		return nil, err
+	}
 	if err := d.seedPods(ctx, s.Initial.Pods); err != nil {
+		return nil, err
+	}
+	for _, tick := range s.Timeline {
+		for _, ev := range tick.Events {
+			if ev.ID == "ctrl.staleRead" {
+				d.usesStaleReads = true
+			}
+		}
+	}
+	if err := d.refreshStaleCache(ctx, 0); err != nil {
 		return nil, err
 	}
 	return d, nil
@@ -275,6 +308,27 @@ func (d *driver) podTemplate(image string) *corev1.PodSpec {
 	}
 }
 
+// podMeta renders the pod template's own labels and annotations, nil when
+// the scenario declares none so the revision keeps its metadata-free
+// payload.
+func (d *driver) podMeta() *metav1.ObjectMeta {
+	if len(d.spec.PodLabels) == 0 && len(d.spec.PodAnnotations) == 0 {
+		return nil
+	}
+	return &metav1.ObjectMeta{Labels: copyMap(d.spec.PodLabels), Annotations: copyMap(d.spec.PodAnnotations)}
+}
+
+func copyMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
 // sortedEnv renders the scenario's environment in key order, because the
 // template is hashed and a map iteration would mint a different revision
 // on every run.
@@ -297,8 +351,12 @@ func sortedEnv(env map[string]string) []corev1.EnvVar {
 // desiredSpec projects the driver's mutable spec onto the engine's input.
 func (d *driver) desiredSpec() (types.WorkloadDesiredSpec, error) {
 	strategy := types.UpdateStrategy{Type: types.UpdateStrategyType(d.spec.Strategy)}
-	if d.spec.MaxUnavailable != "" || d.spec.MaxSurge != "" {
+	if d.spec.MaxUnavailable != "" || d.spec.MaxSurge != "" || d.spec.Partition != nil {
 		rolling := &types.RollingUpdate{}
+		if d.spec.Partition != nil {
+			partition := *d.spec.Partition
+			rolling.Partition = &partition
+		}
 		if d.spec.MaxUnavailable != "" {
 			value := intstr.Parse(d.spec.MaxUnavailable)
 			rolling.MaxUnavailable = &value
@@ -332,6 +390,7 @@ func (d *driver) desiredSpec() (types.WorkloadDesiredSpec, error) {
 		MinReadySeconds:         d.spec.MinReadySeconds,
 		Runners:                 []types.Runner{{Name: DefaultRunner, Size: 1}},
 		PodSpec:                 d.podTemplate(d.spec.Image),
+		PodTemplateObjectMeta:   d.podMeta(),
 		Lifecycle:               lifecycle,
 		Paused:                  d.spec.Paused,
 		PauseFreeze:             d.spec.PauseFreeze,
@@ -359,7 +418,7 @@ func (d *driver) ensureRevision(ctx context.Context, image string) (*appsv1.Cont
 	}
 	target, collision, err := revision.EnsureControllerRevision(
 		ctx, d.cli, d.cli, d.owner, v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"),
-		key, d.podTemplate(image), nil, d.collisionCount, parentUID,
+		key, d.podTemplate(image), d.podMeta(), d.collisionCount, parentUID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("replay: ensure revision: %w", err)
@@ -389,20 +448,33 @@ func (d *driver) bumpGeneration(ctx context.Context) error {
 	return nil
 }
 
-// revisionFor resolves a scenario's symbolic revision name.
-func (d *driver) revisionFor(ctx context.Context, symbol string) (string, error) {
-	switch symbol {
-	case "":
-		return "", nil
-	case "current":
-		rev, err := d.ensureRevision(ctx, d.spec.Image)
-		if err != nil {
-			return "", err
-		}
-		return rev.Name, nil
-	default:
-		return "", fmt.Errorf("replay: unknown revision symbol %q (use \"current\")", symbol)
+// revisionFor resolves a scenario's revision name to the ControllerRevision
+// it mints: "current" is the initial spec's template, an image reference
+// is that image's template, and empty is no revision.
+func (d *driver) revisionFor(ctx context.Context, name string) (string, error) {
+	image, err := revisionImage(name, d.spec.Image)
+	if err != nil || image == "" {
+		return "", err
 	}
+	rev, err := d.ensureRevision(ctx, image)
+	if err != nil {
+		return "", err
+	}
+	return rev.Name, nil
+}
+
+// revisionImage maps a revision name to the image whose template mints
+// it. An image reference is recognized by its registry path or tag.
+func revisionImage(name, current string) (string, error) {
+	switch {
+	case name == "":
+		return "", nil
+	case name == "current":
+		return current, nil
+	case strings.ContainsAny(name, "/:"):
+		return name, nil
+	}
+	return "", fmt.Errorf("replay: revision %q: name a revision as \"current\" or as the image whose template minted it", name)
 }
 
 func (d *driver) seedRows(ctx context.Context, specs []RowSpec) ([]types.InstanceStatus, error) {
@@ -422,6 +494,9 @@ func (d *driver) seedRows(ctx context.Context, specs []RowSpec) ([]types.Instanc
 			return nil, err
 		}
 		row.RunningRevision = running
+		if row.TargetRevision, err = d.revisionFor(ctx, spec.TargetRevision); err != nil {
+			return nil, err
+		}
 		if spec.ReadySince != "" {
 			at, err := d.offset("rows.readySince", spec.ReadySince)
 			if err != nil {
@@ -430,9 +505,176 @@ func (d *driver) seedRows(ctx context.Context, specs []RowSpec) ([]types.Instanc
 			stamp := metav1.NewTime(at)
 			row.ReadySince = &stamp
 		}
+		if spec.Operation != nil {
+			if row.Operation, err = d.seedOperation(ctx, spec, row); err != nil {
+				return nil, err
+			}
+		}
+		// The engine's own ownership table (types.StateOf) decides whether the row is a state
+		// of the machine; a shape it does not name is a seed nothing drives.
+		if types.StateOf(&row) == types.StateUnknown {
+			return nil, fmt.Errorf("replay: rows[%d]: phase %q with operation %s names no state of the instance machine",
+				spec.Index, spec.Phase, describeOperation(row.Operation))
+		}
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+// seedOperation builds the operation a row resumes from, with the
+// identity and timing fields the engine's own stamps write.
+func (d *driver) seedOperation(ctx context.Context, spec RowSpec, row types.InstanceStatus) (*types.InstanceOperation, error) {
+	o := spec.Operation
+	field := fmt.Sprintf("rows[%d].operation", spec.Index)
+	if o.Type == "" || o.Step == "" {
+		return nil, fmt.Errorf("replay: %s: an operation names its type and step", field)
+	}
+	if spec.Phase == "" {
+		return nil, fmt.Errorf("replay: %s: an operation needs the phase the row carries it in", field)
+	}
+	startedAt, err := d.offset(field+".startedAt", o.StartedAt)
+	if err != nil {
+		return nil, err
+	}
+	lastProgressAt := startedAt
+	if o.LastProgressAt != "" {
+		if lastProgressAt, err = d.offset(field+".lastProgressAt", o.LastProgressAt); err != nil {
+			return nil, err
+		}
+	}
+	var deadline metav1.Time
+	if o.Deadline != "" {
+		at, err := d.offset(field+".deadline", o.Deadline)
+		if err != nil {
+			return nil, err
+		}
+		deadline = metav1.NewTime(at)
+	} else {
+		timeout, err := ParseDuration("spec.instanceReadyTimeout", d.spec.InstanceReadyTimeout)
+		if err != nil {
+			return nil, err
+		}
+		deadline = types.DeadlineAt(metav1.NewTime(startedAt), timeout)
+	}
+	target, err := d.revisionFor(ctx, o.TargetRevision)
+	if err != nil {
+		return nil, err
+	}
+	op := &types.InstanceOperation{
+		Type:           types.InstanceOperationType(o.Type),
+		Step:           o.Step,
+		TargetRevision: target,
+		Strategy:       types.UpdateStrategyType(o.Strategy),
+		RequestUUID:    o.RequestUUID,
+		Reason:         o.Reason,
+		Waiting:        o.Waiting,
+		RetryCount:     o.RetryCount,
+		StartedAt:      metav1.NewTime(startedAt),
+		LastProgressAt: metav1.NewTime(lastProgressAt),
+		Deadline:       deadline,
+	}
+	if o.SurgeIndex != nil {
+		sibling := *o.SurgeIndex
+		op.SurgeIndex = &sibling
+	}
+	switch op.Type {
+	case types.InstanceOperationUpdate:
+		if op.TargetRevision == "" {
+			op.TargetRevision = row.TargetRevision
+		}
+		if op.TargetRevision == "" {
+			return nil, fmt.Errorf("replay: %s: an Update operation converges toward a target revision", field)
+		}
+	case types.InstanceOperationMigrate:
+		if op.RequestUUID == "" || op.SurgeIndex == nil {
+			return nil, fmt.Errorf("replay: %s: a Migrate pin carries the request uuid and the paired index", field)
+		}
+		if types.FindMigrationRecord(d.migrations, op.RequestUUID) == nil {
+			return nil, fmt.Errorf("replay: %s: no initial.migrations record carries uuid %q", field, op.RequestUUID)
+		}
+	}
+	op.ID = seededOperationID(op, spec.Index, types.InstancePhase(spec.Phase))
+	return op, nil
+}
+
+// seededOperationID mints the id in the shape the engine's own stamp for
+// the operation would have minted it, so a resumed operation reads in a
+// trace exactly as one the engine opened.
+func seededOperationID(op *types.InstanceOperation, index int32, phase types.InstancePhase) string {
+	unix := op.StartedAt.Unix()
+	switch {
+	case op.Type == types.InstanceOperationMigrate && phase == types.InstancePhaseCreating:
+		return fmt.Sprintf("migrate-%s-surge-%d", op.RequestUUID, unix)
+	case op.Type == types.InstanceOperationMigrate:
+		return fmt.Sprintf("migrate-%s-%d", op.RequestUUID, unix)
+	case op.Step == types.UpdateStepGangSurgeTarget || op.Step == types.UpdateStepGangSurgeTargetCleanup:
+		return fmt.Sprintf("gangsurgetarget-%d-%d", index, unix)
+	}
+	return fmt.Sprintf("%s-%d-%d", strings.ToLower(string(op.Type)), index, unix)
+}
+
+func describeOperation(op *types.InstanceOperation) string {
+	if op == nil {
+		return "nil"
+	}
+	return string(op.Type) + "/" + op.Step
+}
+
+// seedMigrations records the owner's status.migrations entries, with the
+// fields the request's acceptance and the surge allocation write.
+func (d *driver) seedMigrations(specs []MigrationSpec) error {
+	timeout, err := ParseDuration("spec.instanceReadyTimeout", d.spec.InstanceReadyTimeout)
+	if err != nil {
+		return err
+	}
+	for i, spec := range specs {
+		field := fmt.Sprintf("migrations[%d]", i)
+		d.migrationRequests++
+		uuid := spec.UUID
+		if uuid == "" {
+			uuid = fmt.Sprintf("migration-%d", d.migrationRequests)
+		}
+		if types.FindMigrationRecord(d.migrations, uuid) != nil {
+			return fmt.Errorf("replay: %s: uuid %s is already recorded", field, uuid)
+		}
+		startedAt, err := d.offset(field+".startedAt", spec.StartedAt)
+		if err != nil {
+			return err
+		}
+		phase := types.MigrationPhase(spec.Phase)
+		if phase == "" {
+			phase = types.MigrationPhaseAccepted
+			if spec.SurgeIndex != nil {
+				phase = types.MigrationPhaseSurgePending
+			}
+		}
+		started := metav1.NewTime(startedAt)
+		record := types.MigrationRecord{
+			RequestUUID:    uuid,
+			Trigger:        types.MigrationTriggerManual,
+			SourceInstance: spec.Instance,
+			FromNode:       spec.FromNode,
+			Reason:         spec.Reason,
+			Message:        spec.Message,
+			Phase:          phase,
+			StartedAt:      started,
+			Deadline:       types.DeadlineAt(started, timeout),
+		}
+		if spec.SurgeIndex != nil {
+			surge := *spec.SurgeIndex
+			record.SurgeInstance = &surge
+			allocatedAt := startedAt
+			if spec.AllocatedAt != "" {
+				if allocatedAt, err = d.offset(field+".allocatedAt", spec.AllocatedAt); err != nil {
+					return err
+				}
+			}
+			allocated := metav1.NewTime(allocatedAt)
+			record.AllocatedAt = &allocated
+		}
+		d.migrations = append(d.migrations, record)
+	}
+	return nil
 }
 
 func (d *driver) seedRetryBlocks(ctx context.Context, specs []RetryBlockSpec) ([]types.RetryBlock, error) {
@@ -499,6 +741,11 @@ func (d *driver) seedPods(ctx context.Context, specs []PodSpec) error {
 				return err
 			}
 		}
+		if spec.Terminating {
+			if err := d.staging(func() error { return d.cli.Delete(ctx, pod) }); err != nil {
+				return fmt.Errorf("replay: seed terminating pod %s: %w", pod.Name, err)
+			}
+		}
 	}
 	return nil
 }
@@ -524,7 +771,7 @@ func (d *driver) renderPod(spec PodSpec, rev *appsv1.ControllerRevision) (*corev
 	}
 	pod, err := workloadops.RenderWithRevision(
 		d.owner, v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"), d.key(),
-		d.podTemplate(image), nil, plan, inst, runner, spec.Ordinal,
+		d.podTemplate(image), d.podMeta(), plan, inst, runner, spec.Ordinal,
 		query.RevisionHashFromControllerRevisionName(rev.Name), nil,
 	)
 	if err != nil {
@@ -568,10 +815,25 @@ func (d *driver) applyPodStatus(ctx context.Context, name string, spec PodSpec) 
 // runTick applies a tick's events and then runs exactly one reconcile.
 func (d *driver) runTick(ctx context.Context, tick Tick) error {
 	d.trace.beginTick(tick.Tick, tick.Note)
+	d.store.BeginPass()
 	for _, ev := range tick.Events {
 		if err := d.apply(ctx, ev); err != nil {
 			return err
 		}
+	}
+	// The adapter's teardown pass checks the deadline before it dispatches
+	// anything, and once the owner is gone no pass runs at all.
+	if d.ownerGone {
+		d.trace.callback("owner gone; nothing reconciles")
+		d.trace.emit("pass result=none")
+		return nil
+	}
+	overdue, err := d.teardownOverdue()
+	if err != nil {
+		return err
+	}
+	if overdue {
+		return d.releaseTeardown(ctx)
 	}
 
 	desired, err := d.desiredSpec()
@@ -582,6 +844,8 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 	if err != nil {
 		return err
 	}
+	// An owner that never reported a rolled-out revision reports the one
+	// the first tick's spec renders, as a freshly created owner does.
 	if d.currentRevision == "" {
 		d.currentRevision = specTarget.Name
 	}
@@ -607,10 +871,14 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 		target = pinned
 	}
 
+	rows, publishing, err := d.publishedRows(ctx)
+	if err != nil {
+		return err
+	}
 	observed := types.WorkloadObservedState{
 		CurrentRevision:  d.currentRevision,
 		UpdateRevision:   specTarget.Name,
-		InstanceStatuses: d.store.Rows(),
+		InstanceStatuses: rows,
 		RetryBlocks:      d.store.RetryBlocks(),
 		Migrations:       append([]types.MigrationRecord(nil), d.migrations...),
 	}
@@ -623,8 +891,10 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 	if err != nil {
 		return err
 	}
+	// The engine's two readers: the cache, which a staged stale read
+	// serves from the previous tick, and the live reader, always current.
 	deps := types.Deps{
-		Client:       d.cli,
+		Client:       d.cachedClient(),
 		APIReader:    d.cli,
 		Recorder:     d.recorder,
 		Expectations: d.expectations,
@@ -640,14 +910,61 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 		if err := d.reconcileHeldDeadlines(ctx, input, true, 0); err != nil {
 			return err
 		}
-		input.ObservedState.InstanceStatuses = d.store.Rows()
+		input.ObservedState.InstanceStatuses = d.overlayPublished(d.store.Rows())
 	}
 	result, rerr := workload.Reconcile(ctx, deps, input, plan, target)
 	d.trace.emit("pass result=%s", renderResult(result, rerr))
+	// The status publication that follows the pass writes this pass's pod
+	// counts, which the next pass reads.
+	d.published = publishing
 	// The status-aggregate pass runs after the dispatcher on every
 	// reconcile: it parks the deadline of an Instance held by admission or
 	// by an external wait, and rearms one that has been released.
-	return d.reconcileHeldDeadlines(ctx, input, desired.Paused, plan.InstanceReadyTimeout)
+	if err := d.reconcileHeldDeadlines(ctx, input, desired.Paused, plan.InstanceReadyTimeout); err != nil {
+		return err
+	}
+	if unfired := d.store.UnfiredConflicts(); len(unfired) > 0 {
+		return fmt.Errorf("replay: tick %d: api.conflict armed for status write %v, but the pass made no such write", tick.Tick, unfired)
+	}
+	d.stalePass = false
+	return d.refreshStaleCache(ctx, tick.Tick)
+}
+
+// teardownOverdue reports whether the deleted owner has held its finalizer
+// past the configured teardown deadline. An unconfigured deadline holds
+// strictly, as the adapter does.
+func (d *driver) teardownOverdue() (bool, error) {
+	if !d.teardown {
+		return false, nil
+	}
+	deadline, err := ParseDuration("config.teardownDeadline", d.cfg.TeardownDeadline)
+	if err != nil || deadline <= 0 {
+		return false, err
+	}
+	return d.clock.Now().After(d.teardownAt.Add(deadline)), nil
+}
+
+// teardownDeadlineExceeded is the Warning the adapter's teardown pass
+// emits when it releases a deleted owner's finalizer past its deadline.
+const teardownDeadlineExceeded = "TeardownDeadlineExceeded"
+
+// releaseTeardown is the adapter's deadline release: a Warning naming the
+// pods that survive, then the finalizer lifted, which deletes the owner
+// object and every row it carried in one stroke. The pods stay, left to
+// background GC the fake apiserver does not run.
+func (d *driver) releaseTeardown(ctx context.Context) error {
+	pods, err := query.ListOMENativePodsByName(ctx, d.cli, d.opts.Namespace, d.opts.OwnerName, d.opts.Component, false)
+	if err != nil {
+		return fmt.Errorf("replay: list pods for the teardown release: %w", err)
+	}
+	d.recorder.Eventf(d.owner, corev1.EventTypeWarning, teardownDeadlineExceeded,
+		"teardown deadline %s exceeded (%d owned pod(s) observed; selector: parent=%q, component=%q); releasing the teardown finalizer to background GC",
+		d.cfg.TeardownDeadline, len(pods), d.opts.OwnerName, d.opts.Component)
+	removed := d.store.Purge()
+	d.trace.callback("owner deleted rows=%d", len(removed))
+	d.ownerGone = true
+	d.trace.emit("pass result=none")
+	return nil
 }
 
 // reconcileHeldDeadlines is the adapter's deadline park/rearm step. An
@@ -705,7 +1022,7 @@ func (d *driver) reconcileHeldDeadlines(ctx context.Context, input types.Reconci
 // podsByInstance buckets the Component's pods by the Instance index they
 // are labelled with.
 func (d *driver) podsByInstance(ctx context.Context) (map[int32][]*corev1.Pod, error) {
-	pods, err := query.ListOMENativePodsByName(ctx, d.cli, d.opts.Namespace, d.opts.OwnerName, d.opts.Component, false)
+	pods, err := query.ListOMENativePodsByName(ctx, d.cachedClient(), d.opts.Namespace, d.opts.OwnerName, d.opts.Component, false)
 	if err != nil {
 		return nil, fmt.Errorf("replay: list pods for deadline parking: %w", err)
 	}
@@ -718,6 +1035,32 @@ func (d *driver) podsByInstance(ctx context.Context) (map[int32][]*corev1.Pod, e
 		byIndex[index] = append(byIndex[index], pod)
 	}
 	return byIndex, nil
+}
+
+// publishedRows is the engine's row observation for this pass: the store's
+// rows carrying the pod count the status publication wrote from the
+// previous pass's observation, as the adapter's rollup hands it to the next
+// reconcile. It also returns this pass's counts, which the publication
+// after the pass writes.
+func (d *driver) publishedRows(ctx context.Context) ([]types.InstanceStatus, map[int32]int32, error) {
+	byIndex, err := d.podsByInstance(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	publishing := make(map[int32]int32, len(byIndex))
+	for index, pods := range byIndex {
+		publishing[index] = int32(len(pods))
+	}
+	return d.overlayPublished(d.store.Rows()), publishing, nil
+}
+
+// overlayPublished writes the published pod counts onto a row observation;
+// the store's rows carry none, so nothing is rendered for them.
+func (d *driver) overlayPublished(rows []types.InstanceStatus) []types.InstanceStatus {
+	for i := range rows {
+		rows[i].PodCount = d.published[rows[i].Index]
+	}
+	return rows
 }
 
 // retryPolicyOf converts the scenario's retry ladder to the engine's

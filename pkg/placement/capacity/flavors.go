@@ -23,7 +23,7 @@ import (
 // Reports must be the member root's complete local observations, not fleet rows.
 // This checks mapping provenance; Reader checks hardware quantities and freshness.
 func AttributeUnit(unit UnitDemand, flavors []quotacapacity.Flavor, reports []v1beta1.AcceleratorCapacityStatus) (Demand, error) {
-	if unit.Fingerprint == "" || len(unit.Pods) == 0 {
+	if unit.Fingerprint == "" || len(unit.Pods) == 0 || unit.PrimaryUnits < 0 {
 		return Demand{}, fmt.Errorf("flavor attribution requires measured replica demand")
 	}
 	mapping, rows, err := verifiedMapping(flavors, reports)
@@ -94,7 +94,7 @@ func AttributeUnit(unit UnitDemand, flavors []quotacapacity.Flavor, reports []v1
 	if len(pools) == 0 {
 		return Demand{}, fmt.Errorf("replica unit has no accelerator pools")
 	}
-	out := Demand{Pools: slices.Collect(maps.Values(pools))}
+	out := Demand{Pools: slices.Collect(maps.Values(pools)), PrimaryUnits: max(unit.PrimaryUnits, 1)}
 	slices.SortFunc(out.Pools, func(a, b Pool) int {
 		if order := cmp.Compare(a.ResourceName, b.ResourceName); order != 0 {
 			return order

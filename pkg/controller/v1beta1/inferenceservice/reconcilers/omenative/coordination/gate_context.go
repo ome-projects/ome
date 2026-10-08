@@ -112,26 +112,19 @@ func ResolveGateContextWithDefaults(ctx context.Context, reads client.Reader, is
 			Reads:        reads,
 		}
 	}
-	// Fail-closed plan gate: a Component in ANY declared rollout group (raw
-	// spec membership — canary and ref-only groups included, which the
-	// coordination-only ResolveGroups below deliberately excludes) may not
-	// take updates until a run pins the effective plan. This is the load-
-	// bearing ordering invariant of the run model: between a target
-	// divergence and the pin (different loops), and while a plan is parked
-	// unresolvable, the gate holds — otherwise a ref-only group would roll
-	// forward as if it were a bare blueGreen, skipping its declared gates.
-	if isvc.Spec.Rollout != nil && specGroupMember(isvc.Spec.Rollout, component) &&
-		(isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil) {
+	if held, reason := planHold(isvc, component); held {
 		return GateContext{
 			ISVC:       isvc,
 			Component:  component,
 			Hold:       true,
-			HoldReason: "rollout plan not pinned: no active run for this rollout group (run opening, or parked on an unresolvable plan)",
+			HoldReason: reason,
 			Ctx:        ctx,
 			Reads:      reads,
 		}
 	}
-	groups := ResolveGroups(rollout.Effective(isvc), defaults)
+	// The hold above covers every unpinned state of a grouped Component, so
+	// the view read here is the pinned plan, which needs no observed policies.
+	groups := ResolveGroups(rollout.Effective(isvc, rollout.Policies{}), defaults)
 	if len(groups) == 0 {
 		return GateContext{
 			ISVC:         isvc,
@@ -160,6 +153,22 @@ func ResolveGateContextWithDefaults(ctx context.Context, reads client.Reader, is
 		Ctx:       ctx,
 		Reads:     reads,
 	}
+}
+
+// planHold is the fail-closed plan gate: a Component in ANY declared rollout
+// group (raw spec membership — canary and ref-only groups included, which the
+// coordination-only ResolveGroups deliberately excludes) may not take updates
+// until a run pins the effective plan. This is the load-bearing ordering
+// invariant of the run model: between a target divergence and the pin
+// (different loops), and while a plan is parked unresolvable, the gate holds
+// — otherwise a ref-only group would roll forward as if it were a bare
+// blueGreen, skipping its declared gates.
+func planHold(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) (bool, string) {
+	if isvc.Spec.Rollout != nil && specGroupMember(isvc.Spec.Rollout, component) &&
+		(isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil) {
+		return true, "rollout plan not pinned: no active run for this rollout group (run opening, or parked on an unresolvable plan)"
+	}
+	return false, ""
 }
 
 // specGroupMember reports raw spec-group membership: whether the Component is

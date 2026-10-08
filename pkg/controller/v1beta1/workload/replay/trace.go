@@ -186,6 +186,12 @@ func (t *Trace) RowCommitted(commit RowCommit) {
 		strings.Join(t.rowFields(*row), " "), commit.Outcome)
 }
 
+// StatusConflict renders one status write the apiserver refused with a
+// conflict, by its ordinal in the pass and the retry attempt it refused.
+func (t *Trace) StatusConflict(c StatusConflict) {
+	t.emit("status conflict write=%d attempt=%d/%d", c.Write, c.Attempt, c.Attempts)
+}
+
 // RetryBlockCommitted renders one resolved retry-block write.
 func (t *Trace) RetryBlockCommitted(commit RetryBlockCommit) {
 	t.emit("retryblock target=%s %s %s", commit.TargetRevision, commit.Disposition,

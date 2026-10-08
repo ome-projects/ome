@@ -49,10 +49,9 @@ package types
 //	                           admissible.
 //
 // EXCLUDED — ambiguous scope (could be the revision OR the
-// device/node): CrashLoopBackOff, RunContainerError,
-// CreateContainerError, and the readiness limbo a pod reaches when it
-// runs every container yet never reports ContainersReady
-// (ReasonContainersNotReady). A repeated process exit or a runtime start
+// device/node): RunContainerError, CreateContainerError, and the
+// readiness limbo a pod reaches when it runs every container yet never
+// reports ContainersReady (ReasonContainersNotReady). A runtime start
 // rejection can equally be a broken binary (revision fault) or a dead
 // GPU / broken driver / node-local runtime damage (placement fault).
 // Holding the revision on the first such failure would wedge a sound
@@ -61,13 +60,20 @@ package types
 // bounded by the operator's autoMigrate.maxAttempts. An attempt that
 // ends without a relocation directive is still a failed attempt at the
 // revision and counts on its retry ladder like any other, so a revision
-// that crashes on every start ends Held at updateRetry.maxAttempts
-// rather than retried forever; a wave the relocation directive claimed
-// is not counted a second time. An instance that reaches Ready prunes
-// its AutoRecover records and its block. A revision held for a failure
-// that was the node's after all is released by the operator through the
+// that fails on every start ends Held at updateRetry.maxAttempts rather
+// than retried forever; a wave the relocation directive claimed is not
+// counted a second time. An instance that reaches Ready prunes its
+// AutoRecover records and its block. A revision held for a failure that
+// was the node's after all is released by the operator through the
 // release annotation; a revision that fails on several nodes in a row
 // was not the node's fault.
+//
+// EXCLUDED from this set and from relocation alike: CrashLoopBackOff. A
+// container that keeps exiting does so on any node, so a crash loop never
+// steers the rebuild off the node it ran on; its disposition is the
+// terminal branch's, which counts a wave on the ladder when one is
+// configured and otherwise writes no block and re-opens the attempt,
+// rather than this set's hold-at-once with no ladder.
 var workloadCausedWaitingReasons = map[string]struct{}{
 	"ImagePullBackOff":            {},
 	"ErrImagePull":                {},
@@ -122,8 +128,8 @@ func IsEnvironmentCausedReason(reason string) bool {
 type FailureCause int
 
 const (
-	// CauseUnattributed: the failure could equally be the revision or the
-	// node it ran on — a crash loop, a runtime start rejection, readiness
+	// CauseUnattributed: the reason alone does not pin the failure on the
+	// pod template — a crash loop, a runtime start rejection, readiness
 	// never reached, a bare elapsed deadline. It is a failed attempt at
 	// the revision and counts on the ladder like any other; with no
 	// ladder configured it is left unrecorded.

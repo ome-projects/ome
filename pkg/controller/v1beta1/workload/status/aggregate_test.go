@@ -107,58 +107,118 @@ func TestRolloutComplete(t *testing.T) {
 // TestCurrentRevisionFor pins the rollup both ways: promoted once every
 // Instance is Ready on the update revision and its retry ladder records
 // no failure; withdrawn when current already names the update revision
-// while an Instance still runs another; left as recorded on every other
-// shape, a repair on the current revision included. A revision whose
-// block still stands has not landed, whatever its rows read between
-// crashes, so a push never lands by attrition.
+// while an Instance still runs another or is pinned to one by its update
+// operation; left as recorded on every other shape, a repair on the
+// current revision included. A revision whose block still stands has not
+// landed, whatever its rows read between crashes, so a push never lands
+// by attrition.
 func TestCurrentRevisionFor(t *testing.T) {
 	const prior, next = "isvc-engine-aaaaaaaa", "isvc-engine-bbbbbbbb"
 	row := func(phase types.InstancePhase, rev string) types.InstanceStatus {
 		return types.InstanceStatus{Phase: phase, RunningRevision: rev}
 	}
+	// pinned is a row mid-surge: it runs running while its operation is
+	// pinned to target.
+	pinned := func(phase types.InstancePhase, running, target string) types.InstanceStatus {
+		return types.InstanceStatus{Phase: phase, RunningRevision: running, Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurge, TargetRevision: target}}
+	}
+	surgeIdx := int32(2)
+	gangSource := func(phase types.InstancePhase, running, target string) types.InstanceStatus {
+		s := pinned(phase, running, target)
+		s.Operation.SurgeIndex = &surgeIdx
+		return s
+	}
+	// marker is the row claiming a replacement gang's index: it has run
+	// nothing, and its claim names the replacement's revision.
+	marker := func(step, target string) types.InstanceStatus {
+		return types.InstanceStatus{Index: surgeIdx, Phase: types.InstancePhaseCreating, TargetRevision: target,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: step, TargetRevision: target}}
+	}
 	block := func(state types.RetryBlockState) []types.RetryBlock {
 		return []types.RetryBlock{{TargetRevision: next, State: state, AttemptsStarted: 1}}
 	}
+	// heldPrior is the ladder after an attempt at the prior revision failed
+	// for good: what a rolled-back Instance leaves behind when it comes
+	// back broken.
+	heldPrior := []types.RetryBlock{{TargetRevision: prior, State: types.RetryBlockHeld, AttemptsStarted: 1}}
+	// withdrawn names the revision the current revision was withdrawn
+	// from while the status still records that withdrawal; "" when nothing
+	// was withdrawn, or the update revision has moved on since.
 	cases := []struct {
 		name            string
 		rows            []types.InstanceStatus
 		current, update string
 		blocks          []types.RetryBlock
+		withdrawn       string
 		want            string
 	}{
 		{"every Instance Ready on the update revision promotes it",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, nil, next},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, nil, "", next},
 		{"every Instance Ready on a Held revision does not land it",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockHeld), prior},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockHeld), "", prior},
 		{"every Instance Ready on a revision in backoff does not land it",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockBackoff), prior},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockBackoff), "", prior},
 		{"every Instance Ready on a revision with an attempt in flight does not land it",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockRetryInProgress), prior},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next, block(types.RetryBlockRetryInProgress), "", prior},
 		{"a block on another revision does not withhold the landing",
 			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, prior, next,
-			[]types.RetryBlock{{TargetRevision: prior, State: types.RetryBlockHeld}}, next},
+			[]types.RetryBlock{{TargetRevision: prior, State: types.RetryBlockHeld}}, "", next},
 		{"a withdrawn current stays withdrawn while the update revision's block stands",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, "", next, block(types.RetryBlockHeld), ""},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next)}, "", next, block(types.RetryBlockHeld), prior, ""},
 		{"a forward roll in flight keeps the prior revision",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseUpdating, prior)}, prior, next, nil, prior},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseUpdating, prior)}, prior, next, nil, "", prior},
 		{"a rollback onto the current revision withdraws it while every Instance runs the superseded one",
-			[]types.InstanceStatus{row(types.InstancePhaseUpdating, next), row(types.InstancePhaseReady, next)}, prior, prior, nil, ""},
+			[]types.InstanceStatus{row(types.InstancePhaseUpdating, next), row(types.InstancePhaseReady, next)}, prior, prior, nil, "", ""},
 		{"one Instance still on the superseded revision is enough to withdraw",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, next)}, prior, prior, nil, ""},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, next)}, prior, prior, nil, "", ""},
 		{"a repair on the current revision keeps it",
-			[]types.InstanceStatus{row(types.InstancePhaseRestarting, prior), row(types.InstancePhaseReady, prior)}, prior, prior, nil, prior},
+			[]types.InstanceStatus{row(types.InstancePhaseRestarting, prior), row(types.InstancePhaseReady, prior)}, prior, prior, nil, "", prior},
 		{"an Instance that has not run anything yet decides nothing",
-			[]types.InstanceStatus{row(types.InstancePhaseCreating, ""), row(types.InstancePhaseReady, prior)}, prior, prior, nil, prior},
+			[]types.InstanceStatus{row(types.InstancePhaseCreating, ""), row(types.InstancePhaseReady, prior)}, prior, prior, nil, "", prior},
 		{"withdrawn stays withdrawn until every Instance is Ready on the update revision",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseUpdating, next)}, "", prior, nil, ""},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseUpdating, next)}, "", prior, nil, prior, ""},
 		{"no update revision leaves current alone",
-			[]types.InstanceStatus{row(types.InstancePhaseReady, prior)}, prior, "", nil, prior},
-		{"no Instances leave current alone", nil, prior, prior, nil, prior},
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior)}, prior, "", nil, "", prior},
+		{"no Instances leave current alone", nil, prior, prior, nil, "", prior},
+		{"a rollback onto the current revision withdraws it while a surge is still pinned to the superseded one",
+			[]types.InstanceStatus{pinned(types.InstancePhaseUpdating, prior, next), row(types.InstancePhaseReady, prior)}, prior, prior, nil, "", ""},
+		{"a rollback onto the current revision withdraws it while a gang surge marker is still pinned to the superseded one",
+			[]types.InstanceStatus{gangSource(types.InstancePhaseUpdating, prior, next), row(types.InstancePhaseReady, prior),
+				marker(types.UpdateStepGangSurgeTarget, next)}, prior, prior, nil, "", ""},
+		{"the cleanup marker of an abandoned gang surge keeps the current revision withdrawn",
+			[]types.InstanceStatus{gangSource(types.InstancePhaseUpdating, prior, next), row(types.InstancePhaseReady, prior),
+				marker(types.UpdateStepGangSurgeTargetCleanup, next)}, prior, prior, nil, "", ""},
+		{"a lingering gang surge marker alone keeps the current revision withdrawn",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior),
+				marker(types.UpdateStepGangSurgeTargetCleanup, next)}, prior, prior, nil, "", ""},
+		{"a Failed source still pinned to the superseded revision withdraws the current revision",
+			[]types.InstanceStatus{gangSource(types.InstancePhaseFailed, prior, next), row(types.InstancePhaseReady, prior),
+				marker(types.UpdateStepGangSurgeTarget, next)}, prior, prior, nil, "", ""},
+		{"withdrawn stays withdrawn while an operation is still pinned to the superseded revision",
+			[]types.InstanceStatus{pinned(types.InstancePhaseUpdating, prior, next), row(types.InstancePhaseReady, prior)}, "", prior, nil, prior, ""},
+		{"an operation pinned to the update revision itself keeps it",
+			[]types.InstanceStatus{pinned(types.InstancePhaseUpdating, prior, prior), row(types.InstancePhaseReady, prior)}, prior, prior, nil, "", prior},
+		{"a withdrawn current comes back once every Instance is back on the withdrawn revision, a Failed one and its block included",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior),
+				row(types.InstancePhaseFailed, prior)}, "", prior, heldPrior, prior, prior},
+		{"a withdrawn current stays withdrawn while an Instance is still pinned to another revision, however the others read",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior),
+				pinned(types.InstancePhaseFailed, prior, next)}, "", prior, heldPrior, prior, ""},
+		{"a withdrawn current comes back when the Failed Instance has no pod left to run anything",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior),
+				row(types.InstancePhaseFailed, "")}, "", prior, heldPrior, prior, prior},
+		{"a revision pushed after the withdrawal does not land while an Instance is Failed on it",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next), row(types.InstancePhaseReady, next),
+				row(types.InstancePhaseFailed, next)}, "", next, block(types.RetryBlockHeld), prior, ""},
+		{"with no withdrawal on record a fleet with a Failed Instance stays unlanded",
+			[]types.InstanceStatus{row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior), row(types.InstancePhaseReady, prior),
+				row(types.InstancePhaseFailed, prior)}, "", prior, heldPrior, "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := status.CurrentRevisionFor(tc.rows, tc.current, tc.update, tc.blocks); got != tc.want {
-				t.Errorf("CurrentRevisionFor(current=%q, update=%q) = %q, want %q", tc.current, tc.update, got, tc.want)
+			if got := status.CurrentRevisionFor(tc.rows, tc.current, tc.update, tc.blocks, tc.withdrawn); got != tc.want {
+				t.Errorf("CurrentRevisionFor(current=%q, update=%q, withdrawn=%q) = %q, want %q", tc.current, tc.update, tc.withdrawn, got, tc.want)
 			}
 		})
 	}
@@ -359,5 +419,29 @@ func TestCountServingPods_ExcludesAMemberLeavingTheGang(t *testing.T) {
 	}
 	if got := status.CountServingInstances([]types.InstanceStatus{{Index: 0, PodCount: leaving.PodCount, ServingPodCount: leaving.ServingPodCount}}, desired); got != 0 {
 		t.Fatalf("serving Instances with a member leaving = %d, want 0", got)
+	}
+}
+
+func TestWithdrawnRevisionAfter(t *testing.T) {
+	const prior, next = "isvc-engine-aaaaaaaa", "isvc-engine-bbbbbbbb"
+	cases := []struct {
+		name                                string
+		before, oldCurrent, current, update string
+		want                                string
+	}{
+		{"the write that withdraws current records the revision it named", "", prior, "", prior, prior},
+		{"the record stays while current stays empty on the same update revision", prior, "", "", prior, prior},
+		{"the record is dropped once the update revision moves on", prior, "", "", next, ""},
+		{"the record is dropped once a current revision is recorded again", prior, "", prior, prior, ""},
+		{"a promotion records no withdrawal", "", prior, next, next, ""},
+		{"a current that was never set records no withdrawal", "", "", "", prior, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.WithdrawnRevisionAfter(tc.before, tc.oldCurrent, tc.current, tc.update); got != tc.want {
+				t.Errorf("WithdrawnRevisionAfter(before=%q, oldCurrent=%q, current=%q, update=%q) = %q, want %q",
+					tc.before, tc.oldCurrent, tc.current, tc.update, got, tc.want)
+			}
+		})
 	}
 }

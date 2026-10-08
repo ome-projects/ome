@@ -98,7 +98,7 @@ func (r *Reconciler) refreshSingleMovementFloor(ctx context.Context, source *v1b
 		}
 		r.sweepPlannedRace(ctx, accepted)
 		standing.refresh(ctx, r, accepted, winner)
-		result, err := r.writeSinglePlanStatus(ctx, accepted, standing, "AwaitingMemberConvergence")
+		result, err := r.writeSinglePlanStatus(ctx, accepted, standing, "AwaitingMemberConvergence", "")
 		return true, result, err
 	}
 	return false, ctrl.Result{}, nil

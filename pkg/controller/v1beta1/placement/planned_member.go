@@ -136,18 +136,18 @@ func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.Inf
 	}
 	ctx = context.WithValue(ctx, backendTargetKey{}, backendTarget{cluster: candidate.Cluster, uid: assignment.ClusterUID, transport: transport})
 	if assignment.Capacity != nil && assignment.DesiredReplicas == 0 {
-		return r.retireCapacityFloor(ctx, cl, source, assignment)
+		return r.retireCapacityFloor(ctx, cl, source, candidate)
 	}
 	desired, err := r.derivedFor(source)
 	if err != nil {
 		return err
 	}
-	var ceiling int32
-	if source.Spec.Placement.Split != nil {
-		ceiling = source.Spec.Placement.Split.MaxReplicasPerCluster
-	}
 	if assignment.CurrentHome == nil {
-		setPlannedReplicas(desired, assignment.CurrentReplicas, ceiling)
+		bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate)
+		if err != nil {
+			return err
+		}
+		setPlannedReplicas(desired, bounds)
 	} else if assignment.CurrentHome.InputDigest != source.Status.Placement.Plan.InputDigest || !equality.Semantic.DeepEqual(assignment.CurrentHome, assignment.DesiredHome) {
 		return r.syncPlannedPolicy(ctx, source, candidate)
 	}
@@ -167,27 +167,6 @@ func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.Inf
 		return err
 	}
 	return r.applyDerived(ctx, candidate.Cluster, cl, source, desired, existingOnly)
-}
-
-// setPlannedReplicas fixes member bounds at the allocation unless an explicit
-// local ceiling permits autoscaling. A retained floor can exceed a reduced cap
-// until its replacement serves.
-func setPlannedReplicas(member *v1beta1.InferenceService, replicas, ceiling int32) {
-	apply := func(component *v1beta1.ComponentExtensionSpec) {
-		floor := int(replicas)
-		component.MinReplicas = &floor
-		if ceiling > 0 {
-			component.MaxReplicas = int(max(ceiling, replicas))
-		} else {
-			component.MaxReplicas = floor
-		}
-	}
-	if member.Spec.Engine != nil {
-		apply(&member.Spec.Engine.ComponentExtensionSpec)
-	}
-	if member.Spec.Decoder != nil {
-		apply(&member.Spec.Decoder.ComponentExtensionSpec)
-	}
 }
 
 // syncPlannedPolicy updates coordination authority without a source refresh.

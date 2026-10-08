@@ -2,6 +2,7 @@ package escalation_test
 
 import (
 	"context"
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,7 +14,6 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
@@ -199,8 +199,8 @@ func TestEscalation_StuckPodNotServing_IdenticalDispositionOutcome(t *testing.T)
 	if rec.store[0].Phase != workloadtypes.InstancePhaseFailed {
 		t.Errorf("Phase: got %q want Failed", rec.store[0].Phase)
 	}
-	if rec.store[0].Operation != nil {
-		t.Errorf("Operation: got %+v want nil (disposition clears the failed attempt)", rec.store[0].Operation)
+	if op := rec.store[0].Operation; !workloadtypes.OperationParked(op) || op.Waiting != string(workloadtypes.RolloutHoldGateHeld) {
+		t.Errorf("Operation: got %+v want the attempt parked under the hold (its pod is alive)", op)
 	}
 	if len(rec.blocks) != 1 || rec.blocks[0].TargetRevision != "own-engine-badhash" {
 		t.Errorf("RetryBlock: got %+v want one block for own-engine-badhash", rec.blocks)
@@ -290,7 +290,7 @@ func TestEscalation_SinglePodSurgeDeadlineRelocatesOffTheTargetNode(t *testing.T
 		grace  time.Duration
 	}{
 		{name: "bound but never started", target: boundNeverStarted, grace: time.Second},
-		{name: "wedged with the fast escalator disabled", target: waitingPod("engine-0-default-1", "CrashLoopBackOff", "node-target", now.Add(-2*time.Hour)), grace: 0},
+		{name: "wedged with the fast escalator disabled", target: waitingPod("engine-0-default-1", "RunContainerError", "node-target", now.Add(-2*time.Hour)), grace: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := clocktesting.NewFakeClock(now)
@@ -538,7 +538,10 @@ func TestEscalation_DispositionFlushesPendingStamps(t *testing.T) {
 		t.Fatalf("escalation pass: %v", err)
 	}
 
-	want := []string{"batch", "retryblock", "mutate"}
+	// The disposition reads the fresh row through the row seam before it
+	// writes anything (the first "mutate" commits nothing), then writes
+	// the block ahead of the row.
+	want := []string{"batch", "mutate", "retryblock", "mutate"}
 	if len(sequence) != len(want) {
 		t.Fatalf("write sequence: got %v want %v", sequence, want)
 	}
@@ -550,8 +553,8 @@ func TestEscalation_DispositionFlushesPendingStamps(t *testing.T) {
 	if store[0].Phase != workloadtypes.InstancePhaseFailed {
 		t.Errorf("instance 0 Phase: got %q want Failed", store[0].Phase)
 	}
-	if store[1].Phase != workloadtypes.InstancePhaseFailed || store[1].Operation != nil {
-		t.Errorf("instance 1: got Phase=%q Operation=%v want Failed with Operation cleared (disposition path)", store[1].Phase, store[1].Operation)
+	if store[1].Phase != workloadtypes.InstancePhaseFailed || !workloadtypes.OperationParked(store[1].Operation) {
+		t.Errorf("instance 1: got Phase=%q Operation=%v want Failed with the attempt parked (disposition path)", store[1].Phase, store[1].Operation)
 	}
 }
 
@@ -727,9 +730,11 @@ func TestEscalation_RestartDeadlineElapsed_FailsInstance(t *testing.T) {
 // A Restart's elapsed deadline parks a set, and the pass reads which set
 // there is off the live pods, not off the observation the deadline was
 // judged on: the repair's drain may have deleted that set since. With the
-// set gone or terminating the stamp waits, and the row keeps its repair;
-// with a pod live — the drain not finished, or the rebuilt set present —
-// the row parks with the Restart preserved.
+// set gone, or deleting inside its own deletion deadline, the stamp waits
+// and the row keeps its repair; with a pod live — the drain not finished,
+// the rebuilt set present, or a pod deleting past its own deletion
+// deadline, which no delete in flight explains and which holds the name
+// the rebuild needs — the row parks with the Restart preserved.
 func TestEscalation_RestartDeadlineParksOnlyALiveSet(t *testing.T) {
 	now := time.Now()
 	for _, tc := range []struct {
@@ -741,6 +746,7 @@ func TestEscalation_RestartDeadlineParksOnlyALiveSet(t *testing.T) {
 		{name: "the drained set is terminating", live: []*corev1.Pod{terminating(incarnationPod("engine-0-default-0", 1, now))}, parks: false},
 		{name: "the drain has not finished", live: []*corev1.Pod{incarnationPod("engine-0-default-0", 1, now)}, parks: true},
 		{name: "the rebuilt set exists", live: []*corev1.Pod{terminating(incarnationPod("engine-0-default-0", 1, now)), incarnationPod("engine-0-default-0-r", 2, now)}, parks: true},
+		{name: "the drained set is terminating past its own deletion deadline", live: []*corev1.Pod{terminatingOverdue(incarnationPod("engine-0-default-0", 1, now))}, parks: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			insts := []workloadtypes.InstanceStatus{{
@@ -821,12 +827,28 @@ func incarnationPod(name string, incarnation int64, created time.Time) *corev1.P
 }
 
 // terminating marks the pod as deleting: a deletion stamp held open by a
-// finalizer, the way a pod reads between its delete and its removal.
+// finalizer, the way a pod reads between its delete and its removal. The
+// stamp is the pod's own deletion deadline, the request plus its grace,
+// and sits ahead of the pass unless the pod already carries one.
 func terminating(pod *corev1.Pod) *corev1.Pod {
-	now := metav1.Now()
-	pod.DeletionTimestamp = &now
+	if pod.DeletionTimestamp == nil {
+		deadline := metav1.NewTime(time.Now().Add(time.Hour))
+		pod.DeletionTimestamp = &deadline
+	}
 	pod.Finalizers = []string{"example.com/termination"}
 	return pod
+}
+
+// terminatingOverdue marks the pod as deleting past its own deletion
+// deadline: the kubelet behind it stopped before it acknowledged the
+// delete, so only that kubelet, a finalizer owner or the force-delete
+// sweep ever removes the object. The finalizer stands in for the missing
+// acknowledgement, which the fake apiserver cannot hold a pod on; the
+// stamp reads the deadline, never the finalizer.
+func terminatingOverdue(pod *corev1.Pod) *corev1.Pod {
+	deadline := metav1.NewTime(time.Now().Add(-time.Hour))
+	pod.DeletionTimestamp = &deadline
+	return terminating(pod)
 }
 
 // DeadlineExceeded is outside the terminal waiting set, so the fast
@@ -918,8 +940,8 @@ func TestEscalation_AdmissionGatedInstance_DeadlineSkipped(t *testing.T) {
 	}
 }
 
-// TestEscalation_DrainingPodDoesNotMaskStuckReplacement pins
-// podSetFullyServing's deleting-pod rule from three sides. A completed
+// TestEscalation_DrainingPodDoesNotMaskStuckReplacement pins the
+// capacity reading's deleting-pod rule from three sides. A completed
 // surge leaves the drained source next to its serving replacement, so a
 // deleting pod must not disqualify an otherwise healthy set (a); but it
 // proves nothing on its own, so it cannot cover the desired count (b),
@@ -980,6 +1002,100 @@ func TestEscalation_DrainingPodDoesNotMaskStuckReplacement(t *testing.T) {
 		{
 			name:     "drain in flight beside a terminal replacement",
 			pods:     []*corev1.Pod{deleting(servingPod("engine-0-default-0")), terminalPod("engine-0-default-1")},
+			escalate: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input, rec := escalationFixture(surgeDrainInstance())
+			if err := runEscalationPass(t, workloadtypes.Deps{}, input, singleInstancePlan(0, 1),
+				map[int32][]*corev1.Pod{0: tc.pods}); err != nil {
+				t.Fatalf("escalation pass: %v", err)
+			}
+			failed := rec.store[0].Phase == workloadtypes.InstancePhaseFailed
+			if failed != tc.escalate {
+				t.Fatalf("Phase: got %q (escalated=%v) want escalated=%v", rec.store[0].Phase, failed, tc.escalate)
+			}
+			want := 0
+			if tc.escalate {
+				want = 1
+			}
+			if len(rec.warns) != want {
+				t.Errorf("WarnInstanceFailed: got %v want %d call(s)", rec.warns, want)
+			}
+		})
+	}
+}
+
+// heldOutOfRotationBy is a pod whose serving gate the named writer holds
+// off: containers ready, out of rotation, not deleting.
+func heldOutOfRotationBy(name, userAgent, key string) *corev1.Pod {
+	writers, err := json.Marshal([]podreadiness.Message{{UserAgent: userAgent, Key: key}})
+	if err != nil {
+		panic(err)
+	}
+	pod := servingPod(name)
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: podreadiness.ConditionType, Status: corev1.ConditionFalse, Message: string(writers)},
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+	}
+	return pod
+}
+
+// TestEscalation_SourceTheSurgeDrainedCountsBesideItsServingReplacement
+// pins the drained-source rule of the fully-serving reading. The surge
+// takes its source out of rotation under its own writer a whole endpoint
+// convergence ahead of deleting it, so inside that window the source is
+// read like a deleting pod: it does not disqualify a set whose
+// replacement serves (a), covers no desired slot on its own (b), vouches
+// for no terminal replacement (c), and a source some other writer took
+// out is not the surge's drain (d). Only (a) suppresses escalation.
+func TestEscalation_SourceTheSurgeDrainedCountsBesideItsServingReplacement(t *testing.T) {
+	now := time.Now()
+	const drainKey = "update-surge-drain-0-1"
+	terminalPod := func(name string) *corev1.Pod {
+		pod := servingPod(name)
+		pod.Status.Phase = corev1.PodFailed
+		return pod
+	}
+	surgeDrainInstance := func() []workloadtypes.InstanceStatus {
+		return []workloadtypes.InstanceStatus{{
+			Index:    0,
+			Phase:    workloadtypes.InstancePhaseUpdating,
+			PodCount: 1,
+			Operation: &workloadtypes.InstanceOperation{
+				Type:           workloadtypes.InstanceOperationUpdate,
+				Step:           workloadtypes.UpdateStepSurgeDrain,
+				TargetRevision: "own-engine-newhash",
+				Deadline:       metav1.NewTime(now.Add(-time.Hour)),
+			},
+		}}
+	}
+
+	cases := []struct {
+		name     string
+		pods     []*corev1.Pod
+		escalate bool
+	}{
+		{
+			name:     "source the surge drained beside its serving replacement",
+			pods:     []*corev1.Pod{heldOutOfRotationBy("engine-0-default-0", podreadiness.WriterUpdateSurgeDrain, drainKey), servingPod("engine-0-default-1")},
+			escalate: false,
+		},
+		{
+			name:     "source the surge drained cannot cover the desired count alone",
+			pods:     []*corev1.Pod{heldOutOfRotationBy("engine-0-default-0", podreadiness.WriterUpdateSurgeDrain, drainKey)},
+			escalate: true,
+		},
+		{
+			name:     "source the surge drained beside a terminal replacement",
+			pods:     []*corev1.Pod{heldOutOfRotationBy("engine-0-default-0", podreadiness.WriterUpdateSurgeDrain, drainKey), terminalPod("engine-0-default-1")},
+			escalate: true,
+		},
+		{
+			name:     "source another writer took out beside the serving replacement",
+			pods:     []*corev1.Pod{heldOutOfRotationBy("engine-0-default-0", podreadiness.WriterDeleteDrain, "0"), servingPod("engine-0-default-1")},
 			escalate: true,
 		},
 	}
@@ -1475,6 +1591,123 @@ func TestEscalation_RestartDeadlineWithGateNotFoldedPod_NamesTheGate(t *testing.
 	}
 	if !strings.Contains(got.LastFailure.Message, string(podreadiness.ConditionType)) {
 		t.Errorf("LastFailure.Message: got %q want the unsatisfied gate named", got.LastFailure.Message)
+	}
+	if len(rec.blocks) != 0 {
+		t.Errorf("RetryBlock: got %v want none (an unsatisfied gate is ambiguous, not revision-scoped)", rec.blocks)
+	}
+}
+
+// The other way Ready never follows: the serving gate IS written, and a
+// second readiness gate the pod declares stays unsatisfied. The pod reads
+// ContainersReady and serving, yet it is in no Service's endpoints, so it
+// is not capacity and no exemption may keep it from the deadline.
+
+// secondReadinessGate is a readiness gate another writer owns, declared
+// on the pod beside the serving gate.
+const secondReadinessGate corev1.PodConditionType = "example.com/load-balancer"
+
+// gateWrittenNeverReadyPod builds that shape: phase Running, the container
+// running and Ready, ContainersReady=True, the serving gate True, and the
+// second gate declared with no condition for it, so Ready stays False.
+func gateWrittenNeverReadyPod(name string, since time.Time) *corev1.Pod {
+	pod := gateNotFoldedPod(name, since)
+	pod.Spec.ReadinessGates = append(pod.Spec.ReadinessGates, corev1.PodReadinessGate{ConditionType: secondReadinessGate})
+	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+		Type:               podreadiness.ConditionType,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(since),
+	})
+	for i := range pod.Status.Conditions {
+		if pod.Status.Conditions[i].Type == corev1.PodReady {
+			pod.Status.Conditions[i].Message = "corresponding condition of pod readiness gate \"" + string(secondReadinessGate) + "\" does not exist"
+		}
+	}
+	return pod
+}
+
+// TestEscalation_RestartDeadlineWithGateWrittenButNeverReady_NamesTheGate:
+// a restart's rebuilt pod passes its probes and receives the serving gate,
+// but never becomes Ready because a second readiness gate stays
+// unsatisfied. The row is not capacity, so the elapsed deadline fails the
+// repair with that gate named and the attempt keeps its blame.
+func TestEscalation_RestartDeadlineWithGateWrittenButNeverReady_NamesTheGate(t *testing.T) {
+	now := time.Now()
+	insts := []workloadtypes.InstanceStatus{{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       workloadtypes.InstancePhaseRestarting,
+		PodCount:    1,
+		Operation: &workloadtypes.InstanceOperation{
+			Type:     workloadtypes.InstanceOperationRestart,
+			Step:     "Drain",
+			Deadline: metav1.NewTime(now.Add(-time.Hour)),
+		},
+	}}
+	input, rec := escalationFixture(insts)
+
+	if err := runEscalationPass(t, workloadtypes.Deps{}, input, singleInstancePlan(0, 1),
+		map[int32][]*corev1.Pod{0: {gateWrittenNeverReadyPod("engine-0-default-0", now.Add(-time.Hour))}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	got := rec.store[0]
+	if got.Phase != workloadtypes.InstancePhaseFailed {
+		t.Fatalf("Phase: got %q want Failed (a pod the serving gate alone cannot make Ready is not capacity)", got.Phase)
+	}
+	if got.Operation == nil || got.Operation.Type != workloadtypes.InstanceOperationRestart {
+		t.Errorf("Operation: got %+v want the Restart preserved", got.Operation)
+	}
+	if got.LastFailure == nil || got.LastFailure.Reason != evidence.ReasonReadinessGateNotSatisfied {
+		t.Fatalf("LastFailure.Reason: got %+v want %q", got.LastFailure, evidence.ReasonReadinessGateNotSatisfied)
+	}
+	if !strings.Contains(got.LastFailure.Message, string(secondReadinessGate)) {
+		t.Errorf("LastFailure.Message: got %q want the unsatisfied gate %q named", got.LastFailure.Message, secondReadinessGate)
+	}
+	if len(rec.blocks) != 0 {
+		t.Errorf("RetryBlock: got %v want none (an unsatisfied gate is ambiguous, not revision-scoped)", rec.blocks)
+	}
+}
+
+// TestEscalation_RestartDeadlineWithOneGangMemberNeverReady_NamesItsGate:
+// the gang form. One rebuilt member is Ready and serving, the other has
+// the serving gate but never becomes Ready, so the set is short of
+// rotation and the deadline fails the repair naming that member's gate.
+func TestEscalation_RestartDeadlineWithOneGangMemberNeverReady_NamesItsGate(t *testing.T) {
+	now := time.Now()
+	insts := []workloadtypes.InstanceStatus{{
+		Index:       0,
+		Incarnation: 2,
+		Phase:       workloadtypes.InstancePhaseRestarting,
+		PodCount:    2,
+		Operation: &workloadtypes.InstanceOperation{
+			Type:     workloadtypes.InstanceOperationRestart,
+			Step:     "Drain",
+			Deadline: metav1.NewTime(now.Add(-time.Hour)),
+		},
+	}}
+	input, rec := escalationFixture(insts)
+
+	pods := []*corev1.Pod{
+		servingPod("engine-0-leader-0"),
+		gateWrittenNeverReadyPod("engine-0-worker-0", now.Add(-time.Hour)),
+	}
+	if err := runEscalationPass(t, workloadtypes.Deps{}, input, singleInstancePlan(0, 2),
+		map[int32][]*corev1.Pod{0: pods}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	got := rec.store[0]
+	if got.Phase != workloadtypes.InstancePhaseFailed {
+		t.Fatalf("Phase: got %q want Failed (a gang with a member out of rotation is not capacity)", got.Phase)
+	}
+	if got.LastFailure == nil || got.LastFailure.Reason != evidence.ReasonReadinessGateNotSatisfied {
+		t.Fatalf("LastFailure.Reason: got %+v want %q", got.LastFailure, evidence.ReasonReadinessGateNotSatisfied)
+	}
+	if got.LastFailure.PodName != "engine-0-worker-0" {
+		t.Errorf("LastFailure.PodName: got %q want the member that never became Ready", got.LastFailure.PodName)
+	}
+	if !strings.Contains(got.LastFailure.Message, string(secondReadinessGate)) {
+		t.Errorf("LastFailure.Message: got %q want the unsatisfied gate %q named", got.LastFailure.Message, secondReadinessGate)
 	}
 	if len(rec.blocks) != 0 {
 		t.Errorf("RetryBlock: got %v want none (an unsatisfied gate is ambiguous, not revision-scoped)", rec.blocks)
@@ -2224,6 +2457,94 @@ func TestEscalateStuckPodFailures_UpdateAttemptIgnoresTheWedgedSource(t *testing
 	}
 }
 
+// TestEscalateStuckPodFailures_InPlaceAttemptInheritsNoWedge pins the
+// grace an in-place attempt is given over a pod that was already wedged
+// when the attempt opened. The patch restamps the pod to the attempt's
+// revision before the kubelet has replaced its container, so the old
+// container's waiting reason is still on the pod when the next pass reads
+// it: for one grace from the attempt's start that reason is the attempt's
+// reason, not its failure, and a pod still parked past that grace fails the
+// attempt as its own wedge. Without the floor the pass right after the
+// restamp disposes every corrective roll over a crash-looping pod and
+// charges the fix's ladder for the crash it corrects.
+func TestEscalateStuckPodFailures_InPlaceAttemptInheritsNoWedge(t *testing.T) {
+	grace := time.Minute
+	now := time.Now()
+	// Restamped to the attempt's revision, ContainersReady False since the
+	// old revision crashed ten minutes ago, the old container still parked.
+	restamped := func() *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "engine-0-default-0",
+				CreationTimestamp: metav1.NewTime(now.Add(-time.Hour)),
+				Labels:            map[string]string{"ome.io/revision-hash": "newhash"},
+			},
+			Status: corev1.PodStatus{
+				Conditions: []corev1.PodCondition{{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(now.Add(-10 * time.Minute))}},
+				ContainerStatuses: []corev1.ContainerStatus{{
+					Name:  "main",
+					State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+				}},
+			},
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		startedAgo time.Duration
+		wantPhase  workloadtypes.InstancePhase
+	}{
+		{name: "inside the attempt's grace: the inherited wedge is not the attempt's failure", startedAgo: 5 * time.Second, wantPhase: workloadtypes.InstancePhaseUpdating},
+		{name: "past the attempt's grace: a pod still parked is the attempt's own wedge", startedAgo: 2 * time.Minute, wantPhase: workloadtypes.InstancePhaseFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			insts := []workloadtypes.InstanceStatus{{
+				Index:           0,
+				Phase:           workloadtypes.InstancePhaseUpdating,
+				PodCount:        1,
+				RunningRevision: "own-engine-oldhash",
+				Operation: &workloadtypes.InstanceOperation{
+					Type:           workloadtypes.InstanceOperationUpdate,
+					Step:           workloadtypes.UpdateStepInPlace,
+					TargetRevision: "own-engine-newhash",
+					StartedAt:      metav1.NewTime(now.Add(-tc.startedAgo)),
+					Deadline:       metav1.NewTime(now.Add(time.Hour)),
+				},
+			}}
+			input := workloadtypes.ReconcileInput{
+				StuckPodGrace: grace,
+				MutateInstance: func(_ context.Context, idx int32, mutate func(*workloadtypes.InstanceStatus) bool) error {
+					for i := range insts {
+						if insts[i].Index == idx {
+							mutate(&insts[i])
+						}
+					}
+					return nil
+				},
+				WarnInstanceFailed: func(int32, string, string) {},
+			}
+			input.ObservedState.InstanceStatuses = insts
+			input.ObservedState.CurrentRevision = "own-engine-oldhash"
+
+			if err := runEscalationPass(t, workloadtypes.Deps{}, input, singleInstancePlan(0, 1),
+				map[int32][]*corev1.Pod{0: {restamped()}}); err != nil {
+				t.Fatalf("escalation pass: %v", err)
+			}
+			if insts[0].Phase != tc.wantPhase {
+				t.Errorf("Phase: got %q want %q", insts[0].Phase, tc.wantPhase)
+			}
+			if tc.wantPhase == workloadtypes.InstancePhaseUpdating {
+				if lf := insts[0].LastFailure; lf != nil && lf.Reason == "CrashLoopBackOff" {
+					t.Errorf("LastFailure: got %+v, want the wedge the patch replaces left unblamed", lf)
+				}
+				return
+			}
+			if lf := insts[0].LastFailure; lf == nil || lf.PodName != "engine-0-default-0" || lf.Reason != "CrashLoopBackOff" {
+				t.Errorf("LastFailure: got %+v, want the restamped pod blamed for its crash loop", lf)
+			}
+		})
+	}
+}
+
 // TestEscalateStuckPodFailures_AlreadyFailedNoOp pins the idempotency:
 // the escalator must not re-fire on an already-Failed Instance even
 // though the wedged pod is still in front of it.
@@ -2792,6 +3113,48 @@ func TestEscalation_RestartingRowNamingTheLoopIsJudgedOnItsRebuild(t *testing.T)
 			}
 			if len(rec.warns) != tc.wantWarns {
 				t.Errorf("WarnInstanceFailed: got %v want %d call(s)", rec.warns, tc.wantWarns)
+			}
+		})
+	}
+}
+
+// An attempt parked after its disposition is left to its ladder: the
+// clocks that ended it do not end it again, whichever phase its pods
+// currently give it. A pod wedged past the grace on such a row writes no
+// second disposal, charges no second wave and raises no second warning.
+func TestEscalation_ParkedAttemptIsLeftToItsLadder(t *testing.T) {
+	for _, phase := range []workloadtypes.InstancePhase{workloadtypes.InstancePhaseUpdating, workloadtypes.InstancePhaseFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			now := time.Now()
+			insts := []workloadtypes.InstanceStatus{{
+				Index: 0, Phase: phase, PodCount: 1,
+				RunningRevision: "own-engine-oldhash", TargetRevision: "own-engine-newhash",
+				Operation: &workloadtypes.InstanceOperation{
+					ID: "update-0-1", Type: workloadtypes.InstanceOperationUpdate, Step: workloadtypes.UpdateStepParked,
+					TargetRevision: "own-engine-newhash", Waiting: string(workloadtypes.RolloutHoldGateRetryBlock),
+				},
+				LastFailure: &workloadtypes.InstanceTermination{PodName: "engine-0-default-0", Reason: "CrashLoopBackOff", Time: metav1.NewTime(now.Add(-time.Minute))},
+			}}
+			input, rec := escalationFixture(insts)
+			input.StuckPodGrace = 30 * time.Second
+			pod := waitingPod("engine-0-default-0", "CrashLoopBackOff", "node-a", now.Add(-time.Hour))
+			pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{Type: podreadiness.ConditionType, Status: corev1.ConditionTrue})
+
+			if err := runEscalationPass(t, workloadtypes.Deps{}, input, singleInstancePlan(0, 1), map[int32][]*corev1.Pod{0: {pod}}); err != nil {
+				t.Fatalf("escalation pass: %v", err)
+			}
+			row := rec.store[0]
+			if row.Phase != phase {
+				t.Errorf("Phase: got %q want %q untouched", row.Phase, phase)
+			}
+			if row.Operation == nil || row.Operation.ID != "update-0-1" || row.Operation.Waiting != string(workloadtypes.RolloutHoldGateRetryBlock) {
+				t.Errorf("Operation: got %+v want the parked attempt kept as it was", row.Operation)
+			}
+			if len(rec.blocks) != 0 {
+				t.Errorf("RetryBlock: got %+v want no second wave", rec.blocks)
+			}
+			if len(rec.warns) != 0 {
+				t.Errorf("WarnInstanceFailed: got %v want none", rec.warns)
 			}
 		})
 	}

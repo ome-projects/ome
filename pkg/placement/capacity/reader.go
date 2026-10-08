@@ -32,9 +32,12 @@ type Pool struct {
 
 // Demand identifies the resolved runtime and placement-unit shape on a member.
 // Its fingerprint must change when the runtime or resource mapping changes.
+// PrimaryUnits is the number of primary-component replicas one unit of this
+// demand contains; zero means one.
 type Demand struct {
-	Fingerprint string
-	Pools       []Pool
+	Fingerprint  string
+	Pools        []Pool
+	PrimaryUnits int64
 }
 
 // Evidence records the hardware and demand used for one resource/flavor ratio.
@@ -50,6 +53,8 @@ type Evidence struct {
 }
 
 // Sample is one member's nominal whole-replica capacity and its evidence.
+// Evidence Allocatable is scaled by the demand's primary multiplicity so each
+// pool's Allocatable/Demand quotient counts primary replicas.
 type Sample struct {
 	ClusterUID        types.UID
 	DemandFingerprint string
@@ -109,9 +114,10 @@ type pair struct {
 }
 
 func normalize(cluster v1beta1.WorkloadCluster, demand Demand, reports []v1beta1.AcceleratorCapacityStatus, now time.Time, maxAge time.Duration) (Sample, error) {
-	if demand.Fingerprint == "" || len(demand.Pools) == 0 {
+	if demand.Fingerprint == "" || len(demand.Pools) == 0 || demand.PrimaryUnits < 0 {
 		return Sample{}, fmt.Errorf("resolved accelerator demand and fingerprint are required")
 	}
+	units := max(demand.PrimaryUnits, 1)
 	pools := map[pair]Pool{}
 	for _, pool := range demand.Pools {
 		if pool.ResourceName == "" || pool.ResourceFlavor == "" || pool.FlavorUID == "" || pool.FlavorSetHash == "" {
@@ -173,9 +179,10 @@ func normalize(cluster v1beta1.WorkloadCluster, demand Demand, reports []v1beta1
 			return Sample{}, fmt.Errorf("report mapping is unverified or incompatible for %s/%s", key.resource, key.flavor)
 		}
 		available, exact := wholeUnits(row.Allocatable)
-		if !exact || available < 0 {
+		if !exact || available < 0 || available > math.MaxInt64/units {
 			return Sample{}, fmt.Errorf("allocatable for %s/%s must be nonnegative whole units within int64", key.resource, key.flavor)
 		}
+		available *= units
 		if len(sample.Pools) > 0 && (sample.Pools[0].ReportUID != row.ReportUID || sample.Pools[0].ReportResourceVersion != row.ReportResourceVersion || sample.Pools[0].Attribution.FlavorSetHash != mapping.FlavorSetHash) {
 			return Sample{}, fmt.Errorf("required pools belong to different source reports or attribution mappings")
 		}

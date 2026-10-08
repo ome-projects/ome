@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -56,7 +57,7 @@ func TestAllPlanSurvivesMemberStatusUpdates(t *testing.T) {
 				f.connections.m[name] = workloadcluster.NewNeverCachingClient(watched)
 			}
 			for range 3 {
-				proposal, err := f.reconciler.allProposal(t.Context(), source, f.clusters, []string{"member-a", "member-b"})
+				proposal, _, err := f.reconciler.allProposal(t.Context(), source, f.clusters, []string{"member-a", "member-b"})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -225,18 +226,11 @@ func TestAllPlanWholeHomeBudget(t *testing.T) {
 		reason string
 	}{
 		{name: "complete home fits", wantB: 3, reason: "AwaitingMemberConvergence"},
-		{name: "partial home is forbidden", edit: func(s *v1beta1.InferenceService, _ map[string]plannedHomeObservation) {
-			s.Spec.Placement.MaxSurge = ptr.To[int32](2)
-		}, reason: "SurgeBudgetExhausted"},
 		{name: "existing rollout shares allowance", edit: func(_ *v1beta1.InferenceService, o map[string]plannedHomeObservation) {
 			h := o["a"]
 			h.RolloutReserved = 1
 			o["a"] = h
 		}, reason: "SurgeBudgetExhausted"},
-		{name: "unset allowance blocks move", edit: func(s *v1beta1.InferenceService, _ map[string]plannedHomeObservation) {
-			s.Spec.Placement.MaxSurge = nil
-			s.Status.Placement.Plan.PauseSurge = false
-		}, reason: "MigrationBlocked"},
 		{name: "pause required on standing home", edit: func(_ *v1beta1.InferenceService, o map[string]plannedHomeObservation) {
 			h := o["a"]
 			h.PauseAcknowledged = false
@@ -255,7 +249,6 @@ func TestAllPlanWholeHomeBudget(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			home := &v1beta1.PlacementHomePolicy{InputDigest: "intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: 3}}}
 			s := srcISVCMode(v1beta1.PlacementModeAll, "")
-			s.Spec.Placement.MaxSurge = ptr.To[int32](3)
 			s.Status.Placement = &v1beta1.PlacementStatus{Plan: &v1beta1.PlacementPlanStatus{Mode: v1beta1.PlacementModeAll, InputDigest: "intent", AssignedReplicas: 3, PauseSurge: true}, Candidates: []v1beta1.CandidatePlacement{
 				{Cluster: "a", Allocation: &v1beta1.CandidateAllocationStatus{CurrentHome: home.DeepCopy(), OriginalReplicas: 3, CurrentReplicas: 3}},
 				{Cluster: "b", Allocation: &v1beta1.CandidateAllocationStatus{DesiredHome: home.DeepCopy(), DesiredReplicas: 3, Matched: true}},
@@ -430,7 +423,7 @@ func TestAllUnknownRuntimeRetainsDesiredAuthority(t *testing.T) {
 	if err := f.workers["member-a"].Delete(t.Context(), backendTestRuntime()); err != nil {
 		t.Fatal(err)
 	}
-	proposal, err := f.reconciler.allProposal(t.Context(), f.source, f.clusters, []string{"member-a", "member-b"})
+	proposal, _, err := f.reconciler.allProposal(t.Context(), f.source, f.clusters, []string{"member-a", "member-b"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,19 +439,16 @@ func TestAllUnknownRuntimeRetainsDesiredAuthority(t *testing.T) {
 	}
 }
 
-// TestAllUnreadableObservationKeepsAcknowledgedCandidate settles two serving
-// homes, then fails one home's inventory read for a single pass. That pass
-// reports the gap through the observation flag alone: the home keeps its
-// acknowledged plan, endpoint and admission, every decision holds, and the
-// next readable pass restores the known observation.
-func TestAllUnreadableObservationKeepsAcknowledgedCandidate(t *testing.T) {
-	const replicas = 3
+// settleAllServingHomes converges two serving homes on an All source and
+// returns the fixture with its settled status.
+func settleAllServingHomes(t *testing.T, replicas int32) (*backendFixture, *v1beta1.InferenceService) {
+	t.Helper()
 	names := []string{"member-a", "member-b"}
 	f := newBackendFixture(t, v1beta1.PlacementModeAll)
 	if err := f.reconciler.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {
 		t.Fatal(err)
 	}
-	f.source.Spec.Engine.MinReplicas = ptr.To(replicas)
+	f.source.Spec.Engine.MinReplicas = ptr.To(int(replicas))
 	if err := f.reconciler.Update(t.Context(), f.source); err != nil {
 		t.Fatal(err)
 	}
@@ -482,6 +472,17 @@ func TestAllUnreadableObservationKeepsAcknowledgedCandidate(t *testing.T) {
 	if condition := settled.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Status != corev1.ConditionTrue {
 		t.Fatalf("serving homes did not settle: %+v", condition)
 	}
+	return f, settled
+}
+
+// TestAllUnreadableObservationKeepsAcknowledgedCandidate settles two serving
+// homes, then fails one home's inventory read for a single pass. That pass
+// reports the gap through the observation flag alone: the home keeps its
+// acknowledged plan, endpoint and admission, every decision holds, and the
+// next readable pass restores the known observation.
+func TestAllUnreadableObservationKeepsAcknowledgedCandidate(t *testing.T) {
+	const replicas = 3
+	f, settled := settleAllServingHomes(t, replicas)
 	before := candidateOf(t, settled, "member-a")
 	if !before.ObservationKnown || before.AppliedPlanID != settled.Status.Placement.Plan.ID || before.ReadyReplicas != replicas || before.Endpoint == nil {
 		t.Fatalf("settled home is not serving its acknowledged plan: %+v", before)
@@ -531,5 +532,134 @@ func TestAllUnreadableObservationKeepsAcknowledgedCandidate(t *testing.T) {
 	}
 	if condition := recovered.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Status != corev1.ConditionTrue {
 		t.Fatalf("readable observation did not reconverge: %+v", condition)
+	}
+}
+
+// TestAllAbsentMemberWithUnreadableInventoryIsUnknown settles two serving
+// homes, then removes one home's member copy while its component inventory
+// cannot be listed. The standing read is conclusively absent and the planned
+// read is unknown: the pass keeps the home's acknowledged plan behind an
+// unknown observation instead of carrying the flag of the last readable pass.
+func TestAllAbsentMemberWithUnreadableInventoryIsUnknown(t *testing.T) {
+	f, settled := settleAllServingHomes(t, 3)
+	before := candidateOf(t, settled, "member-a")
+	if !before.ObservationKnown || before.AppliedPlanID != settled.Status.Placement.Plan.ID {
+		t.Fatalf("settled home has not acknowledged the accepted plan: %+v", before)
+	}
+	member, present := allMemberOn(t, f, "member-a")
+	if !present {
+		t.Fatal("settled home has no member")
+	}
+	if err := f.workers["member-a"].Delete(t.Context(), member); err != nil {
+		t.Fatal(err)
+	}
+	f.connections.m["member-a"] = unreadableAllMember(f, "member-a")
+	unknown := f.reconcile(t)
+	if diff := cmp.Diff(settled.Status.Placement.Plan, unknown.Status.Placement.Plan); diff != "" {
+		t.Fatalf("unknown pass changed the accepted plan (-want +got):\n%s", diff)
+	}
+	got := candidateOf(t, unknown, "member-a")
+	if diff := cmp.Diff(before.AppliedPlanID, got.AppliedPlanID); diff != "" {
+		t.Fatalf("unknown pass blanked the acknowledged plan (-want +got):\n%s", diff)
+	}
+	if got.ObservationKnown {
+		t.Fatalf("absent member with unreadable inventory reported a current observation: %+v", got)
+	}
+	if condition := unknown.Status.GetCondition(v1beta1.PlacementSatisfied); condition == nil || condition.Status == corev1.ConditionTrue {
+		t.Fatalf("retained evidence satisfied the plan: %+v", condition)
+	}
+}
+
+// ratioAllSource gives the fixture source a decoder and a router whose
+// minimums differ from the engine's.
+func ratioAllSource(t *testing.T, f *backendFixture) {
+	t.Helper()
+	if err := f.reconciler.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {
+		t.Fatal(err)
+	}
+	runner := &v1beta1.RunnerSpec{Container: corev1.Container{Name: "ome-container", Image: "img"}}
+	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(60), 60
+	f.source.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(40), MaxReplicas: 40}, Runner: runner.DeepCopy()}
+	f.source.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(8), MaxReplicas: 8}, Runner: runner.DeepCopy()}
+	if err := f.reconciler.Update(t.Context(), f.source); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAllPlanPlacesRatioFloorsOnEveryHome(t *testing.T) {
+	f := newBackendFixture(t, v1beta1.PlacementModeAll)
+	ratioAllSource(t, f)
+	live := f.reconcile(t)
+	want := []v1beta1.PlacementComponentFloor{{Component: v1beta1.DecoderComponent, Replicas: 40}, {Component: v1beta1.EngineComponent, Replicas: 60}, {Component: v1beta1.RouterComponent, Replicas: 8}}
+	if live.Status.Placement == nil || live.Status.Placement.Plan == nil {
+		t.Fatalf("no accepted plan: %+v", live.Status)
+	}
+	// Every full home requests its own 60 primary units.
+	if diff := cmp.Diff(int64(60*len(live.Status.Placement.Candidates)), live.Status.Placement.Plan.RequestedReplicas); diff != "" {
+		t.Errorf("requested primary units (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(2, len(live.Status.Placement.Candidates)); diff != "" {
+		t.Errorf("planned homes (-want +got):\n%s", diff)
+	}
+	if condition := live.Status.GetCondition(v1beta1.PlacementConverged); condition == nil || condition.Reason == "AwaitingHomeInputs" {
+		t.Errorf("ratio floors held as unresolved: %+v", condition)
+	}
+	for _, candidate := range live.Status.Placement.Candidates {
+		a := candidate.Allocation
+		if a == nil || a.HomeInputsPending || a.DesiredHome == nil {
+			t.Fatalf("%s home is unresolved: %+v", candidate.Cluster, a)
+		}
+		if diff := cmp.Diff(want, a.DesiredHome.ReplicaFloors); diff != "" {
+			t.Errorf("%s desired floors (-want +got):\n%s", candidate.Cluster, diff)
+		}
+		if diff := cmp.Diff(int32(60), a.DesiredReplicas); diff != "" {
+			t.Errorf("%s desired primary units (-want +got):\n%s", candidate.Cluster, diff)
+		}
+		member, ok := allMemberOn(t, f, candidate.Cluster)
+		if !ok {
+			t.Fatalf("%s has no member", candidate.Cluster)
+		}
+		policy, err := protocol.FromDerived(member)
+		if err != nil || policy == nil {
+			t.Fatalf("%s full-home authority: %v", candidate.Cluster, err)
+		}
+		if diff := cmp.Diff(want, policy.ReplicaFloors); diff != "" {
+			t.Errorf("%s member floors (-want +got):\n%s", candidate.Cluster, diff)
+		}
+		if diff := cmp.Diff(f.source.Spec.Decoder.MinReplicas, member.Spec.Decoder.MinReplicas); diff != "" {
+			t.Errorf("%s decoder policy changed (-want +got):\n%s", candidate.Cluster, diff)
+		}
+	}
+}
+
+func TestAllPlanReportsUnresolvedHomePolicy(t *testing.T) {
+	f := newBackendFixture(t, v1beta1.PlacementModeAll)
+	if err := f.reconciler.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {
+		t.Fatal(err)
+	}
+	f.source.Spec.Engine.MinReplicas = nil
+	if err := f.reconciler.Update(t.Context(), f.source); err != nil {
+		t.Fatal(err)
+	}
+	unresolved := backendTestRuntime()
+	if err := f.workers["member-b"].Get(t.Context(), client.ObjectKeyFromObject(unresolved), unresolved); err != nil {
+		t.Fatal(err)
+	}
+	unresolved.Spec.EngineConfig = nil
+	if err := f.workers["member-b"].Update(t.Context(), unresolved); err != nil {
+		t.Fatal(err)
+	}
+	live := f.reconcile(t)
+	condition := live.Status.GetCondition(v1beta1.PlacementConverged)
+	if condition == nil || condition.Reason != "AwaitingHomeInputs" {
+		t.Fatalf("unresolved home did not hold inputs: %+v", condition)
+	}
+	if !strings.Contains(condition.Message, "home policy is unresolved on member-b: ") {
+		t.Fatalf("condition message does not name the unresolved home: %q", condition.Message)
+	}
+	for _, candidate := range live.Status.Placement.Candidates {
+		if candidate.Cluster == "member-b" && !candidate.Allocation.HomeInputsPending {
+			t.Fatalf("member-b inputs were not held: %+v", candidate.Allocation)
+		}
 	}
 }

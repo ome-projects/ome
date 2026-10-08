@@ -15,7 +15,8 @@ import (
 // retireCapacityFloor preserves an outgoing home's rendering while reducing
 // its floor. Hardware weights authorize new allocation; they cannot prevent
 // cleanup of an already accepted, observed reduction.
-func (r *Reconciler) retireCapacityFloor(ctx context.Context, cl client.Client, source *v1beta1.InferenceService, assignment *v1beta1.CandidateAllocationStatus) error {
+func (r *Reconciler) retireCapacityFloor(ctx context.Context, cl client.Client, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) error {
+	assignment := candidate.Allocation
 	member := &v1beta1.InferenceService{}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(source), member); err != nil {
 		return err
@@ -46,11 +47,11 @@ func (r *Reconciler) retireCapacityFloor(ctx context.Context, cl client.Client, 
 		return err
 	}
 	base := member.DeepCopy()
-	var ceiling int32
-	if source.Spec.Placement.Split != nil {
-		ceiling = source.Spec.Placement.Split.MaxReplicasPerCluster
+	bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate)
+	if err != nil {
+		return err
 	}
-	setPlannedReplicas(member, assignment.CurrentReplicas, ceiling)
+	setPlannedReplicas(member, bounds)
 	if equality.Semantic.DeepEqual(base.Spec, member.Spec) && member.Annotations[constants.PlacementExecution] == raw {
 		return nil
 	}

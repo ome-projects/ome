@@ -42,7 +42,7 @@ func TestDispatch_RetargetWhileRollingBackWithTerminatingReplacement(t *testing.
 		canaryControllerRevision(ns, isvc.Name, "engine", "new", 2),
 	).Build()
 	ctx := context.Background()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 	dispatch := func(pass string) Outcome {
 		t.Helper()
 		out, err := Dispatch(ctx, deps)
@@ -96,7 +96,7 @@ func TestDispatch_RetargetWhileRollingBackWithTerminatingReplacement(t *testing.
 	}
 
 	reopenRun(isvc, v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "v3", StableRevision: "old"})
-	deps.Group = rollout.CanaryGroup(isvc)
+	deps.Group = rollout.CanaryGroup(isvc, rollout.Policies{})
 	updateIR(t, c, irKey, func(ir *v1beta1.InferenceReplica) { ir.Status.UpdateRevision = isvc.Name + "-engine-v3" })
 	if err := c.Create(ctx, canaryControllerRevision(ns, isvc.Name, "engine", "v3", 3)); err != nil {
 		t.Fatal(err)

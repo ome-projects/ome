@@ -176,9 +176,9 @@ func TestMergeCandidateObservationsPreservesAuthority(t *testing.T) {
 		want     []v1beta1.CandidatePlacement
 	}{
 		{name: "missing observation", want: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: stored[0].Allocation, AppliedPlanID: "plan-a"}}},
-		{name: "unidentified observation", observed: []v1beta1.CandidatePlacement{{Cluster: "member-a", ReadyReplicas: 2, ObservationKnown: true, AppliedPlanID: "plan-b"}}, want: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: stored[0].Allocation, ReadyReplicas: 2}}},
+		{name: "unidentified observation", observed: []v1beta1.CandidatePlacement{{Cluster: "member-a", ReadyReplicas: 2, ObservationKnown: true, AppliedPlanID: "plan-b"}}, want: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: stored[0].Allocation, ReadyReplicas: 2, AppliedPlanID: "plan-a"}}},
 		{name: "identified observation", observed: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: "registration-a"}, ReadyReplicas: 2, ObservationKnown: true, AppliedPlanID: "plan-a"}}, want: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: stored[0].Allocation, ReadyReplicas: 2, ObservationKnown: true, AppliedPlanID: "plan-a"}}},
-		{name: "replacement incarnation", observed: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: "registration-b"}, ObservationKnown: true, AppliedPlanID: "plan-a"}}, want: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: stored[0].Allocation}}},
+		{name: "replacement incarnation", observed: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: "registration-b"}, ObservationKnown: true, AppliedPlanID: "plan-b"}}, want: []v1beta1.CandidatePlacement{{Cluster: "member-a", Allocation: stored[0].Allocation, AppliedPlanID: "plan-a"}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := mergeCandidateObservations(stored, tt.observed)

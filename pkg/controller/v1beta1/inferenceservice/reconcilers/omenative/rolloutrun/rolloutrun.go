@@ -43,12 +43,13 @@ const (
 
 // Inputs is the controller-side input for one run-layer pass.
 type Inputs struct {
-	// Client serves cached reads (drift and resolution-view policy lookups —
-	// they run every reconcile) and the verb-annotation consumption writes.
+	// Client serves the cached reads of every pass (the referenced policies
+	// the effective view resolves through) and the verb-annotation
+	// consumption writes.
 	Client client.Client
 	// Reader serves the reads a run DECISION depends on (IR revision pairs,
-	// policy bodies at open/repin): acting on a cache-lagged target would pin
-	// the wrong plan.
+	// and the referenced policies on the pass that pins them): acting on a
+	// cache-lagged target would pin the wrong plan.
 	Reader   client.Reader
 	Recorder record.EventRecorder
 	ISVC     *v1beta1.InferenceService
@@ -79,6 +80,10 @@ type Outcome struct {
 	// be bound to the run without being reset.
 	Opened  bool
 	Adopted bool
+	// Policies is the set of referenced RolloutPolicy objects this pass
+	// observed: the set the executors' effective view resolves through, so
+	// they read every reference the way the run opener did.
+	Policies rollout.Policies
 }
 
 // composedPlan is one rendered effective plan: the pinnable groups plus their
@@ -90,8 +95,20 @@ type composedPlan struct {
 
 // Reconcile drives the run lifecycle for one ISVC, mutating isvc.Status
 // in-memory; the controller's status flush persists it together with the
-// executors' step state.
+// executors' step state. The referenced policies are observed once here
+// through the cache and handed back in the Outcome for the executors' view;
+// a pass that pins a plan composes it from a live reading.
 func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
+	policies, err := observePolicies(ctx, in, in.Client)
+	if err != nil {
+		return Outcome{}, err
+	}
+	out, err := reconcile(ctx, in, policies)
+	out.Policies = policies
+	return out, err
+}
+
+func reconcile(ctx context.Context, in Inputs, policies rollout.Policies) (Outcome, error) {
 	isvc := in.ISVC
 	if in.Now.IsZero() {
 		in.Now = time.Now()
@@ -103,7 +120,7 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		specGroups = len(isvc.Spec.Rollout.Groups)
 	}
 
-	if err := writeResolutionView(ctx, in); err != nil {
+	if err := writeResolutionView(isvc, policies); err != nil {
 		return Outcome{}, err
 	}
 
@@ -170,7 +187,7 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 			setPlanDrift(isvc, false, v1beta1.RolloutPlanDriftReasonInSync, "", now)
 			return Outcome{StateChanged: true}, nil
 		} else {
-			if err := updateDrift(ctx, in, active, now); err != nil {
+			if err := updateDrift(in, policies, active, now); err != nil {
 				return Outcome{}, err
 			}
 			setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonPinned,
@@ -183,12 +200,19 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		return Outcome{RequeueAfter: shortRequeue}, nil
 	}
 	diverged := divergedMember(isvc, targets)
-	if !diverged && !canaryMidFlight(isvc, nil) {
+	midFlight := canaryMidFlight(isvc, policies)
+	if !diverged && !midFlight {
 		settleNoRun(isvc, now)
 		return Outcome{}, nil
 	}
 
-	plan, parkReason, parkMsg, err := composePlan(ctx, in, in.Reader)
+	// The plan is pinned from a live reading of the referenced policies: a
+	// cached body can lag an edit, and the pin is what executes.
+	live, err := observePolicies(ctx, in, in.Reader)
+	if err != nil {
+		return Outcome{}, err
+	}
+	plan, parkReason, parkMsg, err := composePlan(in, live)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -200,14 +224,7 @@ func Reconcile(ctx context.Context, in Inputs) (Outcome, error) {
 		}
 		return Outcome{Parked: true, RequeueAfter: parkRequeue}, nil
 	}
-	// A ref-sourced canary's done sentinel is only exact against the composed
-	// body; a finished ladder with nothing diverged needs no run.
-	if !diverged && !canaryMidFlight(isvc, plan.groups) {
-		settleNoRun(isvc, now)
-		return Outcome{}, nil
-	}
-
-	adopting := !retargeting && canaryMidFlight(isvc, plan.groups)
+	adopting := !retargeting && midFlight
 	openRun(isvc, plan, targets, stableOverrides, adopting, now)
 	recordRunOpened(isvc, plan, adopting)
 	setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonPinned,
@@ -236,52 +253,24 @@ func activeRun(isvc *v1beta1.InferenceService) *v1beta1.RolloutRun {
 	return isvc.Status.Rollout.ActiveRun
 }
 
-// composePlan renders the effective plan from the live spec: per group,
-// inline-wins resolution, ref fetch through reads, composed-body
-// re-validation, and provider resolution. A non-empty parkReason means the
-// plan is unresolvable — the caller parks instead of opening.
-func composePlan(ctx context.Context, in Inputs, reads client.Reader) (composedPlan, string, string, error) {
+// composePlan renders the effective plan from the live spec: per group, the
+// resolver's body and provenance, then composed-body re-validation and
+// provider resolution. A non-empty parkReason means the plan is unresolvable
+// — the caller parks instead of opening.
+func composePlan(in Inputs, policies rollout.Policies) (composedPlan, string, string, error) {
 	isvc := in.ISVC
 	inflated := derivedProvenance(isvc)
 	var plan composedPlan
 	for gi := range isvc.Spec.Rollout.Groups {
-		g := &isvc.Spec.Rollout.Groups[gi]
-		var policySpec *v1beta1.RolloutPolicySpec
-		var provRef *v1beta1.RolloutPolicyRef
-		var policyGen int64
-
-		if g.PolicyRef != nil && g.Canary == nil && g.BlueGreen == nil && g.RollingUpdate == nil {
-			if !in.FeatureEnabled {
-				return plan, v1beta1.RolloutPlanReasonPlanInvalid,
-					fmt.Sprintf("groups[%d].policyRef %q: the rollout policy feature is not enabled on this cluster, so the ref cannot resolve", gi, g.PolicyRef.Name), nil
+		resolved, rerr := rollout.ResolveGroup(gi, &isvc.Spec.Rollout.Groups[gi], policies)
+		if rerr != nil {
+			var unresolved *rollout.Unresolved
+			if errors.As(rerr, &unresolved) {
+				return plan, unresolved.Reason, unresolved.Message, nil
 			}
-			policy := &v1beta1.RolloutPolicy{}
-			err := reads.Get(ctx, client.ObjectKey{Namespace: isvc.Namespace, Name: g.PolicyRef.Name}, policy)
-			switch {
-			case err == nil:
-			case client.IgnoreNotFound(err) == nil:
-				return plan, v1beta1.RolloutPlanReasonPolicyNotFound,
-					fmt.Sprintf("groups[%d].policyRef %q: RolloutPolicy not found in namespace %s", gi, g.PolicyRef.Name, isvc.Namespace), nil
-			default:
-				return plan, "", "", err
-			}
-			if verr := validation.ValidateRolloutPolicySpec(&policy.Spec); verr != nil {
-				return plan, v1beta1.RolloutPlanReasonPolicyNotReady,
-					fmt.Sprintf("groups[%d].policyRef %q: policy body is invalid: %v", gi, g.PolicyRef.Name, verr), nil
-			}
-			policySpec = &policy.Spec
-			provRef = g.PolicyRef.DeepCopy()
-			policyGen = policy.Generation
+			return plan, "", "", rerr
 		}
-
-		composed, cerr := rolloutpolicy.ComposeGroup(g, policySpec)
-		if cerr != nil {
-			reason := v1beta1.RolloutPlanReasonPlanInvalid
-			if errors.Is(cerr, rolloutpolicy.ErrProgressionMismatch) {
-				reason = v1beta1.RolloutPlanReasonProgressionMismatch
-			}
-			return plan, reason, fmt.Sprintf("groups[%d]: %v", gi, cerr), nil
-		}
+		composed := resolved.Group
 		// Composed-body re-validation, the belt against skew: the body passed
 		// its own admission, but this instance of it is what will execute.
 		if composed.Canary != nil {
@@ -300,10 +289,8 @@ func composePlan(ctx context.Context, in Inputs, reads client.Reader) (composedP
 		if derr != nil {
 			return plan, "", "", derr
 		}
-		source := v1beta1.RolloutPlanSourceInline
-		if policySpec != nil {
-			source = v1beta1.RolloutPlanSourcePolicy
-		} else if p, ok := inflated[gi]; ok {
+		source, provRef := resolved.Source, resolved.PolicyRef
+		if p, ok := inflated[gi]; ok && source == v1beta1.RolloutPlanSourceInline {
 			// A derived ISVC's inline group inflated from a policy at derive
 			// time: report the policy identity a locally-resolved ref would.
 			source = v1beta1.RolloutPlanSourcePolicy
@@ -319,7 +306,7 @@ func composePlan(ctx context.Context, in Inputs, reads client.Reader) (composedP
 		plan.groups = append(plan.groups, v1beta1.RolloutRunGroup{
 			Source:           source,
 			PolicyRef:        provRef,
-			PolicyGeneration: policyGen,
+			PolicyGeneration: resolved.PolicyGeneration,
 			PortableDigest:   digest,
 			Group:            composed,
 		})
@@ -348,10 +335,14 @@ func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1be
 	seen := map[v1beta1.ComponentType]bool{}
 	for i := range plan.groups {
 		g := &plan.groups[i].Group
+		// Adoption is a unit's: only the Components of the unit whose ladder
+		// the run adopts are mid-roll, so only they resolve their stable from
+		// the records; every other unit resolves as in a fresh run.
+		unitAdopting := adopting && unitLadderInFlight(isvc, g)
 		// Adoption does not reset the unit, so the pin must be the target the
 		// executor's hold is keyed on; the run's close then recognizes the
 		// rollback as its own.
-		reverting := adopting && g.Canary != nil && revertInFlight(isvc, g)
+		reverting := unitAdopting && revertInFlight(isvc, g)
 		for _, comp := range g.Components {
 			if seen[comp] {
 				continue
@@ -364,7 +355,7 @@ func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1be
 			}
 			stable, carried := stableOverrides[comp]
 			if !carried {
-				stable = componentStableRevision(isvc, comp, rev, t, adopting)
+				stable = componentStableRevision(isvc, comp, rev, t, unitAdopting)
 			}
 			if hold := rejected[comp]; hold != "" && rev == hold && stable != "" && !reverting {
 				rev = stable
@@ -412,17 +403,25 @@ func closeRun(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, outcom
 	isvc.Status.Rollout.ActiveRun = nil
 }
 
-// componentStableRevision resolves the last promoted revision for a Component.
-// A distinct IR current revision is authoritative at run open. When the IR has
-// already advanced CurrentRevision to its target (a run adopted mid-flight),
-// the unit's canary record names the stable it shifts from, and the
-// Component's LatestRolledoutRevision names the revision that last owned its
-// traffic: the durable identity every OMENative writer keeps, coordination
-// for its Components and the canary executor at each completed promotion and
-// rollback for its members, so a secondary with no record of its own still
-// resolves.
+// componentStableRevision resolves the revision a Component falls back to in
+// the run: the InferenceReplica answers wherever it can, the status records
+// only where it cannot. A current revision off the pin is the stable. A
+// Component settled on the pin, its current revision the pinned one with no
+// Instance trailing, is where it stands: the run pins it at that revision as
+// both target and stable, so it sits the run out, and a record naming an
+// earlier revision (one no Instance may run any more) is never promoted to
+// its rollback target. The records answer for the Components of the unit
+// whose ladder the run adopts (adopting), mid-roll by definition, and for a
+// Component whose agreeing pair still trails Instances (a mid-roll revert): the unit's
+// canary record names the stable its ladder shifts traffic from, and
+// LatestRolledoutRevision names the revision that last owned the traffic,
+// kept by coordination for its Components and by the canary executor for
+// its members, so a secondary with no record of its own still resolves.
 func componentStableRevision(isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, pinnedRevision string, target targetPair, adopting bool) string {
 	if target.current != "" && target.current != pinnedRevision {
+		return target.current
+	}
+	if !adopting && target.current != "" && !target.straggling() {
 		return target.current
 	}
 	if cs := rollout.CanaryStatusFor(&isvc.Status, comp); comp == rollout.CanaryUnit(comp) && cs != nil && cs.StableRevisionHash != "" {
@@ -585,7 +584,7 @@ func primaryPhase(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) v1bet
 // pinned one and stamps RolloutPlanDrift. A canary group disappearing from
 // the spec gets a pointed event: only the rollback and repin verbs abort a
 // pinned run.
-func updateDrift(ctx context.Context, in Inputs, active *v1beta1.RolloutRun, now metav1.Time) error {
+func updateDrift(in Inputs, policies rollout.Policies, active *v1beta1.RolloutRun, now metav1.Time) error {
 	isvc := in.ISVC
 	specGroups := isvc.Spec.Rollout.Groups
 	pinned := active.Plan.Groups
@@ -605,7 +604,7 @@ func updateDrift(ctx context.Context, in Inputs, active *v1beta1.RolloutRun, now
 	}
 
 	for gi := range specGroups {
-		live, err := liveSourceDigest(ctx, in.Client, isvc, &specGroups[gi])
+		live, err := liveSourceDigest(&specGroups[gi], policies)
 		if err != nil {
 			return err
 		}
@@ -665,7 +664,12 @@ func handleRepin(ctx context.Context, in Inputs, active *v1beta1.RolloutRun, now
 	want := isvc.Annotations[constants.RolloutRepinAnnotation]
 	oldDigest := combinedPlanDigest(pinnedDigests(active))
 
-	plan, parkReason, parkMsg, err := composePlan(ctx, in, in.Reader)
+	// A repin replaces the pin, so it renders from a live reading too.
+	live, err := observePolicies(ctx, in, in.Reader)
+	if err != nil {
+		return false, err
+	}
+	plan, parkReason, parkMsg, err := composePlan(in, live)
 	if err != nil {
 		return false, err
 	}
@@ -773,9 +777,8 @@ func pinnedDigests(active *v1beta1.RolloutRun) []string {
 
 // writeResolutionView refreshes status.rollout.groups[] — the always-current
 // per-group source view, including the shadowed-policy preview when an
-// inline arm outranks a ref. Cached reads: this runs every reconcile.
-func writeResolutionView(ctx context.Context, in Inputs) error {
-	isvc := in.ISVC
+// inline arm outranks a ref — from the policies this pass observed.
+func writeResolutionView(isvc *v1beta1.InferenceService, policies rollout.Policies) error {
 	if isvc.Spec.Rollout == nil || len(isvc.Spec.Rollout.Groups) == 0 {
 		if isvc.Status.Rollout != nil {
 			isvc.Status.Rollout.Groups = nil
@@ -792,7 +795,7 @@ func writeResolutionView(ctx context.Context, in Inputs) error {
 		if g.PolicyRef != nil {
 			entry.PolicyRef = g.PolicyRef.DeepCopy()
 		}
-		live, err := liveSourceDigest(ctx, in.Client, isvc, g)
+		live, err := liveSourceDigest(g, policies)
 		if err != nil {
 			return err
 		}
@@ -801,13 +804,10 @@ func writeResolutionView(ctx context.Context, in Inputs) error {
 		// the policy would pin so the cutover diff is one field-compare.
 		if entry.Source == v1beta1.RolloutPlanSourceInline && g.PolicyRef != nil {
 			shadow := &v1beta1.ShadowedRolloutPolicyRef{Name: g.PolicyRef.Name}
-			policy := &v1beta1.RolloutPolicy{}
-			if err := in.Client.Get(ctx, client.ObjectKey{Namespace: isvc.Namespace, Name: g.PolicyRef.Name}, policy); err == nil {
+			if policy := policies.ByName[g.PolicyRef.Name]; policy != nil {
 				if d, derr := rolloutpolicy.PortableDigest(&policy.Spec); derr == nil {
 					shadow.WouldPinDigest = d
 				}
-			} else if client.IgnoreNotFound(err) != nil {
-				return err
 			}
 			entry.ShadowedPolicyRef = shadow
 		}

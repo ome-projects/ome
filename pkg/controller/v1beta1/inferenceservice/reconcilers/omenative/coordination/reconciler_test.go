@@ -17,14 +17,20 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 func TestReconcile_NilISVCErrors(t *testing.T) {
@@ -1391,6 +1397,124 @@ func TestBuildComponentObservation_FailedPropagatesThroughBlueGreen(t *testing.T
 	}
 }
 
+// A parked roll attempt's phase is its pod set's, and the Component's
+// failure rollup is the row's phase, so the group's phase follows the set:
+// it enters Failed while the set sits in the kubelet's back-off, leaves it
+// once the set serves, and holds still while the runner restarts in place
+// inside the stuck-pod grace, however many times - the GroupFailed warning
+// fires once for the back-off and not again until the set is unready past
+// the grace. The rows are the workload layer's own readings of the set.
+func TestGroupPhase_ParkedAttemptRestartingInsideTheGraceDoesNotReenterFailed(t *testing.T) {
+	const grace = 90 * time.Second
+	now := time.Now()
+	const attemptRevision = "llama-engine-newhash"
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: attemptRevision}}
+	row := workloadtypes.InstanceStatus{
+		Index: 0, Incarnation: 2, Phase: workloadtypes.InstancePhaseFailed, PodCount: 1,
+		RunningRevision: "llama-engine-oldhash", TargetRevision: attemptRevision,
+		Operation: &workloadtypes.InstanceOperation{
+			ID: "update-0-1", Type: workloadtypes.InstanceOperationUpdate, Step: workloadtypes.UpdateStepParked,
+			TargetRevision: attemptRevision, Waiting: string(workloadtypes.RolloutHoldGateRetryBlock),
+		},
+		LastFailure: &workloadtypes.InstanceTermination{PodName: "llama-engine-0-default-0", Reason: "CrashLoopBackOff"},
+	}
+	pod := func(ready bool, unreadyFor time.Duration, waiting string) *corev1.Pod {
+		status := corev1.ConditionFalse
+		if ready {
+			status = corev1.ConditionTrue
+		}
+		since := metav1.NewTime(now.Add(-unreadyFor))
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "llama-engine-0-default-0", CreationTimestamp: metav1.NewTime(now.Add(-time.Hour))},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{
+				{Type: podreadiness.ConditionType, Status: corev1.ConditionTrue},
+				{Type: corev1.ContainersReady, Status: status, LastTransitionTime: since},
+				{Type: corev1.PodReady, Status: status, LastTransitionTime: since},
+			}},
+		}
+		cs := corev1.ContainerStatus{Name: "main", Ready: ready, RestartCount: 2, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}
+		if waiting != "" {
+			cs.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waiting}}
+		}
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{cs}
+		return p
+	}
+	serving := pod(true, 0, "")
+	backoff := pod(false, 0, "CrashLoopBackOff")
+	restarting := func(unreadyFor time.Duration) *corev1.Pod { return pod(false, unreadyFor, "") }
+
+	input := workloadtypes.ReconcileInput{StuckPodGrace: grace, Clock: clocktesting.NewFakeClock(now)}
+	input.MutateInstance = func(_ context.Context, _ int32, mutate func(*workloadtypes.InstanceStatus) bool) error {
+		mutate(&row)
+		return nil
+	}
+	plan := workloadtypes.ComponentPlan{Component: workloadtypes.ComponentEngine, Replicas: 1,
+		Instances: []workloadtypes.InstancePlan{{Index: 0, Incarnation: 2, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}}}}
+	follow := func(p *corev1.Pod) {
+		t.Helper()
+		input.ObservedState.InstanceStatuses = []workloadtypes.InstanceStatus{row}
+		err := escalation.FollowParkedAttempts(context.Background(), escalation.PassInput{
+			Input: input, Plan: plan, Target: target,
+			Pods: func(context.Context) (map[int32][]*corev1.Pod, error) { return map[int32][]*corev1.Pod{0: {p}}, nil },
+		})
+		if err != nil {
+			t.Fatalf("FollowParkedAttempts: %v", err)
+		}
+	}
+
+	isvc := testOMENativeISVC()
+	g := ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Policy: v1beta1.CoordinationPolicyRollingUpdate}
+	rec := record.NewFakeRecorder(20)
+	var prevPhase v1beta1.CoordinationPhase
+	var prevComposite string
+	groupPass := func() v1beta1.CoordinationPhase {
+		t.Helper()
+		ir := &v1beta1.InferenceReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: irprojector.InferenceReplicaName(isvc.Name, v1beta1.EngineComponent), Namespace: isvc.Namespace},
+			Status:     v1beta1.InferenceReplicaStatus{Replicas: 1, InstanceStatuses: v1beta1convert.InstanceStatusSliceFromWorkload([]workloadtypes.InstanceStatus{row})},
+		}
+		obs, err := buildGroupObservation(context.Background(), testClient(ir), isvc, g, map[v1beta1.ComponentType]map[string]int32{})
+		if err != nil {
+			t.Fatalf("buildGroupObservation: %v", err)
+		}
+		tr := ComputeTransition(obs)
+		emitPhaseEvents(rec, isvc, g, tr, prevPhase, prevComposite)
+		prevPhase, prevComposite = tr.Phase, tr.CompositePhase
+		return tr.Phase
+	}
+	failedEvents := func() int {
+		n := 0
+		for _, e := range drainEvents(rec) {
+			if contains(e, EventReasonGroupFailed) {
+				n++
+			}
+		}
+		return n
+	}
+
+	follow(backoff)
+	if phase := groupPass(); phase != v1beta1.CoordinationPhaseFailed || failedEvents() != 1 {
+		t.Fatalf("the set in the kubelet's back-off: group %s, want Failed announced once", phase)
+	}
+	follow(serving)
+	if phase := groupPass(); phase == v1beta1.CoordinationPhaseFailed {
+		t.Fatalf("the set serving again must take the group out of Failed")
+	}
+	for i, p := range []*corev1.Pod{restarting(5 * time.Second), serving, restarting(grace / 2), serving, restarting(grace - time.Second)} {
+		follow(p)
+		if phase := groupPass(); phase == v1beta1.CoordinationPhaseFailed || row.Phase != workloadtypes.InstancePhaseUpdating {
+			t.Fatalf("pass %d: group %s with the row %s, want the restart in place inside the grace to move nothing", i, phase, row.Phase)
+		}
+	}
+	if n := failedEvents(); n != 0 {
+		t.Fatalf("%d GroupFailed warning(s) across restarts in place inside the grace, want none", n)
+	}
+	follow(restarting(grace + time.Second))
+	if phase := groupPass(); phase != v1beta1.CoordinationPhaseFailed || failedEvents() != 1 {
+		t.Fatalf("the set unready past the grace: group %s, want Failed announced once more", phase)
+	}
+}
+
 func TestCollectFailedInstanceIndices_PreservesOrder(t *testing.T) {
 	out := collectFailedInstanceIndices([]v1beta1.OMENativeInstanceStatus{
 		{Index: 0, Phase: v1beta1.OMENativeInstanceReady},
@@ -2392,4 +2516,299 @@ func TestReconcile_ReferencedRoleKeysPerRevisionObjectsOnTheReplicaPrefix(t *tes
 	if len(router.Traffic) != 1 || router.Traffic[0].RevisionName != "llama-router-rev-hash1" {
 		t.Errorf("router Traffic must keep the service-named Service: %+v", router.Traffic)
 	}
+}
+
+// rollingEngineIR is the engine's replica mid-roll: one Instance still on
+// revision aaaa, the update revision bbbb recorded and no pod on it yet.
+func rollingEngineIR(isvc *v1beta1.InferenceService) *v1beta1.InferenceReplica {
+	prior := isvc.Name + "-engine-aaaa"
+	return &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: irprojector.InferenceReplicaName(isvc.Name, v1beta1.EngineComponent), Namespace: isvc.Namespace},
+		Status: v1beta1.InferenceReplicaStatus{
+			Replicas: 1, ReadyReplicas: 1, ServingReplicas: 1, AvailableReplicas: 1,
+			CurrentRevision: prior, UpdateRevision: isvc.Name + "-engine-bbbb",
+			InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: prior}},
+		},
+	}
+}
+
+func groupPhaseOf(isvc *v1beta1.InferenceService) v1beta1.CoordinationPhase {
+	if isvc.Status.RolloutCoordination == nil || len(isvc.Status.RolloutCoordination.Groups) == 0 {
+		return ""
+	}
+	return isvc.Status.RolloutCoordination.Groups[0].Phase
+}
+
+// A member whose InferenceReplica is gone reads as a zero observation, not
+// rolling and not failed, on the pass that first misses it; the pass before
+// wrote the phase its own read computed.
+func TestReconcile_MissingReplicaReadsIdleOnTheNextPass(t *testing.T) {
+	ctx := context.Background()
+	isvc := testOMENativeISVC()
+	isvc.Spec.Rollout = singleEngineGroup()
+	ir := rollingEngineIR(isvc)
+	c := testClient(ir, buildPod(isvc, v1beta1.EngineComponent, "aaaa", 0))
+	in := ReconcileInputs{ISVC: isvc, Client: c, Reader: c, Now: time.Now(), ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent)}
+	if _, err := Reconcile(ctx, in); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if got := groupPhaseOf(isvc); got != v1beta1.CoordinationPhaseSurging {
+		t.Fatalf("a rolling member with no new pod reads Surging; got %q", got)
+	}
+	if err := c.Delete(ctx, ir); err != nil {
+		t.Fatalf("delete replica: %v", err)
+	}
+	if _, err := Reconcile(ctx, in); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if got := groupPhaseOf(isvc); got != v1beta1.CoordinationPhaseIdle {
+		t.Fatalf("a member with no replica is not rolling, so the group reads Idle; got %q", got)
+	}
+	cond := isvc.Status.GetCondition(apis.ConditionType(v1beta1.RolloutCoordinationReady))
+	if cond == nil || cond.Status != corev1.ConditionTrue {
+		t.Fatalf("RolloutCoordinationReady should read True over a zero observation; got %+v", cond)
+	}
+}
+
+// The counters the phase is computed from are the replica's published ones;
+// the pod list only feeds the total. A replica whose counters trail the pods
+// the pass lists reads the phase the counters say for that pass.
+func TestBuildComponentObservation_CountersTrailingThePodsReadTheCounters(t *testing.T) {
+	const prior, target = "svc-engine-aaaa", "svc-engine-bbbb"
+	summary := &v1beta1.InferenceReplicaStatus{
+		Replicas: 2, ReadyReplicas: 2, ServingReplicas: 2,
+		CurrentRevision: prior, UpdateRevision: target,
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: prior},
+			{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: prior},
+		},
+	}
+	// The cache lists a target pod the replica has not counted yet.
+	pods := map[string]int32{"aaaa": 2, "bbbb": 1}
+	g := ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Policy: v1beta1.CoordinationPolicyBlueGreen}
+	obs := GroupObservation{Group: g, Components: map[v1beta1.ComponentType]ComponentObservation{
+		v1beta1.EngineComponent: buildComponentObservation(summary, v1beta1.EngineComponent, pods, 0),
+	}}
+	if got := obs.Components[v1beta1.EngineComponent]; got.TotalPods != 3 || got.NewRevisionPods != 0 {
+		t.Fatalf("the total comes from the pods and the new-revision count from the counters; got %+v", got)
+	}
+	if tr := ComputeTransition(obs); tr.Phase != v1beta1.CoordinationPhaseSurging {
+		t.Fatalf("trailing counters read Surging although a target pod is listed; got %q", tr.Phase)
+	}
+	// Once the replica publishes the pod, the same pods read Waiting.
+	summary.UpdatedReplicas = 1
+	obs.Components[v1beta1.EngineComponent] = buildComponentObservation(summary, v1beta1.EngineComponent, pods, 0)
+	if tr := ComputeTransition(obs); tr.Phase != v1beta1.CoordinationPhaseWaiting {
+		t.Fatalf("fresh counters read Waiting; got %q", tr.Phase)
+	}
+}
+
+// A copy of the service with no anchor snapshots one from the replicas the
+// pass sees, whatever anchor the live object carries.
+func TestBuildRatioState_CopyWithoutAnchorSnapshotsTodaysReplicas(t *testing.T) {
+	g := ResolvedGroup{
+		Name:       "0",
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},
+		Policy:     v1beta1.CoordinationPolicyBlueGreen,
+		Pacing:     v1beta1.CoordinationPacing{Type: v1beta1.CoordinationPacingRatioBalanced},
+	}
+	// The pass copy predates the flush that wrote the anchor.
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "isvc", Namespace: "default"}}
+	obs := GroupObservation{Group: g, Components: map[v1beta1.ComponentType]ComponentObservation{
+		v1beta1.EngineComponent:  {Component: v1beta1.EngineComponent, DesiredReplicas: 3},
+		v1beta1.DecoderComponent: {Component: v1beta1.DecoderComponent, DesiredReplicas: 1},
+	}}
+	state := buildRatioState(isvc, g, obs, map[v1beta1.ComponentType]map[string]int32{})
+	if state.Original[v1beta1.EngineComponent] != 3 || state.Original[v1beta1.DecoderComponent] != 1 {
+		t.Fatalf("a copy without an anchor snapshots today's replica counts; got %v", state.Original)
+	}
+}
+
+// refusingServiceClient fails every Service create with err and passes
+// everything else through.
+func refusingServiceClient(err error, objs ...runtime.Object) client.Client {
+	scheme := runtime.NewScheme()
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, v1beta1.AddToScheme} {
+		if addErr := add(scheme); addErr != nil {
+			panic(addErr)
+		}
+	}
+	return fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).WithInterceptorFuncs(interceptor.Funcs{
+		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, ok := obj.(*corev1.Service); ok {
+				return err
+			}
+			return cl.Create(ctx, obj, opts...)
+		},
+	}).Build()
+}
+
+// seededGroupEntry is a group entry a prior pass left behind, at a phase the
+// current facts do not compute, so an untouched entry is observable.
+func seededGroupEntry(isvc *v1beta1.InferenceService, then time.Time) {
+	at := metav1.NewTime(then)
+	isvc.Status.RolloutCoordination = &v1beta1.RolloutCoordinationStatus{Groups: []v1beta1.RolloutCoordinationGroupStatus{{
+		Name: "0", Policy: v1beta1.CoordinationPolicyBlueGreen, Phase: v1beta1.CoordinationPhaseShifting,
+		CompositePhase: string(v1beta1.CoordinationPhaseShifting), LastTransitionTime: &at,
+	}}}
+}
+
+// A per-revision Service write that fails before the group is evaluated
+// fails the pass and leaves the group entry as the previous pass wrote it,
+// whatever phase the members would compute.
+func TestReconcile_ServiceWriteFailureLeavesTheGroupEntry(t *testing.T) {
+	isvc := testOMENativeISVC()
+	isvc.Spec.Rollout = singleEngineGroup()
+	then := time.Now().Add(-time.Hour)
+	seededGroupEntry(isvc, then)
+	c := refusingServiceClient(apierrors.NewInternalError(errors.New("etcdserver: request timed out")),
+		rollingEngineIR(isvc), buildPod(isvc, v1beta1.EngineComponent, "aaaa", 0))
+	_, err := Reconcile(context.Background(), ReconcileInputs{
+		ISVC: isvc, Client: c, Reader: c, Now: time.Now(), ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
+	})
+	if err == nil {
+		t.Fatal("a failed Service write must fail the pass so it is retried")
+	}
+	g := isvc.Status.RolloutCoordination.Groups[0]
+	if g.Phase != v1beta1.CoordinationPhaseShifting || !g.LastTransitionTime.Time.Equal(then) {
+		t.Fatalf("the group entry must be untouched by a pass that failed before evaluating it; got %+v", g)
+	}
+}
+
+// A per-revision Service create the apiserver refuses because the namespace
+// is terminating ends the pass cleanly without evaluating the group: the
+// entry stays as the previous pass wrote it and no error is returned.
+func TestReconcile_NamespaceTerminatingStopsBeforeTheGroup(t *testing.T) {
+	isvc := testOMENativeISVC()
+	isvc.Spec.Rollout = singleEngineGroup()
+	then := time.Now().Add(-time.Hour)
+	seededGroupEntry(isvc, then)
+	refusal := apierrors.NewForbidden(corev1.Resource("services"), "svc", errors.New("namespace is being terminated"))
+	refusal.ErrStatus.Details.Causes = append(refusal.ErrStatus.Details.Causes, metav1.StatusCause{Type: corev1.NamespaceTerminatingCause})
+	c := refusingServiceClient(refusal, rollingEngineIR(isvc), buildPod(isvc, v1beta1.EngineComponent, "aaaa", 0))
+	result, err := Reconcile(context.Background(), ReconcileInputs{
+		ISVC: isvc, Client: c, Reader: c, Now: time.Now(), ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
+	})
+	if err != nil || result == nil {
+		t.Fatalf("a terminating namespace ends the pass cleanly; got result=%v err=%v", result, err)
+	}
+	g := isvc.Status.RolloutCoordination.Groups[0]
+	if g.Phase != v1beta1.CoordinationPhaseShifting || !g.LastTransitionTime.Time.Equal(then) {
+		t.Fatalf("the group entry must be untouched by a pass that stopped before evaluating it; got %+v", g)
+	}
+}
+
+// Both accepted values of the pause annotation read as the global pause, so
+// a change between them is invisible to the group.
+func TestBuildGroupObservation_EitherPauseValueReadsPaused(t *testing.T) {
+	g := ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Policy: v1beta1.CoordinationPolicyBlueGreen}
+	for _, value := range []string{"true", constants.PausedRolloutFreezeValue} {
+		isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{
+			Name: "isvc", Namespace: "default", Annotations: map[string]string{constants.PausedRolloutAnnotation: value},
+		}}
+		obs, err := buildGroupObservation(context.Background(), testClient(), isvc, g, map[v1beta1.ComponentType]map[string]int32{})
+		if err != nil {
+			t.Fatalf("%s: %v", value, err)
+		}
+		if !obs.PausedGlobal {
+			t.Fatalf("%s: the pause must read as the global pause", value)
+		}
+		if tr := ComputeTransition(obs); tr.Phase != v1beta1.CoordinationPhasePaused {
+			t.Fatalf("%s: got %q want Paused", value, tr.Phase)
+		}
+	}
+}
+
+// Each pass writes the phase its own read of the replica and the pods
+// computed; a fact that lands after that read is observed by the next pass,
+// which recomputes from it. The walk below changes the cluster between
+// passes only, and every phase written is the one the facts before the pass
+// compute.
+func TestReconcile_EachPassWritesThePhaseItsOwnReadComputed(t *testing.T) {
+	ctx := context.Background()
+	isvc := testOMENativeISVC()
+	isvc.Spec.Rollout = singleEngineGroup()
+	prior, target := isvc.Name+"-engine-aaaa", isvc.Name+"-engine-bbbb"
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: irprojector.InferenceReplicaName(isvc.Name, v1beta1.EngineComponent), Namespace: isvc.Namespace},
+		Status: v1beta1.InferenceReplicaStatus{
+			Replicas: 1, ReadyReplicas: 1, ServingReplicas: 1, UpdatedReplicas: 1, UpdatedReadyReplicas: 1,
+			CurrentRevision: prior, UpdateRevision: prior,
+			InstanceStatuses: []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: prior}},
+		},
+	}
+	oldPod := buildPod(isvc, v1beta1.EngineComponent, "aaaa", 0).(*corev1.Pod)
+	newPod := buildReadyPod(isvc, v1beta1.EngineComponent, "bbbb", 1, false).(*corev1.Pod)
+	c := testClient(ir, oldPod)
+	in := ReconcileInputs{ISVC: isvc, Client: c, Reader: c, Now: time.Now(), ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent)}
+	publish := func(edit func(*v1beta1.InferenceReplicaStatus)) {
+		t.Helper()
+		live := &v1beta1.InferenceReplica{}
+		if err := c.Get(ctx, client.ObjectKeyFromObject(ir), live); err != nil {
+			t.Fatalf("read replica: %v", err)
+		}
+		edit(&live.Status)
+		if err := c.Update(ctx, live); err != nil {
+			t.Fatalf("publish replica: %v", err)
+		}
+	}
+	pass := func(step string, want v1beta1.CoordinationPhase) {
+		t.Helper()
+		if _, err := Reconcile(ctx, in); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		if got := groupPhaseOf(isvc); got != want {
+			t.Fatalf("%s: phase got %q want %q", step, got, want)
+		}
+	}
+	pass("settled", v1beta1.CoordinationPhaseIdle)
+
+	// The bump lands after the Idle write; the next pass reads Surging.
+	publish(func(s *v1beta1.InferenceReplicaStatus) {
+		s.UpdateRevision = target
+		s.UpdatedReplicas, s.UpdatedReadyReplicas = 0, 0
+	})
+	pass("bumped", v1beta1.CoordinationPhaseSurging)
+
+	// A row counted on the target, its pod not Ready, lands after the Surging
+	// write; the next pass reads Waiting.
+	if err := c.Create(ctx, newPod); err != nil {
+		t.Fatalf("create target pod: %v", err)
+	}
+	publish(func(s *v1beta1.InferenceReplicaStatus) { s.UpdatedReplicas = 1 })
+	pass("surged", v1beta1.CoordinationPhaseWaiting)
+
+	// The target pod turns Ready while the old one still serves; Shifting.
+	if err := c.Get(ctx, client.ObjectKeyFromObject(newPod), newPod); err != nil {
+		t.Fatalf("read target pod: %v", err)
+	}
+	newPod.Status = corev1.PodStatus{Phase: corev1.PodRunning, Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}}
+	if err := c.Update(ctx, newPod); err != nil {
+		t.Fatalf("ready target pod: %v", err)
+	}
+	publish(func(s *v1beta1.InferenceReplicaStatus) { s.UpdatedReadyReplicas = 1 })
+	pass("ready on target", v1beta1.CoordinationPhaseShifting)
+
+	// The old pod leaves; ScalingDown until the replica promotes.
+	if err := c.Delete(ctx, oldPod); err != nil {
+		t.Fatalf("delete old pod: %v", err)
+	}
+	pass("old pods gone", v1beta1.CoordinationPhaseScalingDown)
+
+	publish(func(s *v1beta1.InferenceReplicaStatus) { s.CurrentRevision = target })
+	pass("converged", v1beta1.CoordinationPhaseIdle)
+
+	// A Failed row lands after the Idle write; the next pass reads Failed,
+	// and the pass after the row recovers reads Idle again.
+	publish(func(s *v1beta1.InferenceReplicaStatus) { s.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceFailed })
+	pass("row failed", v1beta1.CoordinationPhaseFailed)
+	publish(func(s *v1beta1.InferenceReplicaStatus) { s.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceReady })
+	pass("row recovered", v1beta1.CoordinationPhaseIdle)
+
+	// The pause annotation is read on the pass after it is set, and its
+	// removal on the pass after that.
+	isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: "true"}
+	pass("paused", v1beta1.CoordinationPhasePaused)
+	delete(isvc.Annotations, constants.PausedRolloutAnnotation)
+	pass("unpaused", v1beta1.CoordinationPhaseIdle)
 }

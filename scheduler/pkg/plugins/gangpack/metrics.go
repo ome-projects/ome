@@ -44,14 +44,15 @@ var (
 	// member reached the gate), "templates_complete" (the live member set
 	// reached minMember after a member had parked short of it),
 	// "reservation_released" (a forming gang's domain reservation drained or was
-	// released, waking the pods it had kept out of the domain) or
-	// "podgroup_change" (the plugin's PodGroup informer stored a new or edited
-	// PodGroup, waking the gang's members).
+	// released, waking the pods it had kept out of the domain), "podgroup_change"
+	// (the plugin's PodGroup informer stored a new or edited PodGroup, waking the
+	// gang's members) or "domain_failed" (a pinned member was vetoed in a domain
+	// new to its gang while another is untried, and retries to plan there).
 	gangActivationTotal = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Subsystem:      metricsSubsystem,
 			Name:           "gang_activation_total",
-			Help:           "Explicit pod activations by trigger (permit, templates_complete, reservation_released, podgroup_change).",
+			Help:           "Explicit pod activations by trigger (permit, templates_complete, reservation_released, podgroup_change, domain_failed).",
 			StabilityLevel: metrics.ALPHA,
 		},
 		[]string{"trigger"},

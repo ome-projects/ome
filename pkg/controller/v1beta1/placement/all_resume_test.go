@@ -115,7 +115,6 @@ func TestAllResumedRetargetKeepsServingHomeUntilReplacementServes(t *testing.T) 
 	// A retarget to the unknown peer, with room for a whole home, holds.
 	source := live()
 	source.Spec.Placement.ClusterAffinity = testAffinity("metadata.name=member-b")
-	source.Spec.Placement.MaxSurge = ptr.To[int32](replicas)
 	source.Generation++
 	if err := f.reconciler.Update(t.Context(), source); err != nil {
 		t.Fatal(err)

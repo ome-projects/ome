@@ -54,6 +54,16 @@ func pinnedTemplate(ctx context.Context, reads client.Reader, input workload.Rec
 	return storedTemplate(ctx, reads, input, target, name)
 }
 
+// createTemplate is the template a Create attempt pinned to rev renders; an
+// attempt naming no revision renders the current template unstamped. found
+// is false when the pinned revision has no ControllerRevision left.
+func createTemplate(ctx context.Context, reads client.Reader, input workload.ReconcileInput, plan workload.ComponentPlan, target *appsv1.ControllerRevision, rev string) (podTemplate, bool, error) {
+	if rev == "" {
+		return desiredTemplate(input, plan, query.RevisionID{}), true, nil
+	}
+	return pinnedTemplate(ctx, reads, input, plan, target, rev)
+}
+
 // storedTemplate is the template the named ControllerRevision records,
 // stamped with that revision. target is the roll target: it tells the
 // renderer which keys of the current template's metadata belong to a

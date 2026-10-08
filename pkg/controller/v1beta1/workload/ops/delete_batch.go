@@ -72,7 +72,12 @@ func DeleteBatch(
 	if input.OwnerObject == nil || input.OwnerObject.GetUID() == "" {
 		return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: owner with UID is required")
 	}
-	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, extras, podsByInstance, input.ScaleDownPodBatchSize)
+	footprint := workload.ScaleDownPodFootprint(input.ObservedState.InstanceStatuses, podsByInstance)
+	budget, err := workload.ResolveScaleDownPodBatchSize(input.ScaleDownPodBatchSize, footprint)
+	if err != nil {
+		return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: resolve scale-down Pod batch size: %w", err)
+	}
+	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, extrasNotParked(input, extras, podsByInstance), podsByInstance, budget)
 	if err != nil {
 		return DeleteBatchResult{}, err
 	}
@@ -89,14 +94,20 @@ func DeleteBatch(
 	admittedInstances := 0
 	defer func() {
 		budgetValue := any("unbounded")
+		if budget != nil {
+			budgetValue = *budget
+		}
+		configuredBudget := any("unbounded")
 		if input.ScaleDownPodBatchSize != nil {
-			budgetValue = *input.ScaleDownPodBatchSize
+			configuredBudget = input.ScaleDownPodBatchSize.String()
 		}
 		logf.FromContext(ctx).Info("OMENative scale-down wave",
 			"namespace", input.Key.Namespace,
 			"isvc", input.Key.OwnerName,
 			"component", plan.Component,
 			"podBudget", budgetValue,
+			"configuredPodBudget", configuredBudget,
+			"podFootprint", footprint,
 			"activePodCost", result.SelectedPodCost,
 			"activeInstances", len(selection.candidates),
 			"admittedInstances", admittedInstances,
@@ -143,13 +154,18 @@ func DeleteBatch(
 		}
 	}
 
-	completed, requeueAt, err := driveDeleteBatch(ctx, deps, input, plan, selection.candidates)
+	completed, requeueAt, parked, err := driveDeleteBatch(ctx, deps, input, plan, selection.candidates)
 	if err != nil {
 		if errors.Is(err, podreadiness.ErrPodIdentityChanged) {
 			result.ImmediateRequeue = true
 			return result, nil
 		}
 		return DeleteBatchResult{}, err
+	}
+	// A wave whose every row the apiserver refused has nothing left to
+	// poll; the rows are re-admitted when their ladder re-arms.
+	if parked > 0 && parked == len(selection.candidates) && result.Deferred == 0 {
+		result.InProgress = false
 	}
 	if !requeueAt.IsZero() {
 		remaining := requeueAt.Sub(input.Now())
@@ -420,17 +436,19 @@ func preflightDeleteOwnedBatch(ctx context.Context, input workload.ReconcileInpu
 	return absent, nil
 }
 
+// The int result counts the rows a permanent apiserver rejection disposed
+// mid-wave: each is left as the rejection left it, out of this wave.
 func driveDeleteBatch(
 	ctx context.Context,
 	deps workload.Deps,
 	input workload.ReconcileInput,
 	plan workload.ComponentPlan,
 	candidates []deleteBatchCandidate,
-) ([]deleteBatchCandidate, time.Time, error) {
+) ([]deleteBatchCandidate, time.Time, int, error) {
 	for _, candidate := range candidates {
 		for _, pod := range candidate.pods {
 			if pod.UID == "" {
-				return nil, time.Time{}, fmt.Errorf("DeleteBatch: refuse to delete pod %s/%s without an observed UID", pod.Namespace, pod.Name)
+				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: refuse to delete pod %s/%s without an observed UID", pod.Namespace, pod.Name)
 			}
 		}
 	}
@@ -442,7 +460,7 @@ func driveDeleteBatch(
 				next, err := escalateStuckTerminatingWithDeadline(ctx, deps, input, pod, candidate.status.Index)
 				if err != nil {
 					if input.ScaleDownRequeueInterval <= 0 {
-						return nil, time.Time{}, fmt.Errorf("DeleteBatch: evaluate stuck-Terminating pod %s: %w", pod.Name, err)
+						return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: evaluate stuck-Terminating pod %s: %w", pod.Name, err)
 					}
 					logf.FromContext(ctx).V(1).Info("stuck-Terminating escalation deferred", "pod", pod.Name, "error", err.Error())
 				}
@@ -453,6 +471,7 @@ func driveDeleteBatch(
 			input.Key.Namespace, input.Key.OwnerName, input.Key.Component, candidate.status.Index)
 	}
 
+	parked := make(map[int32]struct{})
 	// Every serving hold in the selected wave lands before any member Pod can
 	// be deleted, preserving gang drain atomicity across Instance boundaries.
 	for _, candidate := range candidates {
@@ -462,7 +481,14 @@ func driveDeleteBatch(
 			}
 			if err := podreadiness.MarkPodNotServing(ctx, deps.Client, deps.Reader(), pod,
 				podreadiness.WriterDeleteDrain, deleteDrainKey(candidate.status.Index)); err != nil {
-				return nil, time.Time{}, fmt.Errorf("DeleteBatch: mark not serving (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, err)
+				if handled, derr := disposeRejectedRowWrite(ctx, deps, input, candidate.status.Index, pod.Name, err); handled {
+					if derr != nil {
+						return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: dispose rejected drain (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, derr)
+					}
+					parked[candidate.status.Index] = struct{}{}
+					break
+				}
+				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: mark not serving (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, err)
 			}
 		}
 	}
@@ -470,11 +496,14 @@ func driveDeleteBatch(
 	drainer := drain.NewBatcher(deps.Reader(), input.Key.Namespace)
 	completed := make([]deleteBatchCandidate, 0)
 	for _, candidate := range candidates {
+		if _, skip := parked[candidate.status.Index]; skip {
+			continue
+		}
 		if len(candidate.pods) == 0 {
 			if input.FinalizeInstanceResources != nil {
 				complete, err := input.FinalizeInstanceResources(ctx, candidate.status.Index)
 				if err != nil {
-					return nil, time.Time{}, fmt.Errorf("DeleteBatch: finalize resources (instance=%d): %w", candidate.status.Index, err)
+					return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: finalize resources (instance=%d): %w", candidate.status.Index, err)
 				}
 				if !complete {
 					continue
@@ -495,7 +524,7 @@ func driveDeleteBatch(
 			serviceName := query.PerRevisionServiceName(input.Key.OwnerName, plan.Component, hash)
 			podDrained, err := drainer.IsPodDrained(ctx, serviceName, pod)
 			if err != nil {
-				return nil, time.Time{}, fmt.Errorf("DeleteBatch: check drain (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, err)
+				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: check drain (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, err)
 			}
 			if !podDrained {
 				drained = false
@@ -517,11 +546,50 @@ func driveDeleteBatch(
 				if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 					continue
 				}
-				return nil, time.Time{}, fmt.Errorf("DeleteBatch: delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
+				if handled, derr := disposeRejectedRowWrite(ctx, deps, input, candidate.status.Index, pod.Name, err); handled {
+					if derr != nil {
+						return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: dispose rejected delete (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, derr)
+					}
+					parked[candidate.status.Index] = struct{}{}
+					break
+				}
+				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
 			}
 		}
 	}
-	return completed, requeueAt, nil
+	return completed, requeueAt, len(parked), nil
+}
+
+// extrasNotParked drops the scale-down victims whose own write the
+// apiserver refused: a row a permanent rejection disposed, while the
+// revision in force denies a fresh attempt and the pod the rejection names
+// still stands in the row's set. Such a victim holds no wave open and is
+// re-admitted once the ladder admits or that pod is gone. A row failed by
+// a refused create names no standing pod and is taken as any extra.
+func extrasNotParked(input workload.ReconcileInput, extras []int32, podsByInstance map[int32][]*corev1.Pod) []int32 {
+	kept := make([]int32, 0, len(extras))
+	for _, index := range extras {
+		row := input.ObservedState.Instance(index)
+		if parked, _ := rejectionParked(input, row); parked && refusedPodStands(row, podsByInstance[index]) {
+			continue
+		}
+		kept = append(kept, index)
+	}
+	return kept
+}
+
+// refusedPodStands reports whether the pod row's failure names is in the
+// row's current pod set.
+func refusedPodStands(row *workload.InstanceStatus, pods []*corev1.Pod) bool {
+	if row == nil || row.LastFailure == nil || row.LastFailure.PodName == "" {
+		return false
+	}
+	for _, pod := range pods {
+		if pod != nil && pod.Name == row.LastFailure.PodName {
+			return true
+		}
+	}
+	return false
 }
 
 func earlierTime(current, candidate time.Time) time.Time {

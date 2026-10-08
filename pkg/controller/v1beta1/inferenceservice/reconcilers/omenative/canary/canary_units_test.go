@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 func TestResolveStepNewCount(t *testing.T) {
@@ -122,7 +123,7 @@ func TestEffectivePartition(t *testing.T) {
 	}
 
 	// No canary → not active.
-	if _, ok := EffectivePartition(&v1beta1.InferenceService{}, v1beta1.EngineComponent, 4); ok {
+	if _, ok := EffectivePartition(&v1beta1.InferenceService{}, rollout.Policies{}, v1beta1.EngineComponent, 4); ok {
 		t.Fatal("no canary must be inactive")
 	}
 
@@ -131,7 +132,7 @@ func TestEffectivePartition(t *testing.T) {
 		v1beta1.RolloutGroupStep{Capacity: intstr.FromString("50%"), Traffic: 50},
 		v1beta1.RolloutGroupStep{Capacity: intstr.FromString("100%"), Traffic: 100},
 	)
-	p, ok := EffectivePartition(isvc, v1beta1.EngineComponent, 4)
+	p, ok := EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4)
 	if !ok || p == nil || *p != 2 {
 		t.Fatalf("step0: want partition 2, got %v ok=%v", p, ok)
 	}
@@ -139,7 +140,7 @@ func TestEffectivePartition(t *testing.T) {
 	// Advance to the final step → 100% new, less the held floor: the last
 	// stable instance stays until the cutover completes → partition 1.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: 1}
-	p, ok = EffectivePartition(isvc, v1beta1.EngineComponent, 4)
+	p, ok = EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4)
 	if !ok || p == nil || *p != 1 {
 		t.Fatalf("final: want partition 1, got %v ok=%v", p, ok)
 	}
@@ -149,7 +150,7 @@ func TestEffectivePartition(t *testing.T) {
 	// to a step's partition, which would hold instances on the old revision
 	// after completion.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: 2}
-	p, ok = EffectivePartition(isvc, v1beta1.EngineComponent, 4)
+	p, ok = EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4)
 	if !ok || p == nil || *p != 0 {
 		t.Fatalf("done sentinel: want partition 0, got %v ok=%v", p, ok)
 	}
@@ -158,7 +159,7 @@ func TestEffectivePartition(t *testing.T) {
 	// so the IR's RollbackToRevision target drives the revert without the partition
 	// fighting it. Step 0 would otherwise be partition 2.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: 0, RolledBackRevisionHash: "rejected"}
-	p, ok = EffectivePartition(isvc, v1beta1.EngineComponent, 4)
+	p, ok = EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4)
 	if !ok || p == nil || *p != 0 {
 		t.Fatalf("rolled back: want partition 0, got %v ok=%v", p, ok)
 	}
@@ -168,7 +169,7 @@ func TestEffectivePartition(t *testing.T) {
 	// executor, not the annotation directly.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: 0}
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
-	p, ok = EffectivePartition(isvc, v1beta1.EngineComponent, 4)
+	p, ok = EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4)
 	if !ok || p == nil || *p != 2 {
 		t.Fatalf("annotation alone: want step-0 partition 2, got %v ok=%v", p, ok)
 	}
@@ -188,7 +189,7 @@ func TestStepPartition(t *testing.T) {
 			}},
 		}}}}}
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4}
-	p := StepPartition(isvc, v1beta1.EngineComponent, ext)
+	p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext)
 	if p == nil || *p != 2 {
 		t.Fatalf("step0 50%% of 4 → partition 2, got %v", p)
 	}
@@ -202,7 +203,7 @@ func TestStepPartition(t *testing.T) {
 	extUser := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4,
 		Lifecycle: &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{
 			RollingUpdate: &v1beta1.RollingUpdate{Partition: &user}}}}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, extUser); p == nil || *p != 2 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, extUser); p == nil || *p != 2 {
 		t.Fatalf("step partition must be computed regardless of the user partition, got %v", p)
 	}
 	if got := extUser.Lifecycle.UpdateStrategy.RollingUpdate.Partition; got == nil || *got != 1 {
@@ -211,7 +212,7 @@ func TestStepPartition(t *testing.T) {
 
 	// No canary → nil (and the lifecycle chain is not created).
 	ext2 := &v1beta1.ComponentExtensionSpec{MinReplicas: &n}
-	if p := StepPartition(&v1beta1.InferenceService{}, v1beta1.EngineComponent, ext2); p != nil {
+	if p := StepPartition(&v1beta1.InferenceService{}, rollout.Policies{}, v1beta1.EngineComponent, ext2); p != nil {
 		t.Fatalf("no canary must yield no partition, got %d", *p)
 	}
 	if ext2.Lifecycle != nil {
@@ -222,7 +223,7 @@ func TestStepPartition(t *testing.T) {
 	// write can go below 0) must clamp to step 0, not panic indexing plan.Steps.
 	isvc.Status.Canary = &v1beta1.CanaryStatus{CurrentStep: -1}
 	ext3 := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext3); p == nil || *p != 2 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext3); p == nil || *p != 2 {
 		t.Fatalf("negative step must clamp to step-0 partition 2, got %v", p)
 	}
 }
@@ -239,13 +240,13 @@ func TestPlanGateHoldPartition(t *testing.T) {
 			PolicyRef:  &v1beta1.RolloutPolicyRef{Name: "unresolved", Progression: v1beta1.RolloutProgressionCanary},
 		}}}}}
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: &n, MaxReplicas: 4}
-	if p := PlanGateHoldPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 4 {
+	if p := PlanGateHoldPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 4 {
 		t.Fatalf("canary-kind group without a plan must hold every Instance (4), got %v", p)
 	}
 	if ext.Lifecycle != nil {
 		t.Fatal("the plan-gate hold must not create the user's lifecycle chain")
 	}
-	if p := PlanGateHoldPartition(isvc, v1beta1.RouterComponent, ext); p != nil {
+	if p := PlanGateHoldPartition(isvc, rollout.Policies{}, v1beta1.RouterComponent, ext); p != nil {
 		t.Fatalf("a Component outside the canary-kind group must get no hold, got %d", *p)
 	}
 }

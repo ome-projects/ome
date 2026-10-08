@@ -1,6 +1,7 @@
 package affinity
 
 import (
+	"math"
 	"slices"
 	"testing"
 
@@ -103,7 +104,8 @@ func TestSelectorWeightOverlap(t *testing.T) {
 		{name: "weighted adds", weights: []*int32{ptr.To(int32(3)), ptr.To(int32(2))}, want: 5},
 		{name: "omitted contributes one", weights: []*int32{ptr.To(int32(3)), nil}, want: 4},
 		{name: "explicit one enables addition", weights: []*int32{ptr.To(int32(1)), nil}, want: 2},
-		{name: "effective sum exceeds term maximum", weights: []*int32{ptr.To(int32(100)), ptr.To(int32(100))}, want: 200},
+		{name: "weight above one hundred", weights: []*int32{ptr.To(int32(400)), ptr.To(int32(168))}, want: 568},
+		{name: "effective sum exceeds int32", weights: []*int32{ptr.To(int32(math.MaxInt32)), ptr.To(int32(math.MaxInt32))}, want: 2 * math.MaxInt32},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			terms := []v1beta1.ClusterAffinityTerm{region, nameTerm("cluster-a")}
@@ -194,11 +196,11 @@ func TestSelectorRejectsMalformedIntent(t *testing.T) {
 		_, err := Compile([]v1beta1.ClusterAffinityTerm{{MatchFields: []v1beta1.ClusterSelectorRequirement{req}}}, false)
 		require.ErrorContains(t, err, "only metadata.name with In or NotIn")
 	}
-	for _, weight := range []int32{0, -1, v1beta1.MaxClusterAffinityWeight + 1} {
+	for _, weight := range []int32{0, -1, math.MinInt32} {
 		term := nameTerm("cluster-a")
 		term.Weight = &weight
 		_, err := Compile([]v1beta1.ClusterAffinityTerm{term}, true)
-		require.ErrorContains(t, err, "weight must be between")
+		require.ErrorContains(t, err, "weight must be positive")
 	}
 	term := nameTerm("cluster-a")
 	term.Weight = ptr.To(int32(1))

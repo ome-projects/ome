@@ -17,8 +17,10 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -216,5 +218,78 @@ func TestReconcile_Teardown_NoSupersededPrune(t *testing.T) {
 	}
 	if len(*removed) != 0 {
 		t.Fatalf("teardown reconcile pruned %v, want none", *removed)
+	}
+}
+
+// TestPruneOutlivedRetryBlocks_HealedInPlaceSetIsOutlivedAtTheWindow pins
+// the prune of a block an idle crash loop recorded against the running
+// revision once the kubelet brings the same pod back serving, under a
+// restart policy that rebuilds nothing. The row's ReadySince stays where
+// it was and the pod's status carries its restart, so the set is read as
+// a comeback: unproven until it has held Ready for the proven window,
+// the stuck-pod grace here, since it re-entered Ready. The block is kept
+// inside that window and pruned once the window has run.
+func TestPruneOutlivedRetryBlocks_HealedInPlaceSetIsOutlivedAtTheWindow(t *testing.T) {
+	const rev = "own-engine-current1"
+	readyAgain := time.Date(2026, 1, 1, 0, 10, 0, 0, time.UTC)
+	readySince := metav1.NewTime(readyAgain.Add(-10 * time.Minute))
+	crashed := metav1.NewTime(readyAgain.Add(-20 * time.Second))
+	due := metav1.NewTime(readyAgain.Add(40 * time.Second))
+	healedPod := func() *corev1.Pod {
+		pod := enginePod("llama-70b", "prod", 0)
+		pod.CreationTimestamp = metav1.NewTime(readySince.Add(-time.Minute))
+		pod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(rev)
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(readyAgain)},
+			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(readyAgain)},
+			{Type: query.ServingConditionType, Status: corev1.ConditionTrue, LastTransitionTime: readySince},
+		}
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:         constants.MainContainerName,
+			Image:        "test:v1",
+			Ready:        true,
+			RestartCount: 2,
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1, Reason: "Error",
+				StartedAt:  metav1.NewTime(crashed.Add(-5 * time.Second)),
+				FinishedAt: crashed,
+			}},
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(readyAgain.Add(-15 * time.Second))}},
+		}}
+		return pod
+	}
+	for _, tc := range []struct {
+		name   string
+		at     time.Duration
+		pruned bool
+	}{
+		{name: "inside the window the block is kept", at: 45 * time.Second},
+		{name: "at the window the block is pruned", at: 60 * time.Second, pruned: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := minimalInput(t)
+			input.Clock = clocktesting.NewFakeClock(readyAgain.Add(tc.at))
+			input.StuckPodGrace = time.Minute
+			removed := recordRetryBlockRemovals(&input)
+			input.ObservedState.CurrentRevision = rev
+			input.ObservedState.UpdateRevision = rev
+			input.ObservedState.InstanceStatuses = []types.InstanceStatus{
+				{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: rev, PodCount: 1, ServingPodCount: 1, ReadySince: &readySince,
+					LastFailure: &types.InstanceTermination{PodName: "llama-70b-engine-0-default-0", ContainerName: constants.MainContainerName, Reason: "CrashLoopBackOff", Time: crashed}},
+			}
+			input.ObservedState.RetryBlocks = []types.RetryBlock{{TargetRevision: rev, State: types.RetryBlockBackoff, AttemptsStarted: 1, NextRetryAt: &due, Reason: "CrashLoopBackOff"}}
+			target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: rev, CreationTimestamp: metav1.NewTime(readySince.Add(-time.Hour))}}
+			pods := func(context.Context) (map[int32][]*corev1.Pod, error) {
+				return map[int32][]*corev1.Pod{0: {healedPod()}}, nil
+			}
+
+			if err := escalation.PruneOutlivedRetryBlocks(context.Background(), input, minimalPlan(), target, pods); err != nil {
+				t.Fatalf("outlived prune: %v", err)
+			}
+			if got := len(*removed) == 1 && (*removed)[0] == rev; got != tc.pruned {
+				t.Fatalf("pruned=%v want %v (removed %v)", got, tc.pruned, *removed)
+			}
+		})
 	}
 }

@@ -56,15 +56,18 @@ func (g *GangPack) Unreserve(_ context.Context, state framework.CycleState, pod 
 	g.releaseAttempt(pin, pod, false)
 }
 
-func (g *GangPack) releaseAttempt(pin *pinState, pod *v1.Pod, failedDomain bool) bool {
+// releaseAttempt drops the attempt's commitment. It reports whether this call
+// released it and, with failedDomain, whether the pinned domain was new to the
+// gang's failed-domain memory.
+func (g *GangPack) releaseAttempt(pin *pinState, pod *v1.Pod, failedDomain bool) (released, newFailedDomain bool) {
 	key := pin.gang.key
 	token := pin.commitment
 	// Count the unwind once per gang: only the first member's Unreserve actually
 	// releases the matching attempt. Rejected siblings from an older attempt cannot
 	// release or reject a newer retry because the token must still own the pin.
-	released := g.pins.ReleaseIf(key, token, func() {
+	released = g.pins.ReleaseIf(key, token, func() {
 		if failedDomain {
-			g.markFailedDomain(pin.gang, placement.Domain{TopologyKey: pin.topologyKey, Name: pin.domain})
+			newFailedDomain = g.markFailedDomain(pin.gang, placement.Domain{TopologyKey: pin.topologyKey, Name: pin.domain})
 		}
 		if g.handle != nil {
 			g.handle.IterateOverWaitingPods(func(wp framework.WaitingPod) {
@@ -80,7 +83,7 @@ func (g *GangPack) releaseAttempt(pin *pinState, pod *v1.Pod, failedDomain bool)
 		g.activateReservationBlocked()
 	}
 	g.forgetAttempt(pod, token)
-	return released
+	return released, newFailedDomain
 }
 
 func (g *GangPack) hasWaitingAttempt(key string, token uint64) bool {

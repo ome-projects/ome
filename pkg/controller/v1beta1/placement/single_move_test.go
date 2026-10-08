@@ -15,7 +15,6 @@ import (
 
 func replacementRaceFixture() (*v1beta1.InferenceService, plan.Proposal, map[string]plannedHomeObservation) {
 	source := srcISVCMode(v1beta1.PlacementModeSingle, "")
-	source.Spec.Placement.MaxSurge = ptr.To[int32](3)
 	home := &v1beta1.PlacementHomePolicy{InputDigest: "intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: 3}}}
 	p := plan.Proposal{Mode: v1beta1.PlacementModeSingle, Winner: "member-a", PauseSurge: true, SingleMove: &v1beta1.PlacementSingleMoveStatus{}, InputDigest: "intent", Assignments: map[string]v1beta1.CandidateAllocationStatus{
 		"member-a": {ClusterUID: "member-a-uid", OriginalReplicas: 3, CurrentReplicas: 3, CurrentHome: home.DeepCopy()},
@@ -69,12 +68,6 @@ func TestBoundedReplacementRace(t *testing.T) {
 			o["member-c"] = plannedHomeObservation{}
 		}},
 		{name: "whole home fits shared allowance", b: 3, reason: "SurgeBudgetExhausted"},
-		{name: "enough surge races multiple candidates", b: 3, c: 3, reason: "AwaitingMemberConvergence", edit: func(s *v1beta1.InferenceService, _ *plan.Proposal, _ map[string]plannedHomeObservation) {
-			s.Spec.Placement.MaxSurge = ptr.To[int32](6)
-		}},
-		{name: "partial home is forbidden", reason: "SurgeBudgetExhausted", edit: func(s *v1beta1.InferenceService, _ *plan.Proposal, _ map[string]plannedHomeObservation) {
-			s.Spec.Placement.MaxSurge = ptr.To[int32](2)
-		}},
 		{name: "rollout reservation consumes allowance", reason: "SurgeBudgetExhausted", edit: func(_ *v1beta1.InferenceService, _ *plan.Proposal, o map[string]plannedHomeObservation) {
 			a := o["member-a"]
 			a.RolloutReserved = 1
@@ -93,14 +86,10 @@ func TestBoundedReplacementRace(t *testing.T) {
 			a.PauseAcknowledged = false
 			o["member-a"] = a
 		}},
-		{name: "unset allowance blocks movement", reason: "MigrationBlocked", edit: func(s *v1beta1.InferenceService, _ *plan.Proposal, _ map[string]plannedHomeObservation) {
-			s.Spec.Placement.MaxSurge = nil
-		}},
 		{name: "admission selects before full readiness", b: 3, selected: "member-b", reason: "ReplacementNotReady", edit: func(_ *v1beta1.InferenceService, p *plan.Proposal, o map[string]plannedHomeObservation) {
 			activeReplacement(p, o, "member-b", true)
 		}},
-		{name: "simultaneous admissions use lexical order", b: 3, c: 3, selected: "member-b", reason: "ReplacementNotReady", edit: func(s *v1beta1.InferenceService, p *plan.Proposal, o map[string]plannedHomeObservation) {
-			s.Spec.Placement.MaxSurge = ptr.To[int32](6)
+		{name: "simultaneous admissions use lexical order", b: 3, c: 3, selected: "member-b", reason: "ReplacementNotReady", edit: func(_ *v1beta1.InferenceService, p *plan.Proposal, o map[string]plannedHomeObservation) {
 			activeReplacement(p, o, "member-b", true)
 			activeReplacement(p, o, "member-c", true)
 		}},
@@ -202,19 +191,17 @@ func TestReplacementTimeoutKeepsOccupancyCharged(t *testing.T) {
 
 func TestReplacementBudgetForDifferentFloors(t *testing.T) {
 	for _, tt := range []struct {
-		name                  string
-		original, b, c, surge int32
-		wantB, wantC          int32
+		name           string
+		original, b, c int32
+		wantB, wantC   int32
 	}{
-		{name: "larger destination sets nominal floor", original: 2, b: 4, c: 4, surge: 2, wantB: 4},
-		{name: "smaller winner cannot inherit a larger probes budget", original: 2, b: 4, c: 1, surge: 2, wantB: 4},
-		{name: "small first probe bounds later nominations", original: 2, b: 1, c: 4, surge: 2, wantB: 1},
-		{name: "heterogeneous race fits every possible winner", original: 2, b: 4, c: 1, surge: 5, wantB: 4, wantC: 1},
-		{name: "original floor remains the larger baseline", original: 5, b: 2, c: 3, surge: 5, wantB: 2, wantC: 3},
+		{name: "larger destination sets nominal floor", original: 2, b: 4, c: 4, wantB: 4},
+		{name: "smaller winner cannot inherit a larger probes budget", original: 2, b: 4, c: 1, wantB: 4},
+		{name: "small first probe bounds later nominations", original: 2, b: 1, c: 4, wantB: 1},
+		{name: "original floor remains the larger baseline", original: 5, b: 2, c: 3, wantB: 2},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, p, o := replacementRaceFixture()
-			s.Spec.Placement.MaxSurge = ptr.To(tt.surge)
 			for name, floor := range map[string]int32{"member-a": tt.original, "member-b": tt.b, "member-c": tt.c} {
 				a := p.Assignments[name]
 				home := &v1beta1.PlacementHomePolicy{InputDigest: "intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: floor}}}
@@ -236,7 +223,7 @@ func TestReplacementBudgetForDifferentFloors(t *testing.T) {
 				t.Fatal(diff)
 			}
 			for _, floor := range []int32{tt.wantB, tt.wantC} {
-				if floor > 0 && tt.original+tt.wantB+tt.wantC > max(tt.original, floor)+tt.surge {
+				if floor > 0 && tt.original+tt.wantB+tt.wantC > max(tt.original, floor)+floor {
 					t.Fatal("a nominated winner cannot cover the committed budget")
 				}
 			}
@@ -317,7 +304,6 @@ func TestReplacementRaceReleasesOnlyAbsentOriginal(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source, proposal, observations := replacementRaceFixture()
-			source.Spec.Placement.MaxSurge = ptr.To[int32](0)
 			observations["member-a"] = plannedHomeObservation{Home: tt.home}
 			original := proposal.Assignments["member-a"].OriginalReplicas
 			step, err := advanceSingleRace(source, observations, &proposal, time.Unix(100, 0))
@@ -341,8 +327,8 @@ func TestReplacementRaceReleasesOnlyAbsentOriginal(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(map[string]int32{"member-a": 0, "member-b": 3, "member-c": 0}, step.Targets); diff != "" {
-				t.Fatalf("released baseline must fit one complete probe without surge: %s", diff)
+			if diff := cmp.Diff(map[string]int32{"member-a": 0, "member-b": 3, "member-c": 3}, step.Targets); diff != "" {
+				t.Fatalf("released baseline plus one extra home must fund two complete probes: %s", diff)
 			}
 			if diff := cmp.Diff(original, proposal.Assignments["member-a"].OriginalReplicas); diff != "" {
 				t.Fatalf("original budget changed: %s", diff)

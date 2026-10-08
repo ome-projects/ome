@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -430,5 +431,58 @@ func TestTerminalLifecycle_FailsClosedWithoutStrongOwnerIdentity(t *testing.T) {
 				t.Fatal("terminal finalization accepted an unverifiable owner or adapter")
 			}
 		})
+	}
+}
+
+// A recycle of the same dead pod bumps the ladder's bookkeeping and keeps
+// the failure it already recorded, time included; a same-name replacement
+// that fails the same way, or a different failure, replaces the record.
+func TestRecordRecycleAttempt_KeepsTheRecordedFailureAcrossRecyclesOfTheSamePod(t *testing.T) {
+	born := time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC)
+	first := born.Add(time.Second)
+	capture := func(at time.Time) *types.InstanceTermination {
+		return &types.InstanceTermination{PodName: "engine-0", Reason: "UnexpectedAdmissionError", Message: "Pod was rejected", Time: metav1.NewTime(at)}
+	}
+	recycle := func(at, podBorn time.Time, termination *types.InstanceTermination, w *rowWriter) int32 {
+		t.Helper()
+		n, err := RecordRecycleAttempt(context.Background(), w.input(at), 0, types.InstanceOperationCreate, metav1.NewTime(at), termination, metav1.NewTime(podBorn))
+		if err != nil {
+			t.Fatalf("recycle at %s: %v", at, err)
+		}
+		return n
+	}
+	w := newRowWriter(types.InstanceStatus{
+		Index: 0, Phase: types.InstancePhaseCreating,
+		Operation: &types.InstanceOperation{ID: "create-0-1", Type: types.InstanceOperationCreate},
+	})
+
+	if n := recycle(first, born, capture(first), w); n != 1 {
+		t.Fatalf("first recycle: got %d want 1", n)
+	}
+	recorded := *w.rows[0].LastFailure
+
+	later := first.Add(2 * time.Second)
+	if n := recycle(later, born, capture(later), w); n != 2 {
+		t.Fatalf("second recycle: got %d want 2", n)
+	}
+	got := w.rows[0]
+	if got.Operation.RetryCount != 2 || !got.Operation.LastProgressAt.Time.Equal(later) {
+		t.Fatalf("Operation = %+v, want RetryCount 2 anchored at the second recycle", got.Operation)
+	}
+	if got.LastFailure == nil || *got.LastFailure != recorded {
+		t.Fatalf("LastFailure = %+v, want the first record kept unchanged at %+v", got.LastFailure, recorded)
+	}
+
+	reborn := later.Add(time.Second)
+	again := reborn.Add(time.Second)
+	recycle(again, reborn, capture(again), w)
+	if got := w.rows[0].LastFailure; got == nil || *got != *capture(again) {
+		t.Fatalf("LastFailure = %+v, want the replacement's failure recorded at %s", got, again)
+	}
+
+	other := &types.InstanceTermination{PodName: "engine-0", Reason: "Evicted", Message: "The node was low on resource: memory", Time: metav1.NewTime(again)}
+	recycle(again, reborn, other, w)
+	if got := w.rows[0].LastFailure; got == nil || *got != *other {
+		t.Fatalf("LastFailure = %+v, want the new failure %+v recorded", got, other)
 	}
 }

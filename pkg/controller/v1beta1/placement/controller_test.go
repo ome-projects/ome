@@ -1949,46 +1949,47 @@ func requestNames(reqs []ctrl.Request) []string {
 	return out
 }
 
-// hangingClient blocks every Create until the (per-cluster) context deadline
-// fires, simulating a wedged remote apiserver that neither succeeds nor returns
-// an error promptly.
-type hangingClient struct {
+// wedgedCreateClient is a member whose create never answers: it fails exactly
+// as its bounded context would and keeps the deadline it was handed, so the
+// bound is checked without waiting on a real clock.
+type wedgedCreateClient struct {
 	client.WithWatch
+	creates int
+	bounded bool
+	budget  time.Duration
 }
 
-func (c hangingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
-	<-ctx.Done()
-	return ctx.Err()
+func (c *wedgedCreateClient) Create(ctx context.Context, _ client.Object, _ ...client.CreateOption) error {
+	c.creates++
+	var deadline time.Time
+	deadline, c.bounded = ctx.Deadline()
+	c.budget = time.Until(deadline)
+	return context.DeadlineExceeded
 }
 
-// Fault isolation: a wedged remote whose apply hangs is bounded by the
-// per-cluster PlaceTimeout and skipped, so the healthy peer still gets the
-// derived and the reconcile completes (Admitting) instead of stalling on the stuck
-// cluster.
+// Fault isolation: a member whose apply never answers is bounded by the
+// per-member PlaceTimeout and skipped; the healthy peer still gets the derived
+// and the reconcile completes (Admitting) instead of stalling.
 func TestReconcile_FanOutBoundsStuckClusterAndProceeds(t *testing.T) {
 	s := testScheme(t)
-	wa := hangingClient{WithWatch: fakeclient.NewClientBuilder().WithScheme(s).Build()} // wedged
-	wb := emptyWorker(s)                                                                // healthy
+	wa := &wedgedCreateClient{WithWatch: emptyWorker(s)} // wedged apply on a valid backend
+	wb := emptyWorker(s)                                 // healthy
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(wa),
 		"b": workloadcluster.NewNeverCachingClient(wb),
 	}}
 	r, cp := newPlacer(s, clusters, srcISVC("gpu=gb300"),
 		readyWC("a", map[string]string{"gpu": "gb300"}), readyWC("b", map[string]string{"gpu": "gb300"}))
-	r.PlaceTimeout = 50 * time.Millisecond // bound the wedged apply tightly for the test
+	// The bound under test. It caps every call of the healthy member too, so it
+	// stays far above what a loaded test host can stretch those calls to.
+	r.PlaceTimeout = time.Minute
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, err := r.Reconcile(context.Background(), req())
-		assert.NoError(t, err, "a wedged cluster must not fail the whole reconcile")
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reconcile blocked on a stuck cluster; per-cluster timeout did not fire")
-	}
+	_, err := r.Reconcile(context.Background(), req())
+	require.NoError(t, err, "a wedged cluster must not fail the whole reconcile")
 
+	assert.Equal(t, 1, wa.creates, "the wedged apply is attempted once per pass, not retried against the peer's turn")
+	assert.True(t, wa.bounded, "the wedged apply carried a deadline")
+	assert.LessOrEqual(t, wa.budget, r.PlaceTimeout, "the wedged apply was bounded by PlaceTimeout")
 	assert.True(t, hasDerived(t, wb), "healthy cluster b still got the derived despite the wedged peer")
 	p := cpPlacement(t, cp)
 	require.NotNil(t, p)
@@ -2584,9 +2585,9 @@ func TestSplitScaleComponentsAndAccounting(t *testing.T) {
 		v1beta1.DecoderComponent: &ds,
 	}
 	comps := []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}
-	assert.Equal(t, int32(2), placementAdmittedReplicas(comps, statuses), "min admitted = complete pairs")
-	assert.Equal(t, int32(1), placementReadyReplicas(comps, statuses), "min ready across components")
+	assert.Equal(t, int32(2), placementAdmittedReplicas(comps, statuses, nil), "min admitted = complete pairs")
+	assert.Equal(t, int32(1), placementReadyReplicas(comps, statuses, nil), "min ready across components")
 
 	// Engine-only accounting is just the engine's counts.
-	assert.Equal(t, int32(3), placementAdmittedReplicas([]v1beta1.ComponentType{v1beta1.EngineComponent}, statuses))
+	assert.Equal(t, int32(3), placementAdmittedReplicas([]v1beta1.ComponentType{v1beta1.EngineComponent}, statuses, nil))
 }

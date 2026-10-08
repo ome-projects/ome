@@ -10,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -83,7 +84,7 @@ func TestSingleAdmissionWaitHonorsStatusBackstop(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(ctrl.Result{RequeueAfter: tt.want}, got); diff != "" {
+			if diff := cmp.Diff(ctrl.Result{RequeueAfter: tt.want, Priority: ptr.To(retryPriority)}, got); diff != "" {
 				t.Errorf("next reconcile (-want +got):\n%s", diff)
 			}
 			source := &v1beta1.InferenceService{}

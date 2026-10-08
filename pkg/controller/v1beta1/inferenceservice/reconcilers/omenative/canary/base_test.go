@@ -2,6 +2,10 @@ package canary
 
 import (
 	"testing"
+	"time"
+
+	"k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -179,5 +183,38 @@ func TestBaseKeepsTheLiveRolledOutRevisionsOverAStalePass(t *testing.T) {
 	if got.LatestReadyRevision != "e-new" || got.LatestRolledoutRevision != "e-new" || got.PreviousRolledoutRevision != "e-old" {
 		t.Fatalf("the live rolled-out revisions were not kept: ready %q latest %q previous %q",
 			got.LatestReadyRevision, got.LatestRolledoutRevision, got.PreviousRolledoutRevision)
+	}
+}
+
+// The flush tells a stale pass apart on the whole record and the phase, not
+// on the fields a step moves: a hold whose record changed only in its
+// capacity-wait clock, or only in the phase the revert projected, still
+// keeps the live state over a pass that read the copy before it.
+func TestBaseKeepsALiveHoldOverAPassThatMissedItsClockOrPhase(t *testing.T) {
+	drain := &v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", CurrentStep: 1, ObservedTrafficWeight: 100}
+	shortDrain := drain.DeepCopy()
+	shortDrain.CapacityWaitSince = &metav1.Time{Time: time.Unix(1000, 0)}
+	revert := &v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", RolledBackRevisionHash: "new"}
+	cases := []struct {
+		name        string
+		stale, live *v1beta1.InferenceServiceStatus
+	}{
+		{"a drain that dipped since the copy was read", statusWithRecord(drain, v1beta1.RolloutPhasePromoting), statusWithRecord(shortDrain, v1beta1.RolloutPhasePromoting)},
+		{"a revert that completed since the copy was read", statusWithRecord(revert, v1beta1.RolloutPhaseRollingBack), statusWithRecord(revert, v1beta1.RolloutPhaseRolledBack)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			base := NewBase(isvcWith(c.stale))
+			desired := c.stale.DeepCopy()
+			if !base.PreserveFresh(desired, c.live) || !base.Stale() {
+				t.Fatal("a pass that read the copy before the hold moved was not treated as stale")
+			}
+			if got, want := engineRecord(desired), engineRecord(c.live); !equality.Semantic.DeepEqual(got, want) {
+				t.Fatalf("the live record was not kept: got %+v, want %+v", got, want)
+			}
+			if got, want := desired.Components[v1beta1.EngineComponent].RolloutPhase, c.live.Components[v1beta1.EngineComponent].RolloutPhase; got != want {
+				t.Fatalf("the live phase was not kept: got %q, want %q", got, want)
+			}
+		})
 	}
 }

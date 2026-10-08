@@ -8,8 +8,9 @@ hash for each declared Engine/Decoder component. These versions identify fixed
 wire formats; they are not operator configuration or behavior defaults.
 
 Version `3` carries each resolved component's replica floor and may also carry
-the demand contract. Engine and Decoder floors must be equal when both exist;
-Router has an independent floor. An unpaused contract accepts explicit zero
+the demand contract. Engine and Decoder floors are independent counts whose
+ratio follows the source minimums; the Engine count is the home's replica unit,
+and Router has an independent floor. An unpaused contract accepts explicit zero
 floors so members can retain their service and external autoscaler while no
 replicas are running. Omitted, negative, or mismatched floors do not authorize
 projection. A surge pause requires positive floors for every component;

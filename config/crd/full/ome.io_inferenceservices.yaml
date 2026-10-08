@@ -23950,7 +23950,6 @@ spec:
                             x-kubernetes-list-type: atomic
                           weight:
                             format: int32
-                            maximum: 100
                             minimum: 1
                             type: integer
                         type: object
@@ -28827,6 +28826,10 @@ spec:
                           type: string
                       type: object
                   type: object
+                ttlSecondsAfterCreation:
+                  format: int64
+                  minimum: 1
+                  type: integer
               type: object
               x-kubernetes-validations:
                 - message: ClusterAffinity placement policy cannot be removed; drain and recreate the service to change placement ownership

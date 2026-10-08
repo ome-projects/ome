@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -407,7 +409,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 		configMapData map[string]string
 		omitConfigMap bool
 		wantScaleUp   int32
-		wantScaleDown int32
+		wantScaleDown intstr.IntOrString
 		wantInterval  time.Duration
 		wantError     string
 	}{
@@ -417,8 +419,15 @@ func TestLoadPodBatchSizes(t *testing.T) {
 				controllerconfig.LifecycleConfigName: `{"scaleUpPodBatchSize":37,"scaleDownPodBatchSize":41,"scaleDownRequeueInterval":"7s"}`,
 			},
 			wantScaleUp:   37,
-			wantScaleDown: 41,
+			wantScaleDown: intstr.FromInt32(41),
 			wantInterval:  7 * time.Second,
+		},
+		{
+			name: "percentage configured at manager startup",
+			configMapData: map[string]string{
+				controllerconfig.LifecycleConfigName: `{"scaleDownPodBatchSize":"10%"}`,
+			},
+			wantScaleDown: intstr.FromString("10%"),
 		},
 		{
 			name: "scale-up field does not configure scale-down",
@@ -432,7 +441,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 			configMapData: map[string]string{
 				controllerconfig.LifecycleConfigName: `{"scaleDownPodBatchSize":41}`,
 			},
-			wantScaleDown: 41,
+			wantScaleDown: intstr.FromInt32(41),
 		},
 		{
 			name: "requeue interval does not configure either batch size",
@@ -496,7 +505,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 			configMapData: map[string]string{
 				controllerconfig.LifecycleConfigName: `{"scaleDownPodBatchSize":"many"}`,
 			},
-			wantError: "cannot unmarshal string",
+			wantError: "lifecycle.scaleDownPodBatchSize",
 		},
 		{
 			name: "malformed requeue interval is rejected",
@@ -559,7 +568,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 					require.NotNil(t, got.ScaleUp)
 					assert.Equal(t, tt.wantScaleUp, *got.ScaleUp)
 				}
-				if tt.wantScaleDown == 0 {
+				if tt.wantScaleDown == (intstr.IntOrString{}) {
 					assert.Nil(t, got.ScaleDown)
 				} else {
 					require.NotNil(t, got.ScaleDown)

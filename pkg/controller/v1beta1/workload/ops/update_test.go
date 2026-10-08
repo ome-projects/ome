@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
@@ -3139,4 +3140,480 @@ func TestUpdateWithPods_RecreateFallbackRetargetedToTheRunningRevisionStaysARecr
 	case after.Labels[query.LabelRevisionHash] != query.RevisionOf(probedCR).Hash():
 		t.Errorf("the superseded pod was relabeled to %q; a pod rendered from %s never carries another revision", after.Labels[query.LabelRevisionHash], probedCR.Name)
 	}
+}
+
+// restartedRunnerPod is a serving single-pod set whose runner restarted
+// after readySince: once, the run that died being the promoted one, or
+// again, the run that died having itself begun after Ready. The new run
+// is Ready again since readyAgain; down leaves it not Ready yet.
+func restartedRunnerPod(readySince, readyAgain time.Time, again, down bool) *corev1.Pod {
+	died := corev1.ContainerStateTerminated{
+		ExitCode: 1, Reason: "Error",
+		StartedAt:  metav1.NewTime(readySince.Add(-5 * time.Minute)),
+		FinishedAt: metav1.NewTime(readySince.Add(20 * time.Second)),
+	}
+	restarts := int32(1)
+	if again {
+		died.StartedAt = metav1.NewTime(readySince.Add(21 * time.Second))
+		died.FinishedAt = metav1.NewTime(readySince.Add(40 * time.Second))
+		restarts = 2
+	}
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-0-0", Namespace: "prod"}}
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: constants.MainContainerName, Ready: !down, RestartCount: restarts,
+		State:                corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(died.FinishedAt.Add(time.Second))}},
+		LastTerminationState: corev1.ContainerState{Terminated: &died},
+	}}
+	ready := corev1.ConditionTrue
+	if down {
+		ready = corev1.ConditionFalse
+	}
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: ready, LastTransitionTime: metav1.NewTime(readyAgain)},
+		{Type: corev1.PodReady, Status: ready, LastTransitionTime: metav1.NewTime(readyAgain)},
+		{Type: query.ServingConditionType, Status: corev1.ConditionTrue},
+	}
+	return pod
+}
+
+// TestRolledInstanceNotServing_RestartedRunnerServesOnceItHoldsReadyForTheWindow
+// pins the serving bar for a promoted pod whose runner restarted after the
+// row entered Ready, once or more than once. The row's anchor moves only
+// on an entry into Ready, so the pod is proven by its current run alone:
+// it holds the slot while it is down and while it is Ready again for less
+// than the window, and serves once it has held Ready for the window,
+// however many restarts its record carries. With no window configured,
+// Ready again is serving.
+func TestRolledInstanceNotServing_RestartedRunnerServesOnceItHoldsReadyForTheWindow(t *testing.T) {
+	const target = "llama-70b-engine-v2hash"
+	readySince := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	readyAgain := readySince.Add(45 * time.Second)
+	row := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: target, ReadySince: &metav1.Time{Time: readySince}}
+	cases := []struct {
+		name   string
+		again  bool
+		down   bool
+		window int32
+		now    time.Time
+		held   bool
+		wait   time.Duration
+		reason string
+	}{
+		{name: "restarted once, Ready again for less than the window", window: 30, now: readyAgain.Add(15 * time.Second),
+			held: true, wait: 15 * time.Second, reason: "restarted since Ready, Ready again for less than the 30s window"},
+		{name: "restarted once, Ready again for the window", window: 30, now: readyAgain.Add(30 * time.Second)},
+		{name: "restarted again, the new run not Ready yet", again: true, down: true, window: 30, now: readyAgain.Add(15 * time.Second),
+			held: true, reason: "restarted again since Ready"},
+		{name: "restarted again, Ready again for less than the window", again: true, window: 30, now: readyAgain.Add(15 * time.Second),
+			held: true, wait: 15 * time.Second, reason: "restarted again since Ready, Ready again for less than the 30s window"},
+		{name: "restarted again, Ready again for the window", again: true, window: 30, now: readyAgain.Add(30 * time.Second)},
+		{name: "restarted again, no window configured", again: true, now: readyAgain.Add(time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := restartedRunnerPod(readySince, readyAgain, tc.again, tc.down)
+			held, wait, reason := RolledInstanceNotServing(row, target, time.Time{}, []*corev1.Pod{pod}, 1, tc.window, tc.now)
+			if held != tc.held || wait != tc.wait {
+				t.Fatalf("RolledInstanceNotServing = (%v, %s, %q), want held=%v wait=%s", held, wait, reason, tc.held, tc.wait)
+			}
+			if !strings.Contains(reason, tc.reason) {
+				t.Fatalf("the reason must name %q, got %q", tc.reason, reason)
+			}
+		})
+	}
+}
+
+// TestRolledSetInRotation pins the serving half of the roll's reading of
+// a promoted set: in rotation when every live pod of the revision is
+// ContainersReady and serving, whatever window a pod that came back has
+// yet to hold Ready for; short of rotation when a pod is not Ready, is
+// terminal, or is missing. A Terminating pod and a pod of another
+// revision are not the set's.
+func TestRolledSetInRotation(t *testing.T) {
+	const target = "llama-70b-engine-v2hash"
+	readySince := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	readyAgain := readySince.Add(45 * time.Second)
+	serving := restartedRunnerPod(readySince, readyAgain, false, false)
+	down := restartedRunnerPod(readySince, readyAgain, false, true)
+	terminating := restartedRunnerPod(readySince, readyAgain, false, false)
+	terminating.DeletionTimestamp = &metav1.Time{Time: readyAgain}
+	other := restartedRunnerPod(readySince, readyAgain, false, false)
+	other.Labels = map[string]string{query.LabelRevisionHash: "v1hash"}
+	cases := []struct {
+		name    string
+		pods    []*corev1.Pod
+		desired int32
+		want    bool
+	}{
+		{name: "Ready again inside the window is in rotation", pods: []*corev1.Pod{serving}, desired: 1, want: true},
+		{name: "a pod not Ready is short of rotation", pods: []*corev1.Pod{down}, desired: 1},
+		{name: "no pod is short of rotation", desired: 1},
+		{name: "a Terminating pod is not the set's", pods: []*corev1.Pod{terminating}, desired: 1},
+		{name: "a pod of another revision is not the set's", pods: []*corev1.Pod{other}, desired: 1},
+		{name: "a gang short of a member is short of rotation", pods: []*corev1.Pod{serving}, desired: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RolledSetInRotation(target, tc.pods, tc.desired); got != tc.want {
+				t.Fatalf("RolledSetInRotation = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRolledInstanceCrashed_RememberedCrashReadsThroughTheRebuild pins the
+// row's own record as a reading of the crash: a failure of a container of
+// the promoted set dated after the row entered Ready keeps the Instance
+// reading crashed while the rebuild answering it has torn the pods down,
+// and a record older than the row's Ready, or one naming no container,
+// leaves the reading to the pods.
+func TestRolledInstanceCrashed_RememberedCrashReadsThroughTheRebuild(t *testing.T) {
+	const target = "llama-70b-engine-v2hash"
+	readySince := metav1.NewTime(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	afterReady := metav1.NewTime(readySince.Add(20 * time.Second))
+	beforeReady := metav1.NewTime(readySince.Add(-time.Minute))
+	restart := &workload.InstanceOperation{Type: workload.InstanceOperationRestart, Step: workload.RestartStepDrain}
+	cases := []struct {
+		name string
+		row  *workload.InstanceStatus
+		want bool
+	}{
+		{name: "a Restarting row remembering its set's crash", want: true, row: &workload.InstanceStatus{
+			Phase: workload.InstancePhaseRestarting, RunningRevision: target, ReadySince: &readySince, Operation: restart,
+			LastFailure: &workload.InstanceTermination{PodName: "p", ContainerName: "main", Reason: "Error", Time: afterReady}}},
+		{name: "a Ready row remembering its set's crash with no pod left to read", want: true, row: &workload.InstanceStatus{
+			Phase: workload.InstancePhaseReady, RunningRevision: target, ReadySince: &readySince,
+			LastFailure: &workload.InstanceTermination{PodName: "p", ContainerName: "main", Reason: "Error", Time: afterReady}}},
+		{name: "a record older than the row's Ready is a prior set's", want: false, row: &workload.InstanceStatus{
+			Phase: workload.InstancePhaseRestarting, RunningRevision: target, ReadySince: &readySince, Operation: restart,
+			LastFailure: &workload.InstanceTermination{PodName: "p", ContainerName: "main", Reason: "Error", Time: beforeReady}}},
+		{name: "a record naming no container is a wait, not a crash", want: false, row: &workload.InstanceStatus{
+			Phase: workload.InstancePhaseRestarting, RunningRevision: target, ReadySince: &readySince, Operation: restart,
+			LastFailure: &workload.InstanceTermination{PodName: "p", Reason: "Unschedulable", Time: afterReady}}},
+		{name: "a row off the target is not the roll's", want: false, row: &workload.InstanceStatus{
+			Phase: workload.InstancePhaseRestarting, RunningRevision: "llama-70b-engine-v1hash", ReadySince: &readySince, Operation: restart,
+			LastFailure: &workload.InstanceTermination{PodName: "p", ContainerName: "main", Reason: "Error", Time: afterReady}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RolledInstanceCrashed(tc.row, target, time.Time{}, nil, 30); got != tc.want {
+				t.Fatalf("RolledInstanceCrashed = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRetryBlockOfCrashedAttempt pins which block states read as the
+// ladder's attempt being the rebuild of crashed rows: a Backoff that has
+// come due and RetryInProgress; a Held block and a Backoff not yet due
+// are the trigger gate's denials, read elsewhere.
+func TestRetryBlockOfCrashedAttempt(t *testing.T) {
+	t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-v2hash"}}
+	later := metav1.NewTime(t0.Add(time.Minute))
+	earlier := metav1.NewTime(t0.Add(-time.Minute))
+	cases := []struct {
+		name  string
+		block *workload.RetryBlock
+		want  bool
+	}{
+		{name: "no block", want: false},
+		{name: "RetryInProgress", block: &workload.RetryBlock{State: workload.RetryBlockRetryInProgress}, want: true},
+		{name: "Backoff that has come due", block: &workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: &earlier}, want: true},
+		{name: "Backoff with no retry time is due", block: &workload.RetryBlock{State: workload.RetryBlockBackoff}, want: true},
+		{name: "Backoff not yet due", block: &workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: &later}, want: false},
+		{name: "Held", block: &workload.RetryBlock{State: workload.RetryBlockHeld}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := workload.ReconcileInput{Clock: clocktesting.NewFakeClock(t0)}
+			if tc.block != nil {
+				b := *tc.block
+				b.TargetRevision = target.Name
+				input.ObservedState.RetryBlocks = []workload.RetryBlock{b}
+			}
+			got := RetryBlockOfCrashedAttempt(input, target)
+			if (got != nil) != tc.want {
+				t.Fatalf("RetryBlockOfCrashedAttempt = %+v, want present=%v", got, tc.want)
+			}
+			if RetryBlockOfCrashedAttempt(input, nil) != nil {
+				t.Fatalf("no target has no block")
+			}
+		})
+	}
+}
+
+// darkRunnerPod is a promoted pod whose runner keeps running but has
+// failed readiness since the given instant: ContainersReady and PodReady
+// False from then, the serving gate written at promotion still True, no
+// restart on its record.
+func darkRunnerPod(name string, since time.Time) *corev1.Pod {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod"}}
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: constants.MainContainerName, Ready: false,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(since.Add(-time.Hour))}},
+	}}
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(since)},
+		{Type: corev1.PodReady, Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(since)},
+		{Type: query.ServingConditionType, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(since.Add(-time.Hour))},
+	}
+	return pod
+}
+
+// rotationRunnerPod is a promoted pod in rotation: Ready with the serving
+// gate True.
+func rotationRunnerPod(name string) *corev1.Pod {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod"}}
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: constants.MainContainerName, Ready: true,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}}
+	pod.Status.Conditions = []corev1.PodCondition{
+		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+		{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+		{Type: query.ServingConditionType, Status: corev1.ConditionTrue},
+	}
+	return pod
+}
+
+// TestRolledInstanceDark_ShortfallOfDarkPodsAloneIsNotTheRollsOpenWork pins
+// the reading that frees the roll from an Instance it moved onto the
+// target whose promoted pod served and then failed readiness for the
+// stuck-pod grace: nothing the pod does lifts the shortfall, so the
+// Instance is dark for the roll and holds no slot. Inside the grace the
+// Instance still holds its slot and the reading says how long until it
+// reads dark. With no grace configured, with a runner restarted since
+// Ready (the ladder's shape), with a pod missing, terminal or never
+// promoted, off the target or mid-update, the Instance is not dark. A
+// gang reads every member: a dark worker beside a serving leader is dark,
+// a member inside the grace beside one past it is not yet.
+func TestRolledInstanceDark_ShortfallOfDarkPodsAloneIsNotTheRollsOpenWork(t *testing.T) {
+	const target = "llama-70b-engine-v2hash"
+	const grace = time.Minute
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	readySince := metav1.NewTime(now.Add(-time.Hour))
+	row := func(phase workload.InstancePhase, rev string) *workload.InstanceStatus {
+		return &workload.InstanceStatus{Index: 0, Phase: phase, RunningRevision: rev, ReadySince: &readySince}
+	}
+	dark := func(name string) *corev1.Pod { return darkRunnerPod(name, now.Add(-2*grace)) }
+	inside := func(name string) *corev1.Pod { return darkRunnerPod(name, now.Add(-grace/4)) }
+	never := dark("llama-70b-engine-0-0")
+	never.Status.Conditions = never.Status.Conditions[:2]
+	failed := dark("llama-70b-engine-0-0")
+	failed.Status.Phase = corev1.PodFailed
+	cases := []struct {
+		name    string
+		row     *workload.InstanceStatus
+		pods    []*corev1.Pod
+		desired int32
+		grace   time.Duration
+		dark    bool
+		wait    time.Duration
+	}{
+		{name: "unready past the grace with no restart since Ready", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{dark("llama-70b-engine-0-0")}, desired: 1, grace: grace, dark: true},
+		{name: "unready inside the grace", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{inside("llama-70b-engine-0-0")}, desired: 1, grace: grace, wait: 3 * grace / 4},
+		{name: "no grace configured", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{dark("llama-70b-engine-0-0")}, desired: 1},
+		{name: "restarted since Ready and down", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{restartedRunnerPod(readySince.Time, now.Add(-2*grace), false, true)}, desired: 1, grace: grace},
+		{name: "a pod short of the set", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{dark("llama-70b-engine-0-0")}, desired: 2, grace: grace},
+		{name: "in rotation", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{rotationRunnerPod("llama-70b-engine-0-0")}, desired: 1, grace: grace},
+		{name: "never promoted", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{never}, desired: 1, grace: grace},
+		{name: "terminal", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{failed}, desired: 1, grace: grace},
+		{name: "off the target", row: row(workload.InstancePhaseReady, "llama-70b-engine-v1hash"),
+			pods: []*corev1.Pod{dark("llama-70b-engine-0-0")}, desired: 1, grace: grace},
+		{name: "mid-update", row: row(workload.InstancePhaseUpdating, target),
+			pods: []*corev1.Pod{dark("llama-70b-engine-0-0")}, desired: 1, grace: grace},
+		{name: "gang: worker dark beside a serving leader", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{rotationRunnerPod("llama-70b-engine-0-0-leader"), dark("llama-70b-engine-0-0-worker")}, desired: 2, grace: grace, dark: true},
+		{name: "gang: leader dark beside a worker never promoted", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{dark("llama-70b-engine-0-0-leader"), never}, desired: 2, grace: grace},
+		{name: "gang: one member past the grace, one inside it", row: row(workload.InstancePhaseReady, target),
+			pods: []*corev1.Pod{dark("llama-70b-engine-0-0-leader"), inside("llama-70b-engine-0-0-worker")}, desired: 2, grace: grace, wait: 3 * grace / 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dark, wait := RolledInstanceDark(tc.row, target, time.Time{}, tc.pods, tc.desired, int32(grace/time.Second), tc.grace, now)
+			if dark != tc.dark || wait != tc.wait {
+				t.Fatalf("RolledInstanceDark = (%v, %s), want (%v, %s)", dark, wait, tc.dark, tc.wait)
+			}
+			notServing, _, _ := RolledInstanceNotServing(tc.row, target, time.Time{}, tc.pods, tc.desired, int32(grace/time.Second), now)
+			if dark && !notServing {
+				t.Fatal("a dark Instance is short of serving by the strict bar; the dark reading is the exception the roll takes")
+			}
+		})
+	}
+}
+
+// An attempt parked after its disposition is gated like the Failed row it
+// stands for, whichever phase its pods give it: the ladder's backoff denies
+// it with the remaining wait, a held ladder denies it outright, a due
+// ladder triggers it as a fresh start, and it is never an attempt in
+// flight at its revision.
+func TestEvaluateUpdateTrigger_ParkedAttemptIsGatedByItsLadder(t *testing.T) {
+	t0 := time.Now()
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-newhash", Namespace: "prod"}}
+	parked := func(phase workload.InstancePhase, waiting string) workload.InstanceStatus {
+		return workload.InstanceStatus{
+			Index: 0, Phase: phase, RunningRevision: "llama-70b-engine-oldhash", TargetRevision: target.Name,
+			Operation: &workload.InstanceOperation{
+				Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepParked,
+				TargetRevision: target.Name, Waiting: waiting,
+			},
+		}
+	}
+	for _, phase := range []workload.InstancePhase{workload.InstancePhaseUpdating, workload.InstancePhaseFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			fc := clocktesting.NewFakeClock(t0)
+			next := metav1.NewTime(t0.Add(37 * time.Second))
+			input := workload.ReconcileInput{Clock: fc, ObservedState: workload.WorkloadObservedState{
+				InstanceStatuses: []workload.InstanceStatus{parked(phase, string(workload.RolloutHoldGateRetryBlock))},
+				RetryBlocks:      []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockBackoff, NextRetryAt: &next}},
+			}}
+			dec := EvaluateUpdateTrigger(input, workload.InstancePlan{Index: 0}, target, nil)
+			if dec.Trigger || !dec.RetryBlockDenied || dec.RetryAfter != 37*time.Second {
+				t.Fatalf("under a backoff not due: got %+v, want denied with the remaining wait", dec)
+			}
+
+			fc.Step(40 * time.Second)
+			dec = EvaluateUpdateTrigger(input, workload.InstancePlan{Index: 0}, target, nil)
+			if !dec.Trigger || dec.RetryBlockDenied {
+				t.Fatalf("once the ladder is due: got %+v, want a fresh start", dec)
+			}
+
+			input.ObservedState.InstanceStatuses = []workload.InstanceStatus{parked(phase, string(workload.RolloutHoldGateHeld))}
+			input.ObservedState.RetryBlocks = []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockHeld}}
+			dec = EvaluateUpdateTrigger(input, workload.InstancePlan{Index: 0}, target, nil)
+			if dec.Trigger || !dec.RetryBlockDenied {
+				t.Fatalf("under a held ladder: got %+v, want denied", dec)
+			}
+		})
+	}
+	if anyInFlightUpdateAt([]workload.InstanceStatus{parked(workload.InstancePhaseUpdating, string(workload.RolloutHoldGateRetryBlock))}, target.Name) {
+		t.Fatalf("a parked attempt is not an attempt in flight at its revision")
+	}
+	inFlight := parked(workload.InstancePhaseUpdating, "")
+	inFlight.Operation.Step = workload.UpdateStepDrain
+	if !anyInFlightUpdateAt([]workload.InstanceStatus{inFlight}, target.Name) {
+		t.Fatalf("an attempt on its Drain step is in flight")
+	}
+}
+
+// A parked attempt pins nothing on the next one: the strategy it runs
+// under is the desired one, as for a Failed row, and the wreckage scan
+// reads the row in either of the phases its pods give it.
+func TestParkedAttempt_PinsNoStrategyAndIsScannedForWreckage(t *testing.T) {
+	parked := func(phase workload.InstancePhase) *workload.InstanceStatus {
+		return &workload.InstanceStatus{
+			Index: 0, Phase: phase, RunningRevision: "llama-70b-engine-oldhash", TargetRevision: "llama-70b-engine-badhash",
+			Operation: &workload.InstanceOperation{
+				Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepParked, Strategy: workload.UpdateStrategyRecreatePod,
+				TargetRevision: "llama-70b-engine-badhash", Waiting: string(workload.RolloutHoldGateRetryBlock),
+			},
+		}
+	}
+	for _, phase := range []workload.InstancePhase{workload.InstancePhaseUpdating, workload.InstancePhaseFailed} {
+		if got := effectiveUpdateStrategy(parked(phase), workload.UpdateStrategyInPlaceIfPossible); got != workload.UpdateStrategyInPlaceIfPossible {
+			t.Errorf("%s: effective strategy = %s, want the desired one; a parked attempt pins nothing", phase, got)
+		}
+		if recreateInFlight(parked(phase)) {
+			t.Errorf("%s: a parked attempt is not a recreate in flight", phase)
+		}
+	}
+	rolledBack := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-oldhash", Namespace: "prod"}}
+	alien := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "engine-0", Labels: map[string]string{
+		query.LabelRevisionHash: query.RevisionHashFromControllerRevisionName("llama-70b-engine-badhash"),
+	}}}
+	if !EvaluateWreckage(parked(workload.InstancePhaseUpdating), rolledBack, []*corev1.Pod{alien}) {
+		t.Errorf("a parked attempt whose pods are on a withdrawn revision is wreckage while its set serves too")
+	}
+}
+
+// TestDetectUpdate_VerdictEndedAttemptRollsOnlyTowardAnotherRevision: a
+// row keeping an attempt the gang verdict ended is withheld at the
+// revision that attempt pinned, whatever its pod set says, and rolls
+// toward any other target, with or without pods, since the pin already
+// proves it off target. A rollback onto the running revision is such a
+// target for a recreate pinned past it.
+func TestDetectUpdate_VerdictEndedAttemptRollsOnlyTowardAnotherRevision(t *testing.T) {
+	const other = "llama-70b-engine-otherrev"
+	verdict := &workload.InstanceTermination{Reason: workload.PodGroupOwnershipConflictReason, Message: "PodGroup llama-70b-engine-0 is controlled by StatefulSet/other-owner, not by this owner"}
+	create := func(pin string) *workload.InstanceOperation {
+		return &workload.InstanceOperation{ID: "create-0-1", Type: workload.InstanceOperationCreate, Step: status.CreateStepCreatePods, TargetRevision: pin}
+	}
+	drain := func(pin string) *workload.InstanceOperation {
+		return &workload.InstanceOperation{ID: "update-0-1", Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepDrain, TargetRevision: pin}
+	}
+	cases := []struct {
+		name        string
+		running     string
+		op          func(target string) *workload.InstanceOperation
+		unreadyPod  bool
+		wantTrigger bool
+	}{
+		{"create pinned to the target, members unready on it", "", func(target string) *workload.InstanceOperation { return create(target) }, true, false},
+		{"create pinned to the target, members never placed", "", func(target string) *workload.InstanceOperation { return create(target) }, false, false},
+		{"create pinned elsewhere, members never placed", "", func(string) *workload.InstanceOperation { return create(other) }, false, true},
+		{"recreate pinned to the target", "llama-70b-engine-oldrev", func(target string) *workload.InstanceOperation { return drain(target) }, false, false},
+		{"recreate pinned elsewhere", "llama-70b-engine-oldrev", func(string) *workload.InstanceOperation { return drain(other) }, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t0 := time.Now()
+			input, plan, tcr, calls, c, isvc := retryGateFixture(t, t0)
+			row := &input.ObservedState.InstanceStatuses[0]
+			row.Phase = workload.InstancePhaseFailed
+			row.RunningRevision = tc.running
+			row.Operation = tc.op(tcr.Name)
+			row.LastFailure = verdict
+			var pods []*corev1.Pod
+			if tc.unreadyPod {
+				pod := legacyPodForInstance(isvc, 0, false, false)
+				pod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(tcr.Name)
+				pods = []*corev1.Pod{pod}
+			}
+
+			trigger, retryAfter, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, pods)
+			if err != nil {
+				t.Fatalf("detect: %v", err)
+			}
+			if trigger != tc.wantTrigger {
+				t.Errorf("trigger = %v, want %v", trigger, tc.wantTrigger)
+			}
+			if retryAfter != 0 {
+				t.Errorf("retryAfter: got %v want 0", retryAfter)
+			}
+			if len(*calls) != 0 {
+				t.Errorf("the trigger must not touch a RetryBlock: %d calls", len(*calls))
+			}
+		})
+	}
+
+	t.Run("recreate pinned past a rollback onto the running revision", func(t *testing.T) {
+		t0 := time.Now()
+		input, plan, tcr, _, c, _ := retryGateFixture(t, t0)
+		row := &input.ObservedState.InstanceStatuses[0]
+		row.Phase = workload.InstancePhaseFailed
+		row.RunningRevision = tcr.Name
+		row.Operation = drain(other)
+		row.LastFailure = verdict
+
+		trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), *input, plan, plan.Instances[0], tcr, nil)
+		if err != nil {
+			t.Fatalf("detect: %v", err)
+		}
+		if !trigger {
+			t.Errorf("a target other than the pinned revision re-drives the ended recreate, the running revision included")
+		}
+	})
 }

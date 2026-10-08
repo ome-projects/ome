@@ -66,8 +66,8 @@ func compileTerm(input v1beta1.ClusterAffinityTerm, allowWeights bool) (term, er
 		if !allowWeights {
 			return term{}, fmt.Errorf("weight is permitted only in Split mode")
 		}
-		if *input.Weight < 1 || *input.Weight > v1beta1.MaxClusterAffinityWeight {
-			return term{}, fmt.Errorf("weight must be between 1 and %d", v1beta1.MaxClusterAffinityWeight)
+		if *input.Weight < 1 {
+			return term{}, fmt.Errorf("weight must be positive")
 		}
 		out.weight = int64(*input.Weight)
 	}

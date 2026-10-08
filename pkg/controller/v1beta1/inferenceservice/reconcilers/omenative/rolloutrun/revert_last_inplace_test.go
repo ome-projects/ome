@@ -43,11 +43,14 @@ func TestRevertAtTheLastInPlaceInstanceClosesTheRunSuperseded(t *testing.T) {
 		RollingUpdate: &v1beta1.GroupRollingUpdate{},
 	})
 	// current mirrors the IR controller's rollup: it follows
-	// CurrentRevisionFor over the rows the pass publishes.
-	current := oldRev
+	// CurrentRevisionFor over the rows the pass publishes, with the
+	// withdrawal carried from pass to pass as the stored record is.
+	current, withdrawn := oldRev, ""
 	pass := func(t *testing.T, target string, rows []workloadtypes.InstanceStatus) {
 		t.Helper()
-		current = workloadstatus.CurrentRevisionFor(rows, current, target, nil)
+		next := workloadstatus.CurrentRevisionFor(rows, current, target, nil, withdrawn)
+		withdrawn = workloadstatus.WithdrawnRevisionAfter(withdrawn, current, next, target)
+		current = next
 		local := isvc.DeepCopy()
 		local.ObjectMeta.ResourceVersion = ""
 		if _, err := Reconcile(context.Background(), testInputs(t, local, irPublished(t, current, target, rows))); err != nil {
@@ -139,10 +142,12 @@ func TestRevertAtTheLastInstanceWaitsForTheProjectionBeforeJudgingTheRun(t *test
 		RollingUpdate: &v1beta1.GroupRollingUpdate{},
 	})
 	isvc.Generation = 1
-	current := oldRev
+	current, withdrawn := oldRev, ""
 	pass := func(t *testing.T, target string, projectedFrom int64, rows []workloadtypes.InstanceStatus) {
 		t.Helper()
-		current = workloadstatus.CurrentRevisionFor(rows, current, target, nil)
+		next := workloadstatus.CurrentRevisionFor(rows, current, target, nil, withdrawn)
+		withdrawn = workloadstatus.WithdrawnRevisionAfter(withdrawn, current, next, target)
+		current = next
 		local := isvc.DeepCopy()
 		local.ObjectMeta.ResourceVersion = ""
 		ir := irPublished(t, current, target, rows)

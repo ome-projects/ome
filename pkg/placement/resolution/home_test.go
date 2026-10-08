@@ -36,12 +36,19 @@ func TestResolveHome(t *testing.T) {
 			f.runtime.Spec.EngineConfig.MinReplicas = nil
 			cm.Data["deploy"] = `{"defaultDeploymentMode":"RawDeployment"}`
 		}, wantErr: true},
-		{name: "unequal zero floor", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) { f.service.Spec.Engine.MinReplicas = ptr.To(0) }, wantErr: true},
+		{name: "zero engine with a positive decoder", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) { f.service.Spec.Engine.MinReplicas = ptr.To(0) }, want: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent}, {Component: v1beta1.DecoderComponent, Replicas: 2}, {Component: v1beta1.RouterComponent, Replicas: 1}}},
 		{name: "explicit zero whole home", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) {
 			f.service.Spec.Engine.MinReplicas, f.service.Spec.Decoder.MinReplicas = ptr.To(0), ptr.To(0)
 		}, want: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent}, {Component: v1beta1.DecoderComponent}, {Component: v1beta1.RouterComponent, Replicas: 1}}},
 		{name: "explicit zero router", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) { f.service.Spec.Router.MinReplicas = ptr.To(0) }, want: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: 2}, {Component: v1beta1.DecoderComponent, Replicas: 2}, {Component: v1beta1.RouterComponent}}},
-		{name: "unequal whole units", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) { f.service.Spec.Decoder.MinReplicas = ptr.To(5) }, wantErr: true},
+		{name: "decoder floor above the engine floor", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) { f.service.Spec.Decoder.MinReplicas = ptr.To(5) }, want: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: 2}, {Component: v1beta1.DecoderComponent, Replicas: 5}, {Component: v1beta1.RouterComponent, Replicas: 1}}},
+		{name: "ratio floors with an independent router", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) {
+			f.service.Spec.Engine.MinReplicas, f.service.Spec.Decoder.MinReplicas, f.service.Spec.Router.MinReplicas = ptr.To(60), ptr.To(40), ptr.To(8)
+		}, want: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: 60}, {Component: v1beta1.DecoderComponent, Replicas: 40}, {Component: v1beta1.RouterComponent, Replicas: 8}}},
+		{name: "ratio floors inherited from the runtime", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) {
+			f.service.Spec.Engine.MinReplicas, f.service.Spec.Decoder.MinReplicas = nil, nil
+			f.runtime.Spec.EngineConfig.MinReplicas, f.runtime.Spec.DecoderConfig.MinReplicas = ptr.To(6), ptr.To(4)
+		}, want: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: 6}, {Component: v1beta1.DecoderComponent, Replicas: 4}, {Component: v1beta1.RouterComponent, Replicas: 1}}},
 		{name: "router backend is required", edit: func(f *runtimeFixture, _ *corev1.ConfigMap) {
 			f.service.Spec.Router.Annotations = map[string]string{constants.DeploymentMode: string(constants.RawDeployment)}
 		}, wantErr: true},

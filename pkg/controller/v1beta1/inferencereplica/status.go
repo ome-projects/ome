@@ -59,6 +59,15 @@ const InferenceReplicaConditionRolloutStalled = "RolloutStalled"
 // overdue.
 const InferenceReplicaConditionDrainOverdue = "DrainOverdue"
 
+// InferenceReplicaConditionCurrentRevisionWithdrawn is present, True, while
+// status.currentRevision stands withdrawn; the rollup reads it to restore
+// the current revision once every Instance is back on that revision.
+const InferenceReplicaConditionCurrentRevisionWithdrawn = "CurrentRevisionWithdrawn"
+
+// ReasonInstanceOffRevision is the CurrentRevisionWithdrawn reason: an
+// Instance still runs, or is pinned to, another revision.
+const ReasonInstanceOffRevision = "InstanceOffRevision"
+
 const (
 	// ReasonInstancesFailing — RolloutStalled=True: >=1 Instance recorded a
 	// terminal failure while not yet on the target revision.
@@ -281,7 +290,9 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 		if target != nil {
 			fresh.Status.UpdatedReplicas = counters.UpdatedReplicas
 			fresh.Status.UpdatedReadyReplicas = counters.UpdatedReadyReplicas
+			withdrawn := withdrawnRevisionFor(&fresh.Status)
 			fresh.Status.UpdateRevision = target.Name
+			recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, fresh.Status.CurrentRevision)
 		}
 		irstatus.ClearPodDerivedObservations(fresh.Status.InstanceStatuses)
 
@@ -504,6 +515,32 @@ func hasFailedInstance(insts []v1beta1.OMENativeInstanceStatus) bool {
 	return false
 }
 
+// withdrawnRevisionFor names the revision the current revision was
+// withdrawn from while the status still records the withdrawal: the
+// recorded update revision, which the withdrawal left current equal to.
+func withdrawnRevisionFor(st *v1beta1.InferenceReplicaStatus) string {
+	if st.CurrentRevision != "" || !apimeta.IsStatusConditionTrue(st.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn) {
+		return ""
+	}
+	return st.UpdateRevision
+}
+
+// recordCurrentRevisionWithdrawal keeps the CurrentRevisionWithdrawn
+// condition in step with the revision pair a write is about to persist,
+// given the withdrawal on record and the current revision it replaces.
+func recordCurrentRevisionWithdrawal(st *v1beta1.InferenceReplicaStatus, before, oldCurrent string) {
+	if workloadstatus.WithdrawnRevisionAfter(before, oldCurrent, st.CurrentRevision, st.UpdateRevision) == "" {
+		apimeta.RemoveStatusCondition(&st.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn)
+		return
+	}
+	apimeta.SetStatusCondition(&st.Conditions, metav1.Condition{
+		Type:    InferenceReplicaConditionCurrentRevisionWithdrawn,
+		Status:  metav1.ConditionTrue,
+		Reason:  ReasonInstanceOffRevision,
+		Message: "current revision withdrawn while an Instance still runs, or is pinned to, another revision",
+	})
+}
+
 // computeReadyCondition derives the Ready condition for the IR from
 // already-rolled-up status counters + per-Instance phases. Caller passes
 // a pre-aggregated IR.Status snapshot (Replicas, ReadyReplicas,
@@ -680,8 +717,16 @@ func summarizeFailureReasons(reasons map[string]int) string {
 // fresh start and is the hold that stands; otherwise the persisted hold
 // stands as written until a pass that runs the Update pass replaces or
 // clears it.
+//
+// A converged subject is read the same way: a roll with nothing left to
+// do clears the hold with a nil verdict, which a pass that finds every
+// row settled and serving reports, while one whose promoted sets crash
+// after it completed stands behind the budget while a set is out of
+// rotation, or behind the ladder while its block counts the crash, and
+// its verdict says so. Only a subject with no update revision has
+// nothing to hold.
 func effectiveRolloutHold(holdObserved bool, hold *workloadtypes.RolloutHold, status *v1beta1.InferenceReplicaStatus, now time.Time) *v1beta1.RolloutHold {
-	if status.UpdateRevision == "" || status.CurrentRevision == status.UpdateRevision {
+	if status.UpdateRevision == "" {
 		return nil
 	}
 	if holdObserved {
@@ -801,13 +846,17 @@ func computeReadyCondition(status *v1beta1.InferenceReplicaStatus, desiredReplic
 	return cond
 }
 
-// irLabelSelectorString returns the "k=v,k=v" selector the HPA scale
-// subresource reads from IR.status.labelSelector: the name-prefix,
-// component and managed-by labels every pod of the replica carries.
+// irLabelSelectorString returns the selector the HPA scale subresource reads
+// from IR.status.labelSelector: the name-prefix, component and managed-by
+// labels, narrowed to the runners an Instance has exactly one of. The HPA
+// multiplies a Value or Utilization ratio by the Ready pods this selects and
+// writes the result as an Instance count, so it must select one pod per
+// Instance: the "default" pod of a single-pod Instance, the leader of a
+// multi-pod one.
 func irLabelSelectorString(namePrefix string, component v1beta1.ComponentType) string {
 	return labels.SelectorFromSet(labels.Set{
 		constants.InferenceServicePodLabelKey: namePrefix,
 		constants.OMEComponentLabel:           string(component),
 		query.LabelManagedBy:                  query.ManagedByOMENative,
-	}).String()
+	}).String() + "," + query.LabelRunner + " in (" + workloadtypes.RunnerDefault + "," + workloadtypes.RunnerLeader + ")"
 }

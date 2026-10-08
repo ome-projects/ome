@@ -68,10 +68,17 @@ type Scenario struct {
 type Initial struct {
 	Spec   SpecState   `json:"spec"`
 	Config ConfigState `json:"config,omitempty"`
-	Rows   []RowSpec   `json:"rows,omitempty"`
-	Pods   []PodSpec   `json:"pods,omitempty"`
+	// CurrentRevision is the revision the owner reports as fully rolled
+	// out when the run starts, as a revision name (see RowSpec). Empty
+	// reads as the revision the initial spec renders.
+	CurrentRevision string    `json:"currentRevision,omitempty"`
+	Rows            []RowSpec `json:"rows,omitempty"`
+	Pods            []PodSpec `json:"pods,omitempty"`
 	// RetryBlocks seeds the owner's per-revision retry authority.
 	RetryBlocks []RetryBlockSpec `json:"retryBlocks,omitempty"`
+	// Migrations seeds the owner's status.migrations records, which a
+	// seeded Migrate operation resumes from.
+	Migrations []MigrationSpec `json:"migrations,omitempty"`
 }
 
 // SpecState is the part of the owner spec a scenario edits. It is the
@@ -97,10 +104,19 @@ type SpecState struct {
 	// image it is not an in-place-eligible diff — which is what makes an
 	// InPlaceOnly rejection reachable.
 	Env map[string]string `json:"env,omitempty"`
+	// PodLabels and PodAnnotations are the pod template's own metadata.
+	// They are hashed into the revision except for the keys the hasher
+	// derives rather than reads as intent, which is what makes an
+	// annotation-only edit reachable.
+	PodLabels      map[string]string `json:"podLabels,omitempty"`
+	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 	// MaxUnavailable and MaxSurge are the rolling-update budgets, as an
 	// int-or-percent string ("1", "25%"). Empty leaves the engine default.
 	MaxUnavailable string `json:"maxUnavailable,omitempty"`
 	MaxSurge       string `json:"maxSurge,omitempty"`
+	// Partition is rollingUpdate.partition, the canary hold: Instances
+	// below it keep their revision. Unset leaves the engine default.
+	Partition *int32 `json:"partition,omitempty"`
 	// InstanceReadyTimeout bounds a newly created Instance becoming Ready
 	// and is what an operation deadline is derived from.
 	InstanceReadyTimeout string `json:"instanceReadyTimeout,omitempty"`
@@ -156,6 +172,10 @@ type ConfigState struct {
 	// per-Instance relocation budget the disposition spends. Unset
 	// leaves the engine unconfigured, which never records a directive.
 	AutoMigrateBudget int32 `json:"autoMigrateBudget,omitempty"`
+	// TeardownDeadline is lifecycle.teardown.deadline, how long a deleted
+	// owner may hold its finalizer with pods surviving before it is
+	// released to background GC. Unset holds strictly.
+	TeardownDeadline string `json:"teardownDeadline,omitempty"`
 }
 
 // MigrationAudit is the migration admission budget.
@@ -180,20 +200,69 @@ type ForceDelete struct {
 	NodeUnreachableThreshold string `json:"nodeUnreachableThreshold"`
 }
 
-// RowSpec seeds one persisted InstanceStatus. A seeded row carries no
-// in-flight operation: a scenario reaches an operation by driving the
-// engine into it, so the row it acts on is one the engine itself wrote
-// and cannot contradict an invariant the engine maintains.
+// RowSpec seeds one persisted InstanceStatus, with or without an
+// operation in flight. A revision field names a revision the way
+// spec.rollbackTarget does: "current" is the revision the initial spec
+// renders, and an image reference is the revision that image's template
+// mints. A row carrying an operation must resolve to a state of the
+// instance machine, which is checked when the run is built.
 type RowSpec struct {
-	Index       int32  `json:"index"`
-	Incarnation int64  `json:"incarnation,omitempty"`
-	Phase       string `json:"phase,omitempty"`
-	// RunningRevision names the revision the row's pods run, as the
-	// symbolic "current" (what the initial spec renders) or "previous"
-	// (what PreviousImage renders).
-	RunningRevision string `json:"runningRevision,omitempty"`
-	ActiveOrdinal   int32  `json:"activeOrdinal,omitempty"`
-	ReadySince      string `json:"readySince,omitempty"`
+	Index           int32          `json:"index"`
+	Incarnation     int64          `json:"incarnation,omitempty"`
+	Phase           string         `json:"phase,omitempty"`
+	RunningRevision string         `json:"runningRevision,omitempty"`
+	TargetRevision  string         `json:"targetRevision,omitempty"`
+	ActiveOrdinal   int32          `json:"activeOrdinal,omitempty"`
+	ReadySince      string         `json:"readySince,omitempty"`
+	Operation       *OperationSpec `json:"operation,omitempty"`
+}
+
+// OperationSpec seeds the operation a row carries when the run starts:
+// the durable record of a destructive action the engine resumes from,
+// as a controller restarted mid-operation would find it. Instants are
+// offsets from the scenario start; a deadline left empty is derived from
+// startedAt and the spec's instanceReadyTimeout, as the engine's own
+// stamps derive it.
+type OperationSpec struct {
+	Type string `json:"type"`
+	Step string `json:"step"`
+	// TargetRevision is the revision the operation converges toward; an
+	// Update operation defaults it to the row's targetRevision.
+	TargetRevision string `json:"targetRevision,omitempty"`
+	// Strategy is the update strategy pinned on the attempt. Left empty it
+	// seeds the shape of a surge row persisted without a pin.
+	Strategy string `json:"strategy,omitempty"`
+	// SurgeIndex is the paired index: a gang surge's replacement, or the
+	// other half of a migration pair.
+	SurgeIndex *int32 `json:"surgeIndex,omitempty"`
+	// RequestUUID keys a Migrate pin to its status.migrations record.
+	RequestUUID    string `json:"requestUUID,omitempty"`
+	Reason         string `json:"reason,omitempty"`
+	Waiting        string `json:"waiting,omitempty"`
+	RetryCount     int32  `json:"retryCount,omitempty"`
+	StartedAt      string `json:"startedAt,omitempty"`
+	LastProgressAt string `json:"lastProgressAt,omitempty"`
+	Deadline       string `json:"deadline,omitempty"`
+}
+
+// MigrationSpec seeds one status.migrations record. A record with a surge
+// index has been allocated and reads SurgePending unless the phase says
+// otherwise; one without is a queued request and reads Accepted. The
+// deadline is derived from startedAt and the spec's instanceReadyTimeout,
+// as the request's acceptance derives it.
+type MigrationSpec struct {
+	// UUID identifies the record; empty numbers it in list order.
+	UUID       string `json:"uuid,omitempty"`
+	Instance   int32  `json:"instance"`
+	SurgeIndex *int32 `json:"surgeIndex,omitempty"`
+	FromNode   string `json:"fromNode,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	Phase      string `json:"phase,omitempty"`
+	Message    string `json:"message,omitempty"`
+	StartedAt  string `json:"startedAt,omitempty"`
+	// AllocatedAt is when the surge index was taken; empty reads as
+	// startedAt for an allocated record.
+	AllocatedAt string `json:"allocatedAt,omitempty"`
 }
 
 // PodSpec seeds one pod the engine observes at the first tick.
@@ -217,6 +286,9 @@ type PodSpec struct {
 	// ReadyAt offsets the Ready condition's transition time from the
 	// scenario start, so a minReadySeconds window can be seeded open.
 	ReadyAt string `json:"readyAt,omitempty"`
+	// Terminating seeds the pod with a deletion already issued and held
+	// open by the driver, the way pod.terminating leaves it.
+	Terminating bool `json:"terminating,omitempty"`
 }
 
 // RetryBlockSpec seeds one per-revision retry block.
@@ -262,9 +334,19 @@ type EventArgs struct {
 	// template edit a spec.revision makes when the edit is not an image
 	// rewrite.
 	Env map[string]string `json:"env,omitempty"`
-	// Verb and Resource scope an injected apiserver rejection.
-	Verb     string `json:"verb,omitempty"`
-	Resource string `json:"resource,omitempty"`
+	// Labels and Annotations rewrite the pod template's metadata: the
+	// edit spec.annotationOnly makes, or, for an annotation the hasher
+	// reads as intent, the template edit a spec.revision makes.
+	Labels      map[string]string `json:"labels,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+	// Verb and Resource scope an injected apiserver rejection; RetryAfter
+	// is the delay a shedding apiserver suggests with it.
+	Verb       string `json:"verb,omitempty"`
+	Resource   string `json:"resource,omitempty"`
+	RetryAfter string `json:"retryAfter,omitempty"`
+	// Write is the ordinal, within the pass, of the owner status write an
+	// api.conflict answers.
+	Write int `json:"write,omitempty"`
 	// Slack pushes the clock past a deadline rather than exactly onto it.
 	// Required by the timer events: how far past a deadline an
 	// observation lands is a property of the scenario, not a default the
@@ -285,6 +367,10 @@ type EventArgs struct {
 	// Value is the new setting of the lifecycle knob a spec.policyTuning
 	// edit rewrites, spelled as the owner spec spells it.
 	Value string `json:"value,omitempty"`
+	// Config is the new value of the operator-configuration knob a
+	// config.changed edit rewrites: the knob's whole field group, so a
+	// group left empty clears the knob.
+	Config *ConfigState `json:"config,omitempty"`
 }
 
 // PodRef addresses one pod by the coordinates its stable name is built
@@ -356,38 +442,54 @@ func (e *TimelineEvent) UnmarshalJSON(data []byte) error {
 // eventArgKeys is the argument each event reads. An event absent from the
 // map takes no arguments.
 var eventArgKeys = map[string][]string{
-	ClockAdvance:              {"duration"},
-	"pod.scheduled":           {"pod", "message"},
-	"pod.containersReady":     {"pod"},
-	"pod.ready":               {"pod"},
-	"pod.servingOn":           {"pod"},
-	"pod.servingOff":          {"pod"},
-	"pod.terminating":         {"pod"},
-	"pod.stuckTerminating":    {"pod"},
-	"pod.deleted":             {"pod"},
-	"pod.phaseTerminal":       {"pod"},
-	"pod.waiting":             {"pod", "container", "message"},
-	"pod.unschedulable":       {"pod"},
-	"pod.containerRestart":    {"pod", "container", "message"},
-	"endpoint.rotationIn":     {"pod"},
-	"endpoint.rotationOut":    {"pod"},
-	"api.quotaDenied":         {"verb", "resource", "count"},
-	"api.invalid":             {"verb", "resource", "count"},
-	"spec.revision":           {"image", "env"},
-	"spec.strategy":           {"strategy"},
-	"spec.replicasUp":         {"to"},
-	"spec.replicasDown":       {"to"},
-	"spec.gangWidth":          {"to"},
-	"spec.rollbackTarget":     {"image"},
-	"spec.policyTuning":       {"value"},
-	"spec.migrateRequest":     {"instance", "fromNode", "uuid", "reason"},
-	"gang.podGroup":           {"instance"},
-	"timer.operationDeadline": {"slack"},
-	"timer.stuckPodGrace":     {"slack"},
-	"timer.retryAt":           {"slack"},
-	"timer.repairRetry":       {"slack"},
-	"timer.migrationDeadline": {"slack"},
-	"timer.forceDelete":       {"slack"},
+	ClockAdvance:               {"duration"},
+	"pod.scheduled":            {"pod", "message"},
+	"pod.containersReady":      {"pod"},
+	"pod.containersNotReady":   {"pod"},
+	"pod.ready":                {"pod"},
+	"pod.servingOn":            {"pod"},
+	"pod.servingOff":           {"pod"},
+	"pod.terminating":          {"pod"},
+	"pod.stuckTerminating":     {"pod"},
+	"pod.deleted":              {"pod"},
+	"pod.uidRotated":           {"pod"},
+	"pod.phaseTerminal":        {"pod"},
+	"pod.admissionRejected":    {"pod", "resource", "message"},
+	"pod.evicted":              {"pod", "message"},
+	"pod.nodeLost":             {"pod"},
+	"pod.waiting":              {"pod", "container", "message"},
+	"pod.unschedulable":        {"pod"},
+	"pod.schedulingGated":      {"pod"},
+	"pod.admitted":             {"pod"},
+	"pod.containerRestart":     {"pod", "container", "message"},
+	"endpoint.rotationIn":      {"pod"},
+	"endpoint.rotationOut":     {"pod"},
+	"api.quotaDenied":          {"verb", "resource", "count"},
+	"api.invalid":              {"verb", "resource", "count"},
+	"api.notFound":             {"verb", "resource", "count"},
+	"api.alreadyExists":        {"verb", "resource", "count"},
+	"api.throttled":            {"verb", "resource", "count", "retryAfter"},
+	"api.namespaceTerminating": {"verb", "resource", "count"},
+	"api.conflict":             {"verb", "resource", "count", "write"},
+	"spec.revision":            {"image", "env", "annotations"},
+	"spec.annotationOnly":      {"labels", "annotations"},
+	"spec.strategy":            {"strategy"},
+	"spec.replicasUp":          {"to"},
+	"spec.replicasDown":        {"to"},
+	"spec.gangWidth":           {"to"},
+	"spec.partition":           {"to"},
+	"spec.rollbackTarget":      {"image"},
+	"spec.policyTuning":        {"value"},
+	"spec.migrateRequest":      {"instance", "fromNode", "uuid", "reason"},
+	"config.changed":           {"config"},
+	"gang.podGroup":            {"instance"},
+	"timer.operationDeadline":  {"slack"},
+	"timer.stuckPodGrace":      {"slack"},
+	"timer.retryAt":            {"slack"},
+	"timer.repairRetry":        {"slack"},
+	"timer.migrationDeadline":  {"slack"},
+	"timer.forceDelete":        {"slack"},
+	"timer.teardownDeadline":   {"slack"},
 }
 
 // Key renders the event the way a timeline and a trace both spell it.

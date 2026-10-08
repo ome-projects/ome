@@ -86,6 +86,17 @@ func TestReadNominalCapacity(t *testing.T) {
 			f.root.Status.Budgets = []v1beta1.AcceleratorBudgetStatus{{Nominal: resource.MustParse("1"), Admitted: resource.MustParse("100"), Reserved: resource.MustParse("200")}}
 		}},
 		{name: "decimal quantity storage", wantWeight: 12, wantDemand: 8, wantAllocatable: 96, mutate: func(f *fixture) { row(f).Allocatable.ToDec(); pool(f).Quantity.ToDec() }},
+		{name: "ratio unit counts primary replicas", wantWeight: 57, wantDemand: 5, wantAllocatable: 288, mutate: func(f *fixture) {
+			d := f.demands["member-a"]
+			d.PrimaryUnits = 3
+			d.Pools[0].Quantity = resource.MustParse("5")
+			f.demands["member-a"] = d
+		}},
+		{name: "single primary unit keeps raw evidence", wantWeight: 12, wantDemand: 8, wantAllocatable: 96, mutate: func(f *fixture) {
+			d := f.demands["member-a"]
+			d.PrimaryUnits = 1
+			f.demands["member-a"] = d
+		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			f := inputs()

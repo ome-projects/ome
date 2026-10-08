@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/rolloutpolicy"
+	"sigs.k8s.io/ome/pkg/validation"
 )
 
 // targetPair is one grouped Component's observed revision state, read from its
@@ -29,6 +30,13 @@ type targetPair struct {
 	target   string
 	replicas int32
 	updated  int32
+}
+
+// straggling reports Instances still off the target revision. Paired with an
+// agreeing revision pair it marks a Component that owes a roll, as opposed to
+// one that has arrived.
+func (t targetPair) straggling() bool {
+	return t.replicas > 0 && t.updated < t.replicas
 }
 
 // observeGroupTargets reads the IR revision pair for every Component named in
@@ -258,7 +266,7 @@ func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.Componen
 			if groupKind(g) == v1beta1.RolloutProgressionCanary && t.target != "" && t.target == rejected[comp] {
 				continue
 			}
-			if t.replicas > 0 && t.updated < t.replicas {
+			if t.straggling() {
 				return true
 			}
 			if t.target == "" || t.target == t.current {
@@ -277,38 +285,42 @@ func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.Componen
 // convergence). A revert still draining counts: the rejected target opens
 // no run of its own, and the plan gate admits the roll back to stable only
 // under a pinned run. A settled rolled-back hold is terminal, not
-// in-progress. The done sentinel is exact against an inline canary body, or
-// against the composed body in composed (index-aligned with the spec groups)
-// for a ref-sourced canary. Without either, any non-terminal state counts, so
-// a caller must compose before acting on a true for a ref-sourced group: a
-// run opened around an already-done canary closes Completed on the next pass
-// and the following pass would open it again.
-func canaryMidFlight(isvc *v1beta1.InferenceService, composed []v1beta1.RolloutRunGroup) bool {
+// in-progress. The done sentinel is read against the effective body; a
+// group whose reference does not resolve has none, so any non-terminal
+// state counts and the open then parks on the reference.
+func canaryMidFlight(isvc *v1beta1.InferenceService, policies rollout.Policies) bool {
 	if isvc == nil || isvc.Spec.Rollout == nil {
 		return false
 	}
-	cs := rollout.CanaryStatusFor(&isvc.Status, primaryCanaryComponent(isvc))
+	primary := primaryCanaryComponent(isvc)
+	if primary == "" {
+		return false
+	}
+	cs := rollout.CanaryStatusFor(&isvc.Status, primary)
 	if cs == nil {
 		return false
 	}
-	for gi := range isvc.Spec.Rollout.Groups {
-		g := &isvc.Spec.Rollout.Groups[gi]
-		if groupKind(g) != v1beta1.RolloutProgressionCanary {
-			continue
+	g := rollout.CanaryGroupFor(isvc, policies, primary)
+	if cs.RolledBackRevisionHash != "" {
+		if g == nil {
+			g = declaredCanaryGroup(isvc)
 		}
-		if cs.RolledBackRevisionHash != "" {
-			return revertInFlight(isvc, g)
-		}
-		body := g.Canary
-		if body == nil && gi < len(composed) {
-			body = composed[gi].Group.Canary
-		}
-		if body != nil {
-			return int(cs.CurrentStep) < len(body.Steps)
-		}
-		return true
+		return revertInFlight(isvc, g)
 	}
-	return false
+	if g != nil {
+		return int(cs.CurrentStep) < len(g.Canary.Steps)
+	}
+	return true
+}
+
+// declaredCanaryGroup is the first spec group declaring canary, by any form.
+func declaredCanaryGroup(isvc *v1beta1.InferenceService) *v1beta1.RolloutGroup {
+	for gi := range isvc.Spec.Rollout.Groups {
+		if g := &isvc.Spec.Rollout.Groups[gi]; groupKind(g) == v1beta1.RolloutProgressionCanary {
+			return g
+		}
+	}
+	return nil
 }
 
 // revertInFlight reports whether a canary group's unit is still rolling
@@ -326,6 +338,24 @@ func revertInFlight(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) boo
 		steps = len(g.Canary.Steps)
 	}
 	return rollout.StateOf(cs, isvc.Status.Components[primary].RolloutPhase, steps) == rollout.CanaryStateRollingBack
+}
+
+// unitLadderInFlight reports whether a canary group's own ladder is one a
+// run adopts: its primary carries a canary record short of the ladder's end,
+// or a revert still draining. A group whose unit is idle, or finished, has
+// nothing in flight whatever another group's ladder is doing.
+func unitLadderInFlight(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) bool {
+	if g == nil || g.Canary == nil {
+		return false
+	}
+	cs := rollout.CanaryStatusFor(&isvc.Status, primaryOfGroup(g))
+	if cs == nil {
+		return false
+	}
+	if cs.RolledBackRevisionHash != "" {
+		return revertInFlight(isvc, g)
+	}
+	return int(cs.CurrentStep) < len(g.Canary.Steps)
 }
 
 // derivedProvenance parses the derive-time plan-source annotation
@@ -363,22 +393,59 @@ func derivedProvenance(isvc *v1beta1.InferenceService) map[int]v1beta1.RolloutRu
 
 // liveSourceDigest computes the portable digest of what a run opened NOW
 // would pin for one spec group: the inline body's digest when an inline arm
-// is set, else the referenced policy's (fetched through c — the caller
-// chooses cached vs live). Returns "" with no error when the source is
-// unresolvable (dangling ref) — the caller reports that separately.
-func liveSourceDigest(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) (string, error) {
-	if g.Canary != nil || g.BlueGreen != nil || g.RollingUpdate != nil || g.PolicyRef == nil {
+// is set, else the referenced policy's. Returns "" with no error when the
+// source is unresolvable (dangling ref) — the caller reports that separately.
+func liveSourceDigest(g *v1beta1.RolloutGroup, policies rollout.Policies) (string, error) {
+	if rolloutpolicy.GroupSource(g) == v1beta1.RolloutPlanSourceInline {
 		return rolloutpolicy.ProgressionDigest(g)
 	}
-	policy := &v1beta1.RolloutPolicy{}
-	key := types.NamespacedName{Namespace: isvc.Namespace, Name: g.PolicyRef.Name}
-	if err := c.Get(ctx, key, policy); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
-		}
-		return "", err
+	policy := policies.ByName[g.PolicyRef.Name]
+	if policy == nil {
+		return "", nil
 	}
 	return rolloutpolicy.PortableDigest(&policy.Spec)
+}
+
+// observePolicies reads through reads every RolloutPolicy the spec's groups
+// reference, shadowed references included so the resolution view can report
+// what they would pin: the cached client once per pass for the set the
+// executors' effective view resolves through, the live reader on the pass
+// that pins a plan. The cached set is enough for the view because a body
+// executes only through a pin: a stale body between runs is reported by
+// drift and corrected at open, which composes from the live reading, and
+// while a run is open the view reads the pin. A missing policy is absent
+// from the set; a policy whose body fails validation is kept with the
+// reason, so the opener parks on it as it parks on a missing one. Nothing
+// is read while the policy surface is not installed.
+func observePolicies(ctx context.Context, in Inputs, reads client.Reader) (rollout.Policies, error) {
+	isvc := in.ISVC
+	out := rollout.Policies{Namespace: isvc.Namespace, Enabled: in.FeatureEnabled}
+	if !in.FeatureEnabled || isvc.Spec.Rollout == nil {
+		return out, nil
+	}
+	out.ByName = map[string]*v1beta1.RolloutPolicy{}
+	out.Invalid = map[string]error{}
+	seen := map[string]bool{}
+	for gi := range isvc.Spec.Rollout.Groups {
+		ref := isvc.Spec.Rollout.Groups[gi].PolicyRef
+		if ref == nil || seen[ref.Name] {
+			continue
+		}
+		seen[ref.Name] = true
+		policy := &v1beta1.RolloutPolicy{}
+		err := reads.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: ref.Name}, policy)
+		switch {
+		case err == nil:
+			out.ByName[ref.Name] = policy
+			if verr := validation.ValidateRolloutPolicySpec(&policy.Spec); verr != nil {
+				out.Invalid[ref.Name] = verr
+			}
+		case apierrors.IsNotFound(err):
+		default:
+			return rollout.Policies{}, err
+		}
+	}
+	return out, nil
 }
 
 // combinedPlanDigest folds the per-group digests into the one value the

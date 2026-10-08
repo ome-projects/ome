@@ -58,8 +58,8 @@ type PlacementSpec struct {
 	// +kubebuilder:validation:MaxItems=64
 	ClusterAffinity []ClusterAffinityTerm `json:"clusterAffinity,omitempty"`
 
-	// MaxSurge is the whole-replica allowance shared by placement transitions
-	// and local rollout surge. Omission blocks disruptive movement between homes.
+	// Deprecated: MaxSurge is ignored. A placement move may hold one extra full
+	// copy of the desired allocation; admission warns when this is set.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxSurge *int32 `json:"maxSurge,omitempty"`

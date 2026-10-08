@@ -1,6 +1,7 @@
 package replay
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -8,10 +9,13 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	types "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // TestMapDiffRecordsValues pins the property the in-place lock rests on:
@@ -152,5 +156,128 @@ func TestInstanceIndexOfRejectsAMissingLabel(t *testing.T) {
 	idx, err := instanceIndexOf(good)
 	if err != nil || idx != 7 {
 		t.Fatalf("got %d, %v", idx, err)
+	}
+}
+
+// TestNotFoundRejectionRemovesThePod pins that a not-found answer is never
+// a lie about the cluster: the engine's write is refused and the pod it
+// addressed is gone when the next read looks for it.
+func TestNotFoundRejectionRemovesThePod(t *testing.T) {
+	const ready = `
+scenario: ready-pod
+arrows: [T-empty-create]
+initial:
+  spec: {replicas: 1, image: registry.example.com/runtime:v1}
+  rows: [{index: 0, phase: Ready, runningRevision: current, readySince: 0s}]
+  pods: [{index: 0, ready: true, serving: true, routed: true}]
+timeline:
+  - tick: 1
+`
+	ctx := context.Background()
+	d := mustDriver(t, ready)
+	if _, err := applyRejection(notFound, "delete")(ctx, d, TimelineEvent{ID: "api.notFound"}); err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	name := d.podName(PodRef{Index: 0})
+	pod, err := d.getPod(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = d.cli.Delete(ctx, pod)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("the engine's delete must be answered not found, got %v", err)
+	}
+	if _, err := d.getPod(ctx, name); !apierrors.IsNotFound(err) {
+		t.Fatalf("the pod must be gone behind the answer, got %v", err)
+	}
+	if !strings.Contains(d.trace.String(), "pod delete-rejected name="+name+" rejection=api.notFound") {
+		t.Fatalf("the refusal is traced:\n%s", d.trace.String())
+	}
+}
+
+// TestAlreadyExistsRejectionLandsThePod pins that an already-exists answer
+// is true of the cluster: the engine's create is refused and the pod it
+// rendered is there, held like every pod, when the next read looks.
+func TestAlreadyExistsRejectionLandsThePod(t *testing.T) {
+	ctx := context.Background()
+	d := mustDriver(t, minimalScenario)
+	if _, err := applyRejection(alreadyExists, "create")(ctx, d, TimelineEvent{ID: "api.alreadyExists"}); err != nil {
+		t.Fatalf("arm: %v", err)
+	}
+	rev, err := d.ensureRevision(ctx, d.spec.Image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod, err := d.renderPod(PodSpec{Index: 0}, rev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.cli.Create(ctx, pod); !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("the engine's create must be answered already exists, got %v", err)
+	}
+	landed, err := d.getPod(ctx, pod.Name)
+	if err != nil {
+		t.Fatalf("the pod must be there behind the answer: %v", err)
+	}
+	if landed.UID == "" || !contains(landed.Finalizers, podLifecycleFinalizer) {
+		t.Fatalf("the landed pod is admitted like every pod: uid=%q finalizers=%v", landed.UID, landed.Finalizers)
+	}
+	if !strings.Contains(d.trace.String(), "pod create-rejected name="+pod.Name+" rejection=api.alreadyExists") {
+		t.Fatalf("the refusal is traced:\n%s", d.trace.String())
+	}
+}
+
+// TestThrottledRejectionCarriesTheRetryAfter pins the shed answer against
+// the engine's classifier: both spellings read as throttled, the
+// Retry-After the scenario names reaches the classifier, and one without
+// a delay suggests none.
+func TestThrottledRejectionCarriesTheRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		variant, retryAfter string
+		want                time.Duration
+	}{
+		{"TooManyRequests", "30s", 30 * time.Second},
+		{"ServiceUnavailable", "2m", 2 * time.Minute},
+		{"TooManyRequests", "", 0},
+	} {
+		d := mustDriver(t, minimalScenario)
+		detail, err := applyThrottled(ctx, d, TimelineEvent{ID: "api.throttled", Variant: tc.variant, Args: EventArgs{RetryAfter: tc.retryAfter}})
+		if err != nil {
+			t.Fatalf("%s: arm: %v", tc.variant, err)
+		}
+		if (tc.want > 0) != strings.Contains(detail, "retryAfter=") {
+			t.Fatalf("%s: detail %q", tc.variant, detail)
+		}
+		rev, err := d.ensureRevision(ctx, d.spec.Image)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pod, err := d.renderPod(PodSpec{Index: 0}, rev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = d.cli.Create(ctx, pod)
+		rejection := evidence.ClassifyAPIError(err)
+		if rejection.Class != types.APIRejectionThrottled || rejection.RetryAfter != tc.want {
+			t.Fatalf("%s: the engine must read the shed create as throttled with the suggested delay: class=%v retryAfter=%s err=%v", tc.variant, rejection.Class, rejection.RetryAfter, err)
+		}
+		if _, err := d.getPod(ctx, pod.Name); !apierrors.IsNotFound(err) {
+			t.Fatalf("%s: a shed create lands nothing: %v", tc.variant, err)
+		}
+	}
+	if _, err := applyThrottled(ctx, mustDriver(t, minimalScenario), TimelineEvent{ID: "api.throttled"}); err == nil {
+		t.Fatal("the shed answer names its spelling")
+	}
+}
+
+// TestNamespaceTerminatingRejectionIsWhatTheClassifierReads pins the
+// refusal against the engine's classifier: a Forbidden carrying the
+// NamespaceTerminating cause reads as a permanent environment rejection
+// with that reason.
+func TestNamespaceTerminatingRejectionIsWhatTheClassifierReads(t *testing.T) {
+	rejection := evidence.ClassifyAPIError(namespaceTerminating("pods", "svc-a"))
+	if rejection.Class != types.APIRejectionPermanentEnvironment || rejection.Reason != types.RejectionReasonNamespaceTerminating {
+		t.Fatalf("got class=%v reason=%q", rejection.Class, rejection.Reason)
 	}
 }

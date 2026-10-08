@@ -1,7 +1,6 @@
 package placement
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -10,7 +9,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/placement/allocation"
@@ -89,13 +87,7 @@ func TestAllZeroFloorRetention(t *testing.T) {
 		{name: "restart retains idle homes", restart: true},
 		{name: "autoscaler requests are not orphaned allocations", replicas: 3},
 		{name: "unknown inventory retains accepted authority", wantReason: "AwaitingMemberConvergence", edit: func(_ *testing.T, f *backendFixture) {
-			worker := interceptor.NewClient(f.workers["member-a"], interceptor.Funcs{List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-				if _, ok := list.(*corev1.PodList); ok {
-					return fmt.Errorf("inventory unavailable")
-				}
-				return cl.List(ctx, list, opts...)
-			}})
-			f.connections.m["member-a"] = workloadcluster.NewNeverCachingClient(worker)
+			f.connections.m["member-a"] = unreadablePodInventory(f, "member-a")
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -160,7 +152,6 @@ func TestAllZeroFloorMovement(t *testing.T) {
 			source := f.reconcile(t)
 			accepted := source.Status.Placement.Plan.DeepCopy()
 			selectHome(source, "member-b")
-			source.Spec.Placement.MaxSurge = ptr.To[int32](3)
 			source.Generation++
 			if err := f.reconciler.Update(t.Context(), source); err != nil {
 				t.Fatal(err)
@@ -291,5 +282,71 @@ func TestAllZeroFloorUnreadableObservationKeepsAppliedPlan(t *testing.T) {
 		if diff := cmp.Diff(v1beta1.PlacementPhasePlaced, got.Status.Placement.Phase); diff != "" {
 			t.Fatalf("pass %d phase (-want +got):\n%s", pass, diff)
 		}
+	}
+}
+
+// TestAllZeroFloorUnreadableHomesKeepPlaced converges idle zero-floor homes,
+// then makes one pass unable to verify any of them. The pass keeps the Placed
+// phase and every acknowledged plan behind unknown observations, holds
+// convergence on the reason, and the next readable pass reconverges.
+func TestAllZeroFloorUnreadableHomesKeepPlaced(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		unread func(*backendFixture, string) workloadcluster.SelectivelyCachingClient
+	}{
+		{name: "unreadable pod inventory", unread: unreadablePodInventory},
+		{name: "unreadable component inventory", unread: unreadableAllMember},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := allZeroFixture(t, false)
+			f.reconcile(t)
+			for name := range f.workers {
+				seedSingleAdmission(t, f, name, declaredComponents(f.source)...)
+				acknowledgeSingleFloor(t, f, name, 0)
+			}
+			stored := f.reconcile(t)
+			if diff := cmp.Diff(v1beta1.PlacementPhasePlaced, stored.Status.Placement.Phase); diff != "" {
+				t.Fatalf("idle homes did not settle as Placed (-want +got):\n%s", diff)
+			}
+			readable := map[string]workloadcluster.SelectivelyCachingClient{}
+			for name := range f.workers {
+				if candidate := candidateOf(t, stored, name); !candidate.ObservationKnown || candidate.AppliedPlanID != stored.Status.Placement.Plan.ID {
+					t.Fatalf("%s has not acknowledged the accepted plan: %+v", name, candidate)
+				}
+				readable[name] = f.connections.m[name]
+				f.connections.m[name] = tt.unread(f, name)
+			}
+			unknown := f.reconcile(t)
+			for name, connection := range readable {
+				f.connections.m[name] = connection
+			}
+
+			if diff := cmp.Diff(stored.Status.Placement.Plan, unknown.Status.Placement.Plan); diff != "" {
+				t.Fatalf("unreadable pass changed the idle plan (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(v1beta1.PlacementPhasePlaced, unknown.Status.Placement.Phase); diff != "" {
+				t.Fatalf("unreadable pass demoted the idle homes (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff("AwaitingMemberConvergence", unknown.Status.GetCondition(v1beta1.PlacementConverged).Reason); diff != "" {
+				t.Fatalf("unreadable pass decided on kept acknowledgements (-want +got):\n%s", diff)
+			}
+			for name := range f.workers {
+				candidate := candidateOf(t, unknown, name)
+				if candidate.ObservationKnown || candidate.AppliedPlanID != unknown.Status.Placement.Plan.ID || candidate.ReadyReplicas != 0 {
+					t.Fatalf("unreadable pass reported %s as %+v", name, candidate)
+				}
+				if candidate.Allocation.CurrentHome == nil || candidate.Allocation.DesiredHome == nil || candidate.Allocation.DrainRequested {
+					t.Fatalf("unreadable pass changed the retained zero floor of %s: %+v", name, candidate.Allocation)
+				}
+			}
+
+			recovered := f.reconcile(t)
+			if diff := cmp.Diff(v1beta1.PlacementPhasePlaced, recovered.Status.Placement.Phase); diff != "" {
+				t.Fatalf("readable pass did not keep the idle homes Placed (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff("AllocationConverged", recovered.Status.GetCondition(v1beta1.PlacementConverged).Reason); diff != "" {
+				t.Fatalf("readable pass did not reconverge (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

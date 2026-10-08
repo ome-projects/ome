@@ -207,7 +207,7 @@ func componentExt(isvc *v1beta1.InferenceService, comp v1beta1.ComponentType) *v
 // replica's.
 func (s *passSim) project(working *v1beta1.InferenceService, comp v1beta1.ComponentType) {
 	s.t.Helper()
-	want := StepPartition(working, comp, componentExt(working, comp))
+	want := StepPartition(working, rollout.Policies{}, comp, componentExt(working, comp))
 	if want == nil {
 		return
 	}
@@ -265,7 +265,7 @@ func (s *passSim) pass(name string, stale bool) {
 		s.t.Fatalf("%s: run layer: %v", name, err)
 	}
 	if out.Opened {
-		for _, g := range rollout.CanaryGroups(working) {
+		for _, g := range rollout.CanaryGroups(working, rollout.Policies{}) {
 			if err := BindRun(ctx, s.c, working, g, out.Adopted); err != nil {
 				s.t.Fatalf("%s: bind run: %v", name, err)
 			}
@@ -282,7 +282,7 @@ func (s *passSim) pass(name string, stale bool) {
 	}
 	res, err := Dispatch(ctx, DispatchDeps{
 		Client: s.c, Reader: s.c, ISVC: working, Now: s.now, Requeue: reconcileRequeue,
-		ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(working),
+		ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(working, rollout.Policies{}),
 	})
 	if err != nil {
 		s.t.Fatalf("%s: dispatch: %v", name, err)

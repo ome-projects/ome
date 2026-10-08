@@ -616,11 +616,12 @@ type LifecycleConfig struct {
 	// preserves this field's unbounded compatibility behavior.
 	ScaleUpPodBatchSize *int32 `json:"scaleUpPodBatchSize,omitempty"`
 	// ScaleDownPodBatchSize bounds active delete selection in Pod-equivalent
-	// units: its live and Terminating Pods, with a cost-1 floor for Podless
-	// status work. An Instance (including a leader/worker gang) remains
+	// units: an absolute count or a percentage of current live and Terminating
+	// Pods, with a cost-1 floor for Podless status work. Percentages round up.
+	// An Instance (including a leader/worker gang) remains
 	// indivisible. The first eligible Instance may exceed a positive budget and
 	// proceeds alone. Nil preserves this field's unbounded compatibility behavior.
-	ScaleDownPodBatchSize *int32 `json:"scaleDownPodBatchSize,omitempty"`
+	ScaleDownPodBatchSize *intstr.IntOrString `json:"scaleDownPodBatchSize,omitempty"`
 	// ScaleDownRequeueInterval is the periodic wake-up cadence while destructive
 	// work remains in flight. The controller also watches Pods, EndpointSlices,
 	// PodGroups, and its owner. Absence disables only cadence polling; configured
@@ -659,7 +660,7 @@ type LifecycleConfig struct {
 // +kubebuilder:object:generate=false
 type PodBatchSizes struct {
 	ScaleUp                  *int32
-	ScaleDown                *int32
+	ScaleDown                *intstr.IntOrString
 	ScaleDownRequeueInterval time.Duration
 	Repair                   *int32
 }
@@ -1036,14 +1037,17 @@ func (c *LifecycleConfig) ToScaleUpPodBatchSize() (*int32, error) {
 }
 
 // ToScaleDownPodBatchSize validates the configured delete Pod-equivalent batch
-// size. A nil LifecycleConfig or absent field preserves unbounded candidate
-// selection. Explicit zero or negative values are invalid so manager startup
-// can reject bad configuration.
-func (c *LifecycleConfig) ToScaleDownPodBatchSize() (*int32, error) {
-	if c == nil {
+// policy. A nil field preserves unbounded selection; invalid absolute or
+// percentage values prevent manager startup.
+func (c *LifecycleConfig) ToScaleDownPodBatchSize() (*intstr.IntOrString, error) {
+	if c == nil || c.ScaleDownPodBatchSize == nil {
 		return nil, nil
 	}
-	return positiveInt32Field("scaleDownPodBatchSize", c.ScaleDownPodBatchSize)
+	if _, err := workloadtypes.ResolveScaleDownPodBatchSize(c.ScaleDownPodBatchSize, 0); err != nil {
+		return nil, fmt.Errorf("invalid lifecycle.%w", err)
+	}
+	value := *c.ScaleDownPodBatchSize
+	return &value, nil
 }
 
 // ToRepairBatchSize validates the configured per-pass crash-loop repair batch

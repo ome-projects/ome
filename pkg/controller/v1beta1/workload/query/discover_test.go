@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -268,6 +270,100 @@ func promotePod(name string, containersReady bool, readyAt time.Time) *corev1.Po
 // ContainersReady alone is below it, PodReady past the minReadySeconds
 // window clears it, and a set still inside the window reports the
 // remainder so the caller wakes on it instead of polling.
+//
+// conditionedPod builds a pod in phase carrying the given conditions True,
+// with its one container running.
+func conditionedPod(name string, phase corev1.PodPhase, conds ...corev1.PodConditionType) *corev1.Pod {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"}}
+	pod.Status.Phase = phase
+	for _, c := range conds {
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{Type: c, Status: corev1.ConditionTrue})
+	}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "main", Ready: true, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+	return pod
+}
+
+// admittedPod is ContainersReady with the serving gate written: the bar
+// PodSetFullyServing reads, before the kubelet has folded Ready.
+func admittedPod(name string, phase corev1.PodPhase) *corev1.Pod {
+	return conditionedPod(name, phase, corev1.ContainersReady, ServingConditionType)
+}
+
+// rotationPod is admittedPod with Ready folded: in its Service's endpoints.
+func rotationPod(name string, phase corev1.PodPhase) *corev1.Pod {
+	return conditionedPod(name, phase, corev1.ContainersReady, ServingConditionType, corev1.PodReady)
+}
+
+// deletingPod marks the pod as draining with its conditions cleared.
+func deletingPod(pod *corev1.Pod) *corev1.Pod {
+	now := metav1.Now()
+	pod.DeletionTimestamp = &now
+	pod.Finalizers = []string{"example.com/termination"}
+	pod.Status.Conditions = nil
+	return pod
+}
+
+// TestPodSetFullyServing_TerminalPodDisqualifies: the admitted-set reading
+// never treats a terminal pod as health, whatever stale conditions it
+// carries and whether or not a serving sibling would cover the count; a
+// deleting pod is excluded rather than disqualifying.
+func TestPodSetFullyServing_TerminalPodDisqualifies(t *testing.T) {
+	serving := admittedPod("serving", corev1.PodRunning)
+	cases := []struct {
+		name    string
+		pods    []*corev1.Pod
+		desired int32
+		want    bool
+	}{
+		{"healthy set", []*corev1.Pod{serving}, 1, true},
+		{"failed pod with stale healthy conditions", []*corev1.Pod{admittedPod("dead", corev1.PodFailed)}, 1, false},
+		{"succeeded pod with stale healthy conditions", []*corev1.Pod{admittedPod("done", corev1.PodSucceeded)}, 1, false},
+		{"serving sibling does not cover a failed member", []*corev1.Pod{serving, admittedPod("dead", corev1.PodFailed)}, 1, false},
+		{"deleting pod is still excluded, not disqualifying", []*corev1.Pod{serving, deletingPod(admittedPod("draining", corev1.PodRunning))}, 1, true},
+		{"nothing expected proves nothing", []*corev1.Pod{serving}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PodSetFullyServing(tc.pods, tc.desired); got != tc.want {
+				t.Fatalf("PodSetFullyServing = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPodSetReadyAndServing_RequiresReadyAndTheGate: the rotation reading
+// counts a pod only when PodReady and the serving gate agree. A pod whose
+// gate is written but whose Ready never followed is in no Service's
+// endpoints, so it neither counts nor is covered by a sibling that is;
+// terminal and deleting pods read as they do for the admitted set.
+func TestPodSetReadyAndServing_RequiresReadyAndTheGate(t *testing.T) {
+	inRotation := rotationPod("ready", corev1.PodRunning)
+	gateOnly := admittedPod("gate-written", corev1.PodRunning)
+	readyNoGate := conditionedPod("ready-no-gate", corev1.PodRunning, corev1.ContainersReady, corev1.PodReady)
+	cases := []struct {
+		name    string
+		pods    []*corev1.Pod
+		desired int32
+		want    bool
+	}{
+		{"ready and serving", []*corev1.Pod{inRotation}, 1, true},
+		{"gate written but Ready never followed", []*corev1.Pod{gateOnly}, 1, false},
+		{"Ready without the gate", []*corev1.Pod{readyNoGate}, 1, false},
+		{"serving sibling does not cover a member whose Ready never followed", []*corev1.Pod{inRotation, gateOnly}, 2, false},
+		{"a member short of rotation disqualifies even above the count", []*corev1.Pod{inRotation, gateOnly}, 1, false},
+		{"deleting pod is excluded, not disqualifying", []*corev1.Pod{inRotation, deletingPod(rotationPod("draining", corev1.PodRunning))}, 1, true},
+		{"terminal pod with stale conditions disqualifies", []*corev1.Pod{inRotation, rotationPod("dead", corev1.PodFailed)}, 1, false},
+		{"nothing expected proves nothing", []*corev1.Pod{inRotation}, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PodSetReadyAndServing(tc.pods, tc.desired); got != tc.want {
+				t.Fatalf("PodSetReadyAndServing = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPodSetPromotable(t *testing.T) {
 	cases := []struct {
 		name            string
@@ -441,6 +537,105 @@ func TestAllPodsRuntimeReady_TerminalPodNeverReady(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := AllPodsRuntimeReady(tc.pods); got != tc.want {
 				t.Fatalf("AllPodsRuntimeReady = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A pod with a deletion timestamp is gone for every promote and hand-over
+// decision whatever its readiness says: the kubelet keeps a terminating
+// container answering its probe through the grace period while the pod is
+// already out of its Service. Both shared readings leave such a pod out of
+// the set they judge, so a set short because of it waits, and no later
+// instant is known to promote it.
+func TestPromoteBars_DeletingPodIsGone(t *testing.T) {
+	deleting := func(name string) *corev1.Pod {
+		pod := promotePod(name, true, promoteNow.Add(-time.Minute))
+		at := metav1.NewTime(promoteNow)
+		pod.DeletionTimestamp = &at
+		return pod
+	}
+	cases := []struct {
+		name string
+		pods []*corev1.Pod
+	}{
+		{"the only pod is being deleted", []*corev1.Pod{deleting("a")}},
+		{"one member of the set is being deleted", []*corev1.Pod{
+			promotePod("live", true, promoteNow.Add(-time.Minute)),
+			deleting("b"),
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if AllPodsRuntimeReady(tc.pods) {
+				t.Errorf("AllPodsRuntimeReady = true; a pod being deleted must not count as runtime-ready")
+			}
+			for _, window := range []int32{0, 20} {
+				promotable, wait := PodSetPromotable(tc.pods, window, promoteNow)
+				if promotable || wait != 0 {
+					t.Errorf("PodSetPromotable(window=%ds) = (%t, %s), want (false, 0)", window, promotable, wait)
+				}
+			}
+		})
+	}
+}
+
+// The fully-serving reading skips a pod that is on its way out: one with a
+// deletion timestamp, and one the surge drain itself holds out of rotation
+// ahead of deleting it. Neither disqualifies a set whose replacement
+// serves, neither covers a desired slot, and a hold by any other writer
+// is not the surge's drain.
+func TestPodSetFullyServing_SkipsAPodTheSurgeDrained(t *testing.T) {
+	gated := func(name string, status corev1.ConditionStatus, writers ...podreadiness.Message) *corev1.Pod {
+		message := ""
+		if len(writers) > 0 {
+			raw, err := json.Marshal(writers)
+			if err != nil {
+				t.Fatal(err)
+			}
+			message = string(raw)
+		}
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+					{Type: podreadiness.ConditionType, Status: status, Message: message},
+				},
+			},
+		}
+	}
+	surgeDrain := podreadiness.Message{UserAgent: podreadiness.WriterUpdateSurgeDrain, Key: "update-surge-drain-0-1"}
+	deleteDrain := podreadiness.Message{UserAgent: podreadiness.WriterDeleteDrain, Key: "0"}
+	serving := func(name string) *corev1.Pod { return gated(name, corev1.ConditionTrue) }
+	deleting := func(pod *corev1.Pod) *corev1.Pod {
+		ts := metav1.NewTime(time.Now())
+		pod.DeletionTimestamp = &ts
+		pod.Finalizers = []string{"ome.io/test"}
+		return pod
+	}
+	terminal := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Status.Phase = corev1.PodFailed
+		return pod
+	}
+
+	for _, tc := range []struct {
+		name string
+		pods []*corev1.Pod
+		want bool
+	}{
+		{name: "surge-drained source beside a serving replacement", pods: []*corev1.Pod{gated("source", corev1.ConditionFalse, surgeDrain), serving("replacement")}, want: true},
+		{name: "deleting source beside a serving replacement", pods: []*corev1.Pod{deleting(serving("source")), serving("replacement")}, want: true},
+		{name: "surge-drained source alone covers nothing", pods: []*corev1.Pod{gated("source", corev1.ConditionFalse, surgeDrain)}, want: false},
+		{name: "surge-drained source beside a terminal replacement", pods: []*corev1.Pod{gated("source", corev1.ConditionFalse, surgeDrain), terminal(serving("replacement"))}, want: false},
+		{name: "surge-drained source beside a replacement not yet in rotation", pods: []*corev1.Pod{gated("source", corev1.ConditionFalse, surgeDrain), gated("replacement", corev1.ConditionFalse)}, want: false},
+		{name: "source another writer holds beside a serving replacement", pods: []*corev1.Pod{gated("source", corev1.ConditionFalse, deleteDrain), serving("replacement")}, want: false},
+		{name: "source held by the surge drain and another writer", pods: []*corev1.Pod{gated("source", corev1.ConditionFalse, deleteDrain, surgeDrain), serving("replacement")}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PodSetFullyServing(tc.pods, 1); got != tc.want {
+				t.Fatalf("PodSetFullyServing = %v, want %v", got, tc.want)
 			}
 		})
 	}

@@ -47,7 +47,7 @@ func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			setPlannedReplicas(member, 2, tt.ceiling)
+			setPlannedReplicas(member, map[v1beta1.ComponentType]plannedBound{v1beta1.EngineComponent: {Floor: 2, Ceiling: tt.ceiling}})
 			worker := f.workers["member-a"]
 			if err := worker.Create(t.Context(), member); err != nil {
 				t.Fatal(err)

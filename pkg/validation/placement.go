@@ -25,9 +25,6 @@ func ValidatePlacement(spec *v1beta1.InferenceServiceSpec) error {
 	if _, err := affinity.Compile(p.ClusterAffinity, p.Mode == v1beta1.PlacementModeSplit); err != nil {
 		return fmt.Errorf("spec.placement.%w", err)
 	}
-	if p.MaxSurge != nil && *p.MaxSurge < 0 {
-		return fmt.Errorf("spec.placement.maxSurge must be nonnegative whole replicas")
-	}
 	if p.ReplacementTimeout != nil && (p.Mode != v1beta1.PlacementModeSingle || p.ReplacementTimeout.Duration <= 0) {
 		return fmt.Errorf("spec.placement.replacementTimeout must be positive and is permitted only for Single")
 	}

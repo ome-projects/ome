@@ -32,6 +32,7 @@ func TestOwner_EveryMachineStateHasExactlyOneOwner(t *testing.T) {
 		{StateUpdateGangSurgeTargetCleanup, rowFor(InstancePhaseCreating, InstanceOperationUpdate, UpdateStepGangSurgeTargetCleanup), OwnerUpdate},
 		{StateUpdateInPlace, rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepInPlace), OwnerUpdate},
 		{StateUpdateDrain, rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepDrain), OwnerUpdate},
+		{StateUpdateParked, rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepParked), OwnerNone},
 		{StateRestartDrain, rowFor(InstancePhaseRestarting, InstanceOperationRestart, "Drain"), OwnerRestart},
 		{StateMigrateCreateSurge, rowFor(InstancePhaseMigrating, InstanceOperationMigrate, "CreateSurge"), OwnerMigrate},
 		{StateMigrateSurgeTarget, rowFor(InstancePhaseCreating, InstanceOperationMigrate, "CreateSurge"), OwnerMigrate},
@@ -329,5 +330,98 @@ func TestRecreateOfDarkRow_OnlyANonSurgeFreshStartServingNothing(t *testing.T) {
 	}
 	if RecreateOfDarkRow(nil, UpdateStrategyRecreatePod) {
 		t.Error("no row, no start")
+	}
+}
+
+// An Update attempt parked after its disposition is no continuation: it
+// is a spent attempt the roll re-opens as a fresh start, in whichever
+// phase its pods give it.
+func TestUpdateContinuation_ParkedAttemptIsNotAContinuation(t *testing.T) {
+	for _, gate := range []RolloutHoldGate{RolloutHoldGateRetryBlock, RolloutHoldGateHeld, RolloutHoldGateBudget} {
+		parked := &InstanceOperation{Type: InstanceOperationUpdate, Step: UpdateStepParked, Waiting: string(gate)}
+		for _, phase := range []InstancePhase{InstancePhaseUpdating, InstancePhaseFailed} {
+			if UpdateContinuation(&InstanceStatus{Phase: phase, Operation: parked}) {
+				t.Errorf("%s parked on %s: a parked attempt is not a continuation", phase, gate)
+			}
+		}
+	}
+	external := &InstanceOperation{Type: InstanceOperationUpdate, Step: UpdateStepDrain, Waiting: WaitingReasonUnschedulable}
+	if !UpdateContinuation(&InstanceStatus{Phase: InstancePhaseUpdating, Operation: external}) {
+		t.Errorf("an attempt held by an external authority is still in flight")
+	}
+}
+
+// A parked attempt is a settled row of the ownership table: the parked step is its
+// own state while the set serves and the Failed state while it is down,
+// nobody owns it, it claims no verb, and it is never in flight.
+func TestParkedAttempt_IsSettledAndClaimsNothing(t *testing.T) {
+	parked := &InstanceOperation{ID: "update-0-1", Type: InstanceOperationUpdate, Step: UpdateStepParked, TargetRevision: "rev-b", Waiting: string(RolloutHoldGateRetryBlock)}
+	serving := &InstanceStatus{Index: 0, Phase: InstancePhaseUpdating, Operation: parked}
+	down := &InstanceStatus{Index: 1, Phase: InstancePhaseFailed, Operation: parked}
+	if got := StateOf(serving); got != StateUpdateParked {
+		t.Errorf("StateOf(serving parked row) = %q, want %q", got, StateUpdateParked)
+	}
+	if got := StateOf(down); got != StateFailed {
+		t.Errorf("StateOf(down parked row) = %q, want %q", got, StateFailed)
+	}
+	for _, row := range []*InstanceStatus{serving, down} {
+		if got := Owner(row); got != OwnerNone {
+			t.Errorf("Owner(%s parked row) = %q, want nobody", row.Phase, got)
+		}
+		if got := ClaimOf(row); got != OwnerNone {
+			t.Errorf("ClaimOf(%s parked row) = %q, want no claim", row.Phase, got)
+		}
+		if InFlight(row) {
+			t.Errorf("a %s parked row is not in flight", row.Phase)
+		}
+		if UpdateContinuation(row) {
+			t.Errorf("a %s parked row is not a continuation", row.Phase)
+		}
+	}
+	if got := OwnerOfOperation(parked); got != OwnerNone {
+		t.Errorf("OwnerOfOperation(parked) = %q, want nobody", got)
+	}
+	owned := RowsByOwner([]InstanceStatus{*serving, *down})
+	if !owned.Owns(OwnerNone, 0) || !owned.Owns(OwnerNone, 1) || owned.AnyInFlight(OwnerNone, allRows) || owned.Any(OwnerUpdate) {
+		t.Errorf("parked rows must be grouped under nobody and never in flight")
+	}
+	for _, event := range OwnershipEvents() {
+		if StateInterruptible(StateUpdateParked, event) {
+			t.Errorf("%s: no clock and no hold acts on a parked attempt", event)
+		}
+	}
+}
+
+// A row keeps an attempt the gang verdict ended when it is Failed with
+// its operation kept and the recorded failure is the PodGroup ownership
+// conflict; a gang surge's rows are the surge machine's and are not read.
+func TestEndedByOwnershipVerdict_FailedRowKeepingTheEndedAttempt(t *testing.T) {
+	verdict := &InstanceTermination{Reason: PodGroupOwnershipConflictReason}
+	deadline := &InstanceTermination{Reason: "DeadlineExceeded"}
+	one := int32(1)
+	create := &InstanceOperation{Type: InstanceOperationCreate, Step: "CreatePods", TargetRevision: "rev-a"}
+	drain := &InstanceOperation{Type: InstanceOperationUpdate, Step: UpdateStepDrain, TargetRevision: "rev-b"}
+	surgeSource := &InstanceOperation{Type: InstanceOperationUpdate, Step: UpdateStepSurge, SurgeIndex: &one}
+	marker := &InstanceOperation{Type: InstanceOperationUpdate, Step: UpdateStepGangSurgeTarget}
+	restart := &InstanceOperation{Type: InstanceOperationRestart, Step: "Drain"}
+	cases := []struct {
+		name string
+		row  *InstanceStatus
+		want bool
+	}{
+		{"nil row", nil, false},
+		{"create ended by the verdict", &InstanceStatus{Phase: InstancePhaseFailed, Operation: create, LastFailure: verdict}, true},
+		{"recreate ended by the verdict", &InstanceStatus{Phase: InstancePhaseFailed, Operation: drain, LastFailure: verdict}, true},
+		{"create ended by its deadline", &InstanceStatus{Phase: InstancePhaseFailed, Operation: create, LastFailure: deadline}, false},
+		{"verdict recorded, operation cleared", &InstanceStatus{Phase: InstancePhaseFailed, LastFailure: verdict}, false},
+		{"verdict recorded, attempt in flight", &InstanceStatus{Phase: InstancePhaseCreating, Operation: create, LastFailure: verdict}, false},
+		{"gang surge source", &InstanceStatus{Phase: InstancePhaseFailed, Operation: surgeSource, LastFailure: verdict}, false},
+		{"gang surge marker", &InstanceStatus{Phase: InstancePhaseFailed, Operation: marker, LastFailure: verdict}, false},
+		{"repair ended by the verdict", &InstanceStatus{Phase: InstancePhaseFailed, Operation: restart, LastFailure: verdict}, false},
+	}
+	for _, tc := range cases {
+		if got := EndedByOwnershipVerdict(tc.row); got != tc.want {
+			t.Errorf("%s: EndedByOwnershipVerdict = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

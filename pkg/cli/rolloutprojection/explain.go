@@ -281,7 +281,7 @@ func (b *explainProjector) projectEffectiveGroups() {
 		return
 	}
 	effectiveSpec := b.isvc.Spec
-	effectiveSpec.Rollout = omerollout.Effective(b.isvc)
+	effectiveSpec.Rollout = omerollout.Effective(b.isvc, omerollout.Policies{})
 	if !validEffectiveRolloutSpec(b.isvc, &effectiveSpec) {
 		b.addIssue(
 			reportv1alpha1.RolloutExplainIssueActiveRunMalformed,
@@ -1037,7 +1037,7 @@ func (b *explainProjector) projectHolds() {
 			Kind: reportv1alpha1.RolloutHoldPlanParked, Evidence: reportv1alpha1.EvidenceReported,
 		})
 	}
-	if effective := omerollout.Effective(b.isvc); effective != nil {
+	if effective := omerollout.Effective(b.isvc, omerollout.Policies{}); effective != nil {
 		for index, group := range effective.Groups {
 			if index >= maxExplainGroups {
 				break

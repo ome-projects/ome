@@ -253,6 +253,13 @@ func (r *Reconciler) wireCoordinationGates(ctx context.Context, input *workloadt
 			allowed, gate, reason := coordination.EvaluateUpdateGate(ctx, r.liveReader(), parent, ir.Spec.Component, target, r.Recorder, coordDefaults, strategy, inFlightSurge, inFlightUnavail)
 			return allowed, workloadtypes.RolloutHoldGate(gate), reason
 		}
+		// The pin alone, for the starts the workload admits without the
+		// capacity consult: an Instance that serves nothing still rolls on
+		// the plan.
+		input.PlanGate = func() (bool, workloadtypes.RolloutHoldGate, string) {
+			allowed, gate, reason := coordination.EvaluatePlanGate(parent, ir.Spec.Component)
+			return allowed, workloadtypes.RolloutHoldGate(gate), reason
+		}
 		// The drain-time half of the pair floor: a surge update asks it with
 		// the replacement already serving, over live pod state.
 		input.DrainGate = func(sourcePods []string) (bool, workloadtypes.RolloutHoldGate, string) {
@@ -1041,9 +1048,12 @@ func mirrorInstanceStatuses(ir *v1beta1.InferenceReplica, statuses []v1beta1.OME
 //     does not promote — the Staged Ready reason derives downstream from
 //     the CurrentRevision != UpdateRevision skew; a revision whose ladder
 //     still records a failure has not landed, whatever the rows read
-//     between crashes), and withdrawn while it names targetName but an
+//     between crashes), withdrawn while it names targetName but an
 //     Instance still runs another revision, the shape a rollback onto the
-//     last promoted revision leaves behind;
+//     last promoted revision leaves behind, and restored to targetName
+//     once every Instance is back on the revision it was withdrawn from,
+//     which the CurrentRevisionWithdrawn condition records beside the
+//     empty current and this write raises or clears with it;
 //   - an unchanged value short-circuits with no write (a converged steady
 //     state performs ZERO writes);
 //   - retry.RetryOnConflict mirrors buildMutateInstance.
@@ -1078,11 +1088,14 @@ func buildPromoteCurrentRevision(writer statusWriter, reads client.Reader, ir *v
 				return workloadtypes.ErrStatusMutationPrecondition
 			}
 			insts := v1beta1convert.InstanceStatusSliceToWorkload(fresh.Status.InstanceStatuses)
-			want := workloadstatus.CurrentRevisionFor(insts, fresh.Status.CurrentRevision, targetName, retryBlocksFromIR(fresh))
-			if want == fresh.Status.CurrentRevision {
+			withdrawn := withdrawnRevisionFor(&fresh.Status)
+			recorded := fresh.Status.CurrentRevision
+			want := workloadstatus.CurrentRevisionFor(insts, recorded, targetName, retryBlocksFromIR(fresh), withdrawn)
+			if want == recorded {
 				return nil
 			}
 			fresh.Status.CurrentRevision = want
+			recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, recorded)
 			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
 				if apierrors.IsNotFound(err) {
 					return workloadtypes.ErrStatusOwnerGone
@@ -1105,8 +1118,12 @@ func buildPromoteCurrentRevision(writer statusWriter, reads client.Reader, ir *v
 // buildRecordUpdateRevision writes status.updateRevision ahead of the pass
 // that first renders a revision: re-read under retry.RetryOnConflict,
 // refuse a generation the pass did not plan against, write, and mirror the
-// committed name onto the caller's in-memory IR. The publication at the end
+// committed names onto the caller's in-memory IR. The publication at the end
 // of the pass restates the same name beside the counters.
+//
+// The pair is written as one pair: the same write sets status.currentRevision
+// from status.CurrentRevisionFor over the fresh rows, so no stored status reads
+// current equal to update while an Instance runs, or is pinned to, another revision.
 func buildRecordUpdateRevision(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, targetName string) error {
 	key := client.ObjectKeyFromObject(ir)
 	ownerUID := ir.UID
@@ -1115,7 +1132,10 @@ func buildRecordUpdateRevision(writer statusWriter, reads client.Reader, ir *v1b
 		if targetName == "" {
 			return nil
 		}
+		var committedCurrent string
+		wrote := false
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			committedCurrent, wrote = "", false
 			fresh := &v1beta1.InferenceReplica{}
 			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
 			if err != nil {
@@ -1133,13 +1153,20 @@ func buildRecordUpdateRevision(writer statusWriter, reads client.Reader, ir *v1b
 			if fresh.Status.UpdateRevision == targetName {
 				return nil
 			}
+			insts := v1beta1convert.InstanceStatusSliceToWorkload(fresh.Status.InstanceStatuses)
+			withdrawn := withdrawnRevisionFor(&fresh.Status)
+			recorded := fresh.Status.CurrentRevision
+			current := workloadstatus.CurrentRevisionFor(insts, recorded, targetName, retryBlocksFromIR(fresh), withdrawn)
 			fresh.Status.UpdateRevision = targetName
+			fresh.Status.CurrentRevision = current
+			recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, recorded)
 			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
 				if apierrors.IsNotFound(err) {
 					return workloadtypes.ErrStatusOwnerGone
 				}
 				return fmt.Errorf("update IR status: %w", err)
 			}
+			committedCurrent, wrote = current, true
 			return nil
 		})
 		if err != nil {
@@ -1147,6 +1174,9 @@ func buildRecordUpdateRevision(writer statusWriter, reads client.Reader, ir *v1b
 		}
 		if ir != nil {
 			ir.Status.UpdateRevision = targetName
+			if wrote {
+				ir.Status.CurrentRevision = committedCurrent
+			}
 		}
 		return nil
 	}

@@ -533,7 +533,7 @@ func TestDispatch_ResumeUnpinsTheIRRollbackTarget(t *testing.T) {
 	if _, err := Dispatch(ctx, DispatchDeps{
 		Client: c, Reader: c, ISVC: isvc,
 		ComponentRunnerPorts: canaryRunnerPorts(),
-		Group:                rollout.CanaryGroup(isvc),
+		Group:                rollout.CanaryGroup(isvc, rollout.Policies{}),
 	}); err != nil {
 		t.Fatalf("Dispatch resume: %v", err)
 	}

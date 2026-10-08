@@ -191,11 +191,12 @@ func runRow(ctx context.Context, in PassInput, row Row, out *Result) error {
 
 // skips reports whether the row is one this authority never touches: a
 // deferred scale-down victim receives no mutation before admission, and
-// a Failed row has no attempt left for a fact to hold. The pause reaches
-// both — it releases its own token wherever it left one.
+// a row nobody owns — Failed, or an attempt parked after its disposition
+// — has no attempt left for a fact to hold. The pause reaches all of
+// them — it releases its own token wherever it left one.
 func (r Row) skips(a authority) bool {
 	if a.everyRow {
 		return false
 	}
-	return r.Excluded || r.Status.Phase == types.InstancePhaseFailed
+	return r.Excluded || types.Owner(&r.Status) == types.OwnerNone
 }

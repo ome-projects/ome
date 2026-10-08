@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -1121,5 +1122,60 @@ func TestSweepStuckTerminatingPods_OneUnreadableNodeDoesNotShieldTheRest(t *test
 	}
 	if len(deletes) != 1 || deletes[0].name != "wedged" {
 		t.Fatalf("deletes: got %+v want wedged alone", deletes)
+	}
+}
+
+// The audit ledger is written after the force-delete lands, so an
+// apiserver refusal of the ledger ConfigMap create - the name taken by a
+// concurrent writer, a quota, a terminating namespace - costs the audit
+// row and nothing else: the pod is gone and its Warning fired, the
+// refusal returns as the escalation's error, and the next evaluation
+// finds no pod to act on, so the row is never recorded and nothing is
+// deleted twice.
+func TestForceDelete_LedgerCreateRefused_PodGoneAndRowLost(t *testing.T) {
+	ledger := corev1.Resource("configmaps")
+	terminating := apierrors.NewForbidden(ledger, "audit", errors.New("unable to create new content in namespace because it is being terminated"))
+	terminating.ErrStatus.Details.Causes = append(terminating.ErrStatus.Details.Causes, metav1.StatusCause{
+		Type: corev1.NamespaceTerminatingCause, Message: "namespace is being terminated", Field: "metadata.namespace",
+	})
+	for name, refusal := range map[string]error{
+		"already exists":        apierrors.NewAlreadyExists(ledger, "audit"),
+		"quota denied":          apierrors.NewForbidden(ledger, "audit", errors.New("exceeded quota: object-counts, requested: configmaps=1, used: configmaps=10, limited: configmaps=10")),
+		"namespace terminating": terminating,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var deletes []recordedDeleteOpts
+			funcs := fdDeleteRecorder(&deletes)
+			funcs.Create = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*corev1.ConfigMap); ok {
+					return refusal
+				}
+				return cl.Create(ctx, obj, opts...)
+			}
+			pod := fdTerminatingPod("wedge-0", "gone-node", overdueTS)
+			c := fdFakeClient(t, &funcs, fdStoredCopy(pod))
+			isvc := fdISVC("llama")
+			rec := record.NewFakeRecorder(16)
+			deps := workload.Deps{Client: c, Recorder: rec}
+			input := fdInput(isvc, fdPolicy())
+
+			if err := escalateStuckTerminating(context.Background(), deps, input, pod, 3); err == nil {
+				t.Fatalf("escalate: nil error, want the refused ledger write returned")
+			}
+			if len(deletes) != 1 || deletes[0].grace == nil || *deletes[0].grace != 0 || deletes[0].uid == nil {
+				t.Fatalf("deletes = %+v, want one grace-zero UID-preconditioned delete ahead of the ledger write", deletes)
+			}
+			// A later evaluation of the same observation meets NotFound on
+			// the name, which the escalation reads as success.
+			if err := escalateStuckTerminating(context.Background(), deps, input, pod, 3); err != nil {
+				t.Fatalf("second evaluation: %v, want nothing to act on once the pod is gone", err)
+			}
+			if n := fdCountEvents(fdDrainEvents(rec), workload.EventReasonPodForceDeleted); n != 1 {
+				t.Errorf("PodForceDeleted events: got %d want 1", n)
+			}
+			if entries := fdLedgerEntries(t, c, isvc); len(entries) != 0 {
+				t.Errorf("ledger entries = %+v, want none: the refused row is not written again", entries)
+			}
+		})
 	}
 }

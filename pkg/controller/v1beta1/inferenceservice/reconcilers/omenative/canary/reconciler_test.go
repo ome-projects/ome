@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 func i32(v int32) *int32 { return &v }
@@ -177,7 +178,7 @@ func TestReconcile_InitialConvergenceUsesReadyInstanceCount(t *testing.T) {
 
 func TestReconcile_CanaryingPaused(t *testing.T) {
 	isvc := canaryISVC(twoStep(), nil)
-	Reconcile(context.Background(), baseInputs(isvc, map[string]int32{"new": 2}))
+	Reconcile(context.Background(), baseInputs(isvc, map[string]int32{"new": 2, "old": 2}))
 	if phaseOf(isvc) != v1beta1.RolloutPhasePaused {
 		t.Fatalf("expected Paused at a manual paused step, got %q", phaseOf(isvc))
 	}
@@ -1842,7 +1843,7 @@ func TestReconcile_PinnedPlanInertToSpecEdits(t *testing.T) {
 	if canaryPercent != 50 {
 		t.Fatalf("traffic must follow the pinned step (50), got %d", canaryPercent)
 	}
-	if p, ok := EffectivePartition(isvc, v1beta1.EngineComponent, 4); !ok || p == nil || *p != 2 {
+	if p, ok := EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4); !ok || p == nil || *p != 2 {
 		t.Fatalf("EffectivePartition must read the pinned plan, got %v ok=%v", p, ok)
 	}
 }

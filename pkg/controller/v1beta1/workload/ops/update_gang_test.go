@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +16,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -144,7 +147,7 @@ func TestAbandonFailedGangSurge_DeletesStalePodsFirst(t *testing.T) {
 	blockCalls := recordRetryBlockCalls(&input, nil)
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 2, src.RunningRevision, "gang-a-engine-badrev", "pod stuck", workload.CauseWorkload)
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 2, src.RunningRevision, "gang-a-engine-badrev", "pod stuck", workload.CauseWorkload, gangSurgeEnd{})
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -219,7 +222,7 @@ func TestAbandonFailedGangSurge_ResetsSourceAfterPodsGone(t *testing.T) {
 	blockCalls := recordRetryBlockCalls(&input, nil)
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx, src.RunningRevision, src.TargetRevision, "pod stuck", workload.CauseWorkload)
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx, src.RunningRevision, src.TargetRevision, "pod stuck", workload.CauseWorkload, gangSurgeEnd{})
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -255,6 +258,108 @@ func TestAbandonFailedGangSurge_ResetsSourceAfterPodsGone(t *testing.T) {
 	}
 }
 
+// A superseded gang surge whose source never ran a revision ends in the
+// fresh-start Failed shape: the operation and target cleared, LastFailure
+// kept, no running revision. Ready would record capacity nothing serves,
+// since the source's own pods were never promoted. Both abandon tails
+// write the same shape.
+func TestAbandonFailedGangSurge_NeverPromotedSourceEndsFailed(t *testing.T) {
+	const isvcName, namespace = "gang-never-promoted", "test-ns"
+	const targetRevision = "gang-never-promoted-engine-newrev"
+	surgeIndex := int32(2)
+	failure := &workload.InstanceTermination{Reason: workload.PodGroupOwnershipConflictReason, Message: "PodGroup held by another owner"}
+	wantFreshStart := func(t *testing.T, got workload.InstanceStatus) {
+		t.Helper()
+		if got.Phase != workload.InstancePhaseFailed || got.Operation != nil || got.RunningRevision != "" || got.TargetRevision != "" {
+			t.Errorf("source = %+v, want Failed with no operation, target or running revision", got)
+		}
+		if got.LastFailure == nil || got.LastFailure.Reason != failure.Reason {
+			t.Errorf("LastFailure = %+v, want the recorded failure kept", got.LastFailure)
+		}
+	}
+
+	t.Run("standalone writer", func(t *testing.T) {
+		legacyResetExpectations(t)
+		c := legacyNewFakeClient(t) // the replacement's members are already gone
+		src := &workload.InstanceStatus{
+			Index: 0, Phase: workload.InstancePhaseUpdating, TargetRevision: targetRevision,
+			Operation: &workload.InstanceOperation{
+				Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepSurge,
+				TargetRevision: targetRevision, SurgeIndex: &surgeIndex,
+			},
+			LastFailure: failure,
+		}
+		var removed []int32
+		input := gangAbandonInput(isvcName, namespace, src, &removed)
+		blockCalls := recordRetryBlockCalls(&input, nil)
+		plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+		if _, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIndex,
+			src.RunningRevision, "", "", workload.CauseUnattributed, gangSurgeEnd{}); err != nil {
+			t.Fatalf("abandonFailedGangSurge: %v", err)
+		}
+		if len(removed) != 1 || removed[0] != surgeIndex {
+			t.Errorf("RemoveInstance calls: got %v want [%d]", removed, surgeIndex)
+		}
+		wantFreshStart(t, *src)
+		if len(*blockCalls) != 0 {
+			t.Errorf("MutateRetryBlock calls: got %d want none (no revision to prune, no failure to record)", len(*blockCalls))
+		}
+	})
+
+	t.Run("atomic tail", func(t *testing.T) {
+		legacyResetExpectations(t)
+		source := workload.InstanceStatus{
+			Index: 0, Incarnation: 1, Phase: workload.InstancePhaseUpdating, TargetRevision: targetRevision,
+			Operation: &workload.InstanceOperation{
+				ID: "gang-update-0", Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepSurge,
+				TargetRevision: targetRevision, SurgeIndex: &surgeIndex,
+			},
+			LastFailure: failure,
+		}
+		marker := workload.InstanceStatus{
+			Index: surgeIndex, Incarnation: 1, Phase: workload.InstancePhaseCreating, TargetRevision: targetRevision,
+			Operation: &workload.InstanceOperation{
+				ID: "gang-update-target-2", Type: workload.InstanceOperationUpdate,
+				Step: workload.UpdateStepGangSurgeTargetCleanup, TargetRevision: targetRevision,
+			},
+		}
+		store := &terminalMutationStore{
+			ownerUID: "owner-a",
+			statuses: map[int32]workload.InstanceStatus{
+				source.Index: cloneTerminalStatus(source),
+				marker.Index: cloneTerminalStatus(marker),
+			},
+		}
+		input := workload.ReconcileInput{
+			OwnerObject: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{UID: "owner-a"}},
+			Key: workload.Key{
+				Namespace: namespace,
+				OwnerName: isvcName,
+				Component: workload.ComponentEngine,
+				SelectorLabels: map[string]string{
+					constants.InferenceServicePodLabelKey: isvcName,
+					constants.OMEComponentLabel:           string(workload.ComponentEngine),
+					query.LabelManagedBy:                  query.ManagedByOMENative,
+				},
+			},
+			ObservedState: workload.WorkloadObservedState{
+				InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
+			},
+			ApplyInstanceMutationsWithRetryBlock: store.apply,
+			FinalizeInstanceResources:            func(context.Context, int32) (bool, error) { return true, nil },
+		}
+		plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+		if _, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(legacyNewFakeClient(t)), input, plan,
+			source.Index, surgeIndex, source.RunningRevision, "", "", workload.CauseUnattributed, gangSurgeEnd{}); err != nil {
+			t.Fatalf("abandonFailedGangSurge: %v", err)
+		}
+		if _, found := store.statuses[surgeIndex]; found {
+			t.Error("the cleanup marker must be removed with the reset")
+		}
+		wantFreshStart(t, store.statuses[source.Index])
+	})
+}
+
 // TestAbandonFailedGangSurge_RecordsRetryBlockWithPolicy drives the reset
 // pass with a configured RetryPolicy and asserts the recorded block is a
 // counted Backoff wave: AttemptsStarted=1, NextRetryAt = now + initial
@@ -288,7 +393,7 @@ func TestAbandonFailedGangSurge_RecordsRetryBlockWithPolicy(t *testing.T) {
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
 	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx,
-		src.RunningRevision, src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned"), instanceFailureCause(src))
+		src.RunningRevision, src.Operation.TargetRevision, instanceFailureReason(src, "gang surge abandoned"), instanceFailureCause(src), gangSurgeEnd{})
 	if err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
@@ -362,7 +467,7 @@ func gangAbandonWaveUnderPolicy(t *testing.T, t0 time.Time, failure *workload.In
 
 	if _, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, surgeIdx,
 		src.RunningRevision, src.Operation.TargetRevision,
-		instanceFailureReason(src, "gang surge abandoned"), instanceFailureCause(src)); err != nil {
+		instanceFailureReason(src, "gang surge abandoned"), instanceFailureCause(src), gangSurgeEnd{}); err != nil {
 		t.Fatalf("abandonFailedGangSurge: %v", err)
 	}
 	if src.Operation != nil || src.Phase != workload.InstancePhaseReady {
@@ -646,7 +751,7 @@ func TestAbandonFailedGangSurge_EventReasons(t *testing.T) {
 		plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 
 		if _, err := abandonFailedGangSurge(context.Background(), deps, input, plan, 0, surgeIdx,
-			src.RunningRevision, failedTargetRev, "pod stuck", workload.CauseWorkload); err != nil {
+			src.RunningRevision, failedTargetRev, "pod stuck", workload.CauseWorkload, gangSurgeEnd{}); err != nil {
 			t.Fatalf("abandonFailedGangSurge: %v", err)
 		}
 		events := drainRecorderEvents(rec)
@@ -1774,7 +1879,7 @@ func TestAbandonFailedGangSurge_PersistsCleanupMarkerAcrossRemovalFailure(t *tes
 
 	done, err := abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(c), input, plan, source.Index, surgeIndex,
-		source.RunningRevision, targetRevision, "pod stuck", workload.CauseWorkload,
+		source.RunningRevision, targetRevision, "pod stuck", workload.CauseWorkload, gangSurgeEnd{},
 	)
 	if !errors.Is(err, statusFailure) || done {
 		t.Fatalf("first pass: done=%v err=%v", done, err)
@@ -1802,7 +1907,7 @@ func TestAbandonFailedGangSurge_PersistsCleanupMarkerAcrossRemovalFailure(t *tes
 	}
 	done, err = abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(c), input, plan, source.Index, surgeIndex,
-		source.RunningRevision, targetRevision, "pod stuck", workload.CauseWorkload,
+		source.RunningRevision, targetRevision, "pod stuck", workload.CauseWorkload, gangSurgeEnd{},
 	)
 	if err != nil || done {
 		t.Fatalf("retry pass: done=%v err=%v", done, err)
@@ -1828,7 +1933,8 @@ func TestAbandonFailedGangSurge_PersistsCleanupMarkerAcrossRemovalFailure(t *tes
 // source keeps its surge step, and so the budget, until the members are
 // gone: a member that never carried the serving gate goes on the
 // configured abandoned-replacement grace, one that has carried it keeps
-// the pod's own grace.
+// the pod's own grace, and one still in rotation leaves it a pass ahead
+// of its deletion.
 func TestAbandonFailedGangSurge_AbandonGraceBoundsUnservedMembers(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, _ := surgeISVCReady("llama-70b", "prod", 1)
@@ -1853,9 +1959,24 @@ func TestAbandonFailedGangSurge_AbandonGraceBoundsUnservedMembers(t *testing.T) 
 	input := gangInputWithRemove(isvc, c)
 	input.AbandonedReplacementGrace = 7 * time.Second
 
-	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 1, v1Name, v2Name, "", workload.CauseUnattributed)
+	done, err := abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 1, v1Name, v2Name, "", workload.CauseUnattributed, gangSurgeEnd{})
 	if err != nil || done {
 		t.Fatalf("abandon pass: done=%v err=%v", done, err)
+	}
+	// The serving leader leaves rotation first; nothing is deleted yet.
+	if len(deletes) != 0 {
+		t.Fatalf("deletes = %+v, want none while the serving leader leaves rotation", deletes)
+	}
+	fresh := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(leader), fresh); err != nil {
+		t.Fatalf("re-read leader: %v", err)
+	}
+	if podreadiness.IsServing(fresh) {
+		t.Fatalf("the leader must leave rotation before it is deleted")
+	}
+	done, err = abandonFailedGangSurge(context.Background(), legacyTestDeps(c), input, plan, 0, 1, v1Name, v2Name, "", workload.CauseUnattributed, gangSurgeEnd{})
+	if err != nil || done {
+		t.Fatalf("delete pass: done=%v err=%v", done, err)
 	}
 	if len(deletes) != 2 {
 		t.Fatalf("deletes = %+v, want both replacement members", deletes)
@@ -1963,7 +2084,7 @@ func TestAbandonFailedGangSurge_AtomicallyRemovesMarkerAndResetsSource(t *testin
 	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
 	done, err := abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(legacyNewFakeClient(t)), input, plan,
-		source.Index, surgeIndex, runningRevision, "", "", workload.CauseUnattributed,
+		source.Index, surgeIndex, runningRevision, "", "", workload.CauseUnattributed, gangSurgeEnd{},
 	)
 	if err != nil || done {
 		t.Fatalf("abandon: done=%v err=%v", done, err)
@@ -2230,7 +2351,7 @@ func atomicAbandonWave(t *testing.T, store *terminalMutationStore, t0 time.Time,
 
 	done, err := abandonFailedGangSurge(
 		context.Background(), legacyTestDeps(legacyNewFakeClient(t)), input, plan, source.Index, surgeIndex,
-		runningRevision, targetRevision, instanceFailureReason(&source, "gang surge abandoned"), instanceFailureCause(&source),
+		runningRevision, targetRevision, instanceFailureReason(&source, "gang surge abandoned"), instanceFailureCause(&source), gangSurgeEnd{},
 	)
 	if err != nil || done {
 		t.Fatalf("abandon: done=%v err=%v", done, err)
@@ -3122,5 +3243,477 @@ func TestGangSurge_PromotionRebindsPendingMovesToTheReplacement(t *testing.T) {
 	}
 	if rebound != 1 {
 		t.Errorf("one event names the rebound move; got %d in %v", rebound, events)
+	}
+}
+
+// TestGangSurgeDrain_SkipsSourceMembersAlreadyOutOfRotation: the source
+// gang's drain flip reads the members it listed, and a member can be out
+// of rotation before the flip writes: already terminating, or gone between
+// the list and the write. Such a member is left alone instead of failing
+// the pass, and the members still in rotation are taken out of it.
+func TestGangSurgeDrain_SkipsSourceMembersAlreadyOutOfRotation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// leave takes the source leader out of rotation by other means and
+		// returns the pod as the pass lists it.
+		leave func(t *testing.T, c client.Client, leader *corev1.Pod) *corev1.Pod
+		// gone is true when the leader is not in the API.
+		gone bool
+	}{
+		{
+			name: "a member already terminating is left to its exit",
+			leave: func(t *testing.T, c client.Client, leader *corev1.Pod) *corev1.Pod {
+				t.Helper()
+				return terminatingPod(t, c, leader)
+			},
+		},
+		{
+			name: "a member gone between the list and the flip",
+			gone: true,
+			leave: func(t *testing.T, c client.Client, leader *corev1.Pod) *corev1.Pod {
+				t.Helper()
+				listed := &corev1.Pod{}
+				if err := c.Get(context.Background(), client.ObjectKeyFromObject(leader), listed); err != nil {
+					t.Fatalf("re-read leader: %v", err)
+				}
+				if err := c.Delete(context.Background(), listed); err != nil {
+					t.Fatalf("lose the leader: %v", err)
+				}
+				return listed
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			isvc, _ := surgeISVCReady("llama-70b", "prod", 1)
+			plan := gangSurgePlan()
+			v1Name := "llama-70b-engine-rev-v1hash"
+			v2Name := "llama-70b-engine-rev-v2hash"
+			v1Hash := query.RevisionHashFromControllerRevisionName(v1Name)
+			v2Hash := query.RevisionHashFromControllerRevisionName(v2Name)
+
+			base := legacyNewFakeClient(t, isvc, gangSurgeInFlightIR(isvc, v1Name, v2Name))
+			makeCR(t, base, isvc, v2Name)
+			leader := gangPodAt(isvc, 0, "leader", v1Hash, true, true)
+			worker := gangPodAt(isvc, 0, "worker", v1Hash, true, true)
+			for _, pod := range []*corev1.Pod{leader, worker} {
+				if err := base.Create(context.Background(), pod); err != nil {
+					t.Fatalf("seed source gang pod %s: %v", pod.Name, err)
+				}
+			}
+			for _, runner := range []string{"leader", "worker"} {
+				p := gangPodAt(isvc, 1, runner, v2Hash, true, true)
+				p.Status.Conditions = append(p.Status.Conditions, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue})
+				if err := base.Create(context.Background(), p); err != nil {
+					t.Fatalf("seed replacement gang pod %s: %v", runner, err)
+				}
+			}
+			listed := tc.leave(t, base, leader)
+			// The pass lists the source gang itself; a member gone since is
+			// still in that list, as a pod the API lost after the list is.
+			c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+				List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if err := cl.List(ctx, list, opts...); err != nil {
+						return err
+					}
+					if pods, ok := list.(*corev1.PodList); ok && tc.gone {
+						for _, p := range pods.Items {
+							if p.Name == worker.Name {
+								pods.Items = append(pods.Items, *listed.DeepCopy())
+								break
+							}
+						}
+					}
+					return nil
+				},
+			})
+			// An outstanding expectation holds the pass at the post-drain gate,
+			// so the flip is observable on the worker before its deletion.
+			workload.DefaultExpectations.ExpectDeletes("prod", "llama-70b", workload.ComponentEngine, 0, 1)
+
+			input := gangInputWithRemove(isvc, c)
+			v2 := &appsv1.ControllerRevision{}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: v2Name}, v2); err != nil {
+				t.Fatalf("get v2 CR: %v", err)
+			}
+			done, err := surgeUpdate(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], v2, nil)
+			if err != nil {
+				t.Fatalf("gang surge drain pass: %v (a member already out of rotation must not fail the flip)", err)
+			}
+			if done {
+				t.Fatalf("done: got true want false (the source is still draining)")
+			}
+
+			fresh := &corev1.Pod{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(worker), fresh); err != nil {
+				t.Fatalf("re-read worker: %v", err)
+			}
+			if podreadiness.IsServing(fresh) {
+				t.Fatalf("the worker, still in rotation, must be taken out of it by the flip")
+			}
+			if tc.gone {
+				return
+			}
+			left := &corev1.Pod{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(leader), left); err != nil {
+				t.Fatalf("the terminating leader must be left to its exit: %v", err)
+			}
+			if !podreadiness.IsServing(left) {
+				t.Fatalf("a member already terminating is out of rotation by its exit; its gate is not rewritten")
+			}
+		})
+	}
+}
+
+// TestGangSurgeUpdate_TerminatingReplacementMemberHoldsTheHandoff: a
+// replacement member being deleted is gone for the hand-over whatever its
+// readiness says. The kubelet keeps the terminating container answering its
+// probe while the pod is already out of its Service, so draining the source
+// behind it would hand the Instance to a gang about to be short. The source
+// keeps serving, nothing is refilled while the object holds its name, and
+// once it is gone the same attempt refills the member; the whole gang then
+// clears the bar and the source drains.
+func TestGangSurgeUpdate_TerminatingReplacementMemberHoldsTheHandoff(t *testing.T) {
+	legacyResetExpectations(t)
+	ctx := context.Background()
+	isvc, _ := surgeISVCReady("gang-b", "prod", 1)
+	plan := gangSurgePlan()
+
+	v1Name := "gang-b-engine-rev-v1hash"
+	v2Name := "gang-b-engine-rev-v2hash"
+	ir := gangSurgeInFlightIR(isvc, v1Name, v2Name)
+	c := gangSchedClient(t, isvc, ir)
+	makeCR(t, c, isvc, v1Name)
+	makeCR(t, c, isvc, v2Name)
+	v1Hash := query.RevisionHashFromControllerRevisionName(v1Name)
+	v2Hash := query.RevisionHashFromControllerRevisionName(v2Name)
+
+	// Source gang (idx=0) fully in rotation.
+	for _, runner := range []string{"leader", "worker"} {
+		if err := c.Create(ctx, gangPodAt(isvc, 0, runner, v1Hash, true, true)); err != nil {
+			t.Fatalf("seed source pod (%s): %v", runner, err)
+		}
+	}
+	// Replacement gang (idx=1): every member ContainersReady, serving and
+	// PodReady, the shape that releases the source drain.
+	var worker *corev1.Pod
+	for _, runner := range []string{"leader", "worker"} {
+		pod := gangPodAt(isvc, 1, runner, v2Hash, true, true)
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now(),
+		})
+		if err := c.Create(ctx, pod); err != nil {
+			t.Fatalf("seed replacement pod (%s): %v", runner, err)
+		}
+		if runner == "worker" {
+			worker = pod
+		}
+	}
+	// The worker is deleted from outside while still Ready.
+	terminatingPod(t, c, worker)
+
+	deps := legacyTestDeps(c)
+	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroup(deps)
+	v2 := &appsv1.ControllerRevision{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: "prod", Name: v2Name}, v2); err != nil {
+		t.Fatalf("get v2 CR: %v", err)
+	}
+	gangPods := func(idx int32) (present, serving int, pods []*corev1.Pod) {
+		t.Helper()
+		pods, err := query.LiveListPodsForInstance(ctx, c, "prod", "gang-b", workload.ComponentEngine, idx)
+		if err != nil {
+			t.Fatalf("list pods of instance %d: %v", idx, err)
+		}
+		for _, p := range pods {
+			present++
+			if podreadiness.IsServing(p) {
+				serving++
+			}
+		}
+		return present, serving, pods
+	}
+	pass := func(when string) {
+		t.Helper()
+		input := gangInputWithRemove(isvc, c)
+		input.DesiredSpec.GangSchedulingAvailable = true
+		if _, err := surgeUpdate(ctx, deps, input, plan, plan.Instances[0], v2, nil); err != nil {
+			t.Fatalf("gang surge pass (%s): %v", when, err)
+		}
+	}
+
+	// The replacement reads short: the source keeps serving, the step does
+	// not advance, and the Terminating worker holds its name.
+	pass("worker terminating")
+	if present, serving, _ := gangPods(0); present != 2 || serving != 2 {
+		t.Fatalf("source drained behind a replacement member that is being deleted (present=%d serving=%d)", present, serving)
+	}
+	if present, _, _ := gangPods(1); present != 2 {
+		t.Fatalf("replacement pods: got %d want 2 (the Terminating worker holds its name)", present)
+	}
+	if src := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]; src.Operation == nil || src.Operation.Step != workload.UpdateStepSurge {
+		t.Errorf("source operation: got %+v want Step=Surge (the hand-over must not advance)", src.Operation)
+	}
+
+	// The worker is gone: the same attempt refills it, and the source still
+	// serves while the refill is not Ready.
+	releaseTerminatingPod(t, c, worker)
+	pass("worker gone")
+	var refilled *corev1.Pod
+	if _, _, pods := gangPods(1); true {
+		for _, p := range pods {
+			if p.Name == worker.Name {
+				refilled = p
+			}
+		}
+	}
+	if refilled == nil || refilled.DeletionTimestamp != nil {
+		t.Fatalf("the worker was not refilled once its object was gone")
+	}
+	if present, serving, _ := gangPods(0); present != 2 || serving != 2 {
+		t.Fatalf("source drained while the refilled worker is not Ready (present=%d serving=%d)", present, serving)
+	}
+
+	// The refilled worker reports Ready: the whole gang clears the bar and
+	// the source leaves rotation (and, with no routed Service to wait on, is
+	// deleted in the same pass).
+	refilled.Status.Conditions = append(refilled.Status.Conditions,
+		corev1.PodCondition{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()},
+		corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.Now()})
+	if err := c.Status().Update(ctx, refilled); err != nil {
+		t.Fatalf("mark refilled worker Ready: %v", err)
+	}
+	pass("worker ready")
+	if present, serving, _ := gangPods(0); serving != 0 {
+		t.Errorf("source still serving after the whole gang cleared the bar (present=%d serving=%d)", present, serving)
+	}
+}
+
+// gangCleanupRejectionFixture is a gang surge superseded by a newer
+// revision: the source still pins the replacement index, the marker is a
+// surge target whose members exist, and the Component's revision in force
+// has moved past the surge's target.
+func gangCleanupRejectionFixture(t *testing.T) (workload.ReconcileInput, *terminalMutationStore, client.Client, int32, string) {
+	t.Helper()
+	legacyResetExpectations(t)
+	const isvcName, namespace = "gang-cleanup", "test-ns"
+	const surgeIndex, retired, currentRev = int32(2), "gang-cleanup-engine-retired", "gang-cleanup-engine-inforce"
+	source := workload.InstanceStatus{
+		Index:           0,
+		Incarnation:     3,
+		Phase:           workload.InstancePhaseUpdating,
+		RunningRevision: "gang-cleanup-engine-running",
+		TargetRevision:  retired,
+		Operation: &workload.InstanceOperation{
+			ID:             "gang-update-0",
+			Type:           workload.InstanceOperationUpdate,
+			Step:           workload.UpdateStepSurge,
+			TargetRevision: retired,
+			SurgeIndex:     ptr.To(surgeIndex),
+		},
+	}
+	marker := workload.InstanceStatus{
+		Index:          surgeIndex,
+		Incarnation:    1,
+		Phase:          workload.InstancePhaseCreating,
+		TargetRevision: retired,
+		Operation: &workload.InstanceOperation{
+			ID:             "gang-update-target-2",
+			Type:           workload.InstanceOperationUpdate,
+			Step:           workload.UpdateStepGangSurgeTarget,
+			TargetRevision: retired,
+		},
+	}
+	store := &terminalMutationStore{
+		ownerUID: "owner-a",
+		statuses: map[int32]workload.InstanceStatus{
+			source.Index: cloneTerminalStatus(source),
+			surgeIndex:   cloneTerminalStatus(marker),
+		},
+	}
+	leader := gangSurgePod(isvcName, namespace, surgeIndex, "leader", query.RevisionHashFromControllerRevisionName(retired))
+	worker := gangSurgePod(isvcName, namespace, surgeIndex, "worker", query.RevisionHashFromControllerRevisionName(retired))
+	c := legacyNewFakeClient(t, leader, worker)
+	input := workload.ReconcileInput{
+		OwnerObject: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{UID: "owner-a"}},
+		Key: workload.Key{
+			Namespace: namespace,
+			OwnerName: isvcName,
+			Component: workload.ComponentEngine,
+			SelectorLabels: map[string]string{
+				constants.InferenceServicePodLabelKey: isvcName,
+				constants.OMEComponentLabel:           string(workload.ComponentEngine),
+				query.LabelManagedBy:                  query.ManagedByOMENative,
+			},
+		},
+		ObservedState: workload.WorkloadObservedState{
+			UpdateRevision:   currentRev,
+			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
+		},
+		FinalizeInstanceResources:            func(context.Context, int32) (bool, error) { return true, nil },
+		ApplyInstanceMutationsWithRetryBlock: store.apply,
+	}
+	input.MutateInstance = func(ctx context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
+		return store.apply(ctx, []workload.InstanceMutation{{Index: idx, Mutate: mutate}}, "", nil)
+	}
+	return input, store, c, surgeIndex, currentRev
+}
+
+// rejectPodDeletesCounting wraps c so every pod delete is refused with err,
+// counting the attempts.
+func rejectPodDeletesCounting(t *testing.T, c client.Client, err error, attempts *int) client.Client {
+	t.Helper()
+	base, ok := c.(client.WithWatch)
+	if !ok {
+		t.Fatalf("fixture client %T does not implement client.WithWatch", c)
+	}
+	return interceptor.NewClient(base, interceptor.Funcs{
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod {
+				*attempts++
+				return err
+			}
+			return cl.Delete(ctx, obj, opts...)
+		},
+	})
+}
+
+// gangCleanupRejectionPass drives one retirement pass of the fixture's
+// superseded surge, re-reading the rows and the ladder from the test's
+// stores as the engine would from the owner.
+func gangCleanupRejectionPass(t *testing.T, input *workload.ReconcileInput, store *terminalMutationStore, deps workload.Deps, blocks map[string]workload.RetryBlock, surgeIndex int32) func() (bool, error) {
+	t.Helper()
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	return func() (bool, error) {
+		t.Helper()
+		input.ObservedState.InstanceStatuses = nil
+		for _, row := range store.statuses {
+			input.ObservedState.InstanceStatuses = append(input.ObservedState.InstanceStatuses, cloneTerminalStatus(row))
+		}
+		sort.Slice(input.ObservedState.InstanceStatuses, func(i, j int) bool {
+			return input.ObservedState.InstanceStatuses[i].Index < input.ObservedState.InstanceStatuses[j].Index
+		})
+		input.ObservedState.RetryBlocks = nil
+		for _, b := range blocks {
+			input.ObservedState.RetryBlocks = append(input.ObservedState.RetryBlocks, b)
+		}
+		input.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
+			b, found := blocks[rev]
+			if !found {
+				b = workload.RetryBlock{TargetRevision: rev}
+			}
+			switch mutate(&b) {
+			case workload.RetryBlockPersist:
+				blocks[rev] = b
+			case workload.RetryBlockRemove:
+				delete(blocks, rev)
+			}
+			return nil
+		}
+		source := input.ObservedState.Instance(0)
+		return abandonFailedGangSurge(context.Background(), deps, *input, plan, 0, surgeIndex,
+			source.RunningRevision, source.Operation.TargetRevision, "gang surge abandoned after a corrective edit", workload.CauseUnattributed, gangSurgeEnd{})
+	}
+}
+
+// TestAbandonFailedGangSurge_RejectedDeleteParksRetirementOnce: the
+// retirement of a superseded gang surge deletes the replacement's members
+// under the marker's index. A permanent rejection of that delete ends the
+// marker as a rejected create would: Failed with the rejection on
+// LastFailure, the revision in force held, one Warning; the marker keeps
+// the cleanup operation that pins it to its source, and the next pass
+// issues nothing while the ladder denies.
+func TestAbandonFailedGangSurge_RejectedDeleteParksRetirementOnce(t *testing.T) {
+	input, store, base, surgeIndex, currentRev := gangCleanupRejectionFixture(t)
+	attempts := 0
+	c := rejectPodDeletesCounting(t, base, siteInvalidError(), &attempts)
+	recorder := record.NewFakeRecorder(16)
+	deps := workload.Deps{Client: c, Recorder: recorder}
+	blocks := map[string]workload.RetryBlock{}
+	pass := gangCleanupRejectionPass(t, &input, store, deps, blocks, surgeIndex)
+
+	if _, err := pass(); err != nil {
+		t.Fatalf("abandonFailedGangSurge: %v (a permanent rejection is disposed, not returned)", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("rejected deletes: got %d want 1", attempts)
+	}
+	marker := store.statuses[surgeIndex]
+	if marker.Phase != workload.InstancePhaseFailed {
+		t.Fatalf("marker Phase: got %q want Failed", marker.Phase)
+	}
+	if marker.Operation == nil || marker.Operation.Step != workload.UpdateStepGangSurgeTargetCleanup {
+		t.Fatalf("marker Operation: got %+v want the cleanup operation kept (it pins the marker to its source)", marker.Operation)
+	}
+	if marker.LastFailure == nil || marker.LastFailure.Reason != workload.RejectionReasonInvalidPodSpec {
+		t.Fatalf("marker LastFailure: got %+v want reason %s", marker.LastFailure, workload.RejectionReasonInvalidPodSpec)
+	}
+	if b, held := blocks[currentRev]; !held || b.State != workload.RetryBlockHeld {
+		t.Fatalf("RetryBlock for %s: got %+v want Held (the revision in force is blamed)", currentRev, blocks)
+	}
+	if n := countEventsWithReason(drainRecorderEvents(recorder), workload.EventReasonInstanceRejected); n != 1 {
+		t.Fatalf("InstanceRejected events after the rejection: got %d want 1", n)
+	}
+
+	if done, err := pass(); err != nil || done {
+		t.Fatalf("pass on the parked retirement: done=%v err=%v want done=false err=nil", done, err)
+	}
+	if attempts != 1 {
+		t.Fatalf("the rejected delete was issued again: %d attempts", attempts)
+	}
+	if n := countEventsWithReason(drainRecorderEvents(recorder), workload.EventReasonInstanceRejected); n != 0 {
+		t.Fatalf("InstanceRejected events on the pass after: got %d want 0", n)
+	}
+	if _, found := store.statuses[surgeIndex]; !found {
+		t.Fatalf("the marker was removed while its members still exist")
+	}
+}
+
+// TestAbandonFailedGangSurge_ParkedRetirementCompletesOnceMembersAreGone:
+// the park guards only the writes the apiserver refused, the unroute and
+// the delete over the retired members. Once no member stands there is
+// nothing left to refuse, so the retirement finalizes the marker and
+// resets the source as any abandon does, while the ladder still denies.
+func TestAbandonFailedGangSurge_ParkedRetirementCompletesOnceMembersAreGone(t *testing.T) {
+	input, store, base, surgeIndex, currentRev := gangCleanupRejectionFixture(t)
+	attempts := 0
+	c := rejectPodDeletesCounting(t, base, siteInvalidError(), &attempts)
+	recorder := record.NewFakeRecorder(16)
+	deps := workload.Deps{Client: c, Recorder: recorder}
+	blocks := map[string]workload.RetryBlock{}
+	pass := gangCleanupRejectionPass(t, &input, store, deps, blocks, surgeIndex)
+
+	if _, err := pass(); err != nil {
+		t.Fatalf("abandonFailedGangSurge: %v (a permanent rejection is disposed, not returned)", err)
+	}
+	if marker := store.statuses[surgeIndex]; marker.Phase != workload.InstancePhaseFailed {
+		t.Fatalf("marker after the rejection: got %q want Failed", marker.Phase)
+	}
+	if b, held := blocks[currentRev]; !held || b.State != workload.RetryBlockHeld {
+		t.Fatalf("RetryBlock for %s: got %+v want Held", currentRev, blocks)
+	}
+
+	// The retired members leave on their own while the ladder still denies.
+	if err := base.DeleteAllOf(context.Background(), &corev1.Pod{}, client.InNamespace(input.Key.Namespace)); err != nil {
+		t.Fatalf("remove the retired members: %v", err)
+	}
+
+	if done, err := pass(); err != nil || done {
+		t.Fatalf("pass with no member standing: done=%v err=%v want done=false err=nil (an abandon always requeues)", done, err)
+	}
+	if attempts != 1 {
+		t.Fatalf("deletes issued with no member standing: %d attempts want the one refused", attempts)
+	}
+	if marker, found := store.statuses[surgeIndex]; found {
+		t.Fatalf("the marker was kept with no member standing: %+v", marker)
+	}
+	source := store.statuses[0]
+	if source.Phase != workload.InstancePhaseReady || source.Operation != nil || source.TargetRevision != "" {
+		t.Fatalf("source after the retirement: got %+v want Ready on its running revision with the surge cleared", source)
+	}
+	if source.RunningRevision != "gang-cleanup-engine-running" {
+		t.Fatalf("source RunningRevision: got %q want gang-cleanup-engine-running (unchanged)", source.RunningRevision)
+	}
+	if b, held := blocks[currentRev]; !held || b.State != workload.RetryBlockHeld {
+		t.Fatalf("RetryBlock for %s after the completion: got %+v want still Held (finishing the retirement re-arms nothing)", currentRev, blocks)
 	}
 }

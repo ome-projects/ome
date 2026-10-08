@@ -79,6 +79,7 @@ const migrationExpiredReason = "MigrationExpired"
 // legacy -1 sentinel) has no instance ops to clear and no surge to tear
 // down: op stamps only ever happen after the allocation write, so the
 // expiry is record + ledger + event only and the source is not touched.
+// Its outcome names the wait the drive last recorded on it, when any.
 func ExpireMigrations(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan) (int, error) {
 	now := input.Now()
 	expired := 0
@@ -188,7 +189,7 @@ func expireMigrationRecord(ctx context.Context, deps workload.Deps, input worklo
 		}
 	}
 
-	blocker := migrationExpiryBlocker(rec.Phase)
+	blocker := migrationExpiryBlocker(rec)
 
 	if err := failMigrationThroughRecord(ctx, deps, input, plan, rec, blocker,
 		migrationExpiredReason, "migration expired; source pods unhealthy"); err != nil {
@@ -389,22 +390,33 @@ func mirrorTerminalMigrationLedger(ctx context.Context, deps workload.Deps, inpu
 		HintTargetNodes: append([]string(nil), rec.HintTargetNodes...),
 		Reason:          rec.Reason,
 	}
-	surgeIdx := int32(-1)
-	if rec.SurgeInstance != nil {
-		surgeIdx = *rec.SurgeInstance
-	}
-	ledger.UpsertEntry(audit.NewTerminalEntry(*ledger.InFlightEntryOrSeed(rec.RequestUUID, req, surgeIdx), phase, outcome))
+	ledger.UpsertEntry(audit.NewTerminalEntry(*ledger.InFlightEntryOrSeed(rec.RequestUUID, req, ledgerSurgeIndex(rec)), phase, outcome))
 	if err := audit.PersistLedgerForOwner(ctx, deps.Client, ledgerOwnerObject(input), ledgerOwnerGVK(input), ledger); err != nil {
 		return fmt.Errorf("persist terminal ledger mirror (uuid=%s): %w", rec.RequestUUID, err)
 	}
 	return nil
 }
 
+// ledgerSurgeIndex is the surge index a terminal ledger row carries for
+// rec: the allocated index, or the accept pass's unallocated sentinel
+// (-1, since 0 is a valid Instance index) while no surge exists.
+func ledgerSurgeIndex(rec *workload.MigrationRecord) int32 {
+	if rec != nil && rec.SurgeInstance != nil {
+		return *rec.SurgeInstance
+	}
+	return -1
+}
+
 // migrationExpiryBlocker names what the migration was stuck on when its
-// Deadline passed, derived deterministically from the record's phase.
-func migrationExpiryBlocker(p workload.MigrationPhase) string {
-	switch p {
+// Deadline passed: for a record still Accepted, the wait the drive last
+// wrote on it (a pause, a parked source repair, unconfigured capacity
+// caps); otherwise, deterministically, the phase it was stranded in.
+func migrationExpiryBlocker(rec *workload.MigrationRecord) string {
+	switch p := rec.Phase; p {
 	case workload.MigrationPhaseAccepted:
+		if rec.Message != "" {
+			return "deadline exceeded in phase Accepted while " + rec.Message
+		}
 		return "deadline exceeded in phase Accepted: surge never allocated"
 	case workload.MigrationPhaseSurgePending:
 		return "deadline exceeded in phase SurgePending: surge pods never became ready"

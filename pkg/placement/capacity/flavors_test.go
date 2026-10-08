@@ -292,3 +292,42 @@ func TestAttributedDemandFingerprint(t *testing.T) {
 		})
 	}
 }
+
+// engineOnlyDemandFingerprint pins the attributed demand contract digest of
+// the engine-only fixture on the verified catalog.
+const engineOnlyDemandFingerprint = "24e5901a3d6c074b25d6d8942d3fb1557625b847e4467db8f1e7cca49b194f55"
+
+func TestAttributedDemandFingerprintIsStable(t *testing.T) {
+	spec := demandUnit()
+	spec.Engine[0].Spec.NodeSelector = map[string]string{"hardware": "a"}
+	flavors := flavorCatalog()
+	got, err := AttributeUnit(flavorUnit(t, spec), flavors, flavorReports(flavors))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(engineOnlyDemandFingerprint, got.Fingerprint); diff != "" {
+		t.Fatalf("engine-only demand fingerprint (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(int64(1), got.PrimaryUnits); diff != "" {
+		t.Fatalf("engine-only primary units (-want +got):\n%s", diff)
+	}
+}
+
+func TestAttributeUnitCarriesPrimaryUnits(t *testing.T) {
+	spec := demandUnit()
+	spec.Engine[0].Spec.NodeSelector = map[string]string{"hardware": "a"}
+	spec.Decoder = []PodSet{demandSet("primary", 1, gpuContainer("runner", "4"))}
+	spec.Decoder[0].Spec.NodeSelector = map[string]string{"hardware": "a"}
+	spec.Units = map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 3, v1beta1.DecoderComponent: 2}
+	flavors := flavorCatalog()
+	got, err := AttributeUnit(flavorUnit(t, spec), flavors, flavorReports(flavors))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(int64(3), got.PrimaryUnits); diff != "" {
+		t.Fatalf("primary units (-want +got):\n%s", diff)
+	}
+	if len(got.Pools) != 1 || got.Pools[0].Quantity.Cmp(resource.MustParse("14")) != 0 {
+		t.Fatalf("ratio unit pools = %+v, want one pool of 14", got.Pools)
+	}
+}

@@ -77,6 +77,21 @@ var (
 	// spec.rollout.groups[].canary is unset.
 	RolloutPromoteAnnotation = OMEAPIGroupName + "/rollout-promote"
 
+	// RolloutPromoteForceAnnotation is the operator verb that lets a canary
+	// step proceed without waiting for its capacity. It applies at every step
+	// of an armed ladder: the step's capacity wait keeps no clock and takes no
+	// CapacityTimeout park, the partition still asks for the staged count so
+	// capacity converges in the background, and the step's gate, if it has
+	// one, opens. Traffic still follows the serving rule — a revision with no
+	// serving pod carries none — so a forced step never routes traffic onto
+	// nothing. Value: the canary revision hash, guarded and recorded
+	// (PromotedThrough) like the promote: one force, one step; through a final
+	// step's drain it stays live and is recorded at the completion edge. It
+	// never overrides a rollout pause or freeze, or a Failed or rolled-back
+	// canary: there it is consumed with an event saying why it did nothing.
+	// The controller clears the annotation after consuming it.
+	RolloutPromoteForceAnnotation = OMEAPIGroupName + "/rollout-promote-force"
+
 	// RolloutRollbackAnnotation is the operator verb for instant
 	// rollback. Value: "true" ("false" is identical to absence). Traffic
 	// shifts to 100% old, new revision drains after scaleDownDelaySeconds.

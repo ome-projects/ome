@@ -134,12 +134,12 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 	newInst.Incarnation = newInc
 
 	desired := expectedPodNamesForInstance(input, plan, newInst)
-	// A rebuilt pod the kubelet refused to admit never ran and never
-	// will, yet it still holds its name. Free it now rather than polling
-	// its readiness to the operation deadline.
-	if recycling, rerr := recycleAdmissionRejectedTargets(ctx, deps, input, inst.Index, inst.Index,
+	// A rebuilt pod in a terminal phase — crashed, exited, evicted or
+	// refused by its node — still holds its name and will never clear the
+	// promote bar; free it now rather than poll it to the deadline.
+	if recycling, rerr := recycleTerminalTargets(ctx, deps, input, inst.Index, inst.Index,
 		workload.InstanceOperationUpdate, newPods, desired); rerr != nil {
-		return false, fmt.Errorf("recycle rejected replacement (instance=%d): %w", inst.Index, rerr)
+		return false, fmt.Errorf("recycle terminal replacement (instance=%d): %w", inst.Index, rerr)
 	} else if recycling {
 		return false, nil
 	}

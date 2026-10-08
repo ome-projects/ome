@@ -72,6 +72,7 @@ var controlPlaneOnlyAnnotations = []string{
 	ClusterSelectorAnnotation,
 	constants.TrafficDrainAnnotation,
 	constants.RolloutPromoteAnnotation,
+	constants.RolloutPromoteForceAnnotation,
 	constants.RolloutRollbackAnnotation,
 	constants.RolloutRepinAnnotation,
 	constants.RolloutResumeAnnotation,

@@ -14,7 +14,8 @@ import (
 // InferenceReplica's rollout-control spec.pacing.partition before the
 // component reconcilers run; the engine's partition hold reads it ahead of
 // an operator-set lifecycle partition. Returns (nil, false) when no canary
-// plan is set for the InferenceService.
+// plan is effective for the Component; policies is the run layer's reading
+// of the referenced policies, which the view resolves through outside a run.
 //
 //   - The current step's Capacity resolved against desired, never below the
 //     held floor: the stable revision keeps its last instance until the done
@@ -30,8 +31,8 @@ import (
 // RollbackToRevision target (it overrides the desired pod template with the
 // stable revision and rolls every instance back onto it). A non-zero partition
 // here would fight that revert, so it is forced to 0 for the duration.
-func EffectivePartition(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, desiredReplicas int32) (*int32, bool) {
-	g := rollout.CanaryGroupFor(isvc, component)
+func EffectivePartition(isvc *v1beta1.InferenceService, policies rollout.Policies, component v1beta1.ComponentType, desiredReplicas int32) (*int32, bool) {
+	g := rollout.CanaryGroupFor(isvc, policies, component)
 	if g == nil || g.Canary == nil || len(g.Canary.Steps) == 0 {
 		return nil, false
 	}
@@ -45,7 +46,7 @@ func EffectivePartition(isvc *v1beta1.InferenceService, component v1beta1.Compon
 	// partition; a non-zero partition here would fight that revert.
 	// The group's run state is keyed by its primary; a member of the group's
 	// other unit must read the same state to stay in step with it.
-	cs := rollout.GroupCanaryStatusFor(isvc, component)
+	cs := rollout.GroupCanaryStatusFor(isvc, policies, component)
 	if cs != nil && cs.RolledBackRevisionHash != "" {
 		zero := int32(0)
 		return &zero, true
@@ -81,7 +82,7 @@ func EffectivePartition(isvc *v1beta1.InferenceService, component v1beta1.Compon
 // is the user's update strategy. nil when no canary is active for the
 // Component. desiredReplicas is read from the Component's MinReplicas
 // (fallback MaxReplicas).
-func StepPartition(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, ext *v1beta1.ComponentExtensionSpec) *int32 {
+func StepPartition(isvc *v1beta1.InferenceService, policies rollout.Policies, component v1beta1.ComponentType, ext *v1beta1.ComponentExtensionSpec) *int32 {
 	if ext == nil {
 		return nil
 	}
@@ -89,7 +90,7 @@ func StepPartition(isvc *v1beta1.InferenceService, component v1beta1.ComponentTy
 	if ext.MinReplicas != nil {
 		desired = int32(*ext.MinReplicas)
 	}
-	p, ok := EffectivePartition(isvc, component, desired)
+	p, ok := EffectivePartition(isvc, policies, component, desired)
 	if !ok {
 		return nil
 	}
@@ -109,16 +110,16 @@ func groupHasComponent(g *v1beta1.RolloutGroup, c v1beta1.ComponentType) bool {
 // PlanGateHoldPartition returns a full-hold partition (every instance held
 // on its current revision) for a Component that belongs to a canary-KIND
 // spec group — an inline canary or a policyRef declaring canary — while NO
-// effective canary plan is resolvable (run not yet open, or parked on an
-// unresolvable ref). It is the projection-side twin of the update gates'
-// plan hold: the projected spec stays DETERMINISTIC across the pre-open and
-// parked states, so a transiently lost pin cannot flap the projected IR
-// between a step partition and no partition (which churns the IR generation
-// and starves every fresh-snapshot gate downstream). nil when a canary plan
-// IS effective (StepPartition owns that) or the Component is not in a
+// effective canary plan is resolvable (a reference whose policy cannot be
+// resolved). It is the projection-side twin of the update gates' plan hold:
+// the projected spec stays DETERMINISTIC across the pre-open and parked
+// states, so a transiently lost pin cannot flap the projected IR between a
+// step partition and no partition (which churns the IR generation and
+// starves every fresh-snapshot gate downstream). nil when a canary plan IS
+// effective (StepPartition owns that) or the Component is not in a
 // canary-kind group.
-func PlanGateHoldPartition(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, ext *v1beta1.ComponentExtensionSpec) *int32 {
-	if ext == nil || isvc.Spec.Rollout == nil || rollout.CanaryGroupFor(isvc, component) != nil {
+func PlanGateHoldPartition(isvc *v1beta1.InferenceService, policies rollout.Policies, component v1beta1.ComponentType, ext *v1beta1.ComponentExtensionSpec) *int32 {
+	if ext == nil || isvc.Spec.Rollout == nil || rollout.CanaryGroupFor(isvc, policies, component) != nil {
 		return nil
 	}
 	member := false

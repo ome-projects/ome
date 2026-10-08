@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -714,92 +716,95 @@ func TestTeardown_InvalidOwnedPodIndexBlocksAllEffects(t *testing.T) {
 // configured budget in deterministic waves, while groups referenced by a
 // live owned Pod's name or owned Instance index remain intact.
 func TestTeardown_StatuslessPodGroupsDeleteInBoundedWaves(t *testing.T) {
-	ir := terminatingIR("llama-engine", "podgroup-waves", 1, time.Now())
-	ir.Status.InstanceStatuses = nil
-	liveGroupName := "zz-live"
-	livePod := podForIR(ir, 9, "default", 0, false, false)
-	livePod.Labels[query.LabelPodGroup] = liveGroupName
-	indexOnlyGroupName := "yy-live-by-index"
-	indexOnlyPod := podForIR(ir, 10, "default", 0, false, false)
-	delete(indexOnlyPod.Labels, query.LabelPodGroup)
-	emptyNames := []string{"aa-empty", "bb-empty", "cc-empty"}
-	objects := []client.Object{
-		ir,
-		livePod,
-		indexOnlyPod,
-		ownedPodGroupForIR(ir, liveGroupName, 9),
-		ownedPodGroupForIR(ir, indexOnlyGroupName, 10),
-	}
-	for idx, name := range emptyNames {
-		objects = append(objects, ownedPodGroupForIR(ir, name, int32(idx)))
-	}
+	for _, policy := range []intstr.IntOrString{intstr.FromInt32(2), intstr.FromString("40%")} {
+		t.Run(policy.String(), func(t *testing.T) {
+			ir := terminatingIR("llama-engine", "podgroup-waves", 1, time.Now())
+			ir.Status.InstanceStatuses = nil
+			liveGroupName := "zz-live"
+			livePod := podForIR(ir, 9, "default", 0, false, false)
+			livePod.Labels[query.LabelPodGroup] = liveGroupName
+			indexOnlyGroupName := "yy-live-by-index"
+			indexOnlyPod := podForIR(ir, 10, "default", 0, false, false)
+			delete(indexOnlyPod.Labels, query.LabelPodGroup)
+			emptyNames := []string{"aa-empty", "bb-empty", "cc-empty"}
+			objects := []client.Object{
+				ir,
+				livePod,
+				indexOnlyPod,
+				ownedPodGroupForIR(ir, liveGroupName, 9),
+				ownedPodGroupForIR(ir, indexOnlyGroupName, 10),
+			}
+			for idx, name := range emptyNames {
+				objects = append(objects, ownedPodGroupForIR(ir, name, int32(idx)))
+			}
 
-	c := fake.NewClientBuilder().
-		WithScheme(testScheme(t)).
-		WithObjects(objects...).
-		WithStatusSubresource(&v1beta1.InferenceReplica{}).
-		Build()
-	reader := &teardownListReader{Reader: c}
-	budget := int32(2)
-	recorder := record.NewFakeRecorder(16)
-	r := &Reconciler{
-		Client:                   c,
-		APIReader:                reader,
-		Log:                      ctrl.Log.WithName("test"),
-		Recorder:                 recorder,
-		Expectations:             workloadtypes.NewExpectations(),
-		InstanceStatusTarget:     irstatus.EncodingDenseV1,
-		GangSchedulingAvailable:  true,
-		ScaleDownPodBatchSize:    &budget,
-		ScaleDownRequeueInterval: testScaleDownRequeueInterval,
-	}
-	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+			c := fake.NewClientBuilder().
+				WithScheme(testScheme(t)).
+				WithObjects(objects...).
+				WithStatusSubresource(&v1beta1.InferenceReplica{}).
+				Build()
+			reader := &teardownListReader{Reader: c}
+			recorder := record.NewFakeRecorder(16)
+			r := &Reconciler{
+				Client:                   c,
+				APIReader:                reader,
+				Log:                      ctrl.Log.WithName("test"),
+				Recorder:                 recorder,
+				Expectations:             workloadtypes.NewExpectations(),
+				InstanceStatusTarget:     irstatus.EncodingDenseV1,
+				GangSchedulingAvailable:  true,
+				ScaleDownPodBatchSize:    &policy,
+				ScaleDownRequeueInterval: testScaleDownRequeueInterval,
+			}
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
 
-	result, err := r.Reconcile(context.Background(), req)
-	if err != nil {
-		t.Fatalf("first cleanup wave: %v", err)
-	}
-	if result.RequeueAfter != testScaleDownRequeueInterval {
-		t.Fatalf("first cleanup wave must poll, got %+v", result)
-	}
-	for _, name := range emptyNames[:2] {
-		if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: name}, &schedulingv1alpha1.PodGroup{}); !apierrors.IsNotFound(err) {
-			t.Errorf("first cleanup wave must delete %s: %v", name, err)
-		}
-	}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: emptyNames[2]}, &schedulingv1alpha1.PodGroup{}); err != nil {
-		t.Errorf("first cleanup wave exceeded budget and deleted %s: %v", emptyNames[2], err)
-	}
-	for _, name := range []string{liveGroupName, indexOnlyGroupName} {
-		if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: name}, &schedulingv1alpha1.PodGroup{}); err != nil {
-			t.Errorf("live referenced PodGroup %s was deleted: %v", name, err)
-		}
-	}
-	if reader.podLists != 1 || reader.podGroupLists != 1 {
-		t.Fatalf("first pass authoritative list counts: pods=%d PodGroups=%d, want 1 each", reader.podLists, reader.podGroupLists)
-	}
-	blocked := eventsContaining(drainEvents(recorder), ReasonTeardownBlocked)
-	if len(blocked) != 1 || !strings.Contains(blocked[0], "2 owned pod(s) and 5 owned PodGroup(s)") {
-		t.Fatalf("first pass must report the bounded pending-resource summary; events=%v", blocked)
-	}
+			result, err := r.Reconcile(context.Background(), req)
+			if err != nil {
+				t.Fatalf("first cleanup wave: %v", err)
+			}
+			if result.RequeueAfter != testScaleDownRequeueInterval {
+				t.Fatalf("first cleanup wave must poll, got %+v", result)
+			}
+			for _, name := range emptyNames[:2] {
+				if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: name}, &schedulingv1alpha1.PodGroup{}); !apierrors.IsNotFound(err) {
+					t.Errorf("first cleanup wave must delete %s: %v", name, err)
+				}
+			}
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: emptyNames[2]}, &schedulingv1alpha1.PodGroup{}); err != nil {
+				t.Errorf("first cleanup wave exceeded budget and deleted %s: %v", emptyNames[2], err)
+			}
+			for _, name := range []string{liveGroupName, indexOnlyGroupName} {
+				if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: name}, &schedulingv1alpha1.PodGroup{}); err != nil {
+					t.Errorf("live referenced PodGroup %s was deleted: %v", name, err)
+				}
+			}
+			if reader.podLists != 1 || reader.podGroupLists != 1 {
+				t.Fatalf("first pass authoritative list counts: pods=%d PodGroups=%d, want 1 each", reader.podLists, reader.podGroupLists)
+			}
+			blocked := eventsContaining(drainEvents(recorder), ReasonTeardownBlocked)
+			if len(blocked) != 1 || !strings.Contains(blocked[0], "2 owned pod(s) and 5 owned PodGroup(s)") {
+				t.Fatalf("first pass must report the bounded pending-resource summary; events=%v", blocked)
+			}
 
-	result, err = r.Reconcile(context.Background(), req)
-	if err != nil {
-		t.Fatalf("second cleanup wave: %v", err)
-	}
-	if result.RequeueAfter != testScaleDownRequeueInterval {
-		t.Fatalf("second cleanup wave must poll, got %+v", result)
-	}
-	if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: emptyNames[2]}, &schedulingv1alpha1.PodGroup{}); !apierrors.IsNotFound(err) {
-		t.Errorf("second cleanup wave must delete %s: %v", emptyNames[2], err)
-	}
-	for _, name := range []string{liveGroupName, indexOnlyGroupName} {
-		if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: name}, &schedulingv1alpha1.PodGroup{}); err != nil {
-			t.Errorf("live referenced PodGroup %s was deleted in second wave: %v", name, err)
-		}
-	}
-	if reader.podLists != 2 || reader.podGroupLists != 2 {
-		t.Fatalf("two-pass authoritative list counts: pods=%d PodGroups=%d, want 2 each", reader.podLists, reader.podGroupLists)
+			result, err = r.Reconcile(context.Background(), req)
+			if err != nil {
+				t.Fatalf("second cleanup wave: %v", err)
+			}
+			if result.RequeueAfter != testScaleDownRequeueInterval {
+				t.Fatalf("second cleanup wave must poll, got %+v", result)
+			}
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: emptyNames[2]}, &schedulingv1alpha1.PodGroup{}); !apierrors.IsNotFound(err) {
+				t.Errorf("second cleanup wave must delete %s: %v", emptyNames[2], err)
+			}
+			for _, name := range []string{liveGroupName, indexOnlyGroupName} {
+				if err := c.Get(context.Background(), types.NamespacedName{Namespace: ir.Namespace, Name: name}, &schedulingv1alpha1.PodGroup{}); err != nil {
+					t.Errorf("live referenced PodGroup %s was deleted in second wave: %v", name, err)
+				}
+			}
+			if reader.podLists != 2 || reader.podGroupLists != 2 {
+				t.Fatalf("two-pass authoritative list counts: pods=%d PodGroups=%d, want 2 each", reader.podLists, reader.podGroupLists)
+			}
+		})
 	}
 }
 
@@ -1100,6 +1105,7 @@ func TestTeardown_DeadlineExceeded_ReleasesFromEveryInstanceState(t *testing.T) 
 		{state: "Update/GangSurgeTargetCleanup", phase: v1beta1.OMENativeInstanceCreating, op: op(v1beta1.InstanceOperationUpdate, workloadtypes.UpdateStepGangSurgeTargetCleanup)},
 		{state: "Update/InPlace", phase: v1beta1.OMENativeInstanceUpdating, op: op(v1beta1.InstanceOperationUpdate, "InPlace")},
 		{state: "Update/Drain", phase: v1beta1.OMENativeInstanceUpdating, op: op(v1beta1.InstanceOperationUpdate, "Drain")},
+		{state: "Update/Parked", phase: v1beta1.OMENativeInstanceUpdating, op: op(v1beta1.InstanceOperationUpdate, workloadtypes.UpdateStepParked)},
 		{state: "Restart/Drain", phase: v1beta1.OMENativeInstanceRestarting, op: op(v1beta1.InstanceOperationRestart, "Drain")},
 		{state: "Migrate/CreateSurge", phase: v1beta1.OMENativeInstanceMigrating, op: op(v1beta1.InstanceOperationMigrate, "CreateSurge")},
 		{state: "Migrate/SurgeTarget", phase: v1beta1.OMENativeInstanceCreating, op: op(v1beta1.InstanceOperationMigrate, "CreateSurge")},

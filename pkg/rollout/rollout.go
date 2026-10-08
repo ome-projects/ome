@@ -7,17 +7,19 @@ package rollout
 import "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 
 // Effective returns the rollout view executors must consume: the pinned
-// active-run plan while a run is open, the live spec otherwise. PairingProtocol
-// is always read live — it is per-service wire-contract state and an operator
-// input, not plan content.
-func Effective(isvc *v1beta1.InferenceService) *v1beta1.RolloutSpec {
+// active-run plan while a run is open, otherwise the live spec with every
+// policy reference resolved through policies. The pin is what the same
+// resolver produced at run open, so a group's body reads the same in every
+// phase of a run's life. PairingProtocol is always read live — it is
+// per-service wire-contract state and an operator input, not plan content.
+func Effective(isvc *v1beta1.InferenceService, policies Policies) *v1beta1.RolloutSpec {
 	if isvc == nil {
 		return nil
 	}
 	if isvc.Status.Rollout != nil && isvc.Status.Rollout.ActiveRun != nil {
 		return isvc.Status.Rollout.ActiveRun.Plan.AsRolloutSpec(isvc.Spec.Rollout)
 	}
-	return isvc.Spec.Rollout
+	return resolveLive(isvc.Spec.Rollout, policies)
 }
 
 // CanaryGroups returns every effective rollout group carrying an EXECUTABLE
@@ -27,12 +29,12 @@ func Effective(isvc *v1beta1.InferenceService) *v1beta1.RolloutSpec {
 // contend.
 //
 // The inline body is the test on purpose: this answers "which ladder can be
-// stepped", not "which group declared canary". A ref-only group has no ladder
-// until a run pins its policy, so it is absent here and its Components take
+// stepped", not "which group declared canary". A group whose reference does
+// not resolve has no ladder, so it is absent here and its Components take
 // the plan-gate hold instead. Consumers asking the declared question —
 // whether a Component is gated at all — must use RolloutGroup.DeclaredProgression.
-func CanaryGroups(isvc *v1beta1.InferenceService) []*v1beta1.RolloutGroup {
-	spec := Effective(isvc)
+func CanaryGroups(isvc *v1beta1.InferenceService, policies Policies) []*v1beta1.RolloutGroup {
+	spec := Effective(isvc, policies)
 	if spec == nil {
 		return nil
 	}
@@ -50,8 +52,8 @@ func CanaryGroups(isvc *v1beta1.InferenceService) []*v1beta1.RolloutGroup {
 // Component must use this rather than the first canary group: with a group per
 // unit, the first group is another unit's ladder, and executing it would step
 // one unit's capacity and traffic to another unit's weights.
-func CanaryGroupFor(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *v1beta1.RolloutGroup {
-	for _, g := range CanaryGroups(isvc) {
+func CanaryGroupFor(isvc *v1beta1.InferenceService, policies Policies, component v1beta1.ComponentType) *v1beta1.RolloutGroup {
+	for _, g := range CanaryGroups(isvc, policies) {
 		for _, c := range g.Components {
 			if CanaryUnit(c) == CanaryUnit(component) {
 				return g
@@ -65,8 +67,8 @@ func CanaryGroupFor(isvc *v1beta1.InferenceService, component v1beta1.ComponentT
 // canary, or nil. The pinned-plan-aware analogue of
 // InferenceServiceSpec.GetCanaryGroup; executors must use this so a mid-run
 // spec edit cannot change the plan under the persisted step counter.
-func CanaryGroup(isvc *v1beta1.InferenceService) *v1beta1.RolloutGroup {
-	spec := Effective(isvc)
+func CanaryGroup(isvc *v1beta1.InferenceService, policies Policies) *v1beta1.RolloutGroup {
+	spec := Effective(isvc, policies)
 	if spec == nil {
 		return nil
 	}
@@ -101,8 +103,8 @@ func PrimaryOf(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
 // both units: a P/D pair rolled through a router-primary group reads the
 // router's step, and reading its own unit would find nothing and stay at the
 // first step's capacity while the primary advances.
-func GroupCanaryStatusFor(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *v1beta1.CanaryStatus {
-	g := CanaryGroupFor(isvc, component)
+func GroupCanaryStatusFor(isvc *v1beta1.InferenceService, policies Policies, component v1beta1.ComponentType) *v1beta1.CanaryStatus {
+	g := CanaryGroupFor(isvc, policies, component)
 	if g == nil {
 		return nil
 	}
@@ -111,12 +113,13 @@ func GroupCanaryStatusFor(isvc *v1beta1.InferenceService, component v1beta1.Comp
 
 // CanaryOwnedComponents returns every Component a canary group governs: the
 // members of each group the spec declares as canary (inline or by policyRef)
-// and of each canary group the pinned plan carries. The canary executor is
-// the sole producer of their per-revision Services, traffic targets and
-// rolled-out revision fields, the primary's and every secondary's alike;
-// coordination's pod-proportional writer leaves them alone, so a canary
-// weight is never overwritten and a group edited out of the spec mid-run
-// stays with the run that pins it.
+// and of each canary group the pinned plan carries. Ownership follows the
+// declaration, so it needs no resolution. The canary executor is the sole
+// producer of their per-revision Services, traffic targets and rolled-out
+// revision fields, the primary's and every secondary's alike; coordination's
+// pod-proportional writer leaves them alone, so a canary weight is never
+// overwritten and a group edited out of the spec mid-run stays with the run
+// that pins it.
 func CanaryOwnedComponents(isvc *v1beta1.InferenceService) map[v1beta1.ComponentType]struct{} {
 	owned := map[v1beta1.ComponentType]struct{}{}
 	if isvc == nil {
@@ -130,8 +133,14 @@ func CanaryOwnedComponents(isvc *v1beta1.InferenceService) map[v1beta1.Component
 			owned[c] = struct{}{}
 		}
 	}
-	for _, g := range CanaryGroups(isvc) {
-		for _, c := range g.Components {
+	if isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
+		return owned
+	}
+	for _, pinned := range isvc.Status.Rollout.ActiveRun.Plan.Groups {
+		if pinned.Group.Canary == nil {
+			continue
+		}
+		for _, c := range pinned.Group.Components {
 			owned[c] = struct{}{}
 		}
 	}

@@ -66,10 +66,25 @@ func spreadWorkerPod(name, ns, pgName string) *v1.Pod {
 	return p
 }
 
+// affinityWorkerPod is spreadWorkerPod carrying the rendered worker-to-leader
+// affinity: a required term only the gang's own leader satisfies, so the
+// worker yields until the leader is placed instead of planning a domain.
+func affinityWorkerPod(name, ns, pgName string) *v1.Pod {
+	p := spreadWorkerPod(name, ns, pgName)
+	p.Spec.Affinity = affinityToLeader(pgName)
+	return p
+}
+
 // placeTSCGang creates a 2-member gang whose leader carries the spread
 // constraint, waits for both binds, asserts gang integrity, and returns the
 // value of domainLabel on the gang's nodes.
 func placeTSCGang(t *testing.T, tc *testContext, ns, pgName, spreadKey, domainLabel string) string {
+	t.Helper()
+	return placeTSCGangWithWorker(t, tc, ns, pgName, spreadKey, domainLabel, spreadWorkerPod)
+}
+
+// placeTSCGangWithWorker is placeTSCGang with the worker built by worker.
+func placeTSCGangWithWorker(t *testing.T, tc *testContext, ns, pgName, spreadKey, domainLabel string, worker func(name, ns, pgName string) *v1.Pod) string {
 	t.Helper()
 	makePlainPG(t, tc, ns, pgName)
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx,
@@ -77,7 +92,7 @@ func placeTSCGang(t *testing.T, tc *testContext, ns, pgName, spreadKey, domainLa
 		t.Fatalf("create leader: %v", err)
 	}
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx,
-		spreadWorkerPod(pgName+"-1", ns, pgName), metav1.CreateOptions{}); err != nil {
+		worker(pgName+"-1", ns, pgName), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create worker: %v", err)
 	}
 	labelOf := func(node string) string {
@@ -206,5 +221,31 @@ func TestTSCBalancesThenBlocksThenFrees(t *testing.T) {
 		if d := domainOfNode(t, tc, node); d != "b" {
 			t.Fatalf("freed gang pod %s bound in %q, want b", name, d)
 		}
+	}
+}
+
+// TestTSCVetoedLeaderReplansWithAffinityBoundWorker: an affinity-bound worker
+// cannot plan for its vetoed leader, so the second gang's leader must be
+// re-activated to re-plan; both gangs bind long before the periodic flush.
+func TestTSCVetoedLeaderReplansWithAffinityBoundWorker(t *testing.T) {
+	tc := startScheduler(t, globalKubeConfig, gangPackOptions(t)...)
+	defer tc.teardown(t)
+
+	const ns = "tsc-affinity-worker"
+	createNamespace(t, tc, ns)
+	// One node per domain, each with room for two gangs, so the first gang's
+	// domain stays the best fit for the second.
+	for _, n := range []struct{ name, domain string }{{"tsc-a1", "a"}, {"tsc-b1", "b"}} {
+		if _, err := tc.ClientSet.CoreV1().Nodes().Create(tc.Ctx, makeGPUNode(n.name, n.domain, 4), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create node %s: %v", n.name, err)
+		}
+	}
+
+	// The second gang is created only once the first is bound, so its leader
+	// best-fits the occupied domain and the spread constraint vetoes it.
+	d0 := placeTSCGangWithWorker(t, tc, ns, "w0", domainLabelKey, domainLabelKey, affinityWorkerPod)
+	d1 := placeTSCGangWithWorker(t, tc, ns, "w1", domainLabelKey, domainLabelKey, affinityWorkerPod)
+	if d0 == d1 {
+		t.Fatalf("both gangs in domain %q, want the second re-planned away from the first", d0)
 	}
 }

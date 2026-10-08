@@ -734,3 +734,61 @@ func inventoryPodGroup(t *testing.T, owner client.Object, ownerName string, inde
 func stringIndex(index int32) string {
 	return fmt.Sprintf("%d", index)
 }
+
+// A retired gang's PodGroup that is already Terminating holds the index:
+// the finalization issues no second delete and reports the index incomplete
+// until the object is gone, which is what keeps a cleanup marker in place
+// for one more pass.
+func TestFinalizeOwnedName_TerminatingGroupHoldsTheIndex(t *testing.T) {
+	owner := newOwner("prod", "llama")
+	pg := inventoryPodGroup(t, owner, "llama", 1)
+	pg.UID = "pg-uid"
+	pg.Finalizers = []string{"example.com/keep"}
+	base := newGangClient(t, owner, pg)
+	if err := base.Delete(context.Background(), pg); err != nil {
+		t.Fatalf("stamp deletion: %v", err)
+	}
+	held := &schedulingv1alpha1.PodGroup{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(pg), held); err != nil {
+		t.Fatalf("get terminating group: %v", err)
+	}
+	if held.DeletionTimestamp == nil {
+		t.Fatal("the finalizer must leave the group Terminating")
+	}
+
+	inv, err := ObservePodGroups(context.Background(), base, owner)
+	if err != nil {
+		t.Fatalf("ObservePodGroups: %v", err)
+	}
+	deletes := 0
+	counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			deletes++
+			return c.Delete(ctx, obj, opts...)
+		},
+	})
+	finalize := BuildFinalizeInstanceResources(counting, counting, inv, owner, "llama", types.ComponentEngine)
+	complete, err := finalize(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+	if complete {
+		t.Fatal("a Terminating group must hold the index incomplete")
+	}
+	if deletes != 0 {
+		t.Fatalf("delete calls on a Terminating group: got %d want 0", deletes)
+	}
+
+	held.Finalizers = nil
+	if err := base.Update(context.Background(), held); err != nil {
+		t.Fatalf("release finalizer: %v", err)
+	}
+	fresh, err := ObservePodGroups(context.Background(), base, owner)
+	if err != nil {
+		t.Fatalf("refresh inventory: %v", err)
+	}
+	complete, err = BuildFinalizeInstanceResources(base, base, fresh, owner, "llama", types.ComponentEngine)(context.Background(), 1)
+	if err != nil || !complete {
+		t.Fatalf("absence did not complete finalization: complete=%v err=%v", complete, err)
+	}
+}

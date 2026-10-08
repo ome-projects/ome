@@ -10,7 +10,7 @@ import (
 	reportv1alpha1 "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/rolloutprojection"
 	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	omevalidation "sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -128,7 +128,7 @@ func scalePartitionAllows(replica *v1beta1.InferenceReplica, replicas int32) boo
 		}
 	}
 	for _, partition := range partitions {
-		if partition != nil && (*partition < 0 || escalation.HeldByPartition(partition, replicas)) {
+		if partition != nil && (*partition < 0 || workloadops.HeldByPartition(partition, replicas)) {
 			return false
 		}
 	}

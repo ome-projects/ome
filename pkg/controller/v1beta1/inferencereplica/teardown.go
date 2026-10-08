@@ -223,7 +223,11 @@ func (r *Reconciler) reconcileTeardown(ctx context.Context, log logr.Logger, ir 
 		return result, nil
 	}
 	if len(input.ObservedState.InstanceStatuses) == 0 {
-		if _, derr := deleteTeardownOrphanPodGroups(ctx, r.Client, podGroupInventory, ownedPods, input.ScaleDownPodBatchSize); derr != nil {
+		budget, err := workloadtypes.ResolveScaleDownPodBatchSize(input.ScaleDownPodBatchSize, int32(pendingTeardownPodGroups(podGroupInventory)))
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("InferenceReplica teardown: resolve orphan PodGroup cleanup budget: %w", err)
+		}
+		if _, derr := deleteTeardownOrphanPodGroups(ctx, r.Client, podGroupInventory, ownedPods, budget); derr != nil {
 			return ctrl.Result{}, fmt.Errorf("InferenceReplica teardown: delete orphan PodGroups: %w", derr)
 		}
 	}

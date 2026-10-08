@@ -14,6 +14,9 @@ type pinState struct {
 	topologyKey string
 	gang        gangInfo
 	commitment  uint64
+	// soleFit marks a domain no other could stand in for: the only one that fit
+	// the gang, or the one its bound members impose. A veto there is not re-planned.
+	soleFit bool
 }
 
 // Clone satisfies framework.StateData. The struct is value-only, so a shallow
@@ -30,6 +33,14 @@ func writePin(state framework.CycleState, domain string, gang gangInfo, commitme
 		id = commitment[0]
 	}
 	state.Write(pinStateKey, &pinState{domain: domain, topologyKey: gang.topologyKey, gang: gang, commitment: id})
+}
+
+// markSoleFit flags the cycle's pin as the only domain that fit the gang, so a
+// veto there parks the member instead of activating a re-plan.
+func markSoleFit(state framework.CycleState) {
+	if pin := readPin(state); pin != nil {
+		pin.soleFit = true
+	}
 }
 
 // readPin returns the pin recorded for this cycle, or nil when none was recorded

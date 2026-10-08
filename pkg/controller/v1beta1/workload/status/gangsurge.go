@@ -298,7 +298,8 @@ func StampGangSurgeTargetReady(
 
 // ResetGangSurgeSource releases a source claim whose target slot turned
 // out to be occupied: the source goes back to Ready on its running
-// revision and the occupied target is not touched. The strong path
+// revision, or to the fresh-start Failed shape when it never ran one, and
+// the occupied target is not touched. The strong path
 // guards both lifecycle identities in one authoritative snapshot;
 // compatibility adapters confirm the target and source independently
 // through their fresh mutation reads. Reports whether this pass reset.
@@ -310,13 +311,11 @@ func ResetGangSurgeSource(
 ) (bool, error) {
 	sourceIdentity := Capture(source)
 	targetIdentity := Capture(target)
-	reset := ReadyOnRevisionMutation(source.Index, source.RunningRevision, input.Now())
+	reset := AbandonedSurgeSourceMutation(source.Index, source.RunningRevision, input.Now())
 	reset.Postcondition = func(row *types.InstanceStatus) bool {
 		return row != nil && row.Index == source.Index &&
 			row.Incarnation == source.Incarnation &&
-			row.Phase == types.InstancePhaseReady &&
-			row.RunningRevision == source.RunningRevision &&
-			row.TargetRevision == "" && row.Operation == nil &&
+			AbandonedSurgeSourceSettled(row, source.RunningRevision) &&
 			row.ActiveOrdinal == source.ActiveOrdinal
 	}
 
@@ -537,7 +536,8 @@ func RestoreGangSurgeTargetCleanup(
 }
 
 // ResetGangSurgeSourceAndRemoveMarker ends an abandoned gang surge in
-// one batch: the SOURCE goes back to Ready on sourceRunningRev and the
+// one batch: the SOURCE goes back to Ready on sourceRunningRev, or to the
+// fresh-start Failed shape when it never ran a revision, and the
 // TARGET's cleanup marker is removed, with the failed revision's
 // RetryBlock disposition committed in the same write. Fenced on both
 // identities, proved once before the adapter finalizes the surge index's
@@ -554,6 +554,101 @@ func ResetGangSurgeSourceAndRemoveMarker(
 	failedTargetRev string,
 	failureReason string,
 	cause types.FailureCause,
+) (bool, error) {
+	if source == nil {
+		return false, nil
+	}
+	reset := AbandonedSurgeSourceMutation(source.Index, sourceRunningRev, input.Now())
+	reset.Postcondition = func(row *types.InstanceStatus) bool {
+		return row != nil && row.Index == source.Index &&
+			row.Incarnation == source.Incarnation &&
+			AbandonedSurgeSourceSettled(row, sourceRunningRev) &&
+			row.ActiveOrdinal == source.ActiveOrdinal
+	}
+	var retryRevision string
+	var mutateRetryBlock func(*types.RetryBlock) types.RetryBlockDisposition
+	heldAttempts := int32(0)
+	if input.MutateRetryBlock != nil && failedTargetRev != "" {
+		retryRevision = failedTargetRev
+		now := metav1.NewTime(input.Now())
+		mutateRetryBlock = func(block *types.RetryBlock) types.RetryBlockDisposition {
+			var disposition types.RetryBlockDisposition
+			disposition, heldAttempts = types.ApplyUpdateFailureToRetryBlock(
+				block, input.UpdateRetryPolicy, now, failureReason, cause,
+			)
+			return disposition
+		}
+	}
+	committed, err := endGangSurgePair(ctx, deps, input, source, marker, surgeIdx, sourceRunningRev, reset, retryRevision, mutateRetryBlock)
+	if err == nil && committed && heldAttempts > 0 && input.WarnRetryHeld != nil {
+		input.WarnRetryHeld(failedTargetRev, heldAttempts, failureReason)
+	}
+	return committed, err
+}
+
+// HoldGangSurgeSourceAndRemoveMarker ends a gang surge whose pinned
+// revision admits no further attempt, in one batch: the SOURCE is left
+// Failed with no operation and termination recorded, on the revision it
+// ran, and the TARGET's cleanup marker is removed. The ladder already
+// holds, so no RetryBlock is written. Fenced like the reset. Reports
+// whether this pass committed the hold.
+func HoldGangSurgeSourceAndRemoveMarker(
+	ctx context.Context,
+	deps types.Deps,
+	input types.ReconcileInput,
+	source *types.InstanceStatus,
+	marker *types.InstanceStatus,
+	surgeIdx int32,
+	termination *types.InstanceTermination,
+) (bool, error) {
+	if source == nil {
+		return false, nil
+	}
+	hold := FailedWithoutOperationMutation(source.Index, termination)
+	hold.Postcondition = func(row *types.InstanceStatus) bool {
+		return row != nil && row.Index == source.Index &&
+			row.Incarnation == source.Incarnation &&
+			row.Phase == types.InstancePhaseFailed && row.Operation == nil
+	}
+	return endGangSurgePair(ctx, deps, input, source, marker, surgeIdx, "", hold, "", nil)
+}
+
+// FailedWithoutOperationMutation ends the attempt a row carries where it
+// stands: Phase Failed, the operation released, termination recorded. The
+// revisions the row ran and converged toward are left as they were.
+func FailedWithoutOperationMutation(idx int32, termination *types.InstanceTermination) types.InstanceMutation {
+	return types.InstanceMutation{Index: idx, Mutate: func(s *types.InstanceStatus) bool {
+		if s.Phase == types.InstancePhaseFailed && s.Operation == nil && sameFailureIdentity(s.LastFailure, termination) {
+			return false
+		}
+		s.Phase = types.InstancePhaseFailed
+		s.Operation = nil
+		if termination != nil {
+			captured := *termination
+			s.LastFailure = &captured
+		}
+		return true
+	}}
+}
+
+// endGangSurgePair commits the end of a gang surge pair: the source's end
+// mutation and the removal of the marker, fenced on both identities,
+// proved once before the adapter finalizes the surge index's resources
+// and again on the write, with the retry-block mutation, when there is
+// one, in the same write. A block standing against prunedRevision is
+// pruned first, the way a promote onto it would. Reports whether this
+// pass committed the end.
+func endGangSurgePair(
+	ctx context.Context,
+	deps types.Deps,
+	input types.ReconcileInput,
+	source *types.InstanceStatus,
+	marker *types.InstanceStatus,
+	surgeIdx int32,
+	prunedRevision string,
+	end types.InstanceMutation,
+	retryRevision string,
+	mutateRetryBlock func(*types.RetryBlock) types.RetryBlockDisposition,
 ) (bool, error) {
 	if err := RequireOwner(input); err != nil {
 		return false, err
@@ -588,8 +683,8 @@ func ResetGangSurgeSourceAndRemoveMarker(
 		}
 		return false, err
 	}
-	if sourceRunningRev != "" && types.FindRetryBlock(input.ObservedState.RetryBlocks, sourceRunningRev) != nil {
-		if err := RetryBlockPruneOnPromote(ctx, input, sourceRunningRev); err != nil {
+	if prunedRevision != "" && types.FindRetryBlock(input.ObservedState.RetryBlocks, prunedRevision) != nil {
+		if err := RetryBlockPruneOnPromote(ctx, input, prunedRevision); err != nil {
 			return false, err
 		}
 	}
@@ -605,46 +700,15 @@ func ResetGangSurgeSourceAndRemoveMarker(
 	}
 
 	committed := false
-	reset := ReadyOnRevisionMutation(source.Index, sourceRunningRev, input.Now())
-	reset.BatchPrecondition = guard
-	reset.Postcondition = func(row *types.InstanceStatus) bool {
-		return row != nil && row.Index == source.Index &&
-			row.Incarnation == source.Incarnation &&
-			row.Phase == types.InstancePhaseReady &&
-			row.RunningRevision == sourceRunningRev &&
-			row.TargetRevision == "" && row.Operation == nil &&
-			row.ActiveOrdinal == source.ActiveOrdinal
-	}
-	reset.OnCommit = func(_, _ *types.InstanceStatus) {
+	end.BatchPrecondition = guard
+	end.OnCommit = func(_, _ *types.InstanceStatus) {
 		committed = true
 		deps.ExpectationsCache().Forget(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, surgeIdx)
 	}
 	removeMarker := types.InstanceMutation{Index: surgeIdx, Remove: true}
-
-	var retryRevision string
-	var mutateRetryBlock func(*types.RetryBlock) types.RetryBlockDisposition
-	heldAttempts := int32(0)
-	if input.MutateRetryBlock != nil && failedTargetRev != "" {
-		retryRevision = failedTargetRev
-		now := metav1.NewTime(input.Now())
-		mutateRetryBlock = func(block *types.RetryBlock) types.RetryBlockDisposition {
-			var disposition types.RetryBlockDisposition
-			disposition, heldAttempts = types.ApplyUpdateFailureToRetryBlock(
-				block, input.UpdateRetryPolicy, now, failureReason, cause,
-			)
-			return disposition
-		}
-	}
-	priorOnCommit := reset.OnCommit
-	reset.OnCommit = func(previous, current *types.InstanceStatus) {
-		priorOnCommit(previous, current)
-		if heldAttempts > 0 && input.WarnRetryHeld != nil {
-			input.WarnRetryHeld(failedTargetRev, heldAttempts, failureReason)
-		}
-	}
 	err := input.ApplyInstanceMutationsWithRetryBlock(
 		ctx,
-		[]types.InstanceMutation{reset, removeMarker},
+		[]types.InstanceMutation{end, removeMarker},
 		retryRevision,
 		mutateRetryBlock,
 	)
@@ -823,4 +887,101 @@ func sameRestoredGangSurgeTarget(current, desired *types.InstanceStatus) bool {
 	return current != nil && desired != nil && gangSurgeTargetMatches(current, desired.TargetRevision) &&
 		current.Index == desired.Index && current.Incarnation == desired.Incarnation &&
 		current.Operation.ID == desired.Operation.ID
+}
+
+// StampReplacementLost records on a gang surge SOURCE that its replacement
+// gang lost members after the hand-over: Phase Failed with the operation
+// kept, termination on LastFailure. The attempt that died is closed for the
+// ladder to count; a later pass re-arms or holds it. A row already Failed
+// on the same loss, or one with no operation left, is a no-op.
+func StampReplacementLost(termination *types.InstanceTermination) func(*types.InstanceStatus) bool {
+	return func(s *types.InstanceStatus) bool {
+		if s.Phase == "" || s.Operation == nil {
+			return false
+		}
+		changed := false
+		if s.Phase != types.InstancePhaseFailed {
+			s.Phase = types.InstancePhaseFailed
+			changed = true
+		}
+		if termination != nil && !sameFailureIdentity(s.LastFailure, termination) {
+			captured := *termination
+			s.LastFailure = &captured
+			changed = true
+		}
+		return changed
+	}
+}
+
+// RearmGangSurgeRebuild opens the next attempt of a gang surge whose
+// replacement died after the hand-over: the SOURCE goes back to Updating
+// at its drain step with the retry counted on the operation and a fresh
+// deadline from now, and the pinned revision's due backoff becomes the
+// attempt in progress in the same write. Fenced on the source identity.
+// Reports whether this pass re-armed.
+func RearmGangSurgeRebuild(
+	ctx context.Context,
+	input types.ReconcileInput,
+	source *types.InstanceStatus,
+	timeout time.Duration,
+) (bool, error) {
+	if source == nil || source.Operation == nil || source.Operation.TargetRevision == "" {
+		return false, nil
+	}
+	now := metav1.NewTime(input.Now())
+	identity := Capture(source)
+	retry := source.Operation.RetryCount + 1
+	rearm := func(s *types.InstanceStatus) bool {
+		if !identity.Matches(*s) {
+			return false
+		}
+		s.Phase = types.InstancePhaseUpdating
+		op := *s.Operation
+		op.RetryCount = retry
+		op.StartedAt = now
+		op.LastProgressAt = now
+		op.Deadline = types.DeadlineAt(now, timeout)
+		s.Operation = &op
+		return true
+	}
+	pin := source.Operation.TargetRevision
+	if input.ApplyInstanceMutationsWithRetryBlock == nil {
+		committed := false
+		if err := input.MutateInstance(ctx, source.Index, func(s *types.InstanceStatus) bool {
+			committed = rearm(s)
+			return committed
+		}); err != nil || !committed {
+			return false, err
+		}
+		return true, RetryBlockAttemptStarted(ctx, input, pin)
+	}
+	if err := RequireOwner(input); err != nil {
+		return false, err
+	}
+	ownerUID := input.OwnerObject.GetUID()
+	committed := false
+	mutation := types.InstanceMutation{
+		Index:  source.Index,
+		Mutate: rearm,
+		BatchPrecondition: func(snapshot types.InstanceMutationSnapshot) bool {
+			if snapshot.OwnerUID != ownerUID {
+				return false
+			}
+			current, found := snapshot.Instances[source.Index]
+			return found && identity.Matches(current)
+		},
+		Postcondition: func(row *types.InstanceStatus) bool {
+			return row != nil && row.Phase == types.InstancePhaseUpdating &&
+				row.Operation != nil && row.Operation.RetryCount == retry
+		},
+		OnCommit: func(_, _ *types.InstanceStatus) { committed = true },
+	}
+	err := input.ApplyInstanceMutationsWithRetryBlock(ctx, []types.InstanceMutation{mutation}, pin, RetryBlockStartAttempt)
+	if errors.Is(err, types.ErrStatusMutationPrecondition) || errors.Is(err, types.ErrStatusOwnerGone) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return committed, nil
 }

@@ -52,7 +52,7 @@ func expectReleased(t *testing.T, isvc *v1beta1.InferenceService, res *Result, s
 		t.Fatal("the pre-canary identity is kept until nothing runs it")
 	}
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(4)}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 0 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 0 {
 		t.Fatalf("the done sentinel must project partition 0, got %v", fmtPartition(p))
 	}
 }
@@ -92,7 +92,7 @@ func TestReconcile_FinalStepHoldsTheLastStableInstanceThroughTheDrain(t *testing
 	// The final step's partition keeps one instance on stable while the
 	// stable revision still carries traffic.
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(4)}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
 		t.Fatalf("final step must hold the last stable instance (partition 1) before traffic moves, got %v", fmtPartition(p))
 	}
 
@@ -107,7 +107,7 @@ func TestReconcile_FinalStepHoldsTheLastStableInstanceThroughTheDrain(t *testing
 	if res.Partition != 1 {
 		t.Fatalf("the stable instance stays held through the drain window, got partition %d", res.Partition)
 	}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
 		t.Fatalf("projected partition must keep the stable instance through the drain, got %v", fmtPartition(p))
 	}
 
@@ -263,7 +263,7 @@ func TestDispatch_CutoverMovesTrafficBeforeReleasingStableCapacity(t *testing.T)
 	isvc.Status.Rollout.ActiveRun.TargetRevisions = []v1beta1.RolloutRunTarget{
 		{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: "old"},
 	}
-	g := rollout.CanaryGroup(isvc)
+	g := rollout.CanaryGroup(isvc, rollout.Policies{})
 	start := time.Unix(1000, 0)
 	// The final step was just entered: the split served 50/50 at step 0.
 	rollout.SetCanaryStatusFor(&isvc.Status, v1beta1.EngineComponent, &v1beta1.CanaryStatus{
@@ -302,7 +302,7 @@ func TestDispatch_CutoverMovesTrafficBeforeReleasingStableCapacity(t *testing.T)
 		t.Fatalf("staged capacity Ready must shift 100%% traffic, got phase %q", got)
 	}
 	expectSoleTarget(t, isvc, v1beta1.EngineComponent, "new")
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
 		t.Fatalf("the last stable instance stays held while traffic settles, got partition %v", fmtPartition(p))
 	}
 
@@ -314,7 +314,7 @@ func TestDispatch_CutoverMovesTrafficBeforeReleasingStableCapacity(t *testing.T)
 	if got := isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase; got != v1beta1.RolloutPhasePromoting {
 		t.Fatalf("drain elapsed releases the held instance but is not Stable while it runs the stable revision, got phase %q", got)
 	}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 0 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 0 {
 		t.Fatalf("the release must project partition 0, got partition %v", fmtPartition(p))
 	}
 	if out.RequeueAfter == 0 && !out.Requeue {

@@ -29,8 +29,12 @@ type ReconcileInputs struct {
 	// an applied verb from an inapplicable one. nil (tests) silences them.
 	Recorder record.EventRecorder
 	ISVC     *v1beta1.InferenceService
+	// Policies is the set of RolloutPolicy objects the run layer observed
+	// for this pass; the effective view resolves the spec's references
+	// through it outside a pinned run.
+	Policies rollout.Policies
 	// Group is the canary group being dispatched — the unit's own ladder. Nil
-	// resolves it from Component.
+	// resolves it from Component through the effective view.
 	Group              *v1beta1.RolloutGroup
 	Component          v1beta1.ComponentType
 	CanaryRevisionHash string
@@ -285,7 +289,7 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 
 	g := in.Group
 	if g == nil {
-		g = rollout.CanaryGroupFor(in.ISVC, in.Component)
+		g = rollout.CanaryGroupFor(in.ISVC, in.Policies, in.Component)
 	}
 	if g == nil || g.Canary == nil || len(g.Canary.Steps) == 0 {
 		return &Result{Active: false}, nil
@@ -300,12 +304,22 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	}
 
 	// Global pause (ome.io/rollout-paused): the operator held the rollout.
-	// Observe only — no step advance, no traffic or phase write, no annotation
-	// consumption, no rollback arm/clear, and no state-machine (re)initialization.
-	// Step timers are left untouched, so clearing the pause resumes the current
-	// step with its clocks intact. Both pause depths hold the canary equally;
-	// the depth only changes whether Instance repair keeps running underneath.
-	if paused, _ := constants.RolloutPauseState(in.ISVC.Annotations); paused {
+	// Observe only — no step advance, no traffic or phase write, no rollback
+	// arm/clear, and no state-machine (re)initialization. Step timers are
+	// left untouched, so clearing the pause resumes the current step with its
+	// clocks intact. Both pause depths hold the canary equally; the depth
+	// only changes whether Instance repair keeps running underneath. The one
+	// verb the pause consumes is a forced promote: it never overrides the
+	// pause, and left in place it would open the first gate the resumed
+	// ladder meets.
+	if paused, freeze := constants.RolloutPauseState(in.ISVC.Annotations); paused {
+		if cs != nil && int(cs.CurrentStep) < len(plan.Steps) {
+			why := "the rollout is paused"
+			if freeze {
+				why = "the rollout is frozen"
+			}
+			ignoreForce(in, cs, take, why)
+		}
 		return pausedResult(in, cs, plan), nil
 	}
 	targetChanged := cs != nil && in.RunActive && in.TargetID != "" && cs.TargetID != "" && cs.TargetID != in.TargetID
@@ -363,6 +377,10 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	syncPromotedThrough(in, cs, take)
 	step := plan.Steps[cs.CurrentStep]
 
+	// A forced promote applies at every step of an armed ladder: it lifts the
+	// step's capacity wait and opens the step's gate if it has one.
+	forced := forceRequested(in.ISVC, cs)
+
 	// The step's partition keeps the stable revision's last instance (the
 	// held floor) for as long as the canary is in flight, so the capacity a
 	// step stages, and its gate waits for, is what the remaining instances can
@@ -384,16 +402,24 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	publishReadyRevisions(in)
 	state := rollout.StateOf(cs, in.ISVC.Status.Components[in.Component].RolloutPhase, len(plan.Steps))
 	capacityShort := readyCanary < newCount || !in.SecondaryCapacityReady
-	if capacityShort && cs.CapacityWaitSince == nil {
+	// A forced step's wait keeps no clock: the operator lifted it, so it is
+	// never timed and never parks, while the partition still asks for the
+	// staged count and capacity converges behind the gate. A clock that was
+	// running is the force taking effect on this pass.
+	lifted := forced && cs.CapacityWaitSince != nil
+	if forced {
+		cs.CapacityWaitSince = nil
+	}
+	if capacityShort && !forced && cs.CapacityWaitSince == nil {
 		cs.CapacityWaitSince = &metav1.Time{Time: in.Now}
 	}
-	if capacityShort && state != rollout.CanaryStateDraining {
+	if capacityShort && !forced && state != rollout.CanaryStateDraining {
 		// The held split names the canary revision only while a pod of it
 		// serves; its share rests on the stable revision otherwise and
 		// returns on the pass that sees a canary pod serve again.
 		holdGroupTraffic(in)
 	}
-	if capacityShort && capacityGateExpired(cs, resolveReadyTimeout(in, plan), in.Now) {
+	if capacityShort && !forced && capacityGateExpired(cs, resolveReadyTimeout(in, plan), in.Now) {
 		// A drain's split names the canary revision alone, so its park hands
 		// the traffic back to the held stable instance, as a crash park does.
 		if state == rollout.CanaryStateDraining {
@@ -402,7 +428,7 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 		parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureCapacityTimeout, in.Now)
 		return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
 	}
-	if capacityShort && state != rollout.CanaryStateDraining {
+	if capacityShort && !forced && state != rollout.CanaryStateDraining {
 		// A drain is exempt from this hold: capacity lost after the final
 		// traffic write is the workload engine's repair, and the drain's own
 		// release waits on it below, inside the same timeout.
@@ -424,21 +450,29 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	// converged toward the clamped step — capacity ahead of traffic is the
 	// supported warm-up pattern; exposure is the traffic write below.
 	if cs.PreStepHold {
-		if in.ISVC.Annotations[constants.RolloutPromoteAnnotation] == cs.CanaryRevisionHash {
+		released := false
+		for _, key := range promoteKeys {
+			if in.ISVC.Annotations[key] != cs.CanaryRevisionHash {
+				continue
+			}
 			// The release is recorded like any applied promote: the record
 			// keeps the annotation inert until the controller removes it after
 			// the flush, so a lost flush cannot leave the hold released and
-			// the verb gone.
+			// the verb gone. A force is spent on the release like a promote.
 			cs.PreStepHold = false
 			cs.PromotedThrough = cs.CanaryRevisionHash
-			take(constants.RolloutPromoteAnnotation)
-		} else {
+			take(key)
+			released = true
+		}
+		if !released {
 			// The held split follows the pods like any held split: its
 			// share is back on the canary revision as soon as one serves.
 			holdGroupTraffic(in)
 			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePaused)
 			return (&Result{Active: true, Partition: partition}).wake(in.Requeue), nil
 		}
+		// A verb spent on the release opens no gate on this pass.
+		forced = false
 	}
 
 	// Capacity satisfied: program this step's external traffic weight on
@@ -460,6 +494,10 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 		if shifted {
 			cs.StepEnteredTime = &metav1.Time{Time: in.Now}
 		}
+		// The final step re-reads a live promote on every pass until
+		// completion, so a force is announced once: on the pass that opens
+		// the step into its drain or lifts a running capacity wait.
+		opening := in.ISVC.Status.Components[in.Component].RolloutPhase != v1beta1.RolloutPhasePromoting
 		setPhase(in.ISVC, in.Component, v1beta1.RolloutPhasePromoting)
 		// The final 100% step honors the same gate as intermediate steps: analysis
 		// validates at full traffic (a breach within the drain window still rolls
@@ -470,8 +508,7 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 		if stepGated(step) {
 			switch evaluateStep(ctx, in, cs, step) {
 			case decRollback:
-				cs.RolledBackRevisionHash = cs.CanaryRevisionHash
-				return reconcileRollback(in, cs), nil
+				return rollBackOnGateFailure(in, cs, partition), nil
 			case decFailed:
 				parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureAnalysisStalled, in.Now)
 				return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
@@ -483,6 +520,9 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 			case decAdvance:
 				// gate passed at 100% — fall through to the drain window + completion.
 			}
+		}
+		if forced && (opening || lifted) {
+			announceForce(in, cs, readyCanary, newCount)
 		}
 		// The release cannot be undone, so it is decided on a count taken
 		// after the 100% write landed: the pass that moved traffic ends here,
@@ -496,10 +536,7 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 			// completion edge it is recorded and handed back for removal after
 			// the flush; the done sentinel's sync clears the record once the
 			// annotation is observed gone.
-			if v, ok := in.ISVC.Annotations[constants.RolloutPromoteAnnotation]; ok {
-				cs.PromotedThrough = v
-				take(constants.RolloutPromoteAnnotation)
-			}
+			recordPromotes(in, cs, take)
 			// Mark done (sentinel), don't clear: EffectivePartition reads the
 			// sentinel as partition 0, which releases the held stable instance
 			// now that traffic has left it and drained, instead of re-holding
@@ -527,8 +564,7 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	if stepGated(step) {
 		switch evaluateStep(ctx, in, cs, step) {
 		case decRollback:
-			cs.RolledBackRevisionHash = cs.CanaryRevisionHash
-			return reconcileRollback(in, cs), nil
+			return rollBackOnGateFailure(in, cs, partition), nil
 		case decFailed:
 			parkFailed(in.ISVC, in.Component, cs, v1beta1.CanaryFailureAnalysisStalled, in.Now)
 			return (&Result{Active: true, Partition: partition}).wake(in.ParkedRequeue), nil
@@ -538,6 +574,9 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 		case decAdvance:
 			// fall through to advance.
 		}
+	}
+	if forced {
+		announceForce(in, cs, readyCanary, newCount)
 	}
 	advanceStep(in, take)
 	return (&Result{Active: true, Stepped: true, Partition: partition}).wake(in.Requeue), nil
@@ -785,8 +824,8 @@ func resolveReadyTimeout(in ReconcileInputs, plan *v1beta1.GroupCanary) time.Dur
 
 // effectiveCanaryPlan is the effective canary body for callers that hold only
 // ReconcileInputs (the plan indexing itself stays in Reconcile).
-func effectiveCanaryPlan(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *v1beta1.GroupCanary {
-	g := rollout.CanaryGroupFor(isvc, component)
+func effectiveCanaryPlan(in ReconcileInputs) *v1beta1.GroupCanary {
+	g := rollout.CanaryGroupFor(in.ISVC, in.Policies, in.Component)
 	if g == nil {
 		return nil
 	}

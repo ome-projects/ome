@@ -50,7 +50,9 @@ func TestReconcile_RollbackWaitsForServingStableCapacity(t *testing.T) {
 
 // A secondary's rollback write follows the same rule on its own stable
 // revision: a member whose stable revision has no serving capacity keeps its
-// programmed split until it does.
+// programmed split until it does. That split was written on the member's
+// serving capacity alone, its target, because a stable revision with no
+// serving pod carries no weight.
 func TestReconcile_SecondaryRollbackWaitsForItsServingStableCapacity(t *testing.T) {
 	isvc, in := pdInputs(map[string]int32{"new": 2, "old": 2}, bumpedDecoder())
 	in.GroupReadyPerRevisionPods = map[v1beta1.ComponentType]map[string]int32{
@@ -66,8 +68,7 @@ func TestReconcile_SecondaryRollbackWaitsForItsServingStableCapacity(t *testing.
 		"old": {percent: 100, protocol: pdStableProtocol},
 	})
 	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{
-		"decnew": {percent: 50, protocol: pdCanaryProtocol, latest: true},
-		"decold": {percent: 50, protocol: pdStableProtocol},
+		"decnew": {percent: 100, protocol: pdCanaryProtocol, latest: true},
 	})
 	in.GroupReadyPerRevisionPods[v1beta1.DecoderComponent] = map[string]int32{"decnew": 1, "decold": 1}
 	mustReconcile(t, isvc, in)
@@ -89,7 +90,7 @@ func TestDispatch_RollbackKeepsTrafficOffAnEmptyStableRevision(t *testing.T) {
 	isvc.Status.Rollout.ActiveRun.TargetRevisions = []v1beta1.RolloutRunTarget{
 		{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: "old"},
 	}
-	g := rollout.CanaryGroup(isvc)
+	g := rollout.CanaryGroup(isvc, rollout.Policies{})
 	rollout.SetCanaryStatusFor(&isvc.Status, v1beta1.EngineComponent, &v1beta1.CanaryStatus{
 		TargetID:              activeCanaryTargetID(isvc, g),
 		CanaryRevisionHash:    "new",

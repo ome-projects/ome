@@ -19,13 +19,14 @@ import (
 // leaves a Failed row that says nothing; no other stamp here touches an
 // evidence field.
 
-// StampFailed stamps Phase=Failed AND clears the in-flight
-// Operation in one write: the abandon-analogue for single-pod and
-// create attempts. Failed-with-no-Operation hands control back to
-// operation-specific recovery on a later reconcile, and clearing the
-// Operation is what stops the current attempt's stamper from extending
-// it. termination, when non-nil, is recorded on LastFailure in the same
-// write.
+// StampFailed stamps Phase=Failed AND clears whatever Operation the row
+// carries in one write, for a failure decided on the row itself rather
+// than on an attempt the pass observed: a rejected write of this pass, a
+// crash the retry ladder parks. Failed-with-no-Operation hands control
+// back to operation-specific recovery on a later reconcile, and clearing
+// the Operation is what stops the current attempt's stamper from
+// extending it. termination, when non-nil, is recorded on LastFailure in
+// the same write.
 //
 // A fresh-empty slot (Phase=="") from the writer's append path is a
 // sentinel for a slot deleted out from under us — don't resurrect.
@@ -45,6 +46,87 @@ func StampFailed(ctx context.Context, input types.ReconcileInput, idx int32, ter
 		}
 		return true
 	})
+}
+
+// StampFailedEndingAttempt is the disposition's clearing stamp: Phase=Failed
+// with the Operation cleared and termination recorded, landing only while
+// the fresh row still carries the attempt the pass observed (attemptOnRow).
+// It reports whether the row changed.
+func StampFailedEndingAttempt(ctx context.Context, input types.ReconcileInput, idx int32, attempt types.InstanceOperation, termination *types.InstanceTermination) (bool, error) {
+	return ApplyStamp(ctx, input, idx, func(s *types.InstanceStatus) bool {
+		if !attemptOnRow(s, attempt) {
+			return false
+		}
+		s.Phase = types.InstancePhaseFailed
+		s.Operation = nil
+		if termination != nil {
+			captured := *termination
+			s.LastFailure = &captured
+		}
+		return true
+	})
+}
+
+// StampRejected records a permanent apiserver rejection as the row's
+// failure: Phase=Failed, the operation cleared unless keepOperation, and
+// LastFailure the rejection, naming the pod the refused write was for
+// when it made one. A row already Failed on this same rejection of the
+// same pod is left as it is, so a repeated disposition writes nothing.
+func StampRejected(ctx context.Context, input types.ReconcileInput, idx int32, termination *types.InstanceTermination, keepOperation bool) (bool, error) {
+	return ApplyStamp(ctx, input, idx, func(s *types.InstanceStatus) bool {
+		if s.Phase == "" {
+			return false
+		}
+		same := s.LastFailure != nil && s.LastFailure.PodName == termination.PodName &&
+			s.LastFailure.Reason == termination.Reason && s.LastFailure.Message == termination.Message
+		if s.Phase == types.InstancePhaseFailed && same && (keepOperation || s.Operation == nil) {
+			return false
+		}
+		s.Phase = types.InstancePhaseFailed
+		if !keepOperation {
+			s.Operation = nil
+		}
+		captured := *termination
+		s.LastFailure = &captured
+		return true
+	})
+}
+
+// AttemptStanding is how the fresh row relates to an attempt a pass
+// observed: still carrying it, re-opened under another attempt, or
+// concluded with no attempt left (an appended slot reads as concluded).
+type AttemptStanding int
+
+const (
+	AttemptOnRow AttemptStanding = iota
+	AttemptReopened
+	AttemptConcluded
+)
+
+// AttemptStandingOnFreshRow reads the row through the single-row seam, as
+// a write landing now would find it, and reports the attempt's standing
+// on it; nothing is written.
+func AttemptStandingOnFreshRow(ctx context.Context, input types.ReconcileInput, idx int32, attempt types.InstanceOperation) (AttemptStanding, error) {
+	standing := AttemptConcluded
+	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		switch {
+		case attemptOnRow(s, attempt):
+			standing = AttemptOnRow
+		case s.Phase != "" && s.Operation != nil:
+			standing = AttemptReopened
+		}
+		return false
+	})
+	return standing, err
+}
+
+// attemptOnRow reports whether the fresh row still carries the attempt a
+// pass observed and decided on. A row with no operation, or with another
+// attempt (SameAttempt), concluded or was re-opened since the observation
+// and is not that decision's to end; an appended slot (Phase=="") is a
+// deleted row and is never resurrected.
+func attemptOnRow(s *types.InstanceStatus, attempt types.InstanceOperation) bool {
+	return s.Phase != "" && s.Operation != nil && SameAttempt(*s.Operation, attempt)
 }
 
 // StampFailedKeepingOperation is the deadline backstop's stamp: Phase=Failed
@@ -105,6 +187,94 @@ func StampFailedOnStuckPod(termination *types.InstanceTermination, blamedIncarna
 			captured := *termination
 			s.LastFailure = &captured
 		}
+		return true
+	}
+}
+
+// StampFailedParkingAttempt is the disposition's stamp for an attempt
+// whose pod set is still alive: Phase=Failed for the set that is down
+// now, with the Update operation kept on the parked step — waiting
+// names the wait the next attempt stands behind and the deadline is
+// parked, since the clock that ended the attempt must not end it again.
+// termination is recorded on LastFailure in the same write.
+//
+// attempt is the operation the disposition observed. The park lands only
+// while the fresh row still carries that Update attempt (attemptOnRow): a
+// row carrying another attempt, or none, has nothing to park. An already
+// parked Failed row is a no-op. It reports whether the row changed.
+func StampFailedParkingAttempt(ctx context.Context, input types.ReconcileInput, idx int32, attempt types.InstanceOperation, termination *types.InstanceTermination, waiting string) (bool, error) {
+	return ApplyStamp(ctx, input, idx, func(s *types.InstanceStatus) bool {
+		if !attemptOnRow(s, attempt) || s.Operation.Type != types.InstanceOperationUpdate {
+			return false
+		}
+		if s.Phase == types.InstancePhaseFailed && types.OperationParked(s.Operation) {
+			return false
+		}
+		s.Phase = types.InstancePhaseFailed
+		op := *s.Operation
+		op.Step = types.UpdateStepParked
+		op.Waiting = waiting
+		op.Deadline = metav1.Time{}
+		s.Operation = &op
+		if termination != nil {
+			captured := *termination
+			s.LastFailure = &captured
+		}
+		return true
+	})
+}
+
+// SameAttempt reports whether two operations are the same attempt: the
+// same ID, or the same start when neither carries one.
+func SameAttempt(a, b types.InstanceOperation) bool {
+	if a.ID != "" || b.ID != "" {
+		return a.ID == b.ID
+	}
+	return a.StartedAt.Equal(&b.StartedAt)
+}
+
+// FollowParkedAttempt gives a parked attempt the phase its pod set earns:
+// Updating while the full set serves, Failed otherwise. waiting, when
+// non-empty, replaces the wait the row names. A row whose operation is
+// not a parked attempt has moved on and is left alone.
+func FollowParkedAttempt(serving bool, waiting string) func(*types.InstanceStatus) bool {
+	return func(s *types.InstanceStatus) bool {
+		if !types.OperationParked(s.Operation) {
+			return false
+		}
+		if s.Phase != types.InstancePhaseFailed && s.Phase != types.InstancePhaseUpdating {
+			return false
+		}
+		phase := types.InstancePhaseFailed
+		if serving {
+			phase = types.InstancePhaseUpdating
+		}
+		changed := false
+		if s.Phase != phase {
+			s.Phase = phase
+			changed = true
+		}
+		if waiting != "" && s.Operation.Waiting != waiting {
+			op := *s.Operation
+			op.Waiting = waiting
+			s.Operation = &op
+			changed = true
+		}
+		return changed
+	}
+}
+
+// ParkedAttemptWaits names waiting as the wait a parked attempt stands
+// behind, and touches nothing else. A row whose operation is not a parked
+// attempt is left alone, as is one already naming it.
+func ParkedAttemptWaits(waiting string) func(*types.InstanceStatus) bool {
+	return func(s *types.InstanceStatus) bool {
+		if !types.OperationParked(s.Operation) || !types.ParkedWaitingReason(waiting) || s.Operation.Waiting == waiting {
+			return false
+		}
+		op := *s.Operation
+		op.Waiting = waiting
+		s.Operation = &op
 		return true
 	}
 }
@@ -200,19 +370,22 @@ func StampDeadline(ctx context.Context, input types.ReconcileInput, idx int32, d
 // re-resolved on every pass, so a roll can change mechanism mid-flight
 // without the attempt ending — and an attempt that restarted its clock
 // on each of those turns would never be bounded by InstanceReadyTimeout
-// at all.
+// at all. An attempt parked after its disposition is nobody's and not in
+// flight: a new attempt opens over it with its own identity and deadline.
 func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx int32, targetRev string, strategy types.UpdateStrategyType, timeout time.Duration) error {
 	now := metav1.NewTime(input.Now())
+	var openSince *metav1.Time
 	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
-		if s.Phase == types.InstancePhaseUpdating &&
-			s.Operation != nil && s.Operation.Type == types.InstanceOperationUpdate &&
-			s.Operation.Step == types.UpdateStepInPlace &&
-			s.TargetRevision == targetRev {
+		openSince = nil
+		inFlight := types.Owner(s) == types.OwnerUpdate && s.Operation.Type == types.InstanceOperationUpdate
+		if inFlight && s.Operation.Step == types.UpdateStepInPlace && s.TargetRevision == targetRev {
+			started := s.Operation.StartedAt
+			openSince = &started
 			return false
 		}
-		if s.Phase == types.InstancePhaseUpdating &&
-			s.Operation != nil && s.Operation.Type == types.InstanceOperationUpdate &&
-			s.Operation.TargetRevision == targetRev && s.TargetRevision == targetRev {
+		if inFlight && s.Operation.TargetRevision == targetRev && s.TargetRevision == targetRev {
+			started := s.Operation.StartedAt
+			openSince = &started
 			op := *s.Operation
 			op.Step = types.UpdateStepInPlace
 			op.LastProgressAt = now
@@ -236,7 +409,7 @@ func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx i
 	if err != nil {
 		return err
 	}
-	return RetryBlockAttemptStarted(ctx, input, targetRev)
+	return entryStampAttemptStarted(ctx, input, targetRev, openSince)
 }
 
 // StampRecreating is the recreate entry point: bumps Incarnation (like
@@ -245,15 +418,21 @@ func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx i
 // a revision-roll recreate is distinguishable in status from a
 // pod-failure Restart. Returns the post-write Incarnation. The
 // skip-write guard requires Step==Drain so a prior in-place pass at the
-// same target does not block the bump.
+// same target does not block the bump; an attempt parked after its
+// disposition sits on its own step, so a new attempt opens over it and
+// the bump makes the parked set the one it drains.
 func StampRecreating(ctx context.Context, input types.ReconcileInput, idx int32, targetRev, reason string, strategy types.UpdateStrategyType, timeout time.Duration) (int64, error) {
 	var observedIncarnation int64
+	var openSince *metav1.Time
 	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		openSince = nil
 		if s.Phase == types.InstancePhaseUpdating &&
 			s.Operation != nil && s.Operation.Type == types.InstanceOperationUpdate &&
 			s.Operation.Step == types.UpdateStepDrain &&
 			s.TargetRevision == targetRev && s.Incarnation > 0 {
 			observedIncarnation = s.Incarnation
+			started := s.Operation.StartedAt
+			openSince = &started
 			return false
 		}
 		if s.Incarnation == 0 {
@@ -280,7 +459,7 @@ func StampRecreating(ctx context.Context, input types.ReconcileInput, idx int32,
 	if err != nil {
 		return observedIncarnation, err
 	}
-	return observedIncarnation, RetryBlockAttemptStarted(ctx, input, targetRev)
+	return observedIncarnation, entryStampAttemptStarted(ctx, input, targetRev, openSince)
 }
 
 // StampRestarting idempotently stamps Phase=Restarting + Restart/Drain
@@ -414,7 +593,9 @@ func StampRecreateFromInPlace(ctx context.Context, input types.ReconcileInput, i
 // but a different Step namespace).
 func StampSurging(ctx context.Context, input types.ReconcileInput, idx int32, targetRev string, strategy types.UpdateStrategyType, timeout time.Duration) error {
 	now := metav1.NewTime(input.Now())
+	var openSince *metav1.Time
 	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		openSince = nil
 		// Already surging toward this target — no-op, whether the row is
 		// still Updating or the escalator has since failed it. A Failed
 		// row is not resurrected toward the same target; only a new
@@ -423,6 +604,8 @@ func StampSurging(ctx context.Context, input types.ReconcileInput, idx int32, ta
 			SurgeUpdateStep(s.Operation.Step) &&
 			s.TargetRevision == targetRev &&
 			(s.Phase == types.InstancePhaseUpdating || s.Phase == types.InstancePhaseFailed) {
+			started := s.Operation.StartedAt
+			openSince = &started
 			return false
 		}
 		s.Phase = types.InstancePhaseUpdating
@@ -442,7 +625,7 @@ func StampSurging(ctx context.Context, input types.ReconcileInput, idx int32, ta
 	if err != nil {
 		return err
 	}
-	return RetryBlockAttemptStarted(ctx, input, targetRev)
+	return entryStampAttemptStarted(ctx, input, targetRev, openSince)
 }
 
 // StampSurgeDrainStep moves the surge operation from Step=Surge to
@@ -498,6 +681,47 @@ func ReadyOnRevisionMutation(idx int32, rev string, now time.Time) types.Instanc
 		s.Operation = nil
 		return true
 	}}
+}
+
+// AbandonedSurgeSourceMutation resets the source of an abandoned gang
+// surge: Ready on the revision it runs, or the fresh-start Failed shape
+// when it never ran one, since Ready with no revision would count a gang
+// that never served as capacity. LastFailure is kept either way.
+func AbandonedSurgeSourceMutation(idx int32, rev string, now time.Time) types.InstanceMutation {
+	if rev != "" {
+		return ReadyOnRevisionMutation(idx, rev, now)
+	}
+	return types.InstanceMutation{Index: idx, Mutate: func(s *types.InstanceStatus) bool {
+		if s.Phase == "" || AbandonedSurgeSourceSettled(s, rev) {
+			return false
+		}
+		s.Phase = types.InstancePhaseFailed
+		s.TargetRevision = ""
+		s.Operation = nil
+		return true
+	}}
+}
+
+// AbandonedSurgeSourceSettled reports whether the row already reads as
+// the reset of an abandoned surge's source leaves it for rev.
+func AbandonedSurgeSourceSettled(s *types.InstanceStatus, rev string) bool {
+	if s == nil || s.Operation != nil || s.TargetRevision != "" {
+		return false
+	}
+	if rev == "" {
+		return s.Phase == types.InstancePhaseFailed
+	}
+	return s.Phase == types.InstancePhaseReady && s.RunningRevision == rev
+}
+
+// StampAbandonedSurgeSource writes AbandonedSurgeSourceMutation through
+// the single-row seam and prunes rev's RetryBlock when there is one.
+func StampAbandonedSurgeSource(ctx context.Context, input types.ReconcileInput, idx int32, rev string) error {
+	mutation := AbandonedSurgeSourceMutation(idx, rev, input.Now())
+	if err := input.MutateInstance(ctx, mutation.Index, mutation.Mutate); err != nil {
+		return err
+	}
+	return RetryBlockPruneOnPromote(ctx, input, rev)
 }
 
 // StampReadyAtOrdinal is the surge-promote terminator: clears
@@ -634,6 +858,33 @@ func RetryBlockStartAttempt(rb *types.RetryBlock) types.RetryBlockDisposition {
 	}
 	rb.State = types.RetryBlockRetryInProgress
 	return types.RetryBlockPersist
+}
+
+// entryStampAttemptStarted is the RetryBlock half of an update entry
+// stamp, which runs again on every pass of its attempt. openSince is nil
+// on the pass that opened the attempt, and otherwise the time it opened.
+// An attempt open since before the block was due belongs to the wave the
+// block already counts and starts nothing on the ladder; one opened once
+// it was due is the attempt the ladder admitted, so a later pass lands
+// the flip an earlier one did not.
+func entryStampAttemptStarted(ctx context.Context, input types.ReconcileInput, targetRev string, openSince *metav1.Time) error {
+	if openSince == nil {
+		return RetryBlockAttemptStarted(ctx, input, targetRev)
+	}
+	if input.MutateRetryBlock == nil {
+		return nil
+	}
+	since := *openSince
+	err := input.MutateRetryBlock(ctx, targetRev, func(rb *types.RetryBlock) types.RetryBlockDisposition {
+		if rb.NextRetryAt != nil && since.Before(rb.NextRetryAt) {
+			return types.RetryBlockUnchanged
+		}
+		return RetryBlockStartAttempt(rb)
+	})
+	if err != nil {
+		return fmt.Errorf("mark retry in progress (rev=%s): %w", targetRev, err)
+	}
+	return nil
 }
 
 // RowRemembersCrashOn reports whether a row Ready on rev records a

@@ -157,11 +157,11 @@ func TestGroupCanaryStatusForFollowsTheGroupPrimary(t *testing.T) {
 	want := &v1beta1.CanaryStatus{CanaryRevisionHash: "new", CurrentStep: 1}
 	SetCanaryStatusFor(&isvc.Status, v1beta1.RouterComponent, want)
 	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
-		if got := GroupCanaryStatusFor(isvc, c); got != want {
+		if got := GroupCanaryStatusFor(isvc, Policies{}, c); got != want {
 			t.Errorf("%s: GroupCanaryStatusFor = %+v, want the router's state", c, got)
 		}
 	}
-	if got := GroupCanaryStatusFor(&v1beta1.InferenceService{}, v1beta1.EngineComponent); got != nil {
+	if got := GroupCanaryStatusFor(&v1beta1.InferenceService{}, Policies{}, v1beta1.EngineComponent); got != nil {
 		t.Errorf("no canary group: got %+v, want nil", got)
 	}
 }

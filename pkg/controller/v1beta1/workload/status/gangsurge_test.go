@@ -407,3 +407,38 @@ func TestResetGangSurgeSourceAndRemoveMarker_CommitsBothOrNeither(t *testing.T) 
 		t.Fatalf("source = %+v, want Ready on its running revision", got)
 	}
 }
+
+// A source that never ran a revision has nothing to be Ready on: the
+// reset leaves it in the fresh-start Failed shape with its failure record
+// kept, and removes the marker in the same write. The write's own
+// postcondition must accept that shape, or the adapter refuses it.
+func TestResetGangSurgeSourceAndRemoveMarker_NeverPromotedSourceEndsFailed(t *testing.T) {
+	const targetRevision = "abandon-engine-newrev"
+	surgeIndex := int32(2)
+	source := gangSurgeRecoverySource(surgeIndex, targetRevision)
+	source.RunningRevision = ""
+	source.LastFailure = &types.InstanceTermination{Reason: types.PodGroupOwnershipConflictReason}
+	marker := gangSurgeActiveTarget(surgeIndex, targetRevision)
+	marker.Operation.Step = types.UpdateStepGangSurgeTargetCleanup
+	deps := types.Deps{Expectations: types.NewExpectations()}
+	store := &terminalMutationStore{ownerUID: "owner-a", statuses: map[int32]types.InstanceStatus{
+		source.Index: cloneTerminalStatus(source), marker.Index: cloneTerminalStatus(marker),
+	}}
+	input := gangSurgeRecoveryInput("owner-a", "abandon", "test-ns", store, cloneTerminalStatus(source), cloneTerminalStatus(marker))
+	input.FinalizeInstanceResources = func(context.Context, int32) (bool, error) { return true, nil }
+
+	reset, err := ResetGangSurgeSourceAndRemoveMarker(context.Background(), deps, input, &source, &marker, surgeIndex, "", "", "", types.CauseUnattributed)
+	if err != nil || !reset || store.writes != 1 {
+		t.Fatalf("reset: reset=%v writes=%d err=%v", reset, store.writes, err)
+	}
+	if _, present := store.statuses[marker.Index]; present {
+		t.Fatal("the marker must be removed in the same write")
+	}
+	got := store.statuses[source.Index]
+	if got.Phase != types.InstancePhaseFailed || got.Operation != nil || got.RunningRevision != "" || got.TargetRevision != "" {
+		t.Fatalf("source = %+v, want the fresh-start Failed shape", got)
+	}
+	if got.LastFailure == nil || got.LastFailure.Reason != types.PodGroupOwnershipConflictReason {
+		t.Fatalf("LastFailure = %+v, want kept", got.LastFailure)
+	}
+}

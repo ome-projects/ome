@@ -189,7 +189,7 @@ type WorkloadAggregateStatus struct {
 // user's update strategy. Adapters compute it once per reconcile from
 // IR spec.pacing.
 //
-// Only Partition is read by the engine (escalation.EffectivePartition:
+// Only Partition is read by the engine (ops.EffectivePartition:
 // it takes precedence over the user's RollingUpdate.Partition).
 // MaxUnavailable has no producer and is not read — the per-Component
 // budget comes from RollingUpdate.MaxUnavailable and the group ceiling

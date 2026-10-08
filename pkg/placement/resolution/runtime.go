@@ -21,9 +21,12 @@ import (
 
 // Resolver uses a direct client for the identified member. OperatorNamespace
 // locates that member's configuration and runtime revisions; it has no fallback.
+// ComponentUnits is the replica count of each component in one measured
+// capacity unit; nil measures one replica of every declared component.
 type Resolver struct {
 	Client            client.Client
 	OperatorNamespace string
+	ComponentUnits    map[v1beta1.ComponentType]int64
 }
 
 // Runtime records selection and merged specs before deployment defaults or

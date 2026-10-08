@@ -3,6 +3,7 @@ package placement
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -20,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/placement/allocation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 )
@@ -76,11 +78,20 @@ func TestObservePlannedHome(t *testing.T) {
 		Ready, Admitted   int32
 	}
 	steady := result{Home: allocation.Home{Known: true, Applied: true, Occupied: 1, Ready: 1}, PauseAcknowledged: true, Applied: "plan-a", Ready: 1, Admitted: 1}
+	componentReads := func(obj client.Object) bool { _, ok := obj.(*v1beta1.InferenceReplica); return ok }
+	memberReads := func(obj client.Object) bool { _, ok := obj.(*v1beta1.InferenceService); return ok }
+	surgePod := func(f *plannedObservationFixture) *corev1.Pod {
+		pod := f.resources.pods[0].DeepCopy()
+		pod.Name, pod.UID = "engine-0-b", "pod-b"
+		pod.Labels[query.LabelPodOrdinal], pod.Labels[query.LabelRevisionHash] = "1", "b"
+		return pod
+	}
 	for _, tt := range []struct {
 		name    string
 		edit    func(*plannedObservationFixture)
 		want    result
 		wantErr bool
+		errText string
 	}{
 		{name: "observed component acknowledges pause", want: steady},
 		{name: "complete contracted policy acknowledges pause", edit: func(f *plannedObservationFixture) { f.attachContract(t) }, want: steady},
@@ -143,6 +154,27 @@ func TestObservePlannedHome(t *testing.T) {
 			f.extraObjects = []client.Object{ir, pod}
 			f.components = append(f.components, v1beta1.DecoderComponent)
 		}, want: result{Home: allocation.Home{Known: true, Applied: true, Occupied: 2, Ready: 1}, PauseAcknowledged: true, Applied: "plan-a", Ready: 1, Admitted: 1}},
+		{name: "ratio floors count whole primary units", edit: func(f *plannedObservationFixture) {
+			f.source.Status.Placement.Plan.Mode = v1beta1.PlacementModeAll
+			home := &v1beta1.PlacementHomePolicy{InputDigest: "intent", ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.DecoderComponent, Replicas: 2}, {Component: v1beta1.EngineComponent, Replicas: 1}}}
+			a := f.source.Status.Placement.Candidates[0].Allocation
+			a.CurrentHome, a.DesiredHome = home, home.DeepCopy()
+			policy := executionPolicy(f.source, a)
+			raw, err := protocol.Encode(policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.member.Annotations[constants.PlacementExecution] = raw
+			f.resources.ir.Spec.PlacementExecution = policy.DeepCopy()
+			f.extraObjects = f.decoderTwin(policy, 2)
+			f.components = append(f.components, v1beta1.DecoderComponent)
+		}, want: steady},
+		{name: "split decoder is held to its apportioned floor", edit: func(f *plannedObservationFixture) {
+			// Two fleet engines carry six decoders, so this one-engine home owes three.
+			f.source.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(6)}}
+			f.extraObjects = f.decoderTwin(f.resources.ir.Spec.PlacementExecution, 2)
+			f.components = append(f.components, v1beta1.DecoderComponent)
+		}, want: result{Home: allocation.Home{Known: true, Occupied: 1}}},
 		{name: "columnar component acknowledges pause", edit: func(f *plannedObservationFixture) {
 			f.resources.ir = columnarTwin(t, f.resources.ir)
 			f.decodeBound = 1
@@ -173,11 +205,25 @@ func TestObservePlannedHome(t *testing.T) {
 			f.member.Finalizers = []string{"example.com/cleanup"}
 		}, want: result{Home: allocation.Home{Known: true, Occupied: 1}}},
 		{name: "ongoing surge preserves serving observation", edit: func(f *plannedObservationFixture) { f.resources.addSurge() }, want: result{Home: allocation.Home{Known: true, Applied: true, Occupied: 1}, Reserved: 1, PauseAcknowledged: true, Applied: "plan-a", Ready: 1, Admitted: 1}},
-		{name: "ordinary local collision stays unverified", edit: func(f *plannedObservationFixture) { f.member.Annotations, f.member.Labels = nil, nil }, wantErr: true},
-		{name: "orphan pod blocks absence proof", edit: func(f *plannedObservationFixture) { f.resources.ir, f.member = nil, nil }, wantErr: true},
-		{name: "orphan component needs source provenance", edit: func(f *plannedObservationFixture) { f.member = nil; f.resources.ir.Spec.PlacementExecution = nil }, wantErr: true},
-		{name: "component from another member is unknown", edit: func(f *plannedObservationFixture) { f.resources.ir.OwnerReferences[0].UID = "replaced-member" }, wantErr: true},
-		{name: "unsupported component is unknown", edit: func(f *plannedObservationFixture) { f.resources.ir.Spec.Component = "unsupported" }, wantErr: true},
+		{name: "ordinary local collision stays unverified", edit: func(f *plannedObservationFixture) { f.member.Annotations, f.member.Labels = nil, nil }, wantErr: true, errText: "member service ownership is unverified"},
+		{name: "orphan pod blocks absence proof", edit: func(f *plannedObservationFixture) { f.resources.ir, f.member = nil, nil }, wantErr: true, errText: "member pods remain without identified live components"},
+		{name: "pod of an unlisted component blocks observation", edit: func(f *plannedObservationFixture) {
+			pod := f.resources.pods[0].DeepCopy()
+			pod.Name, pod.UID, pod.OwnerReferences[0].UID = "engine-1", "pod-unlisted", "unlisted-component"
+			f.extraObjects = []client.Object{pod}
+		}, wantErr: true, errText: "member pods remain without identified live components"},
+		{name: "orphan component needs source provenance", edit: func(f *plannedObservationFixture) { f.member = nil; f.resources.ir.Spec.PlacementExecution = nil }, wantErr: true, errText: "has unverified source identity"},
+		{name: "orphan component from another cluster is unknown", edit: func(f *plannedObservationFixture) {
+			f.member = nil
+			f.resources.ir.Spec.PlacementExecution.ClusterUID = "other-cluster-uid"
+		}, wantErr: true, errText: "has unverified source identity"},
+		{name: "component of another service is unknown", edit: func(f *plannedObservationFixture) { f.resources.ir.Spec.ParentRef.Name = "other-service" }, wantErr: true, errText: "has unverified service ownership"},
+		{name: "component from another member is unknown", edit: func(f *plannedObservationFixture) { f.resources.ir.OwnerReferences[0].UID = "replaced-member" }, wantErr: true, errText: "belongs to a different member service"},
+		{name: "rewritten component from another member stays unknown", edit: func(f *plannedObservationFixture) {
+			f.resources.ir.OwnerReferences[0].UID = "replaced-member"
+			f.intercept = busyReads(0, componentReads)
+		}, wantErr: true, errText: "belongs to a different member service"},
+		{name: "unsupported component is unknown", edit: func(f *plannedObservationFixture) { f.resources.ir.Spec.Component = "unsupported" }, wantErr: true, errText: "has an unsupported role"},
 		{name: "unresolved component set cannot grant credit", edit: func(f *plannedObservationFixture) { f.components = nil }, wantErr: true},
 		{name: "unreadable pod inventory is unknown", edit: func(f *plannedObservationFixture) {
 			f.intercept.List = func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
@@ -197,34 +243,46 @@ func TestObservePlannedHome(t *testing.T) {
 				return c.List(ctx, list, opts...)
 			}
 		}, wantErr: true},
-		{name: "racing component version is unknown", edit: func(f *plannedObservationFixture) {
-			f.source.Status.Placement.Candidates[0].ReadyReplicas = 1
-			f.intercept.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if err := c.Get(ctx, key, obj, opts...); err != nil {
-					return err
-				}
-				if _, ir := obj.(*v1beta1.InferenceReplica); ir {
-					obj.SetResourceVersion("changed")
-				}
-				return nil
-			}
-		}, wantErr: true},
-		{name: "racing member version withholds previous ready capacity", edit: func(f *plannedObservationFixture) {
-			f.source.Status.Placement.Candidates[0].ReadyReplicas = 1
+		{name: "component status rewritten after the list is observed from the fresh read", edit: func(f *plannedObservationFixture) {
+			f.resources.ir.Status.PlacementObservedGeneration = 0
 			reads := 0
 			f.intercept.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if err := c.Get(ctx, key, obj, opts...); err != nil {
 					return err
 				}
-				if _, member := obj.(*v1beta1.InferenceService); member {
+				if ir, ok := obj.(*v1beta1.InferenceReplica); ok {
 					reads++
-					if reads == 2 {
-						obj.SetResourceVersion("changed")
-					}
+					ir.Status.PlacementObservedGeneration = ir.Generation
+					ir.ResourceVersion = fmt.Sprintf("rewritten-%d", reads)
 				}
 				return nil
 			}
-		}, wantErr: true},
+		}, want: steady},
+		{name: "component rewritten between consecutive reads is observed", edit: func(f *plannedObservationFixture) {
+			f.intercept = busyReads(1, componentReads)
+		}, want: steady},
+		{name: "member rewritten during the pass is observed", edit: func(f *plannedObservationFixture) {
+			f.intercept = busyReads(0, memberReads)
+		}, want: steady},
+		{name: "pod created after the component snapshot is charged to its owner", edit: func(f *plannedObservationFixture) {
+			created := surgePod(f)
+			f.afterFirstComponentRead(func(ctx context.Context, c client.WithWatch) error { return c.Create(ctx, created) })
+		}, want: result{Home: allocation.Home{Known: true, Applied: true, Occupied: 2}, PauseAcknowledged: true, Applied: "plan-a", Ready: 1, Admitted: 1}},
+		{name: "pod gone before the list keeps the snapshot's committed count", edit: func(f *plannedObservationFixture) {
+			gone := client.ObjectKeyFromObject(&f.resources.pods[0])
+			f.afterFirstComponentRead(func(ctx context.Context, c client.WithWatch) error {
+				return c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: gone.Name, Namespace: gone.Namespace}})
+			})
+		}, want: result{Home: allocation.Home{Known: true, Applied: true, Occupied: 1}, PauseAcknowledged: true, Applied: "plan-a"}},
+		{name: "reserved pod gone before the list keeps its reservation", edit: func(f *plannedObservationFixture) {
+			f.resources.addSurge()
+			reserved := surgePod(f)
+			f.extraObjects = []client.Object{reserved}
+			gone := client.ObjectKeyFromObject(reserved)
+			f.afterFirstComponentRead(func(ctx context.Context, c client.WithWatch) error {
+				return c.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: gone.Name, Namespace: gone.Namespace}})
+			})
+		}, want: result{Home: allocation.Home{Known: true, Applied: true, Occupied: 1}, Reserved: 1, PauseAcknowledged: true, Applied: "plan-a", Ready: 1, Admitted: 1}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			fixture := observationFixture(t)
@@ -252,6 +310,9 @@ func TestObservePlannedHome(t *testing.T) {
 				t.Fatalf("observation error = %v, want error %t", err, tt.wantErr)
 			}
 			if tt.wantErr {
+				if tt.errText != "" && !strings.Contains(err.Error(), tt.errText) {
+					t.Fatalf("observation error = %q, want %q", err, tt.errText)
+				}
 				type evidence struct {
 					AllocationKnown, ObservationKnown bool
 					AppliedPlan                       string
@@ -271,6 +332,67 @@ func TestObservePlannedHome(t *testing.T) {
 			}
 		})
 	}
+}
+
+// afterFirstComponentRead applies effect to the member right after its first
+// component read, so the Pod inventory listed afterwards differs from the
+// inventory at the time of that component snapshot.
+func (f *plannedObservationFixture) afterFirstComponentRead(effect func(context.Context, client.WithWatch) error) {
+	applied := false
+	f.intercept.Get = func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+		if _, component := obj.(*v1beta1.InferenceReplica); component && !applied {
+			applied = true
+			return effect(ctx, c)
+		}
+		return nil
+	}
+}
+
+// busyReads returns every matching object with a resourceVersion that is new on
+// each read after its first `stable` reads: a member whose objects are rewritten
+// between any two reads of them.
+func busyReads(stable int, matches func(client.Object) bool) interceptor.Funcs {
+	reads := map[string]int{}
+	total := 0
+	return interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if err := c.Get(ctx, key, obj, opts...); err != nil {
+			return err
+		}
+		if !matches(obj) {
+			return nil
+		}
+		id := fmt.Sprintf("%T/%s", obj, key)
+		reads[id]++
+		total++
+		if reads[id] > stable {
+			obj.SetResourceVersion(fmt.Sprintf("busy-%d", total))
+		}
+		return nil
+	}}
+}
+
+// decoderTwin clones the engine component as a decoder with the given
+// replica count, two of which are admitted, ready and backed by live pods.
+func (f *plannedObservationFixture) decoderTwin(policy *v1beta1.PlacementExecutionPolicy, replicas int32) []client.Object {
+	ir := f.resources.ir.DeepCopy()
+	ir.UID, ir.Name, ir.Spec.Component = "decoder-uid", "service-decoder", v1beta1.DecoderComponent
+	ir.Spec.Replicas, ir.Spec.PlacementReplicaLimit = ptr.To(replicas), ptr.To(replicas)
+	ir.Spec.PlacementExecution = policy.DeepCopy()
+	ir.Status.ReadyReplicas = 2
+	second := ir.Status.InstanceStatuses[0]
+	second.Index = 1
+	ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, second)
+	out := []client.Object{ir}
+	for index := range 2 {
+		pod := f.resources.pods[0].DeepCopy()
+		pod.Name, pod.UID, pod.OwnerReferences[0].UID = fmt.Sprintf("decoder-%d", index), types.UID(fmt.Sprintf("decoder-pod-%d", index)), ir.UID
+		pod.Labels[query.LabelInstanceIdx] = strconv.Itoa(index)
+		out = append(out, pod)
+	}
+	return out
 }
 
 func (f *plannedObservationFixture) attachContract(t *testing.T) {

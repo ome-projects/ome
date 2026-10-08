@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -249,9 +250,30 @@ type Reconciler struct {
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	res, err := r.reconcile(ctx, request)
 	if apierrors.IsConflict(err) {
-		return ctrl.Result{Requeue: true}, nil
+		res, err = ctrl.Result{Requeue: true}, nil
 	}
-	return res, err
+	return normalizeRetryPriority(res, err), err
+}
+
+// retryPriority is the queue priority every re-enqueue of a placement request
+// carries. The priority queue serves higher priorities first with no aging, and
+// a request keeps the priority it entered with unless the result sets one, so a
+// source listed at startup at the informer's low priority whose first pass met a
+// transient failure would otherwise wait behind the live fleet's events for as
+// long as those keep coming.
+const retryPriority = 0
+
+// normalizeRetryPriority gives a result that re-enqueues the request (a retry
+// after a delay, an immediate requeue, or an error) the normal queue priority,
+// unless the pass chose one itself.
+func normalizeRetryPriority(res ctrl.Result, err error) ctrl.Result {
+	if res.Priority != nil {
+		return res
+	}
+	if err != nil || res.Requeue || res.RequeueAfter > 0 {
+		res.Priority = ptr.To(retryPriority)
+	}
+	return res
 }
 
 func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -468,41 +490,29 @@ func placementScaleComponents(isvc *v1beta1.InferenceService) []v1beta1.Componen
 	return cs
 }
 
-// placementAdmittedReplicas is a home's admitted replica count: the MIN
-// admitted instances across the scaled components, since a PD replica is
-// admitted only when BOTH its engine and decoder instances are (an engine-only
-// home is just the engine count). Zero when no scaled component is declared.
-func placementAdmittedReplicas(comps []v1beta1.ComponentType, statuses map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus) int32 {
-	if len(comps) == 0 {
-		return 0
-	}
-	mn := int32(math.MaxInt32)
+// placementAdmittedReplicas is a home's admitted count in primary units: each
+// scaled component covers admitted/floor of its share and the home has the
+// smallest coverage. Equal floors make this the minimum admitted count, so a
+// PD replica is admitted only when both its engine and decoder instances are;
+// an engine-only home is just the engine count. Zero without scaled components.
+func placementAdmittedReplicas(comps []v1beta1.ComponentType, statuses map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, floors map[v1beta1.ComponentType]int32) int32 {
+	counts := make(map[v1beta1.ComponentType]int32, len(comps))
 	for _, c := range comps {
-		if n := admittedReplicaCount(statuses[c]); n < mn {
-			mn = n
-		}
+		counts[c] = admittedReplicaCount(statuses[c])
 	}
-	return mn
+	return primaryUnits(comps, counts, floors)
 }
 
-// placementReadyReplicas is a home's ready replica count (the endpoint weight):
-// the MIN ReadyReplicas across the scaled components, for the same pairing
-// reason.
-func placementReadyReplicas(comps []v1beta1.ComponentType, statuses map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus) int32 {
-	if len(comps) == 0 {
-		return 0
-	}
-	mn := int32(math.MaxInt32)
+// placementReadyReplicas is a home's ready count (the endpoint weight) in
+// primary units, with the same per-component coverage as admission.
+func placementReadyReplicas(comps []v1beta1.ComponentType, statuses map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, floors map[v1beta1.ComponentType]int32) int32 {
+	counts := make(map[v1beta1.ComponentType]int32, len(comps))
 	for _, c := range comps {
-		var r int32
 		if st := statuses[c]; st != nil {
-			r = st.ReadyReplicas
-		}
-		if r < mn {
-			mn = r
+			counts[c] = st.ReadyReplicas
 		}
 	}
-	return mn
+	return primaryUnits(comps, counts, floors)
 }
 
 func (r *Reconciler) deleteDerivedOnBounded(ctx context.Context, cluster string, isvc *v1beta1.InferenceService) error {

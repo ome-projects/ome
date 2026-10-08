@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/replay"
 	types "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -13,11 +15,15 @@ import (
 // recordingSink captures the resolved writes a store reports, so a test
 // asserts on the same stream a trace renders.
 type recordingSink struct {
-	rows   []replay.RowCommit
-	blocks []replay.RetryBlockCommit
+	rows      []replay.RowCommit
+	blocks    []replay.RetryBlockCommit
+	conflicts []replay.StatusConflict
 }
 
 func (s *recordingSink) RowCommitted(c replay.RowCommit) { s.rows = append(s.rows, c) }
+func (s *recordingSink) StatusConflict(c replay.StatusConflict) {
+	s.conflicts = append(s.conflicts, c)
+}
 func (s *recordingSink) RetryBlockCommitted(c replay.RetryBlockCommit) {
 	s.blocks = append(s.blocks, c)
 }
@@ -292,5 +298,58 @@ func TestRowStoreErrorNamesTheOffendingMutation(t *testing.T) {
 	err := store.ApplyInstanceMutations(context.Background(), []types.InstanceMutation{{Index: 3}})
 	if err == nil || !strings.Contains(err.Error(), "index 3") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestConflictRetriesLikeTheAdapter pins the store's stand-in for the
+// adapter's conflict retry: a refused attempt is re-applied and commits,
+// a refusal past the retry budget hands the conflict to the engine with
+// nothing committed, and a conflict armed for a write the pass never
+// made is reported rather than forgotten.
+func TestConflictRetriesLikeTheAdapter(t *testing.T) {
+	ctx := context.Background()
+	sink := &recordingSink{}
+	store := replay.NewRowStore(nil, nil, sink)
+	store.BeginPass()
+	store.ArmConflict(1, 2)
+	if err := store.MutateInstance(ctx, 0, func(s *types.InstanceStatus) bool {
+		s.Phase = types.InstancePhasePending
+		return true
+	}); err != nil {
+		t.Fatalf("a refused write within the budget commits on retry: %v", err)
+	}
+	if len(sink.conflicts) != 2 || sink.conflicts[0] != (replay.StatusConflict{Write: 1, Attempt: 1, Attempts: retry.DefaultRetry.Steps}) ||
+		sink.conflicts[1].Attempt != 2 {
+		t.Fatalf("conflicts: %+v", sink.conflicts)
+	}
+	if rows := store.Rows(); len(rows) != 1 || rows[0].Phase != types.InstancePhasePending {
+		t.Fatalf("the retried write must commit: %+v", rows)
+	}
+	if len(sink.rows) != 1 {
+		t.Fatalf("one committed write recorded, got %d", len(sink.rows))
+	}
+
+	store.ArmConflict(2, retry.DefaultRetry.Steps)
+	err := store.MutateInstance(ctx, 0, func(s *types.InstanceStatus) bool {
+		s.Phase = types.InstancePhaseReady
+		return true
+	})
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("a refusal past the budget hands the engine the conflict: %v", err)
+	}
+	if store.Rows()[0].Phase != types.InstancePhasePending || len(sink.rows) != 1 {
+		t.Fatalf("nothing commits past the budget: rows=%+v commits=%d", store.Rows(), len(sink.rows))
+	}
+	if unfired := store.UnfiredConflicts(); len(unfired) != 0 {
+		t.Fatalf("both conflicts fired: %v", unfired)
+	}
+
+	store.BeginPass()
+	store.ArmConflict(3, 1)
+	if unfired := store.UnfiredConflicts(); len(unfired) != 1 || unfired[0] != 3 {
+		t.Fatalf("a conflict the pass never reached is reported: %v", unfired)
+	}
+	if unfired := store.UnfiredConflicts(); len(unfired) != 0 {
+		t.Fatalf("reporting forgets the armed conflicts: %v", unfired)
 	}
 }

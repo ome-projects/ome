@@ -187,11 +187,13 @@ func podHasWaitingReason(pod *corev1.Pod, reason string) bool {
 //   - no in-place patching — different pod NAMES throughout.
 //   - target stability across reconciles: once an Operation is recorded
 //     with a surge lifecycle Step and TargetRevision=X, the in-flight
-//     surge is committed to driving to X. Spec bumps mid-surge are
-//     picked up by the NEXT reconcile after this surge promotes —
-//     detectUpdateTrigger fires because RunningRevision=X != target=Y.
-//     Without pinning, the surge would silently drift the in-flight
-//     pod (still on X) to "RunningRevision=Y" in status.
+//     surge drives to X and nothing else. A spec bump at Step=Surge
+//     abandons the surge while the source still stands (the redirect
+//     below); past that step, or with the source gone, the cycle
+//     promotes onto X and the NEXT reconcile rolls toward Y because
+//     RunningRevision=X != target=Y. Without pinning, the surge would
+//     silently drift the in-flight pod (still on X) to
+//     "RunningRevision=Y" in status.
 //
 // Single-pod path (Runner.Size == 1). Multi-pod (gang) SurgeThenDrain
 // branches to gangSurgeUpdate at the top of this function.
@@ -239,20 +241,23 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		return false, err
 	}
 
-	// Uncommitted-surge redirect (level-triggered "desired wins"): the
-	// in-flight surge is committed to a target revision the desired state no
-	// longer asks for AND is not about to promote (surge pod not yet Ready).
-	// Abandon JUST the stuck surge pod — the source at oldOrdinal keeps
-	// serving, so capacity never drops — and reset the Instance to Ready on
-	// its running revision. The NEXT reconcile re-enters through the normal
-	// gated path, so maxSurge / maxUnavailable / ratio / canary all re-apply.
-	// Without this, a surge that never becomes Ready and never escalates pins
-	// itself to a dead rev and holds the maxSurge budget until
-	// instanceReadyTimeout. A surge that IS about to promote (Ready) skips
-	// this and keeps the committed-rev pin below so its promote stamps the
-	// rev its pods actually run. Only Step=Surge — later surge steps are
-	// past the point of no return (source already draining) and finish
-	// their cycle.
+	// Superseded-target redirect (level-triggered "desired wins"): the
+	// in-flight surge is committed to a target revision the desired state
+	// has withdrawn. While the source still stands the surge is
+	// abandoned whether or not its replacement is Ready: a replacement
+	// built for a withdrawn revision has nothing to promote to, and the
+	// drain its promote would need is withheld for as long as the Component
+	// is below its unavailability floor, which a roll-back after a broken
+	// Instance is by construction. Only the replacement goes — out of
+	// rotation first, then deleted — and the Instance is reset to Ready on
+	// its running revision once it is gone. The source at oldOrdinal keeps
+	// serving throughout, so capacity never drops, and the NEXT reconcile
+	// re-enters through the normal gated path, so maxSurge / maxUnavailable
+	// / ratio / canary all re-apply. Only Step=Surge — later surge steps
+	// are past the point of no return (source already draining) and finish
+	// their cycle. A Ready replacement whose source is already gone is the
+	// Instance's only pod set: it keeps its pin and promotes, and a newer
+	// target rolls from there.
 	//
 	// A strategy edit is NOT a redirect: the strategy is pinned for the life
 	// of the operation, so the surge finishes its cycle and the edit reaches
@@ -263,14 +268,22 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 	// its own grace would hold the slot that long for a pod owing no work.
 	supersededTarget := row != nil && row.Operation != nil &&
 		row.Operation.TargetRevision != "" && row.Operation.TargetRevision != target.Name
+	replacementIsAllThatStands := !anyPodStanding(oldPods) &&
+		len(surgePods) > 0 && query.AllPodsRuntimeReady(surgePods)
 	if s := row; s != nil &&
 		s.Phase != workload.InstancePhaseFailed && s.Operation != nil &&
 		s.Operation.Type == workload.InstanceOperationUpdate &&
 		s.Operation.Step == workload.UpdateStepSurge &&
-		supersededTarget &&
-		!(len(surgePods) > 0 && query.AllPodsRuntimeReady(surgePods)) {
+		supersededTarget && !replacementIsAllThatStands {
 		if len(surgePods) > 0 {
 			if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index) {
+				return false, nil
+			}
+			// A replacement in rotation leaves it a pass ahead of its
+			// deletion, like every routed pod the rollout removes.
+			if unrouted, err := unrouteServingPods(ctx, deps, inst.Index, surgePods, nil); err != nil {
+				return false, fmt.Errorf("unroute abandoned surge pod (instance=%d): %w", inst.Index, err)
+			} else if unrouted {
 				return false, nil
 			}
 			for _, pod := range surgePods {
@@ -295,13 +308,19 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		// The reset clears Operation, and the InstanceStatus the caller handed
 		// in may alias the storage MutateInstance writes through. Read the
 		// abandoned revision out before the write, not after.
-		abandonedRev := s.Operation.TargetRevision
-		if err := status.StampReadyOnRevision(ctx, input, inst.Index, s.RunningRevision); err != nil {
+		abandonedRev, runningRev := s.Operation.TargetRevision, s.RunningRevision
+		if err := status.StampReadyOnRevision(ctx, input, inst.Index, runningRev); err != nil {
 			return false, fmt.Errorf("reset abandoned surge source (instance=%d): %w", inst.Index, err)
 		}
-		workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonRecreateUpdateStarted,
-			"OMENative %s abandoned superseded surge to %s; re-surging toward %s",
-			workload.InstanceKey(input.Key.Component, inst.Index), abandonedRev, target.Name)
+		if target.Name == runningRev {
+			workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonSurgeAbandoned,
+				"OMENative %s abandoned surge to withdrawn revision %s; the Instance stays on revision %s",
+				workload.InstanceKey(input.Key.Component, inst.Index), abandonedRev, runningRev)
+		} else {
+			workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonSurgeAbandoned,
+				"OMENative %s abandoned superseded surge to %s; re-surging toward %s",
+				workload.InstanceKey(input.Key.Component, inst.Index), abandonedRev, target.Name)
+		}
 		return false, nil
 	}
 
@@ -382,12 +401,12 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		Runner:  runner,
 		Ordinal: newOrdinal,
 	}}
-	// A replacement the kubelet refused to admit never ran and never
-	// will, yet it still holds the surge name. Free it now rather than
-	// polling its readiness to the operation deadline.
-	if recycling, rerr := recycleAdmissionRejectedTargets(ctx, deps, input, inst.Index, inst.Index,
+	// A replacement in a terminal phase — crashed, exited, evicted or
+	// refused by its node — still holds the surge name and will never
+	// clear the promote bar; free it now rather than poll it to the deadline.
+	if recycling, rerr := recycleTerminalTargets(ctx, deps, input, inst.Index, inst.Index,
 		workload.InstanceOperationUpdate, surgePods, targets); rerr != nil {
-		return false, fmt.Errorf("recycle rejected surge target (instance=%d): %w", inst.Index, rerr)
+		return false, fmt.Errorf("recycle terminal surge target (instance=%d): %w", inst.Index, rerr)
 	} else if recycling {
 		return false, nil
 	}
@@ -506,13 +525,11 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		if err := status.StampSurgeDrainStep(ctx, input, inst.Index); err != nil {
 			return false, fmt.Errorf("transition surge step to drain (instance=%d): %w", inst.Index, err)
 		}
-		for _, pod := range oldPods {
-			if !podreadiness.IsServing(pod) {
-				continue
-			}
-			if err := podreadiness.MarkPodNotServing(ctx, deps.Client, deps.Reader(), pod, podreadiness.WriterUpdateSurgeDrain, surgeDrainKey(inst.Index, newOrdinal)); err != nil {
-				return false, fmt.Errorf("mark old not serving (instance=%d, pod=%s): %w", inst.Index, pod.Name, err)
-			}
+		// The flip reads the pass's pod list, which the stuck-pod sweep
+		// ran ahead of: a source it force-deleted is out of rotation
+		// already and is skipped like any pod that has gone.
+		if _, err := unroutePodsUnder(ctx, deps, oldPods, podreadiness.WriterUpdateSurgeDrain, surgeDrainKey(inst.Index, newOrdinal), nil); err != nil {
+			return false, fmt.Errorf("mark old not serving (instance=%d): %w", inst.Index, err)
 		}
 		// Live drain check via per-revision routed Service — the
 		// headless slice would lie because of PublishNotReadyAddresses.

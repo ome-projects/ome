@@ -83,7 +83,7 @@ func expectHeldAtFinalStep(t *testing.T, isvc *v1beta1.InferenceService, res *Re
 		t.Fatalf("phase %q, want %q", phaseOf(isvc), phase)
 	}
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(2)}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
 		t.Fatalf("the projected partition must keep the stable instance, got %v", fmtPartition(p))
 	}
 }
@@ -188,7 +188,7 @@ func TestDispatch_ADeletedPodStillInTheCacheIsNotCapacity(t *testing.T) {
 	isvc.Status.Rollout.ActiveRun.TargetRevisions = []v1beta1.RolloutRunTarget{
 		{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: "old"},
 	}
-	g := rollout.CanaryGroup(isvc)
+	g := rollout.CanaryGroup(isvc, rollout.Policies{})
 	start := time.Unix(1000, 0)
 	// The final step was just entered: the split served 50/50 at step 0.
 	rollout.SetCanaryStatusFor(&isvc.Status, v1beta1.EngineComponent, &v1beta1.CanaryStatus{
@@ -233,7 +233,7 @@ func TestDispatch_ADeletedPodStillInTheCacheIsNotCapacity(t *testing.T) {
 	}
 	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"old": {percent: 100}})
 	ext := &isvc.Spec.Engine.ComponentExtensionSpec
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
 		t.Fatalf("the stable instance stays held, got partition %v", fmtPartition(p))
 	}
 	if out.RequeueAfter == 0 && !out.Requeue {
@@ -379,7 +379,7 @@ func expectParkKeepsItsExits(t *testing.T, parked func(t *testing.T) (*v1beta1.I
 			t.Fatalf("the park holds at its cadence, got %+v", res)
 		}
 		ext := &v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(2)}
-		if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
+		if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
 			t.Fatalf("the park keeps the stable instance held, got %v", fmtPartition(p))
 		}
 		expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")
@@ -460,7 +460,7 @@ func TestReconcile_HeldFinalStepTimesOutIntoThePark(t *testing.T) {
 		t.Fatalf("a park is not re-evaluated, got res=%+v status=%+v", res, cs)
 	}
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(2)}
-	if p := StepPartition(isvc, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
+	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, ext); p == nil || *p != 1 {
 		t.Fatalf("the park keeps the stable instance held, got %v", fmtPartition(p))
 	}
 	expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")

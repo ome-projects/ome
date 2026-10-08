@@ -122,8 +122,10 @@ func DetectRestartTriggerWithPods(input workload.ReconcileInput, plan workload.C
 	}
 	// A pod wedged in a terminal kubelet waiting reason cannot recover on
 	// its own and no other pass owns an operation-free Ready row, so the
-	// repair starts regardless of the restart policy.
-	if reason, wedged := crashLoopRepairReason(input, s, expected, instancePods); wedged {
+	// repair starts regardless of the restart policy; a pod that runs but
+	// fails readiness is no wedge of an idle row under any policy
+	// (readCrashLoopRepair).
+	if reason, wedged := crashLoopRepairReason(input, plan, s, expected, instancePods); wedged {
 		return true, reason
 	}
 	// A crash of the promoted pod set inside its window is remembered on
@@ -211,20 +213,27 @@ func instanceLostGangMember(input workload.ReconcileInput, plan workload.Compone
 	case workload.InstancePhaseEmpty, workload.InstancePhasePending,
 		workload.InstancePhaseCreating, workload.InstancePhaseFailed,
 		workload.InstancePhaseReady:
+	case workload.InstancePhaseUpdating:
+		// A roll attempt parked after its disposition is settled in the
+		// phase its pods give it; an attempt in flight owns its set.
+		if workload.StateOf(s) != workload.StateUpdateParked {
+			return "", false
+		}
 	default:
 		return "", false
 	}
 	if isMigrateOwnedStatus(s) {
 		return "", false
 	}
-	// A preserved Update or Migrate operation keeps its own pass as owner
+	// A preserved Update or Migrate claim keeps its own pass as owner
 	// whatever the phase says. A Restart operation parked at Failed is a
 	// spent attempt, not an owner: its deadline elapsed with a member still
 	// missing, and only another Restart can rebuild the gang as a whole
 	// (incarnation bump, survivors drained), so it may re-arm. Each cycle
-	// is bounded by the attempt deadline.
-	if s.Operation != nil && s.Operation.Type != workload.InstanceOperationCreate &&
-		!(s.Operation.Type == workload.InstanceOperationRestart && s.Phase == workload.InstancePhaseFailed) {
+	// is bounded by the attempt deadline. A roll attempt parked after its
+	// disposition claims nothing and is spent the same way.
+	if claim := workload.ClaimOf(s); claim != workload.OwnerNone && claim != workload.OwnerCreate &&
+		!(claim == workload.OwnerRestart && s.Phase == workload.InstancePhaseFailed) {
 		return "", false
 	}
 	createCommitted := s.Operation != nil && s.Operation.Step == status.CreateStepCreatePods
@@ -646,24 +655,41 @@ func rebuildRevision(s *workload.InstanceStatus) string {
 // first materialization pinned to a superseded revision and materializes
 // a demoted row that has no pod left.
 //
-// Three rows are never yielded: an open Restart, which is driven on — its
+// Four rows are never yielded: an open Restart, which is driven on — its
 // rebuild follows the target itself while it has created no pod
-// (rebuildFollowsTarget); a Migrate-owned row, which its record owns; and
-// a row demoted for losing every pod that holds pods again, which no
+// (rebuildFollowsTarget); a Migrate-owned row, which its record owns; a
+// row demoted for losing every pod that holds pods again, which no
 // update trigger reads, so its repair rebuilds the revision it records and
-// the roll follows once it is Ready. A row that records no revision, or a
-// pass with no target, has nothing to compare.
+// the roll follows once it is Ready; and a row owed a crash-loop episode
+// (readCrashLoopEpisode), which is status truth about the set the row
+// holds and opens nothing, so the park follows its set through the roll
+// that waits to take it. A row that records no revision, or a pass with
+// no target, has nothing to compare.
+//
+// A row whose pods are a superseded revision's leftovers (EvaluateWreckage)
+// is yielded whatever revision it records: the update pass's wreckage
+// cleanup removes those pods, and while its deletes land one at a time the
+// half-gone set reads as a loss that is not the row's own. The row is the
+// cleanup's until they are gone and the Create pass's fresh start after,
+// both of which rebuild it at the target. A pause withholds the cleanup,
+// so under one the repair stands.
 //
 // The roll the row is left to must be one that can start (rollTargetOpen):
 // an Instance kept dark for the length of a pause or a hold is worse than
 // one rebuilt at the revision the roll is held on. The roll takes the row
 // once the pause or the hold clears.
 func RepairYieldsToTarget(input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) bool {
-	if !rollTargetOpen(input, plan, target) {
-		return false
-	}
 	s := input.ObservedState.Instance(inst.Index)
 	if s == nil || s.Phase == workload.InstancePhaseRestarting || isMigrateOwnedStatus(s) {
+		return false
+	}
+	if readCrashLoopEpisode(input, s, inst.TotalPods(), instancePods).step != crashLoopNothing {
+		return false
+	}
+	if !plan.Paused && EvaluateWreckage(s, target, instancePods) {
+		return true
+	}
+	if !rollTargetOpen(input, plan, target) {
 		return false
 	}
 	rev := rebuildRevision(s)
@@ -691,17 +717,19 @@ func rollTargetOpen(input workload.ReconcileInput, plan workload.ComponentPlan, 
 
 // rebuildFollowsTarget reports whether the rebuild of an open repair
 // renders the roll target instead of the revision its row records: no pod
-// of the rebuild exists yet and the row is off a target the roll could
-// start on. The Instance serves nothing, so the rebuild is the pass that
-// puts it on the target and no pod set is torn down for it. A rebuild
-// whose pods exist finishes on the revision they carry: replacing a
-// starting pod set is the roll's job, under its budget.
+// of the rebuild exists yet, the row is off a target the roll could start
+// on, and the canary step does not hold the Instance. The Instance serves
+// nothing, so the rebuild is the pass that puts it on the target and no pod
+// set is torn down for it; a held Instance is the step's stable side, which
+// the step machine alone promotes. A rebuild whose pods exist finishes on
+// the revision they carry: replacing a starting pod set is the roll's job,
+// under its budget.
 func rebuildFollowsTarget(input workload.ReconcileInput, plan workload.ComponentPlan, idx int32, target *appsv1.ControllerRevision, rebuiltPods []*corev1.Pod) bool {
 	if len(query.ExcludeTerminalPods(rebuiltPods)) > 0 || !rollTargetOpen(input, plan, target) {
 		return false
 	}
 	rev := rebuildRevision(input.ObservedState.Instance(idx))
-	return rev != "" && rev != target.Name
+	return rev != "" && rev != target.Name && !canaryStepHeldIndices(input, plan, target)[idx]
 }
 
 // RunnerRestartedSinceReady reports whether pod's runner container carries
@@ -788,12 +816,19 @@ func RunnerRestartedAgainSinceReady(pod *corev1.Pod, readySince *metav1.Time) bo
 // wedge with no such restart answers to the RetryBlock as a repair of a
 // never-Ready Instance does.
 
+// ladderReadsUnready reports whether the running revision's ladder reads a
+// promoted pod unready past the stuck-pod grace as the wedge of the crash it
+// counts: the set came up after a restart the policy answers and went dark.
+func ladderReadsUnready(plan workload.ComponentPlan) bool {
+	return plan.RestartPolicy == workload.RestartPolicyRecreateInstance
+}
+
 // crashLoopRepairReason reports whether this row holds a crash-loop
 // wedge the restart pass acts on: the wedge itself is
 // evidence.CrashLoopWedge, and the running revision's retry ladder says
 // whether the rebuild opens, waits, or the row parks (readCrashLoopRepair).
-func crashLoopRepairReason(input workload.ReconcileInput, s *workload.InstanceStatus, expected int32, pods []*corev1.Pod) (string, bool) {
-	r := readCrashLoopRepair(input, s, expected, pods)
+func crashLoopRepairReason(input workload.ReconcileInput, plan workload.ComponentPlan, s *workload.InstanceStatus, expected int32, pods []*corev1.Pod) (string, bool) {
+	r := readCrashLoopRepair(input, plan, s, expected, pods)
 	if !r.fires {
 		return "", false
 	}
@@ -815,7 +850,7 @@ type crashLoopRepair struct {
 }
 
 func (r crashLoopRepair) restartReason() string {
-	return fmt.Sprintf("pod %s wedged in %s past the stuck-pod grace", r.pod.Name, r.reason)
+	return evidence.WedgeReason(r.pod, r.reason)
 }
 
 // runnerCrash is the crash of a promoted pod set: a pod carrying the
@@ -1011,6 +1046,29 @@ func crashRemembered(s *workload.InstanceStatus) bool {
 	return s.LastFailure != nil && s.ReadySince != nil && s.LastFailure.Time.After(s.ReadySince.Time)
 }
 
+// crashOfPromotedSet reports whether the crash the row remembers is its
+// promoted set's: the record names a pod of that set, at the row's
+// incarnation on the running revision. A surge replacement's failure is
+// recorded on its source row as well and names the other generation's
+// pod; the source's set cannot serve its way out of that record.
+func crashOfPromotedSet(s *workload.InstanceStatus, pods []*corev1.Pod) bool {
+	if !crashRemembered(s) {
+		return false
+	}
+	running := query.RevisionFromName(s.RunningRevision)
+	for _, pod := range pods {
+		if pod == nil || pod.Name != s.LastFailure.PodName {
+			continue
+		}
+		if inc, ok := query.InstanceIncarnationFromLabels(pod); ok && inc != s.Incarnation {
+			return false
+		}
+		podRev := query.RevisionFromPod(pod)
+		return podRev.IsZero() || running.IsZero() || podRev.Same(running)
+	}
+	return false
+}
+
 // crashCountedOnBlock reports whether the ladder already counts the
 // remembered crash of this promoted set: the row's record is dated no
 // earlier than the block's first failure. The record and the block's
@@ -1036,9 +1094,12 @@ func rememberCrash(ctx context.Context, input workload.ReconcileInput, idx int32
 // crashRebuildWarranted reports whether a trigger of the restart pass
 // would rebuild the row's pod set for its crash: the pod set is wedged
 // past the stuck-pod grace, or the policy rebuilds on a runner restart.
-// A crash that warrants no rebuild is only counted.
+// A crash that warrants no rebuild is only counted. The crash is the
+// promoted set's on the revision the row runs, so its wedge is read
+// there: a roll promotes that revision ahead of the Component's current
+// one, and a pushed set rebuilds on its ladder as a current one does.
 func crashRebuildWarranted(input workload.ReconcileInput, plan workload.ComponentPlan, s *workload.InstanceStatus, expected int32, pods []*corev1.Pod) bool {
-	if pod, _, _ := evidence.CrashLoopWedgedPod(input, s, expected, pods); pod != nil {
+	if pod, _, _ := evidence.CrashLoopWedgedPodOn(input, s, expected, pods, s.RunningRevision, ladderReadsUnready(plan)); pod != nil {
 		return true
 	}
 	return plan.RestartPolicy == workload.RestartPolicyRecreateInstance && runnerRestartedSinceReady(pods, s.ReadySince)
@@ -1086,9 +1147,23 @@ type crashLoopLadder struct {
 // parked inside the grace is not a wedge yet, and the grace ending raises
 // no watch event, so the pass deposits the grace left and comes back when
 // the repair can open; a ladder whose backoff is not due deposits that
-// wait the same way.
-func readCrashLoopRepair(input workload.ReconcileInput, s *workload.InstanceStatus, expected int32, pods []*corev1.Pod) crashLoopRepair {
-	pod, reason, graceLeft := evidence.CrashLoopWedgedPod(input, s, expected, pods)
+// wait the same way. A crash the ladder counts is the promoted set's on
+// the revision the row runs, and its wedge is read there; a wedge no
+// counted crash is behind is repaired on the Component's current revision
+// alone, and an off-current one is the escalation's. A pod that runs but
+// fails readiness is read as a wedge only with the ladder (ladderReadsUnready):
+// on an idle row it is the runtime's own out-of-rotation signal, dark for
+// the budgets and the roll and rebuilt by no policy.
+func readCrashLoopRepair(input workload.ReconcileInput, plan workload.ComponentPlan, s *workload.InstanceStatus, expected int32, pods []*corev1.Pod) crashLoopRepair {
+	ladder := readCrashLadder(input, s, expected, pods)
+	var pod *corev1.Pod
+	var reason string
+	var graceLeft time.Duration
+	if ladder != nil {
+		pod, reason, graceLeft = evidence.CrashLoopWedgedPodOn(input, s, expected, pods, s.RunningRevision, ladderReadsUnready(plan))
+	} else {
+		pod, reason, graceLeft = evidence.CrashLoopWedgedPod(input, s, expected, pods, false)
+	}
 	if pod == nil {
 		if graceLeft > 0 {
 			input.PassWake.Observe(graceLeft)
@@ -1096,7 +1171,7 @@ func readCrashLoopRepair(input workload.ReconcileInput, s *workload.InstanceStat
 		return crashLoopRepair{}
 	}
 	r := crashLoopRepair{pod: pod, reason: reason}
-	if ladder := readCrashLadder(input, s, expected, pods); ladder != nil {
+	if ladder != nil {
 		r.ladder = ladder
 		r.opens = ladder.open
 		r.fires = ladder.open || ladder.record || ladder.parks || ladder.remember
@@ -1275,8 +1350,8 @@ func countCrashOnLadder(ctx context.Context, input workload.ReconcileInput, plan
 // Restart already in flight must be driven to completion, and the
 // pod-loss and lost-member triggers repair an outage rather than causing
 // one. Only a fresh open counts against the per-pass repair batch.
-func RestartOpensRepair(input workload.ReconcileInput, inst workload.InstancePlan, instancePods []*corev1.Pod) bool {
-	return readCrashLoopRepair(input, input.ObservedState.Instance(inst.Index), inst.TotalPods(), instancePods).opens
+func RestartOpensRepair(input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, instancePods []*corev1.Pod) bool {
+	return readCrashLoopRepair(input, plan, input.ObservedState.Instance(inst.Index), inst.TotalPods(), instancePods).opens
 }
 
 // RestartOpensLadderAttempt names the revision whose retry ladder admits
@@ -1292,6 +1367,30 @@ func RestartOpensLadderAttempt(input workload.ReconcileInput, plan workload.Comp
 	return ""
 }
 
+// LadderAttemptRebuilds reports whether the attempt of rev's retry
+// ladder rebuilds this row's crashed set: the row runs rev, its crash
+// counts on the ladder, a trigger of the restart pass would rebuild the
+// set, and the ladder has not held — the rebuild waits on the backoff or
+// on another attempt at rev, or the ladder admits it this pass — or the
+// row's own rebuild is the attempt under way (a Restart rendering rev
+// while rev's block is RetryInProgress). Every such rebuild is part of
+// the ladder's attempt, so the hold that names the attempt names the row.
+func LadderAttemptRebuilds(input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, rev string, instancePods []*corev1.Pod) bool {
+	s := input.ObservedState.Instance(inst.Index)
+	if s == nil || rev == "" {
+		return false
+	}
+	if s.Phase == workload.InstancePhaseRestarting {
+		block := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev)
+		return rebuildRevision(s) == rev && block != nil && block.State == workload.RetryBlockRetryInProgress
+	}
+	if s.RunningRevision != rev {
+		return false
+	}
+	l := readCrashLadder(input, s, inst.TotalPods(), instancePods)
+	return l != nil && !l.held && crashRebuildWarranted(input, plan, s, inst.TotalPods(), instancePods)
+}
+
 // RestartOpensUnavailability reports whether a restart selection for
 // inst would OPEN a fresh crash-loop repair this pass that takes serving
 // capacity offline. Only such an open is put to the per-Component
@@ -1299,8 +1398,8 @@ func RestartOpensLadderAttempt(input workload.ReconcileInput, plan workload.Comp
 // (evidence.PodSetServesNothing, the reading the update pass makes for a
 // dark row) removes no serving capacity, so its rebuild is neither
 // admitted nor charged.
-func RestartOpensUnavailability(input workload.ReconcileInput, inst workload.InstancePlan, instancePods []*corev1.Pod) bool {
-	return RestartOpensRepair(input, inst, instancePods) && !evidence.PodSetServesNothing(instancePods)
+func RestartOpensUnavailability(input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, instancePods []*corev1.Pod) bool {
+	return RestartOpensRepair(input, plan, inst, instancePods) && !evidence.PodSetServesNothing(instancePods, input.Now(), input.StuckPodGrace)
 }
 
 // A crash-loop park follows its pod set: Failed while the set is out of
@@ -1340,7 +1439,7 @@ type crashLoopEpisode struct {
 // remembers a crash of its promoted set: unpark a park whose set serves,
 // name the loop on a held serving row, clear a note that has gone stale.
 func readCrashLoopEpisode(input workload.ReconcileInput, s *workload.InstanceStatus, expected int32, pods []*corev1.Pod) crashLoopEpisode {
-	if s == nil || s.Operation != nil || s.RunningRevision == "" || !crashRemembered(s) {
+	if s == nil || s.Operation != nil || s.RunningRevision == "" || !crashOfPromotedSet(s, pods) {
 		return crashLoopEpisode{}
 	}
 	held := revisionHeld(input, s.RunningRevision)

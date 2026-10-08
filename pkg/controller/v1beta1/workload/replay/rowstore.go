@@ -2,12 +2,24 @@ package replay
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	types "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+)
+
+// The owner resource a status conflict is reported against: the
+// InferenceReplica whose status the store stands in for.
+var (
+	statusOwnerGroup    = v1beta1.SchemeGroupVersion.Group
+	statusOwnerResource = "inferencereplicas"
 )
 
 // Precondition outcomes recorded against one buffered mutation.
@@ -51,12 +63,31 @@ type RetryBlockCommit struct {
 	After          *types.RetryBlock
 }
 
-// RowSink receives every resolved write in commit order. The driver wires
+// RowSink receives every resolved write in commit order, and every
+// status write the apiserver answered with a conflict. The driver wires
 // the trace recorder; a caller with no interest in the detail may leave
 // it nil.
 type RowSink interface {
 	RowCommitted(RowCommit)
 	RetryBlockCommitted(RetryBlockCommit)
+	StatusConflict(StatusConflict)
+}
+
+// StatusConflict is one status write the apiserver answered 409: which
+// write of the pass it was, which attempt of the adapter's conflict retry
+// it refused, and how many attempts the retry allows.
+type StatusConflict struct {
+	Write    int
+	Attempt  int
+	Attempts int
+}
+
+// statusConflict is an armed 409: the write of the pass it answers and
+// how many of that write's attempts it refuses.
+type statusConflict struct {
+	write     int
+	remaining int
+	fired     bool
 }
 
 // RowStore is the in-memory owner status the engine writes rows through.
@@ -72,6 +103,10 @@ type RowStore struct {
 	rows            []types.InstanceStatus
 	retryBlocks     []types.RetryBlock
 	sink            RowSink
+	// writes counts the status writes of the pass, which is how an armed
+	// conflict names the write it answers.
+	writes    int
+	conflicts []*statusConflict
 }
 
 // NewRowStore seeds a store from the rows an owner already persists.
@@ -103,6 +138,45 @@ func (s *RowStore) RetryBlocks() []types.RetryBlock {
 	return append([]types.RetryBlock(nil), s.retryBlocks...)
 }
 
+// BeginPass resets the status-write count a conflict is armed against.
+func (s *RowStore) BeginPass() {
+	s.writes = 0
+}
+
+// ArmConflict makes the apiserver answer the write-th status write of the
+// pass with a conflict, count attempts in a row. The adapter's retry
+// re-reads and re-applies after each; past its budget the write fails.
+func (s *RowStore) ArmConflict(write, count int) {
+	s.conflicts = append(s.conflicts, &statusConflict{write: write, remaining: count})
+}
+
+// UnfiredConflicts reports the writes armed this pass that no status
+// write reached, and forgets every armed conflict: a conflict is the
+// scenario's claim about one pass, and one that fired on nothing is a
+// claim the pass did not bear out.
+func (s *RowStore) UnfiredConflicts() []int {
+	var unfired []int
+	for _, c := range s.conflicts {
+		if !c.fired {
+			unfired = append(unfired, c.write)
+		}
+	}
+	s.conflicts = nil
+	return unfired
+}
+
+// conflictFor consumes one refusal armed for the write-th write, if any.
+func (s *RowStore) conflictFor(write int) bool {
+	for _, c := range s.conflicts {
+		if c.write == write && c.remaining > 0 {
+			c.remaining--
+			c.fired = true
+			return true
+		}
+	}
+	return false
+}
+
 // Install wires the store onto every status seam of a ReconcileInput.
 func (s *RowStore) Install(input *types.ReconcileInput) {
 	input.MutateInstance = s.MutateInstance
@@ -132,6 +206,15 @@ func (s *RowStore) RemoveInstance(_ context.Context, idx int32) (bool, error) {
 	return true, nil
 }
 
+// Purge is the owner object leaving the apiserver: every row and retry
+// block goes with it, outside any mutation batch, and the removed rows
+// are returned for the record.
+func (s *RowStore) Purge() []types.InstanceStatus {
+	removed := s.rows
+	s.rows, s.retryBlocks = nil, nil
+	return removed
+}
+
 // ApplyInstanceMutations commits a batch with no retry-block write.
 func (s *RowStore) ApplyInstanceMutations(ctx context.Context, muts []types.InstanceMutation) error {
 	return s.ApplyInstanceMutationsWithRetryBlock(ctx, muts, "", nil)
@@ -157,6 +240,29 @@ func (s *RowStore) ApplyInstanceMutationsWithRetryBlock(
 	if len(muts) == 0 && mutateRetryBlock == nil {
 		return nil
 	}
+	// The adapter persists under retry.RetryOnConflict: a refused attempt
+	// re-reads the owner and re-applies the whole batch, and the budget
+	// exhausted hands the conflict to the engine with nothing committed.
+	s.writes++
+	attempts := retry.DefaultRetry.Steps
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if !s.conflictFor(s.writes) {
+			return s.applyBatch(muts, targetRevision, mutateRetryBlock)
+		}
+		if s.sink != nil {
+			s.sink.StatusConflict(StatusConflict{Write: s.writes, Attempt: attempt, Attempts: attempts})
+		}
+	}
+	return apierrors.NewConflict(schema.GroupResource{Group: statusOwnerGroup, Resource: statusOwnerResource}, string(s.ownerUID),
+		errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+}
+
+// applyBatch is one attempt at the batch against a fresh snapshot.
+func (s *RowStore) applyBatch(
+	muts []types.InstanceMutation,
+	targetRevision string,
+	mutateRetryBlock func(*types.RetryBlock) types.RetryBlockDisposition,
+) error {
 	snapshot := types.InstanceMutationSnapshot{
 		OwnerUID:        s.ownerUID,
 		OwnerGeneration: s.ownerGeneration,

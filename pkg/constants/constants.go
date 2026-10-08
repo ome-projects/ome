@@ -492,6 +492,7 @@ var (
 		// managed pods/Services. (The revision layer also strips them from
 		// the pod-template hash so toggling one never mints a revision.)
 		RolloutPromoteAnnotation,
+		RolloutPromoteForceAnnotation,
 		RolloutRollbackAnnotation,
 	}
 

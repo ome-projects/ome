@@ -30,6 +30,18 @@ func ignoreRollback(in ReconcileInputs, take func(string)) {
 	take(constants.RolloutRollbackAnnotation)
 }
 
+// ignoreForce consumes a forced promote the unit's state gives nothing to
+// act on, and says why: left in place it would act on the first step the
+// ladder meets later, which is not the step the operator forced.
+func ignoreForce(in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(string), why string) {
+	if cs == nil || !forceRequested(in.ISVC, cs) {
+		return
+	}
+	emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonCanaryForceIgnored,
+		"forced promote of %s revision %s ignored: %s; the request is removed", in.Component, cs.CanaryRevisionHash, why)
+	take(constants.RolloutPromoteForceAnnotation)
+}
+
 // refuseRollback hands back a rollback request against a unit parked because
 // its stable revision is not retained, and says so. The request is spent:
 // the rejected hash it recorded keeps a copy still visible after the flush
@@ -144,11 +156,18 @@ func applyHolds(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanaryStatu
 				}
 				resetCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, in.CanaryRevisionHash, in.Now)
 			} else if !parkedWithoutStable(cs) {
+				why := "the canary is rolling back"
+				if in.ISVC.Status.Components[in.Component].RolloutPhase == v1beta1.RolloutPhaseRolledBack {
+					why = "the canary is held rolled back"
+				}
+				ignoreForce(in, cs, take, why)
 				return cs, reconcileRollback(in, cs), nil
 			}
 		} else if isRollbackRequested(in.ISVC) && int(cs.CurrentStep) < steps {
 			// A rollback is the operator's decision about the canary, parked
-			// or not: it ends a Failed park and drains the rejected revision.
+			// or not: it ends a Failed park and drains the rejected revision,
+			// toward an empty stable revision too, which is said out loud.
+			warnEmptyRollbackTargets(in, cs)
 			cs.RolledBackRevisionHash = cs.CanaryRevisionHash
 			cs.Failed = nil
 			recordRollback(in.ISVC, in.Component, "manual")
@@ -169,6 +188,7 @@ func applyHolds(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanaryStatu
 			// un-park the canary.
 			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseFailed)
 			refuseRollback(in, cs, take)
+			ignoreForce(in, cs, take, "the canary is parked Failed")
 			return cs, (&Result{Active: true}).wake(in.ParkedRequeue), nil
 		}
 	}

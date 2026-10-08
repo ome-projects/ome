@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
@@ -686,6 +687,91 @@ func TestReconcile_FailedRestart_RecreateBypassesCoordGate(t *testing.T) {
 	}
 }
 
+// TestReconcile_FailedRestart_RecreateAnswersThePlanGate pins the other
+// half of the exemption: a zero-serving Instance's recreate skips the
+// capacity consult, whose count already carries its outage, but not the
+// plan. With the plan seam holding (no run pinned for the group) neither
+// the dead Instance's recreate nor the serving peer's start opens, the
+// capacity gate is never asked, the pass records the Plan hold and
+// requeues at the gate cadence.
+func TestReconcile_FailedRestart_RecreateAnswersThePlanGate(t *testing.T) {
+	scheme := makeScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	deps := types.Deps{Client: c}
+
+	in := minimalInput(t)
+	in.DesiredSpec.Replicas = 2
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{
+			Index: 0, Incarnation: 2,
+			Phase: types.InstancePhaseFailed, RunningRevision: "prior-rev",
+			Operation: &types.InstanceOperation{
+				Type: types.InstanceOperationRestart, Step: "Drain",
+			},
+		},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "prior-rev",
+			PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+	}
+	mutatedIndices := map[int32]int{}
+	in.MutateInstance = func(_ context.Context, idx int32, fn func(*types.InstanceStatus) bool) error {
+		mutatedIndices[idx]++
+		for i := range in.ObservedState.InstanceStatuses {
+			if in.ObservedState.InstanceStatuses[i].Index == idx {
+				_ = fn(&in.ObservedState.InstanceStatuses[i])
+				break
+			}
+		}
+		return nil
+	}
+	gateConsults, planConsults := 0, 0
+	in.UpdateGate = func(types.UpdateStrategyType, int32, int32) (bool, types.RolloutHoldGate, string) {
+		gateConsults++
+		return true, "", ""
+	}
+	in.PlanGate = func() (bool, types.RolloutHoldGate, string) {
+		planConsults++
+		return false, types.RolloutHoldGate(v1beta1.RolloutHoldGatePlan), "rollout plan not pinned: no active run for this rollout group"
+	}
+	var hold *types.RolloutHold
+	in.RecordRolloutHold = func(h *types.RolloutHold) { hold = h }
+
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
+		Replicas:  2,
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 2, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			{Index: 1, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+		},
+		UpdateStrategy: types.UpdateStrategy{
+			Type:          types.UpdateStrategyRecreatePod,
+			RollingUpdate: &types.RollingUpdate{MaxUnavailable: intOrStringInt(1)},
+		},
+	}
+	target := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-newtarget", Namespace: "prod"},
+	}
+
+	res, err := workload.Reconcile(context.Background(), deps, in, plan, target)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(mutatedIndices) != 0 {
+		t.Errorf("rows written while the plan was unpinned: %v; the zero-serving Instance's recreate answers the plan gate like every fresh start", mutatedIndices)
+	}
+	if planConsults == 0 {
+		t.Errorf("the plan seam was never asked")
+	}
+	if gateConsults != 0 {
+		t.Errorf("capacity gate consults = %d, want 0: a held plan is decided before any capacity question", gateConsults)
+	}
+	if hold == nil || hold.Gate != types.RolloutHoldGate(v1beta1.RolloutHoldGatePlan) {
+		t.Errorf("recorded hold = %+v, want the plan gate's hold", hold)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("result = %+v, want a requeue at the gate cadence", res)
+	}
+}
+
 // TestReconcile_PerComponentBudget_PercentForm exercises the percent
 // resolver through the dispatcher: 25% on 4 replicas → budget=1, so
 // only one fresh start is allowed. This is the load-bearing
@@ -1116,6 +1202,37 @@ func TestTerminatingSurgeInFlight(t *testing.T) {
 			}
 			if !got.NextRelease.Equal(tc.wantWakeAt) {
 				t.Errorf("next release = %v, want %v", got.NextRelease, tc.wantWakeAt)
+			}
+		})
+	}
+}
+
+// An attempt parked after its disposition holds no unavailability slot: the
+// next attempt on its own Instance is a fresh start the budget must be
+// free to admit, in whichever phase the parked row's pods give it.
+func TestCurrentUnavailableInFlight_ParkedAttemptHoldsNoSlot(t *testing.T) {
+	parked := func(phase types.InstancePhase, waiting string) types.InstanceStatus {
+		return types.InstanceStatus{Index: 0, Phase: phase, Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepParked, TargetRevision: "rev-b", Waiting: waiting,
+		}}
+	}
+	inFlight := types.InstanceStatus{Index: 0, Phase: types.InstancePhaseUpdating, Operation: &types.InstanceOperation{
+		Type: types.InstanceOperationUpdate, Step: types.UpdateStepDrain, TargetRevision: "rev-b",
+	}}
+	for _, tc := range []struct {
+		name string
+		row  types.InstanceStatus
+		want int32
+	}{
+		{name: "parked on the ladder while its set serves", row: parked(types.InstancePhaseUpdating, string(types.RolloutHoldGateRetryBlock)), want: 0},
+		{name: "parked on the ladder while its set is down", row: parked(types.InstancePhaseFailed, string(types.RolloutHoldGateRetryBlock)), want: 0},
+		{name: "parked under a held ladder", row: parked(types.InstancePhaseFailed, string(types.RolloutHoldGateHeld)), want: 0},
+		{name: "parked behind the budget", row: parked(types.InstancePhaseUpdating, string(types.RolloutHoldGateBudget)), want: 0},
+		{name: "an attempt in flight still holds its slot", row: inFlight, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := escalation.CurrentUnavailableInFlight([]types.InstanceStatus{tc.row}); got != tc.want {
+				t.Fatalf("CurrentUnavailableInFlight = %d, want %d", got, tc.want)
 			}
 		})
 	}

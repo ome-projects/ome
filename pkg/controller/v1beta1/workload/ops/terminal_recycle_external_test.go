@@ -578,17 +578,23 @@ func TestCreate_TerminalPodReobservedAfterTheFreshStartWritesNoPhase(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resetExpectations(t)
+			// Status timestamps round-trip at second precision, so the
+			// second pass runs on a later second: a record re-stamped
+			// with its time cannot hide behind the truncation.
+			clk := clocktesting.NewFakeClock(time.Now().Truncate(time.Second))
 			isvc := minimalISVC("llama-70b", "prod", 1)
 			ir := instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
 				Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceFailed,
 				RunningRevision: "llama-70b-engine-" + testRevisionHash,
 			})
 			dead := tc.kill(podForInstance(isvc, 0, false, false))
+			dead.CreationTimestamp = metav1.NewTime(clk.Now().Add(-time.Minute))
 			c := newFakeClient(t, isvc, ir, dead)
 			deps := workload.Deps{Client: c}
 			plan := buildPlanSinglePodEngine(1)
 
 			input := buildTestInput(isvc, c, workload.ComponentEngine)
+			input.Clock = clk
 			if _, err := ops.Create(context.Background(), deps, input, plan, nil); err != nil {
 				t.Fatalf("Create pass 1: %v", err)
 			}
@@ -599,11 +605,14 @@ func TestCreate_TerminalPodReobservedAfterTheFreshStartWritesNoPhase(t *testing.
 
 			// The same dead object is observed once more, after the stamp.
 			reobserved := tc.kill(podForInstance(isvc, 0, false, false))
+			reobserved.CreationTimestamp = dead.CreationTimestamp
 			if err := c.Create(context.Background(), reobserved); err != nil {
 				t.Fatalf("re-seed the terminal pod: %v", err)
 			}
 			workload.DefaultExpectations.Forget("prod", "llama-70b", workload.ComponentEngine, 0)
+			clk.Step(2 * time.Second)
 			input = buildTestInput(isvc, c, workload.ComponentEngine)
+			input.Clock = clk
 			if _, err := ops.Create(context.Background(), deps, input, plan, nil); err != nil {
 				t.Fatalf("Create pass 2: %v", err)
 			}
@@ -636,6 +645,10 @@ func TestRestart_TerminalPodReobservedKeepsPhaseAndStep(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resetExpectations(t)
+			// Status timestamps round-trip at second precision, so the
+			// second pass runs on a later second: a record re-stamped
+			// with its time cannot hide behind the truncation.
+			clk := clocktesting.NewFakeClock(time.Now().Truncate(time.Second))
 			isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
 			ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
 				Index:           0,
@@ -649,10 +662,12 @@ func TestRestart_TerminalPodReobservedKeepsPhaseAndStep(t *testing.T) {
 				},
 			}
 			dead := tc.kill(podAtIncarnation(isvc, 0, 2, false, false))
+			dead.CreationTimestamp = metav1.NewTime(clk.Now().Add(-time.Minute))
 			c := newFakeClient(t, isvc, ir, dead)
 			deps := workload.Deps{Client: c}
 
 			input := buildTestInput(isvc, c, workload.ComponentEngine)
+			input.Clock = clk
 			plan := buildPlanSinglePodEngineForRestart(c, isvc)
 			if _, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], nil, "trigger"); err != nil {
 				t.Fatalf("Restart pass 1: %v", err)
@@ -661,11 +676,14 @@ func TestRestart_TerminalPodReobservedKeepsPhaseAndStep(t *testing.T) {
 
 			// The same dead object is observed once more.
 			reobserved := tc.kill(podAtIncarnation(isvc, 0, 2, false, false))
+			reobserved.CreationTimestamp = dead.CreationTimestamp
 			if err := c.Create(context.Background(), reobserved); err != nil {
 				t.Fatalf("re-seed the terminal pod: %v", err)
 			}
 			workload.DefaultExpectations.Forget("prod", "llama-70b", workload.ComponentEngine, 0)
+			clk.Step(2 * time.Second)
 			input = buildTestInput(isvc, c, workload.ComponentEngine)
+			input.Clock = clk
 			plan = buildPlanSinglePodEngineForRestart(c, isvc)
 			done, err := ops.Restart(context.Background(), deps, input, plan, plan.Instances[0], nil, "trigger")
 			if err != nil {
@@ -686,6 +704,9 @@ func TestRestart_TerminalPodReobservedKeepsPhaseAndStep(t *testing.T) {
 			}
 			if after.Incarnation != recycled.Incarnation {
 				t.Errorf("Incarnation: got %d want %d unchanged", after.Incarnation, recycled.Incarnation)
+			}
+			if !reflect.DeepEqual(after.LastFailure, recycled.LastFailure) {
+				t.Errorf("LastFailure: got %+v want it unchanged at %+v", after.LastFailure, recycled.LastFailure)
 			}
 		})
 	}

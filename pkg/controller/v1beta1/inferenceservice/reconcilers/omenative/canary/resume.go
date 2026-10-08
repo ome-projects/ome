@@ -61,8 +61,8 @@ func (r resumeRequest) addressesUnit(c v1beta1.ComponentType, cs *v1beta1.Canary
 
 // addressesAnyUnit reports whether some canary unit of the InferenceService
 // owns this verb. A verb no unit owns has nothing to act on, now or later.
-func (r resumeRequest) addressesAnyUnit(isvc *v1beta1.InferenceService) bool {
-	for _, g := range rollout.CanaryGroups(isvc) {
+func (r resumeRequest) addressesAnyUnit(isvc *v1beta1.InferenceService, policies rollout.Policies) bool {
+	for _, g := range rollout.CanaryGroups(isvc, policies) {
 		primary := rollout.PrimaryOf(g)
 		if r.addressesUnit(primary, rollout.CanaryStatusFor(&isvc.Status, primary)) {
 			return true
@@ -100,7 +100,7 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 		return nil
 	}
 	if !req.addressesUnit(in.Component, cs) {
-		if req.addressesAnyUnit(in.ISVC) {
+		if req.addressesAnyUnit(in.ISVC, in.Policies) {
 			return false, nil
 		}
 		// A verb no canary carries is consumed and ignored rather than left

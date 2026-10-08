@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/clock"
 	knapis "knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/network"
@@ -153,10 +154,12 @@ type InferenceServiceReconciler struct {
 	// SetupWithManager initializes it (if nil) and registers the Pod
 	// event handler against the same instance the component dispatch
 	// path threads into ReconcileParams.
-	Expectations    *omenative.Expectations
-	Log             logr.Logger
-	Scheme          *runtime.Scheme
-	Recorder        record.EventRecorder
+	Expectations *omenative.Expectations
+	Log          logr.Logger
+	Scheme       *runtime.Scheme
+	Recorder     record.EventRecorder
+	// Clock measures spec.ttlSecondsAfterCreation. Nil means the real clock.
+	Clock           clock.PassiveClock
 	RuntimeSelector runtimeselector.Selector
 	// AcceleratorClassSelector resolves the AcceleratorClass for each
 	// Engine/Decoder component (explicit name, or policy over the
@@ -227,7 +230,7 @@ type InferenceServiceReconciler struct {
 	componentDeps *components.ComponentDeps
 }
 
-func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	// Fetch the InferenceService instance
 	isvc := &v1beta1.InferenceService{}
 	if err := r.Get(ctx, req.NamespacedName, isvc); err != nil {
@@ -246,6 +249,19 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// consistent.
 	log := r.Log.WithValues("namespace", isvc.Namespace, "isvc", isvc.Name)
 	ctx = ctrl.LoggerInto(ctx, log)
+	// spec.ttlSecondsAfterCreation is checked before anything that can fail,
+	// so an invalid spec cannot keep an expired InferenceService alive. A
+	// placement member copy is left to the TTL of its source.
+	if isvc.DeletionTimestamp.IsZero() && !protocol.IsMember(isvc) {
+		if remaining, ok := ttlRemaining(isvc, r.now()); ok {
+			if remaining <= 0 {
+				log.Info("Deleting InferenceService because ttlSecondsAfterCreation has passed",
+					"ttlSecondsAfterCreation", *isvc.Spec.TTLSecondsAfterCreation)
+				return ctrl.Result{}, r.deleteExpired(ctx, isvc)
+			}
+			defer func() { result = requeueBy(result, err, remaining) }()
+		}
+	}
 	// Unsupported member authority must hold before any reconciliation writes.
 	// Deletion still follows finalizer cleanup regardless of the stored policy.
 	if isvc.DeletionTimestamp.IsZero() {
@@ -533,6 +549,9 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	var rolloutRunRequeue time.Duration
 	var rolloutConfig *controllerconfig.RolloutConfig
 	var metricProviders controllerconfig.MetricProvidersConfig
+	// The referenced RolloutPolicy objects as the run layer observed them this
+	// pass; every reader of the effective view resolves through the same set.
+	var policies rollout.Policies
 	if isvc.Spec.Rollout != nil || isvc.Status.Rollout != nil {
 		rolloutConfig, err = controllerconfig.NewRolloutConfigCached(r.ConfigCache, r.Clientset)
 		if err != nil {
@@ -559,11 +578,12 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			return reconcile.Result{}, errors.Wrapf(runErr, "fails to reconcile rollout run")
 		}
 		rolloutRunRequeue = runOutcome.RequeueAfter
+		policies = runOutcome.Policies
 		if runOutcome.Opened {
 			// Bind/reset the canary state before persisting the run boundary so
 			// activeRun and its step state become visible atomically. Adoption is
 			// the exception: preserve the in-flight step and attach its target ID.
-			for _, g := range rollout.CanaryGroups(isvc) {
+			for _, g := range rollout.CanaryGroups(isvc, policies) {
 				if err := canary.BindRun(ctx, r.Client, isvc, g, runOutcome.Adopted); err != nil {
 					log.Error(err, "Failed to bind canary state to the rollout run")
 					return reconcile.Result{}, errors.Wrapf(err, "fails to bind canary state to the rollout run")
@@ -595,28 +615,28 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// lifecycle — and the engine's partition hold stages the old/new split
 	// from there. The step machine + traffic run in Step 6a below.
 	var enginePartition, decoderPartition, routerPartition *int32
-	if len(rollout.CanaryGroups(isvc)) > 0 {
+	if len(rollout.CanaryGroups(isvc, policies)) > 0 {
 		if mergedEngine != nil {
-			enginePartition = canary.StepPartition(isvc, v1beta1.EngineComponent, &mergedEngine.ComponentExtensionSpec)
+			enginePartition = canary.StepPartition(isvc, policies, v1beta1.EngineComponent, &mergedEngine.ComponentExtensionSpec)
 		}
 		if mergedDecoder != nil {
-			decoderPartition = canary.StepPartition(isvc, v1beta1.DecoderComponent, &mergedDecoder.ComponentExtensionSpec)
+			decoderPartition = canary.StepPartition(isvc, policies, v1beta1.DecoderComponent, &mergedDecoder.ComponentExtensionSpec)
 		}
 		if mergedRouter != nil {
-			routerPartition = canary.StepPartition(isvc, v1beta1.RouterComponent, &mergedRouter.ComponentExtensionSpec)
+			routerPartition = canary.StepPartition(isvc, policies, v1beta1.RouterComponent, &mergedRouter.ComponentExtensionSpec)
 		}
 	} else {
-		// A canary-KIND group with no resolvable plan (ref-only pre-open, or
-		// parked) projects a full hold instead of no partition, keeping the
-		// projected spec deterministic across run states.
+		// A canary-KIND group with no resolvable plan (a reference whose
+		// policy cannot be resolved) projects a full hold instead of no
+		// partition, keeping the projected spec deterministic across run states.
 		if mergedEngine != nil {
-			enginePartition = canary.PlanGateHoldPartition(isvc, v1beta1.EngineComponent, &mergedEngine.ComponentExtensionSpec)
+			enginePartition = canary.PlanGateHoldPartition(isvc, policies, v1beta1.EngineComponent, &mergedEngine.ComponentExtensionSpec)
 		}
 		if mergedDecoder != nil {
-			decoderPartition = canary.PlanGateHoldPartition(isvc, v1beta1.DecoderComponent, &mergedDecoder.ComponentExtensionSpec)
+			decoderPartition = canary.PlanGateHoldPartition(isvc, policies, v1beta1.DecoderComponent, &mergedDecoder.ComponentExtensionSpec)
 		}
 		if mergedRouter != nil {
-			routerPartition = canary.PlanGateHoldPartition(isvc, v1beta1.RouterComponent, &mergedRouter.ComponentExtensionSpec)
+			routerPartition = canary.PlanGateHoldPartition(isvc, policies, v1beta1.RouterComponent, &mergedRouter.ComponentExtensionSpec)
 		}
 	}
 
@@ -746,7 +766,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Operator annotations the canary passes applied this reconcile. They
 	// are removed after the status write that carries their effect lands.
 	var canaryConsume []string
-	if canaryGroups := rollout.CanaryGroups(isvc); len(canaryGroups) > 0 {
+	if canaryGroups := rollout.CanaryGroups(isvc, policies); len(canaryGroups) > 0 {
 		// Resolve the metrics source + query timeout per-reconcile from the
 		// canaryAnalysis operator config (so ConfigMap edits take effect without a
 		// restart); the sampler's structural tuning is fixed at startup. Only
@@ -783,6 +803,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 				MetricProviders:          metricProviders,
 				DefaultProvider:          analysisConfig.DefaultProvider,
 				ComponentRunnerPorts:     componentRunnerPorts,
+				Policies:                 policies,
 				Group:                    g,
 			})
 			if err != nil {
@@ -808,8 +829,9 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return reconcile.Result{}, errors.Wrapf(err, "fails to load coordination config")
 	}
 	if _, err := coordination.Reconcile(ctx, coordination.ReconcileInputs{
-		ISVC:   isvc,
-		Client: r.Client,
+		ISVC:     isvc,
+		Policies: policies,
+		Client:   r.Client,
 		// The coordination gates decode per-Instance rows, so the live reader
 		// carries the configured row decoder.
 		Reader:                       irstatus.NewReader(r.APIReader, r.InstanceStatusDecoder),
@@ -863,7 +885,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// flushing it here those writes are dropped on every requeuing pass,
 	// which is the steady state during active rollouts.
 	if pendingRequeue.Requeue || pendingRequeue.RequeueAfter > 0 {
-		if err := r.flushStatusThenConsume(ctx, isvc, deploymentMode, canaryConsume, base); err != nil {
+		if err := r.FlushStatusThenConsume(ctx, isvc, deploymentMode, canaryConsume, base); err != nil {
 			r.Recorder.Event(isvc, v1.EventTypeWarning, "InternalError", err.Error())
 			return reconcile.Result{}, err
 		}
@@ -1003,7 +1025,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return reconcile.Result{}, err
 	}
 
-	if err = r.flushStatusThenConsume(ctx, isvc, deploymentMode, canaryConsume, base); err != nil {
+	if err = r.FlushStatusThenConsume(ctx, isvc, deploymentMode, canaryConsume, base); err != nil {
 		// A terminal status conflict is benign — requeue and re-reconcile
 		// off fresh state instead of surfacing an ERROR-level failure.
 		if apierrors.IsConflict(err) {
@@ -1200,13 +1222,14 @@ func (r *InferenceServiceReconciler) clearRuntimeUnresolved(isvc *v1beta1.Infere
 	})
 }
 
-// flushStatusThenConsume writes the status, then removes the operator
+// FlushStatusThenConsume writes the status, then removes the operator
 // annotations whose effect that write carried. The order is the contract: a
 // verb is consumed only once the state it produced is durable, and each
 // applied verb leaves a record in status that keeps a still-visible
 // annotation inert, so a removal that fails here is retried by a later pass
-// rather than re-applied.
-func (r *InferenceServiceReconciler) flushStatusThenConsume(ctx context.Context, isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, consume []string, base *canary.Base) error {
+// rather than re-applied. It is the pass's flush; the replay driver enters
+// it with the pass's own base and verbs.
+func (r *InferenceServiceReconciler) FlushStatusThenConsume(ctx context.Context, isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, consume []string, base *canary.Base) error {
 	if err := r.updateStatus(isvc, deploymentMode, base); err != nil {
 		return err
 	}

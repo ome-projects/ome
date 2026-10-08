@@ -36,7 +36,7 @@ func TestEffectivePartition_MembersFollowTheGroupPrimaryStep(t *testing.T) {
 		CurrentStep:        1,
 	})
 	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
-		p, ok := EffectivePartition(isvc, c, 8)
+		p, ok := EffectivePartition(isvc, rollout.Policies{}, c, 8)
 		if !ok || p == nil {
 			t.Fatalf("%s: expected a canary partition", c)
 		}
@@ -55,7 +55,7 @@ func TestEffectivePartition_MembersFollowTheGroupRollback(t *testing.T) {
 		RolledBackRevisionHash: "new",
 	})
 	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
-		p, ok := EffectivePartition(isvc, c, 8)
+		p, ok := EffectivePartition(isvc, rollout.Policies{}, c, 8)
 		if !ok || p == nil || *p != 0 {
 			t.Errorf("%s: partition during the group's rollback = %v, want 0", c, p)
 		}

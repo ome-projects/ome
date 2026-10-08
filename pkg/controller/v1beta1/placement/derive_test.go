@@ -22,13 +22,14 @@ func TestDeriveISVC(t *testing.T) {
 			Name: "svc", Namespace: "prod", UID: "uid-123",
 			ResourceVersion: "999",
 			Annotations: map[string]string{
-				LocalQueueAnnotation:                "serving-lq",
-				AcceleratorRequirementsAnnotation:   "gpu=gb300",
-				ClusterSelectorAnnotation:           "provider=cloud-a",
-				constants.TrafficDrainAnnotation:    `{"drain":{"cluster":"cluster-a","reason":"mitigation"}}`,
-				constants.RolloutPromoteAnnotation:  "abc123def",
-				constants.RolloutRollbackAnnotation: "true",
-				constants.NetworkVisibility:         "cluster-local", // an ingress override that SHOULD ride along
+				LocalQueueAnnotation:                    "serving-lq",
+				AcceleratorRequirementsAnnotation:       "gpu=gb300",
+				ClusterSelectorAnnotation:               "provider=cloud-a",
+				constants.TrafficDrainAnnotation:        `{"drain":{"cluster":"cluster-a","reason":"mitigation"}}`,
+				constants.RolloutPromoteAnnotation:      "abc123def",
+				constants.RolloutPromoteForceAnnotation: "abc123def",
+				constants.RolloutRollbackAnnotation:     "true",
+				constants.NetworkVisibility:             "cluster-local", // an ingress override that SHOULD ride along
 			},
 		},
 		Spec: v1beta1.InferenceServiceSpec{
@@ -67,7 +68,7 @@ func TestDeriveISVC(t *testing.T) {
 	for _, k := range []string{
 		AcceleratorRequirementsAnnotation, ClusterSelectorAnnotation,
 		constants.TrafficDrainAnnotation,
-		constants.RolloutPromoteAnnotation, constants.RolloutRollbackAnnotation,
+		constants.RolloutPromoteAnnotation, constants.RolloutPromoteForceAnnotation, constants.RolloutRollbackAnnotation,
 	} {
 		_, has := d.Annotations[k]
 		assert.Falsef(t, has, "control-plane-only annotation %q must be stripped", k)
@@ -181,7 +182,8 @@ func TestSetPlannedReplicas(t *testing.T) {
 				Router:  &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(1), MaxReplicas: 7}},
 			}}
 			router := member.Spec.Router.DeepCopy()
-			setPlannedReplicas(member, tt.floor, tt.cap)
+			bound := plannedBound{Floor: tt.floor, Ceiling: tt.cap}
+			setPlannedReplicas(member, map[v1beta1.ComponentType]plannedBound{v1beta1.EngineComponent: bound, v1beta1.DecoderComponent: bound})
 			want := v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(int(tt.floor)), MaxReplicas: tt.wantMaximum}
 			for _, got := range []v1beta1.ComponentExtensionSpec{member.Spec.Engine.ComponentExtensionSpec, member.Spec.Decoder.ComponentExtensionSpec} {
 				if diff := cmp.Diff(want, got); diff != "" {

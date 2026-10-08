@@ -43,7 +43,7 @@ func mustSecondaryReady(t *testing.T, ctx context.Context, reads client.Reader, 
 			}
 		}
 	}
-	ok, fresh, _, err := secondaryCapacityReady(ctx, reads, isvc, perRev, readyPerRev, observedPods, primary, rollout.CanaryGroup(isvc))
+	ok, fresh, _, err := secondaryCapacityReady(ctx, reads, isvc, perRev, readyPerRev, observedPods, primary, rollout.CanaryGroup(isvc, rollout.Policies{}))
 	if err != nil {
 		t.Fatalf("secondaryCapacityReady error: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestSecondaryCapacityReadyRequiresAuthoritativeIR(t *testing.T) {
 				objects = append(objects, tc.ir)
 			}
 			reads := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objects...).Build()
-			ready, fresh, _, err := secondaryCapacityReady(context.Background(), reads, isvc, perRev, perRev, nil, v1beta1.RouterComponent, rollout.CanaryGroup(isvc))
+			ready, fresh, _, err := secondaryCapacityReady(context.Background(), reads, isvc, perRev, perRev, nil, v1beta1.RouterComponent, rollout.CanaryGroup(isvc, rollout.Policies{}))
 			if err != nil {
 				t.Fatalf("secondaryCapacityReady: %v", err)
 			}
@@ -527,7 +527,7 @@ func TestDispatch_HoldsUntilIRIdentifiesCanaryTarget(t *testing.T) {
 		).
 		Build()
 	ctx := context.Background()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	if _, err := Dispatch(ctx, deps); err != nil {
 		t.Fatalf("Dispatch with lagging IR status: %v", err)
@@ -610,7 +610,7 @@ func TestDispatch_ArmsFromLivePodsWhenCurrentRevisionUnpromoted(t *testing.T) {
 		).
 		Build()
 	ctx := context.Background()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	if _, err := Dispatch(ctx, deps); err != nil {
 		t.Fatalf("Dispatch with unpromoted current revision: %v", err)
@@ -665,7 +665,7 @@ func TestDispatch_SingleRevisionDoesNotArmWithoutCurrentRevision(t *testing.T) {
 			canaryControllerRevision(ns, isvc.Name, "engine", "target", 1),
 		).
 		Build()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 	if _, err := Dispatch(context.Background(), deps); err != nil {
 		t.Fatalf("Dispatch on a single revision: %v", err)
 	}
@@ -709,7 +709,7 @@ func TestDispatch_StalePrimaryRetargetDoesNotResetCanary(t *testing.T) {
 			canaryPod(ns, isvc.Name, "engine", "next", "next-5"),
 		).
 		Build()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	if _, err := Dispatch(context.Background(), deps); err != nil {
 		t.Fatalf("Dispatch with stale retarget: %v", err)
@@ -779,7 +779,7 @@ func TestDispatch_MissingOrEmptyPrimaryIRDefersCommands(t *testing.T) {
 			}
 			c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objects...).Build()
 
-			if _, err := Dispatch(context.Background(), DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+			if _, err := Dispatch(context.Background(), DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 				t.Fatalf("Dispatch: %v", err)
 			}
 			if got := isvc.Status.Canary; got.CanaryRevisionHash != "target" || got.StableRevisionHash != "stable" || got.RolledBackRevisionHash != "" {
@@ -837,7 +837,7 @@ func TestDispatch_StaleSecondaryDefersRollback(t *testing.T) {
 		canaryPod(ns, isvc.Name, "engine", "engine-new", "engine-new-1"),
 	).Build()
 
-	if _, err := Dispatch(context.Background(), DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(context.Background(), DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
 	if isvc.Status.Canary.RolledBackRevisionHash != "" {
@@ -885,7 +885,7 @@ func TestDispatch_RepairsInvertedStableIdentity(t *testing.T) {
 		canaryPod(ns, isvc.Name, "engine", "target", "target-2"),
 		canaryPod(ns, isvc.Name, "engine", "target", "target-3"),
 	).Build()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	isvc.Annotations = map[string]string{constants.PausedRolloutAnnotation: "true"}
 	if _, err := Dispatch(context.Background(), deps); err != nil {
@@ -968,7 +968,7 @@ func TestDispatch_MultiPodSecondaryCapacityCountsInstances(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objects...).Build()
 
-	if _, err := Dispatch(context.Background(), DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(context.Background(), DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}
 	if got := isvc.Status.Components[v1beta1.RouterComponent].RolloutPhase; got != v1beta1.RolloutPhasePending {
@@ -1007,7 +1007,7 @@ func TestDispatch_ReadyTargetHashResyncsBeforePromotion(t *testing.T) {
 		canaryPod(ns, isvc.Name, "engine", "stable", "stable-0"),
 		canaryPod(ns, isvc.Name, "engine", "stable", "stable-1"),
 	).Build()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	if _, err := Dispatch(context.Background(), deps); err != nil {
 		t.Fatalf("Dispatch error: %v", err)
@@ -1061,7 +1061,7 @@ func TestDispatch_UsesObservedRunnerShapeForRevisionServices(t *testing.T) {
 		Client:               c,
 		Reader:               c,
 		ISVC:                 isvc,
-		ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+		ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch error: %v", err)
 	}
 
@@ -1159,7 +1159,7 @@ func TestDispatch_ServicesHashAndRollbackWarning(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).Build()
 	ctx := context.Background()
 
-	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch error: %v", err)
 	}
 	// IR-sourced hash recorded.
@@ -1182,7 +1182,7 @@ func TestDispatch_ServicesHashAndRollbackWarning(t *testing.T) {
 	// Rollback: the executor records the rejected hash + Dispatch points the IR at
 	// the stable revision (Pacing.RollbackToRevision = IR CurrentRevision).
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
-	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch (rollback) error: %v", err)
 	}
 	if isvc.Status.Canary == nil || isvc.Status.Canary.RolledBackRevisionHash != "newhash" {
@@ -1264,7 +1264,7 @@ func TestDispatch_PDRouterRollbackTargetsStable(t *testing.T) {
 	ctx := context.Background()
 
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
-	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch (rollback) error: %v", err)
 	}
 	if got := isvc.Status.Components[v1beta1.RouterComponent].RolloutPhase; got != v1beta1.RolloutPhaseRollingBack {
@@ -1329,7 +1329,7 @@ func TestDispatch_SecondaryOnlyTargetStartsCanary(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objects...).Build()
 
 	if _, err := Dispatch(context.Background(), DispatchDeps{
-		Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+		Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatal(err)
 	}
 	if isvc.Status.Canary == nil || isvc.Status.Canary.CurrentStep != 0 {
@@ -1382,7 +1382,7 @@ func TestDispatch_RollbackTargetsPersistedStableAfterRetarget(t *testing.T) {
 	ctx := context.Background()
 
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
-	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch (rollback) error: %v", err)
 	}
 	if isvc.Status.Canary.RolledBackRevisionHash != "revC" {
@@ -1568,7 +1568,7 @@ func TestDispatch_EnsuresPerRevisionServicesForSecondary(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).Build()
 	ctx := context.Background()
-	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("Dispatch error: %v", err)
 	}
 	svc := &corev1.Service{}
@@ -1610,7 +1610,7 @@ func TestDispatch_RecreatesDeletedServiceWhenConverged(t *testing.T) {
 	ctx := context.Background()
 
 	// First Dispatch ensures the per-revision Service.
-	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("first Dispatch error: %v", err)
 	}
 	key := types.NamespacedName{Namespace: ns, Name: coordination.PerRevisionServiceName("cv1", v1beta1.EngineComponent, "stable0")}
@@ -1627,7 +1627,7 @@ func TestDispatch_RecreatesDeletedServiceWhenConverged(t *testing.T) {
 	}
 
 	// Second Dispatch: converged, but the deleted Service must be recreated.
-	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}); err != nil {
+	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}); err != nil {
 		t.Fatalf("second Dispatch error: %v", err)
 	}
 	if err := c.Get(ctx, key, &corev1.Service{}); err != nil {
@@ -1650,16 +1650,16 @@ func TestPrimaryComponent(t *testing.T) {
 		}
 		return isvc
 	}
-	if got := primaryComponentOf(rollout.CanaryGroup(mk(v1beta1.EngineComponent))); got != v1beta1.EngineComponent {
+	if got := primaryComponentOf(rollout.CanaryGroup(mk(v1beta1.EngineComponent), rollout.Policies{})); got != v1beta1.EngineComponent {
 		t.Fatalf("engine-only → engine, got %q", got)
 	}
-	if got := primaryComponentOf(rollout.CanaryGroup(mk(v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent))); got != v1beta1.RouterComponent {
+	if got := primaryComponentOf(rollout.CanaryGroup(mk(v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent), rollout.Policies{})); got != v1beta1.RouterComponent {
 		t.Fatalf("PD with router → router, got %q", got)
 	}
-	if got := primaryComponentOf(rollout.CanaryGroup(mk(v1beta1.EngineComponent, v1beta1.DecoderComponent))); got != v1beta1.EngineComponent {
+	if got := primaryComponentOf(rollout.CanaryGroup(mk(v1beta1.EngineComponent, v1beta1.DecoderComponent), rollout.Policies{})); got != v1beta1.EngineComponent {
 		t.Fatalf("engine+decoder (no router) → engine, got %q", got)
 	}
-	if got := primaryComponentOf(rollout.CanaryGroup(mk())); got != "" {
+	if got := primaryComponentOf(rollout.CanaryGroup(mk(), rollout.Policies{})); got != "" {
 		t.Fatalf("no canary group → empty, got %q", got)
 	}
 }
@@ -1746,7 +1746,7 @@ func countEvents(rec *record.FakeRecorder, reason string) int {
 // with the reason instead of reporting a revert that never completes.
 func TestDispatch_RollbackWithoutStableRevisionParksFailed(t *testing.T) {
 	isvc, c := missingStableFixture(t, "no-stable")
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
 	for pass := 0; pass < 2; pass++ {
@@ -1780,7 +1780,7 @@ func TestDispatch_MissingStableParkAppliesTheRollbackOnce(t *testing.T) {
 	isvc, c := missingStableFixture(t, "park-once")
 	rec := record.NewFakeRecorder(16)
 	start := time.Unix(1000, 0)
-	deps := DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, Now: start, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, Now: start, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	rollbacksBefore := manualRollbacks(isvc)
 	parkEvents := 0
@@ -1829,7 +1829,7 @@ func TestDispatch_MissingStableParkRefusesARepeatAndRearms(t *testing.T) {
 	isvc, c := missingStableFixture(t, "park-repeat")
 	rec := record.NewFakeRecorder(16)
 	ctx := context.Background()
-	deps := DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, Now: time.Unix(1000, 0), ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, Now: time.Unix(1000, 0), ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 	dispatch := func(pass string) Outcome {
 		t.Helper()
 		out, err := Dispatch(ctx, deps)
@@ -1945,7 +1945,7 @@ func TestGroupRollbackInputs_EveryMember(t *testing.T) {
 		v1beta1.EngineComponent:  "engStable",
 		v1beta1.DecoderComponent: "decStable",
 	}
-	pods, stable := groupRollbackInputs(isvc, rollout.CanaryGroup(isvc), v1beta1.RouterComponent, totalRev)
+	pods, stable := groupRollbackInputs(isvc, rollout.CanaryGroup(isvc, rollout.Policies{}), v1beta1.RouterComponent, totalRev)
 	if len(pods) != len(totalRev) || len(stable) != len(wantStable) {
 		t.Fatalf("every configured member must be present: pods=%v stable=%v", pods, stable)
 	}
@@ -2018,7 +2018,7 @@ func TestDispatch_PDRollbackWaitsForEveryMember(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).Build()
 	ctx := context.Background()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 
 	if _, err := Dispatch(ctx, deps); err != nil {
 		t.Fatalf("Dispatch: %v", err)
@@ -2114,7 +2114,7 @@ func TestDispatch_RunReopenedAfterRollbackArmsTheNewTarget(t *testing.T) {
 		canaryControllerRevision(ns, isvc.Name, "engine", "new", 2),
 	).Build()
 	ctx := context.Background()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 	dispatch := func(pass string) {
 		t.Helper()
 		if _, err := Dispatch(ctx, deps); err != nil {
@@ -2166,7 +2166,7 @@ func TestDispatch_RunReopenedAfterRollbackArmsTheNewTarget(t *testing.T) {
 	// A new target: the run layer opens a fresh run toward it and the
 	// controller binds the unit to that run before the executor's pass.
 	reopenRun(isvc, v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "v3", StableRevision: "old"})
-	deps.Group = rollout.CanaryGroup(isvc)
+	deps.Group = rollout.CanaryGroup(isvc, rollout.Policies{})
 	updateIR(t, c, irKey, func(ir *v1beta1.InferenceReplica) { ir.Status.UpdateRevision = isvc.Name + "-engine-v3" })
 	if err := c.Create(ctx, canaryControllerRevision(ns, isvc.Name, "engine", "v3", 3)); err != nil {
 		t.Fatal(err)
@@ -2235,7 +2235,7 @@ func TestDispatch_RunReopenedWhileRollingBackArmsTheNewTarget(t *testing.T) {
 		canaryControllerRevision(ns, isvc.Name, "engine", "new", 2),
 	).Build()
 	ctx := context.Background()
-	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc)}
+	deps := DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 	dispatch := func(pass string) {
 		t.Helper()
 		if _, err := Dispatch(ctx, deps); err != nil {
@@ -2268,7 +2268,7 @@ func TestDispatch_RunReopenedWhileRollingBackArmsTheNewTarget(t *testing.T) {
 	// The new target arrives before the rejected pods are gone: the run layer
 	// opens a fresh run toward it and the controller binds the unit first.
 	reopenRun(isvc, v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "v3", StableRevision: "old"})
-	deps.Group = rollout.CanaryGroup(isvc)
+	deps.Group = rollout.CanaryGroup(isvc, rollout.Policies{})
 	updateIR(t, c, irKey, func(ir *v1beta1.InferenceReplica) { ir.Status.UpdateRevision = isvc.Name + "-engine-v3" })
 	if err := c.Create(ctx, canaryControllerRevision(ns, isvc.Name, "engine", "v3", 3)); err != nil {
 		t.Fatal(err)

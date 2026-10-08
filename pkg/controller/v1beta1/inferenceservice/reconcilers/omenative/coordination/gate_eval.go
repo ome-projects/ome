@@ -133,6 +133,21 @@ func EvaluateUpdateGate(
 	return true, "", ""
 }
 
+// EvaluatePlanGate is the plan gate alone, the question the workload asks
+// for a start it admits without the capacity consult: an Instance that
+// serves nothing still rolls on the plan, and until a run pins it no
+// grouped Component rolls. A nil service holds nothing, as the full stack
+// short-circuits on one.
+func EvaluatePlanGate(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) (allowed bool, gate v1beta1.RolloutHoldGate, denyReason string) {
+	if isvc == nil {
+		return true, "", ""
+	}
+	if held, reason := planHold(isvc, component); held {
+		return false, v1beta1.RolloutHoldGatePlan, reason
+	}
+	return true, "", ""
+}
+
 // GateWaitsOnPeerCounters reports whether a hold on gate is released by a
 // peer Component's serving counters moving. The pair floor and the ratio
 // band simulate the step against the peers' live serving counts, so a

@@ -116,12 +116,14 @@ type PassInput struct {
 //     be failed out from under the batch still driving it.
 //
 // FAILED-WHILE-SERVING GUARD: an Instance whose blamed pod set is fully
-// healthy — every live (non-deleting) pod ContainersReady AND in the
-// serving rotation, at the desired count — is never escalated, whatever
-// the evidence says. Stamping Phase=Failed over a serving workload is a
+// in rotation — every live (non-deleting) pod PodReady AND carrying the
+// serving gate, at the desired count — is never escalated, whatever the
+// evidence says. Stamping Phase=Failed over a serving workload is a
 // status lie (the pods are fine; only the bookkeeping is stale), and the
 // coordination layer would amplify it into a group-level failure. Such
-// an Instance is skipped untouched.
+// an Instance is skipped untouched. A pod whose gate is written but whose
+// Ready never followed is in no Service's endpoints and earns no exemption:
+// the deadline is the one exit of an attempt it holds behind the promote bar.
 //
 // Instances with a disposable in-flight attempt (Create, recreate and
 // in-place Update Operations — see disposableAttempt) route through
@@ -200,7 +202,7 @@ func Run(ctx context.Context, in PassInput) error {
 		if podSetIsCapacity(row, pods, desired) {
 			continue
 		}
-		if reason := gangTerminalReason(gang.State); reason != "" && gangVerdictActionable(row.Operation) {
+		if reason := gangTerminalReason(gang.State); reason != "" && gangVerdictActionable(&row) {
 			escalateGangFailure(input, stamps, row, gang, reason, now)
 			continue
 		}
@@ -474,11 +476,26 @@ func evidenceFor(insts []types.InstanceStatus, byIdx map[int32][]*corev1.Pod, id
 	if grace <= 0 {
 		return ev
 	}
-	if pod, reason := evidence.FirstStuckPodForInstance(pods, now, grace); pod != nil {
+	if pod, reason := evidence.FirstStuckPodForInstanceSince(pods, now, grace, attemptEvidenceFloor(inst)); pod != nil {
 		ev.StuckPod = pod
 		ev.StuckReason = reason
 	}
 	return ev
+}
+
+// attemptEvidenceFloor is the instant before which a pod's waiting
+// evidence is not the attempt's own. An in-place patch acts on a pod that
+// already exists and restamps it before the kubelet has replaced its
+// container, so a reason the pod held when the attempt opened — the
+// crash loop of the revision the patch replaces — is the attempt's reason,
+// and the grace to clear it runs from the attempt's start. Every other
+// attempt's pods are created after it opens, so its floor is zero.
+func attemptEvidenceFloor(inst *types.InstanceStatus) time.Time {
+	if inst == nil || inst.Operation == nil ||
+		inst.Operation.Type != types.InstanceOperationUpdate || inst.Operation.Step != types.UpdateStepInPlace {
+		return time.Time{}
+	}
+	return inst.Operation.StartedAt.Time
 }
 
 func singlePodSurgeAttempt(row *types.InstanceStatus, desiredPods int32) bool {
@@ -487,21 +504,25 @@ func singlePodSurgeAttempt(row *types.InstanceStatus, desiredPods int32) bool {
 		row.Operation.Step == types.UpdateStepSurge && row.Operation.SurgeIndex == nil
 }
 
-// repairSetGone reports whether every pod of the Instance is deleting or
-// gone on a live read: the repair's drain has deleted the set it replaces
-// and the rebuild has not run yet. The deadline was judged on the pass's
-// pod observation, which predates that delete, and a spent repair's exits
-// are read off its pods, so a park with no set behind it has none. The
-// repair owns the set until the rebuilt one exists; the elapsed deadline
-// parks that one. A set still live on the read — a drain not finished, or
-// a rebuilt set in any state — parks as the deadline says.
+// repairSetGone reports whether every pod of the Instance is gone, or
+// deleting inside its own deletion deadline, on a live read: the repair's
+// drain has deleted the set it replaces and the rebuild has not run yet.
+// The deadline was judged on the pass's pod observation, which predates
+// that delete, and a spent repair's exits are read off its pods, so a park
+// with no set behind it has none. The repair owns the set until the
+// rebuilt one exists; the elapsed deadline parks that one. A set still
+// live on the read — a drain not finished, or a rebuilt set in any state —
+// parks as the deadline says. So does a pod deleting past its own deadline:
+// a kubelet removes a pod within moments of it, so what stays is a name no
+// delete in flight will free, and the park is what makes that visible.
 func repairSetGone(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, idx int32) (bool, error) {
 	pods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), input.Key.Namespace, input.Key.OwnerName, plan.Component, idx)
 	if err != nil {
 		return false, err
 	}
+	now := input.Now()
 	for _, pod := range pods {
-		if pod.DeletionTimestamp == nil {
+		if pod.DeletionTimestamp == nil || now.After(pod.DeletionTimestamp.Time) {
 			return false, nil
 		}
 	}
@@ -573,7 +594,8 @@ func (b *failureStampBuffer) flush(ctx context.Context) error {
 }
 
 // podSetIsCapacity reports whether the Instance is healthy capacity,
-// which is what buys it the FAILED-WHILE-SERVING exemption.
+// which is what buys it the FAILED-WHILE-SERVING exemption: a set in
+// rotation, PodReady and the serving gate agreeing on every pod.
 //
 // Pod conditions alone do not settle that during a surge. Until the
 // drain step the source is what holds the Instance's traffic, and a
@@ -582,13 +604,7 @@ func (b *failureStampBuffer) flush(ctx context.Context) error {
 // in rotation, and a replacement wedged in that state must escalate
 // rather than be exempted by a source that is not serving.
 func podSetIsCapacity(row types.InstanceStatus, pods []*corev1.Pod, desired int32) bool {
-	return podSetFullyServing(pods, desired) && !types.OperationSourceUnrouted(row.Operation)
-}
-
-// podSetFullyServing is query.PodSetFullyServing under the name the
-// escalation pass's guards read by.
-func podSetFullyServing(pods []*corev1.Pod, desired int32) bool {
-	return query.PodSetFullyServing(pods, desired)
+	return query.PodSetReadyAndServing(pods, desired) && !types.OperationSourceUnrouted(row.Operation)
 }
 
 // anyPodAdmissionGated reports whether any pod still carries an

@@ -7,7 +7,6 @@ const (
 	MaxClusterAffinityTerms        = 64
 	MaxClusterSelectorRequirements = 64
 	MaxClusterSelectorValues       = 64
-	MaxClusterAffinityWeight       = 100
 )
 
 // ClusterAffinityTerm selects WorkloadClusters by ANDing its requirements.
@@ -17,9 +16,9 @@ type ClusterAffinityTerm struct {
 	// Weight is permitted only for static Split. If any term has an explicit
 	// weight, matching term weights add and omitted weights contribute one.
 	// Omission must be preserved to distinguish unweighted overlapping terms.
+	// Weights are replica ratios, so they have no upper bound.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=100
 	Weight *int32 `json:"weight,omitempty"`
 
 	// MatchExpressions selects the WorkloadCluster's actual labels.

@@ -2,6 +2,7 @@ package placement
 
 import (
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/placement/protocol"
 )
 
 type homeObservationState uint8
@@ -203,19 +205,53 @@ func (r *Reconciler) observeHome(
 	}
 	if AllComponentsAdmitted(derived, statuses) {
 		components := placementScaleComponents(derived)
+		floors := observedHomeFloors(derived)
 		candidate.Phase = v1beta1.CandidatePhaseAdmitted
 		if endpoint := endpointFor(derived); endpoint != nil {
 			candidate.Endpoint = endpoint.DeepCopy()
 		}
-		candidate.AdmittedReplicas = placementAdmittedReplicas(components, statuses)
+		candidate.AdmittedReplicas = placementAdmittedReplicas(components, statuses, floors)
 		if derived.Status.IsConditionReady(v1beta1.IngressReady) {
-			candidate.ReadyReplicas = placementReadyReplicas(components, statuses)
+			candidate.ReadyReplicas = placementReadyReplicas(components, statuses, floors)
 		}
 	}
 	return homeObservation{
 		state: homePresent, candidate: candidate,
 		serving: placementCandidateServing(derived, candidate),
 	}
+}
+
+// observedHomeFloors reads the per-component floors a standing member is held
+// to: its execution policy's floors when it carries them, otherwise the
+// replica minimums written into its spec.
+func observedHomeFloors(derived *v1beta1.InferenceService) map[v1beta1.ComponentType]int32 {
+	if policy, err := protocol.FromDerived(derived); err == nil && policy != nil && len(policy.ReplicaFloors) > 0 {
+		return floorMap(policy.ReplicaFloors)
+	}
+	floors := map[v1beta1.ComponentType]int32{}
+	for component, spec := range map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec{
+		v1beta1.EngineComponent:  engineExtension(derived),
+		v1beta1.DecoderComponent: decoderExtension(derived),
+	} {
+		if spec != nil && spec.MinReplicas != nil && *spec.MinReplicas >= 0 && int64(*spec.MinReplicas) <= math.MaxInt32 {
+			floors[component] = int32(*spec.MinReplicas)
+		}
+	}
+	return floors
+}
+
+func engineExtension(isvc *v1beta1.InferenceService) *v1beta1.ComponentExtensionSpec {
+	if isvc == nil || isvc.Spec.Engine == nil {
+		return nil
+	}
+	return &isvc.Spec.Engine.ComponentExtensionSpec
+}
+
+func decoderExtension(isvc *v1beta1.InferenceService) *v1beta1.ComponentExtensionSpec {
+	if isvc == nil || isvc.Spec.Decoder == nil {
+		return nil
+	}
+	return &isvc.Spec.Decoder.ComponentExtensionSpec
 }
 
 func terminalHome(cluster string, member *v1beta1.InferenceService) homeObservation {
@@ -230,9 +266,12 @@ func terminalHome(cluster string, member *v1beta1.InferenceService) homeObservat
 	}
 }
 
+// retainedUnknownCandidate carries a home's last known state behind an unknown
+// observation. Ready capacity is withheld because it is the routing weight.
 func retainedUnknownCandidate(isvc *v1beta1.InferenceService, previous v1beta1.CandidatePlacement) v1beta1.CandidatePlacement {
 	candidate := *previous.DeepCopy()
 	candidate = normalizeCandidatePhase(candidate)
+	candidate.ObservationKnown = false
 	candidate.ReadyReplicas = 0
 	if !hasPolicyRefs(isvc) {
 		candidate.Autoscaling = nil
@@ -312,7 +351,7 @@ func (r *Reconciler) writeObservedSingle(
 	observations *placementObservations,
 ) (ctrl.Result, error) {
 	if isvc.Status.Placement != nil && isvc.Status.Placement.Plan != nil && isvc.Status.Placement.Plan.Mode == v1beta1.PlacementModeSingle {
-		return r.writeSinglePlanStatus(ctx, isvc, observations, "")
+		return r.writeSinglePlanStatus(ctx, isvc, observations, "", "")
 	}
 	winner := winnerCluster(isvc)
 	if winner != "" && observations.known[winner] && !observations.projects(winner) {

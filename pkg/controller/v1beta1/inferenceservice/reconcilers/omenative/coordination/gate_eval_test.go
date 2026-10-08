@@ -31,6 +31,26 @@ func TestGateWaitsOnPeerCounters(t *testing.T) {
 	}
 }
 
+// TestEvaluatePlanGate_HoldsUntilARunIsPinned pins the plan gate taken
+// alone, the question the workload asks for a start it admits without the
+// capacity consult: a grouped Component is held while no run is pinned and
+// admitted once one is, whatever its serving counters read.
+func TestEvaluatePlanGate_HoldsUntilARunIsPinned(t *testing.T) {
+	isvc := mkUnavailFixture(iosInt(1))
+	isvc.Status.Rollout = nil
+	allowed, gate, reason := EvaluatePlanGate(isvc, v1beta1.EngineComponent)
+	if allowed || gate != v1beta1.RolloutHoldGatePlan || !strings.Contains(reason, "not pinned") {
+		t.Fatalf("plan gate with no run open = (%v, %q, %q), want the plan hold", allowed, gate, reason)
+	}
+	pinActiveRun(isvc)
+	if allowed, gate, reason := EvaluatePlanGate(isvc, v1beta1.EngineComponent); !allowed {
+		t.Fatalf("plan gate with a run open = (%v, %q, %q), want the start admitted to the capacity gates", allowed, gate, reason)
+	}
+	if allowed, _, _ := EvaluatePlanGate(nil, v1beta1.EngineComponent); !allowed {
+		t.Fatal("a nil service holds nothing, as the full gate stack short-circuits on one")
+	}
+}
+
 // TestEvaluateUpdateGate_DarkRowConsultIsHeldWithoutAndWithARun pins what
 // the gate stack answers when asked about the recreate of an Instance that
 // serves nothing, which is why the workload's repair admission does not

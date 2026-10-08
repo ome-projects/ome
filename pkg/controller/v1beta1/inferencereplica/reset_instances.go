@@ -51,11 +51,11 @@ type resetSkip struct {
 // keeps serving on its old pods) is skipped untouched: draining a
 // serving source is the rollout machinery's job, not this verb's. And
 // only repair-owned parked attempts are in scope (no Operation, Create,
-// Restart — status.ResetOwnsOperation): an Instance parked behind an
-// Update or Migrate continuation is skipped, because the gang abandon,
-// wreckage cleanup, release-held, and migration-expiry paths own those
-// continuations and clearing one here would orphan its surge marker or
-// migration record.
+// Restart, and the recreate the gang verdict ended — status.ResetOwnsRow):
+// an Instance parked behind any other Update or a Migrate continuation is
+// skipped, because the gang abandon, wreckage cleanup, release-held, and
+// migration-expiry paths own those continuations and clearing one here
+// would orphan its surge marker or migration record.
 //
 // Mailbox discipline mirrors consumeReleaseHeldRequest: every present
 // request is answered. A candidate has every pod deleted (live list,
@@ -159,7 +159,9 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 // each pod not already Terminating (ExpectDeletes before the Delete,
 // ObservedDelete on error, NotFound tolerated), then clear the preserved
 // Operation through MutateInstance, which mirrors the committed status
-// onto the caller's IR. Phase and LastFailure are untouched. An Instance
+// onto the caller's IR. LastFailure is untouched, and so is Phase, except
+// that a parked Update attempt read Updating reads Failed once its set is
+// deleted: the mailbox addresses a parked attempt in either phase. An Instance
 // with no pod to delete and no Operation to clear is already in the
 // rebuild shape and is skipped — the branch a re-delivered request lands
 // in. Stops at the first error; Instances already handled stay
@@ -175,16 +177,24 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 	// skipped with its owner named.
 	var candidates []int32
 	classify := func(idx int32, s *v1beta1.OMENativeInstanceStatus) {
-		if !status.ResetOwnsOperation(v1beta1convert.InstanceOperationToWorkload(s.Operation)) {
+		row := v1beta1convert.InstanceStatusToWorkload(*s)
+		if !status.ResetOwnsRow(&row) {
 			skipped = append(skipped, resetSkip{index: idx, reason: "owned by " + string(s.Operation.Type)})
 			return
 		}
 		candidates = append(candidates, idx)
 	}
+	// addressable is the Failed row, and the Update attempt parked after
+	// its disposition in whichever phase its pod set gives it: the row it
+	// stands for is Failed.
+	addressable := func(s *v1beta1.OMENativeInstanceStatus) bool {
+		return s.Phase == v1beta1.OMENativeInstanceFailed ||
+			workloadtypes.OperationParked(v1beta1convert.InstanceOperationToWorkload(s.Operation))
+	}
 	if req.all {
 		failed := make([]int32, 0, len(statuses))
 		for idx, s := range statuses {
-			if s.Phase == v1beta1.OMENativeInstanceFailed {
+			if addressable(s) {
 				failed = append(failed, idx)
 			}
 		}
@@ -198,7 +208,7 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 			switch {
 			case !ok:
 				skipped = append(skipped, resetSkip{index: idx, reason: "no such instance"})
-			case s.Phase != v1beta1.OMENativeInstanceFailed:
+			case !addressable(s):
 				skipped = append(skipped, resetSkip{index: idx, reason: "Phase=" + string(s.Phase)})
 			default:
 				classify(idx, s)

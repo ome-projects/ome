@@ -57,7 +57,7 @@ func Project(
 	// Validate and project one rollout view: the active run's pinned plan when
 	// present, including an intentionally empty plan, and the live spec otherwise.
 	effectiveSpec := isvc.Spec
-	effectiveSpec.Rollout = omerollout.Effective(isvc)
+	effectiveSpec.Rollout = omerollout.Effective(isvc, omerollout.Policies{})
 	b := projector{
 		isvc:          isvc,
 		effectiveSpec: &effectiveSpec,

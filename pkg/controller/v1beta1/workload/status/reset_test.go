@@ -75,6 +75,20 @@ func TestClearFailedInstanceOperation(t *testing.T) {
 			status: types.InstanceStatus{Index: 3, Phase: types.InstancePhaseFailed, Operation: parkedOperation(types.InstanceOperationUpdate), LastFailure: failure},
 		},
 		{
+			name:        "failed with a parked Update attempt clears it",
+			status:      types.InstanceStatus{Index: 3, Phase: types.InstancePhaseFailed, Operation: parkedUpdateAttempt(), LastFailure: failure, Incarnation: 2},
+			wantCleared: true,
+		},
+		{
+			name:        "a parked Update attempt read Updating clears it and reads Failed",
+			status:      types.InstanceStatus{Index: 3, Phase: types.InstancePhaseUpdating, Operation: parkedUpdateAttempt(), LastFailure: failure, Incarnation: 2},
+			wantCleared: true,
+		},
+		{
+			name:   "updating with an Update attempt in flight writes nothing",
+			status: types.InstanceStatus{Index: 3, Phase: types.InstancePhaseUpdating, Operation: parkedOperation(types.InstanceOperationUpdate), LastFailure: failure},
+		},
+		{
 			name:   "failed with preserved Migrate is refused",
 			status: types.InstanceStatus{Index: 3, Phase: types.InstancePhaseFailed, Operation: parkedOperation(types.InstanceOperationMigrate)},
 		},
@@ -118,7 +132,7 @@ func TestClearFailedInstanceOperation(t *testing.T) {
 				t.Fatalf("Operation must be cleared, got %+v", s.Operation)
 			}
 			if s.Phase != types.InstancePhaseFailed {
-				t.Fatalf("Phase must stay Failed, got %q", s.Phase)
+				t.Fatalf("Phase must read Failed, got %q", s.Phase)
 			}
 			if s.LastFailure != failure || s.Incarnation != before.Incarnation {
 				t.Fatalf("LastFailure and Incarnation must survive: got %+v", s)
@@ -195,4 +209,51 @@ func TestCloseSpentRepair(t *testing.T) {
 			t.Fatalf("err = %v, want %v", err, want)
 		}
 	})
+}
+
+// parkedUpdateAttempt is an Update attempt parked after its disposition.
+func parkedUpdateAttempt() *types.InstanceOperation {
+	parked := parkedOperation(types.InstanceOperationUpdate)
+	parked.Step = types.UpdateStepParked
+	parked.Waiting = string(types.RolloutHoldGateRetryBlock)
+	return parked
+}
+
+// A parked Update attempt is the reset's to clear: it is a spent attempt
+// like a parked repair, not a continuation the rollout machinery owns.
+func TestResetOwnsOperation_ParkedUpdateAttempt(t *testing.T) {
+	parked := parkedUpdateAttempt()
+	if !status.ResetOwnsOperation(parked) {
+		t.Fatalf("a parked Update attempt must be reset-owned")
+	}
+}
+
+// A recreate the gang verdict ended keeps an Update continuation no pass
+// re-drives at its pinned revision, so the reset owns it as it owns a
+// parked attempt; any other Update continuation stays the rollout's.
+func TestResetOwnsRow_RecreateEndedByTheGangVerdict(t *testing.T) {
+	drain := &types.InstanceOperation{ID: "update-3-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepDrain, TargetRevision: "rev-b"}
+	verdict := &types.InstanceTermination{Reason: types.PodGroupOwnershipConflictReason, Message: "PodGroup engine-3 is controlled by StatefulSet/other-owner, not by this owner"}
+	ended := types.InstanceStatus{Index: 3, Phase: types.InstancePhaseFailed, RunningRevision: "rev-a", Operation: drain, LastFailure: verdict, Incarnation: 2}
+	if !status.ResetOwnsRow(&ended) {
+		t.Fatalf("a recreate the gang verdict ended must be reset-owned")
+	}
+	deadline := ended
+	deadline.LastFailure = &types.InstanceTermination{Reason: "DeadlineExceeded"}
+	if status.ResetOwnsRow(&deadline) {
+		t.Errorf("an Update continuation ended any other way stays the rollout's")
+	}
+
+	store := map[int32]*types.InstanceStatus{3: &ended}
+	mutate := func(_ context.Context, idx int32, fn func(*types.InstanceStatus) bool) error {
+		fn(store[idx])
+		return nil
+	}
+	cleared, err := status.ClearFailedInstanceOperation(context.Background(), mutate, 3)
+	if err != nil || !cleared {
+		t.Fatalf("ClearFailedInstanceOperation: cleared=%v err=%v, want the kept recreate cleared", cleared, err)
+	}
+	if got := store[3]; got.Operation != nil || got.Phase != types.InstancePhaseFailed || got.LastFailure != verdict || got.RunningRevision != "rev-a" || got.Incarnation != 2 {
+		t.Errorf("row after the reset = %+v, want Failed with no operation and everything else kept", got)
+	}
 }

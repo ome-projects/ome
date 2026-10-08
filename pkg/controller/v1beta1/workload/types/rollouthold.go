@@ -55,3 +55,25 @@ type RolloutHold struct {
 	// Target is the ControllerRevision name the held Update was aimed at.
 	Target string
 }
+
+// ParkedWaitingReason reports whether token names a rollout hold gate:
+// the vocabulary of the wait a parked attempt names on Operation.Waiting.
+// The hold authorities never write one.
+func ParkedWaitingReason(token string) bool {
+	switch RolloutHoldGate(token) {
+	case RolloutHoldGateRatio, RolloutHoldGateSequential, RolloutHoldGateBudget,
+		RolloutHoldGateRetryBlock, RolloutHoldGateHeld, RolloutHoldGatePairing:
+		return true
+	}
+	return false
+}
+
+// OperationParked reports whether op is an Update attempt parked after
+// its disposition: its deadline or a wedged pod ended it while its pod
+// set was still alive, so the row keeps it on the parked step with the
+// wait the next attempt stands behind. No pass drives a parked attempt;
+// the update trigger re-opens the row as a fresh start once that wait
+// ends, and the row's phase is whatever its pod set earns.
+func OperationParked(op *InstanceOperation) bool {
+	return op != nil && op.Type == InstanceOperationUpdate && op.Step == UpdateStepParked
+}

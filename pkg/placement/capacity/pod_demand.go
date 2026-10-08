@@ -26,7 +26,9 @@ type PodSet struct {
 	Spec  *corev1.PodSpec
 }
 
-// ReplicaUnit contains one replica of each declared Engine/Decoder component.
+// ReplicaUnit contains the declared Engine/Decoder components in the ratio of
+// their minimums. Units holds each component's replica count within one unit;
+// an absent entry means one replica and zero leaves the component out.
 // InputFingerprint identifies the resolved runtime and rendering dependencies.
 // The caller supplies complete pod templates, including admission resources
 // such as RuntimeClass overhead. Router has a separate per-home replica policy.
@@ -34,6 +36,7 @@ type ReplicaUnit struct {
 	InputFingerprint string
 	Engine           []PodSet
 	Decoder          []PodSet
+	Units            map[v1beta1.ComponentType]int64
 }
 
 // PodDemand retains the pod's scheduling constraints for flavor attribution.
@@ -46,9 +49,12 @@ type PodDemand struct {
 
 // UnitDemand is measured accelerator demand before resource/flavor attribution.
 // Its fingerprint includes all supplied pod shapes and rendering dependencies.
+// PrimaryUnits is the number of primary-component replicas the measured unit
+// contains; hardware divided by this demand counts whole units of that many.
 type UnitDemand struct {
-	Fingerprint string
-	Pods        []PodDemand
+	Fingerprint  string
+	Pods         []PodDemand
+	PrimaryUnits int64
 }
 
 // MeasureUnit accounts regular containers, ordered restartable init containers,
@@ -77,6 +83,23 @@ func MeasureUnit(unit ReplicaUnit, acceleratorResources []string) (UnitDemand, e
 		name v1beta1.ComponentType
 		pods []PodSet
 	}{{v1beta1.EngineComponent, unit.Engine}, {v1beta1.DecoderComponent, unit.Decoder}} {
+		replicas, err := unitReplicas(unit.Units, component.name)
+		if err != nil {
+			return UnitDemand{}, err
+		}
+		if len(component.pods) == 0 {
+			continue
+		}
+		// The first declared component is the placement unit and must be present.
+		if out.PrimaryUnits == 0 {
+			if replicas == 0 {
+				return UnitDemand{}, fmt.Errorf("%s replica unit multiplicity must be positive", component.name)
+			}
+			out.PrimaryUnits = replicas
+		}
+		if replicas == 0 {
+			continue
+		}
 		sets := slices.Clone(component.pods)
 		slices.SortFunc(sets, func(a, b PodSet) int { return cmp.Compare(a.Name, b.Name) })
 		for i, set := range sets {
@@ -86,6 +109,10 @@ func MeasureUnit(unit ReplicaUnit, acceleratorResources []string) (UnitDemand, e
 			if i > 0 && sets[i-1].Name == set.Name {
 				return UnitDemand{}, fmt.Errorf("duplicate %s pod set %q", component.name, set.Name)
 			}
+			if set.Count > math.MaxInt64/replicas {
+				return UnitDemand{}, fmt.Errorf("%s pod set %q count exceeds int64 within the replica unit", component.name, set.Name)
+			}
+			set.Count *= replicas
 			set.Spec = set.Spec.DeepCopy()
 			requests, err := measurePod(set.Spec, wanted)
 			if err != nil {
@@ -116,6 +143,19 @@ func MeasureUnit(unit ReplicaUnit, acceleratorResources []string) (UnitDemand, e
 	sum := sha256.Sum256(encoded)
 	out.Fingerprint = hex.EncodeToString(sum[:])
 	return out, nil
+}
+
+// unitReplicas reads a component's replica count within the measured unit.
+// An absent entry is one replica; an explicit zero excludes the component.
+func unitReplicas(units map[v1beta1.ComponentType]int64, component v1beta1.ComponentType) (int64, error) {
+	replicas, declared := units[component]
+	if !declared {
+		return 1, nil
+	}
+	if replicas < 0 {
+		return 0, fmt.Errorf("%s replica unit multiplicity must be nonnegative", component)
+	}
+	return replicas, nil
 }
 
 func measurePod(spec *corev1.PodSpec, wanted map[corev1.ResourceName]bool) (corev1.ResourceList, error) {

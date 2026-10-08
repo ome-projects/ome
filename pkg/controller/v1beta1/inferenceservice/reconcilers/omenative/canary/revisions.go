@@ -52,6 +52,45 @@ func recordRolledBackRevisions(in ReconcileInputs, stableHash string) {
 	}
 }
 
+// recordSettledRevisions keeps the records of a unit with no ladder active
+// level with its InferenceReplicas: every member that has settled on one
+// revision is recorded on it, through the writer coordination uses for the
+// Components it owns. Outside an armed ladder a record is not the memory of
+// a traffic shift, and one left naming a revision no Instance runs would
+// resolve as the member's stable in the next run that pins it. A member
+// recorded on the revision already changes nothing.
+func recordSettledRevisions(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, primary v1beta1.ComponentType, primaryObserved observedCanaryRevisions, secondaryObserved map[v1beta1.ComponentType]observedCanaryRevisions, total, ready map[v1beta1.ComponentType]map[string]int32) {
+	for _, c := range configuredComponents(g) {
+		observed := primaryObserved
+		if c != primary {
+			observed = secondaryObserved[c]
+		}
+		if hash := settledRevision(observed, total[c], ready[c]); hash != "" {
+			recordRolledOut(isvc, c, hash, "")
+		}
+	}
+}
+
+// settledRevision is the one revision a member stands on: the IR's current
+// and target revision agree on it, read at the IR's generation, every pod of
+// the member runs it and at least one is Ready, so the revision owns the
+// member's traffic. Anything less, a pod of another revision or no Ready pod
+// yet, is not settled and returns "".
+func settledRevision(o observedCanaryRevisions, total, ready map[string]int32) string {
+	if !o.fromIR || !o.statusFresh || o.currentHash == "" || o.currentHash != o.targetHash {
+		return ""
+	}
+	if ready[o.currentHash] == 0 {
+		return ""
+	}
+	for hash, n := range total {
+		if hash != o.currentHash && n > 0 {
+			return ""
+		}
+	}
+	return o.currentHash
+}
+
 // setLatestReady writes one member's LatestReadyRevision, named under the
 // member's replica prefix; no hash writes nothing.
 func setLatestReady(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, hash string) {

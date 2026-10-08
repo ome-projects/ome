@@ -331,6 +331,16 @@ func deploymentStrategyWarnings(isvc *v1beta1.InferenceService) admission.Warnin
 	return warnings
 }
 
+// placementMaxSurgeWarnings flags the deprecated spec.placement.maxSurge. The
+// placer ignores it: a move may hold one extra full copy of the desired
+// allocation.
+func placementMaxSurgeWarnings(isvc *v1beta1.InferenceService) admission.Warnings {
+	if isvc.Spec.Placement == nil || isvc.Spec.Placement.MaxSurge == nil { //nolint:staticcheck // Reads the deprecated field only to warn about it.
+		return nil
+	}
+	return admission.Warnings{"spec.placement.maxSurge is deprecated and ignored; a placement move may hold one extra full copy of the desired allocation"}
+}
+
 func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context, isvc *v1beta1.InferenceService) (admission.Warnings, error) {
 	var allWarnings admission.Warnings
 
@@ -461,6 +471,7 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 	// OMENative / PD it is silently ignored. Warn so operators move rollout
 	// pacing to lifecycle.updateStrategy, which OMENative actually reads.
 	allWarnings = append(allWarnings, deploymentStrategyWarnings(isvc)...)
+	allWarnings = append(allWarnings, placementMaxSurgeWarnings(isvc)...)
 
 	// At least one of spec.model or spec.runtime must be set. When
 	// spec.model is omitted (lean path), spec.runtime must name the

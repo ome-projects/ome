@@ -305,14 +305,14 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 		}
 	}
 
+	soleFit := false
 	if !pinned {
-		d, id, status := g.planDomain(nodes, gang, placement, free, need, pod)
+		d, id, sole, status := g.planDomain(nodes, gang, placement, free, need, pod)
 		if status != nil {
 			klog.V(4).InfoS("gangpack.pinGang.no_fit", "gang", gang.key, "status", status.Message())
 			return nil, status
 		}
-		domain = d
-		commitment = id
+		domain, commitment, soleFit = d, id, sole
 	}
 	domainNodes := nodeInfosInDomain(nodes, gang.topologyKey, domain)
 	candidates := matchingCandidateNodesForNeed(domainNodes, gang.topologyKey, domain, templates, need)
@@ -321,6 +321,9 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 			"pinned domain "+domain+" has no node feasible for gang member "+gang.key)
 	}
 	writePin(state, domain, gang, commitment)
+	if soleFit {
+		markSoleFit(state)
+	}
 	klog.V(4).InfoS("gangpack.pinGang.result", "gang", gang.key, "domain", domain, "narrowedNodes", candidates.Len())
 	return &framework.PreFilterResult{NodeNames: candidates}, nil
 }
@@ -328,16 +331,17 @@ func (g *GangPack) pinGang(state framework.CycleState, nodes []framework.NodeInf
 // planDomain commits an unpinned gang to a domain: it adopts the domain of any
 // already-placed members (failover / lost pin), else best-fits a fresh one. It
 // records the pin and the placement metric. status is non-nil (Unschedulable)
-// only when the gang fits in no domain.
+// only when the gang fits in no domain. soleFit reports that no other domain
+// could take the gang, so a veto in this one has nothing left to re-plan into.
 //
 // Room the snapshot has but Choose withholds belongs to another gang's
 // outstanding reservation. That reservation draining or unwinding produces no
 // cluster event, so pod is remembered and woken with the reservation's other
 // blocked pods; a gang short of capacity everywhere is left to the registered
 // pod and node events.
-func (g *GangPack) planDomain(nodes []framework.NodeInfo, gang gangInfo, bound boundGangPlacement, free topology.FreeByDomain, need int, pod *v1.Pod) (string, uint64, *framework.Status) {
+func (g *GangPack) planDomain(nodes []framework.NodeInfo, gang gangInfo, bound boundGangPlacement, free topology.FreeByDomain, need int, pod *v1.Pod) (domain string, id uint64, soleFit bool, status *framework.Status) {
 	if bound.split {
-		return "", 0, framework.NewStatus(framework.UnschedulableAndUnresolvable,
+		return "", 0, false, framework.NewStatus(framework.UnschedulableAndUnresolvable,
 			"gang "+gang.key+" already has members in multiple topology domains")
 	}
 	if d, count := bound.domain, bound.count; count > 0 {
@@ -348,16 +352,17 @@ func (g *GangPack) planDomain(nodes []framework.NodeInfo, gang gangInfo, bound b
 		gangPinTotal.WithLabelValues("adopted").Inc()
 		pinnedGroups.Set(float64(g.pins.Len()))
 		if free[d] < need {
-			return "", 0, framework.NewStatus(framework.Unschedulable,
+			return "", 0, false, framework.NewStatus(framework.Unschedulable,
 				"adopted domain "+d+" cannot fit remaining gang members "+gang.key)
 		}
-		return d, id, nil
+		return d, id, true, nil
 	}
 	choice, hadFailed := g.withoutFailedDomains(gang, free)
 	d, id, fits := g.pins.ChooseForOwnerInTopologyOnNodes(gang.key, gang.uid, gang.topologyKey, choice,
 		nodeNamesByDomain(nodes, gang.topologyKey), need)
 	if !fits && hadFailed {
 		g.clearFailedDomains(gang)
+		choice = free
 		d, id, fits = g.pins.ChooseForOwnerInTopologyOnNodes(gang.key, gang.uid, gang.topologyKey, free,
 			nodeNamesByDomain(nodes, gang.topologyKey), need)
 	}
@@ -365,15 +370,26 @@ func (g *GangPack) planDomain(nodes []framework.NodeInfo, gang gangInfo, bound b
 		if _, room := topology.BestFit(free, need); room {
 			g.rememberReservationBlocked(pod)
 			gangPinTotal.WithLabelValues("reserved").Inc()
-			return "", 0, framework.NewStatus(framework.Unschedulable,
+			return "", 0, false, framework.NewStatus(framework.Unschedulable,
 				"no domain has room for gang "+gang.key+": every fitting domain is reserved for a forming gang")
 		}
 		gangPinTotal.WithLabelValues("no_fit").Inc()
-		return "", 0, framework.NewStatus(framework.Unschedulable, "no domain has room for gang "+gang.key)
+		return "", 0, false, framework.NewStatus(framework.Unschedulable, "no domain has room for gang "+gang.key)
 	}
 	gangPinTotal.WithLabelValues("pinned").Inc()
 	pinnedGroups.Set(float64(g.pins.Len()))
-	return d, id, nil
+	return d, id, fittingDomains(choice, need) < 2, nil
+}
+
+// fittingDomains counts the domains with room for the whole gang.
+func fittingDomains(free topology.FreeByDomain, need int) int {
+	n := 0
+	for _, room := range free {
+		if room >= need {
+			n++
+		}
+	}
+	return n
 }
 
 // PreFilterExtensions returns nil: the plugin does not incrementally re-evaluate

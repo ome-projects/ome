@@ -103,3 +103,22 @@ func gateNotFoldedPod(name string, since time.Time) *corev1.Pod {
 		},
 	}
 }
+
+// unreadyAfterServingPod builds the shape of a promoted pod whose
+// readiness probe stopped passing at since: phase Running, the container
+// still running, the serving gate the controller wrote at promotion still
+// True, and ContainersReady and Ready False since then.
+func unreadyAfterServingPod(name string, since time.Time) *corev1.Pod {
+	pod := servingPod(name)
+	pod.CreationTimestamp = metav1.NewTime(since.Add(-time.Hour))
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses[0].Ready = false
+	for i := range pod.Status.Conditions {
+		switch pod.Status.Conditions[i].Type {
+		case corev1.ContainersReady, corev1.PodReady:
+			pod.Status.Conditions[i].Status = corev1.ConditionFalse
+			pod.Status.Conditions[i].LastTransitionTime = metav1.NewTime(since)
+		}
+	}
+	return pod
+}

@@ -1,14 +1,19 @@
 package placement
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 )
@@ -179,5 +184,100 @@ func TestCapacityHoldPreservesAcceptedAllocation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCapacityHoldKeepsAcknowledgedPlan settles a capacity split whose members
+// acknowledged the accepted plan, then holds that plan on passes that read no
+// member: unknown capacity, then a plan write that fails. Every hold pass keeps
+// each member's acknowledged plan behind an unknown observation, and the next
+// readable pass reports the acknowledgement it observes.
+func TestCapacityHoldKeepsAcknowledgedPlan(t *testing.T) {
+	f := newCapacityProviderFixture(t)
+	bf := &backendFixture{source: f.source, workers: f.workers, reconciler: f.r}
+	floors := map[string]int32{"member-a": 8, "member-b": 4}
+	settled := bf.reconcile(t)
+	acknowledged := func(source *v1beta1.InferenceService) bool {
+		for name := range floors {
+			candidate := candidateOf(t, source, name)
+			if !candidate.ObservationKnown || candidate.AppliedPlanID != source.Status.Placement.Plan.ID {
+				return false
+			}
+		}
+		return true
+	}
+	for pass := 0; pass < 8 && !acknowledged(settled); pass++ {
+		for name, floor := range floors {
+			projectAllHome(t, bf, name, floor)
+		}
+		settled = bf.reconcile(t)
+	}
+	if !acknowledged(settled) {
+		t.Fatalf("members did not acknowledge the accepted plan: %+v", settled.Status.Placement.Candidates)
+	}
+	accepted := settled.Status.Placement.Plan.DeepCopy()
+
+	assertHeld := func(t *testing.T, got *v1beta1.InferenceService, reason string) {
+		t.Helper()
+		if diff := cmp.Diff(reason, got.Status.GetCondition(v1beta1.PlacementConverged).Reason); diff != "" {
+			t.Fatalf("hold reason (-want +got):\n%s", diff)
+		}
+		if diff := cmp.Diff(accepted, got.Status.Placement.Plan); diff != "" {
+			t.Fatalf("%s changed the accepted plan (-want +got):\n%s", reason, diff)
+		}
+		for name := range floors {
+			candidate := candidateOf(t, got, name)
+			if diff := cmp.Diff(accepted.ID, candidate.AppliedPlanID); diff != "" {
+				t.Fatalf("%s blanked the acknowledged plan on %s (-want +got):\n%s", reason, name, diff)
+			}
+			if candidate.ObservationKnown {
+				t.Fatalf("%s reported a current observation of %s without reading it", reason, name)
+			}
+		}
+	}
+
+	f.clock.Step(providerConfig().MaxAge)
+	assertHeld(t, bf.reconcile(t), "CapacityUnknown")
+
+	// Fresh reports and a new demand produce a plan the store cannot write.
+	for _, cluster := range f.clusters {
+		root := &v1beta1.AcceleratorQuota{}
+		if err := f.workers[cluster.Name].Get(t.Context(), client.ObjectKey{Name: providerConfig().RootName}, root); err != nil {
+			t.Fatal(err)
+		}
+		root.Status.Capacity[0].ObservedAt = &metav1.Time{Time: f.clock.Now()}
+		if err := f.workers[cluster.Name].Update(t.Context(), root); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.syncFleet(t)
+	source := &v1beta1.InferenceService{}
+	if err := f.r.Get(t.Context(), client.ObjectKeyFromObject(f.source), source); err != nil {
+		t.Fatal(err)
+	}
+	source.Spec.Placement.Split.Replicas = ptr.To[int32](14)
+	source.Generation++
+	if err := f.r.Update(t.Context(), source); err != nil {
+		t.Fatal(err)
+	}
+	writer := f.r.Client
+	f.r.Client = interceptor.NewClient(writer.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if written, ok := obj.(*v1beta1.InferenceService); ok && written.Status.Placement != nil && written.Status.Placement.Plan != nil && written.Status.Placement.Plan.ID != accepted.ID {
+			return errors.New("plan write rejected")
+		}
+		return c.SubResource(name).Update(ctx, obj, opts...)
+	}})
+	assertHeld(t, bf.reconcile(t), "PlanNotPersisted")
+
+	f.r.Client = writer
+	readable := bf.reconcile(t)
+	if readable.Status.Placement.Plan.ID == accepted.ID {
+		t.Fatal("readable pass did not persist the new plan")
+	}
+	for name := range floors {
+		candidate := candidateOf(t, readable, name)
+		if !candidate.ObservationKnown || candidate.AppliedPlanID != "" {
+			t.Fatalf("readable pass kept a stale acknowledgement on %s: %+v", name, candidate)
+		}
 	}
 }

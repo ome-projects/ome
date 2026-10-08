@@ -210,7 +210,7 @@ func armLadderCanaryWire(t *testing.T, steps []v1beta1.RolloutGroupStep, t0 time
 	ctx := context.Background()
 	rec := record.NewFakeRecorder(16)
 	w := &timedCanaryWire{ctx: ctx, client: c, rec: rec, isvc: isvc, ns: ns,
-		deps: DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc), Now: t0}}
+		deps: DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{}), Now: t0}}
 	if _, err := Dispatch(ctx, w.deps); err != nil {
 		t.Fatalf("Dispatch arming the canary: %v", err)
 	}

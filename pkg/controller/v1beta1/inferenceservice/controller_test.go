@@ -1409,7 +1409,7 @@ func TestFlushStatusThenConsumeOrdersRemovalAfterTheWrite(t *testing.T) {
 		isvc := newISVC()
 		live := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc).WithStatusSubresource(isvc).Build()
 		reconciler := &InferenceServiceReconciler{Client: live, APIReader: live, Scheme: scheme, Log: ctrl.Log.WithName("test"), Recorder: record.NewFakeRecorder(10)}
-		err := reconciler.flushStatusThenConsume(context.TODO(), desiredFrom(live), constants.OMENative, []string{constants.RolloutPromoteAnnotation}, nil)
+		err := reconciler.FlushStatusThenConsume(context.TODO(), desiredFrom(live), constants.OMENative, []string{constants.RolloutPromoteAnnotation}, nil)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		persisted := &v1beta1.InferenceService{}
 		g.Expect(live.Get(context.TODO(), nn, persisted)).NotTo(gomega.HaveOccurred())
@@ -1427,7 +1427,7 @@ func TestFlushStatusThenConsumeOrdersRemovalAfterTheWrite(t *testing.T) {
 			},
 		})
 		reconciler := &InferenceServiceReconciler{Client: failing, APIReader: live, Scheme: scheme, Log: ctrl.Log.WithName("test"), Recorder: record.NewFakeRecorder(10)}
-		err := reconciler.flushStatusThenConsume(context.TODO(), desiredFrom(live), constants.OMENative, []string{constants.RolloutPromoteAnnotation}, nil)
+		err := reconciler.FlushStatusThenConsume(context.TODO(), desiredFrom(live), constants.OMENative, []string{constants.RolloutPromoteAnnotation}, nil)
 		g.Expect(err).To(gomega.HaveOccurred())
 		persisted := &v1beta1.InferenceService{}
 		g.Expect(live.Get(context.TODO(), nn, persisted)).NotTo(gomega.HaveOccurred())
@@ -1513,7 +1513,7 @@ func TestUpdateStatusKeepsTheLiveCanaryRecordOverAStalePass(t *testing.T) {
 		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", CurrentStep: 1, PromotedThrough: "new"}, v1beta1.RolloutPhasePending)
 		delete(working.Annotations, constants.RolloutPromoteAnnotation)
 
-		g.Expect(reconciler.flushStatusThenConsume(context.TODO(), working, constants.OMENative, []string{constants.RolloutPromoteAnnotation}, base)).NotTo(gomega.HaveOccurred())
+		g.Expect(reconciler.FlushStatusThenConsume(context.TODO(), working, constants.OMENative, []string{constants.RolloutPromoteAnnotation}, base)).NotTo(gomega.HaveOccurred())
 		got := persisted(live)
 		g.Expect(engine(got).Canary.CurrentStep).To(gomega.Equal(int32(0)))
 		g.Expect(engine(got).Canary.PromotedThrough).To(gomega.BeEmpty())
@@ -1531,7 +1531,7 @@ func TestUpdateStatusKeepsTheLiveCanaryRecordOverAStalePass(t *testing.T) {
 		working.Status = statusWith(&v1beta1.CanaryStatus{CanaryRevisionHash: "new", StableRevisionHash: "old", ObservedTrafficWeight: 50, CurrentStep: 1, PromotedThrough: "new"}, v1beta1.RolloutPhasePending)
 		delete(working.Annotations, constants.RolloutPromoteAnnotation)
 
-		g.Expect(reconciler.flushStatusThenConsume(context.TODO(), working, constants.OMENative, []string{constants.RolloutPromoteAnnotation}, base)).NotTo(gomega.HaveOccurred())
+		g.Expect(reconciler.FlushStatusThenConsume(context.TODO(), working, constants.OMENative, []string{constants.RolloutPromoteAnnotation}, base)).NotTo(gomega.HaveOccurred())
 		g.Expect(base.Stale()).To(gomega.BeFalse())
 		got := persisted(live)
 		g.Expect(engine(got).Canary.CurrentStep).To(gomega.Equal(int32(1)))

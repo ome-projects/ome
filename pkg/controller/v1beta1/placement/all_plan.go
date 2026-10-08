@@ -25,7 +25,7 @@ import (
 // An incomplete initial inventory permits independent additive provisioning
 // only while the original source intent and matched membership remain fixed.
 func (r *Reconciler) reconcileAllPlanned(ctx context.Context, source *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster, eligible []string, standing *placementObservations) (ctrl.Result, error) {
-	proposal, err := r.allProposal(ctx, source, clusters, eligible)
+	proposal, holds, err := r.allProposal(ctx, source, clusters, eligible)
 	if err != nil {
 		return r.writeSplitHold(ctx, source, standing, "HomePolicyUnresolved", err)
 	}
@@ -40,14 +40,17 @@ func (r *Reconciler) reconcileAllPlanned(ctx context.Context, source *v1beta1.In
 	if refresh {
 		return r.applyAllMovementFloors(ctx, source, eligible, standing, proposal)
 	}
-	return r.executePlannedAllocation(ctx, source, eligible, standing, proposal)
+	return r.executePlannedAllocation(ctx, source, eligible, standing, proposal, holds)
 }
 
-func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster, eligible []string) (plan.Proposal, error) {
+// allProposal resolves every matched home's full policy. Homes whose policy
+// cannot be resolved stay pending; their causes are returned for the status.
+func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster, eligible []string) (plan.Proposal, []string, error) {
 	out := plan.Proposal{Mode: v1beta1.PlacementModeAll, Assignments: map[string]v1beta1.CandidateAllocationStatus{}}
+	var holds []string
 	selector, err := placementSelector(source)
 	if err != nil {
-		return out, err
+		return out, nil, err
 	}
 	matched := map[string]types.UID{}
 	terms := map[string][]int32{}
@@ -55,7 +58,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 	for i := range clusters {
 		cluster := &clusters[i]
 		if cluster.UID == "" || cluster.Name == "" || registered[cluster.Name] != "" {
-			return out, fmt.Errorf("home inventory requires distinct identified registrations")
+			return out, nil, fmt.Errorf("home inventory requires distinct identified registrations")
 		}
 		registered[cluster.Name] = cluster.UID
 		if match, ok := selector.Match(cluster); ok && cluster.DeletionTimestamp.IsZero() {
@@ -68,7 +71,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 		Members             map[string]types.UID
 	}{source.Spec, source.Labels, source.Annotations, matched})
 	if err != nil {
-		return out, err
+		return out, nil, err
 	}
 	digest := sha256.Sum256(encoded)
 	out.InputDigest = hex.EncodeToString(digest[:])
@@ -76,12 +79,12 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 	if !initial {
 		previous := source.Status.Placement.Plan
 		if previous.SourceUID != source.UID || previous.Mode != v1beta1.PlacementModeAll {
-			return out, fmt.Errorf("standing allocation must be reconciled in its accepted placement mode")
+			return out, nil, fmt.Errorf("standing allocation must be reconciled in its accepted placement mode")
 		}
 		out.AdoptionDigest, out.PauseSurge = previous.AdoptionDigest, previous.PauseSurge
 		for _, candidate := range source.Status.Placement.Candidates {
 			if candidate.Allocation == nil {
-				return out, fmt.Errorf("standing home %q has no allocation authority", candidate.Cluster)
+				return out, nil, fmt.Errorf("standing home %q has no allocation authority", candidate.Cluster)
 			}
 			out.Assignments[candidate.Cluster] = *candidate.Allocation.DeepCopy()
 		}
@@ -89,7 +92,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 		out.AdoptionDigest = out.InputDigest
 		for _, candidate := range standingPlacementCandidates(source) {
 			if registered[candidate.Cluster] == "" {
-				return out, fmt.Errorf("standing home %q has no identified registration", candidate.Cluster)
+				return out, nil, fmt.Errorf("standing home %q has no identified registration", candidate.Cluster)
 			}
 		}
 		// A member write may precede its first successful source status write.
@@ -100,7 +103,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 	for name, uid := range matched {
 		a, exists := out.Assignments[name]
 		if exists && a.ClusterUID != uid {
-			return out, fmt.Errorf("home %q registration identity changed", name)
+			return out, nil, fmt.Errorf("home %q registration identity changed", name)
 		}
 		if !exists {
 			a = v1beta1.CandidateAllocationStatus{ClusterUID: uid, InventoryPending: true}
@@ -109,7 +112,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 	}
 	desired, err := r.derivedFor(source)
 	if err != nil {
-		return out, err
+		return out, nil, err
 	}
 	pending := false
 	for _, name := range slices.Sorted(maps.Keys(out.Assignments)) {
@@ -135,6 +138,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 				a.DesiredReplicas, _ = protocol.ValidateReplicaFloors(home.ReplicaFloors)
 			} else {
 				r.Log.V(1).Info("home policy is unresolved", "cluster", name, "error", resolveErr)
+				holds = append(holds, fmt.Sprintf("home policy is unresolved on %s: %v", name, resolveErr))
 			}
 		}
 		cancel()
@@ -165,7 +169,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 			}
 		}
 	}
-	return out, nil
+	return out, holds, nil
 }
 
 func (r *Reconciler) resolveFullHome(ctx context.Context, source, desired *v1beta1.InferenceService, name string, uid types.UID, digest string) (*v1beta1.PlacementHomePolicy, error) {

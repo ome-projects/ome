@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -220,4 +221,51 @@ func TestReconcile_UnbumpedMemberRecordsItsRevisionWithoutDemotion(t *testing.T)
 		t.Fatalf("the ungated final step completes, got %+v", res)
 	}
 	expectRevisions(t, isvc, v1beta1.DecoderComponent, revisionWant{ready: "decold", latest: "decold"})
+}
+
+// With no ladder active, each member is recorded on the one revision its
+// replica has settled on: the pair agrees at the replica's generation, a pod
+// of it is Ready and no pod of another revision exists. A member recorded
+// there already changes nothing; one recorded elsewhere moves to it and the
+// prior latest is demoted to previous. Anything less than settled records
+// nothing.
+func TestRecordSettledRevisionsFollowsTheReplica(t *testing.T) {
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "team-a"}}
+	g := &v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}}
+	settled := func(hash string) observedCanaryRevisions {
+		return observedCanaryRevisions{currentHash: hash, targetHash: hash, fromIR: true, statusFresh: true}
+	}
+	pods := func(engine, decoder string) map[v1beta1.ComponentType]map[string]int32 {
+		return map[v1beta1.ComponentType]map[string]int32{
+			v1beta1.EngineComponent:  {engine: 2},
+			v1beta1.DecoderComponent: {decoder: 1},
+		}
+	}
+	secondaries := map[v1beta1.ComponentType]observedCanaryRevisions{v1beta1.DecoderComponent: settled("dnew")}
+
+	recordSettledRevisions(isvc, g, v1beta1.EngineComponent, settled("engnew"), secondaries, pods("engnew", "dnew"), pods("engnew", "dnew"))
+	expectRevisions(t, isvc, v1beta1.EngineComponent, revisionWant{ready: "engnew", latest: "engnew"})
+	expectRevisions(t, isvc, v1beta1.DecoderComponent, revisionWant{ready: "dnew", latest: "dnew"})
+
+	recordSettledRevisions(isvc, g, v1beta1.EngineComponent, settled("engnew"), secondaries, pods("engnew", "dnew"), pods("engnew", "dnew"))
+	expectRevisions(t, isvc, v1beta1.EngineComponent, revisionWant{ready: "engnew", latest: "engnew"})
+
+	recordSettledRevisions(isvc, g, v1beta1.EngineComponent, settled("engnext"), secondaries, pods("engnext", "dnew"), pods("engnext", "dnew"))
+	expectRevisions(t, isvc, v1beta1.EngineComponent, revisionWant{ready: "engnext", latest: "engnext", previous: "engnew"})
+	expectRevisions(t, isvc, v1beta1.DecoderComponent, revisionWant{ready: "dnew", latest: "dnew"})
+
+	for name, tc := range map[string]struct {
+		observed     observedCanaryRevisions
+		total, ready map[string]int32
+	}{
+		"a pod of another revision":  {settled("x"), map[string]int32{"x": 1, "y": 1}, map[string]int32{"x": 1}},
+		"no Ready pod":               {settled("x"), map[string]int32{"x": 1}, map[string]int32{}},
+		"a pair that disagrees":      {observedCanaryRevisions{currentHash: "x", targetHash: "y", fromIR: true, statusFresh: true}, map[string]int32{"x": 1}, map[string]int32{"x": 1}},
+		"a status behind generation": {observedCanaryRevisions{currentHash: "x", targetHash: "x", fromIR: true}, map[string]int32{"x": 1}, map[string]int32{"x": 1}},
+		"no replica observation":     {observedCanaryRevisions{currentHash: "x", targetHash: "x", statusFresh: true}, map[string]int32{"x": 1}, map[string]int32{"x": 1}},
+	} {
+		if got := settledRevision(tc.observed, tc.total, tc.ready); got != "" {
+			t.Errorf("%s: settledRevision = %q, want nothing", name, got)
+		}
+	}
 }

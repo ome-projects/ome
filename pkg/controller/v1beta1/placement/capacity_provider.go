@@ -134,7 +134,13 @@ func (r *Reconciler) resolveCapacityOn(ctx context.Context, cl client.Client, so
 	} else if !isOurDerived(standing, source) || standing.UID == "" || !standing.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("capacity member is not an identified live derived service")
 	}
-	resolver := resolution.Resolver{Client: cl, OperatorNamespace: r.MemberOperatorNamespace}
+	// The measured unit follows the source ratio; an unresolved fleet floor
+	// measures one replica of each component and holds at planning instead.
+	var units map[v1beta1.ComponentType]int64
+	if minimums, err := splitComponentMinimums(source); err == nil {
+		units = protocol.ReplicaUnitRatio(minimums.floors)
+	}
+	resolver := resolution.Resolver{Client: cl, OperatorNamespace: r.MemberOperatorNamespace, ComponentUnits: units}
 	demand, err := resolver.ResolveDemand(ctx, desired, standing, r.Capacity.RootName)
 	if err != nil {
 		return nil, err
@@ -176,7 +182,11 @@ func (r *Reconciler) checkCapacityApplication(ctx context.Context, cl client.Cli
 			if attribution != nil && len(attribution.NodeLabels) == 0 {
 				attribution.NodeLabels = nil
 			}
-			if matched || hardware.Allocatable.Cmp(*resource.NewQuantity(pool.Allocatable, resource.DecimalSI)) != 0 || !equality.Semantic.DeepEqual(attribution, &pool.Attribution) {
+			// Accepted evidence counts hardware in primary units of the ratio.
+			units := max(demand.Demand.PrimaryUnits, 1)
+			scaled := hardware.Allocatable.DeepCopy()
+			scaled.Mul(units)
+			if matched || scaled.Cmp(*resource.NewQuantity(pool.Allocatable, resource.DecimalSI)) != 0 || !equality.Semantic.DeepEqual(attribution, &pool.Attribution) {
 				return fmt.Errorf("accepted member hardware changed before application")
 			}
 			now := r.capacityNow()

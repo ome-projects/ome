@@ -8,6 +8,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/holds"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -130,6 +131,41 @@ func disposeRejectedAttempt(ctx context.Context, deps workload.Deps, input workl
 	if err != nil {
 		return err
 	}
+	announceRejected(deps, input, idx, podName, rejection, held)
+	return nil
+}
+
+// disposeRejectedRowWrite reads the apiserver's refusal of a pod write
+// issued for idx with no attempt in flight: a serving-gate patch, a drain
+// patch or a delete. A permanent refusal gives the row the ending a
+// rejected create gets, with the revision in force charged, and reports
+// true; any other class is left for the caller to return.
+func disposeRejectedRowWrite(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, podName string, err error) (bool, error) {
+	rejection := evidence.ClassifyAPIError(err)
+	if !rejection.Class.Permanent() {
+		return false, nil
+	}
+	heldRevision := ""
+	if rejection.Class == workload.APIRejectionPermanentWorkload {
+		heldRevision = input.ObservedState.UpdateRevision
+	}
+	// A surge marker's operation is its source's pin on the index, so the
+	// marker keeps it and the retirement can resume once re-armed.
+	keepOperation := isGangSurgeTargetMarker(input.ObservedState.Instance(idx))
+	changed, derr := disposeRejection(ctx, input, idx, heldRevision, rejection, podName, keepOperation)
+	if derr != nil {
+		return true, derr
+	}
+	if changed {
+		announceRejected(deps, input, idx, podName, rejection, heldRevision)
+	}
+	return true, nil
+}
+
+// announceRejected is the operator-facing Warning for a permanently
+// rejected pod write: the pod, the apiserver's own explanation and
+// whether a revision was held.
+func announceRejected(deps workload.Deps, input workload.ReconcileInput, idx int32, podName string, rejection workload.APIRejection, held string) {
 	detail := "no revision is blamed"
 	if held != "" {
 		detail = fmt.Sprintf("revision %s held for retry", held)
@@ -137,7 +173,27 @@ func disposeRejectedAttempt(ctx context.Context, deps workload.Deps, input workl
 	workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonInstanceRejected,
 		"OMENative %s: apiserver rejected pod %s (%s: %s); %s",
 		workload.InstanceKey(input.Key.Component, idx), podName, rejection.Reason, rejection.Message, detail)
-	return nil
+}
+
+// rejectionParked reports whether row is an Instance a permanent apiserver
+// rejection disposed while the revision in force still denies a fresh
+// attempt; the passes that drive no attempt leave such a row as it
+// stands. retryAfter is the ladder's next due time when it has one.
+func rejectionParked(input workload.ReconcileInput, row *workload.InstanceStatus) (parked bool, retryAfter time.Duration) {
+	if row == nil || row.Phase != workload.InstancePhaseFailed || row.LastFailure == nil {
+		return false, 0
+	}
+	switch row.LastFailure.Reason {
+	case workload.RejectionReasonInvalidPodSpec, workload.RejectionReasonNamespaceTerminating:
+	default:
+		return false, 0
+	}
+	rev := input.ObservedState.UpdateRevision
+	block := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev)
+	if block == nil {
+		return false, 0
+	}
+	return evaluateRetryBlockGate(block, input.Now(), anyInFlightUpdateAt(input.ObservedState.InstanceStatuses, rev))
 }
 
 // recordAdmissionWait records that the apiserver could not take podName's
@@ -220,21 +276,39 @@ func disposeAPIRejection(ctx context.Context, input workload.ReconcileInput, ins
 	}
 	if rejection.Class == workload.APIRejectionPermanentWorkload && blameRevision {
 		heldRevision = rejectionTargetRevision(input, inst)
-		if heldRevision != "" {
-			if err := workload.RecordUpdateFailureInRetryBlock(ctx, input, heldRevision, rejection.Reason, workload.CauseWorkload); err != nil {
-				return "", fmt.Errorf("record retry block for rejected attempt (instance=%d rev=%s): %w", inst.Index, heldRevision, err)
-			}
+	}
+	// A rejected create made no pod, so the failure names none: the row's
+	// set holds nothing the rejection refers to.
+	if _, err := disposeRejection(ctx, input, inst.Index, heldRevision, rejection, "", false); err != nil {
+		return "", err
+	}
+	return heldRevision, nil
+}
+
+// disposeRejection is the one ending every permanently rejected pod write
+// gets: the ladder of heldRevision charged when one is named, then the row
+// stamped Failed with the rejection as its failure, the operation cleared
+// unless keepOperation. podName is the standing pod the refused write was
+// for, recorded on the failure so the passes that leave such a row alone
+// can tell whether that pod is still there; empty when the write made no
+// pod. Reports whether the row changed.
+func disposeRejection(ctx context.Context, input workload.ReconcileInput, idx int32, heldRevision string, rejection workload.APIRejection, podName string, keepOperation bool) (bool, error) {
+	if heldRevision != "" {
+		if err := workload.RecordUpdateFailureInRetryBlock(ctx, input, heldRevision, rejection.Reason, workload.CauseWorkload); err != nil {
+			return false, fmt.Errorf("record retry block for rejected attempt (instance=%d rev=%s): %w", idx, heldRevision, err)
 		}
 	}
 	termination := &workload.InstanceTermination{
+		PodName: podName,
 		Reason:  rejection.Reason,
 		Message: rejection.Message,
 		Time:    metav1.NewTime(input.Now()),
 	}
-	if err := status.StampFailed(ctx, input, inst.Index, termination); err != nil {
-		return heldRevision, fmt.Errorf("clear operation + stamp Failed (instance=%d): %w", inst.Index, err)
+	changed, err := status.StampRejected(ctx, input, idx, termination, keepOperation)
+	if err != nil {
+		return false, fmt.Errorf("clear operation + stamp Failed (instance=%d): %w", idx, err)
 	}
-	return heldRevision, nil
+	return changed, nil
 }
 
 // rejectionTargetRevision resolves the revision a rejected attempt was

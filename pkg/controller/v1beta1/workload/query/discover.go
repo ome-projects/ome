@@ -393,17 +393,27 @@ func ExcludeTerminalPods(pods []*corev1.Pod) []*corev1.Pod {
 	return out
 }
 
+// podCountsForPromote reports whether a pod may vouch for the set a promote
+// or hand-over is judged on: neither a terminal pod nor one being deleted is
+// a member, so a set relying on either is short and waits.
+func podCountsForPromote(pod *corev1.Pod) bool {
+	return pod != nil && !IsTerminalPod(pod) && pod.DeletionTimestamp == nil
+}
+
 // AllPodsRuntimeReady reports whether every pod has the ContainersReady
 // PodCondition. Empty input returns false (nothing is Ready). A terminal
 // pod is never runtime-ready whatever conditions it still carries: the
 // presence pass ahead of every readiness gate treats it as a missing
-// target, so answering true here would promote an incomplete set.
+// target, so answering true here would promote an incomplete set. A pod
+// being deleted is gone the same way whatever its readiness says: the
+// kubelet keeps a terminating container answering its probe through the
+// grace period while the pod is already out of its Service.
 func AllPodsRuntimeReady(pods []*corev1.Pod) bool {
 	if len(pods) == 0 {
 		return false
 	}
 	for _, pod := range pods {
-		if IsTerminalPod(pod) || !podreadiness.IsContainersReady(pod) {
+		if !podCountsForPromote(pod) || !podreadiness.IsContainersReady(pod) {
 			return false
 		}
 	}
@@ -412,12 +422,13 @@ func AllPodsRuntimeReady(pods []*corev1.Pod) bool {
 
 // PodSetPromotable reports whether a pod set clears the one bar every path
 // stamping an Instance Ready shares: the set is non-empty, no pod is
-// terminal, every pod is PodReady — the readiness gates the controller
-// writes are folded by kubelet into that condition, so a PodReady pod is
-// eligible for its Service — and every pod has held Ready for the
-// Component's minReadySeconds window. A window <= 0 reduces the bar to
-// PodReady. Each extra predicate is an additional per-path requirement on
-// every pod (the in-place roll confirms its runtime images there).
+// terminal or being deleted, every pod is PodReady — the readiness gates
+// the controller writes are folded by kubelet into that condition, so a
+// PodReady pod is eligible for its Service — and every pod has held Ready
+// for the Component's minReadySeconds window. A window <= 0 reduces the
+// bar to PodReady. Each extra predicate is an additional per-path
+// requirement on every pod (the in-place roll confirms its runtime images
+// there).
 //
 // The duration is how long until the last pod inside its window clears it,
 // so a caller waiting on the window wakes when it elapses instead of
@@ -432,7 +443,7 @@ func PodSetPromotable(pods []*corev1.Pod, minReadySeconds int32, now time.Time, 
 	}
 	var wait time.Duration
 	for _, pod := range pods {
-		if IsTerminalPod(pod) || !podreadiness.IsContainersReady(pod) {
+		if !podCountsForPromote(pod) || !podreadiness.IsContainersReady(pod) {
 			return false, 0
 		}
 		for _, satisfied := range extra {
@@ -456,30 +467,49 @@ func PodSetPromotable(pods []*corev1.Pod, minReadySeconds int32, now time.Time, 
 	return wait == 0, wait
 }
 
-// PodSetFullyServing reports whether the pod set is fully healthy in
+// PodSetFullyServing reports whether the pod set is fully admitted to
 // the rotation: at least `desired` live (non-deleting) pods, every one
 // of them ContainersReady AND carrying the serving gate. The bar is the
 // gate rather than the pod's Ready condition because the gate is written
 // in the same pass as the guards that read this, and the kubelet folds it
 // into Ready afterwards: a set admitted this pass is already healthy
-// capacity that no deadline or wedge check may punish. Deleting pods
-// are excluded rather than disqualifying — a completed surge leaves the
-// old pod draining next to the serving replacement. A terminal pod is
-// never live and disqualifies the set outright: it is failure evidence
-// that must reach the escalation pass even when stale conditions on it
-// still read healthy, or when a serving sibling would otherwise cover
-// the count. desired <= 0 never counts as serving (nothing is expected,
-// so nothing can prove health).
+// capacity that no deadline or wedge check may punish. A pod on its way
+// out is excluded rather than disqualifying: one with a deletion
+// timestamp, and one the surge drain holds out of rotation under its own
+// writer ahead of deleting it, since a surge leaves its source draining
+// next to the serving replacement for the endpoint-convergence window
+// first. A terminal pod is never live and disqualifies the set outright:
+// it is failure evidence that must reach the escalation pass even when
+// stale conditions on it still read healthy, or when a serving sibling
+// would otherwise cover the count. desired <= 0 never counts as serving
+// (nothing is expected, so nothing can prove health).
 func PodSetFullyServing(pods []*corev1.Pod, desired int32) bool {
+	return podSetAtBar(pods, desired, func(p *corev1.Pod) bool {
+		return podreadiness.IsContainersReady(p) && podreadiness.IsServing(p)
+	})
+}
+
+// PodSetReadyAndServing is PodSetFullyServing at the rotation bar: every
+// live pod PodReady AND carrying the gate (podreadiness.ReadyAndServing).
+// A pod whose gate is written but whose Ready never followed does not count.
+func PodSetReadyAndServing(pods []*corev1.Pod, desired int32) bool {
+	return podSetAtBar(pods, desired, podreadiness.ReadyAndServing)
+}
+
+// podSetAtBar is the set reading both bars share: a pod on its way out
+// (deleting, or held out of rotation by the surge drain ahead of its
+// deletion) is skipped, a terminal pod or a live pod short of bar
+// disqualifies the set, and at least desired (> 0) live pods must clear it.
+func podSetAtBar(pods []*corev1.Pod, desired int32, bar func(*corev1.Pod) bool) bool {
 	if desired <= 0 {
 		return false
 	}
 	var live int32
 	for _, p := range pods {
-		if p == nil || p.DeletionTimestamp != nil {
+		if p == nil || p.DeletionTimestamp != nil || podreadiness.HeldNotServingBy(p, podreadiness.WriterUpdateSurgeDrain) {
 			continue
 		}
-		if IsTerminalPod(p) || !podreadiness.IsContainersReady(p) || !podreadiness.IsServing(p) {
+		if IsTerminalPod(p) || !bar(p) {
 			return false
 		}
 		live++

@@ -1,17 +1,22 @@
 package placement
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -247,6 +252,58 @@ func testMemberPodGroup(ir *v1beta1.InferenceReplica) *unstructured.Unstructured
 	}}
 }
 
+// labelMemberPodGroup stamps the service and component labels the gang creator
+// writes, which make the group visible to a selector list.
+func labelMemberPodGroup(group *unstructured.Unstructured, ir *v1beta1.InferenceReplica) {
+	group.SetLabels(map[string]string{
+		constants.InferenceServicePodLabelKey: ir.NamePrefix(),
+		constants.OMEComponentLabel:           string(ir.Spec.Component),
+	})
+}
+
+func TestMemberGangSizesListsComponentGangsOnce(t *testing.T) {
+	fixture := resourceFixture()
+	fixture.ir.Spec.Component = v1beta1.EngineComponent
+	fixture.ir.Spec.ParentRef = &v1beta1.ParentReference{Name: "service"}
+	template := fixture.pods[0]
+	fixture.pods = nil
+	want := map[string]int32{}
+	objects := []client.Object{}
+	for i := range 3 {
+		name := fmt.Sprintf("service-engine-%d", i)
+		pod := *template.DeepCopy()
+		pod.Name, pod.UID = name, types.UID(name)
+		pod.Labels[query.LabelPodGroup] = name
+		fixture.pods = append(fixture.pods, pod)
+		group := testMemberPodGroup(fixture.ir)
+		group.SetName(name)
+		labelMemberPodGroup(group, fixture.ir)
+		objects = append(objects, group)
+		want[name] = 2
+	}
+	var gets, lists int
+	cl := interceptor.NewClient(fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objects...).Build(), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			gets++
+			return c.Get(ctx, key, obj, opts...)
+		},
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			lists++
+			return c.List(ctx, list, opts...)
+		},
+	})
+	got, err := memberGangSizes(t.Context(), cl, fixture.ir, fixture.pods)
+	if err != nil {
+		t.Fatalf("gang read error = %v", err)
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("gang widths (-want +got):\n%s", diff)
+	}
+	if lists != 1 || gets != 0 {
+		t.Errorf("reads = %d lists and %d gets, want one list independent of gang count", lists, gets)
+	}
+}
+
 func TestMemberGangSizes(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
@@ -267,27 +324,35 @@ func TestMemberGangSizes(t *testing.T) {
 		{name: "invalid gang size is unknown", edit: func(g *unstructured.Unstructured) { g.Object["spec"] = map[string]interface{}{"minMember": "two"} }, wantErr: true},
 		{name: "non gang size is unknown", edit: func(g *unstructured.Unstructured) { g.Object["spec"] = map[string]interface{}{"minMember": int64(1)} }, wantErr: true},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			fixture := resourceFixture()
-			fixture.addGang()
-			group := testMemberPodGroup(fixture.ir)
-			if tt.edit != nil {
-				tt.edit(group)
-			}
-			objects := []client.Object{}
-			if !tt.missing {
-				objects = append(objects, group)
-			}
-			cl := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objects...).Build()
-			got, err := memberGangSizes(t.Context(), cl, fixture.ir, fixture.pods)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("gang read error = %v, want error %t", err, tt.wantErr)
-			}
-			if !tt.wantErr {
-				if diff := cmp.Diff(fixture.gangSizes, got); diff != "" {
-					t.Errorf("gang widths (-want +got):\n%s", diff)
+		// A labeled gang arrives through the component list; an unlabeled one is
+		// read by name. Both paths apply the same identity and size checks.
+		for _, labeled := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/labeled=%t", tt.name, labeled), func(t *testing.T) {
+				fixture := resourceFixture()
+				fixture.ir.Spec.Component = v1beta1.EngineComponent
+				fixture.addGang()
+				group := testMemberPodGroup(fixture.ir)
+				if labeled {
+					labelMemberPodGroup(group, fixture.ir)
 				}
-			}
-		})
+				if tt.edit != nil {
+					tt.edit(group)
+				}
+				objects := []client.Object{}
+				if !tt.missing {
+					objects = append(objects, group)
+				}
+				cl := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objects...).Build()
+				got, err := memberGangSizes(t.Context(), cl, fixture.ir, fixture.pods)
+				if (err != nil) != tt.wantErr {
+					t.Fatalf("gang read error = %v, want error %t", err, tt.wantErr)
+				}
+				if !tt.wantErr {
+					if diff := cmp.Diff(fixture.gangSizes, got); diff != "" {
+						t.Errorf("gang widths (-want +got):\n%s", diff)
+					}
+				}
+			})
+		}
 	}
 }

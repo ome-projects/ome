@@ -71,7 +71,7 @@ func placementDecisionsFor(t *testing.T, reads client.Reader, isvc *v1beta1.Infe
 	return placementDecisions{
 		anyAdmitted:      AnyInstanceAdmitted(statuses),
 		allAdmitted:      AllComponentsAdmitted(isvc, statuses),
-		admittedReplicas: placementAdmittedReplicas(declaredComponents(isvc), statuses),
+		admittedReplicas: placementAdmittedReplicas(declaredComponents(isvc), statuses, nil),
 		terminallyFailed: IsTerminallyFailed(isvc, statuses),
 		engineRows:       statuses[v1beta1.EngineComponent].InstanceStatuses,
 		decoderRows:      statuses[v1beta1.DecoderComponent].InstanceStatuses,

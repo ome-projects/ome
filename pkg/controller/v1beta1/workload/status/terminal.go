@@ -111,6 +111,10 @@ func FinalizeAndRemove(
 // The operation type is the precondition: a row whose attempt has been
 // replaced since the pass read it is not the row this recycle belongs
 // to.
+//
+// A record already naming this failure is kept, time included, when the
+// dead pod is no newer than it: the same pod is seen again on every pass
+// until its delete lands, while a same-name replacement starts afresh.
 func RecordRecycleAttempt(
 	ctx context.Context,
 	input types.ReconcileInput,
@@ -118,6 +122,7 @@ func RecordRecycleAttempt(
 	opType types.InstanceOperationType,
 	now metav1.Time,
 	termination *types.InstanceTermination,
+	born metav1.Time,
 ) (int32, error) {
 	var recycle int32
 	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
@@ -129,13 +134,20 @@ func RecordRecycleAttempt(
 		op.LastProgressAt = now
 		s.Operation = &op
 		recycle = op.RetryCount
-		if termination != nil {
+		if termination != nil && !sameDeadPodFailure(s.LastFailure, termination, born) {
 			captured := *termination
 			s.LastFailure = &captured
 		}
 		return true
 	})
 	return recycle, err
+}
+
+// sameDeadPodFailure reports whether recorded already names the failure
+// of a dead pod created at born: the same failure identity on a pod no
+// newer than the record. A pod created after the record is a replacement.
+func sameDeadPodFailure(recorded, fresh *types.InstanceTermination, born metav1.Time) bool {
+	return sameFailureIdentity(recorded, fresh) && !born.After(recorded.Time.Time)
 }
 
 // AnnounceDrainOverdue is the announcement an overdue drain earns: the

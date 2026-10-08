@@ -30,7 +30,6 @@ func TestValidatePlacement(t *testing.T) {
 		{name: "empty term", placement: `{"mode":"Single","clusterAffinity":[{}]}`, wantError: "requirement"},
 		{name: "weight forbidden in capacity mode", placement: `{"mode":"SplitByCapacity","clusterAffinity":[{"weight":1,"matchExpressions":[{"key":"accelerator","operator":"Exists"}]}]}`, wantError: "weight"},
 		{name: "unknown match field", placement: `{"mode":"Single","clusterAffinity":[{"matchFields":[{"key":"metadata.namespace","operator":"In","values":["team-a"]}]}]}`, wantError: "metadata.name"},
-		{name: "negative surge", placement: `{"mode":"Single","maxSurge":-1}`, wantError: "maxSurge"},
 		{name: "split settings for single", placement: `{"mode":"Single","split":{}}`, wantError: "permitted only"},
 		{name: "zero requested floor", placement: `{"mode":"Split","split":{"replicas":0}}`, wantError: "replicas"},
 		{name: "negative per-home ceiling", placement: `{"mode":"Split","split":{"maxReplicasPerCluster":-1}}`, wantError: "maxReplicasPerCluster"},

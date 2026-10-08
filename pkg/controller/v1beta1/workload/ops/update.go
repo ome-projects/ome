@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
@@ -218,6 +220,23 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 		plan.UpdateStrategy.Type = workload.UpdateStrategyRecreatePod
 	}
 
+	// InPlaceIfPossible patches where the patch can do the work. A step
+	// that replaces no container cannot bring a pod that fails readiness
+	// back into rotation, so over a pod set dark on readiness the roll
+	// replaces the set at the target; a patch already in flight moves to
+	// the Drain step on the same operation, as it does when its pod is lost.
+	if mode == updateModeInPlace && strategy == workload.UpdateStrategyInPlaceIfPossible &&
+		InPlaceCannotRestore(runningSpec, targetSpec, pods, input.Now(), input.StuckPodGrace) {
+		if _, err := status.StampRecreateFromInPlace(ctx, input, inst.Index, target.Name); err != nil {
+			return false, fmt.Errorf("re-resolve in-place roll over a dark pod set to recreate (instance=%d): %w", inst.Index, err)
+		}
+		workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonInPlaceUpdateNotPossible,
+			"OMENative %s has failed readiness for the stuck-pod grace and the in-place update to revision %s replaces no container; recreating instead",
+			workload.InstanceKey(input.Key.Component, inst.Index), target.Name)
+		mode = updateModeRecreate
+		plan.UpdateStrategy.Type = workload.UpdateStrategyRecreatePod
+	}
+
 	// Status stamping is per-mode: recreate bumps Incarnation atomically
 	// with the Updating transition; in-place must NOT bump (same
 	// materialization); surge advances ActiveOrdinal (single-pod) or
@@ -277,11 +296,15 @@ func inPlaceStrategy(strategy workload.UpdateStrategyType) bool {
 // SurgeHasNoSource reports whether a fresh start on the row has nothing a
 // surge could keep in rotation: the Instance was never promoted, so no pod
 // of its is a serving source, and the attempt that built its pod set has
-// been disposed. Such a start runs as a recreate under every strategy, so
-// the update pass reads it here to consult the admission gate for a
-// rebuild rather than a surge.
+// ended, disposed or kept as the Create the gang verdict ended. Such a
+// start runs as a recreate under every strategy, so the update pass reads
+// it here to consult the admission gate for a rebuild rather than a surge.
+// A kept surge operation is the surge machine's own continuation.
 func SurgeHasNoSource(s *workload.InstanceStatus) bool {
-	return s != nil && s.RunningRevision == "" && s.Phase == workload.InstancePhaseFailed && s.Operation == nil
+	if s == nil || s.RunningRevision != "" || s.Phase != workload.InstancePhaseFailed {
+		return false
+	}
+	return s.Operation == nil || s.Operation.Type == workload.InstanceOperationCreate
 }
 
 // InPlaceFallsBackToRecreate reports whether an in-place strategy runs as
@@ -311,6 +334,25 @@ func InPlaceFallsBackToRecreate(strategy workload.UpdateStrategyType, multiPod b
 		return !inPlaceEligible(runningSpec, target), nil
 	}
 	return false, nil
+}
+
+// InPlaceCannotRestore reports whether an in-place step has nothing that
+// could return the Instance's pods to rotation: its diff against the
+// running revision replaces no container, every live pod already runs the
+// target images, and the pod set is dark on its kubelet readiness
+// (evidence.PodSetDarkOnReadiness). Such a patch leaves readiness exactly
+// as it found it, so the step could only wait out its deadline; the roll
+// replaces the set at the target instead, as it does when the pod is gone.
+func InPlaceCannotRestore(running, target *corev1.PodSpec, pods []*corev1.Pod, now time.Time, grace time.Duration) bool {
+	if target == nil || len(evidence.ChangedContainerImages(running, target)) > 0 {
+		return false
+	}
+	for _, pod := range pods {
+		if len(imagePatchTargets(pod, target)) > 0 {
+			return false
+		}
+	}
+	return evidence.PodSetDarkOnReadiness(pods, now, grace)
 }
 
 // chooseUpdateModeForInstance is chooseUpdateMode with the fallback rule
@@ -535,6 +577,100 @@ type UpdateTriggerDecision struct {
 	AdoptRevision bool
 }
 
+// EffectivePartition returns the partition the update pass holds at.
+// The projected Pacing.Partition wins when set — it is the rollout-
+// control value the composer (a canary step, a plan-gate hold) owns,
+// and an explicit 0 there releases every Instance even when the user's
+// strategy carries a partition. Otherwise the user's
+// RollingUpdate.Partition applies. nil when neither is set.
+func EffectivePartition(pacing *workload.WorkloadPacing, ru *workload.RollingUpdate) *int32 {
+	if pacing != nil && pacing.Partition != nil {
+		return pacing.Partition
+	}
+	if ru == nil {
+		return nil
+	}
+	return ru.Partition
+}
+
+// HeldByPartition reports whether the hold candidate at `rank` (its
+// position in PartitionHeldIndices' ascending candidate order) is held
+// by the effective partition (the StatefulSet-style canary): the first
+// `partition` candidates are held. A nil partition or partition <= 0
+// holds nothing.
+func HeldByPartition(partition *int32, rank int32) bool {
+	if partition == nil || *partition <= 0 {
+		return false
+	}
+	return rank < *partition
+}
+
+// PartitionHeldIndices returns the set of Instance indices the
+// effective partition holds on their current revision this pass.
+// Partition counts Instances to hold, not index values — migration and
+// lowest-unused surge allocation leave sparse index sets (e.g. {1,2}
+// for replicas=2), so a raw index<Partition compare holds the wrong
+// count. The hold is keyed to revision membership, not position in the
+// index set: gang surge places TARGET-revision replacements at freed
+// (often lower) indices, so a positional hold would let a replacement
+// steal a held slot mid-roll and un-hold a still-old Instance — ending
+// the roll with zero old-revision Instances and the desired staged
+// shape (ReachedDesiredShape) permanently unsatisfiable.
+//
+// Hold candidates are planned Instances observed OFF the target
+// revision (unset RunningRevision included — ReachedDesiredShape
+// counts those as held too, and the two must agree on membership).
+// Excluded from candidacy, so they are never held:
+//   - unobserved Instances (nothing running to hold);
+//   - Instances already converging to target — an Update attempt in
+//     flight (the row's Owner, gang-surge target markers included) or
+//     the continuation of one (UpdateContinuation). An in-flight
+//     update must finish: holding it strands its surge pod, which is
+//     never promoted to serving and permanently consumes the surge
+//     budget, deadlocking the roll on the non-held Instances. The hold
+//     falls to the next-lowest old-revision Instance instead,
+//     preserving the count. A parked attempt claims nothing and is held
+//     like the Failed row it stands for, in either phase its pods give
+//     it; held with no pod left, the Create pass rebuilds it on the
+//     revision it runs;
+//   - transient migration surge Instances (Op.Type=Migrate on a
+//     non-Migrating phase) — the pair's source carries the steady
+//     capacity.
+//
+// The lowest-indexed `partition` candidates are held.
+func PartitionHeldIndices(partition *int32, input workload.ReconcileInput, planned []workload.InstancePlan, targetRevName string) map[int32]bool {
+	held := make(map[int32]bool)
+	if partition == nil || *partition <= 0 {
+		return held
+	}
+	tgt := query.RevisionFromName(targetRevName)
+	candidates := make([]int32, 0, len(planned))
+	for _, inst := range planned {
+		s := input.ObservedState.Instance(inst.Index)
+		if s == nil {
+			continue
+		}
+		if query.RevisionFromName(s.RunningRevision).Same(tgt) {
+			continue
+		}
+		if workload.Owner(s) == workload.OwnerUpdate || workload.UpdateContinuation(s) {
+			continue
+		}
+		if s.Operation != nil && s.Operation.Type == workload.InstanceOperationMigrate && s.Phase != workload.InstancePhaseMigrating {
+			continue
+		}
+		candidates = append(candidates, inst.Index)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i] < candidates[j] })
+	for i, idx := range candidates {
+		if !HeldByPartition(partition, int32(i)) {
+			break
+		}
+		held[idx] = true
+	}
+	return held
+}
+
 // EvaluateUpdateTrigger is the pure update-trigger evaluation: no
 // client reads, no status writes. instancePods must already be
 // filtered to inst.Index (nil is an empty pod set); they are consulted
@@ -569,7 +705,15 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 	if isGangSurgeTargetMarker(s) {
 		return UpdateTriggerDecision{}, false
 	}
-	if s.Phase == workload.InstancePhaseUpdating {
+	// An attempt parked after its disposition is a settled row to the
+	// ownership table and is read as the Failed row it stands for,
+	// whichever phase its pods give it: gated by its ladder below and
+	// re-opened as a fresh start.
+	parked := workload.StateOf(s) == workload.StateUpdateParked
+	// A gang source Failed past its Surge step is an attempt in flight
+	// whatever the stamp says: the handoff finishes on its pin, a target
+	// equal to the running revision included.
+	if (s.Phase == workload.InstancePhaseUpdating && !parked) || failedGangSurgeDrainContinuation(s) {
 		return UpdateTriggerDecision{Trigger: true}, false
 	}
 	// A Failed Instance must still re-trigger toward a NEW target. Once a
@@ -579,7 +723,7 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 	// revision forever. Treat Failed like Ready for the revision comparison so a
 	// changed target re-drives it (the reconciler's budget path lets a
 	// mid-operation Failed Instance continue rather than start fresh).
-	if s.Phase != workload.InstancePhaseReady && s.Phase != workload.InstancePhaseFailed {
+	if s.Phase != workload.InstancePhaseReady && s.Phase != workload.InstancePhaseFailed && !parked {
 		return UpdateTriggerDecision{}, false
 	}
 
@@ -594,6 +738,14 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 		if denied {
 			return UpdateTriggerDecision{RetryAfter: retryAfter, RetryBlockDenied: true}, false
 		}
+	}
+
+	// A row keeping an attempt the gang verdict ended rolls toward a
+	// corrective revision alone, whatever its pod set: the pin proves it
+	// off target, and the pinned revision waits for the reset mailbox.
+	if workload.EndedByOwnershipVerdict(s) {
+		pinned := s.Operation.TargetRevision
+		return UpdateTriggerDecision{Trigger: pinned != "" && pinned != target.Name}, false
 	}
 
 	// RunningRevision is the cheap fast-path comparison.
@@ -690,6 +842,14 @@ func gangSurgeSourceClaim(s *workload.InstanceStatus) bool {
 	return surgeClaim(s) && s.Operation.SurgeIndex != nil
 }
 
+// failedGangSurgeDrainContinuation reports a gang source stamped Failed past
+// its Surge step: it is out of rotation behind a replacement that is in
+// rotation, so only the surge machine can finish the handoff, on its pin.
+func failedGangSurgeDrainContinuation(s *workload.InstanceStatus) bool {
+	return gangSurgeSourceClaim(s) && s.Phase == workload.InstancePhaseFailed &&
+		s.Operation.Step != workload.UpdateStepSurge
+}
+
 // isSurgeOwnedStatus reports whether the SurgeThenDrain sub-machine is
 // running on this row, so a mode resolved from a since-edited strategy must
 // not be dispatched over it.
@@ -698,22 +858,27 @@ func gangSurgeSourceClaim(s *workload.InstanceStatus) bool {
 // Failed row is not, since a failed surge has already escalated to operator
 // attention and editing the strategy is one of the levers used to rescue it.
 // Mechanism: of the update pass's sub-machines, the one in flight is the
-// surge cycle.
+// surge cycle. The one Failed row the surge machine keeps is a gang source
+// past its Surge step: its replacement is in rotation and no other mode can
+// finish the handoff.
 func isSurgeOwnedStatus(s *workload.InstanceStatus) bool {
 	switch workload.StateOf(s) {
 	case workload.StateUpdateSurge, workload.StateUpdateSurgeDrain:
 		return true
 	}
-	return false
+	return failedGangSurgeDrainContinuation(s)
 }
 
 // effectiveUpdateStrategy returns the strategy an attempt runs under: the
 // one pinned on the operation in flight, or the desired one when no attempt
-// owns the Instance. A Failed row holds no attempt — editing the strategy is
-// the operator's way out of a mode that cannot make progress — so its
-// preserved operation does not pin anything.
+// owns the Instance. A Failed row and a parked attempt hold no attempt —
+// editing the strategy is the operator's way out of a mode that cannot
+// make progress — so their preserved operation does not pin anything,
+// except for a gang source Failed past its Surge step, whose handoff the
+// surge machine still finishes on the pinned strategy.
 func effectiveUpdateStrategy(s *workload.InstanceStatus, desired workload.UpdateStrategyType) workload.UpdateStrategyType {
-	if workload.Owner(s) != workload.OwnerUpdate || s.Operation.Strategy == "" {
+	pinned := workload.Owner(s) == workload.OwnerUpdate || failedGangSurgeDrainContinuation(s)
+	if !pinned || s.Operation.Strategy == "" {
 		return desired
 	}
 	return s.Operation.Strategy
@@ -757,18 +922,60 @@ func RetryBlockDenyingFreshStart(input workload.ReconcileInput, target *appsv1.C
 	return b
 }
 
-// anyInFlightUpdateAt reports whether any Instance carries an in-flight
-// Update Operation targeting rev. Used by the retry gate to distinguish
-// a live RetryInProgress authorization from one leaked by a superseded
-// or interrupted attempt.
+// RetryBlockOfCrashedAttempt returns the target's RetryBlock while its
+// attempt is the rebuild of rows that crashed after promotion: a Backoff
+// that has come due, whose attempt the restart pass opens, or
+// RetryInProgress, whose attempt is a Restart under way or a rebuilt set
+// not yet proven. No Update is in flight at such a block, so
+// RetryBlockDenyingFreshStart reads it as admitting a start; the hold
+// that names the ladder for those rows reads the attempt that is. Nil
+// otherwise.
+func RetryBlockOfCrashedAttempt(input workload.ReconcileInput, target *appsv1.ControllerRevision) *workload.RetryBlock {
+	if target == nil {
+		return nil
+	}
+	b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, target.Name)
+	if b == nil {
+		return nil
+	}
+	switch b.State {
+	case workload.RetryBlockRetryInProgress:
+		return b
+	case workload.RetryBlockBackoff:
+		if b.NextRetryAt == nil || !input.Now().Before(b.NextRetryAt.Time) {
+			return b
+		}
+	}
+	return nil
+}
+
+// anyInFlightUpdateAt reports whether any Instance carries an Update
+// Operation targeting rev that still claims the update verb. Used by the
+// retry gate to distinguish a live RetryInProgress authorization from one
+// leaked by a superseded or interrupted attempt. The claim, not the
+// owner: a Failed continuation still holds the authorization, while an
+// attempt parked after its disposition claims nothing.
 func anyInFlightUpdateAt(statuses []workload.InstanceStatus, rev string) bool {
 	for i := range statuses {
-		op := statuses[i].Operation
-		if op != nil && op.Type == workload.InstanceOperationUpdate && op.TargetRevision == rev {
+		s := &statuses[i]
+		if workload.ClaimOf(s) == workload.OwnerUpdate && s.Operation.TargetRevision == rev {
 			return true
 		}
 	}
 	return false
+}
+
+// LadderDeniesStart reports whether rev's retry ladder denies a fresh
+// start this pass, as the trigger gate reads it: a Held block, a backoff
+// not yet due, or an attempt at rev still in flight under the one
+// authorization the ladder grants at a time.
+func LadderDeniesStart(input workload.ReconcileInput, rev string) bool {
+	b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev)
+	if b == nil {
+		return false
+	}
+	denied, _ := evaluateRetryBlockGate(b, input.Now(), anyInFlightUpdateAt(input.ObservedState.InstanceStatuses, rev))
+	return denied
 }
 
 // ProvenWindowSeconds is how long, in whole seconds, a promoted pod that
@@ -849,12 +1056,17 @@ func RebuiltAfterFailure(pod *corev1.Pod, failure *workload.InstanceTermination,
 // a superseded revision never holds the new roll, so a corrected push
 // lands as a fresh roll. A pod that never restarted since Ready and
 // answers no such failure is read off its serving state alone:
-// minReadySeconds already paced its promotion. A container that has
-// restarted more than once since Ready (RunnerRestartedAgainSinceReady)
-// keeps restarting: it is up only between its crashes, so it keeps the
-// slot through those windows whatever their length, and the roll never
-// creeps forward on them. The reason names what holds the slot, for the
-// pass to log; it is empty when nothing does.
+// minReadySeconds already paced its promotion. This is the strict bar
+// the RetryBlock prune reads; the roll's selection takes one exception
+// to it, an Instance short of serving by dark pods alone
+// (RolledInstanceDark). A container that restarted
+// more than once since Ready (RunnerRestartedAgainSinceReady) is proven
+// the same way: the anchor moves only on an entry into Ready, so a pod
+// that serves on after its restarts is read off its current run, and a
+// set that is up only between its crashes never holds Ready for the
+// window; a loop is the crash-loop repair's to rebuild or park. The reason
+// names what holds the slot, for the pass to log; it is empty when nothing
+// does.
 func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revisionBorn time.Time, pods []*corev1.Pod, desired, window int32, now time.Time) (bool, time.Duration, string) {
 	if row == nil || target == "" || row.RunningRevision != target {
 		return false, 0, ""
@@ -862,25 +1074,18 @@ func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revis
 	if workload.UpdateContinuation(row) || isMigrateOwnedStatus(row) {
 		return false, 0, ""
 	}
-	targetRev := query.RevisionFromName(target)
-	own := make([]*corev1.Pod, 0, len(pods))
+	own := rolledSetPods(target, pods)
 	held, wait, reason := false, time.Duration(0), ""
-	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		if podRev := query.RevisionFromPod(pod); !podRev.IsZero() && !podRev.Same(targetRev) {
-			continue
-		}
+	for _, pod := range own {
 		comeback := ""
 		if RebuiltAfterFailure(pod, row.LastFailure, revisionBorn, window) {
 			comeback = fmt.Sprintf("pod %s rebuilt after the failure recorded at %s", pod.Name, row.LastFailure.Time.UTC().Format(time.RFC3339))
 		}
 		if _, restarted := RunnerRestartedSinceReady(pod, row.ReadySince); restarted {
-			if RunnerRestartedAgainSinceReady(pod, row.ReadySince) {
-				return true, 0, fmt.Sprintf("pod %s restarted again since Ready", pod.Name)
-			}
 			comeback = fmt.Sprintf("pod %s restarted since Ready", pod.Name)
+			if RunnerRestartedAgainSinceReady(pod, row.ReadySince) {
+				comeback = fmt.Sprintf("pod %s restarted again since Ready", pod.Name)
+			}
 		}
 		if comeback != "" {
 			if available, remaining := podreadiness.IsPodAvailable(pod, window, now); !available {
@@ -889,7 +1094,6 @@ func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revis
 				reason = fmt.Sprintf("%s, Ready again for less than the %ds window (%s left)", comeback, window, remaining.Round(time.Second))
 			}
 		}
-		own = append(own, pod)
 	}
 	if held {
 		return true, wait, reason
@@ -898,6 +1102,114 @@ func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revis
 		return true, 0, fmt.Sprintf("pod set not fully serving (%d of %d pods on the revision)", len(own), desired)
 	}
 	return false, 0, ""
+}
+
+// RolledSetInRotation reports whether the pod set an Instance runs on
+// target is fully in rotation: every pod of that revision is live,
+// ContainersReady and serving, whatever window a pod that came back has
+// yet to hold Ready for. It is the serving half of what
+// RolledInstanceNotServing holds a slot for: a set that is in rotation
+// and unproven paces a further start, while one short of rotation is
+// what a roll with nothing left to start still stands behind.
+func RolledSetInRotation(target string, pods []*corev1.Pod, desired int32) bool {
+	return query.PodSetFullyServing(rolledSetPods(target, pods), desired)
+}
+
+// rolledSetPods is the pod set an Instance runs on target as the roll
+// reads it: the live pods carrying that revision, or no revision at all.
+func rolledSetPods(target string, pods []*corev1.Pod) []*corev1.Pod {
+	targetRev := query.RevisionFromName(target)
+	own := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if pod == nil || pod.DeletionTimestamp != nil {
+			continue
+		}
+		if podRev := query.RevisionFromPod(pod); !podRev.IsZero() && !podRev.Same(targetRev) {
+			continue
+		}
+		own = append(own, pod)
+	}
+	return own
+}
+
+// RolledInstanceDark reports whether an Instance the roll already moved
+// onto target is short of serving by dark pods alone: promoted pods that
+// run, served and have failed readiness for the stuck-pod grace, none
+// restarted since Ready (the ladder's shape, RolledInstanceCrashed), none
+// missing, terminal or still coming up. Nothing such a pod does lifts the
+// shortfall and no policy rebuilds it, so the Instance is not the roll's
+// open work: it holds no slot in either arm's budget and opens no floor
+// hold, as a dark Instance off the target holds none. The duration is how
+// long until a pod unready inside the grace reads dark, for the pass to
+// wake on; zero otherwise. No grace configured means no pod is ever dark.
+func RolledInstanceDark(row *workload.InstanceStatus, target string, revisionBorn time.Time, pods []*corev1.Pod, desired, window int32, grace time.Duration, now time.Time) (bool, time.Duration) {
+	if row == nil || target == "" || row.RunningRevision != target || grace <= 0 {
+		return false, 0
+	}
+	if workload.UpdateContinuation(row) || isMigrateOwnedStatus(row) {
+		return false, 0
+	}
+	if RolledInstanceCrashed(row, target, revisionBorn, pods, window) {
+		return false, 0
+	}
+	own := rolledSetPods(target, pods)
+	if int32(len(own)) < desired {
+		return false, 0
+	}
+	dark, wait := false, time.Duration(0)
+	for _, pod := range own {
+		switch {
+		case podreadiness.ReadyAndServing(pod):
+		case evidence.PodUnreadyPastGrace(pod, now, grace):
+			dark = true
+		case evidence.UnreadyGraceLeft(pod, now, grace) > 0:
+			wait = max(wait, evidence.UnreadyGraceLeft(pod, now, grace))
+		default:
+			return false, 0
+		}
+	}
+	if wait > 0 {
+		return false, wait
+	}
+	return dark, 0
+}
+
+// RolledInstanceCrashed reports whether an Instance the roll moved onto
+// target holds a pod of that revision that crashed after the row entered
+// Ready: a runner restarted since Ready, in place or across the rebuild
+// answering the row's recorded failure (RebuiltAfterFailure). It is the
+// shape RolledInstanceNotServing holds the slot for, read on its own: a
+// rolled Instance short of serving for any other reason is a row another
+// pass repairs or parks and says so itself, so only this shape is what a
+// roll with nothing left to start reports as the hold it stands behind.
+//
+// The row's own record reads the same way: a container failure of its
+// promoted set dated after it entered Ready (types.RemembersCrash)
+// outlives the pods the rebuild tears down, so the Instance reads
+// crashed through the rebuild until the rebuilt set enters Ready anew.
+func RolledInstanceCrashed(row *workload.InstanceStatus, target string, revisionBorn time.Time, pods []*corev1.Pod, window int32) bool {
+	if row == nil || target == "" || row.RunningRevision != target {
+		return false
+	}
+	if workload.UpdateContinuation(row) || isMigrateOwnedStatus(row) {
+		return false
+	}
+	if workload.RemembersCrash(row) && row.LastFailure.ContainerName != "" {
+		return true
+	}
+	targetRev := query.RevisionFromName(target)
+	for _, pod := range pods {
+		if pod == nil || pod.DeletionTimestamp != nil {
+			continue
+		}
+		if podRev := query.RevisionFromPod(pod); !podRev.IsZero() && !podRev.Same(targetRev) {
+			continue
+		}
+		if _, restarted := RunnerRestartedSinceReady(pod, row.ReadySince); restarted || RebuiltAfterFailure(pod, row.LastFailure, revisionBorn, window) {
+			return true
+		}
+	}
+	return false
 }
 
 // Wreckage is per-instance rollout debris keyed to a SUPERSEDED
@@ -937,7 +1249,9 @@ func EvaluateWreckage(s *workload.InstanceStatus, target *appsv1.ControllerRevis
 	if isMigrateOwnedStatus(s) || isGangSurgeTargetMarker(s) {
 		return false
 	}
-	if s.Phase != workload.InstancePhaseReady && s.Phase != workload.InstancePhaseFailed {
+	// A parked attempt is settled in either phase its pods give it, so a
+	// set it left on a withdrawn revision is wreckage while it serves too.
+	if state := workload.StateOf(s); state != workload.StateReady && state != workload.StateFailed && state != workload.StateUpdateParked {
 		return false
 	}
 	if failedGangSurgeContinuation(s, target.Name) {
@@ -946,24 +1260,27 @@ func EvaluateWreckage(s *workload.InstanceStatus, target *appsv1.ControllerRevis
 	return len(alienRevisionPods(s, target.Name, instancePods)) > 0
 }
 
-// failedGangSurgeContinuation reports the gang wreckage shape: a Failed
-// source whose preserved gang-surge operation targets a revision other
-// than the current roll target.
+// failedGangSurgeContinuation reports the gang wreckage shape: a source
+// Failed at its Surge step whose kept gang surge targets a revision other
+// than the roll target; past that step the surge machine finishes the row.
 func failedGangSurgeContinuation(s *workload.InstanceStatus, targetName string) bool {
 	return s.Phase == workload.InstancePhaseFailed &&
 		s.Operation != nil && s.Operation.Type == workload.InstanceOperationUpdate &&
-		s.Operation.SurgeIndex != nil &&
+		s.Operation.SurgeIndex != nil && s.Operation.Step == workload.UpdateStepSurge &&
 		s.Operation.TargetRevision != targetName
 }
 
-// alienRevisionPods returns the instance's live pods labeled with a
-// revision that matches neither the instance's RunningRevision nor the
-// current roll target. Unlabeled pods are never selected (legacy pods
-// are the ordinal partition's business). An empty RunningRevision
-// yields no aliens: with no recorded baseline, alienness is
-// undecidable — that state is owned by the trigger's per-pod diff /
-// adoption path, and deleting an unproven-but-innocent pod there would
-// destroy the very pod adoption is waiting on.
+// alienRevisionPods returns the instance's pods labeled with a revision
+// that matches neither the instance's RunningRevision nor the current
+// roll target. A pod the cleanup has already deleted stays an alien
+// while it terminates: the row is the cleanup's until the object is
+// gone, so no other pass reads the half-gone set as a loss of its own.
+// Unlabeled pods are never selected (a pod without a revision label is the ordinal
+// partition's business). An empty RunningRevision yields no aliens:
+// with no recorded baseline, alienness is undecidable — that state is
+// owned by the trigger's per-pod diff / adoption path, and deleting an
+// unproven-but-innocent pod there would destroy the very pod adoption is
+// waiting on.
 func alienRevisionPods(s *workload.InstanceStatus, targetName string, pods []*corev1.Pod) []*corev1.Pod {
 	if s.RunningRevision == "" {
 		return nil
@@ -972,7 +1289,7 @@ func alienRevisionPods(s *workload.InstanceStatus, targetName string, pods []*co
 	target := query.RevisionFromName(targetName)
 	var out []*corev1.Pod
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
+		if pod == nil {
 			continue
 		}
 		hash, ok := pod.Labels[query.LabelRevisionHash]
@@ -1003,8 +1320,9 @@ func alienRevisionPods(s *workload.InstanceStatus, targetName string, pods []*co
 //     not-yet-promoted surge pod.
 //
 // The serving source is never touched: no serving-gate flip, no status
-// stamp — after the debris is gone the Create pass re-proves readiness
-// and promotes. done=true means no wreckage remains for this instance.
+// stamp — the Create pass re-proves readiness on the pods at the row's
+// active ordinals and promotes, the debris left to its deletion or to the
+// force-delete sweep. done=true means no wreckage remains for this instance.
 func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) (bool, error) {
 	if deps.Client == nil {
 		return false, fmt.Errorf("CleanupWreckage: nil client")
@@ -1016,11 +1334,16 @@ func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.Rec
 	if s == nil {
 		return true, nil
 	}
+	// A row the apiserver refused is left as the rejection left it until
+	// the revision in force admits a fresh attempt.
+	if parked, _ := rejectionParked(input, s); parked {
+		return true, nil
+	}
 
 	if failedGangSurgeContinuation(s, target.Name) {
 		return abandonFailedGangSurge(ctx, deps, input, plan, inst.Index, *s.Operation.SurgeIndex,
 			s.RunningRevision, s.Operation.TargetRevision,
-			instanceFailureReason(s, "gang surge abandoned after a corrective edit"), instanceFailureCause(s))
+			instanceFailureReason(s, "gang surge abandoned after a corrective edit"), instanceFailureCause(s), gangSurgeEnd{})
 	}
 
 	aliens := alienRevisionPods(s, target.Name, instancePods)
@@ -1028,6 +1351,54 @@ func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.Rec
 		return true, nil
 	}
 	return deleteSupersededRevisionPods(ctx, deps, input, inst.Index, aliens, target.Name)
+}
+
+// unrouteServingPods takes the pods of idx that are still in rotation out of
+// it under the delete-drain key, ahead of a deletion the caller issues on a
+// later pass: deleting in the pass that unrouted gives the endpoint
+// controllers no window to act on the withdrawal, and a bare delete drops
+// the connections the pod carries. Reports whether the caller must stop here
+// this pass: a pod left rotation, or refused consumed the apiserver's refusal
+// of the patch (a nil refused leaves every refusal to the caller as an error).
+func unrouteServingPods(ctx context.Context, deps workload.Deps, idx int32, pods []*corev1.Pod, refused func(*corev1.Pod, error) (bool, error)) (bool, error) {
+	return unroutePodsUnder(ctx, deps, pods, podreadiness.WriterDeleteDrain, deleteDrainKey(idx), refused)
+}
+
+// unroutePodsUnder takes every pod of pods still in rotation out of it under
+// the caller's writer key. A pod already terminating, one that has vanished,
+// or one that came back under a new UID is out of rotation by other means
+// already and is left alone. Reports whether the caller must stop here this
+// pass: a pod left rotation, or refused consumed the apiserver's refusal.
+func unroutePodsUnder(ctx context.Context, deps workload.Deps, pods []*corev1.Pod, writer, key string, refused func(*corev1.Pod, error) (bool, error)) (bool, error) {
+	unrouted := false
+	for _, pod := range pods {
+		if pod == nil || pod.DeletionTimestamp != nil || !podreadiness.IsServing(pod) {
+			continue
+		}
+		if err := podreadiness.MarkPodNotServing(ctx, deps.Client, deps.Reader(), pod, writer, key); err != nil {
+			if apierrors.IsNotFound(err) || errors.Is(err, podreadiness.ErrPodIdentityChanged) {
+				continue
+			}
+			if refused != nil {
+				if handled, derr := refused(pod, err); handled {
+					return true, derr
+				}
+			}
+			return false, fmt.Errorf("%s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		unrouted = true
+	}
+	return unrouted, nil
+}
+
+// anyPodStanding reports whether any of pods is live and not terminating.
+func anyPodStanding(pods []*corev1.Pod) bool {
+	for _, pod := range pods {
+		if pod != nil && pod.DeletionTimestamp == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // deleteSupersededRevisionPods evicts an Instance's pods keyed to a revision
@@ -1038,46 +1409,43 @@ func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.Rec
 // withdrawal, and a bare delete drops the connections it is carrying.
 // Deletes are counted on the expectations cache before they are issued, and
 // compensated when the apiserver refuses, so the next pass reads a pod set
-// it can trust.
+// it can trust. A pod already terminating is on its way out: it is neither
+// unrouted nor deleted again, and the one expectation its delete recorded
+// is the one its disappearance satisfies.
 //
 // done=false whenever there is still work here: outstanding expectations,
-// a pod just unrouted, or pods deleted that the next pass has to re-read.
+// a pod just unrouted, pods deleted that the next pass has to re-read, or
+// pods still terminating.
 func deleteSupersededRevisionPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, pods []*corev1.Pod, targetName string) (bool, error) {
 	cache := deps.ExpectationsCache()
 	ns, owner, component := input.Key.Namespace, input.Key.OwnerName, input.Key.Component
 	if !cache.Satisfied(ns, owner, component, idx) {
 		return false, nil
 	}
-	unrouted := false
-	for _, pod := range pods {
-		if !podreadiness.IsServing(pod) {
-			continue
-		}
-		if err := podreadiness.MarkPodNotServing(ctx, deps.Client, deps.Reader(), pod,
-			podreadiness.WriterDeleteDrain, deleteDrainKey(idx)); err != nil {
-			// A pod that has vanished, or come back under a new UID, is out
-			// of rotation by other means already; the delete resolves it.
-			if !apierrors.IsNotFound(err) && !errors.Is(err, podreadiness.ErrPodIdentityChanged) {
-				return false, fmt.Errorf("unroute superseded-revision pod %s/%s: %w", pod.Namespace, pod.Name, err)
-			}
-			continue
-		}
-		unrouted = true
+	// A pod that was still carrying traffic goes on the next pass; one
+	// already out of rotation has nothing to wait for and goes now.
+	unrouted, err := unrouteServingPods(ctx, deps, idx, pods, func(pod *corev1.Pod, err error) (bool, error) {
+		return disposeRejectedRowWrite(ctx, deps, input, idx, pod.Name, err)
+	})
+	if err != nil {
+		return false, fmt.Errorf("unroute superseded-revision pod: %w", err)
 	}
-	// Deleting in the pass that unrouted gives the endpoint controllers no
-	// window to act on the withdrawal, so a pod that was still carrying
-	// traffic goes on the next pass. One that was already out of rotation
-	// has nothing to wait for and goes now.
 	if unrouted {
 		return false, nil
 	}
 	deleted := 0
 	for _, pod := range pods {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
 		cache.ExpectDeletes(ns, owner, component, idx, 1)
 		if err := deps.Client.Delete(ctx, pod); err != nil {
 			cache.ObservedDelete(ns, owner, component, idx)
 			if apierrors.IsNotFound(err) {
 				continue
+			}
+			if handled, derr := disposeRejectedRowWrite(ctx, deps, input, idx, pod.Name, err); handled {
+				return false, derr
 			}
 			return false, fmt.Errorf("delete superseded-revision pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}

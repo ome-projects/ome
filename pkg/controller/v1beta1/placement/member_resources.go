@@ -172,17 +172,29 @@ func countMemberResources(ir *v1beta1.InferenceReplica, pods []corev1.Pod, gangS
 
 // memberGangSizes reads the expected shape carried by each live gang, which
 // can differ from the component's current runner templates during a rollout.
+// One list covers the component so the read cost does not grow with replicas;
+// a gang the list misses is still read by name.
 func memberGangSizes(ctx context.Context, reads client.Reader, ir *v1beta1.InferenceReplica, pods []corev1.Pod) (map[string]int32, error) {
 	sizes := map[string]int32{}
+	var listed map[string]*unstructured.Unstructured
 	for _, pod := range pods {
 		name := pod.Labels[query.LabelPodGroup]
 		if name == "" || sizes[name] > 0 {
 			continue
 		}
-		group := &unstructured.Unstructured{}
-		group.SetGroupVersionKind(schedulingv1alpha1.SchemeGroupVersion.WithKind(constants.PodGroupKind))
-		if err := reads.Get(ctx, client.ObjectKey{Namespace: ir.Namespace, Name: name}, group); err != nil {
-			return nil, err
+		if listed == nil {
+			var err error
+			if listed, err = listMemberGangs(ctx, reads, ir); err != nil {
+				return nil, err
+			}
+		}
+		group, ok := listed[name]
+		if !ok {
+			group = &unstructured.Unstructured{}
+			group.SetGroupVersionKind(schedulingv1alpha1.SchemeGroupVersion.WithKind(constants.PodGroupKind))
+			if err := reads.Get(ctx, client.ObjectKey{Namespace: ir.Namespace, Name: name}, group); err != nil {
+				return nil, err
+			}
 		}
 		owner := metav1.GetControllerOf(group)
 		if group.GetUID() == "" || !group.GetDeletionTimestamp().IsZero() || owner == nil || owner.UID != ir.UID || owner.Kind != "InferenceReplica" || owner.APIVersion != v1beta1.SchemeGroupVersion.String() {
@@ -195,6 +207,24 @@ func memberGangSizes(ctx context.Context, reads client.Reader, ir *v1beta1.Infer
 		sizes[name] = int32(size)
 	}
 	return sizes, nil
+}
+
+// listMemberGangs indexes the component's gangs by name through the service
+// and component labels their creator stamps on every PodGroup.
+func listMemberGangs(ctx context.Context, reads client.Reader, ir *v1beta1.InferenceReplica) (map[string]*unstructured.Unstructured, error) {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schedulingv1alpha1.SchemeGroupVersion.WithKind(constants.PodGroupKind + "List"))
+	if err := reads.List(ctx, list, client.InNamespace(ir.Namespace), client.MatchingLabels{
+		constants.InferenceServicePodLabelKey: ir.NamePrefix(),
+		constants.OMEComponentLabel:           string(ir.Spec.Component),
+	}); err != nil {
+		return nil, err
+	}
+	out := make(map[string]*unstructured.Unstructured, len(list.Items))
+	for i := range list.Items {
+		out[list.Items[i].GetName()] = &list.Items[i]
+	}
+	return out, nil
 }
 
 func memberSlot(pod *corev1.Pod) (memberPodSlot, error) {

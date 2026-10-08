@@ -195,12 +195,11 @@ func executeDecision(ctx context.Context, deps types.Deps, input types.Reconcile
 // observation — the hold authorities ran at the top of the pass and
 // reported what they found, so the row still names the wait an operator
 // needs to see — and the supersede-prune is withheld work in the same
-// sense, not an observation a pause hides.
+// sense, not an observation a pause hides. The parked attempts' phases
+// follow their pods on every pass, paused included: that is observation
+// of a set no pass drives, not repair.
 func endOfPassBookkeeping(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, snapshot *ObservedSnapshot, decision Decision, held holds.Result) error {
-	if !decision.Escalate {
-		return nil
-	}
-	if err := escalation.Run(ctx, escalation.PassInput{
+	pass := escalation.PassInput{
 		Deps:     deps,
 		Input:    input,
 		Plan:     plan,
@@ -208,13 +207,19 @@ func endOfPassBookkeeping(ctx context.Context, deps types.Deps, input types.Reco
 		Pods:     snapshot.CachedPods,
 		Excluded: scaleDownExtras(decision),
 		Held:     held,
-	}); err != nil {
-		return err
 	}
-	if err := escalation.PruneSupersededRetryBlocks(ctx, input, target); err != nil {
-		return err
+	if decision.Escalate {
+		if err := escalation.Run(ctx, pass); err != nil {
+			return err
+		}
+		if err := escalation.PruneSupersededRetryBlocks(ctx, input, target); err != nil {
+			return err
+		}
+		if err := escalation.PruneOutlivedRetryBlocks(ctx, input, plan, target, snapshot.CachedPods); err != nil {
+			return err
+		}
 	}
-	return escalation.PruneOutlivedRetryBlocks(ctx, input, plan, target, snapshot.CachedPods)
+	return escalation.FollowParkedAttempts(ctx, pass)
 }
 
 // sweepStuckTerminatingPods is the Component-wide force-delete sweep:
@@ -311,7 +316,8 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 		// 3. Per-Instance restart pass. Constraint: a repair opened or
 		// held owns the wake-up — nothing in the cluster changes while a
 		// denial stands, so no watch event is coming — and the pass ends
-		// on it after materializing the surge-free indices itself.
+		// on it after materializing the surge-free indices itself and
+		// advancing the update attempts already in flight elsewhere.
 		case ActionRestart:
 			createFollows := hasActionKind(decision.Actions[actionIndex+1:], ActionCreate)
 			res, stop, err := executeRestartPass(ctx, deps, input, plan, target, action.Restarts, createFollows)
@@ -319,7 +325,8 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 				return res, false, err
 			}
 			if stop {
-				return res, false, nil
+				res, err := advanceUpdatesBesideRepair(ctx, deps, input, plan, target, snapshot, decision, action.Restarts, res)
+				return res, false, err
 			}
 
 		// 4. Migration expiry pass. Constraint: the plan is stale when
@@ -351,13 +358,28 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 		// 6. Per-Instance update pass. Constraint: an Update that ran
 		// leaves the observation stale for Create — see executeUpdatePass's
 		// anyUpdateRan — so stop=true ends the pass with the interval the
-		// update asked for.
+		// update asked for, after materializing the surge-free indices.
 		case ActionUpdate:
 			res, stop, err := executeUpdatePass(ctx, deps, input, plan, target, snapshot, action.Update, decision.RequeueAfter)
 			if err != nil {
 				return res, false, err
 			}
 			if stop {
+				// Surge-free indices — brand-new ones, and rows demoted for
+				// losing every pod — legitimately bypass the skip-Create gate:
+				// no Update this pass could have moved their ordinal or their
+				// running revision, so the stale-observation hazard does not
+				// apply — see ops.CreateFreshIndices. Materialize them now so a
+				// concurrent scale-up isn't starved behind the in-flight
+				// rollout, and so a row that lost its pods is rebuilt whether
+				// or not a start is admitted around it: a podless row on the
+				// target holds a slot in the budget that denies the start, and
+				// nothing but its rebuild releases it. The full Create pass
+				// still owns surge-sensitive (touched) indices once the
+				// rollout drains.
+				if _, err := createPass(ctx, deps, input, plan, target, createScopeFresh); err != nil {
+					return ctrl.Result{}, false, err
+				}
 				return res, false, nil
 			}
 
@@ -382,16 +404,106 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 }
 
 // reportIdleUpdate stands in for the update pass on a Decision that
-// planned none because the roll has nothing left to do (Decision.UpdateIdle):
-// it reports a nil hold where the update pass would have, so a hold a
-// prior pass recorded clears. A pass that ends before the update position,
+// planned none. A roll with nothing left to do (Decision.UpdateIdle)
+// reports a nil hold where the update pass would have, so a hold a prior
+// pass recorded clears; a roll waiting on the target's ladder with
+// nothing to run (Decision.LadderHold) reports the ladder hold there,
+// every pass, so the hold names what the ladder's attempt rebuilds as the
+// wait goes on; a roll with nothing to run whose Instances on the target
+// crashed after promotion, are out of rotation and hold its budget
+// (Decision.StandingHold) reports that hold there. A pass that ends
+// before the update position,
 // on a scale wave or a repair, never reaches it and leaves the hold
-// standing.
+// standing, except the repair, which reports the update pass's verdict
+// when it advances update attempts in flight, and the standing hold
+// itself otherwise (reportStandingHold).
 func reportIdleUpdate(input types.ReconcileInput, decision Decision) {
-	if !decision.UpdateIdle || input.RecordRolloutHold == nil {
+	if input.RecordRolloutHold == nil {
 		return
 	}
-	input.RecordRolloutHold(nil)
+	switch {
+	case decision.UpdateIdle:
+		input.RecordRolloutHold(nil)
+	case decision.LadderHold != nil:
+		input.RecordRolloutHold(decision.LadderHold)
+	case decision.StandingHold != nil:
+		input.RecordRolloutHold(decision.StandingHold)
+	}
+}
+
+// reportStandingHold stands in for the update pass on a pass the restart
+// pass consumed with no update attempt in flight to advance
+// (advanceUpdatesBesideRepair): the repair owns the wake-up, but the
+// Instances already on the target that do not serve it hold the roll
+// whether or not its pass runs, so the hold they stand behind is
+// reported where the update pass would have reported it — the
+// selection's when the pass had Instances to run, the Decision's when it
+// had none. When none stands nothing is reported, and a hold a prior pass
+// recorded waits for the pass that reaches the update position to
+// replace or clear it.
+func reportStandingHold(input types.ReconcileInput, decision Decision) {
+	if input.RecordRolloutHold == nil {
+		return
+	}
+	hold := decision.StandingHold
+	if selection := decision.updateSelection(); selection != nil {
+		hold = selection.StandingHold
+	}
+	if hold == nil {
+		return
+	}
+	input.RecordRolloutHold(hold)
+}
+
+// advanceUpdatesBesideRepair runs, on a pass the restart pass consumed,
+// the update attempts already in flight on the Instances no repair
+// selected, and folds their wake-up into the repair's. Such an attempt's
+// next step — the serving gate on a ContainersReady replacement, the
+// drain, the promote — waits on nothing a repair changes, while its
+// deadline runs whether or not a pass drives it: held until every repair
+// finishes, a healthy attempt is failed by the escalation pass. A fresh
+// start still waits for a pass the restart pass does not consume, since
+// its admission projects against counts Plan read before this pass's
+// repairs opened.
+func advanceUpdatesBesideRepair(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, snapshot *ObservedSnapshot, decision Decision, restarts []RestartSelection, res ctrl.Result) (ctrl.Result, error) {
+	selection := decision.updateSelection()
+	var inFlight []UpdateItem
+	if selection != nil {
+		inFlight = updateAttemptsInFlight(selection.Items, restarts)
+	}
+	if len(inFlight) == 0 {
+		reportStandingHold(input, decision)
+		return res, nil
+	}
+	advancing := *selection
+	advancing.Items = inFlight
+	updateRes, _, err := executeUpdatePass(ctx, deps, input, plan, target, snapshot, &advancing, decision.RequeueAfter)
+	if err != nil {
+		return updateRes, err
+	}
+	return types.EarliestWake(res, updateRes.RequeueAfter), nil
+}
+
+// updateAttemptsInFlight keeps the update items that continue an attempt
+// already in flight on an Instance no repair selected. A fresh start, a
+// revision backfill and a wreckage cleanup each begin something, and
+// wait for a pass the restart pass does not consume.
+func updateAttemptsInFlight(items []UpdateItem, restarts []RestartSelection) []UpdateItem {
+	repairing := make(map[int32]struct{}, len(restarts))
+	for _, restart := range restarts {
+		repairing[restart.Instance.Index] = struct{}{}
+	}
+	var kept []UpdateItem
+	for _, item := range items {
+		if item.StartingFresh || item.AdoptRevision || item.CleanupOnly {
+			continue
+		}
+		if _, ok := repairing[item.Instance.Index]; ok {
+			continue
+		}
+		kept = append(kept, item)
+	}
+	return kept
 }
 
 // demoteUnbackedInstances applies the truth pass: the status-only

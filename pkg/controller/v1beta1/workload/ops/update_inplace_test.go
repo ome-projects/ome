@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -896,10 +897,11 @@ func TestUpdate_InPlacePausedCompletesThePatch(t *testing.T) {
 // TestUpdateInPlace_PodObservationsThatDecideNothing: the in-place step
 // promotes on one thing only — every changed image confirmed from
 // container status on a pod that is PodReady past its availability
-// window. Everything else the kubelet can report about that pod either
-// is the patch taking effect or is a wait: none of them ends the attempt,
-// bumps the Incarnation, or moves the step off the patch. The roll is
-// bounded by its operation deadline, not by any of these readings.
+// window. Short of a terminal phase, which the attempt recycles,
+// everything else the kubelet can report about that pod either is the
+// patch taking effect or is a wait: none of them ends the attempt, bumps
+// the Incarnation, or moves the step off the patch. The roll is bounded by
+// its operation deadline, not by any of these readings.
 func TestUpdateInPlace_PodObservationsThatDecideNothing(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -927,31 +929,6 @@ func TestUpdateInPlace_PodObservationsThatDecideNothing(t *testing.T) {
 			observe: func(t *testing.T, f *nonSurgeFixture) *corev1.Pod {
 				pod := f.pod.DeepCopy()
 				pod.Spec.NodeName = "node-that-no-longer-exists"
-				return pod
-			},
-		},
-		{
-			name: "the pod evicted",
-			observe: func(t *testing.T, f *nonSurgeFixture) *corev1.Pod {
-				pod := f.pod.DeepCopy()
-				pod.Status.Phase = corev1.PodFailed
-				pod.Status.Reason = "Evicted"
-				return pod
-			},
-		},
-		{
-			name: "the pod in a terminal Failed phase",
-			observe: func(t *testing.T, f *nonSurgeFixture) *corev1.Pod {
-				pod := f.pod.DeepCopy()
-				pod.Status.Phase = corev1.PodFailed
-				return pod
-			},
-		},
-		{
-			name: "the pod in a terminal Succeeded phase",
-			observe: func(t *testing.T, f *nonSurgeFixture) *corev1.Pod {
-				pod := f.pod.DeepCopy()
-				pod.Status.Phase = corev1.PodSucceeded
 				return pod
 			},
 		},
@@ -1230,4 +1207,290 @@ func TestUpdateInPlace_AdmissionUnavailable_SaysWhyThePatchWaits(t *testing.T) {
 	if named != 1 {
 		t.Errorf("admission events carrying the apiserver's words: got %d want 1 (%v)", named, events)
 	}
+}
+
+// darkInPlaceFixture seeds a single-pod Instance Ready at incarnation 1
+// whose running revision records spec under the release annotation "one"
+// and whose pod ran that revision, served, and has failed its kubelet
+// readiness for unreadyFor while it keeps running. The target revision
+// carries targetSpec under the release annotation "two": with the same
+// image that is a diff an in-place step patches without replacing a
+// container.
+func darkInPlaceFixture(t *testing.T, targetSpec *corev1.PodSpec, unreadyFor time.Duration) (*v1beta1.InferenceService, *corev1.Pod, client.Client, *appsv1.ControllerRevision) {
+	t.Helper()
+	legacyResetExpectations(t)
+	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
+	spec := legacyTargetSpecImage("example.com/app:v1")
+	pod := legacyRunningPodAtRevision(isvc, 0, 1, "example.com/app:v1")
+	pod.Annotations = map[string]string{"release": "one"}
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "main", Image: "example.com/app:v1", Ready: false,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}}
+	since := metav1.NewTime(time.Now().Add(-unreadyFor))
+	for i := range pod.Status.Conditions {
+		switch pod.Status.Conditions[i].Type {
+		case corev1.ContainersReady, corev1.PodReady:
+			pod.Status.Conditions[i].Status = corev1.ConditionFalse
+			pod.Status.Conditions[i].LastTransitionTime = since
+		}
+	}
+	c := legacyNewFakeClient(t, isvc, ir, pod)
+	legacySeedRunningRevisionWithMeta(t, c, isvc, workload.ComponentEngine, 0, spec,
+		&metav1.ObjectMeta{Annotations: map[string]string{"release": "one"}})
+	target := legacyEnsureTargetCRWithMeta(t, c, isvc, targetSpec,
+		&metav1.ObjectMeta{Annotations: map[string]string{"release": "two"}})
+	return isvc, pod, c, target
+}
+
+// drainRecorder returns every event the fake recorder has queued.
+func drainRecorder(rec *record.FakeRecorder) []string {
+	var out []string
+	for {
+		select {
+		case e := <-rec.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+// TestUpdateWithPods_InPlaceStartOverADarkPodRecreatesWhenItReplacesNoContainer:
+// a fresh InPlaceIfPossible start whose diff is metadata alone reaches a
+// pod that has failed readiness for the stuck-pod grace. The patch would
+// leave the kubelet's readiness as it found it and the step could only
+// wait out its deadline with the unavailability slot spent, so the roll
+// resolves the start to a recreate: the row opens on the Drain step at a
+// bumped Incarnation, the dark pod is deleted for a replacement at the
+// target, and the fallback is announced once.
+func TestUpdateWithPods_InPlaceStartOverADarkPodRecreatesWhenItReplacesNoContainer(t *testing.T) {
+	spec := legacyTargetSpecImage("example.com/app:v1")
+	isvc, pod, c, target := darkInPlaceFixture(t, spec, 2*time.Minute)
+	in := legacyTestInput(isvc, c, workload.ComponentEngine)
+	in.StuckPodGrace = time.Minute
+	plan := legacyComponentPlan(workload.UpdateStrategyInPlaceIfPossible, nil)
+	rec := record.NewFakeRecorder(16)
+	deps := workload.Deps{Client: c, Recorder: rec}
+
+	done, err := UpdateWithPods(context.Background(), deps, in, plan, plan.Instances[0], target, spec, []*corev1.Pod{pod})
+	if err != nil {
+		t.Fatalf("UpdateWithPods: %v", err)
+	}
+	if done {
+		t.Fatal("the roll must stay in flight while the replacement comes up")
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceUpdating || s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain {
+		t.Fatalf("row = phase %q op %+v, want Updating on the Drain step: a patch that replaces no container cannot restore a dark pod", s.Phase, s.Operation)
+	}
+	if s.Incarnation != 2 {
+		t.Errorf("Incarnation: got %d want 2 (the recreate's new materialization)", s.Incarnation)
+	}
+	live := &corev1.Pod{}
+	if gerr := c.Get(context.Background(), client.ObjectKeyFromObject(pod), live); !apierrors.IsNotFound(gerr) {
+		t.Errorf("the dark pod must be deleted for its replacement; get = %v, annotations %v", gerr, live.Annotations)
+	}
+	announced := 0
+	for _, e := range drainRecorder(rec) {
+		if strings.Contains(e, string(workload.EventReasonInPlaceUpdateNotPossible)) {
+			announced++
+		}
+	}
+	if announced != 1 {
+		t.Errorf("InPlaceUpdateNotPossible announced %d times, want once", announced)
+	}
+}
+
+// TestUpdateWithPods_InPlacePatchOverAPodDarkPastTheGraceMovesToRecreate:
+// an in-place patch opened on a pod inside its stuck-pod grace, drained
+// and relabeled to the target, finds the pod still failing readiness once
+// the grace has run. The step changed no container, so nothing it waits
+// for can arrive: the attempt moves to the Drain step on the same
+// operation, keeping its identity and deadline, with the Incarnation
+// bumped and the mechanism pinned, exactly as a pod loss moves it.
+func TestUpdateWithPods_InPlacePatchOverAPodDarkPastTheGraceMovesToRecreate(t *testing.T) {
+	spec := legacyTargetSpecImage("example.com/app:v1")
+	isvc, pod, c, target := darkInPlaceFixture(t, spec, 2*time.Minute)
+	op := &v1beta1.InstanceOperation{
+		ID:             "update-0-1",
+		Type:           v1beta1.InstanceOperationUpdate,
+		Step:           workload.UpdateStepInPlace,
+		TargetRevision: target.Name,
+		Strategy:       string(v1beta1.UpdateStrategyInPlaceIfPossible),
+		StartedAt:      metav1.NewTime(time.Now().Add(-90 * time.Second)),
+		LastProgressAt: metav1.NewTime(time.Now().Add(-90 * time.Second)),
+		Deadline:       metav1.NewTime(time.Now().Add(29 * time.Minute)),
+	}
+	ir := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: isvc.Namespace, Name: legacyIRName(isvc, workload.ComponentEngine)}, ir); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceUpdating
+	ir.Status.InstanceStatuses[0].TargetRevision = target.Name
+	ir.Status.InstanceStatuses[0].Operation = op.DeepCopy()
+	if err := c.Status().Update(context.Background(), ir); err != nil {
+		t.Fatalf("seed the in-flight patch: %v", err)
+	}
+	// The patch has landed: the pod carries the target's metadata and
+	// revision label, and its serving gate is off from the drain.
+	patched := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), patched); err != nil {
+		t.Fatalf("get pod: %v", err)
+	}
+	patched.Annotations["release"] = "two"
+	patched.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(target.Name)
+	for i := range patched.Status.Conditions {
+		if patched.Status.Conditions[i].Type == query.ServingConditionType {
+			patched.Status.Conditions[i].Status = corev1.ConditionFalse
+		}
+	}
+	if err := c.Update(context.Background(), patched); err != nil {
+		t.Fatalf("relabel pod: %v", err)
+	}
+	if err := c.Status().Update(context.Background(), patched); err != nil {
+		t.Fatalf("drain pod: %v", err)
+	}
+
+	in := legacyTestInput(isvc, c, workload.ComponentEngine)
+	in.StuckPodGrace = time.Minute
+	plan := legacyComponentPlan(workload.UpdateStrategyInPlaceIfPossible, nil)
+	rec := record.NewFakeRecorder(16)
+	deps := workload.Deps{Client: c, Recorder: rec}
+
+	done, err := UpdateWithPods(context.Background(), deps, in, plan, plan.Instances[0], target, spec, []*corev1.Pod{patched})
+	if err != nil {
+		t.Fatalf("UpdateWithPods: %v", err)
+	}
+	if done {
+		t.Fatal("the roll must stay in flight while the replacement comes up")
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceUpdating || s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain {
+		t.Fatalf("row = phase %q op %+v, want Updating on the Drain step", s.Phase, s.Operation)
+	}
+	if s.Operation.ID != op.ID {
+		t.Errorf("Operation.ID: got %q want %q (same attempt)", s.Operation.ID, op.ID)
+	}
+	if s.Operation.Deadline.Unix() != op.Deadline.Unix() {
+		t.Errorf("Operation.Deadline: got %v want %v (same attempt)", s.Operation.Deadline, op.Deadline)
+	}
+	if s.Operation.Strategy != string(v1beta1.UpdateStrategyRecreatePod) {
+		t.Errorf("Operation.Strategy: got %q want %q (the mechanism it re-resolved to)", s.Operation.Strategy, v1beta1.UpdateStrategyRecreatePod)
+	}
+	if s.Incarnation != 2 {
+		t.Errorf("Incarnation: got %d want 2 (the recreate's new materialization)", s.Incarnation)
+	}
+	live := &corev1.Pod{}
+	if gerr := c.Get(context.Background(), client.ObjectKeyFromObject(pod), live); !apierrors.IsNotFound(gerr) {
+		t.Errorf("the dark pod must be deleted for its replacement; get = %v", gerr)
+	}
+	if !strings.Contains(strings.Join(drainRecorder(rec), "\n"), string(workload.EventReasonInPlaceUpdateNotPossible)) {
+		t.Errorf("the re-resolution must be announced")
+	}
+}
+
+// TestUpdateWithPods_InPlaceStepOverAnUnreadyPodKeepsPatching pins the
+// edges of the fallback: a step that replaces a container keeps the patch,
+// because the kubelet's restart with the new image is what the row waits
+// on; a pod unready for less than the grace keeps it, because its wait may
+// still resolve; no grace configured never reads a pod dark; and
+// InPlaceOnly keeps the patch under its promise never to rebuild.
+func TestUpdateWithPods_InPlaceStepOverAnUnreadyPodKeepsPatching(t *testing.T) {
+	cases := []struct {
+		name       string
+		target     *corev1.PodSpec
+		unreadyFor time.Duration
+		grace      time.Duration
+		strategy   workload.UpdateStrategyType
+	}{
+		{"the step replaces a container", legacyTargetSpecImage("example.com/app:v2"), 2 * time.Minute, time.Minute, workload.UpdateStrategyInPlaceIfPossible},
+		{"the pod is inside its grace", legacyTargetSpecImage("example.com/app:v1"), 10 * time.Second, time.Minute, workload.UpdateStrategyInPlaceIfPossible},
+		{"no grace is configured", legacyTargetSpecImage("example.com/app:v1"), 2 * time.Minute, 0, workload.UpdateStrategyInPlaceIfPossible},
+		{"InPlaceOnly never rebuilds", legacyTargetSpecImage("example.com/app:v1"), 2 * time.Minute, time.Minute, workload.UpdateStrategyInPlaceOnly},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc, pod, c, target := darkInPlaceFixture(t, tc.target, tc.unreadyFor)
+			in := legacyTestInput(isvc, c, workload.ComponentEngine)
+			in.StuckPodGrace = tc.grace
+			plan := legacyComponentPlan(tc.strategy, nil)
+			deps := workload.Deps{Client: c, Recorder: record.NewFakeRecorder(16)}
+			if _, err := UpdateWithPods(context.Background(), deps, in, plan, plan.Instances[0], target, tc.target, []*corev1.Pod{pod}); err != nil {
+				t.Fatalf("UpdateWithPods: %v", err)
+			}
+			s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+			if s.Phase != v1beta1.OMENativeInstanceUpdating || s.Operation == nil || s.Operation.Step != workload.UpdateStepInPlace {
+				t.Fatalf("row = phase %q op %+v, want Updating on the InPlace step", s.Phase, s.Operation)
+			}
+			if s.Incarnation != 1 {
+				t.Errorf("Incarnation: got %d want 1 (the patch keeps the materialization)", s.Incarnation)
+			}
+			if gerr := c.Get(context.Background(), client.ObjectKeyFromObject(pod), &corev1.Pod{}); gerr != nil {
+				t.Errorf("the pod must stay for the patch: %v", gerr)
+			}
+		})
+	}
+}
+
+// TestUpdateInPlace_ExpiredExpectationsReleaseThePass: the in-place step
+// seeds a delete expectation when it recycles a terminal pod, and an empty
+// pod set counts as evidence only once that delete has been observed; an
+// unobserved one holds the pass. The expectation is not held forever: past
+// its TTL the cache reads as satisfied, the next pass reads the pod set
+// afresh, and a set that is empty re-resolves the roll to recreate on the
+// same operation and renders the replacement.
+func TestUpdateInPlace_ExpiredExpectationsReleaseThePass(t *testing.T) {
+	seed := func(t *testing.T) (*nonSurgeFixture, *workload.Expectations, *clocktesting.FakeClock) {
+		t.Helper()
+		f := inPlaceInFlightFixture(t)
+		// The recycle's delete landed - the pod is gone from the apiserver -
+		// but the watch event confirming it never arrived.
+		if err := f.c.Delete(context.Background(), f.pod); err != nil {
+			t.Fatalf("remove the recycled pod: %v", err)
+		}
+		fc := clocktesting.NewFakeClock(time.Now())
+		exp := workload.NewExpectationsWithClock(fc)
+		exp.ExpectDeletes(f.isvc.Namespace, f.isvc.Name, workload.ComponentEngine, 0, 1)
+		return f, exp, fc
+	}
+	run := func(t *testing.T, f *nonSurgeFixture, exp *workload.Expectations) (bool, v1beta1.OMENativeInstanceStatus, int) {
+		t.Helper()
+		in := f.input()
+		plan := legacyComponentPlan(f.strategy, nil)
+		deps := workload.Deps{Client: f.c, Recorder: record.NewFakeRecorder(32), Expectations: exp}
+		done, err := UpdateWithPods(context.Background(), deps, in, plan, plan.Instances[0], f.targetCR, f.targetSpec, nil)
+		if err != nil {
+			t.Fatalf("UpdateWithPods: %v", err)
+		}
+		pods := &corev1.PodList{}
+		if err := f.c.List(context.Background(), pods, client.InNamespace(f.isvc.Namespace)); err != nil {
+			t.Fatalf("list pods: %v", err)
+		}
+		return done, legacyInstanceStatusesOnIR(f.c, f.isvc, workload.ComponentEngine)[0], len(pods.Items)
+	}
+
+	t.Run("an outstanding delete holds the pass", func(t *testing.T) {
+		f, exp, _ := seed(t)
+		done, s, pods := run(t, f, exp)
+		if done || s.Operation == nil || s.Operation.Step != workload.UpdateStepInPlace || s.Incarnation != 1 {
+			t.Errorf("row moved on an empty set with a delete still unobserved: done=%v op=%+v incarnation=%d", done, s.Operation, s.Incarnation)
+		}
+		if pods != 0 {
+			t.Errorf("pods: got %d want none created while the delete is unobserved", pods)
+		}
+	})
+
+	t.Run("an expired delete lets the empty set re-resolve to recreate", func(t *testing.T) {
+		f, exp, fc := seed(t)
+		fc.Step(3 * time.Minute)
+		done, s, pods := run(t, f, exp)
+		if done || s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain || s.Incarnation != 2 {
+			t.Errorf("row: got done=%v op=%+v incarnation=%d want the recreate restamped at the bumped incarnation", done, s.Operation, s.Incarnation)
+		}
+		if pods != 1 {
+			t.Errorf("pods: got %d want the replacement rendered at the target revision", pods)
+		}
+	})
 }

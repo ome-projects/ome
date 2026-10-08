@@ -282,6 +282,113 @@ func TestConsumeResetInstances_RepairOwnedTargets_Reset(t *testing.T) {
 	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonInstancesResetSkipped))).To(gomega.BeEmpty())
 }
 
+// parkedAttemptRow is an Update attempt parked after its disposition on
+// Instance idx, in the phase its pod set last gave it.
+func parkedAttemptRow(idx int32, phase v1beta1.OMENativeInstancePhase) v1beta1.OMENativeInstanceStatus {
+	now := metav1.Now()
+	return v1beta1.OMENativeInstanceStatus{
+		Index: idx, Phase: phase, RunningRevision: "llama-engine-aaaaaaaa", TargetRevision: "llama-engine-bbbbbbbb", Incarnation: 2,
+		Operation: &v1beta1.InstanceOperation{
+			ID: "update-5-1", Type: v1beta1.InstanceOperationUpdate, Step: workloadtypes.UpdateStepParked,
+			StartedAt: now, LastProgressAt: now, TargetRevision: "llama-engine-bbbbbbbb", Waiting: string(workloadtypes.RolloutHoldGateRetryBlock),
+		},
+		LastFailure: &v1beta1.InstanceTermination{PodName: "llama-engine-5-default-0", Reason: "CrashLoopBackOff", Time: now},
+	}
+}
+
+// A parked attempt is addressed by the mailbox in either phase its pod set
+// gives it: named outright or under "all", a parked row reading Updating
+// whose set is out of the serving rotation loses its pods and the parked
+// operation and reads Failed, the fresh-start shape the Create pass
+// rebuilds; one whose set still serves is skipped as still serving.
+func TestConsumeResetInstances_ParkedAttemptReadingUpdating_Reset(t *testing.T) {
+	for _, value := range []string{"5", "all"} {
+		t.Run(value, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			seed := resetIR(value)
+			seed.Status.InstanceStatuses = append(seed.Status.InstanceStatuses, parkedAttemptRow(5, v1beta1.OMENativeInstanceUpdating))
+			pods := append(resetPods(seed), podForIR(seed, 5, "default", 0, false, false))
+			r, c, rec, ir := newResetFixture(t, seed, pods, nil)
+			want5 := instanceStatusAt(t, ir, 5)
+
+			requeue, err := r.consumeResetInstancesRequest(context.Background(), r.Log, ir, nil)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(requeue).To(gomega.BeFalse())
+
+			assertInstanceReset(t, g, c, ir, 5, want5)
+			assertResetAnnotationConsumed(t, g, c, ir)
+			events := drainEvents(rec)
+			g.Expect(eventsContaining(events, string(workloadtypes.EventReasonInstancesReset)+" ")).To(gomega.HaveLen(1))
+			g.Expect(eventsContaining(events, "5")).NotTo(gomega.BeEmpty())
+			g.Expect(eventsContaining(events, "5 (")).To(gomega.BeEmpty(), "the parked attempt must not be skipped")
+		})
+	}
+	t.Run("still serving", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		seed := resetIR("5")
+		seed.Status.InstanceStatuses = append(seed.Status.InstanceStatuses, parkedAttemptRow(5, v1beta1.OMENativeInstanceUpdating))
+		pods := append(resetPods(seed), podForIR(seed, 5, "default", 0, true, true))
+		r, c, rec, ir := newResetFixture(t, seed, pods, nil)
+		want5 := instanceStatusAt(t, ir, 5)
+
+		_, err := r.consumeResetInstancesRequest(context.Background(), r.Log, ir, nil)
+		g.Expect(err).NotTo(gomega.HaveOccurred())
+
+		g.Expect(livePodsForInstance(t, c, ir, 5)).To(gomega.HaveLen(1), "a serving set is never removed by a reset")
+		fresh := &v1beta1.InferenceReplica{}
+		g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh)).To(gomega.Succeed())
+		g.Expect(instanceStatusAt(t, fresh, 5)).To(gomega.Equal(want5))
+		skips := eventsContaining(drainEvents(rec), string(workloadtypes.EventReasonInstancesResetSkipped))
+		g.Expect(skips).To(gomega.HaveLen(1))
+		g.Expect(skips[0]).To(gomega.ContainSubstring("5 (still serving)"))
+	})
+}
+
+// verdictEndedRecreateRow is a gang's recreate the gang verdict ended on
+// Instance idx: Failed with the Update continuation kept and the
+// ownership conflict recorded.
+func verdictEndedRecreateRow(idx int32) v1beta1.OMENativeInstanceStatus {
+	now := metav1.Now()
+	return v1beta1.OMENativeInstanceStatus{
+		Index: idx, Phase: v1beta1.OMENativeInstanceFailed, RunningRevision: "llama-engine-aaaaaaaa", TargetRevision: "llama-engine-bbbbbbbb", Incarnation: 2,
+		Operation: &v1beta1.InstanceOperation{
+			ID: "update-6-1", Type: v1beta1.InstanceOperationUpdate, Step: workloadtypes.UpdateStepDrain,
+			StartedAt: now, LastProgressAt: now, Deadline: now, TargetRevision: "llama-engine-bbbbbbbb",
+			Reason: "revision llama-engine-aaaaaaaa -> llama-engine-bbbbbbbb",
+		},
+		LastFailure: &v1beta1.InstanceTermination{Reason: workloadtypes.PodGroupOwnershipConflictReason, Message: "PodGroup llama-engine-6 is controlled by StatefulSet/other-owner, not by this owner", Time: now},
+	}
+}
+
+// A recreate the gang verdict ended is the reset's to clear, named
+// outright or under "all": no pass re-drives it at its pinned revision,
+// so the mailbox is the operator's way out beside a corrective revision.
+// Its members are deleted and the kept Update continuation cleared, with
+// Phase, LastFailure, Incarnation and the running revision kept.
+func TestConsumeResetInstances_RecreateEndedByTheGangVerdict_Reset(t *testing.T) {
+	for _, value := range []string{"6", "all"} {
+		t.Run(value, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			seed := resetIR(value)
+			seed.Status.InstanceStatuses = append(seed.Status.InstanceStatuses, verdictEndedRecreateRow(6))
+			pods := append(resetPods(seed), podForIR(seed, 6, "leader", 0, false, false), podForIR(seed, 6, "worker", 0, false, false))
+			r, c, rec, ir := newResetFixture(t, seed, pods, nil)
+			want6 := instanceStatusAt(t, ir, 6)
+
+			requeue, err := r.consumeResetInstancesRequest(context.Background(), r.Log, ir, nil)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(requeue).To(gomega.BeFalse())
+
+			assertInstanceReset(t, g, c, ir, 6, want6)
+			assertResetAnnotationConsumed(t, g, c, ir)
+			events := drainEvents(rec)
+			g.Expect(eventsContaining(events, string(workloadtypes.EventReasonInstancesReset)+" ")).To(gomega.HaveLen(1))
+			g.Expect(eventsContaining(events, "6 ")).NotTo(gomega.BeEmpty(), "the event must name the reset recreate")
+			g.Expect(eventsContaining(events, "6 (")).To(gomega.BeEmpty(), "the ended recreate must not be skipped")
+		})
+	}
+}
+
 // TestConsumeResetInstances_ServingTarget_SkipConsumed pins the serving
 // guard: a Failed Instance with a pod still in the serving rotation is
 // left exactly as it was — pod and preserved Operation — no expectation
@@ -601,5 +708,74 @@ func TestParseResetInstancesValue(t *testing.T) {
 	for _, bad := range []string{"", " ", ",", "1,", "1,,2", "x", "-1", "1.5", "ALL", "all,1", "99999999999"} {
 		_, err := parseResetInstancesValue(bad)
 		g.Expect(err).To(gomega.HaveOccurred(), "value %q must be rejected", bad)
+	}
+}
+
+// TestConsumeResetInstances_ParkedAndKeptCreate_RedeliveryIsNoOp pins the
+// mailbox's at-most-once effect on the rows a reset owns besides a parked
+// repair: an attempt parked after its disposition in either phase its set
+// gives it, and a Create attempt kept by the gang verdict. The request is
+// consumed only after its effects commit, so a re-delivery that finds the
+// pods gone and the operations cleared deletes nothing, writes no status
+// and reports the targets as having nothing to reset.
+func TestConsumeResetInstances_ParkedAndKeptCreate_RedeliveryIsNoOp(t *testing.T) {
+	g := gomega.NewWithT(t)
+	crash := true
+	deletes := 0
+	funcs := &interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*v1beta1.InferenceReplica); ok && crash {
+				return errors.New("simulated crash before the annotation delete")
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+		Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			deletes++
+			return cl.Delete(ctx, obj, opts...)
+		},
+	}
+	seed := resetIR("2,5,6")
+	seed.Status.InstanceStatuses = append(seed.Status.InstanceStatuses,
+		parkedAttemptRow(5, v1beta1.OMENativeInstanceUpdating),
+		parkedAttemptRow(6, v1beta1.OMENativeInstanceFailed))
+	pods := append(resetPods(seed),
+		podForIR(seed, 5, "default", 0, false, false),
+		podForIR(seed, 6, "default", 0, false, false))
+	r, c, rec, ir := newResetFixture(t, seed, pods, funcs)
+	wants := map[int32]v1beta1.OMENativeInstanceStatus{}
+	for _, idx := range []int32{2, 5, 6} {
+		wants[idx] = instanceStatusAt(t, ir, idx)
+	}
+
+	_, err := r.consumeResetInstancesRequest(context.Background(), r.Log, ir, nil)
+	g.Expect(err).To(gomega.HaveOccurred(), "a failed annotation delete must surface so the request re-drives")
+	g.Expect(deletes).To(gomega.Equal(3), "the kept Create's pod and both parked pods are deleted before the annotation is touched")
+	for _, idx := range []int32{2, 5, 6} {
+		assertInstanceReset(t, g, c, ir, idx, wants[idx])
+	}
+	fresh := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh)).To(gomega.Succeed())
+	g.Expect(fresh.Annotations).To(gomega.HaveKeyWithValue(constants.ResetInstancesAnnotationKey, "2,5,6"),
+		"the effects commit before the annotation is removed")
+	g.Expect(eventsContaining(drainEvents(rec), string(workloadtypes.EventReasonInstancesReset)+" ")).To(gomega.HaveLen(1))
+	afterCrash := fresh.Status.DeepCopy()
+
+	crash = false
+	requeue, err := r.consumeResetInstancesRequest(context.Background(), r.Log, ir, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(requeue).To(gomega.BeFalse())
+
+	g.Expect(deletes).To(gomega.Equal(3), "re-delivery must issue no further deletes")
+	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(ir), fresh)).To(gomega.Succeed())
+	g.Expect(fresh.Status).To(gomega.Equal(*afterCrash), "re-delivery must write no status")
+	assertResetAnnotationConsumed(t, g, c, ir)
+
+	events := drainEvents(rec)
+	g.Expect(eventsContaining(events, string(workloadtypes.EventReasonInstancesReset)+" ")).To(gomega.BeEmpty(),
+		"re-delivery must not report a second reset")
+	skips := eventsContaining(events, string(workloadtypes.EventReasonInstancesResetSkipped))
+	g.Expect(skips).To(gomega.HaveLen(1))
+	for _, idx := range []string{"2", "5", "6"} {
+		g.Expect(skips[0]).To(gomega.ContainSubstring(idx + " (nothing to reset)"))
 	}
 }

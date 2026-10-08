@@ -137,6 +137,14 @@ const UpdateStepInPlace = "InPlace"
 // bumped Incarnation, and the serving flip before promotion.
 const UpdateStepDrain = "Drain"
 
+// UpdateStepParked is the step of an Update attempt parked after its
+// disposition: ended by its deadline or a wedged pod while its own pod
+// set was still alive, kept on the row with Operation.Waiting naming the
+// wait the next attempt stands behind. The step is the attempt's state,
+// not a resume point: no pass drives it, and the roll opens a fresh
+// attempt over it.
+const UpdateStepParked = "Parked"
+
 // RestartStepDrain is the one step of the Restart machine: draining and
 // deleting the old incarnation, then recreating at the bumped one.
 const RestartStepDrain = "Drain"
@@ -362,11 +370,11 @@ type Key struct {
 // pods the Instance has, and how many of them are available.
 //
 // Both are written only by the adapter's status publication, never by a
-// pass, so a guard that reads them is an adapter-lane input: no replay
-// scenario can reach it, and the transition it guards is covered by a Go
-// test naming the arrow. Reading them through one accessor is what marks
-// that at every site. A row the caller has not observed publishes
-// nothing.
+// pass, from the previous reconcile's pod observation. The replay driver
+// models the pod count the same way; the available count comes only from
+// the adapter, so a guard reading it is covered by a Go unit test rather
+// than a replay scenario. Reading them through one accessor is what marks
+// that at every site. A row the caller has not observed publishes nothing.
 func AdapterPublished(s *InstanceStatus) (pods, available int32) {
 	if s == nil {
 		return 0, 0

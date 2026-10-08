@@ -233,13 +233,14 @@ const (
 // schemas, so a root rule is the one structural check that also holds in the
 // minimal CRD variant.
 //
-// The printer column names and order follow the kubectl-qt plugin, so a node
-// reads the same either way, and the budget every node carries is in the
-// default view rather than behind -o wide. Only status.budgets[0] fits a row;
-// the plugin emits one per (resource, flavor) pair. Observed capacity is
-// deliberately not a column: the root alone reports it, so in a flat list it
-// would be blank on every other row. Read it off the root directly, or
-// through the plugin, which has the tree to put it in.
+// The printer columns are the ones the CLI's quota tree view prints, in the
+// same order, so a node reads the same either way, and the budget every node
+// carries is in the default view rather than behind -o wide. Only
+// status.budgets[0] fits a row; the tree view emits one per (resource,
+// flavor) pair. Observed capacity is deliberately not a column: the root
+// alone reports it, so in a flat list it would be blank on every other row.
+// Read it off the root directly, or through the tree view, which has the
+// tree to put it in.
 //
 // These notes are kept apart from the doc comment below so they stay out of
 // the generated API reference and OpenAPI descriptions.

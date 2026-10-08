@@ -116,7 +116,7 @@ func newPDCanary(t *testing.T, name string, decoderBumped bool) *pdCanary {
 	}
 	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).Build()
 	return &pdCanary{t: t, ns: ns, name: name, isvc: isvc, c: c, deps: DispatchDeps{
-		Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc),
+		Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{}),
 	}}
 }
 

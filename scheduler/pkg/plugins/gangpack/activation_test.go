@@ -157,7 +157,8 @@ func TestTemplatesIncompleteAgainRearmsActivation(t *testing.T) {
 // of capacity, whether in PreFilter (no domain fits) or after PreFilter (every
 // candidate rejected, unwound by PostFilter), never activate each other. The
 // wake-up is tied to the set-completion transition alone, so two failing
-// members cannot ping-pong through the backoff-bypassing Activate.
+// members cannot ping-pong through the backoff-bypassing Activate; a veto in
+// the only fitting domain parks the member without an activation of its own.
 func TestCapacityFailuresDoNotActivateSiblings(t *testing.T) {
 	ctx := context.Background()
 	leader, worker := namedMember("leader"), namedMember("worker")

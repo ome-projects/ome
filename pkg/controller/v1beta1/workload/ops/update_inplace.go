@@ -60,10 +60,10 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 	}
 
 	// In-place keeps the same Incarnation — only the container image rolls.
-	wasNotUpdating := true
-	if s := input.ObservedState.Instance(inst.Index); s != nil && s.Phase == workload.InstancePhaseUpdating {
-		wasNotUpdating = false
-	}
+	// A row the update pass owns is mid-update; one in Updating only
+	// because a parked attempt's pods serve is not, and the patch over it
+	// is a first pass.
+	wasNotUpdating := workload.Owner(input.ObservedState.Instance(inst.Index)) != workload.OwnerUpdate
 	if err := status.StampUpdatingInPlace(ctx, input, inst.Index, target.Name, plan.UpdateStrategy.Type, plan.InstanceReadyTimeout); err != nil {
 		return false, fmt.Errorf("patch status Updating (instance=%d): %w", inst.Index, err)
 	}
@@ -71,6 +71,16 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 		workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonInPlaceUpdateStarted,
 			"OMENative %s in-place update to revision %s",
 			workload.InstanceKey(input.Key.Component, inst.Index), target.Name)
+	}
+
+	// A pod in a terminal phase can never report the new image: free it
+	// now rather than patch and poll it to the deadline; the empty set then
+	// re-resolves the roll to recreate, above.
+	if recycling, err := recycleTerminalTargets(ctx, deps, input, inst.Index, inst.Index,
+		workload.InstanceOperationUpdate, pods, expectedPodNamesForInstance(input, plan, inst)); err != nil {
+		return false, fmt.Errorf("recycle terminal pod (instance=%d): %w", inst.Index, err)
+	} else if recycling {
+		return false, nil
 	}
 
 	markNotReady := true

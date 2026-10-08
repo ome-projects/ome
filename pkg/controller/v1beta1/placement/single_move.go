@@ -24,9 +24,6 @@ import (
 
 func (r *Reconciler) reconcileSingleMove(ctx context.Context, source *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster, eligible []string, standing *placementObservations) (ctrl.Result, error) {
 	active := source.Status.Placement != nil && source.Status.Placement.Plan != nil && source.Status.Placement.Plan.SingleMove != nil
-	if !active && source.Spec.Placement.MaxSurge == nil {
-		return r.writeSinglePlanStatus(ctx, source, standing, "MigrationBlocked")
-	}
 	if !active && source.Status.Placement != nil && source.Status.Placement.Plan != nil {
 		r.sweepPlannedRace(ctx, source)
 	}
@@ -36,7 +33,7 @@ func (r *Reconciler) reconcileSingleMove(ctx context.Context, source *v1beta1.In
 	if active {
 		if r.singleMoveEmpty(ctx, source, clusters, standing) {
 			if r.graceRemaining(source.UID, time.Now()) > 0 || len(eligible) == 0 {
-				return r.writeSinglePlanStatus(ctx, source, standing, "AwaitingWinnerRecovery")
+				return r.writeSinglePlanStatus(ctx, source, standing, "AwaitingWinnerRecovery", "")
 			}
 			store := plan.Store{Client: r.Client, Reader: r.APIReader}
 			reset, err := store.Persist(ctx, source, emptySingleMove(source))
@@ -55,7 +52,7 @@ func (r *Reconciler) reconcileSingleMove(ctx context.Context, source *v1beta1.In
 		}
 		return r.writeSplitHold(ctx, source, standing, "AwaitingHomeInputs", err)
 	}
-	return r.executePlannedAllocation(ctx, source, eligible, standing, proposal)
+	return r.executePlannedAllocation(ctx, source, eligible, standing, proposal, nil)
 }
 
 // singleMoveProposal keeps the original floor across probing and handoff.
@@ -302,10 +299,6 @@ func advanceSingleRace(source *v1beta1.InferenceService, observations map[string
 		step.Reason = "AwaitingMemberCleanup"
 		return step, nil
 	}
-	if source.Spec.Placement.MaxSurge == nil {
-		step.Reason = "MigrationBlocked"
-		return step, nil
-	}
 	names := slices.Sorted(maps.Keys(proposal.Assignments))
 	index := 0
 	for i, name := range names {
@@ -323,7 +316,9 @@ func advanceSingleRace(source *v1beta1.InferenceService, observations map[string
 		if activeFloor > 0 {
 			floor = min(floor, activeFloor)
 		}
-		limit := max(original, int64(floor)) + int64(*source.Spec.Placement.MaxSurge)
+		// The original floor plus one full probe, so a serving original races
+		// one replacement at a time.
+		limit := max(original, int64(floor)) + int64(floor)
 		if used+int64(a.DesiredReplicas) > limit {
 			step.Reason = "SurgeBudgetExhausted"
 			continue

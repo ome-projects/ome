@@ -52,8 +52,9 @@ func unschedulableFailureMessage(message string) string {
 // so leaving the announcement to it would let the row go Failed in
 // silence. Its callback is withheld for that call and fired here
 // instead — but only when the disposition actually wrote something. It
-// declines outright for a superseded leftover, and announcing a
-// transition that did not happen would re-fire every pass.
+// declines outright for a superseded leftover and withholds its end from
+// a row that moved on, and announcing a transition that did not happen
+// would re-fire every pass.
 func escalateSchedulerHold(ctx context.Context, deps types.Deps, input types.ReconcileInput, disposition types.DispositionDeps, stamps *failureStampBuffer, row types.InstanceStatus, pods []*corev1.Pod, desired int32, rowEvidence InstanceEvidence, now time.Time) error {
 	reason := unschedulableFailureMessage(rowEvidence.UnschedulableMessage)
 	idx, podName := row.Index, rowEvidence.Unschedulable.Name
@@ -74,7 +75,7 @@ func escalateSchedulerHold(ctx context.Context, deps types.Deps, input types.Rec
 		if err != nil {
 			return err
 		}
-		if outcome != DispositionSkippedSuperseded {
+		if outcome != DispositionSkippedSuperseded && outcome != DispositionWithheld {
 			warn()
 		}
 		return nil

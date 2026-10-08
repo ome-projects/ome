@@ -68,7 +68,7 @@ func TestReconcile_AnotherGroupsRunKeepsTheRejectedHold(t *testing.T) {
 				v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "old", StableRevision: "old"},
 			)
 			in := baseInputs(isvc, tc.pods)
-			in.Group = rollout.CanaryGroupFor(isvc, v1beta1.EngineComponent)
+			in.Group = rollout.CanaryGroupFor(isvc, rollout.Policies{}, v1beta1.EngineComponent)
 			in.CanaryRevisionHash, in.StableRevisionHash = "new", "old"
 			in.TargetID = activeCanaryTargetID(isvc, in.Group)
 			if in.TargetID == "" || in.TargetID == "engine-new" {
@@ -107,7 +107,7 @@ func TestReconcile_OwnRetargetRearmsTheRejectedHold(t *testing.T) {
 		v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "v3", StableRevision: "old"},
 	)
 	in := baseInputs(isvc, map[string]int32{"old": 4})
-	in.Group = rollout.CanaryGroupFor(isvc, v1beta1.EngineComponent)
+	in.Group = rollout.CanaryGroupFor(isvc, rollout.Policies{}, v1beta1.EngineComponent)
 	in.CanaryRevisionHash, in.StableRevisionHash = "v3", "old"
 	in.TargetID = activeCanaryTargetID(isvc, in.Group)
 
@@ -183,7 +183,7 @@ func TestDispatch_AnotherGroupsRunKeepsTheRolledBackUnitHeld(t *testing.T) {
 			t.Fatalf("the run must pin the rolled-back engine at its stable revision, got %+v", target)
 		}
 	}
-	for _, g := range rollout.CanaryGroups(isvc) {
+	for _, g := range rollout.CanaryGroups(isvc, rollout.Policies{}) {
 		if err := BindRun(ctx, c, isvc, g, out.Adopted); err != nil {
 			t.Fatalf("bind %v: %v", g.Components, err)
 		}
@@ -192,7 +192,7 @@ func TestDispatch_AnotherGroupsRunKeepsTheRolledBackUnitHeld(t *testing.T) {
 		t.Fatalf("the router unit must arm toward its new revision, got %+v", rcs)
 	}
 
-	group := rollout.CanaryGroupFor(isvc, v1beta1.EngineComponent)
+	group := rollout.CanaryGroupFor(isvc, rollout.Policies{}, v1beta1.EngineComponent)
 	if _, err := Dispatch(ctx, DispatchDeps{Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: group}); err != nil {
 		t.Fatalf("Dispatch: %v", err)
 	}

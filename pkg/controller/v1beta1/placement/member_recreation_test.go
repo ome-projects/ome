@@ -122,7 +122,7 @@ func TestPlannedMemberRecreationWaitsForInventory(t *testing.T) {
 					if err := root.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {
 						t.Fatal(err)
 					}
-					if _, err := r.executePlannedAllocation(t.Context(), f.source, []string{"member-a"}, &placementObservations{}, proposal); err != nil {
+					if _, err := r.executePlannedAllocation(t.Context(), f.source, []string{"member-a"}, &placementObservations{}, proposal, nil); err != nil {
 						t.Fatal(err)
 					}
 					wantCreates := 0
@@ -164,7 +164,7 @@ func TestPlannedMemberRecreationWaitsForInventory(t *testing.T) {
 					if err := root.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {
 						t.Fatal(err)
 					}
-					if _, err := r.executePlannedAllocation(t.Context(), f.source, []string{"member-a"}, &placementObservations{}, proposal); err != nil {
+					if _, err := r.executePlannedAllocation(t.Context(), f.source, []string{"member-a"}, &placementObservations{}, proposal, nil); err != nil {
 						t.Fatal(err)
 					}
 					if diff := cmp.Diff(1, creates); diff != "" {

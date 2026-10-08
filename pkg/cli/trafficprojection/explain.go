@@ -572,7 +572,7 @@ func computedTrafficSource(freshness reportv1alpha1.TrafficFreshness) reportv1al
 }
 
 func hasDeclaredCanary(isvc *omev1beta1.InferenceService) bool {
-	rollout := omerollout.Effective(isvc)
+	rollout := omerollout.Effective(isvc, omerollout.Policies{})
 	if rollout == nil {
 		return false
 	}
@@ -585,7 +585,7 @@ func hasDeclaredCanary(isvc *omev1beta1.InferenceService) bool {
 }
 
 func hasCanaryAllocationIssue(isvc *omev1beta1.InferenceService, issues []reportv1alpha1.TrafficIssue) bool {
-	rollout := omerollout.Effective(isvc)
+	rollout := omerollout.Effective(isvc, omerollout.Policies{})
 	if rollout == nil {
 		return false
 	}

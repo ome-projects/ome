@@ -397,14 +397,16 @@ func hasDerivedAnnotation(annotations map[string]string) bool {
 // like the canary verbs below — to keep this package a leaf.
 const pausedRolloutAnnotation = "ome.io/rollout-paused"
 
-// rolloutPromoteAnnotation and rolloutRollbackAnnotation are the canary
-// operator verbs (constants.RolloutPromoteAnnotation /
+// rolloutPromoteAnnotation, rolloutPromoteForceAnnotation and
+// rolloutRollbackAnnotation are the canary operator verbs
+// (constants.RolloutPromoteAnnotation / RolloutPromoteForceAnnotation /
 // RolloutRollbackAnnotation). Like the pause signal they are written to
 // and consumed off the ISVC mid-rollout; duplicated here as literals to
 // keep this package a leaf.
 const (
-	rolloutPromoteAnnotation  = "ome.io/rollout-promote"
-	rolloutRollbackAnnotation = "ome.io/rollout-rollback"
+	rolloutPromoteAnnotation      = "ome.io/rollout-promote"
+	rolloutPromoteForceAnnotation = "ome.io/rollout-promote-force"
+	rolloutRollbackAnnotation     = "ome.io/rollout-rollback"
 )
 
 // isLifecycleAnnotation reports whether the annotation key is one the
@@ -424,7 +426,7 @@ func isLifecycleAnnotation(key string) bool {
 		return true
 	}
 	switch key {
-	case pausedRolloutAnnotation, rolloutPromoteAnnotation, rolloutRollbackAnnotation,
+	case pausedRolloutAnnotation, rolloutPromoteAnnotation, rolloutPromoteForceAnnotation, rolloutRollbackAnnotation,
 		constants.ReleaseHeldRevisionAnnotationKey, constants.ResetInstancesAnnotationKey:
 		return true
 	}

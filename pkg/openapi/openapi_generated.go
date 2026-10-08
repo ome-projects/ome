@@ -3723,7 +3723,7 @@ func schema_pkg_apis_ome_v1beta1_ClusterAffinityTerm(ref common.ReferenceCallbac
 				Properties: map[string]spec.Schema{
 					"weight": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Weight is permitted only for static Split. If any term has an explicit weight, matching term weights add and omitted weights contribute one. Omission must be preserved to distinguish unweighted overlapping terms.",
+							Description: "Weight is permitted only for static Split. If any term has an explicit weight, matching term weights add and omitted weights contribute one. Omission must be preserved to distinguish unweighted overlapping terms. Weights are replica ratios, so they have no upper bound.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
@@ -7270,6 +7270,13 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec"),
 						},
 					},
+					"ttlSecondsAfterCreation": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TTLSecondsAfterCreation limits how long this InferenceService lives. Once that many seconds have passed since its creationTimestamp, the controller deletes it, and garbage collection removes everything it owns. Unset means it lives until deleted. The deadline is computed from creationTimestamp on every reconcile, so changing or clearing the field moves or cancels it. Placement member copies ignore it; the source InferenceService's TTL governs them.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
 				},
 			},
 		},
@@ -10690,7 +10697,7 @@ func schema_pkg_apis_ome_v1beta1_PlacementSpec(ref common.ReferenceCallback) com
 					},
 					"maxSurge": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxSurge is the whole-replica allowance shared by placement transitions and local rollout surge. Omission blocks disruptive movement between homes.",
+							Description: "Deprecated: MaxSurge is ignored. A placement move may hold one extra full copy of the desired allocation; admission warns when this is set.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},

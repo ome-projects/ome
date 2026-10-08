@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -24,6 +25,8 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -1732,4 +1735,549 @@ func TestCreate_ConflictingSelectorCreatesNothing(t *testing.T) {
 	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
 		t.Fatalf("no pod may be created: got %d", len(pods))
 	}
+}
+
+// The revision a Create attempt renders is the one its pods stamp. A member
+// refilled into an Instance that still has live pods of its running revision
+// joins that revision, whatever the roll target is; an Instance with no live
+// pod left, and a first materialization, render the target.
+
+// runningRevisionName is the stored revision the refill fixtures' Instance
+// runs. Its hash differs from the roll target's, as does its template.
+const runningRevisionName = "llama-70b-engine-0000000a"
+
+// refillFixture is a gang Instance recorded on runningRevisionName while the
+// roll target is the current template, with the stored revision's
+// ControllerRevision seeded unless a test withholds it.
+type refillFixture struct {
+	input   *workload.ReconcileInput
+	plan    workload.ComponentPlan
+	target  *appsv1.ControllerRevision
+	running *appsv1.ControllerRevision
+	calls   *[]retryBlockCall
+	client  client.Client
+	isvc    *v1beta1.InferenceService
+}
+
+func newRefillFixture(t *testing.T, t0 time.Time, row v1beta1.OMENativeInstanceStatus, storeRunning bool) *refillFixture {
+	t.Helper()
+	row.RunningRevision = runningRevisionName
+	input, _, target, calls, c, isvc := createGateFixture(t, t0, row)
+	running := storedPayloadRevision(t, runningRevisionName, revision.DataPayload{
+		PodSpec:         legacyTargetSpecImage("test:v0"),
+		WorkerPodSpec:   legacyTargetSpecImage("test:v0-worker"),
+		PairingProtocol: ptr.To("proto-v0"),
+	})
+	if storeRunning {
+		if err := c.Create(context.Background(), running); err != nil {
+			t.Fatalf("seed the running revision: %v", err)
+		}
+	}
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	plan.PairingProtocol = "proto-v1"
+	return &refillFixture{input: input, plan: plan, target: target, running: running, calls: calls, client: c, isvc: isvc}
+}
+
+// seedLeader leaves the gang's leader alive at the running revision.
+func (f *refillFixture) seedLeader(t *testing.T) {
+	t.Helper()
+	createGateGangPod(t, f.client, f.isvc, 0, "leader", 0)
+	pinPodRevision(t, f.client, f.isvc, f.podName("leader"), f.running)
+}
+
+// seedDeadWorker leaves the gang's worker on its stable name, exited
+// Succeeded at the running revision.
+func (f *refillFixture) seedDeadWorker(t *testing.T) {
+	t.Helper()
+	createGateGangPod(t, f.client, f.isvc, 0, "worker", 0)
+	pinPodRevision(t, f.client, f.isvc, f.podName("worker"), f.running)
+	pod := f.pod(t, f.podName("worker"))
+	pod.Status.Phase = corev1.PodSucceeded
+	if err := f.client.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("kill the worker: %v", err)
+	}
+}
+
+func (f *refillFixture) podName(runner string) string {
+	return query.PodName(f.isvc.Name, workload.ComponentEngine, 0, runner, 0)
+}
+
+func (f *refillFixture) pod(t *testing.T, name string) *corev1.Pod {
+	t.Helper()
+	pod := &corev1.Pod{}
+	if err := f.client.Get(context.Background(), client.ObjectKey{Namespace: f.isvc.Namespace, Name: name}, pod); err != nil {
+		t.Fatalf("get pod %s: %v", name, err)
+	}
+	return pod
+}
+
+func (f *refillFixture) run(t *testing.T, deps workload.Deps) ctrl.Result {
+	t.Helper()
+	res, err := Create(context.Background(), deps, *f.input, f.plan, f.target)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	return res
+}
+
+// reobserve starts the next pass from the persisted status, as the
+// dispatcher does.
+func (f *refillFixture) reobserve(t *testing.T) {
+	t.Helper()
+	legacyResetExpectations(t)
+	f.input.ObservedState.InstanceStatuses = legacyInstanceStatuses(f.client, f.isvc, workload.ComponentEngine)
+}
+
+func (f *refillFixture) row(t *testing.T) v1beta1.OMENativeInstanceStatus {
+	t.Helper()
+	rows := legacyInstanceStatusesOnIR(f.client, f.isvc, workload.ComponentEngine)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %+v, want exactly one", rows)
+	}
+	return rows[0]
+}
+
+// requireRenderedAt asserts pod is a render of rev's template: its revision
+// label, its image and its pairing protocol are all that revision's.
+func requireRenderedAt(t *testing.T, pod *corev1.Pod, rev *appsv1.ControllerRevision, image, protocol string) {
+	t.Helper()
+	if got := pod.Labels[query.LabelRevisionHash]; got != query.RevisionOf(rev).Hash() {
+		t.Errorf("pod %s revision label = %q, want %s", pod.Name, got, query.RevisionOf(rev).Hash())
+	}
+	if got := pod.Spec.Containers[0].Image; got != image {
+		t.Errorf("pod %s image = %q, want %q", pod.Name, got, image)
+	}
+	if got := pod.Labels[query.LabelPairingProtocol]; got != protocol {
+		t.Errorf("pod %s pairing protocol = %q, want %q", pod.Name, got, protocol)
+	}
+}
+
+// A Ready gang running one revision that lost its worker while the roll
+// target is another: the refilled worker is the running revision's worker
+// template, stamped with that revision, so the Instance never holds two
+// revisions. The attempt pins the revision it renders and starts on that
+// revision's RetryBlock, and the row keeps the revision it runs.
+func TestCreate_MemberRefillKeepsTheRunningRevision(t *testing.T) {
+	f := newRefillFixture(t, time.Now(), v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+	}, true)
+	f.seedLeader(t)
+
+	f.run(t, legacyTestDeps(f.client))
+
+	if pods := createGatePods(t, f.client, f.isvc.Namespace); len(pods) != 2 {
+		t.Fatalf("the lost worker must be refilled: got %d pod(s) want 2", len(pods))
+	}
+	requireRenderedAt(t, f.pod(t, f.podName("worker")), f.running, "test:v0-worker", "proto-v0")
+	row := f.row(t)
+	if row.Phase != v1beta1.OMENativeInstanceCreating || row.Operation == nil ||
+		row.Operation.Type != v1beta1.InstanceOperationCreate || row.Operation.TargetRevision != runningRevisionName {
+		t.Errorf("the refill must open a Create attempt pinned to the running revision, got %+v", row)
+	}
+	if row.RunningRevision != runningRevisionName {
+		t.Errorf("RunningRevision = %q, want %s kept", row.RunningRevision, runningRevisionName)
+	}
+	for _, call := range *f.calls {
+		if call.rev != runningRevisionName {
+			t.Errorf("the attempt start touched the block of %s, want only %s", call.rev, runningRevisionName)
+		}
+	}
+	if len(*f.calls) == 0 {
+		t.Errorf("the attempt start must be recorded on the running revision's block")
+	}
+}
+
+// The worker exited Succeeded on its stable name. The first pass recycles
+// the dead pod and commits the attempt pinned to the running revision; the
+// next pass, reading that pin, renders the worker at the running revision
+// although the roll target has not changed.
+func TestCreate_MemberRefillAfterTheRecycleKeepsTheRunningRevision(t *testing.T) {
+	f := newRefillFixture(t, time.Now(), v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+	}, true)
+	f.seedLeader(t)
+	f.seedDeadWorker(t)
+	deps := legacyTestDeps(f.client)
+
+	f.run(t, deps)
+	pods := createGatePods(t, f.client, f.isvc.Namespace)
+	if len(pods) != 1 || pods[0].Name != f.podName("leader") {
+		t.Fatalf("the first pass must recycle the dead worker and create nothing yet, got %d pod(s)", len(pods))
+	}
+	if row := f.row(t); row.Operation == nil || row.Operation.TargetRevision != runningRevisionName {
+		t.Fatalf("the recycle pass must commit the attempt pinned to the running revision, got %+v", row)
+	}
+
+	f.reobserve(t)
+	f.run(t, deps)
+	if pods := createGatePods(t, f.client, f.isvc.Namespace); len(pods) != 2 {
+		t.Fatalf("the second pass must rebuild the worker: got %d pod(s) want 2", len(pods))
+	}
+	requireRenderedAt(t, f.pod(t, f.podName("worker")), f.running, "test:v0-worker", "proto-v0")
+}
+
+// A roll target whose RetryBlock is Held denies pods at that revision, not a
+// member refilled at the revision the Instance runs. A Held block on the
+// running revision does deny the refill: the pod would be one more at a
+// revision the block holds, and the row is left unstamped.
+func TestCreate_MemberRefillAnswersToTheRunningRevisionsBlock(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		held    func(f *refillFixture) string
+		created int
+	}{
+		{name: "held target", held: func(f *refillFixture) string { return f.target.Name }, created: 2},
+		{name: "held running revision", held: func(f *refillFixture) string { return runningRevisionName }, created: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRefillFixture(t, time.Now(), v1beta1.OMENativeInstanceStatus{
+				Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+			}, true)
+			f.seedLeader(t)
+			f.input.ObservedState.RetryBlocks = []workload.RetryBlock{
+				{TargetRevision: tc.held(f), State: workload.RetryBlockHeld, AttemptsStarted: 1, Reason: "ImagePullBackOff"},
+			}
+
+			f.run(t, legacyTestDeps(f.client))
+
+			if pods := createGatePods(t, f.client, f.isvc.Namespace); len(pods) != tc.created {
+				t.Fatalf("got %d pod(s) want %d", len(pods), tc.created)
+			}
+			row := f.row(t)
+			if tc.created == 2 {
+				requireRenderedAt(t, f.pod(t, f.podName("worker")), f.running, "test:v0-worker", "proto-v0")
+				return
+			}
+			if row.Phase != v1beta1.OMENativeInstanceReady || row.Operation != nil {
+				t.Errorf("a denied refill must not stamp an attempt, got %+v", row)
+			}
+			if len(*f.calls) != 0 {
+				t.Errorf("a denied refill must not touch any block: %d call(s)", len(*f.calls))
+			}
+		})
+	}
+}
+
+// A refill whose running revision has no ControllerRevision left creates
+// nothing: rendering the current template under that revision's label would
+// put a pod of the target inside an Instance of the running revision. The
+// attempt stays open on the pin and the row says why.
+func TestCreate_MemberRefillHoldsWhenTheRunningRevisionIsGone(t *testing.T) {
+	f := newRefillFixture(t, time.Now(), v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+	}, false)
+	f.seedLeader(t)
+	rec := record.NewFakeRecorder(8)
+
+	f.run(t, workload.Deps{Client: f.client, Recorder: rec})
+
+	if pods := createGatePods(t, f.client, f.isvc.Namespace); len(pods) != 1 {
+		t.Fatalf("nothing may be rendered for a gone revision: got %d pod(s) want the 1 survivor", len(pods))
+	}
+	row := f.row(t)
+	if row.Phase != v1beta1.OMENativeInstanceCreating || row.Operation == nil || row.Operation.TargetRevision != runningRevisionName {
+		t.Errorf("the attempt must stay open on the running revision, got %+v", row)
+	}
+	var warnings []string
+	for len(rec.Events) > 0 {
+		if e := <-rec.Events; strings.Contains(e, string(workload.EventReasonRepairRevisionGone)) {
+			warnings = append(warnings, e)
+		}
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], runningRevisionName) || !strings.HasPrefix(warnings[0], "Warning ") {
+		t.Fatalf("%s events = %v, want one Warning naming %s", workload.EventReasonRepairRevisionGone, warnings, runningRevisionName)
+	}
+}
+
+// An Instance with no row at all renders the roll target: a first
+// materialization has no revision of its own to keep.
+func TestCreate_FirstMaterializationRendersTheTarget(t *testing.T) {
+	input, _, target, _, c, isvc := createGateFixture(t, time.Now())
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	plan.PairingProtocol = "proto-v1"
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, target); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	pods := createGatePods(t, c, isvc.Namespace)
+	if len(pods) != 2 {
+		t.Fatalf("got %d pod(s) want the whole gang", len(pods))
+	}
+	for i := range pods {
+		requireRenderedAt(t, &pods[i], target, "test:v1", "proto-v1")
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Operation == nil || s.Operation.TargetRevision != target.Name {
+		t.Errorf("a first materialization pins the target, got %+v", s.Operation)
+	}
+}
+
+// A row demoted for losing every pod still records the revision it ran, but
+// serves nothing: its rebuild renders the roll target as a unit, with no pod
+// set torn down for it, and the row keeps its record until the promote.
+func TestCreate_PodlessDemotedRowRendersTheTarget(t *testing.T) {
+	f := newRefillFixture(t, time.Now(), v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstancePending,
+	}, true)
+
+	f.run(t, legacyTestDeps(f.client))
+
+	pods := createGatePods(t, f.client, f.isvc.Namespace)
+	if len(pods) != 2 {
+		t.Fatalf("got %d pod(s) want the whole gang", len(pods))
+	}
+	for i := range pods {
+		requireRenderedAt(t, &pods[i], f.target, "test:v1", "proto-v1")
+	}
+	row := f.row(t)
+	if row.Operation == nil || row.Operation.TargetRevision != f.target.Name || row.RunningRevision != runningRevisionName {
+		t.Errorf("a podless rebuild pins the target and keeps the recorded revision, got %+v", row)
+	}
+}
+
+// A row that lost every pod while the canary step holds its Instance is the
+// step's stable side: the rebuild renders the revision the row records and
+// pins it, so the step keeps its planned size and only the step machine
+// promotes the Instance. Released by the step, the same row renders the roll
+// target; a Failed row whose attempt was disposed follows the same rule, and
+// so does a parked attempt whose pods are gone, in either phase its pods
+// last gave it. The user's own rollingUpdate partition is no canary and
+// leaves the rebuild at the target.
+func TestCreate_PodlessStableRowUnderACanaryKeepsItsRevision(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		phase v1beta1.OMENativeInstancePhase
+		// parked keeps a parked Update attempt on the row.
+		parked bool
+		// step is the canary step's projected partition; user is the
+		// user's own rollingUpdate partition. nil leaves either unset.
+		step, user *int32
+		keeps      bool
+	}{
+		{name: "demoted row the step holds", phase: v1beta1.OMENativeInstancePending, step: ptr.To[int32](1), keeps: true},
+		{name: "demoted row the step released", phase: v1beta1.OMENativeInstancePending, step: ptr.To[int32](0)},
+		{name: "disposed Failed row the step holds", phase: v1beta1.OMENativeInstanceFailed, step: ptr.To[int32](1), keeps: true},
+		{name: "parked attempt the step holds", phase: v1beta1.OMENativeInstanceFailed, parked: true, step: ptr.To[int32](1), keeps: true},
+		{name: "parked attempt last read serving the step holds", phase: v1beta1.OMENativeInstanceUpdating, parked: true, step: ptr.To[int32](1), keeps: true},
+		{name: "parked attempt the step released", phase: v1beta1.OMENativeInstanceFailed, parked: true, step: ptr.To[int32](0)},
+		{name: "demoted row under the user's own partition", phase: v1beta1.OMENativeInstancePending, user: ptr.To[int32](1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seed := v1beta1.OMENativeInstanceStatus{Index: 0, Incarnation: 1, Phase: tc.phase}
+			if tc.parked {
+				seed.Operation = &v1beta1.InstanceOperation{
+					ID: "op-parked", Type: v1beta1.InstanceOperationUpdate, Step: workload.UpdateStepParked,
+					TargetRevision: "comp-rev-parked", Waiting: string(workload.RolloutHoldGateRetryBlock),
+				}
+			}
+			f := newRefillFixture(t, time.Now(), seed, true)
+			if tc.step != nil {
+				f.input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: tc.step}
+			}
+			if tc.user != nil {
+				f.plan.UpdateStrategy.RollingUpdate = &workload.RollingUpdate{Partition: tc.user}
+			}
+
+			f.run(t, legacyTestDeps(f.client))
+
+			if pods := createGatePods(t, f.client, f.isvc.Namespace); len(pods) != 2 {
+				t.Fatalf("got %d pod(s) want the whole gang", len(pods))
+			}
+			wantRev, wantPin := f.target, f.target.Name
+			leaderImage, workerImage, protocol := "test:v1", "test:v1", "proto-v1"
+			if tc.keeps {
+				wantRev, wantPin = f.running, runningRevisionName
+				leaderImage, workerImage, protocol = "test:v0", "test:v0-worker", "proto-v0"
+			}
+			requireRenderedAt(t, f.pod(t, f.podName("leader")), wantRev, leaderImage, protocol)
+			requireRenderedAt(t, f.pod(t, f.podName("worker")), wantRev, workerImage, protocol)
+			row := f.row(t)
+			if row.Phase != v1beta1.OMENativeInstanceCreating || row.Operation == nil ||
+				row.Operation.Type != v1beta1.InstanceOperationCreate || row.Operation.TargetRevision != wantPin {
+				t.Errorf("the rebuild must open a Create attempt pinned to %s, got %+v", wantPin, row)
+			}
+			if row.RunningRevision != runningRevisionName {
+				t.Errorf("RunningRevision = %q, want %s kept until the promote", row.RunningRevision, runningRevisionName)
+			}
+			if len(*f.calls) == 0 {
+				t.Errorf("the attempt start must be recorded on the block of %s", wantPin)
+			}
+			for _, call := range *f.calls {
+				if call.rev != wantPin {
+					t.Errorf("the attempt start touched the block of %s, want only %s", call.rev, wantPin)
+				}
+			}
+		})
+	}
+}
+
+// Two Instances that lost every pod under a canary step holding one of them
+// come back on different revisions in one pass: the held Instance on the
+// revision it ran, the Instance the step promoted on the roll target.
+func TestCreate_PodlessRowsRebuildOnTheirSideOfTheCanaryStep(t *testing.T) {
+	input, _, target, _, c, isvc := createGateFixture(t, time.Now(),
+		v1beta1.OMENativeInstanceStatus{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstancePending, RunningRevision: runningRevisionName},
+		v1beta1.OMENativeInstanceStatus{Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstancePending, RunningRevision: runningRevisionName},
+	)
+	running := storedPayloadRevision(t, runningRevisionName, revision.DataPayload{
+		PodSpec:         legacyTargetSpecImage("test:v0"),
+		WorkerPodSpec:   legacyTargetSpecImage("test:v0-worker"),
+		PairingProtocol: ptr.To("proto-v0"),
+	})
+	if err := c.Create(context.Background(), running); err != nil {
+		t.Fatalf("seed the running revision: %v", err)
+	}
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	plan.Replicas = 2
+	plan.Instances = append(plan.Instances, workload.InstancePlan{Index: 1, Incarnation: 1, Runners: plan.Instances[0].Runners})
+	plan.PairingProtocol = "proto-v1"
+	input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: ptr.To[int32](1)}
+
+	if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, target); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 4 {
+		t.Fatalf("got %d pod(s) want both gangs", len(pods))
+	}
+	podOf := func(idx int32, runner string) *corev1.Pod {
+		pod := &corev1.Pod{}
+		name := query.PodName(isvc.Name, workload.ComponentEngine, idx, runner, 0)
+		if err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: name}, pod); err != nil {
+			t.Fatalf("get pod %s: %v", name, err)
+		}
+		return pod
+	}
+	requireRenderedAt(t, podOf(0, "leader"), running, "test:v0", "proto-v0")
+	requireRenderedAt(t, podOf(0, "worker"), running, "test:v0-worker", "proto-v0")
+	requireRenderedAt(t, podOf(1, "leader"), target, "test:v1", "proto-v1")
+	requireRenderedAt(t, podOf(1, "worker"), target, "test:v1", "proto-v1")
+	pins := map[int32]string{}
+	for _, row := range legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine) {
+		if row.Operation != nil {
+			pins[row.Index] = row.Operation.TargetRevision
+		}
+	}
+	if pins[0] != runningRevisionName || pins[1] != target.Name {
+		t.Errorf("pins = %v, want Instance 0 on %s and Instance 1 on %s", pins, runningRevisionName, target.Name)
+	}
+}
+
+// A first materialization has no revision of its own to keep, so it renders
+// the roll target under a canary step's hold as it does without one: with no
+// row at all, and with a disposed attempt that never ran a revision.
+func TestCreate_FirstMaterializationUnderACanaryRendersTheTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rows []v1beta1.OMENativeInstanceStatus
+	}{
+		{name: "no row"},
+		{name: "disposed attempt that never ran a revision", rows: []v1beta1.OMENativeInstanceStatus{disposedFreshStart()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input, _, target, _, c, isvc := createGateFixture(t, time.Now(), tc.rows...)
+			plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+			plan.PairingProtocol = "proto-v1"
+			input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: ptr.To[int32](1)}
+
+			if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, target); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+
+			pods := createGatePods(t, c, isvc.Namespace)
+			if len(pods) != 2 {
+				t.Fatalf("got %d pod(s) want the whole gang", len(pods))
+			}
+			for i := range pods {
+				requireRenderedAt(t, &pods[i], target, "test:v1", "proto-v1")
+			}
+			s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+			if s.Operation == nil || s.Operation.TargetRevision != target.Name {
+				t.Errorf("a first materialization pins the target under the hold, got %+v", s.Operation)
+			}
+		})
+	}
+}
+
+// A parked attempt is the fresh start a disposed attempt leaves behind: the
+// Create pass opens a first attempt over it once its pods are gone, in
+// whichever phase its pods last gave it. While a live pod of the set
+// stands the row is the roll's, in either phase; a set left only in dead
+// pods is gone.
+func TestCreateFreshStart_ParkedAttemptIsAFreshStart(t *testing.T) {
+	parked := func(phase workload.InstancePhase) *workload.InstanceStatus {
+		return &workload.InstanceStatus{Index: 0, Phase: phase, Operation: &workload.InstanceOperation{
+			Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepParked, TargetRevision: "rev-b",
+			Waiting: string(workload.RolloutHoldGateRetryBlock),
+		}}
+	}
+	live := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "live"}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	dead := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "dead"}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	for _, phase := range []workload.InstancePhase{workload.InstancePhaseFailed, workload.InstancePhaseUpdating} {
+		if !createFreshStart(parked(phase), nil) {
+			t.Errorf("%s: a parked attempt whose set is gone must read as a fresh start", phase)
+		}
+		if !createFreshStart(parked(phase), []*corev1.Pod{dead}) {
+			t.Errorf("%s: a parked attempt left only dead pods must read as a fresh start", phase)
+		}
+		if createFreshStart(parked(phase), []*corev1.Pod{live, dead}) {
+			t.Errorf("%s: a parked attempt with a live pod standing is the roll's, not a fresh start", phase)
+		}
+	}
+	inFlight := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseUpdating, Operation: &workload.InstanceOperation{
+		Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepDrain, TargetRevision: "rev-b",
+	}}
+	if createFreshStart(inFlight, nil) {
+		t.Errorf("an attempt in flight is not a fresh start")
+	}
+}
+
+// TestCreate_AttemptEndedByTheGangVerdictIsLeftAlone: a row keeping a
+// Create the gang verdict ended is not the Create pass's, whether the
+// name is still foreign or free again: no member is built, nothing is
+// written and no wake-up is asked for. The row waits for the reset
+// mailbox or a corrective revision.
+func TestCreate_AttemptEndedByTheGangVerdictIsLeftAlone(t *testing.T) {
+	t0 := time.Now()
+	ended := disposedFreshStart()
+	ended.Operation = &v1beta1.InstanceOperation{ID: "create-0-1", Type: v1beta1.InstanceOperationCreate, Step: status.CreateStepCreatePods, StartedAt: metav1.NewTime(t0), Deadline: metav1.NewTime(t0.Add(30 * time.Minute))}
+	ended.LastFailure = &v1beta1.InstanceTermination{Reason: workload.PodGroupOwnershipConflictReason, Message: "PodGroup llama-70b-engine-0 is controlled by StatefulSet/other-owner, not by this owner", Time: metav1.NewTime(t0)}
+	input, plan, tcr, calls, c, isvc := createGateFixture(t, t0, ended)
+	// The attempt pinned the revision the pass would otherwise build at.
+	input.ObservedState.InstanceStatuses[0].Operation.TargetRevision = tcr.Name
+	before := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+
+	for _, gangs := range []*workload.GangObservations{
+		gangObservationsFor(0, workload.GangStateOwnershipConflict),
+		nil,
+	} {
+		input.Gangs = gangs
+		for pass := 0; pass < 2; pass++ {
+			res, err := Create(context.Background(), legacyTestDeps(c), *input, plan, tcr)
+			if err != nil {
+				t.Fatalf("create pass %d (gangs=%v): %v", pass, gangs != nil, err)
+			}
+			if res != (ctrl.Result{}) {
+				t.Errorf("pass %d (gangs=%v): an ended attempt asks for no wake-up: got %+v", pass, gangs != nil, res)
+			}
+		}
+	}
+	if pods := createGatePods(t, c, isvc.Namespace); len(pods) != 0 {
+		t.Errorf("no member may be built for an ended attempt: got %d pod(s)", len(pods))
+	}
+	if len(*calls) != 0 {
+		t.Errorf("an ended attempt touches no RetryBlock: %d calls", len(*calls))
+	}
+	if after := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]; after.Phase != before.Phase || after.Operation == nil || after.Operation.ID != before.Operation.ID {
+		t.Errorf("row after the passes = %+v, want the kept Create left as it was", after)
+	}
+}
+
+// gangObservationsFor wires one Instance's PodGroup classification into
+// the input, the way the PodGroup pass does ahead of the dispatcher.
+func gangObservationsFor(idx int32, state workload.GangState) *workload.GangObservations {
+	g := workload.NewGangObservations()
+	g.Record(idx, workload.GangObservation{Name: "llama-70b-engine-0", State: state, Message: "PodGroup llama-70b-engine-0 is controlled by StatefulSet/other-owner, not by this owner"})
+	return g
 }

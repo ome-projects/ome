@@ -178,9 +178,6 @@ func TestAdvanceSplitPlanPauseAndCleanup(t *testing.T) {
 			o.RolloutReserved = 1
 			obs["a"] = o
 		}, want: allocation.Step{Targets: map[string]int32{"a": 1, "b": 0}, Reason: "SurgeBudgetExhausted"}},
-		{name: "unset allowance blocks a move", edit: func(s *v1beta1.InferenceService, _ map[string]plannedHomeObservation) {
-			s.Spec.Placement.MaxSurge = nil
-		}, want: allocation.Step{Targets: map[string]int32{"a": 1, "b": 0}, Reason: "MigrationBlocked"}},
 		{name: "unknown route cannot fund a reduction", edit: func(_ *v1beta1.InferenceService, obs map[string]plannedHomeObservation) {
 			o := obs["a"]
 			o.Home.Known = false
@@ -200,7 +197,6 @@ func TestAdvanceSplitPlanPauseAndCleanup(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := plannedTestSource()
-			source.Spec.Placement.MaxSurge = ptr.To[int32](1)
 			source.Status.Placement.Plan.PauseSurge = true
 			source.Status.Placement.Plan.AssignedReplicas = 1
 			source.Status.Placement.Candidates = []v1beta1.CandidatePlacement{
@@ -248,7 +244,6 @@ func testMoveUsesRoutingIntent(t *testing.T, mode v1beta1.PlacementMode, cancelM
 	source := fixture.source
 	source.Namespace = "prod"
 	source.Spec.Placement.Split.Replicas = ptr.To[int32](1)
-	source.Spec.Placement.MaxSurge = ptr.To[int32](1)
 	source.Spec.Placement.ClusterAffinity = testAffinity("target=true")
 	source.Status.Placement.Plan.PauseSurge = false
 	source.Status.Placement.Candidates[0].Cluster = "a"
@@ -583,9 +578,13 @@ func TestAdoptSplitMembers(t *testing.T) {
 		{name: "unresolved member floor holds adoption", edit: func(f *plannedObservationFixture) {
 			f.member.Spec.Engine.MinReplicas = nil
 		}, wantErr: true},
-		{name: "mismatched component floors hold adoption", edit: func(f *plannedObservationFixture) {
+		{name: "engine floor leads a differently sized decoder", edit: func(f *plannedObservationFixture) {
 			f.member.Spec.Engine.MinReplicas = ptr.To(1)
 			f.member.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(2)}}
+		}, wantFloor: 1},
+		{name: "unresolved decoder floor holds adoption", edit: func(f *plannedObservationFixture) {
+			f.member.Spec.Engine.MinReplicas = ptr.To(1)
+			f.member.Spec.Decoder = &v1beta1.DecoderSpec{}
 		}, wantErr: true},
 		{name: "missing registration cannot erase a standing home", edit: func(f *plannedObservationFixture) {
 			f.source.Status.Placement.Candidates = append(f.source.Status.Placement.Candidates, v1beta1.CandidatePlacement{Cluster: "removed"})
@@ -778,23 +777,22 @@ func TestReconcileSplitConflictDoesNotHideWriteFailure(t *testing.T) {
 func TestSplitPauseRequired(t *testing.T) {
 	for _, tt := range []struct {
 		name                   string
-		surge                  *int32
+		settled                bool
 		active, adoption, want bool
 	}{
-		{name: "unconfigured move leaves member execution available"},
-		{name: "unconfigured adoption does not freeze members", adoption: true},
-		{name: "explicit zero allowance coordinates members", surge: ptr.To[int32](0), want: true},
-		{name: "explicit allowance coordinates members", surge: ptr.To[int32](1), want: true},
-		{name: "removing allowance cannot release an active move", active: true, want: true},
+		{name: "move coordinates members", want: true},
+		{name: "adopted move coordinates members", adoption: true, want: true},
+		{name: "active move stays coordinated", active: true, want: true},
+		{name: "settled plan leaves member execution available", settled: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			source := plannedTestSource()
-			source.Spec.Placement.MaxSurge = tt.surge
-			source.Status.Placement.Plan.PauseSurge = tt.active
 			proposal := plan.Proposal{PauseSurge: tt.active || tt.adoption, Assignments: map[string]v1beta1.CandidateAllocationStatus{
 				"a": {CurrentReplicas: 1}, "b": {DesiredReplicas: 1},
 			}}
-			if diff := cmp.Diff(tt.want, splitPauseRequired(source, proposal)); diff != "" {
+			if tt.settled {
+				proposal.Assignments = map[string]v1beta1.CandidateAllocationStatus{"a": {CurrentReplicas: 1, DesiredReplicas: 1}}
+			}
+			if diff := cmp.Diff(tt.want, splitPauseRequired(proposal)); diff != "" {
 				t.Error(diff)
 			}
 		})
@@ -903,5 +901,72 @@ func TestSplitObservationWithoutPublication(t *testing.T) {
 				t.Errorf("completion (-want +got):\n%s; reason: %s", diff, step.Reason)
 			}
 		})
+	}
+}
+
+// TestSplitObservationOfBusyMembers observes members whose service and every
+// component are rewritten between any two reads of them. Each home is observed
+// from its fresh reads and acknowledges the accepted plan.
+func TestSplitObservationOfBusyMembers(t *testing.T) {
+	f := observationFixture(t)
+	container := corev1.Container{Name: "ome-container", Image: "img"}
+	f.source.Spec.Decoder = &v1beta1.DecoderSpec{PodSpec: v1beta1.PodSpec{Containers: []corev1.Container{container}}}
+	f.source.Spec.Router = &v1beta1.RouterSpec{PodSpec: v1beta1.PodSpec{Containers: []corev1.Container{container}}}
+	members := []string{"member-a", "member-b", "member-c"}
+	f.source.Status.Placement.Candidates = nil
+	for _, name := range members {
+		f.source.Status.Placement.Candidates = append(f.source.Status.Placement.Candidates, v1beta1.CandidatePlacement{
+			Cluster: name, Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: types.UID(name + "-uid"), CurrentReplicas: 1, DesiredReplicas: 1},
+		})
+	}
+	busy := func(obj client.Object) bool {
+		switch obj.(type) {
+		case *v1beta1.InferenceReplica, *v1beta1.InferenceService:
+			return true
+		}
+		return false
+	}
+	scheme := testScheme(t)
+	connections := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}
+	controlPlane := []client.Object{f.source}
+	for i, name := range members {
+		policy := executionPolicy(f.source, f.source.Status.Placement.Candidates[i].Allocation)
+		raw, err := protocol.Encode(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		member := DeriveISVC(f.source, "", "")
+		member.UID, member.Generation = types.UID(name+"-service"), 3
+		member.Status.URL = &apis.URL{Scheme: "https", Host: name + ".example.com"}
+		member.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{Status: corev1.ConditionTrue})
+		member.Annotations[constants.PlacementExecution] = raw
+		objects := []client.Object{member}
+		for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+			ir := f.resources.ir.DeepCopy()
+			ir.Name, ir.UID, ir.Spec.Component = fmt.Sprintf("service-%s", component), types.UID(fmt.Sprintf("%s-%s", name, component)), component
+			ir.Spec.PlacementExecution = policy.DeepCopy()
+			ir.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(member, v1beta1.SchemeGroupVersion.WithKind("InferenceService"))}
+			pod := f.resources.pods[0].DeepCopy()
+			pod.Name, pod.UID = fmt.Sprintf("%s-0", component), types.UID(fmt.Sprintf("%s-%s-pod", name, component))
+			pod.OwnerReferences[0].Name, pod.OwnerReferences[0].UID = ir.Name, ir.UID
+			objects = append(objects, ir, pod)
+		}
+		worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithInterceptorFuncs(busyReads(0, busy)).Build()
+		connections.m[name] = workloadcluster.NewNeverCachingClient(worker)
+		controlPlane = append(controlPlane, readyWC(name, nil))
+	}
+	r, _ := newPlacer(scheme, connections, controlPlane...)
+	observations := r.observeSplitMembers(t.Context(), f.source, members)
+	for _, name := range members {
+		type home struct {
+			Known, ObservationKnown bool
+			Applied                 string
+			Occupied, Ready         int32
+		}
+		observed := observations[name]
+		got := home{observed.Home.Known, observed.Candidate.ObservationKnown, observed.Candidate.AppliedPlanID, observed.Home.Occupied, observed.Candidate.ReadyReplicas}
+		if diff := cmp.Diff(home{Known: true, ObservationKnown: true, Applied: "plan-a", Occupied: 1, Ready: 1}, got); diff != "" {
+			t.Errorf("%s (-want +got):\n%s", name, diff)
+		}
 	}
 }

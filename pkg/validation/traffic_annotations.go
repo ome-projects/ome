@@ -63,6 +63,7 @@ var trafficAnnotationKinds = map[string]trafficAnnotationKind{
 	constants.RolloutReadyTimeoutAnnotation:    kindDuration,
 	constants.RevisionHistoryLimitAnnotation:   kindPositiveInt,
 	constants.RolloutPromoteAnnotation:         kindPromoteTarget,
+	constants.RolloutPromoteForceAnnotation:    kindPromoteTarget,
 	constants.RolloutRollbackAnnotation:        kindBool,
 	constants.RolloutResumeAnnotation:          kindResumeTarget,
 }
@@ -195,7 +196,7 @@ func validateAnnotationValue(key, value string, kind trafficAnnotationKind) erro
 			}
 		}
 	case kindPromoteTarget:
-		// The canary manual-promote verb only ever matches the exact canary
+		// The promote and its forced form only ever match the exact canary
 		// revision hash (promotion.shouldAdvanceManual), so admission accepts
 		// nothing else — any other value would sit on the object doing nothing.
 		if !isRevisionHashToken(value) {

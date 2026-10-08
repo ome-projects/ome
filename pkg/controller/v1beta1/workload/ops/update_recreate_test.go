@@ -8,6 +8,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -181,9 +183,8 @@ func TestRecreateDrain_ReadyOldIncarnationPodIsNotThePromoteSignal(t *testing.T)
 // TestRecreateDrain_PodObservationsThatDecideNothing: the recreate
 // promotes over one bar — the bumped set complete, serving and PodReady
 // past its availability window — and re-derives it every wake-up. A pod
-// wedged Terminating, one whose node is gone, and one in a terminal phase
-// all fail that bar in the same way: the roll waits, and only its
-// operation deadline ends it.
+// wedged Terminating and one whose node is gone both fail that bar in the
+// same way: the roll waits, and only its operation deadline ends it.
 func TestRecreateDrain_PodObservationsThatDecideNothing(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -205,24 +206,6 @@ func TestRecreateDrain_PodObservationsThatDecideNothing(t *testing.T) {
 			observe: func(_ *testing.T, _ *nonSurgeFixture, pod *corev1.Pod) *corev1.Pod {
 				out := pod.DeepCopy()
 				out.Spec.NodeName = "node-that-no-longer-exists"
-				return out
-			},
-		},
-		{
-			name:        "a rebuilt pod in a terminal Failed phase",
-			incarnation: 2,
-			observe: func(_ *testing.T, _ *nonSurgeFixture, pod *corev1.Pod) *corev1.Pod {
-				out := pod.DeepCopy()
-				out.Status.Phase = corev1.PodFailed
-				return out
-			},
-		},
-		{
-			name:        "a rebuilt pod in a terminal Succeeded phase",
-			incarnation: 2,
-			observe: func(_ *testing.T, _ *nonSurgeFixture, pod *corev1.Pod) *corev1.Pod {
-				out := pod.DeepCopy()
-				out.Status.Phase = corev1.PodSucceeded
 				return out
 			},
 		},
@@ -341,5 +324,158 @@ func TestRecreateDrain_ConflictOnTheServingFlipRetriesFromAFreshRead(t *testing.
 	}
 	if len(*f.blocks) != 0 {
 		t.Errorf("RetryBlock writes: got %v want none (a conflict blames no revision)", *f.blocks)
+	}
+}
+
+// failedDrainContinuation turns the fixture's in-flight recreate into the
+// row the gang verdict leaves behind: Phase=Failed with the Update
+// operation kept on its Drain step and the verdict on LastFailure. The
+// update pass re-drives such a row as a continuation.
+func failedDrainContinuation(t *testing.T, f *nonSurgeFixture) {
+	t.Helper()
+	ctx := context.Background()
+	ir := &v1beta1.InferenceReplica{}
+	key := client.ObjectKey{Namespace: f.isvc.Namespace, Name: legacyIRName(f.isvc, workload.ComponentEngine)}
+	if err := f.c.Get(ctx, key, ir); err != nil {
+		t.Fatalf("re-read IR: %v", err)
+	}
+	ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceFailed
+	ir.Status.InstanceStatuses[0].LastFailure = &v1beta1.InstanceTermination{
+		Reason: workload.PodGroupOwnershipConflictReason, Message: "PodGroup held by another owner", Time: metav1.Now(),
+	}
+	if err := f.c.Status().Update(ctx, ir); err != nil {
+		t.Fatalf("seed the Failed continuation: %v", err)
+	}
+}
+
+// outstandingDelete is an expectations cache holding one unobserved delete
+// for the fixture's Instance, on a clock the test can move past the TTL.
+func outstandingDelete(f *nonSurgeFixture) (*workload.Expectations, *clocktesting.FakeClock) {
+	fc := clocktesting.NewFakeClock(time.Now())
+	exp := workload.NewExpectationsWithClock(fc)
+	exp.ExpectDeletes(f.isvc.Namespace, f.isvc.Name, workload.ComponentEngine, 0, 1)
+	return exp, fc
+}
+
+// runWithExpectations is nonSurgeFixture.run with the expectations cache
+// the pass consults supplied by the test.
+func runWithExpectations(f *nonSurgeFixture, exp *workload.Expectations, pods []*corev1.Pod) (bool, error) {
+	in := f.input()
+	plan := legacyComponentPlan(f.strategy, nil)
+	deps := workload.Deps{Client: f.c, Recorder: record.NewFakeRecorder(32), Expectations: exp}
+	return UpdateWithPods(context.Background(), deps, in, plan, plan.Instances[0], f.targetCR, f.targetSpec, pods)
+}
+
+// TestRecreateUpdate_ExpiredExpectationsReleaseTheDrain: Phase A issues
+// its deletes only once the Instance's earlier creates and deletes have
+// been observed, so an unobserved delete holds the drain. The expectation
+// is not held forever: once it ages past its TTL the cache reads as
+// satisfied and the next pass re-derives Phase A from the live pod set,
+// deleting the old-incarnation pod it still finds. A Failed row that
+// kept its recreate is restamped as a continuation first and then waits
+// on, or is released by, the same expectation.
+func TestRecreateUpdate_ExpiredExpectationsReleaseTheDrain(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		failed bool
+	}{
+		{"an in-flight recreate", false},
+		{"a Failed row re-driven as a continuation", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seed := func(t *testing.T) (*nonSurgeFixture, *corev1.Pod) {
+				t.Helper()
+				f := recreateDrainInFlightFixture(t)
+				if tc.failed {
+					failedDrainContinuation(t, f)
+				}
+				old := legacyPodAtIncarnation(f.isvc, 0, 1, true /* ready */, false /* not serving */)
+				old.Spec.Containers = []corev1.Container{{Name: "main", Image: "llama:v1"}}
+				if err := f.c.Create(context.Background(), old); err != nil {
+					t.Fatalf("seed the old-incarnation pod: %v", err)
+				}
+				return f, old
+			}
+			check := func(t *testing.T, f *nonSurgeFixture, done bool, err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatalf("UpdateWithPods: %v", err)
+				}
+				if done {
+					t.Errorf("done: got true want false (Phase A is not finished)")
+				}
+				s := legacyInstanceStatusesOnIR(f.c, f.isvc, workload.ComponentEngine)[0]
+				if s.Phase != v1beta1.OMENativeInstanceUpdating || s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain {
+					t.Errorf("row: got phase %q op %+v want Updating on the Drain step", s.Phase, s.Operation)
+				}
+			}
+
+			t.Run("an outstanding delete holds the drain", func(t *testing.T) {
+				f, old := seed(t)
+				exp, _ := outstandingDelete(f)
+				done, err := runWithExpectations(f, exp, []*corev1.Pod{old})
+				check(t, f, done, err)
+				if sitePodGone(t, f.c, old) {
+					t.Errorf("Phase A deleted %s while a delete of the Instance is still unobserved", old.Name)
+				}
+			})
+
+			t.Run("an expired delete releases it", func(t *testing.T) {
+				f, old := seed(t)
+				exp, fc := outstandingDelete(f)
+				fc.Step(3 * time.Minute)
+				done, err := runWithExpectations(f, exp, []*corev1.Pod{old})
+				check(t, f, done, err)
+				if !sitePodGone(t, f.c, old) {
+					t.Errorf("Phase A left %s standing after the unobserved delete aged past its TTL", old.Name)
+				}
+			})
+		})
+	}
+}
+
+// TestRecreateUpdate_RefusedStatusRestampLeavesTheRowAlone: the re-drive
+// of a Failed row that kept its recreate begins with the status restamp.
+// An apiserver that refuses that write - a 422 on the status object, or a
+// shed request - ends the pass through the generic error path with the
+// refusal wrapped: the row keeps its Failed phase and its kept operation,
+// no pod of the ended attempt is touched, and the next pass tries again.
+func TestRecreateUpdate_RefusedStatusRestampLeavesTheRowAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		refuse error
+		is     func(error) bool
+	}{
+		{"a 422 on the status write", apierrors.NewInvalid(schema.GroupKind{Group: "ome.io", Kind: "InferenceReplica"}, "llama-70b-engine", nil), apierrors.IsInvalid},
+		{"a shed status write", apierrors.NewTooManyRequests("the apiserver is shedding load", 1), apierrors.IsTooManyRequests},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := recreateDrainInFlightFixture(t)
+			failedDrainContinuation(t, f)
+			pod := legacyPodAtIncarnation(f.isvc, 0, 2, true /* ready */, false /* not serving */)
+			pod.Spec.Containers = []corev1.Container{{Name: "main", Image: "llama:v2"}}
+			if err := f.c.Create(context.Background(), pod); err != nil {
+				t.Fatalf("seed the ended attempt's pod: %v", err)
+			}
+			in := f.input()
+			in.MutateInstance = func(context.Context, int32, func(*workload.InstanceStatus) bool) error { return tc.refuse }
+			plan := legacyComponentPlan(f.strategy, nil)
+			deps := workload.Deps{Client: f.c, Recorder: record.NewFakeRecorder(32)}
+
+			done, err := UpdateWithPods(context.Background(), deps, in, plan, plan.Instances[0], f.targetCR, f.targetSpec, []*corev1.Pod{pod})
+			if err == nil || !tc.is(err) {
+				t.Fatalf("UpdateWithPods: got done=%v err=%v, want the refusal wrapped", done, err)
+			}
+			if done {
+				t.Errorf("done: got true want false")
+			}
+			s := legacyInstanceStatusesOnIR(f.c, f.isvc, workload.ComponentEngine)[0]
+			if s.Phase != v1beta1.OMENativeInstanceFailed || s.Incarnation != 2 || s.Operation == nil || s.Operation.Step != workload.UpdateStepDrain {
+				t.Errorf("row: got phase %q incarnation %d op %+v want the Failed row with its kept recreate untouched", s.Phase, s.Incarnation, s.Operation)
+			}
+			if sitePodGone(t, f.c, pod) {
+				t.Errorf("pod %s was touched although the restamp never landed", pod.Name)
+			}
+		})
 	}
 }

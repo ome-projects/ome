@@ -52,6 +52,11 @@ const (
 	StateUpdateGangSurgeTargetCleanup RowState = "Update/GangSurgeTargetCleanup"
 	StateUpdateInPlace                RowState = "Update/InPlace"
 	StateUpdateDrain                  RowState = "Update/Drain"
+	// StateUpdateParked is an Update attempt parked after its disposition
+	// whose pod set serves: the row reads Updating, but the attempt is
+	// spent and no pass drives it. The same attempt with its set down is
+	// the Failed state, since the phase decides a Failed row.
+	StateUpdateParked RowState = "Update/Parked"
 
 	StateRestartDrain RowState = "Restart/Drain"
 
@@ -124,6 +129,7 @@ var ownershipTable = map[RowState]ownership{
 	StateUpdateGangSurgeTargetCleanup: {owner: OwnerUpdate, interrupts: interruptedBy(EventOperationDeadline, EventStuckPodGrace)},
 	StateUpdateInPlace:                {owner: OwnerUpdate, interrupts: interruptedBy(EventOperationDeadline, EventStuckPodGrace)},
 	StateUpdateDrain:                  {owner: OwnerUpdate, interrupts: interruptedBy(EventOperationDeadline, EventStuckPodGrace)},
+	StateUpdateParked:                 {owner: OwnerNone},
 
 	StateRestartDrain: {owner: OwnerRestart, interrupts: interruptedBy(EventOperationDeadline, EventStuckPodGrace)},
 
@@ -209,6 +215,8 @@ func updateStateOf(step string) RowState {
 		return StateUpdateInPlace
 	case UpdateStepDrain:
 		return StateUpdateDrain
+	case UpdateStepParked:
+		return StateUpdateParked
 	}
 	return StateUnknown
 }
@@ -239,9 +247,10 @@ func OwnerOfOperation(op *InstanceOperation) RowOwner {
 // Owner is OwnerNone; but the pinned revision, the surge index and the
 // migration pair it names are still that verb's, and a trigger deciding
 // whether to start something new on the row asks this question. A row
-// with no operation claims nothing.
+// with no operation claims nothing, and neither does a parked attempt:
+// it pins nothing the roll must finish, and the roll starts over it.
 func ClaimOf(s *InstanceStatus) RowOwner {
-	if s == nil || s.Operation == nil {
+	if s == nil || s.Operation == nil || OperationParked(s.Operation) {
 		return OwnerNone
 	}
 	switch s.Operation.Type {
@@ -260,17 +269,30 @@ func ClaimOf(s *InstanceStatus) RowOwner {
 }
 
 // UpdateContinuation reports whether the row carries an Update attempt
-// the update pass continues rather than starts: a row in Phase=Updating,
-// or a Failed row whose preserved operation is an Update. The in-flight
-// pod of either already counts against the unavailability budget, so a
-// continuation is never admitted or charged again — the exemption and
-// the charge cover the same set.
+// the update pass continues rather than starts: one the update pass owns,
+// or a Failed row whose preserved operation still claims the update verb.
+// The in-flight pod of either already counts against the unavailability
+// budget, so a continuation is never admitted or charged again — the
+// exemption and the charge cover the same set. A parked attempt is
+// settled and claims nothing, so the roll starts fresh over it; every
+// other Updating row, an operation the ownership table does not name included, is
+// re-derived by the update pass rather than left.
 func UpdateContinuation(s *InstanceStatus) bool {
 	if s == nil {
 		return false
 	}
-	return s.Phase == InstancePhaseUpdating ||
-		(s.Phase == InstancePhaseFailed && ClaimOf(s) == OwnerUpdate)
+	if s.Phase == InstancePhaseUpdating {
+		return StateOf(s) != StateUpdateParked
+	}
+	return s.Phase == InstancePhaseFailed && ClaimOf(s) == OwnerUpdate
+}
+
+// InFlight reports whether the row carries a step its owner advances: a
+// settled row — none, waiting to be materialized, serving, Failed, or an
+// attempt parked after its disposition — has no clock to run and no
+// attempt for a hold or a verdict to end.
+func InFlight(s *InstanceStatus) bool {
+	return !settledState(StateOf(s))
 }
 
 // RecreateOfDarkRow reports a fresh update start that takes nothing
@@ -285,6 +307,26 @@ func RecreateOfDarkRow(s *InstanceStatus, strategy UpdateStrategyType) bool {
 	return s != nil && !UpdateContinuation(s) &&
 		strategy != UpdateStrategySurgeThenDrain &&
 		s.Phase == InstancePhaseFailed && s.ServingPodCount == 0
+}
+
+// EndedByOwnershipVerdict reports whether the row keeps an attempt the gang
+// verdict ended: Failed, operation kept, the ownership conflict recorded. No
+// pass re-drives it at the pinned revision; it resumes through the reset
+// mailbox or another revision. A gang surge's rows are the surge machine's.
+func EndedByOwnershipVerdict(s *InstanceStatus) bool {
+	if s == nil || s.Phase != InstancePhaseFailed || s.Operation == nil ||
+		s.LastFailure == nil || s.LastFailure.Reason != PodGroupOwnershipConflictReason {
+		return false
+	}
+	switch s.Operation.Type {
+	case InstanceOperationCreate:
+		return true
+	case InstanceOperationUpdate:
+		state := updateStateOf(s.Operation.Step)
+		return s.Operation.SurgeIndex == nil &&
+			state != StateUpdateGangSurgeTarget && state != StateUpdateGangSurgeTargetCleanup
+	}
+	return false
 }
 
 // RemembersCrash reports whether the row records a failure of its current
@@ -366,7 +408,7 @@ func RowsByOwner(statuses []InstanceStatus) OwnedRows {
 // spent attempt.
 func settledState(state RowState) bool {
 	switch state {
-	case StateEmpty, StatePending, StateReady, StateFailed, StateUnknown:
+	case StateEmpty, StatePending, StateReady, StateFailed, StateUpdateParked, StateUnknown:
 		return true
 	}
 	return false
@@ -405,7 +447,7 @@ func OwnershipStates() []RowState {
 		StateCreateCreatePods,
 		StateUpdateSurge, StateUpdateSurgeDrain,
 		StateUpdateGangSurgeTarget, StateUpdateGangSurgeTargetCleanup,
-		StateUpdateInPlace, StateUpdateDrain,
+		StateUpdateInPlace, StateUpdateDrain, StateUpdateParked,
 		StateRestartDrain,
 		StateMigrateCreateSurge, StateMigrateSurgeTarget,
 		StateDeleteDrain,

@@ -96,10 +96,11 @@ func mergeCandidateObservations(stored, observed []v1beta1.CandidatePlacement) [
 		candidate := *observation.DeepCopy()
 		if previous, ok := planned[candidate.Cluster]; ok {
 			candidate.Allocation = previous.Allocation.DeepCopy()
-			// Unidentified observations cannot acknowledge a stored allocation.
+			// An observation that does not identify the stored allocation neither
+			// acknowledges it nor retracts the acknowledgement already recorded.
 			if observation.Allocation == nil || observation.Allocation.ClusterUID != previous.Allocation.ClusterUID {
 				candidate.ObservationKnown = false
-				candidate.AppliedPlanID = ""
+				candidate.AppliedPlanID = previous.AppliedPlanID
 			}
 			delete(planned, candidate.Cluster)
 		}

@@ -376,3 +376,95 @@ func TestMeasureUnitFingerprint(t *testing.T) {
 		})
 	}
 }
+
+// engineOnlyUnitFingerprint pins the measured demand of the engine-only
+// fixture so a source without a decoder keeps its demand contract digest.
+const engineOnlyUnitFingerprint = "b06961b5a53a96a6fde49b092f252d045b3fbfff57fa07b92a0d0fc66f02da87"
+
+func TestMeasureUnitFingerprintIsStable(t *testing.T) {
+	got, err := MeasureUnit(demandUnit(), []string{demandGPU, demandTPU})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(engineOnlyUnitFingerprint, got.Fingerprint); diff != "" {
+		t.Fatalf("engine-only unit fingerprint (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(int64(1), got.PrimaryUnits); diff != "" {
+		t.Fatalf("engine-only primary units (-want +got):\n%s", diff)
+	}
+}
+
+func TestMeasureUnitRatio(t *testing.T) {
+	type pod struct {
+		Component v1beta1.ComponentType
+		Name      string
+		Count     int64
+		GPU       string
+	}
+	pdUnit := func() ReplicaUnit {
+		unit := demandUnit()
+		unit.Decoder = []PodSet{demandSet("primary", 1, gpuContainer("runner", "4"))}
+		return unit
+	}
+	for _, tt := range []struct {
+		name         string
+		unit         func() ReplicaUnit
+		units        map[v1beta1.ComponentType]int64
+		want         []pod
+		primaryUnits int64
+		sameAsPlain  bool
+		wantErr      string
+	}{
+		{name: "engine only measures one engine", unit: demandUnit, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 1},
+			want: []pod{{v1beta1.EngineComponent, "primary", 1, "2"}}, primaryUnits: 1, sameAsPlain: true},
+		{name: "equal minimums measure one of each", unit: pdUnit, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 1, v1beta1.DecoderComponent: 1},
+			want: []pod{{v1beta1.EngineComponent, "primary", 1, "2"}, {v1beta1.DecoderComponent, "primary", 1, "4"}}, primaryUnits: 1, sameAsPlain: true},
+		{name: "ratio scales each component", unit: pdUnit, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 3, v1beta1.DecoderComponent: 2},
+			want: []pod{{v1beta1.EngineComponent, "primary", 3, "6"}, {v1beta1.DecoderComponent, "primary", 2, "8"}}, primaryUnits: 3},
+		{name: "zero decoder minimum leaves the unit", unit: pdUnit, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 1, v1beta1.DecoderComponent: 0},
+			want: []pod{{v1beta1.EngineComponent, "primary", 1, "2"}}, primaryUnits: 1},
+		{name: "decoder leads an undeclared engine", unit: func() ReplicaUnit {
+			unit := pdUnit()
+			unit.Engine = nil
+			return unit
+		}, units: map[v1beta1.ComponentType]int64{v1beta1.DecoderComponent: 2},
+			want: []pod{{v1beta1.DecoderComponent, "primary", 2, "8"}}, primaryUnits: 2},
+		{name: "negative multiplicity", unit: pdUnit, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: -1}, wantErr: "multiplicity"},
+		{name: "zero primary multiplicity", unit: pdUnit, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 0, v1beta1.DecoderComponent: 1}, wantErr: "multiplicity"},
+		{name: "unit without any component", unit: pdUnit, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 0, v1beta1.DecoderComponent: 0}, wantErr: "multiplicity"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resources := []string{demandGPU, demandTPU}
+			plain, err := MeasureUnit(tt.unit(), resources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unit := tt.unit()
+			unit.Units = tt.units
+			got, err := MeasureUnit(unit, resources)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var pods []pod
+			for _, measured := range got.Pods {
+				gpu := measured.Requests[demandGPU]
+				pods = append(pods, pod{measured.Component, measured.Name, measured.Count, gpu.String()})
+			}
+			if diff := cmp.Diff(tt.want, pods); diff != "" {
+				t.Fatalf("measured pods (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.primaryUnits, got.PrimaryUnits); diff != "" {
+				t.Fatalf("primary units (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tt.sameAsPlain, plain.Fingerprint == got.Fingerprint); diff != "" {
+				t.Fatalf("fingerprint shared with the unscaled unit (-want +got):\n%s", diff)
+			}
+		})
+	}
+}

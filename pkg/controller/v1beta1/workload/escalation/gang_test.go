@@ -413,7 +413,9 @@ func TestEscalation_GangFailedNeitherHoldsNorEnds(t *testing.T) {
 // belongs to DeleteBatch and a migration to its record, and both stay
 // planned while they run — so a foreign-owned PodGroup name reaches
 // those rows and must not flip a phase out from under the machine
-// driving them.
+// driving them. A Migrating row pinned by its phase alone, with no
+// operation on it, is the record's as well and has nothing a Failed
+// stamp could keep: the verdict writes nothing to it.
 func TestEscalation_GangTerminalKeepsOffRowsOwnedElsewhere(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -424,15 +426,24 @@ func TestEscalation_GangTerminalKeepsOffRowsOwnedElsewhere(t *testing.T) {
 			Type: types.InstanceOperationDelete, Step: "Drain"}},
 		{"migration", types.InstancePhaseMigrating, &types.InstanceOperation{
 			Type: types.InstanceOperationMigrate, Step: "CreateSurge"}},
+		{"migration pinned by phase alone", types.InstancePhaseMigrating, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			now := time.Now()
-			tc.op.Deadline = metav1.NewTime(now.Add(-time.Hour))
+			if tc.op != nil {
+				tc.op.Deadline = metav1.NewTime(now.Add(-time.Hour))
+			}
 			insts := []types.InstanceStatus{{
 				Index: 0, Phase: tc.phase, PodCount: 2, Operation: tc.op,
 			}}
 			input, rec := escalationFixture(insts)
 			input.Gangs = gangObservations(0, types.GangStateOwnershipConflict, gangConflictMessage)
+			writes := 0
+			seam := input.MutateInstance
+			input.MutateInstance = func(ctx context.Context, idx int32, mutate func(*types.InstanceStatus) bool) error {
+				writes++
+				return seam(ctx, idx, mutate)
+			}
 
 			if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2), pendingGangPods()); err != nil {
 				t.Fatalf("escalation pass: %v", err)
@@ -441,6 +452,9 @@ func TestEscalation_GangTerminalKeepsOffRowsOwnedElsewhere(t *testing.T) {
 			got := rec.store[0]
 			if got.Phase != tc.phase {
 				t.Errorf("Phase: got %q want %q (another machine owns this row)", got.Phase, tc.phase)
+			}
+			if writes != 0 {
+				t.Errorf("MutateInstance calls: got %d want none, the verdict has nothing to write here", writes)
 			}
 			if len(rec.warns) != 0 {
 				t.Errorf("WarnInstanceFailed: got %v want none", rec.warns)
@@ -1158,5 +1172,35 @@ func TestEscalation_GangReadingsOnASurgeSource(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A parked attempt is no attempt for a gang verdict to end: a name held by
+// another controller leaves the row as its pods gave it, with no stamp and
+// no warning, in either phase.
+func TestEscalation_GangVerdictLeavesAParkedAttempt(t *testing.T) {
+	for _, phase := range []types.InstancePhase{types.InstancePhaseUpdating, types.InstancePhaseFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			insts := []types.InstanceStatus{{
+				Index: 0, Phase: phase, PodCount: 2, RunningRevision: "own-engine-oldhash", TargetRevision: "own-engine-newhash",
+				Operation: &types.InstanceOperation{
+					ID: "update-0-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepParked,
+					TargetRevision: "own-engine-newhash", Waiting: string(types.RolloutHoldGateRetryBlock),
+				},
+				LastFailure: &types.InstanceTermination{PodName: "engine-0-leader-0", Reason: "CrashLoopBackOff"},
+			}}
+			input, rec := escalationFixture(insts)
+			input.Gangs = gangObservations(0, types.GangStateOwnershipConflict, gangConflictMessage)
+			if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2), pendingGangPods()); err != nil {
+				t.Fatalf("escalation pass: %v", err)
+			}
+			got := rec.store[0]
+			if got.Phase != phase || got.LastFailure.Reason != "CrashLoopBackOff" || !types.OperationParked(got.Operation) {
+				t.Errorf("row = %+v, want the parked attempt left as it was", got)
+			}
+			if len(rec.warns) != 0 {
+				t.Errorf("WarnInstanceFailed: got %v want none", rec.warns)
+			}
+		})
 	}
 }

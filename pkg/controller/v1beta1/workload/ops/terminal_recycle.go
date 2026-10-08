@@ -63,17 +63,25 @@ func admissionRejectedTargetPods(existing []*corev1.Pod, targets []podTarget) []
 	return dead
 }
 
-// recycleAdmissionRejectedTargets frees the target names an admission
-// rejection is holding so the owning operation can place them again.
-// Shared by every path that puts a REPLACEMENT pod down — the per-pod
-// surge, the recreate's rebuild, the gang surge — which otherwise read a
-// rejected pod as "present but not ready" and hold to the operation
-// deadline.
+// recycleTerminalTargets frees the target names a terminal pod is holding
+// so the owning attempt can place them again. Every update attempt that
+// puts a replacement down — the per-pod surge, the recreate's rebuild, the
+// gang surge, the in-place patch — replaces a dead pod at once, as the
+// Create and Restart passes do, rather than reading it as "present but
+// not ready" to the operation deadline.
 //
 // statusIdx owns the operation and takes the bookkeeping; podIdx buckets
 // the pods and their expectations. They differ for a gang surge, whose
 // pods live under the surge index while the governing operation stays on
 // the source. Reports true when the caller must not create this pass.
+func recycleTerminalTargets(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, statusIdx, podIdx int32, opType workload.InstanceOperationType, existing []*corev1.Pod, targets []podTarget) (bool, error) {
+	return recycleTerminalPods(ctx, deps, input, statusIdx, podIdx, opType,
+		terminalTargetPods(existing, targets))
+}
+
+// recycleAdmissionRejectedTargets is recycleTerminalTargets narrowed to
+// the pods a node refused: the migration surge frees only those, and
+// leaves any other terminal surge pod to its record's deadline.
 func recycleAdmissionRejectedTargets(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, statusIdx, podIdx int32, opType workload.InstanceOperationType, existing []*corev1.Pod, targets []podTarget) (bool, error) {
 	return recycleTerminalPods(ctx, deps, input, statusIdx, podIdx, opType,
 		admissionRejectedTargetPods(existing, targets))
@@ -122,7 +130,7 @@ func recycleTerminalPods(ctx context.Context, deps workload.Deps, input workload
 	}
 
 	termination := terminalPodTermination(dead[0], metav1.NewTime(now))
-	recycle, err := status.RecordRecycleAttempt(ctx, input, statusIdx, opType, metav1.NewTime(now), termination)
+	recycle, err := status.RecordRecycleAttempt(ctx, input, statusIdx, opType, metav1.NewTime(now), termination, dead[0].CreationTimestamp)
 	if err != nil {
 		return true, fmt.Errorf("record terminal pod recycle (instance=%d): %w", statusIdx, err)
 	}

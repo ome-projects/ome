@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
@@ -112,9 +114,9 @@ type Reconciler struct {
 	// compatibility behavior when the field is absent.
 	ScaleUpPodBatchSize *int32
 	// ScaleDownPodBatchSize is the startup-validated active delete budget in
-	// Pod-equivalent units. It is immutable for the manager process lifetime;
-	// nil preserves unbounded candidate selection when the field is absent.
-	ScaleDownPodBatchSize *int32
+	// Pod-equivalent units, as a count or percentage of the current Component.
+	// It is immutable for the manager process lifetime; nil is unbounded.
+	ScaleDownPodBatchSize *intstr.IntOrString
 	// ScaleDownRequeueInterval is the startup-validated poll cadence for an
 	// active delete wave. Zero disables cadence polling; watches and configured
 	// lifecycle deadlines still schedule progress.
@@ -353,6 +355,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// so the deferred status-write can log on real transitions
 	// (CurrentRevision promotion, first Phase=Failed escalation).
 	priorCurrentRevision := ir.Status.CurrentRevision
+	priorWithdrawnRevision := withdrawnRevisionFor(&ir.Status)
 	priorAnyFailed := hasFailedInstance(ir.Status.InstanceStatuses)
 
 	// Resolve the parent ISVC for the event stream. Best-effort: an
@@ -611,12 +614,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		// the non-nil-primary-error path).
 		r.sweepRevisions(ctx, ir)
 		switch {
+		case priorWithdrawnRevision != "" && ir.Status.CurrentRevision == priorWithdrawnRevision:
+			log.Info("Rollout closed; CurrentRevision restored once every Instance was back on the revision it was withdrawn from",
+				"currentRevision", ir.Status.CurrentRevision)
 		case priorCurrentRevision != ir.Status.CurrentRevision && ir.Status.CurrentRevision != "":
 			log.Info("Rollout complete; CurrentRevision promoted",
 				"previousCurrentRevision", priorCurrentRevision,
 				"currentRevision", ir.Status.CurrentRevision)
 		case priorCurrentRevision != "" && ir.Status.CurrentRevision == "":
-			log.Info("Rollout reopened; CurrentRevision withdrawn while an Instance still runs another revision",
+			log.Info("Rollout reopened; CurrentRevision withdrawn while an Instance still runs, or is still pinned to, another revision",
 				"previousCurrentRevision", priorCurrentRevision,
 				"updateRevision", ir.Status.UpdateRevision)
 		}
@@ -670,7 +676,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// pass that ends between creating a pod and the deferred publication
 	// then leaves pods of the new revision beside a status that already
 	// names it, never beside one still reporting the previous revision as
-	// current and done.
+	// current and done. The record moves the pair as one pair, so a
+	// rollback onto the current revision reads open from this write on.
 	if specTarget != nil && ir.Status.UpdateRevision != specTarget.Name {
 		if rerr := buildRecordUpdateRevision(r.statusWriter(), r.liveReader(), ir)(ctx, specTarget.Name); rerr != nil {
 			if errors.Is(rerr, workloadtypes.ErrStatusOwnerGone) {
@@ -752,7 +759,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	}
 	podGroupState := workloadgang.PodGroupReconcileState{
 		Inventory:     podGroupInventory,
-		TerminalOwned: terminalFinalizationOwned(input.ObservedState),
+		TerminalOwned: TerminalFinalizationOwned(input.ObservedState),
 	}
 	deps.EnsureGangPodGroup = workloadgang.EnsureSurgePodGroupWithState(deps, podGroupState)
 
@@ -904,7 +911,7 @@ func (r *Reconciler) requiresAuthoritativePodGroupInventory(
 	if scaleDownPodObservationRequired(input, plan) {
 		return true, nil
 	}
-	if len(terminalFinalizationOwned(input.ObservedState)) > 0 {
+	if len(TerminalFinalizationOwned(input.ObservedState)) > 0 {
 		return true, nil
 	}
 	return workloadgang.CachedOwnerHasPodGroups(ctx, r.Client, input.OwnerObject)
@@ -934,7 +941,7 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 	if inventory == nil || !inventory.Available() {
 		return false, nil
 	}
-	terminalOwned := terminalFinalizationOwned(input.ObservedState)
+	terminalOwned := TerminalFinalizationOwned(input.ObservedState)
 	type stalePodGroup struct {
 		name  string
 		index int32
@@ -982,6 +989,21 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 	if podsByInstance == nil {
 		podsByInstance = query.BucketPodsByInstanceIdx(input.AuthoritativePods.Pods)
 	}
+	footprint := workloadtypes.ScaleDownPodFootprint(input.ObservedState.InstanceStatuses, podsByInstance)
+	statusIndices := make(map[int32]struct{}, len(input.ObservedState.InstanceStatuses))
+	for _, row := range input.ObservedState.InstanceStatuses {
+		statusIndices[row.Index] = struct{}{}
+	}
+	for _, group := range groups {
+		_, hasStatus := statusIndices[group.index]
+		if !hasStatus && len(podsByInstance[group.index]) == 0 && footprint < math.MaxInt32 {
+			footprint++
+		}
+	}
+	budget, err := workloadtypes.ResolveScaleDownPodBatchSize(input.ScaleDownPodBatchSize, footprint)
+	if err != nil {
+		return false, fmt.Errorf("InferenceReplica reconciler: resolve stale PodGroup cleanup budget: %w", err)
+	}
 	pending := int32(0)
 	for _, entry := range inventory.OwnedEntries() {
 		if entry.PodGroup.DeletionTimestamp != nil || inventory.DeleteAccepted(entry.Name) {
@@ -1004,7 +1026,7 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 		if len(podsByInstance[group.index]) > 0 {
 			continue
 		}
-		if input.ScaleDownPodBatchSize != nil && pending+deleted >= *input.ScaleDownPodBatchSize {
+		if budget != nil && pending+deleted >= *budget {
 			blocked = true
 			continue
 		}
@@ -1017,7 +1039,10 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 	return blocked, nil
 }
 
-func terminalFinalizationOwned(observed workloadtypes.WorkloadObservedState) map[int32]struct{} {
+// TerminalFinalizationOwned is the set of Instance indices whose PodGroup a
+// terminal lifecycle owner finalizes itself: a draining migration source, a
+// Deleting row, a gang-surge cleanup marker, and a drained or failed surge pair.
+func TerminalFinalizationOwned(observed workloadtypes.WorkloadObservedState) map[int32]struct{} {
 	owned := make(map[int32]struct{})
 	for _, record := range observed.Migrations {
 		if record.Phase == workloadtypes.MigrationPhaseDraining {

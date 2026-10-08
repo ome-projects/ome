@@ -74,14 +74,26 @@ func targetServes(readyPods map[string]int32, target, stable string) bool {
 	return readyPods == nil || target == "" || target == stable || readyPods[target] > 0
 }
 
-// servedWeight is the share a member writes on its target: the step weight
-// while the canary path serves, nothing while it does not and the stable
-// side has a serving pod. A stable side with no pod leaves the weight.
+// servedWeight is the share a member writes on its target. The rule is the
+// same on both sides: a revision with no serving pod carries no weight and
+// the serving side carries the rest. The step weight while both sides
+// serve; nothing while the canary path is broken and the stable side
+// serves; everything while the path serves and the stable side has no pod.
+// With no pod view, no stable side, or nothing serving on either side the
+// step weight stands: a loss with nothing to move onto is the workload's
+// repair, not a traffic decision.
 func servedWeight(weight int32, pathServes bool, stable string, readyPods map[string]int32) int32 {
-	if pathServes || stable == "" || readyPods[stable] <= 0 {
+	if stable == "" || readyPods == nil {
 		return weight
 	}
-	return 0
+	stableServes := readyPods[stable] > 0
+	switch {
+	case !pathServes && stableServes:
+		return 0
+	case pathServes && !stableServes:
+		return 100
+	}
+	return weight
 }
 
 // memberWeights is a secondary's split: its target at `weight`, its stable

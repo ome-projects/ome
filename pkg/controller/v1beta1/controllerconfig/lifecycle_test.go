@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
@@ -50,7 +53,7 @@ func TestNewLifecycleConfig(t *testing.T) {
 				require.NotNil(t, cfg.ScaleUpPodBatchSize)
 				assert.Equal(t, int32(100), *cfg.ScaleUpPodBatchSize)
 				require.NotNil(t, cfg.ScaleDownPodBatchSize)
-				assert.Equal(t, int32(75), *cfg.ScaleDownPodBatchSize)
+				assert.Equal(t, intstr.FromInt32(75), *cfg.ScaleDownPodBatchSize)
 				require.NotNil(t, cfg.ScaleDownRequeueInterval)
 				assert.Equal(t, "7s", *cfg.ScaleDownRequeueInterval)
 				require.NotNil(t, cfg.RepairBatchSize)
@@ -129,20 +132,20 @@ func TestLifecycleConfig_ToScaleDownPodBatchSize(t *testing.T) {
 	})
 
 	t.Run("positive value passes through as a copy", func(t *testing.T) {
-		configured := int32(100)
+		configured := intstr.FromInt32(100)
 		cfg := &LifecycleConfig{ScaleDownPodBatchSize: &configured}
 		size, err := cfg.ToScaleDownPodBatchSize()
 		require.NoError(t, err)
 		require.NotNil(t, size)
-		assert.Equal(t, int32(100), *size)
+		assert.Equal(t, intstr.FromInt32(100), *size)
 
-		configured = 200
-		assert.Equal(t, int32(100), *size)
+		configured = intstr.FromInt32(200)
+		assert.Equal(t, intstr.FromInt32(100), *size)
 	})
 
 	for _, configured := range []int32{0, -1} {
-		configured := configured
-		t.Run(fmt.Sprintf("rejects %d", configured), func(t *testing.T) {
+		configured := intstr.FromInt32(configured)
+		t.Run(fmt.Sprintf("rejects %s", configured.String()), func(t *testing.T) {
 			cfg := &LifecycleConfig{ScaleDownPodBatchSize: &configured}
 			size, err := cfg.ToScaleDownPodBatchSize()
 			require.ErrorContains(t, err, "lifecycle.scaleDownPodBatchSize")
@@ -228,7 +231,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 		lifecycle     *string
 		omitConfigMap bool
 		wantScaleUp   *int32
-		wantScaleDown *int32
+		wantScaleDown *intstr.IntOrString
 		wantRepair    *int32
 		wantInterval  time.Duration
 		wantError     string
@@ -237,9 +240,24 @@ func TestLoadPodBatchSizes(t *testing.T) {
 			name:          "scale settings come from one snapshot",
 			lifecycle:     stringPointer(`{"scaleUpPodBatchSize":37,"scaleDownPodBatchSize":41,"scaleDownRequeueInterval":"7s","repairBatchSize":5}`),
 			wantScaleUp:   int32Pointer(37),
-			wantScaleDown: int32Pointer(41),
+			wantScaleDown: ptr.To(intstr.FromInt32(41)),
 			wantRepair:    int32Pointer(5),
 			wantInterval:  7 * time.Second,
+		},
+		{
+			name:          "percentage is preserved for each Component observation",
+			lifecycle:     stringPointer(`{"scaleDownPodBatchSize":"10%"}`),
+			wantScaleDown: ptr.To(intstr.FromString("10%")),
+		},
+		{
+			name:      "zero percentage is rejected",
+			lifecycle: stringPointer(`{"scaleDownPodBatchSize":"0%"}`),
+			wantError: "lifecycle.scaleDownPodBatchSize",
+		},
+		{
+			name:      "percentage above a full Component is rejected",
+			lifecycle: stringPointer(`{"scaleDownPodBatchSize":"101%"}`),
+			wantError: "lifecycle.scaleDownPodBatchSize",
 		},
 		{
 			name:       "repair alone leaves both scale directions unbounded",
@@ -254,7 +272,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 		{
 			name:          "scale-down alone leaves scale-up unbounded",
 			lifecycle:     stringPointer(`{"scaleDownPodBatchSize":41}`),
-			wantScaleDown: int32Pointer(41),
+			wantScaleDown: ptr.To(intstr.FromInt32(41)),
 		},
 		{
 			name:         "requeue interval alone leaves both directions unbounded",
@@ -281,7 +299,7 @@ func TestLoadPodBatchSizes(t *testing.T) {
 		{
 			name:      "malformed scale-down field type is rejected",
 			lifecycle: stringPointer(`{"scaleDownPodBatchSize":"many"}`),
-			wantError: "cannot unmarshal string",
+			wantError: "lifecycle.scaleDownPodBatchSize",
 		},
 		{
 			name:      "malformed requeue interval is rejected",

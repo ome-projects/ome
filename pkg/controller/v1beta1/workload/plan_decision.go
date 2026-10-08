@@ -112,13 +112,19 @@ type UpdateItem struct {
 	// (types.RecreateOfDarkRow, a Ready row whose pod set is provably out
 	// of service — evidence.PodSetServesNothing — or one the count already
 	// excludes on a parked member — evidence.PodSetUnavailableOnParkedMember);
-	// the per-Component budget still applies.
+	// the plan gate and the per-Component budget still apply.
 	CoordGateExempt bool
 	// ReplacesDarkPodSet: the fresh start replaces an Instance that serves
-	// nothing (replacesDarkPodSet). Such starts restore capacity rather
-	// than spend it, so they are listed ahead of the rest and the budget
-	// reaches them before any serving Instance is taken offline.
+	// nothing by the graced reading the budgets and the gate share
+	// (replacesDarkPodSet).
 	ReplacesDarkPodSet bool
+	// OutOfRotation: the fresh start's Instance serves nothing at this
+	// pass — a dark one (ReplacesDarkPodSet) or a pod set with no routed
+	// pod in rotation, its grace run or not (evidence.PodSetOutOfRotation).
+	// Taking it first costs no capacity, so such starts are listed ahead
+	// of the rest and the budget reaches them before any serving Instance
+	// is taken offline; the budgets and the gate still read the grace.
+	OutOfRotation bool
 	// RecreateFallback: the Component's in-place strategy runs as a
 	// recreate on this Instance (ops.InPlaceFallsBackToRecreate: a gang, or
 	// a single-pod diff beyond container images), so the fresh start is
@@ -142,10 +148,10 @@ type UpdateItem struct {
 // plus the pure budget inputs the executor's within-pass counters
 // project against.
 type UpdateSelection struct {
-	// Items in the order the executor admits them: the fresh starts that
-	// replace a dark Instance first, then plan order. Instances held by
-	// the effective partition (canary) and Instances with no trigger are
-	// not listed.
+	// Items in the order the executor admits them: the fresh starts of an
+	// Instance out of rotation first (OutOfRotation), then plan order.
+	// Instances held by the effective partition (canary) and Instances
+	// with no trigger are not listed.
 	Items []UpdateItem
 	// Strategy is the resolved update strategy (empty Type defaults to
 	// SurgeThenDrain — matches workload.BuildPlan's defaulting).
@@ -192,6 +198,36 @@ type UpdateSelection struct {
 	// that gave up on the revision is reported even when no candidate
 	// reaches the trigger.
 	LadderHold *types.RolloutHold
+	// CrashedNotServing lists, in plan order, the Instances of
+	// RolledNotServing whose pushed pod crashed after the row entered
+	// Ready (ops.RolledInstanceCrashed): the roll's open work that no
+	// other pass says anything about while the pod is up between
+	// crashes.
+	CrashedNotServing []int32
+	// CrashedOutOfRotation lists, in plan order, the Instances of
+	// CrashedNotServing whose set is short of fully in rotation
+	// (ops.RolledSetInRotation): a pod down, restarting or not yet
+	// serving. The rest are back in rotation and merely unproven for the
+	// window, which paces a further start and nothing else. It is the
+	// standing hold's reading alone: an item's OutOfRotation ordering key
+	// asks whether the Instance serves nothing now, a different question.
+	CrashedOutOfRotation []int32
+	// StandingHold is the hold the roll stands behind on account of the
+	// Instances already on the target that do not serve it, whether or
+	// not a start reaches the admission this pass: the ladder's when the
+	// target's block denies a fresh start or counts their crash, else the
+	// budget's when those Instances and the starts in flight already
+	// exhaust the strategy's arm. The budget's stands only while one of
+	// them crashed after promotion and is out of rotation
+	// (CrashedOutOfRotation): a rolled Instance short of serving for
+	// another reason is repaired or parked by a pass that says so itself,
+	// and one back in rotation leaves a roll with nothing to start nothing
+	// to stand behind. Nil otherwise, when a further start would still be
+	// admitted, or while paused. The update pass reports it when it admits
+	// nothing, a roll with nothing selected reports it at the update
+	// position (Decision.StandingHold), and a pass the restart pass
+	// consumes reports it in the update pass's place.
+	StandingHold *types.RolloutHold
 }
 
 // PlannedAction is one pass-level action selected for this reconcile.
@@ -249,12 +285,29 @@ type Decision struct {
 	RequeueAfter time.Duration
 
 	// UpdateIdle reports that the update selection ran for an unpaused
-	// Component and found nothing: no Instance to drive and no
-	// same-target RetryBlock that still denies a start. Execute reports a
-	// nil rollout hold at the update pass's position, so a hold a prior
-	// pass recorded does not outlive the roll it paced, while a ladder
-	// that gave up on the revision stays reported.
+	// Component and found nothing: no Instance to drive, no same-target
+	// RetryBlock that still denies a start, and no Instance on the target
+	// that crashed after promotion and is out of rotation or under the
+	// ladder's attempt. Execute reports a nil rollout hold at the update
+	// pass's position, so a hold a prior pass recorded does not outlive
+	// the roll it paced or the loss it named, while a ladder that gave up
+	// on the revision stays reported.
 	UpdateIdle bool
+
+	// LadderHold is the hold an unpaused roll waits on when the target's
+	// RetryBlock denies every start at the trigger stage and nothing else
+	// is selected (UpdateSelection.LadderHold with no items). Execute
+	// reports it at the update pass's position, so the wait says what
+	// the ladder's attempt rebuilds on every pass that reaches it.
+	LadderHold *types.RolloutHold
+
+	// StandingHold is the hold an unpaused roll with nothing selected
+	// stands behind on account of the Instances already on the target that
+	// are out of rotation because a pushed pod crashed after promotion
+	// (UpdateSelection.StandingHold with no items). Execute reports it at
+	// the update pass's position after the ladder's hold, and a pass the
+	// restart pass consumes reports it there in the update pass's place.
+	StandingHold *types.RolloutHold
 
 	// Owned is the pass's rows grouped by the owner that may advance
 	// them. Built once here, from the ownership table; Execute hands it
@@ -400,14 +453,28 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 		}
 		if plan.Paused {
 			// A RetryBlock wake-up paces a fresh re-trigger, which a pause
-			// withholds; the unpause is the wake-up that matters here.
+			// withholds; the unpause is the wake-up that matters here. The
+			// pause is the roll's hold; what its parked Instances stand
+			// behind is reported once the roll may move again.
 			selection.Items = pausedUpdateContinuations(input, selection.Items)
+			selection.StandingHold = nil
 		} else {
 			decision.RequeueAfter = retryBlockWait
 			// A roll with nothing left to do holds nothing: no Instance to
-			// drive, and no ladder that still holds the target, whether a
-			// candidate reached its gate or a partition kept every one back.
-			decision.UpdateIdle = len(selection.Items) == 0 && len(selection.RetryBlockDenied) == 0 && selection.LadderHold == nil
+			// drive, no ladder that still holds the target, whether a
+			// candidate reached its gate or a partition kept every one back,
+			// and no Instance on the target out of rotation after a crash,
+			// or proving itself under the ladder's attempt, that holds the
+			// roll.
+			decision.UpdateIdle = len(selection.Items) == 0 && len(selection.RetryBlockDenied) == 0 && selection.LadderHold == nil && selection.StandingHold == nil
+			// A roll with nothing to run but a hold to report waits on it:
+			// the ladder's when the target's block denies every start, else
+			// the one its parked Instances stand behind. Either is reported
+			// at the update position.
+			if len(selection.Items) == 0 {
+				decision.LadderHold = selection.LadderHold
+				decision.StandingHold = selection.StandingHold
+			}
 		}
 		if len(selection.Items) > 0 {
 			decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionUpdate, Update: &selection})
@@ -547,8 +614,8 @@ func planRestartSelections(ctx context.Context, input types.ReconcileInput, plan
 		restarts = append(restarts, RestartSelection{
 			Instance:            inst,
 			Reason:              reason,
-			OpensRepair:         workloadops.RestartOpensRepair(input, inst, liveByInstance[inst.Index]),
-			OpensUnavailability: workloadops.RestartOpensUnavailability(input, inst, liveByInstance[inst.Index]),
+			OpensRepair:         workloadops.RestartOpensRepair(input, plan, inst, liveByInstance[inst.Index]),
+			OpensUnavailability: workloadops.RestartOpensUnavailability(input, plan, inst, liveByInstance[inst.Index]),
 			LadderRevision:      workloadops.RestartOpensLadderAttempt(input, plan, inst, liveByInstance[inst.Index]),
 		})
 	}
@@ -670,8 +737,8 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 	}
 	// The hold reads the projected pacing partition first (a canary step
 	// or plan-gate hold), then the user's rollingUpdate partition.
-	partition := escalation.EffectivePartition(input.DesiredSpec.Pacing, rollingUpdate)
-	heldIndices := escalation.PartitionHeldIndices(partition, input, plan.Instances, target.Name)
+	partition := workloadops.EffectivePartition(input.DesiredSpec.Pacing, rollingUpdate)
+	heldIndices := workloadops.PartitionHeldIndices(partition, input, plan.Instances, target.Name)
 	// The window a promoted pod that restarted must serve again before
 	// the roll reads it as serving: minReadySeconds floored by the
 	// stuck-pod grace.
@@ -689,13 +756,31 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 			continue
 		}
 		if notServing, wait, why := workloadops.RolledInstanceNotServing(input.ObservedState.Instance(inst.Index), target.Name, target.CreationTimestamp.Time, updateByInstance[inst.Index], inst.TotalPods(), provenWindow, input.Now()); notServing {
-			selection.RolledNotServing = append(selection.RolledNotServing, inst.Index)
-			logf.FromContext(ctx).V(1).Info("rolled Instance not serving",
-				"component", plan.Component, "instance", inst.Index, "target", target.Name, "reason", why, "wait", wait)
-			// A pod Ready again inside its window raises no watch event
-			// when the window elapses; the pass comes back for it.
-			if wait > 0 {
-				input.PassWake.Observe(wait)
+			// A shortfall of dark pods alone is not the roll's open work:
+			// nothing those pods do lifts it, so the Instance holds no slot.
+			dark, graceLeft := workloadops.RolledInstanceDark(input.ObservedState.Instance(inst.Index), target.Name, target.CreationTimestamp.Time, updateByInstance[inst.Index], inst.TotalPods(), provenWindow, input.StuckPodGrace, input.Now())
+			if dark {
+				logf.FromContext(ctx).V(1).Info("rolled Instance dark: not the roll's open work",
+					"component", plan.Component, "instance", inst.Index, "target", target.Name, "reason", why)
+			} else {
+				selection.RolledNotServing = append(selection.RolledNotServing, inst.Index)
+				if workloadops.RolledInstanceCrashed(input.ObservedState.Instance(inst.Index), target.Name, target.CreationTimestamp.Time, updateByInstance[inst.Index], provenWindow) {
+					selection.CrashedNotServing = append(selection.CrashedNotServing, inst.Index)
+					if !workloadops.RolledSetInRotation(target.Name, updateByInstance[inst.Index], inst.TotalPods()) {
+						selection.CrashedOutOfRotation = append(selection.CrashedOutOfRotation, inst.Index)
+					}
+				}
+				logf.FromContext(ctx).V(1).Info("rolled Instance not serving",
+					"component", plan.Component, "instance", inst.Index, "target", target.Name, "reason", why, "wait", wait, "graceLeft", graceLeft)
+				// Neither a pod Ready again inside its window nor one unready
+				// inside its grace raises a watch event when the window or
+				// the grace elapses; the pass comes back for it.
+				if wait > 0 {
+					input.PassWake.Observe(wait)
+				}
+				if graceLeft > 0 {
+					input.PassWake.Observe(graceLeft)
+				}
 			}
 		}
 		decision := workloadops.EvaluateUpdateTrigger(input, inst, target, updateByInstance[inst.Index])
@@ -756,6 +841,16 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 				return UpdateSelection{}, 0, fmt.Errorf("workload.Reconcile: resolve update mechanism (instance=%d): %w", inst.Index, ferr)
 			}
 			recreateFallback = fallback || workloadops.SurgeHasNoSource(row)
+			// A step that replaces no container cannot restore a pod set dark
+			// on readiness, so such an in-place start runs as a recreate and
+			// is consulted as the drain-first start it is.
+			if !recreateFallback && strategy == types.UpdateStrategyInPlaceIfPossible {
+				running, rerr := snapshot.RunningRevisionPodSpec(ctx, inst.Index)
+				if rerr != nil {
+					return UpdateSelection{}, 0, fmt.Errorf("workload.Reconcile: resolve update mechanism (instance=%d): %w", inst.Index, rerr)
+				}
+				recreateFallback = workloadops.InPlaceCannotRestore(running, input.DesiredSpec.PodSpec, pods, input.Now(), input.StuckPodGrace)
+			}
 		}
 		mechanism := strategy
 		if recreateFallback {
@@ -769,21 +864,23 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 		gateExempt := types.RecreateOfDarkRow(row, mechanism) ||
 			(startingFresh && mechanism != types.UpdateStrategySurgeThenDrain &&
 				row != nil && row.Phase == types.InstancePhaseReady &&
-				(evidence.PodSetServesNothing(pods) || evidence.PodSetUnavailableOnParkedMember(pods, inst.TotalPods())))
-		dark := startingFresh && replacesDarkPodSet(row, pods)
+				(evidence.PodSetServesNothing(pods, input.Now(), input.StuckPodGrace) || evidence.PodSetUnavailableOnParkedMember(pods, inst.TotalPods(), input.Now(), input.StuckPodGrace)))
+		dark := startingFresh && replacesDarkPodSet(input, row, pods)
+		outOfRotation := startingFresh && (dark || evidence.PodSetOutOfRotation(pods))
 		logf.FromContext(ctx).V(1).Info("update selected",
 			"component", plan.Component, "instance", inst.Index, "target", target.Name,
 			"startingFresh", startingFresh, "coordGateExempt", gateExempt, "recreateFallback", recreateFallback,
-			"replacesDarkPodSet", dark)
-		selection.Items = append(selection.Items, UpdateItem{Instance: inst, StartingFresh: startingFresh, CoordGateExempt: gateExempt, ReplacesDarkPodSet: dark, RecreateFallback: recreateFallback})
+			"replacesDarkPodSet", dark, "outOfRotation", outOfRotation)
+		selection.Items = append(selection.Items, UpdateItem{Instance: inst, StartingFresh: startingFresh, CoordGateExempt: gateExempt, ReplacesDarkPodSet: dark, OutOfRotation: outOfRotation, RecreateFallback: recreateFallback})
 	}
-	// A start that replaces a dark Instance restores capacity while every
-	// other start spends it, so the budget is offered to the dark ones
-	// first; within each group plan order stands. The order is all this
+	// A start on an Instance out of rotation restores capacity while every
+	// other start spends it, so the budget is offered to those first, from
+	// the moment the Instance left rotation rather than once its grace has
+	// run; within each group plan order stands. The order is all this
 	// decides: the budgets and the gate admit or deny each start on their
 	// own terms, and the partition has already chosen who is listed.
 	sort.SliceStable(selection.Items, func(i, j int) bool {
-		return selection.Items[i].ReplacesDarkPodSet && !selection.Items[j].ReplacesDarkPodSet
+		return selection.Items[i].OutOfRotation && !selection.Items[j].OutOfRotation
 	})
 	// An extra pod the API still lists holds a surge slot: a Terminating
 	// one until it exits or passes its deletion deadline, which raises no
@@ -810,9 +907,36 @@ func planUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 		"terminatingPods", selection.ExtraPodSurge.Terminating,
 		"liveExtraPods", selection.ExtraPodSurge.Live,
 		"rolledNotServing", selection.RolledNotServing,
+		"crashedNotServing", selection.CrashedNotServing,
+		"crashedOutOfRotation", selection.CrashedOutOfRotation,
 		"retryBlockDenied", selection.RetryBlockDenied)
-	selection.LadderHold = ladderHold(input, target, selection.RolledNotServing)
+	selection.LadderHold = ladderHold(input, target, selection.RolledNotServing, selection.CrashedNotServing, ladderRebuilds(input, plan, target, updateByInstance))
+	selection.StandingHold = standingHold(&selection, target)
 	return selection, retryBlockWait, nil
+}
+
+// ladderRebuilds lists, in plan order, the Instances whose crashed set
+// the target's retry ladder rebuilds in its attempt
+// (workloadops.LadderAttemptRebuilds), for the ladder hold to name.
+func ladderRebuilds(input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, byInstance map[int32][]*corev1.Pod) []int32 {
+	var rebuilds []int32
+	for _, inst := range plan.Instances {
+		if workloadops.LadderAttemptRebuilds(input, plan, inst, target.Name, byInstance[inst.Index]) {
+			rebuilds = append(rebuilds, inst.Index)
+		}
+	}
+	return rebuilds
+}
+
+// updateSelection is the selection the update pass runs this reconcile,
+// nil when none is planned.
+func (d Decision) updateSelection() *UpdateSelection {
+	for _, action := range d.Actions {
+		if action.Kind == ActionUpdate {
+			return action.Update
+		}
+	}
+	return nil
 }
 
 // anyFreshStart reports whether the selection carries a start the pass
@@ -831,11 +955,11 @@ func anyFreshStart(items []UpdateItem) bool {
 // counter types.RecreateOfDarkRow reads), or a pod set provably out of
 // service (evidence.PodSetServesNothing, the reading a Ready row is dark
 // on). Replacing such an Instance takes no capacity out of rotation.
-func replacesDarkPodSet(row *types.InstanceStatus, pods []*corev1.Pod) bool {
+func replacesDarkPodSet(input types.ReconcileInput, row *types.InstanceStatus, pods []*corev1.Pod) bool {
 	if row != nil && row.Phase == types.InstancePhaseFailed && row.ServingPodCount == 0 {
 		return true
 	}
-	return evidence.PodSetServesNothing(pods)
+	return evidence.PodSetServesNothing(pods, input.Now(), input.StuckPodGrace)
 }
 
 // planMigrationDrive selects the migrate pass's work in dispatch order:

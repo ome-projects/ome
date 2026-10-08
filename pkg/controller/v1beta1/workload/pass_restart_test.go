@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -18,13 +20,14 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
+	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
@@ -286,6 +289,208 @@ func TestReconcile_PausedRestart_DoesNotCreateFreshIndices(t *testing.T) {
 	}
 	if s := instanceStatusByIndex(f.client, f.isvc, v1beta1.EngineComponent, 1); s != nil {
 		t.Errorf("paused reconcile must not allocate status for absent index 1; got %+v", s)
+	}
+}
+
+const (
+	repairBesideRollPrior  = "llama-70b-engine-priorrev"
+	repairBesideRollTarget = "llama-70b-engine-newtarget"
+)
+
+// repairBesideRollRows are Instance 0 at Step=Surge on its way to the
+// target and Instance 1 rebuilding on the target under an open repair.
+func repairBesideRollRows(now time.Time) []workloadtypes.InstanceStatus {
+	return []workloadtypes.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: workloadtypes.InstancePhaseUpdating, RunningRevision: repairBesideRollPrior,
+			TargetRevision: repairBesideRollTarget, PodCount: 2, ServingPodCount: 1,
+			Operation: &workloadtypes.InstanceOperation{
+				ID: "update-0", Type: workloadtypes.InstanceOperationUpdate, Step: workloadtypes.UpdateStepSurge,
+				TargetRevision: repairBesideRollTarget, Strategy: workloadtypes.UpdateStrategySurgeThenDrain,
+				StartedAt: metav1.NewTime(now.Add(-40 * time.Minute)), LastProgressAt: metav1.NewTime(now.Add(-40 * time.Minute)),
+				Deadline: metav1.NewTime(now.Add(time.Hour)),
+			}},
+		repairBesideRollRepairRow(now),
+	}
+}
+
+func repairBesideRollRepairRow(now time.Time) workloadtypes.InstanceStatus {
+	return workloadtypes.InstanceStatus{
+		Index: 1, Incarnation: 2, Phase: workloadtypes.InstancePhaseRestarting, RunningRevision: repairBesideRollTarget,
+		Operation: &workloadtypes.InstanceOperation{
+			ID: "restart-1", Type: workloadtypes.InstanceOperationRestart, Step: workloadtypes.RestartStepDrain,
+			StartedAt: metav1.NewTime(now.Add(-30 * time.Minute)), LastProgressAt: metav1.NewTime(now.Add(-30 * time.Minute)),
+		},
+	}
+}
+
+// repairBesideRollRebuiltPod is the repair's rebuilt pod, created at the
+// bumped incarnation and still Pending: nothing has started in it.
+func repairBesideRollRebuiltPod(now time.Time) *corev1.Pod {
+	pod := liveEnginePod("llama-70b", "prod", 1, 0, "newtarget", now.Add(-30*time.Minute))
+	pod.Labels[query.LabelInstanceIncarnation] = "2"
+	return pod
+}
+
+// repairBesideRollFixture is the Component the two rows describe, with
+// Instance 0's source serving and the replacement and rebuilt pods given.
+func repairBesideRollFixture(t *testing.T, now time.Time, maxSurge, maxUnavailable int, rows []workloadtypes.InstanceStatus, pods ...*corev1.Pod) *terminatingSurgeFixture {
+	t.Helper()
+	planned := make([]int32, 0, len(rows))
+	for _, row := range rows {
+		planned = append(planned, row.Index)
+	}
+	f := newTerminatingSurgeFixture(t, rows, planned, []int32{0}, pods...)
+	f.in.DesiredSpec.Replicas = int32(len(rows))
+	f.plan.Replicas = int32(len(rows))
+	f.plan.RestartPolicy = workloadtypes.RestartPolicyRecreateInstance
+	f.plan.UpdateStrategy.RollingUpdate = &workloadtypes.RollingUpdate{MaxSurge: intOrStringInt(maxSurge), MaxUnavailable: intOrStringInt(maxUnavailable)}
+	for i := range f.plan.Instances {
+		if row := f.in.ObservedState.Instance(f.plan.Instances[i].Index); row != nil {
+			f.plan.Instances[i].Incarnation = row.Incarnation
+		}
+	}
+	f.in.DrainHolds = &workloadtypes.DrainHolds{}
+	return f
+}
+
+// An open repair whose rebuilt pod has not started consumes the pass, and
+// the update attempts already in flight on other Instances still advance
+// in it, under the rules a full pass applies: a ContainersReady
+// replacement gets its serving gate, one past the promote bar takes its
+// source out of rotation, and an Instance rebuilding on the target holds
+// the floor like any rolled Instance that does not serve it.
+func TestReconcile_RepairInFlight_UpdateAttemptsInFlightAdvance(t *testing.T) {
+	cases := []struct {
+		name string
+		// promotable has the replacement Ready and serving since before the
+		// pass, past the promote bar; otherwise it is ContainersReady only.
+		promotable     bool
+		maxUnavailable int
+		wantStep       string
+		wantSourceOut  bool
+		wantFloorHold  bool
+	}{
+		{name: "a ContainersReady replacement gets its serving gate", wantStep: workloadtypes.UpdateStepSurge},
+		{name: "a replacement past the promote bar takes its source out of rotation", promotable: true, maxUnavailable: 1,
+			wantStep: workloadtypes.UpdateStepSurgeDrain, wantSourceOut: true},
+		{name: "the Instance under repair holds the floor and the source stays in rotation", promotable: true,
+			wantStep: workloadtypes.UpdateStepSurge, wantFloorHold: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			replacement := liveEnginePod("llama-70b", "prod", 0, 1, "newtarget", now.Add(-40*time.Minute))
+			replacement.Status.Phase = corev1.PodRunning
+			replacement.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: constants.MainContainerName, Ready: true,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now.Add(-30 * time.Minute))}},
+			}}
+			replacement.Status.Conditions = []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now.Add(-10 * time.Minute))},
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ReadinessGatesNotReady", LastTransitionTime: metav1.NewTime(now.Add(-10 * time.Minute))},
+			}
+			if tc.promotable {
+				servingSince(replacement, now.Add(-4*time.Minute))
+			}
+			rebuilt := repairBesideRollRebuiltPod(now)
+			f := repairBesideRollFixture(t, now, 1, tc.maxUnavailable, repairBesideRollRows(now), replacement, rebuilt)
+			var asked [][]string
+			f.in.DrainGate = func(sourcePods []string) (bool, workloadtypes.RolloutHoldGate, string) {
+				asked = append(asked, sourcePods)
+				return true, "", ""
+			}
+
+			if res := f.pass(); res.RequeueAfter == 0 && !res.Requeue { //nolint:staticcheck // the bare backoff has no non-deprecated spelling
+				t.Fatalf("a pass with a repair and an update in flight must ask for another; got %+v", res)
+			}
+
+			read := func(pod *corev1.Pod) *corev1.Pod {
+				t.Helper()
+				stored := &corev1.Pod{}
+				if err := f.c.Get(context.Background(), client.ObjectKeyFromObject(pod), stored); err != nil {
+					t.Fatalf("get %s: %v", pod.Name, err)
+				}
+				return stored
+			}
+			if !podreadiness.IsServing(read(replacement)) {
+				t.Fatalf("the ContainersReady replacement %s must carry %s while Instance 1's repair is open", replacement.Name, query.ServingConditionType)
+			}
+			if row := f.in.ObservedState.Instance(0); row == nil || row.Operation == nil || row.Operation.Step != tc.wantStep {
+				t.Fatalf("Instance 0 must be at Step=%s, got %+v", tc.wantStep, row)
+			}
+			// A drained source is deleted in the pass that drains it.
+			source := &corev1.Pod{}
+			err := f.c.Get(context.Background(), client.ObjectKeyFromObject(servingEnginePod(0)), source)
+			if err != nil && !apierrors.IsNotFound(err) {
+				t.Fatalf("get the source: %v", err)
+			}
+			if sourceOut := err != nil || !podreadiness.IsServing(source); sourceOut != tc.wantSourceOut {
+				t.Fatalf("source out of rotation = %v, want %v", sourceOut, tc.wantSourceOut)
+			}
+			if tc.wantSourceOut && len(asked) != 1 {
+				t.Fatalf("the drain gate must be consulted once with the source, got %v", asked)
+			}
+			if tc.wantFloorHold {
+				if len(asked) != 0 {
+					t.Fatalf("the drain gate was consulted below the floor: %v", asked)
+				}
+				hold := f.lastHold()
+				if hold == nil || hold.Gate != workloadtypes.RolloutHoldGateBudget || !strings.Contains(hold.Reason, "no source leaves rotation") || !holdNamesInstance(hold, 1) {
+					t.Fatalf("the Component must report the floor's Budget hold naming Instance 1, got %+v", hold)
+				}
+			}
+			if row := f.in.ObservedState.Instance(1); row == nil || row.Phase != workloadtypes.InstancePhaseRestarting || row.Incarnation != 2 {
+				t.Fatalf("Instance 1's repair must stay open at incarnation 2, got %+v", row)
+			}
+			if pod := read(rebuilt); podreadiness.IsServing(pod) {
+				t.Fatalf("the repair's rebuilt pod %s must not serve before it starts", pod.Name)
+			}
+		})
+	}
+}
+
+// A pass an open repair consumes begins no update: the fresh start the
+// budget would admit on a full pass, as the control shows, waits until no
+// repair consumes the pass.
+func TestReconcile_RepairInFlight_StartsNoFreshUpdate(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		repairing bool
+	}{
+		{name: "control: no repair open, the start opens"},
+		{name: "a repair open, no start opens", repairing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			rows := []workloadtypes.InstanceStatus{
+				{Index: 0, Incarnation: 1, Phase: workloadtypes.InstancePhaseReady, RunningRevision: repairBesideRollPrior,
+					ReadySince: &metav1.Time{Time: now.Add(-time.Hour)}, PodCount: 1, ServingPodCount: 1},
+			}
+			var pod1 *corev1.Pod
+			if tc.repairing {
+				rows = append(rows, repairBesideRollRepairRow(now))
+				pod1 = repairBesideRollRebuiltPod(now)
+			} else {
+				rows = append(rows, workloadtypes.InstanceStatus{Index: 1, Incarnation: 1, Phase: workloadtypes.InstancePhaseReady,
+					RunningRevision: repairBesideRollTarget, ReadySince: &metav1.Time{Time: now.Add(-time.Hour)}, PodCount: 1, ServingPodCount: 1})
+				pod1 = servingEnginePod(1)
+				pod1.Labels[query.LabelRevisionHash] = "newtarget"
+			}
+			f := repairBesideRollFixture(t, now, 2, 1, rows, pod1)
+
+			f.pass()
+
+			row := f.in.ObservedState.Instance(0)
+			started := row != nil && row.Operation != nil && row.Operation.Type == workloadtypes.InstanceOperationUpdate
+			replacement := query.PodName("llama-70b", workloadtypes.ComponentEngine, 0, "default", 1)
+			created := slices.Contains(f.listedPods(), replacement)
+			if tc.repairing && (started || created) {
+				t.Fatalf("a pass the repair consumed began an update on Instance 0: row %+v, pods %v", row, f.listedPods())
+			}
+			if !tc.repairing && (!started || !created) {
+				t.Fatalf("the control pass must start the update on Instance 0: row %+v, pods %v", row, f.listedPods())
+			}
+		})
 	}
 }
 
@@ -875,6 +1080,95 @@ func newRestartHarness(t *testing.T, replicas int32) *recoveryHarness {
 	return h
 }
 
+// recoverySecondGate is the second readiness gate the gated stories declare
+// on the template beside the serving gate: one another controller owns.
+const recoverySecondGate corev1.PodConditionType = "example.com/load-balancer"
+
+// newGatedRestartHarness is newRestartHarness with the template declaring
+// recoverySecondGate, an attempt deadline short enough for a repair that
+// cannot finish to meet it inside the story, and the multi-pod shape on
+// request. The kubelet model satisfies the gate on the initial pods, so
+// the Component converges Ready before the story acts.
+func newGatedRestartHarness(t *testing.T, multiPod bool) *recoveryHarness {
+	t.Helper()
+	h := newRecoveryHarness(t, multiPod)
+	policy := workloadtypes.RestartPolicyRecreateInstance
+	h.lifecycle = workloadtypes.Lifecycle{
+		RestartPolicy:        &policy,
+		InstanceReadyTimeout: &metav1.Duration{Duration: 6 * recoveryStepFloor},
+	}
+	h.readinessGate = recoverySecondGate
+	h.revV1 = h.ensureRevision(h.podSpec(goodImage))
+	h.setTarget(h.revV1, goodImage)
+	if !h.run(40, func() bool { return h.settledOn(h.revV1, 1) }) {
+		h.dumpState("initial create")
+		t.Fatalf("initial create never settled on v1 behind a second readiness gate")
+	}
+	return h
+}
+
+// A repaired pod comes up, passes its probes and receives the serving gate,
+// but a second readiness gate it declares is never satisfied, so Ready
+// never follows and the promote bar never clears. The Instance serves
+// nothing, so the operation deadline is what ends the repair: Failed with
+// the Restart preserved and the unsatisfied gate named. The gang form holds
+// the gate on one member only.
+func TestRestart_RebuiltPodGateWrittenButNeverReady_FailsAtTheDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		multiPod   bool
+		heldRunner string
+	}{
+		{"single pod", false, ""},
+		{"gang with one member never Ready", true, "worker"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newGatedRestartHarness(t, tc.multiPod)
+			h.gateHeldSince = h.clk.Now()
+			h.gateHeldRunner = tc.heldRunner
+			h.losePods(0)
+
+			// The shape under test: every held member of the rebuilt set is
+			// ContainersReady with the serving gate written and Ready withheld.
+			gateWrittenNeverReady := func() bool {
+				held := 0
+				for _, pod := range h.podsOf(0) {
+					if !h.gateHeld(pod) {
+						continue
+					}
+					held++
+					if !podreadiness.IsContainersReady(pod) || !podreadiness.IsServing(pod) || podreadiness.IsPodReady(pod) {
+						return false
+					}
+				}
+				return held > 0
+			}
+			if !h.run(20, gateWrittenNeverReady) {
+				h.dumpState("rebuild")
+				t.Fatalf("the rebuilt pod never reached ContainersReady with the serving gate written and Ready withheld")
+			}
+			if !h.run(40, func() bool { return parkedRepair(h, 0) }) {
+				h.dumpState("deadline")
+				phase := workloadtypes.InstancePhase("")
+				if s := h.instance(0); s != nil {
+					phase = s.Phase
+				}
+				t.Fatalf("the repair outlived its deadline: the row stayed %q with the Instance serving nothing", phase)
+			}
+			got := h.instance(0)
+			if got.LastFailure == nil || got.LastFailure.Reason != evidence.ReasonReadinessGateNotSatisfied {
+				t.Fatalf("LastFailure: got %+v want reason %q", got.LastFailure, evidence.ReasonReadinessGateNotSatisfied)
+			}
+			if !strings.Contains(got.LastFailure.Message, string(recoverySecondGate)) {
+				t.Errorf("LastFailure.Message: got %q want the gate %q named", got.LastFailure.Message, recoverySecondGate)
+			}
+			if tc.heldRunner != "" && !strings.Contains(got.LastFailure.PodName, tc.heldRunner) {
+				t.Errorf("LastFailure.PodName: got %q want the %s member", got.LastFailure.PodName, tc.heldRunner)
+			}
+		})
+	}
+}
+
 // crashForm names how the old-revision Instance breaks: its pod dies at
 // every start and is never Ready again, its pod dies after it is up and
 // keeps coming back between crashes, or a gang loses a member outright.
@@ -1074,6 +1368,16 @@ func assertNoRepairHeld(t *testing.T, rec *record.FakeRecorder) {
 // counts the calls.
 func planHoldGate(consults *int) func(workloadtypes.UpdateStrategyType, int32, int32) (bool, workloadtypes.RolloutHoldGate, string) {
 	return func(workloadtypes.UpdateStrategyType, int32, int32) (bool, workloadtypes.RolloutHoldGate, string) {
+		*consults++
+		return false, workloadtypes.RolloutHoldGate(v1beta1.RolloutHoldGatePlan), "rollout plan not pinned: no active run for this rollout group"
+	}
+}
+
+// unpinnedPlanGate stands in for the plan seam of a rollout group with no
+// run pinned: every fresh start is held on the pin. consults counts the
+// calls.
+func unpinnedPlanGate(consults *int) func() (bool, workloadtypes.RolloutHoldGate, string) {
+	return func() (bool, workloadtypes.RolloutHoldGate, string) {
 		*consults++
 		return false, workloadtypes.RolloutHoldGate(v1beta1.RolloutHoldGatePlan), "rollout plan not pinned: no active run for this rollout group"
 	}
@@ -1860,7 +2164,8 @@ func TestSpentRepair_ResetMailboxStillRebuilds(t *testing.T) {
 // A revision Held after its retry budget is spent stays Held when the
 // cause of its failures clears: only a new revision or the release
 // mailbox admits another attempt at it. The Instance keeps serving the
-// revision it ran.
+// revision it ran through the source alone, and the row stays Failed:
+// the healed wreckage of the last attempt is no attempt's to promote.
 func TestHeldRevision_StaysHeldWhenItsCauseHeals(t *testing.T) {
 	h := newRecoveryHarness(t, false)
 	h.driveToReadyOnV1()
@@ -1875,9 +2180,13 @@ func TestHeldRevision_StaysHeldWhenItsCauseHeals(t *testing.T) {
 	if b := h.findBlock(h.revBad.Name); b == nil || b.State != workloadtypes.RetryBlockHeld {
 		t.Fatalf("block = %+v, want Held: a healed cause releases nothing on its own", b)
 	}
-	if s := h.instance(0); s == nil || s.Phase != workloadtypes.InstancePhaseReady || s.Operation != nil || s.RunningRevision != h.revV1.Name {
+	if s := h.instance(0); s == nil || s.Phase != workloadtypes.InstancePhaseFailed || s.Operation != nil || s.RunningRevision != h.revV1.Name {
 		h.dumpState("held")
-		t.Fatalf("the Instance must keep serving v1 while the revision is Held: %+v", s)
+		t.Fatalf("the Instance stays Failed on v1 while the revision is Held: %+v", s)
+	}
+	if serving := h.servingPods(); len(serving) != 1 || serving[0].Spec.Containers[0].Image != goodImage {
+		h.dumpState("held")
+		t.Fatalf("the v1 source alone serves while the revision is Held, got %d serving pod(s)", len(serving))
 	}
 	if got := len(h.badPods()); got > badPodsBefore {
 		h.dumpState("held")
@@ -2129,6 +2438,143 @@ func TestReconcile_OpenRepair_TargetMovesAfterThePodsExist(t *testing.T) {
 	}
 }
 
+// TestReconcile_PushedGangCrashesAfterPromotion_RollbackLandsOnItsRepair:
+// two leader+worker gangs are pushed under InPlaceIfPossible maxUnavailable
+// 1 (a gang's in-place update is a recreate) under the gang's default
+// restart policy, and both promote onto the pushed revision before the
+// first gang's leader dies once after promotion. The policy's repair opens
+// and deletes the set, and the push is rolled back to the starting
+// revision while the repair is open: before the rebuild has created a
+// pod, or once its pods exist. Either way no pod of the withdrawn revision
+// is created after the rollback and both gangs settle on the starting
+// revision with the one repair on record. Before the first create the
+// rebuild itself renders the starting revision and records it on the
+// row; once the pods exist the repair finishes on the revision they carry
+// and the roll replaces the gang from Ready.
+func TestReconcile_PushedGangCrashesAfterPromotion_RollbackLandsOnItsRepair(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		podsExist bool
+	}{
+		{name: "before the rebuild creates a pod"},
+		{name: "once the rebuild's pods exist", podsExist: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const replicas = int32(2)
+			h := newRecoveryHarnessFor(t, true, constants.MainContainerName)
+			h.recorder = record.NewFakeRecorder(256)
+			h.replicas = replicas
+			// Only the leader dies, once, after serving long enough for the
+			// roll to land the second gang first and well inside the crash
+			// window.
+			h.crashLeaderOnly = true
+			h.crashAfterServed = 6
+			h.stuckGrace = 10 * time.Minute
+			h.stepFloor = 5 * time.Second
+			h.stepCap = h.stepFloor
+			h.kubeletLag = time.Second
+			maxSurge, maxUnavailable := intstr.FromInt32(0), intstr.FromInt32(1)
+			h.lifecycle.UpdateStrategy = &workloadtypes.UpdateStrategy{
+				Type:          workloadtypes.UpdateStrategyInPlaceIfPossible,
+				RollingUpdate: &workloadtypes.RollingUpdate{MaxSurge: &maxSurge, MaxUnavailable: &maxUnavailable},
+			}
+			h.setTarget(h.revV1, goodImage)
+			if !h.run(60, func() bool { return h.settledOn(h.revV1, replicas) }) {
+				h.dumpState("initial create")
+				t.Fatalf("initial create never settled on v1 for %d gangs", replicas)
+			}
+
+			revPushed := h.crashRevision(crashOnceAfterServingImage)
+			if !h.run(80, func() bool { return h.settledOn(revPushed, replicas) }) {
+				h.dumpState("push")
+				t.Fatalf("the push never landed on both gangs")
+			}
+			if len(h.crashedInstances) > 0 {
+				h.dumpState("early crash")
+				t.Fatalf("a promoted leader died before the roll completed; the story needs a completed roll")
+			}
+			incarnationAtPush := map[int32]int64{}
+			for _, s := range h.irStatuses() {
+				incarnationAtPush[s.Index] = s.Incarnation
+			}
+			h.events = nil
+
+			victim := int32(-1)
+			repairOpen := func() bool {
+				for _, s := range h.irStatuses() {
+					if s.Phase == workloadtypes.InstancePhaseRestarting && s.RunningRevision == revPushed.Name {
+						victim = s.Index
+						return true
+					}
+				}
+				return false
+			}
+			moment := func() bool {
+				if !repairOpen() {
+					return false
+				}
+				if tc.podsExist {
+					return len(h.podsOf(victim)) == len(h.desired.Runners)
+				}
+				return len(h.podsOf(victim)) == 0
+			}
+			if !h.run(60, moment) {
+				h.dumpState("repair")
+				t.Fatalf("no repair of a promoted gang whose leader died reached the moment the story rolls back at")
+			}
+			pushedHash := query.RevisionOf(revPushed).Hash()
+			alive := map[types.UID]struct{}{}
+			for _, pod := range h.livePods() {
+				if pod.Labels[query.LabelRevisionHash] == pushedHash {
+					alive[pod.UID] = struct{}{}
+				}
+			}
+
+			h.setTarget(h.revV1, goodImage)
+			noWithdrawnPodAfter := func() {
+				for _, pod := range h.livePods() {
+					if pod.Labels[query.LabelRevisionHash] != pushedHash {
+						continue
+					}
+					if _, ok := alive[pod.UID]; !ok {
+						h.dumpState("withdrawn revision rebuilt")
+						t.Fatalf("pod %s was created on the withdrawn revision after the rollback", pod.Name)
+					}
+				}
+			}
+			if tc.podsExist {
+				if !h.runWithInvariant(20, func() bool { return h.repairedAbove(victim, incarnationAtPush[victim]) }, noWithdrawnPodAfter) {
+					h.dumpState("open repair after the rollback")
+					t.Fatalf("the repair did not finish on the pods it had created")
+				}
+				if s := h.instance(victim); s.RunningRevision != revPushed.Name {
+					t.Fatalf("repaired row records %q, want %s: the repair finishes on the revision its pods carry", s.RunningRevision, revPushed.Name)
+				}
+			} else {
+				rebuilt := func() bool { return len(h.podsOf(victim)) == len(h.desired.Runners) }
+				if !h.runWithInvariant(20, rebuilt, noWithdrawnPodAfter) {
+					h.dumpState("rebuild after the rollback")
+					t.Fatalf("the rebuild never created the gang's pods after the rollback")
+				}
+				if s := h.instance(victim); s.RunningRevision != h.revV1.Name {
+					t.Fatalf("rebuilding row records %q, want %s: a rebuild that created no pod yet renders the roll target", s.RunningRevision, h.revV1.Name)
+				}
+				h.requirePodsRender(victim, h.revV1, goodImage)
+			}
+			if !h.runWithInvariant(120, func() bool { return h.settledOn(h.revV1, replicas) }, noWithdrawnPodAfter) {
+				h.dumpState("after the rollback")
+				t.Fatalf("the gangs never settled back on the starting revision")
+			}
+			for _, s := range h.irStatuses() {
+				h.requirePodsRender(s.Index, h.revV1, goodImage)
+			}
+			if n := h.restartsRecorded(); n != 1 {
+				t.Fatalf("restarts recorded = %d, want exactly the repair that was already open: %v", n, h.events)
+			}
+		})
+	}
+}
+
 // TestReconcile_OpenRepair_PeersStayInRotationWhileTheTargetMoves: three
 // Instances, the repair of one has rebuilt its pod set and that set is still
 // starting when the target moves. The open repair owns the Component's
@@ -2160,7 +2606,7 @@ func TestReconcile_OpenRepair_PeersStayInRotationWhileTheTargetMoves(t *testing.
 				}
 				// The rebuilt pod stays in its startup window for as long as
 				// the story needs: the readiness it is held on is lifted below.
-				rebuilt := h.podsOf(victim)[0].Name
+				rebuilt := h.podsOf(victim)[0].UID
 				h.readinessFails[rebuilt] = true
 
 				h.setTarget(h.revFixed, fixedImage)
@@ -3701,5 +4147,337 @@ func TestDeadlineElapsesOnAWedgedRebuild_RepairParksWithItsPodSet(t *testing.T) 
 	}
 	if got := h.instance(0); got.Incarnation != parked.Incarnation+1 {
 		t.Errorf("incarnation = %d, want %d: one rebuild on the ladder", got.Incarnation, parked.Incarnation+1)
+	}
+}
+
+// A repair's drain deletes the old pod and the node under it then stops
+// reporting, with no force-delete policy configured. The pod stays
+// Terminating past its own deletion deadline: no kubelet is left to remove
+// it, no policy lets the sweep free it, and the stable name it holds keeps
+// the rebuild from running. The operation deadline is this state's single
+// exit, so the repair parks visibly at Failed with its Restart kept, the
+// elapsed deadline on LastFailure and one InstanceFailed warning. A single pod's park
+// holds, the close waiting on the object; a gang short of its other member
+// re-arms through the lost-member trigger under a fresh deadline, which
+// blocks on the same held name. Either way the Instance serves again once
+// its kubelet returns and the object goes.
+func TestRepairDrainStuckTerminatingOnADeadNode_ParksAtTheDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gang bool
+		pods int
+	}{
+		{name: "single pod", pods: 1},
+		{name: "gang, the leader's node stops", gang: true, pods: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRecoveryHarnessFor(t, tc.gang, constants.MainContainerName)
+			h.recorder = record.NewFakeRecorder(256)
+			policy := workloadtypes.RestartPolicyRecreateInstance
+			h.lifecycle = workloadtypes.Lifecycle{
+				RestartPolicy:        &policy,
+				InstanceReadyTimeout: &metav1.Duration{Duration: 4 * recoveryStepFloor},
+			}
+			// Only the deadline ends the attempt: the fast escalation is off
+			// and no ladder re-arms a park. A deleted pod takes a step to
+			// terminate, and no force-delete policy is configured.
+			h.stuckGrace = 0
+			h.retryPolicy = nil
+			h.podGrace = recoveryStepFloor
+			h.forceDelete = nil
+			h.useNodes("node-a", "node-b", "node-c")
+			h.setTarget(h.revV1, goodImage)
+			if !h.run(30, func() bool { return h.settledOn(h.revV1, 1) }) {
+				h.dumpState("initial create")
+				t.Fatalf("the Instance never settled on v1")
+			}
+			before := h.instance(0).Incarnation
+
+			// A serving runner killed once after Ready opens the repair,
+			// whose drain deletes the set.
+			var victim *corev1.Pod
+			for _, pod := range h.podsOf(0) {
+				if !tc.gang || pod.Labels[query.LabelRunner] == "leader" {
+					victim = pod
+				}
+			}
+			if victim == nil {
+				t.Fatalf("no pod of Instance 0 to kill")
+			}
+			h.killRunnerOnce(victim)
+			if !h.run(10, func() bool { return stillTerminating(h, 0) }) {
+				h.dumpState("drain")
+				t.Fatalf("the repair's drain never deleted the old pod (events=%v)", h.events)
+			}
+			opened := h.instance(0)
+			if opened.Phase != workloadtypes.InstancePhaseRestarting || opened.Operation == nil || opened.Operation.Type != workloadtypes.InstanceOperationRestart {
+				t.Fatalf("the kill opened no repair: %+v", *opened)
+			}
+
+			// The node under the deleted pod stops reporting before its
+			// kubelet finishes the termination: the object stays.
+			node := ""
+			for _, pod := range podObjectsOf(h, 0) {
+				if pod.Name == victim.Name && pod.DeletionTimestamp != nil {
+					node = pod.Spec.NodeName
+				}
+			}
+			if node == "" {
+				t.Fatalf("the killed pod %s is not Terminating on a node", victim.Name)
+			}
+			h.failNode(node)
+
+			heldDark := func() {
+				if h.sawEvent(workloadtypes.EventReasonPodForceDeleted) {
+					t.Fatalf("a pod was force-deleted with no policy configured (events=%v)", h.events)
+				}
+				if !stillTerminating(h, 0) {
+					h.dumpState("object gone")
+					t.Fatalf("the old pod left while its kubelet was stopped")
+				}
+				if n := len(h.podsOf(0)); n != 0 {
+					h.dumpState("rebuilt")
+					t.Fatalf("%d pod(s) rebuilt under a name the Terminating pod still holds", n)
+				}
+			}
+			parked := func() bool { return parkedRepair(h, 0) }
+			h.runWithInvariant(12, parked, heldDark)
+			got := h.instance(0)
+			if !parked() {
+				h.dumpState("past the deadline")
+				t.Fatalf("Instance 0 reads %s %v past the deadline of its repair with the old pod stuck Terminating: the row was left with no exit (events=%v)",
+					got.Phase, h.clk.Now().Sub(opened.Operation.Deadline.Time).Round(time.Second), h.events)
+			}
+			if got.LastFailure == nil || got.LastFailure.Reason != escalation.DeadlineExceededReason {
+				t.Fatalf("the park records %+v, want the elapsed deadline", got.LastFailure)
+			}
+			if got.Incarnation <= before {
+				t.Fatalf("the park holds incarnation %d, want the repair's, above %d", got.Incarnation, before)
+			}
+			if len(h.failedWarnings) != 1 {
+				t.Fatalf("InstanceFailed warnings = %v, want exactly one for the park", h.failedWarnings)
+			}
+			if tc.gang {
+				// The worker is gone and the Terminating leader counts as a
+				// survivor, so the lost-member trigger re-arms the gang under a
+				// fresh deadline; the name stays held, so nothing is rebuilt.
+				rearmed := func() bool {
+					s := h.instance(0)
+					return s != nil && s.Phase == workloadtypes.InstancePhaseRestarting && s.Incarnation > got.Incarnation
+				}
+				if !h.runWithInvariant(3, rearmed, heldDark) {
+					h.dumpState("re-arm")
+					t.Fatalf("the parked gang never re-armed through the lost-member trigger (events=%v)", h.events)
+				}
+				if n := h.restartsRecorded(); n != 2 {
+					t.Fatalf("RestartTriggered events = %d, want 2: the repair and its re-arm", n)
+				}
+				// The kubelet returns and finishes the termination: the drain
+				// completes on the absence and the gang is rebuilt as a whole.
+				h.recoverNode(node)
+				if !h.run(spentRepairExitPasses, func() bool { return servingReady(h, 0, tc.pods) }) {
+					h.dumpState("exit")
+					t.Fatalf("the Instance never served again after its node returned (events=%v)", h.events)
+				}
+				return
+			}
+			// Parked, the row stays put and the name stays held: nothing is
+			// rebuilt and nothing is said twice.
+			for i := 0; i < 3; i++ {
+				h.step()
+				heldDark()
+			}
+			if s := h.instance(0); !parkedRepair(h, 0) || len(h.failedWarnings) != 1 {
+				t.Fatalf("the park did not hold: %+v (warnings=%v)", *s, h.failedWarnings)
+			}
+
+			// The kubelet returns and finishes the termination: no live pod
+			// is left, so the spent repair closes and the Create pass rebuilds
+			// the row as a fresh start under the row's incarnation.
+			parkedKeys := podKeys(h.podsOf(0))
+			h.recoverNode(node)
+			assertFreshStartServes(t, h, got, parkedKeys, tc.pods, 1)
+		})
+	}
+}
+
+// missingKeyReason is the kubelet's waiting reason for a container whose
+// ConfigMap key is gone; the kubelet retries the start in place.
+const missingKeyReason = "CreateContainerConfigError"
+
+// missingKeyShapes are the Instance shapes a missing key is read under:
+// one pod, or a gang whose leader alone reads it.
+var missingKeyShapes = []struct {
+	name   string
+	gang   bool
+	runner string
+	pods   int
+}{
+	{"single pod", false, "", 1},
+	{"gang, the leader reads the key", true, "leader", 2},
+}
+
+// missingKeyHarness is replicas Instances settled on v1 under restart
+// policy None with no retry ladder, and the missing key armed: every pod
+// of runner created from now on waits on it (every pod when runner is
+// empty) and starts once it is back.
+func missingKeyHarness(t *testing.T, gang bool, runner string, replicas int32) *recoveryHarness {
+	t.Helper()
+	h := newRecoveryHarness(t, gang)
+	h.recorder = record.NewFakeRecorder(256)
+	h.retryPolicy = nil
+	none := workloadtypes.RestartPolicyNone
+	h.lifecycle = workloadtypes.Lifecycle{RestartPolicy: &none}
+	h.replicas = replicas
+	h.setTarget(h.revV1, goodImage)
+	if !h.run(40, func() bool { return h.settledOn(h.revV1, replicas) }) {
+		h.dumpState("initial create")
+		t.Fatalf("%d instances never settled on v1", replicas)
+	}
+	h.armWedge(missingKeyReason, false)
+	h.wedgeRunner = runner
+	return h
+}
+
+// waitingOn is the waiting reason of the pod's first container, "" when
+// it is not waiting.
+func waitingOn(pod *corev1.Pod) string {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil {
+			return cs.State.Waiting.Reason
+		}
+	}
+	return ""
+}
+
+// requireWaitsOnMissingKey checks the shape of a Failed row waiting on
+// the key: pods live pods, the key-reading runner's pod waiting on it and
+// named by the failure record with the kubelet's reason, every other
+// member running.
+func requireWaitsOnMissingKey(t *testing.T, h *recoveryHarness, idx int32, runner string, pods int) {
+	t.Helper()
+	row := h.instance(idx)
+	if row == nil || row.Phase != workloadtypes.InstancePhaseFailed {
+		t.Fatalf("instance %d = %+v, want Failed", idx, row)
+	}
+	if got := len(h.podsOf(idx)); got != pods {
+		h.dumpState("pod set")
+		t.Fatalf("instance %d has %d live pods, want %d", idx, got, pods)
+	}
+	reader := h.podOf(idx, runner)
+	if got := waitingOn(reader); got != missingKeyReason {
+		t.Fatalf("pod %s waits on %q, want %s", reader.Name, got, missingKeyReason)
+	}
+	for _, pod := range h.podsOf(idx) {
+		if pod.Name != reader.Name && waitingOn(pod) != "" {
+			t.Fatalf("pod %s waits on %q, want it running: it reads no key", pod.Name, waitingOn(pod))
+		}
+	}
+	if row.LastFailure == nil || row.LastFailure.Reason != missingKeyReason || row.LastFailure.PodName != reader.Name {
+		t.Fatalf("instance %d lastFailure = %+v, want it naming pod %s and %s", idx, row.LastFailure, reader.Name, missingKeyReason)
+	}
+}
+
+// A settled Instance whose key-reading pod loses its ConfigMap key under
+// restart policy None, single pod and leader+worker gang alike. The
+// stuck-pod repair opens whatever the policy says and rebuilds the set
+// once; the rebuilt key-reading pod waits on the same key, so the row
+// parks Failed with its Restart kept and its failure record naming that
+// pod, the kubelet's reason and what the park waits for. Nothing re-arms:
+// the set stays where the kubelet retries it, the incarnation holds, and
+// the warning fires once.
+func TestMissingKey_RepairUnderPolicyNone_ParksNamingTheWaitingPod(t *testing.T) {
+	for _, tc := range missingKeyShapes {
+		t.Run(tc.name, func(t *testing.T) {
+			h := missingKeyHarness(t, tc.gang, tc.runner, 1)
+			before := h.instance(0).Incarnation
+			h.wedgePod(h.podOf(0, tc.runner), missingKeyReason)
+			if !h.run(40, func() bool { return parkedRepair(h, 0) }) {
+				h.dumpState("park")
+				t.Fatalf("the repair never parked at Failed with its Restart kept")
+			}
+			parked := h.instance(0)
+			if parked.Incarnation != before+1 {
+				t.Fatalf("incarnation = %d, want %d: one rebuild under the repair", parked.Incarnation, before+1)
+			}
+			requireWaitsOnMissingKey(t, h, 0, tc.runner, tc.pods)
+			if !h.atIncarnation(0, parked.Incarnation) {
+				t.Fatalf("the parked set is not the rebuild at incarnation %d", parked.Incarnation)
+			}
+			parkedPods := podKeys(h.podsOf(0))
+
+			noted := func() bool {
+				row := h.instance(0)
+				return row.LastFailure != nil && strings.Contains(row.LastFailure.Message, workloadops.RepairWaitingNote)
+			}
+			if !h.run(10, noted) {
+				t.Fatalf("lastFailure.message = %q, want it to say what the park waits for", h.instance(0).LastFailure.Message)
+			}
+			h.settle(20)
+			got := h.instance(0)
+			if !parkedRepair(h, 0) || got.Incarnation != parked.Incarnation || got.Operation.ID != parked.Operation.ID {
+				h.dumpState("re-arm")
+				t.Fatalf("the park moved: %+v, want the repair kept as parked", got)
+			}
+			if keys := podKeys(h.podsOf(0)); keys != parkedPods {
+				t.Errorf("pods changed under the park: %s, want %s", keys, parkedPods)
+			}
+			if n := eventCount(h, string(workloadtypes.EventReasonRestartTriggered)); n != 1 {
+				t.Errorf("RestartTriggered events = %d, want exactly 1: the repair opened once and never re-armed", n)
+			}
+			if n := eventCount(h, string(workloadtypes.EventReasonRepairWaitingOnWorkload)); n != 1 {
+				t.Errorf("RepairWaitingOnWorkload events = %d, want exactly 1", n)
+			}
+		})
+	}
+}
+
+// A scale-up by one beside that park. The new Instance is rendered from
+// the same runner, so its key-reading pod waits on the same key; once it
+// has sat past the stuck-pod grace the Create attempt is disposed: the
+// row reads Failed with no operation and its failure record naming the
+// waiting pod and the kubelet's reason, the revision is held, and the pod
+// set stays where the kubelet retries it. The parked Instance keeps its
+// park and the healthy Instance keeps its pods.
+func TestMissingKey_ScaleUpBesideTheParkedRepair_NewInstanceWaitsOnTheKey(t *testing.T) {
+	for _, tc := range missingKeyShapes {
+		t.Run(tc.name, func(t *testing.T) {
+			h := missingKeyHarness(t, tc.gang, tc.runner, 2)
+			h.wedgePod(h.podOf(0, tc.runner), missingKeyReason)
+			if !h.run(40, func() bool { return parkedRepair(h, 0) }) {
+				h.dumpState("park")
+				t.Fatalf("the repair never parked at Failed with its Restart kept")
+			}
+			parked, healthy := h.instance(0), h.instanceIdentity(1)
+
+			h.replicas = 3
+			h.setTarget(h.revV1, goodImage)
+			disposed := func() bool {
+				row := h.instance(2)
+				return row != nil && row.Phase == workloadtypes.InstancePhaseFailed && row.Operation == nil
+			}
+			if !h.run(40, disposed) {
+				h.dumpState("scale-up")
+				t.Fatalf("the new Instance never read Failed with its Create disposed")
+			}
+			requireWaitsOnMissingKey(t, h, 2, tc.runner, tc.pods)
+			newPods := podKeys(h.podsOf(2))
+			if block := h.findBlock(h.revV1.Name); block == nil || block.State != workloadtypes.RetryBlockHeld {
+				t.Fatalf("retry block for v1 = %+v, want Held: the key is the revision's to fix", block)
+			}
+
+			h.settle(20)
+			if !disposed() || podKeys(h.podsOf(2)) != newPods {
+				h.dumpState("settle")
+				t.Fatalf("the new Instance moved: %+v with pods %s, want Failed with its set %s kept", h.instance(2), podKeys(h.podsOf(2)), newPods)
+			}
+			if got := observedIndices(h); indicesString(got) != "[0 1 2]" {
+				t.Fatalf("indices = %s, want [0 1 2]: one new Instance beside the park", indicesString(got))
+			}
+			if got := h.instance(0); !parkedRepair(h, 0) || got.Incarnation != parked.Incarnation {
+				t.Fatalf("the parked repair moved under the scale-up: %+v", got)
+			}
+			requireIdentitiesKept(t, h, map[int32]string{1: healthy}, "scale-up beside the park")
+		})
 	}
 }

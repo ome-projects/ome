@@ -28,9 +28,9 @@ type Transition struct {
 	Current map[string]int32
 	Desired Plan
 	Homes   map[string]Home
-	// MaxSurge is the shared allowance above the larger of the original and
-	// desired floors. Nil blocks moves between homes; zero permits no excess.
-	MaxSurge *int32
+	// Surge is the shared allowance above the larger of the original and
+	// desired floors; zero permits no excess.
+	Surge int64
 	// RolloutReserved is additional rollout capacity already authorized but not
 	// included in Occupied. It consumes the same allowance as placement growth.
 	RolloutReserved int32
@@ -45,6 +45,8 @@ type Step struct {
 	Resume   []string
 	Reason   string
 	Complete bool
+	// Message explains a hold in operator terms; empty uses the reason's text.
+	Message string
 }
 
 // Advance moves toward Desired while retaining old replicas until replacement
@@ -73,7 +75,7 @@ func advanceTransition(in Transition, wholeHomes bool) (Step, error) {
 	if _, err := planTotal(Plan{Targets: in.Current}); err != nil {
 		return Step{}, fmt.Errorf("current targets: %w", err)
 	}
-	if in.RolloutReserved < 0 || (in.MaxSurge != nil && *in.MaxSurge < 0) {
+	if in.RolloutReserved < 0 || in.Surge < 0 {
 		return Step{}, fmt.Errorf("surge allowance and rollout reservation must be nonnegative")
 	}
 	all := maps.Clone(in.Desired.Targets)
@@ -139,10 +141,6 @@ func advanceTransition(in Transition, wholeHomes bool) (Step, error) {
 			out.Reason = "ObservationUnknown"
 			return out, nil
 		}
-	}
-	if grow && shrink && in.MaxSurge == nil {
-		out.Reason = "MigrationBlocked"
-		return out, nil
 	}
 	for _, name := range names {
 		if in.Desired.Targets[name] > 0 && in.Current[name] > 0 && in.Homes[name].Drained {
@@ -224,12 +222,10 @@ func advanceTransition(in Transition, wholeHomes bool) (Step, error) {
 		return out, nil
 	}
 	limit := max(fromFloor, desiredFloor)
-	if in.MaxSurge != nil {
-		if int64(*in.MaxSurge) > math.MaxInt64-limit {
-			return Step{}, fmt.Errorf("floor plus surge allowance exceeds int64")
-		}
-		limit += int64(*in.MaxSurge)
+	if in.Surge > math.MaxInt64-limit {
+		return Step{}, fmt.Errorf("floor plus surge allowance exceeds int64")
 	}
+	limit += in.Surge
 	available := max(int64(0), limit-used)
 	budgetBlocked := false
 	for _, name := range names {

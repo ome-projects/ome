@@ -60,12 +60,19 @@ func (f *demandFixture) report() {
 
 func TestResolveDemand(t *testing.T) {
 	for _, tt := range []struct {
-		name   string
-		mutate func(*demandFixture)
-		want   string
+		name         string
+		mutate       func(*demandFixture)
+		units        map[v1beta1.ComponentType]int64
+		primaryUnits int64
+		want         string
 	}{
 		{name: "identified root and catalog", want: "2"},
 		{name: "combined engine and decoder", want: "6", mutate: func(f *demandFixture) {
+			f.service.Spec.Decoder = &v1beta1.DecoderSpec{}
+			f.service.Spec.Decoder.NodeSelector = map[string]string{"hardware": "a"}
+			f.runtime.Spec.DecoderConfig.Runner = unitRunner("4")
+		}},
+		{name: "ratio unit scales each component", want: "14", primaryUnits: 3, units: map[v1beta1.ComponentType]int64{v1beta1.EngineComponent: 3, v1beta1.DecoderComponent: 2}, mutate: func(f *demandFixture) {
 			f.service.Spec.Decoder = &v1beta1.DecoderSpec{}
 			f.service.Spec.Decoder.NodeSelector = map[string]string{"hardware": "a"}
 			f.runtime.Spec.DecoderConfig.Runner = unitRunner("4")
@@ -96,9 +103,12 @@ func TestResolveDemand(t *testing.T) {
 				},
 				Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error { return reject() },
 			})
-			got, err := (Resolver{Client: cl, OperatorNamespace: f.namespace}).ResolveDemand(t.Context(), f.service, nil, f.root.Name)
+			got, err := (Resolver{Client: cl, OperatorNamespace: f.namespace, ComponentUnits: tt.units}).ResolveDemand(t.Context(), f.service, nil, f.root.Name)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if diff := cmp.Diff(max(tt.primaryUnits, 1), got.Demand.PrimaryUnits); diff != "" {
+				t.Fatalf("primary units (-want +got):\n%s", diff)
 			}
 			want := []capacity.Pool{{ResourceName: unitGPU, ResourceFlavor: "gpu-a", Quantity: resource.MustParse(tt.want), FlavorUID: "flavor-a",
 				NodeLabels: map[string]string{"hardware": "a"}, FlavorSetHash: f.root.Status.Capacity[0].Attribution.FlavorSetHash}}

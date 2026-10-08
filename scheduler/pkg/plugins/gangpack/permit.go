@@ -78,6 +78,10 @@ const (
 	// PodGroup watch that can run ahead of this informer; a member retried
 	// against the older PodGroup parks again with no later event to wake it.
 	activationTriggerPodGroupChange = "podgroup_change"
+	// activationTriggerDomainFailed: a pinned member was vetoed by another Filter
+	// in a domain its gang had not failed before while another domain is untried.
+	// The in-flight activation requeues it after its normal backoff to plan there.
+	activationTriggerDomainFailed = "domain_failed"
 )
 
 // podGroupChanged wakes a gang's live members once the plugin's PodGroup
@@ -92,7 +96,8 @@ func (g *GangPack) podGroupChanged(namespace, name string) {
 // transition that can unblock a parked sibling must be turned into queue
 // activity explicitly; the permit and templates_complete triggers are the
 // gang-wide transitions, while a reservation release wakes only the pods it
-// parked (see activateReservationBlocked).
+// parked (see activateReservationBlocked) and a domain veto only the vetoed
+// member (see PostFilter).
 // Activation bypasses backoff, so callers must fire it on a real transition,
 // not on every failed attempt. except, when non-nil, is the in-flight member
 // observing the transition; it is already being scheduled and needs no wake-up.

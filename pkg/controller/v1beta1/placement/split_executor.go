@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -53,11 +54,14 @@ func (r *Reconciler) reconcileSplit(ctx context.Context, source *v1beta1.Inferen
 			return r.writeSplitHold(ctx, source, standing, "ObservationUnknown", err)
 		}
 	}
-	return r.executePlannedAllocation(ctx, source, eligible, standing, proposal)
+	return r.executePlannedAllocation(ctx, source, eligible, standing, proposal, nil)
 }
 
-func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1beta1.InferenceService, eligible []string, standing *placementObservations, proposal plan.Proposal) (ctrl.Result, error) {
-	proposal.PauseSurge = splitPauseRequired(source, proposal)
+// executePlannedAllocation persists the proposal, advances it against member
+// observations and applies the step. holds explain unresolved home inputs in
+// the status condition while the step waits for them.
+func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1beta1.InferenceService, eligible []string, standing *placementObservations, proposal plan.Proposal, holds []string) (ctrl.Result, error) {
+	proposal.PauseSurge = splitPauseRequired(proposal)
 	if proposal.AdoptionDigest != "" {
 		proposal.PauseSurge = false
 	}
@@ -88,6 +92,9 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 	}
 	if err != nil {
 		return r.writeSplitObservations(ctx, accepted, observations, "ObservationUnknown", err.Error())
+	}
+	if step.Reason == "AwaitingHomeInputs" && len(holds) > 0 {
+		step.Message = strings.Join(holds, "; ")
 	}
 	if proposal.SingleMove != nil && proposal.SingleMove.Selected != "" && proposal.SingleMove.Selected != proposal.Winner {
 		selected := observations[proposal.SingleMove.Selected]
@@ -190,10 +197,10 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 			}
 		}
 	}
-	return r.writeSplitObservations(ctx, next, observations, step.Reason, "")
+	return r.writeSplitObservations(ctx, next, observations, step.Reason, step.Message)
 }
 
-func splitPauseRequired(source *v1beta1.InferenceService, proposal plan.Proposal) bool {
+func splitPauseRequired(proposal plan.Proposal) bool {
 	if proposal.SingleMove != nil {
 		return true
 	}
@@ -202,12 +209,6 @@ func splitPauseRequired(source *v1beta1.InferenceService, proposal plan.Proposal
 		grow = grow || assignment.DesiredReplicas > assignment.CurrentReplicas
 		shrink = shrink || assignment.DesiredReplicas < assignment.CurrentReplicas
 		drain = drain || assignment.DrainRequested
-	}
-	active := source.Status.Placement != nil && source.Status.Placement.Plan != nil && source.Status.Placement.Plan.PauseSurge
-	// An unconfigured move cannot begin. Leave member rollouts and scaling
-	// available unless an accepted transition already owns their allowance.
-	if source.Spec.Placement.MaxSurge == nil && grow && shrink && !active {
-		return false
 	}
 	return proposal.PauseSurge || grow || shrink || drain
 }
@@ -261,6 +262,9 @@ func (r *Reconciler) adoptSplitMembers(ctx context.Context, source *v1beta1.Infe
 	return nil
 }
 
+// adoptedMemberFloor reads a standing member's floor in primary units: the
+// engine minimum when declared, otherwise the decoder minimum. Every scalable
+// component must carry a resolved count.
 func adoptedMemberFloor(member *v1beta1.InferenceService) (int32, error) {
 	if member == nil {
 		return 0, fmt.Errorf("remaining member resources have no verifiable service floor")
@@ -272,20 +276,15 @@ func adoptedMemberFloor(member *v1beta1.InferenceService) (int32, error) {
 	if member.Spec.Decoder != nil {
 		floors = append(floors, member.Spec.Decoder.MinReplicas)
 	}
-	var floor int32
-	for i, value := range floors {
-		if value == nil || *value < 0 || int64(*value) > math.MaxInt32 {
-			return 0, fmt.Errorf("standing component floor is unresolved")
-		}
-		if i > 0 && floor != int32(*value) {
-			return 0, fmt.Errorf("standing engine and decoder floors must use whole replica units")
-		}
-		floor = int32(*value)
-	}
 	if len(floors) == 0 {
 		return 0, fmt.Errorf("standing service has no scalable component")
 	}
-	return floor, nil
+	for _, value := range floors {
+		if value == nil || *value < 0 || int64(*value) > math.MaxInt32 {
+			return 0, fmt.Errorf("standing component floor is unresolved")
+		}
+	}
+	return int32(*floors[0]), nil
 }
 
 func (r *Reconciler) observeSplitMembers(ctx context.Context, source *v1beta1.InferenceService, eligible []string) map[string]plannedHomeObservation {
@@ -325,7 +324,9 @@ func advanceSplitPlan(source *v1beta1.InferenceService, observations map[string]
 	input := allocation.Transition{
 		From:    allocation.Plan{Targets: map[string]int32{}, Unassigned: accepted.OriginalUnassignedReplicas},
 		Current: map[string]int32{}, Desired: allocation.Plan{Targets: map[string]int32{}, Unassigned: accepted.UnassignedReplicas},
-		Homes: map[string]allocation.Home{}, MaxSurge: source.Spec.Placement.MaxSurge,
+		Homes: map[string]allocation.Home{},
+		// A move may hold one extra full copy of the desired allocation.
+		Surge: int64(accepted.UnassignedReplicas),
 	}
 	var reserved, occupied int64
 	pauseAcknowledged := true
@@ -334,6 +335,7 @@ func advanceSplitPlan(source *v1beta1.InferenceService, observations map[string]
 		input.From.Targets[candidate.Cluster] = assignment.OriginalReplicas
 		input.Current[candidate.Cluster] = assignment.CurrentReplicas
 		input.Desired.Targets[candidate.Cluster] = assignment.DesiredReplicas
+		input.Surge += int64(assignment.DesiredReplicas)
 		input.Homes[candidate.Cluster] = observed.Home
 		reserved += int64(observed.RolloutReserved)
 		occupied += int64(observed.Home.Occupied)
@@ -405,7 +407,7 @@ func (r *Reconciler) writeSplitObservations(ctx context.Context, source *v1beta1
 			standing.homes[name] = homeObservation{state: state, candidate: observed.Candidate, serving: serving, terminal: observed.Terminal}
 			standing.standing = append(standing.standing, name)
 		}
-		return r.writeSinglePlanStatus(ctx, source, standing, reason)
+		return r.writeSinglePlanStatus(ctx, source, standing, reason, message)
 	}
 	res := placementResult{phase: v1beta1.PlacementPhasePending, conditions: []policyCondition{splitProgressCondition(reason, message)}}
 	if placementMode(source) == v1beta1.PlacementModeSplitByCapacity {
@@ -421,7 +423,12 @@ func (r *Reconciler) writeSplitObservations(ctx context.Context, source *v1beta1
 		if (previous.Allocation.CurrentReplicas > 0 || previous.Allocation.CurrentHome != nil) && res.phase == v1beta1.PlacementPhasePending {
 			res.phase = v1beta1.PlacementPhaseAdmitting
 		}
-		if candidate.AdmittedReplicas > 0 || observed.IdleZeroFloor {
+		// An idle home proves Placed only through a readable observation. An
+		// unreadable pass keeps the Placed verdict the last readable pass reached
+		// for this same plan instead of retracting evidence it did not disprove.
+		keptPlaced := !candidate.ObservationKnown && zeroHomeFloor(previous.Allocation.CurrentHome) &&
+			candidate.AppliedPlanID == source.Status.Placement.Plan.ID && source.Status.Placement.Phase == v1beta1.PlacementPhasePlaced
+		if candidate.AdmittedReplicas > 0 || observed.IdleZeroFloor || keptPlaced {
 			res.phase = v1beta1.PlacementPhasePlaced
 		}
 		res.ready = res.ready || (candidate.ObservationKnown && candidate.ReadyReplicas > 0 && candidate.Endpoint != nil)
@@ -437,7 +444,7 @@ func (r *Reconciler) writeSplitObservations(ctx context.Context, source *v1beta1
 
 func (r *Reconciler) writeSplitHold(ctx context.Context, source *v1beta1.InferenceService, standing *placementObservations, reason string, cause error) (ctrl.Result, error) {
 	if source.Status.Placement != nil && source.Status.Placement.Plan != nil && source.Status.Placement.Plan.Mode == v1beta1.PlacementModeSingle {
-		return r.writeSinglePlanStatus(ctx, source, standing, reason)
+		return r.writeSinglePlanStatus(ctx, source, standing, reason, cause.Error())
 	}
 	res := placementResult{phase: v1beta1.PlacementPhasePending, conditions: []policyCondition{splitProgressCondition(reason, cause.Error())}}
 	if placementMode(source) == v1beta1.PlacementModeSplitByCapacity {
