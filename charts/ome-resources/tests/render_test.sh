@@ -329,6 +329,15 @@ scale_down_batch_zero="$("${helm_bin}" template ome-resources "${chart_dir}" \
 grep -Fq '"scaleDownPodBatchSize":0' <<<"${scale_down_batch_zero}" ||
   fail "explicit zero OMENative scale-down Pod batch size was not rendered"
 
+scale_down_percentage="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-string ome.controller.lifecycle.scaleDownPodBatchSize=10% \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"scaleDownPodBatchSize":"10%"' <<<"${scale_down_percentage}" ||
+  fail "OMENative scale-down percentage was not rendered as a JSON string"
+grep -Fq '"scaleUpPodBatchSize":100' <<<"${scale_down_percentage}" ||
+  fail "scale-down percentage unexpectedly changed the scale-up Pod batch size"
+
 scale_down_batch_omitted="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
   --set ome.controller.lifecycle.scaleDownPodBatchSize=null \

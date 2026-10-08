@@ -564,8 +564,9 @@ ome:
       # reads this once at startup and rejects non-positive values; Helm rolls
       # the manager automatically when the rendered ConfigMap changes.
       scaleUpPodBatchSize: 100
-      # Active scale-down budget in Pod-equivalent units: live and Terminating
-      # Pods, with a cost-1 floor for Podless status work. Instance and
+      # Active scale-down budget: an absolute Pod count or a percentage string
+      # such as "10%", resolved from each Component's current live and Terminating
+      # Pods, rounded up, with a cost-1 floor for Podless status work. Instance and
       # leader/worker gang boundaries remain atomic, and the first eligible
       # Instance larger than this value proceeds alone. Existing Delete-owned
       # work is resumed before newly extra Instances are admitted. Omit only to

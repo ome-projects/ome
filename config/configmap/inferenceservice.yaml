@@ -73,8 +73,10 @@ data:
   # The scale-up and scale-down Pod batch sizes bound create and delete work in
   # Pod-equivalent units. Each Instance or gang is selected atomically, and a
   # first eligible Instance larger than its budget proceeds alone. Omitting a
-  # batch field preserves that direction's unbounded selection. The scale-down
-  # requeue interval polls while destructive work remains in flight; omitting
+  # batch field preserves that direction's unbounded selection. Scale-down also
+  # accepts a percentage string such as "10%" of the current Component footprint,
+  # rounded up; the footprint includes live/Terminating Pods and Podless statuses.
+  # The scale-down requeue interval polls while destructive work remains in flight; omitting
   # it leaves progress to watched resources and exact configured lifecycle
   # deadlines. The repair batch size bounds the crash-loop repairs opened per
   # Component in one pass, in Instances (a gang counts as one); omitting it
