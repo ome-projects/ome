@@ -33,6 +33,12 @@ type MaintenanceCondition struct {
 type MaintenanceLabel struct {
 	Key   string  `json:"key"`
 	Value *string `json:"value,omitempty"`
+	// ValueIsStartTime reads the label value as the Unix time, in whole
+	// seconds, when maintenance starts. The rule matches from that time on.
+	// A value that is not such a number matches at once, so the start time
+	// can delay maintenance but never cancel it. It cannot be combined with
+	// Value.
+	ValueIsStartTime bool `json:"valueIsStartTime,omitempty"`
 }
 
 // MaintenanceTaint matches one taint. An absent value or effect is unrestricted.
@@ -81,6 +87,9 @@ func (n *NodeHealth) validateTriggers() error {
 		if label := trigger.Label; label != nil {
 			if err := validateMaintenanceKeyValue(path+".label", label.Key, label.Value); err != nil {
 				return err
+			}
+			if label.ValueIsStartTime && label.Value != nil {
+				return fmt.Errorf("%s.label cannot set both value and valueIsStartTime", path)
 			}
 		}
 		if taint := trigger.Taint; taint != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -68,9 +69,12 @@ func (e *EarlyTicker) observe(oldObj, newObj interface{}) {
 	cfg := e.Store.Get()
 	changed := earlyTickEnabled(cfg, config.EarlyTickNodeConditionChange) && nodeConditionsChanged(oldNode, newNode)
 	if !changed && earlyTickEnabled(cfg, config.EarlyTickNodeMaintenanceChange) {
-		triggers := cfg.Policies.NodeHealth.Maintenance.Triggers
-		oldMaintenance := snapshot.ObserveNodeMaintenance(oldNode, triggers)
-		newMaintenance := snapshot.ObserveNodeMaintenance(newNode, triggers)
+		// Both versions are read at one instant, so only a Node edit can change
+		// the result. A start time that passes without an edit is picked up by
+		// the regular decision pass.
+		triggers, now := cfg.Policies.NodeHealth.Maintenance.Triggers, time.Now()
+		oldMaintenance := snapshot.ObserveNodeMaintenance(oldNode, triggers, now)
+		newMaintenance := snapshot.ObserveNodeMaintenance(newNode, triggers, now)
 		changed = !slices.Equal(oldMaintenance.Triggers, newMaintenance.Triggers)
 	}
 	if !changed {

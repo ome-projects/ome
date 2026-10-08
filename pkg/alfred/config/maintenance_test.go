@@ -16,6 +16,9 @@ func TestMaintenanceConfigValidation(t *testing.T) {
 		{"condition unknown", `[{name: patch, condition: {type: Patching, status: Unknown}}]`, true},
 		{"presence label", `[{name: patch, label: {key: ops.example/patch}}]`, true},
 		{"empty label value", `[{name: patch, label: {key: ops.example/patch, value: ""}}]`, true},
+		{"label start time", `[{name: patch, label: {key: ops.example/patch-at, valueIsStartTime: true}}]`, true},
+		{"label start time off", `[{name: patch, label: {key: ops.example/patch, value: planned, valueIsStartTime: false}}]`, true},
+		{"label start time with value", `[{name: patch, label: {key: ops.example/patch-at, value: "1767355200", valueIsStartTime: true}}]`, false},
 		{"taint", `[{name: patch, taint: {key: ops.example/patch, value: planned, effect: NoSchedule}}]`, true},
 		{"taint presence", `[{name: patch, taint: {key: ops.example/patch}}]`, true},
 		{"empty trigger", `[{}]`, false},
@@ -73,14 +76,19 @@ policies:
         taint: {key: patch}
       - name: taint-empty
         taint: {key: patch, value: ""}
+      - name: label-start-time
+        label: {key: patch-at, valueIsStartTime: true}
 `)
 	if outcome, err := store.Update(raw); err != nil || outcome != OutcomeSuccess {
 		t.Fatalf("reload=%s, %v", outcome, err)
 	}
 	loaded := store.Get()
 	rules := loaded.Policies.NodeHealth.Maintenance.Triggers
-	if len(rules) != 4 || rules[0].Label.Value != nil || rules[1].Label.Value == nil || *rules[1].Label.Value != "" || rules[2].Taint.Value != nil || rules[3].Taint.Value == nil || *rules[3].Taint.Value != "" {
+	if len(rules) != 5 || rules[0].Label.Value != nil || rules[1].Label.Value == nil || *rules[1].Label.Value != "" || rules[2].Taint.Value != nil || rules[3].Taint.Value == nil || *rules[3].Taint.Value != "" {
 		t.Fatalf("optional matching values lost in config: %+v", rules)
+	}
+	if rules[0].Label.ValueIsStartTime || !rules[4].Label.ValueIsStartTime || rules[4].Label.Value != nil {
+		t.Fatalf("start-time option lost or leaked in config: %+v %+v", rules[0].Label, rules[4].Label)
 	}
 	invalid := strings.Replace(string(raw), "name: label-empty", "name: label-presence", 1)
 	if outcome, err := store.Update([]byte(invalid)); err == nil || outcome != OutcomeFailure || store.Get() != loaded {

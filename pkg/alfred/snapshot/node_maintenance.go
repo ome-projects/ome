@@ -2,18 +2,21 @@ package snapshot
 
 import (
 	"sort"
+	"strconv"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/ome/pkg/alfred/config"
 )
 
 // ObserveNodeMaintenance evaluates configured planned-work signals against the
-// current Node. The returned sorted trigger identities also let event handlers
-// distinguish actionable changes from heartbeat and unrelated metadata updates.
-func ObserveNodeMaintenance(node *corev1.Node, triggers []config.MaintenanceTrigger) NodeMaintenanceObservation {
+// current Node at time now. The returned sorted trigger identities also let
+// event handlers distinguish actionable changes from heartbeat and unrelated
+// metadata updates.
+func ObserveNodeMaintenance(node *corev1.Node, triggers []config.MaintenanceTrigger, now time.Time) NodeMaintenanceObservation {
 	result := NodeMaintenanceObservation{}
 	for _, trigger := range triggers {
-		if maintenanceTriggerMatches(node, trigger) {
+		if maintenanceTriggerMatches(node, trigger, now) {
 			result.Triggers = append(result.Triggers, trigger.Name)
 		}
 	}
@@ -22,7 +25,7 @@ func ObserveNodeMaintenance(node *corev1.Node, triggers []config.MaintenanceTrig
 	return result
 }
 
-func maintenanceTriggerMatches(node *corev1.Node, trigger config.MaintenanceTrigger) bool {
+func maintenanceTriggerMatches(node *corev1.Node, trigger config.MaintenanceTrigger, now time.Time) bool {
 	if match := trigger.Condition; match != nil {
 		for _, condition := range node.Status.Conditions {
 			if condition.Type == match.Type && condition.Status == match.Status {
@@ -32,7 +35,13 @@ func maintenanceTriggerMatches(node *corev1.Node, trigger config.MaintenanceTrig
 	}
 	if match := trigger.Label; match != nil {
 		value, present := node.Labels[match.Key]
-		return present && (match.Value == nil || value == *match.Value)
+		if !present {
+			return false
+		}
+		if match.ValueIsStartTime {
+			return startTimeReached(value, now)
+		}
+		return match.Value == nil || value == *match.Value
 	}
 	if match := trigger.Taint; match != nil {
 		for _, taint := range node.Spec.Taints {
@@ -42,4 +51,16 @@ func maintenanceTriggerMatches(node *corev1.Node, trigger config.MaintenanceTrig
 		}
 	}
 	return false
+}
+
+// startTimeReached reports whether now is at or after the Unix time, in whole
+// seconds, written in value. A value that is not a whole number counts as
+// reached: the key alone already asks for maintenance, and the time may only
+// delay it.
+func startTimeReached(value string, now time.Time) bool {
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return true
+	}
+	return !now.Before(time.Unix(seconds, 0))
 }

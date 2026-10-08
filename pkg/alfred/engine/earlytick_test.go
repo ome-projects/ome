@@ -116,6 +116,56 @@ policies:
 	}
 }
 
+func TestEarlyTickMaintenanceStartTime(t *testing.T) {
+	store := config.NewStore()
+	if _, err := store.Update([]byte(`
+schemaVersion: 1
+earlyTickOn: [NodeMaintenanceChange]
+policies:
+  nodeHealth:
+    maintenance:
+      triggers:
+      - name: leaving
+        label: {key: ops.example/leave-at, valueIsStartTime: true}
+`)); err != nil {
+		t.Fatal(err)
+	}
+	ticker := &EarlyTicker{Store: store, Log: logr.Discard(), C: make(chan struct{}, 1)}
+	base := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
+	withValue := func(value string) *corev1.Node {
+		node := base.DeepCopy()
+		node.Labels = map[string]string{"ops.example/leave-at": value}
+		return node
+	}
+	// One second after 1970 has passed; the last second of 9999 has not.
+	past, future := withValue("1"), withValue("253402300799")
+	tests := []struct {
+		name      string
+		old, next *corev1.Node
+		want      bool
+	}{
+		{"start time already passed", base, past, true},
+		{"start time in the future", base, future, false},
+		{"future start time moved to the past", future, past, true},
+		{"past start time moved to the future", past, future, true},
+		{"future start time removed", future, base, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ticker.observe(tt.old, tt.next)
+			got := false
+			select {
+			case <-ticker.C:
+				got = true
+			default:
+			}
+			if got != tt.want {
+				t.Fatalf("early tick=%t, want=%t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestEarlyTickHealthTransitionTimeChanges(t *testing.T) {
 	ticker := &EarlyTicker{Store: config.NewStore(), Log: logr.Discard(), C: make(chan struct{}, 1)}
 	old := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{Type: "GpuUnhealthy", Status: corev1.ConditionFalse, LastTransitionTime: metav1.NewTime(time.Unix(1, 0))}}}}

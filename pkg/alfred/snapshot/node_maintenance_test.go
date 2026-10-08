@@ -45,7 +45,7 @@ func TestObserveNodeMaintenance(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.trigger.Name = "maintenance"
-			got := ObserveNodeMaintenance(node, []config.MaintenanceTrigger{tt.trigger})
+			got := ObserveNodeMaintenance(node, []config.MaintenanceTrigger{tt.trigger}, buildNow)
 			if got.Requested != tt.want {
 				t.Fatalf("observation=%+v, want requested=%t", got, tt.want)
 			}
@@ -59,17 +59,65 @@ func TestObserveNodeMaintenance(t *testing.T) {
 		{Name: "a-condition", Condition: &config.MaintenanceCondition{Type: "Patching", Status: corev1.ConditionTrue}},
 		{Name: "unmatched", Label: &config.MaintenanceLabel{Key: "missing"}},
 	}
-	got := ObserveNodeMaintenance(node, triggers)
+	got := ObserveNodeMaintenance(node, triggers, buildNow)
 	if !got.Requested || !reflect.DeepEqual(got.Triggers, []string{"a-condition", "z-label"}) {
 		t.Fatalf("combined observation=%+v", got)
 	}
-	if got := ObserveNodeMaintenance(node, nil); got.Requested || len(got.Triggers) != 0 {
+	if got := ObserveNodeMaintenance(node, nil, buildNow); got.Requested || len(got.Triggers) != 0 {
 		t.Fatalf("disabled observation=%+v", got)
 	}
 	node.Labels = nil
 	node.Status.Conditions = nil
-	if got := ObserveNodeMaintenance(node, triggers); got.Requested || len(got.Triggers) != 0 {
+	if got := ObserveNodeMaintenance(node, triggers, buildNow); got.Requested || len(got.Triggers) != 0 {
 		t.Fatalf("cleared observation=%+v", got)
+	}
+}
+
+func TestObserveNodeMaintenanceStartTime(t *testing.T) {
+	// buildNow is 2026-01-02T12:00:00Z, Unix time 1767355200.
+	trigger := config.MaintenanceTrigger{Name: "leaving", Label: &config.MaintenanceLabel{Key: "leave-at", ValueIsStartTime: true}}
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"start time passed", map[string]string{"leave-at": "1767355199"}, true},
+		{"start time is now", map[string]string{"leave-at": "1767355200"}, true},
+		{"start time in the future", map[string]string{"leave-at": "1767355201"}, false},
+		{"zero is long past", map[string]string{"leave-at": "0"}, true},
+		{"not a number starts at once", map[string]string{"leave-at": "true"}, true},
+		{"empty value starts at once", map[string]string{"leave-at": ""}, true},
+		{"too large to parse starts at once", map[string]string{"leave-at": "99999999999999999999"}, true},
+		{"missing label", map[string]string{"other": "1767355199"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: tt.labels}}
+			got := ObserveNodeMaintenance(node, []config.MaintenanceTrigger{trigger}, buildNow)
+			if got.Requested != tt.want {
+				t.Fatalf("observation=%+v, want requested=%t", got, tt.want)
+			}
+		})
+	}
+	// Without the option the same label keeps its presence meaning, so a
+	// future time still matches at once.
+	presence := config.MaintenanceTrigger{Name: "leaving", Label: &config.MaintenanceLabel{Key: "leave-at"}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"leave-at": "1767355201"}}}
+	if got := ObserveNodeMaintenance(node, []config.MaintenanceTrigger{presence}, buildNow); !got.Requested {
+		t.Fatalf("presence rule must ignore the value: %+v", got)
+	}
+}
+
+func TestBuildMaintenanceStartTimeUsesSnapshotClock(t *testing.T) {
+	triggers := []config.MaintenanceTrigger{{Name: "leaving", Label: &config.MaintenanceLabel{Key: "leave-at", ValueIsStartTime: true}}}
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "leaving", Labels: map[string]string{"leave-at": "1767355200"}}}
+	before := Options{MaintenanceTriggers: triggers, Now: func() time.Time { return buildNow.Add(-time.Second) }}
+	if got := buildNode(node, &before); got.Maintenance.Requested || got.UnavailableAsTarget() {
+		t.Fatalf("node before its start time=%+v", got)
+	}
+	at := Options{MaintenanceTriggers: triggers, Now: func() time.Time { return buildNow }}
+	if got := buildNode(node, &at); !got.Maintenance.Requested || !got.UnavailableAsTarget() {
+		t.Fatalf("node at its start time=%+v", got)
 	}
 }
 

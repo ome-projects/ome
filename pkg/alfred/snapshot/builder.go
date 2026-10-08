@@ -191,7 +191,7 @@ func buildNode(node *corev1.Node, opts *Options) *Node {
 		}
 	}
 	n.Health = observeNodeHealth(node.Status.Conditions, opts.triggerConditions(), opts.now(), opts.nodeSuspicionWindow())
-	n.Maintenance = ObserveNodeMaintenance(node, opts.MaintenanceTriggers)
+	n.Maintenance = ObserveNodeMaintenance(node, opts.MaintenanceTriggers, opts.now())
 	return n
 }
 

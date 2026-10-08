@@ -1473,6 +1473,14 @@ value), or taint matcher (key, optional value and optional effect). Any matching
 rule requests maintenance; all specified fields within that rule must match.
 For labels and taints, omitted value means key presence, while `value: ""`
 means an explicitly empty value. An omitted taint effect matches any effect.
+A label rule may instead set `valueIsStartTime: true`. The label value is then
+the Unix time, in whole seconds, when maintenance starts. A node labeled
+`maintenance.example.com/start-at=1767355200` is left alone until
+2026-01-02T12:00:00Z and evacuated from then on. A value that is not a whole
+number starts maintenance at once, because the key alone asks for it. The
+option cannot be combined with `value`. Alfred notices a start time that passes
+without a node edit on its next regular decision pass. This option is off by
+default; without it a label rule keeps its presence or exact-value meaning.
 No rules are installed by default, and unconfigured labels/taints do nothing.
 Invalid or ambiguous rules are rejected without replacing last-known-good
 configuration.
@@ -1781,6 +1789,8 @@ policies:
           condition: {type: Patching, status: "True"}
         - name: patching-label
           label: {key: maintenance.example.com/state, value: patching}
+        - name: patching-start-time
+          label: {key: maintenance.example.com/start-at, valueIsStartTime: true}
         - name: patching-taint
           taint: {key: maintenance.example.com/patching, value: "true", effect: NoSchedule}
 ```

@@ -57,6 +57,9 @@ data:
           triggers: []
           # - name: patching-label
           #   label: {key: maintenance.example.com/state, value: patching}
+          # # The label value is the Unix time (seconds) when maintenance starts.
+          # - name: patching-start-time
+          #   label: {key: maintenance.example.com/start-at, valueIsStartTime: true}
           # - name: patching-taint
           #   taint: {key: maintenance.example.com/patching, value: "true", effect: NoSchedule}
           # - name: patching-condition
