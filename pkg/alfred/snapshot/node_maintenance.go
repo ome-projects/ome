@@ -62,5 +62,7 @@ func startTimeReached(value string, now time.Time) bool {
 	if err != nil {
 		return true
 	}
-	return !now.Before(time.Unix(seconds, 0))
+	// Compare whole seconds: time.Unix overflows for values near the int64
+	// limit and would turn a far-future time into a past one.
+	return now.Unix() >= seconds
 }

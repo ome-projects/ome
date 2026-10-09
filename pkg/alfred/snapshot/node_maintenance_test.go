@@ -84,6 +84,7 @@ func TestObserveNodeMaintenanceStartTime(t *testing.T) {
 		{"start time passed", map[string]string{"leave-at": "1767355199"}, true},
 		{"start time is now", map[string]string{"leave-at": "1767355200"}, true},
 		{"start time in the future", map[string]string{"leave-at": "1767355201"}, false},
+		{"largest whole number is still the future", map[string]string{"leave-at": "9223372036854775807"}, false},
 		{"zero is long past", map[string]string{"leave-at": "0"}, true},
 		{"not a number starts at once", map[string]string{"leave-at": "true"}, true},
 		{"empty value starts at once", map[string]string{"leave-at": ""}, true},
