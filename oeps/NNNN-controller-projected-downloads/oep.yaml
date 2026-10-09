@@ -1,0 +1,14 @@
+title: Controller-projected model download scope
+oep-number: NNNN
+authors:
+  - "@gsgvijay"
+status: provisional
+creation-date: 2026-10-06
+reviewers:
+  - TBD
+approvers:
+  - TBD
+stage: alpha
+feature-gates:
+  - name: download-scope-node-label and download-scope-pool-label
+disable-supported: true

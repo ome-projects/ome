@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -28,6 +29,13 @@ import (
 )
 
 type Scout struct {
+	// Configured before informers start. Event handlers and node replay share a lock.
+	DownloadScope          DownloadScope
+	eventMu                sync.Mutex
+	nodeMu                 sync.RWMutex
+	scopeNode              *v1.Node
+	scopeRequired          bool
+	scopeReplayNode        *v1.Node
 	ctx                    context.Context
 	baseModelLister        omev1beta1lister.BaseModelLister
 	baseModelSynced        cache.InformerSynced
@@ -38,7 +46,7 @@ type Scout struct {
 	nodeName               string
 	nodeInfo               *v1.Node
 	nodeShapeAlias         string
-	kubeClient             *kubernetes.Clientset
+	kubeClient             kubernetes.Interface
 	logger                 *zap.SugaredLogger
 }
 
@@ -92,6 +100,8 @@ func NewScout(ctx context.Context, nodeName string,
 		ctx:                    ctx,
 		nodeShapeAlias:         nodeShapeAlias,
 		nodeInfo:               nodeInfo,
+		scopeNode:              nodeInfo,
+		scopeReplayNode:        nodeInfo,
 		baseModelLister:        baseModelInformer.Lister(),
 		baseModelSynced:        baseModelInformer.Informer().HasSynced,
 		clusterBaseModelLister: clusterBaseModelInformer.Lister(),
@@ -238,14 +248,31 @@ syncComplete:
 	// This ensures we catch any deletion requests that occurred while the agent was down
 	w.reconcilePendingDeletions()
 
-	<-stopCh
-	close(w.gopherChan)
+	if w.requiresScope() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+	loop:
+		for {
+			select {
+			case <-stopCh:
+				break loop
+			case <-ticker.C:
+				w.refreshDownloadScopeNode()
+			}
+		}
+	} else {
+		<-stopCh
+	}
+	// Gopher observes the same stop channel. Do not close a channel while
+	// informer handlers can still be sending to it.
 	w.logger.Info("Shutting down scout")
 
 	return nil
 }
 
 func (w *Scout) downloadBaseModel(obj interface{}) {
+	w.eventMu.Lock()
+	defer w.eventMu.Unlock()
 	baseModel, ok := obj.(*v1beta1.BaseModel)
 	if !ok {
 		w.logger.Errorf("Failed to convert %v to BaseModel", obj)
@@ -258,15 +285,10 @@ func (w *Scout) downloadBaseModel(obj interface{}) {
 		return
 	}
 
-	if w.shouldDownloadModel(baseModel.Spec.Storage) {
-		// Refresh the node info
-		var err error
-		w.nodeInfo, err = w.kubeClient.CoreV1().Nodes().Get(w.ctx, w.nodeName, metav1.GetOptions{})
-		if err != nil {
-			w.logger.Errorf("Error getting the node info: %s, skipping download", err.Error())
+	if w.modelEligible(baseModel, baseModel.Spec.Storage) {
+		if !w.refreshNodeForAdd() || !w.modelEligible(baseModel, baseModel.Spec.Storage) {
 			return
 		}
-
 		w.enqueueBaseModelDownload(baseModel)
 	}
 }
@@ -293,10 +315,12 @@ func (w *Scout) enqueueBaseModelDownload(baseModel *v1beta1.BaseModel) {
 		},
 	}
 
-	w.gopherChan <- gopherTask
+	w.sendTask(gopherTask)
 }
 
 func (w *Scout) downloadClusterBaseModel(obj interface{}) {
+	w.eventMu.Lock()
+	defer w.eventMu.Unlock()
 	clusterBaseModel, ok := obj.(*v1beta1.ClusterBaseModel)
 	if !ok {
 		w.logger.Errorf("Failed to convert %v to clusterBaseModel", obj)
@@ -309,15 +333,10 @@ func (w *Scout) downloadClusterBaseModel(obj interface{}) {
 		return
 	}
 
-	if w.shouldDownloadModel(clusterBaseModel.Spec.Storage) {
-		// Refresh the node info
-		var err error
-		w.nodeInfo, err = w.kubeClient.CoreV1().Nodes().Get(w.ctx, w.nodeName, metav1.GetOptions{})
-		if err != nil {
-			w.logger.Errorf("Error getting the node info: %s, skipping download", err.Error())
+	if w.modelEligible(clusterBaseModel, clusterBaseModel.Spec.Storage) {
+		if !w.refreshNodeForAdd() || !w.modelEligible(clusterBaseModel, clusterBaseModel.Spec.Storage) {
 			return
 		}
-
 		w.enqueueClusterBaseModelDownload(clusterBaseModel)
 	}
 }
@@ -344,10 +363,12 @@ func (w *Scout) enqueueClusterBaseModelDownload(clusterBaseModel *v1beta1.Cluste
 		},
 	}
 
-	w.gopherChan <- gopherTask
+	w.sendTask(gopherTask)
 }
 
 func (w *Scout) updateBaseModel(old, new interface{}) {
+	w.eventMu.Lock()
+	defer w.eventMu.Unlock()
 	oldBaseModel, ok := old.(*v1beta1.BaseModel)
 	if !ok {
 		w.logger.Errorf("Failed to convert %v to ClusterBaseModel", old)
@@ -363,12 +384,15 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 
 	// Placement changes add or remove this node without refreshing an artifact
 	// on a node that remains eligible.
-	wasEligible := w.shouldDownloadModel(oldBaseModel.Spec.Storage)
-	isEligible := w.shouldDownloadModel(newBaseModel.Spec.Storage)
+	wasEligible := w.modelEligible(oldBaseModel, oldBaseModel.Spec.Storage)
+	isEligible := w.modelEligible(newBaseModel, newBaseModel.Spec.Storage)
 	switch {
 	case wasEligible && !isEligible:
+		if !w.mayRemoveIneligibleModel(newBaseModel, newBaseModel.Spec.Storage) {
+			return
+		}
 		w.logger.Infof("BaseModel %s in namespace %s no longer matches this node, deleting", newBaseModel.Name, newBaseModel.Namespace)
-		w.gopherChan <- &GopherTask{TaskType: Delete, BaseModel: newBaseModel, NodeIneligible: true}
+		w.sendTask(&GopherTask{TaskType: Delete, BaseModel: newBaseModel, NodeIneligible: true})
 		return
 	case !wasEligible && isEligible:
 		w.enqueueBaseModelDownload(newBaseModel)
@@ -384,7 +408,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldBaseModel.Labels, newBaseModel.Labels},
-		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
+		{"Annotations", downloadAnnotations(oldBaseModel.Annotations), downloadAnnotations(newBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldBaseModel.Spec), downloadOverrideInputsFromSpec(newBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -400,6 +424,8 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 }
 
 func (w *Scout) updateClusterBaseModel(old, new interface{}) {
+	w.eventMu.Lock()
+	defer w.eventMu.Unlock()
 	oldClusterBaseModel, ok := old.(*v1beta1.ClusterBaseModel)
 	if !ok {
 		w.logger.Errorf("Failed to convert %v to ClusterBaseModel", old)
@@ -420,12 +446,15 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	// Placement changes add or remove this node without refreshing an artifact
 	// on a node that remains eligible.
-	wasEligible := w.shouldDownloadModel(oldClusterBaseModel.Spec.Storage)
-	isEligible := w.shouldDownloadModel(newClusterBaseModel.Spec.Storage)
+	wasEligible := w.modelEligible(oldClusterBaseModel, oldClusterBaseModel.Spec.Storage)
+	isEligible := w.modelEligible(newClusterBaseModel, newClusterBaseModel.Spec.Storage)
 	switch {
 	case wasEligible && !isEligible:
+		if !w.mayRemoveIneligibleModel(newClusterBaseModel, newClusterBaseModel.Spec.Storage) {
+			return
+		}
 		w.logger.Infof("ClusterBaseModel %s no longer matches this node, deleting", newClusterBaseModel.Name)
-		w.gopherChan <- &GopherTask{TaskType: Delete, ClusterBaseModel: newClusterBaseModel, NodeIneligible: true}
+		w.sendTask(&GopherTask{TaskType: Delete, ClusterBaseModel: newClusterBaseModel, NodeIneligible: true})
 		return
 	case !wasEligible && isEligible:
 		w.enqueueClusterBaseModelDownload(newClusterBaseModel)
@@ -441,7 +470,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldClusterBaseModel.Labels, newClusterBaseModel.Labels},
-		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
+		{"Annotations", downloadAnnotations(oldClusterBaseModel.Annotations), downloadAnnotations(newClusterBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldClusterBaseModel.Spec), downloadOverrideInputsFromSpec(newClusterBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -498,7 +527,7 @@ func (w *Scout) deleteBaseModel(obj interface{}) {
 		BaseModel: baseModel,
 	}
 
-	w.gopherChan <- gopherTask
+	w.sendTask(gopherTask)
 }
 
 func (w *Scout) deleteClusterBaseModel(obj interface{}) {
@@ -514,7 +543,7 @@ func (w *Scout) deleteClusterBaseModel(obj interface{}) {
 		TaskType:         Delete,
 		ClusterBaseModel: clusterBaseModel,
 	}
-	w.gopherChan <- gopherTask
+	w.sendTask(gopherTask)
 }
 
 // reconcilePendingDeletions checks for any resources with deletion timestamps
@@ -585,6 +614,9 @@ func (w *Scout) shouldDownloadModelCommon(storageSpec *v1beta1.StorageSpec, defa
 	// Check NodeAffinity if specified
 	if storageSpec.NodeAffinity != nil && storageSpec.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
 		nodeSelectorTerms := storageSpec.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		if len(nodeSelectorTerms) == 0 && w.DownloadScope.appliesTo(w.nodeInfo) {
+			return false
+		}
 		if len(nodeSelectorTerms) > 0 {
 			matches := false
 			for _, term := range nodeSelectorTerms {
@@ -609,6 +641,9 @@ func (w *Scout) shouldDownloadModel(storageSpec *v1beta1.StorageSpec) bool {
 }
 
 func (w *Scout) nodeMatchesSelectorTerm(term v1.NodeSelectorTerm) bool {
+	if len(term.MatchExpressions) == 0 && len(term.MatchFields) == 0 && w.DownloadScope.appliesTo(w.nodeInfo) {
+		return false
+	}
 	// Check match expressions
 	for _, expr := range term.MatchExpressions {
 		if !w.nodeMatchesExpression(expr) {
@@ -649,7 +684,8 @@ func (w *Scout) nodeMatchesExpression(expr v1.NodeSelectorRequirement) bool {
 	}
 
 	if !exists {
-		return expr.Operator == v1.NodeSelectorOpDoesNotExist
+		return expr.Operator == v1.NodeSelectorOpDoesNotExist ||
+			(expr.Operator == v1.NodeSelectorOpNotIn && w.DownloadScope.appliesTo(w.nodeInfo))
 	}
 
 	switch expr.Operator {
@@ -777,7 +813,7 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnClusterBaseModel(clusterBaseM
 	}
 
 	w.logger.Infof("generate DownloadOverride task %v", clusterBaseModel.Spec.DisplayName)
-	w.gopherChan <- gopherTask
+	w.sendTask(gopherTask)
 }
 
 func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.BaseModel) {
@@ -797,5 +833,5 @@ func (w *Scout) generateDownloadOverrideTaskBasedOnBaseModel(baseModel *v1beta1.
 		},
 	}
 	w.logger.Infof("generate DownloadOverride task %v", baseModel.Spec.DisplayName)
-	w.gopherChan <- gopherTask
+	w.sendTask(gopherTask)
 }

@@ -27,9 +27,11 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllerconfigruntime "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -403,6 +405,9 @@ func main() {
 
 	mgrOpts := manager.Options{
 		Scheme: scheme,
+		// Warm the registered watch sources before readiness, including on
+		// standbys. Reconciliation still requires the leader lease.
+		Controller: controllerconfigruntime.Controller{EnableWarmup: ptr.To(true)},
 		Cache: cache.Options{
 			// Strip managedFields from every cached object (Pods, Nodes,
 			// EndpointSlices, ConfigMaps, ...): typically a large fraction of
@@ -432,11 +437,12 @@ func main() {
 	}
 	options.leaderElectionTiming.Apply(&mgrOpts)
 
-	mgr, err := manager.New(cfg, mgrOpts)
+	rawManager, err := manager.New(cfg, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "Failed to initialize controller manager")
 		os.Exit(1)
 	}
+	mgr := &sourceReadyManager{Manager: rawManager}
 
 	// Register the OMENative pod field index so per-Instance pod lookups
 	// resolve through the cache index instead of scanning every cached
@@ -884,6 +890,10 @@ func main() {
 	}
 	if err := mgr.AddReadyzCheck("readyz", probeChecker); err != nil {
 		setupLog.Error(err, "Unable to set up ready check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("controller-sources", mgr.sourcesReady); err != nil {
+		setupLog.Error(err, "Unable to set up controller source readiness")
 		os.Exit(1)
 	}
 

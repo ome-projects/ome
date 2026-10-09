@@ -57,6 +57,8 @@ type GopherTask struct {
 }
 
 type Gopher struct {
+	// Optional current-identity/selection check supplied by Scout. No endpoint client.
+	TaskAllowed              func(*GopherTask) bool
 	modelConfigParser        *modelparser.ModelConfigParser
 	configMapReconciler      *ConfigMapReconciler
 	downloadRetry            int
@@ -225,6 +227,9 @@ func (s *Gopher) enqueueTask(task *GopherTask) {
 	if task == nil {
 		return
 	}
+	if s.TaskAllowed != nil && !s.TaskAllowed(task) {
+		return
+	}
 	s.artifactRouting.mutex.Lock()
 	s.routeArtifactTaskLocked(task)
 	s.artifactRouting.mutex.Unlock()
@@ -388,6 +393,9 @@ func (s *Gopher) processTaskWithSourceAdapters(task *GopherTask, allowFallbackDo
 	processHFSource func(context.Context, *GopherTask, v1beta1.BaseModelSpec, bool) (bool, error),
 	downloadOCI func(context.Context, *ociobjectstore.ObjectURI, string, *GopherTask) error,
 ) error {
+	if s.TaskAllowed != nil && !s.TaskAllowed(task) {
+		return nil
+	}
 	if task.BaseModel == nil && task.ClusterBaseModel == nil {
 		return fmt.Errorf("gopher got empty task")
 	}

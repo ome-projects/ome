@@ -45,6 +45,8 @@ type config struct {
 	numDownloadWorker            int
 	numHighPriorityWorker        int
 	samePathWaitTimeout          time.Duration
+	downloadScopeNodeLabel       string
+	downloadScopePoolLabel       string
 	namespace                    string
 	logLevel                     string
 }
@@ -86,6 +88,8 @@ func init() {
 	rootCmd.PersistentFlags().IntVar(&cfg.numDownloadWorker, "num-download-worker", 5, "Number of download workers")
 	rootCmd.PersistentFlags().IntVar(&cfg.numHighPriorityWorker, "num-high-priority-worker", 1, "Number of high-priority workers for delete and same-path reuse tasks")
 	rootCmd.PersistentFlags().DurationVar(&cfg.samePathWaitTimeout, "same-path-wait-timeout", 30*time.Minute, "Maximum time to wait for same-path model reuse before falling back to normal download")
+	rootCmd.PersistentFlags().StringVar(&cfg.downloadScopeNodeLabel, "download-scope-node-label", "", "Node classification label for controller-projected model storage scope")
+	rootCmd.PersistentFlags().StringVar(&cfg.downloadScopePoolLabel, "download-scope-pool-label", "", "Node pool label for controller-projected model storage scope")
 	rootCmd.PersistentFlags().StringVar(&cfg.namespace, "namespace", "ome", "Kubernetes namespace to use")
 	rootCmd.PersistentFlags().StringVar(&cfg.logLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 
@@ -290,6 +294,14 @@ func initializeComponents(
 		return nil, nil, fmt.Errorf("failed to create gopher: %w", err)
 	}
 
+	scope := modelagent.DownloadScope{NodeLabel: v.GetString("download-scope-node-label"), PoolLabel: v.GetString("download-scope-pool-label")}
+	if err := scope.Validate(); err != nil {
+		return nil, nil, err
+	}
+	scout.DownloadScope = scope
+	if scope.NodeLabel != "" {
+		gopher.TaskAllowed = scout.CurrentTaskAllowed
+	}
 	return scout, gopher, nil
 }
 
