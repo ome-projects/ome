@@ -1,0 +1,78 @@
+# Optional permissions for a controller that calls pkg/artifactinventory.
+# Change the ServiceAccount and agent namespace to match the caller.
+# This example is not installed by the OME charts.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ome-artifact-inventory
+  namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ome-artifact-inventory
+rules:
+  - apiGroups: ["ome.io"]
+    resources: ["basemodels"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ome-artifact-inventory
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ome-artifact-inventory
+subjects:
+  - kind: ServiceAccount
+    name: ome-artifact-inventory
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ome-artifact-inventory-models
+  namespace: ome
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ome-artifact-inventory-models
+  namespace: ome
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ome-artifact-inventory-models
+subjects:
+  - kind: ServiceAccount
+    name: ome-artifact-inventory
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ome-artifact-inventory-jobs
+  namespace: default
+rules:
+  - apiGroups: ["ome.io"]
+    resources: ["replicationjobs"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ome-artifact-inventory-jobs
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ome-artifact-inventory-jobs
+subjects:
+  - kind: ServiceAccount
+    name: ome-artifact-inventory
+    namespace: ome
