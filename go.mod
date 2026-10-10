@@ -54,9 +54,9 @@ require (
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
 	knative.dev/pkg v0.0.0-20250326102644-9f3e60a9244c
 	sigs.k8s.io/controller-runtime v0.24.1
-	sigs.k8s.io/gateway-api v1.6.0
+	sigs.k8s.io/gateway-api v1.6.3
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
-	sigs.k8s.io/kueue v0.19.2
+	sigs.k8s.io/kueue v0.19.7
 	sigs.k8s.io/lws v0.9.0
 	sigs.k8s.io/scheduler-plugins v0.34.7
 	sigs.k8s.io/yaml v1.6.0
@@ -64,7 +64,7 @@ require (
 )
 
 require (
-	cel.dev/expr v0.25.1 // indirect
+	cel.dev/expr v0.25.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/NYTimes/gziphandler v1.1.1 // indirect
@@ -163,7 +163,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.43.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
-	go.opentelemetry.io/otel/sdk v1.43.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.10.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
@@ -182,7 +182,7 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260610212136-7ab31c22f7ad // indirect
-	google.golang.org/grpc v1.82.1 // indirect
+	google.golang.org/grpc v1.83.2 // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
