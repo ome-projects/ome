@@ -1,0 +1,24 @@
+# Optional: apply with config/alfred and add --enable-maintenance-cordon=true to
+# the deployment to let execute mode cordon nodes under a maintenance rule with
+# cordon: true. Alfred never uncordons.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ome-alfred-maintenance-cordon
+rules:
+  - apiGroups: [ "" ]
+    resources: [ "nodes" ]
+    verbs: [ "get", "patch" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ome-alfred-maintenance-cordon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ome-alfred-maintenance-cordon
+subjects:
+  - kind: ServiceAccount
+    name: ome-alfred
+    namespace: ome

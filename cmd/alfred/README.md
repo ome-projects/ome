@@ -36,7 +36,9 @@ Alfred.
 Start with the [Helm defaults](../../charts/ome-alfred/values.yaml) or
 [Kustomize configuration](../../config/alfred). The default is `recommend-only`:
 Alfred can publish reports and Events but does not request migrations. Node
-health conditions and maintenance conditions, labels and taints are configurable.
+health conditions and maintenance conditions, labels and taints are configurable. A maintenance
+rule can also ask Alfred to cordon its nodes in execute mode; that needs the
+separate `maintenanceCordon` opt-in, and Alfred never uncordons.
 
 Execution requires compatible scheduler workers, explicit migration-v1 startup
 configuration, execution policy, admission guards and a retained dispatch

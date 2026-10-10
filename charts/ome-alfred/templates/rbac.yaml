@@ -24,7 +24,8 @@ rules:
     resources: [ "validatingadmissionpolicies", "validatingadmissionpolicybindings" ]
     resourceNames: [ "ome-alfred-migration-writes" ]
     verbs: [ "get" ]
-  # Nodes (read-only) — no cordon, no drain, no patch.
+  # Nodes (read-only) — no cordon, no drain, no patch. The opt-in
+  # maintenance-cordon ClusterRole is the only node write, and only cordons.
   - apiGroups: [ "" ]
     resources: [ "nodes" ]
     verbs: [ "get", "list", "watch" ]

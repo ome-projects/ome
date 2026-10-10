@@ -20,6 +20,11 @@ type MaintenanceTrigger struct {
 	Condition *MaintenanceCondition `json:"condition,omitempty"`
 	Label     *MaintenanceLabel     `json:"label,omitempty"`
 	Taint     *MaintenanceTaint     `json:"taint,omitempty"`
+	// Cordon asks Alfred to cordon a node while this rule requests
+	// maintenance, so schedulers stop placing new work there. It takes effect
+	// only in execute mode with the --enable-maintenance-cordon startup flag.
+	// Alfred never uncordons.
+	Cordon bool `json:"cordon,omitempty"`
 }
 
 // MaintenanceCondition matches an explicit condition type and status.

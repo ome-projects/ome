@@ -60,6 +60,9 @@ spec:
           - {{ printf "--migration-ack-timeout=%s" .Values.migration.acknowledgementTimeout | quote }}
           - {{ printf "--migration-failure-backoff=%s" .Values.migration.failureBackoff | quote }}
           {{- end }}
+          {{- if .Values.maintenanceCordon.enabled }}
+          - "--enable-maintenance-cordon=true"
+          {{- end }}
           {{- if .Values.simulation.configMapName }}
           - "--simulation-workers=/etc/alfred-simulation/workers.json"
           - {{ printf "--simulation-timeout=%s" .Values.simulation.timeout | quote }}
