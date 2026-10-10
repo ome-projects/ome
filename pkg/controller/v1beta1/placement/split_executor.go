@@ -74,11 +74,13 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 	if proposal.Mode == v1beta1.PlacementModeAll {
 		for name, observed := range observations {
 			// The standing read still describes an unreadable planned home. It keeps
-			// the plan it last acknowledged; only unverified ready capacity is withheld.
+			// the plan it last acknowledged, and its ready count follows the grace
+			// the failed planned read applied.
 			if home, exists := standing.get(name); exists && !observed.Candidate.ObservationKnown {
 				candidate := *home.candidate.DeepCopy()
 				candidate.Allocation, candidate.AppliedPlanID = observed.Candidate.Allocation, observed.Candidate.AppliedPlanID
-				candidate.ObservationKnown, candidate.ReadyReplicas = false, 0
+				candidate.ObservationKnown, candidate.ReadyReplicas = false, observed.Candidate.ReadyReplicas
+				candidate.ObservationFailingSince = observed.Candidate.ObservationFailingSince.DeepCopy()
 				observed.Candidate = candidate
 				observations[name] = observed
 			}
@@ -239,9 +241,7 @@ func (r *Reconciler) adoptSplitMembers(ctx context.Context, source *v1beta1.Infe
 	for _, name := range slices.Sorted(maps.Keys(inventory)) {
 		assignment := inventory[name]
 		candidate := v1beta1.CandidatePlacement{Cluster: name, Allocation: &assignment}
-		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-		observed, err := r.observePlannedHome(cctx, readSource, candidate, declaredComponents(source))
-		cancel()
+		observed, err := r.observePlannedHome(ctx, readSource, candidate, declaredComponents(source))
 		if err != nil {
 			return fmt.Errorf("cluster %q: %w", name, err)
 		}
@@ -298,9 +298,7 @@ func (r *Reconciler) observeSplitMembers(ctx context.Context, source *v1beta1.In
 		settled = settled && candidate.Allocation.CurrentReplicas == candidate.Allocation.DesiredReplicas
 	}
 	for _, candidate := range source.Status.Placement.Candidates {
-		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-		observed, err := r.observePlannedHome(cctx, source, candidate, declaredComponents(source))
-		cancel()
+		observed, err := r.observePlannedHome(ctx, source, candidate, declaredComponents(source))
 		if err != nil {
 			r.Log.Error(err, "planned member observation failed", "cluster", candidate.Cluster)
 		}
@@ -417,7 +415,7 @@ func (r *Reconciler) writeSplitObservations(ctx context.Context, source *v1beta1
 		observed := observations[previous.Cluster]
 		candidate := observed.Candidate
 		if candidate.Cluster == "" {
-			candidate = retainedUnknownCandidate(source, previous)
+			candidate = r.unknownCandidate(source, previous)
 		}
 		res.candidates = append(res.candidates, candidate)
 		if (previous.Allocation.CurrentReplicas > 0 || previous.Allocation.CurrentHome != nil) && res.phase == v1beta1.PlacementPhasePending {

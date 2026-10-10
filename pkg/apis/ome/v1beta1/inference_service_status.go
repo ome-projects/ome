@@ -600,6 +600,14 @@ type CandidatePlacement struct {
 	// +optional
 	ObservationKnown bool `json:"observationKnown,omitempty"`
 
+	// ObservationFailingSince is when the control plane's reads of this home
+	// started failing. It is unset while reads succeed. While the configured
+	// observation grace lasts from this time, the home keeps the ready count
+	// from its last successful read.
+	// +optional
+	// +ome:since=v1.3
+	ObservationFailingSince *metav1.Time `json:"observationFailingSince,omitempty"`
+
 	// Cluster is the WorkloadCluster name.
 	Cluster string `json:"cluster"`
 	// Phase is the candidate's state.

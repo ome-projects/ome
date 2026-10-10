@@ -35,6 +35,8 @@ func TestNewMultiClusterConfig(t *testing.T) {
 				assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.HealthIntervalDuration())
 				assert.Equal(t, time.Duration(0), cfg.Placement.RequeueIntervalDuration())
 				assert.Equal(t, 0, cfg.Placement.MaxConcurrentReconciles)
+				assert.Equal(t, time.Duration(0), cfg.Placement.ObservationGraceDuration())
+				assert.Equal(t, PlacementMemberReadRetryConfig{}, cfg.Placement.MemberReadRetry)
 				assert.Equal(t, "", cfg.Placement.DispatcherMode)
 				assert.Equal(t, "", cfg.Endpoint.GlobalGateway)
 				assert.Equal(t, RoutingObserverConfig{}, cfg.Routing.Observer)
@@ -66,6 +68,8 @@ func TestNewMultiClusterConfig(t *testing.T) {
 						"maxConcurrentReconciles": 8,
 						"fanoutTimeout": "20s",
 						"winnerLostGrace": "2m",
+						"observationGrace": "3m",
+						"memberReadRetry": {"maxAttempts": 3, "initialBackoff": "200ms", "maxBackoff": "1s"},
 						"statusBatchPeriod": "500ms",
 						"statusSafetyRequeue": "5m",
 						"dispatcherMode": "Incremental",
@@ -127,6 +131,10 @@ func TestNewMultiClusterConfig(t *testing.T) {
 				assert.Equal(t, 8, pl.MaxConcurrentReconciles)
 				assert.Equal(t, 20*time.Second, pl.FanoutTimeoutDuration())
 				assert.Equal(t, 2*time.Minute, pl.WinnerLostGraceDuration())
+				assert.Equal(t, 3*time.Minute, pl.ObservationGraceDuration())
+				assert.Equal(t, 3, pl.MemberReadRetry.MaxAttempts)
+				assert.Equal(t, 200*time.Millisecond, pl.MemberReadRetry.InitialBackoffDuration())
+				assert.Equal(t, time.Second, pl.MemberReadRetry.MaxBackoffDuration())
 				assert.Equal(t, 500*time.Millisecond, pl.StatusBatchPeriodDuration())
 				assert.Equal(t, 5*time.Minute, pl.StatusSafetyRequeueDuration())
 				assert.Equal(t, "Incremental", pl.DispatcherMode)
@@ -222,6 +230,39 @@ func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 			name: "non-positive duration",
 			cfg:  MultiClusterConfig{Placement: PlacementConfig{GCInterval: "0s"}},
 			want: "placement.gcInterval",
+		},
+		{
+			name: "observation grace missing a unit",
+			cfg:  MultiClusterConfig{Placement: PlacementConfig{ObservationGrace: "90"}},
+			want: "placement.observationGrace",
+		},
+		{
+			name: "negative member read attempts",
+			cfg: MultiClusterConfig{Placement: PlacementConfig{
+				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: -1},
+			}},
+			want: "placement.memberReadRetry.maxAttempts",
+		},
+		{
+			name: "member read retries without backoffs",
+			cfg: MultiClusterConfig{Placement: PlacementConfig{
+				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 3},
+			}},
+			want: "placement.memberReadRetry.initialBackoff",
+		},
+		{
+			name: "member read backoffs without retries",
+			cfg: MultiClusterConfig{Placement: PlacementConfig{
+				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 1, InitialBackoff: "1s", MaxBackoff: "2s"},
+			}},
+			want: "placement.memberReadRetry.maxAttempts",
+		},
+		{
+			name: "member read maximum backoff below the initial one",
+			cfg: MultiClusterConfig{Placement: PlacementConfig{
+				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 3, InitialBackoff: "2s", MaxBackoff: "1s"},
+			}},
+			want: "placement.memberReadRetry.maxBackoff",
 		},
 		{
 			name: "malformed observer minimum period",
@@ -324,7 +365,10 @@ func TestMultiClusterConfig_ValidateAcceptsEmptyAndWellFormed(t *testing.T) {
 	require.NoError(t, MultiClusterConfig{Endpoint: EndpointConfig{}}.Validate())
 	require.NoError(t, MultiClusterConfig{
 		WorkloadCluster: WorkloadClusterConfig{HealthInterval: "30s", EstablishMax: "10m"},
-		Placement:       PlacementConfig{GCInterval: "5m", LocalQueue: "gpu-queue"},
+		Placement: PlacementConfig{
+			GCInterval: "5m", LocalQueue: "gpu-queue", ObservationGrace: "2m",
+			MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 3, InitialBackoff: "500ms", MaxBackoff: "2s"},
+		},
 		Endpoint: EndpointConfig{
 			GlobalGateway: "infra/global-gw",
 			BackendPort:   443,

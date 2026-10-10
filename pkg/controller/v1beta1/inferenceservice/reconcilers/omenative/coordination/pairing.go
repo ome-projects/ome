@@ -205,10 +205,7 @@ func (ctx GateContext) CheckPairing(strategy workloadtypes.UpdateStrategyType, i
 		workloadtypes.UpdateStrategyInPlaceIfPossible, workloadtypes.UpdateStrategyInPlaceOnly:
 		credit = 1
 	}
-	peer := v1beta1.DecoderComponent
-	if component == v1beta1.DecoderComponent {
-		peer = v1beta1.EngineComponent
-	}
+	peer := pairingPeer(component)
 	// In-flight fresh starts from this wake-up haven't reached IR status yet;
 	// charge them against the cohort under simulation (worst case they all
 	// came from it). Surge in-flights carry their own replacement credit.

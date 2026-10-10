@@ -32,12 +32,19 @@ type plannedHomeObservation struct {
 	Terminal          bool
 }
 
-// observePlannedHome reads a direct, identity-checked member inventory. Component
+// observePlannedHome reads a direct, identity-checked member inventory,
+// re-reading it after a transient failure as MemberReadRetry allows. Component
 // requirements include every declared component, even before its IR exists.
 func (r *Reconciler) observePlannedHome(ctx context.Context, source *v1beta1.InferenceService, previous v1beta1.CandidatePlacement, components []v1beta1.ComponentType) (plannedHomeObservation, error) {
+	return retryMemberRead(ctx, r, previous.Cluster, func(attemptCtx context.Context) (plannedHomeObservation, error) {
+		return r.observePlannedHomeOnce(attemptCtx, source, previous, components)
+	})
+}
+
+func (r *Reconciler) observePlannedHomeOnce(ctx context.Context, source *v1beta1.InferenceService, previous v1beta1.CandidatePlacement, components []v1beta1.ComponentType) (plannedHomeObservation, error) {
 	// An unreadable member keeps the plan it last acknowledged behind an unknown
-	// observation; unverified ready capacity is withheld because it routes traffic.
-	out := plannedHomeObservation{Candidate: retainedUnknownCandidate(source, previous)}
+	// observation; its ready count, which routes traffic, follows the grace.
+	out := plannedHomeObservation{Candidate: r.unknownCandidate(source, previous)}
 	if previous.Allocation == nil || source.Status.Placement == nil || source.Status.Placement.Plan == nil || len(components) == 0 {
 		return out, fmt.Errorf("planned observation requires allocation authority and resolved components")
 	}

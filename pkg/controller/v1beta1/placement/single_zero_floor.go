@@ -46,9 +46,7 @@ func (r *Reconciler) retainZeroFloorWinner(ctx context.Context, source *v1beta1.
 		if candidate.Cluster != winner || candidate.Allocation == nil || !zeroHomeFloor(candidate.Allocation.CurrentHome) {
 			continue
 		}
-		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-		observed, err := r.observePlannedHome(cctx, source, candidate, declaredComponents(source))
-		cancel()
+		observed, err := r.observePlannedHome(ctx, source, candidate, declaredComponents(source))
 		if err != nil {
 			return false, err
 		}

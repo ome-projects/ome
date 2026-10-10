@@ -114,7 +114,7 @@ func TestPlan_MigrationRequestWaitsForASurgeCycleToResolve(t *testing.T) {
 // Ready row there is the pause between crashes, and keeping it over the
 // running revision's row would land the push by attrition and leave the
 // Component on a revision the ladder has given up on. Within each class
-// the serving rows are kept first, then the oldest index.
+// the serving rows are kept first, then the lowest index.
 func TestBuildPlan_ScaleDownKeepsARunningRevisionRowOverAFailingRevisionOne(t *testing.T) {
 	const running, pushed = "svc-engine-aaaaaaaa", "svc-engine-bbbbbbbb"
 	now := metav1.Now()
@@ -156,7 +156,7 @@ func TestBuildPlan_ScaleDownKeepsARunningRevisionRowOverAFailingRevisionOne(t *t
 			[]types.InstanceStatus{failedToward(0, running, pushed), readyOn(1, pushed)}, held, []int32{1}},
 		{"with every row on the failing revision the serving row is kept",
 			[]types.InstanceStatus{readyOn(0, pushed), restartingOn(1, pushed)}, held, []int32{0}},
-		{"rows on a sound revision keep the oldest index",
+		{"rows on a sound revision keep the lowest index",
 			[]types.InstanceStatus{readyOn(0, running), readyOn(1, running)}, held, []int32{0}},
 		{"an attempt in flight on the revision does not read it as failing",
 			[]types.InstanceStatus{readyOn(0, pushed), readyOn(1, running)}, []types.RetryBlock{{TargetRevision: pushed, State: types.RetryBlockRetryInProgress}}, []int32{0}},
@@ -174,6 +174,39 @@ func TestBuildPlan_ScaleDownKeepsARunningRevisionRowOverAFailingRevisionOne(t *t
 			}
 			if diff := cmp.Diff(tc.want, got); diff != "" {
 				t.Fatalf("the plan must keep the running revision's row over a failing revision's (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// A scale-down reads the cordoned Instances the adapter projects: the
+// Instance with a pod on a cordoned node leaves first even when it is the
+// healthiest and lowest index, and the extras are exactly the rows the
+// plan dropped.
+func TestBuildPlan_ScaleDownRemovesTheCordonedInstanceFirst(t *testing.T) {
+	healthy := func(idx int32) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, PodCount: 1, ServingPodCount: 1}
+	}
+	rows := []types.InstanceStatus{healthy(0), {Index: 1, Phase: types.InstancePhaseCreating, PodCount: 1}, healthy(2), healthy(3)}
+	cases := []struct {
+		name     string
+		cordoned map[int32]struct{}
+		replicas int32
+		extras   []int32
+	}{
+		{"no cordoned node: the Creating row and then the highest index leave", nil, 2, []int32{1, 3}},
+		{"the healthy lowest index on a cordoned node leaves first", map[int32]struct{}{0: {}}, 3, []int32{0}},
+		{"then the usual order among the rest", map[int32]struct{}{0: {}}, 2, []int32{0, 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			observed := types.WorkloadObservedState{InstanceStatuses: rows, CordonedInstances: tc.cordoned}
+			plan, err := workload.BuildPlan(types.ComponentEngine, types.WorkloadDesiredSpec{Replicas: tc.replicas}, observed)
+			if err != nil {
+				t.Fatalf("BuildPlan: %v", err)
+			}
+			if diff := cmp.Diff(tc.extras, workload.ScaleDownExtras(rows, plan)); diff != "" {
+				t.Fatalf("scale-down extras (-want +got):\n%s", diff)
 			}
 		})
 	}

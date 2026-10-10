@@ -167,6 +167,16 @@ type Reconciler struct {
 	// once the window elapses. Config-driven
 	// (manager flag / chart); zero (unset) falls back to DefaultWinnerLostGrace.
 	WinnerLostGracePeriod time.Duration
+	// ObservationGrace is how long a home whose reads fail keeps the ready count
+	// from its last successful read, counted from the first failed read that the
+	// home's candidate status records. Config-driven (chart); zero withdraws the
+	// count at the first failed read.
+	ObservationGrace time.Duration
+	// MemberReadRetry re-reads a member within one reconcile after a transient
+	// failure. Config-driven (chart); the zero value reads each member once.
+	MemberReadRetry MemberReadRetry
+	// ObservationClock dates failed reads and their grace; nil uses the system clock.
+	ObservationClock clock.PassiveClock
 
 	// DispatcherMode selects the fan-out BREADTH policy: AllAtOnce clones onto
 	// every matched candidate at once (the historical behavior); Incremental
@@ -245,12 +255,17 @@ type Reconciler struct {
 // InferenceService — this placer writes status and its finalizer, the endpoint
 // publisher writes its own finalizer — so a write can lose a resourceVersion
 // race. That is benign and self-corrects on the requeue, so it must not surface
-// as an error-level "Reconciler error" (misleading log noise). All other results
-// pass through unchanged.
+// as an error-level "Reconciler error" (misleading log noise). Every other
+// result passes through, except that the requeue is shortened to the end of
+// the earliest observation grace so the drain after it is not late.
 func (r *Reconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
-	res, err := r.reconcile(ctx, request)
+	wake := &graceWake{}
+	res, err := r.reconcile(context.WithValue(ctx, graceWakeKey{}, wake), request)
 	if apierrors.IsConflict(err) {
 		res, err = ctrl.Result{Requeue: true}, nil
+	}
+	if err == nil {
+		res = r.wakeForGrace(res, wake)
 	}
 	return normalizeRetryPriority(res, err), err
 }
@@ -903,6 +918,7 @@ func (r *Reconciler) writePlacement(ctx context.Context, isvc *v1beta1.Inference
 		policyConds = append(policyConds, capacityFreshCondition("Unknown", "CapacityNotObserved", "Capacity inputs have not been verified in this reconcile"))
 	}
 	key := client.ObjectKeyFromObject(isvc)
+	var written []v1beta1.CandidatePlacement
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		cur := &v1beta1.InferenceService{}
 		if err := r.APIReader.Get(ctx, key, cur); err != nil {
@@ -934,6 +950,7 @@ func (r *Reconciler) writePlacement(ctx context.Context, isvc *v1beta1.Inference
 		// for conflict-safe status persistence. A concurrent spec update must not
 		// be reported as observed until its own reconcile computes placement.
 		cur.Status.ObservedGeneration = isvc.Generation
+		written = cur.Status.Placement.Candidates
 		return r.Status().Update(ctx, cur)
 	})
 	if err != nil {
@@ -948,6 +965,7 @@ func (r *Reconciler) writePlacement(ctx context.Context, isvc *v1beta1.Inference
 	// Publish only after the status write landed, so the gauges never advertise
 	// a placement the API server rejected.
 	recordPlacement(isvc, res)
+	r.noteGraceEnds(ctx, written)
 	return ctrl.Result{RequeueAfter: r.safetyRequeue()}, nil
 }
 

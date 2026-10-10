@@ -310,9 +310,7 @@ func (r *Reconciler) singlePlanStatus(ctx context.Context, source *v1beta1.Infer
 			candidate.AppliedPlanID = stored.AppliedPlanID
 		}
 		if candidate.Allocation != nil {
-			cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-			observed, err := r.observePlannedHome(cctx, source, candidate, declaredComponents(source))
-			cancel()
+			observed, err := r.observePlannedHome(ctx, source, candidate, declaredComponents(source))
 			if err != nil {
 				r.Log.Error(err, "planned member observation failed", "cluster", name)
 			} else {

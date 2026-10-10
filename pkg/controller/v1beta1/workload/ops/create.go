@@ -637,7 +637,7 @@ func processReadyActions(ctx context.Context, deps workload.Deps, input workload
 			if podreadiness.IsServing(pod) {
 				continue
 			}
-			changed, err := podreadiness.MarkPodServingWithChange(ctx, deps.Client, deps.Reader(), pod, podreadiness.WriterLifecycle, podreadiness.KeyLifecycleInstanceReady)
+			changed, err := putPodBackIntoService(ctx, deps, input, action.instance.Index, pod)
 			if err != nil {
 				// A permanently refused gate patch disposes the row; its
 				// promotion is void and the neighbours go on.
@@ -671,6 +671,21 @@ func processReadyActions(ctx context.Context, deps workload.Deps, input workload
 		}
 	}
 	return commitReadyActions(ctx, deps, input, completed)
+}
+
+// putPodBackIntoService writes the serving gate on a pod the Create pass
+// promotes. A hold a surge's drain step left on the pod outlives the
+// attempt that wrote it, so it is lifted first: the gate write alone would
+// leave the pod out of rotation under a hold nothing else releases.
+func putPodBackIntoService(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, pod *corev1.Pod) (bool, error) {
+	var activeOrdinal int32
+	if row := input.ObservedState.Instance(idx); row != nil {
+		activeOrdinal = row.ActiveOrdinal
+	}
+	if err := liftSurgeDrainHolds(ctx, deps, idx, activeOrdinal, []*corev1.Pod{pod}); err != nil {
+		return false, err
+	}
+	return podreadiness.MarkPodServingWithChange(ctx, deps.Client, deps.Reader(), pod, podreadiness.WriterLifecycle, podreadiness.KeyLifecycleInstanceReady)
 }
 
 func commitReadyActions(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, actions []*createReadyAction) (bool, error) {

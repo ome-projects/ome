@@ -1590,6 +1590,10 @@ func (in *CandidatePlacement) DeepCopyInto(out *CandidatePlacement) {
 		*out = new(CandidateAllocationStatus)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.ObservationFailingSince != nil {
+		in, out := &in.ObservationFailingSince, &out.ObservationFailingSince
+		*out = (*in).DeepCopy()
+	}
 	if in.Endpoint != nil {
 		in, out := &in.Endpoint, &out.Endpoint
 		*out = new(apis.URL)

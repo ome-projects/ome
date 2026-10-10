@@ -105,9 +105,7 @@ func (o *placementObservations) refresh(ctx context.Context, r *Reconciler, isvc
 			previous = current.candidate
 		}
 	}
-	observationCtx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-	home := r.observeHome(observationCtx, isvc, previous, o.known[cluster])
-	cancel()
+	home := r.observeHome(ctx, isvc, previous, o.known[cluster])
 	o.homes[cluster] = home
 	return home
 }
@@ -117,11 +115,25 @@ func (o *placementObservations) get(cluster string) (homeObservation, bool) {
 	return home, ok
 }
 
-// observeHome reads one member without changing it. A disconnected or
-// unreadable member is Unknown and loses routable ready capacity for this
-// observation. NotFound, a terminating copy, a foreign same-name object, or a
+// observeHome reads one member without changing it, re-reading it after a
+// transient failure as MemberReadRetry allows. A disconnected or unreadable
+// member is Unknown and keeps its ready count only within the observation
+// grace. NotFound, a terminating copy, a foreign same-name object, or a
 // removed WorkloadCluster are conclusive absence.
 func (r *Reconciler) observeHome(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	previous v1beta1.CandidatePlacement,
+	known bool,
+) homeObservation {
+	home, _ := retryMemberRead(ctx, r, previous.Cluster, func(attemptCtx context.Context) (homeObservation, error) {
+		home := r.observeHomeOnce(attemptCtx, isvc, previous, known)
+		return home, home.err
+	})
+	return home
+}
+
+func (r *Reconciler) observeHomeOnce(
 	ctx context.Context,
 	isvc *v1beta1.InferenceService,
 	previous v1beta1.CandidatePlacement,
@@ -140,7 +152,7 @@ func (r *Reconciler) observeHome(
 		return absent()
 	}
 	unknown := func(err error) homeObservation {
-		candidate := retainedUnknownCandidate(isvc, previous)
+		candidate := r.unknownCandidate(isvc, previous)
 		return homeObservation{state: homeUnknown, candidate: candidate, err: err}
 	}
 	var cl client.Client
@@ -184,7 +196,7 @@ func (r *Reconciler) observeHome(
 
 	statuses, err := componentIRStatuses(ctx, r.instanceStatusReader(cl), derived)
 	if err != nil {
-		candidate := retainedUnknownCandidate(isvc, previous)
+		candidate := r.unknownCandidate(isvc, previous)
 		candidate.Endpoint = nil
 		if endpoint := endpointFor(derived); endpoint != nil {
 			candidate.Endpoint = endpoint.DeepCopy()
@@ -264,22 +276,6 @@ func terminalHome(cluster string, member *v1beta1.InferenceService) homeObservat
 		terminal:       true,
 		terminalMember: member,
 	}
-}
-
-// retainedUnknownCandidate carries a home's last known state behind an unknown
-// observation. Ready capacity is withheld because it is the routing weight.
-func retainedUnknownCandidate(isvc *v1beta1.InferenceService, previous v1beta1.CandidatePlacement) v1beta1.CandidatePlacement {
-	candidate := *previous.DeepCopy()
-	candidate = normalizeCandidatePhase(candidate)
-	candidate.ObservationKnown = false
-	candidate.ReadyReplicas = 0
-	if !hasPolicyRefs(isvc) {
-		candidate.Autoscaling = nil
-	}
-	if !hasRolloutPolicyRefs(isvc) {
-		candidate.Rollout = nil
-	}
-	return candidate
 }
 
 func standingPlacementCandidates(isvc *v1beta1.InferenceService) []v1beta1.CandidatePlacement {

@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
@@ -2280,4 +2281,60 @@ func gangObservationsFor(idx int32, state workload.GangState) *workload.GangObse
 	g := workload.NewGangObservations()
 	g.Record(idx, workload.GangObservation{Name: "llama-70b-engine-0", State: state, Message: "PodGroup llama-70b-engine-0 is controlled by StatefulSet/other-owner, not by this owner"})
 	return g
+}
+
+// TestCreate_PutsASourceBackIntoServiceByLiftingTheDrainHoldItsSurgeLeft
+// pins the gate write of the Create pass on a row it re-proves. A single-pod
+// surge disposed at its drain step left its source out of rotation under
+// the drain's hold, and the roll target is back on the revision the source
+// runs. The hold is lifted before the serving gate is written, so the source
+// returns to rotation: with PodReady already folded the row promotes in the
+// same pass, and without it the row waits on the promote bar with its pod
+// routable again.
+func TestCreate_PutsASourceBackIntoServiceByLiftingTheDrainHoldItsSurgeLeft(t *testing.T) {
+	const running = "llama-70b-engine-rev-v1hash"
+	for _, tc := range []struct {
+		name     string
+		podReady bool
+	}{
+		{"PodReady folded, the row promotes", true},
+		{"PodReady not yet folded, the row waits with its pod routable", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			isvc, ir := surgeISVCReady("llama-70b", "prod", 1)
+			ir.Status.InstanceStatuses[0] = v1beta1.OMENativeInstanceStatus{
+				Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceFailed, RunningRevision: running,
+			}
+			source := surgePodAtOrdinal(isvc, 0, 1, 0, true, false)
+			source.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(running)
+			if tc.podReady {
+				podReadyAt(source, time.Now().Add(-time.Minute))
+			}
+			c := legacyNewFakeClient(t, isvc, ir, source)
+			holdSourceForDrain(t, c, source)
+			target := makeCR(t, c, isvc, running)
+			input := legacyTestInput(isvc, c, workload.ComponentEngine)
+			if _, err := Create(context.Background(), legacyTestDeps(c), input, surgePlan(), target); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+
+			fresh := &corev1.Pod{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(source), fresh); err != nil {
+				t.Fatalf("read the source: %v", err)
+			}
+			if !podreadiness.IsServing(fresh) || podreadiness.HeldNotServingBy(fresh, podreadiness.WriterUpdateSurgeDrain) {
+				t.Fatalf("the source is still held out of rotation after the gate write: conditions=%+v", fresh.Status.Conditions)
+			}
+			s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+			wantPhase := v1beta1.OMENativeInstanceFailed
+			if tc.podReady {
+				wantPhase = v1beta1.OMENativeInstanceReady
+			}
+			if s.Phase != wantPhase || s.Operation != nil || s.RunningRevision != running {
+				t.Fatalf("row after the pass: phase=%s running=%s op=%+v, want phase=%s on %s with no operation",
+					s.Phase, s.RunningRevision, s.Operation, wantPhase, running)
+			}
+		})
+	}
 }
