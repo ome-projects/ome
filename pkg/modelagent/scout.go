@@ -13,12 +13,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
 	"knative.dev/pkg/kmp"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omev1beta1client "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omev1beta1informers "sigs.k8s.io/ome/pkg/client/informers/externalversions"
 	omev1beta1 "sigs.k8s.io/ome/pkg/client/informers/externalversions/ome/v1beta1"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
@@ -39,6 +42,7 @@ type Scout struct {
 	nodeInfo               *v1.Node
 	nodeShapeAlias         string
 	kubeClient             *kubernetes.Clientset
+	omeClient              omev1beta1client.Interface
 	logger                 *zap.SugaredLogger
 }
 
@@ -65,6 +69,7 @@ func NewScout(ctx context.Context, nodeName string,
 	informerFactory omev1beta1informers.SharedInformerFactory,
 	gopherChan chan<- *GopherTask,
 	kubeClient *kubernetes.Clientset,
+	omeClient omev1beta1client.Interface,
 	logger *zap.SugaredLogger) (*Scout, error) {
 
 	logger.Infof("Initializing Scout for node: %s", nodeName)
@@ -100,6 +105,7 @@ func NewScout(ctx context.Context, nodeName string,
 		gopherChan:             gopherChan,
 		nodeName:               nodeName,
 		kubeClient:             kubeClient,
+		omeClient:              omeClient,
 		logger:                 logger,
 	}
 
@@ -133,7 +139,7 @@ func NewScout(ctx context.Context, nodeName string,
 	if _, err := baseModelInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    scout.downloadBaseModel,
 		UpdateFunc: scout.updateBaseModel,
-		DeleteFunc: scout.deleteBaseModel,
+		DeleteFunc: scout.onBaseModelDeleted,
 	}); err != nil {
 		return nil, err
 	}
@@ -141,7 +147,7 @@ func NewScout(ctx context.Context, nodeName string,
 	if _, err := clusterBaseModelInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    scout.downloadClusterBaseModel,
 		UpdateFunc: scout.updateClusterBaseModel,
-		DeleteFunc: scout.deleteClusterBaseModel,
+		DeleteFunc: scout.onClusterBaseModelDeleted,
 	}); err != nil {
 		return nil, err
 	}
@@ -482,6 +488,70 @@ func downloadOverrideInputsFromSpec(spec v1beta1.BaseModelSpec) downloadOverride
 		IsTensorRTLLMModel:   isTensorRTLLMModel,
 		TensorRTLLMModelType: modelType,
 	}
+}
+
+// onBaseModelDeleted handles an informer Deleted event for a BaseModel.
+// A real deletion normally reaches updateBaseModel first, because the
+// controller's finalizer keeps the object while its deletion timestamp is
+// set. This path therefore only cleans up after a live read confirms that
+// the object is gone.
+func (w *Scout) onBaseModelDeleted(obj interface{}) {
+	baseModel, ok := obj.(*v1beta1.BaseModel)
+	if !ok {
+		w.deleteBaseModel(obj)
+		return
+	}
+	key := baseModel.Namespace + "/" + baseModel.Name
+	if w.deleteContradictedByLiveObject("BaseModel", key, baseModel.UID, func(ctx context.Context) (metav1.Object, error) {
+		return w.omeClient.OmeV1beta1().BaseModels(baseModel.Namespace).Get(ctx, baseModel.Name, metav1.GetOptions{})
+	}) {
+		return
+	}
+	w.deleteBaseModel(baseModel)
+}
+
+// onClusterBaseModelDeleted handles an informer Deleted event for a
+// ClusterBaseModel. See onBaseModelDeleted.
+func (w *Scout) onClusterBaseModelDeleted(obj interface{}) {
+	clusterBaseModel, ok := obj.(*v1beta1.ClusterBaseModel)
+	if !ok {
+		w.deleteClusterBaseModel(obj)
+		return
+	}
+	if w.deleteContradictedByLiveObject("ClusterBaseModel", clusterBaseModel.Name, clusterBaseModel.UID, func(ctx context.Context) (metav1.Object, error) {
+		return w.omeClient.OmeV1beta1().ClusterBaseModels().Get(ctx, clusterBaseModel.Name, metav1.GetOptions{})
+	}) {
+		return
+	}
+	w.deleteClusterBaseModel(clusterBaseModel)
+}
+
+// deleteContradictedByLiveObject reads the object from the API server and
+// reports whether the informer Deleted event must be ignored. It returns true
+// when the same object (same UID) still exists without a deletion timestamp,
+// for example after a phantom Deleted event during a CRD upgrade. It also
+// returns true when the live read keeps failing, because removing node state
+// for a model that may still be live is worse than a missed cleanup.
+func (w *Scout) deleteContradictedByLiveObject(kind, key string, uid types.UID, get func(context.Context) (metav1.Object, error)) bool {
+	var live metav1.Object
+	err := retry.OnError(retry.DefaultBackoff, func(err error) bool {
+		return !errors.IsNotFound(err)
+	}, func() error {
+		var getErr error
+		live, getErr = get(w.ctx)
+		return getErr
+	})
+	switch {
+	case errors.IsNotFound(err):
+		return false
+	case err != nil:
+		w.logger.Errorf("Ignoring Deleted event for %s %s: cannot confirm deletion with the API server: %v", kind, key, err)
+		return true
+	case live.GetUID() != uid || live.GetDeletionTimestamp() != nil:
+		return false
+	}
+	w.logger.Warnf("Ignoring Deleted event for %s %s: object still exists with UID %s", kind, key, uid)
+	return true
 }
 
 func (w *Scout) deleteBaseModel(obj interface{}) {
