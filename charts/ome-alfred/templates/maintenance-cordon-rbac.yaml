@@ -1,0 +1,30 @@
+{{- if and .Values.enabled .Values.maintenanceCordon.enabled }}
+# The only node write Alfred can make: cordon a node that a maintenance rule
+# with cordon: true puts under maintenance. Kept out of the base ClusterRole so
+# installs without the opt-in stay read-only on nodes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ome-alfred-maintenance-cordon
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [ "" ]
+    resources: [ "nodes" ]
+    verbs: [ "get", "patch" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ome-alfred-maintenance-cordon
+  labels:
+    {{- include "ome-alfred.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ome-alfred-maintenance-cordon
+subjects:
+  - kind: ServiceAccount
+    name: ome-alfred
+    namespace: {{ .Release.Namespace }}
+{{- end }}

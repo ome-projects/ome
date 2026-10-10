@@ -1509,6 +1509,24 @@ tolerate). Labels alone do not prevent scheduling without corresponding hard
 affinity. `NoExecute` can evict live pods independently of Alfred's safe
 migration path. Alfred never adds or removes these Node restrictions.
 
+#### Optional maintenance cordon
+
+Planned maintenance can be signalled by a label alone, such as a start time.
+Nothing then stops schedulers from placing new work on those nodes, so the
+nodes may never empty, and a replacement may land on another node of the same
+group. An operator who wants Alfred to close that gap sets `cordon: true` on a
+maintenance rule, runs Alfred with `--enable-maintenance-cordon`, and grants the
+separate `ome-alfred-maintenance-cordon` ClusterRole (`get`, `patch` on nodes).
+The chart does all three with `maintenanceCordon.enabled: true`.
+
+In execute mode Alfred then cordons each node that such a rule puts under
+maintenance, before it decides moves. It re-reads the node, acts only while the
+rule still matches it, records the rule in the
+`alfred.ome.io/cordoned-for-maintenance` annotation and emits
+`NodeCordonedForMaintenance`. It never uncordons, and it leaves an existing
+cordon unclaimed: the tooling that owns the node returns it to service.
+Recommend-only mode never cordons.
+
 #### TPU instances on per-Instance slices
 
 Surge planning and the scheduler simulation model GPUs only, so a TPU instance
@@ -1553,7 +1571,7 @@ Alfred already holds.** Those three, and nothing more:
 
 There is **no** `patch nodes`, **no** `update nodes/status`, **no** cordon (which
 is a node spec write), **no** drain, **no** cloud-API call, **no** pod-level
-write of any kind. RawDeployment and LWS remain advisory in Alpha, and therefore
+write of any kind, unless an operator opts into the maintenance cordon below. RawDeployment and LWS remain advisory in Alpha, and therefore
 **no** cloud credential anywhere in Policy #2. Emitting an Event whose `involvedObject`
 is a Node requires only the `create events` permission Alfred already has for its
 recommendations — it does not require write access to the Node itself.
@@ -2362,7 +2380,7 @@ perform on that resource:
 
 | Resource | Verbs | What the write can do | Why no broader grant |
 |---|---|---|---|
-| `nodes` | get, list, watch | nothing — read-only | Policy #2 evacuates *workloads*, it never touches the Node object; node cordon/drain belongs to maintenance tooling, not the caretaker |
+| `nodes` | get, list, watch | nothing — read-only | Policy #2 evacuates *workloads* and by default never touches the Node object; node cordon/drain belongs to maintenance tooling. The opt-in maintenance cordon (below) adds `get, patch` in a separate ClusterRole and only sets `spec.unschedulable` |
 | `pods` | get, list, watch | nothing — read-only | physical placement and current readiness; Alfred never performs pod-level lifecycle actions |
 | `persistentvolumeclaims`, `persistentvolumes` | get, list, watch | nothing — read-only | model-volume access modes and topology for placement feasibility |
 | `inferencereplicas` | get, list, watch | nothing — read-only | stable OMENative Instance identity, lifecycle state, and authoritative migration status |

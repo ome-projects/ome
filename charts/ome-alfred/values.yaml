@@ -73,6 +73,12 @@ migration:
   acknowledgementTimeout: 2m
   failureBackoff: 5m
 
+# Operator opt-in that lets execute mode cordon nodes under a maintenance rule
+# with cordon: true. Grants node get/patch in a separate ClusterRole and passes
+# --enable-maintenance-cordon. Alfred never uncordons.
+maintenanceCordon:
+  enabled: false
+
 # Alfred's policy configuration, rendered verbatim
 # into <configMapName>'s config.yaml and hot-reloaded by every replica. A
 # config that fails schema validation is rejected at reload and the

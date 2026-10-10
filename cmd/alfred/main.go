@@ -81,6 +81,7 @@ type Options struct {
 	migrationServiceAccount string
 	migrationAckTimeout     time.Duration
 	migrationFailureBackoff time.Duration
+	maintenanceCordon       bool
 	zapOpts                 zap.Options
 }
 
@@ -116,6 +117,7 @@ func GetOptions() Options {
 	flag.DurationVar(&opts.simulationTimeout, "simulation-timeout", opts.simulationTimeout, "Whole-process timeout per scheduler prediction (positive, at most 1m).")
 	flag.StringVar(&opts.migrationAPIVersion, "migration-api-version", "", "Operator-confirmed migration API compatibility (v1); empty disables migration dispatch.")
 	flag.StringVar(&opts.migrationServiceAccount, "migration-service-account", "", "Alfred service account name enforced by the migration admission guard; required with migration-api-version.")
+	flag.BoolVar(&opts.maintenanceCordon, "enable-maintenance-cordon", false, "Let execute mode cordon nodes that a maintenance rule with cordon: true puts under maintenance. Requires node patch permission; Alfred never uncordons.")
 	flag.DurationVar(&opts.migrationAckTimeout, "migration-ack-timeout", opts.migrationAckTimeout, "Timeout before marking an unacknowledged request stalled (positive, at most 1h).")
 	flag.DurationVar(&opts.migrationFailureBackoff, "migration-failure-backoff", opts.migrationFailureBackoff, "Backoff after migration failure (positive, at most 1h).")
 	opts.zapOpts.BindFlags(flag.CommandLine)
@@ -239,6 +241,14 @@ func main() {
 		Metrics:   alfredMetrics,
 		Log:       ctrl.Log.WithName("alfred-decision"),
 		EarlyTick: earlyTicker.C,
+	}
+	if opts.maintenanceCordon {
+		decisionLoop.Cordoner = &engine.MaintenanceCordoner{
+			Client:   mgr.GetClient(),
+			Recorder: mgr.GetEventRecorderFor("alfred"),
+			Metrics:  alfredMetrics,
+			Log:      ctrl.Log.WithName("alfred-cordon"),
+		}
 	}
 	if err := configureMigration(opts, mgr.GetAPIReader(), mgr.GetClient(), observationLoop, decisionLoop); err != nil {
 		setupLog.Error(err, "unable to configure migration dispatch")

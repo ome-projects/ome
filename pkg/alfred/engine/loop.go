@@ -46,10 +46,13 @@ type DecisionLoop struct {
 	// Predictions is optional and can only enrich non-executable advice.
 	Predictions *PredictionStage
 	Dispatcher  MigrationDispatcher
-	Arbiter     *Arbiter
-	Reporter    *Reporter
-	Metrics     *metrics.Metrics
-	Log         logr.Logger
+	// Cordoner is optional; it fences nodes under cordon maintenance rules
+	// before moves are decided.
+	Cordoner *MaintenanceCordoner
+	Arbiter  *Arbiter
+	Reporter *Reporter
+	Metrics  *metrics.Metrics
+	Log      logr.Logger
 
 	// EarlyTick requests a fresh supplemental pass without postponing the
 	// regular deadline or interrupting a running pass. The channel has capacity
@@ -199,6 +202,7 @@ func (l *DecisionLoop) RunOnce(ctx context.Context) {
 	cfg := l.Store.Get()
 
 	l.Reporter.ReportOMENativeState(snap.OMENativeExecutor.Available)
+	l.Cordoner.Reconcile(ctx, snap, cfg)
 
 	var candidates []policy.Candidate
 	for _, p := range l.Policies {

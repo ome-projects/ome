@@ -101,3 +101,14 @@ policies:
 		t.Fatal("reload did not remove maintenance rules")
 	}
 }
+
+func TestMaintenanceTriggerCordonOption(t *testing.T) {
+	cfg, err := Load([]byte("schemaVersion: 1\npolicies:\n  nodeHealth:\n    maintenance:\n      triggers:\n      - name: leave\n        label: {key: ops.example/leave-at, valueIsStartTime: true}\n        cordon: true\n      - name: patch\n        label: {key: ops.example/patch}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := cfg.Policies.NodeHealth.Maintenance.Triggers
+	if !rules[0].Cordon || rules[1].Cordon {
+		t.Fatalf("cordon flags = %t/%t, want true/false", rules[0].Cordon, rules[1].Cordon)
+	}
+}
