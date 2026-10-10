@@ -105,6 +105,11 @@ ome:
         maxConcurrentReconciles: 0  # parallel placement reconciles (0 => single worker)
         fanoutTimeout: ""           # per-cluster placement read/apply/delete deadline
         winnerLostGrace: ""         # grace for transient absence, membership removal, or admission loss of the sticky winner
+        observationGrace: ""        # how long a home whose reads fail keeps its last ready count ("" => withdrawn at the first failed read)
+        memberReadRetry:            # re-reads of a member after a transient failure, within one reconcile
+          maxAttempts: 0            # reads per member, the first included (0 => one read, no retry)
+          initialBackoff: ""        # wait before the first re-read, doubling per re-read; required when maxAttempts > 1
+          maxBackoff: ""            # cap on that wait; required when maxAttempts > 1
         statusBatchPeriod: ""       # debounce for a burst of cross-cluster status events
         statusSafetyRequeue: ""     # steady-state re-read backstop when the funnel is on
         dispatcherMode: ""          # "AllAtOnce" (default) or "Incremental"
