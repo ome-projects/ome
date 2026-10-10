@@ -165,6 +165,12 @@ type PodInfo struct {
 	// TPUs is the pod's TPU chip request. TPU chips make the pod a node
 	// occupant but never count toward GPU capacity.
 	TPUs int64
+	// TPUSliceProvisioned reports that OME provisions this pod's TPU slice
+	// per Instance (the ome.io/tpu-slice-provisioning pod annotation).
+	TPUSliceProvisioned bool
+	// NodeSelector is the pod's nodeSelector, retained for TPU pods only:
+	// OME pins slice-provisioned pods to their slice and topology through it.
+	NodeSelector map[string]string
 	// Ready reports the pod Ready condition.
 	Ready bool
 	// Terminating reports a non-nil deletion timestamp.

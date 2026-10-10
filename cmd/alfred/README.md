@@ -55,7 +55,9 @@ Pause-related recommendations and dispatch diagnostics can currently report
 generic ineligibility or source-change reasons rather than identifying the pause.
 
 Current execution supports eligible OMENative instances only. RawDeployment,
-LWS and other workloads have no eviction adapter. Simulation reserves no
+LWS and other workloads have no eviction adapter. TPU instances move only with
+`tpuSliceMigrationEnabled`, when OME provisions one slice per Instance; those
+moves check free slice capacity instead of simulating placement. Simulation reserves no
 capacity; target hints are preferences, not scheduling-time health guarantees.
 One unresolved request blocks new dispatches. Do not erase the journal to
 unblock it. These limits and the recorded qualification results are not a

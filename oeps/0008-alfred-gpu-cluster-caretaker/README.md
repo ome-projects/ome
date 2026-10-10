@@ -277,7 +277,7 @@ At the 2026-09-14 baseline, the source tree has the following status:
 | Observation and configuration | Implemented | Every replica builds snapshots and publishes gauges; configuration hot-reloads with last-known-good fallback. |
 | Capacity-descheduling Policy #1 | Partially implemented | Fragmentation scoring, cheap candidate generation, arbitration, and reporting run; GPU arithmetic is not scheduler feasibility. |
 | Arbiter and Reporter | Implemented baseline | Core admission gates and truthful UUID request outcomes are connected. Durable serial dispatch bookkeeping complements retained status, cooldowns and the in-memory breaker. |
-| Node-Health Policy #2 | Implemented | Four-state health observation and independently configured maintenance markers exclude unsafe targets. Whole-instance candidates share the simulator, arbiter and guarded dispatcher. Repair/maintenance lifecycle reports require fresh observation evidence. RawDeployment, LWS and non-steady OMENative instances remain advisory. |
+| Node-Health Policy #2 | Implemented | Four-state health observation and independently configured maintenance markers exclude unsafe targets. Whole-instance candidates share the simulator, arbiter and guarded dispatcher. Repair/maintenance lifecycle reports require fresh observation evidence. RawDeployment, LWS and non-steady OMENative instances remain advisory. TPU instances are advisory unless `tpuSliceMigrationEnabled` lets per-Instance slice instances move. |
 | Scheduler profile selection and simulation protocol | Implemented | Exact effective scheduler profiles select trusted startup workers. Whole-placement responses are fenced to request/snapshot/profile identity. Optional `migrationFromNode` distinguishes the actual API's one-node exclusion from recommendation all-source exclusion. |
 | Predictive simulation inputs | Implemented | Full public objects and checked source cohorts produce private Pods/PodGroups without a workload preview or renderer import. Execution overlays the existing API's required hostname exclusion and weight-50 soft hints; sources remain occupied. |
 | Scheduler simulation worker | Implemented | The separate `pkg/alfred/simulator` module runs Kubernetes v1.35.4 plus the same OMEGangPack plugin through private snapshot-only clients. Production invokes its trusted exact-profile subprocess registry; profile configuration alone never enables migration. |
@@ -1509,6 +1509,36 @@ tolerate). Labels alone do not prevent scheduling without corresponding hard
 affinity. `NoExecute` can evict live pods independently of Alfred's safe
 migration path. Alfred never adds or removes these Node restrictions.
 
+#### TPU instances on per-Instance slices
+
+Surge planning and the scheduler simulation model GPUs only, so a TPU instance
+is advisory (`AcceleratorPlacementUnmodeled`) by default. OME can also give each
+TPU Instance its own slice (`ome.io/tpu-slice-provisioning: "true"`). When it
+migrates such an Instance, it creates a new slice for the replacement and the
+slice scheduler picks the partition. Alfred cannot simulate that choice.
+
+`tpuSliceMigrationEnabled: true` lets these instances move anyway. A finding
+becomes executable only when every member pod is slice-provisioned with one
+topology (the pod nodeSelector `tpuSlicePartitions.topologyLabel`), and at least
+one partition of that topology is free. A partition is the set of nodes that
+share its id label (`tpuSlicePartitions.idLabel`, `%s` replaced by the topology). It is
+free when every one of those nodes is an acceptable destination, reports
+`healthyState` in `stateLabel`, and holds no accelerator pod.
+No free partition gives the advisory `NoTPUSliceCapacity`.
+
+An executable TPU slice move names no target nodes and claims no GPUs. The
+dispatcher skips only the simulation: the fresh policy replay re-checks free
+capacity, and source identity, budgets, cooldowns, the admission guard and the
+write-ahead journal apply as for any other move. The free-partition count is an
+estimate, not a reservation. A slice created after the check, or a partition
+the slice scheduler rejects, can leave the replacement waiting until the
+owning controller's migration deadline restores the source.
+
+The slice scheduler places only on partitions it considers schedulable. To keep
+replacements and new slices off nodes under maintenance, the maintenance
+tooling must still make those nodes unschedulable, for example by cordoning
+them, as the scheduling boundary above requires.
+
 #### The narrow-contracts property (no new RBAC, no cloud credentials)
 
 State it plainly, because it is the load-bearing reason Policy #2 is cheap and
@@ -1763,6 +1793,7 @@ config.yaml: |
   # Also requires immutable startup --migration-api-version=v1 and a verified
   # admission guard; these are not hot policy settings or liveness discovery.
   lwsRecommendationsEnabled: true      # produce recommendations for LWS (never execute)
+  tpuSliceMigrationEnabled: false      # TPU instances on per-Instance OME slices may move
 
   # Output
   recommendationsConfigMapEnabled: true

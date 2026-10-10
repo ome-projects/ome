@@ -36,6 +36,21 @@ func BuildExecutionRequest(s *Snapshot, source Source, profiles scheduling.Confi
 	if err != nil {
 		return scheduling.Request{}, err
 	}
+	if err := validateExecutionSource(s, source, state); err != nil {
+		return scheduling.Request{}, err
+	}
+	r.ExcludedNodes = []string{source.FromNode}
+	r.MigrationFromNode = source.FromNode
+	for i := range r.ReplacementPods {
+		applyExecutionOverlay(&r.ReplacementPods[i], source.FromNode, hints)
+	}
+	return r, nil
+}
+
+// validateExecutionSource applies the source checks every move needs before a
+// migration request names from_node: member Pods must match their stable runner
+// template's node affinity, and from_node's hostname label must equal its name.
+func validateExecutionSource(s *Snapshot, source Source, state *sourceState) error {
 	// A live pod may retain migration-only affinity from an earlier surge.
 	// The consumer renders the stable revision, not that live PodSpec. Only
 	// accept node affinity equal to the current, observed runner baseline;
@@ -48,39 +63,60 @@ func BuildExecutionRequest(s *Snapshot, source Source, profiles scheduling.Confi
 			}
 			matchedRunner = true
 			if !reflect.DeepEqual(executionNodeAffinity(member.pod.Spec), executionNodeAffinity(runner.Template.Spec)) {
-				return scheduling.Request{}, fmt.Errorf("source node affinity differs from stable runner template")
+				return fmt.Errorf("source node affinity differs from stable runner template")
 			}
 		}
 		if !matchedRunner {
-			return scheduling.Request{}, fmt.Errorf("source runner template is missing")
+			return fmt.Errorf("source runner template is missing")
 		}
 	}
 	matched := false
 	for _, object := range s.Objects {
 		var header metav1.TypeMeta
 		if err := json.Unmarshal(object.Raw, &header); err != nil {
-			return scheduling.Request{}, fmt.Errorf("invalid snapshot object")
+			return fmt.Errorf("invalid snapshot object")
 		}
 		if header.APIVersion != "v1" || header.Kind != "Node" {
 			continue
 		}
 		var node corev1.Node
 		if err := json.Unmarshal(object.Raw, &node); err != nil {
-			return scheduling.Request{}, fmt.Errorf("invalid snapshot node")
+			return fmt.Errorf("invalid snapshot node")
 		}
 		if node.Name == source.FromNode {
 			matched = node.Labels[corev1.LabelHostname] == source.FromNode
 		}
 	}
 	if !matched {
-		return scheduling.Request{}, fmt.Errorf("source hostname does not match migration exclusion")
+		return fmt.Errorf("source hostname does not match migration exclusion")
 	}
-	r.ExcludedNodes = []string{source.FromNode}
-	r.MigrationFromNode = source.FromNode
-	for i := range r.ReplacementPods {
-		applyExecutionOverlay(&r.ReplacementPods[i], source.FromNode, hints)
+	return nil
+}
+
+// ExecutionSourcePods returns the source Instance's member Pods for a move
+// whose replacement placement Alfred does not simulate, such as a TPU instance
+// moving onto a new OME-provisioned slice. It applies the same capture,
+// source-key and execution-source checks as BuildExecutionRequest, without
+// selecting a scheduling profile.
+func ExecutionSourcePods(s *Snapshot, source Source, now time.Time, maxAge time.Duration) ([]corev1.Pod, error) {
+	if err := s.Validate(now, maxAge); err != nil {
+		return nil, fmt.Errorf("source snapshot: %w", err)
 	}
-	return r, nil
+	if err := validateSourceKey(source); err != nil {
+		return nil, err
+	}
+	state, err := resolveSource(s, source)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateExecutionSource(s, source, state); err != nil {
+		return nil, err
+	}
+	pods := make([]corev1.Pod, len(state.members))
+	for i := range state.members {
+		pods[i] = *state.members[i].pod.DeepCopy()
+	}
+	return pods, nil
 }
 
 func executionNodeAffinity(spec corev1.PodSpec) *corev1.NodeAffinity {

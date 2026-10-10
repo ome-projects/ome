@@ -215,6 +215,15 @@ func ingestPod(s *ClusterSnapshot, pod *corev1.Pod, podEvidence *[]PodInfo, opts
 		ManagedBy:   pod.Labels[labelManagedBy],
 	}
 	parseOMENativePodIdentity(&info, pod)
+	if info.TPUs > 0 {
+		info.TPUSliceProvisioned = pod.Annotations[constants.TPUSliceProvisioningAnnotationKey] == "true"
+		if len(pod.Spec.NodeSelector) > 0 {
+			info.NodeSelector = make(map[string]string, len(pod.Spec.NodeSelector))
+			for k, v := range pod.Spec.NodeSelector {
+				info.NodeSelector[k] = v
+			}
+		}
+	}
 	if pod.Status.StartTime != nil {
 		t := pod.Status.StartTime.Time
 		info.StartTime = &t

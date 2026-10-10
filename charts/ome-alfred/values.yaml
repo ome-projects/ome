@@ -157,6 +157,11 @@ alfredConfig:
   # OMENative execution uses the owning controller's migration annotations.
   omenativeMigrationEnabled: true
   lwsRecommendationsEnabled: true
+  # TPU instances that OME provisions one slice per Instance for may move to a
+  # new slice; off keeps every TPU finding advisory. Moves are not simulated:
+  # Alfred requires a free healthy partition of the instance's topology, read
+  # from the labels in tpuSlicePartitions (GKE's labels by default).
+  tpuSliceMigrationEnabled: false
 
   # Output. The recommendations ConfigMap is pre-created by this chart;
   # Alfred updates it but never creates it.
