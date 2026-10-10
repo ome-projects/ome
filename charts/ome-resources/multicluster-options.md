@@ -68,6 +68,8 @@ All options below are under `ome.multicluster.config`. Each has a consumer in
 | `placement.gcInterval` | Keep. Orphan cleanup has a separate lifecycle from readiness reconciliation. |
 | `placement.maxConcurrentReconciles`, `.fanoutTimeout` | Keep as worker and remote-operation bounds. |
 | `placement.winnerLostGrace` | Relevant to sticky single-active placement; not a Split distribution control. |
+| `placement.observationGrace` | Keep. How long a home whose reads fail keeps its last ready count, and so its traffic share. The start of the failure is stored in the candidate status, so a restart keeps it. Empty withdraws the count at the first failed read. |
+| `placement.memberReadRetry` (`maxAttempts`, `initialBackoff`, `maxBackoff`) | Keep. Re-reads a member within one reconcile after a timeout, a dropped connection, throttling, or a server error. Each read has its own `fanoutTimeout`, so a reconcile can spend up to `maxAttempts` times that per member, plus the backoff waits between reads. |
 | `placement.dispatcherMode`, `.dispatcherStepSize`, `.dispatcherRoundTimeout` | Candidate-dispatch tuning for single-active placement. The step/dwell knobs are unused by AllAtOnce; Split follows its apportionment path. |
 | `placement.localQueue` | Optional fallback only. A source's `ome.io/local-queue` annotation wins. Leave empty for a fleet with per-service quota leaves. |
 | `placement.memberOperatorNamespace` | Namespace of each member's `inferenceservice-config` and pinned runtime revisions. Required for SplitByCapacity, and for any mode that must resolve a pinned runtime or an operator-default floor. Empty holds that resolution. |

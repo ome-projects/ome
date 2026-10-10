@@ -752,6 +752,22 @@ if tr -d '[:space:]' <<<"${controller_config}" | grep -Eq '"memberOperatorNamesp
   fail "default placement configuration names a member namespace or a capacity block"
 fi
 
+# The manager reads the member-read grace and retry from multicluster.placement;
+# a value that is not rendered there leaves the single-read default in force.
+member_read_config="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.config.placement.observationGrace=2m \
+  --set ome.multicluster.config.placement.memberReadRetry.maxAttempts=3 \
+  --set ome.multicluster.config.placement.memberReadRetry.initialBackoff=500ms \
+  --set ome.multicluster.config.placement.memberReadRetry.maxBackoff=2s \
+  --show-only templates/ome-controller/configmap.yaml | tr -d '[:space:]')"
+grep -Fq '"observationGrace":"2m"' <<<"${member_read_config}" ||
+  fail "placement.observationGrace is not rendered into the manager configuration"
+grep -Fq '"memberReadRetry":{"maxAttempts":3,"initialBackoff":"500ms","maxBackoff":"2s"}' <<<"${member_read_config}" ||
+  fail "placement.memberReadRetry is not rendered into the manager configuration"
+grep -Fq '"observationGrace":"","memberReadRetry":{"maxAttempts":0,"initialBackoff":"","maxBackoff":""}' <<<"$(tr -d '[:space:]' <<<"${controller_config}")" ||
+  fail "default placement configuration sets a member-read grace or retry"
+
 routing_topology_error='ome.multicluster.config.routing.enabled=true requires ome.multicluster.enabled=true and ome.multicluster.role=control-plane'
 
 if routing_without_multicluster="$("${helm_bin}" template ome-resources "${chart_dir}" \
