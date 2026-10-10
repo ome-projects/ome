@@ -67,6 +67,11 @@ type Config struct {
 	RawDeploymentMigrationEnabled *bool `json:"rawDeploymentMigrationEnabled"`
 	OMENativeMigrationEnabled     *bool `json:"omenativeMigrationEnabled"`
 	LWSRecommendationsEnabled     *bool `json:"lwsRecommendationsEnabled"`
+	// TPUSliceMigrationEnabled makes TPU instances that OME provisions one
+	// slice per Instance for move candidates. Off by default.
+	TPUSliceMigrationEnabled *bool `json:"tpuSliceMigrationEnabled"`
+	// TPUSlicePartitions names the labels the TPU slice capacity check reads.
+	TPUSlicePartitions TPUSlicePartitions `json:"tpuSlicePartitions"`
 
 	RecommendationsConfigMapEnabled *bool  `json:"recommendationsConfigMapEnabled"`
 	RecommendationsConfigMapName    string `json:"recommendationsConfigMapName"`
@@ -244,6 +249,10 @@ func (c *Config) applyDefaults() {
 	if c.LWSRecommendationsEnabled == nil {
 		c.LWSRecommendationsEnabled = boolPtr(true)
 	}
+	if c.TPUSliceMigrationEnabled == nil {
+		c.TPUSliceMigrationEnabled = boolPtr(false)
+	}
+	c.TPUSlicePartitions.applyDefaults()
 	if c.RecommendationsConfigMapEnabled == nil {
 		c.RecommendationsConfigMapEnabled = boolPtr(true)
 	}
@@ -289,6 +298,9 @@ func (c *Config) validate() error {
 	}
 	if c.Mode != ModeRecommendOnly && c.Mode != ModeExecute {
 		return fmt.Errorf("mode must be %q or %q, got %q", ModeRecommendOnly, ModeExecute, c.Mode)
+	}
+	if err := c.TPUSlicePartitions.validate(); err != nil {
+		return err
 	}
 	if c.DecisionLoopInterval.Duration < time.Second {
 		return fmt.Errorf("decisionLoopInterval must be >= 1s, got %s", c.DecisionLoopInterval.Duration)

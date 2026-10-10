@@ -68,6 +68,10 @@ const (
 	// that surge planning cannot place (TPU chips), so no replacement can be
 	// planned or simulated.
 	AdvisoryAcceleratorPlacementUnmodeled = "AcceleratorPlacementUnmodeled"
+	// AdvisoryNoTPUSliceCapacity: the TPU instance could move to a new
+	// slice, but no free healthy partition of its topology exists on nodes
+	// Alfred accepts as a destination.
+	AdvisoryNoTPUSliceCapacity = "NoTPUSliceCapacity"
 )
 
 // ComponentWideInstance marks a Candidate that addresses a whole component
@@ -133,6 +137,10 @@ type Candidate struct {
 	// SurgeShaped records the simulated execution shape. Defragmentation
 	// has one executable Alpha shape: OMENative place-then-free surge.
 	SurgeShaped bool
+	// TPUSlice is set when the move replaces a TPU instance with one on a
+	// new OME-provisioned slice. The slice scheduler places that slice, so
+	// such a move carries no target nodes and is not simulated.
+	TPUSlice *TPUSlicePlan
 	// FootprintGPUs is the instance's GPU footprint. For a surge-shaped
 	// move this much headroom must exist while the source still holds its
 	// GPUs; it is also the ranking tie-break (smaller moves first).

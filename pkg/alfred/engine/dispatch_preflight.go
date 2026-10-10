@@ -93,14 +93,28 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 		hints = req.HintTargetNodes
 	}
 	source := input.Source{Namespace: current.Workload.Namespace, InferenceService: current.Workload.Name, Component: current.Component, Instance: current.Instance, FromNode: current.FromNode}
-	request, err := input.BuildExecutionRequest(captured, source, cfg.Scheduling, requestID, hints, d.now(), predictionMaxAge)
+	// A move onto a new OME-provisioned TPU slice is placed by the slice
+	// scheduler, not by a scheduler profile Alfred can simulate. It keeps every
+	// other check below; the policy replay above already re-checked capacity.
+	sliceMove := current.TPUSlice != nil
+	var request scheduling.Request
+	var sourcePods []corev1.Pod
+	if sliceMove {
+		if len(hints) != 0 {
+			return empty, "SourceUnsupported"
+		}
+		sourcePods, err = input.ExecutionSourcePods(captured, source, d.now(), predictionMaxAge)
+	} else {
+		request, err = input.BuildExecutionRequest(captured, source, cfg.Scheduling, requestID, hints, d.now(), predictionMaxAge)
+		sourcePods = request.SourcePods
+	}
 	if err != nil {
 		return empty, "SourceUnsupported"
 	}
-	if !predictionOwnersMatch(fresh, captured, current) || !predictionMembersMatch(fresh, current, request.SourcePods) {
+	if !predictionOwnersMatch(fresh, captured, current) || !predictionMembersMatch(fresh, current, sourcePods) {
 		return empty, "SourceChanged"
 	}
-	if observed != nil && (!predictionOwnersMatch(observed, captured, current) || !predictionMembersMatch(observed, current, request.SourcePods)) {
+	if observed != nil && (!predictionOwnersMatch(observed, captured, current) || !predictionMembersMatch(observed, current, sourcePods)) {
 		return empty, "SourceChanged"
 	}
 	owner := fresh.Workloads[current.Workload].ISVC
@@ -115,16 +129,19 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 		}
 		fingerprintVersion = dispatchFingerprintLegacy
 	}
-	fingerprint, err := dispatchSourceFingerprint(owner, ir, request.SourcePods, current.Instance, fingerprintVersion)
+	fingerprint, err := dispatchSourceFingerprint(owner, ir, sourcePods, current.Instance, fingerprintVersion)
 	if err != nil {
 		return empty, "SourceChanged"
 	}
 	if existing != nil && (fingerprint != existing.SourceFingerprint || owner.UID != existing.WorkloadUID || ir.UID != existing.IRUID || ir.Name != existing.IRName) {
 		return empty, "SourceChanged"
 	}
-	result, err := d.Simulator.Evaluate(ctx, request)
-	if err != nil || scheduling.ValidateResult(request, result) != nil || result.Decision != scheduling.DecisionFeasible {
-		return empty, "SimulationNotFeasible"
+	var result scheduling.Result
+	if !sliceMove {
+		result, err = d.Simulator.Evaluate(ctx, request)
+		if err != nil || scheduling.ValidateResult(request, result) != nil || result.Decision != scheduling.DecisionFeasible {
+			return empty, "SimulationNotFeasible"
+		}
 	}
 	if !observationFresh(fresh, d.now()) || captured.Validate(d.now(), predictionMaxAge) != nil {
 		return empty, "SimulationStale"
@@ -144,11 +161,18 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	if err != nil {
 		return empty, "SnapshotUnavailable"
 	}
-	finalRequest, err := input.BuildExecutionRequest(finalCapture, source, cfg.Scheduling, requestID, hints, d.now(), predictionMaxAge)
+	var finalSourcePods []corev1.Pod
+	if sliceMove {
+		finalSourcePods, err = input.ExecutionSourcePods(finalCapture, source, d.now(), predictionMaxAge)
+	} else {
+		var finalRequest scheduling.Request
+		finalRequest, err = input.BuildExecutionRequest(finalCapture, source, cfg.Scheduling, requestID, hints, d.now(), predictionMaxAge)
+		finalSourcePods = finalRequest.SourcePods
+	}
 	if err != nil {
 		return empty, "SourceChanged"
 	}
-	if !predictionOwnersMatch(final, finalCapture, current) || !predictionMembersMatch(final, current, finalRequest.SourcePods) {
+	if !predictionOwnersMatch(final, finalCapture, current) || !predictionMembersMatch(final, current, finalSourcePods) {
 		return empty, "SourceChanged"
 	}
 	finalOwner := final.Workloads[current.Workload].ISVC
@@ -158,7 +182,7 @@ func (d *Dispatcher) preflight(ctx context.Context, observed *snapshot.ClusterSn
 	if finalOwner.Generation != owner.Generation || finalIR.Generation != ir.Generation {
 		return empty, "SourceChanged"
 	}
-	finalFingerprint, err := dispatchSourceFingerprint(finalOwner, finalIR, finalRequest.SourcePods, current.Instance, fingerprintVersion)
+	finalFingerprint, err := dispatchSourceFingerprint(finalOwner, finalIR, finalSourcePods, current.Instance, fingerprintVersion)
 	if err != nil || finalFingerprint != fingerprint {
 		return empty, "SourceChanged"
 	}

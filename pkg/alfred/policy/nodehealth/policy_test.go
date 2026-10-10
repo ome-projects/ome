@@ -568,3 +568,52 @@ func TestMixedGPUAndTPUInstanceIsNotExecutable(t *testing.T) {
 		t.Fatalf("findings = %+v, want one non-executable %s finding", got, policy.AdvisoryAcceleratorPlacementUnmodeled)
 	}
 }
+
+func TestTPUSliceInstanceBecomesExecutableWhenEnabled(t *testing.T) {
+	const idLabel, stateLabel = "cloud.google.com/gke-tpu-partition-2x2x2-id", "cloud.google.com/gke-tpu-partition-2x2x2-state"
+	build := func(withFree bool) *snapshot.ClusterSnapshot {
+		b := testutil.NewSnapshot().
+			WithNode("source", "", 0, testutil.NodeMaintenance("de-schedule"),
+				testutil.NodeLabels(map[string]string{idLabel: "p-src", stateLabel: "HEALTHY"}))
+		if withFree {
+			b.WithNode("free", "", 0, testutil.NodeLabels(map[string]string{idLabel: "p-free", stateLabel: "HEALTHY"}))
+		}
+		snap := b.WithMultiPodTPUInstance("prod/tpu", v1beta1.EngineComponent, constants.OMENative, 4, "source").Build()
+		inst := snap.Workloads[types.NamespacedName{Namespace: "prod", Name: "tpu"}].Components[v1beta1.EngineComponent].Instances[0]
+		inst.Pods[0].TPUSliceProvisioned = true
+		inst.Pods[0].NodeSelector = map[string]string{"cloud.google.com/gke-tpu-topology": "2x2x2"}
+		return snap
+	}
+	cfg := config.Default()
+	enabled := true
+	cfg.TPUSliceMigrationEnabled = &enabled
+
+	got := moves(evaluate(t, build(true), cfg))
+	if len(got) != 1 || !got[0].Executable || !got[0].SurgeShaped || got[0].AdvisoryReason != "" ||
+		got[0].Reason != policy.ReasonNodeMaintenance || got[0].FromNode != "source" ||
+		got[0].TPUSlice == nil || got[0].TPUSlice.Topology != "2x2x2" || got[0].TPUSlice.FreePartitions != 1 ||
+		len(got[0].HintTargetNodes) != 0 || len(got[0].PlacementTargetNodes) != 0 {
+		t.Fatalf("findings = %+v, want one executable TPU slice move with no target nodes", got)
+	}
+
+	got = moves(evaluate(t, build(false), cfg))
+	if len(got) != 1 || got[0].Executable || got[0].AdvisoryReason != policy.AdvisoryNoTPUSliceCapacity {
+		t.Fatalf("findings = %+v, want one %s advisory", got, policy.AdvisoryNoTPUSliceCapacity)
+	}
+
+	got = moves(evaluate(t, build(true), config.Default()))
+	if len(got) != 1 || got[0].Executable || got[0].AdvisoryReason != policy.AdvisoryAcceleratorPlacementUnmodeled {
+		t.Fatalf("findings = %+v, want the default advisory while the path is off", got)
+	}
+}
+
+// moves returns the workload candidates, dropping node remediation markers.
+func moves(candidates []policy.Candidate) []policy.Candidate {
+	var out []policy.Candidate
+	for _, candidate := range candidates {
+		if candidate.Remediation == nil {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}

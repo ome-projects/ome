@@ -321,6 +321,11 @@ func (st *admitState) decide(c policy.Candidate) Decision {
 // and — when nothing fits a surge — a reason distinguishing *why*: a hint
 // under evacuation, a hint already landed on this cycle, or plain capacity.
 func (st *admitState) selectTarget(c policy.Candidate, inst *snapshot.Instance) (string, map[string]int64, string) {
+	if c.TPUSlice != nil {
+		// The slice scheduler places a new OME slice; the policy already
+		// required a free partition. There is no node to pick or GPU to claim.
+		return "", nil, ""
+	}
 	targets := c.PlacementTargetNodes
 	if len(targets) == 0 {
 		targets = c.HintTargetNodes

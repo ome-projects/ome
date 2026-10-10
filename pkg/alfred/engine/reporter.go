@@ -106,6 +106,7 @@ type recommendationView struct {
 	DispatchReason string   `json:"dispatchReason,omitempty"`
 
 	Scheduling *policy.SchedulingDiagnostics `json:"scheduling,omitempty"`
+	TPUSlice   *policy.TPUSlicePlan          `json:"tpuSlice,omitempty"`
 }
 
 // ReportCycle publishes one decision pass: produced/accepted/rejected
@@ -153,6 +154,7 @@ func (r *Reporter) ReportCycle(ctx context.Context, candidates []policy.Candidat
 			Score:          c.Score,
 			Emergency:      c.Emergency,
 			Scheduling:     c.Scheduling,
+			TPUSlice:       c.TPUSlice,
 		}
 
 		d, ok := decided[candidateKey(c)]

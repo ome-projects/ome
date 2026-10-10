@@ -329,7 +329,16 @@ func classify(snap *snapshot.ClusterSnapshot, cfg *config.Config, w *snapshot.Wo
 		return candidate, true
 	}
 	if inst.TotalTPUs > 0 {
-		candidate.AdvisoryReason = policy.AdvisoryAcceleratorPlacementUnmodeled
+		// Surge planning models GPUs only. A TPU instance can move only onto a
+		// new OME-provisioned slice, which the slice scheduler places.
+		plan, reason := policy.PlanTPUSliceReplacement(snap, cfg, inst)
+		if reason != "" {
+			candidate.AdvisoryReason = reason
+			return candidate, true
+		}
+		candidate.SurgeShaped = true
+		candidate.Executable = true
+		candidate.TPUSlice = plan
 		return candidate, true
 	}
 

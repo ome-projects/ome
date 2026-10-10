@@ -76,6 +76,9 @@ data:
     # Future execution surfaces; owning controllers execute annotations.
     omenativeMigrationEnabled: true
     lwsRecommendationsEnabled: true
+    # TPU instances with one OME slice per Instance may move to a new slice;
+    # off keeps every TPU finding advisory.
+    tpuSliceMigrationEnabled: false
 
     # Output.
     recommendationsConfigMapEnabled: true
