@@ -455,6 +455,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// back on the suspect node for a pass.
 	input.ObservedState.ExcludedNodesByInstance = r.reconcileRelocationDirectives(ctx, log, ir, parent, autoMigrateBudget)
 
+	// The Instances with a pod on a cordoned node, which a scale-down
+	// removes before any other. Fail-open: an unreadable cordon drops only
+	// the preference, for this pass.
+	input.ObservedState.CordonedInstances = r.cordonedInstances(ctx, log, ir, input)
+
 	// Migration-entry bookkeeping, then the mailbox. syncMigrationEntries
 	// first: it imports pre-upgrade in-flight ledger Started rows into
 	// status.migrations (so they resume through the entry path) and

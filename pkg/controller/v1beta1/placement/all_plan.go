@@ -123,15 +123,16 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 		if matched[name] == "" {
 			a.DesiredHome, a.DesiredReplicas = nil, 0
 		}
-		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
 		if a.InventoryPending {
-			err = r.adoptAllHome(cctx, source, name, &a, out.InputDigest, out.AdoptionDigest != "")
+			err = r.adoptAllHome(ctx, source, name, &a, out.InputDigest, out.AdoptionDigest != "")
 			if err != nil {
 				r.Log.V(1).Info("home inventory is pending", "cluster", name, "error", err)
 			}
 		}
 		if matched[name] != "" && slices.Contains(eligible, name) {
+			cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
 			home, resolveErr := r.resolveFullHome(cctx, source, desired, name, a.ClusterUID, out.InputDigest)
+			cancel()
 			if resolveErr == nil {
 				a.HomeInputsPending = false
 				a.DesiredHome = home
@@ -141,7 +142,6 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 				holds = append(holds, fmt.Sprintf("home policy is unresolved on %s: %v", name, resolveErr))
 			}
 		}
-		cancel()
 		pending = pending || a.InventoryPending || a.HomeInputsPending
 		out.Assignments[name] = a
 	}
@@ -192,6 +192,9 @@ func (r *Reconciler) resolveFullHome(ctx context.Context, source, desired *v1bet
 	return &v1beta1.PlacementHomePolicy{InputDigest: digest, ReplicaFloors: floors}, nil
 }
 
+// adoptAllHome inventories one home before an allocation exists. ctx is the
+// reconcile context: the member read and the policy resolution each bound
+// their own calls by placeTimeout.
 func (r *Reconciler) adoptAllHome(ctx context.Context, source *v1beta1.InferenceService, name string, assignment *v1beta1.CandidateAllocationStatus, digest string, allowStanding bool) error {
 	readSource := source.DeepCopy()
 	readSource.Status.Placement = &v1beta1.PlacementStatus{Plan: &v1beta1.PlacementPlanStatus{SourceUID: source.UID}}
@@ -206,7 +209,9 @@ func (r *Reconciler) adoptAllHome(ctx context.Context, source *v1beta1.Inference
 		if observed.Member == nil {
 			return fmt.Errorf("home has resources without a verifiable service policy")
 		}
-		home, err := r.resolveFullHome(ctx, source, observed.Member, name, assignment.ClusterUID, digest)
+		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
+		home, err := r.resolveFullHome(cctx, source, observed.Member, name, assignment.ClusterUID, digest)
+		cancel()
 		if err != nil {
 			return err
 		}

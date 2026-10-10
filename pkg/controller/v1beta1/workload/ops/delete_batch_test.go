@@ -1436,7 +1436,7 @@ func TestSelectDeleteBatchFreshGangAwarePrefix(t *testing.T) {
 				statuses = append(statuses, workload.InstanceStatus{Index: index, Incarnation: 1, Phase: workload.InstancePhaseReady})
 				pods[index] = deleteSelectionPods(index, test.costs[index])
 			}
-			selection, err := selectDeleteBatch(statuses, test.indices, pods, test.budget)
+			selection, err := selectDeleteBatch(statuses, test.indices, pods, test.budget, nil)
 			if err != nil {
 				t.Fatalf("selectDeleteBatch: %v", err)
 			}
@@ -1470,7 +1470,7 @@ func TestSelectDeleteBatchEightPodGangs(t *testing.T) {
 		extras = append(extras, index)
 		pods[index] = deleteSelectionPods(index, 8)
 	}
-	selection, err := selectDeleteBatch(statuses, extras, pods, int32Pointer(100))
+	selection, err := selectDeleteBatch(statuses, extras, pods, int32Pointer(100), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1500,7 +1500,7 @@ func TestSelectDeleteBatchDeleteOwnedOrderingAndFreshClosure(t *testing.T) {
 		5: deleteSelectionPods(5, 2),
 		9: deleteSelectionPods(9, 1),
 	}
-	selection, err := selectDeleteBatch(statuses, []int32{9}, pods, int32Pointer(4))
+	selection, err := selectDeleteBatch(statuses, []int32{9}, pods, int32Pointer(4), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1515,13 +1515,65 @@ func TestSelectDeleteBatchDeleteOwnedOrderingAndFreshClosure(t *testing.T) {
 	}
 }
 
+// A fresh wave admits the extras with a pod on a cordoned node first,
+// highest index first among them, then the rest by highest index, so a
+// budget that splits the reduction empties the cordoned nodes first.
+func TestSelectDeleteBatchAdmitsCordonedExtrasFirst(t *testing.T) {
+	statuses := make([]workload.InstanceStatus, 0, 5)
+	pods := make(map[int32][]*corev1.Pod, 5)
+	for index := int32(1); index <= 5; index++ {
+		statuses = append(statuses, workload.InstanceStatus{Index: index, Phase: workload.InstancePhaseReady})
+		pods[index] = deleteSelectionPods(index, 1)
+	}
+	extras := []int32{1, 2, 4, 5}
+	cordoned := map[int32]struct{}{1: {}, 4: {}}
+	tests := []struct {
+		name     string
+		budget   *int32
+		want     []int32
+		deferred int
+	}{
+		{name: "split by the budget", budget: int32Pointer(2), want: []int32{4, 1}, deferred: 2},
+		{name: "unbounded", want: []int32{4, 1, 5, 2}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selection, err := selectDeleteBatch(statuses, extras, pods, test.budget, cordoned)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := selectedDeleteIndices(selection); !equalInt32Slices(got, test.want) {
+				t.Fatalf("selected = %v, want %v", got, test.want)
+			}
+			if selection.deferred != test.deferred {
+				t.Fatalf("deferred = %d, want %d", selection.deferred, test.deferred)
+			}
+		})
+	}
+}
+
+// Committed work keeps its admission order: a cordoned node does not move
+// a delete-owned row ahead of one admitted before it.
+func TestSelectDeleteBatchDeleteOwnedOrderIgnoresCordon(t *testing.T) {
+	t0 := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	statuses := []workload.InstanceStatus{deleteOwnedStatus(2, t0.Add(time.Minute)), deleteOwnedStatus(7, t0)}
+	pods := map[int32][]*corev1.Pod{2: deleteSelectionPods(2, 2), 7: deleteSelectionPods(7, 2)}
+	selection, err := selectDeleteBatch(statuses, nil, pods, int32Pointer(2), map[int32]struct{}{2: {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := selectedDeleteIndices(selection), []int32{7}; !equalInt32Slices(got, want) {
+		t.Fatalf("selected = %v, want %v", got, want)
+	}
+}
+
 func TestSelectDeleteBatchCountsTerminatingPods(t *testing.T) {
 	now := metav1.Now()
 	pods := deleteSelectionPods(3, 3)
 	pods[1].DeletionTimestamp = &now
 	selection, err := selectDeleteBatch(
 		[]workload.InstanceStatus{{Index: 3, Phase: workload.InstancePhaseReady}},
-		[]int32{3}, map[int32][]*corev1.Pod{3: pods}, int32Pointer(2),
+		[]int32{3}, map[int32][]*corev1.Pod{3: pods}, int32Pointer(2), nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1539,7 +1591,7 @@ func TestSelectDeleteBatchSortsCopiedPodSlices(t *testing.T) {
 	}
 	selection, err := selectDeleteBatch(
 		[]workload.InstanceStatus{{Index: 3, Phase: workload.InstancePhaseReady}},
-		[]int32{3}, map[int32][]*corev1.Pod{3: original}, nil,
+		[]int32{3}, map[int32][]*corev1.Pod{3: original}, nil, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -1559,7 +1611,7 @@ func TestSelectDeleteBatchRejectsInvalidBudget(t *testing.T) {
 	for _, budget := range []int32{0, -1} {
 		_, err := selectDeleteBatch(
 			[]workload.InstanceStatus{{Index: 0, Phase: workload.InstancePhaseReady}},
-			[]int32{0}, nil, &budget,
+			[]int32{0}, nil, &budget, nil,
 		)
 		if err == nil {
 			t.Errorf("budget %d: expected error", budget)
@@ -1577,7 +1629,7 @@ func TestSelectDeleteBatchTwoThousandDeterministic(t *testing.T) {
 		extras = append(extras, index)
 		pods[index] = deleteSelectionPods(index, 1)
 	}
-	selection, err := selectDeleteBatch(statuses, extras, pods, int32Pointer(100))
+	selection, err := selectDeleteBatch(statuses, extras, pods, int32Pointer(100), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

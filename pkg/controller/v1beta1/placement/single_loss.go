@@ -24,9 +24,7 @@ func (r *Reconciler) singleMoveEmpty(ctx context.Context, source *v1beta1.Infere
 		inventory[candidate.Cluster] = candidate
 	}
 	for _, name := range slices.Sorted(maps.Keys(inventory)) {
-		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-		observed, err := r.observePlannedHome(cctx, source, inventory[name], declaredComponents(source))
-		cancel()
+		observed, err := r.observePlannedHome(ctx, source, inventory[name], declaredComponents(source))
 		if err != nil || !observed.Home.Known || !observed.Home.Absent {
 			return false
 		}

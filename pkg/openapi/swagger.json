@@ -1902,6 +1902,10 @@
           "description": "Endpoint is this candidate's own externally-addressable URL, mirrored from its derived InferenceService's status.url once admitted AND addressable. In Single mode only the winner carries one and the top-level PlacementStatus.Endpoint is authoritative; in All/Split mode every serving home carries its own, and this list is the source of truth an external LB/DNS consumes to route across homes. Empty until the home is addressable.",
           "$ref": "#/definitions/knative.URL"
         },
+        "observationFailingSince": {
+          "description": "ObservationFailingSince is when the control plane's reads of this home started failing. It is unset while reads succeed. While the configured observation grace lasts from this time, the home keeps the ready count from its last successful read.",
+          "$ref": "#/definitions/v1.Time"
+        },
         "observationKnown": {
           "description": "ObservationKnown distinguishes a current observation from retained evidence.",
           "type": "boolean"

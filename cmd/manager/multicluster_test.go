@@ -62,6 +62,8 @@ func TestResolveMCWiringFullConfig(t *testing.T) {
 		"placement": {
 			"requeueInterval": "45s", "gcInterval": "10m", "maxConcurrentReconciles": 8,
 			"fanoutTimeout": "20s", "winnerLostGrace": "2m", "statusBatchPeriod": "500ms",
+			"observationGrace": "3m",
+			"memberReadRetry": {"maxAttempts": 3, "initialBackoff": "200ms", "maxBackoff": "1s"},
 			"statusSafetyRequeue": "7m", "dispatcherMode": "Incremental", "dispatcherStepSize": 4,
 			"dispatcherRoundTimeout": "30s"
 		},
@@ -123,6 +125,8 @@ func TestResolveMCWiringFullConfig(t *testing.T) {
 	assert.Equal(t, 8, w.maxConcurrent)
 	assert.Equal(t, 20*time.Second, w.placeTimeout)
 	assert.Equal(t, 2*time.Minute, w.winnerLostGrace)
+	assert.Equal(t, 3*time.Minute, w.observationGrace)
+	assert.Equal(t, placement.MemberReadRetry{MaxAttempts: 3, InitialBackoff: 200 * time.Millisecond, MaxBackoff: time.Second}, w.memberReadRetry)
 	assert.Equal(t, 500*time.Millisecond, w.statusBatchPeriod)
 	assert.Equal(t, 7*time.Minute, w.statusSafetyRequeue) // cache on => configured backstop
 	assert.Equal(t, placement.DispatcherMode("Incremental"), w.dispatcherMode)
@@ -196,6 +200,8 @@ func TestResolveMCWiringAbsentBlockIsZero(t *testing.T) {
 	assert.Equal(t, time.Duration(0), w.gcInterval)
 	assert.Equal(t, time.Duration(0), w.statusSafetyRequeue)
 	assert.Equal(t, 0, w.maxConcurrent)
+	assert.Equal(t, time.Duration(0), w.observationGrace)
+	assert.Equal(t, placement.MemberReadRetry{}, w.memberReadRetry)
 	assert.Equal(t, 0, w.funnelBufferSize)
 	assert.Equal(t, placement.DispatcherMode(""), w.dispatcherMode)
 	assert.Equal(t, placementendpoint.Config{}, w.endpoint)

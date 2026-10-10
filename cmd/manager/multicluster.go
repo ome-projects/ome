@@ -44,6 +44,8 @@ type mcWiring struct {
 	maxConcurrent           int
 	placeTimeout            time.Duration
 	winnerLostGrace         time.Duration
+	observationGrace        time.Duration
+	memberReadRetry         placement.MemberReadRetry
 	statusBatchPeriod       time.Duration
 	statusSafetyRequeue     time.Duration
 	dispatcherMode          placement.DispatcherMode
@@ -153,11 +155,17 @@ func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
 			EstablishMax:     wc.EstablishMaxDuration(),
 			RetryMax:         wc.ReconnectRetryMaxDuration(),
 		},
-		requeue:                 pl.RequeueIntervalDuration(),
-		gcInterval:              pl.GCIntervalDuration(),
-		maxConcurrent:           pl.MaxConcurrentReconciles,
-		placeTimeout:            pl.FanoutTimeoutDuration(),
-		winnerLostGrace:         pl.WinnerLostGraceDuration(),
+		requeue:          pl.RequeueIntervalDuration(),
+		gcInterval:       pl.GCIntervalDuration(),
+		maxConcurrent:    pl.MaxConcurrentReconciles,
+		placeTimeout:     pl.FanoutTimeoutDuration(),
+		winnerLostGrace:  pl.WinnerLostGraceDuration(),
+		observationGrace: pl.ObservationGraceDuration(),
+		memberReadRetry: placement.MemberReadRetry{
+			MaxAttempts:    pl.MemberReadRetry.MaxAttempts,
+			InitialBackoff: pl.MemberReadRetry.InitialBackoffDuration(),
+			MaxBackoff:     pl.MemberReadRetry.MaxBackoffDuration(),
+		},
 		statusBatchPeriod:       pl.StatusBatchPeriodDuration(),
 		statusSafetyRequeue:     safetyRequeue,
 		dispatcherMode:          placement.DispatcherMode(pl.DispatcherMode),
@@ -406,6 +414,8 @@ func setupMultiCluster(mgr manager.Manager, clientSet kubernetes.Interface, opti
 		MaxConcurrentReconciles: w.maxConcurrent,
 		PlaceTimeout:            w.placeTimeout,
 		WinnerLostGracePeriod:   w.winnerLostGrace,
+		ObservationGrace:        w.observationGrace,
+		MemberReadRetry:         w.memberReadRetry,
 		DispatcherMode:          w.dispatcherMode,
 		DispatcherStepSize:      w.dispatcherStepSize,
 		DispatcherRoundTimeout:  w.dispatcherRoundTimeout,

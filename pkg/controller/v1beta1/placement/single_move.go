@@ -107,9 +107,7 @@ func (r *Reconciler) singleMoveProposal(ctx context.Context, source *v1beta1.Inf
 	out.InputDigest = hex.EncodeToString(digest[:])
 	if source.Status.Placement.Plan == nil {
 		a := out.Assignments[out.Winner]
-		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-		err = r.adoptAllHome(cctx, source, out.Winner, &a, out.InputDigest, true)
-		cancel()
+		err = r.adoptAllHome(ctx, source, out.Winner, &a, out.InputDigest, true)
 		if err != nil {
 			return out, err
 		}
@@ -135,9 +133,7 @@ func (r *Reconciler) singleMoveProposal(ctx context.Context, source *v1beta1.Inf
 	for _, name := range slices.Sorted(maps.Keys(out.Assignments)) {
 		a := out.Assignments[name]
 		if a.RaceCandidate && a.CurrentReplicas == 0 && a.DrainRequested && zeroHomeFloor(a.CurrentHome) {
-			cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-			observed, err := r.observePlannedHome(cctx, source, v1beta1.CandidatePlacement{Cluster: name, Allocation: &a}, declaredComponents(source))
-			cancel()
+			observed, err := r.observePlannedHome(ctx, source, v1beta1.CandidatePlacement{Cluster: name, Allocation: &a}, declaredComponents(source))
 			if err != nil {
 				return out, err
 			}
@@ -195,9 +191,7 @@ func (r *Reconciler) restoreSingleWinner(ctx context.Context, source *v1beta1.In
 		if !known || home.state != homeAbsent {
 			return nil
 		}
-		cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-		observed, err := r.observePlannedHome(cctx, source, v1beta1.CandidatePlacement{Cluster: proposal.Winner, Allocation: &a}, declaredComponents(source))
-		cancel()
+		observed, err := r.observePlannedHome(ctx, source, v1beta1.CandidatePlacement{Cluster: proposal.Winner, Allocation: &a}, declaredComponents(source))
 		if err != nil {
 			return err
 		}

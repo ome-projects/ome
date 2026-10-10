@@ -424,6 +424,12 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, inst.Index) {
 			return false, nil
 		}
+		// Past the hand-over a lost replacement is rebuilt only for a
+		// revision the roll still wants; with the pin withdrawn the roll
+		// ends instead of rebuilding a pod nobody asked for.
+		if surgeTargetName != target.Name && surgeStepIs(input, inst.Index, workload.UpdateStepSurgeDrain) {
+			return endWithdrawnSurge(ctx, deps, input, inst, row, oldPods, oldOrdinal, surgeTargetName, target.Name)
+		}
 		// A pin that is the roll target renders the current template; a
 		// pin the target has moved away from renders its stored one.
 		tmpl, found, err := pinnedTemplate(ctx, deps.Reader(), input, plan, target, surgeTargetName)
@@ -580,6 +586,66 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		"OMENative %s surge to revision %s complete (activeOrdinal=%d)",
 		workload.InstanceKey(input.Key.Component, inst.Index), surgeTargetName, newOrdinal)
 	return true, nil
+}
+
+// surgeDrainHolds are the serving-gate entries a surge's drain step writes
+// on the source pods of Instance idx: the single-pod key, named for the
+// replacement's ordinal, and the gang key.
+func surgeDrainHolds(idx, activeOrdinal int32) []podreadiness.Message {
+	return []podreadiness.Message{
+		{UserAgent: podreadiness.WriterUpdateSurgeDrain, Key: surgeDrainKey(idx, 1-activeOrdinal)},
+		{UserAgent: podreadiness.WriterUpdateSurgeDrain, Key: gangSurgeDrainKey(idx)},
+	}
+}
+
+// liftSurgeDrainHolds returns pods a surge's drain step took out of
+// rotation to it once the attempt that held them is over: a pod that keeps
+// serving its revision must be routable before its row reads Ready. A pod
+// on its way out, or one carrying no such hold, is left alone.
+func liftSurgeDrainHolds(ctx context.Context, deps workload.Deps, idx, activeOrdinal int32, pods []*corev1.Pod) error {
+	for _, pod := range pods {
+		if pod == nil || pod.DeletionTimestamp != nil {
+			continue
+		}
+		for _, hold := range surgeDrainHolds(idx, activeOrdinal) {
+			if !podreadiness.ContainsNotReadyKey(pod, hold) {
+				continue
+			}
+			if err := podreadiness.RemoveNotReadyKeyIgnoreNotFound(ctx, deps.Client, deps.Reader(), pod, hold); err != nil {
+				return fmt.Errorf("lift the drain hold of pod %s/%s: %w", pod.Namespace, pod.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// endWithdrawnSurge ends a single-pod surge past the hand-over whose
+// replacement is gone while the roll target has moved off the pinned
+// revision: a replacement is rebuilt only for a revision the roll still
+// wants. The source's drain hold is lifted so it returns to rotation on the
+// revision it runs; with no source pod standing the Instance re-enters as
+// the Create pass's fresh start at the target, without a repair.
+func endWithdrawnSurge(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, inst workload.InstancePlan, row *workload.InstanceStatus, sourcePods []*corev1.Pod, activeOrdinal int32, pinned, targetName string) (bool, error) {
+	if err := liftSurgeDrainHolds(ctx, deps, inst.Index, activeOrdinal, sourcePods); err != nil {
+		return false, err
+	}
+	runningRev := ""
+	if row != nil && anyPodStanding(sourcePods) {
+		runningRev = row.RunningRevision
+	}
+	if err := status.StampAbandonedSurgeSource(ctx, input, inst.Index, runningRev); err != nil {
+		return false, fmt.Errorf("end withdrawn surge (instance=%d): %w", inst.Index, err)
+	}
+	if runningRev != "" {
+		workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonSurgeAbandoned,
+			"OMENative %s abandoned surge to withdrawn revision %s: the replacement was lost after it took over serving and nothing is rebuilt at it; the source returns to rotation on revision %s",
+			workload.InstanceKey(input.Key.Component, inst.Index), pinned, runningRev)
+	} else {
+		workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonSurgeAbandoned,
+			"OMENative %s abandoned surge to withdrawn revision %s: the replacement was lost after it took over serving and no source pod stands, so the Instance re-enters as a fresh start at revision %s",
+			workload.InstanceKey(input.Key.Component, inst.Index), pinned, targetName)
+	}
+	return false, nil
 }
 
 // surgeStepIs reports whether the Instance's in-flight surge attempt is

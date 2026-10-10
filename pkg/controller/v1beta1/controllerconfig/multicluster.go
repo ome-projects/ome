@@ -104,6 +104,13 @@ type PlacementConfig struct {
 	// including derived absence, membership removal, or admission loss. Empty
 	// uses the controller default.
 	WinnerLostGrace string `json:"winnerLostGrace,omitempty"`
+	// ObservationGrace is how long a home whose reads fail keeps the ready count
+	// from its last successful read, measured from the first failed read. Empty
+	// withholds that count at the first failed read.
+	ObservationGrace string `json:"observationGrace,omitempty"`
+	// MemberReadRetry re-reads a member within one reconcile after a transient
+	// read failure. Absent reads each member once per reconcile.
+	MemberReadRetry PlacementMemberReadRetryConfig `json:"memberReadRetry,omitempty"`
 	// StatusBatchPeriod debounces a burst of cross-cluster derived-status events for
 	// one ISVC into a single placement reconcile.
 	StatusBatchPeriod string `json:"statusBatchPeriod,omitempty"`
@@ -125,6 +132,54 @@ type PlacementConfig struct {
 	// annotation. It names a resource the operator created, so it has no in-code
 	// default: empty leaves the choice to the placement package.
 	LocalQueue string `json:"localQueue,omitempty"`
+}
+
+// +kubebuilder:object:generate=false
+// PlacementMemberReadRetryConfig bounds how often placement re-reads a member
+// after a transient failure. MaxAttempts counts every read, the first one
+// included, so zero or one reads once. The wait before each re-read starts at
+// InitialBackoff and doubles up to MaxBackoff; both are required once
+// MaxAttempts exceeds one, and neither is accepted otherwise.
+type PlacementMemberReadRetryConfig struct {
+	MaxAttempts    int    `json:"maxAttempts,omitempty"`
+	InitialBackoff string `json:"initialBackoff,omitempty"`
+	MaxBackoff     string `json:"maxBackoff,omitempty"`
+}
+
+// Validate reports a retry block that is stated but unusable.
+func (c PlacementMemberReadRetryConfig) Validate() error {
+	var errs []error
+	if c.MaxAttempts < 0 {
+		errs = append(errs, fmt.Errorf("placement.memberReadRetry.maxAttempts: %d must not be negative", c.MaxAttempts))
+	}
+	if c.MaxAttempts <= 1 {
+		if c.InitialBackoff != "" || c.MaxBackoff != "" {
+			errs = append(errs, errors.New("placement.memberReadRetry.maxAttempts: must exceed 1 when backoffs are set"))
+		}
+		return errors.Join(errs...)
+	}
+	for _, field := range []struct{ name, value string }{
+		{"initialBackoff", c.InitialBackoff},
+		{"maxBackoff", c.MaxBackoff},
+	} {
+		if d, err := time.ParseDuration(field.value); err != nil || d <= 0 {
+			errs = append(errs, fmt.Errorf("placement.memberReadRetry.%s: %q must be a positive duration when maxAttempts exceeds 1", field.name, field.value))
+		}
+	}
+	if len(errs) == 0 && c.MaxBackoffDuration() < c.InitialBackoffDuration() {
+		errs = append(errs, errors.New("placement.memberReadRetry.maxBackoff: must not be shorter than initialBackoff"))
+	}
+	return errors.Join(errs...)
+}
+
+// InitialBackoffDuration returns the parsed InitialBackoff (0 if absent/unparsable).
+func (c PlacementMemberReadRetryConfig) InitialBackoffDuration() time.Duration {
+	return parseDurationOrZero(c.InitialBackoff)
+}
+
+// MaxBackoffDuration returns the parsed MaxBackoff (0 if absent/unparsable).
+func (c PlacementMemberReadRetryConfig) MaxBackoffDuration() time.Duration {
+	return parseDurationOrZero(c.MaxBackoff)
 }
 
 // +kubebuilder:object:generate=false
@@ -479,6 +534,7 @@ func (c MultiClusterConfig) Validate() error {
 		"placement.gcInterval":                                          c.Placement.GCInterval,
 		"placement.fanoutTimeout":                                       c.Placement.FanoutTimeout,
 		"placement.winnerLostGrace":                                     c.Placement.WinnerLostGrace,
+		"placement.observationGrace":                                    c.Placement.ObservationGrace,
 		"placement.statusBatchPeriod":                                   c.Placement.StatusBatchPeriod,
 		"placement.statusSafetyRequeue":                                 c.Placement.StatusSafetyRequeue,
 		"placement.dispatcherRoundTimeout":                              c.Placement.DispatcherRoundTimeout,
@@ -496,6 +552,9 @@ func (c MultiClusterConfig) Validate() error {
 	}
 	sort.Strings(keys)
 	var errs []error
+	if err := c.Placement.MemberReadRetry.Validate(); err != nil {
+		errs = append(errs, err)
+	}
 	if c.Placement.Capacity != nil {
 		if strings.TrimSpace(c.Placement.MemberOperatorNamespace) == "" {
 			errs = append(errs, errors.New("placement.memberOperatorNamespace is required for capacity placement"))
@@ -623,6 +682,11 @@ func (c PlacementConfig) FanoutTimeoutDuration() time.Duration {
 // WinnerLostGraceDuration returns the parsed WinnerLostGrace (0 if absent/unparsable).
 func (c PlacementConfig) WinnerLostGraceDuration() time.Duration {
 	return parseDurationOrZero(c.WinnerLostGrace)
+}
+
+// ObservationGraceDuration returns the parsed ObservationGrace (0 if absent/unparsable).
+func (c PlacementConfig) ObservationGraceDuration() time.Duration {
+	return parseDurationOrZero(c.ObservationGrace)
 }
 
 // StatusBatchPeriodDuration returns the parsed StatusBatchPeriod (0 if absent/unparsable).

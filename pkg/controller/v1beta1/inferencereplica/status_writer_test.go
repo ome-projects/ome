@@ -847,7 +847,7 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	approve("pkg/webhook/admission/isvc/replica_refs.go", "InferenceServiceValidator.validateReferencedReplica", "Get", 1, passThroughSpecMetadata+" (referenced replica: component, parentRef, owner)")
 
 	// Placement discovers identities before fetching bounded decoded rows.
-	approve("pkg/controller/v1beta1/placement/planned_observation.go", "Reconciler.observePlannedHome", "List", 1, passThroughSpecMetadata+" (inventory identities; each object is fetched through GetDecoded before resource accounting)")
+	approve("pkg/controller/v1beta1/placement/planned_observation.go", "Reconciler.observePlannedHomeOnce", "List", 1, passThroughSpecMetadata+" (inventory identities; each object is fetched through GetDecoded before resource accounting)")
 
 	// Generated client-go informer: a raw list/watch cache that consumes no
 	// rows; row-consuming code reads through the decoded accessor, never

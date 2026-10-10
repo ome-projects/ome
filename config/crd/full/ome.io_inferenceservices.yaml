@@ -29738,6 +29738,9 @@ spec:
                             type: string
                           endpoint:
                             type: string
+                          observationFailingSince:
+                            format: date-time
+                            type: string
                           observationKnown:
                             type: boolean
                           phase:

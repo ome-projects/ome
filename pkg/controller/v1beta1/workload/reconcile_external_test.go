@@ -1335,8 +1335,11 @@ type recoveryHarness struct {
 	// binds every new pod to the least-loaded node whose kubelet is alive.
 	// deadNodes names the nodes whose kubelet has stopped — nothing on
 	// them is updated or finishes terminating until the node recovers.
-	nodeNames []string
-	deadNodes map[string]bool
+	// cordonedNodes names the nodes marked unschedulable: their pods keep
+	// running, and no new pod is bound to them.
+	nodeNames     []string
+	deadNodes     map[string]bool
+	cordonedNodes map[string]bool
 
 	// readinessFails names, by UID, the pods whose readiness probe fails
 	// from now on: the kubelet model keeps their container running and
@@ -2607,10 +2610,11 @@ func (h *recoveryHarness) useNodes(names ...string) {
 }
 
 // leastLoadedLiveNode is the node model's placement for pod: the node
-// with the fewest pods bound to it among those whose kubelet is alive
-// and that the pod's required node affinity admits, earliest declared
-// first on a tie. A node with a stopped kubelet is never chosen, as a
-// scheduler honoring its unreachable taint would not.
+// with the fewest pods bound to it among those whose kubelet is alive,
+// that are not cordoned, and that the pod's required node affinity
+// admits, earliest declared first on a tie. A node with a stopped kubelet
+// is never chosen, as a scheduler honoring its unreachable taint would
+// not, and neither is a cordoned one.
 func (h *recoveryHarness) leastLoadedLiveNode(pod *corev1.Pod, pods []corev1.Pod) string {
 	h.t.Helper()
 	bound := map[string]int{}
@@ -2619,7 +2623,7 @@ func (h *recoveryHarness) leastLoadedLiveNode(pod *corev1.Pod, pods []corev1.Pod
 	}
 	chosen := ""
 	for _, name := range h.nodeNames {
-		if h.deadNodes[name] || !nodeAffinityAdmits(pod, name) {
+		if h.deadNodes[name] || h.cordonedNodes[name] || !nodeAffinityAdmits(pod, name) {
 			continue
 		}
 		if chosen == "" || bound[name] < bound[chosen] {
@@ -2703,6 +2707,35 @@ func (h *recoveryHarness) recoverNode(name string) {
 	h.t.Helper()
 	delete(h.deadNodes, name)
 	h.setNodeCondition(name, corev1.ConditionTrue)
+}
+
+// cordonNode marks name unschedulable, as kubectl cordon does: the pods
+// on it keep running and the scheduler model places nothing new there.
+func (h *recoveryHarness) cordonNode(name string) {
+	h.t.Helper()
+	node := &corev1.Node{}
+	if err := h.c.Get(h.ctx, types.NamespacedName{Name: name}, node); err != nil {
+		h.t.Fatalf("get node %s: %v", name, err)
+	}
+	node.Spec.Unschedulable = true
+	if err := h.c.Update(h.ctx, node); err != nil {
+		h.t.Fatalf("cordon node %s: %v", name, err)
+	}
+	if h.cordonedNodes == nil {
+		h.cordonedNodes = map[string]bool{}
+	}
+	h.cordonedNodes[name] = true
+}
+
+// cordonedInstances projects the Instances with a pod on a cordoned node
+// the way the adapter does, from the Nodes and pods the API holds.
+func (h *recoveryHarness) cordonedInstances() map[int32]struct{} {
+	h.t.Helper()
+	nodes, err := query.CordonedNodes(h.ctx, h.c)
+	if err != nil {
+		h.t.Fatalf("list cordoned nodes: %v", err)
+	}
+	return query.CordonedInstances(query.BucketPodsByInstanceIdx(h.livePods()), nodes)
 }
 
 func (h *recoveryHarness) setNodeCondition(name string, ready corev1.ConditionStatus) {
@@ -2848,11 +2881,12 @@ func (h *recoveryHarness) buildInput() workloadtypes.ReconcileInput {
 		},
 		DesiredSpec: h.desired,
 		ObservedState: workloadtypes.WorkloadObservedState{
-			InstanceStatuses: h.irStatuses(),
-			RetryBlocks:      append([]workloadtypes.RetryBlock(nil), h.blocks...),
-			Migrations:       append([]workloadtypes.MigrationRecord(nil), h.migrations...),
-			CurrentRevision:  h.currentRevision,
-			UpdateRevision:   h.target.Name,
+			InstanceStatuses:  h.irStatuses(),
+			RetryBlocks:       append([]workloadtypes.RetryBlock(nil), h.blocks...),
+			Migrations:        append([]workloadtypes.MigrationRecord(nil), h.migrations...),
+			CurrentRevision:   h.currentRevision,
+			UpdateRevision:    h.target.Name,
+			CordonedInstances: h.cordonedInstances(),
 		},
 		MutateInstance:     h.mutateInstance(),
 		MutateMigration:    h.mutateMigration,
@@ -7792,6 +7826,102 @@ func TestScaleDown_RemovesTheInstanceThatServesNothingFirst(t *testing.T) {
 					}
 				})
 			}
+		}
+	}
+}
+
+// TestScaleDown_RemovesTheInstanceOnACordonedNodeFirst: four healthy
+// Instances, every pod on a node of its own, and the node under one pod
+// of Instance 1 is cordoned. A scale-down by one removes Instance 1, not
+// the highest index; a scale-down by two removes Instance 1 and then the
+// highest index. The survivors keep the pods they had, nothing lands on
+// the cordoned node, and the rows settle at the new count. Single pod,
+// and gang where only the worker sits on the cordoned node.
+func TestScaleDown_RemovesTheInstanceOnACordonedNodeFirst(t *testing.T) {
+	shapes := []struct {
+		name     string
+		multiPod bool
+		runner   string
+	}{
+		{"single pod", false, "default"},
+		{"gang worker", true, "worker"},
+	}
+	reductions := []struct {
+		name    string
+		down    int32
+		removed []int32
+		kept    []int32
+	}{
+		{"down by one", 1, []int32{1}, []int32{0, 2, 3}},
+		{"down by two", 2, []int32{1, 3}, []int32{0, 2}},
+	}
+	for _, shape := range shapes {
+		for _, reduction := range reductions {
+			t.Run(shape.name+"/"+reduction.name, func(t *testing.T) {
+				h := newRecoveryHarness(t, shape.multiPod)
+				h.atomicStatus = true
+				h.replicas = 4
+				h.useNodes("node-a", "node-b", "node-c", "node-d", "node-e", "node-f", "node-g", "node-h")
+				h.setTarget(h.revV1, goodImage)
+				if !h.run(40, func() bool { return h.settledOn(h.revV1, 4) }) {
+					h.dumpState("initial create")
+					t.Fatalf("four instances never settled on v1")
+				}
+				cordoned := ""
+				for _, pod := range h.podsOf(1) {
+					if pod.Labels[query.LabelRunner] == shape.runner {
+						cordoned = pod.Spec.NodeName
+					}
+				}
+				if cordoned == "" || len(h.podsOnNode(cordoned)) != 1 {
+					h.dumpState("placement")
+					t.Fatalf("story shape: the %s pod of Instance 1 needs a node of its own, got %q", shape.runner, cordoned)
+				}
+				before := map[int32]string{}
+				for _, idx := range reduction.kept {
+					before[idx] = h.instanceIdentity(idx)
+				}
+
+				h.cordonNode(cordoned)
+				h.replicas = 4 - reduction.down
+				h.setTarget(h.revV1, goodImage)
+				atRest := func() bool {
+					rows := h.irStatuses()
+					if int32(len(rows)) != h.replicas {
+						return false
+					}
+					for _, row := range rows {
+						if row.Phase != workloadtypes.InstancePhaseReady || row.Operation != nil {
+							return false
+						}
+					}
+					return len(h.livePods()) == int(h.replicas)*len(h.desired.Runners)
+				}
+				if !h.run(40, atRest) {
+					h.dumpState("scale-down")
+					t.Fatalf("the component never came to rest at %d instances", h.replicas)
+				}
+				for _, idx := range reduction.removed {
+					if h.instance(idx) != nil || len(h.podsOf(idx)) != 0 {
+						h.dumpState("scale-down")
+						t.Fatalf("instance %d should have left; row=%+v pods=%d", idx, h.instance(idx), len(h.podsOf(idx)))
+					}
+				}
+				for _, idx := range reduction.kept {
+					if got := h.instanceIdentity(idx); got != before[idx] {
+						h.dumpState("scale-down")
+						t.Fatalf("instance %d should have kept its pods:\n got %q\nwant %q", idx, got, before[idx])
+					}
+				}
+				if on := h.podsOnNode(cordoned); len(on) != 0 {
+					h.dumpState("scale-down")
+					t.Fatalf("%d pod(s) still on the cordoned node %s", len(on), cordoned)
+				}
+				if !h.settledOn(h.revV1, h.replicas) {
+					h.dumpState("scale-down")
+					t.Fatalf("the component is not settled on v1 at %d instances", h.replicas)
+				}
+			})
 		}
 	}
 }
@@ -14412,5 +14542,167 @@ func TestGangVerdict_CorrectiveRevisionResumesTheFailedCreate(t *testing.T) {
 	}
 	if pods := h.podsOf(0); len(pods) != 2 {
 		t.Errorf("the gang was not rebuilt at its own index: %d pod(s) at index 0", len(pods))
+	}
+}
+
+// surgeHandedOver drives a single-pod surge to its drain step and returns
+// the harness there: the replacement serves and the source is out of
+// rotation, draining, with both pods standing.
+func surgeHandedOver(t *testing.T) *recoveryHarness {
+	t.Helper()
+	h := newRecoveryHarness(t, false)
+	h.routed = true
+	h.recorder = record.NewFakeRecorder(256)
+	h.useRollingBudget(workloadtypes.UpdateStrategySurgeThenDrain)
+	h.driveToReadyOnV1()
+	h.lifecycle.InstanceReadyTimeout = &metav1.Duration{Duration: 4 * time.Minute}
+	h.setTarget(h.revFixed, fixedImage)
+	handedOver := func() bool {
+		s := h.instance(0)
+		return s != nil && s.Operation != nil && s.Operation.Step == workloadtypes.UpdateStepSurgeDrain && len(h.podsOf(0)) == 2
+	}
+	if !h.run(20, handedOver) {
+		h.dumpState("hand-over")
+		t.Fatalf("the surge never took the source out of rotation behind a serving replacement")
+	}
+	for _, pod := range h.podsOf(0) {
+		if replacement := pod.Spec.Containers[0].Image == fixedImage; replacement != podreadiness.IsServing(pod) {
+			t.Fatalf("pod %s serving=%v after the hand-over; the replacement serves and the source is out of rotation", pod.Name, !replacement)
+		}
+	}
+	return h
+}
+
+// losePod deletes one live pod, the way a node or an operator takes it
+// away.
+func (h *recoveryHarness) losePod(pod *corev1.Pod) {
+	h.t.Helper()
+	if err := h.c.Delete(h.ctx, pod); err != nil {
+		h.t.Fatalf("delete pod %s: %v", pod.Name, err)
+	}
+}
+
+// noLivePodOnRevision fails the test as soon as a live pod carries rev's
+// hash: what a withdrawal leaves behind for the revision it took away.
+func (h *recoveryHarness) noLivePodOnRevision(rev *appsv1.ControllerRevision) func() {
+	hash := query.RevisionOf(rev).Hash()
+	return func() {
+		for _, pod := range h.livePods() {
+			if pod.Labels[query.LabelRevisionHash] == hash {
+				h.dumpState("withdrawn revision rebuilt")
+				h.t.Fatalf("pod %s was created on the withdrawn revision %s", pod.Name, rev.Name)
+			}
+		}
+	}
+}
+
+// A single-pod surge hands over, the operator re-applies the starting
+// revision, and the replacement is lost before the source's drain
+// converges. Nothing is rebuilt at the withdrawn revision: the roll ends,
+// the source returns to rotation on the starting revision with the pod it
+// had, and the row is Ready there.
+func TestSurgeAfterHandover_RollbackThenReplacementLostEndsTheRollOnTheStartingRevision(t *testing.T) {
+	h := surgeHandedOver(t)
+	source, replacement := h.podsOfOnImage(0, goodImage), h.podsOfOnImage(0, fixedImage)
+	if len(source) != 1 || len(replacement) != 1 {
+		t.Fatalf("hand-over shape: %d source pod(s), %d replacement pod(s), want one of each", len(source), len(replacement))
+	}
+	h.setTarget(h.revV1, goodImage)
+	h.losePod(replacement[0])
+	noWithdrawnPod := h.noLivePodOnRevision(h.revFixed)
+	ended := func() bool {
+		s := h.instance(0)
+		return s != nil && s.Phase == workloadtypes.InstancePhaseReady && s.Operation == nil &&
+			s.RunningRevision == h.revV1.Name && h.instanceInRotation(0)
+	}
+	if !h.runWithInvariant(5, ended, noWithdrawnPod) {
+		h.dumpState("roll never ended")
+		t.Fatalf("the rollback did not end the roll whose replacement was lost: %+v", h.instance(0))
+	}
+	if !h.sawEvent(workloadtypes.EventReasonSurgeAbandoned) {
+		t.Fatalf("no SurgeAbandoned event for the ended roll: %v", h.events)
+	}
+	if pods := h.podsOf(0); len(pods) != 1 || pods[0].UID != source[0].UID {
+		t.Fatalf("the source was rebuilt or joined; it runs the starting revision and keeps its pod: %d pod(s)", len(pods))
+	}
+	// The clock passes: nothing re-opens and no repair runs on the source.
+	h.runWithInvariant(15, func() bool { return false }, noWithdrawnPod)
+	if !ended() {
+		h.dumpState("after the clock")
+		t.Fatalf("the Instance left Ready on the starting revision: %+v", h.instance(0))
+	}
+	if n := h.restartsRecorded(); n != 0 {
+		t.Fatalf("restarts recorded = %d, want none: the rollback owns the Instance: %v", n, h.events)
+	}
+}
+
+// A single-pod surge hands over, the operator pushes a corrected revision,
+// and the replacement is lost before the source's drain converges. The roll
+// ends with the source back in rotation on the starting revision, and the
+// corrected revision rolls from there through the ordinary gates until the
+// Instance serves it; no pod of the withdrawn revision is created again.
+func TestSurgeAfterHandover_CorrectivePushThenReplacementLostRollsToTheCorrectedRevision(t *testing.T) {
+	h := surgeHandedOver(t)
+	replacement := h.podsOfOnImage(0, fixedImage)
+	if len(replacement) != 1 {
+		t.Fatalf("hand-over shape: %d replacement pod(s), want one", len(replacement))
+	}
+	const correctedImage = "registry.test/serving:v3"
+	corrected := h.pushRevision(correctedImage)
+	h.losePod(replacement[0])
+	noWithdrawnPod := h.noLivePodOnRevision(h.revFixed)
+	h.step()
+	noWithdrawnPod()
+	if s := h.instance(0); s == nil || s.Phase != workloadtypes.InstancePhaseReady || s.Operation != nil ||
+		s.RunningRevision != h.revV1.Name || !h.instanceInRotation(0) {
+		h.dumpState("roll never ended")
+		t.Fatalf("the corrected push did not end the roll whose replacement was lost with the source back in rotation: %+v", h.instance(0))
+	}
+	if !h.sawEvent(workloadtypes.EventReasonSurgeAbandoned) {
+		t.Fatalf("no SurgeAbandoned event for the ended roll: %v", h.events)
+	}
+	if !h.runWithInvariant(40, func() bool { return h.converged(corrected.Name) && h.instanceInRotation(0) }, noWithdrawnPod) {
+		h.dumpState("never converged")
+		t.Fatalf("the Instance never settled on the corrected revision: %+v", h.instance(0))
+	}
+	h.requirePodsRender(0, corrected, correctedImage)
+	if n := h.restartsRecorded(); n != 0 {
+		t.Fatalf("restarts recorded = %d, want none: the roll owns the Instance: %v", n, h.events)
+	}
+}
+
+// A single-pod surge hands over and the drained source is deleted; the
+// replacement is then lost in the same window in which the operator
+// re-applies the starting revision. The roll ends as a fresh start: the row
+// re-enters Failed with no attempt on the revision it ran, and the Create
+// pass rebuilds the Instance there without a repair; no pod of the
+// withdrawn revision is created again.
+func TestSurgeAfterHandover_ReplacementLostWithSourceGoneThenRollbackRebuildsAtTheStartingRevision(t *testing.T) {
+	h := surgeHandedOver(t)
+	sourceGone := func() bool {
+		s, pods := h.instance(0), h.podsOf(0)
+		return s != nil && s.Operation != nil && s.Operation.Step == workloadtypes.UpdateStepSurgeDrain &&
+			len(pods) == 1 && pods[0].Spec.Containers[0].Image == fixedImage
+	}
+	if !h.run(10, sourceGone) {
+		h.dumpState("source never drained")
+		t.Fatalf("the drained source was never deleted behind the serving replacement")
+	}
+	h.setTarget(h.revV1, goodImage)
+	h.losePod(h.podsOf(0)[0])
+	noWithdrawnPod := h.noLivePodOnRevision(h.revFixed)
+	h.step()
+	noWithdrawnPod()
+	if s := h.instance(0); s == nil || s.Phase != workloadtypes.InstancePhaseFailed || s.Operation != nil || s.RunningRevision != h.revV1.Name {
+		h.dumpState("no fresh start")
+		t.Fatalf("the roll did not end as a fresh start on the revision the source ran: %+v", h.instance(0))
+	}
+	if !h.runWithInvariant(20, func() bool { return h.converged(h.revV1.Name) && h.instanceInRotation(0) }, noWithdrawnPod) {
+		h.dumpState("never rebuilt")
+		t.Fatalf("the Instance was not rebuilt at the starting revision after the rollback: %+v", h.instance(0))
+	}
+	h.requirePodsRender(0, h.revV1, goodImage)
+	if n := h.restartsRecorded(); n != 0 {
+		t.Fatalf("restarts recorded = %d, want none: the fresh start is the Create pass's, not a repair's: %v", n, h.events)
 	}
 }

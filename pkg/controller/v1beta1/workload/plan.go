@@ -35,7 +35,7 @@ func BuildPlan(component types.ComponentType, desired types.WorkloadDesiredSpec,
 	// The plan grows beyond replicas during the surge phase of a
 	// migration; scale-down logic is responsible for picking the right
 	// deletion target after that surge resolves.
-	indices := instancePlanIndices(observed.InstanceStatuses, replicas, observed.RetryBlocks)
+	indices := instancePlanIndices(observed.InstanceStatuses, replicas, observed.RetryBlocks, observed.CordonedInstances)
 	instances := make([]types.InstancePlan, len(indices))
 	runners := runnersForInstance(desired.MultiPod, workerSize)
 	for i, idx := range indices {
@@ -174,9 +174,11 @@ func MigrationModeOrDefault(p *types.MigrationPolicy) types.MigrationMode {
 // instancePlanIndices computes the per-Instance index set the plan should
 // drive: live surge pairs (unbounded by replicas), then the existing
 // steady indices up to the replica cap — in rank order (scaleDownRank),
-// oldest first within a rank — excluding sources whose replacements are
-// proven promoted, then new indices to round out scale-up. blocks is the
-// Component's retry ladder, which the rank reads a row's revision by.
+// lowest index first within a rank — excluding sources whose replacements
+// are proven promoted, then new indices to round out scale-up. blocks is
+// the Component's retry ladder, which the rank reads a row's revision by;
+// cordoned holds the indices with a pod on a cordoned node, which rank
+// below every other row.
 //
 // The replica cap counts only non-migration indices. Counting the
 // surge against it would drop a healthy non-migrating sibling out of
@@ -186,8 +188,9 @@ func MigrationModeOrDefault(p *types.MigrationPolicy) types.MigrationMode {
 // for the steady budget behind the Ready rows, the source charged like
 // any steady row and its marker following the source in or out, so the
 // two leave the plan together and the scale-down retires them as one
-// unit instead of taking a healthy sibling.
-func instancePlanIndices(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock) []int32 {
+// unit instead of taking a healthy sibling. The pair counts as cordoned
+// when either half has a pod on a cordoned node.
+func instancePlanIndices(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock, cordoned map[int32]struct{}) []int32 {
 	used := existingInstanceIndices(instances)
 	// "Protected" / "source" sets cover BOTH migration surge pairs and
 	// multi-pod (gang) update-surge pairs — the two cases that transiently
@@ -222,14 +225,19 @@ func instancePlanIndices(instances []types.InstanceStatus, replicas int32, block
 		}
 	}
 
-	// The steady rows are kept in rank order; a scale-down removes the
-	// lowest-ranked rows first.
+	// The steady rows are kept in rank order, rank 0 first, so a scale-down
+	// removes the highest-numbered ranks first.
 	rankByIndex := map[int32]int{}
 	statusByIndex := map[int32]types.InstanceStatus{}
 	retiringSources := map[int32]struct{}{}
 	for _, s := range instances {
 		statusByIndex[s.Index] = s
-		rankByIndex[s.Index] = scaleDownRank(s, blocks)
+		_, onCordonedNode := cordoned[s.Index]
+		if marker, paired := markerOf[s.Index]; paired {
+			_, markerOnCordonedNode := cordoned[marker]
+			onCordonedNode = onCordonedNode || markerOnCordonedNode
+		}
+		rankByIndex[s.Index] = scaleDownRank(s, blocks, onCordonedNode)
 	}
 
 	// A handoff source retires only after its replacement is Ready. Gang updates
@@ -286,7 +294,7 @@ func instancePlanIndices(instances []types.InstanceStatus, replicas int32, block
 	}
 
 	// Pass 2: fill the steady replica budget in rank order, keeping the
-	// oldest eligible index within each rank.
+	// lowest eligible index within each rank.
 	fill := func(rank int) {
 		for _, idx := range sorted {
 			if steadyCount >= replicas {
@@ -342,12 +350,15 @@ func instancePlanIndices(instances []types.InstanceStatus, replicas int32, block
 }
 
 // scaleDownRank orders the steady rows a scale-down keeps, lowest kept
-// first: a serving row on a sound revision, any other row on a sound
-// revision, a serving row on a failing revision, then the rest. A row on
-// a failing revision ranks below every row on a sound one: its Ready is
-// the pause between crashes of a revision the ladder reads as failed,
-// not capacity the Component can keep.
-func scaleDownRank(s types.InstanceStatus, blocks []types.RetryBlock) int {
+// first. A row with a pod on a cordoned node ranks below every row
+// without one: its node is being emptied, so keeping it means moving it
+// later, while dropping it frees the node now. Within each half: a
+// serving row on a sound revision, any other row on a sound revision, a
+// serving row on a failing revision, then the rest. A row on a failing
+// revision ranks below every row on a sound one: its Ready is the pause
+// between crashes of a revision the ladder reads as failed, not capacity
+// the Component can keep.
+func scaleDownRank(s types.InstanceStatus, blocks []types.RetryBlock, onCordonedNode bool) int {
 	rank := 0
 	if !keepsPreference(s) {
 		rank++
@@ -355,11 +366,14 @@ func scaleDownRank(s types.InstanceStatus, blocks []types.RetryBlock) int {
 	if rowOnFailingRevision(s, blocks) {
 		rank += 2
 	}
+	if onCordonedNode {
+		rank += 4
+	}
 	return rank
 }
 
 // lowestScaleDownRank is the last rank scaleDownRank assigns.
-const lowestScaleDownRank = 3
+const lowestScaleDownRank = 7
 
 // keepsPreference reports whether a row is a stable replica the plan keeps
 // ahead of the rest: Ready, with every pod its published counts hold in

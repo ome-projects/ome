@@ -3520,6 +3520,12 @@ func schema_pkg_apis_ome_v1beta1_CandidatePlacement(ref common.ReferenceCallback
 							Format:      "",
 						},
 					},
+					"observationFailingSince": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ObservationFailingSince is when the control plane's reads of this home started failing. It is unset while reads succeed. While the configured observation grace lasts from this time, the home keeps the ready count from its last successful read.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
 					"cluster": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Cluster is the WorkloadCluster name.",
@@ -3572,7 +3578,7 @@ func schema_pkg_apis_ome_v1beta1_CandidatePlacement(ref common.ReferenceCallback
 			},
 		},
 		Dependencies: []string{
-			"knative.dev/pkg/apis.URL", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAllocationStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAutoscalingStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateRolloutStatus"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "knative.dev/pkg/apis.URL", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAllocationStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAutoscalingStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateRolloutStatus"},
 	}
 }
 

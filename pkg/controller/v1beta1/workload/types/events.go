@@ -102,9 +102,11 @@ const (
 
 	// EventReasonSurgeAbandoned fires when a single-pod surge is abandoned
 	// because the desired state has withdrawn the revision it is pinned
-	// to: the replacement is deleted and the source, still in
-	// rotation, is reset to Ready on its running revision. Normal, not a
-	// failure: the retired revision never got the chance to fail.
+	// to: the replacement is deleted and the source, still in rotation, is
+	// reset to Ready on its running revision; past the hand-over a lost
+	// replacement is not rebuilt and the source returns to rotation.
+	// Normal, not a failure: the retired revision never got the chance to
+	// fail.
 	EventReasonSurgeAbandoned EventReason = "SurgeAbandoned"
 
 	// Restart (workload/ops/restart.go).

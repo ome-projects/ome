@@ -77,7 +77,7 @@ func DeleteBatch(
 	if err != nil {
 		return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: resolve scale-down Pod batch size: %w", err)
 	}
-	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, extrasNotParked(input, extras, podsByInstance), podsByInstance, budget)
+	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, extrasNotParked(input, extras, podsByInstance), podsByInstance, budget, input.ObservedState.CordonedInstances)
 	if err != nil {
 		return DeleteBatchResult{}, err
 	}
@@ -201,11 +201,16 @@ func DeleteBatch(
 	return result, nil
 }
 
+// selectDeleteBatch picks the wave this pass drives. Delete-owned rows come
+// first, oldest operation first; only when none remain are fresh extras
+// admitted, those with a pod on a cordoned node first, then the highest
+// index, so a wave the budget splits empties the cordoned nodes first.
 func selectDeleteBatch(
 	statuses []workload.InstanceStatus,
 	extras []int32,
 	podsByInstance map[int32][]*corev1.Pod,
 	budget *int32,
+	cordoned map[int32]struct{},
 ) (deleteBatchSelection, error) {
 	if budget != nil && *budget <= 0 {
 		return deleteBatchSelection{}, fmt.Errorf("DeleteBatch: scale-down Pod batch size must be positive")
@@ -252,7 +257,14 @@ func selectDeleteBatch(
 	if len(pool) == 0 {
 		pool = fresh
 		selection.fresh = true
-		sort.Slice(pool, func(i, j int) bool { return pool[i].status.Index > pool[j].status.Index })
+		sort.Slice(pool, func(i, j int) bool {
+			_, iCordoned := cordoned[pool[i].status.Index]
+			_, jCordoned := cordoned[pool[j].status.Index]
+			if iCordoned != jCordoned {
+				return iCordoned
+			}
+			return pool[i].status.Index > pool[j].status.Index
+		})
 	} else {
 		blockedFresh = len(fresh)
 		sort.SliceStable(pool, func(i, j int) bool {

@@ -23,6 +23,8 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/config"
+	"sigs.k8s.io/controller-runtime/pkg/controller/priorityqueue"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
@@ -33,6 +35,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/sliceprovision"
 	workloadgang "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/tpuslice/gke"
 	"sigs.k8s.io/ome/pkg/utils"
@@ -103,6 +106,7 @@ func newSetupManager(t *testing.T, skipNameValidation bool) ctrl.Manager {
 	} {
 		mapper.Add(gvk, meta.RESTScopeNamespace)
 	}
+	mapper.Add(corev1.SchemeGroupVersion.WithKind("Node"), meta.RESTScopeRoot)
 	mgr, err := ctrl.NewManager(&rest.Config{Host: "http://127.0.0.1:0"}, manager.Options{
 		Scheme:                 scheme,
 		Logger:                 logr.Discard(),
@@ -208,6 +212,37 @@ func TestSetupWithManager_RegistersTheController(t *testing.T) {
 	}
 }
 
+// TestControllerOptions_QueueIsFirstInFirstOut pins the replica queue's order.
+// controller-runtime's priority queue serves an item the manager listed at
+// startup only when no item with a higher priority is ready, and a requeue
+// keeps its priority. Two replicas that requeue after every pass would keep a
+// re-listed replica, such as one whose teardown was in flight when the manager
+// restarted, waiting for as long as they run.
+func TestControllerOptions_QueueIsFirstInFirstOut(t *testing.T) {
+	opts := (&Reconciler{MaxConcurrentReconciles: 4}).controllerOptions()
+	if opts.UsePriorityQueue == nil || *opts.UsePriorityQueue {
+		t.Fatalf("UsePriorityQueue = %v, want false", opts.UsePriorityQueue)
+	}
+	if opts.MaxConcurrentReconciles != 4 {
+		t.Fatalf("MaxConcurrentReconciles = %d, want 4", opts.MaxConcurrentReconciles)
+	}
+
+	// The behavior the option avoids: with a priority queue, the re-listed
+	// replica is never served while the two busy replicas keep requeueing.
+	q := priorityqueue.New[string]("replica-order")
+	defer q.ShutDown()
+	q.AddWithOpts(priorityqueue.AddOpts{Priority: ptr.To(handler.LowPriority)}, "relisted")
+	q.AddWithOpts(priorityqueue.AddOpts{}, "busy-a", "busy-b")
+	for range 20 {
+		item, _ := q.Get()
+		if item == "relisted" {
+			t.Fatal("the priority queue served a startup item ahead of ready requeues; revisit whether the replica queue still needs to be first in, first out")
+		}
+		q.Done(item)
+		q.AddWithOpts(priorityqueue.AddOpts{}, item)
+	}
+}
+
 // TestSetupWithManager_GangSchedulingFollowsThePodGroupCRD pins the
 // discovery-gated half of setup: with the PodGroup CRD present the
 // reconciler reports gang scheduling available and registers the
@@ -243,6 +278,20 @@ func TestSetupWithManager_GangSchedulingFollowsThePodGroupCRD(t *testing.T) {
 				t.Fatalf("setup must not touch the PodGroup index when the CRD is absent, got %v", err)
 			}
 		})
+	}
+}
+
+// TestSetupWithManager_RegistersTheNodeUnschedulableIndex pins that setup
+// installs the index the scale-down reads cordoned nodes through. The index
+// can be registered once per cache, so a second registration fails.
+func TestSetupWithManager_RegistersTheNodeUnschedulableIndex(t *testing.T) {
+	seedCRDDiscovery(false, false)
+	mgr := newSetupManager(t, true)
+	if err := wiredReconciler(mgr).SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if err := query.RegisterNodeUnschedulableIndex(context.Background(), mgr.GetFieldIndexer()); err == nil {
+		t.Fatal("setup must register the Node unschedulable index")
 	}
 }
 

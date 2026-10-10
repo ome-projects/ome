@@ -151,6 +151,13 @@ type WorkloadObservedState struct {
 	// NotIn overlay. Nil / missing index = no exclusion (zero change for
 	// normal instances).
 	ExcludedNodesByInstance map[int32][]NodeExclusion
+
+	// CordonedInstances is the set of Instance indices with a live pod on
+	// a cordoned node (spec.unschedulable), projected per reconcile by the
+	// adapter from cached pods and nodes. A scale-down removes these
+	// Instances before any other, and its wave admits them first. Nil
+	// means no Instance is known to sit on a cordoned node.
+	CordonedInstances map[int32]struct{}
 }
 
 // Instance returns the observed row at idx, or nil when the observation

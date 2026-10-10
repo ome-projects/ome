@@ -4223,3 +4223,150 @@ func TestSurgeUpdate_ExpiredExpectationUnblocksTheStep(t *testing.T) {
 		}
 	})
 }
+
+// surgeDrainRow is a single-pod source at the drain step of a surge pinned
+// to pinned while running running: the replacement served, the source is
+// out of rotation, and the cycle has its pin.
+func surgeDrainRow(running, pinned string) v1beta1.OMENativeInstanceStatus {
+	return v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceUpdating,
+		RunningRevision: running, TargetRevision: pinned,
+		Operation: &v1beta1.InstanceOperation{
+			ID:             "update-0-1",
+			Type:           v1beta1.InstanceOperationType(workload.InstanceOperationUpdate),
+			Step:           workload.UpdateStepSurgeDrain,
+			TargetRevision: pinned,
+			Strategy:       string(workload.UpdateStrategySurgeThenDrain),
+		},
+	}
+}
+
+// holdSourceForDrain takes the source out of rotation the way the drain
+// step does, under the surge-drain writer's key for the replacement's slot.
+func holdSourceForDrain(t *testing.T, c client.Client, source *corev1.Pod) {
+	t.Helper()
+	if err := podreadiness.MarkPodNotServing(context.Background(), c, c, source, podreadiness.WriterUpdateSurgeDrain, surgeDrainKey(0, 1)); err != nil {
+		t.Fatalf("hold the source for the drain: %v", err)
+	}
+}
+
+// TestSurgeUpdate_WithdrawnTargetEndsTheRollWhenTheReplacementIsLost pins
+// the drain-step end. The source is out of rotation under the drain's hold,
+// the replacement at the surge ordinal is gone, and the roll target has
+// moved off the pinned revision, back to the running one or on to a newer
+// one. Nothing is created at the pinned revision: the source's hold is
+// lifted so it serves again, and the row settles Ready on the running
+// revision at its own ordinal, from where the roll target rolls through the
+// ordinary gates.
+func TestSurgeUpdate_WithdrawnTargetEndsTheRollWhenTheReplacementIsLost(t *testing.T) {
+	const running, pinned, newer = "llama-70b-engine-rev-v1hash", "llama-70b-engine-rev-v2hash", "llama-70b-engine-rev-v3hash"
+	wantMessage := "abandoned surge to withdrawn revision " + pinned + ": the replacement was lost after it took over serving and nothing is rebuilt at it; the source returns to rotation on revision " + running
+	for _, tc := range []struct{ name, target string }{
+		{"rolled back to the running revision", running},
+		{"moved on to a corrected revision", newer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			isvc, ir := surgeISVCReady("llama-70b", "prod", 1)
+			ir.Status.InstanceStatuses[0] = surgeDrainRow(running, pinned)
+			source := surgePodAtOrdinal(isvc, 0, 1, 0, true, false)
+			source.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(running)
+			c := legacyNewFakeClient(t, isvc, ir, source)
+			holdSourceForDrain(t, c, source)
+			revisions := map[string]*appsv1.ControllerRevision{}
+			for _, name := range []string{running, pinned, newer} {
+				revisions[name] = makeCR(t, c, isvc, name)
+			}
+			rec := record.NewFakeRecorder(8)
+			deps := legacyTestDeps(c)
+			deps.Recorder = rec
+			input := legacyTestInput(isvc, c, workload.ComponentEngine)
+			input.DrainHolds = &workload.DrainHolds{}
+			plan := surgePlan()
+			pods, err := query.LiveListPodsForInstance(context.Background(), c, "prod", "llama-70b", workload.ComponentEngine, 0)
+			if err != nil {
+				t.Fatalf("list pods: %v", err)
+			}
+			if _, err := surgeUpdate(context.Background(), deps, input, plan, plan.Instances[0], revisions[tc.target], pods); err != nil {
+				t.Fatalf("surgeUpdate: %v", err)
+			}
+
+			replacement := query.PodName("llama-70b", workload.ComponentEngine, 0, "default", 1)
+			if err := c.Get(context.Background(), k8stypes.NamespacedName{Namespace: "prod", Name: replacement}, &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Fatalf("a pod stands at the surge ordinal after the end (err=%v); nothing is rebuilt at the withdrawn revision", err)
+			}
+			fresh := &corev1.Pod{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(source), fresh); err != nil {
+				t.Fatalf("read the source: %v", err)
+			}
+			if !podreadiness.IsServing(fresh) || podreadiness.HeldNotServingBy(fresh, podreadiness.WriterUpdateSurgeDrain) {
+				t.Fatalf("the source is not back in rotation after the end: conditions=%+v", fresh.Status.Conditions)
+			}
+			s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+			if s.Phase != v1beta1.OMENativeInstanceReady || s.RunningRevision != running ||
+				s.Operation != nil || s.TargetRevision != "" || s.ActiveOrdinal != 0 {
+				t.Fatalf("the row must settle Ready on %s at ordinal 0 with no operation, got phase=%s running=%s target=%q activeOrdinal=%d op=%+v",
+					running, s.Phase, s.RunningRevision, s.TargetRevision, s.ActiveOrdinal, s.Operation)
+			}
+			want := corev1.EventTypeNormal + " " + string(workload.EventReasonSurgeAbandoned)
+			matched := 0
+			for _, e := range drainRecorderEvents(rec) {
+				if strings.HasPrefix(e, want) && strings.Contains(e, wantMessage) {
+					matched++
+				}
+			}
+			if matched != 1 {
+				t.Fatalf("want one %q event naming %q, got %v", want, wantMessage, drainRecorderEvents(rec))
+			}
+		})
+	}
+}
+
+// TestSurgeUpdate_WithdrawnTargetWithNoSourceLeftEndsAsAFreshStart pins the
+// other end of the same row: the drained source is gone, the replacement at
+// the surge ordinal is gone, and the roll target has moved off the pinned
+// revision. Nothing is created at the pinned revision; the row takes the
+// fresh-start Failed shape on the revision it ran, which the Create pass
+// rebuilds at the roll target.
+func TestSurgeUpdate_WithdrawnTargetWithNoSourceLeftEndsAsAFreshStart(t *testing.T) {
+	const running, pinned = "llama-70b-engine-rev-v1hash", "llama-70b-engine-rev-v2hash"
+	legacyResetExpectations(t)
+	isvc, ir := surgeISVCReady("llama-70b", "prod", 1)
+	ir.Status.InstanceStatuses[0] = surgeDrainRow(running, pinned)
+	c := legacyNewFakeClient(t, isvc, ir)
+	target := makeCR(t, c, isvc, running)
+	makeCR(t, c, isvc, pinned)
+	rec := record.NewFakeRecorder(8)
+	deps := legacyTestDeps(c)
+	deps.Recorder = rec
+	input := legacyTestInput(isvc, c, workload.ComponentEngine)
+	input.DrainHolds = &workload.DrainHolds{}
+	plan := surgePlan()
+	if _, err := surgeUpdate(context.Background(), deps, input, plan, plan.Instances[0], target, nil); err != nil {
+		t.Fatalf("surgeUpdate: %v", err)
+	}
+
+	pods, err := query.LiveListPodsForInstance(context.Background(), c, "prod", "llama-70b", workload.ComponentEngine, 0)
+	if err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	if len(pods) != 0 {
+		t.Fatalf("the end created %d pod(s); the Create pass owns the fresh start", len(pods))
+	}
+	s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+	if s.Phase != v1beta1.OMENativeInstanceFailed || s.RunningRevision != running || s.Operation != nil || s.TargetRevision != "" {
+		t.Fatalf("the row must take the fresh-start Failed shape on %s, got phase=%s running=%s target=%q op=%+v",
+			running, s.Phase, s.RunningRevision, s.TargetRevision, s.Operation)
+	}
+	wantMessage := "abandoned surge to withdrawn revision " + pinned + ": the replacement was lost after it took over serving and no source pod stands, so the Instance re-enters as a fresh start at revision " + running
+	events := drainRecorderEvents(rec)
+	matched := 0
+	for _, e := range events {
+		if strings.Contains(e, string(workload.EventReasonSurgeAbandoned)) && strings.Contains(e, wantMessage) {
+			matched++
+		}
+	}
+	if matched != 1 {
+		t.Fatalf("want one SurgeAbandoned event naming %q, got %v", wantMessage, events)
+	}
+}
