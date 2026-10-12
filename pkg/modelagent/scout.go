@@ -384,7 +384,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldBaseModel.Labels, newBaseModel.Labels},
-		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
+		{"Annotations", downloadInputAnnotations(oldBaseModel.Annotations), downloadInputAnnotations(newBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldBaseModel.Spec), downloadOverrideInputsFromSpec(newBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -441,7 +441,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldClusterBaseModel.Labels, newClusterBaseModel.Labels},
-		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
+		{"Annotations", downloadInputAnnotations(oldClusterBaseModel.Annotations), downloadInputAnnotations(newClusterBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldClusterBaseModel.Spec), downloadOverrideInputsFromSpec(newClusterBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -453,6 +453,22 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
 	}
+}
+
+// downloadInputAnnotations excludes only usage bookkeeping. Preserve all other
+// inputs, including lifecycle intent, and never mutate informer-owned maps.
+func downloadInputAnnotations(annotations map[string]string) map[string]string {
+	var inputs map[string]string
+	for key, value := range annotations {
+		if key == constants.ModelUsageHistoryAnnotation {
+			continue
+		}
+		if inputs == nil {
+			inputs = make(map[string]string, len(annotations))
+		}
+		inputs[key] = value
+	}
+	return inputs
 }
 
 func hasDownloadOverrideChanges(candidates []downloadOverrideChangeCandidate, opts ...cmp.Option) (bool, error) {

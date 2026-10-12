@@ -75,6 +75,9 @@ const (
 	TensorRTLLM           = "tensorrtllm"
 )
 
+// ModelUsageHistoryAnnotation stores idleSince and lastObservedDemandEndedAt.
+const ModelUsageHistoryAnnotation = "ome.io/model-usage-history"
+
 // InferenceService Annotations
 var (
 	DeploymentMode                          = OMEAPIGroupName + "/deploymentMode"
