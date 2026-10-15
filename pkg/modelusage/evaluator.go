@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/evictionplanner"
+	"sigs.k8s.io/ome/pkg/modelclaims"
 )
 
 // Evaluator maintains history and returns advisory planner eligibility. Reader
@@ -40,8 +41,8 @@ type history struct {
 
 // Reconcile checks current references before changing history. Planner callers
 // must pass the inventory UID; an empty expectedUID is for history-only events.
-// A protected success consumes a release event: the remaining source's later
-// removal supplies its own event. Errors should retry the identical request.
+// A protected success consumes a release event: a remaining source removal or
+// final claim release supplies a later event. Errors retry the identical request.
 // This result is advisory, not authorization to delete artifacts; the execution
 // controller must coordinate with concurrently starting serving demand.
 func (e *Evaluator) Reconcile(ctx context.Context, request Request, expectedUID types.UID, inFlight bool) (evictionplanner.Eligibility, error) {
@@ -61,6 +62,15 @@ func (e *Evaluator) Reconcile(ctx context.Context, request Request, expectedUID 
 		expectedUID = model.UID
 		if reason := excluded(model, inFlight); reason != "" {
 			return protected(reason), nil
+		}
+		// A newly preparing endpoint may hold a claim before its ISVC reaches the
+		// informer cache. Invalid claim metadata also blocks automatic eviction.
+		held, err := modelclaims.HasClaims(model.Annotations)
+		if err != nil {
+			return protected("artifact use claims could not be established"), err
+		}
+		if held {
+			return protected("artifact use claim exists"), nil
 		}
 		active, err := e.references.HasReferences(ctx, request.Model)
 		if err != nil {
@@ -115,6 +125,8 @@ func excluded(model *v1beta1.BaseModel, inFlight bool) string {
 		return "BaseModel is deleting"
 	case model.Spec.Storage != nil && model.Spec.Storage.StorageUri != nil && strings.HasPrefix(*model.Spec.Storage.StorageUri, "vendor://"):
 		return "vendor model"
+	// The agent retention label explicitly requests preserved files, so exclude
+	// the model from automated eviction even when it has no serving references.
 	case strings.EqualFold(model.Labels[constants.ReserveModelArtifact], "true"):
 		return "model artifact is reserved"
 	case model.Annotations["ome.io/artifact-residency"] == "Evicted":

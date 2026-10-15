@@ -17,6 +17,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/modelclaims"
 )
 
 // ModelReferences contains the distinct names protected by one source. An
@@ -120,13 +121,32 @@ type Request struct {
 // RemovedReferences derives release requests from an update or actual deletion
 // (newObject == nil). Add/startup events, status-only updates, duplicate names,
 // and reference additions produce no requests. Retry the returned request with
-// its original timestamp; never replace it with reconciliation time.
+// its original timestamp; never replace it with reconciliation time. BaseModel
+// updates also emit a request when their last use claim is released.
 func RemovedReferences(oldObject, newObject client.Object, observedAt time.Time) ([]Request, error) {
 	if oldObject == nil {
 		return nil, nil
 	}
 	if observedAt.IsZero() {
 		return nil, fmt.Errorf("reference removal requires an observation timestamp")
+	}
+	if oldModel, ok := oldObject.(*v1beta1.BaseModel); ok {
+		newModel, ok := newObject.(*v1beta1.BaseModel)
+		if !ok || newModel == nil || oldModel.UID == "" || oldModel.UID != newModel.UID || client.ObjectKeyFromObject(oldModel) != client.ObjectKeyFromObject(newModel) {
+			return nil, nil
+		}
+		// The final workload event can arrive while its endpoint still holds a
+		// claim. Safe release of the last claim supplies the subsequent demand-end
+		// event; ordinary history patches and releases of other claims do not.
+		hadClaims, err := modelclaims.HasClaims(oldModel.Annotations)
+		if err != nil || !hadClaims {
+			return nil, err
+		}
+		hasClaims, err := modelclaims.HasClaims(newModel.Annotations)
+		if err != nil || hasClaims {
+			return nil, err
+		}
+		return []Request{{Model: client.ObjectKeyFromObject(newModel), ReferenceRemovedAt: observedAt.UTC()}}, nil
 	}
 	oldRefs, err := References(oldObject)
 	if err != nil {

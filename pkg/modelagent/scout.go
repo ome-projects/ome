@@ -460,7 +460,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 func downloadInputAnnotations(annotations map[string]string) map[string]string {
 	var inputs map[string]string
 	for key, value := range annotations {
-		if key == constants.ModelUsageHistoryAnnotation {
+		if key == constants.ModelUsageHistoryAnnotation || key == constants.ModelArtifactUseClaimsAnnotation {
 			continue
 		}
 		if inputs == nil {

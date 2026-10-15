@@ -356,3 +356,45 @@ func TestMissingCacheIndexProtectsWithoutFullList(t *testing.T) {
 		t.Fatal("query fell back to unindexed list")
 	}
 }
+
+func TestOnlyFinalClaimReleaseProducesHistoryEvent(t *testing.T) {
+	for _, tc := range []struct {
+		name, old, next string
+		want            int
+	}{
+		{"release one of two", `{"a":true,"b":true}`, `{"b":true}`, 0},
+		{"release final", `{"b":true}`, `{}`, 1},
+		{"remove annotation", `{"b":true}`, "", 1},
+		{"add", `{}`, `{"a":true}`, 0},
+		{"no claims", `{}`, `{}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := baseModel("")
+			old.Annotations[constants.ModelArtifactUseClaimsAnnotation] = tc.old
+			next := old.DeepCopy()
+			if tc.next == "" {
+				delete(next.Annotations, constants.ModelArtifactUseClaimsAnnotation)
+			} else {
+				next.Annotations[constants.ModelArtifactUseClaimsAnnotation] = tc.next
+			}
+			requests, err := RemovedReferences(old, next, testTime)
+			if err != nil || len(requests) != tc.want {
+				t.Fatalf("requests=%+v err=%v", requests, err)
+			}
+			if tc.want == 1 && (!requests[0].ReferenceRemovedAt.Equal(testTime) || requests[0].Model != modelKey) {
+				t.Fatalf("wrong claim release event: %+v", requests)
+			}
+			next.UID = "replacement"
+			requests, err = RemovedReferences(old, next, testTime)
+			if err != nil || len(requests) != 0 {
+				t.Fatalf("replacement generated history: %+v %v", requests, err)
+			}
+		})
+	}
+	old := baseModel("")
+	old.Annotations[constants.ModelArtifactUseClaimsAnnotation] = `{"a":true}`
+	requests, err := RemovedReferences(old, nil, testTime)
+	if err != nil || len(requests) != 0 {
+		t.Fatalf("deleted model generated history: %+v %v", requests, err)
+	}
+}

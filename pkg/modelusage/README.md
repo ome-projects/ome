@@ -24,13 +24,17 @@ controller, watches, artifact deletion, or separate in-memory reference graph.
    Unwrap informer deletion tombstones to the typed object first. Capture
    `observedAt` once when receiving the event, then enqueue each returned
    `Request`. Creates, startup/relist additions, status-only changes, reference
-   additions, and duplicate names do not produce release requests.
+   additions, and duplicate names do not produce release requests. Also watch
+   **BaseModel updates** and pass their old/new objects to this function: release
+   of the final valid use claim produces a request for that model. BaseModels
+   need no reference index; their claim guard uses the uncached GET.
 5. Call `Reconcile(ctx, request, expectedUID, inFlight)`. The comparable request
    can be a workqueue item and must retain its original `ReferenceRemovedAt`
    through retries. If a queue coalesces by model instead, retain the newest
    actual removal time; never replace it with reconciliation time. Errors
    protect the model and retry the same request. A successful protected result
-   consumes the event: a remaining source's later removal generates another.
+   consumes the event: a remaining source's later removal or the final claim
+   release generates another.
    No package state remembers or reconstructs missed events.
 6. Ordinary planning/startup uses `Request{Model: key}`, with no removal time.
    Planner callers supply the inventory UID and current eviction-in-flight
@@ -63,7 +67,9 @@ conflicting primary identity on an OME workload protects its whole namespace.
 
 Unready, terminating, terminal, and zero-replica sources retain their references
 until actual removal. Deleting, vendor-URI, reserved, Evicted, and in-flight
-BaseModels are protected without history writes.
+BaseModels are protected without history writes. Active or malformed
+`ome.io/artifact-use-claims` also protect the model before reference queries.
+This covers preparing endpoints whose ISVC has not reached the cache yet.
 
 ## History and limits
 
@@ -92,7 +98,9 @@ known names cannot supply model-specific removal events. History is a scoring
 input, and eligibility is an advisory snapshot: execution must revalidate and
 coordinate with newly starting demand before submitting eviction intent.
 
-Scout excludes the exact history annotation from download-input comparisons.
+Scout excludes the exact history and use-claims annotations from download-input
+comparisons. See [modelclaims](../modelclaims/README.md) for conditional claim
+and eviction writes; the evaluator itself never submits eviction.
 
 ## Validation
 

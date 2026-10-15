@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/ome/pkg/artifactinventory"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/evictionplanner"
+	"sigs.k8s.io/ome/pkg/modelclaims"
 )
 
 type testClient struct {
@@ -469,5 +470,111 @@ func TestConflictRetryRetainsOriginalEventTime(t *testing.T) {
 	h := readHistory(t, c, modelKey)
 	if h["lastObservedDemandEndedAt"] != removedAt.Format(time.RFC3339) {
 		t.Fatalf("wrong persisted event time: %v", h)
+	}
+}
+
+func TestUseClaimsProtectBeforeServingCacheSeesDemand(t *testing.T) {
+	for _, raw := range []string{`{"endpoint-a":true}`, `broken`, `{"endpoint-a":false}`, ""} {
+		t.Run(raw, func(t *testing.T) {
+			now := testTime
+			m := baseModel("")
+			m.Annotations[constants.ModelArtifactUseClaimsAnnotation] = raw
+			c, q := queryClient(t, m)
+			result, err := evaluator(c, q, &now).Reconcile(context.Background(), Request{Model: modelKey}, m.UID, false)
+			if raw == `{"endpoint-a":true}` && err != nil {
+				t.Fatal(err)
+			}
+			if result.Eligible || c.patches != 0 || c.lists != 0 {
+				t.Fatalf("claim must protect without history writes or reference queries: %+v, patches=%d lists=%d", result, c.patches, c.lists)
+			}
+		})
+	}
+}
+
+func TestReleasedClaimsAllowReferenceAndHistoryEvaluation(t *testing.T) {
+	now := testTime
+	m := baseModel("")
+	m.Annotations[constants.ModelArtifactUseClaimsAnnotation] = `{}`
+	c, q := queryClient(t, m)
+	result := reconcile(t, evaluator(c, q, &now), m, time.Time{})
+	if !result.Eligible || c.patches != 1 || c.lists == 0 {
+		t.Fatalf("empty claims should continue normal evaluation: %+v", result)
+	}
+}
+
+func TestClaimProtectsWholeSharedArtifactFromPlanner(t *testing.T) {
+	now := testTime
+	idle := baseModel(`{"idleSince":"2026-10-12T11:00:00Z"}`)
+	used := idle.DeepCopy()
+	used.Name = "used"
+	used.UID = "used-uid"
+	used.Annotations[constants.ModelArtifactUseClaimsAnnotation] = `{"endpoint-a":true}`
+	c, q := queryClient(t, idle, used)
+	e := evaluator(c, q, &now)
+	eligibility := map[types.UID]evictionplanner.Eligibility{idle.UID: reconcile(t, e, idle, time.Time{}), used.UID: reconcile(t, e, used, time.Time{})}
+	size := int64(500)
+	plan, err := evictionplanner.Build(evictionplanner.Input{
+		Now:              now,
+		EligibilityByUID: eligibility,
+		Nodes: []evictionplanner.Node{{
+			Name:           "node",
+			CapacityBytes:  1000,
+			AvailableBytes: 50,
+			HighWatermark:  .9,
+			LowWatermark:   .8,
+			Inventory: &artifactinventory.Inventory{
+				NodeName: "node",
+				Artifacts: []artifactinventory.Artifact{{
+					Path:                   "/models/shared",
+					EstimatedArtifactBytes: &size,
+					EvictionEligible:       true,
+					Models: []artifactinventory.ModelRef{
+						{Namespace: idle.Namespace, Name: idle.Name, UID: idle.UID},
+						{Namespace: used.Namespace, Name: used.Name, UID: used.UID},
+					},
+				}},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Models) != 0 || len(plan.Nodes[0].ExcludedArtifacts) != 1 || !strings.Contains(plan.Nodes[0].ExcludedArtifacts[0].Reason, "claim") {
+		t.Fatalf("shared artifact selected: %+v", plan)
+	}
+}
+
+func TestFinalClaimReleaseUpdatesDemandEndAfterWorkloadRemoval(t *testing.T) {
+	ctx := context.Background()
+	now := testTime
+	m := baseModel(`{"idleSince":"2026-10-12T11:00:00Z"}`)
+	m.Annotations[constants.ModelArtifactUseClaimsAnnotation] = `{"endpoint-a":true}`
+	c, q := queryClient(t, m)
+	e := evaluator(c, q, &now)
+	// The final workload has gone, but preparation/cleanup still holds the claim.
+	workloadEndedAt := now.Add(-time.Minute)
+	result := reconcile(t, e, m, workloadEndedAt)
+	if result.Eligible || c.patches != 0 {
+		t.Fatalf("claim did not protect pending cleanup: %+v", result)
+	}
+	before := &v1beta1.BaseModel{}
+	if err := c.Get(ctx, modelKey, before); err != nil {
+		t.Fatal(err)
+	}
+	if err := modelclaims.NewCoordinator(c, c).Release(ctx, modelKey, m.UID, "endpoint-a"); err != nil {
+		t.Fatal(err)
+	}
+	after := &v1beta1.BaseModel{}
+	if err := c.Get(ctx, modelKey, after); err != nil {
+		t.Fatal(err)
+	}
+	requests, err := RemovedReferences(before, after, now)
+	if err != nil || len(requests) != 1 {
+		t.Fatalf("final claim release: %+v %v", requests, err)
+	}
+	// This is the end of the protected demand, after the workload-removal event.
+	result, err = e.Reconcile(ctx, requests[0], m.UID, false)
+	if err != nil || !result.Eligible || result.IdleSince == nil || !result.IdleSince.Equal(now) {
+		t.Fatalf("claim release did not advance recency: %+v %v", result, err)
 	}
 }

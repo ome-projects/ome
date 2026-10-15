@@ -381,56 +381,82 @@ func checkScoutUpdateTask(t *testing.T, scout *Scout, tasks chan *GopherTask, cl
 	}
 }
 
-// Usage history is controller bookkeeping, not a changed download input.
-func TestScoutUpdateUsageHistory(t *testing.T) {
-	const historyKey = constants.ModelUsageHistoryAnnotation
-	for _, cluster := range []bool{false, true} {
-		kind := "BaseModel"
-		if cluster {
-			kind = "ClusterBaseModel"
+// Usage history and use claims are bookkeeping, not changed download inputs.
+func TestScoutUpdateBookkeepingAnnotations(t *testing.T) {
+	for _, annotation := range []struct {
+		name, key, old, next string
+	}{
+		{
+			name: "usage_history", key: constants.ModelUsageHistoryAnnotation,
+			old:  `{"idleSince":"2026-10-12T00:00:00Z"}`,
+			next: `{"lastObservedDemandEndedAt":"2026-10-13T00:00:00Z"}`,
+		},
+		{
+			name: "use_claims", key: constants.ModelArtifactUseClaimsAnnotation,
+			old:  `{"endpoint-a":true}`,
+			next: `{"endpoint-a":true,"endpoint-b":true}`,
+		},
+	} {
+		key := annotation.key
+		cases := []struct {
+			name      string
+			old, next map[string]string
+			want      GopherTaskType
+		}{
+			{name: "add", next: map[string]string{key: annotation.old}},
+			{name: "update", old: map[string]string{key: annotation.old}, next: map[string]string{key: annotation.next}},
+			{name: "remove", old: map[string]string{key: annotation.old}},
+			{name: "empty_map", old: map[string]string{}, next: map[string]string{key: annotation.next}},
+			{
+				name: "existing_eviction_intent",
+				old:  map[string]string{"ome.io/artifact-residency": "Evicted"},
+				next: map[string]string{"ome.io/artifact-residency": "Evicted", key: annotation.next},
+			},
+			{
+				name: "existing_restore_request",
+				old:  map[string]string{"ome.io/artifact-rehydration-id": "r1"},
+				next: map[string]string{"ome.io/artifact-rehydration-id": "r1", key: annotation.next},
+			},
+			{
+				name: "other_annotation",
+				old:  map[string]string{key: annotation.old},
+				next: map[string]string{key: annotation.next, "refresh": "1"},
+				want: DownloadOverride,
+			},
+			{
+				name: "hf_identity",
+				old:  map[string]string{hfModelIDAnnotationKey: "org/old"},
+				next: map[string]string{key: annotation.next, hfModelIDAnnotationKey: "org/new"},
+				want: DownloadOverride,
+			},
+			{
+				name: "eviction_intent_changed",
+				next: map[string]string{key: annotation.old, "ome.io/artifact-residency": "Evicted"},
+				want: DownloadOverride,
+			},
+			{
+				name: "restore_intent_changed",
+				next: map[string]string{key: annotation.old, "ome.io/artifact-rehydration-id": "r2"},
+				want: DownloadOverride,
+			},
+			{name: "similar_key_is_not_exempt", next: map[string]string{key + "-other": "new"}, want: DownloadOverride},
 		}
-		for _, policy := range []v1beta1.DownloadPolicy{v1beta1.AlwaysDownload, v1beta1.ReuseIfExists} {
-			for _, tc := range []struct {
-				name      string
-				old, next map[string]string
-				want      GopherTaskType
-			}{
-				{name: "add", next: map[string]string{historyKey: `{"idleSince":"2026-10-12T00:00:00Z"}`}},
-				{name: "update", old: map[string]string{historyKey: "old"}, next: map[string]string{historyKey: "new"}},
-				{name: "remove", old: map[string]string{historyKey: "old"}},
-				{name: "empty_map", old: map[string]string{}, next: map[string]string{historyKey: "new"}},
-				{
-					name: "existing_eviction_intent",
-					old:  map[string]string{"ome.io/artifact-residency": "Evicted"},
-					next: map[string]string{"ome.io/artifact-residency": "Evicted", historyKey: "new"},
-				},
-				{
-					name: "existing_restore_request",
-					old:  map[string]string{"ome.io/rehydration-id": "r1"},
-					next: map[string]string{"ome.io/rehydration-id": "r1", historyKey: "new"},
-				},
-				{
-					name: "other_annotation",
-					old:  map[string]string{historyKey: "old"},
-					next: map[string]string{historyKey: "new", "refresh": "1"},
-					want: DownloadOverride,
-				},
-				{
-					name: "hf_identity",
-					old:  map[string]string{hfModelIDAnnotationKey: "org/old"},
-					next: map[string]string{historyKey: "new", hfModelIDAnnotationKey: "org/new"},
-					want: DownloadOverride,
-				},
-				{name: "similar_key_is_not_exempt", next: map[string]string{historyKey + "-other": "new"}, want: DownloadOverride},
-			} {
-				t.Run(kind+"/"+string(policy)+"/"+tc.name, func(t *testing.T) {
-					scout, tasks := newScoutForUpdateTest(t)
-					old := newBaseModel("model", policy, "oci://n/ns/b/models/o/model")
-					old.Annotations = tc.old
-					next := old.DeepCopy()
-					next.Annotations = tc.next
-					checkScoutUpdateTask(t, scout, tasks, cluster, old, next, tc.want)
-				})
+		for _, cluster := range []bool{false, true} {
+			kind := "BaseModel"
+			if cluster {
+				kind = "ClusterBaseModel"
+			}
+			for _, policy := range []v1beta1.DownloadPolicy{v1beta1.AlwaysDownload, v1beta1.ReuseIfExists} {
+				for _, tc := range cases {
+					t.Run(annotation.name+"/"+kind+"/"+string(policy)+"/"+tc.name, func(t *testing.T) {
+						scout, tasks := newScoutForUpdateTest(t)
+						old := newBaseModel("model", policy, "oci://n/ns/b/models/o/model")
+						old.Annotations = tc.old
+						next := old.DeepCopy()
+						next.Annotations = tc.next
+						checkScoutUpdateTask(t, scout, tasks, cluster, old, next, tc.want)
+					})
+				}
 			}
 		}
 	}

@@ -78,6 +78,9 @@ const (
 // ModelUsageHistoryAnnotation stores idleSince and lastObservedDemandEndedAt.
 const ModelUsageHistoryAnnotation = "ome.io/model-usage-history"
 
+// ModelArtifactUseClaimsAnnotation records endpoint IDs holding an artifact use claim.
+const ModelArtifactUseClaimsAnnotation = "ome.io/artifact-use-claims"
+
 // InferenceService Annotations
 var (
 	DeploymentMode                          = OMEAPIGroupName + "/deploymentMode"
