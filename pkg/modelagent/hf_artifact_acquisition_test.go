@@ -29,6 +29,9 @@ func TestHfArtifactRetriesUncertainAcquisition(t *testing.T) {
 						return false, nil, nil
 					}
 					cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+					if _, exists := cm.Data[input.Parent.Key]; !exists {
+						return false, nil, nil // Initial intent precedes parent acquisition.
+					}
 					parent, err := decodeHfArtifactEntry(input.Parent.Key, cm.Data[input.Parent.Key])
 					require.NoError(t, err)
 					require.Equal(t, HfArtifactStatusUpdating, parent.Status)

@@ -122,7 +122,11 @@ func (h *hfArtifactTaskHandler) deleteLockedParent(
 	if err != nil {
 		return newHfArtifactRetryResult(parent.Key, fmt.Errorf("scan child symlinks for shared Hugging Face parent %s: %w", parent.Key, err)), nil
 	}
-	if hasChildren {
+	pendingDownloads, err := h.repository.hasPendingDownloads(ctx, parent)
+	if err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
+	}
+	if hasChildren || pendingDownloads {
 		// Preserve files for an unrecorded child and end deletion ownership.
 		// Reconstructing the missing references is separate recovery work.
 		if err := h.releaseParentDeletionLock(ctx, parent, wasReady); err != nil {

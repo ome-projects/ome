@@ -30,7 +30,7 @@ func (pending HfArtifactPendingDeletion) parentForChild(key string) HfArtifactEn
 }
 
 func (r *HfArtifactRepository) pendingDeletion(ctx context.Context, key string) (*HfArtifactPendingDeletion, error) {
-	cm, err := r.configMaps.getConfigMap(ctx)
+	cm, err := r.configMaps.getConfigMapForHfArtifactCleanup(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -33,6 +33,13 @@ func (s *Gopher) processHfOCIArtifact(ctx context.Context, task *GopherTask, spe
 	}
 	handler := s.sharedHfArtifactHandler()
 	key := s.configMapReconciler.getModelConfigMapKey(task.BaseModel, task.ClusterBaseModel)
+	var next *hfArtifactTaskInput
+	if eligible {
+		next = &input
+	}
+	if waiting, err := s.cleanupHfArtifactPendingDownload(ctx, task, next, allowDownload); waiting || err != nil {
+		return true, waiting, err
+	}
 	if _, waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, allowDownload); waiting || err != nil {
 		return true, waiting, err
 	}
@@ -391,6 +398,9 @@ func (s *Gopher) detachHfArtifactForDefaultDownload(ctx context.Context, task *G
 	if s.configMapReconciler == nil {
 		return false, nil
 	}
+	if waiting, err := s.cleanupHfArtifactPendingDownload(ctx, task, nil, allowDownload); waiting || err != nil {
+		return waiting, err
+	}
 	if _, waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, allowDownload); waiting || err != nil {
 		return waiting, err
 	}
@@ -463,6 +473,9 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 		return true, false, nil
 	}
 	handler := s.sharedHfArtifactHandler()
+	if waiting, err := s.cleanupHfArtifactPendingDownload(ctx, task, nil, true); waiting || err != nil {
+		return true, waiting, err
+	}
 	if handled, waiting, err := s.resumeHfArtifactChildDeletion(ctx, task, true); handled || err != nil {
 		return true, waiting, err
 	}

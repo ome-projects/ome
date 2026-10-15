@@ -48,6 +48,10 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 	if h.childPathConflictsWithParent(input.ChildModelPath, parent.LocalPath) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
+	input.Parent = parent
+	if err := h.repository.rememberDownload(ctx, input); err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
+	}
 	parent, acquired, err = h.repository.TryAcquireLockForRepair(ctx, parent)
 	if err != nil {
 		if acquired {

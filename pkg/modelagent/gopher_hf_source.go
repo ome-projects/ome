@@ -113,6 +113,13 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 				if referenced {
 					return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(parent.Key, err))
 				}
+				pending, lookupErr := s.sharedHfArtifactHandler().repository.pendingDownload(ctx, key)
+				if lookupErr != nil && !apierrors.IsNotFound(lookupErr) {
+					return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(key, lookupErr))
+				}
+				if pending != nil {
+					return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(hfArtifactConfigMapKey(pending.Identity), err))
+				}
 			}
 			// Fresh ordinary downloads still use best-effort revision resolution.
 			s.logger.Warnf("Cannot resolve HF revision for %s; using ordinary download: %v", config.RepoID, err)
@@ -247,6 +254,13 @@ func (source directHfSource) process(ctx context.Context, s *Gopher, task *Gophe
 // Matching shared children stay attached. Only a policy/identity/path change
 // goes through the ordinary-download detach path.
 func (s *Gopher) detachChangedDirectHfReference(ctx context.Context, task *GopherTask, spec v1beta1.BaseModelSpec, input hfArtifactTaskInput, eligible, allowDownload bool) (bool, error) {
+	var next *hfArtifactTaskInput
+	if eligible {
+		next = &input
+	}
+	if waiting, err := s.cleanupHfArtifactPendingDownload(ctx, task, next, allowDownload); waiting || err != nil {
+		return waiting, err
+	}
 	if eligible {
 		parent, referenced, err := s.sharedHfArtifactHandler().repository.GetParentForChild(ctx, input.ChildModelKey)
 		if ctx.Err() != nil {

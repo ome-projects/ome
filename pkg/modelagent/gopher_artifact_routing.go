@@ -45,7 +45,7 @@ func (routing *gopherArtifactRouting) observeSnapshot(data map[string]string) er
 			continue
 		}
 		var child ModelEntry
-		if json.Unmarshal([]byte(raw), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil) {
+		if json.Unmarshal([]byte(raw), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil || child.HfArtifactPendingDownload != nil) {
 			routing.children[key] = true
 		}
 	}

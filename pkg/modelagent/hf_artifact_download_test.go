@@ -488,6 +488,12 @@ func TestHfArtifactDownloadPreservesSymlinkAfterReferenceWriteFailure(t *testing
 			require.NoError(t, runTestHfArtifactDownload(handler, first))
 			failReads := false
 			client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+				cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+				child, err := existingModelEntry(cm.Data, second.ChildModelKey)
+				require.NoError(t, err)
+				if child.HfArtifactKey == "" {
+					return false, nil, nil // Inject at reference publication, not intent creation.
+				}
 				if failure == "confirmation read failed" {
 					failReads = true
 					return false, nil, nil
@@ -583,8 +589,9 @@ func TestHfArtifactDownloadRechecksLocalChildrenAfterLockAcquisition(t *testing.
 	require.NoError(t, writeTestHfArtifactFiles(input.Parent.LocalPath))
 	childPath := filepath.Join(input.ModelStoreRoot, "unrecorded-child")
 	createdChild := false
-	client.PrependReactor("update", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
-		if !createdChild {
+	client.PrependReactor("update", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		cm := action.(ktesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+		if _, acquiring := cm.Data[input.Parent.Key]; acquiring && !createdChild {
 			// The initial scan finished, but acquisition has not yet returned.
 			require.NoError(t, os.Symlink(input.Parent.LocalPath, childPath))
 			createdChild = true

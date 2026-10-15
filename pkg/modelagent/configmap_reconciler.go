@@ -376,7 +376,7 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 		// Shared ownership needs an explicit UID handoff. Ordinary entries,
 		// including completed opt-outs, retain their existing deletion behavior.
 		var child ModelEntry
-		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil) {
+		if json.Unmarshal([]byte(cached.ModelEntryJSON), &child) == nil && (child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil || child.HfArtifactPendingDownload != nil) {
 			c.cacheMutex.Unlock()
 			return fmt.Errorf("cannot delete shared model %s owned by another UID", modelID)
 		}
@@ -400,7 +400,7 @@ func (c *ConfigMapReconciler) DeleteModelFromConfigMap(ctx context.Context, base
 		// after file cleanup. Check ownership on every final-removal CAS attempt.
 		var child ModelEntry
 		if json.Unmarshal([]byte(raw), &child) == nil {
-			if child.HfArtifactKey != "" || child.HfArtifactPendingDeletion != nil && child.HfArtifactPendingDeletion.ModelUID != modelUID {
+			if child.HfArtifactKey != "" || child.HfArtifactPendingDownload != nil || child.HfArtifactPendingDeletion != nil && child.HfArtifactPendingDeletion.ModelUID != modelUID {
 				return false, fmt.Errorf("shared artifact ownership changed before deleting model %s", modelID)
 			}
 		}

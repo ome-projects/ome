@@ -307,6 +307,10 @@ func (r *HfArtifactRepository) AddModelReference(ctx context.Context, expected H
 		if model.HfArtifactPendingDeletion != nil {
 			return false, fmt.Errorf("model %s has unfinished shared artifact deletion", modelKey)
 		}
+		if pending := model.HfArtifactPendingDownload; pending != nil &&
+			*pending != (HfArtifactPendingDownload{Identity: stored.Identity, ParentPath: stored.LocalPath, ChildPath: modelPath, ModelUID: modelUID}) {
+			return false, fmt.Errorf("model %s has another pending shared download", modelKey)
+		}
 		if model.HfArtifactKey != "" && model.HfArtifactKey != stored.Key {
 			return false, fmt.Errorf("model %s already references Hugging Face artifact %s", modelKey, model.HfArtifactKey)
 		}
@@ -327,6 +331,7 @@ func (r *HfArtifactRepository) AddModelReference(ctx context.Context, expected H
 		}
 		stored.Children[modelKey] = modelPath
 		model.HfArtifactKey = stored.Key
+		model.HfArtifactPendingDownload = nil
 
 		artifactChanged, err := writeHfArtifactEntry(configMap.Data, stored)
 		if err != nil {

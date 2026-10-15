@@ -88,6 +88,8 @@ type ModelEntry struct {
 	HfArtifactKey string            `json:"hfArtifactKey,omitempty"` // ConfigMap key of the shared HF artifact used by this model
 	// Pending cleanup survives reference removal until local and parent cleanup finish.
 	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
+	// Initial downloads retain their destination before a Ready reference exists.
+	HfArtifactPendingDownload *HfArtifactPendingDownload `json:"hfArtifactPendingDownload,omitempty"`
 }
 
 // ConvertMetadataToModelConfig converts internal ModelMetadata to a client-facing ModelConfig

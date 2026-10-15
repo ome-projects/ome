@@ -9,8 +9,30 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 )
+
+// Cleanup cannot treat a lost ConfigMap as proof that ownership is absent.
+// Restore trusted cached state before Delete can evict its last cleanup receipt.
+func (c *ConfigMapReconciler) getConfigMapForHfArtifactCleanup(ctx context.Context) (*corev1.ConfigMap, error) {
+	cm, err := c.getConfigMap(ctx)
+	if !apierrors.IsNotFound(err) {
+		return cm, err
+	}
+	err = c.mutateConfigMapWithRetry(ctx, func(current *corev1.ConfigMap) (bool, error) {
+		changed, err := c.restoreCachedConfigMapEntries(current.Data, "", false)
+		if err == nil {
+			cm = current.DeepCopy()
+		}
+		return changed, err
+	})
+	if err != nil {
+		// A NotFound during recovery is a failed write, not absent ownership.
+		return nil, fmt.Errorf("recover shared artifact cleanup state: %v", err)
+	}
+	return cm, nil
+}
 
 // getConfigMapForRecovery seeds reconstruction from a fresh serialized read.
 // Startup uses it before child tasks have written statuses or registered UIDs.
@@ -76,7 +98,7 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && entry.ModelEntryJSON == "" {
+	if model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.HfArtifactPendingDownload == nil && entry.ModelEntryJSON == "" {
 		// Only explicit ordinary writes may seed typed recovery. Observing
 		// unrelated records, including at startup, must not adopt them.
 		if modelID == "" && before[key] != raw && c.modelCache[key] == nil {
@@ -200,6 +222,7 @@ func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]st
 		return nil
 	}
 	if cached.HfArtifactKey != "" && (childErr != nil || child.HfArtifactKey == "") ||
+		cached.HfArtifactPendingDownload != nil && (childErr != nil || child.HfArtifactPendingDownload == nil) ||
 		cached.HfArtifactPendingDeletion != nil && (childErr != nil || child.HfArtifactPendingDeletion == nil) {
 		return fmt.Errorf("shared artifact state for model %s requires reconciliation", key)
 	}

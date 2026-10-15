@@ -44,6 +44,10 @@ func (h *hfArtifactTaskHandler) handleDownload(
 	if h.childPathConflictsWithParent(input.ChildModelPath, parent.LocalPath) {
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
+	input.Parent = parent
+	if err := h.repository.rememberDownload(ctx, input); err != nil {
+		return newHfArtifactRetryResult(parent.Key, err), nil
+	}
 
 	if !found || parent.Status == HfArtifactStatusFailed {
 		return h.downloadParentAndAttachChild(ctx, input, parent, download)
