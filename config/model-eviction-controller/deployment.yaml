@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-eviction-controller
+  namespace: ome
+spec:
+  # Opt in only after setting the image, node selector and kubelet CA.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: model-eviction-controller
+  template:
+    metadata:
+      labels:
+        app: model-eviction-controller
+    spec:
+      serviceAccountName: model-eviction-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: model-eviction-controller:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            # Select only pools where model storage shares kubelet imageFs.
+            - --node-selector=nvidia.com/gpu.present=true
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]

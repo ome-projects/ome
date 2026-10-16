@@ -1,0 +1,100 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-eviction-controller
+  namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ome-model-eviction-controller
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [nodes/stats]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets]
+    verbs: [get, list, watch]
+  - apiGroups: [ome.io]
+    resources: [inferenceservices, inferencereplicas]
+    verbs: [get, list, watch]
+  - apiGroups: [ome.io]
+    resources: [basemodels]
+    # The controller only patches usage history, even in dry-run mode.
+    verbs: [get, list, watch, patch]
+  - apiGroups: [leaderworkerset.x-k8s.io]
+    resources: [leaderworkersets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ome-model-eviction-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ome-model-eviction-controller
+subjects:
+  - kind: ServiceAccount
+    name: model-eviction-controller
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: model-eviction-controller
+  namespace: ome
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: model-eviction-controller
+  namespace: ome
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: model-eviction-controller
+subjects:
+  - kind: ServiceAccount
+    name: model-eviction-controller
+    namespace: ome
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: model-eviction-controller-jobs
+  namespace: default
+rules:
+  - apiGroups: [ome.io]
+    resources: [replicationjobs]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: model-eviction-controller-jobs
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: model-eviction-controller-jobs
+subjects:
+  - kind: ServiceAccount
+    name: model-eviction-controller
+    namespace: ome
