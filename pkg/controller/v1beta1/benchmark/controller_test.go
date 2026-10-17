@@ -1025,6 +1025,27 @@ func TestBenchmarkJobReconciler_updateStatus(t *testing.T) {
 			expectedError: false,
 			expectedState: "Running",
 		},
+		{
+			name: "running job receives start time without state change",
+			benchmarkJob: &v1beta1.BenchmarkJob{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-job",
+					Namespace: "default",
+				},
+				Status: v1beta1.BenchmarkJobStatus{State: "Running"},
+			},
+			existingJob: &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-job",
+					Namespace: "default",
+				},
+				Status: batchv1.JobStatus{
+					StartTime: &metav1.Time{Time: time.Now()},
+				},
+			},
+			expectedError: false,
+			expectedState: "Running",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1032,7 +1053,6 @@ func TestBenchmarkJobReconciler_updateStatus(t *testing.T) {
 			// Create a copy of the BenchmarkJob without resourceVersion
 			benchmarkJobCopy := tt.benchmarkJob.DeepCopy()
 			benchmarkJobCopy.ResourceVersion = ""
-			benchmarkJobCopy.Status = v1beta1.BenchmarkJobStatus{}
 			benchmarkJobCopy.SetGroupVersionKind(v1beta1.SchemeGroupVersion.WithKind("BenchmarkJob"))
 
 			// Start building the client
@@ -1060,6 +1080,9 @@ func TestBenchmarkJobReconciler_updateStatus(t *testing.T) {
 			} else {
 				assert.NoError(t, err)
 				assert.Equal(t, tt.expectedState, benchmarkJobCopy.Status.State)
+				if tt.existingJob != nil && tt.existingJob.Status.StartTime != nil {
+					assert.NotNil(t, benchmarkJobCopy.Status.StartTime)
+				}
 			}
 		})
 	}
