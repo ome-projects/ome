@@ -234,6 +234,7 @@ func initializeComponents(
 		omeInformerFactory,
 		gopherTaskChan,
 		kubeClient,
+		omeClient,
 		logger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create scout: %w", err)

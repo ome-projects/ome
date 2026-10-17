@@ -13,12 +13,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
 	"knative.dev/pkg/kmp"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omev1beta1client "sigs.k8s.io/ome/pkg/client/clientset/versioned"
 	omev1beta1informers "sigs.k8s.io/ome/pkg/client/informers/externalversions"
 	omev1beta1 "sigs.k8s.io/ome/pkg/client/informers/externalversions/ome/v1beta1"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
@@ -39,8 +42,20 @@ type Scout struct {
 	nodeInfo               *v1.Node
 	nodeShapeAlias         string
 	kubeClient             *kubernetes.Clientset
+	omeClient              omev1beta1client.Interface
+	deleteQueue            workqueue.TypedRateLimitingInterface[deleteConfirmation]
 	logger                 *zap.SugaredLogger
 }
+
+const (
+	// deleteConfirmationTimeout bounds each live read that confirms an
+	// informer Deleted event.
+	deleteConfirmationTimeout = 10 * time.Second
+	// deleteConfirmationBaseDelay and deleteConfirmationMaxDelay bound the
+	// per-item backoff before a failed confirmation is retried.
+	deleteConfirmationBaseDelay = time.Second
+	deleteConfirmationMaxDelay  = 5 * time.Minute
+)
 
 type TensorRTLLMShapeFilter struct {
 	IsTensorrtLLMModel bool
@@ -65,6 +80,7 @@ func NewScout(ctx context.Context, nodeName string,
 	informerFactory omev1beta1informers.SharedInformerFactory,
 	gopherChan chan<- *GopherTask,
 	kubeClient *kubernetes.Clientset,
+	omeClient omev1beta1client.Interface,
 	logger *zap.SugaredLogger) (*Scout, error) {
 
 	logger.Infof("Initializing Scout for node: %s", nodeName)
@@ -100,6 +116,8 @@ func NewScout(ctx context.Context, nodeName string,
 		gopherChan:             gopherChan,
 		nodeName:               nodeName,
 		kubeClient:             kubeClient,
+		omeClient:              omeClient,
+		deleteQueue:            newDeleteConfirmationQueue(deleteConfirmationBaseDelay, deleteConfirmationMaxDelay),
 		logger:                 logger,
 	}
 
@@ -133,7 +151,7 @@ func NewScout(ctx context.Context, nodeName string,
 	if _, err := baseModelInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    scout.downloadBaseModel,
 		UpdateFunc: scout.updateBaseModel,
-		DeleteFunc: scout.deleteBaseModel,
+		DeleteFunc: scout.onBaseModelDeleted,
 	}); err != nil {
 		return nil, err
 	}
@@ -141,7 +159,7 @@ func NewScout(ctx context.Context, nodeName string,
 	if _, err := clusterBaseModelInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    scout.downloadClusterBaseModel,
 		UpdateFunc: scout.updateClusterBaseModel,
-		DeleteFunc: scout.deleteClusterBaseModel,
+		DeleteFunc: scout.onClusterBaseModelDeleted,
 	}); err != nil {
 		return nil, err
 	}
@@ -153,6 +171,9 @@ func (w *Scout) Run(stopCh <-chan struct{}) error {
 	defer runtime.HandleCrash()
 
 	w.logger.Info("Starting scout")
+	defer w.deleteQueue.ShutDown()
+	go w.runDeleteConfirmationWorker()
+
 	w.logger.Info("Starting informer cache")
 	go w.informerFactory.Start(stopCh)
 
@@ -239,6 +260,7 @@ syncComplete:
 	w.reconcilePendingDeletions()
 
 	<-stopCh
+	w.deleteQueue.ShutDown()
 	close(w.gopherChan)
 	w.logger.Info("Shutting down scout")
 
@@ -482,6 +504,128 @@ func downloadOverrideInputsFromSpec(spec v1beta1.BaseModelSpec) downloadOverride
 		IsTensorRTLLMModel:   isTensorRTLLMModel,
 		TensorRTLLMModelType: modelType,
 	}
+}
+
+// deleteConfirmation is an informer Deleted event for a BaseModel or a
+// ClusterBaseModel that waits in Scout.deleteQueue for a live read. Exactly
+// one field is set.
+type deleteConfirmation struct {
+	baseModel        *v1beta1.BaseModel
+	clusterBaseModel *v1beta1.ClusterBaseModel
+}
+
+// describe returns the kind, key and UID of the model behind the event.
+func (c deleteConfirmation) describe() (kind, key string, uid types.UID) {
+	if c.baseModel != nil {
+		return "BaseModel", c.baseModel.Namespace + "/" + c.baseModel.Name, c.baseModel.UID
+	}
+	return "ClusterBaseModel", c.clusterBaseModel.Name, c.clusterBaseModel.UID
+}
+
+// newDeleteConfirmationQueue returns the queue that holds Deleted events
+// until a live read confirms them. A failed read is retried after a per-item
+// exponential backoff between baseDelay and maxDelay.
+func newDeleteConfirmationQueue(baseDelay, maxDelay time.Duration) workqueue.TypedRateLimitingInterface[deleteConfirmation] {
+	return workqueue.NewTypedRateLimitingQueueWithConfig(
+		workqueue.NewTypedItemExponentialFailureRateLimiter[deleteConfirmation](baseDelay, maxDelay),
+		workqueue.TypedRateLimitingQueueConfig[deleteConfirmation]{Name: "model-agent-delete-confirmation"})
+}
+
+// onBaseModelDeleted handles an informer Deleted event for a BaseModel.
+// A real deletion normally reaches updateBaseModel first, because the
+// controller's finalizer keeps the object while its deletion timestamp is
+// set. This handler therefore only queues the event; confirmDelete cleans up
+// once a live read shows that the object is gone.
+func (w *Scout) onBaseModelDeleted(obj interface{}) {
+	baseModel, ok := obj.(*v1beta1.BaseModel)
+	if !ok {
+		w.deleteBaseModel(obj)
+		return
+	}
+	w.deleteQueue.Add(deleteConfirmation{baseModel: baseModel})
+}
+
+// onClusterBaseModelDeleted handles an informer Deleted event for a
+// ClusterBaseModel. See onBaseModelDeleted.
+func (w *Scout) onClusterBaseModelDeleted(obj interface{}) {
+	clusterBaseModel, ok := obj.(*v1beta1.ClusterBaseModel)
+	if !ok {
+		w.deleteClusterBaseModel(obj)
+		return
+	}
+	w.deleteQueue.Add(deleteConfirmation{clusterBaseModel: clusterBaseModel})
+}
+
+// runDeleteConfirmationWorker processes queued Deleted events until the
+// queue shuts down.
+func (w *Scout) runDeleteConfirmationWorker() {
+	for w.processNextDeleteConfirmation() {
+	}
+}
+
+// processNextDeleteConfirmation confirms one queued Deleted event. It returns
+// false once the queue is shutting down.
+func (w *Scout) processNextDeleteConfirmation() bool {
+	item, shutdown := w.deleteQueue.Get()
+	if shutdown {
+		return false
+	}
+	defer w.deleteQueue.Done(item)
+	if w.deleteQueue.ShuttingDown() {
+		// The gopher stops reading tasks on shutdown, so do not hand off more.
+		return false
+	}
+	w.confirmDelete(item)
+	return true
+}
+
+// confirmDelete reads the model behind a queued Deleted event from the API
+// server and hands the delete to the gopher when the object is gone, has a
+// new UID, or is being deleted. It drops the event when the same object still
+// exists, for example after a phantom Deleted event during a CRD upgrade. A
+// failed read requeues the event with backoff, so a cleanup is neither lost
+// nor run for a model that may still be live.
+func (w *Scout) confirmDelete(item deleteConfirmation) {
+	kind, key, uid := item.describe()
+	live, err := getWithTimeout(w.ctx, deleteConfirmationTimeout, func(ctx context.Context) (metav1.Object, error) {
+		return w.getLiveModel(ctx, item)
+	})
+	switch {
+	case errors.IsNotFound(err):
+		// The object is gone: clean up below.
+	case err != nil:
+		w.logger.Warnf("Cannot confirm Deleted event for %s %s with the API server (attempt %d), will retry: %v",
+			kind, key, w.deleteQueue.NumRequeues(item)+1, err)
+		w.deleteQueue.AddRateLimited(item)
+		return
+	case live.GetUID() == uid && live.GetDeletionTimestamp() == nil:
+		w.logger.Warnf("Ignoring Deleted event for %s %s: object still exists with UID %s", kind, key, uid)
+		w.deleteQueue.Forget(item)
+		return
+	}
+	w.deleteQueue.Forget(item)
+	if item.baseModel != nil {
+		w.deleteBaseModel(item.baseModel)
+	} else {
+		w.deleteClusterBaseModel(item.clusterBaseModel)
+	}
+}
+
+// getLiveModel reads the model behind a queued Deleted event from the API
+// server, bypassing the informer cache.
+func (w *Scout) getLiveModel(ctx context.Context, item deleteConfirmation) (metav1.Object, error) {
+	if item.baseModel != nil {
+		return w.omeClient.OmeV1beta1().BaseModels(item.baseModel.Namespace).Get(ctx, item.baseModel.Name, metav1.GetOptions{})
+	}
+	return w.omeClient.OmeV1beta1().ClusterBaseModels().Get(ctx, item.clusterBaseModel.Name, metav1.GetOptions{})
+}
+
+// getWithTimeout runs get with a context that expires after timeout, so one
+// slow read cannot stall the confirmation worker.
+func getWithTimeout(parent context.Context, timeout time.Duration, get func(context.Context) (metav1.Object, error)) (metav1.Object, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	return get(ctx)
 }
 
 func (w *Scout) deleteBaseModel(obj interface{}) {
