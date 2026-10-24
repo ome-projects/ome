@@ -235,6 +235,7 @@ func initializeComponents(
 		gopherTaskChan,
 		kubeClient,
 		configMapReconciler,
+		omeClient,
 		logger)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create scout: %w", err)
