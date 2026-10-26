@@ -785,6 +785,74 @@ func TestParseModelConfigFromFiles_HFQuantConfigUnknownAlgoLeavesEmpty(t *testin
 	}
 }
 
+// qwen3EmbeddingConfigJSON is the config.json shape of Qwen3-Embedding:
+// indistinguishable from a Qwen3 causal LM without the
+// config_sentence_transformers.json shipped beside it.
+var qwen3EmbeddingConfigJSON = []byte(`{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"max_position_embeddings":40960}`)
+
+func TestParseModelConfigDir_SentenceTransformersEmbedding(t *testing.T) {
+	// Agent path: the model dir on disk holds config.json and
+	// config_sentence_transformers.json. parseModelConfigDir must read
+	// the latter to classify the model as an embedding model.
+	tempDir := t.TempDir()
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tempDir, DefaultConfigFileName),
+		qwen3EmbeddingConfigJSON,
+		0o644,
+	))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(tempDir, modelconfig.SentenceTransformersConfigFileName),
+		[]byte(`{"similarity_fn_name":"cosine"}`),
+		0o644,
+	))
+
+	parser := &ModelConfigParser{
+		logger:          zap.NewNop().Sugar(),
+		loadModelConfig: modelconfig.LoadModelConfig,
+	}
+
+	metadata, err := parser.ParseModelConfig(tempDir, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, metadata)
+	assert.Equal(t, []string{string(v1beta1.ModelCapabilityEmbedding)}, metadata.ModelCapabilities)
+}
+
+func TestParseModelConfigFromFiles_SentenceTransformersEmbedding(t *testing.T) {
+	cases := []struct {
+		name        string
+		sidecarPath string
+		want        v1beta1.ModelCapability
+	}{
+		{
+			name:        "beside config.json",
+			sidecarPath: modelconfig.SentenceTransformersConfigFileName,
+			want:        v1beta1.ModelCapabilityEmbedding,
+		},
+		{
+			// A sentence-transformers config describes only the
+			// config.json in its own directory.
+			name:        "in another directory",
+			sidecarPath: "other/" + modelconfig.SentenceTransformersConfigFileName,
+			want:        v1beta1.ModelCapabilityTextToText,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parser := &ModelConfigParser{logger: zap.NewNop().Sugar()}
+			files := []ModelConfigFileInput{
+				{Path: DefaultConfigFileName, Data: qwen3EmbeddingConfigJSON},
+				{Path: tc.sidecarPath, Data: []byte(`{"similarity_fn_name":"cosine"}`)},
+			}
+
+			metadata, err := parser.ParseModelConfigFromFiles(context.Background(), files, nil, nil)
+			require.NoError(t, err)
+			require.NotNil(t, metadata)
+			assert.Equal(t, []string{string(tc.want)}, metadata.ModelCapabilities)
+		})
+	}
+}
+
 func TestParseModelConfigFromFilesRejectsEscapingPath(t *testing.T) {
 	logger := zap.NewNop().Sugar()
 	parser := &ModelConfigParser{logger: logger}

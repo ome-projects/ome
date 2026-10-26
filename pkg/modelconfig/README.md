@@ -31,6 +31,11 @@ What the resolver derives:
   `vision_config`, `mm_vision_tower`, `image_token_id`,
   `image_token_index`, or `img_processor` flips it on. No
   per-`model_type` allowlist.
+- **Embedding**: a `config_sentence_transformers.json` beside the
+  config that names a `similarity_fn_name` marks the model as an
+  embedding model. Decoder-based embedders such as Qwen3-Embedding
+  have the `config.json` of a causal LM, so this file is their only
+  signal.
 - **Quantization**: read from `quantization_config.quant_method`.
 
 `pkg/modelparser` consumes this interface and maps the result onto

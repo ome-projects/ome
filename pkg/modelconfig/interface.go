@@ -54,4 +54,7 @@ type HuggingFaceDiffusionModel interface {
 type ModelConfigInput struct {
 	Path string
 	Data []byte
+	// SentenceTransformersConfig holds the config_sentence_transformers.json
+	// found beside the config, if the model ships one.
+	SentenceTransformersConfig []byte
 }

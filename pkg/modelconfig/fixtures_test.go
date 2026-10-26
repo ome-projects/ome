@@ -39,8 +39,6 @@ func TestAllFixturesParse(t *testing.T) {
 // fixturesSkipped is the set of testdata entries the Loose-contract
 // walker excludes. Each entry has a stable reason captured here:
 //
-//   - config_sentence_transformers.json: auxiliary sentence-transformer
-//     pooling config, not a HF model config.
 //   - clip_vision_model.json: CLIP vision-encoder sub-component, not a
 //     complete model. It has no text context length (image_size /
 //     patch_size only) so the Loose context > 0 assertion would fail
@@ -53,8 +51,7 @@ func TestAllFixturesParse(t *testing.T) {
 //     un-skipped after Task 5 of the modelconfig-unification plan
 //     collapses LoadModelConfig onto GenericModelConfig.
 var fixturesSkipped = map[string]string{
-	"config_sentence_transformers.json": "auxiliary sentence-transformer pooling config",
-	"clip_vision_model.json":            "vision-encoder sub-component, no text context length",
+	"clip_vision_model.json": "vision-encoder sub-component, no text context length",
 
 	// Genuinely sparse JSON — exotic per-model logic synthesized
 	// data that isn't in the file. We agreed during brainstorming

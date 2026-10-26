@@ -3,6 +3,7 @@ package modelconfig
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // ParseModelConfig parses a HuggingFace model configuration from
@@ -18,6 +19,7 @@ func ParseModelConfig(input ModelConfigInput) (HuggingFaceModel, error) {
 
 // LoadModelConfig reads a HuggingFace model configuration from a
 // config.json or model_index.json file and returns a HuggingFaceModel.
+// A config_sentence_transformers.json beside the file is read too.
 func LoadModelConfig(configPath string) (HuggingFaceModel, error) {
 	if configPath == "" {
 		return nil, fmt.Errorf("config path cannot be empty")
@@ -26,5 +28,12 @@ func LoadModelConfig(configPath string) (HuggingFaceModel, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read model config %s: %w", configPath, err)
 	}
-	return parseGenericModelConfig(ModelConfigInput{Path: configPath, Data: data})
+	input := ModelConfigInput{Path: configPath, Data: data}
+	// Most models ship no sentence-transformers config, so a missing or
+	// unreadable one is not an error.
+	stConfigPath := filepath.Join(filepath.Dir(configPath), SentenceTransformersConfigFileName)
+	if stData, err := os.ReadFile(stConfigPath); err == nil {
+		input.SentenceTransformersConfig = stData
+	}
+	return parseGenericModelConfig(input)
 }

@@ -53,9 +53,10 @@ func (c *BaseModelConfig) HasVision() bool {
 	return false
 }
 
-// IsEmbedding defaults to false. The capability classifier in this
-// package detects embedding models from architecture name (BertModel,
-// SentenceTransformerModel, etc.), so few configs need to override.
+// IsEmbedding defaults to false. GenericModelConfig overrides this from
+// config_sentence_transformers.json; the capability classifier in this
+// package also detects embedding models from architecture name
+// (BertModel, SentenceTransformerModel, etc.).
 func (c *BaseModelConfig) IsEmbedding() bool {
 	return false
 }

@@ -550,3 +550,75 @@ func TestGenericVisionShapeDetection(t *testing.T) {
 		})
 	}
 }
+
+// TestQwen3EmbeddingClassifiesAsEmbedding covers decoder-based embedding
+// models. Qwen3-Embedding's config.json is that of a Qwen3 causal LM;
+// only the config_sentence_transformers.json beside it marks the
+// checkpoint as an embedding model.
+func TestQwen3EmbeddingClassifiesAsEmbedding(t *testing.T) {
+	model, err := LoadModelConfig(filepath.Join("testdata", "Qwen3-Embedding-8B", "config.json"))
+	if err != nil {
+		t.Fatalf("LoadModelConfig: %v", err)
+	}
+	if got := model.GetArchitecture(); got != "Qwen3ForCausalLM" {
+		t.Fatalf("architecture = %q, want Qwen3ForCausalLM", got)
+	}
+	if !model.IsEmbedding() {
+		t.Error("IsEmbedding() = false, want true")
+	}
+	if got, want := model.GetCapabilities(), []Capability{CapabilityEmbedding}; !equalCaps(got, want) {
+		t.Errorf("GetCapabilities() = %v, want %v", got, want)
+	}
+}
+
+func TestGenericSentenceTransformersDetection(t *testing.T) {
+	config := []byte(`{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"max_position_embeddings":40960}`)
+	cases := []struct {
+		name    string
+		sidecar string
+		want    bool
+	}{
+		{
+			name: "no sentence-transformers config",
+			want: false,
+		},
+		{
+			name:    "similarity function named",
+			sidecar: `{"similarity_fn_name":"cosine"}`,
+			want:    true,
+		},
+		{
+			// sentence-transformers before 3.0 records no similarity
+			// function; the architecture decides.
+			name:    "no similarity function",
+			sidecar: `{"__version__":{"sentence_transformers":"2.7.0"}}`,
+			want:    false,
+		},
+		{
+			name:    "null similarity function",
+			sidecar: `{"similarity_fn_name":null}`,
+			want:    false,
+		},
+		{
+			name:    "malformed config is ignored",
+			sidecar: `{`,
+			want:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			model, err := ParseModelConfig(ModelConfigInput{
+				Path:                       "config.json",
+				Data:                       config,
+				SentenceTransformersConfig: []byte(tc.sidecar),
+			})
+			if err != nil {
+				t.Fatalf("ParseModelConfig: %v", err)
+			}
+			if got := model.IsEmbedding(); got != tc.want {
+				t.Errorf("IsEmbedding() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 )
 
+// SentenceTransformersConfigFileName is the config sentence-transformers
+// saves beside config.json for the embedding models it serves.
+const SentenceTransformersConfigFileName = "config_sentence_transformers.json"
+
 // GenericModelConfig is the only HuggingFaceModel implementation for
 // transformer config.json. It parses common fields, probes nested
 // sub-configs (text_config, llm_config, language_config) for
@@ -36,6 +40,10 @@ type GenericModelConfig struct {
 
 	// Set during loading when a vision shape signal is detected.
 	hasVisionConfig bool
+
+	// Set during loading when config_sentence_transformers.json names a
+	// similarity function.
+	isEmbedding bool
 
 	// Preserve the top-level sound config for architecture-specific rules.
 	// Absent, explicit null, and object-valued configs have different meanings.
@@ -292,6 +300,30 @@ func (c *GenericModelConfig) HasVision() bool {
 	return c.hasVisionConfig
 }
 
+// IsEmbedding returns true if the model's sentence-transformers config
+// names a similarity function.
+func (c *GenericModelConfig) IsEmbedding() bool {
+	return c.isEmbedding
+}
+
+// declaresSimilarityFn reports whether a config_sentence_transformers.json
+// names the similarity function used to compare the model's embeddings.
+// It is what identifies decoder-based embedding models such as
+// Qwen3-Embedding, whose config.json is that of a causal LM. A malformed
+// file counts as no signal.
+func declaresSimilarityFn(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	var config struct {
+		SimilarityFnName string `json:"similarity_fn_name"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return false
+	}
+	return config.SimilarityFnName != ""
+}
+
 // GetCapabilities returns the model's classified capabilities by
 // running the modelconfig rule dispatcher against this config.
 // Overrides BaseModelConfig's [CapabilityUnknown] default.
@@ -345,6 +377,7 @@ func parseGenericModelConfig(input ModelConfigInput) (HuggingFaceModel, error) {
 	// Probe nested sub-configs (text_config, llm_config, language_config)
 	// to fill zero-valued fields for multimodal models.
 	probeNestedConfig(data, &config)
+	config.isEmbedding = declaresSimilarityFn(input.SentenceTransformersConfig)
 
 	return &config, nil
 }

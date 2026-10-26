@@ -236,8 +236,10 @@ func (p *ModelConfigParser) updateParsedModelMetadata(baseModel *v1beta1.BaseMod
 // (so iteration is deterministic across producers), then routes each
 // file to the appropriate bucket: model_index.json → diffusion,
 // config.json → transformer, hf_quant_config.json → standalone quant
-// config, safetensors / .index.json → counting helper. Files outside
-// the recognized basename set are dropped silently.
+// config, safetensors / .index.json → counting helper. A
+// config_sentence_transformers.json beside the chosen config.json rides
+// along with it. Files outside the recognized basename set are dropped
+// silently.
 func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInput) (*modelconfig.ModelConfigInput, []modelconfig.SafetensorsFileInput, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -294,6 +296,15 @@ func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInpu
 	// pipeline manifest when both exist.
 	if modelIndexInput != nil {
 		return modelIndexInput, safetensorsFiles, hfQuantConfigBytes, nil
+	}
+	if configInput != nil {
+		stConfigPath := path.Join(path.Dir(configInput.Path), modelconfig.SentenceTransformersConfigFileName)
+		for _, file := range normalized {
+			if file.Path == stConfigPath {
+				configInput.SentenceTransformersConfig = file.Data
+				break
+			}
+		}
 	}
 	return configInput, safetensorsFiles, hfQuantConfigBytes, nil
 }
