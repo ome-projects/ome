@@ -853,6 +853,81 @@ func TestParseModelConfigFromFiles_SentenceTransformersEmbedding(t *testing.T) {
 	}
 }
 
+func TestParseModelConfigFromFiles_PrefersRootConfig(t *testing.T) {
+	// sentence-transformers repos keep each module in a numbered folder
+	// with its own config.json. 1_Pooling/config.json sorts before the
+	// model's config.json but is not a model config.
+	parser := &ModelConfigParser{logger: zap.NewNop().Sugar()}
+	files := []ModelConfigFileInput{
+		{Path: DefaultConfigFileName, Data: qwen3EmbeddingConfigJSON},
+		{Path: "1_Pooling/" + DefaultConfigFileName, Data: []byte(`{"word_embedding_dimension":4096,"pooling_mode_lasttoken":true}`)},
+		{Path: modelconfig.SentenceTransformersConfigFileName, Data: []byte(`{"similarity_fn_name":"cosine"}`)},
+	}
+
+	metadata, err := parser.ParseModelConfigFromFiles(context.Background(), files, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, metadata)
+	assert.Equal(t, "Qwen3ForCausalLM", metadata.ModelArchitecture)
+	assert.Equal(t, []string{string(v1beta1.ModelCapabilityEmbedding)}, metadata.ModelCapabilities)
+}
+
+func TestSplitModelConfigFileInputs_PrefersFileNearestRoot(t *testing.T) {
+	cases := []struct {
+		name      string
+		paths     []string
+		wantInput string // path of the returned model_index.json or config.json
+		wantQuant string // path of the hf_quant_config.json whose data is returned
+	}{
+		{
+			name:      "root config.json beats a module folder that sorts first",
+			paths:     []string{"1_Pooling/config.json", "config.json"},
+			wantInput: "config.json",
+		},
+		{
+			name:      "common subdirectory beats other folders",
+			paths:     []string{"1_Pooling/config.json", "model/config.json"},
+			wantInput: "model/config.json",
+		},
+		{
+			name:      "shallower folder beats deeper folder",
+			paths:     []string{"a/b/config.json", "z/config.json"},
+			wantInput: "z/config.json",
+		},
+		{
+			name:      "same depth keeps sort order",
+			paths:     []string{"b/config.json", "a/config.json"},
+			wantInput: "a/config.json",
+		},
+		{
+			name:      "root model_index.json beats a subfolder",
+			paths:     []string{"a/model_index.json", "model_index.json"},
+			wantInput: "model_index.json",
+		},
+		{
+			name:      "root hf_quant_config.json beats a subfolder",
+			paths:     []string{"a/hf_quant_config.json", "config.json", "hf_quant_config.json"},
+			wantInput: "config.json",
+			wantQuant: "hf_quant_config.json",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := make([]ModelConfigFileInput, 0, len(tc.paths))
+			for _, p := range tc.paths {
+				// Each file holds its own path, so the test can tell which one won.
+				files = append(files, ModelConfigFileInput{Path: p, Data: []byte(p)})
+			}
+
+			input, _, hfQuantConfig, err := splitModelConfigFileInputs(context.Background(), files)
+			require.NoError(t, err)
+			require.NotNil(t, input)
+			assert.Equal(t, tc.wantInput, input.Path)
+			assert.Equal(t, tc.wantQuant, string(hfQuantConfig))
+		})
+	}
+}
+
 func TestParseModelConfigFromFilesRejectsEscapingPath(t *testing.T) {
 	logger := zap.NewNop().Sugar()
 	parser := &ModelConfigParser{logger: logger}

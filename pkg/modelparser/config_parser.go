@@ -236,10 +236,13 @@ func (p *ModelConfigParser) updateParsedModelMetadata(baseModel *v1beta1.BaseMod
 // (so iteration is deterministic across producers), then routes each
 // file to the appropriate bucket: model_index.json → diffusion,
 // config.json → transformer, hf_quant_config.json → standalone quant
-// config, safetensors / .index.json → counting helper. A
-// config_sentence_transformers.json beside the chosen config.json rides
-// along with it. Files outside the recognized basename set are dropped
-// silently.
+// config, safetensors / .index.json → counting helper. When several
+// folders hold a model_index.json, config.json or hf_quant_config.json,
+// the one nearest the model root wins (see locationRank), so a
+// sentence-transformers module's 1_Pooling/config.json does not shadow
+// the model's own. A config_sentence_transformers.json beside the chosen
+// config.json rides along with it. Files outside the recognized basename
+// set are dropped silently.
 func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInput) (*modelconfig.ModelConfigInput, []modelconfig.SafetensorsFileInput, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -263,6 +266,7 @@ func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInpu
 	var (
 		modelIndexInput    *modelconfig.ModelConfigInput
 		configInput        *modelconfig.ModelConfigInput
+		hfQuantConfigPath  string
 		hfQuantConfigBytes []byte
 		safetensorsFiles   = make([]modelconfig.SafetensorsFileInput, 0)
 	)
@@ -276,18 +280,18 @@ func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInpu
 		}
 		switch path.Base(file.Path) {
 		case DefaultModelIndexFileName:
-			if modelIndexInput == nil {
+			if modelIndexInput == nil || locationRank(file.Path) < locationRank(modelIndexInput.Path) {
 				input := modelconfig.ModelConfigInput{Path: file.Path, Data: file.Data}
 				modelIndexInput = &input
 			}
 		case DefaultConfigFileName:
-			if configInput == nil {
+			if configInput == nil || locationRank(file.Path) < locationRank(configInput.Path) {
 				input := modelconfig.ModelConfigInput{Path: file.Path, Data: file.Data}
 				configInput = &input
 			}
 		case modelconfig.HFQuantConfigFileName:
-			if hfQuantConfigBytes == nil {
-				hfQuantConfigBytes = file.Data
+			if hfQuantConfigPath == "" || locationRank(file.Path) < locationRank(hfQuantConfigPath) {
+				hfQuantConfigPath, hfQuantConfigBytes = file.Path, file.Data
 			}
 		}
 	}
@@ -307,6 +311,23 @@ func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInpu
 		}
 	}
 	return configInput, safetensorsFiles, hfQuantConfigBytes, nil
+}
+
+// locationRank orders input paths that share a base name the way the
+// directory path searches: the model root first, then commonConfigSubdirs
+// in order (findInCommonLocations), then any other folder, shallowest
+// first. Lower ranks win; on a tie the path that sorts first is kept.
+func locationRank(filePath string) int {
+	dir := path.Dir(filePath)
+	if dir == "." {
+		return 0
+	}
+	for i, sub := range commonConfigSubdirs {
+		if dir == sub {
+			return i + 1
+		}
+	}
+	return len(commonConfigSubdirs) + strings.Count(filePath, "/")
 }
 
 func cleanInputFilePath(filePath string) (string, error) {
