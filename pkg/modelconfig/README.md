@@ -34,8 +34,10 @@ What the resolver derives:
 - **Embedding**: a `config_sentence_transformers.json` beside the
   config that names a `similarity_fn_name` marks the model as an
   embedding model. Decoder-based embedders such as Qwen3-Embedding
-  have the `config.json` of a causal LM, so this file is their only
-  signal.
+  have the `config.json` of a causal LM, so this file is what tells
+  them apart. Only sentence-transformers 3.0 and later write the
+  field; models saved with older versions fall back to the
+  architecture rules.
 - **Quantization**: read from `quantization_config.quant_method`.
 
 `pkg/modelparser` consumes this interface and maps the result onto
