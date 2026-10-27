@@ -240,8 +240,9 @@ func embeddingRule(hf HuggingFaceModel) []Capability {
 	}
 	arch := hf.GetArchitecture()
 	// BertModel, BertForMaskedLM, BertForSequenceClassification, ...
-	// IsEmbedding is rarely set on real configs, so the architecture
-	// token is the practical detector for BERT-family encoders.
+	// IsEmbedding needs a sentence-transformers config, which many
+	// encoders lack, so the architecture token is the practical
+	// detector for BERT-family encoders.
 	if hasArchToken(arch, "Bert") {
 		return []Capability{CapabilityEmbedding}
 	}
