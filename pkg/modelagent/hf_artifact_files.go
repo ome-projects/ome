@@ -268,6 +268,16 @@ func (files hfArtifactFiles) RemoveChildSymlink(childModelPath, parentPath strin
 // WalkDir inspects symlinks without following them. This is a point-in-time
 // filesystem check, not a lock against concurrent child creation.
 func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, error) {
+	return hasHfArtifactChildrenExcept(parentPath, modelStoreRoot, nil)
+}
+
+// HasUnrecordedChildren excludes only paths indexed by the locked parent.
+// Unknown symlinks still protect files after partial reference reconstruction.
+func (hfArtifactFiles) HasUnrecordedChildren(parent HfArtifactEntry, modelStoreRoot string) (bool, error) {
+	return hasHfArtifactChildrenExcept(parent.LocalPath, modelStoreRoot, parent.Children)
+}
+
+func hasHfArtifactChildrenExcept(parentPath, modelStoreRoot string, recorded map[string]string) (bool, error) {
 	root, err := canonicalHfArtifactStoreRoot(modelStoreRoot)
 	if err != nil {
 		return false, err
@@ -275,6 +285,14 @@ func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, err
 	cleanParentPath, err := hfArtifactPathInRoot(parentPath, modelStoreRoot, root)
 	if err != nil {
 		return false, err
+	}
+	recordedPaths := make(map[string]bool, len(recorded))
+	for _, path := range recorded {
+		canonicalPath, err := hfArtifactPathInRoot(path, modelStoreRoot, root)
+		if err != nil {
+			return false, err
+		}
+		recordedPaths[canonicalPath] = true
 	}
 	foundChild := false
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -292,7 +310,7 @@ func (hfArtifactFiles) HasChildren(parentPath, modelStoreRoot string) (bool, err
 		if path != root && entry.IsDir() && (path == cleanParentPath || entry.Name() == hfArtifactLockDirectory) {
 			return filepath.SkipDir
 		}
-		if entry.Type()&os.ModeSymlink == 0 {
+		if entry.Type()&os.ModeSymlink == 0 || recordedPaths[path] {
 			return nil
 		}
 		target, err := readChildSymlinkTarget(path)

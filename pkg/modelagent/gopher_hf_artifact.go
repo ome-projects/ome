@@ -354,7 +354,12 @@ func (s *Gopher) runHfArtifactDownload(ctx context.Context, task *GopherTask, in
 		return hfArtifactTaskResult{Outcome: hfArtifactTaskUseDefaultDownload}, nil
 	}
 	parentIdle := !parent.blocksNewOperation()
-	needsRepair := task.TaskType == DownloadOverride || (found && parentIdle &&
+	// A new agent may have lost the ConfigMap while the model disk survived.
+	// Validate retained bytes before rebuilding references; an absent record
+	// does not make resetting an existing parent safe. Include dangling links.
+	retainedParent := !found && (handler.files.ChildPathExists(input.Parent.LocalPath) ||
+		handler.files.IsChildLinkedToParent(input.ChildModelPath, input.Parent.LocalPath))
+	needsRepair := task.TaskType == DownloadOverride || retainedParent || (found && parentIdle &&
 		(parent.Status != HfArtifactStatusReady || !handler.files.ParentReadyMarkerExists(parent)))
 	startupValidation := s.hfArtifactStartup.needsValidation(input.Parent.Key)
 	if !allowDownload && (needsRepair || !found || startupValidation) {
