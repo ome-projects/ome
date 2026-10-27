@@ -94,9 +94,9 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 		return result, nil
 	}
 	if !valid {
-		if download == nil {
-			return h.finishParentWithError(ctx, parent, fmt.Errorf("download function for shared Hugging Face parent %s is nil", parent.Key))
-		}
+		// Proven corruption invalidates known children even if unknown local
+		// users subsequently prevent file replacement. Preserve prior statuses
+		// so a later successful validation can restore them.
 		failedParent, err := h.repository.MarkChildrenFailedForRepair(ctx, parent)
 		if err != nil {
 			return h.finishParentWithError(ctx, parent, err)
@@ -115,6 +115,20 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 					return h.finishParentWithError(ctx, parent, err)
 				}
 			}
+		}
+		// ConfigMap loss can leave local users absent from parent.Children.
+		// Valid bytes can be adopted, but replacing invalid bytes would bypass
+		// status/ownership checks for those unknown users. This also protects
+		// retries after only some siblings have rebuilt their references.
+		unrecorded, err := h.files.HasUnrecordedChildren(parent, input.ModelStoreRoot)
+		if err != nil {
+			return h.finishParentWithError(ctx, parent, err)
+		}
+		if unrecorded {
+			return h.finishParentWithError(ctx, parent, fmt.Errorf("shared Hugging Face parent %s has unrecorded child symlinks; refusing to replace files", parent.Key))
+		}
+		if download == nil {
+			return h.finishParentWithError(ctx, parent, fmt.Errorf("download function for shared Hugging Face parent %s is nil", parent.Key))
 		}
 		// Leave the old marker alone until validation and status updates have
 		// succeeded. The download callback may now replace corrupt files.
