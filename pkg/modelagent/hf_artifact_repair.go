@@ -10,7 +10,8 @@ import (
 )
 
 // handleDownloadOverride validates under the current parent's lock. Only proven
-// invalid files cause children to fail; download owns replacing corrupt data.
+// invalid files cause children to fail. Unreferenced invalid parents are reset;
+// shared parents are repaired in place.
 func (h *hfArtifactTaskHandler) handleDownloadOverride(
 	ctx context.Context,
 	input hfArtifactTaskInput,
@@ -130,9 +131,14 @@ func (h *hfArtifactTaskHandler) handleDownloadOverride(
 		if download == nil {
 			return h.finishParentWithError(ctx, parent, fmt.Errorf("download function for shared Hugging Face parent %s is nil", parent.Key))
 		}
-		// Leave the old marker alone until validation and status updates have
-		// succeeded. The download callback may now replace corrupt files.
-		if err := os.Remove(filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName)); err != nil && !os.IsNotExist(err) {
+		// With no recorded or local children, reset interrupted files before
+		// downloading so objects outside the manifest do not survive. Shared
+		// parents stay in place after their children have been marked Failed.
+		if len(parent.Children) == 0 {
+			if err := h.files.ResetParentDirectory(parent.LocalPath); err != nil {
+				return h.finishParentWithError(ctx, parent, err)
+			}
+		} else if err := os.Remove(filepath.Join(parent.LocalPath, constants.HfArtifactReadyMarkerFileName)); err != nil && !os.IsNotExist(err) {
 			return h.finishParentWithError(ctx, parent, err)
 		}
 		if err := download(parent.LocalPath); err != nil {

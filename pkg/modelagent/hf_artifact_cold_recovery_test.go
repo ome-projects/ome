@@ -89,6 +89,71 @@ func TestGopherHfArtifactColdRecoveryRestoresReferences(t *testing.T) {
 	}
 }
 
+func TestGopherHfArtifactColdRecoveryResetsOnlyUnreferencedInvalidFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		valid bool
+		err   error
+	}{
+		{name: "invalid files"},
+		{name: "valid files", valid: true},
+		{name: "inspection error", err: errors.New("manifest unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, marker := range []bool{false, true} {
+				t.Run(map[bool]string{false: "without marker", true: "with marker"}[marker], func(t *testing.T) {
+					s, task, input := newTestHfArtifactGopher(t)
+					require.NoError(t, writeTestHfArtifactFiles(input.Parent.LocalPath))
+					stale := filepath.Join(input.Parent.LocalPath, "old-shard.safetensors")
+					require.NoError(t, os.WriteFile(stale, []byte("partial download"), 0o644))
+					before, err := os.Stat(stale)
+					require.NoError(t, err)
+					markerPath := filepath.Join(input.Parent.LocalPath, constants.HfArtifactReadyMarkerFileName)
+					if marker {
+						require.NoError(t, os.WriteFile(markerPath, []byte("previous-owner"), 0o644))
+					}
+					downloads := 0
+					result, err := s.runHfArtifactDownload(context.Background(), task, input, true,
+						func(path string) (bool, error) {
+							require.FileExists(t, stale, "validation must precede cleanup")
+							return tc.valid, tc.err
+						}, func(path string) error {
+							downloads++
+							entries, err := os.ReadDir(path)
+							require.NoError(t, err)
+							require.Empty(t, entries, "unreferenced invalid files must be cleared before downloading")
+							return writeTestHfArtifactFiles(path)
+						})
+					if tc.err != nil {
+						require.ErrorIs(t, err, tc.err)
+					} else {
+						require.NoError(t, err)
+						require.Equal(t, hfArtifactTaskDone, result.Outcome)
+						assertParentEntryReady(t, s.sharedHfArtifactHandler().repository, input.Parent,
+							map[string]string{input.ChildModelKey: input.ChildModelPath})
+					}
+					if !tc.valid && tc.err == nil {
+						require.Equal(t, 1, downloads)
+						require.NoFileExists(t, stale)
+						return
+					}
+					// Valid files and inspection failures must both retain the original bytes.
+					require.Zero(t, downloads)
+					after, err := os.Stat(stale)
+					require.NoError(t, err)
+					require.True(t, os.SameFile(before, after))
+					require.Equal(t, before.ModTime(), after.ModTime())
+					if tc.err != nil && marker {
+						bytes, err := os.ReadFile(markerPath)
+						require.NoError(t, err)
+						require.Equal(t, "previous-owner", string(bytes))
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestGopherHfArtifactColdRecoveryPreservesUnverifiedFiles(t *testing.T) {
 	for _, validationErr := range []error{nil, errors.New("manifest unavailable")} {
 		t.Run(map[bool]string{false: "invalid files", true: "inspection error"}[validationErr != nil], func(t *testing.T) {
