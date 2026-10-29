@@ -38,6 +38,14 @@ func ProcessBaseAnnotations(p *Piece, isvc *v1beta1.InferenceService, annotation
 	if p.FineTunedServingWithMergedWeights {
 		p.Log.V(1).Info("Fine-tuned serving with merged weights", "namespace", isvc.Namespace)
 		annotations[constants.FTServingWithMergedWeightsAnnotationKey] = "true"
+	} else if p.BaseModelMeta != nil {
+		// Model init reads the decryption key and secret from pod annotations.
+		if keyName, ok := p.BaseModelMeta.Annotations[constants.BaseModelDecryptionKeyName]; ok {
+			annotations[constants.BaseModelDecryptionKeyName] = keyName
+		}
+		if secretName, ok := p.BaseModelMeta.Annotations[constants.BaseModelDecryptionSecretName]; ok {
+			annotations[constants.BaseModelDecryptionSecretName] = secretName
+		}
 	}
 
 	// Add base model specific annotations
