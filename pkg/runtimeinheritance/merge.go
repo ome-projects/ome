@@ -38,6 +38,11 @@ func Merge(parent, child *v1beta1.ServingRuntimeSpec) (*v1beta1.ServingRuntimeSp
 	if err != nil {
 		return nil, fmt.Errorf("strip nulls from child: %w", err)
 	}
+	// Set after the strip above, which would drop these nulls.
+	childJSON, err = NullStaleEnvSources(childJSON)
+	if err != nil {
+		return nil, fmt.Errorf("null stale env sources in child: %w", err)
+	}
 
 	mergedJSON, err := strategicpatch.StrategicMergePatch(parentJSON, childJSON, v1beta1.ServingRuntimeSpec{})
 	if err != nil {
@@ -49,6 +54,57 @@ func Merge(parent, child *v1beta1.ServingRuntimeSpec) (*v1beta1.ServingRuntimeSp
 		return nil, fmt.Errorf("unmarshal merged: %w", err)
 	}
 	return merged, nil
+}
+
+// NullStaleEnvSources sets the other half of every env entry in the override
+// to null: `valueFrom` for an entry that sets `value`, `value` for one that
+// sets `valueFrom`. An entry that sets both is left as written. Within a
+// `valueFrom`, every source it does not set is nulled too. Strategic merge
+// joins env entries by name and merges them field by field, so without the
+// nulls an entry that changes its source keeps the base entry's other half or
+// other source, and the API server rejects the env var.
+func NullStaleEnvSources(patch []byte) ([]byte, error) {
+	var doc any
+	if err := json.Unmarshal(patch, &doc); err != nil {
+		return nil, err
+	}
+	var walk func(v any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			if env, ok := t["env"].([]any); ok {
+				for _, e := range env {
+					entry, ok := e.(map[string]any)
+					if !ok {
+						continue
+					}
+					_, hasSource := entry["valueFrom"]
+					_, hasValue := entry["value"]
+					if hasSource && !hasValue {
+						entry["value"] = nil
+					} else if hasValue && !hasSource {
+						entry["valueFrom"] = nil
+					}
+					if source, ok := entry["valueFrom"].(map[string]any); ok {
+						for _, key := range []string{"fieldRef", "resourceFieldRef", "configMapKeyRef", "secretKeyRef", "fileKeyRef"} {
+							if _, set := source[key]; !set {
+								source[key] = nil
+							}
+						}
+					}
+				}
+			}
+			for _, child := range t {
+				walk(child)
+			}
+		case []any:
+			for _, child := range t {
+				walk(child)
+			}
+		}
+	}
+	walk(doc)
+	return json.Marshal(doc)
 }
 
 // StripJSONNulls returns the JSON document with all null-valued object
