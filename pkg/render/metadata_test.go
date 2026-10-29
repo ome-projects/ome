@@ -68,7 +68,10 @@ func TestProcessComponentAnnotationsBaseModelDecryption(t *testing.T) {
 			name:          "merged weights do not inherit base model keys",
 			modelMeta:     &metav1.ObjectMeta{Name: "embed-v4", Annotations: modelAnnotations},
 			mergedWeights: true,
-			want:          map[string]string{constants.FTServingWithMergedWeightsAnnotationKey: "true"},
+			want: map[string]string{
+				constants.FTServingWithMergedWeightsAnnotationKey: "true",
+				constants.ModelInitInjectionKey:                   "false",
+			},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
