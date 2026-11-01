@@ -197,7 +197,7 @@ func calculateMemoryFitScore(
 	candidate v1beta1.AcceleratorClass,
 	constraints *v1beta1.AcceleratorConstraints,
 ) float64 {
-	if constraints.MinMemory == nil {
+	if constraints == nil || constraints.MinMemory == nil {
 		return 1.0 // No requirement, perfect score
 	}
 
@@ -268,6 +268,9 @@ func calculateComputePerformanceTFLOPSScore(
 	}
 
 	perf := spec.Capabilities.Performance
+	if constraints == nil {
+		constraints = &v1beta1.AcceleratorConstraints{}
+	}
 
 	// If no MinComputePerformanceTFLOPS requirement, return 1.0
 	requiredTFLOPS := int64(0)
