@@ -38,6 +38,47 @@ func (m splitMinimums) secondaries() map[v1beta1.ComponentType]int32 {
 	return out
 }
 
+// ceilings resolves each component's cap on one member: the cap the source
+// declares for it (see SplitSpec.Ceiling), or for a secondary component
+// without one, the primary's cap scaled by its ratio of minimums and rounded
+// up. A component without a cap is absent and stays fixed at its share.
+func (m splitMinimums) ceilings(source *v1beta1.InferenceService) map[v1beta1.ComponentType]int32 {
+	split := splitSpecOf(source)
+	primary := split.Ceiling(m.primary)
+	out := map[v1beta1.ComponentType]int32{}
+	if primary > 0 {
+		out[m.primary] = primary
+	}
+	for component := range m.secondaries() {
+		if declared := split.Ceiling(component); declared > 0 {
+			out[component] = declared
+		} else if primary > 0 {
+			out[component] = int32(min(m.scaledCeiling(component, primary), math.MaxInt32))
+		}
+	}
+	return out
+}
+
+// splitSpecOf returns the source's split block, or nil.
+func splitSpecOf(source *v1beta1.InferenceService) *v1beta1.SplitSpec {
+	if source.Spec.Placement == nil {
+		return nil
+	}
+	return source.Spec.Placement.Split
+}
+
+// scaledCeiling converts a ceiling declared in primary replicas into a
+// secondary component's own ratio, rounded up.
+func (m splitMinimums) scaledCeiling(component v1beta1.ComponentType, ceiling int32) int64 {
+	return scaleCeil(int64(ceiling), int64(m.floors[component]), int64(m.floors[m.primary]))
+}
+
+// scaleCeil scales count by numerator over denominator, rounded up. The
+// denominator must be positive.
+func scaleCeil(count, numerator, denominator int64) int64 {
+	return (count*numerator + denominator - 1) / denominator
+}
+
 // splitComponentMinimums reads the source's fleet minimums. The primary floor
 // is split.replicas or the engine minimum. A declared decoder minimum follows
 // the engine minimum in their declared ratio, scaled to the primary floor and
@@ -47,7 +88,7 @@ func (m splitMinimums) secondaries() map[v1beta1.ComponentType]int32 {
 func splitComponentMinimums(source *v1beta1.InferenceService) (splitMinimums, error) {
 	primaryFloor := splitDesiredReplicas(source)
 	if primaryFloor <= 0 {
-		return splitMinimums{}, fmt.Errorf("ReplicaCountUnresolved: declare split.replicas or a positive engine.minReplicas")
+		return splitMinimums{}, replicaCountUnresolved(source)
 	}
 	out := splitMinimums{floors: map[v1beta1.ComponentType]int32{}}
 	for _, component := range placementScaleComponents(source) {
@@ -67,7 +108,7 @@ func splitComponentMinimums(source *v1beta1.InferenceService) (splitMinimums, er
 			}
 			minimum = declared
 			if engine := source.Spec.Engine.MinReplicas; engine != nil && *engine > 0 && int64(*engine) != int64(primaryFloor) {
-				minimum = (declared*int64(primaryFloor) + int64(*engine) - 1) / int64(*engine)
+				minimum = scaleCeil(declared, int64(primaryFloor), int64(*engine))
 			}
 		}
 		out.floors[component] = int32(min(minimum, math.MaxInt32))
@@ -87,7 +128,7 @@ func splitComponentMinimums(source *v1beta1.InferenceService) (splitMinimums, er
 			declared = source.Spec.Decoder.MinReplicas
 		}
 		if declared != nil && *declared > 0 && int64(*declared) != int64(primaryFloor) {
-			minimum = (minimum*int64(primaryFloor) + int64(*declared) - 1) / int64(*declared)
+			minimum = scaleCeil(minimum, int64(primaryFloor), int64(*declared))
 		}
 		out.floors[v1beta1.RouterComponent] = int32(min(minimum, math.MaxInt32))
 	}
@@ -95,24 +136,33 @@ func splitComponentMinimums(source *v1beta1.InferenceService) (splitMinimums, er
 }
 
 // routerDivided reports whether the source divides its routers across Split
-// members: an affinity term sets a router weight. Otherwise every member runs
-// the source's full router policy.
+// members: no affinity term sets weights, or a term sets a default or router
+// weight. Weights that name only the engine or decoder keep the full router
+// policy on every member.
 func routerDivided(source *v1beta1.InferenceService) bool {
 	return source.Spec.Router != nil && placementMode(source) == v1beta1.PlacementModeSplit &&
 		affinity.DividesRouters(source.Spec.Placement.ClusterAffinity)
 }
 
-// splitMemberFloors apportions every secondary component's minimum over the
-// members' current primary targets, in the fleet ratio of whatever those targets
-// sum to, and returns the named member's floors. The member's own allocation is
-// authoritative for its target.
-func splitMemberFloors(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement) ([]v1beta1.PlacementComponentFloor, error) {
-	if member.Cluster == "" || member.Allocation == nil {
-		return nil, fmt.Errorf("split home floors require an identified allocation")
-	}
+// splitMemberFloors reads the source's fleet minimums and apportions them to
+// the named member, trimmed as memberShares describes. held is what the
+// member's copy holds now.
+func splitMemberFloors(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement, held map[v1beta1.ComponentType]int32) ([]v1beta1.PlacementComponentFloor, error) {
 	minimums, err := splitComponentMinimums(source)
 	if err != nil {
 		return nil, err
+	}
+	trimmed, _, err := minimums.memberShares(source, candidates, member, held)
+	return trimmed, err
+}
+
+// memberShare apportions every secondary component's minimum over the
+// members' current primary targets, in the fleet ratio of whatever those targets
+// sum to, and returns the named member's floors. The member's own allocation is
+// authoritative for its target.
+func (m splitMinimums) memberShare(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement) ([]v1beta1.PlacementComponentFloor, error) {
+	if member.Cluster == "" || member.Allocation == nil {
+		return nil, fmt.Errorf("split home floors require an identified allocation")
 	}
 	targets := map[string]int32{}
 	allocations := map[string]v1beta1.CandidateAllocationStatus{}
@@ -124,11 +174,56 @@ func splitMemberFloors(source *v1beta1.InferenceService, candidates []v1beta1.Ca
 	}
 	targets[member.Cluster] = member.Allocation.CurrentReplicas
 	allocations[member.Cluster] = *member.Allocation
-	floors, err := apportionSplitFloors(minimums, targets, splitWeightsOf(source, allocations))
+	floors, err := apportionSplitFloors(m, targets, splitWeightsOf(source, allocations))
 	if err != nil {
 		return nil, err
 	}
 	return floors[member.Cluster], nil
+}
+
+// memberShares returns the named member's minimums twice: trimmed, as
+// placement writes them, and as memberShare's in-flight apportionment gives
+// them.
+//
+// While primaries above the minimum are still in flight, the secondary total
+// follows them upward. A member whose primary target is not falling gets none
+// of that extra: each of its secondary minimums is at most the larger of what
+// its copy holds and its share at every member's desired target. Otherwise it
+// would start replicas that the move removes once the extra primaries are
+// gone. held is nil when the copy was not read, which trims nothing; a copy
+// that does not exist yet holds nothing.
+func (m splitMinimums) memberShares(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement, held map[v1beta1.ComponentType]int32) (trimmed, inFlight []v1beta1.PlacementComponentFloor, err error) {
+	inFlight, err = m.memberShare(source, candidates, member)
+	if err != nil {
+		return nil, nil, err
+	}
+	current := int64(member.Allocation.CurrentReplicas)
+	desired := map[string]int32{member.Cluster: member.Allocation.DesiredReplicas}
+	allocations := map[string]v1beta1.CandidateAllocationStatus{member.Cluster: *member.Allocation}
+	for _, candidate := range candidates {
+		if candidate.Allocation != nil && candidate.Cluster != "" && candidate.Cluster != member.Cluster {
+			current += int64(candidate.Allocation.CurrentReplicas)
+			desired[candidate.Cluster] = candidate.Allocation.DesiredReplicas
+			allocations[candidate.Cluster] = *candidate.Allocation
+		}
+	}
+	if held == nil || member.Allocation.CurrentReplicas > member.Allocation.DesiredReplicas || current <= int64(m.floors[m.primary]) {
+		return inFlight, inFlight, nil
+	}
+	// The desired targets passed the plan's own check. Should they fail here,
+	// the member keeps its in-flight shares.
+	final, err := apportionSplitFloors(m, desired, splitWeightsOf(source, allocations))
+	if err != nil {
+		return inFlight, inFlight, nil
+	}
+	finalShares := floorMap(final[member.Cluster])
+	trimmed = slices.Clone(inFlight)
+	for i, share := range trimmed {
+		if share.Component != m.primary {
+			trimmed[i].Replicas = min(share.Replicas, max(held[share.Component], finalShares[share.Component]))
+		}
+	}
+	return trimmed, inFlight, nil
 }
 
 // splitWeights holds the accepted static weights of a split plan: the primary
@@ -137,13 +232,20 @@ func splitMemberFloors(source *v1beta1.InferenceService, candidates []v1beta1.Ca
 type splitWeights struct {
 	primary    map[string]int64
 	components map[v1beta1.ComponentType]map[string]int64
+	// maxPrimary and maxComponents hold the maximum ratios of the ratio form;
+	// both stay empty in the integer form.
+	maxPrimary    map[string]int64
+	maxComponents map[v1beta1.ComponentType]map[string]int64
 }
 
 // splitWeightsOf reads the weights an accepted or proposed allocation records.
 // Only static Split gives a component its own weights; every other plan
 // apportions by the primary targets alone.
 func splitWeightsOf(source *v1beta1.InferenceService, allocations map[string]v1beta1.CandidateAllocationStatus) splitWeights {
-	out := splitWeights{primary: map[string]int64{}, components: map[v1beta1.ComponentType]map[string]int64{}}
+	out := splitWeights{
+		primary: map[string]int64{}, components: map[v1beta1.ComponentType]map[string]int64{},
+		maxPrimary: map[string]int64{}, maxComponents: map[v1beta1.ComponentType]map[string]int64{},
+	}
 	if placementMode(source) != v1beta1.PlacementModeSplit {
 		return out
 	}
@@ -152,6 +254,9 @@ func splitWeightsOf(source *v1beta1.InferenceService, allocations map[string]v1b
 			continue
 		}
 		out.primary[name] = *allocation.Weight
+		if allocation.MaxWeight != nil {
+			out.maxPrimary[name] = *allocation.MaxWeight
+		}
 		for _, match := range allocation.ComponentMatches {
 			if match.Weight == nil {
 				continue
@@ -160,6 +265,12 @@ func splitWeightsOf(source *v1beta1.InferenceService, allocations map[string]v1b
 				out.components[match.Component] = map[string]int64{}
 			}
 			out.components[match.Component][name] = *match.Weight
+			if match.MaxWeight != nil {
+				if out.maxComponents[match.Component] == nil {
+					out.maxComponents[match.Component] = map[string]int64{}
+				}
+				out.maxComponents[match.Component][name] = *match.MaxWeight
+			}
 		}
 	}
 	return out
@@ -246,7 +357,7 @@ func apportionSplitFloors(minimums splitMinimums, targets map[string]int32, weig
 		}
 	}
 	primaryMinimum := minimums.floors[minimums.primary]
-	floors, err := protocol.ApportionReplicaFloors(minimums.primary, primaryMinimum, targets, following)
+	out, err := protocol.ApportionReplicaFloors(minimums.primary, primaryMinimum, targets, following)
 	if err != nil {
 		return nil, err
 	}
@@ -260,39 +371,36 @@ func apportionSplitFloors(minimums splitMinimums, targets map[string]int32, weig
 			return nil, err
 		}
 		for name := range targets {
-			floors[name] = append(floors[name], v1beta1.PlacementComponentFloor{Component: component, Replicas: shares[name]})
-			slices.SortFunc(floors[name], func(a, b v1beta1.PlacementComponentFloor) int { return cmp.Compare(a.Component, b.Component) })
+			out[name] = append(out[name], v1beta1.PlacementComponentFloor{Component: component, Replicas: shares[name]})
+			slices.SortFunc(out[name], func(a, b v1beta1.PlacementComponentFloor) int { return cmp.Compare(a.Component, b.Component) })
 		}
 	}
-	return floors, nil
+	return out, nil
 }
 
 // splitPlannedBounds derives the member replica band of each scalable
-// component on a split member. The local ceiling is declared in primary
-// replicas; a secondary component's ceiling is that ceiling in its own ratio,
-// rounded up.
-func splitPlannedBounds(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement) (map[v1beta1.ComponentType]plannedBound, error) {
-	floors, err := splitMemberFloors(source, candidates, member)
-	if err != nil {
-		return nil, err
-	}
+// component on a split member: its share, up to its cap (see ceilings, or
+// ratioCeilings when the terms set replica ratios).
+func splitPlannedBounds(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement, held map[v1beta1.ComponentType]int32) (map[v1beta1.ComponentType]plannedBound, error) {
 	minimums, err := splitComponentMinimums(source)
 	if err != nil {
 		return nil, err
 	}
-	var ceiling int32
-	if source.Spec.Placement != nil && source.Spec.Placement.Split != nil {
-		ceiling = source.Spec.Placement.Split.MaxReplicasPerCluster
+	shares, _, err := minimums.memberShares(source, candidates, member, held)
+	if err != nil {
+		return nil, err
 	}
-	out := make(map[v1beta1.ComponentType]plannedBound, len(floors))
-	primaryMinimum := int64(minimums.floors[minimums.primary])
-	for _, floor := range floors {
-		bound := plannedBound{Floor: floor.Replicas, Ceiling: ceiling}
-		if ceiling > 0 && floor.Component != minimums.primary {
-			scaled := (int64(ceiling)*int64(minimums.floors[floor.Component]) + primaryMinimum - 1) / primaryMinimum
-			bound.Ceiling = int32(min(scaled, math.MaxInt32))
+	var ceilings map[v1beta1.ComponentType]int32
+	if usesRatioForm(source) {
+		if ceilings, _, err = ratioCeilings(source, candidates, member, shares); err != nil {
+			return nil, err
 		}
-		out[floor.Component] = bound
+	} else {
+		ceilings = minimums.ceilings(source)
+	}
+	out := make(map[v1beta1.ComponentType]plannedBound, len(shares))
+	for _, share := range shares {
+		out[share.Component] = plannedBound{share.Replicas, ceilings[share.Component]}
 	}
 	return out, nil
 }
@@ -384,5 +492,5 @@ func occupiedUnits(count, floor, primaryFloor int32) int32 {
 	if count <= 0 || floor <= 0 || primaryFloor <= 0 {
 		return count
 	}
-	return int32(min((int64(count)*int64(primaryFloor)+int64(floor)-1)/int64(floor), math.MaxInt32))
+	return int32(min(scaleCeil(int64(count), int64(primaryFloor), int64(floor)), math.MaxInt32))
 }

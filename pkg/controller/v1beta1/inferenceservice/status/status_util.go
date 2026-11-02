@@ -96,11 +96,11 @@ func (sr *StatusReconciler) InitializeComponentCondition(status *v1beta1.Inferen
 
 // getReadyConditionsMap returns the mapping of component types to ready conditions
 func (sr *StatusReconciler) getReadyConditionsMap() map[v1beta1.ComponentType]apis.ConditionType {
-	return map[v1beta1.ComponentType]apis.ConditionType{
-		v1beta1.RouterComponent:  v1beta1.RouterReady,
-		v1beta1.EngineComponent:  v1beta1.EngineReady,
-		v1beta1.DecoderComponent: v1beta1.DecoderReady,
+	conditions := make(map[v1beta1.ComponentType]apis.ConditionType, len(v1beta1.Roles))
+	for _, r := range v1beta1.Roles {
+		conditions[r.Type] = r.ReadyCondition
 	}
+	return conditions
 }
 
 // checkContainerStatuses checks the status of containers in a pod

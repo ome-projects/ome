@@ -8,20 +8,17 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	appsv1 "k8s.io/api/apps/v1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // Global test variables
@@ -42,17 +39,6 @@ var _ = BeforeSuite(func() {
 
 	By("Setting up test context")
 	testCtx, cancel = context.WithCancel(context.TODO())
-
-	By("Creating scheme")
-	testScheme := runtime.NewScheme()
-	Expect(scheme.AddToScheme(testScheme)).To(Succeed())
-	Expect(v1beta1.AddToScheme(testScheme)).To(Succeed())
-	Expect(appsv1.AddToScheme(testScheme)).To(Succeed())
-	Expect(v1.AddToScheme(testScheme)).To(Succeed())
-	Expect(kedav1.AddToScheme(testScheme)).To(Succeed())
-	Expect(lws.AddToScheme(testScheme)).To(Succeed())
-	Expect(autoscalingv2.AddToScheme(testScheme)).To(Succeed())
-	Expect(monitoringv1.AddToScheme(testScheme)).To(Succeed())
 
 	By("Creating fake client")
 	// Create initial objects for the fake client
@@ -75,11 +61,10 @@ var _ = BeforeSuite(func() {
 		},
 	}
 
-	k8sClient = fake.NewClientBuilder().
-		WithScheme(testScheme).
-		WithObjects(initialObjects...).
-		WithStatusSubresource(&v1beta1.InferenceService{}).
-		Build()
+	k8sClient = fakeclient.New(GinkgoTB(),
+		fakeclient.WithTypes(kedav1.AddToScheme, lws.AddToScheme, monitoringv1.AddToScheme),
+		fakeclient.WithObjects(initialObjects...),
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}))
 
 	// Create test data in the client
 	Expect(createTestData()).To(Succeed())

@@ -7,17 +7,12 @@ import (
 	"testing"
 
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
-	networkingv1 "k8s.io/api/networking/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -27,13 +22,13 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/acceleratorclassselector"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // followerFixture is an engine the decoder follows at ratio 1, both
@@ -67,15 +62,7 @@ const (
 
 func newFollowerFixture(t *testing.T, opts followerOptions) *followerFixture {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{
-		v1beta1.AddToScheme, v1.AddToScheme, appsv1.AddToScheme, autoscalingv2.AddToScheme,
-		policyv1.AddToScheme, monitoringv1.AddToScheme, networkingv1.AddToScheme,
-	} {
-		if err := add(scheme); err != nil {
-			t.Fatal(err)
-		}
-	}
+	scheme := fakeclient.Scheme(t, monitoringv1.AddToScheme)
 	runner := func(image string) *v1beta1.RunnerSpec {
 		return &v1beta1.RunnerSpec{Container: v1.Container{Name: constants.MainContainerName, Image: image}}
 	}
@@ -182,9 +169,9 @@ func newFollowerFixture(t *testing.T, opts followerOptions) *followerFixture {
 			return c.Patch(ctx, obj, patch, opts...)
 		}
 	}
-	f.client = ctrlclientfake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(isvc, rt, engine, decoder).WithStatusSubresource(isvc, engine, decoder).
-		WithInterceptorFuncs(funcs).Build()
+	f.client = fakeclient.New(t, fakeclient.WithScheme(scheme),
+		fakeclient.WithObjects(isvc, rt, engine, decoder), fakeclient.WithStatusSubresource(isvc, engine, decoder),
+		fakeclient.WithInterceptors(funcs))
 
 	clientset := fake.NewClientset()
 	if _, err := clientset.CoreV1().ConfigMaps("ome").Create(context.TODO(), &v1.ConfigMap{

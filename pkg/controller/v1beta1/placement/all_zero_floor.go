@@ -102,7 +102,7 @@ func (r *Reconciler) prepareAllMovementFloors(ctx context.Context, source *v1bet
 func (r *Reconciler) applyAllMovementFloors(ctx context.Context, source *v1beta1.InferenceService, eligible []string, standing *placementObservations, proposal plan.Proposal) (ctrl.Result, error) {
 	accepted, err := (plan.Store{Client: r.Client, Reader: r.APIReader}).Persist(ctx, source, proposal)
 	if err != nil {
-		return r.writeSplitHold(ctx, source, standing, "PlanNotPersisted", err)
+		return r.writeSplitHold(ctx, source, standing, reasonPlanNotPersisted, err)
 	}
 	for _, candidate := range accepted.Status.Placement.Candidates {
 		if candidate.Allocation.CurrentHome == nil {
@@ -112,10 +112,10 @@ func (r *Reconciler) applyAllMovementFloors(ctx context.Context, source *v1beta1
 		err := r.placePlannedMember(cctx, accepted, candidate, true, nil)
 		cancel()
 		if err != nil {
-			return r.writeSplitHold(ctx, accepted, standing, "MemberApplicationFailed", err)
+			return r.writeSplitHold(ctx, accepted, standing, reasonMemberApplicationFailed, err)
 		}
 	}
-	return r.writeSplitObservations(ctx, accepted, r.observeSplitMembers(ctx, accepted, eligible), "AwaitingMemberConvergence", "")
+	return r.writeSplitObservations(ctx, accepted, r.observeSplitMembers(ctx, accepted, eligible), reasonAwaitingMemberConvergence, "")
 }
 
 // advanceAllZeroFloors acknowledges retained policy without treating autoscaled
@@ -126,11 +126,11 @@ func advanceAllZeroFloors(source *v1beta1.InferenceService, observations map[str
 		a, observed := candidate.Allocation, observations[candidate.Cluster]
 		out.Targets[candidate.Cluster] = a.CurrentReplicas
 		if a.DrainRequested || a.CurrentReplicas != a.DesiredReplicas || (a.CurrentHome != nil) != (a.DesiredHome != nil) {
-			out.Complete, out.Reason = false, "PositiveFloorRequired"
+			out.Complete, out.Reason = false, reasonPositiveMinimumRequired
 		} else if (a.CurrentHome != nil && (!observed.MemberState.Known || !observed.MemberState.Applied)) || (a.CurrentHome == nil && !observed.MemberState.Absent) {
 			out.Complete = false
 			if out.Reason == "" {
-				out.Reason = "AwaitingMemberConvergence"
+				out.Reason = reasonAwaitingMemberConvergence
 			}
 		}
 	}

@@ -52,21 +52,8 @@ const (
 // .MaxSurge (both *intstr.IntOrString) and MinReadySeconds.
 // Wired into the webhook from inference_service_validation.go.
 func ValidateLifecycle(spec *v1beta1.InferenceServiceSpec) error {
-	if spec == nil {
-		return nil
-	}
-	if spec.Engine != nil {
-		if err := validateComponentLifecycle("engine", spec.Engine.Lifecycle); err != nil {
-			return err
-		}
-	}
-	if spec.Decoder != nil {
-		if err := validateComponentLifecycle("decoder", spec.Decoder.Lifecycle); err != nil {
-			return err
-		}
-	}
-	if spec.Router != nil {
-		if err := validateComponentLifecycle("router", spec.Router.Lifecycle); err != nil {
+	for _, r := range declaredRoles(spec) {
+		if err := validateComponentLifecycle(string(r.kind), r.extension.Lifecycle); err != nil {
 			return err
 		}
 	}

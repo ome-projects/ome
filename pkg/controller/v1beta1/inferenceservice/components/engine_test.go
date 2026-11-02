@@ -15,6 +15,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -901,7 +902,7 @@ func TestEngineWorkerPodSpec(t *testing.T) {
 
 // TestEngineUsesLeaderTemplate pins the structural predicate that drives
 // pod-template selection in reconcilePodSpec. Switching on
-// isvcutils.DetermineEngineDeploymentMode(spec) instead would return
+// isvcutils.RoleDeploymentMode(spec) instead would return
 // MultiNode for ANY spec with Leader/Worker set, regardless of the
 // authoritative DeploymentMode wired in at construction time; for an
 // OMENative-mode engine with Leader != nil the two disagree (helper says
@@ -1013,7 +1014,7 @@ func TestEngineReconcilePodSpec_OMENativeWithLeader(t *testing.T) {
 	c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
 
 	// Construct with DeploymentMode=OMENative — distinct from what
-	// DetermineEngineDeploymentMode would return for this spec (MultiNode).
+	// RoleDeploymentMode would return for this spec (MultiNode).
 	engine := NewEngine(
 		&ComponentDeps{Client: c, Clientset: clientset, Scheme: scheme, Config: &controllerconfig.InferenceServicesConfig{}},
 		ComponentInputs{DeploymentMode: constants.OMENative},
@@ -1079,7 +1080,8 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 	}
 
 	t.Run("rendered leader and worker templates carry the top-level name", func(t *testing.T) {
-		mergedEngine, _, _, err := isvcutils.MergeRuntimeSpecs(isvc.DeepCopy(), multiPodRuntime(""), logr.Discard())
+		specs, err := isvcutils.MergeRuntimeRoleSpecs(isvc.DeepCopy(), multiPodRuntime(""), logr.Discard())
+		mergedEngine := specs.Engine
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 
 		engine := newEngineFromMerged(mergedEngine, constants.OMENative)
@@ -1094,7 +1096,8 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 	})
 
 	t.Run("leader-level name overrides the top-level name", func(t *testing.T) {
-		mergedEngine, _, _, err := isvcutils.MergeRuntimeSpecs(isvc.DeepCopy(), multiPodRuntime("leader-scheduler"), logr.Discard())
+		specs, err := isvcutils.MergeRuntimeRoleSpecs(isvc.DeepCopy(), multiPodRuntime("leader-scheduler"), logr.Discard())
+		mergedEngine := specs.Engine
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 
 		engine := newEngineFromMerged(mergedEngine, constants.OMENative)
@@ -1116,7 +1119,8 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 				Runner: &v1beta1.RunnerSpec{Container: v1.Container{Name: "ome-container", Image: "engine:latest"}},
 			},
 		}
-		mergedEngine, _, _, err := isvcutils.MergeRuntimeSpecs(isvc.DeepCopy(), rt, logr.Discard())
+		specs, err := isvcutils.MergeRuntimeRoleSpecs(isvc.DeepCopy(), rt, logr.Discard())
+		mergedEngine := specs.Engine
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 
 		engine := newEngineFromMerged(mergedEngine, constants.RawDeployment)
@@ -1127,16 +1131,18 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 	})
 }
 
-// TestEngineReconcileOMENativeSubresources_Rank0Selector pins that the
-// per-Component stable Service selector ADDS `ome.io/pod-ordinal=0`
-// when the Engine is multi-pod (Worker.Size > 0), but leaves the
-// selector broad for single-pod Engines (so SurgeThenDrain's ordinal
-// alternation doesn't zero-endpoint the Service during surge).
+// TestEngineReconcileOMENativeSubresources_LeaderSelector pins that the
+// per-Component stable Service selects only the leader pod (runner=leader
+// and pod-ordinal=0) whenever the effective engine shape is a leader/worker
+// gang, whether the InferenceService declares that shape itself or only the
+// runtime does. A single-pod engine keeps the broad selector so
+// SurgeThenDrain's ordinal alternation doesn't zero-endpoint the Service
+// during surge.
 //
-// Also pins that the PodMonitor selector NEVER carries the rank-0
-// filter — Prometheus scrapes every pod of the gang, not just the
-// leader. Workers emit per-rank metrics too.
-func TestEngineReconcileOMENativeSubresources_Rank0Selector(t *testing.T) {
+// Also pins that the PodMonitor selector NEVER carries the leader filter:
+// Prometheus scrapes every pod of the gang, and workers emit per-rank
+// metrics too.
+func TestEngineReconcileOMENativeSubresources_LeaderSelector(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
 	scheme := runtime.NewScheme()
@@ -1144,54 +1150,80 @@ func TestEngineReconcileOMENativeSubresources_Rank0Selector(t *testing.T) {
 	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
 	g.Expect(monitoringv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
 
+	enginePodSpec := func() v1beta1.PodSpec {
+		return v1beta1.PodSpec{Containers: []v1.Container{{Name: "engine", Image: "engine:v1"}}}
+	}
+	gang := func() (*v1beta1.LeaderSpec, *v1beta1.WorkerSpec) {
+		return &v1beta1.LeaderSpec{PodSpec: enginePodSpec()},
+			&v1beta1.WorkerSpec{Size: intPtr(2), PodSpec: enginePodSpec()}
+	}
+	isvcGang := func() *v1beta1.EngineSpec {
+		leader, worker := gang()
+		return &v1beta1.EngineSpec{PodSpec: enginePodSpec(), Leader: leader, Worker: worker}
+	}
+	// runtimeGang is a ServingRuntime whose engineConfig supplies the whole
+	// leader/worker shape, so the InferenceService never has to declare it.
+	runtimeGang := func() *v1beta1.ServingRuntimeSpec {
+		leader, worker := gang()
+		return &v1beta1.ServingRuntimeSpec{EngineConfig: &v1beta1.EngineSpec{
+			PodSpec: enginePodSpec(), Leader: leader, Worker: worker,
+		}}
+	}
+
 	tests := []struct {
-		name                  string
-		workerSize            *int
-		wantStableSelectorHas string
+		name string
+		// isvcEngine is the engine block as written on the InferenceService.
+		isvcEngine *v1beta1.EngineSpec
+		// runtime supplies the rest of the effective engine spec, if any.
+		runtime        *v1beta1.ServingRuntimeSpec
+		wantLeaderOnly bool
 	}{
 		{
-			name:                  "single-pod (no Worker) → no pod-ordinal filter",
-			workerSize:            nil,
-			wantStableSelectorHas: "",
+			name:       "single-pod engine keeps the broad selector",
+			isvcEngine: &v1beta1.EngineSpec{PodSpec: enginePodSpec()},
 		},
 		{
-			name:                  "multi-pod (Worker.Size=2) → pod-ordinal=0 added",
-			workerSize:            intPtr(2),
-			wantStableSelectorHas: "0",
+			name:           "leader and worker declared on the InferenceService select the leader",
+			isvcEngine:     isvcGang(),
+			wantLeaderOnly: true,
+		},
+		{
+			name:           "leader and worker supplied only by the runtime select the leader",
+			isvcEngine:     &v1beta1.EngineSpec{},
+			runtime:        runtimeGang(),
+			wantLeaderOnly: true,
+		},
+		{
+			name: "InferenceService overriding runtime fields without declaring the shape selects the leader",
+			isvcEngine: &v1beta1.EngineSpec{
+				ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(2)},
+				Runner:                 &v1beta1.RunnerSpec{Container: v1.Container{Image: "engine:override"}},
+			},
+			runtime:        runtimeGang(),
+			wantLeaderOnly: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			engineSpec := &v1beta1.EngineSpec{
-				PodSpec: v1beta1.PodSpec{
-					Containers: []v1.Container{
-						{Name: "engine", Image: "engine:v1"},
-					},
-				},
-			}
-			if tt.workerSize != nil {
-				engineSpec.Leader = &v1beta1.LeaderSpec{
-					PodSpec: v1beta1.PodSpec{
-						Containers: []v1.Container{{Name: "engine", Image: "engine:v1"}},
-					},
-				}
-				engineSpec.Worker = &v1beta1.WorkerSpec{
-					Size: tt.workerSize,
-					PodSpec: v1beta1.PodSpec{
-						Containers: []v1.Container{{Name: "engine", Image: "engine:v1"}},
-					},
-				}
-			}
-
+			g := gomega.NewGomegaWithT(t)
 			isvc := &v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-isvc", Namespace: "default",
 					UID: types.UID("test-isvc-uid"),
 				},
 				Spec: v1beta1.InferenceServiceSpec{
-					Engine: engineSpec,
+					Engine: tt.isvcEngine,
 				},
+			}
+			// The component reconciler holds the effective spec: the runtime's
+			// engineConfig with the InferenceService's engine block merged over it.
+			engineSpec := tt.isvcEngine
+			if tt.runtime != nil {
+				specs, err := isvcutils.MergeRuntimeRoleSpecs(isvc.DeepCopy(), tt.runtime, logr.Discard())
+				merged := specs.Engine
+				g.Expect(err).NotTo(gomega.HaveOccurred())
+				engineSpec = merged
 			}
 			objectMeta := metav1.ObjectMeta{
 				Name:      "test-isvc-engine",
@@ -1225,26 +1257,45 @@ func TestEngineReconcileOMENativeSubresources_Rank0Selector(t *testing.T) {
 				constants.OMEComponentLabel, string(v1beta1.EngineComponent)))
 			g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(
 				query.LabelManagedBy, query.ManagedByOMENative))
-			// Rank-0 filter (runner=leader + pod-ordinal=0) present only when
-			// multi-pod. runner=leader is required because pod-ordinal is
-			// numbered per runner, so the rank-0 worker also carries ordinal 0.
-			if tt.wantStableSelectorHas == "" {
-				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelPodOrdinal),
-					"single-pod Service selector must NOT carry %s", query.LabelPodOrdinal)
-				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelRunner),
-					"single-pod Service selector must NOT carry %s", query.LabelRunner)
-			} else {
-				g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(
-					query.LabelPodOrdinal, tt.wantStableSelectorHas),
-					"multi-pod Service selector must carry %s=%s",
-					query.LabelPodOrdinal, tt.wantStableSelectorHas)
+
+			// Pod label sets as the OMENative renderer stamps them: the runner
+			// name and a per-runner ordinal on every pod of the Component.
+			podLabels := func(runner v1beta1.RunnerName, ordinal string) labels.Set {
+				return labels.Set{
+					constants.InferenceServicePodLabelKey: "test-isvc",
+					constants.OMEComponentLabel:           string(v1beta1.EngineComponent),
+					query.LabelManagedBy:                  query.ManagedByOMENative,
+					query.LabelRunner:                     string(runner),
+					query.LabelPodOrdinal:                 ordinal,
+				}
+			}
+			selector := labels.SelectorFromSet(svc.Spec.Selector)
+			if tt.wantLeaderOnly {
 				g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(
 					query.LabelRunner, string(v1beta1.RunnerNameLeader)),
 					"multi-pod Service selector must carry %s=leader so it can't match a worker",
 					query.LabelRunner)
+				g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(query.LabelPodOrdinal, "0"),
+					"multi-pod Service selector must pin the leader to ordinal 0")
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameLeader, "0"))).To(gomega.BeTrue(),
+					"the leader pod must be an endpoint")
+				// Ordinals are numbered per runner, so the rank-0 worker also
+				// carries ordinal 0; only the runner key keeps it out.
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameWorker, "0"))).To(gomega.BeFalse(),
+					"a worker pod must never be an endpoint")
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameWorker, "1"))).To(gomega.BeFalse(),
+					"a worker pod must never be an endpoint")
+			} else {
+				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelPodOrdinal),
+					"single-pod Service selector must NOT carry %s", query.LabelPodOrdinal)
+				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelRunner),
+					"single-pod Service selector must NOT carry %s", query.LabelRunner)
+				// SurgeThenDrain alternates a single pod between ordinals 0 and 1.
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameDefault, "0"))).To(gomega.BeTrue())
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameDefault, "1"))).To(gomega.BeTrue())
 			}
 
-			// PodMonitor selector NEVER carries the rank-0 filter —
+			// PodMonitor selector NEVER carries the leader filter —
 			// Prometheus scrapes per pod, not per load-balancer endpoint.
 			pm := &monitoringv1.PodMonitor{}
 			g.Expect(c.Get(context.Background(),
@@ -1593,7 +1644,7 @@ func TestEngineResourceMerging(t *testing.T) {
 				tt.engineSpec,
 			).(*Engine)
 
-			// Call reconcilePodSpec which internally calls MergeEngineResources
+			// Call reconcilePodSpec which internally calls MergeRoleResources
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
 			podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
@@ -1769,7 +1820,7 @@ func TestEngineAffinityMerging(t *testing.T) {
 				tt.engineSpec,
 			).(*Engine)
 
-			// Call reconcilePodSpec which internally calls UpdateEngineAffinity
+			// Call reconcilePodSpec which internally calls UpdateRoleAffinity
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
 			podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
@@ -1782,7 +1833,7 @@ func TestEngineAffinityMerging(t *testing.T) {
 	}
 }
 
-// Note: Worker resource and affinity tests are not included because MergeEngineResources and
-// UpdateEngineAffinity check isvc.Spec.Engine.Runner and isvc.Spec.Engine.PodSpec.Affinity,
+// Note: Worker resource and affinity tests are not included because MergeRoleResources and
+// UpdateRoleAffinity check isvc.Spec.Engine.Runner and isvc.Spec.Engine.PodSpec.Affinity,
 // not the worker-specific fields. This means the merging decision is based on the engine/leader
 // spec, not the worker spec. This is the current implementation behavior.

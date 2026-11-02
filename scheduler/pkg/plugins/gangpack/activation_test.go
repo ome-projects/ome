@@ -267,7 +267,7 @@ func TestPreFilter_AffinityToUnplacedSibling_YieldsWithoutAssignment(t *testing.
 		if readAssignment(state) != nil {
 			t.Fatalf("attempt %d wrote a cycle assignment %+v while yielding", attempt, readAssignment(state))
 		}
-		if _, assigned := g.assignments.Get("team/pf"); assigned {
+		if _, assigned := assignedDomain(g.assignments, "team/pf"); assigned {
 			t.Fatalf("attempt %d assigned the gang while yielding", attempt)
 		}
 		if _, hadFailed := g.withoutFailedDomains(gang, topology.FreeByDomain{"a": 2}); hadFailed {
@@ -342,7 +342,7 @@ func TestPreFilter_AffinityTermNotOnUnplacedSibling_PlansDomain(t *testing.T) {
 // rejection retry at once instead of parking.
 func TestPermit_IncompleteGang_ActivatesOnlyHeldSiblings(t *testing.T) {
 	assignments := placement.New()
-	_, token, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, token, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 3}, map[string][]string{"a": {"a1", "a2", "a3"}}, 3)
 	if !ok {
 		t.Fatal("failed to reserve gang")

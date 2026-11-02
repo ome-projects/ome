@@ -84,17 +84,6 @@ func (f *runtimeFixture) namespaced() *v1beta1.ServingRuntime {
 	return local
 }
 
-func runtimeScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	s := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{v1beta1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme} {
-		if err := add(s); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return s
-}
-
 func TestResolveRuntime(t *testing.T) {
 	for _, tt := range []struct {
 		name          string

@@ -17,7 +17,7 @@ func componentSplitSource(engine, decoder int, engineWeights, decoderWeights map
 	source := ratioSplitSource(engine, ptr.To(decoder))
 	source.Spec.Placement.ClusterAffinity = weightedAffinity(engineWeights)
 	for i, name := range []string{"member-a", "member-b"} {
-		source.Spec.Placement.ClusterAffinity[i].Weights = &v1beta1.ClusterAffinityWeights{Decoder: ptr.To(decoderWeights[name])}
+		source.Spec.Placement.ClusterAffinity[i].Weights.Decoder = ptr.To(decoderWeights[name])
 	}
 	return source
 }
@@ -39,7 +39,7 @@ func settledFloors(t *testing.T, source *v1beta1.InferenceService) (map[string]c
 	candidates := settledCandidates(proposal.Assignments)
 	out := map[string]componentFloors{}
 	for _, candidate := range candidates {
-		floors, err := splitMemberFloors(source, candidates, candidate)
+		floors, err := splitMemberFloors(source, candidates, candidate, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", candidate.Cluster, err)
 		}
@@ -77,7 +77,7 @@ func TestSplitByComponentWeights(t *testing.T) {
 			want: map[string]componentFloors{"member-a": {1, 3}, "member-b": {0, 0}}},
 		{name: "a decoder share above its scaled ceiling holds the plan", source: func() *v1beta1.InferenceService {
 			source := componentSplitSource(4, 12, even, map[string]int32{"member-a": 3, "member-b": 1})
-			source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: 2}
+			source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(2)}
 			return source
 		}, wantErr: `decoder share 9 on cluster "member-a" exceeds its ceiling of 6 replicas`},
 		{name: "fewer decoders than engine members holds the plan", source: func() *v1beta1.InferenceService {
@@ -124,7 +124,7 @@ func TestEqualDecoderWeightsMatchTheEngineWeightsAlone(t *testing.T) {
 			perComponent := componentSplitSource(tt.engine, tt.decoder, tt.weights, tt.weights)
 			for _, source := range []*v1beta1.InferenceService{shared, perComponent} {
 				if tt.splitReplicasSet > 0 || tt.maxPerCluster > 0 {
-					source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: tt.maxPerCluster}
+					source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(tt.maxPerCluster)}
 					if tt.splitReplicasSet > 0 {
 						source.Spec.Placement.Split.Replicas = ptr.To(tt.splitReplicasSet)
 					}
@@ -148,14 +148,12 @@ func TestComponentMatchesArePersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []v1beta1.ComponentAffinityMatch{{Component: v1beta1.DecoderComponent, Weight: ptr.To[int64](3)}}
+	want := []v1beta1.ComponentAffinityMatch{{Component: v1beta1.DecoderComponent, Weight: ptr.To[int64](3), MinWeight: ptr.To[int64](3)}}
 	if diff := cmp.Diff(want, perComponent.Assignments["member-b"].ComponentMatches); diff != "" {
 		t.Errorf("member-b component matches (-want +got):\n%s", diff)
 	}
 
-	shared := ratioSplitSource(4, ptr.To(12))
-	shared.Spec.Placement.ClusterAffinity = weightedAffinity(twoToOne)
-	proposal, err := desiredSplitPlan(shared, twoMembers(), nil)
+	proposal, err := desiredSplitPlan(ratioSplitSource(4, ptr.To(12)), twoMembers(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +216,7 @@ func TestServingFloorsFollowTheServiceRatio(t *testing.T) {
 			components := []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}
 			got := map[string]int32{}
 			for _, candidate := range candidates {
-				floors, err := splitMemberFloors(tt.source, candidates, candidate)
+				floors, err := splitMemberFloors(tt.source, candidates, candidate, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -286,7 +284,7 @@ func threeMemberMinimums(t *testing.T, engine, decoder int, decoderWeights [3]in
 	}
 	out := map[string]copyMinimums{}
 	for _, candidate := range candidates {
-		bounds, err := splitPlannedBounds(source, candidates, candidate)
+		bounds, err := splitPlannedBounds(source, candidates, candidate, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", candidate.Cluster, err)
 		}

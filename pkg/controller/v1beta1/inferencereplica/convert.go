@@ -163,6 +163,9 @@ func (r *Reconciler) buildReconcileInput(ctx context.Context, ir *v1beta1.Infere
 		// gang-level holds. Zero (unconfigured) leaves an unplaceable pod
 		// or gang parking the deadline until an operator acts.
 		UnschedulableGrace: settings.Unschedulable,
+		// Shorter window for a gang held to a domain that cannot take it.
+		// Zero (unconfigured) leaves such a hold on UnschedulableGrace.
+		GangDomainFullGrace: settings.GangDomainFull,
 		// Termination grace of a replacement a rollout abandons before it
 		// ever served. Zero (unconfigured) leaves such a pod its own grace.
 		AbandonedReplacementGrace: settings.AbandonedReplacement,
@@ -314,6 +317,12 @@ func (r *Reconciler) warnInstanceFailedFunc(ir *v1beta1.InferenceReplica, eventT
 	}
 }
 
+// retryHeldMsg formats the operator-facing RetryHeld Warning. A Held block
+// stays until a new target revision arrives or an operator releases it, so
+// the message names both exits; raising the retry limits releases nothing.
+const retryHeldMsg = "InferenceReplica %s/%s component=%s update to revision %s held after %d failed attempt(s) (last failure: %s); " +
+	"publish a corrected revision, or fix the cause and set annotation %s=%s on the InferenceReplica to release the hold"
+
 // warnRetryHeldFunc returns the WarnRetryHeld closure: surface the
 // terminal same-target retry exhaustion (RetryBlock → Held) on the
 // controller log and as a RetryHeld Warning against eventTarget. The
@@ -329,9 +338,9 @@ func (r *Reconciler) warnRetryHeldFunc(ir *v1beta1.InferenceReplica, eventTarget
 		if r.Recorder == nil {
 			return
 		}
-		r.Recorder.Eventf(eventTarget, corev1.EventTypeWarning, string(workloadtypes.EventReasonRetryHeld),
-			"InferenceReplica %s/%s component=%s update to revision %s held after %d failed attempt(s) (last failure: %s); publish a corrected revision or raise lifecycle.updateRetry limits",
-			ir.Namespace, ir.Name, ir.Spec.Component, targetRevision, attempts, reason)
+		r.Recorder.Eventf(eventTarget, corev1.EventTypeWarning, string(workloadtypes.EventReasonRetryHeld), retryHeldMsg,
+			ir.Namespace, ir.Name, ir.Spec.Component, targetRevision, attempts, reason,
+			constants.ReleaseHeldRevisionAnnotationKey, targetRevision)
 	}
 }
 
@@ -416,7 +425,7 @@ func desiredFromIR(ir *v1beta1.InferenceReplica, runners []v1beta1.Runner) workl
 		desired.Lifecycle = v1beta1convert.LifecycleSpecToWorkload(*ir.Spec.Lifecycle)
 	}
 	// The per-role PodSpec and ObjectMeta come off the runners through the
-	// one reader the revision hash and the projector's template stamp share.
+	// one reader the revision hash and the projector's template hash share.
 	templates := v1beta1convert.PodTemplatesOf(runners)
 	desired.PodSpec = templates.Primary
 	desired.PodTemplateObjectMeta = templates.Meta
@@ -1385,7 +1394,7 @@ func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Read
 	}
 }
 
-// templateHashOf is the pod-template hash the projector stamped on a
+// templateHashOf is the pod-template hash the projector wrote on a
 // replica's spec, "" on a replica no projector writes.
 func templateHashOf(ir *v1beta1.InferenceReplica) string {
 	return ir.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]

@@ -45,10 +45,12 @@ type Selector interface {
 	// return reports whether the resolved runtime was cluster-scoped.
 	GetRuntime(ctx context.Context, name string, namespace string, kind string) (*v1beta1.ServingRuntimeSpec, bool, error)
 
-	// GetSupportedModelFormat picks the best SupportedModelFormat for a
-	// runtime-model pair. When userSpecifiedRuntime is true all
-	// SupportedModelFormats are considered; otherwise only ones with
-	// AutoSelect=true are eligible (matching SelectRuntime's behaviour).
+	// GetSupportedModelFormat picks the SupportedModelFormat a pod renders
+	// with. For an auto-selected runtime (userSpecifiedRuntime false) it
+	// reads the formats as SelectRuntime's ranking does, only those marked
+	// autoSelect: true and each at its own priority, so the result is the
+	// format that gave the runtime its score. For a named runtime every
+	// format is considered at the default priority.
 	GetSupportedModelFormat(ctx context.Context, runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, userSpecifiedRuntime bool) *v1beta1.SupportedModelFormat
 }
 
@@ -111,27 +113,54 @@ func (c *RuntimeCollection) forEach(fn func(name string, spec *v1beta1.ServingRu
 	}
 }
 
-// RuntimeMatcher handles compatibility checking between runtimes and models.
+// RuntimeMatcher answers whether a runtime serves a model for a service,
+// and why not.
 type RuntimeMatcher interface {
+	// IsCompatible is GetCompatibilityDetails's answer as a bool. The error
+	// is set only when the runtime will not serve the service at all: a
+	// RuntimeDisabledError for a disabled runtime, a RuntimeCompatibilityError
+	// for one that does not declare the service's accelerator class or
+	// deployment mode. A model that no format or the size range fits gives
+	// false and a nil error.
 	IsCompatible(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (bool, error)
 
-	// GetCompatibilityDetails returns the same compatible/incompatible verdict
-	// as IsCompatible, plus per-dimension match info and the
-	// human-readable reasons exposed in NoRuntimeFoundError.
+	// GetCompatibilityDetails runs the compatibility checks in order and
+	// reports the first one the runtime failed with its reason, or the
+	// format match that made the runtime compatible. The reasons are the
+	// texts NoRuntimeFoundError lists per excluded runtime.
 	GetCompatibilityDetails(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (*CompatibilityReport, error)
 }
 
-// CompatibilityReport provides detailed compatibility analysis.
+// CompatibilityReport is one runtime's answer for one model and service:
+// compatible, with the details of the format match, or the first failed
+// check with its reason.
 type CompatibilityReport struct {
 	IsCompatible           bool
 	MatchDetails           MatchDetails
 	IncompatibilityReasons []string
 	Warnings               []string
+
+	failedCheck compatibilityCheck
 }
+
+// compatibilityCheck names the check an incompatible report stopped at. The
+// zero value means no check failed. The checks run in this order: the first
+// three compare the runtime with the service, the last two with the model.
+type compatibilityCheck int
+
+const (
+	runtimeDisabled compatibilityCheck = iota + 1
+	acceleratorClassNotServed
+	deploymentModeMismatch
+	modelFormatNotSupported
+	modelSizeOutOfRange
+)
 
 // RuntimeScorer calculates scores for runtime-model pairs.
 type RuntimeScorer interface {
-	// CalculateScore returns a score >= 0; higher means a better match.
+	// CalculateScore returns the best score among the formats marked
+	// autoSelect: true, each at its own priority, or 0 when none fits the
+	// model; higher means a better match.
 	CalculateScore(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec) (int64, error)
 
 	// CompareRuntimes returns positive if r1 is better, negative if r2 is

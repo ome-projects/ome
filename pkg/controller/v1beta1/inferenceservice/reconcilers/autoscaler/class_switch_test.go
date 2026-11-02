@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -730,6 +731,103 @@ func TestPlanScaledObjectHPA(t *testing.T) {
 			assert.Equal(t, tt.want, planScaledObjectHPA(p, tt.liveSO, tt.hpa))
 		})
 	}
+}
+
+// longSwitchName is a Component name for which KEDA's own HPA name,
+// "keda-hpa-scaledobject-" plus the Component name, is 64 characters: one
+// more than KEDA's webhook accepts.
+const longSwitchName = "team-a-example-model-shared-shadow-decoder"
+
+func longSwitchParams(c client.Client, autoscaler *v1beta1.ComponentAutoscaler) DispatchParams {
+	p := switchParams(c, autoscaler)
+	p.Name = longSwitchName
+	p.Owner = dispatchOwner(longSwitchName)
+	p.ScaleTargetRef = dispatchScaleTargetRef(longSwitchName)
+	return p
+}
+
+func TestPlanScaledObjectHPA_LongComponentName(t *testing.T) {
+	shortened := keda.ShortenedHPAName(utils.GetScaledObjectName(longSwitchName))
+	require.NotEmpty(t, shortened, "test setup: KEDA's own HPA name must be too long")
+	liveWith := func(name string) *kedav1.ScaledObject {
+		so := &kedav1.ScaledObject{ObjectMeta: metav1.ObjectMeta{UID: "live-scaledobject-uid"}}
+		if name != "" {
+			so.Spec.Advanced = &kedav1.AdvancedConfig{HorizontalPodAutoscalerConfig: &kedav1.HorizontalPodAutoscalerConfig{Name: name}}
+		}
+		return so
+	}
+	tests := []struct {
+		name      string
+		requested *v1beta1.ComponentAutoscaler
+		liveSO    *kedav1.ScaledObject
+		hpa       componentHPA
+		want      scaledObjectHPAPlan
+	}{
+		{
+			name:      "new ScaledObject, no HPA, gets the shortened name",
+			requested: kedaClass(),
+			want:      scaledObjectHPAPlan{hpaName: shortened},
+		},
+		{
+			name:      "new ScaledObject replacing an HPA for another target gets the shortened name",
+			requested: kedaClass(),
+			hpa:       componentHPA{control: hpaControlledByWorkload},
+			want:      scaledObjectHPAPlan{hpaName: shortened, deleteAfterWrite: true},
+		},
+		{
+			name:      "new ScaledObject after an earlier ScaledObject gets the shortened name",
+			requested: kedaClass(),
+			hpa:       componentHPA{control: hpaLeftByScaledObject, targetMatches: true},
+			want:      scaledObjectHPAPlan{hpaName: shortened, deleteBeforeWrite: true},
+		},
+		{
+			name:      "new ScaledObject still takes over the working HPA by the Component name",
+			requested: kedaClass(),
+			hpa:       componentHPA{control: hpaControlledByWorkload, targetMatches: true},
+			want:      scaledObjectHPAPlan{hpaName: longSwitchName, takeOver: true},
+		},
+		{
+			name:      "a requested name wins over the shortened name",
+			requested: kedaClassWithHPAName("custom"),
+			want:      scaledObjectHPAPlan{hpaName: "custom"},
+		},
+		{
+			name:      "live ScaledObject keeps the shortened name",
+			requested: kedaClass(),
+			liveSO:    liveWith(shortened),
+			hpa:       componentHPA{},
+			want:      scaledObjectHPAPlan{hpaName: shortened},
+		},
+		{
+			name:      "dropping a requested name moves to the shortened name",
+			requested: kedaClass(),
+			liveSO:    liveWith("custom"),
+			want:      scaledObjectHPAPlan{hpaName: shortened},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := longSwitchParams(fake.NewClientBuilder().WithScheme(dispatchScheme(t)).Build(), tt.requested)
+			assert.Equal(t, tt.want, planScaledObjectHPA(p, tt.liveSO, tt.hpa))
+		})
+	}
+}
+
+func TestDispatchKEDA_LongComponentNameGetsAShortHPAName(t *testing.T) {
+	writes := &scalerWrites{}
+	c := switchClient(t, writes)
+	soName := utils.GetScaledObjectName(longSwitchName)
+
+	require.NoError(t, DispatchAutoscaler(context.Background(), longSwitchParams(c, kedaClass())))
+	require.NoError(t, DispatchAutoscaler(context.Background(), longSwitchParams(c, kedaClass())))
+
+	assert.Equal(t, []string{"create ScaledObject " + soName}, writes.log, "the second pass writes nothing")
+	so := &kedav1.ScaledObject{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: switchNS, Name: soName}, so))
+	hpaName := keda.ConfiguredHPAName(so.Spec.Advanced)
+	assert.Equal(t, keda.ShortenedHPAName(soName), hpaName)
+	assert.Empty(t, validation.IsDNS1123Label(hpaName), "KEDA's webhook accepts only HPA names that are DNS labels")
+	assert.NotContains(t, so.Annotations, kedav1.ScaledObjectTransferHpaOwnershipAnnotation, "there is no HPA to take over")
 }
 
 func TestSameScaleTarget(t *testing.T) {

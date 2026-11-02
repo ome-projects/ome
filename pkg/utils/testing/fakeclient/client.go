@@ -14,6 +14,9 @@
 // Wrap layers the same behaviours over a client that exists already, so one
 // store can be read through two views that misbehave differently, as a
 // reconciler's cache and its direct API reader do.
+//
+// RecordedEvents reads what a FakeRecorder holds, so every test checks the
+// events a pass emitted the same way.
 package fakeclient
 
 import (

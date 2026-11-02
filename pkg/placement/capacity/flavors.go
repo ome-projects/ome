@@ -1,10 +1,6 @@
 package capacity
 
 import (
-	"cmp"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"maps"
 	"slices"
@@ -30,87 +26,120 @@ func AttributeUnit(unit UnitDemand, flavors []quotacapacity.Flavor, reports []v1
 	if err != nil {
 		return Demand{}, err
 	}
-	keys := sets.New[string]()
-	for _, flavor := range flavors {
-		for key := range flavor.NodeLabels {
-			keys.Insert(key)
-		}
-	}
+	keys := flavorLabelKeys(flavors)
 	pools := map[pair]Pool{}
 	seen := map[string]bool{}
 	for _, pod := range unit.Pods {
 		id := string(pod.Component) + "/" + pod.Name
-		if pod.Spec == nil || pod.Name == "" || pod.Count <= 0 || seen[id] ||
-			(pod.Component != v1beta1.EngineComponent && pod.Component != v1beta1.DecoderComponent) {
+		if !validMeasuredPodSet(pod) || seen[id] {
 			return Demand{}, fmt.Errorf("invalid measured pod set %q", id)
 		}
 		seen[id] = true
 		if len(pod.Requests) == 0 {
 			continue
 		}
-		selector, err := hardwareSelector(pod.Spec, keys)
+		flavor, err := flavorFor(id, pod.Spec, flavors, keys)
 		if err != nil {
-			return Demand{}, fmt.Errorf("pod set %s: %w", id, err)
-		}
-		var selected *quotacapacity.Flavor
-		for i := range flavors {
-			flavor := &flavors[i]
-			matches, err := selector.Match(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: flavor.NodeLabels}})
-			if err != nil {
-				return Demand{}, fmt.Errorf("pod set %s: %w", id, err)
-			}
-			if matches {
-				if selected != nil {
-					return Demand{}, fmt.Errorf("pod set %s matches multiple hardware flavors", id)
-				}
-				selected = flavor
-			}
-		}
-		if selected == nil {
-			return Demand{}, fmt.Errorf("pod set %s has no compatible hardware flavor", id)
+			return Demand{}, err
 		}
 		for name, quantity := range pod.Requests {
 			demand, exact := wholeUnits(quantity)
 			if !isExtendedResource(name) || !exact || demand <= 0 {
 				return Demand{}, fmt.Errorf("pod set %s has invalid accelerator demand for %s", id, name)
 			}
-			key := pair{resource: string(name), flavor: selected.Name}
-			row, exists := rows[key]
-			if !exists || !row.Attribution.Complete {
-				return Demand{}, fmt.Errorf("complete hardware attribution is missing for %s/%s", name, selected.Name)
+			key := pair{resource: string(name), flavor: flavor.Name}
+			if row, exists := rows[key]; !exists || !row.Attribution.Complete {
+				return Demand{}, fmt.Errorf("complete hardware attribution is missing for %s/%s", name, flavor.Name)
 			}
-			pool, exists := pools[key]
-			if !exists {
-				pool = Pool{ResourceName: string(name), ResourceFlavor: selected.Name, FlavorUID: selected.UID,
-					NodeLabels: maps.Clone(selected.NodeLabels), FlavorSetHash: mapping}
+			if err := addPoolDemand(pools, key, flavor, mapping, demand); err != nil {
+				return Demand{}, err
 			}
-			pool.Quantity.Add(*resource.NewQuantity(demand, resource.DecimalSI))
-			if _, exact := wholeUnits(pool.Quantity); !exact {
-				return Demand{}, fmt.Errorf("combined demand exceeds whole int64 units for %s/%s", name, selected.Name)
-			}
-			pools[key] = pool
 		}
 	}
 	if len(pools) == 0 {
 		return Demand{}, fmt.Errorf("replica unit has no accelerator pools")
 	}
-	out := Demand{Pools: slices.Collect(maps.Values(pools)), PrimaryUnits: max(unit.PrimaryUnits, 1)}
-	slices.SortFunc(out.Pools, func(a, b Pool) int {
-		if order := cmp.Compare(a.ResourceName, b.ResourceName); order != 0 {
-			return order
-		}
-		return cmp.Compare(a.ResourceFlavor, b.ResourceFlavor)
-	})
-	encoded, err := json.Marshal(struct {
+	out := Demand{Pools: sortedPools(pools), PrimaryUnits: max(unit.PrimaryUnits, 1)}
+	out.Fingerprint, err = fingerprint(struct {
 		Unit, Mapping string
 		Pools         []Pool
 	}{unit.Fingerprint, mapping, out.Pools})
 	if err != nil {
 		return Demand{}, err
 	}
-	sum := sha256.Sum256(encoded)
-	out.Fingerprint = hex.EncodeToString(sum[:])
 	return out, nil
+}
+
+// validMeasuredPodSet reports whether a measured pod set is an engine or
+// decoder set with a name, a positive count and a rendered spec.
+func validMeasuredPodSet(pod PodDemand) bool {
+	return pod.Spec != nil && pod.Name != "" && pod.Count > 0 &&
+		(pod.Component == v1beta1.EngineComponent || pod.Component == v1beta1.DecoderComponent)
+}
+
+// flavorLabelKeys is the set of node-label keys the catalog uses; only those
+// keys of a pod's scheduling constraints select hardware.
+func flavorLabelKeys(flavors []quotacapacity.Flavor) sets.Set[string] {
+	keys := sets.New[string]()
+	for _, flavor := range flavors {
+		for key := range flavor.NodeLabels {
+			keys.Insert(key)
+		}
+	}
+	return keys
+}
+
+// flavorFor selects the one flavor whose node labels satisfy the pod's
+// hardware constraints; no match or more than one is an error.
+func flavorFor(id string, spec *corev1.PodSpec, flavors []quotacapacity.Flavor, keys sets.Set[string]) (*quotacapacity.Flavor, error) {
+	selector, err := hardwareSelector(spec, keys)
+	if err != nil {
+		return nil, fmt.Errorf("pod set %s: %w", id, err)
+	}
+	var selected *quotacapacity.Flavor
+	for i := range flavors {
+		flavor := &flavors[i]
+		matches, err := selector.Match(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: flavor.NodeLabels}})
+		if err != nil {
+			return nil, fmt.Errorf("pod set %s: %w", id, err)
+		}
+		if !matches {
+			continue
+		}
+		if selected != nil {
+			return nil, fmt.Errorf("pod set %s matches multiple hardware flavors", id)
+		}
+		selected = flavor
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("pod set %s has no compatible hardware flavor", id)
+	}
+	return selected, nil
+}
+
+// addPoolDemand adds whole accelerator units to the pool of one resource and
+// flavor, creating the pool from the flavor's identity on first use.
+func addPoolDemand(pools map[pair]Pool, key pair, flavor *quotacapacity.Flavor, mapping string, demand int64) error {
+	pool, exists := pools[key]
+	if !exists {
+		pool = Pool{ResourceName: key.resource, ResourceFlavor: key.flavor, FlavorUID: flavor.UID,
+			NodeLabels: maps.Clone(flavor.NodeLabels), FlavorSetHash: mapping}
+	}
+	pool.Quantity.Add(*resource.NewQuantity(demand, resource.DecimalSI))
+	if _, exact := wholeUnits(pool.Quantity); !exact {
+		return fmt.Errorf("combined demand exceeds whole int64 units for %s/%s", key.resource, key.flavor)
+	}
+	pools[key] = pool
+	return nil
+}
+
+// sortedPools lists the pools by resource name, then flavor name.
+func sortedPools(pools map[pair]Pool) []Pool {
+	out := slices.Collect(maps.Values(pools))
+	slices.SortFunc(out, func(a, b Pool) int {
+		return pair{a.ResourceName, a.ResourceFlavor}.compare(pair{b.ResourceName, b.ResourceFlavor})
+	})
+	return out
 }
 
 func verifiedMapping(flavors []quotacapacity.Flavor, reports []v1beta1.AcceleratorCapacityStatus) (string, map[pair]v1beta1.AcceleratorCapacityStatus, error) {

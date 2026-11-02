@@ -47,99 +47,88 @@ func NewRBACReconciler(
 }
 
 // Reconcile ensures the RBAC resources are created and configured correctly
-func (r *RBACReconciler) Reconcile() error {
+func (r *RBACReconciler) Reconcile(ctx context.Context) error {
 	r.Log.V(1).Info("Reconciling RBAC resources", "name", r.objectMeta.Name, "namespace", r.objectMeta.Namespace, "component", r.componentType)
 
-	serviceAccountName := r.GetServiceAccountName()
-
-	// Create ServiceAccount
-	sa := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceAccountName,
-			Namespace: r.objectMeta.Namespace,
-			Labels:    r.objectMeta.Labels,
-		},
-	}
-
-	// Set owner reference
-	if len(r.objectMeta.OwnerReferences) > 0 {
-		sa.OwnerReferences = r.objectMeta.OwnerReferences
-	} else if err := controllerutil.SetControllerReference(r.inferenceService, sa, r.scheme); err != nil {
-		return fmt.Errorf("failed to set owner reference for ServiceAccount: %w", err)
-	}
-
-	// Create or update ServiceAccount
-	if err := r.createOrUpdate(sa); err != nil {
-		return fmt.Errorf("failed to reconcile ServiceAccount: %w", err)
-	}
-
-	// Only create Role and RoleBinding for Router component
-	if r.componentType == v1beta1.RouterComponent {
-		roleName := serviceAccountName
-		// Create Role
-		role := &rbacv1.Role{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      roleName,
-				Namespace: r.objectMeta.Namespace,
-				Labels:    r.objectMeta.Labels,
-			},
-			Rules: []rbacv1.PolicyRule{
-				{
-					APIGroups: []string{""},
-					Resources: []string{"pods"},
-					Verbs:     []string{"get", "list", "watch"},
-				},
-			},
+	for _, obj := range r.desiredObjects() {
+		kind := resourceKind(obj)
+		if err := r.setOwner(obj); err != nil {
+			return fmt.Errorf("failed to set owner reference for %s: %w", kind, err)
 		}
-
-		// Set owner reference
-		if len(r.objectMeta.OwnerReferences) > 0 {
-			role.OwnerReferences = r.objectMeta.OwnerReferences
-		} else if err := controllerutil.SetControllerReference(r.inferenceService, role, r.scheme); err != nil {
-			return fmt.Errorf("failed to set owner reference for Role: %w", err)
-		}
-
-		// Create or update Role
-		if err := r.createOrUpdate(role); err != nil {
-			return fmt.Errorf("failed to reconcile Role: %w", err)
-		}
-
-		// Create RoleBinding
-		roleBinding := &rbacv1.RoleBinding{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      roleName,
-				Namespace: r.objectMeta.Namespace,
-				Labels:    r.objectMeta.Labels,
-			},
-			RoleRef: rbacv1.RoleRef{
-				APIGroup: rbacv1.GroupName,
-				Kind:     "Role",
-				Name:     roleName,
-			},
-			Subjects: []rbacv1.Subject{
-				{
-					Kind:      "ServiceAccount",
-					Name:      serviceAccountName,
-					Namespace: r.objectMeta.Namespace,
-				},
-			},
-		}
-
-		// Set owner reference
-		if len(r.objectMeta.OwnerReferences) > 0 {
-			roleBinding.OwnerReferences = r.objectMeta.OwnerReferences
-		} else if err := controllerutil.SetControllerReference(r.inferenceService, roleBinding, r.scheme); err != nil {
-			return fmt.Errorf("failed to set owner reference for RoleBinding: %w", err)
-		}
-
-		// Create or update RoleBinding
-		if err := r.createOrUpdate(roleBinding); err != nil {
-			return fmt.Errorf("failed to reconcile RoleBinding: %w", err)
+		if err := r.createOrUpdate(ctx, obj); err != nil {
+			return fmt.Errorf("failed to reconcile %s: %w", kind, err)
 		}
 	}
 
 	r.Log.V(1).Info("Successfully reconciled RBAC resources", "name", r.objectMeta.Name, "namespace", r.objectMeta.Namespace)
 	return nil
+}
+
+// desiredObjects lists the objects the component owns, in the order they are
+// written: the ServiceAccount every component runs as, and for the router the
+// Role and RoleBinding that let it read the pods it routes to.
+func (r *RBACReconciler) desiredObjects() []client.Object {
+	name := r.GetServiceAccountName()
+	objects := []client.Object{r.serviceAccount(name)}
+	if r.componentType == v1beta1.RouterComponent {
+		objects = append(objects, r.podReaderRole(name), r.podReaderRoleBinding(name))
+	}
+	return objects
+}
+
+func (r *RBACReconciler) serviceAccount(name string) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{ObjectMeta: r.metadata(name)}
+}
+
+func (r *RBACReconciler) podReaderRole(name string) *rbacv1.Role {
+	return &rbacv1.Role{
+		ObjectMeta: r.metadata(name),
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+		},
+	}
+}
+
+func (r *RBACReconciler) podReaderRoleBinding(name string) *rbacv1.RoleBinding {
+	return &rbacv1.RoleBinding{
+		ObjectMeta: r.metadata(name),
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     name,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      name,
+				Namespace: r.objectMeta.Namespace,
+			},
+		},
+	}
+}
+
+// metadata names an owned object in the component's namespace with the
+// component's labels.
+func (r *RBACReconciler) metadata(name string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{
+		Name:      name,
+		Namespace: r.objectMeta.Namespace,
+		Labels:    r.objectMeta.Labels,
+	}
+}
+
+// setOwner gives an owned object the component's owner references when the
+// component has any, and otherwise makes the InferenceService its controller.
+func (r *RBACReconciler) setOwner(obj client.Object) error {
+	if len(r.objectMeta.OwnerReferences) > 0 {
+		obj.SetOwnerReferences(r.objectMeta.OwnerReferences)
+		return nil
+	}
+	return controllerutil.SetControllerReference(r.inferenceService, obj, r.scheme)
 }
 
 // GetServiceAccountName returns the name of the ServiceAccount using inference service name + component name
@@ -151,17 +140,17 @@ func (r *RBACReconciler) GetServiceAccountName() string {
 // Update only when the live object differs from the desired one in a field OME
 // manages. This avoids a no-op PUT (and the accompanying log line) on every
 // reconcile when nothing has changed.
-func (r *RBACReconciler) createOrUpdate(obj client.Object) error {
+func (r *RBACReconciler) createOrUpdate(ctx context.Context, obj client.Object) error {
 	key := client.ObjectKeyFromObject(obj)
 	kind := resourceKind(obj)
 	existing := obj.DeepCopyObject().(client.Object)
 
-	err := r.client.Get(context.Background(), key, existing)
+	err := r.client.Get(ctx, key, existing)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Create the resource
 			r.Log.Info("Creating resource", "kind", kind, "name", obj.GetName())
-			return r.client.Create(context.Background(), obj)
+			return r.client.Create(ctx, obj)
 		}
 		return err
 	}
@@ -175,7 +164,7 @@ func (r *RBACReconciler) createOrUpdate(obj client.Object) error {
 	// Update the resource
 	r.Log.Info("Updating resource", "kind", kind, "name", obj.GetName())
 	obj.SetResourceVersion(existing.GetResourceVersion())
-	return r.client.Update(context.Background(), obj)
+	return r.client.Update(ctx, obj)
 }
 
 // resourceKind derives a human-readable kind for logging. Typed objects built

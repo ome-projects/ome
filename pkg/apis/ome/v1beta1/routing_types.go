@@ -148,7 +148,9 @@ type RoutingCapacitySpec struct {
 	// Mode selects a replica ceiling or an authoritative reported weight.
 	// Unset preserves Ceiling. In Reported mode a home's accepted report is its
 	// capacity in replicas, neither capped by its replica count nor scaled by
-	// its capacity factor. A home without one keeps its replica-based weight.
+	// its capacity factor. A positive report applies only while placement
+	// status shows a ready replica in that cluster. A home without an applied
+	// report keeps its replica-based weight.
 	// +optional
 	Mode RoutingCapacityMode `json:"mode,omitempty"`
 

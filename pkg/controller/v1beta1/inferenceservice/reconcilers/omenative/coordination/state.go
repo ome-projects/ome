@@ -1,9 +1,12 @@
 package coordination
 
 import (
+	"cmp"
+	"slices"
 	"time"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // ComponentObservation captures the inputs the state machine reads for
@@ -78,9 +81,17 @@ type ComponentObservation struct {
 	// done: the Ready condition's last transition to True, which the replica
 	// writes once every Instance is Ready on the target or, under a
 	// partition, at its staged shape. Zero while the condition is not True.
-	// The Sequential wait after this Component is measured from it, the one
-	// clock the replica-side gate reads too.
+	// The Sequential wait after this Component is measured from it while the
+	// group has recorded no finish.
 	ReadyAt time.Time
+
+	// NotReady is true when the replica's Ready condition is False or
+	// absent: every pod of the Component is out of rotation, or its replica
+	// was recreated and has published no condition yet. Unknown, the
+	// condition while a roll is recorded, is neither Ready nor NotReady. A
+	// Sequential chain holds the next member while the finished one reads
+	// NotReady.
+	NotReady bool
 
 	// Failed is true when the Component's OMENative reconciler
 	// flagged a terminal failure (Ready timeout, persistent op error).
@@ -88,6 +99,13 @@ type ComponentObservation struct {
 
 	// FailureMessage is the operator-facing explanation when Failed.
 	FailureMessage string
+
+	// UpdateStrategy is the strategy the Component's starts run on:
+	// SurgeThenDrain (the default when unset), RecreatePod for every
+	// drain-first shape (an in-place strategy on a gang rebuilds it), or an
+	// in-place strategy on single-pod Instances. It names the move a hold
+	// refuses; no phase is decided on it.
+	UpdateStrategy workloadtypes.UpdateStrategyType
 }
 
 // GroupObservation collects per-Component observations plus group-wide
@@ -124,6 +142,29 @@ type GroupObservation struct {
 	// since it moves on every base-phase change. Zero when no prior
 	// status is available (first reconcile).
 	PreviousPhaseEnteredAt time.Time
+
+	// MemberFinished is the finish record the previously-written status
+	// carries for a Sequential group: the member whose roll most recently
+	// read done and the instant it first read so. Zero when the status
+	// holds none.
+	MemberFinished MemberFinish
+}
+
+// MemberFinish is the instant a Sequential member's roll first read done,
+// kept in the group's status so the wait before the next member is measured
+// from one instant on every pass, on the group and on the replica side. A
+// readiness loss or a recreated replica of the member does not move it.
+type MemberFinish struct {
+	// Component names the member.
+	Component v1beta1.ComponentType
+
+	// At is the instant the member first read done.
+	At time.Time
+}
+
+// IsZero reports whether no finish is recorded.
+func (f MemberFinish) IsZero() bool {
+	return f.Component == "" || f.At.IsZero()
 }
 
 // GroupTransition is the state machine's decision for one group this
@@ -154,6 +195,29 @@ type GroupTransition struct {
 	// emit the RatioSkewRejected event + increment the ratio_skew_total
 	// counter. Always false for PerComponent pacing.
 	RatioSkewRejected bool
+
+	// RatioHeldStarts names the Components whose next start RatioBalanced
+	// pacing holds this reconcile, in the group's order, each with the
+	// strategy that start runs on. Empty exactly when RatioSkewRejected is
+	// false.
+	RatioHeldStarts []HeldStart
+
+	// MemberFinished is the finish record the group's status carries after
+	// this pass (Sequential with a wait between members only). Zero when
+	// there is none to carry.
+	MemberFinished MemberFinish
+
+	// MemberNotReady names the finished Sequential member whose readiness
+	// holds the next member this pass. Empty otherwise.
+	MemberNotReady v1beta1.ComponentType
+}
+
+// HeldStart is one Component whose next start RatioBalanced pacing holds,
+// with the strategy the start runs on: the move an operator reads in the
+// event is a surge start, a recreate or an in-place restart by it.
+type HeldStart struct {
+	Component v1beta1.ComponentType
+	Strategy  workloadtypes.UpdateStrategyType
 }
 
 // ComputeTransition walks the group's state machine for this reconcile
@@ -229,20 +293,22 @@ func blueGreenTransition(obs GroupObservation) GroupTransition {
 
 	switch {
 	case !allHaveSurge:
-		_, skew := computeSurgeBudgetWithRatio(obs)
+		_, held := computeSurgeBudgetWithRatio(obs)
 		return GroupTransition{
 			Phase:             v1beta1.CoordinationPhaseSurging,
 			CompositePhase:    string(v1beta1.CoordinationPhaseSurging),
 			Message:           "creating new-revision pods",
-			RatioSkewRejected: skew,
+			RatioSkewRejected: len(held) > 0,
+			RatioHeldStarts:   held,
 		}
 	case !allNewReady:
-		_, skew := computeSurgeBudgetWithRatio(obs)
+		_, held := computeSurgeBudgetWithRatio(obs)
 		return GroupTransition{
 			Phase:             v1beta1.CoordinationPhaseWaiting,
 			CompositePhase:    string(v1beta1.CoordinationPhaseWaiting),
 			Message:           "waiting for new-revision pods to be Ready",
-			RatioSkewRejected: skew,
+			RatioSkewRejected: len(held) > 0,
+			RatioHeldStarts:   held,
 		}
 	}
 
@@ -375,20 +441,22 @@ func rollingUpdateTransition(obs GroupObservation) GroupTransition {
 	}
 	switch {
 	case anySurging:
-		_, skew := computeSurgeBudgetWithRatio(obs)
+		_, held := computeSurgeBudgetWithRatio(obs)
 		return GroupTransition{
 			Phase:             v1beta1.CoordinationPhaseSurging,
 			CompositePhase:    string(v1beta1.CoordinationPhaseSurging),
 			Message:           "at least one Component is surging",
-			RatioSkewRejected: skew,
+			RatioSkewRejected: len(held) > 0,
+			RatioHeldStarts:   held,
 		}
 	case anyWaiting:
-		_, skew := computeSurgeBudgetWithRatio(obs)
+		_, held := computeSurgeBudgetWithRatio(obs)
 		return GroupTransition{
 			Phase:             v1beta1.CoordinationPhaseWaiting,
 			CompositePhase:    string(v1beta1.CoordinationPhaseWaiting),
 			Message:           "waiting for new-revision pods to be Ready",
-			RatioSkewRejected: skew,
+			RatioSkewRejected: len(held) > 0,
+			RatioHeldStarts:   held,
 		}
 	case anyScalingDown:
 		return GroupTransition{
@@ -465,6 +533,7 @@ func sequentialTransition(obs GroupObservation) GroupTransition {
 				CurrentComponent:  c,
 				PreviousComponent: previousCompletedComponent(obs, c),
 				Message:           "Sequential group blocked by Failed Component: " + string(c),
+				MemberFinished:    sequentialMemberFinish(obs, ""),
 			}
 		}
 	}
@@ -473,28 +542,51 @@ func sequentialTransition(obs GroupObservation) GroupTransition {
 	// Sequential's invariant: at most one Component rolls at a time.
 	if c, ok := activeSequentialComponent(obs.Group.Order, obs.Components); ok {
 		comp := obs.Components[c]
+		prev := previousCompletedComponent(obs, c)
+		finished := sequentialMemberFinish(obs, prev)
 		// The wait after a member: while the operator's window since the
 		// previous Component finished is still running, this Component
-		// reads Sequential.Awaiting. The window is measured from that
-		// Component's Ready transition, the instant its roll was recorded
-		// done and the clock the replica-side gate reads, so it is measured
-		// once after each member finishes: the group's own transition time
-		// moves on every base-phase change and would restart the window on
-		// each phase of this Component's roll, or on a pause. No Ready
-		// transition means no window to measure, and the Component's phase
-		// shows.
-		if prev := previousCompletedComponent(obs, c); obs.Group.Soak > 0 && prev != "" {
-			if finished := obs.Components[prev].ReadyAt; !finished.IsZero() {
-				elapsed := obs.Now.Sub(finished)
+		// reads Sequential.Awaiting. The window is measured from the finish
+		// the group's status records, the instant that Component first read
+		// done and the clock the replica-side gate reads too, so it runs
+		// once after each member finishes: that Component losing readiness
+		// afterwards, or its replica being recreated, neither cuts the
+		// window short nor starts it over, and the group's own transition
+		// time, which moves on every base-phase change, decides nothing.
+		if obs.Group.Soak > 0 && prev != "" && finished.Component == prev {
+			elapsed := obs.Now.Sub(finished.At)
+			// The finished member must stand Ready for this Component to
+			// start: while its Ready condition is False or absent, this
+			// Component is held whatever the window says, and the window
+			// keeps running from the recorded finish, so the member's
+			// recovery releases this Component at once when the window has
+			// elapsed by then.
+			if obs.Components[prev].NotReady {
+				msg := "Sequential soak: " + string(prev) + " not Ready; "
 				if elapsed < obs.Group.Soak {
-					return GroupTransition{
-						Phase:             v1beta1.CoordinationPhaseIdle,
-						CompositePhase:    v1beta1.CompositePhaseSequentialAwaiting,
-						CurrentComponent:  c,
-						PreviousComponent: prev,
-						Message: "Sequential soak: " + (obs.Group.Soak - elapsed).String() +
-							" remaining before " + string(c) + " starts",
-					}
+					msg += (obs.Group.Soak - elapsed).String() + " remaining before " + string(c) + " starts, once " + string(prev) + " is Ready"
+				} else {
+					msg += string(c) + " starts once " + string(prev) + " is Ready"
+				}
+				return GroupTransition{
+					Phase:             v1beta1.CoordinationPhaseIdle,
+					CompositePhase:    v1beta1.CompositePhaseSequentialAwaiting,
+					CurrentComponent:  c,
+					PreviousComponent: prev,
+					Message:           msg,
+					MemberFinished:    finished,
+					MemberNotReady:    prev,
+				}
+			}
+			if elapsed < obs.Group.Soak {
+				return GroupTransition{
+					Phase:             v1beta1.CoordinationPhaseIdle,
+					CompositePhase:    v1beta1.CompositePhaseSequentialAwaiting,
+					CurrentComponent:  c,
+					PreviousComponent: prev,
+					Message: "Sequential soak: " + (obs.Group.Soak - elapsed).String() +
+						" remaining before " + string(c) + " starts",
+					MemberFinished: finished,
 				}
 			}
 		}
@@ -514,8 +606,9 @@ func sequentialTransition(obs GroupObservation) GroupTransition {
 			Phase:             sub.Phase,
 			CompositePhase:    string(c) + "." + string(sub.Phase),
 			CurrentComponent:  c,
-			PreviousComponent: previousCompletedComponent(obs, c),
+			PreviousComponent: prev,
 			Message:           sub.Message,
+			MemberFinished:    finished,
 		}
 	}
 
@@ -528,6 +621,7 @@ func sequentialTransition(obs GroupObservation) GroupTransition {
 			Phase:          v1beta1.CoordinationPhaseIdle,
 			CompositePhase: string(v1beta1.CoordinationPhaseIdle),
 			Message:        "Sequential group complete",
+			MemberFinished: sequentialMemberFinish(obs, ""),
 		}
 	}
 	if completed == 0 {
@@ -535,6 +629,7 @@ func sequentialTransition(obs GroupObservation) GroupTransition {
 			Phase:          v1beta1.CoordinationPhaseIdle,
 			CompositePhase: string(v1beta1.CoordinationPhaseIdle),
 			Message:        "Sequential group awaiting first Component spec bump",
+			MemberFinished: sequentialMemberFinish(obs, ""),
 		}
 	}
 	prev := obs.Group.Order[completed-1]
@@ -545,6 +640,7 @@ func sequentialTransition(obs GroupObservation) GroupTransition {
 		CurrentComponent:  next,
 		PreviousComponent: prev,
 		Message:           "Sequential group in soak window between Components",
+		MemberFinished:    sequentialMemberFinish(obs, prev),
 	}
 }
 
@@ -608,6 +704,36 @@ func previousCompletedComponent(obs GroupObservation, c v1beta1.ComponentType) v
 	return ""
 }
 
+// sequentialMemberFinish is the finish record the group's status carries
+// after this pass, for a Sequential group with a wait between members: the
+// record it already holds while that member still reads done, a fresh one
+// when the member before the active one (prev) first reads done, and none
+// when the recorded member rolls again or has left the group. A fresh
+// record carries the member's Ready transition when its replica has
+// recorded the roll done, else now, so the pass between a member's last
+// Instance Ready and its promote counts toward the wait. A group with no
+// wait carries no record.
+func sequentialMemberFinish(obs GroupObservation, prev v1beta1.ComponentType) MemberFinish {
+	if obs.Group.Soak <= 0 {
+		return MemberFinish{}
+	}
+	finished := obs.MemberFinished
+	if !finished.IsZero() {
+		comp, ok := obs.Components[finished.Component]
+		if !ok || (comp.RolloutInFlight && !comp.AtDesiredShape) {
+			finished = MemberFinish{}
+		}
+	}
+	if prev == "" || finished.Component == prev {
+		return finished
+	}
+	at := obs.Components[prev].ReadyAt
+	if at.IsZero() {
+		at = obs.Now
+	}
+	return MemberFinish{Component: prev, At: at}
+}
+
 // computeSurgeBudget returns the per-Component MaxSurge budget for the
 // group's pacing, keyed by Component. Caller plumbs each value into
 // the per-Component surge logic so the operator's MaxSurge bound is
@@ -626,11 +752,12 @@ func computeSurgeBudget(obs GroupObservation) map[v1beta1.ComponentType]int32 {
 	return out
 }
 
-// computeSurgeBudgetWithRatio returns SurgeBudget and a skew-rejected
-// flag. For PerComponent pacing this is identical to computeSurgeBudget
-// + skew=false. For RatioBalanced pacing, EvaluateSurge gates the
-// MaxSurge budget — when the ratio band would be exceeded by even one
-// surge, the budget is zeroed and skew=true so the caller can fire
+// computeSurgeBudgetWithRatio returns SurgeBudget and the Components whose
+// next start RatioBalanced pacing holds, in the group's order. For
+// PerComponent pacing this is identical to computeSurgeBudget with nothing
+// held. For RatioBalanced pacing, EvaluateSurge gates the MaxSurge budget:
+// when the ratio band would be exceeded by even one surge, the budget is
+// zeroed and the Component is held so the caller can fire the
 // RatioSkewRejected metrics/events.
 //
 // Baseline: populates state.Serving from obs.Components.ServingPods so
@@ -643,15 +770,15 @@ func computeSurgeBudget(obs GroupObservation) map[v1beta1.ComponentType]int32 {
 // events with no progress; the dispatcher's CheckRatioGate may still
 // allow drain because it reads ServingReplicas from status, but this
 // state-machine-side gating fires the noise + zeros SurgeBudget map.
-func computeSurgeBudgetWithRatio(obs GroupObservation) (map[v1beta1.ComponentType]int32, bool) {
+func computeSurgeBudgetWithRatio(obs GroupObservation) (map[v1beta1.ComponentType]int32, []HeldStart) {
 	budget := computeSurgeBudget(obs)
 	if obs.Group.Pacing.Type != v1beta1.CoordinationPacingRatioBalanced {
-		return budget, false
+		return budget, nil
 	}
 	if len(obs.OriginalReplicas) == 0 {
 		// No anchor yet — let MaxSurge govern alone, no skew possible
 		// until the next reconcile when SnapshotOriginal has run.
-		return budget, false
+		return budget, nil
 	}
 	state := RatioState{
 		Original: obs.OriginalReplicas,
@@ -664,7 +791,7 @@ func computeSurgeBudgetWithRatio(obs GroupObservation) (map[v1beta1.ComponentTyp
 		state.NewPods[c] = comp.NewRevisionPods
 		state.Serving[c] = comp.ServingPods
 	}
-	var skew bool
+	var held []HeldStart
 	for c, proposed := range budget {
 		if proposed <= 0 {
 			continue
@@ -672,8 +799,23 @@ func computeSurgeBudgetWithRatio(obs GroupObservation) (map[v1beta1.ComponentTyp
 		d := EvaluateSurge(obs.Group.Pacing, state, c, proposed)
 		budget[c] = d.AllowedSurgeDelta
 		if d.SkewRejected {
-			skew = true
+			held = append(held, HeldStart{Component: c, Strategy: obs.Components[c].UpdateStrategy})
 		}
 	}
-	return budget, skew
+	slices.SortFunc(held, func(a, b HeldStart) int {
+		if r := cmp.Compare(memberRank(obs.Group, a.Component), memberRank(obs.Group, b.Component)); r != 0 {
+			return r
+		}
+		return cmp.Compare(a.Component, b.Component)
+	})
+	return budget, held
+}
+
+// memberRank orders members as the group declares them; one the group does
+// not list sorts after them.
+func memberRank(g ResolvedGroup, c v1beta1.ComponentType) int {
+	if i := slices.Index(g.Components, c); i >= 0 {
+		return i
+	}
+	return len(g.Components)
 }

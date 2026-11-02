@@ -32,45 +32,38 @@ type informerReader struct {
 
 var _ podGroupReader = &informerReader{}
 
-// factsFromPodGroup extracts the placement facts the plugin needs from a
-// PodGroup: the gang size (Spec.MinMember), the domain topology key the workload
-// declared (using the configured annotation key), and the gate timeout (the standard
-// Spec.ScheduleTimeoutSeconds, falling back to the configured value when unset).
-// A PodGroup without the topology annotation yields an empty key, which
-// resolveGang treats as unresolvable (no domain to assign).
-func factsFromPodGroup(pg *schedv1alpha1.PodGroup, topologyKeyAnnotation string, defaultPermitTimeout time.Duration) (minMember int, topologyKey string, timeout time.Duration) {
+// facts reads the gang facts from a PodGroup: the gang size (Spec.MinMember),
+// the domain topology key the workload declared under the configured annotation
+// (empty when absent), the gate timeout (the standard Spec.ScheduleTimeoutSeconds,
+// else the configured default), the UID, and whether the configured
+// placement-group label is present. A nil PodGroup yields the zero facts with
+// the default timeout.
+func (r *informerReader) facts(pg *schedv1alpha1.PodGroup) gangFacts {
+	facts := gangFacts{timeout: r.defaultPermitTimeout}
 	if pg == nil {
-		return 0, "", defaultPermitTimeout
+		return facts
 	}
-	timeout = defaultPermitTimeout
 	if s := pg.Spec.ScheduleTimeoutSeconds; s != nil && *s > 0 {
-		timeout = time.Duration(*s) * time.Second
+		facts.timeout = time.Duration(*s) * time.Second
 	}
-	return int(pg.Spec.MinMember), pg.Annotations[topologyKeyAnnotation], timeout
+	facts.minMember = int(pg.Spec.MinMember)
+	facts.topologyKey = pg.Annotations[r.topologyKeyAnnotation]
+	facts.uid = string(pg.UID)
+	if r.placementGroupLabel != "" {
+		_, facts.inPlacementGroup = pg.Labels[r.placementGroupLabel]
+	}
+	return facts
 }
 
-// get resolves a PodGroup into (minMember, topologyKey, timeout, uid, found). Any
-// lookup error or missing PodGroup is reported as not-found; PreFilter holds a
-// labeled member until the informer can validate the group.
-func (r *informerReader) get(namespace, name string) (minMember int, topologyKey string, timeout time.Duration, uid string, found bool) {
+// get resolves a PodGroup into its gang facts. Any lookup error or missing
+// PodGroup is reported as not-found; PreFilter holds a labeled member until the
+// informer can validate the group.
+func (r *informerReader) get(namespace, name string) (gangFacts, bool) {
 	pg, err := r.getPG(namespace, name)
 	if err != nil || pg == nil {
-		return 0, "", 0, "", false
+		return gangFacts{}, false
 	}
-	mm, tk, to := factsFromPodGroup(pg, r.topologyKeyAnnotation, r.defaultPermitTimeout)
-	return mm, tk, to, string(pg.UID), true
-}
-
-func (r *informerReader) placementGroup(namespace, name string) (string, bool) {
-	pg, err := r.getPG(namespace, name)
-	if err != nil || pg == nil {
-		return "", false
-	}
-	if r.placementGroupLabel == "" {
-		return "", false
-	}
-	value, present := pg.Labels[r.placementGroupLabel]
-	return value, present
+	return r.facts(pg), true
 }
 
 // newInformerReader builds a PodGroup informer from the scheduler's shared

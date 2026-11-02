@@ -24,6 +24,10 @@ import (
 // to zero via Place as members become real occupancy, so the live snapshot's
 // own accounting is never double-counted.
 //
+// Every write after Choose or Set names the commitment it acts on by the id
+// those two returned, so a callback from an older scheduling attempt cannot
+// drain or release a newer attempt's commitment.
+//
 // The scheduler runs scheduling cycles single-threaded, but plugin state is also
 // touched from event handlers (failover rebuild, release on gang teardown), so
 // the store guards itself with a mutex.
@@ -49,12 +53,14 @@ type Domain struct {
 	Name        string
 }
 
-// Reservation is an outstanding whole-node claim in a topology domain.
-type Reservation struct {
-	Group     string
-	Domain    Domain
-	Remaining int
-	Nodes     []string
+// Gang names the placement group a commitment belongs to: the group key, the
+// owner identity behind it (GangPack passes the PodGroup UID, so a delete and
+// recreate under the same name inherits no decision), and the topology key its
+// domains are read under.
+type Gang struct {
+	Group       string
+	Owner       string
+	TopologyKey string
 }
 
 // commitment is a group's placement decision: the domain it is committed to plus
@@ -132,44 +138,24 @@ func (p *DomainAssignments) setRemaining(c *commitment, remaining int) {
 	c.remaining = remaining
 }
 
-// Choose returns the domain the group is committed to. A group that already
-// holds an assignment gets that domain back as-is — regardless of current free
-// counts, because members are already reserved there; if the gang can no
-// longer complete there the caller unwinds via Release and calls Choose again.
-// A group without an assignment is best-fitted over the domains without an
-// outstanding reservation, so heterogeneous claims are never treated as
-// fungible slots; the chosen domain becomes the assignment and gangSize whole
-// nodes are reserved there. ok is false only when the group holds no
-// assignment and no domain currently fits the gang (the gang waits,
-// unassigned).
-func (p *DomainAssignments) Choose(group string, rawFree topology.FreeByDomain, gangSize int) (domain string, ok bool) {
-	return p.ChooseInTopology(group, "", rawFree, gangSize)
-}
-
-// ChooseInTopology is Choose with an explicit topology label namespace.
-func (p *DomainAssignments) ChooseInTopology(group, topologyKey string, rawFree topology.FreeByDomain, gangSize int) (domain string, ok bool) {
-	domain, _, ok = p.ChooseInTopologyOnNodes(group, topologyKey, rawFree, nil, gangSize)
-	return domain, ok
-}
-
-// ChooseInTopologyOnNodes is ChooseInTopology with the physical membership of
-// each candidate domain. Physical membership prevents two different topology
-// keys from reserving overlapping nodes. The returned id owns this commitment;
-// lifecycle callbacks must present it before mutating or releasing the
-// assignment.
-func (p *DomainAssignments) ChooseInTopologyOnNodes(group, topologyKey string, rawFree topology.FreeByDomain, nodesByDomain map[string][]string, gangSize int) (domain string, id uint64, ok bool) {
-	return p.ChooseForOwnerInTopologyOnNodes(group, "", topologyKey, rawFree, nodesByDomain, gangSize)
-}
-
-// ChooseForOwnerInTopologyOnNodes binds the commitment to an external owner
-// identity. GangPack uses the PodGroup UID so a delete/recreate with the same
-// namespace/name cannot inherit the old object's placement decision.
-func (p *DomainAssignments) ChooseForOwnerInTopologyOnNodes(group, owner, topologyKey string, rawFree topology.FreeByDomain, nodesByDomain map[string][]string, gangSize int) (domain string, id uint64, ok bool) {
+// Choose returns the domain the gang is committed to and the id that owns the
+// commitment. A gang that already holds a commitment under the same owner gets
+// its domain back as-is, regardless of the current free counts, because members
+// are already reserved there; a gang that can no longer complete there is
+// released by the caller and chosen again. A commitment held under another
+// owner answers nothing. A gang without a commitment is best-fitted over the
+// domains without an outstanding reservation, by reservation metadata and by
+// the physical nodes nodesByDomain lists, so heterogeneous claims are never
+// treated as fungible slots and two topology keys cannot reserve overlapping
+// nodes; the chosen domain becomes the commitment and size whole nodes are
+// reserved there. ok is false only when the gang holds no commitment and no
+// domain currently fits it (the gang waits, unassigned).
+func (p *DomainAssignments) Choose(gang Gang, free topology.FreeByDomain, nodesByDomain map[string][]string, size int) (domain string, id uint64, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if c, assigned := p.byGroup[group]; assigned {
-		if c.owner != owner {
+	if c, assigned := p.byGroup[gang.Group]; assigned {
+		if c.owner != gang.Owner {
 			return "", 0, false
 		}
 		return c.domain.Name, c.id, true
@@ -179,9 +165,9 @@ func (p *DomainAssignments) ChooseForOwnerInTopologyOnNodes(group, owner, topolo
 	// sound for heterogeneous pods: a reservation for a large or selector-bound
 	// member cannot be replaced by an arbitrary smaller slot. Hold the domain until
 	// the reservation drains into real snapshot occupancy.
-	eff := make(topology.FreeByDomain, len(rawFree))
-	for d, f := range rawFree {
-		blocked := p.reserved[Domain{TopologyKey: topologyKey, Name: d}] > 0
+	eff := make(topology.FreeByDomain, len(free))
+	for d, f := range free {
+		blocked := p.reserved[Domain{TopologyKey: gang.TopologyKey, Name: d}] > 0
 		for _, node := range nodesByDomain[d] {
 			if p.reservedNodes[node] > 0 {
 				blocked = true
@@ -195,15 +181,15 @@ func (p *DomainAssignments) ChooseForOwnerInTopologyOnNodes(group, owner, topolo
 		}
 	}
 
-	d, fit := topology.BestFit(eff, gangSize)
+	d, fit := topology.BestFit(eff, size)
 	if !fit {
 		return "", 0, false
 	}
-	dom := Domain{TopologyKey: topologyKey, Name: d}
-	c := &commitment{domain: dom, owner: owner, id: p.nextCommitmentID(), nodes: nodeSet(nodesByDomain[d]),
-		soleFit: fittingDomains(eff, gangSize) < 2}
-	p.byGroup[group] = c
-	p.setRemaining(c, gangSize)
+	dom := Domain{TopologyKey: gang.TopologyKey, Name: d}
+	c := &commitment{domain: dom, owner: gang.Owner, id: p.nextCommitmentID(), nodes: nodeSet(nodesByDomain[d]),
+		soleFit: fittingDomains(eff, size) < 2}
+	p.byGroup[gang.Group] = c
+	p.setRemaining(c, size)
 	return d, c.id, true
 }
 
@@ -218,69 +204,92 @@ func fittingDomains(free topology.FreeByDomain, gangSize int) int {
 	return n
 }
 
-// Place records that one of a group's members has landed on a real node in its
-// assigned domain, shrinking the reservation by one whole node — the member is
-// now counted by the live snapshot instead, so draining the reservation in step
-// keeps the two from double-counting the same node. No-op for a group without
-// an assignment or a reservation already at zero.
-func (p *DomainAssignments) Place(group string) {
-	p.PlaceIf(group, 0)
-}
-
-// PlaceIf drains one reservation only when id owns the current commitment.
-// id==0 is retained for the package's compatibility helpers and tests. drained
-// reports that the last outstanding claim became real snapshot occupancy.
-func (p *DomainAssignments) PlaceIf(group string, id uint64) (placed, drained bool) {
+// Set rebuilds a commitment from members already present in the snapshot and
+// returns the id that owns it. Used on leader failover: domain is where the
+// gang's bound pods sit, remaining is the whole nodes still owed to members not
+// yet placed, and nodes is the domain's physical membership, recorded so another
+// topology key cannot reserve the same nodes while remaining is above zero. A
+// commitment the group held before gives up its reservation first. A rebuilt
+// commitment reports no alternative domain.
+func (p *DomainAssignments) Set(gang Gang, domain string, remaining int, nodes []string) uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if c, ok := p.byGroup[group]; ok && (id == 0 || c.id == id) && c.remaining > 0 {
+	if remaining < 0 {
+		remaining = 0
+	}
+	if old, ok := p.byGroup[gang.Group]; ok {
+		p.setRemaining(old, 0)
+	}
+	dom := Domain{TopologyKey: gang.TopologyKey, Name: domain}
+	c := &commitment{domain: dom, owner: gang.Owner, id: p.nextCommitmentID(), nodes: nodeSet(nodes), soleFit: true}
+	p.byGroup[gang.Group] = c
+	p.setRemaining(c, remaining)
+	return c.id
+}
+
+// Place records that one member of the commitment id owns has landed on a real
+// node in its domain and shrinks the reservation by one whole node: the member
+// is now counted by the live snapshot, so draining in step keeps the two from
+// double-counting the same node. placed is false when id no longer owns the
+// group's commitment or the reservation is already at zero; drained reports
+// that the last outstanding claim became real snapshot occupancy.
+func (p *DomainAssignments) Place(group string, id uint64) (placed, drained bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.byGroup[group]; ok && c.id == id && c.remaining > 0 {
 		p.setRemaining(c, c.remaining-1)
 		return true, c.remaining == 0
 	}
 	return false, false
 }
 
-// Len returns the number of groups that currently hold an assignment; the
-// plugin exports it as a gauge of active placements.
-func (p *DomainAssignments) Len() int {
+// Release drops the commitment id owns together with its reservation, on gang
+// completion, on gate-timeout unwind or on teardown, so the next Choose runs
+// best-fit again and may pick a different domain. It reports whether the
+// commitment was present, so callers act once per gang even though the unwind
+// re-enters per member. beforeUnlock runs while the store is locked, which
+// closes the window in which a new retry could take a commitment before the
+// old attempt's waiting siblings have been rejected.
+func (p *DomainAssignments) Release(group string, id uint64, beforeUnlock func()) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return len(p.byGroup)
+	c, ok := p.byGroup[group]
+	if !ok || c.id != id {
+		return false
+	}
+	delete(p.byGroup, group)
+	p.setRemaining(c, 0)
+	if beforeUnlock != nil {
+		beforeUnlock()
+	}
+	return true
 }
 
-// Domains returns a snapshot of every assigned group's domain. It lets a caller
-// compute, against the live node snapshot, how much each group should still
-// have reserved — the input to Reconcile — without holding the store's lock
-// across that (potentially O(nodes)) scan.
-func (p *DomainAssignments) Domains() map[string]string {
+// Committed reports whether the commitment id owns has converted every reserved
+// slot into an assumed or bound pod: every slot was placed, or the commitment
+// was rebuilt from already-bound members on failover. Either way its members
+// are being bound, so the gate must also count bound siblings, not just waiting
+// ones. Permit reads this instead of combining the scheduler snapshot with the
+// waiting pods, which are already assumed in that snapshot and would be counted
+// twice. A still-forming gang has a reservation left, so this stays false and
+// the gate never pays the bound-sibling scan while a gang is filling normally.
+func (p *DomainAssignments) Committed(group string, id uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make(map[string]string, len(p.byGroup))
-	for group, c := range p.byGroup {
-		out[group] = c.domain.Name
-	}
-	return out
+	c, ok := p.byGroup[group]
+	return ok && c.id == id && c.remaining == 0
 }
 
-// AssignedDomains returns domain names together with their topology keys.
-func (p *DomainAssignments) AssignedDomains() map[string]Domain {
+// SoleFit reports whether the commitment id owns had no alternative when it
+// was made: no other domain free of reservations had room for the gang, or
+// bound members imposed the domain. Every member following the assignment
+// shares the answer, so a veto in the domain is retried at once only when
+// another domain could take the gang.
+func (p *DomainAssignments) SoleFit(group string, id uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make(map[string]Domain, len(p.byGroup))
-	for group, c := range p.byGroup {
-		out[group] = c.domain
-	}
-	return out
-}
-
-// Get returns the group's assigned domain, or ("", false) when it has none.
-func (p *DomainAssignments) Get(group string) (domain string, ok bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if c, ok := p.byGroup[group]; ok {
-		return c.domain.Name, true
-	}
-	return "", false
+	c, ok := p.byGroup[group]
+	return ok && c.id == id && c.soleFit
 }
 
 // GetOwned returns the current commitment metadata needed by a scheduling
@@ -309,79 +318,6 @@ func (p *DomainAssignments) GetOwnedBy(group, owner string) (domain Domain, id u
 	return c.domain, c.id, c.remaining, true, c.owner == owner
 }
 
-// Committed reports whether a group holds an assignment with no outstanding
-// reservation (remaining==0): every reserved slot has been placed, or the
-// assignment was rebuilt from already-bound members on failover. Either way its
-// members are (being) bound, so the gate must also count bound siblings, not
-// just waiting ones. A still-forming gang has remaining>0, so this stays false
-// and the gate never pays the bound-sibling scan while a gang is filling
-// normally.
-func (p *DomainAssignments) Committed(group string) bool {
-	return p.CommittedIf(group, 0)
-}
-
-// CommittedIf reports whether the owned attempt has converted every reserved
-// slot into an assumed or bound pod. Permit uses this instead of combining the
-// scheduler snapshot with waiting pods, because waiting pods are already assumed
-// in that snapshot and would otherwise be counted twice.
-func (p *DomainAssignments) CommittedIf(group string, id uint64) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.byGroup[group]
-	return ok && (id == 0 || c.id == id) && c.remaining == 0
-}
-
-// Set assigns a group to a domain without best-fit. Used on leader failover to
-// rebuild the store from where bound pods already sit — the domain is simply
-// where those pods are. Those pods are real occupancy in the snapshot, so the
-// rebuilt commitment holds no outstanding reservation.
-func (p *DomainAssignments) Set(group, domain string) {
-	p.SetReservation(group, "", domain, 0)
-}
-
-// SetReservation rebuilds an assignment and its still-outstanding reservation.
-func (p *DomainAssignments) SetReservation(group, topologyKey, domain string, remaining int) {
-	p.SetReservationOnNodes(group, topologyKey, domain, remaining, nil)
-}
-
-// SetReservationOnNodes rebuilds a commitment from bound members and returns
-// its ownership id. Physical domain membership is recorded for cross-topology
-// exclusion while the remaining reservation is non-zero.
-func (p *DomainAssignments) SetReservationOnNodes(group, topologyKey, domain string, remaining int, nodes []string) uint64 {
-	return p.SetReservationForOwnerOnNodes(group, "", topologyKey, domain, remaining, nodes)
-}
-
-// SetReservationForOwnerOnNodes rebuilds an owner-bound commitment from members
-// already present in the snapshot.
-func (p *DomainAssignments) SetReservationForOwnerOnNodes(group, owner, topologyKey, domain string, remaining int, nodes []string) uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if remaining < 0 {
-		remaining = 0
-	}
-	// Drop any prior commitment's reservation before overwriting.
-	if old, ok := p.byGroup[group]; ok {
-		p.setRemaining(old, 0)
-	}
-	dom := Domain{TopologyKey: topologyKey, Name: domain}
-	c := &commitment{domain: dom, owner: owner, id: p.nextCommitmentID(), nodes: nodeSet(nodes), soleFit: true}
-	p.byGroup[group] = c
-	p.setRemaining(c, remaining)
-	return c.id
-}
-
-// SoleFit reports whether the commitment id owns had no alternative when it
-// was made: no other domain free of reservations had room for the gang, or
-// bound members imposed the domain. Every member following the assignment
-// shares the answer, so a veto in the domain is retried at once only when
-// another domain could take the gang.
-func (p *DomainAssignments) SoleFit(group string, id uint64) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.byGroup[group]
-	return ok && c.id == id && c.soleFit
-}
-
 // Owners returns the owner identity recorded for every live commitment.
 func (p *DomainAssignments) Owners() map[string]string {
 	p.mu.Lock()
@@ -393,40 +329,17 @@ func (p *DomainAssignments) Owners() map[string]string {
 	return out
 }
 
-// ReleaseIfOwner drops a commitment only when owner still identifies it.
-func (p *DomainAssignments) ReleaseIfOwner(group, owner string) bool {
+// Len returns the number of groups that currently hold an assignment; the
+// plugin exports it as a gauge of active placements.
+func (p *DomainAssignments) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	c, ok := p.byGroup[group]
-	if !ok || c.owner != owner {
-		return false
-	}
-	delete(p.byGroup, group)
-	p.setRemaining(c, 0)
-	return true
-}
-
-// Reservations returns a stable snapshot of outstanding claims. Callers use it
-// to keep ordinary pods out of a domain while a gang is still forming.
-func (p *DomainAssignments) Reservations() []Reservation {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	out := make([]Reservation, 0, len(p.byGroup))
-	for group, c := range p.byGroup {
-		if c.remaining > 0 {
-			nodes := make([]string, 0, len(c.nodes))
-			for node := range c.nodes {
-				nodes = append(nodes, node)
-			}
-			out = append(out, Reservation{Group: group, Domain: c.domain, Remaining: c.remaining, Nodes: nodes})
-		}
-	}
-	return out
+	return len(p.byGroup)
 }
 
 // BlocksNode reports whether a forming gang has an outstanding claim on this
-// physical node. Commitments created through compatibility helpers may not have
-// physical membership; labels provide the conservative metadata fallback.
+// physical node. A commitment recorded without its node set is matched through
+// the node's label for the commitment's topology key instead.
 func (p *DomainAssignments) BlocksNode(name string, nodeLabels map[string]string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -439,85 +352,4 @@ func (p *DomainAssignments) BlocksNode(name string, nodeLabels map[string]string
 		}
 	}
 	return false
-}
-
-// RetainOnly releases every assigned group NOT present in live, returning how
-// many were released. It is the garbage collector's hook: a gang whose pods are
-// all gone (completed and torn down, or deleted before any member reached
-// Reserve) leaves an assignment no failure path reclaims, so byGroup would grow
-// unbounded and a reused PodGroup name could inherit a stale domain.
-// Reconciling against the set of gangs that still have live pods bounds byGroup
-// to live gangs.
-func (p *DomainAssignments) RetainOnly(live map[string]bool) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	released := 0
-	for group, c := range p.byGroup {
-		if !live[group] {
-			delete(p.byGroup, group)
-			p.setRemaining(c, 0)
-			released++
-		}
-	}
-	return released
-}
-
-// Reconcile resets each present group's reservation to the size it can still
-// justify against ground truth, closing the reservation leak. A reservation is
-// drained per-Place only when a member is assumed, but a group can be assigned
-// a domain (reserving gangSize) and then fail its scheduling cycle before any
-// member is assumed — Filter rejects every candidate, so no Reserve or
-// Unreserve runs and the reservation is never returned. Such a reservation
-// subtracts capacity forever, starving other groups.
-//
-// want maps a group to how many whole nodes it still legitimately needs reserved
-// — gangSize minus the members already placed in its domain, computed from the
-// live snapshot. Set on the periodic GC sweep, this bounds a stale reservation's
-// lifetime to one interval instead of forever. A group absent from want is left
-// untouched (its facts weren't resolvable this pass — reconciling on a partial
-// view could wrongly reclaim a live reservation). Negative values clamp to zero.
-func (p *DomainAssignments) Reconcile(want map[string]int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for group, c := range p.byGroup {
-		r, ok := want[group]
-		if !ok {
-			continue
-		}
-		if r < 0 {
-			r = 0
-		}
-		if r != c.remaining {
-			p.setRemaining(c, r)
-		}
-	}
-}
-
-// Release drops a group's assignment and its reservation — on gang completion,
-// on gate-timeout unwind, or on teardown — so the next Choose re-runs best-fit
-// and may pick a different domain. It reports whether an assignment was
-// present, so callers can act once per gang even though the unwind re-enters
-// per member.
-func (p *DomainAssignments) Release(group string) bool {
-	return p.ReleaseIf(group, 0, nil)
-}
-
-// ReleaseIf drops a commitment only when id still owns it. The callback runs
-// while the store is locked, closing the window in which a new retry could
-// take an assignment before old waiting siblings have been rejected. id==0 is
-// the compatibility form used by package-level callers that do not carry
-// lifecycle ownership.
-func (p *DomainAssignments) ReleaseIf(group string, id uint64, beforeUnlock func()) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.byGroup[group]
-	if !ok || (id != 0 && c.id != id) {
-		return false
-	}
-	delete(p.byGroup, group)
-	p.setRemaining(c, 0)
-	if beforeUnlock != nil {
-		beforeUnlock()
-	}
-	return true
 }

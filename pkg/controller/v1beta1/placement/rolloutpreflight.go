@@ -4,12 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
-	"sync"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -37,43 +34,24 @@ type resolvedRolloutPolicy struct {
 	digest string
 }
 
-// rolloutPreflight is the in-memory rollout-policy bookkeeping for the
-// placement controller: the staged preflight condition, the per-source
-// resolved policies the derive-time inflation consumes, the per-(source,member)
-// lifted run provenance, and the manual-Pause warning dedupe. The API
-// deliberately carries no such state; a control-plane restart clears it and
-// the next pass rebuilds it from the spec (conservative: resolution reruns,
-// warnings re-emit at most once per content).
+// rolloutPreflight is the rollout-policy preflight's state: on top of the
+// staged condition and the per-(source, member) run provenance every policy
+// preflight keeps, the per-source resolved policies the derive-time inflation
+// consumes and the manual-Pause warning dedupe. The API deliberately carries
+// no such state; a control-plane restart clears it and the next pass rebuilds
+// it from the spec (conservative: resolution reruns, warnings re-emit at most
+// once per content).
 type rolloutPreflight struct {
-	mu sync.Mutex
-	// preflight is the latest staged PlacementPolicyPreflight condition per
-	// source, applied on the next status write (merged with the autoscaler
-	// preflight's staged condition of the same type).
-	preflight map[types.UID]policyCondition
+	preflightRecord[*v1beta1.CandidateRolloutStatus]
+
 	// plans is the latest successfully-resolved policy set per source; the
-	// fan-out's derive reads it to inflate ref-only groups.
+	// fan-out's derive reads it to inflate ref-only groups. It shares the
+	// record's mutex.
 	plans map[types.UID]map[string]resolvedRolloutPolicy
-	// members is the latest lifted rollout-run observation per (source, member).
-	members map[types.UID]map[string]*v1beta1.CandidateRolloutStatus
 	// warned is the last manual-Pause warning message emitted per source, so
-	// the poll-cadence reconcile does not re-emit an unchanged warning.
+	// the poll-cadence reconcile does not re-emit an unchanged warning. It
+	// shares the record's mutex.
 	warned map[types.UID]string
-}
-
-func (p *rolloutPreflight) setPreflight(uid types.UID, c policyCondition) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.preflight == nil {
-		p.preflight = make(map[types.UID]policyCondition)
-	}
-	p.preflight[uid] = c
-}
-
-func (p *rolloutPreflight) preflightFor(uid types.UID) (policyCondition, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.preflight[uid]
-	return c, ok
 }
 
 func (p *rolloutPreflight) stagePlans(uid types.UID, plans map[string]resolvedRolloutPolicy) {
@@ -92,30 +70,6 @@ func (p *rolloutPreflight) plansFor(uid types.UID) map[string]resolvedRolloutPol
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.plans[uid]
-}
-
-func (p *rolloutPreflight) recordMember(uid types.UID, cluster string, obs *v1beta1.CandidateRolloutStatus) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.members == nil {
-		p.members = make(map[types.UID]map[string]*v1beta1.CandidateRolloutStatus)
-	}
-	if p.members[uid] == nil {
-		p.members[uid] = make(map[string]*v1beta1.CandidateRolloutStatus)
-	}
-	p.members[uid][cluster] = obs
-}
-
-func (p *rolloutPreflight) memberFor(uid types.UID, cluster string) *v1beta1.CandidateRolloutStatus {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.members[uid][cluster]
-}
-
-func (p *rolloutPreflight) forgetMember(uid types.UID, cluster string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.members[uid], cluster)
 }
 
 // warnOnce reports whether msg is new content for this source (and records
@@ -137,9 +91,8 @@ func (p *rolloutPreflight) warnOnce(uid types.UID, msg string) bool {
 func (p *rolloutPreflight) forget(uid types.UID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.preflight, uid)
+	p.dropSourceLocked(uid)
 	delete(p.plans, uid)
-	delete(p.members, uid)
 	delete(p.warned, uid)
 }
 
@@ -176,6 +129,8 @@ type rolloutGroupRef struct {
 	policy string
 }
 
+func (r rolloutGroupRef) policyName() string { return r.policy }
+
 // refOnlyRolloutGroups lists the groups whose ONLY progression source is a
 // PolicyRef — the groups whose resolution failure must hold placement. A
 // group with an inline arm never appears here: inline wins, so a dangling
@@ -189,21 +144,6 @@ func refOnlyRolloutGroups(spec *v1beta1.RolloutSpec) []rolloutGroupRef {
 		}
 	}
 	return out
-}
-
-// distinctRolloutPolicyNames returns the sorted distinct policy names across refs.
-func distinctRolloutPolicyNames(refs []rolloutGroupRef) []string {
-	seen := make(map[string]struct{}, len(refs))
-	var names []string
-	for _, ref := range refs {
-		if _, ok := seen[ref.policy]; ok {
-			continue
-		}
-		seen[ref.policy] = struct{}{}
-		names = append(names, ref.policy)
-	}
-	sort.Strings(names)
-	return names
 }
 
 // rolloutPlanFacts summarizes the EFFECTIVE plan (each group's inline arm, or
@@ -275,21 +215,14 @@ func (r *Reconciler) preflightRolloutPolicies(ctx context.Context, isvc *v1beta1
 	// Resolve each referenced policy on the control plane. Read live
 	// (APIReader) so a missing object surfaces immediately.
 	resolved := make(map[string]resolvedRolloutPolicy, len(refs))
-	for _, name := range distinctRolloutPolicyNames(refs) {
+	for _, name := range distinctPolicyNames(refs) {
 		pol := &v1beta1.RolloutPolicy{}
 		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: name}, pol); err != nil {
-			if !apierrors.IsNotFound(err) && sourcePlaced(isvc) {
-				// A transient control-plane read error is no verdict on the
-				// policy. Hold actuation and re-read soon.
-				r.Log.Error(err, "rollout preflight: policy read failed; holding existing placement",
-					"policy", isvc.Namespace+"/"+name, "isvc", isvc.Namespace+"/"+isvc.Name)
-				return &policyPreflightOutcome{holdAsIs: true, transient: true}
-			}
-			rp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse,
-				v1beta1.RolloutPlanReasonPolicyNotFound,
-				fmt.Sprintf("RolloutPolicy %s/%s has no readable copy on %s: %v; a ref-only rollout group must never fall back to the default progression, holding placement",
-					isvc.Namespace, name, r.controlPlaneName(), err)))
-			return &policyPreflightOutcome{hold: true, transient: !apierrors.IsNotFound(err)}
+			return r.holdOnUnreadableAnchor(err, isvc, name, rp,
+				"rollout preflight: policy read failed; holding existing placement",
+				preflightCondition(corev1.ConditionFalse, v1beta1.RolloutPlanReasonPolicyNotFound,
+					fmt.Sprintf("RolloutPolicy %s/%s has no readable copy on %s: %v; a ref-only rollout group must never fall back to the default progression, holding placement",
+						isvc.Namespace, name, r.controlPlaneName(), err)))
 		}
 		// The body must pass the same validation members enforce at admission:
 		// an invalid body means every derived apply is denied.
@@ -336,49 +269,30 @@ func (r *Reconciler) preflightRolloutPolicies(ctx context.Context, isvc *v1beta1
 		return nil
 	}
 
-	labelsFor := make(map[string]map[string]string, len(clusters))
-	for i := range clusters {
-		labelsFor[clusters[i].Name] = clusters[i].Labels
-	}
-	winner := winnerCluster(isvc)
-	var eligible []string
-	var skips []candidateSkip
-	for _, c := range candidates {
-		if labelsFor[c][constants.WorkloadClusterRolloutPolicyLabel] == WorkloadClusterRolloutPolicyCapability {
-			eligible = append(eligible, c)
-			continue
-		}
-		if c == winner {
-			// Capability ineligibility gates new fan-out without freezing the
-			// standing winner's observed health.
+	labelsFor := clusterLabels(clusters)
+	gate := candidateGate{
+		record: rp,
+		check: func(cluster string) (*candidateSkip, bool) {
+			if labelsFor[cluster][constants.WorkloadClusterRolloutPolicyLabel] == WorkloadClusterRolloutPolicyCapability {
+				return nil, false
+			}
+			return &candidateSkip{
+				reason: v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
+				detail: fmt.Sprintf("cluster does not carry %s=%s; its InferenceService schema would prune the inflated plan's gate fields",
+					constants.WorkloadClusterRolloutPolicyLabel, WorkloadClusterRolloutPolicyCapability),
+			}, false
+		},
+		holdPlaced: func(skip candidateSkip) {
 			r.Log.Info("rollout preflight: standing winner lacks the capability label; holding actuation",
-				"cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name)
+				"cluster", skip.cluster, "isvc", isvc.Namespace+"/"+isvc.Name)
 			rp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse,
 				v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
 				fmt.Sprintf("rollout policy: standing winner %s lacks %s=%s; holding placement",
-					c, constants.WorkloadClusterRolloutPolicyLabel, WorkloadClusterRolloutPolicyCapability)))
-			return &policyPreflightOutcome{holdAsIs: true}
-		}
-		skips = append(skips, candidateSkip{
-			cluster: c,
-			reason:  v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
-			detail: fmt.Sprintf("cluster does not carry %s=%s; its InferenceService schema would prune the inflated plan's gate fields",
-				constants.WorkloadClusterRolloutPolicyLabel, WorkloadClusterRolloutPolicyCapability),
-		})
+					skip.cluster, constants.WorkloadClusterRolloutPolicyLabel, WorkloadClusterRolloutPolicyCapability)))
+		},
+		messagePrefix: "rollout policy: ",
 	}
-	if len(eligible) == 0 {
-		rp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse,
-			v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
-			"rollout policy: no eligible candidate remains; skipped: "+describeSkips(skips)))
-		return &policyPreflightOutcome{hold: true}
-	}
-	msg := fmt.Sprintf("rollout policy: %d of %d candidates eligible", len(eligible), len(candidates))
-	if len(skips) > 0 {
-		msg += "; skipped: " + describeSkips(skips)
-	}
-	rp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionTrue,
-		v1beta1.PlacementPolicyPreflightReasonPassed, msg))
-	return &policyPreflightOutcome{eligible: eligible}
+	return gate.run(isvc.UID, candidates, winnerCluster(isvc))
 }
 
 // warnManualPauseGates emits one Warning event (deduped on content) when the
@@ -480,7 +394,7 @@ func (r *Reconciler) rolloutStatusForWrite(isvc *v1beta1.InferenceService, res *
 		conds = append(conds, pre)
 	}
 	for i := range res.candidates {
-		if obs := rp.memberFor(isvc.UID, res.candidates[i].Cluster); obs != nil {
+		if obs, _ := rp.memberFor(isvc.UID, res.candidates[i].Cluster); obs != nil {
 			res.candidates[i].Rollout = cloneCandidateRollout(obs)
 		}
 	}

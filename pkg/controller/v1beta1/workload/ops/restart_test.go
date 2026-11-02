@@ -2981,15 +2981,12 @@ func TestRestart_RebuildWithNoPodYetFollowsTheTarget(t *testing.T) {
 	cases := []struct {
 		name string
 		gang bool
-		// leaderRebuilt seeds a pod of the rebuild before the pass.
-		leaderRebuilt bool
 		// held puts the target under a Held RetryBlock.
 		held    bool
 		follows bool
 	}{
 		{name: "single pod", follows: true},
 		{name: "gang", gang: true, follows: true},
-		{name: "gang whose leader is already rebuilt", gang: true, leaderRebuilt: true},
 		{name: "target the RetryBlock holds", held: true},
 	}
 	for _, tc := range cases {
@@ -3007,13 +3004,6 @@ func TestRestart_RebuildWithNoPodYetFollowsTheTarget(t *testing.T) {
 			running := mintEngineRevision(t, c, isvc, spec(runningImage), runningWorker)
 			target := mintEngineRevision(t, c, isvc, spec(movedImage), movedWorker)
 			restartingRow(t, c, isvc, running.Name)
-			if tc.leaderRebuilt {
-				leader := gangPod(isvc, 0, "leader", 0, 2, false, false)
-				leader.Labels[query.LabelRevisionHash] = query.RevisionOf(running).Hash()
-				if err := c.Create(context.Background(), leader); err != nil {
-					t.Fatalf("seed the rebuilt leader: %v", err)
-				}
-			}
 
 			input := buildTestInput(isvc, c, workload.ComponentEngine)
 			input.DesiredSpec.PodSpec = spec(movedImage)
@@ -3047,9 +3037,6 @@ func TestRestart_RebuildWithNoPodYetFollowsTheTarget(t *testing.T) {
 				t.Fatalf("pods: got %d want %d", len(pods.Items), want)
 			}
 			for _, pod := range pods.Items {
-				if tc.leaderRebuilt && pod.Labels[query.LabelRunner] == "leader" {
-					continue
-				}
 				if got := pod.Labels[query.LabelRevisionHash]; got != query.RevisionOf(wantRevision).Hash() {
 					t.Errorf("pod %s revision label = %q, want %s", pod.Name, got, wantRevision.Name)
 				}
@@ -4486,6 +4473,161 @@ func TestRepairRetryAt_OwesNothingToARowWithNoKeptRestart(t *testing.T) {
 			row := &workload.InstanceStatus{Index: 0, Incarnation: 2, Phase: workload.InstancePhaseFailed, Operation: tc.op, LastFailure: failure}
 			if at, owed := ops.RepairRetryAt(input, row); owed {
 				t.Errorf("owed a retry at %v, want none: the clock runs on a kept Restart alone", at)
+			}
+		})
+	}
+}
+
+// A repair whose rebuilt set exists on a revision the roll has since
+// dropped, and whose set is not yet runtime-ready, replaces that set at
+// the new target as the roll replaces its own in-flight attempt: the
+// set's pods are deleted in the pass that reads the new target, nothing
+// is created beside them, and the pass after the pods are gone rebuilds
+// the Instance on the target and records it on the row. A set that is
+// one promote from serving finishes on the revision it carries, and so
+// does one under a target the RetryBlock holds or a paused Component,
+// since the roll it would follow cannot start.
+func TestRestart_RebuildOnADroppedRevisionIsRebuiltAtTheTarget(t *testing.T) {
+	const (
+		builtImage = "registry.example.com/runtime:v2"
+		fixImage   = "registry.example.com/runtime:v3"
+	)
+	cases := []struct {
+		name string
+		gang bool
+		// runtimeReady seeds the rebuilt pod with ContainersReady true.
+		runtimeReady bool
+		// held puts the target under a Held RetryBlock; paused pauses
+		// the Component.
+		held, paused bool
+		// replaced is the expected outcome: the rebuilt set is deleted and
+		// rebuilt on the target.
+		replaced bool
+	}{
+		{name: "single pod", replaced: true},
+		{name: "gang whose leader is already rebuilt", gang: true, replaced: true},
+		{name: "single pod one promote from serving", runtimeReady: true},
+		{name: "target the RetryBlock holds", held: true},
+		{name: "paused Component", paused: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resetExpectations(t)
+			isvc, ir := isvcReadyAtIncarnation("llama-70b", "prod", 1)
+			c := newFakeClient(t, isvc, ir)
+			spec := func(image string) *corev1.PodSpec {
+				return &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: image}}}
+			}
+			var builtWorker, fixWorker *corev1.PodSpec
+			if tc.gang {
+				builtWorker, fixWorker = spec(builtImage), spec(fixImage)
+			}
+			built := mintEngineRevision(t, c, isvc, spec(builtImage), builtWorker)
+			target := mintEngineRevision(t, c, isvc, spec(fixImage), fixWorker)
+			restartingRow(t, c, isvc, built.Name)
+			var rebuilt *corev1.Pod
+			if tc.gang {
+				rebuilt = gangPod(isvc, 0, "leader", 0, 2, tc.runtimeReady, false)
+			} else {
+				rebuilt = podAtIncarnation(isvc, 0, 2, tc.runtimeReady, false)
+			}
+			rebuilt.Labels[query.LabelRevisionHash] = query.RevisionOf(built).Hash()
+			rebuilt.Spec.Containers[0].Image = builtImage
+			rebuilt.UID = k8stypes.UID(rebuilt.Name + "-built")
+			if err := c.Create(context.Background(), rebuilt); err != nil {
+				t.Fatalf("seed the rebuilt pod: %v", err)
+			}
+
+			input := buildTestInput(isvc, c, workload.ComponentEngine)
+			input.DesiredSpec.PodSpec = spec(fixImage)
+			input.DesiredSpec.WorkerPodSpec = fixWorker
+			input.ObservedState.UpdateRevision = target.Name
+			if tc.held {
+				input.ObservedState.RetryBlocks = []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockHeld}}
+			}
+			plan := buildPlanSinglePodEngineForRestart(c, isvc)
+			if tc.gang {
+				plan = buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
+			}
+			plan.Paused = tc.paused
+
+			listPods := func() []corev1.Pod {
+				pods := &corev1.PodList{}
+				if err := c.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+					t.Fatalf("list pods: %v", err)
+				}
+				return pods.Items
+			}
+			done, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], target, "pod count 0 below desired 1")
+			if err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			if done {
+				t.Fatalf("expected done=false: the Instance is not Ready")
+			}
+			row := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+			if row == nil || row.Phase != v1beta1.OMENativeInstanceRestarting {
+				t.Fatalf("row = %+v, want an open Restart", row)
+			}
+			if !tc.replaced {
+				pods := listPods()
+				if len(pods) == 0 || pods[0].Name != rebuilt.Name || pods[0].DeletionTimestamp != nil {
+					t.Fatalf("the rebuilt pod on %s must stand: pods = %d", built.Name, len(pods))
+				}
+				for _, pod := range pods {
+					if got := pod.Labels[query.LabelRevisionHash]; got != query.RevisionOf(built).Hash() {
+						t.Errorf("pod %s revision label = %q, want %s: the rebuild finishes on the revision it carries", pod.Name, got, built.Name)
+					}
+				}
+				if row.Incarnation != 2 || row.RunningRevision != built.Name {
+					t.Fatalf("row = {incarnation:%d running:%s}, want the attempt kept at incarnation 2 on %s", row.Incarnation, row.RunningRevision, built.Name)
+				}
+				return
+			}
+			if pods := listPods(); len(pods) != 0 {
+				names := make([]string, 0, len(pods))
+				for _, pod := range pods {
+					names = append(names, pod.Name+"@"+pod.Labels[query.LabelRevisionHash])
+				}
+				t.Fatalf("pods after the pass = %v, want the set on %s deleted and nothing created beside it", names, built.Name)
+			}
+			if row.Incarnation != 3 {
+				t.Fatalf("row Incarnation = %d, want 3: the replaced set is the old set of the next one", row.Incarnation)
+			}
+
+			// The pass after the deleted pods are gone rebuilds the set on
+			// the target and records it on the row; the watch has caught up
+			// with the deletes by then.
+			resetExpectations(t)
+			input = buildTestInput(isvc, c, workload.ComponentEngine)
+			input.DesiredSpec.PodSpec = spec(fixImage)
+			input.DesiredSpec.WorkerPodSpec = fixWorker
+			input.ObservedState.UpdateRevision = target.Name
+			plan = buildPlanSinglePodEngineForRestart(c, isvc)
+			if tc.gang {
+				plan = buildPlanGangEngine(workload.RestartPolicyRecreateInstance)
+			}
+			if _, err := ops.Restart(context.Background(), workload.Deps{Client: c}, input, plan, plan.Instances[0], target, "pod count 0 below desired 1"); err != nil {
+				t.Fatalf("Restart (rebuild): %v", err)
+			}
+			pods := listPods()
+			if want := len(plan.Instances[0].Runners); len(pods) != want {
+				t.Fatalf("pods after the rebuild: got %d want %d", len(pods), want)
+			}
+			for _, pod := range pods {
+				if got := pod.Labels[query.LabelRevisionHash]; got != query.RevisionOf(target).Hash() {
+					t.Errorf("pod %s revision label = %q, want %s", pod.Name, got, target.Name)
+				}
+				if got := pod.Spec.Containers[0].Image; got != fixImage {
+					t.Errorf("pod %s image = %q, want %q", pod.Name, got, fixImage)
+				}
+				if got := pod.Labels[query.LabelInstanceIncarnation]; got != "3" {
+					t.Errorf("pod %s incarnation label = %q, want 3", pod.Name, got)
+				}
+			}
+			row = findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+			if row == nil || row.Phase != v1beta1.OMENativeInstanceRestarting || row.RunningRevision != target.Name {
+				t.Fatalf("row = %+v, want Restarting recording %s", row, target.Name)
 			}
 		})
 	}

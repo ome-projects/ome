@@ -1896,12 +1896,12 @@ func (d *driver) earliestNodeEvidence(ctx context.Context, pods []*corev1.Pod, t
 }
 
 // waitingTerminally reports whether any of a pod's containers is parked in
-// a waiting reason it cannot get itself out of — the set the stuck-pod
-// grace runs against.
+// a waiting state it cannot get itself out of (types.IsTerminalWaiting) —
+// the set the stuck-pod grace runs against.
 func waitingTerminally(pod *corev1.Pod) bool {
 	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
 		for _, cs := range statuses {
-			if cs.State.Waiting != nil && types.IsTerminalWaitingReason(cs.State.Waiting.Reason) {
+			if types.IsTerminalWaiting(cs.State.Waiting) {
 				return true
 			}
 		}

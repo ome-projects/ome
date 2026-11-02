@@ -1,10 +1,11 @@
 package workload
 
 import (
-	"sort"
+	"slices"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -196,185 +197,247 @@ func MigrationModeOrDefault(p *types.MigrationPolicy) types.MigrationMode {
 }
 
 // instancePlanIndices computes the per-Instance index set the plan should
-// drive: live surge pairs (unbounded by replicas), then the existing
-// steady indices up to the replica cap — in rank order (scaleDownRank),
-// lowest index first within a rank — excluding sources whose replacements
-// are proven promoted, then new indices to round out scale-up. blocks is
-// the Component's retry ladder, which the rank reads a row's revision by;
-// cordoned holds the indices with a pod on a cordoned node, which rank
-// below every other row.
+// drive, in three steps over one reading of the rows. Keep: a surge pair
+// in flight stays whatever the count, the source charged to it and the
+// replacement the transient extra over it. Rank: the steady rows fill
+// the rest of the count in rank order (scaleDownRank), lowest index first
+// within a rank, so a scale-down removes the highest ranks first; a
+// source whose replacement is proven promoted is terminal cleanup and
+// fills no slot. Add: new indexes round a scale-up out, lowest unused
+// first. blocks lists the Component's retry blocks, which the rank reads a
+// row's revision by; cordoned holds the indices with a pod on a cordoned
+// node, which rank below every other row.
 //
-// The replica cap counts only non-migration indices. Counting the
-// surge against it would drop a healthy non-migrating sibling out of
-// the plan and into scale-down.
-//
-// A gang surge whose source has failed holds no pin: the pair competes
-// for the steady budget behind the Ready rows, the source charged like
-// any steady row and its marker following the source in or out, so the
-// two leave the plan together and the scale-down retires them as one
-// unit instead of taking a healthy sibling. The pair counts as cordoned
-// when either half has a pod on a cordoned node.
+// A gang surge whose source has failed keeps nothing by itself: the pair
+// competes for the count behind the Ready rows as one unit, the source
+// charged like any steady row and its replacement row following it in or
+// out, so a scale-down retires the two together instead of taking a
+// healthy sibling. The pair counts as cordoned when either half is.
 func instancePlanIndices(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock, cordoned map[int32]struct{}) []int32 {
+	sel := readIndexSelection(instances, replicas, blocks, cordoned)
+	sel.keepPairsInFlight()
+	sel.fillCountByRank()
+	sel.addNewIndexes()
+	slices.Sort(sel.chosen)
+	return sel.chosen
+}
+
+// indexSelection is one plan's choice of Instance indexes, read once from
+// the rows and filled by the three steps of instancePlanIndices.
+type indexSelection struct {
+	replicas int32
+	// existing lists every recorded index, ascending.
+	existing []int32
+	rows     map[int32]types.InstanceStatus
+	rank     map[int32]int
+
+	// pairMembers holds both halves of every surge pair in flight, kept
+	// whatever the count; pairSources holds the halves charged to it.
+	pairMembers map[int32]struct{}
+	pairSources map[int32]struct{}
+	// retiring holds the sources whose replacement is proven promoted.
+	retiring map[int32]struct{}
+	// A failed gang surge pair moves as one unit: failedTargetOf names the
+	// replacement row that follows each failed source, failedSourceOf the
+	// source each such row follows.
+	failedTargetOf map[int32]int32
+	failedSourceOf map[int32]int32
+
+	// chosen and picked hold the indexes selected so far; charged counts
+	// the ones charged to the count.
+	chosen  []int32
+	picked  map[int32]struct{}
+	charged int32
+}
+
+// readIndexSelection reads the rows once: the indexes they record, the
+// surge pairs in flight and the rank of every row.
+func readIndexSelection(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock, cordoned map[int32]struct{}) *indexSelection {
 	used := existingInstanceIndices(instances)
-	// "Protected" / "source" sets cover BOTH migration surge pairs and
-	// multi-pod (gang) update-surge pairs — the two cases that transiently
-	// hold an extra index over the replica cap. Union the gang-surge sets
-	// in so the Pass 1/2/3 algorithm below treats them identically (pin
-	// the pair; count only the source toward the steady budget).
-	migrationProtected := migrationInFlightIndices(instances)
-	for idx := range updateSurgeInFlightIndices(instances) {
-		migrationProtected[idx] = struct{}{}
+	sel := &indexSelection{
+		replicas:    replicas,
+		existing:    make([]int32, 0, len(used)),
+		rows:        make(map[int32]types.InstanceStatus, len(instances)),
+		rank:        make(map[int32]int, len(instances)),
+		pairMembers: migrationInFlightIndices(instances),
+		pairSources: migrationSourceIndices(instances),
+		retiring:    map[int32]struct{}{},
+		chosen:      make([]int32, 0, len(used)),
+		picked:      map[int32]struct{}{},
 	}
-	migrationSource := migrationSourceIndices(instances)
-	for idx := range updateSurgeSourceIndices(instances) {
-		migrationSource[idx] = struct{}{}
-	}
-	unpinnedSources := failedGangSurgeSources(instances)
-	markerOf, sourceOf := failedGangSurgeFollowers(instances)
-	// Every claim reserves its target for uniqueness; the handoff predicates
-	// separately decide whether a source has enough proof to retire. A
-	// failed source's claim reserves without pinning.
-	handoffTargetReferences := map[int32]int{}
-	for _, s := range instances {
-		if s.Operation == nil || s.Operation.SurgeIndex == nil {
-			continue
-		}
-		targetIndex := *s.Operation.SurgeIndex
-		switch s.Operation.Type {
-		case types.InstanceOperationMigrate, types.InstanceOperationUpdate:
-			handoffTargetReferences[targetIndex]++
-			if _, unpinned := unpinnedSources[s.Index]; !unpinned {
-				migrationProtected[targetIndex] = struct{}{}
-			}
-		}
-	}
-
-	// The steady rows are kept in rank order, rank 0 first, so a scale-down
-	// removes the highest-numbered ranks first.
-	rankByIndex := map[int32]int{}
-	statusByIndex := map[int32]types.InstanceStatus{}
-	retiringSources := map[int32]struct{}{}
-	for _, s := range instances {
-		statusByIndex[s.Index] = s
-		_, onCordonedNode := cordoned[s.Index]
-		if marker, paired := markerOf[s.Index]; paired {
-			_, markerOnCordonedNode := cordoned[marker]
-			onCordonedNode = onCordonedNode || markerOnCordonedNode
-		}
-		rankByIndex[s.Index] = scaleDownRank(s, blocks, onCordonedNode)
-	}
-
-	// A handoff source retires only after its replacement is Ready. Gang updates
-	// additionally require the drain step and the operation's pinned revision;
-	// a fresh claim that collides with an occupied index stays protected.
-	for _, s := range instances {
-		if s.Operation == nil || s.Operation.SurgeIndex == nil {
-			continue
-		}
-		targetIndex := *s.Operation.SurgeIndex
-		if s.Operation.Type != types.InstanceOperationUpdate {
-			target, found := statusByIndex[targetIndex]
-			if found && migrationHandoffPromoted(s, target, handoffTargetReferences[targetIndex]) {
-				delete(migrationProtected, s.Index)
-				delete(migrationProtected, targetIndex)
-				delete(migrationSource, s.Index)
-				retiringSources[s.Index] = struct{}{}
-			}
-			continue
-		}
-		target, found := statusByIndex[targetIndex]
-		if !found || !updateHandoffPromoted(s, target, handoffTargetReferences[targetIndex]) {
-			continue
-		}
-		delete(migrationProtected, s.Index)
-		delete(migrationProtected, targetIndex)
-		delete(migrationSource, s.Index)
-		retiringSources[s.Index] = struct{}{}
-	}
-
-	sorted := make([]int32, 0, len(used))
 	for idx := range used {
-		sorted = append(sorted, idx)
+		sel.existing = append(sel.existing, idx)
 	}
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sel.existing)
+	for idx := range updateSurgeInFlightIndices(instances) {
+		sel.pairMembers[idx] = struct{}{}
+	}
+	for idx := range updateSurgeSourceIndices(instances) {
+		sel.pairSources[idx] = struct{}{}
+	}
+	sel.failedTargetOf, sel.failedSourceOf = failedGangSurgeFollowers(instances)
+	claims := sel.claimReplacements(instances)
+	sel.rankRows(instances, blocks, cordoned)
+	sel.releasePromotedSources(instances, claims)
+	return sel
+}
 
-	indices := make([]int32, 0, len(sorted))
-	picked := map[int32]struct{}{}
+// claimsReplacement reports whether the row's attempt claims a replacement
+// index: a migration or an update with a surge index.
+func claimsReplacement(s types.InstanceStatus) bool {
+	if s.Operation == nil || s.Operation.SurgeIndex == nil {
+		return false
+	}
+	return s.Operation.Type == types.InstanceOperationMigrate || s.Operation.Type == types.InstanceOperationUpdate
+}
 
-	// Pass 1: pin migration-in-flight indices (no cap on count; both
-	// source AND surge get pinned). Only the source counts toward the
-	// steady replica budget — it IS the user-facing replica being
-	// relocated; the surge is the transient +1 and does not.
-	steadyCount := int32(0)
-	for _, idx := range sorted {
-		if _, protected := migrationProtected[idx]; !protected {
+// claimReplacements counts the sources that claim each replacement index
+// and keeps the replacement of every source that has not failed beside its
+// source. Every claim counts, so an index two sources name promotes
+// neither; a failed source's claim keeps nothing. Whether a source has
+// proof enough to retire is decided after the rows are read
+// (releasePromotedSources).
+func (sel *indexSelection) claimReplacements(instances []types.InstanceStatus) map[int32]int {
+	failed := failedGangSurgeSources(instances)
+	claims := map[int32]int{}
+	for _, s := range instances {
+		if !claimsReplacement(s) {
 			continue
 		}
-		indices = append(indices, idx)
-		picked[idx] = struct{}{}
-		if _, isSource := migrationSource[idx]; isSource {
-			steadyCount++
+		target := *s.Operation.SurgeIndex
+		claims[target]++
+		if _, sourceFailed := failed[s.Index]; !sourceFailed {
+			sel.pairMembers[target] = struct{}{}
 		}
 	}
+	return claims
+}
 
-	// Pass 2: fill the steady replica budget in rank order, keeping the
-	// lowest eligible index within each rank.
-	fill := func(rank int) {
-		for _, idx := range sorted {
-			if steadyCount >= replicas {
+// rankRows records every row by its index and ranks it for a scale-down.
+// A failed gang surge pair counts as cordoned when either half has a pod
+// on a cordoned node.
+func (sel *indexSelection) rankRows(instances []types.InstanceStatus, blocks []types.RetryBlock, cordoned map[int32]struct{}) {
+	for _, s := range instances {
+		sel.rows[s.Index] = s
+		_, onCordonedNode := cordoned[s.Index]
+		if target, paired := sel.failedTargetOf[s.Index]; paired {
+			if _, targetCordoned := cordoned[target]; targetCordoned {
+				onCordonedNode = true
+			}
+		}
+		sel.rank[s.Index] = scaleDownRank(s, blocks, onCordonedNode)
+	}
+}
+
+// releasePromotedSources frees every pair whose replacement is proven
+// promoted: the pair keeps neither half any more, and the source is
+// terminal cleanup that fills no slot of the count.
+func (sel *indexSelection) releasePromotedSources(instances []types.InstanceStatus, claims map[int32]int) {
+	for _, s := range instances {
+		if s.Operation == nil || s.Operation.SurgeIndex == nil {
+			continue
+		}
+		target := *s.Operation.SurgeIndex
+		row, found := sel.rows[target]
+		if !found || !replacementPromoted(s, row, claims[target]) {
+			continue
+		}
+		delete(sel.pairMembers, s.Index)
+		delete(sel.pairMembers, target)
+		delete(sel.pairSources, s.Index)
+		sel.retiring[s.Index] = struct{}{}
+	}
+}
+
+// replacementPromoted reports whether a source's replacement carries the
+// proof its verb demands: a gang update's drain step and the attempt's
+// recorded revision, a migration's Ready target on the source's revision.
+func replacementPromoted(source, target types.InstanceStatus, claims int) bool {
+	if source.Operation.Type == types.InstanceOperationUpdate {
+		return updateHandoffPromoted(source, target, claims)
+	}
+	return migrationHandoffPromoted(source, target, claims)
+}
+
+// keepPairsInFlight keeps both halves of every surge pair in flight,
+// whatever the count, and charges the sources to it: the source is the
+// replica being replaced, the replacement the transient extra.
+func (sel *indexSelection) keepPairsInFlight() {
+	for _, idx := range sel.existing {
+		if _, member := sel.pairMembers[idx]; !member {
+			continue
+		}
+		sel.choose(idx)
+		if _, source := sel.pairSources[idx]; source {
+			sel.charged++
+		}
+	}
+}
+
+// fillCountByRank fills the rest of the count with the steady rows, rank
+// 0 first and the lowest index first within a rank, so a scale-down
+// removes the highest ranks first. A row kept this way brings a failed
+// gang surge's replacement row along, uncharged.
+func (sel *indexSelection) fillCountByRank() {
+	for rank := 0; rank <= lowestScaleDownRank; rank++ {
+		for _, idx := range sel.existing {
+			if sel.charged >= sel.replicas {
 				return
 			}
-			if _, already := picked[idx]; already {
+			if !sel.fillsSlot(idx, rank) {
 				continue
 			}
-			// A source with a proven promoted replacement is terminal cleanup,
-			// not a fallback for an unrelated Instance awaiting status promotion.
-			if _, retiring := retiringSources[idx]; retiring {
-				continue
-			}
-			// A failed gang surge's marker is its source's to bring along.
-			if _, follower := sourceOf[idx]; follower {
-				continue
-			}
-			if rankByIndex[idx] != rank {
-				continue
-			}
-			indices = append(indices, idx)
-			picked[idx] = struct{}{}
-			steadyCount++
-			if marker, paired := markerOf[idx]; paired {
-				if _, already := picked[marker]; !already {
-					indices = append(indices, marker)
-					picked[marker] = struct{}{}
-				}
+			sel.choose(idx)
+			sel.charged++
+			if target, paired := sel.failedTargetOf[idx]; paired {
+				sel.choose(target)
 			}
 		}
 	}
-	for rank := 0; rank <= lowestScaleDownRank; rank++ {
-		fill(rank)
-	}
+}
 
-	// Pass 3: allocate new slots for scale-up, lowest unused index first.
-	// Every index below a slot just taken is in use, so the search for the
-	// next slot resumes at that slot, and a scale-up of any size pays one
-	// pass over the indexes in all.
-	taken := make(map[int32]struct{}, len(used)+len(indices))
-	for k, v := range used {
-		taken[k] = v
+// fillsSlot reports whether the row at idx may fill a slot of the count at
+// this rank: not chosen yet, not a retiring source, not the replacement
+// row of a failed gang surge (its source brings it), and ranked here.
+func (sel *indexSelection) fillsSlot(idx int32, rank int) bool {
+	if _, already := sel.picked[idx]; already {
+		return false
 	}
-	for _, idx := range indices {
+	if _, retiring := sel.retiring[idx]; retiring {
+		return false
+	}
+	if _, follows := sel.failedSourceOf[idx]; follows {
+		return false
+	}
+	return sel.rank[idx] == rank
+}
+
+// choose adds an index to the selection once.
+func (sel *indexSelection) choose(idx int32) {
+	if _, already := sel.picked[idx]; already {
+		return
+	}
+	sel.chosen = append(sel.chosen, idx)
+	sel.picked[idx] = struct{}{}
+}
+
+// addNewIndexes rounds a scale-up out with the lowest unused indexes,
+// lowest first. An index a row records stays taken whether or not the
+// plan keeps the row. Every index below a slot just taken is in use, so
+// the search resumes at that slot and a scale-up of any size pays one
+// pass over the indexes in all.
+func (sel *indexSelection) addNewIndexes() {
+	taken := make(map[int32]struct{}, len(sel.existing))
+	for _, idx := range sel.existing {
 		taken[idx] = struct{}{}
 	}
 	slot := int32(0)
-	for steadyCount < replicas {
+	for sel.charged < sel.replicas {
 		slot = lowestUnusedIndex(taken, slot)
-		indices = append(indices, slot)
+		sel.chosen = append(sel.chosen, slot)
 		taken[slot] = struct{}{}
-		steadyCount++
+		sel.charged++
 	}
-
-	sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
-	return indices
 }
 
 // scaleDownRank orders the steady rows a scale-down keeps, lowest kept

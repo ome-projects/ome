@@ -12,9 +12,6 @@ import (
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
-// replicaRefRoles is the order the referenced-form checks walk the roles.
-var replicaRefRoles = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}
-
 // validateReplicaRefs applies the referenced-form rules: the shape rules, the
 // block fixed at create (oldIsvc is nil on create) and, on create, the live
 // checks per named replica: it exists in the service's namespace, is
@@ -38,7 +35,7 @@ func (v *InferenceServiceValidator) validateReplicaRefs(ctx context.Context, old
 	if err != nil {
 		return err
 	}
-	for _, c := range replicaRefRoles {
+	for _, c := range validation.ComponentRoles {
 		name := validation.ReferencedReplica(&isvc.Spec, c)
 		if name == "" {
 			continue
@@ -90,7 +87,7 @@ func (v *InferenceServiceValidator) replicaReferrers(ctx context.Context, isvc *
 		if other.Name == isvc.Name {
 			continue
 		}
-		for _, c := range replicaRefRoles {
+		for _, c := range validation.ComponentRoles {
 			name := validation.ReferencedReplica(&other.Spec, c)
 			if _, taken := referrers[name]; name != "" && !taken {
 				referrers[name] = other.Name

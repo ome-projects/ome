@@ -8,11 +8,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // quietPod is a pod whose kubelet has stopped reporting: it still holds
@@ -46,17 +45,13 @@ func withdrawnPod(name, node string) *corev1.Pod {
 // status for age.
 func nodeReader(t *testing.T, name string, ready corev1.ConditionStatus, age time.Duration) types.Deps {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("scheme: %v", err)
-	}
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
 			Type: corev1.NodeReady, Status: ready, LastTransitionTime: metav1.NewTime(time.Now().Add(-age)),
 		}}},
 	}
-	return types.Deps{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(node).Build()}
+	return types.Deps{Client: fakeclient.New(t, fakeclient.WithObjects(node))}
 }
 
 // singlePodPlan is the plan entry for a one-Runner Instance.
@@ -120,14 +115,10 @@ func TestNodeUnknown_HoldsATargetNameASilentNodeKeeps(t *testing.T) {
 		// NodeGone, so the create pass force-deletes the pod this pass and
 		// the hold has nothing to report. Recording it anyway would park
 		// the deadline for one pass and restart it on the next.
-		scheme := runtime.NewScheme()
-		if err := corev1.AddToScheme(scheme); err != nil {
-			t.Fatalf("scheme: %v", err)
-		}
 		policy := &types.ForceDeletePolicy{OverdueSlack: time.Minute, NodeUnreachableThreshold: 5 * time.Minute}
 		store, _ := newStore(creatingRow(""))
 		applyPlannedUnder(t, store, map[int32][]*corev1.Pod{0: {quietPod(target, "node-gone")}},
-			types.Deps{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}, policy)
+			types.Deps{Client: fakeclient.New(t)}, policy)
 		if got := store.waiting(0); got != "" {
 			t.Errorf("waiting = %q, want none: the sweep frees the name on this pass", got)
 		}

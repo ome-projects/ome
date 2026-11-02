@@ -25,7 +25,7 @@ func ratioSplitSource(engine int, decoder *int) *v1beta1.InferenceService {
 func weightedAffinity(weights map[string]int32) []v1beta1.ClusterAffinityTerm {
 	var out []v1beta1.ClusterAffinityTerm
 	for _, name := range []string{"member-a", "member-b"} {
-		out = append(out, v1beta1.ClusterAffinityTerm{Weight: ptr.To(weights[name]), MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}})
+		out = append(out, v1beta1.ClusterAffinityTerm{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To(weights[name])}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}})
 	}
 	return out
 }
@@ -91,7 +91,7 @@ func TestSplitMemberFloorsFollowTheRatio(t *testing.T) {
 			candidates := settledCandidates(proposal.Assignments)
 			got := map[string]member{}
 			for _, candidate := range candidates {
-				floors, err := splitMemberFloors(source, candidates, candidate)
+				floors, err := splitMemberFloors(source, candidates, candidate, nil)
 				if err != nil {
 					t.Fatalf("%s: %v", candidate.Cluster, err)
 				}
@@ -121,6 +121,12 @@ func TestSplitMemberFloorsFollowCurrentShares(t *testing.T) {
 		source  func() *v1beta1.InferenceService
 		current map[string]int32
 		want    map[string]int32
+		// desired and the weights describe the plan; unset, every member is
+		// still moving and the decoder follows the engines. held is the
+		// decoder minimum each member copy holds; a member it omits has none.
+		desired               map[string]int32
+		weight, decoderWeight map[string]int64
+		held                  map[string]int32
 	}{
 		// A growing member and an outgoing member: the decoder follows each member's
 		// current engine target, not the plan it is moving toward.
@@ -133,17 +139,62 @@ func TestSplitMemberFloorsFollowCurrentShares(t *testing.T) {
 			source.Spec.Placement.Split = &v1beta1.SplitSpec{Replicas: ptr.To[int32](2)}
 			return source
 		}, current: map[string]int32{"member-a": 1, "member-b": 1, "member-c": 1}, want: map[string]int32{"member-a": 1, "member-b": 1, "member-c": 1}},
+		// member-b's engine target falls by one while member-a and member-c keep
+		// theirs, each holding 1 decoder. Until it lands, the engines in flight
+		// carry one decoder more than the minimum: 4 rather than 3, split 2/1/1
+		// by the engine targets. member-a already runs its final engine target
+		// and has its final decoder, so it does not start a second one.
+		{name: "members at their target start no decoder while another shrinks", source: func() *v1beta1.InferenceService { return ratioSplitSource(5, ptr.To(3)) },
+			current: map[string]int32{"member-a": 2, "member-b": 2, "member-c": 2}, desired: map[string]int32{"member-a": 2, "member-b": 1, "member-c": 2},
+			weight: map[string]int64{"member-a": 2, "member-b": 1, "member-c": 2}, held: map[string]int32{"member-a": 1, "member-b": 1, "member-c": 1},
+			want: map[string]int32{"member-a": 1, "member-b": 1, "member-c": 1}},
+		// The same with equal decoder weights: 7 decoders in flight split 3/2/2,
+		// and each member holds 2 of the minimum of 6.
+		{name: "members at their target start no weighted decoder while another shrinks", source: func() *v1beta1.InferenceService { return ratioSplitSource(11, ptr.To(6)) },
+			current: map[string]int32{"member-a": 4, "member-b": 4, "member-c": 4}, desired: map[string]int32{"member-a": 4, "member-b": 3, "member-c": 4},
+			weight: map[string]int64{"member-a": 4, "member-b": 3, "member-c": 4}, decoderWeight: map[string]int64{"member-a": 1, "member-b": 1, "member-c": 1},
+			held: map[string]int32{"member-a": 2, "member-b": 2, "member-c": 2}, want: map[string]int32{"member-a": 2, "member-b": 2, "member-c": 2}},
+		// member-c joins while member-b shrinks. Until member-c has engines, the
+		// 8 decoders stay on member-a and member-b, 4 each. member-a is at its
+		// engine target and will end with 2 decoders, but it keeps 4 until the
+		// move gets there: no extra engines are in flight yet.
+		{name: "member at its target keeps its decoders while another joins", source: func() *v1beta1.InferenceService { return ratioSplitSource(12, ptr.To(8)) },
+			current: map[string]int32{"member-a": 6, "member-b": 6, "member-c": 0}, desired: map[string]int32{"member-a": 6, "member-b": 3, "member-c": 3},
+			weight: map[string]int64{"member-a": 2, "member-b": 1, "member-c": 1}, decoderWeight: map[string]int64{"member-a": 1, "member-b": 1, "member-c": 2},
+			held: map[string]int32{"member-a": 4, "member-b": 4}, want: map[string]int32{"member-a": 4, "member-b": 4, "member-c": 0}},
+		// member-c has reached its 3 engines while member-b still runs 6, so 15
+		// engines carry 10 decoders, split 3/2/5. member-c, whose copy holds no
+		// decoder yet, takes its final 4 and does not start a fifth. member-a
+		// keeps 3 of the 4 it holds.
+		{name: "joiner at its target starts no decoder while another shrinks", source: func() *v1beta1.InferenceService { return ratioSplitSource(12, ptr.To(8)) },
+			current: map[string]int32{"member-a": 6, "member-b": 6, "member-c": 3}, desired: map[string]int32{"member-a": 6, "member-b": 3, "member-c": 3},
+			weight: map[string]int64{"member-a": 2, "member-b": 1, "member-c": 1}, decoderWeight: map[string]int64{"member-a": 1, "member-b": 1, "member-c": 2},
+			held: map[string]int32{"member-a": 4, "member-b": 4}, want: map[string]int32{"member-a": 3, "member-b": 2, "member-c": 4}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := tt.source()
 			var candidates []v1beta1.CandidatePlacement
 			for _, name := range []string{"member-a", "member-b", "member-c"} {
 				if current, ok := tt.current[name]; ok {
-					candidates = append(candidates, v1beta1.CandidatePlacement{Cluster: name, Allocation: &v1beta1.CandidateAllocationStatus{ClusterUID: types.UID(name + "-uid"), CurrentReplicas: current}})
+					allocation := &v1beta1.CandidateAllocationStatus{ClusterUID: types.UID(name + "-uid"), CurrentReplicas: current, DesiredReplicas: tt.desired[name]}
+					if weight, ok := tt.weight[name]; ok {
+						allocation.Weight = ptr.To(weight)
+					}
+					if weight, ok := tt.decoderWeight[name]; ok {
+						allocation.ComponentMatches = []v1beta1.ComponentAffinityMatch{{Component: v1beta1.DecoderComponent, Weight: ptr.To(weight)}}
+					}
+					candidates = append(candidates, v1beta1.CandidatePlacement{Cluster: name, Allocation: allocation})
 				}
 			}
 			for _, candidate := range candidates {
-				floors, err := splitMemberFloors(source, candidates, candidate)
+				var held map[v1beta1.ComponentType]int32
+				if tt.held != nil {
+					held = map[v1beta1.ComponentType]int32{}
+					if decoders, ok := tt.held[candidate.Cluster]; ok {
+						held[v1beta1.DecoderComponent] = decoders
+					}
+				}
+				floors, err := splitMemberFloors(source, candidates, candidate, held)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -170,14 +221,14 @@ func TestSplitPlannedBoundsScaleTheCeiling(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := ratioSplitSource(60, ptr.To(40))
-			source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: tt.ceiling}
+			source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(tt.ceiling)}
 			clusters := []v1beta1.WorkloadCluster{wc("member-a", true, map[string]string{"accelerator": "gpu-a"}), wc("member-b", true, map[string]string{"accelerator": "gpu-a"})}
 			proposal, err := desiredSplitPlan(source, clusters, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			candidates := settledCandidates(proposal.Assignments)
-			got, err := splitPlannedBounds(source, candidates, candidates[0])
+			got, err := splitPlannedBounds(source, candidates, candidates[0], nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -205,6 +256,35 @@ func TestSplitPlannedBoundsScaleTheCeiling(t *testing.T) {
 				t.Errorf("router policy changed (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestScaleCeilRoundsUp(t *testing.T) {
+	for _, tt := range []struct {
+		name                          string
+		count, numerator, denominator int64
+		want                          int64
+	}{
+		{name: "exact multiple", count: 60, numerator: 40, denominator: 60, want: 40},
+		{name: "remainder rounds up", count: 50, numerator: 40, denominator: 60, want: 34},
+		{name: "zero count", count: 0, numerator: 7, denominator: 3, want: 0},
+		{name: "unit denominator", count: 9, numerator: 4, denominator: 1, want: 36},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := scaleCeil(tt.count, tt.numerator, tt.denominator); got != tt.want {
+				t.Fatalf("scaleCeil(%d, %d, %d) = %d, want %d", tt.count, tt.numerator, tt.denominator, got, tt.want)
+			}
+		})
+	}
+	for count := int64(0); count <= 40; count++ {
+		for numerator := int64(0); numerator <= 40; numerator++ {
+			for denominator := int64(1); denominator <= 40; denominator++ {
+				got, product := scaleCeil(count, numerator, denominator), count*numerator
+				if got*denominator < product || (got-1)*denominator >= product {
+					t.Fatalf("scaleCeil(%d, %d, %d) = %d is not the smallest count whose %d-fold reaches %d", count, numerator, denominator, got, denominator, product)
+				}
+			}
+		}
 	}
 }
 

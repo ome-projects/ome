@@ -6,6 +6,7 @@ import (
 
 	policyv1 "k8s.io/api/policy/v1"
 
+	"github.com/go-logr/logr"
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/onsi/gomega"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -14,6 +15,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -26,9 +28,14 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
+// TestDecoderReconcileOMENativeSubresources_LeaderSelector pins that the
+// decoder's stable Service selects only the leader pod whenever the effective
+// decoder shape is a leader/worker gang, whether the InferenceService or only
+// the runtime declares it, and keeps the broad selector for a single pod.
 func TestDecoderReconcileOMENativeSubresources_LeaderSelector(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
@@ -37,52 +44,66 @@ func TestDecoderReconcileOMENativeSubresources_LeaderSelector(t *testing.T) {
 	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
 	g.Expect(monitoringv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
 
+	decoderPodSpec := func() v1beta1.PodSpec {
+		return v1beta1.PodSpec{Containers: []v1.Container{{Name: "decoder", Image: "decoder:v1"}}}
+	}
+	gang := func() (*v1beta1.LeaderSpec, *v1beta1.WorkerSpec) {
+		return &v1beta1.LeaderSpec{PodSpec: decoderPodSpec()},
+			&v1beta1.WorkerSpec{Size: intPtr(3), PodSpec: decoderPodSpec()}
+	}
+	isvcGang := func() *v1beta1.DecoderSpec {
+		leader, worker := gang()
+		return &v1beta1.DecoderSpec{PodSpec: decoderPodSpec(), Leader: leader, Worker: worker}
+	}
+	runtimeGang := func() *v1beta1.ServingRuntimeSpec {
+		leader, worker := gang()
+		return &v1beta1.ServingRuntimeSpec{DecoderConfig: &v1beta1.DecoderSpec{
+			PodSpec: decoderPodSpec(), Leader: leader, Worker: worker,
+		}}
+	}
+
 	tests := []struct {
-		name                  string
-		workerSize            *int
-		wantStableSelectorHas string
+		name           string
+		isvcDecoder    *v1beta1.DecoderSpec
+		runtime        *v1beta1.ServingRuntimeSpec
+		wantLeaderOnly bool
 	}{
 		{
-			name:                  "single-pod decoder has no pod-ordinal filter",
-			workerSize:            nil,
-			wantStableSelectorHas: "",
+			name:        "single-pod decoder keeps the broad selector",
+			isvcDecoder: &v1beta1.DecoderSpec{PodSpec: decoderPodSpec()},
 		},
 		{
-			name:                  "multi-pod decoder selects leader ordinal zero",
-			workerSize:            intPtr(3),
-			wantStableSelectorHas: "0",
+			name:           "leader and worker declared on the InferenceService select the leader",
+			isvcDecoder:    isvcGang(),
+			wantLeaderOnly: true,
+		},
+		{
+			name:           "leader and worker supplied only by the runtime select the leader",
+			isvcDecoder:    &v1beta1.DecoderSpec{},
+			runtime:        runtimeGang(),
+			wantLeaderOnly: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			decoderSpec := &v1beta1.DecoderSpec{
-				PodSpec: v1beta1.PodSpec{
-					Containers: []v1.Container{{Name: "decoder", Image: "decoder:v1"}},
-				},
-			}
-			if tt.workerSize != nil {
-				decoderSpec.Leader = &v1beta1.LeaderSpec{
-					PodSpec: v1beta1.PodSpec{
-						Containers: []v1.Container{{Name: "decoder", Image: "decoder:v1"}},
-					},
-				}
-				decoderSpec.Worker = &v1beta1.WorkerSpec{
-					Size: tt.workerSize,
-					PodSpec: v1beta1.PodSpec{
-						Containers: []v1.Container{{Name: "decoder", Image: "decoder:v1"}},
-					},
-				}
-			}
-
+			g := gomega.NewGomegaWithT(t)
 			isvc := &v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-isvc", Namespace: "default",
 					UID: types.UID("test-isvc-uid"),
 				},
 				Spec: v1beta1.InferenceServiceSpec{
-					Decoder: decoderSpec,
+					Engine:  &v1beta1.EngineSpec{PodSpec: decoderPodSpec()},
+					Decoder: tt.isvcDecoder,
 				},
+			}
+			decoderSpec := tt.isvcDecoder
+			if tt.runtime != nil {
+				specs, err := isvcutils.MergeRuntimeRoleSpecs(isvc.DeepCopy(), tt.runtime, logr.Discard())
+				merged := specs.Decoder
+				g.Expect(err).NotTo(gomega.HaveOccurred())
+				decoderSpec = merged
 			}
 			objectMeta := metav1.ObjectMeta{
 				Name:      "test-isvc-decoder",
@@ -110,14 +131,27 @@ func TestDecoderReconcileOMENativeSubresources_LeaderSelector(t *testing.T) {
 				svc)).To(gomega.Succeed())
 			g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(
 				constants.OMEComponentLabel, string(v1beta1.DecoderComponent)))
-			if tt.wantStableSelectorHas == "" {
-				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelPodOrdinal))
-				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelRunner))
-			} else {
-				g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(
-					query.LabelPodOrdinal, tt.wantStableSelectorHas))
+			podLabels := func(runner v1beta1.RunnerName, ordinal string) labels.Set {
+				return labels.Set{
+					constants.InferenceServicePodLabelKey: "test-isvc",
+					constants.OMEComponentLabel:           string(v1beta1.DecoderComponent),
+					query.LabelManagedBy:                  query.ManagedByOMENative,
+					query.LabelRunner:                     string(runner),
+					query.LabelPodOrdinal:                 ordinal,
+				}
+			}
+			selector := labels.SelectorFromSet(svc.Spec.Selector)
+			if tt.wantLeaderOnly {
+				g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(query.LabelPodOrdinal, "0"))
 				g.Expect(svc.Spec.Selector).To(gomega.HaveKeyWithValue(
 					query.LabelRunner, string(v1beta1.RunnerNameLeader)))
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameLeader, "0"))).To(gomega.BeTrue())
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameWorker, "0"))).To(gomega.BeFalse(),
+					"a worker pod must never be an endpoint")
+			} else {
+				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelPodOrdinal))
+				g.Expect(svc.Spec.Selector).NotTo(gomega.HaveKey(query.LabelRunner))
+				g.Expect(selector.Matches(podLabels(v1beta1.RunnerNameDefault, "1"))).To(gomega.BeTrue())
 			}
 
 			pm := &monitoringv1.PodMonitor{}
@@ -1328,7 +1362,7 @@ func TestDecoderResourceMerging(t *testing.T) {
 				tt.decoderSpec,
 			).(*Decoder)
 
-			// Call reconcilePodSpec which internally calls MergeDecoderResources
+			// Call reconcilePodSpec which internally calls MergeRoleResources
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
 			podSpec, err := decoder.reconcilePodSpec(isvc, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
@@ -1504,7 +1538,7 @@ func TestDecoderAffinityMerging(t *testing.T) {
 				tt.decoderSpec,
 			).(*Decoder)
 
-			// Call reconcilePodSpec which internally calls UpdateDecoderAffinity
+			// Call reconcilePodSpec which internally calls UpdateRoleAffinity
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
 			podSpec, err := decoder.reconcilePodSpec(isvc, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())

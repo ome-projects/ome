@@ -1177,7 +1177,7 @@ func evResumeStale(isvc *v1beta1.InferenceService, _ *ReconcileInputs) {
 	annotate(isvc, constants.RolloutResumeAnnotation, "old")
 }
 
-// evResumeOwnUntargeted names the unit's own parked revision after the spec
+// evResumeOwnUntargeted names the unit's own stopped revision after the spec
 // went back to the stable revision: the primary's replica reports the stable
 // revision as its target again. evResumeOwnUntargetedRunClosed is the same
 // value on a settled rollback, whose run has closed.
@@ -1917,7 +1917,7 @@ func TestReconcileCells(t *testing.T) {
 		{"canary/Failed/resume", fixtureFailed, evResumeOwn, cellWant{state: staging, phase: v1beta1.RolloutPhasePending, active: true, consume: []string{constants.RolloutResumeAnnotation}}},
 		{"canary/Failed/resume[stale]", fixtureFailed, evResumeStale, cellWant{state: failed, phase: v1beta1.RolloutPhaseFailed, active: true, consume: []string{constants.RolloutResumeAnnotation}}},
 		{"canary/Failed[stableMissing]/resume", fixtureFailedStableMissing, evResumeOwn, cellWant{state: staging, phase: v1beta1.RolloutPhasePending, active: true, consume: []string{constants.RolloutResumeAnnotation}}},
-		// resume[untargeted]: the value names the parked revision, but the spec went
+		// resume[untargeted]: the value names the stopped revision, but the spec went
 		// back to the stable revision and no member targets it; nothing is left to
 		// re-enter, so the verb is refused and the hold stays.
 		{"canary/RolledBack/resume[untargeted]", fixtureRolledBack, evResumeOwnUntargetedRunClosed, cellWant{state: rolledBack, phase: v1beta1.RolloutPhaseRolledBack, active: true, rolledBk: true, consume: []string{constants.RolloutResumeAnnotation}}},

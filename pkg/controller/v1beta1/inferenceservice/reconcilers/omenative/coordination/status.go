@@ -39,6 +39,13 @@ func BuildGroupStatus(group ResolvedGroup, tr GroupTransition, ratio *RatioState
 	if ratio != nil && group.Pacing.Type == v1beta1.CoordinationPacingRatioBalanced {
 		out.ObservedRatio = ratioStateToAPI(ratio)
 	}
+	out.MemberNotReady = tr.MemberNotReady
+	if !tr.MemberFinished.IsZero() {
+		out.MemberFinished = &v1beta1.RolloutCoordinationMemberFinish{
+			Component: tr.MemberFinished.Component,
+			At:        metav1.NewTime(tr.MemberFinished.At),
+		}
+	}
 	return out
 }
 

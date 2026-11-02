@@ -8,20 +8,12 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	appsv1 "k8s.io/api/apps/v1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
-	nodev1 "k8s.io/api/node/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
@@ -31,6 +23,7 @@ import (
 	"sigs.k8s.io/ome/pkg/placement/capacity"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 	"sigs.k8s.io/ome/pkg/render"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestComponentReconcileChecksPlacementDemandBeforeWrites(t *testing.T) {
@@ -58,19 +51,13 @@ func TestComponentReconcileChecksPlacementDemandBeforeWrites(t *testing.T) {
 						{name: "local ignores invalid policy", allowWrite: true},
 					} {
 						t.Run(tt.name, func(t *testing.T) {
-							scheme := runtime.NewScheme()
-							for _, add := range []func(*runtime.Scheme) error{v1beta1.AddToScheme, corev1.AddToScheme, nodev1.AddToScheme, appsv1.AddToScheme, autoscalingv2.AddToScheme, policyv1.AddToScheme, kedav1.AddToScheme, monitoringv1.AddToScheme, lws.AddToScheme} {
-								if err := add(scheme); err != nil {
-									t.Fatal(err)
-								}
-							}
 							writeErr := errors.New("workload write reached")
 							var writes []string
 							reject := func(obj client.Object) error {
 								writes = append(writes, fmt.Sprintf("%T", obj))
 								return writeErr
 							}
-							cl := fake.NewClientBuilder().WithScheme(scheme).WithInterceptorFuncs(interceptor.Funcs{
+							cl := componentClient(t, fakeclient.WithTypes(lws.AddToScheme), fakeclient.WithInterceptors(interceptor.Funcs{
 								Create: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.CreateOption) error {
 									return reject(obj)
 								},
@@ -83,9 +70,9 @@ func TestComponentReconcileChecksPlacementDemandBeforeWrites(t *testing.T) {
 								Delete: func(_ context.Context, _ client.WithWatch, obj client.Object, _ ...client.DeleteOption) error {
 									return reject(obj)
 								},
-							}).Build()
+							}))
 							configMap := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: constants.InferenceServiceConfigMapName, Namespace: constants.OMENamespace}, Data: map[string]string{}}
-							deps := &ComponentDeps{Client: cl, APIReader: cl, Clientset: kubefake.NewClientset(configMap), Scheme: scheme, Config: &controllerconfig.InferenceServicesConfig{}}
+							deps := &ComponentDeps{Client: cl, APIReader: cl, Clientset: kubefake.NewClientset(configMap), Scheme: cl.Scheme(), Config: &controllerconfig.InferenceServicesConfig{}}
 							in := ComponentInputs{DeploymentMode: mode}
 							runner := &v1beta1.RunnerSpec{Container: corev1.Container{Name: "runner", Image: "example.com/serving:v1", Resources: corev1.ResourceRequirements{
 								Requests: corev1.ResourceList{"example.com/gpu": resource.MustParse("2")}, Limits: corev1.ResourceList{"example.com/gpu": resource.MustParse("2")},

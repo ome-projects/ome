@@ -172,35 +172,17 @@ func podGroupLabels(isvcName string, component workload.ComponentType, instanceI
 	}
 }
 
-// EnsurePodGroup creates (or no-op-reconciles) the PodGroup for one
-// multi-pod Instance. Idempotent. No-op for single-pod Instances.
-//
-// The PodGroup MUST exist before any of its Instance's pods are
-// created — otherwise the coscheduler sees pods referencing an
-// unknown PodGroup and falls back to scheduling them individually
-// (defeating the gang). Callers wire this before the per-Instance
-// Create / Restart op.
-func EnsurePodGroup(ctx context.Context, c client.Client, owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, inst workload.InstancePlan) error {
-	_, err := ensurePodGroupForPods(ctx, c, owner, ownerGVK, ownerName, plan, inst, nil)
-	return err
-}
-
-// ensurePodGroupForPods is EnsurePodGroup with the currently-live pods that
-// reference this PodGroup. Pod affinity is immutable, so while those pods are
-// present the PodGroup topology annotation must describe their rendered
-// topology rather than a newer Component spec. This prevents a topology-only
-// edit or rollback from changing the scheduler contract underneath an
-// in-flight gang. Once the group is empty, desired topology may advance before
-// replacement pods are created.
-func ensurePodGroupForPods(ctx context.Context, c client.Client, owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, inst workload.InstancePlan, pods []*corev1.Pod) (string, error) {
-	return EnsurePodGroupForPodsWithReader(ctx, c, c, owner, ownerGVK, ownerName, plan, inst, pods)
-}
-
-// EnsurePodGroupForPodsWithReader is ensurePodGroupForPods with a separate
-// reader for topology-safety observations. Controllers should pass their live
-// APIReader here: cached pod or PodGroup state must not advance the topology
-// contract while immutable pods from the previous revision still exist.
-func EnsurePodGroupForPodsWithReader(ctx context.Context, c client.Client, reader client.Reader, owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, inst workload.InstancePlan, pods []*corev1.Pod) (string, error) {
+// EnsurePodGroupForPods creates or reconciles the PodGroup of one multi-pod
+// Instance and returns its effective topology key. Idempotent; a single-pod
+// Instance is a no-op. The PodGroup must exist before any of the Instance's
+// pods, or the coscheduler sees pods naming an unknown group and schedules
+// them one by one. pods are the live pods that reference the group: pod
+// affinity is immutable, so while they exist the group's topology annotation
+// must describe their rendered topology, not a newer Component spec, and only
+// once the group is empty may the desired topology advance. reader is the
+// live reader for that proof (nil means c): cached pod or PodGroup state must
+// not advance the contract while pods of the previous revision still exist.
+func EnsurePodGroupForPods(ctx context.Context, c client.Client, reader client.Reader, owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, inst workload.InstancePlan, pods []*corev1.Pod) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("EnsurePodGroup: nil client")
 	}
@@ -314,6 +296,13 @@ func ControlledByUID(obj metav1.Object, ownerUID types.UID) bool {
 	return ref != nil && ref.UID == ownerUID
 }
 
+// IsNotFound reports whether err says there is no PodGroup to read: the
+// object does not exist, or the cluster has no PodGroup API at all (the CRD
+// is not installed, or the type is not in the scheme).
+func IsNotFound(err error) bool {
+	return apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err)
+}
+
 // EffectiveTopologyKeyForPods returns the topology contract that is safe for
 // an Instance when no PodGroup exists to retain prior controller state. Empty
 // pods use the current desired key. Once any immutable pod is live, only an
@@ -342,13 +331,31 @@ func EffectiveTopologyKeyForPods(desiredKey, ownerName string, component workloa
 // term must select the worker pod's own Instance leader. Hand-written affinity
 // is deliberately ignored because it may describe an unrelated relationship.
 func GeneratedTopologyKeyFromPods(ownerName string, component workload.ComponentType, pods []*corev1.Pod) (string, bool, error) {
+	return generatedTopologyKey(ownerName, component, pods, func(pod *corev1.Pod) string {
+		return pod.Labels[query.LabelInstanceIdx]
+	})
+}
+
+// topologyKeyFromLivePods is GeneratedTopologyKeyFromPods for the pods of one
+// Instance: every accepted term must select that Instance's leader, whatever
+// index label the pod carries.
+func topologyKeyFromLivePods(ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod) (string, bool, error) {
+	wantIndex := fmt.Sprintf("%d", instanceIdx)
+	return generatedTopologyKey(ownerName, component, pods, func(*corev1.Pod) string { return wantIndex })
+}
+
+// generatedTopologyKey collects the topology keys of the worker-to-leader
+// affinity terms OME generates, where leaderIndex names the Instance whose
+// leader a pod's term must select (empty skips the pod), and reduces them to
+// one key.
+func generatedTopologyKey(ownerName string, component workload.ComponentType, pods []*corev1.Pod, leaderIndex func(*corev1.Pod) string) (string, bool, error) {
 	keys := make(map[string]struct{})
 	for _, pod := range pods {
 		if pod == nil || pod.Labels[query.LabelRunner] != workload.RunnerWorker ||
 			pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAffinity == nil {
 			continue
 		}
-		wantIndex := pod.Labels[query.LabelInstanceIdx]
+		wantIndex := leaderIndex(pod)
 		if wantIndex == "" {
 			continue
 		}
@@ -411,34 +418,6 @@ func setTopologyKeyAnnotation(pg *schedulingv1alpha1.PodGroup, value string, pre
 		pg.Annotations = make(map[string]string, 1)
 	}
 	pg.Annotations[query.AnnotationTopologyKey] = value
-}
-
-func topologyKeyFromLivePods(ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod) (string, bool, error) {
-	exact := make(map[string]struct{})
-	wantIndex := fmt.Sprintf("%d", instanceIdx)
-	for _, pod := range pods {
-		if pod == nil || pod.Labels[query.LabelRunner] != workload.RunnerWorker ||
-			pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAffinity == nil {
-			continue
-		}
-		for i := range pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-			term := &pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i]
-			if term.TopologyKey == "" {
-				continue
-			}
-			labels := map[string]string(nil)
-			if term.LabelSelector != nil {
-				labels = term.LabelSelector.MatchLabels
-			}
-			if labels[constants.InferenceServicePodLabelKey] == ownerName &&
-				labels[constants.OMEComponentLabel] == string(component) &&
-				labels[query.LabelInstanceIdx] == wantIndex &&
-				labels[query.LabelRunner] == workload.RunnerLeader {
-				exact[term.TopologyKey] = struct{}{}
-			}
-		}
-	}
-	return uniqueTopologyKey(exact)
 }
 
 func uniqueTopologyKey(keys map[string]struct{}) (string, bool, error) {
@@ -523,7 +502,7 @@ func FinalizeObservedPodGroup(ctx context.Context, c client.Client, ownerUID typ
 		opts = append(opts, client.Preconditions{UID: &uid})
 	}
 	if err := c.Delete(ctx, pg.DeepCopy(), opts...); err != nil {
-		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+		if IsNotFound(err) {
 			return true, nil
 		}
 		return false, fmt.Errorf("FinalizeObservedPodGroup: delete %s/%s: %w", pg.Namespace, pg.Name, err)
@@ -537,34 +516,6 @@ func FinalizeObservedPodGroup(ctx context.Context, c client.Client, ownerUID typ
 func DeleteObservedPodGroup(ctx context.Context, c client.Client, ownerUID types.UID, pg *schedulingv1alpha1.PodGroup) error {
 	_, err := FinalizeObservedPodGroup(ctx, c, ownerUID, pg)
 	return err
-}
-
-// deletePodGroup removes the PodGroup for an Instance that has been drained.
-// Safe to call when the PodGroup doesn't exist. Inventory-backed callers
-// should use DeleteObservedPodGroup to avoid this compatibility helper's GET.
-//
-// owner is abstract because the same primitive serves every OMENative owner
-// shape. The controller UID is the authorization check; ownerName only derives
-// the deterministic resource name.
-func deletePodGroup(ctx context.Context, c client.Client, owner client.Object, ownerName string, component workload.ComponentType, instanceIdx int32) error {
-	if c == nil {
-		return fmt.Errorf("deletePodGroup: nil client")
-	}
-	if owner == nil {
-		return fmt.Errorf("deletePodGroup: nil owner")
-	}
-	key := client.ObjectKey{
-		Name:      query.PodGroupName(ownerName, component, instanceIdx),
-		Namespace: owner.GetNamespace(),
-	}
-	pg := &schedulingv1alpha1.PodGroup{}
-	if err := c.Get(ctx, key, pg); err != nil {
-		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
-			return nil
-		}
-		return fmt.Errorf("deletePodGroup: get %s: %w", key, err)
-	}
-	return DeleteObservedPodGroup(ctx, c, owner.GetUID(), pg)
 }
 
 // FinalizePodGroup requests deletion of an owned PodGroup and reports complete
@@ -585,7 +536,7 @@ func FinalizePodGroup(ctx context.Context, c client.Client, reader client.Reader
 	}
 	pg := &schedulingv1alpha1.PodGroup{}
 	if err := reader.Get(ctx, key, pg); err != nil {
-		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
+		if IsNotFound(err) {
 			return true, nil
 		}
 		return false, fmt.Errorf("FinalizePodGroup: get %s: %w", key, err)

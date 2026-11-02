@@ -1,0 +1,85 @@
+{
+  "runners": [
+    {
+      "name": "default",
+      "size": 1,
+      "template": {
+        "metadata": {
+          "labels": {
+            "base-model-name": "model-a",
+            "base-model-size": "SMALL",
+            "base-model-type": "Serving",
+            "component": "encoder",
+            "fine-tuned-serving": "false",
+            "ome.io/inferenceservice": "pool-a",
+            "serving-runtime": "runtime-a",
+            "team": "a"
+          },
+          "annotations": {
+            "example.com/owner": "team-a",
+            "ome.io/base-model-format": "safetensors",
+            "ome.io/base-model-name": "model-a",
+            "ome.io/serving-runtime": "runtime-a"
+          }
+        },
+        "spec": {
+          "volumes": [
+            {
+              "name": "model-a",
+              "hostPath": {
+                "path": "/mnt/models/model-a"
+              }
+            }
+          ],
+          "containers": [
+            {
+              "name": "ome-container",
+              "image": "example.com/serving:v1",
+              "ports": [
+                {
+                  "name": "http",
+                  "containerPort": 8080
+                }
+              ],
+              "env": [
+                {
+                  "name": "MODEL_PATH",
+                  "value": "/mnt/models/model-a"
+                },
+                {
+                  "name": "PARALLELISM_SIZE",
+                  "value": "1"
+                }
+              ],
+              "resources": {
+                "limits": {
+                  "example.com/gpu": "1"
+                },
+                "requests": {
+                  "example.com/gpu": "1"
+                }
+              },
+              "volumeMounts": [
+                {
+                  "name": "model-a",
+                  "readOnly": true,
+                  "mountPath": "/mnt/models/model-a"
+                }
+              ]
+            }
+          ],
+          "nodeSelector": {
+            "models.ome.io/clusterbasemodel.model-a": "Ready",
+            "pool": "runtime",
+            "tier": "x"
+          }
+        }
+      }
+    }
+  ],
+  "pairingProtocol": "",
+  "excludedAnnotationKeys": [
+    "example.com/owner"
+  ],
+  "revisionHash": "fe7084f1"
+}

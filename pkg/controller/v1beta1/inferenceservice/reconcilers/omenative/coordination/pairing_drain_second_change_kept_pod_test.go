@@ -8,10 +8,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // A pairing protocol changed again while the first change is half done,
@@ -184,6 +184,6 @@ func TestEvaluatePairingDrain_SecondChange_TheOldEnginePodStaysUntilADecoderServ
 // defaults, about the second decoder's rebuild from the v1 revision.
 func secondDecoderRebuild(t *testing.T, isvc *v1beta1.InferenceService, objs ...client.Object) (bool, v1beta1.RolloutHoldGate, string) {
 	t.Helper()
-	c := fake.NewClientBuilder().WithScheme(drainScheme(t)).WithObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	return EvaluateUpdateGate(context.Background(), c, isvc, v1beta1.DecoderComponent, "llama-decoder-v1", forwardTarget(isvc, v1beta1.DecoderComponent), nil, GroupDefaults{}, workloadtypes.UpdateStrategyRecreatePod, 0, 0)
 }

@@ -81,13 +81,14 @@ func CanaryGroup(isvc *v1beta1.InferenceService, policies Policies) *v1beta1.Rol
 }
 
 // PrimaryOf is the Component a group's step machine and traffic weight run
-// through: router, else engine, else decoder among the group's members, else
-// the first member. A group's canary run state is stored under this Component.
+// through: the member with the lowest primary rank (router, else engine,
+// else decoder), else the first member. A group's canary run state is stored
+// under this Component.
 func PrimaryOf(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
 	if g == nil || len(g.Components) == 0 {
 		return ""
 	}
-	for _, preferred := range []v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.EngineComponent, v1beta1.DecoderComponent} {
+	for _, preferred := range v1beta1.RolesByPrimaryRank() {
 		for _, c := range g.Components {
 			if c == preferred {
 				return c

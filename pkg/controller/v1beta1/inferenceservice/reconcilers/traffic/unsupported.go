@@ -11,13 +11,13 @@ import (
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
-// allBackendAnnotationKeys is the canonical set of ome.io/* keys that
-// flow through a translator. A translator MAY support a subset of
-// these (e.g. an implementation that doesn't model per-endpoint
-// circuit-breaker limits). Operator-declared keys in this set that
-// the active translator does NOT support are surfaced as
-// UnsupportedField on the InferenceService.
-func allBackendAnnotationKeys() sets.Set[string] {
+// BackendAnnotationKeys is the canonical set of ome.io/* keys that
+// flow through a translator. The Envoy Gateway translator honors all
+// of them; a translator MAY support a subset (e.g. an implementation
+// that doesn't model per-endpoint circuit-breaker limits), and
+// operator-declared keys in this set that the active translator does
+// NOT support are surfaced as UnsupportedField on the InferenceService.
+func BackendAnnotationKeys() sets.Set[string] {
 	return sets.New(
 		constants.CircuitBreakerMaxConnectionsAnnotation,
 		constants.CircuitBreakerMaxParallelRequestsAnnotation,
@@ -48,7 +48,7 @@ func allPassthroughPrefixes() []string {
 // traffic annotations declared on the InferenceService that the
 // active translator does not honor. Two sources:
 //
-//  1. A per-key annotation in allBackendAnnotationKeys() that the
+//  1. A per-key annotation in BackendAnnotationKeys() that the
 //     translator's SupportedAnnotations does not include.
 //  2. A pass-through annotation under a prefix the translator does
 //     not own (e.g. ome.io/dr.* on an Envoy-Gateway cluster).
@@ -67,7 +67,7 @@ func ComputeUnsupportedAnnotations(annotations map[string]string, translator Tra
 		supported = sets.New[string]()
 	}
 	ownedPrefixes := translator.SupportedPassthroughPrefixes()
-	allKnownBackend := allBackendAnnotationKeys()
+	allKnownBackend := BackendAnnotationKeys()
 
 	var unsupported []string
 	for key := range annotations {

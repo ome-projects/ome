@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"slices"
+
 	v1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/ome/pkg/constants"
@@ -10,69 +12,57 @@ func AppendVolumeMount(container *v1.Container, volumeMount *v1.VolumeMount) {
 	container.VolumeMounts = append(container.VolumeMounts, *volumeMount)
 }
 
+// UpdateVolumeMount sets the path, sub-path and read-only flag of the mount
+// with the same name, or appends the mount when the container has none.
 func UpdateVolumeMount(container *v1.Container, volumeMount *v1.VolumeMount) {
 	if volumeMount == nil {
 		return
 	}
-	var updated bool
-	for i, vm := range container.VolumeMounts {
-		if vm.Name == volumeMount.Name {
-			container.VolumeMounts[i].MountPath = volumeMount.MountPath
-			container.VolumeMounts[i].SubPath = volumeMount.SubPath
-			container.VolumeMounts[i].ReadOnly = volumeMount.ReadOnly
-			updated = true
-			break
-		}
-	}
-
-	// If the volume mount does not exist, append it to the list.
-	if !updated {
-		container.VolumeMounts = append(container.VolumeMounts, *volumeMount)
-	}
+	container.VolumeMounts = upsertByName(container.VolumeMounts, volumeMountName, *volumeMount, func(existing *v1.VolumeMount) {
+		existing.MountPath = volumeMount.MountPath
+		existing.SubPath = volumeMount.SubPath
+		existing.ReadOnly = volumeMount.ReadOnly
+	})
 }
 
+// AppendVolumeMountIfNotExist appends the mount unless one with the same name is there.
 func AppendVolumeMountIfNotExist(container *v1.Container, volumeMount *v1.VolumeMount) {
-	for i := range container.VolumeMounts {
-		if container.VolumeMounts[i].Name == volumeMount.Name {
-			return
-		}
-	}
-	container.VolumeMounts = append(container.VolumeMounts, *volumeMount)
+	container.VolumeMounts = upsertByName(container.VolumeMounts, volumeMountName, *volumeMount, nil)
 }
 
+// AppendEnvVarsIfNotExist appends each variable unless one with the same name is there.
 func AppendEnvVarsIfNotExist(container *v1.Container, envVars *[]v1.EnvVar) {
 	if envVars == nil {
 		return
 	}
-
 	for _, envVar := range *envVars {
-		var exists bool
-		for i := range container.Env {
-			if container.Env[i].Name == envVar.Name {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			container.Env = append(container.Env, envVar)
-		}
+		container.Env = upsertByName(container.Env, envVarName, envVar, nil)
 	}
 }
 
+// UpdateEnvVars replaces the variable with the same name, or appends it.
 func UpdateEnvVars(container *v1.Container, envVar *v1.EnvVar) {
-	var updated bool
-	for i, existingEnvVar := range container.Env {
-		if existingEnvVar.Name == envVar.Name {
-			// If it exists, replace it.
-			container.Env[i] = *envVar
-			updated = true
-			break
-		}
+	container.Env = upsertByName(container.Env, envVarName, *envVar, func(existing *v1.EnvVar) {
+		*existing = *envVar
+	})
+}
+
+func volumeMountName(mount v1.VolumeMount) string { return mount.Name }
+
+func envVarName(envVar v1.EnvVar) string { return envVar.Name }
+
+// upsertByName hands the first item with the same name to onFound, or appends
+// item when there is none. A nil onFound keeps the item that is there as it is.
+func upsertByName[T any](items []T, nameOf func(T) string, item T, onFound func(existing *T)) []T {
+	name := nameOf(item)
+	i := slices.IndexFunc(items, func(candidate T) bool { return nameOf(candidate) == name })
+	if i < 0 {
+		return append(items, item)
 	}
-	// If the environment variable does not exist, append it to the list.
-	if !updated {
-		container.Env = append(container.Env, *envVar)
+	if onFound != nil {
+		onFound(&items[i])
 	}
+	return items
 }
 
 // GetGpuCountFromContainer extracts the accelerator count from container

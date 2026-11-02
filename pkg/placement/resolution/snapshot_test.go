@@ -12,8 +12,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
 	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
@@ -70,7 +70,7 @@ func TestSnapshotDependencyChanges(t *testing.T) {
 				objects = append(objects, second)
 			}
 			calls := 0
-			c := fakeclient.New(t, fakeclient.WithScheme(runtimeScheme(t)), fakeclient.WithObjects(objects...),
+			c := fakeclient.New(t, fakeclient.WithObjects(objects...),
 				fakeclient.EditedRead(func(list *corev1.ConfigMapList) {
 					calls++
 					if tt.reorder && calls%2 == 0 {
@@ -122,7 +122,7 @@ func TestSnapshotReadFailures(t *testing.T) {
 			t.Run(operation+"/"+phase, func(t *testing.T) {
 				want := errors.New("member API unavailable")
 				fail := phase == "resolve"
-				c := fakeclient.New(t, fakeclient.WithScheme(runtimeScheme(t)), fakeclient.WithObjects(snapshotObject()), fakeclient.WithInterceptors(interceptor.Funcs{
+				c := fakeclient.New(t, fakeclient.WithObjects(snapshotObject()), fakeclient.WithInterceptors(interceptor.Funcs{
 					Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
 						if fail {
 							return want
@@ -157,7 +157,7 @@ func TestSnapshotReadFailures(t *testing.T) {
 // observation even when the caller treats the lookup as optional and goes on.
 func TestSnapshotRemembersReadFailure(t *testing.T) {
 	want := errors.New("member API unavailable")
-	c := fakeclient.New(t, fakeclient.WithScheme(runtimeScheme(t)), fakeclient.WithObjects(snapshotObject()), fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, want))
+	c := fakeclient.New(t, fakeclient.WithObjects(snapshotObject()), fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, want))
 	reads := newSnapshot(c, t.Context())
 	if err := readSnapshot(reads, false); !errors.Is(err, want) {
 		t.Fatalf("read error = %v, want %v", err, want)
@@ -180,7 +180,7 @@ func TestSnapshotContexts(t *testing.T) {
 					cancelResolve()
 				}
 				var got []string
-				c := fakeclient.New(t, fakeclient.WithScheme(runtimeScheme(t)), fakeclient.WithObjects(snapshotObject()), fakeclient.WithInterceptors(interceptor.Funcs{
+				c := fakeclient.New(t, fakeclient.WithObjects(snapshotObject()), fakeclient.WithInterceptors(interceptor.Funcs{
 					Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
 						got = append(got, ctx.Value(contextKey{}).(string))
 						return cl.Get(ctx, key, object, opts...)
@@ -219,7 +219,7 @@ func TestSnapshotContexts(t *testing.T) {
 func TestSnapshotConcurrentChecks(t *testing.T) {
 	for _, list := range []bool{false, true} {
 		t.Run(map[bool]string{false: "get", true: "list"}[list], func(t *testing.T) {
-			base := fake.NewClientBuilder().WithScheme(runtimeScheme(t)).WithObjects(snapshotObject()).Build()
+			base := fakeclient.New(t, fakeclient.WithObjects(snapshotObject()))
 			reads := newSnapshot(base, t.Context())
 			if err := readSnapshot(reads, list); err != nil {
 				t.Fatal(err)
@@ -249,7 +249,7 @@ func TestSnapshotUnverifiedIdentity(t *testing.T) {
 	} {
 		for _, list := range []bool{false, true} {
 			t.Run(tt.name+"/"+map[bool]string{false: "get", true: "list"}[list], func(t *testing.T) {
-				c := fakeclient.New(t, fakeclient.WithScheme(runtimeScheme(t)), fakeclient.WithObjects(snapshotObject()),
+				c := fakeclient.New(t, fakeclient.WithObjects(snapshotObject()),
 					fakeclient.EditedRead(tt.edit),
 					fakeclient.EditedRead(func(objects *corev1.ConfigMapList) { tt.edit(&objects.Items[0]) }))
 				if diff := cmp.Diff(true, readSnapshot(newSnapshot(c, t.Context()), list) != nil); diff != "" {
@@ -264,7 +264,7 @@ func TestSnapshotRepeatedReads(t *testing.T) {
 	for _, list := range []bool{false, true} {
 		t.Run(map[bool]string{false: "get", true: "list"}[list], func(t *testing.T) {
 			object := snapshotObject()
-			base := fake.NewClientBuilder().WithScheme(runtimeScheme(t)).WithObjects(object).Build()
+			base := fakeclient.New(t, fakeclient.WithObjects(object))
 			reads := newSnapshot(base, t.Context())
 			if err := readSnapshot(reads, list); err != nil {
 				t.Fatal(err)
@@ -288,7 +288,7 @@ func TestSnapshotIncompleteCatalog(t *testing.T) {
 	for _, phase := range []string{"resolve", "check"} {
 		t.Run(phase, func(t *testing.T) {
 			incomplete := phase == "resolve"
-			c := fakeclient.New(t, fakeclient.WithScheme(runtimeScheme(t)), fakeclient.WithObjects(snapshotObject()),
+			c := fakeclient.New(t, fakeclient.WithObjects(snapshotObject()),
 				fakeclient.EditedRead(func(list *corev1.ConfigMapList) {
 					if incomplete {
 						list.SetContinue("next-page")

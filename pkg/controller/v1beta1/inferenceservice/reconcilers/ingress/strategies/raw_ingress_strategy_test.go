@@ -5,22 +5,21 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/interfaces"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/services"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestKubernetesIngressStrategy_GetName(t *testing.T) {
@@ -37,7 +36,24 @@ func TestKubernetesIngressStrategy_Reconcile(t *testing.T) {
 		expectedError         bool
 		expectedIngressReady  corev1.ConditionStatus
 		expectIngressCreation bool
+		// componentNotReady leaves every component condition unset, so the
+		// builder answers that the Component cannot back a rule yet.
+		componentNotReady bool
 	}{
+		{
+			name: "component not ready writes the condition and builds nothing",
+			isvc: createTestInferenceServiceWithRouterRaw("test-isvc", "default"),
+			ingressConfig: &controllerconfig.IngressConfig{
+				EnableGatewayAPI:       false,
+				IngressDomain:          "example.com",
+				IngressClassName:       ptr.To("nginx"),
+				DomainTemplate:         "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
+				UrlScheme:              "https",
+				DisableIngressCreation: false,
+			},
+			expectedIngressReady: corev1.ConditionFalse,
+			componentNotReady:    true,
+		},
 		{
 			name: "successful reconcile with predictor only",
 			isvc: createTestInferenceServiceRaw("test-isvc", "default"),
@@ -153,23 +169,18 @@ func TestKubernetesIngressStrategy_Reconcile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			scheme := runtime.NewScheme()
-			require.NoError(t, v1beta1.AddToScheme(scheme))
-			require.NoError(t, netv1.AddToScheme(scheme))
-			require.NoError(t, corev1.AddToScheme(scheme))
+			scheme := fakeclient.Scheme(t)
 
-			// Set component statuses to ready
-			setComponentStatusReadyRaw(tt.isvc)
+			if !tt.componentNotReady {
+				setComponentStatusReadyRaw(tt.isvc)
+			}
 
 			objs := []client.Object{tt.isvc}
 			if tt.existingIngress != nil {
 				objs = append(objs, tt.existingIngress)
 			}
 
-			fakeClient := fakeclient.NewClientBuilder().
-				WithScheme(scheme).
-				WithObjects(objs...).
-				Build()
+			fakeClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(objs...))
 
 			// Use the proper constructor to create the strategy with builder
 			opts := interfaces.ReconcilerOptions{
@@ -184,12 +195,19 @@ func TestKubernetesIngressStrategy_Reconcile(t *testing.T) {
 
 			if tt.expectedError {
 				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, tt.expectedIngressReady, tt.isvc.Status.GetCondition(v1beta1.IngressReady).Status)
-				assert.NotNil(t, tt.isvc.Status.URL)
-				assert.NotNil(t, tt.isvc.Status.Address)
+				return
 			}
+			assert.NoError(t, err)
+			condition := tt.isvc.Status.GetCondition(v1beta1.IngressReady)
+			assert.Equal(t, tt.expectedIngressReady, condition.Status)
+			if tt.componentNotReady {
+				assert.Equal(t, "ComponentNotReady", condition.Reason)
+				assert.Nil(t, tt.isvc.Status.URL)
+				assert.Error(t, fakeClient.Get(context.Background(), types.NamespacedName{Name: tt.isvc.Name, Namespace: tt.isvc.Namespace}, &netv1.Ingress{}), "no Ingress is built")
+				return
+			}
+			assert.NotNil(t, tt.isvc.Status.URL)
+			assert.NotNil(t, tt.isvc.Status.Address)
 		})
 	}
 }
@@ -330,12 +348,9 @@ func TestKubernetesIngressStrategy_SemanticIngressEquals(t *testing.T) {
 
 // Helper functions
 func createKubernetesIngressStrategy(t *testing.T) interfaces.IngressStrategy {
-	scheme := runtime.NewScheme()
-	require.NoError(t, v1beta1.AddToScheme(scheme))
-	require.NoError(t, netv1.AddToScheme(scheme))
-	require.NoError(t, corev1.AddToScheme(scheme))
+	scheme := fakeclient.Scheme(t)
 
-	fakeClient := fakeclient.NewClientBuilder().WithScheme(scheme).Build()
+	fakeClient := fakeclient.New(t, fakeclient.WithScheme(scheme))
 
 	opts := interfaces.ReconcilerOptions{
 		Client: fakeClient,
@@ -495,10 +510,7 @@ func TestKubernetesIngressStrategy_URLWithPort(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			scheme := runtime.NewScheme()
-			require.NoError(t, v1beta1.AddToScheme(scheme))
-			require.NoError(t, netv1.AddToScheme(scheme))
-			require.NoError(t, corev1.AddToScheme(scheme))
+			scheme := fakeclient.Scheme(t)
 
 			setComponentStatusReadyRaw(tt.isvc)
 
@@ -507,10 +519,7 @@ func TestKubernetesIngressStrategy_URLWithPort(t *testing.T) {
 				objs = append(objs, &tt.services[i])
 			}
 
-			fakeClient := fakeclient.NewClientBuilder().
-				WithScheme(scheme).
-				WithObjects(objs...).
-				Build()
+			fakeClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(objs...))
 
 			opts := interfaces.ReconcilerOptions{
 				Client:        fakeClient,

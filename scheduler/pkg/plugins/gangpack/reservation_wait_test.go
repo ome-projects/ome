@@ -224,7 +224,7 @@ func TestAssignGangDomain_StaleAssignmentReplanned_ActivatesPodsHeldOutOfOldDoma
 	ctx := context.Background()
 	h := &fakeHandle{}
 	g := &GangPack{handle: h, assignments: placement.New()}
-	if d, _, ok := g.assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	if d, _, ok := g.assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 2, "b": 2}, map[string][]string{"a": {"a1", "a2"}, "b": {"b1", "b2"}}, 2); !ok || d != "a" {
 		t.Fatalf("precondition: Choose = %q,%v, want a,true", d, ok)
 	}
@@ -246,7 +246,7 @@ func TestAssignGangDomain_StaleAssignmentReplanned_ActivatesPodsHeldOutOfOldDoma
 	if _, st := g.assignGangDomain(newCycleState(), nodes, gangInfo{key: "team/pf", minMember: 2, topologyKey: testKey}, gangGPUPod("team", "pf", "4")); !st.IsSuccess() {
 		t.Fatalf("assignGangDomain = %v, want Success after re-planning off the stale domain", st)
 	}
-	if d, ok := g.assignments.Get("team/pf"); !ok || d != "b" {
+	if d, ok := assignedDomain(g.assignments, "team/pf"); !ok || d != "b" {
 		t.Fatalf("re-planned assignment = %q,%v, want b,true", d, ok)
 	}
 	if h.activated[string(standalone.UID)] != standalone {

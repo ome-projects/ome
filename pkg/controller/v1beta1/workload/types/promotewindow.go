@@ -11,19 +11,17 @@ import "time"
 // waiting path then wakes when the window elapses instead of polling it.
 // All methods are nil-safe.
 type PromoteWindow struct {
-	pending time.Duration
+	earliestWait
 }
 
 // Observe records how much longer a pod set must stay Ready before it can be
 // promoted, keeping the earliest such instant seen this pass: the first
 // Instance to cross its window is the first thing the next pass can commit.
 func (w *PromoteWindow) Observe(remaining time.Duration) {
-	if w == nil || remaining <= 0 {
+	if w == nil {
 		return
 	}
-	if w.pending == 0 || remaining < w.pending {
-		w.pending = remaining
-	}
+	w.observe(remaining)
 }
 
 // Pending returns the wake-up the pass owes a promote that is only waiting

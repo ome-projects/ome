@@ -24,7 +24,7 @@ func fixtureClient(t *testing.T, f runtimeFixture, opts ...fakeclient.Option) cl
 	if f.standing != nil {
 		objects = append(objects, f.standing)
 	}
-	return fakeclient.New(t, append([]fakeclient.Option{fakeclient.WithScheme(runtimeScheme(t)), fakeclient.WithObjects(objects...)}, opts...)...)
+	return fakeclient.New(t, append([]fakeclient.Option{fakeclient.WithObjects(objects...)}, opts...)...)
 }
 
 func TestResolveStandingIdentity(t *testing.T) {

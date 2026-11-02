@@ -28,7 +28,7 @@ func UpdatePodSpecNodeSelector(p *Piece, isvc *v1beta1.InferenceService, podSpec
 	// Skip node selector for PVC-backed models. The model agent does not
 	// label nodes for PVC storage (PVCs aren't tied to specific nodes), so
 	// the K8s scheduler handles placement based on PVC accessibility.
-	if isPVCBaseModel(p) {
+	if isPVCStorage(p.BaseModel.Storage) {
 		p.Log.V(2).Info("Skipping model node selector for PVC-backed BaseModel; runtime/AcceleratorClass selectors still apply",
 			"inferenceService", isvc.Name, "namespace", isvc.Namespace)
 		applyMergedNodeSelector(p.Runtime, p.AcceleratorClass, isvc, podSpec, componentType)
@@ -36,7 +36,7 @@ func UpdatePodSpecNodeSelector(p *Piece, isvc *v1beta1.InferenceService, podSpec
 	}
 
 	// Add preferred node affinity for model readiness using the shared utility function
-	if isShardedModel(p.BaseModel) {
+	if isvcutils.IsShardedBaseModel(p.BaseModel) {
 		p.Log.V(2).Info("Skipping per-node model readiness selector for sharded model",
 			"modelName", p.BaseModelMeta.Name,
 			"namespace", p.BaseModelMeta.Namespace,
@@ -47,7 +47,7 @@ func UpdatePodSpecNodeSelector(p *Piece, isvc *v1beta1.InferenceService, podSpec
 
 	applyMergedNodeSelector(p.Runtime, p.AcceleratorClass, isvc, podSpec, componentType)
 
-	if !isShardedModel(p.BaseModel) {
+	if !isvcutils.IsShardedBaseModel(p.BaseModel) {
 		p.Log.V(1).Info("Added preferred node affinity for model scheduling",
 			"modelName", p.BaseModelMeta.Name,
 			"namespace", p.BaseModelMeta.Namespace,
@@ -128,46 +128,36 @@ func MergeResources(p *Piece, container *corev1.Container) {
 	isvcutils.MergeResource(container, p.AcceleratorClass, p.Runtime)
 }
 
-// MergeEngineResources merges resource requests and limits for the engine container.
-// It only merges resources from the runtime and accelerator class when the user has not
-// explicitly specified resources in the InferenceService spec. This ensures user-specified
-// resources are respected and not overridden, while providing sensible defaults from the
-// runtime and accelerator class when resources are not specified.
-func MergeEngineResources(p *Piece, isvc *v1beta1.InferenceService, container *corev1.Container) {
-	if isvc.Spec.Engine != nil &&
-		(isvc.Spec.Engine.Runner == nil ||
-			isResourcesUnspecified(isvc.Spec.Engine.Runner.Container.Resources)) {
-		p.Log.V(1).Info("Merging resources for engine container as user did not specify resources in InferenceService")
+// MergeRoleResources merges resource requests and limits for role c's
+// container. It only merges resources from the runtime and accelerator class
+// when the user has not explicitly specified resources for the role in the
+// InferenceService spec. This ensures user-specified resources are respected
+// and not overridden, while providing sensible defaults from the runtime and
+// accelerator class when resources are not specified.
+func MergeRoleResources(p *Piece, isvc *v1beta1.InferenceService, c v1beta1.ComponentType, container *corev1.Container) {
+	view := v1beta1.SpecOf(&isvc.Spec, c)
+	if view != nil && (view.Runner == nil || isResourcesUnspecified(view.Runner.Container.Resources)) {
+		p.Log.V(1).Info("Merging resources for the container as user did not specify resources in InferenceService", "component", c)
 		MergeResources(p, container)
 	}
 }
 
-// MergeDecoderResources merges resource requests and limits for the decoder container.
-// It only merges resources from the runtime and accelerator class when the user has not
-// explicitly specified resources in the InferenceService spec. This ensures user-specified
-// resources are respected and not overridden, while providing sensible defaults from the
-// runtime and accelerator class when resources are not specified.
-func MergeDecoderResources(p *Piece, isvc *v1beta1.InferenceService, container *corev1.Container) {
-	if isvc.Spec.Decoder != nil &&
-		(isvc.Spec.Decoder.Runner == nil ||
-			isResourcesUnspecified(isvc.Spec.Decoder.Runner.Container.Resources)) {
-		p.Log.V(1).Info("Merging resources for decoder container as user did not specify resources in InferenceService")
-		MergeResources(p, container)
-	}
-}
-
-// UpdateEngineAffinity applies the accelerator class's discovery affinity to the
-// engine pod spec when the user did not specify affinity in the InferenceService.
-func UpdateEngineAffinity(p *Piece, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec) {
-	if isvc.Spec.Engine != nil && isvc.Spec.Engine.PodSpec.Affinity == nil {
+// UpdateRoleAffinity applies the accelerator class's discovery affinity to
+// role c's pod spec when the user did not specify affinity for the role in
+// the InferenceService.
+func UpdateRoleAffinity(p *Piece, isvc *v1beta1.InferenceService, c v1beta1.ComponentType, podSpec *corev1.PodSpec) {
+	if view := v1beta1.SpecOf(&isvc.Spec, c); view != nil && view.PodSpec.Affinity == nil {
 		mergeAcceleratorAffinity(p, podSpec)
 	}
 }
 
-// UpdateDecoderAffinity applies the accelerator class's discovery affinity to the
-// decoder pod spec when the user did not specify affinity in the InferenceService.
-func UpdateDecoderAffinity(p *Piece, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec) {
-	if isvc.Spec.Decoder != nil && isvc.Spec.Decoder.PodSpec.Affinity == nil {
+// UpdateEncoderAffinity applies the accelerator class's node affinity to the
+// encoder's pod unless spec.encoder sets a nodeAffinity of its own. A block
+// that sets only podAffinity, such as a rule that keeps the encoder near its
+// prefill pods, keeps the class's node targeting.
+func UpdateEncoderAffinity(p *Piece, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec) {
+	view := v1beta1.SpecOf(&isvc.Spec, v1beta1.EncoderComponent)
+	if view != nil && (view.PodSpec.Affinity == nil || view.PodSpec.Affinity.NodeAffinity == nil) {
 		mergeAcceleratorAffinity(p, podSpec)
 	}
 }

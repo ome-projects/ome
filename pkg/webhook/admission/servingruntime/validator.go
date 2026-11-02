@@ -314,25 +314,15 @@ func validateRuntimeComponentAutoscalers(spec *v1beta1.ServingRuntimeSpec) error
 		return nil
 	}
 	var checks []validation.ComponentAutoscalerCheck
-	if spec.EngineConfig != nil {
+	for _, r := range v1beta1.Roles {
+		piece := v1beta1.PieceOf(spec, r.Type)
+		if piece == nil {
+			continue
+		}
 		checks = append(checks, validation.ComponentAutoscalerCheck{
-			Name:        "engineConfig",
-			Autoscaler:  spec.EngineConfig.Autoscaler,
-			MinReplicas: spec.EngineConfig.MinReplicas,
-		})
-	}
-	if spec.DecoderConfig != nil {
-		checks = append(checks, validation.ComponentAutoscalerCheck{
-			Name:        "decoderConfig",
-			Autoscaler:  spec.DecoderConfig.Autoscaler,
-			MinReplicas: spec.DecoderConfig.MinReplicas,
-		})
-	}
-	if spec.RouterConfig != nil {
-		checks = append(checks, validation.ComponentAutoscalerCheck{
-			Name:        "routerConfig",
-			Autoscaler:  spec.RouterConfig.Autoscaler,
-			MinReplicas: spec.RouterConfig.MinReplicas,
+			Name:        r.RuntimeField,
+			Autoscaler:  piece.Extension.Autoscaler,
+			MinReplicas: piece.Extension.MinReplicas,
 		})
 	}
 	return validation.ValidateComponentsAutoscalers(checks)

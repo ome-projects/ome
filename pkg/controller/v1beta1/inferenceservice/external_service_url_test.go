@@ -9,20 +9,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
-
-func externalServiceScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	s := runtime.NewScheme()
-	require.NoError(t, corev1.AddToScheme(s))
-	require.NoError(t, v1beta1.AddToScheme(s))
-	return s
-}
 
 func isvcForURL() *v1beta1.InferenceService {
 	return &v1beta1.InferenceService{
@@ -37,7 +28,7 @@ func isvcForURL() *v1beta1.InferenceService {
 // reconcile a failed one again.
 func TestSetExternalServiceURLSurfacesNotFoundToTheCaller(t *testing.T) {
 	r := &InferenceServiceReconciler{
-		Client: fakeclient.NewClientBuilder().WithScheme(externalServiceScheme(t)).Build(),
+		Client: fakeclient.New(t),
 	}
 
 	err := r.setExternalServiceURL(context.Background(), isvcForURL(),
@@ -54,8 +45,7 @@ func TestSetExternalServiceURLUsesTheServicePortAndScheme(t *testing.T) {
 		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 30080}}},
 	}
 	r := &InferenceServiceReconciler{
-		Client: fakeclient.NewClientBuilder().
-			WithScheme(externalServiceScheme(t)).WithObjects(svc).Build(),
+		Client: fakeclient.New(t, fakeclient.WithObjects(svc)),
 	}
 
 	isvc := isvcForURL()
@@ -76,8 +66,7 @@ func TestSetExternalServiceURLFallsBackToTheDefaultPort(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "sample", Namespace: "default"},
 	}
 	r := &InferenceServiceReconciler{
-		Client: fakeclient.NewClientBuilder().
-			WithScheme(externalServiceScheme(t)).WithObjects(svc).Build(),
+		Client: fakeclient.New(t, fakeclient.WithObjects(svc)),
 	}
 
 	isvc := isvcForURL()

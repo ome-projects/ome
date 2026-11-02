@@ -335,11 +335,12 @@ func heldReadyForWindow(pod *corev1.Pod, window time.Duration, now time.Time) bo
 }
 
 // parkedIn names the terminal kubelet waiting reason a container of the
-// pod, regular or init, is parked in; empty when none is.
+// pod, regular or init, is parked in (types.IsTerminalWaiting); empty when
+// none is.
 func parkedIn(pod *corev1.Pod) string {
 	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
 		for _, cs := range statuses {
-			if cs.State.Waiting != nil && types.IsTerminalWaitingReason(cs.State.Waiting.Reason) {
+			if types.IsTerminalWaiting(cs.State.Waiting) {
 				return cs.State.Waiting.Reason
 			}
 		}

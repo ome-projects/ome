@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -19,19 +20,24 @@ import (
 type Match struct {
 	TermIndexes []int32
 	Weight      int64
+	// MaxWeight is the sum of the matching terms' maximum ratios, with one for
+	// a term that sets none. It is zero unless some term sets a replica ratio.
+	MaxWeight int64
 }
 
 // Selector is an immutable compiled affinity. Its zero value matches nothing.
 type Selector struct {
 	unconstrained bool
 	weighted      bool
+	ratios        bool
 	terms         []term
 }
 
 type term struct {
-	labels labels.Selector
-	fields []v1beta1.ClusterSelectorRequirement
-	weight int64
+	labels    labels.Selector
+	fields    []v1beta1.ClusterSelectorRequirement
+	weight    int64
+	maxWeight int64
 }
 
 // Compile validates and snapshots an affinity whose matches carry the engine's
@@ -59,38 +65,70 @@ func CompileFor(terms []v1beta1.ClusterAffinityTerm, allowWeights bool, componen
 		if weight := termWeight(input, component); weight != nil {
 			selector.weighted = true
 			compiled.weight = int64(*weight)
+			compiled.maxWeight = compiled.weight
+			if ratio := termRatio(input, component); ratio != nil {
+				compiled.maxWeight = int64(ratio.MaxOrOne())
+			}
 		}
+		selector.ratios = selector.ratios || usesRatios(input.Weights)
 		selector.terms = append(selector.terms, compiled)
 	}
 	return selector, nil
 }
 
 // termWeight returns the weight a term gives a component, or nil when it gives
-// none. The deprecated weight reads as weights.default. The engine takes
-// engine, then default; the decoder takes decoder, then default, then the
-// engine's; the router takes router, then the engine's.
+// none. The engine takes engine, then default; the decoder takes decoder, then
+// default, then the engine's; the router takes router, then default, then the
+// engine's.
 func termWeight(input v1beta1.ClusterAffinityTerm, component v1beta1.ComponentType) *int32 {
 	weights := input.Weights
 	if weights == nil {
-		weights = &v1beta1.ClusterAffinityWeights{}
+		return nil
 	}
-	fallback := cmp.Or(weights.Default, scalarWeight(input))
-	engine := cmp.Or(weights.Engine, fallback)
+	if usesRatios(weights) {
+		if ratio := termRatio(input, component); ratio != nil {
+			return ptr.To(ratio.MinOrOne())
+		}
+		return nil
+	}
+	engine := cmp.Or(weights.Engine, weights.Default)
 	switch component {
 	case v1beta1.EngineComponent:
 		return engine
 	case v1beta1.DecoderComponent:
-		return cmp.Or(weights.Decoder, fallback, engine)
+		return cmp.Or(weights.Decoder, weights.Default, engine)
 	case v1beta1.RouterComponent:
-		return cmp.Or(weights.Router, engine)
+		return cmp.Or(weights.Router, weights.Default, engine)
 	}
 	return nil
 }
 
-// scalarWeight reads the deprecated weight, which means weights.default. It is
-// the only reader, so every other caller goes through the weights rules here.
-func scalarWeight(input v1beta1.ClusterAffinityTerm) *int32 {
-	return input.Weight //nolint:staticcheck // The deprecated weight still means weights.default.
+// termRatio returns the ratio a term gives a component under the same
+// fallback order as termWeight, or nil when the term gives none.
+func termRatio(input v1beta1.ClusterAffinityTerm, component v1beta1.ComponentType) *v1beta1.ReplicaRatio {
+	weights := input.Weights
+	if weights == nil {
+		return nil
+	}
+	engine := cmp.Or(weights.EngineReplicas, weights.DefaultReplicas)
+	switch component {
+	case v1beta1.EngineComponent:
+		return engine
+	case v1beta1.DecoderComponent:
+		return cmp.Or(weights.DecoderReplicas, weights.DefaultReplicas, engine)
+	case v1beta1.RouterComponent:
+		return cmp.Or(weights.RouterReplicas, weights.DefaultReplicas, engine)
+	}
+	return nil
+}
+
+func usesRatios(w *v1beta1.ClusterAffinityWeights) bool {
+	return w != nil && (w.DefaultReplicas != nil || w.EngineReplicas != nil || w.DecoderReplicas != nil || w.RouterReplicas != nil)
+}
+
+// UsesRatios reports whether any term sets a replica ratio key.
+func UsesRatios(terms []v1beta1.ClusterAffinityTerm) bool {
+	return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool { return usesRatios(t.Weights) })
 }
 
 // SetsWeights reports whether any term holds a weights block, which can give
@@ -99,11 +137,19 @@ func SetsWeights(terms []v1beta1.ClusterAffinityTerm) bool {
 	return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool { return t.Weights != nil })
 }
 
-// DividesRouters reports whether any term sets a router weight. Routers are
-// then divided across the matched clusters; otherwise each runs the full
-// router policy.
+// DividesRouters reports whether static Split divides routers across the
+// matched clusters: when no term sets weights, as a default weight of one on
+// every term would, or when a term sets a default or router weight. Weights
+// that name only the engine or decoder keep the full router policy on each.
 func DividesRouters(terms []v1beta1.ClusterAffinityTerm) bool {
-	return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool { return t.Weights != nil && t.Weights.Router != nil })
+	if UsesRatios(terms) {
+		return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool {
+			return t.Weights != nil && (t.Weights.DefaultReplicas != nil || t.Weights.RouterReplicas != nil)
+		})
+	}
+	return !SetsWeights(terms) || slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool {
+		return t.Weights != nil && (t.Weights.Default != nil || t.Weights.Router != nil)
+	})
 }
 
 func compileTerm(input v1beta1.ClusterAffinityTerm, allowWeights bool) (term, error) {
@@ -113,15 +159,7 @@ func compileTerm(input v1beta1.ClusterAffinityTerm, allowWeights bool) (term, er
 	if len(input.MatchExpressions) > v1beta1.MaxClusterSelectorRequirements || len(input.MatchFields) > v1beta1.MaxClusterSelectorRequirements {
 		return term{}, fmt.Errorf("matchExpressions and matchFields each allow at most %d requirements", v1beta1.MaxClusterSelectorRequirements)
 	}
-	out := term{labels: labels.Everything(), weight: 1}
-	if weight := scalarWeight(input); weight != nil {
-		if !allowWeights {
-			return term{}, fmt.Errorf("weight is permitted only in Split mode")
-		}
-		if *weight < 1 {
-			return term{}, fmt.Errorf("weight must be positive")
-		}
-	}
+	out := term{labels: labels.Everything(), weight: 1, maxWeight: 1}
 	if err := validateWeights(input, allowWeights); err != nil {
 		return term{}, err
 	}
@@ -167,6 +205,9 @@ func validateWeights(input v1beta1.ClusterAffinityTerm, allowWeights bool) error
 	if !allowWeights {
 		return fmt.Errorf("weights is permitted only in Split mode")
 	}
+	if usesRatios(w) {
+		return validateRatios(w)
+	}
 	set := 0
 	for _, field := range []struct {
 		name  string
@@ -183,8 +224,26 @@ func validateWeights(input v1beta1.ClusterAffinityTerm, allowWeights bool) error
 	if set == 0 {
 		return fmt.Errorf("weights must set at least one component")
 	}
-	if scalarWeight(input) != nil && (w.Default != nil || w.Engine != nil) {
-		return fmt.Errorf("weight means weights.default; it may sit beside weights.decoder and weights.router, but not beside weights.default or weights.engine")
+	return nil
+}
+
+func validateRatios(w *v1beta1.ClusterAffinityWeights) error {
+	if w.Default != nil || w.Engine != nil || w.Decoder != nil || w.Router != nil {
+		return fmt.Errorf("weights must use either integer weights or replica ratios, not both")
+	}
+	for _, field := range []struct {
+		name  string
+		value *v1beta1.ReplicaRatio
+	}{{"defaultReplicas", w.DefaultReplicas}, {"engineReplicas", w.EngineReplicas}, {"decoderReplicas", w.DecoderReplicas}, {"routerReplicas", w.RouterReplicas}} {
+		if field.value == nil {
+			continue
+		}
+		if field.value.Min != nil && *field.value.Min < 1 {
+			return fmt.Errorf("weights.%s.min must be positive", field.name)
+		}
+		if field.value.Max != nil && *field.value.Max < 1 {
+			return fmt.Errorf("weights.%s.max must be positive", field.name)
+		}
 	}
 	return nil
 }
@@ -215,9 +274,14 @@ func (s *Selector) Match(cluster *v1beta1.WorkloadCluster) (Match, bool) {
 		matched.TermIndexes = append(matched.TermIndexes, int32(i))
 		if s.weighted {
 			matched.Weight += term.weight
+			matched.MaxWeight += term.maxWeight
 		} else {
 			matched.Weight = 1
+			matched.MaxWeight = 1
 		}
+	}
+	if !s.ratios {
+		matched.MaxWeight = 0
 	}
 	return matched, len(matched.TermIndexes) > 0
 }

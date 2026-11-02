@@ -12,21 +12,21 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestReconcileDelete_WaitsForEndpointCleanupBeforeDerived(t *testing.T) {
 	scheme := testScheme(t)
-	worker := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(&v1beta1.InferenceService{
+	worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "svc",
 			Namespace: "prod",
 			Labels:    map[string]string{PlacementOriginLabel: "uid-1"},
 		},
-	}).Build()
+	}))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -59,13 +59,13 @@ func TestReconcileDelete_WaitsForEndpointCleanupBeforeDerived(t *testing.T) {
 
 func TestReconcileDelete_WaitsForOrphanedTrafficMapBeforeDerived(t *testing.T) {
 	scheme := testScheme(t)
-	worker := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(&v1beta1.InferenceService{
+	worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "svc",
 			Namespace: "prod",
 			Labels:    map[string]string{PlacementOriginLabel: "uid-1"},
 		},
-	}).Build()
+	}))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -323,12 +323,12 @@ func TestReconcileDelete_TrafficMapIdentityControlsBackendTeardown(t *testing.T)
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := testScheme(t)
-			worker := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(&v1beta1.InferenceService{
+			worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(&v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "svc", Namespace: "prod",
 					Labels: map[string]string{PlacementOriginLabel: "uid-1"},
 				},
-			}).Build()
+			}))
 			clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 				"a": workloadcluster.NewNeverCachingClient(worker),
 			}}
@@ -377,13 +377,13 @@ func (r trafficMapGetErrorReader) Get(
 
 func TestReconcileDelete_TrafficMapReadFailureKeepsDerived(t *testing.T) {
 	scheme := testScheme(t)
-	worker := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(&v1beta1.InferenceService{
+	worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "svc",
 			Namespace: "prod",
 			Labels:    map[string]string{PlacementOriginLabel: "uid-1"},
 		},
-	}).Build()
+	}))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -407,12 +407,12 @@ func TestReconcileDelete_TrafficMapReadFailureKeepsDerived(t *testing.T) {
 
 func TestReconcileDelete_UsesAuthoritativeReaderForOrphanBarrier(t *testing.T) {
 	scheme := testScheme(t)
-	worker := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(&v1beta1.InferenceService{
+	worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "svc", Namespace: "prod",
 			Labels: map[string]string{PlacementOriginLabel: "uid-1"},
 		},
-	}).Build()
+	}))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -425,7 +425,7 @@ func TestReconcileDelete_UsesAuthoritativeReaderForOrphanBarrier(t *testing.T) {
 		},
 		Status: v1beta1.TrafficMapStatus{SourceUID: source.UID},
 	}
-	r.APIReader = fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(liveMap).Build()
+	r.APIReader = fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(liveMap))
 	require.NoError(t, cacheClient.Delete(context.Background(), source))
 	require.True(t, apierrors.IsNotFound(cacheClient.Get(
 		context.Background(), req().NamespacedName, &v1beta1.TrafficMap{},
@@ -443,12 +443,12 @@ func TestReconcileDelete_UsesAuthoritativeReaderForOrphanBarrier(t *testing.T) {
 
 func TestReconcileDelete_MissingAPIReaderKeepsDerived(t *testing.T) {
 	scheme := testScheme(t)
-	worker := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(&v1beta1.InferenceService{
+	worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "svc", Namespace: "prod",
 			Labels: map[string]string{PlacementOriginLabel: "uid-1"},
 		},
-	}).Build()
+	}))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -480,13 +480,13 @@ func TestReconcileDelete_ForeignOrMalformedTrafficMapDoesNotBlock(t *testing.T) 
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := testScheme(t)
-			worker := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(&v1beta1.InferenceService{
+			worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(&v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "svc",
 					Namespace: "prod",
 					Labels:    map[string]string{PlacementOriginLabel: "uid-1"},
 				},
-			}).Build()
+			}))
 			clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 				"a": workloadcluster.NewNeverCachingClient(worker),
 			}}

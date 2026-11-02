@@ -3,7 +3,6 @@ package ops
 import (
 	"fmt"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 
@@ -1260,18 +1259,6 @@ func envByName(env []corev1.EnvVar) map[string]string {
 		m[e.Name] = e.Value
 	}
 	return m
-}
-
-// envKeys is a small debugging helper; sorted for stable diff messages.
-//
-//nolint:unused
-func envKeys(env []corev1.EnvVar) []string {
-	keys := make([]string, 0, len(env))
-	for _, e := range env {
-		keys = append(keys, e.Name)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 // --- applyMigrationOverlay idempotency ---

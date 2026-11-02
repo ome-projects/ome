@@ -20,20 +20,16 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/interfaces"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/services"
 )
-
-func TestHTTPRouteBuilder_GetResourceType(t *testing.T) {
-	builder := createHTTPRouteBuilder()
-	assert.Equal(t, "HTTPRoute", builder.GetResourceType())
-}
 
 func TestHTTPRouteBuilder_Build(t *testing.T) {
 	builder := createHTTPRouteBuilder()
 	isvc := createTestInferenceServiceHTTPRoute("test-isvc", "default")
 	setEngineReady(isvc)
 
-	httpRoute, err := builder.Build(context.Background(), isvc)
+	httpRoute, err := builder.BuildHTTPRoute(context.Background(), isvc, EngineComponent)
 	assert.NoError(t, err)
 	assert.NotNil(t, httpRoute)
 
@@ -94,15 +90,16 @@ func TestHTTPRouteBuilder_BuildHTTPRoute_EngineComponent(t *testing.T) {
 
 			result, err := builder.BuildHTTPRoute(context.Background(), tt.isvc, EngineComponent)
 
+			if tt.expectNil {
+				var notReady *interfaces.ComponentNotReadyError
+				require.ErrorAs(t, err, &notReady)
+				assert.Nil(t, result)
+				return
+			}
 			if tt.expectedError {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
-			}
-
-			if tt.expectNil {
-				assert.Nil(t, result)
-				return
 			}
 
 			require.NotNil(t, result)
@@ -162,15 +159,16 @@ func TestHTTPRouteBuilder_BuildHTTPRoute_RouterComponent(t *testing.T) {
 
 			result, err := builder.BuildHTTPRoute(context.Background(), tt.isvc, RouterComponent)
 
+			if tt.expectNil {
+				var notReady *interfaces.ComponentNotReadyError
+				require.ErrorAs(t, err, &notReady)
+				assert.Nil(t, result)
+				return
+			}
 			if tt.expectedError {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
-			}
-
-			if tt.expectNil {
-				assert.Nil(t, result)
-				return
 			}
 
 			require.NotNil(t, result)
@@ -227,15 +225,16 @@ func TestHTTPRouteBuilder_BuildHTTPRoute_DecoderComponent(t *testing.T) {
 
 			result, err := builder.BuildHTTPRoute(context.Background(), tt.isvc, DecoderComponent)
 
+			if tt.expectNil {
+				var notReady *interfaces.ComponentNotReadyError
+				require.ErrorAs(t, err, &notReady)
+				assert.Nil(t, result)
+				return
+			}
 			if tt.expectedError {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
-			}
-
-			if tt.expectNil {
-				assert.Nil(t, result)
-				return
 			}
 
 			require.NotNil(t, result)
@@ -310,15 +309,16 @@ func TestHTTPRouteBuilder_BuildHTTPRoute_TopLevelComponent(t *testing.T) {
 
 			result, err := builder.BuildHTTPRoute(context.Background(), tt.isvc, TopLevelComponent)
 
+			if tt.expectNil {
+				var notReady *interfaces.ComponentNotReadyError
+				require.ErrorAs(t, err, &notReady)
+				assert.Nil(t, result)
+				return
+			}
 			if tt.expectedError {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
-			}
-
-			if tt.expectNil {
-				assert.Nil(t, result)
-				return
 			}
 
 			require.NotNil(t, result)
@@ -427,47 +427,40 @@ func TestHTTPRouteBuilder_TopLevelEngineFallback_UsesEngineService(t *testing.T)
 		"top-level HTTPRoute (engine fallback) must back the <isvc>-engine Service when there is no router")
 }
 
-// TestHTTPRouteBuilder_BuildHTTPRoute_ReturnsInterfaceNilWhenComponentNotReady
-// pins the dispatcher-side guard against a typed-nil-through-interface panic.
-//
-// A per-component builder returns (nil, nil) for the "component not ready"
-// branch. Returned directly through the client.Object interface, Go wraps
-// the typed-nil pointer — the interface itself is non-nil (carries type
-// info), only the inner value is nil. A caller checking `if obj == nil`
-// sees FALSE and dereferences the typed-nil pointer in
-// controllerutil.SetControllerReference, crashing the reconciler.
-//
-// The dispatcher detects the typed-nil and explicitly returns untyped nil
-// so `desired == nil` in the caller is true.
-//
-// NOTE: testify's `assert.Nil` uses reflect.IsNil under the hood and would
-// pass even for a typed-nil wrapped in an interface — so this test uses the
-// raw `== nil` comparison, which is the actual check the strategy performs.
+// A Component that cannot back a route yet yields no object and a
+// *interfaces.ComponentNotReadyError naming it. The object is a bare nil, not
+// a typed nil inside the interface, so the caller's `== nil` holds; and the
+// builder writes no condition, that is the strategy's job.
 func TestHTTPRouteBuilder_BuildHTTPRoute_ReturnsInterfaceNilWhenComponentNotReady(t *testing.T) {
 	cases := []struct {
 		name          string
 		componentType string
 		isvc          *v1beta1.InferenceService
+		notReady      v1beta1.ComponentType
 	}{
 		{
 			name:          "engine not ready",
 			componentType: EngineComponent,
 			isvc:          createTestInferenceServiceHTTPRoute("test-isvc", "default"),
+			notReady:      v1beta1.EngineComponent,
 		},
 		{
 			name:          "router not ready",
 			componentType: RouterComponent,
 			isvc:          createTestInferenceServiceWithRouterHTTPRoute("test-isvc", "default"),
+			notReady:      v1beta1.RouterComponent,
 		},
 		{
 			name:          "decoder not ready",
 			componentType: DecoderComponent,
 			isvc:          createTestInferenceServiceWithDecoderHTTPRoute("test-isvc", "default"),
+			notReady:      v1beta1.DecoderComponent,
 		},
 		{
 			name:          "top-level engine fallback not ready",
 			componentType: TopLevelComponent,
 			isvc:          createTestInferenceServiceHTTPRoute("test-isvc", "default"),
+			notReady:      v1beta1.EngineComponent,
 		},
 	}
 
@@ -475,25 +468,19 @@ func TestHTTPRouteBuilder_BuildHTTPRoute_ReturnsInterfaceNilWhenComponentNotRead
 		t.Run(tc.name, func(t *testing.T) {
 			builder := createHTTPRouteBuilder()
 
-			// Deliberately do NOT mark any condition Ready, so the inner
-			// per-component builders take the "component not ready" branch
-			// and return (nil, nil).
+			// No condition is marked Ready, so every per-component builder
+			// answers that its Component cannot back a route.
 			result, err := builder.BuildHTTPRoute(context.Background(), tc.isvc, tc.componentType)
-			require.NoError(t, err)
 
-			// A (*HTTPRoute)(nil) wrapped in a non-nil client.Object
-			// interface makes `result == nil` false and the strategy panic
-			// on the subsequent SetControllerReference. The dispatcher
-			// returns interface-nil instead, so this assertion holds.
-			//
-			// We deliberately use bare `== nil` here, NOT assert.Nil, since
-			// the former is the exact check the strategy performs.
+			var notReady *interfaces.ComponentNotReadyError
+			require.ErrorAs(t, err, &notReady)
+			assert.Equal(t, tc.notReady, notReady.Component)
+			// Bare `== nil`, not assert.Nil: a typed nil inside the interface
+			// would pass assert.Nil and still crash the strategy.
 			if result != nil {
-				t.Fatalf("BuildHTTPRoute(%s) must return interface-nil (== nil) when the component is not ready, "+
-					"but returned a typed-nil-wrapped-in-interface (%T). This is the typed-nil-through-interface bug "+
-					"that crashed the controller's reconcile loop on PD-disaggregated ISVCs.",
-					tc.componentType, result)
+				t.Fatalf("BuildHTTPRoute(%s) must return a bare nil object when the component is not ready, got %T", tc.componentType, result)
 			}
+			assert.Nil(t, tc.isvc.Status.GetCondition(v1beta1.IngressReady), "the builder writes no condition")
 		})
 	}
 }

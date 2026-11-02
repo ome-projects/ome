@@ -9,14 +9,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func rtRefISVC(ns, name, runtimeName string, autoSync *bool) *v1beta1.InferenceService {
@@ -59,14 +58,10 @@ func inheritingSR(ns, name, parent string) *v1beta1.ServingRuntime {
 
 func runtimeWatchClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	s := runtime.NewScheme()
-	if err := v1beta1.AddToScheme(s); err != nil {
-		t.Fatalf("AddToScheme: %v", err)
-	}
-	return ctrlclientfake.NewClientBuilder().WithScheme(s).
-		WithIndex(&v1beta1.InferenceService{}, isvcRuntimeNameIndexField, isvcRuntimeNameIndexExtractor).
-		WithIndex(&v1beta1.InferenceService{}, isvcRuntimeUnresolvedIndexField, isvcRuntimeUnresolvedIndexExtractor).
-		WithObjects(objs...).Build()
+	return fakeclient.New(t,
+		fakeclient.WithIndex(&v1beta1.InferenceService{}, isvcRuntimeNameIndexField, isvcRuntimeNameIndexExtractor),
+		fakeclient.WithIndex(&v1beta1.InferenceService{}, isvcRuntimeUnresolvedIndexField, isvcRuntimeUnresolvedIndexExtractor),
+		fakeclient.WithObjects(objs...))
 }
 
 func TestIsvcsReferencingRuntime(t *testing.T) {

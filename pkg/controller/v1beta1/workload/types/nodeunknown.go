@@ -20,12 +20,6 @@ import (
 // so the token never charges a revision's retry ladder.
 const WaitingReasonNodeUnknown = "NodeUnknown"
 
-// OperationNodeUnknown reports whether an operation is parked on a pod
-// whose node has stopped reporting it.
-func OperationNodeUnknown(op *InstanceOperation) bool {
-	return op != nil && op.Waiting == WaitingReasonNodeUnknown
-}
-
 // PodPhaseUnknown reports whether the kubelet has stopped reporting pod:
 // phase Unknown, which is neither a running pod nor a terminal one.
 func PodPhaseUnknown(pod *corev1.Pod) bool {

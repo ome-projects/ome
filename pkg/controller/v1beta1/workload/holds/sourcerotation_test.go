@@ -8,14 +8,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 const (
@@ -66,15 +65,11 @@ func sourcePod(name string, serving, routable bool) *corev1.Pod {
 // view of a source can be read from EndpointSlices.
 func applySurge(t *testing.T, store *rowStore, pods []*corev1.Pod, slices ...*discoveryv1.EndpointSlice) {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		t.Fatalf("scheme: %v", err)
-	}
-	builder := fake.NewClientBuilder().WithScheme(scheme)
+	objects := make([]client.Object, 0, len(slices))
 	for _, slice := range slices {
-		builder = builder.WithObjects(slice)
+		objects = append(objects, slice)
 	}
-	c := builder.Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objects...))
 	in := store.input()
 	if _, err := Run(context.Background(), PassInput{
 		Deps:  types.Deps{Client: c},

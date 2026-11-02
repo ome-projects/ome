@@ -9,11 +9,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // pushedRow is one Instance of a replica at a second push: the version it
@@ -35,10 +35,10 @@ type pushedReplica struct {
 	observed  int64 // status.observedGeneration
 	target    string
 	rows      []pushedRow
-	// stamp is the template hash the projector wrote beside the spec and
-	// observedStamp the one the status repeats; both empty on a replica the
-	// readers judge by its generation.
-	stamp, observedStamp string
+	// templateHash is the one the projector wrote beside the spec and
+	// observedHash the one the status repeats; both empty on a replica the
+	// readers read by its generation.
+	templateHash, observedHash string
 }
 
 // pushRevision names a side's revision for a version the way the replica
@@ -49,8 +49,8 @@ func pushRevision(comp v1beta1.ComponentType, version string) string {
 
 func (p pushedReplica) build() *v1beta1.InferenceReplica {
 	annotations := parentGenAnnotation(p.projected)
-	if p.stamp != "" {
-		annotations[constants.InferenceReplicaTemplateHashAnnotationKey] = p.stamp
+	if p.templateHash != "" {
+		annotations[constants.InferenceReplicaTemplateHashAnnotationKey] = p.templateHash
 	}
 	ir := &v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{
@@ -69,7 +69,7 @@ func (p pushedReplica) build() *v1beta1.InferenceReplica {
 		},
 		Status: v1beta1.InferenceReplicaStatus{
 			ObservedGeneration:   p.observed,
-			ObservedTemplateHash: p.observedStamp,
+			ObservedTemplateHash: p.observedHash,
 			CurrentRevision:      pushRevision(p.comp, "v1"),
 			UpdateRevision:       pushRevision(p.comp, p.target),
 			Replicas:             int32(len(p.rows)),
@@ -108,10 +108,10 @@ func (p pushedReplica) build() *v1beta1.InferenceReplica {
 // read the same way. The named side is never held by the other side's
 // status, and with no side named the first batch waits on nobody. Whether
 // the status predates the push is read off the template hash the projector
-// stamps beside the spec: a decoder whose generation moved twice for writes
+// writes beside the spec: a decoder whose generation moved twice for writes
 // outside its templates (an annotation value the revision leaves out, a
 // count) is current, and one whose templates changed while its status still
-// repeats the previous stamp predates the push even with its generation
+// repeats the previous hash predates the push even with its generation
 // observed.
 func TestEvaluateUpdateGate_BatchStepWaitsForAPeerWhoseStatusPredatesThePush(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
@@ -184,13 +184,13 @@ func TestEvaluateUpdateGate_BatchStepWaitsForAPeerWhoseStatusPredatesThePush(t *
 		{
 			name:    "the decoder's generation moved for writes outside its templates, so its status is current and the first new decoder opens the prefill side's batch",
 			engine:  engine(3, "v3"),
-			decoder: pushedReplica{comp: dec, step: 1, spec: 5, projected: 7, observed: 3, target: "v3", rows: ready("v3", "v1"), stamp: "t3", observedStamp: "t3"},
+			decoder: pushedReplica{comp: dec, step: 1, spec: 5, projected: 7, observed: 3, target: "v3", rows: ready("v3", "v1"), templateHash: "t3", observedHash: "t3"},
 			ask:     eng, defaults: decoderFirst,
 		},
 		{
-			name:    "the decoder's templates changed and its status still repeats the previous stamp, so it predates the push with its generation observed",
+			name:    "the decoder's templates changed and its status still repeats the previous template hash, so it predates the push with its generation observed",
 			engine:  engine(3, "v3"),
-			decoder: pushedReplica{comp: dec, step: 1, spec: 3, projected: 7, observed: 3, target: "v2", rows: ready("v2", "v1"), stamp: "t3", observedStamp: "t2"},
+			decoder: pushedReplica{comp: dec, step: 1, spec: 3, projected: 7, observed: 3, target: "v2", rows: ready("v2", "v1"), templateHash: "t3", observedHash: "t2"},
 			ask:     eng, defaults: decoderFirst, wantHold: true, wantReason: firstBatchWait,
 		},
 		{
@@ -206,7 +206,7 @@ func TestEvaluateUpdateGate_BatchStepWaitsForAPeerWhoseStatusPredatesThePush(t *
 			isvc := batchService(batchGroupFixture{maxUnavailable: "50%", tolerance: ptr.To(int32(20))}, members)
 			isvc.Generation = 7
 			objs := []client.Object{tc.engine.build(), tc.decoder.build()}
-			reads := fake.NewClientBuilder().WithScheme(pairingScheme(t)).WithObjects(objs...).Build()
+			reads := fakeclient.New(t, fakeclient.WithObjects(objs...))
 			target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Namespace: batchNamespace, Name: pushRevision(tc.ask, "v3")}}
 			allowed, gate, reason := EvaluateUpdateGate(context.Background(), reads, isvc, tc.ask, pushRevision(tc.ask, "v1"), target, nil, tc.defaults, workloadtypes.UpdateStrategyRecreatePod, 0, 0)
 			if tc.wantHold == allowed {

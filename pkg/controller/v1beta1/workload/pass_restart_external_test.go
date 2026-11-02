@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
@@ -62,7 +63,7 @@ import (
 // in, with no deadline or grace left to run, every Instance must either
 // serve or name the reason it does not: a Failed row with its cause, a
 // wait token on its operation, a hold on the Component, or an event that
-// names it. Two pictures the model found are pinned by lock tests:
+// names it. Two pictures the model found are held by lock tests:
 // TestRepair_AWaitDuringARebuildKeepsTheRunnersExitRecord holds that a
 // wait landing on a repair keeps the runner's exit record, and
 // TestRepair_AHeldRepairDoesNotStopTheForceDeleteOfALostNode holds that a
@@ -626,7 +627,7 @@ func (w *repairWorld) observe(n *repairNode, h *recoveryHarness) {
 				// A wait that landed on the repair wrote its reading over
 				// the exit record; the lock
 				// TestRepair_AWaitDuringARebuildKeepsTheRunnersExitRecord
-				// pins the waits that must leave the record in place.
+				// locks in the waits that must leave the record in place.
 				class = "known-wait-replaced-exit-record"
 			}
 			n.found = append(n.found, repairFinding{class: class,
@@ -1172,7 +1173,7 @@ func (w *repairWorld) knownWait(h *recoveryHarness, idx int32) string {
 		// The force delete of a serving Instance's lost node runs in the
 		// create pass; with another Instance's attempt open, the model
 		// reads this pod's wait as known. The lock
-		// TestRepair_AHeldRepairDoesNotStopTheForceDeleteOfALostNode pins
+		// TestRepair_AHeldRepairDoesNotStopTheForceDeleteOfALostNode locks in
 		// the held repair that must not stop that delete.
 		return "lost-node-behind-another-attempt"
 	}

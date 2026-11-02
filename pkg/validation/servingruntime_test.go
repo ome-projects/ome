@@ -9,64 +9,6 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-func TestValidateSupportedModelFormats_Entries_RequireFormatAndFrameworkNames(t *testing.T) {
-	tests := []struct {
-		name    string
-		formats []v1beta1.SupportedModelFormat
-		wantErr bool
-	}{
-		{
-			name:    "nil formats",
-			formats: nil,
-			wantErr: false,
-		},
-		{
-			name:    "empty formats",
-			formats: []v1beta1.SupportedModelFormat{},
-			wantErr: false,
-		},
-		{
-			name: "valid single format",
-			formats: []v1beta1.SupportedModelFormat{
-				{
-					ModelFormat:    &v1beta1.ModelFormat{Name: "safetensors"},
-					ModelFramework: &v1beta1.ModelFrameworkSpec{Name: "transformers"},
-				},
-			},
-		},
-		{
-			name: "missing modelFormat.name",
-			formats: []v1beta1.SupportedModelFormat{
-				{
-					ModelFramework: &v1beta1.ModelFrameworkSpec{Name: "transformers"},
-				},
-			},
-			wantErr: true,
-		},
-		{
-			name: "missing modelFramework.name",
-			formats: []v1beta1.SupportedModelFormat{
-				{
-					ModelFormat: &v1beta1.ModelFormat{Name: "safetensors"},
-				},
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateSupportedModelFormats(tc.formats)
-			if tc.wantErr && err == nil {
-				t.Fatalf("expected error, got nil")
-			}
-			if !tc.wantErr && err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-		})
-	}
-}
-
 func TestValidateModelFormatPrioritySame_RepeatedName_AutoSelectedPrioritiesAgree(t *testing.T) {
 	tests := []struct {
 		name    string

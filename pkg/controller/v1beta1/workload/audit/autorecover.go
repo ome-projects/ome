@@ -21,35 +21,19 @@ const ReasonAutoRecover = "AutoRecover"
 // mover path, distinct from the copier (surge-migration) machinery.
 const OutcomeRelocateRecreate = "relocate-recreate"
 
-// HasInFlightMigrationForInstance reports whether the ledger has a
-// Started entry for this (component, instance) without a terminal
-// counterpart. Used to suppress fresh auto-recovery requests while an
-// existing one is still being driven by the migration detector's
-// ledger source.
+// HasInFlightMigrationForInstance reports whether the ledger holds an
+// in-flight (Started) row for this (component, instance). Used to
+// suppress fresh auto-recovery requests while a migration of the same
+// Instance is still being driven by the migration detector's ledger
+// source.
 func HasInFlightMigrationForInstance(ledger *Ledger, component string, idx int32) bool {
 	if ledger == nil {
 		return false
 	}
-	terminal := map[string]struct{}{}
 	for _, e := range ledger.Entries {
-		if e.Phase == PhaseCompleted || e.Phase == PhaseFailed {
-			terminal[e.RequestUUID] = struct{}{}
+		if e.InFlight() && e.Component == component && e.SourceInstance == idx {
+			return true
 		}
-	}
-	for _, e := range ledger.Entries {
-		if e.Phase != PhaseStarted {
-			continue
-		}
-		if e.Component != component {
-			continue
-		}
-		if e.SourceInstance != idx {
-			continue
-		}
-		if _, done := terminal[e.RequestUUID]; done {
-			continue
-		}
-		return true
 	}
 	return false
 }

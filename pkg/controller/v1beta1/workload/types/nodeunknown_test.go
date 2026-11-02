@@ -10,10 +10,10 @@ import (
 )
 
 func TestOperationNodeUnknown(t *testing.T) {
-	if OperationNodeUnknown(nil) || OperationNodeUnknown(&InstanceOperation{}) {
+	if OperationWaitingOn(nil, WaitingReasonNodeUnknown) || OperationWaitingOn(&InstanceOperation{}, WaitingReasonNodeUnknown) {
 		t.Error("only the node-unknown token reports the hold")
 	}
-	if !OperationNodeUnknown(&InstanceOperation{Waiting: WaitingReasonNodeUnknown}) {
+	if !OperationWaitingOn(&InstanceOperation{Waiting: WaitingReasonNodeUnknown}, WaitingReasonNodeUnknown) {
 		t.Error("the token reads as node-unknown")
 	}
 }

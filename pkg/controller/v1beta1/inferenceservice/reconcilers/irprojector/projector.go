@@ -518,12 +518,12 @@ func applyDesiredSpec(ir *v1beta1.InferenceReplica, p Params, name string) {
 	ir.Spec.TopologySpread = p.TopologySpread
 	ir.Spec.TopologySpreadKey = p.TopologySpreadKey
 	ir.Spec.Pacing = projectedPacing(ir.Spec.Pacing, p.PacingPartition, ir.Spec.Replicas)
-	// Project the P/D pairing protocol onto the Components that pair. The
-	// token rides the engine/decoder revision hash so a protocol change rolls
-	// both; the router does not participate in pairing and must not re-roll
-	// on a protocol change.
+	// Project the pairing protocol onto the Components that pair. The token
+	// rides each pairing role's revision hash so a protocol change rolls them
+	// all; the router does not participate in pairing and must not re-roll on
+	// a protocol change.
 	ir.Spec.PairingProtocol = nil
-	if p.Component == v1beta1.EngineComponent || p.Component == v1beta1.DecoderComponent {
+	if role, _ := v1beta1.RoleOf(p.Component); role.Pairs {
 		if proto := p.ISVC.Spec.RolloutPairingProtocol(); proto != "" {
 			ir.Spec.PairingProtocol = &proto
 		}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"net/netip"
 	"sort"
 
@@ -75,7 +74,7 @@ func (p *GatewayAPIPublisher) ensureGatewayBackendResources(
 				return nil, nil, err
 			}
 			for _, endpointSlice := range slices {
-				if err := p.applyEndpointSlice(ctx, isvc, endpointSlice); err != nil {
+				if err := applyOwned(ctx, p, isvc, ownedEndpointSlice, endpointSlice); err != nil {
 					return nil, nil, err
 				}
 				desiredSlices[endpointSlice.Name] = struct{}{}
@@ -84,7 +83,7 @@ func (p *GatewayAPIPublisher) ensureGatewayBackendResources(
 
 		if p.config.GatewayBackend.TLS.Enabled {
 			policy := p.buildBackendTLSPolicy(isvc, serviceName, cluster)
-			if err := p.applyBackendTLSPolicy(ctx, isvc, policy); err != nil {
+			if err := applyOwned(ctx, p, isvc, ownedBackendTLSPolicy, policy); err != nil {
 				return nil, nil, err
 			}
 			desiredPolicies[policy.Name] = struct{}{}
@@ -197,66 +196,24 @@ func (p *GatewayAPIPublisher) buildBackendTLSPolicy(
 	}
 }
 
-func (p *GatewayAPIPublisher) applyEndpointSlice(ctx context.Context, isvc *v1beta1.InferenceService, desired *discoveryv1.EndpointSlice) error {
-	existing := &discoveryv1.EndpointSlice{}
-	err := p.apiReader.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
-	if apierrors.IsNotFound(err) {
-		if err := p.client.Create(ctx, desired); err != nil {
-			return fmt.Errorf("create global backend EndpointSlice %s/%s: %w", desired.Namespace, desired.Name, err)
-		}
-		return nil
+var (
+	ownedEndpointSlice = ownedKind[*discoveryv1.EndpointSlice]{
+		name:  "backend EndpointSlice",
+		empty: func() *discoveryv1.EndpointSlice { return &discoveryv1.EndpointSlice{} },
+		equal: func(desired, live *discoveryv1.EndpointSlice) bool {
+			return desired.AddressType == live.AddressType &&
+				equality.Semantic.DeepEqual(desired.Endpoints, live.Endpoints) &&
+				equality.Semantic.DeepEqual(desired.Ports, live.Ports)
+		},
 	}
-	if err != nil {
-		return fmt.Errorf("read global backend EndpointSlice %s/%s: %w", desired.Namespace, desired.Name, err)
+	ownedBackendTLSPolicy = ownedKind[*gatewayapiv1.BackendTLSPolicy]{
+		name:  "BackendTLSPolicy",
+		empty: func() *gatewayapiv1.BackendTLSPolicy { return &gatewayapiv1.BackendTLSPolicy{} },
+		equal: func(desired, live *gatewayapiv1.BackendTLSPolicy) bool {
+			return equality.Semantic.DeepEqual(desired.Spec, live.Spec)
+		},
 	}
-	if !p.ownsResource(existing, isvc) {
-		return fmt.Errorf("global backend EndpointSlice %s/%s belongs to another InferenceService", desired.Namespace, desired.Name)
-	}
-	if err := requireActiveGatewayResource(existing, "backend EndpointSlice"); err != nil {
-		return err
-	}
-	desired.ResourceVersion = existing.ResourceVersion
-	desired.Finalizers = append([]string(nil), existing.Finalizers...)
-	if desired.AddressType == existing.AddressType &&
-		equality.Semantic.DeepEqual(desired.Endpoints, existing.Endpoints) &&
-		equality.Semantic.DeepEqual(desired.Ports, existing.Ports) &&
-		maps.Equal(desired.Labels, existing.Labels) {
-		return nil
-	}
-	if err := p.client.Update(ctx, desired); err != nil {
-		return fmt.Errorf("update global backend EndpointSlice %s/%s: %w", desired.Namespace, desired.Name, err)
-	}
-	return nil
-}
-
-func (p *GatewayAPIPublisher) applyBackendTLSPolicy(ctx context.Context, isvc *v1beta1.InferenceService, desired *gatewayapiv1.BackendTLSPolicy) error {
-	existing := &gatewayapiv1.BackendTLSPolicy{}
-	err := p.apiReader.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
-	if apierrors.IsNotFound(err) {
-		if err := p.client.Create(ctx, desired); err != nil {
-			return fmt.Errorf("create global BackendTLSPolicy %s/%s: %w", desired.Namespace, desired.Name, err)
-		}
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read global BackendTLSPolicy %s/%s: %w", desired.Namespace, desired.Name, err)
-	}
-	if !p.ownsResource(existing, isvc) {
-		return fmt.Errorf("global BackendTLSPolicy %s/%s belongs to another InferenceService", desired.Namespace, desired.Name)
-	}
-	if err := requireActiveGatewayResource(existing, "BackendTLSPolicy"); err != nil {
-		return err
-	}
-	desired.ResourceVersion = existing.ResourceVersion
-	desired.Finalizers = append([]string(nil), existing.Finalizers...)
-	if equality.Semantic.DeepEqual(desired.Spec, existing.Spec) && maps.Equal(desired.Labels, existing.Labels) {
-		return nil
-	}
-	if err := p.client.Update(ctx, desired); err != nil {
-		return fmt.Errorf("update global BackendTLSPolicy %s/%s: %w", desired.Namespace, desired.Name, err)
-	}
-	return nil
-}
+)
 
 func (p *GatewayAPIPublisher) sourceEndpointSlices(
 	ctx context.Context,

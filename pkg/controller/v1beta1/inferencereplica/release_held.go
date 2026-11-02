@@ -6,8 +6,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -23,21 +21,15 @@ import (
 // exit from the terminal Held state (one `kubectl annotate` instead of
 // a status-subresource patch).
 //
-// Mailbox discipline mirrors consumeMigrationRequests: every present
-// request is answered — a matching Held block is removed (status write
-// through the MutateRetryBlock seam, which also mirrors the committed
-// slice onto the in-memory IR) with a Normal RetryBlockReleased event;
-// a non-Held match or an unknown revision is a no-op answered with a
-// RetryBlockReleaseSkipped event — and the annotation is then deleted
-// (consume = ack) against a fresh IR read under conflict retry, with
-// the deletion mirrored onto the caller's in-memory IR. Write order:
-// the block removal commits BEFORE the annotation delete, so a crash
-// between the two re-delivers into the no-op branch and the annotation
-// is cleaned up idempotently. Only the matched block is touched.
-//
-// Exhausted conflict retries on the annotation delete return
-// requeue=true; the request re-answers next pass. Events land on the
-// parent ISVC when resolvable (the user-facing stream), else the IR.
+// Every present request is answered: a matching Held block is removed
+// (status write through the MutateRetryBlock seam, which also mirrors
+// the committed slice onto the in-memory IR) with a Normal
+// RetryBlockReleased event; a non-Held match or an unknown revision is
+// a no-op answered with a RetryBlockReleaseSkipped event. The block
+// removal commits before acknowledgeRequest removes the annotation, so
+// a crash between the two re-delivers into the no-op branch. Only the
+// matched block is touched. Events land on the parent ISVC when
+// resolvable (the user-facing stream), else the IR.
 func (r *Reconciler) consumeReleaseHeldRequest(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, retryBlockHistoryLimit *int32) (requeue bool, err error) {
 	val, present := ir.Annotations[constants.ReleaseHeldRevisionAnnotationKey]
 	if !present {
@@ -83,35 +75,11 @@ func (r *Reconciler) consumeReleaseHeldRequest(ctx context.Context, log logr.Log
 		}
 	}
 
-	// Consume the annotation against a FRESH IR read under conflict
-	// retry — same discipline as the migration mailbox delete.
 	key := client.ObjectKeyFromObject(ir)
-	uerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return r.acknowledgeRequest(ctx, ir, "release-held annotation", func(ctx context.Context) (client.Object, error) {
 		fresh := &v1beta1.InferenceReplica{}
-		if err := r.APIReader.Get(ctx, key, fresh); err != nil {
-			return err
-		}
-		if _, ok := fresh.Annotations[constants.ReleaseHeldRevisionAnnotationKey]; !ok {
-			return nil
-		}
-		delete(fresh.Annotations, constants.ReleaseHeldRevisionAnnotationKey)
-		return r.Update(ctx, fresh)
-	})
-	if uerr != nil {
-		if apierrors.IsConflict(uerr) {
-			// Retries exhausted on a hot IR; the request re-answers next
-			// pass (every branch above is idempotent on re-delivery).
-			return true, nil
-		}
-		if apierrors.IsNotFound(uerr) {
-			return false, nil
-		}
-		return false, fmt.Errorf("delete consumed release-held annotation: %w", uerr)
-	}
-	// Mirror the deletion onto the caller's in-memory IR so this pass
-	// observes the consumed mailbox.
-	delete(ir.Annotations, constants.ReleaseHeldRevisionAnnotationKey)
-	return false, nil
+		return fresh, r.APIReader.Get(ctx, key, fresh)
+	}, constants.ReleaseHeldRevisionAnnotationKey)
 }
 
 // findRetryBlockByRevisionOrHash returns the RetryBlock whose

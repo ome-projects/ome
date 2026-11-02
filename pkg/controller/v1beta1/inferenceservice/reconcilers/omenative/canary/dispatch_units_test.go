@@ -7,11 +7,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // unitGroup is one canary group over one unit with the manual two-step plan.
@@ -125,7 +125,7 @@ func newTwoUnitRun(t *testing.T, isvc *v1beta1.InferenceService) *unitRun {
 	routerIR.Status.CurrentRevision = isvc.Name + "-router-rold"
 	engineIR := ir(ns, isvc.Name, v1beta1.EngineComponent, "oldrev")
 	engineIR.Status.CurrentRevision = isvc.Name + "-engine-oldrev"
-	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(
+	c := fakeclient.New(t, fakeclient.WithObjects(
 		isvc, routerIR, engineIR,
 		canaryPod(ns, isvc.Name, "router", "rold", "rold-0"),
 		canaryPod(ns, isvc.Name, "router", "rnew", "rnew-1"),
@@ -136,7 +136,7 @@ func newTwoUnitRun(t *testing.T, isvc *v1beta1.InferenceService) *unitRun {
 		canaryControllerRevision(ns, isvc.Name, "router", "rold", 1),
 		canaryControllerRevision(ns, isvc.Name, "router", "rnew", 2),
 		canaryControllerRevision(ns, isvc.Name, "engine", "oldrev", 1),
-	).Build()
+	))
 	return &unitRun{t: t, ctx: context.Background(), c: c, isvc: isvc}
 }
 

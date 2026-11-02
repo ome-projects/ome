@@ -76,86 +76,101 @@ OuterLoop:
 	return nil
 }
 
+// applyFinetunedModelChanges makes the model directories match the fine-tuned
+// weight list: it downloads and unpacks the models the list names that are not
+// installed yet, and removes the ones the list no longer names. A failure to
+// read the list or to install a model stops the sidecar.
 func (s *ServingSidecar) applyFinetunedModelChanges() {
-	ftModelInfofilePath := s.Config.FineTunedWeightInfoFilePath
-	unzippedFtModelDir := s.Config.UnzippedFineTunedWeightDirectory
-	zippedFtModelDir := s.Config.ZippedFineTunedWeightDirectory
-
-	// Step 1: Get the list of fine-tune models info
-	objectURIs, ftModelNames, err := readObjectURIsFromFile(ftModelInfofilePath)
+	objectURIs, ftModelNames, err := readObjectURIsFromFile(s.Config.FineTunedWeightInfoFilePath)
 	if err != nil {
-		s.logger.Infof("Error reading %s: %s", ftModelInfofilePath, err)
+		s.logger.Infof("Error reading %s: %s", s.Config.FineTunedWeightInfoFilePath, err)
 		panic(err)
 	}
 
-	// Step 2: Determine new models to be downloaded from Object Storage and models to be deleted from unzipped fine-tune models directory
-	unzippedFtModelNames, err := getExistingFtModelNamesFromDir(zippedFtModelDir)
+	existingNames, err := getExistingFtModelNamesFromDir(s.Config.ZippedFineTunedWeightDirectory)
 	if err != nil {
 		panic(err)
 	}
+	modelsToAdd, modelsToDelete := findModelNameDifferences(ftModelNames, existingNames)
 
-	modelsToAdd, modelsToDelete := findModelNameDifferences(ftModelNames, unzippedFtModelNames)
-
-	// Step 3: Download and unzip new models from Object Storage and delete old models from unzipped fine-tune models directory
-	// Iterate through objectURIs
 	for _, uri := range objectURIs {
-		if modelsToAdd[uri.ObjectName] {
-			s.logger.Infof("Model '%s' to be downloaded\n", uri.ObjectName)
-
-			err := os.MkdirAll(zippedFtModelDir, os.ModePerm)
-			if err != nil {
-				panic(err)
-			}
-			// Download model to target directory with retries
-			for attempt := 1; attempt <= maxRetries; attempt++ {
-				err = s.Config.ObjectStorageDataStore.DownloadWithStrategy(
-					uri,
-					zippedFtModelDir,
-					ociobjectstore.WithBaseNameOnly(true),
-					ociobjectstore.WithChunkSize(DefaultDownloadChunkSizeInMB),
-					ociobjectstore.WithThreads(DefaultDownloadThreads),
-					ociobjectstore.WithSizeThreshold(BigFileSizeInMB),
-				)
-
-				if err != nil {
-					s.logger.Infof("Error when downloading '%s'\n", uri.ObjectName)
-					if attempt < maxRetries {
-						s.logger.Infof("Retrying download '%s'\n", uri.ObjectName)
-						time.Sleep(retryDelay)
-						continue
-					} else {
-						panic(err)
-					}
-				} else {
-					break
-				}
-			}
-			s.logger.Infof("Model '%s' downloaded\n", uri.ObjectName)
-
-			zippedFtModelPath := filepath.Join(zippedFtModelDir, ociobjectstore.ObjectBaseName(uri.ObjectName))
-
-			// Unzip the downloaded model
-			err = zipper.Unzip(zippedFtModelPath, unzippedFtModelDir)
-			if err != nil {
-				s.logger.Errorf("Error when unzip %s to %s. %v\n", zippedFtModelPath, unzippedFtModelDir, err)
-				panic(err)
-			}
-			s.logger.Infof("Model '%s' unzipped\n", uri.ObjectName)
-
-			// Downloaded ft model zip file will be kept in the target folder
+		if !modelsToAdd[uri.ObjectName] {
+			continue
+		}
+		if err := s.addModel(uri); err != nil {
+			panic(err)
 		}
 	}
 
-	// Step 4: Delete models with their unzipped files and zip file
-	for modelToDelete := range modelsToDelete {
-		s.logger.Infof("Deleting fintuned model: %s\n", modelToDelete)
-		if err := deleteFilesWithMatchingString(unzippedFtModelDir, modelToDelete); err != nil {
-			s.logger.Errorf("Error when deleting unzipped model '%s' related files in %s, %v\n", modelToDelete, unzippedFtModelDir, err)
-		}
+	for name := range modelsToDelete {
+		s.removeModel(name)
+	}
+}
 
-		if err := os.Remove(filepath.Join(zippedFtModelDir, modelToDelete)); err != nil {
-			s.logger.Errorf("Error when deleting zipped model '%s' related files in %s, %v\n", modelToDelete, zippedFtModelDir, err)
+// addModel downloads one zipped model and unpacks it. The zip file stays in the
+// zipped directory, which is how the next pass sees the model as installed.
+func (s *ServingSidecar) addModel(uri ociobjectstore.ObjectURI) error {
+	s.logger.Infof("Model '%s' to be downloaded\n", uri.ObjectName)
+	if err := s.downloadWithRetries(uri); err != nil {
+		return err
+	}
+	s.logger.Infof("Model '%s' downloaded\n", uri.ObjectName)
+	if err := s.unzipModel(uri); err != nil {
+		return err
+	}
+	s.logger.Infof("Model '%s' unzipped\n", uri.ObjectName)
+	return nil
+}
+
+// downloadWithRetries fetches one zipped model into the zipped directory,
+// trying up to maxRetries times with retryDelay between attempts, and returns
+// the last attempt's error.
+func (s *ServingSidecar) downloadWithRetries(uri ociobjectstore.ObjectURI) error {
+	if err := os.MkdirAll(s.Config.ZippedFineTunedWeightDirectory, os.ModePerm); err != nil {
+		return err
+	}
+	var err error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err = s.Config.ObjectStorageDataStore.DownloadWithStrategy(
+			uri,
+			s.Config.ZippedFineTunedWeightDirectory,
+			ociobjectstore.WithBaseNameOnly(true),
+			ociobjectstore.WithChunkSize(DefaultDownloadChunkSizeInMB),
+			ociobjectstore.WithThreads(DefaultDownloadThreads),
+			ociobjectstore.WithSizeThreshold(BigFileSizeInMB),
+		)
+		if err == nil {
+			return nil
 		}
+		s.logger.Infof("Error when downloading '%s'\n", uri.ObjectName)
+		if attempt < maxRetries {
+			s.logger.Infof("Retrying download '%s'\n", uri.ObjectName)
+			time.Sleep(retryDelay)
+		}
+	}
+	return err
+}
+
+// unzipModel unpacks a downloaded model from the zipped directory into the
+// unzipped directory.
+func (s *ServingSidecar) unzipModel(uri ociobjectstore.ObjectURI) error {
+	zippedPath := filepath.Join(s.Config.ZippedFineTunedWeightDirectory, ociobjectstore.ObjectBaseName(uri.ObjectName))
+	if err := zipper.Unzip(zippedPath, s.Config.UnzippedFineTunedWeightDirectory); err != nil {
+		s.logger.Errorf("Error when unzip %s to %s. %v\n", zippedPath, s.Config.UnzippedFineTunedWeightDirectory, err)
+		return err
+	}
+	return nil
+}
+
+// removeModel deletes a model's unpacked files and its zip file. A failed
+// delete is logged and does not stop the sync.
+func (s *ServingSidecar) removeModel(name string) {
+	s.logger.Infof("Deleting fintuned model: %s\n", name)
+	if err := deleteFilesWithMatchingString(s.Config.UnzippedFineTunedWeightDirectory, name); err != nil {
+		s.logger.Errorf("Error when deleting unzipped model '%s' related files in %s, %v\n", name, s.Config.UnzippedFineTunedWeightDirectory, err)
+	}
+	if err := os.Remove(filepath.Join(s.Config.ZippedFineTunedWeightDirectory, name)); err != nil {
+		s.logger.Errorf("Error when deleting zipped model '%s' related files in %s, %v\n", name, s.Config.ZippedFineTunedWeightDirectory, err)
 	}
 }
 

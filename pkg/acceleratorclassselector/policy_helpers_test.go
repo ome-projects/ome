@@ -1,6 +1,7 @@
 package acceleratorclassselector
 
 import (
+	"context"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -531,94 +532,121 @@ func TestCalculateBestFitScore(t *testing.T) {
 	}
 }
 
-// TestCompareCosts tests cost comparison logic
-func TestCompareCosts(t *testing.T) {
+// TestCostGroupCheaper asserts the order inside each cost group: the lower figure is
+// cheaper, equal figures are not, and the spot price stands for the hourly figure.
+func TestCostGroupCheaper(t *testing.T) {
+	quantity := func(v int64) *resource.Quantity { return resource.NewQuantity(v, resource.DecimalSI) }
 	tests := []struct {
-		name     string
-		cost1    *resource.Quantity
-		cost2    *resource.Quantity
-		expected int
+		name  string
+		group string
+		cheap v1beta1.AcceleratorCost
+		dear  v1beta1.AcceleratorCost
 	}{
 		{
-			name:     "cost1 < cost2",
-			cost1:    resource.NewQuantity(1, resource.DecimalSI),
-			cost2:    resource.NewQuantity(2, resource.DecimalSI),
-			expected: -1,
+			name:  "hourly on-demand",
+			group: "hourly",
+			cheap: v1beta1.AcceleratorCost{PerHour: quantity(1)},
+			dear:  v1beta1.AcceleratorCost{PerHour: quantity(2)},
 		},
 		{
-			name:     "cost1 > cost2",
-			cost1:    resource.NewQuantity(3, resource.DecimalSI),
-			cost2:    resource.NewQuantity(2, resource.DecimalSI),
-			expected: 1,
+			name:  "hourly spot price counts before on-demand",
+			group: "hourly",
+			cheap: v1beta1.AcceleratorCost{PerHour: quantity(5), SpotPerHour: quantity(1)},
+			dear:  v1beta1.AcceleratorCost{PerHour: quantity(2)},
 		},
 		{
-			name:     "cost1 == cost2",
-			cost1:    resource.NewQuantity(2, resource.DecimalSI),
-			cost2:    resource.NewQuantity(2, resource.DecimalSI),
-			expected: 0,
+			name:  "per million tokens",
+			group: "per-million-tokens",
+			cheap: v1beta1.AcceleratorCost{PerMillionTokens: quantity(50)},
+			dear:  v1beta1.AcceleratorCost{PerMillionTokens: quantity(100)},
+		},
+		{
+			name:  "tier",
+			group: "tier",
+			cheap: v1beta1.AcceleratorCost{Tier: "low"},
+			dear:  v1beta1.AcceleratorCost{Tier: "high"},
+		},
+		{
+			name:  "unknown tier counts as medium",
+			group: "tier",
+			cheap: v1beta1.AcceleratorCost{Tier: "bronze"},
+			dear:  v1beta1.AcceleratorCost{Tier: "high"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := compareCosts(tt.cost1, tt.cost2)
-			if result != tt.expected {
-				t.Errorf("compareCosts() = %d, want %d", result, tt.expected)
+			var group *costGroup
+			for i := range costGroups {
+				if costGroups[i].label == tt.group {
+					group = &costGroups[i]
+				}
+			}
+			if group == nil {
+				t.Fatalf("no cost group %q", tt.group)
+			}
+			if !group.stated(tt.cheap) || !group.stated(tt.dear) {
+				t.Fatalf("both costs should state a %s figure", tt.group)
+			}
+			if !group.cheaper(tt.cheap, tt.dear) {
+				t.Errorf("cheaper(cheap, dear) = false, want true")
+			}
+			if group.cheaper(tt.dear, tt.cheap) {
+				t.Errorf("cheaper(dear, cheap) = true, want false")
+			}
+			if group.cheaper(tt.cheap, tt.cheap) {
+				t.Errorf("cheaper(cheap, cheap) = true, want false")
 			}
 		})
 	}
 }
 
-// TestSortScoredCandidates tests candidate sorting
-func TestSortScoredCandidates(t *testing.T) {
-	candidates := []scoredCandidate{
-		{AcceleratorClass: v1beta1.AcceleratorClass{ObjectMeta: metav1.ObjectMeta{Name: "c1"}}, Score: 0.5},
-		{AcceleratorClass: v1beta1.AcceleratorClass{ObjectMeta: metav1.ObjectMeta{Name: "c2"}}, Score: 0.9},
-		{AcceleratorClass: v1beta1.AcceleratorClass{ObjectMeta: metav1.ObjectMeta{Name: "c3"}}, Score: 0.3},
-		{AcceleratorClass: v1beta1.AcceleratorClass{ObjectMeta: metav1.ObjectMeta{Name: "c4"}}, Score: 0.7},
+// TestHighestScoring asserts the choice among scored candidates: the highest score wins,
+// the first listed wins a tie, and nothing is scored when fewer than two remain.
+func TestHighestScoring(t *testing.T) {
+	named := func(names ...string) []v1beta1.AcceleratorClass {
+		candidates := make([]v1beta1.AcceleratorClass, 0, len(names))
+		for _, name := range names {
+			candidates = append(candidates, v1beta1.AcceleratorClass{ObjectMeta: metav1.ObjectMeta{Name: name}})
+		}
+		return candidates
 	}
+	byName := func(scores map[string]float64) func(v1beta1.AcceleratorClass) float64 {
+		return func(c v1beta1.AcceleratorClass) float64 { return scores[c.Name] }
+	}
+	ctx := context.Background()
 
-	t.Run("Sort descending (highest first)", func(t *testing.T) {
-		testCandidates := make([]scoredCandidate, len(candidates))
-		copy(testCandidates, candidates)
-
-		sortScoredCandidates(testCandidates, false)
-
-		expected := []string{"c2", "c4", "c1", "c3"}
-		for i, name := range expected {
-			if testCandidates[i].Name != name {
-				t.Errorf("Position %d: got %s, want %s", i, testCandidates[i].Name, name)
-			}
+	t.Run("Highest score wins", func(t *testing.T) {
+		score := byName(map[string]float64{"c1": 0.5, "c2": 0.9, "c3": 0.3, "c4": 0.7})
+		selected := highestScoring(ctx, "BestFit", named("c1", "c2", "c3", "c4"), score)
+		if selected == nil || *selected != "c2" {
+			t.Errorf("got %v, want c2", selected)
 		}
 	})
 
-	t.Run("Sort ascending (lowest first)", func(t *testing.T) {
-		testCandidates := make([]scoredCandidate, len(candidates))
-		copy(testCandidates, candidates)
-
-		sortScoredCandidates(testCandidates, true)
-
-		expected := []string{"c3", "c1", "c4", "c2"}
-		for i, name := range expected {
-			if testCandidates[i].Name != name {
-				t.Errorf("Position %d: got %s, want %s", i, testCandidates[i].Name, name)
-			}
+	t.Run("First listed wins a tie", func(t *testing.T) {
+		score := byName(map[string]float64{"c1": 0.7, "c2": 0.9, "c3": 0.9})
+		selected := highestScoring(ctx, "BestFit", named("c1", "c2", "c3"), score)
+		if selected == nil || *selected != "c2" {
+			t.Errorf("got %v, want c2", selected)
 		}
 	})
 
 	t.Run("Empty slice", func(t *testing.T) {
-		testCandidates := []scoredCandidate{}
-		sortScoredCandidates(testCandidates, false)
-		// Should not panic
+		selected := highestScoring(ctx, "BestFit", nil, byName(nil))
+		if selected != nil {
+			t.Errorf("got %s, want nil", *selected)
+		}
 	})
 
-	t.Run("Single element", func(t *testing.T) {
-		testCandidates := []scoredCandidate{
-			{AcceleratorClass: v1beta1.AcceleratorClass{ObjectMeta: metav1.ObjectMeta{Name: "only"}}, Score: 1.0},
+	t.Run("Single element is chosen without scoring", func(t *testing.T) {
+		score := func(c v1beta1.AcceleratorClass) float64 {
+			t.Fatalf("scored %s", c.Name)
+			return 0
 		}
-		sortScoredCandidates(testCandidates, false)
-		if testCandidates[0].Name != "only" {
-			t.Errorf("Single element changed: got %s", testCandidates[0].Name)
+		selected := highestScoring(ctx, "BestFit", named("only"), score)
+		if selected == nil || *selected != "only" {
+			t.Errorf("got %v, want only", selected)
 		}
 	})
 }
@@ -881,6 +909,39 @@ func TestMeetsRequirements(t *testing.T) {
 				if reason != tt.expectedReason {
 					t.Errorf("meetsRequirements() reason = %q, want %q", reason, tt.expectedReason)
 				}
+			}
+		})
+	}
+}
+
+// A compute capability is a dotted number ("major.minor", as NVIDIA states
+// it), so a two-digit major sorts above a one-digit one: a class at "10.0"
+// satisfies a minimum of "9.0", and a class at "9.0" does not satisfy a
+// minimum of "10.0". A value that is not a number form keeps the text order.
+func TestMeetsRequirements_ComputeCapabilityIsComparedAsNumbers(t *testing.T) {
+	class := func(capability string) v1beta1.AcceleratorClass {
+		return v1beta1.AcceleratorClass{
+			ObjectMeta: metav1.ObjectMeta{Name: "gpu-" + capability},
+			Spec:       v1beta1.AcceleratorClassSpec{Capabilities: v1beta1.AcceleratorCapabilities{ComputeCapability: capability}},
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		have, want string
+		eligible   bool
+		reason     string
+	}{
+		{"two-digit major above a one-digit minimum", "10.0", "9.0", true, ""},
+		{"one-digit major below a two-digit minimum", "9.0", "10.0", false, "compute capability 9.0 < required 10.0"},
+		{"minor below the minimum", "7.5", "8.0", false, "compute capability 7.5 < required 8.0"},
+		{"equal to the minimum", "9.0", "9.0", true, ""},
+		{"a text form keeps the text order", "sm_90", "sm_80", true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eligible, reason := meetsRequirements(class(tc.have), &v1beta1.AcceleratorConstraints{MinArchitectureVersion: ptr.To(tc.want)})
+			if eligible != tc.eligible || reason != tc.reason {
+				t.Fatalf("capability %s against minimum %s: eligible=%v reason=%q, want eligible=%v reason=%q",
+					tc.have, tc.want, eligible, reason, tc.eligible, tc.reason)
 			}
 		})
 	}

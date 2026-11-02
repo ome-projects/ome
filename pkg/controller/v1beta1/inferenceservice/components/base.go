@@ -161,15 +161,24 @@ func resolveComponentAutoscaling(ctx context.Context, b *BaseComponentFields, is
 		return ComponentAutoscaling{}, err
 	}
 	resolved, source, hold := autoscaler.ResolveComponentAutoscalerWithPolicy(b.Runtime, isvc, componentType, outcome)
-	if b.CoordinatorFollower && source == autoscaler.SpecSourceDefault && !hold {
-		resolved = &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerNone}
-	}
+	resolved = coordinatorFollowerAutoscaler(b, resolved, source, hold)
 	res := ComponentAutoscaling{Outcome: outcome, Resolved: resolved, Source: source, Hold: hold}
 	if hold {
 		emitHoldEvent(b, isvc, componentType, outcome)
 		res.RequeueAfter = policyHoldRequeueAfter(b)
 	}
 	return res, nil
+}
+
+// coordinatorFollowerAutoscaler gives a scaling-policy follower that declares
+// no autoscaler of its own class None: the coordinator writes its desired
+// count, so the default scaler would fight it. Dispatch and the status writer
+// both apply it, so status reports the class that actually runs.
+func coordinatorFollowerAutoscaler(b *BaseComponentFields, resolved *v1beta1.ComponentAutoscaler, source autoscaler.SpecSource, hold bool) *v1beta1.ComponentAutoscaler {
+	if b.CoordinatorFollower && source == autoscaler.SpecSourceDefault && !hold {
+		return &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerNone}
+	}
+	return resolved
 }
 
 // emitHoldEvent raises the AutoscalerPolicyHold warning only on transition:
@@ -343,30 +352,6 @@ func MergeResources(b *BaseComponentFields, container *corev1.Container) {
 	render.MergeResources(&b.Piece, container)
 }
 
-// MergeEngineResources merges runtime and accelerator class resources into
-// the engine container when the service specifies none.
-func MergeEngineResources(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container) {
-	render.MergeEngineResources(&b.Piece, isvc, container)
-}
-
-// MergeDecoderResources merges runtime and accelerator class resources into
-// the decoder container when the service specifies none.
-func MergeDecoderResources(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container) {
-	render.MergeDecoderResources(&b.Piece, isvc, container)
-}
-
-// UpdateEngineAffinity applies the accelerator class's discovery affinity to
-// the engine pod spec when the service specifies no affinity.
-func UpdateEngineAffinity(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec) {
-	render.UpdateEngineAffinity(&b.Piece, isvc, podSpec)
-}
-
-// UpdateDecoderAffinity applies the accelerator class's discovery affinity to
-// the decoder pod spec when the service specifies no affinity.
-func UpdateDecoderAffinity(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec) {
-	render.UpdateDecoderAffinity(&b.Piece, isvc, podSpec)
-}
-
 // ProcessBaseAnnotations processes common annotations.
 func ProcessBaseAnnotations(b *BaseComponentFields, isvc *v1beta1.InferenceService, annotations map[string]string) (map[string]string, error) {
 	return render.ProcessBaseAnnotations(&b.Piece, isvc, annotations)
@@ -486,6 +471,7 @@ func writeComponentAutoscalerStatus(b *BaseComponentFields, isvc *v1beta1.Infere
 		}
 	} else {
 		resolved, source, hold = autoscaler.ResolveComponentAutoscalerWithPolicy(b.Runtime, isvc, componentType, outcome)
+		resolved = coordinatorFollowerAutoscaler(b, resolved, source, hold)
 	}
 
 	scaleTargetRef := canonicalScaleTargetRef(b.DeploymentMode, isvc, objectMeta.Name, componentType)
@@ -652,14 +638,15 @@ func canonicalScaleTargetRef(mode constants.DeploymentModeType, isvc *v1beta1.In
 // rules: prefer a port named "metrics", else the first declared port,
 // else "http".
 //
-// The stable Service adds leader filters only when the ISVC declares
-// Worker.Size. Runtime-only shape is not used here because this
-// Service spans revisions that may have different runner shapes.
-//
-// The multi-pod filter is runner=leader AND pod-ordinal=0: pod-ordinal
-// is numbered per runner, so the rank-0 worker also carries ordinal 0
-// and pod-ordinal alone would still admit a worker. runner=leader pins
-// the one serving pod.
+// multiPod is the effective shape of the Component: the runtime's
+// leader/worker blocks with the ISVC's merged over them, the same
+// decision that renders leader and worker runners. A shape the runtime
+// alone supplies therefore narrows the stable Service exactly like one
+// declared on the ISVC. Workers are distributed-compute peers that do
+// not serve the customer endpoint, so a multi-pod Service selects only
+// the leader at ordinal 0 (query.LeaderRoutingSelector): pod-ordinal is
+// numbered per runner, so the rank-0 worker also carries ordinal 0 and
+// the runner key is what keeps it out.
 //
 // Single-pod Components keep the broader selector: SurgeThenDrain
 // alternates the pod-naming ordinal between 0 and 1 across surges
@@ -690,11 +677,12 @@ func ReconcileOMENativeSubresources(
 	componentExt *v1beta1.ComponentExtensionSpec,
 	objectMeta metav1.ObjectMeta,
 	podSpec *corev1.PodSpec,
+	multiPod bool,
 ) error {
 	if podSpec == nil {
 		return nil
 	}
-	return ReconcileStableSubresources(ctx, b, isvc, componentType, isvc.Name, isvcutils.IsMultiPodComponent(isvc, componentType), componentExt, objectMeta, podSpec)
+	return ReconcileStableSubresources(ctx, b, isvc, componentType, isvc.Name, multiPod, componentExt, objectMeta, podSpec)
 }
 
 // ReconcileStableSubresources is ReconcileOMENativeSubresources with the pod
@@ -715,20 +703,13 @@ func ReconcileStableSubresources(
 	podSpec *corev1.PodSpec,
 ) error {
 	// Base selector — narrows to OMENative-managed pods of this (ISVC,
-	// Component) pair. Used as-is for PodMonitor; augmented with a
-	// `runner=leader` + `pod-ordinal=0` filter when the ISVC declares a
-	// multi-pod shape (see function-level docstring for rationale).
+	// Component) pair. Used as-is for PodMonitor; narrowed to the leader
+	// for the stable Service of a multi-pod Component (see function-level
+	// docstring for rationale).
 	baseSelector := omeNativePodSelector(podPrefix, componentType)
 	stableSelector := baseSelector
 	if leaderOnly {
-		stableSelector = make(map[string]string, len(baseSelector)+2)
-		for k, v := range baseSelector {
-			stableSelector[k] = v
-		}
-		// Pod ordinals are numbered per runner, so worker ordinal 0 also carries
-		// this value. Combining the runner and ordinal selects only the leader.
-		stableSelector[query.LabelRunner] = string(v1beta1.RunnerNameLeader)
-		stableSelector[query.LabelPodOrdinal] = "0"
+		stableSelector = query.LeaderRoutingSelector(baseSelector, true)
 	}
 	componentMeta := objectMeta.DeepCopy()
 	componentMeta.OwnerReferences = []metav1.OwnerReference{

@@ -201,3 +201,59 @@ func TestPeerEnvDeclared(t *testing.T) {
 		t.Error("ISVC with a rollout group must declare peer env")
 	}
 }
+
+// Every declared role learns every other declared role's address, in a
+// stable order, whatever the shape: P, P+D, E+P, E+P+D, each with and
+// without a router.
+func TestServingPeersNamesEveryOtherDeclaredRole(t *testing.T) {
+	shape := func(encoder, decoder, router bool) *v1beta1.InferenceService {
+		isvc := peerISVC()
+		isvc.Spec.Engine = &v1beta1.EngineSpec{}
+		if encoder {
+			isvc.Spec.Encoder = &v1beta1.EncoderSpec{}
+		}
+		if decoder {
+			isvc.Spec.Decoder = &v1beta1.DecoderSpec{}
+		}
+		if router {
+			isvc.Spec.Router = &v1beta1.RouterSpec{}
+		}
+		return isvc
+	}
+	const (
+		E = v1beta1.EncoderComponent
+		P = v1beta1.EngineComponent
+		D = v1beta1.DecoderComponent
+		R = v1beta1.RouterComponent
+	)
+	cases := []struct {
+		name                     string
+		encoder, decoder, router bool
+		caller                   v1beta1.ComponentType
+		want                     []v1beta1.ComponentType
+	}{
+		{name: "P engine", caller: P, want: nil},
+		{name: "P+R engine", router: true, caller: P, want: []v1beta1.ComponentType{R}},
+		{name: "P+D engine", decoder: true, caller: P, want: []v1beta1.ComponentType{D}},
+		{name: "P+D+R decoder", decoder: true, router: true, caller: D, want: []v1beta1.ComponentType{P, R}},
+		{name: "E+P engine", encoder: true, caller: P, want: []v1beta1.ComponentType{E}},
+		{name: "E+P encoder", encoder: true, caller: E, want: []v1beta1.ComponentType{P}},
+		{name: "E+P+R encoder", encoder: true, router: true, caller: E, want: []v1beta1.ComponentType{P, R}},
+		{name: "E+P+D engine", encoder: true, decoder: true, caller: P, want: []v1beta1.ComponentType{D, E}},
+		{name: "E+P+D encoder", encoder: true, decoder: true, caller: E, want: []v1beta1.ComponentType{D, P}},
+		{name: "E+P+D+R router", encoder: true, decoder: true, router: true, caller: R, want: []v1beta1.ComponentType{D, E, P}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ServingPeers(shape(tc.encoder, tc.decoder, tc.router), tc.caller)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ServingPeers = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("ServingPeers = %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}

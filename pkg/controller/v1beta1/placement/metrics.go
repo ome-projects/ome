@@ -1,6 +1,8 @@
 package placement
 
 import (
+	"cmp"
+
 	"github.com/prometheus/client_golang/prometheus"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
@@ -64,7 +66,22 @@ var (
 
 	placementSplitMaxPerCluster = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "ome_isvc_placement_split_max_replicas_per_cluster",
-		Help: "Per-cluster replica ceiling from spec.placement.split.maxReplicasPerCluster (0 = uncapped).",
+		Help: "Per-cluster replica cap of the primary component (the engine, or else the decoder), from spec.placement.split.maxPerCluster (0 = uncapped).",
+	}, []string{"namespace", "isvc"})
+
+	placementTotalDesiredReplicas = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ome_isvc_placement_total_desired_replicas",
+		Help: "Requested primary replica units in the accepted placement plan for the current source generation, including unassigned replicas.",
+	}, []string{"namespace", "isvc"})
+
+	placementCandidateDesiredReplicas = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ome_isvc_placement_candidate_desired_replicas",
+		Help: "Desired primary replica units assigned to this member in the current accepted plan. Zero includes draining or retired members; unassigned demand is excluded.",
+	}, []string{"namespace", "isvc", "cluster"})
+
+	placementCapacityObservationKnown = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "ome_isvc_placement_capacity_observation_known",
+		Help: "Whether the current placement plan and all required member capacity observations are known (1) or unknown (0).",
 	}, []string{"namespace", "isvc"})
 )
 
@@ -75,6 +92,7 @@ func init() {
 		placementCandidateObservationKnown, placementCandidateObservationFailingSince,
 		placementPolicyInfo, placementSplitReplicas,
 		placementSplitMaxPerCluster,
+		placementTotalDesiredReplicas, placementCandidateDesiredReplicas, placementCapacityObservationKnown,
 	)
 }
 
@@ -129,6 +147,57 @@ func recordPlacement(isvc *v1beta1.InferenceService, res placementResult) {
 	}
 
 	recordPolicy(isvc)
+	recordCapacity(isvc, res.candidates)
+}
+
+// recordCapacity preserves the accepted target when a member disappears.
+// Unknown observations must not reuse the Ready count retained during grace.
+func recordCapacity(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement) {
+	ns, name := source.Namespace, source.Name
+	match := prometheus.Labels{"namespace": ns, "isvc": name}
+	placementTotalDesiredReplicas.DeletePartialMatch(match)
+	placementCandidateDesiredReplicas.DeletePartialMatch(match)
+	placementCapacityObservationKnown.WithLabelValues(ns, name).Set(0)
+	if source.Status.Placement == nil || source.Status.Placement.Plan == nil {
+		return
+	}
+	accepted := source.Status.Placement.Plan
+	if source.UID == "" || accepted.SourceUID != source.UID || accepted.ID == "" || accepted.Revision <= 0 || accepted.ObservedGeneration != source.Generation || accepted.RequestedReplicas < 0 || accepted.AssignedReplicas < 0 || accepted.UnassignedReplicas < 0 {
+		return
+	}
+	placementTotalDesiredReplicas.WithLabelValues(ns, name).Set(float64(accepted.RequestedReplicas))
+	var assigned int64
+	known := true
+	desired := make(map[string]int32, len(candidates))
+	seen := make(map[string]bool, len(candidates))
+	for _, candidate := range candidates {
+		allocation := candidate.Allocation
+		if candidate.Cluster == "" || seen[candidate.Cluster] || allocation == nil || allocation.DesiredReplicas < 0 || allocation.CurrentReplicas < 0 {
+			return
+		}
+		seen[candidate.Cluster] = true
+		assigned += int64(allocation.DesiredReplicas)
+		desired[candidate.Cluster] = allocation.DesiredReplicas
+		// Unknown retired members contribute no capacity. A trusted positive
+		// Ready count contradicts a fully retired allocation.
+		if allocation.DesiredReplicas == 0 && allocation.CurrentReplicas == 0 && allocation.DesiredHome == nil && allocation.CurrentHome == nil {
+			known = known && (!candidate.ObservationKnown || candidate.ReadyReplicas == 0)
+			continue
+		}
+		if allocation.ClusterUID == "" {
+			return
+		}
+		known = known && candidate.ObservationKnown && candidate.ReadyReplicas >= 0
+	}
+	if assigned != accepted.AssignedReplicas || accepted.RequestedReplicas != assigned+int64(accepted.UnassignedReplicas) {
+		return
+	}
+	for cluster, replicas := range desired {
+		placementCandidateDesiredReplicas.WithLabelValues(ns, name, cluster).Set(float64(replicas))
+	}
+	if known {
+		placementCapacityObservationKnown.WithLabelValues(ns, name).Set(1)
+	}
 }
 
 // recordPolicy publishes the spec-side placement policy. Split-only numeric
@@ -155,7 +224,9 @@ func recordPolicy(isvc *v1beta1.InferenceService) {
 	if p.Split.Replicas != nil {
 		placementSplitReplicas.WithLabelValues(ns, name).Set(float64(*p.Split.Replicas))
 	}
-	placementSplitMaxPerCluster.WithLabelValues(ns, name).Set(float64(p.Split.MaxReplicasPerCluster))
+	// A source that declares no component reports the engine's cap.
+	primary := cmp.Or(primaryScaleComponent(declaredComponents(isvc)), v1beta1.EngineComponent)
+	placementSplitMaxPerCluster.WithLabelValues(ns, name).Set(float64(p.Split.Ceiling(primary)))
 }
 
 // DeleteForISVC drops every placement series for an ISVC. Called on teardown so
@@ -175,4 +246,7 @@ func DeleteForISVC(namespace, isvc string) {
 	placementPolicyInfo.DeletePartialMatch(match)
 	placementSplitReplicas.DeletePartialMatch(match)
 	placementSplitMaxPerCluster.DeletePartialMatch(match)
+	placementTotalDesiredReplicas.DeletePartialMatch(match)
+	placementCandidateDesiredReplicas.DeletePartialMatch(match)
+	placementCapacityObservationKnown.DeletePartialMatch(match)
 }

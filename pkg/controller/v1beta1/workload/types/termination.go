@@ -48,8 +48,9 @@ const RunnerExitUnobservedMessage = "the runner restarted after the Instance ent
 //     CrashLoopBackOff pod shows the crash in LastTerminationState while
 //     its live State is Waiting.
 //  2. A container stuck in a terminal waiting state (CrashLoopBackOff,
-//     ImagePullBackOff, CreateContainerError, ...) — the wedge signal the
-//     stuck-pod escalator fires on. ExitCode is left nil (no process ran).
+//     ImagePullBackOff, a CreateContainerError the runtime refused, ...;
+//     IsTerminalWaiting) — the wedge signal the stuck-pod escalator fires
+//     on. ExitCode is left nil (no process ran).
 //  3. Any terminated container at all (exit 0 but the pod is Failed — rare,
 //     e.g. a restartPolicy=Never sidecar exiting).
 //  4. Pod-level fallback: Reason="PodFailed" with the pod's status message,
@@ -80,7 +81,7 @@ func PodTermination(pod *corev1.Pod, now metav1.Time) *InstanceTermination {
 	// the prior crash in LastTerminationState — prefer that over `now` so
 	// the record is stable across observations.
 	for _, cs := range allStatuses {
-		if cs.State.Waiting != nil && IsTerminalWaitingReason(cs.State.Waiting.Reason) {
+		if IsTerminalWaiting(cs.State.Waiting) {
 			return &InstanceTermination{
 				PodName:       pod.Name,
 				ContainerName: cs.Name,

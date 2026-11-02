@@ -7,7 +7,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -124,30 +123,29 @@ type policyMemberObservation struct {
 	failedClosed bool
 }
 
-// policyPreflight holds the config-driven preflight tunables plus the
-// in-memory per-(source,member) bookkeeping the multi-cluster policy detectors
-// need. The API deliberately carries no such state; a control-plane restart
-// clears it and every clock restarts conservatively (detectors only ever fire
-// later, never spuriously).
+// policyPreflight is the autoscaler-policy preflight's state: the config-driven
+// tunables plus the per-source bookkeeping the multi-cluster policy detectors
+// need, on top of the staged condition and member observations every policy
+// preflight keeps. The API deliberately carries no such state; a control-plane
+// restart clears it and every clock restarts conservatively (detectors only
+// ever fire later, never spuriously).
 type policyPreflight struct {
+	preflightRecord[policyMemberObservation]
+
 	memberGetTimeout time.Duration
 	skewDeadline     time.Duration
 	// now is injectable so tests drive the skew clock without sleeping.
 	now func() time.Time
 
-	mu sync.Mutex
-	// preflight is the latest staged PlacementPolicyPreflight condition per
-	// source, applied on the next status write.
-	preflight map[types.UID]policyCondition
-	// members is the latest lifted observation per (source, member).
-	members map[types.UID]map[string]policyMemberObservation
-	// prunes counts CONSECUTIVE ref-prune reverts per (source, member).
+	// prunes counts CONSECUTIVE ref-prune reverts per (source, member); it
+	// shares the record's mutex.
 	prunes map[types.UID]map[string]int
 	// eligibility is the last terminally-determined preflight verdict per
 	// (source, candidate). A transient member read error keeps the candidate
 	// in this last-known state instead of evicting it, so an auth blip or a
 	// slow apiserver can never re-race a serving member; only NotFound and
-	// digest skew (terminal verdicts) overwrite it.
+	// digest skew (terminal verdicts) overwrite it. It shares the record's
+	// mutex.
 	eligibility map[types.UID]map[string]bool
 }
 
@@ -176,54 +174,24 @@ func (p *policyPreflight) clock() time.Time {
 	return time.Now()
 }
 
-func (p *policyPreflight) setPreflight(uid types.UID, c policyCondition) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.preflight == nil {
-		p.preflight = make(map[types.UID]policyCondition)
-	}
-	p.preflight[uid] = c
-}
-
-func (p *policyPreflight) preflightFor(uid types.UID) (policyCondition, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.preflight[uid]
-	return c, ok
-}
-
+// recordMember stores a member's observation with the skew clock anchored at
+// the FIRST observation of this ref-carrying (source, member) pair; the
+// derived's creation time only ever moves the anchor FORWARD (a recreated
+// derived restarts the clock). Anchoring on creation alone would start a
+// long-placed derived already past the deadline the moment a ref is added to
+// its source.
 func (p *policyPreflight) recordMember(uid types.UID, cluster string, obs policyMemberObservation) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.members == nil {
-		p.members = make(map[types.UID]map[string]policyMemberObservation)
-	}
-	byCluster := p.members[uid]
-	if byCluster == nil {
-		byCluster = make(map[string]policyMemberObservation)
-		p.members[uid] = byCluster
-	}
-	// The skew clock anchors at the FIRST observation of this ref-carrying
-	// (source, member) pair; the derived's creation time only ever moves the
-	// anchor FORWARD (a recreated derived restarts the clock). Anchoring on
-	// creation alone would start a long-placed derived already past the
-	// deadline the moment a ref is added to its source.
 	anchor := p.clock()
-	if prev, ok := byCluster[cluster]; ok && !prev.placedSince.IsZero() {
+	if prev, ok := p.members[uid][cluster]; ok && !prev.placedSince.IsZero() {
 		anchor = prev.placedSince
 	}
 	if obs.placedSince.After(anchor) {
 		anchor = obs.placedSince
 	}
 	obs.placedSince = anchor
-	byCluster[cluster] = obs
-}
-
-func (p *policyPreflight) memberFor(uid types.UID, cluster string) (policyMemberObservation, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	obs, ok := p.members[uid][cluster]
-	return obs, ok
+	p.putMemberLocked(uid, cluster, obs)
 }
 
 func (p *policyPreflight) forgetMember(uid types.UID, cluster string) {
@@ -295,8 +263,7 @@ func (p *policyPreflight) prunedMembers(uid types.UID) []string {
 func (p *policyPreflight) forget(uid types.UID) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	delete(p.preflight, uid)
-	delete(p.members, uid)
+	p.dropSourceLocked(uid)
 	delete(p.prunes, uid)
 	delete(p.eligibility, uid)
 }
@@ -338,6 +305,8 @@ type componentPolicyRef struct {
 	policy    string
 }
 
+func (r componentPolicyRef) policyName() string { return r.policy }
+
 // hasPolicyRefs is the allocation-free zero-cost guard: the entire policy
 // preflight/lift surface is inert for the common ISVC that references no
 // AutoscalerPolicy, keeping placement behavior byte-identical for it.
@@ -359,85 +328,12 @@ func referencedPolicyRefs(isvc *v1beta1.InferenceService) []componentPolicyRef {
 	return out
 }
 
-// distinctPolicyNames returns the sorted distinct policy names across refs.
-func distinctPolicyNames(refs []componentPolicyRef) []string {
-	seen := make(map[string]struct{}, len(refs))
-	var names []string
-	for _, ref := range refs {
-		if _, ok := seen[ref.policy]; ok {
-			continue
-		}
-		seen[ref.policy] = struct{}{}
-		names = append(names, ref.policy)
-	}
-	sort.Strings(names)
-	return names
-}
-
 // controlPlaneName names this control plane in operator-facing messages.
 func (r *Reconciler) controlPlaneName() string {
 	if r.ControlPlaneID != "" {
 		return "control plane " + r.ControlPlaneID
 	}
 	return "the control plane"
-}
-
-// policyPreflightOutcome is the preflight verdict for one pass: the candidates
-// still eligible for fan-out, or a full hold (Split hard gate, missing anchor,
-// or no eligible candidate at all).
-type policyPreflightOutcome struct {
-	eligible []string
-	// hold gates fan-out while the caller continues observing standing members.
-	hold bool
-	// holdAsIs gates fan-out and Single re-racing while the caller continues
-	// observing and publishing standing-member health.
-	holdAsIs bool
-	// transient marks a pass whose verdict rests on a transient read error,
-	// so the caller re-checks at the poll cadence instead of the long
-	// steady-state backstop.
-	transient bool
-}
-
-// candidateSkip records one candidate the preflight made ineligible this pass.
-type candidateSkip struct {
-	cluster string
-	reason  string
-	detail  string
-	// transient: the verdict rests on a read error that can heal by itself
-	// (anything but NotFound), not on observed terminal skew.
-	transient bool
-}
-
-// skipReasonPrecedence orders the False reason chosen when NO candidate
-// remains eligible: a digest mismatch is the loudest genuine-skew signal,
-// then a missing member copy (distribution lag), then an unreachable member,
-// then a member that never declared the capability at all.
-var skipReasonPrecedence = []string{
-	v1beta1.PlacementPolicyPreflightReasonDigestMismatch,
-	v1beta1.PlacementPolicyPreflightReasonPolicyMissing,
-	v1beta1.PlacementPolicyPreflightReasonMemberGetTimeout,
-	v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
-}
-
-func dominantSkipReason(skips []candidateSkip) string {
-	present := make(map[string]bool, len(skips))
-	for _, s := range skips {
-		present[s.reason] = true
-	}
-	for _, reason := range skipReasonPrecedence {
-		if present[reason] {
-			return reason
-		}
-	}
-	return v1beta1.PlacementPolicyPreflightReasonCapabilityMissing
-}
-
-func describeSkips(skips []candidateSkip) string {
-	parts := make([]string, 0, len(skips))
-	for _, s := range skips {
-		parts = append(parts, fmt.Sprintf("%s (%s: %s)", s.cluster, s.reason, s.detail))
-	}
-	return strings.Join(parts, "; ")
 }
 
 // preflightPolicies gates the candidate set for a policy-referencing source
@@ -474,18 +370,11 @@ func (r *Reconciler) preflightPolicies(ctx context.Context, isvc *v1beta1.Infere
 	for _, name := range names {
 		pol := &v1beta1.AutoscalerPolicy{}
 		if err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: name}, pol); err != nil {
-			if !apierrors.IsNotFound(err) && sourcePlaced(isvc) {
-				// A transient control-plane read error is no verdict on the
-				// anchor. Hold actuation and re-read soon.
-				r.Log.Error(err, "policy preflight: anchor read failed; holding existing placement",
-					"policy", isvc.Namespace+"/"+name, "isvc", isvc.Namespace+"/"+isvc.Name)
-				return &policyPreflightOutcome{holdAsIs: true, transient: true}
-			}
-			pp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse,
-				v1beta1.PlacementPolicyPreflightReasonPolicyMissing,
-				fmt.Sprintf("AutoscalerPolicy %s/%s has no readable anchor copy on %s: %v; holding placement",
-					isvc.Namespace, name, r.controlPlaneName(), err)))
-			return &policyPreflightOutcome{hold: true, transient: !apierrors.IsNotFound(err)}
+			return r.holdOnUnreadableAnchor(err, isvc, name, pp,
+				"policy preflight: anchor read failed; holding existing placement",
+				preflightCondition(corev1.ConditionFalse, v1beta1.PlacementPolicyPreflightReasonPolicyMissing,
+					fmt.Sprintf("AutoscalerPolicy %s/%s has no readable anchor copy on %s: %v; holding placement",
+						isvc.Namespace, name, r.controlPlaneName(), err)))
 		}
 		digest, err := render.PortableDigest(&pol.Spec)
 		if err != nil {
@@ -508,80 +397,61 @@ func (r *Reconciler) preflightPolicies(ctx context.Context, isvc *v1beta1.Infere
 		anchorDigests[name] = digest
 	}
 
-	labelsFor := make(map[string]map[string]string, len(clusters))
-	for i := range clusters {
-		labelsFor[clusters[i].Name] = clusters[i].Labels
-	}
-
-	winner := winnerCluster(isvc)
-	var eligible []string
-	var skips []candidateSkip
-	transient := false
-	for _, c := range candidates {
-		var skip *candidateSkip
-		if labelsFor[c][constants.WorkloadClusterAutoscalerPolicyLabel] != WorkloadClusterAutoscalerPolicyCapability {
-			skip = &candidateSkip{
-				cluster: c,
-				reason:  v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
-				detail: fmt.Sprintf("cluster does not carry %s=%s",
-					constants.WorkloadClusterAutoscalerPolicyLabel, WorkloadClusterAutoscalerPolicyCapability),
-			}
-		} else {
-			cl, ok := r.Clusters.ClientFor(c)
-			if !ok {
-				// Not connected this pass: fan-out cannot reach it anyway, and the
-				// sticky-winner logic owns transport flaps. Leave it eligible;
-				// verification happens on the pass that can actually place.
-				eligible = append(eligible, c)
-				continue
-			}
-			skip = r.memberPolicySkew(ctx, cl, isvc.Namespace, names, anchorDigests)
-		}
-		if skip == nil {
-			pp.recordEligibility(isvc.UID, c, true)
-			eligible = append(eligible, c)
-			continue
-		}
-		skip.cluster = c
-		if skip.transient {
-			transient = true
-			if last, known := pp.lastEligibility(isvc.UID, c); known && last {
-				// A transient read error keeps the candidate in its last
-				// terminally-verified eligibility; only NotFound and digest
-				// skew evict. Re-verified at the poll cadence.
-				eligible = append(eligible, c)
-				continue
-			}
-		} else {
-			pp.recordEligibility(isvc.UID, c, false)
-		}
-		if c == winner {
-			// Preflight ineligibility gates new fan-out without freezing the
-			// standing winner's observed health.
+	labelsFor := clusterLabels(clusters)
+	gate := candidateGate{
+		record: pp,
+		check: func(cluster string) (*candidateSkip, bool) {
+			return r.policyCandidateSkip(ctx, isvc, cluster, labelsFor[cluster], names, anchorDigests)
+		},
+		holdPlaced: func(skip candidateSkip) {
 			r.Log.Info("policy preflight: standing winner ineligible; holding actuation",
-				"cluster", c, "isvc", isvc.Namespace+"/"+isvc.Name, "reason", skip.reason, "detail", skip.detail)
+				"cluster", skip.cluster, "isvc", isvc.Namespace+"/"+isvc.Name, "reason", skip.reason, "detail", skip.detail)
 			if !skip.transient {
 				pp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse, skip.reason,
-					"standing winner is ineligible; skipped: "+describeSkips([]candidateSkip{*skip})))
+					"standing winner is ineligible; skipped: "+describeSkips([]candidateSkip{skip})))
 			}
-			return &policyPreflightOutcome{holdAsIs: true, transient: skip.transient}
-		}
-		skips = append(skips, *skip)
+		},
 	}
+	return gate.run(isvc.UID, candidates, winnerCluster(isvc))
+}
 
-	if len(eligible) == 0 {
-		pp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionFalse,
-			dominantSkipReason(skips),
-			"no eligible candidate remains; skipped: "+describeSkips(skips)))
-		return &policyPreflightOutcome{hold: true, transient: transient}
+// policyCandidateSkip classifies one candidate for the autoscaler preflight
+// and keeps the eligibility memory current. A candidate without the
+// capability label or with a skewed member copy is skipped and remembered as
+// ineligible; a verified member is remembered as eligible; a member that is
+// not connected this pass stays eligible unrecorded; a transient member read
+// error keeps the candidate as it was last verified.
+func (r *Reconciler) policyCandidateSkip(ctx context.Context, isvc *v1beta1.InferenceService, cluster string, labels map[string]string, names []string, anchorDigests map[string]string) (skip *candidateSkip, keep bool) {
+	pp := r.policyState()
+	if labels[constants.WorkloadClusterAutoscalerPolicyLabel] != WorkloadClusterAutoscalerPolicyCapability {
+		skip = &candidateSkip{
+			reason: v1beta1.PlacementPolicyPreflightReasonCapabilityMissing,
+			detail: fmt.Sprintf("cluster does not carry %s=%s",
+				constants.WorkloadClusterAutoscalerPolicyLabel, WorkloadClusterAutoscalerPolicyCapability),
+		}
+	} else {
+		cl, ok := r.Clusters.ClientFor(cluster)
+		if !ok {
+			// Not connected this pass: fan-out cannot reach it anyway, and the
+			// sticky-winner logic owns transport flaps. Leave it eligible;
+			// verification happens on the pass that can actually place.
+			return nil, false
+		}
+		skip = r.memberPolicySkew(ctx, cl, isvc.Namespace, names, anchorDigests)
 	}
-	msg := fmt.Sprintf("%d of %d candidates eligible", len(eligible), len(candidates))
-	if len(skips) > 0 {
-		msg += "; skipped: " + describeSkips(skips)
+	if skip == nil {
+		pp.recordEligibility(isvc.UID, cluster, true)
+		return nil, false
 	}
-	pp.setPreflight(isvc.UID, preflightCondition(corev1.ConditionTrue,
-		v1beta1.PlacementPolicyPreflightReasonPassed, msg))
-	return &policyPreflightOutcome{eligible: eligible, transient: transient}
+	if skip.transient {
+		// A transient read error keeps the candidate in its last
+		// terminally-verified eligibility; only NotFound and digest
+		// skew evict. Re-verified at the poll cadence.
+		last, known := pp.lastEligibility(isvc.UID, cluster)
+		return skip, known && last
+	}
+	pp.recordEligibility(isvc.UID, cluster, false)
+	return skip, false
 }
 
 // sourcePlaced reports whether the source currently publishes a Placed

@@ -20,26 +20,8 @@ func UpdateVolumeMounts(p *Piece, isvc *v1beta1.InferenceService, container *cor
 		return
 	}
 
-	// Add model volume mount if base model is specified and it's necessary
-	if p.BaseModel != nil && !isShardedModel(p.BaseModel) && p.BaseModel.Storage != nil && p.BaseModelMeta != nil {
-		if isvcutils.IsOriginalModelVolumeMountNecessary(objectMeta.Annotations) {
-			if pvc := parsePVCComponents(p); pvc != nil {
-				vm := corev1.VolumeMount{
-					Name:      p.BaseModelMeta.Name,
-					MountPath: constants.ModelDefaultMountPath,
-					SubPath:   pvc.SubPath,
-					ReadOnly:  true,
-				}
-				isvcutils.AppendVolumeMount(container, &vm)
-			} else if p.BaseModel.Storage.Path != nil {
-				vm := corev1.VolumeMount{
-					Name:      p.BaseModelMeta.Name,
-					MountPath: *p.BaseModel.Storage.Path,
-					ReadOnly:  true,
-				}
-				isvcutils.AppendVolumeMount(container, &vm)
-			}
-		}
+	if _, mount, ok := modelSource(p); ok && isvcutils.IsOriginalModelVolumeMountNecessary(objectMeta.Annotations) {
+		isvcutils.AppendVolumeMount(container, &mount)
 	}
 
 	AppendOverlayVolumeMounts(p, p.Overlays, container)
@@ -134,30 +116,8 @@ func UpdateEnvVariables(p *Piece, isvc *v1beta1.InferenceService, container *cor
 
 // UpdatePodSpecVolumes updates pod spec with common volumes
 func UpdatePodSpecVolumes(p *Piece, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, objectMeta *metav1.ObjectMeta) {
-	// Add model volume if base model is specified.
-	if p.BaseModel != nil && !isShardedModel(p.BaseModel) && p.BaseModel.Storage != nil && p.BaseModelMeta != nil {
-		if pvc := parsePVCComponents(p); pvc != nil {
-			modelVolume := corev1.Volume{
-				Name: p.BaseModelMeta.Name,
-				VolumeSource: corev1.VolumeSource{
-					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-						ClaimName: pvc.PVCName,
-						ReadOnly:  true,
-					},
-				},
-			}
-			podSpec.Volumes = append(podSpec.Volumes, modelVolume)
-		} else if p.BaseModel.Storage.Path != nil {
-			modelVolume := corev1.Volume{
-				Name: p.BaseModelMeta.Name,
-				VolumeSource: corev1.VolumeSource{
-					HostPath: &corev1.HostPathVolumeSource{
-						Path: *p.BaseModel.Storage.Path,
-					},
-				},
-			}
-			podSpec.Volumes = append(podSpec.Volumes, modelVolume)
-		}
+	if volume, _, ok := modelSource(p); ok {
+		podSpec.Volumes = append(podSpec.Volumes, volume)
 	}
 
 	AppendOverlayVolumes(p, p.Overlays, podSpec)
@@ -176,15 +136,47 @@ func UpdatePodSpecVolumes(p *Piece, isvc *v1beta1.InferenceService, podSpec *cor
 	}
 }
 
-func isShardedModel(model *v1beta1.BaseModelSpec) bool {
-	return model != nil && model.Distribution != nil && *model.Distribution == v1beta1.DistributionSharded
+// modelSource is the volume holding the primary model's bytes and its read-only
+// mount: a claim mounted at the default model path under its sub-path, or a host
+// path mounted at that same path. ok is false when the pod mounts nothing for
+// the model (no model, no storage, no metadata, or a model with the Sharded
+// distribution, which the pod does not mount).
+func modelSource(p *Piece) (corev1.Volume, corev1.VolumeMount, bool) {
+	if p.BaseModel == nil || isvcutils.IsShardedBaseModel(p.BaseModel) || p.BaseModel.Storage == nil || p.BaseModelMeta == nil {
+		return corev1.Volume{}, corev1.VolumeMount{}, false
+	}
+	source, subPath, ok := storageSource(p.BaseModel.Storage)
+	if !ok {
+		return corev1.Volume{}, corev1.VolumeMount{}, false
+	}
+	mountPath := constants.ModelDefaultMountPath
+	if source.HostPath != nil {
+		mountPath = source.HostPath.Path
+	}
+	name := p.BaseModelMeta.Name
+	return corev1.Volume{Name: name, VolumeSource: source},
+		corev1.VolumeMount{Name: name, MountPath: mountPath, SubPath: subPath, ReadOnly: true},
+		true
+}
+
+// storageSource reads where a storage spec keeps a model's bytes: a
+// PersistentVolumeClaim, with the sub-path inside the claim, or a path on the
+// node. ok is false when the spec names neither.
+func storageSource(s *v1beta1.StorageSpec) (source corev1.VolumeSource, subPath string, ok bool) {
+	if pvc := parsePVCStorage(s); pvc != nil {
+		return corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvc.PVCName, ReadOnly: true}}, pvc.SubPath, true
+	}
+	if s != nil && s.Path != nil {
+		return corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: *s.Path}}, "", true
+	}
+	return corev1.VolumeSource{}, "", false
 }
 
 func modelPathEnvValue(p *Piece, objectMeta *metav1.ObjectMeta) (string, bool) {
 	if p == nil || p.BaseModel == nil || p.BaseModel.Storage == nil {
 		return "", false
 	}
-	if isShardedModel(p.BaseModel) {
+	if isvcutils.IsShardedBaseModel(p.BaseModel) {
 		if p.BaseModel.Storage.StorageUri == nil || *p.BaseModel.Storage.StorageUri == "" {
 			return "", false
 		}
@@ -193,7 +185,7 @@ func modelPathEnvValue(p *Piece, objectMeta *metav1.ObjectMeta) (string, bool) {
 	if objectMeta == nil || !isvcutils.IsOriginalModelVolumeMountNecessary(objectMeta.Annotations) {
 		return "", false
 	}
-	if isPVCBaseModel(p) {
+	if isPVCStorage(p.BaseModel.Storage) {
 		return constants.ModelDefaultMountPath, true
 	}
 	if p.BaseModel.Storage.Path == nil || *p.BaseModel.Storage.Path == "" {

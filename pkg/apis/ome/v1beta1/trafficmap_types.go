@@ -39,11 +39,16 @@ const TrafficMapRoutable = "Routable"
 // currently override one or more route-arm weights.
 const TrafficMapOverrideActive = "OverrideActive"
 
-// Reasons for the OverrideActive condition.
+// Reasons for the OverrideActive condition. OverridesApplied accompanies True;
+// OverridesPending and NoOverrides accompany False. OverridesInvalid accompanies
+// Unknown while the annotation cannot be parsed: the map keeps its last valid
+// table, so the holds of the last valid value still set their clusters' weights
+// to zero.
 const (
 	TrafficMapReasonOverridesApplied = "OverridesApplied"
 	TrafficMapReasonOverridesPending = "OverridesPending"
 	TrafficMapReasonNoOverrides      = "NoOverrides"
+	TrafficMapReasonOverridesInvalid = "OverridesInvalid"
 )
 
 // TrafficMapCapacityFallback is the condition type reporting whether one or
@@ -308,7 +313,8 @@ type TrafficMapProbe struct {
 type TrafficMapCapacity struct {
 	// ReportedWeight is the accepted endpoint capacity in Reported mode, in
 	// replicas, and replaces the replica-based weight. Nil means no fresh
-	// quorum, so the entry weighs its replica count; zero means the reporter
+	// quorum, or a positive report while placement status shows no ready
+	// replica, so the entry weighs its replica count. Zero means the reporter
 	// cannot serve traffic.
 	// +optional
 	ReportedWeight *resource.Quantity `json:"reportedWeight,omitempty"`
@@ -351,9 +357,11 @@ type TrafficMapCapacity struct {
 	Reported *int32 `json:"reported,omitempty"`
 
 	// FallbackReason explains why a configured endpoint capacity source did not
-	// produce a current observation. The entry keeps its replica-based weight;
-	// in Reported mode it first uses a fresh cached report. Empty means the
-	// latest result was usable or polling is disabled.
+	// produce a current observation, or why Reported mode did not apply a
+	// positive one: placement status shows no ready replica. The entry keeps its
+	// replica-based weight, except that after a failed poll Reported mode uses a
+	// fresh cached report while a replica is ready. Empty means the latest result
+	// was usable or polling is disabled.
 	// +optional
 	FallbackReason string `json:"fallbackReason,omitempty"`
 }
@@ -374,7 +382,8 @@ type TrafficMapStatus struct {
 	SourceUID types.UID `json:"sourceUID,omitempty"`
 
 	// Published reports whether the active publisher has realized this map onto
-	// its data plane.
+	// its data plane. For a publisher that only writes weights to an external
+	// system, it means those writes succeeded, not that anything reads them.
 	// +optional
 	Published bool `json:"published,omitempty"`
 

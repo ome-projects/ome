@@ -9,6 +9,7 @@ package escalation_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +25,9 @@ import (
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/holds"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/replay"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -280,7 +283,8 @@ func TestReconcileGatedDeadlines_ParksUnschedulableInstance(t *testing.T) {
 // TestReconcileGatedDeadlines_ParksUnschedulableGangSurgeSource: a gang
 // surge creates its pods under the SURGE index while the governing
 // operation and its deadline live on the SOURCE, so the source's clock
-// must park on the surge row's hold.
+// must park on the surge row's hold, whichever member the gang scheduler
+// rejected.
 func TestReconcileGatedDeadlines_ParksUnschedulableGangSurgeSource(t *testing.T) {
 	now := time.Now()
 	surge := int32(1)
@@ -1249,5 +1253,621 @@ func TestEscalation_UnschedulablePastGraceReleasesTheExclusion(t *testing.T) {
 	}
 	if len(rec.blockCalls) != 0 {
 		t.Errorf("RetryBlock calls: got %+v want none (no placement is not the revision's fault)", rec.blockCalls)
+	}
+}
+
+// gangDomainFullMessage is the scheduler's report for a gang held to the
+// topology domain where its other members run, when that domain cannot
+// take the member being placed.
+const gangDomainFullMessage = "0/8 nodes are available: domain domain-a cannot fit all remaining gang members ns/engine-0. preemption: not eligible"
+
+// gangDomainFullWorker is the gang's worker the scheduler cannot place because
+// the domain the leader already runs in cannot take it.
+func gangDomainFullWorker(since time.Time) *corev1.Pod {
+	pod := unschedulablePod("engine-0-worker-0", since)
+	pod.Status.Conditions[0].Message = gangDomainFullMessage
+	return pod
+}
+
+// TestEscalation_UnschedulableGangDomainFullEndsOnTheShorterGrace: a
+// repair's leader is placed and running, but its worker has waited six
+// minutes because the domain the leader runs in cannot take it. More
+// capacity elsewhere cannot help, so the five minute full-domain grace
+// ends the attempt well before the fifteen minute general grace would.
+// The failure is the environment's: the scheduler's message is recorded
+// and no revision is charged.
+func TestEscalation_UnschedulableGangDomainFullEndsOnTheShorterGrace(t *testing.T) {
+	now := time.Now()
+	input, rec := escalationFixture(restartingGang(now.Add(30 * time.Minute)))
+	input.UnschedulableGrace = 15 * time.Minute
+	input.GangDomainFullGrace = 5 * time.Minute
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2),
+		map[int32][]*corev1.Pod{0: {
+			servingPod("engine-0-leader-0"),
+			gangDomainFullWorker(now.Add(-6 * time.Minute)),
+		}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	got := rec.store[0]
+	if got.Phase != types.InstancePhaseFailed {
+		t.Errorf("Phase: got %q want Failed (six minutes against a five minute full-domain grace)", got.Phase)
+	}
+	if got.LastFailure == nil || got.LastFailure.Reason != types.WaitingReasonUnschedulable ||
+		!strings.Contains(got.LastFailure.Message, "cannot fit all remaining gang members") {
+		t.Errorf("LastFailure: got %+v want the scheduler's full-domain message", got.LastFailure)
+	}
+	if len(rec.blocks) != 0 {
+		t.Errorf("RetryBlock: got %v want none (environment-caused)", rec.blocks)
+	}
+	if len(rec.warns) != 1 {
+		t.Errorf("WarnInstanceFailed: got %v want one call", rec.warns)
+	}
+}
+
+// TestEscalation_UnschedulableGangDomainFullWaitsWhileAMemberTerminates: the
+// same full-domain report while another pod of the attempt is still
+// being deleted. That pod may be what fills the domain, and its room
+// frees as it goes, so the hold waits on the general grace instead.
+func TestEscalation_UnschedulableGangDomainFullWaitsWhileAMemberTerminates(t *testing.T) {
+	now := time.Now()
+	input, rec := escalationFixture(restartingGang(now.Add(30 * time.Minute)))
+	input.UnschedulableGrace = 15 * time.Minute
+	input.GangDomainFullGrace = 5 * time.Minute
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2),
+		map[int32][]*corev1.Pod{0: {
+			terminating(servingPod("engine-0-leader-0")),
+			gangDomainFullWorker(now.Add(-6 * time.Minute)),
+		}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	got := rec.store[0]
+	if got.Phase != types.InstancePhaseRestarting {
+		t.Errorf("Phase: got %q want Restarting (a terminating member keeps the general grace)", got.Phase)
+	}
+	if got.Operation == nil || got.Operation.Waiting != types.WaitingReasonUnschedulable {
+		t.Errorf("Operation.Waiting: got %+v want %q", got.Operation, types.WaitingReasonUnschedulable)
+	}
+	if len(rec.warns) != 0 {
+		t.Errorf("WarnInstanceFailed: got %v want none", rec.warns)
+	}
+}
+
+// TestEscalation_UnschedulableGangDomainFullGraceChoosesTheShorter: the
+// full-domain grace never makes a hold wait longer than the general
+// grace, applies to any other scheduler report not at all, and applies on
+// its own when the general grace is unconfigured.
+func TestEscalation_UnschedulableGangDomainFullGraceChoosesTheShorter(t *testing.T) {
+	now := time.Now()
+	otherReport := func(since time.Time) *corev1.Pod {
+		return unschedulablePod("engine-0-worker-0", since)
+	}
+	cases := []struct {
+		name        string
+		general     time.Duration
+		domainGrace time.Duration
+		worker      *corev1.Pod
+		wantFailure bool
+	}{
+		{"full-domain report, general grace shorter", 10 * time.Minute, 30 * time.Minute, gangDomainFullWorker(now.Add(-12 * time.Minute)), true},
+		{"full-domain report, full-domain grace unconfigured", 15 * time.Minute, 0, gangDomainFullWorker(now.Add(-6 * time.Minute)), false},
+		{"full-domain report, general grace unconfigured", 0, 5 * time.Minute, gangDomainFullWorker(now.Add(-6 * time.Minute)), true},
+		{"full-domain report inside the full-domain grace", 15 * time.Minute, 5 * time.Minute, gangDomainFullWorker(now.Add(-4 * time.Minute)), false},
+		{"other report keeps the general grace", 15 * time.Minute, 5 * time.Minute, otherReport(now.Add(-6 * time.Minute)), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input, rec := escalationFixture(restartingGang(now.Add(30 * time.Minute)))
+			input.UnschedulableGrace = tc.general
+			input.GangDomainFullGrace = tc.domainGrace
+			if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2),
+				map[int32][]*corev1.Pod{0: {servingPod("engine-0-leader-0"), tc.worker}}); err != nil {
+				t.Fatalf("escalation pass: %v", err)
+			}
+			if failed := rec.store[0].Phase == types.InstancePhaseFailed; failed != tc.wantFailure {
+				t.Errorf("Failed: got %v want %v (Phase %q)", failed, tc.wantFailure, rec.store[0].Phase)
+			}
+		})
+	}
+}
+
+// gangWaitingOnWorker is a two-pod gang's Create attempt whose leader is
+// placed and serving while the worker waits for placement since
+// workerSince. placementWait, when set, is the attempt's recorded
+// placement wait.
+func gangWaitingOnWorker(now, workerSince time.Time, placementWait *time.Time) ([]types.InstanceStatus, map[int32][]*corev1.Pod) {
+	insts := creatingInstance(now.Add(30 * time.Minute))
+	insts[0].PodCount = 2
+	insts[0].Operation.Waiting = types.WaitingReasonUnschedulable
+	if placementWait != nil {
+		at := metav1.NewTime(*placementWait)
+		insts[0].Operation.PlacementWaitSince = &at
+	}
+	leader := servingPod("engine-0-default-0")
+	leader.Spec.NodeName = "node-b"
+	return insts, map[int32][]*corev1.Pod{0: {leader, unschedulablePod("engine-0-default-1", workerSince)}}
+}
+
+// TestEscalation_UnschedulableGrace_ReplacedGangMemberRunsFromPlacementWait:
+// a gang whose worker was rebuilt after its node stopped reporting has
+// waited for placement since the attempt's recorded placement wait, not
+// since the rebuilt worker's own PodScheduled transition. Past the grace
+// from that start the attempt ends, and the ending retires the recorded
+// wait so the attempt after it runs on its own clock.
+func TestEscalation_UnschedulableGrace_ReplacedGangMemberRunsFromPlacementWait(t *testing.T) {
+	now := time.Now()
+	attemptSince := now.Add(-18 * time.Minute)
+	insts, pods := gangWaitingOnWorker(now, now.Add(-time.Minute), &attemptSince)
+	input, rec := escalationFixture(insts)
+	input.UnschedulableGrace = 15 * time.Minute
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2), pods); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	got := rec.store[0]
+	if got.Phase != types.InstancePhaseFailed {
+		t.Errorf("Phase: got %q want Failed (18 minutes of placement wait against a 15 minute grace)", got.Phase)
+	}
+	if len(rec.warns) != 1 {
+		t.Errorf("WarnInstanceFailed: got %v want one call", rec.warns)
+	}
+	if got.Operation != nil && got.Operation.PlacementWaitSince != nil {
+		t.Errorf("PlacementWaitSince: got %v want it retired by the ending", got.Operation.PlacementWaitSince)
+	}
+}
+
+// TestEscalation_UnschedulableGrace_NoPlacementWaitRunsFromPod: an
+// attempt with no recorded placement wait (a scheduler wait alone, or an
+// operation written before the field existed) is measured from the
+// unplaceable pod's own PodScheduled transition, as before.
+func TestEscalation_UnschedulableGrace_NoPlacementWaitRunsFromPod(t *testing.T) {
+	now := time.Now()
+	insts, pods := gangWaitingOnWorker(now, now.Add(-time.Minute), nil)
+	input, rec := escalationFixture(insts)
+	input.UnschedulableGrace = 15 * time.Minute
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2), pods); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	if rec.store[0].Phase != types.InstancePhaseCreating {
+		t.Errorf("Phase: got %q want Creating (one minute of hold against a 15 minute grace)", rec.store[0].Phase)
+	}
+	if len(rec.warns) != 0 {
+		t.Errorf("WarnInstanceFailed: got %v want none", rec.warns)
+	}
+}
+
+// TestEscalation_UnschedulableGrace_LaterPlacementWaitKeepsPodWait: a
+// recorded placement wait never makes the grace run later than the
+// unplaceable pod's own wait; the earlier of the two counts.
+func TestEscalation_UnschedulableGrace_LaterPlacementWaitKeepsPodWait(t *testing.T) {
+	now := time.Now()
+	attemptSince := now.Add(-30 * time.Second)
+	insts, pods := gangWaitingOnWorker(now, now.Add(-20*time.Minute), &attemptSince)
+	input, rec := escalationFixture(insts)
+	input.UnschedulableGrace = 15 * time.Minute
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2), pods); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	if rec.store[0].Phase != types.InstancePhaseFailed {
+		t.Errorf("Phase: got %q want Failed (the worker has waited 20 minutes against a 15 minute grace)", rec.store[0].Phase)
+	}
+}
+
+// TestEscalation_UnschedulableGrace_GangDomainFullRunsFromPlacementWait:
+// the replacement for a gang member whose node stopped reporting is
+// refused because the domain the leader runs in cannot take it. The
+// full-domain grace, like the general one, runs from the attempt's
+// placement wait: the replacement's own refusal is one minute old, but
+// six minutes of the attempt's wait against a five minute full-domain
+// grace end the attempt.
+func TestEscalation_UnschedulableGrace_GangDomainFullRunsFromPlacementWait(t *testing.T) {
+	now := time.Now()
+	attemptSince := now.Add(-6 * time.Minute)
+	insts, pods := gangWaitingOnWorker(now, now.Add(-time.Minute), &attemptSince)
+	pods[0][1].Status.Conditions[0].Message = gangDomainFullMessage
+	input, rec := escalationFixture(insts)
+	input.UnschedulableGrace = 15 * time.Minute
+	input.GangDomainFullGrace = 5 * time.Minute
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2), pods); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	if rec.store[0].Phase != types.InstancePhaseFailed {
+		t.Errorf("Phase: got %q want Failed (six minutes of placement wait against a five minute full-domain grace)", rec.store[0].Phase)
+	}
+}
+
+// TestEscalation_UnschedulableGrace_TerminatingMemberKeepsGeneralGrace: the
+// rebuilt member is refused because the leader's domain cannot take it,
+// but the leader is itself terminating, and its room may free as it goes.
+// The full-domain grace then does not apply, even though the attempt's
+// placement wait is past it: the general grace runs from that start and
+// has not elapsed.
+func TestEscalation_UnschedulableGrace_TerminatingMemberKeepsGeneralGrace(t *testing.T) {
+	now := time.Now()
+	attemptSince := now.Add(-6 * time.Minute)
+	insts, pods := gangWaitingOnWorker(now, now.Add(-time.Minute), &attemptSince)
+	pods[0][0] = terminating(pods[0][0])
+	pods[0][1].Status.Conditions[0].Message = gangDomainFullMessage
+	input, rec := escalationFixture(insts)
+	input.UnschedulableGrace = 15 * time.Minute
+	input.GangDomainFullGrace = 5 * time.Minute
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2), pods); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	if rec.store[0].Phase != types.InstancePhaseCreating {
+		t.Errorf("Phase: got %q want Creating (a terminating member keeps the general grace: six minutes against 15)", rec.store[0].Phase)
+	}
+	if len(rec.warns) != 0 {
+		t.Errorf("WarnInstanceFailed: got %v want none", rec.warns)
+	}
+}
+
+// batchedRowStore wires the pass's status writes through the replay
+// harness's row store, which applies a batch the way the status adapter
+// does: a batch that names one Instance twice while its mutations report
+// their commit is refused whole, and nothing in it lands. It returns the
+// input, the store, and the indexes warned about, in order.
+func batchedRowStore(insts []types.InstanceStatus) (types.ReconcileInput, *replay.RowStore, *[]int32) {
+	store := replay.NewRowStore(insts, nil, nil)
+	warned := &[]int32{}
+	input := types.ReconcileInput{
+		WarnInstanceFailed: func(idx int32, _, _ string) { *warned = append(*warned, idx) },
+	}
+	store.Install(&input)
+	input.ObservedState.InstanceStatuses = append([]types.InstanceStatus(nil), insts...)
+	return input, store, warned
+}
+
+// waitingSince records that the attempt has waited for placement since
+// since, with the scheduler's token on the row.
+func waitingSince(row types.InstanceStatus, since time.Time) types.InstanceStatus {
+	op := *row.Operation
+	at := metav1.NewTime(since)
+	op.PlacementWaitSince = &at
+	op.Waiting = types.WaitingReasonUnschedulable
+	row.Operation = &op
+	return row
+}
+
+// workerWaiting is a two-pod gang of Instance idx whose leader is placed
+// and serving while the worker has waited one minute for placement.
+func workerWaiting(idx int32, now time.Time) []*corev1.Pod {
+	leader := servingPod(fmt.Sprintf("engine-%d-default-0", idx))
+	leader.Spec.NodeName = "node-b"
+	return []*corev1.Pod{leader, unschedulablePod(fmt.Sprintf("engine-%d-default-1", idx), now.Add(-time.Minute))}
+}
+
+// TestEscalation_PlacementWaitPastGraceInOneBatch_EveryEndingLands: an
+// attempt whose grace runs from its recorded placement wait ends in the
+// pass's batched status write beside another Instance whose own grace
+// ended in the same pass. The row's own Failed write clears the start, so
+// the batch names each Instance once, which the status adapter requires
+// of a batch whose writes report their commit. A gang surge replacement
+// whose source is draining stays live, and its start is cleared in a
+// write of its own. A recreate ends through the deadline decision's own
+// writes instead, and its start goes with them.
+func TestEscalation_PlacementWaitPastGraceInOneBatch_EveryEndingLands(t *testing.T) {
+	now := time.Now()
+	attemptSince := now.Add(-18 * time.Minute)
+	gang := func(indexes ...int32) []types.InstancePlan {
+		var out []types.InstancePlan
+		for _, idx := range indexes {
+			out = append(out, types.InstancePlan{Index: idx, Runners: []types.RunnerPlan{{Name: "default", Size: 2}}})
+		}
+		return out
+	}
+	// The other Instance is a one-pod Restart at index 9 whose rebuilt pod
+	// has had no placement for an hour and records no placement wait.
+	other := restartingInstance(now.Add(30 * time.Minute))[0]
+	other.Index = 9
+	otherPlan := types.InstancePlan{Index: 9, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}}
+	otherPods := []*corev1.Pod{unschedulablePod("engine-9-default-0", now.Add(-time.Hour))}
+
+	surgeIdx := int32(2)
+	gangSource := func(step string) types.InstanceStatus {
+		return types.InstanceStatus{
+			Index: 0, Phase: types.InstancePhaseUpdating, PodCount: 2,
+			RunningRevision: "own-engine-oldhash", TargetRevision: "own-engine-newhash",
+			Operation: &types.InstanceOperation{
+				Type: types.InstanceOperationUpdate, Step: step, SurgeIndex: &surgeIdx, TargetRevision: "own-engine-newhash",
+			},
+		}
+	}
+	replacement := waitingSince(types.InstanceStatus{
+		Index: 2, Phase: types.InstancePhaseCreating, PodCount: 2, TargetRevision: "own-engine-newhash",
+		Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTarget, TargetRevision: "own-engine-newhash",
+		},
+	}, attemptSince)
+	restart := restartingInstance(now.Add(30 * time.Minute))[0]
+	restart.PodCount = 2
+	migration := migrationPair(now.Add(30 * time.Minute))
+	recreate := types.InstanceStatus{
+		Index: 0, Phase: types.InstancePhaseUpdating, PodCount: 2,
+		RunningRevision: "own-engine-oldhash", TargetRevision: "own-engine-newhash",
+		Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepDrain, TargetRevision: "own-engine-newhash",
+			Deadline: metav1.NewTime(now.Add(30 * time.Minute)),
+		},
+	}
+
+	cases := []struct {
+		name string
+		rows []types.InstanceStatus
+		plan []types.InstancePlan
+		pods map[int32][]*corev1.Pod
+		// ended are the Instances written Failed; live the ones left in
+		// their phase. Every one of them ends the pass with no start.
+		ended []int32
+		live  []int32
+	}{
+		{
+			name:  "a gang Restart",
+			rows:  []types.InstanceStatus{waitingSince(restart, attemptSince)},
+			plan:  gang(0),
+			pods:  map[int32][]*corev1.Pod{0: workerWaiting(0, now)},
+			ended: []int32{0},
+		},
+		{
+			name: "a gang surge replacement beside its serving source",
+			rows: []types.InstanceStatus{gangSource(types.UpdateStepSurge), replacement},
+			plan: gang(0, 2),
+			pods: map[int32][]*corev1.Pod{
+				0: {servingPod("engine-0-default-0"), servingPod("engine-0-default-1")},
+				2: workerWaiting(2, now),
+			},
+			ended: []int32{0, 2},
+		},
+		{
+			name: "a gang surge replacement whose source drains",
+			rows: []types.InstanceStatus{gangSource(types.UpdateStepSurgeDrain), replacement},
+			plan: gang(0, 2),
+			pods: map[int32][]*corev1.Pod{
+				0: {unroutedPod("engine-0-default-0"), unroutedPod("engine-0-default-1")},
+				2: workerWaiting(2, now),
+			},
+			ended: []int32{0},
+			live:  []int32{2},
+		},
+		{
+			name: "a migration's surge",
+			rows: []types.InstanceStatus{migration[0], waitingSince(migration[1], attemptSince)},
+			plan: []types.InstancePlan{
+				{Index: 0, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+				{Index: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+			},
+			pods: map[int32][]*corev1.Pod{
+				0: {servingPod("engine-0-default-0")},
+				1: {unschedulablePod("engine-1-default-0", now.Add(-time.Minute))},
+			},
+			ended: []int32{1},
+			live:  []int32{0},
+		},
+		{
+			name:  "a gang recreate, which takes the deadline decision",
+			rows:  []types.InstanceStatus{waitingSince(recreate, attemptSince)},
+			plan:  gang(0),
+			pods:  map[int32][]*corev1.Pod{0: workerWaiting(0, now)},
+			ended: []int32{0},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := append(append([]types.InstanceStatus(nil), tc.rows...), other)
+			input, store, warned := batchedRowStore(rows)
+			input.UnschedulableGrace = 15 * time.Minute
+			pods := map[int32][]*corev1.Pod{9: otherPods}
+			for idx, set := range tc.pods {
+				pods[idx] = set
+			}
+			plan := types.ComponentPlan{Instances: append(append([]types.InstancePlan(nil), tc.plan...), otherPlan)}
+
+			if err := runEscalationPass(t, types.Deps{}, input, plan, pods); err != nil {
+				t.Errorf("escalation pass: %v", err)
+			}
+
+			stored := map[int32]types.InstanceStatus{}
+			for _, row := range store.Rows() {
+				stored[row.Index] = row
+			}
+			for _, idx := range append(append([]int32(nil), tc.ended...), other.Index) {
+				if got := stored[idx]; got.Phase != types.InstancePhaseFailed {
+					t.Errorf("Instance %d Phase: got %q want Failed", idx, got.Phase)
+				}
+			}
+			for _, idx := range tc.live {
+				if got := stored[idx]; got.Phase == types.InstancePhaseFailed || got.Phase == "" {
+					t.Errorf("Instance %d Phase: got %q want it left live", idx, got.Phase)
+				}
+			}
+			for _, idx := range append(append([]int32(nil), tc.ended...), tc.live...) {
+				if op := stored[idx].Operation; op != nil && op.PlacementWaitSince != nil {
+					t.Errorf("Instance %d PlacementWaitSince: got %v want it cleared", idx, op.PlacementWaitSince)
+				}
+			}
+			want := len(tc.ended) + 1
+			if len(*warned) != want {
+				t.Errorf("WarnInstanceFailed: got %v want one call per Instance written Failed (%d)", *warned, want)
+			}
+		})
+	}
+}
+
+// committedWrites counts the row writes a replay row store commits.
+type committedWrites struct{ rows int }
+
+func (c *committedWrites) RowCommitted(commit replay.RowCommit) {
+	if commit.Outcome == replay.PreconditionOK {
+		c.rows++
+	}
+}
+
+func (c *committedWrites) RetryBlockCommitted(replay.RetryBlockCommit) {}
+
+func (c *committedWrites) StatusConflict(replay.StatusConflict) {}
+
+// TestEscalation_DrainStepPairStoppedOnHeldName_WritesNothing: a
+// replacement gang has taken over serving, and its worker had no placement
+// past the grace, so the attempt ended on the source, which reads Failed
+// at the drain step. The replacement's leader is on a node that stopped
+// reporting, so its name is held and the refused worker cannot be retired
+// until the name is freed. Nothing changes between passes, and no pass
+// writes: the hold pass records no placement wait on the replacement's row
+// while its source reads Failed, so the escalation has none to clear.
+func TestEscalation_DrainStepPairStoppedOnHeldName_WritesNothing(t *testing.T) {
+	now := time.Now()
+	surgeIdx := int32(2)
+	worker := unschedulablePod("own-engine-2-default-1", now.Add(-20*time.Minute))
+	leader := servingPod("own-engine-2-default-0")
+	leader.Spec.NodeName = "node-b"
+	leader.Status.Phase = corev1.PodUnknown
+	source := types.InstanceStatus{
+		Index: 0, Phase: types.InstancePhaseFailed, PodCount: 2,
+		RunningRevision: "own-engine-oldhash", TargetRevision: "own-engine-newhash",
+		Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurgeDrain, SurgeIndex: &surgeIdx,
+			TargetRevision: "own-engine-newhash", RetryCount: 1, LastProgressAt: metav1.NewTime(now.Add(-30 * time.Minute)),
+		},
+		LastFailure: types.UnschedulableTermination(worker, types.WaitingReasonUnschedulable+": "+schedulerMessage, metav1.NewTime(now.Add(-time.Minute))),
+	}
+	replacement := types.InstanceStatus{
+		Index: 2, Phase: types.InstancePhaseCreating, PodCount: 2, TargetRevision: "own-engine-newhash",
+		Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTarget, TargetRevision: "own-engine-newhash",
+			Waiting: types.WaitingReasonUnschedulable,
+		},
+		LastFailure: types.UnschedulableTermination(worker, schedulerMessage, worker.Status.Conditions[0].LastTransitionTime),
+	}
+	pods := map[int32][]*corev1.Pod{
+		0: {unroutedPod("own-engine-0-default-0"), unroutedPod("own-engine-0-default-1")},
+		2: {leader, worker},
+	}
+	plan := types.ComponentPlan{Component: types.ComponentEngine, Instances: []types.InstancePlan{
+		{Index: 0, Runners: []types.RunnerPlan{{Name: "default", Size: 2}}},
+		{Index: 2, Runners: []types.RunnerPlan{{Name: "default", Size: 2}}},
+	}}
+
+	writes := &committedWrites{}
+	store := replay.NewRowStore([]types.InstanceStatus{source, replacement}, nil, writes)
+	for pass := 1; pass <= 2; pass++ {
+		input := types.ReconcileInput{UnschedulableGrace: 15 * time.Minute}
+		input.Key.OwnerName, input.Key.Component = "own", types.ComponentEngine
+		store.Install(&input)
+		input.ObservedState.InstanceStatuses = store.Rows()
+		if err := runEscalationPass(t, types.Deps{}, input, plan, pods); err != nil {
+			t.Fatalf("pass %d: escalation pass: %v", pass, err)
+		}
+		for _, row := range store.Rows() {
+			if row.Index == replacement.Index && (row.Operation == nil || row.Operation.PlacementWaitSince != nil) {
+				t.Errorf("pass %d: replacement operation = %+v, want it kept with no placement wait", pass, row.Operation)
+			}
+		}
+	}
+	if writes.rows != 0 {
+		t.Errorf("committed row writes = %d, want 0 over two passes of a pair where nothing changes", writes.rows)
+	}
+}
+
+// TestEscalation_UnschedulableGrace_DrainSourceFailedAtPassStartRunsFromPodWait:
+// a replacement gang of a leader and two workers has taken over serving.
+// Worker 1's node stopped reporting sixteen minutes ago, so the
+// replacement's row recorded when the attempt started waiting for
+// placement. The sweep then freed worker 1's name, and the loss ended the
+// attempt on the source, which reads Failed at the drain step in the rows
+// the pass read at its start. Worker 2 has had no placement for one
+// minute. In this pass the update pass rebuilds worker 1 and opens the
+// next attempt before the escalation runs. The start the replacement's
+// row carries in the rows the pass read belongs to the attempt that
+// ended, so the hold is measured from worker 2's own wait: one minute
+// against a 15 minute grace, and the next attempt goes on.
+func TestEscalation_UnschedulableGrace_DrainSourceFailedAtPassStartRunsFromPodWait(t *testing.T) {
+	now := time.Now()
+	surgeIdx := int32(2)
+	endedAttemptSince := metav1.NewTime(now.Add(-16 * time.Minute))
+	source := types.InstanceStatus{
+		Index: 0, Phase: types.InstancePhaseFailed, PodCount: 3,
+		RunningRevision: "own-engine-oldhash", TargetRevision: "own-engine-newhash",
+		Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurgeDrain, SurgeIndex: &surgeIdx,
+			TargetRevision: "own-engine-newhash", RetryCount: 1, LastProgressAt: metav1.NewTime(now.Add(-20 * time.Minute)),
+		},
+		LastFailure: &types.InstanceTermination{Reason: "ReplacementLost", Time: metav1.NewTime(now.Add(-5 * time.Second))},
+	}
+	replacement := types.InstanceStatus{
+		Index: 2, Phase: types.InstancePhaseCreating, PodCount: 2, TargetRevision: "own-engine-newhash",
+		Operation: &types.InstanceOperation{
+			Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTarget, TargetRevision: "own-engine-newhash",
+			PlacementWaitSince: &endedAttemptSince,
+		},
+	}
+	leader := servingPod("own-engine-2-default-0")
+	leader.Spec.NodeName = "node-b"
+	pods := map[int32][]*corev1.Pod{
+		0: {unroutedPod("own-engine-0-default-0"), unroutedPod("own-engine-0-default-1"), unroutedPod("own-engine-0-default-2")},
+		// Worker 1 was freed by the sweep and is not rebuilt yet.
+		2: {leader, unschedulablePod("own-engine-2-default-2", now.Add(-time.Minute))},
+	}
+	plan := types.ComponentPlan{Component: types.ComponentEngine, Instances: []types.InstancePlan{
+		{Index: 0, Runners: []types.RunnerPlan{{Name: "default", Size: 3}}},
+		{Index: 2, Runners: []types.RunnerPlan{{Name: "default", Size: 3}}},
+	}}
+	store := replay.NewRowStore([]types.InstanceStatus{source, replacement}, nil, nil)
+	var warned []int32
+	input := types.ReconcileInput{
+		UnschedulableGrace: 15 * time.Minute,
+		WarnInstanceFailed: func(idx int32, _, _ string) { warned = append(warned, idx) },
+	}
+	input.Clock = clocktesting.NewFakeClock(now)
+	input.Key.OwnerName, input.Key.Component = "own", types.ComponentEngine
+	store.Install(&input)
+	input.ObservedState.InstanceStatuses = store.Rows()
+	podsOf := func(context.Context) (map[int32][]*corev1.Pod, error) { return pods, nil }
+	ctx := context.Background()
+
+	held, err := holds.Run(ctx, holds.PassInput{
+		Input: input, Plan: plan, Rows: holds.RowsForPlan(plan, input.ObservedState.InstanceStatuses, nil), Pods: podsOf,
+	})
+	if err != nil {
+		t.Fatalf("hold pass: %v", err)
+	}
+	if !held.Holding(replacement.Index, types.WaitingReasonUnschedulable) {
+		t.Fatal("hold pass: no scheduler hold on the replacement's row")
+	}
+	// The update pass opens the next attempt: the source is Updating again
+	// at the drain step, with one more retry counted and a fresh deadline.
+	if err := input.MutateInstance(ctx, source.Index, func(s *types.InstanceStatus) bool {
+		s.Phase = types.InstancePhaseUpdating
+		op := *s.Operation
+		op.RetryCount++
+		op.StartedAt, op.LastProgressAt = metav1.NewTime(now), metav1.NewTime(now)
+		op.Deadline = metav1.NewTime(now.Add(30 * time.Minute))
+		s.Operation = &op
+		return true
+	}); err != nil {
+		t.Fatalf("open the next attempt: %v", err)
+	}
+
+	if err := escalation.Run(ctx, escalation.PassInput{Input: input, Plan: plan, Pods: podsOf, Held: held}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+	for _, row := range store.Rows() {
+		if row.Index == source.Index && row.Phase != types.InstancePhaseUpdating {
+			t.Errorf("source Phase: got %q want Updating (worker 2 has waited one minute of a 15 minute grace)", row.Phase)
+		}
+	}
+	if len(warned) != 0 {
+		t.Errorf("WarnInstanceFailed: got %v want none", warned)
 	}
 }

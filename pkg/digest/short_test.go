@@ -34,12 +34,15 @@ func TestShort(t *testing.T) {
 	}
 }
 
-// TestShortLengthsNest checks that a shorter hash is a prefix of a longer
-// one of the same data, so a caller that lengthens its digest can still
+// TestShortLengthsNest checks that every short hash is a prefix of the full
+// hex of the same data, so a caller that lengthens its digest can still
 // compare old values by prefix.
 func TestShortLengthsNest(t *testing.T) {
 	data := []byte(`{"canary":{"steps":[{"weight":10}]}}`)
-	full := Short(data, 64)
+	full := Hex(data)
+	if len(full) != 64 {
+		t.Fatalf("Hex(data) has %d characters, want 64", len(full))
+	}
 	for _, n := range []int{0, 1, 8, 12, 32, 64} {
 		if got := Short(data, n); got != full[:n] {
 			t.Fatalf("Short(data, %d) = %q, want prefix %q of the full hash", n, got, full[:n])

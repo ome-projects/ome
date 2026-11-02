@@ -7,27 +7,19 @@ import (
 	"github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 const omeNS = "ome"
 
 func newClient(t *testing.T, initial ...client.Object) client.Client {
 	t.Helper()
-	s := runtime.NewScheme()
-	if err := appsv1.AddToScheme(s); err != nil {
-		t.Fatalf("add apps scheme: %v", err)
-	}
-	if err := v1beta1.AddToScheme(s); err != nil {
-		t.Fatalf("add ome scheme: %v", err)
-	}
-	return ctrlfake.NewClientBuilder().WithScheme(s).WithObjects(initial...).Build()
+	return fakeclient.New(t, fakeclient.WithObjects(initial...))
 }
 
 func minimalSpec() *v1beta1.ServingRuntimeSpec {

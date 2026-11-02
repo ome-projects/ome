@@ -17,15 +17,16 @@ import (
 func TestPostFilter_EveryCandidateFailedBeforeReserve_ReleasesAndRejectsSiblings(t *testing.T) {
 	sibling := &fakeWaitingPod{pod: gangPod("team", "pf")}
 	g := &GangPack{handle: &fakeHandle{waiting: []framework.WaitingPod{sibling}}, assignments: placement.New()}
-	g.assignments.ChooseInTopology("team/pf", testKey, topology.FreeByDomain{"a": 2}, 2)
+	_, id, _ := g.assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey}, topology.FreeByDomain{"a": 2}, nil, 2)
+	g.rememberAttempt(sibling.pod, id)
 	state := newCycleState()
-	writeAssignment(state, "a", gangInfo{key: "team/pf", minMember: 2, topologyKey: testKey, timeout: time.Minute})
+	writeAssignment(state, "a", gangInfo{key: "team/pf", minMember: 2, topologyKey: testKey, timeout: time.Minute}, id)
 
 	_, status := g.PostFilter(context.Background(), state, gangPod("team", "pf"), nil)
 	if status.Code() != framework.Unschedulable {
 		t.Fatalf("PostFilter = %v, want Unschedulable", status)
 	}
-	if _, assigned := g.assignments.Get("team/pf"); assigned {
+	if _, assigned := assignedDomain(g.assignments, "team/pf"); assigned {
 		t.Fatal("assignment leaked after every candidate failed before Reserve")
 	}
 	if !sibling.rejected {
@@ -113,7 +114,7 @@ func TestPostFilter_AssignedMemberVetoed_ActivatesItToPlanNextDomain(t *testing.
 	if _, st := g.PostFilter(ctx, first, leader, nil); st.Code() != framework.Unschedulable {
 		t.Fatalf("PostFilter = %v, want Unschedulable", st)
 	}
-	if _, assigned := g.assignments.Get("team/pf"); assigned {
+	if _, assigned := assignedDomain(g.assignments, "team/pf"); assigned {
 		t.Fatal("assignment kept after every candidate in domain x was filtered")
 	}
 	if h.activateCalls != 1 || h.activated["team/pf-leader"] == nil {

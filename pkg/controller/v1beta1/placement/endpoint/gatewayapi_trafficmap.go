@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"sort"
 	"strings"
@@ -51,7 +52,7 @@ func NewGatewayAPITrafficMapPublisher(
 	cfg Config,
 	opts ...GatewayAPIPublisherOption,
 ) *GatewayAPITrafficMapPublisher {
-	cfg.Labels = cloneGatewayAPILabels(cfg.Labels)
+	cfg.Labels = maps.Clone(cfg.Labels)
 	gatewayOptions := append([]GatewayAPIPublisherOption(nil), opts...)
 	gatewayOptions = append(gatewayOptions, WithGatewayAPIReader(apiReader))
 	gatewayOptions = append(gatewayOptions, withStrictResourceOwnership())
@@ -616,15 +617,4 @@ func validateGatewayAPIResourceLabels(labels map[string]string) error {
 		}
 	}
 	return nil
-}
-
-func cloneGatewayAPILabels(labels map[string]string) map[string]string {
-	if labels == nil {
-		return nil
-	}
-	cloned := make(map[string]string, len(labels))
-	for key, value := range labels {
-		cloned[key] = value
-	}
-	return cloned
 }

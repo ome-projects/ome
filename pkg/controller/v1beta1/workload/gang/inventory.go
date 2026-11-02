@@ -6,10 +6,7 @@ import (
 	"sort"
 	"strconv"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
@@ -63,7 +60,7 @@ func CachedOwnerHasPodGroups(ctx context.Context, reader client.Reader, owner cl
 	if err := reader.List(ctx, list,
 		client.InNamespace(owner.GetNamespace()),
 		client.MatchingFields{PodGroupControllerUIDIndexField: string(owner.GetUID())}); err != nil {
-		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) || runtime.IsNotRegisteredError(err) {
+		if podgroup.IsNotFound(err) {
 			return false, nil
 		}
 		return false, fmt.Errorf("CachedOwnerHasPodGroups: list owner %s: %w", owner.GetUID(), err)
@@ -111,7 +108,7 @@ func ObservePodGroups(ctx context.Context, reader client.Reader, owner client.Ob
 	inv := newPodGroupInventory(owner.GetUID(), true)
 	list := &schedulingv1alpha1.PodGroupList{}
 	if err := reader.List(ctx, list, client.InNamespace(owner.GetNamespace())); err != nil {
-		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) || runtime.IsNotRegisteredError(err) {
+		if podgroup.IsNotFound(err) {
 			return newPodGroupInventory(owner.GetUID(), false), nil
 		}
 		return nil, fmt.Errorf("ObservePodGroups: list namespace %s: %w", owner.GetNamespace(), err)

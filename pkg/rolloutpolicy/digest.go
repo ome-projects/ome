@@ -39,16 +39,13 @@ func PortableDigest(spec *v1beta1.RolloutPolicySpec) (string, error) {
 // ref-first migration, shadowedPolicyRef.wouldPinDigest matching the inline
 // group's observed digest proves the cutover is a no-op.
 func ProgressionDigest(g *v1beta1.RolloutGroup) (string, error) {
-	if g == nil {
+	if g == nil || !hasInlineProgression(g) {
 		return "", nil
 	}
 	synthetic := &v1beta1.RolloutPolicySpec{
 		Canary:        g.Canary,
 		BlueGreen:     g.BlueGreen,
 		RollingUpdate: g.RollingUpdate,
-	}
-	if _, ok := synthetic.Progression(); !ok {
-		return "", nil
 	}
 	return PortableDigest(synthetic)
 }

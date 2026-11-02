@@ -7,8 +7,9 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 
-	"sigs.k8s.io/ome/pkg/configutils"
 	"sigs.k8s.io/ome/pkg/logging"
+
+	"sigs.k8s.io/ome/pkg/agentconfig"
 )
 
 // Config defines the configuration for the model metadata extractor
@@ -69,7 +70,7 @@ func WithViper(v *viper.Viper) Option {
 		*c = *defaultConfig()
 
 		// Bind environment variables
-		if err := configutils.BindEnvsRecursive(v, c, ""); err != nil {
+		if err := agentconfig.BindEnvs(v, c); err != nil {
 			return fmt.Errorf("error binding envs: %w", err)
 		}
 

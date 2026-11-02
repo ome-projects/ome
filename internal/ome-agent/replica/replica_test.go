@@ -446,7 +446,6 @@ func TestValidateModelSize(t *testing.T) {
 		objects       []common.ReplicationObject
 		expectPanic   bool
 		panicContains string
-		skip          bool
 	}{
 		{
 			name: "model size within limit - OCI objects",
@@ -516,7 +515,6 @@ func TestValidateModelSize(t *testing.T) {
 			}(),
 			expectPanic:   true,
 			panicContains: "Model weights exceed size limit",
-			skip:          true, // Skip this test case as it's failing due to mock expectations
 		},
 		{
 			name: "model size exceeds limit - HuggingFace objects",
@@ -552,7 +550,6 @@ func TestValidateModelSize(t *testing.T) {
 			}(),
 			expectPanic:   true,
 			panicContains: "Model weights exceed size limit",
-			skip:          true, // Skip this test case as it's failing due to mock expectations
 		},
 		{
 			name: "size check disabled - OCI objects",
@@ -606,27 +603,23 @@ func TestValidateModelSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Skip tests marked for skipping
-			if tt.skip {
-				t.Skip("Skipping test due to mock expectation issues")
-			}
-
 			agent := &ReplicaAgent{
 				Logger: tt.config.AnotherLogger,
 				Config: tt.config,
 			}
 
 			if tt.expectPanic {
+				// Fatal and Fatalf exit the process in production; the mock
+				// panics instead so the test can recover and check the call.
+				mockLogger := tt.config.AnotherLogger.(*testingPkg.MockLogger)
+				mockLogger.On("Fatalf", mock.Anything, mock.Anything).Panic("fatal")
+				mockLogger.On("Fatal", mock.Anything).Panic("fatal")
 				defer func() {
-					r := recover()
-					assert.NotNil(t, r)
+					assert.NotNil(t, recover())
 					if tt.panicContains != "" {
-						// The Fatal call will use os.Exit in production,
-						// but in tests with the mock logger it will just record the call
-						// We'll verify that the Fatal method was called
-						// This is a compromise since we can't actually test the os.Exit behavior
-						mockLogger := tt.config.AnotherLogger.(*testingPkg.MockLogger)
-						mockLogger.AssertCalled(t, "Fatalf", mock.Anything, mock.Anything)
+						mockLogger.AssertCalled(t, "Fatalf", mock.MatchedBy(func(format string) bool {
+							return strings.Contains(format, tt.panicContains)
+						}), mock.Anything)
 					}
 				}()
 			}

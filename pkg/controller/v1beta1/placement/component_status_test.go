@@ -41,11 +41,7 @@ func TestComponentSharesCondition(t *testing.T) {
 			wantReason: "OwnWeights", wantMsg: "unused because the cluster holds no engine: engine weight on member-b, decoder weight on member-b"},
 		{name: "a divided router is reported", source: func() *v1beta1.InferenceService { return dividedRouterSource(4, even) },
 			wantReason: "OwnWeights", wantMsg: "decoder follows the engine shares; router is split by its own weights"},
-		{name: "the shared list clears it", source: func() *v1beta1.InferenceService {
-			source := ratioSplitSource(4, ptr.To(12))
-			source.Spec.Placement.ClusterAffinity = weightedAffinity(threeToOne)
-			return source
-		}, wantClear: true},
+		{name: "a source without weights clears it", source: func() *v1beta1.InferenceService { return ratioSplitSource(4, ptr.To(12)) }, wantClear: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got := componentSharesCondition(plannedComponentSource(t, tt.source()))

@@ -439,22 +439,11 @@ func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute(t *testing.T) {
 }
 
 // typedNilHTTPRouteBuilder is a stub HTTPRouteBuilder that always returns
-// a (*gatewayapiv1.HTTPRoute)(nil) wrapped in a non-nil client.Object — a
-// shape a bare `== nil` check does not catch. The strategy must defend
-// against it even if a dispatcher regression reintroduces it.
+// a (*gatewayapiv1.HTTPRoute)(nil) wrapped in a non-nil client.Object, a
+// shape a bare `== nil` check does not catch.
 type typedNilHTTPRouteBuilder struct{}
 
-func (typedNilHTTPRouteBuilder) GetResourceType() string { return "HTTPRoute" }
-
-func (typedNilHTTPRouteBuilder) Build(_ context.Context, _ *v1beta1.InferenceService) (client.Object, error) {
-	return (*gatewayapiv1.HTTPRoute)(nil), nil
-}
-
 func (typedNilHTTPRouteBuilder) BuildHTTPRoute(_ context.Context, _ *v1beta1.InferenceService, _ string) (client.Object, error) {
-	// Wrap a typed-nil *HTTPRoute in the interface return. `result == nil`
-	// returns FALSE for this value because the interface header carries
-	// non-nil type info; only the inner value is nil. The strategy's
-	// typed-nil guard must catch this.
 	return (*gatewayapiv1.HTTPRoute)(nil), nil
 }
 
@@ -462,25 +451,11 @@ func (typedNilHTTPRouteBuilder) Endpoints(_ *v1beta1.InferenceService, _ string)
 	return nil, nil
 }
 
-// TestGatewayAPIStrategy_ReconcileComponentHTTPRoute_TypedNilBuilderDoesNotPanic
-// pins the strategy-side defense against a typed-nil-through-interface
-// panic.
-//
-// A typed-nil *HTTPRoute wrapped in a non-nil client.Object interface
-// defeats the `desired == nil` check at the top of
-// reconcileComponentHTTPRoute (the interface is non-nil), the type
-// assertion succeeds with ok=true, and the subsequent
-// controllerutil.SetControllerReference call dereferences the typed-nil
-// pointer.
-//
-// The BuildHTTPRoute dispatcher returns interface-nil for the not-ready
-// branch, which closes the usual source. This test exercises the second
-// layer — a defensive nil check inside the strategy that catches any
-// caller (test stub, dispatcher regression, third-party builder) that
-// still hands the strategy a typed-nil-wrapped-in-interface. The stub
-// builder is injected directly into the strategy struct, bypassing the
-// dispatcher, so this test pins the defense regardless of any change to
-// BuildHTTPRoute.
+// A builder that hands back a typed-nil *HTTPRoute inside a non-nil
+// client.Object, with no error, broke its contract: the strategy refuses it
+// with an error instead of dereferencing the nil route, and writes no
+// condition it cannot explain. The stub is injected into the strategy struct,
+// so the production builder's own answer is not in play.
 func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute_TypedNilBuilderDoesNotPanic(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1beta1.AddToScheme(scheme))
@@ -488,9 +463,6 @@ func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute_TypedNilBuilderDoesNotPa
 	require.NoError(t, corev1.AddToScheme(scheme))
 
 	isvc := createTestInferenceServiceWithDecoderGateway("test-isvc", "default")
-	// Deliberately do NOT call setComponentStatusReadyGateway — even though
-	// our stub builder ignores readiness anyway, leaving it not-ready mirrors
-	// the production trigger (decoder component not yet ready).
 
 	fakeClient := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(isvc).Build()
 
@@ -502,31 +474,22 @@ func TestGatewayAPIStrategy_ReconcileComponentHTTPRoute_TypedNilBuilderDoesNotPa
 	}
 	strategy := NewGatewayAPIStrategy(opts, services.NewDomainService(), services.NewPathService()).(*GatewayAPIStrategy)
 
-	// Swap in the stub builder. This bypasses the layer-1 dispatcher fix so
-	// the strategy sees the bad shape directly and we exercise the layer-2
-	// defense in isolation.
 	strategy.httpRouteBuilder = typedNilHTTPRouteBuilder{}
 
-	// Without the guard this panics at SetControllerReference. Wrap in a
-	// recover() check to give a precise diagnostic if the defense regresses.
 	var err error
 	var ready bool
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				t.Fatalf("reconcileComponentHTTPRoute panicked on a typed-nil HTTPRoute (this is the bug we are guarding against): %v", r)
+				t.Fatalf("reconcileComponentHTTPRoute panicked on a typed-nil HTTPRoute: %v", r)
 			}
 		}()
 		ready, err = strategy.reconcileComponentHTTPRoute(context.Background(), isvc, builders.DecoderComponent)
 	}()
 
-	require.NoError(t, err, "strategy must return nil error (not a panic and not a real failure) when builder hands it a typed-nil HTTPRoute")
-	assert.False(t, ready, "a typed-nil route means the component is not ready")
-
-	cond := isvc.Status.GetCondition(v1beta1.IngressReady)
-	require.NotNil(t, cond, "IngressReady condition must be set by the typed-nil guard")
-	assert.Equal(t, corev1.ConditionFalse, cond.Status, "IngressReady must be False when component is not ready")
-	assert.Equal(t, "ComponentNotReady", cond.Reason, "IngressReady reason must identify the not-ready component cause")
+	require.Error(t, err, "a typed-nil route with no error is a broken builder contract")
+	assert.False(t, ready)
+	assert.Nil(t, isvc.Status.GetCondition(v1beta1.IngressReady), "the strategy writes no condition for a builder answer it cannot explain")
 }
 
 func TestGatewayAPIStrategy_CheckHTTPRouteStatuses(t *testing.T) {
@@ -597,7 +560,7 @@ func TestGatewayAPIStrategy_CheckHTTPRouteStatuses(t *testing.T) {
 // TestGatewayAPIStrategy_CheckHTTPRouteStatuses_NotFoundIsTolerated pins
 // that checkHTTPRouteStatuses treats IsNotFound as a tolerable absence,
 // not a hard error. reconcileComponentHTTPRoute skips create when a
-// component isn't Ready (Builder returns nil), so during PD-disaggregated
+// component isn't Ready (the builder answers not ready), so during PD-disaggregated
 // bring-up some routes do not exist yet; a hard error there would crash
 // the reconcile every loop. The status-check must continue past the
 // missing routes rather than failing.
@@ -741,6 +704,56 @@ func TestGatewayAPIStrategy_Reconcile_AlreadyExistsCacheLagNotReady(t *testing.T
 	require.NotNil(t, cond)
 	assert.Equal(t, corev1.ConditionFalse, cond.Status,
 		"an unobserved route must not count toward IngressReady=True")
+}
+
+// TestGatewayAPIStrategy_RoutesCreatedInOnePass_TopLevelRouteFirst checks the
+// creation order when every component is Ready before any route exists. Under
+// per-ISVC subdomains the four routes match the same host at "/", and Gateway
+// API gives that tie to the oldest route, so the top-level route comes first.
+func TestGatewayAPIStrategy_RoutesCreatedInOnePass_TopLevelRouteFirst(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	require.NoError(t, gatewayapiv1.Install(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	isvc := createTestInferenceServiceWithRouterGateway("test-isvc", "default")
+	isvc.Spec.Decoder = &v1beta1.DecoderSpec{}
+	setComponentStatusReadyGateway(isvc)
+
+	var created []string
+	fakeClient := fakeclient.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(isvc).
+		WithStatusSubresource(&gatewayapiv1.HTTPRoute{}).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*gatewayapiv1.HTTPRoute); ok {
+					created = append(created, obj.GetName())
+				}
+				return c.Create(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	ingressConfig := gatewayTestIngressConfig()
+	ingressConfig.PerISVCSubdomain = true
+	strategy := NewGatewayAPIStrategy(interfaces.ReconcilerOptions{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		IngressConfig: ingressConfig,
+		IsvcConfig:    &controllerconfig.InferenceServicesConfig{},
+	}, services.NewDomainService(), services.NewPathService())
+
+	require.NoError(t, strategy.Reconcile(context.Background(), isvc))
+
+	assert.Equal(t, []string{"test-isvc", "test-isvc-engine", "test-isvc-router", "test-isvc-decoder"}, created)
+	routes := &gatewayapiv1.HTTPRouteList{}
+	require.NoError(t, fakeClient.List(context.Background(), routes, client.InNamespace("default")))
+	require.Len(t, routes.Items, 4)
+	for _, route := range routes.Items {
+		assert.Equal(t, []gatewayapiv1.Hostname{"test-isvc.default.example.com"}, route.Spec.Hostnames, route.Name)
+		require.NotEmpty(t, route.Spec.Rules, route.Name)
+		assert.Equal(t, "/", *route.Spec.Rules[0].Matches[0].Path.Value, route.Name)
+	}
 }
 
 // gatewayStrategyWithConfig builds a GatewayAPIStrategy over an explicit

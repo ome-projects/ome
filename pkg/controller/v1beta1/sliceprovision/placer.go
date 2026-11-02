@@ -24,9 +24,22 @@ const (
 	// does not hold has the name of one of the owner's slots.
 	EventReasonSliceOwnershipConflict workload.EventReason = "SliceOwnershipConflict"
 	// EventReasonSliceHostUnavailable is recorded when an Instance's pods are
-	// withheld from a ready slice with a host that cannot take them, and the
-	// slice is provisioned again.
+	// withheld from a ready slice with a host the scheduler refuses for its
+	// health, and the slice is provisioned again.
 	EventReasonSliceHostUnavailable workload.EventReason = "SliceHostUnavailable"
+	// EventReasonSliceHostShortOfResources is recorded when an Instance's pods
+	// are withheld from a ready slice with a healthy host whose other pods
+	// leave too little of a resource the pods request, and the slice is
+	// provisioned again. The slice scheduler does not weigh host resources, so
+	// the slot may be placed on the same hosts again; a repeated warning shows
+	// it.
+	EventReasonSliceHostShortOfResources workload.EventReason = "SliceHostShortOfResources"
+	// EventReasonSlicePodsTooLargeForHosts is recorded when an Instance's pods
+	// are withheld from a ready slice with a host where they do not fit even
+	// next to its DaemonSet and static pods alone. Those pods run on every
+	// matching host, so another slice would not fit them either: the slice is
+	// kept and the pods wait until the pods' requests or the hosts change.
+	EventReasonSlicePodsTooLargeForHosts workload.EventReason = "SlicePodsTooLargeForHosts"
 	// EventReasonSliceReadyTimeout is recorded when an Instance's pods are
 	// withheld from a slice that has stayed out of a ready state for longer
 	// than the ready timeout, and the slice is provisioned again.
@@ -159,9 +172,10 @@ func (pl *Placer) Place(ctx context.Context, input workload.ReconcileInput, _ wo
 }
 
 // Pending reports why Place withholds the pod. It creates no slice and
-// records nothing. Slices and nodes are read from the cache; a ready slice
-// with a host that cannot take the pods also costs a live read of the
-// owner's pods.
+// records nothing. Slices and nodes are read from the cache. When the pods
+// request more than chips, a ready slice's healthy hosts also cost a live
+// read each of the pods bound to them; a ready slice with a host that cannot
+// take the pods also costs a live read of the owner's pods.
 func (pl *Placer) Pending(ctx context.Context, input workload.ReconcileInput, _ workload.ComponentPlan, inst workload.InstancePlan, _ workload.RunnerPlan, ordinal int32) (string, bool, error) {
 	r, err := pl.resolve(ctx, input, inst)
 	if err != nil {
@@ -308,28 +322,42 @@ func (pl *Placer) vet(ctx context.Context, placement Placement, r *resolution, n
 }
 
 // vetHosts vets a ready slice's hosts. A host that cannot take any of the
-// pods, while no pod holds the slice, withholds the pods and releases the
-// slice: every host takes one of the slot's pods, so the slot cannot start
+// pods, because it is unhealthy or its other pods leave too little of a
+// resource the pods request, while no pod holds the slice, withholds the pods
+// and releases the slice. When a healthy host cannot fit the pods even next
+// to its DaemonSet and static pods alone, the pods are withheld and the slice
+// is kept, since every matching host runs those pods: every host takes one of the slot's pods, so the slot cannot start
 // there. A slice a pod holds is left to the scheduler, since the pods it
 // still needs may fit on the hosts that can take them. Until every host the
 // slice needs is visible the pods wait: hosts are found by a label the
 // provider adds as the slice activates, which may lag its state.
 func (pl *Placer) vetHosts(ctx context.Context, s gke.Slice, r *resolution) (vetting, error) {
-	hosts, found, err := unavailableHosts(ctx, pl.nodes, pl.p.cfg.NodeLabels.Slice, s.Name, r.pods)
+	report, err := unavailableHosts(ctx, pl.nodes, pl.p.hosts, pl.p.cfg.NodeLabels.Slice, s.Name, pl.p.cfg.ChipResource, r.pods)
 	if err != nil {
 		return vetting{}, err
 	}
-	if len(hosts) > 0 {
+	if hosts := report.reasons(); len(hosts) > 0 {
 		held, err := pl.held(ctx, s)
 		if err != nil {
 			return vetting{}, err
 		}
+		if !held && len(report.unhealthy) == 0 && len(report.tooSmall) > 0 {
+			return vetting{
+				reason: fmt.Sprintf("slice %s is %s, but %s; every matching host runs these DaemonSet and static pods, so another slice would not fit the pods either, and the slice is kept",
+					s.Name, s.State, strings.Join(hosts, ", ")),
+				event: EventReasonSlicePodsTooLargeForHosts,
+			}, nil
+		}
 		if !held {
+			event := EventReasonSliceHostUnavailable
+			if len(report.unhealthy) == 0 {
+				event = EventReasonSliceHostShortOfResources
+			}
 			return vetting{
 				reason: fmt.Sprintf("slice %s is %s, but %s; it is released and provisioned again once no pod holds it",
 					s.Name, s.State, strings.Join(hosts, ", ")),
 				release: true,
-				event:   EventReasonSliceHostUnavailable,
+				event:   event,
 			}, nil
 		}
 	}
@@ -337,8 +365,8 @@ func (pl *Placer) vetHosts(ctx context.Context, s gke.Slice, r *resolution) (vet
 	if err != nil {
 		return vetting{}, fmt.Errorf("hosts of slice %s: %w", s.Name, err)
 	}
-	if int64(found) < need {
-		return vetting{reason: fmt.Sprintf("slice %s is %s, but only %d of its %d hosts are visible yet", s.Name, s.State, found, need)}, nil
+	if int64(report.found) < need {
+		return vetting{reason: fmt.Sprintf("slice %s is %s, but only %d of its %d hosts are visible yet", s.Name, s.State, report.found, need)}, nil
 	}
 	return vetting{}, nil
 }

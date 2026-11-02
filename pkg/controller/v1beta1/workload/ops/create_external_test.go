@@ -4934,3 +4934,60 @@ func TestCreate_EmptyPlanNeedsNoRevision(t *testing.T) {
 		t.Fatalf("a pass with no pods to create needs no revision: %v", err)
 	}
 }
+
+// A Create attempt on a promoted Instance that renders a revision other
+// than the one the Instance served is the attempt's own rebuild onto a
+// roll target: the Instance lost its only pod and the pass built it on
+// the target of that moment. When the target moves on before the set
+// serves, the attempt is retired into a fresh one at the new target, as a
+// first attempt is, and the pass after deletes the pod the retired
+// attempt built. A refill beside live pods at the revision the Instance
+// serves is not this shape and is left to the roll
+// (TestCreate_PromotedInstanceRepairIsNotRetired).
+func TestCreate_RebuildOffTheServedRevisionIsRetiredWithTheTarget(t *testing.T) {
+	const servedRevision = "llama-70b-engine-5e12ed00"
+	for _, gang := range []bool{false, true} {
+		name := "single pod"
+		if gang {
+			name = "gang"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newSupersededFixture(t, gang)
+			ir := &v1beta1.InferenceReplica{}
+			key := client.ObjectKey{Namespace: "prod", Name: irName(f.isvc, workload.ComponentEngine)}
+			if err := f.client.Get(context.Background(), key, ir); err != nil {
+				t.Fatalf("re-read IR: %v", err)
+			}
+			ir.Status.InstanceStatuses[0].RunningRevision = servedRevision
+			if err := f.client.Status().Update(context.Background(), ir); err != nil {
+				t.Fatalf("seed the served revision: %v", err)
+			}
+
+			if writes := f.run(t); writes != 1 {
+				t.Fatalf("status writes in the retiring pass: got %d, want exactly 1", writes)
+			}
+			s := findInstanceStatusOnIR(f.client, f.isvc, workload.ComponentEngine, 0)
+			requireRetiredIntoFreshAttempt(t, s, f.priorOp.ID, f.target.Name)
+			if s.RunningRevision != servedRevision {
+				t.Errorf("RunningRevision = %q, want %q kept: the retirement replaces the attempt, not the Instance's history", s.RunningRevision, servedRevision)
+			}
+			if events := drainEvents(f.recorder); !anyEventContains(events, string(workload.EventReasonCreateAttemptSuperseded)) {
+				t.Errorf("events = %v, want the retirement named", events)
+			}
+
+			// The pass after owns the pod the retired attempt built: it
+			// carries a revision the fresh attempt is not converging to.
+			f.run(t)
+			pods := &corev1.PodList{}
+			if err := f.client.List(context.Background(), pods, client.InNamespace("prod")); err != nil {
+				t.Fatalf("list pods: %v", err)
+			}
+			priorHash := query.RevisionHashFromControllerRevisionName(supersededPriorRevision)
+			for i := range pods.Items {
+				if pods.Items[i].Labels[query.LabelRevisionHash] == priorHash && pods.Items[i].DeletionTimestamp == nil {
+					t.Errorf("pod %s on the retired revision still stands; the fresh attempt must replace it", pods.Items[i].Name)
+				}
+			}
+		})
+	}
+}

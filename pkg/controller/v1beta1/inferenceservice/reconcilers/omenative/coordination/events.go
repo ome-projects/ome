@@ -21,8 +21,12 @@ const (
 	// timeout, persistent reconcile error, etc.).
 	EventReasonGroupFailed = "CoordinationGroupFailed"
 
-	// EventReasonRatioSkewRejected fires when RatioBalanced pacing
-	// refused a surge to avoid drifting the cross-Component ratio.
+	// EventReasonRatioSkewRejected fires on the pass RatioBalanced pacing
+	// starts holding a Component's next start to avoid drifting the
+	// cross-Component ratio; the message names the move held by the
+	// Component's strategy (a surge start, a recreate or an in-place
+	// restart). The group status carries the refusal (SurgeHeldByRatio)
+	// while it holds, and the passes it holds across record nothing more.
 	EventReasonRatioSkewRejected = "RatioSkewRejected"
 
 	// EventReasonRatioGateBypassed fires when the OMENative ops
@@ -50,9 +54,11 @@ const (
 	// group to a shape one step keeps inside it.
 	EventReasonRatioStepOutsideTolerance = "RatioStepOutsideTolerance"
 
-	// EventReasonMixedPairingObserved fires when a RollingUpdate
-	// group sees distinct (vN, vM) revision pairs in flight.
-	// Informational — helps operators audit back-compat assertions.
+	// EventReasonMixedPairingObserved fires on the pass a RollingUpdate
+	// group first sees distinct (vN, vM) revision pairs in flight; the
+	// group status carries the picture (MixedPairing) while it holds, and
+	// the passes it holds across record nothing more. Informational: it
+	// helps operators audit back-compat assertions.
 	EventReasonMixedPairingObserved = "MixedPairingObserved"
 
 	// EventReasonSequentialAwaitingNext fires when a Sequential group

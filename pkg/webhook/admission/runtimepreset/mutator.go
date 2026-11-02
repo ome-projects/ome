@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -38,23 +39,7 @@ type ServingRuntimeMutator struct {
 
 func (m *ServingRuntimeMutator) Handle(_ context.Context, req admission.Request) admission.Response {
 	sr := &v1beta1.ServingRuntime{}
-	if err := m.Decoder.Decode(req, sr); err != nil {
-		log.Error(err, "decode ServingRuntime", "name", sr.Name, "namespace", sr.Namespace)
-		return admission.Errored(http.StatusBadRequest, err)
-	}
-	merged, resp := applyPreset(sr.Annotations, &sr.Spec)
-	if resp != nil {
-		return *resp
-	}
-	if merged == nil {
-		return admission.Allowed("no engine preset annotation")
-	}
-	original, errResp := marshalForPatch(sr)
-	if errResp != nil {
-		return *errResp
-	}
-	sr.Spec = *merged
-	return patchResponse(original, sr)
+	return mutate(m.Decoder, req, sr, &sr.Spec)
 }
 
 type ClusterServingRuntimeMutator struct {
@@ -63,23 +48,36 @@ type ClusterServingRuntimeMutator struct {
 
 func (m *ClusterServingRuntimeMutator) Handle(_ context.Context, req admission.Request) admission.Response {
 	csr := &v1beta1.ClusterServingRuntime{}
-	if err := m.Decoder.Decode(req, csr); err != nil {
-		log.Error(err, "decode ClusterServingRuntime", "name", csr.Name)
+	return mutate(m.Decoder, req, csr, &csr.Spec)
+}
+
+// mutate decodes the request into runtime, merges the preset its engine
+// annotation names into spec (the field inside runtime) and answers with
+// the patch from the decoded object to the merged one.
+func mutate(decoder admission.Decoder, req admission.Request, runtime client.Object, spec *v1beta1.ServingRuntimeSpec) admission.Response {
+	if err := decoder.Decode(req, runtime); err != nil {
+		log.Error(err, "decode "+req.Kind.Kind, "name", runtime.GetName(), "namespace", runtime.GetNamespace())
 		return admission.Errored(http.StatusBadRequest, err)
 	}
-	merged, resp := applyPreset(csr.Annotations, &csr.Spec)
+	merged, resp := applyPreset(runtime.GetAnnotations(), spec)
 	if resp != nil {
 		return *resp
 	}
 	if merged == nil {
 		return admission.Allowed("no engine preset annotation")
 	}
-	original, errResp := marshalForPatch(csr)
-	if errResp != nil {
-		return *errResp
+	original, err := encodeWithoutNulls(runtime)
+	if err != nil {
+		log.Error(err, "encode runtime for patch base")
+		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	csr.Spec = *merged
-	return patchResponse(original, csr)
+	*spec = *merged
+	mutated, err := encodeWithoutNulls(runtime)
+	if err != nil {
+		log.Error(err, "encode mutated runtime")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	return admission.PatchResponseFromRaw(original, mutated)
 }
 
 // applyPreset returns (merged, nil) on success, (nil, &resp) on
@@ -110,44 +108,18 @@ func applyPreset(annotations map[string]string, spec *v1beta1.ServingRuntimeSpec
 	return merged, nil
 }
 
-// marshalForPatch serializes the decoded (pre-mutation) object as the
-// patch base. Diffing against the decoded object, not the raw request,
-// keeps fields this build's API types don't know out of the patch — a
-// raw-based diff would emit remove ops that destroy them.
-func marshalForPatch(obj any) ([]byte, *admission.Response) {
-	out, err := json.Marshal(obj)
+// encodeWithoutNulls serializes the runtime as one side of the patch.
+// Both sides come from the decoded object, not the raw request, so fields
+// this build's API types do not know stay out of the patch (a raw-based
+// diff would emit remove ops that destroy them). ServingRuntimePodSpec's
+// embedded Containers lacks omitempty, so a nil slice marshals as "null",
+// which CRD validation rejects; the nulls go so both sides are symmetric.
+func encodeWithoutNulls(runtime any) ([]byte, error) {
+	out, err := json.Marshal(runtime)
 	if err != nil {
-		log.Error(err, "marshal runtime for patch base")
-		resp := admission.Errored(http.StatusInternalServerError, err)
-		return nil, &resp
+		return nil, err
 	}
-	// ServingRuntimePodSpec.Containers (embedded) lacks omitempty, so
-	// a nil slice marshals as "null". CRD validation rejects null
-	// arrays; strip them so base and target are symmetric.
-	out, err = runtimeinheritance.StripJSONNulls(out)
-	if err != nil {
-		log.Error(err, "strip nulls from runtime patch base")
-		resp := admission.Errored(http.StatusInternalServerError, err)
-		return nil, &resp
-	}
-	return out, nil
-}
-
-func patchResponse(original []byte, obj any) admission.Response {
-	out, err := json.Marshal(obj)
-	if err != nil {
-		log.Error(err, "marshal mutated runtime")
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	// ServingRuntimePodSpec.Containers (embedded) lacks omitempty, so
-	// a nil slice marshals as "null". CRD validation rejects null
-	// arrays. Strip nulls before computing the patch.
-	out, err = runtimeinheritance.StripJSONNulls(out)
-	if err != nil {
-		log.Error(err, "strip nulls from mutated runtime")
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	return admission.PatchResponseFromRaw(original, out)
+	return runtimeinheritance.StripJSONNulls(out)
 }
 
 func knownPresetNames() []string {

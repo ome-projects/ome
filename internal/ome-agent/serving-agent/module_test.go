@@ -3,12 +3,15 @@ package serving_agent
 import (
 	"testing"
 
+	"github.com/oracle/oci-go-sdk/v65/objectstorage"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/fx"
 
+	"sigs.k8s.io/ome/pkg/logging"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
-	testingPkg "sigs.k8s.io/ome/pkg/testing"
+	testingPkg "sigs.k8s.io/ome/pkg/utils/testing"
 )
 
 func TestModule(t *testing.T) {
@@ -172,4 +175,40 @@ func TestModuleErrorHandling(t *testing.T) {
 	sidecar, err := NewServingSidecar(config)
 	assert.NoError(t, err)
 	assert.NotNil(t, sidecar)
+}
+
+// buildThroughModule builds the sidecar the way the agent binary does: the
+// settings in v, the named logger and an object store with a client wired through fx.
+func buildThroughModule(t *testing.T, v *viper.Viper) error {
+	t.Helper()
+	app := fx.New(
+		fx.NopLogger,
+		fx.Supply(v, &ociobjectstore.OCIOSDataStore{Client: &objectstorage.ObjectStorageClient{}}),
+		fx.Provide(fx.Annotated{Name: "another_log", Target: func() logging.Interface { return testingPkg.SetupMockLogger() }}),
+		Module,
+		fx.Invoke(func(*ServingSidecar) {}),
+	)
+	return app.Err()
+}
+
+func completeSettings() *viper.Viper {
+	v := viper.New()
+	v.Set("fine_tuned_weight_info_file_path", "/mnt/ft-model-info.json")
+	v.Set("unzipped_fine_tuned_weight_directory", "/mnt/unzipped-ft-models")
+	v.Set("zipped_fine_tuned_weight_directory", "/mnt/zipped-ft-models")
+	return v
+}
+
+func TestModule_EveryRequiredSettingPresent_Builds(t *testing.T) {
+	require.NoError(t, buildThroughModule(t, completeSettings()))
+}
+
+// A required setting left empty is refused when the agent starts, naming the
+// setting, instead of failing inside the weight sync later.
+func TestModule_RequiredSettingMissing_RefusedAtStart(t *testing.T) {
+	v := completeSettings()
+	v.Set("fine_tuned_weight_info_file_path", "")
+	err := buildThroughModule(t, v)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "FineTunedWeightInfoFilePath")
 }

@@ -12,12 +12,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // resetPlacementMetrics clears every vector so whole-vector counts are
@@ -35,6 +37,9 @@ func resetPlacementMetrics() {
 	placementPolicyInfo.Reset()
 	placementSplitReplicas.Reset()
 	placementSplitMaxPerCluster.Reset()
+	placementTotalDesiredReplicas.Reset()
+	placementCandidateDesiredReplicas.Reset()
+	placementCapacityObservationKnown.Reset()
 }
 
 func splitISVC(ns, name string, replicas int32) *v1beta1.InferenceService {
@@ -44,8 +49,8 @@ func splitISVC(ns, name string, replicas int32) *v1beta1.InferenceService {
 			Placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity,
 				Mode: v1beta1.PlacementModeSplit,
 				Split: &v1beta1.SplitSpec{
-					Replicas:              &replicas,
-					MaxReplicasPerCluster: 4,
+					Replicas:      &replicas,
+					MaxPerCluster: engineCap(4),
 				},
 			},
 		},
@@ -164,6 +169,30 @@ func TestRecordPolicy_SplitFieldsAndModeChange(t *testing.T) {
 	}
 }
 
+// TestRecordPolicy_MaxPerClusterReportsThePrimaryCap: the gauge reports the
+// primary component's cap, whichever field declares it.
+func TestRecordPolicy_MaxPerClusterReportsThePrimaryCap(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		ceilings v1beta1.SplitCeilings
+		want     float64
+	}{
+		{name: "default", ceilings: v1beta1.SplitCeilings{Default: ptr.To[int32](6), Router: ptr.To[int32](2)}, want: 6},
+		{name: "engine key", ceilings: v1beta1.SplitCeilings{Engine: ptr.To[int32](5)}, want: 5},
+		{name: "no engine cap", ceilings: v1beta1.SplitCeilings{Router: ptr.To[int32](2)}, want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			resetPlacementMetrics()
+			isvc := splitISVC("ns", "svc", 8)
+			isvc.Spec.Placement.Split = &v1beta1.SplitSpec{Replicas: ptr.To[int32](8), MaxPerCluster: &tt.ceilings}
+			recordPolicy(isvc)
+			if got := testutil.ToFloat64(placementSplitMaxPerCluster.WithLabelValues("ns", "svc")); got != tt.want {
+				t.Errorf("max_per_cluster = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestRecordPolicy_NoPlacementEmitsNothing: an ISVC with no placement block is
 // not a multi-cluster ISVC and must not appear in the policy metrics.
 func TestRecordPolicy_NoPlacementEmitsNothing(t *testing.T) {
@@ -201,6 +230,9 @@ func TestDeleteForISVC_DropsEverything(t *testing.T) {
 		"policy_info":               testutil.CollectAndCount(placementPolicyInfo),
 		"split_replicas":            testutil.CollectAndCount(placementSplitReplicas),
 		"max_per_cluster":           testutil.CollectAndCount(placementSplitMaxPerCluster),
+		"desired":                   testutil.CollectAndCount(placementTotalDesiredReplicas),
+		"candidate_desired":         testutil.CollectAndCount(placementCandidateDesiredReplicas),
+		"capacity_known":            testutil.CollectAndCount(placementCapacityObservationKnown),
 	} {
 		if n != 0 {
 			t.Errorf("%s series = %d, want 0 after DeleteForISVC", name, n)
@@ -321,14 +353,7 @@ func TestWritePlacementMetricsKeepSavedStateWhenStatusWriteFails(t *testing.T) {
 	assertCandidateObservationMetrics(t, source, "member-a", 3, 1, 0)
 
 	writeErr := errors.New("status update rejected")
-	r.Client = interceptor.NewClient(hub.(client.WithWatch), interceptor.Funcs{
-		SubResourceUpdate: func(ctx context.Context, cl client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-			if subresource == "status" {
-				return writeErr
-			}
-			return cl.SubResource(subresource).Update(ctx, obj, opts...)
-		},
-	})
+	r.Client = fakeclient.Wrap(t, hub.(client.WithWatch), fakeclient.FailingVerb(fakeclient.StatusUpdate, fakeclient.EveryCall, writeErr))
 	since := metav1.NewTime(time.Unix(100, 0))
 	_, err = r.writePlacement(t.Context(), source, placementResult{
 		phase:      v1beta1.PlacementPhasePlaced,
@@ -351,7 +376,7 @@ func TestWritePlacementMetricsUseAcceptedStatusResponse(t *testing.T) {
 	source.UID = "source-a"
 	r, hub := newPlacer(testScheme(t), nil, source)
 	r.ObservationGrace = 5 * time.Minute
-	r.Client = interceptor.NewClient(hub.(client.WithWatch), interceptor.Funcs{
+	r.Client = fakeclient.Wrap(t, hub.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, cl client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 			if subresource != "status" {
 				return cl.SubResource(subresource).Update(ctx, obj, opts...)
@@ -366,7 +391,7 @@ func TestWritePlacementMetricsUseAcceptedStatusResponse(t *testing.T) {
 			*obj.(*v1beta1.InferenceService) = *accepted
 			return nil
 		},
-	})
+	}))
 	since := metav1.NewTime(time.Unix(100, 0))
 	_, err := r.writePlacement(t.Context(), source, placementResult{
 		phase:      v1beta1.PlacementPhasePlaced,

@@ -4077,6 +4077,9 @@ spec:
                               lastProgressAt:
                                 format: date-time
                                 type: string
+                              placementWaitSince:
+                                format: date-time
+                                type: string
                               reason:
                                 type: string
                               requestUUID:
@@ -4366,6 +4369,9 @@ spec:
                           id:
                             type: string
                           lastProgressAt:
+                            format: date-time
+                            type: string
+                          placementWaitSince:
                             format: date-time
                             type: string
                           reason:

@@ -5,9 +5,11 @@
 # remote_write. Disable it when your cluster
 # already runs a Prometheus that scrapes OME pods.
 #
-# A ConfigMap change triggers a rollout via the checksum annotation
-# below; the `--web.enable-lifecycle` flag also allows an in-pod
-# `POST /-/reload` for operators who want zero-downtime reloads.
+# prometheus.configReload applies a ConfigMap change in place: Prometheus
+# re-reads prometheus.yml on an interval, so the pod and its emptyDir TSDB
+# survive a scrape-config edit. With reload disabled, the checksum annotation
+# replaces the pod on every config change. `--web.enable-lifecycle` also
+# accepts a manual `POST /-/reload`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,8 +28,10 @@ spec:
     metadata:
       labels:
         {{- include "ome-prometheus.labels" . | nindent 8 }}
+      {{- if not .Values.prometheus.configReload.enabled }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/prometheus/configmap.yaml") . | sha256sum }}
+      {{- end }}
     spec:
       serviceAccountName: ome-prometheus
       securityContext:
@@ -70,6 +74,12 @@ spec:
             {{- end }}
             {{- with .Values.prometheus.query.timeout }}
             - --query.timeout={{ . }}
+            {{- end }}
+            {{- if .Values.prometheus.configReload.enabled }}
+            - --enable-feature=auto-reload-config
+            {{- with .Values.prometheus.configReload.interval }}
+            - --config.auto-reload-interval={{ . }}
+            {{- end }}
             {{- end }}
             - --web.enable-lifecycle
             - --web.listen-address=:{{ .Values.prometheus.listenPort }}

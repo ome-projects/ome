@@ -15,6 +15,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // eventApplier turns one timeline event into the cluster, spec or replica
@@ -63,14 +64,11 @@ var producedEvents = map[string]string{
 	"cr.collision":           "a hash collision is minted by the replica controller, which the replay does not run",
 	"scope.rotated":          "a replica is never deleted and re-projected in a replay",
 	"ir.readError":           "the fake apiserver answers every replica read",
-	"analysis.sample":        "the analysis sampler is not modelled",
-	"analysis.unavailable":   "the analysis sampler is not modelled",
-	"record.legacy":          "a persisted record that lacks an optional field is not modelled",
+	"analysis.unavailable":   "the gate's miss is the pass's own: stage no analysis.sample anywhere for no sampler, none for a member for no fresh sample",
 	"member.staged":          "a staged member needs the user partition flow, which is not modelled",
 	"ir.staged":              "the replica rests at its staged shape on its own; stage the partition, ir.straggling and replica.currentWithdrawn",
 	"timer.pauseElapsed":     "a timed soak is not modelled",
 	"timer.drainElapsed":     "a drain window is not modelled",
-	"pod.canaryCrashed":      "the crash reading is not modelled",
 	"pod.canaryRestarted":    "the restart reading is not modelled",
 	"pod.canaryDeleted":      "a canary pod on its way out is not modelled",
 	"pod.replacementReady":   "the released floor's replacement is not modelled",
@@ -108,11 +106,15 @@ func init() {
 		"member.capacityLost":      applyCapacityLost,
 		"member.failed":            applyRowPhase(v1beta1.OMENativeInstanceFailed),
 		"member.surgeFailed":       applySurgeFailed,
+		"member.held":              applyHeld,
 		"member.recovered":         applyRowPhase(v1beta1.OMENativeInstanceReady),
 		"member.dark":              applyDark,
 		"ir.missing":               applyReplicaMissing,
 		"capacity.reached":         applyCapacityReached,
 		"capacity.dropped":         applyCapacityDropped,
+		"pod.canaryCrashed":        applyCanaryCrash,
+		"analysis.sample":          applyAnalysisSample,
+		"record.legacy":            applyRecordLegacy,
 		"pod.rejectedGone":         applyRejectedGone,
 		"pod.lastStableRolled":     applyLastStableRolled,
 		"stable.crMissing":         applyCollected,
@@ -157,7 +159,7 @@ var eventArgKeys = map[string][]string{
 	"ir.straggling":            {"component", "trailing"},
 	"ir.stale":                 {"component", "lag"},
 	"member.surgePodCreated":   {"component", "index", "replacement"},
-	"member.readyOnTarget":     {"component", "index"},
+	"member.readyOnTarget":     {"component", "index", "listedAfter"},
 	"member.oldPodsGone":       {"component", "index"},
 	"member.converged":         {"component"},
 	"replica.currentPromoted":  {"component"},
@@ -165,11 +167,15 @@ var eventArgKeys = map[string][]string{
 	"member.capacityLost":      {"component", "gone"},
 	"member.failed":            {"component", "index"},
 	"member.surgeFailed":       {"component", "index"},
+	"member.held":              {"component", "attempts"},
 	"member.recovered":         {"component", "index"},
 	"member.dark":              {"component"},
 	"ir.missing":               {"component"},
 	"capacity.reached":         {"component"},
 	"capacity.dropped":         {"component", "index"},
+	"pod.canaryCrashed":        {"component", "index"},
+	"analysis.sample":          {"component", "outcome"},
+	"record.legacy":            {"component"},
 	"pod.rejectedGone":         {"component"},
 	"pod.lastStableRolled":     {"component"},
 	"stable.crMissing":         {"component", "image"},
@@ -471,6 +477,37 @@ func applySurgeFailed(_ context.Context, d *driver, ev TimelineEvent) (string, e
 	return fmt.Sprintf("component=%s index=%d revision=%s", m.component, row.index, row.target), nil
 }
 
+// applyHeld sets or clears a member's retry record for its target as the
+// replica controller would publish it. Set, the record reads Held after
+// the attempts the event names and no fresh start opens on the member;
+// released, the operator's release removed it and the next attempt opens
+// as a fresh start. The stand-in runs no retry schedule of its own, so the
+// scenario names the moment.
+func applyHeld(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	m, err := requireMember(d, ev)
+	if err != nil {
+		return "", err
+	}
+	switch ev.Variant {
+	case "set":
+		if m.target == "" || m.target == m.current {
+			return "", fmt.Errorf("replay: %s: %s has no push in flight whose record could be Held", ev.Key(), m.component)
+		}
+		if ev.Args.Attempts <= 0 {
+			return "", fmt.Errorf("replay: %s needs the failed attempts the record counts", ev.Key())
+		}
+		m.heldAttempts = ev.Args.Attempts
+		return fmt.Sprintf("component=%s revision=%s attempts=%d", m.component, m.target, m.heldAttempts), nil
+	case "released":
+		if m.heldAttempts == 0 {
+			return "", fmt.Errorf("replay: %s: %s has no Held record to release", ev.Key(), m.component)
+		}
+		m.heldAttempts = 0
+		return fmt.Sprintf("component=%s revision=%s", m.component, m.target), nil
+	}
+	return "", fmt.Errorf("replay: %s: the variant is set or released", ev.Key())
+}
+
 func (m *member) row(index int32) *rowState {
 	for i := range m.rows {
 		if m.rows[i].index == index {
@@ -490,17 +527,26 @@ func applyReadyOnTarget(_ context.Context, d *driver, ev TimelineEvent) (string,
 	if ev.Args.Index != nil && m.row(*ev.Args.Index) == nil {
 		return "", fmt.Errorf("replay: %s: no row %d", ev.Key(), *ev.Args.Index)
 	}
+	listedAfter, err := ParseDuration("member.readyOnTarget.listedAfter", ev.Args.ListedAfter)
+	if err != nil {
+		return "", err
+	}
 	n := 0
 	for i := range m.pods {
 		if m.pods[i].image == m.target && (ev.Args.Index == nil || m.pods[i].index == *ev.Args.Index) {
 			m.pods[i].ready, m.pods[i].serving = true, true
+			m.pods[i].listedAfter = listedAfter
 			n++
 		}
 	}
 	if n == 0 {
 		return "", fmt.Errorf("replay: member.readyOnTarget: %s has no pod on its target revision", m.component)
 	}
-	return fmt.Sprintf("component=%s pods=%d", m.component, n), nil
+	detail := fmt.Sprintf("component=%s pods=%d", m.component, n)
+	if listedAfter > 0 {
+		detail += " listedAfter=" + listedAfter.String()
+	}
+	return detail, nil
 }
 
 // applyOldPodsGone removes every pod of a member that is not on the target
@@ -745,6 +791,69 @@ func applyCapacityDropped(_ context.Context, d *driver, ev TimelineEvent) (strin
 		return "", fmt.Errorf("replay: %s: Instance %d has no pod on the target revision", ev.Key(), *ev.Args.Index)
 	}
 	return fmt.Sprintf("component=%s index=%d", m.component, *ev.Args.Index), nil
+}
+
+// applyCanaryCrash puts the runner of one Instance's target-revision pod
+// into a crash loop after the Instance served: the kubelet restarted the
+// runner once since the Instance entered Ready and the restarted run died
+// again now, so the pod reports CrashLoopBackOff with that death recorded
+// and is not Ready. The row keeps the Ready phase the replica publishes
+// over a pod set that served and lost its runner. The crash reading dates
+// the deaths against the row's readiness and the run's open, so the clock
+// must have moved since the Instance served.
+func applyCanaryCrash(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	m, err := requireMember(d, ev)
+	if err != nil {
+		return "", err
+	}
+	if ev.Args.Index == nil {
+		return "", fmt.Errorf("replay: %s needs the index of the Instance whose pod keeps dying", ev.Key())
+	}
+	row := m.row(*ev.Args.Index)
+	if row == nil {
+		return "", fmt.Errorf("replay: %s: no row %d", ev.Key(), *ev.Args.Index)
+	}
+	pod := m.podOn(row.index, m.target)
+	if pod == nil {
+		return "", fmt.Errorf("replay: %s: Instance %d of %s has no pod on the target revision", ev.Key(), row.index, m.component)
+	}
+	if row.readySince.IsZero() || !d.clock.Now().After(row.readySince) {
+		return "", fmt.Errorf("replay: %s: Instance %d of %s has not served on the target revision before now; a crash loop is read only after the Instance served, so stage capacity.reached and move the clock first", ev.Key(), row.index, m.component)
+	}
+	pod.ready, pod.serving = false, false
+	pod.crashedAt = d.clock.Now()
+	return fmt.Sprintf("component=%s index=%d revision=%s", m.component, row.index, m.target), nil
+}
+
+// applyRecordLegacy writes a member's canary status the way an external
+// status writer would, in the shape the variant names, so the next pass
+// reads it back from the store. Only the Failed phase with an empty failure
+// reason is staged: the primary's phase reads Failed while its record names
+// no reason for it.
+func applyRecordLegacy(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
+	m, err := requireMember(d, ev)
+	if err != nil {
+		return "", err
+	}
+	if ev.Variant != "failedPhaseNoMarker" {
+		return "", fmt.Errorf("replay: %s: only the failedPhaseNoMarker variant is staged", ev.Key())
+	}
+	isvc, err := d.liveService(ctx)
+	if err != nil {
+		return "", err
+	}
+	cs := rollout.CanaryStatusFor(&isvc.Status, m.component)
+	if cs == nil {
+		return "", fmt.Errorf("replay: %s: %s carries no canary record to write over", ev.Key(), m.component)
+	}
+	cs.Failed = nil
+	entry := isvc.Status.Components[m.component]
+	entry.RolloutPhase = v1beta1.RolloutPhaseFailed
+	isvc.Status.Components[m.component] = entry
+	if err := d.cluster.staging(func() error { return d.cluster.cli.Status().Update(ctx, isvc) }); err != nil {
+		return "", fmt.Errorf("replay: write the %s status: %w", m.component, err)
+	}
+	return fmt.Sprintf("component=%s phase=%s failed=nil", m.component, v1beta1.RolloutPhaseFailed), nil
 }
 
 // applyRejectedGone returns a unit's members to their current revision:
@@ -1258,7 +1367,8 @@ func applyServiceWriteFailed(_ context.Context, d *driver, ev TimelineEvent) (st
 }
 
 // applySoakTimer moves the clock onto the earliest Sequential soak
-// deadline: a group's lastTransitionTime plus its soak, plus the slack.
+// deadline: the previous member's recorded finish plus the group's soak,
+// plus the slack.
 func applySoakTimer(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
 	slack, err := requireSlack(ev)
 	if err != nil {
@@ -1274,13 +1384,20 @@ func applySoakTimer(ctx context.Context, d *driver, ev TimelineEvent) (string, e
 		if soak <= 0 || g.PreviousComponent == "" {
 			continue
 		}
-		// The engine measures the wait from the previous member's Ready
-		// transition, the instant its replica recorded the roll done.
-		ir, err := d.replica(ctx, g.PreviousComponent)
-		if err != nil {
-			return "", err
+		// The engine measures the wait from the finish the group's entry
+		// records for the previous member and, while it records none, from
+		// that member's Ready transition, the instant its replica recorded
+		// the roll done.
+		var finished time.Time
+		if g.MemberFinished != nil && g.MemberFinished.Component == g.PreviousComponent {
+			finished = g.MemberFinished.At.Time
+		} else {
+			ir, err := d.replica(ctx, g.PreviousComponent)
+			if err != nil {
+				return "", err
+			}
+			finished = readyTransitionOf(ir)
 		}
-		finished := readyTransitionOf(ir)
 		if finished.IsZero() {
 			continue
 		}

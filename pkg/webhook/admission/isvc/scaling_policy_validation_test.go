@@ -8,12 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -37,9 +36,7 @@ func scalingPolicyISVC(policy *v1beta1.ScalingPolicy) *v1beta1.InferenceService 
 
 func scalingPolicyValidator(t *testing.T) *InferenceServiceValidator {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	require.NoError(t, v1beta1.AddToScheme(scheme))
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := fakeclient.New(t)
 	return &InferenceServiceValidator{Client: c, Reader: c, RuntimeSelector: runtimeselector.New(c)}
 }
 

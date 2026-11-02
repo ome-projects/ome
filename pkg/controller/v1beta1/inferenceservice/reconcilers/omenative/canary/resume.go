@@ -194,7 +194,7 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 			"resume rejected for %s: %q is not the parked canary revision %q", in.Component, req.hash, cs.CanaryRevisionHash)
 		return false, consume()
 	}
-	// A resume re-enters the steps toward the parked revision, so a member of
+	// A resume re-enters the steps toward the stopped canary's revision, so a member of
 	// the unit must still target it. Once the spec went back to the stable
 	// revision nothing is left to roll: a re-entry would record the stable
 	// revision as its own canary and wait for a promote that moves nothing.
@@ -212,7 +212,7 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 	if err := consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutRollbackAnnotation); err != nil {
 		return false, err
 	}
-	// The record re-arms toward the parked revision the value named; the
+	// The record restarts the steps toward the stopped revision the value named; the
 	// member check above is what makes it a revision the unit still targets.
 	resetCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, cs.CanaryRevisionHash, in.Now)
 	recordResume(in.ISVC, in.Component, resumeApplied)

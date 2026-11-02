@@ -99,7 +99,7 @@ func (r *Reconciler) singleMoveProposal(ctx context.Context, source *v1beta1.Inf
 		Spec                v1beta1.InferenceServiceSpec
 		Labels, Annotations map[string]string
 		Matched             map[string]types.UID
-	}{source.Spec, source.Labels, source.Annotations, matched})
+	}{source.Spec, source.Labels, planIntentAnnotations(source.Annotations), matched})
 	if err != nil {
 		return out, err
 	}

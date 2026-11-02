@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 type identifiedTestClusters struct {
@@ -203,15 +204,9 @@ func TestPlannedDeleteRequiresDrainAndConditionalIdentity(t *testing.T) {
 				t.Fatal(err)
 			}
 			if withoutUID {
-				worker = interceptor.NewClient(worker, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if err := c.Get(ctx, key, obj, opts...); err != nil {
-						return err
-					}
-					if _, ok := obj.(*v1beta1.InferenceService); ok {
-						obj.SetUID("")
-					}
-					return nil
-				}})
+				worker = fakeclient.Wrap(t, worker, fakeclient.EditedRead(func(member *v1beta1.InferenceService) {
+					member.SetUID("")
+				}))
 			}
 			if tt.absent {
 				if err := worker.Delete(ctx, member); err != nil {
@@ -219,7 +214,7 @@ func TestPlannedDeleteRequiresDrainAndConditionalIdentity(t *testing.T) {
 				}
 			}
 			base := worker
-			worker = interceptor.NewClient(base, interceptor.Funcs{Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			worker = fakeclient.Wrap(t, base, fakeclient.WithInterceptors(interceptor.Funcs{Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 				if tt.race {
 					live := &v1beta1.InferenceService{}
 					if err := c.Get(ctx, client.ObjectKeyFromObject(obj), live); err != nil {
@@ -231,7 +226,7 @@ func TestPlannedDeleteRequiresDrainAndConditionalIdentity(t *testing.T) {
 					}
 				}
 				return c.Delete(ctx, obj, opts...)
-			}})
+			}}))
 			clusters := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(worker)}}, uid: "member-a-uid"}
 			liveSource := source.DeepCopy()
 			if tt.editSource != nil {

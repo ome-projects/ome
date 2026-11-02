@@ -8,15 +8,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // pdGangUnit is a prefill/decode unit behind a router: three engine gangs
@@ -64,7 +63,7 @@ func newPDGangUnit(t *testing.T, name string) *pdGangUnit {
 		}
 		return r
 	}
-	objects := []runtime.Object{isvc, routerIR, gangIR(v1beta1.EngineComponent), gangIR(v1beta1.DecoderComponent),
+	objects := []client.Object{isvc, routerIR, gangIR(v1beta1.EngineComponent), gangIR(v1beta1.DecoderComponent),
 		canaryControllerRevision(ns, name, "router", pdGangRouterRev, 1),
 	}
 	for _, comp := range []string{"engine", "decoder"} {
@@ -84,7 +83,7 @@ func newPDGangUnit(t *testing.T, name string) *pdGangUnit {
 		objects = append(objects, u.gang(comp, "v2", 1, true)...)
 		objects = append(objects, u.gang(comp, "v2", 3, true)...)
 	}
-	u.c = fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objects...).Build()
+	u.c = fakeclient.New(t, fakeclient.WithObjects(objects...))
 	u.deps = DispatchDeps{Client: u.c, Reader: u.c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{})}
 	return u
 }
@@ -108,8 +107,8 @@ func (u *pdGangUnit) routerPod(index int) *corev1.Pod {
 }
 
 // gang is one Instance's leader and worker on a revision, Ready or not.
-func (u *pdGangUnit) gang(comp v1beta1.ComponentType, rev string, index int, ready bool) []runtime.Object {
-	var pods []runtime.Object
+func (u *pdGangUnit) gang(comp v1beta1.ComponentType, rev string, index int, ready bool) []client.Object {
+	var pods []client.Object
 	for _, runner := range []v1beta1.RunnerName{v1beta1.RunnerNameLeader, v1beta1.RunnerNameWorker} {
 		name := fmt.Sprintf("%s-%s-%d-%s-0", u.isvc.Name, comp, index, runner)
 		pod := canaryRunnerPod(u.ns, u.isvc.Name, string(comp), rev, name, runner, "0")
@@ -125,7 +124,7 @@ func (u *pdGangUnit) gang(comp v1beta1.ComponentType, rev string, index int, rea
 func (u *pdGangUnit) createGang(comp v1beta1.ComponentType, rev string, index int, ready bool) {
 	u.t.Helper()
 	for _, obj := range u.gang(comp, rev, index, ready) {
-		if err := u.c.Create(u.ctx, obj.(client.Object)); err != nil {
+		if err := u.c.Create(u.ctx, obj); err != nil {
 			u.t.Fatal(err)
 		}
 	}
@@ -134,7 +133,7 @@ func (u *pdGangUnit) createGang(comp v1beta1.ComponentType, rev string, index in
 func (u *pdGangUnit) deleteGang(comp v1beta1.ComponentType, rev string, index int) {
 	u.t.Helper()
 	for _, obj := range u.gang(comp, rev, index, true) {
-		if err := u.c.Delete(u.ctx, obj.(client.Object)); err != nil {
+		if err := u.c.Delete(u.ctx, obj); err != nil {
 			u.t.Fatal(err)
 		}
 	}

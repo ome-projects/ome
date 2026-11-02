@@ -186,11 +186,11 @@ func Resolve(ctx context.Context, in Inputs) (*Resolved, error) {
 	if err := validateResolvedRuntimeEnabled(res.Runtime, res.RuntimeName, res.RuntimeIsCluster); err != nil {
 		return nil, err
 	}
-	engine, decoder, router, err := isvcutils.MergeRuntimeSpecs(service, res.Runtime, in.Log)
+	specs, err := isvcutils.MergeRuntimeRoleSpecs(service, res.Runtime, in.Log)
 	if err != nil {
 		return nil, &MergeError{Err: err}
 	}
-	res.Specs = Specs{Engine: engine, Decoder: decoder, Router: router}
+	res.Specs = specs
 	return res, nil
 }
 
@@ -207,23 +207,14 @@ func validateResolvedRuntimeEnabled(runtimeSpec *v1beta1.ServingRuntimeSpec, run
 // Prepare determines each declared role's deployment mode and applies the
 // operator's deploy defaults to the merged specs, in place.
 func Prepare(r *Resolved, specMode *constants.DeploymentModeType, deploy *controllerconfig.DeployConfig) error {
-	engineMode, decoderMode, routerMode, err := isvcutils.DetermineDeploymentModes(r.Specs.Engine, r.Specs.Decoder, r.Specs.Router, r.Runtime, specMode)
+	modes, err := isvcutils.DetermineRoleDeploymentModes(r.Specs, specMode)
 	if err != nil {
 		return err
 	}
-	r.Modes = make(map[v1beta1.ComponentType]constants.DeploymentModeType, 3)
-	if r.Specs.Engine != nil {
-		r.Modes[v1beta1.EngineComponent] = engineMode
+	r.Modes = modes
+	for _, view := range r.Specs.Declared() {
+		specdefaults.Role(&view, modes[view.Type], deploy)
 	}
-	if r.Specs.Decoder != nil {
-		r.Modes[v1beta1.DecoderComponent] = decoderMode
-	}
-	if r.Specs.Router != nil {
-		r.Modes[v1beta1.RouterComponent] = routerMode
-	}
-	specdefaults.Engine(r.Specs.Engine, engineMode, deploy)
-	specdefaults.Decoder(r.Specs.Decoder, decoderMode, deploy)
-	specdefaults.Router(r.Specs.Router, routerMode, deploy)
 	return nil
 }
 
@@ -233,39 +224,27 @@ func Prepare(r *Resolved, specMode *constants.DeploymentModeType, deploy *contro
 // uses it instead of Prepare, which requires an engine. The merged specs
 // must declare the role.
 func PrepareRole(r *Resolved, c v1beta1.ComponentType, specMode *constants.DeploymentModeType, deploy *controllerconfig.DeployConfig) error {
+	if _, ok := v1beta1.RoleOf(c); !ok {
+		return fmt.Errorf("component %q is not a role", c)
+	}
+	view := r.Specs.View(c)
+	if view == nil {
+		return fmt.Errorf("the merged specs declare no %s role", c)
+	}
 	if r.Modes == nil {
 		r.Modes = make(map[v1beta1.ComponentType]constants.DeploymentModeType, 1)
 	}
-	switch c {
-	case v1beta1.EngineComponent:
-		if r.Specs.Engine == nil {
-			return fmt.Errorf("the merged specs declare no %s role", c)
-		}
-		r.Modes[c] = isvcutils.DetermineComponentDeploymentMode(r.Specs.Engine, r.Runtime, specMode)
-		specdefaults.Engine(r.Specs.Engine, r.Modes[c], deploy)
-	case v1beta1.DecoderComponent:
-		if r.Specs.Decoder == nil {
-			return fmt.Errorf("the merged specs declare no %s role", c)
-		}
-		r.Modes[c] = isvcutils.DetermineComponentDeploymentMode(r.Specs.Decoder, r.Runtime, specMode)
-		specdefaults.Decoder(r.Specs.Decoder, r.Modes[c], deploy)
-	case v1beta1.RouterComponent:
-		if r.Specs.Router == nil {
-			return fmt.Errorf("the merged specs declare no %s role", c)
-		}
-		r.Modes[c] = isvcutils.DetermineComponentDeploymentMode(r.Specs.Router, r.Runtime, specMode)
-		specdefaults.Router(r.Specs.Router, r.Modes[c], deploy)
-	default:
-		return fmt.Errorf("component %q is not a role", c)
-	}
+	r.Modes[c] = isvcutils.RoleDeploymentMode(view, specMode)
+	specdefaults.Role(view, r.Modes[c], deploy)
 	return nil
 }
 
 // Piece assembles the render inputs for one role: the accelerator class the
 // selector picks for it and the runtime's supported format for the model.
 // The picked AcceleratorClass object is returned beside the piece, nil when
-// the role has none, for callers that record its identity. The router takes
-// neither a class nor a format.
+// the role has none, for callers that record its identity. A role that does
+// not run on an accelerator class (the router) takes neither a class nor a
+// format.
 func (r *Resolved) Piece(ctx context.Context, in Inputs, c v1beta1.ComponentType) (*Piece, *v1beta1.AcceleratorClass, error) {
 	p := &Piece{
 		Client:                 in.Client,
@@ -278,7 +257,7 @@ func (r *Resolved) Piece(ctx context.Context, in Inputs, c v1beta1.ComponentType
 		RuntimeName:            r.RuntimeName,
 		Overlays:               r.Overlays,
 	}
-	if c == v1beta1.RouterComponent {
+	if role, _ := v1beta1.RoleOf(c); !role.RunsModel {
 		return p, nil, nil
 	}
 	if in.Accelerators == nil || in.Runtimes == nil {

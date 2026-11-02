@@ -78,8 +78,8 @@ func TestName_AndWatches(t *testing.T) {
 	if !ok {
 		t.Fatalf("Watches returned %T, want *unstructured.Unstructured", w)
 	}
-	if got := u.GroupVersionKind(); got != btpGVK {
-		t.Fatalf("Watches GVK = %v, want %v", got, btpGVK)
+	if got := u.GroupVersionKind(); got != PolicyGVK {
+		t.Fatalf("Watches GVK = %v, want %v", got, PolicyGVK)
 	}
 }
 
@@ -113,8 +113,8 @@ func TestTranslate_TargetRefsAndMetadata(t *testing.T) {
 	if u.GetName() != "isvc" || u.GetNamespace() != "ns" {
 		t.Fatalf("name/ns = %q/%q", u.GetName(), u.GetNamespace())
 	}
-	if u.GroupVersionKind() != btpGVK {
-		t.Fatalf("GVK = %v, want %v", u.GroupVersionKind(), btpGVK)
+	if u.GroupVersionKind() != PolicyGVK {
+		t.Fatalf("GVK = %v, want %v", u.GroupVersionKind(), PolicyGVK)
 	}
 	refs, found, err := unstructured.NestedSlice(u.Object, "spec", "targetRefs")
 	if err != nil || !found {
@@ -571,7 +571,7 @@ func i32p(v int32) *int32 { return &v }
 // plane.
 func btpWithStatusConditions(conds []map[string]interface{}) *unstructured.Unstructured {
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(btpGVK)
+	u.SetGroupVersionKind(PolicyGVK)
 	raw := make([]interface{}, 0, len(conds))
 	for _, c := range conds {
 		raw = append(raw, c)
@@ -631,7 +631,7 @@ func TestObserveAcceptance_AcceptedUnknown_IsPending(t *testing.T) {
 
 func TestObserveAcceptance_NoConditions_IsPending(t *testing.T) {
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(btpGVK)
+	u.SetGroupVersionKind(PolicyGVK)
 	got := New().ObserveAcceptance(u)
 	if got.State != traffic.AcceptancePending {
 		t.Fatalf("no status -> Pending, got %d", got.State)

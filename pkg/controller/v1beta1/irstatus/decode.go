@@ -33,15 +33,11 @@ type decodePlan struct {
 	rowCount      int
 	rowOrder      []int32
 
-	phases             []indexSet
-	runningRevisions   []indexSet
-	targetRevisions    []indexSet
-	incarnations       []indexSet
-	podCounts          []indexSet
-	servingPodCounts   []indexSet
-	availablePodCounts []indexSet
-	admitted           *indexSet
-	activeOrdinalOne   *indexSet
+	// groups holds, per grouped column in groupedColumns order, the index
+	// set of each of its groups.
+	groups           [len(groupedColumns)][]indexSet
+	admitted         *indexSet
+	activeOrdinalOne *indexSet
 }
 
 func validateColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64) (*decodePlan, error) {
@@ -57,26 +53,10 @@ func validateColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64
 	}
 	plan := &decodePlan{members: members, rowCount: int(members.Cardinality())}
 
-	if plan.phases, err = validateGroupColumn(columns.Phases, members, true, phaseGroupAccess); err != nil {
-		return nil, err
-	}
-	if plan.runningRevisions, err = validateGroupColumn(columns.RunningRevisions, members, false, revisionGroupAccess); err != nil {
-		return nil, err
-	}
-	if plan.targetRevisions, err = validateGroupColumn(columns.TargetRevisions, members, false, revisionGroupAccess); err != nil {
-		return nil, err
-	}
-	if plan.incarnations, err = validateGroupColumn(columns.Incarnations, members, false, incarnationGroupAccess); err != nil {
-		return nil, err
-	}
-	if plan.podCounts, err = validateGroupColumn(columns.PodCounts, members, false, countGroupAccess); err != nil {
-		return nil, err
-	}
-	if plan.servingPodCounts, err = validateGroupColumn(columns.ServingPodCounts, members, false, countGroupAccess); err != nil {
-		return nil, err
-	}
-	if plan.availablePodCounts, err = validateGroupColumn(columns.AvailablePodCounts, members, false, countGroupAccess); err != nil {
-		return nil, err
+	for i, column := range groupedColumns {
+		if plan.groups[i], err = column.validate(columns, members); err != nil {
+			return nil, err
+		}
 	}
 	if plan.admitted, err = validateOptionalIndexSet(columns.Admitted, members); err != nil {
 		return nil, err
@@ -96,89 +76,6 @@ func validateColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64
 	}
 	plan.rowOrder = columns.RowOrder
 	return plan, nil
-}
-
-// groupAccess adapts one typed group slice to the shared column validator.
-type groupAccess[G any] struct {
-	indexes    func(*G) string
-	valueValid func(*G) bool
-	ascending  func(previous, current *G) bool
-}
-
-var (
-	phaseGroupAccess = groupAccess[v1beta1.InstanceStatusPhaseGroup]{
-		indexes:    func(g *v1beta1.InstanceStatusPhaseGroup) string { return g.Indexes },
-		valueValid: func(g *v1beta1.InstanceStatusPhaseGroup) bool { return supportedPhase(g.Value) },
-		ascending:  func(p, c *v1beta1.InstanceStatusPhaseGroup) bool { return p.Value < c.Value },
-	}
-	revisionGroupAccess = groupAccess[v1beta1.InstanceStatusRevisionGroup]{
-		indexes:    func(g *v1beta1.InstanceStatusRevisionGroup) string { return g.Indexes },
-		valueValid: func(g *v1beta1.InstanceStatusRevisionGroup) bool { return g.Value != "" },
-		ascending:  func(p, c *v1beta1.InstanceStatusRevisionGroup) bool { return p.Value < c.Value },
-	}
-	incarnationGroupAccess = groupAccess[v1beta1.InstanceStatusIncarnationGroup]{
-		indexes:    func(g *v1beta1.InstanceStatusIncarnationGroup) string { return g.Indexes },
-		valueValid: func(g *v1beta1.InstanceStatusIncarnationGroup) bool { return g.Value != 0 },
-		ascending:  func(p, c *v1beta1.InstanceStatusIncarnationGroup) bool { return p.Value < c.Value },
-	}
-	countGroupAccess = groupAccess[v1beta1.InstanceStatusCountGroup]{
-		indexes:    func(g *v1beta1.InstanceStatusCountGroup) string { return g.Indexes },
-		valueValid: func(g *v1beta1.InstanceStatusCountGroup) bool { return g.Value > 0 },
-		ascending:  func(p, c *v1beta1.InstanceStatusCountGroup) bool { return p.Value < c.Value },
-	}
-)
-
-// validateGroupColumn checks one grouped column: a bounded group count,
-// values inside their domain in strictly ascending canonical order, each
-// index set canonical, bounded by and contained in members, the groups
-// pairwise disjoint, and, for a required column, exact coverage of members.
-// An absent optional column is valid; an explicitly empty one is not.
-func validateGroupColumn[G any](groups []G, members indexSet, required bool, access groupAccess[G]) ([]indexSet, error) {
-	n := members.Cardinality()
-	if len(groups) == 0 {
-		switch {
-		case required:
-			return nil, newCodecError(ErrorReasonCoverage)
-		case groups != nil:
-			return nil, newCodecError(ErrorReasonValueDomain)
-		default:
-			return nil, nil
-		}
-	}
-	if uint64(len(groups)) > n {
-		return nil, newCodecError(ErrorReasonCardinalityLimit)
-	}
-
-	sets := make([]indexSet, len(groups))
-	var covered uint64
-	for i := range groups {
-		group := &groups[i]
-		if !access.valueValid(group) {
-			return nil, newCodecError(ErrorReasonValueDomain)
-		}
-		if i > 0 && !access.ascending(&groups[i-1], group) {
-			return nil, newCodecError(ErrorReasonCanonicalOrder)
-		}
-		set, err := parseIndexSet(access.indexes(group), n)
-		if err != nil {
-			return nil, err
-		}
-		if !set.IsSubsetOf(members) {
-			return nil, newCodecError(ErrorReasonCoverage)
-		}
-		covered += set.Cardinality()
-		if covered > n {
-			return nil, newCodecError(ErrorReasonCoverage)
-		}
-		sets[i] = set
-	}
-	if required && covered != n {
-		return nil, newCodecError(ErrorReasonCoverage)
-	}
-	if !disjointIndexSets(sets) {
-		return nil, newCodecError(ErrorReasonCoverage)
-	}
-	return sets, nil
 }
 
 func validateOptionalIndexSet(raw *string, members indexSet) (*indexSet, error) {
@@ -285,33 +182,8 @@ func (p *decodePlan) expand(columns *v1beta1.InstanceStatusColumns) []v1beta1.OM
 		return &rows[rank]
 	}
 
-	for i, set := range p.phases {
-		value := columns.Phases[i].Value
-		set.forEach(func(index int32) { rowAt(index).Phase = value })
-	}
-	for i, set := range p.runningRevisions {
-		value := columns.RunningRevisions[i].Value
-		set.forEach(func(index int32) { rowAt(index).RunningRevision = value })
-	}
-	for i, set := range p.targetRevisions {
-		value := columns.TargetRevisions[i].Value
-		set.forEach(func(index int32) { rowAt(index).TargetRevision = value })
-	}
-	for i, set := range p.incarnations {
-		value := columns.Incarnations[i].Value
-		set.forEach(func(index int32) { rowAt(index).Incarnation = value })
-	}
-	for i, set := range p.podCounts {
-		value := columns.PodCounts[i].Value
-		set.forEach(func(index int32) { rowAt(index).PodCount = value })
-	}
-	for i, set := range p.servingPodCounts {
-		value := columns.ServingPodCounts[i].Value
-		set.forEach(func(index int32) { rowAt(index).ServingPodCount = value })
-	}
-	for i, set := range p.availablePodCounts {
-		value := columns.AvailablePodCounts[i].Value
-		set.forEach(func(index int32) { rowAt(index).AvailablePodCount = value })
+	for i, column := range groupedColumns {
+		column.expand(columns, p.groups[i], rowAt)
 	}
 	if p.admitted != nil {
 		p.admitted.forEach(func(index int32) { rowAt(index).Admitted = true })

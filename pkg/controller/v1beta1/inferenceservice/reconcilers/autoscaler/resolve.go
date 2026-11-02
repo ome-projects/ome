@@ -236,53 +236,20 @@ func isvcAutoscaler(isvc *v1beta1.InferenceService, component v1beta1.ComponentT
 	if isvc == nil {
 		return nil
 	}
-	switch component {
-	case v1beta1.EngineComponent:
-		if isvc.Spec.Engine == nil {
-			return nil
-		}
-		return isvc.Spec.Engine.ComponentExtensionSpec.Autoscaler
-	case v1beta1.DecoderComponent:
-		if isvc.Spec.Decoder == nil {
-			return nil
-		}
-		return isvc.Spec.Decoder.ComponentExtensionSpec.Autoscaler
-	case v1beta1.RouterComponent:
-		if isvc.Spec.Router == nil {
-			return nil
-		}
-		return isvc.Spec.Router.ComponentExtensionSpec.Autoscaler
-	default:
-		return nil
+	if view := v1beta1.SpecOf(&isvc.Spec, component); view != nil {
+		return view.Extension.Autoscaler
 	}
+	return nil
 }
 
 // runtimeAutoscaler dereferences the Component-level Autoscaler block
 // on the resolved ServingRuntimeSpec. Returns nil when the runtime, the
 // Component config, or the Autoscaler field is unset.
 func runtimeAutoscaler(runtime *v1beta1.ServingRuntimeSpec, component v1beta1.ComponentType) *v1beta1.ComponentAutoscaler {
-	if runtime == nil {
-		return nil
+	if piece := v1beta1.PieceOf(runtime, component); piece != nil {
+		return piece.Extension.Autoscaler
 	}
-	switch component {
-	case v1beta1.EngineComponent:
-		if runtime.EngineConfig == nil {
-			return nil
-		}
-		return runtime.EngineConfig.ComponentExtensionSpec.Autoscaler
-	case v1beta1.DecoderComponent:
-		if runtime.DecoderConfig == nil {
-			return nil
-		}
-		return runtime.DecoderConfig.ComponentExtensionSpec.Autoscaler
-	case v1beta1.RouterComponent:
-		if runtime.RouterConfig == nil {
-			return nil
-		}
-		return runtime.RouterConfig.ComponentExtensionSpec.Autoscaler
-	default:
-		return nil
-	}
+	return nil
 }
 
 // defaultAutoscaler returns the universal default ComponentAutoscaler.

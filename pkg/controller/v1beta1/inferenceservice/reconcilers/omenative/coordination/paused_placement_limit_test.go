@@ -8,10 +8,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // A placement surge pause holds a replica's workload at its placement
@@ -93,10 +93,10 @@ func TestEvaluateUpdateGate_BatchStepCountsThePausedPlacementLimit(t *testing.T)
 					engine := batchMemberFixture{desired: 11, step: "10%", surge: "10%", strategy: s.strategy, promoted: 10}
 					decoder := batchMemberFixture{desired: 12, step: "10%", surge: "10%", strategy: s.strategy, promoted: 12}
 					isvc := batchService(batchGroupFixture{}, map[v1beta1.ComponentType]batchMemberFixture{eng: engine, dec: decoder})
-					c := fake.NewClientBuilder().WithScheme(pairingScheme(t)).WithObjects(
+					c := fakeclient.New(t, fakeclient.WithObjects(
 						batchReplica(eng, engine),
 						withPlacementLimit(batchReplica(dec, decoder), 22, 12, pause),
-					).Build()
+					))
 					allowed, gate, reason := batchGateWith(t, isvc, c, eng, s.mechanism, 0, r.defaults)
 					if pause && !allowed {
 						t.Fatalf("the prefill side waits (gate %q, reason %q), but the paused decoder already serves every Instance it can run", gate, reason)

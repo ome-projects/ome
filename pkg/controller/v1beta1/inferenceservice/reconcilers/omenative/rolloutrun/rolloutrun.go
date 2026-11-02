@@ -618,15 +618,10 @@ func groupStaged(isvc *v1beta1.InferenceService, resolved []coordination.Resolve
 }
 
 // primaryPhase is the rollout phase of the canary group's primary Component
-// (router > engine > decoder among the group's members — the step machine's
-// Component).
+// (rollout.PrimaryOf — the step machine's Component).
 func primaryPhase(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) v1beta1.RolloutPhase {
-	for _, c := range []v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.EngineComponent, v1beta1.DecoderComponent} {
-		for _, gc := range g.Components {
-			if gc == c {
-				return isvc.Status.Components[c].RolloutPhase
-			}
-		}
+	if p := rollout.PrimaryOf(g); p != "" {
+		return isvc.Status.Components[p].RolloutPhase
 	}
 	return ""
 }

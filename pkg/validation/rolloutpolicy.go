@@ -6,6 +6,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
 
 // ReasonRolloutPolicyInvalid is the admission rejection reason for a
@@ -36,27 +37,17 @@ func ValidateRolloutPolicySpec(spec *v1beta1.RolloutPolicySpec) error {
 	if spec == nil {
 		return fmt.Errorf("spec must not be empty (%s)", ReasonRolloutPolicyInvalid)
 	}
-	set := 0
-	if spec.Canary != nil {
-		set++
-	}
-	if spec.BlueGreen != nil {
-		set++
-	}
-	if spec.RollingUpdate != nil {
-		set++
-	}
 	// Value-level mirror of the CRD's exactly-one CEL rule, for callers that
 	// bypass schema validation.
-	if set != 1 {
-		return fmt.Errorf("spec must set exactly one of canary, blueGreen, or rollingUpdate; got %d (%s)", set, ReasonRolloutPolicyInvalid)
+	bodies := rolloutpolicy.ProgressionBodies(spec.Canary, spec.BlueGreen, spec.RollingUpdate)
+	if len(bodies) != 1 {
+		return fmt.Errorf("spec must set exactly one of canary, blueGreen, or rollingUpdate; got %d (%s)", len(bodies), ReasonRolloutPolicyInvalid)
 	}
-
-	switch {
-	case spec.Canary != nil:
-		return validateRolloutPolicyCanary(spec.Canary)
-	case spec.RollingUpdate != nil:
-		return validateRolloutPolicyRollingUpdate(spec.RollingUpdate)
+	switch body := bodies[0].Body.(type) {
+	case *v1beta1.GroupCanary:
+		return validateRolloutPolicyCanary(body)
+	case *v1beta1.GroupRollingUpdate:
+		return validateRolloutPolicyRollingUpdate(body)
 	}
 	// blueGreen carries no fields today.
 	return nil

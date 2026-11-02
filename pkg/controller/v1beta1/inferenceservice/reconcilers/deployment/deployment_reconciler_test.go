@@ -836,3 +836,88 @@ func TestReconcileReplicaOwnership(t *testing.T) {
 		assert.Equal(t, int32(5), *stored.Spec.Replicas)
 	})
 }
+
+// A new Deployment starts at minReplicas whatever the class; no scaler has
+// written a count before the Deployment exists.
+func TestReconcile_CreateStartsAtMinReplicasForEveryClass(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, appsv1.AddToScheme(scheme))
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container", Image: "test-image:latest"}}}
+	componentMeta := metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"}
+	minReplicas := 4
+
+	for _, as := range []*v1beta1.ComponentAutoscaler{
+		nil,
+		{Class: v1beta1.AutoscalerNone},
+		{Class: v1beta1.AutoscalerHPA},
+		{Class: v1beta1.AutoscalerKEDA},
+		{Class: v1beta1.AutoscalerExternal},
+	} {
+		name := "nil"
+		if as != nil {
+			name = string(as.Class)
+		}
+		t.Run(name, func(t *testing.T) {
+			componentExt := &v1beta1.ComponentExtensionSpec{MinReplicas: &minReplicas, MaxReplicas: 8}
+			cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+			reconciler := NewDeploymentReconciler(cl, scheme, componentMeta, componentExt, podSpec.DeepCopy(), as)
+
+			_, err := reconciler.Reconcile()
+			assert.NoError(t, err)
+
+			stored := &appsv1.Deployment{}
+			assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: componentMeta.Name, Namespace: componentMeta.Namespace}, stored))
+			if assert.NotNil(t, stored.Spec.Replicas) {
+				assert.Equal(t, int32(4), *stored.Spec.Replicas)
+			}
+		})
+	}
+}
+
+// Without a positive minReplicas a new Deployment leaves spec.replicas unset
+// and takes the apiserver default.
+func TestReconcile_CreateWithoutPositiveMinReplicasLeavesReplicasUnset(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, appsv1.AddToScheme(scheme))
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container", Image: "test-image:latest"}}}
+	componentMeta := metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"}
+	zero := 0
+
+	for _, ext := range []*v1beta1.ComponentExtensionSpec{{}, {MinReplicas: &zero, MaxReplicas: 3}} {
+		cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+		reconciler := NewDeploymentReconciler(cl, scheme, componentMeta, ext, podSpec.DeepCopy(),
+			&v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerKEDA})
+		_, err := reconciler.Reconcile()
+		assert.NoError(t, err)
+		stored := &appsv1.Deployment{}
+		assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: componentMeta.Name, Namespace: componentMeta.Namespace}, stored))
+		assert.Nil(t, stored.Spec.Replicas)
+	}
+}
+
+// After create, a scaler-owned class keeps the live count even when it sits
+// below minReplicas; the scaler, not the controller, moves it.
+func TestReconcile_ExternalClassUpdateKeepsLiveCountBelowMinReplicas(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, appsv1.AddToScheme(scheme))
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "test-container", Image: "test-image:latest"}}}
+	componentMeta := metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"}
+	minReplicas := 4
+	componentExt := &v1beta1.ComponentExtensionSpec{MinReplicas: &minReplicas, MaxReplicas: 8}
+	existing := createRawDeployment(componentMeta, componentExt, podSpec.DeepCopy())
+	existing.Spec.Replicas = ptr.Int32(2)
+	existing.Spec.Template.Spec.Containers[0].Image = "old-image:latest"
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+
+	reconciler := NewDeploymentReconciler(cl, scheme, componentMeta, componentExt, podSpec.DeepCopy(),
+		&v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerExternal})
+	_, err := reconciler.Reconcile()
+	assert.NoError(t, err)
+
+	stored := &appsv1.Deployment{}
+	assert.NoError(t, cl.Get(context.TODO(), types.NamespacedName{Name: componentMeta.Name, Namespace: componentMeta.Namespace}, stored))
+	assert.Equal(t, "test-image:latest", stored.Spec.Template.Spec.Containers[0].Image)
+	if assert.NotNil(t, stored.Spec.Replicas) {
+		assert.Equal(t, int32(2), *stored.Spec.Replicas)
+	}
+}

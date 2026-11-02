@@ -305,6 +305,7 @@ type UpdateStrategyDefaultsConfig struct {
 	Router  *ComponentUpdateStrategyDefaults `json:"router,omitempty"`
 	Engine  *ComponentUpdateStrategyDefaults `json:"engine,omitempty"`
 	Decoder *ComponentUpdateStrategyDefaults `json:"decoder,omitempty"`
+	Encoder *ComponentUpdateStrategyDefaults `json:"encoder,omitempty"`
 }
 
 // ComponentUpdateStrategyDefaults carries one component's per-pod-swap
@@ -339,6 +340,8 @@ func (c *UpdateStrategyDefaultsConfig) ForComponent(component workloadtypes.Comp
 		return c.Engine
 	case workloadtypes.ComponentDecoder:
 		return c.Decoder
+	case workloadtypes.ComponentEncoder:
+		return c.Encoder
 	default:
 		return nil
 	}
@@ -354,7 +357,7 @@ func (c *UpdateStrategyDefaultsConfig) validate() error {
 	for _, entry := range []struct {
 		name  string
 		value *ComponentUpdateStrategyDefaults
-	}{{"router", c.Router}, {"engine", c.Engine}, {"decoder", c.Decoder}} {
+	}{{"router", c.Router}, {"engine", c.Engine}, {"decoder", c.Decoder}, {"encoder", c.Encoder}} {
 		if entry.value == nil {
 			continue
 		}
@@ -415,6 +418,7 @@ type ReplicasDefaultsConfig struct {
 type ComponentMaxReplicasDefaults struct {
 	Engine  *int `json:"engine,omitempty"`
 	Decoder *int `json:"decoder,omitempty"`
+	Encoder *int `json:"encoder,omitempty"`
 	Router  *int `json:"router,omitempty"`
 }
 
@@ -427,31 +431,25 @@ func (c *ReplicasDefaultsConfig) Min() *int {
 	return c.DefaultMinReplicas
 }
 
-// EngineMax returns the configured engine maxReplicas default; nil
-// (including a nil receiver) means unconfigured.
-func (c *ReplicasDefaultsConfig) EngineMax() *int {
+// MaxFor returns the configured maxReplicas default of a component; nil
+// (including a nil receiver, or a component with no entry) means
+// unconfigured.
+func (c *ReplicasDefaultsConfig) MaxFor(component workloadtypes.ComponentType) *int {
 	if c == nil {
 		return nil
 	}
-	return c.DefaultMaxReplicas.Engine
-}
-
-// DecoderMax returns the configured decoder maxReplicas default; nil
-// (including a nil receiver) means unconfigured.
-func (c *ReplicasDefaultsConfig) DecoderMax() *int {
-	if c == nil {
+	switch component {
+	case workloadtypes.ComponentEngine:
+		return c.DefaultMaxReplicas.Engine
+	case workloadtypes.ComponentDecoder:
+		return c.DefaultMaxReplicas.Decoder
+	case workloadtypes.ComponentEncoder:
+		return c.DefaultMaxReplicas.Encoder
+	case workloadtypes.ComponentRouter:
+		return c.DefaultMaxReplicas.Router
+	default:
 		return nil
 	}
-	return c.DefaultMaxReplicas.Decoder
-}
-
-// RouterMax returns the configured router maxReplicas default; nil
-// (including a nil receiver) means unconfigured.
-func (c *ReplicasDefaultsConfig) RouterMax() *int {
-	if c == nil {
-		return nil
-	}
-	return c.DefaultMaxReplicas.Router
 }
 
 // validate rejects non-positive configured values. A replica default of
@@ -465,6 +463,7 @@ func (c *ReplicasDefaultsConfig) validate() error {
 		{"defaultMinReplicas", c.DefaultMinReplicas},
 		{"defaultMaxReplicas.engine", c.DefaultMaxReplicas.Engine},
 		{"defaultMaxReplicas.decoder", c.DefaultMaxReplicas.Decoder},
+		{"defaultMaxReplicas.encoder", c.DefaultMaxReplicas.Encoder},
 		{"defaultMaxReplicas.router", c.DefaultMaxReplicas.Router},
 	}
 	for _, f := range fields {
@@ -564,10 +563,24 @@ type LifecycleConfig struct {
 	// UnschedulableGracePeriod is how long a pod may carry
 	// PodScheduled=False/Unschedulable before its Instance is failed as
 	// environment-caused. A duration string ("10m"), measured from the
-	// condition's last transition. There is intentionally NO in-code
-	// default: absence means the escalation does not exist and an
-	// unplaceable pod only parks the InstanceReadyTimeout clock.
+	// condition's last transition, or from the attempt's placement wait when
+	// that began earlier (a pod name the attempt needs was held by a node
+	// that stopped reporting). There is intentionally NO in-code default:
+	// absence means the escalation does not exist and an unplaceable pod
+	// only parks the InstanceReadyTimeout clock.
 	UnschedulableGracePeriod string `json:"unschedulableGracePeriod,omitempty"`
+	// GangDomainFullGracePeriod is the shorter grace for an unschedulable
+	// gang member when the scheduler reports that the gang is held to the
+	// topology domain where its other members run and that domain cannot
+	// take it. More capacity elsewhere does not free such a gang, so the
+	// attempt can end sooner than UnschedulableGracePeriod and be rebuilt.
+	// A duration string ("5m"), measured from the same start as
+	// UnschedulableGracePeriod, so a member rebuilt after a node loss can
+	// end the attempt on its first refusal. The shorter of the two applies,
+	// and UnschedulableGracePeriod alone applies while a pod of the attempt
+	// is still terminating. There is intentionally NO in-code default:
+	// absence leaves such a hold on UnschedulableGracePeriod.
+	GangDomainFullGracePeriod string `json:"gangDomainFullGracePeriod,omitempty"`
 	// AbandonedReplacementGracePeriod is the termination grace a rollout
 	// gives a replacement pod it abandons before the pod ever entered the
 	// serving rotation (a surge replacement superseded by a newer revision,
@@ -1044,6 +1057,24 @@ func (c *LifecycleConfig) ToUnschedulableGracePeriod() (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("invalid lifecycle.unschedulableGracePeriod: must be > 0, got %s", d)
+	}
+	return d, nil
+}
+
+// ToGangDomainFullGracePeriod validates and parses GangDomainFullGracePeriod.
+// A nil receiver or absent key is NOT an error — it means a gang held to
+// a full domain waits on UnschedulableGracePeriod like any other hold,
+// which the caller distinguishes from invalid by the returned zero value.
+func (c *LifecycleConfig) ToGangDomainFullGracePeriod() (time.Duration, error) {
+	if c == nil || c.GangDomainFullGracePeriod == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.GangDomainFullGracePeriod)
+	if err != nil {
+		return 0, fmt.Errorf("invalid lifecycle.gangDomainFullGracePeriod %q: %w", c.GangDomainFullGracePeriod, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid lifecycle.gangDomainFullGracePeriod: must be > 0, got %s", d)
 	}
 	return d, nil
 }

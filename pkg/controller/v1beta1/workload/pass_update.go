@@ -31,8 +31,15 @@ func executeUpdatePass(ctx context.Context, deps types.Deps, input types.Reconci
 	// First StartingFresh denial this pass (Budget or UpdateGate), for
 	// RecordRolloutHold — one Component has one hold slot, so the first
 	// denial found (selection order) wins, matching the gate stack's own
-	// first-denial-wins precedence.
+	// first-denial-wins precedence, except a Held answer (heldDenial).
 	var firstDenial *types.RolloutHold
+	// heldDenial is the pass's first denial under the Held gate: the
+	// coordination gate's answer that the roll is held as a whole until a
+	// corrected revision or an operator release. It is the Component's
+	// hold whichever start was denied first: every start of this side
+	// waits on it, and a budget wait whose slot frees only through a held
+	// start has no way out of its own.
+	var heldDenial *types.RolloutHold
 	// anyUpdateRan tracks whether ANY Update call fired this pass,
 	// including one that returned done=true: even a done Update mutates
 	// the row. Create must not run on an ObservedState an Update just
@@ -90,6 +97,9 @@ func executeUpdatePass(ctx context.Context, deps types.Deps, input types.Reconci
 				if firstDenial == nil {
 					firstDenial = denial
 				}
+				if heldDenial == nil && denial.Gate == types.RolloutHoldGateHeld {
+					heldDenial = denial
+				}
 				// A stopped attempt (step Parked) names the wait its next
 				// attempt stands behind; a denial here is that wait once the
 				// retry schedule admits.
@@ -113,6 +123,9 @@ func executeUpdatePass(ctx context.Context, deps types.Deps, input types.Reconci
 		if !done {
 			anyUpdating = true
 		}
+	}
+	if heldDenial != nil {
+		firstDenial = heldDenial
 	}
 	// A start the target's RetryBlock denied at the trigger stage never
 	// reached the admission above; the block is the denial it stands on,
@@ -226,8 +239,26 @@ func (a *updateAdmission) fromRevision(item UpdateItem) string {
 	return ""
 }
 
-func (a *updateAdmission) surge() bool {
-	return a.selection.Strategy == types.UpdateStrategySurgeThenDrain
+// surgeStart reports whether item's start adds a pod beside the ones it
+// replaces: the per-Component budget it answers to, surge or
+// unavailability, follows the mechanism the start runs on, not the
+// Component's strategy, since a surge strategy rebuilds an Instance that
+// never ran a revision in place.
+func (a *updateAdmission) surgeStart(item UpdateItem) bool {
+	return a.mechanism(item) == types.UpdateStrategySurgeThenDrain
+}
+
+// rebuildOfANeverPromotedInstance reports whether item's start rebuilds
+// in place an Instance that never ran a revision: its create failed, and
+// the pod it left waiting on its image is what keeps the row out of the
+// create pass. The start takes nothing out of service and adds no pod, so
+// neither per-Component budget projects it; it is charged as in flight so
+// the starts after it in the pass project against it. A promoted Instance
+// whose set crashed is not one: its rebuild spends the unavailability
+// budget like any drain-first start.
+func (a *updateAdmission) rebuildOfANeverPromotedInstance(item UpdateItem) bool {
+	row := a.observed.Instance(item.Instance.Index)
+	return !a.surgeStart(item) && row != nil && row.RunningRevision == "" && row.Phase == types.InstancePhaseFailed
 }
 
 // admit reports whether item may start this pass. The per-Component
@@ -235,7 +266,9 @@ func (a *updateAdmission) surge() bool {
 // must allow; the first denial is returned as the hold that produced
 // it, so the caller can report which layer is holding the Component.
 // Both layers project (prior + this pass + 1) against their budget, the
-// way the coordination group budget is projected.
+// way the coordination group budget is projected. Which budget a start
+// answers to follows the mechanism it runs on, and a rebuild in place of
+// an Instance that never ran a revision is projected on neither.
 func (a *updateAdmission) admit(ctx context.Context, plan types.ComponentPlan, item UpdateItem) (bool, *types.RolloutHold) {
 	// The plan gate is asked for every start, the ones that skip the
 	// capacity consult included: a start that takes nothing further out of
@@ -245,7 +278,11 @@ func (a *updateAdmission) admit(ctx context.Context, plan types.ComponentPlan, i
 		return false, hold
 	}
 	rolled := int32(len(a.selection.RolledNotServing))
-	if a.surge() {
+	switch {
+	case a.rebuildOfANeverPromotedInstance(item):
+		// Nothing to project: the start adds no pod and takes nothing out
+		// of service. The charge below still counts it for the pass.
+	case a.surgeStart(item):
 		// An extra pod still listed holds a slot: a Terminating one inside
 		// its grace, a live one until a start on its Instance evicts it.
 		// The hold names them so the wait reads as the pods'.
@@ -257,11 +294,13 @@ func (a *updateAdmission) admit(ctx context.Context, plan types.ComponentPlan, i
 				Target: a.target.Name,
 			}
 		}
-	} else if projected, denied := escalation.BudgetDenies(a.selection.UnavailBudget, a.selection.PriorUnavailInFlight+rolled+a.downOutsideRollBeside(item), a.inFlightUnavail); denied {
-		return false, &types.RolloutHold{
-			Gate:   types.RolloutHoldGateBudget,
-			Reason: fmt.Sprintf("per-Component unavailability budget %d exhausted (would become %d)%s", a.selection.UnavailBudget, projected, types.InstancesNotServingClause(a.selection.RolledNotServing, a.target.Name)),
-			Target: a.target.Name,
+	default:
+		if projected, denied := escalation.BudgetDenies(a.selection.UnavailBudget, a.selection.PriorUnavailInFlight+rolled+a.downOutsideRollBeside(item), a.inFlightUnavail); denied {
+			return false, &types.RolloutHold{
+				Gate:   types.RolloutHoldGateBudget,
+				Reason: fmt.Sprintf("per-Component unavailability budget %d exhausted (would become %d)%s", a.selection.UnavailBudget, projected, types.InstancesNotServingClause(a.selection.RolledNotServing, a.target.Name)),
+				Target: a.target.Name,
+			}
 		}
 	}
 	// A CoordGateExempt start skips the capacity consult: the gate already
@@ -485,9 +524,11 @@ func (a *updateAdmission) extraPodClause() string {
 
 // charge counts a fresh start the pass opened, so every later consult
 // projects against it. A surge start on an Instance whose live extra
-// pods hold slots takes those slots over.
+// pods hold slots takes those slots over; every other start, the rebuild
+// of a never-promoted Instance included, counts on the unavailability
+// budget.
 func (a *updateAdmission) charge(item UpdateItem) {
-	if a.surge() {
+	if a.surgeStart(item) {
 		a.inFlightSurge++
 		a.replacedExtraSlots += a.selection.ExtraPodSurge.LiveSlotsByInstance[item.Instance.Index]
 		return

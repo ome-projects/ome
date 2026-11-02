@@ -313,6 +313,9 @@ func (t *Trace) operation(op *types.InstanceOperation) string {
 	if op.RetryCount != 0 {
 		parts = append(parts, "retryCount="+fmt.Sprint(op.RetryCount))
 	}
+	if op.PlacementWaitSince != nil {
+		parts = append(parts, "placementWaitSince="+t.norm.atMeta(op.PlacementWaitSince))
+	}
 	parts = append(parts,
 		"started="+t.norm.at(op.StartedAt.Time),
 		"lastProgressAt="+t.norm.at(op.LastProgressAt.Time),

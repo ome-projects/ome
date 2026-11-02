@@ -15,7 +15,7 @@ const (
 )
 
 // Name builds the revision's metadata.name from the source runtime's
-// scope, namespace, name, plus the 8-char content hash. All revisions
+// scope, namespace, name, plus the short content hash. All revisions
 // live in the OME system namespace; the prefix and embedded
 // source-namespace prevent collisions between
 //
@@ -35,12 +35,13 @@ func Name(kind SourceKind, sourceNamespace, runtimeName, shortHash string) strin
 
 // MatchesRuntime reports whether revName conforms to the naming
 // convention for a revision of the given (kind, sourceNamespace,
-// runtimeName). Used by the ISVC admission validator to reject pins
-// that obviously can't refer to the named runtime, without an API call.
+// runtimeName). Used by the ISVC admission validator to reject a
+// spec.runtime.revision that obviously can't refer to the named runtime,
+// without an API call.
 //
-// Validates the prefix shape and that the trailing 8 characters are
-// lowercase hex. Does NOT confirm existence — that's deferred to
-// reconcile.
+// Validates the prefix shape and that the trailing shortHashLength
+// characters are lowercase hex. Does NOT confirm existence — that's
+// deferred to reconcile.
 func MatchesRuntime(revName string, kind SourceKind, sourceNamespace, runtimeName string) bool {
 	var prefix string
 	switch kind {
@@ -55,13 +56,13 @@ func MatchesRuntime(revName string, kind SourceKind, sourceNamespace, runtimeNam
 		return false
 	}
 	suffix := revName[len(prefix):]
-	if len(suffix) != 8 {
-		return false
-	}
-	for _, c := range suffix {
-		isDigit := c >= '0' && c <= '9'
-		isHexLower := c >= 'a' && c <= 'f'
-		if !isDigit && !isHexLower {
+	return len(suffix) == shortHashLength && isLowerHex(suffix)
+}
+
+// isLowerHex reports whether every character of s is a lowercase hex digit.
+func isLowerHex(s string) bool {
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}

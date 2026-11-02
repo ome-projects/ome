@@ -1136,7 +1136,7 @@ func TestGetFormatMismatchReason(t *testing.T) {
 // +optional in the CRD). A missing Min must behave as "no lower bound" and
 // a missing Max as "no upper bound" — never a panic. Each row is driven
 // through all three call sites that read both pointers:
-// GetCompatibilityDetails, checkModelSize (via IsCompatible), and
+// GetCompatibilityDetails, the size check (via IsCompatible), and
 // calculateSizeScore (via CompareRuntimes).
 func TestModelSizeRangePartialBounds(t *testing.T) {
 	tests := []struct {
@@ -1231,7 +1231,7 @@ func TestModelSizeRangePartialBounds(t *testing.T) {
 				assert.Equal(t, tt.want, report.MatchDetails.SizeMatch, "GetCompatibilityDetails SizeMatch")
 			})
 
-			// Site 2: checkModelSize, reached through IsCompatible (matcher.go ~470-471).
+			// Site 2: the size check, reached through IsCompatible.
 			assert.NotPanics(t, func() {
 				ok, err := matcher.IsCompatible(runtime, model, isvc, "rt")
 				assert.NoError(t, err)

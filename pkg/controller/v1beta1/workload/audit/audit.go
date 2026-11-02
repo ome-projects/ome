@@ -120,6 +120,20 @@ func (e Entry) CompletedAtTime() (time.Time, bool) {
 	return parseTime(e.CompletedAt)
 }
 
+// Terminal reports whether the row records finished work, Completed or
+// Failed. A terminal row is history: it dedups a re-delivered request
+// and is never resumed.
+func (e Entry) Terminal() bool {
+	return e.Phase == PhaseCompleted || e.Phase == PhaseFailed
+}
+
+// InFlight reports whether the row records work still being driven, a
+// Started row. UpsertEntry keeps one row per request UUID, so a Started
+// row is in flight by itself.
+func (e Entry) InFlight() bool {
+	return e.Phase == PhaseStarted
+}
+
 // Ledger is the in-memory shape of the audit ConfigMap's history.json
 // payload.
 type Ledger struct {
@@ -210,7 +224,7 @@ func (l *Ledger) HasCompletedOrFailedRequest(uuid string) bool {
 		if e.RequestUUID != uuid || e.Reason == ReasonForceDelete {
 			continue
 		}
-		if e.Phase == PhaseCompleted || e.Phase == PhaseFailed {
+		if e.Terminal() {
 			return true
 		}
 	}
@@ -229,7 +243,7 @@ func (l *Ledger) InFlightEntry(uuid string) *Entry {
 		if l.Entries[i].RequestUUID != uuid {
 			continue
 		}
-		if l.Entries[i].Phase == PhaseStarted {
+		if l.Entries[i].InFlight() {
 			e := l.Entries[i]
 			return &e
 		}
@@ -280,7 +294,7 @@ func (l *Ledger) UpsertEntry(entry Entry) {
 func (l *Ledger) trim() {
 	var terminal []int
 	for i, e := range l.Entries {
-		if e.Phase == PhaseCompleted || e.Phase == PhaseFailed {
+		if e.Terminal() {
 			terminal = append(terminal, i)
 		}
 	}
@@ -513,18 +527,17 @@ func ValidateCapacity(policy *types.MigrationAuditPolicy, records []types.Migrat
 }
 
 // parseTime parses the RFC3339-formatted StartedAt / CompletedAt strings
-// the audit ledger uses. Returns (zero, false) on parse error so the
-// caller can choose to skip rather than treat a malformed timestamp as
-// "very old" or "very recent".
+// the audit ledger uses; the layout also accepts fractional seconds when
+// parsing. Returns (zero, false) on parse error so the caller can choose
+// to skip rather than treat a malformed timestamp as "very old" or "very
+// recent".
 func parseTime(raw string) (time.Time, bool) {
 	if raw == "" {
 		return time.Time{}, false
 	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return t, true
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false
 	}
-	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
-		return t, true
-	}
-	return time.Time{}, false
+	return t, true
 }

@@ -28,6 +28,68 @@ func unschedulableGraceElapsed(since metav1.Time, now time.Time, grace time.Dura
 	return now.Sub(since.Time) > grace
 }
 
+// schedulerHoldGrace is the grace a scheduler hold is measured against.
+// When the scheduler keeps a gang in the topology domain where some of its
+// members run and that domain cannot take the rest, more capacity
+// elsewhere does not help: only removing the placed members frees the
+// gang, and ending the attempt does that. Such a hold takes the operator's
+// full-domain grace when that one is shorter, unless a pod of the attempt
+// is still terminating: a member on its way out may be what fills the
+// domain, and its room frees as it goes.
+func schedulerHoldGrace(input types.ReconcileInput, message string, pods []*corev1.Pod) time.Duration {
+	grace, domainGrace := input.UnschedulableGrace, input.GangDomainFullGrace
+	if domainGrace <= 0 || !types.SchedulerReportsGangDomainFull(message) || anyPodTerminating(pods) {
+		return grace
+	}
+	if grace > 0 && grace < domainGrace {
+		return grace
+	}
+	return domainGrace
+}
+
+// anyPodTerminating reports whether any pod is being deleted.
+func anyPodTerminating(pods []*corev1.Pod) bool {
+	for _, pod := range pods {
+		if pod != nil && pod.DeletionTimestamp != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// schedulerHoldSince is the moment a scheduler hold is measured from:
+// the attempt's placement wait when the operation records one that began
+// earlier, else the unplaceable pod's own PodScheduled transition. The
+// attempt's moment spans the members of a gang, so a member placed and
+// another then unplaceable is one wait, not two. An operation written
+// before the moment existed records none and is measured as before.
+//
+// So is a gang surge replacement whose source reads Failed at the drain
+// step in statuses, the rows the pass read at its start
+// (drainSourceEnded). The moment such a row carries belongs to the attempt
+// that ended. The update pass may open the next attempt in this same pass,
+// before the escalation runs, and that attempt waits on its own clock.
+func schedulerHoldSince(statuses []types.InstanceStatus, row types.InstanceStatus, podSince metav1.Time) metav1.Time {
+	op := row.Operation
+	if op == nil || op.PlacementWaitSince == nil || drainSourceEnded(statuses, row) {
+		return podSince
+	}
+	if podSince.IsZero() || op.PlacementWaitSince.Before(&podSince) {
+		return *op.PlacementWaitSince
+	}
+	return podSince
+}
+
+// drainSourceEnded reports whether replacement is the row of a gang surge
+// replacement whose source reads Failed at the drain step: the ending was
+// written on the source alone, and the replacement's row stays live. The
+// hold pass reads the pair the same way: it records no placement wait on
+// such a row and retires one the row still carries.
+func drainSourceEnded(statuses []types.InstanceStatus, replacement types.InstanceStatus) bool {
+	source := gangSurgeSourceOf(statuses, replacement, types.UpdateStepSurgeDrain)
+	return source != nil && source.Phase == types.InstancePhaseFailed
+}
+
 // unschedulableFailureMessage is the operator-facing summary of a
 // scheduler hold: the grep-stable token plus the scheduler's own
 // explanation of which constraint had no placement.

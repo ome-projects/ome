@@ -9,6 +9,7 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
@@ -134,7 +135,7 @@ func evEngineReplicasUpPD24(_ *v1beta1.InferenceService, in *ReconcileInputs) {
 	in.DesiredReplicas = 26
 }
 
-// expectProjectedPartition reads the partition the projector would stamp on
+// expectProjectedPartition reads the partition the projector would write on
 // a member scaled to desired.
 func expectProjectedPartition(t *testing.T, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, desired, want int32) {
 	t.Helper()
@@ -212,9 +213,9 @@ func rollbackReleasesThePartition(t *testing.T, isvc *v1beta1.InferenceService) 
 	expectProjectedPartition(t, isvc, v1beta1.DecoderComponent, pd24Decoders, 0)
 }
 
-// A stop is announced once, on the pass that records it, and the message
+// A stop is reported once, on the pass that records it, and the message
 // says how far each member's roll had come and what ends the hold.
-func TestParkFailed_AnnouncesTheHeldRollOnce(t *testing.T) {
+func TestParkFailed_ReportsTheHeldRollOnce(t *testing.T) {
 	isvc, in := fixtureStagingFinalPD24(t)
 	rec := record.NewFakeRecorder(8)
 	in.Recorder = rec
@@ -227,7 +228,7 @@ func TestParkFailed_AnnouncesTheHeldRollOnce(t *testing.T) {
 		}
 	}
 	if len(held) != 1 {
-		t.Fatalf("the stop must be announced once, got %v", held)
+		t.Fatalf("the stop must be reported once, got %v", held)
 	}
 	for _, want := range []string{
 		"engine canary stopped at step 3 (CapacityTimeout)",
@@ -237,14 +238,14 @@ func TestParkFailed_AnnouncesTheHeldRollOnce(t *testing.T) {
 		constants.RolloutRollbackAnnotation, constants.RolloutResumeAnnotation,
 	} {
 		if !strings.Contains(held[0], want) {
-			t.Errorf("the announcement must say %q, got %q", want, held[0])
+			t.Errorf("the report must say %q, got %q", want, held[0])
 		}
 	}
 	in.Now = in.Now.Add(time.Minute)
 	mustReconcile(t, isvc, in)
 	for len(rec.Events) > 0 {
 		if ev := <-rec.Events; strings.Contains(ev, EventReasonCanaryRollHeld) {
-			t.Fatalf("a stopped unit announces nothing again, got %q", ev)
+			t.Fatalf("a stopped unit reports nothing again, got %q", ev)
 		}
 	}
 }

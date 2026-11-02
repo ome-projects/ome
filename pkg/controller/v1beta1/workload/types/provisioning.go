@@ -36,12 +36,6 @@ type Provisioner interface {
 	Pending(ctx context.Context, input ReconcileInput, plan ComponentPlan, inst InstancePlan, runner RunnerPlan, ordinal int32) (message string, pending bool, err error)
 }
 
-// OperationCapacityProvisioning reports whether an operation is parked on
-// the provisioning hold's waiting token.
-func OperationCapacityProvisioning(op *InstanceOperation) bool {
-	return op != nil && op.Waiting == WaitingReasonCapacityProvisioning
-}
-
 // CapacityProvisioningTermination is the evidence record for the hold:
 // the pod withheld, the provisioner's explanation, and when that
 // explanation was first seen.

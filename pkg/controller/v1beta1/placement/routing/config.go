@@ -73,23 +73,18 @@ func (c Config) Validate() error {
 	if err := c.Probe.Validate(); err != nil {
 		return &configValidationError{section: "probe", err: err}
 	}
-	if c.Probe.IsEnabled() && c.Probe.Period < c.Observer.MinPeriod {
-		return &configValidationError{section: "probe", err: fmt.Errorf(
-			"routing.probe.period (%s) must be at least routing.observer.minPeriod (%s)",
-			c.Probe.Period, c.Observer.MinPeriod)}
+	if c.Probe.IsEnabled() {
+		if err := c.Observer.probeLimits(c.Probe); err != nil {
+			return &configValidationError{section: "probe", err: err}
+		}
 	}
 	if err := c.Capacity.Validate(); err != nil {
 		return &configValidationError{section: "capacity", err: err}
 	}
-	if c.Capacity.IsEnabled() && c.Capacity.Period < c.Observer.MinPeriod {
-		return &configValidationError{section: "capacity", err: fmt.Errorf(
-			"routing.capacity.period (%s) must be at least routing.observer.minPeriod (%s)",
-			c.Capacity.Period, c.Observer.MinPeriod)}
-	}
-	if c.Capacity.IsEnabled() && c.Capacity.samples() > c.Observer.MaxSamples {
-		return &configValidationError{section: "capacity", err: fmt.Errorf(
-			"routing.capacity.samples (%d) must not exceed routing.observer.maxSamples (%d)",
-			c.Capacity.samples(), c.Observer.MaxSamples)}
+	if c.Capacity.IsEnabled() {
+		if err := c.Observer.capacityLimits(c.Capacity); err != nil {
+			return &configValidationError{section: "capacity", err: err}
+		}
 	}
 	if c.Publisher.ResyncInterval <= 0 {
 		return &configValidationError{section: "publisher", err: fmt.Errorf(
@@ -139,6 +134,95 @@ func (c ObserverConfig) Validate() error {
 	return nil
 }
 
+// probeLimits rejects an enabled probe that polls faster than the observer's
+// minimum period. A limit that is not set bounds nothing.
+func (c ObserverConfig) probeLimits(probe ProbeConfig) error {
+	if c.MinPeriod > 0 && probe.Period < c.MinPeriod {
+		return fmt.Errorf("routing.probe.period (%s) must be at least routing.observer.minPeriod (%s)",
+			probe.Period, c.MinPeriod)
+	}
+	return nil
+}
+
+// capacityLimits rejects an enabled capacity source that polls faster than the
+// observer's minimum period or keeps a longer window than its maximum. A limit
+// that is not set bounds nothing.
+func (c ObserverConfig) capacityLimits(capacity CapacityConfig) error {
+	if c.MinPeriod > 0 && capacity.Period < c.MinPeriod {
+		return fmt.Errorf("routing.capacity.period (%s) must be at least routing.observer.minPeriod (%s)",
+			capacity.Period, c.MinPeriod)
+	}
+	if c.MaxSamples > 0 && capacity.samples() > c.MaxSamples {
+		return fmt.Errorf("routing.capacity.samples (%d) must not exceed routing.observer.maxSamples (%d)",
+			capacity.samples(), c.MaxSamples)
+	}
+	return nil
+}
+
+// httpPoll is the request a probe or capacity block repeats against each
+// cluster: its path, method and cadence. The two blocks check it by the same
+// rules under their own config key.
+type httpPoll struct {
+	key     string
+	path    string
+	method  string
+	period  time.Duration
+	timeout time.Duration
+}
+
+// validatePath rejects a path that does not begin with "/".
+func (h httpPoll) validatePath() error {
+	if h.path[0] != '/' {
+		return fmt.Errorf("%s.path %q must begin with %q", h.key, h.path, "/")
+	}
+	return nil
+}
+
+// validateMethodSet rejects an empty method: the load a request puts on a
+// cluster is always an explicit choice, never a default.
+func (h httpPoll) validateMethodSet() error {
+	if h.method == "" {
+		return fmt.Errorf("%s.method is required when %s.path is set", h.key, h.key)
+	}
+	return nil
+}
+
+// validateMethodAllowed rejects a method other than GET, HEAD or POST.
+func (h httpPoll) validateMethodAllowed() error {
+	switch h.method {
+	case "GET", "HEAD", "POST":
+		return nil
+	}
+	return fmt.Errorf("%s.method %q must be GET, HEAD, or POST", h.key, h.method)
+}
+
+// validateCadence rejects a non-positive period or timeout, and a timeout that
+// reaches the next request: requests to a slow cluster would overlap and pile
+// up, and the real rate would stop matching the configured period.
+func (h httpPoll) validateCadence() error {
+	if h.period <= 0 {
+		return fmt.Errorf("%s.period must be positive when %s.path is set", h.key, h.key)
+	}
+	if h.timeout <= 0 {
+		return fmt.Errorf("%s.timeout must be positive when %s.path is set", h.key, h.key)
+	}
+	if h.timeout >= h.period {
+		return fmt.Errorf("%s.timeout (%s) must be shorter than %s.period (%s)",
+			h.key, h.timeout, h.key, h.period)
+	}
+	return nil
+}
+
+// firstError runs the checks in order and returns the first error.
+func firstError(checks ...func() error) error {
+	for _, check := range checks {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // PublisherConfig selects one compiled-in TrafficMap publisher backend.
 //
 // +kubebuilder:object:generate=false
@@ -164,7 +248,7 @@ func (c PublisherConfig) IsEnabled() bool {
 }
 
 // ProbeConfig configures the active end-to-end probe of each cluster's
-// externally-addressable endpoint — the URL a client uses, so the verdict
+// externally-addressable endpoint — the URL a client uses, so the outcome
 // covers the whole serving path rather than pod readiness inside the cluster.
 //
 // Every field is operator-supplied with no in-code default. An unconfigured
@@ -222,7 +306,7 @@ type ProbeConfig struct {
 	// crossed the probe failure threshold. PreserveTraffic ignores only the probe
 	// gates and recomputes from ready capacity; Drain preserves the all-zero result
 	// so the publisher removes every route arm. It has no effect while any cluster is
-	// passing or has no conclusive verdict.
+	// passing or has no conclusive outcome.
 	AllFailedPolicy AllFailedPolicy
 }
 
@@ -248,17 +332,25 @@ func (p ProbeConfig) Validate() error {
 	if !p.IsEnabled() {
 		return nil
 	}
-	if p.Path[0] != '/' {
-		return fmt.Errorf("routing.probe.path %q must begin with %q", p.Path, "/")
-	}
-	if p.Method == "" {
-		return fmt.Errorf("routing.probe.method is required when routing.probe.path is set")
-	}
-	switch p.Method {
-	case "GET", "HEAD", "POST":
-	default:
-		return fmt.Errorf("routing.probe.method %q must be GET, HEAD, or POST", p.Method)
-	}
+	poll := p.httpPoll()
+	return firstError(
+		poll.validatePath,
+		poll.validateMethodSet,
+		poll.validateMethodAllowed,
+		p.validateStatusLists,
+		poll.validateCadence,
+		p.validateThresholds,
+		p.validateAllFailedPolicy,
+	)
+}
+
+func (p ProbeConfig) httpPoll() httpPoll {
+	return httpPoll{key: "routing.probe", path: p.Path, method: p.Method, period: p.Period, timeout: p.Timeout}
+}
+
+// validateStatusLists requires both status lists, with valid HTTP codes, no
+// code in both, and none of 401, 403 and 429 as a gate code.
+func (p ProbeConfig) validateStatusLists() error {
 	if len(p.AcceptStatuses) == 0 {
 		return fmt.Errorf("routing.probe.acceptStatuses is required when routing.probe.path is set")
 	}
@@ -285,64 +377,61 @@ func (p ProbeConfig) Validate() error {
 			}
 		}
 	}
-	if p.Period <= 0 {
-		return fmt.Errorf("routing.probe.period must be positive when routing.probe.path is set")
-	}
-	if p.Timeout <= 0 {
-		return fmt.Errorf("routing.probe.timeout must be positive when routing.probe.path is set")
-	}
-	if p.Timeout >= p.Period {
-		// Otherwise a slow cluster's probes overlap and pile up, and the effective
-		// probe rate silently stops matching the configured period.
-		return fmt.Errorf("routing.probe.timeout (%s) must be shorter than routing.probe.period (%s)",
-			p.Timeout, p.Period)
-	}
+	return nil
+}
+
+// validateThresholds requires a positive failure and success threshold.
+func (p ProbeConfig) validateThresholds() error {
 	if p.FailureThreshold <= 0 {
 		return fmt.Errorf("routing.probe.failureThreshold must be positive when routing.probe.path is set")
 	}
 	if p.SuccessThreshold <= 0 {
 		return fmt.Errorf("routing.probe.successThreshold must be positive when routing.probe.path is set")
 	}
-	switch p.AllFailedPolicy {
-	case AllFailedPolicyPreserveTraffic, AllFailedPolicyDrain:
-	default:
-		return fmt.Errorf("routing.probe.allFailedPolicy %q must be %q or %q when routing.probe.path is set",
-			p.AllFailedPolicy, AllFailedPolicyPreserveTraffic, AllFailedPolicyDrain)
-	}
 	return nil
 }
 
-// Verdict classifies one probe outcome against the configured status policy.
-type Verdict int
+// validateAllFailedPolicy requires one of the two known policies.
+func (p ProbeConfig) validateAllFailedPolicy() error {
+	switch p.AllFailedPolicy {
+	case AllFailedPolicyPreserveTraffic, AllFailedPolicyDrain:
+		return nil
+	}
+	return fmt.Errorf("routing.probe.allFailedPolicy %q must be %q or %q when routing.probe.path is set",
+		p.AllFailedPolicy, AllFailedPolicyPreserveTraffic, AllFailedPolicyDrain)
+}
+
+// ProbeOutcome classifies one probe response against the configured status policy.
+type ProbeOutcome int
 
 const (
-	// VerdictInconclusive leaves the gate and the failure count untouched. It
+	// ProbeOutcomeInconclusive leaves the gate and the failure count untouched. It
 	// covers a status in neither list — 429 (alive but overloaded), 401/403 (the
 	// prober's credentials, not the cluster's health) — and the probe that could
 	// not run at all. That last case is uniform across clusters, so counting it as
 	// failure would zero the whole fleet at once.
-	VerdictInconclusive Verdict = iota
+	ProbeOutcomeInconclusive ProbeOutcome = iota
 
-	// VerdictPass counts toward restoring a gated cluster.
-	VerdictPass
+	// ProbeOutcomePass counts toward restoring a gated cluster.
+	ProbeOutcomePass
 
-	// VerdictFail counts toward gating a cluster.
-	VerdictFail
+	// ProbeOutcomeFail counts toward gating a cluster.
+	ProbeOutcomeFail
 )
 
 // ClassifyStatus maps an HTTP status onto the configured policy.
-func (p ProbeConfig) ClassifyStatus(code int) Verdict {
+func (p ProbeConfig) ClassifyStatus(code int) ProbeOutcome {
 	for _, s := range p.AcceptStatuses {
 		if s == code {
-			return VerdictPass
+			return ProbeOutcomePass
 		}
 	}
 	for _, s := range p.GateStatuses {
 		if s == code {
-			return VerdictFail
+			return ProbeOutcomeFail
 		}
 	}
-	return VerdictInconclusive
+	return ProbeOutcomeInconclusive
 }
 
 // CapacityConfig configures polling a cluster for its replica ceiling or weight.
@@ -426,39 +515,52 @@ func (c CapacityConfig) resolvedFormat() CapacityFormat {
 // Validate rejects a partially-configured capacity source, for the same reason
 // the probe does: half-configured reads as enabled while behaving arbitrarily.
 func (c CapacityConfig) Validate() error {
+	if err := c.validateMode(); err != nil {
+		return err
+	}
+	if !c.IsEnabled() {
+		return nil
+	}
+	poll := c.httpPoll()
+	return firstError(
+		poll.validatePath,
+		poll.validateMethodSet,
+		c.validateFormatSet,
+		poll.validateMethodAllowed,
+		poll.validateCadence,
+		c.validateWindow,
+		c.validateFormat,
+	)
+}
+
+func (c CapacityConfig) httpPoll() httpPoll {
+	return httpPoll{key: "routing.capacity", path: c.Path, method: c.Method, period: c.Period, timeout: c.Timeout}
+}
+
+// validateMode requires a known mode, and polling for Reported mode, whether or
+// not the source is enabled.
+func (c CapacityConfig) validateMode() error {
 	if c.Mode != "" && c.Mode != v1beta1.RoutingCapacityModeCeiling && c.Mode != v1beta1.RoutingCapacityModeReported {
 		return fmt.Errorf("routing.capacity.mode %q must be Ceiling or Reported", c.Mode)
 	}
 	if c.Mode == v1beta1.RoutingCapacityModeReported && !c.IsEnabled() {
 		return fmt.Errorf("routing.capacity.mode Reported requires capacity polling")
 	}
-	if !c.IsEnabled() {
-		return nil
-	}
-	if c.Path[0] != '/' {
-		return fmt.Errorf("routing.capacity.path %q must begin with %q", c.Path, "/")
-	}
-	if c.Method == "" {
-		return fmt.Errorf("routing.capacity.method is required when routing.capacity.path is set")
-	}
+	return nil
+}
+
+// validateFormatSet requires a response format once polling is on.
+func (c CapacityConfig) validateFormatSet() error {
 	if c.Format == "" {
 		return fmt.Errorf("routing.capacity.format is required when routing.capacity.path is set")
 	}
-	switch c.Method {
-	case "GET", "HEAD", "POST":
-	default:
-		return fmt.Errorf("routing.capacity.method %q must be GET, HEAD, or POST", c.Method)
-	}
-	if c.Period <= 0 {
-		return fmt.Errorf("routing.capacity.period must be positive when routing.capacity.path is set")
-	}
-	if c.Timeout <= 0 {
-		return fmt.Errorf("routing.capacity.timeout must be positive when routing.capacity.path is set")
-	}
-	if c.Timeout >= c.Period {
-		return fmt.Errorf("routing.capacity.timeout (%s) must be shorter than routing.capacity.period (%s)",
-			c.Timeout, c.Period)
-	}
+	return nil
+}
+
+// validateWindow requires a positive age bound, window and quorum, a quorum
+// the window can reach, and an age bound that outlives the polls the quorum
+// needs.
+func (c CapacityConfig) validateWindow() error {
 	if c.MaxAge <= 0 {
 		// Without a bound the staleness guard cannot fire, and a frozen reporter
 		// would pin a cluster's ceiling indefinitely.
@@ -489,6 +591,12 @@ func (c CapacityConfig) Validate() error {
 		return fmt.Errorf("routing.capacity.maxAge (%s) must be at least routing.capacity.period (%s)",
 			c.MaxAge, c.Period)
 	}
+	return nil
+}
+
+// validateFormat requires a format this build carries and lets the format
+// check its own options.
+func (c CapacityConfig) validateFormat() error {
 	name := c.resolvedFormat()
 	plugin, ok := lookupCapacityFormat(name)
 	if !ok {

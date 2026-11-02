@@ -51,36 +51,20 @@ func (r *AcceleratorClassReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Handle deletion. Finalizer writes race with the Node-watch fan-out and
-	// this controller's own status patches, so optimistic-lock conflicts are a
-	// normal outcome — requeue instead of surfacing an error.
 	if !ac.DeletionTimestamp.IsZero() {
 		if controllerutil.ContainsFinalizer(ac, constants.AcceleratorClassFinalizer) {
 			controllerutil.RemoveFinalizer(ac, constants.AcceleratorClassFinalizer)
 			if err := r.Update(ctx, ac); err != nil {
-				if errors.IsNotFound(err) {
-					return ctrl.Result{}, nil
-				}
-				if errors.IsConflict(err) {
-					return ctrl.Result{Requeue: true}, nil
-				}
-				return ctrl.Result{}, err
+				return finalizerWriteResult(err)
 			}
 		}
 		return ctrl.Result{}, nil
 	}
 
-	// Ensure finalizer present
 	if !controllerutil.ContainsFinalizer(ac, constants.AcceleratorClassFinalizer) {
 		controllerutil.AddFinalizer(ac, constants.AcceleratorClassFinalizer)
 		if err := r.Update(ctx, ac); err != nil {
-			if errors.IsNotFound(err) {
-				return ctrl.Result{}, nil
-			}
-			if errors.IsConflict(err) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, err
+			return finalizerWriteResult(err)
 		}
 	}
 
@@ -118,14 +102,30 @@ func (r *AcceleratorClassReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if !acceleratorClassStatusEqualIgnoreTime(latest.Status, desired.Status) {
 		desired.Status.LastUpdated = metav1.Now()
 		if err := r.Status().Patch(ctx, desired, client.MergeFrom(latest)); err != nil {
-			if errors.IsConflict(err) {
-				return ctrl.Result{Requeue: true}, nil
-			}
-			return ctrl.Result{}, err
+			return requeueOnConflict(err)
 		}
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// requeueOnConflict turns a write error into the pass's result. Writes race
+// with the Node-watch fan-out and this controller's own status patches, so a
+// resourceVersion conflict requeues the pass. Any other error is returned.
+func requeueOnConflict(err error) (ctrl.Result, error) {
+	if errors.IsConflict(err) {
+		return ctrl.Result{Requeue: true}, nil
+	}
+	return ctrl.Result{}, err
+}
+
+// finalizerWriteResult ends the pass when the class is already deleted and
+// otherwise applies the conflict rule.
+func finalizerWriteResult(err error) (ctrl.Result, error) {
+	if errors.IsNotFound(err) {
+		return ctrl.Result{}, nil
+	}
+	return requeueOnConflict(err)
 }
 
 // SetupWithManager wires the controller and watches nodes to trigger reconciles

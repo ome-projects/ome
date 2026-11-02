@@ -317,7 +317,7 @@ func (m *migrationPass) resumePair(ctx context.Context) (bool, error) {
 
 // admitFreshRequest takes a record that has no surge yet through the
 // admission phases, in order: refuse a source that cannot move, wait for
-// a steady source, name the node to leave, judge the request against the
+// a steady source, name the node to leave, check the request against the
 // migration caps, check the overlay before any row is written, allocate
 // the surge and write the record, write the pair's rows, record the
 // acceptance. A record with a surge index was admitted on an earlier
@@ -405,12 +405,12 @@ func (m *migrationPass) resolveNodeToLeave(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// admitUnderCapacity judges the request against the operator's migration
+// admitUnderCapacity checks the request against the operator's migration
 // caps over the owner's records: moves in flight (a surge allocated, the
 // record not terminal) and moves allocated inside the trailing window,
 // this request's own record excluded; queued Accepted records hold
 // nothing and are not counted. With no caps configured there is no
-// bound to judge against, so the request waits without taking the pair,
+// bound to check against, so the request waits without taking the pair,
 // and the pass asks for a requeue because the operator writing the key
 // raises no event the controller watches. A request over a cap is
 // refused.

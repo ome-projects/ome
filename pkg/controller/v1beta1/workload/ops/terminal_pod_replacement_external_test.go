@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // A terminal pod occupies its stable name, so the owning operation must
@@ -59,16 +60,9 @@ func evictedPod(pod *corev1.Pod) *corev1.Pod {
 	return pod
 }
 
+// drainEvents is RecordedEvents under the name the create tests call.
 func drainEvents(rec *record.FakeRecorder) []string {
-	var events []string
-	for {
-		select {
-		case e := <-rec.Events:
-			events = append(events, e)
-		default:
-			return events
-		}
-	}
+	return fakeclient.RecordedEvents(rec)
 }
 
 func podExists(c client.Client, pod *corev1.Pod) bool {
@@ -125,7 +119,7 @@ func TestCreate_RecyclesTerminalPodThenRecreates(t *testing.T) {
 	if s.LastFailure == nil || s.LastFailure.PodName != dead.Name || s.LastFailure.Reason != admissionRejectReason {
 		t.Fatalf("LastFailure must carry the dead pod's admission reason, got %+v", s.LastFailure)
 	}
-	events := drainEvents(rec)
+	events := fakeclient.RecordedEvents(rec)
 	found := false
 	for _, e := range events {
 		if strings.Contains(e, string(workload.EventReasonTerminalPodRecycled)) && strings.Contains(e, dead.Name) {

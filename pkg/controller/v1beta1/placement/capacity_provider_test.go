@@ -14,7 +14,6 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	kueuev1beta2 "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
@@ -26,6 +25,7 @@ import (
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 	quotacapacity "sigs.k8s.io/ome/pkg/quota/capacity"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 type capacityProviderFixture struct {
@@ -72,13 +72,15 @@ func newCapacityProviderFixture(t *testing.T) *capacityProviderFixture {
 		registration := wc(name, true, nil)
 		f.clusters = append(f.clusters, registration)
 		objects = append(objects, registration.DeepCopy())
-		worker := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(capacityMemberObjects(name, []int64{2, 4, 2}[i], []int64{16, 16, 0}[i], now)...).WithInterceptorFuncs(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*v1beta1.InferenceService); ok {
-				obj.SetUID(types.UID("derived-" + name))
-				obj.SetGeneration(1)
-			}
-			return c.Create(ctx, obj, opts...)
-		}}).Build()
+		worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}),
+			fakeclient.WithObjects(capacityMemberObjects(name, []int64{2, 4, 2}[i], []int64{16, 16, 0}[i], now)...),
+			fakeclient.WithInterceptors(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				if _, ok := obj.(*v1beta1.InferenceService); ok {
+					obj.SetUID(types.UID("derived-" + name))
+					obj.SetGeneration(1)
+				}
+				return c.Create(ctx, obj, opts...)
+			}}))
 		f.workers[name] = worker
 		connections.m[name] = workloadcluster.NewNeverCachingClient(worker)
 	}
@@ -210,7 +212,7 @@ func TestCapacityProviderRejectsChangesDuringRead(t *testing.T) {
 	for _, change := range []string{"runtime", "registration", "source read error"} {
 		t.Run(change, func(t *testing.T) {
 			f := newCapacityProviderFixture(t)
-			f.r.APIReader = interceptor.NewClient(f.r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			f.r.APIReader = fakeclient.Wrap(t, f.r.Client.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 				if err := cl.Get(ctx, key, obj, opts...); err != nil {
 					return err
 				}
@@ -235,7 +237,7 @@ func TestCapacityProviderRejectsChangesDuringRead(t *testing.T) {
 				default:
 					return errors.New("fleet report unavailable")
 				}
-			}})
+			}}))
 			got, err := f.r.readSplitCapacity(t.Context(), f.source, f.clusters, f.clock.Now())
 			if err == nil {
 				t.Fatal("unverified inputs returned capacity")

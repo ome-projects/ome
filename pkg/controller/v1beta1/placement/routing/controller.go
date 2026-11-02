@@ -2,11 +2,13 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -37,6 +39,10 @@ import (
 
 const trafficMapRoutableStatusFieldOwner = "ome-trafficmap-routing"
 
+// reportedCapacityNotReadyReason explains a Reported-mode cluster whose accepted
+// positive report is not applied because placement observes no ready replicas on it.
+const reportedCapacityNotReadyReason = "reported capacity is not applied: placement observes no ready replicas on this cluster"
+
 // +kubebuilder:rbac:groups=ome.io,resources=inferenceservices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ome.io,resources=trafficmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=ome.io,resources=trafficmaps/status,verbs=get;update;patch
@@ -63,8 +69,9 @@ type Reconciler struct {
 	// Prober optionally gates capacity on end-to-end reachability. Nil or
 	// disabled leaves the selected capacity mode as the health source.
 	Prober *Prober
-	// Capacity supplies endpoint ceilings or weights. A missing report uses
-	// replica counts in Ceiling mode and zero weight in Reported mode.
+	// Capacity supplies endpoint ceilings or weights. A cluster without a usable
+	// report weighs its replica count, and so does a Reported cluster whose
+	// positive report waits for a ready replica.
 	Capacity *CapacityPoller
 }
 
@@ -111,9 +118,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	overrides, err := trafficdrain.FromAnnotations(isvc.Annotations)
 	if err != nil {
-		// Preserve the last valid map if malformed intent reaches storage;
-		// treating it as absent could restore traffic during a drain.
-		return ctrl.Result{}, fmt.Errorf("parse %s: %w", constants.TrafficDrainAnnotation, err)
+		// Keep the last valid map: treating malformed intent as absent could restore
+		// traffic during a drain. No admission webhook checks the value on the control
+		// plane, so OverrideActive on an existing map reports the parse error.
+		parseErr := fmt.Errorf("parse %s: %w", constants.TrafficDrainAnnotation, err)
+		if statusErr := r.setInvalidOverrideStatus(ctx, isvc, parseErr); statusErr != nil {
+			return ctrl.Result{}, errors.Join(parseErr, statusErr)
+		}
+		return ctrl.Result{}, parseErr
 	}
 
 	probePolicy, err := ResolveProbePolicy(r.Config, &isvc.Spec)
@@ -362,6 +374,62 @@ func (r *Reconciler) setRoutingStatus(ctx context.Context, isvc *v1beta1.Inferen
 		return r.Status().Apply(ctx, trafficMapRoutingStatusApply(tm),
 			client.FieldOwner(trafficMapRoutableStatusFieldOwner), client.ForceOwnership)
 	})
+}
+
+// setInvalidOverrideStatus reports an unparsable traffic-drain annotation on the
+// existing map. Only OverrideActive changes: the spec and the other routing
+// conditions still describe the last valid pass.
+func (r *Reconciler) setInvalidOverrideStatus(ctx context.Context, isvc *v1beta1.InferenceService, cause error) error {
+	key := types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		tm := &v1beta1.TrafficMap{}
+		if err := r.APIReader.Get(ctx, key, tm); err != nil {
+			// No map yet: the error is only in the controller log.
+			return client.IgnoreNotFound(err)
+		}
+		if !placementcontroller.TrafficMapHasExactController(tm, isvc) {
+			return nil
+		}
+		if err := validateTrafficMapSourceUID(tm, isvc); err != nil {
+			return err
+		}
+		cond := metav1.Condition{
+			Type:               v1beta1.TrafficMapOverrideActive,
+			Status:             metav1.ConditionUnknown,
+			Reason:             v1beta1.TrafficMapReasonOverridesInvalid,
+			Message:            invalidOverrideMessage(cause),
+			ObservedGeneration: tm.Generation,
+		}
+		if current := apimeta.FindStatusCondition(tm.Status.Conditions, cond.Type); current != nil &&
+			current.Status == cond.Status && current.Reason == cond.Reason &&
+			current.Message == cond.Message && current.ObservedGeneration == cond.ObservedGeneration {
+			return nil
+		}
+		tm.Status.SourceUID = isvc.UID
+		apimeta.SetStatusCondition(&tm.Status.Conditions, cond)
+		return r.Status().Apply(ctx, trafficMapRoutingStatusApply(tm),
+			client.FieldOwner(trafficMapRoutableStatusFieldOwner), client.ForceOwnership)
+	})
+}
+
+// maxConditionMessageBytes is the TrafficMap CRD's limit on a condition message.
+const maxConditionMessageBytes = 32768
+
+// invalidOverrideMessage fits the parse error under the message limit. The
+// parser quotes override IDs and field names, which an annotation can make
+// longer than the limit.
+func invalidOverrideMessage(cause error) string {
+	const kept = "; the last valid route table is kept until the annotation is fixed"
+	const cut = "..."
+	text := cause.Error()
+	if room := maxConditionMessageBytes - len(kept); len(text) > room {
+		end := room - len(cut)
+		for end > 0 && !utf8.RuneStart(text[end]) {
+			end--
+		}
+		text = text[:end] + cut
+	}
+	return text + kept
 }
 
 func trafficMapRoutingStatusApply(trafficMap *v1beta1.TrafficMap) runtime.ApplyConfiguration {
@@ -649,7 +717,18 @@ func buildSpec(
 		}
 		if useReportedWeight {
 			clusters[i].Mode = v1beta1.RoutingCapacityModeReported
-			if reported != nil {
+			switch {
+			case reported == nil:
+				// Without an accepted report the cluster weighs its replica count.
+			case c.ReadyReplicas <= 0 && *reported > 0:
+				// A gateway can forward the poll to routers that are not ready, so a
+				// positive report needs a ready replica in placement status. A zero
+				// report adds no weight or health, so it always applies.
+				if capacityFallbackReasons[i] == "" {
+					// The fallback count skips this reason, so a failed poll keeps its own.
+					capacityFallbackReasons[i] = reportedCapacityNotReadyReason
+				}
+			default:
 				quantity, err := resource.ParseQuantity(strconv.FormatFloat(*reported, 'f', -1, 64))
 				if err == nil {
 					clusters[i].ReportedWeight = &quantity

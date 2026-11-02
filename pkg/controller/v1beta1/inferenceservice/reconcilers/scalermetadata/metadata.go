@@ -1,7 +1,8 @@
 package scalermetadata
 
 import (
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 
 	"sigs.k8s.io/ome/pkg/constants"
@@ -16,8 +17,8 @@ type propagatedKeys struct {
 // removed user controls can converge without disturbing metadata injected by
 // Kubernetes or another controller.
 func Track(labels, annotations map[string]string) (map[string]string, map[string]string) {
-	trackedLabels := cloneMap(labels)
-	trackedAnnotations := cloneMap(annotations)
+	trackedLabels := maps.Clone(labels)
+	trackedAnnotations := maps.Clone(annotations)
 	if trackedAnnotations == nil {
 		trackedAnnotations = map[string]string{}
 	}
@@ -38,18 +39,18 @@ func Contains(existingLabels, existingAnnotations, desiredLabels, desiredAnnotat
 // Merge overlays desired managed metadata onto the live maps, removes tracked
 // keys omitted from the desired set, and preserves untracked live metadata.
 func Merge(existingLabels, existingAnnotations, desiredLabels, desiredAnnotations map[string]string) (map[string]string, map[string]string) {
-	mergedLabels := cloneMap(existingLabels)
-	mergedAnnotations := cloneMap(existingAnnotations)
+	mergedLabels := maps.Clone(existingLabels)
+	mergedAnnotations := maps.Clone(existingAnnotations)
 	previous := decode(existingAnnotations[constants.AutoscalerPropagatedMetadataKeys])
 	desired := decode(desiredAnnotations[constants.AutoscalerPropagatedMetadataKeys])
 
 	for _, key := range previous.labels {
-		if !contains(desired.labels, key) {
+		if !slices.Contains(desired.labels, key) {
 			delete(mergedLabels, key)
 		}
 	}
 	for _, key := range previous.annotations {
-		if !contains(desired.annotations, key) {
+		if !slices.Contains(desired.annotations, key) {
 			delete(mergedAnnotations, key)
 		}
 	}
@@ -69,14 +70,8 @@ func Merge(existingLabels, existingAnnotations, desiredLabels, desiredAnnotation
 }
 
 func sortedKeys(values map[string]string, excluded string) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		if key != excluded {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
-	return keys
+	keys := slices.Sorted(maps.Keys(values))
+	return slices.DeleteFunc(keys, func(key string) bool { return key == excluded })
 }
 
 func encode(keys propagatedKeys) string {
@@ -108,24 +103,4 @@ func mapContains(existing, desired map[string]string) bool {
 		}
 	}
 	return true
-}
-
-func contains(values []string, wanted string) bool {
-	for _, value := range values {
-		if value == wanted {
-			return true
-		}
-	}
-	return false
-}
-
-func cloneMap(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
 }

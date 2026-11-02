@@ -58,8 +58,8 @@ func TestName_AndWatches(t *testing.T) {
 	if !ok {
 		t.Fatalf("Watches returned %T", w)
 	}
-	if got := u.GroupVersionKind(); got != drGVK {
-		t.Fatalf("Watches GVK = %v, want %v", got, drGVK)
+	if got := u.GroupVersionKind(); got != PolicyGVK {
+		t.Fatalf("Watches GVK = %v, want %v", got, PolicyGVK)
 	}
 }
 
@@ -108,7 +108,7 @@ func TestTranslate_HostAndMetadata(t *testing.T) {
 	if u.GetName() != "isvc" || u.GetNamespace() != "ns" {
 		t.Fatalf("name/ns = %q/%q", u.GetName(), u.GetNamespace())
 	}
-	if u.GroupVersionKind() != drGVK {
+	if u.GroupVersionKind() != PolicyGVK {
 		t.Fatalf("GVK = %v", u.GroupVersionKind())
 	}
 	if got := nestedString(t, u, "spec", "host"); got != "isvc.ns.svc.cluster.local" {
@@ -317,7 +317,7 @@ func TestTranslate_Determinism(t *testing.T) {
 
 func drWithConditions(conds []map[string]interface{}) *unstructured.Unstructured {
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(drGVK)
+	u.SetGroupVersionKind(PolicyGVK)
 	raw := make([]interface{}, 0, len(conds))
 	for _, c := range conds {
 		raw = append(raw, c)
@@ -351,7 +351,7 @@ func TestObserveAcceptance_Reconciled_False(t *testing.T) {
 
 func TestObserveAcceptance_NoStatus_IsPending(t *testing.T) {
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(drGVK)
+	u.SetGroupVersionKind(PolicyGVK)
 	got := New().ObserveAcceptance(u)
 	if got.State != traffic.AcceptancePending {
 		t.Fatalf("state = %d", got.State)

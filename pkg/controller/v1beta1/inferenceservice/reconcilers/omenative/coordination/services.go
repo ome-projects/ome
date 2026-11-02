@@ -151,16 +151,7 @@ func BuildPerRevisionRoutingService(isvc *v1beta1.InferenceService, component v1
 	labels := perRevisionServiceSelector(prefix, component, revisionHash)
 	selector := labels
 	if routing.LeaderOnly {
-		selector = make(map[string]string, len(labels)+2)
-		for k, v := range labels {
-			selector[k] = v
-		}
-		selector[query.LabelRunner] = string(v1beta1.RunnerNameLeader)
-		if routing.PodOrdinal {
-			// Ordinals are numbered per runner, so runner=leader is required
-			// alongside ordinal 0 to exclude worker ordinal 0.
-			selector[query.LabelPodOrdinal] = "0"
-		}
+		selector = query.LeaderRoutingSelector(labels, routing.PodOrdinal)
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{

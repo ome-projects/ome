@@ -47,7 +47,7 @@ func (g *GangPack) Permit(_ context.Context, state framework.CycleState, pod *v1
 	// members adopted as already bound, have arrived. Waiting pods are assumed in
 	// the scheduler snapshot, so combining a snapshot count with the waiting set
 	// would count them twice and open the gate early.
-	if !g.assignments.CommittedIf(gang.key, assignment.commitment) {
+	if !g.assignments.Committed(gang.key, assignment.commitment) {
 		gangGateTotal.WithLabelValues("wait").Inc()
 		return framework.NewStatus(framework.Wait), gang.timeout
 	}
@@ -125,15 +125,14 @@ func (g *GangPack) gateWaiters(gangKey string, pod *v1.Pod) []*v1.Pod {
 // (lister and handle available), so a caller can consume a one-shot record
 // only after the requeue happened.
 func (g *GangPack) activateGangMembers(gang gangInfo, trigger string, except ...*v1.Pod) bool {
-	lister, ok := g.podLister.(gangMemberLister)
-	if !ok || g.handle == nil {
+	if g.podLister == nil || g.handle == nil {
 		return false
 	}
 	ns, name, ok := splitGangKey(gang.key)
 	if !ok {
 		return false
 	}
-	pods, err := lister.gangPods(ns, name)
+	pods, err := g.podLister.gangPods(ns, name)
 	if err != nil {
 		return false
 	}
@@ -188,8 +187,7 @@ func (g *GangPack) clearTemplatesIncomplete(gang gangInfo) bool {
 // per record under the lock: a member marking its gang concurrently waits for
 // the lock, so a record for a gang that has just gained a pod is never dropped.
 func (g *GangPack) pruneTemplatesIncomplete() {
-	lister, ok := g.podLister.(gangMemberLister)
-	if !ok {
+	if g.podLister == nil {
 		return
 	}
 	g.templatesMu.Lock()
@@ -200,7 +198,7 @@ func (g *GangPack) pruneTemplatesIncomplete() {
 			delete(g.templatesIncomplete, key)
 			continue
 		}
-		if pods, err := lister.gangPods(ns, name); err == nil && len(pods) == 0 {
+		if pods, err := g.podLister.gangPods(ns, name); err == nil && len(pods) == 0 {
 			delete(g.templatesIncomplete, key)
 		}
 	}

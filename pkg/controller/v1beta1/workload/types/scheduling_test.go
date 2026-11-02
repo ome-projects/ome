@@ -83,6 +83,29 @@ func TestFirstUnschedulablePod(t *testing.T) {
 	}
 }
 
+// TestSchedulerReportsGangDomainFull: each report the gang-packing
+// scheduler plugin gives for a gang held to a domain that cannot take it
+// is recognized inside the scheduler's full message, and a plain capacity
+// shortage or an empty message is not.
+func TestSchedulerReportsGangDomainFull(t *testing.T) {
+	full := []string{
+		"0/8 nodes are available: domain domain-a cannot fit all remaining gang members ns/engine-0. preemption: not eligible",
+		"0/8 nodes are available: adopted domain domain-a cannot fit remaining gang members ns/engine-0.",
+		"0/8 nodes are available: domain domain-a has no node feasible for gang member ns/engine-0.",
+		"0/8 nodes are available: gang ns/engine-0 already has members in multiple topology domains.",
+	}
+	for _, message := range full {
+		if !SchedulerReportsGangDomainFull(message) {
+			t.Errorf("%q: got false want true", message)
+		}
+	}
+	for _, message := range []string{schedulerMessage, ""} {
+		if SchedulerReportsGangDomainFull(message) {
+			t.Errorf("%q: got true want false", message)
+		}
+	}
+}
+
 // TestPodAdmissionGated pins the gated-pod detector: a pod is "gated"
 // (queued for admission, e.g. by Kueue) iff it still carries a scheduling
 // gate. An un-gated or nil pod is not.
@@ -107,10 +130,10 @@ func TestPodAdmissionGated(t *testing.T) {
 // not run through it.
 func TestOperationExternallyHeld_AdmissionUnavailable(t *testing.T) {
 	op := &InstanceOperation{Type: InstanceOperationCreate, Waiting: RejectionReasonAdmissionUnavailable}
-	if !OperationAdmissionHeld(op) || !OperationExternallyHeld(op) {
-		t.Errorf("an admission wait must park the clock: admission=%v external=%v", OperationAdmissionHeld(op), OperationExternallyHeld(op))
+	if !OperationWaitingOn(op, RejectionReasonAdmissionUnavailable) || !OperationExternallyHeld(op) {
+		t.Errorf("an admission wait must park the clock: admission=%v external=%v", OperationWaitingOn(op, RejectionReasonAdmissionUnavailable), OperationExternallyHeld(op))
 	}
-	if OperationAdmissionHeld(&InstanceOperation{Type: InstanceOperationCreate}) {
+	if OperationWaitingOn(&InstanceOperation{Type: InstanceOperationCreate}, RejectionReasonAdmissionUnavailable) {
 		t.Error("an unheld operation must not read as an admission wait")
 	}
 }

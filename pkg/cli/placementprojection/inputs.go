@@ -8,6 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	validation "k8s.io/apimachinery/pkg/util/validation"
+
 	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	v "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 	"sigs.k8s.io/ome/pkg/cli/safetext"
@@ -26,7 +27,12 @@ func projectInputs(parent *ome.InferenceService) (v.PlacementInputs, labels.Sele
 			in.ModeEvidence = "Declared"
 		}
 		if p.Split != nil {
-			in.Split = &v.PlacementSplit{Replicas: pointerCount(p.Split.Replicas), Spread: "UnknownOrDefaultedPacked", MaxReplicasPerCluster: count(p.Split.MaxReplicasPerCluster, true), MinReplicasPerCluster: count(0, false)}
+			// The per-cluster cap reported is the primary component's: the engine, or the decoder when there is no engine.
+			primary := ome.EngineComponent
+			if parent.Spec.Engine == nil && parent.Spec.Decoder != nil {
+				primary = ome.DecoderComponent
+			}
+			in.Split = &v.PlacementSplit{Replicas: pointerCount(p.Split.Replicas), Spread: "UnknownOrDefaultedPacked", MaxReplicasPerCluster: count(p.Split.Ceiling(primary), true), MinReplicasPerCluster: count(0, false)}
 		}
 	}
 	in.Requirements = v.PlacementSelector{Present: requirements != "", State: "Absent"}

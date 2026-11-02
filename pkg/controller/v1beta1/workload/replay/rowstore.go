@@ -283,7 +283,9 @@ func (s *RowStore) ApplyInstanceMutationsWithRetryBlock(
 		errors.New("the object has been modified; please apply your changes to the latest version and try again"))
 }
 
-// applyBatch is one attempt at the batch against a fresh snapshot.
+// applyBatch is one attempt at the batch against a fresh snapshot: the
+// batch guards first, then each mutation against the working rows, then
+// the retry block, and the commits reported and called back in order.
 func (s *RowStore) applyBatch(
 	muts []types.InstanceMutation,
 	targetRevision string,
@@ -311,55 +313,21 @@ func (s *RowStore) applyBatch(
 		callback func(*types.InstanceStatus, *types.InstanceStatus)
 		record   RowCommit
 	}
-	next := CloneRows(s.rows)
+	next := batchRows(CloneRows(s.rows))
 	committed := make([]committedMutation, 0, len(muts))
 	var pending []RowCommit
 	for _, mutation := range muts {
-		position := -1
-		for i := range next {
-			if next[i].Index == mutation.Index {
-				position = i
-				break
-			}
-		}
+		var record RowCommit
+		var ok bool
 		if mutation.Remove {
-			if position < 0 {
-				pending = append(pending, RowCommit{Index: mutation.Index, Remove: true, Outcome: PreconditionNoChange})
-				continue
-			}
-			before := CloneRow(next[position])
-			if mutation.Precondition != nil && !mutation.Precondition(&before) {
-				pending = append(pending, RowCommit{Index: mutation.Index, Remove: true, Outcome: PreconditionRejected, Before: &before})
-				continue
-			}
-			next = append(next[:position], next[position+1:]...)
-			record := RowCommit{Index: mutation.Index, Remove: true, Outcome: PreconditionOK, Before: &before}
-			committed = append(committed, committedMutation{callback: mutation.OnCommit, record: record})
-			continue
-		}
-
-		status := types.InstanceStatus{Index: mutation.Index}
-		var before *types.InstanceStatus
-		if position >= 0 {
-			status = CloneRow(next[position])
-			copied := CloneRow(status)
-			before = &copied
-		}
-		if mutation.Precondition != nil && !mutation.Precondition(&status) {
-			pending = append(pending, RowCommit{Index: mutation.Index, Outcome: PreconditionRejected, Before: before})
-			continue
-		}
-		if !mutation.Mutate(&status) {
-			pending = append(pending, RowCommit{Index: mutation.Index, Outcome: PreconditionNoChange, Before: before})
-			continue
-		}
-		if position >= 0 {
-			next[position] = CloneRow(status)
+			record, ok = next.applyRemove(mutation)
 		} else {
-			next = append(next, CloneRow(status))
+			record, ok = next.applyMutate(mutation)
 		}
-		after := CloneRow(status)
-		record := RowCommit{Index: mutation.Index, Outcome: PreconditionOK, Before: before, After: &after}
+		if !ok {
+			pending = append(pending, record)
+			continue
+		}
 		committed = append(committed, committedMutation{callback: mutation.OnCommit, record: record})
 	}
 
@@ -387,6 +355,54 @@ func (s *RowStore) applyBatch(
 		}
 	}
 	return nil
+}
+
+// batchRows is the rows of one batch attempt as its mutations rewrite
+// them. The store adopts them only when the attempt commits.
+type batchRows []types.InstanceStatus
+
+// applyRemove drops the row the mutation names and reports the record
+// and whether the removal committed. A missing row is no change; a
+// refused precondition drops only this mutation.
+func (rows *batchRows) applyRemove(mutation types.InstanceMutation) (RowCommit, bool) {
+	position := indexPosition(*rows, mutation.Index)
+	if position < 0 {
+		return RowCommit{Index: mutation.Index, Remove: true, Outcome: PreconditionNoChange}, false
+	}
+	before := CloneRow((*rows)[position])
+	if mutation.Precondition != nil && !mutation.Precondition(&before) {
+		return RowCommit{Index: mutation.Index, Remove: true, Outcome: PreconditionRejected, Before: &before}, false
+	}
+	*rows = append((*rows)[:position], (*rows)[position+1:]...)
+	return RowCommit{Index: mutation.Index, Remove: true, Outcome: PreconditionOK, Before: &before}, true
+}
+
+// applyMutate upserts the row the mutation names through its callback
+// and reports the record and whether the write committed. A refused
+// precondition or a callback that changed nothing drops only this
+// mutation.
+func (rows *batchRows) applyMutate(mutation types.InstanceMutation) (RowCommit, bool) {
+	position := indexPosition(*rows, mutation.Index)
+	status := types.InstanceStatus{Index: mutation.Index}
+	var before *types.InstanceStatus
+	if position >= 0 {
+		status = CloneRow((*rows)[position])
+		copied := CloneRow(status)
+		before = &copied
+	}
+	if mutation.Precondition != nil && !mutation.Precondition(&status) {
+		return RowCommit{Index: mutation.Index, Outcome: PreconditionRejected, Before: before}, false
+	}
+	if !mutation.Mutate(&status) {
+		return RowCommit{Index: mutation.Index, Outcome: PreconditionNoChange, Before: before}, false
+	}
+	if position >= 0 {
+		(*rows)[position] = CloneRow(status)
+	} else {
+		*rows = append(*rows, CloneRow(status))
+	}
+	after := CloneRow(status)
+	return RowCommit{Index: mutation.Index, Outcome: PreconditionOK, Before: before, After: &after}, true
 }
 
 // validateMutationBatch rejects a batch the adapter would reject. These
@@ -461,8 +477,14 @@ func (s *RowStore) applyRetryBlock(commit RetryBlockCommit) {
 }
 
 func (s *RowStore) rowPosition(idx int32) int {
-	for i := range s.rows {
-		if s.rows[i].Index == idx {
+	return indexPosition(s.rows, idx)
+}
+
+// indexPosition is where the row of this Instance index sits in rows, or
+// -1 when absent.
+func indexPosition(rows []types.InstanceStatus, idx int32) int {
+	for i := range rows {
+		if rows[i].Index == idx {
 			return i
 		}
 	}

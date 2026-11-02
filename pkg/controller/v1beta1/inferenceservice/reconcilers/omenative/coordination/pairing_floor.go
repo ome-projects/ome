@@ -35,7 +35,25 @@ func resolvePairFloor(ir *v1beta1.InferenceReplica, pacing v1beta1.CoordinationP
 	if desired <= 0 {
 		return pairFloor{}
 	}
-	budget := MaxUnavailableBudget(pacing, desired)
+	return pairableMinimumUnder(ir, desired, MaxUnavailableBudget(pacing, desired))
+}
+
+// ownPairableMinimum reads the pairable minimum off the Component's replica
+// alone, for a group that carries no budget of its own (a canary unit):
+// desired minus the Component's own maxUnavailable. A Component that
+// declares none rolls under no unavailability cap and keeps no minimum
+// beyond the one pair the gate always protects.
+func ownPairableMinimum(ir *v1beta1.InferenceReplica) pairFloor {
+	desired := effectiveDesiredReplicas(ir)
+	if desired <= 0 {
+		return pairFloor{}
+	}
+	return pairableMinimumUnder(ir, desired, desired)
+}
+
+// pairableMinimumUnder is desired minus the stricter of budget and the
+// Component's own rollingUpdate.maxUnavailable.
+func pairableMinimumUnder(ir *v1beta1.InferenceReplica, desired, budget int32) pairFloor {
 	if lc := ir.Spec.Lifecycle; lc != nil && lc.UpdateStrategy != nil && lc.UpdateStrategy.RollingUpdate != nil && lc.UpdateStrategy.RollingUpdate.MaxUnavailable != nil {
 		if own := utils.ScaledCountFromIntOrString(lc.UpdateStrategy.RollingUpdate.MaxUnavailable, desired, true); own < budget {
 			budget = own
@@ -46,6 +64,17 @@ func resolvePairFloor(ir *v1beta1.InferenceReplica, pacing v1beta1.CoordinationP
 		floor = 0
 	}
 	return pairFloor{known: true, desired: desired, maxUnavailable: budget, floor: floor}
+}
+
+// pairableMinimumOf is the pairable minimum of one pairing side under this
+// context's group: desired minus the stricter of the side's own
+// maxUnavailable and the group's unavailability budget. A canary unit has
+// no group budget, so its members' minimums are their own.
+func (ctx GateContext) pairableMinimumOf(ir *v1beta1.InferenceReplica) pairFloor {
+	if ctx.CanaryUnit {
+		return ownPairableMinimum(ir)
+	}
+	return resolvePairFloor(ir, ctx.Group.Pacing)
 }
 
 // pairableCohortCount counts the serving Instances of one side, held by

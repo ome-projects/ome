@@ -7,10 +7,6 @@ import (
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
-// roleOrder is the order the roles are walked: the engine first, since every
-// service has one, then decoder and router.
-var roleOrder = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}
-
 // RoleReplicaRef returns the standalone InferenceReplica spec.replicaRefs
 // names for a role, or "" when the service renders the role itself or does
 // not serve it.
@@ -28,7 +24,7 @@ func ReferencesReplicas(isvc *v1beta1.InferenceService) bool {
 // replicas, engine first.
 func ReferencedRoles(isvc *v1beta1.InferenceService) []v1beta1.ComponentType {
 	var roles []v1beta1.ComponentType
-	for _, c := range roleOrder {
+	for _, c := range v1beta1.RoleTypes() {
 		if RoleReplicaRef(isvc, c) != "" {
 			roles = append(roles, c)
 		}
@@ -43,15 +39,7 @@ func RoleDeclared(isvc *v1beta1.InferenceService, c v1beta1.ComponentType) bool 
 	if RoleReplicaRef(isvc, c) != "" {
 		return true
 	}
-	switch c {
-	case v1beta1.EngineComponent:
-		return isvc.Spec.Engine != nil
-	case v1beta1.DecoderComponent:
-		return isvc.Spec.Decoder != nil
-	case v1beta1.RouterComponent:
-		return isvc.Spec.Router != nil
-	}
-	return false
+	return v1beta1.SpecOf(&isvc.Spec, c) != nil
 }
 
 // RoleReplicaName returns the name of the InferenceReplica behind a role:

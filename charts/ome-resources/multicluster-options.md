@@ -95,7 +95,7 @@ installs.
 | `routing.observer.maxConcurrentReconciles`, `.maxConcurrentRequests`, `.maxResponseBytes`, `.minPeriod`, `.maxSamples` | Keep chart defaults. Validation requires these bounds when routing is enabled, even if active probes are not configured. |
 | `routing.publisher.name`, `.resyncInterval`, `.options` | Keep. Selects and configures the publication backend and its periodic recovery cadence. |
 | `routing.probe` (`path`, `method`, `acceptStatuses`, `gateStatuses`, `period`, `timeout`, `failureThreshold`, `successThreshold`, `allFailedPolicy`) | Optional active endpoint health checks. Omit when readiness-based health is sufficient. |
-| `routing.capacity` (`mode`, `path`, `method`, `format`, `options`, `samples`, `quorum`, `period`, `timeout`, `maxAge`) | Optional endpoint capacity polling. Unset mode or `Ceiling` caps replica-based capacity; `Reported` uses the endpoint's capacity, in replicas, directly, and the replica count for a home without a usable report. Independent of probing. |
+| `routing.capacity` (`mode`, `path`, `method`, `format`, `options`, `samples`, `quorum`, `period`, `timeout`, `maxAge`) | Optional endpoint capacity polling. Unset mode or `Ceiling` caps replica-based capacity; `Reported` uses the endpoint's capacity, in replicas, directly, and the replica count for a home without a usable report or with a positive report but no ready replica. Independent of probing. |
 
 With an external publisher, Gateway backend settings, probes, and capacity polling
 need no override unless those capabilities are deliberately used. They remain

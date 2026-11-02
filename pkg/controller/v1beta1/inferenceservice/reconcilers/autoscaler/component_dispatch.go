@@ -69,7 +69,10 @@ type RawDispatchInput struct {
 	// PolicySourced marks ResolvedAutoscaler as a policy render: dispatch
 	// stamps it into the Deployment's last-rendered annotation afterwards,
 	// so a later policy outage has a last-known-good block to stand on
-	// (RawDeployment has no InferenceReplica to carry one).
+	// (RawDeployment has no InferenceReplica to carry one). A pass that is
+	// neither policy-sourced nor a hold removes the annotation once its own
+	// scaler is in place, so a hold never replays a policy's scaler after
+	// OME has replaced it.
 	PolicySourced bool
 
 	// PolicyHold is the fail-closed state: ResolvedAutoscaler is nil and
@@ -150,8 +153,20 @@ func DispatchForRawComponent(ctx context.Context, input RawDispatchInput) error 
 		return dispatchErr
 	}
 
-	if input.PolicySourced && !input.PolicyHold {
+	switch {
+	case input.PolicyHold:
+	case input.PolicySourced:
 		if err := stampRawLastRendered(ctx, input.Client, input.ComponentMeta.Namespace, input.ComponentMeta.Name, input.ResolvedAutoscaler); err != nil {
+			return err
+		}
+	case dispatchErr != nil:
+		// The policy's scaler may be all that runs until the switch finishes,
+		// so a hold in this window must still be able to restore it.
+	default:
+		// The record describes a scaler a policy rendered. Once the Component's
+		// scaler comes from anywhere else, a later hold must keep that scaler
+		// instead of bringing the old policy's scaler back.
+		if err := clearRawLastRendered(ctx, input.Client, input.ComponentMeta.Namespace, input.ComponentMeta.Name); err != nil {
 			return err
 		}
 	}
@@ -202,6 +217,28 @@ func stampRawLastRendered(ctx context.Context, c client.Client, namespace, name 
 	patched.Annotations[constants.AutoscalerPolicyLastRendered] = encoded
 	if err := c.Patch(ctx, patched, client.MergeFrom(deployment)); err != nil {
 		return fmt.Errorf("stamp last-rendered autoscaler for %s/%s: %w", namespace, name, err)
+	}
+	return nil
+}
+
+// clearRawLastRendered removes the last-known-good policy render from the
+// Deployment. Patch-only and skipped when absent, so steady state adds no
+// writes.
+func clearRawLastRendered(ctx context.Context, c client.Client, namespace, name string) error {
+	deployment := &appsv1.Deployment{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, deployment); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("clear last-rendered autoscaler for %s/%s: %w", namespace, name, err)
+	}
+	if _, ok := deployment.Annotations[constants.AutoscalerPolicyLastRendered]; !ok {
+		return nil
+	}
+	patched := deployment.DeepCopy()
+	delete(patched.Annotations, constants.AutoscalerPolicyLastRendered)
+	if err := c.Patch(ctx, patched, client.MergeFrom(deployment)); err != nil {
+		return fmt.Errorf("clear last-rendered autoscaler for %s/%s: %w", namespace, name, err)
 	}
 	return nil
 }

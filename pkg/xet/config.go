@@ -6,7 +6,8 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/viper"
-	"sigs.k8s.io/ome/pkg/configutils"
+
+	"sigs.k8s.io/ome/pkg/agentconfig"
 	"sigs.k8s.io/ome/pkg/logging"
 )
 
@@ -23,7 +24,7 @@ type Config struct {
 	Logger                  logging.Interface
 	Endpoint                string `mapstructure:"endpoint" validate:"required"`
 	Token                   string `mapstructure:"hf_token"`
-	CacheDir                string `mapstructure:"cache_dir"`
+	CacheDir                string `mapstructure:"cache_dir"` // Optional: the client passes none to the library when empty
 	MaxConcurrentDownloads  uint32 `mapstructure:"max_concurrent_downloads" validate:"gt=0"`
 	EnableDedup             bool   `mapstructure:"enable_dedup"`
 	LogLevel                string `mapstructure:"log_level"` // Optional: error, warn, info, debug, trace
@@ -71,7 +72,7 @@ func defaultConfig() *Config {
 // WithViper attempts to resolve the configuration using Viper
 func WithViper(v *viper.Viper) Option {
 	return func(c *Config) error {
-		if err := configutils.BindEnvsRecursive(v, c, ""); err != nil {
+		if err := agentconfig.BindEnvs(v, c); err != nil {
 			return fmt.Errorf("error occurred when binding envs: %+v", err)
 		}
 
@@ -139,25 +140,9 @@ func (c *Config) Validate() error {
 	if c.Endpoint == "" {
 		return errors.New("endpoint is required")
 	}
-	if c.CacheDir == "" {
-		return errors.New("cache directory is required")
-	}
 	if c.MaxConcurrentDownloads <= 0 {
 		return errors.New("max workers must be positive")
 	}
 
 	return nil
-}
-
-// ToDownloadConfig converts Config to DownloadConfig
-func (c *Config) ToDownloadConfig() *DownloadConfig {
-	return &DownloadConfig{
-		Token:      c.Token,
-		CacheDir:   c.CacheDir,
-		Endpoint:   c.Endpoint,
-		MaxWorkers: int(c.MaxConcurrentDownloads),
-		// Set sensible defaults for common fields
-		Revision: "main",        // Default git branch
-		RepoType: RepoTypeModel, // Most common repository type
-	}
 }

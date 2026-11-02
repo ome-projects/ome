@@ -13,7 +13,7 @@ import (
 
 func TestPermit_CommittedGang_AdmitsWithoutSnapshotRead(t *testing.T) {
 	assignments := placement.New()
-	assignments.Set("team/pf", "a")
+	id := assignments.Set(placement.Gang{Group: "team/pf"}, "a", 0, nil)
 	g := &GangPack{
 		handle:      &fakeHandle{},
 		assignments: assignments,
@@ -21,7 +21,7 @@ func TestPermit_CommittedGang_AdmitsWithoutSnapshotRead(t *testing.T) {
 	}
 
 	state := newCycleState()
-	writeAssignment(state, "a", gangInfo{key: "team/pf", minMember: 3, topologyKey: testKey, timeout: time.Minute})
+	writeAssignment(state, "a", gangInfo{key: "team/pf", minMember: 3, topologyKey: testKey, timeout: time.Minute}, id)
 	status, _ := g.Permit(context.Background(), state, gangPod("team", "pf"), "a3")
 	if status.IsWait() {
 		t.Fatal("gate wedged: committed gang with 2 bound siblings + arriving member = 3 should admit, not wait")
@@ -33,15 +33,15 @@ func TestPermit_CommittedGang_AdmitsWithoutSnapshotRead(t *testing.T) {
 
 func TestPermit_WaitingSiblingAlsoAssumed_CountsItOnce(t *testing.T) {
 	assignments := placement.New()
-	_, token, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, token, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 4}, map[string][]string{"a": {"a1", "a2", "a3", "a4"}}, 4)
 	if !ok {
 		t.Fatal("failed to reserve gang")
 	}
 	// Two members have reached Reserve. Both are already assumed in the snapshot,
 	// and one is also in the waiting set; only two of four members have arrived.
-	assignments.PlaceIf("team/pf", token)
-	assignments.PlaceIf("team/pf", token)
+	assignments.Place("team/pf", token)
+	assignments.Place("team/pf", token)
 	waiterPod := gangPod("team", "pf")
 	waiterPod.Name = "waiter"
 	current := gangPod("team", "pf")
@@ -70,7 +70,7 @@ func TestPermit_WaitingSiblingAlsoAssumed_CountsItOnce(t *testing.T) {
 // holds until its reservation drains, regardless of snapshot contents.
 func TestPermit_FormingGangWithBoundSiblings_WaitsWithoutScanningBound(t *testing.T) {
 	assignments := placement.New()
-	assignments.Choose("team/pf", topology.FreeByDomain{"a": 5}, 3) // assigned, remaining==3, not committed
+	_, id, _ := assignments.Choose(placement.Gang{Group: "team/pf"}, topology.FreeByDomain{"a": 5}, nil, 3) // assigned, remaining==3, not committed
 	// A snapshot that WOULD satisfy the gate if (wrongly) counted.
 	snapshot := []framework.NodeInfo{
 		nodeInfo(gpuNode("a1", "a", "4"), gangPod("team", "pf")),
@@ -82,7 +82,7 @@ func TestPermit_FormingGangWithBoundSiblings_WaitsWithoutScanningBound(t *testin
 		pgReader:    fakeReader{"team/pf": {min: 3, topo: testKey}},
 	}
 	state := newCycleState()
-	writeAssignment(state, "a", gangInfo{key: "team/pf", minMember: 3, topologyKey: testKey, timeout: time.Minute})
+	writeAssignment(state, "a", gangInfo{key: "team/pf", minMember: 3, topologyKey: testKey, timeout: time.Minute}, id)
 	status, _ := g.Permit(context.Background(), state, gangPod("team", "pf"), "a3")
 	if !status.IsWait() {
 		t.Fatalf("forming gang (remaining>0) must wait, not count bound siblings; got %v", status)
@@ -116,12 +116,12 @@ func TestPermit_LabelledPodWithoutCycleAssignment_IsUnschedulable(t *testing.T) 
 
 func TestPermit_WaiterFromOlderAttempt_DoesNotCountOrRelease(t *testing.T) {
 	assignments := placement.New()
-	_, oldToken, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, oldToken, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 2}, map[string][]string{"a": {"a1", "a2"}}, 2)
-	if !ok || !assignments.ReleaseIf("team/pf", oldToken, nil) {
+	if !ok || !assignments.Release("team/pf", oldToken, nil) {
 		t.Fatal("failed to establish old attempt")
 	}
-	_, newToken, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, newToken, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"b": 2}, map[string][]string{"b": {"b1", "b2"}}, 2)
 	if !ok {
 		t.Fatal("failed to establish retry")

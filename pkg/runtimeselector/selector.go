@@ -39,85 +39,96 @@ func (s *defaultSelector) SelectRuntime(ctx context.Context, model *v1beta1.Base
 		return nil, err
 	}
 
-	matches, err := s.GetCompatibleRuntimes(ctx, model, isvc, namespace)
+	evaluated, err := s.evaluateRuntimes(ctx, model, isvc, namespace)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(matches) == 0 {
-		collection, _ := s.fetcher.FetchRuntimes(ctx, namespace)
-		excludedRuntimes := make(map[string]error)
-		collection.forEach(func(name string, spec *v1beta1.ServingRuntimeSpec, _ bool) {
-			if compatible, _ := s.matcher.IsCompatible(spec, model, isvc, name); compatible {
-				return
-			}
-			report, _ := s.matcher.GetCompatibilityDetails(spec, model, isvc, name)
-			if report != nil && len(report.IncompatibilityReasons) > 0 {
-				excludedRuntimes[name] = fmt.Errorf("%s", report.IncompatibilityReasons[0])
-			}
-		})
-
+	if len(evaluated.matches) == 0 {
 		return nil, &NoRuntimeFoundError{
 			ModelName:          getModelName(model),
 			ModelFormat:        model.ModelFormat.Name,
 			Namespace:          namespace,
-			ExcludedRuntimes:   excludedRuntimes,
-			TotalRuntimes:      len(collection.NamespaceRuntimes) + len(collection.ClusterRuntimes),
-			NamespacedRuntimes: len(collection.NamespaceRuntimes),
-			ClusterRuntimes:    len(collection.ClusterRuntimes),
+			ExcludedRuntimes:   evaluated.excluded,
+			TotalRuntimes:      evaluated.namespaced + evaluated.cluster,
+			NamespacedRuntimes: evaluated.namespaced,
+			ClusterRuntimes:    evaluated.cluster,
 		}
 	}
 
-	best := matches[0]
+	best := evaluated.matches[0]
 	logger.Info("Selected runtime",
 		"runtime", best.Name,
 		"score", best.Score,
 		"isCluster", best.IsCluster,
 		"model", model.ModelFormat.Name,
 		"namespace", namespace,
-		"candidates", len(matches))
+		"candidates", len(evaluated.matches))
 
 	return &best.RuntimeSelection, nil
 }
 
 func (s *defaultSelector) GetCompatibleRuntimes(ctx context.Context, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, namespace string) ([]RuntimeMatch, error) {
-	logger := log.FromContext(ctx)
-
 	if err := s.validateModel(model); err != nil {
 		return nil, err
 	}
+
+	evaluated, err := s.evaluateRuntimes(ctx, model, isvc, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return evaluated.matches, nil
+}
+
+// evaluatedRuntimes is one pass over the runtimes visible from a namespace:
+// the ranked matches, the first reason of every runtime the matcher found
+// incompatible, and how many runtimes of each scope were considered.
+type evaluatedRuntimes struct {
+	matches             []RuntimeMatch
+	excluded            map[string]error
+	namespaced, cluster int
+}
+
+// evaluateRuntimes fetches the namespace's and the cluster's runtimes once
+// and evaluates each. Namespace-scoped matches rank before cluster-scoped
+// ones, each group sorted best first.
+func (s *defaultSelector) evaluateRuntimes(ctx context.Context, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, namespace string) (*evaluatedRuntimes, error) {
+	logger := log.FromContext(ctx)
 
 	collection, err := s.fetcher.FetchRuntimes(ctx, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch runtimes: %w", err)
 	}
 
+	result := &evaluatedRuntimes{
+		excluded:   make(map[string]error),
+		namespaced: len(collection.NamespaceRuntimes),
+		cluster:    len(collection.ClusterRuntimes),
+	}
 	var namespaceMatches, clusterMatches []RuntimeMatch
 	collection.forEach(func(name string, spec *v1beta1.ServingRuntimeSpec, isCluster bool) {
-		match := s.evaluateRuntime(ctx, spec, model, isvc, name, isCluster)
-		if match == nil {
-			return
-		}
-		if isCluster {
+		match, report := s.evaluateRuntime(ctx, spec, model, isvc, name, isCluster)
+		switch {
+		case match != nil && isCluster:
 			clusterMatches = append(clusterMatches, *match)
-		} else {
+		case match != nil:
 			namespaceMatches = append(namespaceMatches, *match)
+		case report != nil && !report.IsCompatible:
+			result.excluded[name] = fmt.Errorf("%s", report.IncompatibilityReasons[0])
 		}
 	})
 
-	// Namespace-scoped runtimes always win against cluster runtimes — sort
-	// each list independently, then concatenate.
 	s.sortMatches(namespaceMatches, model)
 	s.sortMatches(clusterMatches, model)
-	matches := append(namespaceMatches, clusterMatches...)
+	result.matches = append(namespaceMatches, clusterMatches...)
 
 	logger.V(1).Info("Compatible runtimes evaluated",
 		"model", model.ModelFormat.Name,
 		"namespace", namespace,
-		"matches", len(matches),
-		"considered", len(collection.NamespaceRuntimes)+len(collection.ClusterRuntimes))
+		"matches", len(result.matches),
+		"considered", result.namespaced+result.cluster)
 
-	return matches, nil
+	return result, nil
 }
 
 func (s *defaultSelector) ValidateRuntime(ctx context.Context, runtimeName string, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService) error {
@@ -146,59 +157,56 @@ func (s *defaultSelector) ValidateRuntime(ctx context.Context, runtimeName strin
 		}
 	}
 
-	compatible, err := s.matcher.IsCompatible(runtimeSpec, model, isvc, runtimeName)
+	report, err := s.matcher.GetCompatibilityDetails(runtimeSpec, model, isvc, runtimeName)
 	if err != nil {
 		return err
 	}
-
-	if !compatible {
-		report, _ := s.matcher.GetCompatibilityDetails(runtimeSpec, model, isvc, runtimeName)
-		reason := "incompatible model format"
-		if report != nil && len(report.IncompatibilityReasons) > 0 {
-			reason = report.IncompatibilityReasons[0]
-		}
-
-		return &RuntimeCompatibilityError{
-			RuntimeName: runtimeName,
-			ModelName:   getModelName(model),
-			ModelFormat: model.ModelFormat.Name,
-			Reason:      reason,
-		}
-	}
-
-	return nil
-}
-
-func (s *defaultSelector) evaluateRuntime(ctx context.Context, spec *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, name string, isCluster bool) *RuntimeMatch {
-	logger := log.FromContext(ctx)
-
-	if spec.IsDisabled() {
-		logger.V(2).Info("Skipping disabled runtime", "runtime", name)
+	if report.IsCompatible {
 		return nil
 	}
+	if refusal := report.serviceRefusal(runtimeName, model); refusal != nil {
+		return refusal
+	}
+	return &RuntimeCompatibilityError{
+		RuntimeName: runtimeName,
+		ModelName:   getModelName(model),
+		ModelFormat: model.ModelFormat.Name,
+		Reason:      report.IncompatibilityReasons[0],
+	}
+}
+
+// evaluateRuntime returns the runtime as a ranked match when it is
+// compatible, has an auto-selectable format and scores above zero, or nil.
+// The matcher's report comes back either way.
+func (s *defaultSelector) evaluateRuntime(ctx context.Context, spec *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, name string, isCluster bool) (*RuntimeMatch, *CompatibilityReport) {
+	logger := log.FromContext(ctx)
 
 	report, err := s.matcher.GetCompatibilityDetails(spec, model, isvc, name)
 	if err != nil {
 		logger.Error(err, "Failed to get compatibility details", "runtime", name)
-		return nil
+		return nil, nil
 	}
 
 	if !report.IsCompatible {
-		logger.V(2).Info("Runtime not compatible",
-			"runtime", name,
-			"reasons", report.IncompatibilityReasons)
-		return nil
+		if report.failedCheck == runtimeDisabled {
+			logger.V(2).Info("Skipping disabled runtime", "runtime", name)
+		} else {
+			logger.V(2).Info("Runtime not compatible",
+				"runtime", name,
+				"reasons", report.IncompatibilityReasons)
+		}
+		return nil, report
 	}
 
 	if !runtimeHasAutoSelectFormat(spec) {
 		logger.V(2).Info("Runtime does not have auto-select enabled", "runtime", name)
-		return nil
+		return nil, report
 	}
 
 	score, err := s.scorer.CalculateScore(spec, model)
 	if err != nil {
 		logger.Error(err, "Failed to calculate score", "runtime", name)
-		return nil
+		return nil, report
 	}
 
 	// Zero score means none of the supported formats produced a match
@@ -206,7 +214,7 @@ func (s *defaultSelector) evaluateRuntime(ctx context.Context, spec *v1beta1.Ser
 	// don't pollute the ranked candidate list.
 	if score <= 0 {
 		logger.V(2).Info("Runtime has non-positive score", "runtime", name, "score", score)
-		return nil
+		return nil, report
 	}
 
 	return &RuntimeMatch{
@@ -217,7 +225,7 @@ func (s *defaultSelector) evaluateRuntime(ctx context.Context, spec *v1beta1.Ser
 			IsCluster: isCluster,
 		},
 		MatchDetails: report.MatchDetails,
-	}
+	}, report
 }
 
 func (s *defaultSelector) sortMatches(matches []RuntimeMatch, model *v1beta1.BaseModelSpec) {
@@ -255,6 +263,12 @@ func getModelName(model *v1beta1.BaseModelSpec) string {
 	return "unknown"
 }
 
+// GetSupportedModelFormat picks the format the pod renders with. For an
+// auto-selected runtime it reads the formats as the ranking does, only those
+// marked autoSelect: true and each at its own priority, so the rendered
+// format is the one that gave the runtime its score. For a named runtime
+// every format counts at the default priority: naming the runtime overrides
+// the priorities.
 func (s *defaultSelector) GetSupportedModelFormat(ctx context.Context, runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, userSpecifiedRuntime bool) *v1beta1.SupportedModelFormat {
 	// Lean path (no model): downstream components treat a nil
 	// SupportedModelFormat as "no model-format metadata available", which is
@@ -265,10 +279,14 @@ func (s *defaultSelector) GetSupportedModelFormat(ctx context.Context, runtime *
 	maxScore := int64(0)
 	bestSupportedFormat := v1beta1.SupportedModelFormat{}
 	for _, supportedFormat := range runtime.SupportedModelFormats {
-		if !userSpecifiedRuntime && (supportedFormat.AutoSelect == nil || !*supportedFormat.AutoSelect) {
-			continue
+		priority := int64(s.config.DefaultPriority)
+		if !userSpecifiedRuntime {
+			if !autoSelectEnabled(supportedFormat) {
+				continue
+			}
+			priority = formatPriority(supportedFormat, s.config.DefaultPriority)
 		}
-		score := s.scorer.CalculateFormatScore(model, supportedFormat, int64(s.config.DefaultPriority))
+		score := s.scorer.CalculateFormatScore(model, supportedFormat, priority)
 		if score > maxScore {
 			maxScore = score
 			bestSupportedFormat = supportedFormat

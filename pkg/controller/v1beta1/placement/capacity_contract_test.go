@@ -1,15 +1,12 @@
 package placement
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -17,6 +14,7 @@ import (
 	"sigs.k8s.io/ome/pkg/placement/capacity"
 	"sigs.k8s.io/ome/pkg/placement/plan"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestCapacityPlanRejectsUnboundDemand(t *testing.T) {
@@ -166,18 +164,12 @@ func TestPlannedMutationsRecheckCompleteAuthority(t *testing.T) {
 					r.Capacity = config
 					r.MemberOperatorNamespace = "operator-system"
 					reads := 0
-					r.APIReader = fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(source, plannedTestRegistration()).WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-						if err := c.Get(ctx, key, obj, opts...); err != nil {
-							return err
+					r.APIReader = fakeclient.New(t, fakeclient.WithObjects(source, plannedTestRegistration()), fakeclient.EditedRead(func(live *v1beta1.InferenceService) {
+						reads++
+						if reads >= tt.read {
+							tt.edit(live)
 						}
-						if live, ok := obj.(*v1beta1.InferenceService); ok {
-							reads++
-							if reads >= tt.read {
-								tt.edit(live)
-							}
-						}
-						return nil
-					}}).Build()
+					}))
 					err := action.run(r, source, *candidate)
 					if !errors.Is(err, plan.ErrSchemaUnsupported) {
 						t.Fatalf("want storage authority error, got %v", err)

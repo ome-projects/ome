@@ -749,6 +749,59 @@ func TestLifecycleConfig_ToUnschedulableGracePeriod(t *testing.T) {
 	}
 }
 
+// TestLifecycleConfig_ToGangDomainFullGracePeriod checks the validation
+// contract for the full-domain grace: a configured duration parses, an
+// absent key yields zero (unconfigured, not an error), and any
+// non-positive or unparsable value is an error the caller treats as
+// unconfigured.
+func TestLifecycleConfig_ToGangDomainFullGracePeriod(t *testing.T) {
+	t.Run("configured value parses", func(t *testing.T) {
+		cfg := &LifecycleConfig{GangDomainFullGracePeriod: "5m"}
+		grace, err := cfg.ToGangDomainFullGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, 5*time.Minute, grace)
+	})
+
+	t.Run("nil receiver yields zero, no error", func(t *testing.T) {
+		var cfg *LifecycleConfig
+		grace, err := cfg.ToGangDomainFullGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), grace)
+	})
+
+	t.Run("absent key yields zero, no error", func(t *testing.T) {
+		cfg := &LifecycleConfig{}
+		grace, err := cfg.ToGangDomainFullGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), grace)
+	})
+
+	t.Run("decodes from the lifecycle document", func(t *testing.T) {
+		var cfg LifecycleConfig
+		require.NoError(t, json.Unmarshal([]byte(`{"gangDomainFullGracePeriod":"5m"}`), &cfg))
+		grace, err := cfg.ToGangDomainFullGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, 5*time.Minute, grace)
+	})
+
+	invalid := []struct {
+		name  string
+		value string
+	}{
+		{"invalid duration", "not-a-duration"},
+		{"zero duration", "0s"},
+		{"negative duration", "-5s"},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &LifecycleConfig{GangDomainFullGracePeriod: tt.value}
+			grace, err := cfg.ToGangDomainFullGracePeriod()
+			assert.Error(t, err)
+			assert.Equal(t, time.Duration(0), grace)
+		})
+	}
+}
+
 // TestLifecycleConfig_ToAbandonedReplacementGracePeriod pins the
 // validation contract for the abandoned-replacement grace: a configured
 // duration parses, an absent key yields zero (unconfigured, not an

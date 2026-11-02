@@ -129,11 +129,11 @@ func Reconcile(ctx context.Context, deps types.Deps, input types.ReconcileInput,
 // loop, then the end-of-pass bookkeeping (endOfPassBookkeeping). A
 // scale-down status commit is a pass boundary because it invalidates the
 // plan. While an admitted wave is polling, escalation still runs for
-// retained Instances but excludes every scale-down extra; deferred victims
-// must receive no lifecycle mutation before admission. Other operation
-// requeues keep the escalation running, so a surge or gang past its
-// deadline can fail while its operation keeps polling. Teardown never
-// reaches Execute.
+// retained Instances but excludes every scale-down extra; a leaving
+// Instance the wave has not admitted must receive no lifecycle mutation
+// before admission. Other operation requeues keep the escalation
+// running, so a surge or gang past its deadline can fail while its
+// operation keeps polling. Teardown never reaches Execute.
 //
 // An errored op pass does NOT suspend that bookkeeping. Both end-of-pass
 // steps are per-Instance and re-derive their own reading from the
@@ -238,7 +238,7 @@ func endOfPassBookkeeping(ctx context.Context, deps types.Deps, input types.Reco
 			return err
 		}
 	}
-	return escalation.FollowParkedAttempts(ctx, pass)
+	return escalation.FollowStoppedAttempts(ctx, pass)
 }
 
 // sweepStuckTerminatingPods is the Component-wide force-delete sweep:
@@ -314,8 +314,8 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 		switch action.Kind {
 		// 1. Scale-down. Constraint: a status commit ends the pass — the
 		// wave's own write is what the plan below was computed without —
-		// and an admitted wave polling its victims must see no lifecycle
-		// mutation from a later action before it completes.
+		// and an admitted wave polling the Instances it removes must see no
+		// lifecycle mutation from a later action before it completes.
 		case ActionScaleDown:
 			outcome, err := deleteExtraInstances(ctx, deps, input, plan, snapshot, action.Extras)
 			if err != nil {
@@ -581,9 +581,9 @@ func hasActionKind(actions []PlannedAction, kind ActionKind) bool {
 
 // scaleDownResult maps one scale-down batch outcome onto the pass. A
 // status commit ends the pass at a boundary (the wave's own write is
-// what the plan was computed without); a wave still polling its victims
-// returns its wake-up and stops the actions without ending the pass; a
-// finished wave lets the actions continue.
+// what the plan was computed without); a wave still polling the
+// Instances it removes returns its wake-up and stops the actions without
+// ending the pass; a finished wave lets the actions continue.
 func scaleDownResult(input types.ReconcileInput, outcome workloadops.DeleteBatchResult) (res ctrl.Result, stop, endsPass bool) {
 	if outcome.ImmediateRequeue {
 		return types.RequeueNow(), true, true

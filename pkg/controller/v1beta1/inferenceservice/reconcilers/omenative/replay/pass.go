@@ -108,7 +108,7 @@ func (d *driver) runPass(ctx context.Context) error {
 			return err
 		}
 		for _, g := range canaryGroups {
-			out, err := canary.Dispatch(ctx, canary.DispatchDeps{
+			deps := canary.DispatchDeps{
 				ISVC:                 isvc,
 				Client:               cached,
 				Reader:               irstatus.NewReader(live, irstatus.Decoder{}),
@@ -120,7 +120,11 @@ func (d *driver) runPass(ctx context.Context) error {
 				ComponentRunnerPorts: d.runnerPorts(),
 				Policies:             policies,
 				Group:                g,
-			})
+			}
+			if d.samples != nil {
+				deps.StepSampler = d.samples
+			}
+			out, err := canary.Dispatch(ctx, deps)
 			if err != nil {
 				return d.endPass(ctrl.Result{}, err)
 			}
@@ -409,10 +413,26 @@ func (d *driver) groupDiff(before, after *v1beta1.RolloutCoordinationGroupStatus
 	if ab, aa := anchorOf(before), anchorOf(after); ab != aa {
 		parts = append(parts, fmt.Sprintf("anchor:%s→%s", ab, aa))
 	}
+	if fb, fa := d.memberFinishOf(before), d.memberFinishOf(after); fb != fa {
+		parts = append(parts, fmt.Sprintf("finished:%s→%s", fb, fa))
+	}
+	if before.MemberNotReady != after.MemberNotReady {
+		parts = append(parts, fmt.Sprintf("notReady:%s→%s", orNil(string(before.MemberNotReady)), orNil(string(after.MemberNotReady))))
+	}
 	if len(parts) == 0 {
 		return "other-fields"
 	}
 	return strings.Join(parts, " ")
+}
+
+// memberFinishOf renders the finish a Sequential group's entry records for
+// the member before the one it waits on: the member and the instant it
+// first read done.
+func (d *driver) memberFinishOf(g *v1beta1.RolloutCoordinationGroupStatus) string {
+	if g.MemberFinished == nil {
+		return "nil"
+	}
+	return string(g.MemberFinished.Component) + "@" + d.norm.atValue(g.MemberFinished.At)
 }
 
 // anchorOf renders a group's ratio anchor.
@@ -531,6 +551,14 @@ func conditionValue(isvc *v1beta1.InferenceService, condType string) string {
 	return fmt.Sprintf("%s=%s(%s)", condType, cond.Status, cond.Reason)
 }
 
+// prefixed returns sep followed by value, or nothing for an empty value.
+func prefixed(sep, value string) string {
+	if value == "" {
+		return ""
+	}
+	return sep + value
+}
+
 // traceBind records the canary record the bind left on a group's unit.
 func (d *driver) traceBind(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) {
 	primary := rollout.PrimaryOf(g)
@@ -632,6 +660,11 @@ func (d *driver) traceCoordination(passCopy *v1beta1.InferenceServiceStatus, isv
 		}
 	}
 	d.trace.line("coordination conditions %s", conditionValue(isvc, v1beta1.RolloutCoordinationReady))
+	// The endpoints condition exists only once a revision's share waited
+	// for the endpoints controller, so it is traced only then.
+	if cond := isvc.Status.GetCondition(apis.ConditionType(v1beta1.TrafficEndpointsReady)); cond != nil {
+		d.trace.line("coordination endpoints %s%s", conditionValue(isvc, v1beta1.TrafficEndpointsReady), prefixed(" ", cond.Message))
+	}
 }
 
 // groupEntry renders the group fields the coordination machine reads back.
@@ -639,9 +672,16 @@ func (d *driver) groupEntry(g *v1beta1.RolloutCoordinationGroupStatus) string {
 	if g == nil || g.Name == "" {
 		return "nil"
 	}
-	return fmt.Sprintf("{phase=%s composite=%s current=%s previous=%s transition=%s anchor=%s}",
+	entry := fmt.Sprintf("{phase=%s composite=%s current=%s previous=%s transition=%s anchor=%s",
 		orNil(string(g.Phase)), orNil(g.CompositePhase), orNil(string(g.CurrentComponent)), orNil(string(g.PreviousComponent)),
 		d.norm.atMeta(g.LastTransitionTime), anchorOf(g))
+	if g.MemberFinished != nil {
+		entry += " finished=" + d.memberFinishOf(g)
+	}
+	if g.MemberNotReady != "" {
+		entry += " notReady=" + string(g.MemberNotReady)
+	}
+	return entry + "}"
 }
 
 // traceRevisions records every Component's rolled-out revision record and

@@ -136,7 +136,8 @@ func sameScaleTarget(got, want autoscalingv2.CrossVersionObjectReference) bool {
 // with the HPA named after the Component around the ScaledObject write.
 type scaledObjectHPAPlan struct {
 	// hpaName is advanced.horizontalPodAutoscalerConfig.name on the
-	// ScaledObject; empty lets KEDA pick its own name.
+	// ScaledObject; empty lets KEDA pick its own name, which happens only
+	// when that name fits KEDA's length limit.
 	hpaName string
 	// takeOver asks KEDA to take over the HPA named after the Component.
 	takeOver bool
@@ -183,6 +184,10 @@ func planScaledObjectHPA(p DispatchParams, liveSO *kedav1.ScaledObject, hpa comp
 	default:
 		plan.hpaName = requested
 		plan.deleteBeforeWrite = hpa.control == hpaControlledByWorkload || hpa.control == hpaLeftByScaledObject
+	}
+	if plan.hpaName == "" {
+		// KEDA's own HPA name for a long Component name fails its webhook.
+		plan.hpaName = keda.ShortenedHPAName(utils.GetScaledObjectName(p.Name))
 	}
 	plan.takeOver = plan.hpaName == p.Name
 	return plan

@@ -320,11 +320,13 @@ func NewRestartBatch(deps workload.Deps, input workload.ReconcileInput) *Restart
 //
 // target is the Component's roll target, nil when it has none. A rebuild
 // that has created no pod yet follows it when the row is off it
-// (rebuildFollowsTarget); every other rebuild renders the revision the
-// lost pods ran, which the row records before its drain deletes them
-// (revisionPodsRan), unless the row runs the Component's current revision
-// or no lost pod is left to read, when it renders the revision its row
-// records.
+// (rebuildFollowsTarget), and one whose set carries a revision the roll
+// has since moved off replaces that set at the target before it serves
+// (replaceRebuiltSetOffTheTarget); every other rebuild renders the
+// revision the lost pods ran, which the row records before its drain
+// deletes them (revisionPodsRan), unless the row runs the Component's
+// current revision or no lost pod is left to read, when it renders the
+// revision its row records.
 //
 // Source-agnostic: callers construct workload.ReconcileInput from their
 // own source-of-truth types — today the InferenceReplica adapter
@@ -350,10 +352,11 @@ func Restart(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 // row and the pods found decide how far a pass gets:
 //
 //	settle a crash-loop episode; resolve the attempt; sort the pods by
-//	incarnation; record the revision the lost pods ran; drain the old set;
-//	delete the old set; plan the rebuilt set; free the rebuilt set's names;
-//	create the missing members; mark the rebuilt set serving; wait at the
-//	promote bar; promote.
+//	incarnation; replace a rebuilt set the roll has moved off; record the
+//	revision the lost pods ran; drain the old set; delete the old set;
+//	plan the rebuilt set; free the rebuilt set's names; create the
+//	missing members; mark the rebuilt set serving; wait at the promote
+//	bar; promote.
 func (b *RestartBatch) Advance(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, reason string, pods []*corev1.Pod) (bool, error) {
 	if deps.Client == nil {
 		return false, fmt.Errorf("Restart: nil client")
@@ -368,6 +371,7 @@ func (b *RestartBatch) Advance(ctx context.Context, deps workload.Deps, input wo
 	phases := []func(context.Context) (bool, error){
 		repair.resolveAttempt,
 		repair.sortPodsByIncarnation,
+		repair.replaceRebuiltSetOffTheTarget,
 		repair.recordRevisionTheLostPodsRan,
 		repair.drainOldSet,
 		repair.deleteOldSet,
@@ -453,8 +457,8 @@ func (b *RestartBatch) newInstanceRepair(deps workload.Deps, input workload.Reco
 // settleCrashLoop writes the step an operation-free row owes for a crash
 // loop of its promoted set, if it owes one, and ends the pass as done: a
 // row held Failed whose set serves again returns to Ready, a Ready row on
-// a held revision gets the loop named on it, and a note that has gone
-// stale is cleared (readCrashLoopEpisode). Nothing opens and nothing is
+// a held revision gets the loop named on it, and a note gone stale is
+// cleared (readCrashLoopEpisode). Nothing opens and nothing is
 // left in flight.
 func (r *instanceRepair) settleCrashLoop(ctx context.Context) (bool, error) {
 	episode := readCrashLoopEpisode(r.input, r.row, r.inst.TotalPods(), r.pods)
@@ -580,6 +584,64 @@ func (r *instanceRepair) sortPodsByIncarnation(context.Context) (bool, error) {
 			workload.InstanceKey(r.input.Key.Component, r.inst.Index), pod.Namespace, pod.Name)
 	}
 	return true, nil
+}
+
+// replaceRebuiltSetOffTheTarget replaces the set the attempt built when
+// the roll has moved off the revision it carries before the set came to
+// serve: the row's set number moves on in one write
+// (status.RestartReplacesItsRebuiltSet), so the set reads as the old set
+// the phases after this one drain and delete, and the pass that finds it
+// gone rebuilds the Instance on the target, as the roll replaces its own
+// attempt when the target moves under it. The pods are sorted again under
+// the new number, so the drain runs in this pass. A row another pass has
+// moved on ends this one, which reads it again.
+func (r *instanceRepair) replaceRebuiltSetOffTheTarget(ctx context.Context) (bool, error) {
+	built, replace := r.rebuiltSetOffTheTarget()
+	if !replace {
+		return false, nil
+	}
+	incarnation, moved, err := status.RestartReplacesItsRebuiltSet(ctx, r.input, r.inst.Index, r.incarnation, r.plan.InstanceReadyTimeout)
+	if err != nil {
+		return false, fmt.Errorf("Restart: replace the rebuilt set the roll moved off (instance=%d): %w", r.inst.Index, err)
+	}
+	if !moved {
+		return true, nil
+	}
+	workload.RecordNormal(r.deps.Recorder, workload.EventTarget(r.input), workload.EventReasonRestartRetargeted,
+		"OMENative %s restart replaces the pod set built on %s at %s (incarnation=%d)",
+		workload.InstanceKey(r.input.Key.Component, r.inst.Index), built, r.target.Name, incarnation)
+	r.incarnation = incarnation
+	return r.sortPodsByIncarnation(ctx)
+}
+
+// rebuiltSetOffTheTarget reports whether the set the attempt built is one
+// the repair replaces at the roll target now, and names the revision it
+// carries: live pods of it exist and agree on a revision other than a
+// target the roll could start on (rollTargetOpen), the roll's partition
+// does not hold the Instance (RollHeldIndices), and the set is short of
+// serving, a member missing or a pod not yet runtime-ready. A set one
+// promote from serving is kept: it promotes on the revision it carries and
+// the roll replaces it from Ready under its budget. A paused Component, a
+// Held target or a held Instance keeps the set as well, as it keeps a
+// rebuild that has created no pod on the revision the row records.
+func (r *instanceRepair) rebuiltSetOffTheTarget() (string, bool) {
+	live := query.ExcludeTerminalPods(r.rebuiltSet)
+	if len(live) == 0 || r.target == nil || !rollTargetOpen(r.input, r.plan, r.target) ||
+		RollHeldIndices(r.input, r.plan, r.target)[r.inst.Index] {
+		return "", false
+	}
+	built := revisionPodsRan(r.input, r.plan, live)
+	if built == "" || built == r.target.Name {
+		return "", false
+	}
+	set := r.inst
+	set.Incarnation = r.incarnation
+	set.Runners = r.plan.RunnersFor(r.inst, built)
+	complete := len(missingPodTargets(expectedPodNamesForInstance(r.input, r.plan, set), live)) == 0
+	if complete && query.AllPodsRuntimeReady(live) {
+		return "", false
+	}
+	return built, true
 }
 
 // recordRevisionTheLostPodsRan writes on the row the revision the old set
@@ -791,8 +853,8 @@ func (r *instanceRepair) missingMembers() []podTarget {
 // Instance as on target once it is Ready; it renders the target's current
 // template. Every other rebuild renders the stored template of the
 // revision its row records: a repair under a pause or a Held target, and
-// one whose pods already exist, which the roll replaces from Ready. found
-// is false when that revision is gone.
+// one whose pods already exist on that revision. found is false when that
+// revision is gone.
 func (r *instanceRepair) rebuiltSetTemplate(ctx context.Context) (podTemplate, bool, error) {
 	if !r.followsTarget {
 		tmpl, found, err := rebuildTemplate(ctx, r.deps, r.input, r.plan, r.target, r.inst.Index)
@@ -1020,8 +1082,9 @@ func rebuildRevision(s *workload.InstanceStatus) string {
 // a demoted row that has no pod left.
 //
 // Four rows are never yielded: an open Restart, which is driven on — its
-// rebuild follows the target itself while it has created no pod
-// (rebuildFollowsTarget); a Migrate-owned row, which its record owns; a
+// rebuild follows the target itself until its set serves
+// (rebuildFollowsTarget, replaceRebuiltSetOffTheTarget); a Migrate-owned
+// row, which its record owns; a
 // row demoted for losing every pod that holds pods again, which no
 // update trigger reads, so its repair rebuilds the revision it records and
 // the roll follows once it is Ready; and a row owed a crash-loop episode
@@ -1113,8 +1176,11 @@ func RollHeldIndices(input workload.ReconcileInput, plan workload.ComponentPlan,
 // serves nothing, so the rebuild is the pass that puts it on the target and
 // no pod set is torn down for it; a held Instance is the step's stable
 // side, which the step machine alone promotes. A rebuild whose pods exist
-// finishes on the revision they carry: replacing a starting pod set is the
-// roll's job, under its budget.
+// renders the revision they carry; while the roll has moved off that
+// revision and the set is short of serving, the repair replaces the set at
+// the target (replaceRebuiltSetOffTheTarget), and a set one promote from
+// serving promotes on its revision, for the roll to replace from Ready
+// under its budget.
 //
 // A row that records no revision follows any target it has, whatever the
 // pause, the hold or the canary step say: its rebuild renders the current

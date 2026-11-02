@@ -47,7 +47,7 @@ const kubeConfigSecretRefIndex = "spec.clusterSource.kubeConfig.secretRef"
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 // Reconciler reconciles a WorkloadCluster: it resolves the cluster's
-// kubeconfig, probes reachability, and stamps the Ready condition. It does NOT
+// kubeconfig, probes reachability, and writes the Ready condition. It does NOT
 // read capacity — that is a placer concern.
 type Reconciler struct {
 	client.Client
@@ -82,18 +82,12 @@ type Reconciler struct {
 	// cadence that schedules the next one, and this controller runs one worker.
 	ProbeTimeout time.Duration
 
-	// mu guards firstFailure. The reconciler runs single-worker per key, but
-	// firstFailure is shared across keys.
+	// mu guards health. Each record is read and written only by its own
+	// cluster's pass, and controller-runtime runs one pass per key at a time.
 	mu sync.Mutex
-	// firstFailure records, per cluster, when the current run of consecutive
-	// probe failures began. Cleared on a successful probe. Used to keep a live
-	// connection up across brief blips (within ConnectionGracePeriod).
-	firstFailure map[string]time.Time
-	// failCount records, per cluster, how many consecutive connection failures
-	// have occurred. It drives the reconnect retry backoff (retryAfter) so a
-	// persistently-down cluster is re-probed with exponentially-spaced requeues
-	// instead of every health interval. Cleared on a successful pass.
-	failCount map[string]uint
+	// health holds one record per registered cluster; a removed or replaced
+	// registration drops its record.
+	health map[string]*clusterHealth
 
 	// cfg is the resolved timing configuration assembled at SetupWithManager
 	// from functional Options (seeded by the HealthInterval/ConnectionGracePeriod
@@ -103,16 +97,102 @@ type Reconciler struct {
 	cfg *controllerConfig
 }
 
+// clusterHealth is what the controller remembers about one cluster between
+// passes. The failure clock runs from the first failed reachability probe
+// until a probe succeeds, and bounds the grace window. The failure count grows
+// with every pass that ends disconnected and resets when the cluster connects;
+// it indexes the reconnect backoff.
+type clusterHealth struct {
+	firstFailure time.Time
+	failures     uint
+}
+
+// startFailureClock begins the failure run at now unless one is running.
+func (h *clusterHealth) startFailureClock(now time.Time) {
+	if h.firstFailure.IsZero() {
+		h.firstFailure = now
+	}
+}
+
+func (h *clusterHealth) stopFailureClock() {
+	h.firstFailure = time.Time{}
+}
+
+// countFailure adds a pass that ended disconnected and returns the run length.
+func (h *clusterHealth) countFailure() uint {
+	h.failures++
+	return h.failures
+}
+
+func (h *clusterHealth) resetFailures() {
+	h.failures = 0
+}
+
+// Ready condition reasons.
+const (
+	reasonReachable                 = "Reachable"
+	reasonConnectionFailed          = "ConnectionFailed"
+	reasonProbeFailedRetrying       = "ProbeFailedRetrying"
+	reasonSecretNotFound            = "SecretNotFound"
+	reasonBadKubeConfig             = "BadKubeConfig"
+	reasonClusterProfileUnsupported = "ClusterProfileUnsupported"
+)
+
+// probeOutcome is what one pass learned about a cluster: the Ready condition
+// it earns and, when it is reachable, the kubeconfig bytes to connect with.
+type probeOutcome struct {
+	status     metav1.ConditionStatus
+	reason     string
+	message    string
+	kubeconfig []byte
+}
+
+func notReady(reason, message string) probeOutcome {
+	return probeOutcome{status: metav1.ConditionFalse, reason: reason, message: message}
+}
+
+func (o probeOutcome) reachable() bool {
+	return o.status == metav1.ConditionTrue
+}
+
+// connectionFailed reports a reachability failure, the one kind the grace
+// window and the reconnect backoff apply to. The other failures are
+// configuration problems and are acted on at once.
+func (o probeOutcome) connectionFailed() bool {
+	return o.status != metav1.ConditionTrue && o.reason == reasonConnectionFailed
+}
+
+// heldWithinGrace is the outcome reported while a live connection is kept
+// through a transient probe failure: Ready stays True and the message names
+// the failure.
+func (o probeOutcome) heldWithinGrace() probeOutcome {
+	return probeOutcome{
+		status:  metav1.ConditionTrue,
+		reason:  reasonProbeFailedRetrying,
+		message: fmt.Sprintf("transient probe failure, holding connection within grace period: %s", o.message),
+	}
+}
+
+// readyCondition is the Ready condition this outcome earns on the cluster's
+// current generation.
+func (o probeOutcome) readyCondition(wc *v1beta1.WorkloadCluster) metav1.Condition {
+	return metav1.Condition{
+		Type:               v1beta1.WorkloadClusterReady,
+		Status:             o.status,
+		Reason:             o.reason,
+		Message:            o.message,
+		ObservedGeneration: wc.Generation,
+	}
+}
+
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	wc := &v1beta1.WorkloadCluster{}
 	if err := r.Get(ctx, req.NamespacedName, wc); err != nil {
 		if apierrors.IsNotFound(err) {
+			r.forgetConnection(req.Name)
 			if r.Manager != nil {
-				r.Manager.Disconnect(req.Name)
 				r.Manager.MarkConnectionDecided(req.Name, "")
 			}
-			r.clearFailure(req.Name)
-			r.clearRetry(req.Name)
 			// The member is gone: drop its series so it stops counting toward
 			// the fleet size reported by ome_workload_cluster_ready.
 			deleteForCluster(req.Name)
@@ -123,84 +203,53 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if r.Manager != nil {
 		if _, connected := r.Manager.ClientFor(wc.Name); connected {
 			if _, matches := r.Manager.ClientForUID(wc.Name, wc.UID); !matches {
-				r.Manager.Disconnect(wc.Name)
-				r.clearFailure(wc.Name)
-				r.clearRetry(wc.Name)
+				r.forgetConnection(wc.Name)
 			}
 		}
 	}
 
-	status, reason, msg, raw := r.assess(ctx, wc)
+	outcome := r.assess(ctx, wc)
 	if r.Manager != nil {
 		// Every path below settles whether this registration is connected, so a
 		// missing connection after this pass is a decision, not a pending one.
 		defer r.Manager.MarkConnectionDecided(wc.Name, wc.UID)
 	}
+	health := r.healthOf(wc.Name)
 
-	// Reconnect/backoff: a transient probe failure must not immediately tear
-	// down a live, working connection. If the only thing that failed is the
-	// reachability probe (ConnectionFailed) and we still hold a connection that
-	// failed within the grace window, hold the previous Ready=True and keep the
-	// client connected. Only after the grace period elapses do we flip to
-	// Ready=False and disconnect. Non-probe failures (bad secret/kubeconfig/
-	// unsupported source) are config problems, not blips: act on them at once.
-	requeue := r.healthInterval()
-	if status == metav1.ConditionFalse && reason == "ConnectionFailed" && r.withinGrace(wc.Name) {
-		// Re-probe sooner than the steady-state cadence so a real outage is
-		// confirmed (and torn down) promptly once grace expires.
-		requeue = r.graceRequeue()
-		apimeta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
-			Type:               v1beta1.WorkloadClusterReady,
-			Status:             metav1.ConditionTrue,
-			Reason:             "ProbeFailedRetrying",
-			Message:            fmt.Sprintf("transient probe failure, holding connection within grace period: %s", msg),
-			ObservedGeneration: wc.Generation,
-		})
-		// Leave the existing connection in place; do not Connect/Disconnect.
-		return r.finish(ctx, wc, requeue)
+	// A transient probe failure must not tear down a live connection: while the
+	// cluster still holds a client and its failure run is inside the grace
+	// window, Ready stays True and the client stays connected. Re-probing sooner
+	// than the steady cadence confirms a real outage once grace expires.
+	if outcome.connectionFailed() && r.withinGrace(wc.Name, health) {
+		apimeta.SetStatusCondition(&wc.Status.Conditions, outcome.heldWithinGrace().readyCondition(wc))
+		return r.finish(ctx, wc, r.graceRequeue())
 	}
 
-	if status == metav1.ConditionTrue {
-		r.clearFailure(wc.Name)
-	} else if reason == "ConnectionFailed" {
-		r.recordFailure(wc.Name)
+	if outcome.connectionFailed() {
+		health.startFailureClock(time.Now())
 	} else {
-		// Non-probe failure: not a blip, so reset the failure clock.
-		r.clearFailure(wc.Name)
+		health.stopFailureClock()
 	}
-
-	apimeta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
-		Type:               v1beta1.WorkloadClusterReady,
-		Status:             status,
-		Reason:             reason,
-		Message:            msg,
-		ObservedGeneration: wc.Generation,
-	})
-	connFailed := status != metav1.ConditionTrue && reason == "ConnectionFailed"
+	apimeta.SetStatusCondition(&wc.Status.Conditions, outcome.readyCondition(wc))
+	connFailed := outcome.connectionFailed()
 	if r.Manager != nil {
-		if status == metav1.ConditionTrue {
-			if err := r.Manager.ConnectFor(r.connectCtx(), wc.Name, wc.UID, raw); err != nil {
-				r.recordFailure(wc.Name)
+		if outcome.reachable() {
+			if err := r.Manager.ConnectFor(r.connectCtx(), wc.Name, wc.UID, outcome.kubeconfig); err != nil {
+				health.startFailureClock(time.Now())
 				connFailed = true
-				apimeta.SetStatusCondition(&wc.Status.Conditions, metav1.Condition{
-					Type:               v1beta1.WorkloadClusterReady,
-					Status:             metav1.ConditionFalse,
-					Reason:             "ConnectionFailed",
-					Message:            err.Error(),
-					ObservedGeneration: wc.Generation,
-				})
+				apimeta.SetStatusCondition(&wc.Status.Conditions, notReady(reasonConnectionFailed, err.Error()).readyCondition(wc))
 			}
 		} else {
 			r.Manager.Disconnect(wc.Name)
 		}
 	}
-	// Space reconnect attempts to a down cluster with the retry backoff
-	// (0 -> ~5m20s) instead of hammering at the health interval, and clear the
-	// counter once the cluster is healthy again.
+	// A down cluster is re-probed on the reconnect backoff (0 to about 5m20s)
+	// rather than at every health interval; the count resets once it connects.
+	requeue := r.healthInterval()
 	if connFailed {
-		requeue = r.nextRetryRequeue(wc.Name)
+		requeue = r.backoff().retryAfter(health.countFailure())
 	} else {
-		r.clearRetry(wc.Name)
+		health.resetFailures()
 	}
 	return r.finish(ctx, wc, requeue)
 }
@@ -262,10 +311,11 @@ func (r *Reconciler) graceRequeue() time.Duration {
 	return h
 }
 
-// withinGrace reports whether the named cluster is still inside its transient-
-// failure grace window AND currently holds a live connection. A cluster with no
-// connection (or no Manager) cannot be "held", so it is never within grace.
-func (r *Reconciler) withinGrace(name string) bool {
+// withinGrace reports whether a probe failure is still inside the grace
+// window: the cluster holds a live client and its failure run, which this call
+// starts if none is running, is shorter than the grace period. A cluster with
+// no connection (or no Manager) has nothing to hold, so it is never within grace.
+func (r *Reconciler) withinGrace(name string, health *clusterHealth) bool {
 	if r.Manager == nil {
 		return false
 	}
@@ -276,71 +326,52 @@ func (r *Reconciler) withinGrace(name string) bool {
 	if g <= 0 {
 		return false
 	}
+	now := time.Now()
+	health.startFailureClock(now)
+	return now.Sub(health.firstFailure) < g
+}
+
+// healthOf returns the cluster's record, creating it on first use.
+func (r *Reconciler) healthOf(name string) *clusterHealth {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.firstFailure == nil {
-		r.firstFailure = map[string]time.Time{}
+	if r.health == nil {
+		r.health = map[string]*clusterHealth{}
 	}
-	first, ok := r.firstFailure[name]
+	h, ok := r.health[name]
 	if !ok {
-		// First failure of a previously-healthy connection: start the clock and
-		// hold the connection this pass.
-		r.firstFailure[name] = time.Now()
-		return true
+		h = &clusterHealth{}
+		r.health[name] = h
 	}
-	return time.Since(first) < g
+	return h
 }
 
-func (r *Reconciler) recordFailure(name string) {
+// forgetConnection drops the cluster's client and its health record, so the
+// next pass starts as it would for a new registration.
+func (r *Reconciler) forgetConnection(name string) {
+	if r.Manager != nil {
+		r.Manager.Disconnect(name)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.firstFailure == nil {
-		r.firstFailure = map[string]time.Time{}
-	}
-	if _, ok := r.firstFailure[name]; !ok {
-		r.firstFailure[name] = time.Now()
-	}
+	delete(r.health, name)
 }
 
-func (r *Reconciler) clearFailure(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.firstFailure, name)
-}
-
-// nextRetryRequeue increments the cluster's consecutive-failure count and
-// returns the retry-backoff delay for it (0 on the first failure, then growing
-// to the configured cap). Falls back to the default backoff when Setup has not
-// resolved one (e.g. unit tests building the Reconciler directly).
-func (r *Reconciler) nextRetryRequeue(name string) time.Duration {
-	r.mu.Lock()
-	if r.failCount == nil {
-		r.failCount = map[string]uint{}
-	}
-	r.failCount[name]++
-	n := r.failCount[name]
-	r.mu.Unlock()
-
-	b := defaultReconnectBackoff()
+// backoff is the reconnect schedule Setup resolved, or the default for a
+// Reconciler built directly (unit tests).
+func (r *Reconciler) backoff() reconnectBackoff {
 	if r.cfg != nil {
-		b = r.cfg.reconnect
+		return r.cfg.reconnect
 	}
-	return b.retryAfter(n)
+	return defaultReconnectBackoff()
 }
 
-func (r *Reconciler) clearRetry(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.failCount, name)
-}
-
-// assess resolves the connection and probes it, returning the Ready condition
-// fields. The Probe is injected so this is unit-testable without a real cluster.
-func (r *Reconciler) assess(ctx context.Context, wc *v1beta1.WorkloadCluster) (status metav1.ConditionStatus, reason, msg string, kubeconfig []byte) {
+// assess resolves the cluster's kubeconfig and probes reachability. The Probe
+// is injected so this is unit-testable without a real cluster.
+func (r *Reconciler) assess(ctx context.Context, wc *v1beta1.WorkloadCluster) probeOutcome {
 	src := wc.Spec.ClusterSource
 	if src.KubeConfig == nil {
-		return metav1.ConditionFalse, "ClusterProfileUnsupported",
-			"clusterProfileRef is not yet supported; use kubeConfig", nil
+		return notReady(reasonClusterProfileUnsupported, "clusterProfileRef is not yet supported; use kubeConfig")
 	}
 
 	key := src.KubeConfig.Key
@@ -351,31 +382,28 @@ func (r *Reconciler) assess(ctx context.Context, wc *v1beta1.WorkloadCluster) (s
 	nn := types.NamespacedName{Name: src.KubeConfig.SecretRef.Name, Namespace: src.KubeConfig.SecretRef.Namespace}
 	if err := r.secretReader().Get(ctx, nn, secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return metav1.ConditionFalse, "SecretNotFound",
-				fmt.Sprintf("kubeconfig Secret %s/%s not found", nn.Namespace, nn.Name), nil
+			return notReady(reasonSecretNotFound, fmt.Sprintf("kubeconfig Secret %s/%s not found", nn.Namespace, nn.Name))
 		}
 		// Local-apiserver read failures are transient transport failures, not a
 		// missing configuration. Reuse the connection grace path so one timeout
 		// does not discard an otherwise healthy remote client.
-		return metav1.ConditionFalse, "ConnectionFailed",
-			fmt.Sprintf("reading kubeconfig Secret %s/%s: %v", nn.Namespace, nn.Name, err), nil
+		return notReady(reasonConnectionFailed, fmt.Sprintf("reading kubeconfig Secret %s/%s: %v", nn.Namespace, nn.Name, err))
 	}
 	raw, ok := secret.Data[key]
 	if !ok || len(raw) == 0 {
-		return metav1.ConditionFalse, "BadKubeConfig",
-			fmt.Sprintf("Secret %s/%s has no %q key", nn.Namespace, nn.Name, key), nil
+		return notReady(reasonBadKubeConfig, fmt.Sprintf("Secret %s/%s has no %q key", nn.Namespace, nn.Name, key))
 	}
 	// Validate the kubeconfig (parse + security: reject exec/token-file/insecure)
 	// BEFORE probing. This keeps "malformed/unsafe kubeconfig" (BadKubeConfig)
 	// distinct from "cluster unreachable" (ConnectionFailed), and ensures the
 	// security validation runs regardless of which probe is in use.
 	if _, err := RESTConfigFromKubeConfig(raw, r.ExecPolicy); err != nil {
-		return metav1.ConditionFalse, "BadKubeConfig", err.Error(), nil
+		return notReady(reasonBadKubeConfig, err.Error())
 	}
 	if err := r.Probe(ctx, raw); err != nil {
-		return metav1.ConditionFalse, "ConnectionFailed", err.Error(), nil
+		return notReady(reasonConnectionFailed, err.Error())
 	}
-	return metav1.ConditionTrue, "Reachable", "", raw
+	return probeOutcome{status: metav1.ConditionTrue, reason: reasonReachable, kubeconfig: raw}
 }
 
 func (r *Reconciler) healthInterval() time.Duration {
@@ -425,9 +453,6 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts ...Option) error {
 	}
 	if r.SecretReader == nil {
 		r.SecretReader = mgr.GetAPIReader()
-	}
-	if r.firstFailure == nil {
-		r.firstFailure = map[string]time.Time{}
 	}
 	cfg := r.resolveConfig(opts...)
 	r.cfg = &cfg

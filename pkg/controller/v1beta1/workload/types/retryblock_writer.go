@@ -17,10 +17,6 @@ import (
 // Operation is cleared in the same transition (block write first — a
 // crash between the two re-enters the caller's failed branch, where the
 // wave dedup refreshes without recounting).
-//
-// Lives in the leaf types package so both workload/ops (gang abandon)
-// and the workload-root disposition share ONE implementation without
-// closing the workload → workload/ops import cycle.
 func RecordUpdateFailureInRetryBlock(ctx context.Context, input ReconcileInput, targetRev, reason string, cause FailureCause) error {
 	return RecordUpdateFailureInRetryBlockAt(ctx, input, targetRev, reason, cause, metav1.NewTime(input.Now()))
 }

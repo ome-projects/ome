@@ -17,7 +17,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/placement/allocation"
-	"sigs.k8s.io/ome/pkg/placement/affinity"
 	"sigs.k8s.io/ome/pkg/placement/capacity"
 	"sigs.k8s.io/ome/pkg/placement/plan"
 )
@@ -70,6 +69,7 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 	if err != nil {
 		return r.writeSplitHold(ctx, source, standing, "PlanNotPersisted", err)
 	}
+	r.recordSplitCeilingRaised(source, accepted)
 	observations := r.observeSplitMembers(ctx, accepted, eligible)
 	if proposal.Mode == v1beta1.PlacementModeAll {
 		for name, observed := range observations {
@@ -208,7 +208,24 @@ func (r *Reconciler) executePlannedAllocation(ctx context.Context, source *v1bet
 			}
 		}
 	}
-	return r.writeSplitObservations(ctx, next, observations, step.Reason, step.Message)
+	// The persisted plan no longer pauses, so the operator's release has taken
+	// effect; status and an event say so before the request is removed.
+	if step.Complete && step.CleanupReleased {
+		note := cleanupReleasedNote(accepted, observations)
+		if step.Message == "" {
+			step.Message = note
+		} else {
+			step.Message = strings.TrimSuffix(step.Message, ".") + ". " + note
+		}
+		r.recordCleanupReleased(accepted, note)
+	}
+	result, err := r.writeSplitObservations(ctx, next, observations, step.Reason, step.Message)
+	// A request for the revision whose pause just ended has nothing left to do.
+	// A request for a move that has not finished stays until it does.
+	if step.Complete && releasesCleanupWait(accepted) {
+		r.answerEndedCleanupRelease(ctx, accepted, step.CleanupReleased)
+	}
+	return result, err
 }
 
 func splitPauseRequired(proposal plan.Proposal) bool {
@@ -354,7 +371,10 @@ func advanceSplitPlan(source *v1beta1.InferenceService, observations map[string]
 		// A move may hold one extra full copy of the desired allocation.
 		Surge: int64(accepted.UnassignedReplicas),
 	}
-	var reserved, occupied int64
+	// The transition spends the allowance view of each member, in which decoders
+	// its copy keeps running are its own share. The cleanup wait below compares
+	// the share view, in which they are excess, with the replicas the plan assigns.
+	var reserved, allowanceReserved, occupied int64
 	pauseAcknowledged := true
 	for _, candidate := range source.Status.Placement.Candidates {
 		assignment, observed := candidate.Allocation, observations[candidate.Cluster]
@@ -362,8 +382,10 @@ func advanceSplitPlan(source *v1beta1.InferenceService, observations map[string]
 		input.Current[candidate.Cluster] = assignment.CurrentReplicas
 		input.Desired.Targets[candidate.Cluster] = assignment.DesiredReplicas
 		input.Surge += int64(assignment.DesiredReplicas)
-		input.Members[candidate.Cluster] = observed.MemberState
+		state, reservation := observed.allowanceState()
+		input.Members[candidate.Cluster] = state
 		reserved += int64(observed.RolloutReserved)
+		allowanceReserved += int64(reservation)
 		occupied += int64(observed.MemberState.Occupied)
 		if !observed.MemberState.Absent && !observed.PauseAcknowledged {
 			pauseAcknowledged = false
@@ -372,7 +394,7 @@ func advanceSplitPlan(source *v1beta1.InferenceService, observations map[string]
 	if reserved > math.MaxInt32 {
 		return allocation.Step{}, fmt.Errorf("rollout reservations exceed supported replica count")
 	}
-	input.RolloutReserved = int32(reserved)
+	input.RolloutReserved = int32(allowanceReserved)
 	if accepted.PauseSurge && !pauseAcknowledged {
 		return allocation.Step{Targets: input.Current, Reason: "AwaitingSurgePause"}, nil
 	}
@@ -417,10 +439,15 @@ func advanceSplitPlan(source *v1beta1.InferenceService, observations map[string]
 	// wait, because autoscalers need not shrink for them: an All change that keeps
 	// every member and adds no engine replicas, and a Split change with a local
 	// ceiling where no member leaves or drains, once each one serves its new share.
+	// An operator request that names this plan revision also skips it, and only it.
 	if step.Complete && accepted.PauseSurge && occupied+reserved > accepted.AssignedReplicas &&
 		!allMembersStayWithoutEngineGrowth(source.Status.Placement) && !splitSharesChangedInPlace(source, observations) {
-		step.Complete = false
-		step.Reason = "AwaitingMemberCleanup"
+		if releasesCleanupWait(source) {
+			step.CleanupReleased = true
+		} else {
+			step.Complete = false
+			step.Reason = "AwaitingMemberCleanup"
+		}
 	}
 	return step, err
 }
@@ -451,18 +478,20 @@ func allMembersStayWithoutEngineGrowth(placement *v1beta1.PlacementStatus) bool 
 }
 
 // splitSharesChangedInPlace reports whether a complete, paused Split step can
-// end the pause while autoscalers keep replicas above the new shares. The plan
-// needs a local ceiling, which lets an autoscaler run above its share, and no
-// affinity term may set component weights. No member leaves or drains and no
-// replicas are unassigned. A member may join. A complete step shows only that
-// members applied their targets, so each must also serve at least its new
-// engine and decoder shares. No member may keep a decoder or router for a
-// replacement elsewhere.
+// end the pause while autoscalers keep replicas above the new shares. The
+// primary component needs headroom (see primaryHeadroom), which lets an
+// autoscaler run above its share. No member
+// leaves or drains and no replicas are unassigned. A member may join. A complete
+// step shows only that members applied their targets, so each must also serve
+// at least its new engine and decoder shares, and its router share when routers
+// are divided, as the plan's weights split them. No member may keep a decoder or
+// router for a replacement elsewhere.
 func splitSharesChangedInPlace(source *v1beta1.InferenceService, observations map[string]plannedMemberObservation) bool {
 	placement := source.Status.Placement
+	primary := primaryScaleComponent(declaredComponents(source))
 	// A Split plan records no mode of its own.
 	if (placement.Plan.Mode != "" && placement.Plan.Mode != v1beta1.PlacementModeSplit) || placementMode(source) != v1beta1.PlacementModeSplit ||
-		affinity.SetsWeights(source.Spec.Placement.ClusterAffinity) || source.Spec.Placement.Split == nil || source.Spec.Placement.Split.MaxReplicasPerCluster <= 0 ||
+		primary == "" || !primaryHeadroom(source, primary) ||
 		placement.Plan.UnassignedReplicas != 0 || placement.Plan.OriginalUnassignedReplicas != 0 {
 		return false
 	}
@@ -470,6 +499,13 @@ func splitSharesChangedInPlace(source *v1beta1.InferenceService, observations ma
 		if held, err := splitSecondaryHolds(source, observations); err != nil || len(held) > 0 {
 			return false
 		}
+	}
+	// Engines and decoders are always divided across the members. Routers are
+	// divided unless the terms set weights that name only the engine or
+	// decoder; then every member runs the full router policy.
+	divided := []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}
+	if routerDivided(source) {
+		divided = append(divided, v1beta1.RouterComponent)
 	}
 	shares := componentFloorsFor(source, observations)
 	for _, candidate := range placement.Candidates {
@@ -490,19 +526,27 @@ func splitSharesChangedInPlace(source *v1beta1.InferenceService, observations ma
 		// A member that OME can read but not place gets the new plan without its
 		// new minimums, so its spec can lag the plan's shares.
 		minimums := memberMinimums(observed.Member)
-		if primary := primaryScaleComponent(declaredComponents(source)); primary != "" {
-			minimums[primary] = max(minimums[primary], a.CurrentReplicas)
-		}
+		minimums[primary] = max(minimums[primary], a.CurrentReplicas)
 		for _, share := range shares[candidate.Cluster] {
 			minimums[share.Component] = max(minimums[share.Component], share.Desired)
 		}
-		for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
+		for _, component := range divided {
 			if observed.ComponentReady[component] < minimums[component] {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+// primaryHeadroom reports whether a member's autoscaler may run the primary
+// component above its share: in the ratio form, when the source's maxReplicas
+// for it exceeds its minReplicas; otherwise, under a cap in split.maxPerCluster.
+func primaryHeadroom(source *v1beta1.InferenceService, primary v1beta1.ComponentType) bool {
+	if usesRatioForm(source) {
+		return componentMaxReplicas(source, primary) > componentMinReplicas(source, primary)
+	}
+	return source.Spec.Placement.Split.Ceiling(primary) > 0
 }
 
 // memberMinimums reads the minimum of each scalable component from a member's

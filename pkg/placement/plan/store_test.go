@@ -341,3 +341,55 @@ func TestPersistEmptyAllocation(t *testing.T) {
 		})
 	}
 }
+
+// withMinWeight copies a proposal and sets MinWeight to Weight on every
+// assignment and component match.
+func withMinWeight(p Proposal) Proposal {
+	out := p
+	out.Assignments = map[string]v1beta1.CandidateAllocationStatus{}
+	for name, stored := range p.Assignments {
+		a := *stored.DeepCopy()
+		a.MinWeight = a.Weight
+		for i := range a.ComponentMatches {
+			a.ComponentMatches[i].MinWeight = a.ComponentMatches[i].Weight
+		}
+		out.Assignments[name] = a
+	}
+	return out
+}
+
+// TestPersistMinWeightKeepsPlanIdentity persists a plan without MinWeight, as
+// a stored plan of an earlier release has, then the same plan with MinWeight:
+// the plan keeps its ID and revision and the stored status is not rewritten.
+// A fresh plan with MinWeight gets the same ID and stores MinWeight.
+func TestPersistMinWeightKeepsPlanIdentity(t *testing.T) {
+	proposal := proposalFixture()
+	a := proposal.Assignments["member-a"]
+	a.ComponentMatches = []v1beta1.ComponentAffinityMatch{{Component: v1beta1.DecoderComponent, Weight: ptr.To(int64(3))}}
+	proposal.Assignments["member-a"] = a
+
+	source := sourceFixture()
+	store := storeFixture(t, source)
+	first := mustPersist(t, store, source, proposal)
+	again := mustPersist(t, store, first, withMinWeight(proposal))
+	if diff := cmp.Diff(first, again); diff != "" {
+		t.Fatalf("adding MinWeight rewrote the stored plan (-first +again):\n%s", diff)
+	}
+
+	// Integer-form identity must not change: a different plan ID gives every
+	// stored plan a new revision on upgrade.
+	const wantID = "eca69b41b0fd94e78a3a13d55c357d8ccfb2bffb20af3a9d264604114f33d623.1"
+	if first.Status.Placement.Plan.ID != wantID {
+		t.Fatalf("plan ID %s without MinWeight, want %s", first.Status.Placement.Plan.ID, wantID)
+	}
+	fresh := sourceFixture()
+	got := mustPersist(t, storeFixture(t, fresh), fresh, withMinWeight(proposal))
+	if got.Status.Placement.Plan.ID != wantID {
+		t.Fatalf("plan ID %s with MinWeight, want %s", got.Status.Placement.Plan.ID, wantID)
+	}
+	for _, c := range got.Status.Placement.Candidates {
+		if c.Allocation.MinWeight == nil || *c.Allocation.MinWeight != *c.Allocation.Weight {
+			t.Fatalf("%s: minWeight %v not stored", c.Cluster, c.Allocation.MinWeight)
+		}
+	}
+}

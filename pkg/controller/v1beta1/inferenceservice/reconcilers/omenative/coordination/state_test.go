@@ -524,7 +524,7 @@ func TestComputeTransition_SequentialSoakHolds(t *testing.T) {
 		},
 		Now: now,
 	}
-	// 2s into a 5s soak, measured from the decoder's Ready transition.
+	// 2s into a 5s wait after readiness, measured from the decoder's Ready transition.
 	finishedAt(obs, v1beta1.DecoderComponent, now.Add(-2*time.Second))
 	tr := ComputeTransition(obs)
 	if tr.CompositePhase != v1beta1.CompositePhaseSequentialAwaiting {
@@ -571,7 +571,7 @@ func TestComputeTransition_SequentialSoakReleases(t *testing.T) {
 		},
 		Now: now,
 	}
-	// soak elapsed (10s > 5s) since the decoder's Ready transition
+	// the wait after readiness elapsed (10s > 5s) since the decoder's Ready transition
 	finishedAt(obs, v1beta1.DecoderComponent, now.Add(-10*time.Second))
 	tr := ComputeTransition(obs)
 	if tr.CompositePhase == v1beta1.CompositePhaseSequentialAwaiting {
@@ -784,8 +784,8 @@ func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) 
 			v1beta1.DecoderComponent: 2,
 		},
 	}
-	_, skew := computeSurgeBudgetWithRatio(obs)
-	if !skew {
+	_, held := computeSurgeBudgetWithRatio(obs)
+	if len(held) == 0 {
 		t.Errorf("with ServingPods=0 (a zero-serving baseline) the gate MUST trip skew — this test pins the deadlock shape so a regression is visible at unit level, not just in KIND")
 	}
 }
@@ -922,9 +922,11 @@ func scaledTo(m ComponentObservation, n int32) ComponentObservation {
 }
 
 // darkened takes every pod of a member out of readiness and rotation, as
-// rows demoted to Pending read, without a Failed row.
+// rows demoted to Pending read, without a Failed row; the replica's Ready
+// condition is no longer True, so no Ready transition is read.
 func darkened(m ComponentObservation) ComponentObservation {
 	m.ReadyPods, m.ServingPods, m.NewRevisionReadyPods, m.AtDesiredShape = 0, 0, 0, false
+	m.ReadyAt, m.NotReady = time.Time{}, true
 	return m
 }
 
@@ -951,16 +953,25 @@ func groupOf(policy v1beta1.CoordinationPolicy, members ...ComponentObservation)
 	return obs
 }
 
-// soaking is a Sequential group in its soak window: the decoder completed,
-// the engine bumped and rolling, and the soak not yet elapsed since the
-// decoder's Ready transition. The group's own transition time is a second
-// old, as after a phase change, and decides nothing.
+// soaking is a Sequential group inside its wait after readiness: the decoder completed
+// elapsed ago, which the previous pass recorded and the decoder's Ready
+// transition still shows, the engine bumped and rolling, and the wait not
+// yet elapsed. The group's own transition time is a second old, as after a
+// phase change, and decides nothing.
 func soaking(engine ComponentObservation, elapsed time.Duration) GroupObservation {
 	obs := groupOf(v1beta1.CoordinationPolicySequential, settledOn(v1beta1.DecoderComponent, "rev2"), engine)
 	obs.Group.Soak = 5 * time.Minute
 	obs.Now = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	obs.PreviousPhaseEnteredAt = obs.Now.Add(-time.Second)
 	finishedAt(obs, v1beta1.DecoderComponent, obs.Now.Add(-elapsed))
+	obs.MemberFinished = MemberFinish{Component: v1beta1.DecoderComponent, At: obs.Now.Add(-elapsed)}
+	return obs
+}
+
+// unrecorded drops the finish record the previous pass carried, as a group
+// whose status was never written with one reads.
+func unrecorded(obs GroupObservation) GroupObservation {
+	obs.MemberFinished = MemberFinish{}
 	return obs
 }
 
@@ -1016,6 +1027,15 @@ func TestComputeTransition_PhaseFollowsTheMembersFromEveryState(t *testing.T) {
 		return edited(m, func(m *ComponentObservation) { m.Partition = p })
 	}
 	pausedGroup := func(obs GroupObservation) GroupObservation { obs.PausedGlobal = true; return obs }
+	// readyAgain is a completed member whose pods are Ready again after a
+	// loss: its Ready condition turned True ago before now.
+	readyAgain := func(ago time.Duration) func(ComponentObservation) ComponentObservation {
+		return func(m ComponentObservation) ComponentObservation {
+			m.ReadyAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(-ago)
+			return m
+		}
+	}
+	readyAgainNow := readyAgain(0)
 
 	cases := []struct {
 		name      string
@@ -1046,6 +1066,15 @@ func TestComputeTransition_PhaseFollowsTheMembersFromEveryState(t *testing.T) {
 		{name: "awaiting-soak-elapsed-enters-the-member-phase", obs: soaking(rollingTo(engine, 3, 1, 0), 6*time.Minute), want: waiting, composite: "engine.Waiting"},
 		{name: "awaiting-soak-long-elapsed-reads-the-member-phase", obs: soaking(rollingTo(engine, 2, 0, 0), time.Hour), want: surging, composite: "engine.Surging"},
 		{name: "awaiting-completed-member-capacity-lost-keeps-awaiting", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), time.Minute), decoder, darkened), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
+		{name: "awaiting-completed-member-out-of-rotation-keeps-the-recorded-window", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), 2*time.Minute+45*time.Second), decoder, darkened), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
+		{name: "awaiting-completed-member-recovered-keeps-the-recorded-window", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), 3*time.Minute), decoder, readyAgainNow), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
+		{name: "awaiting-completed-member-recovered-releases-at-the-recorded-deadline", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), 5*time.Minute+time.Second), decoder, readyAgain(2*time.Minute+time.Second)), want: surging, composite: "engine.Surging"},
+		{name: "awaiting-completed-member-not-ready-past-the-window-stays-held", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), 6*time.Minute), decoder, darkened), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
+		{name: "awaiting-completed-member-ready-again-past-the-window-releases", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), 6*time.Minute), decoder, readyAgainNow), want: surging, composite: "engine.Surging"},
+		{name: "awaiting-completed-member-missing-keeps-the-recorded-window", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), 2*time.Minute+15*time.Second), decoder, func(ComponentObservation) ComponentObservation { return missing(decoder) }), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
+		{name: "awaiting-unrecorded-finish-is-recorded-from-the-ready-transition", obs: unrecorded(soaking(rollingTo(engine, 2, 0, 0), 4*time.Minute)), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
+		{name: "awaiting-unrecorded-finish-with-no-ready-transition-is-recorded-now", obs: edited2(unrecorded(soaking(rollingTo(engine, 2, 0, 0), time.Hour)), decoder, darkened), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
+		{name: "awaiting-completed-member-rolling-again-drops-the-record", obs: groupOf(seq, rollingTo(decoder, 2, 0, 0), rollingTo(engine, 2, 0, 0)), want: surging, composite: "decoder.Surging"},
 		{name: "awaiting-partition-on-the-next-member-keeps-awaiting", obs: soaking(withPartition(rollingTo(engine, 2, 0, 0), 1), time.Minute), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
 		{name: "awaiting-partition-cleared-keeps-awaiting", obs: soaking(withPartition(rollingTo(engine, 2, 0, 0), 0), time.Minute), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
 		{name: "awaiting-counters-trailing-keep-awaiting", obs: edited2(soaking(rollingTo(engine, 2, 0, 0), time.Minute), decoder, func(m ComponentObservation) ComponentObservation { m.ReadyPods = 1; return m }), want: idle, composite: v1beta1.CompositePhaseSequentialAwaiting},
@@ -1202,6 +1231,38 @@ func TestComputeTransition_PhaseFollowsTheMembersFromEveryState(t *testing.T) {
 				t.Fatalf("ratio skew: got %v want %v", tr.RatioSkewRejected, *tc.skew)
 			}
 		})
+	}
+}
+
+// A Sequential chain holds the next member while the finished one is not
+// Ready, names that member in the group status, and keeps the window
+// running from the recorded finish meanwhile: decoder then engine with a
+// five-minute wait, every decoder pod out of rotation at t+2m45s and still
+// out at t+6m, then Ready again at t+6m.
+func TestComputeTransition_SequentialHoldsWhileTheFinishedMemberIsNotReady(t *testing.T) {
+	engine, decoder := v1beta1.EngineComponent, v1beta1.DecoderComponent
+	// readyAgainNow is the decoder Ready again at this instant.
+	readyAgainNow := func(m ComponentObservation) ComponentObservation {
+		m.ReadyAt, m.NotReady = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), false
+		return m
+	}
+	held := ComputeTransition(edited2(soaking(rollingTo(engine, 2, 0, 0), 2*time.Minute+45*time.Second), decoder, darkened))
+	if held.CompositePhase != v1beta1.CompositePhaseSequentialAwaiting || held.MemberNotReady != decoder {
+		t.Fatalf("at t+2m45s the group must await the engine naming the decoder as not Ready; got %q (%q)", held.CompositePhase, held.MemberNotReady)
+	}
+	if want := "Sequential soak: decoder not Ready; 2m15s remaining before engine starts, once decoder is Ready"; held.Message != want {
+		t.Fatalf("message at t+2m45s: got %q want %q", held.Message, want)
+	}
+	past := ComputeTransition(edited2(soaking(rollingTo(engine, 2, 0, 0), 6*time.Minute), decoder, darkened))
+	if past.CompositePhase != v1beta1.CompositePhaseSequentialAwaiting || past.MemberNotReady != decoder {
+		t.Fatalf("at t+6m with the decoder still not Ready the group must keep awaiting the engine; got %q (%q)", past.CompositePhase, past.MemberNotReady)
+	}
+	if want := "Sequential soak: decoder not Ready; engine starts once decoder is Ready"; past.Message != want {
+		t.Fatalf("message at t+6m: got %q want %q", past.Message, want)
+	}
+	released := ComputeTransition(edited2(soaking(rollingTo(engine, 2, 0, 0), 6*time.Minute), decoder, readyAgainNow))
+	if released.CompositePhase != "engine.Surging" || released.MemberNotReady != "" {
+		t.Fatalf("the decoder Ready again at t+6m releases the engine at once; got %q (%q)", released.CompositePhase, released.MemberNotReady)
 	}
 }
 

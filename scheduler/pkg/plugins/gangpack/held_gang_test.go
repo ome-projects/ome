@@ -139,7 +139,7 @@ func TestPostFilter_FollowerVetoed_ActivatesReplanOnlyIfAnotherDomainFits(t *tes
 
 	t.Run("other domain reserved by a forming gang", func(t *testing.T) {
 		g, h, nodes, leader, worker := heldGang("x1", "x2", "y1", "y2")
-		if _, _, ok := g.assignments.ChooseInTopologyOnNodes("team/other", testKey, topology.FreeByDomain{"y": 2}, map[string][]string{"y": {"y1", "y2"}}, 2); !ok {
+		if _, _, ok := g.assignments.Choose(placement.Gang{Group: "team/other", TopologyKey: testKey}, topology.FreeByDomain{"y": 2}, map[string][]string{"y": {"y1", "y2"}}, 2); !ok {
 			t.Fatal("failed to reserve domain y for another gang")
 		}
 		if d := heldRound(t, g, h, nodes, leader, worker); d != "x" {

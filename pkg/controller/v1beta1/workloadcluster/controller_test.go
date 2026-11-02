@@ -288,12 +288,7 @@ func TestReconcile_BackoffTearsDownAfterGrace(t *testing.T) {
 
 	// Simulate that the failure run started well outside the grace window.
 	fail = true
-	r.mu.Lock()
-	if r.firstFailure == nil {
-		r.firstFailure = map[string]time.Time{}
-	}
-	r.firstFailure["c1"] = time.Now().Add(-2 * time.Hour)
-	r.mu.Unlock()
+	r.healthOf("c1").firstFailure = time.Now().Add(-2 * time.Hour)
 
 	_, err = r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "c1"}})
 	require.NoError(t, err)
@@ -360,10 +355,7 @@ func TestReconcile_RecoversAfterTransientFailure(t *testing.T) {
 	_, err = r.Reconcile(context.Background(), req)
 	require.NoError(t, err)
 
-	r.mu.Lock()
-	_, stillFailing := r.firstFailure["c1"]
-	r.mu.Unlock()
-	assert.False(t, stillFailing, "a recovered probe must clear the failure clock")
+	assert.True(t, r.healthOf("c1").firstFailure.IsZero(), "a recovered probe must clear the failure clock")
 	cond := readyCond(c, "c1")
 	require.NotNil(t, cond)
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)

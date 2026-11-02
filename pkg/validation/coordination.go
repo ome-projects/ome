@@ -77,11 +77,21 @@ const (
 // non-blocking warning since they effectively disable ratio enforcement.
 const ratioToleranceWarningThreshold int32 = 50
 
-// validComponents is the closed set of Components allowed in a rollout group.
-var validComponents = map[v1beta1.ComponentType]struct{}{
-	v1beta1.RouterComponent:  {},
-	v1beta1.EngineComponent:  {},
-	v1beta1.DecoderComponent: {},
+// isRole reports whether c names a role, the closed set of Components a
+// rollout group may list.
+func isRole(c v1beta1.ComponentType) bool {
+	_, ok := v1beta1.RoleOf(c)
+	return ok
+}
+
+// roleNames joins every role's name with sep, in primary-rank order (router
+// first), the order the rollout refusals list them in.
+func roleNames(sep string) string {
+	names := make([]string, 0, len(v1beta1.Roles))
+	for _, c := range v1beta1.RolesByPrimaryRank() {
+		names = append(names, string(c))
+	}
+	return strings.Join(names, sep)
 }
 
 // ValidateCoordination runs the coordination-style (blueGreen / rollingUpdate)
@@ -152,14 +162,37 @@ func CoordinationUpdateWarnings(oldSpec, newSpec *v1beta1.InferenceServiceSpec) 
 // or canary. Any other shape — independent Components, separate groups, or a
 // rollingUpdate group — reaches a step where every serving engine speaks a
 // protocol no serving decoder does (or vice versa), leaving routing with no
-// valid pair. Transitions to or from the empty value are always admitted:
-// empty pairs with anything, so every intermediate mix stays routable. So is
-// a change on a spec without both engine and decoder — there is no pair to
-// break.
+// valid pair. Without an encoder, transitions to or from the empty value are
+// always admitted: empty pairs with anything, so every intermediate mix stays
+// routable. So is a change on a spec without both engine and decoder — there
+// is no pair to break.
+//
+// While the old or the new spec declares an encoder, the value may only stay
+// the same or be cleared. The rollout gate keeps only the engine and the
+// decoder pairable, and it starts from what still serves, not from the edit:
+// a new value set while an earlier value still serves would leave the
+// encoder and the engine without a guard. For the same reason an edit that
+// adds an encoder must leave the value empty: an earlier change may still be
+// rolling, and the edit alone cannot show it.
 func ValidatePairingProtocolUpdate(oldSpec, newSpec *v1beta1.InferenceServiceSpec) error {
 	oldProtocol := oldSpec.RolloutPairingProtocol()
 	newProtocol := newSpec.RolloutPairingProtocol()
-	if oldProtocol == newProtocol || oldProtocol == "" || newProtocol == "" {
+	if oldSpec.Encoder == nil && newSpec.Encoder != nil && newProtocol != "" {
+		return fmt.Errorf("spec.rollout.pairingProtocol: adding an encoder needs an empty pairing protocol, but it is %q; clear it in the same edit, because an earlier change of the value may still be rolling and only the engine and the decoder are kept pairable through it (%s)",
+			newProtocol, ReasonEncoderAddedWithPairingProtocol)
+	}
+	if oldProtocol == newProtocol || newProtocol == "" {
+		return nil
+	}
+	if newSpec.Encoder != nil || oldSpec.Encoder != nil {
+		allowed := fmt.Sprintf("stay %q or be cleared", oldProtocol)
+		if oldProtocol == "" {
+			allowed = "stay empty"
+		}
+		return fmt.Errorf("spec.rollout.pairingProtocol: setting the pairing protocol to %q is refused while the service declares an encoder, or in the edit that removes it; the value may only %s, since only the engine and the decoder are kept pairable through a change (%s)",
+			newProtocol, allowed, ReasonPairingProtocolChangeWithEncoder)
+	}
+	if oldProtocol == "" {
 		return nil
 	}
 	if newSpec.Engine == nil || newSpec.Decoder == nil {
@@ -217,9 +250,9 @@ func validateGroupComponents(groups []v1beta1.RolloutGroup) error {
 			continue
 		}
 		for _, c := range g.Components {
-			if _, ok := validComponents[c]; !ok {
-				return fmt.Errorf("spec.rollout.groups[%d]: component %q is not one of router/engine/decoder (%s)",
-					i, c, ReasonInvalidComponentInCoordinationGroup)
+			if !isRole(c) {
+				return fmt.Errorf("spec.rollout.groups[%d]: component %q is not one of %s (%s)",
+					i, c, roleNames("/"), ReasonInvalidComponentInCoordinationGroup)
 			}
 		}
 		if err := validateOrderSubset(i, g.Components, g.Order); err != nil {
@@ -445,17 +478,8 @@ func componentPhrase(components []v1beta1.ComponentType) string {
 // declaredComponents returns the set of Components present on the spec.
 func declaredComponents(spec *v1beta1.InferenceServiceSpec) map[v1beta1.ComponentType]struct{} {
 	out := map[v1beta1.ComponentType]struct{}{}
-	if spec == nil {
-		return out
-	}
-	if spec.Engine != nil {
-		out[v1beta1.EngineComponent] = struct{}{}
-	}
-	if spec.Decoder != nil {
-		out[v1beta1.DecoderComponent] = struct{}{}
-	}
-	if spec.Router != nil {
-		out[v1beta1.RouterComponent] = struct{}{}
+	for _, r := range declaredRoles(spec) {
+		out[r.kind] = struct{}{}
 	}
 	return out
 }
@@ -471,14 +495,8 @@ func omenativeDeploymentModeMap(spec *v1beta1.InferenceServiceSpec) map[v1beta1.
 	if spec == nil {
 		return out
 	}
-	if spec.Engine != nil {
-		out[v1beta1.EngineComponent] = resolveComponentDeploymentMode(spec.Engine.Annotations, spec.DeploymentMode)
-	}
-	if spec.Decoder != nil {
-		out[v1beta1.DecoderComponent] = resolveComponentDeploymentMode(spec.Decoder.Annotations, spec.DeploymentMode)
-	}
-	if spec.Router != nil {
-		out[v1beta1.RouterComponent] = resolveComponentDeploymentMode(spec.Router.Annotations, spec.DeploymentMode)
+	for _, r := range declaredRoles(spec) {
+		out[r.kind] = resolveComponentDeploymentMode(r.extension.Annotations, spec.DeploymentMode)
 	}
 	return out
 }

@@ -29,25 +29,17 @@ func RequiredTrafficCapabilities(t *v1beta1.TrafficSpec) []string {
 	if t.Algorithm != nil {
 		out = append(out, constants.TrafficCapabilityAlgorithm)
 	}
-	if t.ConsistentHash != nil {
-		switch t.ConsistentHash.Type {
-		case v1beta1.HashTypeHeader:
-			out = append(out, constants.TrafficCapabilityHashHeader)
-			if len(t.ConsistentHash.Headers) > 1 {
+	if c := t.ConsistentHash; c != nil {
+		if rule, ok := hashTypeRules[c.Type]; ok {
+			out = append(out, rule.capability)
+			if rule.reads == hashKeyHeaders && len(c.Headers) > 1 {
 				out = append(out, constants.TrafficCapabilityHashMultipleHeaders)
 			}
-		case v1beta1.HashTypeCookie:
-			out = append(out, constants.TrafficCapabilityHashCookie)
-		case v1beta1.HashTypeSourceIP:
-			out = append(out, constants.TrafficCapabilityHashSourceIP)
 		}
 	}
-	if t.EndpointOverride != nil {
-		switch t.EndpointOverride.Type {
-		case v1beta1.EndpointOverrideTypeHeader:
-			out = append(out, constants.TrafficCapabilityEndpointOverrideHeader)
-		case v1beta1.EndpointOverrideTypeMetadata:
-			out = append(out, constants.TrafficCapabilityEndpointOverrideMetadata)
+	if e := t.EndpointOverride; e != nil {
+		if rule, ok := endpointOverrideRules[e.Type]; ok {
+			out = append(out, rule.capability)
 		}
 	}
 	return out

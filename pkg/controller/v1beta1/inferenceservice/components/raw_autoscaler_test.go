@@ -5,20 +5,15 @@ import (
 	"testing"
 
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -34,8 +29,7 @@ func TestRawComponentDeployment_UsesTypedKEDAForEveryComponent(t *testing.T) {
 		v1beta1.RouterComponent,
 	} {
 		t.Run(string(component), func(t *testing.T) {
-			scheme := rawAutoscalerTestScheme(t)
-			cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+			cl := componentClient(t)
 			clientset := rawAutoscalerTestClientset()
 			minReplicas := 1
 			ext := v1beta1.ComponentExtensionSpec{
@@ -67,7 +61,7 @@ func TestRawComponentDeployment_UsesTypedKEDAForEveryComponent(t *testing.T) {
 			deps := &ComponentDeps{
 				Client:    cl,
 				Clientset: clientset,
-				Scheme:    scheme,
+				Scheme:    cl.Scheme(),
 				Config:    &controllerconfig.InferenceServicesConfig{},
 			}
 
@@ -138,8 +132,7 @@ func TestWriteComponentAutoscalerStatus_RawCompatibilityResolution(t *testing.T)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			scheme := rawAutoscalerTestScheme(t)
-			cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+			cl := componentClient(t)
 			isvc := &v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: "status-raw", Namespace: "default"},
 				Spec: v1beta1.InferenceServiceSpec{
@@ -168,23 +161,6 @@ func TestWriteComponentAutoscalerStatus_RawCompatibilityResolution(t *testing.T)
 			assert.Equal(t, objectMeta.Name, status.ScaleTargetRef.Name)
 		})
 	}
-}
-
-func rawAutoscalerTestScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	scheme := runtime.NewScheme()
-	for _, addToScheme := range []func(*runtime.Scheme) error{
-		v1beta1.AddToScheme,
-		appsv1.AddToScheme,
-		autoscalingv2.AddToScheme,
-		corev1.AddToScheme,
-		policyv1.AddToScheme,
-		kedav1.AddToScheme,
-		monitoringv1.AddToScheme,
-	} {
-		require.NoError(t, addToScheme(scheme))
-	}
-	return scheme
 }
 
 func rawAutoscalerTestClientset() kubernetes.Interface {

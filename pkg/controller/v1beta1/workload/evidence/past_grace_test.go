@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -164,7 +165,7 @@ func TestFirstStuckPodForInstance_SkipsDeletingPods(t *testing.T) {
 		mkPod("ok", 10*time.Second, false, nil),            // skipped (no Waiting)
 		mkPod("stuck", 10*time.Second, false, &terminal),   // first eligible
 	}
-	got, reason := FirstStuckPodForInstance(pods, now, 2*time.Second)
+	got, reason := FirstStuckPodForInstanceSince(pods, now, 2*time.Second, time.Time{})
 	if got == nil || got.Name != "stuck" {
 		t.Errorf("got %+v want pod 'stuck'", got)
 	}
@@ -173,9 +174,9 @@ func TestFirstStuckPodForInstance_SkipsDeletingPods(t *testing.T) {
 	}
 
 	// No stuck pods: returns (nil, "").
-	none, noneReason := FirstStuckPodForInstance(
+	none, noneReason := FirstStuckPodForInstanceSince(
 		[]*corev1.Pod{mkPod("ok1", 10*time.Second, false, nil)},
-		now, 2*time.Second,
+		now, 2*time.Second, time.Time{},
 	)
 	if none != nil || noneReason != "" {
 		t.Errorf("no stuck pods: got (%v, %q) want (nil, '')", none, noneReason)
@@ -322,6 +323,82 @@ func TestPodStuckInTerminalWaiting_MeasuresFromTheWaitingEpisode(t *testing.T) {
 				t.Errorf("grace left = %s, want %s", left, tc.wantLeft)
 			}
 		})
+	}
+}
+
+// TestTerminalWaitReadings_CreateStillInFlight_NeitherFires checks a
+// CreateContainerError for a create the runtime has not finished: the
+// kubelet's call ran past its CRI deadline, or its retry found the
+// container name still reserved by the first call. Past the grace, neither
+// the escalation's reading nor the repair's reading fires on such a pod,
+// on a regular or an init container; a create the runtime refused fires
+// as before.
+func TestTerminalWaitReadings_CreateStillInFlight_NeitherFires(t *testing.T) {
+	now := time.Now()
+	const grace = time.Minute
+	for _, tc := range []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{name: "name still reserved by the first create", message: fixture.CreateReservedMessage},
+		{name: "call ran past the CRI deadline", message: "context deadline exceeded"},
+		{name: "runtime cancelled the call at its deadline", message: "stream terminated by RST_STREAM with error code: CANCEL"},
+		{name: "runtime refused the create", message: "failed to create containerd container: error unpacking image: no space left on device", want: true},
+	} {
+		for _, initContainer := range []bool{false, true} {
+			name := tc.name
+			if initContainer {
+				name += ", init container"
+			}
+			t.Run(name, func(t *testing.T) {
+				statuses := []corev1.ContainerStatus{{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "CreateContainerError",
+					Message: tc.message,
+				}}}}
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-10 * time.Minute))},
+					Status:     corev1.PodStatus{Phase: corev1.PodPending, ContainerStatuses: statuses},
+				}
+				if initContainer {
+					pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses = nil, statuses
+				}
+				if _, fired := PodStuckInTerminalWaiting(pod, now, grace); fired != tc.want {
+					t.Errorf("escalation reading = %v, want %v", fired, tc.want)
+				}
+				if _, fired := PodWedgedPastGrace(pod, now, grace); fired != tc.want {
+					t.Errorf("repair reading = %v, want %v", fired, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// TestFirstPodWaitingForReason_CreateStillInFlight_SkipsThatPod checks that
+// the pod named for a terminal reason is one the classifier counts as
+// terminal: in a gang where one pod's create is still running and another's
+// was refused, the refused pod is named; with only a create still running,
+// none is. A reason outside the terminal set is matched on the reason.
+func TestFirstPodWaitingForReason_CreateStillInFlight_SkipsThatPod(t *testing.T) {
+	waiting := func(name, reason, message string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: reason, Message: message},
+			}}}},
+		}
+	}
+	inFlight := waiting("engine-0-default-0", "CreateContainerError", fixture.CreateReservedMessage)
+	refused := waiting("engine-0-default-1", "CreateContainerError", "failed to create containerd container: error unpacking image: no space left on device")
+	if got := FirstPodWaitingForReason([]*corev1.Pod{inFlight, refused}, "CreateContainerError"); got != refused {
+		t.Errorf("mixed gang: got %v, want %s", got, refused.Name)
+	}
+	if got := FirstPodWaitingForReason([]*corev1.Pod{inFlight}, "CreateContainerError"); got != nil {
+		t.Errorf("create still running: got %s, want none", got.Name)
+	}
+	creating := waiting("engine-0-default-0", "ContainerCreating", "")
+	if got := FirstPodWaitingForReason([]*corev1.Pod{creating}, "ContainerCreating"); got != creating {
+		t.Errorf("non-terminal reason: got %v, want %s", got, creating.Name)
 	}
 }
 
@@ -532,7 +609,7 @@ func TestPodStuckInTerminalWaitingSince(t *testing.T) {
 		{name: "zero floor: measured from the episode", pod: wedgedFor(10 * time.Minute), wantStuck: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			reason, stuck := PodStuckInTerminalWaitingSince(tc.pod, now, grace, tc.floor)
+			reason, stuck := podStuckInTerminalWaitingSince(tc.pod, now, grace, tc.floor)
 			if stuck != tc.wantStuck {
 				t.Fatalf("stuck: got %v (%q) want %v", stuck, reason, tc.wantStuck)
 			}

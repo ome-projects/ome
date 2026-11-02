@@ -39,7 +39,7 @@ func TestMutator_Handle(t *testing.T) {
 		Status: v1.NamespaceStatus{},
 	}
 
-	if err := c.Create(context.TODO(), &omeNamespace); err != nil {
+	if err := c.Create(context.TODO(), &omeNamespace); err != nil && !apierrors.IsAlreadyExists(err) {
 		t.Errorf("failed to create namespace: %v", err)
 	}
 	mutator := Mutator{Client: c, Clientset: clientset, Decoder: admission.NewDecoder(c.Scheme())}

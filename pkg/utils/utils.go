@@ -64,15 +64,9 @@ func Includes(slice []string, value string) bool {
 	return false
 }
 
-// FilterPodOnlyAnnotations removes annotations that should only be applied to Pods,
-// not to Services. This is used when creating Kubernetes Service objects to prevent
-// pod-specific annotations (like Grafana scraping, GKE networking, container injection)
-// from being applied to Services where they have no effect.
-//
-// The filtering is based on constants.PodOnlyAnnotationPrefixes which contains both
-// prefix patterns (e.g., "k8s.grafana.com/") and exact annotation keys.
-//
-// Returns nil if input is nil, otherwise returns a new map with pod-only annotations removed.
+// FilterPodOnlyAnnotations returns a copy of annotations without the keys that
+// start with an entry of constants.PodOnlyAnnotationPrefixes, which belong on a
+// Pod and do nothing on a Service; nil stays nil.
 func FilterPodOnlyAnnotations(annotations map[string]string) map[string]string {
 	if annotations == nil {
 		return nil
@@ -118,20 +112,9 @@ func IsGPUEnabled(requirements v1.ResourceRequirements, acceleratorResources []s
 	return false
 }
 
-// PodRequestsAccelerator reports whether any container of spec requests one of
-// acceleratorResources in either Requests or Limits, counting init containers
-// alongside the runtime ones. The unit is the whole pod, which is the unit an
-// admission or accounting decision is made over.
-//
-// It is wider than IsGPUEnabled on both counts, deliberately: that one reads
-// Limits alone on a single container's requirements, and its callers rely on
-// exactly that. Here a chip held through Requests, or held only for the length
-// of an init container, is capacity held all the same.
-//
-// It applies no fallback either — an empty acceleratorResources matches
-// nothing rather than standing in for a default vendor. A caller whose
-// decision must not turn on an unconfigured list guards on the empty list
-// itself, so a fallback is never mistaken for a real answer.
+// PodRequestsAccelerator reports whether any container of spec, init containers
+// included, names one of acceleratorResources in its Requests or Limits. An empty
+// acceleratorResources matches nothing: there is no default resource name.
 func PodRequestsAccelerator(spec *v1.PodSpec, acceleratorResources []string) bool {
 	if spec == nil || len(acceleratorResources) == 0 {
 		return false
@@ -164,10 +147,8 @@ func IsPrefixSupported(input string, prefixes []string) bool {
 	return false
 }
 
-// MergeEnvs Merge a slice of EnvVars (`O`) into another slice of EnvVars (`B`), which does the following:
-// 1. If an EnvVar is present in B but not in O, value remains unchanged in the result
-// 2. If an EnvVar is present in `O` but not in `B`, appends to the result
-// 3. If an EnvVar is present in both O and B, uses the value from O in the result
+// MergeEnvs copies each override's Value onto the base entry of the same Name,
+// rewriting baseEnvs in place, and appends the overrides that have no base entry.
 func MergeEnvs(baseEnvs []v1.EnvVar, overrideEnvs []v1.EnvVar) []v1.EnvVar {
 	var extra []v1.EnvVar
 

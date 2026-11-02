@@ -11,14 +11,15 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// nodeUnknownHold is a name a silent node still holds: a pod in phase
-// Unknown, or one whose Ready the control plane withdrew because its
-// kubelet stopped heartbeating (evidence.SilentKubeletTargetPods). Neither is
-// terminal — the node stopped reporting and the container may still be
-// running — so recycling the name the way a Failed or Succeeded occupant
-// is recycled would risk two pods of one identity. The name is freed only
-// by the force-delete sweep, on proven node death; until then the row
-// reports the wait instead of spending its deadline in silence.
+// nodeUnknownHold is a name a pod with no report from its kubelet still
+// holds: a pod in phase Unknown, or one whose Ready the control plane
+// withdrew because its kubelet stopped heartbeating
+// (evidence.UnreportedTargetPods). Neither is terminal — the node stopped
+// reporting and the container may still be running — so recycling the
+// name the way a Failed or Succeeded occupant is recycled would risk two
+// pods of one identity. The name is freed only by the force-delete sweep,
+// on proven node death; until then the row reports the wait instead of
+// spending its deadline with no reason on the row.
 var nodeUnknownHold = authority{
 	token:  types.WaitingReasonNodeUnknown,
 	mayOwn: anyAttemptOwner,
@@ -36,25 +37,37 @@ var nodeUnknownHold = authority{
 // freed, not a wait, and recording it would park the attempt's deadline
 // for one pass and restart it on the next. A pod whose node posts Ready
 // is the kubelet's own lag, not a wait either.
+//
+// Both a held pod and a pod the sweep frees are named in nodeLost. Such a
+// member waits for its node or is about to be rebuilt, so the attempt is
+// not placed yet, even in the pass that frees the name.
 func reportNodeUnknown(ctx context.Context, in PassInput, row Row) (reading, error) {
 	own, _, err := in.rowPods(ctx, row)
 	if err != nil {
 		return reading{}, err
 	}
 	var held []*corev1.Pod
-	for _, pod := range evidence.SilentKubeletTargetPods(own, targetPodNames(in, row), in.Input.ForceDelete) {
-		kind, err := evidence.ReadSilentPod(ctx, in.Deps.Reader(), pod, in.Input.ForceDelete, in.Input.Now())
+	var nodeLost map[string]struct{}
+	for _, pod := range evidence.UnreportedTargetPods(own, targetPodNames(in, row), in.Input.ForceDelete) {
+		kind, err := evidence.ReadUnreportedPod(ctx, in.Deps.Reader(), pod, in.Input.ForceDelete, in.Input.Now())
 		if err != nil {
 			return reading{}, err
 		}
-		if evidence.SilentPodHeld(pod, kind) {
+		stillHeld := evidence.UnreportedPodHeld(pod, kind)
+		if stillHeld {
 			held = append(held, pod)
+		}
+		if stillHeld || kind.Actionable() {
+			if nodeLost == nil {
+				nodeLost = make(map[string]struct{})
+			}
+			nodeLost[pod.Name] = struct{}{}
 		}
 	}
 	if len(held) == 0 {
-		return reading{release: true}, nil
+		return reading{release: true, nodeLost: nodeLost}, nil
 	}
-	return reading{waiting: true, evidence: types.NodeUnknownTermination(held[0])}, nil
+	return reading{waiting: true, evidence: types.NodeUnknownTermination(held[0]), nodeLost: nodeLost}, nil
 }
 
 // target is one pod the row's plan asks for: its name and the Runner

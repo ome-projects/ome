@@ -1,19 +1,3 @@
-// service.go declares the typed input the workload package consumes
-// when rendering per-Component supporting Services. Splitting the spec
-// type out of the renderer keeps `workload/service` free of any
-// owner-CRD coupling: adapters (the ISVC OMENative dispatcher and the
-// InferenceReplica controller) populate PerComponentServiceSpec from
-// their respective owner shapes and hand it to
-// `service.ReconcileHeadlessService`.
-//
-// Why this lives here and not under `workload/`: the parent workload
-// tree's Service helpers in workload/service must depend on this type,
-// and several of the other typed inputs (Deps, ReconcileInput, plan,
-// ...) already live in workload/types/. Co-locating the Service input
-// alongside them keeps the workload package boundary clean — every
-// data carrier the workload renderer reads is in the same subpackage,
-// and the parent workload package's helpers reach for them via a
-// single `workload/types` import.
 package types
 
 import (

@@ -108,92 +108,142 @@ func (r Reader) Read(ctx context.Context, matched []v1beta1.WorkloadCluster, dem
 	return out, nil
 }
 
+// pair keys pools and report rows by accelerator resource and hardware flavor.
 type pair struct {
 	resource string
 	flavor   string
 }
 
+// compare orders pairs by resource name, then flavor name.
+func (p pair) compare(q pair) int {
+	if order := cmp.Compare(p.resource, q.resource); order != 0 {
+		return order
+	}
+	return cmp.Compare(p.flavor, q.flavor)
+}
+
+// normalize divides one member's reported hardware by its combined demand,
+// pool by pool, and keeps the smallest whole quotient as the member's weight.
 func normalize(cluster v1beta1.WorkloadCluster, demand Demand, reports []v1beta1.AcceleratorCapacityStatus, now time.Time, maxAge time.Duration) (Sample, error) {
 	if demand.Fingerprint == "" || len(demand.Pools) == 0 || demand.PrimaryUnits < 0 {
 		return Sample{}, fmt.Errorf("resolved accelerator demand and fingerprint are required")
 	}
 	units := max(demand.PrimaryUnits, 1)
-	pools := map[pair]Pool{}
-	for _, pool := range demand.Pools {
-		if pool.ResourceName == "" || pool.ResourceFlavor == "" || pool.FlavorUID == "" || pool.FlavorSetHash == "" {
-			return Sample{}, fmt.Errorf("resource, flavor identity, and mapping fingerprint are required")
-		}
-		quantity, exact := wholeUnits(pool.Quantity)
-		if !exact || quantity <= 0 {
-			return Sample{}, fmt.Errorf("demand for %s/%s must be positive whole units within int64", pool.ResourceName, pool.ResourceFlavor)
-		}
-		key := pair{pool.ResourceName, pool.ResourceFlavor}
-		if combined, exists := pools[key]; exists {
-			if combined.FlavorUID != pool.FlavorUID || combined.FlavorSetHash != pool.FlavorSetHash || !maps.Equal(combined.NodeLabels, pool.NodeLabels) {
-				return Sample{}, fmt.Errorf("components disagree on mapping for %s/%s", key.resource, key.flavor)
-			}
-			combined.Quantity.Add(pool.Quantity)
-			pools[key] = combined
-		} else {
-			pool.Quantity = pool.Quantity.DeepCopy()
-			pools[key] = pool
-		}
+	pools, err := combinePools(demand.Pools)
+	if err != nil {
+		return Sample{}, err
 	}
-	keys := slices.Collect(maps.Keys(pools))
-	slices.SortFunc(keys, func(a, b pair) int {
-		if a.resource != b.resource {
-			return cmp.Compare(a.resource, b.resource)
-		}
-		return cmp.Compare(a.flavor, b.flavor)
-	})
+	reading := clusterReading{clusterUID: cluster.UID, rows: clusterRows(reports, cluster.Name), now: now, maxAge: maxAge}
 	sample := Sample{ClusterUID: cluster.UID, DemandFingerprint: demand.Fingerprint, Weight: math.MaxInt64}
-	for _, key := range keys {
+	for _, key := range sortedKeys(pools) {
 		pool := pools[key]
 		required, exact := wholeUnits(pool.Quantity)
 		if !exact || required <= 0 {
 			return Sample{}, fmt.Errorf("combined demand for %s/%s exceeds whole int64 units", key.resource, key.flavor)
 		}
-		var row *v1beta1.AcceleratorClusterCapacityStatus
-		for _, report := range reports {
-			if report.ResourceName != key.resource || report.ResourceFlavor != key.flavor {
-				continue
-			}
-			for _, candidate := range report.PerCluster {
-				if candidate.Cluster != cluster.Name {
-					continue
-				}
-				if row != nil {
-					return Sample{}, fmt.Errorf("duplicate report for %s/%s", key.resource, key.flavor)
-				}
-				row = candidate.DeepCopy()
-			}
-		}
-		if row == nil || row.ClusterUID != cluster.UID || !row.ReportAvailable || row.ReportUID == "" || row.ReportResourceVersion == "" {
-			return Sample{}, fmt.Errorf("identified available report is missing for %s/%s", key.resource, key.flavor)
-		}
-		if row.ObservedAt == nil || row.ObservedAt.After(now) || now.Sub(row.ObservedAt.Time) >= maxAge {
-			return Sample{}, fmt.Errorf("report for %s/%s is missing a fresh observation time", key.resource, key.flavor)
-		}
-		mapping := row.Attribution
-		if mapping == nil || !mapping.Complete || mapping.FlavorUID != pool.FlavorUID || mapping.FlavorSetHash != pool.FlavorSetHash || !maps.Equal(mapping.NodeLabels, pool.NodeLabels) {
-			return Sample{}, fmt.Errorf("report mapping is unverified or incompatible for %s/%s", key.resource, key.flavor)
+		row, err := reading.verifiedRow(key, pool)
+		if err != nil {
+			return Sample{}, err
 		}
 		available, exact := wholeUnits(row.Allocatable)
 		if !exact || available < 0 || available > math.MaxInt64/units {
 			return Sample{}, fmt.Errorf("allocatable for %s/%s must be nonnegative whole units within int64", key.resource, key.flavor)
 		}
 		available *= units
-		if len(sample.Pools) > 0 && (sample.Pools[0].ReportUID != row.ReportUID || sample.Pools[0].ReportResourceVersion != row.ReportResourceVersion || sample.Pools[0].Attribution.FlavorSetHash != mapping.FlavorSetHash) {
+		if len(sample.Pools) > 0 && (sample.Pools[0].ReportUID != row.ReportUID || sample.Pools[0].ReportResourceVersion != row.ReportResourceVersion || sample.Pools[0].Attribution.FlavorSetHash != row.Attribution.FlavorSetHash) {
 			return Sample{}, fmt.Errorf("required pools belong to different source reports or attribution mappings")
 		}
 		sample.Weight = min(sample.Weight, available/required)
 		sample.Pools = append(sample.Pools, Evidence{
 			ResourceName: key.resource, ResourceFlavor: key.flavor, Demand: required, Allocatable: available,
 			ObservedAt: *row.ObservedAt, ReportUID: row.ReportUID, ReportResourceVersion: row.ReportResourceVersion,
-			Attribution: *mapping.DeepCopy(),
+			Attribution: *row.Attribution.DeepCopy(),
 		})
 	}
 	return sample, nil
+}
+
+// combinePools sums the demand of pools that share a resource and flavor.
+// Pools of one pair must agree on the flavor's identity and mapping.
+func combinePools(pools []Pool) (map[pair]Pool, error) {
+	out := map[pair]Pool{}
+	for _, pool := range pools {
+		if pool.ResourceName == "" || pool.ResourceFlavor == "" || pool.FlavorUID == "" || pool.FlavorSetHash == "" {
+			return nil, fmt.Errorf("resource, flavor identity, and mapping fingerprint are required")
+		}
+		quantity, exact := wholeUnits(pool.Quantity)
+		if !exact || quantity <= 0 {
+			return nil, fmt.Errorf("demand for %s/%s must be positive whole units within int64", pool.ResourceName, pool.ResourceFlavor)
+		}
+		key := pair{pool.ResourceName, pool.ResourceFlavor}
+		combined, exists := out[key]
+		if !exists {
+			pool.Quantity = pool.Quantity.DeepCopy()
+			out[key] = pool
+			continue
+		}
+		if combined.FlavorUID != pool.FlavorUID || combined.FlavorSetHash != pool.FlavorSetHash || !maps.Equal(combined.NodeLabels, pool.NodeLabels) {
+			return nil, fmt.Errorf("components disagree on mapping for %s/%s", key.resource, key.flavor)
+		}
+		combined.Quantity.Add(pool.Quantity)
+		out[key] = combined
+	}
+	return out, nil
+}
+
+// sortedKeys lists the pool keys by resource name, then flavor name.
+func sortedKeys(pools map[pair]Pool) []pair {
+	keys := slices.Collect(maps.Keys(pools))
+	slices.SortFunc(keys, pair.compare)
+	return keys
+}
+
+// clusterReading is one member's rows of the root's capacity reports and the
+// freshness rule they are read under.
+type clusterReading struct {
+	clusterUID types.UID
+	rows       map[pair][]*v1beta1.AcceleratorClusterCapacityStatus
+	now        time.Time
+	maxAge     time.Duration
+}
+
+// clusterRows indexes one cluster's rows of the capacity reports by resource
+// and flavor; a pair with more than one row is a duplicate report.
+func clusterRows(reports []v1beta1.AcceleratorCapacityStatus, cluster string) map[pair][]*v1beta1.AcceleratorClusterCapacityStatus {
+	rows := map[pair][]*v1beta1.AcceleratorClusterCapacityStatus{}
+	for _, report := range reports {
+		key := pair{report.ResourceName, report.ResourceFlavor}
+		for _, candidate := range report.PerCluster {
+			if candidate.Cluster == cluster {
+				rows[key] = append(rows[key], candidate.DeepCopy())
+			}
+		}
+	}
+	return rows
+}
+
+// verifiedRow is the cluster's one report row for a pool, when that row is
+// identified, available, fresh, and attributed to the pool's flavor mapping.
+func (r clusterReading) verifiedRow(key pair, pool Pool) (*v1beta1.AcceleratorClusterCapacityStatus, error) {
+	rows := r.rows[key]
+	if len(rows) > 1 {
+		return nil, fmt.Errorf("duplicate report for %s/%s", key.resource, key.flavor)
+	}
+	var row *v1beta1.AcceleratorClusterCapacityStatus
+	if len(rows) == 1 {
+		row = rows[0]
+	}
+	if row == nil || row.ClusterUID != r.clusterUID || !row.ReportAvailable || row.ReportUID == "" || row.ReportResourceVersion == "" {
+		return nil, fmt.Errorf("identified available report is missing for %s/%s", key.resource, key.flavor)
+	}
+	if row.ObservedAt == nil || row.ObservedAt.After(r.now) || r.now.Sub(row.ObservedAt.Time) >= r.maxAge {
+		return nil, fmt.Errorf("report for %s/%s is missing a fresh observation time", key.resource, key.flavor)
+	}
+	mapping := row.Attribution
+	if mapping == nil || !mapping.Complete || mapping.FlavorUID != pool.FlavorUID || mapping.FlavorSetHash != pool.FlavorSetHash || !maps.Equal(mapping.NodeLabels, pool.NodeLabels) {
+		return nil, fmt.Errorf("report mapping is unverified or incompatible for %s/%s", key.resource, key.flavor)
+	}
+	return row, nil
 }
 
 // wholeUnits accepts every exact Quantity representation, including decimal

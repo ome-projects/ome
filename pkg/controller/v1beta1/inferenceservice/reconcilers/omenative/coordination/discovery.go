@@ -146,7 +146,7 @@ func InjectPeerEnv(pod *corev1.Pod, isvc *v1beta1.InferenceService, peers []v1be
 }
 
 // ServingPeers returns the other Components declared on the ISVC (the serving
-// topology: router/engine/decoder), excluding c, deduplicated and sorted.
+// topology: every declared role), excluding c, deduplicated and sorted.
 //
 // Peer endpoints are a SERVING concern — a PD engine needs the decoder's address
 // to serve regardless of how the rollout groups or sequences the Components — so
@@ -157,20 +157,11 @@ func ServingPeers(isvc *v1beta1.InferenceService, c v1beta1.ComponentType) []v1b
 	if isvc == nil {
 		return nil
 	}
-	declared := make([]v1beta1.ComponentType, 0, 3)
-	if isvc.Spec.Router != nil {
-		declared = append(declared, v1beta1.RouterComponent)
-	}
-	if isvc.Spec.Engine != nil {
-		declared = append(declared, v1beta1.EngineComponent)
-	}
-	if isvc.Spec.Decoder != nil {
-		declared = append(declared, v1beta1.DecoderComponent)
-	}
+	declared := v1beta1.ServiceRoles(&isvc.Spec).Declared()
 	peers := make([]v1beta1.ComponentType, 0, len(declared))
 	for _, d := range declared {
-		if d != c {
-			peers = append(peers, d)
+		if d.Type != c {
+			peers = append(peers, d.Type)
 		}
 	}
 	return sortedComponents(peers)

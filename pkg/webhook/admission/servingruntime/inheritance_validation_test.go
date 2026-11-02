@@ -6,76 +6,57 @@ import (
 	"testing"
 
 	"github.com/onsi/gomega"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/runtimeinheritance"
 	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
-func mkProfile(name string, disabled bool) *v1beta1.ClusterServingRuntime {
-	return &v1beta1.ClusterServingRuntime{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        name,
-			Annotations: map[string]string{constants.RuntimeProfileAnnotationKey: "true"},
-		},
-		Spec: v1beta1.ServingRuntimeSpec{Disabled: ptr.To(disabled)},
-	}
-}
-
-func mkCSR(name, inheritFrom string) *v1beta1.ClusterServingRuntime {
-	annotations := map[string]string{}
-	if inheritFrom != "" {
-		annotations[constants.RuntimeInheritFromAnnotationKey] = inheritFrom
-	}
-	return &v1beta1.ClusterServingRuntime{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: annotations},
-	}
-}
-
+// A runtime annotated as a profile must be disabled.
 func TestValidateProfileMarker(t *testing.T) {
-	g := gomega.NewWithT(t)
-
-	// No marker → always OK.
-	g.Expect(validateProfileMarker(nil, nil)).To(gomega.Succeed())
-	g.Expect(validateProfileMarker(map[string]string{}, ptr.To(false))).To(gomega.Succeed())
-
-	// Marker set + disabled=true → OK.
-	g.Expect(validateProfileMarker(
-		map[string]string{constants.RuntimeProfileAnnotationKey: "true"},
-		ptr.To(true),
-	)).To(gomega.Succeed())
-
-	// Marker set + disabled=nil → reject.
-	err := validateProfileMarker(map[string]string{constants.RuntimeProfileAnnotationKey: "true"}, nil)
-	g.Expect(err).To(gomega.HaveOccurred())
-	g.Expect(err.Error()).To(gomega.ContainSubstring("disabled: true"))
-
-	// Marker set + disabled=false → reject.
-	err = validateProfileMarker(
-		map[string]string{constants.RuntimeProfileAnnotationKey: "true"},
-		ptr.To(false),
-	)
-	g.Expect(err).To(gomega.HaveOccurred())
+	profile := map[string]string{constants.RuntimeProfileAnnotationKey: "true"}
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		disabled    *bool
+		wantErr     bool
+	}{
+		{name: "no annotations"},
+		{name: "no profile annotation, enabled", annotations: map[string]string{}, disabled: ptr.To(false)},
+		{name: "profile annotation, disabled", annotations: profile, disabled: ptr.To(true)},
+		{name: "profile annotation, disabled unset", annotations: profile, wantErr: true},
+		{name: "profile annotation, enabled", annotations: profile, disabled: ptr.To(false), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			err := validateProfileMarker(tt.annotations, tt.disabled)
+			if !tt.wantErr {
+				g.Expect(err).To(gomega.Succeed())
+				return
+			}
+			g.Expect(err).To(gomega.HaveOccurred())
+			g.Expect(err.Error()).To(gomega.ContainSubstring("disabled: true"))
+		})
+	}
 }
 
 func TestValidateClusterRuntimeInheritance_NoAnnotation(t *testing.T) {
 	g := gomega.NewWithT(t)
 	c := fakeclient.New(t)
 
-	csr := mkCSR("solo", "")
+	csr := clusterServingRuntime("solo")
 	g.Expect(validateClusterRuntimeInheritance(context.Background(), c, csr)).To(gomega.Succeed())
 }
 
 func TestValidateClusterRuntimeInheritance_ParentExists(t *testing.T) {
 	g := gomega.NewWithT(t)
-	profile := mkProfile("profile-infra", true)
+	profile := clusterServingRuntime("profile-infra", withProfileAnnotation(), withDisabled(true))
 	c := fakeclient.New(t, fakeclient.WithObjects(profile))
 
-	csr := mkCSR("rt", "profile-infra")
+	csr := clusterServingRuntime("rt", withParent("profile-infra"))
 	g.Expect(validateClusterRuntimeInheritance(context.Background(), c, csr)).To(gomega.Succeed())
 }
 
@@ -83,19 +64,18 @@ func TestValidateClusterRuntimeInheritance_ParentMissing(t *testing.T) {
 	g := gomega.NewWithT(t)
 	c := fakeclient.New(t)
 
-	csr := mkCSR("rt", "ghost")
+	csr := clusterServingRuntime("rt", withParent("missing-parent"))
 	err := validateClusterRuntimeInheritance(context.Background(), c, csr)
 	g.Expect(err).To(gomega.HaveOccurred())
 	var pnf *runtimeinheritance.ParentNotFoundError
 	g.Expect(errors.As(err, &pnf)).To(gomega.BeTrue())
-	g.Expect(pnf.Parent).To(gomega.Equal("ghost"))
+	g.Expect(pnf.Parent).To(gomega.Equal("missing-parent"))
 }
 
 func TestValidateClusterRuntimeInheritance_Cycle(t *testing.T) {
 	g := gomega.NewWithT(t)
-	// b → a; we then create a → b which forms the cycle.
-	b := mkCSR("b", "a")
-	a := mkCSR("a", "b")
+	b := clusterServingRuntime("b", withParent("a"))
+	a := clusterServingRuntime("a", withParent("b"))
 	c := fakeclient.New(t, fakeclient.WithObjects(a, b))
 
 	err := validateClusterRuntimeInheritance(context.Background(), c, a)
@@ -106,17 +86,17 @@ func TestValidateClusterRuntimeInheritance_Cycle(t *testing.T) {
 
 func TestValidateClusterRuntimeInheritance_DepthExceeded(t *testing.T) {
 	g := gomega.NewWithT(t)
-	// 6-deep chain: n0 (root) ← n1 ← … ← n5; test the runtime that points to n5 (overall depth = 7).
+	// A chain of six, n0 to n5, and a runtime under n5: seven levels in all.
 	objects := []client.Object{}
 	prev := ""
 	for i := 0; i < 6; i++ {
 		name := "n" + string(rune('0'+i))
-		objects = append(objects, mkCSR(name, prev))
+		objects = append(objects, clusterServingRuntime(name, withParent(prev)))
 		prev = name
 	}
 	c := fakeclient.New(t, fakeclient.WithObjects(objects...))
 
-	leaf := mkCSR("leaf", "n5")
+	leaf := clusterServingRuntime("leaf", withParent("n5"))
 	err := validateClusterRuntimeInheritance(context.Background(), c, leaf)
 	g.Expect(err).To(gomega.HaveOccurred())
 	var de *runtimeinheritance.MaxDepthExceededError
@@ -125,55 +105,30 @@ func TestValidateClusterRuntimeInheritance_DepthExceeded(t *testing.T) {
 
 func TestValidateNamespacedRuntimeInheritance_SameNamespace(t *testing.T) {
 	g := gomega.NewWithT(t)
-	parent := &v1beta1.ServingRuntime{
-		ObjectMeta: metav1.ObjectMeta{Name: "ns-profile", Namespace: "team"},
-	}
+	parent := servingRuntime("ns-profile", "team")
 	c := fakeclient.New(t, fakeclient.WithObjects(parent))
 
-	sr := &v1beta1.ServingRuntime{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "rt",
-			Namespace:   "team",
-			Annotations: map[string]string{constants.RuntimeInheritFromAnnotationKey: "ns-profile"},
-		},
-	}
+	sr := servingRuntime("rt", "team", withParent("ns-profile"))
 	g.Expect(validateNamespacedRuntimeInheritance(context.Background(), c, sr)).To(gomega.Succeed())
 }
 
 func TestValidateNamespacedRuntimeInheritance_FallsBackToCluster(t *testing.T) {
 	g := gomega.NewWithT(t)
-	parent := mkCSR("cluster-profile", "")
+	parent := clusterServingRuntime("cluster-profile")
 	c := fakeclient.New(t, fakeclient.WithObjects(parent))
 
-	sr := &v1beta1.ServingRuntime{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "rt",
-			Namespace: "team",
-			Annotations: map[string]string{
-				constants.RuntimeInheritFromAnnotationKey: "cluster-profile",
-			},
-		},
-	}
+	sr := servingRuntime("rt", "team", withParent("cluster-profile"))
 	g.Expect(validateNamespacedRuntimeInheritance(context.Background(), c, sr)).To(gomega.Succeed())
 }
 
+// A parent is read from the runtime's own namespace and from cluster scope
+// only, so a same-named runtime in another namespace is not found.
 func TestValidateNamespacedRuntimeInheritance_CrossNamespaceRejected(t *testing.T) {
 	g := gomega.NewWithT(t)
-	// Parent is a ServingRuntime in a different namespace. The
-	// fetcher only checks the consumer's namespace + cluster scope,
-	// so the cross-ns name resolves as ParentNotFound.
-	otherNS := &v1beta1.ServingRuntime{
-		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "other-team"},
-	}
+	otherNS := servingRuntime("shared", "other-team")
 	c := fakeclient.New(t, fakeclient.WithObjects(otherNS))
 
-	sr := &v1beta1.ServingRuntime{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:        "rt",
-			Namespace:   "team",
-			Annotations: map[string]string{constants.RuntimeInheritFromAnnotationKey: "shared"},
-		},
-	}
+	sr := servingRuntime("rt", "team", withParent("shared"))
 	err := validateNamespacedRuntimeInheritance(context.Background(), c, sr)
 	g.Expect(err).To(gomega.HaveOccurred())
 	var pnf *runtimeinheritance.ParentNotFoundError

@@ -14,6 +14,7 @@ type InferenceServiceStatus struct {
 	//
 	// - EngineReady: engine readiness condition.
 	// - DecoderReady: decoder readiness condition.
+	// - EncoderReady: encoder readiness condition.
 	// - RouterReady: router readiness condition.
 	// - IngressReady: ingress resource readiness.
 	// - Ready: component aggregate on workload clusters, or placement serving
@@ -294,10 +295,11 @@ type ComponentTrafficTarget struct {
 	// +optional
 	LatestRevision bool `json:"latestRevision,omitempty"`
 
-	// PairingProtocol is the engine↔decoder wire-compatibility token the
-	// target's revision was minted under (spec.rollout.pairingProtocol at
-	// mint time). Consumers MUST only pair engine and decoder targets whose
-	// PairingProtocol values are equal; an empty value pairs with anything.
+	// PairingProtocol is the wire-compatibility token the target's revision
+	// was minted under (spec.rollout.pairingProtocol at mint time). Consumers
+	// MUST only pair targets of two roles that pass state to each other
+	// (engine and decoder, encoder and engine) whose PairingProtocol values
+	// are equal; an empty value pairs with anything.
 	// +optional
 	PairingProtocol string `json:"pairingProtocol,omitempty"`
 }
@@ -328,6 +330,7 @@ const (
 	RouterComponent  ComponentType = "router"
 	EngineComponent  ComponentType = "engine"
 	DecoderComponent ComponentType = "decoder"
+	EncoderComponent ComponentType = "encoder"
 )
 
 // ConditionType represents a Service condition value
@@ -336,6 +339,9 @@ const (
 	EngineReady apis.ConditionType = "EngineReady"
 	// DecoderReady is set when decoder pods are ready.
 	DecoderReady apis.ConditionType = "DecoderReady"
+	// EncoderReady is set when encoder pods are ready. Like DecoderReady, it
+	// is not part of the aggregate Ready condition.
+	EncoderReady apis.ConditionType = "EncoderReady"
 	// RouterReady is set when router has reported readiness.
 	RouterReady apis.ConditionType = "RouterReady"
 	// IngressReady is set when Ingress is created

@@ -127,15 +127,15 @@ func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
 	// events drive freshness and the safety requeue only recovers a missed event;
 	// with it off there is no event source, so the poll cadence (requeueInterval)
 	// is the backstop.
-	safetyRequeue := pl.StatusSafetyRequeueDuration()
+	safetyRequeue := pl.StatusSafetyRequeue.Duration()
 	if !wc.CacheEnabled {
-		safetyRequeue = pl.RequeueIntervalDuration()
+		safetyRequeue = pl.RequeueInterval.Duration()
 	}
 	var capacityConfig *placement.CapacityConfig
 	if pl.Capacity != nil {
 		capacityConfig = &placement.CapacityConfig{
 			RootName: pl.Capacity.RootName,
-			MaxAge:   pl.Capacity.MaxAgeDuration(), StabilityWindow: pl.Capacity.StabilityWindowDuration(), RefreshInterval: pl.Capacity.RefreshIntervalDuration(),
+			MaxAge:   pl.Capacity.MaxAge.Duration(), StabilityWindow: pl.Capacity.StabilityWindow.Duration(), RefreshInterval: pl.Capacity.RefreshInterval.Duration(),
 		}
 	}
 
@@ -143,37 +143,37 @@ func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
 		clientTuning: workloadcluster.ClientTuning{
 			QPS:            float32(wc.ClientQPS),
 			Burst:          wc.ClientBurst,
-			PerCallTimeout: wc.PerCallTimeoutDuration(),
+			PerCallTimeout: wc.PerCallTimeout.Duration(),
 		},
 		cacheEnabled:      wc.CacheEnabled,
-		healthInterval:    wc.HealthIntervalDuration(),
-		connectionGrace:   wc.ConnectionGraceDuration(),
-		eventsBatchPeriod: wc.EventsBatchPeriodDuration(),
+		healthInterval:    wc.HealthInterval.Duration(),
+		connectionGrace:   wc.ConnectionGrace.Duration(),
+		eventsBatchPeriod: wc.EventsBatchPeriod.Duration(),
 		reconnectBackoff: workloadcluster.ReconnectBackoffConfig{
-			EstablishInitial: wc.EstablishInitialDuration(),
-			EstablishMax:     wc.EstablishMaxDuration(),
-			RetryMax:         wc.ReconnectRetryMaxDuration(),
+			EstablishInitial: wc.EstablishInitial.Duration(),
+			EstablishMax:     wc.EstablishMax.Duration(),
+			RetryMax:         wc.ReconnectRetryMax.Duration(),
 		},
-		requeue:          pl.RequeueIntervalDuration(),
-		gcInterval:       pl.GCIntervalDuration(),
+		requeue:          pl.RequeueInterval.Duration(),
+		gcInterval:       pl.GCInterval.Duration(),
 		maxConcurrent:    pl.MaxConcurrentReconciles,
-		placeTimeout:     pl.FanoutTimeoutDuration(),
-		winnerLostGrace:  pl.WinnerLostGraceDuration(),
-		observationGrace: pl.ObservationGraceDuration(),
+		placeTimeout:     pl.FanoutTimeout.Duration(),
+		winnerLostGrace:  pl.WinnerLostGrace.Duration(),
+		observationGrace: pl.ObservationGrace.Duration(),
 		memberReadRetry: placement.MemberReadRetry{
 			MaxAttempts:    pl.MemberReadRetry.MaxAttempts,
-			InitialBackoff: pl.MemberReadRetry.InitialBackoffDuration(),
-			MaxBackoff:     pl.MemberReadRetry.MaxBackoffDuration(),
+			InitialBackoff: pl.MemberReadRetry.InitialBackoff.Duration(),
+			MaxBackoff:     pl.MemberReadRetry.MaxBackoff.Duration(),
 		},
-		statusBatchPeriod:       pl.StatusBatchPeriodDuration(),
+		statusBatchPeriod:       pl.StatusBatchPeriod.Duration(),
 		statusSafetyRequeue:     safetyRequeue,
 		dispatcherMode:          placement.DispatcherMode(pl.DispatcherMode),
 		dispatcherStepSize:      pl.DispatcherStepSize,
-		dispatcherRoundTimeout:  pl.DispatcherRoundTimeoutDuration(),
+		dispatcherRoundTimeout:  pl.DispatcherRoundTimeout.Duration(),
 		localQueue:              pl.LocalQueue,
 		capacity:                capacityConfig,
 		memberOperatorNamespace: pl.MemberOperatorNamespace,
-		funnelResyncInterval:    wc.FunnelResyncIntervalDuration(),
+		funnelResyncInterval:    wc.FunnelResyncInterval.Duration(),
 		funnelBufferSize:        wc.FunnelBufferSize,
 		endpoint: placementendpoint.Config{
 			GlobalHostTemplate: ep.GlobalHostTemplate,
@@ -188,7 +188,7 @@ func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
 				},
 				EndpointSlices: placementendpoint.GatewayBackendEndpointSliceConfig{
 					Enabled:                ep.GatewayBackend.EndpointSlices.Enabled,
-					AddressRefreshInterval: ep.GatewayBackend.EndpointSlices.AddressRefreshIntervalDuration(),
+					AddressRefreshInterval: ep.GatewayBackend.EndpointSlices.AddressRefreshInterval.Duration(),
 				},
 			},
 		},
@@ -198,21 +198,21 @@ func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
 				MaxConcurrentReconciles: rt.Observer.MaxConcurrentReconciles,
 				MaxConcurrentRequests:   rt.Observer.MaxConcurrentRequests,
 				MaxResponseBytes:        rt.Observer.MaxResponseBytes,
-				MinPeriod:               rt.Observer.MinPeriodDuration(),
+				MinPeriod:               rt.Observer.MinPeriod.Duration(),
 				MaxSamples:              rt.Observer.MaxSamples,
 			},
 			Publisher: placementrouting.PublisherConfig{
 				Name:           rt.Publisher.Name,
 				Options:        rt.Publisher.Options,
-				ResyncInterval: rt.Publisher.ResyncIntervalDuration(),
+				ResyncInterval: rt.Publisher.ResyncInterval.Duration(),
 			},
 			Probe: placementrouting.ProbeConfig{
 				Path:             rt.Probe.Path,
 				Method:           rt.Probe.Method,
 				AcceptStatuses:   rt.Probe.AcceptStatuses,
 				GateStatuses:     rt.Probe.GateStatuses,
-				Period:           rt.Probe.PeriodDuration(),
-				Timeout:          rt.Probe.TimeoutDuration(),
+				Period:           rt.Probe.Period.Duration(),
+				Timeout:          rt.Probe.Timeout.Duration(),
 				FailureThreshold: rt.Probe.FailureThreshold,
 				SuccessThreshold: rt.Probe.SuccessThreshold,
 				AllFailedPolicy:  placementrouting.AllFailedPolicy(rt.Probe.AllFailedPolicy),
@@ -225,9 +225,9 @@ func resolveMCWiring(mc *controllerconfig.MultiClusterConfig) mcWiring {
 				Options: rt.Capacity.Options,
 				Samples: rt.Capacity.Samples,
 				Quorum:  rt.Capacity.Quorum,
-				Period:  rt.Capacity.PeriodDuration(),
-				Timeout: rt.Capacity.TimeoutDuration(),
-				MaxAge:  rt.Capacity.MaxAgeDuration(),
+				Period:  rt.Capacity.Period.Duration(),
+				Timeout: rt.Capacity.Timeout.Duration(),
+				MaxAge:  rt.Capacity.MaxAge.Duration(),
 			},
 		},
 	}

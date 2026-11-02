@@ -11,6 +11,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -240,7 +241,7 @@ func TestReconcile_DataPlaneRunsWithoutCoordinationGroup(t *testing.T) {
 	pods := []runtime.Object{
 		buildPod(isvc, v1beta1.EngineComponent, "hash1", 0),
 	}
-	c := testClient(pods...)
+	c := testClient(endpointsListed(isvc, pods...)...)
 	r, err := Reconcile(context.Background(), ReconcileInputs{
 		ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
 		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
@@ -431,7 +432,7 @@ func TestReconcile_ObservesPodsViaCachedClient(t *testing.T) {
 	pods := []runtime.Object{
 		buildPod(isvc, v1beta1.EngineComponent, "hash1", 0),
 	}
-	c := testClient(pods...)
+	c := testClient(endpointsListed(isvc, pods...)...)
 	// Reader deliberately nil: if coordination still read pods via Reader
 	// this would panic. The cached Client must carry the observation.
 	r, err := Reconcile(context.Background(), ReconcileInputs{
@@ -457,7 +458,7 @@ func TestReconcile_WritesTrafficStatus(t *testing.T) {
 		buildPod(isvc, v1beta1.EngineComponent, "hash1", 0),
 		buildPod(isvc, v1beta1.EngineComponent, "hash1", 1),
 	}
-	c := testClient(pods...)
+	c := testClient(endpointsListed(isvc, pods...)...)
 	if _, err := Reconcile(context.Background(), ReconcileInputs{
 		ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
 		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
@@ -587,7 +588,7 @@ func TestReconcile_TrafficLatestRevisionIdenticalShapeAcrossComponents(t *testin
 		buildPod(isvc, v1beta1.DecoderComponent, "decoderHash", 0),
 		buildPod(isvc, v1beta1.RouterComponent, "routerHash", 0),
 	}
-	c := testClient(append(pods, engineIR, decoderIR, routerIR)...)
+	c := testClient(endpointsListed(isvc, append(pods, engineIR, decoderIR, routerIR)...)...)
 	if _, err := Reconcile(context.Background(), ReconcileInputs{
 		ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
 		ComponentDeploymentModes: testOMENativeModes(
@@ -645,10 +646,13 @@ func TestReconcile_TrafficLatestRevisionFlipPersists(t *testing.T) {
 	if err := appsv1.AddToScheme(scheme); err != nil {
 		panic(err)
 	}
+	if err := discoveryv1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
 	if err := v1beta1.AddToScheme(scheme); err != nil {
 		panic(err)
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(pod, engineIR).WithStatusSubresource(&v1beta1.InferenceReplica{}).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(endpointsListed(isvc, pod, engineIR)...).WithStatusSubresource(&v1beta1.InferenceReplica{}).Build()
 
 	// First reconcile: UpdateRevision empty → LatestRevision=false.
 	if _, err := Reconcile(context.Background(), ReconcileInputs{
@@ -711,7 +715,7 @@ func TestReconcile_PreviousRolledoutRecordedOnAdvance(t *testing.T) {
 				UpdateRevision: isvc.Name + "-engine-" + hash,
 			},
 		}
-		c := testClient(buildPod(isvc, v1beta1.EngineComponent, hash, 0), engineIR)
+		c := testClient(endpointsListed(isvc, buildPod(isvc, v1beta1.EngineComponent, hash, 0), engineIR)...)
 		if _, err := Reconcile(context.Background(), ReconcileInputs{
 			ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
 			ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
@@ -1079,6 +1083,9 @@ func testClient(objs ...runtime.Object) client.Client {
 		panic(err)
 	}
 	if err := appsv1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	if err := discoveryv1.AddToScheme(scheme); err != nil {
 		panic(err)
 	}
 	if err := v1beta1.AddToScheme(scheme); err != nil {
@@ -1522,12 +1529,12 @@ func TestGroupPhase_ParkedAttemptRestartingInsideTheGraceDoesNotReenterFailed(t 
 	follow := func(p *corev1.Pod) {
 		t.Helper()
 		input.ObservedState.InstanceStatuses = []workloadtypes.InstanceStatus{row}
-		err := escalation.FollowParkedAttempts(context.Background(), escalation.PassInput{
+		err := escalation.FollowStoppedAttempts(context.Background(), escalation.PassInput{
 			Input: input, Plan: plan, Target: target,
 			Pods: func(context.Context) (map[int32][]*corev1.Pod, error) { return map[int32][]*corev1.Pod{0: {p}}, nil },
 		})
 		if err != nil {
-			t.Fatalf("FollowParkedAttempts: %v", err)
+			t.Fatalf("FollowStoppedAttempts: %v", err)
 		}
 	}
 
@@ -2022,7 +2029,7 @@ func TestReconcile_TrafficWeighsOnlyReadyPods(t *testing.T) {
 		buildPod(isvc, v1beta1.EngineComponent, "hash1", 0),
 		buildReadyPod(isvc, v1beta1.EngineComponent, "hash2", 1, false),
 	}
-	c := testClient(pods...)
+	c := testClient(endpointsListed(isvc, pods...)...)
 	if _, err := Reconcile(context.Background(), ReconcileInputs{
 		ISVC: isvc, Client: c, Reader: c, Now: time.Now(), ComponentRunnerPorts: testComponentRunnerPorts(),
 		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
@@ -2356,7 +2363,7 @@ func TestReconcile_TrafficDropsRevisionHeldOutOfRotation(t *testing.T) {
 	objs := []runtime.Object{oldRevision, newRevision, decoderIR}
 	objs = append(objs, buildGangPods(isvc, decoder, newHash, 0, corev1.ConditionTrue)...)
 	objs = append(objs, buildGangPods(isvc, decoder, oldHash, 1, corev1.ConditionFalse)...)
-	c := testClient(objs...)
+	c := testClient(endpointsListed(isvc, objs...)...)
 	if _, err := Reconcile(context.Background(), ReconcileInputs{
 		ISVC: isvc, Client: c, Reader: c, Now: time.Now(), ComponentRunnerPorts: testComponentRunnerPorts(),
 		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent, decoder),
@@ -2402,7 +2409,7 @@ func TestReconcile_ReferencedRoleKeysPerRevisionObjectsOnTheReplicaPrefix(t *tes
 		},
 		Spec: corev1.ServiceSpec{Selector: perRevisionServiceSelector("pool-d", v1beta1.DecoderComponent, "old")},
 	}
-	c := testClient(referencedPod("pool-a", v1beta1.EngineComponent), referencedPod("pool-d", v1beta1.DecoderComponent), buildPod(isvc, v1beta1.RouterComponent, "hash1", 0), stale)
+	c := testClient(endpointsListed(isvc, referencedPod("pool-a", v1beta1.EngineComponent), referencedPod("pool-d", v1beta1.DecoderComponent), buildPod(isvc, v1beta1.RouterComponent, "hash1", 0), stale)...)
 	if _, err := Reconcile(context.Background(), ReconcileInputs{
 		ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
 		ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent),
@@ -2744,7 +2751,7 @@ func TestReconcile_EachPassWritesThePhaseItsOwnReadComputed(t *testing.T) {
 // in the order the pass issued it, and passes every call through.
 func recordingServiceClient(created *[]string, objs ...runtime.Object) client.Client {
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, v1beta1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, discoveryv1.AddToScheme, v1beta1.AddToScheme} {
 		if addErr := add(scheme); addErr != nil {
 			panic(addErr)
 		}
@@ -2778,9 +2785,9 @@ func TestReconcile_PerRevisionServicesAreWrittenInSortedRevisionOrder(t *testing
 		isvc := testOMENativeISVC()
 		isvc.Spec.Rollout = singleEngineGroup()
 		var created []string
-		c := recordingServiceClient(&created, rollingEngineIR(isvc),
+		c := recordingServiceClient(&created, endpointsListed(isvc, rollingEngineIR(isvc),
 			buildPod(isvc, v1beta1.EngineComponent, "aaaa", 0),
-			buildPod(isvc, v1beta1.EngineComponent, "bbbb", 1))
+			buildPod(isvc, v1beta1.EngineComponent, "bbbb", 1))...)
 		if _, err := Reconcile(ctx, ReconcileInputs{
 			ISVC: isvc, Client: c, Reader: c, Now: time.Now(),
 			ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent),
@@ -2922,9 +2929,9 @@ func TestReconcile_TrafficFollowsTheServingGangs(t *testing.T) {
 	}
 	oldLeader := gangMemberPod(isvc, eng, "old", 0, v1beta1.RunnerNameLeader, true)
 	newLeader := gangMemberPod(isvc, eng, "new", 1, v1beta1.RunnerNameLeader, true)
-	c := testClient(engineIR,
+	c := testClient(endpointsListed(isvc, engineIR,
 		oldLeader, gangMemberPod(isvc, eng, "old", 0, v1beta1.RunnerNameWorker, true),
-		newLeader, gangMemberPod(isvc, eng, "new", 1, v1beta1.RunnerNameWorker, true))
+		newLeader, gangMemberPod(isvc, eng, "new", 1, v1beta1.RunnerNameWorker, true))...)
 	reconcile := func(step string) {
 		t.Helper()
 		if _, err := Reconcile(context.Background(), ReconcileInputs{
@@ -2961,7 +2968,7 @@ func TestReconcile_TrafficStaysOnTheOnlyRevisionWhileItsGangIsDark(t *testing.T)
 	isvc := testOMENativeISVC()
 	eng := v1beta1.EngineComponent
 	leader := gangMemberPod(isvc, eng, "only", 0, v1beta1.RunnerNameLeader, true)
-	c := testClient(leader, gangMemberPod(isvc, eng, "only", 0, v1beta1.RunnerNameWorker, true))
+	c := testClient(endpointsListed(isvc, leader, gangMemberPod(isvc, eng, "only", 0, v1beta1.RunnerNameWorker, true))...)
 	reconcile := func(step string) {
 		t.Helper()
 		if _, err := Reconcile(context.Background(), ReconcileInputs{
@@ -3111,6 +3118,313 @@ func TestReconcile_ARemovedGroupIsPrunedFromEveryPhase(t *testing.T) {
 			cond := isvc.Status.GetCondition(apis.ConditionType(v1beta1.RolloutCoordinationReady))
 			if cond == nil || cond.Status != corev1.ConditionTrue {
 				t.Fatalf("RolloutCoordinationReady must read True once no group is left; got %+v", cond)
+			}
+		})
+	}
+}
+
+// chainMemberIR is one chain member's replica with two Instances on the
+// running revision, its current and update revisions by hash, and a Ready
+// condition in the given state since the given instant. The rows and the
+// counters follow the condition: Ready rows while it is True, Pending rows
+// and no Ready pod otherwise. The parent-generation annotation matches the
+// service, so the replica-side gate reads the replica as fresh.
+func chainMemberIR(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, currentHash, updateHash, runningHash string, ready metav1.ConditionStatus, since time.Time) *v1beta1.InferenceReplica {
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: irprojector.InferenceReplicaName(isvc.Name, c), Namespace: isvc.Namespace,
+			Annotations: parentGenAnnotation(isvc.Generation),
+		},
+		Spec: v1beta1.InferenceReplicaSpec{Replicas: int32Ptr(2)},
+		Status: v1beta1.InferenceReplicaStatus{
+			Replicas:        2,
+			CurrentRevision: isvc.Name + "-" + string(c) + "-" + currentHash,
+			UpdateRevision:  isvc.Name + "-" + string(c) + "-" + updateHash,
+		},
+	}
+	setChainMemberRows(ir, runningHash, ready, since)
+	return ir
+}
+
+// setChainMemberRows writes a chain member's rows, counters and Ready
+// condition for the given readiness: every Instance Ready on the running
+// revision while the condition is True, Pending with no Ready pod otherwise.
+func setChainMemberRows(ir *v1beta1.InferenceReplica, runningHash string, ready metav1.ConditionStatus, since time.Time) {
+	running := ir.Name + "-" + runningHash
+	phase, n := v1beta1.OMENativeInstanceReady, int32(2)
+	if ready != metav1.ConditionTrue {
+		phase, n = v1beta1.OMENativeInstancePending, 0
+	}
+	ir.Status.ReadyReplicas, ir.Status.ServingReplicas, ir.Status.AvailableReplicas = n, n, n
+	ir.Status.UpdatedReplicas, ir.Status.UpdatedReadyReplicas = 0, 0
+	if running == ir.Status.UpdateRevision {
+		ir.Status.UpdatedReplicas, ir.Status.UpdatedReadyReplicas = 2, n
+	}
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: phase, RunningRevision: running},
+		{Index: 1, Phase: phase, RunningRevision: running},
+	}
+	reason := "AllInstancesReady"
+	if ready != metav1.ConditionTrue {
+		reason = "NoInstanceReady"
+	}
+	ir.Status.Conditions = []metav1.Condition{{Type: conditionReady, Status: ready, Reason: reason, LastTransitionTime: metav1.NewTime(since)}}
+}
+
+// setChainMemberReadiness rewrites a stored chain member's readiness: its
+// rows, counters and Ready condition, as the replica controller publishes
+// them when every pod leaves rotation or serves again.
+func setChainMemberReadiness(ctx context.Context, t *testing.T, c client.Client, ir *v1beta1.InferenceReplica, runningHash string, ready metav1.ConditionStatus, since time.Time) {
+	t.Helper()
+	live := &v1beta1.InferenceReplica{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(ir), live); err != nil {
+		t.Fatalf("read replica %s: %v", ir.Name, err)
+	}
+	setChainMemberRows(live, runningHash, ready, since)
+	if err := c.Update(ctx, live); err != nil {
+		t.Fatalf("write replica %s: %v", ir.Name, err)
+	}
+}
+
+// chainPods are the two pods of each chain member on the given revision.
+func chainPods(isvc *v1beta1.InferenceService, decoderHash, engineHash string) []runtime.Object {
+	return []runtime.Object{
+		buildPod(isvc, v1beta1.DecoderComponent, decoderHash, 0), buildPod(isvc, v1beta1.DecoderComponent, decoderHash, 1),
+		buildPod(isvc, v1beta1.EngineComponent, engineHash, 0), buildPod(isvc, v1beta1.EngineComponent, engineHash, 1),
+	}
+}
+
+// sequentialChainPass runs one coordination pass over a chain at the given
+// offset from t0 and checks the composite phase the group writes.
+func sequentialChainPass(ctx context.Context, t *testing.T, isvc *v1beta1.InferenceService, c client.Client, t0 time.Time, at time.Duration, want string) {
+	t.Helper()
+	in := ReconcileInputs{ISVC: isvc, Client: c, Reader: c, Now: t0.Add(at), ComponentDeploymentModes: testOMENativeModes(v1beta1.EngineComponent, v1beta1.DecoderComponent)}
+	if _, err := Reconcile(ctx, in); err != nil {
+		t.Fatalf("pass at t+%s: %v", at, err)
+	}
+	if isvc.Status.RolloutCoordination == nil || len(isvc.Status.RolloutCoordination.Groups) != 1 {
+		t.Fatalf("pass at t+%s: expected one group entry; got %+v", at, isvc.Status.RolloutCoordination)
+	}
+	if got := isvc.Status.RolloutCoordination.Groups[0].CompositePhase; got != want {
+		t.Fatalf("at t+%s the group reads %q, want %q (message %q)", at, got, want, isvc.Status.RolloutCoordination.Groups[0].Message)
+	}
+}
+
+// A Sequential chain's wait after a finished member runs from the instant
+// that member first read done, and a readiness loss of the member afterwards
+// neither cuts the wait short nor starts it over. Decoder then engine, both
+// of 2 Instances, a five-minute wait after the decoder: the decoder finishes
+// at t+0; every decoder pod leaves rotation at t+2m45s and is Ready again at
+// t+3m; the group keeps Awaiting the engine until t+5m and reads the engine's
+// own phase from then on.
+func TestReconcile_TheWaitAfterAMemberRunsFromItsFinishThroughAReadinessLoss(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	isvc := sequentialChainISVC(5 * time.Minute)
+	decoder := chainMemberIR(isvc, v1beta1.DecoderComponent, "bbbb", "bbbb", "bbbb", metav1.ConditionTrue, t0)
+	engine := chainMemberIR(isvc, v1beta1.EngineComponent, "aaaa", "bbbb", "aaaa", metav1.ConditionUnknown, t0)
+	c := testClient(append(chainPods(isvc, "bbbb", "aaaa"), decoder, engine)...)
+
+	sequentialChainPass(ctx, t, isvc, c, t0, 0, v1beta1.CompositePhaseSequentialAwaiting)
+	setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionFalse, t0.Add(2*time.Minute+45*time.Second))
+	sequentialChainPass(ctx, t, isvc, c, t0, 2*time.Minute+45*time.Second, v1beta1.CompositePhaseSequentialAwaiting)
+	if msg := isvc.Status.RolloutCoordination.Groups[0].Message; !strings.Contains(msg, "decoder not Ready") {
+		t.Fatalf("at t+2m45s the group must say the decoder is not Ready; got %q", msg)
+	}
+	setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionTrue, t0.Add(3*time.Minute))
+	sequentialChainPass(ctx, t, isvc, c, t0, 3*time.Minute, v1beta1.CompositePhaseSequentialAwaiting)
+	if msg := isvc.Status.RolloutCoordination.Groups[0].Message; strings.Contains(msg, "not Ready") {
+		t.Fatalf("at t+3m the decoder is Ready again and the group must say so; got %q", msg)
+	}
+	sequentialChainPass(ctx, t, isvc, c, t0, 4*time.Minute+59*time.Second, v1beta1.CompositePhaseSequentialAwaiting)
+	sequentialChainPass(ctx, t, isvc, c, t0, 5*time.Minute+time.Second, "engine.Surging")
+}
+
+// While the finished member is not Ready the next member is held past the
+// window too, and it starts on the member's recovery when the window has
+// elapsed meanwhile: every decoder pod leaves rotation at t+2m45s and comes
+// back at t+6m; at t+5m1s the group still awaits the engine, naming the
+// decoder's readiness, and at t+6m the engine's own phase shows at once.
+func TestReconcile_TheNextMemberStartsOnRecoveryWhenTheWaitElapsedDuringTheLoss(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	isvc := sequentialChainISVC(5 * time.Minute)
+	decoder := chainMemberIR(isvc, v1beta1.DecoderComponent, "bbbb", "bbbb", "bbbb", metav1.ConditionTrue, t0)
+	engine := chainMemberIR(isvc, v1beta1.EngineComponent, "aaaa", "bbbb", "aaaa", metav1.ConditionUnknown, t0)
+	c := testClient(append(chainPods(isvc, "bbbb", "aaaa"), decoder, engine)...)
+
+	sequentialChainPass(ctx, t, isvc, c, t0, 0, v1beta1.CompositePhaseSequentialAwaiting)
+	setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionFalse, t0.Add(2*time.Minute+45*time.Second))
+	sequentialChainPass(ctx, t, isvc, c, t0, 5*time.Minute+time.Second, v1beta1.CompositePhaseSequentialAwaiting)
+	if msg := isvc.Status.RolloutCoordination.Groups[0].Message; !strings.Contains(msg, "decoder not Ready") {
+		t.Fatalf("at t+5m1s the group must say the decoder is not Ready; got %q", msg)
+	}
+	setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionTrue, t0.Add(6*time.Minute))
+	sequentialChainPass(ctx, t, isvc, c, t0, 6*time.Minute, "engine.Surging")
+}
+
+// The wait after a finished member also runs on while that member's replica
+// object is deleted and created again: the fresh object publishes nothing
+// for a pass and then a Ready condition that turned True on the new object,
+// and neither releases the engine early nor delays it past t+5m.
+func TestReconcile_TheWaitAfterAMemberRunsOnWhenItsReplicaIsRecreated(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	isvc := sequentialChainISVC(5 * time.Minute)
+	decoder := chainMemberIR(isvc, v1beta1.DecoderComponent, "bbbb", "bbbb", "bbbb", metav1.ConditionTrue, t0)
+	engine := chainMemberIR(isvc, v1beta1.EngineComponent, "aaaa", "bbbb", "aaaa", metav1.ConditionUnknown, t0)
+	c := testClient(append(chainPods(isvc, "bbbb", "aaaa"), decoder, engine)...)
+
+	sequentialChainPass(ctx, t, isvc, c, t0, 0, v1beta1.CompositePhaseSequentialAwaiting)
+	if err := c.Delete(ctx, decoder); err != nil {
+		t.Fatalf("delete replica: %v", err)
+	}
+	recreated := chainMemberIR(isvc, v1beta1.DecoderComponent, "bbbb", "bbbb", "bbbb", metav1.ConditionTrue, t0)
+	recreated.Status = v1beta1.InferenceReplicaStatus{}
+	if err := c.Create(ctx, recreated); err != nil {
+		t.Fatalf("create replica again: %v", err)
+	}
+	sequentialChainPass(ctx, t, isvc, c, t0, 2*time.Minute+15*time.Second, v1beta1.CompositePhaseSequentialAwaiting)
+	// The replica controller publishes the recreated object: the same
+	// revisions, a Ready condition that turned True now.
+	live := &v1beta1.InferenceReplica{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(recreated), live); err != nil {
+		t.Fatalf("read replica: %v", err)
+	}
+	live.Status = decoder.Status
+	setChainMemberRows(live, "bbbb", metav1.ConditionTrue, t0.Add(2*time.Minute+16*time.Second))
+	if err := c.Update(ctx, live); err != nil {
+		t.Fatalf("publish replica: %v", err)
+	}
+	sequentialChainPass(ctx, t, isvc, c, t0, 2*time.Minute+30*time.Second, v1beta1.CompositePhaseSequentialAwaiting)
+	sequentialChainPass(ctx, t, isvc, c, t0, 5*time.Minute+time.Second, "engine.Surging")
+}
+
+// TestGroupPhase_AHeldMemberKeepsThePhaseItsRowsCompute locks what the group
+// reads while a rolling member's retry record for its target is Held: the
+// phase its Instance rows compute, and nothing from the record. A push whose
+// new image no pod can pull ends its attempt with the old pod still serving,
+// so the row reads Ready on the old revision with the failed attempt on its
+// record and the group reads Surging, a roll in flight and held, not Failed,
+// under BlueGreen, RollingUpdate and Sequential alike; Sequential keeps the
+// held member as the current one. A Failed row beside the record reads
+// Failed with the rows' own summary. The replicas' own holds carry the Held
+// reading, and a release of the record changes nothing the phase reads.
+func TestGroupPhase_AHeldMemberKeepsThePhaseItsRowsCompute(t *testing.T) {
+	isvc := testOMENativeISVC()
+	engine, decoder := v1beta1.EngineComponent, v1beta1.DecoderComponent
+	const v1, v2 = "llama-engine-v1", "llama-engine-v2"
+	old := func(index int32) v1beta1.OMENativeInstanceStatus {
+		return v1beta1.OMENativeInstanceStatus{Index: index, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: v1, TargetRevision: v1, PodCount: 1, ServingPodCount: 1}
+	}
+	// attempted is the row the replica publishes once a surge toward v2 has
+	// ended without serving: Ready on v1, the pushed revision kept as its
+	// target, the failure on its record and no operation open.
+	attempted := func(index int32) v1beta1.OMENativeInstanceStatus {
+		row := old(index)
+		row.TargetRevision = v2
+		row.LastFailure = &v1beta1.InstanceTermination{PodName: "pull-failed", Reason: "ImagePullBackOff"}
+		return row
+	}
+	replica := func(c v1beta1.ComponentType, update string, rows []v1beta1.OMENativeInstanceStatus, held bool) *v1beta1.InferenceReplica {
+		ir := &v1beta1.InferenceReplica{
+			ObjectMeta: metav1.ObjectMeta{Name: irprojector.InferenceReplicaName(isvc.Name, c), Namespace: isvc.Namespace},
+			Status: v1beta1.InferenceReplicaStatus{
+				Replicas: int32(len(rows)), ReadyReplicas: int32(len(rows)), ServingReplicas: int32(len(rows)),
+				CurrentRevision: v1, UpdateRevision: update, InstanceStatuses: rows,
+			},
+		}
+		if held {
+			ir.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: v2, State: v1beta1.RetryBlockHeld, AttemptsStarted: 3, Reason: "ImagePullBackOff"}}
+		}
+		return ir
+	}
+	failedRow := func(index int32) v1beta1.OMENativeInstanceStatus {
+		row := attempted(index)
+		row.Phase = v1beta1.OMENativeInstanceFailed
+		row.ServingPodCount = 0
+		return row
+	}
+	cases := []struct {
+		name          string
+		group         ResolvedGroup
+		replicas      []runtime.Object
+		wantPhase     v1beta1.CoordinationPhase
+		wantComposite string
+		wantMessage   string
+		wantCurrent   v1beta1.ComponentType
+	}{
+		{
+			name:  "bluegreen: one engine attempt failed and the revision is Held while the other engine and the decoder serve",
+			group: ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{engine, decoder}, Policy: v1beta1.CoordinationPolicyBlueGreen},
+			replicas: []runtime.Object{
+				replica(engine, v2, []v1beta1.OMENativeInstanceStatus{attempted(0), old(1)}, true),
+				replica(decoder, v1, []v1beta1.OMENativeInstanceStatus{old(0)}, false),
+			},
+			wantComposite: "Surging",
+		},
+		{
+			name:  "sequential: the decoder, first in Order, is Held and the engine waits its turn",
+			group: ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{decoder, engine}, Order: []v1beta1.ComponentType{decoder, engine}, Policy: v1beta1.CoordinationPolicySequential},
+			replicas: []runtime.Object{
+				replica(decoder, v2, []v1beta1.OMENativeInstanceStatus{attempted(0)}, true),
+				replica(engine, v2, []v1beta1.OMENativeInstanceStatus{old(0)}, false),
+			},
+			wantComposite: "decoder.Surging",
+			wantCurrent:   decoder,
+		},
+		{
+			name:  "rollingupdate: both sides roll, each with one failed attempt, and the decoder is Held",
+			group: ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{engine, decoder}, Policy: v1beta1.CoordinationPolicyRollingUpdate},
+			replicas: []runtime.Object{
+				replica(engine, v2, []v1beta1.OMENativeInstanceStatus{attempted(0), old(1), old(2)}, false),
+				replica(decoder, v2, []v1beta1.OMENativeInstanceStatus{attempted(0), old(1), old(2)}, true),
+			},
+			wantComposite: "Surging",
+		},
+		{
+			name:  "rollingupdate: the same rows with the record released read the same",
+			group: ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{engine, decoder}, Policy: v1beta1.CoordinationPolicyRollingUpdate},
+			replicas: []runtime.Object{
+				replica(engine, v2, []v1beta1.OMENativeInstanceStatus{attempted(0), old(1), old(2)}, false),
+				replica(decoder, v2, []v1beta1.OMENativeInstanceStatus{attempted(0), old(1), old(2)}, false),
+			},
+			wantComposite: "Surging",
+		},
+		{
+			name:  "rollingupdate: a Failed row beside the Held decoder reads Failed from the row",
+			group: ResolvedGroup{Name: "0", Components: []v1beta1.ComponentType{engine, decoder}, Policy: v1beta1.CoordinationPolicyRollingUpdate},
+			replicas: []runtime.Object{
+				replica(engine, v2, []v1beta1.OMENativeInstanceStatus{failedRow(0), old(1), old(2)}, false),
+				replica(decoder, v2, []v1beta1.OMENativeInstanceStatus{attempted(0), old(1), old(2)}, true),
+			},
+			wantPhase:     v1beta1.CoordinationPhaseFailed,
+			wantComposite: "Failed",
+			wantMessage:   "one or more Components in the RollingUpdate group failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			obs, err := buildGroupObservation(context.Background(), testClient(tc.replicas...), isvc, tc.group, map[v1beta1.ComponentType]map[string]int32{})
+			if err != nil {
+				t.Fatalf("buildGroupObservation: %v", err)
+			}
+			tr := ComputeTransition(obs)
+			wantPhase := tc.wantPhase
+			if wantPhase == "" {
+				wantPhase = v1beta1.CoordinationPhaseSurging
+			}
+			if tr.Phase != wantPhase {
+				t.Fatalf("phase=%q (composite %q, message %q), want %q: the phase is the rows', the record never enters it", tr.Phase, tr.CompositePhase, tr.Message, wantPhase)
+			}
+			if tc.wantMessage != "" && tr.Message != tc.wantMessage {
+				t.Errorf("message=%q, want %q", tr.Message, tc.wantMessage)
+			}
+			if tr.CompositePhase != tc.wantComposite {
+				t.Errorf("composite=%q, want %q", tr.CompositePhase, tc.wantComposite)
+			}
+			if tr.CurrentComponent != tc.wantCurrent {
+				t.Errorf("current=%q, want %q", tr.CurrentComponent, tc.wantCurrent)
 			}
 		})
 	}

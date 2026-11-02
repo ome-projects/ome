@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	clocktesting "k8s.io/utils/clock/testing"
 	kptr "k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
@@ -39,7 +40,8 @@ func TestBuildSpec_ReportedCapacityMode_WeightsByReportNotReplicas(t *testing.T)
 		{"all zero", []float64{0, 0}, []int32{0, 0}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			isvc := splitISVC([]string{"a", "b"}, []int32{60, 80}, []int32{0, 80})
+			// One ready replica on a lets its report apply without capping it.
+			isvc := splitISVC([]string{"a", "b"}, []int32{60, 80}, []int32{1, 80})
 			isvc.Spec.Routing = &v1beta1.RoutingSpec{CapacityFactors: map[string]resource.Quantity{
 				"a": resource.MustParse("100"), "b": resource.MustParse("0.01"),
 			}}
@@ -273,7 +275,8 @@ func TestBuildSpec_ReportedModeSourceNotPlacedOrNoEndpoint_EmptyWithReason(t *te
 }
 
 func TestBuildSpec_ReportedModeZeroReplicas_AdmittedPhaseDecidesNotCounts(t *testing.T) {
-	isvc := splitISVC([]string{"a"}, []int32{0}, []int32{0})
+	// A ready replica lets the report apply, and a zero admitted count does not cap it.
+	isvc := splitISVC([]string{"a"}, []int32{0}, []int32{1})
 	poller := newTestPoller(t)
 	policy := reportedCapacityPolicy(t)
 	candidate := &isvc.Status.Placement.Candidates[0]
@@ -397,22 +400,42 @@ func TestReconcile_ReportedCapacityOverHTTP_WeightsFollowReportsThenExpire(t *te
 	tm, exists = getTrafficMap(t, client)
 	require.True(t, exists)
 	require.Len(t, tm.Spec.Entries, 2)
+	unready := tm.Spec.Entries[0]
+	assert.Zero(t, unready.Weight, "a report cannot route to a cluster without ready replicas")
+	assert.False(t, unready.Healthy)
+	assert.Nil(t, unready.Capacity.ReportedWeight)
+	assert.Equal(t, v1beta1.CapacitySourceControlPlane, unready.Capacity.Source)
+	assert.Equal(t, reportedCapacityNotReadyReason, unready.Capacity.FallbackReason)
+	assert.Positive(t, tm.Spec.Entries[1].Weight)
+	assert.Equal(t, v1beta1.TrafficMapReasonRoutable, routableReason(tm))
+
+	// One ready replica applies a's accepted report at once, uncapped by that count.
+	setCandidateReady(t, r, 0, 1)
+	reconcile(t, r)
+	tm, _ = getTrafficMap(t, client)
 	assert.Equal(t, int32(2), tm.Spec.Entries[0].Weight)
 	assert.Equal(t, int32(1), tm.Spec.Entries[1].Weight)
-	assert.True(t, tm.Spec.Entries[0].Healthy, "a router report supplies serving health despite lagging replica readiness")
+	assert.True(t, tm.Spec.Entries[0].Healthy)
+	assert.Equal(t, v1beta1.CapacitySourceEndpoint, tm.Spec.Entries[0].Capacity.Source)
 
 	zeroFirst.Store(true)
 	clk.Step(config.Period)
 	reconcile(t, r)
 	tm, _ = getTrafficMap(t, client)
 	assert.Zero(t, tm.Spec.Entries[0].Weight)
+	require.NotNil(t, tm.Spec.Entries[0].Capacity.ReportedWeight, "a ready cluster's zero report applies")
+	assert.True(t, tm.Spec.Entries[0].Capacity.ReportedWeight.IsZero())
+	assert.False(t, tm.Spec.Entries[0].Healthy)
 	assert.Positive(t, tm.Spec.Entries[1].Weight)
 
+	setCandidateReady(t, r, 0, 0)
 	setUnavailable(true)
 	clk.Step(config.Period)
 	reconcile(t, r)
 	tm, _ = getTrafficMap(t, client)
 	assert.Zero(t, tm.Spec.Entries[0].Weight)
+	require.NotNil(t, tm.Spec.Entries[0].Capacity.ReportedWeight, "a zero report applies without a ready replica")
+	assert.True(t, tm.Spec.Entries[0].Capacity.ReportedWeight.IsZero())
 	assert.Positive(t, tm.Spec.Entries[1].Weight)
 	assert.NotNil(t, tm.Spec.Entries[1].Capacity.ReportedWeight, "a fresh report survives a failed poll")
 	assert.NotEmpty(t, tm.Spec.Entries[1].Capacity.FallbackReason)
@@ -427,9 +450,10 @@ func TestReconcile_ReportedCapacityOverHTTP_WeightsFollowReportsThenExpire(t *te
 	assert.Positive(t, tm.Spec.Entries[1].Weight, "expired reports fall back to the replica count")
 	assert.Equal(t, v1beta1.TrafficMapReasonRoutable, routableReason(tm))
 
-	// a reports again with no ready replicas; b still cannot report.
+	// a reports again with one ready replica; b still cannot report.
 	zeroFirst.Store(false)
 	unavailable[0].Store(false)
+	setCandidateReady(t, r, 0, 1)
 	clk.Step(config.Period)
 	reconcile(t, r)
 	tm, _ = getTrafficMap(t, client)
@@ -439,4 +463,165 @@ func TestReconcile_ReportedCapacityOverHTTP_WeightsFollowReportsThenExpire(t *te
 	assert.Equal(t, v1beta1.CapacitySourceEndpoint, tm.Spec.Entries[0].Capacity.Source)
 	assert.Equal(t, v1beta1.CapacitySourceControlPlane, tm.Spec.Entries[1].Capacity.Source)
 	assert.Equal(t, v1beta1.TrafficMapReasonRoutable, routableReason(tm))
+}
+
+// setCandidateReady stores one candidate's ready count in the source status.
+func setCandidateReady(t *testing.T, r *Reconciler, index int, ready int32) {
+	t.Helper()
+	isvc := &v1beta1.InferenceService{}
+	key := types.NamespacedName{Name: testName, Namespace: testNS}
+	require.NoError(t, r.Get(context.Background(), key, isvc))
+	isvc.Status.Placement.Candidates[index].ReadyReplicas = ready
+	require.NoError(t, r.Status().Update(context.Background(), isvc))
+}
+
+// entryWeights lists the table's weights in entry order.
+func entryWeights(spec v1beta1.TrafficMapSpec) []int32 {
+	weights := make([]int32, len(spec.Entries))
+	for i := range spec.Entries {
+		weights[i] = spec.Entries[i].Weight
+	}
+	return weights
+}
+
+// A gateway can forward the capacity poll to routers that are not ready, so a
+// report alone cannot make a cluster without ready replicas routable.
+func TestBuildSpec_PositiveReportWithoutReadyReplica_DoesNotApply(t *testing.T) {
+	isvc := splitISVC([]string{"a", "b", "c"}, []int32{9, 9, 6}, []int32{9, 9, 0})
+	poller := newTestPoller(t)
+	policy := reportedCapacityPolicy(t)
+	for i, value := range []float64{9, 9, 6} {
+		target := targetForCandidate(isvc, &isvc.Status.Placement.Candidates[i], "")
+		require.True(t, poller.record(target, policy, kptr.To(value), ""))
+	}
+	spec, status, reason := buildSpec(isvc, ResolvedProbePolicy{}, policy, nil, poller)
+	require.Len(t, spec.Entries, 3)
+	assert.Equal(t, []int32{1, 1, 0}, entryWeights(spec))
+	assert.Equal(t, metav1.ConditionTrue, status)
+	assert.Equal(t, v1beta1.TrafficMapReasonRoutable, reason)
+	unready := spec.Entries[2]
+	assert.False(t, unready.Healthy)
+	assert.Nil(t, unready.Capacity.ReportedWeight, "a report that does not apply is not published")
+	assert.Equal(t, v1beta1.CapacitySourceControlPlane, unready.Capacity.Source)
+	assert.Equal(t, reportedCapacityNotReadyReason, unready.Capacity.FallbackReason)
+	assert.Equal(t, int32(6), unready.Capacity.Allocated)
+	assert.Zero(t, unready.Capacity.Ready)
+	assert.Zero(t, capacityFallbackCount(spec), "a current report that waits for a ready replica is not a fallback")
+	for _, entry := range spec.Entries[:2] {
+		assert.True(t, entry.Healthy)
+		assert.Equal(t, v1beta1.CapacitySourceEndpoint, entry.Capacity.Source)
+	}
+
+	// PreserveTraffic ignores only failed probes, so it cannot route to c either.
+	prober, probePolicy := failingProbeState(t, isvc, AllFailedPolicyPreserveTraffic, "a", "b", "c")
+	spec, status, reason = buildSpec(isvc, probePolicy, policy, prober, poller)
+	assert.Equal(t, []int32{1, 1, 0}, entryWeights(spec))
+	assert.Equal(t, metav1.ConditionTrue, status)
+	assert.Equal(t, v1beta1.TrafficMapReasonAllHomesProbeFailed, reason)
+
+	// One ready replica applies the full report, not a weight capped at one replica.
+	isvc.Status.Placement.Candidates[2].ReadyReplicas = 1
+	spec, _, _ = buildSpec(isvc, ResolvedProbePolicy{}, policy, nil, poller)
+	assert.Equal(t, []int32{3, 3, 2}, entryWeights(spec))
+	assert.True(t, spec.Entries[2].Healthy)
+	require.NotNil(t, spec.Entries[2].Capacity.ReportedWeight)
+	assert.Equal(t, v1beta1.CapacitySourceEndpoint, spec.Entries[2].Capacity.Source)
+	assert.Empty(t, spec.Entries[2].Capacity.FallbackReason)
+
+	// After a failed poll c keeps its cached report and the poll's reason. Without
+	// a ready replica the report waits, and the fallback count includes c.
+	isvc.Status.Placement.Candidates[2].ReadyReplicas = 0
+	target := targetForCandidate(isvc, &isvc.Status.Placement.Candidates[2], "")
+	require.True(t, poller.record(target, policy, nil, "capacity report unavailable"))
+	spec, _, _ = buildSpec(isvc, ResolvedProbePolicy{}, policy, nil, poller)
+	assert.Equal(t, []int32{1, 1, 0}, entryWeights(spec))
+	assert.Nil(t, spec.Entries[2].Capacity.ReportedWeight)
+	assert.Equal(t, "capacity report unavailable", spec.Entries[2].Capacity.FallbackReason)
+	assert.Equal(t, 1, capacityFallbackCount(spec))
+}
+
+// With no ready replica on any cluster every positive report waits, so the table
+// carries no report. It gets the Ceiling table's weights and Routable reason, and
+// both tables keep positive allocations, so a publisher may replay either one.
+func TestBuildSpec_NoClusterReadyWithPositiveReports_MatchesCeiling(t *testing.T) {
+	isvc := splitISVC([]string{"a", "b"}, []int32{9, 6}, []int32{0, 0})
+	poller := newTestPoller(t)
+	reported := reportedCapacityPolicy(t)
+	ceiling := testCapacityPolicy(t, singleSampleConfig())
+	for i := range isvc.Status.Placement.Candidates {
+		target := targetForCandidate(isvc, &isvc.Status.Placement.Candidates[i], "")
+		require.True(t, poller.record(target, reported, kptr.To(6.0), ""))
+		require.True(t, poller.record(target, ceiling, kptr.To(6.0), ""))
+	}
+	spec, status, reason := buildSpec(isvc, ResolvedProbePolicy{}, reported, nil, poller)
+	require.Len(t, spec.Entries, 2)
+	assert.Equal(t, metav1.ConditionFalse, status)
+	assert.Equal(t, v1beta1.TrafficMapReasonAllHomesUnready, reason)
+	for i, entry := range spec.Entries {
+		assert.Zero(t, entry.Weight)
+		assert.False(t, entry.Healthy)
+		assert.Nil(t, entry.Capacity.ReportedWeight)
+		assert.Equal(t, reportedCapacityNotReadyReason, entry.Capacity.FallbackReason)
+		assert.Equal(t, isvc.Status.Placement.Candidates[i].AdmittedReplicas, entry.Capacity.Allocated)
+	}
+
+	want, wantStatus, wantReason := buildSpec(isvc, ResolvedProbePolicy{}, ceiling, nil, poller)
+	assert.Equal(t, wantStatus, status)
+	assert.Equal(t, wantReason, reason)
+	assert.Equal(t, entryWeights(want), entryWeights(spec))
+	for i := range want.Entries {
+		assert.Equal(t, want.Entries[i].Healthy, spec.Entries[i].Healthy)
+		assert.Positive(t, want.Entries[i].Capacity.Allocated)
+	}
+}
+
+// A zero report adds no weight or health, so it applies without a ready replica.
+// The table carries it and is published at once. The Ceiling table for the same
+// reports allocates zero to that cluster, so no publisher replays it either.
+func TestBuildSpec_ZeroReportWithoutReadyReplica_StillApplies(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		reports []float64
+	}{
+		{"every cluster reports zero", []float64{0, 0}},
+		{"one cluster reports zero and one waits", []float64{0, 6}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := splitISVC([]string{"a", "b"}, []int32{9, 6}, []int32{0, 0})
+			poller := newTestPoller(t)
+			reported := reportedCapacityPolicy(t)
+			ceiling := testCapacityPolicy(t, singleSampleConfig())
+			for i, value := range tc.reports {
+				target := targetForCandidate(isvc, &isvc.Status.Placement.Candidates[i], "")
+				require.True(t, poller.record(target, reported, kptr.To(value), ""))
+				require.True(t, poller.record(target, ceiling, kptr.To(value), ""))
+			}
+			spec, status, reason := buildSpec(isvc, ResolvedProbePolicy{}, reported, nil, poller)
+			require.Len(t, spec.Entries, 2)
+			assert.Equal(t, metav1.ConditionFalse, status)
+			assert.Equal(t, v1beta1.TrafficMapReasonNoRoutableCapacity, reason)
+			assert.Equal(t, []int32{0, 0}, entryWeights(spec))
+			for i, value := range tc.reports {
+				capacity := spec.Entries[i].Capacity
+				assert.False(t, spec.Entries[i].Healthy)
+				if value > 0 {
+					assert.Nil(t, capacity.ReportedWeight)
+					assert.Equal(t, reportedCapacityNotReadyReason, capacity.FallbackReason)
+					continue
+				}
+				require.NotNil(t, capacity.ReportedWeight)
+				assert.True(t, capacity.ReportedWeight.IsZero())
+				assert.Equal(t, v1beta1.CapacitySourceEndpoint, capacity.Source)
+				assert.Empty(t, capacity.FallbackReason)
+			}
+			assert.Zero(t, capacityFallbackCount(spec))
+
+			want, _, _ := buildSpec(isvc, ResolvedProbePolicy{}, ceiling, nil, poller)
+			assert.Equal(t, entryWeights(want), entryWeights(spec))
+			assert.Zero(t, want.Entries[0].Capacity.Allocated)
+			for i := range want.Entries {
+				assert.Equal(t, want.Entries[i].Healthy, spec.Entries[i].Healthy)
+			}
+		})
+	}
 }

@@ -134,6 +134,11 @@ func TestPrimaryOf(t *testing.T) {
 		{[]v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}, v1beta1.RouterComponent},
 		{[]v1beta1.ComponentType{v1beta1.DecoderComponent, v1beta1.EngineComponent}, v1beta1.EngineComponent},
 		{[]v1beta1.ComponentType{v1beta1.DecoderComponent}, v1beta1.DecoderComponent},
+		{[]v1beta1.ComponentType{v1beta1.EncoderComponent, v1beta1.DecoderComponent, v1beta1.EngineComponent}, v1beta1.EngineComponent},
+		{[]v1beta1.ComponentType{v1beta1.EncoderComponent, v1beta1.DecoderComponent}, v1beta1.DecoderComponent},
+		{[]v1beta1.ComponentType{v1beta1.EncoderComponent}, v1beta1.EncoderComponent},
+		{[]v1beta1.ComponentType{"sidecar", v1beta1.RouterComponent}, v1beta1.RouterComponent},
+		{[]v1beta1.ComponentType{"sidecar"}, "sidecar"},
 	}
 	for _, tc := range cases {
 		if got := PrimaryOf(&v1beta1.RolloutGroup{Components: tc.members}); got != tc.want {

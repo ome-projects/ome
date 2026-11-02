@@ -222,7 +222,7 @@ func repeat(n int, inst drainInstance) []drainInstance {
 //     (Surging), while one promoted prefill is not Ready (Waiting), and while
 //     every new pod is Ready (Shifting).
 //   - lastPair: the pod is the last keeping any serving engine and decoder
-//     pair alive. A second protocol change lands while the first is half
+//     pair serving. A second protocol change lands while the first is half
 //     done: the decode's replacement on the middle protocol is the only
 //     partner of the engines on it, so the roll's attempt to retire that
 //     replacement is held (Surging; Waiting once an Instance of each side

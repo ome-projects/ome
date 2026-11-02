@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/go-playground/validator/v10"
 	v1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -18,16 +17,15 @@ const (
 )
 
 type FineTunedAdapterInjector struct {
-	Image               string `json:"image" validate:"required"`
-	MemoryRequest       string `json:"memoryRequest"`
-	MemoryLimit         string `json:"memoryLimit"`
-	CpuRequest          string `json:"cpuRequest"`
-	CpuLimit            string `json:"cpuLimit"`
-	CompartmentId       string `json:"compartmentId" validate:"required"`
-	AuthType            string `json:"authType" validate:"required"`
-	Region              string `json:"region"`
-	fineTunedWeightName string
-	client              client.Client
+	Image         string `json:"image" validate:"required"`
+	MemoryRequest string `json:"memoryRequest"`
+	MemoryLimit   string `json:"memoryLimit"`
+	CpuRequest    string `json:"cpuRequest"`
+	CpuLimit      string `json:"cpuLimit"`
+	CompartmentId string `json:"compartmentId" validate:"required"`
+	AuthType      string `json:"authType" validate:"required"`
+	Region        string `json:"region"`
+	client        client.Client
 }
 
 func newFineTunedAdapterInjector(configMap *v1.ConfigMap, client client.Client) (*FineTunedAdapterInjector, error) {
@@ -46,38 +44,34 @@ func newFineTunedAdapterInjector(configMap *v1.ConfigMap, client client.Client) 
 // names a FineTunedWeight to download.
 func (fa *FineTunedAdapterInjector) InjectFineTunedAdapter(pod *v1.Pod) error {
 	if fineTunedWeightName, ok := pod.ObjectMeta.Annotations[constants.FineTunedAdapterInjectionKey]; ok && len(fineTunedWeightName) > 0 {
-		fa.fineTunedWeightName = fineTunedWeightName
-		return fa.injectFineTunedAdapter(pod)
+		return fa.injectFineTunedAdapter(pod, fineTunedWeightName)
 	}
 	return nil
 }
 
-func (fa *FineTunedAdapterInjector) injectFineTunedAdapter(pod *v1.Pod) error {
-	if fa.containerExists(pod) {
+func (fa *FineTunedAdapterInjector) injectFineTunedAdapter(pod *v1.Pod, fineTunedWeightName string) error {
+	if findContainer(pod.Spec.InitContainers, constants.FineTunedAdapterContainerName) != nil {
 		return nil
 	}
-	if err := fa.validate(); err != nil {
+	if err := requireConfigured(fa, "FineTunedAdapterInjector"); err != nil {
 		return err
 	}
-	if err := fa.validateAuth(pod); err != nil {
+	if err := requireWorkloadIdentityServiceAccount(pod, fa.AuthType); err != nil {
 		return err
 	}
 
-	fineTunedWeightUri, err := fa.getFineTunedWeightUri(pod)
+	fineTunedWeightUri, err := fa.getFineTunedWeightUri(pod, fineTunedWeightName)
 	if err != nil {
-		return fmt.Errorf("failed to resolve fine-tuned weight URI for %s: %w", fa.fineTunedWeightName, err)
+		return fmt.Errorf("failed to resolve fine-tuned weight URI for %s: %w", fineTunedWeightName, err)
 	}
-	initEnvs, err := fa.getModelInitEnvs(pod, fineTunedWeightUri)
-	if err != nil {
-		return err
-	}
-	securityContext, err := fa.getMainContainerSecurityContext(pod)
+	securityContext, err := mainContainerSecurityContext(pod)
 	if err != nil {
 		return err
 	}
 
+	envs := fa.getModelInitEnvs(pod, fineTunedWeightUri)
 	mounts := fa.getVolumeMounts(pod)
-	initContainer, err := fa.createInitContainer(initEnvs, mounts, securityContext)
+	initContainer, err := agentContainer(fa.agentContainerSpec(), envs, mounts, securityContext)
 	if err != nil {
 		return err
 	}
@@ -99,30 +93,29 @@ func (fa *FineTunedAdapterInjector) getVolumeMounts(pod *v1.Pod) []v1.VolumeMoun
 	}
 }
 
-func (fa *FineTunedAdapterInjector) createInitContainer(envs []v1.EnvVar, mounts []v1.VolumeMount, securityContext *v1.SecurityContext) (*v1.Container, error) {
-	resources, err := newResourceRequirements(fa.CpuLimit, fa.MemoryLimit, fa.CpuRequest, fa.MemoryRequest)
-	if err != nil {
-		return nil, fmt.Errorf("fine-tuned adapter injector: %w", err)
+// agentContainerSpec is the init container that downloads the weight:
+// ome-agent's fine-tuned-adapter subcommand with this block's image and
+// resources.
+func (fa *FineTunedAdapterInjector) agentContainerSpec() agentContainerSpec {
+	return agentContainerSpec{
+		injector:      "fine-tuned adapter injector",
+		name:          constants.FineTunedAdapterContainerName,
+		subcommand:    "fine-tuned-adapter",
+		image:         fa.Image,
+		cpuRequest:    fa.CpuRequest,
+		cpuLimit:      fa.CpuLimit,
+		memoryRequest: fa.MemoryRequest,
+		memoryLimit:   fa.MemoryLimit,
 	}
-	return &v1.Container{
-		Name:                     constants.FineTunedAdapterContainerName,
-		Image:                    fa.Image,
-		TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
-		Env:                      envs,
-		VolumeMounts:             mounts,
-		Args:                     []string{"fine-tuned-adapter", "--config", "/ome-agent.yaml", "--debug"},
-		Resources:                resources,
-		SecurityContext:          securityContext,
-	}, nil
 }
 
-func (fa *FineTunedAdapterInjector) getFineTunedWeightUri(pod *v1.Pod) (*storage.OCIStorageComponents, error) {
-	fineTunedWeight, err := isvcutils.GetFineTunedWeight(fa.client, fa.fineTunedWeightName)
+func (fa *FineTunedAdapterInjector) getFineTunedWeightUri(pod *v1.Pod, fineTunedWeightName string) (*storage.OCIStorageComponents, error) {
+	fineTunedWeight, err := isvcutils.GetFineTunedWeight(fa.client, fineTunedWeightName)
 	if err != nil {
 		return nil, err
 	}
 	if fineTunedWeight.Spec.Storage == nil || fineTunedWeight.Spec.Storage.StorageUri == nil {
-		return nil, fmt.Errorf("fine-tuned weight %s has no storage URI", fa.fineTunedWeightName)
+		return nil, fmt.Errorf("fine-tuned weight %s has no storage URI", fineTunedWeightName)
 	}
 	osUri, err := storage.ParseOCIStorageURI(*fineTunedWeight.Spec.Storage.StorageUri)
 	if err != nil {
@@ -137,7 +130,7 @@ func (fa *FineTunedAdapterInjector) getFineTunedWeightUri(pod *v1.Pod) (*storage
 	return osUri, nil
 }
 
-func (fa *FineTunedAdapterInjector) getModelInitEnvs(pod *v1.Pod, fineTunedWeightUri *storage.OCIStorageComponents) ([]v1.EnvVar, error) {
+func (fa *FineTunedAdapterInjector) getModelInitEnvs(pod *v1.Pod, fineTunedWeightUri *storage.OCIStorageComponents) []v1.EnvVar {
 	return []v1.EnvVar{
 		{Name: constants.AgentAuthTypeEnvVarKey, Value: fa.AuthType},
 		{Name: constants.AgentCompartmentIDEnvVarKey, Value: fa.CompartmentId},
@@ -147,47 +140,7 @@ func (fa *FineTunedAdapterInjector) getModelInitEnvs(pod *v1.Pod, fineTunedWeigh
 		{Name: constants.AgentModelBucketNameEnvVarKey, Value: fineTunedWeightUri.Bucket},
 		{Name: constants.AgentModelNamespaceEnvVarKey, Value: fineTunedWeightUri.Namespace},
 		{Name: constants.AgentModelObjectName, Value: fineTunedWeightUri.Prefix},
-	}, nil
-}
-
-func (fa *FineTunedAdapterInjector) containerExists(pod *v1.Pod) bool {
-	for _, container := range pod.Spec.InitContainers {
-		if container.Name == constants.FineTunedAdapterContainerName {
-			return true
-		}
 	}
-	return false
-}
-
-// validateAuth enforces that OKEWorkloadIdentity carries a service
-// account and turns on token automounting (the runtime uses the SA token
-// to obtain workload-identity credentials).
-func (fa *FineTunedAdapterInjector) validateAuth(pod *v1.Pod) error {
-	if fa.AuthType != constants.AuthtypeOKEWorkloadIdentity {
-		return nil
-	}
-	if len(pod.Spec.ServiceAccountName) == 0 {
-		return fmt.Errorf("a service account should be specified when using OKEWorkloadIdentity")
-	}
-	automount := true
-	pod.Spec.AutomountServiceAccountToken = &automount
-	return nil
-}
-
-func (fa *FineTunedAdapterInjector) validate() error {
-	if err := validator.New().Struct(fa); err != nil {
-		return fmt.Errorf("failed to validate FineTunedAdapterInjector: %w", err)
-	}
-	return nil
-}
-
-func (fa *FineTunedAdapterInjector) getMainContainerSecurityContext(pod *v1.Pod) (*v1.SecurityContext, error) {
-	for _, container := range pod.Spec.Containers {
-		if container.Name == constants.MainContainerName {
-			return container.SecurityContext.DeepCopy(), nil
-		}
-	}
-	return nil, fmt.Errorf("no main container %s specified", constants.MainContainerName)
 }
 
 func (fa *FineTunedAdapterInjector) getFineTunedWeightVolumeMountPath(pod *v1.Pod) string {

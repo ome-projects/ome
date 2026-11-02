@@ -1,7 +1,6 @@
 package placement
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -15,13 +14,13 @@ import (
 	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // TestAllResumedRetargetKeepsServingMemberUntilReplacementServes drives a full
@@ -479,11 +478,6 @@ func publishAllRouting(t *testing.T, f *backendFixture, weights map[string]int32
 // unreadableAllMember returns a connection to the named member whose component
 // inventory cannot be listed, so every planned observation of it is unknown.
 func unreadableAllMember(f *backendFixture, name string) workloadcluster.SelectivelyCachingClient {
-	unreadable := interceptor.NewClient(f.workers[name], interceptor.Funcs{List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-		if _, ok := list.(*v1beta1.InferenceReplicaList); ok {
-			return errors.New("member inventory unavailable")
-		}
-		return cl.List(ctx, list, opts...)
-	}})
+	unreadable := fakeclient.Wrap(f.t, f.workers[name], fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, errors.New("member inventory unavailable")).OnKind(&v1beta1.InferenceReplicaList{}))
 	return workloadcluster.NewNeverCachingClient(unreadable)
 }

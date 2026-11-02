@@ -45,6 +45,12 @@ import (
 // flight, reported by the token, while the exit is a fact about the set
 // that died. The two sit side by side on the row, and observing the same
 // wait again on such a row writes nothing.
+//
+// placementSince, when set, is also recorded as the attempt's placement
+// wait (Operation.PlacementWaitSince) if the operation holds none yet, in
+// the same write, so entering a placement wait costs one status write. It
+// is recorded even when another authority holds the token: the wait
+// belongs to the attempt, whichever authority reports it.
 func RecordWaiting(
 	ctx context.Context,
 	input types.ReconcileInput,
@@ -53,6 +59,7 @@ func RecordWaiting(
 	mayOwn func(types.RowOwner) bool,
 	takes func(token, current string) bool,
 	evidence *types.InstanceTermination,
+	placementSince *metav1.Time,
 ) (entered, held bool, err error) {
 	err = input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
 		if s.Phase == "" || s.Operation == nil {
@@ -61,20 +68,31 @@ func RecordWaiting(
 		if !mayOwn(types.OwnerOfOperation(s.Operation)) {
 			return false
 		}
+		placing := placementSince != nil && s.Operation.PlacementWaitSince == nil
 		current := s.Operation.Waiting
 		if !takes(token, current) {
-			return false
+			if !placing {
+				return false
+			}
+			op := *s.Operation
+			op.PlacementWaitSince = placementSince.DeepCopy()
+			s.Operation = &op
+			return true
 		}
 		held = true
 		kept := deathRecordKept(s.LastFailure, evidence)
-		if current == token && (kept || sameEvidence(s.LastFailure, evidence)) {
+		unchanged := current == token && (kept || sameEvidence(s.LastFailure, evidence))
+		if unchanged && !placing {
 			return false
 		}
 		op := *s.Operation
 		op.Waiting = token
+		if placing {
+			op.PlacementWaitSince = placementSince.DeepCopy()
+		}
 		s.Operation = &op
 		entered = current != token
-		if evidence != nil && !kept {
+		if evidence != nil && !kept && !unchanged {
 			captured := *evidence
 			s.LastFailure = &captured
 		}
@@ -97,14 +115,19 @@ func deathRecordKept(recorded, reading *types.InstanceTermination) bool {
 // ReleaseWaiting retires token once its authority reports the wait over.
 // Another authority's token, or none at all, is left untouched: clearing
 // unconditionally would let one authority's completion re-arm a deadline
-// another authority is still holding.
-func ReleaseWaiting(ctx context.Context, input types.ReconcileInput, idx int32, token string) error {
+// another authority is still holding. clearPlacement also retires the
+// attempt's placement wait in the same write, once every pod the attempt
+// asks for runs on a node.
+func ReleaseWaiting(ctx context.Context, input types.ReconcileInput, idx int32, token string, clearPlacement bool) error {
 	return input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
 		if s.Phase == "" || s.Operation == nil || s.Operation.Waiting != token {
 			return false
 		}
 		op := *s.Operation
 		op.Waiting = ""
+		if clearPlacement {
+			op.PlacementWaitSince = nil
+		}
 		s.Operation = &op
 		return true
 	})
@@ -333,4 +356,18 @@ func ClearCapacityRefusal(ctx context.Context, input types.ReconcileInput, idx i
 		s.Operation = &op
 		return true
 	})
+}
+
+// ClearPlacementWait retires the moment once every pod the attempt asks
+// for runs on a node, or once the attempt ends.
+func ClearPlacementWait(ctx context.Context, input types.ReconcileInput, idx int32) error {
+	return input.MutateInstance(ctx, idx, ClearPlacementWaitMutation())
+}
+
+// ClearPlacementWaitMutation is ClearPlacementWait as a row mutation, for
+// a pass that batches its writes. A row holding no moment is left alone.
+func ClearPlacementWaitMutation() func(*types.InstanceStatus) bool {
+	return func(s *types.InstanceStatus) bool {
+		return s.Phase != "" && clearPlacementWait(s)
+	}
 }

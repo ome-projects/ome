@@ -179,7 +179,7 @@ func (g *GangPack) isSchedulableAfterNodeDelete(_ klog.Logger, pod *v1.Pod, oldO
 
 func (g *GangPack) topologyKeyFor(pod *v1.Pod) string {
 	if g.pgReader != nil {
-		if gang, ok := resolveGang(pod, g.pgReader); ok {
+		if gang, ok := resolveGang(pod, g.pgReader, g.topologyKey); ok {
 			return gang.topologyKey
 		}
 	}

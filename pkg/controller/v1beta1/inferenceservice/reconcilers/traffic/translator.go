@@ -15,26 +15,28 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic/status"
 )
 
 // AcceptanceState reports whether the Gateway implementation has
 // accepted the emitted backend policy resource. The reconciler reads
 // status.conditions on the post-apply object via Translator.
-// ObserveAcceptance to decide which TrafficStatus condition to surface.
-type AcceptanceState int
+// ObserveAcceptance and passes the answer to status.Build, which owns
+// the type and picks the TrafficStatus condition from it.
+type AcceptanceState = status.GatewayAcceptance
 
 const (
 	// AcceptancePending means the gateway controller has not (yet)
 	// written an acceptance signal. Typical on first reconcile after
 	// the policy was created, or for translators whose target
 	// implementation does not surface acceptance state.
-	AcceptancePending AcceptanceState = iota
+	AcceptancePending = status.GatewayAcceptancePending
 	// AcceptanceAccepted means the gateway controller has accepted
 	// the policy.
-	AcceptanceAccepted
+	AcceptanceAccepted = status.GatewayAcceptanceAccepted
 	// AcceptanceRejected means the gateway controller has rejected
 	// the policy. The reason / message live on AcceptanceObservation.
-	AcceptanceRejected
+	AcceptanceRejected = status.GatewayAcceptanceRejected
 )
 
 // AcceptanceObservation is the result of Translator.ObserveAcceptance.

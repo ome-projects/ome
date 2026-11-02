@@ -52,7 +52,7 @@ type RolloutSpec struct {
 	// Only meaningful for OMENative-managed Components.
 	// +optional
 	// +listType=atomic
-	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:MaxItems=4
 	Groups []RolloutGroup `json:"groups,omitempty"`
 
 	// GroupOrdering declares what groups[] list order means. Sequential (the
@@ -80,6 +80,9 @@ type RolloutSpec struct {
 	// are equal. Empty or unset pairs with anything, so setting or clearing the
 	// token is upgrade-neutral. Changing it between two non-empty values
 	// requires engine and decoder to roll as one blueGreen or canary group.
+	// While the service declares an encoder, whose revisions carry the token
+	// too, and in the edit that removes it, the value may only stay the same
+	// or be cleared.
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`
@@ -99,9 +102,9 @@ type RolloutSpec struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.order) || self.order.all(c, c in self.components)",message="order must reference only Components listed in this group"
 type RolloutGroup struct {
 	// Components lists the Component names in this group (they roll together).
-	// Valid values: "router", "engine", "decoder".
+	// Valid values: "router", "engine", "decoder", "encoder".
 	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:MaxItems=4
 	// +listType=atomic
 	Components []ComponentType `json:"components"`
 
@@ -114,7 +117,7 @@ type RolloutGroup struct {
 	// only Components in this group.
 	// +optional
 	// +listType=atomic
-	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:MaxItems=4
 	Order []ComponentType `json:"order,omitempty"`
 
 	// Canary advances the group through explicit capacity + service-level-traffic

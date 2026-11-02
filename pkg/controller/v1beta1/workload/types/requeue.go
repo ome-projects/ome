@@ -32,9 +32,7 @@ func RequeueNow() ctrl.Result {
 func PassRequeue(cadence time.Duration, explicit ...time.Duration) ctrl.Result {
 	earliest := cadence
 	for _, wait := range explicit {
-		if wait > 0 && (earliest <= 0 || wait < earliest) {
-			earliest = wait
-		}
+		earliest = EarliestPositive(earliest, wait)
 	}
 	if earliest > 0 {
 		return ctrl.Result{RequeueAfter: earliest}
@@ -50,9 +48,7 @@ func PassRequeue(cadence time.Duration, explicit ...time.Duration) ctrl.Result {
 func EarliestWake(res ctrl.Result, waits ...time.Duration) ctrl.Result {
 	earliest := res.RequeueAfter
 	for _, wait := range waits {
-		if wait > 0 && (earliest <= 0 || wait < earliest) {
-			earliest = wait
-		}
+		earliest = EarliestPositive(earliest, wait)
 	}
 	if earliest <= 0 {
 		return res

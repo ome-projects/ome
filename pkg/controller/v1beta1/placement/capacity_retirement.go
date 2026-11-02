@@ -47,7 +47,7 @@ func (r *Reconciler) retireCapacityFloor(ctx context.Context, cl client.Client, 
 		return err
 	}
 	base := member.DeepCopy()
-	bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate)
+	bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate, memberMinimums(member))
 	if err != nil {
 		return err
 	}

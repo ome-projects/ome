@@ -572,18 +572,57 @@ grep -Fq 'metric_relabel_configs:' <<<"${metric_relabel_config}" ||
   fail "Prometheus metric relabel configuration was not rendered"
 grep -Fq 'regex: up|cd_probe_up' <<<"${metric_relabel_config}" ||
   fail "Prometheus metric relabel regex override was not rendered"
-default_prometheus_checksum="$(grep -m1 'checksum/config:' <<<"${prometheus_deployment}" | awk '{print $2}')"
+grep -Fq -- '--enable-feature=auto-reload-config' <<<"${prometheus_deployment}" ||
+  fail "Prometheus config auto-reload was not enabled by default"
+grep -Fq -- '--config.auto-reload-interval=30s' <<<"${prometheus_deployment}" ||
+  fail "default Prometheus config reload interval was not rendered"
+if grep -Fq 'checksum/config:' <<<"${prometheus_deployment}"; then
+  fail "Prometheus config checksum was rendered while config reload is enabled"
+fi
 metric_relabel_deployment="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \
   --set 'prometheus.metricRelabelConfigs[0].source_labels[0]=__name__' \
   --set-string 'prometheus.metricRelabelConfigs[0].regex=up|cd_probe_up' \
   --set 'prometheus.metricRelabelConfigs[0].action=keep' \
   --show-only templates/prometheus/deployment.yaml)"
-metric_relabel_checksum="$(grep -m1 'checksum/config:' <<<"${metric_relabel_deployment}" | awk '{print $2}')"
+[[ "${prometheus_deployment}" == "${metric_relabel_deployment}" ]] ||
+  fail "changing Prometheus metric relabeling changed the Prometheus pod template while config reload is enabled"
+prometheus_reload_interval="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set prometheus.configReload.interval=2m \
+  --show-only templates/prometheus/deployment.yaml)"
+grep -Fq -- '--config.auto-reload-interval=2m' <<<"${prometheus_reload_interval}" ||
+  fail "Prometheus config reload interval override was not rendered"
+prometheus_reload_default_interval="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-string prometheus.configReload.interval= \
+  --show-only templates/prometheus/deployment.yaml)"
+grep -Fq -- '--enable-feature=auto-reload-config' <<<"${prometheus_reload_default_interval}" ||
+  fail "Prometheus config auto-reload was not enabled with an empty interval"
+if grep -Fq -- '--config.auto-reload-interval' <<<"${prometheus_reload_default_interval}"; then
+  fail "empty Prometheus config reload interval rendered an interval flag"
+fi
+
+prometheus_restart_deployment="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set prometheus.configReload.enabled=false \
+  --show-only templates/prometheus/deployment.yaml)"
+if grep -Fq -- 'auto-reload' <<<"${prometheus_restart_deployment}"; then
+  fail "Prometheus config auto-reload flags were rendered while config reload is disabled"
+fi
+default_prometheus_checksum="$(grep -m1 'checksum/config:' <<<"${prometheus_restart_deployment}" | awk '{print $2}')"
+metric_relabel_restart_deployment="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set prometheus.configReload.enabled=false \
+  --set 'prometheus.metricRelabelConfigs[0].source_labels[0]=__name__' \
+  --set-string 'prometheus.metricRelabelConfigs[0].regex=up|cd_probe_up' \
+  --set 'prometheus.metricRelabelConfigs[0].action=keep' \
+  --show-only templates/prometheus/deployment.yaml)"
+metric_relabel_checksum="$(grep -m1 'checksum/config:' <<<"${metric_relabel_restart_deployment}" | awk '{print $2}')"
 [[ -n "${default_prometheus_checksum}" && -n "${metric_relabel_checksum}" ]] ||
-  fail "Prometheus ConfigMap checksum was not rendered"
+  fail "Prometheus ConfigMap checksum was not rendered while config reload is disabled"
 [[ "${default_prometheus_checksum}" != "${metric_relabel_checksum}" ]] ||
-  fail "changing Prometheus metric relabeling did not roll the config checksum"
+  fail "changing Prometheus metric relabeling did not roll the config checksum while config reload is disabled"
 
 prometheus_runtime_overrides="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --namespace ome \

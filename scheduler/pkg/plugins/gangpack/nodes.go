@@ -117,27 +117,6 @@ func inspectBoundGangMembers(nodeInfos []framework.NodeInfo, pod *v1.Pod, topolo
 	return result
 }
 
-// placedInDomain counts a gang's members (namespace + pod-group name) occupying
-// nodes of the given domain in the snapshot. Unlike inspectBoundGangMembers it matches a
-// gang by its resolved key rather than a live pod object, so the reservation
-// reconciler can count an assigned gang's real footprint without a pod in hand.
-func placedInDomain(nodeInfos []framework.NodeInfo, namespace, pgName, topologyKey, domain string) int {
-	count := 0
-	for _, info := range nodeInfos {
-		n := info.Node()
-		if n == nil || domainOf(n, topologyKey) != domain {
-			continue
-		}
-		for _, pi := range info.GetPods() {
-			mp := pi.GetPod()
-			if mp != nil && mp.Namespace == namespace && mp.Labels[podGroupLabel] == pgName {
-				count++
-			}
-		}
-	}
-	return count
-}
-
 // nodeSchedulable reports whether the gang pod could actually be placed on this
 // node right now — beyond having the accelerator free, the node must be
 // schedulable: not cordoned (spec.unschedulable), and its NoSchedule/NoExecute
@@ -156,8 +135,8 @@ func nodeSchedulable(node *v1.Node, pod *v1.Pod) bool {
 	return !untolerated
 }
 
-// freeByDomain is the homogeneous convenience projection used by focused tests
-// and tracing. Planning uses feasibleByDomain with every remaining member.
+// freeByDomain counts, per domain, the candidate nodes the pod fits. PreScore
+// reads it to rank a standalone pod's domains by how full they are.
 func freeByDomain(nodeInfos []framework.NodeInfo, topologyKey string, pod *v1.Pod) topology.FreeByDomain {
 	out := topology.FreeByDomain{}
 	for _, info := range nodeInfos {
@@ -173,19 +152,12 @@ func freeByDomain(nodeInfos []framework.NodeInfo, topologyKey string, pod *v1.Po
 	return out
 }
 
-// feasibleByDomain returns a best-fit score only for domains that can place all
-// remaining gang templates at once. Feasibility is a bipartite matching problem:
-// templates may have different requests, selectors, affinities, and tolerations,
-// so aggregate free-node counts are insufficient.
-func feasibleByDomain(nodeInfos []framework.NodeInfo, topologyKey string, pods []*v1.Pod) topology.FreeByDomain {
-	return feasibleAtLeastByDomain(nodeInfos, topologyKey, pods, len(pods))
-}
-
-// feasibleAtLeastByDomain is the minMember-aware form of feasibleByDomain. The
-// first pod is the current scheduling cycle and must fit; among surplus siblings,
-// any subset large enough to reach need may supply the rest of the gang. A
-// domain's value is the room its nodes offer the gang, counted in members, or
-// zero when the gang cannot form there.
+// feasibleAtLeastByDomain reads, per domain, the room its nodes offer the gang's
+// remaining members, counted in members, or zero when the gang cannot form there.
+// Members may differ in requests, selectors, affinities and tolerations, so the
+// reading matches members to nodes instead of counting free nodes. The first pod
+// is the current scheduling cycle and must fit; among surplus siblings, any
+// subset large enough to reach need may supply the rest of the gang.
 func feasibleAtLeastByDomain(nodeInfos []framework.NodeInfo, topologyKey string, pods []*v1.Pod, need int) topology.FreeByDomain {
 	byDomain := make(map[string][]framework.NodeInfo)
 	for _, info := range nodeInfos {

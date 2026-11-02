@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/autoscalerpolicy/render"
@@ -113,6 +115,27 @@ func isvcWithPolicyRefs(engine, decoder, router *v1beta1.AutoscalerPolicyRef) *v
 		}
 	}
 	return isvc
+}
+
+func TestValidateAutoscalerPolicySpec_KedaHPAName_RejectsNamesThatAreNotDNSLabels(t *testing.T) {
+	withName := func(name string) *v1beta1.AutoscalerPolicySpec {
+		spec := validKedaPolicySpec()
+		spec.Keda.Advanced = &kedav1.AdvancedConfig{
+			HorizontalPodAutoscalerConfig: &kedav1.HorizontalPodAutoscalerConfig{Name: name},
+		}
+		return spec
+	}
+
+	if err := ValidateAutoscalerPolicySpec(withName(strings.Repeat("a", 63))); err != nil {
+		t.Fatalf("63-character name: unexpected error: %v", err)
+	}
+	err := ValidateAutoscalerPolicySpec(withName(strings.Repeat("a", 64)))
+	if err == nil {
+		t.Fatal("64-character name: expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), ReasonKedaHPANameInvalid) {
+		t.Fatalf("64-character name: error %q does not name reason %s", err, ReasonKedaHPANameInvalid)
+	}
 }
 
 func TestValidateAutoscalerPolicyRefs_GateAndKind_RejectsGateOffOrClusterKind(t *testing.T) {
@@ -227,17 +250,17 @@ func TestAutoscalerPolicySplitCeilingWarning_SplitRefNoCap_WarnsNamingComponents
 		if got == "" {
 			t.Fatal("expected warning")
 		}
-		for _, want := range []string{"engine", "maxReplicasPerCluster", v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling} {
+		for _, want := range []string{"engine", "maxPerCluster", v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling} {
 			if !strings.Contains(got, want) {
 				t.Errorf("warning %q does not mention %s", got, want)
 			}
 		}
 	})
 
-	t.Run("split with ref and zero cap warns", func(t *testing.T) {
+	t.Run("split with ref and a split block without caps warns", func(t *testing.T) {
 		isvc := withPlacement(isvcWithPolicyRefs(nil, ref, nil), &v1beta1.PlacementSpec{
 			Mode:  v1beta1.PlacementModeSplit,
-			Split: &v1beta1.SplitSpec{MaxReplicasPerCluster: 0},
+			Split: &v1beta1.SplitSpec{},
 		})
 		got := AutoscalerPolicySplitCeilingWarning(isvc)
 		if got == "" {
@@ -248,13 +271,24 @@ func TestAutoscalerPolicySplitCeilingWarning_SplitRefNoCap_WarnsNamingComponents
 		}
 	})
 
-	t.Run("split with ref and positive cap is quiet", func(t *testing.T) {
-		isvc := withPlacement(isvcWithPolicyRefs(ref, nil, nil), &v1beta1.PlacementSpec{
+	t.Run("split with an engine cap in maxPerCluster is quiet", func(t *testing.T) {
+		isvc := withPlacement(isvcWithPolicyRefs(ref, ref, ref), &v1beta1.PlacementSpec{
 			Mode:  v1beta1.PlacementModeSplit,
-			Split: &v1beta1.SplitSpec{MaxReplicasPerCluster: 3},
+			Split: &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Engine: ptr.To[int32](3)}},
 		})
 		if got := AutoscalerPolicySplitCeilingWarning(isvc); got != "" {
 			t.Errorf("unexpected warning: %q", got)
+		}
+	})
+
+	t.Run("a router cap alone leaves the engine uncapped", func(t *testing.T) {
+		isvc := withPlacement(isvcWithPolicyRefs(ref, nil, ref), &v1beta1.PlacementSpec{
+			Mode:  v1beta1.PlacementModeSplit,
+			Split: &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Router: ptr.To[int32](4)}},
+		})
+		got := AutoscalerPolicySplitCeilingWarning(isvc)
+		if !strings.Contains(got, "autoscalerPolicyRef on engine but") {
+			t.Errorf("warning %q does not name only the uncapped engine", got)
 		}
 	})
 
@@ -283,7 +317,7 @@ func TestAutoscalerPolicySplitCeilingWarning_EitherSplitMode_SameWarningText(t *
 		t.Run(string(mode), func(t *testing.T) {
 			isvc := isvcWithPolicyRefs(&v1beta1.AutoscalerPolicyRef{Name: "request-activity-v1"}, nil, nil)
 			isvc.Spec.Placement = &v1beta1.PlacementSpec{Mode: mode}
-			want := fmt.Sprintf("spec.placement.mode=%s with autoscalerPolicyRef on engine but spec.placement.split.maxReplicasPerCluster is unset; policy templates render against each home's derived bounds, and without a per-cluster cap that ceiling is unbounded (%s)", mode, v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling)
+			want := fmt.Sprintf("spec.placement.mode=%s with autoscalerPolicyRef on engine but spec.placement.split.maxPerCluster caps none of them; policy templates render against each home's derived bounds, and without a per-cluster cap that ceiling is unbounded (%s)", mode, v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling)
 			if diff := cmp.Diff(want, AutoscalerPolicySplitCeilingWarning(isvc)); diff != "" {
 				t.Error(diff)
 			}

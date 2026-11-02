@@ -182,6 +182,11 @@ func TestNodeFitsPod_SelectorOrRequiredAffinityMismatch_IsFalse(t *testing.T) {
 	}
 }
 
+// feasibleByDomain is feasibleAtLeastByDomain with every member required.
+func feasibleByDomain(nodeInfos []framework.NodeInfo, topologyKey string, pods []*v1.Pod) topology.FreeByDomain {
+	return feasibleAtLeastByDomain(nodeInfos, topologyKey, pods, len(pods))
+}
+
 func TestFeasibleByDomain_MembersWithDifferentSelectors_CountsOnlyMatchingNodes(t *testing.T) {
 	aGPU := gpuNode("a-gpu", "a", "8")
 	aGPU.Labels["kind"] = "gpu"
@@ -223,10 +228,27 @@ func TestFeasibleAtLeastByDomain_SurplusMemberFitsNowhere_IgnoresIt(t *testing.T
 	}
 }
 
-// TestPlacedInDomain_MixedOccupants_CountsOnlyThisGangInThatDomain counts a gang's members occupying a specific domain — the
-// input the reservation reconciler uses to learn an assigned gang's real footprint.
-// Only the named gang's pods in the named domain count: a sibling gang's members,
-// this gang's members in another domain, and non-gang pods are all excluded.
+// placedInDomain counts the named gang's members on the nodes of one domain.
+func placedInDomain(nodeInfos []framework.NodeInfo, namespace, pgName, topologyKey, domain string) int {
+	count := 0
+	for _, info := range nodeInfos {
+		n := info.Node()
+		if n == nil || domainOf(n, topologyKey) != domain {
+			continue
+		}
+		for _, pi := range info.GetPods() {
+			mp := pi.GetPod()
+			if mp != nil && mp.Namespace == namespace && mp.Labels[podGroupLabel] == pgName {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// TestPlacedInDomain_MixedOccupants_CountsOnlyThisGangInThatDomain: only the named
+// gang's pods in the named domain count. A sibling gang's members, this gang's
+// members in another domain, and non-gang pods are all excluded.
 func TestPlacedInDomain_MixedOccupants_CountsOnlyThisGangInThatDomain(t *testing.T) {
 	nodes := []framework.NodeInfo{
 		nodeInfo(gpuNode("a1", "a", "4"), gangPod("team", "pf")),     // pf in a  -> count

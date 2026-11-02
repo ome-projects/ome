@@ -286,10 +286,11 @@ func ratioToleranceNeeded(origA, origB, projA, projB int32) int32 {
 // it reads the field, and reads a still-unset or non-positive field as the
 // API default of one. Zero only for a Component the spec does not declare.
 func componentReplicaBasis(spec *v1beta1.InferenceServiceSpec, c v1beta1.ComponentType, defaultMinReplicas *int) int32 {
-	ext := componentExtension(spec, c)
-	if ext == nil {
+	role := declaredRoles(spec).find(c)
+	if role == nil {
 		return 0
 	}
+	ext := role.extension
 	if ext.MinReplicas != nil && *ext.MinReplicas > 0 {
 		return int32(*ext.MinReplicas)
 	}
@@ -305,44 +306,15 @@ func componentReplicaBasis(spec *v1beta1.InferenceServiceSpec, c v1beta1.Compone
 // componentUpdateShape reports the Component's declared update strategy
 // (empty when unset) and whether its Instances are multi-pod gangs.
 func componentUpdateShape(spec *v1beta1.InferenceServiceSpec, c v1beta1.ComponentType) (v1beta1.UpdateStrategyType, bool) {
-	ext := componentExtension(spec, c)
-	if ext == nil {
+	role := declaredRoles(spec).find(c)
+	if role == nil {
 		return "", false
 	}
 	var strategy v1beta1.UpdateStrategyType
-	if ext.Lifecycle != nil && ext.Lifecycle.UpdateStrategy != nil {
-		strategy = ext.Lifecycle.UpdateStrategy.Type
+	if lc := role.extension.Lifecycle; lc != nil && lc.UpdateStrategy != nil {
+		strategy = lc.UpdateStrategy.Type
 	}
-	switch c {
-	case v1beta1.EngineComponent:
-		return strategy, DeclaredMultiPod(engineLeader(spec.Engine), engineWorker(spec.Engine))
-	case v1beta1.DecoderComponent:
-		return strategy, DeclaredMultiPod(decoderLeader(spec.Decoder), decoderWorker(spec.Decoder))
-	}
-	return strategy, false
-}
-
-// componentExtension returns the Component's extension spec, nil when the
-// Component is not declared.
-func componentExtension(spec *v1beta1.InferenceServiceSpec, c v1beta1.ComponentType) *v1beta1.ComponentExtensionSpec {
-	if spec == nil {
-		return nil
-	}
-	switch c {
-	case v1beta1.EngineComponent:
-		if spec.Engine != nil {
-			return &spec.Engine.ComponentExtensionSpec
-		}
-	case v1beta1.DecoderComponent:
-		if spec.Decoder != nil {
-			return &spec.Decoder.ComponentExtensionSpec
-		}
-	case v1beta1.RouterComponent:
-		if spec.Router != nil {
-			return &spec.Router.ComponentExtensionSpec
-		}
-	}
-	return nil
+	return strategy, DeclaredMultiPod(role.leader, role.worker)
 }
 
 // DeclaredMultiPod reports whether a Component declares a Leader+Worker pair

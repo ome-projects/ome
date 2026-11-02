@@ -5,9 +5,25 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kube-scheduler/framework"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
+
+	"sigs.k8s.io/ome/scheduler/pkg/placement"
+	"sigs.k8s.io/ome/scheduler/pkg/topology"
 )
 
 func newCycleState() framework.CycleState { return schedulerframework.NewCycleState() }
+
+// choose asks the store for a domain for a group that names no owner, topology
+// key or nodes, and answers with the domain alone.
+func choose(a *placement.DomainAssignments, group string, free topology.FreeByDomain, size int) (string, bool) {
+	domain, _, ok := a.Choose(placement.Gang{Group: group}, free, nil, size)
+	return domain, ok
+}
+
+// assignedDomain is the domain the group holds, or "" and false.
+func assignedDomain(a *placement.DomainAssignments, group string) (string, bool) {
+	domain, _, _, ok := a.GetOwned(group)
+	return domain.Name, ok
+}
 
 // fakeWaitingPod is a minimal framework.WaitingPod for tests: it records whether
 // Allow/Reject was called. The embedded nil interface satisfies the methods we

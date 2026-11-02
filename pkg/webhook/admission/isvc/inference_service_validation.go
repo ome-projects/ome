@@ -221,7 +221,7 @@ func (v *InferenceServiceValidator) validateNoStandaloneReplicaCollision(ctx con
 		return nil
 	}
 	candidates := []string{isvc.Name}
-	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+	for _, c := range validation.ComponentRoles {
 		candidates = append(candidates, isvc.Name+"-"+string(c))
 	}
 	for _, name := range candidates {
@@ -281,21 +281,13 @@ func validateAddedMigrationRequests(oldIsvc, isvc *v1beta1.InferenceService) err
 }
 
 // validateMigrationRequestComponent checks a migration request's
-// component against the components this ISVC declares: engine always;
-// decoder / router only when their spec blocks are present (same
-// enumeration rule as isvcAutoscalerChecks).
+// component against the components this ISVC declares: engine always,
+// since every service serves one; any other role only when its spec block
+// is present (same enumeration rule as isvcAutoscalerChecks).
 func validateMigrationRequestComponent(isvc *v1beta1.InferenceService, component string) error {
-	switch component {
-	case string(v1beta1.EngineComponent):
+	c := v1beta1.ComponentType(component)
+	if c == v1beta1.EngineComponent || v1beta1.SpecOf(&isvc.Spec, c) != nil {
 		return nil
-	case string(v1beta1.DecoderComponent):
-		if isvc.Spec.Decoder != nil {
-			return nil
-		}
-	case string(v1beta1.RouterComponent):
-		if isvc.Spec.Router != nil {
-			return nil
-		}
 	}
 	return fmt.Errorf("component %q does not exist on this InferenceService", component)
 }
@@ -347,14 +339,8 @@ func deploymentStrategyWarnings(isvc *v1beta1.InferenceService) admission.Warnin
 				name, mode, name))
 		}
 	}
-	if isvc.Spec.Engine != nil {
-		check("engine", &isvc.Spec.Engine.ComponentExtensionSpec)
-	}
-	if isvc.Spec.Decoder != nil {
-		check("decoder", &isvc.Spec.Decoder.ComponentExtensionSpec)
-	}
-	if isvc.Spec.Router != nil {
-		check("router", &isvc.Spec.Router.ComponentExtensionSpec)
+	for _, role := range v1beta1.ServiceRoles(&isvc.Spec).Declared() {
+		check(string(role.Type), role.Extension)
 	}
 	return warnings
 }
@@ -428,6 +414,9 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 		return allWarnings, err
 	}
 	if err := validation.ValidateEngineDecoderDeploymentMode(&isvc.Spec); err != nil {
+		return allWarnings, err
+	}
+	if err := validation.ValidateEncoder(&isvc.Spec); err != nil {
 		return allWarnings, err
 	}
 	if err := validation.ValidateScaleToZero(isvc); err != nil {
@@ -784,25 +773,11 @@ func expectedPinPattern(kind runtimerevision.SourceKind, sourceNS, runtimeName s
 // so an absent Component never produces a spurious "<name>:" error.
 func isvcAutoscalerChecks(isvc *v1beta1.InferenceService) []validation.ComponentAutoscalerCheck {
 	var checks []validation.ComponentAutoscalerCheck
-	if isvc.Spec.Engine != nil {
+	for _, role := range v1beta1.ServiceRoles(&isvc.Spec).Declared() {
 		checks = append(checks, validation.ComponentAutoscalerCheck{
-			Name:        "engine",
-			Autoscaler:  isvc.Spec.Engine.Autoscaler,
-			MinReplicas: isvc.Spec.Engine.MinReplicas,
-		})
-	}
-	if isvc.Spec.Decoder != nil {
-		checks = append(checks, validation.ComponentAutoscalerCheck{
-			Name:        "decoder",
-			Autoscaler:  isvc.Spec.Decoder.Autoscaler,
-			MinReplicas: isvc.Spec.Decoder.MinReplicas,
-		})
-	}
-	if isvc.Spec.Router != nil {
-		checks = append(checks, validation.ComponentAutoscalerCheck{
-			Name:        "router",
-			Autoscaler:  isvc.Spec.Router.Autoscaler,
-			MinReplicas: isvc.Spec.Router.MinReplicas,
+			Name:        string(role.Type),
+			Autoscaler:  role.Extension.Autoscaler,
+			MinReplicas: role.Extension.MinReplicas,
 		})
 	}
 	return checks
@@ -822,14 +797,8 @@ type componentExtensionCheck struct {
 // skipped so an absent Component never produces a spurious error.
 func isvcComponentExtensions(isvc *v1beta1.InferenceService) []componentExtensionCheck {
 	var checks []componentExtensionCheck
-	if isvc.Spec.Engine != nil {
-		checks = append(checks, componentExtensionCheck{"engine", &isvc.Spec.Engine.ComponentExtensionSpec})
-	}
-	if isvc.Spec.Decoder != nil {
-		checks = append(checks, componentExtensionCheck{"decoder", &isvc.Spec.Decoder.ComponentExtensionSpec})
-	}
-	if isvc.Spec.Router != nil {
-		checks = append(checks, componentExtensionCheck{"router", &isvc.Spec.Router.ComponentExtensionSpec})
+	for _, role := range v1beta1.ServiceRoles(&isvc.Spec).Declared() {
+		checks = append(checks, componentExtensionCheck{string(role.Type), role.Extension})
 	}
 	return checks
 }

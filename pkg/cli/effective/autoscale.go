@@ -812,6 +812,11 @@ func validateResolvedAutoscaler(autoscaler *v1beta1.ComponentAutoscaler, minRepl
 		if autoscaler.Keda == nil || len(autoscaler.Keda.Triggers) == 0 {
 			return AutoscalingIssueKEDATriggersRequired
 		}
+		// A requested HPA name that is not a DNS label is a configuration
+		// error, not an idle-count one.
+		if validation.ValidateKedaHPAName(autoscaler.Keda.Advanced) != nil {
+			return AutoscalingIssueKEDAConfigurationInvalid
+		}
 		return AutoscalingIssueKEDAIdleNotBelowMinimum
 	case v1beta1.AutoscalerHPA:
 		return AutoscalingIssueHPAMetricMalformed

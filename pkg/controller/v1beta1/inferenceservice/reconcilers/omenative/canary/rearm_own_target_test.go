@@ -6,11 +6,11 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // twoUnitISVC is one service with a canary group per unit: the engine's
@@ -157,7 +157,7 @@ func TestDispatch_AnotherGroupsRunKeepsTheRolledBackUnitHeld(t *testing.T) {
 		r.Generation, r.Status.ObservedGeneration = 1, 1
 	}
 	engineKey := types.NamespacedName{Namespace: ns, Name: engineIR.Name}
-	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(
+	c := fakeclient.New(t, fakeclient.WithObjects(
 		isvc, engineIR, routerIR,
 		canaryPod(ns, isvc.Name, "engine", "old", "old-0"),
 		canaryPod(ns, isvc.Name, "engine", "old", "old-1"),
@@ -168,7 +168,7 @@ func TestDispatch_AnotherGroupsRunKeepsTheRolledBackUnitHeld(t *testing.T) {
 		canaryControllerRevision(ns, isvc.Name, "engine", "new", 2),
 		canaryControllerRevision(ns, isvc.Name, "router", "rold", 1),
 		canaryControllerRevision(ns, isvc.Name, "router", "rnew", 2),
-	).Build()
+	))
 	ctx := context.Background()
 
 	out, err := rolloutrun.Reconcile(ctx, rolloutrun.Inputs{Client: c, Reader: c, ISVC: isvc, Now: time.Unix(1000, 0), FeatureEnabled: true})

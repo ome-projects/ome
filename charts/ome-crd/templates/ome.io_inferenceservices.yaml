@@ -108,6 +108,506 @@ spec:
                 - OMENative
                 - RawDeployment
                 type: string
+              encoder:
+                properties:
+                  acceleratorOverride:
+                    properties:
+                      acceleratorClass:
+                        type: string
+                      constraints:
+                        properties:
+                          architectureFamilies:
+                            items:
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          excludedClasses:
+                            items:
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          maxMemory:
+                            format: int64
+                            type: integer
+                          minArchitectureVersion:
+                            type: string
+                          minComputePerformanceTFLOPS:
+                            format: int64
+                            type: integer
+                          minMemory:
+                            format: int64
+                            type: integer
+                          preferredPrecisions:
+                            items:
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          requiredFeatures:
+                            items:
+                              type: string
+                            type: array
+                            x-kubernetes-list-type: atomic
+                        type: object
+                      policy:
+                        enum:
+                        - BestFit
+                        - Cheapest
+                        - MostCapable
+                        - FirstAvailable
+                        type: string
+                    type: object
+                  activeDeadlineSeconds:
+                    format: int64
+                    type: integer
+                  affinity:
+{{- include "ome-crd.schema.c228fd20cb73" . | nindent 20 }}
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  automountServiceAccountToken:
+                    type: boolean
+                  autoscaler:
+{{- include "ome-crd.schema.1f0e7e408c14" . | nindent 20 }}
+                  autoscalerPolicyRef:
+                    properties:
+                      kind:
+                        default: AutoscalerPolicy
+                        enum:
+                        - AutoscalerPolicy
+                        - ClusterAutoscalerPolicy
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                    type: object
+                  containers:
+{{- include "ome-crd.schema.ea152dab22a5" . | nindent 20 }}
+                  deploymentStrategy:
+                    properties:
+                      rollingUpdate:
+                        properties:
+                          maxSurge:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            x-kubernetes-int-or-string: true
+                          maxUnavailable:
+                            anyOf:
+                            - type: integer
+                            - type: string
+                            x-kubernetes-int-or-string: true
+                        type: object
+                      type:
+                        type: string
+                    type: object
+                  dnsConfig:
+                    properties:
+                      nameservers:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      options:
+                        items:
+                          properties:
+                            name:
+                              type: string
+                            value:
+                              type: string
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      searches:
+                        items:
+                          type: string
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  dnsPolicy:
+                    type: string
+                  enableServiceLinks:
+                    type: boolean
+                  hostAliases:
+                    items:
+                      properties:
+                        hostnames:
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        ip:
+                          type: string
+                      required:
+                      - ip
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - ip
+                    x-kubernetes-list-type: map
+                  hostIPC:
+                    type: boolean
+                  hostNetwork:
+                    type: boolean
+                  hostPID:
+                    type: boolean
+                  hostUsers:
+                    type: boolean
+                  hostname:
+                    type: string
+                  imagePullSecrets:
+                    items:
+                      properties:
+                        name:
+                          default: ""
+                          type: string
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  initContainers:
+{{- include "ome-crd.schema.49fc672a34b1" . | nindent 20 }}
+                  labels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  lifecycle:
+                    properties:
+                      instanceReadyTimeout:
+                        type: string
+                      migrationPolicy:
+                        properties:
+                          mode:
+                            enum:
+                            - Auto
+                            - Surge
+                            - Never
+                            type: string
+                        type: object
+                      minReadySeconds:
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      readyPolicy:
+                        enum:
+                        - AllPodReady
+                        - None
+                        type: string
+                      restartPolicy:
+                        enum:
+                        - None
+                        - RecreateInstanceOnPodRestart
+                        type: string
+                      updateStrategy:
+                        properties:
+                          inPlaceUpdateStrategy:
+                            properties:
+                              gracePeriodSeconds:
+                                format: int32
+                                minimum: 0
+                                type: integer
+                              markNotReadyDuringLifecycle:
+                                type: boolean
+                            type: object
+                          rollingUpdate:
+                            properties:
+                              maxSurge:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                              maxUnavailable:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                              partition:
+                                format: int32
+                                minimum: 0
+                                type: integer
+                            type: object
+                          type:
+                            enum:
+                            - SurgeThenDrain
+                            - RecreatePod
+                            - InPlaceIfPossible
+                            - InPlaceOnly
+                            type: string
+                        type: object
+                    type: object
+                  maxReplicas:
+                    type: integer
+                  maxUnavailable:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    x-kubernetes-int-or-string: true
+                  minAvailable:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    x-kubernetes-int-or-string: true
+                  minReplicas:
+                    type: integer
+                  nodeName:
+                    type: string
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  os:
+                    properties:
+                      name:
+                        type: string
+                    type: object
+                  overhead:
+                    additionalProperties:
+                      anyOf:
+                      - type: integer
+                      - type: string
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                    type: object
+                  preemptionPolicy:
+                    type: string
+                  priority:
+                    format: int32
+                    type: integer
+                  priorityClassName:
+                    type: string
+                  readinessGates:
+                    items:
+                      properties:
+                        conditionType:
+                          type: string
+                      required:
+                      - conditionType
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  resourceClaims:
+                    items:
+                      properties:
+                        name:
+                          type: string
+                        resourceClaimName:
+                          type: string
+                        resourceClaimTemplateName:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  restartPolicy:
+                    type: string
+                  runner:
+{{- include "ome-crd.schema.c92c41cdad05" . | nindent 20 }}
+                  runtimeClassName:
+                    type: string
+                  schedulerName:
+                    type: string
+                  schedulingGates:
+                    items:
+                      properties:
+                        name:
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  securityContext:
+                    properties:
+                      appArmorProfile:
+                        properties:
+                          localhostProfile:
+                            type: string
+                          type:
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      fsGroup:
+                        format: int64
+                        type: integer
+                      fsGroupChangePolicy:
+                        type: string
+                      runAsGroup:
+                        format: int64
+                        type: integer
+                      runAsNonRoot:
+                        type: boolean
+                      runAsUser:
+                        format: int64
+                        type: integer
+                      seLinuxChangePolicy:
+                        type: string
+                      seLinuxOptions:
+                        properties:
+                          level:
+                            type: string
+                          role:
+                            type: string
+                          type:
+                            type: string
+                          user:
+                            type: string
+                        type: object
+                      seccompProfile:
+                        properties:
+                          localhostProfile:
+                            type: string
+                          type:
+                            type: string
+                        required:
+                        - type
+                        type: object
+                      supplementalGroups:
+                        items:
+                          format: int64
+                          type: integer
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      supplementalGroupsPolicy:
+                        type: string
+                      sysctls:
+                        items:
+                          properties:
+                            name:
+                              type: string
+                            value:
+                              type: string
+                          required:
+                          - name
+                          - value
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      windowsOptions:
+                        properties:
+                          gmsaCredentialSpec:
+                            type: string
+                          gmsaCredentialSpecName:
+                            type: string
+                          hostProcess:
+                            type: boolean
+                          runAsUserName:
+                            type: string
+                        type: object
+                    type: object
+                  serviceAccount:
+                    type: string
+                  serviceAccountName:
+                    type: string
+                  servicePortAppProtocols:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  setHostnameAsFQDN:
+                    type: boolean
+                  shareProcessNamespace:
+                    type: boolean
+                  subdomain:
+                    type: string
+                  terminationGracePeriodSeconds:
+                    format: int64
+                    type: integer
+                  timeoutSeconds:
+                    format: int64
+                    type: integer
+                  tolerations:
+                    items:
+                      properties:
+                        effect:
+                          type: string
+                        key:
+                          type: string
+                        operator:
+                          type: string
+                        tolerationSeconds:
+                          format: int64
+                          type: integer
+                        value:
+                          type: string
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  topologySpread:
+                    enum:
+                    - Preferred
+                    - Required
+                    type: string
+                  topologySpreadConstraints:
+                    items:
+                      properties:
+                        labelSelector:
+                          properties:
+                            matchExpressions:
+                              items:
+                                properties:
+                                  key:
+                                    type: string
+                                  operator:
+                                    type: string
+                                  values:
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            matchLabels:
+                              additionalProperties:
+                                type: string
+                              type: object
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        matchLabelKeys:
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        maxSkew:
+                          format: int32
+                          type: integer
+                        minDomains:
+                          format: int32
+                          type: integer
+                        nodeAffinityPolicy:
+                          type: string
+                        nodeTaintsPolicy:
+                          type: string
+                        topologyKey:
+                          type: string
+                        whenUnsatisfiable:
+                          type: string
+                      required:
+                      - maxSkew
+                      - topologyKey
+                      - whenUnsatisfiable
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - topologyKey
+                    - whenUnsatisfiable
+                    x-kubernetes-list-type: map
+                  topologySpreadKey:
+                    type: string
+                  volumes:
+{{- include "ome-crd.schema.f929430e068e" . | nindent 20 }}
+                type: object
               engine:
 {{- include "ome-crd.schema.f8a6c3ee73a4" . | nindent 16 }}
               model:
@@ -207,10 +707,6 @@ spec:
                           maxItems: 64
                           type: array
                           x-kubernetes-list-type: atomic
-                        weight:
-                          format: int32
-                          minimum: 1
-                          type: integer
                         weights:
                           minProperties: 1
                           properties:
@@ -218,18 +714,62 @@ spec:
                               format: int32
                               minimum: 1
                               type: integer
+                            decoderReplicas:
+                              properties:
+                                max:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                min:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                              type: object
                             default:
                               format: int32
                               minimum: 1
                               type: integer
+                            defaultReplicas:
+                              properties:
+                                max:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                min:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                              type: object
                             engine:
                               format: int32
                               minimum: 1
                               type: integer
+                            engineReplicas:
+                              properties:
+                                max:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                min:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                              type: object
                             router:
                               format: int32
                               minimum: 1
                               type: integer
+                            routerReplicas:
+                              properties:
+                                max:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                                min:
+                                  format: int32
+                                  minimum: 1
+                                  type: integer
+                              type: object
                           type: object
                       type: object
                       x-kubernetes-validations:
@@ -237,10 +777,6 @@ spec:
                         rule: (has(self.matchExpressions) && size(self.matchExpressions)
                           > 0) || (has(self.matchFields) && size(self.matchFields)
                           > 0)
-                      - message: weight means weights.default; it may sit beside weights.decoder
-                          and weights.router, but not beside weights.default or weights.engine
-                        rule: '!has(self.weight) || !has(self.weights) || (!has(self.weights.default)
-                          && !has(self.weights.engine))'
                     maxItems: 64
                     minItems: 1
                     nullable: true
@@ -268,10 +804,26 @@ spec:
                       rule: duration(self) > duration('0s')
                   split:
                     properties:
-                      maxReplicasPerCluster:
-                        format: int32
-                        minimum: 0
-                        type: integer
+                      maxPerCluster:
+                        minProperties: 1
+                        properties:
+                          decoder:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          default:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          engine:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          router:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                        type: object
                       replicas:
                         format: int32
                         minimum: 1
@@ -285,6 +837,19 @@ spec:
                 - message: replacementTimeout requires Single placement
                   rule: '!has(self.replacementTimeout) || (has(self.policy) && self.policy
                     == ''ClusterAffinity'' && has(self.mode) && self.mode == ''Single'')'
+                - message: clusterAffinity weights use either default/engine/decoder/router
+                    or the *Replicas ratios, not both
+                  rule: '!has(self.clusterAffinity) || !(self.clusterAffinity.exists(t,
+                    has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas)
+                    || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas)))
+                    && self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.default)
+                    || has(t.weights.engine) || has(t.weights.decoder) || has(t.weights.router))))'
+                - message: '*Replicas ratios are allowed only in Split and replace
+                    spec.placement.split; remove split'
+                  rule: '!has(self.clusterAffinity) || !self.clusterAffinity.exists(t,
+                    has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas)
+                    || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas)))
+                    || (self.mode == ''Split'' && !has(self.split))'
               replicaRefs:
                 properties:
                   decoder:
@@ -312,8 +877,8 @@ spec:
                     type: string
                   groups:
                     items:
-{{- include "ome-crd.schema.4be67df18eab" . | nindent 22 }}
-                    maxItems: 3
+{{- include "ome-crd.schema.f1554e604551" . | nindent 22 }}
+                    maxItems: 4
                     type: array
                     x-kubernetes-list-type: atomic
                   pairingProtocol:
@@ -992,6 +1557,7 @@ spec:
                         enum:
                         - engine
                         - decoder
+                        - encoder
                         - router
                         type: string
                       ratios:
@@ -1857,6 +2423,14 @@ spec:
                                     - decoder
                                     - router
                                     type: string
+                                  maxWeight:
+                                    format: int64
+                                    minimum: 0
+                                    type: integer
+                                  minWeight:
+                                    format: int64
+                                    minimum: 0
+                                    type: integer
                                   weight:
                                     format: int64
                                     minimum: 0
@@ -1953,6 +2527,14 @@ spec:
                                 type: integer
                               type: array
                               x-kubernetes-list-type: set
+                            maxWeight:
+                              format: int64
+                              minimum: 0
+                              type: integer
+                            minWeight:
+                              format: int64
+                              minimum: 0
+                              type: integer
                             originalReplicas:
                               format: int32
                               minimum: 0
@@ -2188,7 +2770,7 @@ spec:
                             items:
                               properties:
                                 group:
-{{- include "ome-crd.schema.4be67df18eab" . | nindent 34 }}
+{{- include "ome-crd.schema.f1554e604551" . | nindent 34 }}
                                 policyGeneration:
                                   format: int64
                                   type: integer
@@ -2378,8 +2960,23 @@ spec:
                         lastTransitionTime:
                           format: date-time
                           type: string
+                        memberFinished:
+                          properties:
+                            at:
+                              format: date-time
+                              type: string
+                            component:
+                              type: string
+                          required:
+                          - at
+                          - component
+                          type: object
+                        memberNotReady:
+                          type: string
                         message:
                           type: string
+                        mixedPairing:
+                          type: boolean
                         name:
                           type: string
                         observedRatio:
@@ -2432,6 +3029,8 @@ spec:
                           type: string
                         previousComponent:
                           type: string
+                        surgeHeldByRatio:
+                          type: boolean
                       required:
                       - name
                       type: object

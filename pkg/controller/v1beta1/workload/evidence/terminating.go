@@ -59,29 +59,24 @@ func (e TerminatingClass) Actionable() bool {
 	return false
 }
 
-// String names the evidence branch for events and logs.
+// terminatingClassNames names every class for events and logs, by value.
+var terminatingClassNames = [...]string{
+	NotConfigured:         "not-configured",
+	WithinGrace:           "within-grace",
+	ForeignFinalizers:     "foreign-finalizers",
+	Unscheduled:           "unscheduled",
+	NodeReadError:         "node-read-error",
+	NodeHealthy:           "node-healthy",
+	NodeNotDeadLongEnough: "node-not-dead-long-enough",
+	NodeGone:              "node-gone",
+	NodeUnreachableTaint:  "node-unreachable-taint",
+	NodeNotReady:          "node-not-ready",
+}
+
+// String names the class for events and logs.
 func (e TerminatingClass) String() string {
-	switch e {
-	case NotConfigured:
-		return "not-configured"
-	case WithinGrace:
-		return "within-grace"
-	case ForeignFinalizers:
-		return "foreign-finalizers"
-	case Unscheduled:
-		return "unscheduled"
-	case NodeReadError:
-		return "node-read-error"
-	case NodeHealthy:
-		return "node-healthy"
-	case NodeNotDeadLongEnough:
-		return "node-not-dead-long-enough"
-	case NodeGone:
-		return "node-gone"
-	case NodeUnreachableTaint:
-		return "node-unreachable-taint"
-	case NodeNotReady:
-		return "node-not-ready"
+	if e >= 0 && int(e) < len(terminatingClassNames) && terminatingClassNames[e] != "" {
+		return terminatingClassNames[e]
 	}
 	return "unknown"
 }
@@ -101,51 +96,13 @@ type TerminatingResult struct {
 	NodeReadErr error
 }
 
-// StuckTerminating is the PURE classification behind the
-// force-delete escalation. Safety contract, branch by branch:
-//
-//	NotConfigured        — nil policy: the escalation does not exist; no
-//	                       node is ever read. Acting would be acting on
-//	                       an in-code default, which this feature bans.
-//	WithinGrace          — now <= DeletionTimestamp+OverdueSlack. The
-//	                       pod's DeletionTimestamp ALREADY includes its
-//	                       own terminationGracePeriodSeconds (the k8s
-//	                       contract: deletionTimestamp = request time +
-//	                       grace), so a 10-minute-drain pod gets its 10
-//	                       minutes and a 30s pod gets 30s — that is why
-//	                       the check is per-pod. Acting earlier would
-//	                       race a healthy graceful shutdown.
-//	ForeignFinalizers    — force-delete cannot remove a finalizer-pinned
-//	                       object, and stripping another controller's
-//	                       finalizer is off-limits. Report-only.
-//	Unscheduled          — no NodeName: there is no node whose death
-//	                       could prove the container isn't running.
-//	NodeReadError        — the live read failed; without evidence the
-//	                       fail-safe is to do nothing this pass.
-//	NodeHealthy          — Ready=True, evaluated FIRST and vetoing every
-//	                       node-death branch below, including a lingering
-//	                       unreachable taint: the kubelet writes
-//	                       NodeStatus itself, so a dead node cannot post
-//	                       Ready=True — a current Ready=True always
-//	                       outranks stale taint state, and the veto can
-//	                       only shrink the fire surface, never grow it.
-//	                       A Ready node means the kubelet is merely slow;
-//	                       force-deleting risks a double-running
-//	                       container. Never actionable.
-//	NodeNotDeadLongEnough— taint/NotReady present but younger than the
-//	                       threshold (or age unprovable): a blip, not a
-//	                       death. Wait.
-//	NodeGone             — Node object deleted: no kubelet exists to run
-//	                       the container or acknowledge the termination.
-//	                       Safe to remove the API object.
-//	NodeUnreachableTaint — the node-lifecycle controller has marked the
-//	                       node unreachable for >= threshold (age from
-//	                       the taint's own TimeAdded — no observation
-//	                       state to persist, restart-safe).
-//	NodeNotReady         — NodeReady False/Unknown for >= threshold (age
-//	                       from the condition's own LastTransitionTime).
-//
-// Every branch from Unscheduled down is NodeDeath's.
+// StuckTerminating classifies one Terminating pod for the force-delete
+// escalation, in this order: NotConfigured without a policy (no Node is
+// read); WithinGrace until DeletionTimestamp plus OverdueSlack has passed
+// (the timestamp already holds the pod's own grace period, so each pod
+// gets its own window); ForeignFinalizers, report-only, while finalizers
+// remain, since a force-delete cannot remove them; otherwise NodeDeath
+// decides from the node.
 func StuckTerminating(ctx context.Context, reader client.Reader, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time) TerminatingResult {
 	if policy == nil {
 		return TerminatingResult{Kind: NotConfigured}
@@ -168,21 +125,20 @@ func StuckTerminating(ctx context.Context, reader client.Reader, pod *corev1.Pod
 	return NodeDeath(ctx, reader, pod, policy, now, overdue)
 }
 
-// NodeDeath is the node half of the force-delete predicate: does
-// the cluster prove that no kubelet is left to run pod's containers. It
-// is shared by every caller that may only remove a pod object once the
-// node under it is provably gone — the stuck-Terminating sweep, and the
-// rebuild paths whose target name is held by a pod its node has stopped
-// reporting. overdue is carried through for the caller's event text.
+// NodeDeath is the node half of the force-delete predicate: does the
+// cluster prove that no kubelet is left to run the pod's containers. It
+// serves every caller that may remove a pod object only once the node
+// under it is provably gone: the Terminating sweep, and the rebuild paths
+// whose target name is held by a pod its node stopped reporting. overdue
+// is carried through for the caller's event text.
 //
-// Reads the Node through the LIVE reader (never the informer cache) so
-// a stale cache can neither hold a recovered node "NotReady" nor miss a
+// Reads the Node through the LIVE reader (never the informer cache) so a
+// stale cache can neither hold a recovered node "NotReady" nor miss a
 // fresh recovery.
 func NodeDeath(ctx context.Context, reader client.Reader, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time, overdue time.Duration) TerminatingResult {
 	if pod.Spec.NodeName == "" {
 		return TerminatingResult{Kind: Unscheduled, Overdue: overdue}
 	}
-
 	node := &corev1.Node{}
 	if err := reader.Get(ctx, client.ObjectKey{Name: pod.Spec.NodeName}, node); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -190,72 +146,92 @@ func NodeDeath(ctx context.Context, reader client.Reader, pod *corev1.Pod, polic
 		}
 		return TerminatingResult{Kind: NodeReadError, NodeName: pod.Spec.NodeName, Overdue: overdue, NodeReadErr: err}
 	}
+	kind, requeueAt := nodeDeathClass(node, now, policy.NodeUnreachableThreshold)
+	return TerminatingResult{Kind: kind, NodeName: node.Name, RequeueAt: requeueAt, Overdue: overdue}
+}
 
-	// Ready=True vetoes everything below, including a lingering
-	// unreachable taint: the kubelet writes NodeStatus itself, so a dead
-	// node cannot post Ready=True — a current Ready=True always outranks
-	// stale taint state. The veto can only shrink the fire surface,
-	// never grow it.
-	for _, cond := range node.Status.Conditions {
-		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
-			return TerminatingResult{
-				Kind:      NodeHealthy,
-				NodeName:  node.Name,
-				RequeueAt: now.Add(policy.NodeUnreachableThreshold),
-				Overdue:   overdue,
-			}
+// nodeDeathClass reads a live Node in three steps. A current Ready=True
+// vetoes everything else, a lingering unreachable taint included: the
+// kubelet writes NodeStatus itself, so a dead node cannot post it, and
+// the veto only ever shrinks what may be force-deleted. Then each
+// unreachable taint and each NotReady condition, in that order, is
+// actionable once older than threshold. Otherwise the node is healthy,
+// rechecked after one threshold, or not dead long enough, rechecked when
+// the earliest dated sign comes of age (never, if no sign carries a time).
+func nodeDeathClass(node *corev1.Node, now time.Time, threshold time.Duration) (TerminatingClass, time.Time) {
+	if nodeReportsReady(node) {
+		return NodeHealthy, now.Add(threshold)
+	}
+	signs := append(unreachableTaintSigns(node), notReadySigns(node)...)
+	var nextAt time.Time
+	for _, sign := range signs {
+		if !sign.dated {
+			continue
+		}
+		actionableAt := sign.since.Add(threshold)
+		if !now.Before(actionableAt) {
+			return sign.kind, time.Time{}
+		}
+		if nextAt.IsZero() || actionableAt.Before(nextAt) {
+			nextAt = actionableAt
 		}
 	}
+	if len(signs) > 0 {
+		return NodeNotDeadLongEnough, nextAt
+	}
+	return NodeHealthy, now.Add(threshold)
+}
 
-	// Evidence present but younger than the threshold — remembered so
-	// the fall-through distinguishes "dying, wait" from "healthy".
-	young := false
-	var nextEvidenceAt time.Time
+// nodeDeathSign is one sign on a Node that its kubelet stopped running
+// pods: the class it proves once older than the threshold, and when it
+// appeared. A taint without TimeAdded is undated: it rules out a healthy
+// node but can never prove its age.
+type nodeDeathSign struct {
+	kind  TerminatingClass
+	since time.Time
+	dated bool
+}
+
+// nodeReportsReady reports a current NodeReady=True condition.
+func nodeReportsReady(node *corev1.Node) bool {
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// unreachableTaintSigns lists the node's unreachable taints, dated by the
+// taint's own TimeAdded, in the order the node carries them.
+func unreachableTaintSigns(node *corev1.Node) []nodeDeathSign {
+	var signs []nodeDeathSign
 	for _, taint := range node.Spec.Taints {
 		if taint.Key != corev1.TaintNodeUnreachable {
 			continue
 		}
-		// Age comes from the taint's own TimeAdded; a nil TimeAdded
-		// cannot prove the threshold elapsed.
+		sign := nodeDeathSign{kind: NodeUnreachableTaint}
 		if taint.TimeAdded != nil {
-			actionableAt := taint.TimeAdded.Add(policy.NodeUnreachableThreshold)
-			if !now.Before(actionableAt) {
-				return TerminatingResult{Kind: NodeUnreachableTaint, NodeName: node.Name, Overdue: overdue}
-			}
-			if nextEvidenceAt.IsZero() || actionableAt.Before(nextEvidenceAt) {
-				nextEvidenceAt = actionableAt
-			}
+			sign.since, sign.dated = taint.TimeAdded.Time, true
 		}
-		young = true
+		signs = append(signs, sign)
 	}
+	return signs
+}
+
+// notReadySigns lists the node's NodeReady False or Unknown conditions,
+// dated by the condition's own LastTransitionTime.
+func notReadySigns(node *corev1.Node) []nodeDeathSign {
+	var signs []nodeDeathSign
 	for _, cond := range node.Status.Conditions {
 		if cond.Type != corev1.NodeReady {
 			continue
 		}
 		if cond.Status == corev1.ConditionFalse || cond.Status == corev1.ConditionUnknown {
-			actionableAt := cond.LastTransitionTime.Add(policy.NodeUnreachableThreshold)
-			if !now.Before(actionableAt) {
-				return TerminatingResult{Kind: NodeNotReady, NodeName: node.Name, Overdue: overdue}
-			}
-			if nextEvidenceAt.IsZero() || actionableAt.Before(nextEvidenceAt) {
-				nextEvidenceAt = actionableAt
-			}
-			young = true
+			signs = append(signs, nodeDeathSign{kind: NodeNotReady, since: cond.LastTransitionTime.Time, dated: true})
 		}
 	}
-	if young {
-		res := TerminatingResult{Kind: NodeNotDeadLongEnough, NodeName: node.Name, Overdue: overdue}
-		if !nextEvidenceAt.IsZero() {
-			res.RequeueAt = nextEvidenceAt
-		}
-		return res
-	}
-	return TerminatingResult{
-		Kind:      NodeHealthy,
-		NodeName:  node.Name,
-		RequeueAt: now.Add(policy.NodeUnreachableThreshold),
-		Overdue:   overdue,
-	}
+	return signs
 }
 
 // AllPodsTerminatingOverdue reports whether pods is non-empty and every
@@ -350,39 +326,40 @@ func podReadyWithdrawn(pod *corev1.Pod) bool {
 	return containersReady && !podReady && len(unsatisfiedReadinessGates(pod)) == 0
 }
 
-// SilentKubeletTargetPods returns the pods occupying one of the target
-// names whose kubelet has stopped reporting them, lowest name first. A
-// phase-Unknown pod always qualifies. A pod silent only by its withdrawn
-// Ready (podReadyWithdrawn) qualifies only under a force-delete policy:
-// without one no Node is ever read, and only that read separates a dead
-// node from the kubelet's lag behind a readiness-gate write. Name order —
-// not the informer's map iteration order — decides which pod a hold's
-// evidence names, so re-observing the same wait writes the same record.
-func SilentKubeletTargetPods(pods []*corev1.Pod, targets map[string]struct{}, policy *types.ForceDeletePolicy) []*corev1.Pod {
+// UnreportedTargetPods returns the pods occupying one of the target
+// names that have no report from the kubelet, lowest name first. A
+// phase-Unknown pod always qualifies. A pod unreported only by its
+// withdrawn Ready (podReadyWithdrawn) qualifies only under a force-delete
+// policy: without one no Node is ever read, and only that read separates
+// a dead node from the kubelet's lag behind a readiness-gate write. Name
+// order — not the informer's map iteration order — decides which pod a
+// hold's evidence names, so re-observing the same wait writes the same
+// record.
+func UnreportedTargetPods(pods []*corev1.Pod, targets map[string]struct{}, policy *types.ForceDeletePolicy) []*corev1.Pod {
 	if len(pods) == 0 || len(targets) == 0 {
 		return nil
 	}
-	var quiet []*corev1.Pod
+	var unreported []*corev1.Pod
 	for _, pod := range pods {
 		if !types.PodPhaseUnknown(pod) && (policy == nil || !podReadyWithdrawn(pod)) {
 			continue
 		}
 		if _, ok := targets[pod.Name]; ok {
-			quiet = append(quiet, pod)
+			unreported = append(unreported, pod)
 		}
 	}
-	sort.Slice(quiet, func(i, j int) bool { return quiet[i].Name < quiet[j].Name })
-	return quiet
+	sort.Slice(unreported, func(i, j int) bool { return unreported[i].Name < unreported[j].Name })
+	return unreported
 }
 
-// ReadSilentPod is the force-delete sweep's reading of a pod its kubelet
-// has stopped reporting, taken by the hold ahead of the sweep so a hold
+// ReadUnreportedPod is the force-delete sweep's reading of a pod with no
+// report from its kubelet, taken by the hold ahead of the sweep so a hold
 // names only the pods the sweep leaves behind: node death for a pod
 // nobody has asked to delete, the stuck-Terminating classification for
 // one already on its way out, NotConfigured when there is no policy to
 // read a Node under. A read error is returned rather than read as
 // "kept": the sweep fails the pass on it too.
-func ReadSilentPod(ctx context.Context, reader client.Reader, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time) (TerminatingClass, error) {
+func ReadUnreportedPod(ctx context.Context, reader client.Reader, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time) (TerminatingClass, error) {
 	if policy == nil || pod == nil {
 		return NotConfigured, nil
 	}
@@ -398,14 +375,14 @@ func ReadSilentPod(ctx context.Context, reader client.Reader, pod *corev1.Pod, p
 	return res.Kind, nil
 }
 
-// SilentPodHeld reports whether a pod the sweep does not free on this
+// UnreportedPodHeld reports whether a pod the sweep does not free on this
 // reading still holds its name against the rebuild. A phase-Unknown pod
 // does whatever its node says: the kubelet itself stopped vouching for
-// it. A pod silent only by its withdrawn Ready holds the name while its
-// node shows unreachable evidence or is on its way out; on a node posting
-// Ready, or with no node at all, the shape is the kubelet's lag behind a
-// readiness-gate write, and nothing waits on it.
-func SilentPodHeld(pod *corev1.Pod, kind TerminatingClass) bool {
+// it. A pod unreported only by its withdrawn Ready holds the name while
+// its node shows unreachable evidence or is on its way out; on a node
+// posting Ready, or with no node at all, the shape is the kubelet's lag
+// behind a readiness-gate write, and nothing waits on it.
+func UnreportedPodHeld(pod *corev1.Pod, kind TerminatingClass) bool {
 	if kind.Actionable() {
 		return false
 	}

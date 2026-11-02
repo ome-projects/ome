@@ -237,7 +237,7 @@ func (r *Reconciler) observeMemberOnce(
 			candidate.Endpoint = endpoint.DeepCopy()
 		}
 		candidate.AdmittedReplicas = placementAdmittedReplicas(components, statuses, floors)
-		if derived.Status.IsConditionReady(v1beta1.IngressReady) {
+		if derived.Status.IsConditionReady(v1beta1.IngressReady) && routerServing(derived, statuses) {
 			candidate.ReadyReplicas = placementReadyReplicas(components, statuses, servingFloors(isvc, floors))
 		}
 	}
@@ -245,6 +245,17 @@ func (r *Reconciler) observeMemberOnce(
 		state: memberPresent, candidate: candidate,
 		serving: placementCandidateServing(derived, candidate),
 	}
+}
+
+// routerServing reports whether a member that declares a router has a ready
+// router instance. Its ingress sends every request through the router, so
+// without one the member serves nothing, whatever its engines report.
+func routerServing(member *v1beta1.InferenceService, statuses map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus) bool {
+	if member.Spec.Router == nil {
+		return true
+	}
+	status := statuses[v1beta1.RouterComponent]
+	return status != nil && status.ReadyReplicas > 0
 }
 
 // observedMemberFloors reads the per-component floors a standing member is held

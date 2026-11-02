@@ -8,10 +8,8 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -19,6 +17,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // passSim drives the controller's pass order over a P/D canary unit on the
@@ -78,7 +77,7 @@ func newPassSim(t *testing.T, name string) *passSim {
 		r.Spec.Pacing = &v1beta1.InferenceReplicaPacing{Partition: &one}
 		return r
 	}
-	objs := []runtime.Object{isvc,
+	objs := []client.Object{isvc,
 		replica(v1beta1.EngineComponent, simEngineStable, simEngineCanary),
 		replica(v1beta1.DecoderComponent, simDecoderStable, simDecoderCanary),
 		canaryPod(ns, name, "engine", simEngineStable, name+"-engine-0"),
@@ -95,12 +94,14 @@ func newPassSim(t *testing.T, name string) *passSim {
 
 // newPassSimWith builds the simulation over seeded objects for the given
 // group members.
-func newPassSimWith(t *testing.T, ns, name string, members []v1beta1.ComponentType, objs []runtime.Object) *passSim {
+func newPassSimWith(t *testing.T, ns, name string, members []v1beta1.ComponentType, objs []client.Object) *passSim {
 	t.Helper()
 	s := &passSim{t: t, ns: ns, name: name, now: time.Unix(1000, 0), specWrites: map[v1beta1.ComponentType]int{}, members: members}
-	base := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).
-		WithStatusSubresource(&v1beta1.InferenceService{}).Build()
-	s.c = interceptor.NewClient(base, interceptor.Funcs{Update: s.bumpGeneration})
+	s.c = fakeclient.New(t,
+		fakeclient.WithObjects(objs...),
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}),
+		fakeclient.WithInterceptors(interceptor.Funcs{Update: s.bumpGeneration}),
+	)
 	s.record()
 	return s
 }

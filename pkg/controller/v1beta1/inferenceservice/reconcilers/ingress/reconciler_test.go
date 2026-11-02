@@ -220,7 +220,7 @@ func TestIngressReconciler_GetDeploymentMode(t *testing.T) {
 				},
 			}
 
-			mode := reconciler.getDeploymentMode(isvc, tt.engine, tt.decoder, tt.router)
+			mode := reconciler.getDeploymentMode(isvc)
 			assert.Equal(t, tt.expectedMode, mode)
 		})
 	}

@@ -28,13 +28,10 @@ func (s *assignmentState) Clone() framework.StateData {
 	return &c
 }
 
-// writeAssignment records the gang's domain for this cycle (called by PreFilter).
-func writeAssignment(state framework.CycleState, domain string, gang gangInfo, commitment ...uint64) {
-	var id uint64
-	if len(commitment) > 0 {
-		id = commitment[0]
-	}
-	state.Write(assignmentStateKey, &assignmentState{domain: domain, topologyKey: gang.topologyKey, gang: gang, commitment: id})
+// writeAssignment records the gang's domain and the id of the commitment that
+// holds it for this cycle (called by PreFilter).
+func writeAssignment(state framework.CycleState, domain string, gang gangInfo, commitment uint64) {
+	state.Write(assignmentStateKey, &assignmentState{domain: domain, topologyKey: gang.topologyKey, gang: gang, commitment: commitment})
 }
 
 // markSoleFit flags the cycle's assignment as the only domain that fit the gang,

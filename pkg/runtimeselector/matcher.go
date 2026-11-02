@@ -23,102 +23,47 @@ func NewDefaultRuntimeMatcher(config *Config) RuntimeMatcher {
 }
 
 func (m *DefaultRuntimeMatcher) IsCompatible(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (bool, error) {
-	if runtime.IsDisabled() {
-		return false, &RuntimeDisabledError{RuntimeName: runtimeName}
-	}
-
-	// Check accelerator class compatibility
-	if !m.compareAcceleratorClass(runtime, isvc) {
-		return false, &RuntimeCompatibilityError{
-			RuntimeName: runtimeName,
-			ModelName:   "", // Will be filled by caller if available
-			ModelFormat: model.ModelFormat.Name,
-			Reason:      "runtime does not support the required accelerator class",
-		}
-	}
-	// Apply component-level deployment mode constraints
-	if ok, reason := m.compareDeploymentMode(runtime, isvc); !ok {
-		return false, &RuntimeCompatibilityError{
-			RuntimeName: runtimeName,
-			ModelName:   "", // Will be filled by caller if available
-			ModelFormat: model.ModelFormat.Name,
-			Reason:      reason,
-		}
-	}
-	// Check if any supported format matches
-	for _, format := range runtime.SupportedModelFormats {
-		if !m.compareSupportedModelFormats(model, format) {
-			continue
-		}
-		// A matching format is only useful if the model size fits — keep
-		// scanning the rest in case a different supported format pairs
-		// with a wider ModelSizeRange.
-		if err := m.checkModelSize(runtime, model, runtimeName); err == nil {
-			return true, nil
-		}
-	}
-
-	return false, nil
+	report := m.evaluate(runtime, model, isvc)
+	return report.IsCompatible, report.serviceRefusal(runtimeName, model)
 }
 
-func (m *DefaultRuntimeMatcher) GetCompatibilityDetails(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (*CompatibilityReport, error) {
+func (m *DefaultRuntimeMatcher) GetCompatibilityDetails(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, _ string) (*CompatibilityReport, error) {
+	return m.evaluate(runtime, model, isvc), nil
+}
+
+// evaluate is the one compatibility rule. The checks run in order and the
+// first failure ends the report: the runtime is enabled, it declares every
+// accelerator class the service asks for, its engine and decoder deployment
+// modes agree with the service's, one of its supported formats fits the
+// model, and the model's size lies in its size range.
+func (m *DefaultRuntimeMatcher) evaluate(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService) *CompatibilityReport {
 	report := &CompatibilityReport{
 		IncompatibilityReasons: []string{},
 		Warnings:               []string{},
 	}
 
 	if runtime.IsDisabled() {
-		report.IncompatibilityReasons = append(report.IncompatibilityReasons, "runtime is disabled")
-		return report, nil
+		return report.incompatible(runtimeDisabled, "runtime is disabled")
 	}
-
-	// Check if accelerator class is compatible
 	if !m.compareAcceleratorClass(runtime, isvc) {
-		report.IncompatibilityReasons = append(report.IncompatibilityReasons,
-			"runtime does not support the required accelerator class")
-		return report, nil
+		return report.incompatible(acceleratorClassNotServed, "runtime does not support the required accelerator class")
 	}
-
-	// Apply component-level deployment mode constraints
 	if ok, reason := m.compareDeploymentMode(runtime, isvc); !ok {
-		report.IncompatibilityReasons = append(report.IncompatibilityReasons, reason)
-		return report, nil
+		return report.incompatible(deploymentModeMismatch, reason)
 	}
 
-	// Check supported formats (mimics original RuntimeSupportsModel logic)
-	formatSupported := false
-	var formatMismatchReasons []string
-	for _, format := range runtime.SupportedModelFormats {
-		if m.compareSupportedModelFormats(model, format) {
-			formatSupported = true
-			report.MatchDetails = m.evaluateFormatMatch(model, format)
-			break
-		}
-		formatMismatchReasons = append(formatMismatchReasons, m.getFormatMismatchReason(model, format))
+	format, mismatches := m.firstSupportedFormat(runtime, model)
+	if format == nil {
+		return report.incompatible(modelFormatNotSupported, formatNotSupportedReason(model, mismatches))
 	}
+	report.MatchDetails = m.evaluateFormatMatch(model, *format)
 
-	if !formatSupported {
-		if len(formatMismatchReasons) > 0 {
-			report.IncompatibilityReasons = append(report.IncompatibilityReasons,
-				fmt.Sprintf("model format '%s' not in supported formats: %s",
-					getModelFormatLabel(model), strings.Join(formatMismatchReasons, "; ")))
-		} else {
-			report.IncompatibilityReasons = append(report.IncompatibilityReasons,
-				fmt.Sprintf("model format '%s' not in supported formats: no supported formats defined",
-					getModelFormatLabel(model)))
-		}
-		return report, nil
-	}
-
-	if model.ModelParameterSize != nil && runtime.ModelSizeRange != nil {
-		if !modelSizeInRange(*model.ModelParameterSize, runtime.ModelSizeRange) {
-			report.IncompatibilityReasons = append(report.IncompatibilityReasons,
-				fmt.Sprintf("model size %s is outside supported range %s",
-					*model.ModelParameterSize, modelSizeRangeLabel(runtime.ModelSizeRange)))
-			report.MatchDetails.SizeMatch = false
-			return report, nil
-		}
-		report.MatchDetails.SizeMatch = true
+	if model.ModelParameterSize != nil && runtime.ModelSizeRange != nil &&
+		!modelSizeInRange(*model.ModelParameterSize, runtime.ModelSizeRange) {
+		report.MatchDetails.SizeMatch = false
+		return report.incompatible(modelSizeOutOfRange,
+			fmt.Sprintf("model size %s is outside supported range %s",
+				*model.ModelParameterSize, modelSizeRangeLabel(runtime.ModelSizeRange)))
 	}
 
 	report.IsCompatible = true
@@ -136,7 +81,61 @@ func (m *DefaultRuntimeMatcher) GetCompatibilityDetails(runtime *v1beta1.Serving
 			"model does not specify size, but runtime has size constraints")
 	}
 
-	return report, nil
+	return report
+}
+
+// incompatible records the check the runtime failed and its reason, and
+// returns the report.
+func (r *CompatibilityReport) incompatible(check compatibilityCheck, reason string) *CompatibilityReport {
+	r.failedCheck = check
+	r.IncompatibilityReasons = append(r.IncompatibilityReasons, reason)
+	return r
+}
+
+// serviceRefusal is the typed error IsCompatible and ValidateRuntime return
+// when the runtime will not serve the service at all: a RuntimeDisabledError
+// for a disabled runtime, a RuntimeCompatibilityError for one that does not
+// declare the service's accelerator class or deployment mode. It is nil for
+// a compatible report and for a model the runtime's formats or size range
+// do not fit.
+func (r *CompatibilityReport) serviceRefusal(runtimeName string, model *v1beta1.BaseModelSpec) error {
+	switch r.failedCheck {
+	case runtimeDisabled:
+		return &RuntimeDisabledError{RuntimeName: runtimeName}
+	case acceleratorClassNotServed, deploymentModeMismatch:
+		return &RuntimeCompatibilityError{
+			RuntimeName: runtimeName,
+			ModelFormat: model.ModelFormat.Name,
+			Reason:      r.IncompatibilityReasons[0],
+		}
+	}
+	return nil
+}
+
+// firstSupportedFormat returns the first supported format the model fits,
+// or nil with each scanned format's reason for not fitting it.
+func (m *DefaultRuntimeMatcher) firstSupportedFormat(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec) (*v1beta1.SupportedModelFormat, []string) {
+	var mismatches []string
+	for i := range runtime.SupportedModelFormats {
+		format := &runtime.SupportedModelFormats[i]
+		if m.compareSupportedModelFormats(model, *format) {
+			return format, nil
+		}
+		mismatches = append(mismatches, m.getFormatMismatchReason(model, *format))
+	}
+	return nil, mismatches
+}
+
+// formatNotSupportedReason is the report's reason when no supported format
+// fits the model: the model's format label with each format's own reason,
+// or, when the runtime declares no formats, that it declares none.
+func formatNotSupportedReason(model *v1beta1.BaseModelSpec, mismatches []string) string {
+	if len(mismatches) == 0 {
+		return fmt.Sprintf("model format '%s' not in supported formats: no supported formats defined",
+			getModelFormatLabel(model))
+	}
+	return fmt.Sprintf("model format '%s' not in supported formats: %s",
+		getModelFormatLabel(model), strings.Join(mismatches, "; "))
 }
 
 // evaluateFormatMatch runs only after compareSupportedModelFormats has
@@ -237,11 +236,10 @@ func (m *DefaultRuntimeMatcher) compareAcceleratorClass(runtime *v1beta1.Serving
 	if isvc.Spec.AcceleratorSelector != nil && isvc.Spec.AcceleratorSelector.AcceleratorClass != nil {
 		requiredClasses[*isvc.Spec.AcceleratorSelector.AcceleratorClass] = struct{}{}
 	}
-	if isvc.Spec.Engine != nil && isvc.Spec.Engine.AcceleratorOverride != nil && isvc.Spec.Engine.AcceleratorOverride.AcceleratorClass != nil {
-		requiredClasses[*isvc.Spec.Engine.AcceleratorOverride.AcceleratorClass] = struct{}{}
-	}
-	if isvc.Spec.Decoder != nil && isvc.Spec.Decoder.AcceleratorOverride != nil && isvc.Spec.Decoder.AcceleratorOverride.AcceleratorClass != nil {
-		requiredClasses[*isvc.Spec.Decoder.AcceleratorOverride.AcceleratorClass] = struct{}{}
+	for _, role := range v1beta1.ServiceRoles(&isvc.Spec).Declared() {
+		if role.AcceleratorOverride != nil && role.AcceleratorOverride.AcceleratorClass != nil {
+			requiredClasses[*role.AcceleratorOverride.AcceleratorClass] = struct{}{}
+		}
 	}
 
 	// If ISVC has no accelerator requirements, it's compatible from this perspective.
@@ -286,23 +284,6 @@ func (m *DefaultRuntimeMatcher) compareModelFrameworkVersions(supportedFramework
 	return validation.VersionsMatch(*modelFramework.Version, *supportedFramework.Version, supportedFramework.Operator)
 }
 
-func (m *DefaultRuntimeMatcher) checkModelSize(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, runtimeName string) error {
-	if model.ModelParameterSize == nil || runtime.ModelSizeRange == nil {
-		return nil
-	}
-
-	if !modelSizeInRange(*model.ModelParameterSize, runtime.ModelSizeRange) {
-		return &RuntimeCompatibilityError{
-			RuntimeName: runtimeName,
-			ModelFormat: model.ModelFormat.Name,
-			Reason: fmt.Sprintf("model size %s is outside supported range %s",
-				*model.ModelParameterSize, modelSizeRangeLabel(runtime.ModelSizeRange)),
-		}
-	}
-
-	return nil
-}
-
 // modelSizeInRange reports whether the parsed model size falls within the
 // runtime's ModelSizeRange. Min and Max are each +optional in the CRD: a nil
 // Min means "no lower bound" and a nil Max means "no upper bound", so a range
@@ -335,12 +316,7 @@ func modelSizeRangeLabel(sizeRange *v1beta1.ModelSizeRangeSpec) string {
 }
 
 func runtimeHasAutoSelectFormat(runtime *v1beta1.ServingRuntimeSpec) bool {
-	for _, format := range runtime.SupportedModelFormats {
-		if format.AutoSelect != nil && *format.AutoSelect {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(runtime.SupportedModelFormats, autoSelectEnabled)
 }
 
 // optionalEqual treats "both nil" and "both equal" as matches; a mixed
@@ -413,32 +389,18 @@ func getModelFormatLabel(model *v1beta1.BaseModelSpec) string {
 
 // compareDeploymentMode rejects a runtime only when both the InferenceService
 // component and the matching runtime component explicitly declare different
-// deployment modes.
+// deployment modes. Only the roles that run the model are compared.
 func (m *DefaultRuntimeMatcher) compareDeploymentMode(runtime *v1beta1.ServingRuntimeSpec, isvc *v1beta1.InferenceService) (bool, string) {
-	isvcEngineDeploymentMode, hasIsvcEngineDeploymentMode := inferenceServiceEngineDeploymentMode(isvc)
-	runtimeEngineDeploymentMode, hasRuntimeEngineDeploymentMode := getRuntimeComponentDeploymentMode(runtime, v1beta1.EngineComponent)
-	if ok, reason := compareComponentDeploymentMode(
-		"engine",
-		isvcEngineDeploymentMode,
-		hasIsvcEngineDeploymentMode,
-		runtimeEngineDeploymentMode,
-		hasRuntimeEngineDeploymentMode,
-	); !ok {
-		return false, reason
+	for _, role := range v1beta1.Roles {
+		if !role.RunsModel {
+			continue
+		}
+		isvcMode, hasIsvcMode := inferenceServiceRoleDeploymentMode(isvc, role.Type)
+		runtimeMode, hasRuntimeMode := getRuntimeComponentDeploymentMode(runtime, role.Type)
+		if ok, reason := compareComponentDeploymentMode(string(role.Type), isvcMode, hasIsvcMode, runtimeMode, hasRuntimeMode); !ok {
+			return false, reason
+		}
 	}
-
-	isvcDecoderDeploymentMode, hasIsvcDecoderDeploymentMode := inferenceServiceDecoderDeploymentMode(isvc)
-	runtimeDecoderDeploymentMode, hasRuntimeDecoderDeploymentMode := getRuntimeComponentDeploymentMode(runtime, v1beta1.DecoderComponent)
-	if ok, reason := compareComponentDeploymentMode(
-		"decoder",
-		isvcDecoderDeploymentMode,
-		hasIsvcDecoderDeploymentMode,
-		runtimeDecoderDeploymentMode,
-		hasRuntimeDecoderDeploymentMode,
-	); !ok {
-		return false, reason
-	}
-
 	return true, ""
 }
 
@@ -457,56 +419,36 @@ func compareComponentDeploymentMode(
 		componentName, runtimeDeploymentMode, componentName, isvcDeploymentMode)
 }
 
-// inferenceServiceEngineDeploymentMode returns the deployment mode the
-// InferenceService explicitly declares for its engine: the per-component
+// inferenceServiceRoleDeploymentMode returns the deployment mode the
+// InferenceService explicitly declares for role c: the per-component
 // ome.io/deploymentMode annotation when present, else the typed
 // spec.deploymentMode (which applies to every component). The engine always
-// renders, so the typed field counts even when spec.engine is absent.
-func inferenceServiceEngineDeploymentMode(isvc *v1beta1.InferenceService) (constants.DeploymentModeType, bool) {
+// renders, so for it the typed field counts even when spec.engine is absent.
+// Any other role reports nothing when the InferenceService does not declare
+// it — a runtime piece's mode must not filter services that will never
+// deploy that role.
+func inferenceServiceRoleDeploymentMode(isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (constants.DeploymentModeType, bool) {
 	if isvc == nil {
 		return "", false
 	}
-	if isvc.Spec.Engine != nil {
-		if mode, found := deploymentModeFromAnnotations(isvc.Spec.Engine.Annotations); found {
+	view := v1beta1.SpecOf(&isvc.Spec, c)
+	if view == nil && c != v1beta1.EngineComponent {
+		return "", false
+	}
+	if view != nil {
+		if mode, found := deploymentModeFromAnnotations(view.Extension.Annotations); found {
 			return mode, true
 		}
 	}
 	return deploymentModeFromSpecField(isvc.Spec.DeploymentMode)
 }
 
-// inferenceServiceDecoderDeploymentMode mirrors the engine variant for the
-// decoder. It reports nothing when the InferenceService declares no decoder —
-// a runtime's decoderConfig mode must not filter services that will never
-// deploy one.
-func inferenceServiceDecoderDeploymentMode(isvc *v1beta1.InferenceService) (constants.DeploymentModeType, bool) {
-	if isvc == nil || isvc.Spec.Decoder == nil {
-		return "", false
-	}
-	if mode, found := deploymentModeFromAnnotations(isvc.Spec.Decoder.Annotations); found {
-		return mode, true
-	}
-	return deploymentModeFromSpecField(isvc.Spec.DeploymentMode)
-}
-
 func getRuntimeComponentDeploymentMode(runtime *v1beta1.ServingRuntimeSpec, componentType v1beta1.ComponentType) (constants.DeploymentModeType, bool) {
-	if runtime == nil {
+	piece := v1beta1.PieceOf(runtime, componentType)
+	if piece == nil {
 		return "", false
 	}
-
-	switch componentType {
-	case v1beta1.EngineComponent:
-		if runtime.EngineConfig == nil {
-			return "", false
-		}
-		return deploymentModeFromAnnotations(runtime.EngineConfig.Annotations)
-	case v1beta1.DecoderComponent:
-		if runtime.DecoderConfig == nil {
-			return "", false
-		}
-		return deploymentModeFromAnnotations(runtime.DecoderConfig.Annotations)
-	default:
-		return "", false
-	}
+	return deploymentModeFromAnnotations(piece.Extension.Annotations)
 }
 
 func deploymentModeFromAnnotations(annotations map[string]string) (constants.DeploymentModeType, bool) {

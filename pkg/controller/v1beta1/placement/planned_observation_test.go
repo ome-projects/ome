@@ -143,6 +143,22 @@ func TestObservePlannedMember(t *testing.T) {
 			f.extraObjects = []client.Object{ir, pod}
 			f.components = append(f.components, v1beta1.RouterComponent)
 		}, want: steady},
+		{name: "router pods without the serving condition keep the member unready", edit: func(f *plannedObservationFixture) {
+			// The router containers pass their probes but the ome.io/serving gate
+			// is unset, so no router pod is Ready. The member's ingress and the
+			// router's status still report ready, yet the member counts no ready replica.
+			ir := f.resources.ir.DeepCopy()
+			ir.UID, ir.Name, ir.Spec.Component = "router-uid", "service-router", v1beta1.RouterComponent
+			ir.Spec.Replicas = ptr.To[int32](8)
+			pod := f.resources.pods[0].DeepCopy()
+			pod.Name, pod.UID, pod.OwnerReferences[0].UID = "router-0", "router-pod", ir.UID
+			pod.Status.Conditions = []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ReadinessGatesNotReady"},
+			}
+			f.extraObjects = []client.Object{ir, pod}
+			f.components = append(f.components, v1beta1.RouterComponent)
+		}, want: result{MemberState: allocation.MemberState{Known: true, Applied: true, Occupied: 1}, PauseAcknowledged: true, Applied: "plan-a", Admitted: 1}},
 		{name: "router must be admitted before the member serves", edit: func(f *plannedObservationFixture) { f.components = append(f.components, v1beta1.RouterComponent) }, want: result{MemberState: allocation.MemberState{Known: true, Occupied: 1}}},
 		{name: "engine and decoder share whole replica accounting", edit: func(f *plannedObservationFixture) {
 			ir := f.resources.ir.DeepCopy()

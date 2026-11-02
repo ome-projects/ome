@@ -45,7 +45,7 @@ func TestAffinityMatchDiagnostics(t *testing.T) {
 		}},
 		{name: "weighted terms retain original indexes", edit: func(s *v1beta1.InferenceService) {
 			s.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-			s.Spec.Placement.ClusterAffinity[0].Weight = ptr.To[int32](3)
+			s.Spec.Placement.ClusterAffinity[0].Weights = &v1beta1.ClusterAffinityWeights{Engine: ptr.To[int32](3)}
 		}, clusters: []v1beta1.WorkloadCluster{*readyWC("member-b", map[string]string{"region": "east"})}, unmatched: "[0]"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

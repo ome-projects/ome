@@ -18,6 +18,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -2431,7 +2432,7 @@ func TestPromoteCurrentRevision_HeldRevisionDoesNotLandByAttrition(t *testing.T)
 
 	// The hold the ladder stands for is still what the status reports.
 	fresh := getFreshIR(t, r, ir)
-	hold := effectiveRolloutHold(false, nil, &fresh.Status, crashed.Time)
+	hold := effectiveRolloutHold(false, nil, &fresh.Status, false, crashed.Time)
 	g.Expect(hold).NotTo(gomega.BeNil(), "the Held hold must be reported while the push has not landed")
 	g.Expect(hold.Gate).To(gomega.Equal(v1beta1.RolloutHoldGateHeld))
 
@@ -2597,7 +2598,7 @@ func TestPromoteCurrentRevision_SameNameReplacementAborts(t *testing.T) {
 	g.Expect(persisted.Status.CurrentRevision).To(gomega.Equal(promotePriorRev))
 }
 
-// TestPromoteCurrentRevision_GenerationChangeAborts pins the promotion's
+// TestPromoteCurrentRevision_GenerationChangeAborts locks in the promotion's
 // precondition: a spec that changed in something the pass read (here the
 // replica count) since the pass planned refuses the write.
 func TestPromoteCurrentRevision_GenerationChangeAborts(t *testing.T) {
@@ -2626,7 +2627,7 @@ func TestPromoteCurrentRevision_GenerationChangeAborts(t *testing.T) {
 	g.Expect(persisted.Status.CurrentRevision).To(gomega.Equal(promotePriorRev))
 }
 
-// TestPromoteCurrentRevision_ExcludedAnnotationValueChangeLands pins the
+// TestPromoteCurrentRevision_ExcludedAnnotationValueChangeLands locks in the
 // other side of the precondition: a generation that moved for the value of
 // an annotation the revision leaves out changed nothing the pass read, so
 // the promotion lands on the live generation.
@@ -3167,6 +3168,38 @@ func TestStandaloneReplicaDerivesNamesFromItsOwnName(t *testing.T) {
 	}
 }
 
+// The per-Component headless Service is peer discovery for distributed
+// init, so it selects every pod of the Component, workers included; only
+// routing Services narrow to the leader.
+func TestHeadlessServiceSelectsEveryPodOfTheComponent(t *testing.T) {
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc-engine", Namespace: "team-a"},
+		Spec: v1beta1.InferenceReplicaSpec{
+			ParentRef: &v1beta1.ParentReference{Name: "svc"},
+			Component: v1beta1.EngineComponent,
+		},
+	}
+	svc := buildHeadlessServiceSpec(ir)
+	for _, key := range []string{query.LabelRunner, query.LabelPodOrdinal} {
+		if _, ok := svc.Selector[key]; ok {
+			t.Errorf("headless Service selector must not include %s: %v", key, svc.Selector)
+		}
+	}
+	selector := labels.SelectorFromSet(svc.Selector)
+	for _, runner := range []string{workloadtypes.RunnerLeader, workloadtypes.RunnerWorker, workloadtypes.RunnerDefault} {
+		pod := labels.Set{
+			constants.InferenceServicePodLabelKey: "svc",
+			constants.OMEComponentLabel:           string(v1beta1.EngineComponent),
+			query.LabelManagedBy:                  query.ManagedByOMENative,
+			query.LabelRunner:                     runner,
+			query.LabelPodOrdinal:                 "1",
+		}
+		if !selector.Matches(pod) {
+			t.Errorf("headless Service must select %s pods: selector=%v", runner, svc.Selector)
+		}
+	}
+}
+
 func TestProjectedReplicaDerivesNamesFromItsParent(t *testing.T) {
 	ir := &v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc-engine", Namespace: "team-a"},
@@ -3490,4 +3523,24 @@ func TestBuildMutateInstance_KeepsPublishedReadyOverASurgeSourceWhoseReplacement
 		g.Expect(row.Operation).To(gomega.BeNil())
 		g.Expect(row.TargetRevision).To(gomega.BeEmpty())
 	})
+}
+
+// TestBuildReconcileInput_SchedulerGracesFromSettings: both scheduler-hold
+// windows the operator configured reach the workload engine, the general
+// one and the shorter one for a gang held to a domain that cannot take it.
+func TestBuildReconcileInput_SchedulerGracesFromSettings(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ir := baselineIR("llama-engine", "prod", 1)
+	c, _ := newWireNormalizingStatusClient(t, ir)
+	r := &Reconciler{
+		Client:               c,
+		APIReader:            c,
+		Clock:                clocktesting.NewFakeClock(time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)),
+		Expectations:         workloadtypes.NewExpectations(),
+		InstanceStatusTarget: irstatus.EncodingDenseV1,
+	}
+	settings := lifecycleSettings{Unschedulable: 15 * time.Minute, GangDomainFull: 5 * time.Minute}
+	input := r.buildReconcileInput(context.Background(), ir, ir.Spec.Runners, nil, nil, nil, settings, 0, coordination.GroupDefaults{})
+	g.Expect(input.UnschedulableGrace).To(gomega.Equal(15 * time.Minute))
+	g.Expect(input.GangDomainFullGrace).To(gomega.Equal(5 * time.Minute))
 }

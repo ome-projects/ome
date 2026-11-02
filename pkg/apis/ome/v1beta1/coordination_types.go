@@ -230,6 +230,23 @@ type RolloutCoordinationGroupStatus struct {
 	// +optional
 	PreviousComponent ComponentType `json:"previousComponent,omitempty"`
 
+	// MemberFinished records, for a Sequential group with a wait between
+	// members, the member whose roll most recently read done and the
+	// instant it first read so. The wait before the next member runs from
+	// that instant on the group and on the replica side; the member losing
+	// readiness afterwards, or its replica being recreated, does not move
+	// it. Cleared when that member rolls again.
+	// +optional
+	MemberFinished *RolloutCoordinationMemberFinish `json:"memberFinished,omitempty"`
+
+	// MemberNotReady names the finished Sequential member whose Ready
+	// condition is False or absent while the next member waits on it: the
+	// next member is held until that member is Ready again, and the wait
+	// keeps running from MemberFinished meanwhile, so the next member starts
+	// on the recovery when the wait has elapsed by then. Empty otherwise.
+	// +optional
+	MemberNotReady ComponentType `json:"memberNotReady,omitempty"`
+
 	// ObservedSurge is the IntOrString surge target applied during the
 	// current Surging / Waiting phase. Empty when the group is Idle.
 	// +optional
@@ -244,10 +261,36 @@ type RolloutCoordinationGroupStatus struct {
 	// +optional
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 
+	// MixedPairing reports that the group's Components serve distinct
+	// revisions at once, which a RollingUpdate group permits while it
+	// rolls; a BlueGreen or Sequential group never sets it. It holds for
+	// as long as the picture does. The event MixedPairingObserved is
+	// recorded on the pass that sets it, not on every pass it holds.
+	// +optional
+	MixedPairing bool `json:"mixedPairing,omitempty"`
+
+	// SurgeHeldByRatio reports that RatioBalanced pacing refused the
+	// group's next surge on this pass to keep the cross-Component ratio.
+	// It holds for as long as the refusal does. The event RatioSkewRejected
+	// is recorded on the pass that sets it, not on every pass it holds.
+	// +optional
+	SurgeHeldByRatio bool `json:"surgeHeldByRatio,omitempty"`
+
 	// Message is a short operator-facing explanation of the current
 	// Phase. Set on Failed / RollingBack / Paused phases.
 	// +optional
 	Message string `json:"message,omitempty"`
+}
+
+// RolloutCoordinationMemberFinish is the instant a Sequential member's
+// roll first read done, the clock the wait before the next member runs
+// from.
+type RolloutCoordinationMemberFinish struct {
+	// Component names the member.
+	Component ComponentType `json:"component"`
+
+	// At is the instant the member first read done.
+	At metav1.Time `json:"at"`
 }
 
 // CoordinationPhase is the metric-stable enum for a coordination
@@ -345,3 +388,11 @@ const RolloutCoordinationReady = "RolloutCoordinationReady"
 // transition, not every reconcile. Not a dependent of the Ready
 // conditionSet, so it never affects overall readiness.
 const CoordinationAdvisory = "CoordinationAdvisory"
+
+// TrafficEndpointsReady is the InferenceServiceStatus condition type for
+// the data-plane side of the traffic split. False while a revision has
+// serving pods that are not yet Ready endpoints of its routed Service, with
+// a message naming the revision and the counts; the split withholds that
+// revision's share until the endpoints controller lists them. True once
+// every serving pod is listed. Not a dependent of the Ready conditionSet.
+const TrafficEndpointsReady = "TrafficEndpointsReady"

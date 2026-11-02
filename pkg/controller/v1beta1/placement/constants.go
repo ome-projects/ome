@@ -58,15 +58,17 @@ var (
 // rollout operator-verbs (promote/rollback/repin/resume advance one shared
 // rollout, owned by the control plane — a copy on every candidate would each
 // consume the verb, and the source's still-live copy would re-derive it onto
-// the member on the next sync, replaying it forever), and the rollout
+// the member on the next sync, replaying it forever), the cleanup release
+// request (it names a revision of the control plane's plan), and the rollout
 // plan-source provenance (system-authored during derive-time policy
 // inflation; a user-supplied value on the source must never masquerade as
 // control-plane provenance on the derived). Stripped by DeriveISVC;
 // inflation re-authors the plan-source entry afterwards.
 //
 // Nothing forwards these hub→member, and the hub runs no rollout of its own,
-// so on a placed InferenceService a verb takes effect only when applied
-// directly to the member object.
+// so on a placed InferenceService a rollout verb takes effect only when
+// applied directly to the member object. The cleanup release request acts on
+// the hub, where placement reads it from the source.
 var controlPlaneOnlyAnnotations = []string{
 	AcceleratorRequirementsAnnotation,
 	ClusterSelectorAnnotation,
@@ -76,6 +78,7 @@ var controlPlaneOnlyAnnotations = []string{
 	constants.RolloutRollbackAnnotation,
 	constants.RolloutRepinAnnotation,
 	constants.RolloutResumeAnnotation,
+	constants.PlacementReleaseCleanupWaitAnnotation,
 	constants.RolloutPlanSourceAnnotation,
 }
 

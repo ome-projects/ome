@@ -6,10 +6,13 @@ import (
 	"strconv"
 	"strings"
 
+	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/placement/affinity"
 )
 
 // Multi-node validation reason constants. Operators reference these
@@ -353,26 +356,11 @@ func ValidateScaleToZero(isvc *v1beta1.InferenceService) error {
 	annotations := isvc.ObjectMeta.Annotations
 	legacyKEDA := constants.AutoscalerClassType(annotations[constants.AutoscalerClass]) == constants.AutoscalerClassKEDA
 
-	// Collect the (MinReplicas, Autoscaler) pair for each present
-	// Component. Engine/Decoder/Router all embed ComponentExtensionSpec,
-	// so MinReplicas and Autoscaler are promoted fields on each.
-	type scaleToZeroCheck struct {
-		name        string
-		minReplicas *int
-		autoscaler  *v1beta1.ComponentAutoscaler
-	}
-	var checks []scaleToZeroCheck
-	if c := isvc.Spec.Engine; c != nil {
-		checks = append(checks, scaleToZeroCheck{"engine", c.MinReplicas, c.Autoscaler})
-	}
-	if c := isvc.Spec.Decoder; c != nil {
-		checks = append(checks, scaleToZeroCheck{"decoder", c.MinReplicas, c.Autoscaler})
-	}
-	if c := isvc.Spec.Router; c != nil {
-		checks = append(checks, scaleToZeroCheck{"router", c.MinReplicas, c.Autoscaler})
-	}
-	for _, c := range checks {
-		if c.minReplicas == nil || *c.minReplicas != 0 {
+	// Every role embeds ComponentExtensionSpec, which carries MinReplicas
+	// and Autoscaler.
+	for _, r := range declaredRoles(&isvc.Spec) {
+		minReplicas, autoscaler := r.extension.MinReplicas, r.extension.Autoscaler
+		if minReplicas == nil || *minReplicas != 0 {
 			continue
 		}
 		// MinReplicas=0 on this Component. Accept when the whole-ISVC legacy
@@ -381,14 +369,14 @@ func ValidateScaleToZero(isvc *v1beta1.InferenceService) error {
 		if legacyKEDA {
 			continue
 		}
-		if c.autoscaler != nil && c.autoscaler.Class == v1beta1.AutoscalerKEDA {
+		if autoscaler != nil && autoscaler.Class == v1beta1.AutoscalerKEDA {
 			continue
 		}
 		return fmt.Errorf(
 			"InvalidScaleToZero: %s.minReplicas=0 requires KEDA autoscaling "+
 				"(set spec.%s.autoscaler.class=%s or the %s=%s annotation); "+
 				"Serverless mode no longer auto-promotes scale-to-zero",
-			c.name, c.name, v1beta1.AutoscalerKEDA,
+			r.kind, r.kind, v1beta1.AutoscalerKEDA,
 			constants.AutoscalerClass, constants.AutoscalerClassKEDA,
 		)
 	}
@@ -486,6 +474,13 @@ const (
 	// rejection after the OME write succeeds.
 	ReasonKedaIdleBelowMin = "KedaIdleBelowMin"
 
+	// ReasonKedaHPANameInvalid rejects a KEDA block whose
+	// advanced.horizontalPodAutoscalerConfig.name is not a DNS label, for
+	// example because it is longer than 63 characters. KEDA's own admission
+	// rejects the ScaledObject at reconcile time; this rejects the spec when
+	// it is applied instead.
+	ReasonKedaHPANameInvalid = "KedaHPANameInvalid"
+
 	// ReasonAutoscalerAnnotationConflict rejects an ISVC that carries
 	// both the legacy ome.io/autoscalerClass annotation AND a new
 	// Autoscaler block on any Component. The
@@ -566,6 +561,8 @@ func ValidateComponentsAutoscalers(checks []ComponentAutoscalerCheck) error {
 //  4. class=keda with both Keda.IdleReplicaCount and the supplied
 //     minReplicas set: IdleReplicaCount must be strictly less than
 //     minReplicas.
+//  5. class=keda with advanced.horizontalPodAutoscalerConfig.name set: the
+//     name must be a DNS label, as KEDA's admission requires.
 //
 // Returns nil when autoscaler is nil — every Component-level Autoscaler
 // block is optional.
@@ -621,6 +618,31 @@ func ValidateAutoscaler(autoscaler *v1beta1.ComponentAutoscaler, minReplicas *in
 		}
 	}
 
+	// Rule 5: a requested KEDA HPA name must be a DNS label.
+	if as.Class == v1beta1.AutoscalerKEDA && as.Keda != nil {
+		if err := ValidateKedaHPAName(as.Keda.Advanced); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ValidateKedaHPAName checks advanced.horizontalPodAutoscalerConfig.name, the
+// HPA name a KEDA block asks for. KEDA's admission rejects a ScaledObject
+// whose HPA name is not a DNS label, so OME rejects the spec up front. An
+// unset name is valid: OME and KEDA choose one.
+func ValidateKedaHPAName(advanced *kedav1.AdvancedConfig) error {
+	if advanced == nil || advanced.HorizontalPodAutoscalerConfig == nil || advanced.HorizontalPodAutoscalerConfig.Name == "" {
+		return nil
+	}
+	name := advanced.HorizontalPodAutoscalerConfig.Name
+	if errs := k8svalidation.IsDNS1123Label(name); len(errs) > 0 {
+		return fmt.Errorf(
+			"%s: keda.advanced.horizontalPodAutoscalerConfig.name %q is not a valid HPA name: %s",
+			ReasonKedaHPANameInvalid, name, strings.Join(errs, "; "),
+		)
+	}
 	return nil
 }
 
@@ -708,15 +730,11 @@ func ValidateAutoscalerAnnotationConflict(isvc *v1beta1.InferenceService) error 
 	if _, has := isvc.Annotations[constants.AutoscalerClass]; !has {
 		return nil
 	}
-	conflicting := []string{}
-	if isvc.Spec.Engine != nil && isvc.Spec.Engine.Autoscaler != nil {
-		conflicting = append(conflicting, "engine")
-	}
-	if isvc.Spec.Decoder != nil && isvc.Spec.Decoder.Autoscaler != nil {
-		conflicting = append(conflicting, "decoder")
-	}
-	if isvc.Spec.Router != nil && isvc.Spec.Router.Autoscaler != nil {
-		conflicting = append(conflicting, "router")
+	conflicting := []v1beta1.ComponentType{}
+	for _, r := range declaredRoles(&isvc.Spec) {
+		if r.extension.Autoscaler != nil {
+			conflicting = append(conflicting, r.kind)
+		}
 	}
 	if len(conflicting) == 0 {
 		return nil
@@ -760,15 +778,10 @@ func ValidateLegacyAutoscalerFieldsRaw(rawObj []byte) error {
 	if len(rawObj) == 0 {
 		return nil
 	}
+	// Every role's block, on a service (keyed by the role) or a runtime
+	// (keyed by its piece), is a member of spec.
 	var envelope struct {
-		Spec struct {
-			Engine        json.RawMessage `json:"engine,omitempty"`
-			Decoder       json.RawMessage `json:"decoder,omitempty"`
-			Router        json.RawMessage `json:"router,omitempty"`
-			EngineConfig  json.RawMessage `json:"engineConfig,omitempty"`
-			DecoderConfig json.RawMessage `json:"decoderConfig,omitempty"`
-			RouterConfig  json.RawMessage `json:"routerConfig,omitempty"`
-		} `json:"spec,omitempty"`
+		Spec map[string]json.RawMessage `json:"spec,omitempty"`
 	}
 	if err := json.Unmarshal(rawObj, &envelope); err != nil {
 		// The primary decoder will surface a JSON parse failure; this
@@ -776,28 +789,25 @@ func ValidateLegacyAutoscalerFieldsRaw(rawObj []byte) error {
 		// real error.
 		return nil
 	}
-	checks := []struct {
-		name string
-		body json.RawMessage
-	}{
-		{"engine", envelope.Spec.Engine},
-		{"decoder", envelope.Spec.Decoder},
-		{"router", envelope.Spec.Router},
-		{"engineConfig", envelope.Spec.EngineConfig},
-		{"decoderConfig", envelope.Spec.DecoderConfig},
-		{"routerConfig", envelope.Spec.RouterConfig},
+	names := make([]string, 0, 2*len(v1beta1.Roles))
+	for _, r := range v1beta1.Roles {
+		names = append(names, string(r.Type))
 	}
-	for _, c := range checks {
-		if len(c.body) == 0 {
+	for _, r := range v1beta1.Roles {
+		names = append(names, r.RuntimeField)
+	}
+	for _, name := range names {
+		body := envelope.Spec[name]
+		if len(body) == 0 {
 			continue
 		}
-		if field, ok := legacyAutoscalerFieldOn(c.body); ok {
+		if field, ok := legacyAutoscalerFieldOn(body); ok {
 			return fmt.Errorf(
 				"%s: spec.%s.%s is no longer supported. "+
 					"Use spec.%s.autoscaler.%s instead.",
 				ReasonLegacyAutoscalerFieldsRejected,
-				c.name, field,
-				c.name, legacyAutoscalerReplacement(field),
+				name, field,
+				name, legacyAutoscalerReplacement(field),
 			)
 		}
 	}
@@ -884,14 +894,10 @@ func isvcAutoscalerPolicyRefChecks(isvc *v1beta1.InferenceService) []autoscalerP
 		return nil
 	}
 	var checks []autoscalerPolicyRefCheck
-	if isvc.Spec.Engine != nil && isvc.Spec.Engine.AutoscalerPolicyRef != nil {
-		checks = append(checks, autoscalerPolicyRefCheck{"engine", isvc.Spec.Engine.AutoscalerPolicyRef})
-	}
-	if isvc.Spec.Decoder != nil && isvc.Spec.Decoder.AutoscalerPolicyRef != nil {
-		checks = append(checks, autoscalerPolicyRefCheck{"decoder", isvc.Spec.Decoder.AutoscalerPolicyRef})
-	}
-	if isvc.Spec.Router != nil && isvc.Spec.Router.AutoscalerPolicyRef != nil {
-		checks = append(checks, autoscalerPolicyRefCheck{"router", isvc.Spec.Router.AutoscalerPolicyRef})
+	for _, r := range declaredRoles(&isvc.Spec) {
+		if r.extension.AutoscalerPolicyRef != nil {
+			checks = append(checks, autoscalerPolicyRefCheck{string(r.kind), r.extension.AutoscalerPolicyRef})
+		}
 	}
 	return checks
 }
@@ -925,30 +931,64 @@ func ValidateAutoscalerPolicyRefs(isvc *v1beta1.InferenceService, featureEnabled
 }
 
 // AutoscalerPolicySplitCeilingWarning returns a webhook warning (never a
-// rejection) when placement splits replicas, at least one Component
-// references an AutoscalerPolicy, and
-// spec.placement.split.maxReplicasPerCluster is unset or zero. Policy
-// templates render against each home's derived replica bounds; without a
-// per-cluster cap that ceiling is unbounded, so a fail-to-max fallback on
-// one home can fabricate the whole fleet's count. Empty string when the
-// combination is absent.
+// rejection) when placement splits replicas and a Component that references
+// an AutoscalerPolicy has no per-cluster cap. A component is capped by its
+// split.maxPerCluster key or default, or by the primary component's cap, which
+// scales to the others. Policy templates render against each home's derived
+// replica bounds; without a per-cluster cap that ceiling is unbounded, so a
+// fail-to-max fallback on one home can fabricate the whole fleet's count.
+// Empty string when the combination is absent.
 func AutoscalerPolicySplitCeilingWarning(isvc *v1beta1.InferenceService) string {
 	if isvc == nil || isvc.Spec.Placement == nil || (isvc.Spec.Placement.Mode != v1beta1.PlacementModeSplit && isvc.Spec.Placement.Mode != v1beta1.PlacementModeSplitByCapacity) {
 		return ""
 	}
-	if s := isvc.Spec.Placement.Split; s != nil && s.MaxReplicasPerCluster > 0 {
+	if affinity.UsesRatios(isvc.Spec.Placement.ClusterAffinity) {
+		return ratioFormCeilingWarning(isvc)
+	}
+	split := isvc.Spec.Placement.Split
+	primary := v1beta1.EngineComponent
+	if isvc.Spec.Engine == nil && isvc.Spec.Decoder != nil {
+		primary = v1beta1.DecoderComponent
+	}
+	if split.Ceiling(primary) > 0 {
 		return ""
 	}
 	var referencing []string
 	for _, c := range isvcAutoscalerPolicyRefChecks(isvc) {
-		referencing = append(referencing, c.name)
+		if component := v1beta1.ComponentType(c.name); split.Ceiling(component) == 0 {
+			referencing = append(referencing, c.name)
+		}
 	}
 	if len(referencing) == 0 {
 		return ""
 	}
 	return fmt.Sprintf(
-		"spec.placement.mode=%s with autoscalerPolicyRef on %s but spec.placement.split.maxReplicasPerCluster is unset; "+
+		"spec.placement.mode=%s with autoscalerPolicyRef on %s but spec.placement.split.maxPerCluster caps none of them; "+
 			"policy templates render against each home's derived bounds, and without a per-cluster cap that ceiling is unbounded (%s)",
+		isvc.Spec.Placement.Mode, strings.Join(referencing, ", "), v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling,
+	)
+}
+
+// ratioFormCeilingWarning covers a ratio-form source, whose per-cluster
+// ceiling is a share of the component's maxReplicas: a component that
+// references an AutoscalerPolicy without maxReplicas has no ceiling to share.
+func ratioFormCeilingWarning(isvc *v1beta1.InferenceService) string {
+	maxReplicas := map[string]int{}
+	for _, r := range declaredRoles(&isvc.Spec) {
+		maxReplicas[string(r.kind)] = r.extension.MaxReplicas
+	}
+	var referencing []string
+	for _, c := range isvcAutoscalerPolicyRefChecks(isvc) {
+		if maxReplicas[c.name] == 0 {
+			referencing = append(referencing, c.name)
+		}
+	}
+	if len(referencing) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"spec.placement.mode=%s with replica ratios and autoscalerPolicyRef on %s but no maxReplicas on them; "+
+			"each cluster's ceiling is its share of maxReplicas, and without maxReplicas that ceiling is unbounded (%s)",
 		isvc.Spec.Placement.Mode, strings.Join(referencing, ", "), v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling,
 	)
 }

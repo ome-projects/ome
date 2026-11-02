@@ -8,19 +8,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestReconcileRetriesFinalizerConflict(t *testing.T) {
@@ -38,9 +37,6 @@ func TestReconcileRetriesFinalizerConflict(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			g := gomega.NewWithT(t)
 			ctx := context.Background()
-			scheme := runtime.NewScheme()
-			g.Expect(v1beta1.AddToScheme(scheme)).To(gomega.Succeed())
-
 			isvc := &v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "finalizer-conflict",
@@ -54,11 +50,7 @@ func TestReconcileRetriesFinalizerConflict(t *testing.T) {
 				isvc.Finalizers = []string{finalizerName}
 			}
 
-			live := clientfake.NewClientBuilder().
-				WithScheme(scheme).
-				WithObjects(isvc).
-				WithStatusSubresource(isvc).
-				Build()
+			live := fakeclient.New(t, fakeclient.WithObjects(isvc), fakeclient.WithStatusSubresource(isvc))
 			key := client.ObjectKeyFromObject(isvc)
 			if test.deleting {
 				g.Expect(live.Delete(ctx, isvc)).To(gomega.Succeed())
@@ -73,8 +65,8 @@ func TestReconcileRetriesFinalizerConflict(t *testing.T) {
 			g.Expect(live.Status().Update(ctx, latest)).To(gomega.Succeed())
 
 			staleGet := true
-			updateCalls := 0
-			cached := interceptor.NewClient(live, interceptor.Funcs{
+			updates := fakeclient.CountingVerb(fakeclient.Update)
+			cached := fakeclient.Wrap(t, live, updates, fakeclient.WithInterceptors(interceptor.Funcs{
 				Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 					if staleGet && key == client.ObjectKeyFromObject(stale) {
 						if out, ok := obj.(*v1beta1.InferenceService); ok {
@@ -85,11 +77,7 @@ func TestReconcileRetriesFinalizerConflict(t *testing.T) {
 					}
 					return c.Get(ctx, key, obj, opts...)
 				},
-				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-					updateCalls++
-					return c.Update(ctx, obj, opts...)
-				},
-			})
+			}))
 
 			configMap := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -112,7 +100,7 @@ func TestReconcileRetriesFinalizerConflict(t *testing.T) {
 			result, err := reconciler.Reconcile(ctx, request)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 			g.Expect(result.Requeue).To(gomega.BeTrue())
-			g.Expect(updateCalls).To(gomega.Equal(1))
+			g.Expect(updates.Count()).To(gomega.Equal(1))
 
 			stored := &v1beta1.InferenceService{}
 			g.Expect(live.Get(ctx, key, stored)).To(gomega.Succeed())

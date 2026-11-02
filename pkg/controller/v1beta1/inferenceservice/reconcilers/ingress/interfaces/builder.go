@@ -8,10 +8,15 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// ResourceBuilder builds Kubernetes resources for ingress
-type ResourceBuilder interface {
-	Build(ctx context.Context, isvc *v1beta1.InferenceService) (client.Object, error)
-	GetResourceType() string
+// ComponentNotReadyError is a builder's answer when the Component a route
+// would send traffic to cannot back it yet: nothing is built, and the strategy
+// that asked reports the condition.
+type ComponentNotReadyError struct {
+	Component v1beta1.ComponentType
+}
+
+func (e *ComponentNotReadyError) Error() string {
+	return string(e.Component) + " component not ready"
 }
 
 // ClusterLocalEndpointClass is the conventional class tagged on the in-cluster
@@ -45,7 +50,8 @@ type Endpoint struct {
 
 // HTTPRouteBuilder builds Gateway API HTTPRoute resources
 type HTTPRouteBuilder interface {
-	ResourceBuilder
+	// BuildHTTPRoute returns the route for componentType, or a
+	// *ComponentNotReadyError when its Component cannot back a route yet.
 	BuildHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService, componentType string) (client.Object, error)
 	// Endpoints returns every reachable endpoint for the route named by
 	// serviceName ("<isvc>" for the top-level route, "<isvc>-engine" etc. for a
@@ -57,6 +63,7 @@ type HTTPRouteBuilder interface {
 
 // IngressBuilder builds Kubernetes Ingress resources
 type IngressBuilder interface {
-	ResourceBuilder
+	// BuildIngress returns the Ingress, or a *ComponentNotReadyError when the
+	// Component its rules send traffic to cannot back them yet.
 	BuildIngress(ctx context.Context, isvc *v1beta1.InferenceService) (client.Object, error)
 }

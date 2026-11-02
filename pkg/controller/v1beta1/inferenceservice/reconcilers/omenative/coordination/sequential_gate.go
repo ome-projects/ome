@@ -112,31 +112,40 @@ func (ctx GateContext) CheckSequential() (allowed bool, reason string) {
 	// mirrors that on the dispatcher side so the per-Instance Update
 	// doesn't fire while the operator's soak is still elapsing.
 	//
-	// Timestamp source: read the previous Component's IR Ready
-	// condition's LastTransitionTime. Ready sits at Unknown
-	// (RolloutInProgress) while the previous Component rolls and turns
-	// True when its roll is done: every Instance on the target, or, under
-	// a partition, every movable Instance on the target with the held
-	// ones Ready on their own revision (reason Staged). That transition
-	// is the moment the wait is measured from. The group's
-	// LastTransitionTime is the wrong source: it only updates when the
-	// base Phase changes, and Sequential's soak window holds the group at
-	// Phase=Idle (CompositePhase=Sequential.AwaitingNextComponent), so
-	// LastTransitionTime points back at the pre-rollout Idle and
-	// time.Since(entered) is always past soakDuration.
+	// Clock: the finish the group's status records for the previous
+	// Component, the instant the group first read its roll done and the
+	// clock the group's own phase reads, so both sides measure one window
+	// that the previous Component losing readiness afterwards, or its
+	// replica being recreated, neither cuts short nor starts over. While
+	// the group has not recorded the finish yet, the previous Component's
+	// IR Ready condition transition stands in: Ready sits at Unknown
+	// (RolloutInProgress) while it rolls and turns True when its roll is
+	// done, every Instance on the target or, under a partition, at the
+	// staged shape. The group's LastTransitionTime is the wrong source: it
+	// only updates when the base Phase changes, and Sequential's soak
+	// window holds the group at Phase=Idle
+	// (CompositePhase=Sequential.AwaitingNextComponent), so it points back
+	// at the pre-rollout Idle and time.Since(entered) is always past
+	// soakDuration.
+	//
+	// The previous Component must also stand Ready: while its Ready
+	// condition is False or absent, this Component is held whatever the
+	// window says, and the window keeps running, so the recovery releases
+	// this Component at once when the window has elapsed by then. Both
+	// reasons carry stable facts only (components, the configured
+	// duration): a live countdown would change every reconcile and defeat
+	// the Since preservation on status.rolloutHold (storms the apiserver).
 	if group.Soak > 0 {
 		if prev := previousCompletedComponentForGate(group.Order, observations, component); prev != "" {
-			completed, err := previousComponentReadyAt(ctx.Ctx, ctx.Reads, isvc, prev)
-			if err != nil {
-				return false, fmt.Sprintf("cannot read %s IR status for soak, failing closed: %v", prev, err)
+			completed := recordedMemberFinishAt(isvc, group.Name, prev)
+			if completed.IsZero() {
+				completed = observations[prev].ReadyAt
 			}
 			if !completed.IsZero() {
-				elapsed := time.Since(completed)
-				if elapsed < group.Soak {
-					// Stable facts only (component + configured duration):
-					// a live countdown here would change every reconcile
-					// and defeat the Since preservation on
-					// status.rolloutHold (storms the apiserver).
+				if observations[prev].NotReady {
+					return false, fmt.Sprintf("Sequential.Soak: %s held while %s is not Ready; it starts once %s is Ready and the %s soak after %s has elapsed", component, prev, prev, group.Soak, prev)
+				}
+				if time.Since(completed) < group.Soak {
 					return false, fmt.Sprintf("Sequential.Soak: %s waiting out the %s soak after %s", component, group.Soak, prev)
 				}
 			}
@@ -169,10 +178,10 @@ func (ctx GateContext) CheckSequential() (allowed bool, reason string) {
 //     IR's status has recorded the new target. In that window
 //     UpdateRevision still names the OLD CR (so signal #1 is silent)
 //     even though the Component is about to roll. The compare is
-//     against the template hash the projector stamped beside the spec,
+//     against the template hash the projector wrote beside the spec,
 //     not the generation: a spec write that changes no template (an
 //     annotation value the revision leaves out, a count, a pause, a
-//     partition) leaves the status current. The stamp says nothing
+//     partition) leaves the status current. The template hash says nothing
 //     about the parent ISVC — that is signal #3's job.
 //
 //  3. Projection lag: the parent-generation annotation the projector
@@ -212,13 +221,17 @@ func observeSequentialComponentsForGate(ctx context.Context, reads client.Reader
 			return nil, err
 		}
 		partition := irprojector.IRPartition(ir)
-		obs := ComponentObservation{Component: c, Partition: partition}
+		// A replica that is gone publishes no Ready condition: NotReady, as
+		// the group's own observation reads it.
+		obs := ComponentObservation{Component: c, Partition: partition, NotReady: true}
 		if ir != nil {
 			summary := &ir.Status
 			cur := query.RevisionFromName(summary.CurrentRevision)
 			tgt := query.RevisionFromName(summary.UpdateRevision)
 			obs.CurrentRevisionHash = cur.Hash()
 			obs.TargetRevisionHash = tgt.Hash()
+			obs.ReadyAt = readyTransitionAt(summary.Conditions)
+			obs.NotReady = readyConditionFalseOrAbsent(summary.Conditions)
 			revisionSkew := !tgt.IsZero() && !tgt.Same(cur)
 			statusLag := !StatusObservedTemplates(ir)
 			projectionLag := irParentGenerationMismatch(ir, isvc.Generation)
@@ -301,40 +314,18 @@ func previousCompletedComponentForGate(order []v1beta1.ComponentType, observatio
 	return ""
 }
 
-// previousComponentReadyAt returns the moment the named Component's
-// rollout completed — read from its IR `Ready` condition's
-// LastTransitionTime. Ready sits at Unknown (RolloutInProgress) while
-// the Component rolls and transitions to True when every Instance is on
-// the target, or when the Component reached its staged shape under a
-// partition (reason Staged), so the timestamp anchors the wall-clock the
-// Sequential soak gate compares `time.Since(...)` against.
-//
-// Returns the zero time when:
-//   - The Component has no IR / no Ready condition yet (first reconcile
-//     before the status writer has run).
-//   - The Ready condition is not currently True (the previous Component
-//     never finished a rollout, so there is no completion timestamp to
-//     honor — the gate's caller treats this as "no soak clock, allow").
-//
-// Returns a non-nil error when the IR read fails — callers fail closed.
-//
-// Why not `RolloutCoordinationGroupStatus.LastTransitionTime`?
-// `LastTransitionTime` is updated only when the group's base Phase
-// changes. Sequential's soak window holds the group at Phase=Idle while
-// only CompositePhase advances to Sequential.AwaitingNextComponent —
-// Phase stays constant, so LastTransitionTime keeps pointing at the
-// initial pre-rollout Idle. `time.Since(LastTransitionTime)` is always
-// well past `soak`, the gate never fires, and the soak window is a
-// no-op. The Ready condition tracks the actual rollout-completion
-// moment because `apimeta.SetStatusCondition` only updates
-// LastTransitionTime on real status transitions (Unknown→True).
-func previousComponentReadyAt(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, prev v1beta1.ComponentType) (time.Time, error) {
-	summary, err := irprojector.ComponentIRStatusFor(ctx, reads, isvc, prev)
-	if err != nil {
-		return time.Time{}, err
+// recordedMemberFinishAt returns the instant the service's status records
+// the named group's member prev done, zero when the group's entry carries
+// no record or records another member.
+func recordedMemberFinishAt(isvc *v1beta1.InferenceService, groupName string, prev v1beta1.ComponentType) time.Time {
+	if isvc == nil || isvc.Status.RolloutCoordination == nil {
+		return time.Time{}
 	}
-	if summary == nil {
-		return time.Time{}, nil
+	for _, gs := range isvc.Status.RolloutCoordination.Groups {
+		if gs.Name != groupName || gs.MemberFinished == nil || gs.MemberFinished.Component != prev {
+			continue
+		}
+		return gs.MemberFinished.At.Time
 	}
-	return readyTransitionAt(summary.Conditions), nil
+	return time.Time{}
 }

@@ -210,6 +210,24 @@ func TestPodReading_OutOfService(t *testing.T) {
 	}
 }
 
+// TestPodReading_CreateStillInFlight_NotOutOfService checks the reading
+// against the engine's terminal waiting set: a CreateContainerError for a
+// create the runtime has not finished leaves a pod that never served in
+// service, a refused create takes it out.
+func TestPodReading_CreateStillInFlight_NotOutOfService(t *testing.T) {
+	waiting := func(message string) *corev1.Pod {
+		pod := fixture.Pod(podName, fixture.NeverReady, fixture.ContainerWaiting("CreateContainerError"))
+		pod.Status.ContainerStatuses[0].State.Waiting.Message = message
+		return pod
+	}
+	if reading.ReadPod(waiting("context deadline exceeded"), base()).OutOfService() {
+		t.Errorf("a create still in flight reads out of service, want in service")
+	}
+	if !reading.ReadPod(waiting("failed to create containerd container: error unpacking image: no space left on device"), base()).OutOfService() {
+		t.Errorf("a refused create reads in service, want out of service")
+	}
+}
+
 func TestRead_Counts(t *testing.T) {
 	ctx := base()
 	ctx.AvailabilityWindow = 10 * time.Minute

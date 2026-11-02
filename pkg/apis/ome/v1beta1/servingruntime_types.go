@@ -225,6 +225,11 @@ type ServingRuntimeSpec struct {
 	// Decoder configuration for this runtime
 	// +optional
 	DecoderConfig *DecoderSpec `json:"decoderConfig,omitempty"`
+	// Encoder configuration for this runtime. A service that declares
+	// spec.encoder merges it; the piece alone deploys no encoder.
+	// +optional
+	// +ome:since=v1.3
+	EncoderConfig *EncoderSpec `json:"encoderConfig,omitempty"`
 
 	// ProtocolVersions lists the inference protocols the runtime serves:
 	// openAI, openInference-v1 or openInference-v2. Runtime selection
@@ -405,42 +410,8 @@ func (srSpec *ServingRuntimeSpec) IsDisabled() bool {
 	return srSpec.Disabled != nil && *srSpec.Disabled
 }
 
-func (srSpec *ServingRuntimeSpec) IsProtocolVersionSupported(modelProtocolVersion constants.InferenceServiceProtocol) bool {
-	if len(modelProtocolVersion) == 0 || srSpec.ProtocolVersions == nil || len(srSpec.ProtocolVersions) == 0 {
-		return true
-	}
-	for _, srProtocolVersion := range srSpec.ProtocolVersions {
-		if srProtocolVersion == modelProtocolVersion {
-			return true
-		}
-	}
-	return false
-}
-
-// GetPriority returns the priority of the specified model. It returns nil if priority is not set or the model is not found.
-func (srSpec *ServingRuntimeSpec) GetPriority(modelName string) *int32 {
-	for _, model := range srSpec.SupportedModelFormats {
-		if model.Name == modelName {
-			return model.Priority
-		}
-	}
-	return nil
-}
-
 func (f *SupportedModelFormat) IsAutoSelectEnabled() bool {
 	return f.AutoSelect != nil && *f.AutoSelect
-}
-
-func (srSpec *ServingRuntimeSpec) SupportsAcceleratorClass(acceleratorClass string) bool {
-	if srSpec.AcceleratorRequirements == nil {
-		return false
-	}
-	for _, supported := range srSpec.AcceleratorRequirements.AcceleratorClasses {
-		if supported == acceleratorClass {
-			return true
-		}
-	}
-	return false
 }
 
 // GetAcceleratorConfig returns the accelerator-specific config for a model format

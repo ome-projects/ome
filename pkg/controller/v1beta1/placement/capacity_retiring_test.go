@@ -1,7 +1,6 @@
 package placement
 
 import (
-	"context"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -9,11 +8,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
@@ -61,7 +60,7 @@ func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 				}
 			}
 			source := f.source.DeepCopy()
-			source.Spec.Placement.Split.MaxReplicasPerCluster = tt.ceiling
+			source.Spec.Placement.Split.MaxPerCluster = engineCap(tt.ceiling)
 			if tt.template {
 				source.Spec.Engine.Runner = &v1beta1.RunnerSpec{Container: corev1.Container{Image: "example.com/serving:v2"}}
 			}
@@ -107,18 +106,12 @@ func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 			r.Capacity, r.CapacityClock = f.r.Capacity, f.clock
 			if tt.staleSource {
 				reads := 0
-				r.APIReader = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if err := cl.Get(ctx, key, obj, opts...); err != nil {
-						return err
+				r.APIReader = fakeclient.Wrap(t, r.Client.(client.WithWatch), fakeclient.EditedRead(func(live *v1beta1.InferenceService) {
+					reads++
+					if reads == 2 {
+						live.Generation++
 					}
-					if live, ok := obj.(*v1beta1.InferenceService); ok {
-						reads++
-						if reads == 2 {
-							live.Generation++
-						}
-					}
-					return nil
-				}})
+				}))
 			}
 			err = r.placePlannedOn(t.Context(), source, source.Status.Placement.Candidates[0])
 			if diff := cmp.Diff(tt.wantErr, err != nil); diff != "" {

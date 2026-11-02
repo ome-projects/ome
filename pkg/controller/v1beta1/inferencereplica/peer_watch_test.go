@@ -257,6 +257,9 @@ func TestPeerCounterPredicate_AdmitsOnlyCounterTransitions(t *testing.T) {
 		{"columnar rows move", func(ir *v1beta1.InferenceReplica) {
 			ir.Status.InstanceStatusColumns = &v1beta1.InstanceStatusColumns{Members: "1"}
 		}, true},
+		{"a retry record turns Held", func(ir *v1beta1.InferenceReplica) {
+			ir.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: "llama-decoder-d2", State: v1beta1.RetryBlockHeld, AttemptsStarted: 3}}
+		}, true},
 		{"status observes the generation", func(ir *v1beta1.InferenceReplica) { ir.Status.ObservedGeneration++ }, false},
 		{"revisions move", func(ir *v1beta1.InferenceReplica) { ir.Status.CurrentRevision = ir.Status.UpdateRevision }, false},
 		{"generation bumps", func(ir *v1beta1.InferenceReplica) { ir.Generation++ }, false},
@@ -280,10 +283,12 @@ func TestPeerCounterPredicate_AdmitsOnlyCounterTransitions(t *testing.T) {
 
 // TestHeldPeerReplicasOf_WakesOnlySiblingsHeldOnPeerCounters pins the bound
 // on the held-peer watch: a peer's counter transition reaches a sibling
-// only while that sibling's recorded hold waits on peer serving counters.
-// A sibling with no hold, or one held on its own budget, its retry state, a
-// revision or the plan pin, is not enqueued, so a busy peer's churn wakes
-// no one unless someone is waiting on it.
+// only while that sibling's recorded hold waits on the peer: the pairing
+// and ratio gates on its serving counters, and the Held gate, under which
+// the batch step may name the peer's own Held retry record. A sibling with
+// no hold, or one held on its own budget, its retry schedule, a revision
+// or the plan pin, is not enqueued, so a busy peer's churn wakes no one
+// unless someone is waiting on it.
 func TestHeldPeerReplicasOf_WakesOnlySiblingsHeldOnPeerCounters(t *testing.T) {
 	ctx := context.Background()
 	holdOn := func(gate v1beta1.RolloutHoldGate) *v1beta1.RolloutHold {
@@ -292,11 +297,11 @@ func TestHeldPeerReplicasOf_WakesOnlySiblingsHeldOnPeerCounters(t *testing.T) {
 	wakes := map[v1beta1.RolloutHoldGate]bool{
 		v1beta1.RolloutHoldGateRatio:      true,
 		v1beta1.RolloutHoldGatePairing:    true,
+		v1beta1.RolloutHoldGateHeld:       true,
 		v1beta1.RolloutHoldGateSequential: false,
 		v1beta1.RolloutHoldGatePlan:       false,
 		v1beta1.RolloutHoldGateBudget:     false,
 		v1beta1.RolloutHoldGateRetryBlock: false,
-		v1beta1.RolloutHoldGateHeld:       false,
 	}
 	for gate, want := range wakes {
 		t.Run("engine held on "+string(gate), func(t *testing.T) {

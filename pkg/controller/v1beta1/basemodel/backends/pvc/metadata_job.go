@@ -117,6 +117,20 @@ func metadataJobName(modelName, storageURI string) string {
 	return name
 }
 
+// metadataJobLabels are the labels a model's metadata-extraction Job and its
+// pod carry: the model name and its scope. The cleanup paths find the Jobs by
+// them, because the Jobs live in the PVC's namespace, which only the URI names.
+func metadataJobLabels(obj client.Object, isClusterScoped bool) map[string]string {
+	scope := metadataJobScopeNamespaced
+	if isClusterScoped {
+		scope = metadataJobScopeCluster
+	}
+	return map[string]string{
+		constants.PVCMetadataModelNameLabel: obj.GetName(),
+		constants.PVCMetadataScopeLabel:     scope,
+	}
+}
+
 // buildMetadataJob constructs (without creating) the Job that runs
 // `ome-agent model-metadata` against a PVC-mounted model directory.
 //
@@ -140,14 +154,7 @@ func buildMetadataJob(obj client.Object, isClusterScoped bool, components *stora
 	}
 
 	jobName := metadataJobName(obj.GetName(), storageURI)
-	scope := metadataJobScopeNamespaced
-	if isClusterScoped {
-		scope = metadataJobScopeCluster
-	}
-	jobLabels := map[string]string{
-		constants.PVCMetadataModelNameLabel: obj.GetName(),
-		constants.PVCMetadataScopeLabel:     scope,
-	}
+	jobLabels := metadataJobLabels(obj, isClusterScoped)
 
 	args := []string{
 		"model-metadata",

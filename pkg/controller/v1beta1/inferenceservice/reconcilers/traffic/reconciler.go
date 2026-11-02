@@ -132,7 +132,7 @@ func (r *Reconciler) Reconcile(
 		ConflictMessage:          conflictMessage,
 		ObservedGeneration:       isvc.Generation,
 		Now:                      r.now(),
-		GatewayAcceptance:        toStatusAcceptance(acceptance.State),
+		GatewayAcceptance:        acceptance.State,
 		GatewayAcceptanceReason:  acceptance.Reason,
 		GatewayAcceptanceMessage: acceptance.Message,
 		UnsupportedAnnotations:   ComputeUnsupportedAnnotations(isvc.Annotations, r.translator),
@@ -196,21 +196,6 @@ func (r *Reconciler) observeAcceptance(ctx context.Context, desired client.Objec
 		return AcceptanceObservation{State: AcceptancePending}
 	}
 	return r.translator.ObserveAcceptance(fetched)
-}
-
-// toStatusAcceptance bridges the translator-side AcceptanceState to
-// the status-package primitive type. Keeping the two enums separate
-// is what lets the status package avoid importing the parent traffic
-// package (and the import cycle that would create).
-func toStatusAcceptance(s AcceptanceState) status.GatewayAcceptance {
-	switch s {
-	case AcceptanceAccepted:
-		return status.GatewayAcceptanceAccepted
-	case AcceptanceRejected:
-		return status.GatewayAcceptanceRejected
-	default:
-		return status.GatewayAcceptancePending
-	}
 }
 
 func algorithmOf(intent *ResolvedIntent) string {

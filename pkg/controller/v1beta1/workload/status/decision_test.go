@@ -554,18 +554,18 @@ func TestParkedAttemptStamps_KeepTheAttemptAndFollowTheSet(t *testing.T) {
 		}
 	}
 
-	follow := FollowParkedAttempt(true, string(types.RolloutHoldGateHeld))
+	follow := FollowStoppedAttempt(true, string(types.RolloutHoldGateHeld))
 	if !follow(&row) || row.Phase != types.InstancePhaseUpdating || row.Operation.Waiting != string(types.RolloutHoldGateHeld) {
 		t.Fatalf("follow while serving = %+v, want Updating naming the hold", row)
 	}
 	if follow(&row) {
 		t.Fatal("a row already where the set puts it is a no-op")
 	}
-	if !FollowParkedAttempt(false, "")(&row) || row.Phase != types.InstancePhaseFailed || row.Operation.Waiting != string(types.RolloutHoldGateHeld) {
+	if !FollowStoppedAttempt(false, "")(&row) || row.Phase != types.InstancePhaseFailed || row.Operation.Waiting != string(types.RolloutHoldGateHeld) {
 		t.Fatalf("follow while down = %+v, want Failed with the wait kept", row)
 	}
 	inFlight := fixture.RowWithOperation(0, types.InstancePhaseUpdating)
-	if FollowParkedAttempt(false, "")(&inFlight) || inFlight.Phase != types.InstancePhaseUpdating {
+	if FollowStoppedAttempt(false, "")(&inFlight) || inFlight.Phase != types.InstancePhaseUpdating {
 		t.Fatal("an attempt in flight is not followed")
 	}
 
@@ -716,5 +716,34 @@ func TestEnterReady_UnknownRevisionLeavesLegacyReadyAndNewRowsUntouched(t *testi
 				t.Fatalf("unknown revision changed the row: %+v", row)
 			}
 		})
+	}
+}
+
+// TestFailedWriteHelpers_RetireThePlacementWait: the helpers every Failed
+// write that keeps the operation goes through retire the attempt's
+// placement wait in that same write, so the attempt after it waits on its
+// own clock; a row with nothing recorded is left alone.
+func TestFailedWriteHelpers_RetireThePlacementWait(t *testing.T) {
+	waiting := func() types.InstanceStatus {
+		row := fixture.RowWithOperation(0, types.InstancePhaseUpdating)
+		since := metav1.NewTime(time.Date(2026, time.January, 2, 12, 0, 0, 0, time.UTC))
+		row.Operation.PlacementWaitSince = &since
+		return row
+	}
+
+	kept := waiting()
+	if op := keepOperationWithoutDeadline(&kept); op.PlacementWaitSince != nil || !op.Deadline.IsZero() {
+		t.Errorf("keepOperationWithoutDeadline: operation = %+v, want the deadline and the placement wait cleared", op)
+	}
+
+	cleared := waiting()
+	if !clearPlacementWait(&cleared) || cleared.Operation.PlacementWaitSince != nil {
+		t.Errorf("clearPlacementWait: operation = %+v, want the placement wait retired", cleared.Operation)
+	}
+	if clearPlacementWait(&cleared) {
+		t.Error("clearPlacementWait reported a change on a row with nothing recorded")
+	}
+	if ClearPlacementWaitMutation()(&cleared) {
+		t.Error("ClearPlacementWaitMutation reported a change on a row with nothing recorded")
 	}
 }

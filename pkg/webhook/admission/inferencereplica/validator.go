@@ -48,11 +48,11 @@
 // the identity, so an unreadable config never refuses one.
 //
 // A standalone replica renders from exactly one template source:
-// spec.runners, or spec.modelRef and/or spec.runtimeRef; a runtime pin is
-// rejected. A named runtime that resolves without the piece for the
-// replica's component, or whose inherit-from chain names a runtime that does
-// not exist, is rejected when the reference is set or changed; one that is
-// not found is admitted, and the controller reports it on the replica.
+// spec.runners, or spec.modelRef and/or spec.runtimeRef; a fixed runtime
+// revision is rejected. A named runtime that resolves without the piece for
+// the replica's component, or whose inherit-from chain names a runtime that
+// does not exist, is rejected when the reference is set or changed; one that
+// is not found is admitted, and the controller reports it on the replica.
 //
 // spec.parentRef and spec.component are immutable for every writer, and
 // deletion is never gated.
@@ -64,6 +64,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
@@ -145,166 +146,256 @@ func hasControllerWriteAnnotation(annotations map[string]string) bool {
 		constants.InferenceReplicaControllerWriteAnnotationVal
 }
 
+// write is one create or update as the ownership table reads it: the
+// request, the requester, the object before the write (nil on create), the
+// object written, and the replica's form. The form is read from the old
+// object on update, so a write is decided by the form the replica had.
+type write struct {
+	req       admission.Request
+	who       actor
+	old, obj  *v1beta1.InferenceReplica
+	parent    string
+	projected bool
+}
+
+func newWrite(req admission.Request, old, obj *v1beta1.InferenceReplica) write {
+	w := write{req: req, old: old, obj: obj}
+	before := obj
+	if old != nil {
+		before = old
+	}
+	w.parent, w.projected = projectedForm(before)
+	return w
+}
+
+func (w write) create() bool { return w.old == nil }
+
+// specWritten reports whether the write sets the spec: every create does,
+// and an update that changes it.
+func (w write) specWritten() bool {
+	return w.old == nil || specChanged(w.old.Spec, w.obj.Spec)
+}
+
+// oldSpec is the spec before the write, empty on create.
+func (w write) oldSpec() v1beta1.InferenceReplicaSpec {
+	if w.old == nil {
+		return v1beta1.InferenceReplicaSpec{}
+	}
+	return w.old.Spec
+}
+
+// deny refuses the write, naming the replica before the reason.
+func deny(w write, reason string) admission.Response {
+	return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", w.req.Namespace, w.req.Name, reason))
+}
+
 const projectedWriteHint = "edit the InferenceService instead"
 
-func denyProjectedWrite(req admission.Request, parent string, who actor) admission.Response {
-	if who.identityConfigured {
+func denyProjectedWrite(w write) admission.Response {
+	req := w.req
+	if w.who.identityConfigured {
 		return admission.Denied(fmt.Sprintf(
 			"InferenceReplica %s/%s is projected by InferenceService %s/%s, whose controller alone writes its spec; %s (request from %q)",
-			req.Namespace, req.Name, req.Namespace, parent, projectedWriteHint, req.UserInfo.Username))
+			req.Namespace, req.Name, req.Namespace, w.parent, projectedWriteHint, req.UserInfo.Username))
 	}
 	return admission.Denied(fmt.Sprintf(
 		"InferenceReplica %s/%s is projected by InferenceService %s/%s and rejects a direct %s without the %s=%s annotation; %s",
-		req.Namespace, req.Name, req.Namespace, parent, req.Operation,
+		req.Namespace, req.Name, req.Namespace, w.parent, req.Operation,
 		constants.InferenceReplicaControllerWriteAnnotationKey, constants.InferenceReplicaControllerWriteAnnotationVal,
 		projectedWriteHint))
 }
 
-func denyControllerOnlyFields(req admission.Request) admission.Response {
-	return admission.Denied(fmt.Sprintf(
-		"InferenceReplica %s/%s: spec.placementExecution and spec.placementReplicaLimit are written only by the InferenceService controller",
-		req.Namespace, req.Name))
+func denyParentRefWithoutOwner(w write) admission.Response {
+	return deny(w, "spec.parentRef is set by the InferenceService controller on the replicas it projects; omit it on a standalone InferenceReplica")
 }
 
-func denyStandaloneMigration(req admission.Request) admission.Response {
-	return admission.Denied(fmt.Sprintf(
-		"InferenceReplica %s/%s: manual migration is not available on a standalone replica; it surges through the per-revision Service only an InferenceService creates",
-		req.Namespace, req.Name))
+func denyOwnerReferenceInstall(w write) admission.Response {
+	return deny(w, "only the InferenceService controller may set an InferenceService controller owner reference or change a projected replica's")
 }
 
-func denyControllerUserFieldWrite(req admission.Request) admission.Response {
-	return admission.Denied(fmt.Sprintf(
-		"InferenceReplica %s/%s: the InferenceService controller writes only rollout-control fields (%s) on a replica it does not project; the replica's owner writes its other fields",
-		req.Namespace, req.Name, rolloutControlFieldList))
+func denyComposedFieldsWrite(w write) admission.Response {
+	return deny(w, fmt.Sprintf(
+		"the %s annotation is written by the InferenceService controller; to release the fields it names, remove the reference on the InferenceService instead",
+		constants.InferenceReplicaComposedFieldsAnnotationKey))
 }
 
 // denyControllerStandaloneCreate refuses a standalone create by the
 // controller. With no identity configured the controller is recognized by
 // the controller-write annotation, which a manifest copied from a projected
 // replica carries, so the denial names it as the thing to drop.
-func denyControllerStandaloneCreate(req admission.Request, who actor) admission.Response {
-	if who.identityConfigured {
-		return admission.Denied(fmt.Sprintf(
-			"InferenceReplica %s/%s: the InferenceService controller creates only the replicas it projects; create a standalone replica as a user",
-			req.Namespace, req.Name))
+func denyControllerStandaloneCreate(w write) admission.Response {
+	if w.who.identityConfigured {
+		return deny(w, "the InferenceService controller creates only the replicas it projects; create a standalone replica as a user")
 	}
 	return admission.Denied(fmt.Sprintf(
 		"InferenceReplica %s/%s carries the %s=%s annotation, which marks a write by the InferenceService controller, and the controller creates only the replicas it projects; create a standalone replica without it",
-		req.Namespace, req.Name,
+		w.req.Namespace, w.req.Name,
 		constants.InferenceReplicaControllerWriteAnnotationKey, constants.InferenceReplicaControllerWriteAnnotationVal))
 }
 
-func denyComposedFieldsWrite(req admission.Request) admission.Response {
-	return admission.Denied(fmt.Sprintf(
-		"InferenceReplica %s/%s: the %s annotation is written by the InferenceService controller; to release the fields it names, remove the reference on the InferenceService instead",
-		req.Namespace, req.Name, constants.InferenceReplicaComposedFieldsAnnotationKey))
+func denyControllerOnlyFields(w write) admission.Response {
+	return deny(w, "spec.placementExecution and spec.placementReplicaLimit are written only by the InferenceService controller")
 }
 
-// admitCreate applies the create rows of the ownership table; shape checks
-// run afterwards in Handle.
-func (v *Validator) admitCreate(ctx context.Context, obj *v1beta1.InferenceReplica, who actor, req admission.Request) admission.Response {
-	// The projector creates parentRef together with the controller owner
-	// reference, so parentRef alone is refused for every writer.
-	if obj.Spec.ParentRef != nil && projectingParent(obj) == nil {
-		return admission.Denied(fmt.Sprintf(
-			"InferenceReplica %s/%s: spec.parentRef is set by the InferenceService controller on the replicas it projects; omit it on a standalone InferenceReplica",
-			req.Namespace, req.Name))
-	}
-	if !who.controller && composedFieldsChanged(nil, obj) {
-		return denyComposedFieldsWrite(req)
-	}
-	if parent, projected := projectedForm(obj); projected {
-		if !who.controller {
-			return denyProjectedWrite(req, parent, who)
-		}
-		return admission.Allowed("")
-	}
-	// The controller creates only the replicas it projects, so a standalone
-	// create comes from a user, who may not set the placement fields.
-	if who.controller {
-		return denyControllerStandaloneCreate(req, who)
-	}
-	if placementFieldsSet(obj.Spec) {
-		return denyControllerOnlyFields(req)
-	}
-	if err := standaloneSpecError(obj.Spec); err != nil {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", req.Namespace, req.Name, err))
-	}
-	if err := validation.ValidateInferenceServiceName(req.Name); err != nil {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: a standalone replica's name is the prefix of its pod and Service names and must match %q", req.Namespace, req.Name, validation.IsvcNameFmt))
-	}
-	if migrationRequested(nil, obj) {
-		return denyStandaloneMigration(req)
-	}
-	if v.Reader != nil {
-		if resp := v.admitRuntimePiece(ctx, obj, req); !resp.Allowed {
-			return resp
-		}
-		for _, candidate := range collidingInferenceServiceNames(req.Name) {
-			isvc := &v1beta1.InferenceService{}
-			err := v.Reader.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: candidate}, isvc)
-			switch {
-			case err == nil:
-				return admission.Denied(fmt.Sprintf(
-					"InferenceReplica %s/%s: InferenceService %s/%s exists and the replicas it projects would share pod and Service names with this one; choose another name",
-					req.Namespace, req.Name, req.Namespace, candidate))
-			case !apierrors.IsNotFound(err):
-				return admission.Errored(http.StatusInternalServerError, fmt.Errorf("check InferenceService %s/%s: %w", req.Namespace, candidate, err))
-			}
-		}
-	}
-	return admission.Allowed("")
+func denyControllerUserFieldWrite(w write) admission.Response {
+	return deny(w, fmt.Sprintf(
+		"the InferenceService controller writes only rollout-control fields (%s) on a replica it does not project; the replica's owner writes its other fields",
+		rolloutControlFieldList))
 }
 
-// admitUpdate applies the update rows of the ownership table. The form is
-// read from the old object; immutability and metadata-only updates are
-// decided by Handle before this runs.
-func (v *Validator) admitUpdate(ctx context.Context, oldObj, newObj *v1beta1.InferenceReplica, who actor, req admission.Request) admission.Response {
+func denySpecError(w write) admission.Response {
+	return deny(w, standaloneSpecError(w.obj.Spec).Error())
+}
+
+func denyStandaloneName(w write) admission.Response {
+	return deny(w, fmt.Sprintf("a standalone replica's name is the prefix of its pod and Service names and must match %q", validation.IsvcNameFmt))
+}
+
+func denyStandaloneMigration(w write) admission.Response {
+	return deny(w, "manual migration is not available on a standalone replica; it surges through the per-revision Service only an InferenceService creates")
+}
+
+// replicaForm selects the rows read for a write: those of its form and
+// those of either form.
+type replicaForm uint8
+
+const (
+	eitherForm replicaForm = iota
+	projectedReplica
+	standaloneReplica
+)
+
+// operation selects the rows read on create, on update, or on both.
+type operation uint8
+
+const (
+	createOrUpdate operation = iota
+	onCreate
+	onUpdate
+)
+
+// ownershipRow is one row of the ownership table: the form and operation
+// it is read on, the condition under which the write breaks it, and the
+// refusal.
+type ownershipRow struct {
+	form    replicaForm
+	on      operation
+	applies func(w write) bool
+	deny    func(w write) admission.Response
+}
+
+// refuses reports whether the row is read on this write, by form and
+// operation, and its condition holds.
+func (r ownershipRow) refuses(w write) bool {
+	if r.form != eitherForm && (r.form == projectedReplica) != w.projected {
+		return false
+	}
+	if r.on != createOrUpdate && (r.on == onCreate) != w.create() {
+		return false
+	}
+	return r.applies(w)
+}
+
+// ownershipTable is the ownership rule the package comment states, as the
+// rows Handle applies in order once a write has passed the immutability
+// and metadata-only checks. The first row that refuses answers the write;
+// a write no row refuses goes on to the cluster reads and the shape checks.
+var ownershipTable = []ownershipRow{
+	// The projector creates spec.parentRef together with the controller
+	// owner reference, so parentRef alone is refused for every writer.
+	{on: onCreate,
+		applies: func(w write) bool { return w.obj.Spec.ParentRef != nil && projectingParent(w.obj) == nil },
+		deny:    denyParentRefWithoutOwner},
 	// A non-controller may keep or remove a controller owner reference but
 	// not install one on a projected replica, whose projector would refuse
-	// it and wedge the InferenceService, nor attach a standalone replica to
+	// it and stop the InferenceService, nor attach a standalone replica to
 	// an InferenceService. Removal is how the garbage collector orphans a
-	// replica; the projector re-stamps the reference while the
+	// replica; the projector restores the reference while the
 	// InferenceService exists.
-	parent, projected := projectedForm(oldObj)
-	if !who.controller && controllerRefInstalled(oldObj, newObj) && (projected || projectingParent(newObj) != nil) {
-		return admission.Denied(fmt.Sprintf(
-			"InferenceReplica %s/%s: only the InferenceService controller may set an InferenceService controller owner reference or change a projected replica's",
-			req.Namespace, req.Name))
-	}
-	// The composed-fields annotation records the fields the controller holds
-	// on a replica, so on either form only the controller changes it.
-	if !who.controller && composedFieldsChanged(oldObj, newObj) {
-		return denyComposedFieldsWrite(req)
-	}
-	if projected {
-		if !who.controller && specChanged(oldObj.Spec, newObj.Spec) {
-			return denyProjectedWrite(req, parent, who)
+	{on: onUpdate,
+		applies: func(w write) bool {
+			return !w.who.controller && controllerRefInstalled(w.old, w.obj) && (w.projected || projectingParent(w.obj) != nil)
+		},
+		deny: denyOwnerReferenceInstall},
+	// The composed-fields annotation records the fields the controller
+	// holds on a replica, so on either form only the controller changes it.
+	{applies: func(w write) bool { return !w.who.controller && composedFieldsChanged(w.old, w.obj) },
+		deny: denyComposedFieldsWrite},
+	// Only the controller writes a projected replica's spec.
+	{form: projectedReplica,
+		applies: func(w write) bool { return !w.who.controller && w.specWritten() },
+		deny:    denyProjectedWrite},
+	// The controller creates only the replicas it projects, so a
+	// standalone create comes from a user.
+	{form: standaloneReplica, on: onCreate,
+		applies: func(w write) bool { return w.who.controller },
+		deny:    denyControllerStandaloneCreate},
+	// The placement fields are the controller's on every replica.
+	{form: standaloneReplica,
+		applies: func(w write) bool { return !w.who.controller && controllerOnlyChanged(w.oldSpec(), w.obj.Spec) },
+		deny:    denyControllerOnlyFields},
+	// On a replica it does not project the controller is a composer, not
+	// the owner: it steers the rollout through the rollout-control fields
+	// and leaves every user field alone.
+	{form: standaloneReplica, on: onUpdate,
+		applies: func(w write) bool { return w.who.controller && userFieldsChanged(w.old.Spec, w.obj.Spec) },
+		deny:    denyControllerUserFieldWrite},
+	// A standalone spec renders from one template source and carries no
+	// setting nothing acts on.
+	{form: standaloneReplica,
+		applies: func(w write) bool { return standaloneSpecError(w.obj.Spec) != nil },
+		deny:    denySpecError},
+	// A standalone replica's name is the prefix of its pod and Service
+	// names.
+	{form: standaloneReplica, on: onCreate,
+		applies: func(w write) bool { return validation.ValidateInferenceServiceName(w.req.Name) != nil },
+		deny:    denyStandaloneName},
+	// A manual migration surges through the per-revision Service only an
+	// InferenceService creates.
+	{form: standaloneReplica,
+		applies: func(w write) bool { return migrationRequested(w.old, w.obj) },
+		deny:    denyStandaloneMigration},
+}
+
+// admit applies the ownership table to one write and, on a standalone
+// replica, the checks that read the cluster.
+func (v *Validator) admit(ctx context.Context, w write) admission.Response {
+	for _, row := range ownershipTable {
+		if row.refuses(w) {
+			return row.deny(w)
 		}
+	}
+	if w.projected || v.Reader == nil {
 		return admission.Allowed("")
 	}
-	if !who.controller && controllerOnlyChanged(oldObj.Spec, newObj.Spec) {
-		return denyControllerOnlyFields(req)
-	}
-	// On a replica it does not project the controller is a composer, not the
-	// owner: it steers the rollout through the rollout-control fields and
-	// leaves every user field alone.
-	if who.controller && userFieldsChanged(oldObj.Spec, newObj.Spec) {
-		return denyControllerUserFieldWrite(req)
-	}
-	if err := standaloneSpecError(newObj.Spec); err != nil {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", req.Namespace, req.Name, err))
-	}
-	if migrationRequested(oldObj, newObj) {
-		return denyStandaloneMigration(req)
-	}
-	// A runtime is checked when the update names it; an update that keeps
-	// the reference is admitted even if the runtime has since lost the
-	// piece, which the controller reports, so a scale or pause never waits
-	// on the runtime.
-	if v.Reader != nil && runtimeRefChanged(oldObj.Spec, newObj.Spec) {
-		if resp := v.admitRuntimePiece(ctx, newObj, req); !resp.Allowed {
+	return v.admitStandaloneReads(ctx, w)
+}
+
+// admitStandaloneReads checks a standalone replica against the cluster. The
+// runtime it names must declare its piece, read on create and when the
+// reference changes: an update that keeps the reference is admitted even if
+// the runtime has since lost the piece, which the controller reports, so a
+// scale or pause never waits on the runtime. On create no InferenceService
+// may project replicas of the same name.
+func (v *Validator) admitStandaloneReads(ctx context.Context, w write) admission.Response {
+	if w.create() || runtimeRefChanged(w.old.Spec, w.obj.Spec) {
+		if resp := v.admitRuntimePiece(ctx, w); !resp.Allowed {
 			return resp
+		}
+	}
+	if !w.create() {
+		return admission.Allowed("")
+	}
+	for _, candidate := range collidingInferenceServiceNames(w.req.Name) {
+		isvc := &v1beta1.InferenceService{}
+		err := v.Reader.Get(ctx, types.NamespacedName{Namespace: w.req.Namespace, Name: candidate}, isvc)
+		switch {
+		case err == nil:
+			return deny(w, fmt.Sprintf(
+				"InferenceService %s/%s exists and the replicas it projects would share pod and Service names with this one; choose another name",
+				w.req.Namespace, candidate))
+		case !apierrors.IsNotFound(err):
+			return admission.Errored(http.StatusInternalServerError, fmt.Errorf("check InferenceService %s/%s: %w", w.req.Namespace, candidate, err))
 		}
 	}
 	return admission.Allowed("")
@@ -314,21 +405,21 @@ func (v *Validator) admitUpdate(ctx context.Context, oldObj, newObj *v1beta1.Inf
 // without the piece for its component, or whose inherit-from chain names a
 // runtime that does not exist, a configuration no retry resolves; a replica
 // that names no runtime is admitted.
-func (v *Validator) admitRuntimePiece(ctx context.Context, obj *v1beta1.InferenceReplica, req admission.Request) admission.Response {
-	if obj.Spec.RuntimeRef == nil {
+func (v *Validator) admitRuntimePiece(ctx context.Context, w write) admission.Response {
+	ref := w.obj.Spec.RuntimeRef
+	if ref == nil {
 		return admission.Allowed("")
 	}
-	msg, err := v.runtimePieceMissing(ctx, req.Namespace, obj.Spec)
+	msg, err := v.runtimePieceMissing(ctx, w.req.Namespace, w.obj.Spec)
 	var parentMissing *runtimeinheritance.ParentNotFoundError
 	if errors.As(err, &parentMissing) {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: runtime %q inherits from %q, which does not exist, so the runtime cannot be resolved",
-			req.Namespace, req.Name, obj.Spec.RuntimeRef.Name, parentMissing.Parent))
+		return deny(w, fmt.Sprintf("runtime %q inherits from %q, which does not exist, so the runtime cannot be resolved", ref.Name, parentMissing.Parent))
 	}
 	if err != nil {
-		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("check runtime %q: %w", obj.Spec.RuntimeRef.Name, err))
+		return admission.Errored(http.StatusInternalServerError, fmt.Errorf("check runtime %q: %w", ref.Name, err))
 	}
 	if msg != "" {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", req.Namespace, req.Name, msg))
+		return deny(w, msg)
 	}
 	return admission.Allowed("")
 }
@@ -385,15 +476,22 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 				"namespace", req.Namespace, "name", req.Name)
 			return admission.Errored(http.StatusBadRequest, err)
 		}
+	}
+	w := newWrite(req, oldObj, newObj)
+	if oldObj == nil {
+		// The component picks the runtime piece, the pod label and the
+		// workload role; a value that names no role would run with none.
+		// It is immutable, so checking the create covers every update.
+		if _, ok := v1beta1.RoleOf(newObj.Spec.Component); !ok {
+			return deny(w, fmt.Sprintf("spec.component %q is not a role: use one of %s", newObj.Spec.Component, roleNames()))
+		}
+	}
+	if oldObj != nil {
 		if !reflect.DeepEqual(oldObj.Spec.ParentRef, newObj.Spec.ParentRef) {
-			return admission.Denied(fmt.Sprintf(
-				"InferenceReplica %s/%s: spec.parentRef is immutable",
-				req.Namespace, req.Name))
+			return deny(w, "spec.parentRef is immutable")
 		}
 		if oldObj.Spec.Component != newObj.Spec.Component {
-			return admission.Denied(fmt.Sprintf(
-				"InferenceReplica %s/%s: spec.component is immutable",
-				req.Namespace, req.Name))
+			return deny(w, "spec.component is immutable")
 		}
 		// An update that keeps the spec, installs no controller owner
 		// reference and leaves the composed-fields annotation unchanged is
@@ -402,8 +500,8 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 		// must pass this fail-closed webhook even when the config is
 		// unreadable. The unchanged spec is not re-checked.
 		if !specChanged(oldObj.Spec, newObj.Spec) && !controllerRefInstalled(oldObj, newObj) && !composedFieldsChanged(oldObj, newObj) {
-			if _, projected := projectedForm(oldObj); !projected && migrationRequested(oldObj, newObj) {
-				return denyStandaloneMigration(req)
+			if !w.projected && migrationRequested(oldObj, newObj) {
+				return denyStandaloneMigration(w)
 			}
 			return admission.Allowed("metadata-only update")
 		}
@@ -418,37 +516,39 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 			"namespace", req.Namespace, "name", req.Name)
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	who := actorFor(identity, req.UserInfo, newObj)
-
-	if oldObj != nil {
-		if resp := v.admitUpdate(ctx, oldObj, newObj, who, req); !resp.Allowed {
-			return resp
-		}
-	} else if resp := v.admitCreate(ctx, newObj, who, req); !resp.Allowed {
+	w.who = actorFor(identity, req.UserInfo, newObj)
+	if resp := v.admit(ctx, w); !resp.Allowed {
 		return resp
 	}
 
-	// Shape checks hold for every writer.
-	if err := validateIRAutoscaler(newObj); err != nil {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", req.Namespace, req.Name, err.Error()))
+	for _, check := range shapeChecks {
+		if err := check(newObj); err != nil {
+			return deny(w, err.Error())
+		}
 	}
-	if err := validateIRPacing(newObj); err != nil {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", req.Namespace, req.Name, err.Error()))
-	}
-	if err := validateIRRunnerVolumes(newObj); err != nil {
-		return admission.Denied(fmt.Sprintf("InferenceReplica %s/%s: %s", req.Namespace, req.Name, err.Error()))
-	}
-
 	// The controller withholds the pods of an Instance that cannot fill a
 	// provisioned slice, so such runners would leave every Instance they
 	// reach without pods. Rejecting them leaves the IR as it was.
 	if err := v.validateIRTPUSlices(ctx, oldObj, newObj); err != nil {
-		return admission.Denied(fmt.Sprintf(
-			"InferenceReplica %s/%s: %s",
-			req.Namespace, req.Name, err.Error()))
+		return deny(w, err.Error())
 	}
-
 	return admission.Allowed("")
+}
+
+// roleNames lists every role's name in the order of v1beta1.Roles.
+func roleNames() string {
+	names := make([]string, 0, len(v1beta1.Roles))
+	for _, c := range v1beta1.RoleTypes() {
+		names = append(names, string(c))
+	}
+	return strings.Join(names, ", ")
+}
+
+// shapeChecks hold for every writer and run after the ownership table.
+var shapeChecks = []func(*v1beta1.InferenceReplica) error{
+	validateIRAutoscaler,
+	validateIRPacing,
+	validateIRRunnerVolumes,
 }
 
 // validateIRAutoscaler runs the shared Autoscaler shape check against

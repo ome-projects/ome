@@ -27,5 +27,8 @@ var Module = fx.Provide(
 		if err != nil {
 			return nil, fmt.Errorf("error creating serving sidecar config: %+v", err)
 		}
+		if err := config.Validate(); err != nil {
+			return nil, fmt.Errorf("error validating serving sidecar config: %w", err)
+		}
 		return NewServingSidecar(config)
 	})

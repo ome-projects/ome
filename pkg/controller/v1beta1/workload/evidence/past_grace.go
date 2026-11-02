@@ -38,15 +38,15 @@ import (
 // ImagePulling window. A pod with no creation stamp cannot prove any
 // duration and is never stuck.
 func PodStuckInTerminalWaiting(pod *corev1.Pod, now time.Time, grace time.Duration) (string, bool) {
-	return PodStuckInTerminalWaitingSince(pod, now, grace, time.Time{})
+	return podStuckInTerminalWaitingSince(pod, now, grace, time.Time{})
 }
 
-// PodStuckInTerminalWaitingSince is PodStuckInTerminalWaiting with the
+// podStuckInTerminalWaitingSince is PodStuckInTerminalWaiting with the
 // waiting episode's start floored at floor: a reason the pod already held
 // when an attempt began acting on it is that attempt's reason, not yet its
 // failure, so the grace runs from the attempt's own start. A zero floor
 // measures from the episode alone.
-func PodStuckInTerminalWaitingSince(pod *corev1.Pod, now time.Time, grace time.Duration, floor time.Time) (string, bool) {
+func podStuckInTerminalWaitingSince(pod *corev1.Pod, now time.Time, grace time.Duration, floor time.Time) (string, bool) {
 	since := WaitingEpisodeStart(pod)
 	if since.IsZero() {
 		return "", false
@@ -186,44 +186,30 @@ func WaitingEpisodeStart(pod *corev1.Pod) time.Time {
 }
 
 // terminalWaitingReason names the terminal kubelet waiting reason a
-// container of the pod, regular or init, is parked in.
+// container of the pod, regular or init, is parked in
+// (types.IsTerminalWaiting).
 func terminalWaitingReason(pod *corev1.Pod) (string, bool) {
-	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
-		for _, cs := range statuses {
-			if cs.State.Waiting != nil && types.IsTerminalWaitingReason(cs.State.Waiting.Reason) {
-				return cs.State.Waiting.Reason, true
-			}
+	for cs := range containerStatuses(pod) {
+		if types.IsTerminalWaiting(cs.State.Waiting) {
+			return cs.State.Waiting.Reason, true
 		}
 	}
 	return "", false
 }
 
-// FirstStuckPodForInstance returns the first pod in pods that is stuck
-// in a terminal kubelet waiting state past the grace window, plus the
-// kubelet reason string. Returns (nil, "") when no pod is stuck —
-// caller skips escalation.
-//
-// "First" is order-deterministic by the input slice; callers that need
-// a stable index should sort pods before calling. For event emission
-// the order doesn't matter (the message names the specific pod).
-func FirstStuckPodForInstance(pods []*corev1.Pod, now time.Time, grace time.Duration) (*corev1.Pod, string) {
-	return FirstStuckPodForInstanceSince(pods, now, grace, time.Time{})
-}
-
-// FirstStuckPodForInstanceSince is FirstStuckPodForInstance with each
-// pod's waiting episode floored at floor (PodStuckInTerminalWaitingSince).
+// FirstStuckPodForInstanceSince returns the first live pod in pods with a
+// container, regular or init, in a terminal kubelet waiting reason for at
+// least grace since its waiting episode began, floored at floor
+// (podStuckInTerminalWaitingSince), plus the kubelet reason. (nil, "")
+// when there is none. "First" follows the order of pods.
 func FirstStuckPodForInstanceSince(pods []*corev1.Pod, now time.Time, grace time.Duration, floor time.Time) (*corev1.Pod, string) {
 	for _, pod := range pods {
-		if pod == nil {
+		// A pod marked for deletion is on its way out, so a waiting
+		// reason on it counts for nothing.
+		if pod == nil || pod.DeletionTimestamp != nil {
 			continue
 		}
-		// Skip pods marked for deletion — kubelet may be tearing them
-		// down, and "ImagePullBackOff on a deleting pod" is not an
-		// escalation signal (the pod is about to be gone anyway).
-		if pod.DeletionTimestamp != nil {
-			continue
-		}
-		if reason, stuck := PodStuckInTerminalWaitingSince(pod, now, grace, floor); stuck {
+		if reason, stuck := podStuckInTerminalWaitingSince(pod, now, grace, floor); stuck {
 			return pod, reason
 		}
 	}
@@ -323,19 +309,8 @@ func FirstWorkloadCausedPod(pods []*corev1.Pod) (*corev1.Pod, string) {
 		if pod == nil || pod.DeletionTimestamp != nil {
 			continue
 		}
-		for _, cs := range pod.Status.ContainerStatuses {
-			if cs.State.Waiting == nil {
-				continue
-			}
-			if types.IsWorkloadCausedReason(cs.State.Waiting.Reason) {
-				return pod, cs.State.Waiting.Reason
-			}
-		}
-		for _, cs := range pod.Status.InitContainerStatuses {
-			if cs.State.Waiting == nil {
-				continue
-			}
-			if types.IsWorkloadCausedReason(cs.State.Waiting.Reason) {
+		for cs := range containerStatuses(pod) {
+			if cs.State.Waiting != nil && types.IsWorkloadCausedReason(cs.State.Waiting.Reason) {
 				return pod, cs.State.Waiting.Reason
 			}
 		}
@@ -362,11 +337,9 @@ func FirstCrashLoopingPod(pods []*corev1.Pod, attemptRev string) (*corev1.Pod, s
 		if pod == nil || pod.DeletionTimestamp != nil || !podOnAttemptRevision(pod, attemptRev) {
 			continue
 		}
-		for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
-			for _, cs := range statuses {
-				if containerCrashLooping(cs) {
-					return pod, ReasonCrashLoop
-				}
+		for cs := range containerStatuses(pod) {
+			if containerCrashLooping(cs) {
+				return pod, ReasonCrashLoop
 			}
 		}
 	}
@@ -391,17 +364,19 @@ func containerCrashLooping(cs corev1.ContainerStatus) bool {
 // FirstPodWaitingForReason returns the first live pod with a container —
 // regular or init — parked in the named waiting reason. It answers "which
 // pod is the one the caller already classified", so the caller's cleanup
-// removes exactly that object rather than the whole set.
+// removes exactly that object rather than the whole set. For a terminal
+// reason it skips a container the classifier does not count as terminal
+// (types.IsTerminalWaiting), so a gang member whose create is still
+// running is not named in place of the member whose create was refused.
 func FirstPodWaitingForReason(pods []*corev1.Pod, reason string) *corev1.Pod {
 	for _, pod := range pods {
 		if pod == nil || pod.DeletionTimestamp != nil {
 			continue
 		}
-		for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
-			for _, status := range statuses {
-				if status.State.Waiting != nil && status.State.Waiting.Reason == reason {
-					return pod
-				}
+		for cs := range containerStatuses(pod) {
+			if w := cs.State.Waiting; w != nil && w.Reason == reason &&
+				(!types.IsTerminalWaitingReason(reason) || types.IsTerminalWaiting(w)) {
+				return pod
 			}
 		}
 	}

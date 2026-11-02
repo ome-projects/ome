@@ -129,35 +129,37 @@ func ShardedBaseModelReady(status *v1beta1.ModelStatusSpec, generation int64) (b
 	return true, readyCondition.Message
 }
 
-// MergeRuntimeSpecs merges the runtime and isvc specs to get final engine, decoder, and router specs
+// MergeRuntimeSpecs merges the runtime's engine, decoder and router pieces
+// with the service's blocks, for callers that name those three roles.
+// Callers that name the three roles link against this signature. Code that
+// walks every role uses MergeRuntimeRoleSpecs.
 func MergeRuntimeSpecs(isvc *v1beta1.InferenceService, runtime *v1beta1.ServingRuntimeSpec, log logr.Logger) (*v1beta1.EngineSpec, *v1beta1.DecoderSpec, *v1beta1.RouterSpec, error) {
-	var runtimeEngine *v1beta1.EngineSpec
-	var runtimeDecoder *v1beta1.DecoderSpec
-	var runtimeRouter *v1beta1.RouterSpec
-
-	// Extract runtime specs if available
-	if runtime != nil {
-		runtimeEngine = runtime.EngineConfig
-		runtimeDecoder = runtime.DecoderConfig
-		runtimeRouter = runtime.RouterConfig
-	}
-
-	// Merge engine specs
-	mergedEngine, err := MergeEngineSpec(runtimeEngine, isvc.Spec.Engine)
+	merged, err := MergeRuntimeRoleSpecs(isvc, runtime, log)
 	if err != nil {
-		return nil, nil, nil, goerrors.Wrap(err, "failed to merge engine specs")
+		return nil, nil, nil, err
 	}
+	return merged.Engine, merged.Decoder, merged.Router, nil
+}
 
-	// Merge decoder specs
-	mergedDecoder, err := MergeDecoderSpec(runtimeDecoder, isvc.Spec.Decoder)
-	if err != nil {
-		return nil, nil, nil, goerrors.Wrap(err, "failed to merge decoder specs")
+// MergeRuntimeRoleSpecs merges the runtime's pieces with the service's role
+// blocks into the final spec of every role the service declares; a piece
+// alone declares nothing.
+func MergeRuntimeRoleSpecs(isvc *v1beta1.InferenceService, runtime *v1beta1.ServingRuntimeSpec, log logr.Logger) (v1beta1.RoleSpecs, error) {
+	pieces := v1beta1.RuntimeRoles(runtime)
+	var merged v1beta1.RoleSpecs
+	var err error
+
+	if merged.Engine, err = MergeEngineSpec(pieces.Engine, isvc.Spec.Engine); err != nil {
+		return v1beta1.RoleSpecs{}, goerrors.Wrap(err, "failed to merge engine specs")
 	}
-
-	// Merge router specs
-	mergedRouter, err := MergeRouterSpec(isvc.Spec.Router, runtimeRouter)
-	if err != nil {
-		return nil, nil, nil, goerrors.Wrap(err, "failed to merge router specs")
+	if merged.Decoder, err = MergeDecoderSpec(pieces.Decoder, isvc.Spec.Decoder); err != nil {
+		return v1beta1.RoleSpecs{}, goerrors.Wrap(err, "failed to merge decoder specs")
+	}
+	if merged.Encoder, err = MergeEncoderSpec(pieces.Encoder, isvc.Spec.Encoder); err != nil {
+		return v1beta1.RoleSpecs{}, goerrors.Wrap(err, "failed to merge encoder specs")
+	}
+	if merged.Router, err = MergeRouterSpec(isvc.Spec.Router, pieces.Router); err != nil {
+		return v1beta1.RoleSpecs{}, goerrors.Wrap(err, "failed to merge router specs")
 	}
 
 	// The renderers read only the merged component specs, so this is the
@@ -165,7 +167,7 @@ func MergeRuntimeSpecs(isvc *v1beta1.InferenceService, runtime *v1beta1.ServingR
 	// pod. Applied after the component merges so every more specific
 	// level (component / leader / worker, from either side) keeps
 	// precedence.
-	MergeSchedulerName(runtime, mergedEngine, mergedDecoder, mergedRouter)
+	MergeSchedulerName(runtime, merged)
 
-	return mergedEngine, mergedDecoder, mergedRouter, nil
+	return merged, nil
 }

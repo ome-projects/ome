@@ -346,6 +346,16 @@ func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.
 		return ctrl.Result{}, nil
 	}
 	isvc = current
+	// A cleanup release request that cannot act on the stored plan is removed
+	// before any plan write, and the next pass reads the updated source. A failed
+	// removal stops the pass only for a revision the plan has not reached.
+	answered, err := r.answerOutdatedCleanupRelease(ctx, isvc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if answered {
+		return ctrl.Result{RequeueAfter: r.requeue()}, nil
+	}
 	ctx = unverifiedBackend(ctx, isvc)
 	if placementMode(isvc) != v1beta1.PlacementModeSplitByCapacity {
 		r.forgetCapacity(request.NamespacedName)
@@ -484,8 +494,16 @@ func placementMode(isvc *v1beta1.InferenceService) v1beta1.PlacementMode {
 
 // splitDesiredReplicas is the Split desired replica count: spec.placement.split.
 // replicas when set, else the engine component's minReplicas (the guaranteed
-// floor). Zero when neither is declared.
+// floor). Zero when neither is declared. A ratio-form source has no split
+// block, so its count is the primary component's minReplicas: the engine's
+// when an engine is declared, else the decoder's.
 func splitDesiredReplicas(isvc *v1beta1.InferenceService) int32 {
+	if usesRatioForm(isvc) {
+		if isvc.Spec.Engine == nil && isvc.Spec.Decoder != nil {
+			return componentMinReplicas(isvc, v1beta1.DecoderComponent)
+		}
+		return componentMinReplicas(isvc, v1beta1.EngineComponent)
+	}
 	if p := isvc.Spec.Placement; p != nil && p.Split != nil && p.Split.Replicas != nil {
 		return *p.Split.Replicas
 	}
@@ -496,6 +514,19 @@ func splitDesiredReplicas(isvc *v1beta1.InferenceService) int32 {
 		}
 	}
 	return 0
+}
+
+// replicaCountUnresolved reports a Split source whose desired replica count
+// resolves to zero, naming the field the source's form reads it from.
+func replicaCountUnresolved(isvc *v1beta1.InferenceService) error {
+	if usesRatioForm(isvc) {
+		field := "engine.minReplicas"
+		if isvc.Spec.Engine == nil && isvc.Spec.Decoder != nil {
+			field = "decoder.minReplicas"
+		}
+		return fmt.Errorf("ReplicaCountUnresolved: declare a positive %s", field)
+	}
+	return fmt.Errorf("ReplicaCountUnresolved: declare split.replicas or a positive engine.minReplicas")
 }
 
 // placementScaleComponents are the replica-scaled components whose

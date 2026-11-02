@@ -142,12 +142,6 @@ func ParseOCIStorageURI(uri string) (*OCIStorageComponents, error) {
 	}, nil
 }
 
-// ValidateOCIStorageURI validates if the given URI matches OCI storage format
-func ValidateOCIStorageURI(uri string) error {
-	_, err := ParseOCIStorageURI(uri)
-	return err
-}
-
 // ParsePVCStorageURI parses a PVC storage URI and returns its components
 // Format: pvc://{pvc-name}/{sub-path} OR pvc://{namespace}:{pvc-name}/{sub-path}
 // When namespace is not specified, it should be inferred from the BaseModel's namespace
@@ -239,12 +233,6 @@ func isValidNamespace(s string) bool {
 	return s[0] != '-' && s[len(s)-1] != '-'
 }
 
-// ValidatePVCStorageURI validates if the given URI matches PVC storage format
-func ValidatePVCStorageURI(uri string) error {
-	_, err := ParsePVCStorageURI(uri)
-	return err
-}
-
 // ParseVendorStorageURI parses a vendor storage URI and returns its components
 // Format: vendor://{vendor-name}/{resource-type}/{resource-path}
 func ParseVendorStorageURI(uri string) (*VendorStorageComponents, error) {
@@ -269,12 +257,6 @@ func ParseVendorStorageURI(uri string) (*VendorStorageComponents, error) {
 		ResourceType: parts[1],
 		ResourcePath: parts[2],
 	}, nil
-}
-
-// ValidateVendorStorageURI validates if the given URI matches vendor storage format
-func ValidateVendorStorageURI(uri string) error {
-	_, err := ParseVendorStorageURI(uri)
-	return err
 }
 
 // ParseHuggingFaceStorageURI parses a Hugging Face model URI and returns its components
@@ -309,12 +291,6 @@ func ParseHuggingFaceStorageURI(uri string) (*HuggingFaceStorageComponents, erro
 		ModelID: modelID,
 		Branch:  branch,
 	}, nil
-}
-
-// ValidateHuggingFaceStorageURI validates if the given URI matches Hugging Face model storage format
-func ValidateHuggingFaceStorageURI(uri string) error {
-	_, err := ParseHuggingFaceStorageURI(uri)
-	return err
 }
 
 // ParseS3StorageURI parses an S3 storage URI and returns its components
@@ -363,12 +339,6 @@ func ParseS3StorageURI(uri string) (*S3StorageComponents, error) {
 		Prefix: prefix,
 		Region: region,
 	}, nil
-}
-
-// ValidateS3StorageURI validates if the given URI matches S3 storage format
-func ValidateS3StorageURI(uri string) error {
-	_, err := ParseS3StorageURI(uri)
-	return err
 }
 
 // ParseAzureStorageURI parses an Azure Blob storage URI and returns its components
@@ -425,12 +395,6 @@ func ParseAzureStorageURI(uri string) (*AzureStorageComponents, error) {
 	}, nil
 }
 
-// ValidateAzureStorageURI validates if the given URI matches Azure storage format
-func ValidateAzureStorageURI(uri string) error {
-	_, err := ParseAzureStorageURI(uri)
-	return err
-}
-
 // ParseGCSStorageURI parses a Google Cloud Storage URI and returns its components
 // Format: gs://{bucket}/{object_path}
 func ParseGCSStorageURI(uri string) (*GCSStorageComponents, error) {
@@ -461,12 +425,6 @@ func ParseGCSStorageURI(uri string) (*GCSStorageComponents, error) {
 		Bucket: bucket,
 		Object: object,
 	}, nil
-}
-
-// ValidateGCSStorageURI validates if the given URI matches GCS storage format
-func ValidateGCSStorageURI(uri string) error {
-	_, err := ParseGCSStorageURI(uri)
-	return err
 }
 
 // ParseGitHubStorageURI parses a GitHub Releases storage URI and returns its components
@@ -518,12 +476,6 @@ func ParseGitHubStorageURI(uri string) (*GitHubStorageComponents, error) {
 	}, nil
 }
 
-// ValidateGitHubStorageURI validates if the given URI matches GitHub storage format
-func ValidateGitHubStorageURI(uri string) error {
-	_, err := ParseGitHubStorageURI(uri)
-	return err
-}
-
 // ParseLocalStorageURI parses a local filesystem storage URI and returns its components
 // Format: local://{absolute-path} or local://./{relative-path}
 func ParseLocalStorageURI(uri string) (*LocalStorageComponents, error) {
@@ -542,12 +494,6 @@ func ParseLocalStorageURI(uri string) (*LocalStorageComponents, error) {
 	return &LocalStorageComponents{
 		Path: path,
 	}, nil
-}
-
-// ValidateLocalStorageURI validates if the given URI matches local storage format
-func ValidateLocalStorageURI(uri string) error {
-	_, err := ParseLocalStorageURI(uri)
-	return err
 }
 
 // ParseModelPackStorageURI parses a CNCF ModelPack artifact URI.
@@ -570,71 +516,63 @@ func ParseModelPackStorageURI(uri string) (*ModelPackStorageComponents, error) {
 	return &ModelPackStorageComponents{Reference: reference}, nil
 }
 
-// ValidateModelPackStorageURI validates if the given URI matches ModelPack storage format
-func ValidateModelPackStorageURI(uri string) error {
-	_, err := ParseModelPackStorageURI(uri)
-	return err
+// scheme is one storage URI grammar: the prefix that selects it, the type it
+// reports, the parser that accepts or refuses a URI of that prefix and, for the
+// schemes the agent downloads from, the builder of its ObjectURI.
+type scheme struct {
+	prefix      string
+	storageType StorageType
+	validate    func(uri string) error
+	objectURI   func(uri string) (*ociobjectstore.ObjectURI, error)
+}
+
+// validator turns a scheme's parser into its validity check.
+func validator[T any](parse func(string) (*T, error)) func(string) error {
+	return func(uri string) error {
+		_, err := parse(uri)
+		return err
+	}
+}
+
+// schemes lists every storage URI grammar; a URI belongs to the first row whose
+// prefix it carries. A row without an objectURI builder is a scheme the agent
+// cannot read.
+var schemes = []scheme{
+	{prefix: OCIStoragePrefix, storageType: StorageTypeOCI, validate: validator(ParseOCIStorageURI), objectURI: ociObjectURI},
+	{prefix: PVCStoragePrefix, storageType: StorageTypePVC, validate: validator(ParsePVCStorageURI), objectURI: pvcObjectURI},
+	{prefix: VendorStoragePrefix, storageType: StorageTypeVendor, validate: validator(ParseVendorStorageURI)},
+	{prefix: HuggingFaceStoragePrefix, storageType: StorageTypeHuggingFace, validate: validator(ParseHuggingFaceStorageURI), objectURI: huggingFaceObjectURI},
+	{prefix: S3StoragePrefix, storageType: StorageTypeS3, validate: validator(ParseS3StorageURI)},
+	{prefix: AzureStoragePrefix, storageType: StorageTypeAzure, validate: validator(ParseAzureStorageURI)},
+	{prefix: GCSStoragePrefix, storageType: StorageTypeGCS, validate: validator(ParseGCSStorageURI)},
+	{prefix: GitHubStoragePrefix, storageType: StorageTypeGitHub, validate: validator(ParseGitHubStorageURI)},
+	{prefix: LocalStoragePrefix, storageType: StorageTypeLocal, validate: validator(ParseLocalStorageURI), objectURI: localObjectURI},
+	{prefix: ModelPackStoragePrefix, storageType: StorageTypeModelPack, validate: validator(ParseModelPackStorageURI)},
+}
+
+// schemeOf finds the row whose prefix the URI carries.
+func schemeOf(uri string) (scheme, error) {
+	for _, s := range schemes {
+		if strings.HasPrefix(uri, s.prefix) {
+			return s, nil
+		}
+	}
+	return scheme{}, fmt.Errorf("unknown storage type for URI: %s", uri)
 }
 
 // GetStorageType determines the type of storage URI
 func GetStorageType(uri string) (StorageType, error) {
-	switch {
-	case strings.HasPrefix(uri, OCIStoragePrefix):
-		return StorageTypeOCI, nil
-	case strings.HasPrefix(uri, PVCStoragePrefix):
-		return StorageTypePVC, nil
-	case strings.HasPrefix(uri, VendorStoragePrefix):
-		return StorageTypeVendor, nil
-	case strings.HasPrefix(uri, HuggingFaceStoragePrefix):
-		return StorageTypeHuggingFace, nil
-	case strings.HasPrefix(uri, S3StoragePrefix):
-		return StorageTypeS3, nil
-	case strings.HasPrefix(uri, AzureStoragePrefix):
-		return StorageTypeAzure, nil
-	case strings.HasPrefix(uri, GCSStoragePrefix):
-		return StorageTypeGCS, nil
-	case strings.HasPrefix(uri, GitHubStoragePrefix):
-		return StorageTypeGitHub, nil
-	case strings.HasPrefix(uri, LocalStoragePrefix):
-		return StorageTypeLocal, nil
-	case strings.HasPrefix(uri, ModelPackStoragePrefix):
-		return StorageTypeModelPack, nil
-	default:
-		return "", fmt.Errorf("unknown storage type for URI: %s", uri)
-	}
+	s, err := schemeOf(uri)
+	return s.storageType, err
 }
 
 // ValidateStorageURI validates a storage URI based on its type
 func ValidateStorageURI(uri string) error {
-	storageType, err := GetStorageType(uri)
+	s, err := schemeOf(uri)
 	if err != nil {
 		return err
 	}
-
-	switch storageType {
-	case StorageTypeOCI:
-		return ValidateOCIStorageURI(uri)
-	case StorageTypePVC:
-		return ValidatePVCStorageURI(uri)
-	case StorageTypeVendor:
-		return ValidateVendorStorageURI(uri)
-	case StorageTypeHuggingFace:
-		return ValidateHuggingFaceStorageURI(uri)
-	case StorageTypeS3:
-		return ValidateS3StorageURI(uri)
-	case StorageTypeAzure:
-		return ValidateAzureStorageURI(uri)
-	case StorageTypeGCS:
-		return ValidateGCSStorageURI(uri)
-	case StorageTypeGitHub:
-		return ValidateGitHubStorageURI(uri)
-	case StorageTypeLocal:
-		return ValidateLocalStorageURI(uri)
-	case StorageTypeModelPack:
-		return ValidateModelPackStorageURI(uri)
-	default:
-		return fmt.Errorf("unsupported storage type: %s", storageType)
-	}
+	return s.validate(uri)
 }
 
 // NewObjectURI creates a new ObjectURI from a storage URI string
@@ -642,28 +580,19 @@ func ValidateStorageURI(uri string) error {
 // - oci://namespace@region/bucket/prefix
 // - oci://n/namespace/b/bucket/o/prefix
 // - hf://model-id[@branch]
-// NewObjectURI creates a new ObjectURI from a storage URI string
 func NewObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
-	storageType, err := GetStorageType(uriStr)
+	s, err := schemeOf(uriStr)
 	if err != nil {
 		return nil, err
 	}
-
-	switch storageType {
-	case StorageTypeOCI:
-		return parseOCIObjectURI(uriStr)
-	case StorageTypeHuggingFace:
-		return parseHuggingFaceObjectURI(uriStr)
-	case StorageTypePVC:
-		return parsePVCStorageURI(uriStr)
-	case StorageTypeLocal:
-		return parseLocalStorageObjectURI(uriStr)
-	default:
-		return nil, fmt.Errorf("unsupported storage type for object URI: %s", storageType)
+	if s.objectURI == nil {
+		return nil, fmt.Errorf("unsupported storage type for object URI: %s", s.storageType)
 	}
+	return s.objectURI(uriStr)
 }
 
-func parsePVCStorageURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
+// pvcObjectURI maps a PVC URI onto the agent's ObjectURI.
+func pvcObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 	pvcComponents, err := ParsePVCStorageURI(uriStr)
 	if err != nil {
 		return nil, err
@@ -680,8 +609,8 @@ func parsePVCStorageURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 	}, nil
 }
 
-// parseLocalStorageObjectURI parses a local storage URI into an ObjectURI
-func parseLocalStorageObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
+// localObjectURI maps a local filesystem URI onto the agent's ObjectURI.
+func localObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 	localComponents, err := ParseLocalStorageURI(uriStr)
 	if err != nil {
 		return nil, err
@@ -697,8 +626,8 @@ func parseLocalStorageObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error
 	}, nil
 }
 
-// parseHuggingFaceObjectURI parses a Hugging Face URI into an ObjectURI
-func parseHuggingFaceObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
+// huggingFaceObjectURI maps a Hugging Face URI onto the agent's ObjectURI.
+func huggingFaceObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 	hfComponents, err := ParseHuggingFaceStorageURI(uriStr)
 	if err != nil {
 		return nil, err
@@ -715,8 +644,8 @@ func parseHuggingFaceObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error)
 	}, nil
 }
 
-// parseOCIObjectURI parses an OCI URI string into an ObjectURI
-func parseOCIObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
+// ociObjectURI maps an OCI URI onto the agent's ObjectURI.
+func ociObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 	if !strings.HasPrefix(uriStr, OCIStoragePrefix) {
 		return nil, fmt.Errorf("URI must start with '%s'", OCIStoragePrefix)
 	}
@@ -735,7 +664,7 @@ func parseOCIObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 		namespace := parts[1]
 		bucketName := parts[3]
 
-		// Validate the marker for the object prefix
+		// The segment before the object prefix must be "o"
 		if len(parts) > 4 && parts[4] != "o" {
 			return nil, fmt.Errorf("invalid OCI URI format, expected 'oci://n/namespace/b/bucket/o/prefix': %s", uriStr)
 		}

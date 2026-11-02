@@ -4,6 +4,7 @@ import (
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -155,6 +156,22 @@ func ConfiguredHPAName(advanced *kedav1.AdvancedConfig) string {
 		return ""
 	}
 	return advanced.HorizontalPodAutoscalerConfig.Name
+}
+
+// kedaHPANamePrefix is the prefix KEDA puts before the ScaledObject name when
+// the ScaledObject does not name its HPA.
+const kedaHPANamePrefix = "keda-hpa-"
+
+// ShortenedHPAName returns the HPA name to set on a ScaledObject that does not
+// name its HPA, or "" when KEDA's own name fits. KEDA's admission webhook
+// rejects a ScaledObject whose HPA name is longer than a DNS label, so a longer
+// name is cut to a DNS label with a hash of the full name, keeping names unique.
+func ShortenedHPAName(scaledObjectName string) string {
+	name := kedaHPANamePrefix + scaledObjectName
+	if len(name) <= validation.DNS1123LabelMaxLength {
+		return ""
+	}
+	return constants.TruncateNameWithMaxLength(name, validation.DNS1123LabelMaxLength)
 }
 
 // WithHPAName returns kedaSpec with advanced.horizontalPodAutoscalerConfig.name

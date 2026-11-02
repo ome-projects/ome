@@ -2,6 +2,7 @@ package strategies
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -58,26 +59,27 @@ func (k *KubernetesIngressStrategy) Reconcile(ctx context.Context, isvc *v1beta1
 	var err error
 
 	if !k.ingressConfig.DisableIngressCreation {
-		// Use builder to create the ingress
 		desired, err := k.builder.BuildIngress(ctx, isvc)
-		if err != nil {
-			return fmt.Errorf("builder error: %w", err)
-		}
-		if desired == nil {
-			// Set ingress condition to indicate component not ready
+		var notReady *interfaces.ComponentNotReadyError
+		if errors.As(err, &notReady) {
 			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
 				Type:    v1beta1.IngressReady,
 				Status:  corev1.ConditionFalse,
 				Reason:  "ComponentNotReady",
 				Message: "Target service not ready for ingress creation",
 			})
-			klog.V(1).InfoS("Builder returned nil ingress; component not ready", "isvc", isvc.Name)
+			klog.V(1).InfoS("Component not ready; Ingress not built", "isvc", isvc.Name, "component", notReady.Component)
 			return nil
 		}
+		if err != nil {
+			return fmt.Errorf("builder error: %w", err)
+		}
 
+		// A builder that hands back no Ingress without saying why broke its
+		// contract; refuse it instead of dereferencing a nil object below.
 		ingress, ok := desired.(*netv1.Ingress)
-		if !ok {
-			return fmt.Errorf("builder returned unexpected type %T, expected *netv1.Ingress", desired)
+		if !ok || ingress == nil {
+			return fmt.Errorf("builder returned %T, expected a non-nil *netv1.Ingress", desired)
 		}
 
 		// reconcile ingress

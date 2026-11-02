@@ -700,6 +700,7 @@ func StampReplacementLost(termination *types.InstanceTermination) func(*types.In
 		changed := false
 		if s.Phase != types.InstancePhaseFailed {
 			s.Phase = types.InstancePhaseFailed
+			clearPlacementWait(s)
 			changed = true
 		}
 		if termination != nil && !sameFailureIdentity(s.LastFailure, termination) {
@@ -716,16 +717,20 @@ func StampReplacementLost(termination *types.InstanceTermination) func(*types.In
 // at its drain step with the retry counted on the operation and a fresh
 // deadline from now, and the pinned revision's due backoff becomes the
 // attempt in progress in the same write. Fenced on the source identity.
-// Reports whether this pass re-armed.
+// The same write clears the placement wait the ended attempt left on the
+// replacement's row (endedAttemptWaitClear), so the next attempt never
+// starts from it, even when the hold pass's write that clears it did not
+// land. Reports whether this pass re-armed.
 func RearmGangSurgeRebuild(
 	ctx context.Context,
 	input types.ReconcileInput,
-	source *types.InstanceStatus,
+	source, replacement *types.InstanceStatus,
 	timeout time.Duration,
 ) (bool, error) {
 	if source == nil || source.Operation == nil || source.Operation.TargetRevision == "" {
 		return false, nil
 	}
+	clears := endedAttemptWaitClear(replacement, source.Operation.TargetRevision)
 	now := metav1.NewTime(input.Now())
 	identity := Capture(source)
 	retry := source.Operation.RetryCount + 1
@@ -744,6 +749,13 @@ func RearmGangSurgeRebuild(
 	}
 	pin := source.Operation.TargetRevision
 	if input.ApplyInstanceMutationsWithRetryBlock == nil {
+		// With no batched write, the wait goes first: the source opens the
+		// next attempt only once the replacement's row no longer carries it.
+		for _, clear := range clears {
+			if err := input.MutateInstance(ctx, clear.Index, clear.Mutate); err != nil {
+				return false, err
+			}
+		}
 		committed := false
 		if err := input.MutateInstance(ctx, source.Index, func(s *types.InstanceStatus) bool {
 			committed = rearm(s)
@@ -767,5 +779,26 @@ func RearmGangSurgeRebuild(
 		},
 		OnCommit: write.recordCommit,
 	}
-	return write.commit(ctx, input, []types.InstanceMutation{mutation}, pin, RetryBlockStartAttempt)
+	return write.commit(ctx, input, append([]types.InstanceMutation{mutation}, clears...), pin, RetryBlockStartAttempt)
+}
+
+// endedAttemptWaitClear is the mutation that retires the placement wait a
+// gang surge replacement's row recorded for the attempt that ended, for
+// the write that opens the next attempt to carry. It is empty when the
+// row the pass read records none, so that write names no row it would
+// leave unchanged. The row is cleared only while it still holds the
+// pair's live claim on targetRevision.
+func endedAttemptWaitClear(replacement *types.InstanceStatus, targetRevision string) []types.InstanceMutation {
+	if replacement == nil || replacement.Operation == nil || replacement.Operation.PlacementWaitSince == nil {
+		return nil
+	}
+	return []types.InstanceMutation{{
+		Index: replacement.Index,
+		Mutate: func(s *types.InstanceStatus) bool {
+			return GangSurgeActiveTargetClaimMatches(s, targetRevision) && clearPlacementWait(s)
+		},
+		Postcondition: func(row *types.InstanceStatus) bool {
+			return row != nil && (!GangSurgeActiveTargetClaimMatches(row, targetRevision) || row.Operation.PlacementWaitSince == nil)
+		},
+	}}
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -23,13 +22,12 @@ var (
 func main() {
 	// Command-line flags
 	var (
-		repoID    = flag.String("repo", "bert-base-uncased", "Hugging Face repository ID")
-		filename  = flag.String("file", "config.json", "File to download")
-		localDir  = flag.String("dir", "", "Local directory for download (default: temp dir)")
-		token     = flag.String("token", "", "Hugging Face API token")
-		endpoint  = flag.String("endpoint", "https://huggingface.co", "API endpoint")
-		snapshot  = flag.Bool("snapshot", false, "Download entire repository")
-		useCompat = flag.Bool("compat", false, "Use HF compatibility layer")
+		repoID   = flag.String("repo", "bert-base-uncased", "Hugging Face repository ID")
+		filename = flag.String("file", "config.json", "File to download")
+		localDir = flag.String("dir", "", "Local directory for download (default: temp dir)")
+		token    = flag.String("token", "", "Hugging Face API token")
+		endpoint = flag.String("endpoint", "https://huggingface.co", "API endpoint")
+		snapshot = flag.Bool("snapshot", false, "Download entire repository")
 	)
 
 	flag.Parse()
@@ -53,13 +51,7 @@ func main() {
 		*token = os.Getenv("HF_TOKEN")
 	}
 
-	if *useCompat {
-		// Test compatibility layer
-		testCompatibilityLayer(*repoID, *filename, *localDir, *token, *endpoint, *snapshot)
-	} else {
-		// Test direct xet client
-		testDirectClient(*repoID, *filename, *localDir, *token, *endpoint, *snapshot)
-	}
+	testDirectClient(*repoID, *filename, *localDir, *token, *endpoint, *snapshot)
 }
 
 func testDirectClient(repoID, filename, localDir, token, endpoint string, snapshot bool) {
@@ -133,53 +125,5 @@ func testDirectClient(repoID, filename, localDir, token, endpoint string, snapsh
 		if stat, err := os.Stat(path); err == nil {
 			fmt.Printf("File size: %d bytes\n", stat.Size())
 		}
-	}
-}
-
-func testCompatibilityLayer(repoID, filename, localDir, token, endpoint string, snapshot bool) {
-	fmt.Println("Testing HF compatibility layer...")
-
-	config := &xet.DownloadConfig{
-		RepoID:   repoID,
-		RepoType: "models",
-		Revision: "main",
-		Filename: filename,
-		LocalDir: localDir,
-		Endpoint: endpoint,
-		Token:    token,
-	}
-
-	ctx := context.Background()
-
-	if snapshot {
-		fmt.Printf("\nDownloading snapshot of %s to %s\n", repoID, localDir)
-		path, err := xet.SnapshotDownload(ctx, config)
-		if err != nil {
-			log.Fatalf("Snapshot download failed: %v", err)
-		}
-		fmt.Printf("Snapshot downloaded to: %s\n", path)
-	} else {
-		fmt.Printf("\nDownloading %s/%s using compatibility layer\n", repoID, filename)
-		path, err := xet.HfHubDownload(ctx, config)
-		if err != nil {
-			log.Fatalf("Download failed: %v", err)
-		}
-		fmt.Printf("File downloaded to: %s\n", path)
-	}
-
-	// List downloaded files
-	fmt.Printf("\nFiles in %s:\n", localDir)
-	err := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() {
-			relPath, _ := filepath.Rel(localDir, path)
-			fmt.Printf("  - %s (%d bytes)\n", relPath, info.Size())
-		}
-		return nil
-	})
-	if err != nil {
-		log.Printf("Failed to list files: %v", err)
 	}
 }

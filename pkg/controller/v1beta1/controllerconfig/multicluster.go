@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"time"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -27,8 +26,8 @@ const MultiClusterConfigName = "multicluster"
 // deploy-time decisions (a restart), not hot-tunable config.
 //
 // An absent "multicluster" block reproduces the disabled built-in behavior.
-// Optional durations are stored as strings and parsed by the *Duration()
-// accessors, which yield 0 on an empty or unparsable value; a zero handed to the
+// Optional durations are text on the wire; Duration() reads one as zero when it
+// is absent, malformed or not positive, and a zero handed to the
 // workloadcluster/placement options makes those packages apply their own
 // in-package default. Routing observer limits are different: they bound shared
 // process resources and are required explicitly whenever routing is enabled.
@@ -51,33 +50,33 @@ type WorkloadClusterConfig struct {
 	ClientQPS   float64 `json:"clientQPS,omitempty"`
 	ClientBurst int     `json:"clientBurst,omitempty"`
 	// PerCallTimeout bounds one remote request. Empty leaves no client-level timeout.
-	PerCallTimeout string `json:"perCallTimeout,omitempty"`
+	PerCallTimeout durationValue `json:"perCallTimeout,omitempty"`
 	// CacheEnabled serves member InferenceService, ServingRuntime, and
 	// ClusterServingRuntime reads from per-cluster informers. The cache includes
 	// shared runtimes and foreign services so ownership collisions remain visible.
 	// False keeps reads live and disables the member event funnels.
 	CacheEnabled bool `json:"cacheEnabled,omitempty"`
 	// HealthInterval is the re-probe cadence for an otherwise-idle WorkloadCluster.
-	HealthInterval string `json:"healthInterval,omitempty"`
+	HealthInterval durationValue `json:"healthInterval,omitempty"`
 	// ConnectionGrace is how long a previously reachable cluster tolerates transient
 	// probe failures before it is flipped to Ready=False and disconnected.
-	ConnectionGrace string `json:"connectionGrace,omitempty"`
+	ConnectionGrace durationValue `json:"connectionGrace,omitempty"`
 	// EventsBatchPeriod debounces a rotated-kubeconfig Secret's burst of key updates
 	// into one reconcile.
-	EventsBatchPeriod string `json:"eventsBatchPeriod,omitempty"`
+	EventsBatchPeriod durationValue `json:"eventsBatchPeriod,omitempty"`
 	// EstablishInitial / EstablishMax bound a single remote watch-establish attempt
 	// (the timeout grows from initial to max). ReconnectRetryMax caps the
 	// inter-attempt backoff for an unreachable cluster.
-	EstablishInitial  string `json:"establishInitial,omitempty"`
-	EstablishMax      string `json:"establishMax,omitempty"`
-	ReconnectRetryMax string `json:"reconnectRetryMax,omitempty"`
+	EstablishInitial  durationValue `json:"establishInitial,omitempty"`
+	EstablishMax      durationValue `json:"establishMax,omitempty"`
+	ReconnectRetryMax durationValue `json:"reconnectRetryMax,omitempty"`
 	// FunnelResyncInterval is how often the status funnel reconciles its per-cluster
 	// watch set against the connected clusters (how fast a newly-connected cluster
 	// is noticed, not the status latency). FunnelBufferSize is the depth of its
 	// buffered event channel; a full channel drops events (the safety requeue
 	// recovers).
-	FunnelResyncInterval string `json:"funnelResyncInterval,omitempty"`
-	FunnelBufferSize     int    `json:"funnelBufferSize,omitempty"`
+	FunnelResyncInterval durationValue `json:"funnelResyncInterval,omitempty"`
+	FunnelBufferSize     int           `json:"funnelBufferSize,omitempty"`
 }
 
 // +kubebuilder:object:generate=false
@@ -91,32 +90,32 @@ type PlacementConfig struct {
 	Capacity *PlacementCapacityConfig `json:"capacity,omitempty"`
 	// RequeueInterval is the status-refresh poll cadence. With the cache/funnel off
 	// it also paces the cross-cluster status re-read.
-	RequeueInterval string `json:"requeueInterval,omitempty"`
+	RequeueInterval durationValue `json:"requeueInterval,omitempty"`
 	// GCInterval is the orphan-sweep cadence for the placement GC runnable.
-	GCInterval string `json:"gcInterval,omitempty"`
+	GCInterval durationValue `json:"gcInterval,omitempty"`
 	// MaxConcurrentReconciles caps placement reconciles in parallel (distinct
 	// ISVCs). Zero falls back to controller-runtime's single worker.
 	MaxConcurrentReconciles int `json:"maxConcurrentReconciles,omitempty"`
 	// FanoutTimeout is the per-cluster deadline bounding a single placement read,
 	// apply, or delete, so one slow remote cannot block work on healthy peers.
-	FanoutTimeout string `json:"fanoutTimeout,omitempty"`
+	FanoutTimeout durationValue `json:"fanoutTimeout,omitempty"`
 	// WinnerLostGrace is the grace window for transient loss of a sticky winner,
 	// including derived absence, membership removal, or admission loss. Empty
 	// uses the controller default.
-	WinnerLostGrace string `json:"winnerLostGrace,omitempty"`
+	WinnerLostGrace durationValue `json:"winnerLostGrace,omitempty"`
 	// ObservationGrace is how long a home whose reads fail keeps the ready count
 	// from its last successful read, measured from the first failed read. Empty
 	// withholds that count at the first failed read.
-	ObservationGrace string `json:"observationGrace,omitempty"`
+	ObservationGrace durationValue `json:"observationGrace,omitempty"`
 	// MemberReadRetry re-reads a member within one reconcile after a transient
 	// read failure. Absent reads each member once per reconcile.
 	MemberReadRetry PlacementMemberReadRetryConfig `json:"memberReadRetry,omitempty"`
 	// StatusBatchPeriod debounces a burst of cross-cluster derived-status events for
 	// one ISVC into a single placement reconcile.
-	StatusBatchPeriod string `json:"statusBatchPeriod,omitempty"`
+	StatusBatchPeriod durationValue `json:"statusBatchPeriod,omitempty"`
 	// StatusSafetyRequeue is the steady-state re-read backstop when the funnel is on
 	// (events drive freshness; this only recovers a missed event).
-	StatusSafetyRequeue string `json:"statusSafetyRequeue,omitempty"`
+	StatusSafetyRequeue durationValue `json:"statusSafetyRequeue,omitempty"`
 	// DispatcherMode is the fan-out breadth policy: "AllAtOnce" clones onto every
 	// matched candidate at once; "Incremental" probes candidates in batches. Empty
 	// or unrecognized means AllAtOnce.
@@ -126,7 +125,7 @@ type PlacementConfig struct {
 	DispatcherStepSize int `json:"dispatcherStepSize,omitempty"`
 	// DispatcherRoundTimeout is how long an Incremental round waits for a nominated
 	// cluster to win before adding the next batch. Non-positive enforces no dwell.
-	DispatcherRoundTimeout string `json:"dispatcherRoundTimeout,omitempty"`
+	DispatcherRoundTimeout durationValue `json:"dispatcherRoundTimeout,omitempty"`
 	// LocalQueue is the Kueue LocalQueue that a derived workload's pods join on
 	// the target cluster when the InferenceService carries no per-ISVC queue
 	// annotation. It names a resource the operator created, so it has no in-code
@@ -141,9 +140,9 @@ type PlacementConfig struct {
 // InitialBackoff and doubles up to MaxBackoff; both are required once
 // MaxAttempts exceeds one, and neither is accepted otherwise.
 type PlacementMemberReadRetryConfig struct {
-	MaxAttempts    int    `json:"maxAttempts,omitempty"`
-	InitialBackoff string `json:"initialBackoff,omitempty"`
-	MaxBackoff     string `json:"maxBackoff,omitempty"`
+	MaxAttempts    int           `json:"maxAttempts,omitempty"`
+	InitialBackoff durationValue `json:"initialBackoff,omitempty"`
+	MaxBackoff     durationValue `json:"maxBackoff,omitempty"`
 }
 
 // Validate reports a retry block that is stated but unusable.
@@ -153,43 +152,36 @@ func (c PlacementMemberReadRetryConfig) Validate() error {
 		errs = append(errs, fmt.Errorf("placement.memberReadRetry.maxAttempts: %d must not be negative", c.MaxAttempts))
 	}
 	if c.MaxAttempts <= 1 {
-		if c.InitialBackoff != "" || c.MaxBackoff != "" {
+		if c.InitialBackoff.written() || c.MaxBackoff.written() {
 			errs = append(errs, errors.New("placement.memberReadRetry.maxAttempts: must exceed 1 when backoffs are set"))
 		}
 		return errors.Join(errs...)
 	}
-	for _, field := range []struct{ name, value string }{
+	for _, field := range []struct {
+		name  string
+		value durationValue
+	}{
 		{"initialBackoff", c.InitialBackoff},
 		{"maxBackoff", c.MaxBackoff},
 	} {
-		if positiveDurationOrZero(field.value) == 0 {
-			errs = append(errs, fmt.Errorf("placement.memberReadRetry.%s: %q must be a positive duration when maxAttempts exceeds 1", field.name, field.value))
+		if field.value.Duration() == 0 {
+			errs = append(errs, fmt.Errorf("placement.memberReadRetry.%s: %q must be a positive duration when maxAttempts exceeds 1", field.name, field.value.text))
 		}
 	}
-	if len(errs) == 0 && c.MaxBackoffDuration() < c.InitialBackoffDuration() {
+	if len(errs) == 0 && c.MaxBackoff.Duration() < c.InitialBackoff.Duration() {
 		errs = append(errs, errors.New("placement.memberReadRetry.maxBackoff: must not be shorter than initialBackoff"))
 	}
 	return errors.Join(errs...)
-}
-
-// InitialBackoffDuration returns the parsed InitialBackoff (0 if absent/unparsable).
-func (c PlacementMemberReadRetryConfig) InitialBackoffDuration() time.Duration {
-	return positiveDurationOrZero(c.InitialBackoff)
-}
-
-// MaxBackoffDuration returns the parsed MaxBackoff (0 if absent/unparsable).
-func (c PlacementMemberReadRetryConfig) MaxBackoffDuration() time.Duration {
-	return positiveDurationOrZero(c.MaxBackoff)
 }
 
 // +kubebuilder:object:generate=false
 // PlacementCapacityConfig identifies reports and bounds their acceptance age.
 // All fields are required when the block is present; there are no Go defaults.
 type PlacementCapacityConfig struct {
-	RootName        string `json:"rootName"`
-	MaxAge          string `json:"maxAge"`
-	StabilityWindow string `json:"stabilityWindow"`
-	RefreshInterval string `json:"refreshInterval"`
+	RootName        string        `json:"rootName"`
+	MaxAge          durationValue `json:"maxAge"`
+	StabilityWindow durationValue `json:"stabilityWindow"`
+	RefreshInterval durationValue `json:"refreshInterval"`
 }
 
 func (c PlacementCapacityConfig) Validate() error {
@@ -197,25 +189,18 @@ func (c PlacementCapacityConfig) Validate() error {
 	if strings.TrimSpace(c.RootName) == "" {
 		errs = append(errs, errors.New("placement.capacity: rootName is required"))
 	}
-	for _, field := range []struct{ name, value string }{{"maxAge", c.MaxAge}, {"stabilityWindow", c.StabilityWindow}, {"refreshInterval", c.RefreshInterval}} {
-		if positiveDurationOrZero(field.value) == 0 {
+	for _, field := range []struct {
+		name  string
+		value durationValue
+	}{{"maxAge", c.MaxAge}, {"stabilityWindow", c.StabilityWindow}, {"refreshInterval", c.RefreshInterval}} {
+		if field.value.Duration() == 0 {
 			errs = append(errs, fmt.Errorf("placement.capacity.%s: must be an explicit positive duration", field.name))
 		}
 	}
-	if len(errs) == 0 && c.RefreshIntervalDuration() >= c.MaxAgeDuration() {
+	if len(errs) == 0 && c.RefreshInterval.Duration() >= c.MaxAge.Duration() {
 		errs = append(errs, errors.New("placement.capacity.refreshInterval: must be shorter than maxAge"))
 	}
 	return errors.Join(errs...)
-}
-
-func (c PlacementCapacityConfig) MaxAgeDuration() time.Duration {
-	return positiveDurationOrZero(c.MaxAge)
-}
-func (c PlacementCapacityConfig) StabilityWindowDuration() time.Duration {
-	return positiveDurationOrZero(c.StabilityWindow)
-}
-func (c PlacementCapacityConfig) RefreshIntervalDuration() time.Duration {
-	return positiveDurationOrZero(c.RefreshInterval)
 }
 
 // +kubebuilder:object:generate=false
@@ -272,14 +257,7 @@ type EndpointGatewayBackendEndpointSliceConfig struct {
 	Enabled bool `json:"enabled,omitempty"`
 	// AddressRefreshInterval is how often child Gateway status addresses are
 	// refreshed.
-	AddressRefreshInterval string `json:"addressRefreshInterval,omitempty"`
-}
-
-// AddressRefreshIntervalDuration returns the parsed refresh interval, or zero
-// when absent or malformed. MultiClusterConfig.Validate rejects a malformed or
-// missing value when EndpointSlice publication is enabled.
-func (c EndpointGatewayBackendEndpointSliceConfig) AddressRefreshIntervalDuration() time.Duration {
-	return positiveDurationOrZero(c.AddressRefreshInterval)
+	AddressRefreshInterval durationValue `json:"addressRefreshInterval,omitempty"`
 }
 
 // +kubebuilder:object:generate=false
@@ -326,15 +304,9 @@ type RoutingObserverConfig struct {
 	// MaxResponseBytes bounds the body read from one observed endpoint.
 	MaxResponseBytes int64 `json:"maxResponseBytes,omitempty"`
 	// MinPeriod is the shortest permitted probe or capacity cadence.
-	MinPeriod string `json:"minPeriod,omitempty"`
+	MinPeriod durationValue `json:"minPeriod,omitempty"`
 	// MaxSamples caps the effective per-home capacity history window.
 	MaxSamples int `json:"maxSamples,omitempty"`
-}
-
-// MinPeriodDuration parses MinPeriod, yielding zero when it is absent or
-// malformed so the routing package can reject an enabled invalid config.
-func (c RoutingObserverConfig) MinPeriodDuration() time.Duration {
-	return positiveDurationOrZero(c.MinPeriod)
 }
 
 // TrafficMapPublisherConfig configures the TrafficMap publication backend.
@@ -346,16 +318,9 @@ type TrafficMapPublisherConfig struct {
 	Name string `json:"name,omitempty"`
 	// ResyncInterval is the safety cadence for reconciling publisher state.
 	// It is required when routing is enabled and has no binary default.
-	ResyncInterval string `json:"resyncInterval,omitempty"`
+	ResyncInterval durationValue `json:"resyncInterval,omitempty"`
 	// Options are interpreted and validated only by the named publisher.
 	Options map[string]string `json:"options,omitempty"`
-}
-
-// ResyncIntervalDuration parses ResyncInterval, yielding zero when it is
-// absent or malformed so the routing package can reject an enabled invalid
-// config.
-func (c TrafficMapPublisherConfig) ResyncIntervalDuration() time.Duration {
-	return positiveDurationOrZero(c.ResyncInterval)
 }
 
 // +kubebuilder:object:generate=false
@@ -391,45 +356,16 @@ type CapacityConfig struct {
 	Quorum int `json:"quorum,omitempty"`
 
 	// Period is how often each home is polled, as a duration string.
-	Period string `json:"period,omitempty"`
+	Period durationValue `json:"period,omitempty"`
 
 	// Timeout bounds one capacity request, as a duration string.
-	Timeout string `json:"timeout,omitempty"`
+	Timeout durationValue `json:"timeout,omitempty"`
 
 	// MaxAge is how old a report's observedAt stamp may be and still be
 	// applied, as a duration string. Beyond it the poller falls open to the
 	// plan, so a home whose reporter froze releases its ceiling rather than
 	// pinning a stale one forever.
-	MaxAge string `json:"maxAge,omitempty"`
-}
-
-// PeriodDuration parses Period, yielding 0 on an unparsable value so Validate
-// rejects it rather than a default being silently substituted.
-func (c CapacityConfig) PeriodDuration() time.Duration {
-	d, err := time.ParseDuration(c.Period)
-	if err != nil {
-		return 0
-	}
-	return d
-}
-
-// TimeoutDuration parses Timeout, with the same rejection-over-substitution
-// rule as PeriodDuration.
-func (c CapacityConfig) TimeoutDuration() time.Duration {
-	d, err := time.ParseDuration(c.Timeout)
-	if err != nil {
-		return 0
-	}
-	return d
-}
-
-// MaxAgeDuration parses MaxAge, with the same rejection-over-substitution rule.
-func (c CapacityConfig) MaxAgeDuration() time.Duration {
-	d, err := time.ParseDuration(c.MaxAge)
-	if err != nil {
-		return 0
-	}
-	return d
+	MaxAge durationValue `json:"maxAge,omitempty"`
 }
 
 // +kubebuilder:object:generate=false
@@ -459,10 +395,10 @@ type ProbeConfig struct {
 	GateStatuses []int `json:"gateStatuses,omitempty"`
 
 	// Period is how often each home is probed, as a duration string.
-	Period string `json:"period,omitempty"`
+	Period durationValue `json:"period,omitempty"`
 
 	// Timeout bounds one probe request, as a duration string.
-	Timeout string `json:"timeout,omitempty"`
+	Timeout durationValue `json:"timeout,omitempty"`
 
 	// FailureThreshold is the number of consecutive failures before a home is
 	// gated to weight 0.
@@ -475,26 +411,6 @@ type ProbeConfig struct {
 	// AllFailedPolicy controls whether a conclusive failure from every home
 	// preserves traffic or drains every route arm.
 	AllFailedPolicy string `json:"allFailedPolicy,omitempty"`
-}
-
-// PeriodDuration parses Period. An unparsable value yields 0, which the
-// routing config's Validate rejects rather than silently substituting a rate.
-func (p ProbeConfig) PeriodDuration() time.Duration {
-	d, err := time.ParseDuration(p.Period)
-	if err != nil {
-		return 0
-	}
-	return d
-}
-
-// TimeoutDuration parses Timeout, with the same rejection-over-substitution
-// rule as PeriodDuration.
-func (p ProbeConfig) TimeoutDuration() time.Duration {
-	d, err := time.ParseDuration(p.Timeout)
-	if err != nil {
-		return 0
-	}
-	return d
 }
 
 // NewMultiClusterConfig loads the "multicluster" block from the
@@ -521,7 +437,7 @@ func parseMultiClusterConfig(configMap *v1.ConfigMap) (*MultiClusterConfig, erro
 // discarding the operator's intended value for the life of the process. The
 // composition root calls this so the deploy fails loudly instead.
 func (c MultiClusterConfig) Validate() error {
-	durations := map[string]string{
+	durations := map[string]durationValue{
 		"workloadCluster.perCallTimeout":                                c.WorkloadCluster.PerCallTimeout,
 		"workloadCluster.healthInterval":                                c.WorkloadCluster.HealthInterval,
 		"workloadCluster.connectionGrace":                               c.WorkloadCluster.ConnectionGrace,
@@ -564,32 +480,23 @@ func (c MultiClusterConfig) Validate() error {
 		}
 	}
 	for _, k := range keys {
-		raw := durations[k]
-		if raw == "" {
-			continue
-		}
-		d, err := time.ParseDuration(raw)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %q is not a duration (use forms like \"30s\", \"5m\")", k, raw))
-			continue
-		}
-		if d <= 0 {
-			errs = append(errs, fmt.Errorf("%s: %q must be positive", k, raw))
+		if err := durations[k].validatePositive(k); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	publisherResync := c.Routing.Publisher.ResyncInterval
-	if publisherResync == "" {
+	if !publisherResync.written() {
 		if c.Routing.Enabled {
 			errs = append(errs, errors.New("routing.publisher.resyncInterval: must be positive when routing is enabled"))
 		}
-	} else if d, err := time.ParseDuration(publisherResync); err != nil {
+	} else if !publisherResync.wellFormed {
 		errs = append(errs, fmt.Errorf(
 			"routing.publisher.resyncInterval: %q is not a duration (use forms like \"30s\", \"5m\")",
-			publisherResync))
-	} else if d < 0 || (c.Routing.Enabled && d == 0) {
+			publisherResync.text))
+	} else if publisherResync.parsed < 0 || (c.Routing.Enabled && publisherResync.parsed == 0) {
 		errs = append(errs, fmt.Errorf(
 			"routing.publisher.resyncInterval: %q must be positive when routing is enabled and non-negative otherwise",
-			publisherResync))
+			publisherResync.text))
 	}
 	if p := c.Endpoint.BackendPort; p < 0 || p > 65535 {
 		errs = append(errs, fmt.Errorf("endpoint.backendPort: %d is not a valid port", p))
@@ -615,91 +522,11 @@ func (c MultiClusterConfig) Validate() error {
 		errs = append(errs, errors.New("endpoint.gatewayBackend.tls.enabled: must be true when TLS settings are supplied"))
 	}
 	if gb.EndpointSlices.Enabled {
-		if strings.TrimSpace(gb.EndpointSlices.AddressRefreshInterval) == "" {
+		if strings.TrimSpace(gb.EndpointSlices.AddressRefreshInterval.text) == "" {
 			errs = append(errs, errors.New("endpoint.gatewayBackend.endpointSlices.addressRefreshInterval: must be set when enabled"))
 		}
-	} else if gb.EndpointSlices.AddressRefreshInterval != "" {
+	} else if gb.EndpointSlices.AddressRefreshInterval.written() {
 		errs = append(errs, errors.New("endpoint.gatewayBackend.endpointSlices.enabled: must be true when EndpointSlice settings are supplied"))
 	}
 	return errors.Join(errs...)
-}
-
-// PerCallTimeoutDuration returns the parsed PerCallTimeout (0 if absent/unparsable).
-func (c WorkloadClusterConfig) PerCallTimeoutDuration() time.Duration {
-	return positiveDurationOrZero(c.PerCallTimeout)
-}
-
-// HealthIntervalDuration returns the parsed HealthInterval (0 if absent/unparsable).
-func (c WorkloadClusterConfig) HealthIntervalDuration() time.Duration {
-	return positiveDurationOrZero(c.HealthInterval)
-}
-
-// ConnectionGraceDuration returns the parsed ConnectionGrace (0 if absent/unparsable).
-func (c WorkloadClusterConfig) ConnectionGraceDuration() time.Duration {
-	return positiveDurationOrZero(c.ConnectionGrace)
-}
-
-// EventsBatchPeriodDuration returns the parsed EventsBatchPeriod (0 if absent/unparsable).
-func (c WorkloadClusterConfig) EventsBatchPeriodDuration() time.Duration {
-	return positiveDurationOrZero(c.EventsBatchPeriod)
-}
-
-// EstablishInitialDuration returns the parsed EstablishInitial (0 if absent/unparsable).
-func (c WorkloadClusterConfig) EstablishInitialDuration() time.Duration {
-	return positiveDurationOrZero(c.EstablishInitial)
-}
-
-// EstablishMaxDuration returns the parsed EstablishMax (0 if absent/unparsable).
-func (c WorkloadClusterConfig) EstablishMaxDuration() time.Duration {
-	return positiveDurationOrZero(c.EstablishMax)
-}
-
-// ReconnectRetryMaxDuration returns the parsed ReconnectRetryMax (0 if absent/unparsable).
-func (c WorkloadClusterConfig) ReconnectRetryMaxDuration() time.Duration {
-	return positiveDurationOrZero(c.ReconnectRetryMax)
-}
-
-// FunnelResyncIntervalDuration returns the parsed FunnelResyncInterval (0 if absent/unparsable).
-func (c WorkloadClusterConfig) FunnelResyncIntervalDuration() time.Duration {
-	return positiveDurationOrZero(c.FunnelResyncInterval)
-}
-
-// RequeueIntervalDuration returns the parsed RequeueInterval (0 if absent/unparsable).
-func (c PlacementConfig) RequeueIntervalDuration() time.Duration {
-	return positiveDurationOrZero(c.RequeueInterval)
-}
-
-// GCIntervalDuration returns the parsed GCInterval (0 if absent/unparsable).
-func (c PlacementConfig) GCIntervalDuration() time.Duration {
-	return positiveDurationOrZero(c.GCInterval)
-}
-
-// FanoutTimeoutDuration returns the parsed FanoutTimeout (0 if absent/unparsable).
-func (c PlacementConfig) FanoutTimeoutDuration() time.Duration {
-	return positiveDurationOrZero(c.FanoutTimeout)
-}
-
-// WinnerLostGraceDuration returns the parsed WinnerLostGrace (0 if absent/unparsable).
-func (c PlacementConfig) WinnerLostGraceDuration() time.Duration {
-	return positiveDurationOrZero(c.WinnerLostGrace)
-}
-
-// ObservationGraceDuration returns the parsed ObservationGrace (0 if absent/unparsable).
-func (c PlacementConfig) ObservationGraceDuration() time.Duration {
-	return positiveDurationOrZero(c.ObservationGrace)
-}
-
-// StatusBatchPeriodDuration returns the parsed StatusBatchPeriod (0 if absent/unparsable).
-func (c PlacementConfig) StatusBatchPeriodDuration() time.Duration {
-	return positiveDurationOrZero(c.StatusBatchPeriod)
-}
-
-// StatusSafetyRequeueDuration returns the parsed StatusSafetyRequeue (0 if absent/unparsable).
-func (c PlacementConfig) StatusSafetyRequeueDuration() time.Duration {
-	return positiveDurationOrZero(c.StatusSafetyRequeue)
-}
-
-// DispatcherRoundTimeoutDuration returns the parsed DispatcherRoundTimeout (0 if absent/unparsable).
-func (c PlacementConfig) DispatcherRoundTimeoutDuration() time.Duration {
-	return positiveDurationOrZero(c.DispatcherRoundTimeout)
 }

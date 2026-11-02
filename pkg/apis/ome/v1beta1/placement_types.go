@@ -1,6 +1,8 @@
 package v1beta1
 
 import (
+	"cmp"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -39,6 +41,8 @@ const (
 
 // PlacementSpec declares explicit multi-cluster matching and allocation intent.
 // +kubebuilder:validation:XValidation:rule="!has(self.replacementTimeout) || (has(self.policy) && self.policy == 'ClusterAffinity' && has(self.mode) && self.mode == 'Single')",message="replacementTimeout requires Single placement"
+// +kubebuilder:validation:XValidation:rule="!has(self.clusterAffinity) || !(self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) && self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.default) || has(t.weights.engine) || has(t.weights.decoder) || has(t.weights.router))))",message="clusterAffinity weights use either default/engine/decoder/router or the *Replicas ratios, not both"
+// +kubebuilder:validation:XValidation:rule="!has(self.clusterAffinity) || !self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) || (self.mode == 'Split' && !has(self.split))",message="*Replicas ratios are allowed only in Split and replace spec.placement.split; remove split"
 type PlacementSpec struct {
 	// Policy selects affinity matching and persisted allocation plans.
 	// +required
@@ -77,7 +81,7 @@ type PlacementSpec struct {
 	Split *SplitSpec `json:"split,omitempty"`
 }
 
-// SplitSpec declares the fleet floor and optional local ceiling. The floor
+// SplitSpec declares the fleet floor and optional local ceilings. The floor
 // falls back only to an explicitly declared positive engine.minReplicas.
 type SplitSpec struct {
 	// Replicas is the fleet-wide desired replica count to distribute across homes.
@@ -89,11 +93,61 @@ type SplitSpec struct {
 	// +kubebuilder:validation:Minimum=1
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// MaxReplicasPerCluster is an optional local ceiling. Plans exceeding it
-	// are held; zero follows the assigned allocation without an extra ceiling.
+	// MaxPerCluster caps how many replicas of each component one cluster runs.
+	// A plan that gives a component more than its cap is held.
 	// +optional
-	// +kubebuilder:validation:Minimum=0
-	MaxReplicasPerCluster int32 `json:"maxReplicasPerCluster,omitempty"`
+	MaxPerCluster *SplitCeilings `json:"maxPerCluster,omitempty"`
+}
+
+// SplitCeilings holds one cap per component. A component takes its own key,
+// then default. A component with neither takes the primary component's cap,
+// scaled by its ratio of minimums and rounded up; the primary component is
+// the engine, or the decoder when there is no engine. A component with no cap
+// is fixed at its share.
+// +kubebuilder:validation:MinProperties=1
+type SplitCeilings struct {
+	// Default caps every component this map does not name.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Default *int32 `json:"default,omitempty"`
+
+	// Engine caps the engine.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Engine *int32 `json:"engine,omitempty"`
+
+	// Decoder caps the decoder.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Decoder *int32 `json:"decoder,omitempty"`
+
+	// Router caps the router. It applies only when Split divides the routers.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Router *int32 `json:"router,omitempty"`
+}
+
+// Ceiling returns the cap the source declares for a component on one cluster:
+// its maxPerCluster key, else the map's default. Zero means none is declared;
+// a secondary component then takes the primary's cap in its ratio.
+func (s *SplitSpec) Ceiling(component ComponentType) int32 {
+	if s == nil || s.MaxPerCluster == nil {
+		return 0
+	}
+	c := s.MaxPerCluster
+	var key *int32
+	switch component {
+	case EngineComponent:
+		key = c.Engine
+	case DecoderComponent:
+		key = c.Decoder
+	case RouterComponent:
+		key = c.Router
+	}
+	if key = cmp.Or(key, c.Default); key != nil {
+		return *key
+	}
+	return 0
 }
 
 // UsesClusterAffinity reports the explicit opt-in, without inferring policy

@@ -223,13 +223,13 @@ The main directory layout might look something like this:
 ome/
 ├── cmd/                            # Contains subbinaries
 │   └── ome-agent/                  # Contains Cobra subcommands
-│       ├── main.go                 # Main entry point for the CLI
-│       ├── hf_download_agent.go    # Subcommand for HuggingFace model downloads
-│       ├── enigma_agent.go         # Subcommand for model encryption/decryption
-│       ├── model_metadata_agent.go # Subcommand for model metadata extraction
-│       ├── replica_agent.go        # Subcommand for object storage replication
-│       └── serving_agent.go        # Subcommand for serving sidecar agent
-│       └── fine-tuned-adapter.go   # Subcommand for fine-tuned adapter
+│       ├── main.go                 # Main entry point and the table of subcommands
+│       ├── agent.go                # One subcommand row: flags, fx modules, the agent it runs
+│       ├── config.go               # Loads the config file and environment into viper
+│       ├── enigma_agent.go         # The enigma agent: model encryption and decryption
+│       ├── hf_download_agent.go    # The HuggingFace download agent
+│       ├── replica_agent.go        # Storage providers of the replica subcommand
+│       └── k8sclient.go            # Kubernetes client of the model-metadata subcommand
 ├── internal/                       # Contains the core business logic for each feature
 │   ├── enigma/                     # Logic for encryption/decryption
 │   ├── fine-tuned-adapter/         # Logic for fine-tuned adapter

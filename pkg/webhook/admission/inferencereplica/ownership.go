@@ -79,12 +79,6 @@ func controllerOnly(s v1beta1.InferenceReplicaSpec) controllerOnlyFields {
 	}
 }
 
-// placementFieldsSet reports whether the placement fields, which only the
-// controller writes, are present.
-func placementFieldsSet(s v1beta1.InferenceReplicaSpec) bool {
-	return s.PlacementExecution != nil || s.PlacementReplicaLimit != nil
-}
-
 func controllerOnlyChanged(oldSpec, newSpec v1beta1.InferenceReplicaSpec) bool {
 	return !equality.Semantic.DeepEqual(controllerOnly(oldSpec), controllerOnly(newSpec))
 }
@@ -137,12 +131,12 @@ func composedFieldsChanged(oldObj, newObj *v1beta1.InferenceReplica) bool {
 }
 
 // standaloneSpecError rejects a standalone spec that renders from more or
-// fewer than one template source or pins its runtime, and settings a
-// standalone replica accepts in shape but nothing acts on: only the
+// fewer than one template source or names a fixed runtime revision, and
+// settings a standalone replica accepts in shape but nothing acts on: only the
 // InferenceService controller creates HPA or KEDA scalers, and a replica reads
 // spec.minReadySeconds, never the nested lifecycle field.
 func standaloneSpecError(s v1beta1.InferenceReplicaSpec) error {
-	if err := validation.ValidateInferenceReplicaTemplateSource(len(s.Runners), s.ModelRef != nil, s.RuntimeRef != nil, pinnedRuntime(s.RuntimeRef)); err != nil {
+	if err := validation.ValidateInferenceReplicaTemplateSource(len(s.Runners), s.ModelRef != nil, s.RuntimeRef != nil, namesRuntimeRevision(s.RuntimeRef)); err != nil {
 		return err
 	}
 	if s.Autoscaler != nil && (s.Autoscaler.Class == v1beta1.AutoscalerHPA || s.Autoscaler.Class == v1beta1.AutoscalerKEDA) {
@@ -155,10 +149,11 @@ func standaloneSpecError(s v1beta1.InferenceReplicaSpec) error {
 	return nil
 }
 
-// pinnedRuntime reports whether ref asks for a runtime pin: autoSync off or a
-// named revision. A replica renders the live runtime and keeps no
-// ControllerRevision of it, so a pin is rejected rather than ignored.
-func pinnedRuntime(ref *v1beta1.ServingRuntimeRef) bool {
+// namesRuntimeRevision reports whether ref asks for a fixed runtime revision:
+// autoSync off or a named revision. A replica renders the live runtime and
+// keeps no ControllerRevision of it, so the request is refused rather than
+// ignored.
+func namesRuntimeRevision(ref *v1beta1.ServingRuntimeRef) bool {
 	if ref == nil {
 		return false
 	}
@@ -196,7 +191,7 @@ func migrationRequested(oldObj, newObj *v1beta1.InferenceReplica) bool {
 // component suffix removed.
 func collidingInferenceServiceNames(name string) []string {
 	out := []string{name}
-	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+	for _, c := range v1beta1.RoleTypes() {
 		if trimmed := strings.TrimSuffix(name, "-"+string(c)); trimmed != name && trimmed != "" {
 			out = append(out, trimmed)
 		}

@@ -32,16 +32,16 @@ func TestNewMultiClusterConfig_BlockForms_FullBlockParsesAbsentIsZeroBadJsonErro
 			validate: func(t *testing.T, cfg *MultiClusterConfig) {
 				// Every knob zero/empty: each consumer applies its own default.
 				assert.False(t, cfg.WorkloadCluster.CacheEnabled)
-				assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.HealthIntervalDuration())
-				assert.Equal(t, time.Duration(0), cfg.Placement.RequeueIntervalDuration())
+				assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.HealthInterval.Duration())
+				assert.Equal(t, time.Duration(0), cfg.Placement.RequeueInterval.Duration())
 				assert.Equal(t, 0, cfg.Placement.MaxConcurrentReconciles)
-				assert.Equal(t, time.Duration(0), cfg.Placement.ObservationGraceDuration())
+				assert.Equal(t, time.Duration(0), cfg.Placement.ObservationGrace.Duration())
 				assert.Equal(t, PlacementMemberReadRetryConfig{}, cfg.Placement.MemberReadRetry)
 				assert.Equal(t, "", cfg.Placement.DispatcherMode)
 				assert.Equal(t, "", cfg.Endpoint.GlobalGateway)
 				assert.Equal(t, RoutingObserverConfig{}, cfg.Routing.Observer)
 				assert.Equal(t, "", cfg.Routing.Publisher.Name)
-				assert.Equal(t, time.Duration(0), cfg.Routing.Publisher.ResyncIntervalDuration())
+				assert.Equal(t, time.Duration(0), cfg.Routing.Publisher.ResyncInterval.Duration())
 			},
 		},
 		{
@@ -114,32 +114,32 @@ func TestNewMultiClusterConfig_BlockForms_FullBlockParsesAbsentIsZeroBadJsonErro
 				wc := cfg.WorkloadCluster
 				assert.Equal(t, 50.0, wc.ClientQPS)
 				assert.Equal(t, 100, wc.ClientBurst)
-				assert.Equal(t, 15*time.Second, wc.PerCallTimeoutDuration())
+				assert.Equal(t, 15*time.Second, wc.PerCallTimeout.Duration())
 				assert.True(t, wc.CacheEnabled)
-				assert.Equal(t, 30*time.Second, wc.HealthIntervalDuration())
-				assert.Equal(t, 90*time.Second, wc.ConnectionGraceDuration())
-				assert.Equal(t, 200*time.Millisecond, wc.EventsBatchPeriodDuration())
-				assert.Equal(t, 2*time.Minute, wc.EstablishInitialDuration())
-				assert.Equal(t, 20*time.Minute, wc.EstablishMaxDuration())
-				assert.Equal(t, 5*time.Minute, wc.ReconnectRetryMaxDuration())
-				assert.Equal(t, 250*time.Millisecond, wc.FunnelResyncIntervalDuration())
+				assert.Equal(t, 30*time.Second, wc.HealthInterval.Duration())
+				assert.Equal(t, 90*time.Second, wc.ConnectionGrace.Duration())
+				assert.Equal(t, 200*time.Millisecond, wc.EventsBatchPeriod.Duration())
+				assert.Equal(t, 2*time.Minute, wc.EstablishInitial.Duration())
+				assert.Equal(t, 20*time.Minute, wc.EstablishMax.Duration())
+				assert.Equal(t, 5*time.Minute, wc.ReconnectRetryMax.Duration())
+				assert.Equal(t, 250*time.Millisecond, wc.FunnelResyncInterval.Duration())
 				assert.Equal(t, 64, wc.FunnelBufferSize)
 
 				pl := cfg.Placement
-				assert.Equal(t, 45*time.Second, pl.RequeueIntervalDuration())
-				assert.Equal(t, 10*time.Minute, pl.GCIntervalDuration())
+				assert.Equal(t, 45*time.Second, pl.RequeueInterval.Duration())
+				assert.Equal(t, 10*time.Minute, pl.GCInterval.Duration())
 				assert.Equal(t, 8, pl.MaxConcurrentReconciles)
-				assert.Equal(t, 20*time.Second, pl.FanoutTimeoutDuration())
-				assert.Equal(t, 2*time.Minute, pl.WinnerLostGraceDuration())
-				assert.Equal(t, 3*time.Minute, pl.ObservationGraceDuration())
+				assert.Equal(t, 20*time.Second, pl.FanoutTimeout.Duration())
+				assert.Equal(t, 2*time.Minute, pl.WinnerLostGrace.Duration())
+				assert.Equal(t, 3*time.Minute, pl.ObservationGrace.Duration())
 				assert.Equal(t, 3, pl.MemberReadRetry.MaxAttempts)
-				assert.Equal(t, 200*time.Millisecond, pl.MemberReadRetry.InitialBackoffDuration())
-				assert.Equal(t, time.Second, pl.MemberReadRetry.MaxBackoffDuration())
-				assert.Equal(t, 500*time.Millisecond, pl.StatusBatchPeriodDuration())
-				assert.Equal(t, 5*time.Minute, pl.StatusSafetyRequeueDuration())
+				assert.Equal(t, 200*time.Millisecond, pl.MemberReadRetry.InitialBackoff.Duration())
+				assert.Equal(t, time.Second, pl.MemberReadRetry.MaxBackoff.Duration())
+				assert.Equal(t, 500*time.Millisecond, pl.StatusBatchPeriod.Duration())
+				assert.Equal(t, 5*time.Minute, pl.StatusSafetyRequeue.Duration())
 				assert.Equal(t, "Incremental", pl.DispatcherMode)
 				assert.Equal(t, 4, pl.DispatcherStepSize)
-				assert.Equal(t, 30*time.Second, pl.DispatcherRoundTimeoutDuration())
+				assert.Equal(t, 30*time.Second, pl.DispatcherRoundTimeout.Duration())
 
 				ep := cfg.Endpoint
 				assert.Equal(t, "{{.Name}}.{{.Namespace}}.global.example", ep.GlobalHostTemplate)
@@ -151,11 +151,11 @@ func TestNewMultiClusterConfig_BlockForms_FullBlockParsesAbsentIsZeroBadJsonErro
 				assert.Equal(t, 8, cfg.Routing.Observer.MaxConcurrentReconciles)
 				assert.Equal(t, 16, cfg.Routing.Observer.MaxConcurrentRequests)
 				assert.Equal(t, int64(65536), cfg.Routing.Observer.MaxResponseBytes)
-				assert.Equal(t, time.Second, cfg.Routing.Observer.MinPeriodDuration())
+				assert.Equal(t, time.Second, cfg.Routing.Observer.MinPeriod.Duration())
 				assert.Equal(t, 100, cfg.Routing.Observer.MaxSamples)
 				assert.Equal(t, "Drain", cfg.Routing.Probe.AllFailedPolicy)
 				assert.Equal(t, "test-publisher", cfg.Routing.Publisher.Name)
-				assert.Equal(t, time.Minute, cfg.Routing.Publisher.ResyncIntervalDuration())
+				assert.Equal(t, time.Minute, cfg.Routing.Publisher.ResyncInterval.Duration())
 				assert.Equal(t, map[string]string{"key": "value"}, cfg.Routing.Publisher.Options)
 			},
 		},
@@ -168,10 +168,10 @@ func TestNewMultiClusterConfig_BlockForms_FullBlockParsesAbsentIsZeroBadJsonErro
 				}`,
 			},
 			validate: func(t *testing.T, cfg *MultiClusterConfig) {
-				assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.HealthIntervalDuration())
-				assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.ConnectionGraceDuration())
+				assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.HealthInterval.Duration())
+				assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.ConnectionGrace.Duration())
 				// non-positive parses but is treated as "use the package default".
-				assert.Equal(t, time.Duration(0), cfg.Placement.RequeueIntervalDuration())
+				assert.Equal(t, time.Duration(0), cfg.Placement.RequeueInterval.Duration())
 			},
 		},
 		{
@@ -212,9 +212,9 @@ func TestNewMultiClusterConfig_BlockForms_FullBlockParsesAbsentIsZeroBadJsonErro
 }
 
 // A stated-but-unparsable duration must fail at startup rather than read as
-// "not set": the forgiving accessors would discard the operator's intended
-// value for the life of the process, with the built-in default silently
-// standing in.
+// "not set": the forgiving Duration() read would discard the operator's
+// intended value for the life of the process, with the built-in default
+// silently standing in.
 func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 	cases := []struct {
 		name string
@@ -223,17 +223,17 @@ func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 	}{
 		{
 			name: "duration missing a unit",
-			cfg:  MultiClusterConfig{WorkloadCluster: WorkloadClusterConfig{HealthInterval: "30"}},
+			cfg:  MultiClusterConfig{WorkloadCluster: WorkloadClusterConfig{HealthInterval: durationText("30")}},
 			want: "workloadCluster.healthInterval",
 		},
 		{
 			name: "non-positive duration",
-			cfg:  MultiClusterConfig{Placement: PlacementConfig{GCInterval: "0s"}},
+			cfg:  MultiClusterConfig{Placement: PlacementConfig{GCInterval: durationText("0s")}},
 			want: "placement.gcInterval",
 		},
 		{
 			name: "observation grace missing a unit",
-			cfg:  MultiClusterConfig{Placement: PlacementConfig{ObservationGrace: "90"}},
+			cfg:  MultiClusterConfig{Placement: PlacementConfig{ObservationGrace: durationText("90")}},
 			want: "placement.observationGrace",
 		},
 		{
@@ -253,28 +253,28 @@ func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 		{
 			name: "member read backoffs without retries",
 			cfg: MultiClusterConfig{Placement: PlacementConfig{
-				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 1, InitialBackoff: "1s", MaxBackoff: "2s"},
+				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 1, InitialBackoff: durationText("1s"), MaxBackoff: durationText("2s")},
 			}},
 			want: "placement.memberReadRetry.maxAttempts",
 		},
 		{
 			name: "member read maximum backoff below the initial one",
 			cfg: MultiClusterConfig{Placement: PlacementConfig{
-				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 3, InitialBackoff: "2s", MaxBackoff: "1s"},
+				MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 3, InitialBackoff: durationText("2s"), MaxBackoff: durationText("1s")},
 			}},
 			want: "placement.memberReadRetry.maxBackoff",
 		},
 		{
 			name: "malformed observer minimum period",
 			cfg: MultiClusterConfig{Routing: RoutingConfig{
-				Observer: RoutingObserverConfig{MinPeriod: "1 second"},
+				Observer: RoutingObserverConfig{MinPeriod: durationText("1 second")},
 			}},
 			want: "routing.observer.minPeriod",
 		},
 		{
 			name: "malformed publisher resync interval",
 			cfg: MultiClusterConfig{Routing: RoutingConfig{
-				Publisher: TrafficMapPublisherConfig{ResyncInterval: "every minute"},
+				Publisher: TrafficMapPublisherConfig{ResyncInterval: durationText("every minute")},
 			}},
 			want: "routing.publisher.resyncInterval",
 		},
@@ -289,14 +289,14 @@ func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 			name: "enabled publisher zero resync interval",
 			cfg: MultiClusterConfig{Routing: RoutingConfig{
 				Enabled:   true,
-				Publisher: TrafficMapPublisherConfig{ResyncInterval: "0s"},
+				Publisher: TrafficMapPublisherConfig{ResyncInterval: durationText("0s")},
 			}},
 			want: "routing.publisher.resyncInterval",
 		},
 		{
 			name: "disabled publisher negative resync interval",
 			cfg: MultiClusterConfig{Routing: RoutingConfig{
-				Publisher: TrafficMapPublisherConfig{ResyncInterval: "-1s"},
+				Publisher: TrafficMapPublisherConfig{ResyncInterval: durationText("-1s")},
 			}},
 			want: "routing.publisher.resyncInterval",
 		},
@@ -334,7 +334,7 @@ func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 			name: "endpoint slice settings ignored while disabled",
 			cfg: MultiClusterConfig{Endpoint: EndpointConfig{
 				GatewayBackend: EndpointGatewayBackendConfig{
-					EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{AddressRefreshInterval: "1m"},
+					EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{AddressRefreshInterval: durationText("1m")},
 				},
 			}},
 			want: "endpoint.gatewayBackend.endpointSlices.enabled",
@@ -354,20 +354,20 @@ func TestMultiClusterConfig_ValidateRejectsMalformedKnobs(t *testing.T) {
 func TestMultiClusterConfig_ValidateAcceptsEmptyAndWellFormed(t *testing.T) {
 	require.NoError(t, MultiClusterConfig{}.Validate())
 	require.NoError(t, MultiClusterConfig{Routing: RoutingConfig{
-		Publisher: TrafficMapPublisherConfig{Name: "custom", ResyncInterval: "0s"},
+		Publisher: TrafficMapPublisherConfig{Name: "custom", ResyncInterval: durationText("0s")},
 	}}.Validate(), "disabled cleanup permits an explicit zero publisher resync")
 	require.NoError(t, MultiClusterConfig{Routing: RoutingConfig{
 		Enabled:   true,
-		Publisher: TrafficMapPublisherConfig{ResyncInterval: "1m"},
+		Publisher: TrafficMapPublisherConfig{ResyncInterval: durationText("1m")},
 	}}.Validate(), "enabled routing accepts a positive built-in publisher resync")
 	// Endpoint publishing fully off (no gateway, no port) stays valid: that is
 	// the graceful-degradation default, not a half-finished config.
 	require.NoError(t, MultiClusterConfig{Endpoint: EndpointConfig{}}.Validate())
 	require.NoError(t, MultiClusterConfig{
-		WorkloadCluster: WorkloadClusterConfig{HealthInterval: "30s", EstablishMax: "10m"},
+		WorkloadCluster: WorkloadClusterConfig{HealthInterval: durationText("30s"), EstablishMax: durationText("10m")},
 		Placement: PlacementConfig{
-			GCInterval: "5m", LocalQueue: "gpu-queue", ObservationGrace: "2m",
-			MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 3, InitialBackoff: "500ms", MaxBackoff: "2s"},
+			GCInterval: durationText("5m"), LocalQueue: "gpu-queue", ObservationGrace: durationText("2m"),
+			MemberReadRetry: PlacementMemberReadRetryConfig{MaxAttempts: 3, InitialBackoff: durationText("500ms"), MaxBackoff: durationText("2s")},
 		},
 		Endpoint: EndpointConfig{
 			GlobalGateway: "infra/global-gw",
@@ -380,7 +380,7 @@ func TestMultiClusterConfig_ValidateAcceptsEmptyAndWellFormed(t *testing.T) {
 				},
 				EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{
 					Enabled:                true,
-					AddressRefreshInterval: "1m",
+					AddressRefreshInterval: durationText("1m"),
 				},
 			},
 		},
@@ -388,7 +388,7 @@ func TestMultiClusterConfig_ValidateAcceptsEmptyAndWellFormed(t *testing.T) {
 	for _, gatewayBackend := range []EndpointGatewayBackendConfig{
 		{RewriteHostname: true},
 		{TLS: EndpointGatewayBackendTLSConfig{Enabled: true, WellKnownCACertificates: "System"}},
-		{EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{Enabled: true, AddressRefreshInterval: "1m"}},
+		{EndpointSlices: EndpointGatewayBackendEndpointSliceConfig{Enabled: true, AddressRefreshInterval: durationText("1m")}},
 	} {
 		require.NoError(t, MultiClusterConfig{Endpoint: EndpointConfig{
 			GlobalGateway:  "infra/global-gw",
@@ -399,7 +399,7 @@ func TestMultiClusterConfig_ValidateAcceptsEmptyAndWellFormed(t *testing.T) {
 }
 
 // Loading stays forgiving by contract: a malformed knob must NOT fail the load
-// (the accessor reads it as zero). Validate is the separate, explicit gate the
+// (Duration() reads it as zero). Validate is the separate, explicit gate the
 // composition root applies.
 func TestNewMultiClusterConfig_LoadStaysForgiving_ValidateGates(t *testing.T) {
 	cs := fake.NewSimpleClientset(&v1.ConfigMap{
@@ -408,7 +408,7 @@ func TestNewMultiClusterConfig_LoadStaysForgiving_ValidateGates(t *testing.T) {
 	})
 	cfg, err := NewMultiClusterConfig(cs)
 	require.NoError(t, err, "load must not reject knob values")
-	assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.HealthIntervalDuration())
+	assert.Equal(t, time.Duration(0), cfg.WorkloadCluster.HealthInterval.Duration())
 
 	err = cfg.Validate()
 	require.Error(t, err, "validation must catch what loading tolerates")

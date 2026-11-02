@@ -118,18 +118,37 @@ func TestDetermineDeploymentModes_PerComponentAnnotations(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			engineMode, decoderMode, routerMode, err := DetermineDeploymentModes(tt.engine, tt.decoder, tt.router, nil, nil)
+			modes, err := DetermineRoleDeploymentModes(v1beta1.RoleSpecs{Engine: tt.engine, Decoder: tt.decoder, Router: tt.router}, nil)
 			assert.NoError(t, err)
+			engineMode, decoderMode, routerMode := modeOrRaw(modes, v1beta1.EngineComponent), modeOrRaw(modes, v1beta1.DecoderComponent), modeOrRaw(modes, v1beta1.RouterComponent)
 			assert.Equal(t, tt.wantEngineMode, engineMode, "engine mode mismatch")
 			assert.Equal(t, tt.wantDecoder, decoderMode, "decoder mode mismatch")
 			assert.Equal(t, tt.wantRouter, routerMode, "router mode mismatch")
+
+			// The three-role signature resolves every role the same way.
+			engineMode, decoderMode, routerMode, err = DetermineDeploymentModes(tt.engine, tt.decoder, tt.router, nil, nil)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.wantEngineMode, engineMode, "three-role engine mode mismatch")
+			assert.Equal(t, tt.wantDecoder, decoderMode, "three-role decoder mode mismatch")
+			assert.Equal(t, tt.wantRouter, routerMode, "three-role router mode mismatch")
 		})
 	}
 }
 
 func TestDetermineDeploymentModes_NilEngineRejected(t *testing.T) {
-	_, _, _, err := DetermineDeploymentModes(nil, nil, nil, nil, nil)
+	_, err := DetermineRoleDeploymentModes(v1beta1.RoleSpecs{}, nil)
 	assert.Error(t, err)
+	_, _, _, err = DetermineDeploymentModes(nil, &v1beta1.DecoderSpec{}, nil, nil, nil)
+	assert.Error(t, err)
+}
+
+// modeOrRaw reads a role's mode, RawDeployment for a role the specs do not
+// declare: the mode an undeclared role's dispatch would resolve to.
+func modeOrRaw(modes map[v1beta1.ComponentType]constants.DeploymentModeType, c v1beta1.ComponentType) constants.DeploymentModeType {
+	if mode, ok := modes[c]; ok {
+		return mode
+	}
+	return constants.RawDeployment
 }
 
 // TestDetermineDeploymentModes_SpecDeploymentModeField covers the
@@ -236,112 +255,12 @@ func TestDetermineDeploymentModes_SpecDeploymentModeField(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			engineMode, decoderMode, routerMode, err := DetermineDeploymentModes(tt.engine, tt.decoder, tt.router, nil, tt.specMode)
+			modes, err := DetermineRoleDeploymentModes(v1beta1.RoleSpecs{Engine: tt.engine, Decoder: tt.decoder, Router: tt.router}, tt.specMode)
 			assert.NoError(t, err)
+			engineMode, decoderMode, routerMode := modeOrRaw(modes, v1beta1.EngineComponent), modeOrRaw(modes, v1beta1.DecoderComponent), modeOrRaw(modes, v1beta1.RouterComponent)
 			assert.Equal(t, tt.wantEngineMode, engineMode, "engine mode mismatch")
 			assert.Equal(t, tt.wantDecoder, decoderMode, "decoder mode mismatch")
 			assert.Equal(t, tt.wantRouter, routerMode, "router mode mismatch")
-		})
-	}
-}
-
-func TestIsMultiPodComponent(t *testing.T) {
-	ptrInt := func(i int) *int { return &i }
-	tests := []struct {
-		name      string
-		isvc      *v1beta1.InferenceService
-		component v1beta1.ComponentType
-		want      bool
-	}{
-		{
-			name:      "nil ISVC → false",
-			isvc:      nil,
-			component: v1beta1.EngineComponent,
-			want:      false,
-		},
-		{
-			name: "Engine without Worker → single-pod",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}},
-			},
-			component: v1beta1.EngineComponent,
-			want:      false,
-		},
-		{
-			name: "Engine.Worker present but Size nil → multi-pod (size resolves to one worker at reconcile)",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{
-					Worker: &v1beta1.WorkerSpec{},
-				}},
-			},
-			component: v1beta1.EngineComponent,
-			want:      true,
-		},
-		{
-			name: "Engine.Worker.Size = 0 → single-pod (validator should reject before reconcile)",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{
-					Worker: &v1beta1.WorkerSpec{Size: ptrInt(0)},
-				}},
-			},
-			component: v1beta1.EngineComponent,
-			want:      false,
-		},
-		{
-			name: "Engine.Worker.Size = 1 → multi-pod (Leader + 1 worker = 2 pods)",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{
-					Worker: &v1beta1.WorkerSpec{Size: ptrInt(1)},
-				}},
-			},
-			component: v1beta1.EngineComponent,
-			want:      true,
-		},
-		{
-			name: "Engine.Worker.Size = 2 → multi-pod (3 pods)",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{
-					Worker: &v1beta1.WorkerSpec{Size: ptrInt(2)},
-				}},
-			},
-			component: v1beta1.EngineComponent,
-			want:      true,
-		},
-		{
-			name: "Decoder.Worker.Size = 3 → multi-pod decoder",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{Decoder: &v1beta1.DecoderSpec{
-					Worker: &v1beta1.WorkerSpec{Size: ptrInt(3)},
-				}},
-			},
-			component: v1beta1.DecoderComponent,
-			want:      true,
-		},
-		{
-			name: "Router is always single-pod regardless of Engine.Worker.Size",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{
-					Engine: &v1beta1.EngineSpec{Worker: &v1beta1.WorkerSpec{Size: ptrInt(4)}},
-					Router: &v1beta1.RouterSpec{},
-				},
-			},
-			component: v1beta1.RouterComponent,
-			want:      false,
-		},
-		{
-			name: "Decoder absent → false (component asked is Decoder)",
-			isvc: &v1beta1.InferenceService{
-				Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{
-					Worker: &v1beta1.WorkerSpec{Size: ptrInt(2)},
-				}},
-			},
-			component: v1beta1.DecoderComponent,
-			want:      false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, IsMultiPodComponent(tt.isvc, tt.component))
 		})
 	}
 }
@@ -424,18 +343,4 @@ func TestInferenceServiceDeploymentMode(t *testing.T) {
 			assert.Equal(t, tc.want, InferenceServiceDeploymentMode(tc.isvc, tc.def))
 		})
 	}
-}
-
-func TestIsMultiPodComponent_UnsetSize(t *testing.T) {
-	zero := 0
-	engine := func(worker *v1beta1.WorkerSpec) *v1beta1.InferenceService {
-		return &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{
-			Engine: &v1beta1.EngineSpec{Leader: &v1beta1.LeaderSpec{}, Worker: worker},
-		}}
-	}
-	assert.True(t, IsMultiPodComponent(engine(&v1beta1.WorkerSpec{}), v1beta1.EngineComponent),
-		"a declared worker with an unset size resolves to one worker, so the Component is multi-pod")
-	assert.False(t, IsMultiPodComponent(engine(&v1beta1.WorkerSpec{Size: &zero}), v1beta1.EngineComponent),
-		"an explicit size of 0 spawns no workers")
-	assert.False(t, IsMultiPodComponent(engine(nil), v1beta1.EngineComponent))
 }

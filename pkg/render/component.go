@@ -27,11 +27,7 @@ func (r Rendered) Runners() []v1beta1.Runner {
 
 // Specs are the merged role specs a service declares; a nil entry means the
 // service has no such role.
-type Specs struct {
-	Engine  *v1beta1.EngineSpec
-	Decoder *v1beta1.DecoderSpec
-	Router  *v1beta1.RouterSpec
-}
+type Specs = v1beta1.RoleSpecs
 
 // ComponentName is the object name of a component: the service name and the
 // role, joined by a dash. Pods, Services and projected replicas derive from it.
@@ -40,24 +36,13 @@ func ComponentName(service *v1beta1.InferenceService, c v1beta1.ComponentType) s
 }
 
 // RuntimeDeclaresPiece reports whether a runtime declares the role spec for
-// component c: its engineConfig, decoderConfig or routerConfig. It is false
-// when the runtime declares no such role, or c is not a role, and a replica
-// of that component cannot render from the runtime. Admission and the
-// replica controller share this check so both mean the same thing by "has
-// the piece".
+// component c, its piece (engineConfig for the engine, and so on). It is
+// false when the runtime declares no such role, or c is not a role, and a
+// replica of that component cannot render from the runtime. Admission and
+// the replica controller share this check so both mean the same thing by
+// "has the piece".
 func RuntimeDeclaresPiece(rt *v1beta1.ServingRuntimeSpec, c v1beta1.ComponentType) bool {
-	if rt == nil {
-		return false
-	}
-	switch c {
-	case v1beta1.EngineComponent:
-		return rt.EngineConfig != nil
-	case v1beta1.DecoderComponent:
-		return rt.DecoderConfig != nil
-	case v1beta1.RouterComponent:
-		return rt.RouterConfig != nil
-	}
-	return false
+	return v1beta1.PieceOf(rt, c) != nil
 }
 
 // RenderComponent renders the role c of service from its merged spec.
@@ -67,6 +52,8 @@ func RenderComponent(ctx context.Context, p *Piece, service *v1beta1.InferenceSe
 		return RenderEngine(ctx, p, service, specs.Engine)
 	case v1beta1.DecoderComponent:
 		return RenderDecoder(ctx, p, service, specs.Decoder)
+	case v1beta1.EncoderComponent:
+		return RenderEncoder(ctx, p, service, specs.Encoder)
 	case v1beta1.RouterComponent:
 		return RenderRouter(ctx, p, service, specs.Router)
 	}

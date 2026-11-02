@@ -102,34 +102,23 @@ func (r *IngressReconciler) ReconcileWithDeploymentMode(ctx context.Context, isv
 // Reconcile orchestrates the ingress reconciliation using the appropriate strategy
 func (r *IngressReconciler) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) error {
 	// Determine deployment mode for ingress strategy selection
-	deploymentMode := r.getDeploymentMode(isvc, isvc.Spec.Engine, isvc.Spec.Decoder, isvc.Spec.Router)
+	deploymentMode := r.getDeploymentMode(isvc)
 
 	return r.ReconcileWithDeploymentMode(ctx, isvc, deploymentMode)
 }
 
-// getDeploymentMode determines deployment mode using new spec-based logic
-func (r *IngressReconciler) getDeploymentMode(isvc *v1beta1.InferenceService, engine *v1beta1.EngineSpec, decoder *v1beta1.DecoderSpec, router *v1beta1.RouterSpec) constants.DeploymentModeType {
-	// Determine entrypoint component for deployment mode selection
-	entrypointComponent := isvcutils.DetermineEntrypointComponent(isvc)
-
-	// Determine deployment modes for all components
-	engineMode, decoderMode, routerMode, err := isvcutils.DetermineDeploymentModes(engine, decoder, router, nil, isvc.Spec.DeploymentMode)
+// getDeploymentMode returns the deployment mode of the service's entrypoint
+// component, read from the service's own role blocks.
+func (r *IngressReconciler) getDeploymentMode(isvc *v1beta1.InferenceService) constants.DeploymentModeType {
+	modes, err := isvcutils.DetermineRoleDeploymentModes(v1beta1.ServiceRoles(&isvc.Spec), isvc.Spec.DeploymentMode)
 	if err != nil {
 		mainLog.Error(err, "Failed to determine deployment modes, falling back to RawDeployment", "isvc", isvc.Name)
 		return constants.RawDeployment
 	}
-
-	// Return the deployment mode of the entrypoint component
-	switch entrypointComponent {
-	case v1beta1.RouterComponent:
-		return routerMode
-	case v1beta1.EngineComponent:
-		return engineMode
-	case v1beta1.DecoderComponent:
-		return decoderMode
-	default:
-		return engineMode
+	if mode, ok := modes[isvcutils.DetermineEntrypointComponent(isvc)]; ok {
+		return mode
 	}
+	return modes[v1beta1.EngineComponent]
 }
 
 // getStrategy returns the appropriate strategy for the deployment mode

@@ -28,10 +28,10 @@ func TestReserve_EachMemberLands_DrainsOneSlotUntilDomainFrees(t *testing.T) {
 		pgReader:    fakeReader{"team/pf": {min: 2, topo: "clique"}},
 	}
 	// PreFilter would have assigned pf into domain d over 2 free nodes, reserving 2.
-	g.assignments.Choose("team/pf", topology.FreeByDomain{"d": 2}, 2)
+	choose(g.assignments, "team/pf", topology.FreeByDomain{"d": 2}, 2)
 	_, token, _, _ := g.assignments.GetOwned("team/pf")
 	// A second gang can't fit: d is fully reserved (2 raw - 2 reserved = 0).
-	if _, ok := g.assignments.Choose("team/other", topology.FreeByDomain{"d": 2}, 1); ok {
+	if _, ok := choose(g.assignments, "team/other", topology.FreeByDomain{"d": 2}, 1); ok {
 		t.Fatal("precondition: d should be fully reserved before Reserve")
 	}
 
@@ -41,13 +41,13 @@ func TestReserve_EachMemberLands_DrainsOneSlotUntilDomainFrees(t *testing.T) {
 	if s := g.Reserve(context.Background(), state, gangPod("team", "pf"), "node1"); !s.IsSuccess() {
 		t.Fatalf("Reserve = %v, want Success", s)
 	}
-	if _, ok := g.assignments.Choose("team/other", topology.FreeByDomain{"d": 2}, 1); ok {
+	if _, ok := choose(g.assignments, "team/other", topology.FreeByDomain{"d": 2}, 1); ok {
 		t.Fatal("another gang must remain blocked while any reservation is outstanding")
 	}
 	if s := g.Reserve(context.Background(), state, gangPod("team", "pf"), "node2"); !s.IsSuccess() {
 		t.Fatalf("second Reserve = %v, want Success", s)
 	}
-	if d, ok := g.assignments.Choose("team/other", topology.FreeByDomain{"d": 2}, 1); !ok || d != "d" {
+	if d, ok := choose(g.assignments, "team/other", topology.FreeByDomain{"d": 2}, 1); !ok || d != "d" {
 		t.Fatalf("after reservation drains, other Choose = %q,%v want d,true", d, ok)
 	}
 }
@@ -63,7 +63,7 @@ func TestUnreserve_OneMember_ReleasesAssignmentAndRejectsOwnWaitingSiblings(t *t
 		assignments: placement.New(),
 		pgReader:    fakeReader{"team/pf": {min: 3, topo: "clique"}},
 	}
-	g.assignments.Set("team/pf", "d1")
+	g.assignments.Set(placement.Gang{Group: "team/pf"}, "d1", 0, nil)
 	_, token, _, _ := g.assignments.GetOwned("team/pf")
 	g.rememberAttempt(sibling.pod, token)
 	state := newCycleState()
@@ -71,7 +71,7 @@ func TestUnreserve_OneMember_ReleasesAssignmentAndRejectsOwnWaitingSiblings(t *t
 
 	g.Unreserve(context.Background(), state, gangPod("team", "pf"), "node1")
 
-	if _, assigned := g.assignments.Get("team/pf"); assigned {
+	if _, assigned := assignedDomain(g.assignments, "team/pf"); assigned {
 		t.Fatal("assignment should be released so the retry re-plans")
 	}
 	if !sibling.rejected {
@@ -106,26 +106,26 @@ func TestUnreserve_PodGroupDeleted_StillReleasesAssignment(t *testing.T) {
 		assignments: placement.New(),
 		pgReader:    fakeReader{}, // empty: the PodGroup is gone
 	}
-	g.assignments.Set("team/pf", "d1") // assigned before the PodGroup vanished
+	g.assignments.Set(placement.Gang{Group: "team/pf"}, "d1", 0, nil) // assigned before the PodGroup vanished
 	_, token, _, _ := g.assignments.GetOwned("team/pf")
 	state := newCycleState()
 	writeAssignment(state, "d1", gangInfo{key: "team/pf", topologyKey: "clique"}, token)
 
 	g.Unreserve(context.Background(), state, gangPod("team", "pf"), "node1")
 
-	if _, assigned := g.assignments.Get("team/pf"); assigned {
+	if _, assigned := assignedDomain(g.assignments, "team/pf"); assigned {
 		t.Fatal("assignment must be released even though the PodGroup is gone (else it leaks)")
 	}
 }
 
 func TestUnreserve_FromOlderAttempt_LeavesRetryAssignmentAndWaiter(t *testing.T) {
 	assignments := placement.New()
-	_, oldToken, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, oldToken, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 1}, map[string][]string{"a": {"a1"}}, 1)
-	if !ok || !assignments.ReleaseIf("team/pf", oldToken, nil) {
+	if !ok || !assignments.Release("team/pf", oldToken, nil) {
 		t.Fatal("failed to establish and release old attempt")
 	}
-	_, newToken, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, newToken, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"b": 1}, map[string][]string{"b": {"b1"}}, 1)
 	if !ok {
 		t.Fatal("failed to establish retry")
@@ -149,7 +149,7 @@ func TestUnreserve_FromOlderAttempt_LeavesRetryAssignmentAndWaiter(t *testing.T)
 
 func TestReserve_ReservationDrains_ActivatesStandalonePodItBlocked(t *testing.T) {
 	assignments := placement.New()
-	_, token, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, token, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 1}, map[string][]string{"a": {"a1"}}, 1)
 	if !ok {
 		t.Fatal("failed to reserve domain")
@@ -173,7 +173,7 @@ func TestReserve_ReservationDrains_ActivatesStandalonePodItBlocked(t *testing.T)
 
 func TestPostBind_MemberBound_ClearsAttemptKeepsAssignment(t *testing.T) {
 	assignments := placement.New()
-	_, token, ok := assignments.ChooseInTopologyOnNodes("team/pf", testKey,
+	_, token, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 2}, map[string][]string{"a": {"a1", "a2"}}, 2)
 	if !ok {
 		t.Fatal("failed to establish gang assignment")

@@ -14,8 +14,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestReconcileCapacityInitialPlacement(t *testing.T) {
@@ -194,7 +196,7 @@ func TestCapacityHoldPreservesAcceptedAllocation(t *testing.T) {
 // readable pass reports the acknowledgement it observes.
 func TestCapacityHoldKeepsAcknowledgedPlan(t *testing.T) {
 	f := newCapacityProviderFixture(t)
-	bf := &backendFixture{source: f.source, workers: f.workers, reconciler: f.r}
+	bf := &backendFixture{t: t, source: f.source, workers: f.workers, reconciler: f.r}
 	floors := map[string]int32{"member-a": 8, "member-b": 4}
 	settled := bf.reconcile(t)
 	acknowledged := func(source *v1beta1.InferenceService) bool {
@@ -261,12 +263,12 @@ func TestCapacityHoldKeepsAcknowledgedPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := f.r.Client
-	f.r.Client = interceptor.NewClient(writer.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+	f.r.Client = fakeclient.Wrap(t, writer.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 		if written, ok := obj.(*v1beta1.InferenceService); ok && written.Status.Placement != nil && written.Status.Placement.Plan != nil && written.Status.Placement.Plan.ID != accepted.ID {
 			return errors.New("plan write rejected")
 		}
 		return c.SubResource(name).Update(ctx, obj, opts...)
-	}})
+	}}))
 	assertHeld(t, bf.reconcile(t), "PlanNotPersisted")
 
 	f.r.Client = writer

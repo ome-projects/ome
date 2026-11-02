@@ -203,6 +203,15 @@ func ContainerWaiting(reason string) PodOption {
 	}
 }
 
+// CreateReservedMessage is the message a container runtime writes on a
+// CreateContainerError, in the shape it writes it, when the kubelet's retry
+// finds the container name still reserved by a first create the runtime
+// has not finished.
+const CreateReservedMessage = `failed to reserve container name "ome-container_example-model-engine-0-default-0_team-a_00000000-0000-4000-8000-000000000001_0"; ` +
+	`check if another CreateContainer request is in progress: ` +
+	`name "ome-container_example-model-engine-0-default-0_team-a_00000000-0000-4000-8000-000000000001_0" ` +
+	`is reserved for "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"`
+
 // ContainersUnready is a pod whose ContainersReady reads False while
 // PodReady and the gate still read True, a shape no kubelet writes.
 func ContainersUnready(pod *corev1.Pod) {

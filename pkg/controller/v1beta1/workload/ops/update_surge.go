@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -201,6 +202,26 @@ func podHasWaitingReason(pod *corev1.Pod, reason string) bool {
 	return false
 }
 
+// podWaitsInTerminalReason reports whether a container of the pod,
+// regular or init, waits in a kubelet reason it cannot get itself out of
+// (workload.IsTerminalWaitingReason): the pod still shows the failure
+// that ended an attempt on it. The reason alone decides, so a replacement
+// whose create the runtime never finished is rebuilt too, not waited on
+// by a second attempt.
+func podWaitsInTerminalReason(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
+		for _, row := range statuses {
+			if row.State.Waiting != nil && workload.IsTerminalWaitingReason(row.State.Waiting.Reason) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // surgeUpdate runs the SurgeThenDrain roll for one Instance. A multi-pod
 // Instance replaces its whole gang at a fresh Instance index
 // (gangSurgeUpdate). A single-pod Instance runs the phases below in a
@@ -209,8 +230,9 @@ func podHasWaitingReason(pod *corev1.Pod, reason string) bool {
 //
 //	refuse a pod at neither slot; remove a failed replacement from a node
 //	the deadline decision excluded; redirect when the roll target moved;
-//	open the attempt; free the replacement's name; create the replacement;
-//	wait for it; drain the source; delete the source; promote.
+//	open the attempt; remove the replacement the previous attempt failed
+//	on; free the replacement's name; create the replacement; wait for it;
+//	drain the source; delete the source; promote.
 //
 // Invariants:
 //   - the serving count never drops below the desired count: the
@@ -223,7 +245,10 @@ func podHasWaitingReason(pod *corev1.Pod, reason string) bool {
 //     A spec change at the first step ends the attempt while the source
 //     still serves, unless the pairing gate keeps a serving replacement;
 //     past that step the attempt promotes onto its own revision and the
-//     next pass rolls on toward the newer target.
+//     next pass rolls on toward the newer target;
+//   - every attempt builds its own replacement: a pod the previous attempt
+//     failed on is removed before this one waits on anything, so one pod's
+//     failure counts once on the retry schedule.
 func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision, pods []*corev1.Pod) (bool, error) {
 	if inst.TotalPods() > 1 {
 		return gangSurgeUpdate(ctx, deps, input, plan, inst, target)
@@ -238,6 +263,7 @@ func surgeUpdate(ctx context.Context, deps workload.Deps, input workload.Reconci
 		roll.removeRefusedReplacement,
 		roll.redirectWhenTargetMoved,
 		roll.openAttempt,
+		roll.removeReplacementOfTheEndedAttempt,
 		roll.freeReplacementName,
 		roll.createReplacement,
 		roll.waitForReplacement,
@@ -284,6 +310,11 @@ type singlePodSurge struct {
 	// attemptRevision is the revision this attempt drives to, set when the
 	// attempt opens: the one an open attempt recorded, else the roll target.
 	attemptRevision string
+	// attemptOpenedAt is when the attempt this pass drives opened, read
+	// when the attempt opens: the recorded start of an attempt already
+	// open, else this pass. A replacement built before it is a previous
+	// attempt's.
+	attemptOpenedAt time.Time
 	// keptForPairing is the pairing gate's reason for keeping a serving
 	// replacement whose revision the roll target moved past; empty when the
 	// gate was not asked or let it go.
@@ -457,7 +488,12 @@ func (s *singlePodSurge) openAttempt(ctx context.Context) (bool, error) {
 	// A pod at the replacement slot that runs another revision is a
 	// leftover to drain, not the replacement (reclassifyByRevisionHash).
 	s.replacementPods, s.sourcePods = reclassifyByRevisionHash(s.replacementPods, s.sourcePods, query.RevisionFromName(s.attemptRevision))
-	wasNotSurging := !surgeClaim(s.input.ObservedState.Instance(s.inst.Index))
+	observed := s.input.ObservedState.Instance(s.inst.Index)
+	wasNotSurging := !surgeClaim(observed)
+	s.attemptOpenedAt = s.input.Now()
+	if !wasNotSurging && observed.Phase != workload.InstancePhaseFailed {
+		s.attemptOpenedAt = observed.Operation.StartedAt.Time
+	}
 	if err := status.StampSurging(ctx, s.input, s.inst.Index, s.attemptRevision, s.plan.UpdateStrategy.Type, s.plan.InstanceReadyTimeout); err != nil {
 		return false, fmt.Errorf("stamp surge step (instance=%d): %w", s.inst.Index, err)
 	}
@@ -467,6 +503,37 @@ func (s *singlePodSurge) openAttempt(ctx context.Context) (bool, error) {
 			workload.InstanceKey(s.input.Key.Component, s.inst.Index), s.attemptRevision, s.replacementOrdinal)
 	}
 	return false, nil
+}
+
+// removeReplacementOfTheEndedAttempt deletes the replacement a previous
+// attempt failed on once this attempt has opened over it: a pod at the
+// replacement slot built before this attempt opened and still waiting in
+// a terminal kubelet reason is the one that failed, and a retry builds
+// its own replacement, so one pod's failure counts once on the retry
+// schedule instead of once per attempt that finds it standing. A pod
+// that has started, or waits on nothing terminal, is left to come up
+// whichever attempt built it; one in a terminal phase is the next
+// phase's to remove; one already on its way out is waited for. The pass
+// ends with the delete, and the create waits for the name to be free.
+func (s *singlePodSurge) removeReplacementOfTheEndedAttempt(ctx context.Context) (bool, error) {
+	openedAt := s.attemptOpenedAt.Truncate(time.Second)
+	var failedOn []*corev1.Pod
+	for _, pod := range s.replacementPods {
+		if pod == nil || pod.DeletionTimestamp != nil || query.IsTerminalPod(pod) ||
+			pod.CreationTimestamp.IsZero() || !pod.CreationTimestamp.Time.Before(openedAt) {
+			continue
+		}
+		if podWaitsInTerminalReason(pod) {
+			failedOn = append(failedOn, pod)
+		}
+	}
+	if len(failedOn) == 0 {
+		return false, nil
+	}
+	if !s.expectationsSatisfied() {
+		return true, nil
+	}
+	return true, s.deletePods(ctx, failedOn, "replacement of the ended attempt", s.removedReplacementGrace)
 }
 
 // freeReplacementName stops the pass while the replacement's pod name is

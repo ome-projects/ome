@@ -26,6 +26,7 @@ func TestComponentTypeRoundtrip(t *testing.T) {
 		v1beta1.RouterComponent,
 		v1beta1.EngineComponent,
 		v1beta1.DecoderComponent,
+		v1beta1.EncoderComponent,
 	}
 	for _, in := range cases {
 		t.Run(string(in), func(t *testing.T) {
@@ -101,6 +102,7 @@ func TestComponentTypeRoundtripReverse(t *testing.T) {
 		workloadtypes.ComponentRouter,
 		workloadtypes.ComponentEngine,
 		workloadtypes.ComponentDecoder,
+		workloadtypes.ComponentEncoder,
 	}
 	for _, in := range cases {
 		t.Run(string(in), func(t *testing.T) {
@@ -213,21 +215,23 @@ func TestInstanceOperationRoundtrip_AllFieldsPopulated(t *testing.T) {
 	started := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
 	progress := metav1.NewTime(time.Date(2026, 1, 1, 12, 5, 0, 0, time.UTC))
 	deadline := metav1.NewTime(time.Date(2026, 1, 1, 12, 30, 0, 0, time.UTC))
+	placementWait := metav1.NewTime(time.Date(2026, 1, 1, 12, 10, 0, 0, time.UTC))
 	surge := int32(7)
 	in := &v1beta1.InstanceOperation{
-		ID:              "op-abc-123",
-		Type:            v1beta1.InstanceOperationMigrate,
-		Step:            "Drain",
-		StartedAt:       started,
-		LastProgressAt:  progress,
-		Deadline:        deadline,
-		RetryCount:      3,
-		TargetRevision:  "rev-7",
-		Reason:          "node-fragmentation",
-		SurgeIndex:      &surge,
-		FromNode:        "node-a",
-		HintTargetNodes: []string{"node-x", "node-y"},
-		RequestUUID:     "uuid-deadbeef",
+		ID:                 "op-abc-123",
+		Type:               v1beta1.InstanceOperationMigrate,
+		Step:               "Drain",
+		StartedAt:          started,
+		LastProgressAt:     progress,
+		Deadline:           deadline,
+		RetryCount:         3,
+		TargetRevision:     "rev-7",
+		Reason:             "node-fragmentation",
+		PlacementWaitSince: &placementWait,
+		SurgeIndex:         &surge,
+		FromNode:           "node-a",
+		HintTargetNodes:    []string{"node-x", "node-y"},
+		RequestUUID:        "uuid-deadbeef",
 	}
 	got := InstanceOperationFromWorkload(InstanceOperationToWorkload(in))
 	if diff := cmp.Diff(in, got); diff != "" {
@@ -237,6 +241,9 @@ func TestInstanceOperationRoundtrip_AllFieldsPopulated(t *testing.T) {
 	// affect the input.
 	if got.SurgeIndex == in.SurgeIndex {
 		t.Fatalf("SurgeIndex pointer was not deep-copied")
+	}
+	if got.PlacementWaitSince == in.PlacementWaitSince {
+		t.Fatalf("PlacementWaitSince pointer was not deep-copied")
 	}
 	if len(got.HintTargetNodes) > 0 && len(in.HintTargetNodes) > 0 {
 		got.HintTargetNodes[0] = "mutated"

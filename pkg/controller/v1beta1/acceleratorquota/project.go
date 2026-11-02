@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -152,32 +153,11 @@ func (r *Reconciler) project(ctx context.Context, built *tree.Tree,
 		log.V(1).Info("no member is connected, so nothing is projected this pass")
 		return view, nil
 	}
-
-	// Every member the admin registered, not merely the ones answering. A
-	// proportional split divides by the fleet's capacity, so a member that has
-	// dropped out does not simply lose its turn — its capacity leaves the basis
-	// and every surviving member's share grows to fill the gap. Meanwhile the
-	// absent member still holds the projection it last received, so the fleet
-	// would have handed out more than the admin authorized, and the excess would
-	// only become visible when the member came back.
-	//
-	// So the pass holds instead. Freezing keeps every projection exactly where
-	// it is, which is wrong by at most the change an admin just made; rebalancing
-	// is wrong by the whole of the missing member's share. An operator resolves
-	// it by fixing the member or deregistering it, and either way says what they
-	// meant.
 	registered, err := r.registeredClusters(ctx)
 	if err != nil {
 		return view, fmt.Errorf("reading the cluster registry: %w", err)
 	}
-	if absent := missing(registered, connected); len(absent) > 0 {
-		log.Info("holding every projection: part of the fleet is unreachable",
-			"unreachable", absent, "connected", connected)
-		reason := fmt.Sprintf(
-			"projections held: %v unreachable, and re-splitting without them would over-grant the fleet", absent)
-		for _, node := range built.Nodes() {
-			view.say(node.Name(), registered, reason)
-		}
+	if holdWhenFleetIncomplete(log, built, registered, connected, view) {
 		return view, nil
 	}
 	// Members own their roots, so no projected root is read back to replace a
@@ -202,41 +182,79 @@ func (r *Reconciler) project(ctx context.Context, built *tree.Tree,
 	}, projection.ResolveOptions{
 		DefaultPolicy: r.Project.DefaultPolicy,
 	})
-
 	for node, reason := range resolution.Unresolved {
 		view.say(node, registered, reason)
 	}
+	withholdHeldAllowances(resolution.ByCluster, frozen, registered, view)
+	held := heldNodes(built, frozen, resolution.Unresolved)
+	return view, r.projectOntoMembers(ctx, built, connected, resolution.ByCluster, held, view)
+}
 
-	// A frozen node keeps whatever it last received. Withholding this pass's
-	// copy IS the freeze: the member's existing projection is left exactly as it
-	// is, rather than being rewritten from a tree the hub has already judged
-	// unsound. Dropping the leaf also drops any ancestor only it needed, since
-	// the matched set is derived from the leaves that travel.
-	for cluster, allowances := range resolution.ByCluster {
+// holdWhenFleetIncomplete keeps every projection where it is while a registered
+// member is unreachable, says so on every node, and reports whether it held.
+//
+// The check is against every member the admin registered, not merely the ones
+// answering. A proportional split divides by the fleet's capacity, so a member
+// that has dropped out does not simply lose its turn: its capacity leaves the
+// basis and every surviving member's share grows to fill the gap. Meanwhile the
+// absent member still holds the projection it last received, so the fleet
+// would have handed out more than the admin authorized, and the excess would
+// only become visible when the member came back.
+//
+// Holding is wrong by at most the change an admin just made; rebalancing is
+// wrong by the whole of the missing member's share. An operator resolves it by
+// fixing the member or deregistering it, and either way says what they meant.
+func holdWhenFleetIncomplete(log logr.Logger, built *tree.Tree, registered, connected []string, view fleetView) bool {
+	absent := missing(registered, connected)
+	if len(absent) == 0 {
+		return false
+	}
+	log.Info("holding every projection: part of the fleet is unreachable",
+		"unreachable", absent, "connected", connected)
+	reason := fmt.Sprintf(
+		"projections held: %v unreachable, and re-splitting without them would over-grant the fleet", absent)
+	for _, node := range built.Nodes() {
+		view.say(node.Name(), registered, reason)
+	}
+	return true
+}
+
+// withholdHeldAllowances removes this pass's copy of every node a violation
+// holds from the members' allowances and says so on the node. Withholding IS
+// the hold: the member's existing projection is left exactly as it is, rather
+// than being rewritten from a tree the hub has already judged unsound. Dropping
+// the leaf also drops any ancestor only it needed, since the matched set is
+// derived from the leaves that travel.
+func withholdHeldAllowances(byCluster map[string][]projection.Allowance, heldBy map[string]tree.Violation,
+	registered []string, view fleetView,
+) {
+	for cluster, allowances := range byCluster {
 		kept := allowances[:0]
 		for _, a := range allowances {
-			if v, held := frozen[a.Node]; held {
+			if v, held := heldBy[a.Node]; held {
 				view.say(a.Node, registered, fmt.Sprintf("projection held at its last value: %s", v.Message))
 				continue
 			}
 			kept = append(kept, a)
 		}
-		resolution.ByCluster[cluster] = kept
+		byCluster[cluster] = kept
 	}
+}
 
-	held := heldNodes(built, frozen, resolution.Unresolved)
+// projectOntoMembers applies each connected member's copy in name order and
+// carries on past a member that fails: the next member's quota does not depend
+// on this one's write having landed. The failures come back joined, one per
+// member.
+func (r *Reconciler) projectOntoMembers(ctx context.Context, built *tree.Tree, connected []string,
+	byCluster map[string][]projection.Allowance, held sets.Set[string], view fleetView,
+) error {
 	var errs []error
 	for _, cluster := range connected {
-		if err := r.projectOnto(ctx, built, cluster, resolution.ByCluster[cluster], held, view); err != nil {
-			// Recorded per cluster and carried on. The next member's quota does
-			// not depend on this one's write having landed.
+		if err := r.projectOnto(ctx, built, cluster, byCluster[cluster], held, view); err != nil {
 			errs = append(errs, fmt.Errorf("cluster %s: %w", cluster, err))
 		}
 	}
-	if len(errs) > 0 {
-		return view, errors.Join(errs...)
-	}
-	return view, nil
+	return errors.Join(errs...)
 }
 
 // registeredClusters is every member an admin has registered, whatever its

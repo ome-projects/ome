@@ -7,10 +7,10 @@ import (
 	"testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // The pictures below are a prefill/decode service of 2 engines and 6
@@ -58,7 +58,7 @@ func askPairing(t *testing.T, isvc *v1beta1.InferenceService, objs []client.Obje
 // askStack asks the whole gate stack about the same start.
 func askStack(t *testing.T, isvc *v1beta1.InferenceService, objs []client.Object, component v1beta1.ComponentType, hash string) (bool, v1beta1.RolloutHoldGate, string) {
 	t.Helper()
-	c := fake.NewClientBuilder().WithScheme(pairingScheme(t)).WithObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	return EvaluateUpdateGate(context.Background(), c, isvc, component, "llama-"+string(component)+"-"+hash, forwardTarget(isvc, component), nil, GroupDefaults{},
 		workloadtypes.UpdateStrategyRecreatePod, 0, 0)
 }

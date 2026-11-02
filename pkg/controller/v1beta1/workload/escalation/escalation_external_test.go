@@ -2,7 +2,6 @@ package escalation_test
 
 import (
 	"context"
-	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,14 +13,15 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/ome/pkg/constants"
+
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
-	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -30,63 +30,6 @@ import (
 // whose blamed pod set is actually serving (the stale-bookkeeping /
 // wedged-Operation shape), while still firing identically for a
 // genuinely wedged pod set.
-
-// servingPod builds a pod that is ContainersReady AND carries the
-// ome.io/serving readiness gate — a pod in the load-balancer rotation.
-func servingPod(name string) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              name,
-			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Hour)),
-		},
-		Status: corev1.PodStatus{
-			Conditions: []corev1.PodCondition{
-				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
-				{Type: "ome.io/serving", Status: corev1.ConditionTrue},
-				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
-			},
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name:  "main",
-				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
-			}},
-		},
-	}
-}
-
-// escalationFixture wires a ReconcileInput whose MutateInstance applies
-// the callback to the local store and whose WarnInstanceFailed /
-// MutateRetryBlock record their calls.
-type escalationRecorder struct {
-	store  []workloadtypes.InstanceStatus
-	warns  []string
-	blocks []workloadtypes.RetryBlock
-}
-
-func escalationFixture(insts []workloadtypes.InstanceStatus) (workloadtypes.ReconcileInput, *escalationRecorder) {
-	rec := &escalationRecorder{store: append([]workloadtypes.InstanceStatus(nil), insts...)}
-	input := workloadtypes.ReconcileInput{
-		MutateInstance: func(_ context.Context, idx int32, mutate func(*workloadtypes.InstanceStatus) bool) error {
-			for i := range rec.store {
-				if rec.store[i].Index == idx {
-					mutate(&rec.store[i])
-					return nil
-				}
-			}
-			return nil
-		},
-		MutateRetryBlock: func(_ context.Context, rev string, mutate func(*workloadtypes.RetryBlock) workloadtypes.RetryBlockDisposition) error {
-			b := workloadtypes.RetryBlock{TargetRevision: rev}
-			mutate(&b)
-			rec.blocks = append(rec.blocks, b)
-			return nil
-		},
-		WarnInstanceFailed: func(_ int32, _, reason string) {
-			rec.warns = append(rec.warns, reason)
-		},
-	}
-	input.ObservedState.InstanceStatuses = append([]workloadtypes.InstanceStatus(nil), insts...)
-	return input, rec
-}
 
 // TestEscalation_DeadlineElapsedButServing_NoFailedStamp pins the
 // Failed-while-serving guard: an Instance whose Operation.Deadline has
@@ -261,6 +204,198 @@ func TestEscalation_SinglePodSurgeRelocatesTheFailedTarget(t *testing.T) {
 	}
 	if len(rec.blockCalls) != 0 {
 		t.Fatalf("RetryBlocks: got %+v want none for ambiguous node-local failure", rec.blockCalls)
+	}
+}
+
+// createAttemptRevision is the revision the Create attempts below build.
+const createAttemptRevision = "own-engine-targethash"
+
+// createAttempt is a single-pod Create attempt at createAttemptRevision and
+// its pod on node-a, created when the attempt opened and waiting in
+// CreateContainerError. Migration is automatic with relocation budget left
+// and the revision has a retry policy, so a failed attempt either steers
+// its rebuild off node-a (the revision serves on a sibling) or counts as a
+// failed attempt of the revision (it serves nowhere).
+type createAttempt struct {
+	fc    *clocktesting.FakeClock
+	insts []workloadtypes.InstanceStatus
+	input workloadtypes.ReconcileInput
+	rec   *dispositionRecorders
+	c     client.Client
+	pod   *corev1.Pod
+}
+
+func newCreateAttempt(t *testing.T, now, started, deadline time.Time, message string, served bool) *createAttempt {
+	t.Helper()
+	a := &createAttempt{fc: clocktesting.NewFakeClock(now), c: fakeLedgerClient(t)}
+	a.insts = []workloadtypes.InstanceStatus{{
+		Index:    0,
+		Phase:    workloadtypes.InstancePhaseCreating,
+		PodCount: 1,
+		Operation: &workloadtypes.InstanceOperation{
+			Type:           workloadtypes.InstanceOperationCreate,
+			Step:           status.CreateStepCreatePods,
+			TargetRevision: createAttemptRevision,
+			StartedAt:      metav1.NewTime(started),
+			Deadline:       metav1.NewTime(deadline),
+		},
+	}}
+	if served {
+		a.insts = append(a.insts, servingRowOn(1, createAttemptRevision))
+	}
+	retry := &workloadtypes.RetryPolicy{MaxAttempts: 2, InitialDelay: time.Minute, MaxDelay: 30 * time.Minute, Multiplier: 2}
+	a.input, a.rec = dispositionFixtureInput(a.fc, &a.insts, createAttemptRevision, retry, ledgerOwnerCM())
+	a.input.StuckPodGrace = time.Minute
+	a.input.Disposition.AutoMigrateMaxAttempts = 3
+	a.pod = waitingPod("engine-0-default-0", "CreateContainerError", "node-a", started)
+	a.pod.Status.ContainerStatuses[0].State.Waiting.Message = message
+	return a
+}
+
+// relocations returns the relocation entries the attempt's pass recorded.
+func (a *createAttempt) relocations(t *testing.T) []audit.Entry {
+	t.Helper()
+	return loadLedger(t, a.c).Entries
+}
+
+func (a *createAttempt) escalate(t *testing.T) {
+	t.Helper()
+	plan := singleInstancePlan(0, 1)
+	plan.MigrationMode = workloadtypes.MigrationModeAuto
+	if err := runEscalationPass(t, workloadtypes.Deps{Client: a.c, Clock: a.fc}, a.input, plan,
+		map[int32][]*corev1.Pod{0: {a.pod}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+}
+
+// TestEscalation_CreateStillInFlight_KeepsTheAttemptWaiting checks a create
+// the runtime has not finished. When many pods start at once, the runtime
+// can take longer than the kubelet's CRI deadline to create a container:
+// the kubelet reports CreateContainerError, and its retries find the
+// container name still reserved until the first create ends. Five minutes
+// in, well past the one-minute grace for a pod in a terminal waiting state,
+// the attempt keeps waiting: no node is excluded and no failed attempt is
+// counted, whether the revision serves on a sibling or nowhere.
+func TestEscalation_CreateStillInFlight_KeepsTheAttemptWaiting(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	for _, msg := range []struct{ name, text string }{
+		{name: "name still reserved by the first create", text: fixture.CreateReservedMessage},
+		{name: "call ran past the CRI deadline", text: "context deadline exceeded"},
+		{name: "runtime cancelled the call at its deadline", text: "stream terminated by RST_STREAM with error code: CANCEL"},
+	} {
+		for _, rev := range []struct {
+			name   string
+			served bool
+		}{{name: "revision serves elsewhere", served: true}, {name: "revision serves nowhere"}} {
+			t.Run(msg.name+", "+rev.name, func(t *testing.T) {
+				a := newCreateAttempt(t, now, now.Add(-5*time.Minute), now.Add(25*time.Minute), msg.text, rev.served)
+				a.escalate(t)
+
+				if entries := a.relocations(t); len(entries) != 0 {
+					t.Fatalf("relocation entries: got %+v want none: the runtime is still creating the container", entries)
+				}
+				if len(a.rec.blockCalls) != 0 {
+					t.Fatalf("RetryBlocks: got %+v want none: the attempt has not failed", a.rec.blockCalls)
+				}
+				if a.insts[0].Phase != workloadtypes.InstancePhaseCreating || a.insts[0].Operation == nil || a.insts[0].LastFailure != nil {
+					t.Fatalf("instance: got Phase=%q Operation=%+v LastFailure=%+v want the attempt still Creating", a.insts[0].Phase, a.insts[0].Operation, a.insts[0].LastFailure)
+				}
+				if len(a.rec.warns) != 0 {
+					t.Fatalf("WarnInstanceFailed: got %+v want none", a.rec.warns)
+				}
+			})
+		}
+	}
+}
+
+// TestEscalation_CreateRefusedByTheRuntime_RelocatesOffTheNode checks every
+// other CreateContainerError: a create the runtime refused on this node,
+// here because its disk is full, waits past the grace, so the attempt
+// ends and its rebuild is steered off the node while the revision serves
+// elsewhere.
+func TestEscalation_CreateRefusedByTheRuntime_RelocatesOffTheNode(t *testing.T) {
+	const refused = "failed to create containerd container: error unpacking image: no space left on device"
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	a := newCreateAttempt(t, now, now.Add(-5*time.Minute), now.Add(25*time.Minute), refused, true)
+	a.escalate(t)
+
+	if entries := a.relocations(t); len(entries) != 1 || entries[0].FromNode != "node-a" {
+		t.Fatalf("relocation entries: got %+v want one directive for node-a", entries)
+	}
+	if a.insts[0].Phase != workloadtypes.InstancePhaseFailed || a.insts[0].Operation != nil {
+		t.Fatalf("instance: got Phase=%q Operation=%+v want Failed with no operation", a.insts[0].Phase, a.insts[0].Operation)
+	}
+	if lf := a.insts[0].LastFailure; lf == nil || lf.Reason != "CreateContainerError" || lf.Message != refused {
+		t.Fatalf("LastFailure: got %+v want the refused create", lf)
+	}
+	if len(a.rec.blockCalls) != 0 {
+		t.Fatalf("RetryBlocks: got %+v want none: the relocation claims the attempt", a.rec.blockCalls)
+	}
+}
+
+// TestEscalation_GangCreateRefusedOnOneMember_RecordNamesTheRefusedPod checks
+// the failure record of a two-pod Create attempt whose first pod's create
+// is still running on node-a while the runtime refused the second pod's
+// create on node-b. The refused pod ends the attempt, and the record names
+// that pod with the runtime's message, not the first pod that shares its
+// waiting reason.
+func TestEscalation_GangCreateRefusedOnOneMember_RecordNamesTheRefusedPod(t *testing.T) {
+	const refused = "failed to create containerd container: error unpacking image: no space left on device"
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	started := now.Add(-5 * time.Minute)
+	a := newCreateAttempt(t, now, started, now.Add(25*time.Minute), fixture.CreateReservedMessage, false)
+	a.insts[0].PodCount = 2
+	a.input.ObservedState.InstanceStatuses[0].PodCount = 2
+	refusedPod := waitingPod("engine-0-default-1", "CreateContainerError", "node-b", started)
+	refusedPod.Status.ContainerStatuses[0].State.Waiting.Message = refused
+	plan := singleInstancePlan(0, 2)
+	plan.MigrationMode = workloadtypes.MigrationModeAuto
+	if err := runEscalationPass(t, workloadtypes.Deps{Client: a.c, Clock: a.fc}, a.input, plan,
+		map[int32][]*corev1.Pod{0: {a.pod, refusedPod}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	if a.insts[0].Phase != workloadtypes.InstancePhaseFailed {
+		t.Fatalf("instance: got Phase=%q want Failed: the refused create ends the attempt", a.insts[0].Phase)
+	}
+	lf := a.insts[0].LastFailure
+	if lf == nil || lf.PodName != refusedPod.Name || lf.Reason != "CreateContainerError" || lf.Message != refused {
+		t.Fatalf("LastFailure: got %+v want pod %s with the refused create's message", lf, refusedPod.Name)
+	}
+}
+
+// TestEscalation_CreateStillInFlightPastTheDeadline_EndsTheAttempt checks the
+// bound on that wait: a create the runtime has still not finished when the
+// attempt's deadline (instanceReadyTimeout) passes ends the attempt as an
+// elapsed deadline. Its rebuild is steered off the node while the revision
+// serves elsewhere; otherwise the deadline counts as a failed attempt.
+func TestEscalation_CreateStillInFlightPastTheDeadline_EndsTheAttempt(t *testing.T) {
+	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		served bool
+	}{{name: "revision serves elsewhere", served: true}, {name: "revision serves nowhere"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newCreateAttempt(t, now, now.Add(-31*time.Minute), now.Add(-time.Minute), fixture.CreateReservedMessage, tc.served)
+			a.escalate(t)
+
+			if a.insts[0].Phase != workloadtypes.InstancePhaseFailed || a.insts[0].Operation != nil {
+				t.Fatalf("instance: got Phase=%q Operation=%+v want Failed with no operation", a.insts[0].Phase, a.insts[0].Operation)
+			}
+			if lf := a.insts[0].LastFailure; lf == nil || lf.Reason != escalation.DeadlineExceededReason {
+				t.Fatalf("LastFailure: got %+v want the elapsed deadline", lf)
+			}
+			entries := a.relocations(t)
+			if tc.served {
+				if len(entries) != 1 || entries[0].FromNode != "node-a" || len(a.rec.blockCalls) != 0 {
+					t.Fatalf("got relocation entries %+v and RetryBlocks %+v want one directive for node-a and no block", entries, a.rec.blockCalls)
+				}
+				return
+			}
+			if len(entries) != 0 || len(a.rec.blockCalls) != 1 || a.rec.blockCalls[0].block.Reason != escalation.DeadlineExceededReason {
+				t.Fatalf("got relocation entries %+v and RetryBlocks %+v want no directive and the deadline counted once", entries, a.rec.blockCalls)
+			}
+		})
 	}
 }
 
@@ -799,58 +934,6 @@ func TestEscalation_RestartDeadlineParksOnlyALiveSet(t *testing.T) {
 	}
 }
 
-// incarnationPod builds a Pending pod of Instance 0 at the given
-// incarnation, labeled the way the live lister selects.
-func incarnationPod(name string, incarnation int64, created time.Time) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              name,
-			Namespace:         "ns",
-			CreationTimestamp: metav1.NewTime(created.Add(-time.Hour)),
-			Labels: map[string]string{
-				constants.InferenceServicePodLabelKey: "own",
-				constants.OMEComponentLabel:           string(workloadtypes.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-				query.LabelInstanceIdx:                "0",
-				query.LabelInstanceIncarnation:        strconv.FormatInt(incarnation, 10),
-			},
-		},
-		Spec: corev1.PodSpec{NodeName: "node-a"},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodPending,
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name:  "main",
-				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
-			}},
-		},
-	}
-}
-
-// terminating marks the pod as deleting: a deletion stamp held open by a
-// finalizer, the way a pod reads between its delete and its removal. The
-// stamp is the pod's own deletion deadline, the request plus its grace,
-// and sits ahead of the pass unless the pod already carries one.
-func terminating(pod *corev1.Pod) *corev1.Pod {
-	if pod.DeletionTimestamp == nil {
-		deadline := metav1.NewTime(time.Now().Add(time.Hour))
-		pod.DeletionTimestamp = &deadline
-	}
-	pod.Finalizers = []string{"example.com/termination"}
-	return pod
-}
-
-// terminatingOverdue marks the pod as deleting past its own deletion
-// deadline: the kubelet behind it stopped before it acknowledged the
-// delete, so only that kubelet, a finalizer owner or the force-delete
-// sweep ever removes the object. The finalizer stands in for the missing
-// acknowledgement, which the fake apiserver cannot hold a pod on; the
-// stamp reads the deadline, never the finalizer.
-func terminatingOverdue(pod *corev1.Pod) *corev1.Pod {
-	deadline := metav1.NewTime(time.Now().Add(-time.Hour))
-	pod.DeletionTimestamp = &deadline
-	return terminating(pod)
-}
-
 // DeadlineExceeded is outside the terminal waiting set, so the fast
 // escalation never fires on it: a Restart whose pod holds that reason
 // past the stuck-pod grace keeps its step and waits out its own
@@ -1027,22 +1110,6 @@ func TestEscalation_DrainingPodDoesNotMaskStuckReplacement(t *testing.T) {
 	}
 }
 
-// heldOutOfRotationBy is a pod whose serving gate the named writer holds
-// off: containers ready, out of rotation, not deleting.
-func heldOutOfRotationBy(name, userAgent, key string) *corev1.Pod {
-	writers, err := json.Marshal([]podreadiness.Message{{UserAgent: userAgent, Key: key}})
-	if err != nil {
-		panic(err)
-	}
-	pod := servingPod(name)
-	pod.Status.Conditions = []corev1.PodCondition{
-		{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
-		{Type: podreadiness.ConditionType, Status: corev1.ConditionFalse, Message: string(writers)},
-		{Type: corev1.PodReady, Status: corev1.ConditionFalse},
-	}
-	return pod
-}
-
 // TestEscalation_SourceTheSurgeDrainedCountsBesideItsServingReplacement
 // pins the drained-source rule of the fully-serving reading. The surge
 // takes its source out of rotation under its own writer a whole endpoint
@@ -1187,34 +1254,6 @@ func TestEscalation_PausedHoldSkipsStuckPodFastPath(t *testing.T) {
 	if rec.store[0].Phase != workloadtypes.InstancePhaseFailed {
 		t.Errorf("unrouted Phase: got %q want Failed (the pause guard must not cover it)", rec.store[0].Phase)
 	}
-}
-
-// wedgedButGatedPod is the shape the failed-while-serving guard must not
-// read as healthy capacity: conditions still say ContainersReady and the
-// serving gate is still True, while the container is parked in a
-// terminal waiting reason.
-func wedgedButGatedPod(name, reason string) *corev1.Pod {
-	pod := servingPod(name)
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
-		Name:  "main",
-		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
-	}}
-	return pod
-}
-
-func surgingInstanceWithWaiting(waiting string) []workloadtypes.InstanceStatus {
-	return []workloadtypes.InstanceStatus{{
-		Index:    0,
-		Phase:    workloadtypes.InstancePhaseUpdating,
-		PodCount: 1,
-		Operation: &workloadtypes.InstanceOperation{
-			Type:           workloadtypes.InstanceOperationUpdate,
-			Step:           workloadtypes.UpdateStepSurge,
-			TargetRevision: "own-engine-targethash",
-			Deadline:       metav1.NewTime(time.Now().Add(30 * time.Minute)),
-			Waiting:        waiting,
-		},
-	}}
 }
 
 // TestEscalation_UnroutedSourceDoesNotExemptAWedgedSurge: the
@@ -1481,43 +1520,6 @@ func TestExpireOperations_ExactBoundary(t *testing.T) {
 // it stands behind waits forever and the operation deadline is the only exit.
 // The record that exit leaves must name the gate rather than the clock.
 
-// gateNotFoldedPod builds the gate-limbo shape: phase Running, the container
-// running and Ready, ContainersReady=True, and a declared readiness gate
-// whose condition nobody has satisfied, so Ready stays False.
-func gateNotFoldedPod(name string, since time.Time) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              name,
-			CreationTimestamp: metav1.NewTime(since.Add(-time.Minute)),
-		},
-		Spec: corev1.PodSpec{
-			ReadinessGates: []corev1.PodReadinessGate{{ConditionType: podreadiness.ConditionType}},
-		},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning,
-			Conditions: []corev1.PodCondition{
-				{
-					Type:               corev1.ContainersReady,
-					Status:             corev1.ConditionTrue,
-					LastTransitionTime: metav1.NewTime(since),
-				},
-				{
-					Type:               corev1.PodReady,
-					Status:             corev1.ConditionFalse,
-					Reason:             "ReadinessGatesNotReady",
-					Message:            "corresponding condition of pod readiness gate \"ome.io/serving\" does not exist",
-					LastTransitionTime: metav1.NewTime(since),
-				},
-			},
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name:  "main",
-				Ready: true,
-				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
-			}},
-		},
-	}
-}
-
 // TestEscalation_DeadlineWithGateNotFoldedPod_NamesTheGate: the deadline
 // expires on a Create attempt whose pod passed every probe but never became
 // eligible for its Service. The record names the unsatisfied gate. Evidence
@@ -1601,29 +1603,6 @@ func TestEscalation_RestartDeadlineWithGateNotFoldedPod_NamesTheGate(t *testing.
 // second readiness gate the pod declares stays unsatisfied. The pod reads
 // ContainersReady and serving, yet it is in no Service's endpoints, so it
 // is not capacity and no exemption may keep it from the deadline.
-
-// secondReadinessGate is a readiness gate another writer owns, declared
-// on the pod beside the serving gate.
-const secondReadinessGate corev1.PodConditionType = "example.com/load-balancer"
-
-// gateWrittenNeverReadyPod builds that shape: phase Running, the container
-// running and Ready, ContainersReady=True, the serving gate True, and the
-// second gate declared with no condition for it, so Ready stays False.
-func gateWrittenNeverReadyPod(name string, since time.Time) *corev1.Pod {
-	pod := gateNotFoldedPod(name, since)
-	pod.Spec.ReadinessGates = append(pod.Spec.ReadinessGates, corev1.PodReadinessGate{ConditionType: secondReadinessGate})
-	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
-		Type:               podreadiness.ConditionType,
-		Status:             corev1.ConditionTrue,
-		LastTransitionTime: metav1.NewTime(since),
-	})
-	for i := range pod.Status.Conditions {
-		if pod.Status.Conditions[i].Type == corev1.PodReady {
-			pod.Status.Conditions[i].Message = "corresponding condition of pod readiness gate \"" + string(secondReadinessGate) + "\" does not exist"
-		}
-	}
-	return pod
-}
 
 // TestEscalation_RestartDeadlineWithGateWrittenButNeverReady_NamesTheGate:
 // a restart's rebuilt pod passes its probes and receives the serving gate,
@@ -1718,35 +1697,6 @@ func TestEscalation_RestartDeadlineWithOneGangMemberNeverReady_NamesItsGate(t *t
 // kubelet reports no waiting reason, and ContainersReady simply never
 // flips. The operation deadline is the only exit, and the record it
 // leaves must say what was never ready rather than "the clock ran out".
-
-const probeMessage = "containers with unready status: [main]"
-
-// runningNotReadyPod builds the limbo shape: phase Running, every
-// container started, ContainersReady=False with the kubelet's own reason
-// and message.
-func runningNotReadyPod(name string, since time.Time) *corev1.Pod {
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              name,
-			CreationTimestamp: metav1.NewTime(since.Add(-time.Minute)),
-		},
-		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning,
-			Conditions: []corev1.PodCondition{{
-				Type:               corev1.ContainersReady,
-				Status:             corev1.ConditionFalse,
-				Reason:             evidence.ReasonContainersNotReady,
-				Message:            probeMessage,
-				LastTransitionTime: metav1.NewTime(since),
-			}},
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name:  "main",
-				Ready: false,
-				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
-			}},
-		},
-	}
-}
 
 // TestEscalation_DeadlineWithRunningNotReadyPod_NamesTheProbe: when the
 // deadline expires on a single-pod Create attempt whose pod runs but
@@ -2825,28 +2775,6 @@ func TestEscalation_RepairWaitingOnWorkloadIsAnnouncedOnce(t *testing.T) {
 	}
 }
 
-// parkedPodAt is a pod created an hour ago, parked in reason for that
-// whole hour, at the named incarnation and revision hash: the shape of a
-// pod the fast path reads as stuck under any grace.
-func parkedPodAt(name, reason, incarnation, hash string, now time.Time) *corev1.Pod {
-	hourAgo := metav1.NewTime(now.Add(-time.Hour))
-	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              name,
-			CreationTimestamp: hourAgo,
-			Labels:            map[string]string{query.LabelInstanceIncarnation: incarnation, query.LabelRevisionHash: hash},
-		},
-		Status: corev1.PodStatus{
-			Phase:      corev1.PodPending,
-			Conditions: []corev1.PodCondition{{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, LastTransitionTime: hourAgo}},
-			ContainerStatuses: []corev1.ContainerStatus{{
-				Name:  "main",
-				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
-			}},
-		},
-	}
-}
-
 // A Restarting row is judged on the pods at its incarnation. The set of
 // the incarnation before it is what the repair drains and deletes, so a
 // wedge there is the repair's reason and the row keeps its Restart; a
@@ -2959,62 +2887,6 @@ func TestEscalation_StuckStampYieldsToARepairThatClaimedThePod(t *testing.T) {
 			}
 		})
 	}
-}
-
-// crashLoopRowNamingTheLoop is a settled or restarting row whose promoted
-// set crashed after it entered Ready and that names the loop on its
-// failure record, as the restart pass writes it while a held revision's
-// set serves between crashes.
-func crashLoopRowNamingTheLoop(now time.Time, phase workloadtypes.InstancePhase, incarnation int64, revision string) workloadtypes.InstanceStatus {
-	readySince := metav1.NewTime(now.Add(-time.Hour))
-	return workloadtypes.InstanceStatus{
-		Index:           0,
-		Incarnation:     incarnation,
-		Phase:           phase,
-		PodCount:        1,
-		RunningRevision: revision,
-		ReadySince:      &readySince,
-		LastFailure: &workloadtypes.InstanceTermination{
-			PodName: "engine-0-default-0", ContainerName: "main", Reason: "CrashLoopBackOff",
-			Message: "back-off restarting failed container; " + workloadops.CrashLoopServingNote,
-			Time:    metav1.NewTime(now.Add(-10 * time.Minute)),
-		},
-	}
-}
-
-// crashLoopPodBack is a pod of a crash loop as it reads at one moment:
-// serving again since brokeOrBackAgo, or down again in CrashLoopBackOff
-// since then. It was created an hour ago, so its age is past any grace.
-func crashLoopPodBack(now time.Time, incarnation, hash string, serving bool, since time.Duration) *corev1.Pod {
-	at := metav1.NewTime(now.Add(-since))
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "engine-0-default-0",
-			CreationTimestamp: metav1.NewTime(now.Add(-time.Hour)),
-			Labels:            map[string]string{query.LabelInstanceIncarnation: incarnation, query.LabelRevisionHash: hash},
-		},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning},
-	}
-	status := corev1.ContainerStatus{Name: "main", RestartCount: 3,
-		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error", FinishedAt: at}}}
-	if serving {
-		status.Ready = true
-		status.State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: at}}
-		pod.Status.Conditions = []corev1.PodCondition{
-			{Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: at},
-			{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: at},
-			{Type: "ome.io/serving", Status: corev1.ConditionTrue, LastTransitionTime: at},
-		}
-	} else {
-		status.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}
-		pod.Status.Conditions = []corev1.PodCondition{
-			{Type: corev1.ContainersReady, Status: corev1.ConditionFalse, LastTransitionTime: at},
-			{Type: corev1.PodReady, Status: corev1.ConditionFalse, LastTransitionTime: at},
-			{Type: "ome.io/serving", Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now.Add(-time.Hour))},
-		}
-	}
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{status}
-	return pod
 }
 
 // A crash-loop park the restart pass returned to Ready while its set
@@ -3158,73 +3030,6 @@ func TestEscalation_ParkedAttemptIsLeftToItsLadder(t *testing.T) {
 			}
 		})
 	}
-}
-
-// routedDeps is a client with no routed Service or EndpointSlice behind it,
-// which is what the hold pass reads a serving source's rotation through.
-func routedDeps(t *testing.T) workloadtypes.Deps {
-	t.Helper()
-	c := fake.NewClientBuilder().WithScheme(makeScheme(t)).Build()
-	return workloadtypes.Deps{Client: c, APIReader: c}
-}
-
-// surgePairAtIncarnation is a gang surge in flight: the source row at idx,
-// at the given incarnation, surging to surgeIdx, beside the replacement's
-// marker row at incarnation one, both pinned to the target revision with
-// the same attempt deadline.
-func surgePairAtIncarnation(idx, surgeIdx int32, incarnation int64, deadline time.Time) []workloadtypes.InstanceStatus {
-	k := surgeIdx
-	return []workloadtypes.InstanceStatus{
-		{
-			Index: idx, Incarnation: incarnation, Phase: workloadtypes.InstancePhaseUpdating, PodCount: 2,
-			RunningRevision: "own-engine-oldhash", TargetRevision: "own-engine-newhash",
-			Operation: &workloadtypes.InstanceOperation{
-				ID: "gangsurge-1-1", Type: workloadtypes.InstanceOperationUpdate, Step: workloadtypes.UpdateStepSurge,
-				SurgeIndex: &k, TargetRevision: "own-engine-newhash", Strategy: workloadtypes.UpdateStrategySurgeThenDrain,
-				Deadline: metav1.NewTime(deadline),
-			},
-		},
-		{
-			Index: surgeIdx, Incarnation: 1, Phase: workloadtypes.InstancePhaseCreating, TargetRevision: "own-engine-newhash",
-			Operation: &workloadtypes.InstanceOperation{
-				ID: "gangsurgetarget-2-1", Type: workloadtypes.InstanceOperationUpdate, Step: workloadtypes.UpdateStepGangSurgeTarget,
-				TargetRevision: "own-engine-newhash", Deadline: metav1.NewTime(deadline),
-			},
-		},
-	}
-}
-
-// gangPlan plans a two-member gang, a leader and one worker, at each index.
-func gangPlan(indexes ...int32) workloadtypes.ComponentPlan {
-	var plan workloadtypes.ComponentPlan
-	for _, idx := range indexes {
-		plan.Instances = append(plan.Instances, workloadtypes.InstancePlan{
-			Index:   idx,
-			Runners: []workloadtypes.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}},
-		})
-	}
-	return plan
-}
-
-// gangMemberAt is a gang member at the named incarnation and revision
-// hash: serving, or Running and not yet ready.
-func gangMemberAt(name, incarnation, hash string, serving bool, now time.Time) *corev1.Pod {
-	pod := servingPod(name)
-	pod.CreationTimestamp = metav1.NewTime(now.Add(-time.Hour))
-	pod.Labels = map[string]string{query.LabelInstanceIncarnation: incarnation, query.LabelRevisionHash: hash}
-	if !serving {
-		pod.Status.Conditions = nil
-	}
-	return pod
-}
-
-// warnsByIndex records every WarnInstanceFailed call as "<index>:<pod>:<reason>".
-func warnsByIndex(input *workloadtypes.ReconcileInput) *[]string {
-	var warned []string
-	input.WarnInstanceFailed = func(idx int32, pod, reason string) {
-		warned = append(warned, strconv.Itoa(int(idx))+":"+pod+":"+reason)
-	}
-	return &warned
 }
 
 // A gang surge's replacement is a row of its own and its pods carry that

@@ -68,7 +68,7 @@ func MigrationPinMutation(input types.ReconcileInput, idx, siblingIdx int32, rol
 		s.Operation = &types.InstanceOperation{
 			ID:             fmt.Sprintf("migrate-%s%s-%d", uuid, idSuffix, now.Unix()),
 			Type:           types.InstanceOperationMigrate,
-			Step:           "CreateSurge",
+			Step:           types.MigrateStepCreateSurge,
 			RequestUUID:    uuid,
 			SurgeIndex:     &siblingPtr,
 			StartedAt:      now,

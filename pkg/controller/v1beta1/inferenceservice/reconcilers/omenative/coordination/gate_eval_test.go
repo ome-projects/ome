@@ -9,19 +9,22 @@ import (
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// TestGateWaitsOnPeerCounters pins which holds a peer's serving counters
-// release: the two gates that simulate the step against them. A hold on
-// any other gate waits on a revision, the plan pin, or the Component's own
-// budget or retry state, and a peer's counter churn must not wake it.
+// TestGateWaitsOnPeerCounters pins which holds a peer's status releases:
+// the two gates that simulate the step against the peer's serving counts,
+// and the Held gate, under which the batch step names a peer whose retry
+// record is Held and which that peer's release or corrected revision ends.
+// A hold on any other gate waits on a revision, the plan pin, or the
+// Component's own budget or retry schedule, and a peer's churn must not
+// wake it.
 func TestGateWaitsOnPeerCounters(t *testing.T) {
 	waits := map[v1beta1.RolloutHoldGate]bool{
 		v1beta1.RolloutHoldGatePairing:    true,
 		v1beta1.RolloutHoldGateRatio:      true,
+		v1beta1.RolloutHoldGateHeld:       true,
 		v1beta1.RolloutHoldGateSequential: false,
 		v1beta1.RolloutHoldGatePlan:       false,
 		v1beta1.RolloutHoldGateBudget:     false,
 		v1beta1.RolloutHoldGateRetryBlock: false,
-		v1beta1.RolloutHoldGateHeld:       false,
 		"":                                false,
 	}
 	for gate, want := range waits {

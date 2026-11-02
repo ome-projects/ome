@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
+	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
@@ -72,7 +73,9 @@ func (p *peerRevisions) hashFor(peer v1beta1.ComponentType, podRevisionHash stri
 // instead of deadlocking.
 //
 // A peer with no IR (not IR-managed, or not projected yet) resolves to no
-// revision: its pods get only the generic endpoint and nothing holds.
+// revision: its pods get only the generic endpoint and nothing holds. The
+// exception is a Component's first pods beside an encoder, which wait for
+// every OMENative peer's IR (awaitsPeerProjection).
 //
 // Peer IRs are read through the cache: the generation stamp and the status
 // travel on the same object, so a stale copy can only fail a freshness
@@ -93,6 +96,9 @@ func (r *Reconciler) resolvePeerRevisions(ctx context.Context, ir *v1beta1.Infer
 			return nil, "", err
 		}
 		if peerIR == nil {
+			if awaitsPeerProjection(ir, parent, peer) {
+				return nil, fmt.Sprintf("%s IR is not projected yet, and this Component has no pods to keep serving", peer), nil
+			}
 			continue
 		}
 		if peerGeneration := peerIR.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]; peerGeneration != ownGeneration {
@@ -110,6 +116,21 @@ func (r *Reconciler) resolvePeerRevisions(ctx context.Context, ir *v1beta1.Infer
 		out.irs[peer] = peerIR
 	}
 	return out, "", nil
+}
+
+// awaitsPeerProjection reports whether a peer with no IR holds this
+// Component's render. Beside an encoder every role is an OMENative IR that
+// one service pass projects, one role after another, so a missing peer IR is
+// on its way, and a first pod rendered before it lands would lack that peer's
+// revision endpoint for its whole life. A Component that already has
+// Instances keeps rendering, so a peer that cannot be projected never stops
+// its repairs.
+func awaitsPeerProjection(ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, peer v1beta1.ComponentType) bool {
+	if parent.Spec.Encoder == nil || len(ir.Status.InstanceStatuses) > 0 {
+		return false
+	}
+	view := v1beta1.SpecOf(&parent.Spec, peer)
+	return view != nil && isvcutils.RoleDeploymentMode(view, parent.Spec.DeploymentMode) == constants.OMENative
 }
 
 // peerRollTargetHash is the revision hash a peer's reconciler is rolling

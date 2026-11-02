@@ -7,14 +7,13 @@ import (
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // singlePodRunnerRuntime models a ServingRuntime whose engineConfig declares
@@ -56,13 +55,14 @@ func multiNodeRunnerRuntime() *v1beta1.ServingRuntimeSpec {
 // other pod-spec-reconcile tests do: a fake client/clientset is enough
 // because reconcilePodSpec/reconcileWorkerPodSpec never touch the API
 // server, only the merged spec passed in.
-func newRunnerTestEngine(t *testing.T, scheme *runtime.Scheme, mergedEngine *v1beta1.EngineSpec) *Engine {
+func newRunnerTestEngine(t *testing.T, mergedEngine *v1beta1.EngineSpec) *Engine {
 	t.Helper()
+	cl := fakeclient.New(t)
 	return NewEngine(
 		&ComponentDeps{
-			Client:    ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build(),
+			Client:    cl,
 			Clientset: fake.NewClientset(),
-			Scheme:    scheme,
+			Scheme:    cl.Scheme(),
 			Config:    &controllerconfig.InferenceServicesConfig{},
 		},
 		ComponentInputs{DeploymentMode: constants.OMENative},
@@ -84,8 +84,6 @@ func newRunnerTestEngine(t *testing.T, scheme *runtime.Scheme, mergedEngine *v1b
 // found" and the component never reaches Ready.
 func TestMergeEngineSpec_RunnerResolvesForBothSuiteShapes(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
-	scheme := runtime.NewScheme()
-	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
 
 	objectMeta := &metav1.ObjectMeta{Name: "test-isvc-engine", Namespace: "default"}
 
@@ -100,12 +98,13 @@ func TestMergeEngineSpec_RunnerResolvesForBothSuiteShapes(t *testing.T) {
 			},
 		}
 
-		mergedEngine, _, _, err := isvcutils.MergeRuntimeSpecs(isvc.DeepCopy(), singlePodRunnerRuntime(), logr.Discard())
+		specs, err := isvcutils.MergeRuntimeRoleSpecs(isvc.DeepCopy(), singlePodRunnerRuntime(), logr.Discard())
+		mergedEngine := specs.Engine
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(mergedEngine.Worker).To(gomega.BeNil(),
 			"a runtime with no worker block must not promote a single-pod ISVC to multi-pod")
 
-		engine := newRunnerTestEngine(t, scheme, mergedEngine)
+		engine := newRunnerTestEngine(t, mergedEngine)
 
 		podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
@@ -130,12 +129,13 @@ func TestMergeEngineSpec_RunnerResolvesForBothSuiteShapes(t *testing.T) {
 			},
 		}
 
-		mergedEngine, _, _, err := isvcutils.MergeRuntimeSpecs(isvc.DeepCopy(), multiNodeRunnerRuntime(), logr.Discard())
+		specs, err := isvcutils.MergeRuntimeRoleSpecs(isvc.DeepCopy(), multiNodeRunnerRuntime(), logr.Discard())
+		mergedEngine := specs.Engine
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(mergedEngine.Leader).NotTo(gomega.BeNil())
 		g.Expect(mergedEngine.Worker).NotTo(gomega.BeNil())
 
-		engine := newRunnerTestEngine(t, scheme, mergedEngine)
+		engine := newRunnerTestEngine(t, mergedEngine)
 
 		leaderPodSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())

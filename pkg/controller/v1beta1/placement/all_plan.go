@@ -124,7 +124,7 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 		Spec                v1beta1.InferenceServiceSpec
 		Labels, Annotations map[string]string
 		Members             map[string]types.UID
-	}{source.Spec, source.Labels, source.Annotations, matched})
+	}{source.Spec, source.Labels, planIntentAnnotations(source.Annotations), matched})
 	if err != nil {
 		return out, nil, err
 	}

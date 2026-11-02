@@ -31,11 +31,7 @@ const PolicyRefIndexField = "spec.autoscalerPolicyRefs"
 // policyRefComponents is every component that can carry a policy reference,
 // in the order the InferenceService controller's index extractor visits
 // them.
-var policyRefComponents = []v1beta1.ComponentType{
-	v1beta1.EngineComponent,
-	v1beta1.DecoderComponent,
-	v1beta1.RouterComponent,
-}
+var policyRefComponents = v1beta1.RoleTypes()
 
 // PolicyRefIndexer is the extractor for PolicyRefIndexField: the distinct
 // policy names across a service's components.

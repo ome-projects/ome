@@ -697,6 +697,14 @@ func (d *driver) seedOperation(ctx context.Context, spec RowSpec, row types.Inst
 		sibling := *o.SurgeIndex
 		op.SurgeIndex = &sibling
 	}
+	if o.PlacementWaitSince != "" {
+		at, err := d.offset(field+".placementWaitSince", o.PlacementWaitSince)
+		if err != nil {
+			return nil, err
+		}
+		since := metav1.NewTime(at)
+		op.PlacementWaitSince = &since
+	}
 	switch op.Type {
 	case types.InstanceOperationUpdate:
 		if op.TargetRevision == "" {
@@ -1495,6 +1503,10 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 	if err != nil {
 		return types.ReconcileInput{}, err
 	}
+	gangDomainFullGrace, err := ParseDuration("config.gangDomainFullGrace", d.cfg.GangDomainFullGrace)
+	if err != nil {
+		return types.ReconcileInput{}, err
+	}
 	abandonedReplacementGrace, err := ParseDuration("config.abandonedReplacementGrace", d.cfg.AbandonedReplacementGrace)
 	if err != nil {
 		return types.ReconcileInput{}, err
@@ -1510,6 +1522,7 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 		ScaleDownRequeueInterval:  scaleDown,
 		StuckPodGrace:             stuckPodGrace,
 		UnschedulableGrace:        unschedulableGrace,
+		GangDomainFullGrace:       gangDomainFullGrace,
 		AbandonedReplacementGrace: abandonedReplacementGrace,
 		Requeue:                   types.RequeueIntervals{Operation: requeueOperation, Gate: requeueGate},
 		Gangs:                     types.NewGangObservations(),

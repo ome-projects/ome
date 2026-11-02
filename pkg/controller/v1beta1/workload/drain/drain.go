@@ -195,6 +195,26 @@ func (b *Batcher) IsPodRouted(ctx context.Context, serviceName string, pod *core
 	return !podDrainedInSlices(slices, pod), nil
 }
 
+// IsPodInRotation reports whether serviceName publishes pod as an
+// endpoint eligible for new traffic, Ready and not Terminating, off the
+// same memoized slice list the drain gate reads. Identical semantics to
+// the package-level IsPodInRotation: with no slice listing the pod, the
+// Service absent or the endpoints controller not yet caught up, no new
+// request reaches the pod through serviceName and it is not in rotation.
+func (b *Batcher) IsPodInRotation(ctx context.Context, serviceName string, pod *corev1.Pod) (bool, error) {
+	if pod == nil {
+		return false, fmt.Errorf("IsPodInRotation: nil pod")
+	}
+	if serviceName == "" {
+		return false, fmt.Errorf("IsPodInRotation: empty serviceName")
+	}
+	slices, err := b.listSlices(ctx, serviceName)
+	if err != nil {
+		return false, err
+	}
+	return podInRotationInSlices(slices, pod), nil
+}
+
 func indexRoutablePodTargets(slices []discoveryv1.EndpointSlice) routablePodTargets {
 	targets := routablePodTargets{
 		exactNamespace: make(map[client.ObjectKey]struct{}),
@@ -289,17 +309,20 @@ func IsPodInRotation(ctx context.Context, reader client.Reader, namespace, servi
 	if err != nil {
 		return false, err
 	}
+	return podInRotationInSlices(slices, pod), nil
+}
+
+// podInRotationInSlices reports whether some endpoint targeting pod across
+// slices is eligible for new traffic.
+func podInRotationInSlices(slices []discoveryv1.EndpointSlice, pod *corev1.Pod) bool {
 	for _, slice := range slices {
 		for _, ep := range slice.Endpoints {
-			if !endpointTargetsPod(ep, pod) {
-				continue
-			}
-			if EndpointAvailable(ep) {
-				return true, nil
+			if endpointTargetsPod(ep, pod) && EndpointAvailable(ep) {
+				return true
 			}
 		}
 	}
-	return false, nil
+	return false
 }
 
 // EndpointSlicesForService lists EndpointSlices in namespace owned by

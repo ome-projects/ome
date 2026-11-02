@@ -54,10 +54,13 @@ type deleteBatchSelection struct {
 	fresh      bool
 }
 
-// DeleteBatch advances one durable, gang-atomic scale-down wave. Fresh
-// candidates are committed as one status transaction and never receive an
-// external effect in the admission pass. Persisted Delete-owned candidates
-// resume from the authoritative Pod snapshot on later passes.
+// DeleteBatch advances one durable, gang-atomic scale-down wave: the
+// Instances the plan no longer covers leave in waves sized by the pod
+// budget. A fresh wave is written Deleting in one status transaction and
+// takes no external effect in the pass that admits it. A wave already
+// Delete-owned resumes from the authoritative Pod snapshot: every serving
+// pod leaves rotation, each row waits for its drain and deletes its pods,
+// and the rows with no pod left are removed in one transaction.
 func DeleteBatch(
 	ctx context.Context,
 	deps workload.Deps,
@@ -72,133 +75,131 @@ func DeleteBatch(
 	if input.OwnerObject == nil || input.OwnerObject.GetUID() == "" {
 		return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: owner with UID is required")
 	}
-	footprint := workload.ScaleDownPodFootprint(input.ObservedState.InstanceStatuses, podsByInstance)
-	budget, err := workload.ResolveScaleDownPodBatchSize(input.ScaleDownPodBatchSize, footprint)
-	if err != nil {
-		return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: resolve scale-down Pod batch size: %w", err)
-	}
-	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, extrasNotParked(input, extras, podsByInstance), podsByInstance, budget, input.ObservedState.CordonedInstances)
+	wave, err := selectScaleDownWave(deps, input, plan, extras, podsByInstance)
 	if err != nil {
 		return DeleteBatchResult{}, err
 	}
-	result := DeleteBatchResult{
+	defer wave.log(ctx)
+	if len(wave.selection.candidates) == 0 {
+		return wave.result, nil
+	}
+	steps := []func(context.Context) (bool, error){
+		wave.writeDeleting,
+		wave.confirmResumedRows,
+		wave.driveDeleteBatch,
+		wave.reportOverdueDrains,
+		wave.removeRows,
+	}
+	for _, step := range steps {
+		stop, err := step(ctx)
+		if err != nil {
+			return DeleteBatchResult{}, err
+		}
+		if stop {
+			return wave.result, nil
+		}
+	}
+	return wave.result, nil
+}
+
+// scaleDownWave is one pass of the scale-down over one Component: the rows
+// the pass selected, the budget they were selected under, and what the
+// steps find out as they run. A step reports stop when the pass ends with
+// it; the next pass selects again from the top.
+type scaleDownWave struct {
+	deps           workload.Deps
+	input          workload.ReconcileInput
+	plan           workload.ComponentPlan
+	podsByInstance map[int32][]*corev1.Pod
+
+	// budget is the pod count one wave may take, nil when unbounded;
+	// footprint is the pod count of every observed Instance it was
+	// resolved against.
+	budget    *int32
+	footprint int32
+	selection deleteBatchSelection
+	result    DeleteBatchResult
+	// admitted counts the Instances a fresh wave wrote Deleting this pass.
+	admitted int
+
+	// expectationsSatisfied records, per selected row, whether the
+	// expectations cache has seen every delete the row expected.
+	expectationsSatisfied map[int32]bool
+	// refused records the rows whose own write the apiserver refused for
+	// good mid-wave; each is left as the refusal left it, out of this wave.
+	refused map[int32]struct{}
+	// completed is the rows with no pod left, removed at the end of the pass.
+	completed []deleteBatchCandidate
+	// policyDeadlineAt is the earliest time the force-delete policy wants
+	// the pass back for a pod already Terminating; zero when none does.
+	policyDeadlineAt time.Time
+}
+
+// selectScaleDownWave resolves the pod budget, picks the rows this pass
+// drives (selectDeleteBatch) and records what it picked in the pass's
+// counters and metrics.
+func selectScaleDownWave(deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, extras []int32, podsByInstance map[int32][]*corev1.Pod) (*scaleDownWave, error) {
+	footprint := workload.ScaleDownPodFootprint(input.ObservedState.InstanceStatuses, podsByInstance)
+	budget, err := workload.ResolveScaleDownPodBatchSize(input.ScaleDownPodBatchSize, footprint)
+	if err != nil {
+		return nil, fmt.Errorf("DeleteBatch: resolve scale-down Pod batch size: %w", err)
+	}
+	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, extrasNotParked(input, extras, podsByInstance), podsByInstance, budget, input.ObservedState.CordonedInstances)
+	if err != nil {
+		return nil, err
+	}
+	wave := &scaleDownWave{
+		deps:                  deps,
+		input:                 input,
+		plan:                  plan,
+		podsByInstance:        podsByInstance,
+		budget:                budget,
+		footprint:             footprint,
+		selection:             selection,
+		expectationsSatisfied: make(map[int32]bool, len(selection.candidates)),
+		refused:               make(map[int32]struct{}),
+	}
+	wave.result = DeleteBatchResult{
 		InProgress: len(selection.candidates) > 0 || selection.deferred > 0,
 		Deferred:   selection.deferred,
 		Oversized:  selection.oversized,
 	}
 	for _, candidate := range selection.candidates {
-		result.SelectedPodCost += candidate.cost
+		wave.result.SelectedPodCost += candidate.cost
 	}
-	obsmetrics.SetScaleDownActivePods(input.Key.Namespace, input.Key.OwnerName, string(plan.Component), result.SelectedPodCost)
-	obsmetrics.SetScaleDownDeferredInstances(input.Key.Namespace, input.Key.OwnerName, string(plan.Component), result.Deferred)
-	admittedInstances := 0
-	defer func() {
-		budgetValue := any("unbounded")
-		if budget != nil {
-			budgetValue = *budget
-		}
-		configuredBudget := any("unbounded")
-		if input.ScaleDownPodBatchSize != nil {
-			configuredBudget = input.ScaleDownPodBatchSize.String()
-		}
-		logf.FromContext(ctx).Info("OMENative scale-down wave",
-			"namespace", input.Key.Namespace,
-			"isvc", input.Key.OwnerName,
-			"component", plan.Component,
-			"podBudget", budgetValue,
-			"configuredPodBudget", configuredBudget,
-			"podFootprint", footprint,
-			"activePodCost", result.SelectedPodCost,
-			"activeInstances", len(selection.candidates),
-			"admittedInstances", admittedInstances,
-			"deferredInstances", result.Deferred)
-	}()
-	if len(selection.candidates) == 0 {
-		return result, nil
-	}
-	if selection.fresh {
-		committed, err := admitDeleteBatch(ctx, input, plan, selection.candidates)
-		if err != nil {
-			if errors.Is(err, workload.ErrStatusMutationPrecondition) || errors.Is(err, workload.ErrStatusOwnerGone) {
-				result.ImmediateRequeue = true
-				return result, nil
-			}
-			return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: admit wave: %w", err)
-		}
-		result.ImmediateRequeue = committed
-		if committed {
-			admittedInstances = len(selection.candidates)
-			obsmetrics.RecordScaleDownBatchPods(string(plan.Component), result.SelectedPodCost)
-			if result.Oversized {
-				obsmetrics.RecordScaleDownOversizedBatch(string(plan.Component))
-			}
-		}
-		if result.ImmediateRequeue || !committed {
-			return result, nil
-		}
-	} else {
-		absent, err := preflightDeleteOwnedBatch(ctx, input, selection.candidates)
-		if err != nil {
-			if errors.Is(err, workload.ErrStatusMutationPrecondition) || errors.Is(err, workload.ErrStatusOwnerGone) {
-				result.ImmediateRequeue = true
-				return result, nil
-			}
-			return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: verify owned wave: %w", err)
-		}
-		if len(absent) > 0 {
-			for index := range absent {
-				deps.ExpectationsCache().Forget(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, index)
-			}
-			result.ImmediateRequeue = true
-			return result, nil
-		}
-	}
+	obsmetrics.SetScaleDownActivePods(input.Key.Namespace, input.Key.OwnerName, string(plan.Component), wave.result.SelectedPodCost)
+	obsmetrics.SetScaleDownDeferredInstances(input.Key.Namespace, input.Key.OwnerName, string(plan.Component), wave.result.Deferred)
+	return wave, nil
+}
 
-	completed, requeueAt, parked, err := driveDeleteBatch(ctx, deps, input, plan, selection.candidates)
-	if err != nil {
-		if errors.Is(err, podreadiness.ErrPodIdentityChanged) {
-			result.ImmediateRequeue = true
-			return result, nil
-		}
-		return DeleteBatchResult{}, err
+// log reports the wave as the pass leaves it, whatever ended the pass.
+func (w *scaleDownWave) log(ctx context.Context) {
+	budgetValue := any("unbounded")
+	if w.budget != nil {
+		budgetValue = *w.budget
 	}
-	// A wave whose every row the apiserver refused has nothing left to
-	// poll; the rows are re-admitted when their ladder re-arms.
-	if parked > 0 && parked == len(selection.candidates) && result.Deferred == 0 {
-		result.InProgress = false
+	configuredBudget := any("unbounded")
+	if w.input.ScaleDownPodBatchSize != nil {
+		configuredBudget = w.input.ScaleDownPodBatchSize.String()
 	}
-	if !requeueAt.IsZero() {
-		remaining := requeueAt.Sub(input.Now())
-		if remaining <= 0 {
-			result.PolicyDeadlineDue = true
-		} else {
-			result.RequeueAfter = remaining
-		}
-	}
-	// Visibility for the rows this wave is still waiting on. Runs after
-	// the drive so it reports the wave's own effects, and it changes
-	// nothing the completion below reads: the record it writes is not
-	// part of the delete identity the completion guard tests.
-	if err := announceOverdueDrains(ctx, deps, input, plan, podsByInstance); err != nil {
-		if errors.Is(err, workload.ErrStatusMutationPrecondition) || errors.Is(err, workload.ErrStatusOwnerGone) {
-			result.ImmediateRequeue = true
-			return result, nil
-		}
-		return DeleteBatchResult{}, err
-	}
-	if len(completed) == 0 {
-		return result, nil
-	}
-	committed, err := completeDeleteBatch(ctx, deps, input, completed)
-	if err != nil {
-		if errors.Is(err, workload.ErrStatusMutationPrecondition) || errors.Is(err, workload.ErrStatusOwnerGone) {
-			result.ImmediateRequeue = true
-			return result, nil
-		}
-		return DeleteBatchResult{}, fmt.Errorf("DeleteBatch: complete wave: %w", err)
-	}
-	result.ImmediateRequeue = committed
-	return result, nil
+	logf.FromContext(ctx).Info("OMENative scale-down wave",
+		"namespace", w.input.Key.Namespace,
+		"isvc", w.input.Key.OwnerName,
+		"component", w.plan.Component,
+		"podBudget", budgetValue,
+		"configuredPodBudget", configuredBudget,
+		"podFootprint", w.footprint,
+		"activePodCost", w.result.SelectedPodCost,
+		"activeInstances", len(w.selection.candidates),
+		"admittedInstances", w.admitted,
+		"deferredInstances", w.result.Deferred)
+}
+
+// staleWrite reports whether a status write failed because the rows moved
+// under the pass or the owner is gone; the pass then asks for a fresh plan
+// in place of an error.
+func staleWrite(err error) bool {
+	return errors.Is(err, workload.ErrStatusMutationPrecondition) || errors.Is(err, workload.ErrStatusOwnerGone)
 }
 
 // selectDeleteBatch picks the wave this pass drives. Delete-owned rows come
@@ -415,6 +416,58 @@ func candidateStatuses(candidates []deleteBatchCandidate) []workload.InstanceSta
 	return rows
 }
 
+// writeDeleting admits a fresh wave: every selected row goes to Deleting
+// under one Delete operation in a single status transaction, with the
+// retry record of an attempt the wave retires (admitDeleteBatch). The pass
+// ends with the write, committed or not: a wave takes no external effect
+// in the pass that admits it, and a write the rows moved under asks for a
+// fresh plan.
+func (w *scaleDownWave) writeDeleting(ctx context.Context) (bool, error) {
+	if !w.selection.fresh {
+		return false, nil
+	}
+	committed, err := admitDeleteBatch(ctx, w.input, w.plan, w.selection.candidates)
+	if err != nil {
+		if staleWrite(err) {
+			w.result.ImmediateRequeue = true
+			return true, nil
+		}
+		return true, fmt.Errorf("DeleteBatch: admit wave: %w", err)
+	}
+	w.result.ImmediateRequeue = committed
+	if committed {
+		w.admitted = len(w.selection.candidates)
+		obsmetrics.RecordScaleDownBatchPods(string(w.plan.Component), w.result.SelectedPodCost)
+		if w.result.Oversized {
+			obsmetrics.RecordScaleDownOversizedBatch(string(w.plan.Component))
+		}
+	}
+	return true, nil
+}
+
+// confirmResumedRows checks, before any external effect, that every row of
+// a resumed wave still carries the wave's own Delete operation
+// (preflightDeleteOwnedBatch). A row already removed has its expectations
+// forgotten, and the pass asks for a fresh plan.
+func (w *scaleDownWave) confirmResumedRows(ctx context.Context) (bool, error) {
+	absent, err := preflightDeleteOwnedBatch(ctx, w.input, w.selection.candidates)
+	if err != nil {
+		if staleWrite(err) {
+			w.result.ImmediateRequeue = true
+			return true, nil
+		}
+		return true, fmt.Errorf("DeleteBatch: verify owned wave: %w", err)
+	}
+	if len(absent) == 0 {
+		return false, nil
+	}
+	for index := range absent {
+		w.deps.ExpectationsCache().Forget(w.input.Key.Namespace, w.input.Key.OwnerName, w.input.Key.Component, index)
+	}
+	w.result.ImmediateRequeue = true
+	return true, nil
+}
+
 func preflightDeleteOwnedBatch(ctx context.Context, input workload.ReconcileInput, candidates []deleteBatchCandidate) (map[int32]struct{}, error) {
 	if input.ApplyInstanceMutationsWithRetryBlock == nil {
 		return nil, fmt.Errorf("DeleteBatch: owner-aware atomic status adapter is required")
@@ -457,136 +510,290 @@ func preflightDeleteOwnedBatch(ctx context.Context, input workload.ReconcileInpu
 	return absent, nil
 }
 
-// The int result counts the rows a permanent apiserver rejection disposed
-// mid-wave: each is left as the rejection left it, out of this wave.
-func driveDeleteBatch(
-	ctx context.Context,
-	deps workload.Deps,
-	input workload.ReconcileInput,
-	plan workload.ComponentPlan,
-	candidates []deleteBatchCandidate,
-) ([]deleteBatchCandidate, time.Time, int, error) {
-	for _, candidate := range candidates {
+// driveDeleteBatch moves a resumed wave's pods toward gone, in one listed
+// order: every pod must carry an observed UID; the pods already
+// Terminating run the force-delete clock; every serving pod leaves
+// rotation before any pod is deleted; then each row waits for its drain
+// and deletes its pods, and a row with no pod left completes. A pod whose
+// identity changed under the pass asks for a fresh plan.
+func (w *scaleDownWave) driveDeleteBatch(ctx context.Context) (bool, error) {
+	steps := []func(context.Context) error{
+		w.requirePodUIDs,
+		w.readTerminatingPods,
+		w.takeOutOfRotation,
+		w.deleteDrainedRows,
+	}
+	for _, step := range steps {
+		if err := step(ctx); err != nil {
+			if errors.Is(err, podreadiness.ErrPodIdentityChanged) {
+				w.result.ImmediateRequeue = true
+				return true, nil
+			}
+			return true, err
+		}
+	}
+	w.recordRequeue()
+	return false, nil
+}
+
+// requirePodUIDs refuses to drive a wave over a pod observed without a
+// UID: every delete is preconditioned on the UID, and a pod without one
+// cannot be told from a replacement at the same name.
+func (w *scaleDownWave) requirePodUIDs(context.Context) error {
+	for _, candidate := range w.selection.candidates {
 		for _, pod := range candidate.pods {
 			if pod.UID == "" {
-				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: refuse to delete pod %s/%s without an observed UID", pod.Namespace, pod.Name)
+				return fmt.Errorf("DeleteBatch: refuse to delete pod %s/%s without an observed UID", pod.Namespace, pod.Name)
 			}
 		}
 	}
-	expectationsSatisfied := make(map[int32]bool, len(candidates))
-	var requeueAt time.Time
-	for _, candidate := range candidates {
-		for _, pod := range candidate.pods {
-			if pod.DeletionTimestamp != nil {
-				next, err := escalateStuckTerminatingWithDeadline(ctx, deps, input, pod, candidate.status.Index)
-				if err != nil {
-					if input.ScaleDownRequeueInterval <= 0 {
-						return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: evaluate stuck-Terminating pod %s: %w", pod.Name, err)
-					}
-					logf.FromContext(ctx).V(1).Info("stuck-Terminating escalation deferred", "pod", pod.Name, "error", err.Error())
-				}
-				requeueAt = earlierTime(requeueAt, next)
-			}
-		}
-		expectationsSatisfied[candidate.status.Index] = deps.ExpectationsCache().Satisfied(
-			input.Key.Namespace, input.Key.OwnerName, input.Key.Component, candidate.status.Index)
-	}
+	return nil
+}
 
-	parked := make(map[int32]struct{})
-	// Every serving hold in the selected wave lands before any member Pod can
-	// be deleted, preserving gang drain atomicity across Instance boundaries.
-	for _, candidate := range candidates {
+// readTerminatingPods runs the force-delete clock on every pod of the wave
+// that is already Terminating, keeping the earliest time the policy wants
+// the pass back, and reads per row whether the expectations cache has
+// seen every delete the row expected. A clock that cannot be read ends the
+// pass only when the scale-down has no poll interval to come back on.
+func (w *scaleDownWave) readTerminatingPods(ctx context.Context) error {
+	for _, candidate := range w.selection.candidates {
 		for _, pod := range candidate.pods {
-			if !podreadiness.IsServing(pod) {
+			if pod.DeletionTimestamp == nil {
 				continue
 			}
-			if err := podreadiness.MarkPodNotServing(ctx, deps.Client, deps.Reader(), pod,
-				podreadiness.WriterDeleteDrain, deleteDrainKey(candidate.status.Index)); err != nil {
-				if handled, derr := disposeRejectedRowWrite(ctx, deps, input, candidate.status.Index, pod.Name, err); handled {
-					if derr != nil {
-						return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: dispose rejected drain (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, derr)
-					}
-					parked[candidate.status.Index] = struct{}{}
-					break
+			next, err := escalateStuckTerminatingWithDeadline(ctx, w.deps, w.input, pod, candidate.status.Index)
+			if err != nil {
+				if w.input.ScaleDownRequeueInterval <= 0 {
+					return fmt.Errorf("DeleteBatch: evaluate stuck-Terminating pod %s: %w", pod.Name, err)
 				}
-				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: mark not serving (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, err)
+				logf.FromContext(ctx).V(1).Info("stuck-Terminating escalation deferred", "pod", pod.Name, "error", err.Error())
 			}
+			w.policyDeadlineAt = earlierTime(w.policyDeadlineAt, next)
+		}
+		w.expectationsSatisfied[candidate.status.Index] = w.deps.ExpectationsCache().Satisfied(
+			w.input.Key.Namespace, w.input.Key.OwnerName, w.input.Key.Component, candidate.status.Index)
+	}
+	return nil
+}
+
+// takeOutOfRotation writes the serving gate false on every serving pod of
+// the wave before any pod is deleted, so a gang leaves traffic whole
+// across its Instances.
+func (w *scaleDownWave) takeOutOfRotation(ctx context.Context) error {
+	for _, candidate := range w.selection.candidates {
+		refused, err := w.markRowNotServing(ctx, candidate)
+		if err != nil {
+			return err
+		}
+		if refused {
+			w.refused[candidate.status.Index] = struct{}{}
 		}
 	}
+	return nil
+}
 
-	drainer := drain.NewBatcher(deps.Reader(), input.Key.Namespace)
-	completed := make([]deleteBatchCandidate, 0)
-	for _, candidate := range candidates {
-		if _, skip := parked[candidate.status.Index]; skip {
+// markRowNotServing takes one row's serving pods out of rotation. It
+// reports true when the apiserver refused the write for good and the
+// refusal was recorded on the row; the row's other pods are left alone.
+func (w *scaleDownWave) markRowNotServing(ctx context.Context, candidate deleteBatchCandidate) (bool, error) {
+	index := candidate.status.Index
+	for _, pod := range candidate.pods {
+		if !podreadiness.IsServing(pod) {
+			continue
+		}
+		err := podreadiness.MarkPodNotServing(ctx, w.deps.Client, w.deps.Reader(), pod, podreadiness.WriterDeleteDrain, deleteDrainKey(index))
+		if err == nil {
+			continue
+		}
+		handled, derr := disposeRejectedRowWrite(ctx, w.deps, w.input, index, pod.Name, err)
+		if !handled {
+			return false, fmt.Errorf("DeleteBatch: mark not serving (instance=%d, pod=%s): %w", index, pod.Name, err)
+		}
+		if derr != nil {
+			return false, fmt.Errorf("DeleteBatch: dispose rejected drain (instance=%d, pod=%s): %w", index, pod.Name, derr)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// deleteDrainedRows walks every row the wave still drives: a row with no
+// pod left completes once its resources are released; a row whose deletes
+// the expectations cache has not yet seen waits; a row still routed waits
+// for its drain; a drained row has its pods deleted.
+func (w *scaleDownWave) deleteDrainedRows(ctx context.Context) error {
+	drainer := drain.NewBatcher(w.deps.Reader(), w.input.Key.Namespace)
+	w.completed = make([]deleteBatchCandidate, 0)
+	for _, candidate := range w.selection.candidates {
+		index := candidate.status.Index
+		if _, skip := w.refused[index]; skip {
 			continue
 		}
 		if len(candidate.pods) == 0 {
-			if input.FinalizeInstanceResources != nil {
-				complete, err := input.FinalizeInstanceResources(ctx, candidate.status.Index)
-				if err != nil {
-					return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: finalize resources (instance=%d): %w", candidate.status.Index, err)
-				}
-				if !complete {
-					continue
-				}
-			}
-			completed = append(completed, candidate)
-			continue
-		}
-		if !expectationsSatisfied[candidate.status.Index] {
-			continue
-		}
-		drained := true
-		for _, pod := range candidate.pods {
-			hash := pod.Labels[query.LabelRevisionHash]
-			if hash == "" {
-				continue
-			}
-			serviceName := query.PerRevisionServiceName(input.Key.OwnerName, plan.Component, hash)
-			podDrained, err := drainer.IsPodDrained(ctx, serviceName, pod)
+			complete, err := w.finalizeEmptyRow(ctx, index)
 			if err != nil {
-				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: check drain (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, err)
+				return err
 			}
-			if !podDrained {
-				drained = false
+			if complete {
+				w.completed = append(w.completed, candidate)
 			}
+			continue
+		}
+		if !w.expectationsSatisfied[index] {
+			continue
+		}
+		drained, err := w.rowDrained(ctx, drainer, candidate)
+		if err != nil {
+			return err
 		}
 		if !drained {
 			continue
 		}
-		for _, pod := range candidate.pods {
-			if pod.DeletionTimestamp != nil {
-				continue
-			}
-			uid := pod.UID
-			deps.ExpectationsCache().ExpectDeletes(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, candidate.status.Index, 1)
-			if err := deps.Client.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil {
-				deps.ExpectationsCache().ObservedDelete(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, candidate.status.Index)
-				// Absence and UID mismatch both prove the observed Pod identity
-				// does not occupy its name.
-				if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-					continue
-				}
-				if handled, derr := disposeRejectedRowWrite(ctx, deps, input, candidate.status.Index, pod.Name, err); handled {
-					if derr != nil {
-						return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: dispose rejected delete (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, derr)
-					}
-					parked[candidate.status.Index] = struct{}{}
-					break
-				}
-				return nil, time.Time{}, 0, fmt.Errorf("DeleteBatch: delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
-			}
+		refused, err := w.deleteRowPods(ctx, candidate)
+		if err != nil {
+			return err
+		}
+		if refused {
+			w.refused[index] = struct{}{}
 		}
 	}
-	return completed, requeueAt, len(parked), nil
+	return nil
 }
 
-// extrasNotParked drops the scale-down victims whose own write the
-// apiserver refused: a row a permanent rejection disposed, while the
-// revision in force denies a fresh attempt and the pod the rejection names
-// still stands in the row's set. Such a victim holds no wave open and is
-// re-admitted once the ladder admits or that pod is gone. A row failed by
-// a refused create names no standing pod and is taken as any extra.
+// finalizeEmptyRow releases the resources of a row with no pod left
+// through the adapter, when the adapter has any to release; the row
+// completes once they are reported gone.
+func (w *scaleDownWave) finalizeEmptyRow(ctx context.Context, index int32) (bool, error) {
+	if w.input.FinalizeInstanceResources == nil {
+		return true, nil
+	}
+	complete, err := w.input.FinalizeInstanceResources(ctx, index)
+	if err != nil {
+		return false, fmt.Errorf("DeleteBatch: finalize resources (instance=%d): %w", index, err)
+	}
+	return complete, nil
+}
+
+// rowDrained reports whether every pod of the row has left its
+// per-revision Service, each read through the pass's one EndpointSlice
+// observation per Service. A pod with no revision label is routed by no
+// per-revision Service and is read as drained.
+func (w *scaleDownWave) rowDrained(ctx context.Context, drainer *drain.Batcher, candidate deleteBatchCandidate) (bool, error) {
+	drained := true
+	for _, pod := range candidate.pods {
+		hash := pod.Labels[query.LabelRevisionHash]
+		if hash == "" {
+			continue
+		}
+		serviceName := query.PerRevisionServiceName(w.input.Key.OwnerName, w.plan.Component, hash)
+		podDrained, err := drainer.IsPodDrained(ctx, serviceName, pod)
+		if err != nil {
+			return false, fmt.Errorf("DeleteBatch: check drain (instance=%d, pod=%s): %w", candidate.status.Index, pod.Name, err)
+		}
+		if !podDrained {
+			drained = false
+		}
+	}
+	return drained, nil
+}
+
+// deleteRowPods deletes the row's pods that are not yet Terminating, each
+// under its observed UID, with the delete expected before the call and the
+// expectation rolled back when the call fails. A pod already gone, or
+// replaced at its name, needs nothing. It reports true when the apiserver
+// refused a delete for good and the refusal was recorded on the row.
+func (w *scaleDownWave) deleteRowPods(ctx context.Context, candidate deleteBatchCandidate) (bool, error) {
+	index := candidate.status.Index
+	for _, pod := range candidate.pods {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		uid := pod.UID
+		w.deps.ExpectationsCache().ExpectDeletes(w.input.Key.Namespace, w.input.Key.OwnerName, w.input.Key.Component, index, 1)
+		err := w.deps.Client.Delete(ctx, pod, client.Preconditions{UID: &uid})
+		if err == nil {
+			continue
+		}
+		w.deps.ExpectationsCache().ObservedDelete(w.input.Key.Namespace, w.input.Key.OwnerName, w.input.Key.Component, index)
+		// Absence and UID mismatch both prove the observed Pod identity
+		// does not occupy its name.
+		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+			continue
+		}
+		handled, derr := disposeRejectedRowWrite(ctx, w.deps, w.input, index, pod.Name, err)
+		if !handled {
+			return false, fmt.Errorf("DeleteBatch: delete pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		if derr != nil {
+			return false, fmt.Errorf("DeleteBatch: dispose rejected delete (instance=%d, pod=%s): %w", index, pod.Name, derr)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// recordRequeue settles what the pass reports after the drive: a wave
+// whose every row the apiserver refused holds nothing open (the rows are
+// admitted again once the retry record admits them or the refused pod is
+// gone), and the force-delete clock sets when the pass runs again.
+func (w *scaleDownWave) recordRequeue() {
+	if len(w.refused) > 0 && len(w.refused) == len(w.selection.candidates) && w.result.Deferred == 0 {
+		w.result.InProgress = false
+	}
+	if w.policyDeadlineAt.IsZero() {
+		return
+	}
+	remaining := w.policyDeadlineAt.Sub(w.input.Now())
+	if remaining <= 0 {
+		w.result.PolicyDeadlineDue = true
+	} else {
+		w.result.RequeueAfter = remaining
+	}
+}
+
+// reportOverdueDrains tells the operator about every Delete-owned row
+// whose drain is past its deadline. It runs after the drive so it reports
+// the wave's own effects, and it changes nothing the removal reads: the
+// record it writes is not part of the delete identity the removal guard
+// tests.
+func (w *scaleDownWave) reportOverdueDrains(ctx context.Context) (bool, error) {
+	err := announceOverdueDrains(ctx, w.deps, w.input, w.plan, w.podsByInstance)
+	if err == nil {
+		return false, nil
+	}
+	if staleWrite(err) {
+		w.result.ImmediateRequeue = true
+		return true, nil
+	}
+	return true, err
+}
+
+// removeRows completes the wave: every row with no pod left is removed in
+// one status transaction fenced on the wave's own operation
+// (completeDeleteBatch). A pass that completed no row ends here; a
+// committed removal asks for a fresh plan.
+func (w *scaleDownWave) removeRows(ctx context.Context) (bool, error) {
+	if len(w.completed) == 0 {
+		return true, nil
+	}
+	committed, err := completeDeleteBatch(ctx, w.deps, w.input, w.completed)
+	if err != nil {
+		if staleWrite(err) {
+			w.result.ImmediateRequeue = true
+			return true, nil
+		}
+		return true, fmt.Errorf("DeleteBatch: complete wave: %w", err)
+	}
+	w.result.ImmediateRequeue = committed
+	return true, nil
+}
+
+// extrasNotParked drops the leaving rows whose own write the apiserver
+// refused: a row a permanent rejection ended, while the revision in force
+// denies a fresh attempt and the pod the rejection names still stands in
+// the row's set. Such a row holds no wave open and is admitted again once
+// the retry record admits or that pod is gone. A row failed by a refused
+// create names no standing pod and is taken as any extra.
 func extrasNotParked(input workload.ReconcileInput, extras []int32, podsByInstance map[int32][]*corev1.Pod) []int32 {
 	kept := make([]int32, 0, len(extras))
 	for _, index := range extras {

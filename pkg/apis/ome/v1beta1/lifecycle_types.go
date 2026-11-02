@@ -121,7 +121,8 @@ const (
 	// waiting for its NextRetryAt.
 	RolloutHoldGateRetryBlock RolloutHoldGate = "RetryBlock"
 	// RolloutHoldGateHeld: a same-target RetryBlock is Held — retry
-	// attempts are exhausted; only a new target revision releases it.
+	// attempts are exhausted; a new target revision, or the operator
+	// release annotation ome.io/release-held-revision, releases it.
 	RolloutHoldGateHeld RolloutHoldGate = "Held"
 )
 
@@ -400,6 +401,19 @@ type InstanceOperation struct {
 	// refusal. Empty means the last create was not refused for capacity.
 	// +optional
 	CapacityRefusedAt *metav1.Time `json:"capacityRefusedAt,omitempty"`
+
+	// PlacementWaitSince is when the attempt started waiting for its pods
+	// to be placed, recorded once a pod name the attempt needs is held by a
+	// node that stopped reporting: the member there must be rebuilt before
+	// the attempt can run. It is the earlier of that moment and the start
+	// of another member's wait for the scheduler. It stays while the
+	// attempt waits, even as the waiting pod changes (one member placed,
+	// the rebuilt member then unplaceable), and is cleared once every pod
+	// the attempt asks for runs on a node or the attempt ends. The
+	// unschedulable grace is measured from it when it is earlier than the
+	// unplaceable pod's own wait. Empty means no such wait is recorded.
+	// +optional
+	PlacementWaitSince *metav1.Time `json:"placementWaitSince,omitempty"`
 
 	// Strategy is the update strategy the operation runs under, pinned
 	// when the operation opens. UpdateStrategy is not part of the revision

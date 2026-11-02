@@ -108,6 +108,8 @@ type RuntimeScorer interface {
    - Calculate compatibility score
 
 3. **Score and Sort**
+   - Only formats marked `autoSelect: true` count, each at its own priority;
+     the format a pod renders with is the one that produced the score
    - Calculate weighted scores based on:
      - Model format match (weight × priority)
      - Model framework match (weight × priority)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"html/template"
+	"maps"
 	"regexp"
 	"strconv"
 	"strings"
@@ -324,6 +325,34 @@ func MergeDecoderSpec(runtimeDecoder, isvcDecoder *v1beta1.DecoderSpec) (*v1beta
 	return merged, nil
 }
 
+// MergeEncoderSpec merges a runtime-provided EncoderSpec with a user-provided
+// EncoderSpec from InferenceService. The user-provided (isvcEncoder) fields
+// take precedence over the runtime defaults. An encoder is a single pod, so
+// there is no leader or worker to fold the component pod spec into.
+func MergeEncoderSpec(runtimeEncoder, isvcEncoder *v1beta1.EncoderSpec) (*v1beta1.EncoderSpec, error) {
+	switch {
+	case isvcEncoder == nil:
+		// if encoder is not specified in isvc, return nil
+		return nil, nil
+	case runtimeEncoder == nil:
+		// if encoder is not specified in runtime, return a copy of isvcEncoder
+		return isvcEncoder.DeepCopy(), nil
+	}
+
+	merged, err := mergeSpec(v1beta1.EncoderSpec{
+		ComponentExtensionSpec: runtimeEncoder.ComponentExtensionSpec,
+		PodSpec:                runtimeEncoder.PodSpec,
+		Runner:                 runtimeEncoder.Runner,
+		TopologySpread:         runtimeEncoder.TopologySpread,
+		TopologySpreadKey:      runtimeEncoder.TopologySpreadKey,
+	}, *isvcEncoder)
+	if err != nil {
+		return nil, err
+	}
+	restoreRunnerName(merged.Runner, runtimeEncoder.Runner)
+	return merged, nil
+}
+
 // ConvertPodSpec converts v1beta1.PodSpec to v1.PodSpec
 // This handles the conversion between the custom v1beta1.PodSpec type and the core v1.PodSpec type
 func ConvertPodSpec(spec *v1beta1.PodSpec) (*v1.PodSpec, error) {
@@ -360,44 +389,32 @@ func ReplacePlaceholders(container *v1.Container, meta metav1.ObjectMeta) error 
 	return json.Unmarshal(buf.Bytes(), container)
 }
 
-// MergeNodeSelector merges node selectors from runtime, accelerator class, and inference service (isvc).
-// Only add mergedNodeSelector to engine and decoder component.
+// MergeNodeSelector merges the node selectors of the runtime, the accelerator
+// class and the InferenceService's component, each later one winning on a
+// shared key. Only a role that runs the model contributes a component
+// selector.
 func MergeNodeSelector(runtime *v1beta1.ServingRuntimeSpec, acceleratorClass *v1beta1.AcceleratorClassSpec, isvc *v1beta1.InferenceService, component v1beta1.ComponentType) map[string]string {
-	// Start with runtime node selector
-	mergedNodeSelector := map[string]string{}
-	if runtime != nil && runtime.ServingRuntimePodSpec.NodeSelector != nil {
-		for k, v := range runtime.ServingRuntimePodSpec.NodeSelector {
-			mergedNodeSelector[k] = v
-		}
+	merged := map[string]string{}
+	if runtime != nil {
+		maps.Copy(merged, runtime.ServingRuntimePodSpec.NodeSelector)
 	}
-
-	// Merge in accelerator class node selector, overriding any conflicts
-	if acceleratorClass != nil && acceleratorClass.Discovery.NodeSelector != nil {
-		for k, v := range acceleratorClass.Discovery.NodeSelector {
-			mergedNodeSelector[k] = v
-		}
+	if acceleratorClass != nil {
+		maps.Copy(merged, acceleratorClass.Discovery.NodeSelector)
 	}
+	maps.Copy(merged, componentNodeSelector(isvc, component))
+	return merged
+}
 
-	// Finally merge in isvc node selector, overriding any conflicts
-	switch component {
-	case v1beta1.EngineComponent:
-		if isvc.Spec.Engine != nil && isvc.Spec.Engine.PodSpec.NodeSelector != nil {
-			for k, v := range isvc.Spec.Engine.PodSpec.NodeSelector {
-				mergedNodeSelector[k] = v
-			}
-		}
-		return mergedNodeSelector
-
-	case v1beta1.DecoderComponent:
-		if isvc.Spec.Decoder != nil && isvc.Spec.Decoder.PodSpec.NodeSelector != nil {
-			for k, v := range isvc.Spec.Decoder.PodSpec.NodeSelector {
-				mergedNodeSelector[k] = v
-			}
-		}
-		return mergedNodeSelector
+// componentNodeSelector is the node selector the InferenceService sets on a
+// role that runs the model; any other component contributes none.
+func componentNodeSelector(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) map[string]string {
+	if role, ok := v1beta1.RoleOf(component); !ok || !role.RunsModel {
+		return nil
 	}
-
-	return mergedNodeSelector
+	if view := v1beta1.SpecOf(&isvc.Spec, component); view != nil {
+		return view.PodSpec.NodeSelector
+	}
+	return nil
 }
 
 // MergeSchedulerName back-fills the runtime's top-level schedulerName
@@ -407,7 +424,7 @@ func MergeNodeSelector(runtime *v1beta1.ServingRuntimeSpec, acceleratorClass *v1
 // InferenceService or the runtime's component config) always wins, and
 // with nothing set anywhere the field stays empty so the cluster's
 // default scheduler applies.
-func MergeSchedulerName(runtime *v1beta1.ServingRuntimeSpec, engine *v1beta1.EngineSpec, decoder *v1beta1.DecoderSpec, router *v1beta1.RouterSpec) {
+func MergeSchedulerName(runtime *v1beta1.ServingRuntimeSpec, specs v1beta1.RoleSpecs) {
 	if runtime == nil || runtime.ServingRuntimePodSpec.SchedulerName == "" {
 		return
 	}
@@ -418,90 +435,60 @@ func MergeSchedulerName(runtime *v1beta1.ServingRuntimeSpec, engine *v1beta1.Eng
 			spec.SchedulerName = name
 		}
 	}
-	if engine != nil {
-		fill(&engine.PodSpec)
-		if engine.Leader != nil {
-			fill(&engine.Leader.PodSpec)
+	for _, view := range specs.Declared() {
+		fill(view.PodSpec)
+		if view.Leader != nil {
+			fill(&view.Leader.PodSpec)
 		}
-		if engine.Worker != nil {
-			fill(&engine.Worker.PodSpec)
+		if view.Worker != nil {
+			fill(&view.Worker.PodSpec)
 		}
-	}
-	if decoder != nil {
-		fill(&decoder.PodSpec)
-		if decoder.Leader != nil {
-			fill(&decoder.Leader.PodSpec)
-		}
-		if decoder.Worker != nil {
-			fill(&decoder.Worker.PodSpec)
-		}
-	}
-	if router != nil {
-		fill(&router.PodSpec)
 	}
 }
 
-// MergeResource fills the container's resource requests/limits from
-// the matching runtime container when the operator hasn't set them on
-// the InferenceService spec (fill-only), then applies the accelerator
-// class's declared resources, which take precedence over the runtime's.
+// MergeResource fills the container's requests and limits from the runtime
+// container of the same name wherever the container sets none, then sets the
+// accelerator class's resources, which win over both.
 func MergeResource(container *v1.Container, acceleratorClass *v1beta1.AcceleratorClassSpec, runtime *v1beta1.ServingRuntimeSpec) {
 	if container == nil {
 		return
 	}
+	runtimeResources := runtimeContainerResources(runtime, container.Name)
+	container.Resources.Requests = fillResourceList(container.Resources.Requests, runtimeResources.Requests, acceleratorClass)
+	container.Resources.Limits = fillResourceList(container.Resources.Limits, runtimeResources.Limits, acceleratorClass)
+}
 
-	// Merge resource requests.
-	if container.Resources.Requests == nil {
-		container.Resources.Requests = v1.ResourceList{}
+// runtimeContainerResources are the resources of the first runtime container
+// with the given name; a runtime without one contributes nothing.
+func runtimeContainerResources(runtime *v1beta1.ServingRuntimeSpec, name string) v1.ResourceRequirements {
+	if runtime == nil {
+		return v1.ResourceRequirements{}
 	}
-	// Merge resource requests from runtime with the same container name if it does not already exist.
-	if runtime != nil && runtime.ServingRuntimePodSpec.Containers != nil {
-		for _, rtContainer := range runtime.ServingRuntimePodSpec.Containers {
-			if rtContainer.Name == container.Name {
-				for resourceName, quantity := range rtContainer.Resources.Requests {
-					if _, exists := container.Resources.Requests[resourceName]; !exists {
-						container.Resources.Requests[resourceName] = quantity.DeepCopy()
-					}
-				}
-				break
-			}
+	for _, rtContainer := range runtime.ServingRuntimePodSpec.Containers {
+		if rtContainer.Name == name {
+			return rtContainer.Resources
 		}
 	}
-	// Merge resource requests from accelerator class.
-	// AcceleratorClass takes precedence and overrides runtime resources.
-	if acceleratorClass != nil && acceleratorClass.Resources != nil {
-		for _, resource := range acceleratorClass.Resources {
-			resourceName := v1.ResourceName(resource.Name)
-			quantity := resource.Quantity
-			container.Resources.Requests[resourceName] = quantity.DeepCopy()
-		}
-	}
+	return v1.ResourceRequirements{}
+}
 
-	// Merge resource limits
-	if container.Resources.Limits == nil {
-		container.Resources.Limits = v1.ResourceList{}
+// fillResourceList adds the runtime quantities for the names the list lacks,
+// then sets every accelerator class resource. A nil list becomes an empty one.
+func fillResourceList(list, runtimeList v1.ResourceList, acceleratorClass *v1beta1.AcceleratorClassSpec) v1.ResourceList {
+	if list == nil {
+		list = v1.ResourceList{}
 	}
-	// Merge resource limits from runtime with the same container name if it does not already exist.
-	if runtime != nil && runtime.ServingRuntimePodSpec.Containers != nil {
-		for _, rtContainer := range runtime.ServingRuntimePodSpec.Containers {
-			if rtContainer.Name == container.Name {
-				for resourceName, quantity := range rtContainer.Resources.Limits {
-					if _, exists := container.Resources.Limits[resourceName]; !exists {
-						container.Resources.Limits[resourceName] = quantity.DeepCopy()
-					}
-				}
-				break
-			}
+	for name, quantity := range runtimeList {
+		if _, exists := list[name]; !exists {
+			list[name] = quantity.DeepCopy()
 		}
 	}
-	// AcceleratorClass takes precedence and overrides runtime resource limits.
-	if acceleratorClass != nil && acceleratorClass.Resources != nil {
+	if acceleratorClass != nil {
 		for _, resource := range acceleratorClass.Resources {
-			resourceName := v1.ResourceName(resource.Name)
-			quantity := resource.Quantity
-			container.Resources.Limits[resourceName] = quantity.DeepCopy()
+			list[v1.ResourceName(resource.Name)] = resource.Quantity.DeepCopy()
 		}
 	}
+	return list
 }
 
 // extractArgKey extracts the key from an argument string for deduplication and override matching.

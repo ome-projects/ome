@@ -39,46 +39,20 @@ type componentRevisionSpec struct {
 // Component. nil when the Component is not declared on the spec, so
 // add/remove of a whole Component also reads as a change.
 func componentRevisionSpecFor(spec *v1beta1.InferenceServiceSpec, c v1beta1.ComponentType) *componentRevisionSpec {
-	if spec == nil {
+	role := declaredRoles(spec).find(c)
+	if role == nil {
 		return nil
 	}
-	switch c {
-	case v1beta1.EngineComponent:
-		if e := spec.Engine; e != nil {
-			return &componentRevisionSpec{
-				PodSpec:     &e.PodSpec,
-				Runner:      e.Runner,
-				Leader:      e.Leader,
-				Worker:      e.Worker,
-				TopologyKey: e.TopologyKey,
-				Labels:      e.Labels,
-				Annotations: e.Annotations,
-			}
-		}
-	case v1beta1.DecoderComponent:
-		if d := spec.Decoder; d != nil {
-			return &componentRevisionSpec{
-				PodSpec:     &d.PodSpec,
-				Runner:      d.Runner,
-				Leader:      d.Leader,
-				Worker:      d.Worker,
-				TopologyKey: d.TopologyKey,
-				Labels:      d.Labels,
-				Annotations: d.Annotations,
-			}
-		}
-	case v1beta1.RouterComponent:
-		if r := spec.Router; r != nil {
-			return &componentRevisionSpec{
-				PodSpec:     &r.PodSpec,
-				Runner:      r.Runner,
-				Config:      r.Config,
-				Labels:      r.Labels,
-				Annotations: r.Annotations,
-			}
-		}
+	return &componentRevisionSpec{
+		PodSpec:     role.podSpec,
+		Runner:      role.runner,
+		Leader:      role.leader,
+		Worker:      role.worker,
+		TopologyKey: role.topologyKey,
+		Config:      role.routerConfig,
+		Labels:      role.extension.Labels,
+		Annotations: role.extension.Annotations,
 	}
-	return nil
 }
 
 // componentRevisionSpecChanged reports whether the Component's

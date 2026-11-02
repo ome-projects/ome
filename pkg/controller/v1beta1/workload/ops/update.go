@@ -330,15 +330,17 @@ func inPlaceStrategy(strategy workload.UpdateStrategyType) bool {
 // SurgeHasNoSource reports whether a fresh start on the row has nothing a
 // surge could keep in rotation: the Instance was never promoted, so no pod
 // of its is a serving source, and the attempt that built its pod set has
-// ended, disposed or kept as the Create the gang verdict ended. Such a
-// start runs as a recreate under every strategy, so the update pass reads
-// it here to consult the admission gate for a rebuild rather than a surge.
-// A kept surge operation is the surge machine's own continuation.
+// ended, disposed, kept as the Create the gang verdict ended, or stopped
+// at UpdateStepParked. Such a start runs as a recreate under every
+// strategy, so the update pass reads it here to consult the admission
+// gate for a rebuild rather than a surge. A kept surge operation is the
+// surge machine's own continuation; a stopped one claims nothing, and the
+// start over it replaces the set it left in place.
 func SurgeHasNoSource(s *workload.InstanceStatus) bool {
 	if s == nil || s.RunningRevision != "" || s.Phase != workload.InstancePhaseFailed {
 		return false
 	}
-	return s.Operation == nil || s.Operation.Type == workload.InstanceOperationCreate
+	return s.Operation == nil || s.Operation.Type == workload.InstanceOperationCreate || workload.OperationParked(s.Operation)
 }
 
 // InPlaceFallsBackToRecreate reports whether an in-place strategy runs as
@@ -697,8 +699,11 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 	// Same-target retry gate: a persisted RetryBlock for the CURRENT
 	// target denies FRESH re-triggering. A different target revision is
 	// a different RetrySubject and passes. A continuation (the teardown
-	// or abandon of a failed candidate) is exempt, by the same predicate
-	// the dispatcher admits and charges with.
+	// or abandon of a failed candidate) is exempt, by the predicate the
+	// dispatcher lists continuations with. The one continuation the
+	// dispatcher admits and charges, a Failed surge claim the edited
+	// strategy replaces drain-first (FailedSurgeStartsDrainFirst), keeps
+	// the exemption: the edit, not the retry schedule, reopens it.
 	if b := workload.FindRetryBlock(input.ObservedState.RetryBlocks, target.Name); b != nil && !workload.UpdateContinuation(s) {
 		denied, retryAfter := evaluateRetryBlockGate(b, input.Now(),
 			anyInFlightUpdateAt(input.ObservedState.InstanceStatuses, target.Name))
@@ -849,6 +854,22 @@ func effectiveUpdateStrategy(s *workload.InstanceStatus, desired workload.Update
 		return desired
 	}
 	return s.Operation.Strategy
+}
+
+// FailedSurgeStartsDrainFirst reports a Failed row that still claims a
+// surge, so its own pod set kept serving while the replacement came up,
+// whose next start runs on a drain-first mechanism rather than on the
+// surge machine: the edited strategy is read over the row, and a recreate
+// or an in-place patch takes the serving set offline. The selection
+// admits and charges such a start as a fresh one, the way it would any
+// drain-first start, instead of listing it as the continuation the row's
+// claim makes it. A Failed gang source past its Surge step stays with the
+// surge machine (failedGangSurgeDrainContinuation), and a desired surge
+// strategy resumes the surge over the claim and takes nothing offline.
+func FailedSurgeStartsDrainFirst(s *workload.InstanceStatus, desired workload.UpdateStrategyType) bool {
+	return s != nil && s.Phase == workload.InstancePhaseFailed && surgeClaim(s) &&
+		!isSurgeOwnedStatus(s) &&
+		effectiveUpdateStrategy(s, desired) != workload.UpdateStrategySurgeThenDrain
 }
 
 // isGangSurgeTargetMarker reports whether s is a gang surge-target marker —

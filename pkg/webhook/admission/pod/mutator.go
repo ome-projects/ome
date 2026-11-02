@@ -93,20 +93,15 @@ func (mutator *Mutator) mutate(pod *v1.Pod, configMap *v1.ConfigMap) error {
 		return err
 	}
 
-	rdmaInjector := NewRDMAInjector()
-	shmInjector := NewShmInjector()
-	probeInjector := NewProbeInjector()
-	observabilityInjector := NewObservabilityInjector()
-
 	mutators := []func(pod *v1.Pod) error{
 		modelInitInjector.InjectModelInit,
 		metricsAggregator.InjectMetricsAggregator,
 		fineTunedAdapterInjector.InjectFineTunedAdapter,
 		servingSidecarInjector.InjectServingSidecar,
-		rdmaInjector.InjectRDMA,
-		shmInjector.InjectShm,
-		probeInjector.InjectProbes,
-		observabilityInjector.InjectObservability,
+		injectRDMA,
+		injectShm,
+		injectProbes,
+		injectObservability,
 	}
 
 	for _, mutator := range mutators {

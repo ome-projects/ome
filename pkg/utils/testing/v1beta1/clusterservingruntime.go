@@ -165,6 +165,16 @@ func (w *ClusterServingRuntimeWrapper) DecoderRunner(c corev1.Container) *Cluste
 	return w
 }
 
+// EncoderRunner sets spec.encoderConfig.runner — same pattern as
+// DecoderRunner but for the encoder component.
+func (w *ClusterServingRuntimeWrapper) EncoderRunner(c corev1.Container) *ClusterServingRuntimeWrapper {
+	if w.Spec.EncoderConfig == nil {
+		w.Spec.EncoderConfig = &v1beta1.EncoderSpec{}
+	}
+	w.Spec.EncoderConfig.Runner = &v1beta1.RunnerSpec{Container: c}
+	return w
+}
+
 // RouterRunner sets spec.routerConfig.runner.
 func (w *ClusterServingRuntimeWrapper) RouterRunner(c corev1.Container) *ClusterServingRuntimeWrapper {
 	if w.Spec.RouterConfig == nil {

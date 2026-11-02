@@ -434,7 +434,7 @@ func TestResume_ClearsRolledBackHoldAndTakesTheRollbackVerb(t *testing.T) {
 	in := baseInputs(isvc, map[string]int32{"old": 4})
 	// A completed rollback moved every Instance back to the stable revision,
 	// but the replica keeps reporting the spec's revision as its target, so
-	// the observed target still names the parked canary. The rollback closed
+	// the observed target still names the stopped canary. The rollback closed
 	// the run, which is why this terminal needs no pinned plan.
 	in.CanaryRevisionHash = "new"
 	in.RunActive = false
@@ -488,15 +488,15 @@ func TestResume_RolledBackDoesNotRunTheStepsOnTheResumePass(t *testing.T) {
 	}
 }
 
-// TestResume_RefusedWhenNoMemberTargetsTheParkedRevision: a resume that
+// TestResume_RefusedWhenNoMemberTargetsTheStoppedRevision: a resume that
 // arrives after the operator set the spec back to the stable revision has
 // nothing to re-enter. Four engine Instances, version 2 rolled back, the spec
 // back on version 1, then a resume naming version 2: the verb is refused with
 // a warning that names the value and each member's target, the hold keeps
 // its revert signal, the annotation is removed, and the next pass changes
-// nothing. Without the refusal the record re-armed toward version 2 and the
+// nothing. Without the refusal the record restarted the steps toward version 2 and the
 // run layer then recorded a canary of version 1 over itself.
-func TestResume_RefusedWhenNoMemberTargetsTheParkedRevision(t *testing.T) {
+func TestResume_RefusedWhenNoMemberTargetsTheStoppedRevision(t *testing.T) {
 	cases := []struct {
 		name        string
 		members     []v1beta1.ComponentType

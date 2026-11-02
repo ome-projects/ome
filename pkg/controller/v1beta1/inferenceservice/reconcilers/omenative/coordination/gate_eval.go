@@ -27,7 +27,11 @@ import (
 // sequential. First denial wins; later gates short-circuit. The caller
 // reads the allowed bit and may also surface gate + denyReason as a
 // RolloutHold; gate names Pairing, Ratio (the batch step reports under
-// it), Budget (surge or unavailability), or Sequential accordingly.
+// it), Held (the batch step's wait on a named first side whose retry
+// record is Held), Budget (surge or unavailability), or Sequential
+// accordingly. A member of a prefill/decode canary unit stops after the
+// pairing gate: the canary executor stages its capacity and its own budget
+// paces its starts.
 //
 // The batch step takes the ratio gate's place for the members of a group
 // whose engine and decoder both step (readBatchStep): a drain-first member
@@ -37,7 +41,10 @@ import (
 // the serving band. The budget gates still cap each wake-up. Under the
 // operator's keepRatio setting a pairing member that patches single pods in
 // place steps too, and the two sides' batches are planned to the group's
-// tolerance; under firstSide the named side moves first inside each batch.
+// tolerance; under firstSide the named side moves first inside each batch,
+// and while that side's retry record is Held the other side's wait on it
+// reads Held, naming the side and its record, so the roll is held as a
+// whole until a corrected revision or a release of the record.
 //
 // Ratio projection is strategy-aware (see the projDelta computation
 // below): SurgeThenDrain projects +1 (a Ready pod is added before the old
@@ -110,6 +117,14 @@ func EvaluateUpdateGate(
 		return false, v1beta1.RolloutHoldGatePairing, pairing.reason
 	}
 
+	// A member of a prefill/decode canary unit answers to the pairing gate
+	// alone: the canary executor stages its capacity through the partition
+	// and its own budget paces its starts, so the batch step, the ratio
+	// band, the group budgets and the Sequential gate are not consulted.
+	if gateCtx.CanaryUnit {
+		return true, "", ""
+	}
+
 	// The batch step reads every member's replica; a read it cannot make
 	// fails closed like the other gates, under the gate name its hold uses.
 	batch, err := gateCtx.readBatchStep()
@@ -128,8 +143,8 @@ func EvaluateUpdateGate(
 		if pairing.peerHeldStill {
 			waived = pairingPeer(component)
 		}
-		if held, reason := batch.hold(waived); held {
-			return false, v1beta1.RolloutHoldGateRatio, reason
+		if gate, reason := batch.hold(waived); gate != "" {
+			return false, gate, reason
 		}
 	case !inPlace:
 		// Strategy-aware ratio projection. SurgeThenDrain adds a Ready pod
@@ -201,12 +216,13 @@ func EvaluatePlanGate(isvc *v1beta1.InferenceService, component v1beta1.Componen
 }
 
 // GateWaitsOnPeerCounters reports whether a hold on gate is released by a
-// peer Component's serving counters moving. The pair floor and the ratio
-// band simulate the step against the peers' live serving counts, so a
-// replica they deny waits on exactly those transitions. Every other gate
-// waits on something else: a peer's revision or the plan pin (Sequential,
-// Plan), the Component's own budget (Budget), or its own retry state
-// (RetryBlock, Held).
+// peer Component's status moving. The pair floor and the ratio band
+// simulate the step against the peers' live serving counts, and a Held
+// hold may name a peer whose retry record is Held, which a release or a
+// corrected revision on that peer ends; a replica they deny waits on
+// exactly those transitions. Every other gate waits on something else: a
+// peer's revision or the plan pin (Sequential, Plan), the Component's own
+// budget (Budget), or its own retry schedule (RetryBlock).
 func GateWaitsOnPeerCounters(gate v1beta1.RolloutHoldGate) bool {
-	return gate == v1beta1.RolloutHoldGatePairing || gate == v1beta1.RolloutHoldGateRatio
+	return gate == v1beta1.RolloutHoldGatePairing || gate == v1beta1.RolloutHoldGateRatio || gate == v1beta1.RolloutHoldGateHeld
 }

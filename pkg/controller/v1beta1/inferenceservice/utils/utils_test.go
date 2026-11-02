@@ -1525,7 +1525,7 @@ func TestMergeDecoderSpec(t *testing.T) {
 	}
 }
 
-func TestDetermineEngineDeploymentMode(t *testing.T) {
+func TestRoleDeploymentModeOfAnEngine(t *testing.T) {
 	intPtr := func(i int) *int { return &i }
 
 	tests := []struct {
@@ -1640,7 +1640,7 @@ func TestDetermineEngineDeploymentMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := DetermineEngineDeploymentMode(tt.engine, nil)
+			result := RoleDeploymentMode(v1beta1.RoleSpecs{Engine: tt.engine}.View(v1beta1.EngineComponent), nil)
 			assert.Equal(t, tt.expectedMode, result)
 		})
 	}
@@ -1715,14 +1715,14 @@ func TestMergedRunnerPorts(t *testing.T) {
 	// rather than an empty-but-present entry it might read as authoritative.
 	decoder := &v1beta1.DecoderSpec{Runner: &v1beta1.RunnerSpec{}}
 
-	got := MergedRunnerPorts(engine, decoder, router)
+	got := MergedRunnerPorts(v1beta1.RoleSpecs{Engine: engine, Decoder: decoder, Router: router})
 	assert.Equal(t, enginePorts, got[v1beta1.EngineComponent])
 	assert.Equal(t, routerPorts, got[v1beta1.RouterComponent])
 	assert.NotContains(t, got, v1beta1.DecoderComponent)
 
 	// Absent Components and portless Components contribute nothing.
-	assert.Empty(t, MergedRunnerPorts(nil, nil, nil))
-	assert.Empty(t, MergedRunnerPorts(&v1beta1.EngineSpec{}, nil, nil))
+	assert.Empty(t, MergedRunnerPorts(v1beta1.RoleSpecs{}))
+	assert.Empty(t, MergedRunnerPorts(v1beta1.RoleSpecs{Engine: &v1beta1.EngineSpec{}}))
 }
 
 // The serving container's ports can be declared on the Component's own pod
@@ -1735,7 +1735,7 @@ func TestMergedRunnerPorts_FallsBackToPodContainer(t *testing.T) {
 		engine := &v1beta1.EngineSpec{PodSpec: v1beta1.PodSpec{
 			Containers: []v1.Container{{Name: "ome-container", Ports: podPorts}},
 		}}
-		assert.Equal(t, podPorts, MergedRunnerPorts(engine, nil, nil)[v1beta1.EngineComponent])
+		assert.Equal(t, podPorts, MergedRunnerPorts(v1beta1.RoleSpecs{Engine: engine})[v1beta1.EngineComponent])
 	})
 
 	t.Run("portless runner uses the container it merges into", func(t *testing.T) {
@@ -1746,7 +1746,7 @@ func TestMergedRunnerPorts_FallsBackToPodContainer(t *testing.T) {
 				{Name: "runner", Ports: podPorts},
 			}},
 		}
-		assert.Equal(t, podPorts, MergedRunnerPorts(engine, nil, nil)[v1beta1.EngineComponent])
+		assert.Equal(t, podPorts, MergedRunnerPorts(v1beta1.RoleSpecs{Engine: engine})[v1beta1.EngineComponent])
 	})
 }
 
@@ -1823,7 +1823,7 @@ func TestMergedRunnerPorts_UsesEffectiveLeaderTemplateForMultiPod(t *testing.T) 
 					t.Fatalf("MergeDecoderSpec: %v", err)
 				}
 			}
-			assert.Equal(t, tc.want, MergedRunnerPorts(engine, decoder, nil)[tc.component])
+			assert.Equal(t, tc.want, MergedRunnerPorts(v1beta1.RoleSpecs{Engine: engine, Decoder: decoder})[tc.component])
 		})
 	}
 }
@@ -1843,7 +1843,7 @@ func TestMergedRunnerPorts_InvalidMultiPodShapeUsesTopLevelTemplate(t *testing.T
 		Leader: &v1beta1.LeaderSpec{Runner: &v1beta1.RunnerSpec{Container: v1.Container{Ports: leaderPorts}}},
 	}
 
-	got := MergedRunnerPorts(engine, decoder, nil)
+	got := MergedRunnerPorts(v1beta1.RoleSpecs{Engine: engine, Decoder: decoder})
 	assert.Equal(t, topLevelPorts, got[v1beta1.EngineComponent])
 	assert.Equal(t, topLevelPorts, got[v1beta1.DecoderComponent])
 }

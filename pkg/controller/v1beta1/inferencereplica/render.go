@@ -64,14 +64,7 @@ func serviceShell(ir *v1beta1.InferenceReplica) *v1beta1.InferenceService {
 			DeploymentMode: ptr.To(constants.OMENative),
 		},
 	}
-	switch ir.Spec.Component {
-	case v1beta1.EngineComponent:
-		shell.Spec.Engine = &v1beta1.EngineSpec{}
-	case v1beta1.DecoderComponent:
-		shell.Spec.Decoder = &v1beta1.DecoderSpec{}
-	case v1beta1.RouterComponent:
-		shell.Spec.Router = &v1beta1.RouterSpec{}
-	}
+	v1beta1.DeclareRole(&shell.Spec, ir.Spec.Component)
 	return shell
 }
 

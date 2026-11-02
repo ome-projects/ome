@@ -2,7 +2,6 @@ package status
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -87,6 +86,7 @@ func StampRejected(ctx context.Context, input types.ReconcileInput, idx int32, t
 		if !keepOperation {
 			s.Operation = nil
 		}
+		clearPlacementWait(s)
 		captured := *termination
 		s.LastFailure = &captured
 		return true
@@ -150,6 +150,7 @@ func StampFailedKeepingOperation(termination *types.InstanceTermination) func(*t
 			return false
 		}
 		s.Phase = types.InstancePhaseFailed
+		clearPlacementWait(s)
 		captured := *termination
 		s.LastFailure = &captured
 		return true
@@ -233,13 +234,28 @@ func StampFailedParkingAttempt(ctx context.Context, input types.ReconcileInput, 
 // with the operation kept because its pod set still stands. A Failed row is
 // outside every pass that reads the clock, so a deadline left on it would
 // name a time nobody acts on; the zero deadline reads as "never expires".
-// Every other field stays: the step, the identity and the retry count the
-// repair's retry schedule reads survive the write.
+// The attempt's placement wait goes with it: the attempt after this one
+// waits on its own. Every other field stays: the step, the identity and
+// the retry count the repair's retry schedule reads survive the write.
 func keepOperationWithoutDeadline(s *types.InstanceStatus) *types.InstanceOperation {
 	op := *s.Operation
 	op.Deadline = metav1.Time{}
+	op.PlacementWaitSince = nil
 	s.Operation = &op
 	return s.Operation
+}
+
+// clearPlacementWait retires the attempt's placement wait and reports
+// whether there was one. A Failed write that ends an attempt with its
+// operation kept calls it, so the attempt after it waits on its own clock.
+func clearPlacementWait(s *types.InstanceStatus) bool {
+	if s.Operation == nil || s.Operation.PlacementWaitSince == nil {
+		return false
+	}
+	op := *s.Operation
+	op.PlacementWaitSince = nil
+	s.Operation = &op
+	return true
 }
 
 // SameAttempt reports whether two operations are the same attempt: the
@@ -251,11 +267,11 @@ func SameAttempt(a, b types.InstanceOperation) bool {
 	return a.StartedAt.Equal(&b.StartedAt)
 }
 
-// FollowParkedAttempt gives a parked attempt the phase its pod set earns:
+// FollowStoppedAttempt gives a stopped attempt the phase its pod set earns:
 // Updating while the full set serves, Failed otherwise. waiting, when
 // non-empty, replaces the wait the row names. A row whose operation is
-// not a parked attempt has moved on and is left alone.
-func FollowParkedAttempt(serving bool, waiting string) func(*types.InstanceStatus) bool {
+// not a stopped attempt has moved on and is left alone.
+func FollowStoppedAttempt(serving bool, waiting string) func(*types.InstanceStatus) bool {
 	return func(s *types.InstanceStatus) bool {
 		if !types.OperationParked(s.Operation) {
 			return false
@@ -567,6 +583,35 @@ func StampRestarting(ctx context.Context, input types.ReconcileInput, idx int32,
 	return observedIncarnation, err
 }
 
+// RestartReplacesItsRebuiltSet moves an open repair's Incarnation from
+// observed to the next value, so the set the attempt built reads as the
+// old set the next phases drain and delete, and the set built after it is
+// the attempt's rebuild at the roll target. The attempt goes on: its
+// identity, reason and retry count stay, its progress is dated now, and
+// its deadline is set again from now, as the roll's own retarget of an
+// attempt does. A row that no longer carries that attempt at observed is
+// left alone. Returns the row's Incarnation after the write and whether
+// this call moved it.
+func RestartReplacesItsRebuiltSet(ctx context.Context, input types.ReconcileInput, idx int32, observed int64, timeout time.Duration) (int64, bool, error) {
+	incarnation, moved := observed, false
+	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		incarnation, moved = s.Incarnation, false
+		if s.Phase != types.InstancePhaseRestarting || s.Operation == nil ||
+			s.Operation.Type != types.InstanceOperationRestart || s.Incarnation != observed {
+			return false
+		}
+		s.Incarnation++
+		incarnation, moved = s.Incarnation, true
+		now := metav1.NewTime(input.Now())
+		op := *s.Operation
+		op.LastProgressAt = now
+		op.Deadline = types.DeadlineAt(now, timeout)
+		s.Operation = &op
+		return true
+	})
+	return incarnation, moved, err
+}
+
 // StampRestartRevision records rev as the revision an open repair rebuilds
 // at: RunningRevision on a Restarting row, written before the first pod of
 // the rebuild is created, so the row's revision names the pod set the
@@ -826,62 +871,16 @@ func StampStep(
 	if expected == nil || expected.Operation == nil {
 		return false, nil
 	}
-	if err := RequireOwner(input); err != nil {
-		return false, err
-	}
-	before := Capture(expected)
-	after := before.WithStep(step)
-	ownerUID := input.OwnerObject.GetUID()
-	confirmed := false
-	committed := false
-	mutate := func(status *types.InstanceStatus) bool {
-		if after.Matches(*status) {
-			confirmed = true
-			return false
-		}
-		if !before.Matches(*status) {
-			return false
-		}
-		status.Operation.Step = step
-		if updateProgress {
-			status.Operation.LastProgressAt = metav1.NewTime(input.Now())
-		}
-		return true
-	}
-	mutation := types.InstanceMutation{
-		Index:  expected.Index,
-		Mutate: mutate,
-		BatchPrecondition: func(snapshot types.InstanceMutationSnapshot) bool {
-			confirmed = false
-			if snapshot.OwnerUID != ownerUID {
-				return false
-			}
-			current, found := snapshot.Instances[expected.Index]
-			if !found {
-				return false
-			}
-			if after.Matches(current) {
-				confirmed = true
-				return true
-			}
-			return before.Matches(current)
-		},
-		Postcondition: func(status *types.InstanceStatus) bool {
-			return status != nil && after.Matches(*status)
-		},
-		OnCommit: func(_, _ *types.InstanceStatus) {
-			committed = true
-		},
-	}
-
-	err := Apply(ctx, input, []types.InstanceMutation{mutation})
-	if errors.Is(err, types.ErrStatusMutationPrecondition) || errors.Is(err, types.ErrStatusOwnerGone) {
-		return false, nil
-	}
+	write, err := newGuardedWrite(input)
 	if err != nil {
 		return false, err
 	}
-	return committed || confirmed, nil
+	var progressAt func() time.Time
+	if updateProgress {
+		progressAt = input.Now
+	}
+	mutation := write.stepTransition(Capture(expected), step, nil, progressAt)
+	return write.commit(ctx, input, []types.InstanceMutation{mutation}, "", nil)
 }
 
 // RetryBlockAttemptStarted marks an existing due-Backoff RetryBlock

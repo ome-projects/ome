@@ -120,10 +120,9 @@ func checkConfig(ctx context.Context, kube kubernetes.Interface, inventory *Inve
 		report.Error = err.Error()
 		return report
 	}
-	report.Observed = &ExpectedStatusConfig{InstanceStatusEncoding: parsed.InstanceStatusEncoding, MaxDecodedInstances: parsed.MaxDecodedInstances}
-	report.Matches = report.Observed.InstanceStatusEncoding == inventory.OMENativeStatus.InstanceStatusEncoding &&
-		report.Observed.Bound() == inventory.OMENativeStatus.Bound() &&
-		(report.Observed.MaxDecodedInstances == nil) == (inventory.OMENativeStatus.MaxDecodedInstances == nil)
+	observed := ObservedStatusConfig(*parsed)
+	report.Observed = &observed
+	report.Matches = inventory.OMENativeStatus.Matches(observed)
 	return report
 }
 
@@ -244,19 +243,12 @@ func (c *ClusterReport) deriveReasons(inventory *Inventory) {
 	}
 	if len(c.Replicas.AboveBound) != 0 {
 		c.fail(ReasonAboveBound, "%d %s objects exceed maxDecodedInstances (%s): %s",
-			len(c.Replicas.AboveBound), irstatus.EncodingColumnarV2, boundString(inventory.OMENativeStatus), strings.Join(c.Replicas.AboveBound, ", "))
+			len(c.Replicas.AboveBound), irstatus.EncodingColumnarV2, inventory.OMENativeStatus.BoundString("none configured"), strings.Join(c.Replicas.AboveBound, ", "))
 	}
 	if len(c.Replicas.Undecodable) != 0 {
 		c.fail(ReasonUndecodable, "%d InferenceReplica objects cannot be decoded: %s", len(c.Replicas.Undecodable), c.Replicas.Undecodable)
 	}
 	sort.SliceStable(c.Reasons, func(i, j int) bool { return c.Reasons[i].Kind < c.Reasons[j].Kind })
-}
-
-func boundString(expected ExpectedStatusConfig) string {
-	if expected.MaxDecodedInstances == nil {
-		return "none configured"
-	}
-	return fmt.Sprintf("%d", *expected.MaxDecodedInstances)
 }
 
 func (c *ClusterReport) fail(kind ReasonKind, format string, args ...any) {

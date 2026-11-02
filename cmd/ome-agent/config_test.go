@@ -32,7 +32,7 @@ func TestConfigProviderPassesArtifactReuseEnvironmentOverrideToReplicaConfig(t *
 
 	var configuredViper *viper.Viper
 	app := fx.New(
-		configProvider(command, nil),
+		configProvider(command),
 		fx.Populate(&configuredViper),
 	)
 	require.NoError(t, app.Err())
@@ -68,7 +68,7 @@ func TestConfigProviderLeavesArtifactReuseDisabledWithoutEnvironmentOverride(t *
 
 	var configuredViper *viper.Viper
 	app := fx.New(
-		configProvider(command, nil),
+		configProvider(command),
 		fx.Populate(&configuredViper),
 	)
 	require.NoError(t, app.Err())

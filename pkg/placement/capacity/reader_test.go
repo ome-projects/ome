@@ -11,10 +11,9 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 var sampleTime = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -49,11 +48,7 @@ func inputs() fixture {
 
 func read(t *testing.T, f fixture) (map[string]Sample, error) {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := v1beta1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.root.DeepCopy()).Build()
+	cl := fakeclient.New(t, fakeclient.WithObjects(f.root.DeepCopy()))
 	return (Reader{Client: cl, RootName: "root", MaxAge: time.Minute}).Read(context.Background(), f.clusters, f.demands, sampleTime.Add(time.Second))
 }
 
@@ -282,7 +277,7 @@ func TestReaderConfiguration(t *testing.T) {
 		{name: "missing current time", wantError: "current time", configure: func(_ *Reader, now *time.Time) { *now = time.Time{} }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			r := Reader{Client: fake.NewClientBuilder().Build(), RootName: "root", MaxAge: time.Minute}
+			r := Reader{Client: fakeclient.New(t), RootName: "root", MaxAge: time.Minute}
 			now := sampleTime
 			if tt.configure != nil {
 				tt.configure(&r, &now)
@@ -308,11 +303,7 @@ func TestReaderConfiguration(t *testing.T) {
 }
 
 func TestReaderMissingRoot(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := v1beta1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	r := Reader{Client: fake.NewClientBuilder().WithScheme(scheme).Build(), RootName: "root", MaxAge: time.Minute}
+	r := Reader{Client: fakeclient.New(t), RootName: "root", MaxAge: time.Minute}
 	f := inputs()
 	got, err := r.Read(context.Background(), f.clusters, f.demands, sampleTime)
 	if err == nil || !strings.Contains(err.Error(), "read fleet capacity") {

@@ -5,13 +5,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/types"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
-	"knative.dev/pkg/network"
 )
 
 // OME Constants
@@ -24,7 +21,6 @@ var (
 // InferenceService Constants
 var (
 	InferenceServiceName          = "inferenceservice"
-	InferenceServiceAPIName       = "inferenceservices"
 	InferenceServicePodLabelKey   = OMEAPIGroupName + "/" + InferenceServiceName
 	InferenceServiceConfigMapName = "inferenceservice-config"
 	BaseModelFinalizer            = "basemodels.ome.io/finalizer"
@@ -38,7 +34,6 @@ var (
 
 // OME Agent Constants
 var (
-	AgentName                         = "ome-agent"
 	AgentAppName                      = "OME_AGENT"
 	AgentModelNameEnvVarKey           = AgentAppName + "_" + "MODEL_NAME"
 	AgentModelStoreDirectoryEnvVarKey = AgentAppName + "_" + "MODEL_STORE_DIRECTORY"
@@ -63,12 +58,6 @@ var (
 	AgentZippedFineTunedWeightDirectory   = AgentAppName + "_" + "ZIPPED_FINE_TUNED_WEIGHT_DIRECTORY"
 )
 
-// InferenceService MultiModel Constants
-
-var (
-	ModelConfigFileName = "models.json"
-)
-
 // Model agent Constants
 const (
 	AgentConfigMapKeyName = "agent"
@@ -78,7 +67,6 @@ const (
 // InferenceService Annotations
 var (
 	DeploymentMode                          = OMEAPIGroupName + "/deploymentMode"
-	EnableRoutingTagAnnotationKey           = OMEAPIGroupName + "/enable-tag-routing"
 	AutoscalerClass                         = OMEAPIGroupName + "/autoscalerClass"
 	AutoscalerPropagatedMetadataKeys        = OMEAPIGroupName + "/autoscaler-propagated-metadata-keys"
 	AutoscalerPolicyLastRendered            = OMEAPIGroupName + "/last-rendered-autoscaler"
@@ -87,7 +75,6 @@ var (
 	WorkloadClusterRolloutPolicyLabel       = OMEAPIGroupName + "/rollout-policy"
 	AutoscalerMetrics                       = OMEAPIGroupName + "/metrics"
 	TargetUtilizationPercentage             = OMEAPIGroupName + "/targetUtilizationPercentage"
-	DeprecationWarning                      = OMEAPIGroupName + "/deprecation-warning"
 	EnableMetricAggregation                 = OMEAPIGroupName + "/enable-metric-aggregation"
 	SetPrometheusAnnotation                 = OMEAPIGroupName + "/enable-prometheus-scraping"
 	DedicatedAICluster                      = OMEAPIGroupName + "/dedicated-ai-cluster"
@@ -107,7 +94,6 @@ var (
 	FTServingWithMergedWeightsAnnotationKey = OMEAPIGroupName + "/fine-tuned-serving-with-merged-weights"
 	ServiceType                             = OMEAPIGroupName + "/service-type"
 	LoadBalancerIP                          = OMEAPIGroupName + "/load-balancer-ip"
-	EntrypointComponent                     = OMEAPIGroupName + "/entrypoint-component"
 	ContainerPrometheusPortKey              = "prometheus.ome.io/port"
 	ContainerPrometheusPathKey              = "prometheus.ome.io/path"
 	// ExtraPodMetricsEndpointsAnnotationKey declares ADDITIONAL PodMonitor
@@ -238,7 +224,7 @@ var (
 	// InferenceReplicaTemplateHashAnnotationKey is the hash of the pod
 	// templates a projected InferenceReplica's spec holds, with the gang
 	// settings a revision covers and without the inherited annotation keys
-	// the revision leaves out. The projector stamps it in the same write as
+	// the revision leaves out. The projector sets it in the same write as
 	// the templates, so it moves exactly when the spec's revision would and
 	// stays put when only an excluded annotation value, the replica count,
 	// a pause, a partition or a rollback target changes. The replica's
@@ -308,18 +294,10 @@ const (
 // Controller Constants
 var (
 	DefaultMinReplicas = 1
-
-	IstioSidecarInjectionLabel = "sidecar.istio.io/inject"
 )
 
 type AutoscalerClassType string
 type AutoscalerMetricsType string
-type AutoScalerKPAMetricsType string
-
-// Autoscaler Default Class
-var (
-	DefaultAutoscalerClass = AutoscalerClassHPA
-)
 
 // Autoscaler Class
 var (
@@ -391,10 +369,6 @@ const (
 	ModelConfigKey = "models.json"
 )
 
-const (
-	SentenceTransformersConfigFileName = "config_sentence_transformers.json"
-)
-
 type InferenceServiceComponent string
 
 type InferenceServiceVerb string
@@ -410,10 +384,10 @@ const (
 
 // InferenceService Component enums
 const (
-	Predictor InferenceServiceComponent = "predictor"
-	Router    InferenceServiceComponent = "router"
-	Engine    InferenceServiceComponent = "engine"
-	Decoder   InferenceServiceComponent = "decoder"
+	Router  InferenceServiceComponent = "router"
+	Engine  InferenceServiceComponent = "engine"
+	Decoder InferenceServiceComponent = "decoder"
+	Encoder InferenceServiceComponent = "encoder"
 )
 
 // InferenceService protocol enums
@@ -425,28 +399,19 @@ const (
 
 // InferenceService Endpoint Ports
 const (
-	InferenceServiceDefaultHttpPort     = "8080"
-	InferenceServiceDefaultAgentPortStr = "9081"
-	InferenceServiceDefaultAgentPort    = 9081
-	CommonDefaultHttpPort               = 80
-	CommonISVCPort                      = 8080
-	AggregateMetricsPortName            = "aggr-metric"
+	InferenceServiceDefaultHttpPort = "8080"
+	CommonISVCPort                  = 8080
+	AggregateMetricsPortName        = "aggr-metric"
 )
 
 // Labels to put on kservice
 const (
 	OMEComponentLabel = "component"
-	OMEEndpointLabel  = "endpoint"
 )
 
 // Labels for TrainedModel
 const (
 	InferenceServiceLabel = "ome.io/inferenceservice"
-)
-
-// InferenceService default/canary constants
-const (
-	InferenceServiceDefault = "default"
 )
 
 // DAC/InferenceService/TrainingJob container names
@@ -461,15 +426,6 @@ const (
 // Model Agents Constants
 const (
 	AuthtypeOKEWorkloadIdentity = "OkeWorkloadIdentity"
-)
-
-// Serving Container Block Lists
-const (
-	BlocklistConfigMapVolumeName = "configmap-blocklist-volume"
-	InputBlocklistSubPath        = "input.txt"
-	OutputBlocklistSubPath       = "output.txt"
-	InputBlocklistMountPath      = "/usr/bin/input.txt"
-	OutputBlocklistMountPath     = "/usr/bin/output.txt"
 )
 
 // Cohere volume mount paths
@@ -489,7 +445,6 @@ const (
 
 // Constants used for inference container arguments
 const (
-	LLamaVllmServedModelNameArgName         = "--served-model-name"
 	LLamaVllmFTServingServedModelNamePrefix = "/data"
 )
 
@@ -574,8 +529,6 @@ const (
 
 // container state reason
 const (
-	StateReasonRunning          = "Running"
-	StateReasonCompleted        = "Completed"
 	StateReasonError            = "Error"
 	StateReasonCrashLoopBackOff = "CrashLoopBackOff"
 )
@@ -599,11 +552,6 @@ const (
 	PodGroupKind = "PodGroup"
 )
 
-// Volcano Job Labels
-const (
-	VolcanoJobLabelName = "volcano.sh/job-name"
-)
-
 // Kueue related Labels
 const (
 	KueueQueueLabelKey                 = "kueue.x-k8s.io/queue-name"
@@ -615,7 +563,6 @@ const (
 var (
 	NodeInstanceShapeLabel           = "node.kubernetes.io/instance-type"
 	DeprecatedNodeInstanceShapeLabel = "beta.kubernetes.io/instance-type"
-	ModelsLabelPrefix                = "models.ome/"
 	TargetInstanceShapes             = "models.ome.io/target-instance-shapes"
 	ModelStatusConfigMapLabel        = "models.ome/basemodel-status"
 	ReserveModelArtifact             = "models.ome/reserve-model-artifact"
@@ -645,17 +592,11 @@ const (
 	LoraTrainingStrategy TrainingStrategy = "lora"
 )
 
-type ServingStrategy string
-
 // Default training job constants
 const (
 	TrainingJobName                   = "trainingjob"
 	MergedModelWeightZippedFileSuffix = "-merged-weight"
 )
-
-type TrainingSidecarRuntime string
-
-type TrainingRuntimeType string
 
 // Training sidecar env variable key names and config key names
 
@@ -677,7 +618,6 @@ type ModelVendor string
 const (
 	Meta   ModelVendor = "meta"
 	Cohere ModelVendor = "cohere"
-	OpenAI ModelVendor = "openai"
 )
 
 // BaseModelType enum
@@ -688,10 +628,8 @@ const (
 )
 
 const (
-	BaseModel                 string = "BaseModel"
-	ClusterBaseModel          string = "ClusterBaseModel"
-	LowerCaseBaseModel        string = "basemodel"
-	LowerCaseClusterBaseModel string = "clusterbasemodel"
+	BaseModel        string = "BaseModel"
+	ClusterBaseModel string = "ClusterBaseModel"
 )
 
 func (c CheckResultType) String() string {
@@ -711,10 +649,6 @@ func (c CheckResultType) String() string {
 	default:
 		return "Invalid"
 	}
-}
-
-func GetModelsLabelWithUid(uid types.UID) string {
-	return ModelsLabelPrefix + string(uid)
 }
 
 // GetRawServiceLabel returns the shared label value for Raw workload resources.
@@ -755,39 +689,6 @@ func LWSName(componentName string) string {
 	return TruncateNameWithPrefix(componentName, lwsNamePrefix, maxLWSNameLength)
 }
 
-func InferenceServiceHostName(name string, namespace string, domain string) string {
-	var builder strings.Builder
-	// Pre-allocate capacity: name + "." + namespace + "." + domain
-	builder.Grow(len(name) + len(namespace) + len(domain) + 2)
-	builder.WriteString(name)
-	builder.WriteByte('.')
-	builder.WriteString(namespace)
-	builder.WriteByte('.')
-	builder.WriteString(domain)
-	return builder.String()
-}
-
-func DefaultPredictorServiceName(name string) string {
-	var builder strings.Builder
-	predictorStr := string(Predictor)
-	// Pre-allocate capacity: name + "-" + predictorStr + "-" + InferenceServiceDefault
-	builder.Grow(len(name) + len(predictorStr) + len(InferenceServiceDefault) + 2)
-	builder.WriteString(name)
-	builder.WriteByte('-')
-	builder.WriteString(predictorStr)
-	builder.WriteByte('-')
-	builder.WriteString(InferenceServiceDefault)
-	return builder.String()
-}
-
-func DefaultRouterServiceName(name string) string {
-	return name + "-" + string(Router) + "-" + InferenceServiceDefault
-}
-
-func PredictorServiceName(name string) string {
-	return name
-}
-
 func RouterServiceName(name string) string {
 	return name + "-router"
 }
@@ -798,43 +699,6 @@ func DecoderServiceName(name string) string {
 
 func EngineServiceName(name string) string {
 	return name + "-engine"
-}
-
-func DecoderPrefix() string {
-	return "^/v1/.*$"
-}
-
-func PathBasedExplainPrefix() string {
-	return "(/v1/.*)$"
-}
-
-// FallbackPrefix returns the regex pattern to match any path
-func FallbackPrefix() string {
-	return "^/.*$"
-}
-
-// Should only match 1..65535, but for simplicity it matches 0-99999.
-const portMatch = `(?::\d{1,5})?`
-
-// HostRegExp returns an ECMAScript regular expression to match either host or host:<any port>
-// for clusterLocalHost, we will also match the prefixes.
-func HostRegExp(host string) string {
-	localDomainSuffix := ".svc." + network.GetClusterDomainName()
-	if !strings.HasSuffix(host, localDomainSuffix) {
-		return exact(regexp.QuoteMeta(host) + portMatch)
-	}
-	prefix := regexp.QuoteMeta(strings.TrimSuffix(host, localDomainSuffix))
-	clusterSuffix := regexp.QuoteMeta("." + network.GetClusterDomainName())
-	svcSuffix := regexp.QuoteMeta(".svc")
-	return exact(prefix + optional(svcSuffix+optional(clusterSuffix)) + portMatch)
-}
-
-func exact(regexp string) string {
-	return "^" + regexp + "$"
-}
-
-func optional(regexp string) string {
-	return "(" + regexp + ")?"
 }
 
 // Kubernetes naming constraints
@@ -1069,6 +933,42 @@ func ParseModelInfoFromConfigMapKey(configMapKey string) (namespace, modelName s
 	return "", "", false, false
 }
 
+// ModelInitInjectionKey is the model-init injection annotation; it is listed
+// in PodOnlyAnnotationPrefixes so it never reaches a Service.
+var ModelInitInjectionKey = OMEAPIGroupName + "/inject-model-init"
+
+// ArtifactCompleteMarkerFileName is the OCI-artifact reuse marker: the object
+// written next to a model's artifacts once their upload is complete, so
+// concurrent downloaders can detect it.
+const ArtifactCompleteMarkerFileName = ".ome-artifact-complete"
+
+// IsArtifactCompleteMarkerObjectName reports whether objectName is (or ends
+// with) the artifact-complete sentinel.
+func IsArtifactCompleteMarkerObjectName(objectName string) bool {
+	return objectName == ArtifactCompleteMarkerFileName || strings.HasSuffix(objectName, "/"+ArtifactCompleteMarkerFileName)
+}
+
+// MigrationRequestAnnotationPrefix prefixes the UUID-suffixed
+// migration-request annotations (`ome.io/migration-request-v1-<uuid>`)
+// written onto an InferenceService. The workload audit package carries
+// the same value for the controller-side consumer.
+var MigrationRequestAnnotationPrefix = OMEAPIGroupName + "/migration-request-v1-"
+
+// TruncateNameWithPrefix truncates name to fit maxLength together with the
+// given prefix, preserving the prefix whole when possible.
+func TruncateNameWithPrefix(name, prefix string, maxLength int) string {
+	if maxLength <= 0 {
+		return ""
+	}
+
+	payloadMaxLength := maxLength - len(prefix)
+	if payloadMaxLength <= 0 {
+		return TruncateNameWithMaxLength(prefix, maxLength)
+	}
+
+	return prefix + TruncateNameWithMaxLength(name, payloadMaxLength)
+}
+
 // Env keys the agent's model-decryption and artifact-reuse paths consume.
 var (
 	AgentKeyNameEnvVarKey                    = AgentAppName + "_" + "KEY_NAME"
@@ -1079,36 +979,27 @@ var (
 	AgentTensorRTLLMVersionsEnvVarKey        = AgentAppName + "_" + "TENSORRTLLM_VERSION"
 )
 
-// Model decryption and model-init injection annotation keys.
+// Model decryption annotation keys and the model-init container name.
 var (
 	BaseModelDecryptionKeyName    = OMEAPIGroupName + "/base-model-decryption-key-name"
 	BaseModelDecryptionSecretName = OMEAPIGroupName + "/base-model-decryption-secret-name"
 	DisableModelDecryption        = OMEAPIGroupName + "/disable-model-decryption"
-	ModelInitInjectionKey         = OMEAPIGroupName + "/inject-model-init"
 	ModelInitContainerName        = "model-init"
 )
 
 // OCI-artifact reuse markers: sentinel objects written next to a model's
-// artifacts so concurrent downloaders can detect a complete or in-flight
-// upload.
+// artifacts so concurrent downloaders can detect an in-flight upload.
 const (
-	ArtifactCompleteMarkerFileName = ".ome-artifact-complete"
-	ArtifactCompleteMarkerBody     = "complete\n"
-	ArtifactUploadLockFileName     = ".ome-artifact-upload.lock"
-	ArtifactUploadLockBody         = "uploading\n"
-	HfArtifactConfigMapKeyPrefix   = "artifact.huggingface."
+	ArtifactCompleteMarkerBody   = "complete\n"
+	ArtifactUploadLockFileName   = ".ome-artifact-upload.lock"
+	ArtifactUploadLockBody       = "uploading\n"
+	HfArtifactConfigMapKeyPrefix = "artifact.huggingface."
 	// HfArtifactReadyMarkerFileName records the parent operation's LockID.
 	// It is distinct from the Object Storage completion marker.
 	HfArtifactReadyMarkerFileName = ".ome-hf-artifact-ready"
 	// ModelArtifactsDirectory names the directory for shared artifact parents.
 	ModelArtifactsDirectory = "_artifacts"
 )
-
-// IsArtifactCompleteMarkerObjectName reports whether objectName is (or ends
-// with) the artifact-complete sentinel.
-func IsArtifactCompleteMarkerObjectName(objectName string) bool {
-	return objectName == ArtifactCompleteMarkerFileName || strings.HasSuffix(objectName, "/"+ArtifactCompleteMarkerFileName)
-}
 
 // IsArtifactUploadLockObjectName reports whether objectName is (or ends with)
 // the artifact upload-lock sentinel.
@@ -1155,46 +1046,4 @@ var (
 	// AlfredOptOutReasonAnnotationKey is a free-text operator note
 	// explaining an opt-out; surfaced in events, never parsed.
 	AlfredOptOutReasonAnnotationKey = AlfredAPIGroupName + "/opt-out-reason"
-	// MigrationRequestAnnotationPrefix prefixes the UUID-suffixed
-	// migration-request annotations (`ome.io/migration-request-v1-<uuid>`)
-	// written onto an InferenceService. The workload audit package carries
-	// the same value for the controller-side consumer.
-	MigrationRequestAnnotationPrefix = OMEAPIGroupName + "/migration-request-v1-"
 )
-
-// Annotation-driven KEDA scaling keys and defaults.
-const (
-	KedaScalingOperator         = "autoscaling.keda.sh/operator"
-	KedaScalingThreshold        = "autoscaling.keda.sh/threshold"
-	KedaPrometheusQuery         = "autoscaling.keda.sh/prometheus.query"
-	KedaPrometheusServerAddress = "autoscaling.keda.sh/prometheus.serverAddress"
-	KedaDefaultMinReplicas      = 1
-)
-
-// Istio and scheduling names.
-const (
-	IstioMeshGateway        = "mesh"
-	IstioVirtualServiceKind = "VirtualService"
-	VolcanoScheduler        = "volcano"
-
-	DedicatedAiClusterPreemptionPriorityClass = "volcano-scheduling-high-priority"
-
-	// RevisionLabel is the pod label used to look up pods for non-raw deployment modes.
-	// The key retains its historical serving.knative.dev prefix.
-	RevisionLabel = "serving.knative.dev/revision"
-)
-
-// TruncateNameWithPrefix truncates name to fit maxLength together with the
-// given prefix, preserving the prefix whole when possible.
-func TruncateNameWithPrefix(name, prefix string, maxLength int) string {
-	if maxLength <= 0 {
-		return ""
-	}
-
-	payloadMaxLength := maxLength - len(prefix)
-	if payloadMaxLength <= 0 {
-		return TruncateNameWithMaxLength(prefix, maxLength)
-	}
-
-	return prefix + TruncateNameWithMaxLength(name, payloadMaxLength)
-}

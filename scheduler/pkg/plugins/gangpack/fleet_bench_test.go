@@ -52,14 +52,14 @@ func fleetPermitCases(tb testing.TB) []fleetPermitCase {
 			for n := 0; n < gangSize; n++ {
 				nodes = append(nodes, fmt.Sprintf("%s-n%d", domain, n))
 			}
-			_, token, ok := assignments.ChooseInTopologyOnNodes(gangKey(i), testKey,
+			_, token, ok := assignments.Choose(placement.Gang{Group: gangKey(i), TopologyKey: testKey},
 				topology.FreeByDomain{domain: gangSize}, map[string][]string{domain: nodes}, gangSize)
 			if !ok {
 				tb.Fatalf("gang %d found no domain", i)
 			}
 			tokens[i] = token
 			for m := 0; m < gangSize-1; m++ {
-				assignments.PlaceIf(gangKey(i), token)
+				assignments.Place(gangKey(i), token)
 				pod := fleetGangPod(i, m)
 				g.rememberAttempt(pod, token)
 				waiting = append(waiting, &benchWaitingPod{pod: pod})
@@ -70,7 +70,7 @@ func fleetPermitCases(tb testing.TB) []fleetPermitCase {
 		// The last gang's eighth member arrives: Reserve has drained its slot,
 		// so the gate opens for the whole gang.
 		admitting := gangs - 1
-		assignments.PlaceIf(gangKey(admitting), tokens[admitting])
+		assignments.Place(gangKey(admitting), tokens[admitting])
 		admitState := newCycleState()
 		writeAssignment(admitState, fmt.Sprintf("dom-%d", admitting),
 			gangInfo{key: gangKey(admitting), minMember: gangSize, topologyKey: testKey, timeout: time.Minute}, tokens[admitting])

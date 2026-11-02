@@ -26,7 +26,6 @@ package factory
 import (
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/rest"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic"
@@ -34,22 +33,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic/translators/envoygateway"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic/translators/istio"
 	"sigs.k8s.io/ome/pkg/utils"
-)
-
-// Well-known GroupVersionKinds for backend-policy CRDs. Listed in
-// translator-priority order — the factory probes each in turn and
-// picks the first match.
-var (
-	envoyGatewayBackendTrafficPolicyGVK = schema.GroupVersionKind{
-		Group:   "gateway.envoyproxy.io",
-		Version: "v1alpha1",
-		Kind:    "BackendTrafficPolicy",
-	}
-	istioDestinationRuleGVK = schema.GroupVersionKind{
-		Group:   "networking.istio.io",
-		Version: "v1",
-		Kind:    "DestinationRule",
-	}
 )
 
 // crdProbe abstracts utils.IsCrdAvailable for test injection. The
@@ -71,18 +54,18 @@ func New(cfg *rest.Config) (traffic.Translator, error) {
 
 func newWithProbe(cfg *rest.Config, probe crdProbe) (traffic.Translator, error) {
 	// 1. Envoy Gateway BackendTrafficPolicy (preferred).
-	found, err := probe(cfg, envoyGatewayBackendTrafficPolicyGVK.GroupVersion().String(), envoyGatewayBackendTrafficPolicyGVK.Kind)
+	found, err := probe(cfg, envoygateway.PolicyGVK.GroupVersion().String(), envoygateway.PolicyGVK.Kind)
 	if err != nil {
-		return nil, fmt.Errorf("probe %s: %w", envoyGatewayBackendTrafficPolicyGVK.String(), err)
+		return nil, fmt.Errorf("probe %s: %w", envoygateway.PolicyGVK.String(), err)
 	}
 	if found {
 		return envoygateway.New(), nil
 	}
 
 	// 2. Istio DestinationRule.
-	found, err = probe(cfg, istioDestinationRuleGVK.GroupVersion().String(), istioDestinationRuleGVK.Kind)
+	found, err = probe(cfg, istio.PolicyGVK.GroupVersion().String(), istio.PolicyGVK.Kind)
 	if err != nil {
-		return nil, fmt.Errorf("probe %s: %w", istioDestinationRuleGVK.String(), err)
+		return nil, fmt.Errorf("probe %s: %w", istio.PolicyGVK.String(), err)
 	}
 	if found {
 		return istio.New(), nil

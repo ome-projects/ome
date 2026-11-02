@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -51,63 +53,137 @@ func (p ResolvedCapacityPolicy) IsEnabled() bool {
 	return p.Enabled
 }
 
+// policyBlock is one block of the routing policy that an InferenceService may
+// replace or clear: the probe block or the capacity block.
+type policyBlock interface {
+	ProbeConfig | CapacityConfig
+	IsEnabled() bool
+	Validate() error
+}
+
+// effectiveBlock is one InferenceService's effective probe or capacity block.
+// Enabled requires the routing gate and a configured block; Digest identifies
+// every setting that can change an observation and is empty otherwise.
+type effectiveBlock[T policyBlock] struct {
+	Enabled bool
+	Block   T
+	Digest  string
+}
+
+// resolveBlock applies one InferenceService's override to the operator's block
+// and checks the result. With routing switched off the block is inert and goes
+// unchecked. An override replaces the operator's block whole (the zero block
+// clears it), and a fault in an override is reported under "spec.". An enabled
+// block must also respect the observer's limits before it gets a digest.
+func resolveBlock[T policyBlock](
+	routingEnabled bool,
+	operator T,
+	override *T,
+	observerLimits func(T) error,
+	digest func(T) (string, error),
+) (effectiveBlock[T], error) {
+	block := operator
+	if override != nil {
+		block = *override
+	}
+	if !routingEnabled {
+		return effectiveBlock[T]{Block: block}, nil
+	}
+	if err := block.Validate(); err != nil {
+		return effectiveBlock[T]{}, inSpec(err, override != nil)
+	}
+	if !block.IsEnabled() {
+		return effectiveBlock[T]{Block: block}, nil
+	}
+	if err := observerLimits(block); err != nil {
+		return effectiveBlock[T]{}, inSpec(err, override != nil)
+	}
+	policyDigest, err := digest(block)
+	if err != nil {
+		return effectiveBlock[T]{}, err
+	}
+	return effectiveBlock[T]{Enabled: true, Block: block, Digest: policyDigest}, nil
+}
+
+// inSpec reports a fault under "spec." when the InferenceService's own block
+// caused it, so the message names the object the operator has to fix.
+func inSpec(err error, fromSpec bool) error {
+	if fromSpec {
+		return fmt.Errorf("spec.%w", err)
+	}
+	return err
+}
+
+// routingSpecOf is the InferenceService's routing block, nil when it has none.
+func routingSpecOf(spec *v1beta1.InferenceServiceSpec) *v1beta1.RoutingSpec {
+	if spec == nil {
+		return nil
+	}
+	return spec.Routing
+}
+
+// routingEnabledFor applies the InferenceService's own switch to the
+// operator's routing gate: a service may opt out, never in.
+func routingEnabledFor(global Config, routing *v1beta1.RoutingSpec) bool {
+	if routing != nil && routing.Enabled != nil && !*routing.Enabled {
+		return false
+	}
+	return global.Enabled
+}
+
+// probeOverride is what the InferenceService says about the probe block: nil
+// when it says nothing, the zero block when it marks the probe Disabled,
+// otherwise the inline probe whole.
+func probeOverride(routing *v1beta1.RoutingSpec) *ProbeConfig {
+	if routing == nil || routing.Probe == nil {
+		return nil
+	}
+	override := ProbeConfig{}
+	if !routing.Probe.Disabled {
+		override = probeConfigFromSpec(routing.Probe)
+	}
+	return &override
+}
+
+// capacityOverride is what the InferenceService says about the capacity block,
+// read by the same rule as probeOverride.
+func capacityOverride(routing *v1beta1.RoutingSpec) *CapacityConfig {
+	if routing == nil || routing.Capacity == nil {
+		return nil
+	}
+	override := CapacityConfig{}
+	if !routing.Capacity.Disabled {
+		override = capacityConfigFromSpec(routing.Capacity)
+	}
+	return &override
+}
+
 // ResolveProbePolicy resolves only the probe portion of an InferenceService's
 // routing policy. Capacity and publisher overrides are independent and do not
 // participate in probe resolution.
 func ResolveProbePolicy(global Config, spec *v1beta1.InferenceServiceSpec) (ResolvedProbePolicy, error) {
-	probe := cloneProbeConfig(global.Probe)
-	routingEnabled := global.Enabled
-	var inline *v1beta1.RoutingProbeSpec
-	if spec != nil && spec.Routing != nil {
-		routing := spec.Routing
-		if routing.Enabled != nil && !*routing.Enabled {
-			routingEnabled = false
-		}
-		inline = routing.Probe
-	}
-
-	if inline != nil {
+	routing := routingSpecOf(spec)
+	if routing != nil && routing.Probe != nil {
 		if err := validation.ValidateRouting(&v1beta1.InferenceServiceSpec{
-			Routing: &v1beta1.RoutingSpec{Probe: inline},
+			Routing: &v1beta1.RoutingSpec{Probe: routing.Probe},
 		}); err != nil {
 			return ResolvedProbePolicy{}, err
 		}
-		if inline.Disabled {
-			probe = ProbeConfig{}
-		} else {
-			probe = probeConfigFromSpec(inline)
-		}
 	}
-
-	if !routingEnabled {
-		return ResolvedProbePolicy{Probe: probe}, nil
-	}
-	if err := probe.Validate(); err != nil {
-		if inline != nil {
-			return ResolvedProbePolicy{}, fmt.Errorf("spec.%w", err)
-		}
-		return ResolvedProbePolicy{}, err
-	}
-	if !probe.IsEnabled() {
-		return ResolvedProbePolicy{Probe: probe}, nil
-	}
-	if global.Observer.MinPeriod > 0 && probe.Period < global.Observer.MinPeriod {
-		err := fmt.Errorf("routing.probe.period (%s) must be at least routing.observer.minPeriod (%s)",
-			probe.Period, global.Observer.MinPeriod)
-		if inline != nil {
-			return ResolvedProbePolicy{}, fmt.Errorf("spec.%w", err)
-		}
-		return ResolvedProbePolicy{}, err
-	}
-
-	digest, err := probePolicyDigest(probe)
+	resolved, err := resolveBlock(
+		routingEnabledFor(global, routing),
+		cloneProbeConfig(global.Probe),
+		probeOverride(routing),
+		global.Observer.probeLimits,
+		probePolicyDigest,
+	)
 	if err != nil {
 		return ResolvedProbePolicy{}, err
 	}
 	return ResolvedProbePolicy{
-		Enabled:      true,
-		Probe:        probe,
-		PolicyDigest: digest,
+		Enabled:      resolved.Enabled,
+		Probe:        resolved.Block,
+		PolicyDigest: resolved.Digest,
 	}, nil
 }
 
@@ -148,67 +224,28 @@ func probePolicyDigest(probe ProbeConfig) (string, error) {
 // InferenceService's routing policy. Probe and publisher overrides are
 // independent and do not participate in capacity resolution.
 func ResolveCapacityPolicy(global Config, spec *v1beta1.InferenceServiceSpec) (ResolvedCapacityPolicy, error) {
-	capacity := cloneCapacityConfig(global.Capacity)
-	routingEnabled := global.Enabled
-	var inline *v1beta1.RoutingCapacitySpec
-	if spec != nil && spec.Routing != nil {
-		routing := spec.Routing
-		if routing.Enabled != nil && !*routing.Enabled {
-			routingEnabled = false
-		}
-		inline = routing.Capacity
-	}
-
-	if inline != nil {
+	routing := routingSpecOf(spec)
+	if routing != nil && routing.Capacity != nil {
 		if err := validation.ValidateRouting(&v1beta1.InferenceServiceSpec{
-			Routing: &v1beta1.RoutingSpec{Capacity: inline},
+			Routing: &v1beta1.RoutingSpec{Capacity: routing.Capacity},
 		}); err != nil {
 			return ResolvedCapacityPolicy{}, err
 		}
-		if inline.Disabled {
-			capacity = CapacityConfig{}
-		} else {
-			capacity = capacityConfigFromSpec(inline)
-		}
 	}
-
-	if !routingEnabled {
-		return ResolvedCapacityPolicy{Capacity: capacity}, nil
-	}
-	if err := capacity.Validate(); err != nil {
-		if inline != nil {
-			return ResolvedCapacityPolicy{}, fmt.Errorf("spec.%w", err)
-		}
-		return ResolvedCapacityPolicy{}, err
-	}
-	if !capacity.IsEnabled() {
-		return ResolvedCapacityPolicy{Capacity: capacity}, nil
-	}
-	if global.Observer.MinPeriod > 0 && capacity.Period < global.Observer.MinPeriod {
-		err := fmt.Errorf("routing.capacity.period (%s) must be at least routing.observer.minPeriod (%s)",
-			capacity.Period, global.Observer.MinPeriod)
-		if inline != nil {
-			return ResolvedCapacityPolicy{}, fmt.Errorf("spec.%w", err)
-		}
-		return ResolvedCapacityPolicy{}, err
-	}
-	if global.Observer.MaxSamples > 0 && capacity.samples() > global.Observer.MaxSamples {
-		err := fmt.Errorf("routing.capacity.samples (%d) must not exceed routing.observer.maxSamples (%d)",
-			capacity.samples(), global.Observer.MaxSamples)
-		if inline != nil {
-			return ResolvedCapacityPolicy{}, fmt.Errorf("spec.%w", err)
-		}
-		return ResolvedCapacityPolicy{}, err
-	}
-
-	digest, err := capacityPolicyDigest(capacity)
+	resolved, err := resolveBlock(
+		routingEnabledFor(global, routing),
+		cloneCapacityConfig(global.Capacity),
+		capacityOverride(routing),
+		global.Observer.capacityLimits,
+		capacityPolicyDigest,
+	)
 	if err != nil {
 		return ResolvedCapacityPolicy{}, err
 	}
 	return ResolvedCapacityPolicy{
-		Enabled:      true,
-		Capacity:     capacity,
-		PolicyDigest: digest,
+		Enabled:      resolved.Enabled,
+		Capacity:     resolved.Block,
+		PolicyDigest: resolved.Digest,
 	}, nil
 }
 
@@ -275,7 +312,7 @@ func canonicalStatuses(statuses []int) []int {
 	if len(statuses) == 0 {
 		return nil
 	}
-	canonical := cloneInts(statuses)
+	canonical := slices.Clone(statuses)
 	sort.Ints(canonical)
 	n := 1
 	for _, status := range canonical[1:] {
@@ -305,46 +342,35 @@ func ResolveConfig(
 	if err := validation.ValidateRouting(spec); err != nil {
 		return Config{}, err
 	}
-	if spec == nil || spec.Routing == nil {
+	routing := routingSpecOf(spec)
+	if routing == nil {
 		if err := resolved.Validate(); err != nil {
 			return Config{}, err
 		}
 		return resolved, nil
 	}
-	routingSpec := spec.Routing
 
-	if routingSpec.Enabled != nil && !*routingSpec.Enabled {
-		resolved.Enabled = false
-	}
+	resolved.Enabled = routingEnabledFor(global, routing)
 	if !resolved.Enabled {
 		return resolved, nil
 	}
 
-	if routingSpec.Probe != nil {
-		if routingSpec.Probe.Disabled {
-			resolved.Probe = ProbeConfig{}
-		} else {
-			resolved.Probe = probeConfigFromSpec(routingSpec.Probe)
-		}
+	probe, capacity := probeOverride(routing), capacityOverride(routing)
+	if probe != nil {
+		resolved.Probe = *probe
 	}
-	if routingSpec.Capacity != nil {
-		if routingSpec.Capacity.Disabled {
-			resolved.Capacity = CapacityConfig{}
-		} else {
-			resolved.Capacity = capacityConfigFromSpec(routingSpec.Capacity)
-		}
+	if capacity != nil {
+		resolved.Capacity = *capacity
 	}
 	if err := resolved.Validate(); err != nil {
 		var configErr *configValidationError
-		if errors.As(err, &configErr) &&
-			((configErr.section == "probe" && routingSpec.Probe != nil) ||
-				(configErr.section == "capacity" && routingSpec.Capacity != nil)) {
-			return Config{}, fmt.Errorf("spec.%w", err)
-		}
-		return Config{}, err
+		fromSpec := errors.As(err, &configErr) &&
+			((configErr.section == "probe" && probe != nil) ||
+				(configErr.section == "capacity" && capacity != nil))
+		return Config{}, inSpec(err, fromSpec)
 	}
 
-	if routingSpec.Publisher == nil || len(routingSpec.Publisher.Options) == 0 {
+	if routing.Publisher == nil || len(routing.Publisher.Options) == 0 {
 		return resolved, nil
 	}
 	if resolvePublisherOptions == nil {
@@ -352,13 +378,13 @@ func ResolveConfig(
 			"spec.routing.publisher.options cannot be set because the selected publisher does not support per-InferenceService options")
 	}
 	options, err := resolvePublisherOptions(
-		cloneStringMap(global.Publisher.Options),
-		cloneStringMap(routingSpec.Publisher.Options),
+		maps.Clone(global.Publisher.Options),
+		maps.Clone(routing.Publisher.Options),
 	)
 	if err != nil {
 		return Config{}, fmt.Errorf("spec.routing.publisher.options: %w", err)
 	}
-	resolved.Publisher.Options = cloneStringMap(options)
+	resolved.Publisher.Options = maps.Clone(options)
 
 	return resolved, nil
 }
@@ -367,20 +393,20 @@ func cloneConfig(in Config) Config {
 	out := in
 	out.Probe = cloneProbeConfig(in.Probe)
 	out.Capacity = cloneCapacityConfig(in.Capacity)
-	out.Publisher.Options = cloneStringMap(in.Publisher.Options)
+	out.Publisher.Options = maps.Clone(in.Publisher.Options)
 	return out
 }
 
 func cloneProbeConfig(in ProbeConfig) ProbeConfig {
 	out := in
-	out.AcceptStatuses = cloneInts(in.AcceptStatuses)
-	out.GateStatuses = cloneInts(in.GateStatuses)
+	out.AcceptStatuses = slices.Clone(in.AcceptStatuses)
+	out.GateStatuses = slices.Clone(in.GateStatuses)
 	return out
 }
 
 func cloneCapacityConfig(in CapacityConfig) CapacityConfig {
 	out := in
-	out.Options = cloneStringMap(in.Options)
+	out.Options = maps.Clone(in.Options)
 	return out
 }
 
@@ -404,20 +430,13 @@ func capacityConfigFromSpec(in *v1beta1.RoutingCapacitySpec) CapacityConfig {
 		Path:    in.Path,
 		Method:  in.Method,
 		Format:  CapacityFormat(in.Format),
-		Options: cloneStringMap(in.Options),
+		Options: maps.Clone(in.Options),
 		Period:  in.Period.Duration,
 		Timeout: in.Timeout.Duration,
 		Samples: int(in.Samples),
 		Quorum:  int(in.Quorum),
 		MaxAge:  in.MaxAge.Duration,
 	}
-}
-
-func cloneInts(in []int) []int {
-	if in == nil {
-		return nil
-	}
-	return append([]int(nil), in...)
 }
 
 func int32sToInts(in []int32) []int {
@@ -427,17 +446,6 @@ func int32sToInts(in []int32) []int {
 	out := make([]int, len(in))
 	for i, value := range in {
 		out[i] = int(value)
-	}
-	return out
-}
-
-func cloneStringMap(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
 	}
 	return out
 }

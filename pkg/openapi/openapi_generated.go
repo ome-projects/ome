@@ -91,6 +91,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec":                      schema_pkg_apis_ome_v1beta1_DecoderSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DiffusionComponentSpec":           schema_pkg_apis_ome_v1beta1_DiffusionComponentSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DiffusionPipelineSpec":            schema_pkg_apis_ome_v1beta1_DiffusionPipelineSpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec":                      schema_pkg_apis_ome_v1beta1_EncoderSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.Endpoint":                         schema_pkg_apis_ome_v1beta1_Endpoint(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EndpointOverrideSpec":             schema_pkg_apis_ome_v1beta1_EndpointOverrideSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EndpointSpec":                     schema_pkg_apis_ome_v1beta1_EndpointSpec(ref),
@@ -170,6 +171,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PodOverride":                      schema_pkg_apis_ome_v1beta1_PodOverride(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PodSpec":                          schema_pkg_apis_ome_v1beta1_PodSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ProportionalPolicy":               schema_pkg_apis_ome_v1beta1_ProportionalPolicy(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRatio":                     schema_pkg_apis_ome_v1beta1_ReplicaRatio(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRefs":                      schema_pkg_apis_ome_v1beta1_ReplicaRefs(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaValueSource":               schema_pkg_apis_ome_v1beta1_ReplicaValueSource(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RetryBlock":                       schema_pkg_apis_ome_v1beta1_RetryBlock(ref),
@@ -177,6 +179,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutAnalysis":                  schema_pkg_apis_ome_v1beta1_RolloutAnalysis(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationGroup":         schema_pkg_apis_ome_v1beta1_RolloutCoordinationGroup(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationGroupStatus":   schema_pkg_apis_ome_v1beta1_RolloutCoordinationGroupStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationMemberFinish":  schema_pkg_apis_ome_v1beta1_RolloutCoordinationMemberFinish(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationRatio":         schema_pkg_apis_ome_v1beta1_RolloutCoordinationRatio(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationSpec":          schema_pkg_apis_ome_v1beta1_RolloutCoordinationSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationStatus":        schema_pkg_apis_ome_v1beta1_RolloutCoordinationStatus(ref),
@@ -219,6 +222,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeStatus":             schema_pkg_apis_ome_v1beta1_ServingRuntimeStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ShadowedAutoscalerPolicy":         schema_pkg_apis_ome_v1beta1_ShadowedAutoscalerPolicy(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ShadowedRolloutPolicyRef":         schema_pkg_apis_ome_v1beta1_ShadowedRolloutPolicyRef(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitCeilings":                    schema_pkg_apis_ome_v1beta1_SplitCeilings(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitSpec":                        schema_pkg_apis_ome_v1beta1_SplitSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.StorageSpec":                      schema_pkg_apis_ome_v1beta1_StorageSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SupportedModelFormat":             schema_pkg_apis_ome_v1beta1_SupportedModelFormat(ref),
@@ -3374,7 +3378,21 @@ func schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref common.ReferenceC
 					},
 					"weight": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Weight is the effective static allocation weight, when applicable.",
+							Description: "Weight is deprecated in favour of MinWeight. MinWeight, when present, equals Weight. A plan accepted before MinWeight existed carries only Weight, so readers fall back to Weight when MinWeight is absent. Weight stays until every stored plan carries MinWeight.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"minWeight": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MinWeight is the primary component's effective static weight, which divides minReplicas, when applicable. The planner writes it wherever it writes Weight.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"maxWeight": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MaxWeight is the primary component's summed max ratio. It is set only when the source uses the *Replicas ratio form.",
 							Type:        []string{"integer"},
 							Format:      "int64",
 						},
@@ -3389,7 +3407,7 @@ func schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref common.ReferenceC
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "ComponentMatches records the Split weight of the other components when the affinity terms set weights: the decoder's, and the router's when routers are divided. Weight holds the primary component's. The accepted plan keeps them so that member floors never follow unaccepted label changes.",
+							Description: "ComponentMatches records the Split weight of the other components when the affinity terms set weights: the decoder's, and the router's when routers are divided. MinWeight, or Weight on an older plan, holds the primary component's. The accepted plan keeps them so that member floors never follow unaccepted label changes.",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -3821,16 +3839,9 @@ func schema_pkg_apis_ome_v1beta1_ClusterAffinityTerm(ref common.ReferenceCallbac
 				Description: "ClusterAffinityTerm selects WorkloadClusters by ANDing its requirements. Multiple terms form a union; weights assign replica shares to each match.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
-					"weight": {
-						SchemaProps: spec.SchemaProps{
-							Description: "Deprecated: Weight is weights.default, and is permitted only for static Split. It is the only weight a manager without weights support reads, so a rollback to such a manager keeps the engine shares set here.",
-							Type:        []string{"integer"},
-							Format:      "int32",
-						},
-					},
 					"weights": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Weights sets each component's replica weight on the clusters this term matches, and is permitted only for static Split. If any term gives a component a weight, the weights of matching terms add and a term that gives none contributes one. Weights are ratios, so they have no upper bound.",
+							Description: "Weights sets each component's replica weight on the clusters this term matches, and is permitted only for static Split. If any term gives a component a weight, the weights of matching terms add and a term that gives none contributes one. Weights are ratios, so they have no upper bound. With no weights on any term, every matched cluster weighs one and routers are divided, as a default weight of one on every term would.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ClusterAffinityWeights"),
 						},
 					},
@@ -3884,12 +3895,12 @@ func schema_pkg_apis_ome_v1beta1_ClusterAffinityWeights(ref common.ReferenceCall
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "ClusterAffinityWeights holds one term's weight per component. The engine takes engine, then default. The decoder takes decoder, then default, then the engine's weight. Routers are divided across clusters only when a term sets router; a term without it then contributes the engine's weight.",
+				Description: "ClusterAffinityWeights holds one term's weight per component. The engine takes engine, then default. The decoder takes decoder, then default, then the engine's weight. The router takes router, then default, then the engine's weight. Routers are divided across clusters unless the terms set weights that name only the engine or decoder; then every cluster runs the full router policy. The integer keys and the *Replicas ratio keys are two forms of the same weights; one placement uses only one form.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"default": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Default is the weight of every component this term does not name.",
+							Description: "Default is the weight of every component this term does not name. Setting it on any term divides router.minReplicas across the clusters, as router does.",
 							Type:        []string{"integer"},
 							Format:      "int32",
 						},
@@ -3910,14 +3921,40 @@ func schema_pkg_apis_ome_v1beta1_ClusterAffinityWeights(ref common.ReferenceCall
 					},
 					"router": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Router is the router's weight. Setting it on any term divides router.minReplicas across the clusters; otherwise every cluster runs the full router policy.",
+							Description: "Router is the router's weight. Setting it or default on any term divides router.minReplicas across the clusters, as setting no weights does; weights that name only the engine or decoder keep the full router policy on every cluster.",
 							Type:        []string{"integer"},
 							Format:      "int32",
+						},
+					},
+					"defaultReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DefaultReplicas is the ratio form of default. It applies to every component this term does not name.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRatio"),
+						},
+					},
+					"engineReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "EngineReplicas is the ratio form of engine.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRatio"),
+						},
+					},
+					"decoderReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DecoderReplicas is the ratio form of decoder.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRatio"),
+						},
+					},
+					"routerReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RouterReplicas is the ratio form of router.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRatio"),
 						},
 					},
 				},
 			},
 		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRatio"},
 	}
 }
 
@@ -4224,7 +4261,21 @@ func schema_pkg_apis_ome_v1beta1_ComponentAffinityMatch(ref common.ReferenceCall
 					},
 					"weight": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Weight is the component's effective static weight, when applicable.",
+							Description: "Weight is deprecated in favour of MinWeight. MinWeight, when present, equals Weight. A plan accepted before MinWeight existed carries only Weight, so readers fall back to Weight when MinWeight is absent. Weight stays until every stored plan carries MinWeight.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"minWeight": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MinWeight is the component's effective static weight, which divides minReplicas, when applicable. The planner writes it wherever it writes Weight.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"maxWeight": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MaxWeight is the component's summed max ratio. It is set only when the source uses the *Replicas ratio form.",
 							Type:        []string{"integer"},
 							Format:      "int64",
 						},
@@ -4634,7 +4685,7 @@ func schema_pkg_apis_ome_v1beta1_ComponentTrafficTarget(ref common.ReferenceCall
 					},
 					"pairingProtocol": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PairingProtocol is the engine↔decoder wire-compatibility token the target's revision was minted under (spec.rollout.pairingProtocol at mint time). Consumers MUST only pair engine and decoder targets whose PairingProtocol values are equal; an empty value pairs with anything.",
+							Description: "PairingProtocol is the wire-compatibility token the target's revision was minted under (spec.rollout.pairingProtocol at mint time). Consumers MUST only pair targets of two roles that pass state to each other (engine and decoder, encoder and engine) whose PairingProtocol values are equal; an empty value pairs with anything.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -5465,6 +5516,620 @@ func schema_pkg_apis_ome_v1beta1_DiffusionPipelineSpec(ref common.ReferenceCallb
 		},
 		Dependencies: []string{
 			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DiffusionComponentSpec"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_EncoderSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "EncoderSpec defines the configuration for the Encoder component of an encoder-prefill-decode (EPD) disaggregated deployment: the pods that turn a request's images or audio into embeddings the engine reads. An encoder is a single pod per replica; it has no Leader or Worker.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"volumes": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "name",
+								"x-kubernetes-patch-strategy":  "merge,retainKeys",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "List of volumes that can be mounted by containers belonging to the pod. More info: https://kubernetes.io/docs/concepts/storage/volumes",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.Volume"),
+									},
+								},
+							},
+						},
+					},
+					"initContainers": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "name",
+								"x-kubernetes-patch-strategy":  "merge",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "List of initialization containers belonging to the pod. Init containers are executed in order prior to containers being started. If any init container fails, the pod is considered to have failed and is handled according to its restartPolicy. The name for an init container or normal container must be unique among all containers. Init containers may not have Lifecycle actions, Readiness probes, Liveness probes, or Startup probes. The resourceRequirements of an init container are taken into account during scheduling by finding the highest request/limit for each resource type, and then using the max of of that value or the sum of the normal containers. Limits are applied to init containers in a similar fashion. Init containers cannot currently be added or removed. Cannot be updated. More info: https://kubernetes.io/docs/concepts/workloads/pods/init-containers/",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.Container"),
+									},
+								},
+							},
+						},
+					},
+					"containers": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "name",
+								"x-kubernetes-patch-strategy":  "merge",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "List of containers belonging to the pod. Containers cannot currently be added or removed. There must be at least one container in a Pod. Cannot be updated.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.Container"),
+									},
+								},
+							},
+						},
+					},
+					"ephemeralContainers": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "name",
+								"x-kubernetes-patch-strategy":  "merge",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "List of ephemeral containers run in this pod. Ephemeral containers may be run in an existing pod to perform user-initiated actions such as debugging. This list cannot be specified when creating a pod, and it cannot be modified by updating the pod spec. In order to add an ephemeral container to an existing pod, use the pod's ephemeralcontainers subresource. Don't set it here: Kubernetes doesn't allow ephemeral containers in the pod templates OME creates, and the InferenceService CRD drops the field from spec.engine, spec.decoder and spec.router.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.EphemeralContainer"),
+									},
+								},
+							},
+						},
+					},
+					"restartPolicy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Restart policy for all containers within the pod. One of Always, OnFailure, Never. In some contexts, only a subset of those values may be permitted. Default to Always. More info: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#restart-policy",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"terminationGracePeriodSeconds": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Optional duration in seconds the pod needs to terminate gracefully. May be decreased in delete request. Value must be non-negative integer. The value zero indicates stop immediately via the kill signal (no opportunity to shut down). If this value is nil, the default grace period will be used instead. The grace period is the duration in seconds after the processes running in the pod are sent a termination signal and the time when the processes are forcibly halted with a kill signal. Set this value longer than the expected cleanup time for your process. Defaults to 30 seconds.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"activeDeadlineSeconds": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Optional duration in seconds the pod may be active on the node relative to StartTime before the system will actively try to mark it failed and kill associated containers. Value must be a positive integer.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"dnsPolicy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Set DNS policy for the pod. Defaults to \"ClusterFirst\". Valid values are 'ClusterFirstWithHostNet', 'ClusterFirst', 'Default' or 'None'. DNS parameters given in DNSConfig will be merged with the policy selected with DNSPolicy. To have DNS options set along with hostNetwork, you have to specify DNS policy explicitly to 'ClusterFirstWithHostNet'.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"nodeSelector": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-map-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeSelector is a selector which must be true for the pod to fit on a node. Selector which must match a node's labels for the pod to be scheduled on that node. More info: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"serviceAccountName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ServiceAccountName is the name of the ServiceAccount to use to run this pod. More info: https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"serviceAccount": {
+						SchemaProps: spec.SchemaProps{
+							Description: "DeprecatedServiceAccount is a deprecated alias for ServiceAccountName. Deprecated: Use serviceAccountName instead.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"automountServiceAccountToken": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AutomountServiceAccountToken indicates whether a service account token should be automatically mounted.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"nodeName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeName indicates in which node this pod is scheduled. If empty, this pod is a candidate for scheduling by the scheduler defined in schedulerName. Once this field is set, the kubelet for this node becomes responsible for the lifecycle of this pod. This field should not be used to express a desire for the pod to be scheduled on a specific node. https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodename",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"hostNetwork": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Host networking requested for this pod. Use the host's network namespace. If this option is set, the ports that will be used must be specified. Default to false.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"hostPID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Use the host's pid namespace. Optional: Default to false.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"hostIPC": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Use the host's ipc namespace. Optional: Default to false.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"shareProcessNamespace": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Share a single process namespace between all of the containers in a pod. When this is set containers will be able to view and signal processes from other containers in the same pod, and the first process in each container will not be assigned PID 1. HostPID and ShareProcessNamespace cannot both be set. Optional: Default to false.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"securityContext": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SecurityContext holds pod-level security attributes and common container settings. Optional: Defaults to empty.  See type description for default values of each field.",
+							Ref:         ref("k8s.io/api/core/v1.PodSecurityContext"),
+						},
+					},
+					"imagePullSecrets": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "name",
+								"x-kubernetes-patch-strategy":  "merge",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "ImagePullSecrets is an optional list of references to secrets in the same namespace to use for pulling any of the images used by this PodSpec. If specified, these secrets will be passed to individual puller implementations for them to use. More info: https://kubernetes.io/docs/concepts/containers/images#specifying-imagepullsecrets-on-a-pod",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.LocalObjectReference"),
+									},
+								},
+							},
+						},
+					},
+					"hostname": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Specifies the hostname of the Pod. If not specified, the pod's hostname will be set to a system-defined value.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"subdomain": {
+						SchemaProps: spec.SchemaProps{
+							Description: "If specified, the fully qualified Pod hostname will be \"<hostname>.<subdomain>.<pod namespace>.svc.<cluster domain>\". If not specified, the pod will not have a domainname at all.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"affinity": {
+						SchemaProps: spec.SchemaProps{
+							Description: "If specified, the pod's scheduling constraints",
+							Ref:         ref("k8s.io/api/core/v1.Affinity"),
+						},
+					},
+					"schedulerName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "If specified, the pod will be dispatched by specified scheduler. If not specified, the pod will be dispatched by default scheduler.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"tolerations": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "If specified, the pod's tolerations.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.Toleration"),
+									},
+								},
+							},
+						},
+					},
+					"hostAliases": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"ip",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "ip",
+								"x-kubernetes-patch-strategy":  "merge",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "HostAliases is an optional list of hosts and IPs that will be injected into the pod's hosts file if specified.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.HostAlias"),
+									},
+								},
+							},
+						},
+					},
+					"priorityClassName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "If specified, indicates the pod's priority. \"system-node-critical\" and \"system-cluster-critical\" are two special keywords which indicate the highest priorities with the former being the highest priority. Any other name must be defined by creating a PriorityClass object with that name. If not specified, the pod priority will be default or zero if there is no default.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"priority": {
+						SchemaProps: spec.SchemaProps{
+							Description: "The priority value. Various system components use this field to find the priority of the pod. When Priority Admission Controller is enabled, it prevents users from setting this field. The admission controller populates this field from PriorityClassName. The higher the value, the higher the priority.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"dnsConfig": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Specifies the DNS parameters of a pod. Parameters specified here will be merged to the generated DNS configuration based on DNSPolicy.",
+							Ref:         ref("k8s.io/api/core/v1.PodDNSConfig"),
+						},
+					},
+					"readinessGates": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "If specified, all readiness gates will be evaluated for pod readiness. A pod is ready when all its containers are ready AND all conditions specified in the readiness gates have status equal to \"True\" More info: https://git.k8s.io/enhancements/keps/sig-network/580-pod-readiness-gates",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.PodReadinessGate"),
+									},
+								},
+							},
+						},
+					},
+					"runtimeClassName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RuntimeClassName refers to a RuntimeClass object in the node.k8s.io group, which should be used to run this pod.  If no RuntimeClass resource matches the named class, the pod will not be run. If unset or empty, the \"legacy\" RuntimeClass will be used, which is an implicit class with an empty definition that uses the default runtime handler. More info: https://git.k8s.io/enhancements/keps/sig-node/585-runtime-class",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"enableServiceLinks": {
+						SchemaProps: spec.SchemaProps{
+							Description: "EnableServiceLinks indicates whether information about services should be injected into pod's environment variables, matching the syntax of Docker links. Optional: Defaults to true.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"preemptionPolicy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PreemptionPolicy is the Policy for preempting pods with lower priority. One of Never, PreemptLowerPriority. Defaults to PreemptLowerPriority if unset.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"overhead": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Overhead represents the resource overhead associated with running a pod for a given RuntimeClass. This field will be autopopulated at admission time by the RuntimeClass admission controller. If the RuntimeClass admission controller is enabled, overhead must not be set in Pod create requests. The RuntimeClass admission controller will reject Pod create requests which have the overhead already set. If RuntimeClass is configured and selected in the PodSpec, Overhead will be set to the value defined in the corresponding RuntimeClass, otherwise it will remain unset and treated as zero. More info: https://git.k8s.io/enhancements/keps/sig-node/688-pod-overhead/README.md",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Ref: ref("k8s.io/apimachinery/pkg/api/resource.Quantity"),
+									},
+								},
+							},
+						},
+					},
+					"topologySpreadConstraints": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"topologyKey",
+									"whenUnsatisfiable",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "topologyKey",
+								"x-kubernetes-patch-strategy":  "merge",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "TopologySpreadConstraints describes how a group of pods ought to spread across topology domains. Scheduler will schedule pods in a way which abides by the constraints. All topologySpreadConstraints are ANDed.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.TopologySpreadConstraint"),
+									},
+								},
+							},
+						},
+					},
+					"setHostnameAsFQDN": {
+						SchemaProps: spec.SchemaProps{
+							Description: "If true the pod's hostname will be configured as the pod's FQDN, rather than the leaf name (the default). In Linux containers, this means setting the FQDN in the hostname field of the kernel (the nodename field of struct utsname). In Windows containers, this means setting the registry value of hostname for the registry key HKEY_LOCAL_MACHINE\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\Tcpip\\\\Parameters to FQDN. If a pod does not have FQDN, this has no effect. Default to false.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"os": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Specifies the OS of the containers in the pod. Some pod and container fields are restricted if this is set.\n\nIf the OS field is set to linux, the following fields must be unset: -securityContext.windowsOptions\n\nIf the OS field is set to windows, following fields must be unset: - spec.hostPID - spec.hostIPC - spec.hostUsers - spec.securityContext.appArmorProfile - spec.securityContext.seLinuxOptions - spec.securityContext.seccompProfile - spec.securityContext.fsGroup - spec.securityContext.fsGroupChangePolicy - spec.securityContext.sysctls - spec.shareProcessNamespace - spec.securityContext.runAsUser - spec.securityContext.runAsGroup - spec.securityContext.supplementalGroups - spec.securityContext.supplementalGroupsPolicy - spec.containers[*].securityContext.appArmorProfile - spec.containers[*].securityContext.seLinuxOptions - spec.containers[*].securityContext.seccompProfile - spec.containers[*].securityContext.capabilities - spec.containers[*].securityContext.readOnlyRootFilesystem - spec.containers[*].securityContext.privileged - spec.containers[*].securityContext.allowPrivilegeEscalation - spec.containers[*].securityContext.procMount - spec.containers[*].securityContext.runAsUser - spec.containers[*].securityContext.runAsGroup",
+							Ref:         ref("k8s.io/api/core/v1.PodOS"),
+						},
+					},
+					"hostUsers": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Use the host's user namespace. Optional: Default to true. If set to true or not present, the pod will be run in the host user namespace, useful for when the pod needs a feature only available to the host user namespace, such as loading a kernel module with CAP_SYS_MODULE. When set to false, a new userns is created for the pod. Setting false is useful for mitigating container breakout vulnerabilities even allowing users to run their containers as root without actually having root privileges on the host. This field is alpha-level and is only honored by servers that enable the UserNamespacesSupport feature.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"schedulingGates": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "name",
+								"x-kubernetes-patch-strategy":  "merge",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "SchedulingGates is an opaque list of values that if specified will block scheduling the pod. If schedulingGates is not empty, the pod will stay in the SchedulingGated state and the scheduler will not attempt to schedule the pod.\n\nSchedulingGates can only be set at pod creation time, and be removed only afterwards.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.PodSchedulingGate"),
+									},
+								},
+							},
+						},
+					},
+					"resourceClaims": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type":       "map",
+								"x-kubernetes-patch-merge-key": "name",
+								"x-kubernetes-patch-strategy":  "merge,retainKeys",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "ResourceClaims defines which ResourceClaims must be allocated and reserved before the Pod is allowed to start. The resources will be made available to those containers which consume them by name.\n\nThis is an alpha field and requires enabling the DynamicResourceAllocation feature gate.\n\nThis field is immutable.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.PodResourceClaim"),
+									},
+								},
+							},
+						},
+					},
+					"minReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Minimum number of replicas, defaults to 1 but can be set to 0 to enable scale-to-zero.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"maxReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Maximum number of replicas for autoscaling. A proportional-scaling follower that leaves it unset has no ceiling of its own.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"timeoutSeconds": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TimeoutSeconds specifies the number of seconds to wait before timing out a request to the component.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"labels": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Labels that will be added to the component pod. More info: http://kubernetes.io/docs/user-guide/labels",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"annotations": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Annotations that will be added to the component pod. More info: http://kubernetes.io/docs/user-guide/annotations",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"servicePortAppProtocols": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ServicePortAppProtocols maps generated Service port names to their Kubernetes appProtocol values. Declared ports use their container port name.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"minAvailable": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MinAvailable specifies how many component pods must still be available after the eviction",
+							Ref:         ref("k8s.io/apimachinery/pkg/util/intstr.IntOrString"),
+						},
+					},
+					"maxUnavailable": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MaxUnavailable specifies how many component pods can be unavailable",
+							Ref:         ref("k8s.io/apimachinery/pkg/util/intstr.IntOrString"),
+						},
+					},
+					"deploymentStrategy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "The deployment strategy to use to replace existing pods with new ones. Only applicable for raw deployment mode.",
+							Ref:         ref("k8s.io/api/apps/v1.DeploymentStrategy"),
+						},
+					},
+					"lifecycle": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Lifecycle groups OMENative-specific lifecycle policies for this Component. Applies only when the Component resolves to deploymentMode OMENative (spec.deploymentMode or the per-Component ome.io/deploymentMode annotation); ignored otherwise. A field left unset here inherits the ServingRuntime's value for the Component; the controller fills what neither sets from cluster configuration and fixed fallbacks and never writes them back. The status counterpart is status.components.<component>.lifecycle.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec"),
+						},
+					},
+					"autoscaler": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Autoscaler configures the per-Component autoscaler dispatch and the underlying KEDA / HPA configuration. Takes priority over the legacy ome.io/autoscalerClass annotation for this Component, and is the only way to configure per-Component autoscaling: scale metrics live here (Autoscaler.HPA.Metrics), alongside MinReplicas / MaxReplicas above. Alpha. The API may change without notice.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler"),
+						},
+					},
+					"autoscalerPolicyRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AutoscalerPolicyRef names a same-namespace AutoscalerPolicy whose template renders this Component's autoscaler. An inline Autoscaler block above always outranks the ref; the two may coexist, which is the documented preview/rollback mechanism. Alpha. The API may change without notice.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AutoscalerPolicyRef"),
+						},
+					},
+					"runner": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Runner container override for customizing the main container. This is essentially a container spec that can override the default container. Defines the main encoder container configuration, including image, resource requests/limits, environment variables, and command.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec"),
+						},
+					},
+					"topologySpread": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TopologySpread spreads this component's instances across fault domains so losing one domain (rack / fabric slice / cube) cannot take out every instance at once. Rendered as a standard topologySpreadConstraint (maxSkew 1) on each encoder pod. Required renders as DoNotSchedule; Preferred renders as ScheduleAnyway. Not part of the revision hash: changing it shapes future placements without rolling a healthy fleet. Unset keeps pure bin-packing.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"topologySpreadKey": {
+						SchemaProps: spec.SchemaProps{
+							Description: "TopologySpreadKey is the node-label key naming the fault domains TopologySpread spreads across. An encoder pod has no co-location key, so spreading it requires setting this explicitly. Ignored unless TopologySpread is set.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"acceleratorOverride": {
+						SchemaProps: spec.SchemaProps{
+							Description: "AcceleratorOverride allows overriding the global accelerator selection for this component",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/api/apps/v1.DeploymentStrategy", "k8s.io/api/core/v1.Affinity", "k8s.io/api/core/v1.Container", "k8s.io/api/core/v1.EphemeralContainer", "k8s.io/api/core/v1.HostAlias", "k8s.io/api/core/v1.LocalObjectReference", "k8s.io/api/core/v1.PodDNSConfig", "k8s.io/api/core/v1.PodOS", "k8s.io/api/core/v1.PodReadinessGate", "k8s.io/api/core/v1.PodResourceClaim", "k8s.io/api/core/v1.PodSchedulingGate", "k8s.io/api/core/v1.PodSecurityContext", "k8s.io/api/core/v1.Toleration", "k8s.io/api/core/v1.TopologySpreadConstraint", "k8s.io/api/core/v1.Volume", "k8s.io/apimachinery/pkg/api/resource.Quantity", "k8s.io/apimachinery/pkg/util/intstr.IntOrString", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AutoscalerPolicyRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ComponentAutoscaler", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RunnerSpec"},
 	}
 }
 
@@ -6916,7 +7581,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 					},
 					"component": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Component is the role this pod set fills: engine | decoder | router. Immutable; moving a workload between roles requires recreating the InferenceReplica.",
+							Description: "Component is the role this pod set fills: engine | decoder | encoder | router. Immutable; moving a workload between roles requires recreating the InferenceReplica.",
 							Default:     "",
 							Type:        []string{"string"},
 							Format:      "",
@@ -6971,7 +7636,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 					},
 					"pairingProtocol": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PairingProtocol is the engine/decoder wire-compatibility token. It is folded into the revision hash (a change mints a new revision) and stamped as the ome.io/pairing-protocol label on rendered pods; nil pairs with anything. Only engine and decoder replicas pair on it; a change on any replica still mints a new revision. On a projected replica the InferenceService controller copies spec.rollout.pairingProtocol onto the engine and decoder replicas and never onto the router, which must not re-roll on a protocol change.",
+							Description: "PairingProtocol is the engine/decoder wire-compatibility token. It is folded into the revision hash (a change mints a new revision) and stamped as the ome.io/pairing-protocol label on rendered pods; nil pairs with anything. Only engine, decoder and encoder replicas pair on it; a change on any replica still mints a new revision. On a projected replica the InferenceService controller copies spec.rollout.pairingProtocol onto the engine, decoder and encoder replicas and never onto the router, which must not re-roll on a protocol change.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -7062,7 +7727,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaStatus(ref common.ReferenceCall
 					},
 					"observedTemplateHash": {
 						SchemaProps: spec.SchemaProps{
-							Description: "ObservedTemplateHash is the pod-template hash (the ome.io/template-hash annotation the projector stamps beside the spec's templates) that updateRevision was last computed from. It names the roll target this status describes: a spec whose stamp differs asks for a revision the status has not recorded yet, while a spec change outside the templates leaves both unchanged.",
+							Description: "ObservedTemplateHash is the pod-template hash (the ome.io/template-hash annotation the projector writes beside the spec's templates) that updateRevision was last computed from. It names the roll target this status describes: a spec whose template hash differs asks for a revision the status has not recorded yet, while a spec change outside the templates leaves both unchanged.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -7442,6 +8107,12 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec"),
 						},
 					},
+					"encoder": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Encoder defines the encoder spec: a pod set that turns a request's images or audio into embeddings for the engine (prefill), for encoder-prefill-decode (EPD) disaggregated serving. The runtime moves the embeddings between encoder and engine pods; OME runs the pods, tells each side the other's address (OME_ENCODER_* and OME_ENGINE_* variables) and rolls the encoder as its own Component. Requires spec.engine, at least one spec.rollout.groups entry, and OMENative for every declared role, the router included; not allowed beside spec.placement or spec.routing. Alpha. The API may change without notice.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec"),
+						},
+					},
 					"model": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Model defines the model to be used for inference, referencing either a BaseModel or a custom model. This allows models to be managed independently of the serving configuration.",
@@ -7513,7 +8184,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 			},
 		},
 		Dependencies: []string{
-			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRefs", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec"},
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRefs", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec"},
 	}
 }
 
@@ -7799,6 +8470,12 @@ func schema_pkg_apis_ome_v1beta1_InstanceOperation(ref common.ReferenceCallback)
 					"capacityRefusedAt": {
 						SchemaProps: spec.SchemaProps{
 							Description: "CapacityRefusedAt is when admission last refused one of the operation's pod creates for lack of quota. The refusal is an apiserver answer to a call the create pass made, so it cannot be read off the cluster on a later pass: it is recorded here, and the hold pass converts it into the Waiting token and the deadline park on every pass it stands. Cleared by a create that completes with no refusal. Empty means the last create was not refused for capacity.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"placementWaitSince": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PlacementWaitSince is when the attempt started waiting for its pods to be placed, recorded once a pod name the attempt needs is held by a node that stopped reporting: the member there must be rebuilt before the attempt can run. It is the earlier of that moment and the start of another member's wait for the scheduler. It stays while the attempt waits, even as the waiting pod changes (one member placed, the rebuilt member then unplaceable), and is cleared once every pod the attempt asks for runs on a node or the attempt ends. The unschedulable grace is measured from it when it is earlier than the unplaceable pod's own wait. Empty means no such wait is recorded.",
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
 						},
 					},
@@ -11702,6 +12379,33 @@ func schema_pkg_apis_ome_v1beta1_ProportionalPolicy(ref common.ReferenceCallback
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_ReplicaRatio(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "ReplicaRatio gives a cluster's share of a component's minimum and maximum replicas. Both values are ratios, not replica counts: min divides the source's minReplicas and max divides its maxReplicas across the clusters. An omitted min counts as 1 and an omitted max counts as 1, independently, so an empty ratio weighs the same as a matching term that sets no ratio.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"min": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Min is the cluster's ratio share of minReplicas. When omitted, it is 1.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"max": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Max is the cluster's ratio share of maxReplicas. When omitted, it is 1.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_ReplicaRefs(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -12129,6 +12833,19 @@ func schema_pkg_apis_ome_v1beta1_RolloutCoordinationGroupStatus(ref common.Refer
 							Format:      "",
 						},
 					},
+					"memberFinished": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MemberFinished records, for a Sequential group with a wait between members, the member whose roll most recently read done and the instant it first read so. The wait before the next member runs from that instant on the group and on the replica side; the member losing readiness afterwards, or its replica being recreated, does not move it. Cleared when that member rolls again.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationMemberFinish"),
+						},
+					},
+					"memberNotReady": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MemberNotReady names the finished Sequential member whose Ready condition is False or absent while the next member waits on it: the next member is held until that member is Ready again, and the wait keeps running from MemberFinished meanwhile, so the next member starts on the recovery when the wait has elapsed by then. Empty otherwise.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
 					"observedSurge": {
 						SchemaProps: spec.SchemaProps{
 							Description: "ObservedSurge is the IntOrString surge target applied during the current Surging / Waiting phase. Empty when the group is Idle.",
@@ -12147,6 +12864,20 @@ func schema_pkg_apis_ome_v1beta1_RolloutCoordinationGroupStatus(ref common.Refer
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
 						},
 					},
+					"mixedPairing": {
+						SchemaProps: spec.SchemaProps{
+							Description: "MixedPairing reports that the group's Components serve distinct revisions at once, which a RollingUpdate group permits while it rolls; a BlueGreen or Sequential group never sets it. It holds for as long as the picture does. The event MixedPairingObserved is recorded on the pass that sets it, not on every pass it holds.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
+					"surgeHeldByRatio": {
+						SchemaProps: spec.SchemaProps{
+							Description: "SurgeHeldByRatio reports that RatioBalanced pacing refused the group's next surge on this pass to keep the cross-Component ratio. It holds for as long as the refusal does. The event RatioSkewRejected is recorded on the pass that sets it, not on every pass it holds.",
+							Type:        []string{"boolean"},
+							Format:      "",
+						},
+					},
 					"message": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Message is a short operator-facing explanation of the current Phase. Set on Failed / RollingBack / Paused phases.",
@@ -12158,7 +12889,37 @@ func schema_pkg_apis_ome_v1beta1_RolloutCoordinationGroupStatus(ref common.Refer
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "k8s.io/apimachinery/pkg/util/intstr.IntOrString", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationRatio"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "k8s.io/apimachinery/pkg/util/intstr.IntOrString", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationMemberFinish", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutCoordinationRatio"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_RolloutCoordinationMemberFinish(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "RolloutCoordinationMemberFinish is the instant a Sequential member's roll first read done, the clock the wait before the next member runs from.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"component": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Component names the member.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"at": {
+						SchemaProps: spec.SchemaProps{
+							Description: "At is the instant the member first read done.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+				},
+				Required: []string{"component", "at"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
 	}
 }
 
@@ -12308,7 +13069,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutGroup(ref common.ReferenceCallback) comm
 							},
 						},
 						SchemaProps: spec.SchemaProps{
-							Description: "Components lists the Component names in this group (they roll together). Valid values: \"router\", \"engine\", \"decoder\".",
+							Description: "Components lists the Component names in this group (they roll together). Valid values: \"router\", \"engine\", \"decoder\", \"encoder\".",
 							Type:        []string{"array"},
 							Items: &spec.SchemaOrArray{
 								Schema: &spec.Schema{
@@ -13094,7 +13855,7 @@ func schema_pkg_apis_ome_v1beta1_RolloutSpec(ref common.ReferenceCallback) commo
 					},
 					"pairingProtocol": {
 						SchemaProps: spec.SchemaProps{
-							Description: "PairingProtocol declares the engine↔decoder wire-compatibility contract for prefill-decode pairing (e.g. a KV-transfer protocol generation, such as \"nixl-v2\"). It is an opaque, operator-owned token compared only for equality; bump it ONLY when the engine↔decoder wire contract breaks. The value rides each engine and decoder revision: changing it mints new revisions for both Components (a rollout), stamps ome.io/pairing-protocol on their pods and per-revision Services, and is published on each traffic target so routing pairs only engine and decoder revisions whose values are equal. Empty or unset pairs with anything, so setting or clearing the token is upgrade-neutral. Changing it between two non-empty values requires engine and decoder to roll as one blueGreen or canary group.",
+							Description: "PairingProtocol declares the engine↔decoder wire-compatibility contract for prefill-decode pairing (e.g. a KV-transfer protocol generation, such as \"nixl-v2\"). It is an opaque, operator-owned token compared only for equality; bump it ONLY when the engine↔decoder wire contract breaks. The value rides each engine and decoder revision: changing it mints new revisions for both Components (a rollout), stamps ome.io/pairing-protocol on their pods and per-revision Services, and is published on each traffic target so routing pairs only engine and decoder revisions whose values are equal. Empty or unset pairs with anything, so setting or clearing the token is upgrade-neutral. Changing it between two non-empty values requires engine and decoder to roll as one blueGreen or canary group. While the service declares an encoder, whose revisions carry the token too, and in the edit that removes it, the value may only stay the same or be cleared.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -13808,7 +14569,7 @@ func schema_pkg_apis_ome_v1beta1_RoutingCapacitySpec(ref common.ReferenceCallbac
 				Properties: map[string]spec.Schema{
 					"mode": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Mode selects a replica ceiling or an authoritative reported weight. Unset preserves Ceiling. In Reported mode a home's accepted report is its capacity in replicas, neither capped by its replica count nor scaled by its capacity factor. A home without one keeps its replica-based weight.",
+							Description: "Mode selects a replica ceiling or an authoritative reported weight. Unset preserves Ceiling. In Reported mode a home's accepted report is its capacity in replicas, neither capped by its replica count nor scaled by its capacity factor. A positive report applies only while placement status shows a ready replica in that cluster. A home without an applied report keeps its replica-based weight.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -15056,6 +15817,12 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntimeSpec(ref common.ReferenceCallback
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec"),
 						},
 					},
+					"encoderConfig": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Encoder configuration for this runtime. A service that declares spec.encoder merges it; the piece alone deploys no encoder.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec"),
+						},
+					},
 					"protocolVersions": {
 						VendorExtensible: spec.VendorExtensible{
 							Extensions: spec.Extensions{
@@ -15265,7 +16032,7 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntimeSpec(ref common.ReferenceCallback
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/api/core/v1.Affinity", "k8s.io/api/core/v1.Container", "k8s.io/api/core/v1.LocalObjectReference", "k8s.io/api/core/v1.Toleration", "k8s.io/api/core/v1.Volume", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorRequirements", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelSizeRangeSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SupportedModelFormat"},
+			"k8s.io/api/core/v1.Affinity", "k8s.io/api/core/v1.Container", "k8s.io/api/core/v1.LocalObjectReference", "k8s.io/api/core/v1.Toleration", "k8s.io/api/core/v1.Volume", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorRequirements", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelSizeRangeSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SupportedModelFormat"},
 	}
 }
 
@@ -15387,11 +16154,52 @@ func schema_pkg_apis_ome_v1beta1_ShadowedRolloutPolicyRef(ref common.ReferenceCa
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_SplitCeilings(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "SplitCeilings holds one cap per component. A component takes its own key, then default. A component with neither takes the primary component's cap, scaled by its ratio of minimums and rounded up; the primary component is the engine, or the decoder when there is no engine. A component with no cap is fixed at its share.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"default": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Default caps every component this map does not name.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"engine": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Engine caps the engine.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"decoder": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Decoder caps the decoder.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+					"router": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Router caps the router. It applies only when Split divides the routers.",
+							Type:        []string{"integer"},
+							Format:      "int32",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_SplitSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
 			SchemaProps: spec.SchemaProps{
-				Description: "SplitSpec declares the fleet floor and optional local ceiling. The floor falls back only to an explicitly declared positive engine.minReplicas.",
+				Description: "SplitSpec declares the fleet floor and optional local ceilings. The floor falls back only to an explicitly declared positive engine.minReplicas.",
 				Type:        []string{"object"},
 				Properties: map[string]spec.Schema{
 					"replicas": {
@@ -15401,16 +16209,17 @@ func schema_pkg_apis_ome_v1beta1_SplitSpec(ref common.ReferenceCallback) common.
 							Format:      "int32",
 						},
 					},
-					"maxReplicasPerCluster": {
+					"maxPerCluster": {
 						SchemaProps: spec.SchemaProps{
-							Description: "MaxReplicasPerCluster is an optional local ceiling. Plans exceeding it are held; zero follows the assigned allocation without an extra ceiling.",
-							Type:        []string{"integer"},
-							Format:      "int32",
+							Description: "MaxPerCluster caps how many replicas of each component one cluster runs. A plan that gives a component more than its cap is held.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitCeilings"),
 						},
 					},
 				},
 			},
 		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SplitCeilings"},
 	}
 }
 
@@ -15743,7 +16552,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapCapacity(ref common.ReferenceCallback
 				Properties: map[string]spec.Schema{
 					"reportedWeight": {
 						SchemaProps: spec.SchemaProps{
-							Description: "ReportedWeight is the accepted endpoint capacity in Reported mode, in replicas, and replaces the replica-based weight. Nil means no fresh quorum, so the entry weighs its replica count; zero means the reporter cannot serve traffic.",
+							Description: "ReportedWeight is the accepted endpoint capacity in Reported mode, in replicas, and replaces the replica-based weight. Nil means no fresh quorum, or a positive report while placement status shows no ready replica, so the entry weighs its replica count. Zero means the reporter cannot serve traffic.",
 							Ref:         ref("k8s.io/apimachinery/pkg/api/resource.Quantity"),
 						},
 					},
@@ -15783,7 +16592,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapCapacity(ref common.ReferenceCallback
 					},
 					"fallbackReason": {
 						SchemaProps: spec.SchemaProps{
-							Description: "FallbackReason explains why a configured endpoint capacity source did not produce a current observation. The entry keeps its replica-based weight; in Reported mode it first uses a fresh cached report. Empty means the latest result was usable or polling is disabled.",
+							Description: "FallbackReason explains why a configured endpoint capacity source did not produce a current observation, or why Reported mode did not apply a positive one: placement status shows no ready replica. The entry keeps its replica-based weight, except that after a failed poll Reported mode uses a fresh cached report while a replica is ready. Empty means the latest result was usable or polling is disabled.",
 							Type:        []string{"string"},
 							Format:      "",
 						},
@@ -16261,7 +17070,7 @@ func schema_pkg_apis_ome_v1beta1_TrafficMapStatus(ref common.ReferenceCallback) 
 					},
 					"published": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Published reports whether the active publisher has realized this map onto its data plane.",
+							Description: "Published reports whether the active publisher has realized this map onto its data plane. For a publisher that only writes weights to an external system, it means those writes succeeded, not that anything reads them.",
 							Type:        []string{"boolean"},
 							Format:      "",
 						},

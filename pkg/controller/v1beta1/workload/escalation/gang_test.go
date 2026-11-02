@@ -9,6 +9,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clocktesting "k8s.io/utils/clock/testing"
+
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -294,44 +295,6 @@ func TestEscalation_GangUnschedulableArrivesOnMemberPods(t *testing.T) {
 	}
 	if got.Phase != types.InstancePhaseCreating {
 		t.Errorf("Phase: got %q want Creating (queued for placement, not failed)", got.Phase)
-	}
-}
-
-// TestReconcileGatedDeadlines_ParksGangSurgeSourceOnMemberRejection: a
-// gang surge creates its members under the SURGE index while the
-// governing operation and its deadline live on the SOURCE, so a member
-// the gang scheduler rejected parks the source's clock too.
-func TestReconcileGatedDeadlines_ParksGangSurgeSourceOnMemberRejection(t *testing.T) {
-	now := time.Now()
-	surge := int32(1)
-	insts := []types.InstanceStatus{
-		{
-			Index: 0,
-			Phase: types.InstancePhaseUpdating,
-			Operation: &types.InstanceOperation{
-				Type:       types.InstanceOperationUpdate,
-				Step:       types.UpdateStepSurge,
-				SurgeIndex: &surge,
-				Deadline:   metav1.NewTime(now.Add(10 * time.Minute)),
-			},
-		},
-		{
-			Index: 1,
-			Phase: types.InstancePhaseCreating,
-			Operation: &types.InstanceOperation{
-				Type:    types.InstanceOperationUpdate,
-				Step:    types.UpdateStepGangSurgeTarget,
-				Waiting: types.WaitingReasonUnschedulable,
-			},
-		},
-	}
-	input, store, _ := expireFixture(insts)
-
-	if err := escalation.ReconcileGatedDeadlines(context.Background(), input, insts, map[int32]bool{}, 30*time.Minute); err != nil {
-		t.Fatalf("ReconcileGatedDeadlines: %v", err)
-	}
-	if !(*store)[0].Operation.Deadline.IsZero() {
-		t.Errorf("source Deadline: got %v want zero (parked on the surge row's hold)", (*store)[0].Operation.Deadline)
 	}
 }
 

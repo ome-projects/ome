@@ -75,6 +75,9 @@ func (t *Targets) Replicas(component v1beta1.ComponentType) *int32 {
 type condition struct {
 	ready           bool
 	reason, message string
+	// keepsCounts marks a hold that leaves the policy in force: status keeps
+	// the last counts and standing notes until new ones can be computed.
+	keepsCounts bool
 }
 
 // follower is one follower's resolved count beside the count its replica
@@ -92,6 +95,10 @@ type follower struct {
 type observation struct {
 	anchor        v1beta1.ComponentType
 	anchorDesired int32
+	// anchorKnown reports that the anchor's desired count was read this pass.
+	anchorKnown bool
+	// anchorBounded reports that the anchor's desired count has a ceiling.
+	anchorBounded bool
 	hold          *condition
 	// conflict names the follower with a competing scaler; it holds every follower.
 	conflict  string
@@ -106,6 +113,10 @@ func observe(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceS
 	seen := &observation{}
 	hold := func(ready bool, reason, message string) (*observation, error) {
 		seen.hold = &condition{ready: ready, reason: reason, message: message}
+		return seen, nil
+	}
+	holdCounts := func(reason, message string) (*observation, error) {
+		seen.hold = &condition{reason: reason, message: message, keepsCounts: true}
 		return seen, nil
 	}
 	if policy.Mode == "" || policy.Mode == v1beta1.ScalingIndependent {
@@ -148,12 +159,14 @@ func observe(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceS
 	}
 	anchorIR, err := get(seen.anchor)
 	if apierrors.IsNotFound(err) || (err == nil && anchorIR.Spec.Replicas == nil) {
-		return hold(false, "AnchorUnavailable", "anchor desired count is unavailable; follower counts are held")
+		return holdCounts("AnchorUnavailable", "anchor desired count is unavailable; follower counts are held")
 	}
 	if err != nil {
 		return nil, err
 	}
 	seen.anchorDesired = *anchorIR.Spec.Replicas
+	seen.anchorKnown = true
+	seen.anchorBounded = anchorBounded(components[seen.anchor], anchorIR)
 
 	// A competing writer on any follower holds every follower.
 	current := make(map[v1beta1.ComponentType]*int32, len(keys))
@@ -168,7 +181,7 @@ func observe(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceS
 		}
 		if ir.Spec.Autoscaler != nil && ir.Spec.Autoscaler.Class != v1beta1.AutoscalerNone {
 			seen.conflict = followerConflictMessage(isvc, component, ir.Spec.Autoscaler.Class)
-			return hold(false, "FollowerAutoscalerConflict", seen.conflict)
+			return holdCounts("FollowerAutoscalerConflict", seen.conflict)
 		}
 		current[component] = ptr.To(ptr.Deref(ir.Spec.Replicas, 0))
 	}
@@ -223,7 +236,19 @@ func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventR
 	status.Anchor = seen.anchor
 	status.AnchorDesired = seen.anchorDesired
 	if seen.hold != nil {
-		setCondition(seen.hold.ready, seen.hold.reason, seen.hold.message)
+		message := seen.hold.message
+		// A hold that keeps counts shows the anchor count, the follower
+		// entries and their notes together, all from the last pass that
+		// resolved counts, so status never mixes counts from two moments.
+		// Only followers the current policy keeps at the same ratio stay.
+		if seen.hold.keepsCounts && previous != nil && previous.Mode == status.Mode && previous.Anchor == status.Anchor &&
+			(len(previous.Followers) > 0 || !seen.anchorKnown) {
+			status.AnchorDesired = previous.AnchorDesired
+			held := heldFollowers(previous, policy)
+			status.Followers = append(status.Followers, held...)
+			message = withNotes(message+"; "+heldCountsNote, standingNotes(previous, held, policy, targets.components))
+		}
+		setCondition(seen.hold.ready, seen.hold.reason, message)
 		if seen.conflict != "" && recorder != nil && !samePreviousConflict(previous, seen.conflict) {
 			recorder.Event(isvc, corev1.EventTypeWarning, "FollowerAutoscalerConflict", seen.conflict)
 		}
@@ -232,7 +257,7 @@ func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventR
 	// notes carry what the Ready condition says beyond the counts: which
 	// bound holds a follower, and which follower nothing caps.
 	var notes, pending []string
-	anchorHasMaximum := targets.components[seen.anchor].MaxReplicas > 0
+	anchorHasMaximum := seen.anchorBounded
 	placed := placementSetsBounds(isvc)
 	for _, f := range seen.followers {
 		if f.current == nil {
@@ -250,14 +275,14 @@ func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventR
 			}
 		}
 		if clamped {
-			note := fmt.Sprintf("%s target is bounded to %d Instances by its %s (the ratio asks for %d)", f.component, target, f.count.Bound, f.count.Wanted)
+			note := clampNote(f.component, f.count)
 			notes = append(notes, note)
 			if !previouslyClamped && recorder != nil && !placed {
 				recorder.Event(isvc, corev1.EventTypeWarning, "ScalingTargetClamped", note)
 			}
 		}
 		if FollowerBounds(targets.components[f.component]).Max == nil && !anchorHasMaximum {
-			note := fmt.Sprintf("%s follows %s with no maxReplicas on either side; set maxReplicas on one of them to bound the %s count", f.component, seen.anchor, f.component)
+			note := unboundedNote(f.component, seen.anchor)
 			notes = append(notes, note)
 			if recorder != nil && !previousMessageContains(previous, note) {
 				recorder.Event(isvc, corev1.EventTypeWarning, "ScalingFollowerUnbounded", note)
@@ -274,16 +299,86 @@ func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventR
 		if len(seen.missing) > 0 {
 			message += "; follower InferenceReplica not yet projected: " + strings.Join(seen.missing, ", ")
 		}
-		setCondition(false, "InvalidPolicy", message)
+		setCondition(false, "InvalidPolicy", withNotes(message, notes))
 	case len(seen.missing) > 0:
-		setCondition(false, "FollowerUnavailable", "follower InferenceReplica not yet projected: "+strings.Join(seen.missing, ", "))
+		setCondition(false, "FollowerUnavailable", withNotes("follower InferenceReplica not yet projected: "+strings.Join(seen.missing, ", "), notes))
 	case len(pending) > 0:
 		message := "follower desired counts are written by the next projection: " + strings.Join(pending, "; ")
-		setCondition(false, "FollowerPending", strings.Join(append([]string{message}, notes...), "; "))
+		setCondition(false, "FollowerPending", withNotes(message, notes))
 	default:
-		setCondition(true, "Applied", strings.Join(append([]string{"follower desired counts match the resolved policy"}, notes...), "; "))
+		setCondition(true, "Applied", withNotes("follower desired counts match the resolved policy", notes))
 	}
 	return nil
+}
+
+// heldCountsNote tells the reader of a held status that its counts predate
+// the hold.
+const heldCountsNote = "anchorDesired and follower counts are from before the hold"
+
+// withNotes appends the standing notes to a Ready message. Every Ready
+// message carries them, so a warning raised for a note fires once while
+// the note stands, whatever else the message reports.
+func withNotes(message string, notes []string) string {
+	return strings.Join(append([]string{message}, notes...), "; ")
+}
+
+func clampNote(component v1beta1.ComponentType, count Count) string {
+	return fmt.Sprintf("%s target is bounded to %d Instances by its %s (the ratio asks for %d)", component, count.Target, count.Bound, count.Wanted)
+}
+
+func unboundedNote(component, anchor v1beta1.ComponentType) string {
+	return fmt.Sprintf("%s follows %s with no maxReplicas on either side; set maxReplicas on one of them to bound the %s count", component, anchor, component)
+}
+
+// anchorBounded reports whether the anchor's desired count has a ceiling: a
+// declared maxReplicas, or an HPA or KEDA scaler, whose maximum is never
+// below its minimum even when maxReplicas is unset.
+func anchorBounded(spec *v1beta1.ComponentExtensionSpec, anchorIR *v1beta1.InferenceReplica) bool {
+	if spec != nil && spec.MaxReplicas > 0 {
+		return true
+	}
+	if anchorIR == nil || anchorIR.Spec.Autoscaler == nil {
+		return false
+	}
+	class := anchorIR.Spec.Autoscaler.Class
+	return class == v1beta1.AutoscalerHPA || class == v1beta1.AutoscalerKEDA
+}
+
+// heldFollowers copies the previous pass's follower entries that the current
+// policy still declares at the same ratio. An entry for a follower that the
+// policy omits or rates differently describes a policy that is not in force.
+func heldFollowers(previous *v1beta1.ScalingPolicyStatus, policy *v1beta1.ScalingPolicy) []v1beta1.FollowerScalingStatus {
+	var held []v1beta1.FollowerScalingStatus
+	for _, old := range previous.Followers {
+		if ratio, ok := policy.Proportional.Ratios[old.Component]; ok && ratio.Cmp(old.Ratio) == 0 {
+			held = append(held, *old.DeepCopy())
+		}
+	}
+	return held
+}
+
+// standingNotes recomputes, from the held follower entries of the previous
+// pass, the notes its Ready message carried that the current spec still
+// supports, so a hold keeps reporting them.
+func standingNotes(previous *v1beta1.ScalingPolicyStatus, held []v1beta1.FollowerScalingStatus,
+	policy *v1beta1.ScalingPolicy, components map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec) []string {
+	var notes []string
+	for _, old := range held {
+		bounds := FollowerBounds(components[old.Component])
+		if ratio, ok := policy.Proportional.Ratios[old.Component]; ok && old.Clamped {
+			if count, err := Target(previous.AnchorDesired, ratio.MilliValue(), bounds); err == nil && count.Bound != "" {
+				if note := clampNote(old.Component, count); previousMessageContains(previous, note) {
+					notes = append(notes, note)
+				}
+			}
+		}
+		if bounds.Max == nil {
+			if note := unboundedNote(old.Component, previous.Anchor); previousMessageContains(previous, note) {
+				notes = append(notes, note)
+			}
+		}
+	}
+	return notes
 }
 
 // placementSetsBounds reports a member copy of a Split placement home. The hub
@@ -296,13 +391,17 @@ func placementSetsBounds(isvc *v1beta1.InferenceService) bool {
 	return err == nil && policy != nil && len(policy.ReplicaFloors) == 0
 }
 
-func samePreviousConflict(previous *v1beta1.ScalingPolicyStatus, message string) bool {
+// samePreviousConflict reports whether the last Ready condition already
+// reported this conflict. It matches the conflict text only, so notes that
+// come and go beside it do not raise the warning again.
+func samePreviousConflict(previous *v1beta1.ScalingPolicyStatus, conflict string) bool {
 	if previous == nil {
 		return false
 	}
 	condition := apiMeta.FindStatusCondition(previous.Conditions, "Ready")
 	return condition != nil && condition.Status == metav1.ConditionFalse &&
-		condition.Reason == "FollowerAutoscalerConflict" && condition.Message == message
+		condition.Reason == "FollowerAutoscalerConflict" &&
+		(condition.Message == conflict || strings.HasPrefix(condition.Message, conflict+"; "))
 }
 
 // previousMessageContains reports whether the last Ready condition already

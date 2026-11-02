@@ -158,9 +158,9 @@ func TestValidateScalingPolicyComponents_FollowerAutoscaler_RejectedUnlessNone(t
 	components := map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec{
 		v1beta1.DecoderComponent: {Autoscaler: &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerHPA}},
 	}
-	require.ErrorContains(t, ValidateScalingPolicyComponents(policy, components), "follower autoscaler")
+	require.ErrorContains(t, validateScalingPolicyComponents(policy, components), "follower autoscaler")
 	components[v1beta1.DecoderComponent].Autoscaler.Class = v1beta1.AutoscalerNone
-	require.NoError(t, ValidateScalingPolicyComponents(policy, components))
+	require.NoError(t, validateScalingPolicyComponents(policy, components))
 }
 
 func TestValidateScalingPolicyService_FollowerPolicyRef_RejectedOnCreateAndUpdate(t *testing.T) {

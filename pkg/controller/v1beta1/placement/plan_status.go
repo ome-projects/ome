@@ -3,6 +3,7 @@ package placement
 import (
 	corev1 "k8s.io/api/core/v1"
 	"knative.dev/pkg/apis"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/validation"
 )
@@ -24,24 +25,15 @@ func placementSatisfactionConditions(source *v1beta1.InferenceService) []policyC
 	if status == nil || status.Plan == nil {
 		return nil
 	}
-	condition := policyCondition{condType: apis.ConditionType(v1beta1.PlacementSatisfied), cond: apis.Condition{
-		Status: corev1.ConditionUnknown, Reason: "AwaitingMemberApplication", Message: "Waiting for observations of the accepted placement plan",
-	}}
 	accepted := status.Plan
 	if accepted.SingleMove != nil && accepted.SingleMove.Selected == "" {
-		condition.cond.Reason = "AwaitingReplacementAdmission"
-		condition.cond.Message = "The bounded replacement race has no admitted winner"
-		return []policyCondition{condition}
+		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingReplacementAdmission)}
 	}
 	if accepted.Mode == v1beta1.PlacementModeSingle && accepted.Winner == "" {
-		condition.cond.Reason = "AwaitingSingleWinner"
-		condition.cond.Message = "The admission race has no committed winner"
-		return []policyCondition{condition}
+		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingChosenCluster)}
 	}
 	if source.UID == "" || accepted.ID == "" || accepted.Revision <= 0 || accepted.SourceUID != source.UID || accepted.ObservedGeneration != source.Generation {
-		condition.cond.Reason = "AwaitingCurrentPlan"
-		condition.cond.Message = "Current source intent has no accepted allocation"
-		return []policyCondition{condition}
+		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingCurrentPlan)}
 	}
 	known, shortfall := true, accepted.UnassignedReplicas > 0
 	var assigned int64
@@ -53,30 +45,34 @@ func placementSatisfactionConditions(source *v1beta1.InferenceService) []policyC
 		if accepted.Mode == v1beta1.PlacementModeAll && (candidate.Allocation.InventoryPending || candidate.Allocation.HomeInputsPending || (candidate.Allocation.Matched && (candidate.Allocation.DesiredHome == nil || candidate.Allocation.DesiredHome.InputDigest != accepted.InputDigest))) {
 			known = false
 		}
-		floor := candidate.Allocation.DesiredReplicas
-		assigned += int64(floor)
-		if floor == 0 && candidate.Allocation.DesiredHome == nil {
+		desiredReplicas := candidate.Allocation.DesiredReplicas
+		assigned += int64(desiredReplicas)
+		if desiredReplicas == 0 && candidate.Allocation.DesiredHome == nil {
 			continue
 		}
 		if candidate.Allocation.ClusterUID == "" || !candidate.ObservationKnown || candidate.AppliedPlanID != accepted.ID {
 			known = false
 			continue
 		}
-		shortfall = shortfall || candidate.AdmittedReplicas < floor
+		shortfall = shortfall || candidate.AdmittedReplicas < desiredReplicas
 	}
-	if assigned != accepted.AssignedReplicas || accepted.RequestedReplicas != assigned+int64(accepted.UnassignedReplicas) {
-		condition.cond.Reason = "AllocationObservationIncomplete"
-		condition.cond.Message = "Candidate allocations do not account for the accepted floor"
-	} else if shortfall {
-		condition.cond.Status = corev1.ConditionFalse
-		condition.cond.Reason = "AllocationShortfall"
-		condition.cond.Message = "One or more assigned floors are not admitted or requested replicas remain unassigned"
-	} else if known {
-		condition.cond.Status = corev1.ConditionTrue
-		condition.cond.Reason = "AssignedFloorsAdmitted"
-		condition.cond.Message = "Every assigned floor is admitted and no requested replicas remain unassigned"
+	switch {
+	case assigned != accepted.AssignedReplicas || accepted.RequestedReplicas != assigned+int64(accepted.UnassignedReplicas):
+		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAllocationObservationIncomplete)}
+	case shortfall:
+		return []policyCondition{satisfactionCondition(corev1.ConditionFalse, reasonAllocationShortfall)}
+	case known:
+		return []policyCondition{satisfactionCondition(corev1.ConditionTrue, reasonAssignedMinimumsAdmitted)}
 	}
-	return []policyCondition{condition}
+	return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingMemberApplication)}
+}
+
+// satisfactionCondition is the PlacementSatisfied condition for one reason,
+// carrying the message the reason has in reasonMessages.
+func satisfactionCondition(status corev1.ConditionStatus, reason string) policyCondition {
+	return policyCondition{condType: apis.ConditionType(v1beta1.PlacementSatisfied), cond: apis.Condition{
+		Status: status, Reason: reason, Message: reasonMessages[reason],
+	}}
 }
 
 // mergeCandidateObservations keeps allocation authority when refreshing member

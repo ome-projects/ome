@@ -2,7 +2,7 @@
 // apps/v1.ControllerRevisions. For revisions that OME wrote
 // (identified by the ome.io/created-by=ome-controller annotation),
 // updates may only mutate annotations and other non-identity metadata:
-// .data, .labels, and .revision are pinned to creation-time values.
+// .data, .labels, and .revision keep their creation-time values.
 // Revisions OME didn't create (StatefulSet/DaemonSet-owned) pass
 // through unchanged.
 //
@@ -54,8 +54,9 @@ func (v *ImmutabilityValidator) Handle(_ context.Context, req admission.Request)
 		log.Error(err, "decode new ControllerRevision")
 		return admission.Errored(http.StatusBadRequest, err)
 	}
-	// Data is the serialized ServingRuntimeSpec; tampering with it
-	// would silently change what every pinned ISVC reconciles against.
+	// Data is the serialized ServingRuntimeSpec; tampering with it would
+	// silently change what every InferenceService on this revision
+	// reconciles against.
 	// K8s' built-in ControllerRevision strategy already enforces this;
 	// the check is defense-in-depth.
 	if !bytes.Equal(oldObj.Data.Raw, newObj.Data.Raw) {
@@ -65,9 +66,9 @@ func (v *ImmutabilityValidator) Handle(_ context.Context, req admission.Request)
 	}
 	// Labels carry the cross-check inputs (ome.io/runtime-of,
 	// /revision-hash, /runtime-of-kind, /runtime-of-namespace). The GC
-	// groups by runtime-of and the controller's pinning path rejects
-	// pins whose label doesn't match the requested runtime; relabeling
-	// would let a revision masquerade as another runtime's.
+	// groups by runtime-of, and the controller refuses a fixed revision
+	// whose label doesn't match the requested runtime; relabeling would
+	// let a revision masquerade as another runtime's.
 	if !reflect.DeepEqual(oldObj.Labels, newObj.Labels) {
 		return admission.Denied(fmt.Sprintf(
 			"ControllerRevision %s/%s is owned by OME; .labels are immutable",

@@ -1489,3 +1489,48 @@ func TestValidateScaleToZero_ZeroMinReplicas_RequiresKedaOnThatComponent(t *test
 		})
 	}
 }
+
+func TestValidateAutoscaler_KedaHPAName_RejectsNamesThatAreNotDNSLabels(t *testing.T) {
+	withHPAName := func(class v1beta1.AutoscalerClass, name string) *v1beta1.ComponentAutoscaler {
+		return &v1beta1.ComponentAutoscaler{
+			Class: class,
+			Keda: &v1beta1.KedaAutoscaler{
+				Triggers: []kedav1.ScaleTriggers{{Type: "cron", Metadata: map[string]string{"timezone": "UTC"}}},
+				Advanced: &kedav1.AdvancedConfig{
+					HorizontalPodAutoscalerConfig: &kedav1.HorizontalPodAutoscalerConfig{Name: name},
+				},
+			},
+		}
+	}
+	longest := strings.Repeat("a", 63)
+
+	tests := []struct {
+		name       string
+		autoscaler *v1beta1.ComponentAutoscaler
+		wantErr    bool
+	}{
+		{name: "no name lets OME and KEDA choose one", autoscaler: withHPAName(v1beta1.AutoscalerKEDA, "")},
+		{name: "63-character name is accepted", autoscaler: withHPAName(v1beta1.AutoscalerKEDA, longest)},
+		{name: "64-character name is rejected", autoscaler: withHPAName(v1beta1.AutoscalerKEDA, longest+"a"), wantErr: true},
+		{name: "upper-case name is rejected", autoscaler: withHPAName(v1beta1.AutoscalerKEDA, "Example-HPA"), wantErr: true},
+		{name: "name with a dot is rejected", autoscaler: withHPAName(v1beta1.AutoscalerKEDA, "example.hpa"), wantErr: true},
+		{name: "a KEDA block under another class is not used, so not checked", autoscaler: withHPAName(v1beta1.AutoscalerNone, longest+"a")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateAutoscaler(tc.autoscaler, nil)
+			if !tc.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !strings.Contains(err.Error(), ReasonKedaHPANameInvalid) {
+				t.Fatalf("error %q does not name reason %s", err, ReasonKedaHPANameInvalid)
+			}
+		})
+	}
+}

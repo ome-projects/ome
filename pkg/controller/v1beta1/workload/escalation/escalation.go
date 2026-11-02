@@ -45,8 +45,8 @@ type PassInput struct {
 	// bucketed by Instance index — the same read the hold pass judged on.
 	Pods func(ctx context.Context) (map[int32][]*corev1.Pod, error)
 
-	// Excluded marks the deferred scale-down victims: they receive no
-	// lifecycle mutation before the wave admits them.
+	// Excluded marks the leaving Instances the scale-down has not admitted
+	// yet: they receive no lifecycle mutation before the wave admits them.
 	Excluded map[int32]struct{}
 
 	// Held is what the hold pass recorded this reconcile.
@@ -65,10 +65,13 @@ type PassInput struct {
 //     A pod behind an admission gate, or an operation waiting on quota or
 //     the scheduler, has its clock zeroed by the deadline step instead, and
 //     a deadline written before that zeroing landed does not count.
-//   - An Unschedulable hold older than input.UnschedulableGrace. The
-//     attempt ends as the environment's failure: the scheduler's message is
-//     recorded and no revision is charged. With no grace set, the hold
-//     lasts.
+//   - An Unschedulable hold older than input.UnschedulableGrace, or than
+//     the shorter input.GangDomainFullGrace when the gang is held to a
+//     topology domain that cannot take it. The hold's age runs from the
+//     attempt's placement wait when that began before the pod's own wait
+//     (schedulerHoldSince). The attempt ends as the
+//     environment's failure: the scheduler's message is recorded and no
+//     revision is charged. With no grace set, the hold lasts.
 //   - A PodGroup name another controller owns. The attempt ends at once as
 //     the environment's failure; a name still being collected only holds
 //     the row, and a group the gang scheduler failed ends nothing, because
@@ -320,17 +323,31 @@ func (r *rowEscalation) waitForPodGroupName(context.Context) (bool, error) {
 // in a terminal waiting reason, which the stuck-pod step reads. Past the
 // grace the attempt ends as the environment's failure: the scheduler's
 // message is recorded and no revision is charged. With no grace set, the
-// hold lasts.
+// hold lasts. A gang held to a domain that cannot take it may end sooner
+// (schedulerHoldGrace). The grace runs from the attempt's placement wait
+// (schedulerHoldSince), so it does not start over when the gang member
+// waiting for placement changes.
 func (r *rowEscalation) endOnSchedulerGrace(ctx context.Context) (bool, error) {
 	if !r.unschedulableHold {
 		return true, nil
 	}
 	p := r.pass
-	if !unschedulableGraceElapsed(r.reading.UnschedulableSince, p.now, p.input.UnschedulableGrace) {
+	grace := schedulerHoldGrace(p.input, r.reading.UnschedulableMessage, r.pods)
+	since := schedulerHoldSince(p.input.ObservedState.InstanceStatuses, r.row, r.reading.UnschedulableSince)
+	if !unschedulableGraceElapsed(since, p.now, grace) {
 		return r.reading.StuckPod != nil, nil
 	}
 	if err := escalateSchedulerHold(ctx, p.deps, p.input, p.deadlineDeps, p.failedWrites, r.row, r.pods, r.desiredPods, r.reading, p.now); err != nil {
 		return false, fmt.Errorf("escalate scheduler hold (instance=%d): %w", r.row.Index, err)
+	}
+	if gangSurgeSourceOf(p.input.ObservedState.InstanceStatuses, r.row, types.UpdateStepSurgeDrain) != nil &&
+		r.row.Operation.PlacementWaitSince != nil {
+		// The ending landed on the draining source alone and this row
+		// stays live, so its start is cleared in a write of its own: the
+		// member rebuilt next waits on its own clock. Every other ending
+		// clears the start in the row's own Failed write, and one batch
+		// may name a row only once.
+		p.failedWrites.add(r.row.Index, status.ClearPlacementWaitMutation(), nil)
 	}
 	return false, nil
 }
@@ -551,7 +568,7 @@ func announceRepairWaiting(ctx context.Context, deps types.Deps, input types.Rec
 type InstanceEvidence struct {
 	// StuckPod is the first live, non-deleting pod parked in a
 	// workload-caused/terminal waiting state past the grace window
-	// (evidence.FirstStuckPodForInstance). Nil when no pod is stuck.
+	// (evidence.FirstStuckPodForInstanceSince). Nil when no pod is stuck.
 	StuckPod *corev1.Pod
 	// StuckReason is the kubelet waiting reason of StuckPod ("" when none).
 	StuckReason string

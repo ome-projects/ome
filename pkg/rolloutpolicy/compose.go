@@ -55,10 +55,36 @@ func ComposeGroup(g *v1beta1.RolloutGroup, policy *v1beta1.RolloutPolicySpec) (v
 	return out, nil
 }
 
+// ProgressionBody is one progression body a rollout group or a RolloutPolicy
+// sets: its kind, whose value is the field's name, and the body itself.
+type ProgressionBody struct {
+	Kind v1beta1.RolloutProgressionKind
+	Body any
+}
+
+// ProgressionBodies lists the progression bodies that are set, in the order
+// canary, blueGreen, rollingUpdate. A RolloutGroup and a RolloutPolicySpec
+// carry the same three fields, so both pass theirs. The schema admits at most
+// one body; every rule that needs the count, the first body or its name reads
+// this list.
+func ProgressionBodies(canary *v1beta1.GroupCanary, blueGreen *v1beta1.GroupBlueGreen, rollingUpdate *v1beta1.GroupRollingUpdate) []ProgressionBody {
+	var bodies []ProgressionBody
+	if canary != nil {
+		bodies = append(bodies, ProgressionBody{Kind: v1beta1.RolloutProgressionCanary, Body: canary})
+	}
+	if blueGreen != nil {
+		bodies = append(bodies, ProgressionBody{Kind: v1beta1.RolloutProgressionBlueGreen, Body: blueGreen})
+	}
+	if rollingUpdate != nil {
+		bodies = append(bodies, ProgressionBody{Kind: v1beta1.RolloutProgressionRollingUpdate, Body: rollingUpdate})
+	}
+	return bodies
+}
+
 // hasInlineProgression reports whether the group sets any inline progression
-// arm (which then outranks a coexisting PolicyRef).
+// body (which then outranks a coexisting PolicyRef).
 func hasInlineProgression(g *v1beta1.RolloutGroup) bool {
-	return g.Canary != nil || g.BlueGreen != nil || g.RollingUpdate != nil
+	return len(ProgressionBodies(g.Canary, g.BlueGreen, g.RollingUpdate)) > 0
 }
 
 // GroupSource reports which source a run opened now would pin for the group.

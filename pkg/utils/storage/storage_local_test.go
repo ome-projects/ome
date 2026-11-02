@@ -114,7 +114,7 @@ func TestValidateLocalStorageURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateLocalStorageURI(tt.uri)
+			err := validatorFor(t, StorageTypeLocal)(tt.uri)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {

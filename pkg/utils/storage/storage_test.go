@@ -113,6 +113,18 @@ func TestParseOCIStorageURI(t *testing.T) {
 	}
 }
 
+// validatorFor returns the table row's validity check for one storage type.
+func validatorFor(t *testing.T, storageType StorageType) func(string) error {
+	t.Helper()
+	for _, s := range schemes {
+		if s.storageType == storageType {
+			return s.validate
+		}
+	}
+	t.Fatalf("no scheme row for %s", storageType)
+	return nil
+}
+
 func TestValidateOCIStorageURI(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -141,7 +153,7 @@ func TestValidateOCIStorageURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateOCIStorageURI(tt.uri)
+			err := validatorFor(t, StorageTypeOCI)(tt.uri)
 			if tt.wantErr {
 				assert.Error(t, err)
 				if tt.errContains != "" {
@@ -760,7 +772,7 @@ func TestValidateVendorStorageURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateVendorStorageURI(tt.uri)
+			err := validatorFor(t, StorageTypeVendor)(tt.uri)
 			if tt.wantErr {
 				assert.Error(t, err)
 				if tt.errContains != "" {
@@ -892,7 +904,7 @@ func TestValidateHuggingFaceStorageURI(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateHuggingFaceStorageURI(tt.uri)
+			err := validatorFor(t, StorageTypeHuggingFace)(tt.uri)
 			if tt.wantErr {
 				assert.Error(t, err)
 				if tt.errContains != "" {

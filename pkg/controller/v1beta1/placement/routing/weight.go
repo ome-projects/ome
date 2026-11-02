@@ -13,6 +13,7 @@ import (
 	"math/big"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
@@ -41,7 +42,8 @@ type ClusterCapacity struct {
 
 	// Ready caps the count basis of the weight, so partial readiness changes
 	// traffic proportionally. Zero gates the cluster's weight to 0. A usable
-	// ReportedWeight is neither capped nor gated by it.
+	// ReportedWeight is not capped by it, and the routing controller supplies
+	// a positive one only while Ready is positive.
 	Ready int32
 
 	// Factor applies whenever the replica count is the basis: the per-replica

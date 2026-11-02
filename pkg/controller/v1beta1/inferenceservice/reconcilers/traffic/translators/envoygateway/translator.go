@@ -46,7 +46,9 @@ const (
 	kindHTTPRoute   = "HTTPRoute"
 )
 
-var btpGVK = schema.GroupVersionKind{
+// PolicyGVK is the BackendTrafficPolicy kind the translator emits; the
+// factory probes for its CRD before selecting this translator.
+var PolicyGVK = schema.GroupVersionKind{
 	Group:   groupEnvoyGateway,
 	Version: versionV1Alpha1,
 	Kind:    kindBTP,
@@ -72,7 +74,7 @@ func (t *Translator) Name() string {
 // without us importing the Envoy Gateway types.
 func (t *Translator) Watches() client.Object {
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(btpGVK)
+	u.SetGroupVersionKind(PolicyGVK)
 	return u
 }
 
@@ -135,23 +137,12 @@ func (t *Translator) SupportedPassthroughPrefixes() []string {
 	return []string{constants.PassthroughEnvoyGatewayPrefix}
 }
 
-// SupportedAnnotations returns the set of ome.io/* annotation keys
-// the Envoy Gateway BTP can honor. Pass-through (ome.io/btp.*) is not
-// listed because pass-through is per-prefix, not per-key.
+// SupportedAnnotations returns every ome.io/* annotation key that
+// flows through a translator: the Envoy Gateway BTP honors them all.
+// Pass-through (ome.io/btp.*) is not listed because pass-through is
+// per-prefix, not per-key.
 func (t *Translator) SupportedAnnotations() sets.Set[string] {
-	return sets.New(
-		constants.CircuitBreakerMaxConnectionsAnnotation,
-		constants.CircuitBreakerMaxParallelRequestsAnnotation,
-		constants.CircuitBreakerMaxPendingRequestsAnnotation,
-		constants.CircuitBreakerMaxParallelRetriesAnnotation,
-		constants.CircuitBreakerPerEndpointMaxConnectionsAnnotation,
-		constants.RetryAttemptsAnnotation,
-		constants.RetryOnAnnotation,
-		constants.RetryPerTryTimeoutAnnotation,
-		constants.TimeoutIdleAnnotation,
-		constants.TimeoutMaxConnectionDurationAnnotation,
-		constants.TimeoutTCPConnectAnnotation,
-	)
+	return traffic.BackendAnnotationKeys()
 }
 
 // SupportedTrafficFields returns the typed spec.traffic capability
@@ -180,7 +171,7 @@ func (t *Translator) Translate(
 	intent *traffic.ResolvedIntent,
 ) (client.Object, []string, error) {
 	btp := &unstructured.Unstructured{}
-	btp.SetGroupVersionKind(btpGVK)
+	btp.SetGroupVersionKind(PolicyGVK)
 	btp.SetName(isvc.Name)
 	btp.SetNamespace(isvc.Namespace)
 
