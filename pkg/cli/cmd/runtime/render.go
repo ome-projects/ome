@@ -99,6 +99,7 @@ type renderOptions struct {
 	filenames                []string
 	projectPlacement         bool
 	placementProjectionInput bool
+	validateFileSpec         func([]byte) error
 }
 
 func newRenderCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {

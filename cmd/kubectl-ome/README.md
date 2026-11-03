@@ -268,6 +268,11 @@ including registrations rendered from charts. Projection reads the hub CRD's
 defaults, uses `ProjectSplitReplicas`, and ignores status, admission, and retained
 rollout replicas. It makes no API request or credential lookup.
 
+Both current weight forms are supported: integer `weights.default/engine/decoder/router`
+with optional `split.maxPerCluster`, and `weights.*Replicas: {min, max}` without
+a `split` block. Ratio minimums and maximums divide the source's component bounds
+independently. Removed scalar `weight` and `maxReplicasPerCluster` fields are errors.
+
 ```sh
 kubectl ome runtime project-placement --member member-a \
   -f hub/services.yaml -f hub/workloadclusters.yaml \

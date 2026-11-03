@@ -141,6 +141,42 @@ func TestProjectPlacementEmptyAllocation(t *testing.T) {
 	assert.Contains(t, rendered, `"items": []`)
 }
 
+func TestProjectPlacementCurrentContract(t *testing.T) {
+	ratios := strings.NewReplacer(
+		"weights: {default: 2}", "weights: {defaultReplicas: {min: 2, max: 1}}",
+		"weights: {default: 1}", "weights: {defaultReplicas: {min: 1, max: 3}}",
+		"maxReplicas: 60", "maxReplicas: 180", "maxReplicas: 40", "maxReplicas: 120", "maxReplicas: 3}", "maxReplicas: 12}",
+	).Replace(placementSource)
+	components := strings.NewReplacer(
+		"weights: {default: 2}", "weights: {engineReplicas: {min: 2, max: 1}, decoderReplicas: {min: 1, max: 3}, routerReplicas: {min: 1, max: 1}}",
+		"weights: {default: 1}", "weights: {engineReplicas: {min: 1, max: 3}, decoderReplicas: {min: 3, max: 1}, routerReplicas: {min: 1, max: 1}}",
+		"maxReplicas: 60", "maxReplicas: 120", "maxReplicas: 40", "maxReplicas: 80", "router: {minReplicas: 3, maxReplicas: 3}", "router: {minReplicas: 6, maxReplicas: 12}",
+	).Replace(placementSource)
+	caps := strings.Replace(placementSource, "mode: Split\n", "mode: Split\n    split: {maxPerCluster: {engine: 50, decoder: 30, router: 4}}\n", 1)
+	for _, tc := range []struct {
+		name, source string
+		bounds       [3][2]int
+	}{
+		{"default ratios", ratios, [3][2]int{{40, 45}, {27, 30}, {2, 3}}},
+		{"component ratios", components, [3][2]int{{40, 40}, {10, 60}, {3, 6}}},
+		{"component caps", caps, [3][2]int{{40, 50}, {27, 30}, {2, 4}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := projectionFiles()
+			files["sources.yaml"] = tc.source
+			output, err := executeProjection(t, renderFactory(t, false), files, projectionArgs...)
+			require.NoError(t, err)
+			var projection placementProjection
+			require.NoError(t, json.Unmarshal([]byte(output), &projection))
+			require.Len(t, projection.Items, 1)
+			var isvc v1beta1.InferenceService
+			require.NoError(t, json.Unmarshal(projection.Items[0], &isvc))
+			bounds := [3][2]int{{*isvc.Spec.Engine.MinReplicas, isvc.Spec.Engine.MaxReplicas}, {*isvc.Spec.Decoder.MinReplicas, isvc.Spec.Decoder.MaxReplicas}, {*isvc.Spec.Router.MinReplicas, isvc.Spec.Router.MaxReplicas}}
+			assert.Equal(t, tc.bounds, bounds)
+		})
+	}
+}
+
 func TestProjectPlacementRejectsInvalidInputAtomically(t *testing.T) {
 	for _, tc := range []struct{ name, file, replacement, want string }{
 		{"router shortage", "sources.yaml", strings.Replace(placementSource, "minReplicas: 3", "minReplicas: 1", 1), "router minimum 1"},
@@ -148,9 +184,15 @@ func TestProjectPlacementRejectsInvalidInputAtomically(t *testing.T) {
 		{"duplicate registrations", "clusters.yaml", placementClusters + "---\n" + placementClusters, "ambiguous file input"},
 		{"unknown registration field", "clusters.yaml", placementClusters + "spec: {typo: true}\n", "unknown field"},
 		{"unsupported mode", "sources.yaml", strings.Replace(placementSource, "mode: Split", "mode: All", 1), "supports only explicit ClusterAffinity"},
+		{"removed scalar weight", "sources.yaml", strings.Replace(placementSource, "weights: {default: 2}", "weight: 2", 1), `unknown field "weight"`},
+		{"removed replica cap", "sources.yaml", strings.Replace(placementSource, "mode: Split\n", "mode: Split\n    split: {maxReplicasPerCluster: 50}\n", 1), `unknown field "maxReplicasPerCluster"`},
+		{"zero component cap", "sources.yaml", strings.Replace(placementSource, "mode: Split\n", "mode: Split\n    split: {maxPerCluster: {engine: 0}}\n", 1), "greater than or equal to 1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := projectionFiles()
+			crd, err := os.ReadFile("../../../../config/crd/full/ome.io_inferenceservices.yaml")
+			require.NoError(t, err)
+			files["isvc-crd.yaml"] = string(crd)
 			if tc.file == "sources.yaml" {
 				tc.replacement += "---\n" + strings.Split(files["sources.yaml"], "---\n")[1]
 			}

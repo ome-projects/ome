@@ -286,6 +286,17 @@ file decoder and CRD defaults, then calls the controller's exported
 and makes no API request, runtime lookup, or credential lookup. A name selects
 one source in the current namespace; otherwise every source is projected.
 
+The command accepts both current weight forms: integer weights with per-component
+`split.maxPerCluster` caps, and `*Replicas` ratios with independent `min` and `max`
+shares of the source's component bounds. The planner rejects mixing those forms
+or keeping `split` alongside ratios. Projection checks placement fields against
+the linked API types before the custom presence-preserving decoder runs, so
+removed fields such as scalar `weight` and `maxReplicasPerCluster` cannot be
+silently dropped and change the plan.
+Kubernetes' CRD schema validator checks the defaulted projection inputs, including
+positive component caps. Placement's existing validator and planner enforce the
+rules relating ratio weights, modes, and the split block.
+
 The output is a CLI-owned envelope:
 
 ```yaml

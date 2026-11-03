@@ -12,6 +12,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
 	structuraldefaulting "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/defaulting"
+	crdvalidation "k8s.io/apiextensions-apiserver/pkg/apiserver/validation"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -117,6 +118,22 @@ func (o *renderOptions) loadInferenceServiceStructuralSchema() (*structuralschem
 	structural = structural.DeepCopy()
 	if err := structuraldefaulting.PruneDefaults(structural); err != nil {
 		return nil, fmt.Errorf("--inference-service-crd %s: prepare version %s defaults: %w", path, selected.Name, err)
+	}
+	if o.projectPlacement {
+		validator, _, err := crdvalidation.NewSchemaValidator(internalValidation.OpenAPIV3Schema)
+		if err != nil {
+			return nil, fmt.Errorf("--inference-service-crd %s: create validation schema: %w", path, err)
+		}
+		o.validateFileSpec = func(raw []byte) error {
+			object := map[string]interface{}{}
+			if err := kjson.Unmarshal(raw, &object); err != nil {
+				return err
+			}
+			if object["apiVersion"] != v1beta1.SchemeGroupVersion.String() || object["kind"] != "InferenceService" {
+				return nil
+			}
+			return crdvalidation.ValidateCustomResource(field.NewPath("InferenceService"), object, validator).ToAggregate()
+		}
 	}
 	return structural, nil
 }

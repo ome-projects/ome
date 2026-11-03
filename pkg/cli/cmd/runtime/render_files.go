@@ -239,6 +239,14 @@ func (o *renderOptions) decodeFileObjects(
 			if err != nil {
 				return nil, fmt.Errorf("-f %s: apply InferenceService CRD defaults: %w", path, err)
 			}
+			if o.projectPlacement {
+				if err := validatePlacementFields(raw); err != nil {
+					return nil, fmt.Errorf("-f %s: validate spec.placement: %w", path, err)
+				}
+				if err := o.validateFileSpec(raw); err != nil {
+					return nil, fmt.Errorf("-f %s: validate InferenceService schema: %w", path, err)
+				}
+			}
 			decoded, gvk, err := decoder.Decode(raw, nil, nil)
 			if k8sruntime.IsNotRegisteredError(err) {
 				kinds := "InferenceServices, runtimes, and models"

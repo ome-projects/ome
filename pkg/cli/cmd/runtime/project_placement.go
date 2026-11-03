@@ -191,3 +191,32 @@ func expandPlacementProjection(raw []byte) ([][]byte, bool, error) {
 	}
 	return items, true, nil
 }
+
+// PlacementSpec's custom JSON decoder preserves null affinity but ignores
+// unknown fields. An alias checks the same API fields without changing that
+// decoder's presence semantics.
+func validatePlacementFields(raw []byte) error {
+	var typeMeta metav1.TypeMeta
+	if err := json.Unmarshal(raw, &typeMeta); err != nil {
+		return err
+	}
+	if typeMeta.APIVersion != v1beta1.SchemeGroupVersion.String() || typeMeta.Kind != "InferenceService" {
+		return nil
+	}
+	var source struct {
+		Spec struct {
+			Placement json.RawMessage `json:"placement"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(raw, &source); err != nil {
+		return err
+	}
+	if len(source.Spec.Placement) == 0 {
+		return nil
+	}
+	type placementFields v1beta1.PlacementSpec
+	var fields placementFields
+	decoder := json.NewDecoder(bytes.NewReader(source.Spec.Placement))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(&fields)
+}
