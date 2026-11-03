@@ -16,14 +16,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podgroup"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestObservePodGroups_OneListIndexesOwnedAndRetainsForeignNames(t *testing.T) {
@@ -32,28 +31,16 @@ func TestObservePodGroups_OneListIndexesOwnedAndRetainsForeignNames(t *testing.T
 	owned := inventoryPodGroup(t, owner, "llama", 7)
 	foreign := inventoryPodGroup(t, foreignOwner, "llama", 8)
 	base := newGangClient(t, owner, foreignOwner, owned, foreign)
-	lists, gets := 0, 0
-	counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if _, ok := list.(*schedulingv1alpha1.PodGroupList); ok {
-				lists++
-			}
-			return c.List(ctx, list, opts...)
-		},
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*schedulingv1alpha1.PodGroup); ok {
-				gets++
-			}
-			return c.Get(ctx, key, obj, opts...)
-		},
-	})
+	lists := fakeclient.CountingVerb(fakeclient.List).OnKind(&schedulingv1alpha1.PodGroupList{})
+	gets := fakeclient.CountingVerb(fakeclient.Get).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, lists, gets)
 
 	inv, err := ObservePodGroups(context.Background(), counting, owner)
 	if err != nil {
 		t.Fatalf("ObservePodGroups: %v", err)
 	}
-	if lists != 1 || gets != 0 {
-		t.Fatalf("inventory reads: lists=%d gets=%d, want exactly one LIST and zero GETs", lists, gets)
+	if lists.Count() != 1 || gets.Count() != 0 {
+		t.Fatalf("inventory reads: lists=%d gets=%d, want exactly one LIST and zero GETs", lists.Count(), gets.Count())
 	}
 	if !inv.Available() || inv.OwnerUID() != owner.GetUID() {
 		t.Fatalf("inventory identity: available=%v ownerUID=%q", inv.Available(), inv.OwnerUID())
@@ -141,11 +128,8 @@ func TestPodGroupIndexRejectsInvalidValues(t *testing.T) {
 func TestCachedOwnerHasPodGroups_RuntimeAPIRemovalIsSoftFail(t *testing.T) {
 	owner := newOwner("prod", "llama")
 	base := newGangClient(t, owner)
-	reader := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-			return &apimeta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "scheduling.x-k8s.io", Kind: "PodGroup"}}
-		},
-	})
+	reader := fakeclient.Wrap(t, base, fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall,
+		&apimeta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "scheduling.x-k8s.io", Kind: "PodGroup"}}))
 	hasGroups, err := CachedOwnerHasPodGroups(context.Background(), reader, owner)
 	if err != nil {
 		t.Fatalf("runtime API removal must soft-fail: %v", err)
@@ -158,11 +142,8 @@ func TestCachedOwnerHasPodGroups_RuntimeAPIRemovalIsSoftFail(t *testing.T) {
 func TestObservePodGroups_RuntimeAPIRemovalIsSoftFail(t *testing.T) {
 	owner := newOwner("prod", "llama")
 	base := newGangClient(t, owner)
-	reader := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-			return &apimeta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "scheduling.x-k8s.io", Kind: "PodGroup"}}
-		},
-	})
+	reader := fakeclient.Wrap(t, base, fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall,
+		&apimeta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "scheduling.x-k8s.io", Kind: "PodGroup"}}))
 	inv, err := ObservePodGroups(context.Background(), reader, owner)
 	if err != nil {
 		t.Fatalf("runtime API removal must soft-fail: %v", err)
@@ -174,7 +155,7 @@ func TestObservePodGroups_RuntimeAPIRemovalIsSoftFail(t *testing.T) {
 
 func TestObservePodGroups_UnregisteredOptionalTypeIsSoftFail(t *testing.T) {
 	owner := newOwner("prod", "llama")
-	reader := fake.NewClientBuilder().WithScheme(runtime.NewScheme()).Build()
+	reader := fakeclient.New(t, fakeclient.WithScheme(runtime.NewScheme()))
 	inv, err := ObservePodGroups(context.Background(), reader, owner)
 	if err != nil {
 		t.Fatalf("unregistered optional type must soft-fail: %v", err)
@@ -192,21 +173,9 @@ func TestEnsurePodGroupsWithState_UsesInventoryWithoutPodGroupReads(t *testing.T
 	if err != nil {
 		t.Fatalf("ObservePodGroups: %v", err)
 	}
-	pgReads := 0
-	counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if _, ok := list.(*schedulingv1alpha1.PodGroupList); ok {
-				pgReads++
-			}
-			return c.List(ctx, list, opts...)
-		},
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*schedulingv1alpha1.PodGroup); ok {
-				pgReads++
-			}
-			return c.Get(ctx, key, obj, opts...)
-		},
-	})
+	pgLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&schedulingv1alpha1.PodGroupList{})
+	pgGets := fakeclient.CountingVerb(fakeclient.Get).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, pgLists, pgGets)
 	input, _ := inputWithConditionStore(owner, true, 1, true, "custom-scheduler")
 	input.AuthoritativePods = &types.ComponentPodSnapshot{ByInstance: map[int32][]*corev1.Pod{}}
 	plan := planFor(types.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
@@ -215,7 +184,7 @@ func TestEnsurePodGroupsWithState_UsesInventoryWithoutPodGroupReads(t *testing.T
 		PodGroupReconcileState{Inventory: inv}); err != nil {
 		t.Fatalf("EnsurePodGroupsWithState: %v", err)
 	}
-	if pgReads != 0 {
+	if pgReads := countCalls(pgLists, pgGets); pgReads != 0 {
 		t.Fatalf("shared inventory path issued %d hidden PodGroup read(s)", pgReads)
 	}
 }
@@ -227,35 +196,13 @@ func TestEnsureSurgePodGroupWithState_SeesTopLevelCreateWithoutReads(t *testing.
 	if err != nil {
 		t.Fatalf("ObservePodGroups: %v", err)
 	}
-	reads, creates, deletes := 0, 0, 0
-	counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			switch list.(type) {
-			case *corev1.PodList, *schedulingv1alpha1.PodGroupList:
-				reads++
-			}
-			return c.List(ctx, list, opts...)
-		},
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			switch obj.(type) {
-			case *corev1.Pod, *schedulingv1alpha1.PodGroup:
-				reads++
-			}
-			return c.Get(ctx, key, obj, opts...)
-		},
-		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*schedulingv1alpha1.PodGroup); ok {
-				creates++
-			}
-			return c.Create(ctx, obj, opts...)
-		},
-		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			if _, ok := obj.(*schedulingv1alpha1.PodGroup); ok {
-				deletes++
-			}
-			return c.Delete(ctx, obj, opts...)
-		},
-	})
+	podLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&corev1.PodList{})
+	podGets := fakeclient.CountingVerb(fakeclient.Get).OnKind(&corev1.Pod{})
+	pgLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&schedulingv1alpha1.PodGroupList{})
+	pgGets := fakeclient.CountingVerb(fakeclient.Get).OnKind(&schedulingv1alpha1.PodGroup{})
+	creates := fakeclient.CountingVerb(fakeclient.Create).OnKind(&schedulingv1alpha1.PodGroup{})
+	deletes := fakeclient.CountingVerb(fakeclient.Delete).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, podLists, podGets, pgLists, pgGets, creates, deletes)
 	input, _ := inputWithConditionStore(owner, true, 1, true, "custom-scheduler")
 	input.AuthoritativePods = &types.ComponentPodSnapshot{
 		Pods:       []*corev1.Pod{},
@@ -271,19 +218,19 @@ func TestEnsureSurgePodGroupWithState_SeesTopLevelCreateWithoutReads(t *testing.
 	if _, err := ensure(context.Background(), input, plan, plan.Instances[0]); err != nil {
 		t.Fatalf("EnsureSurgePodGroupWithState: %v", err)
 	}
-	if reads != 0 {
+	if reads := countCalls(podLists, podGets, pgLists, pgGets); reads != 0 {
 		t.Fatalf("shared surge prerequisite issued %d hidden Pod/PodGroup read(s)", reads)
 	}
-	if creates != 1 {
-		t.Fatalf("top-level plus inline ensure created %d PodGroups, want exactly 1", creates)
+	if creates.Count() != 1 {
+		t.Fatalf("top-level plus inline ensure created %d PodGroups, want exactly 1", creates.Count())
 	}
 	finalize := BuildFinalizeInstanceResources(counting, counting, inv, owner, "llama", types.ComponentEngine)
 	complete, err := finalize(context.Background(), 6)
 	if err != nil {
 		t.Fatalf("finalize same-pass PodGroup: %v", err)
 	}
-	if complete || deletes != 1 || !inv.DeleteAccepted(query.PodGroupName("llama", types.ComponentEngine, 6)) {
-		t.Fatalf("same-pass finalization: complete=%v deletes=%d accepted=%v", complete, deletes,
+	if complete || deletes.Count() != 1 || !inv.DeleteAccepted(query.PodGroupName("llama", types.ComponentEngine, 6)) {
+		t.Fatalf("same-pass finalization: complete=%v deletes=%d accepted=%v", complete, deletes.Count(),
 			inv.DeleteAccepted(query.PodGroupName("llama", types.ComponentEngine, 6)))
 	}
 }
@@ -297,15 +244,8 @@ func TestEnsureSurgePodGroupWithState_SeesTopLevelUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ObservePodGroups: %v", err)
 	}
-	updates := 0
-	counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			if _, ok := obj.(*schedulingv1alpha1.PodGroup); ok {
-				updates++
-			}
-			return c.Update(ctx, obj, opts...)
-		},
-	})
+	updates := fakeclient.CountingVerb(fakeclient.Update).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, updates)
 	input, _ := inputWithConditionStore(owner, true, 1, true, "custom-scheduler")
 	input.AuthoritativePods = &types.ComponentPodSnapshot{ByInstance: map[int32][]*corev1.Pod{}}
 	plan := planFor(types.ComponentEngine, []int32{6}, true, 1, 5*time.Minute)
@@ -318,8 +258,8 @@ func TestEnsureSurgePodGroupWithState_SeesTopLevelUpdate(t *testing.T) {
 	if _, err := ensure(context.Background(), input, plan, plan.Instances[0]); err != nil {
 		t.Fatalf("EnsureSurgePodGroupWithState: %v", err)
 	}
-	if updates != 1 {
-		t.Fatalf("top-level plus inline ensure updated %d PodGroups, want exactly 1", updates)
+	if updates.Count() != 1 {
+		t.Fatalf("top-level plus inline ensure updated %d PodGroups, want exactly 1", updates.Count())
 	}
 }
 
@@ -332,21 +272,9 @@ func TestEnsurePodGroupsWithState_TerminalOwnedSkipsEnsure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ObservePodGroups: %v", err)
 	}
-	creates, updates := 0, 0
-	counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			if _, ok := obj.(*schedulingv1alpha1.PodGroup); ok {
-				creates++
-			}
-			return c.Create(ctx, obj, opts...)
-		},
-		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			if _, ok := obj.(*schedulingv1alpha1.PodGroup); ok {
-				updates++
-			}
-			return c.Update(ctx, obj, opts...)
-		},
-	})
+	creates := fakeclient.CountingVerb(fakeclient.Create).OnKind(&schedulingv1alpha1.PodGroup{})
+	updates := fakeclient.CountingVerb(fakeclient.Update).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, creates, updates)
 	input, _ := inputWithConditionStore(owner, true, 1, true, "custom-scheduler")
 	input.AuthoritativePods = &types.ComponentPodSnapshot{ByInstance: map[int32][]*corev1.Pod{}}
 	plan := planFor(types.ComponentEngine, []int32{3}, true, 1, 5*time.Minute)
@@ -355,11 +283,11 @@ func TestEnsurePodGroupsWithState_TerminalOwnedSkipsEnsure(t *testing.T) {
 		PodGroupReconcileState{Inventory: inv, TerminalOwned: map[int32]struct{}{3: {}}}); err != nil {
 		t.Fatalf("EnsurePodGroupsWithState: %v", err)
 	}
-	if creates != 0 {
-		t.Fatalf("terminal-owned index recreated %d PodGroup(s)", creates)
+	if creates.Count() != 0 {
+		t.Fatalf("terminal-owned index recreated %d PodGroup(s)", creates.Count())
 	}
-	if updates != 0 {
-		t.Fatalf("terminal-owned index updated %d PodGroup(s)", updates)
+	if updates.Count() != 0 {
+		t.Fatalf("terminal-owned index updated %d PodGroup(s)", updates.Count())
 	}
 	got := &schedulingv1alpha1.PodGroup{}
 	if err := base.Get(context.Background(), client.ObjectKeyFromObject(pg), got); err != nil {
@@ -621,13 +549,8 @@ func TestBuildFinalizeInstanceResources_DeletesOwnedOnceAndIgnoresForeign(t *tes
 		if err != nil {
 			t.Fatalf("ObservePodGroups: %v", err)
 		}
-		deletes := 0
-		counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-				deletes++
-				return c.Delete(ctx, obj, opts...)
-			},
-		})
+		deletes := fakeclient.CountingVerb(fakeclient.Delete)
+		counting := fakeclient.Wrap(t, base, deletes)
 		finalize := BuildFinalizeInstanceResources(counting, counting, inv, owner, "llama", types.ComponentEngine)
 		complete, err := finalize(context.Background(), 5)
 		if err != nil || complete {
@@ -637,8 +560,8 @@ func TestBuildFinalizeInstanceResources_DeletesOwnedOnceAndIgnoresForeign(t *tes
 		if err != nil || complete {
 			t.Fatalf("idempotent finalize: %v", err)
 		}
-		if deletes != 1 {
-			t.Fatalf("delete calls: got %d want 1", deletes)
+		if deletes.Count() != 1 {
+			t.Fatalf("delete calls: got %d want 1", deletes.Count())
 		}
 		if !inv.DeleteAccepted(pg.Name) {
 			t.Fatal("successful delete was not recorded as accepted")
@@ -688,16 +611,9 @@ func TestBuildFinalizeInstanceResources_DeletesOwnedOnceAndIgnoresForeign(t *tes
 		if err != nil {
 			t.Fatalf("ObservePodGroups: %v", err)
 		}
-		attempts := 0
-		flaky := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-				attempts++
-				if attempts == 1 {
-					return errors.New("transient delete failure")
-				}
-				return c.Delete(ctx, obj, opts...)
-			},
-		})
+		attempts := fakeclient.CountingVerb(fakeclient.Delete)
+		flaky := fakeclient.Wrap(t, base, attempts,
+			fakeclient.FailingVerb(fakeclient.Delete, 1, errors.New("transient delete failure")))
 		finalize := BuildFinalizeInstanceResources(flaky, flaky, inv, owner, "llama", types.ComponentEngine)
 		if _, err := finalize(context.Background(), 5); err == nil {
 			t.Fatal("transient delete failure was swallowed")
@@ -709,10 +625,19 @@ func TestBuildFinalizeInstanceResources_DeletesOwnedOnceAndIgnoresForeign(t *tes
 		if err != nil || complete {
 			t.Fatalf("retry finalize: %v", err)
 		}
-		if attempts != 2 || !inv.DeleteAccepted(pg.Name) {
-			t.Fatalf("retry state: attempts=%d accepted=%v", attempts, inv.DeleteAccepted(pg.Name))
+		if attempts.Count() != 2 || !inv.DeleteAccepted(pg.Name) {
+			t.Fatalf("retry state: attempts=%d accepted=%v", attempts.Count(), inv.DeleteAccepted(pg.Name))
 		}
 	})
+}
+
+// countCalls sums the calls the counters saw.
+func countCalls(counters ...*fakeclient.Calls) int {
+	total := 0
+	for _, c := range counters {
+		total += c.Count()
+	}
+	return total
 }
 
 func inventoryPodGroup(t *testing.T, owner client.Object, ownerName string, index int32) *schedulingv1alpha1.PodGroup {
@@ -760,13 +685,8 @@ func TestFinalizeOwnedName_TerminatingGroupHoldsTheIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ObservePodGroups: %v", err)
 	}
-	deletes := 0
-	counting := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-			deletes++
-			return c.Delete(ctx, obj, opts...)
-		},
-	})
+	deletes := fakeclient.CountingVerb(fakeclient.Delete)
+	counting := fakeclient.Wrap(t, base, deletes)
 	finalize := BuildFinalizeInstanceResources(counting, counting, inv, owner, "llama", types.ComponentEngine)
 	complete, err := finalize(context.Background(), 1)
 	if err != nil {
@@ -775,8 +695,8 @@ func TestFinalizeOwnedName_TerminatingGroupHoldsTheIndex(t *testing.T) {
 	if complete {
 		t.Fatal("a Terminating group must hold the index incomplete")
 	}
-	if deletes != 0 {
-		t.Fatalf("delete calls on a Terminating group: got %d want 0", deletes)
+	if deletes.Count() != 0 {
+		t.Fatalf("delete calls on a Terminating group: got %d want 0", deletes.Count())
 	}
 
 	held.Finalizers = nil

@@ -4,14 +4,13 @@ import (
 	"context"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // The rolled-out record of a canary-owned Component is the executor's to
@@ -35,7 +34,7 @@ func revisionServiceName(isvc *v1beta1.InferenceService, comp v1beta1.ComponentT
 // idleRecordFixture seeds a single-engine canary service with no ladder
 // armed, its engine settled on "cur" with two Ready pods, and a rolled-out
 // record still naming "stale".
-func idleRecordFixture(t *testing.T, name string, objects ...runtime.Object) (*v1beta1.InferenceService, client.Client) {
+func idleRecordFixture(t *testing.T, name string, objects ...client.Object) (*v1beta1.InferenceService, client.Client) {
 	t.Helper()
 	ns := "default"
 	n2 := 2
@@ -48,7 +47,7 @@ func idleRecordFixture(t *testing.T, name string, objects ...runtime.Object) (*v
 	objects = append(objects, isvc, settledIR(ns, name, v1beta1.EngineComponent, "cur"),
 		canaryPod(ns, name, "engine", "cur", "cur-0"),
 		canaryPod(ns, name, "engine", "cur", "cur-1"))
-	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objects...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objects...))
 	return isvc, c
 }
 
@@ -106,10 +105,10 @@ func TestDispatch_IdleMemberNotSettledKeepsItsRecord(t *testing.T) {
 	ns := "default"
 	cases := []struct {
 		name string
-		pods []runtime.Object
+		pods []client.Object
 	}{{
 		name: "a pod of another revision remains",
-		pods: []runtime.Object{canaryPod(ns, "idle-mixed", "engine", "stale", "stale-2")},
+		pods: []client.Object{canaryPod(ns, "idle-mixed", "engine", "stale", "stale-2")},
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -130,8 +129,8 @@ func TestDispatch_IdleMemberNotSettledKeepsItsRecord(t *testing.T) {
 		isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{v1beta1.EngineComponent: {LatestRolledoutRevision: stale}}
 		unready := canaryPod(ns, name, "engine", "cur", "cur-0")
 		unready.Status.Conditions = nil
-		c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(
-			isvc, settledIR(ns, name, v1beta1.EngineComponent, "cur"), unready).Build()
+		c := fakeclient.New(t, fakeclient.WithObjects(
+			isvc, settledIR(ns, name, v1beta1.EngineComponent, "cur"), unready))
 		dispatchOnce(t, isvc, c)
 		if got := isvc.Status.Components[v1beta1.EngineComponent].LatestRolledoutRevision; got != stale {
 			t.Fatalf("LatestRolledoutRevision = %q, want the untouched %q", got, stale)
@@ -153,13 +152,13 @@ func TestDispatch_IdlePairRecordsFollowBothInferenceReplicas(t *testing.T) {
 		v1beta1.EngineComponent:  {LatestRolledoutRevision: revisionServiceName(isvc, v1beta1.EngineComponent, "stale")},
 		v1beta1.DecoderComponent: {LatestRolledoutRevision: revisionServiceName(isvc, v1beta1.DecoderComponent, "dstale")},
 	}
-	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(
+	c := fakeclient.New(t, fakeclient.WithObjects(
 		isvc,
 		settledIR(ns, name, v1beta1.EngineComponent, "cur"),
 		settledIR(ns, name, v1beta1.DecoderComponent, "dcur"),
 		canaryPod(ns, name, "engine", "cur", "cur-0"), canaryPod(ns, name, "engine", "cur", "cur-1"),
 		canaryPod(ns, name, "decoder", "dcur", "dcur-0"), canaryPod(ns, name, "decoder", "dcur", "dcur-1"),
-	).Build()
+	))
 	dispatchOnce(t, isvc, c)
 
 	for comp, hash := range map[v1beta1.ComponentType]string{v1beta1.EngineComponent: "cur", v1beta1.DecoderComponent: "dcur"} {
@@ -203,13 +202,13 @@ func TestDispatch_ArmedMemberRecordIsLeftToTheLadder(t *testing.T) {
 			}
 			engineIR := ir(ns, name, v1beta1.EngineComponent, "new")
 			engineIR.Status.CurrentRevision = name + "-engine-old"
-			objects := []runtime.Object{isvc, engineIR,
+			objects := []client.Object{isvc, engineIR,
 				canaryControllerRevision(ns, name, "engine", "old", 1),
 				canaryControllerRevision(ns, name, "engine", "new", 2)}
 			for i, hash := range tc.pods {
 				objects = append(objects, canaryPod(ns, name, "engine", hash, hash+"-"+string(rune('0'+i))))
 			}
-			c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objects...).Build()
+			c := fakeclient.New(t, fakeclient.WithObjects(objects...))
 			dispatchOnce(t, isvc, c)
 
 			if got := isvc.Status.Components[v1beta1.EngineComponent].LatestRolledoutRevision; got != old {

@@ -8,14 +8,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // drainPod builds a routable OMENative pod of one cohort: the labels Render
@@ -48,18 +46,9 @@ func drainPod(isvcName string, comp v1beta1.ComponentType, name, runner, proto s
 	return pod
 }
 
-func drainScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	scheme := pairingScheme(t)
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
-	return scheme
-}
-
 func drainGate(t *testing.T, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, sources []string, objs ...client.Object) (bool, v1beta1.RolloutHoldGate, string) {
 	t.Helper()
-	c := fake.NewClientBuilder().WithScheme(drainScheme(t)).WithObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	return EvaluatePairingDrain(context.Background(), c, isvc, comp, forwardTarget(isvc, comp), GroupDefaults{}, sources)
 }
 
@@ -186,14 +175,7 @@ func TestEvaluatePairingDrain_InactivePaths(t *testing.T) {
 
 func TestEvaluatePairingDrain_FailsClosedWhenPodsCannotBeListed(t *testing.T) {
 	isvc := pairingISVC("v2")
-	c := fake.NewClientBuilder().WithScheme(drainScheme(t)).WithInterceptorFuncs(interceptor.Funcs{
-		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if _, ok := list.(*corev1.PodList); ok {
-				return errors.New("apiserver unavailable")
-			}
-			return cl.List(ctx, list, opts...)
-		},
-	}).Build()
+	c := fakeclient.New(t, fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, errors.New("apiserver unavailable")).OnKind(&corev1.PodList{}))
 	allowed, gate, reason := EvaluatePairingDrain(context.Background(), c, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), GroupDefaults{}, []string{"x"})
 	if allowed || gate != v1beta1.RolloutHoldGatePairing || !strings.Contains(reason, "failing closed") {
 		t.Fatalf("a list error must fail closed with a retryable Pairing hold: allowed=%v gate=%q reason=%s", allowed, gate, reason)

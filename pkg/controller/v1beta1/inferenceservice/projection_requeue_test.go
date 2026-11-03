@@ -7,24 +7,20 @@ import (
 
 	"github.com/onsi/gomega"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	appsv1 "k8s.io/api/apps/v1"
-	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	v1 "k8s.io/api/core/v1"
-	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/acceleratorclassselector"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // TestReconcileProjectsIRStatusOnRequeuingPass pins the ordering contract
@@ -53,13 +49,7 @@ import (
 func TestReconcileProjectsIRStatusOnRequeuingPass(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	scheme := runtime.NewScheme()
-	g.Expect(v1beta1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(appsv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(autoscalingv2.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(policyv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(monitoringv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
+	scheme := fakeclient.Scheme(t, monitoringv1.AddToScheme)
 
 	const (
 		ns       = "default"
@@ -138,11 +128,8 @@ func TestReconcileProjectsIRStatusOnRequeuingPass(t *testing.T) {
 		},
 	}
 
-	c := ctrlclientfake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(isvc, rt, ir).
-		WithStatusSubresource(isvc, ir).
-		Build()
+	c := fakeclient.New(t, fakeclient.WithScheme(scheme),
+		fakeclient.WithObjects(isvc, rt, ir), fakeclient.WithStatusSubresource(isvc, ir))
 
 	clientset := fake.NewClientset()
 	_, err := clientset.CoreV1().ConfigMaps("ome").Create(context.TODO(), &v1.ConfigMap{
@@ -214,13 +201,7 @@ func TestReconcileProjectsIRStatusOnRequeuingPass(t *testing.T) {
 func TestReconcileProjectionConvergesAcrossRepeatedRequeues(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	scheme := runtime.NewScheme()
-	g.Expect(v1beta1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(appsv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(autoscalingv2.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(policyv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-	g.Expect(monitoringv1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
+	scheme := fakeclient.Scheme(t, monitoringv1.AddToScheme)
 
 	const (
 		ns       = "default"
@@ -283,11 +264,8 @@ func TestReconcileProjectionConvergesAcrossRepeatedRequeues(t *testing.T) {
 		Status: v1beta1.InferenceReplicaStatus{ObservedGeneration: 1},
 	}
 
-	c := ctrlclientfake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(isvc, rt, ir).
-		WithStatusSubresource(isvc, ir).
-		Build()
+	c := fakeclient.New(t, fakeclient.WithScheme(scheme),
+		fakeclient.WithObjects(isvc, rt, ir), fakeclient.WithStatusSubresource(isvc, ir))
 
 	clientset := fake.NewClientset()
 	_, err := clientset.CoreV1().ConfigMaps("ome").Create(context.TODO(), &v1.ConfigMap{

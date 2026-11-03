@@ -7,25 +7,16 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func newDiscoverTestClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
-	if err := v1beta1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add v1beta1: %v", err)
-	}
-	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	return fakeclient.New(t, fakeclient.WithObjects(objs...))
 }
 
 // testPodLabels reproduces the label set Render stamps on every
@@ -74,18 +65,9 @@ func podNames(pods []*corev1.Pod) []string {
 // MatchingFields fast path in ListOMENativePodsByName.
 func newIndexedDiscoverTestClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
-	if err := v1beta1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add v1beta1: %v", err)
-	}
-	return fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithIndex(&corev1.Pod{}, OMENativePodIndexField, OMENativePodIndexExtractor).
-		WithObjects(objs...).
-		Build()
+	return fakeclient.New(t,
+		fakeclient.WithIndex(&corev1.Pod{}, OMENativePodIndexField, OMENativePodIndexExtractor),
+		fakeclient.WithObjects(objs...))
 }
 
 // pod with arbitrary isvc/component labels — used to prove the index

@@ -67,3 +67,17 @@ func SnapshotWithDistinctPodsForTest(input types.ReconcileInput, liveByIdx, cach
 		cached: memoObservation{done: true, observation: cached},
 	}
 }
+
+// The provenance readers. Production code never reads an observation's
+// epoch, source or scope back: the constructors refuse a read that does not
+// fit the epoch, and the tests check which read built the observation.
+
+func (o PodObservation) Source() PodObservationSource { return o.source }
+
+func (o PodObservation) Scope() PodObservationScope { return o.scope }
+
+func (o ComponentObservation) Epoch() ObservationEpoch { return o.epoch }
+
+func (o ComponentObservation) PodSource() PodObservationSource { return o.pods.Source() }
+
+func (o ComponentObservation) PodScope() PodObservationScope { return o.pods.Scope() }

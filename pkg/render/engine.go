@@ -35,7 +35,7 @@ func RenderEngine(ctx context.Context, p *Piece, service *v1beta1.InferenceServi
 	if err != nil {
 		return Rendered{}, err
 	}
-	t := Templates{ObjectMeta: meta, Primary: primary, Worker: worker, WorkerSize: EngineWorkerSize(spec), MultiPod: spec.Leader != nil && spec.Worker != nil}
+	t := Templates{ObjectMeta: meta, Primary: primary, Worker: worker, WorkerSize: EngineWorkerSize(spec), MultiPod: EngineIsMultiPod(spec)}
 	return Rendered{Templates: t, ComponentExt: &spec.ComponentExtensionSpec,
 		TopologyKey: spec.TopologyKey, TopologySpread: spec.TopologySpread, TopologySpreadKey: spec.TopologySpreadKey}, nil
 }
@@ -48,6 +48,15 @@ func RenderEngine(ctx context.Context, p *Piece, service *v1beta1.InferenceServi
 // stay decoupled.
 func EngineUsesLeaderTemplate(spec *v1beta1.EngineSpec) bool {
 	return spec != nil && spec.Leader != nil
+}
+
+// EngineIsMultiPod reports whether the effective engine spec renders a
+// leader/worker gang rather than a single pod. It is the one rule behind the
+// leader and worker runners, the InferenceReplica projection and the
+// leader-only routing selector, so a shape supplied by the runtime counts
+// exactly like one declared on the InferenceService.
+func EngineIsMultiPod(spec *v1beta1.EngineSpec) bool {
+	return spec != nil && spec.Leader != nil && spec.Worker != nil
 }
 
 // EnginePodSpec renders the engine's primary pod. The selected runner
@@ -77,7 +86,7 @@ func EnginePodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Engin
 	if runnerSpec != nil {
 		UpdateEnvVariables(p, isvc, &runnerSpec.Container, objectMeta)
 		UpdateVolumeMounts(p, isvc, &runnerSpec.Container, objectMeta)
-		MergeEngineResources(p, isvc, &runnerSpec.Container)
+		MergeRoleResources(p, isvc, v1beta1.EngineComponent, &runnerSpec.Container)
 		MergeRuntimeArgumentsOverride(p, &runnerSpec.Container)
 		if spec != nil && !AcceleratorProvidesParallelismOverride(p) {
 			SetParallelismEnvVar(p, &runnerSpec.Container, engineParallelismLeaders(), EngineWorkerSize(spec))
@@ -91,7 +100,7 @@ func EnginePodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Engin
 	}
 	UpdatePodSpecVolumes(p, isvc, podSpec, objectMeta)
 	UpdatePodSpecNodeSelector(p, isvc, podSpec, v1beta1.EngineComponent)
-	UpdateEngineAffinity(p, isvc, podSpec)
+	UpdateRoleAffinity(p, isvc, v1beta1.EngineComponent, podSpec)
 
 	p.Log.V(1).Info("Engine PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
 	return podSpec, nil
@@ -113,7 +122,7 @@ func EngineWorkerPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1
 		if workerRunner != nil {
 			UpdateVolumeMounts(p, isvc, &workerRunner.Container, objectMeta)
 			UpdateEnvVariables(p, isvc, &workerRunner.Container, objectMeta)
-			MergeEngineResources(p, isvc, &workerRunner.Container)
+			MergeRoleResources(p, isvc, v1beta1.EngineComponent, &workerRunner.Container)
 			MergeRuntimeArgumentsOverride(p, &workerRunner.Container)
 			if spec != nil && !AcceleratorProvidesParallelismOverride(p) {
 				SetParallelismEnvVar(p, &workerRunner.Container, engineParallelismLeaders(), EngineWorkerSize(spec))
@@ -128,7 +137,7 @@ func EngineWorkerPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1
 	}
 	UpdatePodSpecVolumes(p, isvc, workerPodSpec, objectMeta)
 	UpdatePodSpecNodeSelector(p, isvc, workerPodSpec, v1beta1.EngineComponent)
-	UpdateEngineAffinity(p, isvc, workerPodSpec)
+	UpdateRoleAffinity(p, isvc, v1beta1.EngineComponent, workerPodSpec)
 	p.Log.V(1).Info("Engine Worker PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
 	return workerPodSpec, nil
 }

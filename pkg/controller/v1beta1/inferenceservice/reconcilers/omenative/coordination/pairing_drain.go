@@ -181,8 +181,8 @@ func EvaluatePairingDrain(ctx context.Context, reads client.Reader, isvc *v1beta
 		instances: instances, afterInstances: afterInstances,
 		leaving: leaving,
 		floors: map[v1beta1.ComponentType]pairFloor{
-			component: resolvePairFloor(replicas[component], gateCtx.Group.Pacing),
-			peer:      resolvePairFloor(replicas[peer], gateCtx.Group.Pacing),
+			component: gateCtx.pairableMinimumOf(replicas[component]),
+			peer:      gateCtx.pairableMinimumOf(replicas[peer]),
 		},
 	}
 	if held, reason := picture.hold(); held {

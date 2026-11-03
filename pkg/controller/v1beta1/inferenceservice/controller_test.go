@@ -39,6 +39,8 @@ import (
 	"sigs.k8s.io/ome/pkg/render"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	omeTesting "sigs.k8s.io/ome/pkg/utils/testing"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
+	"sigs.k8s.io/ome/pkg/validation"
 )
 
 func TestInferenceServiceReconcile(t *testing.T) {
@@ -1833,5 +1835,63 @@ func TestRunPassSteps_StopsAtTheFirstStepThatEndsThePass(t *testing.T) {
 	}, step("never", true, nil))
 	if err != nil || done || order != "first,ends" || pass.result != requeue {
 		t.Fatalf("a step ended the pass with a result: done=%v err=%v ran=%q result=%+v, want done=false err=nil ran=first,ends result=%+v", done, err, order, pass.result, requeue)
+	}
+}
+
+// A service with an encoder runs every role as OMENative. A runtime piece can
+// still give a role another mode after admission, so the pass checks the
+// merged modes: it holds the service with EncoderReady=False naming the role,
+// records a Warning event, and stops before any child is written.
+func TestCheckEncoderModesHoldsARoleTheRuntimeMakesRaw(t *testing.T) {
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "epd", Namespace: "default"}}
+	cl := fakeclient.New(t, fakeclient.WithObjects(isvc), fakeclient.WithStatusSubresource(isvc))
+	recorder := record.NewFakeRecorder(5)
+	r := &InferenceServiceReconciler{Client: cl, APIReader: cl, Log: logr.Discard(), Recorder: recorder}
+	modes := map[v1beta1.ComponentType]constants.DeploymentModeType{
+		v1beta1.EngineComponent:  constants.OMENative,
+		v1beta1.EncoderComponent: constants.OMENative,
+		v1beta1.RouterComponent:  constants.RawDeployment,
+	}
+	pass := &servicePass{reconciler: r, isvc: isvc.DeepCopy(), deploymentMode: constants.OMENative, resolved: &render.Resolved{
+		RuntimeName: "example-runtime",
+		Specs:       v1beta1.RoleSpecs{Engine: &v1beta1.EngineSpec{}, Encoder: &v1beta1.EncoderSpec{}, Router: &v1beta1.RouterSpec{}},
+		Modes:       modes,
+	}}
+
+	next, err := pass.checkEncoderModes(t.Context())
+	if err != nil || next {
+		t.Fatalf("a RawDeployment router beside an encoder must end the pass: next=%v err=%v", next, err)
+	}
+	stored := &v1beta1.InferenceService{}
+	if err := cl.Get(t.Context(), client.ObjectKeyFromObject(isvc), stored); err != nil {
+		t.Fatal(err)
+	}
+	cond := stored.Status.GetCondition(v1beta1.EncoderReady)
+	if cond == nil || cond.Status != v1.ConditionFalse || cond.Reason != validation.ReasonEncoderRequiresOMENative {
+		t.Fatalf("EncoderReady = %+v, want False with reason %s", cond, validation.ReasonEncoderRequiresOMENative)
+	}
+	for _, want := range []string{"spec.router", `"RawDeployment"`, `"example-runtime"`, "routerConfig"} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("EncoderReady message %q does not name %s", cond.Message, want)
+		}
+	}
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, v1.EventTypeWarning) || !strings.Contains(event, validation.ReasonEncoderRequiresOMENative) {
+			t.Errorf("event %q, want a Warning with reason %s", event, validation.ReasonEncoderRequiresOMENative)
+		}
+	default:
+		t.Error("no Warning event was recorded")
+	}
+
+	modes[v1beta1.RouterComponent] = constants.OMENative
+	if next, err := pass.checkEncoderModes(t.Context()); err != nil || !next {
+		t.Fatalf("every role OMENative lets the pass go on: next=%v err=%v", next, err)
+	}
+
+	modes[v1beta1.RouterComponent] = constants.RawDeployment
+	pass.resolved.Specs.Encoder = nil
+	if next, err := pass.checkEncoderModes(t.Context()); err != nil || !next {
+		t.Fatalf("a service without an encoder keeps its mixed modes: next=%v err=%v", next, err)
 	}
 }

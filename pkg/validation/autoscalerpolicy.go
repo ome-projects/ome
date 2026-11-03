@@ -19,12 +19,17 @@ func ValidateAutoscalerPolicySpec(spec *v1beta1.AutoscalerPolicySpec) error {
 		return nil
 	}
 	issues := render.ValidateSpec(spec)
-	if len(issues) == 0 {
-		return nil
-	}
-	details := make([]string, 0, len(issues))
+	details := make([]string, 0, len(issues)+1)
 	for _, issue := range issues {
 		details = append(details, issue.String())
+	}
+	if spec.Keda != nil {
+		if err := ValidateKedaHPAName(spec.Keda.Advanced); err != nil {
+			details = append(details, err.Error())
+		}
+	}
+	if len(details) == 0 {
+		return nil
 	}
 	return fmt.Errorf("%s", strings.Join(details, "; "))
 }

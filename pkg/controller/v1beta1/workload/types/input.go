@@ -268,7 +268,9 @@ type ReconcileInput struct {
 	// pass consumed reports the hold its parked Instances stand behind at
 	// that position. When the pass is not reached at all, the adapter's
 	// status writer reads the same-target RetryBlock/Held state from
-	// persisted status and otherwise keeps the hold it last persisted.
+	// persisted status and otherwise keeps the hold it last persisted,
+	// unless that pass removed an Instance: the write that removes a row
+	// carries no hold the pass did not observe.
 	RecordRolloutHold func(hold *RolloutHold)
 
 	// MutateRetryBlock reads-modifies-writes the owner's persisted
@@ -308,11 +310,23 @@ type ReconcileInput struct {
 	// UnschedulableGrace is how long a pod may carry
 	// PodScheduled=False/Unschedulable — or an Instance's PodGroup report
 	// that the gang has no placement — before the escalation pass fails
-	// that Instance as environment-caused. Operator config
+	// that Instance as environment-caused, measured from that report's
+	// start or from the attempt's earlier Operation.PlacementWaitSince.
+	// Operator config
 	// (lifecycle.unschedulableGracePeriod); zero or negative disables that
 	// escalation entirely, leaving the hold to park the
 	// InstanceReadyTimeout clock for as long as it lasts.
 	UnschedulableGrace time.Duration
+
+	// GangDomainFullGrace is the shorter grace for a gang member the
+	// scheduler cannot place because the gang is held to the topology
+	// domain where its other members run and that domain cannot take it
+	// (SchedulerReportsGangDomainFull). Waiting on cluster capacity does
+	// not free such a gang; ending the attempt rebuilds it elsewhere.
+	// Measured from the same start as UnschedulableGrace. Operator config
+	// (lifecycle.gangDomainFullGracePeriod); zero or negative
+	// leaves such a hold on UnschedulableGrace.
+	GangDomainFullGrace time.Duration
 
 	// AbandonedReplacementGrace is the termination grace a rollout gives a
 	// replacement pod it abandons before the pod ever carried the serving

@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -23,7 +24,7 @@ import (
 // pinnedStart opens a run and returns the service with its diverged replica.
 type pinnedStart func(t *testing.T) (*v1beta1.InferenceService, *v1beta1.InferenceReplica)
 
-// openInlineCanary pins a fresh run over an inline canary group.
+// openInlineCanary opens a fresh run over an inline canary group.
 func openInlineCanary(t *testing.T) (*v1beta1.InferenceService, *v1beta1.InferenceReplica) {
 	t.Helper()
 	isvc, ir := isvcFixture(inlineCanary()), divergedIR(oldRev, newRev)
@@ -955,4 +956,113 @@ func TestARevertBeforeAnyInstanceMovedOpensNoRunOverItsRecord(t *testing.T) {
 			t.Fatalf("outcome = %+v, want the in-flight record taken over", out)
 		}
 	})
+}
+
+// sequentialChainISVC is a Sequential roll written as two single-member
+// groups with no progression body, the decoder before the engine. Each
+// group resolves to the default blueGreen when a run opens.
+func sequentialChainISVC() *v1beta1.InferenceService {
+	isvc := isvcFixture(v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}})
+	isvc.Spec.Rollout.Groups = append(isvc.Spec.Rollout.Groups, v1beta1.RolloutGroup{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+	})
+	return isvc
+}
+
+// sequentialChainReplicas are the chain's two replicas, both pushed to a
+// new revision with no Instance rolled yet.
+func sequentialChainReplicas() []runtime.Object {
+	return []runtime.Object{decoderIR(decoderRev, decoderNewRev, 2, 0), divergedIR(oldRev, newRev)}
+}
+
+// askPlanReread runs one pass with the plan reread asked for and checks
+// that the pass consumed the request.
+func askPlanReread(t *testing.T, isvc *v1beta1.InferenceService, objects ...runtime.Object) Outcome {
+	t.Helper()
+	key := constants.RolloutRepinAnnotation
+	annotate(isvc, key, "now")
+	out := passAt(t, isvc, time.Unix(2000, 0), objects...)
+	if _, still := isvc.Annotations[key]; still {
+		t.Fatal("the reread request was not consumed")
+	}
+	return out
+}
+
+// A Sequential roll written as single-member groups with no progression
+// body: two decoders then two engines, version 2 pushed on both. The run
+// opens on the first pass, and every pass after reads the plan InSync
+// while nothing is edited: the live groups are digested as the open
+// digested them, each resolved to the default blueGreen, so the two
+// digests agree and the condition names no edit nobody made. A plan
+// reread asked for with nothing edited is pure cleanup and leaves the
+// same reading.
+func TestASequentialPlanWithNoBodiesReadsInSyncWhileNothingIsEdited(t *testing.T) {
+	isvc := sequentialChainISVC()
+	replicas := sequentialChainReplicas()
+	if out := pass(t, isvc, replicas...); !out.Opened || out.Adopted {
+		t.Fatalf("outcome = %+v, want a fresh open", out)
+	}
+	id := isvc.Status.Rollout.ActiveRun.RunID
+	requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+	for i := 1; i <= 3; i++ {
+		if out := pass(t, isvc, replicas...); !emptyOutcome(out) {
+			t.Fatalf("pass %d with nothing edited: outcome = %+v, want nothing decided", i, out)
+		}
+		requireSameRun(t, isvc, id)
+		requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+	}
+	if out := askPlanReread(t, isvc, replicas...); out.StateChanged || out.Opened {
+		t.Fatalf("the reread with nothing edited: outcome = %+v, want pure cleanup", out)
+	}
+	requireSameRun(t, isvc, id)
+	requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+}
+
+// Under the same run, spelling the default out is no edit and a changed
+// body is one the reread takes. The engine group gains an explicit
+// blueGreen body: it resolves to the body the run recorded, so the plan
+// reads InSync. The decoder group then gains a rollingUpdate body with a
+// surge budget of one: the next pass reads SpecNewerThanRun with the run
+// still on its recorded plan, the reread replaces the plan under the same
+// run id with the new body and the drift reads InSync, and the pass after
+// reads nothing new.
+func TestASequentialPlanWithNoBodiesReadsAnEditedBodyAsDriftUntilTheReread(t *testing.T) {
+	isvc := sequentialChainISVC()
+	replicas := sequentialChainReplicas()
+	if out := pass(t, isvc, replicas...); !out.Opened {
+		t.Fatalf("outcome = %+v, want a fresh open", out)
+	}
+	run := isvc.Status.Rollout.ActiveRun
+	id, recorded := run.RunID, run.Plan.Groups[0].PortableDigest
+
+	isvc.Spec.Rollout.Groups[1].BlueGreen = &v1beta1.GroupBlueGreen{}
+	if out := pass(t, isvc, replicas...); !emptyOutcome(out) {
+		t.Fatalf("the default spelled out: outcome = %+v, want nothing decided", out)
+	}
+	requireSameRun(t, isvc, id)
+	requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+
+	one := intstr.FromInt32(1)
+	isvc.Spec.Rollout.Groups[0].RollingUpdate = &v1beta1.GroupRollingUpdate{MaxSurge: &one}
+	if out := pass(t, isvc, replicas...); !emptyOutcome(out) {
+		t.Fatalf("the body edit: outcome = %+v, want the run left on its recorded plan", out)
+	}
+	run = requireSameRun(t, isvc, id)
+	requireDrift(t, isvc, corev1.ConditionTrue, v1beta1.RolloutPlanDriftReasonSpecNewerThanRun)
+	if got := run.Plan.Groups[0].PortableDigest; got != recorded {
+		t.Fatalf("the edit moved the recorded plan: %s -> %s", recorded, got)
+	}
+
+	if out := askPlanReread(t, isvc, replicas...); !out.StateChanged || out.Opened {
+		t.Fatalf("the reread: outcome = %+v, want the plan replaced under the same run", out)
+	}
+	run = requireSameRun(t, isvc, id)
+	requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+	if got := run.Plan.Groups[0].Group.RollingUpdate; got == nil || got.MaxSurge == nil || got.MaxSurge.IntValue() != 1 {
+		t.Fatalf("the reread recorded %+v, want the rollingUpdate body with a surge budget of one", run.Plan.Groups[0].Group)
+	}
+	if out := pass(t, isvc, replicas...); !emptyOutcome(out) {
+		t.Fatalf("the pass after the reread: outcome = %+v, want nothing decided", out)
+	}
+	requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
 }

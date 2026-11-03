@@ -15,12 +15,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 const testPolicyName = "request-activity-v1"
@@ -71,10 +71,9 @@ func capabilityLabels() map[string]string {
 }
 
 // memberWith returns a fake member cluster client seeded with objs.
-func memberWith(s *runtime.Scheme, objs ...client.Object) workloadcluster.SelectivelyCachingClient {
-	c := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(objs...).Build()
-	return workloadcluster.NewNeverCachingClient(c)
+func memberWith(t *testing.T, s *runtime.Scheme, objs ...client.Object) workloadcluster.SelectivelyCachingClient {
+	t.Helper()
+	return workloadcluster.NewNeverCachingClient(fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}), fakeclient.WithObjects(objs...)))
 }
 
 // flakyPolicyGetter fails member AutoscalerPolicy GETs with a plain
@@ -218,8 +217,8 @@ func TestPreflightPolicies_CapabilityGate(t *testing.T) {
 	s := testScheme(t)
 	isvc := srcISVCWithRef("gpu=gb300")
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": memberWith(s, hpaPolicy(testPolicyName)),
-		"b": memberWith(s, hpaPolicy(testPolicyName)),
+		"a": memberWith(t, s, hpaPolicy(testPolicyName)),
+		"b": memberWith(t, s, hpaPolicy(testPolicyName)),
 	}}
 	r, _ := newPlacer(s, clusters, isvc, hpaPolicy(testPolicyName))
 
@@ -253,9 +252,9 @@ func TestPreflightPolicies_MemberSkewTable(t *testing.T) {
 		member     workloadcluster.SelectivelyCachingClient
 		wantReason string
 	}{
-		{"missing on member", memberWith(s), v1beta1.PlacementPolicyPreflightReasonPolicyMissing},
-		{"digest mismatch", memberWith(s, mismatched), v1beta1.PlacementPolicyPreflightReasonDigestMismatch},
-		{"member get timeout", policyGetBlocker{memberWith(s)}, v1beta1.PlacementPolicyPreflightReasonMemberGetTimeout},
+		{"missing on member", memberWith(t, s), v1beta1.PlacementPolicyPreflightReasonPolicyMissing},
+		{"digest mismatch", memberWith(t, s, mismatched), v1beta1.PlacementPolicyPreflightReasonDigestMismatch},
+		{"member get timeout", policyGetBlocker{memberWith(t, s)}, v1beta1.PlacementPolicyPreflightReasonMemberGetTimeout},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -284,8 +283,8 @@ func TestPreflightPolicies_SkewedMemberStillPasses(t *testing.T) {
 	s := testScheme(t)
 	isvc := srcISVCWithRef("gpu=gb300")
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": memberWith(s, hpaPolicy(testPolicyName)),
-		"b": memberWith(s), // policy not yet synced there
+		"a": memberWith(t, s, hpaPolicy(testPolicyName)),
+		"b": memberWith(t, s), // policy not yet synced there
 	}}
 	r, _ := newPlacer(s, clusters, isvc, hpaPolicy(testPolicyName))
 
@@ -335,8 +334,8 @@ func TestPreflightPolicies_SplitCeilings(t *testing.T) {
 				t.Run(tc.name, func(t *testing.T) {
 					s := testScheme(t)
 					isvc := srcISVCWithRef("")
-					isvc.Spec.Placement = &v1beta1.PlacementSpec{Policy: placement.policy, Mode: placement.mode, Split: &v1beta1.SplitSpec{MaxReplicasPerCluster: tc.cap}}
-					clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"a": memberWith(s, maxConsumingPolicy(testPolicyName))}}
+					isvc.Spec.Placement = &v1beta1.PlacementSpec{Policy: placement.policy, Mode: placement.mode, Split: &v1beta1.SplitSpec{MaxPerCluster: engineCap(tc.cap)}}
+					clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"a": memberWith(t, s, maxConsumingPolicy(testPolicyName))}}
 					r, _ := newPlacer(s, clusters, isvc, maxConsumingPolicy(testPolicyName))
 					out := r.preflightPolicies(t.Context(), isvc, []string{"a"}, []v1beta1.WorkloadCluster{*readyWC("a", capabilityLabels())})
 					if out == nil {
@@ -646,10 +645,9 @@ func TestReconcile_PolicyLiftEndToEnd(t *testing.T) {
 			}},
 		},
 	}
-	w := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).
-		WithObjects(observedWorkerObjects(derived, irWithInstances(v1beta1.EngineComponent, true))...).
-		WithObjects(hpaPolicy(testPolicyName)).Build()
+	w := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}),
+		fakeclient.WithObjects(observedWorkerObjects(derived, irWithInstances(v1beta1.EngineComponent, true))...),
+		fakeclient.WithObjects(hpaPolicy(testPolicyName)))
 	cur := &v1beta1.InferenceService{}
 	require.NoError(t, w.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "svc"}, cur))
 	if len(cur.Status.Components) == 0 {
@@ -698,8 +696,7 @@ func TestReconcile_PolicyPreflightHoldsPlacement(t *testing.T) {
 	mismatched.Spec.Keda = &v1beta1.KedaPolicyTemplate{
 		Triggers: []v1beta1.KedaTriggerTemplate{{Type: "cpu", Metadata: map[string]string{"value": "80"}}},
 	}
-	w := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(mismatched).Build()
+	w := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}), fakeclient.WithObjects(mismatched))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(w),
 	}}
@@ -794,7 +791,7 @@ func TestPreflightPolicies_TransientErrorKeepsLastEligibility(t *testing.T) {
 	isvc := srcISVCWithRef("gpu=gb300")
 	fail := false
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": flakyPolicyGetter{memberWith(s, hpaPolicy(testPolicyName)), &fail},
+		"a": flakyPolicyGetter{memberWith(t, s, hpaPolicy(testPolicyName)), &fail},
 	}}
 	r, _ := newPlacer(s, clusters, isvc, hpaPolicy(testPolicyName))
 	wcs := []v1beta1.WorkloadCluster{*readyWC("a", capabilityLabels())}
@@ -833,7 +830,7 @@ func TestPreflightPolicies_TransientErrorUnverifiedStaysSkipped(t *testing.T) {
 	isvc := srcISVCWithRef("gpu=gb300")
 	fail := true
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-		"a": flakyPolicyGetter{memberWith(s, hpaPolicy(testPolicyName)), &fail},
+		"a": flakyPolicyGetter{memberWith(t, s, hpaPolicy(testPolicyName)), &fail},
 	}}
 	r, _ := newPlacer(s, clusters, isvc, hpaPolicy(testPolicyName))
 
@@ -984,8 +981,7 @@ func TestReconcile_PreflightRejectsInvalidAnchorPolicy(t *testing.T) {
 // source must not carry a frozen final verdict forever.
 func TestReconcile_RefRollbackClearsPolicyConditions(t *testing.T) {
 	s := testScheme(t)
-	w := fakeclient.NewClientBuilder().WithScheme(s).
-		WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(mismatchedPolicy(testPolicyName)).Build()
+	w := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}), fakeclient.WithObjects(mismatchedPolicy(testPolicyName)))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"a": workloadcluster.NewNeverCachingClient(w),
 	}}

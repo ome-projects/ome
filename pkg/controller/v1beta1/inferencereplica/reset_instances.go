@@ -10,7 +10,6 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -57,24 +56,19 @@ type resetSkip struct {
 // migration-expiry paths own those continuations and clearing one here
 // would orphan its surge marker or migration record.
 //
-// Mailbox discipline mirrors consumeReleaseHeldRequest: every present
-// request is answered. A candidate has every pod deleted (live list,
-// expectations recorded before each delete) and its Operation cleared
-// through the MutateInstance seam — Phase stays Failed and LastFailure
-// is preserved, which is exactly the fresh-start shape the Create pass
-// rebuilds (Failed with no Operation and no pods). A target that is not
-// Failed, does not exist, is guarded as above, or has nothing left to
-// tear down is skipped; a malformed value resets nothing. Each outcome
-// gets one event, then the annotation is deleted (consume = ack) against
-// a fresh IR read under conflict retry, with the deletion mirrored onto
-// the caller's in-memory IR. Write order: pod deletes and the status
-// write commit BEFORE the annotation delete, so a crash between the two
-// re-delivers into the nothing-to-reset branch and the annotation is
-// cleaned up idempotently.
+// Every present request is answered. A candidate has every pod deleted
+// (live list, expectations recorded before each delete) and its
+// Operation cleared through the MutateInstance seam — Phase stays Failed
+// and LastFailure is preserved, which is exactly the fresh-start shape
+// the Create pass rebuilds (Failed with no Operation and no pods). A
+// target that is not Failed, does not exist, is guarded as above, or has
+// nothing left to tear down is skipped; a malformed value resets
+// nothing. Each outcome gets one event. The pod deletes and the status
+// write commit before acknowledgeRequest removes the annotation, so a
+// crash between the two re-delivers into the nothing-to-reset branch.
 //
 // A pod delete or status write error leaves the annotation in place and
-// returns the error; the request re-drives next pass. Exhausted conflict
-// retries on the annotation delete return requeue=true. Events land on
+// returns the error; the request re-drives next pass. Events land on
 // the parent ISVC when resolvable (the user-facing stream), else the IR.
 func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService) (requeue bool, err error) {
 	val, present := ir.Annotations[constants.ResetInstancesAnnotationKey]
@@ -121,35 +115,11 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 		}
 	}
 
-	// Consume the annotation against a FRESH IR read under conflict
-	// retry — same discipline as the release-held mailbox delete.
 	key := client.ObjectKeyFromObject(ir)
-	uerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	return r.acknowledgeRequest(ctx, ir, "reset-instances annotation", func(ctx context.Context) (client.Object, error) {
 		fresh := &v1beta1.InferenceReplica{}
-		if err := r.APIReader.Get(ctx, key, fresh); err != nil {
-			return err
-		}
-		if _, ok := fresh.Annotations[constants.ResetInstancesAnnotationKey]; !ok {
-			return nil
-		}
-		delete(fresh.Annotations, constants.ResetInstancesAnnotationKey)
-		return r.Update(ctx, fresh)
-	})
-	if uerr != nil {
-		if apierrors.IsConflict(uerr) {
-			// Retries exhausted on a hot IR; the request re-answers next
-			// pass (every branch above is idempotent on re-delivery).
-			return true, nil
-		}
-		if apierrors.IsNotFound(uerr) {
-			return false, nil
-		}
-		return false, fmt.Errorf("delete consumed reset-instances annotation: %w", uerr)
-	}
-	// Mirror the deletion onto the caller's in-memory IR so this pass
-	// observes the consumed mailbox.
-	delete(ir.Annotations, constants.ResetInstancesAnnotationKey)
-	return false, nil
+		return fresh, r.APIReader.Get(ctx, key, fresh)
+	}, constants.ResetInstancesAnnotationKey)
 }
 
 // resetInstances tears down every requested Instance that is Failed,

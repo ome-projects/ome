@@ -13,7 +13,6 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -49,9 +48,8 @@ func holdTestIR(name string, block *v1beta1.ComponentAutoscaler) *v1beta1.Infere
 // SO from ir.Spec.Autoscaler — trigger content frozen, bounds still
 // flowing from the component spec.
 func TestDispatchIRAutoscaler_HoldRedispatchesStoredBlock(t *testing.T) {
-	scheme := rawAutoscalerTestScheme(t)
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
-	b := &BaseComponentFields{Client: cl, Scheme: scheme}
+	cl := componentClient(t)
+	b := &BaseComponentFields{Client: cl, Scheme: cl.Scheme()}
 	ext := refExt(1)
 	isvc := holdTestISVC(ext)
 	ir := holdTestIR("llm-a-engine", storedIRBlock())
@@ -82,9 +80,8 @@ func TestDispatchIRAutoscaler_HoldRedispatchesStoredBlock(t *testing.T) {
 // stand on, so the hold dispatches nothing — no ScaledObject, no default
 // HPA.
 func TestDispatchIRAutoscaler_HoldWithoutStoredBlockDispatchesNothing(t *testing.T) {
-	scheme := rawAutoscalerTestScheme(t)
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
-	b := &BaseComponentFields{Client: cl, Scheme: scheme}
+	cl := componentClient(t)
+	b := &BaseComponentFields{Client: cl, Scheme: cl.Scheme()}
 	ext := refExt(1)
 	isvc := holdTestISVC(ext)
 	ir := holdTestIR("llm-a-engine", nil)
@@ -121,7 +118,7 @@ func resolvedCondition(t *testing.T, isvc *v1beta1.InferenceService, component v
 // digests, the condition is True/RenderedFromPolicy, and a second
 // identical pass keeps the condition's LastTransitionTime byte-stable.
 func TestWriteComponentAutoscalerStatus_RenderedPolicyProvenance(t *testing.T) {
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
+	cl := componentClient(t)
 	b := &BaseComponentFields{
 		Piece:          render.Piece{DeploymentMode: constants.OMENative},
 		Client:         cl,
@@ -169,7 +166,7 @@ func TestWriteComponentAutoscalerStatus_RenderedPolicyProvenance(t *testing.T) {
 // through the previously observed class, the last successful provenance
 // stays visible, and the condition flips False with the hold reason.
 func TestWriteComponentAutoscalerStatus_HoldKeepsLastClassAndProvenance(t *testing.T) {
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
+	cl := componentClient(t)
 	b := &BaseComponentFields{
 		Piece:          render.Piece{DeploymentMode: constants.OMENative},
 		Client:         cl,
@@ -209,7 +206,7 @@ func TestWriteComponentAutoscalerStatus_HoldKeepsLastClassAndProvenance(t *testi
 // condition True/InlinePrecedence) and the shadow fields preview what the
 // ref WOULD render.
 func TestWriteComponentAutoscalerStatus_InlineShadowsPolicy(t *testing.T) {
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
+	cl := componentClient(t)
 	b := &BaseComponentFields{
 		Piece:          render.Piece{DeploymentMode: constants.OMENative},
 		Client:         cl,
@@ -244,7 +241,7 @@ func TestWriteComponentAutoscalerStatus_InlineShadowsPolicy(t *testing.T) {
 // never reaches the resolver (nil PolicyResolver proves it) and surfaces
 // only as False/UnsupportedDeploymentMode with no published scale target.
 func TestWriteComponentAutoscalerStatus_MultiNodeRefIsInert(t *testing.T) {
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).Build()
+	cl := componentClient(t)
 	b := &BaseComponentFields{Piece: render.Piece{DeploymentMode: constants.MultiNode}, Client: cl}
 	ext := refExt(1)
 	isvc := holdTestISVC(ext)

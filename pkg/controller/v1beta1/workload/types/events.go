@@ -121,6 +121,13 @@ const (
 	EventReasonRestartTriggered EventReason = "RestartTriggered"
 	EventReasonRestartCompleted EventReason = "RestartCompleted"
 
+	// EventReasonRestartRetargeted fires when the target revision moves
+	// while a repair's rebuilt set is still starting: the repair replaces
+	// that set at the new target instead of finishing on a revision the
+	// roll has dropped. Normal, not a failure. Names the revision the set
+	// carried and the one the rebuild renders next.
+	EventReasonRestartRetargeted EventReason = "RestartRetargeted"
+
 	// EventReasonTerminalPodRecycled fires when Create or Restart deletes
 	// a terminal pod (phase Failed or Succeeded) that occupied one of an
 	// Instance's stable pod names, so the target can be recreated.
@@ -170,7 +177,8 @@ const (
 
 	// EventReasonRetryHeld fires once, at the RetryBlock transition into
 	// State=Held — same-target update retries exhausted; a corrected
-	// revision (or raised retry limits) is required. Emitted by adapters
+	// revision or the operator release annotation
+	// (ome.io/release-held-revision) ends the hold. Emitted by adapters
 	// through ReconcileInput.WarnRetryHeld.
 	EventReasonRetryHeld EventReason = "RetryHeld"
 

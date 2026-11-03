@@ -29,10 +29,10 @@ func TestContainerBuilders_BadOrMissingResourceValue_ErrorNamesTheField(t *testi
 
 	for name, tt := range tests {
 		t.Run(name+"/fine-tuned adapter", func(t *testing.T) {
-			_, err := (&FineTunedAdapterInjector{
+			_, err := agentContainer((&FineTunedAdapterInjector{
 				CpuLimit: tt.cpuLimit, MemoryLimit: tt.memoryLimit,
 				CpuRequest: tt.cpuRequest, MemoryRequest: tt.memRequest,
-			}).createInitContainer(nil, nil, nil)
+			}).agentContainerSpec(), nil, nil, nil)
 			if err == nil {
 				t.Fatalf("expected an error, got nil")
 			}
@@ -42,10 +42,10 @@ func TestContainerBuilders_BadOrMissingResourceValue_ErrorNamesTheField(t *testi
 		})
 
 		t.Run(name+"/serving sidecar", func(t *testing.T) {
-			_, err := (&ServingSidecarInjector{
+			_, err := agentContainer((&ServingSidecarInjector{
 				CpuLimit: tt.cpuLimit, MemoryLimit: tt.memoryLimit,
 				CpuRequest: tt.cpuRequest, MemoryRequest: tt.memRequest,
-			}).createServingSidecarContainer(nil, nil, nil)
+			}).agentContainerSpec(), nil, nil, nil)
 			if err == nil {
 				t.Fatalf("expected an error, got nil")
 			}
@@ -57,9 +57,9 @@ func TestContainerBuilders_BadOrMissingResourceValue_ErrorNamesTheField(t *testi
 }
 
 func TestContainerBuilders_ValidResourceValues_SetsLimitsAndRequests(t *testing.T) {
-	c, err := (&FineTunedAdapterInjector{
+	c, err := agentContainer((&FineTunedAdapterInjector{
 		CpuLimit: "1", MemoryLimit: "1Gi", CpuRequest: "100m", MemoryRequest: "100Mi",
-	}).createInitContainer(nil, nil, nil)
+	}).agentContainerSpec(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -74,21 +74,21 @@ func TestContainerBuilders_ValidResourceValues_SetsLimitsAndRequests(t *testing.
 func TestInjectorContainerBuilders_UnparsableCPULimit_ReturnError(t *testing.T) {
 	tests := map[string]func() error{
 		"fine-tuned adapter": func() error {
-			_, err := (&FineTunedAdapterInjector{
+			_, err := agentContainer((&FineTunedAdapterInjector{
 				CpuLimit:      "bad-cpu",
 				MemoryLimit:   "1Gi",
 				CpuRequest:    "1",
 				MemoryRequest: "1Gi",
-			}).createInitContainer(nil, nil, nil)
+			}).agentContainerSpec(), nil, nil, nil)
 			return err
 		},
 		"serving sidecar": func() error {
-			_, err := (&ServingSidecarInjector{
+			_, err := agentContainer((&ServingSidecarInjector{
 				CpuLimit:      "bad-cpu",
 				MemoryLimit:   "1Gi",
 				CpuRequest:    "1",
 				MemoryRequest: "1Gi",
-			}).createServingSidecarContainer(nil, nil, nil)
+			}).agentContainerSpec(), nil, nil, nil)
 			return err
 		},
 	}

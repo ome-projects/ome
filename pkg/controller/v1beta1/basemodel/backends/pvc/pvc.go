@@ -347,47 +347,22 @@ func applyPVCSpecUpdate(ctx context.Context, kubeClient client.Client, log logr.
 	})
 }
 
-// handlePVCModelDeletion is the deletion path for PVC-backed BaseModel
-// and ClusterBaseModel. Unlike per-node models, PVC models have no agent
-// to mark Status=Deleted across N nodes — there is exactly one ConfigMap
-// to clean up. Order: delete the Job first so the agent stops re-creating
-// the ConfigMap, then delete the ConfigMap, then drop the finalizer.
+// HandleModelDeletion is the deletion path for PVC-backed BaseModel and
+// ClusterBaseModel. A PVC model has no agent to mark Status=Deleted across
+// N nodes, so the controller removes its artifacts itself: the Job first, so
+// the agent stops re-creating the ConfigMap, then the ConfigMap, then the
+// finalizer.
 func HandleModelDeletion(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, isClusterScoped bool, finalizer string) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(obj, finalizer) {
 		return ctrl.Result{}, nil
 	}
 
-	// 1. Delete the Job. We use a label-narrowed list rather than a
-	// name-derived Get because the Job lives in the PVC's namespace which
-	// requires URI parsing — easier to find by labels we set ourselves.
-	jobs := &batchv1.JobList{}
-	scope := metadataJobScopeNamespaced
-	if isClusterScoped {
-		scope = metadataJobScopeCluster
-	}
-	if err := kubeClient.List(ctx, jobs,
-		client.MatchingLabels{
-			constants.PVCMetadataModelNameLabel: obj.GetName(),
-			constants.PVCMetadataScopeLabel:     scope,
-		},
-	); err != nil {
-		log.Error(err, "Failed to list metadata Jobs for deletion", "model", obj.GetName())
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
-	}
-	for i := range jobs.Items {
-		propagation := metav1.DeletePropagationBackground
-		if err := kubeClient.Delete(ctx, &jobs.Items[i], &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !errors.IsNotFound(err) {
-			log.Error(err, "Failed to delete metadata Job", "name", jobs.Items[i].Name)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, err
-		}
-	}
-
-	// 2. Delete the per-PVC status ConfigMap.
-	if err := deletePVCStatusConfigMap(ctx, kubeClient, log, obj, isClusterScoped); err != nil {
+	if err := deleteMetadataArtifacts(ctx, kubeClient, log, obj, isClusterScoped); err != nil {
+		log.Error(err, "Failed to delete PVC metadata artifacts", "model", obj.GetName())
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 
-	// 3. Remove the finalizer. Re-fetch to avoid clobbering concurrent edits.
+	// Remove the finalizer. Re-fetch to avoid clobbering concurrent edits.
 	if err := shared.RetryUpdate(ctx, kubeClient, log, obj, "pvc-finalizer-remove", func(ctx context.Context, c client.Client, latest client.Object) error {
 		controllerutil.RemoveFinalizer(latest, finalizer)
 		return c.Update(ctx, latest)
@@ -398,7 +373,7 @@ func HandleModelDeletion(ctx context.Context, kubeClient client.Client, log logr
 	return ctrl.Result{}, nil
 }
 
-// cleanupStalePVCArtifacts deletes any per-PVC ConfigMap, any
+// CleanupStaleArtifacts deletes any per-PVC ConfigMap, any
 // metadata extraction Jobs, and strips PVC-specific stale conditions
 // from a BaseModel/ClusterBaseModel that is no longer PVC-backed.
 //
@@ -413,37 +388,12 @@ func HandleModelDeletion(ctx context.Context, kubeClient client.Client, log logr
 // condition trim is the cost of the no-op path; both are O(per-model)
 // label-selector queries.
 func CleanupStaleArtifacts(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, isClusterScoped bool) error {
-	// 1. Delete metadata extraction Jobs labeled for this model.
-	jobs := &batchv1.JobList{}
-	scope := metadataJobScopeNamespaced
-	if isClusterScoped {
-		scope = metadataJobScopeCluster
-	}
-	if err := kubeClient.List(ctx, jobs,
-		client.MatchingLabels{
-			constants.PVCMetadataModelNameLabel: obj.GetName(),
-			constants.PVCMetadataScopeLabel:     scope,
-		},
-	); err != nil {
-		return fmt.Errorf("list stale PVC metadata Jobs: %w", err)
-	}
-	for i := range jobs.Items {
-		propagation := metav1.DeletePropagationBackground
-		if err := kubeClient.Delete(ctx, &jobs.Items[i], &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("delete stale PVC metadata Job %s/%s: %w", jobs.Items[i].Namespace, jobs.Items[i].Name, err)
-		}
-		log.Info("Deleted orphaned PVC metadata Job after non-PVC reconcile",
-			"job", jobs.Items[i].Name, "namespace", jobs.Items[i].Namespace)
+	if err := deleteMetadataArtifacts(ctx, kubeClient, log, obj, isClusterScoped); err != nil {
+		return err
 	}
 
-	// 2. Delete the per-PVC status ConfigMap.
-	if err := deletePVCStatusConfigMap(ctx, kubeClient, log, obj, isClusterScoped); err != nil {
-		return fmt.Errorf("delete stale per-PVC ConfigMap: %w", err)
-	}
-
-	// 3. Strip PVC-specific conditions from the CR's status. We re-fetch
-	// inside retryUpdate to avoid clobbering concurrent edits. No-op if
-	// no PVC conditions are present.
+	// Strip PVC-specific conditions from the CR's status. The update re-fetches
+	// to avoid clobbering concurrent edits and is a no-op when none are present.
 	return shared.RetryUpdate(ctx, kubeClient, log, obj, "pvc-condition-cleanup", func(ctx context.Context, c client.Client, latest client.Object) error {
 		_, status, err := shared.ModelSpecAndStatus(latest)
 		if err != nil {
@@ -468,7 +418,7 @@ func CleanupStaleArtifacts(ctx context.Context, kubeClient client.Client, log lo
 
 // isPVCConditionReason reports whether the supplied condition Reason
 // is part of the PVC reconcile branch's reason set. Used by
-// cleanupStalePVCArtifacts to identify stale conditions left behind
+// CleanupStaleArtifacts to identify stale conditions left behind
 // after a URI swap from pvc:// to non-PVC.
 func isPVCConditionReason(reason string) bool {
 	switch reason {
@@ -486,18 +436,33 @@ func isPVCConditionReason(reason string) bool {
 	return false
 }
 
-// deletePVCStatusConfigMap removes the per-PVC status ConfigMap.
-func deletePVCStatusConfigMap(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, isClusterScoped bool) error {
-	cmName := constants.GetPVCMetadataConfigMapName(obj.GetName(), obj.GetNamespace(), isClusterScoped)
+// deleteMetadataArtifacts removes what a PVC-backed model leaves behind in the
+// cluster: its metadata-extraction Jobs, found by the labels the controller set
+// on them, and its status ConfigMap in the operator namespace. A Job is deleted
+// in the background so its pods go with it; an object already gone is not an
+// error.
+func deleteMetadataArtifacts(ctx context.Context, kubeClient client.Client, log logr.Logger, obj client.Object, isClusterScoped bool) error {
+	jobs := &batchv1.JobList{}
+	if err := kubeClient.List(ctx, jobs, client.MatchingLabels(metadataJobLabels(obj, isClusterScoped))); err != nil {
+		return fmt.Errorf("list PVC metadata Jobs: %w", err)
+	}
+	propagation := metav1.DeletePropagationBackground
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if err := kubeClient.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("delete PVC metadata Job %s/%s: %w", job.Namespace, job.Name, err)
+		}
+		log.Info("Deleted PVC metadata Job", "job", job.Name, "namespace", job.Namespace)
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cmName,
+			Name:      constants.GetPVCMetadataConfigMapName(obj.GetName(), obj.GetNamespace(), isClusterScoped),
 			Namespace: constants.OMENamespace,
 		},
 	}
 	if err := kubeClient.Delete(ctx, cm); err != nil && !errors.IsNotFound(err) {
-		log.Error(err, "Failed to delete PVC metadata ConfigMap", "name", cmName)
-		return err
+		return fmt.Errorf("delete PVC metadata ConfigMap %s: %w", cm.Name, err)
 	}
 	return nil
 }

@@ -35,7 +35,7 @@ func RenderDecoder(ctx context.Context, p *Piece, service *v1beta1.InferenceServ
 	if err != nil {
 		return Rendered{}, err
 	}
-	t := Templates{ObjectMeta: meta, Primary: primary, Worker: worker, WorkerSize: DecoderWorkerSize(spec), MultiPod: spec.Leader != nil && spec.Worker != nil}
+	t := Templates{ObjectMeta: meta, Primary: primary, Worker: worker, WorkerSize: DecoderWorkerSize(spec), MultiPod: DecoderIsMultiPod(spec)}
 	return Rendered{Templates: t, ComponentExt: &spec.ComponentExtensionSpec,
 		TopologyKey: spec.TopologyKey, TopologySpread: spec.TopologySpread, TopologySpreadKey: spec.TopologySpreadKey}, nil
 }
@@ -48,6 +48,12 @@ func RenderDecoder(ctx context.Context, p *Piece, service *v1beta1.InferenceServ
 // stay decoupled. Mirrors EngineUsesLeaderTemplate.
 func DecoderUsesLeaderTemplate(spec *v1beta1.DecoderSpec) bool {
 	return spec != nil && spec.Leader != nil
+}
+
+// DecoderIsMultiPod reports whether the effective decoder spec renders a
+// leader/worker gang rather than a single pod. Mirrors EngineIsMultiPod.
+func DecoderIsMultiPod(spec *v1beta1.DecoderSpec) bool {
+	return spec != nil && spec.Leader != nil && spec.Worker != nil
 }
 
 // DecoderPodSpec renders the decoder's primary pod. The selected runner
@@ -80,7 +86,7 @@ func DecoderPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Deco
 	if runnerSpec != nil {
 		UpdateEnvVariables(p, isvc, &runnerSpec.Container, objectMeta)
 		UpdateVolumeMounts(p, isvc, &runnerSpec.Container, objectMeta)
-		MergeDecoderResources(p, isvc, &runnerSpec.Container)
+		MergeRoleResources(p, isvc, v1beta1.DecoderComponent, &runnerSpec.Container)
 		MergeRuntimeArgumentsOverride(p, &runnerSpec.Container)
 		if spec != nil && !AcceleratorProvidesParallelismOverride(p) {
 			SetParallelismEnvVar(p, &runnerSpec.Container, decoderParallelismLeaders(spec), DecoderWorkerSize(spec))
@@ -95,7 +101,7 @@ func DecoderPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Deco
 
 	UpdatePodSpecVolumes(p, isvc, podSpec, objectMeta)
 	UpdatePodSpecNodeSelector(p, isvc, podSpec, v1beta1.DecoderComponent)
-	UpdateDecoderAffinity(p, isvc, podSpec)
+	UpdateRoleAffinity(p, isvc, v1beta1.DecoderComponent, podSpec)
 
 	p.Log.V(1).Info("Decoder PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
 	return podSpec, nil
@@ -117,7 +123,7 @@ func DecoderWorkerPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta
 		if workerRunner != nil {
 			UpdateVolumeMounts(p, isvc, &workerRunner.Container, objectMeta)
 			UpdateEnvVariables(p, isvc, &workerRunner.Container, objectMeta)
-			MergeDecoderResources(p, isvc, &workerRunner.Container)
+			MergeRoleResources(p, isvc, v1beta1.DecoderComponent, &workerRunner.Container)
 			MergeRuntimeArgumentsOverride(p, &workerRunner.Container)
 			if spec != nil && !AcceleratorProvidesParallelismOverride(p) {
 				SetParallelismEnvVar(p, &workerRunner.Container, decoderParallelismLeaders(spec), DecoderWorkerSize(spec))
@@ -132,7 +138,7 @@ func DecoderWorkerPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta
 	}
 	UpdatePodSpecVolumes(p, isvc, workerPodSpec, objectMeta)
 	UpdatePodSpecNodeSelector(p, isvc, workerPodSpec, v1beta1.DecoderComponent)
-	UpdateDecoderAffinity(p, isvc, workerPodSpec)
+	UpdateRoleAffinity(p, isvc, v1beta1.DecoderComponent, workerPodSpec)
 
 	p.Log.V(1).Info("Decoder Worker PodSpec updated", "inference service", isvc.Name, "namespace", isvc.Namespace)
 	return workerPodSpec, nil

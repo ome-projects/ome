@@ -9,10 +9,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // The group surge budget on an engine of gangs. A gang cannot swap one pod,
@@ -145,7 +145,7 @@ func gangRollService(policy v1beta1.CoordinationPolicy) *v1beta1.InferenceServic
 
 func gangRollClient(t *testing.T, f gangRollFixture) client.Client {
 	t.Helper()
-	return fake.NewClientBuilder().WithScheme(pairingScheme(t)).WithObjects(gangRollReplica(f)).Build()
+	return fakeclient.New(t, fakeclient.WithObjects(gangRollReplica(f)))
 }
 
 // expectSurgeHeld asks the gate stack about one more engine surge with
@@ -212,7 +212,7 @@ func TestCheckSurge_PercentBudgetIsSizedByTheDesiredCountNotTheRows(t *testing.T
 	isvc := gangRollService(v1beta1.CoordinationPolicyBlueGreen)
 	ask := func(t *testing.T, ir *v1beta1.InferenceReplica, inFlight int32) (bool, string) {
 		t.Helper()
-		c := fake.NewClientBuilder().WithScheme(pairingScheme(t)).WithObjects(ir).Build()
+		c := fakeclient.New(t, fakeclient.WithObjects(ir))
 		return ResolveGateContext(t.Context(), c, isvc, v1beta1.EngineComponent).CheckSurge(inFlight)
 	}
 	t.Run("one-pair-open-spends-the-quarter-of-four", func(t *testing.T) {

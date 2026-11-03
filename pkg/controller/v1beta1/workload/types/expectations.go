@@ -18,9 +18,6 @@ const expectationsTTL = 2 * time.Minute
 // up. Subsequent reconciles call Satisfied to check whether they can
 // safely issue another batch (or proceed past the create step).
 //
-// Pattern borrowed from sigs.k8s.io/controller-runtime samples and the
-// kubernetes/kubernetes ReplicaSet/StatefulSet controllers.
-//
 // Concurrency: all methods are safe for concurrent use; an in-process
 // singleton (DefaultExpectations) is provided for the dispatch path.
 type Expectations struct {
@@ -72,35 +69,29 @@ var DefaultExpectations = NewExpectations()
 // (OwnerName, Component, Instance). Satisfied returns false until all
 // of them are observed via ObservedCreate, or the deadline elapses.
 func (e *Expectations) ExpectCreates(namespace, ownerName string, component ComponentType, instance int32, n int) {
-	if n <= 0 {
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	k := expectationKey{namespace, ownerName, component, instance}
-	ent, ok := e.entries[k]
-	if !ok {
-		ent = &expectationEntry{}
-		e.entries[k] = ent
-	}
-	ent.Adds += n
-	ent.Deadline = e.clock.Now().Add(expectationsTTL)
+	e.expect(expectationKey{namespace, ownerName, component, instance}, n, 0)
 }
 
 // ExpectDeletes records that n pod deletes are in flight.
 func (e *Expectations) ExpectDeletes(namespace, ownerName string, component ComponentType, instance int32, n int) {
-	if n <= 0 {
+	e.expect(expectationKey{namespace, ownerName, component, instance}, 0, n)
+}
+
+// expect adds in-flight creates and deletes to the key's entry and renews
+// its deadline. A call that adds nothing leaves the cache untouched.
+func (e *Expectations) expect(k expectationKey, adds, deletes int) {
+	if adds <= 0 && deletes <= 0 {
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	k := expectationKey{namespace, ownerName, component, instance}
 	ent, ok := e.entries[k]
 	if !ok {
 		ent = &expectationEntry{}
 		e.entries[k] = ent
 	}
-	ent.Deletes += n
+	ent.Adds += adds
+	ent.Deletes += deletes
 	ent.Deadline = e.clock.Now().Add(expectationsTTL)
 }
 

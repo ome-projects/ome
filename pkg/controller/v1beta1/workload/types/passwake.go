@@ -11,8 +11,8 @@ import "time"
 // into the pass result, so the wait is re-consulted instead of waiting
 // for an unrelated event or the resync. All methods are nil-safe.
 type PassWake struct {
-	pending time.Duration
-	bare    bool
+	earliestWait
+	bare bool
 }
 
 // Observe records that the pass must come back, after the given interval
@@ -26,9 +26,7 @@ func (w *PassWake) Observe(after time.Duration) {
 		w.bare = true
 		return
 	}
-	if w.pending == 0 || after < w.pending {
-		w.pending = after
-	}
+	w.observe(after)
 }
 
 // Pending returns the earliest configured interval deposited this pass,

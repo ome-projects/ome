@@ -220,6 +220,21 @@ func TestHandle(t *testing.T) {
 			wantContains: []string{"spec.component is immutable"},
 		},
 		{
+			name: "create with a component that names no role → denied",
+			req: func(t *testing.T) admission.Request {
+				return createReq(t, withComponent(baselineIR(wcw), "sidecar"))
+			},
+			wantAllowed:  false,
+			wantContains: []string{`spec.component "sidecar" is not a role`, "engine, decoder, encoder, router"},
+		},
+		{
+			name: "create with the encoder component (controller write) → allowed",
+			req: func(t *testing.T) admission.Request {
+				return createReq(t, withComponent(baselineIR(wcw), v1beta1.EncoderComponent))
+			},
+			wantAllowed: true,
+		},
+		{
 			name: "update rerendering runners (controller write) → allowed",
 			req: func(t *testing.T) admission.Request {
 				return updateReq(t, baselineIR(wcw), withImage(baselineIR(wcw), "sgl:2.0"))

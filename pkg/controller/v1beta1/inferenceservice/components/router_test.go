@@ -12,16 +12,15 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/render"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestRouterReconcileRejectsInvalidPDBBeforeChildMutation(t *testing.T) {
@@ -30,8 +29,7 @@ func TestRouterReconcileRejectsInvalidPDBBeforeChildMutation(t *testing.T) {
 		constants.OMENative,
 	} {
 		t.Run(string(mode), func(t *testing.T) {
-			scheme := routerPDBTestScheme(t)
-			cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+			cl := componentClient(t)
 			minimum := intstr.FromInt(1)
 			maximum := intstr.FromInt(1)
 			ext := rawPDBTestExtension()
@@ -44,7 +42,7 @@ func TestRouterReconcileRejectsInvalidPDBBeforeChildMutation(t *testing.T) {
 			deps := &ComponentDeps{
 				Client:    cl,
 				Clientset: rawAutoscalerTestClientset(),
-				Scheme:    scheme,
+				Scheme:    cl.Scheme(),
 				Config:    &controllerconfig.InferenceServicesConfig{},
 			}
 			router := NewRouter(deps, ComponentInputs{DeploymentMode: mode}, isvc.Spec.Router).(*Router)
@@ -76,7 +74,6 @@ func TestRouterReconcilePreflightsForeignPDBBeforeRBAC(t *testing.T) {
 		constants.OMENative,
 	} {
 		t.Run(string(mode), func(t *testing.T) {
-			scheme := routerPDBTestScheme(t)
 			maximum := intstr.FromInt(1)
 			ext := rawPDBTestExtension()
 			isvc := rawAutoscalerTestISVC(v1beta1.RouterComponent, ext)
@@ -92,8 +89,8 @@ func TestRouterReconcilePreflightsForeignPDBBeforeRBAC(t *testing.T) {
 					UID: types.UID("foreign-owner"), Controller: &controller,
 				}},
 			}}
-			cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
-			liveReader := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign).Build()
+			cl := componentClient(t)
+			liveReader := componentClient(t, fakeclient.WithObjects(foreign))
 			config := &controllerconfig.InferenceServicesConfig{}
 			if mode == constants.RawDeployment {
 				config.PodDisruptionBudget.RawDeployment = &controllerconfig.PodDisruptionBudgetPolicy{MaxUnavailable: &maximum}
@@ -101,7 +98,7 @@ func TestRouterReconcilePreflightsForeignPDBBeforeRBAC(t *testing.T) {
 				config.PodDisruptionBudget.OMENative = &controllerconfig.PodDisruptionBudgetPolicy{MaxUnavailable: &maximum}
 			}
 			deps := &ComponentDeps{
-				Client: cl, Clientset: rawAutoscalerTestClientset(), APIReader: liveReader, Scheme: scheme, Config: config,
+				Client: cl, Clientset: rawAutoscalerTestClientset(), APIReader: liveReader, Scheme: cl.Scheme(), Config: config,
 			}
 			router := NewRouter(deps, ComponentInputs{DeploymentMode: mode}, isvc.Spec.Router).(*Router)
 
@@ -125,8 +122,7 @@ func TestRouterReconcilePreflightsForeignPDBBeforeRBAC(t *testing.T) {
 }
 
 func TestRouterReconcileWithoutPDBPolicyPreservesRawBehavior(t *testing.T) {
-	scheme := routerPDBTestScheme(t)
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := componentClient(t)
 	ext := rawPDBTestExtension()
 	isvc := rawAutoscalerTestISVC(v1beta1.RouterComponent, ext)
 	isvc.Spec.Router.PodSpec.Containers = []corev1.Container{{
@@ -135,7 +131,7 @@ func TestRouterReconcileWithoutPDBPolicyPreservesRawBehavior(t *testing.T) {
 	deps := &ComponentDeps{
 		Client:    cl,
 		Clientset: rawAutoscalerTestClientset(),
-		Scheme:    scheme,
+		Scheme:    cl.Scheme(),
 	}
 	router := NewRouter(deps, ComponentInputs{DeploymentMode: constants.RawDeployment}, isvc.Spec.Router).(*Router)
 
@@ -193,13 +189,6 @@ func TestResolveComponentPDBBudgetForMode(t *testing.T) {
 			assert.Equal(t, tt.wantMax, budget.MaxUnavailable)
 		})
 	}
-}
-
-func routerPDBTestScheme(t *testing.T) *runtime.Scheme {
-	t.Helper()
-	scheme := rawAutoscalerTestScheme(t)
-	require.NoError(t, rbacv1.AddToScheme(scheme))
-	return scheme
 }
 
 // TestConfigEnvVars_SortedDeterministic pins the env order derived from

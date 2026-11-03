@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -213,7 +214,7 @@ func verifyColumns(columns schema) error {
 		return fmt.Errorf("type is %q, want object", columns.Type)
 	}
 	for _, name := range requiredColumnProperties {
-		if !contains(columns.Required, name) {
+		if !slices.Contains(columns.Required, name) {
 			return fmt.Errorf("%s is not required", name)
 		}
 	}
@@ -292,15 +293,6 @@ func verifyIndexSet(property schema) error {
 func hasRule(rules []validationRule, want string) bool {
 	for _, rule := range rules {
 		if rule.Rule == want {
-			return true
-		}
-	}
-	return false
-}
-
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
 			return true
 		}
 	}

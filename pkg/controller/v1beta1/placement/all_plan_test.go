@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/plan"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestAllPlanSurvivesMemberStatusUpdates(t *testing.T) {
@@ -44,17 +45,11 @@ func TestAllPlanSurvivesMemberStatusUpdates(t *testing.T) {
 			want := source.Status.Placement.Plan.DeepCopy()
 			for name, cl := range f.workers {
 				reads := 0
-				watched := interceptor.NewClient(cl, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if err := c.Get(ctx, key, obj, opts...); err != nil {
-						return err
-					}
-					if member, ok := obj.(*v1beta1.InferenceService); ok {
-						reads++
-						member.ResourceVersion = strconv.Itoa(reads)
-						member.Status.ObservedGeneration = int64(reads)
-					}
-					return nil
-				}})
+				watched := fakeclient.Wrap(t, cl, fakeclient.EditedRead(func(member *v1beta1.InferenceService) {
+					reads++
+					member.ResourceVersion = strconv.Itoa(reads)
+					member.Status.ObservedGeneration = int64(reads)
+				}))
 				f.connections.m[name] = workloadcluster.NewNeverCachingClient(watched)
 			}
 			for range 3 {
@@ -165,7 +160,7 @@ func TestAllPlanInitialApplication(t *testing.T) {
 				if _, ok := f.connections.m[name]; !ok {
 					continue
 				}
-				watched := interceptor.NewClient(cl, interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				watched := fakeclient.Wrap(t, cl, fakeclient.WithInterceptors(interceptor.Funcs{Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 					if _, ok := obj.(*v1beta1.InferenceService); ok {
 						live := &v1beta1.InferenceService{}
 						if err := f.reconciler.Get(ctx, client.ObjectKeyFromObject(f.source), live); err != nil {
@@ -176,7 +171,7 @@ func TestAllPlanInitialApplication(t *testing.T) {
 						}
 					}
 					return c.Create(ctx, obj, opts...)
-				}})
+				}}))
 				f.connections.m[name] = workloadcluster.NewNeverCachingClient(watched)
 			}
 			if _, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.source)}); err != nil {
@@ -283,12 +278,7 @@ func TestAllInventoryRecoveryAcceptsRetarget(t *testing.T) {
 			if failure == "disconnected member" {
 				delete(f.connections.m, "member-b")
 			} else {
-				unreadable := interceptor.NewClient(f.workers["member-b"], interceptor.Funcs{List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-					if _, ok := list.(*v1beta1.InferenceReplicaList); ok {
-						return errors.New("member inventory unavailable")
-					}
-					return cl.List(ctx, list, opts...)
-				}})
+				unreadable := fakeclient.Wrap(t, f.workers["member-b"], fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, errors.New("member inventory unavailable")).OnKind(&v1beta1.InferenceReplicaList{}))
 				f.connections.m["member-b"] = workloadcluster.NewNeverCachingClient(unreadable)
 			}
 			if err := f.reconciler.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {

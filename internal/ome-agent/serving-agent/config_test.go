@@ -3,8 +3,8 @@ package serving_agent
 import (
 	"testing"
 
-	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/objectstorage"
+
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 
@@ -190,11 +190,9 @@ func TestWithAppParams(t *testing.T) {
 }
 
 func TestConfig_Validate(t *testing.T) {
-	// Create a mock OCI client to satisfy the required validation
-	ociClient, err := objectstorage.NewObjectStorageClientWithConfigurationProvider(common.DefaultConfigProvider())
-	if err != nil {
-		t.Skip("Skipping test due to OCI client initialization failure")
-	}
+	// Validation only checks that the data store and its client are set; it
+	// never calls the client, so no OCI configuration is needed.
+	dataStore := &ociobjectstore.OCIOSDataStore{Client: &objectstorage.ObjectStorageClient{}}
 
 	tests := []struct {
 		name        string
@@ -208,7 +206,7 @@ func TestConfig_Validate(t *testing.T) {
 					FineTunedWeightInfoFilePath:      "/test/path/weights.json",
 					UnzippedFineTunedWeightDirectory: "/test/path/unzipped",
 					ZippedFineTunedWeightDirectory:   "/test/path/zipped",
-					ObjectStorageDataStore:           &ociobjectstore.OCIOSDataStore{Client: &ociClient},
+					ObjectStorageDataStore:           dataStore,
 				}
 			},
 			expectError: false,
@@ -219,7 +217,7 @@ func TestConfig_Validate(t *testing.T) {
 				return &Config{
 					UnzippedFineTunedWeightDirectory: "/test/path/unzipped",
 					ZippedFineTunedWeightDirectory:   "/test/path/zipped",
-					ObjectStorageDataStore:           &ociobjectstore.OCIOSDataStore{Client: &ociClient},
+					ObjectStorageDataStore:           dataStore,
 				}
 			},
 			expectError: true,
@@ -230,7 +228,7 @@ func TestConfig_Validate(t *testing.T) {
 				return &Config{
 					FineTunedWeightInfoFilePath:    "/test/path/weights.json",
 					ZippedFineTunedWeightDirectory: "/test/path/zipped",
-					ObjectStorageDataStore:         &ociobjectstore.OCIOSDataStore{Client: &ociClient},
+					ObjectStorageDataStore:         dataStore,
 				}
 			},
 			expectError: true,
@@ -241,7 +239,7 @@ func TestConfig_Validate(t *testing.T) {
 				return &Config{
 					FineTunedWeightInfoFilePath:      "/test/path/weights.json",
 					UnzippedFineTunedWeightDirectory: "/test/path/unzipped",
-					ObjectStorageDataStore:           &ociobjectstore.OCIOSDataStore{Client: &ociClient},
+					ObjectStorageDataStore:           dataStore,
 				}
 			},
 			expectError: true,

@@ -15,11 +15,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	toolscache "k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 var memberKey = types.NamespacedName{Namespace: "prod", Name: "svc"}
@@ -45,10 +45,16 @@ func foreignMember(uid types.UID) *v1beta1.InferenceService {
 	}
 }
 
-func memberWorker(s *runtime.Scheme, funcs interceptor.Funcs, objs ...client.Object) client.WithWatch {
-	objs = append(objs, backendTestRuntime())
-	base := fakeclient.NewClientBuilder().WithScheme(s).WithStatusSubresource(&v1beta1.InferenceService{}).WithObjects(objs...).Build()
-	return interceptor.NewClient(base, funcs)
+// memberWorker is a member cluster's client: its store holds the backend
+// runtime beside the objects an option seeds, under the behaviours and raw
+// hooks the test lays over it.
+func memberWorker(t *testing.T, s *runtime.Scheme, opts ...fakeclient.Option) client.WithWatch {
+	t.Helper()
+	return fakeclient.New(t, append([]fakeclient.Option{
+		fakeclient.WithScheme(s),
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}),
+		fakeclient.WithObjects(backendTestRuntime()),
+	}, opts...)...)
 }
 
 // bumpMemberStatus models the member reconciler's status write: it advances
@@ -78,7 +84,7 @@ func liveMember(t *testing.T, c client.Client) *v1beta1.InferenceService {
 // must still accept the placer's write.
 func TestPlaceOnWritesThroughMemberStatusChurn(t *testing.T) {
 	s := testScheme(t)
-	worker := memberWorker(s, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	worker := memberWorker(t, s, fakeclient.WithObjects(ownedMember()), fakeclient.WithInterceptors(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 		if err := c.Get(ctx, key, obj, opts...); err != nil {
 			return err
 		}
@@ -86,7 +92,7 @@ func TestPlaceOnWritesThroughMemberStatusChurn(t *testing.T) {
 			bumpMemberStatus(ctx, t, c)
 		}
 		return nil
-	}}, ownedMember())
+	}}))
 	r := placerFor(t, s, workloadcluster.NewNeverCachingClient(worker))
 
 	require.NoError(t, r.placeOn(t.Context(), "a", srcISVC(""), false))
@@ -100,21 +106,20 @@ func TestPlaceOnWritesThroughMemberStatusChurn(t *testing.T) {
 // A conflict returns to reconciliation before attempting another member write.
 func TestPlaceOnRetriesMemberConflictOnNextReconcile(t *testing.T) {
 	s := testScheme(t)
-	updates := 0
-	worker := memberWorker(s, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-		updates++
-		if updates == 1 {
+	updates := fakeclient.CountingVerb(fakeclient.Update)
+	worker := memberWorker(t, s, fakeclient.WithObjects(ownedMember()), updates, fakeclient.WithInterceptors(interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+		if updates.Count() == 1 {
 			bumpMemberStatus(ctx, t, c)
 		}
 		return c.Update(ctx, obj, opts...)
-	}}, ownedMember())
+	}}))
 	r := placerFor(t, s, workloadcluster.NewNeverCachingClient(worker))
 
 	require.True(t, apierrors.IsConflict(r.placeOn(t.Context(), "a", srcISVC(""), false)))
-	assert.Equal(t, 1, updates, "a conflict must not loop over the same cached state")
+	assert.Equal(t, 1, updates.Count(), "a conflict must not loop over the same cached state")
 	require.NoError(t, r.placeOn(t.Context(), "a", srcISVC(""), false))
 
-	assert.Equal(t, 2, updates, "one conflicted write and one subsequent reconcile")
+	assert.Equal(t, 2, updates.Count(), "one conflicted write and one subsequent reconcile")
 	got := liveMember(t, worker)
 	assert.NotNil(t, got.Spec.Engine, "desired spec applied")
 	assert.Equal(t, "uid-1", got.Labels[PlacementOriginLabel])
@@ -197,7 +202,7 @@ func TestPlaceOnRetryRechecksMemberOwnership(t *testing.T) {
 					tt.race(ctx, t, c)
 				}
 			}
-			worker := memberWorker(s, interceptor.Funcs{
+			worker := memberWorker(t, s, fakeclient.WithObjects(tt.initial...), fakeclient.WithInterceptors(interceptor.Funcs{
 				Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 					race(ctx, c)
 					return c.Update(ctx, obj, opts...)
@@ -208,7 +213,7 @@ func TestPlaceOnRetryRechecksMemberOwnership(t *testing.T) {
 					}
 					return c.Create(ctx, obj, opts...)
 				},
-			}, tt.initial...)
+			}))
 			r := placerFor(t, s, workloadcluster.NewNeverCachingClient(worker))
 
 			err := r.placeOn(t.Context(), "a", srcISVC(""), false)
@@ -251,7 +256,7 @@ func (c *staleCacheClient) DirectClient() client.WithWatch {
 // Stale observations may reject a write, but cannot overwrite newer member state.
 func TestPlaceOnWaitsForMemberCacheAfterConflict(t *testing.T) {
 	s := testScheme(t)
-	worker := memberWorker(s, interceptor.Funcs{}, ownedMember())
+	worker := memberWorker(t, s, fakeclient.WithObjects(ownedMember()))
 	cached := &staleCacheClient{WithWatch: worker, stale: liveMember(t, worker)}
 	bumpMemberStatus(t.Context(), t, worker)
 	r := placerFor(t, s, cached)
@@ -267,12 +272,12 @@ func TestPolicyPruningUsesSuccessfulWriteResponse(t *testing.T) {
 	for _, pruned := range []bool{false, true} {
 		t.Run(fmt.Sprintf("pruned=%t", pruned), func(t *testing.T) {
 			s := testScheme(t)
-			worker := memberWorker(s, interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			worker := memberWorker(t, s, fakeclient.WithObjects(ownedMember()), fakeclient.WithInterceptors(interceptor.Funcs{Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 				if pruned {
 					obj.(*v1beta1.InferenceService).Spec.Engine.AutoscalerPolicyRef = nil
 				}
 				return c.Update(ctx, obj, opts...)
-			}}, ownedMember())
+			}}))
 			cached := &staleCacheClient{WithWatch: worker, stale: liveMember(t, worker)}
 			src := srcISVCWithRef("")
 			r, _ := newPlacer(s, fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"a": cached}}, src, readyWC("a", nil))
@@ -303,21 +308,17 @@ func TestCachedAbsenceCannotReleaseUnobservedMember(t *testing.T) {
 			if state == "exists" {
 				objects = append(objects, fixture.member)
 			}
-			gets := 0
-			worker := memberWorker(s, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-				if _, member := obj.(*v1beta1.InferenceService); member {
-					gets++
-					if state == "unreadable" {
-						return context.DeadlineExceeded
-					}
-				}
-				return c.Get(ctx, key, obj, opts...)
-			}}, objects...)
+			gets := fakeclient.CountingVerb(fakeclient.Get).OnKind(&v1beta1.InferenceService{})
+			opts := []fakeclient.Option{fakeclient.WithObjects(objects...), gets}
+			if state == "unreadable" {
+				opts = append(opts, fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, context.DeadlineExceeded).OnKind(&v1beta1.InferenceService{}))
+			}
+			worker := memberWorker(t, s, opts...)
 			cached := &staleCacheClient{WithWatch: worker}
 			clusters := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": cached}}, uid: "member-a-uid"}
 			r, _ := newPlacer(s, clusters, fixture.source, plannedTestRegistration())
 			got, err := r.observePlannedMember(t.Context(), fixture.source, fixture.source.Status.Placement.Candidates[0], fixture.components)
-			require.Equal(t, 1, gets, "allocation release requires one direct absence confirmation")
+			require.Equal(t, 1, gets.Count(), "allocation release requires one direct absence confirmation")
 			if state == "absent" {
 				require.NoError(t, err)
 				require.True(t, got.MemberState.Absent)

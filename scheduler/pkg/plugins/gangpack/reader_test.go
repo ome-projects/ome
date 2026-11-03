@@ -47,15 +47,18 @@ func TestFactsFromPodGroup_WithOrWithoutAnnotationAndTimeout_ReadsOrDefaults(t *
 		Spec:       schedv1alpha1.PodGroupSpec{MinMember: 18, ScheduleTimeoutSeconds: ptr.To[int32](120)},
 	}
 	const fallback = 10 * time.Minute
-	if mm, tk, to := factsFromPodGroup(pg, topologyKeyAnnotation, fallback); mm != 18 || tk != "nvidia.com/gpu.clique" || to != 120*time.Second {
-		t.Fatalf("factsFromPodGroup = %d,%q,%v want 18,nvidia.com/gpu.clique,2m", mm, tk, to)
+	r := &informerReader{topologyKeyAnnotation: topologyKeyAnnotation, placementGroupLabel: placementGroupLabel, defaultPermitTimeout: fallback}
+	if f := r.facts(pg); f.minMember != 18 || f.topologyKey != "nvidia.com/gpu.clique" || f.timeout != 120*time.Second || f.inPlacementGroup {
+		t.Fatalf("facts = %+v want 18,nvidia.com/gpu.clique,2m,not in a placement group", f)
 	}
-	// No annotation -> empty key; no ScheduleTimeoutSeconds -> default timeout.
-	if mm, tk, to := factsFromPodGroup(&schedv1alpha1.PodGroup{Spec: schedv1alpha1.PodGroupSpec{MinMember: 4}}, topologyKeyAnnotation, fallback); mm != 4 || tk != "" || to != fallback {
-		t.Fatalf("factsFromPodGroup(no annotation) = %d,%q,%v want 4,'',default", mm, tk, to)
+	// No annotation -> empty key; no ScheduleTimeoutSeconds -> default timeout;
+	// the placement-group label counts by presence, whatever its value.
+	labelled := &schedv1alpha1.PodGroup{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{placementGroupLabel: ""}}, Spec: schedv1alpha1.PodGroupSpec{MinMember: 4}}
+	if f := r.facts(labelled); f.minMember != 4 || f.topologyKey != "" || f.timeout != fallback || !f.inPlacementGroup {
+		t.Fatalf("facts(no annotation) = %+v want 4,'',default,in a placement group", f)
 	}
-	if mm, tk, to := factsFromPodGroup(nil, topologyKeyAnnotation, fallback); mm != 0 || tk != "" || to != fallback {
-		t.Fatalf("factsFromPodGroup(nil) = %d,%q,%v want 0,'',default", mm, tk, to)
+	if f := r.facts(nil); f.minMember != 0 || f.topologyKey != "" || f.timeout != fallback || f.inPlacementGroup {
+		t.Fatalf("facts(nil) = %+v want 0,'',default", f)
 	}
 }
 
@@ -71,16 +74,16 @@ func TestInformerReaderGet_PresentMissingOrNilPodGroup_FoundOnlyWhenPresent(t *t
 		return nil, errors.New("not found")
 	}}
 
-	if mm, tk, _, uid, ok := r.get("team", "pf"); !ok || mm != 8 || tk != "clique" || uid != "pg-uid" {
-		t.Fatalf("get(team/pf) = %d,%q,%v want 8,clique,true", mm, tk, ok)
+	if f, ok := r.get("team", "pf"); !ok || f.minMember != 8 || f.topologyKey != "clique" || f.uid != "pg-uid" {
+		t.Fatalf("get(team/pf) = %+v,%v want 8,clique,pg-uid,true", f, ok)
 	}
-	if _, _, _, _, ok := r.get("team", "missing"); ok {
+	if _, ok := r.get("team", "missing"); ok {
 		t.Fatal("get(missing) should be not-found")
 	}
 
 	// A getPG that returns (nil, nil) is treated as not found, not a panic.
 	rNil := &informerReader{getPG: func(string, string) (*schedv1alpha1.PodGroup, error) { return nil, nil }}
-	if _, _, _, _, ok := rNil.get("x", "y"); ok {
+	if _, ok := rNil.get("x", "y"); ok {
 		t.Fatal("nil PodGroup should be not-found")
 	}
 }
@@ -155,8 +158,8 @@ func TestInformerReaderOnChange_PodGroupStoredOrSpecEdited_ReportsStoredVersion(
 	}
 	reports := make(chan report, 16)
 	if err := r.onChange(func(namespace, name string) {
-		minMember, _, _, _, _ := r.get(namespace, name)
-		reports <- report{key: namespace + "/" + name, minMember: minMember}
+		facts, _ := r.get(namespace, name)
+		reports <- report{key: namespace + "/" + name, minMember: facts.minMember}
 	}); err != nil {
 		t.Fatalf("onChange: %v", err)
 	}

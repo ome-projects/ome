@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/plan"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestPlannedMemberRecreationWaitsForInventory(t *testing.T) {
@@ -78,7 +79,7 @@ func TestPlannedMemberRecreationWaitsForInventory(t *testing.T) {
 					inventoryRead, injected := false, false
 					failList := tt.failList
 					failRefresh, partialRefresh := tt.failRefresh, tt.partialRefresh
-					wrapped := interceptor.NewClient(worker, interceptor.Funcs{
+					wrapped := fakeclient.Wrap(t, worker, fakeclient.WithInterceptors(interceptor.Funcs{
 						Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
 							if _, service := object.(*v1beta1.InferenceService); service && (tt.lateComponent || tt.latePod) && inventoryRead && !injected {
 								var remaining client.Object = f.resources.ir
@@ -116,7 +117,7 @@ func TestPlannedMemberRecreationWaitsForInventory(t *testing.T) {
 							}
 							return c.List(ctx, objects, opts...)
 						},
-					})
+					}))
 					connections := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(wrapped)}}, uid: "member-a-uid"}
 					r, root := newPlacer(scheme, connections, f.source, plannedTestRegistration())
 					if err := root.Get(t.Context(), client.ObjectKeyFromObject(f.source), f.source); err != nil {

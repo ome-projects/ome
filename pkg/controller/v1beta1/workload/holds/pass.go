@@ -28,8 +28,8 @@ type Row struct {
 	// covers this row.
 	Instance *types.InstancePlan
 
-	// Excluded marks a deferred scale-down victim: it receives no
-	// lifecycle mutation before the wave admits it.
+	// Excluded marks a leaving Instance the scale-down has not admitted
+	// yet: it receives no lifecycle mutation before the wave admits it.
 	Excluded bool
 }
 
@@ -116,7 +116,7 @@ func (r *Result) record(idx int32, token string) {
 // RowsForPlan builds the pass's rows from the plan and the observed
 // statuses: a row's desired pod count is the plan's when the plan still
 // covers its index and the observed count otherwise, and excluded marks
-// the deferred scale-down victims.
+// the leaving Instances the scale-down has not admitted yet.
 func RowsForPlan(plan types.ComponentPlan, statuses []types.InstanceStatus, excluded map[int32]struct{}) []Row {
 	desiredByIdx := status.DesiredPodCountByInstance(plan)
 	planned := make(map[int32]*types.InstancePlan, len(plan.Instances))
@@ -156,7 +156,13 @@ func Run(ctx context.Context, in PassInput) (Result, error) {
 	return out, nil
 }
 
-// runRow runs release-then-record for one row.
+// runRow runs read, then release, then record for one row. The
+// attempt's placement wait (placementWait) is written once when it is
+// recorded and once when it is retired, never pass after pass. Each rides
+// on the write of a placement hold recorded or released in the same pass
+// when there is one, and is a status write of its own otherwise: retiring
+// it once the member rebuilt for a name the sweep freed is placed, with no
+// hold left to release, is one.
 func runRow(ctx context.Context, in PassInput, row Row, out *Result) error {
 	readings := make([]reading, len(table))
 	for i, a := range table {
@@ -168,17 +174,24 @@ func runRow(ctx context.Context, in PassInput, row Row, out *Result) error {
 			return fmt.Errorf("read %s hold (instance=%d): %w", a.token, row.Status.Index, err)
 		}
 		readings[i] = r
-		if r.release {
-			if err := release(ctx, in.Input, row.Status.Index, a.token); err != nil {
-				return fmt.Errorf("release %s hold (instance=%d): %w", a.token, row.Status.Index, err)
-			}
+	}
+	wait, err := decidePlacementWait(ctx, in, row, readings)
+	if err != nil {
+		return fmt.Errorf("read placement wait (instance=%d): %w", row.Status.Index, err)
+	}
+	for i, a := range table {
+		if !readings[i].release {
+			continue
+		}
+		if err := release(ctx, in.Input, row.Status.Index, a.token, wait.clearsWith(a.token)); err != nil {
+			return fmt.Errorf("release %s hold (instance=%d): %w", a.token, row.Status.Index, err)
 		}
 	}
 	for i, a := range table {
 		if !readings[i].waiting {
 			continue
 		}
-		_, held, err := mark(ctx, in.Input, in.Plan, row.Status.Index, a, readings[i].evidence)
+		_, held, err := mark(ctx, in.Input, in.Plan, row.Status.Index, a, readings[i].evidence, wait.sinceWith(a.token))
 		if err != nil {
 			return fmt.Errorf("record %s hold (instance=%d): %w", a.token, row.Status.Index, err)
 		}
@@ -186,14 +199,18 @@ func runRow(ctx context.Context, in PassInput, row Row, out *Result) error {
 			out.record(row.Status.Index, a.token)
 		}
 	}
+	if err := wait.apply(ctx, in, row, readings); err != nil {
+		return fmt.Errorf("retire placement wait (instance=%d): %w", row.Status.Index, err)
+	}
 	return nil
 }
 
 // skips reports whether the row is one this authority never touches: a
-// deferred scale-down victim receives no mutation before admission, and
-// a row nobody owns — Failed, or an attempt parked after its disposition
-// — has no attempt left for a fact to hold. The pause reaches all of
-// them — it releases its own token wherever it left one.
+// leaving Instance the scale-down has not admitted receives no mutation
+// before admission, and a row nobody owns — Failed, or an attempt parked
+// after its disposition — has no attempt left for a fact to hold. The
+// pause reaches all of them — it releases its own token wherever it left
+// one.
 func (r Row) skips(a authority) bool {
 	if a.everyRow {
 		return false

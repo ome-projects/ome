@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -20,6 +21,10 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
+
+// fineTunedWeightKind is the Spec.Model.Kind that names a FineTunedWeight
+// instead of a base model.
+const fineTunedWeightKind = "FineTunedWeight"
 
 // ModelSpecInfo holds the extracted storage and metadata for a model or fine-tuned weight.
 type ModelSpecInfo struct {
@@ -44,16 +49,14 @@ type ModelConfigEntry struct {
 }
 
 type ConfigMapReconciler struct {
-	client    client.Client
-	clientset kubernetes.Interface
-	scheme    *runtime.Scheme
+	client client.Client
+	scheme *runtime.Scheme
 }
 
-func NewModelConfigReconciler(client client.Client, clientset kubernetes.Interface, scheme *runtime.Scheme) *ConfigMapReconciler {
+func NewModelConfigReconciler(client client.Client, _ kubernetes.Interface, scheme *runtime.Scheme) *ConfigMapReconciler {
 	return &ConfigMapReconciler{
-		client:    client,
-		clientset: clientset,
-		scheme:    scheme,
+		client: client,
+		scheme: scheme,
 	}
 }
 
@@ -67,10 +70,9 @@ func (c *ConfigMapReconciler) Reconcile(ctx context.Context, isvc *v1beta1.Infer
 		return ctrl.Result{}, nil
 	}
 
-	modelConfigName := constants.ModelConfigName(isvc.Name) // Reverted to constants package
+	modelConfigName := constants.ModelConfigName(isvc.Name)
 
-	// Generate desired ModelConfigEntry
-	desiredEntry, err := c.generateModelConfigEntry(ctx, isvc)
+	model, err := c.resolveModelRef(ctx, isvc)
 	if err != nil {
 		ctxLog.Error(err, "Failed to generate ModelConfigEntry")
 		return ctrl.Result{}, err
@@ -78,7 +80,7 @@ func (c *ConfigMapReconciler) Reconcile(ctx context.Context, isvc *v1beta1.Infer
 
 	// For now, we are managing a single model entry based on InferenceService.Spec.Model
 	// In the future, this could be expanded to manage multiple models in the ConfigMap.
-	desiredEntries := []ModelConfigEntry{*desiredEntry}
+	desiredEntries := []ModelConfigEntry{entryFrom(model)}
 	desiredData, err := json.Marshal(desiredEntries)
 	if err != nil {
 		ctxLog.Error(err, "Failed to marshal desired ModelConfig data")
@@ -133,15 +135,7 @@ func (c *ConfigMapReconciler) Reconcile(ctx context.Context, isvc *v1beta1.Infer
 }
 
 func (c *ConfigMapReconciler) createModelConfig(ctx context.Context, isvc *v1beta1.InferenceService, modelConfigName string, jsonData []byte) (ctrl.Result, error) {
-	// Use the package-level logger or a logger derived from context if specific context is needed.
-	// For now, let's ensure we are not redeclaring if 'log' is already the package-level one.
-	// If we want a context-specific logger:
-	// createLog := logf.FromContext(ctx).WithName("createModelConfig")
-	// And then use createLog instead of log.
-	// For simplicity and to avoid shadowing the package var 'log' with 'log :=' if not intended,
-	// we can directly use the package 'log' or be explicit with a new variable name.
-	// Let's use a new variable for the context logger to avoid confusion.
-	createOpLog := logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 	newModelConfig := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      modelConfigName,
@@ -155,59 +149,136 @@ func (c *ConfigMapReconciler) createModelConfig(ctx context.Context, isvc *v1bet
 		},
 	}
 
-	err := controllerutil.SetControllerReference(isvc, newModelConfig, c.scheme)
-	if err != nil {
-		createOpLog.Error(err, "Failed to set controller reference for modelConfig", "configmap", modelConfigName)
+	if err := controllerutil.SetControllerReference(isvc, newModelConfig, c.scheme); err != nil {
+		log.Error(err, "Failed to set controller reference for modelConfig", "configmap", modelConfigName)
 		return ctrl.Result{}, err
 	}
 
-	// Use c.client for creating corev1 types like ConfigMap
-	err = c.client.Create(ctx, newModelConfig)
-	if err != nil {
-		createOpLog.Error(err, "Failed to create ConfigMap via clientset", "configmap", modelConfigName)
+	if err := c.client.Create(ctx, newModelConfig); err != nil {
+		log.Error(err, "Failed to create ConfigMap", "configmap", modelConfigName)
 		return ctrl.Result{}, err
 	}
 
-	createOpLog.Info("Successfully created modelConfig", "configmap", modelConfigName)
+	log.Info("Successfully created modelConfig", "configmap", modelConfigName)
 	return ctrl.Result{}, nil
 }
 
+// resolvedModel is what Spec.Model names once the referenced objects are read:
+// the base model the entry describes, under the name the entry carries, and the
+// fine-tuned weight applied to it, nil when the reference names none.
+type resolvedModel struct {
+	name   string
+	base   *v1beta1.BaseModelSpec
+	weight *v1beta1.FineTunedWeightSpec
+}
+
+// resolveModelRef reads the objects Spec.Model names. A reference of kind
+// FineTunedWeight resolves to that weight and the base model it was trained
+// on; any other reference resolves to that base model and the first weight
+// listed under it.
+func (c *ConfigMapReconciler) resolveModelRef(ctx context.Context, isvc *v1beta1.InferenceService) (resolvedModel, error) {
+	ref := isvc.Spec.Model
+	if modelRefKind(ref) == fineTunedWeightKind {
+		return c.resolveFineTunedWeightRef(ctx, ref)
+	}
+	return c.resolveBaseModelRef(ctx, ref, isvc.Namespace)
+}
+
+// resolveFineTunedWeightRef resolves a reference of kind FineTunedWeight. The
+// entry is named after the base model the weight names: a BaseModelRef with a
+// namespace names a BaseModel there, one without names a ClusterBaseModel.
+func (c *ConfigMapReconciler) resolveFineTunedWeightRef(ctx context.Context, ref *v1beta1.ModelRef) (resolvedModel, error) {
+	logf.FromContext(ctx).V(1).Info("InferenceService references a FineTunedWeight directly", "ftwName", ref.Name)
+	weight, err := c.getFineTunedWeightSpec(ctx, ref.Name)
+	if err != nil {
+		return resolvedModel{}, fmt.Errorf("failed to get referenced fine tuned weight spec for %s: %w", ref.Name, err)
+	}
+	if weight.BaseModelRef.Name == nil || *weight.BaseModelRef.Name == "" {
+		return resolvedModel{}, fmt.Errorf("FineTunedWeight %s has no BaseModelRef.Name specified", ref.Name)
+	}
+	baseName := *weight.BaseModelRef.Name
+	baseRef := &v1beta1.ModelRef{Name: baseName, Kind: ptr.To(constants.ClusterBaseModel)}
+	baseNamespace := ""
+	if weight.BaseModelRef.Namespace != nil && *weight.BaseModelRef.Namespace != "" {
+		baseRef.Kind = ptr.To(constants.BaseModel)
+		baseNamespace = *weight.BaseModelRef.Namespace
+	}
+	base, err := c.getBaseModelSpec(ctx, baseRef, baseNamespace)
+	if err != nil {
+		return resolvedModel{}, fmt.Errorf("failed to get base model spec for %s (referenced by FTW %s): %w", baseName, ref.Name, err)
+	}
+	return resolvedModel{name: baseName, base: base, weight: weight}, nil
+}
+
+// resolveBaseModelRef resolves a reference to a BaseModel or ClusterBaseModel,
+// with the first fine-tuned weight listed under it when there is one.
+func (c *ConfigMapReconciler) resolveBaseModelRef(ctx context.Context, ref *v1beta1.ModelRef, isvcNamespace string) (resolvedModel, error) {
+	log := logf.FromContext(ctx)
+	log.V(1).Info("InferenceService references a BaseModel/ClusterBaseModel directly", "modelName", ref.Name, "kind", modelRefKind(ref))
+	base, err := c.getBaseModelSpec(ctx, ref, isvcNamespace)
+	if err != nil {
+		return resolvedModel{}, fmt.Errorf("failed to get base model spec for %s: %w", ref.Name, err)
+	}
+	model := resolvedModel{name: ref.Name, base: base}
+	if len(ref.FineTunedWeights) == 0 || ref.FineTunedWeights[0] == "" {
+		return model, nil
+	}
+	weightName := ref.FineTunedWeights[0]
+	log.V(1).Info("Processing FineTunedWeight specified in ModelRef.FineTunedWeights", "ftwName", weightName)
+	model.weight, err = c.getFineTunedWeightSpec(ctx, weightName)
+	if err != nil {
+		return resolvedModel{}, fmt.Errorf("failed to get fine tuned weight spec %s (listed in ModelRef.FineTunedWeights): %w", weightName, err)
+	}
+	return model, nil
+}
+
+// modelRefKind is the reference's Kind, empty when unset.
+func modelRefKind(ref *v1beta1.ModelRef) string {
+	if ref.Kind == nil {
+		return ""
+	}
+	return *ref.Kind
+}
+
+// getBaseModelSpec reads the base model a reference names: a BaseModel in the
+// given namespace when the Kind says so, else a ClusterBaseModel.
 func (c *ConfigMapReconciler) getBaseModelSpec(ctx context.Context, modelRef *v1beta1.ModelRef, isvcNamespace string) (*v1beta1.BaseModelSpec, error) {
 	log := logf.FromContext(ctx)
-	modelKind := "ClusterBaseModel" // Default
-	if modelRef.Kind != nil && *modelRef.Kind != "" {
-		modelKind = *modelRef.Kind
-	}
-
-	namespacedName := types.NamespacedName{Name: modelRef.Name}
-	if modelKind == "BaseModel" {
-		namespacedName.Namespace = isvcNamespace
+	if modelRefKind(modelRef) == constants.BaseModel {
 		baseModel := &v1beta1.BaseModel{}
-		if err := c.client.Get(ctx, namespacedName, baseModel); err != nil {
+		if err := c.client.Get(ctx, types.NamespacedName{Name: modelRef.Name, Namespace: isvcNamespace}, baseModel); err != nil {
 			log.Error(err, "Failed to get referenced BaseModel", "name", modelRef.Name, "namespace", isvcNamespace)
 			return nil, err
 		}
 		return &baseModel.Spec, nil
-	} else {
-		clusterBaseModel := &v1beta1.ClusterBaseModel{}
-		if err := c.client.Get(ctx, namespacedName, clusterBaseModel); err != nil {
-			log.Error(err, "Failed to get referenced ClusterBaseModel", "name", modelRef.Name)
-			return nil, err
-		}
-		return &clusterBaseModel.Spec, nil
 	}
+	clusterBaseModel := &v1beta1.ClusterBaseModel{}
+	if err := c.client.Get(ctx, types.NamespacedName{Name: modelRef.Name}, clusterBaseModel); err != nil {
+		log.Error(err, "Failed to get referenced ClusterBaseModel", "name", modelRef.Name)
+		return nil, err
+	}
+	return &clusterBaseModel.Spec, nil
 }
 
-func (c *ConfigMapReconciler) getFineTunedWeightSpec(ctx context.Context, ftwName string, namespace string) (*v1beta1.FineTunedWeightSpec, error) {
-	log := logf.FromContext(ctx)
+// getFineTunedWeightSpec reads a FineTunedWeight, which is cluster-scoped.
+func (c *ConfigMapReconciler) getFineTunedWeightSpec(ctx context.Context, name string) (*v1beta1.FineTunedWeightSpec, error) {
 	ftw := &v1beta1.FineTunedWeight{}
-	// FineTunedWeight is cluster-scoped, so we only use the Name (no namespace)
-	namespacedName := types.NamespacedName{Name: ftwName}
-	if err := c.client.Get(ctx, namespacedName, ftw); err != nil {
-		log.Error(err, "Failed to get FineTunedWeight", "name", ftwName)
+	if err := c.client.Get(ctx, types.NamespacedName{Name: name}, ftw); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to get FineTunedWeight", "name", name)
 		return nil, err
 	}
 	return &ftw.Spec, nil
+}
+
+// entryFrom is the ConfigMap entry for a resolved model.
+func entryFrom(model resolvedModel) ModelConfigEntry {
+	entry := ModelConfigEntry{ModelName: model.name}
+	populateBaseModelDetails(&entry.ModelSpec, model.base)
+	if model.weight != nil {
+		entry.FineTunedWeightSpec = &ModelSpecInfo{}
+		populateFineTunedWeightDetails(entry.FineTunedWeightSpec, model.weight)
+	}
+	return entry
 }
 
 func populateStorageFields(target *ModelSpecInfo, sourceStorage *v1beta1.StorageSpec) {
@@ -241,97 +312,4 @@ func populateBaseModelDetails(target *ModelSpecInfo, bmSpec *v1beta1.BaseModelSp
 func populateFineTunedWeightDetails(target *ModelSpecInfo, ftwSpec *v1beta1.FineTunedWeightSpec) {
 	populateStorageFields(target, ftwSpec.Storage)
 	target.ModelType = ftwSpec.ModelType
-}
-
-func (c *ConfigMapReconciler) generateModelConfigEntry(ctx context.Context, isvc *v1beta1.InferenceService) (*ModelConfigEntry, error) {
-	log := logf.FromContext(ctx)
-	isvcModelRef := isvc.Spec.Model // This is the ModelRef from the InferenceService Spec
-
-	entry := &ModelConfigEntry{}
-	var baseModelSpecToUse *v1beta1.BaseModelSpec
-	var err error
-
-	// Determine the kind of the primary model reference in the InferenceService Spec
-	primaryModelKind := "" // Default to empty, getBaseModelSpec might default to ClusterBaseModel
-	if isvcModelRef.Kind != nil && *isvcModelRef.Kind != "" {
-		primaryModelKind = *isvcModelRef.Kind
-	}
-
-	if primaryModelKind == "FineTunedWeight" {
-		// Case 1: InferenceService directly references a FineTunedWeight
-		log.V(1).Info("InferenceService references a FineTunedWeight directly", "ftwName", isvcModelRef.Name)
-
-		// 1a. Fetch the FineTunedWeight resource itself.
-		// Note: isvc.Namespace is passed but getFineTunedWeightSpec ignores it as FTW is cluster-scoped.
-		ftwSpec, errFtw := c.getFineTunedWeightSpec(ctx, isvcModelRef.Name, isvc.Namespace)
-		if errFtw != nil {
-			return nil, fmt.Errorf("failed to get referenced fine tuned weight spec for %s: %w", isvcModelRef.Name, errFtw)
-		}
-
-		// 1b. Get the BaseModelRef from ftwSpec.BaseModelRef. This points to the actual base model.
-		if ftwSpec.BaseModelRef.Name == nil || *ftwSpec.BaseModelRef.Name == "" {
-			return nil, fmt.Errorf("FineTunedWeight %s has no BaseModelRef.Name specified", isvcModelRef.Name)
-		}
-
-		actualBaseModelName := *ftwSpec.BaseModelRef.Name
-		entry.ModelName = actualBaseModelName // ModelName in ConfigMap is the name of the actual base model
-
-		// 1c. Construct a ModelRef to fetch this actual base model.
-		refToActualBase := &v1beta1.ModelRef{Name: actualBaseModelName}
-		namespaceForActualBaseLookup := isvc.Namespace // Default to ISVC namespace for base model lookup context
-
-		if ftwSpec.BaseModelRef.Namespace != nil && *ftwSpec.BaseModelRef.Namespace != "" {
-			// If BaseModelRef in FTW specifies a namespace, it's a namespaced BaseModel in that specific namespace.
-			refToActualBase.Kind = func(s string) *string { return &s }("BaseModel")
-			namespaceForActualBaseLookup = *ftwSpec.BaseModelRef.Namespace
-		} else {
-			// If BaseModelRef in FTW does not specify a namespace, it implies a ClusterBaseModel.
-			refToActualBase.Kind = func(s string) *string { return &s }("ClusterBaseModel")
-			// For ClusterBaseModel, the namespaceForActualBaseLookup will be effectively ignored by getBaseModelSpec.
-		}
-
-		// 1d. Fetch the spec of the actual base model.
-		baseModelSpecToUse, err = c.getBaseModelSpec(ctx, refToActualBase, namespaceForActualBaseLookup)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get base model spec for %s (referenced by FTW %s): %w", actualBaseModelName, isvcModelRef.Name, err)
-		}
-
-		// 1e. Populate the FineTunedWeightSpec part of the entry using the initially fetched ftwSpec.
-		entry.FineTunedWeightSpec = &ModelSpecInfo{}
-		populateFineTunedWeightDetails(entry.FineTunedWeightSpec, ftwSpec)
-
-	} else {
-		// Case 2: InferenceService references a BaseModel or ClusterBaseModel directly (or Kind is empty/nil)
-		log.V(1).Info("InferenceService references a BaseModel/ClusterBaseModel directly", "modelName", isvcModelRef.Name, "kind", primaryModelKind)
-		entry.ModelName = isvcModelRef.Name // ModelName in ConfigMap is the name of this directly referenced model
-
-		baseModelSpecToUse, err = c.getBaseModelSpec(ctx, isvcModelRef, isvc.Namespace)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get base model spec for %s: %w", isvcModelRef.Name, err)
-		}
-
-		// 2a. Handle any FineTunedWeights listed in isvcModelRef.FineTunedWeights array.
-		// This applies if the primary reference is a BaseModel/ClusterBaseModel that itself uses a FTW.
-		if len(isvcModelRef.FineTunedWeights) > 0 && isvcModelRef.FineTunedWeights[0] != "" {
-			ftwNameFromArray := isvcModelRef.FineTunedWeights[0]
-			log.V(1).Info("Processing FineTunedWeight specified in ModelRef.FineTunedWeights", "ftwName", ftwNameFromArray)
-
-			// Note: isvc.Namespace is passed but getFineTunedWeightSpec ignores it as FTW is cluster-scoped.
-			ftwSpecFromArray, errFtwArray := c.getFineTunedWeightSpec(ctx, ftwNameFromArray, isvc.Namespace)
-			if errFtwArray != nil {
-				return nil, fmt.Errorf("failed to get fine tuned weight spec %s (listed in ModelRef.FineTunedWeights): %w", ftwNameFromArray, errFtwArray)
-			}
-			entry.FineTunedWeightSpec = &ModelSpecInfo{}
-			populateFineTunedWeightDetails(entry.FineTunedWeightSpec, ftwSpecFromArray)
-		}
-	}
-
-	// Common step: Populate ModelSpec part of the entry using the determined baseModelSpecToUse.
-	if baseModelSpecToUse == nil {
-		// This should ideally not happen if errors are handled above, but as a safeguard:
-		return nil, fmt.Errorf("baseModelSpecToUse is nil for model %s, cannot populate ModelSpecInfo", entry.ModelName)
-	}
-	populateBaseModelDetails(&entry.ModelSpec, baseModelSpecToUse)
-
-	return entry, nil
 }

@@ -42,9 +42,10 @@ import (
 )
 
 // writeStatus runs aggregateAndWriteStatus for tests that only care about the
-// write outcome, discarding the availability wake.
+// write outcome, discarding the availability wake. ir is the replica as the
+// pass began, so its rows are the Instances the pass started with.
 func writeStatus(r *Reconciler, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workloadtypes.RolloutHold) error {
-	_, err := r.aggregateAndWriteStatus(context.Background(), ir, plan, target, holdObserved, hold)
+	_, err := r.aggregateAndWriteStatus(context.Background(), ir, plan, target, holdObserved, hold, instanceIndices(ir.Status.InstanceStatuses))
 	return err
 }
 
@@ -1147,7 +1148,7 @@ func TestAggregateAndWriteStatus_SameNameReplacementIsUntouched(t *testing.T) {
 	g.Expect(got.Status).To(gomega.Equal(*wantStatus))
 }
 
-// TestAggregateAndWriteStatus_GenerationChangeAborts pins the publication's
+// TestAggregateAndWriteStatus_GenerationChangeAborts locks in the publication's
 // precondition: a spec that changed in something the pass read (here the
 // replica count) since the pass planned refuses the write.
 func TestAggregateAndWriteStatus_GenerationChangeAborts(t *testing.T) {
@@ -1192,7 +1193,7 @@ func TestAggregateAndWriteStatus_GenerationChangeAborts(t *testing.T) {
 	g.Expect(got.Status).To(gomega.Equal(*wantStatus))
 }
 
-// TestAggregateAndWriteStatus_ExcludedAnnotationValueChangeLands pins the
+// TestAggregateAndWriteStatus_ExcludedAnnotationValueChangeLands locks in the
 // other side of the precondition: a generation that moved for the value of
 // an annotation the revision leaves out changed nothing the pass read, so
 // the publication lands and names the live generation.
@@ -1806,6 +1807,90 @@ func TestAggregateStatus_DeadlineFuture_NoEscalation(t *testing.T) {
 			"Operation.Deadline in the future must NOT escalate (backstop respects the timeout window)")
 }
 
+// TestComputeRolloutStalledCondition_ReadyInstanceNotReached_NotStalled: an
+// Instance that recovered from a failure days ago still carries that
+// LastFailure. While the roll has not reached it (Ready on its own revision,
+// no operation, no target), it is not failing the roll.
+func TestComputeRolloutStalledCondition_ReadyInstanceNotReached_NotStalled(t *testing.T) {
+	const target = "isvc-engine-5af56222"
+	const cur = "isvc-engine-0f41b090"
+	s := &v1beta1.InferenceReplicaStatus{Replicas: 2, CurrentRevision: cur, UpdateRevision: target}
+	s.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceUpdating, RunningRevision: cur, TargetRevision: target,
+			Operation: &v1beta1.InstanceOperation{TargetRevision: target, StartedAt: metav1.Now()}},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: cur,
+			LastFailure: &v1beta1.InstanceTermination{Reason: "Error", Time: metav1.NewTime(time.Now().Add(-120 * time.Hour))}},
+	}
+	if c := computeRolloutStalledCondition(s); c.Status != metav1.ConditionFalse || c.Reason != ReasonRolloutProgressing {
+		t.Errorf("Ready Instance the roll has not reached: got %s/%s want False/%s", c.Status, c.Reason, ReasonRolloutProgressing)
+	}
+}
+
+// TestComputeRolloutStalledCondition_FailedInstanceWithoutTarget_Stalled: an
+// Instance whose attempt failed, leaving it Failed with no target, still
+// stalls the roll; only a serving Instance the roll has not reached is
+// exempt.
+func TestComputeRolloutStalledCondition_FailedInstanceWithoutTarget_Stalled(t *testing.T) {
+	const target = "isvc-engine-5af56222"
+	const cur = "isvc-engine-0f41b090"
+	s := &v1beta1.InferenceReplicaStatus{Replicas: 1, CurrentRevision: cur, UpdateRevision: target}
+	s.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceFailed, RunningRevision: cur,
+			LastFailure: &v1beta1.InstanceTermination{Reason: "Error", Time: metav1.Now()}},
+	}
+	if c := computeRolloutStalledCondition(s); c.Status != metav1.ConditionTrue || c.Reason != ReasonInstancesFailing {
+		t.Errorf("Failed Instance without a target: got %s/%s want True/%s", c.Status, c.Reason, ReasonInstancesFailing)
+	}
+}
+
+// heldRetryStatus is a roll whose Instance 0 retries in the pass that ended
+// its last attempt with a scheduler refusal: the refusal's time equals the
+// new attempt's start, and the new attempt waits on the given hold.
+func heldRetryStatus(waiting string) *v1beta1.InferenceReplicaStatus {
+	const target = "isvc-decoder-16351b27"
+	const cur = "isvc-decoder-15ae4ac5"
+	at := metav1.NewTime(time.Now().Truncate(time.Second))
+	s := &v1beta1.InferenceReplicaStatus{Replicas: 2, CurrentRevision: cur, UpdateRevision: target}
+	s.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceUpdating, RunningRevision: cur, TargetRevision: target,
+			LastFailure: &v1beta1.InstanceTermination{Reason: workloadtypes.WaitingReasonUnschedulable, Time: at},
+			Operation: &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate, TargetRevision: target,
+				StartedAt: at, Waiting: waiting}},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: cur},
+	}
+	return s
+}
+
+// TestComputeRolloutStalledCondition_RetryHeldBySameRefusal_Stalled: a retry
+// the scheduler still refuses repeats the failure that ended the last
+// attempt, even when that failure's time equals this attempt's start.
+func TestComputeRolloutStalledCondition_RetryHeldBySameRefusal_Stalled(t *testing.T) {
+	s := heldRetryStatus(workloadtypes.WaitingReasonUnschedulable)
+	if c := computeRolloutStalledCondition(s); c.Status != metav1.ConditionTrue || c.Reason != ReasonInstancesFailing {
+		t.Errorf("retry held by the same refusal: got %s/%s want True/%s", c.Status, c.Reason, ReasonInstancesFailing)
+	}
+}
+
+// TestComputeRolloutStalledCondition_RetryPastTheHold_NotStalled: once the
+// retry's pods are placed it waits on nothing, so the last attempt's
+// refusal no longer counts against the roll.
+func TestComputeRolloutStalledCondition_RetryPastTheHold_NotStalled(t *testing.T) {
+	s := heldRetryStatus("")
+	if c := computeRolloutStalledCondition(s); c.Status != metav1.ConditionFalse || c.Reason != ReasonRolloutProgressing {
+		t.Errorf("retry past the hold: got %s/%s want False/%s", c.Status, c.Reason, ReasonRolloutProgressing)
+	}
+}
+
+// TestComputeRolloutStalledCondition_RetryHeldByOtherCondition_NotStalled: a
+// retry waiting on a different hold than the one that failed the last
+// attempt is not repeating that failure.
+func TestComputeRolloutStalledCondition_RetryHeldByOtherCondition_NotStalled(t *testing.T) {
+	s := heldRetryStatus(workloadtypes.WaitingReasonCapacityProvisioning)
+	if c := computeRolloutStalledCondition(s); c.Status != metav1.ConditionFalse || c.Reason != ReasonRolloutProgressing {
+		t.Errorf("retry held by another condition: got %s/%s want False/%s", c.Status, c.Reason, ReasonRolloutProgressing)
+	}
+}
+
 // TestComputeRolloutStalledCondition pins the advisory RolloutStalled
 // condition: True only when a rollout is in flight AND an Instance carries a
 // terminal failure while not yet on the target; and it is a DISTINCT condition
@@ -2048,7 +2133,7 @@ func TestEffectiveRolloutHold(t *testing.T) {
 
 	// No rollout in flight: nothing to hold, even with an exec verdict.
 	noRollout := &v1beta1.InferenceReplicaStatus{}
-	if h := effectiveRolloutHold(true, &workloadtypes.RolloutHold{Gate: workloadtypes.RolloutHoldGateBudget, Reason: "x", Target: "y"}, noRollout, now); h != nil {
+	if h := effectiveRolloutHold(true, &workloadtypes.RolloutHold{Gate: workloadtypes.RolloutHoldGateBudget, Reason: "x", Target: "y"}, noRollout, false, now); h != nil {
 		t.Errorf("no UpdateRevision must clear regardless of exec verdict: got %+v", h)
 	}
 
@@ -2057,25 +2142,25 @@ func TestEffectiveRolloutHold(t *testing.T) {
 	// roll completed as much as the nil a roll with nothing left reports.
 	converged := &v1beta1.InferenceReplicaStatus{CurrentRevision: "rev-a", UpdateRevision: "rev-a"}
 	crashedAfterTheRoll := &workloadtypes.RolloutHold{Gate: workloadtypes.RolloutHoldGateRetryBlock, Reason: "update to rev-a retrying one attempt at a time after 1 failed attempt(s): Error; Instance 0 on revision rev-a not serving", Target: "rev-a"}
-	if h := effectiveRolloutHold(true, crashedAfterTheRoll, converged, now); h == nil || h.Gate != v1beta1.RolloutHoldGateRetryBlock || h.Reason != crashedAfterTheRoll.Reason || h.Target != "rev-a" {
+	if h := effectiveRolloutHold(true, crashedAfterTheRoll, converged, false, now); h == nil || h.Gate != v1beta1.RolloutHoldGateRetryBlock || h.Reason != crashedAfterTheRoll.Reason || h.Target != "rev-a" {
 		t.Errorf("a converged subject must surface the observed hold its promoted sets stand behind: got %+v", h)
 	}
-	if h := effectiveRolloutHold(true, nil, converged, now); h != nil {
+	if h := effectiveRolloutHold(true, nil, converged, false, now); h != nil {
 		t.Errorf("a converged subject whose Update pass reported nothing to hold must clear: got %+v", h)
 	}
 	// Converged with no verdict this pass: the persisted hold stands, and a
 	// same-target block the ladder still holds stands ahead of it.
 	converged.RolloutHold = &v1beta1.RolloutHold{Gate: v1beta1.RolloutHoldGateBudget, Reason: "per-Component unavailability budget 1 exhausted; Instance 0 on revision rev-a not serving", Target: "rev-a", Since: metav1.NewTime(now.Add(-time.Minute))}
-	if h := effectiveRolloutHold(false, nil, converged, now); h == nil || h.Gate != v1beta1.RolloutHoldGateBudget || !h.Since.Equal(&converged.RolloutHold.Since) {
+	if h := effectiveRolloutHold(false, nil, converged, false, now); h == nil || h.Gate != v1beta1.RolloutHoldGateBudget || !h.Since.Equal(&converged.RolloutHold.Since) {
 		t.Errorf("a converged subject with no verdict this pass must keep the persisted hold as written: got %+v", h)
 	}
 	// The pass that finds nothing to update reports a nil verdict, and the
 	// nil verdict outranks the persisted budget hold.
-	if h := effectiveRolloutHold(true, nil, converged, now); h != nil {
+	if h := effectiveRolloutHold(true, nil, converged, false, now); h != nil {
 		t.Errorf("a converged subject whose Update pass found nothing to update must clear the persisted hold: got %+v", h)
 	}
 	converged.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: "rev-a", State: v1beta1.RetryBlockHeld, AttemptsStarted: 3, Reason: "Error"}}
-	if h := effectiveRolloutHold(false, nil, converged, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
+	if h := effectiveRolloutHold(false, nil, converged, false, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
 		t.Errorf("a converged subject whose ladder holds the revision must report the Held block when the Update pass did not run: got %+v", h)
 	}
 
@@ -2083,7 +2168,7 @@ func TestEffectiveRolloutHold(t *testing.T) {
 
 	// Update pass ran and found nothing to hold (forward progress) ->
 	// clear even though the rollout is still in flight.
-	if h := effectiveRolloutHold(true, nil, inFlight, now); h != nil {
+	if h := effectiveRolloutHold(true, nil, inFlight, false, now); h != nil {
 		t.Errorf("Update pass ran with a nil verdict must clear: got %+v", h)
 	}
 
@@ -2091,7 +2176,7 @@ func TestEffectiveRolloutHold(t *testing.T) {
 	// converted to the v1beta1 shape.
 	h := effectiveRolloutHold(true, &workloadtypes.RolloutHold{
 		Gate: workloadtypes.RolloutHoldGateSequential, Reason: "Sequential waiting on decoder", Target: "rev-b",
-	}, inFlight, now)
+	}, inFlight, false, now)
 	if h == nil || h.Gate != v1beta1.RolloutHoldGateSequential || h.Reason != "Sequential waiting on decoder" || h.Target != "rev-b" {
 		t.Errorf("an observed exec denial must be surfaced verbatim: got %+v", h)
 	}
@@ -2101,7 +2186,7 @@ func TestEffectiveRolloutHold(t *testing.T) {
 	inFlight.RetryBlocks = []v1beta1.RetryBlock{
 		{TargetRevision: "rev-b", State: v1beta1.RetryBlockHeld, AttemptsStarted: 2, Reason: "ImagePullBackOff"},
 	}
-	if h := effectiveRolloutHold(false, nil, inFlight, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
+	if h := effectiveRolloutHold(false, nil, inFlight, false, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
 		t.Errorf("Update pass not run must fall back to the persisted RetryBlock/Held state: got %+v", h)
 	}
 
@@ -2115,7 +2200,7 @@ func TestEffectiveRolloutHold(t *testing.T) {
 			Since: metav1.NewTime(now.Add(-time.Minute)),
 		},
 	}
-	if h := effectiveRolloutHold(false, nil, persisted, now); h == nil || h.Gate != v1beta1.RolloutHoldGateBudget || h.Reason != persisted.RolloutHold.Reason || !h.Since.Equal(&persisted.RolloutHold.Since) {
+	if h := effectiveRolloutHold(false, nil, persisted, false, now); h == nil || h.Gate != v1beta1.RolloutHoldGateBudget || h.Reason != persisted.RolloutHold.Reason || !h.Since.Equal(&persisted.RolloutHold.Since) {
 		t.Errorf("Update pass not run must keep the persisted hold as written: got %+v", h)
 	}
 
@@ -2125,8 +2210,56 @@ func TestEffectiveRolloutHold(t *testing.T) {
 	persisted.RetryBlocks = []v1beta1.RetryBlock{
 		{TargetRevision: "rev-b", State: v1beta1.RetryBlockHeld, AttemptsStarted: 2, Reason: "ImagePullBackOff"},
 	}
-	if h := effectiveRolloutHold(false, nil, persisted, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
+	if h := effectiveRolloutHold(false, nil, persisted, false, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld {
 		t.Errorf("a same-target Held block must stand ahead of the persisted hold when the Update pass did not run: got %+v", h)
+	}
+}
+
+// TestEffectiveRolloutHold_APassThatRemovedAnInstanceCarriesNoRecordedHold
+// checks the one case in which a pass with no answer from the update
+// position does not keep the persisted hold: it removed an Instance. The hold an earlier pass recorded
+// describes the Instances that pass saw, so the write that removes one of
+// them carries no hold it did not observe; a same-target retry record, read
+// off live status, is the hold that stands either way; and a pass that
+// removed nothing keeps the persisted hold as written.
+func TestEffectiveRolloutHold_APassThatRemovedAnInstanceCarriesNoRecordedHold(t *testing.T) {
+	now := time.Unix(9000, 0)
+	recorded := &v1beta1.RolloutHold{
+		Gate: v1beta1.RolloutHoldGateBudget, Target: "rev-a",
+		Reason: "per-Component surge budget 1 exhausted; Instance 0 on revision rev-a not serving",
+		Since:  metav1.NewTime(now.Add(-time.Minute)),
+	}
+	status := &v1beta1.InferenceReplicaStatus{
+		CurrentRevision: "rev-a", UpdateRevision: "rev-a",
+		InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "rev-a"},
+		},
+		RolloutHold: recorded.DeepCopy(),
+	}
+
+	if h := effectiveRolloutHold(false, nil, status, true, now); h != nil {
+		t.Errorf("a pass that removed an Instance and reported no answer must carry no recorded hold: got %+v", h)
+	}
+	if h := effectiveRolloutHold(false, nil, status, false, now); h == nil || h.Reason != recorded.Reason || !h.Since.Equal(&recorded.Since) {
+		t.Errorf("a pass that removed nothing and reported no answer must keep the persisted hold as written: got %+v", h)
+	}
+
+	// An answer this pass reported is written as reported, removal or not.
+	observed := &workloadtypes.RolloutHold{Gate: workloadtypes.RolloutHoldGateBudget, Reason: "per-Component surge budget 1 exhausted (would become 2)", Target: "rev-a"}
+	if h := effectiveRolloutHold(true, observed, status, true, now); h == nil || h.Reason != observed.Reason {
+		t.Errorf("an observed answer must be written as reported: got %+v", h)
+	}
+	if h := effectiveRolloutHold(true, nil, status, true, now); h != nil {
+		t.Errorf("an observed nil answer must clear: got %+v", h)
+	}
+
+	// The retry record is live state: it is the hold that stands after a
+	// removal, worded over the rows that remain, so it names no Instance
+	// that is gone.
+	status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: "rev-a", State: v1beta1.RetryBlockHeld, AttemptsStarted: 3, Reason: "Error"}}
+	want := "update to rev-a held after 3 failed attempt(s): Error"
+	if h := effectiveRolloutHold(false, nil, status, true, now); h == nil || h.Gate != v1beta1.RolloutHoldGateHeld || h.Reason != want {
+		t.Errorf("a same-target Held record must be the hold that stands after a removal, read off the live rows:\n got %+v\nwant reason %q", h, want)
 	}
 }
 
@@ -2447,6 +2580,73 @@ func TestAggregateAndWriteStatus_RolloutHold_StandsAcrossAPassWithoutTheUpdatePa
 	cleared := &v1beta1.InferenceReplica{}
 	g.Expect(c.Get(context.Background(), key, cleared)).To(gomega.Succeed())
 	g.Expect(cleared.Status.RolloutHold).To(gomega.BeNil(), "progress observed by the Update pass must clear the hold")
+}
+
+// TestAggregateAndWriteStatus_RolloutHold_TheWriteThatRemovesAnInstanceCarriesNoRecordedHold
+// checks the hold across a scale-down. Four Instances serve one revision and
+// Instance 0's pod set crashes after it was promoted, so the roll's hold
+// reads "per-Component surge budget 1 exhausted; Instance 0 on revision
+// <rev> not serving". The operator asks for one Instance. The scale wave
+// removes Instance 0's row in a pass that ends at the scale-down step, before
+// the update position, so the pass reports no answer. The write that removes
+// the row must not carry the hold: a hold an earlier pass recorded
+// describes the Instances that pass saw, and Instance 0 has no row and no
+// pod from this write on.
+func TestAggregateAndWriteStatus_RolloutHold_TheWriteThatRemovesAnInstanceCarriesNoRecordedHold(t *testing.T) {
+	g := gomega.NewWithT(t)
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "rev-target"}}
+	recorded := &v1beta1.RolloutHold{
+		Gate:   v1beta1.RolloutHoldGateBudget,
+		Reason: "per-Component surge budget 1 exhausted; Instance 0 on revision rev-target not serving",
+		Target: target.Name,
+		Since:  metav1.NewTime(time.Now().Add(-time.Minute).Truncate(time.Second)),
+	}
+
+	// The replica as the pass began: the spec asks for one Instance,
+	// Instance 0 is leaving under the wave and Instance 1 serves.
+	atStart := baselineIR("llama-engine", "prod", 1)
+	atStart.Status.CurrentRevision = target.Name
+	atStart.Status.UpdateRevision = target.Name
+	atStart.Status.RolloutHold = recorded.DeepCopy()
+	atStart.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 3, Phase: v1beta1.OMENativeInstanceDeleting, RunningRevision: target.Name,
+			Operation: &v1beta1.InstanceOperation{ID: "delete-0", Type: v1beta1.InstanceOperationDelete, Step: "Drain"}},
+		{Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: target.Name},
+	}
+	// The live object after the wave's write: Instance 0's row is gone and
+	// its pod with it; Instance 1's pod serves.
+	live := atStart.DeepCopy()
+	live.Status.InstanceStatuses = live.Status.InstanceStatuses[1:]
+	pod1 := podForIR(live, 1, "default", 0, true, true)
+	slice1 := sliceForIRPod(live, pod1, true)
+	r, c := newReconciler(t, live, pod1, slice1)
+
+	plan := workloadtypes.ComponentPlan{
+		Component: v1beta1convert.ComponentTypeToWorkload(live.Spec.Component),
+		Replicas:  1,
+		Instances: []workloadtypes.InstancePlan{
+			{Index: 1, Incarnation: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
+		},
+	}
+	key := client.ObjectKeyFromObject(live)
+
+	g.Expect(writeStatus(r, atStart, plan, target, false, nil)).To(gomega.Succeed())
+	written := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), key, written)).To(gomega.Succeed())
+	g.Expect(written.Status.InstanceStatuses).To(gomega.HaveLen(1))
+	g.Expect(written.Status.InstanceStatuses[0].Index).To(gomega.Equal(int32(1)))
+	g.Expect(written.Status.RolloutHold).To(gomega.BeNil(),
+		"the write that removes Instance 0 must not carry the hold that names it")
+	g.Expect(atStart.Status.RolloutHold).To(gomega.BeNil(), "the in-memory replica must read the same write")
+
+	// The next pass reaches the update position and finds nothing to hold:
+	// the hold stays clear and nothing is written.
+	rv := written.ResourceVersion
+	g.Expect(writeStatus(r, written.DeepCopy(), plan, target, true, nil)).To(gomega.Succeed())
+	settled := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), key, settled)).To(gomega.Succeed())
+	g.Expect(settled.Status.RolloutHold).To(gomega.BeNil())
+	g.Expect(settled.ResourceVersion).To(gomega.Equal(rv), "a pass that changes nothing must perform ZERO writes")
 }
 
 // TestAggregateStatus_PreservesMigrations pins the status aggregator

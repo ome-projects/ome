@@ -195,7 +195,7 @@ func (r *Reconciler) singleProposal(ctx context.Context, source *v1beta1.Inferen
 		Labels, Annotations map[string]string
 		Targets             map[string]types.UID
 		Winner              string
-	}{source.Spec, source.Labels, source.Annotations, targets, winner})
+	}{source.Spec, source.Labels, planIntentAnnotations(source.Annotations), targets, winner})
 	if err != nil {
 		return out, err
 	}

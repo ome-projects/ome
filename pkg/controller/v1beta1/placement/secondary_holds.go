@@ -77,13 +77,13 @@ func splitSecondaryHolds(source *v1beta1.InferenceService, observations map[stri
 		if assignment == nil || assignment.CurrentHome != nil || assignment.CurrentReplicas <= 0 || assignment.DrainRequested {
 			continue
 		}
-		floors, err := splitMemberFloors(source, candidates, candidate)
+		observed := observations[candidate.Cluster]
+		applied := memberFloors(observed.Member)
+		floors, _, err := minimums.memberShares(source, candidates, candidate, applied)
 		if err != nil {
 			return nil, err
 		}
 		next := floorMap(floors)
-		observed := observations[candidate.Cluster]
-		applied := memberFloors(observed.Member)
 		for component := range secondaries {
 			if members[component] == nil {
 				members[component] = map[string]secondaryMember{}

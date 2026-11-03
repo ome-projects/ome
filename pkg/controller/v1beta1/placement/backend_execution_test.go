@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func (f *backendFixture) runtimeMode(t *testing.T, name string, mode constants.DeploymentModeType) {
@@ -145,7 +146,7 @@ func TestBackendWriteRevalidatesInputs(t *testing.T) {
 					}
 					if tt.race {
 						changed := false
-						cl := interceptor.NewClient(worker, interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						cl := fakeclient.Wrap(t, worker, fakeclient.WithInterceptors(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 							if err := c.Get(ctx, key, obj, opts...); err != nil {
 								return err
 							}
@@ -154,7 +155,7 @@ func TestBackendWriteRevalidatesInputs(t *testing.T) {
 								tt.edit(t, f)
 							}
 							return nil
-						}})
+						}}))
 						f.connections.m["member-a"] = workloadcluster.NewNeverCachingClient(cl)
 					} else {
 						tt.edit(t, f)
@@ -319,15 +320,9 @@ func TestBackendHoldUsesCommittedWinner(t *testing.T) {
 	other := emptyWorker(scheme)
 	connections := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"a": workloadcluster.NewNeverCachingClient(winner), "b": workloadcluster.NewNeverCachingClient(other)}}
 	r, root := newPlacer(scheme, connections, source, readyWC("a", nil), readyWC("b", nil))
-	r.Client = interceptor.NewClient(root.(client.WithWatch), interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-		if err := cl.Get(ctx, key, obj, opts...); err != nil {
-			return err
-		}
-		if service, ok := obj.(*v1beta1.InferenceService); ok {
-			service.Status.Placement = nil
-		}
-		return nil
-	}})
+	r.Client = fakeclient.Wrap(t, root.(client.WithWatch), fakeclient.EditedRead(func(service *v1beta1.InferenceService) {
+		service.Status.Placement = nil
+	}))
 	if _, err := r.Reconcile(t.Context(), req()); err != nil {
 		t.Fatal(err)
 	}

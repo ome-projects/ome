@@ -181,16 +181,6 @@ func TestSelectBestFit_Integration(t *testing.T) {
 				mockFetcher.addAccelerator(name, spec)
 			}
 
-			// Create selector
-			config := &Config{
-				Client:                nil,
-				EnableDetailedLogging: false,
-			}
-			selector := &defaultSelector{
-				config:  config,
-				fetcher: mockFetcher,
-			}
-
 			ctx := context.Background()
 
 			// Fetch candidates
@@ -207,7 +197,7 @@ func TestSelectBestFit_Integration(t *testing.T) {
 			}
 
 			// Select best fit
-			selected := selector.selectBestFit(ctx, validCandidates, tt.constraints)
+			selected := selectBestFit(ctx, validCandidates, tt.constraints)
 
 			if selected == nil {
 				t.Errorf("%s: selectBestFit() returned nil", tt.description)
@@ -265,16 +255,6 @@ func TestSelectCheapest_Integration(t *testing.T) {
 				mockFetcher.addAccelerator(name, spec)
 			}
 
-			// Create selector
-			config := &Config{
-				Client:                nil,
-				EnableDetailedLogging: false,
-			}
-			selector := &defaultSelector{
-				config:  config,
-				fetcher: mockFetcher,
-			}
-
 			ctx := context.Background()
 
 			// Fetch candidates
@@ -291,7 +271,7 @@ func TestSelectCheapest_Integration(t *testing.T) {
 			}
 
 			// Select cheapest
-			selected := selector.selectCheapest(ctx, validCandidates)
+			selected := selectCheapest(ctx, validCandidates)
 
 			if selected == nil {
 				t.Errorf("%s: selectCheapest() returned nil", tt.description)
@@ -422,13 +402,9 @@ func TestSelectCheapest_CostTypeGrouping(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			selector := &defaultSelector{
-				config:  &Config{},
-				fetcher: newMockFetcher(),
-			}
 			ctx := context.Background()
 
-			selected := selector.selectCheapest(ctx, tt.candidates)
+			selected := selectCheapest(ctx, tt.candidates)
 
 			if tt.expectNil {
 				if selected != nil {
@@ -507,16 +483,6 @@ func TestSelectMostCapable_Integration(t *testing.T) {
 				mockFetcher.addAccelerator(name, spec)
 			}
 
-			// Create selector
-			config := &Config{
-				Client:                nil,
-				EnableDetailedLogging: false,
-			}
-			selector := &defaultSelector{
-				config:  config,
-				fetcher: mockFetcher,
-			}
-
 			ctx := context.Background()
 
 			// Fetch candidates
@@ -533,7 +499,7 @@ func TestSelectMostCapable_Integration(t *testing.T) {
 			}
 
 			// Select most capable
-			selected := selector.selectMostCapable(ctx, validCandidates, tt.preferredPrecisions)
+			selected := selectMostCapable(ctx, validCandidates, tt.preferredPrecisions)
 
 			if selected == nil {
 				t.Errorf("%s: selectMostCapable() returned nil", tt.description)
@@ -651,23 +617,71 @@ func TestGetAcceleratorClassByPolicy_AllPolicies(t *testing.T) {
 	}
 }
 
+// TestGetAcceleratorClassByPolicy_BestFitWithoutConstraints: a service that states no
+// constraints, or an empty constraints block, gets a BestFit choice ranked as if nothing
+// were required, never a panic.
+func TestGetAcceleratorClassByPolicy_BestFitWithoutConstraints(t *testing.T) {
+	tests := []struct {
+		name        string
+		constraints *v1beta1.AcceleratorConstraints
+	}{
+		{name: "nil constraints", constraints: nil},
+		{name: "empty constraints", constraints: &v1beta1.AcceleratorConstraints{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The first listed class states no compute figures, so BestFit ranks the second above it.
+			mockFetcher := newMockFetcher()
+			mockFetcher.addAccelerator("memory-only", &v1beta1.AcceleratorClassSpec{
+				Capabilities: v1beta1.AcceleratorCapabilities{
+					MemoryGB: resource.NewQuantity(80*1024*1024*1024, resource.BinarySI),
+				},
+			})
+			mockFetcher.addAccelerator("with-compute-figures", &v1beta1.AcceleratorClassSpec{
+				Capabilities: v1beta1.AcceleratorCapabilities{
+					MemoryGB:    resource.NewQuantity(40*1024*1024*1024, resource.BinarySI),
+					Performance: &v1beta1.AcceleratorPerformance{Fp16Tflops: ptr.To[int64](312)},
+				},
+			})
+			selector := &defaultSelector{config: &Config{}, fetcher: mockFetcher}
+
+			isvc := &v1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"},
+				Spec: v1beta1.InferenceServiceSpec{
+					AcceleratorSelector: &v1beta1.AcceleratorSelector{
+						Policy:      v1beta1.BestFitPolicy,
+						Constraints: tt.constraints,
+					},
+				},
+			}
+			runtime := &v1beta1.ServingRuntimeSpec{
+				AcceleratorRequirements: &v1beta1.AcceleratorRequirements{
+					AcceleratorClasses: []string{"memory-only", "with-compute-figures"},
+				},
+			}
+
+			selected, err := selector.getAcceleratorClassByPolicy(context.Background(), isvc, runtime, v1beta1.BestFitPolicy)
+			if err != nil {
+				t.Fatalf("getAcceleratorClassByPolicy() error: %v", err)
+			}
+			if selected == nil {
+				t.Fatal("getAcceleratorClassByPolicy() returned nil, want with-compute-figures")
+			}
+			if *selected != "with-compute-figures" {
+				t.Errorf("getAcceleratorClassByPolicy() = %s, want with-compute-figures", *selected)
+			}
+		})
+	}
+}
+
 // TestEdgeCases tests edge cases for policy selection
 func TestEdgeCases(t *testing.T) {
 	t.Run("Empty candidate list", func(t *testing.T) {
-		mockFetcher := newMockFetcher()
-		config := &Config{
-			Client:                nil,
-			EnableDetailedLogging: false,
-		}
-		selector := &defaultSelector{
-			config:  config,
-			fetcher: mockFetcher,
-		}
-
 		ctx := context.Background()
 		validCandidates := []v1beta1.AcceleratorClass{}
 
-		selected := selector.selectBestFit(ctx, validCandidates, nil)
+		selected := selectBestFit(ctx, validCandidates, nil)
 		if selected != nil {
 			t.Errorf("Empty candidates should return nil, got %s", *selected)
 		}
@@ -701,20 +715,11 @@ func TestEdgeCases(t *testing.T) {
 			mockFetcher.addAccelerator(name, spec)
 		}
 
-		config := &Config{
-			Client:                nil,
-			EnableDetailedLogging: false,
-		}
-		selector := &defaultSelector{
-			config:  config,
-			fetcher: mockFetcher,
-		}
-
 		ctx := context.Background()
 		candidates, _ := candidatesFromNames(ctx, mockFetcher, []string{"nvidia-t4"})
 
 		// Should return immediately without scoring
-		selected := selector.selectBestFit(ctx, candidates, nil)
+		selected := selectBestFit(ctx, candidates, nil)
 		if selected == nil || *selected != "nvidia-t4" {
 			t.Errorf("Single candidate should be selected immediately")
 		}
@@ -734,19 +739,10 @@ func TestEdgeCases(t *testing.T) {
 			},
 		})
 
-		config := &Config{
-			Client:                nil,
-			EnableDetailedLogging: false,
-		}
-		selector := &defaultSelector{
-			config:  config,
-			fetcher: mockFetcher,
-		}
-
 		ctx := context.Background()
 		candidates, _ := candidatesFromNames(ctx, mockFetcher, []string{"no-cost-gpu-1", "no-cost-gpu-2"})
 
-		selected := selector.selectCheapest(ctx, candidates)
+		selected := selectCheapest(ctx, candidates)
 		if selected != nil {
 			t.Errorf("Cheapest with no cost data should return nil, got %s", *selected)
 		}
@@ -761,19 +757,10 @@ func TestEdgeCases(t *testing.T) {
 			},
 		})
 
-		config := &Config{
-			Client:                nil,
-			EnableDetailedLogging: false,
-		}
-		selector := &defaultSelector{
-			config:  config,
-			fetcher: mockFetcher,
-		}
-
 		ctx := context.Background()
 		candidates, _ := candidatesFromNames(ctx, mockFetcher, []string{"no-cost-gpu"})
 
-		selected := selector.selectCheapest(ctx, candidates)
+		selected := selectCheapest(ctx, candidates)
 		if selected == nil || *selected != "no-cost-gpu" {
 			t.Errorf("Single candidate should be selected even without cost data")
 		}

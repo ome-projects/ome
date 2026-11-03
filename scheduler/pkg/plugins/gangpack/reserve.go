@@ -22,7 +22,7 @@ import (
 // assigned gang member reserves nothing.
 func (g *GangPack) Reserve(_ context.Context, state framework.CycleState, _ *v1.Pod, _ string) *framework.Status {
 	if assignment := readAssignment(state); assignment != nil {
-		_, drained := g.assignments.PlaceIf(assignment.gang.key, assignment.commitment)
+		_, drained := g.assignments.Place(assignment.gang.key, assignment.commitment)
 		if drained {
 			g.clearFailedDomains(assignment.gang)
 			g.activateReservationBlocked()
@@ -67,7 +67,7 @@ func (g *GangPack) releaseAttempt(assignment *assignmentState, pod *v1.Pod, fail
 	// releases the matching attempt. Rejected siblings from an older attempt cannot
 	// release or reject a newer retry because the token must still own the
 	// assignment.
-	released = g.assignments.ReleaseIf(key, token, func() {
+	released = g.assignments.Release(key, token, func() {
 		if failedDomain {
 			newFailedDomain = g.markFailedDomain(assignment.gang, placement.Domain{TopologyKey: assignment.topologyKey, Name: assignment.domain})
 		}

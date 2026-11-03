@@ -94,11 +94,7 @@ func isvcFromHeadlessServiceName(name string) (string, v1beta1.ComponentType, bo
 		return "", "", false
 	}
 	trimmed := strings.TrimSuffix(name, headlessServiceSuffix)
-	for _, component := range []v1beta1.ComponentType{
-		v1beta1.RouterComponent,
-		v1beta1.EngineComponent,
-		v1beta1.DecoderComponent,
-	} {
+	for _, component := range v1beta1.RoleTypes() {
 		suffix := "-" + string(component)
 		if strings.HasSuffix(trimmed, suffix) {
 			isvc := strings.TrimSuffix(trimmed, suffix)

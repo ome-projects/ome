@@ -9,15 +9,15 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // The count a canary sizes its steps against is the replica's own: its live
@@ -87,7 +87,7 @@ func rearmedFinalStep(t *testing.T, name string, lagging int) (*v1beta1.Inferenc
 	engineIR := ir(ns, isvc.Name, v1beta1.EngineComponent, "fixed")
 	engineIR.Status.CurrentRevision = engineIR.Status.UpdateRevision
 	engineIR.Spec.Replicas = ptr.To(int32(replicas))
-	objs := []runtime.Object{isvc, engineIR,
+	objs := []client.Object{isvc, engineIR,
 		canaryControllerRevision(ns, isvc.Name, "engine", "old", 1),
 		canaryControllerRevision(ns, isvc.Name, "engine", "broken", 2),
 		canaryControllerRevision(ns, isvc.Name, "engine", "fixed", 3),
@@ -112,7 +112,7 @@ func rearmedFinalStep(t *testing.T, name string, lagging int) (*v1beta1.Inferenc
 		}
 		objs = append(objs, pod)
 	}
-	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	deps := DispatchDeps{
 		Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: g,
 		Requeue: reconcileRequeue, ParkedRequeue: failedRequeue, Now: start.Add(2 * time.Minute),
@@ -180,7 +180,7 @@ func TestDispatch_RowsOnePassBehindReadyPodsWakeAtTheStepCadence(t *testing.T) {
 			PodCount: 1, ServingPodCount: 1, AvailablePodCount: 1,
 		})
 	}
-	objs := []runtime.Object{isvc, engineIR,
+	objs := []client.Object{isvc, engineIR,
 		canaryPod(ns, name, "engine", "old", name+"-engine-0"),
 		canaryPod(ns, name, "engine", "old", name+"-engine-1"),
 		canaryPod(ns, name, "engine", "new", name+"-engine-2"),
@@ -188,7 +188,7 @@ func TestDispatch_RowsOnePassBehindReadyPodsWakeAtTheStepCadence(t *testing.T) {
 		canaryControllerRevision(ns, name, "engine", "old", 1),
 		canaryControllerRevision(ns, name, "engine", "new", 2),
 	}
-	c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithRuntimeObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	deps := DispatchDeps{
 		Client: c, Reader: c, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{}),
 		Requeue: reconcileRequeue, ParkedRequeue: failedRequeue, Now: time.Unix(1000, 0),

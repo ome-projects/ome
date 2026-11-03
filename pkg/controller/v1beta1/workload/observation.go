@@ -65,10 +65,6 @@ func NewAPIReaderSelectorPodObservation(pods []*corev1.Pod, byInstance map[int32
 	return newPodObservation(PodObservationSourceAPIReader, PodObservationScopeSelector, pods, byInstance)
 }
 
-func (o PodObservation) Source() PodObservationSource { return o.source }
-
-func (o PodObservation) Scope() PodObservationScope { return o.scope }
-
 // PodsForInstance returns the read-only bucket for index.
 func (o PodObservation) PodsForInstance(index int32) []*corev1.Pod {
 	return o.byInstance[index]
@@ -118,12 +114,6 @@ func NewOwnedPublicationObservation(persisted []types.InstanceStatus, pods PodOb
 		availabilityObserved: true,
 	}, nil
 }
-
-func (o ComponentObservation) Epoch() ObservationEpoch { return o.epoch }
-
-func (o ComponentObservation) PodSource() PodObservationSource { return o.pods.Source() }
-
-func (o ComponentObservation) PodScope() PodObservationScope { return o.pods.Scope() }
 
 // PersistedStatuses returns an isolated copy in epoch row order.
 func (o *ComponentObservation) PersistedStatuses() []types.InstanceStatus {
@@ -313,7 +303,7 @@ func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]in
 		if status.InstanceMeetsThreshold(current.PodCount, current.AvailablePodCount, desired) {
 			counters.AvailableReplicas++
 		}
-		counters.NextAvailableIn = status.EarliestPending(counters.NextAvailableIn, current.NextAvailableIn)
+		counters.NextAvailableIn = types.EarliestPositive(counters.NextAvailableIn, current.NextAvailableIn)
 		if targetRevName != "" && status.RowOnRevision(row, target) {
 			counters.UpdatedReplicas++
 			if status.InstanceMeetsThreshold(current.PodCount, current.ReadyPodCount, desired) {

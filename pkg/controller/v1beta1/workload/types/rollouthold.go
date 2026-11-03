@@ -62,16 +62,21 @@ type RolloutHold struct {
 	Target string
 }
 
-// ParkedWaitingReason reports whether token names a rollout hold gate:
-// the vocabulary of the wait a parked attempt names on Operation.Waiting.
-// The hold authorities never write one.
+// holdGateTokens are the rollout hold gates as the waits a parked attempt
+// names on Operation.Waiting. The hold authorities never write one.
+var holdGateTokens = map[string]struct{}{
+	string(RolloutHoldGateRatio):      {},
+	string(RolloutHoldGateSequential): {},
+	string(RolloutHoldGateBudget):     {},
+	string(RolloutHoldGateRetryBlock): {},
+	string(RolloutHoldGateHeld):       {},
+	string(RolloutHoldGatePairing):    {},
+}
+
+// ParkedWaitingReason reports whether token names a rollout hold gate.
 func ParkedWaitingReason(token string) bool {
-	switch RolloutHoldGate(token) {
-	case RolloutHoldGateRatio, RolloutHoldGateSequential, RolloutHoldGateBudget,
-		RolloutHoldGateRetryBlock, RolloutHoldGateHeld, RolloutHoldGatePairing:
-		return true
-	}
-	return false
+	_, ok := holdGateTokens[token]
+	return ok
 }
 
 // OperationParked reports whether op is an Update attempt parked after

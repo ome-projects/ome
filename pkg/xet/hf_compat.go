@@ -272,3 +272,16 @@ func ListRepoFiles(ctx context.Context, config *DownloadConfig) ([]FileInfo, err
 
 	return client.ListFiles(config.RepoID, revision)
 }
+
+// ToDownloadConfig converts Config to DownloadConfig
+func (c *Config) ToDownloadConfig() *DownloadConfig {
+	return &DownloadConfig{
+		Token:      c.Token,
+		CacheDir:   c.CacheDir,
+		Endpoint:   c.Endpoint,
+		MaxWorkers: int(c.MaxConcurrentDownloads),
+		// Set sensible defaults for common fields
+		Revision: "main",        // Default git branch
+		RepoType: RepoTypeModel, // Most common repository type
+	}
+}

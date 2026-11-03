@@ -12,9 +12,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	"sigs.k8s.io/yaml"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
@@ -45,12 +47,35 @@ type ExpectedStatusConfig struct {
 	MaxDecodedInstances    *uint64           `json:"maxDecodedInstances,omitempty"`
 }
 
+// ObservedStatusConfig is the block a cluster's manager parsed, in the shape
+// the inventory and the reports use.
+func ObservedStatusConfig(parsed controllerconfig.OMENativeStatusConfig) ExpectedStatusConfig {
+	return ExpectedStatusConfig{InstanceStatusEncoding: parsed.InstanceStatusEncoding, MaxDecodedInstances: parsed.MaxDecodedInstances}
+}
+
 // Bound is the ColumnarV2 row bound to decode with; zero when none is set.
 func (c ExpectedStatusConfig) Bound() uint64 {
 	if c.MaxDecodedInstances == nil {
 		return 0
 	}
 	return *c.MaxDecodedInstances
+}
+
+// BoundString is the bound as the reports print it: the number, or whenUnset
+// when none is set.
+func (c ExpectedStatusConfig) BoundString(whenUnset string) string {
+	if c.MaxDecodedInstances == nil {
+		return whenUnset
+	}
+	return strconv.FormatUint(*c.MaxDecodedInstances, 10)
+}
+
+// Matches reports whether observed runs the same encoding with the same
+// bound; a set bound and an unset one never match.
+func (c ExpectedStatusConfig) Matches(observed ExpectedStatusConfig) bool {
+	return c.InstanceStatusEncoding == observed.InstanceStatusEncoding &&
+		c.Bound() == observed.Bound() &&
+		(c.MaxDecodedInstances == nil) == (observed.MaxDecodedInstances == nil)
 }
 
 // String renders the block the way the report prints it.

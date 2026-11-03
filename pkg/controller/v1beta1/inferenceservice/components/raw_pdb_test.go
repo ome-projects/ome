@@ -11,15 +11,14 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestRawPDBUsesConfiguredFallbackForEveryComponent(t *testing.T) {
@@ -36,14 +35,13 @@ func TestRawPDBUsesConfiguredFallbackForEveryComponent(t *testing.T) {
 		v1beta1.RouterComponent,
 	} {
 		t.Run(string(component), func(t *testing.T) {
-			scheme := rawAutoscalerTestScheme(t)
-			cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+			cl := componentClient(t)
 			ext := rawPDBTestExtension()
 			isvc := rawAutoscalerTestISVC(component, ext)
 			componentMeta := rawPDBTestObjectMeta(isvc, component)
 
 			require.NoError(t, reconcileRawPDBTestComponent(
-				context.Background(), component, cl, scheme, config, isvc, componentMeta,
+				context.Background(), component, cl, config, isvc, componentMeta,
 			))
 
 			budget := &policyv1.PodDisruptionBudget{}
@@ -68,13 +66,12 @@ func TestRawPDBMergedComponentPolicyOverridesConfiguredFallback(t *testing.T) {
 	}
 	ext := rawPDBTestExtension()
 	ext.MinAvailable = &minimum
-	scheme := rawAutoscalerTestScheme(t)
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := componentClient(t)
 	isvc := rawAutoscalerTestISVC(v1beta1.EngineComponent, ext)
 	componentMeta := rawPDBTestObjectMeta(isvc, v1beta1.EngineComponent)
 
 	require.NoError(t, reconcileRawPDBTestComponent(
-		context.Background(), v1beta1.EngineComponent, cl, scheme, config, isvc, componentMeta,
+		context.Background(), v1beta1.EngineComponent, cl, config, isvc, componentMeta,
 	))
 
 	budget := &policyv1.PodDisruptionBudget{}
@@ -99,14 +96,13 @@ func TestRawPDBAbsentPolicyDoesNotCreateAndDeletesOwned(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			scheme := rawAutoscalerTestScheme(t)
 			ext := rawPDBTestExtension()
 			isvc := rawAutoscalerTestISVC(v1beta1.EngineComponent, ext)
 			componentMeta := rawPDBTestObjectMeta(isvc, v1beta1.EngineComponent)
-			builder := ctrlclientfake.NewClientBuilder().WithScheme(scheme)
+			var opts []fakeclient.Option
 			if tt.seedOwnedPDB {
 				stale := intstr.FromInt(3)
-				builder = builder.WithObjects(&policyv1.PodDisruptionBudget{
+				opts = append(opts, fakeclient.WithObjects(&policyv1.PodDisruptionBudget{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:            componentMeta.Name,
 						Namespace:       componentMeta.Namespace,
@@ -122,12 +118,12 @@ func TestRawPDBAbsentPolicyDoesNotCreateAndDeletesOwned(t *testing.T) {
 							constants.RawDeploymentAppLabel: constants.GetRawServiceLabel(componentMeta.Name),
 						}},
 					},
-				})
+				}))
 			}
-			cl := builder.Build()
+			cl := componentClient(t, opts...)
 
 			require.NoError(t, reconcileRawPDBTestComponent(
-				context.Background(), v1beta1.EngineComponent, cl, scheme, tt.config, isvc, componentMeta,
+				context.Background(), v1beta1.EngineComponent, cl, tt.config, isvc, componentMeta,
 			))
 
 			budget := &policyv1.PodDisruptionBudget{}
@@ -146,13 +142,12 @@ func TestRawPDBInvalidPolicyFailsBeforeChildMutation(t *testing.T) {
 	ext := rawPDBTestExtension()
 	ext.MinAvailable = &minimum
 	ext.MaxUnavailable = &maximum
-	scheme := rawAutoscalerTestScheme(t)
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := componentClient(t)
 	isvc := rawAutoscalerTestISVC(v1beta1.EngineComponent, ext)
 	componentMeta := rawPDBTestObjectMeta(isvc, v1beta1.EngineComponent)
 
 	err := reconcileRawPDBTestComponent(
-		context.Background(), v1beta1.EngineComponent, cl, scheme, &controllerconfig.InferenceServicesConfig{}, isvc, componentMeta,
+		context.Background(), v1beta1.EngineComponent, cl, &controllerconfig.InferenceServicesConfig{}, isvc, componentMeta,
 	)
 	require.ErrorContains(t, err, "exactly one of minAvailable or maxUnavailable")
 
@@ -187,7 +182,6 @@ func reconcileRawPDBTestComponent(
 	ctx context.Context,
 	component v1beta1.ComponentType,
 	cl client.Client,
-	scheme *runtime.Scheme,
 	config *controllerconfig.InferenceServicesConfig,
 	isvc *v1beta1.InferenceService,
 	componentMeta metav1.ObjectMeta,
@@ -195,7 +189,7 @@ func reconcileRawPDBTestComponent(
 	deps := &ComponentDeps{
 		Client:    cl,
 		Clientset: rawAutoscalerTestClientset(),
-		Scheme:    scheme,
+		Scheme:    cl.Scheme(),
 		Config:    config,
 	}
 	podSpec := &corev1.PodSpec{

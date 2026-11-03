@@ -1,7 +1,6 @@
 package inferenceservice
 
 import (
-	"context"
 	"errors"
 	"slices"
 	"strings"
@@ -12,7 +11,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
@@ -20,13 +18,12 @@ import (
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestPlacementBackendReconcile(t *testing.T) {
@@ -184,12 +181,7 @@ func TestPlacementBackendReconcile(t *testing.T) {
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s := runtime.NewScheme()
-			for _, add := range []func(*runtime.Scheme) error{v1beta1.AddToScheme, corev1.AddToScheme} {
-				if err := add(s); err != nil {
-					t.Fatal(err)
-				}
-			}
+			s := fakeclient.Scheme(t)
 			f := fixture{
 				deploy:  `{"defaultDeploymentMode":"RawDeployment"}`,
 				service: &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "team-a", UID: "member-uid", Finalizers: []string{inferenceServiceFinalizer}, Annotations: map[string]string{constants.PlacementOriginUID: "source-a", constants.PlacementPolicy: string(v1beta1.PlacementPolicyClusterAffinity)}}, Spec: v1beta1.InferenceServiceSpec{DeploymentMode: ptr.To(constants.OMENative), Runtime: &v1beta1.ServingRuntimeRef{Name: "runtime-a"}, Model: &v1beta1.ModelRef{Name: "model-a"}, Engine: &v1beta1.EngineSpec{}}},
@@ -206,17 +198,13 @@ func TestPlacementBackendReconcile(t *testing.T) {
 				tt.change(&f)
 			}
 			childWrite := errors.New("model configuration write reached")
-			writes := 0
-			reject := func() error { writes++; return childWrite }
-			cl := clientfake.NewClientBuilder().WithScheme(s).WithObjects(f.service, f.runtime,
-				&v1beta1.ClusterBaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model-a"}, Spec: v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "pytorch"}}}).WithStatusSubresource(f.service).WithInterceptorFuncs(interceptor.Funcs{
-				Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error { return reject() },
-				Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error { return reject() },
-				Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
-					return reject()
-				},
-				Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error { return reject() },
-			}).Build()
+			refused, writes := refusedObjectWrites(childWrite)
+			cl := fakeclient.New(t, append([]fakeclient.Option{
+				fakeclient.WithScheme(s),
+				fakeclient.WithObjects(f.service, f.runtime,
+					&v1beta1.ClusterBaseModel{ObjectMeta: metav1.ObjectMeta{Name: "model-a"}, Spec: v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "pytorch"}}}),
+				fakeclient.WithStatusSubresource(f.service),
+			}, refused...)...)
 			before := &v1beta1.InferenceService{}
 			key := client.ObjectKeyFromObject(f.service)
 			if err := cl.Get(t.Context(), key, before); err != nil {
@@ -239,7 +227,7 @@ func TestPlacementBackendReconcile(t *testing.T) {
 			} else if !errors.Is(err, childWrite) {
 				t.Fatalf("error = %v, want continuation to model configuration", err)
 			}
-			if diff := cmp.Diff(wantWrites, writes); diff != "" {
+			if diff := cmp.Diff(wantWrites, writes()); diff != "" {
 				t.Fatalf("child writes (-want +got):\n%s", diff)
 			}
 			wantWarnings := 0
@@ -330,25 +318,22 @@ func TestPlacementBackendConditionWrites(t *testing.T) {
 		{name: "write error", fail: true, wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			s := runtime.NewScheme()
-			if err := v1beta1.AddToScheme(s); err != nil {
-				t.Fatal(err)
-			}
 			service := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "team-a", UID: "uid"}}
-			writes := 0
-			cl := clientfake.NewClientBuilder().WithScheme(s).WithObjects(service).WithStatusSubresource(service).WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-				writes++
-				if tt.conflict {
-					return apierrors.NewConflict(schema.GroupResource{Resource: "inferenceservices"}, service.Name, errors.New("changed"))
-				}
-				if tt.missing {
-					return apierrors.NewNotFound(schema.GroupResource{Resource: "inferenceservices"}, service.Name)
-				}
-				if tt.fail {
-					return errors.New("unavailable")
-				}
-				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
-			}}).Build()
+			writes := fakeclient.CountingVerb(fakeclient.StatusPatch)
+			opts := []fakeclient.Option{fakeclient.WithObjects(service), fakeclient.WithStatusSubresource(service), writes}
+			var refusal error
+			switch {
+			case tt.conflict:
+				refusal = apierrors.NewConflict(schema.GroupResource{Resource: "inferenceservices"}, service.Name, errors.New("changed"))
+			case tt.missing:
+				refusal = apierrors.NewNotFound(schema.GroupResource{Resource: "inferenceservices"}, service.Name)
+			case tt.fail:
+				refusal = errors.New("unavailable")
+			}
+			if refusal != nil {
+				opts = append(opts, fakeclient.FailingVerb(fakeclient.StatusPatch, fakeclient.EveryCall, refusal))
+			}
+			cl := fakeclient.New(t, opts...)
 			if err := cl.Get(t.Context(), client.ObjectKeyFromObject(service), service); err != nil {
 				t.Fatal(err)
 			}
@@ -366,7 +351,7 @@ func TestPlacementBackendConditionWrites(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if diff := cmp.Diff(1, writes); diff != "" {
+			if diff := cmp.Diff(1, writes.Count()); diff != "" {
 				t.Fatal(diff)
 			}
 		})

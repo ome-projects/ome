@@ -2,6 +2,7 @@ package holds
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,6 +70,31 @@ func TestTable_EveryTokenIsWrittenByExactlyOneAuthority(t *testing.T) {
 	}
 	if last := table[len(table)-1].token; last != types.WaitingReasonPaused {
 		t.Errorf("the weakest authority is consulted last; got %s", last)
+	}
+}
+
+// TestTable_TokensAreTheExternalHolds: every authority's token stops the
+// InstanceReadyTimeout clock except the source-rotation report, which
+// names a workload getting worse, so the table and the external-hold set
+// in types are one list.
+func TestTable_TokensAreTheExternalHolds(t *testing.T) {
+	var want []string
+	for _, a := range table {
+		stopsClock := types.OperationExternallyHeld(&types.InstanceOperation{Waiting: a.token})
+		if a.token == types.WaitingReasonSourceUnrouted {
+			if stopsClock {
+				t.Errorf("%s must keep the clock running", a.token)
+			}
+			continue
+		}
+		if !stopsClock {
+			t.Errorf("%s must stop the clock", a.token)
+		}
+		want = append(want, a.token)
+	}
+	slices.Sort(want)
+	if got := types.ExternalHoldTokens(); !slices.Equal(got, want) {
+		t.Errorf("external hold tokens %v, want the table's %v", got, want)
 	}
 }
 
@@ -157,7 +183,7 @@ func TestExternalHold_OneOwnerPerToken(t *testing.T) {
 	ctx, plan := context.Background(), types.ComponentPlan{}
 	input, row := holdFixture(&types.InstanceOperation{Type: types.InstanceOperationCreate})
 
-	entered, held, err := mark(ctx, input, plan, 0, schedulerHold, nil)
+	entered, held, err := mark(ctx, input, plan, 0, schedulerHold, nil, nil)
 	if err != nil || !entered || !held {
 		t.Fatalf("mark unschedulable: entered=%v held=%v err=%v want true, true, nil", entered, held, err)
 	}
@@ -166,7 +192,7 @@ func TestExternalHold_OneOwnerPerToken(t *testing.T) {
 	}
 
 	// A quota refusal arrives while the scheduler hold stands.
-	entered, held, err = mark(ctx, input, plan, 0, quotaHold, nil)
+	entered, held, err = mark(ctx, input, plan, 0, quotaHold, nil, nil)
 	if err != nil {
 		t.Fatalf("mark quota: %v", err)
 	}
@@ -178,7 +204,7 @@ func TestExternalHold_OneOwnerPerToken(t *testing.T) {
 	}
 
 	// The quota path completing must not release someone else's hold.
-	if err := release(ctx, input, 0, types.RejectionReasonQuotaExceeded); err != nil {
+	if err := release(ctx, input, 0, types.RejectionReasonQuotaExceeded, false); err != nil {
 		t.Fatalf("clear quota: %v", err)
 	}
 	if row.Operation.Waiting != types.WaitingReasonUnschedulable {
@@ -186,7 +212,7 @@ func TestExternalHold_OneOwnerPerToken(t *testing.T) {
 	}
 
 	// Its own owner releases it.
-	if err := release(ctx, input, 0, types.WaitingReasonUnschedulable); err != nil {
+	if err := release(ctx, input, 0, types.WaitingReasonUnschedulable, false); err != nil {
 		t.Fatalf("clear unschedulable: %v", err)
 	}
 	if row.Operation.Waiting != "" {
@@ -212,10 +238,10 @@ func TestExternalHold_EdgeTriggered(t *testing.T) {
 		}
 	}
 
-	if entered, held, err := mark(ctx, input, plan, 0, schedulerHold, evidence("0/3 nodes")); err != nil || !entered || !held {
+	if entered, held, err := mark(ctx, input, plan, 0, schedulerHold, evidence("0/3 nodes"), nil); err != nil || !entered || !held {
 		t.Fatalf("first mark: entered=%v held=%v err=%v want true, true, nil", entered, held, err)
 	}
-	if entered, held, err := mark(ctx, input, plan, 0, schedulerHold, evidence("0/9 nodes")); err != nil || entered || !held {
+	if entered, held, err := mark(ctx, input, plan, 0, schedulerHold, evidence("0/9 nodes"), nil); err != nil || entered || !held {
 		t.Fatalf("re-mark with a churned message: entered=%v held=%v err=%v want false, true, nil", entered, held, err)
 	}
 	if got := row.LastFailure; got == nil || got.Message != "0/3 nodes" {
@@ -226,7 +252,7 @@ func TestExternalHold_EdgeTriggered(t *testing.T) {
 	// transition moved, so this is a new episode.
 	fresh := evidence("0/3 nodes")
 	fresh.Time = metav1.NewTime(at.Add(1))
-	if entered, held, err := mark(ctx, input, plan, 0, schedulerHold, fresh); err != nil || entered || !held {
+	if entered, held, err := mark(ctx, input, plan, 0, schedulerHold, fresh, nil); err != nil || entered || !held {
 		t.Fatalf("re-mark at a new transition: entered=%v held=%v err=%v want false, true, nil", entered, held, err)
 	}
 	if got := row.LastFailure; got == nil || !got.Time.Equal(&fresh.Time) {
@@ -263,7 +289,7 @@ func TestExternalHold_OwnerRuleIsRecheckedOnTheFreshRow(t *testing.T) {
 		},
 	}
 	entered, held, err := mark(ctx, input, plan, 0, schedulerHold,
-		&types.InstanceTermination{PodName: "engine-0-default-0", Reason: types.WaitingReasonUnschedulable})
+		&types.InstanceTermination{PodName: "engine-0-default-0", Reason: types.WaitingReasonUnschedulable}, nil)
 	if err != nil {
 		t.Fatalf("mark: %v", err)
 	}

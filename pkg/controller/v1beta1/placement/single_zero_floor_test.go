@@ -1,7 +1,6 @@
 package placement
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"testing"
@@ -14,13 +13,12 @@ import (
 	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func zeroFloorObservationFixture(t *testing.T) plannedObservationFixture {
@@ -92,7 +90,7 @@ func TestZeroFloorMemberObservation(t *testing.T) {
 				objects = append(objects, &f.resources.pods[i])
 			}
 			scheme := testScheme(t)
-			worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+			worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(objects...))
 			clusters := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(worker)}}, uid: "member-a-uid"}
 			r, _ := newPlacer(scheme, clusters, f.source, plannedTestRegistration())
 			observed, err := r.observePlannedMember(t.Context(), f.source, f.source.Status.Placement.Candidates[0], f.components)
@@ -151,12 +149,7 @@ func acknowledgeSingleFloor(t *testing.T, f *backendFixture, name string, replic
 // inventory cannot be listed while its component inventory stays readable, so
 // only the planned observation of that member fails.
 func unreadablePodInventory(f *backendFixture, name string) workloadcluster.SelectivelyCachingClient {
-	unreadable := interceptor.NewClient(f.workers[name], interceptor.Funcs{List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-		if _, ok := list.(*corev1.PodList); ok {
-			return fmt.Errorf("inventory unavailable")
-		}
-		return cl.List(ctx, list, opts...)
-	}})
+	unreadable := fakeclient.Wrap(f.t, f.workers[name], fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, fmt.Errorf("inventory unavailable")).OnKind(&corev1.PodList{}))
 	return workloadcluster.NewNeverCachingClient(unreadable)
 }
 

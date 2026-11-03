@@ -522,8 +522,7 @@ func TestRDMAInjector_InjectRDMA(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			injector := NewRDMAInjector()
-			err := injector.InjectRDMA(tt.pod)
+			err := injectRDMA(tt.pod)
 
 			if tt.expectedError {
 				assert.Error(t, err, tt.description)
@@ -587,9 +586,8 @@ func TestRDMAInjector_injectRDMAConfig(t *testing.T) {
 		},
 	}
 
-	injector := NewRDMAInjector()
 	profile := RDMAProfiles["oci-roce"]
-	err := injector.injectRDMAConfig(pod, profile)
+	err := injectRDMAConfig(pod, profile)
 
 	assert.NoError(t, err)
 	// Verify that the environment variables were added
@@ -607,10 +605,8 @@ func TestRDMAInjector_volumeMountExists(t *testing.T) {
 		},
 	}
 
-	injector := NewRDMAInjector()
-
-	assert.True(t, injector.volumeMountExists(container, "existing-volume"))
-	assert.False(t, injector.volumeMountExists(container, "non-existing-volume"))
+	assert.True(t, hasVolumeMount(container, "existing-volume"))
+	assert.False(t, hasVolumeMount(container, "non-existing-volume"))
 }
 
 func TestRDMAInjector_volumeExists(t *testing.T) {
@@ -624,19 +620,15 @@ func TestRDMAInjector_volumeExists(t *testing.T) {
 		},
 	}
 
-	injector := NewRDMAInjector()
-
-	assert.True(t, injector.volumeExists(pod, "existing-volume"))
-	assert.False(t, injector.volumeExists(pod, "non-existing-volume"))
+	assert.True(t, hasVolume(pod, "existing-volume"))
+	assert.False(t, hasVolume(pod, "non-existing-volume"))
 }
 
 func TestRDMAInjector_capabilityExists(t *testing.T) {
 	capabilities := []v1.Capability{"CAP1", "CAP2"}
 
-	injector := NewRDMAInjector()
-
-	assert.True(t, injector.capabilityExists(capabilities, "CAP1"))
-	assert.False(t, injector.capabilityExists(capabilities, "CAP3"))
+	assert.True(t, hasCapability(capabilities, "CAP1"))
+	assert.False(t, hasCapability(capabilities, "CAP3"))
 }
 
 func TestRDMAInjector_injectVolumes(t *testing.T) {
@@ -659,8 +651,7 @@ func TestRDMAInjector_injectVolumes(t *testing.T) {
 		},
 	}
 
-	injector := NewRDMAInjector()
-	injector.injectVolumes(pod, newVolumes)
+	injectVolumes(pod, newVolumes)
 
 	assert.Len(t, pod.Spec.Volumes, 2)
 	assert.Equal(t, "existing-volume", pod.Spec.Volumes[0].Name)
@@ -693,8 +684,7 @@ func TestRDMAInjector_injectContainerConfig(t *testing.T) {
 		},
 	}
 
-	injector := NewRDMAInjector()
-	injector.injectContainerConfig(container, profile)
+	injectContainerConfig(container, profile)
 
 	// Verify environment variables
 	assert.Len(t, container.Env, 2)
@@ -738,7 +728,7 @@ func assertPodMatches(t *testing.T, expected, actual *v1.Pod, message string) {
 	// Check containers
 	assert.Equal(t, len(expected.Spec.Containers), len(actual.Spec.Containers), "Number of containers should match")
 	for _, expectedContainer := range expected.Spec.Containers {
-		actualContainer := findContainerByName(actual, expectedContainer.Name)
+		actualContainer := findContainer(actual.Spec.Containers, expectedContainer.Name)
 		assert.NotNil(t, actualContainer, "Container %s should exist", expectedContainer.Name)
 		if actualContainer != nil {
 			// Check security context
@@ -796,16 +786,6 @@ func assertPodMatches(t *testing.T, expected, actual *v1.Pod, message string) {
 	}
 }
 
-// findContainerByName returns the container with the given name from the pod
-func findContainerByName(pod *v1.Pod, name string) *v1.Container {
-	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == name {
-			return &pod.Spec.Containers[i]
-		}
-	}
-	return nil
-}
-
 // Helper function to get expected environment variables for tests
 func getExpectedEnvVars() []v1.EnvVar {
 	var envVars []v1.EnvVar
@@ -861,7 +841,7 @@ func TestRDMAInjector_injectNetworks(t *testing.T) {
 			if tt.existingAnno != "" {
 				pod.Annotations = map[string]string{MultusNetworksAnnotation: tt.existingAnno}
 			}
-			err := (&RDMAInjector{}).injectNetworks(pod, tt.profileNetworks)
+			err := injectNetworks(pod, tt.profileNetworks)
 			if tt.expectErr {
 				assert.Error(t, err)
 				return
@@ -893,8 +873,6 @@ func TestRDMAProfiles_cksGbRdmaHasAll16Macvlans(t *testing.T) {
 // that a networks-only profile (no securityContext, e.g. cks-gb-rdma)
 // does not panic or alter the container's existing security context.
 func TestRDMAInjector_injectContainerConfig_NilProfileSecurityContext(t *testing.T) {
-	injector := NewRDMAInjector()
-
 	tests := []struct {
 		name            string
 		securityContext *v1.SecurityContext
@@ -916,7 +894,7 @@ func TestRDMAInjector_injectContainerConfig_NilProfileSecurityContext(t *testing
 				SecurityContext: tt.securityContext.DeepCopy(),
 			}
 			assert.NotPanics(t, func() {
-				injector.injectContainerConfig(container, RDMAProfiles["cks-gb-rdma"])
+				injectContainerConfig(container, RDMAProfiles["cks-gb-rdma"])
 			})
 			assert.Equal(t, tt.securityContext, container.SecurityContext,
 				"networks-only profile must not change the security context")
@@ -928,7 +906,6 @@ func TestRDMAInjector_injectContainerConfig_NilProfileSecurityContext(t *testing
 // already present on the container win over profile values and that
 // re-running the injector (webhook reinvocation) does not stack duplicates.
 func TestRDMAInjector_injectContainerConfig_EnvDedup(t *testing.T) {
-	injector := NewRDMAInjector()
 	profile := RDMAProfiles["oci-roce"]
 
 	container := &v1.Container{
@@ -936,8 +913,8 @@ func TestRDMAInjector_injectContainerConfig_EnvDedup(t *testing.T) {
 		Env:  []v1.EnvVar{{Name: "NCCL_DEBUG", Value: "WARN"}},
 	}
 
-	injector.injectContainerConfig(container, profile)
-	injector.injectContainerConfig(container, profile)
+	injectContainerConfig(container, profile)
+	injectContainerConfig(container, profile)
 
 	assert.Len(t, container.Env, len(profile.EnvVars),
 		"each env name must appear exactly once after repeated injection")

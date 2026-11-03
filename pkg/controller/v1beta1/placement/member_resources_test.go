@@ -1,7 +1,6 @@
 package placement
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -12,13 +11,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 type memberResourceFixture struct {
@@ -281,17 +279,8 @@ func TestMemberGangSizesListsComponentGangsOnce(t *testing.T) {
 		objects = append(objects, group)
 		want[name] = 2
 	}
-	var gets, lists int
-	cl := interceptor.NewClient(fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objects...).Build(), interceptor.Funcs{
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			gets++
-			return c.Get(ctx, key, obj, opts...)
-		},
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			lists++
-			return c.List(ctx, list, opts...)
-		},
-	})
+	gets, lists := fakeclient.CountingVerb(fakeclient.Get), fakeclient.CountingVerb(fakeclient.List)
+	cl := fakeclient.New(t, fakeclient.WithObjects(objects...), gets, lists)
 	got, err := memberGangSizes(t.Context(), cl, fixture.ir, fixture.pods)
 	if err != nil {
 		t.Fatalf("gang read error = %v", err)
@@ -299,8 +288,8 @@ func TestMemberGangSizesListsComponentGangsOnce(t *testing.T) {
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("gang widths (-want +got):\n%s", diff)
 	}
-	if lists != 1 || gets != 0 {
-		t.Errorf("reads = %d lists and %d gets, want one list independent of gang count", lists, gets)
+	if lists.Count() != 1 || gets.Count() != 0 {
+		t.Errorf("reads = %d lists and %d gets, want one list independent of gang count", lists.Count(), gets.Count())
 	}
 }
 
@@ -342,7 +331,7 @@ func TestMemberGangSizes(t *testing.T) {
 				if !tt.missing {
 					objects = append(objects, group)
 				}
-				cl := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objects...).Build()
+				cl := fakeclient.New(t, fakeclient.WithObjects(objects...))
 				got, err := memberGangSizes(t.Context(), cl, fixture.ir, fixture.pods)
 				if (err != nil) != tt.wantErr {
 					t.Fatalf("gang read error = %v, want error %t", err, tt.wantErr)

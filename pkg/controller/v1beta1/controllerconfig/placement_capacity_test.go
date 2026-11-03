@@ -42,7 +42,7 @@ func TestPlacementCapacityConfig_Validate_CompleteBlockPassesPartialOrBadRejecte
 				t.Fatalf("validation: %s: %v", diff, err)
 			}
 			if tt.name == "complete" {
-				got := []time.Duration{cfg.Placement.Capacity.MaxAgeDuration(), cfg.Placement.Capacity.StabilityWindowDuration(), cfg.Placement.Capacity.RefreshIntervalDuration()}
+				got := []time.Duration{cfg.Placement.Capacity.MaxAge.Duration(), cfg.Placement.Capacity.StabilityWindow.Duration(), cfg.Placement.Capacity.RefreshInterval.Duration()}
 				if diff := cmp.Diff([]time.Duration{5 * time.Minute, time.Minute, 10 * time.Second}, got); diff != "" {
 					t.Fatal(diff)
 				}

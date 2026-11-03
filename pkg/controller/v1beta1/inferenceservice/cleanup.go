@@ -65,16 +65,7 @@ func backendWorkloadKind(mode constants.DeploymentModeType) (schema.GroupVersion
 
 // componentReadyCondition is the top-level readiness condition of a Component.
 func componentReadyCondition(component v1beta1.ComponentType) (knapis.ConditionType, bool) {
-	switch component {
-	case v1beta1.EngineComponent:
-		return v1beta1.EngineReady, true
-	case v1beta1.DecoderComponent:
-		return v1beta1.DecoderReady, true
-	case v1beta1.RouterComponent:
-		return v1beta1.RouterReady, true
-	default:
-		return "", false
-	}
+	return v1beta1.ReadyConditionOf(component)
 }
 
 // removedObject identifies an object a sweep deleted.
@@ -92,18 +83,13 @@ type kindList struct {
 	list client.ObjectList
 }
 
-// cleanupRemovedComponents deletes resources for components no longer specified in the spec.
-func (r *InferenceServiceReconciler) cleanupRemovedComponents(
-	ctx context.Context,
-	isvc *v1beta1.InferenceService,
-	engine *v1beta1.EngineSpec,
-	decoder *v1beta1.DecoderSpec,
-	router *v1beta1.RouterSpec,
-) error {
-	active := map[v1beta1.ComponentType]bool{
-		v1beta1.EngineComponent:  engine != nil,
-		v1beta1.DecoderComponent: decoder != nil,
-		v1beta1.RouterComponent:  router != nil,
+// cleanupRemovedComponents deletes resources for components no longer
+// specified in the merged specs. Every role has an entry, so an object of a
+// declared role is never swept.
+func (r *InferenceServiceReconciler) cleanupRemovedComponents(ctx context.Context, isvc *v1beta1.InferenceService, specs v1beta1.RoleSpecs) error {
+	active := make(map[v1beta1.ComponentType]bool, len(v1beta1.Roles))
+	for _, c := range v1beta1.RoleTypes() {
+		active[c] = specs.View(c) != nil
 	}
 	_, err := r.deleteOrphanedResourcesByOwnerRef(ctx, isvc, active)
 	return err

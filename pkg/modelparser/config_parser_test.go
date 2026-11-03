@@ -227,11 +227,9 @@ func TestExtractModelMetadataFromHF(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			metadata := parser.extractModelMetadataFromHF(tc.mockModel)
-			// extractModelMetadataFromHF intentionally does not write
-			// Quantization — the parser entry points apply it via
-			// applyQuantizationFromConfig as the single source of truth.
-			// Mimic that here so the assertion below is meaningful.
+			metadata := parser.extractModelMetadata(tc.mockModel, nil)
+			// extractModelMetadata leaves Quantization to
+			// applyQuantizationFromConfig, as the parse entry points do.
 			applyQuantizationFromConfig(&metadata, syntheticQuantConfig(tc.mockModel.quantizationType), parser.logger)
 
 			if !tc.expectedMetadata(metadata) {
@@ -277,14 +275,11 @@ func TestFindConfigFile(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = os.RemoveAll(tempDir) }()
 
-	logger, _ := zap.NewDevelopment()
-	parser := &ModelConfigParser{logger: logger.Sugar()}
-
 	// Config in the root.
 	configPath := filepath.Join(tempDir, DefaultConfigFileName)
 	_, err = os.Create(configPath)
 	require.NoError(t, err)
-	resultPath, err := parser.findConfigFile(tempDir)
+	resultPath, err := findFile(tempDir, DefaultConfigFileName, commonConfigSubdirs)
 	assert.NoError(t, err)
 	assert.Equal(t, configPath, resultPath)
 
@@ -295,14 +290,14 @@ func TestFindConfigFile(t *testing.T) {
 	configPath = filepath.Join(modelDir, DefaultConfigFileName)
 	_, err = os.Create(configPath)
 	require.NoError(t, err)
-	resultPath, err = parser.findConfigFile(tempDir)
+	resultPath, err = findFile(tempDir, DefaultConfigFileName, commonConfigSubdirs)
 	assert.NoError(t, err)
 	assert.Equal(t, configPath, resultPath)
 
 	// No config file anywhere.
 	require.NoError(t, os.RemoveAll(tempDir))
 	require.NoError(t, os.Mkdir(tempDir, 0755))
-	_, err = parser.findConfigFile(tempDir)
+	_, err = findFile(tempDir, DefaultConfigFileName, commonConfigSubdirs)
 	assert.ErrorContains(t, err, "config.json not found in")
 }
 
@@ -617,7 +612,7 @@ func TestParseModelConfigFromFiles_QuantAwareSafetensorsCount(t *testing.T) {
 func TestParseModelConfigDir_HFQuantConfigFallbackFromDisk(t *testing.T) {
 	// PVC agent path: model dir on disk has config.json (no
 	// quantization_config) + hf_quant_config.json (NVFP4).
-	// parseModelConfigDir is the function the agent's
+	// ParseModelConfig is the function the agent's
 	// MetadataExtractor calls; this proves the fallback wiring works
 	// when the file lives on a real filesystem (not just in-memory
 	// inputs through ParseModelConfigFromFiles).
@@ -646,7 +641,7 @@ func TestParseModelConfigDir_HFQuantConfigFallbackFromDisk(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, metadata)
 	assert.Equal(t, v1beta1.ModelQuantizationNVFP4, metadata.Quantization,
-		"hf_quant_config.json on disk should populate metadata.Quantization via parseModelConfigDir")
+		"hf_quant_config.json on disk should populate metadata.Quantization via ParseModelConfig")
 }
 
 func TestParseModelConfigFromFiles_HFQuantConfigFallback(t *testing.T) {

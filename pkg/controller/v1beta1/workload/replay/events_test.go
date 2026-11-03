@@ -654,6 +654,44 @@ timeline:
 	}
 }
 
+// TestTerminalWaitTimer_CreateStillInFlight_NoGraceRuns checks the timer
+// against the engine's terminal waiting set: a CreateContainerError for a
+// create the runtime has not finished runs no grace, so the timer has
+// nothing to land on, while a refused create runs one.
+func TestTerminalWaitTimer_CreateStillInFlight_NoGraceRuns(t *testing.T) {
+	const ready = `
+scenario: ready-pod
+arrows: [T-empty-create]
+initial:
+  spec: {replicas: 1, image: registry.example.com/runtime:v1}
+  config: {stuckPodGrace: 1m}
+  rows: [{index: 0, phase: Ready, runningRevision: current, readySince: 0s}]
+  pods:
+    - {index: 0, ready: true, serving: true, routed: true}
+timeline:
+  - tick: 1
+`
+	ctx := context.Background()
+	d := mustDriver(t, ready)
+	waiting := func(message string) {
+		t.Helper()
+		ev := TimelineEvent{ID: "pod.waiting", Variant: "CreateContainerError", Args: EventArgs{Pod: &PodRef{Index: 0}, Message: message}}
+		if _, err := applyPodWaiting(ctx, d, ev); err != nil {
+			t.Fatalf("waiting: %v", err)
+		}
+	}
+	for _, tc := range []struct{ name, message, wantErr string }{
+		{name: "a create still in flight runs no grace", message: "context deadline exceeded", wantErr: "no pod holds a terminal waiting reason"},
+		{name: "a refused create runs the grace", message: "failed to create containerd container: error unpacking image: no space left on device"},
+	} {
+		waiting(tc.message)
+		_, err := applyStuckPodGrace(ctx, d, TimelineEvent{Args: EventArgs{Slack: "1s"}})
+		if (tc.wantErr == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.wantErr)) {
+			t.Fatalf("%s: got err %v, want %q", tc.name, err, tc.wantErr)
+		}
+	}
+}
+
 // TestApplyRunningNotReadyIsWhatTheEvidenceReads pins the kubelet's report
 // of a pod that runs but fails its readiness probes against the engine's
 // own readers: the pod is in readiness limbo, dark once the grace has run,

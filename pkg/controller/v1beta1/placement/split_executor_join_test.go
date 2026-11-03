@@ -8,6 +8,12 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
+// twoRoutersEach gives every member two routers. Split divides the router
+// minimum across the members, so the minimum is two times their count.
+func twoRoutersEach(s *v1beta1.InferenceService, members int) {
+	s.Spec.Router.MinReplicas = ptr.To(2 * members)
+}
+
 // TestSplitJoinEndsThePauseOnceTheMemberServes adds member-c to the autoscaled
 // Split service while the autoscalers on member-a and member-b keep more
 // replicas than their shares. The pause stays on while member-c serves
@@ -18,6 +24,7 @@ func TestSplitJoinEndsThePauseOnceTheMemberServes(t *testing.T) {
 	changeAutoscaledSplit(t, f, func(s *v1beta1.InferenceService) {
 		s.Spec.Engine.MinReplicas, s.Spec.Decoder.MinReplicas = ptr.To(18), ptr.To(12)
 		s.Spec.Placement.ClusterAffinity = testAffinity("")
+		twoRoutersEach(s, 3)
 	})
 	running := func(ready bool) func(string) map[v1beta1.ComponentType]int32 {
 		return func(name string) map[v1beta1.ComponentType]int32 {
@@ -56,6 +63,7 @@ func TestSplitJoinWaitsForARecoveredMemberOnOldBounds(t *testing.T) {
 	changeAutoscaledSplit(t, f, func(s *v1beta1.InferenceService) {
 		s.Spec.Engine.MinReplicas, s.Spec.Decoder.MinReplicas = ptr.To(18), ptr.To(18)
 		s.Spec.Placement.ClusterAffinity = testAffinity("")
+		twoRoutersEach(s, 3)
 	})
 	running := func(name string) map[v1beta1.ComponentType]int32 {
 		if name == "member-a" {
@@ -86,6 +94,7 @@ func TestSplitJoinEndsAtTheJoinersExactShare(t *testing.T) {
 	changeAutoscaledSplit(t, f, func(s *v1beta1.InferenceService) {
 		s.Spec.Engine.MinReplicas, s.Spec.Decoder.MinReplicas = ptr.To(18), ptr.To(12)
 		s.Spec.Placement.ClusterAffinity = testAffinity("")
+		twoRoutersEach(s, 3)
 	})
 	running := func(name string) map[v1beta1.ComponentType]int32 {
 		if name == "member-c" {
@@ -106,7 +115,10 @@ func TestSplitJoinEndsAtTheJoinersExactShare(t *testing.T) {
 func TestSplitJoinFundedByFallingSharesEndsThePause(t *testing.T) {
 	f := autoscaledSplitFixture(t)
 	registerAutoscaledAllMember(t, f, "member-c")
-	changeAutoscaledSplit(t, f, func(s *v1beta1.InferenceService) { s.Spec.Placement.ClusterAffinity = testAffinity("") })
+	changeAutoscaledSplit(t, f, func(s *v1beta1.InferenceService) {
+		s.Spec.Placement.ClusterAffinity = testAffinity("")
+		twoRoutersEach(s, 3)
+	})
 	running := func(ready bool) func(string) map[v1beta1.ComponentType]int32 {
 		return func(name string) map[v1beta1.ComponentType]int32 {
 			switch {
@@ -145,6 +157,7 @@ func TestSplitJoinWaitsForEveryRaisedDecoder(t *testing.T) {
 	changeAutoscaledSplit(t, f, func(s *v1beta1.InferenceService) {
 		s.Spec.Engine.MinReplicas, s.Spec.Decoder.MinReplicas = ptr.To(18), ptr.To(18)
 		s.Spec.Placement.ClusterAffinity = testAffinity("")
+		twoRoutersEach(s, 3)
 	})
 	running := func(decoders int32) func(string) map[v1beta1.ComponentType]int32 {
 		return func(name string) map[v1beta1.ComponentType]int32 {

@@ -3,6 +3,8 @@ package holds
 import (
 	"context"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -20,9 +22,10 @@ type authority struct {
 	mayOwn func(owner types.RowOwner, plan types.ComponentPlan) bool
 
 	// everyRow marks an authority that speaks for rows the fact-bearing
-	// holds leave untouched — a deferred scale-down victim and a Failed
-	// row. Only the pause does: it releases its own token wherever it
-	// left one, and its record rule refuses those rows on its own terms.
+	// holds leave untouched — a leaving Instance the scale-down has not
+	// admitted, and a Failed row. Only the pause does: it releases its own
+	// token wherever it left one, and its record rule refuses those rows
+	// on its own terms.
 	everyRow bool
 
 	// report is the authority's reading of the row.
@@ -40,6 +43,15 @@ type reading struct {
 	evidence *types.InstanceTermination
 	// release retires this authority's own token.
 	release bool
+	// waitSince is when the reported wait began, for a wait that carries
+	// its own moment (the scheduler's PodScheduled transition). Zero when
+	// the wait carries none.
+	waitSince metav1.Time
+	// nodeLost names the target pods whose node stopped reporting: the
+	// ones that still hold their name, and the ones the force-delete
+	// sweep frees in this pass. None of them counts as placed. Only the
+	// node-unknown hold sets it.
+	nodeLost map[string]struct{}
 }
 
 // table is the eight holds in the order they are consulted within one
@@ -133,10 +145,12 @@ func Enters(token, current string) bool {
 //
 // A no-op when the slot is gone, has no operation, is refused by the
 // owner rule, or already carries a token this one may not take.
-func mark(ctx context.Context, input types.ReconcileInput, plan types.ComponentPlan, idx int32, a authority, evidence *types.InstanceTermination) (entered, held bool, err error) {
+// placementSince, when set, records the attempt's placement wait in the
+// same write (status.RecordWaiting).
+func mark(ctx context.Context, input types.ReconcileInput, plan types.ComponentPlan, idx int32, a authority, evidence *types.InstanceTermination, placementSince *metav1.Time) (entered, held bool, err error) {
 	return status.RecordWaiting(ctx, input, idx, a.token,
 		func(owner types.RowOwner) bool { return a.mayOwn(owner, plan) },
-		takesRowFrom, evidence)
+		takesRowFrom, evidence, placementSince)
 }
 
 // release retires token once its authority reports the wait over.
@@ -144,11 +158,14 @@ func mark(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 // Edge-triggered off the observation as well as the write: a pass over a
 // row that was never held reaches no mutation at all, so the common case
 // — every reconcile of every healthy row — costs nothing.
-func release(ctx context.Context, input types.ReconcileInput, idx int32, token string) error {
+//
+// clearPlacement also retires the attempt's placement wait in the same
+// write (status.ReleaseWaiting).
+func release(ctx context.Context, input types.ReconcileInput, idx int32, token string, clearPlacement bool) error {
 	if !observedHoldingToken(input, idx, token) {
 		return nil
 	}
-	return status.ReleaseWaiting(ctx, input, idx, token)
+	return status.ReleaseWaiting(ctx, input, idx, token, clearPlacement)
 }
 
 // observedHoldingToken reports whether this reconcile's observation of

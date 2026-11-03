@@ -351,15 +351,15 @@ func TestReadSilentPod(t *testing.T) {
 		{"terminating, node gone, within grace", quiet(corev1.PodRunning, "gone", ptrTime(tNow)), policy, WithinGrace, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ReadSilentPod(context.Background(), reader, tc.pod, tc.policy, tNow)
+			got, err := ReadUnreportedPod(context.Background(), reader, tc.pod, tc.policy, tNow)
 			if err != nil {
-				t.Fatalf("ReadSilentPod: %v", err)
+				t.Fatalf("ReadUnreportedPod: %v", err)
 			}
 			if got != tc.want {
-				t.Errorf("ReadSilentPod = %s, want %s", got, tc.want)
+				t.Errorf("ReadUnreportedPod = %s, want %s", got, tc.want)
 			}
-			if held := SilentPodHeld(tc.pod, got); held != tc.held {
-				t.Errorf("SilentPodHeld = %v, want %v", held, tc.held)
+			if held := UnreportedPodHeld(tc.pod, got); held != tc.held {
+				t.Errorf("UnreportedPodHeld = %v, want %v", held, tc.held)
 			}
 		})
 	}
@@ -409,7 +409,7 @@ func TestSilentKubeletTargetPods(t *testing.T) {
 		}
 		return set
 	}
-	got := SilentKubeletTargetPods(
+	got := UnreportedTargetPods(
 		[]*corev1.Pod{
 			pod("c", corev1.PodUnknown),
 			pod("a", corev1.PodUnknown),
@@ -421,10 +421,10 @@ func TestSilentKubeletTargetPods(t *testing.T) {
 	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
 		t.Fatalf("want the Unknown targets in name order [a c], got %v", got)
 	}
-	if SilentKubeletTargetPods(nil, names("a"), nil) != nil {
+	if UnreportedTargetPods(nil, names("a"), nil) != nil {
 		t.Error("no pods: want nil")
 	}
-	if SilentKubeletTargetPods([]*corev1.Pod{pod("a", corev1.PodUnknown)}, nil, nil) != nil {
+	if UnreportedTargetPods([]*corev1.Pod{pod("a", corev1.PodUnknown)}, nil, nil) != nil {
 		t.Error("no targets: want nil")
 	}
 
@@ -435,10 +435,10 @@ func TestSilentKubeletTargetPods(t *testing.T) {
 		withdrawn("ready", true, true, true),
 	}
 	all := names("withdrawn", "draining", "probe-failing", "ready")
-	if got := SilentKubeletTargetPods(shapes, all, nil); got != nil {
+	if got := UnreportedTargetPods(shapes, all, nil); got != nil {
 		t.Errorf("without a policy no Running pod is read as silent, got %v", got)
 	}
-	got = SilentKubeletTargetPods(shapes, all, policy)
+	got = UnreportedTargetPods(shapes, all, policy)
 	if len(got) != 1 || got[0].Name != "withdrawn" {
 		t.Fatalf("under a policy only the withdrawn-Ready shape is silent, got %v", got)
 	}

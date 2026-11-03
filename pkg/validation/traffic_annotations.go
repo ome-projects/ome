@@ -68,13 +68,15 @@ var trafficAnnotationKinds = map[string]trafficAnnotationKind{
 	constants.RolloutResumeAnnotation:          kindResumeTarget,
 }
 
-// resumableComponents are the Components a "<component>=<hash>"
-// ome.io/rollout-resume scope may name — the ones that carry a canary
-// rollout phase.
-var resumableComponents = map[string]struct{}{
-	string(v1beta1.EngineComponent):  {},
-	string(v1beta1.DecoderComponent): {},
-	string(v1beta1.RouterComponent):  {},
+// resumableRoles names the Components a "<component>=<hash>"
+// ome.io/rollout-resume scope may name — every role, since each carries a
+// canary rollout phase — in the order of v1beta1.Roles.
+func resumableRoles() string {
+	names := make([]string, 0, len(v1beta1.Roles))
+	for _, r := range v1beta1.Roles {
+		names = append(names, string(r.Type))
+	}
+	return strings.Join(names, ", ")
 }
 
 // validRetryOnTokens enumerates the documented Envoy retry-on
@@ -209,8 +211,8 @@ func validateAnnotationValue(key, value string, kind trafficAnnotationKind) erro
 		comp, hash, scoped := strings.Cut(value, "=")
 		if !scoped {
 			hash = value
-		} else if _, ok := resumableComponents[comp]; !ok {
-			return fmt.Errorf("annotation %q scope %q is not a Component that carries a canary rollout phase; use one of engine, decoder, router (InvalidRolloutResumeTarget)", key, comp)
+		} else if !isRole(v1beta1.ComponentType(comp)) {
+			return fmt.Errorf("annotation %q scope %q is not a Component that carries a canary rollout phase; use one of %s (InvalidRolloutResumeTarget)", key, comp, resumableRoles())
 		}
 		if !isRevisionHashToken(hash) {
 			return fmt.Errorf("annotation %q value %q must be the parked canary revision hash, copied from status.components.<component>.canary.canaryRevisionHash, optionally scoped as \"<component>=<hash>\" (lowercase alphanumeric, at least 6 chars) (InvalidRolloutResumeTarget)", key, value)

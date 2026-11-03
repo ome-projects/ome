@@ -170,16 +170,13 @@ func (r *InferenceServiceReconciler) markReplicaRefUnavailable(isvc *v1beta1.Inf
 	r.Recorder.Event(isvc, v1.EventTypeWarning, reason, message)
 }
 
-// roleReadyCondition is the top-level condition that reports a role's readiness.
+// roleReadyCondition is the top-level condition that reports a role's
+// readiness; a value that names no role reads as the engine's.
 func roleReadyCondition(c v1beta1.ComponentType) knapis.ConditionType {
-	switch c {
-	case v1beta1.DecoderComponent:
-		return v1beta1.DecoderReady
-	case v1beta1.RouterComponent:
-		return v1beta1.RouterReady
-	default:
-		return v1beta1.EngineReady
+	if cond, ok := v1beta1.ReadyConditionOf(c); ok {
+		return cond
 	}
+	return v1beta1.EngineReady
 }
 
 // replicaServingTemplate returns the pod template a role's stable Service

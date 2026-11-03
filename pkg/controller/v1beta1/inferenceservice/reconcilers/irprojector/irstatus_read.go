@@ -7,6 +7,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
@@ -187,4 +188,25 @@ func partitionOf(ir *v1beta1.InferenceReplica, err error) (int32, error) {
 		return 0, err
 	}
 	return IRPartition(ir), nil
+}
+
+// HeldRetryBlock reads a replica status's retry record for revision when
+// that record is Held: the attempts at the revision are spent and no fresh
+// start opens on it until a new revision or an operator release.
+func HeldRetryBlock(status *v1beta1.InferenceReplicaStatus, revision string) (v1beta1.RetryBlock, bool) {
+	if status == nil || revision == "" {
+		return v1beta1.RetryBlock{}, false
+	}
+	for i := range status.RetryBlocks {
+		if b := &status.RetryBlocks[i]; b.TargetRevision == revision && b.State == v1beta1.RetryBlockHeld {
+			return *b.DeepCopy(), true
+		}
+	}
+	return v1beta1.RetryBlock{}, false
+}
+
+// HeldUpdateReason is the hold text a Held retry record reads as; every
+// reader that names the record uses these words.
+func HeldUpdateReason(b v1beta1.RetryBlock) string {
+	return fmt.Sprintf("update to %s held after %d failed attempt(s): %s", b.TargetRevision, b.AttemptsStarted, b.Reason)
 }

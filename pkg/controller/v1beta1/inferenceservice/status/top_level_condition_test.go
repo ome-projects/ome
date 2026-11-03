@@ -46,6 +46,14 @@ func TestTopLevelComponentReadyFromLifecycle(t *testing.T) {
 			wantReason: "Ready",
 		},
 		{
+			name:       "encoder fully ready",
+			component:  v1beta1.EncoderComponent,
+			cs:         &v1beta1.LifecycleStatus{Replicas: 3, ReadyReplicas: 3, ServingReplicas: 3},
+			wantType:   v1beta1.EncoderReady,
+			wantStatus: corev1.ConditionTrue,
+			wantReason: "Ready",
+		},
+		{
 			name:       "engine partial, no budget: strict → not ready",
 			component:  v1beta1.EngineComponent,
 			cs:         &v1beta1.LifecycleStatus{Replicas: 2, ReadyReplicas: 1, ServingReplicas: 1},
@@ -127,6 +135,36 @@ func TestTopLevelComponentReadyFromLifecycle(t *testing.T) {
 			component:  v1beta1.RouterComponent,
 			cs:         &v1beta1.LifecycleStatus{Replicas: 1, ReadyReplicas: 1, ServingReplicas: 1},
 			wantType:   v1beta1.RouterReady,
+			wantStatus: corev1.ConditionTrue,
+			wantReason: "Ready",
+		},
+		{
+			// Held Instances: containers ready, none promoted into rotation.
+			name:       "router containers ready but no Instance serving → not ready",
+			component:  v1beta1.RouterComponent,
+			cs:         &v1beta1.LifecycleStatus{Replicas: 8, ReadyReplicas: 8},
+			lifecycle:  lifecycleWithMaxUnavailable(intstr.FromString("25%")),
+			wantType:   v1beta1.RouterReady,
+			wantStatus: corev1.ConditionFalse,
+			wantReason: "InsufficientAvailable",
+		},
+		{
+			// 25% of one Instance rounds up to the whole component, so the
+			// budget alone would let it read ready with nothing serving.
+			name:       "router 1/1 containers ready, none serving, budget covers every Instance → not ready",
+			component:  v1beta1.RouterComponent,
+			cs:         &v1beta1.LifecycleStatus{Replicas: 1, ReadyReplicas: 1},
+			lifecycle:  lifecycleWithMaxUnavailable(intstr.FromString("25%")),
+			wantType:   v1beta1.RouterReady,
+			wantStatus: corev1.ConditionFalse,
+			wantReason: "InsufficientAvailable",
+		},
+		{
+			// An in-place update drains one Instance while the other serves.
+			name:       "engine containers ready with one Instance drained → ready",
+			component:  v1beta1.EngineComponent,
+			cs:         &v1beta1.LifecycleStatus{Replicas: 2, ReadyReplicas: 2, ServingReplicas: 1},
+			wantType:   v1beta1.EngineReady,
 			wantStatus: corev1.ConditionTrue,
 			wantReason: "Ready",
 		},

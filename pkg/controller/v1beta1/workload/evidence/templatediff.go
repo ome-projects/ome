@@ -9,10 +9,10 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 )
 
-// CanonicalImage normalizes Docker Hub references for the runtime-vs-spec
+// canonicalImage normalizes Docker Hub references for the runtime-vs-spec
 // equality compare. Container runtimes may qualify a short reference with
 // docker.io while the Pod spec retains the short form.
-func CanonicalImage(img string) string {
+func canonicalImage(img string) string {
 	const dockerHubPrefix = "docker.io/"
 	if !strings.HasPrefix(img, dockerHubPrefix) {
 		return img
@@ -71,17 +71,17 @@ func ContainerRuntimeImageIs(pod *corev1.Pod, name, image string) bool {
 	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		if cs.Name == name {
-			return CanonicalImage(cs.Image) == CanonicalImage(image)
+			return canonicalImage(cs.Image) == canonicalImage(image)
 		}
 	}
 	return false
 }
 
-// PodRuntimeImageChangesMatch requires runtime confirmation only for
+// podRuntimeImageChangesMatch requires runtime confirmation only for
 // containers whose image field differs between the running and target
 // revisions. ContainerStatus.Image may name any repository tag for the
 // running image, so unchanged containers are not a transition signal.
-func PodRuntimeImageChangesMatch(pod *corev1.Pod, running, target *corev1.PodSpec) bool {
+func podRuntimeImageChangesMatch(pod *corev1.Pod, running, target *corev1.PodSpec) bool {
 	if pod == nil || target == nil {
 		return false
 	}

@@ -22,6 +22,12 @@ import (
 // desiredSplitPlan computes the whole matched set independently of readiness,
 // admission, and local usage. Retained outgoing allocations remain explicit.
 func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster, samples map[string]capacity.Sample) (plan.Proposal, error) {
+	return desiredSplitPlanFromSnapshot(source, clusters, samples, true)
+}
+
+// Actuation requires registration UIDs to verify the cluster it writes to.
+// Offline snapshots can omit server identities because projection writes none.
+func desiredSplitPlanFromSnapshot(source *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster, samples map[string]capacity.Sample, requireRegistrationUID bool) (plan.Proposal, error) {
 	selector, err := placementSelector(source)
 	if err != nil {
 		return plan.Proposal{}, err
@@ -35,7 +41,7 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 	}
 	floor := splitDesiredReplicas(source)
 	if floor <= 0 {
-		return plan.Proposal{}, fmt.Errorf("ReplicaCountUnresolved: declare split.replicas or a positive engine.minReplicas")
+		return plan.Proposal{}, replicaCountUnresolved(source)
 	}
 	proposal := plan.Proposal{Assignments: map[string]v1beta1.CandidateAllocationStatus{}}
 	if existing := source.Status.Placement; existing != nil && existing.Plan != nil {
@@ -50,7 +56,7 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 			}
 			assignment := *candidate.Allocation.DeepCopy()
 			assignment.DesiredReplicas = 0
-			assignment.MatchingTerms, assignment.Weight, assignment.ComponentMatches = nil, nil, nil
+			assignment.MatchingTerms, assignment.Weight, assignment.MinWeight, assignment.MaxWeight, assignment.ComponentMatches = nil, nil, nil, nil, nil
 			if placementMode(source) != v1beta1.PlacementModeSplitByCapacity {
 				assignment.Capacity = nil
 			}
@@ -58,6 +64,7 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 		}
 	}
 	weights := map[string]int64{}
+	ratioForm := affinity.UsesRatios(source.Spec.Placement.ClusterAffinity)
 	for i := range clusters {
 		cluster := &clusters[i]
 		if !cluster.DeletionTimestamp.IsZero() {
@@ -67,7 +74,7 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 		if !matches {
 			continue
 		}
-		if cluster.Name == "" || cluster.UID == "" {
+		if cluster.Name == "" || (requireRegistrationUID && cluster.UID == "") {
 			return plan.Proposal{}, fmt.Errorf("matched registration requires a name and UID")
 		}
 		if _, duplicate := weights[cluster.Name]; duplicate {
@@ -80,7 +87,10 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 		assignment.ClusterUID, assignment.MatchingTerms = cluster.UID, match.TermIndexes
 		assignment.ComponentMatches = componentMatchesOn(source, selectors, cluster)
 		if placementMode(source) == v1beta1.PlacementModeSplit {
-			assignment.Weight = ptr.To(match.Weight)
+			assignment.Weight, assignment.MinWeight = ptr.To(match.Weight), ptr.To(match.Weight)
+			if ratioForm {
+				assignment.MaxWeight = ptr.To(match.MaxWeight)
+			}
 			weights[cluster.Name] = match.Weight
 		} else {
 			sample, exists := samples[cluster.Name]
@@ -98,19 +108,15 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 		}
 		proposal.Assignments[cluster.Name] = assignment
 	}
-	var limit int32
-	if source.Spec.Placement.Split != nil {
-		limit = source.Spec.Placement.Split.MaxReplicasPerCluster
-	}
-	desired, err := allocation.Apportion(floor, weights, limit)
-	if err != nil {
-		return plan.Proposal{}, err
-	}
 	minimums, err := splitComponentMinimums(source)
 	if err != nil {
 		return plan.Proposal{}, err
 	}
-	if err := checkDesiredSplitFloors(source, minimums, desired.Targets, proposal.Assignments, limit); err != nil {
+	desired, err := allocation.Apportion(floor, weights, minimums.ceilings(source)[minimums.primary])
+	if err != nil {
+		return plan.Proposal{}, err
+	}
+	if err := checkDesiredSplitFloors(source, minimums, desired.Targets, proposal.Assignments); err != nil {
 		return plan.Proposal{}, err
 	}
 	proposal.UnassignedReplicas = desired.Unassigned
@@ -120,11 +126,12 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 		proposal.Assignments[name] = assignment
 	}
 	// The digest describes desired intent only. Intermediate movement and fresh
-	// heartbeat timestamps cannot reset a transition's original floor.
+	// heartbeat timestamps cannot reset a transition's original floor. MinWeight
+	// repeats Weight, so it stays out and stored plans keep their digest.
 	intent := make(map[string]v1beta1.CandidateAllocationStatus, len(weights))
 	for name := range weights {
-		stored := proposal.Assignments[name]
-		assignment := stored.DeepCopy()
+		stored := plan.WithoutMinWeight(proposal.Assignments[name])
+		assignment := &stored
 		assignment.OriginalReplicas, assignment.CurrentReplicas, assignment.DrainRequested = 0, 0, false
 		if assignment.Capacity != nil {
 			for i := range assignment.Capacity.Pools {
@@ -140,7 +147,7 @@ func desiredSplitPlan(source *v1beta1.InferenceService, clusters []v1beta1.Workl
 		Labels      map[string]string
 		Assignments map[string]v1beta1.CandidateAllocationStatus
 		Unassigned  int32
-	}{Spec: source.Spec, Annotations: source.Annotations, Labels: source.Labels, Assignments: intent, Unassigned: desired.Unassigned})
+	}{Spec: source.Spec, Annotations: planIntentAnnotations(source.Annotations), Labels: source.Labels, Assignments: intent, Unassigned: desired.Unassigned})
 	if err != nil {
 		return plan.Proposal{}, fmt.Errorf("encode placement intent: %w", err)
 	}
@@ -163,34 +170,41 @@ func componentMatchesOn(source *v1beta1.InferenceService, selectors map[v1beta1.
 			continue
 		}
 		if match, matches := selectors[component].Match(cluster); matches {
-			out = append(out, v1beta1.ComponentAffinityMatch{Component: component, Weight: ptr.To(match.Weight)})
+			entry := v1beta1.ComponentAffinityMatch{Component: component, Weight: ptr.To(match.Weight), MinWeight: ptr.To(match.Weight)}
+			if affinity.UsesRatios(source.Spec.Placement.ClusterAffinity) {
+				entry.MaxWeight = ptr.To(match.MaxWeight)
+			}
+			out = append(out, entry)
 		}
 	}
 	return out
 }
 
 // checkDesiredSplitFloors holds a plan whose secondary floors cannot be met:
-// fewer replicas than members that hold the primary component, or, for a
-// component apportioned by its own weights, a share above its scaled ceiling.
-func checkDesiredSplitFloors(source *v1beta1.InferenceService, minimums splitMinimums, targets map[string]int32, assignments map[string]v1beta1.CandidateAllocationStatus, ceiling int32) error {
+// fewer replicas than members that hold the primary component, or a share
+// above the component's cap. A share that follows the primary shares stays
+// within a cap scaled from the primary's, so only a component apportioned by
+// its own weights, or with a cap of its own, is checked.
+func checkDesiredSplitFloors(source *v1beta1.InferenceService, minimums splitMinimums, targets map[string]int32, assignments map[string]v1beta1.CandidateAllocationStatus) error {
 	weights := splitWeightsOf(source, assignments)
 	floors, err := apportionSplitFloors(minimums, targets, weights)
 	if err != nil {
 		return err
 	}
-	if ceiling <= 0 {
-		return nil
-	}
+	split := splitSpecOf(source)
+	ceilings := minimums.ceilings(source)
 	own := weights.ownWeights()
-	primaryMinimum := int64(minimums.floors[minimums.primary])
 	for _, name := range slices.Sorted(maps.Keys(floors)) {
-		for _, floor := range floors[name] {
-			if _, independent := own[floor.Component]; !independent {
+		for _, share := range floors[name] {
+			ceiling := ceilings[share.Component]
+			if ceiling <= 0 || share.Component == minimums.primary {
 				continue
 			}
-			scaled := (int64(ceiling)*int64(minimums.floors[floor.Component]) + primaryMinimum - 1) / primaryMinimum
-			if int64(floor.Replicas) > scaled {
-				return fmt.Errorf("%s share %d on cluster %q exceeds its ceiling of %d replicas from split.maxReplicasPerCluster", floor.Component, floor.Replicas, name, scaled)
+			if _, independent := own[share.Component]; !independent && split.Ceiling(share.Component) == 0 {
+				continue
+			}
+			if share.Replicas > ceiling {
+				return fmt.Errorf("%s share %d on cluster %q exceeds its ceiling of %d replicas from split.maxPerCluster", share.Component, share.Replicas, name, ceiling)
 			}
 		}
 	}

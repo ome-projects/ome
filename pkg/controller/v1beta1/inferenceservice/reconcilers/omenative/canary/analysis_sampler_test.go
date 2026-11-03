@@ -8,22 +8,17 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestResolveBearerToken(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "prom-auth", Namespace: "ns"},
 		Data:       map[string][]byte{"token": []byte("s3cr3t")},
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(secret))
 	ref := func(name, key string) *corev1.SecretKeySelector {
 		return &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: name},
@@ -62,17 +57,13 @@ func TestResolveBearerToken(t *testing.T) {
 // reference, or the token value behind it), and never embeds raw secret
 // material.
 func TestBuildSampleRequest_PlanHash(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
 	const tokenValue = "s3cr3t-token"
 	newInputs := func(token string) ReconcileInputs {
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: "prom-auth", Namespace: "ns"},
 			Data:       map[string][]byte{"token": []byte(token), "alt": []byte(token)},
 		}
-		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+		c := fakeclient.New(t, fakeclient.WithObjects(secret))
 		return ReconcileInputs{
 			Reader: c,
 			ISVC:   &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"}},
@@ -139,7 +130,7 @@ func TestBuildSampleRequest_PlanHash(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "prom-auth-2", Namespace: "ns"},
 				Data:       map[string][]byte{"token": []byte(tokenValue)},
 			}
-			in.Reader = fake.NewClientBuilder().WithScheme(scheme).WithObjects(sec).Build()
+			in.Reader = fakeclient.New(t, fakeclient.WithObjects(sec))
 			return in
 		}, nil},
 		{"auth secret key", func() ReconcileInputs {
@@ -177,15 +168,11 @@ func TestBuildSampleRequest_PlanHash(t *testing.T) {
 // through ReconcileInputs.Reader (the live API reader), never the cached
 // Client — a cached Get would start a cluster-wide Secret informer.
 func TestBuildSampleRequest_ReadsSecretViaReader(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "prom-auth", Namespace: "ns"},
 		Data:       map[string][]byte{"token": []byte("s3cr3t")},
 	}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(secret))
 
 	in := ReconcileInputs{
 		Reader: c, // Client deliberately unset: the read must go through Reader

@@ -397,6 +397,11 @@ type replicaPass struct {
 	// publishOnReturn is set once the pass may write status: from then on
 	// every return, early or not, publishes the status.
 	publishOnReturn bool
+	// instancesAtStart lists the Instances that had a row when the
+	// publication was set up, before the engine ran: the publication carries
+	// a hold recorded by an earlier pass only while this pass removed none
+	// of them.
+	instancesAtStart []int32
 
 	peerRevisionFor   coordination.PeerRevisionFunc
 	deps              workloadtypes.Deps
@@ -763,7 +768,10 @@ func (p *replicaPass) clearIdleScaleDownGauges(context.Context) (bool, error) {
 // revision, writes the counters, the conditions and the hold, and sweeps
 // old revisions. The publication also stops the readiness deadlines of a
 // paused replica, so a failed live read or PodGroup step must not skip it.
+// It notes the Instances that have a row now, so the publication can tell
+// a row this pass removed from one that never was.
 func (p *replicaPass) installStatusPublication(context.Context) (bool, error) {
+	p.instancesAtStart = instanceIndices(p.ir.Status.InstanceStatuses)
 	p.publishOnReturn = true
 	return true, nil
 }
@@ -1001,7 +1009,7 @@ func (p *replicaPass) publishStatus(ctx context.Context, result ctrl.Result, err
 	if ended, promoteResult, promoteErr := p.promoteCurrentRevision(ctx, err); ended {
 		return promoteResult, promoteErr
 	}
-	nextAvailableIn, serr := p.reconciler.aggregateAndWriteStatus(ctx, p.ir, p.plan, p.specTarget, p.holdObserved, p.hold)
+	nextAvailableIn, serr := p.reconciler.aggregateAndWriteStatus(ctx, p.ir, p.plan, p.specTarget, p.holdObserved, p.hold, p.instancesAtStart)
 	if errors.Is(serr, workloadtypes.ErrStatusMutationPrecondition) {
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -1338,6 +1346,10 @@ type lifecycleSettings struct {
 	// Unschedulable bounds a pod the scheduler cannot place. Zero leaves
 	// the hold parking the clock until an operator resolves it.
 	Unschedulable time.Duration
+	// GangDomainFull bounds a gang member the scheduler cannot place because
+	// the domain its gang is held to cannot take it. Zero leaves such a
+	// hold on Unschedulable.
+	GangDomainFull time.Duration
 	// AbandonedReplacement bounds the termination grace of a replacement
 	// pod a rollout abandons before it ever served. Zero leaves such a pod
 	// its own grace.
@@ -1374,6 +1386,9 @@ func (r *Reconciler) resolveLifecycleSettings(log logr.Logger) lifecycleSettings
 	}
 	if settings.Unschedulable, err = cfg.ToUnschedulableGracePeriod(); err != nil {
 		log.V(1).Info("unschedulable grace invalid; scheduler-hold escalation disabled this pass", "error", err.Error())
+	}
+	if settings.GangDomainFull, err = cfg.ToGangDomainFullGracePeriod(); err != nil {
+		log.V(1).Info("full-domain grace invalid; a gang held to a full domain waits on the unschedulable grace this pass", "error", err.Error())
 	}
 	if settings.AbandonedReplacement, err = cfg.ToAbandonedReplacementGracePeriod(); err != nil {
 		log.V(1).Info("abandoned-replacement grace invalid; an abandoned replacement keeps its own grace this pass", "error", err.Error())

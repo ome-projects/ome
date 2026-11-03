@@ -13,7 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -23,6 +22,7 @@ import (
 	placementendpoint "sigs.k8s.io/ome/pkg/controller/v1beta1/placement/endpoint"
 	placementrouting "sigs.k8s.io/ome/pkg/controller/v1beta1/placement/routing"
 	workloadcluster "sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 type managerTestTrafficMapPublisher struct {
@@ -374,8 +374,8 @@ func TestGatewayTrafficMapResyncInterval_SlicesOnOrOff_EarlierActiveCadenceWins(
 }
 
 func TestNewGatewayTrafficMapPublisher_GlobalOptions_RejectedOtherwiseBuilt(t *testing.T) {
-	kubeClient := fakeclient.NewClientBuilder().Build()
-	apiReader := fakeclient.NewClientBuilder().Build()
+	kubeClient := fakeclient.New(t)
+	apiReader := fakeclient.New(t)
 	endpointConfig := placementendpoint.Config{
 		GatewayBackend: placementendpoint.GatewayBackendConfig{
 			EndpointSlices: placementendpoint.GatewayBackendEndpointSliceConfig{
@@ -413,8 +413,8 @@ func TestNewGatewayTrafficMapPublisher_GlobalOptions_RejectedOtherwiseBuilt(t *t
 }
 
 func TestNewTrafficMapPublisherReconciler_ActiveOrNot_RequeueOnlyWhileActive(t *testing.T) {
-	kubeClient := fakeclient.NewClientBuilder().Build()
-	apiReader := fakeclient.NewClientBuilder().Build()
+	kubeClient := fakeclient.New(t)
+	apiReader := fakeclient.New(t)
 	publisher := &managerTestTrafficMapPublisher{}
 	globalOptions := map[string]string{"safeOption": "value"}
 	selected := &placementrouting.TrafficMapPublisher{

@@ -575,6 +575,83 @@ func TestPlaceReplacesASliceWithAnUnavailableHost(t *testing.T) {
 	}
 }
 
+// A ready slice that no pod holds cannot start its slot on a healthy host
+// whose other pods leave too little memory for the slot's pod: the pod is
+// withheld and reported, Sweep releases the slice, and the next pass
+// provisions the slot again instead of confining a pod to hosts the scheduler refuses.
+func TestPlaceReplacesASliceWithAHostShortOfMemory(t *testing.T) {
+	f := provisioning(t)
+	name := f.p.Name(Slot{})
+	f.seed(t, stored(t, f.p, demand(t, "2x2x1"), Slot{}, withState("ACTIVE", "")))
+	f.addNodes(t, sliceNode("node-b", name, allocatable(corev1.ResourceList{corev1.ResourceMemory: gib(200)})))
+	if err := f.slices.Create(context.Background(), boundPod("cache", "node-b", corev1.ResourceList{corev1.ResourceMemory: gib(40)})); err != nil {
+		t.Fatalf("add the cache pod: %v", err)
+	}
+	old, _ := getSlice(t, f.slices, name)
+	input := placerInput(requesting(podSpec("tpu-a", "2x2x1", 4), corev1.ResourceList{corev1.ResourceMemory: gib(180)}), nil)
+	plan := workload.ComponentPlan{Instances: []workload.InstancePlan{singlePod(0)}}
+
+	pl := f.placer()
+	if selector, placed := place(t, pl, input, singlePod(0), workload.RunnerDefault, 0); placed || selector != nil {
+		t.Fatalf("Place = %v, %v; want the pod withheld from a slice whose host is short of memory", selector, placed)
+	}
+	want := "node node-b has 160.0Gi of memory left unrequested, but a pod requests 180.0Gi"
+	if got := f.events(); len(got) != 1 || !strings.Contains(got[0], string(EventReasonSliceHostShortOfResources)) || !strings.Contains(got[0], want) {
+		t.Fatalf("events = %v, want one %s warning naming the host's shortfall", got, EventReasonSliceHostShortOfResources)
+	}
+	if reason, held := pending(t, f.placer(), input, singlePod(0), 0); !held || !strings.Contains(reason, want) {
+		t.Fatalf("Pending = %q, %v; want the host's shortfall named", reason, held)
+	}
+	if err := pl.Sweep(context.Background(), input, plan); err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if _, found := getSlice(t, f.slices, name); found {
+		t.Fatal("Sweep kept a slice whose host cannot fit the slot's pod")
+	}
+
+	place(t, f.placer(), input, singlePod(0), workload.RunnerDefault, 0)
+	if fresh, found := getSlice(t, f.slices, name); !found || fresh.GetUID() == old.GetUID() {
+		t.Fatalf("slice %s found = %v; want the slot provisioned again", name, found)
+	}
+}
+
+// When a DaemonSet pod leaves too little memory for the slot's pod, every
+// matching host has the same shortfall, so another slice would not help. The
+// pod is withheld with a warning, and the slice is kept rather than replaced
+// over and over.
+func TestPlaceKeepsASliceWhenDaemonSetPodsLeaveTooLittle(t *testing.T) {
+	f := provisioning(t)
+	name := f.p.Name(Slot{})
+	f.seed(t, stored(t, f.p, demand(t, "2x2x1"), Slot{}, withState("ACTIVE", "")))
+	f.addNodes(t, sliceNode("node-b", name, allocatable(corev1.ResourceList{corev1.ResourceMemory: gib(200)})))
+	if err := f.slices.Create(context.Background(), boundPod("cache", "node-b", corev1.ResourceList{corev1.ResourceMemory: gib(40)}, ownedBy("DaemonSet"))); err != nil {
+		t.Fatalf("add the DaemonSet pod: %v", err)
+	}
+	old, _ := getSlice(t, f.slices, name)
+	input := placerInput(requesting(podSpec("tpu-a", "2x2x1", 4), corev1.ResourceList{corev1.ResourceMemory: gib(180)}), nil)
+	plan := workload.ComponentPlan{Instances: []workload.InstancePlan{singlePod(0)}}
+
+	for pass := range 2 {
+		pl := f.placer()
+		if selector, placed := place(t, pl, input, singlePod(0), workload.RunnerDefault, 0); placed || selector != nil {
+			t.Fatalf("pass %d: Place = %v, %v; want the pod withheld", pass, selector, placed)
+		}
+		want := "node node-b has 160.0Gi of memory left next to its DaemonSet and static pods, but a pod requests 180.0Gi"
+		if got := f.events(); len(got) != 1 || !strings.Contains(got[0], string(EventReasonSlicePodsTooLargeForHosts)) || !strings.Contains(got[0], want) {
+			t.Fatalf("pass %d: events = %v, want one %s warning naming the shortfall", pass, got, EventReasonSlicePodsTooLargeForHosts)
+		}
+		if reason, held := pending(t, f.placer(), input, singlePod(0), 0); !held || !strings.Contains(reason, "the slice is kept") {
+			t.Fatalf("pass %d: Pending = %q, %v; want the pod withheld and the slice kept", pass, reason, held)
+		}
+		if err := pl.Sweep(context.Background(), input, plan); err != nil {
+			t.Fatalf("pass %d: Sweep: %v", pass, err)
+		}
+		if kept, found := getSlice(t, f.slices, name); !found || kept.GetUID() != old.GetUID() {
+			t.Fatalf("pass %d: slice %s found = %v; want the same slice kept", pass, name, found)
+		}
+	}
+}
+
 // A slice a pod holds is left to the scheduler: the pods its slot still needs
 // may fit on the hosts that can take them.
 func TestPlaceLeavesAHeldSliceToTheScheduler(t *testing.T) {

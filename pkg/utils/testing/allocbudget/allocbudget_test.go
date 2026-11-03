@@ -16,8 +16,8 @@ var sink []byte
 // TestGolden_RecordingNamesTheDayAndTheMachine: a re-recorded golden names
 // the day and the kind of machine its counts came from and nothing else:
 // no commit, and the Go release without a build suffix. A golden recorded
-// with an older stamp still opens, and the comparison never reads the
-// stamp.
+// with an older header still opens, and the comparison never reads the
+// header.
 func TestGolden_RecordingNamesTheDayAndTheMachine(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fleet_allocations.json")
 	seed := `{"recordedOn":{"commit":"0123456789","date":"2026-01-01","machine":"elsewhere"},"reason":"seed","tolerancePercent":100,"budgets":{"one":1}}`

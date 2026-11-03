@@ -125,9 +125,10 @@ func (e *Engine) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 // reconcileOMENativeSubresources delegates to the shared
 // ReconcileOMENativeSubresources helper in base.go — engine, decoder,
 // and router emit byte-identical Service + PodMonitor pairs; only the
-// component enum and ComponentExtensionSpec pointer differ.
+// component enum, the ComponentExtensionSpec pointer and the effective
+// multi-pod shape differ.
 func (e *Engine) reconcileOMENativeSubresources(ctx context.Context, isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta, podSpec *v1.PodSpec) error {
-	return ReconcileOMENativeSubresources(ctx, &e.BaseComponentFields, isvc, v1beta1.EngineComponent, &e.engineSpec.ComponentExtensionSpec, objectMeta, podSpec)
+	return ReconcileOMENativeSubresources(ctx, &e.BaseComponentFields, isvc, v1beta1.EngineComponent, &e.engineSpec.ComponentExtensionSpec, objectMeta, podSpec, render.EngineIsMultiPod(e.engineSpec))
 }
 
 // reconcileDeployment manages the deployment logic for different deployment modes
@@ -151,7 +152,7 @@ func (e *Engine) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 	case constants.OMENative:
 		// Admission rejects orphan Leader/Worker and Worker.Size <= 0, so
 		// the only valid multi-pod shape has both fields set.
-		multiPod := e.engineSpec.Leader != nil && e.engineSpec.Worker != nil
+		multiPod := render.EngineIsMultiPod(e.engineSpec)
 		// OMENative-mode Components dispatch through the InferenceReplica
 		// path: the ISVC controller projects the desired per-Component
 		// spec onto an InferenceReplica object; the IR controller drives

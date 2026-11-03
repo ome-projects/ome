@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -45,58 +46,65 @@ func fromConfig(cfg *controllerconfig.DeployConfig) values {
 	}
 }
 
-// Engine fills the merged engine spec in place. mode is the Component's
-// resolved deployment mode; lifecycle fields are filled only for OMENative,
-// the one backend that reads them. A nil engine is a no-op.
-func Engine(engine *v1beta1.EngineSpec, mode constants.DeploymentModeType, cfg *controllerconfig.DeployConfig) {
-	if engine == nil {
+// role is the view of one component the filler writes to: the kind the
+// per-component defaults are keyed by, the extension spec, the component's
+// own pod spec, and the Leader+Worker pair, which a router does not have.
+type role struct {
+	kind      workloadtypes.ComponentType
+	extension *v1beta1.ComponentExtensionSpec
+	podSpec   *v1beta1.PodSpec
+	leader    *v1beta1.LeaderSpec
+	worker    *v1beta1.WorkerSpec
+}
+
+// Role fills one role's merged block in place, read through its view. mode
+// is the role's resolved deployment mode; lifecycle fields are filled only
+// for OMENative, the one backend that reads them. A nil view is a no-op.
+func Role(view *v1beta1.RoleView, mode constants.DeploymentModeType, cfg *controllerconfig.DeployConfig) {
+	if view == nil {
 		return
 	}
-	v := fromConfig(cfg)
-	replicaBounds(&engine.ComponentExtensionSpec, v.replicas.Min(), v.replicas.EngineMax())
-	terminationGracePeriod(&engine.PodSpec, v.gracePeriod)
-	if engine.Leader != nil {
-		terminationGracePeriod(&engine.Leader.PodSpec, v.gracePeriod)
-	}
-	if engine.Worker != nil {
-		terminationGracePeriod(&engine.Worker.PodSpec, v.gracePeriod)
-	}
-	workerSize(engine.Leader, engine.Worker)
-	if mode == constants.OMENative {
-		lifecycle(&engine.ComponentExtensionSpec, v.minReadySeconds, v.updateStrategy.ForComponent(workloadtypes.ComponentEngine))
-	}
+	fill(role{
+		kind:      v1beta1convert.ComponentTypeToWorkload(view.Type),
+		extension: view.Extension,
+		podSpec:   view.PodSpec,
+		leader:    view.Leader,
+		worker:    view.Worker,
+	}, mode, cfg)
+}
+
+// Engine fills the merged engine spec in place. A nil engine is a no-op.
+func Engine(engine *v1beta1.EngineSpec, mode constants.DeploymentModeType, cfg *controllerconfig.DeployConfig) {
+	Role(v1beta1.RoleSpecs{Engine: engine}.View(v1beta1.EngineComponent), mode, cfg)
 }
 
 // Decoder is Engine for the decoder component.
 func Decoder(decoder *v1beta1.DecoderSpec, mode constants.DeploymentModeType, cfg *controllerconfig.DeployConfig) {
-	if decoder == nil {
-		return
-	}
-	v := fromConfig(cfg)
-	replicaBounds(&decoder.ComponentExtensionSpec, v.replicas.Min(), v.replicas.DecoderMax())
-	terminationGracePeriod(&decoder.PodSpec, v.gracePeriod)
-	if decoder.Leader != nil {
-		terminationGracePeriod(&decoder.Leader.PodSpec, v.gracePeriod)
-	}
-	if decoder.Worker != nil {
-		terminationGracePeriod(&decoder.Worker.PodSpec, v.gracePeriod)
-	}
-	workerSize(decoder.Leader, decoder.Worker)
-	if mode == constants.OMENative {
-		lifecycle(&decoder.ComponentExtensionSpec, v.minReadySeconds, v.updateStrategy.ForComponent(workloadtypes.ComponentDecoder))
-	}
+	Role(v1beta1.RoleSpecs{Decoder: decoder}.View(v1beta1.DecoderComponent), mode, cfg)
 }
 
 // Router is Engine for the router component, which has no Leader or Worker.
 func Router(router *v1beta1.RouterSpec, mode constants.DeploymentModeType, cfg *controllerconfig.DeployConfig) {
-	if router == nil {
-		return
-	}
+	Role(v1beta1.RoleSpecs{Router: router}.View(v1beta1.RouterComponent), mode, cfg)
+}
+
+// fill writes the configured defaults into one component: the replica
+// bounds, the termination grace period of every pod spec the component
+// declares, one worker for a Leader+Worker pair without a size, and, for
+// OMENative only, the lifecycle fields.
+func fill(r role, mode constants.DeploymentModeType, cfg *controllerconfig.DeployConfig) {
 	v := fromConfig(cfg)
-	replicaBounds(&router.ComponentExtensionSpec, v.replicas.Min(), v.replicas.RouterMax())
-	terminationGracePeriod(&router.PodSpec, v.gracePeriod)
+	replicaBounds(r.extension, v.replicas.Min(), v.replicas.MaxFor(r.kind))
+	terminationGracePeriod(r.podSpec, v.gracePeriod)
+	if r.leader != nil {
+		terminationGracePeriod(&r.leader.PodSpec, v.gracePeriod)
+	}
+	if r.worker != nil {
+		terminationGracePeriod(&r.worker.PodSpec, v.gracePeriod)
+	}
+	workerSize(r.leader, r.worker)
 	if mode == constants.OMENative {
-		lifecycle(&router.ComponentExtensionSpec, v.minReadySeconds, v.updateStrategy.ForComponent(workloadtypes.ComponentRouter))
+		lifecycle(r.extension, v.minReadySeconds, v.updateStrategy.ForComponent(r.kind))
 	}
 }
 

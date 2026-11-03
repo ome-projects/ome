@@ -52,7 +52,7 @@ type probeIdentity struct {
 	PolicyDigest string
 }
 
-// targetProbeState is the prober's running verdict for one exact target identity.
+// targetProbeState is the prober's running state for one exact target identity.
 type targetProbeState struct {
 	identity probeIdentity
 
@@ -171,8 +171,8 @@ func (p *Prober) Reconcile(ctx context.Context, req ProbeReconcileRequest) (time
 	for i := range jobs {
 		job := &jobs[i]
 		future, submitErr := p.Executor.Submit(ctx, req.Policy.Probe.Timeout, func(jobCtx context.Context) error {
-			verdict, message := p.probeOne(jobCtx, job.target, req.Policy.Probe)
-			job.recorded.Store(p.record(job.identity, job.generation, verdict, message, p.Clock.Now()))
+			outcome, message := p.probeOne(jobCtx, job.target, req.Policy.Probe)
+			job.recorded.Store(p.record(job.identity, job.generation, outcome, message, p.Clock.Now()))
 			return nil
 		})
 		if submitErr != nil {
@@ -240,7 +240,7 @@ func (p *Prober) prepare(req ProbeReconcileRequest, targets []Target) []schedule
 		}
 		state.generation = p.nextToken
 		state.inFlight = true
-		state.nextProbeTime = advanceProbeDeadline(state.nextProbeTime, now, req.Policy.Probe.Period)
+		state.nextProbeTime = advanceDeadline(state.nextProbeTime, now, req.Policy.Probe.Period)
 		jobs = append(jobs, scheduledProbe{
 			target:     target,
 			identity:   identity,
@@ -258,60 +258,20 @@ func (p *Prober) prepare(req ProbeReconcileRequest, targets []Target) []schedule
 	return jobs
 }
 
+// normalizeProbeTargets checks the request's targets by the rules both
+// observers share and by the probe's own: every target carries the digest of
+// the policy the request resolved.
 func normalizeProbeTargets(req ProbeReconcileRequest) ([]Target, error) {
-	targets := make([]Target, len(req.Targets))
-	seen := make(map[string]struct{}, len(req.Targets))
-	for i, target := range req.Targets {
-		if target.OwnerUID == "" {
-			return nil, fmt.Errorf("probe target cluster %q has an empty owner UID", target.Cluster)
-		}
-		if target.OwnerUID != req.OwnerUID {
-			return nil, fmt.Errorf("probe target cluster %q has owner UID %q, want %q",
-				target.Cluster, target.OwnerUID, req.OwnerUID)
-		}
-		if target.Map.Namespace == "" || target.Map.Name == "" {
-			return nil, fmt.Errorf("probe target cluster %q has an empty TrafficMap identity", target.Cluster)
-		}
-		if target.Map != req.Map {
-			return nil, fmt.Errorf("probe target cluster %q belongs to TrafficMap %q, want %q",
-				target.Cluster, target.Map.String(), req.Map.String())
-		}
+	return normalizeTargets("probe", req.OwnerUID, req.Map, req.Targets, func(target Target) error {
 		if target.PolicyDigest == "" {
-			return nil, fmt.Errorf("probe target cluster %q has an empty policy digest", target.Cluster)
+			return fmt.Errorf("probe target cluster %q has an empty policy digest", target.Cluster)
 		}
 		if target.PolicyDigest != req.Policy.PolicyDigest {
-			return nil, fmt.Errorf("probe target cluster %q has policy digest %q, want %q",
+			return fmt.Errorf("probe target cluster %q has policy digest %q, want %q",
 				target.Cluster, target.PolicyDigest, req.Policy.PolicyDigest)
 		}
-		if target.Cluster == "" {
-			return nil, errors.New("probe target cluster is empty")
-		}
-		if _, found := seen[target.Cluster]; found {
-			return nil, fmt.Errorf("probe target cluster %q is duplicated", target.Cluster)
-		}
-		seen[target.Cluster] = struct{}{}
-		endpoint, err := CanonicalEndpoint(target.URL)
-		if err != nil {
-			return nil, fmt.Errorf("probe target cluster %q: %w", target.Cluster, err)
-		}
-		target.OwnerUID = req.OwnerUID
-		target.Map = req.Map
-		target.URL = endpoint
-		target.PolicyDigest = req.Policy.PolicyDigest
-		targets[i] = target
-	}
-	sort.Slice(targets, func(i, j int) bool { return targets[i].Cluster < targets[j].Cluster })
-	return targets, nil
-}
-
-func advanceProbeDeadline(deadline, now time.Time, period time.Duration) time.Time {
-	if deadline.IsZero() {
-		return now.Add(period)
-	}
-	if deadline.After(now) {
-		return deadline
-	}
-	return deadline.Add((now.Sub(deadline)/period + 1) * period)
+		return nil
+	})
 }
 
 func (p *Prober) nextDelay(ownerUID types.UID, mapKey types.NamespacedName, targets []Target, now time.Time) time.Duration {
@@ -417,41 +377,41 @@ func (p *Prober) Forget(mapKey types.NamespacedName) {
 
 // probeOne issues one request. Its context deadline is supplied by the
 // ObserverExecutor after the job leaves the queue.
-func (p *Prober) probeOne(ctx context.Context, target Target, config ProbeConfig) (Verdict, string) {
+func (p *Prober) probeOne(ctx context.Context, target Target, config ProbeConfig) (ProbeOutcome, string) {
 	probeURL, err := url.JoinPath(target.URL, config.Path)
 	if err != nil {
-		return VerdictInconclusive, fmt.Sprintf("probe could not run: %v", err)
+		return ProbeOutcomeInconclusive, fmt.Sprintf("probe could not run: %v", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, config.Method, probeURL, nil)
 	if err != nil {
-		return VerdictInconclusive, fmt.Sprintf("probe could not run: %v", err)
+		return ProbeOutcomeInconclusive, fmt.Sprintf("probe could not run: %v", err)
 	}
 	response, err := p.Client.Do(req)
 	if err != nil {
-		return VerdictFail, fmt.Sprintf("transport error: %v", err)
+		return ProbeOutcomeFail, fmt.Sprintf("transport error: %v", err)
 	}
 	defer func() { _ = response.Body.Close() }()
 	if _, err := io.Copy(io.Discard, io.LimitReader(response.Body, p.MaxResponseBytes)); err != nil {
-		return VerdictFail, fmt.Sprintf("response body error: %v", err)
+		return ProbeOutcomeFail, fmt.Sprintf("response body error: %v", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return VerdictFail, fmt.Sprintf("transport error: %v", err)
+		return ProbeOutcomeFail, fmt.Sprintf("transport error: %v", err)
 	}
 
-	switch verdict := config.ClassifyStatus(response.StatusCode); verdict {
-	case VerdictPass:
-		return VerdictPass, fmt.Sprintf("HTTP %d", response.StatusCode)
-	case VerdictFail:
-		return VerdictFail, fmt.Sprintf("HTTP %d", response.StatusCode)
+	switch config.ClassifyStatus(response.StatusCode) {
+	case ProbeOutcomePass:
+		return ProbeOutcomePass, fmt.Sprintf("HTTP %d", response.StatusCode)
+	case ProbeOutcomeFail:
+		return ProbeOutcomeFail, fmt.Sprintf("HTTP %d", response.StatusCode)
 	default:
-		return VerdictInconclusive, fmt.Sprintf("HTTP %d (not in accept or gate list)", response.StatusCode)
+		return ProbeOutcomeInconclusive, fmt.Sprintf("HTTP %d (not in accept or gate list)", response.StatusCode)
 	}
 }
 
 func (p *Prober) record(
 	identity probeIdentity,
 	generation uint64,
-	verdict Verdict,
+	outcome ProbeOutcome,
 	message string,
 	observedAt time.Time,
 ) bool {
@@ -466,10 +426,10 @@ func (p *Prober) record(
 	state.lastMessage = message
 	state.lastProbeTime = observedAt
 
-	switch verdict {
-	case VerdictInconclusive:
+	switch outcome {
+	case ProbeOutcomeInconclusive:
 		state.lastResult = v1beta1.ProbeResultUnknown
-	case VerdictFail:
+	case ProbeOutcomeFail:
 		state.consecutivePasses = 0
 		if state.consecutiveFailures < math.MaxInt32 {
 			state.consecutiveFailures++
@@ -479,7 +439,7 @@ func (p *Prober) record(
 		if state.consecutiveFailures >= state.failureThreshold {
 			state.gated = true
 		}
-	case VerdictPass:
+	case ProbeOutcomePass:
 		state.consecutiveFailures = 0
 		state.lastResult = v1beta1.ProbeResultPassing
 		state.hasConclusiveResult = true

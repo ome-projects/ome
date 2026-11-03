@@ -440,7 +440,7 @@ func (r *gangSurgeRoll) createMissingMembers(ctx context.Context, deps workload.
 		return false, err
 	}
 	if rearm {
-		if err := rearmGangSurgeRebuild(ctx, deps, input, r.plan, r.source, r.surgeIdx, r.revision, len(missing), size); err != nil {
+		if err := rearmGangSurgeRebuild(ctx, deps, input, r.plan, r.source, r.replacement, r.surgeIdx, r.revision, len(missing), size); err != nil {
 			return false, err
 		}
 	}
@@ -1236,9 +1236,11 @@ func recycledMembers(src *workload.InstanceStatus, missing []podTarget) int {
 // rearmGangSurgeRebuild opens the next attempt once a lost replacement's
 // members are created again: the source goes back to Updating at the drain
 // step with the retry counted and a fresh deadline, and the revision's retry
-// record reads an attempt in progress.
-func rearmGangSurgeRebuild(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, src *workload.InstanceStatus, surgeIdx int32, pin string, rebuilt, size int) error {
-	rearmed, err := status.RearmGangSurgeRebuild(ctx, input, src, plan.InstanceReadyTimeout)
+// record reads an attempt in progress. The same write clears the placement
+// wait the ended attempt left on the replacement's row, when the row the
+// pass read still carries one.
+func rearmGangSurgeRebuild(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, src, replacement *workload.InstanceStatus, surgeIdx int32, pin string, rebuilt, size int) error {
+	rearmed, err := status.RearmGangSurgeRebuild(ctx, input, src, replacement, plan.InstanceReadyTimeout)
 	if err != nil || !rearmed {
 		return err
 	}

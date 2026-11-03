@@ -11,11 +11,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // fleetPods builds n routable pods of one Component and cohort, one per
@@ -295,14 +294,8 @@ func TestEvaluatePairingDrain_FailsClosedWhenThePinnedRevisionCannotBeRead(t *te
 	objs = append(objs, fleetPods(v1beta1.EngineComponent, 0, 2, 0, "v1", true)...)
 	objs = append(objs, fleetPods(v1beta1.EngineComponent, 0, 1, 1, "v2", true)...)
 	objs = append(objs, fleetPods(v1beta1.DecoderComponent, 0, 2, 0, "v1", true)...)
-	c := fake.NewClientBuilder().WithScheme(drainScheme(t)).WithObjects(objs...).WithInterceptorFuncs(interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*appsv1.ControllerRevision); ok {
-				return errors.New("apiserver unavailable")
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	}).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...),
+		fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, errors.New("apiserver unavailable")).OnKind(&appsv1.ControllerRevision{}))
 	allowed, gate, reason := EvaluatePairingDrain(context.Background(), c, isvc, v1beta1.EngineComponent, forwardTarget(isvc, v1beta1.EngineComponent), GroupDefaults{}, []string{"llama-engine-0-default-0"})
 	if allowed || gate != v1beta1.RolloutHoldGatePairing || !strings.Contains(reason, "failing closed") {
 		t.Fatalf("an unreadable revision must fail closed with a retryable Pairing hold: allowed=%v gate=%q reason=%s", allowed, gate, reason)
@@ -333,14 +326,8 @@ func TestEvaluatePairingDrain_FailsClosedWhenThePeerReplicaCannotBeRead(t *testi
 	objs = append(objs, fleetPods(v1beta1.EngineComponent, 0, 2, 0, "v1", true)...)
 	objs = append(objs, fleetPods(v1beta1.DecoderComponent, 0, 2, 0, "v1", true)...)
 	objs = append(objs, fleetPods(v1beta1.DecoderComponent, 0, 1, 1, "v2", true)...)
-	c := fake.NewClientBuilder().WithScheme(drainScheme(t)).WithObjects(objs...).WithInterceptorFuncs(interceptor.Funcs{
-		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, ok := obj.(*v1beta1.InferenceReplica); ok {
-				return errors.New("apiserver unavailable")
-			}
-			return cl.Get(ctx, key, obj, opts...)
-		},
-	}).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...),
+		fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, errors.New("apiserver unavailable")).OnKind(&v1beta1.InferenceReplica{}))
 	allowed, gate, reason := EvaluatePairingDrain(context.Background(), c, isvc, v1beta1.DecoderComponent, forwardTarget(isvc, v1beta1.DecoderComponent), GroupDefaults{}, []string{"llama-decoder-0-default-0"})
 	if allowed || gate != v1beta1.RolloutHoldGatePairing || !strings.Contains(reason, "failing closed") {
 		t.Fatalf("an unreadable peer replica must fail closed with a retryable Pairing hold: allowed=%v gate=%q reason=%s", allowed, gate, reason)
@@ -503,7 +490,7 @@ func TestEvaluatePairingDrain_ThenBack_HoldsTheOldProtocolUntilTheOtherSideHasMo
 	objs = append(objs, fleetPods(v1beta1.DecoderComponent, 1, 1, 0, "v1", true)...)
 	source := []string{"llama-decoder-0-default-1"}
 
-	c := fake.NewClientBuilder().WithScheme(drainScheme(t)).WithObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	allowed, gate, reason := EvaluatePairingDrain(context.Background(), c, isvc, v1beta1.DecoderComponent, stable, GroupDefaults{}, source)
 	requireFloorHeld(t, allowed, gate, reason, "the last v2 decoder while three engines still speak v2")
 	if !strings.Contains(reason, `transition to "v1"`) {
@@ -511,7 +498,7 @@ func TestEvaluatePairingDrain_ThenBack_HoldsTheOldProtocolUntilTheOtherSideHasMo
 	}
 
 	back := append(objs, fleetPods(v1beta1.EngineComponent, 0, 3, 0, "v1", true)...)
-	c = fake.NewClientBuilder().WithScheme(drainScheme(t)).WithObjects(back...).Build()
+	c = fakeclient.New(t, fakeclient.WithObjects(back...))
 	if allowed, _, reason := EvaluatePairingDrain(context.Background(), c, isvc, v1beta1.DecoderComponent, stable, GroupDefaults{}, source); !allowed {
 		t.Fatalf("with a v1 replacement serving on every v2 engine the way back proceeds: %s", reason)
 	}

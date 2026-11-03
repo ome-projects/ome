@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -24,14 +25,7 @@ type BaseModelValidator struct {
 
 func (v *BaseModelValidator) Handle(_ context.Context, req admission.Request) admission.Response {
 	bm := &v1beta1.BaseModel{}
-	if err := v.Decoder.Decode(req, bm); err != nil {
-		log.Error(err, "Failed to decode BaseModel", "name", bm.Name, "namespace", bm.Namespace)
-		return admission.Errored(http.StatusBadRequest, err)
-	}
-	if err := validation.ValidatePVCStorage(&bm.Spec, false); err != nil {
-		return admission.Denied(err.Error())
-	}
-	return admission.Allowed("")
+	return validate(v.Decoder, req, bm, &bm.Spec, false)
 }
 
 // +kubebuilder:webhook:verbs=create;update,path=/validate-ome-io-v1beta1-clusterbasemodel,mutating=false,failurePolicy=fail,groups=ome.io,resources=clusterbasemodels,versions=v1beta1,name=clusterbasemodel.ome-webhook-server.validator
@@ -45,11 +39,17 @@ type ClusterBaseModelValidator struct {
 
 func (v *ClusterBaseModelValidator) Handle(_ context.Context, req admission.Request) admission.Response {
 	cbm := &v1beta1.ClusterBaseModel{}
-	if err := v.Decoder.Decode(req, cbm); err != nil {
-		log.Error(err, "Failed to decode ClusterBaseModel", "name", cbm.Name)
+	return validate(v.Decoder, req, cbm, &cbm.Spec, true)
+}
+
+// validate decodes the request into model and refuses a PVC URI whose
+// shape does not fit the model's scope (spec is the field inside model).
+func validate(decoder admission.Decoder, req admission.Request, model client.Object, spec *v1beta1.BaseModelSpec, clusterScoped bool) admission.Response {
+	if err := decoder.Decode(req, model); err != nil {
+		log.Error(err, "Failed to decode "+req.Kind.Kind, "name", model.GetName(), "namespace", model.GetNamespace())
 		return admission.Errored(http.StatusBadRequest, err)
 	}
-	if err := validation.ValidatePVCStorage(&cbm.Spec, true); err != nil {
+	if err := validation.ValidatePVCStorage(spec, clusterScoped); err != nil {
 		return admission.Denied(err.Error())
 	}
 	return admission.Allowed("")

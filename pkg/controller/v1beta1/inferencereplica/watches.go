@@ -153,11 +153,7 @@ func drainServiceRole(name string) (string, v1beta1.ComponentType, bool) {
 	default:
 		return "", "", false
 	}
-	for _, component := range []v1beta1.ComponentType{
-		v1beta1.RouterComponent,
-		v1beta1.EngineComponent,
-		v1beta1.DecoderComponent,
-	} {
+	for _, component := range v1beta1.RoleTypes() {
 		suffix := "-" + string(component)
 		if !strings.HasSuffix(prefix, suffix) {
 			continue
@@ -336,7 +332,8 @@ func podReconcileRelevantChanged(oldPod, newPod *corev1.Pod) bool {
 //     new image into Status.ContainerStatuses[*].Image, so that flip MUST
 //     wake the reconcile or the rollout stalls until the periodic resync.
 //   - State.Waiting (Reason+Message) — terminal-failure / stuck-pod
-//     escalation (evidence.PodStuckInTerminalWaiting, types.PodTermination).
+//     escalation (evidence.PodStuckInTerminalWaiting, types.PodTermination);
+//     both fields feed types.IsTerminalWaiting.
 //   - State.Terminated (ExitCode+Reason+Message) — crash detection
 //     (types.PodTermination).
 //   - LastTerminationState.Terminated (ExitCode+Reason+Message) — a
@@ -383,9 +380,11 @@ func containerStatusesRelevantChanged(oldCS, newCS []corev1.ContainerStatus) boo
 	return false
 }
 
-// waitingRelevantChanged compares the Waiting fields the escalator reads
-// (Reason for terminal-state classification, Message for the LastFailure
-// diagnostic record).
+// waitingRelevantChanged compares the Waiting fields the escalator reads.
+// Both feed the terminal-state classification (types.IsTerminalWaiting): a
+// CreateContainerError whose message moves from a create still running to
+// one the runtime refused must wake the reconcile. Message also fills the
+// LastFailure diagnostic record.
 func waitingRelevantChanged(a, b *corev1.ContainerStateWaiting) bool {
 	if (a == nil) != (b == nil) {
 		return true

@@ -12,7 +12,7 @@ const (
 	// terminal phase and the ladder re-enters at step 0.
 	EventReasonRolloutResumed = "RolloutResumed"
 	// EventReasonRolloutResumeRejected is recorded when an ome.io/rollout-resume
-	// cannot be honored: a stale hash, no pinned run, a parked revision no
+	// cannot be honored: a stale hash, no pinned run, a stopped canary's revision no
 	// member of the unit targets any more, or a value that addresses no
 	// canary of the InferenceService.
 	EventReasonRolloutResumeRejected = "RolloutResumeRejected"

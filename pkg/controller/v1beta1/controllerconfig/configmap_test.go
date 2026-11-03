@@ -648,9 +648,10 @@ func TestNewDeployConfig(t *testing.T) {
 				assert.Nil(t, cfg.Replicas)
 				// Nil-receiver accessors report unconfigured, never a number.
 				assert.Nil(t, cfg.Replicas.Min())
-				assert.Nil(t, cfg.Replicas.EngineMax())
-				assert.Nil(t, cfg.Replicas.DecoderMax())
-				assert.Nil(t, cfg.Replicas.RouterMax())
+				assert.Nil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentEngine))
+				assert.Nil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentDecoder))
+				assert.Nil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentEncoder))
+				assert.Nil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentRouter))
 			},
 		},
 		{
@@ -660,7 +661,7 @@ func TestNewDeployConfig(t *testing.T) {
 					"defaultDeploymentMode": "RawDeployment",
 					"replicas": {
 						"defaultMinReplicas": 1,
-						"defaultMaxReplicas": {"engine": 3, "decoder": 3, "router": 2}
+						"defaultMaxReplicas": {"engine": 3, "decoder": 3, "encoder": 5, "router": 2}
 					}
 				}`,
 			},
@@ -669,12 +670,14 @@ func TestNewDeployConfig(t *testing.T) {
 				require.NotNil(t, cfg.Replicas)
 				require.NotNil(t, cfg.Replicas.Min())
 				assert.Equal(t, 1, *cfg.Replicas.Min())
-				require.NotNil(t, cfg.Replicas.EngineMax())
-				assert.Equal(t, 3, *cfg.Replicas.EngineMax())
-				require.NotNil(t, cfg.Replicas.DecoderMax())
-				assert.Equal(t, 3, *cfg.Replicas.DecoderMax())
-				require.NotNil(t, cfg.Replicas.RouterMax())
-				assert.Equal(t, 2, *cfg.Replicas.RouterMax())
+				require.NotNil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentEncoder))
+				assert.Equal(t, 5, *cfg.Replicas.MaxFor(workloadtypes.ComponentEncoder))
+				require.NotNil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentEngine))
+				assert.Equal(t, 3, *cfg.Replicas.MaxFor(workloadtypes.ComponentEngine))
+				require.NotNil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentDecoder))
+				assert.Equal(t, 3, *cfg.Replicas.MaxFor(workloadtypes.ComponentDecoder))
+				require.NotNil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentRouter))
+				assert.Equal(t, 2, *cfg.Replicas.MaxFor(workloadtypes.ComponentRouter))
 			},
 		},
 		{
@@ -689,10 +692,10 @@ func TestNewDeployConfig(t *testing.T) {
 			validateConfig: func(t *testing.T, cfg *DeployConfig) {
 				require.NotNil(t, cfg.Replicas)
 				assert.Nil(t, cfg.Replicas.Min())
-				require.NotNil(t, cfg.Replicas.EngineMax())
-				assert.Equal(t, 3, *cfg.Replicas.EngineMax())
-				assert.Nil(t, cfg.Replicas.DecoderMax())
-				assert.Nil(t, cfg.Replicas.RouterMax())
+				require.NotNil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentEngine))
+				assert.Equal(t, 3, *cfg.Replicas.MaxFor(workloadtypes.ComponentEngine))
+				assert.Nil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentDecoder))
+				assert.Nil(t, cfg.Replicas.MaxFor(workloadtypes.ComponentRouter))
 			},
 		},
 		{
@@ -1261,10 +1264,15 @@ func TestDeployConfig_UpdateStrategyDefaults(t *testing.T) {
 				"updateStrategy": {
 					"router":  {"type": "SurgeThenDrain",    "maxSurge": "25%"},
 					"engine":  {"type": "InPlaceIfPossible", "maxUnavailable": "10%"},
-					"decoder": {"type": "InPlaceIfPossible", "maxUnavailable": 2}
+					"decoder": {"type": "InPlaceIfPossible", "maxUnavailable": 2},
+					"encoder": {"type": "SurgeThenDrain",    "maxSurge": 1}
 				}
 			}`,
 			validate: func(t *testing.T, cfg *DeployConfig) {
+				encoder := cfg.UpdateStrategy.ForComponent(workloadtypes.ComponentEncoder)
+				require.NotNil(t, encoder)
+				assert.Equal(t, intstr.FromInt(1), *encoder.MaxSurge)
+
 				router := cfg.UpdateStrategy.ForComponent(workloadtypes.ComponentRouter)
 				require.NotNil(t, router)
 				assert.Equal(t, "SurgeThenDrain", router.Type)

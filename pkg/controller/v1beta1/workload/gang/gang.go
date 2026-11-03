@@ -37,24 +37,14 @@ type PodGroupReconcileState struct {
 	TerminalOwned map[int32]struct{}
 }
 
-// EnsureSurgePodGroup builds the Deps.EnsureGangPodGroup callback the
-// gang-surge op invokes to create a surge Instance's PodGroup inline,
-// just before its pods. Keeps the workload/ops package free of a
-// workload/podgroup import (which would close a cycle through podgroup's
-// test deps) while still guaranteeing PodGroup-before-pods for the surge
-// gang regardless of when the surge index lands in the plan the
-// top-level EnsurePodGroups keys off.
-//
-// No-op when the cluster lacks the PodGroup CRD
-// (DesiredSpec.GangSchedulingAvailable == false) or the Instance is
-// single-pod. Idempotent.
-func EnsureSurgePodGroup(deps workload.Deps) workload.EnsureGangPodGroupFn {
-	return EnsureSurgePodGroupWithState(deps, PodGroupReconcileState{})
-}
-
-// EnsureSurgePodGroupWithState shares the Component's authoritative Pod and
-// PodGroup observations with the inline surge prerequisite, so the callback
-// performs no additional Pod LIST or PodGroup GET.
+// EnsureSurgePodGroupWithState builds the Deps.EnsureGangPodGroup callback
+// the gang-surge op invokes to write a surge Instance's PodGroup just before
+// its pods, whether or not the plan carries the surge index yet. It lives
+// here so workload/ops needs no workload/podgroup import. When the input
+// brings the Component's pods and state brings the owner's PodGroups, the
+// callback performs no extra Pod LIST or PodGroup GET. A single-pod Instance
+// or a cluster without the PodGroup API gets no PodGroup, only the topology
+// key its live pods already carry. Idempotent.
 func EnsureSurgePodGroupWithState(deps workload.Deps, state PodGroupReconcileState) workload.EnsureGangPodGroupFn {
 	return func(ctx context.Context, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan) (string, error) {
 		if deps.Client == nil || !podgroup.IsMultiPodInstance(inst) {
@@ -107,54 +97,21 @@ func EnsureSurgePodGroupWithState(deps workload.Deps, state PodGroupReconcileSta
 			}
 			return "", unusableNameError(err)
 		}
-		return podgroup.EnsurePodGroupForPodsWithReader(ctx, deps.Client, reader, input.OwnerObject, input.OwnerGVK, input.Key.OwnerName, plan, inst, pods)
+		return podgroup.EnsurePodGroupForPods(ctx, deps.Client, reader, input.OwnerObject, input.OwnerGVK, input.Key.OwnerName, plan, inst, pods)
 	}
 }
 
-// EnsurePodGroups drives the per-Instance PodGroup lifecycle for one
-// Component reconcile. Adapters call it BEFORE workload.Reconcile's
-// per-Instance Create state machine so the gang is announced to the
-// scheduler before the per-Instance Create op brings up the first
-// pod — announcing it after would let the scheduler place pods
-// individually and defeat the gang.
-//
-// Behavior:
-//
-//   - When the cluster has the PodGroup CRD
-//     (input.DesiredSpec.GangSchedulingAvailable == true), call
-//     podgroup.EnsurePodGroup for every multi-pod Instance in the
-//     plan; single-pod Instances are skipped.
-//
-//   - When the cluster does NOT have the PodGroup CRD AND the plan
-//     has at least one multi-pod Instance, skip PodGroup creation
-//     entirely and stamp the `GangSchedulingUnavailable=True`
-//     Component condition. This is a soft-fail (the workload reconciler
-//     still creates pods) — the condition is the operator-facing signal
-//     that gang placement may race.
-//
-//   - When the Component is single-pod (no multi-pod Instances in the
-//     plan), the condition is set to False with reason
-//     `GangSchedulingAvailable` — gang scheduling is not required.
-//
-// Idempotent: the underlying podgroup.EnsurePodGroup reconciles owned fields;
-// condition writes go through
-// apimeta.SetStatusCondition (inside the WriteAggregateCondition
-// closure) which only bumps LastTransitionTime on a real transition.
-func EnsurePodGroups(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan) error {
-	_, err := EnsurePodGroupsWithTopology(ctx, deps, input, plan)
-	return err
-}
-
-// EnsurePodGroupsWithTopology reconciles PodGroups and returns the effective
-// topology contract for each planned gang. Empty is valid only when topology
-// was intentionally left unset. If a configured key cannot be proven from an
-// active gang's immutable pods or owned PodGroup annotation, reconciliation
-// fails closed before creating missing members.
-func EnsurePodGroupsWithTopology(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan) (map[int32]string, error) {
-	return EnsurePodGroupsWithState(ctx, deps, input, plan, PodGroupReconcileState{})
-}
-
-// EnsurePodGroupsWithState reconciles planned PodGroups from one inventory.
+// EnsurePodGroupsWithState drives the per-Instance PodGroup lifecycle for
+// one Component reconcile and returns the effective topology key of every
+// planned gang. Adapters call it before the per-Instance create pass, so the
+// gang is announced to the scheduler before its first pod exists; a gang
+// announced later would be placed pod by pod. A single-pod Instance gets no
+// PodGroup. When the plan has a gang and the cluster lacks the PodGroup API,
+// nothing is written and the GangSchedulingUnavailable condition is True:
+// pods are still created, and the condition is the operator's signal that
+// gang placement may race. An empty topology key is valid only when topology
+// was left unset; a configured key that cannot be proven from a gang's live
+// pods or its PodGroup fails the pass before any missing member is created.
 // It performs no eager deletion: terminal lifecycle owners delete their own
 // PodGroups after proving their Pod bucket empty.
 //

@@ -41,9 +41,10 @@ import (
 // gate, the Instances a partition holds never offered), then makes one
 // move: a started Instance serves, an attempt fails (a drain that leaves
 // nothing serving, or a surge published Ready over its serving old pod),
-// an attempt is parked, a surge hand-over is kept by the pairing drain
+// an attempt is held by the engine, a surge hand-over is kept by the pairing drain
 // gate during a protocol change, the ladder's backoff ends or its record
-// is pruned, the ladder is spent, a gang loses a member while its
+// is pruned, the ladder is spent (the replica publishing the record, so
+// the gate reads a Held named side), a gang loses a member while its
 // replacement is building or standing beside it, a side's partition is
 // raised, lowered or cleared (on one side or both), or a side is scaled
 // (one side, both sides by the same step, or both to a new ratio), with
@@ -162,20 +163,20 @@ func (r huntRow) open() bool {
 	return false
 }
 
-// huntLadder is the state of the Component's retry record for the target.
-type huntLadder uint8
+// huntSchedule is the state of the Component's retry record for the target.
+type huntSchedule uint8
 
 const (
-	ladderNone     huntLadder = iota
-	ladderBackoff             // a failure was recorded; no fresh start until the backoff ends
-	ladderDue                 // the backoff ended; the next pass admits a wave of starts
-	ladderRetrying            // RetryInProgress: one wave at a time while an attempt is in flight
-	ladderHeld                // the ladder is spent; no fresh start until a new revision
+	scheduleNone     huntSchedule = iota
+	scheduleBackoff               // a failure was recorded; no fresh start until the backoff ends
+	scheduleDue                   // the backoff ended; the next pass admits a wave of starts
+	scheduleRetrying              // RetryInProgress: one wave at a time while an attempt is in flight
+	scheduleHeld                  // the ladder is spent; no fresh start until a new revision
 )
 
-var huntLadderNames = [...]string{"", "backoff", "due", "retrying", "held"}
+var huntScheduleNames = [...]string{"", "backoff", "due", "retrying", "held"}
 
-func (l huntLadder) String() string { return huntLadderNames[l] }
+func (l huntSchedule) String() string { return huntScheduleNames[l] }
 
 // huntMember is one Component of the group: its count, how it rolls, and
 // its own budget (maxSurge for a surging member, maxUnavailable otherwise).
@@ -228,7 +229,7 @@ func (m huntMember) short() string {
 // adversary's remaining moves on it.
 type huntSide struct {
 	rows      []huntRow
-	ladder    huntLadder
+	schedule  huntSchedule
 	attempts  int32
 	partition int32 // the Instances the operator keeps on their revision, zero for none
 	// behind is a replica status that predates the push: it still records
@@ -312,8 +313,8 @@ func (s huntSide) String() string {
 		parts = append(parts, r.String())
 	}
 	out := strings.Join(parts, ",")
-	if s.ladder != ladderNone {
-		out += fmt.Sprintf(" ladder=%s/%d", s.ladder, s.attempts)
+	if s.schedule != scheduleNone {
+		out += fmt.Sprintf(" schedule=%s/%d", s.schedule, s.attempts)
 	}
 	if s.partition > 0 {
 		out += fmt.Sprintf(" partition=%d", s.partition)
@@ -363,7 +364,7 @@ func (st *huntState) key() string {
 		for _, r := range s.rows {
 			b.WriteByte(byte('a' + r))
 		}
-		fmt.Fprintf(&b, "|%d%d%d%d%d%d%d%d%t;", s.ladder, s.attempts, s.fails, s.parks, s.scales, s.partition, s.parts, s.losses, s.behind)
+		fmt.Fprintf(&b, "|%d%d%d%d%d%d%d%d%t;", s.schedule, s.attempts, s.fails, s.parks, s.scales, s.partition, s.parts, s.losses, s.behind)
 	}
 	return b.String()
 }
@@ -491,7 +492,7 @@ func (c huntConfig) String() string {
 	if c.protocolChange {
 		s += " protocolChange"
 	}
-	s += fmt.Sprintf(" ladder=%d", c.maxAttempts)
+	s += fmt.Sprintf(" schedule=%d", c.maxAttempts)
 	if c.behindPush != 0 {
 		var behind []string
 		for i, m := range c.members {
@@ -678,7 +679,7 @@ func (w *huntWorld) replica(i int, s huntSide) *v1beta1.InferenceReplica {
 		}
 		if m.isGang() && kind.surgeTarget() {
 			// The replacement gang lives in a slot of its own above the
-			// desired count, pinned from the source's attempt.
+			// desired count, taken from the source's attempt.
 			slot := n + int32(len(replacements))
 			row.Operation.SurgeIndex = ptr.To(slot)
 			replacement := v1beta1.OMENativeInstanceStatus{Index: slot, Phase: v1beta1.OMENativeInstanceCreating, TargetRevision: target, PodCount: g,
@@ -707,7 +708,30 @@ func (w *huntWorld) replica(i int, s huntSide) *v1beta1.InferenceReplica {
 	}
 	ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, replacements...)
 	ir.Status.ServingReplicas, ir.Status.ReadyReplicas, ir.Status.UpdatedReplicas = serving, serving, promoted
+	if record, ok := s.retryRecord(target); ok {
+		ir.Status.RetryBlocks = []v1beta1.RetryBlock{record}
+	}
 	return ir
+}
+
+// retryRecord is the side's retry record for the target as the replica
+// controller publishes it: Backoff from the first failure until the
+// retry opens, RetryInProgress while one retry runs at a time, Held once
+// the schedule is spent. None before the first failure. The gate reads a
+// Held record on the named first side.
+func (s huntSide) retryRecord(target string) (v1beta1.RetryBlock, bool) {
+	record := v1beta1.RetryBlock{TargetRevision: target, AttemptsStarted: s.attempts, Reason: "the attempt never served"}
+	switch s.schedule {
+	case scheduleBackoff, scheduleDue:
+		record.State = v1beta1.RetryBlockBackoff
+	case scheduleRetrying:
+		record.State = v1beta1.RetryBlockRetryInProgress
+	case scheduleHeld:
+		record.State = v1beta1.RetryBlockHeld
+	default:
+		return v1beta1.RetryBlock{}, false
+	}
+	return record, true
 }
 
 // slotOf is the index of the replacement gang a surging row of a gang
@@ -876,11 +900,11 @@ func (w *huntWorld) pass(st *huntState, i int) (admitted int, hold *huntHold) {
 	m := w.cfg.members[i]
 	side := &st.sides[i]
 	switch {
-	case side.ladder == ladderHeld:
+	case side.schedule == scheduleHeld:
 		return 0, &huntHold{gate: v1beta1.RolloutHoldGateHeld, reason: fmt.Sprintf("update held after %d failed attempt(s)", side.attempts)}
-	case side.ladder == ladderBackoff:
+	case side.schedule == scheduleBackoff:
 		return 0, &huntHold{gate: v1beta1.RolloutHoldGateRetryBlock, reason: fmt.Sprintf("update in backoff after %d failed attempt(s)", side.attempts)}
-	case side.ladder == ladderRetrying && side.inFlight():
+	case side.schedule == scheduleRetrying && side.inFlight():
 		return 0, &huntHold{gate: v1beta1.RolloutHoldGateRetryBlock, reason: "retrying one attempt at a time"}
 	}
 	// The Instances the partition holds are read once per pass, before any
@@ -979,8 +1003,8 @@ func (w *huntWorld) pass(st *huntState, i int) (admitted int, hold *huntHold) {
 			inFlightUnavail++
 			gateUnavail++
 		}
-		if side.ladder == ladderDue {
-			side.ladder = ladderRetrying
+		if side.schedule == scheduleDue {
+			side.schedule = scheduleRetrying
 		}
 		admitted++
 		c = nil
@@ -1103,9 +1127,9 @@ func (w *huntWorld) progressMoves(st *huntState) []huntMove {
 			out = append(out, huntMove{kind: "retire", side: i, idx: idx})
 		}
 		switch {
-		case s.ladder == ladderBackoff:
+		case s.schedule == scheduleBackoff:
 			out = append(out, huntMove{kind: "backoff", side: i})
-		case s.ladder == ladderRetrying && !s.inFlight():
+		case s.schedule == scheduleRetrying && !s.inFlight():
 			out = append(out, huntMove{kind: "prune", side: i})
 		}
 	}
@@ -1188,7 +1212,7 @@ func (w *huntWorld) adverseMoves(st *huntState) []huntMove {
 				}
 			}
 		}
-		if s.ladder != ladderHeld && s.ladder != ladderNone && s.count(huntFailedDark, huntFailedSurge) > 0 {
+		if s.schedule != scheduleHeld && s.schedule != scheduleNone && s.count(huntFailedDark, huntFailedSurge) > 0 {
 			out = append(out, huntMove{kind: "spent", side: i})
 		}
 		if s.scales > 0 {
@@ -1311,23 +1335,23 @@ func (w *huntWorld) applyRaw(next *huntState, mv huntMove) {
 		side.fails--
 		// A failure counts once per wave: a record in Backoff or Held is
 		// not moved by a second failure of the same wave.
-		if side.ladder != ladderBackoff && side.ladder != ladderHeld {
+		if side.schedule != scheduleBackoff && side.schedule != scheduleHeld {
 			side.attempts++
 			if side.attempts >= w.cfg.maxAttempts {
-				side.ladder = ladderHeld
+				side.schedule = scheduleHeld
 			} else {
-				side.ladder = ladderBackoff
+				side.schedule = scheduleBackoff
 			}
 		}
 	case "park":
 		side.rows[mv.idx] = huntRetriesStopped
 		side.parks--
 	case "backoff":
-		side.ladder = ladderDue
+		side.schedule = scheduleDue
 	case "prune":
-		side.ladder = ladderNone
+		side.schedule = scheduleNone
 	case "spent":
-		side.ladder = ladderHeld
+		side.schedule = scheduleHeld
 	case "scale":
 		scaleSide(side, mv.delta)
 		if mv.both {
@@ -1567,7 +1591,7 @@ func (w *huntWorld) check(st *huntState) []huntFinding {
 	// (a) progress: the roll is not done, nothing can move on its own,
 	// and no side was admitted a start.
 	if !st.done() && len(w.progressMoves(st)) == 0 {
-		class, message := w.classifyStuck(st)
+		class, message := w.classifyStandstill(st)
 		add(class, "%s", message)
 	}
 	return out
@@ -1632,8 +1656,10 @@ func (w *huntWorld) withoutPartitions(st *huntState) *huntState {
 	return w.playOut(probe)
 }
 
-// classifyStuck names why a state that cannot move is what it is. Every
-// side with Instances to move is Held ("held"); one side is Held and the
+// classifyStandstill names why a state that cannot move is what it is. Every
+// side with Instances to move is Held ("held"), a side whose hold reads
+// Held because the named first side's retry record is Held counting as
+// held with it, the roll held as a whole; one side is Held and the
 // other waits on something only the Held side could change
 // ("waits-on-held-peer"; where a spent ladder leaves the other side is
 // not decided yet); a side waits on a peer's batch whose only
@@ -1643,13 +1669,13 @@ func (w *huntWorld) withoutPartitions(st *huntState) *huntState {
 // operator's partition explains, because clearing it lets the roll finish
 // ("partition-paced"); or no side is Held and the sides wait on each other
 // or on themselves ("deadlock").
-func (w *huntWorld) classifyStuck(st *huntState) (class, message string) {
+func (w *huntWorld) classifyStandstill(st *huntState) (class, message string) {
 	var lines []string
 	held, waiting := 0, 0
 	ratioRule, onHeldInstances := false, false
 	for i, m := range w.cfg.members {
 		s := st.sides[i]
-		if s.ladder == ladderHeld && !s.complete() {
+		if s.schedule == scheduleHeld && !s.complete() {
 			// A Held side with Instances left is Held whatever its
 			// partition keeps back.
 			held++
@@ -1659,8 +1685,15 @@ func (w *huntWorld) classifyStuck(st *huntState) (class, message string) {
 		if s.done() {
 			continue
 		}
-		waiting++
 		h := st.holds[i]
+		if h != nil && h.gate == v1beta1.RolloutHoldGateHeld {
+			// The gate named the first side's Held record: this side is
+			// held with it, under the operator's two ways out.
+			held++
+			lines = append(lines, fmt.Sprintf("%s (%s) is held with the named side: %s", m.comp, s, h))
+			continue
+		}
+		waiting++
 		if h != nil && h.gate == v1beta1.RolloutHoldGateRatio && (strings.Contains(h.reason, "would outpace") || strings.Contains(h.reason, "would skew")) {
 			ratioRule = true
 		}
@@ -1701,7 +1734,7 @@ func (w *huntWorld) classifyStuck(st *huntState) (class, message string) {
 			class = "partition-paced"
 			break
 		}
-		class, message = w.classifyStuck(cleared)
+		class, message = w.classifyStandstill(cleared)
 		if class == "partition-paced" {
 			class = "deadlock"
 		}
@@ -1854,7 +1887,7 @@ func (w *huntWorld) seeds() []huntSeed {
 			for idx, r := range s.rows {
 				if r == huntOpenDrain || r == huntOpenInPlace || r == huntOpenSurge {
 					held := w.apply(from, huntMove{kind: "fail", side: i, idx: idx})
-					if held.sides[i].ladder == ladderBackoff {
+					if held.sides[i].schedule == scheduleBackoff {
 						held = w.apply(held, huntMove{kind: "spent", side: i})
 					}
 					out = append(out, huntSeed{name: "held", state: held})
@@ -1988,13 +2021,13 @@ func huntSettings() []huntSetting {
 // whole space.
 func huntConfigs(full bool) []huntConfig {
 	var out []huntConfig
-	mk := func(shape [2]int32, es, ds v1beta1.UpdateStrategyType, budget string, setting huntSetting, protocol bool, router v1beta1.UpdateStrategyType, ladder int32, tolerance *int32, gang int32) huntConfig {
+	mk := func(shape [2]int32, es, ds v1beta1.UpdateStrategyType, budget string, setting huntSetting, protocol bool, router v1beta1.UpdateStrategyType, attempts int32, tolerance *int32, gang int32) huntConfig {
 		cfg := huntConfig{
 			members: []huntMember{
 				{comp: v1beta1.EngineComponent, desired: shape[0], strategy: es, budget: budget, gang: gang},
 				{comp: v1beta1.DecoderComponent, desired: shape[1], strategy: ds, budget: budget, gang: gang},
 			},
-			defaults: setting.defaults, protocolChange: protocol, maxAttempts: ladder, tolerance: tolerance,
+			defaults: setting.defaults, protocolChange: protocol, maxAttempts: attempts, tolerance: tolerance,
 			fails: 2, parks: 1, scales: 1, parts: 1, losses: 1, scaleDeltas: []int32{1, -1, 2, -2},
 		}
 		if router != "" {
@@ -2157,16 +2190,16 @@ func huntConfigs(full bool) []huntConfig {
 		if rng.Intn(4) == 0 {
 			router = huntStrategies[rng.Intn(2)]
 		}
-		ladder := int32(3)
+		attempts := int32(3)
 		if rng.Intn(4) == 0 {
-			ladder = 1
+			attempts = 1
 		}
 		var tolerance *int32
 		if rng.Intn(3) == 0 {
 			tolerance = ptr.To([]int32{0, 5, 20, 50, 100}[rng.Intn(5)])
 		}
 		gang := []int32{0, 0, 2, 4}[rng.Intn(4)]
-		cfg := mk(shape, es, ds, budget, setting, protocol, router, ladder, tolerance, gang)
+		cfg := mk(shape, es, ds, budget, setting, protocol, router, attempts, tolerance, gang)
 		cfg.parts = int8(rng.Intn(3))
 		cfg.losses = int8(rng.Intn(2))
 		if full && rng.Intn(3) == 0 {
@@ -2186,8 +2219,10 @@ func huntConfigs(full bool) []huntConfig {
 // runs-ahead-of-a-peer-coming-up (a side more than one batch ahead of a
 // peer whose promoted Instance is not yet counted as serving: that peer
 // waits on its own pod, not on the other side) fails the test.
-// waits-on-held-peer records where a spent ladder leaves the other side,
-// which is not decided yet; the after-scale, under-partition
+// waits-on-held-peer records where a spent ladder leaves the other side
+// when the Held side is not the named first side (a side whose hold names
+// a Held named side is held with it, in the held class), which is not
+// decided yet; the after-scale, under-partition
 // and in-protocol-change classes record where a scale re-plans the
 // batches, where a partition ends one side early and where the pairing
 // waiver lets a side run ahead by design (starts-before-the-named-side
@@ -2282,15 +2317,15 @@ func TestPDPacing_ProtocolChangesNeverWedge(t *testing.T) {
 
 // picture builds a settled state from the rows and ladders given per side;
 // a side not named keeps every Instance on the old revision.
-func (w *huntWorld) picture(rows map[v1beta1.ComponentType][]huntRow, ladders map[v1beta1.ComponentType]huntLadder) *huntState {
+func (w *huntWorld) picture(rows map[v1beta1.ComponentType][]huntRow, ladders map[v1beta1.ComponentType]huntSchedule) *huntState {
 	st := w.initial()
 	for i, m := range w.cfg.members {
 		if r, ok := rows[m.comp]; ok {
 			st.sides[i].rows = append([]huntRow(nil), r...)
 		}
 		if l, ok := ladders[m.comp]; ok {
-			st.sides[i].ladder = l
-			if l != ladderNone {
+			st.sides[i].schedule = l
+			if l != scheduleNone {
 				st.sides[i].attempts = 1
 			}
 		}
@@ -2367,7 +2402,7 @@ func TestPDPacing_AHandOverKeptForTheOtherCohortMustNotHoldTheOtherSidesStart(t 
 		name    string
 		cfg     huntConfig
 		rows    map[v1beta1.ComponentType][]huntRow
-		ladders map[v1beta1.ComponentType]huntLadder
+		ladders map[v1beta1.ComponentType]huntSchedule
 		kept    v1beta1.ComponentType // the side the pairing gate holds: its hand-over kept, or its only start held
 		waiting v1beta1.ComponentType // the side whose start must open
 		// startHeld names a picture where the kept side has not started and
@@ -2383,7 +2418,7 @@ func TestPDPacing_AHandOverKeptForTheOtherCohortMustNotHoldTheOtherSidesStart(t 
 			name:    "2 prefill beside 1 decode, both surging, no setting: the engine's first surge failed and its retry counts as a batch-2 start",
 			cfg:     pair([2]int32{2, 1}, surge, surge, "10%", GroupDefaults{}, true),
 			rows:    map[v1beta1.ComponentType][]huntRow{eng: {huntFailedSurge, huntOld}},
-			ladders: map[v1beta1.ComponentType]huntLadder{eng: ladderDue},
+			ladders: map[v1beta1.ComponentType]huntSchedule{eng: scheduleDue},
 			kept:    dec, waiting: eng, startHeld: true,
 		},
 		{
@@ -2423,7 +2458,7 @@ func TestPDPacing_AHandOverKeptForTheOtherCohortMustNotHoldTheOtherSidesStart(t 
 				eng: {huntReplacementHeld, huntOld, huntOld},
 				dec: {huntFailedSurge, huntOld, huntOld},
 			},
-			ladders: map[v1beta1.ComponentType]huntLadder{dec: ladderDue},
+			ladders: map[v1beta1.ComponentType]huntSchedule{dec: scheduleDue},
 			kept:    eng, waiting: dec,
 		},
 		{
@@ -2433,7 +2468,7 @@ func TestPDPacing_AHandOverKeptForTheOtherCohortMustNotHoldTheOtherSidesStart(t 
 				eng: {huntReplacementHeld, huntOld, huntOld},
 				dec: {huntFailedSurge, huntOld, huntOld},
 			},
-			ladders: map[v1beta1.ComponentType]huntLadder{dec: ladderDue},
+			ladders: map[v1beta1.ComponentType]huntSchedule{dec: scheduleDue},
 			kept:    eng, waiting: dec,
 		},
 		{
@@ -2537,7 +2572,7 @@ func TestPDPacing_AHandOverKeptForTheOtherCohortMustNotHoldTheOtherSidesStart(t 
 	}
 }
 
-// TestPDPacing_ASpentLadderLeavesThePeerWaitingAtItsBatch pins what the
+// TestPDPacing_ASpentScheduleLeavesThePeerWaitingAtItsBatch holds what the
 // batch step does today when one side's retry ladder is spent with
 // Instances left on the old revision. With 12 prefill beside 8 decode at
 // 10 percent, three prefill promoted and a fourth failed when the ladder
@@ -2547,7 +2582,7 @@ func TestPDPacing_AHandOverKeptForTheOtherCohortMustNotHoldTheOtherSidesStart(t 
 // side's batch and its failed count. Where a spent ladder leaves the other
 // side (whether it should finish its own roll) is not decided yet; this
 // test records the current behaviour and is updated when it changes.
-func TestPDPacing_ASpentLadderLeavesThePeerWaitingAtItsBatch(t *testing.T) {
+func TestPDPacing_ASpentScheduleLeavesThePeerWaitingAtItsBatch(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	recreate := v1beta1.UpdateStrategyRecreatePod
 	for _, tc := range []struct {
@@ -2563,7 +2598,7 @@ func TestPDPacing_ASpentLadderLeavesThePeerWaitingAtItsBatch(t *testing.T) {
 			st := w.picture(map[v1beta1.ComponentType][]huntRow{
 				eng: append(append(rows(huntPromoted, 3), huntFailedDark), rows(huntOld, 8)...),
 				dec: append(rows(huntPromoted, 3), rows(huntOld, 5)...),
-			}, map[v1beta1.ComponentType]huntLadder{eng: ladderHeld})
+			}, map[v1beta1.ComponentType]huntSchedule{eng: scheduleHeld})
 			if st.sides[1].inFlight() {
 				t.Fatalf("the decoder opened a start beyond the batch the Held engine never settles: %s", st)
 			}
@@ -2571,6 +2606,58 @@ func TestPDPacing_ASpentLadderLeavesThePeerWaitingAtItsBatch(t *testing.T) {
 				t.Fatalf("the decoder's hold = %s, want Ratio %q", h, tc.want)
 			}
 			t.Logf("with the engine Held at %s, the decoder stops: %s", st.sides[0], st.holds[1])
+		})
+	}
+}
+
+// TestPDPacing_AHeldNamedSideHoldsTheRollAsAWhole is the push onto an
+// image no pod can pull on 3 prefill beside 3 decode, both SurgeThenDrain
+// at a maxSurge of 1, with the decoder named to move first (the chart's
+// setting). The decoder's first surge failed until its retry schedule
+// was spent; the engine's first attempt failed once and its retry is due.
+// That retry belongs to the engine's batch 2 and would wait for the
+// decoder's batch 2 to serve first, which a Held decoder never opens: the
+// hold reads Held, names the decoder and its record, and the explorer
+// reads the state as held, the roll held as a whole, not as a side waiting
+// on a Held peer. With the engine named instead the mirror holds. A Held
+// side that is not the named one leaves the other side waiting at its
+// batch under the Ratio gate, as
+// TestPDPacing_ASpentScheduleLeavesThePeerWaitingAtItsBatch holds.
+func TestPDPacing_AHeldNamedSideHoldsTheRollAsAWhole(t *testing.T) {
+	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
+	surge := v1beta1.UpdateStrategySurgeThenDrain
+	for _, tc := range []struct {
+		name         string
+		named, other v1beta1.ComponentType
+	}{
+		{name: "the decoder named and held", named: dec, other: eng},
+		{name: "the engine named and held", named: eng, other: dec},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newHuntWorld(t, pair([2]int32{3, 3}, surge, surge, "1", huntRules(true, ptr.To(int32(5)), tc.named), false))
+			st := w.picture(map[v1beta1.ComponentType][]huntRow{
+				tc.named: {huntFailedSurge, huntOld, huntOld},
+				tc.other: {huntFailedSurge, huntOld, huntOld},
+			}, map[v1beta1.ComponentType]huntSchedule{tc.named: scheduleHeld, tc.other: scheduleDue})
+			engine, decoder := w.pairIndex()
+			other := engine
+			if tc.other == dec {
+				other = decoder
+			}
+			if st.sides[other].inFlight() {
+				t.Fatalf("the %s opened a start past the Held %s: %s", tc.other, tc.named, st)
+			}
+			h := st.holds[other]
+			if h == nil || h.gate != v1beta1.RolloutHoldGateHeld ||
+				!strings.Contains(h.reason, "the "+string(tc.named)+" is held: update to ") ||
+				!strings.Contains(h.reason, "held after 1 failed attempt(s)") ||
+				!strings.Contains(h.reason, "resumes both sides") {
+				t.Fatalf("the %s's hold = %s, want the Held gate naming the %s and its record", tc.other, h, tc.named)
+			}
+			if class, message := w.classifyStandstill(st); class != "held" {
+				t.Fatalf("the state reads %s (%s), want held: the roll is held as a whole", class, message)
+			}
+			t.Logf("with the %s Held, the %s reads: %s", tc.named, tc.other, h)
 		})
 	}
 }
@@ -2608,7 +2695,7 @@ func TestPDPacing_AnInPlaceMemberWithNoUnavailabilityBudgetHoldsOnlyItself(t *te
 	}
 }
 
-// TestPDPacing_ARouterLeftOutOfTheBatchesIsPacedByTheBand pins where a
+// TestPDPacing_ARouterLeftOutOfTheBatchesIsPacedByTheBand holds where a
 // drain-first router stands beside a surging prefill/decode pair under
 // the group's maintainRatio: it steps in a kind no pairing member has, so
 // the batch step leaves it out, and the ratio rule's serving band paces

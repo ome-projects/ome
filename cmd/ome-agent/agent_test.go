@@ -1,143 +1,146 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/fx"
+	"go.uber.org/zap"
 )
 
-// MockAgentModule is a mock implementation of the AgentModule interface for testing
-type MockAgentModule struct {
-	mock.Mock
+// testAgent records that it ran and returns the error it was given.
+type testAgent struct {
+	ran bool
+	err error
 }
 
-func (m *MockAgentModule) Name() string {
-	args := m.Called()
-	return args.String(0)
+func (a *testAgent) Start() error {
+	a.ran = true
+	return a.err
 }
 
-func (m *MockAgentModule) ShortDescription() string {
-	args := m.Called()
-	return args.String(0)
+// testRow is a command that runs a, with no fx log output and no logger of its own.
+func testRow(a *testAgent, modules ...fx.Option) command {
+	return command{
+		name:    "mock-agent",
+		short:   "Mock Agent Short Description",
+		long:    "Mock Agent Long Description",
+		modules: append([]fx.Option{fx.NopLogger, fx.Provide(zap.NewNop), fx.Supply(a)}, modules...),
+		runs:    fxBuilt[*testAgent](),
+	}
 }
 
-func (m *MockAgentModule) LongDescription() string {
-	args := m.Called()
-	return args.String(0)
+// execute runs the row's cobra command with args and returns its error and
+// everything cobra printed.
+func execute(t *testing.T, row command, args ...string) (error, string) {
+	t.Helper()
+	t.Cleanup(func() { configFilePath = "" })
+	var out bytes.Buffer
+	cmd := row.cobraCommand()
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(args)
+	return cmd.Execute(), out.String()
 }
 
-func (m *MockAgentModule) FxModules() []fx.Option {
-	args := m.Called()
-	return args.Get(0).([]fx.Option)
+// run parses args on the row's cobra command and runs the agent the way the
+// command's Run does, returning the error instead of ending the process.
+func run(t *testing.T, row command, args ...string) error {
+	t.Helper()
+	t.Cleanup(func() { configFilePath = "" })
+	cmd := row.cobraCommand()
+	require.NoError(t, cmd.ParseFlags(args))
+	return runAgentCommand(cmd, row)
 }
 
-func (m *MockAgentModule) ConfigureCommand(cmd *cobra.Command) {
-	m.Called(cmd)
+// configFile writes a minimal config file and returns its path.
+func configFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("debug: false\n"), 0o600))
+	return path
 }
 
-func (m *MockAgentModule) Start() error {
-	args := m.Called()
-	return args.Error(0)
-}
+func TestCobraCommandCarriesTheRowWordsAndFlags(t *testing.T) {
+	cmd := testRow(&testAgent{}).cobraCommand()
 
-// TestCreateAgentCommand tests the CreateAgentCommand function
-func TestCreateAgentCommand(t *testing.T) {
-	// Create a mock agent module
-	mockModule := new(MockAgentModule)
-
-	// Set up expectations
-	mockModule.On("Name").Return("mock-agent")
-	mockModule.On("ShortDescription").Return("Mock Agent Short Description")
-	mockModule.On("LongDescription").Return("Mock Agent Long Description")
-	mockModule.On("ConfigureCommand", mock.AnythingOfType("*cobra.Command")).Run(func(args mock.Arguments) {
-		cmd := args.Get(0).(*cobra.Command)
-		// Add a simple run function to the command
-		cmd.Run = func(cmd *cobra.Command, args []string) {}
-	})
-
-	// Call the function being tested
-	cmd := CreateAgentCommand(mockModule)
-
-	// Verify the command was created correctly
 	assert.Equal(t, "mock-agent", cmd.Use)
 	assert.Equal(t, "Mock Agent Short Description", cmd.Short)
 	assert.Equal(t, "Mock Agent Long Description", cmd.Long)
+	assert.NotNil(t, cmd.Run)
 
-	// Verify the flags were added
 	configFlag := cmd.PersistentFlags().Lookup("config")
-	assert.NotNil(t, configFlag)
+	require.NotNil(t, configFlag)
 	assert.Equal(t, "c", configFlag.Shorthand)
 
 	debugFlag := cmd.PersistentFlags().Lookup("debug")
-	assert.NotNil(t, debugFlag)
+	require.NotNil(t, debugFlag)
 	assert.Equal(t, "d", debugFlag.Shorthand)
-
-	// Verify ConfigureCommand was called
-	mockModule.AssertCalled(t, "ConfigureCommand", mock.AnythingOfType("*cobra.Command"))
 }
 
-// TestRunAgentCommand tests the runAgentCommand function indirectly
-// Note: Since runAgentCommand starts an fx application, we can't easily test it directly
-// Instead, we'll test the function signature and basic setup
-func TestRunAgentCommandSignature(t *testing.T) {
-	// Verify the function signature is correct
-	// This doesn't actually run the function, just verifies it can be called with these arguments
-	assert.NotPanics(t, func() {
-		// We can't actually call runAgentCommand here because it would start an fx application
-		// This is just to verify the function signature
-		_ = runAgentCommand
-	})
-}
-
-// TestAgentModuleInterface tests that our mock correctly implements the AgentModule interface
-func TestAgentModuleInterface(t *testing.T) {
-	// This test verifies that MockAgentModule implements AgentModule
-	var _ AgentModule = (*MockAgentModule)(nil)
-}
-
-// TestAgentStartError tests handling of errors from the Start method
-func TestAgentStartError(t *testing.T) {
-	// Create a mock agent module that returns an error from Start
-	mockModule := new(MockAgentModule)
-	mockModule.On("Name").Return("error-agent")
-	mockModule.On("Start").Return(errors.New("start error"))
-
-	// Verify the error is returned
-	err := mockModule.Start()
-	assert.Error(t, err)
-	assert.Equal(t, "start error", err.Error())
-}
-
-// TestAgentWithSubcommands tests an agent with subcommands
-func TestAgentWithSubcommands(t *testing.T) {
-	// Create a mock agent module
-	mockModule := new(MockAgentModule)
-
-	// Set up expectations
-	mockModule.On("Name").Return("mock-agent")
-	mockModule.On("ShortDescription").Return("Mock Agent Short Description")
-	mockModule.On("LongDescription").Return("Mock Agent Long Description")
-	mockModule.On("ConfigureCommand", mock.AnythingOfType("*cobra.Command")).Run(func(args mock.Arguments) {
-		cmd := args.Get(0).(*cobra.Command)
-
-		// Add a subcommand
-		subCmd := &cobra.Command{
+func TestCobraCommandAddsTheRowFlags(t *testing.T) {
+	row := testRow(&testAgent{})
+	row.flags = func(cmd *cobra.Command) {
+		cmd.Flags().String("extra", "", "a flag of the row's own")
+		cmd.AddCommand(&cobra.Command{
 			Use:   "subcommand",
 			Short: "Subcommand Short Description",
-			Run:   func(cmd *cobra.Command, args []string) {},
-		}
-		cmd.AddCommand(subCmd)
-	})
+			Run:   func(*cobra.Command, []string) {},
+		})
+	}
 
-	// Call the function being tested
-	cmd := CreateAgentCommand(mockModule)
+	cmd := row.cobraCommand()
 
-	// Verify the subcommand was added
-	assert.Equal(t, 1, len(cmd.Commands()))
+	assert.NotNil(t, cmd.Flags().Lookup("extra"))
+	require.Len(t, cmd.Commands(), 1)
 	assert.Equal(t, "subcommand", cmd.Commands()[0].Use)
 	assert.Equal(t, "Subcommand Short Description", cmd.Commands()[0].Short)
+}
+
+func TestRunAgentCommandReturnsTheBuildError(t *testing.T) {
+	a := &testAgent{}
+	// The agent's constructor needs the config, and no config file is given.
+	row := testRow(a, fx.Provide(func(*viper.Viper) struct{} { return struct{}{} }), fx.Invoke(func(struct{}) {}))
+
+	err := run(t, row)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no config file provided")
+	assert.False(t, a.ran)
+}
+
+func TestRunAgentCommandReturnsTheAgentError(t *testing.T) {
+	a := &testAgent{err: errors.New("start error")}
+
+	err := run(t, testRow(a), "--config", configFile(t))
+
+	assert.True(t, a.ran)
+	assert.EqualError(t, err, "start error")
+}
+
+func TestRunAgentCommandReturnsNilWhenTheAgentFinishes(t *testing.T) {
+	a := &testAgent{}
+
+	err := run(t, testRow(a), "--config", configFile(t))
+
+	assert.True(t, a.ran)
+	assert.NoError(t, err)
+}
+
+func TestBadFlagStillPrintsTheUsage(t *testing.T) {
+	a := &testAgent{}
+
+	err, printed := execute(t, testRow(a), "--no-such-flag")
+
+	assert.EqualError(t, err, "unknown flag: --no-such-flag")
+	assert.False(t, a.ran)
+	assert.Contains(t, printed, "Error: unknown flag: --no-such-flag")
+	assert.Contains(t, printed, "Usage:")
 }

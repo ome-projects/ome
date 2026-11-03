@@ -15,15 +15,8 @@ import (
 // An absent lifecycle budget is strict, and desiredReplicas keeps surge from inflating the floor.
 // Unknown Component types return nil.
 func TopLevelComponentReadyFromLifecycle(component v1beta1.ComponentType, cs *v1beta1.LifecycleStatus, lifecycle *v1beta1.LifecycleSpec, desiredReplicas *int32) *apis.Condition {
-	var readyType apis.ConditionType
-	switch component {
-	case v1beta1.EngineComponent:
-		readyType = v1beta1.EngineReady
-	case v1beta1.DecoderComponent:
-		readyType = v1beta1.DecoderReady
-	case v1beta1.RouterComponent:
-		readyType = v1beta1.RouterReady
-	default:
+	readyType, ok := v1beta1.ReadyConditionOf(component)
+	if !ok {
 		return nil
 	}
 	cond := &apis.Condition{Type: readyType}
@@ -33,9 +26,13 @@ func TopLevelComponentReadyFromLifecycle(component v1beta1.ComponentType, cs *v1
 		cond.Message = "Component has no desired Instances"
 		return cond
 	}
-	floor := InstanceAvailabilityFloor(cs.Replicas, desiredReplicas, lifecycle)
+	// A budget that lets every Instance be unavailable still needs one
+	// serving Instance for the component to read ready.
+	floor := max(InstanceAvailabilityFloor(cs.Replicas, desiredReplicas, lifecycle), 1)
 	switch {
-	case cs.ReadyReplicas >= cs.Replicas:
+	// Ready counts containers only; an Instance enters rotation through the
+	// serving gate. A component with no serving Instance is not ready.
+	case cs.ReadyReplicas >= cs.Replicas && cs.ServingReplicas > 0:
 		cond.Status = corev1.ConditionTrue
 		cond.Reason = "Ready"
 		cond.Message = "All Instances are Ready"

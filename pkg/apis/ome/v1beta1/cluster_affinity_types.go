@@ -12,19 +12,13 @@ const (
 // ClusterAffinityTerm selects WorkloadClusters by ANDing its requirements.
 // Multiple terms form a union; weights assign replica shares to each match.
 // +kubebuilder:validation:XValidation:rule="(has(self.matchExpressions) && size(self.matchExpressions) > 0) || (has(self.matchFields) && size(self.matchFields) > 0)",message="a cluster affinity term must contain a requirement"
-// +kubebuilder:validation:XValidation:rule="!has(self.weight) || !has(self.weights) || (!has(self.weights.default) && !has(self.weights.engine))",message="weight means weights.default; it may sit beside weights.decoder and weights.router, but not beside weights.default or weights.engine"
 type ClusterAffinityTerm struct {
-	// Deprecated: Weight is weights.default, and is permitted only for static
-	// Split. It is the only weight a manager without weights support reads, so
-	// a rollback to such a manager keeps the engine shares set here.
-	// +optional
-	// +kubebuilder:validation:Minimum=1
-	Weight *int32 `json:"weight,omitempty"`
-
 	// Weights sets each component's replica weight on the clusters this term
 	// matches, and is permitted only for static Split. If any term gives a
 	// component a weight, the weights of matching terms add and a term that
 	// gives none contributes one. Weights are ratios, so they have no upper bound.
+	// With no weights on any term, every matched cluster weighs one and routers
+	// are divided, as a default weight of one on every term would.
 	// +optional
 	Weights *ClusterAffinityWeights `json:"weights,omitempty"`
 
@@ -60,11 +54,16 @@ type ClusterSelectorRequirement struct {
 
 // ClusterAffinityWeights holds one term's weight per component. The engine
 // takes engine, then default. The decoder takes decoder, then default, then
-// the engine's weight. Routers are divided across clusters only when a term
-// sets router; a term without it then contributes the engine's weight.
+// the engine's weight. The router takes router, then default, then the
+// engine's weight. Routers are divided across clusters unless the terms set
+// weights that name only the engine or decoder; then every cluster runs the
+// full router policy. The integer keys and the *Replicas ratio keys are two
+// forms of the same weights; one placement uses only one form.
 // +kubebuilder:validation:MinProperties=1
 type ClusterAffinityWeights struct {
 	// Default is the weight of every component this term does not name.
+	// Setting it on any term divides router.minReplicas across the clusters,
+	// as router does.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	Default *int32 `json:"default,omitempty"`
@@ -79,10 +78,61 @@ type ClusterAffinityWeights struct {
 	// +kubebuilder:validation:Minimum=1
 	Decoder *int32 `json:"decoder,omitempty"`
 
-	// Router is the router's weight. Setting it on any term divides
-	// router.minReplicas across the clusters; otherwise every cluster runs the
-	// full router policy.
+	// Router is the router's weight. Setting it or default on any term divides
+	// router.minReplicas across the clusters, as setting no weights does;
+	// weights that name only the engine or decoder keep the full router policy
+	// on every cluster.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	Router *int32 `json:"router,omitempty"`
+
+	// DefaultReplicas is the ratio form of default. It applies to every
+	// component this term does not name.
+	// +optional
+	DefaultReplicas *ReplicaRatio `json:"defaultReplicas,omitempty"`
+
+	// EngineReplicas is the ratio form of engine.
+	// +optional
+	EngineReplicas *ReplicaRatio `json:"engineReplicas,omitempty"`
+
+	// DecoderReplicas is the ratio form of decoder.
+	// +optional
+	DecoderReplicas *ReplicaRatio `json:"decoderReplicas,omitempty"`
+
+	// RouterReplicas is the ratio form of router.
+	// +optional
+	RouterReplicas *ReplicaRatio `json:"routerReplicas,omitempty"`
+}
+
+// ReplicaRatio gives a cluster's share of a component's minimum and maximum
+// replicas. Both values are ratios, not replica counts: min divides the
+// source's minReplicas and max divides its maxReplicas across the clusters.
+// An omitted min counts as 1 and an omitted max counts as 1, independently,
+// so an empty ratio weighs the same as a matching term that sets no ratio.
+type ReplicaRatio struct {
+	// Min is the cluster's ratio share of minReplicas. When omitted, it is 1.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Min *int32 `json:"min,omitempty"`
+
+	// Max is the cluster's ratio share of maxReplicas. When omitted, it is 1.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Max *int32 `json:"max,omitempty"`
+}
+
+// MinOrOne returns Min when set and 1 otherwise.
+func (r *ReplicaRatio) MinOrOne() int32 {
+	if r.Min != nil {
+		return *r.Min
+	}
+	return 1
+}
+
+// MaxOrOne returns Max when set and 1 otherwise.
+func (r *ReplicaRatio) MaxOrOne() int32 {
+	if r.Max != nil {
+		return *r.Max
+	}
+	return 1
 }

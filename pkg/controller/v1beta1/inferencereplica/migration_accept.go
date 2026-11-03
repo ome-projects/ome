@@ -27,245 +27,351 @@ import (
 // used (not 0) because 0 is a valid Instance index.
 const unallocatedSurgeIndex = int32(-1)
 
-// consumeMigrationRequests is the migration-request mailbox consumer:
-// each migration-request annotation on the parent ISVC is either
-// consumed into ir.Status.Migrations (validated accept), recorded as a
-// Failed ledger row (invalid), or deleted as a re-delivery of an
-// already-known UUID. Requests addressed to a sibling Component the
-// parent declares are left for that Component's IR pass. At most ONE
-// new Manual entry is accepted per pass (deterministic: lowest-sorted
-// annotation key first), matching the one-migration-dispatch-per-pass
-// pacing.
+// requestOutcome is what one pass does with one migration request
+// annotation on the parent InferenceService.
+type requestOutcome int
+
+const (
+	// requestKnown: this replica already carries the request, or the
+	// audit record holds it finished; the annotation is a re-delivery.
+	requestKnown requestOutcome = iota
+	// requestSibling: the request names another Component the parent
+	// declares; that Component's replica answers it.
+	requestSibling
+	// requestInvalid: the request cannot be a migration here; it is
+	// refused with a reason.
+	requestInvalid
+	// requestRefused: a valid request while the Component's
+	// MigrationPolicy mode is Never.
+	requestRefused
+	// requestAccepted: a valid request this pass takes on.
+	requestAccepted
+	// requestWaits: a valid request behind this pass's one accept; it
+	// stays on the parent for a later pass.
+	requestWaits
+)
+
+// migrationRequest is one request annotation after classification.
+type migrationRequest struct {
+	key     string
+	uuid    string
+	outcome requestOutcome
+	// body is the parsed request; nil when the value did not parse.
+	body *audit.MigrationRequest
+	// parseErr is why the value did not parse; an unsupported schema
+	// version picks its own event reason.
+	parseErr error
+	// reason says why an invalid request is refused.
+	reason string
+}
+
+func (request migrationRequest) invalid(reason string) migrationRequest {
+	request.outcome = requestInvalid
+	request.reason = reason
+	return request
+}
+
+// statusEntry is the status record every answered valid request starts
+// from: a Manual migration of the requested Instance off its node.
+func (request migrationRequest) statusEntry(now metav1.Time) v1beta1.MigrationStatus {
+	return v1beta1.MigrationStatus{
+		RequestUUID:    request.uuid,
+		Trigger:        v1beta1.MigrationTriggerManual,
+		SourceInstance: request.body.Instance,
+		FromNode:       request.body.FromNode,
+		Reason:         request.body.Reason,
+		StartedAt:      now,
+	}
+}
+
+// migrationIntake answers the parent's migration request annotations
+// for one pass: it classifies each request, records the answer on the
+// replica's status and the audit record, and collects the annotations
+// to remove at the end of the pass.
+type migrationIntake struct {
+	reconciler           *Reconciler
+	log                  logr.Logger
+	ir                   *v1beta1.InferenceReplica
+	parent               *v1beta1.InferenceService
+	mode                 workloadtypes.MigrationMode
+	instanceReadyTimeout time.Duration
+	auditRecord          *audit.Ledger
+	auditRecordChanged   bool
+	// accepted is set once a request is accepted: one Manual request per
+	// pass, matching the one migration dispatch per pass.
+	accepted bool
+	// answered lists the annotations to remove from the parent.
+	answered []string
+}
+
+// consumeMigrationRequests answers every migration request annotation
+// on the parent that is this Component's to answer: a valid request
+// becomes an Accepted status entry and a Started audit row, a valid one
+// under mode Never a Failed entry that is terminal at birth, an invalid
+// one a Failed audit row, and a re-delivered one nothing. The annotation
+// is removed in each of those cases. A sibling Component's request and a
+// valid request behind this pass's one accept stay for a later pass.
 //
-// mode is the Component's effective MigrationMode (the same value the
-// dispatcher reads from ComponentPlan.MigrationMode). Under Never a
-// valid request is consumed as a BORN-TERMINAL Failed entry: Never
-// means no migrations, and the mailbox contract means every consumed
-// request gets an immediate, visible answer — parking it Accepted
-// until the Deadline would answer late and lie about why it failed.
-//
-// Write order per accepted request: status entry commit first, then
-// the ledger Started row, then the annotation delete — a crash between
-// the commit and the delete re-enters the dedup branch next pass and
-// the annotation is cleaned up idempotently.
-//
-// All annotation deletions batch into ONE parent Update at pass end,
-// against a fresh parent read under conflict retry; exhausted retries
-// return requeue=true and the annotations retry next pass.
+// Write order per answered request: the status entry first, then the
+// audit row, then the annotation removals, batched into one
+// acknowledgeRequest on the parent, so a crash between them is answered
+// as a re-delivery next pass.
 func (r *Reconciler) consumeMigrationRequests(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, mode workloadtypes.MigrationMode, instanceReadyTimeout time.Duration) (requeue bool, err error) {
 	if parent == nil || len(parent.Annotations) == 0 {
 		return false, nil
 	}
+	keys := migrationRequestKeys(parent)
+	if len(keys) == 0 {
+		return false, nil
+	}
+
+	// The audit record is parent-owned on this path (the same rule as
+	// buildReconcileInput's LedgerOwner). Live read: sibling replicas of
+	// the same parent write it concurrently, and a cache-lagged snapshot
+	// persisted wholesale below would drop their rows.
+	auditRecord, err := audit.LoadLedgerForOwner(ctx, r.APIReader, parent)
+	if err != nil {
+		return false, fmt.Errorf("load migration audit ledger: %w", err)
+	}
+	intake := &migrationIntake{
+		reconciler:           r,
+		log:                  log,
+		ir:                   ir,
+		parent:               parent,
+		mode:                 mode,
+		instanceReadyTimeout: instanceReadyTimeout,
+		auditRecord:          auditRecord,
+	}
+	for _, k := range keys {
+		if err := intake.answer(ctx, intake.classify(k, parent.Annotations[k])); err != nil {
+			return false, err
+		}
+	}
+	if intake.auditRecordChanged {
+		if perr := audit.PersistLedgerForOwner(ctx, r.Client, parent, isvcGVK, auditRecord); perr != nil {
+			return false, fmt.Errorf("persist migration audit ledger: %w", perr)
+		}
+	}
+	if len(intake.answered) == 0 {
+		return false, nil
+	}
+	parentKey := client.ObjectKeyFromObject(parent)
+	return r.acknowledgeRequest(ctx, parent, "migration-request annotations", func(ctx context.Context) (client.Object, error) {
+		fresh := &v1beta1.InferenceService{}
+		return fresh, r.APIReader.Get(ctx, parentKey, fresh)
+	}, intake.answered...)
+}
+
+// migrationRequestKeys lists the parent's migration request annotation
+// keys in sorted order, so every pass answers them in the same order.
+func migrationRequestKeys(parent *v1beta1.InferenceService) []string {
 	keys := make([]string, 0, len(parent.Annotations))
 	for k := range parent.Annotations {
 		if strings.HasPrefix(k, audit.MigrationRequestAnnotationPrefix) {
 			keys = append(keys, k)
 		}
 	}
-	if len(keys) == 0 {
-		return false, nil
-	}
 	sort.Strings(keys)
+	return keys
+}
 
-	// The ledger is parent-owned on this path (same rule as
-	// buildReconcileInput's LedgerOwner). Live read: sibling IRs of the
-	// same parent write this ledger concurrently, and a cache-lagged
-	// snapshot persisted wholesale below would drop their rows.
-	ledger, err := audit.LoadLedgerForOwner(ctx, r.APIReader, parent)
-	if err != nil {
-		return false, fmt.Errorf("load migration audit ledger: %w", err)
+// classify reads one annotation and decides its outcome. The checks
+// repeat the webhook's, because annotations written before the webhook
+// or around it arrive here too.
+func (in *migrationIntake) classify(key, raw string) migrationRequest {
+	request := migrationRequest{key: key, uuid: audit.ExtractRequestUUID(key)}
+	if request.uuid != "" && (findMigrationStatus(in.ir, request.uuid) != nil || in.auditRecord.HasCompletedOrFailedRequest(request.uuid)) {
+		request.outcome = requestKnown
+		return request
 	}
-
-	var toDelete []string
-	ledgerDirty := false
-	accepted := false
-	for _, k := range keys {
-		uuid := audit.ExtractRequestUUID(k)
-		raw := parent.Annotations[k]
-
-		// (a) Re-delivery of an already-known UUID: an entry exists on
-		// this IR (any phase) or the ledger records it terminal. Delete
-		// the annotation; nothing else to do.
-		if uuid != "" && (findMigrationStatus(ir, uuid) != nil || ledger.HasCompletedOrFailedRequest(uuid)) {
-			toDelete = append(toDelete, k)
-			continue
+	request.body, request.parseErr = audit.ParseMigrationRequest(raw)
+	switch {
+	case request.uuid == "":
+		return request.invalid("annotation key carries no request UUID")
+	case request.parseErr != nil:
+		return request.invalid(request.parseErr.Error())
+	case request.body.Component != string(in.ir.Spec.Component):
+		if parentHasComponent(in.parent, request.body.Component) {
+			request.outcome = requestSibling
+			return request
 		}
-
-		// (b) Parse + validate (defense-in-depth behind the webhook —
-		// pre-webhook annotations and direct-write paths still arrive
-		// here).
-		req, perr := audit.ParseMigrationRequest(raw)
-		reason := ""
-		switch {
-		case uuid == "":
-			reason = "annotation key carries no request UUID"
-		case perr != nil:
-			reason = perr.Error()
-		}
-		if reason == "" {
-			switch {
-			case req.Component == string(ir.Spec.Component):
-				if req.Instance < 0 {
-					reason = fmt.Sprintf("instance must be >= 0, got %d", req.Instance)
-				}
-			case parentHasComponent(parent, req.Component):
-				// A sibling Component's request; its own IR pass consumes it.
-				continue
-			default:
-				reason = fmt.Sprintf("component %q does not exist on this InferenceService", req.Component)
-			}
-		}
-		if reason != "" {
-			// Invalid: terminal Failed ledger row (keyed by UUID; a
-			// UUID-less key gets no row — there is nothing to dedup on),
-			// Warning event on the ISVC, annotation consumed.
-			if uuid != "" {
-				now := metav1.NewTime(r.now()).UTC().Format(time.RFC3339)
-				entry := audit.Entry{
-					RequestUUID: uuid,
-					Phase:       audit.PhaseFailed,
-					StartedAt:   now,
-					CompletedAt: now,
-					Outcome:     reason,
-				}
-				if req != nil {
-					entry.Component = req.Component
-					entry.SourceInstance = req.Instance
-					entry.FromNode = req.FromNode
-				}
-				ledger.UpsertEntry(entry)
-				ledgerDirty = true
-			}
-			if r.Recorder != nil {
-				// Unknown schemaVersion keeps its own event reason —
-				// dashboards alert on version skew specifically.
-				eventReason := workloadtypes.EventReasonMigrationRequestRejected
-				if errors.Is(perr, audit.ErrUnsupportedSchemaVersion) {
-					eventReason = workloadtypes.EventReasonUnsupportedSchemaVersion
-				}
-				r.Recorder.Eventf(parent, corev1.EventTypeWarning, string(eventReason),
-					"OMENative migration uuid=%s rejected: %s", uuid, reason)
-			}
-			toDelete = append(toDelete, k)
-			continue
-		}
-
-		// (c) Valid request, but migration is disabled for this
-		// Component: consume as a born-terminal Failed entry (status
-		// entry + ledger Failed row + Warning, annotation deleted) —
-		// same visibility surfaces as an accept, answered immediately.
-		// No pacing gate: rejections are records, never work, so every
-		// Never-mode request resolves in one pass.
-		if mode == workloadtypes.MigrationModeNever {
-			now := metav1.NewTime(r.now())
-			msg := "migrations disabled by MigrationPolicy Mode=Never"
-			if aerr := appendMigrationStatus(ctx, r.statusWriter(), r.liveReader(), ir, v1beta1.MigrationStatus{
-				RequestUUID:    uuid,
-				Trigger:        v1beta1.MigrationTriggerManual,
-				SourceInstance: req.Instance,
-				FromNode:       req.FromNode,
-				Reason:         req.Reason,
-				Phase:          v1beta1.MigrationPhaseFailed,
-				Message:        msg,
-				StartedAt:      now,
-				CompletedAt:    &now,
-				Deadline:       now,
-			}); aerr != nil {
-				return false, fmt.Errorf("append migration status entry (uuid=%s): %w", uuid, aerr)
-			}
-			ts := now.UTC().Format(time.RFC3339)
-			ledger.UpsertEntry(audit.Entry{
-				RequestUUID:    uuid,
-				Component:      req.Component,
-				SourceInstance: req.Instance,
-				FromNode:       req.FromNode,
-				Phase:          audit.PhaseFailed,
-				StartedAt:      ts,
-				CompletedAt:    ts,
-				Outcome:        msg,
-			})
-			ledgerDirty = true
-			if r.Recorder != nil {
-				r.Recorder.Eventf(parent, corev1.EventTypeWarning, string(workloadtypes.EventReasonMigrationRequestRejected),
-					"OMENative migration uuid=%s rejected: %s", uuid, msg)
-			}
-			toDelete = append(toDelete, k)
-			log.V(1).Info("Migration request rejected: MigrationPolicy Mode=Never",
-				"uuid", uuid, "sourceInstance", req.Instance, "fromNode", req.FromNode)
-			continue
-		}
-
-		// (d) Valid request for this Component. One accept per pass;
-		// later keys stay in the mailbox for subsequent passes.
-		if accepted {
-			continue
-		}
-		now := metav1.NewTime(r.now())
-		if aerr := appendMigrationStatus(ctx, r.statusWriter(), r.liveReader(), ir, v1beta1.MigrationStatus{
-			RequestUUID:     uuid,
-			Trigger:         v1beta1.MigrationTriggerManual,
-			SourceInstance:  req.Instance,
-			FromNode:        req.FromNode,
-			HintTargetNodes: append([]string(nil), req.HintTargetNodes...),
-			Reason:          req.Reason,
-			Phase:           v1beta1.MigrationPhaseAccepted,
-			StartedAt:       now,
-			Deadline:        metav1.NewTime(now.Add(instanceReadyTimeout)),
-		}); aerr != nil {
-			return false, fmt.Errorf("append migration status entry (uuid=%s): %w", uuid, aerr)
-		}
-		ledger.UpsertEntry(audit.NewStartedEntry(req, uuid, unallocatedSurgeIndex))
-		ledgerDirty = true
-		toDelete = append(toDelete, k)
-		accepted = true
-		log.V(1).Info("Migration request accepted into status.migrations",
-			"uuid", uuid, "sourceInstance", req.Instance, "fromNode", req.FromNode)
+		return request.invalid(fmt.Sprintf("component %q does not exist on this InferenceService", request.body.Component))
+	case request.body.Instance < 0:
+		return request.invalid(fmt.Sprintf("instance must be >= 0, got %d", request.body.Instance))
+	case in.mode == workloadtypes.MigrationModeNever:
+		request.outcome = requestRefused
+	case in.accepted:
+		request.outcome = requestWaits
+	default:
+		request.outcome = requestAccepted
 	}
+	return request
+}
 
-	if ledgerDirty {
-		if perr := audit.PersistLedgerForOwner(ctx, r.Client, parent, isvcGVK, ledger); perr != nil {
-			return false, fmt.Errorf("persist migration audit ledger: %w", perr)
-		}
-	}
-	if len(toDelete) == 0 {
-		return false, nil
-	}
-	// Delete against a FRESH parent read under conflict retry — the
-	// pass-start snapshot's RV routinely goes stale on a hot parent, and
-	// a short-circuited delete would defer dispatch a whole pass.
-	parentKey := client.ObjectKeyFromObject(parent)
-	uerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		freshParent := &v1beta1.InferenceService{}
-		if err := r.APIReader.Get(ctx, parentKey, freshParent); err != nil {
+// answer records the outcome and, for every request this pass settles,
+// queues its annotation for removal.
+func (in *migrationIntake) answer(ctx context.Context, request migrationRequest) error {
+	switch request.outcome {
+	case requestSibling, requestWaits:
+		return nil
+	case requestKnown:
+		// Only the re-delivered annotation is left to remove.
+	case requestInvalid:
+		in.recordRejected(request)
+	case requestRefused:
+		if err := in.recordRefused(ctx, request); err != nil {
 			return err
 		}
+	case requestAccepted:
+		if err := in.recordAccepted(ctx, request); err != nil {
+			return err
+		}
+	}
+	in.answered = append(in.answered, request.key)
+	return nil
+}
+
+// recordRejected answers a request that cannot be a migration here: a
+// Failed audit row when the key carries a UUID (a key without one has
+// nothing to deduplicate on) and a Warning event on the parent.
+func (in *migrationIntake) recordRejected(request migrationRequest) {
+	if request.uuid != "" {
+		in.auditRecord.UpsertEntry(failedAuditRow(request.uuid, request.body, request.reason, in.reconciler.now()))
+		in.auditRecordChanged = true
+	}
+	// An unsupported schema version keeps its own event reason, so
+	// version skew can be alerted on by itself.
+	eventReason := workloadtypes.EventReasonMigrationRequestRejected
+	if errors.Is(request.parseErr, audit.ErrUnsupportedSchemaVersion) {
+		eventReason = workloadtypes.EventReasonUnsupportedSchemaVersion
+	}
+	in.rejectedEvent(eventReason, request.uuid, request.reason)
+}
+
+// recordRefused answers a valid request while the Component's
+// MigrationPolicy mode is Never: a Failed status entry that is terminal
+// at birth, a Failed audit row and a Warning event, so the refusal shows
+// in every place an accepted migration would, in the same pass.
+func (in *migrationIntake) recordRefused(ctx context.Context, request migrationRequest) error {
+	const message = "migrations disabled by MigrationPolicy Mode=Never"
+	now := metav1.NewTime(in.reconciler.now())
+	entry := request.statusEntry(now)
+	entry.Phase = v1beta1.MigrationPhaseFailed
+	entry.Message = message
+	entry.CompletedAt = &now
+	entry.Deadline = now
+	if err := in.appendStatusEntry(ctx, entry); err != nil {
+		return err
+	}
+	in.auditRecord.UpsertEntry(failedAuditRow(request.uuid, request.body, message, now.Time))
+	in.auditRecordChanged = true
+	in.rejectedEvent(workloadtypes.EventReasonMigrationRequestRejected, request.uuid, message)
+	in.log.V(1).Info("Migration request rejected: MigrationPolicy Mode=Never",
+		"uuid", request.uuid, "sourceInstance", request.body.Instance, "fromNode", request.body.FromNode)
+	return nil
+}
+
+// recordAccepted takes a valid request on: an Accepted status entry with
+// the deadline the moved Instance has to become Ready by, and a Started
+// audit row whose surge index the executor fills in when it allocates
+// the surge.
+func (in *migrationIntake) recordAccepted(ctx context.Context, request migrationRequest) error {
+	now := metav1.NewTime(in.reconciler.now())
+	entry := request.statusEntry(now)
+	entry.HintTargetNodes = append([]string(nil), request.body.HintTargetNodes...)
+	entry.Phase = v1beta1.MigrationPhaseAccepted
+	entry.Deadline = metav1.NewTime(now.Add(in.instanceReadyTimeout))
+	if err := in.appendStatusEntry(ctx, entry); err != nil {
+		return err
+	}
+	in.auditRecord.UpsertEntry(audit.NewStartedEntry(request.body, request.uuid, unallocatedSurgeIndex))
+	in.auditRecordChanged = true
+	in.accepted = true
+	in.log.V(1).Info("Migration request accepted into status.migrations",
+		"uuid", request.uuid, "sourceInstance", request.body.Instance, "fromNode", request.body.FromNode)
+	return nil
+}
+
+// appendStatusEntry commits one entry to the replica's status.migrations.
+func (in *migrationIntake) appendStatusEntry(ctx context.Context, entry v1beta1.MigrationStatus) error {
+	r := in.reconciler
+	if err := appendMigrationStatus(ctx, r.statusWriter(), r.liveReader(), in.ir, entry); err != nil {
+		return fmt.Errorf("append migration status entry (uuid=%s): %w", entry.RequestUUID, err)
+	}
+	return nil
+}
+
+// rejectedEvent warns on the parent, where the operator wrote the request.
+func (in *migrationIntake) rejectedEvent(reason workloadtypes.EventReason, uuid, text string) {
+	if in.reconciler.Recorder == nil {
+		return
+	}
+	in.reconciler.Recorder.Eventf(in.parent, corev1.EventTypeWarning, string(reason),
+		"OMENative migration uuid=%s rejected: %s", uuid, text)
+}
+
+// failedAuditRow is the audit row of a request that never started: a
+// terminal Failed row that opens and closes at the same time.
+func failedAuditRow(uuid string, body *audit.MigrationRequest, outcome string, at time.Time) audit.Entry {
+	when := at.UTC().Format(time.RFC3339)
+	entry := audit.Entry{
+		RequestUUID: uuid,
+		Phase:       audit.PhaseFailed,
+		StartedAt:   when,
+		CompletedAt: when,
+		Outcome:     outcome,
+	}
+	if body != nil {
+		entry.Component = body.Component
+		entry.SourceInstance = body.Instance
+		entry.FromNode = body.FromNode
+	}
+	return entry
+}
+
+// acknowledgeRequest removes the answered request annotations from the
+// object, so a request is delivered once. The request's effect commits
+// first and this removal runs second: a crash between the two delivers
+// the request again, and every answer is a no-op on a re-delivery. The
+// removal is one Update against a live read under conflict retry,
+// because the pass-start snapshot goes stale on a busy object and a
+// skipped removal would defer the next answer by a whole pass. It is
+// mirrored onto the caller's object, so later steps of this pass see the
+// request as answered. Exhausted retries ask for a requeue and the
+// request is answered again next pass; an object that is gone has
+// nothing left to acknowledge. readLive returns the object as the API
+// server holds it now; request names the annotations in the error text.
+func (r *Reconciler) acknowledgeRequest(ctx context.Context, obj client.Object, request string, readLive func(context.Context) (client.Object, error), keys ...string) (requeue bool, err error) {
+	uerr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh, err := readLive(ctx)
+		if err != nil {
+			return err
+		}
+		annotations := fresh.GetAnnotations()
 		changed := false
-		for _, k := range toDelete {
-			if _, ok := freshParent.Annotations[k]; ok {
-				delete(freshParent.Annotations, k)
+		for _, k := range keys {
+			if _, ok := annotations[k]; ok {
+				delete(annotations, k)
 				changed = true
 			}
 		}
 		if !changed {
 			return nil
 		}
-		return r.Update(ctx, freshParent)
+		return r.Update(ctx, fresh)
 	})
 	if uerr != nil {
 		if apierrors.IsConflict(uerr) {
-			// Retries exhausted on a hot parent; the annotations retry
-			// next pass (every branch above is idempotent on re-delivery).
 			return true, nil
 		}
 		if apierrors.IsNotFound(uerr) {
 			return false, nil
 		}
-		return false, fmt.Errorf("delete consumed migration-request annotations: %w", uerr)
+		return false, fmt.Errorf("delete consumed %s: %w", request, uerr)
 	}
-	// Mirror the deletions onto the caller's in-memory parent so
-	// downstream consumers in this pass observe the consumed mailbox.
-	for _, k := range toDelete {
-		delete(parent.Annotations, k)
+	annotations := obj.GetAnnotations()
+	for _, k := range keys {
+		delete(annotations, k)
 	}
 	return false, nil
 }
@@ -695,18 +801,11 @@ func findMigrationStatus(ir *v1beta1.InferenceReplica, uuid string) *v1beta1.Mig
 }
 
 // parentHasComponent reports whether the parent ISVC declares the named
-// component: engine always; decoder / router per spec presence (same
+// component: engine always; any other role per spec presence (same
 // enumeration rule as the ISVC webhook's migration-request validation).
 func parentHasComponent(parent *v1beta1.InferenceService, component string) bool {
-	switch component {
-	case string(v1beta1.EngineComponent):
-		return true
-	case string(v1beta1.DecoderComponent):
-		return parent.Spec.Decoder != nil
-	case string(v1beta1.RouterComponent):
-		return parent.Spec.Router != nil
-	}
-	return false
+	c := v1beta1.ComponentType(component)
+	return c == v1beta1.EngineComponent || v1beta1.SpecOf(&parent.Spec, c) != nil
 }
 
 // now returns the injected clock's time, or wall-clock when no clock

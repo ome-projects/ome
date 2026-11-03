@@ -35,14 +35,21 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 )
 
-func TestGetOptions(t *testing.T) {
-	// Save original command line arguments and restore them after the test
-	oldArgs := os.Args
-	defer func() {
+// withArgs gives a test its own flag set and arguments for GetOptions and
+// restores the process's parsed command line afterwards: the test runner
+// reads that command line again before every repeated run (-count).
+func withArgs(t *testing.T, args ...string) {
+	t.Helper()
+	oldArgs, oldFlags := os.Args, flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet(args[0], flag.ExitOnError)
+	os.Args = args
+	t.Cleanup(func() {
 		os.Args = oldArgs
-		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	}()
+		flag.CommandLine = oldFlags
+	})
+}
 
+func TestGetOptions(t *testing.T) {
 	tests := []struct {
 		name     string
 		args     []string
@@ -86,9 +93,7 @@ func TestGetOptions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Reset flags before each test
-			flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-			os.Args = tt.args
+			withArgs(t, tt.args...)
 
 			options := GetOptions()
 			assert.Equal(t, tt.expected.metricsAddr, options.metricsAddr)
@@ -127,18 +132,11 @@ func TestDefaultOptions(t *testing.T) {
 }
 
 func TestGetOptionsLeaderElectionTiming(t *testing.T) {
-	oldArgs := os.Args
-	defer func() {
-		os.Args = oldArgs
-		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	}()
-
-	flag.CommandLine = flag.NewFlagSet("cmd", flag.ExitOnError)
-	os.Args = []string{"cmd",
+	withArgs(t, "cmd",
 		"--leader-elect-lease-duration=60s",
 		"--leader-elect-renew-deadline=40s",
 		"--leader-elect-retry-period=8s",
-	}
+	)
 
 	o := GetOptions()
 	assert.Equal(t, 60*time.Second, o.leaderElectionTiming.LeaseDuration)
@@ -148,14 +146,7 @@ func TestGetOptionsLeaderElectionTiming(t *testing.T) {
 }
 
 func TestGetOptionsKubeAPIRateLimits(t *testing.T) {
-	oldArgs := os.Args
-	defer func() {
-		os.Args = oldArgs
-		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	}()
-
-	flag.CommandLine = flag.NewFlagSet("cmd", flag.ExitOnError)
-	os.Args = []string{"cmd", "--kube-api-qps=50", "--kube-api-burst=100"}
+	withArgs(t, "cmd", "--kube-api-qps=50", "--kube-api-burst=100")
 
 	o := GetOptions()
 	assert.Equal(t, 50.0, o.kubeAPIQPS)
@@ -163,14 +154,7 @@ func TestGetOptionsKubeAPIRateLimits(t *testing.T) {
 }
 
 func TestGetOptionsPprofBindAddress(t *testing.T) {
-	oldArgs := os.Args
-	defer func() {
-		os.Args = oldArgs
-		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	}()
-
-	flag.CommandLine = flag.NewFlagSet("cmd", flag.ExitOnError)
-	os.Args = []string{"cmd", "--pprof-bind-address=127.0.0.1:6060"}
+	withArgs(t, "cmd", "--pprof-bind-address=127.0.0.1:6060")
 
 	o := GetOptions()
 	assert.Equal(t, "127.0.0.1:6060", o.pprofAddr)
@@ -199,21 +183,14 @@ func TestApplyKubeAPIRateLimits(t *testing.T) {
 // TestGetOptionsMultiCluster asserts the five retained multi-cluster flags parse
 // and bind onto Options (the tunables are ConfigMap-driven and tested separately).
 func TestGetOptionsMultiCluster(t *testing.T) {
-	oldArgs := os.Args
-	defer func() {
-		os.Args = oldArgs
-		flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	}()
-
-	flag.CommandLine = flag.NewFlagSet("cmd", flag.ExitOnError)
-	os.Args = []string{
+	withArgs(t,
 		"cmd",
 		"--enable-multicluster",
 		"--multicluster-role=control-plane",
 		"--allow-exec-credentials",
 		"--exec-credential-allowed-commands=aws,foo",
 		"--placement-control-plane-id=cp-1",
-	}
+	)
 
 	o := GetOptions()
 	assert.True(t, o.enableMultiCluster)

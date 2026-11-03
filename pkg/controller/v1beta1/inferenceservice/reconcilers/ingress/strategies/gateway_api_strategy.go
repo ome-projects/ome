@@ -2,6 +2,7 @@ package strategies
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -74,8 +75,16 @@ func (g *GatewayAPIStrategy) Reconcile(ctx context.Context, isvc *v1beta1.Infere
 		// here would overwrite those False conditions every pass.
 		ingressReady := true
 
-		// Reconcile component HTTPRoutes
-		ready, err := g.reconcileComponentHTTPRoute(ctx, isvc, builders.EngineComponent)
+		// The top-level route is created first. Under per-ISVC subdomains every
+		// route of the service matches the same host at "/", and Gateway API
+		// gives that tie to the oldest route, so the top-level route must be it.
+		ready, err := g.reconcileComponentHTTPRoute(ctx, isvc, builders.TopLevelComponent)
+		if err != nil {
+			return err
+		}
+		ingressReady = ingressReady && ready
+
+		ready, err = g.reconcileComponentHTTPRoute(ctx, isvc, builders.EngineComponent)
 		if err != nil {
 			return err
 		}
@@ -94,11 +103,6 @@ func (g *GatewayAPIStrategy) Reconcile(ctx context.Context, isvc *v1beta1.Infere
 			}
 			ingressReady = ingressReady && ready
 		}
-		ready, err = g.reconcileComponentHTTPRoute(ctx, isvc, builders.TopLevelComponent)
-		if err != nil {
-			return err
-		}
-		ingressReady = ingressReady && ready
 
 		// The default BTP (ConsistentHash on configured headers) is
 		// emitted here only when the operator has NOT declared any
@@ -193,44 +197,31 @@ func (g *GatewayAPIStrategy) setStatusEndpoints(isvc *v1beta1.InferenceService) 
 }
 
 // reconcileComponentHTTPRoute ensures the component's HTTPRoute exists and
-// matches the desired spec. It returns ready=false (with IngressReady=False
-// already set on the ISVC) when the component is not yet ready for a route.
+// matches the desired spec. It returns ready=false, with IngressReady=False
+// written here, when the builder answers that the component cannot back a
+// route yet; the builders write no condition themselves.
 func (g *GatewayAPIStrategy) reconcileComponentHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService, componentType string) (bool, error) {
-	// Use builder to create the HTTPRoute
 	desired, err := g.httpRouteBuilder.BuildHTTPRoute(ctx, isvc, componentType)
+	var notReady *interfaces.ComponentNotReadyError
+	if errors.As(err, &notReady) {
+		isvc.Status.SetCondition(v1beta1.IngressReady, &knapis.Condition{
+			Type:    v1beta1.IngressReady,
+			Status:  corev1.ConditionFalse,
+			Reason:  "ComponentNotReady",
+			Message: fmt.Sprintf("%s component not ready for HTTPRoute creation", componentType),
+		})
+		klog.V(1).InfoS("Component not ready; HTTPRoute not built", "isvc", isvc.Name, "component", componentType)
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	if desired == nil {
-		// Set ingress condition to indicate component not ready
-		isvc.Status.SetCondition(v1beta1.IngressReady, &knapis.Condition{
-			Type:    v1beta1.IngressReady,
-			Status:  corev1.ConditionFalse,
-			Reason:  "ComponentNotReady",
-			Message: fmt.Sprintf("%s component not ready for HTTPRoute creation", componentType),
-		})
-		klog.V(1).InfoS("Builder returned nil HTTPRoute; component not ready", "isvc", isvc.Name, "component", componentType)
-		return false, nil
-	}
 
+	// A builder that hands back no route without saying why broke its
+	// contract; refuse it instead of dereferencing a nil route below.
 	httpRoute, ok := desired.(*gatewayapiv1.HTTPRoute)
-	if !ok {
-		return false, fmt.Errorf("builder returned unexpected type %T, expected *gatewayapiv1.HTTPRoute", desired)
-	}
-	if httpRoute == nil {
-		// Defensive: BuildHTTPRoute now returns interface-nil for not-ready
-		// components, but guard here too so any future caller that hands us
-		// a typed-nil pointer (e.g. via a stub builder in tests, or a future
-		// dispatcher regression) does not crash the reconciler in
-		// controllerutil.SetControllerReference below.
-		isvc.Status.SetCondition(v1beta1.IngressReady, &knapis.Condition{
-			Type:    v1beta1.IngressReady,
-			Status:  corev1.ConditionFalse,
-			Reason:  "ComponentNotReady",
-			Message: fmt.Sprintf("%s component not ready for HTTPRoute creation", componentType),
-		})
-		klog.V(1).InfoS("Builder returned typed-nil HTTPRoute; component not ready", "isvc", isvc.Name, "component", componentType)
-		return false, nil
+	if !ok || httpRoute == nil {
+		return false, fmt.Errorf("builder returned %T for the %s HTTPRoute, expected a non-nil *gatewayapiv1.HTTPRoute", desired, componentType)
 	}
 
 	if err := controllerutil.SetControllerReference(isvc, httpRoute, g.scheme); err != nil {

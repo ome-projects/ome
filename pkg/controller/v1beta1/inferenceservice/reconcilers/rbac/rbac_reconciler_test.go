@@ -193,7 +193,7 @@ func TestRBACReconciler_Reconcile_RouterComponent(t *testing.T) {
 			)
 
 			// Test successful reconciliation
-			err := reconciler.Reconcile()
+			err := reconciler.Reconcile(context.Background())
 			require.NoError(t, err)
 
 			expectedServiceAccountName := "test-inference-service-router"
@@ -309,7 +309,7 @@ func TestRBACReconciler_Reconcile_NonRouterComponent(t *testing.T) {
 	)
 
 	// Test successful reconciliation
-	err := reconciler.Reconcile()
+	err := reconciler.Reconcile(context.Background())
 	require.NoError(t, err)
 
 	expectedServiceAccountName := "test-inference-service-engine"
@@ -380,7 +380,7 @@ func TestRBACReconciler_Reconcile_Update(t *testing.T) {
 	)
 
 	// Test reconciliation updates existing resources
-	err := reconciler.Reconcile()
+	err := reconciler.Reconcile(context.Background())
 	require.NoError(t, err)
 
 	// Verify ServiceAccount was updated with new labels
@@ -408,7 +408,7 @@ func TestRBACReconciler_createOrUpdate(t *testing.T) {
 		},
 	}
 
-	err := reconciler.createOrUpdate(sa)
+	err := reconciler.createOrUpdate(context.Background(), sa)
 	require.NoError(t, err)
 
 	// Verify resource was created
@@ -422,7 +422,7 @@ func TestRBACReconciler_createOrUpdate(t *testing.T) {
 
 	// Test updating existing resource
 	sa.Labels = map[string]string{"updated": "true"}
-	err = reconciler.createOrUpdate(sa)
+	err = reconciler.createOrUpdate(context.Background(), sa)
 	require.NoError(t, err)
 
 	// Verify resource was updated
@@ -450,7 +450,7 @@ func TestRBACReconciler_createOrUpdate_Error(t *testing.T) {
 		},
 	}
 
-	err := reconciler.createOrUpdate(sa)
+	err := reconciler.createOrUpdate(context.Background(), sa)
 	assert.Error(t, err)
 }
 
@@ -514,7 +514,7 @@ func TestRBACReconciler_createOrUpdate_NoOpWhenUnchanged(t *testing.T) {
 			updates := fakeclient.CountingVerb(fakeclient.Update)
 			reconciler := &RBACReconciler{client: fakeclient.New(t, fakeclient.WithObjects(tc.live), updates), Log: logr.Discard()}
 
-			require.NoError(t, reconciler.createOrUpdate(tc.desired))
+			require.NoError(t, reconciler.createOrUpdate(context.Background(), tc.desired))
 			assert.Equal(t, 0, updates.Count(), "steady %s must not issue an Update PUT", tc.name)
 		})
 	}
@@ -572,7 +572,7 @@ func TestRBACReconciler_createOrUpdate_UpdatesOnDrift(t *testing.T) {
 			updates := fakeclient.CountingVerb(fakeclient.Update)
 			reconciler := &RBACReconciler{client: fakeclient.New(t, fakeclient.WithObjects(tc.live), updates), Log: logr.Discard()}
 
-			require.NoError(t, reconciler.createOrUpdate(tc.desired))
+			require.NoError(t, reconciler.createOrUpdate(context.Background(), tc.desired))
 			assert.Equal(t, 1, updates.Count(), "drifted %s must issue exactly one Update PUT", tc.name)
 		})
 	}
@@ -607,7 +607,7 @@ func BenchmarkRBACReconciler_Reconcile(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		err := reconciler.Reconcile()
+		err := reconciler.Reconcile(context.Background())
 		require.NoError(b, err)
 	}
 }

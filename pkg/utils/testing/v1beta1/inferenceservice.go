@@ -145,6 +145,13 @@ func (w *InferenceServiceWrapper) Decoder(spec *v1beta1.DecoderSpec) *InferenceS
 	return w
 }
 
+// Encoder sets spec.Encoder: the encoder pod set of an encoder-prefill-decode
+// service, which needs an engine beside it.
+func (w *InferenceServiceWrapper) Encoder(spec *v1beta1.EncoderSpec) *InferenceServiceWrapper {
+	w.Spec.Encoder = spec
+	return w
+}
+
 // Router sets spec.Router. The router is the third optional component
 // alongside Engine + Decoder; when set it produces its own child
 // resource (Deployment/Service) per the chosen mode.

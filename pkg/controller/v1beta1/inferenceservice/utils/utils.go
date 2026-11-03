@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -69,7 +70,8 @@ func GetValueFromRawExtension(raw runtime.RawExtension, key string) (interface{}
 
 // GetTargetServicePort returns the port of the target service (router or engine).
 // For raw deployment mode, it uses RouterServiceName/EngineServiceName.
-// Returns the port from the service, or constants.CommonISVCPort as default if service lookup fails.
+// Returns the Service's first port, or constants.CommonISVCPort when the
+// Service declares none; a Service that cannot be read is an error.
 func GetTargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService) (int32, error) {
 	return TargetServicePort(ctx, c, isvc, isvc.Spec.Router != nil)
 }
@@ -78,60 +80,53 @@ func GetTargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.In
 // the router's Service when hasRouter, else the engine's. Callers that serve
 // a role through a referenced replica have no spec.router to test.
 func TargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, hasRouter bool) (int32, error) {
-	var serviceName string
+	serviceName := constants.EngineServiceName(isvc.Name)
 	if hasRouter {
 		serviceName = constants.RouterServiceName(isvc.Name)
-	} else {
-		serviceName = constants.EngineServiceName(isvc.Name)
 	}
-
-	// if serviceName reached 63 character, the service name will be truncated during service creation. update name otherwise the service can't found
-	serviceName = constants.TruncateNameWithMaxLength(serviceName, 63)
-
-	service := &corev1.Service{}
-	if err := c.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: isvc.Namespace}, service); err != nil {
+	ports, err := servicePorts(ctx, c, isvc.Namespace, serviceName)
+	if err != nil {
 		return 0, err
 	}
+	return firstPort(ports, constants.CommonISVCPort), nil
+}
 
-	port := int32(constants.CommonISVCPort) // default port
-	if len(service.Spec.Ports) > 0 {
-		port = service.Spec.Ports[0].Port
+// servicePorts reads the ports of the named Service. Service names are
+// truncated to 63 characters on creation, so the lookup truncates too.
+func servicePorts(ctx context.Context, c client.Client, namespace, serviceName string) ([]corev1.ServicePort, error) {
+	service := &corev1.Service{}
+	key := types.NamespacedName{Name: constants.TruncateNameWithMaxLength(serviceName, 63), Namespace: namespace}
+	if err := c.Get(ctx, key, service); err != nil {
+		return nil, err
 	}
+	return service.Spec.Ports, nil
+}
 
-	return port, nil
+// firstPort returns the first port of a Service, or fallback when it has none.
+func firstPort(ports []corev1.ServicePort, fallback int32) int32 {
+	if len(ports) == 0 {
+		return fallback
+	}
+	return ports[0].Port
 }
 
 // MergedRunnerPorts collects the container ports each merged Component's
 // effective serving template declares, keyed by Component type. Per-revision
-// routing uses the Leader template for multi-pod Engine and Decoder shapes and
-// the top-level template for single-pod Components and Router.
+// routing uses the Leader template for a multi-pod shape and the top-level
+// template for a single-pod one.
 //
 // A Component whose merged spec is absent, or whose runner container
 // declares no port, is omitted: the caller decides how to degrade rather
 // than receiving an invented port.
-func MergedRunnerPorts(engine *v1beta1.EngineSpec, decoder *v1beta1.DecoderSpec, router *v1beta1.RouterSpec) map[v1beta1.ComponentType][]corev1.ContainerPort {
-	out := make(map[v1beta1.ComponentType][]corev1.ContainerPort, 3)
-	if engine != nil {
-		runner, containers := engine.Runner, engine.Containers
-		if engine.Leader != nil && engineSpawnsMultiplePods(engine) {
-			runner, containers = engine.Leader.Runner, engine.Leader.Containers
+func MergedRunnerPorts(specs v1beta1.RoleSpecs) map[v1beta1.ComponentType][]corev1.ContainerPort {
+	out := make(map[v1beta1.ComponentType][]corev1.ContainerPort, len(v1beta1.Roles))
+	for _, view := range specs.Declared() {
+		runner, containers := view.Runner, view.PodSpec.Containers
+		if view.Leader != nil && workerSpawnsPods(view.Worker) {
+			runner, containers = view.Leader.Runner, view.Leader.Containers
 		}
 		if ports := runnerContainerPorts(runner, containers); len(ports) > 0 {
-			out[v1beta1.EngineComponent] = ports
-		}
-	}
-	if decoder != nil {
-		runner, containers := decoder.Runner, decoder.Containers
-		if decoder.Leader != nil && decoderSpawnsMultiplePods(decoder) {
-			runner, containers = decoder.Leader.Runner, decoder.Leader.Containers
-		}
-		if ports := runnerContainerPorts(runner, containers); len(ports) > 0 {
-			out[v1beta1.DecoderComponent] = ports
-		}
-	}
-	if router != nil {
-		if ports := runnerContainerPorts(router.Runner, router.Containers); len(ports) > 0 {
-			out[v1beta1.RouterComponent] = ports
+			out[view.Type] = ports
 		}
 	}
 	return out
@@ -166,17 +161,11 @@ func ServiceHasPort(ctx context.Context, c client.Client, namespace, serviceName
 	if c == nil {
 		return false
 	}
-	service := &corev1.Service{}
-	// Service names are truncated to 63 chars on creation; match that here.
-	if err := c.Get(ctx, types.NamespacedName{Name: constants.TruncateNameWithMaxLength(serviceName, 63), Namespace: namespace}, service); err != nil {
+	ports, err := servicePorts(ctx, c, namespace, serviceName)
+	if err != nil {
 		return false
 	}
-	for _, p := range service.Spec.Ports {
-		if p.Port == port {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(ports, func(p corev1.ServicePort) bool { return p.Port == port })
 }
 
 // ResolveServicePort returns the first port of the named Service, which is
@@ -188,16 +177,11 @@ func ResolveServicePort(ctx context.Context, c client.Client, namespace, service
 	if c == nil {
 		return defaultPort
 	}
-
-	service := &corev1.Service{}
-	// Service names are truncated to 63 chars on creation; match that here.
-	if err := c.Get(ctx, types.NamespacedName{Name: constants.TruncateNameWithMaxLength(serviceName, 63), Namespace: namespace}, service); err != nil {
+	ports, err := servicePorts(ctx, c, namespace, serviceName)
+	if err != nil {
 		return defaultPort
 	}
-	if len(service.Spec.Ports) > 0 {
-		return service.Spec.Ports[0].Port
-	}
-	return defaultPort
+	return firstPort(ports, defaultPort)
 }
 
 // AddNodeSelectorForModelReadyNode adds a node selector to the pod spec

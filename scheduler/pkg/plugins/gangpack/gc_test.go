@@ -38,16 +38,16 @@ func (f fakeGangPodLister) gangPods(namespace, name string) ([]*v1.Pod, error) {
 // assignments of gangs with no live pods and keeps those that still have some.
 func TestGC_GangWithNoLivePods_ReleasesItsAssignment(t *testing.T) {
 	assignments := placement.New()
-	assignments.Set("ns/live", "a")
-	assignments.Set("ns/dead", "b")
+	assignments.Set(placement.Gang{Group: "ns/live"}, "a", 0, nil)
+	assignments.Set(placement.Gang{Group: "ns/dead"}, "b", 0, nil)
 	g := &GangPack{assignments: assignments, podLister: fakeGangPodLister{keys: map[string]bool{"ns/live": true}}}
 
 	g.gcAssignments()
 
-	if _, ok := assignments.Get("ns/dead"); ok {
+	if _, ok := assignedDomain(assignments, "ns/dead"); ok {
 		t.Fatal("assignment for a gang with no live pods should be GC'd")
 	}
-	if _, ok := assignments.Get("ns/live"); !ok {
+	if _, ok := assignedDomain(assignments, "ns/live"); !ok {
 		t.Fatal("assignment for a gang that still has pods must be kept")
 	}
 }
@@ -60,7 +60,7 @@ func TestGC_GangWithNoLivePods_ReleasesItsAssignment(t *testing.T) {
 // remaining need; a still-forming gang keeps its whole claim.
 func TestGC_LiveGangWithNoMemberPlaced_KeepsFullReservation(t *testing.T) {
 	assignments := placement.New()
-	if d, ok := assignments.Choose("team/pf", topology.FreeByDomain{"a": 3}, 3); !ok || d != "a" {
+	if d, ok := choose(assignments, "team/pf", topology.FreeByDomain{"a": 3}, 3); !ok || d != "a" {
 		t.Fatalf("precondition Choose = %q,%v want a,true", d, ok)
 	}
 
@@ -81,7 +81,7 @@ func TestGC_LiveGangWithNoMemberPlaced_KeepsFullReservation(t *testing.T) {
 
 	// A justifies its full reservation (0 placed of 3), so a second gang must not be
 	// able to take A's domain — A may yet form there.
-	if _, ok := assignments.Choose("team/other", topology.FreeByDomain{"a": 3}, 3); ok {
+	if _, ok := choose(assignments, "team/other", topology.FreeByDomain{"a": 3}, 3); ok {
 		t.Fatal("with zero members placed, A's reservation is legitimate and must be preserved")
 	}
 }
@@ -92,7 +92,7 @@ func TestGC_LiveGangWithNoMemberPlaced_KeepsFullReservation(t *testing.T) {
 func TestGC_LiveGangWithClaims_LeavesReservationsUntouched(t *testing.T) {
 	assignments := placement.New()
 	// Gang A took "a" reserving 3, but only its actual placement matters now.
-	assignments.Choose("team/pf", topology.FreeByDomain{"a": 5}, 3)
+	choose(assignments, "team/pf", topology.FreeByDomain{"a": 5}, 3)
 
 	g := &GangPack{
 		assignments: assignments,
@@ -103,12 +103,11 @@ func TestGC_LiveGangWithClaims_LeavesReservationsUntouched(t *testing.T) {
 
 	// GC preserves all three claims; Reserve is the only path that converts them
 	// into assumed-pod occupancy.
-	if _, ok := assignments.Choose("team/other", topology.FreeByDomain{"a": 3}, 2); ok {
+	if _, ok := choose(assignments, "team/other", topology.FreeByDomain{"a": 3}, 2); ok {
 		t.Fatal("other gang must remain blocked while A has one outstanding member")
 	}
-	reservations := assignments.Reservations()
-	if len(reservations) != 1 || reservations[0].Remaining != 3 {
-		t.Fatalf("reservations = %+v, want three untouched claims", reservations)
+	if _, _, remaining, _ := assignments.GetOwned("team/pf"); assignments.Len() != 1 || remaining != 3 {
+		t.Fatalf("reservations = %d groups, %d remaining, want one group with three untouched claims", assignments.Len(), remaining)
 	}
 }
 
@@ -116,10 +115,10 @@ func TestGC_LiveGangWithClaims_LeavesReservationsUntouched(t *testing.T) {
 // inputs are missing, so a plugin without a wired reader never panics.
 func TestGC_NoPodGroupReader_KeepsAssignmentWithoutPanic(t *testing.T) {
 	assignments := placement.New()
-	assignments.Choose("team/pf", topology.FreeByDomain{"a": 3}, 3)
+	choose(assignments, "team/pf", topology.FreeByDomain{"a": 3}, 3)
 	g := &GangPack{assignments: assignments, podLister: fakeGangPodLister{keys: map[string]bool{"team/pf": true}}}
 	g.gcAssignments() // pgReader nil -> reconcile no-op, no panic
-	if _, ok := assignments.Get("team/pf"); !ok {
+	if _, ok := assignedDomain(assignments, "team/pf"); !ok {
 		t.Fatal("assignment must survive a no-op reconcile")
 	}
 }
@@ -128,12 +127,12 @@ func TestGC_NoPodGroupReader_KeepsAssignmentWithoutPanic(t *testing.T) {
 // anything (a partial view could reap live gangs) — the next tick retries.
 func TestGC_ListerError_ReleasesNothing(t *testing.T) {
 	assignments := placement.New()
-	assignments.Set("ns/x", "a")
+	assignments.Set(placement.Gang{Group: "ns/x"}, "a", 0, nil)
 	g := &GangPack{assignments: assignments, podLister: fakeGangPodLister{err: errors.New("cache not synced")}}
 
 	g.gcAssignments()
 
-	if _, ok := assignments.Get("ns/x"); !ok {
+	if _, ok := assignedDomain(assignments, "ns/x"); !ok {
 		t.Fatal("must not release assignments on a lister error")
 	}
 }
@@ -182,7 +181,7 @@ func TestLiveGangKeys_TerminalOrDeletingPods_LeavesThemOut(t *testing.T) {
 
 func TestGC_PodGroupRecreatedWithNewUID_ReleasesOldAssignment(t *testing.T) {
 	assignments := placement.New()
-	if _, _, ok := assignments.ChooseForOwnerInTopologyOnNodes("team/pf", "old-uid", testKey,
+	if _, _, ok := assignments.Choose(placement.Gang{Group: "team/pf", Owner: "old-uid", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 1}, map[string][]string{"a": {"a1"}}, 1); !ok {
 		t.Fatal("failed to establish old owner")
 	}
@@ -192,14 +191,14 @@ func TestGC_PodGroupRecreatedWithNewUID_ReleasesOldAssignment(t *testing.T) {
 		pgReader:    fakeReader{"team/pf": {min: 1, topo: testKey, uid: "new-uid"}},
 	}
 	g.gcAssignments()
-	if _, ok := assignments.Get("team/pf"); ok {
+	if _, ok := assignedDomain(assignments, "team/pf"); ok {
 		t.Fatal("same-name assignment from old PodGroup UID survived GC")
 	}
 }
 
 func TestGC_GangWithNoPodsHasPermitWaiter_RejectsTheWaiter(t *testing.T) {
 	assignments := placement.New()
-	_, token, ok := assignments.ChooseForOwnerInTopologyOnNodes("team/pf", "pg-uid", testKey,
+	_, token, ok := assignments.Choose(placement.Gang{Group: "team/pf", Owner: "pg-uid", TopologyKey: testKey},
 		topology.FreeByDomain{"a": 1}, map[string][]string{"a": {"a1"}}, 1)
 	if !ok {
 		t.Fatal("failed to establish commitment")

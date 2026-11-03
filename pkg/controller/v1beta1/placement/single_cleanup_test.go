@@ -11,6 +11,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestSingleRaceCleanupAuthority(t *testing.T) {
@@ -64,7 +65,7 @@ func TestSingleRaceCleanupAuthority(t *testing.T) {
 			if err := worker.Create(t.Context(), member); err != nil {
 				t.Fatal(err)
 			}
-			watched := interceptor.NewClient(worker, interceptor.Funcs{Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			watched := fakeclient.Wrap(t, worker, fakeclient.WithInterceptors(interceptor.Funcs{Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 				if tt.race {
 					changed := &v1beta1.InferenceService{}
 					if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), changed); err != nil {
@@ -76,7 +77,7 @@ func TestSingleRaceCleanupAuthority(t *testing.T) {
 					}
 				}
 				return cl.Delete(ctx, obj, opts...)
-			}})
+			}}))
 			live := s.DeepCopy()
 			if tt.stale {
 				live.Status.Placement.Plan.Revision++

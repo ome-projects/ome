@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/plan"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func singleFixture(t *testing.T, pd bool) *backendFixture {
@@ -86,7 +87,7 @@ func TestSingleRacePersistsBeforeMemberWrites(t *testing.T) {
 			}
 			created, deleted := []string{}, []string{}
 			for name, worker := range f.workers {
-				watched := interceptor.NewClient(worker, interceptor.Funcs{
+				watched := fakeclient.Wrap(t, worker, fakeclient.WithInterceptors(interceptor.Funcs{
 					Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 						if member, ok := obj.(*v1beta1.InferenceService); ok {
 							live := &v1beta1.InferenceService{}
@@ -125,7 +126,7 @@ func TestSingleRacePersistsBeforeMemberWrites(t *testing.T) {
 						deleted = append(deleted, name)
 						return cl.Delete(ctx, obj, opts...)
 					},
-				})
+				}))
 				f.connections.m[name] = workloadcluster.NewNeverCachingClient(watched)
 			}
 			race := f.reconcile(t)
@@ -184,7 +185,7 @@ func TestSingleWinnerFailureCannotDeleteLosers(t *testing.T) {
 			f.reconcile(t)
 			seedSingleAdmission(t, f, "member-a", v1beta1.EngineComponent)
 			base := f.reconciler.Client
-			f.reconciler.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			f.reconciler.Client = fakeclient.Wrap(t, base.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 				s := obj.(*v1beta1.InferenceService)
 				if s.Status.Placement != nil && s.Status.Placement.Plan != nil && s.Status.Placement.Plan.Winner != "" {
 					if !tt.prune {
@@ -194,7 +195,7 @@ func TestSingleWinnerFailureCannotDeleteLosers(t *testing.T) {
 					s.Status.Placement.Plan.Winner = ""
 				}
 				return cl.SubResource(sub).Update(ctx, s, opts...)
-			}})
+			}}))
 			_, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.source)})
 			if err != nil && !errors.Is(err, plan.ErrStaleSnapshot) {
 				t.Fatal(err)
@@ -234,7 +235,7 @@ func TestSingleNominationsMustPersistBeforeCreation(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			f := singleFixture(t, false)
 			base := f.reconciler.Client
-			f.reconciler.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			f.reconciler.Client = fakeclient.Wrap(t, base.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 				s := obj.(*v1beta1.InferenceService).DeepCopy()
 				if s.Status.Placement != nil && s.Status.Placement.Plan != nil {
 					if !tt.prune {
@@ -243,7 +244,7 @@ func TestSingleNominationsMustPersistBeforeCreation(t *testing.T) {
 					s.Status.Placement.Plan = nil
 				}
 				return cl.SubResource(sub).Update(ctx, s, opts...)
-			}})
+			}}))
 			f.reconcile(t)
 			for _, worker := range f.workers {
 				if err := worker.Get(t.Context(), client.ObjectKeyFromObject(f.source), &v1beta1.InferenceService{}); !apierrors.IsNotFound(err) {

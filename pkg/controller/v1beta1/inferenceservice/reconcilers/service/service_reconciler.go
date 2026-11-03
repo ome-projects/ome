@@ -45,20 +45,17 @@ func NewServiceReconciler(client client.Client,
 	}
 }
 
-// determineServiceType determines the service type based on annotations
-func determineServiceType(meta metav1.ObjectMeta) corev1.ServiceType {
-	serviceType := corev1.ServiceTypeClusterIP
-	if serviceTypeAnnotation, ok := meta.Annotations[constants.ServiceType]; ok {
-		switch serviceTypeAnnotation {
-		case "LoadBalancer":
-			serviceType = corev1.ServiceTypeLoadBalancer
-		case "NodePort":
-			serviceType = corev1.ServiceTypeNodePort
-		case "ClusterIP":
-			serviceType = corev1.ServiceTypeClusterIP
-		}
+// ServiceTypeFromAnnotations reads the Service type the annotations ask for.
+// An absent or unknown value means ClusterIP.
+func ServiceTypeFromAnnotations(annotations map[string]string) corev1.ServiceType {
+	switch annotations[constants.ServiceType] {
+	case "LoadBalancer":
+		return corev1.ServiceTypeLoadBalancer
+	case "NodePort":
+		return corev1.ServiceTypeNodePort
+	default:
+		return corev1.ServiceTypeClusterIP
 	}
-	return serviceType
 }
 
 // buildServiceWithLoadBalancer constructs a Service object with LoadBalancer IP support
@@ -112,7 +109,7 @@ func buildService(componentMeta metav1.ObjectMeta,
 		appProtocols = componentExt.ServicePortAppProtocols
 	}
 	servicePorts := buildServicePorts(podSpec, appProtocols)
-	serviceType := determineServiceType(*serviceMeta)
+	serviceType := ServiceTypeFromAnnotations(serviceMeta.Annotations)
 	if selector == nil {
 		selector = map[string]string{"app": constants.TruncateNameWithMaxLength(serviceMeta.Name, 63)}
 	}

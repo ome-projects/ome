@@ -36,7 +36,7 @@ var admissionHold = authority{
 // stale past its operation: the token lives on the Operation, which
 // every completion clears.
 func reportAdmission(_ context.Context, _ PassInput, row Row) (reading, error) {
-	if !types.OperationAdmissionHeld(row.Status.Operation) {
+	if !types.OperationWaitingOn(row.Status.Operation, types.RejectionReasonAdmissionUnavailable) {
 		return reading{}, nil
 	}
 	return reading{waiting: true, evidence: admissionEvidence(row.Status)}, nil
@@ -72,12 +72,12 @@ func RecordAdmissionRefusal(ctx context.Context, input types.ReconcileInput, pla
 		Message: message,
 		Time:    heldSince(observed, types.RejectionReasonAdmissionUnavailable, input.Now()),
 	}
-	entered, _, err = mark(ctx, input, plan, idx, admissionHold, evidence)
+	entered, _, err = mark(ctx, input, plan, idx, admissionHold, evidence, nil)
 	return entered, err
 }
 
 // ReleaseAdmissionRefusal retires the wait once a write of the row's
 // pods went through admission. Another authority's token is left alone.
 func ReleaseAdmissionRefusal(ctx context.Context, input types.ReconcileInput, idx int32) error {
-	return release(ctx, input, idx, types.RejectionReasonAdmissionUnavailable)
+	return release(ctx, input, idx, types.RejectionReasonAdmissionUnavailable, false)
 }

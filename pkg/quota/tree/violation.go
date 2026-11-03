@@ -47,6 +47,12 @@ func (v Violation) String() string {
 	return fmt.Sprintf("%s: %s", v.Node, v.Message)
 }
 
+// violation builds one Violation attributed to node. An empty subject means the
+// violation concerns the node as a whole; format and args render the Message.
+func violation(node, reason, subject, format string, args ...any) Violation {
+	return Violation{Node: node, Reason: reason, Subject: subject, Message: fmt.Sprintf(format, args...)}
+}
+
 // reasonRank orders reasons by which one an operator must act on first, so a
 // node broken several ways reports the cause rather than a symptom. A node with
 // no position in the tree cannot meaningfully be judged on its budget.

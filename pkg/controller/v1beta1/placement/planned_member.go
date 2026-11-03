@@ -148,7 +148,18 @@ func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.Inf
 		return err
 	}
 	if assignment.CurrentHome == nil {
-		bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate)
+		standing, err := getMemberService(ctx, cl, client.ObjectKeyFromObject(source))
+		if err != nil {
+			return err
+		}
+		var held map[v1beta1.ComponentType]int32
+		switch {
+		case standing == nil:
+			held = map[v1beta1.ComponentType]int32{}
+		case isOurDerived(standing, source):
+			held = memberMinimums(standing)
+		}
+		bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate, held)
 		if err != nil {
 			return err
 		}

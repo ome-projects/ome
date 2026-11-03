@@ -22,18 +22,17 @@ func TestValidatePlacement_ModeAndAffinityShapes_RejectsWhatTheModeForbids(t *te
 		{name: "replacement timeout only for Single", placement: `{"mode":"All","replacementTimeout":"5m"}`, wantError: "replacementTimeout"},
 		{name: "unconstrained all", placement: `{"mode":"All"}`},
 		{name: "equal split", placement: `{"mode":"Split","split":{"replicas":6}}`},
-		{name: "capacity split", placement: `{"mode":"SplitByCapacity","split":{"replicas":6,"maxReplicasPerCluster":4},"maxSurge":1}`},
-		{name: "weighted static", placement: `{"mode":"Split","clusterAffinity":[{"weight":3,"matchFields":[{"key":"metadata.name","operator":"In","values":["member-a"]}]}]}`},
+		{name: "capacity split", placement: `{"mode":"SplitByCapacity","split":{"replicas":6,"maxPerCluster":{"default":4}},"maxSurge":1}`},
+		{name: "weighted static", placement: `{"mode":"Split","clusterAffinity":[{"weights":{"default":3},"matchFields":[{"key":"metadata.name","operator":"In","values":["member-a"]}]}]}`},
 		{name: "missing mode", placement: `{}`, wantError: "explicitly select"},
 		{name: "unsupported mode", placement: `{"mode":"Unexpected"}`, wantError: "explicitly select"},
 		{name: "empty affinity", placement: `{"mode":"Single","clusterAffinity":[]}`, wantError: "clusterAffinity"},
 		{name: "null affinity", placement: `{"mode":"Single","clusterAffinity":null}`, wantError: "clusterAffinity"},
 		{name: "empty term", placement: `{"mode":"Single","clusterAffinity":[{}]}`, wantError: "requirement"},
-		{name: "weight forbidden in capacity mode", placement: `{"mode":"SplitByCapacity","clusterAffinity":[{"weight":1,"matchExpressions":[{"key":"accelerator","operator":"Exists"}]}]}`, wantError: "weight"},
+		{name: "weights forbidden in capacity mode", placement: `{"mode":"SplitByCapacity","clusterAffinity":[{"weights":{"default":1},"matchExpressions":[{"key":"accelerator","operator":"Exists"}]}]}`, wantError: "weights"},
 		{name: "unknown match field", placement: `{"mode":"Single","clusterAffinity":[{"matchFields":[{"key":"metadata.namespace","operator":"In","values":["team-a"]}]}]}`, wantError: "metadata.name"},
 		{name: "split settings for single", placement: `{"mode":"Single","split":{}}`, wantError: "permitted only"},
 		{name: "zero requested floor", placement: `{"mode":"Split","split":{"replicas":0}}`, wantError: "replicas"},
-		{name: "negative per-home ceiling", placement: `{"mode":"Split","split":{"maxReplicasPerCluster":-1}}`, wantError: "maxReplicasPerCluster"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var placement *v1beta1.PlacementSpec
@@ -80,7 +79,7 @@ func TestValidatePlacementIntent_RemovedPolicy_NamesTheReplacement(t *testing.T)
 				t.Fatalf("want %q, got %v", tt.wantError, err)
 			}
 			if tt.plan != nil && !errors.Is(err, ErrAcceptedPlanRequiresClusterAffinity) {
-				t.Fatalf("the plan refusal is not the shared sentinel: %v", err)
+				t.Fatalf("the plan refusal is not the shared error value: %v", err)
 			}
 		})
 	}
@@ -144,7 +143,7 @@ func TestValidatePlacementModeUpdate_ModeChanges_RejectsEveryChangeNamingBothMod
 				if err == nil {
 					t.Fatalf("the mode changes from %s to %s, want a refusal", word(before), word(after))
 				}
-				for _, want := range []string{"spec.placement.mode is fixed for the life of the service", "from " + word(before) + " to " + word(after)} {
+				for _, want := range []string{"spec.placement.mode is fixed for the life of the service", "from " + word(before) + " to " + word(after), ReasonPlacementModeImmutable} {
 					if !strings.Contains(err.Error(), want) {
 						t.Fatalf("want %q in %v", want, err)
 					}

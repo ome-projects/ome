@@ -151,6 +151,10 @@ type PodSpec struct {
 	// Serving is the controller-managed serving gate; a Ready pod serves
 	// unless the scenario says otherwise.
 	Serving *bool `json:"serving,omitempty"`
+	// ListedAfter is how long after the pod turns Ready the endpoints
+	// controller lists it in its revision's routed Service; empty lists
+	// it with the pod.
+	ListedAfter string `json:"listedAfter,omitempty"`
 }
 
 // Tick is one pass: the events applied first, then exactly one pass of the
@@ -200,8 +204,14 @@ type EventArgs struct {
 	Value string `json:"value,omitempty"`
 	// Duration is the clock move of clock.advance.
 	Duration string `json:"duration,omitempty"`
+	// ListedAfter is how long after the pods member.readyOnTarget readies
+	// the endpoints controller lists them; empty lists them with the pods.
+	ListedAfter string `json:"listedAfter,omitempty"`
 	// Slack pushes the clock past a deadline rather than exactly onto it.
 	Slack string `json:"slack,omitempty"`
+	// Outcome is a member's staged answer to the metric gate: pass, fail
+	// or inconclusive.
+	Outcome string `json:"outcome,omitempty"`
 	// Name names a RolloutPolicy.
 	Name string `json:"name,omitempty"`
 	// Steps is the traffic ladder of a policy or inline canary body edit.
@@ -214,6 +224,8 @@ type EventArgs struct {
 	// ir.stale: the observed generation alone (the default), or the whole
 	// status, which the last publish then stands for.
 	Lag string `json:"lag,omitempty"`
+	// Attempts is the failed attempts a member's Held retry record counts.
+	Attempts int32 `json:"attempts,omitempty"`
 	// Verb and Resource scope an armed apiserver refusal.
 	Verb     string `json:"verb,omitempty"`
 	Resource string `json:"resource,omitempty"`
@@ -349,11 +361,8 @@ func (s *Scenario) validate(vocab Vocabulary) error {
 }
 
 func knownComponent(name string) bool {
-	switch v1beta1.ComponentType(name) {
-	case v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent:
-		return true
-	}
-	return false
+	_, ok := v1beta1.RoleOf(v1beta1.ComponentType(name))
+	return ok
 }
 
 func validateEvent(scenario string, tick int, ev TimelineEvent, vocab Vocabulary) error {

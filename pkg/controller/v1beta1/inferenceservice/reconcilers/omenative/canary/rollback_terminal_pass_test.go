@@ -9,7 +9,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -60,7 +59,7 @@ func newRetargetRollbackSim(t *testing.T, name string) *passSim {
 	replica.Status.ObservedGeneration = 1
 	replica.Status.CurrentRevision = name + "-engine-" + simRetargetStable
 	replica.Spec.Pacing = &v1beta1.InferenceReplicaPacing{Partition: &partition}
-	objs := []runtime.Object{isvc, replica,
+	objs := []client.Object{isvc, replica,
 		canaryPod(ns, name, "engine", simRetargetStable, name+"-engine-0"),
 		canaryPod(ns, name, "engine", simRetargetStable, name+"-engine-1"),
 		canaryPod(ns, name, "engine", simRetargetCanary, name+"-engine-2"),

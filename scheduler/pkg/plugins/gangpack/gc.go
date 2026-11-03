@@ -11,16 +11,12 @@ import (
 	"k8s.io/kube-scheduler/framework"
 )
 
-// gangPodLister yields the set of gang keys (namespace/podgroup) that still have
-// at least one live pod. An interface so the GC is unit-testable without an
-// informer.
+// gangPodLister reads the live gang pods: the set of gang keys
+// (namespace/podgroup) that still have at least one live pod, and the live
+// members of one gang. An interface so the GC and the member planning are
+// unit-testable without an informer.
 type gangPodLister interface {
 	liveGangKeys() (map[string]bool, error)
-}
-
-// gangMemberLister adds exact member enumeration for heterogeneous feasibility.
-// Kept separate from gangPodLister so the GC remains independently testable.
-type gangMemberLister interface {
 	gangPods(namespace, name string) ([]*v1.Pod, error)
 }
 
@@ -63,8 +59,8 @@ func (g *GangPack) gcAssignments() {
 		if !stale && owner != "" && g.pgReader != nil {
 			namespace, name, ok := splitGangKey(group)
 			if ok {
-				_, _, _, currentOwner, found := g.pgReader.get(namespace, name)
-				stale = !found || currentOwner != owner
+				facts, found := g.pgReader.get(namespace, name)
+				stale = !found || facts.uid != owner
 			}
 		}
 		if !stale {

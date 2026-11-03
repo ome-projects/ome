@@ -120,11 +120,13 @@ func HasCommittedCreate(input workload.ReconcileInput, plan workload.ComponentPl
 // it apart from one to finish by weighing pod evidence, which is not a
 // question a hold should be answering.
 //
-// A row that was serving before — a promoted Instance rebuilding a
-// member it lost — is never retired, whatever revision its attempt
-// names, so a pause finishes it: the pass adds the missing pods under
-// the same operation, and holding it instead would leave the Instance
-// short of its set for the length of the hold.
+// A row that was serving before and refills its set at the revision it
+// served is never retired, so a pause finishes it: the pass adds the
+// missing pods under the same operation, and holding it instead would
+// leave the Instance short of its set for the length of the hold. One
+// rebuilding at a roll target is in the first position: its attempt
+// renders a revision other than the one it served, and a pause leaves it
+// alone until the unpause retires it.
 func createFinishableAt(s *workload.InstanceStatus, target *appsv1.ControllerRevision) bool {
 	if workload.StateOf(s) != workload.StateCreateCreatePods {
 		return false
@@ -239,6 +241,12 @@ type createPassAction struct {
 // atomic: all of its missing Pods are selected together or the Instance is
 // deferred. The first eligible Instance may exceed a positive budget and
 // proceeds alone. Ready promotions do not consume the budget.
+//
+// The pass reads what every decision shares once (newCreatePass), decides a
+// start, a finish, a retirement or nothing for each planned Instance in plan
+// order (createPass.decide), writes the retirements and asks for the next
+// pass when there are any, else commits the starts and finishes group by
+// group, and ends with one requeue for everything it still waits on.
 func createFilteredBatched(
 	ctx context.Context,
 	deps workload.Deps,
@@ -248,316 +256,535 @@ func createFilteredBatched(
 	keep func(idx int32) bool,
 	byInstance map[int32][]*corev1.Pod,
 ) (ctrl.Result, error) {
-	// A pod in phase Unknown still occupies its stable name, so the
-	// missing-pod diff below reads that target as present and nothing else
-	// in the pass would free it. Route it the same way the rebuild paths
-	// do — node-death evidence decides when the name is freed, and the
-	// attempt reports the wait meanwhile — before any Instance is selected,
-	// and over every planned Instance, not only the ones keep admits: the
-	// scope says which Instances this pass may build for, and a lost node
-	// under any other Instance is freed on the same policy clock whatever
-	// the pass is otherwise doing. A held Instance is dropped from the
-	// selection below, which would otherwise leave the pass looking
-	// converged: not-converged keeps the ordinary poll, and nodeDeathAt
-	// carries the exact policy boundary, because the node this waits on
-	// raises no event to requeue on.
-	held, nodeDeathAt, err := recoverUnknownPhaseInstances(ctx, deps, input, plan, byInstance)
+	pass, err := newCreatePass(ctx, deps, input, plan, target, keep, byInstance)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	for _, planned := range plan.Instances {
+		if err := pass.decide(ctx, planned); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if len(pass.retirements) > 0 {
+		return pass.retireOlderCreates(ctx)
+	}
+	if ownerPresent, err := pass.commitActions(ctx); err != nil || !ownerPresent {
+		return ctrl.Result{}, err
+	}
+	return pass.requeue(), pass.revisionErr
+}
+
+// createPass is one run of the Create pass over the Instances the caller
+// admits: what the pass read once, the start, finish or retirement it
+// decided for each Instance, and the waits it collected for its one requeue.
+type createPass struct {
+	deps       workload.Deps
+	input      workload.ReconcileInput
+	plan       workload.ComponentPlan
+	target     *appsv1.ControllerRevision
+	keep       func(idx int32) bool
+	byInstance map[int32][]*corev1.Pod
+	// heldByRoll is the set of Instances the roll's partition holds; a held
+	// Instance that records a revision is rebuilt on it, not on the target.
+	heldByRoll map[int32]bool
+	// nodeDeathAt is the moment the force-delete policy frees a pod name a
+	// node that stopped reporting still holds; zero when no name waits on it.
+	nodeDeathAt time.Time
+
+	actions     []createPassAction
+	retirements []retiredCreateAttempt
+	selection   scaleUpSelection
+	// allReady stays true while every admitted Instance is settled; the pass
+	// then needs no cadence and waits on watches and on the explicit waits.
+	allReady bool
+	// retryBlockWait is the earliest explicit wait a retry record named.
+	retryBlockWait time.Duration
+	revisionErr    error
+}
+
+// newCreatePass reads what every Instance's decision shares. The lost-node
+// reading runs first and over every planned Instance, not only the admitted
+// ones: a pod in phase Unknown still holds its name, so the missing-pod diff
+// would read that name as taken and nothing else in the pass would free it;
+// the force-delete policy decides when the name is freed, and the row
+// reports the wait meanwhile. An Instance such a node holds is dropped from
+// this pass's selection, which keeps the pass from reading as converged, and
+// nodeDeathAt carries the policy boundary the requeue waits on, because the
+// node raises no event.
+func newCreatePass(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, target *appsv1.ControllerRevision, keep func(idx int32) bool, byInstance map[int32][]*corev1.Pod) (*createPass, error) {
+	held, nodeDeathAt, err := recoverUnknownPhaseInstances(ctx, deps, input, plan, byInstance)
+	if err != nil {
+		return nil, err
 	}
 	if len(held) > 0 {
 		admitted := keep
 		keep = func(idx int32) bool { return admitted(idx) && !held[idx] }
 	}
+	return &createPass{
+		deps:        deps,
+		input:       input,
+		plan:        plan,
+		target:      target,
+		keep:        keep,
+		byInstance:  byInstance,
+		heldByRoll:  RollHeldIndices(input, plan, target),
+		nodeDeathAt: nodeDeathAt,
+		actions:     make([]createPassAction, 0, len(plan.Instances)),
+		retirements: make([]retiredCreateAttempt, 0),
+		selection:   scaleUpSelection{limit: input.ScaleUpPodBatchSize},
+		allReady:    len(held) == 0,
+	}, nil
+}
 
-	allReady := len(held) == 0
-	var revisionErr error
-	var retryBlockWait time.Duration
-	actions := make([]createPassAction, 0, len(plan.Instances))
-	retirements := make([]retiredCreateAttempt, 0)
-	selectedPods := int32(0)
-	// Keep each wave as a stable Instance-order prefix. Once an eligible gang
-	// does not fit, it leads the next wave instead of being bypassed by smaller
-	// later Instances.
-	selectionClosed := false
-	heldByRoll := RollHeldIndices(input, plan, target)
+// scaleUpSelection is the pod budget of one pass (lifecycle
+// scaleUpPodBatchSize). Each wave is a stable prefix of the plan order: once
+// an Instance does not fit, it leads the next wave instead of being bypassed
+// by smaller later Instances.
+type scaleUpSelection struct {
+	limit        *int32
+	selectedPods int32
+	closed       bool
+}
 
-	for _, planned := range plan.Instances {
-		if !keep(planned.Index) {
-			continue
-		}
-		// A row the apiserver refused is left as the rejection left it
-		// until the revision in force admits a fresh attempt.
-		if parked, wait := rejectionParked(input, input.ObservedState.Instance(planned.Index)); parked {
-			if wait > 0 && (retryBlockWait == 0 || wait < retryBlockWait) {
-				retryBlockWait = wait
-			}
-			continue
-		}
-		// A row keeping an attempt the gang verdict ended is not this
-		// pass's to build or promote: the roll replaces it at a corrective
-		// revision and the reset mailbox clears it.
-		if workload.EndedByOwnershipVerdict(input.ObservedState.Instance(planned.Index)) {
-			continue
-		}
-		existing := byInstance[planned.Index]
-		observed := input.ObservedState.Instance(planned.Index)
-		// A parked attempt whose set stands is the roll's: nothing of it is
-		// refilled or promoted here. The pass keeps its cadence while a
-		// pod of the set is still coming up, as for any index it is not
-		// done with.
-		if observed != nil && workload.OperationParked(observed.Operation) && !createFreshStart(observed, existing) {
-			if !query.AllPodsRuntimeReady(existing) {
-				allReady = false
-			}
-			continue
-		}
-		// Both rows of a migration pair are the migration record's while
-		// their pins stand: the drive moves them, and only the record's
-		// completion or expiry ends a pin. The pass neither refills nor
-		// promotes either row, whatever its pods report, and keeps its
-		// cadence so the record's deadline is met when no drive paces the
-		// pair.
-		if workload.Owner(observed) == workload.OwnerMigrate {
-			allReady = false
-			continue
-		}
-		// The attempt renders one revision and is short of that revision's
-		// pod set: a gang refilled beside live pods keeps the width it runs,
-		// and one rebuilt at the target takes the target's.
-		rev := createRevision(input, planned.Index, existing, target, heldByRoll[planned.Index])
-		inst := planned
-		inst.Runners = plan.RunnersFor(planned, rev)
-		desired := expectedPodNamesForInstance(input, plan, inst)
-		missing := missingPodTargets(desired, existing)
-		// An attempt that is fully materialized and runtime-ready is one
-		// promote away from serving: its pods are already routed, so retiring
-		// it now drops live traffic and throws away a warmed accelerator. Let
-		// it promote; the update machinery then rolls the Instance to the new
-		// target through a surge, without a gap.
-		onePromoteAway := len(missing) == 0 && len(existing) > 0 && query.AllPodsRuntimeReady(existing)
-		if retired, ok := retireSupersededCreateMutation(input, inst.Index, existing, target, plan.InstanceReadyTimeout); ok && !onePromoteAway {
-			// Replacing an attempt starts a fresh one, so the new target's
-			// RetryBlock gates it as it gates a first attempt. Retire only
-			// once the replacement would be allowed to build: otherwise the
-			// old attempt is torn down and nothing takes its place.
-			if wait, denied := retargetDeniedByRetryBlock(input, inst.Index, target); denied {
-				if wait > 0 && (retryBlockWait == 0 || wait < retryBlockWait) {
-					retryBlockWait = wait
-				}
-				allReady = false
-				continue
-			}
-			retirements = append(retirements, retired)
-			allReady = false
-			continue
-		}
-		// A replacement attempt owns whatever the attempt it retired left
-		// behind: those pods hold the names it needs and carry a revision
-		// it is not converging to.
-		if stale := retiredAttemptPods(input, inst.Index, existing, target); len(stale) > 0 {
-			if _, err := deleteSupersededRevisionPods(ctx, deps, input, inst.Index, stale, target.Name); err != nil {
-				return ctrl.Result{}, err
-			}
-			allReady = false
-			continue
-		}
-		if len(missing) > 0 {
-			allowed, treatedReady, retryAfter := allowCreateForMissingInstance(input, plan, inst, existing, rev)
-			if retryAfter > 0 && (retryBlockWait == 0 || retryAfter < retryBlockWait) {
-				retryBlockWait = retryAfter
-			}
-			if !allowed {
-				if !treatedReady {
-					allReady = false
-				}
-				continue
-			}
-
-			podCost := int32(len(missing))
-			if selectionClosed || !scaleUpPodBatchAdmits(input.ScaleUpPodBatchSize, selectedPods, podCost) {
-				selectionClosed = true
-				allReady = false
-				continue
-			}
-			now := metav1.NewTime(input.Now())
-			mutation := status.CreatingMutation(inst.Index, inst.Incarnation, plan.InstanceReadyTimeout, rev, now)
-			probe := workload.InstanceStatus{Index: inst.Index}
-			if observed != nil {
-				probe = *observed
-			}
-			action := &createStartAction{
-				instance:      inst,
-				missing:       missing,
-				terminal:      terminalTargetPods(existing, missing),
-				revision:      rev,
-				firstCreate:   observed == nil,
-				statusChanges: mutation.Mutate(&probe),
-				transition:    statusTransition{index: inst.Index},
-			}
-			mutation.OnCommit = action.transition.capture
-			action.statusMutation = mutation
-			actions = append(actions, createPassAction{start: action})
-			selectedPods += podCost
-			if input.ScaleUpPodBatchSize != nil && selectedPods >= *input.ScaleUpPodBatchSize {
-				selectionClosed = true
-			}
-			allReady = false
-			continue
-		}
-
-		// The index holds every pod it expects. A Failed row is adopted
-		// only through failedRowAdoptable, judged on the pods at its active
-		// ordinals; any other Failed row is the roll's or the ladder's.
-		podSet := existing
-		if workload.StateOf(observed) == workload.StateFailed {
-			podSet = podsAtTargets(existing, desired)
-			if !failedRowAdoptable(input, observed, podSet, target) {
-				if !query.AllPodsRuntimeReady(existing) {
-					allReady = false
-				}
-				continue
-			}
-		}
-		// ContainersReady permits writing the serving gate; the Ready stamp
-		// itself waits for the shared promote bar, which the gate write is a
-		// precondition of (kubelet folds it into PodReady).
-		if !query.AllPodsRuntimeReady(podSet) {
-			allReady = false
-			continue
-		}
-
-		wasReady := observed != nil && observed.Phase == workload.InstancePhaseReady
-		promotable, wait := query.PodSetPromotable(podSet, plan.MinReadySeconds, input.Now())
-		action := &createReadyAction{
-			instance: inst,
-			existing: podSet,
-			promote:  promotable,
-			wasReady: wasReady,
-		}
-		if !promotable {
-			// A set waiting out its availability window needs no poll: it
-			// becomes promotable at a computable instant. One still waiting
-			// for kubelet to fold the gate into PodReady has no such instant.
-			input.PromoteWindow.Observe(wait)
-			if wait == 0 {
-				allReady = false
-			}
-			actions = append(actions, createPassAction{ready: action})
-			continue
-		}
-		readyRevision := podSetRevision(podsAtTargets(podSet, desired), observed, target)
-		if readyRevision == "" {
-			action.promote = false
-			actions = append(actions, createPassAction{ready: action})
-			// Preserve a settled legacy row so the update pass can replace its
-			// pods under normal rollout budgets. An unfinished attempt cannot
-			// discard its operation without knowing what its pods run.
-			if observed == nil || observed.Phase != workload.InstancePhaseReady || observed.Operation != nil {
-				allReady = false
-				revisionErr = errors.Join(revisionErr, fmt.Errorf("instance %d cannot become Ready from its pod labels: %w", inst.Index, query.ErrRevisionUnknown))
-			}
-			continue
-		}
-		mutation := status.ReadyOnRevisionMutation(inst.Index, readyRevision, input.Now())
-		onTarget := target != nil && readyRevision == target.Name
-		probe := workload.InstanceStatus{Index: inst.Index}
-		if observed != nil {
-			probe = *observed
-		}
-		action.statusChanges = mutation.Mutate(&probe)
-		// The prune is the promote's other half: a row that converges on
-		// the target here leaves no active block. A row that already ran
-		// the target converges on nothing: its pod set was rebuilt for a
-		// failure the revision's block counts, and the block keeps
-		// counting until the rows outlive the failure.
-		if onTarget && action.statusChanges && (observed == nil || observed.RunningRevision != target.Name) {
-			action.pruneRevision = target.Name
-		}
-		action.transition.index = inst.Index
-		mutation.OnCommit = action.transition.capture
-		action.statusMutation = mutation
-		actions = append(actions, createPassAction{ready: action})
+// admit takes podCost from the budget and reports whether the Instance is
+// selected; a refusal closes the selection for the rest of the pass.
+func (s *scaleUpSelection) admit(podCost int32) bool {
+	if s.closed || !scaleUpPodBatchAdmits(s.limit, s.selectedPods, podCost) {
+		s.closed = true
+		return false
 	}
-	if len(retirements) > 0 {
-		mutations := make([]workload.InstanceMutation, 0, len(retirements))
-		for _, retired := range retirements {
-			mutations = append(mutations, retired.mutation)
-		}
-		ownerPresent, err := applyInstanceMutationsWithOutcome(ctx, input, mutations)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("batch retire superseded Create attempts: %w", err)
-		}
-		if !ownerPresent {
-			return ctrl.Result{}, nil
-		}
-		for _, retired := range retirements {
-			workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonCreateAttemptSuperseded,
-				"OMENative %s retired the Create attempt pinned to %s and restarted it at %s",
-				workload.InstanceKey(plan.Component, retired.index), retired.from, target.Name)
-		}
-		return workload.RequeueNow(), nil
+	s.selectedPods += podCost
+	if s.limit != nil && s.selectedPods >= *s.limit {
+		s.closed = true
 	}
+	return true
+}
 
-	readyStatusBatchingAvailable := input.ApplyInstanceMutations != nil || input.ApplyInstanceMutationsWithRetryBlock != nil
-	for i := 0; i < len(actions); {
-		j := i + 1
-		if actions[i].start != nil {
-			lead := actions[i].start
-			// A revision-targeted start also transitions its RetryBlock. Group
-			// it only with starts at the same revision, and only when the
-			// adapter can commit both changes atomically.
-			startStatusBatchingAvailable := input.ApplyInstanceMutationsWithRetryBlock != nil ||
-				(lead.revision == "" && input.ApplyInstanceMutations != nil)
-			starts := []*createStartAction{lead}
-			for startStatusBatchingAvailable && j < len(actions) && actions[j].start != nil &&
-				actions[j].start.statusChanges == lead.statusChanges && actions[j].start.revision == lead.revision {
-				starts = append(starts, actions[j].start)
-				j++
-			}
-			ownerPresent, err := processStartActions(ctx, deps, input, plan, target, starts)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if !ownerPresent {
-				return ctrl.Result{}, nil
-			}
+// waitNoLaterThan keeps the earliest positive explicit wait for the requeue.
+func (p *createPass) waitNoLaterThan(wait time.Duration) {
+	if wait > 0 && (p.retryBlockWait == 0 || wait < p.retryBlockWait) {
+		p.retryBlockWait = wait
+	}
+}
+
+// createCandidate is one planned Instance as the pass reads it: the row it
+// observed, the pods carrying the Instance's name and, once readPodSet has
+// run, the revision the attempt renders, the pod set that revision asks for,
+// the names no live pod holds and the pods a promote is decided on.
+type createCandidate struct {
+	pass     *createPass
+	planned  workload.InstancePlan
+	index    int32
+	observed *workload.InstanceStatus
+	existing []*corev1.Pod
+
+	revision string
+	// inst is the plan entry with the runners of the attempt's revision.
+	inst    workload.InstancePlan
+	desired []podTarget
+	missing []podTarget
+	podSet  []*corev1.Pod
+	finish  *createReadyAction
+}
+
+// decide walks one planned Instance through the pass's questions in order
+// and records the answer on the pass: left alone, retired, a start or a
+// finish. The first step that settles the Instance is the last one run; an
+// error ends the whole pass.
+func (p *createPass) decide(ctx context.Context, planned workload.InstancePlan) error {
+	c := &createCandidate{
+		pass:     p,
+		planned:  planned,
+		index:    planned.Index,
+		observed: p.input.ObservedState.Instance(planned.Index),
+		existing: p.byInstance[planned.Index],
+	}
+	steps := []func(context.Context) (bool, error){
+		c.requireAdmitted,
+		c.leaveRejectedRow,
+		c.leaveRowEndedByOwnershipConflict,
+		c.leaveStoppedAttemptsSet,
+		c.leaveMigrationPair,
+		c.readPodSet,
+		c.retireOnOlderRevision,
+		c.removeLeftoverPods,
+		c.planStart,
+		c.adoptFailedRow,
+		c.requireRuntimeReady,
+		c.waitForPromoteBar,
+		c.planPromote,
+	}
+	for _, step := range steps {
+		if next, err := step(ctx); !next || err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// requireAdmitted leaves an Instance outside the pass's scope untouched: not
+// listed, not promoted, not duplicated.
+func (c *createCandidate) requireAdmitted(context.Context) (bool, error) {
+	return c.pass.keep(c.index), nil
+}
+
+// leaveRejectedRow leaves a row the apiserver refused as the rejection left
+// it until the revision in force admits a fresh attempt; the retry record's
+// next due time joins the requeue.
+func (c *createCandidate) leaveRejectedRow(context.Context) (bool, error) {
+	refused, wait := rejectionParked(c.pass.input, c.observed)
+	if refused {
+		c.pass.waitNoLaterThan(wait)
+	}
+	return !refused, nil
+}
+
+// leaveRowEndedByOwnershipConflict leaves a row keeping an attempt the
+// PodGroup ownership reading ended: the roll replaces it at a corrective
+// revision and the operator's reset clears it.
+func (c *createCandidate) leaveRowEndedByOwnershipConflict(context.Context) (bool, error) {
+	return !workload.EndedByOwnershipVerdict(c.observed), nil
+}
+
+// leaveStoppedAttemptsSet leaves the pods of an attempt the escalation
+// stopped while they still ran to the roll: nothing of the set is refilled
+// or promoted here. The pass keeps its cadence while a pod of the set is
+// still coming up, as for any Instance it is not done with. A stopped
+// attempt whose set is gone is a fresh start and goes on.
+func (c *createCandidate) leaveStoppedAttemptsSet(context.Context) (bool, error) {
+	if c.observed == nil || !workload.OperationParked(c.observed.Operation) || createFreshStart(c.observed, c.existing) {
+		return true, nil
+	}
+	if !query.AllPodsRuntimeReady(c.existing) {
+		c.pass.allReady = false
+	}
+	return false, nil
+}
+
+// leaveMigrationPair leaves both rows of a move to the move's record while
+// their claims stand: the drive moves them, and only the record's completion
+// or expiry ends a claim. The pass neither refills nor promotes either row,
+// whatever its pods report, and keeps its cadence so the record's deadline
+// is met when no drive paces the pair.
+func (c *createCandidate) leaveMigrationPair(context.Context) (bool, error) {
+	if workload.Owner(c.observed) != workload.OwnerMigrate {
+		return true, nil
+	}
+	c.pass.allReady = false
+	return false, nil
+}
+
+// readPodSet names the revision the attempt renders and the pod set it is
+// short of: a gang refilled beside live pods keeps the width it runs, and one
+// rebuilt at the target takes the target's.
+func (c *createCandidate) readPodSet(context.Context) (bool, error) {
+	p := c.pass
+	c.revision = createRevision(p.input, c.index, c.existing, p.target, p.heldByRoll[c.index])
+	c.inst = c.planned
+	c.inst.Runners = p.plan.RunnersFor(c.planned, c.revision)
+	c.desired = expectedPodNamesForInstance(p.input, p.plan, c.inst)
+	c.missing = missingPodTargets(c.desired, c.existing)
+	return true, nil
+}
+
+// onePromoteAway reports a fully materialized, runtime-ready attempt: its
+// pods are already routed, so retiring it would drop live traffic and throw
+// away a warmed accelerator. It is let through to promote; the update pass
+// then rolls the Instance to the new target without a gap.
+func (c *createCandidate) onePromoteAway() bool {
+	return len(c.missing) == 0 && len(c.existing) > 0 && query.AllPodsRuntimeReady(c.existing)
+}
+
+// retireOnOlderRevision replaces an attempt committed to a revision other
+// than the target with a fresh attempt at the target, once the target's
+// retry record would admit the replacement: otherwise the old attempt would
+// be torn down and nothing would take its place, so the record's due time
+// joins the requeue instead.
+func (c *createCandidate) retireOnOlderRevision(context.Context) (bool, error) {
+	p := c.pass
+	retired, ok := retireSupersededCreateMutation(p.input, c.index, c.existing, p.target, p.plan.InstanceReadyTimeout)
+	if !ok || c.onePromoteAway() {
+		return true, nil
+	}
+	p.allReady = false
+	if wait, denied := retargetDeniedByRetryBlock(p.input, c.index, p.target); denied {
+		p.waitNoLaterThan(wait)
+		return false, nil
+	}
+	p.retirements = append(p.retirements, retired)
+	return false, nil
+}
+
+// removeLeftoverPods deletes what the attempt this one replaced left behind:
+// pods that hold the names the attempt needs and carry a revision it does
+// not converge to.
+func (c *createCandidate) removeLeftoverPods(ctx context.Context) (bool, error) {
+	p := c.pass
+	stale := retiredAttemptPods(p.input, c.index, c.existing, p.target)
+	if len(stale) == 0 {
+		return true, nil
+	}
+	if _, err := deleteSupersededRevisionPods(ctx, p.deps, p.input, c.index, stale, p.target.Name); err != nil {
+		return false, err
+	}
+	p.allReady = false
+	return false, nil
+}
+
+// planStart decides the start of an Instance short of its pod set: the retry
+// record and the restart policy must allow the create and the pass's pod
+// budget must have room. A denied fresh start is settled (it holds no pods
+// and runs no deadline) and waits on the record's own due time; a denied
+// rebuild, a deferred Instance and a selected one keep the cadence. An
+// Instance holding every pod it expects goes on to its finish.
+func (c *createCandidate) planStart(context.Context) (bool, error) {
+	if len(c.missing) == 0 {
+		return true, nil
+	}
+	p := c.pass
+	allowed, treatedReady, retryAfter := allowCreateForMissingInstance(p.input, p.plan, c.inst, c.existing, c.revision)
+	p.waitNoLaterThan(retryAfter)
+	if !allowed {
+		if !treatedReady {
+			p.allReady = false
+		}
+		return false, nil
+	}
+	p.allReady = false
+	if p.selection.admit(int32(len(c.missing))) {
+		p.actions = append(p.actions, createPassAction{start: c.startAction()})
+	}
+	return false, nil
+}
+
+// startAction is the Creating write of a selected start and what the create
+// needs once it lands: the names to create, the pods in a terminal phase
+// still holding them, and the revision every pod renders.
+func (c *createCandidate) startAction() *createStartAction {
+	p := c.pass
+	now := metav1.NewTime(p.input.Now())
+	mutation := status.CreatingMutation(c.index, c.inst.Incarnation, p.plan.InstanceReadyTimeout, c.revision, now)
+	action := &createStartAction{
+		instance:      c.inst,
+		missing:       c.missing,
+		terminal:      terminalTargetPods(c.existing, c.missing),
+		revision:      c.revision,
+		firstCreate:   c.observed == nil,
+		statusChanges: mutation.Mutate(c.rowCopy()),
+		transition:    statusTransition{index: c.index},
+	}
+	mutation.OnCommit = action.transition.capture
+	action.statusMutation = mutation
+	return action
+}
+
+// rowCopy is a copy of the observed row, or an empty row at the index, for a
+// mutation to try so the pass learns whether the write changes anything.
+func (c *createCandidate) rowCopy() *workload.InstanceStatus {
+	row := workload.InstanceStatus{Index: c.index}
+	if c.observed != nil {
+		row = *c.observed
+	}
+	return &row
+}
+
+// adoptFailedRow reads a Failed row that holds every pod it expects on the
+// pods at its active ordinals: it is promoted only through
+// failedRowAdoptable; any other Failed row is the roll's or the retry
+// record's.
+func (c *createCandidate) adoptFailedRow(context.Context) (bool, error) {
+	c.podSet = c.existing
+	if workload.StateOf(c.observed) != workload.StateFailed {
+		return true, nil
+	}
+	c.podSet = podsAtTargets(c.existing, c.desired)
+	if failedRowAdoptable(c.pass.input, c.observed, c.podSet, c.pass.target) {
+		return true, nil
+	}
+	if !query.AllPodsRuntimeReady(c.existing) {
+		c.pass.allReady = false
+	}
+	return false, nil
+}
+
+// requireRuntimeReady waits for ContainersReady on every pod of the set,
+// which permits the serving gate write; the Ready write itself waits for the
+// shared promote bar, which the gate write is a precondition of (kubelet
+// folds the gate into PodReady).
+func (c *createCandidate) requireRuntimeReady(context.Context) (bool, error) {
+	if query.AllPodsRuntimeReady(c.podSet) {
+		return true, nil
+	}
+	c.pass.allReady = false
+	return false, nil
+}
+
+// waitForPromoteBar builds the finish and holds it below the promote bar: the
+// action then writes the serving gate alone, because a fresh pod carries the
+// lifecycle hold and cannot reach PodReady until it is released. A set
+// waiting out its availability window becomes promotable at a computable
+// instant and needs no poll; one still waiting for kubelet to fold the gate
+// into PodReady has no such instant and keeps the cadence.
+func (c *createCandidate) waitForPromoteBar(context.Context) (bool, error) {
+	p := c.pass
+	promotable, wait := query.PodSetPromotable(c.podSet, p.plan.MinReadySeconds, p.input.Now())
+	c.finish = &createReadyAction{
+		instance: c.inst,
+		existing: c.podSet,
+		promote:  promotable,
+		wasReady: c.observed != nil && c.observed.Phase == workload.InstancePhaseReady,
+	}
+	if promotable {
+		return true, nil
+	}
+	p.input.PromoteWindow.Observe(wait)
+	if wait == 0 {
+		p.allReady = false
+	}
+	p.actions = append(p.actions, createPassAction{ready: c.finish})
+	return false, nil
+}
+
+// planPromote is the Ready write of a set past the promote bar, on the one
+// known revision every active pod carries; the target's retry record is
+// released with it when the row converges on the target for the first time
+// (a row that already ran the target was rebuilt for a failure the record
+// counts, and the record keeps counting until the rows outlive the failure).
+// With no revision the pod labels identify, the finish keeps the gate write
+// alone: a settled row is left for the update pass to replace under the
+// rollout budgets, and an unfinished attempt is reported, since it cannot
+// drop its operation without knowing what its pods run.
+func (c *createCandidate) planPromote(context.Context) (bool, error) {
+	p := c.pass
+	action := c.finish
+	readyRevision := podSetRevision(podsAtTargets(c.podSet, c.desired), c.observed, p.target)
+	if readyRevision == "" {
+		action.promote = false
+		p.actions = append(p.actions, createPassAction{ready: action})
+		if c.observed == nil || c.observed.Phase != workload.InstancePhaseReady || c.observed.Operation != nil {
+			p.allReady = false
+			p.revisionErr = errors.Join(p.revisionErr, fmt.Errorf("instance %d cannot become Ready from its pod labels: %w", c.index, query.ErrRevisionUnknown))
+		}
+		return false, nil
+	}
+	mutation := status.ReadyOnRevisionMutation(c.index, readyRevision, p.input.Now())
+	action.statusChanges = mutation.Mutate(c.rowCopy())
+	onTarget := p.target != nil && readyRevision == p.target.Name
+	if onTarget && action.statusChanges && (c.observed == nil || c.observed.RunningRevision != p.target.Name) {
+		action.pruneRevision = p.target.Name
+	}
+	action.transition.index = c.index
+	mutation.OnCommit = action.transition.capture
+	action.statusMutation = mutation
+	p.actions = append(p.actions, createPassAction{ready: action})
+	return false, nil
+}
+
+// retireOlderCreates writes every retirement in one status update, names
+// both revisions in an event per Instance and asks for the next pass at
+// once; the starts and finishes decided this pass wait for it.
+func (p *createPass) retireOlderCreates(ctx context.Context) (ctrl.Result, error) {
+	mutations := make([]workload.InstanceMutation, 0, len(p.retirements))
+	for _, retired := range p.retirements {
+		mutations = append(mutations, retired.mutation)
+	}
+	ownerPresent, err := applyInstanceMutationsWithOutcome(ctx, p.input, mutations)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("batch retire superseded Create attempts: %w", err)
+	}
+	if !ownerPresent {
+		return ctrl.Result{}, nil
+	}
+	for _, retired := range p.retirements {
+		workload.RecordNormal(p.deps.Recorder, workload.EventTarget(p.input), workload.EventReasonCreateAttemptSuperseded,
+			"OMENative %s retired the Create attempt pinned to %s and restarted it at %s",
+			workload.InstanceKey(p.plan.Component, retired.index), retired.from, p.target.Name)
+	}
+	return workload.RequeueNow(), nil
+}
+
+// commitActions writes the starts and finishes in plan order, each adjacent
+// group in one status update, and reports false when the owner is gone.
+func (p *createPass) commitActions(ctx context.Context) (bool, error) {
+	for i := 0; i < len(p.actions); {
+		var (
+			ownerPresent bool
+			err          error
+			n            int
+		)
+		if p.actions[i].start != nil {
+			starts := p.adjacentStarts(i)
+			ownerPresent, err = processStartActions(ctx, p.deps, p.input, p.plan, p.target, starts)
+			n = len(starts)
 		} else {
-			ready := []*createReadyAction{actions[i].ready}
-			for readyStatusBatchingAvailable && j < len(actions) && actions[j].ready != nil &&
-				actions[j].ready.statusChanges == actions[i].ready.statusChanges {
-				ready = append(ready, actions[j].ready)
-				j++
-			}
-			ownerPresent, err := processReadyActions(ctx, deps, input, ready)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if !ownerPresent {
-				return ctrl.Result{}, nil
-			}
+			finishes := p.adjacentFinishes(i)
+			ownerPresent, err = processReadyActions(ctx, p.deps, p.input, finishes)
+			n = len(finishes)
 		}
-		i = j
+		if err != nil || !ownerPresent {
+			return ownerPresent, err
+		}
+		i += n
 	}
+	return true, nil
+}
 
-	// One wake-up for the pass: the earliest of the cadence (only while
-	// Instances are still coming up) and every explicit wait collected
-	// above. PassRequeue owns the precedence — an explicit wait always
-	// beats the bare rate-limited backoff. A pass with everything Ready
-	// and nothing due asks for no wake-up at all and waits on watches.
-	var res ctrl.Result
-	promoteWait := input.PromoteWindow.Pending()
-	nodeDeathWait := until(input.Now(), nodeDeathAt)
-	if !allReady || retryBlockWait > 0 || promoteWait > 0 || nodeDeathWait > 0 {
-		cadence := time.Duration(0)
-		if !allReady {
-			cadence = CreateRequeueInterval(input)
+// adjacentStarts is the run of starts from i that commit in one status
+// update with the lead: the same answer on whether the write changes the
+// row, and the same revision, because a revision-targeted start also moves
+// that revision's retry record and only the batch writer commits both
+// changes at once. Without a batch writer each start commits alone.
+func (p *createPass) adjacentStarts(i int) []*createStartAction {
+	lead := p.actions[i].start
+	batching := p.input.ApplyInstanceMutationsWithRetryBlock != nil ||
+		(lead.revision == "" && p.input.ApplyInstanceMutations != nil)
+	starts := []*createStartAction{lead}
+	for j := i + 1; batching && j < len(p.actions); j++ {
+		next := p.actions[j].start
+		if next == nil || next.statusChanges != lead.statusChanges || next.revision != lead.revision {
+			break
 		}
-		res = workload.PassRequeue(cadence, retryBlockWait, promoteWait, nodeDeathWait)
+		starts = append(starts, next)
 	}
-	// A server-suggested throttle delay is a floor, not a preference:
-	// waking earlier just re-earns the 429.
-	return workload.NoSoonerThan(res, input.Pacing.Pending()), revisionErr
+	return starts
+}
+
+// adjacentFinishes is the run of finishes from i that commit in one status
+// update with the lead: the same answer on whether the write changes the
+// row. Without a batch writer each finish commits alone.
+func (p *createPass) adjacentFinishes(i int) []*createReadyAction {
+	lead := p.actions[i].ready
+	batching := p.input.ApplyInstanceMutations != nil || p.input.ApplyInstanceMutationsWithRetryBlock != nil
+	finishes := []*createReadyAction{lead}
+	for j := i + 1; batching && j < len(p.actions); j++ {
+		next := p.actions[j].ready
+		if next == nil || next.statusChanges != lead.statusChanges {
+			break
+		}
+		finishes = append(finishes, next)
+	}
+	return finishes
+}
+
+// requeue is the one result of the pass: the earliest of the cadence (only
+// while an Instance is still coming up) and every explicit wait the pass
+// collected, where an explicit wait always beats the bare rate-limited
+// backoff; a pass with everything Ready and nothing due asks for no requeue
+// and waits on watches. A server-suggested throttle delay is a lower bound on
+// the answer, since a requeue earlier than the server asked only earns the
+// 429 again.
+func (p *createPass) requeue() ctrl.Result {
+	var res ctrl.Result
+	promoteWait := p.input.PromoteWindow.Pending()
+	nodeDeathWait := until(p.input.Now(), p.nodeDeathAt)
+	if !p.allReady || p.retryBlockWait > 0 || promoteWait > 0 || nodeDeathWait > 0 {
+		cadence := time.Duration(0)
+		if !p.allReady {
+			cadence = CreateRequeueInterval(p.input)
+		}
+		res = workload.PassRequeue(cadence, p.retryBlockWait, promoteWait, nodeDeathWait)
+	}
+	return workload.NoSoonerThan(res, p.input.Pacing.Pending())
 }
 
 func processStartActions(
@@ -947,11 +1174,15 @@ func allowCreateForMissingInstance(input workload.ReconcileInput, plan workload.
 			}
 		}
 	}
-	// A promoted row short of its pod set is the restart pass's under
-	// RecreateInstanceOnPodRestart — Ready, or demoted for losing every
-	// pod — and so is a gang that lost a member: filling either pod by pod
-	// would race the whole-Instance rebuild at the running revision.
-	if plan.RestartPolicy == workload.RestartPolicyRecreateInstance && len(existing) > 0 {
+	// A promoted row short of its pod set beside live pods of it is the
+	// restart pass's under RecreateInstanceOnPodRestart — Ready, or
+	// written Pending for losing every pod — and so is a gang that lost a
+	// member: filling either pod by pod would race the whole-Instance
+	// rebuild at the running revision. A pod in a terminal phase is no
+	// live pod: it holds only its name, so a row whose every pod is
+	// terminal is rebuilt here as a row with no pod is, whatever the
+	// policy, and the terminal pods are deleted ahead of the create.
+	if plan.RestartPolicy == workload.RestartPolicyRecreateInstance && len(query.ExcludeTerminalPods(existing)) > 0 {
 		s := input.ObservedState.Instance(inst.Index)
 		if s != nil && (s.Phase == workload.InstancePhaseReady || workload.DemotedReady(s)) {
 			return false, false, 0
@@ -1045,15 +1276,24 @@ func createRevision(input workload.ReconcileInput, idx int32, existing []*corev1
 //
 // Two halves. Ownership: the row is the Create pass's committed attempt —
 // not an empty slot it has yet to materialize, and not a row another machine
-// stamped Creating for its own replacement generation. Promotion history: a
-// recorded RunningRevision excludes the row, because its pods belong to a
-// serving materialization that a repair pass happens to be rebuilding, and
-// rolling those to a new revision is the update machinery's business.
-// Retiring one here would announce a retirement the pod cleanup then
-// declines forever.
+// stamped Creating for its own replacement generation. What the attempt
+// builds: a first materialization, which an empty RunningRevision marks, or
+// the rebuild of a promoted Instance at a roll target, whose target revision
+// is one other than the revision the Instance served; such a set has never
+// served and is the attempt's own. A refill of a serving materialization
+// keeps the served revision as its target: its pods belong to the set that
+// served, and rolling those to a new revision is the update machinery's
+// business. Retiring one here would announce a retirement the pod cleanup
+// then declines forever.
 func createAttemptOwnsPods(row *workload.InstanceStatus) bool {
-	return workload.StateOf(row) == workload.StateCreateCreatePods &&
-		row.RunningRevision == ""
+	if workload.StateOf(row) != workload.StateCreateCreatePods {
+		return false
+	}
+	if row.RunningRevision == "" {
+		return true
+	}
+	target := row.Operation.TargetRevision
+	return target != "" && target != row.RunningRevision
 }
 
 // retargetDeniedByRetryBlock reports whether the revision a retirement would
@@ -1166,9 +1406,10 @@ func firstRevisionLabeledPod(pods []*corev1.Pod) *corev1.Pod {
 // retiredAttemptPods returns the live pods an Instance's in-flight Create
 // attempt cannot converge: they carry a revision other than the one the
 // attempt is pinned to, which is what a retired attempt leaves behind.
-// Restricted to an Instance that has never been promoted — a recorded
-// RunningRevision means the pods belong to a serving materialization, and
-// rolling those is the update machinery's business, not Create's.
+// Restricted to an attempt that owns its pods (createAttemptOwnsPods): the
+// pods of a refill at the revision the Instance served belong to a serving
+// materialization, and rolling those is the update machinery's business,
+// not Create's.
 func retiredAttemptPods(input workload.ReconcileInput, idx int32, existing []*corev1.Pod, target *appsv1.ControllerRevision) []*corev1.Pod {
 	if target == nil {
 		return nil
@@ -1323,28 +1564,29 @@ func activeOrdinalForInstance(input workload.ReconcileInput, idx int32) int32 {
 }
 
 // createMissingPods renders and creates targets, owning the per-pod
-// ExpectCreates bookkeeping. idx is the expectations bucket — pass
-// inst.Index for steady-state Create / Restart Phase B. Callers must
-// NOT call ExpectCreates themselves. tmpl pairs the template the pods
-// are rendered from with the revision they are stamped with: a non-zero
-// revision lands on ome.io/revision-hash so per-revision Services can
-// select the pod, and names the revision a rejection is charged against.
+// ExpectCreates bookkeeping: idx is the expectations bucket (inst.Index for
+// the Create pass and for a repair's rebuild), and callers must not call
+// ExpectCreates themselves. tmpl pairs the template the pods render from
+// with the revision they are labelled with: a non-zero revision lands on
+// ome.io/revision-hash so per-revision Services can select the pod, and
+// names the revision a rejection is charged against.
 //
-// Every create path in the engine funnels through here, so this is where
-// an apiserver rejection is READ rather than passed up opaquely. The
-// classified outcome is returned as a *podRejectionError; only an
-// unclassified (transient) rejection stays a *podCreateError, which callers
-// propagate.
+// Every create path in the engine funnels through here, so this is where an
+// apiserver rejection is read rather than passed up opaquely: the classified
+// outcome is a *podRejectionError, and only an unclassified (transient)
+// rejection stays a *podCreateError, which callers propagate. The steps:
+// provision every target's capacity; per target, render, record the
+// expectation and create, and answer a refusal; last, release the waits a
+// refused pass left on the row.
 func createMissingPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, targets []podTarget, tmpl podTemplate) (int, error) {
 	if len(targets) == 0 {
 		return 0, nil
 	}
-	// A gang whose deterministic PodGroup name this owner cannot write —
-	// held by another controller, or by an object still being collected —
-	// gets no members: every pod is stamped with that name, so creating
-	// one would enlist it in a group this owner does not control. Nothing
-	// created means no progress, which is exactly the wait the caller
-	// reports; the escalation pass owns the row's fate.
+	// A gang whose PodGroup name this owner cannot write (held by another
+	// controller, or by an object still being collected) gets no members:
+	// every pod carries that name, so creating one would enlist it in a group
+	// this owner does not control. Nothing created is the wait the caller
+	// reports; the escalation pass owns the row from there.
 	if input.Gangs.BlocksPods(idx) {
 		return 0, nil
 	}
@@ -1357,122 +1599,167 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 	if err != nil || !ready {
 		return 0, err
 	}
+	set := newPodSetCreate(deps, input, plan, inst, idx, tmpl)
 	created := 0
-	target := tmpl.revision
-	revisionHash := target.Hash()
-	// The pairing protocol is part of the revision being rendered, not of
-	// the plan's current template.
+	for i, t := range targets {
+		pod, err := set.render(ctx, t, selectors[i])
+		if err != nil {
+			return created, err
+		}
+		switch err := set.create(ctx, pod); {
+		case err == nil:
+			created++
+		case apierrors.IsAlreadyExists(err):
+			// A previous pass created it; the cache has not caught up yet.
+		default:
+			return created, set.answerRefusal(ctx, t, err)
+		}
+	}
+	return created, set.releaseWaits(ctx)
+}
+
+// podSetCreate is the creation of one Instance's missing pods: the template
+// and revision every pod renders, the plan carrying that revision's pairing
+// protocol, the gang's peer host list built once, and the expectations
+// bucket the creates are counted in.
+type podSetCreate struct {
+	deps  workload.Deps
+	input workload.ReconcileInput
+	plan  workload.ComponentPlan
+	// renderPlan is plan with the pairing protocol of the revision being
+	// rendered, which is part of the revision and not of the plan's current
+	// template.
+	renderPlan   workload.ComponentPlan
+	inst         workload.InstancePlan
+	idx          int32
+	tmpl         podTemplate
+	revisionHash string
+}
+
+func newPodSetCreate(deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, tmpl podTemplate) *podSetCreate {
 	renderPlan := plan
 	renderPlan.PairingProtocol = tmpl.pairingProtocol
-	// Prime the gang's peer-DNS host list once. It's identical for every
-	// pod in the Instance, so caching it here turns the per-pod O(gangsize)
-	// rebuild inside Render into O(gangsize) total per gang. inst is a value
-	// copy, so this mutation stays loop-local. Single-pod Instances get no
-	// peer list (Render's len<2 gate makes it a no-op anyway).
+	// The gang's peer-DNS host list is the same for every pod of the
+	// Instance, so it is built once here rather than once per pod inside
+	// Render. inst is a value copy, so the list stays with this create. A
+	// single-pod Instance has no peers.
 	if inst.PeerHostnames == nil && inst.TotalPods() > 1 {
 		inst.PeerHostnames = buildInstancePeerHostnames(input.Key.OwnerName, plan.Component, inst)
 	}
-	for i, t := range targets {
-		template := tmpl.podSpec
-		if t.Runner.Name == workload.RunnerWorker && tmpl.workerPodSpec != nil {
-			template = tmpl.workerPodSpec
-		}
-
-		pod, err := RenderWithRevision(
-			input.OwnerObject,
-			input.OwnerGVK,
-			input.Key,
-			template,
-			tmpl.meta,
-			renderPlan,
-			inst,
-			t.Runner,
-			t.Ordinal,
-			revisionHash,
-			deps.RenderHook,
-		)
-		if err != nil {
-			return created, fmt.Errorf("render pod %s: %w", t.Name, err)
-		}
-		if err := confine(pod, selectors[i]); err != nil {
-			return created, fmt.Errorf("confine pod %s: %w", t.Name, err)
-		}
-		if !query.RevisionFromPod(pod).Same(tmpl.revision) {
-			return created, fmt.Errorf("cannot create pod %s: revision label %q does not identify template %s", t.Name, pod.Labels[query.LabelRevisionHash], tmpl.revision.Name())
-		}
-
-		// Advisory (non-blocking): a multi-node gang worker rendered with no
-		// co-location podAffinity — no resolved topologyKey and no
-		// operator-supplied term — and not confined by the provisioner may
-		// schedule across topology domains and break the runtime's
-		// collectives. Warn once per episode per row.
-		if err := maybeWarnGangSplitRisk(ctx, deps, input, plan, inst, t.Runner, pod, len(selectors[i]) > 0); err != nil {
-			return created, err
-		}
-
-		// EXPECT-ORDER: expectation before RPC, rollback via ObservedCreate
-		// on error — a failed Create fires no watch event to decrement it.
-		deps.ExpectationsCache().ExpectCreates(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, idx, 1)
-		if err := deps.Client.Create(ctx, pod); err != nil {
-			deps.ExpectationsCache().ObservedCreate(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, idx)
-			if apierrors.IsAlreadyExists(err) {
-				// Prior reconcile created it; cache hasn't caught up yet.
-				continue
-			}
-			rejection := evidence.ClassifyAPIError(err)
-			switch rejection.Class {
-			case workload.APIRejectionPermanentWorkload, workload.APIRejectionPermanentEnvironment:
-				// A migration surge's pod carries the request's placement
-				// overlay, so its rejection may indict the overlay rather
-				// than the revision — see disposeRejectedAttempt.
-				blameRevision := inst.MigrationOverlay == nil
-				if derr := disposeRejectedAttempt(ctx, deps, input, idx, target.Name(), t.Name, rejection, blameRevision); derr != nil {
-					return created, fmt.Errorf("dispose rejected create (instance=%d, pod=%s): %w", idx, t.Name, derr)
-				}
-				return created, &podRejectionError{podName: t.Name, rejection: rejection, disposed: true, err: err}
-			case workload.APIRejectionCapacityBlocked:
-				recorded, incumbent, merr := status.RecordCapacityRefusal(ctx, input, idx)
-				if merr != nil {
-					return created, fmt.Errorf("record quota refusal (instance=%d, pod=%s): %w", idx, t.Name, merr)
-				}
-				// Announced when the refusal becomes the row's reported
-				// wait, which the hold pass decides by precedence: a row
-				// already queued behind the scheduler or a silent node keeps
-				// reporting that, and hears nothing new.
-				if recorded && holds.Enters(workload.RejectionReasonQuotaExceeded, incumbent) {
-					workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonInstanceQuotaBlocked,
-						"OMENative %s waiting on capacity: %s", workload.InstanceKey(input.Key.Component, idx), rejection.Message)
-				}
-				return created, &podRejectionError{podName: t.Name, rejection: rejection, err: err}
-			case workload.APIRejectionAdmissionUnavailable:
-				// Admission gave no answer: the create waits for the webhook
-				// to come back, the row says so in the apiserver's words,
-				// and the pass retries on the ordinary create interval.
-				if rerr := recordAdmissionWait(ctx, deps, input, plan, idx, t.Name, rejection); rerr != nil {
-					return created, fmt.Errorf("record admission wait (instance=%d, pod=%s): %w", idx, t.Name, rerr)
-				}
-				return created, &podRejectionError{podName: t.Name, rejection: rejection, err: err}
-			case workload.APIRejectionThrottled:
-				// The server named its own delay; deposit it on the pass so
-				// whichever operation issued this create wakes no earlier.
-				input.Pacing.Observe(rejection.RetryAfter)
-				return created, &podRejectionError{podName: t.Name, rejection: rejection, err: err}
-			}
-			return created, &podCreateError{podName: t.Name, err: err}
-		}
-		created++
+	return &podSetCreate{
+		deps:         deps,
+		input:        input,
+		plan:         plan,
+		renderPlan:   renderPlan,
+		inst:         inst,
+		idx:          idx,
+		tmpl:         tmpl,
+		revisionHash: tmpl.revision.Hash(),
 	}
-	// Reaching here means every target was placed or already existed and
-	// no quota refusal was seen: retire the record so the parked deadline
-	// re-arms from this moment. Every create went through admission too,
-	// so an admission wait a refused pass left is over.
-	if err := clearCapacityRefusal(ctx, input, idx); err != nil {
-		return created, fmt.Errorf("clear quota refusal (instance=%d): %w", idx, err)
+}
+
+// render builds the pod of one target: the runner's template, the
+// provisioner's node selector merged in, the revision label checked against
+// the template it identifies, and the advisory warning for a gang worker
+// with no co-location rule.
+func (s *podSetCreate) render(ctx context.Context, t podTarget, selector map[string]string) (*corev1.Pod, error) {
+	template := s.tmpl.podSpec
+	if t.Runner.Name == workload.RunnerWorker && s.tmpl.workerPodSpec != nil {
+		template = s.tmpl.workerPodSpec
 	}
-	if err := releaseAdmissionWait(ctx, input, idx); err != nil {
-		return created, fmt.Errorf("release admission wait (instance=%d): %w", idx, err)
+	pod, err := RenderWithRevision(
+		s.input.OwnerObject,
+		s.input.OwnerGVK,
+		s.input.Key,
+		template,
+		s.tmpl.meta,
+		s.renderPlan,
+		s.inst,
+		t.Runner,
+		t.Ordinal,
+		s.revisionHash,
+		s.deps.RenderHook,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("render pod %s: %w", t.Name, err)
 	}
-	return created, nil
+	if err := confine(pod, selector); err != nil {
+		return nil, fmt.Errorf("confine pod %s: %w", t.Name, err)
+	}
+	if !query.RevisionFromPod(pod).Same(s.tmpl.revision) {
+		return nil, fmt.Errorf("cannot create pod %s: revision label %q does not identify template %s", t.Name, pod.Labels[query.LabelRevisionHash], s.tmpl.revision.Name())
+	}
+	if err := maybeWarnGangSplitRisk(ctx, s.deps, s.input, s.plan, s.inst, t.Runner, pod, len(selector) > 0); err != nil {
+		return nil, err
+	}
+	return pod, nil
+}
+
+// create issues the pod create with its expectation recorded first and given
+// back on error: a failed create fires no watch event to decrement it.
+func (s *podSetCreate) create(ctx context.Context, pod *corev1.Pod) error {
+	key := s.input.Key
+	s.deps.ExpectationsCache().ExpectCreates(key.Namespace, key.OwnerName, key.Component, s.idx, 1)
+	err := s.deps.Client.Create(ctx, pod)
+	if err != nil {
+		s.deps.ExpectationsCache().ObservedCreate(key.Namespace, key.OwnerName, key.Component, s.idx)
+	}
+	return err
+}
+
+// answerRefusal reads the apiserver's refusal of one pod create into the
+// outcome every create path agrees on. A permanent refusal ends the attempt,
+// blaming the revision unless the pod carried a move's placement overlay the
+// revision never asked for; a capacity refusal is recorded on the row, and
+// an event names it when it becomes the row's reported wait, which the hold
+// pass decides by precedence; an admission outage is recorded in the
+// apiserver's words and retried on the ordinary create interval; a throttle
+// deposits the server's delay on the pass, so whichever operation issued the
+// create requeues no earlier. Each is returned classified; an unclassified
+// refusal stays a plain create error the caller propagates.
+func (s *podSetCreate) answerRefusal(ctx context.Context, t podTarget, err error) error {
+	rejection := evidence.ClassifyAPIError(err)
+	switch rejection.Class {
+	case workload.APIRejectionPermanentWorkload, workload.APIRejectionPermanentEnvironment:
+		blameRevision := s.inst.MigrationOverlay == nil
+		if derr := disposeRejectedAttempt(ctx, s.deps, s.input, s.idx, s.tmpl.revision.Name(), t.Name, rejection, blameRevision); derr != nil {
+			return fmt.Errorf("dispose rejected create (instance=%d, pod=%s): %w", s.idx, t.Name, derr)
+		}
+		return &podRejectionError{podName: t.Name, rejection: rejection, disposed: true, err: err}
+	case workload.APIRejectionCapacityBlocked:
+		recorded, incumbent, merr := status.RecordCapacityRefusal(ctx, s.input, s.idx)
+		if merr != nil {
+			return fmt.Errorf("record quota refusal (instance=%d, pod=%s): %w", s.idx, t.Name, merr)
+		}
+		if recorded && holds.Enters(workload.RejectionReasonQuotaExceeded, incumbent) {
+			workload.RecordNormal(s.deps.Recorder, workload.EventTarget(s.input), workload.EventReasonInstanceQuotaBlocked,
+				"OMENative %s waiting on capacity: %s", workload.InstanceKey(s.input.Key.Component, s.idx), rejection.Message)
+		}
+		return &podRejectionError{podName: t.Name, rejection: rejection, err: err}
+	case workload.APIRejectionAdmissionUnavailable:
+		if rerr := recordAdmissionWait(ctx, s.deps, s.input, s.plan, s.idx, t.Name, rejection); rerr != nil {
+			return fmt.Errorf("record admission wait (instance=%d, pod=%s): %w", s.idx, t.Name, rerr)
+		}
+		return &podRejectionError{podName: t.Name, rejection: rejection, err: err}
+	case workload.APIRejectionThrottled:
+		s.input.Pacing.Observe(rejection.RetryAfter)
+		return &podRejectionError{podName: t.Name, rejection: rejection, err: err}
+	}
+	return &podCreateError{podName: t.Name, err: err}
+}
+
+// releaseWaits retires the quota refusal and the admission wait a refused
+// pass left on the row: every target was placed or already existed and went
+// through admission, so the row is no longer blocked and its held deadline
+// runs again from now.
+func (s *podSetCreate) releaseWaits(ctx context.Context) error {
+	if err := clearCapacityRefusal(ctx, s.input, s.idx); err != nil {
+		return fmt.Errorf("clear quota refusal (instance=%d): %w", s.idx, err)
+	}
+	if err := releaseAdmissionWait(ctx, s.input, s.idx); err != nil {
+		return fmt.Errorf("release admission wait (instance=%d): %w", s.idx, err)
+	}
+	return nil
 }
 
 // provisionPods asks deps.Provisioner to place every target before any

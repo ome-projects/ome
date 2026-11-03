@@ -252,28 +252,14 @@ func NewClient(config *Config) (*Client, error) {
 		SetLogLevel(config.LogLevel)
 	}
 
+	var held cStrings
+	defer held.free()
 	cConfig := C.XetConfig{
+		endpoint:                 held.add(config.Endpoint),
+		token:                    held.add(config.Token),
+		cache_dir:                held.add(config.CacheDir),
 		max_concurrent_downloads: C.uint32_t(config.MaxConcurrentDownloads),
 		enable_dedup:             C.bool(config.EnableDedup),
-	}
-
-	// Set string fields
-	if config.Endpoint != "" {
-		cEndpoint := C.CString(config.Endpoint)
-		defer C.free(unsafe.Pointer(cEndpoint))
-		cConfig.endpoint = cEndpoint
-	}
-
-	if config.Token != "" {
-		cToken := C.CString(config.Token)
-		defer C.free(unsafe.Pointer(cToken))
-		cConfig.token = cToken
-	}
-
-	if config.CacheDir != "" {
-		cCacheDir := C.CString(config.CacheDir)
-		defer C.free(unsafe.Pointer(cCacheDir))
-		cConfig.cache_dir = cCacheDir
 	}
 
 	client := C.xet_client_new(&cConfig)
@@ -354,30 +340,14 @@ func (c *Client) DownloadFileWithContext(ctx context.Context, req *DownloadReque
 	if c == nil || c.client == nil {
 		return "", fmt.Errorf("client is closed")
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
 
-	cReq := convertDownloadRequest(req)
-	defer freeDownloadRequest(&cReq)
+	cReq, free := convertDownloadRequest(req)
+	defer free()
+	token, release := cancellation(ctx)
 
 	var outPath *C.char
-
-	var cancelToken *C.XetCancellationToken
-	var cancelHandle cgo.Handle
-	if ctx != nil && ctx.Done() != nil {
-		bridge := &cancellationBridge{ctx: ctx}
-		cancelHandle = cgo.NewHandle(bridge)
-		cancelToken = &C.XetCancellationToken{
-			callback:  (C.XetCancellationCallback)(C.goXetShouldCancel),
-			user_data: unsafe.Pointer(cancelHandle),
-		}
-	}
-
-	errPtr := C.xet_download_file(c.client, &cReq, cancelToken, &outPath)
-	if cancelHandle != 0 {
-		cancelHandle.Delete()
-	}
+	errPtr := C.xet_download_file(c.client, &cReq, token, &outPath)
+	release()
 	if errPtr != nil {
 		return "", convertError(errPtr)
 	}
@@ -395,113 +365,101 @@ func (c *Client) DownloadSnapshotWithContext(ctx context.Context, req *SnapshotR
 	if c == nil || c.client == nil {
 		return "", fmt.Errorf("client is closed")
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
 	if req == nil {
 		return "", fmt.Errorf("snapshot request cannot be nil")
 	}
 
+	cReq, free := convertSnapshotRequest(req)
+	defer free()
+	token, release := cancellation(ctx)
+
 	var outPath *C.char
-
-	var cRepoID *C.char
-	if req.RepoID != "" {
-		cRepoID = C.CString(req.RepoID)
-		defer C.free(unsafe.Pointer(cRepoID))
-	}
-
-	var cRepoType *C.char
-	if req.RepoType != "" {
-		cRepoType = C.CString(req.RepoType)
-		defer C.free(unsafe.Pointer(cRepoType))
-	}
-
-	var cRevision *C.char
-	if req.Revision != "" {
-		cRevision = C.CString(req.Revision)
-		defer C.free(unsafe.Pointer(cRevision))
-	}
-
-	var cLocalDir *C.char
-	if req.LocalDir != "" {
-		cLocalDir = C.CString(req.LocalDir)
-		defer C.free(unsafe.Pointer(cLocalDir))
-	}
-
-	var cancelToken *C.XetCancellationToken
-	var cancelHandle cgo.Handle
-	if ctx != nil && ctx.Done() != nil {
-		bridge := &cancellationBridge{ctx: ctx}
-		cancelHandle = cgo.NewHandle(bridge)
-		cancelToken = &C.XetCancellationToken{
-			callback:  (C.XetCancellationCallback)(C.goXetShouldCancel),
-			user_data: unsafe.Pointer(cancelHandle),
-		}
-	}
-
 	errPtr := C.xet_download_snapshot(
 		c.client,
-		cRepoID,
-		cRepoType,
-		cRevision,
-		cLocalDir,
-		cancelToken,
+		cReq.repoID,
+		cReq.repoType,
+		cReq.revision,
+		cReq.localDir,
+		token,
 		&outPath,
 	)
-
-	if cancelHandle != 0 {
-		cancelHandle.Delete()
-	}
-
+	release()
 	if errPtr != nil {
 		return "", convertError(errPtr)
 	}
-
 	defer C.xet_free_string(outPath)
 	return C.GoString(outPath), nil
 }
 
 // Helper functions
 
-func convertDownloadRequest(req *DownloadRequest) C.XetDownloadRequest {
-	cReq := C.XetDownloadRequest{}
-
-	if req.RepoID != "" {
-		cReq.repo_id = C.CString(req.RepoID)
-	}
-	if req.RepoType != "" {
-		cReq.repo_type = C.CString(req.RepoType)
-	}
-	if req.Revision != "" {
-		cReq.revision = C.CString(req.Revision)
-	}
-	if req.Filename != "" {
-		cReq.filename = C.CString(req.Filename)
-	}
-	if req.LocalDir != "" {
-		cReq.local_dir = C.CString(req.LocalDir)
-	}
-
-	return cReq
+// cStrings holds the C copies of the Go strings one C call takes and frees
+// them together once the call has returned. An empty Go string is passed as
+// NULL, which the Rust side reads as "not given".
+type cStrings struct {
+	owned []*C.char
 }
 
-func freeDownloadRequest(req *C.XetDownloadRequest) {
-	if req.repo_id != nil {
-		C.free(unsafe.Pointer(req.repo_id))
+func (s *cStrings) add(value string) *C.char {
+	if value == "" {
+		return nil
 	}
-	if req.repo_type != nil {
-		C.free(unsafe.Pointer(req.repo_type))
+	p := C.CString(value)
+	s.owned = append(s.owned, p)
+	return p
+}
+
+func (s *cStrings) free() {
+	for _, p := range s.owned {
+		C.free(unsafe.Pointer(p))
 	}
-	if req.revision != nil {
-		C.free(unsafe.Pointer(req.revision))
+	s.owned = nil
+}
+
+// cancellation hands ctx to the Rust side as a token it polls while it works.
+// A context that can never be cancelled passes no token. release drops the
+// handle behind the token and is called once the C call has returned.
+func cancellation(ctx context.Context) (token *C.XetCancellationToken, release func()) {
+	if ctx == nil || ctx.Done() == nil {
+		return nil, func() {}
 	}
-	if req.filename != nil {
-		C.free(unsafe.Pointer(req.filename))
+	handle := cgo.NewHandle(&cancellationBridge{ctx: ctx})
+	token = &C.XetCancellationToken{
+		callback:  (C.XetCancellationCallback)(C.goXetShouldCancel),
+		user_data: unsafe.Pointer(handle),
 	}
-	if req.local_dir != nil {
-		C.free(unsafe.Pointer(req.local_dir))
+	return token, handle.Delete
+}
+
+// convertDownloadRequest is the C view of req; free releases its strings.
+func convertDownloadRequest(req *DownloadRequest) (cReq C.XetDownloadRequest, free func()) {
+	var held cStrings
+	cReq = C.XetDownloadRequest{
+		repo_id:   held.add(req.RepoID),
+		repo_type: held.add(req.RepoType),
+		revision:  held.add(req.Revision),
+		filename:  held.add(req.Filename),
+		local_dir: held.add(req.LocalDir),
 	}
+	return cReq, held.free
+}
+
+// snapshotRequest is the C view of a SnapshotRequest: the strings the Rust
+// side takes one by one.
+type snapshotRequest struct {
+	repoID, repoType, revision, localDir *C.char
+}
+
+// convertSnapshotRequest is the C view of req; free releases its strings.
+func convertSnapshotRequest(req *SnapshotRequest) (cReq snapshotRequest, free func()) {
+	var held cStrings
+	cReq = snapshotRequest{
+		repoID:   held.add(req.RepoID),
+		repoType: held.add(req.RepoType),
+		revision: held.add(req.Revision),
+		localDir: held.add(req.LocalDir),
+	}
+	return cReq, held.free
 }
 
 func convertError(err *C.XetError) error {

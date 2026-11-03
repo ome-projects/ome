@@ -38,65 +38,41 @@ type InheritanceReconciler struct {
 
 func (r *InheritanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	if req.Namespace == "" {
-		return r.reconcileCluster(ctx, req.Name)
-	}
-	return r.reconcileNamespaced(ctx, req.Namespace, req.Name)
-}
-
-func (r *InheritanceReconciler) reconcileCluster(ctx context.Context, name string) (ctrl.Result, error) {
-	csr := &v1beta1.ClusterServingRuntime{}
-	if err := r.Get(ctx, types.NamespacedName{Name: name}, csr); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
+		csr := &v1beta1.ClusterServingRuntime{}
+		if err := r.Get(ctx, req.NamespacedName, csr); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
-		return ctrl.Result{}, err
+		return r.reconcileRuntime(ctx, csr, &csr.Status,
+			runtimeinheritance.ClusterRuntimeRef(csr), runtimeinheritance.ClusterRuntimeFetcher(r.Client),
+			"clusterservingruntime", req.Name)
 	}
-
-	_, chain, err := runtimeinheritance.Resolve(ctx, runtimeinheritance.ClusterRuntimeRef(csr),
-		runtimeinheritance.ClusterRuntimeFetcher(r.Client), constants.RuntimeInheritMaxDepth)
-	if err != nil {
-		r.Log.WithValues("clusterservingruntime", name).Info("inheritance resolution failed",
-			"reason", classifyResolveError(err), "error", err.Error())
-		r.Recorder.Eventf(csr, "Warning", classifyResolveError(err), "%v", err)
-	}
-
-	newStatus := projectInheritanceResult(csr.Status, csr.Generation, chain, err)
-	if equality.Semantic.DeepEqual(csr.Status, newStatus) {
-		return ctrl.Result{}, nil
-	}
-	csr.Status = newStatus
-	if updateErr := r.Status().Update(ctx, csr); updateErr != nil {
-		if apierrors.IsConflict(updateErr) {
-			return ctrl.Result{Requeue: true}, nil
-		}
-		return ctrl.Result{}, updateErr
-	}
-	return ctrl.Result{}, nil
-}
-
-func (r *InheritanceReconciler) reconcileNamespaced(ctx context.Context, namespace, name string) (ctrl.Result, error) {
 	sr := &v1beta1.ServingRuntime{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, sr); err != nil {
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, err
+	if err := r.Get(ctx, req.NamespacedName, sr); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	return r.reconcileRuntime(ctx, sr, &sr.Status,
+		runtimeinheritance.NamespacedRuntimeRef(sr), runtimeinheritance.NamespacedRuntimeFetcher(r.Client, req.Namespace),
+		"servingruntime", req.Name, "namespace", req.Namespace)
+}
 
-	_, chain, err := runtimeinheritance.Resolve(ctx, runtimeinheritance.NamespacedRuntimeRef(sr),
-		runtimeinheritance.NamespacedRuntimeFetcher(r.Client, namespace), constants.RuntimeInheritMaxDepth)
+// reconcileRuntime resolves the inheritance chain of one fetched runtime and
+// records the outcome in its status. The kind decides only where the resolver
+// starts, how it reads parents and how the runtime is named in the log.
+func (r *InheritanceReconciler) reconcileRuntime(ctx context.Context, obj client.Object, status *v1beta1.ServingRuntimeStatus,
+	start *runtimeinheritance.RuntimeRef, parents runtimeinheritance.Fetcher, logKeys ...any) (ctrl.Result, error) {
+	_, chain, err := runtimeinheritance.Resolve(ctx, start, parents, constants.RuntimeInheritMaxDepth)
 	if err != nil {
-		r.Log.WithValues("servingruntime", name, "namespace", namespace).Info("inheritance resolution failed",
+		r.Log.WithValues(logKeys...).Info("inheritance resolution failed",
 			"reason", classifyResolveError(err), "error", err.Error())
-		r.Recorder.Eventf(sr, "Warning", classifyResolveError(err), "%v", err)
+		r.Recorder.Eventf(obj, "Warning", classifyResolveError(err), "%v", err)
 	}
 
-	newStatus := projectInheritanceResult(sr.Status, sr.Generation, chain, err)
-	if equality.Semantic.DeepEqual(sr.Status, newStatus) {
+	newStatus := projectInheritanceResult(*status, obj.GetGeneration(), chain, err)
+	if equality.Semantic.DeepEqual(*status, newStatus) {
 		return ctrl.Result{}, nil
 	}
-	sr.Status = newStatus
-	if updateErr := r.Status().Update(ctx, sr); updateErr != nil {
+	*status = newStatus
+	if updateErr := r.Status().Update(ctx, obj); updateErr != nil {
 		if apierrors.IsConflict(updateErr) {
 			return ctrl.Result{Requeue: true}, nil
 		}

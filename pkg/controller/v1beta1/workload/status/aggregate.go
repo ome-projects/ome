@@ -128,25 +128,13 @@ func CountAvailablePods(pods []*corev1.Pod, availableByName map[string]struct{},
 		if window.MinReadySeconds > 0 {
 			available, remaining := podreadiness.IsPodAvailable(p, window.MinReadySeconds, window.Now)
 			if !available {
-				nextAvailableIn = EarliestPending(nextAvailableIn, remaining)
+				nextAvailableIn = types.EarliestPositive(nextAvailableIn, remaining)
 				continue
 			}
 		}
 		n++
 	}
 	return n, nextAvailableIn
-}
-
-// earliestPending folds candidate into the running "next wake" value: the
-// smallest positive duration wins and a non-positive candidate is no wake.
-func EarliestPending(current, candidate time.Duration) time.Duration {
-	if candidate <= 0 {
-		return current
-	}
-	if current <= 0 || candidate < current {
-		return candidate
-	}
-	return current
 }
 
 // UniqueNodes returns the deterministically-sorted set of node names

@@ -10,9 +10,6 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
-// replicaRefRoles is the order the referenced-form rules walk the roles.
-var replicaRefRoles = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}
-
 // ReplicaRefsField returns the spec path of a role's list in spec.replicaRefs.
 func ReplicaRefsField(c v1beta1.ComponentType) string {
 	return "spec.replicaRefs." + string(c)
@@ -82,7 +79,7 @@ func ValidateReplicaRefs(spec *v1beta1.InferenceServiceSpec) error {
 		return fmt.Errorf("%s is required when spec.replicaRefs is set; a service has an engine", ReplicaRefsField(v1beta1.EngineComponent))
 	}
 	named := map[string]string{}
-	for _, c := range replicaRefRoles {
+	for _, c := range ComponentRoles {
 		field := ReplicaRefsField(c)
 		names := roleReplicaRefs(spec.ReplicaRefs, c)
 		if len(names) > 1 {
@@ -98,13 +95,8 @@ func ValidateReplicaRefs(spec *v1beta1.InferenceServiceSpec) error {
 			named[name] = field
 		}
 	}
-	for _, inline := range []struct {
-		field string
-		set   bool
-	}{{"spec.engine", spec.Engine != nil}, {"spec.decoder", spec.Decoder != nil}, {"spec.router", spec.Router != nil}} {
-		if inline.set {
-			return fmt.Errorf("%s and spec.replicaRefs cannot both be set; a service references all of its roles or none", inline.field)
-		}
+	if inline := declaredRoles(spec); len(inline) > 0 {
+		return fmt.Errorf("%s and spec.replicaRefs cannot both be set; a service references all of its roles or none", inline[0].field)
 	}
 	if spec.Rollout != nil {
 		return fmt.Errorf("spec.rollout is not accepted with spec.replicaRefs; a referenced replica rolls on its own")

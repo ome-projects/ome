@@ -43,5 +43,5 @@ func reportScheduler(ctx context.Context, in PassInput, row Row) (reading, error
 	if serving {
 		return reading{release: true}, nil
 	}
-	return reading{waiting: true, evidence: types.UnschedulableTermination(pod, message, since)}, nil
+	return reading{waiting: true, evidence: types.UnschedulableTermination(pod, message, since), waitSince: since}, nil
 }

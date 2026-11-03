@@ -539,18 +539,6 @@ func projectedReplica(parent *v1beta1.InferenceService, component v1beta1.Compon
 	return ir
 }
 
-func drainEvents(recorder *record.FakeRecorder) []string {
-	var events []string
-	for {
-		select {
-		case event := <-recorder.Events:
-			events = append(events, event)
-		default:
-			return events
-		}
-	}
-}
-
 func followerEntry(t *testing.T, parent *v1beta1.InferenceService) v1beta1.FollowerScalingStatus {
 	t.Helper()
 	status := parent.Status.ScalingPolicy
@@ -635,14 +623,14 @@ func TestReconcileFollowerWithoutMaximumFollowsTheAnchor(t *testing.T) {
 	}
 
 	expect(8, 8, false, 1)
-	if events := drainEvents(recorder); len(events) != 0 {
+	if events := fakeclient.RecordedEvents(recorder); len(events) != 0 {
 		t.Fatalf("a follower inside its bounds must not warn: %v", events)
 	}
 	setAnchor(4)
 	expect(4, 4, false, 2)
 	setAnchor(1)
 	expect(1, 2, true, 3)
-	events := drainEvents(recorder)
+	events := fakeclient.RecordedEvents(recorder)
 	if len(events) != 1 || !strings.Contains(events[0], "ScalingTargetClamped") ||
 		!strings.Contains(events[0], "minReplicas") || !strings.Contains(events[0], "asks for 1") {
 		t.Fatalf("the minimum holding the follower must be named once: %v", events)
@@ -651,7 +639,7 @@ func TestReconcileFollowerWithoutMaximumFollowsTheAnchor(t *testing.T) {
 		t.Fatalf("condition must name the bound: %+v", readyCondition(t, parent))
 	}
 	expect(1, 2, true, 3)
-	if events := drainEvents(recorder); len(events) != 0 {
+	if events := fakeclient.RecordedEvents(recorder); len(events) != 0 {
 		t.Fatalf("an unchanged clamp must not warn again: %v", events)
 	}
 	setAnchor(12)
@@ -692,7 +680,7 @@ func TestReconcileFollowerIsHeldAtItsDeclaredMaximum(t *testing.T) {
 	if condition.Status != metav1.ConditionTrue || condition.Reason != "Applied" || !strings.Contains(condition.Message, "maxReplicas") {
 		t.Fatalf("condition must stay Applied and name the maximum: %+v", condition)
 	}
-	events := drainEvents(recorder)
+	events := fakeclient.RecordedEvents(recorder)
 	if len(events) != 1 || !strings.Contains(events[0], "ScalingTargetClamped") ||
 		!strings.Contains(events[0], "maxReplicas") || !strings.Contains(events[0], "asks for 9") {
 		t.Fatalf("the maximum holding the follower must be named once: %v", events)
@@ -709,7 +697,7 @@ func TestReconcileFollowerIsHeldAtItsDeclaredMaximum(t *testing.T) {
 	if entry := followerEntry(t, parent); entry.Target != 2 || entry.Current != 2 || entry.Clamped || projector.writes != 2 {
 		t.Fatalf("follower %+v after %d projections; want 2 inside its bounds", entry, projector.writes)
 	}
-	if events := drainEvents(recorder); len(events) != 0 {
+	if events := fakeclient.RecordedEvents(recorder); len(events) != 0 {
 		t.Fatalf("a follower back inside its bounds must not warn: %v", events)
 	}
 }
@@ -743,7 +731,7 @@ func TestReconcileWarnsOnceWhenNeitherSideDeclaresAMaximum(t *testing.T) {
 			t.Fatalf("condition must stay Applied and say nothing caps the decoder: %+v", condition)
 		}
 	}
-	events := drainEvents(recorder)
+	events := fakeclient.RecordedEvents(recorder)
 	if len(events) != 1 || !strings.Contains(events[0], "ScalingFollowerUnbounded") ||
 		!strings.Contains(events[0], "decoder") || !strings.Contains(events[0], "engine") {
 		t.Fatalf("one warning naming both sides: %v", events)
@@ -754,7 +742,7 @@ func TestReconcileWarnsOnceWhenNeitherSideDeclaresAMaximum(t *testing.T) {
 	if message := readyCondition(t, parent).Message; strings.Contains(message, "maxReplicas") {
 		t.Fatalf("an anchor with a maximum caps the follower; no note expected: %q", message)
 	}
-	if events := drainEvents(recorder); len(events) != 0 {
+	if events := fakeclient.RecordedEvents(recorder); len(events) != 0 {
 		t.Fatalf("unexpected warning: %v", events)
 	}
 }

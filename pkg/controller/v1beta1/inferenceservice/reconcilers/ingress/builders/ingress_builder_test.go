@@ -16,20 +16,16 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/interfaces"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ingress/services"
 )
-
-func TestIngressBuilder_GetResourceType(t *testing.T) {
-	builder := createIngressBuilder()
-	assert.Equal(t, "Ingress", builder.GetResourceType())
-}
 
 func TestIngressBuilder_Build(t *testing.T) {
 	builder := createIngressBuilder()
 	isvc := createTestInferenceServiceIngress("test-isvc", "default")
 	setEngineReadyIngress(isvc)
 
-	ingress, err := builder.Build(context.Background(), isvc)
+	ingress, err := builder.BuildIngress(context.Background(), isvc)
 	assert.NoError(t, err)
 	assert.NotNil(t, ingress)
 
@@ -93,15 +89,16 @@ func TestIngressBuilder_BuildIngress(t *testing.T) {
 
 			result, err := builder.BuildIngress(context.Background(), tt.isvc)
 
+			if tt.expectNil {
+				var notReady *interfaces.ComponentNotReadyError
+				require.ErrorAs(t, err, &notReady)
+				assert.Nil(t, result)
+				return
+			}
 			if tt.expectedError {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
-			}
-
-			if tt.expectNil {
-				assert.Nil(t, result)
-				return
 			}
 
 			require.NotNil(t, result)
@@ -365,36 +362,38 @@ func TestIngressBuilder_GenerateIngressHost(t *testing.T) {
 	}
 }
 
+// A Component that cannot back a rule yet yields no Ingress and a
+// *interfaces.ComponentNotReadyError naming it; the builder writes no
+// condition, that is the strategy's job.
 func TestIngressBuilder_ComponentReadiness(t *testing.T) {
 	tests := []struct {
-		name              string
-		isvc              *v1beta1.InferenceService
-		setupReadiness    func(*v1beta1.InferenceService)
-		expectedNil       bool
-		expectedCondition corev1.ConditionStatus
-		expectedReason    string
+		name           string
+		isvc           *v1beta1.InferenceService
+		setupReadiness func(*v1beta1.InferenceService)
+		notReady       v1beta1.ComponentType
 	}{
 		{
 			name: "router not ready",
 			isvc: createTestInferenceServiceWithRouterIngress("test-isvc", "default"),
 			setupReadiness: func(isvc *v1beta1.InferenceService) {
 				setEngineReadyIngress(isvc)
-				// Don't set router ready
 			},
-			expectedNil:       true,
-			expectedCondition: corev1.ConditionFalse,
-			expectedReason:    "Router ingress not created",
+			notReady: v1beta1.RouterComponent,
 		},
 		{
 			name: "decoder not ready",
 			isvc: createTestInferenceServiceWithDecoderIngress("test-isvc", "default"),
 			setupReadiness: func(isvc *v1beta1.InferenceService) {
 				setEngineReadyIngress(isvc)
-				// Don't set decoder ready
 			},
-			expectedNil:       true,
-			expectedCondition: corev1.ConditionFalse,
-			expectedReason:    "Decoder ingress not created",
+			notReady: v1beta1.DecoderComponent,
+		},
+		{
+			name: "engine not ready",
+			isvc: createTestInferenceServiceIngress("test-isvc", "default"),
+			setupReadiness: func(isvc *v1beta1.InferenceService) {
+			},
+			notReady: v1beta1.EngineComponent,
 		},
 		{
 			name: "all components ready",
@@ -404,7 +403,6 @@ func TestIngressBuilder_ComponentReadiness(t *testing.T) {
 				setRouterReadyIngress(isvc)
 				setDecoderReadyIngress(isvc)
 			},
-			expectedNil: false,
 		},
 	}
 
@@ -415,17 +413,16 @@ func TestIngressBuilder_ComponentReadiness(t *testing.T) {
 
 			result, err := builder.BuildIngress(context.Background(), tt.isvc)
 
-			assert.NoError(t, err)
-
-			if tt.expectedNil {
-				assert.Nil(t, result)
-				condition := tt.isvc.Status.GetCondition(v1beta1.IngressReady)
-				assert.NotNil(t, condition)
-				assert.Equal(t, tt.expectedCondition, condition.Status)
-				assert.Equal(t, tt.expectedReason, condition.Reason)
-			} else {
+			if tt.notReady == "" {
+				assert.NoError(t, err)
 				assert.NotNil(t, result)
+				return
 			}
+			var notReady *interfaces.ComponentNotReadyError
+			require.ErrorAs(t, err, &notReady)
+			assert.Equal(t, tt.notReady, notReady.Component)
+			assert.Nil(t, result)
+			assert.Nil(t, tt.isvc.Status.GetCondition(v1beta1.IngressReady), "the builder writes no condition")
 		})
 	}
 }

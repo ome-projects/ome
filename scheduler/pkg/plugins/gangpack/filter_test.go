@@ -21,7 +21,7 @@ func TestName_Plugin_ReturnsRegisteredName(t *testing.T) {
 
 func TestFilter_StandalonePodOnReservedDomain_RejectsOnlyThatDomain(t *testing.T) {
 	g := &GangPack{assignments: placement.New()}
-	g.assignments.ChooseInTopology("team/pf", testKey, topology.FreeByDomain{"a": 2}, 2)
+	g.assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey}, topology.FreeByDomain{"a": 2}, nil, 2)
 	state := newCycleState() // standalone pod has no gang assignment
 	if status := g.Filter(context.Background(), state, gpuPod("4"), nodeInfo(gpuNode("a1", "a", "4"))); status.Code() != framework.UnschedulableAndUnresolvable {
 		t.Fatalf("reserved-domain Filter = %v, want UnschedulableAndUnresolvable", status)
@@ -48,7 +48,7 @@ func TestFilter_GangAssignedToDomain_AdmitsOnlyThatDomainsNodes(t *testing.T) {
 	}
 
 	// Assign the gang to domain "a".
-	writeAssignment(st, "a", gangInfo{topologyKey: testKey})
+	writeAssignment(st, "a", gangInfo{topologyKey: testKey}, 0)
 
 	if s := g.Filter(ctx, st, pod, nodeInfo(gpuNode("n1", "a", "4"))); !s.IsSuccess() {
 		t.Fatalf("in-domain Filter = %v, want Success", s)

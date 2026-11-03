@@ -43,7 +43,9 @@ func NewDeploymentReconciler(client kclient.Client,
 	resolvedAutoscaler *v1beta1.ComponentAutoscaler) *DeploymentReconciler {
 	ownedReplicas := controllerOwnedReplicas(resolvedAutoscaler, componentExt)
 	deployment := createRawDeployment(componentMeta, componentExt, podSpec)
-	deployment.Spec.Replicas = ownedReplicas
+	// A new Deployment starts at the declared minReplicas whatever the class: no
+	// scaler has written a count yet. The update path decides ownership.
+	deployment.Spec.Replicas = initialReplicas(componentExt)
 	return &DeploymentReconciler{
 		client:        client,
 		scheme:        scheme,
@@ -66,6 +68,12 @@ func controllerOwnedReplicas(resolvedAutoscaler *v1beta1.ComponentAutoscaler, co
 	if resolvedAutoscaler != nil && resolvedAutoscaler.Class != v1beta1.AutoscalerNone {
 		return nil
 	}
+	return initialReplicas(componentExt)
+}
+
+// initialReplicas returns the replica count a new Deployment is created
+// with: an explicit positive minReplicas, or nil to take the apiserver default.
+func initialReplicas(componentExt *v1beta1.ComponentExtensionSpec) *int32 {
 	if componentExt == nil || componentExt.MinReplicas == nil || *componentExt.MinReplicas <= 0 {
 		return nil
 	}
@@ -153,8 +161,8 @@ func (r *DeploymentReconciler) checkDeploymentExist() (constants.CheckResultType
 		// authoritative — carry it into the target state and exclude the
 		// field from the diff.
 		diffOpts = append(diffOpts, cmpopts.IgnoreFields(appsv1.DeploymentSpec{}, "Replicas"))
+		r.Deployment.Spec.Replicas = existingDeployment.Spec.Replicas
 		if existingDeployment.Spec.Replicas != nil {
-			r.Deployment.Spec.Replicas = existingDeployment.Spec.Replicas
 			log.V(1).Info("Preserving existing replicas in target state", "namespace", r.Deployment.Namespace, "name", r.Deployment.Name, "replicas", *r.Deployment.Spec.Replicas)
 		}
 	}

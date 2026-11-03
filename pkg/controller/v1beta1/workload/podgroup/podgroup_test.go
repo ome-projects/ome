@@ -12,18 +12,16 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // ---------------------------------------------------------------------
@@ -306,7 +304,7 @@ func TestEnsurePodGroup_SinglePodNoOp(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}}
 
-	if err := EnsurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 
@@ -330,7 +328,7 @@ func TestEnsurePodGroup_CreatesWhenAbsent(t *testing.T) {
 	}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 3}}}
 
-	if err := EnsurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 
@@ -421,7 +419,7 @@ func TestEnsurePodGroup_DriftCorrected(t *testing.T) {
 	}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
 
-	if err := EnsurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 
@@ -463,7 +461,7 @@ func TestEnsurePodGroup_UnsetTopologyKeyRemovesOwnedAnnotationOnly(t *testing.T)
 	}
 	c := newPodGroupClient(t, isvc, existing)
 
-	if err := EnsurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 	got := &schedulingv1alpha1.PodGroup{}
@@ -492,13 +490,13 @@ func TestEnsurePodGroup_TopologyAnnotationDriftTriggersUpdate(t *testing.T) {
 	}
 	existing.Annotations[query.AnnotationTopologyKey] = "stale.example.com/domain"
 	existing.Annotations["example.com/preserve"] = "yes"
-	cc := newCountingClient(newPodGroupClient(t, isvc, existing))
+	cc, calls := countedClient(t, newPodGroupClient(t, isvc, existing))
 
-	if err := EnsurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
-	if cc.updates != 1 {
-		t.Fatalf("topology-only drift update count: got %d want 1", cc.updates)
+	if calls.updates.Count() != 1 {
+		t.Fatalf("topology-only drift update count: got %d want 1", calls.updates.Count())
 	}
 	got := &schedulingv1alpha1.PodGroup{}
 	if err := cc.Get(context.Background(), client.ObjectKeyFromObject(existing), got); err != nil {
@@ -529,7 +527,7 @@ func TestEnsurePodGroup_HealsLegacyComponentLabelKey(t *testing.T) {
 	}
 	c := newPodGroupClient(t, isvc, legacy)
 
-	if err := EnsurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 	got := &schedulingv1alpha1.PodGroup{}
@@ -552,14 +550,8 @@ func TestEnsurePodGroup_TransientGetErrorSurfaces(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	base := newPodGroupClient(t, isvc)
 	boom := apierrors.NewServiceUnavailable("apiserver overloaded")
-	failing := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			if _, isPG := obj.(*schedulingv1alpha1.PodGroup); isPG {
-				return boom
-			}
-			return c.Get(ctx, key, obj, opts...)
-		},
-	})
+	failing := fakeclient.Wrap(t, base,
+		fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, boom).OnKind(&schedulingv1alpha1.PodGroup{}))
 	plan := workload.ComponentPlan{
 		Component:            workload.ComponentEngine,
 		InstanceReadyTimeout: 3 * time.Minute,
@@ -573,7 +565,7 @@ func TestEnsurePodGroup_TransientGetErrorSurfaces(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{query.LabelRunner: "worker"}},
 	}}
 
-	_, err := ensurePodGroupForPods(context.Background(), failing, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, pods)
+	_, err := EnsurePodGroupForPods(context.Background(), failing, failing, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, pods)
 	if err == nil {
 		t.Fatal("expected error from failing Get")
 	}
@@ -714,7 +706,7 @@ func TestEnsurePodGroup_Idempotent(t *testing.T) {
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 2}}}
 
 	for i := 0; i < 2; i++ {
-		if err := EnsurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+		if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 			t.Fatalf("EnsurePodGroup pass %d: %v", i, err)
 		}
 	}
@@ -736,7 +728,7 @@ func TestEnsurePodGroup_Idempotent(t *testing.T) {
 // touching the write path (no Create/Update/Patch).
 func TestEnsurePodGroup_FastPathReadsBeforeWriteAndSkipsNoDrift(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
-	cc := newCountingClient(newPodGroupClient(t, isvc))
+	store := newPodGroupClient(t, isvc)
 	plan := workload.ComponentPlan{
 		Component:            workload.ComponentEngine,
 		InstanceReadyTimeout: 5 * time.Minute,
@@ -746,42 +738,43 @@ func TestEnsurePodGroup_FastPathReadsBeforeWriteAndSkipsNoDrift(t *testing.T) {
 
 	// First ensure: object absent -> must be created. The fast path runs
 	// its NotFound probe Get before the direct Create, so we expect one Get
-	// and exactly one Create.
-	cc.reset()
-	if err := EnsurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	// and exactly one Create. Each ensure runs through its own counted view
+	// of the store, so a phase counts only its own calls.
+	cc, calls := countedClient(t, store)
+	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup (create): %v", err)
 	}
-	if cc.creates != 1 {
-		t.Errorf("create ensure: Create count = %d, want 1", cc.creates)
+	if calls.creates.Count() != 1 {
+		t.Errorf("create ensure: Create count = %d, want 1", calls.creates.Count())
 	}
-	if cc.gets != 1 {
-		t.Errorf("create ensure: Get count = %d, want 1 fast-path probe", cc.gets)
+	if calls.gets.Count() != 1 {
+		t.Errorf("create ensure: Get count = %d, want 1 fast-path probe", calls.gets.Count())
 	}
 
 	// Add an unrelated annotation between passes. It is outside this
 	// controller's field ownership, so it must neither trigger a write nor be
 	// removed by the next ensure.
 	seeded := &schedulingv1alpha1.PodGroup{}
-	if err := cc.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: "llama-engine-0"}, seeded); err != nil {
+	if err := store.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: "llama-engine-0"}, seeded); err != nil {
 		t.Fatalf("get before adding unrelated annotation: %v", err)
 	}
 	seeded.Annotations["example.com/preserve"] = "yes"
-	if err := cc.Update(context.Background(), seeded); err != nil {
+	if err := store.Update(context.Background(), seeded); err != nil {
 		t.Fatalf("add unrelated annotation: %v", err)
 	}
 
 	// Second ensure: all owned fields match desired -> the fast path must
 	// short-circuit after a single Get with NO write.
-	cc.reset()
-	if err := EnsurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	cc, calls = countedClient(t, store)
+	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup (no-drift): %v", err)
 	}
-	if cc.creates != 0 || cc.updates != 0 || cc.patches != 0 {
+	if calls.writes() != 0 {
 		t.Errorf("no-drift ensure issued a write: creates=%d updates=%d patches=%d, want all 0",
-			cc.creates, cc.updates, cc.patches)
+			calls.creates.Count(), calls.updates.Count(), calls.patches.Count())
 	}
-	if cc.gets != 1 {
-		t.Errorf("no-drift ensure: Get count = %d, want 1 (fast-path probe only, no write)", cc.gets)
+	if calls.gets.Count() != 1 {
+		t.Errorf("no-drift ensure: Get count = %d, want 1 (fast-path probe only, no write)", calls.gets.Count())
 	}
 
 	// Sanity: the PodGroup that survives the no-drift pass still carries
@@ -816,22 +809,21 @@ func TestEnsurePodGroup_DriftStillWrites(t *testing.T) {
 			ScheduleTimeoutSeconds: int32Ptr(9999),
 		},
 	}
-	cc := newCountingClient(newPodGroupClient(t, isvc, stale))
+	cc, calls := countedClient(t, newPodGroupClient(t, isvc, stale))
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 2}}}
 
-	cc.reset()
-	if err := EnsurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err != nil {
+	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
 		t.Fatalf("EnsurePodGroup (drift): %v", err)
 	}
-	if cc.updates+cc.patches+cc.creates == 0 {
+	if calls.writes() == 0 {
 		t.Errorf("drift ensure issued no write (creates=%d updates=%d patches=%d): fast path swallowed a real drift",
-			cc.creates, cc.updates, cc.patches)
+			calls.creates.Count(), calls.updates.Count(), calls.patches.Count())
 	}
 }
 
 // ---------------------------------------------------------------------
-// deletePodGroup — explicit removal path (scale-down / migration).
+// FinalizePodGroup — removal by name, the path without an inventory.
 // ---------------------------------------------------------------------
 
 func TestDeletePodGroup_Removes(t *testing.T) {
@@ -842,8 +834,8 @@ func TestDeletePodGroup_Removes(t *testing.T) {
 	}
 	c := newPodGroupClient(t, isvc, existing)
 
-	if err := deletePodGroup(context.Background(), c, isvc, isvc.GetName(), workload.ComponentEngine, 0); err != nil {
-		t.Fatalf("deletePodGroup: %v", err)
+	if _, err := FinalizePodGroup(context.Background(), c, c, isvc, isvc.GetName(), workload.ComponentEngine, 0); err != nil {
+		t.Fatalf("FinalizePodGroup: %v", err)
 	}
 	got := &schedulingv1alpha1.PodGroup{}
 	err := c.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: "llama-engine-0"}, got)
@@ -855,8 +847,8 @@ func TestDeletePodGroup_Removes(t *testing.T) {
 func TestDeletePodGroup_AbsentIsNoOp(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	c := newPodGroupClient(t, isvc)
-	if err := deletePodGroup(context.Background(), c, isvc, isvc.GetName(), workload.ComponentEngine, 7); err != nil {
-		t.Errorf("deletePodGroup on absent PodGroup should be no-op, got %v", err)
+	if _, err := FinalizePodGroup(context.Background(), c, c, isvc, isvc.GetName(), workload.ComponentEngine, 7); err != nil {
+		t.Errorf("FinalizePodGroup on absent PodGroup should be no-op, got %v", err)
 	}
 }
 
@@ -910,14 +902,10 @@ func TestDeleteObservedPodGroup_RuntimeAPIRemovalIsAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
-	base := newPodGroupClient(t, isvc, pg)
-	c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
-			return &apimeta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{
-				Group: "scheduling.x-k8s.io", Version: "v1alpha1", Resource: "podgroups",
-			}}
-		},
-	})
+	c := fakeclient.Wrap(t, newPodGroupClient(t, isvc, pg), fakeclient.FailingVerb(fakeclient.Delete, fakeclient.EveryCall,
+		&apimeta.NoResourceMatchError{PartialResource: schema.GroupVersionResource{
+			Group: "scheduling.x-k8s.io", Version: "v1alpha1", Resource: "podgroups",
+		}}))
 	if err := DeleteObservedPodGroup(context.Background(), c, isvc.UID, pg); err != nil {
 		t.Fatalf("runtime PodGroup API removal must be treated as absence: %v", err)
 	}
@@ -939,22 +927,19 @@ func TestDeleteObservedPodGroup_UIDPreconditionProtectsNameReuse(t *testing.T) {
 	replacement := observed.DeepCopy()
 	replacement.UID = "replacement-pg-uid"
 	base := newPodGroupClient(t, isvc, replacement)
-	sawUIDPrecondition := false
-	c := interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		Delete: func(_ context.Context, _ client.WithWatch, _ client.Object, opts ...client.DeleteOption) error {
-			for _, opt := range opts {
-				preconditions, ok := opt.(client.Preconditions)
-				if ok && preconditions.UID != nil && *preconditions.UID == observed.UID {
-					sawUIDPrecondition = true
-				}
-			}
-			return errors.New("simulated UID precondition conflict")
-		},
-	})
+	deletes := fakeclient.CountingVerb(fakeclient.Delete)
+	c := fakeclient.Wrap(t, base, deletes,
+		fakeclient.FailingVerb(fakeclient.Delete, fakeclient.EveryCall, errors.New("simulated UID precondition conflict")))
 
 	complete, err := FinalizeObservedPodGroup(context.Background(), c, isvc.UID, observed)
 	if err == nil || complete {
 		t.Fatal("stale inventory delete unexpectedly passed the UID precondition")
+	}
+	sawUIDPrecondition := false
+	for _, opts := range fakeclient.OptionsOf[client.DeleteOptions](deletes) {
+		if opts.Preconditions != nil && opts.Preconditions.UID != nil && *opts.Preconditions.UID == observed.UID {
+			sawUIDPrecondition = true
+		}
 	}
 	if !sawUIDPrecondition {
 		t.Fatal("delete did not carry the observed PodGroup UID precondition")
@@ -990,42 +975,32 @@ func newPodGroupISVC(ns, name string) *v1beta1.InferenceService {
 	}
 }
 
-// countingClient wraps a client.Client (via an interceptor) and tallies
-// the Get / Create / Update / Patch calls EnsurePodGroup makes, so a
-// test can prove the steady-state fast path reads before writing and
-// skips the write path entirely on no drift. reset() zeroes the
-// counters between phases of a single test.
-type countingClient struct {
-	client.Client
-	gets, creates, updates, patches int
+// verbCalls tallies the Get / Create / Update / Patch calls EnsurePodGroup
+// makes, so a test can prove the steady-state fast path reads before
+// writing and skips the write path entirely on no drift.
+type verbCalls struct {
+	gets, creates, updates, patches *fakeclient.Calls
 }
 
-func newCountingClient(base client.Client) *countingClient {
-	cc := &countingClient{}
-	cc.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
-		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-			cc.gets++
-			return c.Get(ctx, key, obj, opts...)
-		},
-		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-			cc.creates++
-			return c.Create(ctx, obj, opts...)
-		},
-		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
-			cc.updates++
-			return c.Update(ctx, obj, opts...)
-		},
-		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			cc.patches++
-			return c.Patch(ctx, obj, patch, opts...)
-		},
-	})
-	return cc
+// countedClient layers one counter per verb over base, so a test reads the
+// store through base and counts what one ensure did through the view.
+func countedClient(t *testing.T, base client.WithWatch) (client.WithWatch, verbCalls) {
+	t.Helper()
+	n := verbCalls{
+		gets:    fakeclient.CountingVerb(fakeclient.Get),
+		creates: fakeclient.CountingVerb(fakeclient.Create),
+		updates: fakeclient.CountingVerb(fakeclient.Update),
+		patches: fakeclient.CountingVerb(fakeclient.Patch),
+	}
+	return fakeclient.Wrap(t, base, n.gets, n.creates, n.updates, n.patches), n
 }
 
-func (cc *countingClient) reset() { cc.gets, cc.creates, cc.updates, cc.patches = 0, 0, 0, 0 }
+// writes is the number of Create, Update and Patch calls the view saw.
+func (n verbCalls) writes() int {
+	return n.creates.Count() + n.updates.Count() + n.patches.Count()
+}
 
-func newPodGroupClient(t *testing.T, objs ...client.Object) client.Client {
+func newPodGroupClient(t *testing.T, objs ...client.Object) client.WithWatch {
 	t.Helper()
 	var owner client.Object
 	for _, obj := range objs {
@@ -1043,17 +1018,9 @@ func newPodGroupClient(t *testing.T, objs ...client.Object) client.Client {
 			pg.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(owner, testPodGroupOwnerGVK)}
 		}
 	}
-	scheme := runtime.NewScheme()
-	if err := v1beta1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add v1beta1 to scheme: %v", err)
-	}
-	if err := schedulingv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add scheduling/v1alpha1 to scheme: %v", err)
-	}
-	return fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(objs...).
-		Build()
+	return fakeclient.New(t,
+		fakeclient.WithTypes(schedulingv1alpha1.AddToScheme),
+		fakeclient.WithObjects(objs...))
 }
 
 func int32Ptr(n int32) *int32 { return &n }

@@ -51,6 +51,11 @@ webhooks:
     name: inferenceservice.ome-webhook-server.validator
     sideEffects: None
     admissionReviewVersions: ["v1beta1"]
+    # Skip on objects already being deleted: finalizer-only patches
+    # shouldn't trigger spec-invariant checks (would deadlock GC).
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
     rules:
       - apiGroups:
           - ome.io
@@ -78,6 +83,11 @@ webhooks:
     name: clusterservingruntime.ome-webhook-server.validator
     sideEffects: None
     admissionReviewVersions: ["v1beta1"]
+    # Skip on objects already being deleted: finalizer-only patches
+    # shouldn't trigger spec-invariant checks (would deadlock GC).
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
     rules:
       - apiGroups:
           - ome.io
@@ -88,36 +98,6 @@ webhooks:
           - UPDATE
         resources:
           - clusterservingruntimes
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  creationTimestamp: null
-  name: controllerrevision-immutability.ome.io
-webhooks:
-  - clientConfig:
-      caBundle: Cg==
-      service:
-        name: $(webhookServiceName)
-        namespace: $(omeNamespace)
-        path: /validate-apps-v1-controllerrevision
-    failurePolicy: Ignore
-    name: controllerrevision-immutability.ome-webhook-server.validator
-    namespaceSelector:
-      matchLabels:
-        kubernetes.io/metadata.name: $(omeNamespace)
-    sideEffects: None
-    timeoutSeconds: 5
-    admissionReviewVersions: ["v1"]
-    rules:
-      - apiGroups:
-          - apps
-        apiVersions:
-          - v1
-        operations:
-          - UPDATE
-        resources:
-          - controllerrevisions
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -135,6 +115,11 @@ webhooks:
     name: servingruntime.ome-webhook-server.validator
     sideEffects: None
     admissionReviewVersions: ["v1beta1"]
+    # Skip on objects already being deleted: finalizer-only patches
+    # shouldn't trigger spec-invariant checks (would deadlock GC).
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
     rules:
       - apiGroups:
           - ome.io
@@ -145,33 +130,6 @@ webhooks:
           - UPDATE
         resources:
           - servingruntimes
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingWebhookConfiguration
-metadata:
-  creationTimestamp: null
-  name: benchmarkjob.ome.io
-webhooks:
-  - clientConfig:
-      caBundle: Cg==
-      service:
-        name: $(webhookServiceName)
-        namespace: $(omeNamespace)
-        path: /validate-ome-io-v1beta1-benchmarkjob
-    failurePolicy: Fail
-    name: benchmarkjob.ome-webhook-server.validator
-    sideEffects: None
-    admissionReviewVersions: ["v1beta1"]
-    rules:
-      - apiGroups:
-          - ome.io
-        apiVersions:
-          - v1beta1
-        operations:
-          - CREATE
-          - UPDATE
-        resources:
-          - benchmarkjobs
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
@@ -188,7 +146,12 @@ webhooks:
     failurePolicy: Fail
     name: basemodel.ome-webhook-server.validator
     sideEffects: None
-    admissionReviewVersions: ["v1beta1"]
+    admissionReviewVersions: ["v1"]
+    # Skip on objects already being deleted: finalizer-only patches
+    # shouldn't trigger spec-invariant checks (would deadlock GC).
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
     rules:
       - apiGroups:
           - ome.io
@@ -215,7 +178,12 @@ webhooks:
     failurePolicy: Fail
     name: clusterbasemodel.ome-webhook-server.validator
     sideEffects: None
-    admissionReviewVersions: ["v1beta1"]
+    admissionReviewVersions: ["v1"]
+    # Skip on objects already being deleted: finalizer-only patches
+    # shouldn't trigger spec-invariant checks (would deadlock GC).
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
     rules:
       - apiGroups:
           - ome.io
@@ -233,11 +201,14 @@ metadata:
   creationTimestamp: null
   name: inferencereplica.ome.io
 webhooks:
-  # InferenceReplica is a controller-only CRD: this webhook rejects
-  # direct user writes unless the ome.io/controller-write=true annotation
-  # is present (set by the ISVC controller's client on every write).
-  # See pkg/webhook/admission/inferencereplica/validator.go for the
-  # exact rejection rules.
+  # A projected InferenceReplica (owned by an InferenceService) accepts spec
+  # writes only from the controller identity configured in
+  # inferenceservice-config. With no identity configured the webhook accepts
+  # writes that carry the ome.io/controller-write=true annotation. A
+  # standalone replica is governed by RBAC, plus the standalone rules the
+  # webhook enforces (among them: no parentRef or placement fields, no
+  # colliding name, no manual migration). See
+  # pkg/webhook/admission/inferencereplica/validator.go for the rules.
   - clientConfig:
       caBundle: Cg==
       service:
@@ -264,3 +235,123 @@ webhooks:
           - UPDATE
         resources:
           - inferencereplicas
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  creationTimestamp: null
+  name: benchmarkjob.ome.io
+webhooks:
+  - clientConfig:
+      caBundle: Cg==
+      service:
+        name: $(webhookServiceName)
+        namespace: $(omeNamespace)
+        path: /validate-ome-io-v1beta1-benchmarkjob
+    failurePolicy: Fail
+    name: benchmarkjob.ome-webhook-server.validator
+    sideEffects: None
+    admissionReviewVersions: ["v1beta1"]
+    # Skip on objects already being deleted: finalizer-only patches
+    # shouldn't trigger spec-invariant checks (would deadlock GC).
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
+    rules:
+      - apiGroups:
+          - ome.io
+        apiVersions:
+          - v1beta1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - benchmarkjobs
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  creationTimestamp: null
+  name: servingruntime-preset.ome.io
+webhooks:
+  - clientConfig:
+      caBundle: Cg==
+      service:
+        name: $(webhookServiceName)
+        namespace: $(omeNamespace)
+        path: /mutate-ome-io-v1beta1-servingruntime-preset
+    failurePolicy: Fail
+    name: servingruntime.ome-webhook-server.preset
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
+    rules:
+      - apiGroups:
+          - ome.io
+        apiVersions:
+          - v1beta1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - servingruntimes
+  - clientConfig:
+      caBundle: Cg==
+      service:
+        name: $(webhookServiceName)
+        namespace: $(omeNamespace)
+        path: /mutate-ome-io-v1beta1-clusterservingruntime-preset
+    failurePolicy: Fail
+    name: clusterservingruntime.ome-webhook-server.preset
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
+    rules:
+      - apiGroups:
+          - ome.io
+        apiVersions:
+          - v1beta1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - clusterservingruntimes
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  creationTimestamp: null
+  name: controllerrevision-immutability.ome.io
+webhooks:
+  # Scoped to the OME namespace so StatefulSet/DaemonSet-owned
+  # ControllerRevisions in other namespaces are not gated by this
+  # webhook. Inside the OME ns, the handler additionally checks the
+  # ome.io/created-by annotation before rejecting Update.
+  - clientConfig:
+      caBundle: Cg==
+      service:
+        name: $(webhookServiceName)
+        namespace: $(omeNamespace)
+        path: /validate-apps-v1-controllerrevision
+    failurePolicy: Fail
+    name: controllerrevision-immutability.ome-webhook-server.validator
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: $(omeNamespace)
+    rules:
+      - apiGroups:
+          - "apps"
+        apiVersions:
+          - v1
+        operations:
+          - UPDATE
+        resources:
+          - controllerrevisions

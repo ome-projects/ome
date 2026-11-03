@@ -226,25 +226,10 @@ func ComponentPolicyRef(isvc *v1beta1.InferenceService, component v1beta1.Compon
 	if isvc == nil {
 		return nil
 	}
-	switch component {
-	case v1beta1.EngineComponent:
-		if isvc.Spec.Engine == nil {
-			return nil
-		}
-		return isvc.Spec.Engine.AutoscalerPolicyRef
-	case v1beta1.DecoderComponent:
-		if isvc.Spec.Decoder == nil {
-			return nil
-		}
-		return isvc.Spec.Decoder.AutoscalerPolicyRef
-	case v1beta1.RouterComponent:
-		if isvc.Spec.Router == nil {
-			return nil
-		}
-		return isvc.Spec.Router.AutoscalerPolicyRef
-	default:
-		return nil
+	if view := v1beta1.SpecOf(&isvc.Spec, component); view != nil {
+		return view.Extension.AutoscalerPolicyRef
 	}
+	return nil
 }
 
 // EnsureTriggerAuthentications materializes one KEDA TriggerAuthentication

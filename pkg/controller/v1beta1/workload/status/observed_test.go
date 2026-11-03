@@ -19,28 +19,28 @@ func TestRecordWaiting_IncumbentTokenIsKeptUnlessOutranked(t *testing.T) {
 	firstWriterWins := func(token, current string) bool { return current == "" || current == token }
 
 	w := newRowWriter(fixture.RowWithOperation(0, types.InstancePhaseUpdating))
-	entered, held, err := RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, nil)
+	entered, held, err := RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, nil, nil)
 	if err != nil || !entered || !held {
 		t.Fatalf("mark = entered:%v held:%v err:%v", entered, held, err)
 	}
-	entered, held, err = RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, nil)
+	entered, held, err = RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, nil, nil)
 	if err != nil || entered || !held {
 		t.Fatalf("re-mark = entered:%v held:%v err:%v — the edge fires once, the hold stands", entered, held, err)
 	}
 
 	noOwner := func(types.RowOwner) bool { return false }
-	_, held, err = RecordWaiting(context.Background(), w.input(now), 0, "QuotaExceeded", noOwner, firstWriterWins, nil)
+	_, held, err = RecordWaiting(context.Background(), w.input(now), 0, "QuotaExceeded", noOwner, firstWriterWins, nil, nil)
 	if err != nil || held {
 		t.Fatalf("an authority refused by its own owner rule must not hold: held=%v err=%v", held, err)
 	}
 
-	if err := ReleaseWaiting(context.Background(), w.input(now), 0, "QuotaExceeded"); err != nil {
+	if err := ReleaseWaiting(context.Background(), w.input(now), 0, "QuotaExceeded", false); err != nil {
 		t.Fatal(err)
 	}
 	if w.rows[0].Operation.Waiting != "Unschedulable" {
 		t.Fatal("releasing another authority's token must leave the incumbent alone")
 	}
-	if err := ReleaseWaiting(context.Background(), w.input(now), 0, "Unschedulable"); err != nil {
+	if err := ReleaseWaiting(context.Background(), w.input(now), 0, "Unschedulable", false); err != nil {
 		t.Fatal(err)
 	}
 	if w.rows[0].Operation.Waiting != "" {
@@ -65,7 +65,7 @@ func TestRecordWaiting_WaitReadingNeverReplacesAnExitRecord(t *testing.T) {
 
 	// A record naming no container is replaced by the wait's reading.
 	w := newRowWriter(fixture.RowWithOperation(0, types.InstancePhaseRestarting))
-	entered, held, err := RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, wait)
+	entered, held, err := RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, wait, nil)
 	if err != nil || !entered || !held {
 		t.Fatalf("mark = entered:%v held:%v err:%v", entered, held, err)
 	}
@@ -73,11 +73,11 @@ func TestRecordWaiting_WaitReadingNeverReplacesAnExitRecord(t *testing.T) {
 		t.Fatalf("lastFailure = %+v, want the wait's reading on a row with no exit record", got)
 	}
 	writes := w.writes
-	entered, held, err = RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, wait)
+	entered, held, err = RecordWaiting(context.Background(), w.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, wait, nil)
 	if err != nil || entered || !held || w.writes != writes {
 		t.Fatalf("re-mark = entered:%v held:%v writes:%d err:%v — the same wait writes nothing", entered, held, w.writes-writes, err)
 	}
-	if _, _, err := RecordWaiting(context.Background(), w.input(now), 0, "NodeUnknown", anyOwner, func(string, string) bool { return true }, laterWait); err != nil {
+	if _, _, err := RecordWaiting(context.Background(), w.input(now), 0, "NodeUnknown", anyOwner, func(string, string) bool { return true }, laterWait, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := w.rows[0].LastFailure; got == nil || got.Reason != "NodeUnknown" {
@@ -88,7 +88,7 @@ func TestRecordWaiting_WaitReadingNeverReplacesAnExitRecord(t *testing.T) {
 	row := fixture.RowWithOperation(1, types.InstancePhaseRestarting)
 	row.LastFailure = exit
 	w = newRowWriter(row)
-	entered, held, err = RecordWaiting(context.Background(), w.input(now), 1, "Unschedulable", anyOwner, firstWriterWins, wait)
+	entered, held, err = RecordWaiting(context.Background(), w.input(now), 1, "Unschedulable", anyOwner, firstWriterWins, wait, nil)
 	if err != nil || !entered || !held {
 		t.Fatalf("mark = entered:%v held:%v err:%v", entered, held, err)
 	}
@@ -99,11 +99,11 @@ func TestRecordWaiting_WaitReadingNeverReplacesAnExitRecord(t *testing.T) {
 		t.Fatalf("lastFailure = %+v, want the exit record kept as it was", got)
 	}
 	writes = w.writes
-	entered, held, err = RecordWaiting(context.Background(), w.input(now), 1, "Unschedulable", anyOwner, firstWriterWins, wait)
+	entered, held, err = RecordWaiting(context.Background(), w.input(now), 1, "Unschedulable", anyOwner, firstWriterWins, wait, nil)
 	if err != nil || entered || !held || w.writes != writes {
 		t.Fatalf("re-mark = entered:%v held:%v writes:%d err:%v — the kept record is not rewritten pass after pass", entered, held, w.writes-writes, err)
 	}
-	if err := ReleaseWaiting(context.Background(), w.input(now), 1, "Unschedulable"); err != nil {
+	if err := ReleaseWaiting(context.Background(), w.input(now), 1, "Unschedulable", false); err != nil {
 		t.Fatal(err)
 	}
 	if got := w.rows[1].LastFailure; got == nil || got.ContainerName != "main" {
@@ -257,5 +257,76 @@ func TestCrashLoopNote_RecordedOnceAndCleared(t *testing.T) {
 	}
 	if rows[2].Phase != types.InstancePhaseFailed {
 		t.Fatalf("the clear touches nothing but the message; row 2 = %+v", rows[2])
+	}
+}
+
+// TestRecordWaiting_PlacementSince_RecordedOnceWithTheHold: a placement
+// wait start rides on the hold's own write, is recorded once and kept
+// after, and is recorded even when another authority holds the token,
+// because the wait belongs to the attempt.
+func TestRecordWaiting_PlacementSince_RecordedOnceWithTheHold(t *testing.T) {
+	now := time.Date(2026, time.October, 22, 20, 15, 0, 0, time.UTC)
+	anyOwner := func(types.RowOwner) bool { return true }
+	firstWriterWins := func(token, current string) bool { return current == "" || current == token }
+	start := metav1.NewTime(now.Add(-time.Minute))
+	later := metav1.NewTime(now)
+
+	w := newRowWriter(fixture.RowWithOperation(0, types.InstancePhaseUpdating))
+	if _, _, err := RecordWaiting(context.Background(), w.input(now), 0, "NodeUnknown", anyOwner, firstWriterWins, nil, &start); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.rows[0].Operation.PlacementWaitSince; got == nil || !got.Equal(&start) || w.writes != 1 {
+		t.Fatalf("placement wait = %v after %d writes, want %v in the one write that records the hold", got, w.writes, start)
+	}
+	if _, _, err := RecordWaiting(context.Background(), w.input(now), 0, "NodeUnknown", anyOwner, firstWriterWins, nil, &later); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.rows[0].Operation.PlacementWaitSince; !got.Equal(&start) || w.writes != 1 {
+		t.Fatalf("placement wait = %v after %d writes, want the first start kept and no write", got, w.writes)
+	}
+
+	held := newRowWriter(fixture.RowWithOperation(0, types.InstancePhaseUpdating))
+	row := held.rows[0]
+	row.Operation.Waiting = "QuotaExceeded"
+	held.rows[0] = row
+	_, isHeld, err := RecordWaiting(context.Background(), held.input(now), 0, "Unschedulable", anyOwner, firstWriterWins, nil, &start)
+	if err != nil || isHeld {
+		t.Fatalf("held = %v err = %v, want the incumbent token kept", isHeld, err)
+	}
+	if got := held.rows[0].Operation; got.Waiting != "QuotaExceeded" || got.PlacementWaitSince == nil || !got.PlacementWaitSince.Equal(&start) {
+		t.Fatalf("operation = %+v, want the incumbent token kept and the start recorded", got)
+	}
+}
+
+// TestReleaseWaiting_ClearPlacement_RetiresTheWaitInTheSameWrite: the
+// release that ends a placement hold retires the attempt's placement wait
+// in its own write once every pod runs on a node; a plain release leaves
+// it.
+func TestReleaseWaiting_ClearPlacement_RetiresTheWaitInTheSameWrite(t *testing.T) {
+	now := time.Date(2026, time.October, 22, 20, 15, 0, 0, time.UTC)
+	start := metav1.NewTime(now.Add(-time.Hour))
+	seed := func() *rowWriter {
+		w := newRowWriter(fixture.RowWithOperation(0, types.InstancePhaseUpdating))
+		row := w.rows[0]
+		row.Operation.Waiting = "Unschedulable"
+		row.Operation.PlacementWaitSince = &start
+		w.rows[0] = row
+		return w
+	}
+
+	kept := seed()
+	if err := ReleaseWaiting(context.Background(), kept.input(now), 0, "Unschedulable", false); err != nil {
+		t.Fatal(err)
+	}
+	if got := kept.rows[0].Operation.PlacementWaitSince; got == nil {
+		t.Fatal("a plain release retired the placement wait")
+	}
+
+	cleared := seed()
+	if err := ReleaseWaiting(context.Background(), cleared.input(now), 0, "Unschedulable", true); err != nil {
+		t.Fatal(err)
+	}
+	if got := cleared.rows[0].Operation; got.Waiting != "" || got.PlacementWaitSince != nil || cleared.writes != 1 {
+		t.Fatalf("operation = %+v after %d writes, want the token and the placement wait retired in one write", got, cleared.writes)
 	}
 }

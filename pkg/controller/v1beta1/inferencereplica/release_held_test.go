@@ -2,6 +2,7 @@ package inferencereplica
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/onsi/gomega"
@@ -105,6 +106,35 @@ func TestConsumeReleaseHeld_FullNameReleasesHeldBlock(t *testing.T) {
 		"the event must name the released revision")
 	g.Expect(eventsContaining(events, "operator request")).NotTo(gomega.BeEmpty(),
 		"the event must say the release was operator-requested")
+}
+
+// The RetryHeld warning names the release annotation and the held revision.
+// Setting exactly that annotation releases the hold, so an operator who fixed
+// an outside cause can follow the warning without publishing a new revision.
+func TestWarnRetryHeld_RevisionHeld_NamedAnnotationReleasesTheHold(t *testing.T) {
+	g := gomega.NewWithT(t)
+	held := releaseIR("")
+	delete(held.Annotations, constants.ReleaseHeldRevisionAnnotationKey)
+	r, c, rec, ir := newReleaseFixture(t, held)
+
+	r.warnRetryHeldFunc(ir, ir)("llama-engine-aaaaaaaa", 3, "ImagePullBackOff")
+	warnings := eventsContaining(drainEvents(rec), string(workloadtypes.EventReasonRetryHeld))
+	g.Expect(warnings).To(gomega.HaveLen(1))
+	g.Expect(warnings[0]).NotTo(gomega.ContainSubstring("updateRetry"), "raising the retry limits does not release a Held block")
+	_, named, found := strings.Cut(warnings[0], constants.ReleaseHeldRevisionAnnotationKey+"=")
+	g.Expect(found).To(gomega.BeTrue(), "the warning must name the release annotation: %s", warnings[0])
+	value, _, _ := strings.Cut(named, " ")
+	g.Expect(value).To(gomega.Equal("llama-engine-aaaaaaaa"))
+
+	ir.Annotations[constants.ReleaseHeldRevisionAnnotationKey] = value
+	g.Expect(c.Update(context.Background(), ir)).To(gomega.Succeed())
+	_, err := r.consumeReleaseHeldRequest(context.Background(), r.Log, ir, nil, nil)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	fresh := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace}, fresh)).To(gomega.Succeed())
+	g.Expect(fresh.Status.RetryBlocks).To(gomega.HaveLen(1))
+	g.Expect(fresh.Status.RetryBlocks[0].TargetRevision).To(gomega.Equal("llama-engine-bbbbbbbb"),
+		"the named annotation must remove the Held block")
 }
 
 // TestConsumeReleaseHeld_BareHashMatches pins the bare-hash form: the

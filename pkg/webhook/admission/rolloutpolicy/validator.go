@@ -21,28 +21,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
-	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/validation"
+	"sigs.k8s.io/ome/pkg/webhook/admission/policyguard"
 )
 
 var log = logf.Log.WithName("rolloutpolicy-validation-webhook")
 
-// maxNamedReferencingISVCs caps how many referencing InferenceServices the
-// in-use deletion error enumerates. The denial itself covers every consumer;
-// the cap only keeps the message readable when a policy serves a large fleet.
-const maxNamedReferencingISVCs = 10
+// maxNamedReferencingISVCs is the cap the shared guard puts on the
+// InferenceServices an in-use deletion denial names.
+const maxNamedReferencingISVCs = policyguard.MaxNamedReferences
 
 // +kubebuilder:webhook:verbs=create;update;delete,path=/validate-ome-io-v1beta1-rolloutpolicy,mutating=false,failurePolicy=fail,groups=ome.io,resources=rolloutpolicies,versions=v1beta1,name=rolloutpolicy.ome-webhook-server.validator,sideEffects=None,admissionReviewVersions=v1
 
@@ -74,9 +69,25 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 	case admissionv1.Update:
 		return v.validateUpdate(ctx, req)
 	case admissionv1.Delete:
-		return v.validateDelete(ctx, req)
+		return v.guard().ValidateDelete(ctx, req)
 	default:
 		return admission.Allowed("")
+	}
+}
+
+// guard binds the admission rules the policy kinds share to this kind.
+func (v *Validator) guard() policyguard.Guard[*v1beta1.RolloutPolicy] {
+	return policyguard.Guard[*v1beta1.RolloutPolicy]{
+		Client:  v.Client,
+		Decoder: v.Decoder,
+		Log:     log,
+		Kind:    validation.RolloutPolicyKind,
+		New:     func() *v1beta1.RolloutPolicy { return &v1beta1.RolloutPolicy{} },
+		ValidateSpec: func(policy *v1beta1.RolloutPolicy) error {
+			return validation.ValidateRolloutPolicySpec(&policy.Spec)
+		},
+		Referencing: v.referencingInferenceServices,
+		Referent:    "InferenceService",
 	}
 }
 
@@ -84,15 +95,9 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 // cluster-state-free spec validation, then the rendered-size cap. A non-nil
 // response short-circuits the caller.
 func (v *Validator) validateWrite(req admission.Request) (*v1beta1.RolloutPolicy, *admission.Response) {
-	policy := &v1beta1.RolloutPolicy{}
-	if err := v.Decoder.Decode(req, policy); err != nil {
-		log.Error(err, "Failed to decode RolloutPolicy", "name", req.Name, "namespace", req.Namespace)
-		response := admission.Errored(http.StatusBadRequest, err)
-		return nil, &response
-	}
-	if err := validation.ValidateRolloutPolicySpec(&policy.Spec); err != nil {
-		response := admission.Denied(err.Error())
-		return nil, &response
+	policy, earlyResponse := v.guard().ValidateWrite(req)
+	if earlyResponse != nil {
+		return nil, earlyResponse
 	}
 	if v.MaxPlanBytes > 0 {
 		raw, err := json.Marshal(policy.Spec)
@@ -148,92 +153,6 @@ func (v *Validator) validateUpdate(ctx context.Context, req admission.Request) a
 	return admission.Allowed("").WithWarnings(fmt.Sprintf(
 		"%d InferenceService(s) in this namespace reference RolloutPolicy %q; in-flight rollout runs keep their pinned plan, so this edit takes effect at each consumer's next run",
 		len(referencing), req.Name))
-}
-
-// validateDelete denies deletion while any InferenceService rollout group in
-// the namespace references the policy. Exemptions, each of which admits:
-// zero references; the break-glass annotation (set by a prior, reviewable
-// update); a terminating or absent namespace (teardown deletes objects in
-// arbitrary order and must not wedge); the policy itself already gone.
-func (v *Validator) validateDelete(ctx context.Context, req admission.Request) admission.Response {
-	policy, earlyResponse := v.deletedPolicy(ctx, req)
-	if earlyResponse != nil {
-		return *earlyResponse
-	}
-
-	// The break-glass key is the shared ome.io/allow-in-use-delete
-	// annotation, honored by every in-use-deletion guard in the API group.
-	if policy.Annotations[constants.AutoscalerPolicyAllowInUseDelete] == "true" {
-		return admission.Allowed(fmt.Sprintf("in-use deletion allowed by the %s annotation", constants.AutoscalerPolicyAllowInUseDelete))
-	}
-
-	namespace := &corev1.Namespace{}
-	if err := v.Client.Get(ctx, types.NamespacedName{Name: policy.Namespace}, namespace); err != nil {
-		if apierrors.IsNotFound(err) {
-			return admission.Allowed("namespace is gone; nothing can reference the policy")
-		}
-		log.Error(err, "Failed to get namespace for RolloutPolicy deletion", "name", policy.Name, "namespace", policy.Namespace)
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	if namespace.Status.Phase == corev1.NamespaceTerminating || !namespace.DeletionTimestamp.IsZero() {
-		return admission.Allowed("namespace is terminating; teardown deletes objects in arbitrary order")
-	}
-
-	referencing, err := v.referencingInferenceServices(ctx, policy.Namespace, policy.Name)
-	if err != nil {
-		log.Error(err, "Failed to list InferenceServices for RolloutPolicy deletion", "name", policy.Name, "namespace", policy.Namespace)
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	if len(referencing) == 0 {
-		return admission.Allowed("")
-	}
-
-	named := referencing
-	overflow := ""
-	if len(referencing) > maxNamedReferencingISVCs {
-		named = referencing[:maxNamedReferencingISVCs]
-		overflow = fmt.Sprintf(" and %d more", len(referencing)-maxNamedReferencingISVCs)
-	}
-	return admission.Denied(fmt.Sprintf(
-		"RolloutPolicy %q is referenced by %d InferenceService(s): %s%s; remove the refs first, or set the %s=%q annotation to force deletion",
-		policy.Name, len(referencing), strings.Join(named, ", "), overflow,
-		constants.AutoscalerPolicyAllowInUseDelete, "true",
-	))
-}
-
-// deletedPolicy materializes the policy under deletion. The API server
-// usually sends the object in OldObject, but a DELETE request may arrive
-// with an empty payload — then the policy is fetched by name, and a
-// NotFound admits outright (deleting an already-gone object must never
-// wedge). A non-nil response short-circuits the caller.
-func (v *Validator) deletedPolicy(ctx context.Context, req admission.Request) (*v1beta1.RolloutPolicy, *admission.Response) {
-	policy := &v1beta1.RolloutPolicy{}
-	if len(req.OldObject.Raw) > 0 {
-		if err := v.Decoder.DecodeRaw(req.OldObject, policy); err != nil {
-			log.Error(err, "Failed to decode RolloutPolicy under deletion", "name", req.Name, "namespace", req.Namespace)
-			response := admission.Errored(http.StatusBadRequest, err)
-			return nil, &response
-		}
-	} else {
-		if err := v.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Name}, policy); err != nil {
-			if apierrors.IsNotFound(err) {
-				response := admission.Allowed("policy is already gone")
-				return nil, &response
-			}
-			log.Error(err, "Failed to get RolloutPolicy under deletion", "name", req.Name, "namespace", req.Namespace)
-			response := admission.Errored(http.StatusInternalServerError, err)
-			return nil, &response
-		}
-	}
-	// The request coordinates are authoritative; a decoded object may lack
-	// them when the payload carries no metadata.
-	if policy.Name == "" {
-		policy.Name = req.Name
-	}
-	if policy.Namespace == "" {
-		policy.Namespace = req.Namespace
-	}
-	return policy, nil
 }
 
 // referencingInferenceServices lists every same-namespace InferenceService

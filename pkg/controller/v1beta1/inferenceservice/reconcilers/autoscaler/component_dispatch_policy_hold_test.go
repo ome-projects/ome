@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -187,4 +188,180 @@ func TestDispatchForRawComponent_HoldWithMissingDeploymentIsNoError(t *testing.T
 		Name:      componentMeta.Name,
 	}, hpa)
 	assert.True(t, apierrors.IsNotFound(err), "no default HPA may substitute a held policy, got %v", err)
+}
+
+// rawLastRenderedAnnotation returns the last-rendered annotation on the
+// component Deployment and whether it is present.
+func rawLastRenderedAnnotation(t *testing.T, cl client.Client, componentMeta metav1.ObjectMeta) (string, bool) {
+	t.Helper()
+	stored := &appsv1.Deployment{}
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{
+		Namespace: componentMeta.Namespace,
+		Name:      componentMeta.Name,
+	}, stored))
+	value, ok := stored.Annotations[constants.AutoscalerPolicyLastRendered]
+	return value, ok
+}
+
+// TestDispatchForRawComponent_PassWithoutPolicyDropsLastRendered checks that the
+// record only describes a scaler a policy rendered: an inline, default or
+// absent autoscaler removes it, and a later pass writes nothing more.
+func TestDispatchForRawComponent_PassWithoutPolicyDropsLastRendered(t *testing.T) {
+	cases := map[string]*v1beta1.ComponentAutoscaler{
+		"inline hpa":    rawDispatchHPAAutoscaler(),
+		"inline keda":   rawDispatchKEDAAutoscaler(),
+		"external":      {Class: v1beta1.AutoscalerExternal},
+		"no autoscaler": nil,
+	}
+	for name, block := range cases {
+		t.Run(name, func(t *testing.T) {
+			componentMeta := rawDispatchComponentMeta()
+			scheme := rawHoldScheme(t)
+			deployment := rawHoldDeployment(t, componentMeta.Namespace, componentMeta.Name, rawDispatchKEDAAutoscaler())
+			deployment.Annotations["unrelated"] = "kept"
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(deployment).Build()
+
+			input := RawDispatchInput{
+				Client:             cl,
+				Scheme:             scheme,
+				ISVC:               rawDispatchISVC(),
+				ComponentMeta:      componentMeta,
+				ResolvedAutoscaler: block,
+				ComponentExt:       rawDispatchComponentExt(),
+			}
+			deploymentKey := types.NamespacedName{Namespace: componentMeta.Namespace, Name: componentMeta.Name}
+			dispatch := func() *appsv1.Deployment {
+				t.Helper()
+				if err := DispatchForRawComponent(context.Background(), input); err != nil {
+					require.True(t, IsTransitionPending(err), "unexpected dispatch error: %v", err)
+				}
+				stored := &appsv1.Deployment{}
+				require.NoError(t, cl.Get(context.Background(), deploymentKey, stored))
+				return stored
+			}
+
+			first := dispatch()
+			_, ok := first.Annotations[constants.AutoscalerPolicyLastRendered]
+			assert.False(t, ok, "a pass whose scaler no policy rendered must drop the record")
+			assert.Equal(t, "kept", first.Annotations["unrelated"])
+
+			second := dispatch()
+			assert.Equal(t, first.ResourceVersion, second.ResourceVersion, "a pass with no record to drop leaves the Deployment untouched")
+		})
+	}
+}
+
+// TestDispatchForRawComponent_HoldAfterPolicyRefRemovedKeepsRunningHPA covers
+// policy A rendering a ScaledObject, the operator removing the ref so OME runs
+// its default HPA, and then a ref to a missing policy B: the hold keeps the
+// running HPA and never brings back policy A's ScaledObject.
+func TestDispatchForRawComponent_HoldAfterPolicyRefRemovedKeepsRunningHPA(t *testing.T) {
+	ctx := context.Background()
+	componentMeta := rawDispatchComponentMeta()
+	scheme := rawHoldScheme(t)
+	deployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: componentMeta.Namespace, Name: componentMeta.Name}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(deployment).Build()
+	base := RawDispatchInput{
+		Client:        cl,
+		Scheme:        scheme,
+		ISVC:          rawDispatchISVC(),
+		ComponentMeta: componentMeta,
+		ComponentExt:  rawDispatchComponentExt(),
+	}
+	dispatch := func(input RawDispatchInput) {
+		t.Helper()
+		if err := DispatchForRawComponent(ctx, input); err != nil {
+			require.True(t, IsTransitionPending(err), "unexpected dispatch error: %v", err)
+		}
+	}
+
+	policyA := base
+	policyA.ResolvedAutoscaler = rawDispatchKEDAAutoscaler()
+	policyA.PolicySourced = true
+	dispatch(policyA)
+	_, ok := rawLastRenderedAnnotation(t, cl, componentMeta)
+	require.True(t, ok, "a policy render is recorded")
+
+	refRemoved := base
+	refRemoved.ResolvedAutoscaler = &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerHPA}
+	for i := 0; i < 3; i++ {
+		dispatch(refRemoved)
+	}
+	soKey := types.NamespacedName{Namespace: componentMeta.Namespace, Name: utils.GetScaledObjectName(componentMeta.Name)}
+	require.True(t, apierrors.IsNotFound(cl.Get(ctx, soKey, &kedav1.ScaledObject{})), "the default HPA replaced policy A's ScaledObject")
+	hpaKey := types.NamespacedName{Namespace: componentMeta.Namespace, Name: componentMeta.Name}
+	before := &autoscalingv2.HorizontalPodAutoscaler{}
+	require.NoError(t, cl.Get(ctx, hpaKey, before))
+
+	hold := base
+	hold.PolicyHold = true
+	for i := 0; i < 3; i++ {
+		dispatch(hold)
+	}
+	assert.True(t, apierrors.IsNotFound(cl.Get(ctx, soKey, &kedav1.ScaledObject{})),
+		"a hold on a new broken ref must not bring back policy A's ScaledObject")
+	after := &autoscalingv2.HorizontalPodAutoscaler{}
+	require.NoError(t, cl.Get(ctx, hpaKey, after), "the running HPA keeps scaling through the hold")
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "the hold leaves the running HPA untouched")
+}
+
+// TestDispatchForRawComponent_HoldDuringSwitchToHPAKeepsPolicyScaledObject
+// covers policy A rendering a ScaledObject, the operator removing the ref while
+// KEDA still holds the ScaledObject, and then a ref to a missing policy B. The
+// HPA was never created, so the hold must keep policy A's ScaledObject rather
+// than leave the Deployment without any scaler.
+func TestDispatchForRawComponent_HoldDuringSwitchToHPAKeepsPolicyScaledObject(t *testing.T) {
+	ctx := context.Background()
+	componentMeta := rawDispatchComponentMeta()
+	scheme := rawHoldScheme(t)
+	deployment := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: componentMeta.Namespace, Name: componentMeta.Name}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(deployment).Build()
+	base := RawDispatchInput{
+		Client:        cl,
+		Scheme:        scheme,
+		ISVC:          rawDispatchISVC(),
+		ComponentMeta: componentMeta,
+		ComponentExt:  rawDispatchComponentExt(),
+	}
+	soKey := types.NamespacedName{Namespace: componentMeta.Namespace, Name: utils.GetScaledObjectName(componentMeta.Name)}
+	hpaKey := types.NamespacedName{Namespace: componentMeta.Namespace, Name: componentMeta.Name}
+
+	policyA := base
+	policyA.ResolvedAutoscaler = rawDispatchKEDAAutoscaler()
+	policyA.PolicySourced = true
+	require.NoError(t, DispatchForRawComponent(ctx, policyA))
+
+	// KEDA's finalizer keeps the ScaledObject until KEDA finishes deleting it.
+	so := &kedav1.ScaledObject{}
+	require.NoError(t, cl.Get(ctx, soKey, so))
+	so.Finalizers = []string{"finalizer.keda.sh"}
+	require.NoError(t, cl.Update(ctx, so))
+
+	refRemoved := base
+	refRemoved.ResolvedAutoscaler = &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerHPA}
+	err := DispatchForRawComponent(ctx, refRemoved)
+	require.True(t, IsTransitionPending(err), "the switch to the HPA waits for KEDA, got %v", err)
+	require.True(t, apierrors.IsNotFound(cl.Get(ctx, hpaKey, &autoscalingv2.HorizontalPodAutoscaler{})), "no HPA exists while KEDA deletes the ScaledObject")
+	_, ok := rawLastRenderedAnnotation(t, cl, componentMeta)
+	assert.True(t, ok, "a switch that has not put the HPA in place keeps the policy record")
+
+	hold := base
+	hold.PolicyHold = true
+	err = DispatchForRawComponent(ctx, hold)
+	require.True(t, err == nil || IsTransitionPending(err), "unexpected hold error: %v", err)
+
+	terminating := &kedav1.ScaledObject{}
+	require.NoError(t, cl.Get(ctx, soKey, terminating))
+	terminating.Finalizers = nil
+	require.NoError(t, cl.Update(ctx, terminating))
+	require.True(t, apierrors.IsNotFound(cl.Get(ctx, soKey, &kedav1.ScaledObject{})), "KEDA finished deleting the old ScaledObject")
+
+	for i := 0; i < 3; i++ {
+		err = DispatchForRawComponent(ctx, hold)
+		require.True(t, err == nil || IsTransitionPending(err), "unexpected hold error: %v", err)
+	}
+	restored := &kedav1.ScaledObject{}
+	require.NoError(t, cl.Get(ctx, soKey, restored), "the hold restores policy A's ScaledObject so the Deployment keeps a scaler")
+	assert.Equal(t, rawDispatchKEDAAutoscaler().Keda.Triggers, restored.Spec.Triggers)
+	assert.True(t, apierrors.IsNotFound(cl.Get(ctx, hpaKey, &autoscalingv2.HorizontalPodAutoscaler{})), "the hold creates no default HPA")
 }

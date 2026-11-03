@@ -24,13 +24,16 @@ func TestSplitRaisedOrMovedSharesEndThePause(t *testing.T) {
 	running := func(engines int32) map[v1beta1.ComponentType]int32 {
 		return map[v1beta1.ComponentType]int32{v1beta1.EngineComponent: engines, v1beta1.DecoderComponent: 6, v1beta1.RouterComponent: 2}
 	}
+	engineCap := &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Engine: ptr.To[int32](18)}}
 	for _, tt := range []struct {
 		name   string
+		split  *v1beta1.SplitSpec
 		change func(*v1beta1.InferenceService)
 		busy   map[v1beta1.ComponentType]int32
 		shares map[string]int32
 	}{
 		{name: "raised engine minimum", change: raise, busy: autoscaledAllBusy, shares: map[string]int32{"member-a": 8, "member-b": 8}},
+		{name: "raised engine minimum under an engine cap in split.maxPerCluster", split: engineCap, change: raise, busy: autoscaledAllBusy, shares: map[string]int32{"member-a": 8, "member-b": 8}},
 		{name: "raised engine minimum with 16 engines per member", change: raise, busy: running(16), shares: map[string]int32{"member-a": 8, "member-b": 8}},
 		{name: "raised split replicas", change: func(s *v1beta1.InferenceService) { s.Spec.Placement.Split.Replicas = ptr.To[int32](16) }, busy: autoscaledAllBusy, shares: map[string]int32{"member-a": 8, "member-b": 8}},
 		{name: "moved weights", change: move, busy: autoscaledAllBusy, shares: map[string]int32{"member-a": 8, "member-b": 4}},
@@ -38,6 +41,9 @@ func TestSplitRaisedOrMovedSharesEndThePause(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			f := autoscaledSplitFixture(t)
+			if tt.split != nil {
+				f = autoscaledSplitFixtureWith(t, tt.split)
+			}
 			changeAutoscaledSplit(t, f, tt.change)
 			paused := false
 			got := serveAutoscaledSplit(t, f, tt.busy, tt.busy, func(got *v1beta1.InferenceService) bool {
@@ -122,7 +128,7 @@ func TestSplitRaisedShareWaitsForNewReplicas(t *testing.T) {
 func TestSplitPauseWaitsForAStaleDecoderMinimum(t *testing.T) {
 	f := singleFixture(t, true)
 	f.source.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: 18}
+	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)}
 	f.source.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 2, "member-b": 1})
 	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(6), 36
 	f.source.Spec.Decoder.MinReplicas, f.source.Spec.Decoder.MaxReplicas = ptr.To(30), 180
@@ -210,5 +216,21 @@ func changeAutoscaledSplit(t *testing.T, f *backendFixture, change func(*v1beta1
 	change(source)
 	if err := f.reconciler.Update(t.Context(), source); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestSplitSharesInPlaceNeedAPrimaryCap: a share change stays in place only
+// under a cap on the primary component. A source that declares neither an
+// engine nor a decoder has no primary, so it has no such cap.
+func TestSplitSharesInPlaceNeedAPrimaryCap(t *testing.T) {
+	source := &v1beta1.InferenceService{
+		Spec: v1beta1.InferenceServiceSpec{Placement: &v1beta1.PlacementSpec{
+			Policy: v1beta1.PlacementPolicyClusterAffinity, Mode: v1beta1.PlacementModeSplit,
+			Split: &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Default: ptr.To[int32](18)}},
+		}},
+		Status: v1beta1.InferenceServiceStatus{Placement: &v1beta1.PlacementStatus{Plan: &v1beta1.PlacementPlanStatus{}}},
+	}
+	if splitSharesChangedInPlace(source, nil) {
+		t.Fatal("a source without a primary component changed its shares in place")
 	}
 }

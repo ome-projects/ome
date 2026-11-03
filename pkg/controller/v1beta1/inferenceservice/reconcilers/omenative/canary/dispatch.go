@@ -47,6 +47,11 @@ type DispatchDeps struct {
 	// startup). nil disables metric-gated steps (they hold), which keeps a
 	// controller without a configured sampler from advancing analysis steps ungated.
 	Sampler *Sampler
+	// StepSampler, when set, is what the executor reads the analysis gate
+	// from in place of Sampler: a source that answers in the pass with
+	// results dated by the caller's clock, as the replay driver scripts
+	// it. Production leaves it nil.
+	StepSampler stepSampler
 	// BundledPrometheusAddress and QueryTimeout come from the canaryAnalysis operator
 	// config (fetched per-reconcile by the controller), threaded to the sampler.
 	BundledPrometheusAddress string
@@ -266,7 +271,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 		SecondaryCapacityReady:    secondaryReady,
 		Secondaries:               secondaries,
 		Now:                       now,
-		Sampler:                   samplerOrNil(d.Sampler),
+		Sampler:                   d.sampler(),
 		Prometheus:                resolveCanarySource(d.Group, d.MetricProviders, d.DefaultProvider),
 		BundledPrometheusAddress:  d.BundledPrometheusAddress,
 		QueryTimeout:              d.QueryTimeout,
@@ -533,6 +538,16 @@ func secondaryRevisions(ctx context.Context, reads client.Reader, isvc *v1beta1.
 		out[comp] = m
 	}
 	return out, nil
+}
+
+// sampler is the source the executor reads the analysis gate from: the
+// step sampler a caller set, else the shared async sampler behind its nil
+// guard.
+func (d DispatchDeps) sampler() stepSampler {
+	if d.StepSampler != nil {
+		return d.StepSampler
+	}
+	return samplerOrNil(d.Sampler)
 }
 
 // samplerOrNil converts a possibly-nil *Sampler into the stepSampler interface,
@@ -868,9 +883,10 @@ func canaryRestartedAt(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, 
 }
 
 // primaryComponentOf is the externally-routed Component the canary group drives
-// its step machine through: router > engine > decoder, among the group's
-// Components. Secondary Components (a PD pair's engine/decoder) stage capacity,
-// gate the step, and publish the step's weight on their own revisions.
+// its step machine through: the group's role with the lowest primary rank
+// (router > engine > decoder). Secondary Components (a PD pair's
+// engine/decoder) stage capacity, gate the step, and publish the step's weight
+// on their own revisions.
 func primaryComponentOf(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
 	return rollout.PrimaryOf(g)
 }
@@ -878,19 +894,8 @@ func primaryComponentOf(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
 // componentExtension is a Component's declared replica bounds and lifecycle;
 // nil when the InferenceService does not declare the Component.
 func componentExtension(isvc *v1beta1.InferenceService, c v1beta1.ComponentType) *v1beta1.ComponentExtensionSpec {
-	switch c {
-	case v1beta1.EngineComponent:
-		if isvc.Spec.Engine != nil {
-			return &isvc.Spec.Engine.ComponentExtensionSpec
-		}
-	case v1beta1.DecoderComponent:
-		if isvc.Spec.Decoder != nil {
-			return &isvc.Spec.Decoder.ComponentExtensionSpec
-		}
-	case v1beta1.RouterComponent:
-		if isvc.Spec.Router != nil {
-			return &isvc.Spec.Router.ComponentExtensionSpec
-		}
+	if view := v1beta1.SpecOf(&isvc.Spec, c); view != nil {
+		return view.Extension
 	}
 	return nil
 }

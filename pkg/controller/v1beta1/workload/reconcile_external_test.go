@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
@@ -15945,16 +15946,16 @@ func TestSurgeAfterHandover_ReplacementLostWithSourceGoneThenRollbackRebuildsAtT
 // CreateContainerConfigError, so the repair drains the gang; version 2 is
 // pushed before the rebuild creates a pod, so the rebuild renders version 2
 // and the row records it as running before any pod of it serves. Version 1
-// is re-applied while that set starts. The set the roll then builds on
-// version 1 never serves either, since the key is still missing, and its
-// attempts fail one after another until the retry record holds the revision.
+// is re-applied while that set starts, and the repair replaces the set at
+// version 1 at once. The set it builds on version 1 never serves either,
+// since the key is still missing, so the repair stops on the failure and
+// waits for the configuration the pod needs.
 //
 // Once the version 2 pods are gone and a version 1 set stands, the row no
 // longer names version 2 as running. The Component's revision rollup, the
 // current revision the adapter publishes, never reports the rollback done
-// while a row names another revision, and the restore attempts that fail do
-// not close and reopen the rollout once per attempt: the rollup closes at
-// most once and stays closed.
+// while a row names another revision, and a broken restore does not close
+// and reopen the rollout: the rollup closes at most once and stays closed.
 func TestRollback_OverARebuildThatNeverServed_TheRowFollowsTheSetThatStandsAndTheRolloutClosesOnce(t *testing.T) {
 	const replicas = 2
 	const broken = int32(1)
@@ -16052,9 +16053,18 @@ func TestRollback_OverARebuildThatNeverServed_TheRowFollowsTheSetThatStandsAndTh
 			t.Fatalf("Instance 0 left %s during the rollback", h.revV1.Name)
 		}
 	}
-	if !h.runWithInvariant(60, func() bool { return h.heldOn(h.revV1.Name) }, invariant) {
-		h.dumpState("retries")
-		t.Fatalf("the restore attempts never reached Held on %s; closes=%d reopens=%d", h.revV1.Name, closes, reopens)
+	restoreStopped := func() bool {
+		row := h.instance(broken)
+		return row != nil && row.Phase == workloadtypes.InstancePhaseFailed &&
+			workloadtypes.ClaimOf(row) == workloadtypes.OwnerRestart && row.RunningRevision == h.revV1.Name &&
+			!h.livePodOnRevision(pushed) && h.sawEvent(workloadtypes.EventReasonRepairWaitingOnWorkload)
+	}
+	if !h.runWithInvariant(60, restoreStopped, invariant) {
+		h.dumpState("restore")
+		t.Fatalf("the repair's restore on %s never stopped on the missing key; closes=%d reopens=%d", h.revV1.Name, closes, reopens)
+	}
+	if !h.sawEvent(workloadtypes.EventReasonRestartRetargeted) {
+		t.Fatalf("the repair did not name the set it replaced at %s: %v", h.revV1.Name, h.events)
 	}
 	h.runWithInvariant(6, func() bool { return false }, invariant)
 	if h.livePodOnRevision(pushed) {
@@ -16068,5 +16078,263 @@ func TestRollback_OverARebuildThatNeverServed_TheRowFollowsTheSetThatStandsAndTh
 	}
 	if rollup != h.revV1.Name {
 		t.Fatalf("the rollup ends %q, want %s: a rollback whose Instance comes back broken reads landed with a Failed Instance", rollup, h.revV1.Name)
+	}
+}
+
+// podAtSlot is the live pod of Instance idx at the pod-name slot ordinal,
+// nil when none stands there.
+func (h *recoveryHarness) podAtSlot(idx, ordinal int32) *corev1.Pod {
+	for _, pod := range h.livePods() {
+		i, ok := query.InstanceIdxFromLabels(pod)
+		o, ok2 := query.PodOrdinalFromLabels(pod)
+		if ok && ok2 && i == idx && o == ordinal {
+			return pod
+		}
+	}
+	return nil
+}
+
+// TestSurgeRetry_EveryAttemptBuildsItsOwnReplacementAndCountsOnce shows
+// the retry of a surge whose replacement the kubelet cannot pull. Three
+// single-pod Instances roll one surge at a time; the first replacement
+// fails on its image and counts one failed attempt. Each time the
+// schedule comes due the retry deletes the pod the previous attempt failed
+// on and builds a fresh one, so the record counts the next attempt only
+// when that fresh pod has waited past its own grace: as many pods as
+// attempts, never the same pod twice, and the revision Holds at the
+// policy's bound with every source still serving.
+func TestSurgeRetry_EveryAttemptBuildsItsOwnReplacementAndCountsOnce(t *testing.T) {
+	h := newRecoveryHarnessFor(t, false, constants.MainContainerName)
+	h.replicas = 3
+	h.useRollingBudget(workloadtypes.UpdateStrategySurgeThenDrain)
+	if !h.run(60, func() bool { return h.settledOn(h.revV1, 3) }) {
+		h.dumpState("initial create")
+		t.Fatalf("initial create never settled on v1 for 3 Instances")
+	}
+
+	h.setTarget(h.revBad, badImage)
+	type counted struct {
+		attempts int32
+		pod      types.UID
+	}
+	var attempts []counted
+	var last int32
+	held := func() bool {
+		b := h.findBlock(h.revBad.Name)
+		return b != nil && b.State == workloadtypes.RetryBlockHeld
+	}
+	h.runWithInvariant(200, held, func() {
+		b := h.findBlock(h.revBad.Name)
+		if b == nil || b.AttemptsStarted == last {
+			return
+		}
+		last = b.AttemptsStarted
+		pod := h.podAtSlot(0, 1)
+		if pod == nil {
+			h.dumpState("attempt counted with no replacement")
+			t.Fatalf("attempt %d was counted with no replacement standing at the first Instance's surge slot", last)
+		}
+		attempts = append(attempts, counted{attempts: last, pod: pod.UID})
+		if serving := h.instancesServingOn(goodImage); serving != 3 {
+			h.dumpState("source left rotation")
+			t.Fatalf("attempt %d was counted with %d of 3 sources serving", last, serving)
+		}
+	})
+	if !held() {
+		h.dumpState("the schedule never ran out")
+		t.Fatalf("the revision never reached Held; attempts counted: %+v", attempts)
+	}
+	if want := int(h.retryPolicy.MaxAttempts); len(attempts) != want {
+		t.Fatalf("the record counted %d attempt(s), want %d: %+v", len(attempts), want, attempts)
+	}
+	for i := 1; i < len(attempts); i++ {
+		if attempts[i].pod == attempts[i-1].pod {
+			t.Fatalf("attempt %d was counted against the pod attempt %d already failed on (%s): a retry builds its own replacement", attempts[i].attempts, attempts[i-1].attempts, attempts[i].pod)
+		}
+	}
+}
+
+// TestSurgeRetry_AnotherInstancesFailedReplacementDoesNotHoldARebuildThatAddsNoPod
+// shows one side of a prefill/decode roll whose other side is held. Three
+// single-pod Instances roll one surge at a time with no Instance allowed
+// offline. The first replacement fails on its image and counts one failed
+// attempt; from then on the coordination gate refuses every surge start,
+// as it does while the other side of the pair reads Held. A scale-up adds
+// a fourth Instance, built on the same image and failing the same way. Its rebuild
+// replaces its own pod and adds none, so the surge slot the first
+// Instance's failed replacement holds is no reason to refuse it: the
+// rebuild runs each time the schedule comes due, the record counts it,
+// and the Component ends Held with that hold reported, instead of a
+// Budget hold naming the extra pod that nothing can release.
+func TestSurgeRetry_AnotherInstancesFailedReplacementDoesNotHoldARebuildThatAddsNoPod(t *testing.T) {
+	h := newRecoveryHarnessFor(t, false, constants.MainContainerName)
+	h.replicas = 3
+	h.retryPolicy = &workloadtypes.RetryPolicy{MaxAttempts: 3, InitialDelay: 20 * time.Second, MaxDelay: time.Minute, Multiplier: 2}
+	h.useRollingBudget(workloadtypes.UpdateStrategySurgeThenDrain)
+	if !h.run(60, func() bool { return h.settledOn(h.revV1, 3) }) {
+		h.dumpState("initial create")
+		t.Fatalf("initial create never settled on v1 for 3 Instances")
+	}
+
+	h.setTarget(h.revBad, badImage)
+	firstFailed := func() bool {
+		b, s := h.findBlock(h.revBad.Name), h.instance(0)
+		return b != nil && b.AttemptsStarted == 1 && s != nil && s.Phase == workloadtypes.InstancePhaseFailed
+	}
+	if !h.run(30, firstFailed) {
+		h.dumpState("first attempt")
+		t.Fatalf("the first surge never failed on the image")
+	}
+	// The other side of the pair is held, so every surge start is refused
+	// from here on; a rebuild that adds no pod is not a surge start.
+	h.gate = func(_ string, strategy workloadtypes.UpdateStrategyType, _, _ int32) (bool, workloadtypes.RolloutHoldGate, string) {
+		if strategy == workloadtypes.UpdateStrategySurgeThenDrain {
+			return false, workloadtypes.RolloutHoldGateHeld, "engine batch 2 waits for decoder batch 2 to serve first, and the decoder is held"
+		}
+		return true, "", ""
+	}
+	h.replicas = 4
+	h.setTarget(h.revBad, badImage)
+	fourthFailed := func() bool {
+		s := h.instance(3)
+		return s != nil && s.Phase == workloadtypes.InstancePhaseFailed && h.podAtSlot(3, 0) != nil
+	}
+	if !h.run(60, fourthFailed) {
+		h.dumpState("fourth Instance")
+		t.Fatalf("the fourth Instance was never built and failed on the image")
+	}
+	first := h.podAtSlot(3, 0).UID
+	mark := len(h.holds)
+	lastHold := func() *workloadtypes.RolloutHold {
+		if len(h.holds) == 0 {
+			return nil
+		}
+		return &h.holds[len(h.holds)-1]
+	}
+
+	rebuilt := func() bool {
+		pod := h.podAtSlot(3, 0)
+		return pod != nil && pod.UID != first
+	}
+	if !h.run(40, rebuilt) {
+		h.dumpState("the rebuild never ran")
+		t.Fatalf("the fourth Instance's rebuild never opened while the first Instance's failed replacement stood; the last hold reads %+v", lastHold())
+	}
+	for _, hold := range h.holds[mark:] {
+		if hold.Gate == workloadtypes.RolloutHoldGateBudget && strings.Contains(hold.Reason, "holds a surge slot") {
+			t.Fatalf("the rebuild of a pod set that serves nothing was held on the slot another Instance's failed replacement holds: %q", hold.Reason)
+		}
+	}
+
+	held := func() bool {
+		b := h.findBlock(h.revBad.Name)
+		return b != nil && b.State == workloadtypes.RetryBlockHeld
+	}
+	if !h.run(200, held) {
+		h.dumpState("the schedule never ran out")
+		t.Fatalf("the revision never reached Held once the rebuilds ran")
+	}
+	h.settle(2)
+	if hold := lastHold(); hold == nil || hold.Gate != workloadtypes.RolloutHoldGateHeld {
+		t.Fatalf("the Component must report the Held hold once the schedule ran out, got %+v", hold)
+	}
+}
+
+// TestSurgeRetry_AnotherInstancesFailedReplacementDoesNotHoldTheNextRebuildEither
+// is the story above with one attempt more on the schedule. The fourth
+// Instance's first rebuild fails on the image too, so its attempt stops
+// with the pod it could not start still standing. The next rebuild
+// replaces that pod in place: it adds no pod and takes
+// nothing out of service, so the slot the first Instance's failed
+// replacement holds is no reason to refuse it, exactly as it was none for
+// the rebuild before it. The schedule then runs out and the revision
+// reads Held.
+func TestSurgeRetry_AnotherInstancesFailedReplacementDoesNotHoldTheNextRebuildEither(t *testing.T) {
+	h := newRecoveryHarnessFor(t, false, constants.MainContainerName)
+	h.replicas = 3
+	h.retryPolicy = &workloadtypes.RetryPolicy{MaxAttempts: 4, InitialDelay: 20 * time.Second, MaxDelay: time.Minute, Multiplier: 2}
+	h.useRollingBudget(workloadtypes.UpdateStrategySurgeThenDrain)
+	if !h.run(60, func() bool { return h.settledOn(h.revV1, 3) }) {
+		h.dumpState("initial create")
+		t.Fatalf("initial create never settled on v1 for 3 Instances")
+	}
+
+	h.setTarget(h.revBad, badImage)
+	firstFailed := func() bool {
+		b, s := h.findBlock(h.revBad.Name), h.instance(0)
+		return b != nil && b.AttemptsStarted == 1 && s != nil && s.Phase == workloadtypes.InstancePhaseFailed
+	}
+	if !h.run(30, firstFailed) {
+		h.dumpState("first attempt")
+		t.Fatalf("the first surge never failed on the image")
+	}
+	// The other side of the pair is held, so every surge start is refused
+	// from here on; a rebuild that adds no pod is not a surge start.
+	h.gate = func(_ string, strategy workloadtypes.UpdateStrategyType, _, _ int32) (bool, workloadtypes.RolloutHoldGate, string) {
+		if strategy == workloadtypes.UpdateStrategySurgeThenDrain {
+			return false, workloadtypes.RolloutHoldGateHeld, "engine batch 2 waits for decoder batch 2 to serve first, and the decoder is held"
+		}
+		return true, "", ""
+	}
+	h.replicas = 4
+	h.setTarget(h.revBad, badImage)
+	fourthFailed := func() bool {
+		s := h.instance(3)
+		return s != nil && s.Phase == workloadtypes.InstancePhaseFailed && h.podAtSlot(3, 0) != nil
+	}
+	if !h.run(60, fourthFailed) {
+		h.dumpState("fourth Instance")
+		t.Fatalf("the fourth Instance was never built and failed on the image")
+	}
+	first := h.podAtSlot(3, 0).UID
+	mark := len(h.holds)
+	lastHold := func() *workloadtypes.RolloutHold {
+		if len(h.holds) == 0 {
+			return nil
+		}
+		return &h.holds[len(h.holds)-1]
+	}
+
+	rebuiltOnce := func() bool {
+		pod := h.podAtSlot(3, 0)
+		return pod != nil && pod.UID != first
+	}
+	if !h.run(40, rebuiltOnce) {
+		h.dumpState("the first rebuild never ran")
+		t.Fatalf("the fourth Instance's first rebuild never opened while the first Instance's failed replacement stood; the last hold reads %+v", lastHold())
+	}
+	second := h.podAtSlot(3, 0).UID
+	attemptStopped := func() bool {
+		return workloadtypes.OperationParked(h.instance(3).Operation)
+	}
+	if !h.run(60, attemptStopped) {
+		h.dumpState("the first rebuild never stopped")
+		t.Fatalf("the fourth Instance's first rebuild never failed on the image and stopped")
+	}
+	rebuiltTwice := func() bool {
+		pod := h.podAtSlot(3, 0)
+		return pod != nil && pod.UID != first && pod.UID != second
+	}
+	if !h.run(200, rebuiltTwice) {
+		h.dumpState("the second rebuild never ran")
+		t.Fatalf("the fourth Instance's second rebuild never opened while the first Instance's failed replacement stood; the last hold reads %+v", lastHold())
+	}
+	for _, hold := range h.holds[mark:] {
+		if hold.Gate == workloadtypes.RolloutHoldGateBudget && strings.Contains(hold.Reason, "holds a surge slot") {
+			t.Fatalf("the rebuild of a pod set that serves nothing was held on the slot another Instance's failed replacement holds: %q", hold.Reason)
+		}
+	}
+
+	held := func() bool {
+		b := h.findBlock(h.revBad.Name)
+		return b != nil && b.State == workloadtypes.RetryBlockHeld
+	}
+	if !h.run(200, held) {
+		h.dumpState("the schedule never ran out")
+		t.Fatalf("the revision never reached Held once the rebuilds ran")
+	}
+	h.settle(2)
+	if hold := lastHold(); hold == nil || hold.Gate != workloadtypes.RolloutHoldGateHeld {
+		t.Fatalf("the Component must report the Held hold once the schedule ran out, got %+v", hold)
 	}
 }

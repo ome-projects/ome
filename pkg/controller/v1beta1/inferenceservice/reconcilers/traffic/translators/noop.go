@@ -22,12 +22,13 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic/status"
 )
 
 // NoopName is the stable identifier the factory uses for log / metric
-// labels and that the reconciler matches on to surface the
-// NoTranslatorAvailable condition.
-const NoopName = "noop"
+// labels. The status writer matches on it to surface the
+// NoTranslatorAvailable condition, so it reads the writer's constant.
+const NoopName = status.NoopTranslatorName
 
 // Noop is the translator the factory falls back to when no supported
 // Gateway-implementation backend policy CRD is installed.

@@ -17,7 +17,7 @@ func AppendOverlayVolumes(p *Piece, overlays []isvcutils.ResolvedOverlay, podSpe
 		return
 	}
 	for _, ov := range overlays {
-		if vol, ok := overlayVolume(ov); ok {
+		if vol, _, ok := overlaySource(ov); ok {
 			podSpec.Volumes = utils.AppendVolumeIfNotExists(podSpec.Volumes, vol)
 		}
 	}
@@ -28,7 +28,7 @@ func AppendOverlayVolumeMounts(p *Piece, overlays []isvcutils.ResolvedOverlay, c
 		return
 	}
 	for _, ov := range overlays {
-		if vm, ok := overlayVolumeMount(ov); ok {
+		if _, vm, ok := overlaySource(ov); ok {
 			isvcutils.AppendVolumeMount(container, &vm)
 		}
 	}
@@ -75,7 +75,7 @@ func MountedOverlaySummary(overlays []isvcutils.ResolvedOverlay) []v1beta1.Mount
 			EnvVar:       isvcutils.OverlayEnvVarName(ov.Ref.Name),
 			Distribution: overlayDistributionString(ov.Spec),
 		}
-		if vm, ok := overlayVolumeMount(ov); ok {
+		if _, vm, ok := overlaySource(ov); ok {
 			entry.MountPath = vm.MountPath
 		}
 		out = append(out, entry)
@@ -111,49 +111,23 @@ func overlayEffectivePath(ov isvcutils.ResolvedOverlay) (string, bool) {
 	return isvcutils.OverlayMountPath(ov.Ref.Name), true
 }
 
-func overlayVolume(ov isvcutils.ResolvedOverlay) (corev1.Volume, bool) {
-	if ov.Skipped() || ov.Spec == nil || ov.Spec.Storage == nil || isvcutils.IsShardedBaseModel(ov.Spec) {
-		return corev1.Volume{}, false
+// overlaySource is the volume holding an overlay's bytes and its read-only
+// mount under the overlay mount prefix: a claim with its sub-path, or a host
+// path. ok is false for a skipped overlay, one without storage, and one whose
+// bytes the runtime fetches by storage URI instead of a mount (see
+// overlayEffectivePath).
+func overlaySource(ov isvcutils.ResolvedOverlay) (corev1.Volume, corev1.VolumeMount, bool) {
+	if ov.Skipped() || ov.Spec.Storage == nil || isvcutils.IsShardedBaseModel(ov.Spec) {
+		return corev1.Volume{}, corev1.VolumeMount{}, false
 	}
-	if pvc := parsePVCStorage(ov.Spec.Storage); pvc != nil {
-		return corev1.Volume{
-			Name: overlayVolumeName(ov.Ref.Name),
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: pvc.PVCName,
-					ReadOnly:  true,
-				},
-			},
-		}, true
+	source, subPath, ok := storageSource(ov.Spec.Storage)
+	if !ok {
+		return corev1.Volume{}, corev1.VolumeMount{}, false
 	}
-	if ov.Spec.Storage.Path != nil {
-		return corev1.Volume{
-			Name: overlayVolumeName(ov.Ref.Name),
-			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{Path: *ov.Spec.Storage.Path},
-			},
-		}, true
-	}
-	return corev1.Volume{}, false
-}
-
-func overlayVolumeMount(ov isvcutils.ResolvedOverlay) (corev1.VolumeMount, bool) {
-	if ov.Skipped() || ov.Spec == nil || ov.Spec.Storage == nil || isvcutils.IsShardedBaseModel(ov.Spec) {
-		return corev1.VolumeMount{}, false
-	}
-	vm := corev1.VolumeMount{
-		Name:      overlayVolumeName(ov.Ref.Name),
-		MountPath: isvcutils.OverlayMountPath(ov.Ref.Name),
-		ReadOnly:  true,
-	}
-	if pvc := parsePVCStorage(ov.Spec.Storage); pvc != nil {
-		vm.SubPath = pvc.SubPath
-		return vm, true
-	}
-	if ov.Spec.Storage.Path != nil {
-		return vm, true
-	}
-	return corev1.VolumeMount{}, false
+	name := overlayVolumeName(ov.Ref.Name)
+	return corev1.Volume{Name: name, VolumeSource: source},
+		corev1.VolumeMount{Name: name, MountPath: isvcutils.OverlayMountPath(ov.Ref.Name), SubPath: subPath, ReadOnly: true},
+		true
 }
 
 func overlayDistributionString(spec *v1beta1.BaseModelSpec) string {

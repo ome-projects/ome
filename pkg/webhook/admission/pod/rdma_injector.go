@@ -3,7 +3,8 @@ package pod
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 
 	v1 "k8s.io/api/core/v1"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
@@ -179,63 +180,44 @@ type RDMAProfile struct {
 	Networks []NetworkAttachment
 }
 
-type RDMAInjector struct{}
-
-func NewRDMAInjector() *RDMAInjector { return &RDMAInjector{} }
-
-// InjectRDMA applies an RDMA profile (env / volumes / Multus
+// injectRDMA applies an RDMA profile (env / volumes / Multus
 // attachments) when the ome.io/rdma-auto-inject=true annotation is set.
 // The profile name defaults to DefaultRDMAProfile, overridable via
 // ome.io/rdma-profile.
-func (ri *RDMAInjector) InjectRDMA(pod *v1.Pod) error {
-	if autoInject, ok := pod.ObjectMeta.Annotations[constants.RDMAAutoInjectAnnotationKey]; ok && autoInject == "true" {
-		profileName := DefaultRDMAProfile
-		if profile, ok := pod.ObjectMeta.Annotations[constants.RDMAProfileAnnotationKey]; ok && profile != "" {
-			profileName = profile
-		}
-		profile, ok := RDMAProfiles[profileName]
-		if !ok {
-			return fmt.Errorf("unknown RDMA profile: %s", profileName)
-		}
-		return ri.injectRDMAConfig(pod, profile)
+func injectRDMA(pod *v1.Pod) error {
+	if autoInject, ok := pod.ObjectMeta.Annotations[constants.RDMAAutoInjectAnnotationKey]; !ok || autoInject != "true" {
+		return nil
 	}
-	return nil
+	profileName := DefaultRDMAProfile
+	if profile, ok := pod.ObjectMeta.Annotations[constants.RDMAProfileAnnotationKey]; ok && profile != "" {
+		profileName = profile
+	}
+	profile, ok := RDMAProfiles[profileName]
+	if !ok {
+		return fmt.Errorf("unknown RDMA profile: %s", profileName)
+	}
+	return injectRDMAConfig(pod, profile)
 }
 
-func (ri *RDMAInjector) injectRDMAConfig(pod *v1.Pod, profile RDMAProfile) error {
-	targetContainerName := DefaultContainerName
-	if containerName, ok := pod.ObjectMeta.Annotations[constants.RDMAContainerNameAnnotationKey]; ok && containerName != "" {
-		targetContainerName = containerName
-	}
-
-	containerFound := false
-	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == targetContainerName {
-			containerFound = true
-			break
-		}
-	}
-	if !containerFound {
+func injectRDMAConfig(pod *v1.Pod, profile RDMAProfile) error {
+	containerName := targetContainerName(pod, constants.RDMAContainerNameAnnotationKey)
+	target := findContainer(pod.Spec.Containers, containerName)
+	if target == nil {
 		// Quiet log: the runtime YAML names a custom container that
 		// the rendered pod doesn't have; operators see this when an
 		// init container mistakenly carries the annotation.
 		ctrllog.Log.WithName("rdma-injector").V(1).Info("RDMA injection skipped: container not found",
-			"container", targetContainerName,
+			"container", containerName,
 			"pod", pod.Name,
 			"namespace", pod.Namespace)
 		return nil
 	}
 
-	ri.injectVolumes(pod, profile.Volumes)
-	if err := ri.injectNetworks(pod, profile.Networks); err != nil {
+	injectVolumes(pod, profile.Volumes)
+	if err := injectNetworks(pod, profile.Networks); err != nil {
 		return err
 	}
-	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == targetContainerName {
-			ri.injectContainerConfig(&pod.Spec.Containers[i], profile)
-			break
-		}
-	}
+	injectContainerConfig(target, profile)
 	return nil
 }
 
@@ -243,7 +225,7 @@ func (ri *RDMAInjector) injectRDMAConfig(pod *v1.Pod, profile RDMAProfile) error
 // k8s.v1.cni.cncf.io/networks annotation. Existing entries are preserved;
 // dedup is by (name, namespace). Returns an error if the existing
 // annotation is malformed (rather than silently clobbering it).
-func (ri *RDMAInjector) injectNetworks(pod *v1.Pod, networks []NetworkAttachment) error {
+func injectNetworks(pod *v1.Pod, networks []NetworkAttachment) error {
 	if len(networks) == 0 {
 		return nil
 	}
@@ -279,92 +261,67 @@ func (ri *RDMAInjector) injectNetworks(pod *v1.Pod, networks []NetworkAttachment
 	return nil
 }
 
-func (ri *RDMAInjector) injectContainerConfig(container *v1.Container, profile RDMAProfile) {
-	// Sort env keys so the rendered container is byte-stable across runs.
-	keys := make([]string, 0, len(profile.EnvVars))
-	for name := range profile.EnvVars {
-		keys = append(keys, name)
+// injectContainerConfig applies the profile's container settings to the
+// target; values already on the container win.
+func injectContainerConfig(container *v1.Container, profile RDMAProfile) {
+	mergeEnv(container, profile.EnvVars)
+	mergeMounts(container, profile.VolumeMounts)
+	mergeSecurityContext(container, profile.SecurityContext)
+}
+
+// mergeEnv appends the profile's variables in name order, so the rendered
+// container is byte-stable across runs, and skips names the container
+// already sets: operator overrides survive and webhook reinvocation does
+// not stack duplicates.
+func mergeEnv(container *v1.Container, env map[string]string) {
+	existing := make(map[string]struct{}, len(container.Env))
+	for _, e := range container.Env {
+		existing[e.Name] = struct{}{}
 	}
-	sort.Strings(keys)
-	// Existing env vars are authoritative: skip profile entries already
-	// present so operator overrides survive and webhook reinvocation
-	// doesn't stack duplicates.
-	existingEnv := make(map[string]struct{}, len(container.Env))
-	for _, env := range container.Env {
-		existingEnv[env.Name] = struct{}{}
-	}
-	for _, name := range keys {
-		if _, ok := existingEnv[name]; ok {
+	for _, name := range slices.Sorted(maps.Keys(env)) {
+		if _, ok := existing[name]; ok {
 			continue
 		}
-		container.Env = append(container.Env, v1.EnvVar{
-			Name:  name,
-			Value: profile.EnvVars[name],
-		})
+		container.Env = append(container.Env, v1.EnvVar{Name: name, Value: env[name]})
 	}
+}
 
-	for _, mount := range profile.VolumeMounts {
-		if !ri.volumeMountExists(container, mount.Name) {
-			container.VolumeMounts = append(container.VolumeMounts, mount)
-		}
+// mergeMounts adds the profile's mounts the container does not have.
+func mergeMounts(container *v1.Container, mounts []v1.VolumeMount) {
+	for _, mount := range mounts {
+		ensureVolumeMount(container, mount)
 	}
+}
 
-	// Security context merge: preserve the operator's choices, add what
-	// the profile demands. Existing capabilities and Privileged are
-	// authoritative; only nil entries are filled. Profiles without a
-	// securityContext (attachment-only) leave the container untouched.
-	if profile.SecurityContext == nil {
+// mergeSecurityContext adds what the profile demands and keeps the
+// operator's choices: existing capabilities and Privileged are
+// authoritative, only nil entries are filled. A profile without a
+// security context (attachment-only) leaves the container untouched.
+func mergeSecurityContext(container *v1.Container, profile *v1.SecurityContext) {
+	if profile == nil {
 		return
 	}
 	if container.SecurityContext == nil {
-		container.SecurityContext = profile.SecurityContext.DeepCopy()
+		container.SecurityContext = profile.DeepCopy()
 		return
 	}
 	if container.SecurityContext.Capabilities == nil {
-		container.SecurityContext.Capabilities = profile.SecurityContext.Capabilities.DeepCopy()
+		container.SecurityContext.Capabilities = profile.Capabilities.DeepCopy()
 	} else {
-		for _, cap := range profile.SecurityContext.Capabilities.Add {
-			if !ri.capabilityExists(container.SecurityContext.Capabilities.Add, cap) {
+		for _, cap := range profile.Capabilities.Add {
+			if !hasCapability(container.SecurityContext.Capabilities.Add, cap) {
 				container.SecurityContext.Capabilities.Add = append(container.SecurityContext.Capabilities.Add, cap)
 			}
 		}
 	}
 	if container.SecurityContext.Privileged == nil {
-		container.SecurityContext.Privileged = profile.SecurityContext.Privileged
+		container.SecurityContext.Privileged = profile.Privileged
 	}
 }
 
-func (ri *RDMAInjector) volumeMountExists(container *v1.Container, name string) bool {
-	for _, mount := range container.VolumeMounts {
-		if mount.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func (ri *RDMAInjector) volumeExists(pod *v1.Pod, name string) bool {
-	for _, volume := range pod.Spec.Volumes {
-		if volume.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func (ri *RDMAInjector) injectVolumes(pod *v1.Pod, volumes []v1.Volume) {
+// injectVolumes adds the profile's volumes the pod does not have.
+func injectVolumes(pod *v1.Pod, volumes []v1.Volume) {
 	for _, volume := range volumes {
-		if !ri.volumeExists(pod, volume.Name) {
-			pod.Spec.Volumes = append(pod.Spec.Volumes, volume)
-		}
+		ensureVolume(pod, volume)
 	}
-}
-
-func (ri *RDMAInjector) capabilityExists(capabilities []v1.Capability, capability v1.Capability) bool {
-	for _, cap := range capabilities {
-		if cap == capability {
-			return true
-		}
-	}
-	return false
 }

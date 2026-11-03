@@ -177,17 +177,20 @@ const (
 // pass ran at all this reconcile, and hold is its verdict (nil clears).
 // When the Update pass did not run (holdObserved is false — the pass ended
 // before it, nothing needed updating, or Plan selected no target), the
+// same-target RetryBlock/Held state persisted in status is the hold (a
+// RetryBlock-denied Instance is never selected for the Update pass and the
+// pass reports the block only when it runs for other Instances), else the
 // persisted hold stands until a pass that runs the Update pass replaces or
-// clears it, behind the same-target RetryBlock/Held state persisted in
-// status: a RetryBlock-denied Instance is never selected for the Update
-// pass and the pass reports the block only when it runs for other
-// Instances — see effectiveRolloutHold.
+// clears it, unless this pass removed an Instance. instancesAtStart lists
+// the Instances that had a row when the pass began; a recorded hold
+// describes those Instances, so the write that removes one of them carries
+// no hold the pass did not observe — see effectiveRolloutHold.
 //
 // The returned duration is how long until the earliest in-rotation pod still
 // inside the spec.minReadySeconds window becomes Available (0 when none is
 // pending). That raises the Available counters without any watch event, so
 // the caller folds it into the reconcile result to publish them on time.
-func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workloadtypes.RolloutHold) (time.Duration, error) {
+func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workloadtypes.RolloutHold, instancesAtStart []int32) (time.Duration, error) {
 	if r.Client == nil {
 		return 0, fmt.Errorf("aggregateAndWriteStatus: nil client")
 	}
@@ -334,8 +337,9 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 		// on its own once no Instance is overdue.
 		apimeta.SetStatusCondition(&fresh.Status.Conditions, computeDrainOverdueCondition(&fresh.Status))
 		now := r.now()
+		removed := anyInstanceRemoved(instancesAtStart, fresh.Status.InstanceStatuses)
 		fresh.Status.RolloutHold = nextRolloutHold(fresh.Status.RolloutHold,
-			effectiveRolloutHold(holdObserved, hold, &fresh.Status, now), metav1.NewTime(now))
+			effectiveRolloutHold(holdObserved, hold, &fresh.Status, removed, now), metav1.NewTime(now))
 
 		// Skip the write when the recomputed status matches what's
 		// already live: a no-op reconcile must perform ZERO writes so it
@@ -649,7 +653,12 @@ func stagedAtPartition(status *v1beta1.InferenceReplicaStatus, lifecycle *v1beta
 //
 // Failures from before the current attempt started are ignored. LastFailure is
 // kept across revision rolls on purpose, so an Instance that failed once would
-// otherwise look wedged on every roll after it.
+// otherwise look wedged on every roll after it. That includes an Instance the
+// roll has not reached yet: it still serves on its own revision with no
+// attempt toward the target, so any failure it carries is from before. An
+// attempt still held by the environment-caused condition that ended the last
+// one is the exception: a scheduler that still finds no placement makes every
+// retry repeat that failure.
 func computeRolloutStalledCondition(status *v1beta1.InferenceReplicaStatus) metav1.Condition {
 	cond := metav1.Condition{
 		Type:               InferenceReplicaConditionRolloutStalled,
@@ -675,8 +684,14 @@ func computeRolloutStalledCondition(status *v1beta1.InferenceReplicaStatus) meta
 		if s.LastFailure.Reason == workloadtypes.DrainOverdueReason {
 			continue
 		}
-		// It failed before this attempt began, so it is retrying, not stuck.
-		if op := s.Operation; op != nil && !op.StartedAt.Before(&s.LastFailure.Time) {
+		// It failed before this attempt began, so it is retrying, unless
+		// this attempt is held by the condition that failed the last one.
+		if op := s.Operation; op != nil && !op.StartedAt.Before(&s.LastFailure.Time) && !heldByLastFailure(op, s.LastFailure) {
+			continue
+		}
+		// The roll has not reached it: it serves on its own revision and
+		// nothing targets it yet, so its failure predates this roll.
+		if s.Phase == v1beta1.OMENativeInstanceReady && s.Operation == nil && s.TargetRevision != status.UpdateRevision {
 			continue
 		}
 		stalled++
@@ -694,6 +709,15 @@ func computeRolloutStalledCondition(status *v1beta1.InferenceReplicaStatus) meta
 	cond.Message = fmt.Sprintf("%d/%d Instance(s) failing rollout to %s (%s)",
 		stalled, status.Replicas, status.UpdateRevision, summarizeFailureReasons(reasons))
 	return cond
+}
+
+// heldByLastFailure reports whether an open attempt is held by the
+// environment-caused condition its Instance's last failure recorded. The
+// roll opens the next attempt in the pass that ends the last one, so that
+// failure's time can fall in the same second as this attempt's start, and
+// the times alone cannot tell the two refusals apart; the hold can.
+func heldByLastFailure(op *v1beta1.InstanceOperation, failure *v1beta1.InstanceTermination) bool {
+	return op.Waiting != "" && op.Waiting == failure.Reason && workloadtypes.IsEnvironmentCausedReason(failure.Reason)
 }
 
 // computeDrainOverdueCondition derives the advisory DrainOverdue
@@ -770,6 +794,14 @@ func summarizeFailureReasons(reasons map[string]int) string {
 // stands as written until a pass that runs the Update pass replaces or
 // clears it.
 //
+// A recorded hold describes the Instances the pass that wrote it saw. A
+// pass that removed an Instance (instanceRemoved: a row the pass began
+// with is gone from the live object, as after a scale wave's last write)
+// therefore carries no hold it did not observe: the next pass that reaches
+// the update position records whatever stands over the Instances that
+// remain, and a hold naming an Instance that is gone never outlives its
+// row. The retry record is read first either way, since it is live state.
+//
 // A converged subject is read the same way: a roll with nothing left to
 // do clears the hold with a nil verdict, which a pass that finds every
 // row settled and serving reports, while one whose promoted sets crash
@@ -777,7 +809,7 @@ func summarizeFailureReasons(reasons map[string]int) string {
 // rotation, or behind the ladder while its block counts the crash, and
 // its verdict says so. Only a subject with no update revision has
 // nothing to hold.
-func effectiveRolloutHold(holdObserved bool, hold *workloadtypes.RolloutHold, status *v1beta1.InferenceReplicaStatus, now time.Time) *v1beta1.RolloutHold {
+func effectiveRolloutHold(holdObserved bool, hold *workloadtypes.RolloutHold, status *v1beta1.InferenceReplicaStatus, instanceRemoved bool, now time.Time) *v1beta1.RolloutHold {
 	if status.UpdateRevision == "" {
 		return nil
 	}
@@ -794,7 +826,34 @@ func effectiveRolloutHold(holdObserved bool, hold *workloadtypes.RolloutHold, st
 	if blocked := computeRetryBlockRolloutHold(status, now); blocked != nil {
 		return blocked
 	}
+	if instanceRemoved {
+		return nil
+	}
 	return status.RolloutHold
+}
+
+// instanceIndices lists the Instances the rows describe, in row order.
+func instanceIndices(rows []v1beta1.OMENativeInstanceStatus) []int32 {
+	out := make([]int32, 0, len(rows))
+	for i := range rows {
+		out = append(out, rows[i].Index)
+	}
+	return out
+}
+
+// anyInstanceRemoved reports whether an Instance that had a row when the
+// pass began (atStart) has none among rows, the live rows the pass leaves.
+func anyInstanceRemoved(atStart []int32, rows []v1beta1.OMENativeInstanceStatus) bool {
+	present := make(map[int32]struct{}, len(rows))
+	for i := range rows {
+		present[rows[i].Index] = struct{}{}
+	}
+	for _, idx := range atStart {
+		if _, ok := present[idx]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 // computeRetryBlockRolloutHold derives a RolloutHold from a same-target
@@ -821,7 +880,7 @@ func computeRetryBlockRolloutHold(status *v1beta1.InferenceReplicaStatus, now ti
 	case v1beta1.RetryBlockHeld:
 		return &v1beta1.RolloutHold{
 			Gate:   v1beta1.RolloutHoldGateHeld,
-			Reason: fmt.Sprintf("update to %s held after %d failed attempt(s): %s%s", b.TargetRevision, b.AttemptsStarted, b.Reason, notServing),
+			Reason: irprojector.HeldUpdateReason(b) + notServing,
 			Target: b.TargetRevision,
 		}
 	case v1beta1.RetryBlockBackoff:

@@ -173,7 +173,7 @@ func TestNodeHint_NodeAdded_QueuesOnlyWithDomainLabel(t *testing.T) {
 
 func TestNodeDeleteHint_NodeInAnyDomainDeleted_Queues(t *testing.T) {
 	assignments := placement.New()
-	assignments.SetReservation("team/gang", testKey, "a", 0)
+	assignments.Set(placement.Gang{Group: "team/gang", TopologyKey: testKey}, "a", 0, nil)
 	g := &GangPack{assignments: assignments, pgReader: fakeReader{"team/gang": {min: 2, topo: testKey}}}
 	target := gangGPUPod("team", "gang", "4")
 	if got, _ := g.isSchedulableAfterNodeDelete(klog.Background(), target, gpuNode("a1", "a", "4"), nil); got != framework.Queue {
@@ -186,7 +186,7 @@ func TestNodeDeleteHint_NodeInAnyDomainDeleted_Queues(t *testing.T) {
 
 func TestNodeHint_AssignedDomainLabelRemoved_Queues(t *testing.T) {
 	assignments := placement.New()
-	assignments.SetReservationOnNodes("team/gang", testKey, "a", 1, []string{"a1"})
+	assignments.Set(placement.Gang{Group: "team/gang", TopologyKey: testKey}, "a", 1, []string{"a1"})
 	g := &GangPack{assignments: assignments, pgReader: fakeReader{"team/gang": {min: 2, topo: testKey}}}
 	target := gangGPUPod("team", "gang", "4")
 	oldNode := gpuNode("a1", "a", "4")

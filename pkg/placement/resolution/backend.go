@@ -25,16 +25,9 @@ func (r Resolver) ResolveNative(ctx context.Context, desired, standing *v1beta1.
 	if err != nil {
 		return nil, err
 	}
-	engine, decoder, router, err := isvcutils.DetermineDeploymentModes(runtime.Engine, runtime.Decoder, runtime.Router, runtime.Spec, desired.Spec.DeploymentMode)
+	modes, err := isvcutils.DetermineRoleDeploymentModes(v1beta1.RoleSpecs{Engine: runtime.Engine, Decoder: runtime.Decoder, Router: runtime.Router}, desired.Spec.DeploymentMode)
 	if err != nil {
 		return nil, err
-	}
-	modes := map[v1beta1.ComponentType]constants.DeploymentModeType{v1beta1.EngineComponent: engine}
-	if runtime.Decoder != nil {
-		modes[v1beta1.DecoderComponent] = decoder
-	}
-	if runtime.Router != nil {
-		modes[v1beta1.RouterComponent] = router
 	}
 	if err := protocol.ValidateNativeModes(modes); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUnsupportedBackend, err)

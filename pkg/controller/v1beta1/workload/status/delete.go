@@ -51,7 +51,7 @@ func StampDeletingBatch(ctx context.Context, input types.ReconcileInput, timeout
 		operation := types.InstanceOperation{
 			ID:             fmt.Sprintf("delete-%d-%d", row.Index, now.Unix()),
 			Type:           types.InstanceOperationDelete,
-			Step:           "Drain",
+			Step:           types.DeleteStepDrain,
 			StartedAt:      now,
 			LastProgressAt: now,
 			Deadline:       types.DeadlineAt(now, timeout),

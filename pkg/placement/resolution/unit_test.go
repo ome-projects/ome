@@ -81,7 +81,6 @@ func unitClient(t *testing.T, f runtimeFixture, opts ...fakeclient.Option) clien
 		objects[i] = objects[i].DeepCopyObject().(client.Object)
 	}
 	return fakeclient.New(t, append([]fakeclient.Option{
-		fakeclient.WithScheme(runtimeScheme(t)),
 		fakeclient.WithTypes(nodev1.AddToScheme, kueuev1beta2.AddToScheme),
 		fakeclient.WithObjects(objects...),
 	}, opts...)...)

@@ -155,25 +155,10 @@ func primaryCanaryComponent(isvc *v1beta1.InferenceService) v1beta1.ComponentTyp
 }
 
 // primaryOfGroup is the Component a group's step machine and traffic weight run
-// through: router > engine > decoder among the group's own members. A group
-// owns one canary unit, so this is that unit's entrypoint and the key its run
-// state is stored under.
+// through (rollout.PrimaryOf). A group owns one canary unit, so this is that
+// unit's entrypoint and the key its run state is stored under.
 func primaryOfGroup(g *v1beta1.RolloutGroup) v1beta1.ComponentType {
-	if g == nil {
-		return ""
-	}
-	for _, preferred := range []v1beta1.ComponentType{
-		v1beta1.RouterComponent,
-		v1beta1.EngineComponent,
-		v1beta1.DecoderComponent,
-	} {
-		for _, comp := range g.Components {
-			if comp == preferred {
-				return comp
-			}
-		}
-	}
-	return ""
+	return rollout.PrimaryOf(g)
 }
 
 // stickyRejectHashes returns, per Component, the revision that Component's OWN
@@ -469,9 +454,18 @@ func derivedProvenance(isvc *v1beta1.InferenceService) map[int]v1beta1.RolloutRu
 // would pin for one spec group: the inline body's digest when an inline arm
 // is set, else the referenced policy's. Returns "" with no error when the
 // source is unresolvable (dangling ref) — the caller reports that separately.
+//
+// An inline group is digested in its composed form, the form the open
+// records: a group with no progression body composes to the default
+// blueGreen, and the raw group would digest to nothing and never equal its
+// own recorded digest.
 func liveSourceDigest(g *v1beta1.RolloutGroup, policies rollout.Policies) (string, error) {
 	if rolloutpolicy.GroupSource(g) == v1beta1.RolloutPlanSourceInline {
-		return rolloutpolicy.ProgressionDigest(g)
+		composed, err := rolloutpolicy.ComposeGroup(g, nil)
+		if err != nil {
+			return "", err
+		}
+		return rolloutpolicy.ProgressionDigest(&composed)
 	}
 	policy := policies.ByName[g.PolicyRef.Name]
 	if policy == nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,9 +20,11 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
@@ -49,10 +52,12 @@ type ReconcileInputs struct {
 	Client client.Client
 
 	// Reader is the live (uncached) API reader, reserved for
-	// correctness-critical pod reads. The coordination layer itself
-	// reads pods via Client; the live reader is consumed only by the
-	// canary capacity gate (canary.Dispatch -> ObservePerRevisionPods),
-	// which must not lag reality before shifting traffic.
+	// correctness-critical reads. The coordination layer reads pods via
+	// Client and the EndpointSlices behind the traffic split through this
+	// reader, one list per routed Service per pass, so the split never
+	// moves a share onto a revision the data plane cannot reach yet; the
+	// canary capacity gate (canary.Dispatch -> ObservePerRevisionPods)
+	// reads its pods through it for the same reason.
 	Reader client.Reader
 
 	// Recorder emits K8s Events for coordination transitions.
@@ -101,10 +106,10 @@ type ReconcileInputs struct {
 //   - emit metrics for surge skew / failures
 //   - log structured progress lines
 //
-// RatioBalanced skew is published exclusively via the ratio_skew_total
-// Prometheus counter and the RatioSkewRejected event — see the
-// RatioSkewRejected branch in Reconcile — so Result intentionally does
-// not carry a per-reconcile skew count.
+// RatioBalanced skew is published via the ratio_skew_total Prometheus
+// counter, the group status field SurgeHeldByRatio and the RatioSkewRejected
+// event (recordObservations), so Result intentionally does not carry a
+// per-reconcile skew count.
 type Result struct {
 	// GroupStatuses are the per-group statuses freshly computed this
 	// reconcile.
@@ -207,7 +212,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 
 	// Cached client carries the OMENative Pod field index — useIndex=true takes
 	// the index fast path instead of scanning the whole informer store per Component.
-	perRevisionPods, perRevisionReadyPods, perRevisionRouting, _, err := observePerRevisionPods(ctx, in.Client, in.ISVC, componentsTouched, true)
+	perRevisionPods, _, perRevisionRouting, observedPods, err := observePerRevisionPods(ctx, in.Client, in.ISVC, componentsTouched, true)
 	if err != nil {
 		return nil, fmt.Errorf("observe per-revision pods: %w", err)
 	}
@@ -276,16 +281,29 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		}
 	}
 
-	// Write per-Component Traffic[] from the READY pod distribution
-	// (producer-side contract feeding the HTTPRoute weighted-
-	// backendRef consumer). Ready, not total: a revision whose pods are
-	// all Pending/ImagePullBackOff cannot take traffic, and weighting it
-	// points the HTTPRoute at a zero-endpoint Service. Service ensure/GC
-	// above stays on the total map so a not-yet-ready revision's Service
-	// exists before its first pod flips Ready.
-	if err := updateTrafficStatus(ctx, in.Client, in.ISVC, componentsTouched, perRevisionReadyPods, in.TrafficWeightDeadbandPercent); err != nil {
+	// Write per-Component Traffic[] from the pods that serve and are
+	// listed as Ready endpoints of their revision's routed Service
+	// (producer-side contract feeding the HTTPRoute weighted-backendRef
+	// consumer). Listed, not Ready and not total: a revision whose pods
+	// are Pending, or Ready but not yet published by the endpoints
+	// controller, cannot take traffic, and weighting it points the
+	// HTTPRoute at a Service with no endpoint behind it. The condition
+	// names the revisions whose share waits. Service ensure/GC above stays
+	// on the total map so a revision's Service exists before its first pod
+	// flips Ready.
+	endpointReader := in.Reader
+	if endpointReader == nil {
+		endpointReader = in.Client
+	}
+	rotation := drain.NewBatcher(endpointReader, in.ISVC.Namespace)
+	perRevisionListedPods, endpointWaits, err := servingPodsListedByRevision(ctx, rotation, in.ISVC, componentsTouched, observedPods)
+	if err != nil {
+		return nil, fmt.Errorf("observe per-revision endpoints: %w", err)
+	}
+	if err := updateTrafficStatus(ctx, in.Client, in.ISVC, componentsTouched, perRevisionListedPods, in.TrafficWeightDeadbandPercent); err != nil {
 		return nil, fmt.Errorf("update traffic status: %w", err)
 	}
+	SetTrafficEndpointsReady(in.ISVC, endpointWaits)
 
 	// The cached client carries no row decoder; the group observation reads
 	// InferenceReplicas through it paired with the decoder the live reader
@@ -308,6 +326,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		obs.OriginalReplicas = ratio.Original
 		obs.Now = now
 		obs.PreviousPhaseEnteredAt = previousPhaseEnteredAt(in.ISVC, g.Name)
+		obs.MemberFinished = previousMemberFinish(in.ISVC, g.Name)
 		tr := ComputeTransition(obs)
 		groupStatus := BuildGroupStatus(g, tr, ratio, now)
 
@@ -354,27 +373,13 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 			RecordGroupFailure(in.ISVC.Namespace, in.ISVC.Name, g.Name, tr.Message)
 		}
 
-		// RollingUpdate mixed-pairing observability: emit when distinct
-		// revision hashes coexist across Components (RollingUpdate
-		// permits this but operators want to know).
-		if g.Policy == v1beta1.CoordinationPolicyRollingUpdate && hasMixedPairing(g, perRevisionPods) {
-			RecordMixedPairing(in.ISVC.Namespace, in.ISVC.Name, g.Name)
-			if in.Recorder != nil {
-				in.Recorder.Eventf(in.ISVC, corev1.EventTypeNormal, EventReasonMixedPairingObserved,
-					"RollingUpdate group %s observed distinct per-Component revision hashes", g.Name)
-			}
-		}
-
-		// RatioBalanced skew rejection: fire metric + event when
-		// EvaluateSurge zeroed at least one Component's surge budget
-		// to preserve the cross-Component ratio.
-		if tr.RatioSkewRejected {
-			RecordRatioSkew(in.ISVC.Namespace, in.ISVC.Name, g.Name)
-			if in.Recorder != nil {
-				in.Recorder.Eventf(in.ISVC, corev1.EventTypeNormal, EventReasonRatioSkewRejected,
-					"RatioBalanced pacing rejected surge in group %s to preserve cross-Component ratio", g.Name)
-			}
-		}
+		// The two observations the status carries as state: distinct
+		// revisions across the Components of a RollingUpdate group, and a
+		// surge RatioBalanced pacing refused to keep the ratio.
+		groupStatus.MixedPairing = g.Policy == v1beta1.CoordinationPolicyRollingUpdate && hasMixedPairing(g, perRevisionPods)
+		groupStatus.SurgeHeldByRatio = tr.RatioSkewRejected
+		previous, _ := previousGroupStatus(in.ISVC, g.Name)
+		recordObservations(in.Recorder, in.ISVC, g, previous, groupStatus, tr.RatioHeldStarts)
 
 		emitPhaseEvents(in.Recorder, in.ISVC, g, tr, prevPhase, prevComposite)
 		emitSequentialDeferredEvent(in.Recorder, in.ISVC, g, obs, previousActiveComponent(in.ISVC, g.Name))
@@ -401,12 +406,8 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 // to OMENative dispatch. Only those Components participate in coordination's
 // per-revision Service emission and traffic write.
 func collectOMENativeComponents(modes map[v1beta1.ComponentType]constants.DeploymentModeType) []v1beta1.ComponentType {
-	out := make([]v1beta1.ComponentType, 0, 3)
-	for _, component := range []v1beta1.ComponentType{
-		v1beta1.EngineComponent,
-		v1beta1.DecoderComponent,
-		v1beta1.RouterComponent,
-	} {
+	out := make([]v1beta1.ComponentType, 0, len(v1beta1.Roles))
+	for _, component := range v1beta1.RoleTypes() {
 		if modes[component] == constants.OMENative {
 			out = append(out, component)
 		}
@@ -546,10 +547,11 @@ func dropCanaryOwned(comps []v1beta1.ComponentType, isvc *v1beta1.InferenceServi
 	return out
 }
 
-// updateTrafficStatus writes Status.Components.<c>.Traffic[] from
-// observed per-revision READY pod counts (a pod that isn't serving must
-// not pull a traffic share toward its zero-endpoint Service). Idempotent;
-// no-op writes are skipped to avoid bouncing the apiserver.
+// updateTrafficStatus writes Status.Components.<c>.Traffic[] from the
+// per-revision counts of pods that serve and are listed endpoints (a pod
+// no request can reach must not pull a traffic share toward its
+// revision's Service). Idempotent; no-op writes are skipped to avoid
+// bouncing the apiserver.
 func updateTrafficStatus(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, components []v1beta1.ComponentType, perRevisionReadyPods map[v1beta1.ComponentType]map[string]int32, deadbandPercent int32) error {
 	if isvc.Status.Components == nil {
 		isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
@@ -661,6 +663,7 @@ func buildGroupObservation(ctx context.Context, reads client.Reader, isvc *v1bet
 		}
 		co := buildComponentObservation(summary, c, perRevisionPods[c], partition)
 		co.SpecReplicas = specReplicasOf(ir)
+		co.UpdateStrategy = replicaMechanism(ir)
 		obs.Components[c] = co
 	}
 	if paused, _ := constants.RolloutPauseState(isvc.Annotations); paused {
@@ -694,6 +697,7 @@ func buildComponentObservation(summary *v1beta1.InferenceReplicaStatus, c v1beta
 		Partition: partition,
 	}
 	if summary == nil {
+		out.NotReady = true
 		return out
 	}
 	out.DesiredReplicas = summary.Replicas
@@ -708,6 +712,7 @@ func buildComponentObservation(summary *v1beta1.InferenceReplicaStatus, c v1beta
 	out.TargetRevisionHash = tgt.Hash()
 	out.RolloutInFlight = !tgt.IsZero() && !tgt.Same(cur)
 	out.ReadyAt = readyTransitionAt(summary.Conditions)
+	out.NotReady = readyConditionFalseOrAbsent(summary.Conditions)
 
 	// Per-Instance failure rollup: any Instance escalated to
 	// Phase=Failed by the workload escalation pass (or any other
@@ -747,6 +752,18 @@ func readyTransitionAt(conds []metav1.Condition) time.Time {
 		return cond.LastTransitionTime.Time
 	}
 	return time.Time{}
+}
+
+// readyConditionFalseOrAbsent reports whether a replica's Ready condition is
+// False or missing: the replica vouches for no serving Instance. Unknown,
+// the condition while a roll is recorded, is neither.
+func readyConditionFalseOrAbsent(conds []metav1.Condition) bool {
+	for _, cond := range conds {
+		if cond.Type == conditionReady {
+			return cond.Status == metav1.ConditionFalse
+		}
+	}
+	return true
 }
 
 // collectFailedInstanceIndices returns the indices of every Instance
@@ -956,15 +973,90 @@ func existingOriginalReplicas(isvc *v1beta1.InferenceService, groupName string) 
 // treat that as "no transition" so the very first reconcile doesn't
 // synthesize a spurious from="" → to=Idle transition increment.
 func previousGroupPhases(isvc *v1beta1.InferenceService, groupName string) (v1beta1.CoordinationPhase, string) {
+	previous, _ := previousGroupStatus(isvc, groupName)
+	return previous.Phase, previous.CompositePhase
+}
+
+// previousGroupStatus returns the group's status as the previous pass wrote
+// it, and whether the status names the group at all.
+func previousGroupStatus(isvc *v1beta1.InferenceService, groupName string) (v1beta1.RolloutCoordinationGroupStatus, bool) {
 	if isvc.Status.RolloutCoordination == nil {
-		return "", ""
+		return v1beta1.RolloutCoordinationGroupStatus{}, false
 	}
 	for _, gs := range isvc.Status.RolloutCoordination.Groups {
 		if gs.Name == groupName {
-			return gs.Phase, gs.CompositePhase
+			return gs, true
 		}
 	}
-	return "", ""
+	return v1beta1.RolloutCoordinationGroupStatus{}, false
+}
+
+// recordObservations counts the two observations the group status carries
+// on every pass they hold and records each one's event on the pass it
+// begins. A roll keeps an observation for minutes; an event per pass would
+// spend the service's event budget on repeats, and the events that follow
+// them, the run's close among them, would be dropped. The ratio event names
+// the starts the pacing holds, each as the move its strategy makes it.
+func recordObservations(recorder record.EventRecorder, isvc *v1beta1.InferenceService, g ResolvedGroup, previous, next v1beta1.RolloutCoordinationGroupStatus, held []HeldStart) {
+	if next.MixedPairing {
+		RecordMixedPairing(isvc.Namespace, isvc.Name, g.Name)
+		if recorder != nil && !previous.MixedPairing {
+			recorder.Eventf(isvc, corev1.EventTypeNormal, EventReasonMixedPairingObserved,
+				"RollingUpdate group %s observed distinct per-Component revision hashes", g.Name)
+		}
+	}
+	if next.SurgeHeldByRatio {
+		RecordRatioSkew(isvc.Namespace, isvc.Name, g.Name)
+		if recorder != nil && !previous.SurgeHeldByRatio {
+			recorder.Event(isvc, corev1.EventTypeNormal, EventReasonRatioSkewRejected, ratioHoldMessage(g.Name, held))
+		}
+	}
+}
+
+// ratioHoldMessage words a ratio hold for the operator: the move each held
+// Component's next start is under its strategy, the Components in the
+// group's order, as in "held the next recreate of decoder in group 0" or
+// "held the next surge start of engine and decoder in group 0".
+func ratioHoldMessage(group string, held []HeldStart) string {
+	var moves []string
+	members := map[string][]string{}
+	for _, h := range held {
+		move := startName(h.Strategy)
+		if _, seen := members[move]; !seen {
+			moves = append(moves, move)
+		}
+		members[move] = append(members[move], string(h.Component))
+	}
+	parts := make([]string, 0, len(moves))
+	for _, move := range moves {
+		parts = append(parts, fmt.Sprintf("the next %s of %s", move, listOf(members[move])))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "the next start")
+	}
+	return fmt.Sprintf("RatioBalanced pacing held %s in group %s to keep the cross-Component ratio", strings.Join(parts, " and "), group)
+}
+
+// listOf joins names the way a sentence reads them: "engine", "engine and
+// decoder", "engine, decoder and router".
+func listOf(names []string) string {
+	if len(names) <= 1 {
+		return strings.Join(names, "")
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+}
+
+// startName is the move a Component's next start is under its strategy: a
+// drain-first strategy rebuilds the Instance, an in-place one restarts its
+// pod, and SurgeThenDrain (the default) adds a pod beside the old one.
+func startName(strategy workloadtypes.UpdateStrategyType) string {
+	switch strategy {
+	case workloadtypes.UpdateStrategyRecreatePod:
+		return "recreate"
+	case workloadtypes.UpdateStrategyInPlaceIfPossible, workloadtypes.UpdateStrategyInPlaceOnly:
+		return "in-place restart"
+	}
+	return "surge start"
 }
 
 // previousActiveComponent returns the CurrentComponent observed for
@@ -998,6 +1090,22 @@ func previousPhaseEnteredAt(isvc *v1beta1.InferenceService, groupName string) ti
 		}
 	}
 	return time.Time{}
+}
+
+// previousMemberFinish returns the finish record the previously-written
+// status of `groupName` carries: the Sequential member whose roll most
+// recently read done and the instant it first read so. Zero when the status
+// holds none.
+func previousMemberFinish(isvc *v1beta1.InferenceService, groupName string) MemberFinish {
+	if isvc.Status.RolloutCoordination == nil {
+		return MemberFinish{}
+	}
+	for _, gs := range isvc.Status.RolloutCoordination.Groups {
+		if gs.Name == groupName && gs.MemberFinished != nil {
+			return MemberFinish{Component: gs.MemberFinished.Component, At: gs.MemberFinished.At.Time}
+		}
+	}
+	return MemberFinish{}
 }
 
 // hasMixedPairing reports whether the RollingUpdate group's Components

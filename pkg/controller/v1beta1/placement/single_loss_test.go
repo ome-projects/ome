@@ -14,6 +14,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestSingleMoveLossRecovery(t *testing.T) {
@@ -91,12 +92,12 @@ func TestSingleMoveLossRecovery(t *testing.T) {
 				r.winnerLostSince.Store(source.UID, time.Now().Add(-2*r.WinnerLostGracePeriod))
 			}
 			if tt.failReset {
-				r.Client = interceptor.NewClient(root.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				r.Client = fakeclient.Wrap(t, root.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, cl client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 					if s, ok := obj.(*v1beta1.InferenceService); ok && s.Status.Placement.Plan.SingleMove == nil {
 						return fmt.Errorf("plan update unavailable")
 					}
 					return cl.SubResource(sub).Update(ctx, obj, opts...)
-				}})
+				}}))
 			}
 			if _, err := r.Reconcile(t.Context(), req()); err != nil {
 				t.Fatal(err)
@@ -171,12 +172,7 @@ func TestSingleMoveEmptyInventory(t *testing.T) {
 				}
 			}
 			if tt.unavailable {
-				workers["member-b"] = interceptor.NewClient(workers["member-b"], interceptor.Funcs{List: func(ctx context.Context, cl client.WithWatch, obj client.ObjectList, opts ...client.ListOption) error {
-					if _, ok := obj.(*corev1.PodList); ok {
-						return fmt.Errorf("pod inventory unavailable")
-					}
-					return cl.List(ctx, obj, opts...)
-				}})
+				workers["member-b"] = fakeclient.Wrap(t, workers["member-b"], fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, fmt.Errorf("pod inventory unavailable")).OnKind(&corev1.PodList{}))
 			}
 			connections := splitTestClusters{fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}}
 			clusters := []v1beta1.WorkloadCluster{*readyWC("member-a", nil), *readyWC("member-b", nil)}

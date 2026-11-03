@@ -8,6 +8,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,6 +33,9 @@ const (
 	containerName = "main"
 	servingPort   = 8000
 	defaultRunner = "default"
+	// heldRecordReason is the last failure a member's Held retry record
+	// names; the stand-in knows no cause of its own.
+	heldRecordReason = "the replacement never served"
 )
 
 // member is the InferenceReplica controller's stand-in for one Component:
@@ -59,6 +63,9 @@ type member struct {
 	// nothing and syncs no pod until the projector has created the object
 	// again.
 	missing bool
+	// heldAttempts is the failed attempts the member's retry record for its
+	// target counts while that record is Held; zero when none is.
+	heldAttempts int32
 	// revisions maps an image to the ControllerRevision its template minted.
 	revisions map[string]*appsv1.ControllerRevision
 	// readyAt is when the replica's Ready condition last flipped.
@@ -88,6 +95,21 @@ type podState struct {
 	image   string
 	ready   bool
 	serving bool
+	// crashedAt is when the runner's restarted run died again, from when
+	// the pod reports a crash loop; zero for a runner on its first run.
+	crashedAt time.Time
+	// readyAt is when the pod last turned Ready; zero while it is not.
+	readyAt time.Time
+	// listedAfter is how long after readyAt the endpoints controller lists
+	// the pod in its revision's routed Service; zero lists it with the pod.
+	listedAfter time.Duration
+}
+
+// listed reports whether the endpoints controller publishes the pod as a
+// Ready endpoint of its revision's routed Service at now: the pod is Ready
+// and serving, and the controller's delay has passed.
+func (p podState) listed(now time.Time) bool {
+	return p.ready && p.serving && !now.Before(p.readyAt.Add(p.listedAfter))
 }
 
 func (d *driver) member(name string) (*member, error) {
@@ -272,7 +294,12 @@ func (d *driver) renderPod(ctx context.Context, m *member, p podState) (*corev1.
 }
 
 // applyPodStatus writes the kubelet's view of a pod: Running, and Ready
-// with the serving gate when the scenario says so.
+// with the serving gate when the scenario says so. The runner's container
+// status carries the name the engine reads the runner under
+// (constants.MainContainerName); the template's own container name is a
+// fixture identity hashed into every revision and stays as it is. A pod
+// whose runner crashed reports the kubelet's back-off, one restart and the
+// restarted run's death, which is how the crash reading dates the loop.
 func applyPodStatus(pod *corev1.Pod, p podState, now time.Time) {
 	pod.Status.Phase = corev1.PodRunning
 	ready := corev1.ConditionFalse
@@ -289,18 +316,40 @@ func applyPodStatus(pod *corev1.Pod, p podState, now time.Time) {
 		{Type: corev1.PodReady, Status: ready, LastTransitionTime: at},
 		{Type: query.ServingConditionType, Status: serving, LastTransitionTime: at},
 	}
-	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
-		Name:  containerName,
+	runner := corev1.ContainerStatus{
+		Name:  constants.MainContainerName,
 		Image: pod.Spec.Containers[0].Image,
 		Ready: p.ready,
 		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: at}},
-	}}
+	}
+	if !p.crashedAt.IsZero() {
+		died := metav1.NewTime(p.crashedAt)
+		runner.RestartCount = 1
+		runner.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: constants.StateReasonCrashLoopBackOff}}
+		runner.LastTerminationState = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 1, Reason: constants.StateReasonError, StartedAt: died, FinishedAt: died,
+		}}
+	}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{runner}
 }
 
 // syncPods makes the store's pods of a member match the scenario's: a pod
 // the scenario names exists with the status it declares, and no other pod
-// of the member remains.
+// of the member remains. The Ready clock of each pod is kept here, then
+// the endpoints the controller would publish for them.
 func (d *driver) syncPods(ctx context.Context, m *member) error {
+	now := d.clock.Now()
+	for i := range m.pods {
+		switch {
+		case !m.pods[i].ready:
+			m.pods[i].readyAt = time.Time{}
+		case m.pods[i].readyAt.IsZero():
+			m.pods[i].readyAt = now
+		}
+	}
+	if err := d.syncEndpoints(ctx, m); err != nil {
+		return err
+	}
 	want := map[string]podState{}
 	for _, p := range m.pods {
 		want[d.podName(m.component, p)] = p
@@ -356,6 +405,85 @@ func (d *driver) syncPods(ctx context.Context, m *member) error {
 			}
 			if err := d.cluster.cli.Create(ctx, rendered); err != nil {
 				return fmt.Errorf("replay: create pod %s: %w", name, err)
+			}
+		}
+		return nil
+	})
+}
+
+// sliceNameFor is the one EndpointSlice the stand-in keeps per routed
+// Service; the engine reads endpoints, not slice topology.
+func sliceNameFor(serviceName string) string {
+	return serviceName + "-replay"
+}
+
+// syncEndpoints is the endpoints controller's stand-in for one member: for
+// every revision with a pod it keeps the EndpointSlice of the revision's
+// routed Service, listing the pods that are listed at the clock as Ready
+// endpoints; a revision with no pod left loses its slice, as the Service
+// it belongs to is collected.
+func (d *driver) syncEndpoints(ctx context.Context, m *member) error {
+	component := v1beta1convert.ComponentTypeToWorkload(m.component)
+	byService := map[string][]discoveryv1.Endpoint{}
+	now := d.clock.Now()
+	for _, p := range m.pods {
+		hash, err := d.revisionHash(ctx, m, p.image)
+		if err != nil {
+			return err
+		}
+		service := query.PerRevisionServiceName(d.opts.ServiceName, component, hash)
+		endpoints := byService[service]
+		if p.listed(now) {
+			ready := true
+			endpoints = append(endpoints, discoveryv1.Endpoint{
+				Addresses:  []string{fmt.Sprintf("10.%d.%d.%d", len(byService), p.index%256, p.ordinal+1)},
+				Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+				TargetRef:  &corev1.ObjectReference{Kind: "Pod", Namespace: d.opts.Namespace, Name: d.podName(m.component, p)},
+			})
+		}
+		byService[service] = endpoints
+	}
+	live := &discoveryv1.EndpointSliceList{}
+	if err := d.cluster.cli.List(ctx, live, client.InNamespace(d.opts.Namespace), client.MatchingLabels(d.selectorLabels(m.component))); err != nil {
+		return fmt.Errorf("replay: list endpoint slices of %s: %w", m.component, err)
+	}
+	return d.cluster.staging(func() error {
+		kept := map[string]bool{}
+		for i := range live.Items {
+			slice := &live.Items[i]
+			endpoints, ok := byService[slice.Labels[discoveryv1.LabelServiceName]]
+			if !ok {
+				if err := d.cluster.cli.Delete(ctx, slice); err != nil && !apierrors.IsNotFound(err) {
+					return fmt.Errorf("replay: delete endpoint slice %s: %w", slice.Name, err)
+				}
+				continue
+			}
+			kept[slice.Labels[discoveryv1.LabelServiceName]] = true
+			if equality.Semantic.DeepEqual(slice.Endpoints, endpoints) {
+				continue
+			}
+			slice.Endpoints = endpoints
+			if err := d.cluster.cli.Update(ctx, slice); err != nil {
+				return fmt.Errorf("replay: update endpoint slice %s: %w", slice.Name, err)
+			}
+		}
+		services := make([]string, 0, len(byService))
+		for service := range byService {
+			if !kept[service] {
+				services = append(services, service)
+			}
+		}
+		sort.Strings(services)
+		for _, service := range services {
+			labels := d.selectorLabels(m.component)
+			labels[discoveryv1.LabelServiceName] = service
+			slice := &discoveryv1.EndpointSlice{
+				ObjectMeta:  metav1.ObjectMeta{Namespace: d.opts.Namespace, Name: sliceNameFor(service), Labels: labels},
+				AddressType: discoveryv1.AddressTypeIPv4,
+				Endpoints:   byService[service],
+			}
+			if err := d.cluster.cli.Create(ctx, slice); err != nil {
+				return fmt.Errorf("replay: create endpoint slice %s: %w", slice.Name, err)
 			}
 		}
 		return nil
@@ -472,6 +600,9 @@ func (d *driver) publish(ctx context.Context, m *member) error {
 	}
 	status.Replicas = int32(len(rows))
 	status.InstanceStatuses = rows
+	if m.heldAttempts > 0 && target != "" {
+		status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: target, State: v1beta1.RetryBlockHeld, AttemptsStarted: m.heldAttempts, Reason: heldRecordReason}}
+	}
 	status.ObservedGeneration = ir.Generation
 	status.ObservedTemplateHash = ir.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]
 	if m.stale {

@@ -88,8 +88,8 @@ func (r PrefillDecodeRules) namedFirstSide() v1beta1.ComponentType {
 // ResolveGroups turns spec.rollout into a slice of ResolvedGroups in declaration
 // order, for the COORDINATION-style progressions only (blueGreen / rollingUpdate).
 // Canary groups are driven by the canary engine, not coordination, so they are
-// skipped here. Returns nil when no rollout (or no coordination-style group) is
-// declared. defaults carries the operator-configured fill-ins; callers without
+// skipped here; canaryUnitGroup resolves one for the pairing gates alone.
+// Returns nil when no rollout (or no coordination-style group) is declared. defaults carries the operator-configured fill-ins; callers without
 // access to operator configuration pass the zero value and get the documented
 // unconfigured behavior.
 func ResolveGroups(spec *v1beta1.RolloutSpec, defaults GroupDefaults) []ResolvedGroup {
@@ -118,6 +118,43 @@ func ResolveGroups(spec *v1beta1.RolloutSpec, defaults GroupDefaults) []Resolved
 		return []ResolvedGroup{seq}
 	}
 	return out
+}
+
+// canaryUnitGroup is the canary group that lists both the engine and the
+// decoder, with component among its members, resolved for the pairing gates
+// alone: the members in declaration order, the default pacing standing in
+// for the pacing block a canary group does not carry, and no coordination
+// policy. The canary executor stages the unit's capacity through each
+// member's partition and each member's own budget paces its starts; the
+// pairing gates keep each side's pairable minimum during a
+// pairing-protocol change, the way they do for a blueGreen group, and read
+// each side's own maxUnavailable as its budget. A canary over one
+// Component, or over the router alone, has no second side to pair.
+func canaryUnitGroup(spec *v1beta1.RolloutSpec, component v1beta1.ComponentType, defaults GroupDefaults) (ResolvedGroup, bool) {
+	if spec == nil {
+		return ResolvedGroup{}, false
+	}
+	for i := range spec.Groups {
+		g := &spec.Groups[i]
+		if g.DeclaredProgression() != v1beta1.RolloutProgressionCanary {
+			continue
+		}
+		unit := ResolvedGroup{
+			Name:       strconv.Itoa(i),
+			Index:      i,
+			Components: dedupComponents(g.Components),
+			Pacing:     pacingWithDefaults(nil, defaults),
+		}
+		if !groupPairsEngineAndDecoder(unit) {
+			continue
+		}
+		for _, c := range unit.Components {
+			if c == component {
+				return unit, true
+			}
+		}
+	}
+	return ResolvedGroup{}, false
 }
 
 // collapseSequential turns a list of 2+ single-Component blueGreen ResolvedGroups

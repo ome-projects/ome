@@ -21,6 +21,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
@@ -30,7 +32,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
-	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 )
 
 // pdParent is a PD parent ISVC with one blueGreen group spanning engine and
@@ -141,6 +142,41 @@ func TestResolvePeerRevisions_MissingPeerIRResolvesNothing(t *testing.T) {
 	}
 }
 
+// Beside an encoder every role is an OMENative replica that one service pass
+// projects, so a peer replica that does not exist yet holds a Component's
+// first pods: rendered now, they would lack that peer's revision endpoint for
+// life. A Component that already has Instances keeps rendering, and so does
+// one whose missing peer is not OMENative.
+func TestResolvePeerRevisions_MissingPeerHoldsFirstPodsBesideAnEncoder(t *testing.T) {
+	epd := pdParent()
+	epd.Spec.DeploymentMode = ptr.To(constants.OMENative)
+	epd.Spec.Encoder = &v1beta1.EncoderSpec{}
+	engine := projectedIR(v1beta1.EngineComponent, "7", "e1", "e2")
+	decoder := projectedIR(v1beta1.DecoderComponent, "7", "d1", "d2")
+	r, _ := newReconciler(t, engine, decoder, epd)
+
+	_, hold, err := r.resolvePeerRevisions(context.Background(), engine, epd, ownTargetCR("llama-engine-e2"))
+	if err != nil || !strings.Contains(hold, "encoder IR is not projected yet") {
+		t.Fatalf("first pods beside a missing encoder replica must hold: hold=%q err=%v", hold, err)
+	}
+
+	running := engine.DeepCopy()
+	running.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{Index: 0, Phase: v1beta1.OMENativeInstanceReady}}
+	peers, hold, err := r.resolvePeerRevisions(context.Background(), running, epd, ownTargetCR("llama-engine-e2"))
+	if err != nil || hold != "" {
+		t.Fatalf("a Component with Instances keeps rendering: hold=%q err=%v", hold, err)
+	}
+	if got := peers.hashFor(v1beta1.DecoderComponent, "e2"); got != "d2" {
+		t.Errorf("the decoder still pairs on its roll target d2, got %q", got)
+	}
+
+	raw := epd.DeepCopy()
+	raw.Spec.Encoder.Annotations = map[string]string{constants.DeploymentMode: string(constants.RawDeployment)}
+	if _, hold, err := r.resolvePeerRevisions(context.Background(), engine, raw, ownTargetCR("llama-engine-e2")); err != nil || hold != "" {
+		t.Fatalf("a missing peer that is not OMENative never holds: hold=%q err=%v", hold, err)
+	}
+}
+
 // TestResolvePeerRevisions_RollbackPinsPeerTarget pins that a peer rolling
 // back pairs on its rollback revision while that revision exists, and on
 // its spec target once the rollback revision is gone.
@@ -238,28 +274,28 @@ func TestEnsurePeerRevisionServices_CreatesPeerTargetServicesBeforePods(t *testi
 	}
 }
 
-// stampedIR is projectedIR carrying the template hash the projector stamps
+// hashedIR is projectedIR carrying the template hash the projector writes
 // beside the spec and a status that repeats it, the shape of every
 // projected replica.
-func stampedIR(component v1beta1.ComponentType, parentGeneration, currentHash, updateHash string) *v1beta1.InferenceReplica {
+func hashedIR(component v1beta1.ComponentType, parentGeneration, currentHash, updateHash string) *v1beta1.InferenceReplica {
 	ir := projectedIR(component, parentGeneration, currentHash, updateHash)
 	ir.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey] = v1beta1convert.TemplateHash(ir, ir.Spec.Runners)
 	ir.Status.ObservedTemplateHash = ir.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]
 	return ir
 }
 
-// TestResolvePeerRevisions_FreshnessFollowsTheTemplatesNotTheGeneration pins
-// what makes a peer's status stale: the pod templates its spec holds, not
+// TestResolvePeerRevisions_FreshnessFollowsTheTemplatesNotTheGeneration locks
+// in what makes a peer's status stale: the pod templates its spec holds, not
 // its generation. A decoder whose generation moved three times for writes
 // outside its templates (an annotation value the revision leaves out, a
 // count) with its status three generations behind is read as fresh and
 // pairs on the target its status names. A decoder whose templates changed
-// (a new image, a new stamp) while its status still repeats the previous
-// stamp holds the engine's pass, even with its generation observed.
+// (a new image, a new hash) while its status still repeats the previous
+// hash holds the engine's pass, even with its generation observed.
 func TestResolvePeerRevisions_FreshnessFollowsTheTemplatesNotTheGeneration(t *testing.T) {
-	engine := stampedIR(v1beta1.EngineComponent, "7", "e1", "e2")
+	engine := hashedIR(v1beta1.EngineComponent, "7", "e1", "e2")
 
-	rewritten := stampedIR(v1beta1.DecoderComponent, "7", "d1", "d2")
+	rewritten := hashedIR(v1beta1.DecoderComponent, "7", "d1", "d2")
 	rewritten.Generation += 3
 	r, _ := newReconciler(t, engine, rewritten, pdParent())
 	peers, hold, err := r.resolvePeerRevisions(context.Background(), engine, pdParent(), ownTargetCR("llama-engine-e2"))
@@ -270,11 +306,11 @@ func TestResolvePeerRevisions_FreshnessFollowsTheTemplatesNotTheGeneration(t *te
 		t.Errorf("the fresh peer pairs on its recorded target d2, got %q", got)
 	}
 
-	retemplated := stampedIR(v1beta1.DecoderComponent, "7", "d1", "d1")
+	retemplated := hashedIR(v1beta1.DecoderComponent, "7", "d1", "d1")
 	retemplated.Spec.Runners[0].Template.Spec.Containers[0].Image = "sgl:2.0"
 	retemplated.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey] = v1beta1convert.TemplateHash(retemplated, retemplated.Spec.Runners)
 	if retemplated.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey] == retemplated.Status.ObservedTemplateHash {
-		t.Fatal("a new image must move the template stamp")
+		t.Fatal("a new image must move the template hash")
 	}
 	r, _ = newReconciler(t, engine, retemplated, pdParent())
 	if _, hold, err := r.resolvePeerRevisions(context.Background(), engine, pdParent(), ownTargetCR("llama-engine-e2")); err != nil || hold == "" {
@@ -588,13 +624,13 @@ func churnReplica(component v1beta1.ComponentType, replicas int32) *v1beta1.Infe
 	ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "1"
 	ir.Annotations[constants.RevisionExcludedAnnotationKeysAnnotationKey] = churnWriterKey
 	ir.Spec.Runners[0].Template.Annotations = map[string]string{churnWriterKey: "0"}
-	stampTemplateHash(ir)
+	writeTemplateHash(ir)
 	return ir
 }
 
-// stampTemplateHash is the projector's stamp of the pod templates, written
+// writeTemplateHash writes the projector's hash of the pod templates, as
 // with every projection.
-func stampTemplateHash(ir *v1beta1.InferenceReplica) {
+func writeTemplateHash(ir *v1beta1.InferenceReplica) {
 	ir.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey] = v1beta1convert.TemplateHash(ir, ir.Spec.Runners)
 }
 
@@ -645,7 +681,7 @@ func (m *churnModel) push() {
 			m.pushed[key] = ir.Status.UpdateRevision
 			ir.Spec.Runners[0].Template.Spec.Containers[0].Image = "sgl:2.0"
 		}
-		stampTemplateHash(ir)
+		writeTemplateHash(ir)
 		ir.Generation++
 		if err := m.c.Update(m.ctx, ir); err != nil {
 			m.t.Fatalf("push %s: %v", key.Name, err)
@@ -673,7 +709,7 @@ func (m *churnModel) applyWrite(cl client.Client) {
 			}
 			ir.Spec.Runners[i].Template.Annotations[churnWriterKey] = strconv.Itoa(m.writeSeq)
 		}
-		stampTemplateHash(ir)
+		writeTemplateHash(ir)
 		ir.Generation++
 		if err := cl.Update(m.ctx, ir); err != nil {
 			m.t.Fatalf("writer tick: update %s: %v", key.Name, err)

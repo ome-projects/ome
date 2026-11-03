@@ -2497,46 +2497,100 @@ func TestReconcile_OpenRepair_TargetMovesBeforeTheCreate(t *testing.T) {
 }
 
 // TestReconcile_OpenRepair_TargetMovesAfterThePodsExist: the repair has
-// created its pods on the running revision when the fix is pushed. The
-// repair finishes on the revision those pods carry and the roll replaces
-// the Instance at the fix from Ready: tearing down a starting pod set is
-// the roll's job, under its budget. Single pod and gang.
+// created its pods on the running revision when the fix is pushed. A set
+// whose every pod is runtime-ready is one promote from serving: the repair
+// finishes on the revision those pods carry and the roll replaces the
+// Instance at the fix from Ready, under its budget. A set still starting
+// serves nothing, so the repair replaces it at the fix at once, as the
+// roll replaces its own in-flight attempt when the target moves: no pod of
+// the dropped revision is left, and the Instance comes back once, on the
+// fix, with the one repair on record. Single pod and gang.
 func TestReconcile_OpenRepair_TargetMovesAfterThePodsExist(t *testing.T) {
 	for _, gang := range []bool{false, true} {
 		shape := "single"
 		if gang {
 			shape = "gang"
 		}
-		t.Run(shape, func(t *testing.T) {
-			h := offTargetCrashHarness(t, gang, workloadtypes.UpdateStrategySurgeThenDrain, 1, 0, workloadtypes.RestartPolicyRecreateInstance, 1)
-			before := h.instance(0).Incarnation
-			breakWholeInstance(t, h, 0, crashAtStart)
-			h.events = nil
-			podsRebuilt := func() bool {
-				return h.repairInFlight() && len(h.podsOf(0)) == len(h.desired.Runners)
-			}
-			if !h.run(6, podsRebuilt) {
-				h.dumpState("after the crash")
-				t.Fatalf("the repair never rebuilt the pod set")
-			}
+		for _, tc := range []struct {
+			name string
+			// starting holds the rebuilt set below readiness when the fix
+			// is pushed.
+			starting bool
+		}{
+			{name: "set one promote from serving"},
+			{name: "set still starting", starting: true},
+		} {
+			t.Run(shape+"/"+tc.name, func(t *testing.T) {
+				h := offTargetCrashHarness(t, gang, workloadtypes.UpdateStrategySurgeThenDrain, 1, 0, workloadtypes.RestartPolicyRecreateInstance, 1)
+				before := h.instance(0).Incarnation
+				breakWholeInstance(t, h, 0, crashAtStart)
+				h.events = nil
+				podsRebuilt := func() bool {
+					return h.repairInFlight() && len(h.podsOf(0)) == len(h.desired.Runners)
+				}
+				if !h.run(6, podsRebuilt) {
+					h.dumpState("after the crash")
+					t.Fatalf("the repair never rebuilt the pod set")
+				}
+				builtOnV1 := map[types.UID]struct{}{}
+				for _, pod := range h.podsOf(0) {
+					builtOnV1[pod.UID] = struct{}{}
+					if tc.starting {
+						h.readinessFails[pod.UID] = true
+					}
+				}
 
-			h.setTarget(h.revFixed, fixedImage)
-			if !h.run(20, func() bool { return h.repairedAbove(0, before) }) {
-				h.dumpState("open repair after the push")
-				t.Fatalf("the repair did not finish on the pods it had created")
-			}
-			if s := h.instance(0); s.RunningRevision != h.revV1.Name {
-				t.Fatalf("repaired row records %q, want %s: the repair finishes on the revision its pods carry", s.RunningRevision, h.revV1.Name)
-			}
-			h.requirePodsRender(0, h.revV1, goodImage)
-			if !h.run(80, func() bool { return h.settledOn(h.revFixed, 1) }) {
-				h.dumpState("roll after the repair")
-				t.Fatalf("the roll did not replace the repaired Instance at the fix")
-			}
-			if n := h.restartsRecorded(); n != 1 {
-				t.Fatalf("restarts recorded = %d, want exactly the repair that was already open: %v", n, h.events)
-			}
-		})
+				h.setTarget(h.revFixed, fixedImage)
+				if !tc.starting {
+					if !h.run(20, func() bool { return h.repairedAbove(0, before) }) {
+						h.dumpState("open repair after the push")
+						t.Fatalf("the repair did not finish on the pods it had created")
+					}
+					if s := h.instance(0); s.RunningRevision != h.revV1.Name {
+						t.Fatalf("repaired row records %q, want %s: a set one promote from serving finishes on the revision it carries", s.RunningRevision, h.revV1.Name)
+					}
+					h.requirePodsRender(0, h.revV1, goodImage)
+				} else {
+					replaced := func() bool {
+						pods := h.podsOf(0)
+						if !h.repairInFlight() || len(pods) != len(h.desired.Runners) {
+							return false
+						}
+						for _, pod := range pods {
+							if _, old := builtOnV1[pod.UID]; old {
+								return false
+							}
+						}
+						return true
+					}
+					if !h.run(10, replaced) {
+						h.dumpState("open repair after the push")
+						t.Fatalf("the repair did not replace its starting set at the fix")
+					}
+					if s := h.instance(0); s.RunningRevision != h.revFixed.Name {
+						t.Fatalf("rebuilding row records %q, want %s: a set still starting is replaced at the fix", s.RunningRevision, h.revFixed.Name)
+					}
+					h.requirePodsRender(0, h.revFixed, fixedImage)
+					if !h.sawEvent(workloadtypes.EventReasonRestartRetargeted) {
+						t.Fatalf("the replacement was not named: %v", h.events)
+					}
+					for _, pod := range h.podsOf(0) {
+						delete(h.readinessFails, pod.UID)
+					}
+					if !h.run(20, func() bool { return h.repairedAbove(0, before) }) {
+						h.dumpState("repair on the fix")
+						t.Fatalf("the repair did not finish on the set it built at the fix")
+					}
+				}
+				if !h.run(80, func() bool { return h.settledOn(h.revFixed, 1) }) {
+					h.dumpState("roll after the repair")
+					t.Fatalf("the Instance did not settle on the fix")
+				}
+				if n := h.restartsRecorded(); n != 1 {
+					t.Fatalf("restarts recorded = %d, want exactly the repair that was already open: %v", n, h.events)
+				}
+			})
+		}
 	}
 }
 
@@ -2551,8 +2605,9 @@ func TestReconcile_OpenRepair_TargetMovesAfterThePodsExist(t *testing.T) {
 // is created after the rollback and both gangs settle on the starting
 // revision with the one repair on record. Before the first create the
 // rebuild itself renders the starting revision and records it on the
-// row; once the pods exist the repair finishes on the revision they carry
-// and the roll replaces the gang from Ready.
+// row; once the pods exist and are one promote from serving the repair
+// finishes on the revision they carry and the roll replaces the gang
+// from Ready.
 func TestReconcile_PushedGangCrashesAfterPromotion_RollbackLandsOnItsRepair(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -2682,11 +2737,12 @@ func TestReconcile_PushedGangCrashesAfterPromotion_RollbackLandsOnItsRepair(t *t
 // starting when the target moves. The open repair owns the Component's
 // wake-ups until it finishes, so no healthy peer leaves rotation while the
 // repaired Instance serves nothing: the peers stay untouched on the running
-// revision, no roll opens and no pod is added. Once the rebuilt set is up the
-// repair finishes on the revision its pods carry, and the roll then lands the
-// target on every Instance within its budget, with exactly the one repair on
-// record. Every strategy the engine rolls a single-pod Instance under, both
-// restart policies.
+// revision, no roll opens and no pod is added beside the repair, which
+// replaces its starting set at the new target. Once that set is up the
+// repair finishes on the target, and the roll then lands the target on the
+// peers within its budget, with exactly the one repair on record. Every
+// strategy the engine rolls a single-pod Instance under, both restart
+// policies.
 func TestReconcile_OpenRepair_PeersStayInRotationWhileTheTargetMoves(t *testing.T) {
 	const replicas = 3
 	const victim = int32(replicas - 1)
@@ -2706,13 +2762,20 @@ func TestReconcile_OpenRepair_PeersStayInRotationWhileTheTargetMoves(t *testing.
 					h.dumpState("after the crash")
 					t.Fatalf("the repair never rebuilt the pod set")
 				}
-				// The rebuilt pod stays in its startup window for as long as
-				// the story needs: the readiness it is held on is lifted below.
-				rebuilt := h.podsOf(victim)[0].UID
-				h.readinessFails[rebuilt] = true
+				// The repaired Instance's pods stay in their startup window
+				// for as long as the story needs, the set the repair builds
+				// at the new target included: the readiness they are held
+				// on is lifted below.
+				holdRepairedBelowReadiness := func() {
+					for _, pod := range h.podsOf(victim) {
+						h.readinessFails[pod.UID] = true
+					}
+				}
+				holdRepairedBelowReadiness()
 
 				h.setTarget(h.revFixed, fixedImage)
 				peersUntouched := func() {
+					holdRepairedBelowReadiness()
 					if s := h.instance(victim); s == nil || s.Phase != workloadtypes.InstancePhaseRestarting {
 						h.dumpState("repair left")
 						t.Fatalf("the open repair must keep driving the repaired Instance: %+v", s)
@@ -2729,22 +2792,28 @@ func TestReconcile_OpenRepair_PeersStayInRotationWhileTheTargetMoves(t *testing.
 							t.Fatalf("instance %d left rotation while the repaired instance %d served nothing", peer, victim)
 						}
 					}
-					if n := len(h.livePods()); n != replicas {
+					if n := len(h.livePods()); n > replicas {
 						h.dumpState("pod added")
-						t.Fatalf("%d live pods during the open repair, want %d: nothing surges beside a repair", n, replicas)
+						t.Fatalf("%d live pods during the open repair, want at most %d: nothing surges beside a repair", n, replicas)
 					}
 				}
 				h.runWithInvariant(6, func() bool { return false }, peersUntouched)
+				// The repair has replaced the set it built on the running
+				// revision with one at the target, still held below
+				// readiness.
+				h.requirePodsRender(victim, h.revFixed, fixedImage)
 
-				delete(h.readinessFails, rebuilt)
+				for _, pod := range h.podsOf(victim) {
+					delete(h.readinessFails, pod.UID)
+				}
 				if !h.run(20, func() bool { return h.repairedAbove(victim, before) }) {
 					h.dumpState("open repair after the push")
-					t.Fatalf("the repair did not finish on the pods it had created")
+					t.Fatalf("the repair did not finish on the set it built at the target")
 				}
-				if s := h.instance(victim); s.RunningRevision != h.revV1.Name {
-					t.Fatalf("repaired row records %q, want %s: the repair finishes on the revision its pods carry", s.RunningRevision, h.revV1.Name)
+				if s := h.instance(victim); s.RunningRevision != h.revFixed.Name {
+					t.Fatalf("repaired row records %q, want %s: a starting set is replaced at the target the push moved to", s.RunningRevision, h.revFixed.Name)
 				}
-				h.requirePodsRender(victim, h.revV1, goodImage)
+				h.requirePodsRender(victim, h.revFixed, fixedImage)
 
 				withinBudget := func() {
 					if h.repairInFlight() {

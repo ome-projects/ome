@@ -11,13 +11,12 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // These tests drive evaluateAnalysisStep against the PRODUCTION sampling stack —
@@ -135,15 +134,11 @@ func TestAnalysisLifecycle_FailureAccrualAndPacing(t *testing.T) {
 	prom := newPromStub(t)
 	prom.respondVector("0.5") // breaches the 0.05 threshold
 
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "canary-a-prom-auth", Namespace: "canary-a"},
 		Data:       map[string][]byte{"token": []byte("canary-a-token")},
 	}
-	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	reader := fakeclient.New(t, fakeclient.WithObjects(secret))
 
 	events := make(chan event.GenericEvent, 8)
 	s := NewPrometheusSampler(events, 2, time.Hour)

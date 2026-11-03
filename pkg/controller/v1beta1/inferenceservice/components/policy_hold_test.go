@@ -17,7 +17,6 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/autoscalerpolicy/render"
@@ -25,12 +24,13 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func holdTestResolver(t *testing.T, holdRequeue time.Duration, objs ...client.Object) *autoscaler.PolicyResolver {
 	t.Helper()
 	return &autoscaler.PolicyResolver{
-		Client:           ctrlclientfake.NewClientBuilder().WithScheme(rawAutoscalerTestScheme(t)).WithObjects(objs...).Build(),
+		Client:           componentClient(t, fakeclient.WithObjects(objs...)),
 		Providers:        render.Providers{"cluster-prometheus": {ServerAddress: "http://prometheus.example.com:9090"}},
 		Enabled:          true,
 		KedaAvailable:    true,
@@ -140,8 +140,7 @@ func TestMergeRequeueAfter(t *testing.T) {
 // A raw hold's requeue must survive the full component dispatch: the
 // reconcile result carries it, and no scaler object appears (fail closed).
 func TestEngineRawDeployment_HoldRequeueSurfaces(t *testing.T) {
-	scheme := rawAutoscalerTestScheme(t)
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
+	cl := componentClient(t)
 	resolver := &autoscaler.PolicyResolver{
 		Client:           cl,
 		Enabled:          true,
@@ -160,7 +159,7 @@ func TestEngineRawDeployment_HoldRequeueSurfaces(t *testing.T) {
 	deps := &ComponentDeps{
 		Client:    cl,
 		Clientset: rawAutoscalerTestClientset(),
-		Scheme:    scheme,
+		Scheme:    cl.Scheme(),
 		Config:    &controllerconfig.InferenceServicesConfig{},
 	}
 	engine := NewEngine(deps, ComponentInputs{DeploymentMode: constants.RawDeployment, PolicyResolver: resolver}, isvc.Spec.Engine).(*Engine)

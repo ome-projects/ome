@@ -43,6 +43,7 @@ var componentTypes = newEnumTable(map[v1beta1.ComponentType]workloadtypes.Compon
 	v1beta1.RouterComponent:  workloadtypes.ComponentRouter,
 	v1beta1.EngineComponent:  workloadtypes.ComponentEngine,
 	v1beta1.DecoderComponent: workloadtypes.ComponentDecoder,
+	v1beta1.EncoderComponent: workloadtypes.ComponentEncoder,
 })
 
 // instancePhases lists the empty phase too: a row allocated before its
@@ -162,6 +163,10 @@ func InstanceOperationToWorkload(v *v1beta1.InstanceOperation) *workloadtypes.In
 		at := *v.CapacityRefusedAt
 		out.CapacityRefusedAt = &at
 	}
+	if v.PlacementWaitSince != nil {
+		at := *v.PlacementWaitSince
+		out.PlacementWaitSince = &at
+	}
 	if v.SurgeIndex != nil {
 		s := *v.SurgeIndex
 		out.SurgeIndex = &s
@@ -198,6 +203,10 @@ func InstanceOperationFromWorkload(w *workloadtypes.InstanceOperation) *v1beta1.
 	if w.CapacityRefusedAt != nil {
 		at := *w.CapacityRefusedAt
 		out.CapacityRefusedAt = &at
+	}
+	if w.PlacementWaitSince != nil {
+		at := *w.PlacementWaitSince
+		out.PlacementWaitSince = &at
 	}
 	if w.SurgeIndex != nil {
 		s := *w.SurgeIndex

@@ -9,6 +9,7 @@ import (
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -514,5 +515,38 @@ func TestWithHPAName(t *testing.T) {
 	bare := WithHPAName(&v1beta1.KedaAutoscaler{}, "demo-engine")
 	if name := ConfiguredHPAName(bare.Advanced); name != "demo-engine" {
 		t.Errorf("configured name on a block without advanced = %q, want %q", name, "demo-engine")
+	}
+}
+
+func TestShortenedHPAName(t *testing.T) {
+	// KEDA names the HPA "keda-hpa-" plus the ScaledObject name, 9 characters
+	// longer than the ScaledObject name.
+	fits := "scaledobject-" + strings.Repeat("a", 41)
+	if got := len(kedaHPANamePrefix + fits); got != validation.DNS1123LabelMaxLength {
+		t.Fatalf("test setup: KEDA's name is %d characters, want exactly %d", got, validation.DNS1123LabelMaxLength)
+	}
+	if got := ShortenedHPAName(fits); got != "" {
+		t.Errorf("ShortenedHPAName(%q) = %q, want \"\" so KEDA keeps its own name", fits, got)
+	}
+
+	tooLong := "scaledobject-team-a-example-model-shared-shadow-decoder"
+	got := ShortenedHPAName(tooLong)
+	if len(got) != validation.DNS1123LabelMaxLength {
+		t.Errorf("ShortenedHPAName(%q) = %q, %d characters, want %d", tooLong, got, len(got), validation.DNS1123LabelMaxLength)
+	}
+	if errs := validation.IsDNS1123Label(got); len(errs) > 0 {
+		t.Errorf("ShortenedHPAName(%q) = %q, not a DNS label: %v", tooLong, got, errs)
+	}
+	if !strings.HasSuffix(got, "example-model-shared-shadow-decoder") {
+		t.Errorf("ShortenedHPAName(%q) = %q, want it to keep the end of the name", tooLong, got)
+	}
+	if got != ShortenedHPAName(tooLong) {
+		t.Error("ShortenedHPAName must return the same name on every call")
+	}
+	// Two names that differ only in their first characters keep the same end,
+	// so only the hash keeps their HPAs apart.
+	other := ShortenedHPAName("scaledobject-team-b-example-model-shared-shadow-decoder")
+	if other == got {
+		t.Errorf("two ScaledObjects got the same HPA name %q", got)
 	}
 }

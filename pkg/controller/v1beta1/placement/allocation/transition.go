@@ -48,6 +48,9 @@ type Step struct {
 	Complete bool
 	// Message explains a hold in operator terms; empty uses the reason's text.
 	Message string
+	// CleanupReleased reports a complete step whose wait for members to fit
+	// within the plan's replicas was ended by an operator request.
+	CleanupReleased bool
 }
 
 // Advance moves toward Desired while retaining old replicas until replacement

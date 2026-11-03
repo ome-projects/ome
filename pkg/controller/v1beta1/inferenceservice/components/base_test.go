@@ -11,6 +11,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -32,6 +33,34 @@ func TestCoordinatorFollowerDefaultAutoscalerOwnership(t *testing.T) {
 	resolved, err = resolveComponentAutoscaling(context.Background(), fields, service, v1beta1.DecoderComponent, ext)
 	if err != nil || resolved.Resolved == nil || resolved.Resolved.Class != v1beta1.AutoscalerNone {
 		t.Fatalf("coordinator-owned follower should suppress its default HPA: %+v, %v", resolved, err)
+	}
+}
+
+// A scaling-policy follower with no autoscaler block runs class None, and its
+// status says so: a status that re-resolves without the follower rule would
+// report the default HPA as managed by OME while nothing runs it.
+func TestCoordinatorFollowerStatusReportsTheClassThatRuns(t *testing.T) {
+	cl := componentClient(t)
+	fields := &BaseComponentFields{
+		Piece:               render.Piece{DeploymentMode: constants.OMENative},
+		Client:              cl,
+		PolicyResolver:      holdTestResolver(t, 0),
+		CoordinatorFollower: true,
+	}
+	ext := v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(1), MaxReplicas: 8}
+	isvc := holdTestISVC(ext)
+
+	dispatched, err := resolveComponentAutoscaling(context.Background(), fields, isvc, v1beta1.EngineComponent, &ext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeComponentAutoscalerStatus(fields, isvc, v1beta1.EngineComponent, metav1.ObjectMeta{Name: "llm-a-engine", Namespace: "default"}, &ext); err != nil {
+		t.Fatal(err)
+	}
+	status := isvc.Status.Components[v1beta1.EngineComponent].Autoscaler
+	if dispatched.Resolved.Class != v1beta1.AutoscalerNone || status.Class != v1beta1.AutoscalerNone {
+		t.Fatalf("follower dispatch runs class %q; status reports class %q managedBy %q, want None for both",
+			dispatched.Resolved.Class, status.Class, status.ManagedBy)
 	}
 }
 

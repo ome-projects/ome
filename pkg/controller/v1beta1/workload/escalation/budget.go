@@ -82,27 +82,25 @@ func PerComponentMaxUnavailableBudget(ru *types.RollingUpdate, replicas int32) i
 	return utils.ScaledCountFromIntOrString(ru.MaxUnavailable, replicas, true)
 }
 
-// CurrentSurgeInFlight counts InstanceStatuses participating in an
-// in-flight SurgeThenDrain operation — those that already have an
-// extra pod alive from a prior wake-up. The dispatcher consults this
-// before deciding whether to start ONE MORE surge this wake-up. The
-// step-set { "Surge", "SurgeDrain", "SurgeDrainSettle" } mirrors the
-// coordination-group
-// CheckSurge accounting in
+// surgeSteps are the Update steps during which the roll keeps an extra
+// pod beside the Instance's own: the replacement runs before the source
+// pod is deleted. The coordination gate's surgeInFlight in
 // pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go
-// — both layers see the same in-flight signal so the budget math is
-// consistent.
+// counts the same steps, so both layers read one in-flight signal.
+var surgeSteps = map[string]bool{
+	types.UpdateStepSurge:            true,
+	types.UpdateStepSurgeDrain:       true,
+	types.UpdateStepSurgeDrainSettle: true,
+}
+
+// CurrentSurgeInFlight counts the Instances whose roll already holds an
+// extra pod from an earlier pass. The dispatcher reads it before starting
+// one more surge in this pass. The other steps (Drain for a recreate,
+// InPlace for an in-place patch) add no pod.
 func CurrentSurgeInFlight(statuses []types.InstanceStatus) int32 {
 	var n int32
 	for _, s := range statuses {
-		if s.Operation == nil {
-			continue
-		}
-		// Surge contributes +1 pod alive; SurgeDrain does too (the
-		// old pod hasn't been deleted yet). Other ops (Drain for
-		// recreate, InPlace for in-place patch) don't add pods.
-		switch s.Operation.Step {
-		case "Surge", "SurgeDrain", "SurgeDrainSettle":
+		if s.Operation != nil && surgeSteps[s.Operation.Step] {
 			n++
 		}
 	}
@@ -133,19 +131,22 @@ func CurrentUnavailableInFlight(statuses []types.InstanceStatus) int32 {
 		if !updating && !failedUpdate {
 			continue
 		}
-		if s.Operation == nil {
-			n++
+		if s.Operation != nil && (surgeSteps[s.Operation.Step] || replacementGangSteps[s.Operation.Step]) {
+			// A surge keeps the Instance's own pod serving, and a
+			// replacement gang's row is its source's attempt seen from the
+			// other index: it has no set of its own to take offline.
 			continue
 		}
-		switch s.Operation.Step {
-		case "Surge", "SurgeDrain", "SurgeDrainSettle":
-			// Surge doesn't take a pod offline.
-			continue
-		default:
-			n++
-		}
+		n++
 	}
 	return n
+}
+
+// replacementGangSteps are the steps of a gang surge's replacement row,
+// the index the source claims for the gang it builds beside its own.
+var replacementGangSteps = map[string]bool{
+	types.UpdateStepGangSurgeTarget:        true,
+	types.UpdateStepGangSurgeTargetCleanup: true,
 }
 
 // CurrentRestartingInFlight counts InstanceStatuses whose pod set is
@@ -230,15 +231,12 @@ func ExtraPodSurgeInFlight(plan types.ComponentPlan, statuses []types.InstanceSt
 	for i := range statuses {
 		runningRevision[statuses[i].Index] = query.RevisionFromName(statuses[i].RunningRevision)
 		op := statuses[i].Operation
-		if op == nil {
+		if op == nil || !surgeSteps[op.Step] {
 			continue
 		}
-		switch op.Step {
-		case types.UpdateStepSurge, types.UpdateStepSurgeDrain, types.UpdateStepSurgeDrainSettle:
-			charged[statuses[i].Index] = struct{}{}
-			if op.SurgeIndex != nil {
-				charged[*op.SurgeIndex] = struct{}{}
-			}
+		charged[statuses[i].Index] = struct{}{}
+		if op.SurgeIndex != nil {
+			charged[*op.SurgeIndex] = struct{}{}
 		}
 	}
 	for _, idx := range rolled {

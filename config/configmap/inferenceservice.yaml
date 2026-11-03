@@ -27,7 +27,23 @@ data:
 
   deploy: |-
     {
-      "defaultDeploymentMode": "RawDeployment"
+      "defaultDeploymentMode": "RawDeployment",
+      "replicas": {
+        "defaultMinReplicas": 1,
+        "defaultMaxReplicas": {
+          "engine": 3,
+          "decoder": 3,
+          "encoder": 3,
+          "router": 2
+        }
+      }
+    }
+
+  podDisruptionBudget: |-
+    {
+      "rawDeployment": {
+        "maxUnavailable": 1
+      }
     }
 
   # tpuSliceProvisioning describes TPU node pools that provision slices on

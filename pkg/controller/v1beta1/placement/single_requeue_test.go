@@ -18,6 +18,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestSingleAdmissionWaitHonorsStatusBackstop(t *testing.T) {
@@ -49,22 +50,18 @@ func TestSingleAdmissionWaitHonorsStatusBackstop(t *testing.T) {
 				f.reconciler.DispatcherStepSize = 1
 				f.reconciler.DispatcherRoundTimeout = tt.round
 			}
-			if tt.failCreate || tt.failObservation {
-				wrapped := interceptor.NewClient(f.workers["member-b"], interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-					if _, ok := obj.(*v1beta1.InferenceReplica); ok && tt.failObservation {
-						return errors.New("member observation unavailable")
-					}
-					return c.Get(ctx, key, obj, opts...)
-				}, Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
-					if _, ok := obj.(*v1beta1.InferenceService); ok && tt.failCreate {
-						return errors.New("member write unavailable")
-					}
-					return c.Create(ctx, obj, opts...)
-				}})
-				f.connections.m["member-b"] = workloadcluster.NewNeverCachingClient(wrapped)
+			var refusals []fakeclient.Option
+			if tt.failObservation {
+				refusals = append(refusals, fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, errors.New("member observation unavailable")).OnKind(&v1beta1.InferenceReplica{}))
+			}
+			if tt.failCreate {
+				refusals = append(refusals, fakeclient.FailingVerb(fakeclient.Create, fakeclient.EveryCall, errors.New("member write unavailable")).OnKind(&v1beta1.InferenceService{}))
+			}
+			if len(refusals) > 0 {
+				f.connections.m["member-b"] = workloadcluster.NewNeverCachingClient(fakeclient.Wrap(t, f.workers["member-b"], refusals...))
 			}
 			if tt.staleStatus {
-				f.reconciler.Client = interceptor.NewClient(f.reconciler.Client.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				f.reconciler.Client = fakeclient.Wrap(t, f.reconciler.Client.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 					service, ok := obj.(*v1beta1.InferenceService)
 					if ok && subresource == "status" && service.Status.ObservedGeneration == service.Generation {
 						live := &v1beta1.InferenceService{}
@@ -78,7 +75,7 @@ func TestSingleAdmissionWaitHonorsStatusBackstop(t *testing.T) {
 						return apierrors.NewConflict(schema.GroupResource{Group: v1beta1.SchemeGroupVersion.Group, Resource: "inferenceservices"}, service.Name, errors.New("source changed"))
 					}
 					return c.SubResource(subresource).Update(ctx, obj, opts...)
-				}})
+				}}))
 			}
 			got, err := f.reconciler.Reconcile(t.Context(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(f.source)})
 			if err != nil {

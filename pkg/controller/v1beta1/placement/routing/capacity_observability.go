@@ -23,10 +23,14 @@ func init() {
 	ctrlmetrics.Registry.MustRegister(capacityFallbackClusters)
 }
 
+// capacityFallbackCount counts the entries that lack a current observation. A
+// Reported cluster whose current report waits for a ready replica is not
+// counted, just as Ceiling mode needs no fallback for a cluster without one.
 func capacityFallbackCount(spec v1beta1.TrafficMapSpec) int {
 	count := 0
 	for _, entry := range spec.Entries {
-		if entry.Capacity != nil && entry.Capacity.FallbackReason != "" {
+		if entry.Capacity != nil && entry.Capacity.FallbackReason != "" &&
+			entry.Capacity.FallbackReason != reportedCapacityNotReadyReason {
 			count++
 		}
 	}

@@ -270,8 +270,8 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 		serving:   serving,
 		instances: instances,
 		floors: map[v1beta1.ComponentType]pairFloor{
-			component: resolvePairFloor(replicas[component], ctx.Group.Pacing),
-			peer:      resolvePairFloor(replicas[peer], ctx.Group.Pacing),
+			component: ctx.pairableMinimumOf(replicas[component]),
+			peer:      ctx.pairableMinimumOf(replicas[peer]),
 		},
 		mechanics: map[v1beta1.ComponentType]stepMechanics{
 			component: mine,
@@ -282,7 +282,7 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 			peer:      replicas[peer] != nil,
 		},
 		protocols: protoByRevision,
-		firstSide: ctx.Defaults.PrefillDecode.namedFirstSide(),
+		firstSide: ctx.namedFirstSide(),
 	}
 	// A dead end needs a settled picture: nothing in flight on either side,
 	// this pass's starts included.
@@ -345,6 +345,17 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 		return pairingVerdict{reason: reason}
 	}
 	return allow("")
+}
+
+// namedFirstSide is the pairing side the operator names to move first
+// inside every batch, which the batch step orders. A canary unit is not
+// batched, so none is named for it and the pairing gate orders the two
+// sides itself.
+func (ctx GateContext) namedFirstSide() v1beta1.ComponentType {
+	if ctx.CanaryUnit {
+		return ""
+	}
+	return ctx.Defaults.PrefillDecode.namedFirstSide()
 }
 
 // stepMechanics is what a start does to the serving picture at once: the

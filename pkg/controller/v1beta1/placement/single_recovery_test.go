@@ -10,10 +10,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestSingleRestorationRequiresPhysicalAbsence(t *testing.T) {
@@ -98,7 +98,7 @@ func TestSingleRestorationRequiresPhysicalAbsence(t *testing.T) {
 				}
 			}
 			connections := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
-				"member-a": workloadcluster.NewNeverCachingClient(interceptor.NewClient(worker, fixture.intercept)),
+				"member-a": workloadcluster.NewNeverCachingClient(fakeclient.Wrap(t, worker, fakeclient.WithInterceptors(fixture.intercept))),
 				"member-b": workloadcluster.NewNeverCachingClient(emptyWorker(scheme)),
 			}}
 			clusters := []v1beta1.WorkloadCluster{*readyWC("member-a", nil), *readyWC("member-b", nil)}

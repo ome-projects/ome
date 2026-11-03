@@ -104,17 +104,17 @@ func TestNewestAutoRecoverEntry(t *testing.T) {
 	if got := NewestAutoRecoverEntry(nil, "engine", 0); got != nil {
 		t.Errorf("nil ledger: got %+v want nil", got)
 	}
-	ledger := &Ledger{Entries: []Entry{
+	records := &Ledger{Entries: []Entry{
 		autoRecoverEntry("u1", "node-a", -2*time.Minute),
 		autoRecoverEntry("u2", "node-b", -time.Minute),
 		// Non-AutoRecover entry after the newest directive must not win.
 		{RequestUUID: "u3", Component: "engine", SourceInstance: 0, Phase: PhaseStarted},
 	}}
-	got := NewestAutoRecoverEntry(ledger, "engine", 0)
+	got := NewestAutoRecoverEntry(records, "engine", 0)
 	if got == nil || got.RequestUUID != "u2" || got.FromNode != "node-b" {
 		t.Fatalf("newest: got %+v want u2/node-b", got)
 	}
-	if got := NewestAutoRecoverEntry(ledger, "engine", 1); got != nil {
+	if got := NewestAutoRecoverEntry(records, "engine", 1); got != nil {
 		t.Errorf("other instance: got %+v want nil", got)
 	}
 }
@@ -150,5 +150,35 @@ func TestReleaseAutoRecoverExclusions(t *testing.T) {
 	}
 	if ReleaseAutoRecoverExclusions(ledger, "engine", 0, "") != nil || ReleaseAutoRecoverExclusions(nil, "engine", 0, "own-engine-rev1") != nil {
 		t.Errorf("no revision or no ledger must release nothing")
+	}
+}
+
+func TestHasInFlightMigrationForInstance(t *testing.T) {
+	if HasInFlightMigrationForInstance(nil, "engine", 1) {
+		t.Errorf("nil records: got true want false")
+	}
+	row := func(uuid, component string, idx int32, phase string) Entry {
+		return Entry{RequestUUID: uuid, Component: component, SourceInstance: idx, Phase: phase}
+	}
+	cases := []struct {
+		name string
+		rows []Entry
+		want bool
+	}{
+		{"no rows", nil, false},
+		{"started row of the instance", []Entry{row("u1", "engine", 1, PhaseStarted)}, true},
+		{"started row of another instance", []Entry{row("u1", "engine", 2, PhaseStarted)}, false},
+		{"started row of another component", []Entry{row("u1", "decoder", 1, PhaseStarted)}, false},
+		{"completed row of the instance", []Entry{row("u1", "engine", 1, PhaseCompleted)}, false},
+		{"failed row of the instance", []Entry{row("u1", "engine", 1, PhaseFailed)}, false},
+		{"started row after terminal rows", []Entry{
+			row("u0", "engine", 1, PhaseCompleted),
+			row("u1", "engine", 1, PhaseStarted),
+		}, true},
+	}
+	for _, c := range cases {
+		if got := HasInFlightMigrationForInstance(&Ledger{Entries: c.rows}, "engine", 1); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
 	}
 }

@@ -480,3 +480,67 @@ func TestRecreateUpdate_RefusedStatusRestampLeavesTheRowAlone(t *testing.T) {
 		})
 	}
 }
+
+// TestRecreateUpdate_RowWithNoRunningRevisionNamesWhatItRebuilds: a Failed
+// row that names no running revision has no source revision to move from,
+// and its members still stand, so the fresh attempt opens as a recreate
+// that deletes them first rather than as a Create. The operation's reason
+// and the event then say in words what the rebuild follows: a failed
+// create when the Instance never served, a set that never served when the
+// Instance served once before. Neither reads an empty source revision.
+func TestRecreateUpdate_RowWithNoRunningRevisionNamesWhatItRebuilds(t *testing.T) {
+	servedOnce := metav1.NewTime(fixture.Epoch.Add(-time.Hour))
+	tests := []struct {
+		name       string
+		strategy   workload.UpdateStrategyType
+		readySince *metav1.Time
+		wantCause  string
+	}{
+		{name: "never served, recreate strategy", strategy: workload.UpdateStrategyRecreatePod, wantCause: "rebuild after a failed create"},
+		{name: "never served, surge strategy", strategy: workload.UpdateStrategySurgeThenDrain, wantCause: "rebuild after a failed create"},
+		{name: "served once, names no revision now", strategy: workload.UpdateStrategyRecreatePod, readySince: &servedOnce, wantCause: "rebuild of a set that never served"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture.ResetExpectations(t)
+			isvc, ir := fixture.ServiceWithReadyInstance("llama-70b", "prod", 1)
+			ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceFailed
+			ir.Status.InstanceStatuses[0].LastFailure = &v1beta1.InstanceTermination{Reason: "DeadlineExceeded"}
+			// The member the failed attempt left behind: bound, never running.
+			standing := fixture.PodAtRecreation(isvc, 0, 1, false, false)
+			fixture.Pending(standing)
+			c := fixture.FakeClient(t, isvc, ir, standing)
+			targetSpec := fixture.PodSpecWithImage("llama:v1")
+			target := fixture.EnsureTargetRevision(t, c, isvc, targetSpec)
+
+			input := fixture.ReconcileInput(isvc, c, workload.ComponentEngine)
+			input.ObservedState.InstanceStatuses[0].ReadySince = tc.readySince
+			plan := fixture.SinglePodPlan(tc.strategy, nil)
+			rec := record.NewFakeRecorder(16)
+			deps := fixture.Deps(c)
+			deps.Recorder = rec
+
+			if _, err := UpdateWithPods(context.Background(), deps, input, plan, plan.Instances[0], target, targetSpec, []*corev1.Pod{standing}); err != nil {
+				t.Fatalf("UpdateWithPods: %v", err)
+			}
+
+			want := tc.wantCause + " -> " + target.Name
+			row := fixture.StoredInstanceStatuses(c, isvc, workload.ComponentEngine)[0]
+			if row.Operation == nil || row.Operation.Type != v1beta1.InstanceOperationUpdate || row.Operation.Step != workload.UpdateStepDrain {
+				t.Fatalf("operation: got %+v, want the recreate's Update/Drain", row.Operation)
+			}
+			if row.Phase != v1beta1.OMENativeInstanceUpdating {
+				t.Fatalf("phase: got %q, want Updating", row.Phase)
+			}
+			if row.Operation.Reason != want {
+				t.Errorf("Operation.Reason: got %q, want %q", row.Operation.Reason, want)
+			}
+			if events := drainEvents(rec); !anyContains(events, "recreate ("+want+",") {
+				t.Errorf("RecreateUpdateStarted must say what the rebuild follows; got %v", events)
+			}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(standing), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+				t.Errorf("the standing member must be deleted before the rebuild; get: %v", err)
+			}
+		})
+	}
+}

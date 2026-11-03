@@ -22,10 +22,12 @@ import (
 
 // TestSplitCleanupWaitFollowsMovesOnly: a complete Split step with a local
 // ceiling ends the pause while autoscalers keep replicas above the new shares.
-// That applies whether the shares fell, rose, moved or stayed, and when a member
-// joins. The wait stays for a plan without a positive ceiling, a member below
-// its new share or not eligible, and a member that leaves or drains. It also
-// stays for component weights, unassigned replicas and a capacity split.
+// That applies whether the shares fell, rose, moved or stayed, when a member
+// joins, and when the terms set component weights or divide the routers. The
+// wait stays for a plan without a positive ceiling, a member below its new
+// engine or router share or not eligible, and a member that leaves or drains.
+// It also stays while a member keeps routers until their replacements take
+// traffic, for unassigned replicas and for a capacity split.
 func TestSplitCleanupWaitFollowsMovesOnly(t *testing.T) {
 	type edit func(*v1beta1.InferenceService, map[string]plannedMemberObservation)
 	assigned := func(name string, change func(*v1beta1.CandidateAllocationStatus)) edit {
@@ -34,6 +36,25 @@ func TestSplitCleanupWaitFollowsMovesOnly(t *testing.T) {
 				if candidate.Cluster == name {
 					change(candidate.Allocation)
 				}
+			}
+		}
+	}
+	// dividedRouters divides 4 routers by router weights 1 and 3, which give a
+	// and b router shares of 1 and 3. Each member's spec sets its router minimum
+	// from minimums, and it runs the routers in ready.
+	dividedRouters := func(minimums, ready map[string]int32) edit {
+		return func(s *v1beta1.InferenceService, o map[string]plannedMemberObservation) {
+			routerWeights := map[string]int32{"a": 1, "b": 3}
+			s.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(4), MaxReplicas: 8}}
+			s.Spec.Placement.ClusterAffinity = perMemberTerms(map[string]int32{"a": 1, "b": 1}, nil, routerWeights)
+			for _, candidate := range s.Status.Placement.Candidates {
+				candidate.Allocation.Weight = ptr.To[int64](1)
+				candidate.Allocation.ComponentMatches = []v1beta1.ComponentAffinityMatch{{Component: v1beta1.RouterComponent, Weight: ptr.To(int64(routerWeights[candidate.Cluster]))}}
+			}
+			for name, observation := range o {
+				observation.Member.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(int(minimums[name])), MaxReplicas: 8}}
+				observation.ComponentReady[v1beta1.RouterComponent] = ready[name]
+				o[name] = observation
 			}
 		}
 	}
@@ -66,7 +87,7 @@ func TestSplitCleanupWaitFollowsMovesOnly(t *testing.T) {
 			s.Spec.Placement.Split = nil
 		}},
 		{name: "zero local ceiling", want: waiting, edit: func(s *v1beta1.InferenceService, _ map[string]plannedMemberObservation) {
-			s.Spec.Placement.Split.MaxReplicasPerCluster = 0
+			s.Spec.Placement.Split.MaxPerCluster = engineCap(0)
 		}},
 		{name: "member below its new minimum", want: waiting, edit: func(_ *v1beta1.InferenceService, o map[string]plannedMemberObservation) {
 			observation := o["b"]
@@ -103,11 +124,21 @@ func TestSplitCleanupWaitFollowsMovesOnly(t *testing.T) {
 			o["c"] = plannedMemberObservation{MemberState: allocation.MemberState{Known: true, Absent: true}}
 		}},
 		{name: "member asked to drain", want: waiting, edit: assigned("b", func(a *v1beta1.CandidateAllocationStatus) { a.DrainRequested = true })},
-		{name: "component weights", want: waiting, edit: func(s *v1beta1.InferenceService, _ map[string]plannedMemberObservation) {
+		{name: "component weights", want: ends, edit: func(s *v1beta1.InferenceService, _ map[string]plannedMemberObservation) {
 			s.Spec.Placement.ClusterAffinity = []v1beta1.ClusterAffinityTerm{{
 				Weights:     &v1beta1.ClusterAffinityWeights{Default: ptr.To[int32](1)},
 				MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"a", "b"}}},
 			}}
+		}},
+		{name: "divided routers at their shares", want: ends, edit: dividedRouters(map[string]int32{"a": 1, "b": 3}, map[string]int32{"a": 1, "b": 3})},
+		{name: "member below its router share", want: waiting, edit: dividedRouters(map[string]int32{"a": 1, "b": 3}, map[string]int32{"a": 1, "b": 2})},
+		{name: "member keeps routers for a replacement", want: waiting, edit: func(s *v1beta1.InferenceService, o map[string]plannedMemberObservation) {
+			// Every member runs at least its router share, but b takes no
+			// traffic yet, so a keeps 2 routers until it does.
+			dividedRouters(map[string]int32{"a": 2, "b": 3}, map[string]int32{"a": 2, "b": 3})(s, o)
+			observation := o["b"]
+			observation.MemberState.Routable = false
+			o["b"] = observation
 		}},
 		{name: "unassigned replicas", want: waiting, edit: func(s *v1beta1.InferenceService, _ map[string]plannedMemberObservation) {
 			s.Status.Placement.Plan.OriginalUnassignedReplicas = 1
@@ -118,7 +149,7 @@ func TestSplitCleanupWaitFollowsMovesOnly(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s := srcISVCMode(v1beta1.PlacementModeSplit, "")
-			s.Spec.Engine.MinReplicas, s.Spec.Placement.Split = ptr.To(6), &v1beta1.SplitSpec{MaxReplicasPerCluster: 18}
+			s.Spec.Engine.MinReplicas, s.Spec.Placement.Split = ptr.To(6), &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)}
 			s.Status.Placement = &v1beta1.PlacementStatus{Plan: &v1beta1.PlacementPlanStatus{InputDigest: "intent", AssignedReplicas: 6, PauseSurge: true}}
 			o := map[string]plannedMemberObservation{}
 			// Each member began the change at a share of 6, took 3, and its
@@ -286,7 +317,7 @@ func TestSplitPauseWaitsForADecoderReplacement(t *testing.T) {
 func TestSplitPauseWaitsForUnequalDecoderShares(t *testing.T) {
 	f := singleFixture(t, true)
 	f.source.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: 18}
+	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)}
 	f.source.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 2, "member-b": 1})
 	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(6), 36
 	f.source.Spec.Decoder.MinReplicas, f.source.Spec.Decoder.MaxReplicas = ptr.To(30), 180
@@ -353,7 +384,7 @@ func TestSplitPauseWaitsForUnequalDecoderShares(t *testing.T) {
 func TestSplitPauseWaitsForAnIneligibleMember(t *testing.T) {
 	f := singleFixture(t, true)
 	f.source.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: 18}
+	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)}
 	f.source.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 2, "member-b": 1})
 	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(6), 36
 	f.source.Spec.Decoder.MinReplicas, f.source.Spec.Decoder.MaxReplicas = ptr.To(30), 180
@@ -469,9 +500,16 @@ func TestSplitLowerMinimumKeepsServingCapacity(t *testing.T) {
 // ceiling of 18 engines lets each member's autoscaler scale above its share.
 func autoscaledSplitFixture(t *testing.T) *backendFixture {
 	t.Helper()
+	return autoscaledSplitFixtureWith(t, &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)})
+}
+
+// autoscaledSplitFixtureWith is autoscaledSplitFixture with the given split
+// block, which must let each member's autoscaler scale above its share.
+func autoscaledSplitFixtureWith(t *testing.T, split *v1beta1.SplitSpec) *backendFixture {
+	t.Helper()
 	f := singleFixture(t, true)
 	f.source.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxReplicasPerCluster: 18}
+	f.source.Spec.Placement.Split = split
 	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(12), 36
 	f.source.Spec.Decoder.MinReplicas, f.source.Spec.Decoder.MaxReplicas = ptr.To(8), 24
 	f.source.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(2), MaxReplicas: 2}, Runner: f.source.Spec.Engine.Runner.DeepCopy()}

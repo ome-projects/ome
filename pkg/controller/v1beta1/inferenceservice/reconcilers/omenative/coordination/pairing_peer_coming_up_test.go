@@ -8,10 +8,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // The pictures below are a pairing-protocol change, pair-v1 to pair-v2, on
@@ -85,7 +85,7 @@ func comingUpObjects(engine, decoder *v1beta1.InferenceReplica) []client.Object 
 // its reading of the peer.
 func askComingUp(t *testing.T, isvc *v1beta1.InferenceService, objs []client.Object, component v1beta1.ComponentType, strategy workloadtypes.UpdateStrategyType) (allowed bool, gate v1beta1.RolloutHoldGate, reason string, peerHeldStill bool) {
 	t.Helper()
-	c := fake.NewClientBuilder().WithScheme(pairingScheme(t)).WithObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	defaults := keepRatioDecoderFirst(5)
 	from := "llama-" + string(component) + "-v1"
 	allowed, gate, reason = EvaluateUpdateGate(context.Background(), c, isvc, component, from, forwardTarget(isvc, component), nil, defaults, strategy, 0, 0)

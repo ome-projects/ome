@@ -19,8 +19,10 @@ func NewDefaultRuntimeScorer(config *Config) RuntimeScorer {
 }
 
 // CalculateScore picks the best-scoring supported format on the runtime.
-// Each format contributes (modelFormat.weight + modelFramework.weight) *
-// priority; zero weights fall back to the global defaults in Config.
+// Only a format marked autoSelect: true counts: a format that leaves the
+// mark unset is not offered for automatic selection. Each format contributes
+// (modelFormat.weight + modelFramework.weight) * priority; zero weights fall
+// back to the global defaults in Config.
 func (s *DefaultRuntimeScorer) CalculateScore(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec) (int64, error) {
 	var maxScore int64 = 0
 
@@ -29,22 +31,32 @@ func (s *DefaultRuntimeScorer) CalculateScore(runtime *v1beta1.ServingRuntimeSpe
 			continue
 		}
 
-		if supportedFormat.AutoSelect != nil && !(*supportedFormat.AutoSelect) {
+		if !autoSelectEnabled(supportedFormat) {
 			continue
 		}
 
-		priority := int64(s.config.DefaultPriority)
-		if supportedFormat.Priority != nil {
-			priority = int64(*supportedFormat.Priority)
-		}
-
-		score := s.CalculateFormatScore(model, supportedFormat, priority)
+		score := s.CalculateFormatScore(model, supportedFormat, formatPriority(supportedFormat, s.config.DefaultPriority))
 		if score > maxScore {
 			maxScore = score
 		}
 	}
 
 	return maxScore, nil
+}
+
+// autoSelectEnabled reports whether the format is offered for automatic
+// selection: autoSelect must be set to true, unset counts as false.
+func autoSelectEnabled(format v1beta1.SupportedModelFormat) bool {
+	return format.AutoSelect != nil && *format.AutoSelect
+}
+
+// formatPriority is the multiplier a format's score carries in automatic
+// selection: its own priority when set, the configured default otherwise.
+func formatPriority(format v1beta1.SupportedModelFormat, defaultPriority int32) int64 {
+	if format.Priority != nil {
+		return int64(*format.Priority)
+	}
+	return int64(defaultPriority)
 }
 
 // CompareRuntimes orders by (score desc, size-range distance asc,

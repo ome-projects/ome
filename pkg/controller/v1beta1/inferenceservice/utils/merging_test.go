@@ -951,7 +951,7 @@ func TestMergeSchedulerName(t *testing.T) {
 		}
 		router := &v1beta1.RouterSpec{}
 
-		MergeSchedulerName(runtimeWithScheduler(), engine, decoder, router)
+		MergeSchedulerName(runtimeWithScheduler(), v1beta1.RoleSpecs{Engine: engine, Decoder: decoder, Router: router})
 
 		assert.Equal(t, "custom-scheduler", engine.SchedulerName)
 		assert.Equal(t, "custom-scheduler", engine.Leader.SchedulerName)
@@ -969,7 +969,7 @@ func TestMergeSchedulerName(t *testing.T) {
 			Worker:  &v1beta1.WorkerSpec{Size: ptrInt(2)},
 		}
 
-		MergeSchedulerName(runtimeWithScheduler(), engine, nil, nil)
+		MergeSchedulerName(runtimeWithScheduler(), v1beta1.RoleSpecs{Engine: engine})
 
 		assert.Equal(t, "component-scheduler", engine.SchedulerName)
 		assert.Equal(t, "leader-scheduler", engine.Leader.SchedulerName)
@@ -980,15 +980,15 @@ func TestMergeSchedulerName(t *testing.T) {
 	t.Run("empty top-level name is a no-op", func(t *testing.T) {
 		engine := &v1beta1.EngineSpec{Leader: &v1beta1.LeaderSpec{}}
 
-		MergeSchedulerName(&v1beta1.ServingRuntimeSpec{}, engine, nil, nil)
+		MergeSchedulerName(&v1beta1.ServingRuntimeSpec{}, v1beta1.RoleSpecs{Engine: engine})
 
 		assert.Empty(t, engine.SchedulerName)
 		assert.Empty(t, engine.Leader.SchedulerName)
 	})
 
 	t.Run("nil runtime and nil components do not panic", func(t *testing.T) {
-		MergeSchedulerName(nil, &v1beta1.EngineSpec{}, nil, nil)
-		MergeSchedulerName(runtimeWithScheduler(), nil, nil, nil)
+		MergeSchedulerName(nil, v1beta1.RoleSpecs{Engine: &v1beta1.EngineSpec{}})
+		MergeSchedulerName(runtimeWithScheduler(), v1beta1.RoleSpecs{})
 	})
 }
 

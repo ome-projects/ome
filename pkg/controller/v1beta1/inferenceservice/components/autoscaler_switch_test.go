@@ -13,13 +13,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // TestDispatchIRAutoscaler_PendingSwitchRequeues pins that a switch from the
@@ -27,7 +27,6 @@ import (
 // requeues the pass instead of failing it, so the component status is still
 // written.
 func TestDispatchIRAutoscaler_PendingSwitchRequeues(t *testing.T) {
-	scheme := rawAutoscalerTestScheme(t)
 	ext := v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(1), MaxReplicas: 4}
 	isvc := holdTestISVC(ext)
 	ir := holdTestIR("llm-a-engine", nil)
@@ -53,8 +52,8 @@ func TestDispatchIRAutoscaler_PendingSwitchRequeues(t *testing.T) {
 			MaxReplicas: 4,
 		},
 	}
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(working).Build()
-	b := &BaseComponentFields{Client: cl, Scheme: scheme}
+	cl := componentClient(t, fakeclient.WithObjects(working))
+	b := &BaseComponentFields{Client: cl, Scheme: cl.Scheme()}
 
 	result, err := dispatchIRAutoscaler(context.Background(), b, isvc, ir, &ext,
 		ComponentAutoscaling{Resolved: storedIRBlock(), Source: autoscaler.SpecSourceISVC})
@@ -73,7 +72,6 @@ func TestDispatchIRAutoscaler_PendingSwitchRequeues(t *testing.T) {
 // side: switching a Deployment's HPA to KEDA requeues while KEDA takes the
 // HPA over, and the HPA keeps scaling meanwhile.
 func TestRawComponentDeployment_PendingSwitchRequeues(t *testing.T) {
-	scheme := rawAutoscalerTestScheme(t)
 	minReplicas := 1
 	ext := v1beta1.ComponentExtensionSpec{
 		MinReplicas: &minReplicas,
@@ -94,11 +92,11 @@ func TestRawComponentDeployment_PendingSwitchRequeues(t *testing.T) {
 			MaxReplicas:    4,
 		},
 	}
-	cl := ctrlclientfake.NewClientBuilder().WithScheme(scheme).WithObjects(working).Build()
+	cl := componentClient(t, fakeclient.WithObjects(working))
 	deps := &ComponentDeps{
 		Client:    cl,
 		Clientset: rawAutoscalerTestClientset(),
-		Scheme:    scheme,
+		Scheme:    cl.Scheme(),
 		Config:    &controllerconfig.InferenceServicesConfig{},
 	}
 	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: constants.MainContainerName, Image: "example.com/runtime:test"}}}

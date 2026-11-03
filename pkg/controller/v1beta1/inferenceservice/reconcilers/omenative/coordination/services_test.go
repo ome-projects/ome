@@ -227,11 +227,17 @@ func TestBuildPerRevisionHeadlessService_Properties(t *testing.T) {
 		t.Errorf("headless must publish not-ready addresses")
 	}
 	checkSelector(t, svc.Spec.Selector, "llama-70b", "engine", "hash1")
-	// Headless Service NEVER pins the rank-0 selector — workers must
+	// Headless Service NEVER pins the leader selector — workers must
 	// stay discoverable for peer DNS during distributed init.
-	if _, ok := svc.Spec.Selector[query.LabelPodOrdinal]; ok {
-		t.Errorf("headless Service selector must NEVER include %s; got %v",
-			query.LabelPodOrdinal, svc.Spec.Selector)
+	for _, key := range []string{query.LabelRunner, query.LabelPodOrdinal} {
+		if _, ok := svc.Spec.Selector[key]; ok {
+			t.Errorf("headless Service selector must NEVER include %s; got %v", key, svc.Spec.Selector)
+		}
+	}
+	for _, runner := range []v1beta1.RunnerName{v1beta1.RunnerNameLeader, v1beta1.RunnerNameWorker, v1beta1.RunnerNameDefault} {
+		if !routingSelectorMatches(svc.Spec.Selector, revisionPodLabels("hash1", string(runner), "1")) {
+			t.Errorf("headless Service must select %s pods: selector=%v", runner, svc.Spec.Selector)
+		}
 	}
 	checkOwnerRef(t, svc, isvc)
 }

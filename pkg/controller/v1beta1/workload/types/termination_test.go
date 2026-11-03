@@ -284,6 +284,37 @@ func TestPodTermination_TransientWaitingIgnored(t *testing.T) {
 	}
 }
 
+// A container the runtime is still creating is not in a terminal waiting
+// state: a CreateContainerError that shows the create in flight yields no
+// record, as ContainerCreating does.
+func TestPodTermination_CreateStillInFlight_NoRecord(t *testing.T) {
+	pod := podWith("engine-0", corev1.PodPending, corev1.ContainerStatus{
+		Name:  "main",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CreateContainerError", Message: createReservedMessage}},
+	})
+	if got := PodTermination(pod, metav1.Now()); got != nil {
+		t.Fatalf("a create still in flight must not produce a record, got %+v", got)
+	}
+}
+
+// Beside a container the runtime is still creating, the record names the
+// container in a terminal waiting state, even when it is listed second.
+func TestPodTermination_CreateStillInFlightBesideATerminalWait_NamesTheTerminalWait(t *testing.T) {
+	pod := podWith("engine-0", corev1.PodPending,
+		corev1.ContainerStatus{
+			Name:  "sidecar",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CreateContainerError", Message: "context deadline exceeded"}},
+		},
+		corev1.ContainerStatus{
+			Name:  "main",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "back-off pulling"}},
+		})
+	got := PodTermination(pod, metav1.Now())
+	if got == nil || got.ContainerName != "main" || got.Reason != "ImagePullBackOff" {
+		t.Fatalf("want the main container's ImagePullBackOff, got %+v", got)
+	}
+}
+
 // Pod phase Failed with no per-container detail falls back to a
 // pod-level PodFailed record.
 func TestPodTermination_PodLevelFallback(t *testing.T) {

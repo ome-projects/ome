@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/service"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 )
 
@@ -45,54 +46,63 @@ func NewExternalServiceReconciler(
 	}
 }
 
-// Reconcile reconciles the external service for the InferenceService
+// Reconcile makes the external Service match what the InferenceService asks for:
+// present when ingress creation is disabled and a role can serve, absent otherwise.
 func (r *ExternalServiceReconciler) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) error {
-	// Determine if external service should be created
-	shouldCreateExternalService := r.shouldCreateExternalService(isvc)
-
-	// Get existing service
-	existingService := &corev1.Service{}
-	err := r.client.Get(ctx, client.ObjectKey{
-		Namespace: isvc.Namespace,
-		Name:      isvc.Name,
-	}, existingService)
-
-	serviceExists := err == nil
-	if err != nil && !apierrors.IsNotFound(err) {
-		return errors.Wrapf(err, "failed to get external service for InferenceService %s", isvc.Name)
+	existing, err := r.existingExternalService(ctx, isvc)
+	if err != nil {
+		return err
 	}
-
-	if shouldCreateExternalService {
-		// Build the desired service
-		desiredService, err := r.buildExternalService(ctx, isvc)
-		if err != nil {
-			return errors.Wrapf(err, "failed to build external service for InferenceService %s", isvc.Name)
-		}
-
-		if serviceExists {
-			// Update existing service if spec has changed
-			if !r.serviceSpecsEqual(&existingService.Spec, &desiredService.Spec) {
-				existingService.Spec = desiredService.Spec
-				existingService.Labels = desiredService.Labels
-				existingService.Annotations = desiredService.Annotations
-				if err := r.client.Update(ctx, existingService); err != nil {
-					return errors.Wrapf(err, "failed to update external service for InferenceService %s", isvc.Name)
-				}
-			}
-		} else {
-			// Create new service
-			if err := r.client.Create(ctx, desiredService); err != nil {
-				return errors.Wrapf(err, "failed to create external service for InferenceService %s", isvc.Name)
-			}
-		}
-	} else if serviceExists {
-		// Delete existing service if it should no longer exist
-		if err := r.client.Delete(ctx, existingService); err != nil {
-			return errors.Wrapf(err, "failed to delete external service for InferenceService %s", isvc.Name)
-		}
+	desired, err := r.desiredExternalService(ctx, isvc)
+	if err != nil {
+		return err
 	}
+	return r.applyExternalService(ctx, isvc, existing, desired)
+}
 
-	return nil
+// existingExternalService reads the external Service; nil when there is none.
+func (r *ExternalServiceReconciler) existingExternalService(ctx context.Context, isvc *v1beta1.InferenceService) (*corev1.Service, error) {
+	existing := &corev1.Service{}
+	err := r.client.Get(ctx, client.ObjectKey{Namespace: isvc.Namespace, Name: isvc.Name}, existing)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get external service for InferenceService %s", isvc.Name)
+	}
+	return existing, nil
+}
+
+// desiredExternalService builds the Service the InferenceService should have;
+// nil when it should have none.
+func (r *ExternalServiceReconciler) desiredExternalService(ctx context.Context, isvc *v1beta1.InferenceService) (*corev1.Service, error) {
+	if !r.shouldCreateExternalService(isvc) {
+		return nil, nil
+	}
+	desired, err := r.buildExternalService(ctx, isvc)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to build external service for InferenceService %s", isvc.Name)
+	}
+	return desired, nil
+}
+
+// applyExternalService creates, updates or deletes the external Service so the
+// cluster holds desired; a nil desired means the Service goes.
+func (r *ExternalServiceReconciler) applyExternalService(ctx context.Context, isvc *v1beta1.InferenceService, existing, desired *corev1.Service) error {
+	switch {
+	case desired == nil && existing == nil:
+		return nil
+	case desired == nil:
+		return errors.Wrapf(r.client.Delete(ctx, existing), "failed to delete external service for InferenceService %s", isvc.Name)
+	case existing == nil:
+		return errors.Wrapf(r.client.Create(ctx, desired), "failed to create external service for InferenceService %s", isvc.Name)
+	case r.serviceSpecsEqual(&existing.Spec, &desired.Spec):
+		return nil
+	}
+	existing.Spec = desired.Spec
+	existing.Labels = desired.Labels
+	existing.Annotations = desired.Annotations
+	return errors.Wrapf(r.client.Update(ctx, existing), "failed to update external service for InferenceService %s", isvc.Name)
 }
 
 // shouldCreateExternalService determines whether the external service should be created
@@ -140,7 +150,7 @@ func (r *ExternalServiceReconciler) buildExternalService(ctx context.Context, is
 		targetPort = constants.CommonISVCPort
 	}
 
-	service := &corev1.Service{
+	desired := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      isvc.Name,
 			Namespace: isvc.Namespace,
@@ -160,32 +170,15 @@ func (r *ExternalServiceReconciler) buildExternalService(ctx context.Context, is
 					Protocol:   corev1.ProtocolTCP,
 				},
 			},
-			Type: r.getServiceType(isvc),
+			Type: service.ServiceTypeFromAnnotations(isvc.Annotations),
 		},
 	}
 
-	// Set owner reference
-	if err := controllerutil.SetControllerReference(isvc, service, r.scheme); err != nil {
+	if err := controllerutil.SetControllerReference(isvc, desired, r.scheme); err != nil {
 		return nil, errors.Wrapf(err, "failed to set controller reference for external service")
 	}
 
-	return service, nil
-}
-
-// getServiceType determines the service type based on annotations
-func (r *ExternalServiceReconciler) getServiceType(isvc *v1beta1.InferenceService) corev1.ServiceType {
-	if serviceType, ok := isvc.Annotations[constants.ServiceType]; ok {
-		switch serviceType {
-		case "LoadBalancer":
-			return corev1.ServiceTypeLoadBalancer
-		case "NodePort":
-			return corev1.ServiceTypeNodePort
-		case "ClusterIP":
-			return corev1.ServiceTypeClusterIP
-		}
-	}
-	// Default to ClusterIP
-	return corev1.ServiceTypeClusterIP
+	return desired, nil
 }
 
 // getServiceAnnotations extracts service-related annotations from the InferenceService
@@ -216,17 +209,4 @@ func (r *ExternalServiceReconciler) serviceSpecsEqual(spec1, spec2 *corev1.Servi
 	return reflect.DeepEqual(spec1.Selector, spec2.Selector) &&
 		reflect.DeepEqual(spec1.Ports, spec2.Ports) &&
 		spec1.Type == spec2.Type
-}
-
-// getDeploymentMode determines the deployment mode of the InferenceService
-func (r *ExternalServiceReconciler) getDeploymentMode(isvc *v1beta1.InferenceService) constants.DeploymentModeType {
-	// Check if this is a MultiNode deployment by looking for Leader/Worker specs
-	if isvc.Spec.Engine != nil {
-		if isvc.Spec.Engine.Leader != nil || isvc.Spec.Engine.Worker != nil {
-			return constants.MultiNode
-		}
-	}
-
-	// All other cases are RawDeployment
-	return constants.RawDeployment
 }

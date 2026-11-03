@@ -122,13 +122,28 @@ type CandidateAllocationStatus struct {
 	// +optional
 	// +listType=set
 	MatchingTerms []int32 `json:"matchingTerms,omitempty"`
-	// Weight is the effective static allocation weight, when applicable.
+	// Weight is deprecated in favour of MinWeight. MinWeight, when present,
+	// equals Weight. A plan accepted before MinWeight existed carries only
+	// Weight, so readers fall back to Weight when MinWeight is absent. Weight
+	// stays until every stored plan carries MinWeight.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Weight *int64 `json:"weight,omitempty"`
+	// MinWeight is the primary component's effective static weight, which
+	// divides minReplicas, when applicable. The planner writes it wherever it
+	// writes Weight.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MinWeight *int64 `json:"minWeight,omitempty"`
+	// MaxWeight is the primary component's summed max ratio. It is set only
+	// when the source uses the *Replicas ratio form.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxWeight *int64 `json:"maxWeight,omitempty"`
 	// ComponentMatches records the Split weight of the other components when
 	// the affinity terms set weights: the decoder's, and the router's when
-	// routers are divided. Weight holds the primary component's. The accepted
+	// routers are divided. MinWeight, or Weight on an older plan, holds the
+	// primary component's. The accepted
 	// plan keeps them so that member floors never follow unaccepted label changes.
 	// +optional
 	// +listType=map
@@ -220,10 +235,24 @@ type PlacementExecutionPolicy struct {
 type ComponentAffinityMatch struct {
 	// +kubebuilder:validation:Enum=engine;decoder;router
 	Component ComponentType `json:"component"`
-	// Weight is the component's effective static weight, when applicable.
+	// Weight is deprecated in favour of MinWeight. MinWeight, when present,
+	// equals Weight. A plan accepted before MinWeight existed carries only
+	// Weight, so readers fall back to Weight when MinWeight is absent. Weight
+	// stays until every stored plan carries MinWeight.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Weight *int64 `json:"weight,omitempty"`
+	// MinWeight is the component's effective static weight, which divides
+	// minReplicas, when applicable. The planner writes it wherever it writes
+	// Weight.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MinWeight *int64 `json:"minWeight,omitempty"`
+	// MaxWeight is the component's summed max ratio. It is set only when the
+	// source uses the *Replicas ratio form.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MaxWeight *int64 `json:"maxWeight,omitempty"`
 }
 
 // PlacementComponentFloor records a resolved component's guaranteed count.

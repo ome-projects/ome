@@ -9,10 +9,10 @@ import (
 )
 
 func TestOperationCapacityProvisioning(t *testing.T) {
-	if OperationCapacityProvisioning(nil) || OperationCapacityProvisioning(&InstanceOperation{}) {
+	if OperationWaitingOn(nil, WaitingReasonCapacityProvisioning) || OperationWaitingOn(&InstanceOperation{}, WaitingReasonCapacityProvisioning) {
 		t.Error("only the provisioning token reports the hold")
 	}
-	if !OperationCapacityProvisioning(&InstanceOperation{Waiting: WaitingReasonCapacityProvisioning}) {
+	if !OperationWaitingOn(&InstanceOperation{Waiting: WaitingReasonCapacityProvisioning}, WaitingReasonCapacityProvisioning) {
 		t.Error("the token reads as provisioning")
 	}
 }

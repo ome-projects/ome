@@ -161,6 +161,24 @@ func mkSequentialFixture(name string, soak time.Duration) *v1beta1.InferenceServ
 	return pinActiveRun(isvc)
 }
 
+// sequentialChainISVC is the decoder-then-engine chain of
+// mkSequentialFixture with the given wait after the decoder, as the
+// coordination pass reads it: the namespace and uid of the pass fixtures,
+// both Components OMENative, and an open run holding the plan, so the
+// replica-side gate answers too.
+func sequentialChainISVC(wait time.Duration) *v1beta1.InferenceService {
+	base := testOMENativeISVC()
+	isvc := mkSequentialFixture(base.Name, wait)
+	isvc.Namespace, isvc.UID = base.Namespace, base.UID
+	isvc.Spec.Engine = base.Spec.Engine
+	isvc.Spec.Decoder = &v1beta1.DecoderSpec{
+		ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{
+			Annotations: map[string]string{constants.DeploymentMode: string(constants.OMENative)},
+		},
+	}
+	return isvc
+}
+
 // setComponentRevisions stamps Status.Components[c].Lifecycle with
 // ControllerRevision names that produce the desired RolloutInFlight
 // answer (target!=current ⇒ in flight). Revision-name shape is
@@ -1535,4 +1553,58 @@ func TestCheckSequentialGate_APartitionAboveTheOldCountReleasesTheNextComponent(
 			}
 		})
 	}
+}
+
+// The replica-side gate measures the wait after a finished member from the
+// instant the group recorded that member done, the same clock the group's
+// phase reads, so the member losing readiness during the wait neither admits
+// the next member nor delays it past the window. Decoder then engine with a
+// five-minute wait: every decoder pod is out of rotation at t+2m45s and the
+// engine stays held; the pods are Ready again at t+3m and the engine is
+// admitted at t+5m, not t+8m.
+func TestCheckSequentialGate_TheWaitRunsFromTheRecordedFinishThroughAReadinessLoss(t *testing.T) {
+	ctx := context.Background()
+	const wait = 5 * time.Minute
+	// picture is the chain as of now, with the decoder finished finishedAgo
+	// ago and the group's pass of that instant recorded.
+	picture := func(t *testing.T, finishedAgo time.Duration) (*v1beta1.InferenceService, client.Client, *v1beta1.InferenceReplica) {
+		t.Helper()
+		t0 := time.Now().Add(-finishedAgo)
+		isvc := sequentialChainISVC(wait)
+		decoder := chainMemberIR(isvc, v1beta1.DecoderComponent, "bbbb", "bbbb", "bbbb", metav1.ConditionTrue, t0)
+		engine := chainMemberIR(isvc, v1beta1.EngineComponent, "aaaa", "bbbb", "aaaa", metav1.ConditionUnknown, t0)
+		c := testClient(append(chainPods(isvc, "bbbb", "aaaa"), decoder, engine)...)
+		sequentialChainPass(ctx, t, isvc, c, t0, 0, v1beta1.CompositePhaseSequentialAwaiting)
+		return isvc, c, decoder
+	}
+	const notReady = "Sequential.Soak: engine held while decoder is not Ready; it starts once decoder is Ready and the 5m0s soak after decoder has elapsed"
+	t.Run("every decoder pod out of rotation at t+2m45s keeps the engine held, naming the decoder's readiness", func(t *testing.T) {
+		isvc, c, decoder := picture(t, 2*time.Minute+45*time.Second)
+		setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionFalse, time.Now())
+		allowed, reason := CheckSequentialGate(ctx, c, isvc, v1beta1.EngineComponent)
+		if allowed || reason != notReady {
+			t.Fatalf("the decoder is not Ready; got allowed=%v reason=%q, want held with %q", allowed, reason, notReady)
+		}
+	})
+	t.Run("the decoder Ready again at t+3m does not start the wait over", func(t *testing.T) {
+		isvc, c, decoder := picture(t, wait+time.Second)
+		setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionTrue, time.Now().Add(-2*time.Minute-time.Second))
+		allowed, reason := CheckSequentialGate(ctx, c, isvc, v1beta1.EngineComponent)
+		if !allowed {
+			t.Fatalf("the wait elapsed at t+5m; the gate still holds: %s", reason)
+		}
+	})
+	t.Run("a decoder still not Ready after the wait elapsed holds the engine, and its recovery admits it at once", func(t *testing.T) {
+		isvc, c, decoder := picture(t, 6*time.Minute)
+		setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionFalse, time.Now().Add(-3*time.Minute-15*time.Second))
+		allowed, reason := CheckSequentialGate(ctx, c, isvc, v1beta1.EngineComponent)
+		if allowed || reason != notReady {
+			t.Fatalf("the decoder is not Ready although the wait elapsed; got allowed=%v reason=%q, want held with %q", allowed, reason, notReady)
+		}
+		setChainMemberReadiness(ctx, t, c, decoder, "bbbb", metav1.ConditionTrue, time.Now())
+		allowed, reason = CheckSequentialGate(ctx, c, isvc, v1beta1.EngineComponent)
+		if !allowed {
+			t.Fatalf("the decoder is Ready again and the wait elapsed during the loss; the gate still holds: %s", reason)
+		}
+	})
 }

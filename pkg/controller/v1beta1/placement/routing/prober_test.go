@@ -97,14 +97,14 @@ func TestProbeConfig_ClassifyStatus(t *testing.T) {
 	tests := []struct {
 		name string
 		code int
-		want Verdict
+		want ProbeOutcome
 	}{
-		{name: "accepted status passes", code: 200, want: VerdictPass},
-		{name: "listed 5xx gates", code: 503, want: VerdictFail},
-		{name: "overload is inconclusive", code: 429, want: VerdictInconclusive},
-		{name: "unauthorized is inconclusive", code: 401, want: VerdictInconclusive},
-		{name: "forbidden is inconclusive", code: 403, want: VerdictInconclusive},
-		{name: "unlisted status is inconclusive", code: 302, want: VerdictInconclusive},
+		{name: "accepted status passes", code: 200, want: ProbeOutcomePass},
+		{name: "listed 5xx gates", code: 503, want: ProbeOutcomeFail},
+		{name: "overload is inconclusive", code: 429, want: ProbeOutcomeInconclusive},
+		{name: "unauthorized is inconclusive", code: 401, want: ProbeOutcomeInconclusive},
+		{name: "forbidden is inconclusive", code: 403, want: ProbeOutcomeInconclusive},
+		{name: "unlisted status is inconclusive", code: 302, want: ProbeOutcomeInconclusive},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -971,9 +971,9 @@ func TestObserverClient_EndpointRedirects_ProbeIsInconclusiveNoFollow(t *testing
 	if err != nil {
 		t.Fatalf("NewProber() error = %v", err)
 	}
-	verdict, _ := prober.probeOne(context.Background(), Target{URL: source.URL}, testProbeConfig())
-	if verdict != VerdictInconclusive {
-		t.Fatalf("redirect verdict = %v, want %v", verdict, VerdictInconclusive)
+	outcome, _ := prober.probeOne(context.Background(), Target{URL: source.URL}, testProbeConfig())
+	if outcome != ProbeOutcomeInconclusive {
+		t.Fatalf("redirect outcome = %v, want %v", outcome, ProbeOutcomeInconclusive)
 	}
 	if got := redirectedRequests.Load(); got != 0 {
 		t.Fatalf("redirect destination requests = %d, want 0", got)
@@ -993,10 +993,10 @@ func TestProbeOne_BodyNeverArrives_FailsWithDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	prober := &Prober{Client: NewObserverClient(), MaxResponseBytes: testProbeResponseBytes}
-	verdict, message := prober.probeOne(ctx, Target{URL: server.URL}, testProbeConfig())
+	outcome, message := prober.probeOne(ctx, Target{URL: server.URL}, testProbeConfig())
 
-	if verdict != VerdictFail {
-		t.Fatalf("response body timeout verdict = %v, want %v", verdict, VerdictFail)
+	if outcome != ProbeOutcomeFail {
+		t.Fatalf("response body timeout outcome = %v, want %v", outcome, ProbeOutcomeFail)
 	}
 	if !strings.Contains(message, "context deadline exceeded") {
 		t.Fatalf("response body timeout message = %q, want deadline error", message)
@@ -1017,9 +1017,9 @@ func TestProbeOne_EndpointWithPathThenClosed_JoinsPathThenFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProber() error = %v", err)
 	}
-	verdict, message := prober.probeOne(context.Background(), Target{URL: server.URL + "/team/model/"}, testProbeConfig())
-	if verdict != VerdictPass {
-		t.Fatalf("probeOne() = %v (%s), want %v", verdict, message, VerdictPass)
+	outcome, message := prober.probeOne(context.Background(), Target{URL: server.URL + "/team/model/"}, testProbeConfig())
+	if outcome != ProbeOutcomePass {
+		t.Fatalf("probeOne() = %v (%s), want %v", outcome, message, ProbeOutcomePass)
 	}
 	if got := <-paths; got != "/team/model/healthz/deep" {
 		t.Fatalf("request path = %q, want %q", got, "/team/model/healthz/deep")
@@ -1027,9 +1027,9 @@ func TestProbeOne_EndpointWithPathThenClosed_JoinsPathThenFails(t *testing.T) {
 	endpoint := server.URL
 	server.Close()
 
-	verdict, message = prober.probeOne(context.Background(), Target{URL: endpoint}, testProbeConfig())
-	if verdict != VerdictFail || !strings.Contains(message, "transport error") {
-		t.Fatalf("closed-endpoint probe = %v (%s), want transport failure", verdict, message)
+	outcome, message = prober.probeOne(context.Background(), Target{URL: endpoint}, testProbeConfig())
+	if outcome != ProbeOutcomeFail || !strings.Contains(message, "transport error") {
+		t.Fatalf("closed-endpoint probe = %v (%s), want transport failure", outcome, message)
 	}
 }
 
@@ -1074,9 +1074,9 @@ func TestProbeOne_LongResponseBody_ReadsOnlyTheBoundAndCloses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProber() error = %v", err)
 	}
-	verdict, _ := prober.probeOne(context.Background(), Target{URL: "https://service.example.com"}, testProbeConfig())
-	if verdict != VerdictPass {
-		t.Fatalf("probeOne() = %v, want %v", verdict, VerdictPass)
+	outcome, _ := prober.probeOne(context.Background(), Target{URL: "https://service.example.com"}, testProbeConfig())
+	if outcome != ProbeOutcomePass {
+		t.Fatalf("probeOne() = %v, want %v", outcome, ProbeOutcomePass)
 	}
 	if body.read != int(responseBound) {
 		t.Fatalf("response bytes read = %d, want %d", body.read, responseBound)

@@ -105,13 +105,6 @@ func (g *GangObservations) BlocksPods(idx int32) bool {
 	}
 }
 
-// OperationGangHeld reports whether an operation is parked on a
-// gang-scheduling wait: the group's deterministic name is still held by
-// an object being collected, so the gang cannot be announced yet.
-func OperationGangHeld(op *InstanceOperation) bool {
-	return op != nil && op.Waiting == WaitingReasonPodGroupTerminating
-}
-
 // GangTermination is the evidence record for a gang hold or verdict: the
 // token or reason, the PodGroup's own explanation, and when it was seen.
 func GangTermination(reason, message string, at metav1.Time) *InstanceTermination {

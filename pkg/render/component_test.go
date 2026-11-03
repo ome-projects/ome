@@ -9,21 +9,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func newRenderClient(t *testing.T, objects ...client.Object) client.Client {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, v1beta1.AddToScheme} {
-		if err := add(scheme); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	return fakeclient.New(t, fakeclient.WithObjects(objects...))
 }
 
 func TestRenderRequiresInputs(t *testing.T) {

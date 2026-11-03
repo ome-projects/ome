@@ -25,11 +25,11 @@ const (
 	EventGroupRemoved  = "RolloutGroupRemovedMidRun"
 )
 
-// setPlanReady stamps the RolloutPlanReady condition on the ISVC's duck
-// conditions, transitioning the timestamp only on a real change so a parked
-// plan's condition age reflects how long it has been parked.
-func setPlanReady(isvc *v1beta1.InferenceService, status corev1.ConditionStatus, reason, message string, now metav1.Time) bool {
-	condType := apis.ConditionType(v1beta1.RolloutPlanReadyCondition)
+// setPlanCondition writes one rollout-plan condition on the service's duck
+// conditions. The transition time moves only when the status, reason or
+// message changes, so the condition's age says how long the plan has been
+// in that state.
+func setPlanCondition(isvc *v1beta1.InferenceService, condType apis.ConditionType, status corev1.ConditionStatus, reason, message string, now metav1.Time) bool {
 	if prev := isvc.Status.GetCondition(condType); prev != nil &&
 		prev.Status == status && prev.Reason == reason && prev.Message == message {
 		return false
@@ -44,26 +44,19 @@ func setPlanReady(isvc *v1beta1.InferenceService, status corev1.ConditionStatus,
 	return true
 }
 
-// setPlanDrift stamps the RolloutPlanDrift condition; True means an edit
+// setPlanReady writes the RolloutPlanReady condition.
+func setPlanReady(isvc *v1beta1.InferenceService, status corev1.ConditionStatus, reason, message string, now metav1.Time) bool {
+	return setPlanCondition(isvc, apis.ConditionType(v1beta1.RolloutPlanReadyCondition), status, reason, message, now)
+}
+
+// setPlanDrift writes the RolloutPlanDrift condition; True means an edit
 // landed mid-run and is inert until the next run or an explicit repin.
 func setPlanDrift(isvc *v1beta1.InferenceService, drifted bool, reason, message string, now metav1.Time) bool {
-	condType := apis.ConditionType(v1beta1.RolloutPlanDriftCondition)
 	status := corev1.ConditionFalse
 	if drifted {
 		status = corev1.ConditionTrue
 	}
-	if prev := isvc.Status.GetCondition(condType); prev != nil &&
-		prev.Status == status && prev.Reason == reason && prev.Message == message {
-		return false
-	}
-	isvc.Status.SetCondition(condType, &apis.Condition{
-		Type:               condType,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: apis.VolatileTime{Inner: now},
-	})
-	return true
+	return setPlanCondition(isvc, apis.ConditionType(v1beta1.RolloutPlanDriftCondition), status, reason, message, now)
 }
 
 // emit is best-effort observability; a nil recorder (tests) is fine.

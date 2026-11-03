@@ -10,12 +10,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func derivedWithOrigin(name, originUID string) *v1beta1.InferenceService {
@@ -74,14 +73,13 @@ func TestOrphanedDeriveds_ControlPlaneScoped(t *testing.T) {
 }
 
 func TestGCSweep_DeletesOrphansOnly(t *testing.T) {
-	s := testScheme(t)
-	cp := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(&v1beta1.InferenceService{
+	cp := fakeclient.New(t, fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "live", UID: "uid-live"},
-	}).Build()
-	worker := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(
+	}))
+	worker := fakeclient.New(t, fakeclient.WithObjects(
 		derivedWithOrigin("live", "uid-live"),
 		derivedWithOrigin("orphan", "uid-gone"),
-	).Build()
+	))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"w": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -99,21 +97,14 @@ func TestGCSweep_DeletesOrphansOnly(t *testing.T) {
 // gets a fresh UID, so the placer can have a LIVE derived in place by then; a
 // name-only delete would reap the workload it just placed.
 func TestGCSweep_DeletesByUIDPrecondition(t *testing.T) {
-	s := testScheme(t)
-	cp := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(&v1beta1.InferenceService{
+	cp := fakeclient.New(t, fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "live", UID: "uid-live"},
-	}).Build()
+	}))
 	orphan := derivedWithOrigin("orphan", "uid-gone")
 	orphan.UID = "derived-uid"
 
-	var gotOpts []client.DeleteOption
-	worker := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(orphan).
-		WithInterceptorFuncs(interceptor.Funcs{
-			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-				gotOpts = opts
-				return c.Delete(ctx, obj, opts...)
-			},
-		}).Build()
+	deletes := fakeclient.CountingVerb(fakeclient.Delete)
+	worker := fakeclient.New(t, fakeclient.WithObjects(orphan), deletes)
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"w": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -122,9 +113,9 @@ func TestGCSweep_DeletesByUIDPrecondition(t *testing.T) {
 	require.NoError(t, gc.sweep(context.Background()))
 
 	var uid *types.UID
-	for _, o := range gotOpts {
-		if p, ok := o.(client.Preconditions); ok {
-			uid = p.UID
+	for _, o := range fakeclient.OptionsOf[client.DeleteOptions](deletes) {
+		if o.Preconditions != nil {
+			uid = o.Preconditions.UID
 		}
 	}
 	require.NotNil(t, uid, "orphan delete must carry a UID precondition")
@@ -135,13 +126,12 @@ func TestGCSweep_DeletesByUIDPrecondition(t *testing.T) {
 // genuinely-empty control plane) must NOT cause the sweep to reap every
 // derived: an empty live set is treated as suspect, not authoritative.
 func TestGCSweep_EmptyLiveSet_NoDeletes(t *testing.T) {
-	s := testScheme(t)
 	// Control plane has NO ISVCs -> live set is empty.
-	cp := fakeclient.NewClientBuilder().WithScheme(s).Build()
-	worker := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(
+	cp := fakeclient.New(t)
+	worker := fakeclient.New(t, fakeclient.WithObjects(
 		derivedWithOrigin("a", "uid-1"),
 		derivedWithOrigin("b", "uid-2"),
-	).Build()
+	))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"w": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -158,34 +148,28 @@ func TestGCSweep_EmptyLiveSet_NoDeletes(t *testing.T) {
 // the member reads as missing from the first list. Its derived must survive:
 // the sweep confirms a missing source against a fresh read before it deletes.
 func TestGCSweep_KeepsADerivedWhoseSourceAppearedDuringTheSweep(t *testing.T) {
-	s := testScheme(t)
-	lists := 0
-	cp := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(
+	lists := fakeclient.CountingVerb(fakeclient.List)
+	cp := fakeclient.New(t, fakeclient.WithObjects(
 		&v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "keeper", UID: "uid-keeper"}},
 		&v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "fresh", UID: "uid-fresh"}},
-	).WithInterceptorFuncs(interceptor.Funcs{
-		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-			if err := c.List(ctx, list, opts...); err != nil {
-				return err
+	), lists,
+		// The first read of the control plane happens before the source
+		// exists; every later read sees it.
+		fakeclient.EditedRead(func(ml *metav1.PartialObjectMetadataList) {
+			if lists.Count() != 1 {
+				return
 			}
-			lists++
-			// The first read of the control plane happens before the source
-			// exists; every later read sees it.
-			if ml, ok := list.(*metav1.PartialObjectMetadataList); ok && lists == 1 {
-				kept := ml.Items[:0]
-				for _, item := range ml.Items {
-					if item.UID != "uid-fresh" {
-						kept = append(kept, item)
-					}
+			kept := ml.Items[:0]
+			for _, item := range ml.Items {
+				if item.UID != "uid-fresh" {
+					kept = append(kept, item)
 				}
-				ml.Items = kept
 			}
-			return nil
-		},
-	}).Build()
-	worker := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(
+			ml.Items = kept
+		}))
+	worker := fakeclient.New(t, fakeclient.WithObjects(
 		derivedWithOrigin("fresh", "uid-fresh"),
-	).Build()
+	))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"w": workloadcluster.NewNeverCachingClient(worker),
 	}}
@@ -195,7 +179,7 @@ func TestGCSweep_KeepsADerivedWhoseSourceAppearedDuringTheSweep(t *testing.T) {
 
 	require.NoError(t, worker.Get(context.Background(), types.NamespacedName{Namespace: "prod", Name: "fresh"}, &v1beta1.InferenceService{}),
 		"a derived whose source exists by the time the sweep reads the member must be kept")
-	assert.GreaterOrEqual(t, lists, 2, "the sweep confirms a missing source with a second read")
+	assert.GreaterOrEqual(t, lists.Count(), 2, "the sweep confirms a missing source with a second read")
 }
 
 // Two control planes sharing a workload cluster: each GC, scoped by its own
@@ -203,16 +187,15 @@ func TestGCSweep_KeepsADerivedWhoseSourceAppearedDuringTheSweep(t *testing.T) {
 // deriveds — without the scoping, cp-east would reap cp-west's live derived
 // because its source UID is not in cp-east's live set.
 func TestGCSweep_ControlPlaneScoped_DoesNotReapOthers(t *testing.T) {
-	s := testScheme(t)
 	// cp-east's control plane: source "east-live" is live; "east-gone" is gone.
-	cp := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(&v1beta1.InferenceService{
+	cp := fakeclient.New(t, fakeclient.WithObjects(&v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "east-live", UID: "uid-east-live"},
-	}).Build()
-	worker := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(
+	}))
+	worker := fakeclient.New(t, fakeclient.WithObjects(
 		derivedFromControlPlane("east-live", "uid-east-live", "cp-east"), // ours, live -> keep
 		derivedFromControlPlane("east-gone", "uid-east-gone", "cp-east"), // ours, gone -> reap
 		derivedFromControlPlane("west-svc", "uid-west", "cp-west"),       // theirs -> never touch
-	).Build()
+	))
 	clusters := fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{
 		"shared": workloadcluster.NewNeverCachingClient(worker),
 	}}

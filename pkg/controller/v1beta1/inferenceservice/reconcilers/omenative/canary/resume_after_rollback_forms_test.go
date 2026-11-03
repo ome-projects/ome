@@ -10,12 +10,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // A resume after a completed rollback walks a referenced canary through the
@@ -82,18 +82,17 @@ func newLadderWorld(t *testing.T, f executorForm) *ladderWorld {
 	ir.Status.Replicas, ir.Status.UpdatedReplicas = ladderInstances, 0
 	ir.Status.ObservedGeneration = 1
 
-	builder := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithStatusSubresource(&v1beta1.InferenceReplica{}).
-		WithRuntimeObjects(isvc, ir,
-			canaryControllerRevision(isvc.Namespace, isvc.Name, "engine", "old", 1),
-			canaryControllerRevision(isvc.Namespace, isvc.Name, "engine", "new", 2))
+	objects := []client.Object{isvc, ir,
+		canaryControllerRevision(isvc.Namespace, isvc.Name, "engine", "old", 1),
+		canaryControllerRevision(isvc.Namespace, isvc.Name, "engine", "new", 2)}
 	for i := 0; i < ladderInstances; i++ {
 		w.instances = append(w.instances, "old")
-		builder.WithRuntimeObjects(canaryPod(isvc.Namespace, isvc.Name, "engine", "old", fmt.Sprintf("old-%d", i)))
+		objects = append(objects, canaryPod(isvc.Namespace, isvc.Name, "engine", "old", fmt.Sprintf("old-%d", i)))
 	}
 	if f.policy != nil {
-		builder.WithRuntimeObjects(f.policy)
+		objects = append(objects, f.policy)
 	}
-	w.c = builder.Build()
+	w.c = fakeclient.New(t, fakeclient.WithStatusSubresource(&v1beta1.InferenceReplica{}), fakeclient.WithObjects(objects...))
 	return w
 }
 

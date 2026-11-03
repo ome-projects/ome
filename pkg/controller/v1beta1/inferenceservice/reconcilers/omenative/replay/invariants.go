@@ -86,7 +86,7 @@ const (
 
 // componentOrder is the order the controller walks the Components in, so
 // findings list in one order whatever a map iterates.
-var componentOrder = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}
+var componentOrder = v1beta1.RoleTypes()
 
 // CheckInvariants runs every invariant over one tick's view.
 func CheckInvariants(view TickView) []Finding {

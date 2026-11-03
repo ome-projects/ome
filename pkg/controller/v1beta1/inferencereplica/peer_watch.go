@@ -85,10 +85,10 @@ func peerRevisionInputsChanged(oldIR, newIR *v1beta1.InferenceReplica) bool {
 
 // heldPeerReplicasOf maps an InferenceReplica event to the serving peers of
 // the same parent whose recorded RolloutHold waits on this replica's
-// serving counters (coordination.GateWaitsOnPeerCounters). Nothing but
-// this transition lifts such a denial before the denied replica's own
-// requeue, which rides the rate-limited backoff unless a gate cadence is
-// configured. Reading each peer's hold from the cache bounds the wake-ups:
+// serving counters or retry records (coordination.GateWaitsOnPeerCounters).
+// Nothing but this transition lifts such a denial before the denied
+// replica's own requeue, which rides the rate-limited backoff unless a gate
+// cadence is configured. Reading each peer's hold from the cache bounds the wake-ups:
 // a peer's counter churn enqueues nothing while no sibling is held on it.
 // A peer that cannot be read is enqueued rather than skipped; a spurious
 // pass costs less than a missed release.
@@ -120,9 +120,10 @@ func (r *Reconciler) heldPeerReplicasOf(ctx context.Context, obj client.Object) 
 }
 
 // peerCounterPredicate admits the InferenceReplica transitions a held
-// sibling's pairing or ratio simulation reads: the serving counters and the
-// per-Instance rows. Only an update carries such a transition; a peer
-// appearing or vanishing is the peer-revision watch's event.
+// sibling's pairing, ratio or batch-step simulation reads: the serving
+// counters, the per-Instance rows and the retry records. Only an update
+// carries such a transition; a peer appearing or vanishing is the
+// peer-revision watch's event.
 func peerCounterPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc:  func(event.CreateEvent) bool { return false },
@@ -140,10 +141,11 @@ func peerCounterPredicate() predicate.Predicate {
 }
 
 // peerCountersChanged reports whether an old→new InferenceReplica
-// transition moved a value the pairing or ratio simulation reads from a
-// peer: a Component-level replica counter, or a per-Instance row (serving
-// pod counts, running revisions, operations in flight) in either stored
-// encoding.
+// transition moved a value the pairing, ratio or batch-step simulation
+// reads from a peer: a Component-level replica counter, a per-Instance row
+// (serving pod counts, running revisions, operations in flight) in either
+// stored encoding, or a retry record, whose Held state a sibling's hold
+// may name.
 func peerCountersChanged(oldIR, newIR *v1beta1.InferenceReplica) bool {
 	if oldIR == nil || newIR == nil {
 		return true
@@ -156,5 +158,6 @@ func peerCountersChanged(oldIR, newIR *v1beta1.InferenceReplica) bool {
 		o.UpdatedReplicas != n.UpdatedReplicas ||
 		o.UpdatedReadyReplicas != n.UpdatedReadyReplicas ||
 		!equality.Semantic.DeepEqual(o.InstanceStatuses, n.InstanceStatuses) ||
-		!equality.Semantic.DeepEqual(o.InstanceStatusColumns, n.InstanceStatusColumns)
+		!equality.Semantic.DeepEqual(o.InstanceStatusColumns, n.InstanceStatusColumns) ||
+		!equality.Semantic.DeepEqual(o.RetryBlocks, n.RetryBlocks)
 }

@@ -1,7 +1,6 @@
 package placement
 
 import (
-	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -19,8 +18,6 @@ import (
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -28,6 +25,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/plan"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 type splitTestClusters struct{ fakeClusters }
@@ -54,8 +52,8 @@ func TestReconcileSplitInitialAllocation(t *testing.T) {
 			s.Spec.Engine.MinReplicas, s.Spec.Engine.MaxReplicas = ptr.To(20), 20
 			s.Spec.Placement.Split = nil
 			s.Spec.Placement.ClusterAffinity = []v1beta1.ClusterAffinityTerm{
-				{Weight: ptr.To[int32](10), MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}},
-				{Weight: ptr.To[int32](10), MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}}},
+				{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To[int32](10)}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}},
+				{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To[int32](10)}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}}},
 			}
 		}, wantDesired: map[string]int32{"a": 10, "b": 10}, wantCurrent: map[string]int32{"a": 10, "b": 10}, wantReason: "AwaitingMemberConvergence"},
 		{name: "not ready member retains assigned share", edit: func(_ *v1beta1.InferenceService, clusters []*v1beta1.WorkloadCluster) {
@@ -65,7 +63,7 @@ func TestReconcileSplitInitialAllocation(t *testing.T) {
 			s.Spec.Placement.ClusterAffinity = testAffinity("location=unmatched")
 		}, wantDesired: map[string]int32{}, wantCurrent: map[string]int32{}, wantUnassigned: 5, wantReason: "AllocationConverged"},
 		{name: "ceiling overflow holds whole allocation", edit: func(s *v1beta1.InferenceService, _ []*v1beta1.WorkloadCluster) {
-			s.Spec.Placement.Split.MaxReplicasPerCluster = 1
+			s.Spec.Placement.Split.MaxPerCluster = engineCap(1)
 		}, wantNoPlan: true, wantReason: "AllocationUnresolved"},
 		{name: "omitted source maximum follows allocation", edit: func(s *v1beta1.InferenceService, _ []*v1beta1.WorkloadCluster) {
 			s.Spec.Engine.MaxReplicas = 0
@@ -177,6 +175,16 @@ func TestAdvanceSplitPlanPauseAndCleanup(t *testing.T) {
 			o.RolloutReserved = 1
 			obs["a"] = o
 		}, want: allocation.Step{Targets: map[string]int32{"a": 1, "b": 0}, Reason: "SurgeBudgetExhausted"}},
+		{name: "decoders a member's copy keeps leave the allowance to the replacement", edit: func(_ *v1beta1.InferenceService, obs map[string]plannedMemberObservation) {
+			o := obs["a"]
+			o.MemberState.Occupied, o.KeptOccupied = 3, 2
+			obs["a"] = o
+		}, want: allocation.Step{Targets: map[string]int32{"a": 1, "b": 1}, Reason: "AwaitingMemberConvergence"}},
+		{name: "rollout surge on decoders a member's copy keeps leaves the allowance to the replacement", edit: func(_ *v1beta1.InferenceService, obs map[string]plannedMemberObservation) {
+			o := obs["a"]
+			o.RolloutReserved, o.KeptReserved = 1, 1
+			obs["a"] = o
+		}, want: allocation.Step{Targets: map[string]int32{"a": 1, "b": 1}, Reason: "AwaitingMemberConvergence"}},
 		{name: "unknown route cannot fund a reduction", edit: func(_ *v1beta1.InferenceService, obs map[string]plannedMemberObservation) {
 			o := obs["a"]
 			o.MemberState.Known = false
@@ -187,6 +195,13 @@ func TestAdvanceSplitPlanPauseAndCleanup(t *testing.T) {
 			s.Status.Placement.Candidates[1].Allocation.DesiredReplicas = 0
 			o := obs["a"]
 			o.MemberState.Occupied = 2
+			obs["a"] = o
+		}, want: allocation.Step{Targets: map[string]int32{"a": 1, "b": 0}, Reason: "AwaitingMemberCleanup"}},
+		{name: "a finished move still waits for decoders a member's copy keeps", edit: func(s *v1beta1.InferenceService, obs map[string]plannedMemberObservation) {
+			s.Status.Placement.Candidates[0].Allocation.DesiredReplicas = 1
+			s.Status.Placement.Candidates[1].Allocation.DesiredReplicas = 0
+			o := obs["a"]
+			o.MemberState.Occupied, o.KeptOccupied = 2, 1
 			obs["a"] = o
 		}, want: allocation.Step{Targets: map[string]int32{"a": 1, "b": 0}, Reason: "AwaitingMemberCleanup"}},
 		{name: "settled floor releases pause", edit: func(s *v1beta1.InferenceService, _ map[string]plannedMemberObservation) {
@@ -409,9 +424,7 @@ func testMoveUsesRoutingIntent(t *testing.T, mode v1beta1.PlacementMode, cancelM
 			acknowledge("a", false)
 			acknowledge("b", false)
 			publish(map[string]int32{"a": 0, "b": 1})
-			connections.m["a"] = workloadcluster.NewNeverCachingClient(interceptor.NewClient(workers["a"], interceptor.Funcs{Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error {
-				return fmt.Errorf("member delete unavailable")
-			}}))
+			connections.m["a"] = workloadcluster.NewNeverCachingClient(fakeclient.Wrap(t, workers["a"], fakeclient.FailingVerb(fakeclient.Delete, fakeclient.EveryCall, fmt.Errorf("member delete unavailable"))))
 		}, current: map[string]int32{"a": 0, "b": 1}, drain: true, pause: true, memberA: true},
 		{name: "current zero routing plan permits deletion", before: func() {
 			connections.m["a"] = workloadcluster.NewNeverCachingClient(workers["a"])
@@ -691,11 +704,8 @@ func TestReconcileSplitApplyErrorsKeepServingHealth(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			updates := 0
-			worker := interceptor.NewClient(base, interceptor.Funcs{Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error {
-				updates++
-				return tt.failure
-			}})
+			updates := fakeclient.CountingVerb(fakeclient.Update)
+			worker := fakeclient.Wrap(t, base, updates, fakeclient.FailingVerb(fakeclient.Update, fakeclient.EveryCall, tt.failure))
 			connections := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(worker)}}, uid: "member-a-uid"}
 			r, root := newPlacer(scheme, connections, fixture.source, plannedTestRegistration())
 			sink := &recordingSink{}
@@ -704,7 +714,7 @@ func TestReconcileSplitApplyErrorsKeepServingHealth(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if updates == 0 {
+			if updates.Count() == 0 {
 				t.Fatal("member update was not attempted")
 			}
 			if diff := cmp.Diff(time.Second, result.RequeueAfter); diff != "" {
@@ -742,15 +752,14 @@ func TestReconcileSplitConflictDoesNotHideWriteFailure(t *testing.T) {
 			scheme := testScheme(t)
 			source := srcISVCSplit("", 2)
 			connections := splitTestClusters{fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}}
-			attempts := 0
+			attempts := fakeclient.CountingVerb(fakeclient.Create)
 			for _, name := range []string{"a", "b"} {
-				worker := interceptor.NewClient(emptyWorker(scheme), interceptor.Funcs{Create: func(_ context.Context, _ client.WithWatch, object client.Object, _ ...client.CreateOption) error {
-					attempts++
-					if name == failureOn {
-						return fmt.Errorf("member write unavailable")
-					}
-					return apierrors.NewConflict(schema.GroupResource{Group: v1beta1.SchemeGroupVersion.Group, Resource: "inferenceservices"}, object.GetName(), fmt.Errorf("concurrent member update"))
-				}})
+				// One member refuses the write with an outage, the other with a conflict.
+				var refusal error = apierrors.NewConflict(schema.GroupResource{Group: v1beta1.SchemeGroupVersion.Group, Resource: "inferenceservices"}, source.Name, fmt.Errorf("concurrent member update"))
+				if name == failureOn {
+					refusal = fmt.Errorf("member write unavailable")
+				}
+				worker := fakeclient.Wrap(t, emptyWorker(scheme), attempts, fakeclient.FailingVerb(fakeclient.Create, fakeclient.EveryCall, refusal))
 				connections.m[name] = workloadcluster.NewNeverCachingClient(worker)
 			}
 			r, root := newPlacer(scheme, connections, source, readyWC("a", nil), readyWC("b", nil))
@@ -761,7 +770,7 @@ func TestReconcileSplitConflictDoesNotHideWriteFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			// Each member gets one write attempt per reconciliation.
-			if diff := cmp.Diff(2, attempts); diff != "" {
+			if diff := cmp.Diff(2, attempts.Count()); diff != "" {
 				t.Fatalf("member attempts (-want +got):\n%s", diff)
 			}
 			if diff := cmp.Diff(time.Second, result.RequeueAfter); diff != "" {
@@ -893,7 +902,7 @@ func TestSplitObservationWithoutPublication(t *testing.T) {
 				tt.edit(&f)
 			}
 			scheme := testScheme(t)
-			worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.member, f.resources.ir, &f.resources.pods[0]).Build()
+			worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(f.member, f.resources.ir, &f.resources.pods[0]))
 			clusters := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(worker)}}, uid: "member-a-uid"}
 			r, _ := newPlacer(scheme, clusters, f.source, plannedTestRegistration())
 			observations := r.observeSplitMembers(t.Context(), f.source, []string{"member-a"})
@@ -947,7 +956,7 @@ func TestSplitObservationWithoutRouting(t *testing.T) {
 					tt.edit(&f)
 				}
 				scheme := testScheme(t)
-				worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.member, f.resources.ir, &f.resources.pods[0]).Build()
+				worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(f.member, f.resources.ir, &f.resources.pods[0]))
 				clusters := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(worker)}}, uid: "member-a-uid"}
 				r, _ := newPlacer(scheme, clusters, f.source, plannedTestRegistration())
 				r.RoutingDisabled = disabled == "installation"
@@ -978,7 +987,7 @@ func TestSplitObservationOfBusyMembers(t *testing.T) {
 	f := observationFixture(t)
 	container := corev1.Container{Name: "ome-container", Image: "img"}
 	f.source.Spec.Decoder = &v1beta1.DecoderSpec{PodSpec: v1beta1.PodSpec{Containers: []corev1.Container{container}}}
-	f.source.Spec.Router = &v1beta1.RouterSpec{PodSpec: v1beta1.PodSpec{Containers: []corev1.Container{container}}}
+	f.source.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(3)}, PodSpec: v1beta1.PodSpec{Containers: []corev1.Container{container}}}
 	members := []string{"member-a", "member-b", "member-c"}
 	f.source.Status.Placement.Candidates = nil
 	for _, name := range members {
@@ -1018,7 +1027,7 @@ func TestSplitObservationOfBusyMembers(t *testing.T) {
 			pod.OwnerReferences[0].Name, pod.OwnerReferences[0].UID = ir.Name, ir.UID
 			objects = append(objects, ir, pod)
 		}
-		worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithInterceptorFuncs(busyReads(0, busy)).Build()
+		worker := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(objects...), fakeclient.WithInterceptors(busyReads(0, busy)))
 		connections.m[name] = workloadcluster.NewNeverCachingClient(worker)
 		controlPlane = append(controlPlane, readyWC(name, nil))
 	}

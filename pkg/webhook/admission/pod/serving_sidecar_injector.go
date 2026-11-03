@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/go-playground/validator/v10"
 	v1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/ome/pkg/constants"
@@ -47,13 +46,13 @@ func (ss *ServingSidecarInjector) InjectServingSidecar(pod *v1.Pod) error {
 }
 
 func (ss *ServingSidecarInjector) injectServingSidecar(pod *v1.Pod) error {
-	if ss.containerExists(pod) {
+	if findContainer(pod.Spec.Containers, constants.ServingSidecarContainerName) != nil {
 		return nil
 	}
-	if err := ss.validate(); err != nil {
+	if err := requireConfigured(ss, "ServingSidecarInjector"); err != nil {
 		return err
 	}
-	if err := ss.validateAuth(pod); err != nil {
+	if err := requireWorkloadIdentityServiceAccount(pod, ss.AuthType); err != nil {
 		return err
 	}
 
@@ -61,49 +60,18 @@ func (ss *ServingSidecarInjector) injectServingSidecar(pod *v1.Pod) error {
 	if err != nil {
 		return err
 	}
-	securityContext, err := ss.getMainContainerSecurityContext(pod)
+	securityContext, err := mainContainerSecurityContext(pod)
 	if err != nil {
 		return err
 	}
 
 	mounts := ss.getVolumeMounts(pod, fineTunedWeightFTStrategy)
 	envs := ss.getServingSidecarEnvs(fineTunedWeightFTStrategy)
-	sidecarContainer, err := ss.createServingSidecarContainer(envs, mounts, securityContext)
+	sidecarContainer, err := agentContainer(ss.agentContainerSpec(), envs, mounts, securityContext)
 	if err != nil {
 		return err
 	}
 	pod.Spec.Containers = append(pod.Spec.Containers, *sidecarContainer)
-	return nil
-}
-
-func (ss *ServingSidecarInjector) containerExists(pod *v1.Pod) bool {
-	for _, container := range pod.Spec.Containers {
-		if container.Name == constants.ServingSidecarContainerName {
-			return true
-		}
-	}
-	return false
-}
-
-func (ss *ServingSidecarInjector) validate() error {
-	if err := validator.New().Struct(ss); err != nil {
-		return fmt.Errorf("failed to validate ServingSidecarInjector: %w", err)
-	}
-	return nil
-}
-
-// validateAuth enforces that OKEWorkloadIdentity carries a service
-// account and turns on token automounting (the runtime uses the SA token
-// to obtain workload-identity credentials).
-func (ss *ServingSidecarInjector) validateAuth(pod *v1.Pod) error {
-	if ss.AuthType != constants.AuthtypeOKEWorkloadIdentity {
-		return nil
-	}
-	if len(pod.Spec.ServiceAccountName) == 0 {
-		return fmt.Errorf("a service account should be specified when using OKEWorkloadIdentity")
-	}
-	automount := true
-	pod.Spec.AutomountServiceAccountToken = &automount
 	return nil
 }
 
@@ -152,30 +120,17 @@ func (ss *ServingSidecarInjector) getServingSidecarEnvs(fineTunedWeightFTStrateg
 	return envVars
 }
 
-// createServingSidecarContainer constructs the serving sidecar configuration.
-func (ss *ServingSidecarInjector) createServingSidecarContainer(envs []v1.EnvVar, mounts []v1.VolumeMount, securityContext *v1.SecurityContext) (*v1.Container, error) {
-	resources, err := newResourceRequirements(ss.CpuLimit, ss.MemoryLimit, ss.CpuRequest, ss.MemoryRequest)
-	if err != nil {
-		return nil, fmt.Errorf("serving sidecar injector: %w", err)
+// agentContainerSpec is the sidecar that serves the weight: ome-agent's
+// serving-agent subcommand with this block's image and resources.
+func (ss *ServingSidecarInjector) agentContainerSpec() agentContainerSpec {
+	return agentContainerSpec{
+		injector:      "serving sidecar injector",
+		name:          constants.ServingSidecarContainerName,
+		subcommand:    "serving-agent",
+		image:         ss.Image,
+		cpuRequest:    ss.CpuRequest,
+		cpuLimit:      ss.CpuLimit,
+		memoryRequest: ss.MemoryRequest,
+		memoryLimit:   ss.MemoryLimit,
 	}
-	return &v1.Container{
-		Name:                     constants.ServingSidecarContainerName,
-		Image:                    ss.Image,
-		TerminationMessagePolicy: v1.TerminationMessageFallbackToLogsOnError,
-		Env:                      envs,
-		VolumeMounts:             mounts,
-		Args:                     []string{"serving-agent", "--config", "/ome-agent.yaml", "--debug"},
-		Resources:                resources,
-		SecurityContext:          securityContext,
-	}, nil
-}
-
-// getMainContainerSecurityContext finds and returns the security context of the main container.
-func (ss *ServingSidecarInjector) getMainContainerSecurityContext(pod *v1.Pod) (*v1.SecurityContext, error) {
-	for _, container := range pod.Spec.Containers {
-		if container.Name == constants.MainContainerName {
-			return container.SecurityContext.DeepCopy(), nil
-		}
-	}
-	return nil, fmt.Errorf("no main container %s specified", constants.MainContainerName)
 }

@@ -161,6 +161,10 @@ type ConfigState struct {
 	ScaleDownRequeueInterval string `json:"scaleDownRequeueInterval,omitempty"`
 	StuckPodGrace            string `json:"stuckPodGrace,omitempty"`
 	UnschedulableGrace       string `json:"unschedulableGrace,omitempty"`
+	// GangDomainFullGrace is lifecycle.gangDomainFullGracePeriod, the shorter
+	// grace for a gang held to a topology domain that cannot take it.
+	// Unset leaves such a hold on UnschedulableGrace.
+	GangDomainFullGrace string `json:"gangDomainFullGrace,omitempty"`
 	// AbandonedReplacementGrace is lifecycle.abandonedReplacementGracePeriod,
 	// the termination grace of a replacement abandoned before it served.
 	// Unset leaves such a pod its own grace.
@@ -253,6 +257,9 @@ type OperationSpec struct {
 	StartedAt      string `json:"startedAt,omitempty"`
 	LastProgressAt string `json:"lastProgressAt,omitempty"`
 	Deadline       string `json:"deadline,omitempty"`
+	// PlacementWaitSince seeds the attempt's recorded placement wait;
+	// empty seeds none.
+	PlacementWaitSince string `json:"placementWaitSince,omitempty"`
 }
 
 // MigrationSpec seeds one status.migrations record. A record with a surge

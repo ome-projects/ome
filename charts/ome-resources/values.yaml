@@ -171,6 +171,8 @@ ome:
         capacity: {}
         # capacity polls each TrafficMap entry's client-facing endpoint for a
         # replica ceiling or, in Reported mode, the home's capacity in replicas.
+        # In Reported mode a positive report needs a ready replica in placement
+        # status.
         # capacity:
         #   mode: Ceiling # Reported uses the report uncapped; a home without one keeps its replica count
         #   path: /capacity
@@ -288,6 +290,7 @@ ome:
       defaultMaxReplicas:
         engine: 3
         decoder: 3
+        encoder: 3
         router: 2
     # Pod termination grace the reconciler fills on any component whose
     # InferenceService and ServingRuntime both leave
@@ -335,6 +338,10 @@ ome:
         maxSurge: 25%
         maxUnavailable: 25%
       decoder:
+        type: SurgeThenDrain
+        maxSurge: 25%
+        maxUnavailable: 25%
+      encoder:
         type: SurgeThenDrain
         maxSurge: 25%
         maxUnavailable: 25%
@@ -619,8 +626,9 @@ ome:
       # updateRetry bounds automatic same-target update retries (RetryBlock).
       # A rollout that fails toward an UNCHANGED target revision backs off
       # exponentially (initialDelay * multiplier^(attempt-1), capped at
-      # maxDelay) and Holds after maxAttempts; only a new target revision
-      # releases the hold. The OME binary has NO built-in defaults: removing
+      # maxDelay) and Holds after maxAttempts; a new target revision, or the
+      # operator release annotation ome.io/release-held-revision, releases
+      # the hold. The OME binary has NO built-in defaults: removing
       # this block fails safe (the first same-target failure Holds
       # immediately with a RetryHeld warning event).
       updateRetry:
@@ -645,12 +653,28 @@ ome:
       stuckPodGracePeriod: 60s
       # unschedulableGracePeriod is how long a pod may sit with
       # PodScheduled=False/Unschedulable — measured from that condition's last
-      # transition — before its Instance is failed as environment-caused (the
-      # scheduler message is recorded; the revision is never blamed). While the
-      # pod is unschedulable the InstanceReadyTimeout clock is parked either
-      # way. Removing this field disables the escalation, so an unplaceable pod
+      # transition, or from the attempt's earlier placement wait when a pod
+      # name it needs was held by a node that stopped reporting — before its
+      # Instance is failed as environment-caused (the scheduler message is
+      # recorded; the revision is never blamed). While the pod is
+      # unschedulable the InstanceReadyTimeout clock is parked either way.
+      # Removing this field disables the escalation, so an unplaceable pod
       # waits for an operator instead.
       unschedulableGracePeriod: 15m
+      # gangDomainFullGracePeriod is a shorter window for one kind of
+      # unschedulable gang member: the scheduler keeps a gang in the topology
+      # domain where its other members already run, and that domain cannot
+      # take the rest (for example, one of its nodes stopped reporting). More
+      # capacity elsewhere never frees such a gang; ending the attempt deletes
+      # the placed members, and the rebuilt gang can land in another domain.
+      # It runs from the same start as unschedulableGracePeriod, so when a
+      # node stopped reporting, the wait for its pod counts too, and the
+      # rebuilt member's first such refusal can end the attempt. The shorter
+      # of this and unschedulableGracePeriod applies; while a pod of the
+      # attempt is still terminating, only unschedulableGracePeriod does.
+      # Unset by default: such a member then waits on
+      # unschedulableGracePeriod.
+      # gangDomainFullGracePeriod: 5m
       # abandonedReplacementGracePeriod is the termination grace given to a
       # replacement pod a rollout abandons before it ever entered the serving
       # rotation: a surge replacement superseded by a newer revision, or
@@ -1094,6 +1118,17 @@ prometheus:
   # Internal Prometheus HTTP port. service.port remains the Service-facing
   # port and may differ from this value.
   listenPort: 9090
+  # Apply a prometheus.yml change without replacing the pod, so the emptyDir
+  # TSDB survives a scrape-config edit. Prometheus checks the file every
+  # `interval` and reloads it when its checksum changes; the kubelet adds up to
+  # about a minute before the new ConfigMap content appears in the pod. An
+  # invalid file leaves the running config in place and sets
+  # prometheus_config_last_reload_successful to 0. Requires Prometheus v3.0 or
+  # later. Disable to replace the pod on every config change instead; an empty
+  # interval keeps the Prometheus default.
+  configReload:
+    enabled: true
+    interval: 30s
   # Require an explicit scrape opt-in on InferenceService pods through either
   # prometheus.io/scrape="true" or ome.io/enable-prometheus-scraping="true".
   # The compatibility default keeps the existing opt-out behavior; enable this

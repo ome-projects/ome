@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rollout"
@@ -37,34 +38,50 @@ const ReasonMultipleCanaryGroups = "MultipleCanaryGroups"
 const ReasonAnalysisInvalid = "AnalysisInvalid"
 
 // ValidateCanary checks every spec.rollout.groups[] entry whose progression
-// KIND is canary — an inline canary block or a policyRef declaring canary
-// (inline wins when both are set). Returns nil when none (nil-safe). The CRD
-// CEL rule enforces the one-of progression (canary may span multiple
-// Components, primary-driven); these are the value-level rules CEL can't
-// express. The shape rules below apply to every canary-kind group; the plan
-// body is checked only when inline — a referenced body is validated at
-// policy admission and again at run open. Each rule guards a concrete
-// failure:
-//   - Steps non-empty — an empty plan has nothing to execute.
-//   - Every Component in the group is OMENative — other modes wedge at Pending.
-//   - Final step Traffic == 100 — otherwise the rollout never fully cuts over.
-//   - Final step Capacity == 100% — otherwise it completes on a partial fleet.
-//   - Every step Capacity parses strictly (integer >= 0, or "<N>%" with N in
-//     [0,100]) — the runtime resolver maps unparsable values to zero, so a
-//     malformed capacity would silently stage no new pods.
-//   - Traffic in [0,100], non-decreasing, and Traffic>0 requires Capacity>0.
-//   - Each analysis step's config is complete and well-formed (delegated to
-//     validateCanaryAnalysis).
+// kind is canary: an inline canary block, or a policyRef declaring canary
+// (inline wins when both are set). Nil-safe; returns nil when there is none.
+// The CRD's CEL rule keeps the progression one-of; these are the value rules
+// CEL cannot express, run in this order: one canary run per unit across the
+// groups, then per group the plan body when it is inline (a referenced body
+// is checked at policy admission and again at run open), the members, the
+// units, and no maintainRatio.
 func ValidateCanary(spec *v1beta1.InferenceServiceSpec) error {
 	groups := spec.GetRolloutGroups()
+	if err := validateOneCanaryRunPerUnit(groups); err != nil {
+		return err
+	}
 	modeFor := omenativeDeploymentModeMap(spec)
 	declared := declaredComponents(spec)
-	// One canary run per unit. Two canary groups may coexist — a router run and
-	// an engine run advance independently on disjoint Components — but two runs
-	// driving the same unit would each believe they own its revision and step
-	// counter, and would fight over status.components[c].traffic. A duplicate
-	// entry there fails apiserver validation for the whole status write, which
-	// freezes every subsequent reconcile for the InferenceService.
+	for gi := range groups {
+		g := &groups[gi]
+		if rolloutGroupKind(g) != v1beta1.RolloutProgressionCanary {
+			continue
+		}
+		if g.Canary != nil {
+			if err := ValidateCanaryPlan(fmt.Sprintf("spec.rollout.groups[%d].canary", gi), g.Canary); err != nil {
+				return err
+			}
+		}
+		if err := validateCanaryMembers(gi, g, declared, modeFor); err != nil {
+			return err
+		}
+		if err := validateCanaryUnits(gi, g, declared); err != nil {
+			return err
+		}
+		// The canary engine does not enforce maintainRatio, so a group that
+		// sets it is refused rather than run without the guard it asked for.
+		if g.MaintainRatio != nil {
+			return fmt.Errorf("spec.rollout.groups[%d]: maintainRatio is not honored on a canary group (the canary engine does not enforce it) — remove it, or use a blueGreen/rollingUpdate group for ratio-guarded rollout (%s)",
+				gi, ReasonCanaryInvalid)
+		}
+	}
+	return nil
+}
+
+// validateOneCanaryRunPerUnit refuses a unit that two canary groups drive.
+// Groups on different units may each carry a run; one unit carries at most
+// one (ReasonMultipleCanaryGroups says why).
+func validateOneCanaryRunPerUnit(groups []v1beta1.RolloutGroup) error {
 	ownerOf := map[v1beta1.ComponentType]int{}
 	for gi := range groups {
 		if rolloutGroupKind(&groups[gi]) != v1beta1.RolloutProgressionCanary {
@@ -78,73 +95,68 @@ func ValidateCanary(spec *v1beta1.InferenceServiceSpec) error {
 			ownerOf[u] = gi
 		}
 	}
-	for gi := range groups {
-		g := &groups[gi]
-		if rolloutGroupKind(g) != v1beta1.RolloutProgressionCanary {
+	return nil
+}
+
+// validateCanaryMembers checks every member of canary group gi: a known
+// Component, declared on the InferenceService, and OMENative. The primary
+// Component is picked among the members, and only OMENative has the
+// per-revision pods and the InferenceReplica the steps drive.
+func validateCanaryMembers(gi int, g *v1beta1.RolloutGroup, declared map[v1beta1.ComponentType]struct{}, modeFor map[v1beta1.ComponentType]string) error {
+	for _, comp := range g.Components {
+		if !isRole(comp) {
+			return fmt.Errorf("spec.rollout.groups[%d]: canary component %q is not one of %s (%s)",
+				gi, comp, roleNames("/"), ReasonCanaryInvalid)
+		}
+		if _, ok := declared[comp]; !ok {
+			return fmt.Errorf("spec.rollout.groups[%d]: canary component %q is not declared on the InferenceService (%s)",
+				gi, comp, ReasonCanaryInvalid)
+		}
+		if m, ok := modeFor[comp]; ok && m != string(constants.OMENative) {
+			return fmt.Errorf("spec.rollout.groups[%d]: component %q has deploymentMode=%q; canary requires OMENative (%s)",
+				gi, comp, m, ReasonCanaryRequiresOMENative)
+		}
+	}
+	return nil
+}
+
+// validateCanaryUnits checks that canary group gi names the entrypoint
+// Component of every unit it touches (the router for the router unit, the
+// engine for the engine unit), since the step machine and the traffic weight
+// are driven through it. The roles that pair (engine, decoder, encoder) are
+// one unit, so when the InferenceService declares two or more of them a group
+// names all or none: a new-protocol prefill with no pairable peer fails
+// requests.
+func validateCanaryUnits(gi int, g *v1beta1.RolloutGroup, declared map[v1beta1.ComponentType]struct{}) error {
+	has := map[v1beta1.ComponentType]bool{}
+	for _, comp := range g.Components {
+		has[comp] = true
+	}
+	for _, u := range rollout.CanaryUnitsOf(g) {
+		if !has[u] {
+			return fmt.Errorf("spec.rollout.groups[%d]: a canary group covering the %q unit must include its entrypoint Component %q — that is what the step machine and traffic weight are driven through (%s)",
+				gi, u, u, ReasonCanaryInvalid)
+		}
+	}
+	var pairing []string
+	named := 0
+	for _, r := range v1beta1.Roles {
+		if _, ok := declared[r.Type]; !ok || !r.Pairs {
 			continue
 		}
-		if g.Canary != nil {
-			if err := ValidateCanaryPlan(fmt.Sprintf("spec.rollout.groups[%d].canary", gi), g.Canary); err != nil {
-				return err
-			}
+		pairing = append(pairing, string(r.Type))
+		if has[r.Type] {
+			named++
 		}
-		for _, comp := range g.Components {
-			// A canary group's Components must be valid and declared on the ISVC:
-			// primaryComponent picks router>engine>decoder among them, so an invalid
-			// or undeclared member becomes a phantom primary that wedges the roll.
-			if _, ok := validComponents[comp]; !ok {
-				return fmt.Errorf("spec.rollout.groups[%d]: canary component %q is not one of router/engine/decoder (%s)",
-					gi, comp, ReasonCanaryInvalid)
-			}
-			if _, ok := declared[comp]; !ok {
-				return fmt.Errorf("spec.rollout.groups[%d]: canary component %q is not declared on the InferenceService (%s)",
-					gi, comp, ReasonCanaryInvalid)
-			}
-			if m, ok := modeFor[comp]; ok && m != string(constants.OMENative) {
-				return fmt.Errorf("spec.rollout.groups[%d]: component %q has deploymentMode=%q; canary requires OMENative (%s)",
-					gi, comp, m, ReasonCanaryRequiresOMENative)
-			}
+	}
+	if len(pairing) >= 2 && named > 0 && named < len(pairing) {
+		declares, either, all := "both "+pairing[0]+" and "+pairing[1], "either", "both"
+		if len(pairing) > 2 {
+			declares = strings.Join(pairing[:len(pairing)-1], ", ") + " and " + pairing[len(pairing)-1]
+			either, all = "any of them", "all of them"
 		}
-		// A canary group must contain the entrypoint of every unit it touches:
-		// the router for the router unit, the engine for the engine unit. The
-		// unit entrypoint is what primaryComponent drives the step machine and
-		// traffic weight through, so a group that stages a secondary without its
-		// entrypoint has no Component carrying the roll.
-		//
-		// An engine unit moves real traffic without owning the external
-		// entrypoint: the router discovers engine endpoints by label selector
-		// with no revision term, so a step that puts a fraction of engine
-		// replicas on the new revision moves roughly that fraction of requests.
-		// The split is capacity-driven and mediated by the router's balancing
-		// rather than exact, which is why capacity — not traffic — is the
-		// contract for a non-entrypoint unit.
-		has := map[v1beta1.ComponentType]bool{}
-		for _, comp := range g.Components {
-			has[comp] = true
-		}
-		for _, u := range rollout.CanaryUnitsOf(g) {
-			if !has[u] {
-				return fmt.Errorf("spec.rollout.groups[%d]: a canary group covering the %q unit must include its entrypoint Component %q — that is what the step machine and traffic weight are driven through (%s)",
-					gi, u, u, ReasonCanaryInvalid)
-			}
-		}
-		// The engine unit is engine+decoder whenever the ISVC declares both.
-		// Splitting the pair across a canary boundary can leave a new-protocol
-		// prefill with no pairable decode, which fails requests outright.
-		_, hasEngineSpec := declared[v1beta1.EngineComponent]
-		_, hasDecoderSpec := declared[v1beta1.DecoderComponent]
-		if hasEngineSpec && hasDecoderSpec &&
-			has[v1beta1.EngineComponent] != has[v1beta1.DecoderComponent] {
-			return fmt.Errorf("spec.rollout.groups[%d]: this InferenceService declares both engine and decoder, so a canary group naming either must name both — they roll as one unit (%s)",
-				gi, ReasonCanaryInvalid)
-		}
-		// MaintainRatio is silently ignored by the canary engine (it gates only
-		// coordination-style pacing). Reject rather than no-op so an operator is not
-		// misled into thinking the cross-Component ratio is guarded during the canary.
-		if g.MaintainRatio != nil {
-			return fmt.Errorf("spec.rollout.groups[%d]: maintainRatio is not honored on a canary group (the canary engine does not enforce it) — remove it, or use a blueGreen/rollingUpdate group for ratio-guarded rollout (%s)",
-				gi, ReasonCanaryInvalid)
-		}
+		return fmt.Errorf("spec.rollout.groups[%d]: this InferenceService declares %s, so a canary group naming %s must name %s — they roll as one unit (%s)",
+			gi, declares, either, all, ReasonCanaryInvalid)
 	}
 	return nil
 }

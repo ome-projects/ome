@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"iter"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -31,6 +32,23 @@ const ReasonContainersNotReady = "ContainersNotReady"
 // kubelet has already named that failure and the engine classifies it
 // on its own terms.
 func PodRunningNotReady(pod *corev1.Pod) bool {
+	if !allContainersRunning(pod) {
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.ContainersReady {
+			return cond.Status != corev1.ConditionTrue
+		}
+	}
+	// No ContainersReady condition yet: the kubelet has not vouched for
+	// the pod, so it is not ready.
+	return true
+}
+
+// allContainersRunning reports whether a live pod is in phase Running
+// with at least one container status and every regular container
+// running.
+func allContainersRunning(pod *corev1.Pod) bool {
 	if pod == nil || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
 		return false
 	}
@@ -42,13 +60,6 @@ func PodRunningNotReady(pod *corev1.Pod) bool {
 			return false
 		}
 	}
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type == corev1.ContainersReady {
-			return cond.Status != corev1.ConditionTrue
-		}
-	}
-	// No ContainersReady condition yet: the kubelet has not vouched for
-	// the pod, so it is not ready.
 	return true
 }
 
@@ -73,16 +84,8 @@ const ReasonReadinessGateNotSatisfied = "ReadinessGateNotSatisfied"
 // Disjoint from PodRunningNotReady by construction (that shape requires
 // ContainersReady not True), so a pod is evidence for at most one of them.
 func podGateNotFolded(pod *corev1.Pod) bool {
-	if pod == nil || pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+	if !allContainersRunning(pod) {
 		return false
-	}
-	if len(pod.Status.ContainerStatuses) == 0 {
-		return false
-	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Running == nil {
-			return false
-		}
 	}
 	containersReady, podReady := false, false
 	for _, cond := range pod.Status.Conditions {
@@ -164,14 +167,30 @@ func podHasWaitingContainer(pod *corev1.Pod) bool {
 	if pod == nil {
 		return false
 	}
-	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
-		for _, cs := range statuses {
-			if cs.State.Waiting != nil {
-				return true
-			}
+	for cs := range containerStatuses(pod) {
+		if cs.State.Waiting != nil {
+			return true
 		}
 	}
 	return false
+}
+
+// containerStatuses yields the pod's container statuses, the regular
+// containers first and the init containers after them: the order in
+// which every reader of this package names a container.
+func containerStatuses(pod *corev1.Pod) iter.Seq[corev1.ContainerStatus] {
+	return func(yield func(corev1.ContainerStatus) bool) {
+		for _, cs := range pod.Status.ContainerStatuses {
+			if !yield(cs) {
+				return
+			}
+		}
+		for _, cs := range pod.Status.InitContainerStatuses {
+			if !yield(cs) {
+				return
+			}
+		}
+	}
 }
 
 // ContainersNotReadyTermination is the LastFailure record for a pod in
@@ -219,11 +238,9 @@ func ContainersNotReadyTermination(pod *corev1.Pod, now metav1.Time) *types.Inst
 // marked Ready, regular containers first so the primary runner leads.
 func notReadyContainerNames(pod *corev1.Pod) []string {
 	var names []string
-	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
-		for _, cs := range statuses {
-			if !cs.Ready {
-				names = append(names, cs.Name)
-			}
+	for cs := range containerStatuses(pod) {
+		if !cs.Ready {
+			names = append(names, cs.Name)
 		}
 	}
 	return names
@@ -246,49 +263,40 @@ func notReadyContainerNames(pod *corev1.Pod) []string {
 // the node, and a not-ready sibling must not be what decides to hold the
 // revision instead of relocating.
 func FirstRunningNotReadyPod(pods []*corev1.Pod, attemptRev string) (*corev1.Pod, string) {
-	var limbo *corev1.Pod
-	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		if !podOnAttemptRevision(pod, attemptRev) {
-			continue
-		}
-		if podHasWaitingContainer(pod) {
-			return nil, ""
-		}
-		if limbo == nil && PodRunningNotReady(pod) {
-			limbo = pod
-		}
-	}
-	if limbo == nil {
+	pod := firstAttemptPod(pods, attemptRev, PodRunningNotReady)
+	if pod == nil {
 		return nil, ""
 	}
-	return limbo, ReasonContainersNotReady
+	return pod, ReasonContainersNotReady
 }
 
 // FirstGateNotFoldedPod returns the first live pod whose containers are
 // ready but whose Ready condition never followed, under the same scoping and
-// suppression rules as firstRunningNotReadyPod: revision-scoped when the pods
+// suppression rules as FirstRunningNotReadyPod: revision-scoped when the pods
 // say which revision they belong to, and suppressed outright when the kubelet
 // has named a waiting reason on any pod of the scoped set.
 func FirstGateNotFoldedPod(pods []*corev1.Pod, attemptRev string) *corev1.Pod {
-	var limbo *corev1.Pod
+	return firstAttemptPod(pods, attemptRev, podGateNotFolded)
+}
+
+// firstAttemptPod returns the first live pod of the attempt in the given
+// shape, nil when there is none. It is nil as well whenever any live pod
+// of the attempt has a container in a waiting state: the kubelet has
+// named a failure there, and that name owns the blame.
+func firstAttemptPod(pods []*corev1.Pod, attemptRev string, shape func(*corev1.Pod) bool) *corev1.Pod {
+	var first *corev1.Pod
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		if !podOnAttemptRevision(pod, attemptRev) {
+		if pod == nil || pod.DeletionTimestamp != nil || !podOnAttemptRevision(pod, attemptRev) {
 			continue
 		}
 		if podHasWaitingContainer(pod) {
 			return nil
 		}
-		if limbo == nil && podGateNotFolded(pod) {
-			limbo = pod
+		if first == nil && shape(pod) {
+			first = pod
 		}
 	}
-	return limbo
+	return first
 }
 
 // podOnAttemptRevision reports whether a pod may be read as the

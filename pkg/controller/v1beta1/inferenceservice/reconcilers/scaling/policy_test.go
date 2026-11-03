@@ -89,7 +89,7 @@ func TestFollowerBounds(t *testing.T) {
 		{"only-a-minimum", &v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(2)}, 2, nil},
 		{"both", &v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(2), MaxReplicas: 8}, 2, ptr.To[int32](8)},
 		{"maximum-raised-to-minimum", &v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(5), MaxReplicas: 3}, 5, ptr.To[int32](5)},
-		{"zero-minimum-floors-at-one", &v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(0)}, 1, nil},
+		{"zero-minimum-raised-to-one", &v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(0)}, 1, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := FollowerBounds(tc.spec)

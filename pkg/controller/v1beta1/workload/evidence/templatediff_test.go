@@ -89,8 +89,8 @@ func TestCanonicalImage_NormalizesDockerHubReferences(t *testing.T) {
 		{"empty string", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := CanonicalImage(tc.in); got != tc.want {
-				t.Errorf("CanonicalImage(%q) = %q, want %q", tc.in, got, tc.want)
+			if got := canonicalImage(tc.in); got != tc.want {
+				t.Errorf("canonicalImage(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -280,8 +280,8 @@ func TestPodRuntimeImageChangesMatch(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := PodRuntimeImageChangesMatch(test.pod, test.running, test.target); got != test.want {
-				t.Fatalf("PodRuntimeImageChangesMatch() = %v, want %v", got, test.want)
+			if got := podRuntimeImageChangesMatch(test.pod, test.running, test.target); got != test.want {
+				t.Fatalf("podRuntimeImageChangesMatch() = %v, want %v", got, test.want)
 			}
 		})
 	}
@@ -304,7 +304,7 @@ func TestPodRuntimeImageChangesMatchDoesNotUseRestartAsTargetProof(t *testing.T)
 					}},
 				},
 			}
-			if PodRuntimeImageChangesMatch(pod, running, target) {
+			if podRuntimeImageChangesMatch(pod, running, target) {
 				t.Fatal("old runtime image was accepted after an unrelated restart")
 			}
 		})

@@ -18,7 +18,7 @@ import (
 // disallowed list into the Component's pod template, so each new value
 // changes the projected replica's spec and the projector writes it (a new
 // generation on a live apiserver), while the revision hash leaves the key out
-// and no pod changes. The template hash the projector stamps beside the spec
+// and no pod changes. The template hash the projector writes beside the spec
 // follows the revision, not the generation: it stands through the value
 // change and moves with a declared component annotation, which the revision
 // covers.
@@ -38,7 +38,7 @@ func TestServiceAnnotationValueRewritesTheReplicaWithoutANewRevision(t *testing.
 		t.Fatalf("the service annotation must reach the runner template, got %q", got)
 	}
 	firstVersion := stored.ResourceVersion
-	firstStamp := stored.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]
+	firstHash := stored.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]
 	excluded := false
 	for _, k := range first.ExcludedAnnotationKeys {
 		excluded = excluded || k == key
@@ -61,12 +61,12 @@ func TestServiceAnnotationValueRewritesTheReplicaWithoutANewRevision(t *testing.
 	if first.RevisionHash != second.RevisionHash {
 		t.Fatalf("the value must not mint a revision: hash %s before, %s after", first.RevisionHash, second.RevisionHash)
 	}
-	stamp := stored.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]
-	if stamp == "" || stamp != firstStamp {
-		t.Fatalf("the template hash must stand through the value change: %q before, %q after", firstStamp, stamp)
+	templateHash := stored.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]
+	if templateHash == "" || templateHash != firstHash {
+		t.Fatalf("the template hash must stand through the value change: %q before, %q after", firstHash, templateHash)
 	}
-	if want := v1beta1convert.TemplateHash(stored, stored.Spec.Runners); stamp != want {
-		t.Fatalf("the stamp must be the hash of the stored templates: %q, want %q", stamp, want)
+	if want := v1beta1convert.TemplateHash(stored, stored.Spec.Runners); templateHash != want {
+		t.Fatalf("the annotation must be the hash of the stored templates: %q, want %q", templateHash, want)
 	}
 
 	tc.service.Spec.Engine.Annotations = map[string]string{"example.com/declared": "1"}
@@ -77,7 +77,7 @@ func TestServiceAnnotationValueRewritesTheReplicaWithoutANewRevision(t *testing.
 	if third.RevisionHash == first.RevisionHash {
 		t.Fatalf("a declared component annotation mints a revision; the hash stayed %s", third.RevisionHash)
 	}
-	if got := stored.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]; got == firstStamp {
+	if got := stored.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]; got == firstHash {
 		t.Fatalf("the template hash must move with the revision; it stayed %q", got)
 	}
 }

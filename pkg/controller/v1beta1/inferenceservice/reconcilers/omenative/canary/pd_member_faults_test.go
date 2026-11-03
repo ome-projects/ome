@@ -11,10 +11,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/rollout"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // A prefill/decode unit canaried on both members: the engine is the primary
@@ -68,10 +68,9 @@ func armPDWire(t *testing.T, steps []v1beta1.RolloutGroupStep, t0 time.Time) *pd
 		}
 		return r
 	}
-	c := fake.NewClientBuilder().
-		WithScheme(canaryScheme(t)).
-		WithStatusSubresource(&v1beta1.InferenceReplica{}).
-		WithRuntimeObjects(
+	c := fakeclient.New(t,
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceReplica{}),
+		fakeclient.WithObjects(
 			isvc,
 			member(v1beta1.EngineComponent, "engold", "engnew"),
 			member(v1beta1.DecoderComponent, "decold", "decnew"),
@@ -83,8 +82,8 @@ func armPDWire(t *testing.T, steps []v1beta1.RolloutGroupStep, t0 time.Time) *pd
 			canaryControllerRevision(ns, name, "engine", "engnew", 2),
 			canaryControllerRevision(ns, name, "decoder", "decold", 1),
 			canaryControllerRevision(ns, name, "decoder", "decnew", 2),
-		).
-		Build()
+		),
+	)
 	rec := record.NewFakeRecorder(16)
 	w := &pdWire{ctx: context.Background(), client: c, rec: rec, isvc: isvc, ns: ns, name: name,
 		deps: DispatchDeps{Client: c, Reader: c, Recorder: rec, ISVC: isvc, ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(isvc, rollout.Policies{}), Now: t0}}

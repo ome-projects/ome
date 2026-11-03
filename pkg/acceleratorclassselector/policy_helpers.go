@@ -3,21 +3,19 @@ package acceleratorclassselector
 import (
 	"context"
 	"fmt"
-	"sort"
+	"math"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/version"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// scoredCandidate wraps a candidate with its calculated score
-type scoredCandidate struct {
-	v1beta1.AcceleratorClass
-	Score  float64
-	Reason string // Human-readable explanation for debugging
-}
+// gibibyte converts a memory quantity in bytes to gigabytes.
+const gibibyte = 1024 * 1024 * 1024
 
 // candidatesFromNames fetches AcceleratorClass specs for given names
 func candidatesFromNames(
@@ -78,98 +76,122 @@ func filterCandidates(
 	return filtered
 }
 
-// meetsRequirements checks if a candidate satisfies all requirements from InferenceService
+// constraintCheck returns why a candidate breaks one constraint, or "" when it satisfies it.
+type constraintCheck func(candidate v1beta1.AcceleratorClass, constraints *v1beta1.AcceleratorConstraints) string
+
+// constraintChecks are the hard constraints, in the order their refusals are reported.
+// MinComputePerformanceTFLOPS is not one of them: it is a scoring factor
+// (calculateComputePerformanceTFLOPSScore), so a low figure lowers a candidate's
+// score but does not disqualify it.
+var constraintChecks = []constraintCheck{
+	notExcluded,
+	inArchitectureFamilies,
+	memoryWithinBounds,
+	hasRequiredFeatures,
+	computeCapabilityAtLeast,
+}
+
+// meetsRequirements reports whether a candidate satisfies every constraint of the
+// InferenceService, and the first refusal when it does not.
 func meetsRequirements(
 	candidate v1beta1.AcceleratorClass,
 	constraints *v1beta1.AcceleratorConstraints,
 ) (bool, string) {
-	spec := candidate.Spec
-
-	// If no constraints, all candidates are eligible
 	if constraints == nil {
 		return true, ""
 	}
-
-	// Check if excluded
-	for _, excluded := range constraints.ExcludedClasses {
-		if candidate.Name == excluded {
-			return false, "explicitly excluded"
+	for _, check := range constraintChecks {
+		if refusal := check(candidate, constraints); refusal != "" {
+			return false, refusal
 		}
 	}
-
-	// Check architecture family
-	if len(constraints.ArchitectureFamilies) > 0 {
-		candidateVendorFamily := fmt.Sprintf("%s-%s",
-			strings.ToLower(spec.Vendor),
-			strings.ToLower(spec.Family))
-		candidateFamily := strings.ToLower(spec.Family)
-		found := false
-		for _, family := range constraints.ArchitectureFamilies {
-			if strings.Contains(family, "-") {
-				if strings.EqualFold(family, candidateVendorFamily) {
-					found = true
-					break
-				}
-			} else {
-				if strings.EqualFold(family, candidateFamily) {
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			return false, fmt.Sprintf("architecture family %s not in allowed list", candidateFamily)
-		}
-	}
-
-	// Check MinMemory and MaxMemory (cost control)
-	if constraints.MinMemory != nil || constraints.MaxMemory != nil {
-		if spec.Capabilities.MemoryGB == nil {
-			return false, "missing memory specification for memory check"
-		}
-		memGB := spec.Capabilities.MemoryGB.Value() / (1024 * 1024 * 1024)
-
-		if constraints.MinMemory != nil && memGB < *constraints.MinMemory {
-			return false, fmt.Sprintf("memory %dGB < required %dGB", memGB, *constraints.MinMemory)
-		}
-
-		if constraints.MaxMemory != nil && memGB > *constraints.MaxMemory {
-			return false, fmt.Sprintf("memory %dGB > max allowed %dGB", memGB, *constraints.MaxMemory)
-		}
-	}
-
-	// MinComputePerformanceTFLOPS is a scoring factor (calculateComputePerformanceTFLOPSScore), not a hard filter: a low value lowers a candidate's score but does not disqualify it.
-
-	// Check RequiredFeatures (ALL must be present - hard requirement)
-	if len(constraints.RequiredFeatures) > 0 {
-		candidateFeatures := make(map[string]struct{})
-		for _, f := range spec.Capabilities.Features {
-			candidateFeatures[strings.ToLower(f)] = struct{}{}
-		}
-		for _, required := range constraints.RequiredFeatures {
-			if _, found := candidateFeatures[strings.ToLower(required)]; !found {
-				return false, fmt.Sprintf("missing required feature: %s", required)
-			}
-		}
-	}
-
-	// Check MinArchitectureVersion (e.g., "8.0" for Ampere, "9.0" for Hopper)
-	if constraints.MinArchitectureVersion != nil {
-		if spec.Capabilities.ComputeCapability == "" {
-			return false, "missing compute capability for architecture version check"
-		}
-
-		// Compare version strings lexicographically (works for NVIDIA format like "7.5", "8.0", "8.6", "9.0")
-		candidateVersion := spec.Capabilities.ComputeCapability
-		requiredVersion := *constraints.MinArchitectureVersion
-
-		if candidateVersion < requiredVersion {
-			return false, fmt.Sprintf("compute capability %s < required %s",
-				candidateVersion, requiredVersion)
-		}
-	}
-
 	return true, ""
+}
+
+func notExcluded(candidate v1beta1.AcceleratorClass, constraints *v1beta1.AcceleratorConstraints) string {
+	if slices.Contains(constraints.ExcludedClasses, candidate.Name) {
+		return "explicitly excluded"
+	}
+	return ""
+}
+
+// inArchitectureFamilies accepts a family named alone or as vendor-family, ignoring case.
+func inArchitectureFamilies(candidate v1beta1.AcceleratorClass, constraints *v1beta1.AcceleratorConstraints) string {
+	if len(constraints.ArchitectureFamilies) == 0 {
+		return ""
+	}
+	family := strings.ToLower(candidate.Spec.Family)
+	vendorFamily := strings.ToLower(candidate.Spec.Vendor) + "-" + family
+	allowed := slices.ContainsFunc(constraints.ArchitectureFamilies, func(wanted string) bool {
+		if strings.Contains(wanted, "-") {
+			return strings.EqualFold(wanted, vendorFamily)
+		}
+		return strings.EqualFold(wanted, family)
+	})
+	if !allowed {
+		return fmt.Sprintf("architecture family %s not in allowed list", family)
+	}
+	return ""
+}
+
+// memoryWithinBounds compares whole gigabytes against the minimum and maximum the service allows.
+func memoryWithinBounds(candidate v1beta1.AcceleratorClass, constraints *v1beta1.AcceleratorConstraints) string {
+	if constraints.MinMemory == nil && constraints.MaxMemory == nil {
+		return ""
+	}
+	if candidate.Spec.Capabilities.MemoryGB == nil {
+		return "missing memory specification for memory check"
+	}
+	memGB := candidate.Spec.Capabilities.MemoryGB.Value() / gibibyte
+	if constraints.MinMemory != nil && memGB < *constraints.MinMemory {
+		return fmt.Sprintf("memory %dGB < required %dGB", memGB, *constraints.MinMemory)
+	}
+	if constraints.MaxMemory != nil && memGB > *constraints.MaxMemory {
+		return fmt.Sprintf("memory %dGB > max allowed %dGB", memGB, *constraints.MaxMemory)
+	}
+	return ""
+}
+
+// hasRequiredFeatures demands every required feature, compared ignoring case.
+func hasRequiredFeatures(candidate v1beta1.AcceleratorClass, constraints *v1beta1.AcceleratorConstraints) string {
+	have := make(map[string]struct{}, len(candidate.Spec.Capabilities.Features))
+	for _, feature := range candidate.Spec.Capabilities.Features {
+		have[strings.ToLower(feature)] = struct{}{}
+	}
+	for _, required := range constraints.RequiredFeatures {
+		if _, ok := have[strings.ToLower(required)]; !ok {
+			return fmt.Sprintf("missing required feature: %s", required)
+		}
+	}
+	return ""
+}
+
+// computeCapabilityAtLeast demands a compute capability at or above the minimum.
+// Both read as dotted numbers ("major.minor", as NVIDIA states them), so
+// "10.0" is above "9.0"; a value that is not a number form keeps the text order.
+func computeCapabilityAtLeast(candidate v1beta1.AcceleratorClass, constraints *v1beta1.AcceleratorConstraints) string {
+	if constraints.MinArchitectureVersion == nil {
+		return ""
+	}
+	have := candidate.Spec.Capabilities.ComputeCapability
+	if have == "" {
+		return "missing compute capability for architecture version check"
+	}
+	if capabilityBelow(have, *constraints.MinArchitectureVersion) {
+		return fmt.Sprintf("compute capability %s < required %s", have, *constraints.MinArchitectureVersion)
+	}
+	return ""
+}
+
+// capabilityBelow reports whether have sorts below minimum: by number when
+// both parse as dotted numbers, by text otherwise.
+func capabilityBelow(have, minimum string) bool {
+	h, errHave := version.ParseGeneric(have)
+	m, errMinimum := version.ParseGeneric(minimum)
+	if errHave != nil || errMinimum != nil {
+		return have < minimum
+	}
+	return h.LessThan(m)
 }
 
 // calculateBestFitScore computes multi-criteria score for best fit
@@ -179,6 +201,10 @@ func calculateBestFitScore(
 	candidate v1beta1.AcceleratorClass,
 	constraints *v1beta1.AcceleratorConstraints,
 ) float64 {
+	// A service that states no constraints requires nothing: score it as an empty block.
+	if constraints == nil {
+		constraints = &v1beta1.AcceleratorConstraints{}
+	}
 	weights := struct {
 		memory  float64
 		compute float64
@@ -202,12 +228,10 @@ func calculateMemoryFitScore(
 	}
 
 	// Should already be filtered, but safety check
-	spec := candidate.Spec
-	if spec.Capabilities.MemoryGB == nil {
+	candidateMemGB, stated := memoryGB(candidate.Spec.Capabilities)
+	if !stated {
 		return 0.0
 	}
-
-	candidateMemGB := float64(spec.Capabilities.MemoryGB.Value()) / (1024 * 1024 * 1024)
 	requiredMemGB := float64(*constraints.MinMemory)
 
 	if candidateMemGB < requiredMemGB {
@@ -224,6 +248,14 @@ func calculateMemoryFitScore(
 	score := 1.0 / ratio
 
 	return score
+}
+
+// memoryGB reads the class's memory in gigabytes; stated is false when the class gives none.
+func memoryGB(capabilities v1beta1.AcceleratorCapabilities) (gb float64, stated bool) {
+	if capabilities.MemoryGB == nil {
+		return 0, false
+	}
+	return float64(capabilities.MemoryGB.Value()) / gibibyte, true
 }
 
 // scoreFromTFLOPS calculates score based on TFLOPS ratio to requirement
@@ -248,95 +280,100 @@ func scoreFromTFLOPS(tflops int64, requiredTFLOPS int64) float64 {
 	return ratio
 }
 
-// calculateComputePerformanceTFLOPSScore scores compute performance with iterative precision fallback
-// Iterative precision logic:
-// - If no PreferredPrecisions: use max TFLOPS across all precisions
-// - If PreferredPrecisions exist: iterate through them
-//   - First precision with TFLOPS > 0: baseScore * 1.0
-//   - Second precision: baseScore * 0.5 (penalty *= 0.5)
-//   - Third precision: baseScore * 0.25 (penalty *= 0.5)
-//
-// - Fallback to fp16 if not in list
-// - Return 0.0 if no precision has any TFLOPS data
+// calculateComputePerformanceTFLOPSScore scores compute against MinComputePerformanceTFLOPS
+// at the first preferred precision that states a figure; every precision tried before it
+// halves the score. Without preferred precisions the best figure of any precision counts.
+// When no preferred precision states a figure and fp16 is not among them, fp16 serves
+// with the full penalty.
 func calculateComputePerformanceTFLOPSScore(
 	candidate v1beta1.AcceleratorClass,
 	constraints *v1beta1.AcceleratorConstraints,
 ) float64 {
-	spec := candidate.Spec
-	if spec.Capabilities.Performance == nil {
+	perf := candidate.Spec.Capabilities.Performance
+	if perf == nil {
 		return 0.0
 	}
 
-	perf := spec.Capabilities.Performance
-
-	// If no MinComputePerformanceTFLOPS requirement, return 1.0
 	requiredTFLOPS := int64(0)
 	if constraints.MinComputePerformanceTFLOPS != nil {
 		requiredTFLOPS = *constraints.MinComputePerformanceTFLOPS
 	}
 
-	// Case 1: No preferred precisions specified - use max TFLOPS across all precisions
-	if len(constraints.PreferredPrecisions) == 0 {
-		tflops := getMaxTFLOPS(perf)
-		return scoreFromTFLOPS(tflops, requiredTFLOPS)
+	precisions := constraints.PreferredPrecisions
+	if len(precisions) == 0 {
+		return scoreFromTFLOPS(getMaxTFLOPS(perf), requiredTFLOPS)
 	}
 
-	// Case 2: Try each preferred precision in order with penalty degradation
-	penalty := 1.0
-	for _, precision := range constraints.PreferredPrecisions {
-		tflops := getTFLOPSForPrecision(perf, strings.ToLower(precision))
-		if tflops > 0 {
-			baseScore := scoreFromTFLOPS(tflops, requiredTFLOPS)
-			// Apply precision penalty (1.0 for first, 0.5 for second, 0.25 for third, etc.)
-			return baseScore * penalty
-		}
-		// Degrade penalty for next precision
-		penalty *= 0.5
+	tflops, missed := firstPrecisionWithTFLOPS(perf, precisions)
+	fp16Listed := slices.ContainsFunc(precisions, func(precision string) bool {
+		return strings.ToLower(precision) == "fp16"
+	})
+	if tflops == 0 && !fp16Listed {
+		tflops = getTFLOPSForPrecision(perf, "fp16")
 	}
-
-	// Case 3: Fallback to fp16 if not already checked
-	fp16InList := false
-	for _, p := range constraints.PreferredPrecisions {
-		if strings.ToLower(p) == "fp16" {
-			fp16InList = true
-			break
-		}
+	if tflops <= 0 {
+		return 0.0
 	}
-
-	if !fp16InList {
-		tflops := getTFLOPSForPrecision(perf, "fp16")
-		if tflops > 0 {
-			baseScore := scoreFromTFLOPS(tflops, requiredTFLOPS)
-			return baseScore * penalty // Heavily penalized fallback
-		}
-	}
-
-	// Case 4: No precision has any TFLOPS data
-	return 0.0
+	return scoreFromTFLOPS(tflops, requiredTFLOPS) * math.Pow(0.5, float64(missed))
 }
 
-// getHourlyCost returns SpotPerHour if available, otherwise PerHour.
-func getHourlyCost(candidate v1beta1.AcceleratorClass) *resource.Quantity {
-	if candidate.Spec.Cost.SpotPerHour != nil {
-		return candidate.Spec.Cost.SpotPerHour
+// firstPrecisionWithTFLOPS returns the figure of the first listed precision that states
+// one, and how many precisions before it stated none (the list's length when none does).
+func firstPrecisionWithTFLOPS(perf *v1beta1.AcceleratorPerformance, precisions []string) (tflops int64, missed int) {
+	for i, precision := range precisions {
+		if tflops := getTFLOPSForPrecision(perf, precision); tflops > 0 {
+			return tflops, i
+		}
 	}
-	return candidate.Spec.Cost.PerHour
+	return 0, len(precisions)
 }
 
-// compareCosts returns -1 if cost1 < cost2, 0 if equal, 1 if cost1 > cost2
-func compareCosts(cost1, cost2 *resource.Quantity) int {
-	return cost1.Cmp(*cost2)
+// costGroup is one way a class states its price. The groups are tried in order; the
+// first one that any candidate states decides, and within it the lowest figure wins
+// (the first listed on a tie).
+type costGroup struct {
+	label   string
+	stated  func(v1beta1.AcceleratorCost) bool
+	cheaper func(a, b v1beta1.AcceleratorCost) bool
 }
 
-// findCheapestByCost returns the candidate with the lowest cost extracted by costFn.
-func findCheapestByCost(candidates []v1beta1.AcceleratorClass, costFn func(v1beta1.AcceleratorClass) *resource.Quantity) v1beta1.AcceleratorClass {
-	cheapest := candidates[0]
-	cheapestCost := costFn(cheapest)
-	for _, c := range candidates[1:] {
-		cost := costFn(c)
-		if compareCosts(cost, cheapestCost) < 0 {
-			cheapest = c
-			cheapestCost = cost
+var costGroups = []costGroup{
+	{
+		label:   "hourly",
+		stated:  func(cost v1beta1.AcceleratorCost) bool { return cost.SpotPerHour != nil || cost.PerHour != nil },
+		cheaper: func(a, b v1beta1.AcceleratorCost) bool { return hourlyCost(a).Cmp(*hourlyCost(b)) < 0 },
+	},
+	{
+		label:   "per-million-tokens",
+		stated:  func(cost v1beta1.AcceleratorCost) bool { return cost.PerMillionTokens != nil },
+		cheaper: func(a, b v1beta1.AcceleratorCost) bool { return a.PerMillionTokens.Cmp(*b.PerMillionTokens) < 0 },
+	},
+	{
+		label:   "tier",
+		stated:  func(cost v1beta1.AcceleratorCost) bool { return cost.Tier != "" },
+		cheaper: func(a, b v1beta1.AcceleratorCost) bool { return tierToNumeric(a.Tier) < tierToNumeric(b.Tier) },
+	},
+}
+
+// hourlyCost is the spot price when the class states one, otherwise the on-demand price.
+func hourlyCost(cost v1beta1.AcceleratorCost) *resource.Quantity {
+	if cost.SpotPerHour != nil {
+		return cost.SpotPerHour
+	}
+	return cost.PerHour
+}
+
+// cheapestIn returns the candidate with the group's lowest figure, nil when none states one.
+func cheapestIn(group costGroup, priced []v1beta1.AcceleratorClass) *v1beta1.AcceleratorClass {
+	var cheapest *v1beta1.AcceleratorClass
+	for i := range priced {
+		candidate := &priced[i]
+		cost := *candidate.Spec.Cost
+		if !group.stated(cost) {
+			continue
+		}
+		if cheapest == nil || group.cheaper(cost, *cheapest.Spec.Cost) {
+			cheapest = candidate
 		}
 	}
 	return cheapest
@@ -363,30 +400,23 @@ type candidateMaxValues struct {
 	maxBandwidth float64
 }
 
-// getCandidateRawValues extracts raw TFLOPS, memory, and bandwidth from a candidate
+// getCandidateRawValues extracts raw TFLOPS, memory, and bandwidth from a candidate.
+// The TFLOPS figure is the first preferred precision's (fp16's when the service prefers
+// none); when that is zero, the next preferred precision that states one.
 func getCandidateRawValues(candidate v1beta1.AcceleratorClass, preferredPrecisions []string) (tflops, memGB, bandwidthGBps float64) {
 	spec := candidate.Spec
 
-	primaryPrecision := "fp16"
+	precisions := []string{"fp16"}
 	if len(preferredPrecisions) > 0 {
-		primaryPrecision = strings.ToLower(preferredPrecisions[0])
+		precisions = preferredPrecisions
+	}
+	tflops = float64(getTFLOPSForPrecision(spec.Capabilities.Performance, precisions[0]))
+	if tflops == 0 {
+		fallback, _ := firstPrecisionWithTFLOPS(spec.Capabilities.Performance, precisions[1:])
+		tflops = float64(fallback)
 	}
 
-	tflops = float64(getTFLOPSForPrecision(spec.Capabilities.Performance, primaryPrecision))
-
-	if tflops == 0.0 && len(preferredPrecisions) > 1 {
-		for i := 1; i < len(preferredPrecisions); i++ {
-			fallbackTFLOPS := getTFLOPSForPrecision(spec.Capabilities.Performance, strings.ToLower(preferredPrecisions[i]))
-			if fallbackTFLOPS > 0 {
-				tflops = float64(fallbackTFLOPS)
-				break
-			}
-		}
-	}
-
-	if spec.Capabilities.MemoryGB != nil {
-		memGB = float64(spec.Capabilities.MemoryGB.Value()) / (1024 * 1024 * 1024)
-	}
+	memGB, _ = memoryGB(spec.Capabilities)
 
 	if spec.Capabilities.MemoryBandwidthGBps != nil {
 		bandwidthGBps = float64(spec.Capabilities.MemoryBandwidthGBps.Value())
@@ -496,16 +526,4 @@ func getMaxTFLOPS(perf *v1beta1.AcceleratorPerformance) int64 {
 	}
 
 	return maxTFLOPS
-}
-
-// sortScoredCandidates sorts candidates by score
-// ascending=true sorts lowest to highest (for cost minimization)
-// ascending=false sorts highest to lowest (for capability/fit maximization)
-func sortScoredCandidates(scored []scoredCandidate, ascending bool) {
-	sort.Slice(scored, func(i, j int) bool {
-		if ascending {
-			return scored[i].Score < scored[j].Score
-		}
-		return scored[i].Score > scored[j].Score
-	})
 }

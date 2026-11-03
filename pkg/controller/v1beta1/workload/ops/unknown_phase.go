@@ -15,7 +15,7 @@ import (
 // What a rebuild does about a pod that holds one of its target names
 // while its kubelet has stopped reporting it: phase Unknown, or Ready
 // withdrawn by the control plane with the pod's own last report still
-// saying Ready (evidence.SilentKubeletTargetPods).
+// saying Ready (evidence.UnreportedTargetPods).
 //
 // Neither is terminal: the node stopped reporting, and the container may
 // still be running. Recycling the name the way a Failed or Succeeded
@@ -57,19 +57,19 @@ func targetPodNameSet(targets []podTarget) map[string]struct{} {
 // whose pass has no poll of its own must fold it into its requeue, or
 // the sweep fires only when something unrelated wakes the owner.
 //
-// Every silent pod is visited whatever happened to the ones before it: a
-// gang whose members all sit on one dead node is freed as one set, so no
-// repair opens on a gang with a member still held. The errors are joined
-// and the pass fails on them after the sweep.
+// Every unreported pod is visited whatever happened to the ones before
+// it: a gang whose members all sit on one dead node is freed as one set,
+// so no repair opens on a gang with a member still held. The errors are
+// joined and the pass fails on them after the sweep.
 func recoverUnknownPhaseTargets(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, existing []*corev1.Pod, targets []podTarget) (bool, time.Time, error) {
-	quiet := evidence.SilentKubeletTargetPods(existing, targetPodNameSet(targets), input.ForceDelete)
-	if len(quiet) == 0 {
+	unreported := evidence.UnreportedTargetPods(existing, targetPodNameSet(targets), input.ForceDelete)
+	if len(unreported) == 0 {
 		return false, time.Time{}, nil
 	}
 	holding := false
 	var nextEvidenceAt time.Time
 	var errs []error
-	for _, pod := range quiet {
+	for _, pod := range unreported {
 		holds, at, err := sweepUnknownPhasePod(ctx, deps, input, pod, idx)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("sweep unknown-phase pod %s: %w", pod.Name, err))
@@ -100,8 +100,8 @@ func occupiedTargets(pods []*corev1.Pod) []podTarget {
 }
 
 // sweepUnknownPhasePod picks the arm of the force-delete sweep the pod's
-// own state calls for. One that is Terminating as well as silent is the
-// stuck-teardown case, which owns the graceful-shutdown window and the
+// own state calls for. One that is Terminating as well as unreported is
+// the stuck-teardown case, which owns the graceful-shutdown window and the
 // finalizer report; neither arm reaches these callers otherwise, so
 // without this such a pod would hold its name with the attempt deadline
 // parked and nothing left to free it.
@@ -109,14 +109,14 @@ func occupiedTargets(pods []*corev1.Pod) []podTarget {
 // Reports whether the name still stands against the step this pass: a
 // Terminating pod does until its absence is observed, whichever arm
 // acted; a pod the node-death arm deleted does too, for the same reason;
-// one it left alone does unless its node proved live (SilentPodHeld).
+// one it left alone does unless its node proved live (UnreportedPodHeld).
 func sweepUnknownPhasePod(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, pod *corev1.Pod, idx int32) (bool, time.Time, error) {
 	if pod.DeletionTimestamp == nil {
 		kind, at, err := forceDeleteOnNodeDeath(ctx, deps, input, pod, idx)
 		if err != nil {
 			return false, time.Time{}, err
 		}
-		return kind.Actionable() || evidence.SilentPodHeld(pod, kind), at, nil
+		return kind.Actionable() || evidence.UnreportedPodHeld(pod, kind), at, nil
 	}
 	at, err := escalateStuckTerminatingWithDeadline(ctx, deps, input, pod, idx)
 	return true, at, err

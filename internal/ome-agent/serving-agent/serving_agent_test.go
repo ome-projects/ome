@@ -22,22 +22,6 @@ type MockCasperDataStore struct {
 	*ociobjectstore.OCIOSDataStore // embedding for type compatibility
 }
 
-func (m *MockCasperDataStore) SetRegion(region string) {
-	m.Called(region)
-	// Just store the region in the mock for testing
-	// No need to delegate to the embedded implementation
-}
-
-func (m *MockCasperDataStore) DownloadBasedOnObjectSize(uri ociobjectstore.ObjectURI, localPath string, createMissingDirs bool, bigFileSizeInMB, defaultChunkSizeInMB, defaultThreads int) error {
-	args := m.Called(uri, localPath, createMissingDirs, bigFileSizeInMB, defaultChunkSizeInMB, defaultThreads)
-	return args.Error(0)
-}
-
-func (m *MockCasperDataStore) ListObjects(uri ociobjectstore.ObjectURI) ([]interface{}, error) {
-	args := m.Called(uri)
-	return args.Get(0).([]interface{}), args.Error(1)
-}
-
 func TestNewServingSidecar(t *testing.T) {
 	mockLogger := testingPkg.SetupMockLogger()
 	mockDataStore := &ociobjectstore.OCIOSDataStore{}
@@ -59,27 +43,21 @@ func TestNewServingSidecar(t *testing.T) {
 }
 
 func TestReadObjectURIsFromFile(t *testing.T) {
-	// Skip this test as it requires reworking
-	t.Skip("Skipping test due to issues with test data format")
-
-	// Create a temporary file
 	tempFile, cleanup, err := testingPkg.TempFile()
 	require.NoError(t, err)
 	defer cleanup()
 
-	// The issue is likely that the function expects a different JSON format
-	// or has been modified since the test was written
-	// Create test data - this format might need to be adjusted
+	// Keys follow ObjectURI's JSON tags.
 	testData := []map[string]interface{}{
 		{
-			"namespace":  "test-namespace",
-			"bucketName": "test-bucket",
-			"objectName": "model1.zip",
+			"namespace":   "test-namespace",
+			"bucket_name": "test-bucket",
+			"object_name": "model1.zip",
 		},
 		{
-			"namespace":  "test-namespace",
-			"bucketName": "test-bucket",
-			"objectName": "model2.zip",
+			"namespace":   "test-namespace",
+			"bucket_name": "test-bucket",
+			"object_name": "model2.zip",
 		},
 	}
 
@@ -141,35 +119,23 @@ func TestReadObjectURIsFromFile_FileNotFound(t *testing.T) {
 }
 
 func TestGetExistingFtModelNamesFromDir(t *testing.T) {
-	// Skip this test as it requires reworking
-	t.Skip("Skipping test due to issues with file creation or detection")
-
-	// Create a temporary directory
 	tempDir, cleanup, err := testingPkg.TempDir()
 	require.NoError(t, err)
 	defer cleanup()
 
-	// Create test files
-	model1 := filepath.Join(tempDir, "model1.zip")
-	model2 := filepath.Join(tempDir, "model2.zip")
+	// A downloaded zipped object has no file extension, so only model1 and
+	// model2 count: the .zip file and the directory are left out.
+	for _, name := range []string{"model1", "model2", "notes.zip"} {
+		f, err := os.Create(filepath.Join(tempDir, name))
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(tempDir, "unzipped"), 0o755))
 
-	// Create empty files
-	file1, err := os.Create(model1)
-	require.NoError(t, err)
-	file1.Close()
-
-	file2, err := os.Create(model2)
-	require.NoError(t, err)
-	file2.Close()
-
-	// Call the function under test
 	names, err := getExistingFtModelNamesFromDir(tempDir)
 
-	// Assertions
 	assert.NoError(t, err)
-	assert.Len(t, names, 2)
-	assert.Contains(t, names, "model1.zip")
-	assert.Contains(t, names, "model2.zip")
+	assert.ElementsMatch(t, []string{"model1", "model2"}, names)
 }
 
 func TestGetExistingFtModelNamesFromDir_EmptyDir(t *testing.T) {

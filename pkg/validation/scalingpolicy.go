@@ -66,13 +66,13 @@ func ValidateProportionalShape(policy *v1beta1.ScalingPolicy, fieldPath string) 
 }
 
 func validScalingComponent(component v1beta1.ComponentType) bool {
-	return component == v1beta1.EngineComponent || component == v1beta1.DecoderComponent || component == v1beta1.RouterComponent
+	return isRole(component)
 }
 
-// ValidateScalingPolicyComponents checks conflicting explicitly declared
+// validateScalingPolicyComponents checks conflicting explicitly declared
 // follower autoscalers. Missing component blocks may come from the runtime;
 // the reconciler validates their resolved presence before changing a count.
-func ValidateScalingPolicyComponents(policy *v1beta1.ScalingPolicy, components map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec) error {
+func validateScalingPolicyComponents(policy *v1beta1.ScalingPolicy, components map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec) error {
 	if policy == nil || policy.Mode != v1beta1.ScalingProportional || policy.Proportional == nil {
 		return nil
 	}
@@ -107,21 +107,7 @@ func ValidateScalingPolicyService(isvc *v1beta1.InferenceService) error {
 	if isvc.Spec.ReplicaRefs != nil {
 		return fmt.Errorf("Proportional scaling requires InferenceService-owned replicas")
 	}
-	components := map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec{}
-	modes := map[v1beta1.ComponentType]string{}
-	if isvc.Spec.Engine != nil {
-		components[v1beta1.EngineComponent] = &isvc.Spec.Engine.ComponentExtensionSpec
-		modes[v1beta1.EngineComponent] = isvc.Spec.Engine.Annotations[constants.DeploymentMode]
-	}
-	if isvc.Spec.Decoder != nil {
-		components[v1beta1.DecoderComponent] = &isvc.Spec.Decoder.ComponentExtensionSpec
-		modes[v1beta1.DecoderComponent] = isvc.Spec.Decoder.Annotations[constants.DeploymentMode]
-	}
-	if isvc.Spec.Router != nil {
-		components[v1beta1.RouterComponent] = &isvc.Spec.Router.ComponentExtensionSpec
-		modes[v1beta1.RouterComponent] = isvc.Spec.Router.Annotations[constants.DeploymentMode]
-	}
-	return validateScalingComponents(isvc.Spec.ScalingPolicy, components, modes, isvc.Spec.DeploymentMode)
+	return validateScalingComponents(isvc.Spec.ScalingPolicy, declaredRoles(&isvc.Spec), isvc.Spec.DeploymentMode)
 }
 
 // ValidateScalingPolicyRuntime checks the declared component defaults.
@@ -132,25 +118,16 @@ func ValidateScalingPolicyRuntime(runtime *v1beta1.ServingRuntimeSpec) error {
 	if err := ValidateScalingPolicy(runtime.ScalingPolicy, "spec.scalingPolicy"); err != nil {
 		return err
 	}
-	components := map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec{}
-	modes := map[v1beta1.ComponentType]string{}
-	if runtime.EngineConfig != nil {
-		components[v1beta1.EngineComponent] = &runtime.EngineConfig.ComponentExtensionSpec
-		modes[v1beta1.EngineComponent] = runtime.EngineConfig.Annotations[constants.DeploymentMode]
-	}
-	if runtime.DecoderConfig != nil {
-		components[v1beta1.DecoderComponent] = &runtime.DecoderConfig.ComponentExtensionSpec
-		modes[v1beta1.DecoderComponent] = runtime.DecoderConfig.Annotations[constants.DeploymentMode]
-	}
-	if runtime.RouterConfig != nil {
-		components[v1beta1.RouterComponent] = &runtime.RouterConfig.ComponentExtensionSpec
-		modes[v1beta1.RouterComponent] = runtime.RouterConfig.Annotations[constants.DeploymentMode]
-	}
-	return validateScalingComponents(runtime.ScalingPolicy, components, modes, nil)
+	return validateScalingComponents(runtime.ScalingPolicy, runtimeRoles(runtime), nil)
 }
 
-func validateScalingComponents(policy *v1beta1.ScalingPolicy, components map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec,
-	modes map[v1beta1.ComponentType]string, defaultMode *constants.DeploymentModeType) error {
+func validateScalingComponents(policy *v1beta1.ScalingPolicy, roles roleList, defaultMode *constants.DeploymentModeType) error {
+	components := map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec{}
+	modes := map[v1beta1.ComponentType]string{}
+	for _, r := range roles {
+		components[r.kind] = r.extension
+		modes[r.kind] = r.deploymentModeAnnotation()
+	}
 	if components[policy.Proportional.Anchor] == nil {
 		return fmt.Errorf("spec.scalingPolicy.proportional.anchor %q requires a declared component", policy.Proportional.Anchor)
 	}
@@ -167,7 +144,7 @@ func validateScalingComponents(policy *v1beta1.ScalingPolicy, components map[v1b
 	if err := validateScalingMode(policy.Proportional.Anchor, modes[policy.Proportional.Anchor], defaultMode); err != nil {
 		return err
 	}
-	return ValidateScalingPolicyComponents(policy, components)
+	return validateScalingPolicyComponents(policy, components)
 }
 
 func validateScalingMode(component v1beta1.ComponentType, explicit string, defaultMode *constants.DeploymentModeType) error {
@@ -186,12 +163,7 @@ func ValidateScalingPolicyServiceUpdate(old, current *v1beta1.InferenceService) 
 	if old != nil && apiequality.Semantic.DeepEqual(old.Spec.ScalingPolicy, current.Spec.ScalingPolicy) &&
 		apiequality.Semantic.DeepEqual(old.Spec.ReplicaRefs, current.Spec.ReplicaRefs) &&
 		apiequality.Semantic.DeepEqual(old.Spec.DeploymentMode, current.Spec.DeploymentMode) &&
-		!scalingOwnerChanged(engineExtension(old.Spec.Engine), engineExtension(current.Spec.Engine),
-			engineMode(old.Spec.Engine), engineMode(current.Spec.Engine)) &&
-		!scalingOwnerChanged(decoderExtension(old.Spec.Decoder), decoderExtension(current.Spec.Decoder),
-			decoderMode(old.Spec.Decoder), decoderMode(current.Spec.Decoder)) &&
-		!scalingOwnerChanged(routerExtension(old.Spec.Router), routerExtension(current.Spec.Router),
-			routerMode(old.Spec.Router), routerMode(current.Spec.Router)) {
+		!scalingOwnersChanged(declaredRoles(&old.Spec), declaredRoles(&current.Spec)) {
 		return nil
 	}
 	return ValidateScalingPolicyService(current)
@@ -199,65 +171,31 @@ func ValidateScalingPolicyServiceUpdate(old, current *v1beta1.InferenceService) 
 
 func ValidateScalingPolicyRuntimeUpdate(old, current *v1beta1.ServingRuntimeSpec) error {
 	if old != nil && apiequality.Semantic.DeepEqual(old.ScalingPolicy, current.ScalingPolicy) &&
-		!scalingOwnerChanged(engineExtension(old.EngineConfig), engineExtension(current.EngineConfig),
-			engineMode(old.EngineConfig), engineMode(current.EngineConfig)) &&
-		!scalingOwnerChanged(decoderExtension(old.DecoderConfig), decoderExtension(current.DecoderConfig),
-			decoderMode(old.DecoderConfig), decoderMode(current.DecoderConfig)) &&
-		!scalingOwnerChanged(routerExtension(old.RouterConfig), routerExtension(current.RouterConfig),
-			routerMode(old.RouterConfig), routerMode(current.RouterConfig)) {
+		!scalingOwnersChanged(runtimeRoles(old), runtimeRoles(current)) {
 		return nil
 	}
 	return ValidateScalingPolicyRuntime(current)
 }
 
-func scalingOwnerChanged(old, current *v1beta1.ComponentExtensionSpec, oldMode, currentMode string) bool {
-	if (old == nil) != (current == nil) || oldMode != currentMode {
+// scalingOwnersChanged reports whether the two lists declare different roles,
+// or a role's deploymentMode annotation, autoscaler or autoscalerPolicyRef
+// differs between them.
+func scalingOwnersChanged(old, current roleList) bool {
+	if len(old) != len(current) {
 		return true
 	}
-	return old != nil && (!apiequality.Semantic.DeepEqual(old.Autoscaler, current.Autoscaler) ||
-		!apiequality.Semantic.DeepEqual(old.AutoscalerPolicyRef, current.AutoscalerPolicyRef))
+	for i := range old {
+		if old[i].kind != current[i].kind || scalingOwnerChanged(&old[i], &current[i]) {
+			return true
+		}
+	}
+	return false
 }
 
-func engineExtension(engine *v1beta1.EngineSpec) *v1beta1.ComponentExtensionSpec {
-	if engine == nil {
-		return nil
-	}
-	return &engine.ComponentExtensionSpec
-}
-
-func engineMode(engine *v1beta1.EngineSpec) string {
-	if engine == nil {
-		return ""
-	}
-	return engine.Annotations[constants.DeploymentMode]
-}
-
-func decoderExtension(decoder *v1beta1.DecoderSpec) *v1beta1.ComponentExtensionSpec {
-	if decoder == nil {
-		return nil
-	}
-	return &decoder.ComponentExtensionSpec
-}
-
-func decoderMode(decoder *v1beta1.DecoderSpec) string {
-	if decoder == nil {
-		return ""
-	}
-	return decoder.Annotations[constants.DeploymentMode]
-}
-
-func routerExtension(router *v1beta1.RouterSpec) *v1beta1.ComponentExtensionSpec {
-	if router == nil {
-		return nil
-	}
-	return &router.ComponentExtensionSpec
-}
-
-func routerMode(router *v1beta1.RouterSpec) string {
-	if router == nil {
-		return ""
-	}
-	return router.Annotations[constants.DeploymentMode]
+func scalingOwnerChanged(old, current *declaredRole) bool {
+	return old.deploymentModeAnnotation() != current.deploymentModeAnnotation() ||
+		!apiequality.Semantic.DeepEqual(old.extension.Autoscaler, current.extension.Autoscaler) ||
+		!apiequality.Semantic.DeepEqual(old.extension.AutoscalerPolicyRef, current.extension.AutoscalerPolicyRef)
 }
 
 // ValidateScalingPolicyUpdate runs ValidateScalingPolicy only when this write

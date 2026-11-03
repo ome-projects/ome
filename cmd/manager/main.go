@@ -152,6 +152,8 @@ func splitAndTrim(csv string) []string {
 
 // Options defines the program-configurable options that may be passed on the command line.
 type Options struct {
+	webhookOnly             bool
+	webhookCertDir          string
 	metricsAddr             string
 	secureMetrics           bool
 	enableHTTP2             bool
@@ -245,6 +247,8 @@ func GetOptions() Options {
 	flag.StringVar(&opts.leaderElectionNamespace, "leader-election-namespace", opts.leaderElectionNamespace, "The namespace in which the leader election configmap will be created.")
 	opts.leaderElectionTiming.BindFlags(flag.CommandLine)
 	flag.BoolVar(&opts.enableWebhook, "webhook", opts.enableWebhook, "Enable the webhook server.")
+	flag.BoolVar(&opts.webhookOnly, "webhook-only", opts.webhookOnly, "Serve admission webhooks without registering controllers. Requires --webhook and disabled leader election.")
+	flag.StringVar(&opts.webhookCertDir, "webhook-cert-dir", opts.webhookCertDir, "Directory containing webhook tls.crt and tls.key; empty uses controller-runtime's certificate directory.")
 	flag.StringVar(&opts.probeAddr, "health-probe-addr", opts.probeAddr, "The address the probe endpoint binds to.")
 	flag.StringVar(&opts.pprofAddr, "pprof-bind-address", opts.pprofAddr, "The address the pprof endpoint binds to, "+
 		"for example 127.0.0.1:6060 to reach it only through kubectl port-forward. Empty or 0 disables it.")
@@ -392,6 +396,9 @@ type startupStep func() bool
 // and checked, what is built, which controllers and webhooks register, then
 // the manager runs until it is told to stop.
 func (s *startup) run() bool {
+	if s.options.webhookOnly {
+		return runStartupSteps(s.webhookOnlySteps())
+	}
 	return runStartupSteps([]startupStep{
 		s.validateLeaderElectionTiming,
 		s.configureAPIClient,
@@ -431,6 +438,30 @@ func (s *startup) run() bool {
 		s.addHealthChecks,
 		s.startManager,
 	})
+}
+
+// webhookOnlySteps retain admission configuration and handlers without
+// registering reconcilers or initializing controller publication clients.
+func (s *startup) webhookOnlySteps() []startupStep {
+	return []startupStep{
+		s.validateWebhookOnlyOptions,
+		s.configureAPIClient, s.createClientset, s.configureInstanceStatusDecoding,
+		s.disableHTTP2UnlessEnabled, s.createManager, s.registerPodIndex,
+		s.loadDeployConfig, s.loadIngressConfig,
+		s.registerOptionalSchemes, s.selectTrafficTranslator, s.resolveMultiClusterRole,
+		s.probePolicyCRDs, s.loadRolloutPlanCap, s.loadRatioToleranceDefault,
+		s.loadTPUSliceConfig, s.buildRuntimeSelector,
+		s.registerPodAndRuntimeWebhooks, s.registerModelWebhooks,
+		s.registerInferenceReplicaWebhook, s.registerPolicyWebhooks,
+		s.registerInferenceServiceWebhook, s.addHealthChecks, s.startManager,
+	}
+}
+
+func (s *startup) validateWebhookOnlyOptions() bool {
+	if !s.options.enableWebhook || s.options.enableLeaderElection {
+		return stop(fmt.Errorf("webhook-only mode requires --webhook and disabled leader election"), "Invalid webhook-only options")
+	}
+	return true
 }
 
 // runStartupSteps runs the steps in order and reports whether every one let
@@ -546,7 +577,7 @@ func (s *startup) createManager() bool {
 		"metricsAddr", s.options.metricsAddr,
 		"pprofAddr", s.options.pprofAddr,
 		"webhookPort", s.options.webhookPort,
-		"leaderElection", s.options.enableLeaderElection)
+		"leaderElection", s.options.enableLeaderElection, "webhookOnly", s.options.webhookOnly)
 	omePodReq, err := labels.NewRequirement(constants.InferenceServicePodLabelKey, selection.Exists, nil)
 	if err != nil {
 		return stop(err, "Failed to build OME pod cache selector")
@@ -584,6 +615,7 @@ func (s *startup) managerOptions(omePodSelector labels.Selector) manager.Options
 		},
 		WebhookServer: webhook.NewServer(webhook.Options{
 			Port:    s.options.webhookPort,
+			CertDir: s.options.webhookCertDir,
 			TLSOpts: s.tlsOptions,
 		}),
 		LeaderElection:          s.options.enableLeaderElection,
@@ -953,8 +985,7 @@ func (s *startup) setupServingRuntimeControllers() bool {
 
 // buildRuntimeSelector builds the runtime selector the InferenceReplica
 // controller renders replicas with and the InferenceService validator selects
-// with. It carries the cluster's model cache provider, so a sharded model
-// selects a runtime that supports it.
+// with.
 func (s *startup) buildRuntimeSelector() bool {
 	config := runtimeselector.NewConfig(s.mgr.GetClient())
 	s.runtimeSelector = runtimeselector.NewWithConfig(config)

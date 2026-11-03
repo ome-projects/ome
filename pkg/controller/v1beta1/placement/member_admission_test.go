@@ -242,6 +242,60 @@ func TestObserveMemberWholeGangAdmission(t *testing.T) {
 	}
 }
 
+// A member that declares a router serves only through a ready router pod. The
+// status a held placement writes counts its ready replicas the same way, so
+// router pods without the serving condition leave the member with none.
+func TestObserveMember_RouterNotReady_CountsNoReadyReplicas(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		routerReady bool
+		wantReady   int32
+	}{
+		{name: "ready router pod", routerReady: true, wantReady: 1},
+		{name: "router pod without the serving condition"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := observationFixture(t)
+			f.member.Spec.Router = &v1beta1.RouterSpec{}
+			f.resources.ir.Name = f.member.Name + "-engine"
+			for i := range f.resources.pods {
+				f.resources.pods[i].OwnerReferences[0].Name = f.resources.ir.Name
+			}
+			router := f.resources.ir.DeepCopy()
+			router.UID, router.Name, router.Spec.Component = "router-uid", f.member.Name+"-router", v1beta1.RouterComponent
+			pod := f.resources.pods[0].DeepCopy()
+			pod.Name, pod.UID = "router-0", "router-pod"
+			pod.OwnerReferences[0].UID, pod.OwnerReferences[0].Name = router.UID, router.Name
+			if !tt.routerReady {
+				// The containers pass their probes, but the unset readiness gate keeps the pod unready.
+				pod.Status.Conditions = []corev1.PodCondition{
+					{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ReadinessGatesNotReady"},
+				}
+			}
+			objects := []client.Object{f.member, f.resources.ir, router, pod}
+			for i := range f.resources.pods {
+				objects = append(objects, &f.resources.pods[i])
+			}
+			scheme := testScheme(t)
+			worker := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+			clusters := identifiedTestClusters{fakeClusters: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{"member-a": workloadcluster.NewNeverCachingClient(worker)}}, uid: "member-a-uid"}
+			r, _ := newPlacer(scheme, clusters, f.source, plannedTestRegistration())
+			got := r.observeMember(t.Context(), f.source, f.source.Status.Placement.Candidates[0], true)
+			type member struct {
+				Present, Serving bool
+				Phase            v1beta1.CandidatePlacementPhase
+				Admitted, Ready  int32
+			}
+			want := member{Present: true, Serving: tt.wantReady > 0, Phase: v1beta1.CandidatePhaseAdmitted, Admitted: 1, Ready: tt.wantReady}
+			observed := member{got.state == memberPresent, got.serving, got.candidate.Phase, got.candidate.AdmittedReplicas, got.candidate.ReadyReplicas}
+			if diff := cmp.Diff(want, observed); diff != "" {
+				t.Errorf("observation (-want +got):\n%s; %v", diff, got.err)
+			}
+		})
+	}
+}
+
 // TestComponentIRStatusesListsPodsAfterEveryComponentRead pins the read order
 // admission is verified in: one read per component, then one Pod list, so the
 // cohort is at least as current as every status that claims admission.

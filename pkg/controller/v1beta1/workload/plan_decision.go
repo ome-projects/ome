@@ -113,7 +113,8 @@ type UpdateItem struct {
 	// runtime-ready pods already match the target.
 	AdoptRevision bool
 	// StartingFresh: the Instance starts a new update rather than
-	// continuing one (!types.UpdateContinuation), so it is admitted and charged.
+	// continuing one (!types.UpdateContinuation, or a Failed surge claim
+	// the strategy replaces drain-first), so it is admitted and charged.
 	StartingFresh bool
 	// CoordGateExempt: the fresh start skips the coordination gate consult
 	// because it takes nothing further out of the gate's serving count
@@ -912,9 +913,12 @@ func (p *updateSelectionPass) candidate(inst types.InstancePlan) updateCandidate
 
 // startsFresh reports an Instance whose start opens a new attempt rather
 // than continuing one in flight (types.UpdateContinuation). Only a fresh
-// start is admitted and charged.
-func (c updateCandidate) startsFresh() bool {
-	return !types.UpdateContinuation(c.row)
+// start is admitted and charged. A Failed row whose kept surge claim the
+// strategy no longer continues as a surge is one: the drain-first start
+// that replaces the claim takes a serving set offline
+// (workloadops.FailedSurgeStartsDrainFirst).
+func (p *updateSelectionPass) startsFresh(c updateCandidate) bool {
+	return !types.UpdateContinuation(c.row) || workloadops.FailedSurgeStartsDrainFirst(c.row, p.strategy)
 }
 
 // heldByPartition reports an Instance the effective partition keeps on
@@ -998,7 +1002,7 @@ func (p *updateSelectionPass) recordRolledSet(c updateCandidate) {
 	}
 	unserving, graceLeft := workloadops.RolledInstanceDark(c.row, p.target.Name, p.target.CreationTimestamp.Time, c.pods, rolledPods, p.provenWindow, p.input.StuckPodGrace, p.input.Now())
 	if unserving {
-		p.log.Info("rolled Instance dark: not the roll's open work",
+		p.log.Info("rolled Instance serves nothing: not the roll's open work",
 			"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "reason", why)
 		return
 	}
@@ -1094,7 +1098,7 @@ func (p *updateSelectionPass) keepEarliestRetryWait(retryAfter time.Duration) {
 // continuation is listed as it is: it is neither admitted nor charged
 // again.
 func (p *updateSelectionPass) listStart(ctx context.Context, c updateCandidate) error {
-	item := UpdateItem{Instance: c.inst, StartingFresh: c.startsFresh()}
+	item := UpdateItem{Instance: c.inst, StartingFresh: p.startsFresh(c)}
 	if item.StartingFresh {
 		recreate, err := p.recreateFallback(ctx, c)
 		if err != nil {

@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
-func configProvider(cli *cobra.Command, module AgentModule) fx.Option {
+func configProvider(cli *cobra.Command) fx.Option {
 	return fx.Provide(func() (*viper.Viper, error) {
 		v := viper.GetViper()
 

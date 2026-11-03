@@ -354,6 +354,7 @@ func (p *servicePass) run(ctx context.Context) (ctrl.Result, error) {
 		p.useRecordedRuntimeRevision,
 		p.resolveRuntime,
 		p.prepareComponentSpecs,
+		p.checkEncoderModes,
 		p.resolveScalingPolicy,
 		p.checkPlacementMember,
 		p.reconcileRolloutRun,
@@ -709,7 +710,7 @@ func (p *servicePass) resolveRuntime(ctx context.Context) (bool, error) {
 	if !resolved.UserSpecifiedRuntime {
 		p.log.Info("Auto-selected runtime", "runtime", resolved.RuntimeName, "model", p.isvc.Spec.Model.Name)
 	}
-	p.componentRunnerPorts = isvcutils.MergedRunnerPorts(resolved.Specs.Engine, resolved.Specs.Decoder, resolved.Specs.Router)
+	p.componentRunnerPorts = isvcutils.MergedRunnerPorts(resolved.Specs)
 	return true, nil
 }
 
@@ -726,20 +727,41 @@ func (p *servicePass) prepareComponentSpecs(context.Context) (bool, error) {
 	return true, nil
 }
 
+// checkEncoderModes holds a service that declares an encoder while any of
+// its roles resolves to a mode other than OMENative once the runtime's pieces
+// are merged in. Only OMENative pods learn the other roles' addresses.
+// Admission reads the service's own blocks, so a mode that only the runtime
+// sets is caught here. The hold changes nothing in the cluster: it reports
+// EncoderReady=False and a Warning event, and the running pods stay.
+func (p *servicePass) checkEncoderModes(context.Context) (bool, error) {
+	if p.resolved.Specs.Encoder == nil {
+		return true, nil
+	}
+	for _, view := range p.resolved.Specs.Declared() {
+		mode := p.resolved.Modes[view.Type]
+		if mode == constants.OMENative {
+			continue
+		}
+		role, _ := v1beta1.RoleOf(view.Type)
+		source := "the service"
+		if p.resolved.RuntimeName != "" {
+			source = fmt.Sprintf("the service and its runtime %q (%s)", p.resolved.RuntimeName, role.RuntimeField)
+		}
+		cause := fmt.Errorf("%s resolves to deploymentMode %q from %s; a service with an encoder runs every role as OMENative, the only mode that gives the roles each other's addresses. Set the %s: OMENative annotation on %s, or remove the mode the runtime sets (%s)",
+			role.ServiceField, mode, source, constants.DeploymentMode, role.ServiceField, validation.ReasonEncoderRequiresOMENative)
+		return p.end(p.reconciler.holdEncoderModes(p.isvc, p.deploymentMode, cause))
+	}
+	return true, nil
+}
+
 // resolveScalingPolicy picks the service's scaling policy, else the
 // runtime's, and gathers each declared Component's replica bounds, which
 // follows reads.
 func (p *servicePass) resolveScalingPolicy(context.Context) (bool, error) {
 	p.scalingPolicy, p.scalingSource = scaling.Resolve(p.isvc, p.resolved.Runtime)
 	p.componentBounds = map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec{}
-	if engine := p.resolved.Specs.Engine; engine != nil {
-		p.componentBounds[v1beta1.EngineComponent] = &engine.ComponentExtensionSpec
-	}
-	if decoder := p.resolved.Specs.Decoder; decoder != nil {
-		p.componentBounds[v1beta1.DecoderComponent] = &decoder.ComponentExtensionSpec
-	}
-	if router := p.resolved.Specs.Router; router != nil {
-		p.componentBounds[v1beta1.RouterComponent] = &router.ComponentExtensionSpec
+	for _, view := range p.resolved.Specs.Declared() {
+		p.componentBounds[view.Type] = view.Extension
 	}
 	return true, nil
 }
@@ -871,7 +893,7 @@ func (p *servicePass) resolveScalingTargets(ctx context.Context) (bool, error) {
 }
 
 // buildComponentReconcilers builds one reconciler per declared Component, in
-// the order engine, decoder, router. Each takes its render piece (the
+// the order engine, decoder, encoder, router. Each takes its render piece (the
 // accelerator class and the model format; the router has neither, so its
 // piece cannot fail), the policy resolver, the canary's partition resolver
 // for its role and whether the coordinator owns its count.
@@ -900,6 +922,18 @@ func (p *servicePass) buildComponentReconcilers(ctx context.Context) (bool, erro
 			"deploymentMode", piece.DeploymentMode,
 			"acceleratorClass", piece.AcceleratorClassName)
 		p.reconcilers = append(p.reconcilers, components.NewDecoder(componentDeps, p.inputsFor(piece, v1beta1.DecoderComponent), decoder))
+	}
+	if encoder := p.resolved.Specs.Encoder; encoder != nil {
+		piece, _, err := p.resolved.Piece(ctx, p.in, v1beta1.EncoderComponent)
+		if err != nil {
+			p.log.Error(err, "Failed to get accelerator class for encoder component")
+			p.reconciler.Recorder.Eventf(p.isvc, v1.EventTypeWarning, "AcceleratorClassError", "Failed to get accelerator class for encoder: %v", err)
+			return false, err
+		}
+		p.log.V(1).Info("Creating encoder reconciler",
+			"deploymentMode", piece.DeploymentMode,
+			"acceleratorClass", piece.AcceleratorClassName)
+		p.reconcilers = append(p.reconcilers, components.NewEncoder(componentDeps, p.inputsFor(piece, v1beta1.EncoderComponent), encoder))
 	}
 	if router := p.resolved.Specs.Router; router != nil {
 		piece, _, _ := p.resolved.Piece(ctx, p.in, v1beta1.RouterComponent)
@@ -1192,34 +1226,25 @@ func (p *servicePass) setURLWhenIngressDisabled(ctx context.Context) (bool, erro
 // end the pass, so the status flush still lands; it is logged as an error so
 // a lasting permission failure is visible.
 func (p *servicePass) cleanupUndeclaredComponents(ctx context.Context) (bool, error) {
-	engine, decoder, router := p.resolved.Specs.Engine, p.resolved.Specs.Decoder, p.resolved.Specs.Router
-	if err := p.reconciler.cleanupRemovedComponents(ctx, p.isvc, engine, decoder, router); err != nil {
+	specs := p.resolved.Specs
+	if err := p.reconciler.cleanupRemovedComponents(ctx, p.isvc, specs); err != nil {
 		p.log.Error(err, "Failed to cleanup removed components")
 	}
 	if p.isvc.Status.Components == nil {
 		return true, nil
 	}
 	p.log.V(1).Info("Cleaning up component status",
-		"mergedEngine", engine != nil,
-		"mergedDecoder", decoder != nil,
-		"mergedRouter", router != nil,
+		"mergedEngine", specs.Engine != nil,
+		"mergedDecoder", specs.Decoder != nil,
+		"mergedRouter", specs.Router != nil,
 		"statusComponents", len(p.isvc.Status.Components))
-	if engine == nil {
-		if _, present := p.isvc.Status.Components[v1beta1.EngineComponent]; present {
-			delete(p.isvc.Status.Components, v1beta1.EngineComponent)
-			p.log.Info("Deleted engine from status")
+	for _, c := range v1beta1.RoleTypes() {
+		if specs.View(c) != nil {
+			continue
 		}
-	}
-	if decoder == nil {
-		if _, present := p.isvc.Status.Components[v1beta1.DecoderComponent]; present {
-			delete(p.isvc.Status.Components, v1beta1.DecoderComponent)
-			p.log.Info("Deleted decoder from status")
-		}
-	}
-	if router == nil {
-		if _, present := p.isvc.Status.Components[v1beta1.RouterComponent]; present {
-			delete(p.isvc.Status.Components, v1beta1.RouterComponent)
-			p.log.Info("Deleted router from status")
+		if _, present := p.isvc.Status.Components[c]; present {
+			delete(p.isvc.Status.Components, c)
+			p.log.Info(fmt.Sprintf("Deleted %s from status", c))
 		}
 	}
 	return true, nil
@@ -1408,6 +1433,25 @@ func (r *InferenceServiceReconciler) markRuntimeUnresolved(isvc *v1beta1.Inferen
 		Type:    v1beta1.RuntimeReady,
 		Status:  v1.ConditionFalse,
 		Reason:  "RuntimeNotFound",
+		Message: cause.Error(),
+	})
+	if err := r.updateStatus(isvc, deploymentMode, nil); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, nil
+}
+
+// holdEncoderModes reports a service with an encoder whose roles do not all
+// resolve to OMENative and changes nothing else. EncoderReady is not part of
+// the aggregate Ready, so a serving service stays Ready on its running pods.
+// The status is persisted and the reconcile returns without an error; an edit
+// of the service or its runtime starts the next pass.
+func (r *InferenceServiceReconciler) holdEncoderModes(isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, cause error) (reconcile.Result, error) {
+	r.Recorder.Event(isvc, v1.EventTypeWarning, validation.ReasonEncoderRequiresOMENative, cause.Error())
+	isvc.Status.SetCondition(v1beta1.EncoderReady, &knapis.Condition{
+		Type:    v1beta1.EncoderReady,
+		Status:  v1.ConditionFalse,
+		Reason:  validation.ReasonEncoderRequiresOMENative,
 		Message: cause.Error(),
 	})
 	if err := r.updateStatus(isvc, deploymentMode, nil); err != nil {
@@ -1622,15 +1666,16 @@ func preserveLifecycleStatus(comps map[v1beta1.ComponentType]v1beta1.ComponentSt
 	return out
 }
 
+// mergeLifecycleStatus restores the live lifecycle onto the Components the
+// pass still reports. An entry the pass removed, because the spec no longer
+// declares that Component, is not recreated: a removed Component keeps no
+// status.
 func mergeLifecycleStatus(s *v1beta1.InferenceServiceStatus, preserved map[v1beta1.ComponentType]*v1beta1.LifecycleStatus) {
-	if len(preserved) == 0 {
-		return
-	}
-	if s.Components == nil {
-		s.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
-	}
 	for c, om := range preserved {
-		cs := s.Components[c]
+		cs, present := s.Components[c]
+		if !present {
+			continue
+		}
 		cs.Lifecycle = om
 		s.Components[c] = cs
 	}
@@ -2105,9 +2150,10 @@ func (r *InferenceServiceReconciler) isvcsWithAcceleratorPreference(ctx context.
 	var reqs []reconcile.Request
 	for i := range isvcs.Items {
 		isvc := &isvcs.Items[i]
-		hasPreference := isvc.Spec.AcceleratorSelector != nil ||
-			(isvc.Spec.Engine != nil && isvc.Spec.Engine.AcceleratorOverride != nil) ||
-			(isvc.Spec.Decoder != nil && isvc.Spec.Decoder.AcceleratorOverride != nil)
+		hasPreference := isvc.Spec.AcceleratorSelector != nil
+		for _, role := range v1beta1.ServiceRoles(&isvc.Spec).Declared() {
+			hasPreference = hasPreference || role.AcceleratorOverride != nil
+		}
 		if !hasPreference {
 			if _, ok := isvc.Annotations[constants.AcceleratorClassAnnotationKey]; !ok {
 				continue
@@ -2251,7 +2297,7 @@ func autoscalerPolicyRefIndexer(obj client.Object) []string {
 	}
 	seen := map[string]bool{}
 	var names []string
-	for _, componentType := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+	for _, componentType := range v1beta1.RoleTypes() {
 		ref := autoscaler.ComponentPolicyRef(isvc, componentType)
 		if ref == nil || ref.Name == "" || seen[ref.Name] {
 			continue

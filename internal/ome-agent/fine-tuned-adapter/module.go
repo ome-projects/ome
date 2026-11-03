@@ -27,5 +27,8 @@ var Module = fx.Provide(
 		if err != nil {
 			return nil, fmt.Errorf("error creating fine-tuned adapter config: %+v", err)
 		}
+		if err := config.Validate(); err != nil {
+			return nil, fmt.Errorf("error validating fine-tuned adapter config: %w", err)
+		}
 		return NewFineTunedAdapter(config)
 	})

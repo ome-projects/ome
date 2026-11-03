@@ -15,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
@@ -70,11 +69,9 @@ type Result struct {
 // and context the inventory names; the ambient kubeconfig and its current
 // context never select a cluster.
 func ConnectWithKubeconfig(_ context.Context, cluster transitionpreflight.Cluster) (*Clients, error) {
-	loading := &clientcmd.ClientConfigLoadingRules{ExplicitPath: cluster.Kubeconfig}
-	overrides := &clientcmd.ConfigOverrides{CurrentContext: cluster.Context}
-	restConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loading, overrides).ClientConfig()
+	restConfig, err := transitionpreflight.RESTConfigFor(cluster)
 	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig %s context %q: %w", cluster.Kubeconfig, cluster.Context, err)
+		return nil, err
 	}
 	kube, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
@@ -177,11 +174,9 @@ func readStatusConfig(ctx context.Context, kube kubernetes.Interface, inventory 
 	if err != nil {
 		return nil, err
 	}
-	observed := transitionpreflight.ExpectedStatusConfig{InstanceStatusEncoding: config.InstanceStatusEncoding, MaxDecodedInstances: config.MaxDecodedInstances}
-	expected := inventory.OMENativeStatus
-	if observed.InstanceStatusEncoding != expected.InstanceStatusEncoding || observed.Bound() != expected.Bound() ||
-		(observed.MaxDecodedInstances == nil) != (expected.MaxDecodedInstances == nil) {
-		return nil, fmt.Errorf("cluster omenativeStatus is %s, inventory expects %s; align the inventory with the running configuration before repairing", observed, expected)
+	observed := transitionpreflight.ObservedStatusConfig(*config)
+	if !inventory.OMENativeStatus.Matches(observed) {
+		return nil, fmt.Errorf("cluster omenativeStatus is %s, inventory expects %s; align the inventory with the running configuration before repairing", observed, inventory.OMENativeStatus)
 	}
 	return config, nil
 }
@@ -205,7 +200,7 @@ func (r *Result) WriteText(w io.Writer) error {
 		fmt.Sprintf("  inventory digest:  %s", r.InventoryDigest),
 		fmt.Sprintf("  cluster:           %s (context %s)", r.Cluster.Name, r.Cluster.Context),
 		fmt.Sprintf("  object:            %s/%s", r.Namespace, r.Name),
-		fmt.Sprintf("  target:            %s (maxDecodedInstances %s)", r.Config.InstanceStatusEncoding, boundString(r.Config)),
+		fmt.Sprintf("  target:            %s (maxDecodedInstances %s)", r.Config.InstanceStatusEncoding, transitionpreflight.ObservedStatusConfig(r.Config).BoundString("unset")),
 		fmt.Sprintf("  stored:            %s", stored),
 		fmt.Sprintf("  replacement:       %d rows (DenseV1)", r.Outcome.ReplacementRows),
 		fmt.Sprintf("  %s:%s %s, %d bytes (status %d -> %d bytes)", verb, spaces(len("would write")-len(verb)), r.Outcome.SelectedEncoding, r.Outcome.SelectedBytes, r.Outcome.StoredBytes, r.Outcome.SelectedBytes),
@@ -221,13 +216,6 @@ func (r *Result) WriteText(w io.Writer) error {
 		}
 	}
 	return nil
-}
-
-func boundString(config controllerconfig.OMENativeStatusConfig) string {
-	if config.MaxDecodedInstances == nil {
-		return "unset"
-	}
-	return fmt.Sprintf("%d", *config.MaxDecodedInstances)
 }
 
 func spaces(n int) string {

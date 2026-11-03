@@ -10,17 +10,16 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // Test fixtures use a v1beta1.InferenceService stand-in so the
@@ -48,7 +47,7 @@ func newOwner(ns, name string) client.Object {
 	}
 }
 
-func newGangClient(t *testing.T, initObjs ...client.Object) client.Client {
+func newGangClient(t *testing.T, initObjs ...client.Object) client.WithWatch {
 	t.Helper()
 	var owner client.Object
 	for _, obj := range initObjs {
@@ -68,21 +67,10 @@ func newGangClient(t *testing.T, initObjs ...client.Object) client.Client {
 			pg.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(owner, testOwnerGVK)}
 		}
 	}
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
-	if err := v1beta1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add v1beta1: %v", err)
-	}
-	if err := schedulingv1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add scheduling/v1alpha1: %v", err)
-	}
-	return fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(initObjs...).
-		WithIndex(&schedulingv1alpha1.PodGroup{}, PodGroupControllerUIDIndexField, PodGroupControllerUIDIndexExtractor).
-		Build()
+	return fakeclient.New(t,
+		fakeclient.WithTypes(schedulingv1alpha1.AddToScheme),
+		fakeclient.WithObjects(initObjs...),
+		fakeclient.WithIndex(&schedulingv1alpha1.PodGroup{}, PodGroupControllerUIDIndexField, PodGroupControllerUIDIndexExtractor))
 }
 
 // inputWithConditionStore returns a ReconcileInput wired to record
@@ -209,7 +197,7 @@ func TestEnsurePodGroups_SinglePodNoPodGroupConditionFalse(t *testing.T) {
 	input, store := inputWithConditionStore(owner, false, 0, true, "")
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, false, 0, 5*time.Minute)
 
-	if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c}, input, plan); err != nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{}); err != nil {
 		t.Fatalf("EnsurePodGroups: %v", err)
 	}
 
@@ -233,7 +221,7 @@ func TestEnsurePodGroups_MultiPodCRDAvailableCreatesGang(t *testing.T) {
 	input, store := inputWithConditionStore(owner, true, 2, true, "")
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 2, 5*time.Minute)
 
-	if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c}, input, plan); err != nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{}); err != nil {
 		t.Fatalf("EnsurePodGroups: %v", err)
 	}
 
@@ -295,7 +283,7 @@ func TestEnsurePodGroups_HoldsLivePodTopologyUntilGroupIsEmpty(t *testing.T) {
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 	plan.TopologyKey = newTopology
 
-	effective, err := EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: c}, input, plan)
+	effective, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{})
 	if err != nil {
 		t.Fatalf("EnsurePodGroups with live old-topology pod: %v", err)
 	}
@@ -314,7 +302,7 @@ func TestEnsurePodGroups_HoldsLivePodTopologyUntilGroupIsEmpty(t *testing.T) {
 	if err := c.Delete(context.Background(), worker); err != nil {
 		t.Fatalf("delete old-topology pod: %v", err)
 	}
-	effective, err = EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: c}, input, plan)
+	effective, err = EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{})
 	if err != nil {
 		t.Fatalf("EnsurePodGroups after group empty: %v", err)
 	}
@@ -347,9 +335,9 @@ func TestEnsurePodGroups_UpgradeAnnotatesLegacyTPUDerivedTopology(t *testing.T) 
 	input, _ := inputWithConditionStore(owner, true, 1, true, "")
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 
-	effective, err := EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: c}, input, plan)
+	effective, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{})
 	if err != nil {
-		t.Fatalf("EnsurePodGroupsWithTopology: %v", err)
+		t.Fatalf("EnsurePodGroupsWithState: %v", err)
 	}
 	if effective[0] != legacyTopology {
 		t.Fatalf("legacy TPU topology: got %q want %q", effective[0], legacyTopology)
@@ -383,9 +371,9 @@ func TestEnsurePodGroups_UsesAPIReaderForTopologySafety(t *testing.T) {
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 	plan.TopologyKey = newTopology
 
-	effective, err := EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan)
+	effective, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan, PodGroupReconcileState{})
 	if err != nil {
-		t.Fatalf("EnsurePodGroupsWithTopology: %v", err)
+		t.Fatalf("EnsurePodGroupsWithState: %v", err)
 	}
 	if effective[0] != oldTopology {
 		t.Fatalf("effective topology from live reader: got %q want %q", effective[0], oldTopology)
@@ -411,9 +399,9 @@ func TestEnsurePodGroups_LeaderOnlyTrustsExistingPodGroupTopology(t *testing.T) 
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 	plan.TopologyKey = desiredTopology
 
-	effective, err := EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: c}, input, plan)
+	effective, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{})
 	if err != nil {
-		t.Fatalf("EnsurePodGroupsWithTopology: %v", err)
+		t.Fatalf("EnsurePodGroupsWithState: %v", err)
 	}
 	if effective[0] != heldTopology {
 		t.Fatalf("leader-only gang topology: got %q want held %q", effective[0], heldTopology)
@@ -432,9 +420,9 @@ func TestEnsurePodGroups_CRDMissingPreservesLiveTopology(t *testing.T) {
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 	plan.TopologyKey = newTopology
 
-	effective, err := EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan)
+	effective, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan, PodGroupReconcileState{})
 	if err != nil {
-		t.Fatalf("EnsurePodGroupsWithTopology without CRD: %v", err)
+		t.Fatalf("EnsurePodGroupsWithState without CRD: %v", err)
 	}
 	if effective[0] != oldTopology {
 		t.Fatalf("missing-CRD effective topology: got %q want live %q", effective[0], oldTopology)
@@ -451,7 +439,7 @@ func TestEnsurePodGroups_CRDMissingLeaderOnlyWithDesiredTopologyFailsClosed(t *t
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 	plan.TopologyKey = "topology.example.com/desired"
 
-	if _, err := EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan); err == nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan, PodGroupReconcileState{}); err == nil {
 		t.Fatal("leader-only partial create without PodGroup state must hold when desired topology is nonempty")
 	}
 }
@@ -465,7 +453,7 @@ func TestEnsurePodGroups_CRDMissingLeaderOnlyWithoutDesiredTopologyContinues(t *
 	input, _ := inputWithConditionStore(owner, true, 1, false, "")
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 
-	effective, err := EnsurePodGroupsWithTopology(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan)
+	effective, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: cached, APIReader: live}, input, plan, PodGroupReconcileState{})
 	if err != nil {
 		t.Fatalf("intentional no-topology partial create must continue: %v", err)
 	}
@@ -491,9 +479,9 @@ func TestEnsureSurgePodGroup_UsesAPIReaderForTopologySafety(t *testing.T) {
 	plan.TopologyKey = newTopology
 	deps := workloadtypes.Deps{Client: cached, APIReader: live}
 
-	key, err := EnsureSurgePodGroup(deps)(context.Background(), input, plan, plan.Instances[0])
+	key, err := EnsureSurgePodGroupWithState(deps, PodGroupReconcileState{})(context.Background(), input, plan, plan.Instances[0])
 	if err != nil {
-		t.Fatalf("EnsureSurgePodGroup: %v", err)
+		t.Fatalf("EnsureSurgePodGroupWithState: %v", err)
 	}
 	if key != oldTopology {
 		t.Fatalf("surge effective topology from live reader: got %q want %q", key, oldTopology)
@@ -513,9 +501,9 @@ func TestEnsureSurgePodGroup_CRDMissingPreservesLiveTopology(t *testing.T) {
 	plan.TopologyKey = newTopology
 	deps := workloadtypes.Deps{Client: cached, APIReader: live}
 
-	key, err := EnsureSurgePodGroup(deps)(context.Background(), input, plan, plan.Instances[0])
+	key, err := EnsureSurgePodGroupWithState(deps, PodGroupReconcileState{})(context.Background(), input, plan, plan.Instances[0])
 	if err != nil {
-		t.Fatalf("EnsureSurgePodGroup without CRD: %v", err)
+		t.Fatalf("EnsureSurgePodGroupWithState without CRD: %v", err)
 	}
 	if key != oldTopology {
 		t.Fatalf("missing-CRD surge effective topology: got %q want live %q", key, oldTopology)
@@ -579,7 +567,7 @@ func TestEnsurePodGroups_MultiPodCRDMissingSetsConditionTrueNoPodGroup(t *testin
 	input, store := inputWithConditionStore(owner, true, 2, false, "") // CRD absent — soft-fail
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 2, 5*time.Minute)
 
-	if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c}, input, plan); err != nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{}); err != nil {
 		t.Fatalf("EnsurePodGroups: %v", err)
 	}
 
@@ -619,7 +607,7 @@ func TestEnsurePodGroups_ScaleDownLeavesExtraPodGroupsForFinalizer(t *testing.T)
 	}
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 
-	if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c}, input, plan); err != nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{}); err != nil {
 		t.Fatalf("EnsurePodGroups: %v", err)
 	}
 
@@ -644,7 +632,7 @@ func TestEnsurePodGroups_MultiInstanceMultiPodPodGroupsPerInstance(t *testing.T)
 	input, _ := inputWithConditionStore(owner, true, 1, true, "")
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0, 1, 2}, true, 1, 5*time.Minute)
 
-	if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c}, input, plan); err != nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{}); err != nil {
 		t.Fatalf("EnsurePodGroups: %v", err)
 	}
 
@@ -666,7 +654,7 @@ func TestEnsurePodGroups_Idempotent(t *testing.T) {
 	plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
 
 	for i := 0; i < 2; i++ {
-		if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c}, input, plan); err != nil {
+		if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{}); err != nil {
 			t.Fatalf("EnsurePodGroups pass %d: %v", i, err)
 		}
 	}
@@ -681,7 +669,7 @@ func TestEnsurePodGroups_Idempotent(t *testing.T) {
 func TestEnsurePodGroups_NilClientErrors(t *testing.T) {
 	owner := newOwner("prod", "llama")
 	input, _ := inputWithConditionStore(owner, false, 0, false, "")
-	if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{}, input, workloadtypes.ComponentPlan{}); err == nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{}, input, workloadtypes.ComponentPlan{}, PodGroupReconcileState{}); err == nil {
 		t.Fatal("expected nil-client error")
 	}
 }
@@ -815,7 +803,7 @@ func TestEnsurePodGroups_MaybeNoGangSchedulerWarning_Matrix(t *testing.T) {
 			input, _ := inputWithConditionStore(owner, tc.multiPod, tc.workerSize, true, tc.schedulerName)
 			plan := planFor(workloadtypes.ComponentEngine, []int32{0}, tc.multiPod, tc.workerSize, 5*time.Minute)
 
-			if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c, Recorder: rec}, input, plan); err != nil {
+			if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c, Recorder: rec}, input, plan, PodGroupReconcileState{}); err != nil {
 				t.Fatalf("EnsurePodGroups: %v", err)
 			}
 
@@ -864,7 +852,7 @@ func TestEnsurePodGroups_MaybeNoGangScheduler_DedupPerRow(t *testing.T) {
 
 	// Two reconciles back-to-back.
 	for i := 0; i < 2; i++ {
-		if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c, Recorder: rec}, input, plan); err != nil {
+		if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c, Recorder: rec}, input, plan, PodGroupReconcileState{}); err != nil {
 			t.Fatalf("EnsurePodGroups pass %d: %v", i, err)
 		}
 	}
@@ -893,7 +881,7 @@ func TestEnsurePodGroups_MaybeNoGangScheduler_DedupSeparateComponents(t *testing
 	// Engine reconcile.
 	inputEng, _ := inputWithConditionStore(owner, true, 2, true, "")
 	planEng := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 2, 5*time.Minute)
-	if err := EnsurePodGroups(context.Background(), workloadtypes.Deps{Client: c, Recorder: rec}, inputEng, planEng); err != nil {
+	if _, err := EnsurePodGroupsWithState(context.Background(), workloadtypes.Deps{Client: c, Recorder: rec}, inputEng, planEng, PodGroupReconcileState{}); err != nil {
 		t.Fatalf("engine EnsurePodGroups: %v", err)
 	}
 

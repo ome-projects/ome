@@ -177,6 +177,18 @@ var transitionWriteAllowlist = []allowedTransitionWrite{
 		why: "in-memory mirror of the just-committed status onto the caller's IR (fresh → ir " +
 			"field copy), not a decision",
 	},
+	{
+		file: "inferencereplica/migration_accept.go", fn: "recordRefused", field: "Phase", count: 1,
+		why: "the phase of an operator's migration request record (a v1beta1.MigrationStatus the " +
+			"replica controller owns end to end): Failed at birth when the Component's " +
+			"MigrationPolicy mode is Never; a migration record's field, not an Instance row's",
+	},
+	{
+		file: "inferencereplica/migration_accept.go", fn: "recordAccepted", field: "Phase", count: 1,
+		why: "the phase of an operator's migration request record (a v1beta1.MigrationStatus the " +
+			"replica controller owns end to end): Accepted when the request is taken on; a " +
+			"migration record's field, not an Instance row's",
+	},
 }
 
 // transitionWriteSite is one observed assignment.

@@ -146,7 +146,7 @@ func TestScore_AssignedGangMemberSkipped(t *testing.T) {
 		nodeInfo(gpuNode("b1", "b", "4")),
 	}
 	state := newCycleState()
-	writeAssignment(state, "a", gangInfo{key: "ns/g", topologyKey: testKey})
+	writeAssignment(state, "a", gangInfo{key: "ns/g", topologyKey: testKey}, 0)
 	if st := g.PreScore(context.Background(), state, pod, nodes); st == nil || st.Code() != framework.Skip {
 		t.Fatalf("assigned gang member should Skip PreScore, got %v", st)
 	}

@@ -76,6 +76,8 @@ OME Resources and Controller
 | ome.omeAgent.vaultId | string | `"ocid1.vault.oc1.ap-osaka-1.dummy.dummy-vault"` |  |
 | ome.version | string | `"v0.1.2"` |  |
 | prometheus.enabled | bool | `true` | Bundle a single-replica Prometheus for KEDA autoscaling input. See [Bundled Prometheus](#bundled-prometheus). |
+| prometheus.configReload.enabled | bool | `true` | Reload `prometheus.yml` in place when the ConfigMap changes instead of replacing the pod. Requires Prometheus v3.0 or later. See [Configuration changes](#configuration-changes). |
+| prometheus.configReload.interval | string | `"30s"` | How often Prometheus checks `prometheus.yml` for a change; empty uses the Prometheus default. |
 | prometheus.externalLabels | object | `{"cluster":"ome"}` | Labels identifying this Prometheus to remote-write, federation, and alerting consumers. |
 | prometheus.goMemLimit | string | `""` | Optional Go soft memory limit, for example `9GiB`; leave headroom below the container limit for mmap and other non-heap memory. |
 | prometheus.listenPort | int | `9090` | Internal Prometheus HTTP listen port. |
@@ -225,6 +227,30 @@ and cardinality limits before preserving a WAL that cannot be replayed.
 
 For long-term observability, deploy a separate full Prometheus stack
 (kube-prometheus-stack, etc.) and leave `prometheus.enabled=false`.
+
+### Configuration changes
+
+With `prometheus.configReload.enabled=true`, the default, a change to the
+generated `prometheus.yml` leaves the pod template untouched. That covers
+scrape jobs, relabeling, scrape limits and external labels. The kubelet writes
+the new ConfigMap content into the running pod, usually within a minute.
+Prometheus applies it at its next check, every
+`prometheus.configReload.interval`. The pod keeps running and keeps its TSDB,
+so autoscaling and canary queries keep their history.
+
+A change to any other pod field still replaces the pod: the image, flags,
+resources, storage, probes or scheduling.
+
+Prometheus applies a new file only if it is valid. An invalid file leaves the
+previous configuration running, and Prometheus retries it at every check. The
+Deployment stays healthy in this state, so watch
+`prometheus_config_last_reload_successful`, which drops to 0, or the
+`Error reloading config` log line.
+
+Set `prometheus.configReload.enabled=false` to replace the pod on every
+configuration change instead. Prometheus images older than v3.0 need this,
+because they lack the `auto-reload-config` feature. Switching the setting
+changes the pod template, so it replaces the pod once.
 
 ## Multicluster Access
 

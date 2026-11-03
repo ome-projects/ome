@@ -18,7 +18,7 @@ func TestDeriveISVCPlacementIntentStaysOnSource(t *testing.T) {
 		t.Run(string(mode), func(t *testing.T) {
 			src := srcISVCMode(mode, "accelerator=test")
 			src.Spec.Placement.ClusterAffinity = testAffinity("accelerator=test,metadata.name=cluster-a")
-			src.Spec.Placement.Split = &v1beta1.SplitSpec{Replicas: ptr.To(int32(4)), MaxReplicasPerCluster: 3}
+			src.Spec.Placement.Split = &v1beta1.SplitSpec{Replicas: ptr.To(int32(4)), MaxPerCluster: engineCap(3)}
 			before := src.DeepCopy()
 			derived := DeriveISVC(src, "control-plane", "serving")
 			require.Nil(t, derived.Spec.Placement)
@@ -33,7 +33,7 @@ func TestReconcileSplitMemberKeepsConcreteReplicaPolicy(t *testing.T) {
 	scheme := testScheme(t)
 	worker := emptyWorker(scheme)
 	source := srcISVCSplit("accelerator=test", 4)
-	source.Spec.Placement.Split.MaxReplicasPerCluster = 6
+	source.Spec.Placement.Split.MaxPerCluster = engineCap(6)
 	source.Spec.Engine.MinReplicas = ptr.To(8)
 	source.Spec.Engine.MaxReplicas = 10
 	source.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{

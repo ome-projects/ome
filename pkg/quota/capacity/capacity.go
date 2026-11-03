@@ -110,15 +110,8 @@ func Sum(nodes []corev1.Node, flavors []Flavor, opts Options) (Result, error) {
 	if len(opts.AcceleratorResources) == 0 {
 		return Result{}, nil
 	}
-	seen := make(map[string]struct{}, len(flavors))
-	for _, f := range flavors {
-		if f.Name == "" {
-			return Result{}, fmt.Errorf("quota capacity: a flavor has no name")
-		}
-		if _, dup := seen[f.Name]; dup {
-			return Result{}, fmt.Errorf("quota capacity: flavor %q is declared more than once", f.Name)
-		}
-		seen[f.Name] = struct{}{}
+	if err := validateFlavors(flavors); err != nil {
+		return Result{}, err
 	}
 
 	wanted := make(map[string]struct{}, len(opts.AcceleratorResources))
@@ -126,55 +119,81 @@ func Sum(nodes []corev1.Node, flavors []Flavor, opts Options) (Result, error) {
 		wanted[name] = struct{}{}
 	}
 
-	type key struct{ resource, flavor string }
-	totals := map[key]*Capacity{}
+	totals := map[resourceFlavor]*Capacity{}
 	var unattributed []Unattributed
-
 	for i := range nodes {
 		node := &nodes[i]
 		chips := acceleratorsOf(node, wanted)
 		if len(chips) == 0 {
 			continue
 		}
-
 		flavor, reason := match(node, flavors)
 		if flavor == "" {
-			for _, c := range chips {
-				unattributed = append(unattributed, Unattributed{
-					Node: node.Name, ResourceName: c.name, Quantity: c.quantity, Reason: reason,
-				})
-			}
+			unattributed = append(unattributed, unattributedChips(node.Name, chips, reason)...)
 			continue
 		}
+		addNode(totals, chips, flavor, available(node))
+	}
+	return sortedResult(totals, unattributed), nil
+}
 
-		usable := available(node)
-		for _, c := range chips {
-			k := key{resource: c.name, flavor: flavor}
-			t, ok := totals[k]
-			if !ok {
-				t = &Capacity{ResourceName: c.name, ResourceFlavor: flavor}
-				totals[k] = t
-			}
-			if usable {
-				t.Allocatable.Add(c.quantity)
-			} else {
-				t.Unavailable.Add(c.quantity)
-			}
+// validateFlavors rejects a flavor without a name and a name declared twice.
+func validateFlavors(flavors []Flavor) error {
+	seen := make(map[string]struct{}, len(flavors))
+	for _, f := range flavors {
+		if f.Name == "" {
+			return fmt.Errorf("quota capacity: a flavor has no name")
 		}
-		// Counted once per node, not once per resource, so a node advertising
-		// both GPUs and TPUs is one machine rather than two.
-		for _, c := range chips {
-			t := totals[key{resource: c.name, flavor: flavor}]
-			if usable {
-				t.Nodes++
-			} else {
-				t.UnavailableNodes++
-			}
+		if _, dup := seen[f.Name]; dup {
+			return fmt.Errorf("quota capacity: flavor %q is declared more than once", f.Name)
+		}
+		seen[f.Name] = struct{}{}
+	}
+	return nil
+}
+
+// resourceFlavor is the (resource, flavor) pair a total is kept for.
+type resourceFlavor struct{ resource, flavor string }
+
+// addNode adds one node's chips to the totals of the flavor it belongs to.
+// Each chip is a distinct resource, so the node counts once in every
+// (resource, flavor) entry it feeds: a node advertising both GPUs and TPUs is
+// one machine in each of its two entries.
+func addNode(totals map[resourceFlavor]*Capacity, chips []chip, flavor string, usable bool) {
+	for _, c := range chips {
+		k := resourceFlavor{resource: c.name, flavor: flavor}
+		t, ok := totals[k]
+		if !ok {
+			t = &Capacity{ResourceName: c.name, ResourceFlavor: flavor}
+			totals[k] = t
+		}
+		if usable {
+			t.Allocatable.Add(c.quantity)
+			t.Nodes++
+		} else {
+			t.Unavailable.Add(c.quantity)
+			t.UnavailableNodes++
 		}
 	}
+}
 
-	// Nil rather than empty when nothing was found, so the zero Result means
-	// "no capacity" and a caller can test it without a length check.
+// unattributedChips reports every chip of a node no flavor claims, with the
+// reason the node could not be attributed.
+func unattributedChips(nodeName string, chips []chip, reason string) []Unattributed {
+	out := make([]Unattributed, 0, len(chips))
+	for _, c := range chips {
+		out = append(out, Unattributed{
+			Node: nodeName, ResourceName: c.name, Quantity: c.quantity, Reason: reason,
+		})
+	}
+	return out
+}
+
+// sortedResult orders the totals by (resource, flavor) and the unattributed
+// chips by (node, resource). Both slices are nil rather than empty when nothing
+// was found, so the zero Result means "no capacity" and a caller can test it
+// without a length check.
+func sortedResult(totals map[resourceFlavor]*Capacity, unattributed []Unattributed) Result {
 	var out Result
 	for _, t := range totals {
 		out.Capacities = append(out.Capacities, *t)
@@ -192,7 +211,7 @@ func Sum(nodes []corev1.Node, flavors []Flavor, opts Options) (Result, error) {
 		return unattributed[i].ResourceName < unattributed[j].ResourceName
 	})
 	out.Unattributed = unattributed
-	return out, nil
+	return out
 }
 
 type chip struct {

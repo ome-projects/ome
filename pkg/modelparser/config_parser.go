@@ -72,7 +72,25 @@ func NewModelConfigParser(logger *zap.SugaredLogger) *ModelConfigParser {
 // receives the metadata in its spec, in memory; callers persist it
 // themselves, or apply the returned metadata with ApplyModelMetadata.
 func (p *ModelConfigParser) ParseModelConfig(modelDir string, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel) (*ModelMetadata, error) {
-	return p.parseModelConfigDir(modelDir, nil, baseModel, clusterBaseModel)
+	if _, err := os.Stat(modelDir); os.IsNotExist(err) {
+		p.logger.Warnw("model directory does not exist", "dir", modelDir)
+		return nil, nil
+	}
+	if p.shouldSkipConfigParsing(baseModel, clusterBaseModel) {
+		return nil, nil
+	}
+
+	standaloneQuantConfig := p.loadHFQuantConfig(modelDir)
+	hfModel, modelConfigPath, err := p.loadModelConfigFromDir(modelDir)
+	if err != nil {
+		return nil, err
+	}
+	if hfModel == nil {
+		return nil, fmt.Errorf("no model_index.json or config.json found in %s", modelDir)
+	}
+	quantConfig := resolveQuantConfig(standaloneQuantConfig, hfModel)
+	parameterCount := p.quantAwareParameterCount(modelConfigPath, quantConfig)
+	return p.finishParse(hfModel, quantConfig, parameterCount, baseModel, clusterBaseModel), nil
 }
 
 // ParseModelConfigFromFiles parses model metadata from an explicit set
@@ -95,18 +113,13 @@ func (p *ModelConfigParser) ParseModelConfigFromFiles(ctx context.Context, files
 		return nil, fmt.Errorf("no model_index.json or config.json found in file input set")
 	}
 
-	// Resolve hfQuantConfig in priority order: standalone
-	// hf_quant_config.json (ModelOpt) → embedded quantization_config
-	// (HF-native: mxfp4, fbgemm_fp8, gptq, awq, fp8). Both spec.Quantization
-	// AND the safetensors counting downstream read from the same
-	// resolved value to prevent count/spec divergence.
-	var hfQuantConfig *modelconfig.HFQuantConfig
+	var standaloneQuantConfig *modelconfig.HFQuantConfig
 	if len(hfQuantConfigBytes) > 0 {
 		parsed, perr := modelconfig.ParseHFQuantConfig(hfQuantConfigBytes)
 		if perr != nil {
 			p.logger.Warnw("parse hf_quant_config.json failed", "error", perr)
 		} else {
-			hfQuantConfig = parsed
+			standaloneQuantConfig = parsed
 		}
 	}
 
@@ -114,29 +127,62 @@ func (p *ModelConfigParser) ParseModelConfigFromFiles(ctx context.Context, files
 	if err != nil {
 		return nil, fmt.Errorf("parse model config %s: %w", configInput.Path, err)
 	}
-	if hfQuantConfig == nil {
-		hfQuantConfig = hfModel.GetHFQuantConfig()
-	}
+	quantConfig := resolveQuantConfig(standaloneQuantConfig, hfModel)
 
-	var parameterCountOverride *int64
+	var parameterCount *int64
 	if len(safetensorsFiles) > 0 {
-		parameterCount, perr := modelconfig.FindAndParseSafetensorsFilesWithQuantConfig(safetensorsFiles, hfQuantConfig)
+		count, perr := modelconfig.FindAndParseSafetensorsFilesWithQuantConfig(safetensorsFiles, quantConfig)
 		if perr != nil {
 			return nil, fmt.Errorf("parse safetensors metadata from file inputs: %w", perr)
 		}
-		parameterCountOverride = &parameterCount
+		parameterCount = &count
 	}
-
-	metadata := p.extractModelMetadataFromHFWithParameterCount(hfModel, parameterCountOverride)
-	applyQuantizationFromConfig(&metadata, hfQuantConfig, p.logger)
-	p.updateParsedModelMetadata(baseModel, clusterBaseModel, metadata)
-	return &metadata, nil
+	return p.finishParse(hfModel, quantConfig, parameterCount, baseModel, clusterBaseModel), nil
 }
 
-// applyQuantizationFromConfig is the SOLE writer of metadata.Quantization,
-// guaranteeing it shares the same resolved hfQuantConfig source as the
-// safetensors counting path (no NVFP4-count + FP8-spec divergence).
-// No-op for unquantized models or unrecognized algorithms.
+// resolveQuantConfig picks the one quantization config that both the
+// parameter count and spec.Quantization read, so the two never disagree: the
+// standalone hf_quant_config.json (ModelOpt) when present, else the
+// config's embedded quantization_config block (mxfp4, fbgemm_fp8, fp8,
+// gptq, awq), else nil.
+func resolveQuantConfig(standalone *modelconfig.HFQuantConfig, hfModel modelconfig.HuggingFaceModel) *modelconfig.HFQuantConfig {
+	if standalone != nil {
+		return standalone
+	}
+	return hfModel.GetHFQuantConfig()
+}
+
+// quantAwareParameterCount counts the safetensors beside configPath with
+// the quantization config applied; the config's own count under-counts
+// packed-quant models and over-counts excluded modules. Nil when there is
+// no quantization config or the files cannot be counted.
+func (p *ModelConfigParser) quantAwareParameterCount(configPath string, quantConfig *modelconfig.HFQuantConfig) *int64 {
+	if quantConfig == nil || configPath == "" {
+		return nil
+	}
+	count, err := modelconfig.FindAndParseSafetensorsWithQuantConfig(configPath, quantConfig)
+	if err != nil || count <= 0 {
+		return nil
+	}
+	p.logger.Debugw("using quant-aware safetensors count",
+		"count", count, "algo", quantConfig.Quantization.QuantAlgo)
+	return &count
+}
+
+// finishParse turns a parsed config into the model's metadata, writes the
+// quantization read from quantConfig and fills the unset spec fields of
+// the model the caller passed. A non-nil parameterCount replaces the
+// config's own count.
+func (p *ModelConfigParser) finishParse(hfModel modelconfig.HuggingFaceModel, quantConfig *modelconfig.HFQuantConfig, parameterCount *int64, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel) *ModelMetadata {
+	metadata := p.extractModelMetadata(hfModel, parameterCount)
+	applyQuantizationFromConfig(&metadata, quantConfig, p.logger)
+	p.updateParsedModelMetadata(baseModel, clusterBaseModel, metadata)
+	return &metadata
+}
+
+// applyQuantizationFromConfig is the only writer of metadata.Quantization:
+// it maps the config's quant_algo to the OME enum. No-op for unquantized
+// models or unrecognized algorithms.
 func applyQuantizationFromConfig(metadata *ModelMetadata, hfQuantConfig *modelconfig.HFQuantConfig, logger *zap.SugaredLogger) {
 	if hfQuantConfig == nil {
 		return
@@ -151,66 +197,19 @@ func applyQuantizationFromConfig(metadata *ModelMetadata, hfQuantConfig *modelco
 	}
 }
 
-func (p *ModelConfigParser) parseModelConfigDir(modelDir string, parameterCountOverride *int64, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel) (*ModelMetadata, error) {
-	if _, err := os.Stat(modelDir); os.IsNotExist(err) {
-		p.logger.Warnw("model directory does not exist", "dir", modelDir)
-		return nil, nil
-	}
-
-	if p.shouldSkipConfigParsing(baseModel, clusterBaseModel) {
-		return nil, nil
-	}
-
-	// Resolve hfQuantConfig in priority order: standalone
-	// hf_quant_config.json (ModelOpt) → embedded quantization_config
-	// (HF-native: mxfp4, fbgemm_fp8, fp8, gptq, awq). Both
-	// spec.Quantization AND quant-aware safetensors counting read
-	// from the same resolved value to prevent count/spec divergence.
-	hfQuantConfig := p.loadHFQuantConfig(modelDir)
-
-	hfModel, modelConfigPath, loadErr := p.loadModelConfigFromDir(modelDir)
-	if loadErr != nil {
-		return nil, loadErr
-	}
-	if hfModel == nil {
-		return nil, fmt.Errorf("no model_index.json or config.json found in %s", modelDir)
-	}
-
-	if hfQuantConfig == nil {
-		hfQuantConfig = hfModel.GetHFQuantConfig()
-	}
-
-	// Quant-aware count overrides the legacy GetParameterCount() naive
-	// sum (which under-counts packed-quant models ~2x and over-counts
-	// excluded modules).
-	if parameterCountOverride == nil && hfQuantConfig != nil && modelConfigPath != "" {
-		if count, cerr := modelconfig.FindAndParseSafetensorsWithQuantConfig(modelConfigPath, hfQuantConfig); cerr == nil && count > 0 {
-			countCopy := count
-			parameterCountOverride = &countCopy
-			p.logger.Debugw("using quant-aware safetensors count",
-				"count", count, "algo", hfQuantConfig.Quantization.QuantAlgo)
-		}
-	}
-
-	metadata := p.extractModelMetadataFromHFWithParameterCount(hfModel, parameterCountOverride)
-	applyQuantizationFromConfig(&metadata, hfQuantConfig, p.logger)
-	p.updateParsedModelMetadata(baseModel, clusterBaseModel, metadata)
-	return &metadata, nil
-}
-
 // loadModelConfigFromDir prefers model_index.json (diffusion) and
 // falls back to config.json (HF text). Returns (nil, "", nil) if
 // neither exists. The returned path anchors the safetensors counting
 // helpers' directory lookup.
 func (p *ModelConfigParser) loadModelConfigFromDir(modelDir string) (modelconfig.HuggingFaceModel, string, error) {
-	if modelIndexPath, err := p.findModelIndexFile(modelDir); err == nil {
+	if modelIndexPath, err := findFile(modelDir, DefaultModelIndexFileName, nil); err == nil {
 		hfModel, loadErr := p.loadModelConfig(modelIndexPath)
 		if loadErr != nil {
 			return nil, "", fmt.Errorf("parse model_index.json at %s: %w", modelIndexPath, loadErr)
 		}
 		return hfModel, modelIndexPath, nil
 	}
-	configPath, findErr := p.findConfigFile(modelDir)
+	configPath, findErr := findFile(modelDir, DefaultConfigFileName, commonConfigSubdirs)
 	if findErr != nil {
 		return nil, "", nil
 	}
@@ -351,48 +350,42 @@ func isSafetensorsFileInput(filePath string) bool {
 	return base == modelconfig.SafetensorsIndexFileName || strings.HasSuffix(base, modelconfig.SafetensorsExt)
 }
 
-// findConfigFile locates config.json in the model directory, checking
-// the root and commonConfigSubdirs first, then falling back to a
-// bounded recursive walk.
-func (p *ModelConfigParser) findConfigFile(modelDir string) (string, error) {
-	if path := findInCommonLocations(modelDir, DefaultConfigFileName); path != "" {
-		return path, nil
+// findFile returns the path of name under modelDir: the root first, then
+// each of subdirs, then a recursive walk that ends at its first match in
+// lexical order.
+func findFile(modelDir, name string, subdirs []string) (string, error) {
+	if found := findInRootOrSubdirs(modelDir, name, subdirs); found != "" {
+		return found, nil
 	}
 
-	var configPath string
+	var found string
 	err := filepath.Walk(modelDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
-		if !info.IsDir() && info.Name() == DefaultConfigFileName {
-			configPath = path
-			return filepath.SkipDir
+		if !info.IsDir() && info.Name() == name {
+			found = path
+			return filepath.SkipAll
 		}
 		return nil
 	})
 	if err != nil {
 		return "", err
 	}
-	if configPath == "" {
-		return "", fmt.Errorf("config.json not found in %s", modelDir)
+	if found == "" {
+		return "", fmt.Errorf("%s not found in %s", name, modelDir)
 	}
-	return configPath, nil
+	return found, nil
 }
 
-// findHFQuantConfigFile checks the same locations as findConfigFile but
-// returns "" rather than an error — the file is optional.
-func (p *ModelConfigParser) findHFQuantConfigFile(modelDir string) string {
-	return findInCommonLocations(modelDir, modelconfig.HFQuantConfigFileName)
-}
-
-// findInCommonLocations returns the first match of filename in modelDir
-// or any of commonConfigSubdirs, or "" if none exists.
-func findInCommonLocations(modelDir, filename string) string {
-	if path := filepath.Join(modelDir, filename); fileExists(path) {
+// findInRootOrSubdirs returns the first match of name directly under
+// modelDir or under one of subdirs, in that order, or "" if none exists.
+func findInRootOrSubdirs(modelDir, name string, subdirs []string) string {
+	if path := filepath.Join(modelDir, name); fileExists(path) {
 		return path
 	}
-	for _, sub := range commonConfigSubdirs {
-		if path := filepath.Join(modelDir, sub, filename); fileExists(path) {
+	for _, sub := range subdirs {
+		if path := filepath.Join(modelDir, sub, name); fileExists(path) {
 			return path
 		}
 	}
@@ -407,7 +400,7 @@ func fileExists(path string) bool {
 // loadHFQuantConfig returns nil for both "absent" and "parse failed"
 // so callers can use the optional-file pattern without branching.
 func (p *ModelConfigParser) loadHFQuantConfig(modelDir string) *modelconfig.HFQuantConfig {
-	path := p.findHFQuantConfigFile(modelDir)
+	path := findInRootOrSubdirs(modelDir, modelconfig.HFQuantConfigFileName, commonConfigSubdirs)
 	if path == "" {
 		return nil
 	}
@@ -424,41 +417,10 @@ func (p *ModelConfigParser) loadHFQuantConfig(modelDir string) *modelconfig.HFQu
 	return cfg
 }
 
-// findModelIndexFile locates model_index.json in the model directory,
-// checking the root first, then falling back to a bounded recursive walk.
-func (p *ModelConfigParser) findModelIndexFile(modelDir string) (string, error) {
-	if path := filepath.Join(modelDir, DefaultModelIndexFileName); fileExists(path) {
-		return path, nil
-	}
-
-	var indexPath string
-	err := filepath.Walk(modelDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !info.IsDir() && info.Name() == DefaultModelIndexFileName {
-			indexPath = path
-			return filepath.SkipDir
-		}
-		return nil
-	})
-	if err != nil {
-		return "", err
-	}
-	if indexPath == "" {
-		return "", fmt.Errorf("model_index.json not found in %s", modelDir)
-	}
-	return indexPath, nil
-}
-
-// extractModelMetadataFromHF is a thin shim used only by the
-// mock-driven unit tests; production paths call
-// extractModelMetadataFromHFWithParameterCount directly.
-func (p *ModelConfigParser) extractModelMetadataFromHF(hfModel modelconfig.HuggingFaceModel) ModelMetadata {
-	return p.extractModelMetadataFromHFWithParameterCount(hfModel, nil)
-}
-
-func (p *ModelConfigParser) extractModelMetadataFromHFWithParameterCount(hfModel modelconfig.HuggingFaceModel, parameterCountOverride *int64) ModelMetadata {
+// extractModelMetadata reads the metadata of a parsed config. A non-nil
+// parameterCountOverride replaces the config's own count and sizes the
+// model from it. Quantization is left to applyQuantizationFromConfig.
+func (p *ModelConfigParser) extractModelMetadata(hfModel modelconfig.HuggingFaceModel, parameterCountOverride *int64) ModelMetadata {
 	var diffusionModel *modelconfig.DiffusionPipelineSpec
 	if dm, ok := hfModel.(modelconfig.HuggingFaceDiffusionModel); ok {
 		diffusionModel = dm.GetDiffusionModel()
@@ -477,15 +439,6 @@ func (p *ModelConfigParser) extractModelMetadataFromHFWithParameterCount(hfModel
 		ModelCapabilities:  capabilitiesAsStrings(hfModel, p.logger),
 	}
 	p.populateFormatAndFramework(&metadata, hfModel, diffusionModel)
-
-	// metadata.Quantization is intentionally NOT set here. The parser
-	// callers (ParseModelConfigFromFiles + parseModelConfigDir) resolve
-	// the authoritative HFQuantConfig (standalone hf_quant_config.json
-	// → embedded quantization_config block → nil) and write the OME
-	// enum via applyQuantizationFromConfig. Centralizing the write
-	// guarantees the spec.quantization field comes from the SAME quant
-	// config that drove the safetensors parameter counting — otherwise
-	// you can get NVFP4 count + FP8 spec on a model that ships both.
 
 	modelSizeBytes := hfModel.GetModelSizeBytes()
 	if parameterCountOverride != nil {

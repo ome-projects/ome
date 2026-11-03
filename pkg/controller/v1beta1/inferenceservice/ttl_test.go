@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
@@ -17,11 +16,11 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 var ttlTestNow = time.Date(2026, time.January, 2, 15, 4, 5, 0, time.UTC)
@@ -96,9 +95,6 @@ func TestReconcileTTLAfterCreation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			g := gomega.NewWithT(t)
 			ctx := context.Background()
-			scheme := runtime.NewScheme()
-			g.Expect(v1beta1.AddToScheme(scheme)).To(gomega.Succeed())
-
 			isvc := &v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:              "ttl",
@@ -114,11 +110,7 @@ func TestReconcileTTLAfterCreation(t *testing.T) {
 			if test.member {
 				isvc.Labels = map[string]string{constants.PlacementOrigin: "source-cluster"}
 			}
-			live := clientfake.NewClientBuilder().
-				WithScheme(scheme).
-				WithObjects(isvc).
-				WithStatusSubresource(isvc).
-				Build()
+			live := fakeclient.New(t, fakeclient.WithObjects(isvc), fakeclient.WithStatusSubresource(isvc))
 			recorder := record.NewFakeRecorder(10)
 			reconciler := &InferenceServiceReconciler{
 				Client:    live,

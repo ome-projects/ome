@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/rolloutpolicy"
 )
 
 // Admission rejection reasons for spec.rollout.groups[].policyRef. Operators
@@ -90,26 +91,19 @@ func ValidateInlineRolloutPlanSize(spec *v1beta1.InferenceServiceSpec, maxBytes 
 	groups := spec.GetRolloutGroups()
 	for i := range groups {
 		g := &groups[i]
-		var arm string
-		var body any
-		switch {
-		case g.Canary != nil:
-			arm, body = "canary", g.Canary
-		case g.BlueGreen != nil:
-			arm, body = "blueGreen", g.BlueGreen
-		case g.RollingUpdate != nil:
-			arm, body = "rollingUpdate", g.RollingUpdate
-		default:
+		bodies := rolloutpolicy.ProgressionBodies(g.Canary, g.BlueGreen, g.RollingUpdate)
+		if len(bodies) == 0 {
 			continue
 		}
-		raw, err := json.Marshal(body)
+		inline := bodies[0]
+		raw, err := json.Marshal(inline.Body)
 		if err != nil {
 			return fmt.Errorf("spec.rollout.groups[%d].%s: cannot render the progression body: %v (%s)",
-				i, arm, err, ReasonRolloutPlanTooLarge)
+				i, inline.Kind, err, ReasonRolloutPlanTooLarge)
 		}
 		if len(raw) > maxBytes {
 			return fmt.Errorf("spec.rollout.groups[%d].%s: progression body renders to %d bytes, exceeding the configured cap of %d — the plan is pinned into status at run open, so an oversized body would bloat every status write (%s)",
-				i, arm, len(raw), maxBytes, ReasonRolloutPlanTooLarge)
+				i, inline.Kind, len(raw), maxBytes, ReasonRolloutPlanTooLarge)
 		}
 	}
 	return nil

@@ -59,7 +59,11 @@ type batchMemberFixture struct {
 	creating        int32 // created on the target by a scale-up, not serving yet
 	retiring        int32 // Ready on the old revision beyond the desired count: rows a scale-down has not yet retired
 	partition       int32 // the member's own rollingUpdate.partition: that many Instances stay on the old revision
+	held            int32 // the member's retry record for the target is Held after that many failed attempts
 }
+
+// heldRecordReason is the last failure the fixtures' Held retry records name.
+const heldRecordReason = "the image cannot be pulled"
 
 // movable is the number of Instances the roll may move: the desired count
 // less the Instances the partition holds on their revision.
@@ -127,6 +131,9 @@ func batchReplica(comp v1beta1.ComponentType, m batchMemberFixture) *v1beta1.Inf
 	untouched := m.desired - int32(len(rows))
 	add(untouched+m.retiring, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, PodCount: 1, ServingPodCount: 1})
 	ir.Status.InstanceStatuses = rows
+	if m.held > 0 {
+		ir.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: target, State: v1beta1.RetryBlockHeld, AttemptsStarted: m.held, Reason: heldRecordReason}}
+	}
 	ir.Status.UpdatedReplicas = m.promoted
 	ir.Status.UpdatedReadyReplicas = m.promoted
 	ir.Status.ServingReplicas = m.promoted + m.surging + m.handingOver + m.parked + m.failedSurge + m.failedGangSurge + untouched + m.retiring
@@ -137,7 +144,8 @@ func batchReplica(comp v1beta1.ComponentType, m batchMemberFixture) *v1beta1.Inf
 // batchGroupFixture is the group the members roll in: one rollingUpdate
 // group over the listed Components (engine and decoder when empty) with the
 // given group budgets (an empty one is left to the default), under
-// maintainRatio at tolerance when set.
+// maintainRatio at tolerance when set. The active run records every member
+// moving from the old revision to the target.
 type batchGroupFixture struct {
 	maxUnavailable string
 	maxSurge       string
@@ -185,7 +193,12 @@ func batchService(g batchGroupFixture, members map[v1beta1.ComponentType]batchMe
 			ObservedRatio: &v1beta1.RolloutCoordinationRatio{Original: original},
 		}}}
 	}
-	return pinActiveRun(isvc)
+	isvc = pinActiveRun(isvc)
+	for _, comp := range components {
+		isvc.Status.Rollout.ActiveRun.TargetRevisions = append(isvc.Status.Rollout.ActiveRun.TargetRevisions,
+			v1beta1.RolloutRunTarget{Component: comp, Revision: "target", StableRevision: "old"})
+	}
+	return isvc
 }
 
 func batchClient(t *testing.T, members map[v1beta1.ComponentType]batchMemberFixture) client.Client {
@@ -1832,8 +1845,11 @@ func partitionedEightEight(strategy v1beta1.UpdateStrategyType) (engine, decoder
 // count, a side the partition holds whole is done at once, and with the
 // decoder named first the prefill side's last batch does not wait on a
 // decode Instance the partition holds. The partition lowered to zero
-// afterwards starts the two held Instances as a new batch, one at a time
-// as before. The drain-first path and the surge path read alike.
+// afterwards starts the two held Instances as a new batch: one at a time
+// under a configured tolerance, and outside the batch pacing when none is
+// configured, since the decoder is wholly on version 2 by then and the old
+// prefill have no partner of their version left. The drain-first path and
+// the surge path read alike.
 func TestEvaluateUpdateGate_BatchStepPlansOverTheInstancesAPartitionLetsMove(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	for _, mechanism := range []workloadtypes.UpdateStrategyType{workloadtypes.UpdateStrategyRecreatePod, workloadtypes.UpdateStrategySurgeThenDrain} {
@@ -1889,10 +1905,10 @@ func TestEvaluateUpdateGate_BatchStepPlansOverTheInstancesAPartitionLetsMove(t *
 					t.Fatalf("the engine's seventh start must be admitted; got the hold %q", reason)
 				}
 			})
-			t.Run("the partition lowered to zero starts the held Instances as a new batch, one at a time", func(t *testing.T) {
+			t.Run("the partition lowered to zero starts the held Instances as a new batch, one at a time under a configured tolerance", func(t *testing.T) {
 				e, d := engine, decoder
 				e.partition, e.promoted, d.promoted = 0, 6, 8
-				if allowed, reason := ask(t, e, d, eng, GroupDefaults{}); !allowed {
+				if allowed, reason := ask(t, e, d, eng, keepRatio(100)); !allowed {
 					t.Fatalf("the first held Instance's start must be admitted; got the hold %q", reason)
 				}
 				if mechanism == workloadtypes.UpdateStrategySurgeThenDrain {
@@ -1901,13 +1917,25 @@ func TestEvaluateUpdateGate_BatchStepPlansOverTheInstancesAPartitionLetsMove(t *
 					e.inFlight = 1
 				}
 				want := "engine batch 8 waits for engine batch 7 to serve (6 of 7 serving)"
-				if allowed, reason := ask(t, e, d, eng, GroupDefaults{}); allowed || reason != want {
+				if allowed, reason := ask(t, e, d, eng, keepRatio(100)); allowed || reason != want {
 					t.Fatalf("allowed=%v reason=%q, want the hold %q", allowed, reason, want)
 				}
 				e.surging, e.inFlight = 0, 0
-				got, stalled := driveBatchRoll(t, batchGroupFixture{}, e, d, mechanism, GroupDefaults{})
+				got, stalled := driveBatchRoll(t, batchGroupFixture{}, e, d, mechanism, keepRatio(100))
 				if want := []rollPicture{{7, 8}, {8, 8}}; stalled || pictures(got) != pictures(want) {
 					t.Errorf("pictures after each round:\n got %s (stalled %v)\nwant %s", pictures(got), stalled, pictures(want))
+				}
+			})
+			t.Run("with no tolerance configured the held Instances roll outside the batch pacing, the decoder being wholly on version 2", func(t *testing.T) {
+				e, d := engine, decoder
+				e.partition, e.promoted, d.promoted = 0, 6, 8
+				if mechanism == workloadtypes.UpdateStrategySurgeThenDrain {
+					e.surging = 1
+				} else {
+					e.inFlight = 1
+				}
+				if allowed, reason := ask(t, e, d, eng, GroupDefaults{}); !allowed {
+					t.Fatalf("the second held Instance's start is the budgets' to pace, not the batch step's; got the hold %q", reason)
 				}
 			})
 		})
@@ -1956,6 +1984,111 @@ func TestEvaluateUpdateGate_KeepRatioPlansOverTheMovableInstances(t *testing.T) 
 			got, stalled = driveBatchRoll(t, tc.group, engine, decoder, tc.mechanism, keepRatio(10))
 			if want := []rollPicture{{11, 8}, {12, 8}}; stalled || pictures(got) != pictures(want) {
 				t.Errorf("after the partition is lowered, pictures after each round:\n got %s (stalled %v)\nwant %s", pictures(got), stalled, pictures(want))
+			}
+		})
+	}
+}
+
+// TestEvaluateUpdateGate_TheOtherSideReadsHeldWhenTheNamedSideIsHeld is
+// the push onto an image no pod can pull on 3 prefill beside 3 decode, both
+// SurgeThenDrain at a maxSurge of 1, with the decoder named to move first.
+// The decoder's first surge fails three times and its retry record reads
+// Held. The engine's next start belongs to batch 2 and would wait for the
+// decoder's batch 2 to serve first, which a Held decoder never opens: the
+// gate reads Held, names the decoder and its record, and says what resumes
+// both sides. A release of the record puts the plain first-side wait back,
+// and the decoder's batch serving admits the engine. Every other wait is
+// as before: the named side's own answer, a Held side that is not the
+// named one (where a spent retry schedule leaves the other side is not
+// decided yet), and a group with no first side.
+func TestEvaluateUpdateGate_TheOtherSideReadsHeldWhenTheNamedSideIsHeld(t *testing.T) {
+	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
+	surge := v1beta1.UpdateStrategySurgeThenDrain
+	three := func(m batchMemberFixture) batchMemberFixture {
+		m.desired, m.surge, m.strategy = 3, "1", surge
+		return m
+	}
+	one := func(m batchMemberFixture) batchMemberFixture {
+		m.desired, m.surge, m.strategy = 1, "1", surge
+		return m
+	}
+	decoderFirst := GroupDefaults{PrefillDecode: PrefillDecodeRules{FirstSide: dec}}
+	engineFirst := GroupDefaults{PrefillDecode: PrefillDecodeRules{FirstSide: eng}}
+	heldDecoder := "engine batch 2 waits for decoder batch 2 to serve first (0 of 2 serving, 1 failed), and the decoder is held: " +
+		"update to svc-decoder-target held after 3 failed attempt(s): the image cannot be pulled; " +
+		"a corrected revision, or a release of the held revision on the decoder, resumes both sides"
+	heldEngine := "decoder batch 2 waits for engine batch 2 to serve first (0 of 2 serving, 1 failed), and the engine is held: " +
+		"update to svc-engine-target held after 3 failed attempt(s): the image cannot be pulled; " +
+		"a corrected revision, or a release of the held revision on the engine, resumes both sides"
+	cases := []struct {
+		name       string
+		engine     batchMemberFixture
+		decoder    batchMemberFixture
+		comp       v1beta1.ComponentType
+		defaults   GroupDefaults
+		wantGate   v1beta1.RolloutHoldGate
+		wantReason string
+	}{
+		{
+			name:   "decoder named and held: the engine's next start reads Held and names the decoder",
+			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
+			wantGate: v1beta1.RolloutHoldGateHeld, wantReason: heldDecoder,
+		},
+		{
+			name:   "decoder named and held: the engine's first start opens beside the ended decoder attempt, as before",
+			engine: three(batchMemberFixture{}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
+		},
+		{
+			name:   "decoder named and held, both sides scaled to one: the engine's retry of its own batch opens beside the ended decoder attempt, as before",
+			engine: one(batchMemberFixture{failedSurge: 1}), decoder: one(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
+		},
+		{
+			name:   "decoder named and held: the decoder's own answer is the gate's, not the retry schedule's",
+			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: dec, defaults: decoderFirst,
+		},
+		{
+			name:   "engine named and held: the decoder's next start reads Held and names the engine",
+			engine: three(batchMemberFixture{failedSurge: 1, held: 3}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: dec, defaults: engineFirst,
+			wantGate: v1beta1.RolloutHoldGateHeld, wantReason: heldEngine,
+		},
+		{
+			name:   "the record released: the plain first-side wait is back",
+			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: eng, defaults: decoderFirst,
+			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 2 waits for decoder batch 2 to serve first (0 of 2 serving, 1 failed)",
+		},
+		{
+			name:   "the decoder's retry served and its second surge is open: the engine still waits for it",
+			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{promoted: 1, surging: 1}), comp: eng, defaults: decoderFirst,
+			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 2 waits for decoder batch 2 to serve first (1 of 2 serving)",
+		},
+		{
+			name:   "the decoder's second batch serves: the engine's retry is admitted",
+			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{promoted: 2}), comp: eng, defaults: decoderFirst,
+		},
+		{
+			name:   "decoder named, the engine held: the decoder waits on the engine's batch as before",
+			engine: three(batchMemberFixture{failedSurge: 1, held: 3}), decoder: three(batchMemberFixture{promoted: 2}), comp: dec, defaults: decoderFirst,
+			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "decoder batch 3 waits for engine batch 2 to serve (0 of 2 serving, 1 failed)",
+		},
+		{
+			name:   "no first side, the decoder held: the engine waits on the decoder's batch as before",
+			engine: three(batchMemberFixture{promoted: 2}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng,
+			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 3 waits for decoder batch 2 to serve (0 of 2 serving, 1 failed)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			members := map[v1beta1.ComponentType]batchMemberFixture{eng: tc.engine, dec: tc.decoder}
+			isvc := batchService(batchGroupFixture{maxUnavailable: "0", maxSurge: "1"}, members)
+			allowed, gate, reason := batchGateWith(t, isvc, batchClient(t, members), tc.comp, workloadtypes.UpdateStrategySurgeThenDrain, 0, tc.defaults)
+			if wantHold := tc.wantGate != ""; wantHold == allowed {
+				t.Fatalf("allowed=%v, want hold=%v (gate=%q reason=%q)", allowed, wantHold, gate, reason)
+			}
+			if gate != tc.wantGate {
+				t.Errorf("gate=%q, want %q (reason=%q)", gate, tc.wantGate, reason)
+			}
+			if reason != tc.wantReason {
+				t.Errorf("reason=%q, want %q", reason, tc.wantReason)
 			}
 		})
 	}

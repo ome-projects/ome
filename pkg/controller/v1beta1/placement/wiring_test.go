@@ -7,7 +7,7 @@ package placement
 import (
 	"testing"
 
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestValidateWiring(t *testing.T) {
@@ -15,7 +15,7 @@ func TestValidateWiring(t *testing.T) {
 	if err := r.validateWiring(); err == nil {
 		t.Fatal("nil APIReader must be rejected at setup")
 	}
-	r.APIReader = fakeclient.NewClientBuilder().Build()
+	r.APIReader = fakeclient.New(t)
 	if err := r.validateWiring(); err != nil {
 		t.Fatalf("wired APIReader must pass: %v", err)
 	}

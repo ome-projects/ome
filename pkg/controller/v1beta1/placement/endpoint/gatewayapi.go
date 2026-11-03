@@ -222,7 +222,7 @@ func (p *GatewayAPIPublisher) Publish(ctx context.Context, isvc *v1beta1.Inferen
 	if err != nil {
 		return err
 	}
-	if err := p.applyRoute(ctx, isvc, target); err != nil {
+	if err := applyOwned(ctx, p, isvc, ownedHTTPRoute, p.buildHTTPRoute(isvc, target)); err != nil {
 		return err
 	}
 	if err := p.pruneGatewayBackendResources(ctx, isvc, desiredSlices, desiredPolicies); err != nil {
@@ -417,12 +417,7 @@ func (p *GatewayAPIPublisher) sourceServices(
 	sourceKey types.NamespacedName,
 ) ([]corev1.Service, error) {
 	list := &corev1.ServiceList{}
-	if err := p.apiReader.List(ctx, list, client.InNamespace(routeNamespace),
-		client.MatchingLabels{
-			ManagedByLabel:                      ManagedByValue,
-			PlacementEndpointISVCLabel:          sourceKey.Name,
-			PlacementEndpointISVCNamespaceLabel: sourceKey.Namespace,
-		}); err != nil {
+	if err := p.apiReader.List(ctx, list, sourceListOptions(routeNamespace, sourceKey)...); err != nil {
 		return nil, fmt.Errorf("list global backend Services for %s/%s: %w", sourceKey.Namespace, sourceKey.Name, err)
 	}
 	return list.Items, nil
@@ -442,7 +437,8 @@ func (p *GatewayAPIPublisher) ensureServices(ctx context.Context, isvc *v1beta1.
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if err := p.applyService(ctx, isvc, name, desired[name]); err != nil {
+		service := p.buildExternalNameService(isvc, name, desired[name])
+		if err := applyOwned(ctx, p, isvc, ownedBackendService, service); err != nil {
 			return nil, err
 		}
 	}
@@ -473,38 +469,77 @@ func (p *GatewayAPIPublisher) pruneServices(ctx context.Context, isvc *v1beta1.I
 	return nil
 }
 
-func (p *GatewayAPIPublisher) applyService(ctx context.Context, isvc *v1beta1.InferenceService, name string, cluster ServingCluster) error {
-	desired := p.buildExternalNameService(isvc, name, cluster)
-	existing := &corev1.Service{}
-	err := p.apiReader.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
+// ownedKind says how the publisher rewrites one kind of object it owns: the
+// name its errors use, an empty object to read the live state into, the
+// cluster-assigned fields it keeps from the live object because it does not
+// own them, and the owned fields whose difference means an update.
+type ownedKind[T client.Object] struct {
+	name  string
+	empty func() T
+	keep  func(desired, live T)
+	equal func(desired, live T) bool
+}
+
+var (
+	ownedBackendService = ownedKind[*corev1.Service]{
+		name:  "backend Service",
+		empty: func() *corev1.Service { return &corev1.Service{} },
+		keep: func(desired, live *corev1.Service) {
+			desired.Spec.ClusterIP = live.Spec.ClusterIP
+			desired.Spec.ClusterIPs = live.Spec.ClusterIPs
+		},
+		equal: func(desired, live *corev1.Service) bool {
+			return equality.Semantic.DeepEqual(desired.Spec, live.Spec)
+		},
+	}
+	ownedHTTPRoute = ownedKind[*gatewayapiv1.HTTPRoute]{
+		name:  "HTTPRoute",
+		empty: func() *gatewayapiv1.HTTPRoute { return &gatewayapiv1.HTTPRoute{} },
+		equal: func(desired, live *gatewayapiv1.HTTPRoute) bool {
+			return equality.Semantic.DeepEqual(desired.Spec, live.Spec)
+		},
+	}
+)
+
+// applyOwned creates desired when no object has its key. Otherwise it updates
+// the live object in place, but only when this InferenceService owns it, it is
+// not terminating, and its labels or owned fields differ. The live
+// ResourceVersion, finalizers and kept fields go into the write.
+func applyOwned[T client.Object](
+	ctx context.Context,
+	p *GatewayAPIPublisher,
+	isvc *v1beta1.InferenceService,
+	kind ownedKind[T],
+	desired T,
+) error {
+	key := client.ObjectKeyFromObject(desired)
+	live := kind.empty()
+	err := p.apiReader.Get(ctx, key, live)
 	if apierrors.IsNotFound(err) {
 		if err := p.client.Create(ctx, desired); err != nil {
-			return fmt.Errorf("create global backend Service %s/%s: %w", desired.Namespace, desired.Name, err)
+			return fmt.Errorf("create global %s %s/%s: %w", kind.name, key.Namespace, key.Name, err)
 		}
 		return nil
 	}
 	if err != nil {
+		return fmt.Errorf("read global %s %s/%s: %w", kind.name, key.Namespace, key.Name, err)
+	}
+	if !p.ownsResource(live, isvc) {
+		return fmt.Errorf("global %s %s/%s belongs to another InferenceService", kind.name, key.Namespace, key.Name)
+	}
+	if err := requireActiveGatewayResource(live, kind.name); err != nil {
 		return err
 	}
-	if !p.ownsResource(existing, isvc) {
-		return fmt.Errorf("global backend Service %s/%s belongs to another InferenceService", desired.Namespace, desired.Name)
+	desired.SetResourceVersion(live.GetResourceVersion())
+	desired.SetFinalizers(append([]string(nil), live.GetFinalizers()...))
+	if kind.keep != nil {
+		kind.keep(desired, live)
 	}
-	if err := requireActiveGatewayResource(existing, "backend Service"); err != nil {
-		return err
-	}
-	// Repoint (re-placement) or label drift: update in place. Carry the live
-	// ResourceVersion and finalizers, plus cluster-assigned spec fields we do not
-	// own.
-	desired.ResourceVersion = existing.ResourceVersion
-	desired.Finalizers = append([]string(nil), existing.Finalizers...)
-	desired.Spec.ClusterIP = existing.Spec.ClusterIP
-	desired.Spec.ClusterIPs = existing.Spec.ClusterIPs
-	if equality.Semantic.DeepEqual(desired.Spec, existing.Spec) &&
-		maps.Equal(desired.Labels, existing.Labels) {
+	if kind.equal(desired, live) && maps.Equal(desired.GetLabels(), live.GetLabels()) {
 		return nil
 	}
 	if err := p.client.Update(ctx, desired); err != nil {
-		return fmt.Errorf("update global backend Service %s/%s: %w", desired.Namespace, desired.Name, err)
+		return fmt.Errorf("update global %s %s/%s: %w", kind.name, key.Namespace, key.Name, err)
 	}
 	return nil
 }
@@ -528,56 +563,25 @@ func (p *GatewayAPIPublisher) ownsResource(obj metav1.Object, isvc *v1beta1.Infe
 }
 
 // preflightResourceOwnership checks every exact object the publish may create
-// or update before any write. Per-object update checks remain authoritative if
-// another actor creates or replaces an object after this read-only pass.
+// or update before any write, with the EndpointSlices the resolved addresses
+// produce.
 func (p *GatewayAPIPublisher) preflightResourceOwnership(
 	ctx context.Context,
 	isvc *v1beta1.InferenceService,
 	target Target,
 	addresses map[string][]BackendAddress,
 ) error {
-	route := p.buildHTTPRoute(isvc, target)
-	if err := p.requireOwnedOrAbsent(ctx, route, "HTTPRoute", isvc); err != nil {
-		return err
-	}
-
-	clusters := append([]ServingCluster(nil), target.Clusters...)
-	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Cluster < clusters[j].Cluster })
-	for _, cluster := range clusters {
-		serviceName := p.serviceName(isvc, cluster.Cluster)
-		service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
-			Namespace: p.routeNamespace(isvc),
-			Name:      serviceName,
-		}}
-		if err := p.requireOwnedOrAbsent(ctx, service, "backend Service", isvc); err != nil {
-			return err
+	return p.preflightPublishedObjects(ctx, isvc, target, func(serviceName string, cluster ServingCluster) ([]string, error) {
+		slices, err := p.buildEndpointSlices(isvc, serviceName, cluster, addresses[cluster.Cluster])
+		if err != nil {
+			return nil, err
 		}
-		if p.config.GatewayBackend.EndpointSlices.Enabled {
-			slices, err := p.buildEndpointSlices(isvc, serviceName, cluster, addresses[cluster.Cluster])
-			if err != nil {
-				return err
-			}
-			for _, endpointSlice := range slices {
-				probe := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
-					Namespace: endpointSlice.Namespace,
-					Name:      endpointSlice.Name,
-				}}
-				if err := p.requireOwnedOrAbsent(ctx, probe, "backend EndpointSlice", isvc); err != nil {
-					return err
-				}
-			}
+		names := make([]string, 0, len(slices))
+		for _, endpointSlice := range slices {
+			names = append(names, endpointSlice.Name)
 		}
-		if p.config.GatewayBackend.TLS.Enabled {
-			policy := &gatewayapiv1.BackendTLSPolicy{ObjectMeta: metav1.ObjectMeta{
-				Namespace: p.routeNamespace(isvc),
-				Name:      serviceName,
-			}}
-			if err := p.requireOwnedOrAbsent(ctx, policy, "BackendTLSPolicy", isvc); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+		return names, nil
+	})
 }
 
 // preflightResourceKeys checks every object key an active publication can use
@@ -588,38 +592,53 @@ func (p *GatewayAPIPublisher) preflightResourceKeys(
 	isvc *v1beta1.InferenceService,
 	target Target,
 ) error {
+	return p.preflightPublishedObjects(ctx, isvc, target, func(serviceName string, _ ServingCluster) ([]string, error) {
+		return []string{
+			boundedResourceName(serviceName + ipv4EndpointSliceSuffix),
+			boundedResourceName(serviceName + ipv6EndpointSliceSuffix),
+		}, nil
+	})
+}
+
+// preflightPublishedObjects reads every object a publication of target may
+// create or update and fails on the first that belongs to another source or is
+// terminating: the HTTPRoute, then per cluster in name order the backend
+// Service, the EndpointSlices sliceNames returns for it, and its
+// BackendTLSPolicy. Per-object update checks remain authoritative if another
+// actor creates or replaces an object after this read-only pass.
+func (p *GatewayAPIPublisher) preflightPublishedObjects(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	target Target,
+	sliceNames func(serviceName string, cluster ServingCluster) ([]string, error),
+) error {
 	route := p.buildHTTPRoute(isvc, target)
 	if err := p.requireOwnedOrAbsent(ctx, route, "HTTPRoute", isvc); err != nil {
 		return err
 	}
-
+	namespace := p.routeNamespace(isvc)
 	clusters := append([]ServingCluster(nil), target.Clusters...)
 	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Cluster < clusters[j].Cluster })
 	for _, cluster := range clusters {
 		serviceName := p.serviceName(isvc, cluster.Cluster)
-		service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
-			Namespace: p.routeNamespace(isvc),
-			Name:      serviceName,
-		}}
+		service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: serviceName}}
 		if err := p.requireOwnedOrAbsent(ctx, service, "backend Service", isvc); err != nil {
 			return err
 		}
 		if p.config.GatewayBackend.EndpointSlices.Enabled {
-			for _, suffix := range []string{ipv4EndpointSliceSuffix, ipv6EndpointSliceSuffix} {
-				endpointSlice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{
-					Namespace: p.routeNamespace(isvc),
-					Name:      boundedResourceName(serviceName + suffix),
-				}}
+			names, err := sliceNames(serviceName, cluster)
+			if err != nil {
+				return err
+			}
+			for _, name := range names {
+				endpointSlice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 				if err := p.requireOwnedOrAbsent(ctx, endpointSlice, "backend EndpointSlice", isvc); err != nil {
 					return err
 				}
 			}
 		}
 		if p.config.GatewayBackend.TLS.Enabled {
-			policy := &gatewayapiv1.BackendTLSPolicy{ObjectMeta: metav1.ObjectMeta{
-				Namespace: p.routeNamespace(isvc),
-				Name:      serviceName,
-			}}
+			policy := &gatewayapiv1.BackendTLSPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: serviceName}}
 			if err := p.requireOwnedOrAbsent(ctx, policy, "BackendTLSPolicy", isvc); err != nil {
 				return err
 			}
@@ -661,37 +680,6 @@ func requireActiveGatewayResource(object metav1.Object, kind string) error {
 		return nil
 	}
 	return fmt.Errorf("global %s %s/%s is terminating", kind, object.GetNamespace(), object.GetName())
-}
-
-func (p *GatewayAPIPublisher) applyRoute(ctx context.Context, isvc *v1beta1.InferenceService, target Target) error {
-	desired := p.buildHTTPRoute(isvc, target)
-	existing := &gatewayapiv1.HTTPRoute{}
-	err := p.apiReader.Get(ctx, types.NamespacedName{Name: desired.Name, Namespace: desired.Namespace}, existing)
-	if apierrors.IsNotFound(err) {
-		if err := p.client.Create(ctx, desired); err != nil {
-			return fmt.Errorf("create global HTTPRoute %s/%s: %w", desired.Namespace, desired.Name, err)
-		}
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !p.ownsResource(existing, isvc) {
-		return fmt.Errorf("global HTTPRoute %s/%s belongs to another InferenceService", desired.Namespace, desired.Name)
-	}
-	if err := requireActiveGatewayResource(existing, "HTTPRoute"); err != nil {
-		return err
-	}
-	desired.ResourceVersion = existing.ResourceVersion
-	desired.Finalizers = append([]string(nil), existing.Finalizers...)
-	if equality.Semantic.DeepEqual(desired.Spec, existing.Spec) &&
-		maps.Equal(desired.Labels, existing.Labels) {
-		return nil
-	}
-	if err := p.client.Update(ctx, desired); err != nil {
-		return fmt.Errorf("update global HTTPRoute %s/%s: %w", desired.Namespace, desired.Name, err)
-	}
-	return nil
 }
 
 // buildExternalNameService renders the ExternalName Service that aliases one

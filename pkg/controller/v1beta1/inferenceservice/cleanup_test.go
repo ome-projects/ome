@@ -15,8 +15,6 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	policyv1 "k8s.io/api/policy/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,7 +23,6 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
@@ -33,6 +30,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferencereplica"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestCleanupRemovedComponents(t *testing.T) {
@@ -159,20 +157,9 @@ func TestCleanupRemovedComponents(t *testing.T) {
 			ctx := context.Background()
 			ctx = log.IntoContext(ctx, log.Log)
 
-			// Create scheme
-			scheme := runtime.NewScheme()
-			_ = v1beta1.AddToScheme(scheme)
-			_ = appsv1.AddToScheme(scheme)
-			_ = corev1.AddToScheme(scheme)
-			_ = autoscalingv2.AddToScheme(scheme)
-			_ = networkingv1.AddToScheme(scheme)
-
 			// Create fake client with existing resources
 			allObjects := append([]client.Object{tc.isvc}, tc.existingResources...)
-			fakeClient := fakeclient.NewClientBuilder().
-				WithScheme(scheme).
-				WithObjects(allObjects...).
-				Build()
+			fakeClient := fakeclient.New(t, fakeclient.WithObjects(allObjects...))
 
 			// Create reconciler
 			r := &InferenceServiceReconciler{
@@ -181,7 +168,7 @@ func TestCleanupRemovedComponents(t *testing.T) {
 			}
 
 			// Execute cleanup
-			err := r.cleanupRemovedComponents(ctx, tc.isvc, tc.engineSpec, tc.decoderSpec, tc.routerSpec)
+			err := r.cleanupRemovedComponents(ctx, tc.isvc, v1beta1.RoleSpecs{Engine: tc.engineSpec, Decoder: tc.decoderSpec, Router: tc.routerSpec})
 			require.NoError(t, err)
 
 			// Verify expected deletions
@@ -206,9 +193,6 @@ func TestCleanupRemovedComponentsSweepsInferenceReplicas(t *testing.T) {
 	ctx := context.Background()
 	ctx = log.IntoContext(ctx, log.Log)
 
-	scheme := runtime.NewScheme()
-	_ = v1beta1.AddToScheme(scheme)
-
 	isvc := &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-isvc",
@@ -220,10 +204,7 @@ func TestCleanupRemovedComponentsSweepsInferenceReplicas(t *testing.T) {
 	engineIR := createInferenceReplica("test-isvc-engine", "default", "test-isvc", "test-uid", v1beta1.EngineComponent)
 	decoderIR := createInferenceReplica("test-isvc-decoder", "default", "test-isvc", "test-uid", v1beta1.DecoderComponent)
 
-	fakeClient := fakeclient.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(isvc, engineIR, decoderIR).
-		Build()
+	fakeClient := fakeclient.New(t, fakeclient.WithObjects(isvc, engineIR, decoderIR))
 
 	r := &InferenceServiceReconciler{
 		Client:    fakeClient,
@@ -231,7 +212,7 @@ func TestCleanupRemovedComponentsSweepsInferenceReplicas(t *testing.T) {
 	}
 
 	// Decoder removed from the spec.
-	err := r.cleanupRemovedComponents(ctx, isvc, &v1beta1.EngineSpec{}, nil, nil)
+	err := r.cleanupRemovedComponents(ctx, isvc, v1beta1.RoleSpecs{Engine: &v1beta1.EngineSpec{}})
 	require.NoError(t, err)
 
 	// Decoder IR: deletion requested, finalizer still present (drained path).
@@ -368,18 +349,11 @@ func TestIsOwnedBy(t *testing.T) {
 	}
 }
 
-// sweptKindsScheme knows every kind the sweep can list.
+// sweptKindsScheme knows every kind the sweep can list, the optional
+// groups included.
 func sweptKindsScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{
-		v1beta1.AddToScheme, appsv1.AddToScheme, corev1.AddToScheme, autoscalingv2.AddToScheme,
-		networkingv1.AddToScheme, policyv1.AddToScheme, rbacv1.AddToScheme,
-		lws.AddToScheme, kedav1.AddToScheme, monitoringv1.AddToScheme,
-	} {
-		require.NoError(t, add(scheme))
-	}
-	return scheme
+	return fakeclient.Scheme(t, lws.AddToScheme, kedav1.AddToScheme, monitoringv1.AddToScheme)
 }
 
 // A reconciler without a client config sweeps the core kinds, in this
@@ -434,24 +408,24 @@ func TestRemovedComponentSweepReadsTypedLists(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-isvc", Namespace: "default", UID: "test-uid"},
 	}
 	var listed []string
-	fakeClient := fakeclient.NewClientBuilder().
-		WithScheme(sweptKindsScheme(t)).
-		WithObjects(isvc,
+	fakeClient := fakeclient.New(t,
+		fakeclient.WithScheme(sweptKindsScheme(t)),
+		fakeclient.WithObjects(isvc,
 			createDeployment("test-isvc-engine", "default", "test-isvc", "test-uid", v1beta1.EngineComponent),
 			createDeployment("test-isvc-decoder", "default", "test-isvc", "test-uid", v1beta1.DecoderComponent),
 			createService("test-isvc-decoder", "default", "test-isvc", "test-uid", v1beta1.DecoderComponent),
 			createConfigMap("test-isvc-decoder-config", "default", "test-isvc", "test-uid", v1beta1.DecoderComponent),
-		).
-		WithInterceptorFuncs(interceptor.Funcs{
+		),
+		fakeclient.WithInterceptors(interceptor.Funcs{
 			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 				listed = append(listed, fmt.Sprintf("%T", list))
 				return c.List(ctx, list, opts...)
 			},
-		}).
-		Build()
+		}),
+	)
 	r := &InferenceServiceReconciler{Client: fakeClient, Clientset: fake.NewSimpleClientset()}
 
-	require.NoError(t, r.cleanupRemovedComponents(ctx, isvc, &v1beta1.EngineSpec{}, nil, nil))
+	require.NoError(t, r.cleanupRemovedComponents(ctx, isvc, v1beta1.RoleSpecs{Engine: &v1beta1.EngineSpec{}}))
 
 	var typedLists []string
 	for _, kind := range coreSweptKinds() {
@@ -799,14 +773,6 @@ func TestCleanupExternalServiceWithAnnotation(t *testing.T) {
 	ctx := context.Background()
 	ctx = log.IntoContext(ctx, log.Log)
 
-	// Create scheme
-	scheme := runtime.NewScheme()
-	_ = v1beta1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	_ = autoscalingv2.AddToScheme(scheme)
-	_ = networkingv1.AddToScheme(scheme)
-
 	// Test case: External service should NOT be deleted when annotation is set
 	isvc := &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -841,10 +807,7 @@ func TestCleanupExternalServiceWithAnnotation(t *testing.T) {
 
 	// Create fake client with existing resources
 	allObjects := []client.Object{isvc, externalService}
-	fakeClient := fakeclient.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(allObjects...).
-		Build()
+	fakeClient := fakeclient.New(t, fakeclient.WithObjects(allObjects...))
 
 	// Create reconciler
 	r := &InferenceServiceReconciler{
@@ -854,7 +817,7 @@ func TestCleanupExternalServiceWithAnnotation(t *testing.T) {
 
 	// Execute cleanup with engine active
 	engineSpec := &v1beta1.EngineSpec{}
-	err := r.cleanupRemovedComponents(ctx, isvc, engineSpec, nil, nil)
+	err := r.cleanupRemovedComponents(ctx, isvc, v1beta1.RoleSpecs{Engine: engineSpec})
 	require.NoError(t, err)
 
 	// Verify external service still exists
@@ -866,14 +829,6 @@ func TestCleanupExternalServiceWithAnnotation(t *testing.T) {
 func TestCleanupExternalServiceWithoutAnnotation(t *testing.T) {
 	ctx := context.Background()
 	ctx = log.IntoContext(ctx, log.Log)
-
-	// Create scheme
-	scheme := runtime.NewScheme()
-	_ = v1beta1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
-	_ = corev1.AddToScheme(scheme)
-	_ = autoscalingv2.AddToScheme(scheme)
-	_ = networkingv1.AddToScheme(scheme)
 
 	// Test case: External service SHOULD be deleted when annotation is NOT set
 	isvc := &v1beta1.InferenceService{
@@ -907,10 +862,7 @@ func TestCleanupExternalServiceWithoutAnnotation(t *testing.T) {
 
 	// Create fake client with existing resources
 	allObjects := []client.Object{isvc, externalService}
-	fakeClient := fakeclient.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(allObjects...).
-		Build()
+	fakeClient := fakeclient.New(t, fakeclient.WithObjects(allObjects...))
 
 	// Create reconciler
 	r := &InferenceServiceReconciler{
@@ -920,7 +872,7 @@ func TestCleanupExternalServiceWithoutAnnotation(t *testing.T) {
 
 	// Execute cleanup with engine active
 	engineSpec := &v1beta1.EngineSpec{}
-	err := r.cleanupRemovedComponents(ctx, isvc, engineSpec, nil, nil)
+	err := r.cleanupRemovedComponents(ctx, isvc, v1beta1.RoleSpecs{Engine: engineSpec})
 	require.NoError(t, err)
 
 	// Verify external service was deleted
@@ -944,15 +896,10 @@ func TestOrphanSweepOfAPassTheShutdownCutShort(t *testing.T) {
 		{name: "read error after the shutdown is logged below error level", canceled: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			scheme := runtime.NewScheme()
-			require.NoError(t, v1beta1.AddToScheme(scheme))
 			isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "team-a", UID: "service-uid"}}
 			readError := errors.New(shutdownCutMessage)
-			fakeClient := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(isvc).WithInterceptorFuncs(interceptor.Funcs{
-				List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-					return readError
-				},
-			}).Build()
+			fakeClient := fakeclient.New(t, fakeclient.WithObjects(isvc),
+				fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, readError))
 			r := &InferenceServiceReconciler{Client: fakeClient, Clientset: fake.NewSimpleClientset()}
 			sink := &messageSink{}
 			ctx := log.IntoContext(t.Context(), logr.New(sink))
@@ -961,7 +908,7 @@ func TestOrphanSweepOfAPassTheShutdownCutShort(t *testing.T) {
 				ctx, cancel = context.WithCancel(ctx)
 				cancel()
 			}
-			require.NoError(t, r.cleanupRemovedComponents(ctx, isvc, &v1beta1.EngineSpec{}, nil, nil))
+			require.NoError(t, r.cleanupRemovedComponents(ctx, isvc, v1beta1.RoleSpecs{Engine: &v1beta1.EngineSpec{}}))
 			errorLogs := sink.errorLines("Failed to cleanup resources of type")
 			if tt.wantErrorLogs {
 				assert.Positive(t, errorLogs, "a live pass logs the failed read as an error")

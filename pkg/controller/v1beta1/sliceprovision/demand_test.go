@@ -10,11 +10,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/tpuslice"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 const (
@@ -112,7 +111,7 @@ func TestResolveNeeded(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			nodes := fake.NewClientBuilder().WithObjects(provisionOnlyNode("n1", "tpu-a")).Build()
+			nodes := fakeclient.New(t, fakeclient.WithObjects(provisionOnlyNode("n1", "tpu-a")))
 			d, needed, err := Resolve(context.Background(), nodes, testConfig(), tt.pods)
 			if err != nil || !needed {
 				t.Fatalf("Resolve = needed %v, err %v; want needed", needed, err)
@@ -147,7 +146,7 @@ func TestResolveNotNeeded(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			nodes := fake.NewClientBuilder().WithObjects(tt.nodes...).Build()
+			nodes := fakeclient.New(t, fakeclient.WithObjects(tt.nodes...))
 			d, needed, err := Resolve(context.Background(), nodes, tt.cfg, tt.pods)
 			if err != nil || needed || d != (Demand{}) {
 				t.Fatalf("Resolve = %+v, needed %v, err %v; want not needed", d, needed, err)
@@ -177,7 +176,7 @@ func TestResolveRejects(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			nodes := fake.NewClientBuilder().WithObjects(provisionOnlyNode("n1", "tpu-a"), provisionOnlyNode("n2", "tpu-b")).Build()
+			nodes := fakeclient.New(t, fakeclient.WithObjects(provisionOnlyNode("n1", "tpu-a"), provisionOnlyNode("n2", "tpu-b")))
 			_, needed, err := Resolve(context.Background(), nodes, testConfig(), tt.pods)
 			if !errors.Is(err, ErrInvalidDemand) {
 				t.Fatalf("Resolve error = %v, want ErrInvalidDemand", err)
@@ -193,7 +192,7 @@ func TestResolveRejects(t *testing.T) {
 }
 
 func TestResolveNilPodSpec(t *testing.T) {
-	nodes := fake.NewClientBuilder().WithObjects(provisionOnlyNode("n1", "tpu-a")).Build()
+	nodes := fakeclient.New(t, fakeclient.WithObjects(provisionOnlyNode("n1", "tpu-a")))
 	_, needed, err := Resolve(context.Background(), nodes, testConfig(), []*corev1.PodSpec{podSpec("tpu-a", "2x2x1", 4), nil})
 	if err == nil || needed {
 		t.Fatalf("Resolve = needed %v, err %v; want an error for a nil spec", needed, err)
@@ -202,9 +201,7 @@ func TestResolveNilPodSpec(t *testing.T) {
 
 func TestResolveNodeListError(t *testing.T) {
 	boom := errors.New("boom")
-	nodes := fake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
-		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error { return boom },
-	}).Build()
+	nodes := fakeclient.New(t, fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, boom))
 	_, needed, err := Resolve(context.Background(), nodes, testConfig(), repeat(podSpec("tpu-a", "2x2x1", 4), 1))
 	if !errors.Is(err, boom) || errors.Is(err, ErrInvalidDemand) || needed {
 		t.Fatalf("Resolve = needed %v, err %v; want the transient list error", needed, err)

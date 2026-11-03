@@ -89,7 +89,7 @@ func (r *Router) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 		v1beta1.RouterComponent,
 		isvc,
 	)
-	if err := r.rbacReconciler.Reconcile(); err != nil {
+	if err := r.rbacReconciler.Reconcile(ctx); err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to reconcile RBAC resources")
 	}
 
@@ -128,9 +128,10 @@ func (r *Router) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 // reconcileOMENativeSubresources delegates to the shared
 // ReconcileOMENativeSubresources helper in base.go — engine, decoder,
 // and router emit byte-identical Service + PodMonitor pairs; only the
-// component enum and ComponentExtensionSpec pointer differ.
+// component enum, the ComponentExtensionSpec pointer and the effective
+// multi-pod shape differ. Router is always single-pod.
 func (r *Router) reconcileOMENativeSubresources(ctx context.Context, isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta, podSpec *v1.PodSpec) error {
-	return ReconcileOMENativeSubresources(ctx, &r.BaseComponentFields, isvc, v1beta1.RouterComponent, &r.routerSpec.ComponentExtensionSpec, objectMeta, podSpec)
+	return ReconcileOMENativeSubresources(ctx, &r.BaseComponentFields, isvc, v1beta1.RouterComponent, &r.routerSpec.ComponentExtensionSpec, objectMeta, podSpec, false)
 }
 
 // reconcileDeployment manages the deployment logic for different deployment modes

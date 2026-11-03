@@ -18,9 +18,9 @@ import (
 	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // TestMetricNames pins the metrics' names, which dashboards and alerts key on.
@@ -448,11 +448,8 @@ func TestSliceStatesReportNothingWhenAReadFails(t *testing.T) {
 	b := newProvisioner(t, newFakeClient(), Owner{Kind: testOwner.Kind, Namespace: "ns", Name: "svc-other", UID: "uid-b"})
 	d := demand(t, "2x2x1")
 	objs := []client.Object{stored(t, a, d, Slot{}, withState("ACTIVE", "")), stored(t, b, d, Slot{}, withState("ACTIVE", ""))}
-	listFails := stateSource(fake.NewClientBuilder().WithObjects(objs...).WithInterceptorFuncs(interceptor.Funcs{
-		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-			return errors.New("injected list failure")
-		},
-	}).Build(), testOwner.UID, "uid-b")
+	listFails := stateSource(fakeclient.New(t, fakeclient.WithObjects(objs...),
+		fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, errors.New("injected list failure"))), testOwner.UID, "uid-b")
 	lookupFails := stateSource(newFakeClient(objs...), testOwner.UID)
 	exists := lookupFails.OwnerExists
 	lookupFails.OwnerExists = func(ctx context.Context, uid types.UID) (bool, error) {

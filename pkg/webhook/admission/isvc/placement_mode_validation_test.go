@@ -8,12 +8,12 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
+	"sigs.k8s.io/ome/pkg/validation"
 )
 
 // placementModeFixedText opens every refusal of a placement mode change.
@@ -48,37 +48,44 @@ func placedIn(mode v1beta1.PlacementMode) *v1beta1.PlacementSpec {
 
 func placementValidator(t *testing.T) *InferenceServiceValidator {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	require.NoError(t, v1beta1.AddToScheme(scheme))
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := fakeclient.New(t)
 	return &InferenceServiceValidator{Client: c, Reader: c, RuntimeSelector: runtimeselector.New(c)}
 }
 
+// placementValues is every value a stored service's spec.placement.mode can
+// hold, the missing block among them, with the word the refusal uses for it.
+var placementValues = []struct {
+	word      string
+	placement *v1beta1.PlacementSpec
+}{
+	{word: noPlacementBlockWord},
+	{word: "Single", placement: placedIn(v1beta1.PlacementModeSingle)},
+	{word: "All", placement: placedIn(v1beta1.PlacementModeAll)},
+	{word: "Split", placement: placedIn(v1beta1.PlacementModeSplit)},
+	{word: "SplitByCapacity", placement: placedIn(v1beta1.PlacementModeSplitByCapacity)},
+}
+
 // TestInferenceService_PlacementModeChangeIsRefused: a running service keeps
-// the placement mode it was created with. An update that names another mode,
-// adds the placement block to a service created without one, or removes the
-// block is refused, and the refusal names the mode the service has and the
-// one the update asked for.
+// the placement mode it was created with. For every ordered pair of the four
+// modes, and for the placement block added to a service created without one
+// or removed from one that has it, the update is refused; the refusal names
+// the mode the service has, the one the update asked for, and its reason
+// code. The same value on both sides is admitted.
 func TestInferenceService_PlacementModeChangeIsRefused(t *testing.T) {
-	tests := []struct {
-		name     string
-		old, new *v1beta1.PlacementSpec
-		from, to string
-	}{
-		{name: "All to Split", old: placedIn(v1beta1.PlacementModeAll), new: placedIn(v1beta1.PlacementModeSplit), from: "All", to: "Split"},
-		{name: "Split to All", old: placedIn(v1beta1.PlacementModeSplit), new: placedIn(v1beta1.PlacementModeAll), from: "Split", to: "All"},
-		{name: "Single to Split", old: placedIn(v1beta1.PlacementModeSingle), new: placedIn(v1beta1.PlacementModeSplit), from: "Single", to: "Split"},
-		{name: "Split to SplitByCapacity", old: placedIn(v1beta1.PlacementModeSplit), new: placedIn(v1beta1.PlacementModeSplitByCapacity), from: "Split", to: "SplitByCapacity"},
-		{name: "placement block added", old: nil, new: placedIn(v1beta1.PlacementModeSplit), from: noPlacementBlockWord, to: "Split"},
-		{name: "placement block removed", old: placedIn(v1beta1.PlacementModeAll), new: nil, from: "All", to: noPlacementBlockWord},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := placementValidator(t).ValidateUpdate(context.Background(), placementISVC(tt.old), placementISVC(tt.new))
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), placementModeFixedText)
-			assert.Contains(t, err.Error(), "from "+tt.from+" to "+tt.to)
-		})
+	for _, from := range placementValues {
+		for _, to := range placementValues {
+			t.Run(from.word+" to "+to.word, func(t *testing.T) {
+				_, err := placementValidator(t).ValidateUpdate(context.Background(), placementISVC(from.placement), placementISVC(to.placement))
+				if from.word == to.word {
+					require.NoError(t, err, "the mode is kept")
+					return
+				}
+				require.Error(t, err, "the mode changes")
+				assert.Contains(t, err.Error(), placementModeFixedText)
+				assert.Contains(t, err.Error(), "from "+from.word+" to "+to.word)
+				assert.Contains(t, err.Error(), validation.ReasonPlacementModeImmutable)
+			})
+		}
 	}
 }
 

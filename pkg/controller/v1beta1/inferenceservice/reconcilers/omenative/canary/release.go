@@ -8,7 +8,7 @@ import (
 
 // releaseOrder is the order the Components are read in, so a pass releases
 // them the same way every time.
-var releaseOrder = []v1beta1.ComponentType{v1beta1.RouterComponent, v1beta1.EngineComponent, v1beta1.DecoderComponent}
+var releaseOrder = v1beta1.RolesByPrimaryRank()
 
 // ReleaseUndeclaredUnits drops the status a canary projected onto a
 // Component that no group of the effective plan names any more: the unit's

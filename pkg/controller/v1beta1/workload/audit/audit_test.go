@@ -11,12 +11,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	apitypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // fixedNow gives the ValidateCapacity tests a deterministic "now" so the
@@ -273,6 +273,29 @@ func TestParseTime_EmptyOrInvalid(t *testing.T) {
 	}
 }
 
+func TestEntry_TerminalAndInFlight(t *testing.T) {
+	cases := []struct {
+		phase    string
+		terminal bool
+		inFlight bool
+	}{
+		{PhaseStarted, false, true},
+		{PhaseCompleted, true, false},
+		{PhaseFailed, true, false},
+		{"", false, false},
+		{"Relocated", false, false},
+	}
+	for _, c := range cases {
+		e := Entry{RequestUUID: "u1", Phase: c.phase}
+		if got := e.Terminal(); got != c.terminal {
+			t.Errorf("phase %q: Terminal() = %v want %v", c.phase, got, c.terminal)
+		}
+		if got := e.InFlight(); got != c.inFlight {
+			t.Errorf("phase %q: InFlight() = %v want %v", c.phase, got, c.inFlight)
+		}
+	}
+}
+
 // Ledger round-trip + annotation-parsing tests. The ledger is
 // audit-only; dedup and trim behavior guard the history surface.
 
@@ -350,14 +373,10 @@ func TestAuditLedger_TrimDropsOldestTerminalButKeepsStarted(t *testing.T) {
 }
 
 func TestAuditLedger_DedupAcrossPersist(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
 	owner := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 		Name: "llama-70b", Namespace: "prod", UID: apitypes.UID("owner-uid"),
 	}}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(owner).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(owner))
 	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
 
 	ledger, err := LoadLedgerForOwner(context.Background(), c, owner)
@@ -387,14 +406,10 @@ func TestAuditLedger_DedupAcrossPersist(t *testing.T) {
 
 func newLedgerTestClient(t *testing.T) (client.Client, *corev1.ConfigMap, schema.GroupVersionKind) {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
 	owner := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
 		Name: "llama-70b", Namespace: "prod", UID: apitypes.UID("owner-uid"),
 	}}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(owner).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(owner))
 	return c, owner, corev1.SchemeGroupVersion.WithKind("ConfigMap")
 }
 

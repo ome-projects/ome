@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	corev1 "k8s.io/api/core/v1"
 	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -53,26 +51,13 @@ func (b *IngressBuilder) resolveServicePort(ctx context.Context, namespace, serv
 	return isvcutils.ResolveServicePort(ctx, b.client, namespace, serviceName, constants.CommonISVCPort)
 }
 
-func (b *IngressBuilder) GetResourceType() string {
-	return "Ingress"
-}
-
-func (b *IngressBuilder) Build(ctx context.Context, isvc *v1beta1.InferenceService) (client.Object, error) {
-	return b.BuildIngress(ctx, isvc)
-}
-
 func (b *IngressBuilder) BuildIngress(ctx context.Context, isvc *v1beta1.InferenceService) (client.Object, error) {
 	var rules []netv1.IngressRule
 
 	switch {
 	case irprojector.RoleDeclared(isvc, v1beta1.RouterComponent):
 		if !isvc.Status.IsConditionReady(v1beta1.RouterReady) {
-			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-				Type:   v1beta1.IngressReady,
-				Status: corev1.ConditionFalse,
-				Reason: "Router ingress not created",
-			})
-			return nil, nil
+			return nil, &interfaces.ComponentNotReadyError{Component: v1beta1.RouterComponent}
 		}
 		routerRules, err := b.buildRouterRules(ctx, isvc)
 		if err != nil {
@@ -82,12 +67,7 @@ func (b *IngressBuilder) BuildIngress(ctx context.Context, isvc *v1beta1.Inferen
 
 	case irprojector.RoleDeclared(isvc, v1beta1.DecoderComponent):
 		if !isvc.Status.IsConditionReady(v1beta1.DecoderReady) {
-			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-				Type:   v1beta1.IngressReady,
-				Status: corev1.ConditionFalse,
-				Reason: "Decoder ingress not created",
-			})
-			return nil, nil
+			return nil, &interfaces.ComponentNotReadyError{Component: v1beta1.DecoderComponent}
 		}
 		decoderRules, err := b.buildDecoderRules(ctx, isvc)
 		if err != nil {
@@ -97,12 +77,7 @@ func (b *IngressBuilder) BuildIngress(ctx context.Context, isvc *v1beta1.Inferen
 
 	default:
 		if !isvc.Status.IsConditionReady(v1beta1.EngineReady) {
-			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-				Type:   v1beta1.IngressReady,
-				Status: corev1.ConditionFalse,
-				Reason: "Engine ingress not created",
-			})
-			return nil, nil
+			return nil, &interfaces.ComponentNotReadyError{Component: v1beta1.EngineComponent}
 		}
 		engineRules, err := b.buildEngineOnlyRules(ctx, isvc)
 		if err != nil {

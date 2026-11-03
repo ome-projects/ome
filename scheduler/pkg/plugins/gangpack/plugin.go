@@ -46,11 +46,12 @@ type GangPack struct {
 	// assignments records, per placement group, the domain its gang is
 	// committed to.
 	assignments *placement.DomainAssignments
-	// pgReader resolves a pod's PodGroup facts (minMember + declared topology
-	// key). A missing reader fails closed for labeled gang pods.
+	// pgReader resolves a pod's PodGroup into its gang facts. A missing reader
+	// fails closed for labeled gang pods.
 	pgReader podGroupReader
-	// podLister enumerates live gang pods for the assignment garbage collector.
-	// nil in unit tests that don't exercise GC.
+	// podLister reads the live gang pods: the keys the garbage collector keeps
+	// and the members a gang still has to place. nil in unit tests of the
+	// decision core.
 	podLister gangPodLister
 	// attemptByPod associates framework waiting pods with the commitment that
 	// admitted them. It prevents stale waiters from satisfying or unwinding a
@@ -143,54 +144,44 @@ func (g *GangPack) PreFilter(_ context.Context, state framework.CycleState, pod 
 	if g.pgReader == nil {
 		return nil, framework.NewStatus(framework.Unschedulable, "PodGroup reader is unavailable")
 	}
-	minMember, topologyKey, timeout, uid, found := g.pgReader.get(ns, name)
+	key := ns + "/" + name
+	facts, found := g.pgReader.get(ns, name)
 	if !found {
-		g.releaseStaleGang(ns + "/" + name)
+		g.releaseStaleGang(key)
 		// The pod is labelled into a PodGroup the reader can't resolve yet — most
 		// often informer lag right after the PodGroup was created (pod and group
 		// created together). Skipping here would let a lone member bind and break
 		// all-or-nothing, so hold the pod instead; it requeues automatically when
 		// the PodGroup appears (a registered enqueue event). Plain Unschedulable so
 		// the requeue hints stay in effect.
-		return nil, framework.NewStatus(framework.Unschedulable, "PodGroup "+ns+"/"+name+" not resolvable yet")
+		return nil, framework.NewStatus(framework.Unschedulable, "PodGroup "+key+" not resolvable yet")
 	}
-	if minMember <= 0 {
+	if facts.minMember <= 0 {
 		return nil, framework.NewStatus(framework.Unschedulable,
-			"PodGroup "+ns+"/"+name+" must declare a positive minMember")
+			"PodGroup "+key+" must declare a positive minMember")
 	}
 	// A producer may declare a per-gang override on its PodGroup, or a cluster
 	// may configure one topology key for every gang. The latter keeps PodGroup
 	// producers entirely unaware of this plugin's metadata contract.
-	if topologyKey == "" {
-		topologyKey = g.topologyKey
-	}
-	if topologyKey == "" {
+	gang, ok := facts.gang(key, g.topologyKey)
+	if !ok {
 		if g.podGroupTopologyKeyAnnotation == "" {
 			return nil, framework.NewStatus(framework.Unschedulable,
 				"scheduler must configure topologyKey or podGroupTopologyKeyAnnotation for gang pods")
 		}
 		return nil, framework.NewStatus(framework.Unschedulable,
-			"PodGroup "+ns+"/"+name+" must declare "+g.podGroupTopologyKeyAnnotation+" or the scheduler must configure topologyKey")
+			"PodGroup "+key+" must declare "+g.podGroupTopologyKeyAnnotation+" or the scheduler must configure topologyKey")
 	}
 	if g.unsupportedPlacementGroupLabel != "" {
-		if _, present := pod.Labels[g.unsupportedPlacementGroupLabel]; present {
+		if _, present := pod.Labels[g.unsupportedPlacementGroupLabel]; present || facts.inPlacementGroup {
 			return nil, framework.NewStatus(framework.Unschedulable,
 				"partner placement groups are not supported")
 		}
 	}
-	if r, ok := g.pgReader.(interface {
-		placementGroup(namespace, name string) (string, bool)
-	}); ok && g.unsupportedPlacementGroupLabel != "" {
-		if _, present := r.placementGroup(ns, name); present {
-			return nil, framework.NewStatus(framework.Unschedulable,
-				"partner placement groups are not supported")
-		}
-	}
-	if timeout <= 0 {
+	if gang.timeout <= 0 {
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable,
-			"PodGroup "+ns+"/"+name+" must set scheduleTimeoutSeconds or the scheduler must configure defaultPermitTimeoutSeconds")
+			"PodGroup "+key+" must set scheduleTimeoutSeconds or the scheduler must configure defaultPermitTimeoutSeconds")
 	}
-	gang := gangInfo{key: ns + "/" + name, uid: uid, minMember: minMember, topologyKey: topologyKey, timeout: timeout}
 	return g.assignGangDomain(state, nodes, gang, pod)
 }
 
@@ -313,6 +304,10 @@ func (g *GangPack) readGangCycle(nodes []framework.NodeInfo, gang gangInfo, pod 
 	// gangTemplates must exclude. Waiting Permit pods are assumed here, so this is
 	// also the authoritative view for remaining-template selection.
 	cycle.placed = inspectBoundGangMembers(nodes, pod, gang.topologyKey)
+	// The OME controller reads this reason and the domain-cannot-fit reasons
+	// below to end, sooner, the attempt of a gang no capacity elsewhere can
+	// free (gangDomainFullPhrases in pkg/controller/v1beta1/workload/types).
+	// Keep their wording in step with that list.
 	if cycle.placed.split {
 		return nil, framework.NewStatus(framework.UnschedulableAndUnresolvable,
 			"gang "+gang.key+" already has members in multiple topology domains")
@@ -377,7 +372,7 @@ func (g *GangPack) followAssignment(c *gangCycle) *framework.Status {
 		// Releasing also returns the assignment's leaked capacity reservation,
 		// which may be what kept other pods out of the domain, so they are
 		// requeued as on any other release.
-		if g.assignments.ReleaseIf(gang.key, c.assignment.commitment, nil) {
+		if g.assignments.Release(gang.key, c.assignment.commitment, nil) {
 			g.activateReservationBlocked()
 		}
 		gangAssignmentTotal.WithLabelValues("stale_replan").Inc()
@@ -412,8 +407,7 @@ func (g *GangPack) chooseDomain(c *gangCycle) *framework.Status {
 	if d, count := c.placed.domain, c.placed.count; count > 0 {
 		// Rebuild from ground truth: the gang lives where its members already are.
 		remaining := gang.minMember - count
-		id := g.assignments.SetReservationForOwnerOnNodes(gang.key, gang.uid, gang.topologyKey, d, remaining,
-			nodeNamesInDomain(c.nodes, gang.topologyKey, d))
+		id := g.assignments.Set(gang.placementGang(), d, remaining, nodeNamesInDomain(c.nodes, gang.topologyKey, d))
 		gangAssignmentTotal.WithLabelValues("adopted").Inc()
 		assignedGroups.Set(float64(g.assignments.Len()))
 		if c.free[d] < c.need {
@@ -424,12 +418,10 @@ func (g *GangPack) chooseDomain(c *gangCycle) *framework.Status {
 		return nil
 	}
 	choice, hadFailed := g.withoutFailedDomains(gang, c.free)
-	d, id, fits := g.assignments.ChooseForOwnerInTopologyOnNodes(gang.key, gang.uid, gang.topologyKey, choice,
-		nodeNamesByDomain(c.nodes, gang.topologyKey), c.need)
+	d, id, fits := g.assignments.Choose(gang.placementGang(), choice, nodeNamesByDomain(c.nodes, gang.topologyKey), c.need)
 	if !fits && hadFailed {
 		g.clearFailedDomains(gang)
-		d, id, fits = g.assignments.ChooseForOwnerInTopologyOnNodes(gang.key, gang.uid, gang.topologyKey, c.free,
-			nodeNamesByDomain(c.nodes, gang.topologyKey), c.need)
+		d, id, fits = g.assignments.Choose(gang.placementGang(), c.free, nodeNamesByDomain(c.nodes, gang.topologyKey), c.need)
 	}
 	if !fits {
 		return g.noDomainFits(c)
@@ -579,16 +571,14 @@ func nodeNamesInDomain(nodes []framework.NodeInfo, topologyKey, domain string) [
 }
 
 // gangTemplates returns the concrete remaining members used for simultaneous
-// domain feasibility. Production plugins always have the informer-backed member
-// lister; the homogeneous fallback keeps the decision core independently usable
-// in unit tests.
+// domain feasibility. Without a pod lister (unit tests of the decision core)
+// every remaining member is a copy of the current pod.
 func (g *GangPack) gangTemplates(gang gangInfo, current *v1.Pod, placement boundGangPlacement) ([]*v1.Pod, int, *framework.Status) {
 	need := gang.minMember - placement.count
 	if need < 1 {
 		need = 1
 	}
-	lister, ok := g.podLister.(gangMemberLister)
-	if !ok {
+	if g.podLister == nil {
 		out := make([]*v1.Pod, need)
 		for i := range out {
 			out[i] = current
@@ -596,7 +586,7 @@ func (g *GangPack) gangTemplates(gang gangInfo, current *v1.Pod, placement bound
 		return out, need, nil
 	}
 	ns, name, _ := splitGangKey(gang.key)
-	members, err := lister.gangPods(ns, name)
+	members, err := g.podLister.gangPods(ns, name)
 	if err != nil {
 		return nil, 0, framework.AsStatus(err)
 	}

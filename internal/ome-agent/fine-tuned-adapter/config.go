@@ -6,9 +6,10 @@ import (
 	"github.com/go-playground/validator/v10"
 	"github.com/spf13/viper"
 
-	"sigs.k8s.io/ome/pkg/configutils"
 	"sigs.k8s.io/ome/pkg/logging"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
+
+	"sigs.k8s.io/ome/pkg/agentconfig"
 )
 
 type Config struct {
@@ -72,7 +73,7 @@ func WithViper(v *viper.Viper) Option {
 	return func(c *Config) error {
 
 		*c = *defaultConfig()
-		if err := configutils.BindEnvsRecursive(v, c, ""); err != nil {
+		if err := agentconfig.BindEnvs(v, c); err != nil {
 			return fmt.Errorf("error occurred when binding environment variables: %+v", err)
 		}
 

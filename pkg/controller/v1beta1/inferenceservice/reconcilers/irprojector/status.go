@@ -324,14 +324,8 @@ func allDeclaredComponents(isvc *v1beta1.InferenceService) []v1beta1.ComponentTy
 		return ReferencedRoles(isvc)
 	}
 	var out []v1beta1.ComponentType
-	if isvc.Spec.Engine != nil {
-		out = append(out, v1beta1.EngineComponent)
-	}
-	if isvc.Spec.Decoder != nil {
-		out = append(out, v1beta1.DecoderComponent)
-	}
-	if isvc.Spec.Router != nil {
-		out = append(out, v1beta1.RouterComponent)
+	for _, view := range v1beta1.ServiceRoles(&isvc.Spec).Declared() {
+		out = append(out, view.Type)
 	}
 	return out
 }

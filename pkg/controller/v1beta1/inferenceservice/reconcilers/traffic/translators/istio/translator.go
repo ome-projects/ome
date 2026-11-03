@@ -43,7 +43,9 @@ const (
 	istioReadyType = "Reconciled" // Istio control plane uses Reconciled / NotReconciled on .status
 )
 
-var drGVK = schema.GroupVersionKind{
+// PolicyGVK is the DestinationRule kind the translator emits; the
+// factory probes for its CRD before selecting this translator.
+var PolicyGVK = schema.GroupVersionKind{
 	Group:   groupIstio,
 	Version: versionV1,
 	Kind:    kindDR,
@@ -73,7 +75,7 @@ func (t *Translator) Name() string { return Name }
 // without importing the Istio types.
 func (t *Translator) Watches() client.Object {
 	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(drGVK)
+	u.SetGroupVersionKind(PolicyGVK)
 	return u
 }
 
@@ -120,7 +122,7 @@ func (t *Translator) Translate(
 	intent *traffic.ResolvedIntent,
 ) (client.Object, []string, error) {
 	dr := &unstructured.Unstructured{}
-	dr.SetGroupVersionKind(drGVK)
+	dr.SetGroupVersionKind(PolicyGVK)
 	dr.SetName(isvc.Name)
 	dr.SetNamespace(isvc.Namespace)
 

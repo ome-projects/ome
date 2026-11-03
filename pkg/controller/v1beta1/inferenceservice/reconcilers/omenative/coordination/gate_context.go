@@ -79,6 +79,16 @@ type GateContext struct {
 	// resolved with; the batch step reads its rules and the fallback
 	// tolerance from them.
 	Defaults GroupDefaults
+
+	// CanaryUnit is true when Component belongs to no coordination group
+	// but to a canary group that lists both the engine and the decoder.
+	// The canary executor stages such a unit's capacity through each
+	// member's partition and each member's own budget paces its starts;
+	// Group carries the unit's members so the two pairing gates keep each
+	// side's pairable minimum during a pairing-protocol change, the way
+	// they do for a blueGreen group. No other coordination gate reads the
+	// unit.
+	CanaryUnit bool
 }
 
 // ResolveGateContext walks the shared prelude every Check*Gate runs:
@@ -86,6 +96,9 @@ type GateContext struct {
 //   - nil ISVC                → short-circuit with "nil ISVC"
 //   - no coordination block   → short-circuit with "no coordination block"
 //   - Component in no group   → short-circuit with "component not in any coord group"
+//   - Component in a canary group that lists the engine and the decoder
+//     → the unit's members as the group, flagged CanaryUnit, for the
+//     pairing gates alone
 //   - otherwise               → return the resolved group, ready for per-gate logic
 //
 // Returns a GateContext that subsequent CheckRatio / CheckSurge /
@@ -129,35 +142,40 @@ func ResolveGateContextWithDefaults(ctx context.Context, reads client.Reader, is
 	}
 	// The hold above covers every unpinned state of a grouped Component, so
 	// the view read here is the pinned plan, which needs no observed policies.
-	groups := ResolveGroups(rollout.Effective(isvc, rollout.Policies{}), defaults)
-	if len(groups) == 0 {
+	effective := rollout.Effective(isvc, rollout.Policies{})
+	groups := ResolveGroups(effective, defaults)
+	if group, ok := MembershipFor(groups, component); ok {
 		return GateContext{
-			ISVC:         isvc,
-			Component:    component,
-			ShortCircuit: true,
-			ShortReason:  "no coordination groups",
-			Ctx:          ctx,
-			Reads:        reads,
+			ISVC:      isvc,
+			Component: component,
+			Group:     group,
+			Ctx:       ctx,
+			Reads:     reads,
+			Defaults:  defaults,
 		}
 	}
-	group, ok := MembershipFor(groups, component)
-	if !ok {
+	if unit, ok := canaryUnitGroup(effective, component, defaults); ok {
 		return GateContext{
-			ISVC:         isvc,
-			Component:    component,
-			ShortCircuit: true,
-			ShortReason:  "component not in any coord group",
-			Ctx:          ctx,
-			Reads:        reads,
+			ISVC:       isvc,
+			Component:  component,
+			Group:      unit,
+			CanaryUnit: true,
+			Ctx:        ctx,
+			Reads:      reads,
+			Defaults:   defaults,
 		}
+	}
+	reason := "component not in any coord group"
+	if len(groups) == 0 {
+		reason = "no coordination groups"
 	}
 	return GateContext{
-		ISVC:      isvc,
-		Component: component,
-		Group:     group,
-		Ctx:       ctx,
-		Reads:     reads,
-		Defaults:  defaults,
+		ISVC:         isvc,
+		Component:    component,
+		ShortCircuit: true,
+		ShortReason:  reason,
+		Ctx:          ctx,
+		Reads:        reads,
 	}
 }
 

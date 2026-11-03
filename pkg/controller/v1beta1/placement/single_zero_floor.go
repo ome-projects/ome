@@ -71,16 +71,16 @@ func (r *Reconciler) refreshSingleMovementFloor(ctx context.Context, source *v1b
 			err = positiveMovementFloor(proposal.Assignments[winner].CurrentHome)
 		}
 		if err != nil {
-			reason := "HomePolicyUnresolved"
+			reason := reasonClusterPolicyUnresolved
 			if errors.Is(err, errPositiveMovementFloor) {
-				reason = "PositiveFloorRequired"
+				reason = reasonPositiveMinimumRequired
 			}
 			result, writeErr := r.writeSplitHold(ctx, source, standing, reason, err)
 			return true, result, writeErr
 		}
 		accepted, err := (plan.Store{Client: r.Client, Reader: r.APIReader}).Persist(ctx, source, proposal)
 		if err != nil {
-			result, writeErr := r.writeSplitHold(ctx, source, standing, "PlanNotPersisted", err)
+			result, writeErr := r.writeSplitHold(ctx, source, standing, reasonPlanNotPersisted, err)
 			return true, result, writeErr
 		}
 		for _, target := range accepted.Status.Placement.Candidates {
@@ -89,14 +89,14 @@ func (r *Reconciler) refreshSingleMovementFloor(ctx context.Context, source *v1b
 				err = r.placePlannedMember(cctx, accepted, target, true, nil)
 				cancel()
 				if err != nil {
-					result, writeErr := r.writeSplitHold(ctx, accepted, standing, "MemberApplicationFailed", err)
+					result, writeErr := r.writeSplitHold(ctx, accepted, standing, reasonMemberApplicationFailed, err)
 					return true, result, writeErr
 				}
 			}
 		}
 		r.sweepPlannedRace(ctx, accepted)
 		standing.refresh(ctx, r, accepted, winner)
-		result, err := r.writeSinglePlanStatus(ctx, accepted, standing, "AwaitingMemberConvergence", "")
+		result, err := r.writeSinglePlanStatus(ctx, accepted, standing, reasonAwaitingMemberConvergence, "")
 		return true, result, err
 	}
 	return false, ctrl.Result{}, nil

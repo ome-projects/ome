@@ -21,7 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// ComponentType identifies router | engine | decoder. String-mirrors
+// ComponentType identifies router | engine | decoder | encoder. String-mirrors
 // the CRD ComponentType so the adapter conversion is a verbatim cast;
 // the distinct Go type catches accidental cross-package coupling.
 type ComponentType string
@@ -30,6 +30,7 @@ const (
 	ComponentRouter  ComponentType = "router"
 	ComponentEngine  ComponentType = "engine"
 	ComponentDecoder ComponentType = "decoder"
+	ComponentEncoder ComponentType = "encoder"
 )
 
 // InstancePhase is the per-Instance lifecycle phase. String-mirrors
@@ -148,6 +149,15 @@ const UpdateStepParked = "Parked"
 // deleting the old incarnation, then recreating at the next one.
 const RestartStepDrain = "Drain"
 
+// DeleteStepDrain is the one step of the Delete machine: the Instance's
+// pods leave rotation and drain, then they are deleted and the row removed.
+const DeleteStepDrain = "Drain"
+
+// MigrateStepCreateSurge is the one step of the Migrate machine, written on
+// both rows of a move: the source keeps serving while its replacement is
+// created on the target node, and the replacement is promoted once ready.
+const MigrateStepCreateSurge = "CreateSurge"
+
 // UpdateStepSurge marks the source Instance while a single-pod or gang
 // SurgeThenDrain replacement is being created.
 const UpdateStepSurge = "Surge"
@@ -223,6 +233,15 @@ type InstanceOperation struct {
 	// what the deadline park is anchored to, so the clock stops from the
 	// refusal rather than from the pass that reports it.
 	CapacityRefusedAt *metav1.Time
+
+	// PlacementWaitSince is when the attempt started waiting for its pods
+	// to be placed, recorded once a pod name the attempt needs is held by a
+	// node that stopped reporting (holds/placementwait.go). The hold pass
+	// keeps it while the attempt waits, even as the waiting pod changes,
+	// and clears it once every pod the attempt asks for runs on a node or
+	// the attempt ends. The unschedulable grace is measured from it when it
+	// is earlier than the unplaceable pod's own wait.
+	PlacementWaitSince *metav1.Time
 
 	// Strategy is the update strategy the operation runs under, pinned
 	// when the operation opens and read in place of the live plan for as

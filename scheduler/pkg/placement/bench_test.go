@@ -30,8 +30,8 @@ func BenchmarkChoose(b *testing.B) {
 				// New group each iter (so it takes the O(N) scan + assignment path), then
 				// Release to keep the store at N.
 				g := "new"
-				p.Choose(g, raw, 4)
-				p.Release(g)
+				_, id, _ := p.Choose(Gang{Group: g}, raw, nil, 4)
+				p.Release(g, id, nil)
 			}
 		})
 	}

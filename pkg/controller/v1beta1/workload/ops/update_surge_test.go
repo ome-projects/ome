@@ -18,6 +18,7 @@ import (
 	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
@@ -4574,5 +4575,235 @@ func TestSurgeUpdate_WithdrawnTargetWithNoSourceLeftEndsAsAFreshStart(t *testing
 	}
 	if matched != 1 {
 		t.Fatalf("want one SurgeAbandoned event naming %q, got %v", wantMessage, events)
+	}
+}
+
+// surgeRetryFixture is a single-pod Instance whose attempt at a revision
+// ended on a replacement the kubelet never started: the row is Failed
+// with no operation and its source still serving, the replacement stands
+// at the other slot in the state the test gives it, and the retry
+// schedule has come due, so the next pass opens a fresh attempt over it.
+type surgeRetryFixture struct {
+	isvc        *v1beta1.InferenceService
+	client      client.Client
+	deletes     []recordedDeleteOpts
+	input       workload.ReconcileInput
+	plan        workload.ComponentPlan
+	target      *appsv1.ControllerRevision
+	source      *corev1.Pod
+	replacement *corev1.Pod
+	now         time.Time
+}
+
+// newSurgeRetryFixture seeds the shape with the replacement created
+// replacementAge before the pass and shaped by replacement; the source
+// serves on its own revision, the row names the replacement in its last
+// failure, and the pass's clock reads now.
+func newSurgeRetryFixture(t *testing.T, replacementAge time.Duration, replacement func(*corev1.Pod)) *surgeRetryFixture {
+	t.Helper()
+	legacyResetExpectations(t)
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	isvc, _ := surgeISVCReady("llama-70b", "prod", 1)
+	sourceRevision := "llama-70b-engine-rev-sourcehash"
+	targetRevision := "llama-70b-engine-rev-targethash"
+	replacementName := query.PodName(isvc.Name, workload.ComponentEngine, 0, "default", 1)
+	ir := legacyInstanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
+		Index:           0,
+		Incarnation:     1,
+		Phase:           v1beta1.OMENativeInstanceFailed,
+		RunningRevision: sourceRevision,
+		TargetRevision:  targetRevision,
+		ActiveOrdinal:   0,
+		LastFailure: &v1beta1.InstanceTermination{
+			PodName: replacementName,
+			Reason:  "ImagePullBackOff",
+		},
+	})
+
+	source := surgePodAtOrdinal(isvc, 0, 1, 0, true, true)
+	source.Status.Conditions = append(source.Status.Conditions, corev1.PodCondition{Type: corev1.PodReady, Status: corev1.ConditionTrue})
+	source.UID = k8stypes.UID("source-uid")
+	source.CreationTimestamp = metav1.NewTime(now.Add(-time.Hour))
+	source.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(sourceRevision)
+
+	stale := surgePodAtOrdinal(isvc, 0, 1, 1, false, false)
+	stale.UID = k8stypes.UID("replacement-uid")
+	stale.CreationTimestamp = metav1.NewTime(now.Add(-replacementAge))
+	stale.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(targetRevision)
+	stale.Status.Phase = corev1.PodPending
+	stale.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "main",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+			Reason:  "ImagePullBackOff",
+			Message: "manifest unknown",
+		}},
+	}}
+	if replacement != nil {
+		replacement(stale)
+	}
+
+	f := &surgeRetryFixture{isvc: isvc, source: source, replacement: stale, now: now}
+	funcs := fdDeleteRecorder(&f.deletes)
+	f.client = fdFakeClient(t, &funcs, isvc, ir, source, stale)
+	f.target = makeCR(t, f.client, isvc, targetRevision)
+	f.input = legacyTestInput(isvc, f.client, workload.ComponentEngine)
+	f.input.Clock = clocktesting.NewFakeClock(now)
+	f.input.ObservedState.UpdateRevision = targetRevision
+	f.input.ObservedState.InstanceStatuses[0].LastFailure = &workload.InstanceTermination{
+		PodName: replacementName,
+		Reason:  "ImagePullBackOff",
+	}
+	f.plan = surgePlan()
+	return f
+}
+
+// pass runs one surge pass over the pods the API lists for the Instance.
+func (f *surgeRetryFixture) pass(t *testing.T) {
+	t.Helper()
+	list := &corev1.PodList{}
+	if err := f.client.List(context.Background(), list, client.InNamespace("prod")); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	pods := make([]*corev1.Pod, 0, len(list.Items))
+	for i := range list.Items {
+		pods = append(pods, &list.Items[i])
+	}
+	if _, err := surgeUpdate(context.Background(), legacyTestDeps(f.client), f.input, f.plan, f.plan.Instances[0], f.target, pods); err != nil {
+		t.Fatalf("surgeUpdate: %v", err)
+	}
+}
+
+func (f *surgeRetryFixture) row(t *testing.T) v1beta1.OMENativeInstanceStatus {
+	t.Helper()
+	return legacyInstanceStatusesOnIR(f.client, f.isvc, workload.ComponentEngine)[0]
+}
+
+func (f *surgeRetryFixture) podExists(t *testing.T, pod *corev1.Pod) (*corev1.Pod, bool) {
+	t.Helper()
+	stored := &corev1.Pod{}
+	err := f.client.Get(context.Background(), client.ObjectKeyFromObject(pod), stored)
+	if apierrors.IsNotFound(err) {
+		return nil, false
+	}
+	if err != nil {
+		t.Fatalf("get %s: %v", pod.Name, err)
+	}
+	return stored, true
+}
+
+// TestSurgeUpdate_RetryReplacesTheReplacementThePreviousAttemptFailedOn
+// shows what a retry of a failed surge does with the pod the previous
+// attempt failed on: the attempt opens, the replacement still waiting on
+// its image is deleted with the source serving throughout, and the pass after the deletion is observed builds
+// a fresh replacement. One pod's failure therefore counts once on the
+// retry schedule: the next failure the escalation reads is the fresh
+// pod's, after its own grace.
+func TestSurgeUpdate_RetryReplacesTheReplacementThePreviousAttemptFailedOn(t *testing.T) {
+	f := newSurgeRetryFixture(t, 2*time.Minute, nil)
+
+	f.pass(t)
+
+	row := f.row(t)
+	if row.Phase != v1beta1.OMENativeInstanceUpdating || row.Operation == nil || row.Operation.Step != workload.UpdateStepSurge {
+		t.Fatalf("the retry must open the surge attempt, got phase %q operation %+v", row.Phase, row.Operation)
+	}
+	if len(f.deletes) != 1 || f.deletes[0].name != f.replacement.Name {
+		t.Fatalf("deletes = %+v, want exactly the replacement the previous attempt failed on (%s)", f.deletes, f.replacement.Name)
+	}
+	if _, exists := f.podExists(t, f.replacement); exists {
+		t.Fatalf("the replacement the previous attempt failed on must be gone")
+	}
+	source, exists := f.podExists(t, f.source)
+	if !exists || !podreadiness.IsServing(source) {
+		t.Fatalf("the source must keep serving while the failed replacement is replaced, got exists=%v pod=%+v", exists, source)
+	}
+
+	// The deletion is observed, so the next pass builds the fresh pod
+	// under the same name.
+	workload.DefaultExpectations.Forget("prod", "llama-70b", workload.ComponentEngine, 0)
+	f.input = legacyTestInput(f.isvc, f.client, workload.ComponentEngine)
+	f.input.Clock = clocktesting.NewFakeClock(f.now.Add(5 * time.Second))
+	f.input.ObservedState.UpdateRevision = f.target.Name
+	f.pass(t)
+
+	fresh, exists := f.podExists(t, f.replacement)
+	if !exists {
+		t.Fatalf("the pass after the deletion must build a fresh replacement at the slot")
+	}
+	if fresh.UID == f.replacement.UID {
+		t.Fatalf("the fresh replacement must be a new pod, not the one the previous attempt failed on")
+	}
+	if len(f.deletes) != 1 {
+		t.Fatalf("the fresh replacement must not be deleted by the attempt that built it, deletes = %+v", f.deletes)
+	}
+}
+
+// TestSurgeUpdate_RetryKeepsAReplacementThatHasStarted holds the exception:
+// a replacement the previous attempt failed on that has since started a
+// container is coming up on its own, so the retry adopts it and waits
+// instead of building another.
+func TestSurgeUpdate_RetryKeepsAReplacementThatHasStarted(t *testing.T) {
+	f := newSurgeRetryFixture(t, 2*time.Minute, func(pod *corev1.Pod) {
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "main",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}}
+	})
+
+	f.pass(t)
+
+	row := f.row(t)
+	if row.Phase != v1beta1.OMENativeInstanceUpdating || row.Operation == nil || row.Operation.Step != workload.UpdateStepSurge {
+		t.Fatalf("the retry must open the surge attempt, got phase %q operation %+v", row.Phase, row.Operation)
+	}
+	if len(f.deletes) != 0 {
+		t.Fatalf("a replacement that has started must be kept, got deletes %+v", f.deletes)
+	}
+	if _, exists := f.podExists(t, f.replacement); !exists {
+		t.Fatalf("the started replacement must still stand")
+	}
+}
+
+// TestSurgeUpdate_AnAttemptKeepsItsOwnWaitingReplacement holds the bound
+// of the rule: a replacement built after the attempt opened is the
+// attempt's own, and a waiting reason on it is the escalation's to read
+// after its grace, never the roll's to remove.
+func TestSurgeUpdate_AnAttemptKeepsItsOwnWaitingReplacement(t *testing.T) {
+	f := newSurgeRetryFixture(t, 10*time.Second, nil)
+	// The attempt opened half a minute ago and built the replacement.
+	f.pass(t)
+	workload.DefaultExpectations.Forget("prod", "llama-70b", workload.ComponentEngine, 0)
+	if len(f.deletes) != 1 {
+		t.Fatalf("the opening pass must replace the previous attempt's pod, got deletes %+v", f.deletes)
+	}
+	f.input = legacyTestInput(f.isvc, f.client, workload.ComponentEngine)
+	f.input.Clock = clocktesting.NewFakeClock(f.now.Add(5 * time.Second))
+	f.input.ObservedState.UpdateRevision = f.target.Name
+	f.pass(t)
+	own, exists := f.podExists(t, f.replacement)
+	if !exists {
+		t.Fatalf("the attempt must have built its own replacement")
+	}
+	own.Status.Phase = corev1.PodPending
+	own.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "main",
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "manifest unknown"}},
+	}}
+	if err := f.client.Status().Update(context.Background(), own); err != nil {
+		t.Fatalf("hold the attempt's own replacement in ImagePullBackOff: %v", err)
+	}
+
+	f.input = legacyTestInput(f.isvc, f.client, workload.ComponentEngine)
+	f.input.Clock = clocktesting.NewFakeClock(f.now.Add(10 * time.Minute))
+	f.input.ObservedState.UpdateRevision = f.target.Name
+	f.pass(t)
+
+	if len(f.deletes) != 1 {
+		t.Fatalf("the attempt must keep its own waiting replacement for the escalation, got deletes %+v", f.deletes)
+	}
+	if _, exists := f.podExists(t, f.replacement); !exists {
+		t.Fatalf("the attempt's own replacement must still stand")
 	}
 }

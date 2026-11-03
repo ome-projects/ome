@@ -50,6 +50,20 @@ type InferenceServiceSpec struct {
 	// +optional
 	Decoder *DecoderSpec `json:"decoder,omitempty"`
 
+	// Encoder defines the encoder spec: a pod set that turns a request's
+	// images or audio into embeddings for the engine (prefill), for
+	// encoder-prefill-decode (EPD) disaggregated serving. The runtime moves
+	// the embeddings between encoder and engine pods; OME runs the pods,
+	// tells each side the other's address (OME_ENCODER_* and OME_ENGINE_*
+	// variables) and rolls the encoder as its own Component. Requires
+	// spec.engine, at least one spec.rollout.groups entry, and OMENative for
+	// every declared role, the router included; not allowed beside
+	// spec.placement or spec.routing. Alpha. The API may change without
+	// notice.
+	// +optional
+	// +ome:since=v1.3
+	Encoder *EncoderSpec `json:"encoder,omitempty"`
+
 	// Model defines the model to be used for inference, referencing either a BaseModel or a custom model.
 	// This allows models to be managed independently of the serving configuration.
 	// +optional
@@ -450,6 +464,51 @@ type DecoderSpec struct {
 	// setting this explicitly. Ignored unless TopologySpread is set.
 	// +optional
 	// +ome:since=v1.3
+	TopologySpreadKey *string `json:"topologySpreadKey,omitempty"`
+
+	// AcceleratorOverride allows overriding the global accelerator selection for this component
+	// +optional
+	AcceleratorOverride *AcceleratorSelector `json:"acceleratorOverride,omitempty"`
+}
+
+// EncoderSpec defines the configuration for the Encoder component of an
+// encoder-prefill-decode (EPD) disaggregated deployment: the pods that turn
+// a request's images or audio into embeddings the engine reads. An encoder is
+// a single pod per replica; it has no Leader or Worker.
+type EncoderSpec struct {
+	// This spec provides a full PodSpec for the encoder component.
+	// Allows complete customization of the Kubernetes Pod configuration including
+	// containers, volumes, security contexts, affinity rules, and other pod settings.
+	// +optional
+	PodSpec `json:",inline"`
+
+	// ComponentExtensionSpec defines deployment configuration like min/max replicas, scaling metrics, etc.
+	// Controls scaling behavior and resource allocation for the encoder component.
+	ComponentExtensionSpec `json:",inline"`
+
+	// Runner container override for customizing the main container.
+	// This is essentially a container spec that can override the default container.
+	// Defines the main encoder container configuration, including image,
+	// resource requests/limits, environment variables, and command.
+	// +optional
+	Runner *RunnerSpec `json:"runner,omitempty"`
+
+	// TopologySpread spreads this component's instances across fault
+	// domains so losing one domain (rack / fabric slice / cube) cannot
+	// take out every instance at once. Rendered as a standard
+	// topologySpreadConstraint (maxSkew 1) on each encoder pod. Required
+	// renders as DoNotSchedule; Preferred renders as ScheduleAnyway. Not
+	// part of the revision hash: changing it shapes future placements
+	// without rolling a healthy fleet. Unset keeps pure bin-packing.
+	// +optional
+	// +kubebuilder:validation:Enum=Preferred;Required
+	TopologySpread *TopologySpreadPolicy `json:"topologySpread,omitempty"`
+
+	// TopologySpreadKey is the node-label key naming the fault domains
+	// TopologySpread spreads across. An encoder pod has no co-location key,
+	// so spreading it requires setting this explicitly. Ignored unless
+	// TopologySpread is set.
+	// +optional
 	TopologySpreadKey *string `json:"topologySpreadKey,omitempty"`
 
 	// AcceleratorOverride allows overriding the global accelerator selection for this component

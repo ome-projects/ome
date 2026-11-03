@@ -97,7 +97,8 @@ type InferenceReplicaSpec struct {
 	// +optional
 	ParentRef *ParentReference `json:"parentRef,omitempty"`
 
-	// Component is the role this pod set fills: engine | decoder | router.
+	// Component is the role this pod set fills: engine | decoder | encoder |
+	// router.
 	// Immutable; moving a workload between roles requires recreating the
 	// InferenceReplica.
 	Component ComponentType `json:"component"`
@@ -171,11 +172,12 @@ type InferenceReplicaSpec struct {
 	// PairingProtocol is the engine/decoder wire-compatibility token. It is
 	// folded into the revision hash (a change mints a new revision) and
 	// stamped as the ome.io/pairing-protocol label on rendered pods; nil pairs
-	// with anything. Only engine and decoder replicas pair on it; a change on
-	// any replica still mints a new revision. On a projected replica the
-	// InferenceService controller copies spec.rollout.pairingProtocol onto
-	// the engine and decoder replicas and never onto the router, which must
-	// not re-roll on a protocol change.
+	// with anything. Only engine, decoder and encoder replicas pair on it; a
+	// change on any replica still mints a new revision. On a projected
+	// replica the InferenceService controller copies
+	// spec.rollout.pairingProtocol onto the engine, decoder and encoder
+	// replicas and never onto the router, which must not re-roll on a
+	// protocol change.
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`
@@ -401,9 +403,9 @@ type InferenceReplicaStatus struct {
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// ObservedTemplateHash is the pod-template hash (the ome.io/template-hash
-	// annotation the projector stamps beside the spec's templates) that
+	// annotation the projector writes beside the spec's templates) that
 	// updateRevision was last computed from. It names the roll target this
-	// status describes: a spec whose stamp differs asks for a revision the
+	// status describes: a spec whose template hash differs asks for a revision the
 	// status has not recorded yet, while a spec change outside the templates
 	// leaves both unchanged.
 	// +optional
@@ -763,7 +765,8 @@ const (
 	// NextRetryAt.
 	RetryBlockBackoff RetryBlockState = "Backoff"
 	// RetryBlockHeld: attempts exhausted (or retry unconfigured). Only a
-	// new target revision releases the hold.
+	// new target revision, or the operator release annotation
+	// ome.io/release-held-revision, releases the hold.
 	RetryBlockHeld RetryBlockState = "Held"
 	// RetryBlockRetryInProgress: exactly one retry attempt is authorized
 	// and running.

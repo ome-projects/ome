@@ -15,9 +15,11 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 type backendFixture struct {
+	t           testing.TB
 	source      *v1beta1.InferenceService
 	clusters    []v1beta1.WorkloadCluster
 	connections fakeClusters
@@ -33,7 +35,7 @@ func newBackendFixture(t *testing.T, mode v1beta1.PlacementMode) *backendFixture
 	if mode == v1beta1.PlacementModeSplit || mode == v1beta1.PlacementModeSplitByCapacity {
 		source.Spec.Placement.Split = &v1beta1.SplitSpec{Replicas: ptr.To[int32](2)}
 	}
-	f := &backendFixture{source: source, connections: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}, workers: map[string]client.WithWatch{}}
+	f := &backendFixture{t: t, source: source, connections: fakeClusters{m: map[string]workloadcluster.SelectivelyCachingClient{}}, workers: map[string]client.WithWatch{}}
 	objects := []client.Object{source}
 	scheme := testScheme(t)
 	for _, name := range []string{"member-a", "member-b"} {
@@ -88,7 +90,7 @@ func TestBackendPreflight(t *testing.T) {
 				{name: "registration replaced during resolution", status: corev1.ConditionUnknown, edit: func(t *testing.T, f *backendFixture) {
 					t.Helper()
 					changed := false
-					cl := interceptor.NewClient(f.workers["member-b"], interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+					cl := fakeclient.Wrap(t, f.workers["member-b"], fakeclient.WithInterceptors(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 						if err := c.Get(ctx, key, obj, opts...); err != nil {
 							return err
 						}
@@ -105,7 +107,7 @@ func TestBackendPreflight(t *testing.T) {
 							}
 						}
 						return nil
-					}})
+					}}))
 					f.connections.m["member-b"] = workloadcluster.NewNeverCachingClient(cl)
 				}},
 			} {

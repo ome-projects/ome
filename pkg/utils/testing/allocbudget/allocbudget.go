@@ -55,6 +55,9 @@ type File struct {
 // from the counts Check measured instead of comparing them.
 func Open(t testing.TB, path string, update bool) *File {
 	t.Helper()
+	if raceDetector {
+		t.Skip("allocation counts are not stable under the race detector: sync.Pool drops entries at random")
+	}
 	f := &File{t: t, path: path, update: update, measured: map[string]int64{}}
 	data, err := os.ReadFile(path)
 	if err == nil {
@@ -137,7 +140,7 @@ func recordingNow() Recording {
 }
 
 // goRelease is the toolchain's release, the first word of a runtime.Version
-// string; a build suffix after it is not part of the stamp.
+// string; a build suffix after it is not part of the release.
 func goRelease(version string) string {
 	release, _, _ := strings.Cut(version, " ")
 	return release

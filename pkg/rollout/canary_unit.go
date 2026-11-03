@@ -14,11 +14,12 @@ const canaryTargetIDPrefix = "ct1:"
 
 // CanaryUnit is the smallest set of Components that advance through a canary
 // ladder together, named by its entrypoint Component. The router is its own
-// unit; engine and decoder are one unit, because a P/D pair speaks a pairing
-// protocol to each other and rolling them apart can leave a new-protocol
-// prefill with no pairable peer. A unit is what one canary run owns.
+// unit; every role that pairs (engine, decoder and encoder) joins one unit
+// named by the engine, because they speak a pairing protocol to each other
+// and rolling them apart can leave a new-protocol prefill with no pairable
+// peer. A unit is what one canary run owns.
 func CanaryUnit(c v1beta1.ComponentType) v1beta1.ComponentType {
-	if c == v1beta1.DecoderComponent {
+	if role, ok := v1beta1.RoleOf(c); ok && role.Pairs {
 		return v1beta1.EngineComponent
 	}
 	return c

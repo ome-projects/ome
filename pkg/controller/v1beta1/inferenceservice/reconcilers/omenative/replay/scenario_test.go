@@ -12,7 +12,7 @@ func testVocabulary() Vocabulary {
 			"spec.revision":  {"new", "revert", "rejected"},
 			"ctrl.staleRead": {"missesOpen", "missesClose", "missesRepin", "anchorMissing", "phaseRegressed"},
 			"canary.parked":  {},
-			"record.legacy":  {"noTargetID"},
+			"pod.stableGone": {"last"},
 		},
 		Cells: map[string]struct{}{"run/example-cell": {}},
 	}
@@ -52,7 +52,7 @@ func TestParseRefusesWhatCannotBeStaged(t *testing.T) {
 		"undeclared event":    "      - pod.exploded\n",
 		"undeclared variant":  "      - spec.revision[sideways]: {component: engine, image: x/y:z}\n",
 		"produced event":      "      - canary.parked\n",
-		"unapplied event":     "      - record.legacy[noTargetID]\n",
+		"unapplied event":     "      - pod.stableGone[last]\n",
 		"unknown argument":    "      - spec.revision[new]: {component: engine, image: x/y:z, pod: 1}\n",
 		"clock without value": "      - clock.advance\n",
 	}

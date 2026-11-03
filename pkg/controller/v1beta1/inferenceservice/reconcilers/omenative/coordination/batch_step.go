@@ -41,12 +41,26 @@ import (
 // the new version stays within the group's tolerance of the other side's
 // (pairedBatchPlan). When firstSide names a side, the other side's starts
 // of a batch wait until the named side's new Instances of that batch serve.
+// While the named side's retry record for its target is Held it opens no
+// attempt, so that wait would never end: it reads under the Held gate
+// instead, naming the held side and its record, and the roll is held as a
+// whole until a corrected revision or a release of the record on that side.
 //
 // A member's batches cover the Instances the roll may move: its count less
 // the Instances its partition holds on their revision, read with the same
 // rule the roll holds them by. A member whose movable Instances have all
 // served is done, whatever its partition keeps back, and no peer waits on
 // it; a partition lowered later starts the held Instances as a new batch.
+//
+// A member whose Instances still on their old revision have no partner of
+// that revision left is not paced at all: its pairing peer, which this run
+// moved to a new revision, runs the target on every Instance (its last old
+// Instance rolled, or lost its pod and was rebuilt onto the target), so the
+// batch step holds none of the member's starts and its own budget paces
+// them. A configured ratio tolerance keeps the pacing, since the ratio rule
+// governs then; only the setting's absence releases the member. A peer the
+// run did not move keeps its one revision for both of the member's versions
+// and is never a lost partner.
 //
 // A peer's roll target is read off its own status, which a push reaches
 // one status write after the spec. A peer whose status was not written
@@ -67,9 +81,15 @@ type batchMember struct {
 	held      int32 // Instances the partition keeps on their revision; the roll never moves them
 	step      int32
 	marks     []int32 // the count started after each planned batch; nil means batches of step
+	target    string  // the revision the member moves its Instances to
 	promoted  int32   // Instances running the target revision
+	offTarget int32   // Instances not running it: still to move, moving, ended, held, or awaiting retirement
 	open      int32   // Instances with an update attempt toward the target in flight
 	ended     int32   // Instances whose attempt toward the target ended without serving
+	// heldReason is the member's retry record for the target while it is
+	// Held, in the record's own words: no fresh start opens on the member
+	// until a new revision or an operator release. Empty otherwise.
+	heldReason string
 }
 
 // movable is the number of Instances the roll may move: the desired count
@@ -137,6 +157,10 @@ type batchStep struct {
 	acting    int
 	members   []batchMember
 	firstSide v1beta1.ComponentType
+	// released is true when the acting member's Instances still on their
+	// old revision have no partner of that revision left and no ratio
+	// tolerance is configured: the step then holds none of its starts.
+	released bool
 }
 
 // stepKind is what a member counts its starts in: drains for a drain-first
@@ -239,8 +263,55 @@ func (ctx GateContext) readBatchStep() (batchStep, error) {
 			engine.marks, decoder.marks = pairedBatchPlan(engine.movable(), decoder.movable(), engine.step, decoder.step, *tolerance)
 		}
 	}
+	step.released = ctx.partnerless(step, pair)
 	step.governs = true
 	return step, nil
+}
+
+// partnerless reports whether the acting member's Instances still on their
+// old revision have no partner of that revision left: the member is a
+// pairing side, no ratio tolerance is configured for the group, and its
+// pairing peer, which this run moved to a new revision, runs the target on
+// every Instance with none still to create. A peer with nothing on the
+// target, one still growing to its count, or one whose status predates the
+// push is never read this way.
+func (ctx GateContext) partnerless(step batchStep, pair map[v1beta1.ComponentType]int) bool {
+	me := step.members[step.acting].component
+	if me != v1beta1.EngineComponent && me != v1beta1.DecoderComponent {
+		return false
+	}
+	i, ok := pair[pairingPeer(me)]
+	if !ok || ctx.ratioToleranceConfigured() {
+		return false
+	}
+	peer := step.members[i]
+	return peer.desired > 0 && peer.offTarget == 0 && peer.promoted >= peer.desired && ctx.runMoved(peer.component, peer.target)
+}
+
+// ratioToleranceConfigured reports whether the group has a ratio tolerance
+// to keep: one on its maintainRatio, written or filled from the operator's
+// default, or the operator's default under keepRatio, which plans the
+// batches to it. A tolerance of 100, the band's opt-out, is configured;
+// only the setting's absence is not.
+func (ctx GateContext) ratioToleranceConfigured() bool {
+	return ctx.Group.Pacing.RatioTolerancePercent != nil ||
+		(ctx.Defaults.PrefillDecode.KeepRatio && ctx.Defaults.RatioTolerancePercent != nil)
+}
+
+// runMoved reports whether the active run moves comp to a new revision: the
+// target it records for comp is the revision comp rolls to and differs from
+// the stable revision comp had when the run opened. A run that records a
+// member at the revision it already runs did not move it.
+func (ctx GateContext) runMoved(comp v1beta1.ComponentType, target string) bool {
+	if ctx.ISVC == nil || ctx.ISVC.Status.Rollout == nil || ctx.ISVC.Status.Rollout.ActiveRun == nil {
+		return false
+	}
+	for _, recorded := range ctx.ISVC.Status.Rollout.ActiveRun.TargetRevisions {
+		if recorded.Component == comp {
+			return recorded.Revision != "" && recorded.Revision == query.RevisionHashFromControllerRevisionName(target) && recorded.Revision != recorded.StableRevision
+		}
+	}
+	return false
 }
 
 // batchTolerance is the tolerance the ratio rule sizes batches to: the
@@ -255,10 +326,16 @@ func (ctx GateContext) batchTolerance() *int32 {
 
 // hold answers the acting member's next start, which belongs to batch b:
 // every member's batch b-1 but waived's must have settled first, and the
-// first short, peers before self, names the hold. When a first side is
-// named, a start of the other pairing side also waits until the named
-// side's batch b has settled.
-func (s batchStep) hold(waived v1beta1.ComponentType) (held bool, reason string) {
+// first short, peers before self, names the hold under the Ratio gate.
+// When a first side is named, a start of the other pairing side also
+// waits until the named side's batch b has settled. A wait on the named
+// side while its retry record is Held reads under the Held gate instead
+// (batchStep.wait). A released member is held by neither wait. An empty
+// gate is no hold.
+func (s batchStep) hold(waived v1beta1.ComponentType) (gate v1beta1.RolloutHoldGate, reason string) {
+	if s.released {
+		return "", ""
+	}
 	me := s.members[s.acting]
 	b := me.nextBatch()
 	if b > 1 {
@@ -275,8 +352,7 @@ func (s batchStep) hold(waived v1beta1.ComponentType) (held bool, reason string)
 				continue
 			}
 			if mark := x.mark(b - 1); x.settled() < mark {
-				return true, fmt.Sprintf("%s batch %d waits for %s batch %d to serve (%d of %d serving%s%s)",
-					me.component, b, x.component, b-1, x.promoted, mark, failedNote(x), movableNote(x))
+				return s.wait(me, b, x, b-1, mark)
 			}
 		}
 	}
@@ -286,12 +362,32 @@ func (s batchStep) hold(waived v1beta1.ComponentType) (held bool, reason string)
 				continue
 			}
 			if mark := x.mark(b); x.settled() < mark {
-				return true, fmt.Sprintf("%s batch %d waits for %s batch %d to serve first (%d of %d serving%s%s)",
-					me.component, b, x.component, b, x.promoted, mark, failedNote(x), movableNote(x))
+				return s.wait(me, b, x, b, mark)
 			}
 		}
 	}
-	return false, ""
+	return "", ""
+}
+
+// wait names the acting member's wait on batch `on` of member x, whose
+// settled count is short of mark: under the Ratio gate with the serving
+// count, as "engine batch 2 waits for decoder batch 1 to serve (0 of 1
+// serving)", with "to serve first" when the batch is the member's own,
+// the first-side wait. When x is the named first side and its retry
+// record is Held, nothing of x will serve until the operator acts, so the
+// wait reads under the Held gate and names the side and its record.
+func (s batchStep) wait(me batchMember, b int32, x batchMember, on, mark int32) (v1beta1.RolloutHoldGate, string) {
+	first := ""
+	if on == b {
+		first = " first"
+	}
+	text := fmt.Sprintf("%s batch %d waits for %s batch %d to serve%s (%d of %d serving%s%s)",
+		me.component, b, x.component, on, first, x.promoted, mark, failedNote(x), movableNote(x))
+	if x.heldReason != "" && x.component == s.firstSide && x.component != me.component {
+		return v1beta1.RolloutHoldGateHeld, fmt.Sprintf("%s, and the %s is held: %s; a corrected revision, or a release of the held revision on the %s, resumes both sides",
+			text, x.component, x.heldReason, x.component)
+	}
+	return v1beta1.RolloutHoldGateRatio, text
 }
 
 // failedNote names a member's ended attempts in a hold reason.
@@ -315,9 +411,10 @@ func movableNote(m batchMember) string {
 // The step is the member's own budget of its kind capped by the group's, as
 // the budget gates resolve it. An Instance the partition holds is counted
 // as held and nowhere else. A member with no roll target has nothing to
-// move and reads as settled.
+// move and reads as settled. The member's Held retry record for the
+// target, when one stands, travels with it.
 func readBatchMember(ir *v1beta1.InferenceReplica, comp v1beta1.ComponentType, target string, pacing v1beta1.CoordinationPacing, kind stepKind) batchMember {
-	m := batchMember{component: comp}
+	m := batchMember{component: comp, target: target}
 	if kind == stepSurge {
 		m.desired, m.step = resolveSurgeStep(ir, pacing)
 	} else {
@@ -328,23 +425,40 @@ func readBatchMember(ir *v1beta1.InferenceReplica, comp v1beta1.ComponentType, t
 		m.promoted = m.desired
 		return m
 	}
+	m.heldReason = heldUpdateReason(ir, target)
 	rows := ir.Status.InstanceStatuses
 	held := partitionHeldRows(ir, rows, target)
 	for i := range rows {
 		if held[rows[i].Index] {
 			m.held++
+			m.offTarget++
 			continue
 		}
 		switch classifyBatchRow(&rows[i], target) {
 		case batchRowPromoted:
 			m.promoted++
+			continue
 		case batchRowOpen:
 			m.open++
 		case batchRowEnded:
 			m.ended++
 		}
+		m.offTarget++
 	}
 	return m
+}
+
+// heldUpdateReason is the text of a replica's Held retry record for the
+// revision its roll moves Instances to; empty when no such record stands.
+func heldUpdateReason(ir *v1beta1.InferenceReplica, target string) string {
+	if ir == nil {
+		return ""
+	}
+	block, ok := irprojector.HeldRetryBlock(&ir.Status, target)
+	if !ok {
+		return ""
+	}
+	return irprojector.HeldUpdateReason(block)
 }
 
 // partitionHeldRows is the set of a replica's Instances its partition holds
@@ -498,8 +612,8 @@ func peerStatusPredatesPush(peer, acting *v1beta1.InferenceReplica) bool {
 
 // notYetObserved is the member as the batch step reads it while its status
 // predates the push: its count and step stand, nothing is started toward
-// the target, and no Instance reads held, so a peer waits on its first
-// batch until the status records the push.
+// the target, every Instance reads off it, and no Instance reads held, so
+// a peer waits on its first batch until the status records the push.
 func (m batchMember) notYetObserved() batchMember {
-	return batchMember{component: m.component, desired: m.desired, step: m.step}
+	return batchMember{component: m.component, desired: m.desired, step: m.step, target: m.target, offTarget: m.desired}
 }

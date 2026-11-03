@@ -12,9 +12,9 @@ import (
 	"knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestPlacementReconcileLeavesNonparticipantsUntouched(t *testing.T) {
@@ -43,11 +43,7 @@ func TestPlacementReconcileLeavesNonparticipantsUntouched(t *testing.T) {
 				tt.configure(source)
 			}
 			r, cl := newPlacer(testScheme(t), nil, source)
-			r.Client = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
-				List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
-					return errors.New("nonparticipant listed placement resources")
-				},
-			})
+			r.Client = fakeclient.Wrap(t, cl.(client.WithWatch), fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, errors.New("nonparticipant listed placement resources")))
 			key := client.ObjectKeyFromObject(source)
 			var want v1beta1.InferenceService
 			if err := cl.Get(context.Background(), key, &want); err != nil {

@@ -39,10 +39,10 @@ func TestGangObservationsAreNilSafe(t *testing.T) {
 }
 
 func TestOperationGangHeld(t *testing.T) {
-	if OperationGangHeld(nil) || OperationGangHeld(&InstanceOperation{Waiting: WaitingReasonPaused}) {
+	if OperationWaitingOn(nil, WaitingReasonPodGroupTerminating) || OperationWaitingOn(&InstanceOperation{Waiting: WaitingReasonPaused}, WaitingReasonPodGroupTerminating) {
 		t.Error("only the PodGroup-terminating token is the gang hold")
 	}
-	if !OperationGangHeld(&InstanceOperation{Waiting: WaitingReasonPodGroupTerminating}) {
+	if !OperationWaitingOn(&InstanceOperation{Waiting: WaitingReasonPodGroupTerminating}, WaitingReasonPodGroupTerminating) {
 		t.Error("the token reads as gang-held")
 	}
 }

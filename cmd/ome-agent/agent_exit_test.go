@@ -20,18 +20,20 @@ import (
 func TestRunAgentCommandExit(t *testing.T) {
 	const testCaseEnv = "OME_AGENT_EXIT_TEST_CASE"
 	if testCase := os.Getenv(testCaseEnv); testCase != "" {
-		module := &exitTestAgentModule{name: "replica"}
+		name := "replica"
 		if strings.HasPrefix(testCase, "other-agent-") {
-			module.name = "serving-agent"
+			name = "serving-agent"
 		}
+		var options []fx.Option
 		if testCase == "completed-with-stop-error" {
-			module.options = []fx.Option{fx.Invoke(func(lc fx.Lifecycle) {
+			options = []fx.Option{fx.Invoke(func(lc fx.Lifecycle) {
 				lc.Append(fx.Hook{OnStop: func(context.Context) error {
 					return errors.New("cleanup failed")
 				}})
 			})}
 		}
-		runAgentCommand(&cobra.Command{}, module, func() error {
+		var shutdown func() error
+		row := exitTestRow(name, func() error {
 			switch testCase {
 			case "completed", "completed-with-stop-error":
 				return nil
@@ -39,13 +41,16 @@ func TestRunAgentCommandExit(t *testing.T) {
 				return errors.New("replication failed")
 			default:
 				// Request the same zero-code shutdown as SIGTERM while the
-				// action is unfinished, without racing OS signal registration.
-				if err := module.shutdown(); err != nil {
+				// agent is unfinished, without racing OS signal registration.
+				if err := shutdown(); err != nil {
 					return err
 				}
 				select {}
 			}
-		})
+		}, &shutdown, options...)
+		if err := runAgentCommand(&cobra.Command{}, row); err != nil {
+			exitWithError(err)
+		}
 		return
 	}
 
@@ -83,19 +88,19 @@ func TestRunAgentCommandCompletesBeforeStopping(t *testing.T) {
 	for _, name := range []string{"replica", "serving-agent"} {
 		t.Run(name, func(t *testing.T) {
 			var actionCalls, stopCalls atomic.Int32
-			module := &exitTestAgentModule{name: name}
-			module.options = []fx.Option{fx.Invoke(func(lc fx.Lifecycle) {
+			var shutdown func() error
+			row := exitTestRow(name, func() error {
+				actionCalls.Add(1)
+				return nil
+			}, &shutdown, fx.Invoke(func(lc fx.Lifecycle) {
 				lc.Append(fx.Hook{OnStop: func(context.Context) error {
 					assert.Equal(t, int32(1), actionCalls.Load(), "action must finish before cleanup starts")
 					stopCalls.Add(1)
 					return nil
 				}})
-			})}
+			}))
 
-			runAgentCommand(&cobra.Command{}, module, func() error {
-				actionCalls.Add(1)
-				return nil
-			})
+			assert.NoError(t, runAgentCommand(&cobra.Command{}, row))
 
 			assert.Equal(t, int32(1), actionCalls.Load(), "action must execute exactly once")
 			assert.Equal(t, int32(1), stopCalls.Load(), "command must wait for cleanup before returning")
@@ -103,21 +108,17 @@ func TestRunAgentCommandCompletesBeforeStopping(t *testing.T) {
 	}
 }
 
-type exitTestAgentModule struct {
-	name     string
-	shutdown func() error
-	options  []fx.Option
-}
-
-func (m *exitTestAgentModule) Name() string                    { return m.name }
-func (m *exitTestAgentModule) ShortDescription() string        { return "" }
-func (m *exitTestAgentModule) LongDescription() string         { return "" }
-func (m *exitTestAgentModule) ConfigureCommand(*cobra.Command) {}
-func (m *exitTestAgentModule) Start() error                    { return nil }
-func (m *exitTestAgentModule) FxModules() []fx.Option {
-	return append([]fx.Option{
-		fx.Provide(zap.NewNop),
-		fx.NopLogger,
-		fx.Invoke(func(sh fx.Shutdowner) { m.shutdown = func() error { return sh.Shutdown() } }),
-	}, m.options...)
+// exitTestRow is a command named name that runs action, with no fx log output
+// and no logger of its own. *shutdown is set to the application's Shutdowner
+// once fx has built it.
+func exitTestRow(name string, action func() error, shutdown *func() error, options ...fx.Option) command {
+	return command{
+		name: name,
+		modules: append([]fx.Option{
+			fx.Provide(zap.NewNop),
+			fx.NopLogger,
+			fx.Invoke(func(sh fx.Shutdowner) { *shutdown = func() error { return sh.Shutdown() } }),
+		}, options...),
+		runs: agent{populate: fx.Options(), start: action},
+	}
 }

@@ -2,6 +2,7 @@ package routing
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
 	"time"
@@ -74,7 +75,7 @@ func NewTrafficMapPublisher(
 		return nil, fmt.Errorf("TrafficMap publisher %q is not compiled into this manager (available: %v)",
 			cfg.Name, RegisteredTrafficMapPublishers())
 	}
-	cfg.Options = cloneStringMap(cfg.Options)
+	cfg.Options = maps.Clone(cfg.Options)
 	publisher, err := factory(cfg, kubeClient, apiReader)
 	if err != nil {
 		return nil, fmt.Errorf("configure TrafficMap publisher %q: %w", cfg.Name, err)
@@ -87,7 +88,7 @@ func NewTrafficMapPublisher(
 			cfg.Name, publisher.Publisher.Name())
 	}
 	publisher.ResyncInterval = cfg.ResyncInterval
-	publisher.GlobalOptions = cloneStringMap(publisher.GlobalOptions)
+	publisher.GlobalOptions = maps.Clone(publisher.GlobalOptions)
 	return publisher, nil
 }
 

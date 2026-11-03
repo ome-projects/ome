@@ -13,13 +13,8 @@ package autoscalerpolicy
 import (
 	"context"
 	"fmt"
-	"net/http"
-	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
-	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -28,15 +23,14 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler"
 	"sigs.k8s.io/ome/pkg/validation"
+	"sigs.k8s.io/ome/pkg/webhook/admission/policyguard"
 )
 
 var log = logf.Log.WithName("autoscalerpolicy-validation-webhook")
 
-// maxNamedReferencingComponents caps how many referencing components the
-// in-use deletion error enumerates. The denial itself covers every
-// consumer; the cap only keeps the message readable when a policy serves a
-// large fleet.
-const maxNamedReferencingComponents = 10
+// maxNamedReferencingComponents is the cap the shared guard puts on the
+// components an in-use deletion denial names.
+const maxNamedReferencingComponents = policyguard.MaxNamedReferences
 
 // +kubebuilder:webhook:verbs=create;update;delete,path=/validate-ome-io-v1beta1-autoscalerpolicy,mutating=false,failurePolicy=fail,groups=ome.io,resources=autoscalerpolicies,versions=v1beta1,name=autoscalerpolicy.ome-webhook-server.validator,sideEffects=None,admissionReviewVersions=v1
 
@@ -55,128 +49,48 @@ type Validator struct {
 func (v *Validator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	switch req.Operation {
 	case admissionv1.Create, admissionv1.Update:
-		return v.validateWrite(req)
+		if _, earlyResponse := v.guard().ValidateWrite(req); earlyResponse != nil {
+			return *earlyResponse
+		}
+		return admission.Allowed("")
 	case admissionv1.Delete:
-		return v.validateDelete(ctx, req)
+		return v.guard().ValidateDelete(ctx, req)
 	default:
 		return admission.Allowed("")
 	}
 }
 
-// validateWrite rejects a CREATE/UPDATE carrying any spec issue. All
-// findings are joined into one denial so the operator sees the full list
-// in a single rejected write.
-func (v *Validator) validateWrite(req admission.Request) admission.Response {
-	policy := &v1beta1.AutoscalerPolicy{}
-	if err := v.Decoder.Decode(req, policy); err != nil {
-		log.Error(err, "Failed to decode AutoscalerPolicy", "name", req.Name, "namespace", req.Namespace)
-		return admission.Errored(http.StatusBadRequest, err)
+// guard binds the admission rules the policy kinds share to this kind.
+func (v *Validator) guard() policyguard.Guard[*v1beta1.AutoscalerPolicy] {
+	return policyguard.Guard[*v1beta1.AutoscalerPolicy]{
+		Client:  v.Client,
+		Decoder: v.Decoder,
+		Log:     log,
+		Kind:    constants.AutoscalerPolicyKind,
+		New:     func() *v1beta1.AutoscalerPolicy { return &v1beta1.AutoscalerPolicy{} },
+		ValidateSpec: func(policy *v1beta1.AutoscalerPolicy) error {
+			return validation.ValidateAutoscalerPolicySpec(&policy.Spec)
+		},
+		Referencing: v.referencingComponents,
+		Referent:    "component",
 	}
-	if err := validation.ValidateAutoscalerPolicySpec(&policy.Spec); err != nil {
-		return admission.Denied(err.Error())
-	}
-	return admission.Allowed("")
-}
-
-// validateDelete denies deletion while any InferenceService component in
-// the namespace references the policy. Exemptions, each of which admits:
-// zero references; the break-glass annotation (set by a prior, reviewable
-// update); a terminating or absent namespace (teardown deletes objects in
-// arbitrary order and must not wedge); the policy itself already gone.
-func (v *Validator) validateDelete(ctx context.Context, req admission.Request) admission.Response {
-	policy, earlyResponse := v.deletedPolicy(ctx, req)
-	if earlyResponse != nil {
-		return *earlyResponse
-	}
-
-	if policy.Annotations[constants.AutoscalerPolicyAllowInUseDelete] == "true" {
-		return admission.Allowed(fmt.Sprintf("in-use deletion allowed by the %s annotation", constants.AutoscalerPolicyAllowInUseDelete))
-	}
-
-	namespace := &corev1.Namespace{}
-	if err := v.Client.Get(ctx, types.NamespacedName{Name: policy.Namespace}, namespace); err != nil {
-		if apierrors.IsNotFound(err) {
-			return admission.Allowed("namespace is gone; nothing can reference the policy")
-		}
-		log.Error(err, "Failed to get namespace for AutoscalerPolicy deletion", "name", policy.Name, "namespace", policy.Namespace)
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	if namespace.Status.Phase == corev1.NamespaceTerminating || !namespace.DeletionTimestamp.IsZero() {
-		return admission.Allowed("namespace is terminating; teardown deletes objects in arbitrary order")
-	}
-
-	referencing, err := v.referencingComponents(ctx, policy)
-	if err != nil {
-		log.Error(err, "Failed to list InferenceServices for AutoscalerPolicy deletion", "name", policy.Name, "namespace", policy.Namespace)
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-	if len(referencing) == 0 {
-		return admission.Allowed("")
-	}
-
-	named := referencing
-	overflow := ""
-	if len(referencing) > maxNamedReferencingComponents {
-		named = referencing[:maxNamedReferencingComponents]
-		overflow = fmt.Sprintf(" and %d more", len(referencing)-maxNamedReferencingComponents)
-	}
-	return admission.Denied(fmt.Sprintf(
-		"AutoscalerPolicy %q is referenced by %d component(s): %s%s; remove the refs first, or set the %s=%q annotation to force deletion",
-		policy.Name, len(referencing), strings.Join(named, ", "), overflow,
-		constants.AutoscalerPolicyAllowInUseDelete, "true",
-	))
-}
-
-// deletedPolicy materializes the policy under deletion. The API server
-// usually sends the object in OldObject, but a DELETE request may arrive
-// with an empty payload — then the policy is fetched by name, and a
-// NotFound admits outright (deleting an already-gone object must never
-// wedge). A non-nil response short-circuits the caller.
-func (v *Validator) deletedPolicy(ctx context.Context, req admission.Request) (*v1beta1.AutoscalerPolicy, *admission.Response) {
-	policy := &v1beta1.AutoscalerPolicy{}
-	if len(req.OldObject.Raw) > 0 {
-		if err := v.Decoder.DecodeRaw(req.OldObject, policy); err != nil {
-			log.Error(err, "Failed to decode AutoscalerPolicy under deletion", "name", req.Name, "namespace", req.Namespace)
-			response := admission.Errored(http.StatusBadRequest, err)
-			return nil, &response
-		}
-	} else {
-		if err := v.Client.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: req.Name}, policy); err != nil {
-			if apierrors.IsNotFound(err) {
-				response := admission.Allowed("policy is already gone")
-				return nil, &response
-			}
-			log.Error(err, "Failed to get AutoscalerPolicy under deletion", "name", req.Name, "namespace", req.Namespace)
-			response := admission.Errored(http.StatusInternalServerError, err)
-			return nil, &response
-		}
-	}
-	// The request coordinates are authoritative; a decoded object may lack
-	// them when the payload carries no metadata.
-	if policy.Name == "" {
-		policy.Name = req.Name
-	}
-	if policy.Namespace == "" {
-		policy.Namespace = req.Namespace
-	}
-	return policy, nil
 }
 
 // referencingComponents lists every same-namespace InferenceService
 // component whose autoscalerPolicyRef names this policy, as
 // "<isvc>/<component>" in stable order (ISVCs in list order, components
 // engine, decoder, router).
-func (v *Validator) referencingComponents(ctx context.Context, policy *v1beta1.AutoscalerPolicy) ([]string, error) {
+func (v *Validator) referencingComponents(ctx context.Context, namespace, name string) ([]string, error) {
 	consumers := &v1beta1.InferenceServiceList{}
-	if err := v.Client.List(ctx, consumers, client.InNamespace(policy.Namespace)); err != nil {
+	if err := v.Client.List(ctx, consumers, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
 	var referencing []string
 	for i := range consumers.Items {
 		isvc := &consumers.Items[i]
-		for _, componentType := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+		for _, componentType := range validation.ComponentRoles {
 			ref := autoscaler.ComponentPolicyRef(isvc, componentType)
-			if ref == nil || ref.Name != policy.Name {
+			if ref == nil || ref.Name != name {
 				continue
 			}
 			// A reserved cluster-scoped kind cannot name this namespaced

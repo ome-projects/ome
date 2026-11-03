@@ -391,12 +391,8 @@ func checkUnreachable(t *Tree, found Violations) Violations {
 				break
 			}
 		}
-		vs = append(vs, Violation{
-			Node:    n.Name(),
-			Reason:  v1beta1.AcceleratorQuotaReasonUnreachable,
-			Subject: cause,
-			Message: fmt.Sprintf("node has no position in the tree because ancestor %q is unresolved", cause),
-		})
+		vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonUnreachable, cause,
+			"node has no position in the tree because ancestor %q is unresolved", cause))
 	}
 	return vs
 }
@@ -408,12 +404,8 @@ func checkDepth(t *Tree, maxDepth int) Violations {
 	var vs Violations
 	for _, n := range t.Nodes() {
 		if n.Depth > maxDepth {
-			vs = append(vs, Violation{
-				Node:   n.Name(),
-				Reason: v1beta1.AcceleratorQuotaReasonDepthExceeded,
-				Message: fmt.Sprintf("node is %d levels below the root, exceeding the configured maximum of %d",
-					n.Depth, maxDepth),
-			})
+			vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonDepthExceeded, "",
+				"node is %d levels below the root, exceeding the configured maximum of %d", n.Depth, maxDepth))
 		}
 	}
 	return vs
@@ -426,68 +418,71 @@ func checkDepth(t *Tree, maxDepth int) Violations {
 func checkNodeKind(t *Tree) Violations {
 	var vs Violations
 	for _, n := range t.Nodes() {
-		spec := &n.Quota.Spec
 		switch n.Role() {
 		case v1beta1.AcceleratorQuotaRoleClusterQueue:
-			// The violation belongs to the child that attached itself, not to
-			// the leaf it attached to: a third party must not be able to freeze
-			// someone else's live tenant by creating a node under it.
-			for _, c := range n.Children {
-				vs = append(vs, Violation{
-					Node:    c.Name(),
-					Reason:  v1beta1.AcceleratorQuotaReasonNodeKindInvalid,
-					Subject: n.Name(),
-					Message: fmt.Sprintf("parent %q is a ClusterQueue node, which takes no children; "+
-						"attach to a Cohort, or add a ClusterQueue leaf beside it instead", n.Name()),
-				})
-			}
-			if len(spec.Budgets) == 0 {
-				vs = append(vs, Violation{
-					Node:    n.Name(),
-					Reason:  v1beta1.AcceleratorQuotaReasonNodeKindInvalid,
-					Message: "a ClusterQueue node must carry at least one budget",
-				})
-			}
+			vs = append(vs, checkClusterQueueNode(n)...)
 		case v1beta1.AcceleratorQuotaRoleCohort:
-			var set []string
-			if spec.PriorityTier != "" {
-				set = append(set, "priorityTier")
-			}
-			if spec.Distribution != nil {
-				set = append(set, "distribution")
-			}
-			if len(set) > 0 {
-				vs = append(vs, Violation{
-					Node:    n.Name(),
-					Reason:  v1beta1.AcceleratorQuotaReasonNodeKindInvalid,
-					Subject: strings.Join(set, ","),
-					Message: fmt.Sprintf("a Cohort node must not set %s; no workload binds to a grouping",
-						strings.Join(set, ", ")),
-				})
-			}
-			for _, b := range spec.Budgets {
-				if b.Policy == "" && b.BorrowingLimit == nil && b.LendingLimit == nil && len(b.PerCluster) == 0 {
-					continue
-				}
-				key := budgetKey(b.ResourceName, b.ResourceFlavor)
-				vs = append(vs, Violation{
-					Node:    n.Name(),
-					Reason:  v1beta1.AcceleratorQuotaReasonNodeKindInvalid,
-					Subject: key,
-					Message: fmt.Sprintf("budget %s carries leaf-only fields; a Cohort budget is an authoring "+
-						"guardrail that never materializes, so it holds only resourceName, resourceFlavor, and nominal",
-						key),
-				})
-			}
+			vs = append(vs, checkCohortNode(n)...)
 		default:
-			vs = append(vs, Violation{
-				Node:    n.Name(),
-				Reason:  v1beta1.AcceleratorQuotaReasonNodeKindInvalid,
-				Message: fmt.Sprintf("unknown role %q", n.Role()),
-			})
+			vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonNodeKindInvalid, "",
+				"unknown role %q", n.Role()))
 		}
 	}
 	return vs
+}
+
+// checkClusterQueueNode reports the violations of a ClusterQueue node, which
+// takes no children and carries at least one budget.
+func checkClusterQueueNode(n *Node) Violations {
+	var vs Violations
+	// The violation belongs to the child that attached itself, not to the leaf
+	// it attached to: a third party must not be able to freeze someone else's
+	// live tenant by creating a node under it.
+	for _, c := range n.Children {
+		vs = append(vs, violation(c.Name(), v1beta1.AcceleratorQuotaReasonNodeKindInvalid, n.Name(),
+			"parent %q is a ClusterQueue node, which takes no children; "+
+				"attach to a Cohort, or add a ClusterQueue leaf beside it instead", n.Name()))
+	}
+	if len(n.Quota.Spec.Budgets) == 0 {
+		vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonNodeKindInvalid, "",
+			"a ClusterQueue node must carry at least one budget"))
+	}
+	return vs
+}
+
+// checkCohortNode reports the violations of a Cohort node: no workload binds
+// to a grouping, so it sets neither priorityTier nor distribution, and its
+// budgets hold only resourceName, resourceFlavor and nominal.
+func checkCohortNode(n *Node) Violations {
+	var vs Violations
+	spec := &n.Quota.Spec
+	var set []string
+	if spec.PriorityTier != "" {
+		set = append(set, "priorityTier")
+	}
+	if spec.Distribution != nil {
+		set = append(set, "distribution")
+	}
+	if len(set) > 0 {
+		vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonNodeKindInvalid, strings.Join(set, ","),
+			"a Cohort node must not set %s; no workload binds to a grouping", strings.Join(set, ", ")))
+	}
+	for _, b := range spec.Budgets {
+		if !carriesLeafOnlyFields(b) {
+			continue
+		}
+		key := budgetKey(b.ResourceName, b.ResourceFlavor)
+		vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonNodeKindInvalid, key,
+			"budget %s carries leaf-only fields; a Cohort budget is an authoring "+
+				"guardrail that never materializes, so it holds only resourceName, resourceFlavor, and nominal", key))
+	}
+	return vs
+}
+
+// carriesLeafOnlyFields reports whether a budget sets a field that only a
+// ClusterQueue budget may hold.
+func carriesLeafOnlyFields(b v1beta1.AcceleratorBudget) bool {
+	return b.Policy != "" || b.BorrowingLimit != nil || b.LendingLimit != nil || len(b.PerCluster) > 0
 }
 
 // checkContainment enforces parent nominal >= sum of children's nominal, per
@@ -528,13 +523,8 @@ func checkContainment(t *Tree) Violations {
 				continue
 			}
 			if b.Nominal.Cmp(*sum) < 0 {
-				vs = append(vs, Violation{
-					Node:    n.Name(),
-					Reason:  v1beta1.AcceleratorQuotaReasonContainmentViolated,
-					Subject: k,
-					Message: fmt.Sprintf("budget %s is %s but its children total %s",
-						k, b.Nominal.String(), sum.String()),
-				})
+				vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonContainmentViolated, k,
+					"budget %s is %s but its children total %s", k, b.Nominal.String(), sum.String()))
 			}
 		}
 	}

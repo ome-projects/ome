@@ -813,6 +813,18 @@ func TestScore(t *testing.T) {
 			},
 			expectedScore: 0, // AutoSelect is false, so score is 0
 		},
+		{
+			// A format that leaves autoSelect unset is not offered for
+			// automatic selection, so it adds nothing to the score.
+			name: "format that leaves autoSelect unset does not count",
+			runtime: &v1beta1.ServingRuntimeSpec{
+				SupportedModelFormats: []v1beta1.SupportedModelFormat{
+					{ModelFormat: &v1beta1.ModelFormat{Name: "safetensors", Weight: 10}},
+				},
+			},
+			baseModel:     &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "safetensors"}},
+			expectedScore: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1472,4 +1484,106 @@ func TestValidateRuntime_NilModelReturnsError(t *testing.T) {
 	err := selector.ValidateRuntime(context.Background(), "some-runtime", nil, isvc)
 	assert.Error(t, err)
 	assert.IsType(t, &ModelValidationError{}, err)
+}
+
+// A runtime offers a format for automatic selection only by marking it
+// autoSelect: true. The ranking and the rendered format read that mark the
+// same way: a runtime whose only fitting format leaves it unset is not
+// chosen, so a runtime that opted in wins, and alone it leaves the service
+// without a runtime rather than with one that renders no format.
+func TestSelectRuntime_OnlyFittingFormatLeavesAutoSelectUnset_OptedInRuntimeWins(t *testing.T) {
+	model := &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "safetensors"}}
+	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"}}
+	// Opted in for onnx only; the safetensors entry leaves autoSelect unset.
+	notOptedIn := &v1beta1.ServingRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "a-runtime", Namespace: "default"},
+		Spec: v1beta1.ServingRuntimeSpec{SupportedModelFormats: []v1beta1.SupportedModelFormat{
+			{ModelFormat: &v1beta1.ModelFormat{Name: "onnx", Weight: 10}, AutoSelect: ptr(true)},
+			{ModelFormat: &v1beta1.ModelFormat{Name: "safetensors", Weight: 10}},
+		}},
+	}
+	optedIn := &v1beta1.ServingRuntime{
+		ObjectMeta: metav1.ObjectMeta{Name: "b-runtime", Namespace: "default"},
+		Spec: v1beta1.ServingRuntimeSpec{SupportedModelFormats: []v1beta1.SupportedModelFormat{
+			{ModelFormat: &v1beta1.ModelFormat{Name: "safetensors", Weight: 10}, AutoSelect: ptr(true)},
+		}},
+	}
+	ctx := context.Background()
+
+	t.Run("the runtime that opted in wins", func(t *testing.T) {
+		fakeClient := fakeclient.New(t)
+		assert.NoError(t, fakeClient.Create(ctx, notOptedIn.DeepCopy()))
+		assert.NoError(t, fakeClient.Create(ctx, optedIn.DeepCopy()))
+		selector := New(fakeClient)
+
+		selection, err := selector.SelectRuntime(ctx, model, isvc)
+		if assert.NoError(t, err) {
+			assert.Equal(t, "b-runtime", selection.Name)
+			rendered := selector.GetSupportedModelFormat(ctx, selection.Spec, model, false)
+			if assert.NotNil(t, rendered, "the chosen runtime renders the format it was chosen by") {
+				assert.Equal(t, "safetensors", rendered.ModelFormat.Name)
+			}
+		}
+	})
+
+	t.Run("alone it is not chosen", func(t *testing.T) {
+		fakeClient := fakeclient.New(t)
+		assert.NoError(t, fakeClient.Create(ctx, notOptedIn.DeepCopy()))
+		selector := New(fakeClient)
+
+		selection, err := selector.SelectRuntime(ctx, model, isvc)
+		if !assert.IsType(t, &NoRuntimeFoundError{}, err) && selection != nil {
+			t.Logf("chosen %s, rendered format %v", selection.Name, selector.GetSupportedModelFormat(ctx, selection.Spec, model, false))
+		}
+	})
+}
+
+// An auto-selected runtime renders the format that gave it its score. The
+// ranking scores each format at its own priority, so the rendered format is
+// read the same way; a named runtime overrides the priorities and keeps the
+// default for every format.
+func TestGetSupportedModelFormat_AutoSelectedRuntime_RendersTheScoringFormat(t *testing.T) {
+	tensorParallel := func(size int64) map[string]*v1beta1.AcceleratorModelConfig {
+		return map[string]*v1beta1.AcceleratorModelConfig{
+			"class-a": {TensorParallelismOverride: &v1beta1.TensorParallelismConfig{TensorParallelSize: ptr(size)}},
+		}
+	}
+	renderedTensorParallel := func(format *v1beta1.SupportedModelFormat) int64 {
+		return *format.AcceleratorConfig["class-a"].TensorParallelismOverride.TensorParallelSize
+	}
+	runtime := &v1beta1.ServingRuntimeSpec{SupportedModelFormats: []v1beta1.SupportedModelFormat{
+		{
+			ModelFormat:       &v1beta1.ModelFormat{Name: "safetensors", Weight: 10},
+			AutoSelect:        ptr(true),
+			Priority:          ptr(int32(3)),
+			AcceleratorConfig: tensorParallel(8),
+		},
+		{
+			ModelFormat:       &v1beta1.ModelFormat{Name: "safetensors", Weight: 20},
+			AutoSelect:        ptr(true),
+			Priority:          ptr(int32(1)),
+			AcceleratorConfig: tensorParallel(4),
+		},
+	}}
+	model := &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "safetensors"}}
+	selector := New(fakeclient.New(t)).(*defaultSelector)
+	ctx := context.Background()
+
+	score, err := selector.scorer.CalculateScore(runtime, model)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(30), score, "the ranking scores the priority 3 format: 10 x 3")
+
+	t.Run("auto-selected runtime renders the priority 3 format", func(t *testing.T) {
+		rendered := selector.GetSupportedModelFormat(ctx, runtime, model, false)
+		if assert.NotNil(t, rendered) {
+			assert.Equal(t, int64(8), renderedTensorParallel(rendered))
+		}
+	})
+
+	t.Run("named runtime keeps the default priority", func(t *testing.T) {
+		rendered := selector.GetSupportedModelFormat(ctx, runtime, model, true)
+		if assert.NotNil(t, rendered) {
+			assert.Equal(t, int64(4), renderedTensorParallel(rendered))
+		}
+	})
 }

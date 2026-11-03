@@ -1,7 +1,6 @@
 package main
 
 import (
-	"github.com/spf13/cobra"
 	"go.uber.org/fx"
 
 	"sigs.k8s.io/ome/internal/ome-agent/enigma"
@@ -14,56 +13,15 @@ import (
 	ocivault "sigs.k8s.io/ome/pkg/vault/vault"
 )
 
-// EnigmaAgent implements the AgentModule interface for enigma agent
-type EnigmaAgent struct {
-	agent *enigma.Enigma
-}
-
-// Name returns the name of the agent
-func (e *EnigmaAgent) Name() string {
-	return "enigma"
-}
-
-// ShortDescription returns a short description of the agent
-func (e *EnigmaAgent) ShortDescription() string {
-	return "Run OME Enigma Agent"
-}
-
-// LongDescription returns a detailed description of the agent
-func (e *EnigmaAgent) LongDescription() string {
-	return "OME Agent Enigma is dedicated for model encryption and decryption."
-}
-
-// ConfigureCommand configures the agent command
-func (e *EnigmaAgent) ConfigureCommand(cmd *cobra.Command) {
-	// Set the default action for this command
-	cmd.Run = func(cmd *cobra.Command, args []string) {
-		runAgentCommand(cmd, e, e.Start)
-	}
-}
-
-// FxModules returns the fx modules needed by this agent
-func (e *EnigmaAgent) FxModules() []fx.Option {
-	return []fx.Option{
-		kmsvault.Module,
-		kmscrypto.Module,
-		kmsmgm.Module,
-		ocisecret.Module,
-		ocivault.Module,
-		afero.Module,
-		logging.Module,
-		logging.ModuleNamed("another_log"),
-		enigma.Module,
-		fx.Populate(&e.agent),
-	}
-}
-
-// Start starts the agent
-func (e *EnigmaAgent) Start() error {
-	return e.agent.Start()
-}
-
-// NewEnigmaAgent creates a new enigma agent
-func NewEnigmaAgent() *EnigmaAgent {
-	return &EnigmaAgent{}
+// enigmaCommand runs the enigma agent, which encrypts and decrypts model
+// weights with keys held in a vault. main registers it beside the commands table.
+var enigmaCommand = command{
+	name:  "enigma",
+	short: "Run OME Enigma Agent",
+	long:  "OME Agent Enigma is dedicated for model encryption and decryption.",
+	modules: []fx.Option{
+		kmsvault.Module, kmscrypto.Module, kmsmgm.Module, ocisecret.Module, ocivault.Module,
+		afero.Module, logging.Module, logging.ModuleNamed("another_log"), enigma.Module,
+	},
+	runs: fxBuilt[*enigma.Enigma](),
 }

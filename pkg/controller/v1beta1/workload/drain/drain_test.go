@@ -8,28 +8,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
-// newDrainTestClient builds a fake controller-runtime client with the
-// scheme drain.go reads from (corev1 + discoveryv1).
+// newDrainTestClient builds the fake client the drain tests read Pods and
+// EndpointSlices from.
 func newDrainTestClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
-	if err := discoveryv1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add discoveryv1: %v", err)
-	}
-	return fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(objs...).
-		Build()
+	return fakeclient.New(t, fakeclient.WithObjects(objs...))
 }
 
 func testPod(namespace, name string) *corev1.Pod {

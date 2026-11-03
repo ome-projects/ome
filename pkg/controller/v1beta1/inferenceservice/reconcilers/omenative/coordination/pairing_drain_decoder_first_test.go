@@ -8,10 +8,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // A pairing-protocol change, pair-v1 to pair-v2, on a service whose
@@ -99,6 +99,6 @@ func TestEvaluatePairingDrain_TheOldDecodePodStaysUntilAPrefillOfTheNewProtocolS
 // defaults, about the next start of component from the pair-v1 revision.
 func decoderFirstStart(t *testing.T, isvc *v1beta1.InferenceService, defaults GroupDefaults, component v1beta1.ComponentType, strategy workloadtypes.UpdateStrategyType, objs ...client.Object) (bool, v1beta1.RolloutHoldGate, string) {
 	t.Helper()
-	c := fake.NewClientBuilder().WithScheme(drainScheme(t)).WithObjects(objs...).Build()
+	c := fakeclient.New(t, fakeclient.WithObjects(objs...))
 	return EvaluateUpdateGate(context.Background(), c, isvc, component, "llama-"+string(component)+"-v1", forwardTarget(isvc, component), nil, defaults, strategy, 0, 0)
 }

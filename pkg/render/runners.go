@@ -1,6 +1,8 @@
 package render
 
 import (
+	"maps"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -27,8 +29,9 @@ type Templates struct {
 // and the other identity fields are dropped so the owner's identity never
 // reaches the pods.
 func TemplateObjectMeta(meta metav1.ObjectMeta, ext *v1beta1.ComponentExtensionSpec) metav1.ObjectMeta {
-	labels := copyMap(meta.Labels)
-	annotations := copyMap(meta.Annotations)
+	// A nil map stays nil, so absent and empty labels stay distinct.
+	labels := maps.Clone(meta.Labels)
+	annotations := maps.Clone(meta.Annotations)
 	if ext != nil {
 		if len(ext.Labels) > 0 {
 			if labels == nil {
@@ -73,19 +76,6 @@ func Runners(t Templates, ext *v1beta1.ComponentExtensionSpec) []v1beta1.Runner 
 			Size:     int32(t.WorkerSize),
 			Template: corev1.PodTemplateSpec{ObjectMeta: tmplMeta, Spec: *t.Worker},
 		})
-	}
-	return out
-}
-
-// copyMap returns a shallow copy of in; a nil map copies to nil so callers
-// keep the distinction between absent and empty labels.
-func copyMap(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
 	}
 	return out
 }

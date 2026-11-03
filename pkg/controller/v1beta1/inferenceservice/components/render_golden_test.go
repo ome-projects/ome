@@ -81,6 +81,8 @@ type goldenCase struct {
 	wantWorkerEnv    map[string]string
 	wantNodeSelector map[string]string
 	wantGPU          string
+	// wantNodeAffinity is the primary's whole node affinity.
+	wantNodeAffinity *corev1.NodeAffinity
 }
 
 func goldenResources(quantity string) corev1.ResourceRequirements {
@@ -138,6 +140,8 @@ func goldenService(component v1beta1.ComponentType) *v1beta1.InferenceService {
 	switch component {
 	case v1beta1.DecoderComponent:
 		svc.Spec.Decoder = &v1beta1.DecoderSpec{}
+	case v1beta1.EncoderComponent:
+		svc.Spec.Encoder = &v1beta1.EncoderSpec{}
 	case v1beta1.RouterComponent:
 		svc.Spec.Router = &v1beta1.RouterSpec{}
 	}
@@ -209,6 +213,40 @@ func goldenCases() []goldenCase {
 	}
 	decoderGang.service.Spec.Decoder.TopologyKey = ptr.To("kubernetes.io/hostname")
 
+	// An encoder is one pod per replica: one accelerator-bearing pod, the
+	// model mounted, and no worker.
+	encoder := goldenCase{name: "encoder-single", component: v1beta1.EncoderComponent,
+		service: goldenService(v1beta1.EncoderComponent), model: goldenModel(),
+		runtime: goldenRuntime().EngineRunner(goldenContainer("2")).EncoderRunner(goldenContainer("1")).Obj(),
+		wantGPU: "1",
+		wantEnv: map[string]string{constants.ModelPathEnvVarKey: constants.ModelDefaultMountPath, constants.ParallelismSizeEnvVarKey: "1"}}
+	encoder.service.Spec.Rollout = &v1beta1.RolloutSpec{PairingProtocol: ptr.To("embeddings-v1")}
+
+	// spec.encoder sets only podAffinity, a rule that keeps the encoder near
+	// the engine pods; the class's node affinity term still reaches the pod.
+	encoderPodAffinity := goldenCase{name: "encoder-user-podaffinity", component: v1beta1.EncoderComponent,
+		service: goldenService(v1beta1.EncoderComponent), model: goldenModel(),
+		runtime:          goldenRuntime().EngineRunner(goldenContainer("2")).EncoderRunner(goldenContainer("1")).Obj(),
+		wantNodeSelector: map[string]string{"pool": "class", "tier": "x", "accelerator": "type-a"},
+		wantNodeAffinity: requiredNodeAffinity("accelerator-zone", "zone-a").NodeAffinity}
+	withAccelerator(&encoderPodAffinity)
+	encoderPodAffinity.service.Spec.Encoder.Affinity = &corev1.Affinity{PodAffinity: &corev1.PodAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{constants.OMEComponentLabel: string(v1beta1.EngineComponent), constants.InferenceServicePodLabelKey: "pool-a"}},
+			TopologyKey:   "example.com/fabric-domain",
+		}},
+	}}
+
+	// A model on per-node storage: the encoder schedules only onto a node
+	// where the model agent reports the whole checkpoint Ready.
+	perNodeModel := v1beta1testing.MakeClusterBaseModel("model-a").StorageURI("hf://example/model-a").
+		ModelFormat("safetensors").ModelType("llama").ModelArchitecture("LlamaForCausalLM").ModelFramework("Transformers").Obj()
+	perNodeModel.Spec.Storage.Path = ptr.To("/mnt/models/model-a")
+	encoderPerNode := goldenCase{name: "encoder-per-node-model", component: v1beta1.EncoderComponent,
+		service: goldenService(v1beta1.EncoderComponent), model: perNodeModel,
+		runtime:          goldenRuntime().EngineRunner(goldenContainer("2")).EncoderRunner(goldenContainer("1")).Obj(),
+		wantNodeSelector: map[string]string{"pool": "runtime", "tier": "x", constants.GetClusterBaseModelLabel("model-a"): "Ready"}}
+
 	router := goldenCase{name: "router-config-env", component: v1beta1.RouterComponent,
 		service: goldenService(v1beta1.RouterComponent), model: goldenModel(),
 		runtime: goldenRuntime().EngineRunner(goldenContainer("2")).RouterRunner(corev1.Container{Name: goldenContainerName, Image: "example.com/router:v1"}).Obj(),
@@ -245,7 +283,7 @@ func goldenCases() []goldenCase {
 	withAccelerator(&userResources)
 	userResources.service.Spec.Engine.Runner = &v1beta1.RunnerSpec{Container: corev1.Container{Name: goldenContainerName, Resources: goldenResources("1")}}
 
-	return []goldenCase{single, gang, decoder, decoderGang, router, overlay, userAffinity, userResources}
+	return []goldenCase{single, gang, decoder, decoderGang, encoder, encoderPodAffinity, encoderPerNode, router, overlay, userAffinity, userResources}
 }
 
 func goldenClient(t *testing.T, tc goldenCase) client.Client {
@@ -288,17 +326,17 @@ func renderThroughProjector(t *testing.T, ctx context.Context, c client.Client, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, decoder, router, err := isvcutils.MergeRuntimeSpecs(service, rt, logr.Discard())
+	specs, err := isvcutils.MergeRuntimeRoleSpecs(service, rt, logr.Discard())
 	if err != nil {
 		t.Fatal(err)
 	}
-	engineMode, decoderMode, routerMode, err := isvcutils.DetermineDeploymentModes(engine, decoder, router, rt, service.Spec.DeploymentMode)
+	modes, err := isvcutils.DetermineRoleDeploymentModes(specs, service.Spec.DeploymentMode)
 	if err != nil {
 		t.Fatal(err)
 	}
-	specdefaults.Engine(engine, engineMode, deploy)
-	specdefaults.Decoder(decoder, decoderMode, deploy)
-	specdefaults.Router(router, routerMode, deploy)
+	for _, view := range specs.Declared() {
+		specdefaults.Role(&view, modes[view.Type], deploy)
+	}
 	overlays, err := isvcutils.ResolveOverlays(c, service)
 	if err != nil {
 		t.Fatal(err)
@@ -318,18 +356,8 @@ func renderThroughProjector(t *testing.T, ctx context.Context, c client.Client, 
 		}
 	}
 
-	var rendered render.Rendered
-	switch tc.component {
-	case v1beta1.EngineComponent:
-		piece.DeploymentMode = engineMode
-		rendered, err = render.RenderEngine(ctx, piece, service, engine)
-	case v1beta1.DecoderComponent:
-		piece.DeploymentMode = decoderMode
-		rendered, err = render.RenderDecoder(ctx, piece, service, decoder)
-	case v1beta1.RouterComponent:
-		piece.DeploymentMode = routerMode
-		rendered, err = render.RenderRouter(ctx, piece, service, router)
-	}
+	piece.DeploymentMode = modes[tc.component]
+	rendered, err := render.RenderComponent(ctx, piece, service, specs, tc.component)
 	if err != nil {
 		t.Fatalf("render %s: %v", tc.component, err)
 	}
@@ -436,6 +464,15 @@ func TestRenderedRunnersMatchGolden(t *testing.T) {
 			if tc.wantNodeSelector != nil {
 				if diff := cmp.Diff(tc.wantNodeSelector, primary.NodeSelector); diff != "" {
 					t.Fatalf("primary node selector (-want +got):\n%s", diff)
+				}
+			}
+			if tc.wantNodeAffinity != nil {
+				var got *corev1.NodeAffinity
+				if primary.Affinity != nil {
+					got = primary.Affinity.NodeAffinity
+				}
+				if diff := cmp.Diff(tc.wantNodeAffinity, got); diff != "" {
+					t.Fatalf("primary node affinity (-want +got):\n%s", diff)
 				}
 			}
 			if tc.wantGPU != "" {

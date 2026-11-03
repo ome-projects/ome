@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
-	"knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -66,14 +64,6 @@ func (b *HTTPRouteBuilder) resolveServicePort(ctx context.Context, namespace, se
 	return isvcutils.ResolveServicePort(ctx, b.client, namespace, serviceName, defaultPort)
 }
 
-func (b *HTTPRouteBuilder) GetResourceType() string {
-	return "HTTPRoute"
-}
-
-func (b *HTTPRouteBuilder) Build(ctx context.Context, isvc *v1beta1.InferenceService) (client.Object, error) {
-	return b.BuildHTTPRoute(ctx, isvc, EngineComponent)
-}
-
 func (b *HTTPRouteBuilder) BuildHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService, componentType string) (client.Object, error) {
 	var route *gatewayapiv1.HTTPRoute
 	var err error
@@ -89,17 +79,10 @@ func (b *HTTPRouteBuilder) BuildHTTPRoute(ctx context.Context, isvc *v1beta1.Inf
 	default:
 		return nil, fmt.Errorf("unsupported component type: %s", componentType)
 	}
-	if route == nil {
-		// Return an explicit interface-nil rather than letting Go wrap a
-		// typed-nil (*HTTPRoute)(nil) into a non-nil client.Object. The
-		// caller checks `desired == nil`, which is false for a typed-nil
-		// inside an interface — that gap caused a panic when a per-
-		// component builder returned (nil, nil) for the "component not
-		// ready" branch and the strategy then tried to call
-		// controllerutil.SetControllerReference on the typed-nil pointer.
+	if err != nil {
 		return nil, err
 	}
-	return route, err
+	return route, nil
 }
 
 // toGatewayAPIDuration converts seconds to gatewayapiv1.Duration
@@ -319,12 +302,7 @@ func (b *HTTPRouteBuilder) createHTTPRouteRule(routeMatches []gatewayapiv1.HTTPR
 
 func (b *HTTPRouteBuilder) buildEngineHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService) (*gatewayapiv1.HTTPRoute, error) {
 	if !componentCanBackRoute(isvc, v1beta1.EngineComponent, v1beta1.EngineReady) {
-		isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-			Type:   v1beta1.IngressReady,
-			Status: corev1.ConditionFalse,
-			Reason: "Engine ingress not created",
-		})
-		return nil, nil
+		return nil, &interfaces.ComponentNotReadyError{Component: v1beta1.EngineComponent}
 	}
 
 	// The engine HTTPRoute is always named "<isvc>-engine", distinct from the
@@ -355,12 +333,7 @@ func (b *HTTPRouteBuilder) buildEngineHTTPRoute(ctx context.Context, isvc *v1bet
 
 func (b *HTTPRouteBuilder) buildRouterHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService) (*gatewayapiv1.HTTPRoute, error) {
 	if !componentCanBackRoute(isvc, v1beta1.RouterComponent, v1beta1.RouterReady) {
-		isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-			Type:   v1beta1.IngressReady,
-			Status: corev1.ConditionFalse,
-			Reason: "Router ingress not created",
-		})
-		return nil, nil
+		return nil, &interfaces.ComponentNotReadyError{Component: v1beta1.RouterComponent}
 	}
 
 	routerName := constants.RouterServiceName(isvc.Name)
@@ -383,12 +356,7 @@ func (b *HTTPRouteBuilder) buildRouterHTTPRoute(ctx context.Context, isvc *v1bet
 
 func (b *HTTPRouteBuilder) buildDecoderHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService) (*gatewayapiv1.HTTPRoute, error) {
 	if !componentCanBackRoute(isvc, v1beta1.DecoderComponent, v1beta1.DecoderReady) {
-		isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-			Type:   v1beta1.IngressReady,
-			Status: corev1.ConditionFalse,
-			Reason: "Decoder ingress not created",
-		})
-		return nil, nil
+		return nil, &interfaces.ComponentNotReadyError{Component: v1beta1.DecoderComponent}
 	}
 
 	decoderName := constants.DecoderServiceName(isvc.Name)
@@ -425,12 +393,7 @@ func (b *HTTPRouteBuilder) buildTopLevelHTTPRoute(ctx context.Context, isvc *v1b
 		}
 	} else {
 		if !componentCanBackRoute(isvc, v1beta1.EngineComponent, v1beta1.EngineReady) {
-			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-				Type:   v1beta1.IngressReady,
-				Status: corev1.ConditionFalse,
-				Reason: "Engine not ready",
-			})
-			return nil, nil
+			return nil, &interfaces.ComponentNotReadyError{Component: v1beta1.EngineComponent}
 		}
 		// Align with the engine Service name produced by engine.go
 		// (defaultEngineName = isvc.Name + "-engine") rather than the legacy

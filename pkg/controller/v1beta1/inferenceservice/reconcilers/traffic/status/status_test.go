@@ -9,7 +9,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -42,10 +41,8 @@ func (f *fakeObjectKind) GroupVersionKind() schema.GroupVersionKind {
 }
 func (f *fakeObjectKind) SetGroupVersionKind(_ schema.GroupVersionKind) {}
 
-// Statically verify fake satisfies client.Object via embedding (the
-// fakeclient package is imported solely to surface compile errors if
-// the embedded interface shape ever drifts).
-var _ = fakeclient.NewClientBuilder
+// The stand-in is a client.Object by embedding.
+var _ client.Object = (*fakeEmittedPolicy)(nil)
 
 func newEmittedPolicy(name string) client.Object {
 	return &fakeEmittedPolicy{

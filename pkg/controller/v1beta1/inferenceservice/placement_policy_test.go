@@ -1,7 +1,6 @@
 package inferenceservice
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -17,12 +16,11 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestPlacementPolicyPreflight(t *testing.T) {
@@ -62,10 +60,6 @@ func TestPlacementPolicyPreflight(t *testing.T) {
 				{name: "missing execution permits cleanup", origin: "source-a", deleting: true},
 			} {
 				t.Run(tt.name, func(t *testing.T) {
-					scheme := runtime.NewScheme()
-					if err := v1beta1.AddToScheme(scheme); err != nil {
-						t.Fatal(err)
-					}
 					service := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "service", Namespace: "team-a", UID: "member-uid", ResourceVersion: "1", Annotations: map[string]string{}},
 						Spec: v1beta1.InferenceServiceSpec{DeploymentMode: ptr.To(mode)}}
 					if tt.engine {
@@ -81,16 +75,10 @@ func TestPlacementPolicyPreflight(t *testing.T) {
 						service.DeletionTimestamp = ptr.To(metav1.NewTime(time.Unix(100, 0)))
 						service.Finalizers = []string{inferenceServiceFinalizer}
 					}
-					writes := 0
-					reject := func() error { writes++; return errors.New("unexpected object write") }
-					cl := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(service).WithStatusSubresource(service).WithInterceptorFuncs(interceptor.Funcs{
-						Create: func(context.Context, client.WithWatch, client.Object, ...client.CreateOption) error { return reject() },
-						Update: func(context.Context, client.WithWatch, client.Object, ...client.UpdateOption) error { return reject() },
-						Patch: func(context.Context, client.WithWatch, client.Object, client.Patch, ...client.PatchOption) error {
-							return reject()
-						},
-						Delete: func(context.Context, client.WithWatch, client.Object, ...client.DeleteOption) error { return reject() },
-					}).Build()
+					refused, writes := refusedObjectWrites(errors.New("unexpected object write"))
+					cl := fakeclient.New(t, append([]fakeclient.Option{
+						fakeclient.WithObjects(service), fakeclient.WithStatusSubresource(service),
+					}, refused...)...)
 					before := &v1beta1.InferenceService{}
 					if err := cl.Get(t.Context(), client.ObjectKeyFromObject(service), before); err != nil {
 						t.Fatal(err)
@@ -116,7 +104,7 @@ func TestPlacementPolicyPreflight(t *testing.T) {
 					if diff := cmp.Diff(wantReads, configReads); diff != "" {
 						t.Fatalf("configuration reads (-want +got):\n%s", diff)
 					}
-					if diff := cmp.Diff(0, writes); diff != "" {
+					if diff := cmp.Diff(0, writes()); diff != "" {
 						t.Fatalf("object writes (-want +got):\n%s", diff)
 					}
 					stored := &v1beta1.InferenceService{}

@@ -7,12 +7,11 @@ import (
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // Headless Service tests for buildHeadlessService + ReconcileHeadlessService.
@@ -148,20 +147,12 @@ func TestBuildHeadlessService_OwnerReference(t *testing.T) {
 // against the controller-runtime fake client.
 // ---------------------------------------------------------------------
 
-// newServiceClient builds a fake client wired with the corev1.Service
-// scheme. Owner-CRD types aren't required because the spec carries the
-// OwnerReference directly (no GVK resolution from a typed owner
-// happens at this layer; that's the adapter's job).
+// newServiceClient builds the fake client the Service tests reconcile
+// against. The spec carries the OwnerReference directly, so no owner type
+// is resolved at this layer; that is the adapter's job.
 func newServiceClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatalf("add corev1: %v", err)
-	}
-	return fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(objs...).
-		Build()
+	return fakeclient.New(t, fakeclient.WithObjects(objs...))
 }
 
 func TestReconcileHeadlessService_FreshCreate(t *testing.T) {

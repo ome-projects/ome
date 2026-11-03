@@ -3,6 +3,7 @@ package placement
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 
@@ -34,6 +35,22 @@ type plannedMemberObservation struct {
 	// ComponentReady counts each scaled component's ready instances while the
 	// member can serve; it is empty otherwise.
 	ComponentReady map[v1beta1.ComponentType]int32
+	// KeptOccupied and KeptReserved are how many fewer engine units a split
+	// member uses when the decoders above its share are measured against
+	// the copy that keeps them running. OME holds a copy's minimum until the
+	// replacements on other clusters serve, and stops writing the copy of a
+	// member it removes. The move's surge allowance subtracts these units; a
+	// finished move still waits for those decoders to leave.
+	KeptOccupied, KeptReserved int32
+}
+
+// allowanceState returns the member's state and rollout reservation as the
+// move's surge allowance counts them: decoders its copy keeps running are part
+// of its own share, not surge.
+func (o plannedMemberObservation) allowanceState() (allocation.MemberState, int32) {
+	state := o.MemberState
+	state.Occupied -= o.KeptOccupied
+	return state, o.RolloutReserved - o.KeptReserved
 }
 
 // observePlannedMember combines the observed ISVC with a direct workload inventory,
@@ -83,10 +100,32 @@ func (r *Reconciler) observePlannedMemberOnce(ctx context.Context, source *v1bet
 		return out, err
 	}
 	policy := executionPolicy(source, previous.Allocation)
-	floors, err := plannedMemberFloors(source, previous, policy)
+	held := map[v1beta1.ComponentType]int32{}
+	if memberExists {
+		held = memberMinimums(member)
+	}
+	floors, occupancyShares, err := plannedMemberFloors(source, previous, policy, held)
 	if err != nil {
 		return out, err
 	}
+	if memberExists && placementMode(source) == v1beta1.PlacementModeSplit && previous.Allocation.DesiredReplicas == 0 && previous.Allocation.Weight == nil {
+		// The terms no longer match this member, so placement rewrites none of
+		// its minimums while it drains, and its share can fall to the one
+		// replica every member with engines is guaranteed. Its running replicas
+		// are counted against the larger of that share and the minimum its copy
+		// holds, so they do not turn into dozens of phantom engines.
+		occupancyShares = atLeastHeld(occupancyShares, held, primaryScaleComponent(components))
+	}
+	allowance, required := occupancyShares, floors
+	var heldPrimary int32
+	if memberExists && len(policy.ReplicaFloors) == 0 {
+		primary := primaryScaleComponent(components)
+		allowance, heldPrimary = atLeastHeld(occupancyShares, held, primary), held[primary]
+		if previous.Allocation.DesiredReplicas == 0 {
+			required = atMostHeld(floors, held)
+		}
+	}
+	var allowanceOccupied, allowanceReserved int32
 	applied := memberExists && member.DeletionTimestamp.IsZero()
 	if memberExists {
 		memberPolicy, err := protocol.FromDerived(member)
@@ -167,9 +206,9 @@ func (r *Reconciler) observePlannedMemberOnce(ctx context.Context, source *v1bet
 		zeroRequests[ir.Spec.Component] = *ir.Spec.Replicas == 0 && protocol.HasZeroReplicaFloor(policy, ir.Spec.Component)
 		idleComponents[ir.Spec.Component] = zeroRequests[ir.Spec.Component] && count.Occupied == 0 && count.Reserved == 0
 		// Engine and Decoder occupancy is counted in primary units through each
-		// component's floor. Router stays shared within each member, with its own
+		// component's minimum. Router stays shared within each member, with its own
 		// replica policy and readiness gate.
-		floor, primaryFloor := componentFloor(floors, ir.Spec.Component, previous.Allocation.CurrentReplicas), floors[primaryScaleComponent(components)]
+		primaryFloor := floors[primaryScaleComponent(components)]
 		if ir.Spec.Component != v1beta1.RouterComponent {
 			// A paused limit is durable capacity authority, even if the current
 			// autoscaler request is smaller. Requests above it remain deferred.
@@ -177,13 +216,22 @@ func (r *Reconciler) observePlannedMemberOnce(ctx context.Context, source *v1bet
 			if ir.Spec.PlacementExecution != nil && ir.Spec.PlacementExecution.PauseSurge && ir.Spec.PlacementReplicaLimit != nil {
 				committed = *ir.Spec.PlacementReplicaLimit
 			}
-			out.MemberState.Occupied = max(out.MemberState.Occupied, occupiedUnits(max(count.Occupied, committed), floor, primaryFloor))
-			out.RolloutReserved = max(out.RolloutReserved, occupiedUnits(count.Reserved, floor, primaryFloor))
+			occupied := max(count.Occupied, committed)
+			unit := componentFloor(occupancyShares, ir.Spec.Component, previous.Allocation.CurrentReplicas)
+			shareOccupied, shareReserved := occupiedUnits(occupied, unit, primaryFloor), occupiedUnits(count.Reserved, unit, primaryFloor)
+			out.MemberState.Occupied = max(out.MemberState.Occupied, shareOccupied)
+			out.RolloutReserved = max(out.RolloutReserved, shareReserved)
+			// A kept decoder counts at the engine-to-decoder ratio of the copy that
+			// keeps it, and never for more than its share would charge.
+			allowanceUnit, scale := componentFloor(allowance, ir.Spec.Component, previous.Allocation.CurrentReplicas), max(primaryFloor, heldPrimary)
+			allowanceOccupied = max(allowanceOccupied, min(shareOccupied, occupiedUnits(occupied, allowanceUnit, scale)))
+			allowanceReserved = max(allowanceReserved, min(shareReserved, occupiedUnits(count.Reserved, allowanceUnit, scale)))
 		}
+		requiredMinimum := componentFloor(required, ir.Spec.Component, previous.Allocation.CurrentReplicas)
 		if policy.PauseSurge {
 			applied = applied && ir.Spec.PlacementReplicaLimit != nil && *ir.Spec.PlacementReplicaLimit > 0
 			if ir.Spec.Component != v1beta1.RouterComponent {
-				applied = applied && ir.Spec.PlacementReplicaLimit != nil && *ir.Spec.PlacementReplicaLimit >= floor
+				applied = applied && ir.Spec.PlacementReplicaLimit != nil && *ir.Spec.PlacementReplicaLimit >= requiredMinimum
 			}
 		}
 		applied = applied && ir.Generation > 0 && ir.Status.ObservedGeneration == ir.Generation && ir.Status.PlacementObservedGeneration == ir.Generation && ir.DeletionTimestamp.IsZero() && equality.Semantic.DeepEqual(ir.Spec.PlacementExecution, policy)
@@ -191,9 +239,10 @@ func (r *Reconciler) observePlannedMemberOnce(ctx context.Context, source *v1bet
 			applied = applied && ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] == strconv.FormatInt(member.Generation, 10)
 		}
 		if ir.Spec.Component != v1beta1.RouterComponent {
-			applied = applied && ir.Spec.Replicas != nil && *ir.Spec.Replicas >= floor
+			applied = applied && ir.Spec.Replicas != nil && *ir.Spec.Replicas >= requiredMinimum
 		}
 	}
+	out.KeptOccupied, out.KeptReserved = out.MemberState.Occupied-allowanceOccupied, out.RolloutReserved-allowanceReserved
 	if len(byOwner) > 0 {
 		return out, fmt.Errorf("member pods remain without identified live components")
 	}
@@ -292,19 +341,52 @@ func (r *Reconciler) observePlannedMemberOnce(ctx context.Context, source *v1bet
 // plannedMemberFloors returns the per-component floors a planned member is held
 // to: the accepted full policy when the plan carries one, the split
 // apportionment over the plan's current targets otherwise. Without either,
-// every scaled component is held to the member's primary target.
-func plannedMemberFloors(source *v1beta1.InferenceService, previous v1beta1.CandidatePlacement, policy *v1beta1.PlacementExecutionPolicy) (map[v1beta1.ComponentType]int32, error) {
+// every scaled component is held to the member's primary target. held is what
+// the member's copy holds now. The second map is the in-flight apportionment
+// before it is trimmed; occupancy is counted against it, as the move's
+// allowance was planned.
+func plannedMemberFloors(source *v1beta1.InferenceService, previous v1beta1.CandidatePlacement, policy *v1beta1.PlacementExecutionPolicy, held map[v1beta1.ComponentType]int32) (map[v1beta1.ComponentType]int32, map[v1beta1.ComponentType]int32, error) {
 	if len(policy.ReplicaFloors) > 0 {
-		return floorMap(policy.ReplicaFloors), nil
+		floors := floorMap(policy.ReplicaFloors)
+		return floors, floors, nil
 	}
 	if mode := placementMode(source); mode != v1beta1.PlacementModeSplit && mode != v1beta1.PlacementModeSplitByCapacity {
-		return nil, nil
+		return nil, nil, nil
 	}
-	floors, err := splitMemberFloors(source, source.Status.Placement.Candidates, previous)
+	minimums, err := splitComponentMinimums(source)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return floorMap(floors), nil
+	trimmed, inFlight, err := minimums.memberShares(source, source.Status.Placement.Candidates, previous, held)
+	if err != nil {
+		return nil, nil, err
+	}
+	return floorMap(trimmed), floorMap(inFlight), nil
+}
+
+// atLeastHeld returns shares with each component other than primary raised to
+// the minimum the member copy holds, when that is larger.
+func atLeastHeld(shares, held map[v1beta1.ComponentType]int32, primary v1beta1.ComponentType) map[v1beta1.ComponentType]int32 {
+	out := maps.Clone(shares)
+	for component, minimum := range held {
+		if share, shared := out[component]; shared && component != primary {
+			out[component] = max(share, minimum)
+		}
+	}
+	return out
+}
+
+// atMostHeld returns shares with each component lowered to the minimum the
+// member copy holds, when that is smaller. OME stops writing the copy of a
+// member it removes, so the move must not wait for that member to grow.
+func atMostHeld(shares, held map[v1beta1.ComponentType]int32) map[v1beta1.ComponentType]int32 {
+	out := maps.Clone(shares)
+	for component, minimum := range held {
+		if share, shared := out[component]; shared {
+			out[component] = min(share, minimum)
+		}
+	}
+	return out
 }
 
 // componentFloor is the floor a component is held to; a component outside the

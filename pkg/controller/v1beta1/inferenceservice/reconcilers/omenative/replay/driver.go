@@ -91,6 +91,9 @@ type driver struct {
 	// tickRun is what the run layer did in the current pass, kept for the
 	// observer.
 	tickRun RunView
+	// samples is the metric gate's stand-in, wired only when the scenario
+	// stages analysis.sample; nil runs every analysis step with no sampler.
+	samples *sampleScript
 }
 
 func newDriver(ctx context.Context, s *Scenario, opts Options) (*driver, error) {
@@ -133,6 +136,9 @@ func newDriver(ctx context.Context, s *Scenario, opts Options) (*driver, error) 
 		for _, ev := range tick.Events {
 			if _, stale := staleReadEvents[ev.ID]; stale {
 				cl.snapshots = true
+			}
+			if ev.ID == "analysis.sample" && d.samples == nil {
+				d.samples = newSampleScript()
 			}
 		}
 	}
@@ -186,10 +192,10 @@ func copyMap(m map[string]string) map[string]string {
 }
 
 // components lists the declared Components in the order the controller
-// walks them: engine, decoder, router.
+// walks them, the order of v1beta1.Roles.
 func (d *driver) components() []v1beta1.ComponentType {
 	var out []v1beta1.ComponentType
-	for _, c := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
+	for _, c := range v1beta1.RoleTypes() {
 		if _, ok := d.members[c]; ok {
 			out = append(out, c)
 		}
@@ -228,14 +234,15 @@ func (d *driver) componentExt(c v1beta1.ComponentType) *v1beta1.ComponentExtensi
 // isvcSpec renders the service spec from the driver's mutable copy.
 func (d *driver) isvcSpec() v1beta1.InferenceServiceSpec {
 	spec := v1beta1.InferenceServiceSpec{}
-	if cs, ok := d.service.Components[string(v1beta1.EngineComponent)]; ok {
-		spec.Engine = &v1beta1.EngineSpec{PodSpec: v1beta1.PodSpec{Containers: d.podTemplate(cs.Image).Containers}, ComponentExtensionSpec: *d.componentExt(v1beta1.EngineComponent)}
-	}
-	if cs, ok := d.service.Components[string(v1beta1.DecoderComponent)]; ok {
-		spec.Decoder = &v1beta1.DecoderSpec{PodSpec: v1beta1.PodSpec{Containers: d.podTemplate(cs.Image).Containers}, ComponentExtensionSpec: *d.componentExt(v1beta1.DecoderComponent)}
-	}
-	if cs, ok := d.service.Components[string(v1beta1.RouterComponent)]; ok {
-		spec.Router = &v1beta1.RouterSpec{PodSpec: v1beta1.PodSpec{Containers: d.podTemplate(cs.Image).Containers}, ComponentExtensionSpec: *d.componentExt(v1beta1.RouterComponent)}
+	for _, c := range v1beta1.RoleTypes() {
+		cs, ok := d.service.Components[string(c)]
+		if !ok {
+			continue
+		}
+		v1beta1.DeclareRole(&spec, c)
+		view := v1beta1.SpecOf(&spec, c)
+		view.PodSpec.Containers = d.podTemplate(cs.Image).Containers
+		*view.Extension = *d.componentExt(c)
 	}
 	if len(d.service.Groups) > 0 || d.service.PairingProtocol != nil {
 		spec.Rollout = &v1beta1.RolloutSpec{Groups: append([]v1beta1.RolloutGroup(nil), d.service.Groups...), PairingProtocol: d.service.PairingProtocol}
@@ -461,6 +468,9 @@ func (d *driver) seedMember(ctx context.Context, m *member, state ReplicaState) 
 		pod := podState{index: spec.Index, ordinal: spec.Ordinal, ready: spec.Ready, serving: spec.Ready}
 		if spec.Serving != nil {
 			pod.serving = *spec.Serving
+		}
+		if pod.listedAfter, err = ParseDuration("pods.listedAfter", spec.ListedAfter); err != nil {
+			return err
 		}
 		pod.image = m.rowRunning(spec.Index)
 		if spec.Revision != "" {

@@ -40,7 +40,7 @@ func TestReconcileOMENativeSubresources_SkipsPodMonitorWhenSchemeAbsent(t *testi
 	}}}
 
 	err := ReconcileOMENativeSubresources(context.Background(), b, isvc,
-		v1beta1.EngineComponent, &v1beta1.ComponentExtensionSpec{}, objectMeta, podSpec)
+		v1beta1.EngineComponent, &v1beta1.ComponentExtensionSpec{}, objectMeta, podSpec, false)
 	require.NoError(t, err, "reconcile must not fail when the PodMonitor CRD/scheme is absent")
 
 	// The stable Service (which runs before the PodMonitor) must still exist.

@@ -23,19 +23,15 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// NoopTranslatorName is the well-known translator name the Build
-// function short-circuits on to surface NoTranslatorAvailable. The
-// noop translator package defines the canonical constant; this
-// duplicate exists here so the status package stays dependency-free.
-// Any drift between the two surfaces as a unit-test failure in
-// translators/noop_test.go (which asserts the canonical value).
+// NoopTranslatorName is the name of the translator that emits nothing.
+// Build short-circuits on it to surface NoTranslatorAvailable; the noop
+// translator reads its Name from this constant.
 const NoopTranslatorName = "noop"
 
 // GatewayAcceptance is the post-apply observation the reconciler
-// extracts from the gateway controller's status writeback. The status
-// package consumes only primitive values so it stays dependency-free
-// from the parent traffic package (which owns the matching
-// AcceptanceState enum).
+// extracts from the gateway controller's status writeback. This package
+// owns the type; the traffic package names it AcceptanceState, so the
+// translators' answer reaches Build unconverted.
 type GatewayAcceptance int
 
 const (

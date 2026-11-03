@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workloadcluster"
 	"sigs.k8s.io/ome/pkg/placement/plan"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func allZeroFixture(t *testing.T, pd bool) *backendFixture {
@@ -374,12 +375,12 @@ func TestAllZeroFloorHoldKeepsIdleMembersPlaced(t *testing.T) {
 		{name: "plan write rejected", wantReason: "PlanNotPersisted", hold: func(_ *testing.T, f *backendFixture, source *v1beta1.InferenceService) {
 			accepted := source.Status.Placement.Plan.ID
 			writer := f.reconciler.Client
-			f.reconciler.Client = interceptor.NewClient(writer.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			f.reconciler.Client = fakeclient.Wrap(t, writer.(client.WithWatch), fakeclient.WithInterceptors(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 				if written, ok := obj.(*v1beta1.InferenceService); ok && written.Status.Placement != nil && written.Status.Placement.Plan != nil && written.Status.Placement.Plan.ID != accepted {
 					return errors.New("plan write rejected")
 				}
 				return c.SubResource(name).Update(ctx, obj, opts...)
-			}})
+			}}))
 			source.Spec.Engine.MinReplicas = ptr.To(2)
 		}},
 	} {

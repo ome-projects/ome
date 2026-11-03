@@ -154,9 +154,9 @@ type quotaPass struct {
 
 	built      *tree.Tree
 	violations tree.Violations
-	// frozen maps a node to the violation that freezes it, its own or the
-	// nearest ancestor's. A frozen node reports the violation and keeps the
-	// objects it last had.
+	// frozen maps a node to the violation the tree's Frozen reports for it,
+	// its own or the nearest ancestor's. Such a node reports the violation
+	// and keeps the objects it last had.
 	frozen map[string]tree.Violation
 
 	// errs collects the failures that must not stop the pass before every
@@ -277,7 +277,7 @@ func (p *quotaPass) buildTree(context.Context) (bool, error) {
 }
 
 // addCapacityViolations adds the budgets the cluster cannot afford to the
-// violations, so they freeze and report like any other violated invariant.
+// violations, so the tree reports them like any other violated invariant.
 // The numbers are the root's last observed capacity: a value one pass old
 // is the right input for a check that ignores momentary dips.
 func (p *quotaPass) addCapacityViolations(context.Context) (bool, error) {
@@ -288,8 +288,8 @@ func (p *quotaPass) addCapacityViolations(context.Context) (bool, error) {
 	return true, nil
 }
 
-// findFrozenNodes maps every node to the violation that freezes it, its own
-// or the nearest ancestor's.
+// findFrozenNodes maps every node to the violation the tree's Frozen reports
+// for it, its own or the nearest ancestor's.
 func (p *quotaPass) findFrozenNodes(context.Context) (bool, error) {
 	p.frozen = p.built.Frozen(p.violations)
 	return true, nil
@@ -898,80 +898,82 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts ...Option) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.AcceleratorQuota{}).
 		Named("acceleratorquota")
-
 	if r.Capacity.Enabled() {
-		// Reconciles are event-driven, and a cluster can start with no
-		// AcceleratorQuota and no Nodes — nothing to fire an event, so nothing
-		// would ever create the root and capacity would never be reported. One
-		// pass at startup removes that dependency on the cluster happening to
-		// contain something.
-		//
-		// A plain RunnableFunc is leader-elected, so a standby replica does not
-		// race the leader; AlreadyExists is benign in any case. The pass retries
-		// internally and never returns an error, because the write goes through
-		// this component's own fail-closed webhook and the manager it would take
-		// down is the one that brings that webhook up.
+		// A RunnableFunc is leader-elected, so a standby replica does not race
+		// the leader for the root; AlreadyExists is benign in any case.
 		if err := mgr.Add(manager.RunnableFunc(r.bootstrapRoot)); err != nil {
 			return fmt.Errorf("acceleratorquota: scheduling the root check: %w", err)
 		}
-
-		// Every node maps to the same request: reconciliation is whole-tree, so
-		// which node changed does not narrow the work.
-		//
-		// The predicate is not an optimisation to revisit later. Node status is
-		// among the highest-volume writes in a cluster and almost none of it
-		// moves a number this controller reads, so without it a large fleet
-		// would rebuild the tree continuously.
-		b = b.WatchesRawSource(source.Kind(
-			mgr.GetCache(),
-			&corev1.Node{},
-			handler.TypedEnqueueRequestsFromMapFunc(func(context.Context, *corev1.Node) []reconcile.Request {
-				return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: r.Options.RootName}}}
-			}),
-			predicate.TypedFuncs[*corev1.Node]{
-				UpdateFunc: func(e event.TypedUpdateEvent[*corev1.Node]) bool {
-					return nodeCapacityChanged(e.ObjectOld, e.ObjectNew, r.Capacity.Resources)
-				},
-			},
-		))
+		b = r.watchNodeCapacity(b, mgr)
 	}
-
-	// Consumption moves without anything in the tree changing, and nothing else
-	// here would notice: the reconcile is woken by AcceleratorQuota edits and by
-	// node capacity, neither of which a workload admission touches. Left to the
-	// resync tick alone, a queue's figures are up to a full interval stale — long
-	// enough that a fleet with work running reads as an idle one.
-	//
-	// A backend that cannot say what to watch simply does not get watched, and
-	// its figures refresh on the resync tick as before.
-	//
-	// Every event maps to one request, as the node watch does, so a burst of
-	// admissions collapses into a single queued pass rather than one per
-	// workload.
-	if watcher, ok := r.Materialize.Backend.(backend.UsageWatcher); ok {
-		obj, usageChanged := watcher.WatchUsage()
-		b = b.Watches(obj,
-			handler.EnqueueRequestsFromMapFunc(func(context.Context, client.Object) []reconcile.Request {
-				return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: r.Options.RootName}}}
-			}),
-			builder.WithPredicates(usageChanged),
-		)
-	}
-	// One handler for both, because the pass they trigger is the same one: it
-	// rebuilds the whole tree from the root, so a burst of member events and a
-	// reconnection collapse into a single queued request rather than one each.
-	wake := handler.EnqueueRequestsFromMapFunc(
-		func(_ context.Context, obj client.Object) []reconcile.Request {
-			return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: obj.GetName()}}}
-		})
-	if cfg.memberEvents != nil {
-		b = b.WatchesRawSource(source.Channel(cfg.memberEvents, wake))
-	}
-	if cfg.transportEvents != nil {
-		// Every event names the root and the pass rebuilds the whole tree, so a
-		// burst of reconnections collapses into one queued pass rather than one
-		// per member.
-		b = b.WatchesRawSource(source.Channel(cfg.transportEvents, wake))
-	}
+	b = r.watchUsage(b)
+	b = r.watchMembers(b, cfg.memberEvents)
+	b = r.watchTransport(b, cfg.transportEvents)
 	return b.Complete(r)
+}
+
+// enqueueRoot maps every event to the root's request. The pass rebuilds the
+// whole tree from the root, so which object moved does not narrow the work, and
+// a burst of events collapses into one queued pass rather than one each.
+func enqueueRoot[T client.Object](rootName string) handler.TypedEventHandler[T, reconcile.Request] {
+	return handler.TypedEnqueueRequestsFromMapFunc(func(context.Context, T) []reconcile.Request {
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: rootName}}}
+	})
+}
+
+// watchNodeCapacity queues a pass when a node's accelerator capacity moves.
+//
+// The predicate is not an optimisation to revisit later. Node status is among
+// the highest-volume writes in a cluster and almost none of it moves a number
+// this controller reads, so without it a large fleet would rebuild the tree
+// continuously.
+func (r *Reconciler) watchNodeCapacity(b *builder.Builder, mgr ctrl.Manager) *builder.Builder {
+	return b.WatchesRawSource(source.Kind(
+		mgr.GetCache(),
+		&corev1.Node{},
+		enqueueRoot[*corev1.Node](r.Options.RootName),
+		predicate.TypedFuncs[*corev1.Node]{
+			UpdateFunc: func(e event.TypedUpdateEvent[*corev1.Node]) bool {
+				return nodeCapacityChanged(e.ObjectOld, e.ObjectNew, r.Capacity.Resources)
+			},
+		},
+	))
+}
+
+// watchUsage queues a pass when the usage backend's figures move.
+//
+// Consumption changes without anything in the tree changing, and nothing else
+// here would notice: the reconcile runs on AcceleratorQuota edits and on node
+// capacity, neither of which a workload admission touches. Left to the
+// resync tick alone, a queue's figures are up to a full interval stale, long
+// enough that a fleet with work running reads as an idle one. A backend that
+// cannot say what to watch is not watched, and its figures refresh on the
+// resync tick.
+func (r *Reconciler) watchUsage(b *builder.Builder) *builder.Builder {
+	watcher, ok := r.Materialize.Backend.(backend.UsageWatcher)
+	if !ok {
+		return b
+	}
+	obj, usageChanged := watcher.WatchUsage()
+	return b.Watches(obj, enqueueRoot[client.Object](r.Options.RootName), builder.WithPredicates(usageChanged))
+}
+
+// watchMembers queues a pass when an AcceleratorQuota changes on a member, so
+// the hub's account of the fleet follows the fleet instead of a clock. A nil
+// channel leaves the hub on its resync tick.
+func (r *Reconciler) watchMembers(b *builder.Builder, events <-chan event.GenericEvent) *builder.Builder {
+	if events == nil {
+		return b
+	}
+	return b.WatchesRawSource(source.Channel(events, enqueueRoot[client.Object](r.Options.RootName)))
+}
+
+// watchTransport queues a pass when a member connects or drops, so a
+// reconnection does not wait out the resync interval. A nil channel leaves the
+// hub on its resync tick.
+func (r *Reconciler) watchTransport(b *builder.Builder, events <-chan event.GenericEvent) *builder.Builder {
+	if events == nil {
+		return b
+	}
+	return b.WatchesRawSource(source.Channel(events, enqueueRoot[client.Object](r.Options.RootName)))
 }

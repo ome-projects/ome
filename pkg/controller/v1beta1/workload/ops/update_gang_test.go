@@ -2730,7 +2730,7 @@ func TestGangSurgeUpdate_EnsuresPodGroupBeforeSurgePods(t *testing.T) {
 	// Wire the inline surge-PodGroup ensure exactly as the IR reconciler
 	// does (deps.EnsureGangPodGroup = gang.EnsureSurgePodGroup).
 	deps := legacyTestDeps(c)
-	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroup(deps)
+	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroupWithState(deps, gang.PodGroupReconcileState{})
 
 	// Create-surge-gang pass: this is where the surge gang's pods are
 	// created at idx=1.
@@ -2811,7 +2811,7 @@ func TestGangSurgeUpdate_HoldsSourceDrainUntilReplacementPodReady(t *testing.T) 
 	input := gangInputWithRemove(isvc, c)
 	input.DesiredSpec.GangSchedulingAvailable = true
 	deps := legacyTestDeps(c)
-	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroup(deps)
+	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroupWithState(deps, gang.PodGroupReconcileState{})
 
 	v2 := &appsv1.ControllerRevision{}
 	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: v2Name}, v2); err != nil {
@@ -3090,7 +3090,7 @@ func TestGangSurgeUpdate_DrainGateHoldsTheSourceGang(t *testing.T) {
 		return false, workload.RolloutHoldGatePairing, "peer cohort not serving"
 	}
 	deps := legacyTestDeps(c)
-	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroup(deps)
+	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroupWithState(deps, gang.PodGroupReconcileState{})
 	v2 := &appsv1.ControllerRevision{}
 	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: v2Name}, v2); err != nil {
 		t.Fatalf("get v2 CR: %v", err)
@@ -3187,7 +3187,7 @@ func TestGangSurgeUpdate_SupersededSurge_PairingHoldKeepsTheReplacementGang(t *t
 	rec := record.NewFakeRecorder(16)
 	deps := legacyTestDeps(c)
 	deps.Recorder = rec
-	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroup(deps)
+	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroupWithState(deps, gang.PodGroupReconcileState{})
 	gangAt := func(idx int32) (present, serving int) {
 		t.Helper()
 		pods, err := query.LiveListPodsForInstance(context.Background(), c, "prod", "gang-d", workload.ComponentEngine, idx)
@@ -3509,7 +3509,7 @@ func TestGangSurgeUpdate_TerminatingReplacementMemberHoldsTheHandoff(t *testing.
 	terminatingPod(t, c, worker)
 
 	deps := legacyTestDeps(c)
-	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroup(deps)
+	deps.EnsureGangPodGroup = gang.EnsureSurgePodGroupWithState(deps, gang.PodGroupReconcileState{})
 	v2 := &appsv1.ControllerRevision{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: "prod", Name: v2Name}, v2); err != nil {
 		t.Fatalf("get v2 CR: %v", err)
@@ -3938,6 +3938,90 @@ func TestGangSurge_LostMemberIsRebuiltBeforeTheRetryDelayElapses(t *testing.T) {
 	}
 	if len(*removed) != 0 {
 		t.Errorf("RemoveInstance: got %v want none (the source row stays)", *removed)
+	}
+}
+
+// TestGangSurge_ReplacementKeepsEndedAttemptWait_NextAttemptWriteClearsIt:
+// a gang surge past the drain step lost its new gang's worker, and the
+// loss ended the attempt on the source, which reads Failed. The new gang's
+// row still carries the placement wait the ended attempt recorded: the
+// hold pass's write that clears it did not land. The pass rebuilds the
+// worker and opens the next attempt, and the one status write that opens
+// it also clears the wait, so the rebuilt worker waits on its own clock.
+// A row that carries no wait opens the next attempt the same way.
+func TestGangSurge_ReplacementKeepsEndedAttemptWait_NextAttemptWriteClearsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wait bool
+	}{
+		{name: "the new gang's row carries the ended attempt's wait", wait: true},
+		{name: "the new gang's row carries none"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			const isvcName, namespace = "gang-rebuild-wait", "test-ns"
+			const revision = "gang-rebuild-wait-engine-rev-v1hash"
+			surgeIndex := int32(2)
+			t0 := time.Now().Truncate(time.Second)
+			source := gangSurgeRecoverySource(surgeIndex, revision)
+			source.Phase = workload.InstancePhaseFailed
+			source.Operation.Step = workload.UpdateStepSurgeDrain
+			source.Operation.StartedAt = metav1.NewTime(t0.Add(-10 * time.Minute))
+			source.Operation.LastProgressAt = source.Operation.StartedAt
+			source.LastFailure = replacementLostTermination(surgeIndex, 1, 2, metav1.NewTime(t0.Add(-5*time.Second)))
+			replacement := workload.InstanceStatus{
+				Index:          surgeIndex,
+				Incarnation:    1,
+				Phase:          workload.InstancePhaseCreating,
+				TargetRevision: revision,
+				PodCount:       1,
+				Operation: &workload.InstanceOperation{
+					ID:             "gang-update-target-2",
+					Type:           workload.InstanceOperationUpdate,
+					Step:           workload.UpdateStepGangSurgeTarget,
+					TargetRevision: revision,
+				},
+			}
+			if tc.wait {
+				endedSince := metav1.NewTime(t0.Add(-6 * time.Minute))
+				replacement.Operation.PlacementWaitSince = &endedSince
+			}
+			store := &terminalMutationStore{
+				ownerUID: "owner-a",
+				statuses: map[int32]workload.InstanceStatus{
+					source.Index:      cloneTerminalStatus(source),
+					replacement.Index: cloneTerminalStatus(replacement),
+				},
+			}
+			input := gangSurgeRecoveryInput("owner-a", isvcName, namespace, store,
+				cloneTerminalStatus(source), cloneTerminalStatus(replacement))
+			input.Clock = clocktesting.NewFakeClock(t0)
+			c := legacyNewFakeClient(t,
+				gangSurgeReadyRecoveryPod(isvcName, namespace, surgeIndex, "leader", "v1hash"),
+				legacyStoredRevision(t, namespace, revision, input.DesiredSpec.PodSpec, input.DesiredSpec.WorkerPodSpec),
+			)
+			deps := legacyTestDeps(c)
+			deps.Recorder = record.NewFakeRecorder(8)
+			plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+			target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: revision}}
+
+			if done, err := gangSurgeUpdate(context.Background(), deps, input, plan, plan.Instances[0], target); err != nil || done {
+				t.Fatalf("rebuild pass: done=%v err=%v", done, err)
+			}
+			workerName := query.PodName(isvcName, workload.ComponentEngine, surgeIndex, "worker", 0)
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: workerName}, &corev1.Pod{}); err != nil {
+				t.Fatalf("rebuilt worker: %v", err)
+			}
+			if got := store.statuses[source.Index]; got.Phase != workload.InstancePhaseUpdating || got.Operation == nil || got.Operation.RetryCount != 1 {
+				t.Fatalf("source = %+v, want Updating with the retry counted", got)
+			}
+			if got := store.statuses[surgeIndex].Operation; got == nil || got.PlacementWaitSince != nil {
+				t.Errorf("new gang's operation = %+v, want it kept with no placement wait", got)
+			}
+			if store.writes != 1 {
+				t.Errorf("committed status writes = %d, want 1: the wait goes in the write that opens the next attempt", store.writes)
+			}
+		})
 	}
 }
 

@@ -16,20 +16,8 @@ import (
 
 const DefaultRuntimeProbePort = 30000
 
-func resolveRuntimeTargetContainer(pod *v1.Pod) string {
-	if name, ok := pod.ObjectMeta.Annotations[constants.RuntimeContainerNameAnnotationKey]; ok && name != "" {
-		return name
-	}
-	return DefaultContainerName
-}
-
-func findContainer(pod *v1.Pod, name string) *v1.Container {
-	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == name {
-			return &pod.Spec.Containers[i]
-		}
-	}
-	return nil
+func runtimeTargetContainer(pod *v1.Pod) *v1.Container {
+	return findContainer(pod.Spec.Containers, targetContainerName(pod, constants.RuntimeContainerNameAnnotationKey))
 }
 
 // ----- shm ---------------------------------------------------------------
@@ -45,37 +33,26 @@ var ShmProfiles = map[string]struct{}{
 	"default": {},
 }
 
-type ShmInjector struct{}
-
-func NewShmInjector() *ShmInjector { return &ShmInjector{} }
-
-func (s *ShmInjector) InjectShm(pod *v1.Pod) error {
-	name, ok := pod.ObjectMeta.Annotations[constants.RuntimeShmProfileAnnotationKey]
-	if !ok || name == "" {
+func injectShm(pod *v1.Pod) error {
+	profile, err := lookupProfile(pod, constants.RuntimeShmProfileAnnotationKey, ShmProfiles, "shm")
+	if err != nil {
+		return err
+	}
+	if profile == nil {
 		return nil
 	}
-	if _, ok := ShmProfiles[name]; !ok {
-		return fmt.Errorf("unknown shm profile: %s", name)
-	}
-	target := findContainer(pod, resolveRuntimeTargetContainer(pod))
+	target := runtimeTargetContainer(pod)
 	if target == nil {
 		return nil
 	}
 
-	if !volumeNameExists(pod, DshmVolumeName) {
-		pod.Spec.Volumes = append(pod.Spec.Volumes, v1.Volume{
-			Name: DshmVolumeName,
-			VolumeSource: v1.VolumeSource{
-				EmptyDir: &v1.EmptyDirVolumeSource{Medium: v1.StorageMediumMemory},
-			},
-		})
-	}
-	if !containerHasVolumeMount(target, DshmVolumeName) {
-		target.VolumeMounts = append(target.VolumeMounts, v1.VolumeMount{
-			Name:      DshmVolumeName,
-			MountPath: "/dev/shm",
-		})
-	}
+	ensureVolume(pod, v1.Volume{
+		Name: DshmVolumeName,
+		VolumeSource: v1.VolumeSource{
+			EmptyDir: &v1.EmptyDirVolumeSource{Medium: v1.StorageMediumMemory},
+		},
+	})
+	ensureVolumeMount(target, v1.VolumeMount{Name: DshmVolumeName, MountPath: "/dev/shm"})
 	return nil
 }
 
@@ -90,24 +67,19 @@ var ProbeProfiles = map[string]ProbeProfile{
 	"vllm-http":   {Path: "/health"},
 }
 
-type ProbeInjector struct{}
-
-func NewProbeInjector() *ProbeInjector { return &ProbeInjector{} }
-
-func (p *ProbeInjector) InjectProbes(pod *v1.Pod) error {
-	name, ok := pod.ObjectMeta.Annotations[constants.RuntimeProbeProfileAnnotationKey]
-	if !ok || name == "" {
-		return nil
+func injectProbes(pod *v1.Pod) error {
+	profile, err := lookupProfile(pod, constants.RuntimeProbeProfileAnnotationKey, ProbeProfiles, "probe")
+	if err != nil {
+		return err
 	}
-	profile, ok := ProbeProfiles[name]
-	if !ok {
-		return fmt.Errorf("unknown probe profile: %s", name)
+	if profile == nil {
+		return nil
 	}
 	port, err := resolveProbePort(pod)
 	if err != nil {
 		return err
 	}
-	target := findContainer(pod, resolveRuntimeTargetContainer(pod))
+	target := runtimeTargetContainer(pod)
 	if target == nil {
 		return nil
 	}
@@ -163,18 +135,13 @@ var ObservabilityProfiles = map[string]ObservabilityProfile{
 	"prometheus": {Path: "/metrics"},
 }
 
-type ObservabilityInjector struct{}
-
-func NewObservabilityInjector() *ObservabilityInjector { return &ObservabilityInjector{} }
-
-func (o *ObservabilityInjector) InjectObservability(pod *v1.Pod) error {
-	name, ok := pod.ObjectMeta.Annotations[constants.RuntimeObservabilityProfileAnnotationKey]
-	if !ok || name == "" {
-		return nil
+func injectObservability(pod *v1.Pod) error {
+	profile, err := lookupProfile(pod, constants.RuntimeObservabilityProfileAnnotationKey, ObservabilityProfiles, "observability")
+	if err != nil {
+		return err
 	}
-	profile, ok := ObservabilityProfiles[name]
-	if !ok {
-		return fmt.Errorf("unknown observability profile: %s", name)
+	if profile == nil {
+		return nil
 	}
 	port, err := resolveObservabilityPort(pod)
 	if err != nil {
@@ -205,24 +172,6 @@ func resolvePort(pod *v1.Pod, key string) (int32, error) {
 		return 0, fmt.Errorf("invalid port %q (annotation %s)", v, key)
 	}
 	return int32(n), nil
-}
-
-func volumeNameExists(pod *v1.Pod, name string) bool {
-	for _, v := range pod.Spec.Volumes {
-		if v.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-func containerHasVolumeMount(c *v1.Container, name string) bool {
-	for _, m := range c.VolumeMounts {
-		if m.Name == name {
-			return true
-		}
-	}
-	return false
 }
 
 func setIfAbsent(m map[string]string, k, v string) {

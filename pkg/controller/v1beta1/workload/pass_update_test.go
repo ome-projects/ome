@@ -1653,6 +1653,86 @@ func TestReconcile_SurgeHoldNamesTheLiveExtraPod(t *testing.T) {
 	}
 }
 
+// TestReconcile_RebuildOfANeverPromotedInstanceIsNotHeldByAnotherInstancesExtraPod
+// shows the budget's reading of a start that adds no pod. Instance 0's
+// failed replacement stands beside its serving source and holds the one
+// surge slot. Instance 1 never ran a revision: its only pod waits on the
+// same image and serves nothing, so its start rebuilds that pod in place
+// and takes no slot. The pass opens the rebuild instead of holding it on
+// the slot the other Instance's pod holds, and Instance 0's own retry
+// opens beside it.
+func TestReconcile_RebuildOfANeverPromotedInstanceIsNotHeldByAnotherInstancesExtraPod(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	failure := &types.InstanceTermination{Reason: "ImagePullBackOff", Message: "manifest unknown", Time: metav1.NewTime(now.Add(-time.Minute))}
+	rows := []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "llama-70b-engine-priorrev", TargetRevision: "llama-70b-engine-newtarget",
+			PodCount: 2, ServingPodCount: 1, LastFailure: failure},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseFailed, TargetRevision: "llama-70b-engine-newtarget",
+			PodCount: 1, ServingPodCount: 0, LastFailure: failure},
+	}
+	extra := liveEnginePod("llama-70b", "prod", 0, 1, "newtarget", now.Add(-2*time.Minute))
+	own := liveEnginePod("llama-70b", "prod", 1, 0, "newtarget", now.Add(-2*time.Minute))
+	f := newTerminatingSurgeFixture(t, rows, []int32{0, 1}, []int32{0}, extra, own)
+
+	f.pass()
+
+	if row := f.in.ObservedState.Instance(1); row == nil || row.Phase != types.InstancePhaseUpdating || row.Operation == nil || row.Operation.Step != types.UpdateStepDrain {
+		t.Fatalf("the never-promoted Instance's rebuild must open: it adds no pod and takes nothing further offline, got %+v", row)
+	}
+	if row := f.in.ObservedState.Instance(0); row == nil || row.Phase != types.InstancePhaseUpdating || row.Operation == nil || row.Operation.Step != types.UpdateStepSurge {
+		t.Fatalf("the Instance holding the extra pod must still open its own retry over it, got %+v", row)
+	}
+	if hold := f.lastHold(); hold != nil {
+		t.Fatalf("no hold stands while both starts open, got %+v", hold)
+	}
+	if listed := f.listedPods(); len(listed) > 3 {
+		t.Fatalf("the Component must never carry more than replicas plus maxSurge pods, lists %v", listed)
+	}
+}
+
+// TestReconcile_TheHeldAnswerIsTheHoldBesideABudgetDenial is a prefill
+// side whose roll the coordination gate holds under the Held gate (the
+// decoder named to move first is Held) while an earlier start of the
+// same pass is denied by the surge budget: Instance 1's pod left rotation
+// a moment ago, so its start is listed first, and Instance 0's live
+// failed replacement holds the one surge slot against it. The slot frees
+// only through a start on Instance 0, which the gate holds, so the
+// Component reports the Held answer: it is what every start of this side
+// waits on until the operator acts, and the Budget wait has no way out of
+// its own.
+func TestReconcile_TheHeldAnswerIsTheHoldBesideABudgetDenial(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	failure := &types.InstanceTermination{Reason: "ImagePullBackOff", Message: "manifest unknown", Time: metav1.NewTime(now.Add(-time.Minute))}
+	rows := []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "llama-70b-engine-priorrev", TargetRevision: "llama-70b-engine-newtarget",
+			PodCount: 2, ServingPodCount: 1, LastFailure: failure},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "llama-70b-engine-priorrev", PodCount: 1, ServingPodCount: 0},
+	}
+	extra := liveEnginePod("llama-70b", "prod", 0, 1, "newtarget", now.Add(-2*time.Minute))
+	f := newTerminatingSurgeFixture(t, rows, []int32{0, 1}, []int32{0}, extra, unreadyEnginePod(1, 10*time.Second))
+	const heldReason = "engine batch 2 waits for decoder batch 2 to serve first (0 of 2 serving, 1 failed), and the decoder is held: " +
+		"update to svc-decoder-target held after 3 failed attempt(s): the image cannot be pulled; " +
+		"a corrected revision, or a release of the held revision on the decoder, resumes both sides"
+	var consults int
+	f.in.UpdateGate = func(string, types.UpdateStrategyType, int32, int32) (bool, types.RolloutHoldGate, string) {
+		consults++
+		return false, types.RolloutHoldGateHeld, heldReason
+	}
+
+	f.pass()
+
+	if consults == 0 {
+		t.Fatalf("no start of the pass reached the coordination gate")
+	}
+	if got := f.surgePods(); len(got) != 1 || got[0] != extra.Name {
+		t.Fatalf("no start may open while the roll is held, pods on the target: %v", got)
+	}
+	hold := f.lastHold()
+	if hold == nil || hold.Gate != types.RolloutHoldGateHeld || hold.Reason != heldReason || hold.Target != f.target.Name {
+		t.Fatalf("the Component must report the gate's Held answer on %s, got %+v", f.target.Name, hold)
+	}
+}
+
 // correctedPushRows are the rows a corrected push finds after an attempt
 // at a crashing revision was disposed on Instance 1: both Instances on
 // the prior revision, Instance 1 Failed with no operation and its source
@@ -2563,6 +2643,57 @@ func TestReconcile_RolledInstanceWhosePodTheKubeletRefused_RollRebuildsItUnderIt
 	}
 }
 
+// TestReconcile_InstanceStillOnTheOldRevisionWhosePodTheKubeletRefused_RollRebuildsIt:
+// four single-pod Instances roll in place under an unavailability budget
+// of one and restart policy RecreateInstanceOnPodRestart. While Instance
+// 0's in-place step is open, the node of Instance 3, which the roll has
+// not reached, refuses its pod: the kubelet reports it Failed with
+// OutOfcpu and the object stays in the API under the Instance's pod
+// name. The budget holds a start on Instance 3 while Instance 0 is in
+// flight, and with no pod left that could serve, the status publication
+// writes the row Pending. The row is off the roll target, so the restart
+// pass leaves it to the roll, and the roll's rebuild of a row with no
+// live pod is the Create pass's under every restart policy: it deletes
+// the refused pod with an event naming it and its reason and rebuilds
+// the Instance on version 2 under the slot its own outage already holds.
+// The roll finishes with four of four on version 2, the refused pod is
+// gone, and no repair was recorded.
+func TestReconcile_InstanceStillOnTheOldRevisionWhosePodTheKubeletRefused_RollRebuildsIt(t *testing.T) {
+	const replicas = 4
+	const refused = int32(3)
+	h := offTargetCrashHarness(t, false, types.UpdateStrategyInPlaceIfPossible, 0, 1, types.RestartPolicyRecreateInstance, replicas)
+	h.setTarget(h.revFixed, fixedImage)
+	firstStepOpen := func() bool {
+		row := h.instance(0)
+		return row != nil && row.Phase == types.InstancePhaseUpdating &&
+			h.untouchedOn(refused, h.revV1) && h.instanceServes(refused)
+	}
+	if !h.run(10, firstStepOpen) {
+		h.dumpState("first step")
+		t.Fatalf("Instance 0's in-place step never opened with Instance %d still serving v1", refused)
+	}
+	pod := h.rejectPod(refused, "OutOfcpu")
+	h.events = nil
+	h.holds = nil
+	done := func() bool { return h.settledOn(h.revFixed, replicas) }
+	invariant := func() { rollStaysWithinBudget(t, h, types.UpdateStrategyInPlaceIfPossible, 0, 1) }
+	if !h.runWithInvariant(60, done, invariant) {
+		h.dumpState("after the refusal")
+		t.Fatalf("the roll never finished after the kubelet refused Instance %d's pod: last hold %+v", refused, h.lastHold())
+	}
+	for _, live := range h.livePods() {
+		if live.UID == pod.UID {
+			t.Fatalf("the refused pod %s is still in the API; nothing deleted it", pod.Name)
+		}
+	}
+	if !h.sawEventWith(types.EventReasonTerminalPodRecycled, pod.Name) || !h.sawEventWith(types.EventReasonTerminalPodRecycled, "OutOfcpu") {
+		t.Fatalf("no event named the refused pod %s and its reason OutOfcpu: %v", pod.Name, h.events)
+	}
+	if h.sawEvent(types.EventReasonRestartTriggered) {
+		t.Fatalf("a row off the roll target is the roll's to rebuild, yet a repair was recorded: %v", h.events)
+	}
+}
+
 // budgetFixture is a Component of replicas single-pod engine Instances on
 // the prior revision under RecreatePod maxUnavailable 1 and restart policy
 // None, with a serving pod for each index in serving and the extra pods
@@ -2897,4 +3028,106 @@ func TestReconcile_KeptFailedReplacementsBesideAStartingScaleUp(t *testing.T) {
 
 		requireStartAdmitted(t, f, 0)
 	})
+}
+
+// TestReconcile_FailedGangSurge_StrategyEditRecreateAnswersToTheBudget:
+// two leader+worker gangs serve v1 under SurgeThenDrain with maxSurge 1
+// and maxUnavailable 1, and the operator pushes a revision whose pods
+// never pass readiness. Gang 0 surges a replacement; gang 1 waits on the
+// surge budget. The operator then edits the strategy to RecreatePod: gang
+// 1 is the one Instance the unavailability budget lets down, so it is
+// drained and rebuilt at once, and its rebuilt set never comes up. The
+// ready timeout ends gang 0's surge: the row reads Failed at its Surge
+// step with the claim kept and its own members still serving. The pass
+// that reads the edit over that row opens a recreate, which drains a
+// source that still serves, so it answers to the unavailability budget
+// like any drain-first start: while gang 1 is down, gang 0 keeps serving
+// and stays Failed on its claim. A corrective push then brings gang 1 up
+// on the fix, and only then is gang 0 recreated; at no pass are both gangs
+// out of serving.
+func TestReconcile_FailedGangSurge_StrategyEditRecreateAnswersToTheBudget(t *testing.T) {
+	const replicas = 2
+	none := types.RestartPolicyNone
+	h := offTargetCrashHarness(t, true, types.UpdateStrategySurgeThenDrain, 1, 1, none, replicas)
+	// The ready timeout is what ends a surge whose replacement never turns
+	// Ready.
+	h.lifecycle.InstanceReadyTimeout = &metav1.Duration{Duration: 4 * time.Minute}
+	// Version 2: version 1's image behind a readiness check its leader
+	// never passes.
+	neverReadySpec := h.podSpec(goodImage)
+	neverReadySpec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+		HTTPGet: &corev1.HTTPGetAction{Path: neverReadyPath, Port: intstr.FromInt32(8080)},
+	}}
+	revNeverReady := h.ensureRevision(neverReadySpec)
+	pushNeverReady := func() {
+		h.setTarget(revNeverReady, goodImage)
+		h.desired.PodSpec = neverReadySpec
+	}
+	pushNeverReady()
+	if !h.run(10, func() bool { return h.surgeOpen(0) && len(h.podsOf(2)) == 2 }) {
+		h.dumpState("surge toward the never-Ready revision")
+		t.Fatalf("gang 0 never opened its surge with a replacement at index 2")
+	}
+	// The edit lands while the surge is in flight. The recreate it opens on
+	// gang 1 runs under a longer deadline, so only the surge's ready timeout
+	// elapses in the window the test reads.
+	h.lifecycle.UpdateStrategy.Type = types.UpdateStrategyRecreatePod
+	h.lifecycle.InstanceReadyTimeout = &metav1.Duration{Duration: 30 * time.Minute}
+	pushNeverReady()
+	recreating := func(idx int32) bool {
+		s := h.instance(idx)
+		return s != nil && s.Phase == types.InstancePhaseUpdating && s.Operation != nil &&
+			s.Operation.Type == types.InstanceOperationUpdate && s.Operation.Step == types.UpdateStepDrain
+	}
+	if !h.run(10, func() bool { return recreating(1) && !h.instanceServes(1) }) {
+		h.dumpState("edit to recreate")
+		t.Fatalf("gang 1 was not drained by the recreate the edited strategy opens")
+	}
+	failedOnItsClaim := func() bool {
+		s := h.instance(0)
+		return s != nil && s.Phase == types.InstancePhaseFailed && s.Operation != nil &&
+			s.Operation.Step == types.UpdateStepSurge && s.Operation.SurgeIndex != nil
+	}
+	oneGangServes := func() {
+		if !h.instanceServes(0) && !h.instanceServes(1) {
+			h.dumpState("both gangs down")
+			t.Fatalf("both gangs are out of serving under an unavailability budget of 1; last hold %+v", h.lastHold())
+		}
+	}
+	if !h.runWithInvariant(20, failedOnItsClaim, oneGangServes) {
+		h.dumpState("ready timeout")
+		t.Fatalf("the ready timeout never left gang 0 Failed at its Surge step with its claim kept")
+	}
+	// The passes that read the edit over the Failed source: with gang 1
+	// down the recreate waits and gang 0 keeps serving on its claim.
+	h.runWithInvariant(4, func() bool { return false }, func() {
+		oneGangServes()
+		if !failedOnItsClaim() || !h.instanceServes(0) {
+			h.dumpState("edit read over the Failed source")
+			t.Fatalf("gang 0 left its Failed surge claim while gang 1 was down: %+v", h.instance(0))
+		}
+	})
+	if !recreating(1) {
+		t.Fatalf("gang 1's recreate must still be in flight for the reading above to hold, got %+v", h.instance(1))
+	}
+	// The fix is pushed: gang 1 comes up on it first, and only once it
+	// serves does the recreate of gang 0 open, with one gang serving at
+	// every pass. The run stops at that start: the wave that then reaps the
+	// released replacement index needs the adapter this harness does not
+	// wire.
+	h.setTarget(h.revFixed, fixedImage)
+	gang1ServesTheFix := false
+	if !h.runWithInvariant(60, func() bool { return recreating(0) }, func() {
+		oneGangServes()
+		if s := h.instance(1); s != nil && s.RunningRevision == h.revFixed.Name && h.instanceServes(1) {
+			gang1ServesTheFix = true
+		}
+		if recreating(0) && !gang1ServesTheFix {
+			h.dumpState("corrective push")
+			t.Fatalf("the recreate of gang 0 opened before gang 1 served the fix")
+		}
+	}) {
+		h.dumpState("corrective push")
+		t.Fatalf("the recreate of gang 0 never opened once gang 1 served the fix; last hold %+v", h.lastHold())
+	}
 }
