@@ -38,7 +38,7 @@ var fileDecoder = func() k8sruntime.Decoder {
 	return serializer.NewCodecFactory(scheme, serializer.EnableStrict).UniversalDeserializer()
 }()
 
-var fileClusterScopedKinds = map[string]bool{"ClusterServingRuntime": true, "ClusterBaseModel": true}
+var fileClusterScopedKinds = map[string]bool{"ClusterServingRuntime": true, "ClusterBaseModel": true, "WorkloadCluster": true}
 
 type fileObject struct {
 	object ctrlclient.Object
@@ -100,6 +100,11 @@ func (o *renderOptions) runFiles(ctx context.Context, f factory.Factory) error {
 	}
 
 	if len(services) == 0 {
+		if o.placementProjectionInput {
+			return writeRendered(o.Out, o.output, &renderedInferenceServiceList{
+				APIVersion: renderAPIVersion, Kind: renderListKind, Items: []*renderedInferenceService{},
+			})
+		}
 		return errors.New("no InferenceService in -f files")
 	}
 	sort.Slice(services, func(i, j int) bool {
@@ -168,6 +173,7 @@ func (o *renderOptions) readFileObjects(
 	workloadNamespace string,
 	inferenceServiceSchema *structuralschema.Structural,
 ) ([]fileObject, error) {
+	o.placementProjectionInput = false
 	var objects []fileObject
 	seen := map[string]string{}
 	for _, path := range o.filenames {
@@ -216,29 +222,47 @@ func (o *renderOptions) decodeFileObjects(
 		if len(raw) == 0 || string(raw) == "null" {
 			continue
 		}
-		raw, err = defaultFileInferenceService(raw, inferenceServiceSchema)
-		if err != nil {
-			return nil, fmt.Errorf("-f %s: apply InferenceService CRD defaults: %w", path, err)
+		documents := [][]byte{raw}
+		decoder := fileDecoder
+		if o.projectPlacement {
+			decoder = placementFileDecoder
+		} else {
+			var projection bool
+			documents, projection, err = expandPlacementProjection(raw)
+			if err != nil {
+				return nil, fmt.Errorf("-f %s: %w", path, err)
+			}
+			o.placementProjectionInput = o.placementProjectionInput || projection
 		}
-		decoded, gvk, err := fileDecoder.Decode(raw, nil, nil)
-		if k8sruntime.IsNotRegisteredError(err) {
-			fmt.Fprintf(o.ErrOut, "ignoring %s %s from %s: -f reads only InferenceServices, runtimes, and models\n",
-				gvk.GroupVersion(), gvk.Kind, path)
-			continue
+		for _, raw := range documents {
+			raw, err = defaultFileInferenceService(raw, inferenceServiceSchema)
+			if err != nil {
+				return nil, fmt.Errorf("-f %s: apply InferenceService CRD defaults: %w", path, err)
+			}
+			decoded, gvk, err := decoder.Decode(raw, nil, nil)
+			if k8sruntime.IsNotRegisteredError(err) {
+				kinds := "InferenceServices, runtimes, and models"
+				if o.projectPlacement {
+					kinds = "InferenceServices and WorkloadClusters"
+				}
+				fmt.Fprintf(o.ErrOut, "ignoring %s %s from %s: -f reads only %s\n",
+					gvk.GroupVersion(), gvk.Kind, path, kinds)
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("-f %s: %w", path, err)
+			}
+			object := decoded.(ctrlclient.Object)
+			if object.GetName() == "" {
+				return nil, fmt.Errorf("-f %s: %s has no metadata.name", path, gvk.Kind)
+			}
+			switch {
+			case fileClusterScopedKinds[gvk.Kind]:
+				object.SetNamespace("")
+			case object.GetNamespace() == "":
+				object.SetNamespace(workloadNamespace)
+			}
+			objects = append(objects, fileObject{object: object, kind: gvk.Kind})
 		}
-		if err != nil {
-			return nil, fmt.Errorf("-f %s: %w", path, err)
-		}
-		object := decoded.(ctrlclient.Object)
-		if object.GetName() == "" {
-			return nil, fmt.Errorf("-f %s: %s has no metadata.name", path, gvk.Kind)
-		}
-		switch {
-		case fileClusterScopedKinds[gvk.Kind]:
-			object.SetNamespace("")
-		case object.GetNamespace() == "":
-			object.SetNamespace(workloadNamespace)
-		}
-		objects = append(objects, fileObject{object: object, kind: gvk.Kind})
 	}
 }
