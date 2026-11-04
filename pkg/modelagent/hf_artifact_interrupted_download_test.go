@@ -472,7 +472,7 @@ func TestHfArtifactStartupCleanupRequiresConfigMapRead(t *testing.T) {
 	factory := omeinformers.NewSharedInformerFactory(omefake.NewSimpleClientset(), 0)
 	scout, err := NewScout(context.Background(), template.nodeName,
 		factory.Ome().V1beta1().BaseModels(), factory.Ome().V1beta1().ClusterBaseModels(),
-		factory, tasks, template.kubeClient, repository.configMaps, template.logger)
+		factory, tasks, template.kubeClient, repository.configMaps, omefake.NewSimpleClientset(), template.logger)
 	require.ErrorContains(t, err, "API unavailable")
 	require.Nil(t, scout)
 }
@@ -539,7 +539,7 @@ func newHfArtifactScout(t *testing.T, c *ConfigMapReconciler, models ...runtime.
 	baseModels := factory.Ome().V1beta1().BaseModels()
 	clusterBaseModels := factory.Ome().V1beta1().ClusterBaseModels()
 	scout, err := NewScout(context.Background(), template.nodeName, baseModels, clusterBaseModels,
-		factory, tasks, template.kubeClient, c, c.logger)
+		factory, tasks, template.kubeClient, c, client, c.logger)
 	require.NoError(t, err)
 	return scout, tasks, client
 }
@@ -549,7 +549,12 @@ func startHfArtifactScout(t *testing.T, c *ConfigMapReconciler, models ...runtim
 	scout, tasks, client := newHfArtifactScout(t, c, models...)
 	stop := make(chan struct{})
 	scout.startupStopCh = stop
-	t.Cleanup(func() { close(stop); scout.informerFactory.Shutdown() })
+	go scout.runDeleteConfirmationWorker()
+	t.Cleanup(func() {
+		close(stop)
+		scout.deleteQueue.ShutDown()
+		scout.informerFactory.Shutdown()
+	})
 	scout.informerFactory.Start(stop)
 	syncCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
