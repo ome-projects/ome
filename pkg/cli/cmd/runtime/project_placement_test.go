@@ -24,6 +24,7 @@ metadata:
   labels: {example: preview}
 spec:
   runtime: {name: vllm, kind: ServingRuntime}
+  routing: {enabled: true}
   placement:
     policy: ClusterAffinity
     mode: Split
@@ -104,6 +105,8 @@ func TestProjectPlacementFeedsRuntimeRender(t *testing.T) {
 	assert.Equal(t, 40, *split.Spec.Engine.MinReplicas)
 	assert.Equal(t, 27, *split.Spec.Decoder.MinReplicas)
 	assert.Equal(t, 2, *split.Spec.Router.MinReplicas)
+	assert.Nil(t, split.Spec.Placement)
+	assert.Nil(t, split.Spec.Routing)
 	assert.Empty(t, split.UID)
 	assert.Empty(t, split.ResourceVersion)
 	assert.Equal(t, "preview", split.Labels["example"])
@@ -216,4 +219,85 @@ func TestRuntimeRenderRejectsMalformedPlacementProjection(t *testing.T) {
 		require.Error(t, err)
 		assert.Empty(t, output)
 	}
+}
+
+func projectionRuntimeInputs(t *testing.T) (map[string]string, placementProjection) {
+	t.Helper()
+	files := projectionFiles()
+	crd, err := os.ReadFile("../../../../config/crd/full/ome.io_inferenceservices.yaml")
+	require.NoError(t, err)
+	files["isvc-crd.yaml"] = string(crd)
+	output, err := executeProjection(t, renderFactory(t, false), files, projectionArgs...)
+	require.NoError(t, err)
+	var projection placementProjection
+	require.NoError(t, json.Unmarshal([]byte(output), &projection))
+	runtime := strings.Split(renderFileRuntimes, "---")[0]
+	files["runtimes.yaml"] = runtime + "---\n" + strings.Replace(runtime, "  name: vllm\n", "  name: vllm\n  namespace: team-z\n", 1)
+	files["deploy.yaml"] = renderFileDeployConfig
+	return files, projection
+}
+
+const memberReplicaLimitCRD = renderFileInferenceServiceCRD + `
+              engine:
+                type: object
+                properties:
+                  minReplicas:
+                    type: integer
+                    maximum: 39
+`
+
+func TestRuntimeRenderValidatesProjectionItems(t *testing.T) {
+	for _, tc := range []struct{ name, want string }{
+		{"removed placement field", `unknown field "weight"`},
+		{"mixed placement weights", "not both"},
+		{"member schema limit", "less than or equal to 39"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files, projection := projectionRuntimeInputs(t)
+			if tc.name != "member schema limit" {
+				var item map[string]any
+				require.NoError(t, json.Unmarshal(projection.Items[1], &item))
+				term := map[string]any{
+					"matchFields": []any{map[string]any{"key": "metadata.name", "operator": "In", "values": []string{"member-a"}}},
+				}
+				if tc.name == "removed placement field" {
+					term["weight"] = 2
+				} else {
+					term["weights"] = map[string]any{"engine": 1, "decoderReplicas": map[string]any{"min": 1, "max": 1}}
+				}
+				item["spec"].(map[string]any)["placement"] = map[string]any{
+					"policy": "ClusterAffinity", "mode": "Split",
+					"clusterAffinity": []any{term},
+				}
+				var err error
+				projection.Items[1], err = json.Marshal(item)
+				require.NoError(t, err)
+			} else {
+				files["isvc-crd.yaml"] = memberReplicaLimitCRD
+			}
+			data, err := json.Marshal(projection)
+			require.NoError(t, err)
+			files["member.json"] = string(data)
+			out, _, err := executeRenderArgs(t, renderFactory(t, false), files,
+				"-f", "member.json", "-f", "runtimes.yaml", "--deploy-config", "deploy.yaml", "--inference-service-crd", "isvc-crd.yaml", "-o", "json")
+			require.ErrorContains(t, err, tc.want)
+			assert.Empty(t, out)
+		})
+	}
+}
+
+func TestRuntimeRenderProjectionValidationIsPerDocument(t *testing.T) {
+	files, projection := projectionRuntimeInputs(t)
+	projection.Items = projection.Items[:1]
+	data, err := json.Marshal(projection)
+	require.NoError(t, err)
+	ordinary := strings.Replace(placementSource, "weights: {default: 2}", "weight: 2", 1)
+	files["mixed.yaml"] = string(data) + "\n---\n" + ordinary
+	files["isvc-crd.yaml"] = memberReplicaLimitCRD
+	out, _, err := executeRenderArgs(t, renderFactory(t, false), files,
+		"-f", "mixed.yaml", "-f", "runtimes.yaml", "--deploy-config", "deploy.yaml", "--inference-service-crd", "isvc-crd.yaml", "-o", "json")
+	require.NoError(t, err)
+	var rendered renderedInferenceServiceList
+	require.NoError(t, json.Unmarshal([]byte(out), &rendered))
+	require.Len(t, rendered.Items, 2)
 }

@@ -138,7 +138,8 @@ renders every InferenceService in the files, across namespaces, as one
 RenderedInferenceServiceList; if any fails, nothing is printed.
 
 -f also accepts a PlacementProjection from runtime project-placement. Its
-member-specific sources pass through the same CRD validation and runtime merge.
+member-specific sources receive CRD defaults, schema validation, and strict
+placement-field decoding before runtime merging.
 A projection with no allocated sources renders an empty list.
 
 --view live merges the runtime as it is now; --view active merges the

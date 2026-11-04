@@ -311,16 +311,19 @@ items:                          # sorted by namespace, then name
 ```
 
 The envelope cannot be applied. Each item preserves source labels, annotations,
-and spec fields, with projected engine/decoder/router bounds and without server
-metadata or status. These are inputs for runtime rendering, not full member
+and serving spec fields, with projected engine/decoder/router bounds and without
+server metadata or status. Placement and routing directives are omitted, as in
+controller-derived member copies, so member API revisions need not understand
+the hub's placement contract. These are inputs for runtime rendering, not full member
 manifests derived by reconciliation. Status, admission, and retained rollout
 replicas do not influence desired projection. A zero allocation omits the source;
 no allocations produce `items: []`. Unsupported modes and invalid or duplicate
 inputs fail the whole operation without output.
 
-`runtime render -f` accepts this envelope and feeds its items through the same
-strict typed decoding, member CRD validation/defaulting, and runtime resolution
-as ordinary file inputs. It rejects malformed envelopes and duplicate identities
+`runtime render -f` accepts this envelope, applies member CRD defaults, validates
+each expanded item against that schema, and checks placement fields strictly
+before typed decoding and runtime resolution. These checks are scoped to each
+projection document. It rejects malformed envelopes and duplicate identities
 across projected and ordinary files. An empty projection renders an empty list;
 ordinary file input with no InferenceService remains an error.
 

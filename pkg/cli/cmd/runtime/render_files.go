@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/ome/pkg/cli/effective"
 	"sigs.k8s.io/ome/pkg/cli/factory"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	omevalidation "sigs.k8s.io/ome/pkg/validation"
 )
 
 // fileDecoder knows only the kinds file mode reads, so every other object
@@ -224,6 +225,7 @@ func (o *renderOptions) decodeFileObjects(
 		}
 		documents := [][]byte{raw}
 		decoder := fileDecoder
+		validateDocuments := o.projectPlacement
 		if o.projectPlacement {
 			decoder = placementFileDecoder
 		} else {
@@ -233,13 +235,14 @@ func (o *renderOptions) decodeFileObjects(
 				return nil, fmt.Errorf("-f %s: %w", path, err)
 			}
 			o.placementProjectionInput = o.placementProjectionInput || projection
+			validateDocuments = projection
 		}
 		for _, raw := range documents {
 			raw, err = defaultFileInferenceService(raw, inferenceServiceSchema)
 			if err != nil {
 				return nil, fmt.Errorf("-f %s: apply InferenceService CRD defaults: %w", path, err)
 			}
-			if o.projectPlacement {
+			if validateDocuments {
 				if err := validatePlacementFields(raw); err != nil {
 					return nil, fmt.Errorf("-f %s: validate spec.placement: %w", path, err)
 				}
@@ -259,6 +262,12 @@ func (o *renderOptions) decodeFileObjects(
 			}
 			if err != nil {
 				return nil, fmt.Errorf("-f %s: %w", path, err)
+			}
+			if validateDocuments && !o.projectPlacement {
+				isvc := decoded.(*v1beta1.InferenceService)
+				if err := omevalidation.ValidatePlacement(&isvc.Spec); err != nil {
+					return nil, fmt.Errorf("-f %s: validate projected placement: %w", path, err)
+				}
 			}
 			object := decoded.(ctrlclient.Object)
 			if object.GetName() == "" {

@@ -294,6 +294,9 @@ be applied. Server metadata and status are omitted; source labels and annotation
 are preserved. Sources with zero allocation are omitted. An empty projection
 renders an empty `RenderedInferenceServiceList`. Any invalid plan, duplicate
 input, or unsupported placement mode fails without partial output.
+Placement and routing directives used by the hub are omitted from emitted items.
+When `runtime render -f` expands a projection, it validates each item against
+the member CRD and checks placement fields strictly before runtime merging.
 
 Runtime history is retained evidence, not a complete audit log. Compact
 history tables may use display fingerprints such as `PREFIX#DIGEST`; copy

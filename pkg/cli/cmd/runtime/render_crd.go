@@ -119,21 +119,19 @@ func (o *renderOptions) loadInferenceServiceStructuralSchema() (*structuralschem
 	if err := structuraldefaulting.PruneDefaults(structural); err != nil {
 		return nil, fmt.Errorf("--inference-service-crd %s: prepare version %s defaults: %w", path, selected.Name, err)
 	}
-	if o.projectPlacement {
-		validator, _, err := crdvalidation.NewSchemaValidator(internalValidation.OpenAPIV3Schema)
-		if err != nil {
-			return nil, fmt.Errorf("--inference-service-crd %s: create validation schema: %w", path, err)
+	validator, _, err := crdvalidation.NewSchemaValidator(internalValidation.OpenAPIV3Schema)
+	if err != nil {
+		return nil, fmt.Errorf("--inference-service-crd %s: create validation schema: %w", path, err)
+	}
+	o.validateFileSpec = func(raw []byte) error {
+		object := map[string]interface{}{}
+		if err := kjson.Unmarshal(raw, &object); err != nil {
+			return err
 		}
-		o.validateFileSpec = func(raw []byte) error {
-			object := map[string]interface{}{}
-			if err := kjson.Unmarshal(raw, &object); err != nil {
-				return err
-			}
-			if object["apiVersion"] != v1beta1.SchemeGroupVersion.String() || object["kind"] != "InferenceService" {
-				return nil
-			}
-			return crdvalidation.ValidateCustomResource(field.NewPath("InferenceService"), object, validator).ToAggregate()
+		if object["apiVersion"] != v1beta1.SchemeGroupVersion.String() || object["kind"] != "InferenceService" {
+			return nil
 		}
+		return crdvalidation.ValidateCustomResource(field.NewPath("InferenceService"), object, validator).ToAggregate()
 	}
 	return structural, nil
 }

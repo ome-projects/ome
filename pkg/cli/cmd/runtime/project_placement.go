@@ -68,6 +68,7 @@ WorkloadCluster credentials. It outputs a cli.ome.io/v1alpha1 PlacementProjectio
 which runtime render accepts through -f. The output contains supplied manifest
 fields and is for preview only; it is not a complete controller-derived member
 manifest and cannot be applied.
+Placement and routing directives used by the hub are omitted from emitted items.
 
 Use the hub's OME revision for projection, then the member's revision, runtime
 files, deploy config, and CRD for runtime render.`,
@@ -147,6 +148,9 @@ func (o *projectPlacementOptions) runProjection(f factory.Factory) error {
 		if projected == nil {
 			continue
 		}
+		// Member API revisions validate serving inputs without hub directives.
+		projected.Spec.Placement = nil
+		projected.Spec.Routing = nil
 		item, err := json.Marshal(struct {
 			metav1.TypeMeta `json:",inline"`
 			Metadata        metav1.ObjectMeta            `json:"metadata"`
