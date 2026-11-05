@@ -181,6 +181,7 @@ An empty list succeeds; human output writes its empty-result notice to stderr.
 | `runtime explain --isvc SERVICE` | The same selection explanation for a service's model. |
 | `runtime effective SERVICE` | Live versus controller-active runtime evidence, inheritance, pins, and drift. |
 | `runtime render [SERVICE]` | The complete engine, decoder, and router specs the controller acts on, after the runtime merge and deploy defaults. Unredacted. |
+| `runtime project-placement [SERVICE]` | Final desired replica bounds for one member of a static Split source, computed offline by the placement controller's planner. |
 | `runtime history SERVICE` | Retention-bounded runtime ControllerRevision evidence. |
 | `runtime tree RUNTIME` | Parent paths, inheriting descendants, and explicit InferenceService users. |
 | `accelerator explain SERVICE` | Declared accelerator policy, reported selection, verified AcceleratorClass identity, and base/applied requests. |
@@ -260,6 +261,42 @@ kubectl ome runtime render -f base/services.yaml -f base/runtimes.yaml \
   --deploy-config base/inferenceservice-config.yaml \
   --inference-service-crd base/inferenceservice-crd.yaml > before.yaml
 ```
+
+For a hub `ClusterAffinity` source with mode `Split`, project its replica bounds
+before merging the member's runtime. Pass the complete WorkloadCluster inventory,
+including registrations rendered from charts. Projection reads the hub CRD's
+defaults, uses `ProjectSplitReplicas`, and ignores status, admission, and retained
+rollout replicas. It makes no API request or credential lookup.
+
+Both current weight forms are supported: integer `weights.default/engine/decoder/router`
+with optional `split.maxPerCluster`, and `weights.*Replicas: {min, max}` without
+a `split` block. Ratio minimums and maximums divide the source's component bounds
+independently. Removed scalar `weight` and `maxReplicasPerCluster` fields are errors.
+
+```sh
+kubectl ome runtime project-placement --member member-a \
+  -f hub/services.yaml -f hub/workloadclusters.yaml \
+  --inference-service-crd hub/inferenceservice-crd.yaml -o json > member.json
+kubectl ome runtime render -f member.json -f member/runtimes.yaml \
+  --deploy-config member/inferenceservice-config.yaml \
+  --inference-service-crd member/inferenceservice-crd.yaml -o json
+```
+
+Use a binary built against the hub's OME revision for the first command and the
+member's revision for the second. For a PR preview, run both stages on the base
+and proposed snapshots, then diff the rendered results. This projects desired
+bounds; live drift requires the actual member state.
+
+Projection emits a `cli.ome.io/v1alpha1 PlacementProjection` containing the
+member name and sorted `items`. These are source copies with member-specific
+bounds, not complete controller-derived member manifests. The projection cannot
+be applied. Server metadata and status are omitted; source labels and annotations
+are preserved. Sources with zero allocation are omitted. An empty projection
+renders an empty `RenderedInferenceServiceList`. Any invalid plan, duplicate
+input, or unsupported placement mode fails without partial output.
+Placement and routing directives used by the hub are omitted from emitted items.
+When `runtime render -f` expands a projection, it validates each item against
+the member CRD and checks placement fields strictly before runtime merging.
 
 Runtime history is retained evidence, not a complete audit log. Compact
 history tables may use display fingerprints such as `PREFIX#DIGEST`; copy

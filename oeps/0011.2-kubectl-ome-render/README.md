@@ -93,6 +93,8 @@ cannot represent a different revision's schema.
   so a preview does not need to know in advance which services a change
   affects.
 - Reuse exported controller helpers for every step.
+- Project a static Split hub source into one member's desired replica bounds
+  before resolving that member's runtime, using the existing placement planner.
 - Keep diagnostic reports allowlisted and unchanged.
 
 ### Non-Goals
@@ -273,6 +275,65 @@ the result for a service equals rendering it by name.
 Cluster mode still requires `ISVC`. Rendering every service in a
 cluster is out of scope: it needs `list` across namespaces and has no
 preview use yet.
+
+### Offline Placement Projection
+
+`kubectl ome runtime project-placement [ISVC] --member MEMBER` takes repeated
+`-f` inputs containing hub InferenceServices and the complete WorkloadCluster
+inventory, plus the hub's `--inference-service-crd`. It applies the existing
+file decoder and CRD defaults, then calls the controller's exported
+`ProjectSplitReplicas`. It supports explicit `ClusterAffinity` with mode `Split`
+and makes no API request, runtime lookup, or credential lookup. A name selects
+one source in the current namespace; otherwise every source is projected.
+
+The command accepts both current weight forms: integer weights with per-component
+`split.maxPerCluster` caps, and `*Replicas` ratios with independent `min` and `max`
+shares of the source's component bounds. The planner rejects mixing those forms
+or keeping `split` alongside ratios. Projection checks placement fields against
+the linked API types before the custom presence-preserving decoder runs, so
+removed fields such as scalar `weight` and `maxReplicasPerCluster` cannot be
+silently dropped and change the plan.
+Kubernetes' CRD schema validator checks the defaulted projection inputs, including
+positive component caps. Placement's existing validator and planner enforce the
+rules relating ratio weights, modes, and the split block.
+
+The output is a CLI-owned envelope:
+
+```yaml
+apiVersion: cli.ome.io/v1alpha1
+kind: PlacementProjection
+member: member-a
+items:                          # sorted by namespace, then name
+  - apiVersion: ome.io/v1beta1
+    kind: InferenceService
+    metadata: {name: chat, namespace: prod}
+    spec: { ...source with the member's desired replica bounds... }
+```
+
+The envelope cannot be applied. Each item preserves source labels, annotations,
+and serving spec fields, with projected engine/decoder/router bounds and without
+server metadata or status. Placement and routing directives are omitted, as in
+controller-derived member copies, so member API revisions need not understand
+the hub's placement contract. These are inputs for runtime rendering, not full member
+manifests derived by reconciliation. Status, admission, and retained rollout
+replicas do not influence desired projection. A zero allocation omits the source;
+no allocations produce `items: []`. Unsupported modes and invalid or duplicate
+inputs fail the whole operation without output.
+
+`runtime render -f` accepts this envelope, applies member CRD defaults, validates
+each expanded item against that schema, and checks placement fields strictly
+before typed decoding and runtime resolution. These checks are scoped to each
+projection document. It rejects malformed envelopes and duplicate identities
+across projected and ordinary files. An empty projection renders an empty list;
+ordinary file input with no InferenceService remains an error.
+
+Projection and runtime merge remain separate commands: a caller uses the hub's
+OME revision and CRD for placement, then the member's revision, CRD, runtime
+files, and deploy config for runtime rendering. The same two stages on PR base
+and proposed inputs show replica changes without copying allocation logic into
+the preview caller. A live drift comparison still needs actual member state.
+
+This adds only CLI code. The projection helper was already exported by #1247.
 
 ### Output Object
 
