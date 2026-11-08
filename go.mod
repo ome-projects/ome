@@ -54,9 +54,9 @@ require (
 	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3
 	knative.dev/pkg v0.0.0-20250326102644-9f3e60a9244c
 	sigs.k8s.io/controller-runtime v0.24.1
-	sigs.k8s.io/gateway-api v1.6.2
+	sigs.k8s.io/gateway-api v1.6.3
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
-	sigs.k8s.io/kueue v0.19.2
+	sigs.k8s.io/kueue v0.19.11
 	sigs.k8s.io/lws v0.9.0
 	sigs.k8s.io/scheduler-plugins v0.34.7
 	sigs.k8s.io/yaml v1.6.0
