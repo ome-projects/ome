@@ -88,15 +88,18 @@ type renderedComponent struct {
 
 type renderOptions struct {
 	genericiooptions.IOStreams
-	namespaceOptions        *namespace.Options
-	limits                  paging.Limits
-	readFile                func(string) ([]byte, error)
-	name                    string
-	view                    string
-	output                  string
-	deployConfigPath        string
-	inferenceServiceCRDPath string
-	filenames               []string
+	namespaceOptions         *namespace.Options
+	limits                   paging.Limits
+	readFile                 func(string) ([]byte, error)
+	name                     string
+	view                     string
+	output                   string
+	deployConfigPath         string
+	inferenceServiceCRDPath  string
+	filenames                []string
+	projectPlacement         bool
+	placementProjectionInput bool
+	validateFileSpec         func([]byte) error
 }
 
 func newRenderCmd(f factory.Factory, streams genericiooptions.IOStreams) *cobra.Command {
@@ -133,6 +136,11 @@ server defaults to file InferenceServices before they are decoded. Objects
 without a namespace get the -n namespace. Without INFERENCESERVICE, -f
 renders every InferenceService in the files, across namespaces, as one
 RenderedInferenceServiceList; if any fails, nothing is printed.
+
+-f also accepts a PlacementProjection from runtime project-placement. Its
+member-specific sources receive CRD defaults, schema validation, and strict
+placement-field decoding before runtime merging.
+A projection with no allocated sources renders an empty list.
 
 --view live merges the runtime as it is now; --view active merges the
 ControllerRevision the controller has pinned.
