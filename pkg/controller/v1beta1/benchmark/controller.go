@@ -592,6 +592,10 @@ func (r *BenchmarkJobReconciler) setStatusPending(benchmarkJob *v1beta1.Benchmar
 func (r *BenchmarkJobReconciler) syncStatusFromJob(benchmarkJob *v1beta1.BenchmarkJob, k8sJob *batchv1.Job) {
 	state, completionTime, failureMsg := r.parseJobStatus(k8sJob)
 
+	if benchmarkJob.Status.StartTime == nil && k8sJob.Status.StartTime != nil {
+		benchmarkJob.Status.StartTime = k8sJob.Status.StartTime
+	}
+
 	if benchmarkJob.Status.State == state {
 		return
 	}
@@ -599,10 +603,6 @@ func (r *BenchmarkJobReconciler) syncStatusFromJob(benchmarkJob *v1beta1.Benchma
 	now := metav1.Now()
 	benchmarkJob.Status.State = state
 	benchmarkJob.Status.LastReconcileTime = &now
-
-	if benchmarkJob.Status.StartTime == nil && k8sJob.Status.StartTime != nil {
-		benchmarkJob.Status.StartTime = k8sJob.Status.StartTime
-	}
 
 	switch state {
 	case stateFailed, stateCompleted:
