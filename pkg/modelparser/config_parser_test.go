@@ -866,6 +866,56 @@ func TestParseModelConfigFromFiles_PrefersRootConfig(t *testing.T) {
 	assert.Equal(t, []string{string(v1beta1.ModelCapabilityEmbedding)}, metadata.ModelCapabilities)
 }
 
+func TestParseModelConfigFromFiles_CountsOnlyConfigDirectory(t *testing.T) {
+	tensor := func(rows int64) []byte {
+		return safetensorsHeaderBytesForTest(t, map[string]map[string]any{
+			"w": {"shape": []int64{rows, 10}, "dtype": "F16", "data_offsets": []int64{0, rows * 20}},
+		})
+	}
+	config := []byte(`{"model_type":"llama","architectures":["LlamaForCausalLM"]}`)
+	cases := []struct {
+		name  string
+		files []ModelConfigFileInput
+	}{
+		{
+			name: "unindexed weights in a subfolder",
+			files: []ModelConfigFileInput{
+				{Path: "config.json", Data: config},
+				{Path: "model.safetensors", Data: tensor(10)},
+				{Path: "lora/adapter_model.safetensors", Data: tensor(5)},
+			},
+		},
+		{
+			name: "subfolder index sorts before the model index",
+			files: []ModelConfigFileInput{
+				{Path: "config.json", Data: config},
+				{Path: "model.safetensors.index.json", Data: []byte(`{"weight_map":{"w":"model.safetensors"}}`)},
+				{Path: "model.safetensors", Data: tensor(10)},
+				{Path: "a/model.safetensors.index.json", Data: []byte(`{"weight_map":{"w":"s.safetensors"}}`)},
+				{Path: "a/s.safetensors", Data: tensor(5)},
+			},
+		},
+		{
+			name: "config and weights in the same subfolder",
+			files: []ModelConfigFileInput{
+				{Path: "model/config.json", Data: config},
+				{Path: "model/model.safetensors", Data: tensor(10)},
+				{Path: "other/adapter_model.safetensors", Data: tensor(5)},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parser := &ModelConfigParser{logger: zap.NewNop().Sugar()}
+			metadata, err := parser.ParseModelConfigFromFiles(context.Background(), tc.files, nil, nil)
+			require.NoError(t, err)
+			require.NotNil(t, metadata)
+			assert.Equal(t, "100", metadata.ModelParameterSize)
+		})
+	}
+}
+
 func TestSplitModelConfigFileInputs_PrefersFileNearestRoot(t *testing.T) {
 	cases := []struct {
 		name      string
