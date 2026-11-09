@@ -112,6 +112,18 @@ func (p *ModelConfigParser) ParseModelConfigFromFiles(ctx context.Context, files
 	if configInput == nil {
 		return nil, fmt.Errorf("no model_index.json or config.json found in file input set")
 	}
+	if path.Base(configInput.Path) == DefaultConfigFileName {
+		// Transformer weights belong to the directory of config.json.
+		// Diffusers model_index.json can span component directories.
+		configDir := path.Dir(configInput.Path)
+		localFiles := make([]modelconfig.SafetensorsFileInput, 0, len(safetensorsFiles))
+		for _, file := range safetensorsFiles {
+			if path.Dir(file.Path) == configDir {
+				localFiles = append(localFiles, file)
+			}
+		}
+		safetensorsFiles = localFiles
+	}
 
 	var standaloneQuantConfig *modelconfig.HFQuantConfig
 	if len(hfQuantConfigBytes) > 0 {
