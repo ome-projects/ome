@@ -148,7 +148,9 @@ var (
 	//
 	// Resume is deliberately NOT a waiver: the ladder restarts at step 0 and
 	// every gate re-runs, so a revision that failed analysis fails again
-	// unless the underlying cause is fixed.
+	// unless the underlying cause is fixed. A promote or force already naming
+	// the parked revision is removed with the hold, so no approval given
+	// before the resume carries into the restarted ladder.
 	//
 	// Like the other rollout verbs this is control-plane-only: it is stripped
 	// at derive, so on a placed InferenceService it must be applied directly

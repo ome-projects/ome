@@ -212,6 +212,19 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 	if err := consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutRollbackAnnotation); err != nil {
 		return false, err
 	}
+	// A promote or force naming the parked revision predates the resume: it
+	// was set during the park, or applied before it with its removal lost.
+	// The reset below clears the record that keeps an applied one inert, so
+	// left in place it would open the restarted ladder's first gate. Every
+	// gate runs again, so it goes the same way as the rollback. A value naming
+	// another revision is another unit's verb, or inert, and stays.
+	for _, key := range promoteKeys {
+		if v, ok := in.ISVC.Annotations[key]; ok && v == cs.CanaryRevisionHash {
+			if err := consumeAnnotation(ctx, in.Client, in.ISVC, key); err != nil {
+				return false, err
+			}
+		}
+	}
 	// The record restarts the steps toward the stopped revision the value named; the
 	// member check above is what makes it a revision the unit still targets.
 	resetCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, cs.CanaryRevisionHash, in.Now)
