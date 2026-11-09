@@ -174,6 +174,7 @@ func DoctorAPICatalog() []DoctorAPI {
 	add("ome.io/v1beta1", "clusterservingruntimes", "ClusterServingRuntime", false, true)
 	add("ome.io/v1beta1", "inferencereplicas", "InferenceReplica", true, false)
 	add("ome.io/v1beta1", "autoscalerpolicies", "AutoscalerPolicy", true, false)
+	add("ome.io/v1beta1", "rolloutpolicies", "RolloutPolicy", true, false)
 	add("ome.io/v1beta1", "trafficmaps", "TrafficMap", true, false)
 	add("ome.io/v1beta1", "benchmarkjobs", "BenchmarkJob", true, false)
 	add("ome.io/v1beta1", "finetunedweights", "FineTunedWeight", false, false)
@@ -185,9 +186,9 @@ func DoctorAPICatalog() []DoctorAPI {
 	add("gateway.networking.k8s.io/v1", "httproutes", "HTTPRoute", true, false)
 	add("gateway.networking.k8s.io/v1", "gateways", "Gateway", true, false)
 	add("gateway.networking.k8s.io/v1", "gatewayclasses", "GatewayClass", false, false)
-	add("kueue.x-k8s.io/v1beta1", "workloads", "Workload", true, false)
-	add("kueue.x-k8s.io/v1beta1", "localqueues", "LocalQueue", true, false)
-	add("kueue.x-k8s.io/v1beta1", "clusterqueues", "ClusterQueue", false, false)
+	add("kueue.x-k8s.io/v1beta2", "workloads", "Workload", true, false)
+	add("kueue.x-k8s.io/v1beta2", "localqueues", "LocalQueue", true, false)
+	add("kueue.x-k8s.io/v1beta2", "clusterqueues", "ClusterQueue", false, false)
 	return result
 }
 

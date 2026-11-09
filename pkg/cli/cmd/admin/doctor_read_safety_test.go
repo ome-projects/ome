@@ -53,7 +53,7 @@ func TestDoctorProductionRedirectExitAndPrivacyContract(t *testing.T) {
 					var out, stderr bytes.Buffer
 					cmd := doctorCommand(f, &out, &stderr, deps)
 					args := []string{"doctor", "--ome-namespace", "control", "-o", format}
-					want := []string{"/api/v1", "/apis/apps/v1", "/apis/ome.io/v1beta1", "/apis/autoscaling/v2", "/apis/keda.sh/v1alpha1", "/apis/gateway.networking.k8s.io/v1", "/apis/kueue.x-k8s.io/v1beta1", "/apis/apps/v1/namespaces/control/deployments/ome-controller-manager"}
+					want := []string{"/api/v1", "/apis/apps/v1", "/apis/ome.io/v1beta1", "/apis/autoscaling/v2", "/apis/keda.sh/v1alpha1", "/apis/gateway.networking.k8s.io/v1", "/apis/kueue.x-k8s.io/v1beta2", "/apis/apps/v1/namespaces/control/deployments/ome-controller-manager"}
 					wantExit := 0
 					if target.name == "selected ISVC" {
 						args = append(args, "--isvc", "chat")

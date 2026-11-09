@@ -445,8 +445,8 @@ func TestDoctorProductionCollectorEmitsOnlyFixedExactGETs(t *testing.T) {
 						document = metav1.Status{Status: "Failure", Reason: metav1.StatusReasonTooManyRequests, Code: 429, Message: "SECRET https://private.example"}
 					case "/apis/gateway.networking.k8s.io/v1":
 						document = metav1.APIResourceList{GroupVersion: "gateway.networking.k8s.io/v1"}
-					case "/apis/kueue.x-k8s.io/v1beta1":
-						document = metav1.APIResourceList{GroupVersion: "kueue.x-k8s.io/v1beta1"}
+					case "/apis/kueue.x-k8s.io/v1beta2":
+						document = metav1.APIResourceList{GroupVersion: "kueue.x-k8s.io/v1beta2"}
 					case "/apis/apps/v1/namespaces/sk-cccccccccccccccccccc/deployments/ome-controller-manager":
 						document = appsv1.Deployment{TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"}, ObjectMeta: metav1.ObjectMeta{Name: "ome-controller-manager", Namespace: ome}, Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "sidecar", Image: "SECRET"}, {Name: "manager", Image: "private.example:v1.2.3"}}}}}}
 					case "/apis/ome.io/v1beta1/namespaces/sk-bbbbbbbbbbbbbbbbbbbb/inferenceservices/sk-aaaaaaaaaaaaaaaaaaaa":
@@ -496,7 +496,7 @@ func TestDoctorProductionCollectorEmitsOnlyFixedExactGETs(t *testing.T) {
 			if out.String() != baseline {
 				t.Fatalf("%s report changed because of untrusted Warning header", format)
 			}
-			want := []string{"/api/v1", "/apis/apps/v1", "/apis/ome.io/v1beta1", "/apis/autoscaling/v2", "/apis/keda.sh/v1alpha1", "/apis/gateway.networking.k8s.io/v1", "/apis/kueue.x-k8s.io/v1beta1", "/apis/apps/v1/namespaces/sk-cccccccccccccccccccc/deployments/ome-controller-manager"}
+			want := []string{"/api/v1", "/apis/apps/v1", "/apis/ome.io/v1beta1", "/apis/autoscaling/v2", "/apis/keda.sh/v1alpha1", "/apis/gateway.networking.k8s.io/v1", "/apis/kueue.x-k8s.io/v1beta2", "/apis/apps/v1/namespaces/sk-cccccccccccccccccccc/deployments/ome-controller-manager"}
 			if selected {
 				want = append(want, "/apis/ome.io/v1beta1/namespaces/sk-bbbbbbbbbbbbbbbbbbbb/inferenceservices/sk-aaaaaaaaaaaaaaaaaaaa")
 			}
@@ -523,7 +523,7 @@ func TestDoctorProductionCollectorEmitsOnlyFixedExactGETs(t *testing.T) {
 			if err := json.Unmarshal(data, &value); err != nil {
 				t.Fatal(err)
 			}
-			if len(value.Content.APIs) != 26 || value.Content.HasViolations() {
+			if len(value.Content.APIs) != 27 || value.Content.HasViolations() {
 				t.Fatal("wrong production discovery projection")
 			}
 			for _, api := range value.Content.APIs {

@@ -18,7 +18,7 @@ Every run performs the same fixed reads:
 
 1. Seven API discovery documents, one per group version: `v1`, `apps/v1`,
    `ome.io/v1beta1`, `autoscaling/v2`, `keda.sh/v1alpha1`,
-   `gateway.networking.k8s.io/v1` and `kueue.x-k8s.io/v1beta1`.
+   `gateway.networking.k8s.io/v1` and `kueue.x-k8s.io/v1beta2`.
 2. The `ome-controller-manager` Deployment in `--ome-namespace`
    (default `ome`), by exact name.
 3. Only with `--isvc NAME`: that one named InferenceService in the effective
@@ -29,9 +29,9 @@ required ones are `pods`, `events` and `configmaps` (`v1`), `deployments`
 (`apps/v1`), and `inferenceservices`, `basemodels`, `servingruntimes`,
 `clusterbasemodels` and `clusterservingruntimes` (`ome.io/v1beta1`) — and
 verifies each advertised resource's kind and scope match what OME expects.
-Optional resources (InferenceReplica, AutoscalerPolicy, HPA, KEDA
-ScaledObject, Gateway API, Kueue, and others) are reported the same way but
-never fail the run. From the manager Deployment it extracts the `manager`
+Optional resources (InferenceReplica, AutoscalerPolicy, RolloutPolicy, HPA,
+KEDA ScaledObject, Gateway API, Kueue, and others) are reported the same way
+but never fail the run. From the manager Deployment it extracts the `manager`
 container's image tag as a version candidate and compares it against the CLI
 version.
 
