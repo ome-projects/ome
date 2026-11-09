@@ -14,7 +14,7 @@ var discoveryGroups = []struct{ version, path string }{
 	{"autoscaling/v2", "/apis/autoscaling/v2"},
 	{"keda.sh/v1alpha1", "/apis/keda.sh/v1alpha1"},
 	{"gateway.networking.k8s.io/v1", "/apis/gateway.networking.k8s.io/v1"},
-	{"kueue.x-k8s.io/v1beta1", "/apis/kueue.x-k8s.io/v1beta1"},
+	{"kueue.x-k8s.io/v1beta2", "/apis/kueue.x-k8s.io/v1beta2"},
 }
 
 // discoveryRows never interprets advertised verbs as the caller's permissions.

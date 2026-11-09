@@ -825,11 +825,16 @@ func validOperation(operation *omev1beta1.InstanceOperation) bool {
 	}
 }
 
+// normalizeOperationWaiting keeps the tokens the workload controller's holds
+// table records on InstanceOperation.Waiting, in that table's order.
 func normalizeOperationWaiting(value string) (string, bool) {
 	switch value {
 	case "":
 		return "", false
-	case "QuotaExceeded", "NodeUnknown", "SourceUnrouted", "Unschedulable", "PodGroupTerminating", "Paused":
+	case workload.RejectionReasonQuotaExceeded, workload.RejectionReasonAdmissionUnavailable,
+		workload.WaitingReasonNodeUnknown, workload.WaitingReasonCapacityProvisioning,
+		workload.WaitingReasonSourceUnrouted, workload.WaitingReasonUnschedulable,
+		workload.WaitingReasonPodGroupTerminating, workload.WaitingReasonPaused:
 		return value, false
 	default:
 		return "Unknown", true

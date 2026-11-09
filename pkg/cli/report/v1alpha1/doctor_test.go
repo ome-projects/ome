@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime"
+
+	ome "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/cli/printers"
 	"sigs.k8s.io/ome/pkg/cli/report"
 	"sigs.k8s.io/yaml"
@@ -99,6 +102,28 @@ func TestDoctorViolationsAreOnlyProvedRequiredAbsence(t *testing.T) {
 		c := (DoctorContent{APIs: []DoctorAPI{{ID: DoctorAPIID(tc.id), Availability: tc.state}}}).Canonical()
 		if c.HasViolations() != tc.want {
 			t.Fatalf("%s/%s violated=%v", tc.id, tc.state, c.HasViolations())
+		}
+	}
+}
+
+func TestDoctorAPICatalogCoversEveryOMEKind(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := ome.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cataloged := map[string]bool{}
+	for _, api := range DoctorAPICatalog() {
+		if api.GroupVersion == ome.SchemeGroupVersion.String() {
+			cataloged[api.Kind] = true
+		}
+	}
+	apiPackage := reflect.TypeOf(ome.InferenceService{}).PkgPath()
+	for kind, goType := range scheme.KnownTypes(ome.SchemeGroupVersion) {
+		if goType.PkgPath() != apiPackage || strings.HasSuffix(kind, "List") {
+			continue
+		}
+		if !cataloged[kind] {
+			t.Errorf("doctor API catalog has no row for %s", kind)
 		}
 	}
 }

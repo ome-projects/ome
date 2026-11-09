@@ -22,7 +22,7 @@ import (
 	r "sigs.k8s.io/ome/pkg/cli/report/v1alpha1"
 )
 
-var fixturePaths = []string{"/api/v1", "/apis/apps/v1", "/apis/ome.io/v1beta1", "/apis/autoscaling/v2", "/apis/keda.sh/v1alpha1", "/apis/gateway.networking.k8s.io/v1", "/apis/kueue.x-k8s.io/v1beta1"}
+var fixturePaths = []string{"/api/v1", "/apis/apps/v1", "/apis/ome.io/v1beta1", "/apis/autoscaling/v2", "/apis/keda.sh/v1alpha1", "/apis/gateway.networking.k8s.io/v1", "/apis/kueue.x-k8s.io/v1beta2"}
 
 func discoveryFixture(path string) metav1.APIResourceList {
 	gv := strings.TrimPrefix(path, "/apis/")
@@ -32,11 +32,11 @@ func discoveryFixture(path string) metav1.APIResourceList {
 	resources := map[string][]string{
 		"v1":                           {"pods:Pod", "events:Event", "configmaps:ConfigMap"},
 		"apps/v1":                      {"deployments:Deployment", "controllerrevisions:ControllerRevision"},
-		"ome.io/v1beta1":               {"inferenceservices:InferenceService", "basemodels:BaseModel", "servingruntimes:ServingRuntime", "clusterbasemodels:ClusterBaseModel:cluster", "clusterservingruntimes:ClusterServingRuntime:cluster", "inferencereplicas:InferenceReplica", "autoscalerpolicies:AutoscalerPolicy", "trafficmaps:TrafficMap", "benchmarkjobs:BenchmarkJob", "finetunedweights:FineTunedWeight:cluster", "acceleratorclasses:AcceleratorClass:cluster", "acceleratorquotas:AcceleratorQuota:cluster", "workloadclusters:WorkloadCluster:cluster"},
+		"ome.io/v1beta1":               {"inferenceservices:InferenceService", "basemodels:BaseModel", "servingruntimes:ServingRuntime", "clusterbasemodels:ClusterBaseModel:cluster", "clusterservingruntimes:ClusterServingRuntime:cluster", "inferencereplicas:InferenceReplica", "autoscalerpolicies:AutoscalerPolicy", "rolloutpolicies:RolloutPolicy", "trafficmaps:TrafficMap", "benchmarkjobs:BenchmarkJob", "finetunedweights:FineTunedWeight:cluster", "acceleratorclasses:AcceleratorClass:cluster", "acceleratorquotas:AcceleratorQuota:cluster", "workloadclusters:WorkloadCluster:cluster"},
 		"autoscaling/v2":               {"horizontalpodautoscalers:HorizontalPodAutoscaler"},
 		"keda.sh/v1alpha1":             {"scaledobjects:ScaledObject"},
 		"gateway.networking.k8s.io/v1": {"httproutes:HTTPRoute", "gateways:Gateway", "gatewayclasses:GatewayClass:cluster"},
-		"kueue.x-k8s.io/v1beta1":       {"workloads:Workload", "localqueues:LocalQueue", "clusterqueues:ClusterQueue:cluster"},
+		"kueue.x-k8s.io/v1beta2":       {"workloads:Workload", "localqueues:LocalQueue", "clusterqueues:ClusterQueue:cluster"},
 	}
 	value := metav1.APIResourceList{TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "APIResourceList"}, GroupVersion: gv, APIResources: []metav1.APIResource{}}
 	for _, encoded := range resources[gv] {
@@ -101,7 +101,7 @@ func TestCollectFixedGETsAndNoInventedWorkloadPermissions(t *testing.T) {
 			if !reflect.DeepEqual(*paths, want) {
 				t.Fatalf("paths=%v want=%v", *paths, want)
 			}
-			if len(s.APIs) != 26 {
+			if len(s.APIs) != 27 {
 				t.Fatalf("API rows=%d", len(s.APIs))
 			}
 			for _, a := range s.APIs {

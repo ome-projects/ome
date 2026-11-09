@@ -168,7 +168,8 @@ completes.
 - **reason** — why the operation exists (for example a revision-roll cause).
   Set once when the operation starts, and distinct from `waiting`.
 - **waiting** — what *external* condition is currently holding the operation
-  back: `QuotaExceeded`, `NodeUnknown`, `SourceUnrouted`, `Unschedulable`,
+  back: `QuotaExceeded`, `AdmissionUnavailable`, `NodeUnknown`,
+  `CapacityProvisioning`, `SourceUnrouted`, `Unschedulable`,
   `PodGroupTerminating`, or `Paused`. Empty means nothing external blocks it.
   A token this CLI build does not know renders as `Unknown` with an
   `OperationWaitingUnknown` issue rather than echoing the raw value.

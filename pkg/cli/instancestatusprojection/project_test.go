@@ -368,8 +368,12 @@ func TestProjectRejectsUnvalidatedAnnouncementPayload(t *testing.T) {
 func TestProjectOperationWaitingKnownValues(t *testing.T) {
 	t.Parallel()
 
+	// Every token the workload controller's holds table records.
 	for _, waiting := range []string{
-		"QuotaExceeded", "NodeUnknown", "SourceUnrouted", "Unschedulable", "PodGroupTerminating", "Paused",
+		workload.RejectionReasonQuotaExceeded, workload.RejectionReasonAdmissionUnavailable,
+		workload.WaitingReasonNodeUnknown, workload.WaitingReasonCapacityProvisioning,
+		workload.WaitingReasonSourceUnrouted, workload.WaitingReasonUnschedulable,
+		workload.WaitingReasonPodGroupTerminating, workload.WaitingReasonPaused,
 	} {
 		waiting := waiting
 		t.Run(waiting, func(t *testing.T) {
