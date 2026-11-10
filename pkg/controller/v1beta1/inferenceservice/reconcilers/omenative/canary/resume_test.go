@@ -519,16 +519,26 @@ func TestResume_LeftoverPromoteDoesNotOpenTheRestartedGate(t *testing.T) {
 			isvc.Status.Canary.CurrentStep = tc.parkedStep
 			isvc.Status.Canary.PromotedThrough = tc.promotedThrough
 			isvc.Status.Canary.Failed = &v1beta1.CanaryFailure{Reason: v1beta1.CanaryFailureCapacityTimeout}
+			c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithObjects(isvc).Build()
+			in.Client = c
 
-			if _, err := Reconcile(context.Background(), in); err != nil {
+			res, err := Reconcile(context.Background(), in)
+			if err != nil {
 				t.Fatalf("Reconcile: %v", err)
 			}
 			if cs := isvc.Status.Canary; phaseOf(isvc) != v1beta1.RolloutPhasePending || cs.CurrentStep != 0 {
 				t.Fatalf("resume must re-arm at step 0, got phase %q step %d", phaseOf(isvc), cs.CurrentStep)
 			}
+			// The leftover goes the way of the rollback verb: removed on the
+			// apiserver before the status flush, so a copy that outlived the
+			// flush cannot open the gate either.
+			if _, still := storedAnnotations(t, c, isvc)[tc.key]; still {
+				t.Fatalf("%s must be removed durably before the flush", tc.key)
+			}
 			if named := hasEvent(eventsFrom(rec), "removed the pending "+tc.key+" for that revision"); named != tc.pending {
 				t.Fatalf("resume event names the removed %s: got %v, want %v (only a pending one is named)", tc.key, named, tc.pending)
 			}
+			flushed(t, c, isvc, res)
 
 			// Step 0's capacity is met on the next pass, so only its manual gate
 			// stands between the canary and step 1.
@@ -542,7 +552,7 @@ func TestResume_LeftoverPromoteDoesNotOpenTheRestartedGate(t *testing.T) {
 			}
 
 			// A promote given after the resume is the gate's own.
-			isvc.Annotations[constants.RolloutPromoteAnnotation] = "new"
+			isvc.Annotations = map[string]string{constants.RolloutPromoteAnnotation: "new"}
 			in.Now = in.Now.Add(reconcileRequeue)
 			if _, err := Reconcile(context.Background(), in); err != nil {
 				t.Fatalf("Reconcile with a fresh promote: %v", err)

@@ -237,7 +237,7 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 	recordResume(in.ISVC, in.Component, resumeApplied)
 	note := ""
 	if len(dropped) > 0 {
-		note = "; removed the pending " + strings.Join(dropped, " and ") + " for that revision, so the first gate waits for a new promote"
+		note = "; removed the pending " + strings.Join(dropped, " and ") + " for that revision, which cannot advance the restarted canary"
 	}
 	emit(in.Recorder, in.ISVC, corev1.EventTypeNormal, EventReasonRolloutResumed,
 		"resumed %s from %s: re-entering the canary ladder at step 0 on revision %s; every gate re-runs%s",
