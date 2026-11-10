@@ -386,7 +386,7 @@ type ObjectReference struct {
 }
 
 // LifeCycleState enum
-// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed
+// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed;Evicted
 type LifeCycleState string
 
 const (
@@ -396,6 +396,9 @@ const (
 	LifeCycleStateInTraining LifeCycleState = "In_Training"
 	LifeCycleStateReady      LifeCycleState = "Ready"
 	LifeCycleStateFailed     LifeCycleState = "Failed"
+	// Evicted means local model artifacts were intentionally released.
+	// The Model CR remains available for restoration.
+	LifeCycleStateEvicted LifeCycleState = "Evicted"
 )
 
 const (
@@ -447,6 +450,13 @@ const (
 	ModelConditionReasonPVCConfigMissing = "PVCConfigMissing"
 )
 
+// ModelRehydrationStatus records the last restoration request acknowledged by
+// at least one Ready node. Completion is history, not proof
+// of present readiness; the current request is in the Model annotation.
+type ModelRehydrationStatus struct {
+	CompletedRequestID string `json:"completedRequestID,omitempty"`
+}
+
 // ModelStatusSpec defines the observed state of Model weight
 type ModelStatusSpec struct {
 	// LifeCycle is an enum of Deprecated, Experiment, Public, Internal
@@ -474,6 +484,10 @@ type ModelStatusSpec struct {
 
 	// +listType=atomic
 	NodesFailed []string `json:"nodesFailed,omitempty"`
+
+	// Rehydration records restoration completion for per-node models.
+	// +optional
+	Rehydration *ModelRehydrationStatus `json:"rehydration,omitempty"`
 
 	// Conditions describe model readiness and source/metadata state. The PVC
 	// path reports SourceReachable and Ready; PerNode models continue to

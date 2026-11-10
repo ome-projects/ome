@@ -5,6 +5,7 @@ import (
 	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/backends/pernode"
@@ -27,12 +28,12 @@ func pickBackend(backends []shared.Backend, spec *v1beta1.BaseModelSpec) shared.
 // perNodeBackend is the observational default: it reflects the per-node
 // model-status ConfigMaps written by the model-agent DaemonSet into the
 // model's status. It always matches and is the registry fallback.
-type perNodeBackend struct{}
+type perNodeBackend struct{ nodeReader client.Reader }
 
 func (perNodeBackend) Name() string                          { return "pernode" }
 func (perNodeBackend) Matches(_ *v1beta1.BaseModelSpec) bool { return true }
 
-func (perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ctrl.Result, error) {
+func (b perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ctrl.Result, error) {
 	// A model whose storage URI flipped away from pvc:// lands on the
 	// per-node backend; scrub any leftover PVC Job / ConfigMap / conditions
 	// before running the per-node flow. Idempotent no-op when there are no
@@ -42,7 +43,7 @@ func (perNodeBackend) Reconcile(ctx context.Context, a shared.BackendArgs) (ctrl
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, err
 	}
 
-	if err := pernode.ReconcileStatusFromConfigMaps(ctx, a.Client, a.Log, a.Obj, a.IsClusterScoped, a.Kind); err != nil {
+	if err := pernode.ReconcileStatusFromConfigMaps(ctx, a.Client, b.nodeReader, a.Log, a.Obj, a.IsClusterScoped, a.Kind); err != nil {
 		a.Log.Error(err, "Failed to update "+a.Kind+" status")
 		return ctrl.Result{RequeueAfter: time.Minute}, err
 	}

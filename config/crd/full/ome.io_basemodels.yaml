@@ -381,6 +381,11 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              rehydration:
+                properties:
+                  completedRequestID:
+                    type: string
+                type: object
               state:
                 enum:
                 - Creating
@@ -389,6 +394,7 @@ spec:
                 - In_Training
                 - Ready
                 - Failed
+                - Evicted
                 type: string
             required:
             - state

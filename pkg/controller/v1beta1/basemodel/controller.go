@@ -42,6 +42,7 @@ type BaseModelReconciler struct {
 	client.Client
 	Log            logr.Logger
 	Scheme         *runtime.Scheme
+	nodeReader     client.Reader
 	OmeAgentConfig *controllerconfig.OmeAgentConfig
 }
 
@@ -50,6 +51,7 @@ type ClusterBaseModelReconciler struct {
 	client.Client
 	Log            logr.Logger
 	Scheme         *runtime.Scheme
+	nodeReader     client.Reader
 	OmeAgentConfig *controllerconfig.OmeAgentConfig
 }
 
@@ -58,14 +60,14 @@ type ClusterBaseModelReconciler struct {
 func (r *BaseModelReconciler) backends() []shared.Backend {
 	return []shared.Backend{
 		pvc.New(r.OmeAgentConfig),
-		perNodeBackend{},
+		perNodeBackend{nodeReader: r.nodeReader},
 	}
 }
 
 func (r *ClusterBaseModelReconciler) backends() []shared.Backend {
 	return []shared.Backend{
 		pvc.New(r.OmeAgentConfig),
-		perNodeBackend{},
+		perNodeBackend{nodeReader: r.nodeReader},
 	}
 }
 
@@ -147,6 +149,7 @@ func reconcileModel(ctx context.Context, c client.Client, scheme *runtime.Scheme
 
 // SetupWithManager sets up the BaseModel controller with the Manager
 func (r *BaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.nodeReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.BaseModel{}).
 		Owns(&batchv1.Job{}).
@@ -179,6 +182,7 @@ func (r *BaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // SetupWithManager sets up the ClusterBaseModel controller with the Manager
 func (r *ClusterBaseModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.nodeReader = mgr.GetAPIReader()
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1beta1.ClusterBaseModel{}).
 		Owns(&batchv1.Job{}).

@@ -113,6 +113,9 @@ var (
 	ModelConfigFileName = "models.json"
 )
 
+// ModelArtifactRehydrationIDAnnotation identifies a restoration request.
+const ModelArtifactRehydrationIDAnnotation = "ome.io/artifact-rehydration-id"
+
 // Model agent Constants
 const (
 	AgentConfigMapKeyName = "agent"

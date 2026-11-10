@@ -2,35 +2,75 @@ package pernode
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 
 	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/basemodel/shared"
 	"sigs.k8s.io/ome/pkg/modelagent"
 )
 
-// ReconcileStatusFromConfigMaps drives the per-node ConfigMap handshake:
-// list per-node model-status ConfigMaps, parse this model's entries, and
-// reflect them into Status.NodesReady/NodesFailed plus LifeCycleState.
-// This is the observational "normal flow" — the model-agent DaemonSet
-// downloads to nodes and writes status; the controller only reads it back.
-func ReconcileStatusFromConfigMaps(ctx context.Context, c client.Client, log logr.Logger, obj client.Object, isClusterScoped bool, kind string) error {
-	var namespace string
-	if !isClusterScoped {
-		namespace = obj.GetNamespace()
+// ReconcileStatusFromConfigMaps preserves the independent metadata filling and
+// status updates. PVC and sharded backends bypass this per-node path.
+func ReconcileStatusFromConfigMaps(ctx context.Context, c client.Client, nodeReader client.Reader, log logr.Logger, obj client.Object, isClusterScoped bool, kind string) error {
+	reports, err := readModelReports(ctx, c, log, obj, isClusterScoped)
+	if err != nil {
+		return err
 	}
-	specUpdate := func(ctx context.Context, config *modelagent.ModelConfig) error {
-		return retrySpecUpdate(ctx, c, log, obj, config, func(ctx context.Context, kubeClient client.Client, latest client.Object, config *modelagent.ModelConfig) error {
-			latestSpec, _, err := shared.ModelSpecAndStatus(latest)
+	for _, report := range reports {
+		config := report.entry.Config
+		if config == nil {
+			continue
+		}
+		err := retrySpecUpdate(ctx, c, log, obj, config, func(ctx context.Context, c client.Client, current client.Object, config *modelagent.ModelConfig) error {
+			if current.GetUID() != obj.GetUID() {
+				return fmt.Errorf("%s identity changed during reconciliation", kind)
+			}
+			spec, _, err := shared.ModelSpecAndStatus(current)
 			if err != nil {
 				return err
 			}
-			return updateModelSpecWithConfig(ctx, kubeClient, log, latest, latestSpec, config, kind)
+			return updateModelSpecWithConfig(ctx, c, log, current, spec, config, kind)
 		})
+		if err != nil {
+			log.Error(err, "Could not fill Model configuration", "kind", kind)
+		}
 	}
-	statusUpdate := func(ctx context.Context, nodesReady, nodesFailed []string) error {
-		return updateModelStatusWithRetry(ctx, c, log, obj, nodesReady, nodesFailed, kind)
-	}
-	return processModelStatus(ctx, c, log, namespace, obj.GetName(), isClusterScoped, specUpdate, statusUpdate)
+	firstAttempt := true
+	return shared.RetryUpdate(ctx, c, log, obj, "status", func(ctx context.Context, c client.Client, current client.Object) error {
+		if current.GetUID() != obj.GetUID() {
+			return fmt.Errorf("%s identity changed during reconciliation", kind)
+		}
+		// Share the initial read with metadata filling. A conflict invalidates
+		// those reports; retry against the freshly fetched Model and reports.
+		if !firstAttempt {
+			reports, err = readModelReports(ctx, c, log, current, isClusterScoped)
+			if err != nil {
+				return err
+			}
+		}
+		firstAttempt = false
+		snapshot, err := collectModelStatus(ctx, nodeReader, current, reports)
+		if err != nil {
+			return err
+		}
+		_, status, err := shared.ModelSpecAndStatus(current)
+		if err != nil {
+			return err
+		}
+		oldStatus := status.DeepCopy()
+		status.NodesReady, status.NodesFailed = snapshot.ready, snapshot.failed
+		status.State = snapshot.lifecycleState()
+		if snapshot.completedRequestID != "" {
+			status.Rehydration = &v1beta1.ModelRehydrationStatus{CompletedRequestID: snapshot.completedRequestID}
+		}
+		if reflect.DeepEqual(oldStatus, status) {
+			return nil
+		}
+		shared.StampObservedReconcile(current, status)
+		return c.Status().Update(ctx, current)
+	})
 }
