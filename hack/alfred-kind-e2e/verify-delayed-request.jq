@@ -78,9 +78,9 @@ def targets_proven:
     .fallbackAfter.spec.unschedulable == true and
     all(.targets.nodes[]; . as $target |
       .metadata.annotations["alfred-e2e.ome.io/gpu-health"] == "unhealthy" and
-      any($e.originalNodes.items[]; .metadata.name == $target.metadata.name and
-        all(.status.conditions[]? | select(.type == "GpuUnhealthy"); .status != "True") and
-        . as $original |
+      any($e.originalNodes.items[]; . as $original |
+        .metadata.name == $target.metadata.name and
+        all($original.status.conditions[]? | select(.type == "GpuUnhealthy"); .status != "True") and
         any($target.status.conditions[]; .type == "GpuUnhealthy" and .status == "True" and
           .reason == "AlfredE2EGpuUnhealthy" and
           (.lastTransitionTime | instant) >= ($e.request.payload.requested_at | instant) and
