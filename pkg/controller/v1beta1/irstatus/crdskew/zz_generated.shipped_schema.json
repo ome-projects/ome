@@ -3,17 +3,17 @@
   "AcceleratorClass": 30,
   "AcceleratorQuota": 53,
   "AutoscalerPolicy": 78,
-  "BaseModel": 88,
-  "BenchmarkJob": 161,
-  "ClusterBaseModel": 88,
-  "ClusterServingRuntime": 231,
-  "FineTunedWeight": 233,
-  "InferenceReplica": 268,
-  "InferenceService": 369,
-  "RolloutPolicy": 372,
-  "ServingRuntime": 231,
-  "TrafficMap": 384,
-  "WorkloadCluster": 389
+  "BaseModel": 89,
+  "BenchmarkJob": 162,
+  "ClusterBaseModel": 89,
+  "ClusterServingRuntime": 232,
+  "FineTunedWeight": 234,
+  "InferenceReplica": 269,
+  "InferenceService": 370,
+  "RolloutPolicy": 373,
+  "ServingRuntime": 232,
+  "TrafficMap": 385,
+  "WorkloadCluster": 390
  },
  "nodes": [
   {},
@@ -612,6 +612,11 @@
   },
   {
    "properties": {
+    "completedRequestID": 0
+   }
+  },
+  {
+   "properties": {
     "cache": 86,
     "conditions": 28,
     "lastReconcileTime": 0,
@@ -619,6 +624,7 @@
     "nodesFailed": 1,
     "nodesReady": 1,
     "observedGeneration": 0,
+    "rehydration": 87,
     "state": 0
    }
   },
@@ -628,7 +634,7 @@
     "kind": 0,
     "metadata": 0,
     "spec": 85,
-    "status": 87
+    "status": 88
    }
   },
   {
@@ -646,8 +652,8 @@
   },
   {
    "properties": {
-    "endpoint": 89,
-    "inferenceService": 90
+    "endpoint": 90,
+    "inferenceService": 91
    }
   },
   {
@@ -680,22 +686,22 @@
   },
   {
    "properties": {
-    "configMapKeyRef": 92,
-    "fieldRef": 93,
-    "fileKeyRef": 94,
-    "resourceFieldRef": 95,
-    "secretKeyRef": 92
+    "configMapKeyRef": 93,
+    "fieldRef": 94,
+    "fileKeyRef": 95,
+    "resourceFieldRef": 96,
+    "secretKeyRef": 93
    }
   },
   {
    "properties": {
     "name": 0,
     "value": 0,
-    "valueFrom": 96
+    "valueFrom": 97
    }
   },
   {
-   "items": 97
+   "items": 98
   },
   {
    "properties": {
@@ -705,13 +711,13 @@
   },
   {
    "properties": {
-    "configMapRef": 99,
+    "configMapRef": 100,
     "prefix": 0,
-    "secretRef": 99
+    "secretRef": 100
    }
   },
   {
-   "items": 100
+   "items": 101
   },
   {
    "properties": {
@@ -720,11 +726,11 @@
    }
   },
   {
-   "items": 102
+   "items": 103
   },
   {
    "properties": {
-    "claims": 103,
+    "claims": 104,
     "limits": 14,
     "requests": 14
    }
@@ -739,7 +745,7 @@
    }
   },
   {
-   "items": 105
+   "items": 106
   },
   {
    "properties": {
@@ -753,7 +759,7 @@
    }
   },
   {
-   "items": 107
+   "items": 108
   },
   {
    "properties": {
@@ -806,12 +812,12 @@
    }
   },
   {
-   "items": 114
+   "items": 115
   },
   {
    "properties": {
     "defaultMode": 0,
-    "items": 115,
+    "items": 116,
     "name": 0,
     "optional": 0
    }
@@ -827,19 +833,19 @@
   },
   {
    "properties": {
-    "fieldRef": 93,
+    "fieldRef": 94,
     "mode": 0,
     "path": 0,
-    "resourceFieldRef": 95
+    "resourceFieldRef": 96
    }
   },
   {
-   "items": 118
+   "items": 119
   },
   {
    "properties": {
     "defaultMode": 0,
-    "items": 119
+    "items": 120
    }
   },
   {
@@ -872,9 +878,9 @@
   {
    "properties": {
     "accessModes": 1,
-    "dataSource": 122,
-    "dataSourceRef": 123,
-    "resources": 124,
+    "dataSource": 123,
+    "dataSourceRef": 124,
+    "resources": 125,
     "selector": 15,
     "storageClassName": 0,
     "volumeAttributesClassName": 0,
@@ -885,12 +891,12 @@
   {
    "properties": {
     "metadata": 0,
-    "spec": 125
+    "spec": 126
    }
   },
   {
    "properties": {
-    "volumeClaimTemplate": 126
+    "volumeClaimTemplate": 127
    }
   },
   {
@@ -1003,14 +1009,14 @@
   },
   {
    "properties": {
-    "items": 115,
+    "items": 116,
     "name": 0,
     "optional": 0
    }
   },
   {
    "properties": {
-    "items": 119
+    "items": 120
    }
   },
   {
@@ -1033,21 +1039,21 @@
   },
   {
    "properties": {
-    "clusterTrustBundle": 141,
-    "configMap": 142,
-    "downwardAPI": 143,
-    "podCertificate": 144,
-    "secret": 142,
-    "serviceAccountToken": 145
+    "clusterTrustBundle": 142,
+    "configMap": 143,
+    "downwardAPI": 144,
+    "podCertificate": 145,
+    "secret": 143,
+    "serviceAccountToken": 146
    }
   },
   {
-   "items": 146
+   "items": 147
   },
   {
    "properties": {
     "defaultMode": 0,
-    "sources": 147
+    "sources": 148
    }
   },
   {
@@ -1089,7 +1095,7 @@
   {
    "properties": {
     "defaultMode": 0,
-    "items": 115,
+    "items": 116,
     "optional": 0,
     "secretName": 0
    }
@@ -1113,53 +1119,53 @@
   },
   {
    "properties": {
-    "awsElasticBlockStore": 109,
-    "azureDisk": 110,
-    "azureFile": 111,
-    "cephfs": 112,
-    "cinder": 113,
-    "configMap": 116,
-    "csi": 117,
-    "downwardAPI": 120,
-    "emptyDir": 121,
-    "ephemeral": 127,
-    "fc": 128,
-    "flexVolume": 129,
-    "flocker": 130,
-    "gcePersistentDisk": 131,
-    "gitRepo": 132,
-    "glusterfs": 133,
-    "hostPath": 134,
-    "image": 135,
-    "iscsi": 136,
+    "awsElasticBlockStore": 110,
+    "azureDisk": 111,
+    "azureFile": 112,
+    "cephfs": 113,
+    "cinder": 114,
+    "configMap": 117,
+    "csi": 118,
+    "downwardAPI": 121,
+    "emptyDir": 122,
+    "ephemeral": 128,
+    "fc": 129,
+    "flexVolume": 130,
+    "flocker": 131,
+    "gcePersistentDisk": 132,
+    "gitRepo": 133,
+    "glusterfs": 134,
+    "hostPath": 135,
+    "image": 136,
+    "iscsi": 137,
     "name": 0,
-    "nfs": 137,
-    "persistentVolumeClaim": 138,
-    "photonPersistentDisk": 139,
-    "portworxVolume": 140,
-    "projected": 148,
-    "quobyte": 149,
-    "rbd": 150,
-    "scaleIO": 151,
-    "secret": 152,
-    "storageos": 153,
-    "vsphereVolume": 154
+    "nfs": 138,
+    "persistentVolumeClaim": 139,
+    "photonPersistentDisk": 140,
+    "portworxVolume": 141,
+    "projected": 149,
+    "quobyte": 150,
+    "rbd": 151,
+    "scaleIO": 152,
+    "secret": 153,
+    "storageos": 154,
+    "vsphereVolume": 155
    }
   },
   {
-   "items": 155
+   "items": 156
   },
   {
    "properties": {
     "affinity": 21,
-    "env": 98,
-    "envFrom": 101,
+    "env": 99,
+    "envFrom": 102,
     "image": 0,
     "nodeSelector": 14,
-    "resources": 104,
-    "tolerations": 106,
-    "volumeMounts": 108,
-    "volumes": 156
+    "resources": 105,
+    "tolerations": 107,
+    "volumeMounts": 109,
+    "volumes": 157
    }
   },
   {
@@ -1174,15 +1180,15 @@
    "properties": {
     "additionalRequestParams": 14,
     "dataset": 84,
-    "endpoint": 91,
+    "endpoint": 92,
     "huggingFaceSecretReference": 36,
     "maxRequestsPerIteration": 0,
     "maxTimePerIteration": 0,
     "numConcurrency": 1,
     "outputLocation": 84,
-    "podOverride": 157,
+    "podOverride": 158,
     "resultFolderName": 0,
-    "serviceMetadata": 158,
+    "serviceMetadata": 159,
     "task": 0,
     "trafficScenarios": 1
    }
@@ -1202,8 +1208,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 159,
-    "status": 160
+    "spec": 160,
+    "status": 161
    }
   },
   {
@@ -1228,12 +1234,12 @@
    }
   },
   {
-   "items": 164
+   "items": 165
   },
   {
    "properties": {
     "host": 0,
-    "httpHeaders": 165,
+    "httpHeaders": 166,
     "path": 0,
     "port": 0,
     "scheme": 0
@@ -1252,16 +1258,16 @@
   },
   {
    "properties": {
-    "exec": 163,
-    "httpGet": 166,
-    "sleep": 167,
-    "tcpSocket": 168
+    "exec": 164,
+    "httpGet": 167,
+    "sleep": 168,
+    "tcpSocket": 169
    }
   },
   {
    "properties": {
-    "postStart": 169,
-    "preStop": 169,
+    "postStart": 170,
+    "preStop": 170,
     "stopSignal": 0
    }
   },
@@ -1273,14 +1279,14 @@
   },
   {
    "properties": {
-    "exec": 163,
+    "exec": 164,
     "failureThreshold": 0,
-    "grpc": 171,
-    "httpGet": 166,
+    "grpc": 172,
+    "httpGet": 167,
     "initialDelaySeconds": 0,
     "periodSeconds": 0,
     "successThreshold": 0,
-    "tcpSocket": 168,
+    "tcpSocket": 169,
     "terminationGracePeriodSeconds": 0,
     "timeoutSeconds": 0
    }
@@ -1295,7 +1301,7 @@
    }
   },
   {
-   "items": 173
+   "items": 174
   },
   {
    "properties": {
@@ -1304,7 +1310,7 @@
    }
   },
   {
-   "items": 175
+   "items": 176
   },
   {
    "properties": {
@@ -1315,11 +1321,11 @@
   {
    "properties": {
     "action": 0,
-    "exitCodes": 177
+    "exitCodes": 178
    }
   },
   {
-   "items": 178
+   "items": 179
   },
   {
    "properties": {
@@ -1352,17 +1358,17 @@
   {
    "properties": {
     "allowPrivilegeEscalation": 0,
-    "appArmorProfile": 180,
-    "capabilities": 181,
+    "appArmorProfile": 181,
+    "capabilities": 182,
     "privileged": 0,
     "procMount": 0,
     "readOnlyRootFilesystem": 0,
     "runAsGroup": 0,
     "runAsNonRoot": 0,
     "runAsUser": 0,
-    "seLinuxOptions": 182,
-    "seccompProfile": 180,
-    "windowsOptions": 183
+    "seLinuxOptions": 183,
+    "seccompProfile": 181,
+    "windowsOptions": 184
    }
   },
   {
@@ -1372,39 +1378,39 @@
    }
   },
   {
-   "items": 185
+   "items": 186
   },
   {
    "properties": {
     "args": 1,
     "command": 1,
-    "env": 98,
-    "envFrom": 101,
+    "env": 99,
+    "envFrom": 102,
     "image": 0,
     "imagePullPolicy": 0,
-    "lifecycle": 170,
-    "livenessProbe": 172,
+    "lifecycle": 171,
+    "livenessProbe": 173,
     "name": 0,
-    "ports": 174,
-    "readinessProbe": 172,
-    "resizePolicy": 176,
-    "resources": 104,
+    "ports": 175,
+    "readinessProbe": 173,
+    "resizePolicy": 177,
+    "resources": 105,
     "restartPolicy": 0,
-    "restartPolicyRules": 179,
-    "securityContext": 184,
-    "startupProbe": 172,
+    "restartPolicyRules": 180,
+    "securityContext": 185,
+    "startupProbe": 173,
     "stdin": 0,
     "stdinOnce": 0,
     "terminationMessagePath": 0,
     "terminationMessagePolicy": 0,
     "tty": 0,
-    "volumeDevices": 186,
-    "volumeMounts": 108,
+    "volumeDevices": 187,
+    "volumeMounts": 109,
     "workingDir": 0
    }
   },
   {
-   "items": 187
+   "items": 188
   },
   {
    "properties": {
@@ -1421,7 +1427,7 @@
   {
    "properties": {
     "acceleratorClass": 0,
-    "constraints": 189,
+    "constraints": 190,
     "policy": 0
    }
   },
@@ -1440,7 +1446,7 @@
   },
   {
    "properties": {
-    "authenticationRef": 192,
+    "authenticationRef": 193,
     "metadata": 14,
     "metricType": 0,
     "name": 0,
@@ -1449,23 +1455,23 @@
    }
   },
   {
-   "items": 193
+   "items": 194
   },
   {
    "properties": {
     "advanced": 70,
     "cooldownPeriod": 0,
-    "fallback": 191,
+    "fallback": 192,
     "idleReplicaCount": 0,
     "pollingInterval": 0,
-    "triggers": 194
+    "triggers": 195
    }
   },
   {
    "properties": {
     "class": 0,
     "hpa": 67,
-    "keda": 195
+    "keda": 196
    }
   },
   {
@@ -1476,14 +1482,14 @@
   },
   {
    "properties": {
-    "rollingUpdate": 197,
+    "rollingUpdate": 198,
     "type": 0
    }
   },
   {
    "properties": {
     "nameservers": 1,
-    "options": 165,
+    "options": 166,
     "searches": 1
    }
   },
@@ -1494,7 +1500,7 @@
    }
   },
   {
-   "items": 200
+   "items": 201
   },
   {
    "items": 36
@@ -1505,7 +1511,7 @@
    }
   },
   {
-   "items": 203
+   "items": 204
   },
   {
    "properties": {
@@ -1515,23 +1521,23 @@
    }
   },
   {
-   "items": 205
+   "items": 206
   },
   {
    "properties": {
-    "appArmorProfile": 180,
+    "appArmorProfile": 181,
     "fsGroup": 0,
     "fsGroupChangePolicy": 0,
     "runAsGroup": 0,
     "runAsNonRoot": 0,
     "runAsUser": 0,
     "seLinuxChangePolicy": 0,
-    "seLinuxOptions": 182,
-    "seccompProfile": 180,
+    "seLinuxOptions": 183,
+    "seccompProfile": 181,
     "supplementalGroups": 1,
     "supplementalGroupsPolicy": 0,
-    "sysctls": 165,
-    "windowsOptions": 183
+    "sysctls": 166,
+    "windowsOptions": 184
    }
   },
   {
@@ -1547,25 +1553,25 @@
    }
   },
   {
-   "items": 208
+   "items": 209
   },
   {
    "properties": {
     "activeDeadlineSeconds": 0,
     "affinity": 21,
     "automountServiceAccountToken": 0,
-    "containers": 188,
-    "dnsConfig": 199,
+    "containers": 189,
+    "dnsConfig": 200,
     "dnsPolicy": 0,
     "enableServiceLinks": 0,
-    "hostAliases": 201,
+    "hostAliases": 202,
     "hostIPC": 0,
     "hostNetwork": 0,
     "hostPID": 0,
     "hostUsers": 0,
     "hostname": 0,
-    "imagePullSecrets": 202,
-    "initContainers": 188,
+    "imagePullSecrets": 203,
+    "initContainers": 189,
     "nodeName": 0,
     "nodeSelector": 14,
     "os": 36,
@@ -1573,23 +1579,23 @@
     "preemptionPolicy": 0,
     "priority": 0,
     "priorityClassName": 0,
-    "readinessGates": 204,
-    "resourceClaims": 206,
+    "readinessGates": 205,
+    "resourceClaims": 207,
     "restartPolicy": 0,
-    "runner": 187,
+    "runner": 188,
     "runtimeClassName": 0,
     "schedulerName": 0,
-    "schedulingGates": 202,
-    "securityContext": 207,
+    "schedulingGates": 203,
+    "securityContext": 208,
     "serviceAccount": 0,
     "serviceAccountName": 0,
     "setHostnameAsFQDN": 0,
     "shareProcessNamespace": 0,
     "subdomain": 0,
     "terminationGracePeriodSeconds": 0,
-    "tolerations": 106,
-    "topologySpreadConstraints": 209,
-    "volumes": 156
+    "tolerations": 107,
+    "topologySpreadConstraints": 210,
+    "volumes": 157
    }
   },
   {
@@ -1612,19 +1618,19 @@
   },
   {
    "properties": {
-    "inPlaceUpdateStrategy": 212,
-    "rollingUpdate": 213,
+    "inPlaceUpdateStrategy": 213,
+    "rollingUpdate": 214,
     "type": 0
    }
   },
   {
    "properties": {
     "instanceReadyTimeout": 0,
-    "migrationPolicy": 211,
+    "migrationPolicy": 212,
     "minReadySeconds": 0,
     "readyPolicy": 0,
     "restartPolicy": 0,
-    "updateStrategy": 214
+    "updateStrategy": 215
    }
   },
   {
@@ -1632,18 +1638,18 @@
     "activeDeadlineSeconds": 0,
     "affinity": 21,
     "automountServiceAccountToken": 0,
-    "containers": 188,
-    "dnsConfig": 199,
+    "containers": 189,
+    "dnsConfig": 200,
     "dnsPolicy": 0,
     "enableServiceLinks": 0,
-    "hostAliases": 201,
+    "hostAliases": 202,
     "hostIPC": 0,
     "hostNetwork": 0,
     "hostPID": 0,
     "hostUsers": 0,
     "hostname": 0,
-    "imagePullSecrets": 202,
-    "initContainers": 188,
+    "imagePullSecrets": 203,
+    "initContainers": 189,
     "nodeName": 0,
     "nodeSelector": 14,
     "os": 36,
@@ -1651,14 +1657,14 @@
     "preemptionPolicy": 0,
     "priority": 0,
     "priorityClassName": 0,
-    "readinessGates": 204,
-    "resourceClaims": 206,
+    "readinessGates": 205,
+    "resourceClaims": 207,
     "restartPolicy": 0,
-    "runner": 187,
+    "runner": 188,
     "runtimeClassName": 0,
     "schedulerName": 0,
-    "schedulingGates": 202,
-    "securityContext": 207,
+    "schedulingGates": 203,
+    "securityContext": 208,
     "serviceAccount": 0,
     "serviceAccountName": 0,
     "setHostnameAsFQDN": 0,
@@ -1666,36 +1672,36 @@
     "size": 0,
     "subdomain": 0,
     "terminationGracePeriodSeconds": 0,
-    "tolerations": 106,
-    "topologySpreadConstraints": 209,
-    "volumes": 156
+    "tolerations": 107,
+    "topologySpreadConstraints": 210,
+    "volumes": 157
    }
   },
   {
    "properties": {
-    "acceleratorOverride": 190,
+    "acceleratorOverride": 191,
     "activeDeadlineSeconds": 0,
     "affinity": 21,
     "annotations": 14,
     "automountServiceAccountToken": 0,
-    "autoscaler": 196,
-    "autoscalerPolicyRef": 192,
-    "containers": 188,
-    "deploymentStrategy": 198,
-    "dnsConfig": 199,
+    "autoscaler": 197,
+    "autoscalerPolicyRef": 193,
+    "containers": 189,
+    "deploymentStrategy": 199,
+    "dnsConfig": 200,
     "dnsPolicy": 0,
     "enableServiceLinks": 0,
-    "hostAliases": 201,
+    "hostAliases": 202,
     "hostIPC": 0,
     "hostNetwork": 0,
     "hostPID": 0,
     "hostUsers": 0,
     "hostname": 0,
-    "imagePullSecrets": 202,
-    "initContainers": 188,
+    "imagePullSecrets": 203,
+    "initContainers": 189,
     "labels": 14,
-    "leader": 210,
-    "lifecycle": 215,
+    "leader": 211,
+    "lifecycle": 216,
     "maxReplicas": 0,
     "maxUnavailable": 0,
     "minAvailable": 0,
@@ -1707,14 +1713,14 @@
     "preemptionPolicy": 0,
     "priority": 0,
     "priorityClassName": 0,
-    "readinessGates": 204,
-    "resourceClaims": 206,
+    "readinessGates": 205,
+    "resourceClaims": 207,
     "restartPolicy": 0,
-    "runner": 187,
+    "runner": 188,
     "runtimeClassName": 0,
     "schedulerName": 0,
-    "schedulingGates": 202,
-    "securityContext": 207,
+    "schedulingGates": 203,
+    "securityContext": 208,
     "serviceAccount": 0,
     "serviceAccountName": 0,
     "servicePortAppProtocols": 14,
@@ -1723,39 +1729,39 @@
     "subdomain": 0,
     "terminationGracePeriodSeconds": 0,
     "timeoutSeconds": 0,
-    "tolerations": 106,
+    "tolerations": 107,
     "topologyKey": 0,
     "topologySpread": 0,
-    "topologySpreadConstraints": 209,
+    "topologySpreadConstraints": 210,
     "topologySpreadKey": 0,
-    "volumes": 156,
-    "worker": 216
+    "volumes": 157,
+    "worker": 217
    }
   },
   {
    "properties": {
-    "acceleratorOverride": 190,
+    "acceleratorOverride": 191,
     "activeDeadlineSeconds": 0,
     "affinity": 21,
     "annotations": 14,
     "automountServiceAccountToken": 0,
-    "autoscaler": 196,
-    "autoscalerPolicyRef": 192,
-    "containers": 188,
-    "deploymentStrategy": 198,
-    "dnsConfig": 199,
+    "autoscaler": 197,
+    "autoscalerPolicyRef": 193,
+    "containers": 189,
+    "deploymentStrategy": 199,
+    "dnsConfig": 200,
     "dnsPolicy": 0,
     "enableServiceLinks": 0,
-    "hostAliases": 201,
+    "hostAliases": 202,
     "hostIPC": 0,
     "hostNetwork": 0,
     "hostPID": 0,
     "hostUsers": 0,
     "hostname": 0,
-    "imagePullSecrets": 202,
-    "initContainers": 188,
+    "imagePullSecrets": 203,
+    "initContainers": 189,
     "labels": 14,
-    "lifecycle": 215,
+    "lifecycle": 216,
     "maxReplicas": 0,
     "maxUnavailable": 0,
     "minAvailable": 0,
@@ -1767,14 +1773,14 @@
     "preemptionPolicy": 0,
     "priority": 0,
     "priorityClassName": 0,
-    "readinessGates": 204,
-    "resourceClaims": 206,
+    "readinessGates": 205,
+    "resourceClaims": 207,
     "restartPolicy": 0,
-    "runner": 187,
+    "runner": 188,
     "runtimeClassName": 0,
     "schedulerName": 0,
-    "schedulingGates": 202,
-    "securityContext": 207,
+    "schedulingGates": 203,
+    "securityContext": 208,
     "serviceAccount": 0,
     "serviceAccountName": 0,
     "servicePortAppProtocols": 14,
@@ -1783,11 +1789,11 @@
     "subdomain": 0,
     "terminationGracePeriodSeconds": 0,
     "timeoutSeconds": 0,
-    "tolerations": 106,
+    "tolerations": 107,
     "topologySpread": 0,
-    "topologySpreadConstraints": 209,
+    "topologySpreadConstraints": 210,
     "topologySpreadKey": 0,
-    "volumes": 156
+    "volumes": 157
    }
   },
   {
@@ -1808,25 +1814,25 @@
     "affinity": 21,
     "annotations": 14,
     "automountServiceAccountToken": 0,
-    "autoscaler": 196,
-    "autoscalerPolicyRef": 192,
-    "capacityEndpoint": 220,
+    "autoscaler": 197,
+    "autoscalerPolicyRef": 193,
+    "capacityEndpoint": 221,
     "config": 14,
-    "containers": 188,
-    "deploymentStrategy": 198,
-    "dnsConfig": 199,
+    "containers": 189,
+    "deploymentStrategy": 199,
+    "dnsConfig": 200,
     "dnsPolicy": 0,
     "enableServiceLinks": 0,
-    "hostAliases": 201,
+    "hostAliases": 202,
     "hostIPC": 0,
     "hostNetwork": 0,
     "hostPID": 0,
     "hostUsers": 0,
     "hostname": 0,
-    "imagePullSecrets": 202,
-    "initContainers": 188,
+    "imagePullSecrets": 203,
+    "initContainers": 189,
     "labels": 14,
-    "lifecycle": 215,
+    "lifecycle": 216,
     "maxReplicas": 0,
     "maxUnavailable": 0,
     "minAvailable": 0,
@@ -1838,14 +1844,14 @@
     "preemptionPolicy": 0,
     "priority": 0,
     "priorityClassName": 0,
-    "readinessGates": 204,
-    "resourceClaims": 206,
+    "readinessGates": 205,
+    "resourceClaims": 207,
     "restartPolicy": 0,
-    "runner": 187,
+    "runner": 188,
     "runtimeClassName": 0,
     "schedulerName": 0,
-    "schedulingGates": 202,
-    "securityContext": 207,
+    "schedulingGates": 203,
+    "securityContext": 208,
     "serviceAccount": 0,
     "serviceAccountName": 0,
     "servicePortAppProtocols": 14,
@@ -1854,9 +1860,9 @@
     "subdomain": 0,
     "terminationGracePeriodSeconds": 0,
     "timeoutSeconds": 0,
-    "tolerations": 106,
-    "topologySpreadConstraints": 209,
-    "volumes": 156
+    "tolerations": 107,
+    "topologySpreadConstraints": 210,
+    "volumes": 157
    }
   },
   {
@@ -1868,7 +1874,7 @@
   {
    "properties": {
     "mode": 0,
-    "proportional": 222
+    "proportional": 223
    }
   },
   {
@@ -1883,15 +1889,15 @@
     "environmentOverride": 14,
     "minMemoryPerBillionParams": 0,
     "runtimeArgsOverride": 1,
-    "tensorParallelismOverride": 224
+    "tensorParallelismOverride": 225
    }
   },
   {
-   "additionalProperties": 225
+   "additionalProperties": 226
   },
   {
    "properties": {
-    "acceleratorConfig": 226,
+    "acceleratorConfig": 227,
     "autoSelect": 0,
     "diffusionPipeline": 81,
     "modelArchitecture": 0,
@@ -1906,32 +1912,32 @@
    }
   },
   {
-   "items": 227
+   "items": 228
   },
   {
    "properties": {
-    "acceleratorRequirements": 162,
+    "acceleratorRequirements": 163,
     "affinity": 21,
     "annotations": 14,
-    "containers": 188,
-    "decoderConfig": 217,
+    "containers": 189,
+    "decoderConfig": 218,
     "disabled": 0,
     "dnsPolicy": 0,
-    "encoderConfig": 218,
-    "engineConfig": 217,
+    "encoderConfig": 219,
+    "engineConfig": 218,
     "hostIPC": 0,
     "hostNetwork": 0,
-    "imagePullSecrets": 202,
+    "imagePullSecrets": 203,
     "labels": 14,
-    "modelSizeRange": 219,
+    "modelSizeRange": 220,
     "nodeSelector": 14,
     "protocolVersions": 1,
-    "routerConfig": 221,
-    "scalingPolicy": 223,
+    "routerConfig": 222,
+    "scalingPolicy": 224,
     "schedulerName": 0,
-    "supportedModelFormats": 228,
-    "tolerations": 106,
-    "volumes": 156
+    "supportedModelFormats": 229,
+    "tolerations": 107,
+    "volumes": 157
    }
   },
   {
@@ -1945,13 +1951,13 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 229,
-    "status": 230
+    "spec": 230,
+    "status": 231
    }
   },
   {
    "properties": {
-    "baseModelRef": 90,
+    "baseModelRef": 91,
     "compartmentID": 0,
     "configuration": 82,
     "disabled": 0,
@@ -1959,7 +1965,7 @@
     "hyperParameters": 82,
     "modelType": 0,
     "storage": 84,
-    "trainingJobRef": 90,
+    "trainingJobRef": 91,
     "vendor": 0,
     "version": 0
    }
@@ -1969,12 +1975,12 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 232,
-    "status": 87
+    "spec": 233,
+    "status": 88
    }
   },
   {
-   "items": 122
+   "items": 123
   },
   {
    "properties": {
@@ -1982,7 +1988,7 @@
     "fineTunedWeights": 1,
     "kind": 0,
     "name": 0,
-    "overlays": 234
+    "overlays": 235
    }
   },
   {
@@ -1999,11 +2005,11 @@
    }
   },
   {
-   "items": 237
+   "items": 238
   },
   {
    "properties": {
-    "components": 238,
+    "components": 239,
     "fingerprint": 0
    }
   },
@@ -2014,15 +2020,15 @@
    }
   },
   {
-   "items": 240
+   "items": 241
   },
   {
    "properties": {
     "clusterUID": 0,
-    "demand": 239,
+    "demand": 240,
     "pauseSurge": 0,
     "planID": 0,
-    "replicaFloors": 241,
+    "replicaFloors": 242,
     "revision": 0,
     "sourceUID": 0
    }
@@ -2045,19 +2051,19 @@
     "activeDeadlineSeconds": 0,
     "affinity": 21,
     "automountServiceAccountToken": 0,
-    "containers": 188,
-    "dnsConfig": 199,
+    "containers": 189,
+    "dnsConfig": 200,
     "dnsPolicy": 0,
     "enableServiceLinks": 0,
-    "hostAliases": 201,
+    "hostAliases": 202,
     "hostIPC": 0,
     "hostNetwork": 0,
     "hostPID": 0,
     "hostUsers": 0,
     "hostname": 0,
     "hostnameOverride": 0,
-    "imagePullSecrets": 202,
-    "initContainers": 188,
+    "imagePullSecrets": 203,
+    "initContainers": 189,
     "nodeName": 0,
     "nodeSelector": 14,
     "os": 36,
@@ -2065,41 +2071,41 @@
     "preemptionPolicy": 0,
     "priority": 0,
     "priorityClassName": 0,
-    "readinessGates": 204,
-    "resourceClaims": 206,
-    "resources": 104,
+    "readinessGates": 205,
+    "resourceClaims": 207,
+    "resources": 105,
     "restartPolicy": 0,
     "runtimeClassName": 0,
     "schedulerName": 0,
-    "schedulingGates": 202,
-    "securityContext": 207,
+    "schedulingGates": 203,
+    "securityContext": 208,
     "serviceAccount": 0,
     "serviceAccountName": 0,
     "setHostnameAsFQDN": 0,
     "shareProcessNamespace": 0,
     "subdomain": 0,
     "terminationGracePeriodSeconds": 0,
-    "tolerations": 106,
-    "topologySpreadConstraints": 209,
-    "volumes": 156,
-    "workloadRef": 244
+    "tolerations": 107,
+    "topologySpreadConstraints": 210,
+    "volumes": 157,
+    "workloadRef": 245
    }
   },
   {
    "properties": {
-    "metadata": 243,
-    "spec": 245
+    "metadata": 244,
+    "spec": 246
    }
   },
   {
    "properties": {
     "name": 0,
     "size": 0,
-    "template": 246
+    "template": 247
    }
   },
   {
-   "items": 247
+   "items": 248
   },
   {
    "properties": {
@@ -2112,22 +2118,22 @@
   },
   {
    "properties": {
-    "autoscaler": 196,
+    "autoscaler": 197,
     "component": 0,
-    "lifecycle": 215,
+    "lifecycle": 216,
     "minReadySeconds": 0,
-    "modelRef": 235,
-    "pacing": 236,
+    "modelRef": 236,
+    "pacing": 237,
     "pairingProtocol": 0,
     "parentRef": 36,
     "pauseMode": 0,
     "paused": 0,
-    "placementExecution": 242,
+    "placementExecution": 243,
     "placementReplicaLimit": 0,
     "replicas": 0,
     "revisionHistoryLimit": 0,
-    "runners": 248,
-    "runtimeRef": 249,
+    "runners": 249,
+    "runtimeRef": 250,
     "topologyKey": 0,
     "topologySpread": 0,
     "topologySpreadKey": 0
@@ -2140,7 +2146,7 @@
    }
   },
   {
-   "items": 251
+   "items": 252
   },
   {
    "properties": {
@@ -2178,31 +2184,31 @@
     "announced": 1,
     "conditions": 28,
     "index": 0,
-    "lastFailure": 253,
-    "operation": 254,
+    "lastFailure": 254,
+    "operation": 255,
     "readySince": 0
    }
   },
   {
-   "items": 255
+   "items": 256
   },
   {
    "properties": {
     "activeOrdinalOne": 0,
     "admitted": 0,
-    "availablePodCounts": 252,
-    "entries": 256,
-    "incarnations": 252,
+    "availablePodCounts": 253,
+    "entries": 257,
+    "incarnations": 253,
     "members": 0,
-    "phases": 252,
-    "podCounts": 252,
+    "phases": 253,
+    "podCounts": 253,
     "readySinceBase": 0,
     "readySinceIndexes": 0,
     "readySinceOffsets": 1,
     "rowOrder": 1,
-    "runningRevisions": 252,
-    "servingPodCounts": 252,
-    "targetRevisions": 252
+    "runningRevisions": 253,
+    "servingPodCounts": 253,
+    "targetRevisions": 253
    }
   },
   {
@@ -2214,9 +2220,9 @@
     "conditions": 28,
     "incarnation": 0,
     "index": 0,
-    "lastFailure": 253,
+    "lastFailure": 254,
     "nodesOccupied": 1,
-    "operation": 254,
+    "operation": 255,
     "phase": 0,
     "podCount": 0,
     "readyPodCount": 0,
@@ -2228,7 +2234,7 @@
    }
   },
   {
-   "items": 258
+   "items": 259
   },
   {
    "properties": {
@@ -2250,7 +2256,7 @@
    }
   },
   {
-   "items": 260
+   "items": 261
   },
   {
    "properties": {
@@ -2264,7 +2270,7 @@
    }
   },
   {
-   "items": 262
+   "items": 263
   },
   {
    "properties": {
@@ -2284,7 +2290,7 @@
    }
   },
   {
-   "items": 265
+   "items": 266
   },
   {
    "properties": {
@@ -2293,20 +2299,20 @@
     "conditions": 28,
     "coordinationGroupRef": 0,
     "currentRevision": 0,
-    "instanceStatusColumns": 257,
+    "instanceStatusColumns": 258,
     "instanceStatusEncoding": 0,
-    "instanceStatuses": 259,
+    "instanceStatuses": 260,
     "labelSelector": 0,
-    "migrations": 261,
+    "migrations": 262,
     "observedGeneration": 0,
     "observedTemplateHash": 0,
     "placementObservedGeneration": 0,
     "readyReplicas": 0,
     "replicas": 0,
-    "retryBlocks": 263,
-    "rolloutHold": 264,
+    "retryBlocks": 264,
+    "rolloutHold": 265,
     "servingReplicas": 0,
-    "traffic": 266,
+    "traffic": 267,
     "updateRevision": 0,
     "updatedReadyReplicas": 0,
     "updatedReplicas": 0
@@ -2317,27 +2323,27 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 250,
-    "status": 267
+    "spec": 251,
+    "status": 268
    }
   },
   {
    "properties": {
-    "decoder": 219,
-    "default": 219,
-    "engine": 219,
-    "router": 219
+    "decoder": 220,
+    "default": 220,
+    "engine": 220,
+    "router": 220
    }
   },
   {
    "properties": {
     "matchExpressions": 7,
     "matchFields": 7,
-    "weights": 269
+    "weights": 270
    }
   },
   {
-   "items": 270
+   "items": 271
   },
   {
    "properties": {
@@ -2349,18 +2355,18 @@
   },
   {
    "properties": {
-    "maxPerCluster": 272,
+    "maxPerCluster": 273,
     "replicas": 0
    }
   },
   {
    "properties": {
-    "clusterAffinity": 271,
+    "clusterAffinity": 272,
     "maxSurge": 0,
     "mode": 0,
     "policy": 0,
     "replacementTimeout": 0,
-    "split": 273
+    "split": 274
    }
   },
   {
@@ -2372,7 +2378,7 @@
   },
   {
    "properties": {
-    "authRef": 92,
+    "authRef": 93,
     "headers": 14,
     "providerRef": 36,
     "serverAddress": 0
@@ -2387,14 +2393,14 @@
    }
   },
   {
-   "items": 277
+   "items": 278
   },
   {
    "properties": {
     "failureLimit": 0,
     "initialDelay": 0,
     "interval": 0,
-    "metrics": 278,
+    "metrics": 279,
     "onInconclusive": 0
    }
   },
@@ -2405,21 +2411,21 @@
   },
   {
    "properties": {
-    "analysis": 279,
+    "analysis": 280,
     "capacity": 0,
-    "pause": 280,
+    "pause": 281,
     "traffic": 0
    }
   },
   {
-   "items": 281
+   "items": 282
   },
   {
    "properties": {
-    "prometheus": 276,
+    "prometheus": 277,
     "readyTimeout": 0,
     "scaleDownDelaySeconds": 0,
-    "steps": 282
+    "steps": 283
    }
   },
   {
@@ -2437,22 +2443,22 @@
   {
    "properties": {
     "blueGreen": 0,
-    "canary": 283,
+    "canary": 284,
     "components": 1,
-    "maintainRatio": 284,
+    "maintainRatio": 285,
     "order": 1,
-    "policyRef": 285,
-    "rollingUpdate": 197,
+    "policyRef": 286,
+    "rollingUpdate": 198,
     "soak": 0
    }
   },
   {
-   "items": 286
+   "items": 287
   },
   {
    "properties": {
     "groupOrdering": 0,
-    "groups": 287,
+    "groups": 288,
     "pairingProtocol": 0
    }
   },
@@ -2492,11 +2498,11 @@
   },
   {
    "properties": {
-    "capacity": 289,
+    "capacity": 290,
     "capacityFactors": 14,
     "enabled": 0,
-    "probe": 290,
-    "publisher": 291
+    "probe": 291,
+    "publisher": 292
    }
   },
   {
@@ -2507,40 +2513,40 @@
   },
   {
    "properties": {
-    "cookie": 293,
-    "headers": 202,
+    "cookie": 294,
+    "headers": 203,
     "type": 0
    }
   },
   {
    "properties": {
-    "headers": 202,
+    "headers": 203,
     "type": 0
    }
   },
   {
    "properties": {
     "algorithm": 0,
-    "consistentHash": 294,
-    "endpointOverride": 295
+    "consistentHash": 295,
+    "endpointOverride": 296
    }
   },
   {
    "properties": {
-    "acceleratorSelector": 190,
-    "decoder": 217,
+    "acceleratorSelector": 191,
+    "decoder": 218,
     "deploymentMode": 0,
-    "encoder": 218,
-    "engine": 217,
-    "model": 235,
-    "placement": 274,
-    "replicaRefs": 275,
-    "rollout": 288,
-    "router": 221,
-    "routing": 292,
-    "runtime": 249,
-    "scalingPolicy": 223,
-    "traffic": 296,
+    "encoder": 219,
+    "engine": 218,
+    "model": 236,
+    "placement": 275,
+    "replicaRefs": 276,
+    "rollout": 289,
+    "router": 222,
+    "routing": 293,
+    "runtime": 250,
+    "scalingPolicy": 224,
+    "traffic": 297,
     "ttlSecondsAfterCreation": 0
    }
   },
@@ -2553,7 +2559,7 @@
    }
   },
   {
-   "items": 298
+   "items": 299
   },
   {
    "properties": {
@@ -2573,7 +2579,7 @@
    }
   },
   {
-   "items": 301
+   "items": 302
   },
   {
    "properties": {
@@ -2581,10 +2587,10 @@
     "canaryRevisionHash": 0,
     "capacityWaitSince": 0,
     "currentStep": 0,
-    "failed": 300,
+    "failed": 301,
     "lastConclusiveEvaluationTime": 0,
     "lastEvaluationTime": 0,
-    "metricResults": 302,
+    "metricResults": 303,
     "observedTrafficWeight": 0,
     "preStepHold": 0,
     "promotedThrough": 0,
@@ -2619,8 +2625,8 @@
     "desiredReplicas": 0,
     "lastScaleTime": 0,
     "managedBy": 0,
-    "policy": 304,
-    "shadowedPolicyRef": 305,
+    "policy": 305,
+    "shadowedPolicyRef": 306,
     "specSource": 0
    }
   },
@@ -2634,7 +2640,7 @@
     "observedGeneration": 0,
     "readyReplicas": 0,
     "replicas": 0,
-    "rolloutHold": 264,
+    "rolloutHold": 265,
     "servingReplicas": 0,
     "updateRevision": 0,
     "updatedReadyReplicas": 0,
@@ -2651,23 +2657,23 @@
   },
   {
    "properties": {
-    "address": 298,
-    "autoscaler": 306,
-    "canary": 303,
+    "address": 299,
+    "autoscaler": 307,
+    "canary": 304,
     "latestReadyRevision": 0,
     "latestRolledoutRevision": 0,
-    "lifecycle": 307,
+    "lifecycle": 308,
     "previousRolledoutRevision": 0,
     "restURL": 0,
     "rolloutPhase": 0,
     "scaleTargetRef": 62,
-    "selectedAccelerator": 308,
-    "traffic": 266,
+    "selectedAccelerator": 309,
+    "traffic": 267,
     "url": 0
    }
   },
   {
-   "additionalProperties": 309
+   "additionalProperties": 310
   },
   {
    "properties": {
@@ -2680,7 +2686,7 @@
    }
   },
   {
-   "items": 311
+   "items": 312
   },
   {
    "properties": {
@@ -2689,13 +2695,13 @@
    }
   },
   {
-   "items": 313
+   "items": 314
   },
   {
    "properties": {
     "completedAt": 0,
     "component": 0,
-    "events": 314,
+    "events": 315,
     "id": 0,
     "instance": 0,
     "mode": 0,
@@ -2709,7 +2715,7 @@
    }
   },
   {
-   "items": 315
+   "items": 316
   },
   {
    "properties": {
@@ -2735,9 +2741,9 @@
   },
   {
    "properties": {
-    "lastFailureInfo": 317,
-    "modelCopies": 318,
-    "modelRevisionStates": 319,
+    "lastFailureInfo": 318,
+    "modelCopies": 319,
+    "modelRevisionStates": 320,
     "transitionStatus": 0
    }
   },
@@ -2750,7 +2756,7 @@
    }
   },
   {
-   "items": 321
+   "items": 322
   },
   {
    "properties": {
@@ -2765,13 +2771,13 @@
    }
   },
   {
-   "items": 323
+   "items": 324
   },
   {
    "properties": {
-    "demandContract": 239,
+    "demandContract": 240,
     "demandFingerprint": 0,
-    "pools": 324,
+    "pools": 325,
     "replicas": 0
    }
   },
@@ -2784,22 +2790,22 @@
    }
   },
   {
-   "items": 326
+   "items": 327
   },
   {
    "properties": {
     "inputDigest": 0,
-    "replicaFloors": 241
+    "replicaFloors": 242
    }
   },
   {
    "properties": {
-    "capacity": 325,
+    "capacity": 326,
     "clusterUID": 0,
-    "componentMatches": 327,
-    "currentHome": 328,
+    "componentMatches": 328,
+    "currentHome": 329,
     "currentReplicas": 0,
-    "desiredHome": 328,
+    "desiredHome": 329,
     "desiredReplicas": 0,
     "drainRequested": 0,
     "homeInputsPending": 0,
@@ -2821,7 +2827,7 @@
    }
   },
   {
-   "additionalProperties": 330
+   "additionalProperties": 331
   },
   {
    "properties": {
@@ -2830,12 +2836,12 @@
    }
   },
   {
-   "items": 332
+   "items": 333
   },
   {
    "properties": {
-    "components": 331,
-    "policies": 333,
+    "components": 332,
+    "policies": 334,
     "ready": 0
    }
   },
@@ -2847,7 +2853,7 @@
    }
   },
   {
-   "items": 335
+   "items": 336
   },
   {
    "properties": {
@@ -2857,7 +2863,7 @@
    }
   },
   {
-   "items": 337
+   "items": 338
   },
   {
    "properties": {
@@ -2867,29 +2873,29 @@
   },
   {
    "properties": {
-    "activeGroups": 338,
+    "activeGroups": 339,
     "activeRunID": 0,
-    "lastRun": 339
+    "lastRun": 340
    }
   },
   {
    "properties": {
     "admittedReplicas": 0,
-    "allocation": 329,
+    "allocation": 330,
     "appliedPlanID": 0,
-    "autoscaling": 334,
+    "autoscaling": 335,
     "cluster": 0,
-    "componentFloors": 336,
+    "componentFloors": 337,
     "endpoint": 0,
     "observationFailingSince": 0,
     "observationKnown": 0,
     "phase": 0,
     "readyReplicas": 0,
-    "rollout": 340
+    "rollout": 341
    }
   },
   {
-   "items": 341
+   "items": 342
   },
   {
    "properties": {
@@ -2909,7 +2915,7 @@
     "pauseSurge": 0,
     "requestedReplicas": 0,
     "revision": 0,
-    "singleMove": 343,
+    "singleMove": 344,
     "sourceUID": 0,
     "unassignedReplicas": 0,
     "winner": 0
@@ -2917,28 +2923,28 @@
   },
   {
    "properties": {
-    "candidates": 342,
+    "candidates": 343,
     "cluster": 0,
     "endpoint": 0,
     "phase": 0,
-    "plan": 344
+    "plan": 345
    }
   },
   {
    "properties": {
-    "group": 286,
+    "group": 287,
     "policyGeneration": 0,
-    "policyRef": 285,
+    "policyRef": 286,
     "portableDigest": 0,
     "source": 0
    }
   },
   {
-   "items": 346
+   "items": 347
   },
   {
    "properties": {
-    "groups": 347
+    "groups": 348
    }
   },
   {
@@ -2949,15 +2955,15 @@
    }
   },
   {
-   "items": 349
+   "items": 350
   },
   {
    "properties": {
     "openedAt": 0,
     "pinnedAt": 0,
-    "plan": 348,
+    "plan": 349,
     "runID": 0,
-    "targetRevisions": 350
+    "targetRevisions": 351
    }
   },
   {
@@ -2970,39 +2976,39 @@
    "properties": {
     "index": 0,
     "observedDigest": 0,
-    "policyRef": 285,
-    "shadowedPolicyRef": 352,
+    "policyRef": 286,
+    "shadowedPolicyRef": 353,
     "source": 0
    }
   },
   {
-   "items": 353
+   "items": 354
   },
   {
    "properties": {
-    "policyRef": 285,
+    "policyRef": 286,
     "portableDigest": 0,
     "source": 0
    }
   },
   {
-   "items": 355
+   "items": 356
   },
   {
    "properties": {
     "closedAt": 0,
-    "groups": 356,
+    "groups": 357,
     "openedAt": 0,
     "outcome": 0,
     "runID": 0,
-    "targetRevisions": 350
+    "targetRevisions": 351
    }
   },
   {
    "properties": {
-    "activeRun": 351,
-    "groups": 354,
-    "lastRun": 357
+    "activeRun": 352,
+    "groups": 355,
+    "lastRun": 358
    }
   },
   {
@@ -3024,12 +3030,12 @@
     "compositePhase": 0,
     "currentComponent": 0,
     "lastTransitionTime": 0,
-    "memberFinished": 359,
+    "memberFinished": 360,
     "memberNotReady": 0,
     "message": 0,
     "mixedPairing": 0,
     "name": 0,
-    "observedRatio": 360,
+    "observedRatio": 361,
     "observedSurge": 0,
     "order": 1,
     "phase": 0,
@@ -3039,11 +3045,11 @@
    }
   },
   {
-   "items": 361
+   "items": 362
   },
   {
    "properties": {
-    "groups": 362
+    "groups": 363
    }
   },
   {
@@ -3057,14 +3063,14 @@
    }
   },
   {
-   "items": 364
+   "items": 365
   },
   {
    "properties": {
     "anchor": 0,
     "anchorDesired": 0,
     "conditions": 28,
-    "followers": 365,
+    "followers": 366,
     "mode": 0,
     "source": 0
    }
@@ -3079,23 +3085,23 @@
   },
   {
    "properties": {
-    "address": 298,
-    "addresses": 299,
+    "address": 299,
+    "addresses": 300,
     "annotations": 14,
-    "canary": 303,
-    "components": 310,
-    "conditions": 312,
+    "canary": 304,
+    "components": 311,
+    "conditions": 313,
     "lastRuntimeSyncToken": 0,
-    "migrationHistory": 316,
-    "modelStatus": 320,
-    "mountedOverlays": 322,
+    "migrationHistory": 317,
+    "modelStatus": 321,
+    "mountedOverlays": 323,
     "observedGeneration": 0,
     "pinnedRevisionName": 0,
-    "placement": 345,
-    "rollout": 358,
-    "rolloutCoordination": 363,
-    "scalingPolicy": 366,
-    "traffic": 367,
+    "placement": 346,
+    "rollout": 359,
+    "rolloutCoordination": 364,
+    "scalingPolicy": 367,
+    "traffic": 368,
     "url": 0
    },
    "x-kubernetes-preserve-unknown-fields": true
@@ -3105,15 +3111,15 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 297,
-    "status": 368
+    "spec": 298,
+    "status": 369
    }
   },
   {
    "properties": {
     "blueGreen": 0,
-    "canary": 283,
-    "rollingUpdate": 197
+    "canary": 284,
+    "rollingUpdate": 198
    }
   },
   {
@@ -3129,8 +3135,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 370,
-    "status": 371
+    "spec": 371,
+    "status": 372
    }
   },
   {
@@ -3156,22 +3162,22 @@
   },
   {
    "properties": {
-    "capacity": 373,
+    "capacity": 374,
     "cluster": 0,
     "drainRefs": 1,
     "endpoint": 0,
     "healthy": 0,
-    "probe": 374,
+    "probe": 375,
     "weight": 0
    }
   },
   {
-   "items": 375
+   "items": 376
   },
   {
    "properties": {
     "capacityMode": 0,
-    "entries": 376,
+    "entries": 377,
     "mode": 0,
     "observedISVCGeneration": 0,
     "placementPlanID": 0,
@@ -3193,20 +3199,20 @@
    }
   },
   {
-   "items": 379
+   "items": 380
   },
   {
    "properties": {
     "observedISVCGeneration": 0,
     "planCompatibilityDigest": 0,
-    "targets": 380,
+    "targets": 381,
     "trafficMapGeneration": 0
    }
   },
   {
    "properties": {
     "claimedTargets": 1,
-    "lastPositive": 381,
+    "lastPositive": 382,
     "observedOptionsDigest": 0,
     "publisherName": 0
    }
@@ -3214,10 +3220,10 @@
   {
    "properties": {
     "conditions": 28,
-    "gatewayRef": 378,
+    "gatewayRef": 379,
     "observedTrafficMapGeneration": 0,
     "published": 0,
-    "publisher": 382,
+    "publisher": 383,
     "sourceUID": 0
    }
   },
@@ -3226,25 +3232,25 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 377,
-    "status": 383
+    "spec": 378,
+    "status": 384
    }
   },
   {
    "properties": {
     "key": 0,
-    "secretRef": 90
+    "secretRef": 91
    }
   },
   {
    "properties": {
     "clusterProfileRef": 36,
-    "kubeConfig": 385
+    "kubeConfig": 386
    }
   },
   {
    "properties": {
-    "clusterSource": 386
+    "clusterSource": 387
    }
   },
   {
@@ -3257,8 +3263,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 387,
-    "status": 388
+    "spec": 388,
+    "status": 389
    }
   }
  ]

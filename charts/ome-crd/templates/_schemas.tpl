@@ -2896,96 +2896,6 @@ properties:
     type: object
 type: object
 {{- end }}
-{{- define "ome-crd.schema.abbad6a602ca" -}}
-properties:
-  apiVersion:
-    type: string
-  kind:
-    type: string
-  metadata:
-    type: object
-  spec:
-{{- include "ome-crd.schema.e95e0ef0f901" . | nindent 4 }}
-  status:
-    properties:
-      cache:
-        properties:
-          backend:
-            type: string
-          sourceUri:
-            type: string
-        type: object
-      conditions:
-        items:
-          properties:
-            lastTransitionTime:
-              format: date-time
-              type: string
-            message:
-              maxLength: 32768
-              type: string
-            observedGeneration:
-              format: int64
-              minimum: 0
-              type: integer
-            reason:
-              maxLength: 1024
-              minLength: 1
-              pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-              type: string
-            status:
-              enum:
-              - "True"
-              - "False"
-              - Unknown
-              type: string
-            type:
-              maxLength: 316
-              pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-              type: string
-          required:
-          - lastTransitionTime
-          - message
-          - reason
-          - status
-          - type
-          type: object
-        type: array
-        x-kubernetes-list-map-keys:
-        - type
-        x-kubernetes-list-type: map
-      lastReconcileTime:
-        format: date-time
-        type: string
-      lifecycle:
-        type: string
-      nodesFailed:
-        items:
-          type: string
-        type: array
-        x-kubernetes-list-type: atomic
-      nodesReady:
-        items:
-          type: string
-        type: array
-        x-kubernetes-list-type: atomic
-      observedGeneration:
-        format: int64
-        type: integer
-      state:
-        enum:
-        - Creating
-        - Importing
-        - In_Transit
-        - In_Training
-        - Ready
-        - Failed
-        type: string
-    required:
-    - state
-    type: object
-type: object
-{{- end }}
 {{- define "ome-crd.schema.c228fd20cb73" -}}
 properties:
   nodeAffinity:
@@ -6665,6 +6575,102 @@ x-kubernetes-validations:
     <= 1
 - message: order must reference only Components listed in this group
   rule: '!has(self.order) || self.order.all(c, c in self.components)'
+{{- end }}
+{{- define "ome-crd.schema.f17edfe5b1c8" -}}
+properties:
+  apiVersion:
+    type: string
+  kind:
+    type: string
+  metadata:
+    type: object
+  spec:
+{{- include "ome-crd.schema.e95e0ef0f901" . | nindent 4 }}
+  status:
+    properties:
+      cache:
+        properties:
+          backend:
+            type: string
+          sourceUri:
+            type: string
+        type: object
+      conditions:
+        items:
+          properties:
+            lastTransitionTime:
+              format: date-time
+              type: string
+            message:
+              maxLength: 32768
+              type: string
+            observedGeneration:
+              format: int64
+              minimum: 0
+              type: integer
+            reason:
+              maxLength: 1024
+              minLength: 1
+              pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+              type: string
+            status:
+              enum:
+              - "True"
+              - "False"
+              - Unknown
+              type: string
+            type:
+              maxLength: 316
+              pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+              type: string
+          required:
+          - lastTransitionTime
+          - message
+          - reason
+          - status
+          - type
+          type: object
+        type: array
+        x-kubernetes-list-map-keys:
+        - type
+        x-kubernetes-list-type: map
+      lastReconcileTime:
+        format: date-time
+        type: string
+      lifecycle:
+        type: string
+      nodesFailed:
+        items:
+          type: string
+        type: array
+        x-kubernetes-list-type: atomic
+      nodesReady:
+        items:
+          type: string
+        type: array
+        x-kubernetes-list-type: atomic
+      observedGeneration:
+        format: int64
+        type: integer
+      rehydration:
+        properties:
+          completedRequestID:
+            type: string
+        type: object
+      state:
+        enum:
+        - Creating
+        - Importing
+        - In_Transit
+        - In_Training
+        - Ready
+        - Failed
+        - Evicted
+        type: string
+    required:
+    - state
+    type: object
+type: object
 {{- end }}
 {{- define "ome-crd.schema.f8a6c3ee73a4" -}}
 properties:

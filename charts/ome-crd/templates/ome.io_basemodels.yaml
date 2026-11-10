@@ -53,7 +53,7 @@ spec:
     name: v1beta1
     schema:
       openAPIV3Schema:
-{{- include "ome-crd.schema.abbad6a602ca" . | nindent 8 }}
+{{- include "ome-crd.schema.f17edfe5b1c8" . | nindent 8 }}
     served: true
     storage: true
     subresources:
