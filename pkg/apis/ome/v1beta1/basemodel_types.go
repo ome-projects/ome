@@ -391,7 +391,7 @@ const (
 )
 
 // LifeCycleState enum
-// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed
+// +kubebuilder:validation:Enum=Creating;Importing;In_Transit;In_Training;Ready;Failed;Evicted
 type LifeCycleState string
 
 const (
@@ -401,6 +401,9 @@ const (
 	LifeCycleStateInTraining LifeCycleState = "In_Training"
 	LifeCycleStateReady      LifeCycleState = "Ready"
 	LifeCycleStateFailed     LifeCycleState = "Failed"
+	// Evicted means local model artifacts were intentionally released.
+	// The Model CR remains available for restoration.
+	LifeCycleStateEvicted LifeCycleState = "Evicted"
 )
 
 const (
@@ -478,6 +481,13 @@ type ModelCacheStatus struct {
 	SourceUri string `json:"sourceUri,omitempty"`
 }
 
+// ModelRehydrationStatus records the last restoration request acknowledged by
+// at least one Ready node. Completion is history, not proof
+// of present readiness; the current request is in the Model annotation.
+type ModelRehydrationStatus struct {
+	CompletedRequestID string `json:"completedRequestID,omitempty"`
+}
+
 // ModelStatusSpec defines the observed state of Model weight
 type ModelStatusSpec struct {
 	// LifeCycle is the model's lifecycle stage, such as Deprecated,
@@ -507,6 +517,10 @@ type ModelStatusSpec struct {
 
 	// +listType=atomic
 	NodesFailed []string `json:"nodesFailed,omitempty"`
+
+	// Rehydration records observed restoration progress for per-node models.
+	// +optional
+	Rehydration *ModelRehydrationStatus `json:"rehydration,omitempty"`
 
 	// Conditions describe cluster-wide model readiness. OME sets them only
 	// for pvc:// models, which report SourceReachable and Ready. Other models

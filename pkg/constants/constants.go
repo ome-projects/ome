@@ -58,6 +58,9 @@ var (
 	AgentZippedFineTunedWeightDirectory   = AgentAppName + "_" + "ZIPPED_FINE_TUNED_WEIGHT_DIRECTORY"
 )
 
+// ModelArtifactRehydrationIDAnnotation identifies a restoration request.
+const ModelArtifactRehydrationIDAnnotation = "ome.io/artifact-rehydration-id"
+
 // Model agent Constants
 const (
 	AgentConfigMapKeyName = "agent"
