@@ -488,6 +488,82 @@ func TestResume_RolledBackDoesNotRunTheStepsOnTheResumePass(t *testing.T) {
 	}
 }
 
+// TestResume_LeftoverPromoteDoesNotOpenTheRestartedGate: a promote naming the
+// parked revision can still be on the object when the resume lands. A Failed
+// park leaves a promote in place, whether it was set during the park or was
+// applied earlier and its removal never landed, and a force set with the
+// resume arrives before the hold that would take it. The resume clears
+// PromotedThrough, so a leftover would read as a new request and open step 0's
+// manual gate as soon as its capacity is met. Every gate runs again on a
+// resume, so the restarted canary must wait at step 0 for a promote of its
+// own. The resume event names a leftover that was still pending; an applied
+// one is spent and goes unmentioned.
+func TestResume_LeftoverPromoteDoesNotOpenTheRestartedGate(t *testing.T) {
+	cases := []struct {
+		name            string
+		key             string
+		parkedStep      int32
+		promotedThrough string
+		pending         bool
+	}{
+		{name: "promote set during the park", key: constants.RolloutPromoteAnnotation, parkedStep: 0, pending: true},
+		{name: "applied promote whose removal never landed", key: constants.RolloutPromoteAnnotation, parkedStep: 1, promotedThrough: "new"},
+		{name: "force set with the resume", key: constants.RolloutPromoteForceAnnotation, parkedStep: 0, pending: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc, in := parkedFailed("new")
+			rec := record.NewFakeRecorder(8)
+			in.Recorder = rec
+			isvc.Annotations[tc.key] = "new"
+			isvc.Status.Canary.CurrentStep = tc.parkedStep
+			isvc.Status.Canary.PromotedThrough = tc.promotedThrough
+			isvc.Status.Canary.Failed = &v1beta1.CanaryFailure{Reason: v1beta1.CanaryFailureCapacityTimeout}
+			c := fake.NewClientBuilder().WithScheme(canaryScheme(t)).WithObjects(isvc).Build()
+			in.Client = c
+
+			res, err := Reconcile(context.Background(), in)
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if cs := isvc.Status.Canary; phaseOf(isvc) != v1beta1.RolloutPhasePending || cs.CurrentStep != 0 {
+				t.Fatalf("resume must re-arm at step 0, got phase %q step %d", phaseOf(isvc), cs.CurrentStep)
+			}
+			// The leftover goes the way of the rollback verb: removed on the
+			// apiserver before the status flush, so a copy that outlived the
+			// flush cannot open the gate either.
+			if _, still := storedAnnotations(t, c, isvc)[tc.key]; still {
+				t.Fatalf("%s must be removed durably before the flush", tc.key)
+			}
+			if named := hasEvent(eventsFrom(rec), "removed the pending "+tc.key+" for that revision"); named != tc.pending {
+				t.Fatalf("resume event names the removed %s: got %v, want %v (only a pending one is named)", tc.key, named, tc.pending)
+			}
+			flushed(t, c, isvc, res)
+
+			// Step 0's capacity is met on the next pass, so only its manual gate
+			// stands between the canary and step 1.
+			in.Now = in.Now.Add(reconcileRequeue)
+			in.PerRevisionPods = map[string]int32{"new": 2, "old": 2}
+			if _, err := Reconcile(context.Background(), in); err != nil {
+				t.Fatalf("Reconcile after resume: %v", err)
+			}
+			if got := isvc.Status.Canary.CurrentStep; got != 0 {
+				t.Fatalf("%s left from before the resume must not open the restarted canary's manual gate, got step %d", tc.key, got)
+			}
+
+			// A promote given after the resume is the gate's own.
+			isvc.Annotations = map[string]string{constants.RolloutPromoteAnnotation: "new"}
+			in.Now = in.Now.Add(reconcileRequeue)
+			if _, err := Reconcile(context.Background(), in); err != nil {
+				t.Fatalf("Reconcile with a fresh promote: %v", err)
+			}
+			if got := isvc.Status.Canary.CurrentStep; got != 1 {
+				t.Fatalf("a promote given after the resume must open the gate, got step %d", got)
+			}
+		})
+	}
+}
+
 // TestResume_RefusedWhenNoMemberTargetsTheStoppedRevision: a resume that
 // arrives after the operator set the spec back to the stable revision has
 // nothing to re-enter. Four engine Instances, version 2 rolled back, the spec
