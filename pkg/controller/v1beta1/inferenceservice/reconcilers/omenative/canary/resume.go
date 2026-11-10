@@ -217,11 +217,17 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 	// The reset below clears the record that keeps an applied one inert, so
 	// left in place it would open the restarted ladder's first gate. Every
 	// gate runs again, so it goes the same way as the rollback. A value naming
-	// another revision is another unit's verb, or inert, and stays.
+	// another revision is another unit's verb, or inert, and stays. One already
+	// applied is spent; one still pending was the operator's request, so the
+	// resume event names it.
+	var dropped []string
 	for _, key := range promoteKeys {
 		if v, ok := in.ISVC.Annotations[key]; ok && v == cs.CanaryRevisionHash {
 			if err := consumeAnnotation(ctx, in.Client, in.ISVC, key); err != nil {
 				return false, err
+			}
+			if v != cs.PromotedThrough {
+				dropped = append(dropped, key)
 			}
 		}
 	}
@@ -229,9 +235,13 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 	// member check above is what makes it a revision the unit still targets.
 	resetCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, cs.CanaryRevisionHash, in.Now)
 	recordResume(in.ISVC, in.Component, resumeApplied)
+	note := ""
+	if len(dropped) > 0 {
+		note = "; removed the pending " + strings.Join(dropped, " and ") + " for that revision, so the first gate waits for a new promote"
+	}
 	emit(in.Recorder, in.ISVC, corev1.EventTypeNormal, EventReasonRolloutResumed,
-		"resumed %s from %s: re-entering the canary ladder at step 0 on revision %s; every gate re-runs",
-		in.Component, phase, cs.CanaryRevisionHash)
+		"resumed %s from %s: re-entering the canary ladder at step 0 on revision %s; every gate re-runs%s",
+		in.Component, phase, cs.CanaryRevisionHash, note)
 	return true, consume()
 }
 

@@ -496,21 +496,25 @@ func TestResume_RolledBackDoesNotRunTheStepsOnTheResumePass(t *testing.T) {
 // PromotedThrough, so a leftover would read as a new request and open step 0's
 // manual gate as soon as its capacity is met. Every gate runs again on a
 // resume, so the restarted canary must wait at step 0 for a promote of its
-// own.
+// own. The resume event names a leftover that was still pending; an applied
+// one is spent and goes unmentioned.
 func TestResume_LeftoverPromoteDoesNotOpenTheRestartedGate(t *testing.T) {
 	cases := []struct {
 		name            string
 		key             string
 		parkedStep      int32
 		promotedThrough string
+		pending         bool
 	}{
-		{name: "promote set during the park", key: constants.RolloutPromoteAnnotation, parkedStep: 0},
+		{name: "promote set during the park", key: constants.RolloutPromoteAnnotation, parkedStep: 0, pending: true},
 		{name: "applied promote whose removal never landed", key: constants.RolloutPromoteAnnotation, parkedStep: 1, promotedThrough: "new"},
-		{name: "force set with the resume", key: constants.RolloutPromoteForceAnnotation, parkedStep: 0},
+		{name: "force set with the resume", key: constants.RolloutPromoteForceAnnotation, parkedStep: 0, pending: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			isvc, in := parkedFailed("new")
+			rec := record.NewFakeRecorder(8)
+			in.Recorder = rec
 			isvc.Annotations[tc.key] = "new"
 			isvc.Status.Canary.CurrentStep = tc.parkedStep
 			isvc.Status.Canary.PromotedThrough = tc.promotedThrough
@@ -521,6 +525,9 @@ func TestResume_LeftoverPromoteDoesNotOpenTheRestartedGate(t *testing.T) {
 			}
 			if cs := isvc.Status.Canary; phaseOf(isvc) != v1beta1.RolloutPhasePending || cs.CurrentStep != 0 {
 				t.Fatalf("resume must re-arm at step 0, got phase %q step %d", phaseOf(isvc), cs.CurrentStep)
+			}
+			if named := hasEvent(eventsFrom(rec), "removed the pending "+tc.key+" for that revision"); named != tc.pending {
+				t.Fatalf("resume event names the removed %s: got %v, want %v (only a pending one is named)", tc.key, named, tc.pending)
 			}
 
 			// Step 0's capacity is met on the next pass, so only its manual gate
