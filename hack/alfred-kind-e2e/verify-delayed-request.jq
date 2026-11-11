@@ -81,10 +81,10 @@ def targets_proven:
       any($e.originalNodes.items[]; . as $original |
         .metadata.name == $target.metadata.name and
         all($original.status.conditions[]? | select(.type == "GpuUnhealthy"); .status != "True") and
-        any($target.status.conditions[]; .type == "GpuUnhealthy" and .status == "True" and
+        any($target.status.conditions[]; .lastTransitionTime as $transition |
+          .type == "GpuUnhealthy" and .status == "True" and
           .reason == "AlfredE2EGpuUnhealthy" and
           (.lastTransitionTime | instant) >= ($e.request.payload.requested_at | instant) and
-          .lastTransitionTime as $transition |
           all($original.status.conditions[]? | select(.type == "GpuUnhealthy"); .lastTransitionTime != $transition))))
   else false end);
 
