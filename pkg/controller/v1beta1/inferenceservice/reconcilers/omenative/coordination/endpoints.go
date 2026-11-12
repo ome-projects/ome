@@ -29,6 +29,9 @@ const (
 type endpointWait struct {
 	component v1beta1.ComponentType
 	hash      string
+	// service is the revision's routed Service, named once per revision
+	// and read for every one of its pods.
+	service string
 	// ready counts the revision's routed pods that serve by the gate;
 	// listed counts those the endpoints controller publishes as Ready.
 	ready, listed int32
@@ -36,14 +39,17 @@ type endpointWait struct {
 
 // servingPodsListedByRevision counts, per Component and revision, the pods
 // the data plane can reach: podReadyAndServing holds and the Instance's
-// routed pod is a Ready endpoint of the revision's routed Service, read
-// once per routed Service through rotation. The endpoints controller lists
-// a pod from the same PodReady the gate folds into, after a delay of its
-// own, and no request reaches the pod before then; a share moved onto the
-// revision earlier would go to a Service with nothing behind it. A pod the
-// controller still lists after its gate went off is leaving and counts for
-// nothing, as before. The waits name every revision with a serving pod
-// still unlisted, in Component then revision order.
+// routed pod is a Ready endpoint of the revision's routed Service, named
+// once per revision and read once per Service through rotation. The
+// endpoints controller lists a pod from the same PodReady the gate folds
+// into, after a delay of its own, and no request reaches the pod before
+// then; a share moved onto the revision earlier would go to a Service with
+// nothing behind it. A pod the controller still lists after its gate went
+// off is leaving and counts for nothing, as before. The waits name every
+// revision with a serving pod still unlisted, in Component then revision
+// order. pods are the observation's, the informer cache's own objects when
+// the cached client listed them: the reading reads them and writes nothing
+// through them, and keeps none past the pass.
 func servingPodsListedByRevision(ctx context.Context, rotation *drain.Batcher, isvc *v1beta1.InferenceService, components []v1beta1.ComponentType, pods map[v1beta1.ComponentType][]*corev1.Pod) (map[v1beta1.ComponentType]map[string]int32, []endpointWait, error) {
 	out := make(map[v1beta1.ComponentType]map[string]int32, len(components))
 	var waits []endpointWait
@@ -57,14 +63,14 @@ func servingPodsListedByRevision(ctx context.Context, rotation *drain.Batcher, i
 				kept = append(kept, pod)
 				continue
 			}
-			listed, err := rotation.IsPodInRotation(ctx, PerRevisionServiceName(prefix, c, hash), pod)
-			if err != nil {
-				return nil, nil, fmt.Errorf("read endpoints of %s revision %s: %w", c, hash, err)
-			}
 			wait := counts[hash]
 			if wait == nil {
-				wait = &endpointWait{component: c, hash: hash}
+				wait = &endpointWait{component: c, hash: hash, service: PerRevisionServiceName(prefix, c, hash)}
 				counts[hash] = wait
+			}
+			listed, err := rotation.IsPodInRotation(ctx, wait.service, pod)
+			if err != nil {
+				return nil, nil, fmt.Errorf("read endpoints of %s revision %s: %w", c, hash, err)
 			}
 			wait.ready++
 			if !listed {

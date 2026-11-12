@@ -163,15 +163,15 @@ func (s *slicePass) sweep(ctx context.Context, input workloadtypes.ReconcileInpu
 }
 
 // recoverLostSlices deletes ir's pods that run on a slice deleted, or moved
-// off their nodes, from outside, so that their Instance is rebuilt. A cached
-// read of the pods finds them and a live read confirms them before any is
-// deleted. A nil pass recovers nothing.
-func (r *Reconciler) recoverLostSlices(ctx context.Context, ir *v1beta1.InferenceReplica, input workloadtypes.ReconcileInput, s *slicePass) error {
+// off their nodes, from outside, so that their Instance is rebuilt. The
+// pass's cached read of the pods finds them and a live read confirms them
+// before any is deleted through c, the pass's client. A nil pass recovers
+// nothing.
+func (r *Reconciler) recoverLostSlices(ctx context.Context, c client.Client, ir *v1beta1.InferenceReplica, input workloadtypes.ReconcileInput, s *slicePass) error {
 	if s == nil {
 		return nil
 	}
-	cached, err := query.ListOMENativePodsByName(ctx, r.Client, ir.Namespace, ir.NamePrefix(),
-		v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component), true)
+	cached, err := input.CachedPods.Pods(ctx, componentPodLister(r.Client, ir))
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,7 @@ func (r *Reconciler) recoverLostSlices(ctx context.Context, ir *v1beta1.Inferenc
 		names := make([]string, 0, len(l.Pods))
 		for _, pod := range l.Pods {
 			uid := pod.UID
-			if err := r.Client.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			if err := c.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 				return fmt.Errorf("delete pod %s on lost slice %s: %w", pod.Name, l.Name, err)
 			}
 			names = append(names, pod.Name)

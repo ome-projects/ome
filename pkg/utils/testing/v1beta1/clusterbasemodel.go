@@ -33,10 +33,6 @@ func MakeClusterBaseModel(name string) *ClusterBaseModelWrapper {
 
 func (w *ClusterBaseModelWrapper) Obj() *v1beta1.ClusterBaseModel { return &w.ClusterBaseModel }
 
-func (w *ClusterBaseModelWrapper) Clone() *ClusterBaseModelWrapper {
-	return &ClusterBaseModelWrapper{ClusterBaseModel: *w.ClusterBaseModel.DeepCopy()}
-}
-
 func (w *ClusterBaseModelWrapper) StorageURI(uri string) *ClusterBaseModelWrapper {
 	if w.Spec.Storage == nil {
 		w.Spec.Storage = &v1beta1.StorageSpec{}

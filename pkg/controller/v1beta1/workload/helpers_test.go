@@ -2,7 +2,9 @@ package workload
 
 import (
 	"context"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -81,3 +83,15 @@ func (o ComponentObservation) Epoch() ObservationEpoch { return o.epoch }
 func (o ComponentObservation) PodSource() PodObservationSource { return o.pods.Source() }
 
 func (o ComponentObservation) PodScope() PodObservationScope { return o.pods.Scope() }
+
+// PlanUpdateSelectionForTest is the update selection of one plan,
+// planUpdateSelection, for the tests outside the package that measure it
+// alone.
+func PlanUpdateSelectionForTest(ctx context.Context, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, snapshot *ObservedSnapshot) (UpdateSelection, time.Duration, error) {
+	return planUpdateSelection(ctx, input, plan, target, snapshot)
+}
+
+// ReplacesUnservingPodSetLogKeyForTest is the key the "update selected"
+// line carries the ReplacesUnservingPodSet flag under, for the tests
+// outside the package that read the line.
+const ReplacesUnservingPodSetLogKeyForTest = replacesUnservingPodSetLogKey

@@ -10,17 +10,22 @@ import (
 	"time"
 
 	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
+	pkgtest "sigs.k8s.io/ome/pkg/utils/testing"
 	"sigs.k8s.io/ome/pkg/webhook/admission/isvc"
 	"sigs.k8s.io/ome/pkg/webhook/admission/runtimepreset"
 	"sigs.k8s.io/ome/pkg/webhook/admission/servingruntime"
@@ -103,6 +108,29 @@ func writeTestObjects(t *testing.T, path string, objects ...*unstructured.Unstru
 	}
 }
 
+// seedShippedPresets creates inferenceservice-config in the namespace the
+// preset mutators read, carrying the runtimePresets table the kustomize
+// profile ships; the mutators carry no table of their own.
+func seedShippedPresets(t *testing.T, api client.Client) {
+	t.Helper()
+	shipped, err := pkgtest.ShippedInferenceServiceConfigMap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: constants.OMENamespace}}
+	if err := api.Create(ctx, namespace); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: constants.InferenceServiceConfigMapName, Namespace: constants.OMENamespace},
+		Data:       map[string]string{runtimepreset.PresetsConfigKeyName: shipped.Data[runtimepreset.PresetsConfigKeyName]},
+	}
+	if err := api.Create(ctx, configMap); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRuntimePresetAdmissionAndDependencyStorage(t *testing.T) {
 	env, err := loadEnvironment(testRepository(t), os.Getenv("KUBEBUILDER_ASSETS"), "127.0.0.1", time.Minute, "")
 	if err != nil {
@@ -124,6 +152,11 @@ func TestRuntimePresetAdmissionAndDependencyStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedShippedPresets(t, api)
 	decoder := admission.NewDecoder(scheme)
 	calls := &trace{}
 	server := webhook.NewServer(webhook.Options{Host: env.WebhookInstallOptions.LocalServingHost,
@@ -136,8 +169,8 @@ func TestRuntimePresetAdmissionAndDependencyStorage(t *testing.T) {
 			return handler.Handle(ctx, req)
 		})})
 	}
-	register("/mutate-ome-io-v1beta1-servingruntime-preset", &runtimepreset.ServingRuntimeMutator{Decoder: decoder})
-	register("/mutate-ome-io-v1beta1-clusterservingruntime-preset", &runtimepreset.ClusterServingRuntimeMutator{Decoder: decoder})
+	register("/mutate-ome-io-v1beta1-servingruntime-preset", &runtimepreset.ServingRuntimeMutator{Decoder: decoder, Clientset: clientset})
+	register("/mutate-ome-io-v1beta1-clusterservingruntime-preset", &runtimepreset.ClusterServingRuntimeMutator{Decoder: decoder, Clientset: clientset})
 	register("/validate-ome-io-v1beta1-servingruntime", &servingruntime.ServingRuntimeValidator{Client: api, Decoder: decoder})
 	register("/validate-ome-io-v1beta1-clusterservingruntime", &servingruntime.ClusterServingRuntimeValidator{Client: api, Decoder: decoder})
 	serviceValidator := admission.WithValidator(scheme, &isvc.InferenceServiceValidator{

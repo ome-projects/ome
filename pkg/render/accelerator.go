@@ -67,35 +67,47 @@ func applyMergedNodeSelector(runtime *v1beta1.ServingRuntimeSpec, acceleratorCla
 	}
 }
 
-// MergeRuntimeArgumentsOverride merges runtime argument overrides according AcceleratorClass into the container args
+// MergeRuntimeArgumentsOverride merges the runtime argument overrides the
+// model format declares for the resolved AcceleratorClass into the container.
 func MergeRuntimeArgumentsOverride(p *Piece, container *corev1.Container) {
-	// append arg var from runtime spec if it is specified
-	if p.SupportedModelFormat != nil && p.SupportedModelFormat.AcceleratorConfig != nil && p.AcceleratorClassName != "" {
-		acceleratorModelConfig := p.SupportedModelFormat.GetAcceleratorConfig(p.AcceleratorClassName)
-		if acceleratorModelConfig != nil {
-			argsOverride := acceleratorModelConfig.RuntimeArgsOverride
-			container.Args = isvcutils.MergeArgs(container.Args, argsOverride)
+	override := acceleratorModelConfig(p)
+	if override == nil {
+		return
+	}
+	container.Args = isvcutils.MergeArgs(container.Args, override.RuntimeArgsOverride)
+	overrideParallelism(container, override.TensorParallelismOverride)
+}
 
-			// if runtime argument override has TensorParallelism, update the args accordingly
-			// it will be in container.command or container.args
-			// check these two places
-			if acceleratorModelConfig.TensorParallelismOverride != nil {
-				tensorParallelismConfig := acceleratorModelConfig.TensorParallelismOverride
+// acceleratorModelConfig is the model format's override block for the
+// resolved AcceleratorClass: nil without a format, a class name or a block
+// for that class.
+func acceleratorModelConfig(p *Piece) *v1beta1.AcceleratorModelConfig {
+	if p.SupportedModelFormat == nil || p.SupportedModelFormat.AcceleratorConfig == nil || p.AcceleratorClassName == "" {
+		return nil
+	}
+	return p.SupportedModelFormat.GetAcceleratorConfig(p.AcceleratorClassName)
+}
 
-				// Override tensor parallel size if specified
-				// --tp-size and --tp are parameters used in sglang
-				// --tensor-parallel-size is the parameter used in vllm
-				if tensorParallelismConfig.TensorParallelSize != nil && *tensorParallelismConfig.TensorParallelSize > 0 {
-					overrideParam(container, []string{"--tp-size", "--tp", "--tensor-parallel-size"}, *tensorParallelismConfig.TensorParallelSize)
-				}
-				// Override pipeline parallel size if specified
-				// --pp-size and --pp are parameters used in sglang
-				// --pipeline-parallel-size is parameter used in vllm
-				if tensorParallelismConfig.PipelineParallelSize != nil && *tensorParallelismConfig.PipelineParallelSize > 0 {
-					overrideParam(container, []string{"--pp-size", "--pp", "--pipeline-parallel-size"}, *tensorParallelismConfig.PipelineParallelSize)
-				}
-			}
-		}
+// The spellings the runtimes use for the two parallel sizes: sglang reads
+// --tp-size, --tp, --pp-size and --pp; vllm reads --tensor-parallel-size and
+// --pipeline-parallel-size.
+var (
+	tensorParallelFlags   = []string{"--tp-size", "--tp", "--tensor-parallel-size"}
+	pipelineParallelFlags = []string{"--pp-size", "--pp", "--pipeline-parallel-size"}
+)
+
+// overrideParallelism rewrites the tensor and pipeline parallel sizes the
+// override sets to a positive value where the container already names them,
+// in its args first and then in its command.
+func overrideParallelism(container *corev1.Container, parallelism *v1beta1.TensorParallelismConfig) {
+	if parallelism == nil {
+		return
+	}
+	if size := parallelism.TensorParallelSize; size != nil && *size > 0 {
+		overrideParam(container, tensorParallelFlags, *size)
+	}
+	if size := parallelism.PipelineParallelSize; size != nil && *size > 0 {
+		overrideParam(container, pipelineParallelFlags, *size)
 	}
 }
 

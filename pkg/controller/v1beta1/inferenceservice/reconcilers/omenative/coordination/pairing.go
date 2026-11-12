@@ -31,7 +31,7 @@ func PairingProtocolForRevision(ctx context.Context, reads client.Reader, namesp
 	if hash == "" {
 		return "", false, nil
 	}
-	return pairingProtocolForRevisionName(ctx, reads, namespace, fmt.Sprintf("%s-%s-%s", prefix, component, hash))
+	return pairingProtocolForRevisionName(ctx, reads, namespace, ControllerRevisionName(prefix, component, hash))
 }
 
 // pairingProtocolForRevisionName is PairingProtocolForRevision keyed by the
@@ -348,11 +348,11 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 }
 
 // namedFirstSide is the pairing side the operator names to move first
-// inside every batch, which the batch step orders. A canary unit is not
-// batched, so none is named for it and the pairing gate orders the two
-// sides itself.
+// inside every batch, which the batch step orders. A recorded group the
+// spec no longer declares is not batched, so none is named for it and the
+// pairing gate orders the two sides itself.
 func (ctx GateContext) namedFirstSide() v1beta1.ComponentType {
-	if ctx.CanaryUnit {
+	if ctx.Scope == RecordedGroupPairing {
 		return ""
 	}
 	return ctx.Defaults.PrefillDecode.namedFirstSide()

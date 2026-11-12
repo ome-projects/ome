@@ -45,7 +45,7 @@ func TestNew_NoBackendPolicyCRD_ReturnsNoop(t *testing.T) {
 		{found: false},
 		{found: false},
 	}}
-	got, err := newWithProbe(&rest.Config{}, f.probe)
+	got, err := newWithProbe(&rest.Config{}, "cluster.local", f.probe)
 	if err != nil {
 		t.Fatalf("newWithProbe err = %v, want nil", err)
 	}
@@ -70,7 +70,7 @@ func TestNew_EnvoyGatewayDetected_SelectsEnvoyTranslator(t *testing.T) {
 	f := &fakeProbe{results: []probeResult{
 		{found: true},
 	}}
-	got, err := newWithProbe(&rest.Config{}, f.probe)
+	got, err := newWithProbe(&rest.Config{}, "cluster.local", f.probe)
 	if err != nil {
 		t.Fatalf("newWithProbe err = %v, want nil", err)
 	}
@@ -88,7 +88,7 @@ func TestNew_IstioDetected_SelectsIstioTranslator(t *testing.T) {
 		{found: false},
 		{found: true},
 	}}
-	got, err := newWithProbe(&rest.Config{}, f.probe)
+	got, err := newWithProbe(&rest.Config{}, "cluster.local", f.probe)
 	if err != nil {
 		t.Fatalf("newWithProbe err = %v, want nil", err)
 	}
@@ -105,7 +105,7 @@ func TestNew_ProbeError_PropagatedWithGVKContext(t *testing.T) {
 	f := &fakeProbe{results: []probeResult{
 		{err: sentinel},
 	}}
-	_, err := newWithProbe(&rest.Config{}, f.probe)
+	_, err := newWithProbe(&rest.Config{}, "cluster.local", f.probe)
 	if err == nil {
 		t.Fatalf("newWithProbe err = nil, want error")
 	}
@@ -123,7 +123,7 @@ func TestNew_PrefersEnvoyOverIstioWhenBothPresent(t *testing.T) {
 		// keeps probing, the test will fail on call count below.
 		{found: true},
 	}}
-	got, err := newWithProbe(&rest.Config{}, f.probe)
+	got, err := newWithProbe(&rest.Config{}, "cluster.local", f.probe)
 	if err != nil {
 		t.Fatalf("newWithProbe err = %v, want nil", err)
 	}

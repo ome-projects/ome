@@ -86,20 +86,20 @@ func TestOpenPinsTheLivePolicyBodyWhenTheCacheLags(t *testing.T) {
 	if !out.Opened || out.Parked {
 		t.Fatalf("the run must open, got %+v", out)
 	}
-	pinned := isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
-	if pinned.PortableDigest != policyDigest(t, live) || pinned.PortableDigest == policyDigest(t, stale) {
-		t.Fatalf("pinned digest %s, want the live body's %s (stale %s)", pinned.PortableDigest, policyDigest(t, live), policyDigest(t, stale))
+	recorded := isvc.Status.Rollout.ActiveRun.Plan.Groups[0]
+	if recorded.PortableDigest != policyDigest(t, live) || recorded.PortableDigest == policyDigest(t, stale) {
+		t.Fatalf("recorded digest %s, want the live body's %s (stale %s)", recorded.PortableDigest, policyDigest(t, live), policyDigest(t, stale))
 	}
-	if pinned.PolicyGeneration != live.Generation || len(pinned.Group.Canary.Steps) != 3 {
-		t.Fatalf("pinned provenance and body must be the live policy's, got %+v", pinned)
+	if recorded.PolicyGeneration != live.Generation || len(recorded.Group.Canary.Steps) != 3 {
+		t.Fatalf("recorded provenance and body must be the live policy's, got %+v", recorded)
 	}
 	// The set handed back is the cached reading, and the executors still see
-	// the live body on this pass because the view reads the pin.
+	// the live body on this pass because the view reads the record.
 	if out.Policies.ByName[stale.Name].Generation != stale.Generation {
 		t.Fatalf("the per-pass set is the cached reading, got %+v", out.Policies.ByName[stale.Name])
 	}
 	if g := rollout.CanaryGroupFor(isvc, out.Policies, v1beta1.EngineComponent); g == nil || len(g.Canary.Steps) != 3 {
-		t.Fatalf("the view must read the pin while the run is open, got %+v", g)
+		t.Fatalf("the view must read the record while the run is open, got %+v", g)
 	}
 }
 
@@ -113,7 +113,7 @@ func TestRepinPinsTheLivePolicyBodyWhenTheCacheLags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PortableDigest; got != policyDigest(t, stale) {
-		t.Fatalf("precondition: the run pins the stale body, got %s", got)
+		t.Fatalf("precondition: the run records the stale body, got %s", got)
 	}
 
 	in.Reader = liveReader
@@ -123,10 +123,10 @@ func TestRepinPinsTheLivePolicyBodyWhenTheCacheLags(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !out.StateChanged {
-		t.Fatalf("the repin must replace the plan, got %+v", out)
+		t.Fatalf("the plan reread must replace the plan, got %+v", out)
 	}
 	if got := isvc.Status.Rollout.ActiveRun.Plan.Groups[0].PortableDigest; got != policyDigest(t, live) {
-		t.Fatalf("repinned digest %s, want the live body's %s", got, policyDigest(t, live))
+		t.Fatalf("reread digest %s, want the live body's %s", got, policyDigest(t, live))
 	}
 }
 
@@ -144,7 +144,7 @@ func TestPassesThatPinNothingReadNoLivePolicy(t *testing.T) {
 			t.Fatalf("open: %v %+v", err, out)
 		}
 		if counter.policyGets != 1 {
-			t.Fatalf("the open reads the pinned policy live once, got %d reads", counter.policyGets)
+			t.Fatalf("the open reads the recorded policy live once, got %d reads", counter.policyGets)
 		}
 	})
 	t.Run("an open run that moved nothing", func(t *testing.T) {
@@ -159,7 +159,7 @@ func TestPassesThatPinNothingReadNoLivePolicy(t *testing.T) {
 			t.Fatal(err)
 		}
 		if counter.policyGets != 0 {
-			t.Fatalf("a pass that pins nothing must not read policies live, got %d reads", counter.policyGets)
+			t.Fatalf("a pass that records nothing must not read policies live, got %d reads", counter.policyGets)
 		}
 		if got := isvc.Status.Rollout.Groups[0].ObservedDigest; got != policyDigest(t, policy) {
 			t.Fatalf("the resolution view is served from the cache, got %q", got)

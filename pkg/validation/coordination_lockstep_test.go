@@ -150,8 +150,9 @@ func TestCoordinationUpdateWarnings_NamesEveryMemberThatKeepsItsRevision(t *test
 }
 
 // A one-member change that also moves spec.rollout.pairingProtocol is the
-// protocol rule's to judge: under a rollingUpdate group the protocol change
-// is refused with its own reason, whatever the pod templates do.
+// protocol rule's to judge, whatever the pod templates do: the member warning
+// stands on its own, one rollingUpdate group over both members admits the
+// protocol change, and a group over the engine alone refuses it.
 func TestCoordinationUpdateWarnings_MemberAndProtocolChange_ProtocolRuleDecides(t *testing.T) {
 	oldSpec := rollingUpdateGroupSpec(omeNativePDSpecWithImages("v1", "v1"))
 	oldSpec.Rollout.PairingProtocol = ptr.To("kv-v1")
@@ -159,9 +160,13 @@ func TestCoordinationUpdateWarnings_MemberAndProtocolChange_ProtocolRuleDecides(
 	newSpec.Rollout.PairingProtocol = ptr.To("kv-v2")
 	wantWarnings(t, "engine-only image change beside a protocol change", CoordinationUpdateWarnings(oldSpec, newSpec),
 		oneMemberWarning(v1beta1.EngineComponent, v1beta1.DecoderComponent))
+	if err := ValidatePairingProtocolUpdate(oldSpec, newSpec); err != nil {
+		t.Errorf("protocol change under one rollingUpdate group over both members: got %v want admitted", err)
+	}
+	newSpec.Rollout.Groups[0].Components = []v1beta1.ComponentType{v1beta1.EngineComponent}
 	err := ValidatePairingProtocolUpdate(oldSpec, newSpec)
 	if err == nil || !strings.Contains(err.Error(), ReasonPairingProtocolChangeUncoordinated) {
-		t.Errorf("protocol change under a rollingUpdate group: got %v want %s", err, ReasonPairingProtocolChangeUncoordinated)
+		t.Errorf("protocol change with the decoder outside the group: got %v want %s", err, ReasonPairingProtocolChangeUncoordinated)
 	}
 }
 

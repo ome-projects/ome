@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -152,6 +153,13 @@ func (c fakeOpenAPI) Paths() (map[string]openapi.GroupVersion, error) { return c
 
 func fullSchemaOpenAPI(t *testing.T) openapi.Client {
 	t.Helper()
+	return schemaOpenAPI(t, func(map[string]any) {})
+}
+
+// schemaOpenAPI serves the generated full CRD through discovery after mutate
+// has changed its InferenceReplica schema.
+func schemaOpenAPI(t *testing.T, mutate func(root map[string]any)) openapi.Client {
+	t.Helper()
 	path := filepath.Join("..", "..", "..", "..", "..", "config", "crd", "full", "ome.io_inferencereplicas.yaml")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -178,6 +186,7 @@ func fullSchemaOpenAPI(t *testing.T) openapi.Client {
 		t.Fatalf("CRD %s has no v1beta1 schema", path)
 	}
 	root["x-kubernetes-group-version-kind"] = []map[string]string{{"group": v1beta1.SchemeGroupVersion.Group, "version": v1beta1.SchemeGroupVersion.Version, "kind": "InferenceReplica"}}
+	mutate(root)
 	document, err := json.Marshal(map[string]any{
 		"openapi": "3.0.0",
 		"paths": map[string]any{
@@ -605,5 +614,30 @@ func TestCommandReportsUnreachableClustersWithoutAClusterAccess(t *testing.T) {
 	cmd.SetArgs([]string{})
 	if err := cmd.ExecuteContext(context.Background()); err == nil || errors.Is(err, ErrNoGo) {
 		t.Fatalf("a missing --inventory must be a usage error, got %v", err)
+	}
+}
+
+// TestCheckSchemaNamesTheMissingReadySinceColumns: a served schema without
+// the readySince columns is a schema a manager starts under, so the report
+// says ok and names the columns, whose absence keeps each Instance's
+// readySince in its entry; the full schema names none.
+func TestCheckSchemaNamesTheMissingReadySinceColumns(t *testing.T) {
+	columns := []string{"readySinceBase", "readySinceIndexes", "readySinceOffsets"}
+	without := schemaOpenAPI(t, func(root map[string]any) {
+		statusColumns := root["properties"].(map[string]any)["status"].(map[string]any)["properties"].(map[string]any)["instanceStatusColumns"].(map[string]any)
+		for _, name := range columns {
+			delete(statusColumns["properties"].(map[string]any), name)
+		}
+		delete(statusColumns, "x-kubernetes-validations")
+	})
+	report := checkSchema(without)
+	if !report.OK || report.Error != "" || !slices.Equal(report.MissingReadySinceColumns, columns) {
+		t.Fatalf("schema report without the columns = %+v, want ok naming %v", report, columns)
+	}
+	if summary := report.summary(); !strings.HasPrefix(summary, "ok; ") || !strings.Contains(summary, strings.Join(columns, ", ")) || !strings.Contains(summary, "entry") {
+		t.Fatalf("summary = %q, want ok, the columns and where the times go", summary)
+	}
+	if full := checkSchema(fullSchemaOpenAPI(t)); !full.OK || len(full.MissingReadySinceColumns) != 0 || full.summary() != "ok" {
+		t.Fatalf("schema report for the full schema = %+v (%q), want plain ok", full, full.summary())
 	}
 }

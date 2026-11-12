@@ -24,7 +24,7 @@ import (
 // step until it has served a full soak, exactly as the engine's pods do.
 
 // pdWire is an [engine, decoder] canary of two Instances a side, one of each
-// on the canary revision, armed through the dispatcher under a step list: the
+// on the canary revision, started through the dispatcher under a step list: the
 // readings the step machine gets come from both members' pods and rows.
 type pdWire struct {
 	ctx    context.Context
@@ -36,10 +36,10 @@ type pdWire struct {
 	name   string
 }
 
-// armPDWire arms the unit at its first step with the split serving on both
+// startPDWire starts the unit at its first step with the split serving on both
 // members. The run opened before the canary pods served, as a push does,
 // and every row has been Ready since before the story starts.
-func armPDWire(t *testing.T, steps []v1beta1.RolloutGroupStep, t0 time.Time) *pdWire {
+func startPDWire(t *testing.T, steps []v1beta1.RolloutGroupStep, t0 time.Time) *pdWire {
 	t.Helper()
 	ns, name := "default", "pd-wire"
 	n2 := 2
@@ -135,7 +135,7 @@ func (w *pdWire) setRunner(t *testing.T, pod string, status corev1.ContainerStat
 // revisions, as they do for an engine pod.
 func TestDispatch_PDDecoderCanaryPodCrashLoopFailsTheUnit(t *testing.T) {
 	t0 := time.Unix(100000, 0)
-	w := armPDWire(t, twoStep(), t0)
+	w := startPDWire(t, twoStep(), t0)
 
 	// Ten seconds into the hold the decoder's canary runner starts a second
 	// run, dies again and the kubelet backs off before the next start.
@@ -164,7 +164,7 @@ func TestDispatch_PDDecoderCanaryPodCrashLoopFailsTheUnit(t *testing.T) {
 // and moves once the restarted decoder has served a full soak.
 func TestDispatch_PDDecoderRestartInSoakHoldsTheStepForAFullSoak(t *testing.T) {
 	t0 := time.Unix(100000, 0)
-	w := armPDWire(t, twoStepTimed(20*time.Second), t0)
+	w := startPDWire(t, twoStepTimed(20*time.Second), t0)
 
 	// Ten seconds into the soak the decoder's canary runner dies; the
 	// kubelet has it running again two seconds later and it is serving.

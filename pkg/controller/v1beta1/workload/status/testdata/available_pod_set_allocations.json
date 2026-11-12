@@ -1,0 +1,26 @@
+{
+  "recordedOn": {
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The availability reading asks the cache for its own slices (client.UnsafeDisableDeepCopy on the one list, as the cordon and node readings do): the reading keeps the pod names alone and writes nothing through the slices, so no slice is copied, and the set of names is sized from the endpoint count before it is filled. What remains is the map of names: 38 allocations and 235 KB at 4,000 endpoints, where the copies cost 28,507 and 1.5 MB. Recorded at 1,000 and 4,000 single-pod Instances, 160 gangs of eight and 1,725 gangs of two, one endpoint per Instance as the endpointslice controller writes it, 100 endpoints per slice.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/allocations": 24,
+    "1000x1/bytes": 59384,
+    "1000x1/slice-copies": 0,
+    "1000x1/slice-lists": 1,
+    "160x8/allocations": 19,
+    "160x8/bytes": 8144,
+    "160x8/slice-copies": 0,
+    "160x8/slice-lists": 1,
+    "1725x2/allocations": 25,
+    "1725x2/bytes": 62584,
+    "1725x2/slice-copies": 0,
+    "1725x2/slice-lists": 1,
+    "4000x1/allocations": 38,
+    "4000x1/bytes": 234984,
+    "4000x1/slice-copies": 0,
+    "4000x1/slice-lists": 1
+  }
+}

@@ -9,12 +9,22 @@ metadata:
 #   kubectl -n ome rollout restart deployment/ome-controller-manager
 #   kubectl -n ome rollout status deployment/ome-controller-manager
 data:
+  # routeProviderCapabilities declares, per route provider, the per-revision
+  # traffic intent it can express (what a canary step's traffic percentage asks
+  # of the external route). Keys: GatewayAPI (enableGatewayAPI), KubernetesIngress
+  # (ingress creation on without Gateway API), None (ingress creation disabled).
+  # Values: capability tokens; today only "weightedRevisionRouting". There is NO
+  # in-code default. A provider left out has unknown capabilities (canary traffic
+  # percentages are admitted and reported as unverified); a provider listed with
+  # [] can express none (admission rejects such a canary, a stored one holds its
+  # rollout). Example: {"GatewayAPI": ["weightedRevisionRouting"], "None": []}
   ingress: |-
     {
-        "ingressGateway" : "knative-serving/knative-ingress-gateway",
+        "ingressGateway" : "istio-system/ingress-gateway",
         "ingressService" : "istio-ingressgateway.istio-system.svc.cluster.local",
         "omeIngressGateway" : "",
         "ingressDomain"  : "svc.cluster.local",
+        "clusterDomain" : "cluster.local",
         "ingressClassName" : "istio",
         "additionalIngressDomains" : null,
         "domainTemplate": "{{ .Name }}.{{ .Namespace }}.{{ .IngressDomain }}",
@@ -22,7 +32,8 @@ data:
         "disableIstioVirtualHost": false,
         "pathTemplate": "",
         "disableIngressCreation": true,
-        "enableGatewayAPI": false
+        "enableGatewayAPI": false,
+        "routeProviderCapabilities": {}
     }
 
   deploy: |-
@@ -172,6 +183,322 @@ data:
       }
     }
 
+  canaryAnalysis: |-
+    {
+      "bundledPrometheusAddress": "http://ome-prometheus.ome.svc:9090",
+      "queryTimeout": "5s",
+      "maxConcurrency": 8,
+      "cacheTTL": "2m"
+    }
+
+  # metricsAggregator: the pod webhook's metrics wiring. The two switches are
+  # the pod defaults for ome.io/enable-metric-aggregation and
+  # ome.io/enable-prometheus-scraping; containerPort and path are where the
+  # serving container serves metrics (the pod's prometheus.ome.io annotations
+  # override them), aggregatePort is where queue-proxy serves the aggregate,
+  # podPrometheusPort is the pod's scrape port when aggregation is off. The
+  # manager has no built-in ports: without all four, aggregation and scraping
+  # inject nothing and the webhook logs it once.
+  metricsAggregator: |-
+    {
+      "aggregatePort": 9088,
+      "containerPort": 8080,
+      "enableMetricAggregation": "false",
+      "enablePrometheusScraping": "false",
+      "path": "/metrics",
+      "podPrometheusPort": 9091
+    }
+
+  # rdma: the RDMA profile table the pod webhook applies to pods that set
+  # ome.io/rdma-auto-inject=true; ome.io/rdma-profile picks a profile, else
+  # defaultProfile. Each profile is the env, volumes, mounts, security
+  # context and Multus networks of one fabric. The manager has no built-in
+  # profile and this profile ships none: every cluster's fabric differs, so
+  # the cluster's own values file carries the table. Without one such pods get
+  # nothing and the webhook logs it once.
+  rdma: |-
+    {
+      "defaultProfile": "",
+      "profiles": {}
+    }
+
+  # runtimeProfiles: the port the probe and observability profiles use when
+  # a pod names none, and the timings of the three probes a probe profile
+  # injects. Without this key probe profiles inject nothing and observability
+  # profiles serve only pods that name a port; the webhook logs it once.
+  runtimeProfiles: |-
+    {
+      "defaultPort": 30000,
+      "probes": {
+        "liveness": {
+          "failureThreshold": 5,
+          "initialDelaySeconds": 0,
+          "periodSeconds": 60,
+          "successThreshold": 0,
+          "timeoutSeconds": 30
+        },
+        "readiness": {
+          "failureThreshold": 5,
+          "initialDelaySeconds": 60,
+          "periodSeconds": 30,
+          "successThreshold": 1,
+          "timeoutSeconds": 30
+        },
+        "startup": {
+          "failureThreshold": 60,
+          "initialDelaySeconds": 60,
+          "periodSeconds": 30,
+          "successThreshold": 0,
+          "timeoutSeconds": 30
+        }
+      }
+    }
+
+  # runtimePresets: one ServingRuntime spec per ome.io/engine value. The
+  # preset webhook fills it in under the runtime's own fields. Without this
+  # key, or for an engine it does not name, a runtime that names an engine is
+  # refused with a message that says so.
+  runtimePresets: |-
+    {
+      "sglang-pd": {
+        "containers": null,
+        "decoderConfig": {
+          "runner": {
+            "command": [
+              "python3",
+              "-m",
+              "sglang.launch_server",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "30000",
+              "--model-path",
+              "$(MODEL_PATH)",
+              "--disaggregation-mode",
+              "decode",
+              "--disaggregation-transfer-backend",
+              "nixl"
+            ],
+            "env": [
+              {
+                "name": "PYTHONUNBUFFERED",
+                "value": "1"
+              },
+              {
+                "name": "SGLANG_HOST_IP",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "status.podIP"
+                  }
+                }
+              }
+            ],
+            "image": "lmsysorg/sglang:latest",
+            "livenessProbe": {
+              "failureThreshold": 5,
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "periodSeconds": 60,
+              "timeoutSeconds": 10
+            },
+            "name": "ome-container",
+            "ports": [
+              {
+                "containerPort": 30000,
+                "name": "http",
+                "protocol": "TCP"
+              }
+            ],
+            "readinessProbe": {
+              "failureThreshold": 5,
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "periodSeconds": 30,
+              "timeoutSeconds": 10
+            },
+            "resources": {}
+          }
+        },
+        "engineConfig": {
+          "runner": {
+            "command": [
+              "python3",
+              "-m",
+              "sglang.launch_server",
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "30000",
+              "--model-path",
+              "$(MODEL_PATH)",
+              "--disaggregation-mode",
+              "prefill",
+              "--disaggregation-transfer-backend",
+              "nixl",
+              "--disaggregation-bootstrap-port",
+              "8998"
+            ],
+            "env": [
+              {
+                "name": "PYTHONUNBUFFERED",
+                "value": "1"
+              },
+              {
+                "name": "SGLANG_HOST_IP",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "status.podIP"
+                  }
+                }
+              }
+            ],
+            "image": "lmsysorg/sglang:latest",
+            "livenessProbe": {
+              "failureThreshold": 5,
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "periodSeconds": 60,
+              "timeoutSeconds": 10
+            },
+            "name": "ome-container",
+            "ports": [
+              {
+                "containerPort": 30000,
+                "name": "http",
+                "protocol": "TCP"
+              },
+              {
+                "containerPort": 8998,
+                "name": "bootstrap",
+                "protocol": "TCP"
+              }
+            ],
+            "readinessProbe": {
+              "failureThreshold": 5,
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "periodSeconds": 30,
+              "timeoutSeconds": 10
+            },
+            "resources": {}
+          }
+        },
+        "routerConfig": {
+          "runner": {
+            "args": [
+              "--port",
+              "30080",
+              "--k8s-namespace",
+              "$(NAMESPACE)",
+              "--prefill-label-selector",
+              "component=engine,ome.io/inferenceservice=$(INFERENCESERVICE_NAME)",
+              "--decode-label-selector",
+              "component=decoder,ome.io/inferenceservice=$(INFERENCESERVICE_NAME)",
+              "--k8s-engine-port",
+              "30000",
+              "--bootstrap-port",
+              "8998"
+            ],
+            "env": [
+              {
+                "name": "NAMESPACE",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "metadata.namespace"
+                  }
+                }
+              },
+              {
+                "name": "INFERENCESERVICE_NAME",
+                "valueFrom": {
+                  "fieldRef": {
+                    "fieldPath": "metadata.labels['ome.io/inferenceservice']"
+                  }
+                }
+              }
+            ],
+            "image": "lmsysorg/sglang-router:latest",
+            "livenessProbe": {
+              "failureThreshold": 5,
+              "httpGet": {
+                "path": "/liveness",
+                "port": 30080
+              },
+              "periodSeconds": 30,
+              "timeoutSeconds": 10
+            },
+            "name": "router",
+            "ports": [
+              {
+                "containerPort": 30080,
+                "name": "http",
+                "protocol": "TCP"
+              }
+            ],
+            "readinessProbe": {
+              "failureThreshold": 5,
+              "httpGet": {
+                "path": "/readiness",
+                "port": 30080
+              },
+              "periodSeconds": 30,
+              "timeoutSeconds": 10
+            },
+            "resources": {}
+          }
+        }
+      }
+    }
+
+  # podMonitor configures every PodMonitor OME generates per InferenceService
+  # Component. There is intentionally NO in-code default for any key: supply
+  # the values via this ConfigMap (Helm chart / GitOps), so scrape-pipeline
+  # values are never hardcoded in the binary.
+  #
+  # - path, interval, port, fallbackPort: OME's own scrape endpoint, the HTTP
+  #                path scraped every interval (Prometheus duration form) on
+  #                the container port named `port` when the Component's first
+  #                container declares it, wherever it stands; a container
+  #                without it is scraped on its first port when that port is
+  #                named, else on `fallbackPort`. Annotation-declared extra
+  #                endpoints follow at the same interval. Leave one of them
+  #                empty and OME adds no endpoint of its own; the manager logs
+  #                that once.
+  # - labels:      merged into each PodMonitor's metadata.labels (NOT
+  #                spec.selector). Opts the monitor into a label-selecting
+  #                collector, e.g. an OTel target allocator whose
+  #                podMonitorSelector is {monitoring.example.com/scrape-tier: cluster}.
+  # - relabelings: appended to every PodMetricsEndpoint so scraped series carry
+  #                the same label schema as the legacy pod-annotation scrape.
+  #
+  podMonitor: |-
+    {
+      "path": "/metrics",
+      "interval": "10s",
+      "port": "metrics",
+      "fallbackPort": "http"
+    }
+  # With a label-selecting collector, the same block also carries:
+  # podMonitor: |-
+  #   {
+  #     "path": "/metrics", "interval": "10s", "port": "metrics", "fallbackPort": "http",
+  #     "labels": { "monitoring.example.com/scrape-tier": "cluster" },
+  #     "relabelings": [
+  #       { "sourceLabels": ["__meta_kubernetes_pod_label_ome_io_inferenceservice"], "targetLabel": "inferenceservice" },
+  #       { "sourceLabels": ["__meta_kubernetes_pod_label_component"], "targetLabel": "component" },
+  #       { "sourceLabels": ["__meta_kubernetes_pod_label_serving_runtime"], "targetLabel": "serving_runtime" },
+  #       { "sourceLabels": ["__meta_kubernetes_namespace"], "targetLabel": "k8s_namespace_name" }
+  #     ]
+  #   }
+
   modelInit: |-
     {
         "image" : "ghcr.io/moirai-internal/ome-agent:v1.2.2",
@@ -191,11 +518,18 @@ data:
         ]
     }
 
-  kedaConfig: |-
+  omeAgent: |-
     {
-      "enableKeda" : true,
-      "promServerAddress": "http://prometheus-operated.monitoring.svc.cluster.local:9090",
-      "customPromQuery": "",
-      "scalingThreshold": "10",
-      "scalingOperator": "GreaterThanOrEqual"
+      "image": "ghcr.io/moirai-internal/ome-agent:v1.2.2",
+      "serviceAccount": "ome-model-metadata",
+      "cpuRequest": "100m",
+      "memoryRequest": "256Mi",
+      "cpuLimit": "500m",
+      "memoryLimit": "512Mi",
+      "backoffLimit": 2,
+      "ttlSecondsAfterFinished": 3600,
+      "nodeSelector": {},
+      "tolerations": [],
+      "affinity": {},
+      "priorityClassName": ""
     }

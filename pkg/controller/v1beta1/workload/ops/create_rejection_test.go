@@ -75,7 +75,7 @@ func TestDisposeAPIRejection_PermanentWorkload(t *testing.T) {
 		Message: `Pod "engine-0-default-0" is invalid: spec.containers[0].resources.limits: Invalid value: "-1"`,
 	}
 
-	held, err := disposeAPIRejection(context.Background(), input, insts[0], rejection, true)
+	held, err := disposeAPIRejection(context.Background(), input, insts[0], rejection, refusalEndsTheAttempt)
 	if err != nil {
 		t.Fatalf("DisposeAPIRejection: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestDisposeAPIRejection_FallsBackToUpdateRevision(t *testing.T) {
 		Class:   workload.APIRejectionPermanentWorkload,
 		Reason:  workload.RejectionReasonInvalidPodSpec,
 		Message: "invalid pod spec",
-	}, true)
+	}, refusalEndsTheAttempt)
 	if err != nil {
 		t.Fatalf("DisposeAPIRejection: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestDisposeAPIRejection_PermanentEnvironment(t *testing.T) {
 		Class:   workload.APIRejectionPermanentEnvironment,
 		Reason:  workload.RejectionReasonNamespaceTerminating,
 		Message: "unable to create new content in namespace prod because it is being terminated",
-	}, true)
+	}, refusalEndsTheAttempt)
 	if err != nil {
 		t.Fatalf("DisposeAPIRejection: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestDisposeAPIRejection_NonPermanentIsNoOp(t *testing.T) {
 		}}
 		input, rec := rejectionDisposeInput(t0, &insts, "rev-x")
 
-		held, err := disposeAPIRejection(context.Background(), input, insts[0], workload.APIRejection{Class: class, Reason: "Whatever"}, true)
+		held, err := disposeAPIRejection(context.Background(), input, insts[0], workload.APIRejection{Class: class, Reason: "Whatever"}, refusalEndsTheAttempt)
 		if err != nil {
 			t.Fatalf("class %v: DisposeAPIRejection: %v", class, err)
 		}
@@ -218,7 +218,7 @@ func TestDisposeAPIRejection_BlameWithheld(t *testing.T) {
 		Class:   workload.APIRejectionPermanentWorkload,
 		Reason:  workload.RejectionReasonInvalidPodSpec,
 		Message: "invalid pod spec",
-	}, false)
+	}, refusalEndsTheAttemptBlamingNoRevision)
 	if err != nil {
 		t.Fatalf("DisposeAPIRejection: %v", err)
 	}

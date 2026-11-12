@@ -22,7 +22,7 @@ import (
 // identity, digest) is the one thing that legitimately differs, so it is
 // left out of the comparison.
 
-// runForm is one declaration of the same canary ladder plus the objects a
+// runForm is one declaration of the same canary plus the objects a
 // pass must find in the cluster for it.
 type runForm struct {
 	name    string
@@ -79,7 +79,7 @@ func rolledBackRecord(t *testing.T, isvc *v1beta1.InferenceService, rejection st
 // inputs for the pass under test, after any pass needed to reach the phase.
 var runPhases = []struct {
 	name string
-	// runAfter is whether the pass under test leaves a run pinned.
+	// runAfter is whether the pass under test leaves a run recorded.
 	runAfter bool
 	build    func(t *testing.T, f runForm) Inputs
 }{
@@ -143,14 +143,14 @@ func annotateRun(isvc *v1beta1.InferenceService, key, value string) {
 // runDecision is what one run-layer pass decided and left behind, without
 // the provenance fields.
 type runDecision struct {
-	Outcome      Outcome
-	RunActive    bool
-	PinnedCanary *v1beta1.GroupCanary
-	PinnedGroups []v1beta1.ComponentType
-	Targets      []v1beta1.RolloutRunTarget
-	LastOutcome  v1beta1.RolloutRunOutcome
-	PlanReady    string
-	Drift        string
+	Outcome        Outcome
+	RunActive      bool
+	RecordedCanary *v1beta1.GroupCanary
+	RecordedGroups []v1beta1.ComponentType
+	Targets        []v1beta1.RolloutRunTarget
+	LastOutcome    v1beta1.RolloutRunOutcome
+	PlanReady      string
+	Drift          string
 }
 
 func decideRun(t *testing.T, in Inputs) (runDecision, string) {
@@ -161,20 +161,23 @@ func decideRun(t *testing.T, in Inputs) (runDecision, string) {
 	}
 	isvc := in.ISVC
 	// The observed policies are the pass's reading, not a decision; the two
-	// forms observe different sets by construction.
+	// forms observe different sets by construction. The run a retarget
+	// closed is a reading too: its group bodies are compared, its provenance
+	// and its id differ by form.
 	out.Policies = rollout.Policies{}
+	out.Closed = closedGroupBodies(out.Closed)
 	d := runDecision{Outcome: out, RunActive: v1beta1.RolloutRunActive(isvc)}
 	if isvc.Status.Rollout != nil {
 		if active := isvc.Status.Rollout.ActiveRun; active != nil {
 			d.Targets = active.TargetRevisions
 			for i := range active.Plan.Groups {
 				g := &active.Plan.Groups[i].Group
-				d.PinnedGroups = append(d.PinnedGroups, g.Components...)
+				d.RecordedGroups = append(d.RecordedGroups, g.Components...)
 				if g.Canary != nil {
-					d.PinnedCanary = g.Canary
+					d.RecordedCanary = g.Canary
 				}
 				if g.PolicyRef != nil {
-					t.Fatalf("a pinned group must never carry a reference: %+v", g)
+					t.Fatalf("a recorded group must never carry a reference: %+v", g)
 				}
 			}
 		}
@@ -189,6 +192,18 @@ func decideRun(t *testing.T, in Inputs) (runDecision, string) {
 		t.Fatal(err)
 	}
 	return d, string(raw)
+}
+
+// closedGroupBodies keeps only the group bodies of a closed run.
+func closedGroupBodies(closed *v1beta1.RolloutRun) *v1beta1.RolloutRun {
+	if closed == nil {
+		return nil
+	}
+	bodies := &v1beta1.RolloutRun{}
+	for i := range closed.Plan.Groups {
+		bodies.Plan.Groups = append(bodies.Plan.Groups, v1beta1.RolloutRunGroup{Group: closed.Plan.Groups[i].Group})
+	}
+	return bodies
 }
 
 func conditionLabel(c *apis.Condition) string {
@@ -210,19 +225,19 @@ func TestReconcile_ReferencedCanaryRunDecidesLikeInline(t *testing.T) {
 					decisions[f.name], readings[f.name] = decideRun(t, in)
 				}
 				if readings["inline"] != readings["referenced"] {
-					t.Fatalf("the referenced canary's run decided differently from its inline twin\ninline:\n%s\nreferenced:\n%s", readings["inline"], readings["referenced"])
+					t.Fatalf("the referenced canary's run decided differently from its inline form\ninline:\n%s\nreferenced:\n%s", readings["inline"], readings["referenced"])
 				}
 				// The comparison is not vacuous: the inline form's plan is ready,
-				// the phase leaves the run it should, and an open run pins the ladder.
+				// the phase leaves the run it should, and an open run records the canary.
 				inline := decisions["inline"]
 				if inline.PlanReady == "" || inline.PlanReady == string(corev1.ConditionFalse)+"/"+v1beta1.RolloutPlanReasonPolicyNotFound {
-					t.Fatalf("the inline twin's plan must resolve, got %q", inline.PlanReady)
+					t.Fatalf("the inline form's plan must resolve, got %q", inline.PlanReady)
 				}
 				if inline.RunActive != phase.runAfter {
-					t.Fatalf("the inline twin must leave run pinned=%v, got %+v", phase.runAfter, inline)
+					t.Fatalf("the inline form must leave run recorded=%v, got %+v", phase.runAfter, inline)
 				}
-				if inline.RunActive && inline.PinnedCanary == nil {
-					t.Fatalf("an open run must pin the inline ladder, got %+v", inline)
+				if inline.RunActive && inline.RecordedCanary == nil {
+					t.Fatalf("an open run must record the inline canary, got %+v", inline)
 				}
 			})
 		}

@@ -47,7 +47,17 @@ func (s *Selection) SelectedCandidate() *Candidate {
 // carries them. Equal input always yields the same selection. The two
 // candidates share every status field outside the per-Instance
 // representation; the caller writes one of them and discards the other.
+// Only the columns are serialized to be measured; the dense candidate's
+// length is counted from its fields, so no write serializes the list
+// merely to compare. The column candidate stores each readySince in the
+// three readySince columns; SelectCandidateStoring takes the form.
 func SelectCandidate(logical *v1beta1.InferenceReplicaStatus, maxInstances uint64) (*Selection, error) {
+	return SelectCandidateStoring(logical, maxInstances, ReadySinceInColumns)
+}
+
+// SelectCandidateStoring is SelectCandidate with the readySince of each
+// row stored in form, the one the served schema keeps.
+func SelectCandidateStoring(logical *v1beta1.InferenceReplicaStatus, maxInstances uint64, form ReadySinceForm) (*Selection, error) {
 	if logical == nil || logical.InstanceStatusEncoding != nil || logical.InstanceStatusColumns != nil {
 		return nil, newCodecError(ErrorReasonRepresentationUnion)
 	}
@@ -62,7 +72,7 @@ func SelectCandidate(logical *v1beta1.InferenceReplicaStatus, maxInstances uint6
 		Selected: EncodingDenseV1,
 	}
 
-	columns, err := EncodeColumns(dense.InstanceStatuses, maxInstances)
+	columns, err := EncodeColumnsStoring(dense.InstanceStatuses, maxInstances, form)
 	if err != nil {
 		reason, ok := ErrorReasonOf(err)
 		if !ok {
@@ -86,17 +96,18 @@ func SelectCandidate(logical *v1beta1.InferenceReplicaStatus, maxInstances uint6
 }
 
 // DenseCandidate normalizes status in place into the complete DenseV1 write
-// candidate: it clears the three Pod-derived row fields and measures the
-// serialized status. status must be in the logical shape; a marker or column
-// payload is a representation-union error and leaves status untouched. It
-// builds no second candidate and copies nothing, so a DenseV1 write pays no
-// per-write copy of the rows.
+// candidate: it clears the three Pod-derived row fields and counts the
+// serialized length of status field by field, without serializing the
+// rows. status must be in the logical shape; a marker or column payload is
+// a representation-union error and leaves status untouched. It builds no
+// second candidate and copies nothing, so a DenseV1 write pays no per-write
+// copy of the rows.
 func DenseCandidate(status *v1beta1.InferenceReplicaStatus) (*Candidate, error) {
 	if status == nil || status.InstanceStatusEncoding != nil || status.InstanceStatusColumns != nil {
 		return nil, newCodecError(ErrorReasonRepresentationUnion)
 	}
 	ClearPodDerivedObservations(status.InstanceStatuses)
-	size, err := serializedSize(status)
+	size, err := denseStatusSize(status)
 	if err != nil {
 		return nil, err
 	}

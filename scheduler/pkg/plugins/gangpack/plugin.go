@@ -92,7 +92,8 @@ var (
 // PodGroup informer from the scheduler's shared kubeconfig (so PreFilter can
 // resolve gang facts, and so a PodGroup change requeues the gang's members once
 // that informer holds it), wires a gang-pod lister from the scheduler's shared
-// informer, and starts the assignment garbage collector.
+// informer, registers the gate's handler for a member replaced under its name
+// on that informer, and starts the assignment garbage collector.
 func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 	args, err := decodeArgs(obj)
 	if err != nil {
@@ -119,6 +120,9 @@ func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework
 		podLister:                      podLister,
 	}
 	if err := reader.onChange(g.podGroupChanged); err != nil {
+		return nil, err
+	}
+	if err := g.watchReplacedMembers(h.SharedInformerFactory().Core().V1().Pods().Informer()); err != nil {
 		return nil, err
 	}
 	go g.runAssignmentGC(ctx)
@@ -193,19 +197,27 @@ func (g *GangPack) PreFilter(_ context.Context, state framework.CycleState, pod 
 type gangCycle struct {
 	gang gangInfo
 	pod  *v1.Pod
-	// nodes is the whole snapshot; planningNodes is the part the gang may still
-	// plan on: its assigned domain, else the domain of its bound members, else all.
-	nodes         []framework.NodeInfo
-	planningNodes []framework.NodeInfo
+	// nodes is the whole snapshot; view is the one pass over it: the members
+	// already placed, and the nodes grouped by domain, read once. A member that
+	// holds an assignment reads its domain alone; a member choosing one reads
+	// every domain.
+	nodes []framework.NodeInfo
+	view  snapshotView
 	// placed is what the snapshot holds of the gang: the members already bound or
 	// assumed, and the domain they sit in.
 	placed boundGangPlacement
-	// templates lists the current member first, then the unplaced siblings; need
-	// is how many of them must still land together.
-	templates []*v1.Pod
-	need      int
-	// free is the room each domain of planningNodes offers the remaining members.
-	free topology.FreeByDomain
+	// need is how many of the gang's unplaced members must still land together;
+	// members is what each of them asks of a node, read once for every domain.
+	need    int
+	members gangMembers
+	// planning is the part of the view the gang may still plan on: its assigned
+	// domain, else the domain of its bound members, else every domain;
+	// planningNodes counts its nodes (the whole snapshot when planning
+	// everywhere). free is the room each planning domain offers the remaining
+	// members.
+	planning      map[string][]domainNode
+	planningNodes int
+	free          topology.FreeByDomain
 	// assignment is the domain the gang is committed to, nil until chosen.
 	assignment *assignmentState
 }
@@ -224,8 +236,8 @@ type gangCycle struct {
 // When the in-memory assignment is absent but the gang already has members
 // placed in the cluster (scheduler restart / leader failover lost it), the
 // gang's domain is adopted from where those members already sit rather than
-// best-fit afresh: re-planning a live gang into a different domain would strand
-// its bound members.
+// best-fit afresh: re-planning a live gang into a different domain would leave its
+// bound members without the rest of the gang.
 func (g *GangPack) assignGangDomain(state framework.CycleState, nodes []framework.NodeInfo, gang gangInfo, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	assignment, status := g.currentAssignment(gang)
 	if status != nil {
@@ -256,7 +268,7 @@ func (g *GangPack) assignGangDomain(state framework.CycleState, nodes []framewor
 // first, together with its waiting members; when there were any, the gang
 // retries later so a new attempt never forms beside them.
 func (g *GangPack) currentAssignment(gang gangInfo) (*assignmentState, *framework.Status) {
-	domain, commitment, _, found, ownerMatch := g.assignments.GetOwnedBy(gang.key, gang.uid)
+	domain, commitment, found, ownerMatch := g.assignments.GetOwnedBy(gang.key, gang.uid)
 	if !found {
 		return nil, nil
 	}
@@ -301,9 +313,15 @@ func (g *GangPack) currentAssignment(gang gangInfo) (*assignmentState, *framewor
 func (g *GangPack) readGangCycle(nodes []framework.NodeInfo, gang gangInfo, pod *v1.Pod, assignment *assignmentState) (*gangCycle, *framework.Status) {
 	cycle := &gangCycle{gang: gang, pod: pod, nodes: nodes, assignment: assignment}
 	// One snapshot pass establishes bound/assumed placement and the identities that
-	// gangTemplates must exclude. Waiting Permit pods are assumed here, so this is
-	// also the authoritative view for remaining-template selection.
-	cycle.placed = inspectBoundGangMembers(nodes, pod, gang.topologyKey)
+	// gangTemplates must exclude, and groups the nodes the room is read over.
+	// Waiting Permit pods are assumed here, so this is also the authoritative
+	// view for remaining-template selection.
+	scope := everyDomain
+	if assignment != nil {
+		scope = assignment.domain
+	}
+	cycle.view = scanSnapshot(nodes, pod, gang.topologyKey, scope)
+	cycle.placed = cycle.view.placed
 	// The OME controller reads this reason and the domain-cannot-fit reasons
 	// below to end, sooner, the attempt of a gang no capacity elsewhere can
 	// free (gangDomainFullPhrases in pkg/controller/v1beta1/workload/types).
@@ -316,7 +334,7 @@ func (g *GangPack) readGangCycle(nodes []framework.NodeInfo, gang gangInfo, pod 
 	if status != nil {
 		return nil, status
 	}
-	cycle.templates, cycle.need = templates, need
+	cycle.need, cycle.members = need, membersOf(templates)
 	if sibling, blocked := siblingAffinityBlocked(pod, templates[1:], cycle.placed.placed); blocked {
 		klog.V(4).InfoS("gangpack.assignGangDomain.sibling_wait", "gang", gang.key, "sibling", klog.KObj(sibling))
 		return nil, framework.NewStatus(framework.Unschedulable,
@@ -329,15 +347,26 @@ func (g *GangPack) readGangCycle(nodes []framework.NodeInfo, gang gangInfo, pod 
 // measureRoom bounds the planning nodes and measures the room per domain. A
 // gang with an assignment matches only inside its domain; a gang adopted from
 // bound members only inside theirs; all-domain matching is reserved for an
-// unplaced gang choosing a new domain.
+// unplaced gang choosing a new domain. A view read for one domain is read
+// again over every domain when the gang plans outside it: it comes to choose,
+// or its placed members sit in another domain than the one it was assigned.
 func (c *gangCycle) measureRoom() {
-	c.planningNodes = c.nodes
-	if c.assignment != nil {
-		c.planningNodes = nodeInfosInDomain(c.nodes, c.gang.topologyKey, c.assignment.domain)
-	} else if c.placed.count > 0 {
-		c.planningNodes = nodeInfosInDomain(c.nodes, c.gang.topologyKey, c.placed.domain)
+	domain := everyDomain
+	switch {
+	case c.assignment != nil:
+		domain = c.assignment.domain
+	case c.placed.count > 0:
+		domain = c.placed.domain
 	}
-	c.free = feasibleAtLeastByDomain(c.planningNodes, c.gang.topologyKey, c.templates, c.need)
+	if c.view.scope != everyDomain && domain != c.view.scope {
+		c.view = scanSnapshot(c.nodes, c.pod, c.gang.topologyKey, everyDomain)
+	}
+	c.planning = c.view.planning(domain)
+	c.planningNodes = len(c.nodes)
+	if domain != everyDomain {
+		c.planningNodes = len(c.planning[domain])
+	}
+	c.free = roomByDomain(c.planning, c.members, c.need)
 }
 
 // trace writes the planning inputs at V(4): the assignment, the room per domain
@@ -355,7 +384,7 @@ func (c *gangCycle) trace() {
 	}
 	klog.V(4).InfoS("gangpack.assignGangDomain.enter", "gang", c.gang.key, "minMember", c.gang.minMember,
 		"topologyKey", c.gang.topologyKey, "assigned", c.assignment != nil, "assignedDomain", domain,
-		"nodesInAssignedDomain", len(c.planningNodes),
+		"nodesInAssignedDomain", c.planningNodes,
 		"boundDomain", c.placed.domain, "boundCount", c.placed.count, "freeAssignedDomain", c.free[domain], "freeByDomain", fmt.Sprintf("%v", c.free))
 }
 
@@ -368,7 +397,7 @@ func (c *gangCycle) trace() {
 // veto here is judged the same way.
 func (g *GangPack) followAssignment(c *gangCycle) *framework.Status {
 	gang, domain := c.gang, c.assignment.domain
-	if assignmentStale(len(c.planningNodes), c.placed.count, c.free, c.need, domain) {
+	if assignmentStale(c.planningNodes, c.placed.count, c.free, c.need, domain) {
 		// Releasing also returns the assignment's leaked capacity reservation,
 		// which may be what kept other pods out of the domain, so they are
 		// requeued as on any other release.
@@ -407,7 +436,7 @@ func (g *GangPack) chooseDomain(c *gangCycle) *framework.Status {
 	if d, count := c.placed.domain, c.placed.count; count > 0 {
 		// Rebuild from ground truth: the gang lives where its members already are.
 		remaining := gang.minMember - count
-		id := g.assignments.Set(gang.placementGang(), d, remaining, nodeNamesInDomain(c.nodes, gang.topologyKey, d))
+		id := g.assignments.Set(gang.placementGang(), d, remaining, c.view.names(d))
 		gangAssignmentTotal.WithLabelValues("adopted").Inc()
 		assignedGroups.Set(float64(g.assignments.Len()))
 		if c.free[d] < c.need {
@@ -418,10 +447,11 @@ func (g *GangPack) chooseDomain(c *gangCycle) *framework.Status {
 		return nil
 	}
 	choice, hadFailed := g.withoutFailedDomains(gang, c.free)
-	d, id, fits := g.assignments.Choose(gang.placementGang(), choice, nodeNamesByDomain(c.nodes, gang.topologyKey), c.need)
+	names := c.view.namesByDomain()
+	d, id, fits := g.assignments.Choose(gang.placementGang(), choice, names, c.need)
 	if !fits && hadFailed {
 		g.clearFailedDomains(gang)
-		d, id, fits = g.assignments.Choose(gang.placementGang(), c.free, nodeNamesByDomain(c.nodes, gang.topologyKey), c.need)
+		d, id, fits = g.assignments.Choose(gang.placementGang(), c.free, names, c.need)
 	}
 	if !fits {
 		return g.noDomainFits(c)
@@ -453,8 +483,7 @@ func (g *GangPack) noDomainFits(c *gangCycle) *framework.Status {
 // enforces the domain from the recorded state.
 func (g *GangPack) narrowToDomain(state framework.CycleState, c *gangCycle) (*framework.PreFilterResult, *framework.Status) {
 	gang, domain := c.gang, c.assignment.domain
-	domainNodes := nodeInfosInDomain(c.nodes, gang.topologyKey, domain)
-	candidates := matchingCandidateNodesForNeed(domainNodes, gang.topologyKey, domain, c.templates, c.need)
+	candidates := candidateNodes(c.view.byDomain[domain], c.members, c.need)
 	if len(candidates) == 0 {
 		return nil, framework.NewStatus(framework.Unschedulable,
 			"pinned domain "+domain+" has no node feasible for gang member "+gang.key)
@@ -519,7 +548,7 @@ func (g *GangPack) Filter(_ context.Context, state framework.CycleState, pod *v1
 //     leaks until re-plan releases it.
 //
 // A domain that already holds any of this gang's members is NEVER stale: those
-// members are bound (or assumed) there, so re-planning would strand them. Such
+// members are bound (or assumed) there, so re-planning would split the gang. Such
 // a gang keeps its assignment and waits for capacity in its own domain. The
 // full-domain projection is only paid while a gang is unplaced (a transient
 // formation window); once a member lands, the early return keeps steady-state
@@ -529,86 +558,81 @@ func assignmentStale(nodesInAssignedDomain, boundCount int, free topology.FreeBy
 		return true // domain vanished
 	}
 	if boundCount > 0 {
-		return false // has members placed here already; never strand them
+		return false // has members placed here already; never split the gang
 	}
 	return free[domain] < need
 }
 
-func nodeInfosInDomain(nodes []framework.NodeInfo, topologyKey, domain string) []framework.NodeInfo {
-	out := make([]framework.NodeInfo, 0)
-	for _, node := range nodes {
-		if node != nil && domainOf(node.Node(), topologyKey) == domain {
-			out = append(out, node)
-		}
-	}
-	return out
-}
-
-// matchingCandidateNodesForNeed restricts the current member to the domain's
-// nodes that leave room for the need-1 remaining members it brings along.
-func matchingCandidateNodesForNeed(nodes []framework.NodeInfo, topologyKey, domain string, templates []*v1.Pod, need int) sets.Set[string] {
-	if len(templates) == 0 {
-		return sets.New[string]()
-	}
-	return newGangRoom(nodeInfosInDomain(nodes, topologyKey, domain), templates, need).candidates(need - 1)
-}
-
-func nodeNamesByDomain(nodes []framework.NodeInfo, topologyKey string) map[string][]string {
-	out := make(map[string][]string)
-	for _, node := range nodes {
-		if node == nil || node.Node() == nil {
-			continue
-		}
-		if domain := domainOf(node.Node(), topologyKey); domain != "" {
-			out[domain] = append(out[domain], node.Node().Name)
-		}
-	}
-	return out
-}
-
-func nodeNamesInDomain(nodes []framework.NodeInfo, topologyKey, domain string) []string {
-	return nodeNamesByDomain(nodes, topologyKey)[domain]
-}
-
 // gangTemplates returns the concrete remaining members used for simultaneous
-// domain feasibility. Without a pod lister (unit tests of the decision core)
-// every remaining member is a copy of the current pod.
+// domain feasibility: the current member and the siblings still to place, in
+// name order, and how many of them the gang needs. A set short of that need
+// holds the member and is recorded. Without a pod lister (unit tests of the
+// decision core) every remaining member is a copy of the current pod.
 func (g *GangPack) gangTemplates(gang gangInfo, current *v1.Pod, placement boundGangPlacement) ([]*v1.Pod, int, *framework.Status) {
-	need := gang.minMember - placement.count
-	if need < 1 {
-		need = 1
-	}
+	need := membersStillNeeded(gang, placement)
 	if g.podLister == nil {
-		out := make([]*v1.Pod, need)
-		for i := range out {
-			out[i] = current
-		}
-		return out, need, nil
+		return copiesOf(current, need), need, nil
 	}
-	ns, name, _ := splitGangKey(gang.key)
-	members, err := g.podLister.gangPods(ns, name)
+	templates, err := g.membersStillToPlace(gang, current, placement)
 	if err != nil {
 		return nil, 0, framework.AsStatus(err)
 	}
-	sort.Slice(members, func(i, j int) bool { return members[i].Name < members[j].Name })
-	out := []*v1.Pod{current}
-	for _, member := range members {
-		if member == nil || member.Name == current.Name || member.Spec.NodeName != "" || placement.placed[member.Name] != nil ||
-			member.DeletionTimestamp != nil || member.Status.Phase == v1.PodSucceeded || member.Status.Phase == v1.PodFailed {
-			continue
-		}
-		out = append(out, member)
-	}
-	if len(out) < need {
+	if len(templates) < need {
 		g.markTemplatesIncomplete(gang)
 		return nil, 0, framework.NewStatus(framework.Unschedulable,
 			"waiting for all PodGroup member templates for "+gang.key)
 	}
-	// Members held back on the incomplete set are requeued here, once per
-	// completion. The record is consumed only after the activation has run.
+	g.requeueMembersHeldOnTheShortSet(gang, current, len(templates), need)
+	return templates, need, nil
+}
+
+// membersStillNeeded is how many members the gang needs beside those the
+// snapshot already holds; the current member always counts, so at least one.
+func membersStillNeeded(gang gangInfo, placement boundGangPlacement) int {
+	return max(1, gang.minMember-placement.count)
+}
+
+// copiesOf returns count copies of the current pod, one per member still to place.
+func copiesOf(current *v1.Pod, count int) []*v1.Pod {
+	out := make([]*v1.Pod, count)
+	for i := range out {
+		out[i] = current
+	}
+	return out
+}
+
+// membersStillToPlace lists the gang's live members from the pod lister: the
+// current member first, then the siblings still to place in name order.
+func (g *GangPack) membersStillToPlace(gang gangInfo, current *v1.Pod, placement boundGangPlacement) ([]*v1.Pod, error) {
+	ns, name, _ := splitGangKey(gang.key)
+	members, err := g.podLister.gangPods(ns, name)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].Name < members[j].Name })
+	out := []*v1.Pod{current}
+	for _, member := range members {
+		if siblingStillToPlace(member, current, placement) {
+			out = append(out, member)
+		}
+	}
+	return out, nil
+}
+
+// siblingStillToPlace reports whether a listed member is a sibling the gang
+// still has to place: not the current member, not on a node, not held by the
+// snapshot, not being deleted and not finished.
+func siblingStillToPlace(member, current *v1.Pod, placement boundGangPlacement) bool {
+	return member != nil && member.Name != current.Name && member.Spec.NodeName == "" && placement.placed[member.Name] == nil &&
+		member.DeletionTimestamp == nil && member.Status.Phase != v1.PodSucceeded && member.Status.Phase != v1.PodFailed
+}
+
+// requeueMembersHeldOnTheShortSet requeues the members held back while the
+// set was short, once per completion. The record is consumed only after the
+// activation has run; the current member is in flight and left out of it.
+func (g *GangPack) requeueMembersHeldOnTheShortSet(gang gangInfo, current *v1.Pod, listed, need int) {
 	if g.hasTemplatesIncomplete(gang) && g.activateGangMembers(gang, activationTriggerTemplatesComplete, current) {
 		g.clearTemplatesIncomplete(gang)
-		klog.V(4).InfoS("gangpack.templates.complete", "gang", gang.key, "members", len(out), "need", need)
+		klog.V(4).InfoS("gangpack.templates.complete", "gang", gang.key, "members", listed, "need", need)
 	}
-	return out, need, nil
 }

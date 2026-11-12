@@ -133,11 +133,6 @@ func BeNotFoundError() types.GomegaMatcher {
 	return BeAPIError(NotFoundErrorType)
 }
 
-// BeForbiddenError matches an apierrors.IsForbidden error.
-func BeForbiddenError() types.GomegaMatcher {
-	return BeAPIError(ForbiddenErrorType)
-}
-
 // BeInvalidError matches an apierrors.IsInvalid error.
 func BeInvalidError() types.GomegaMatcher {
 	return BeAPIError(InvalidErrorType)
@@ -155,19 +150,17 @@ type APIErrorType int
 
 const (
 	NotFoundErrorType APIErrorType = iota
-	ForbiddenErrorType
 	InvalidErrorType
 	ConflictErrorType
 )
 
 func (t APIErrorType) String() string {
-	return []string{"NotFoundError", "ForbiddenError", "InvalidError", "ConflictError"}[t]
+	return []string{"NotFoundError", "InvalidError", "ConflictError"}[t]
 }
 
 func (t APIErrorType) isError(err error) bool {
 	return []func(error) bool{
 		apierrors.IsNotFound,
-		apierrors.IsForbidden,
 		apierrors.IsInvalid,
 		apierrors.IsConflict,
 	}[t](err)

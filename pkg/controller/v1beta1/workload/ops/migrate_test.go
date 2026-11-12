@@ -75,11 +75,6 @@ func sourceNodeFixture(t *testing.T, pods ...*corev1.Pod) (workload.Deps, worklo
 			Namespace: "prod",
 			Component: workload.ComponentEngine,
 			OwnerName: "llama-70b",
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: "llama-70b",
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 	}
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
@@ -123,8 +118,9 @@ func TestResolveSourceNode_MatchKeepsTheRequestedNode(t *testing.T) {
 }
 
 // The Instance was rebuilt on node7 since the requester saw it on
-// node5: the move leaves node7, so the surge is kept off the node the
-// Instance occupies rather than one it already left.
+// node5: the helper reports node7, the node the Instance runs on, and
+// the pass reads a node other than the requested one as a move the
+// rebuild already made.
 func TestResolveSourceNode_MismatchAnchorsToTheObservedNode(t *testing.T) {
 	deps, input, plan := sourceNodeFixture(t, sourceNodePod("node7"))
 	node, defer_, rejection, err := resolveSourceNode(context.Background(), deps, input, plan, 0, "node5")
@@ -298,9 +294,10 @@ func TestResolveSourceNode_GangSpanningNodesKeepsTheRequestedMember(t *testing.T
 	}
 }
 
-// The gang has moved off node99 since the request. The whole gang moves
-// anyway, so the move leaves the routable member's node, whichever
-// order the pods list in.
+// The gang has moved off node99 since the request. The helper reports
+// the routable member's node, whichever order the pods list in, and the
+// pass reads a gang off the requested node as a move the rebuild already
+// made.
 func TestResolveSourceNode_GangOffTheRequestedNodeAnchorsToTheLeader(t *testing.T) {
 	deps, input, plan := sourceNodeGangFixture(t,
 		sourceNodeGangPod("worker", "node8"),
@@ -343,7 +340,7 @@ func TestResolveSourceNode_GangUnscheduledDefers(t *testing.T) {
 // the leader) so a gang migration renders its worker pods from the right
 // template. Before gang migrate support this returned only the leader
 // spec; the worker spec is nil for single-pod revisions.
-func TestSurgeRevisionAndSpec_ReturnsGangWorkerSpec(t *testing.T) {
+func TestStoredRevisionAndSpec_ReturnsGangWorkerSpec(t *testing.T) {
 	legacyResetExpectations(t)
 	isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 1)
 	c := legacyNewFakeClient(t, isvc, ir)
@@ -366,9 +363,9 @@ func TestSurgeRevisionAndSpec_ReturnsGangWorkerSpec(t *testing.T) {
 	}
 
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
-	gotCR, gotPayload, err := surgeRevisionAndSpec(context.Background(), legacyTestDeps(c), input, 0)
+	gotCR, gotPayload, err := storedRevisionAndSpec(context.Background(), legacyTestDeps(c), input, cr.Name)
 	if err != nil {
-		t.Fatalf("surgeRevisionAndSpec: %v", err)
+		t.Fatalf("storedRevisionAndSpec: %v", err)
 	}
 	if gotCR == nil || gotPayload == nil || gotPayload.PodSpec == nil {
 		t.Fatalf("expected CR + leader spec, got cr=%v payload=%+v", gotCR, gotPayload)
@@ -2152,7 +2149,7 @@ func TestMigrate_SourceFailedOnARevisionThatHasNotStarted_RejectedAtOnce(t *test
 					t.Errorf("no record may stay Accepted after the answer; got %+v", r)
 				}
 			}
-			events := migWedgeEvents(t, f)
+			events := recordedEvents(t, f)
 			if n := countEventsWithReason(events, workload.EventReasonMigrationRequestRejected); n != 1 {
 				t.Fatalf("want one %s event, got %d: %v", workload.EventReasonMigrationRequestRejected, n, events)
 			}
@@ -2201,7 +2198,7 @@ func TestMigrate_SourceMidOperationOnAReadyRow_StillWaits(t *testing.T) {
 	if rec.Phase != workload.MigrationPhaseAccepted || rec.SurgeInstance != nil || rec.Message != "" {
 		t.Errorf("deferred record must stay Accepted, unallocated and unannotated; got %+v", *rec)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Errorf("a defer emits nothing; got %v", events)
 	}
 	ledger, err := audit.LoadLedgerForOwner(context.Background(), f.c, f.isvc)
@@ -2272,7 +2269,7 @@ func assertMigrationWaitsNaming(t *testing.T, f *migFixture, uuid string, wants 
 			t.Errorf("record Message = %q, want substring %q", rec.Message, want)
 		}
 	}
-	events := migWedgeEvents(t, f)
+	events := recordedEvents(t, f)
 	if len(events) != 1 || countEventsWithReason(events, workload.EventReasonMigrationDeferred) != 1 {
 		t.Fatalf("want exactly one %s event, got %v", workload.EventReasonMigrationDeferred, events)
 	}
@@ -2294,7 +2291,7 @@ func assertMigrationWaitsNaming(t *testing.T, f *migFixture, uuid string, wants 
 	if diff := cmp.Diff(before, *f.record(t, uuid)); diff != "" {
 		t.Errorf("the record changed on a pass with nothing new (-want +got):\n%s", diff)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Errorf("a pass with nothing new emits nothing; got %v", events)
 	}
 }
@@ -2450,7 +2447,7 @@ func TestMigrate_SourceRunsAHeldRevision_RejectedAtOnce(t *testing.T) {
 					t.Errorf("no record may stay Accepted after the answer; got %+v", r)
 				}
 			}
-			events := migWedgeEvents(t, f)
+			events := recordedEvents(t, f)
 			if len(events) != 1 || countEventsWithReason(events, workload.EventReasonMigrationRequestRejected) != 1 {
 				t.Fatalf("want exactly one %s event, got %v", workload.EventReasonMigrationRequestRejected, events)
 			}
@@ -2515,7 +2512,7 @@ func TestMigrate_SourceRunsARevisionTheLadderStillPaces_Proceeds(t *testing.T) {
 			if pods := migPodsForInstance(t, f, *rec.SurgeInstance); len(pods) != 1 {
 				t.Errorf("the surge pod must be rendered at index %d; got %d pod(s)", *rec.SurgeInstance, len(pods))
 			}
-			if n := countEventsWithReason(migWedgeEvents(t, f), workload.EventReasonMigrationRequestRejected); n != 0 {
+			if n := countEventsWithReason(recordedEvents(t, f), workload.EventReasonMigrationRequestRejected); n != 0 {
 				t.Errorf("a paced ladder rejects nothing; got %d rejection event(s)", n)
 			}
 		})
@@ -2710,7 +2707,7 @@ func TestMigrate_UnconfiguredCapacityDefersAndResumes(t *testing.T) {
 	if !strings.Contains(rec.Message, "lifecycle.audit") {
 		t.Errorf("held record Message = %q, want the missing configuration named", rec.Message)
 	}
-	events := migWedgeEvents(t, f)
+	events := recordedEvents(t, f)
 	if got := countEventsWithReason(events, workload.EventReasonMigrationPolicyUnconfigured); got != 1 {
 		t.Fatalf("held request must warn once; got %d in %v", got, events)
 	}
@@ -2732,7 +2729,7 @@ func TestMigrate_UnconfiguredCapacityDefersAndResumes(t *testing.T) {
 	if done, accepted = f.pass(t, uuid); done || accepted {
 		t.Fatalf("second pass must keep deferring: done=%v accepted=%v", done, accepted)
 	}
-	if got := countEventsWithReason(migWedgeEvents(t, f), workload.EventReasonMigrationPolicyUnconfigured); got != 0 {
+	if got := countEventsWithReason(recordedEvents(t, f), workload.EventReasonMigrationPolicyUnconfigured); got != 0 {
 		t.Errorf("the hold must warn once per hold, not once per pass; got %d", got)
 	}
 
@@ -2807,14 +2804,14 @@ func TestStampMigrationStatus_SourceSlotMissing_NotResurrected(t *testing.T) {
 	f := newSinglePodMigFixture(t)
 	in := f.input(t)
 
-	if err := patchInstanceStatusMigrating(context.Background(), in, 7, 8, "uuid-guard", time.Minute); err != nil {
+	if err := patchInstanceStatusMigrating(context.Background(), in, 7, 8, "uuid-guard", "", time.Minute); err != nil {
 		t.Fatalf("patchInstanceStatusMigrating: %v", err)
 	}
 	if s := findInstanceStatusOnIRForFixture(t, f, 7); s != nil {
 		t.Fatalf("source stamp resurrected a removed slot: %+v", s)
 	}
 
-	if err := patchInstanceStatusMigrationSurge(context.Background(), in, 8, 7, "uuid-guard", time.Minute); err != nil {
+	if err := patchInstanceStatusMigrationSurge(context.Background(), in, 8, 7, "uuid-guard", "", time.Minute); err != nil {
 		t.Fatalf("patchInstanceStatusMigrationSurge: %v", err)
 	}
 	s := findInstanceStatusOnIRForFixture(t, f, 8)
@@ -2906,7 +2903,7 @@ func TestMigrate_SourceStuckTerminating_EscalationRuns(t *testing.T) {
 	}
 
 	found := false
-	for _, e := range fdLedgerEntries(t, f.c, f.isvc) {
+	for _, e := range fdAuditEntries(t, f.c, f.isvc) {
 		if e.Reason == audit.ReasonForceDelete && e.Outcome == audit.OutcomeForceDeleteFinalizerReport {
 			found = true
 		}
@@ -3066,7 +3063,7 @@ func TestMigrate_DeadlineExceededIsNotEarlyFailureEvidence(t *testing.T) {
 	surgePods := driveToSurgePods(t, f, uuid, 1)
 	wedgePod(t, f, surgePods[0], "DeadlineExceeded")
 	clk.Step(wedgeGrace + time.Hour)
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	done, accepted := f.pass(t, uuid)
 	if done || !accepted {
@@ -3082,7 +3079,7 @@ func TestMigrate_DeadlineExceededIsNotEarlyFailureEvidence(t *testing.T) {
 	if surge := findInstanceStatusOnIRForFixture(t, f, 1); surge == nil || surge.Phase == v1beta1.OMENativeInstanceFailed {
 		t.Errorf("replacement: got %+v want it still coming up", surge)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Errorf("events: got %v want none; this reading is not evidence", events)
 	}
 }
@@ -3144,27 +3141,17 @@ func TestMigrate_RevisionRetargetIsDeclinedWhileTheRecordDrives(t *testing.T) {
 	}
 }
 
-// TestMigrate_SurgeRendersTheSourceRevisionWhileTheTemplateHasMoved: a
-// migration moves an Instance, never its revision. Filed while a roll is
-// rotating the Component — the current template is already the new
-// revision's, with an image and a pod-template annotation the source's
-// revision never carried — the surge renders the source revision's stored
-// template and stamps its hash, so the per-revision Service selecting on
-// that hash routes to a pod running that revision, and the roll takes the
-// moved Instance to the new revision afterwards like any other row. The
-// promoted surge records the source revision.
-func TestMigrate_SurgeRendersTheSourceRevisionWhileTheTemplateHasMoved(t *testing.T) {
+// TestMigrate_ReplacementFollowsTheRollTargetWhileARollIsOpen: a move
+// requested while a roll could take the source builds its replacement on
+// the roll's target, so the Instance is built once and the roll finds it
+// done. The current template is already the new revision's, with an image
+// and a pod-template annotation the source's revision never carried: both
+// rows' operations name the target, the record says so, the surge renders the target's
+// stored template under the target's hash, and the promoted surge records
+// the target.
+func TestMigrate_ReplacementFollowsTheRollTargetWhileARollIsOpen(t *testing.T) {
 	f := newMultiInstanceMigFixture(t, 3)
 	f.recorder = record.NewFakeRecorder(64)
-	source := findInstanceStatusOnIRForFixture(t, f, 2)
-	sourceRevision := &appsv1.ControllerRevision{}
-	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: source.RunningRevision}, sourceRevision); err != nil {
-		t.Fatalf("get the source revision: %v", err)
-	}
-
-	// The operator pushes a new revision while every Instance still runs
-	// the source's: a new image and a pod-template annotation the source
-	// revision never carried.
 	const releaseAnnotation = "example.com/release"
 	nextSpec := legacyTargetSpecImage("llama:v2")
 	nextMeta := &metav1.ObjectMeta{Annotations: map[string]string{releaseAnnotation: "v2"}}
@@ -3172,32 +3159,208 @@ func TestMigrate_SurgeRendersTheSourceRevisionWhileTheTemplateHasMoved(t *testin
 	f.desiredPodSpec = nextSpec
 	f.desiredPodMeta = nextMeta
 
-	const uuid = "mig-mid-roll"
+	const uuid = "mig-under-a-roll"
 	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 2, "node-a")}
 
 	if done, accepted := f.pass(t, uuid); done || !accepted {
 		t.Fatalf("pass 1: got done=%v accepted=%v, want the surge in flight", done, accepted)
+	}
+	for _, idx := range []int32{2, 3} {
+		row := findInstanceStatusOnIRForFixture(t, f, idx)
+		if row == nil || row.Operation == nil || row.Operation.Type != v1beta1.InstanceOperationMigrate {
+			t.Fatalf("instance %d: got %+v want a Migrate-owned row", idx, row)
+		}
+		if row.Operation.TargetRevision != f.target.Name {
+			t.Fatalf("instance %d operation names revision %q, want the roll target %s", idx, row.Operation.TargetRevision, f.target.Name)
+		}
+	}
+	if msg := f.record(t, uuid).Message; !strings.Contains(msg, f.target.Name) {
+		t.Fatalf("record message %q does not name the roll target %s", msg, f.target.Name)
 	}
 	surgePod := &corev1.Pod{}
 	surgePodName := query.PodName(f.isvc.Name, f.component, 3, "default", 0)
 	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: surgePodName}, surgePod); err != nil {
 		t.Fatalf("the surge pod must exist after pass 1: %v", err)
 	}
-	requirePodRendersRevision(t, surgePod, sourceRevision)
-	if got, ok := surgePod.Annotations[releaseAnnotation]; ok {
-		t.Fatalf("surge pod carries %s=%q, an annotation the new revision added, while labelled with the source revision %s",
-			releaseAnnotation, got, sourceRevision.Name)
+	requirePodRendersRevision(t, surgePod, f.target)
+	if got := surgePod.Annotations[releaseAnnotation]; got != "v2" {
+		t.Fatalf("surge pod annotation %s=%q, want the target's v2", releaseAnnotation, got)
 	}
 
 	f.react(t)
 	f.drive(t, uuid, 10)
 	surge := findInstanceStatusOnIRForFixture(t, f, 3)
-	if surge == nil || surge.Phase != v1beta1.OMENativeInstanceReady || surge.RunningRevision != sourceRevision.Name {
-		t.Fatalf("promoted surge = %+v, want Ready on the source revision %s", surge, sourceRevision.Name)
+	if surge == nil || surge.Phase != v1beta1.OMENativeInstanceReady || surge.RunningRevision != f.target.Name {
+		t.Fatalf("promoted surge = %+v, want Ready on the roll target %s", surge, f.target.Name)
 	}
 	events := drainEvents(f.recorder)
-	if want := fmt.Sprintf("instance=3 (revision=%s)", sourceRevision.Name); !anyContains(events, want) {
-		t.Fatalf("no MigrationCompleted event naming the source revision; events = %v", events)
+	if want := fmt.Sprintf("instance=3 (revision=%s)", f.target.Name); !anyContains(events, want) {
+		t.Fatalf("no MigrationCompleted event naming the roll target; events = %v", events)
+	}
+}
+
+// TestMigrate_ReplacementFollowsTheRollTargetWhileItsRetryRecordIsInBackoff:
+// a Backoff block paces the roll's start and does not hold it. A move
+// admitted while the target's retry record is in Backoff, its retry not
+// yet due, builds its replacement on the target instead of waiting out the
+// schedule: both rows' operations name the target and the surge renders
+// its stored template.
+func TestMigrate_ReplacementFollowsTheRollTargetWhileItsRetryRecordIsInBackoff(t *testing.T) {
+	f := newMultiInstanceMigFixture(t, 3)
+	f.recorder = record.NewFakeRecorder(64)
+	clk := f.withFakeClock()
+	nextSpec := legacyTargetSpecImage("llama:v2")
+	f.target = legacyEnsureTargetCR(t, f.c, f.isvc, nextSpec)
+	f.desiredPodSpec = nextSpec
+	nextRetry := metav1.NewTime(clk.Now().Add(10 * time.Minute))
+	f.retryBlocks = []workload.RetryBlock{{
+		TargetRevision:  f.target.Name,
+		State:           workload.RetryBlockBackoff,
+		AttemptsStarted: 1,
+		Reason:          "ImagePullBackOff",
+		NextRetryAt:     &nextRetry,
+	}}
+
+	const uuid = "mig-under-a-roll-in-backoff"
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 2, "node-a")}
+	if done, accepted := f.pass(t, uuid); done || !accepted {
+		t.Fatalf("pass 1: got done=%v accepted=%v, want the surge in flight", done, accepted)
+	}
+	for _, idx := range []int32{2, 3} {
+		row := findInstanceStatusOnIRForFixture(t, f, idx)
+		if row == nil || row.Operation == nil || row.Operation.Type != v1beta1.InstanceOperationMigrate {
+			t.Fatalf("instance %d: got %+v want a Migrate-owned row", idx, row)
+		}
+		if row.Operation.TargetRevision != f.target.Name {
+			t.Fatalf("instance %d operation names revision %q, want the roll target %s", idx, row.Operation.TargetRevision, f.target.Name)
+		}
+	}
+	surgePod := &corev1.Pod{}
+	surgePodName := query.PodName(f.isvc.Name, f.component, 3, "default", 0)
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: surgePodName}, surgePod); err != nil {
+		t.Fatalf("the surge pod must exist after pass 1: %v", err)
+	}
+	requirePodRendersRevision(t, surgePod, f.target)
+}
+
+// TestMigrate_ReplacementKeepsTheSourceRevisionWhenTheRollCannotTakeIt: a
+// roll that cannot start on its target, or may not take the source, leaves
+// the move on the revision the source runs: a paused Component, a target
+// whose retry record is Held, and a partition that holds the source. The
+// operations name no revision, the surge renders the source's stored template
+// under the source's hash, and the promoted surge records the source
+// revision; the roll takes the moved Instance afterwards like any other
+// row.
+func TestMigrate_ReplacementKeepsTheSourceRevisionWhenTheRollCannotTakeIt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arrange func(f *migFixture)
+	}{
+		{name: "the Component is paused", arrange: func(f *migFixture) { f.plan.Paused = true }},
+		{name: "the target's retry record is Held", arrange: func(f *migFixture) {
+			f.retryBlocks = []workload.RetryBlock{{TargetRevision: f.target.Name, State: workload.RetryBlockHeld}}
+		}},
+		{name: "the partition holds the source", arrange: func(f *migFixture) {
+			partition := int32(3)
+			f.plan.UpdateStrategy.RollingUpdate = &workload.RollingUpdate{Partition: &partition}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMultiInstanceMigFixture(t, 3)
+			f.recorder = record.NewFakeRecorder(64)
+			source := findInstanceStatusOnIRForFixture(t, f, 2)
+			sourceRevision := &appsv1.ControllerRevision{}
+			if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: source.RunningRevision}, sourceRevision); err != nil {
+				t.Fatalf("get the source revision: %v", err)
+			}
+			nextSpec := legacyTargetSpecImage("llama:v2")
+			f.target = legacyEnsureTargetCR(t, f.c, f.isvc, nextSpec)
+			f.desiredPodSpec = nextSpec
+			tc.arrange(f)
+
+			const uuid = "mig-under-a-roll-that-cannot-take-the-source"
+			f.records = []workload.MigrationRecord{mkMigRecord(uuid, 2, "node-a")}
+			if done, accepted := f.pass(t, uuid); done || !accepted {
+				t.Fatalf("pass 1: got done=%v accepted=%v, want the surge in flight", done, accepted)
+			}
+			for _, idx := range []int32{2, 3} {
+				row := findInstanceStatusOnIRForFixture(t, f, idx)
+				if row == nil || row.Operation == nil || row.Operation.Type != v1beta1.InstanceOperationMigrate {
+					t.Fatalf("instance %d: got %+v want a Migrate-owned row", idx, row)
+				}
+				if row.Operation.TargetRevision != "" {
+					t.Fatalf("instance %d operation names revision %q, want none: the surge runs what the source runs", idx, row.Operation.TargetRevision)
+				}
+			}
+			surgePod := &corev1.Pod{}
+			surgePodName := query.PodName(f.isvc.Name, f.component, 3, "default", 0)
+			if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: surgePodName}, surgePod); err != nil {
+				t.Fatalf("the surge pod must exist after pass 1: %v", err)
+			}
+			requirePodRendersRevision(t, surgePod, sourceRevision)
+
+			f.react(t)
+			f.drive(t, uuid, 10)
+			surge := findInstanceStatusOnIRForFixture(t, f, 3)
+			if surge == nil || surge.Phase != v1beta1.OMENativeInstanceReady || surge.RunningRevision != sourceRevision.Name {
+				t.Fatalf("promoted surge = %+v, want Ready on the source revision %s", surge, sourceRevision.Name)
+			}
+			events := drainEvents(f.recorder)
+			if want := fmt.Sprintf("instance=3 (revision=%s)", sourceRevision.Name); !anyContains(events, want) {
+				t.Fatalf("no MigrationCompleted event naming the source revision; events = %v", events)
+			}
+		})
+	}
+}
+
+// TestMigrate_ReplacementKeepsItsRecordedRevisionWhenTheTargetMovesAgain:
+// the revision a move renders is decided when its pair is written and
+// carried on both rows' operations. A third revision pushed while the surge is still
+// coming up does not retarget it: the surge pod keeps the recorded
+// revision, the promote lands on it, and the roll takes the moved Instance
+// to the newer revision afterwards like any other row.
+func TestMigrate_ReplacementKeepsItsRecordedRevisionWhenTheTargetMovesAgain(t *testing.T) {
+	f := newMultiInstanceMigFixture(t, 3)
+	f.recorder = record.NewFakeRecorder(64)
+	secondSpec := legacyTargetSpecImage("llama:v2")
+	second := legacyEnsureTargetCR(t, f.c, f.isvc, secondSpec)
+	f.target = second
+	f.desiredPodSpec = secondSpec
+
+	const uuid = "mig-under-a-roll-pushed-again"
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 2, "node-a")}
+	if done, accepted := f.pass(t, uuid); done || !accepted {
+		t.Fatalf("pass 1: got done=%v accepted=%v, want the surge in flight", done, accepted)
+	}
+	surgePodName := query.PodName(f.isvc.Name, f.component, 3, "default", 0)
+	surgePod := &corev1.Pod{}
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: surgePodName}, surgePod); err != nil {
+		t.Fatalf("the surge pod must exist after pass 1: %v", err)
+	}
+	requirePodRendersRevision(t, surgePod, second)
+	created := surgePod.UID
+
+	// The operator pushes a third revision before the surge serves.
+	thirdSpec := legacyTargetSpecImage("llama:v3")
+	f.target = legacyEnsureTargetCR(t, f.c, f.isvc, thirdSpec)
+	f.desiredPodSpec = thirdSpec
+
+	f.react(t)
+	f.drive(t, uuid, 10)
+	if err := f.c.Get(context.Background(), types.NamespacedName{Namespace: f.isvc.Namespace, Name: surgePodName}, surgePod); err != nil {
+		t.Fatalf("the surge pod must survive the move: %v", err)
+	}
+	if surgePod.UID != created {
+		t.Fatalf("the surge pod was replaced after the third push; the recorded revision must stand")
+	}
+	requirePodRendersRevision(t, surgePod, second)
+	surge := findInstanceStatusOnIRForFixture(t, f, 3)
+	if surge == nil || surge.Phase != v1beta1.OMENativeInstanceReady || surge.RunningRevision != second.Name {
+		t.Fatalf("promoted surge = %+v, want Ready on the recorded revision %s, not the third push", surge, second.Name)
+	}
+	events := drainEvents(f.recorder)
+	if want := fmt.Sprintf("instance=3 (revision=%s)", second.Name); !anyContains(events, want) {
+		t.Fatalf("no MigrationCompleted event naming the recorded revision; events = %v", events)
 	}
 }
 
@@ -3337,7 +3500,7 @@ func wedgedSurgePastGrace(t *testing.T, f *migFixture, uuid string) *clocktestin
 	}
 	wedgePod(t, f, surgePods[0], "ImagePullBackOff")
 	clk.Step(wedgeGrace + time.Second)
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 	return clk
 }
 
@@ -3391,7 +3554,7 @@ func TestMigrate_SourcePodLossAroundTheWedgeClose(t *testing.T) {
 		closed := *f.record(t, uuid)
 		assertSourceRestored(t, f, 0, uuid, findInstanceStatusOnIRForFixture(t, f, 0).RunningRevision)
 		restored := *findInstanceStatusOnIRForFixture(t, f, 0)
-		migWedgeEvents(t, f)
+		recordedEvents(t, f)
 
 		deleteSourcePods(t, f)
 		if done, accepted := f.pass(t, uuid); !done || !accepted {
@@ -3403,7 +3566,7 @@ func TestMigrate_SourcePodLossAroundTheWedgeClose(t *testing.T) {
 		if after := findInstanceStatusOnIRForFixture(t, f, 0); !equalitySafeOperation(&restored, after) {
 			t.Errorf("source: got %+v want it left Ready and unpinned (%+v)", after, restored)
 		}
-		if events := migWedgeEvents(t, f); len(events) != 0 {
+		if events := recordedEvents(t, f); len(events) != 0 {
 			t.Errorf("events: got %v want none; the migration reads nothing off an unpinned row", events)
 		}
 	})
@@ -3439,7 +3602,7 @@ func TestMigrate_MigrationDeadlineAroundTheWedgeClose(t *testing.T) {
 	}
 	assertNoRetryBlocks(t, f)
 	restored := *source
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	// The after window: the same elapsed Deadline against a terminal
 	// record.
@@ -3454,7 +3617,7 @@ func TestMigrate_MigrationDeadlineAroundTheWedgeClose(t *testing.T) {
 	if after := findInstanceStatusOnIRForFixture(t, f, 0); !equalitySafeOperation(&restored, after) {
 		t.Errorf("source: got %+v want it left where the close put it (%+v)", after, restored)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Errorf("events: got %v want none; a terminal record announces nothing", events)
 	}
 }
@@ -4047,8 +4210,8 @@ func TestMigrate_SurgePodCreateBlockRequiresBoundedRetry(t *testing.T) {
 // the clock across the boundary explicitly.
 const wedgeGrace = 5 * time.Minute
 
-// migWedgeEvents drains the fixture recorder.
-func migWedgeEvents(t *testing.T, f *migFixture) []string {
+// recordedEvents drains the fixture recorder.
+func recordedEvents(t *testing.T, f *migFixture) []string {
 	t.Helper()
 	var out []string
 	for {
@@ -4188,7 +4351,7 @@ func TestMigrate_SurgeWedgedInImagePull_FailsThroughRecord(t *testing.T) {
 	}
 	wedgePod(t, f, surgePods[0], "ImagePullBackOff")
 	clk.Step(wedgeGrace + time.Second)
-	migWedgeEvents(t, f) // drop the accept event
+	recordedEvents(t, f) // drop the accept event
 
 	done, accepted := f.pass(t, uuid)
 	if !done || !accepted {
@@ -4210,7 +4373,7 @@ func TestMigrate_SurgeWedgedInImagePull_FailsThroughRecord(t *testing.T) {
 		t.Fatalf("surge must keep its slot with the pin cleared so scale-down takes it; got %+v", surge)
 	}
 
-	events := migWedgeEvents(t, f)
+	events := recordedEvents(t, f)
 	if len(events) != 1 {
 		t.Fatalf("want exactly one event for the close; got %v", events)
 	}
@@ -4274,7 +4437,7 @@ func TestMigrate_SurgeWedgeCloseIsIdempotent(t *testing.T) {
 	}
 	closed := *f.record(t, uuid)
 	surgeBefore := findInstanceStatusOnIRForFixture(t, f, 1)
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	if done, accepted := f.pass(t, uuid); !done || !accepted {
 		t.Fatalf("second pass: got done=%v accepted=%v, want the terminal record handled", done, accepted)
@@ -4283,7 +4446,7 @@ func TestMigrate_SurgeWedgeCloseIsIdempotent(t *testing.T) {
 	if after.Message != closed.Message || !after.CompletedAt.Equal(closed.CompletedAt) {
 		t.Errorf("second pass rewrote the terminal record: %+v -> %+v", closed, *after)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Errorf("second pass must be silent; got %v", events)
 	}
 	if got := findInstanceStatusOnIRForFixture(t, f, 1); !equalitySafeOperation(surgeBefore, got) {
@@ -4304,7 +4467,7 @@ func TestMigrate_SurgeWedgeDoesNotReopenTerminalRecord(t *testing.T) {
 	clk.Step(wedgeGrace + time.Second)
 	f.record(t, uuid).Phase = workload.MigrationPhaseFailed
 	f.record(t, uuid).Message = "closed by an earlier authority"
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	if done, accepted := f.pass(t, uuid); !done || !accepted {
 		t.Fatalf("terminal record: got done=%v accepted=%v, want it handled", done, accepted)
@@ -4315,7 +4478,7 @@ func TestMigrate_SurgeWedgeDoesNotReopenTerminalRecord(t *testing.T) {
 	if src := findInstanceStatusOnIRForFixture(t, f, 0); src == nil || src.Operation == nil {
 		t.Errorf("a terminal record drives no restore; source = %+v", src)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Errorf("a terminal record emits nothing; got %v", events)
 	}
 }
@@ -4336,7 +4499,7 @@ func TestMigrate_WedgedSourcePodLeavesTheMigrationDriving(t *testing.T) {
 	}
 	wedgePod(t, f, sourcePods[0], "ImagePullBackOff")
 	clk.Step(wedgeGrace + time.Second)
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	if done, accepted := f.pass(t, uuid); done || !accepted {
 		t.Fatalf("wedged source: got done=%v accepted=%v, want the migration still in flight", done, accepted)
@@ -4348,7 +4511,7 @@ func TestMigrate_WedgedSourcePodLeavesTheMigrationDriving(t *testing.T) {
 	if src == nil || src.Phase != v1beta1.OMENativeInstanceMigrating || src.Operation == nil {
 		t.Fatalf("a wedged source keeps its Migrate pin; got %+v", src)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Errorf("a wedged source announces nothing from the migration pass; got %v", events)
 	}
 }
@@ -4370,7 +4533,7 @@ func TestMigrate_SourceTeardownStalled_ParksThenCompletesOnRemoval(t *testing.T)
 	}
 	driveToDrainingDrainIncomplete(t, f, uuid)
 	f.react(t) // drain settles — the tail is one delete away
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	// The source pod wedges Terminating (finalizer-pinned so the fake
 	// client keeps the object, as a dead node's kubelet would). The
@@ -4384,7 +4547,7 @@ func TestMigrate_SourceTeardownStalled_ParksThenCompletesOnRemoval(t *testing.T)
 	if got := f.record(t, uuid); got.Message != before {
 		t.Fatalf("a pod inside its own grace parks nothing; message went from %q to %q", before, got.Message)
 	}
-	if events := migWedgeEvents(t, f); len(events) != 0 {
+	if events := recordedEvents(t, f); len(events) != 0 {
 		t.Fatalf("a pod inside its own grace raises no event; got %v", events)
 	}
 
@@ -4405,7 +4568,7 @@ func TestMigrate_SourceTeardownStalled_ParksThenCompletesOnRemoval(t *testing.T)
 			t.Errorf("record message %q must name %q", rec.Message, want)
 		}
 	}
-	events := migWedgeEvents(t, f)
+	events := recordedEvents(t, f)
 	if n := countEventsWithReason(events, workload.EventReasonMigrationParked); n != 1 || len(events) != 1 {
 		t.Fatalf("parking announces itself exactly once; got %v", events)
 	}
@@ -4447,7 +4610,7 @@ func TestMigrate_GangSurgeMemberWedged_FailsThroughRecord(t *testing.T) {
 	wedged := surgePods[len(surgePods)-1]
 	wedgePod(t, f, wedged, "ImagePullBackOff")
 	clk.Step(wedgeGrace + time.Second)
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	if done, accepted := f.pass(t, uuid); !done || !accepted {
 		t.Fatalf("gang wedge pass: got done=%v accepted=%v, want the migration closed", done, accepted)
@@ -4481,7 +4644,7 @@ func TestMigrate_SurgeWedgedWhileDraining_RestoresRotation(t *testing.T) {
 	sourceRevision := findInstanceStatusOnIRForFixture(t, f, 0).RunningRevision
 	wedgePod(t, f, migPodsForInstance(t, f, 1)[0], "CrashLoopBackOff")
 	clk.Step(wedgeGrace + time.Second)
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	if done, accepted := f.pass(t, uuid); !done || !accepted {
 		t.Fatalf("draining wedge pass: got done=%v accepted=%v, want the migration closed", done, accepted)
@@ -4549,7 +4712,7 @@ func TestMigrate_SurgeBreaksAfterSourceGone_CompletesTheHandover(t *testing.T) {
 			if pastGrace {
 				clk.Step(wedgeGrace + time.Second)
 			}
-			migWedgeEvents(t, f) // drop the accept event
+			recordedEvents(t, f) // drop the accept event
 
 			if done, accepted := f.pass(t, uuid); !done || !accepted {
 				t.Fatalf("post-drain break: got done=%v accepted=%v, want the handover completed", done, accepted)
@@ -4569,7 +4732,7 @@ func TestMigrate_SurgeBreaksAfterSourceGone_CompletesTheHandover(t *testing.T) {
 			if pods := migPodsForInstance(t, f, 1); len(pods) != 1 || pods[0].Name != surgePod.Name {
 				t.Errorf("the broken surge pod is left to the repair, not torn down by the move; got %d pod(s)", len(pods))
 			}
-			events := migWedgeEvents(t, f)
+			events := recordedEvents(t, f)
 			if len(events) != 1 || !strings.Contains(events[0], string(workload.EventReasonMigrationCompleted)) {
 				t.Errorf("want exactly the completion event; got %v", events)
 			}
@@ -4601,7 +4764,7 @@ func TestMigrate_SurgeWedgeCloseResumesAfterPartialUnwind(t *testing.T) {
 	if surge := findInstanceStatusOnIRForFixture(t, f, 1); surge == nil || surge.Operation != nil {
 		t.Fatalf("crash window setup: the surge must be unpinned; got %+v", surge)
 	}
-	migWedgeEvents(t, f)
+	recordedEvents(t, f)
 
 	if done, accepted := f.pass(t, uuid); !done || !accepted {
 		t.Fatalf("resume pass: got done=%v accepted=%v, want the close finished", done, accepted)
@@ -4727,133 +4890,193 @@ func TestMigrateSurge_UnknownTargetHeldWithoutForceDeletePolicy(t *testing.T) {
 	assertMigrationSourceUntouched(t, f, before)
 }
 
-// An Accepted record binds to the Instance, not to the source pod the
-// requester looked at: a successor pod on the same node is migrated as
-// the original would have been, and a successor rebuilt on another node
-// since the request (a roll, a repair, a node loss) is moved off the
-// node it runs on, with the record, the overlay and the ledger naming
-// that node and one event naming both.
-func TestMigrate_SourcePodRecreatedAfterAcceptance(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		node string
-	}{
-		{name: "same node migrates successor", node: "node-a"},
-		{name: "different node moves the successor off the node it runs on", node: "node-b"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			ctx := context.Background()
-			f := newSinglePodMigFixture(t)
-			f.recorder = record.NewFakeRecorder(16)
-			pods := f.listPods(t)
-			if len(pods) != 1 {
-				t.Fatalf("fixture pods = %d, want one source", len(pods))
-			}
-			// Seed an explicit UID before acceptance; the shared fixture's
-			// fake client does not allocate Kubernetes UIDs automatically.
-			source := recreateCharacterizationSource(t, f, pods[0], "source-at-acceptance", "node-a")
-			const uuid = "source-recreated-after-acceptance"
-			f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-a")}
-			recreated := recreateCharacterizationSource(t, f, source, "source-at-execution", test.node)
+// TestMigrate_SourcePodRecreatedOnTheRequestedNode_MovesTheSuccessor: a
+// request binds to the Instance, not to the pod the requester saw. A
+// source pod recreated under a new UID on the same node before the move
+// runs is the pod the move drains and deletes.
+func TestMigrate_SourcePodRecreatedOnTheRequestedNode_MovesTheSuccessor(t *testing.T) {
+	ctx := context.Background()
+	f := newSinglePodMigFixture(t)
+	f.recorder = record.NewFakeRecorder(16)
+	pods := f.listPods(t)
+	if len(pods) != 1 {
+		t.Fatalf("fixture pods = %d, want one source", len(pods))
+	}
+	// Seed an explicit UID before acceptance; the shared fixture's
+	// fake client does not allocate Kubernetes UIDs automatically.
+	source := recreateCharacterizationSource(t, f, pods[0], "source-at-acceptance", "node-a")
+	const uuid = "source-recreated-after-acceptance"
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-a")}
+	recreated := recreateCharacterizationSource(t, f, source, "source-at-execution", "node-a")
 
-			done, accepted, err := f.passResult(t, uuid)
-			if err != nil || !accepted {
-				t.Fatalf("execute accepted request: done=%v accepted=%v err=%v", done, accepted, err)
-			}
-			current := &corev1.Pod{}
-			if err := f.c.Get(ctx, client.ObjectKeyFromObject(source), current); err != nil {
-				t.Fatalf("source must remain before surge readiness: %v", err)
-			}
-			if current.UID != recreated.UID || current.UID == source.UID || current.Spec.NodeName != test.node || current.DeletionTimestamp != nil {
-				t.Fatalf("unexpected successor source after first pass: UID=%q node=%q deletion=%v", current.UID, current.Spec.NodeName, current.DeletionTimestamp)
-			}
-			sourceStatus := findInstanceStatusOnIRForFixture(t, f, 0)
-			rec := f.record(t, uuid)
-			if done || rec.Phase != workload.MigrationPhaseSurgePending || rec.SurgeInstance == nil || *rec.SurgeInstance != 1 {
-				t.Fatalf("the successor must start the migration: done=%v record=%+v", done, rec)
-			}
-			if rec.FromNode != test.node {
-				t.Fatalf("the record must name the node the Instance leaves: FromNode=%q want %q", rec.FromNode, test.node)
-			}
-			events := migWedgeEvents(t, f)
-			renamed := 0
-			for _, event := range events {
-				if strings.Contains(event, string(workload.EventReasonMigrationFromNodeMismatch)) {
-					renamed++
-					if !strings.HasPrefix(event, corev1.EventTypeNormal) || !strings.Contains(event, "node-a") || !strings.Contains(event, "node-b") {
-						t.Errorf("the re-anchor is a Normal event naming the requested and the observed node; got %q", event)
-					}
-				}
-			}
-			if want := map[bool]int{true: 1, false: 0}[test.node != "node-a"]; renamed != want {
-				t.Errorf("re-anchor events = %d, want %d; events=%v", renamed, want, events)
-			}
-			if sourceStatus == nil || sourceStatus.Phase != v1beta1.OMENativeInstanceMigrating || sourceStatus.Operation == nil || sourceStatus.Operation.RequestUUID != uuid {
-				t.Fatalf("source instance must be owned by the original request: %+v", sourceStatus)
-			}
-			surge := &corev1.Pod{}
-			surgeKey := types.NamespacedName{Namespace: f.isvc.Namespace, Name: query.PodName(f.isvc.Name, f.component, 1, "default", 0)}
-			if err := f.c.Get(ctx, surgeKey, surge); err != nil {
-				t.Fatalf("migration must create the surge Pod: %v", err)
-			}
-			if got := hostnameNotInValues(surge); len(got) != 1 || got[0] != test.node {
-				t.Fatalf("the surge must be kept off the node the Instance leaves: NotIn=%v want [%s]", got, test.node)
-			}
+	done, accepted, err := f.passResult(t, uuid)
+	if err != nil || !accepted {
+		t.Fatalf("execute accepted request: done=%v accepted=%v err=%v", done, accepted, err)
+	}
+	current := &corev1.Pod{}
+	if err := f.c.Get(ctx, client.ObjectKeyFromObject(source), current); err != nil {
+		t.Fatalf("source must remain before surge readiness: %v", err)
+	}
+	if current.UID != recreated.UID || current.UID == source.UID || current.Spec.NodeName != "node-a" || current.DeletionTimestamp != nil {
+		t.Fatalf("unexpected successor source after first pass: UID=%q node=%q deletion=%v", current.UID, current.Spec.NodeName, current.DeletionTimestamp)
+	}
+	sourceStatus := findInstanceStatusOnIRForFixture(t, f, 0)
+	rec := f.record(t, uuid)
+	if done || rec.Phase != workload.MigrationPhaseSurgePending || rec.SurgeInstance == nil || *rec.SurgeInstance != 1 {
+		t.Fatalf("the successor must start the migration: done=%v record=%+v", done, rec)
+	}
+	if rec.FromNode != "node-a" {
+		t.Fatalf("the record must keep the node the Instance leaves: FromNode=%q", rec.FromNode)
+	}
+	for _, event := range recordedEvents(t, f) {
+		if strings.Contains(event, string(workload.EventReasonMigrationFromNodeMismatch)) {
+			t.Errorf("a source on the requested node draws no node mismatch event; got %q", event)
+		}
+	}
+	if sourceStatus == nil || sourceStatus.Phase != v1beta1.OMENativeInstanceMigrating || sourceStatus.Operation == nil || sourceStatus.Operation.RequestUUID != uuid {
+		t.Fatalf("source instance must be owned by the original request: %+v", sourceStatus)
+	}
+	surge := &corev1.Pod{}
+	surgeKey := types.NamespacedName{Namespace: f.isvc.Namespace, Name: query.PodName(f.isvc.Name, f.component, 1, "default", 0)}
+	if err := f.c.Get(ctx, surgeKey, surge); err != nil {
+		t.Fatalf("migration must create the surge Pod: %v", err)
+	}
+	if got := hostnameNotInValues(surge); len(got) != 1 || got[0] != "node-a" {
+		t.Fatalf("the surge must be kept off the node the Instance leaves: NotIn=%v want [node-a]", got)
+	}
 
-			// Once readiness converges, the same original request drains
-			// the recreated Pod, not the now-absent requesting-time UID.
-			f.react(t)
-			f.drive(t, uuid, 10)
-			if rec = f.record(t, uuid); rec.Phase != workload.MigrationPhaseCompleted || rec.CompletedAt == nil {
-				t.Fatalf("migration must complete: %+v", rec)
-			}
-			if err := f.c.Get(ctx, client.ObjectKeyFromObject(recreated), current); !apierrors.IsNotFound(err) {
-				t.Fatalf("successor source must be drained; get returned %v", err)
-			}
-			ledger, err := audit.LoadLedgerForOwner(ctx, f.c, f.isvc)
-			if err != nil {
-				t.Fatalf("load terminal ledger: %v", err)
-			}
-			if len(ledger.Entries) != 1 || ledger.Entries[0].RequestUUID != uuid || ledger.Entries[0].Phase != audit.PhaseCompleted {
-				t.Fatalf("terminal ledger = %+v, want original request Completed", ledger.Entries)
-			}
-			if ledger.Entries[0].FromNode != test.node {
-				t.Errorf("the ledger must record the node the Instance left: FromNode=%q want %q", ledger.Entries[0].FromNode, test.node)
-			}
-		})
+	// Once readiness converges, the same original request drains
+	// the recreated Pod, not the now-absent requesting-time UID.
+	f.react(t)
+	f.drive(t, uuid, 10)
+	if rec = f.record(t, uuid); rec.Phase != workload.MigrationPhaseCompleted || rec.CompletedAt == nil {
+		t.Fatalf("migration must complete: %+v", rec)
+	}
+	if err := f.c.Get(ctx, client.ObjectKeyFromObject(recreated), current); !apierrors.IsNotFound(err) {
+		t.Fatalf("successor source must be drained; get returned %v", err)
+	}
+	history, err := audit.LoadLedgerForOwner(ctx, f.c, f.isvc)
+	if err != nil {
+		t.Fatalf("load the audit history: %v", err)
+	}
+	if len(history.Entries) != 1 || history.Entries[0].RequestUUID != uuid || history.Entries[0].Phase != audit.PhaseCompleted {
+		t.Fatalf("audit history = %+v, want the original request Completed", history.Entries)
 	}
 }
 
-// A gang whose members have all left the requested node since the
-// request is moved off the node its routable member runs on: the whole
-// gang moves anyway, and that is the node the surge must not land on.
-func TestMigrate_GangOffTheRequestedNode_LeavesTheLeadersNode(t *testing.T) {
+// TestMigrate_SourceRebuiltOffTheRequestedNode_IsCompleteWithoutAMove: the
+// Instance left the node the request names before the move ran (a roll or
+// a repair rebuilt it on another node), so the request is already
+// satisfied. The record closes Completed naming both nodes, the history
+// records it the same way, one Normal event says so, no surge is allocated
+// and the source row is left as it was.
+func TestMigrate_SourceRebuiltOffTheRequestedNode_IsCompleteWithoutAMove(t *testing.T) {
+	ctx := context.Background()
+	f := newSinglePodMigFixture(t)
+	f.recorder = record.NewFakeRecorder(16)
+	pods := f.listPods(t)
+	if len(pods) != 1 {
+		t.Fatalf("fixture pods = %d, want one source", len(pods))
+	}
+	source := recreateCharacterizationSource(t, f, pods[0], "source-at-acceptance", "node-a")
+	const uuid = "source-rebuilt-off-the-requested-node"
+	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-a")}
+	rebuilt := recreateCharacterizationSource(t, f, source, "source-at-execution", "node-b")
+	before := findInstanceStatusOnIRForFixture(t, f, 0)
+
+	done, accepted, err := f.passResult(t, uuid)
+	if err != nil || !done || !accepted {
+		t.Fatalf("execute accepted request: done=%v accepted=%v err=%v, want the request answered", done, accepted, err)
+	}
+	rec := f.record(t, uuid)
+	if rec.Phase != workload.MigrationPhaseCompleted || rec.CompletedAt == nil || rec.SurgeInstance != nil {
+		t.Fatalf("record = %+v, want Completed with a completion time and no surge", rec)
+	}
+	if !strings.Contains(rec.Message, "node-a") || !strings.Contains(rec.Message, "node-b") {
+		t.Fatalf("record message %q must name the requested node and the node the Instance runs on", rec.Message)
+	}
+	if rec.FromNode != "node-a" {
+		t.Fatalf("the record keeps the node the request named: FromNode=%q", rec.FromNode)
+	}
+	after := findInstanceStatusOnIRForFixture(t, f, 0)
+	if after == nil || after.Phase != before.Phase || after.Operation != nil || after.RunningRevision != before.RunningRevision {
+		t.Fatalf("source row = %+v, want it left as it was (%+v)", after, before)
+	}
+	if rows := f.getIR(t).Status.InstanceStatuses; len(rows) != 1 {
+		t.Fatalf("rows = %d, want the source alone; nothing is allocated for a move already made", len(rows))
+	}
+	current := &corev1.Pod{}
+	if err := f.c.Get(ctx, client.ObjectKeyFromObject(rebuilt), current); err != nil || current.DeletionTimestamp != nil || current.Spec.NodeName != "node-b" {
+		t.Fatalf("the rebuilt pod must keep running on node-b: err=%v pod=%+v", err, current)
+	}
+	if list := f.listPods(t); len(list) != 1 {
+		t.Fatalf("pods = %d, want the rebuilt source alone and no surge pod", len(list))
+	}
+	events := drainEvents(f.recorder)
+	completed := 0
+	for _, event := range events {
+		if strings.Contains(event, string(workload.EventReasonMigrationFromNodeMismatch)) {
+			t.Errorf("no node is corrected on a move already made; got %q", event)
+		}
+		if strings.Contains(event, string(workload.EventReasonMigrationCompleted)) {
+			completed++
+			if !strings.HasPrefix(event, corev1.EventTypeNormal) || !strings.Contains(event, "node-a") || !strings.Contains(event, "node-b") {
+				t.Errorf("the completion is a Normal event naming both nodes; got %q", event)
+			}
+		}
+	}
+	if completed != 1 {
+		t.Fatalf("MigrationCompleted events = %d, want 1; events=%v", completed, events)
+	}
+	history, err := audit.LoadLedgerForOwner(ctx, f.c, f.isvc)
+	if err != nil {
+		t.Fatalf("load the audit history: %v", err)
+	}
+	if len(history.Entries) != 1 || history.Entries[0].RequestUUID != uuid || history.Entries[0].Phase != audit.PhaseCompleted {
+		t.Fatalf("audit history = %+v, want the request Completed", history.Entries)
+	}
+	if !strings.Contains(history.Entries[0].Outcome, "node-b") {
+		t.Fatalf("history outcome %q must name the node the Instance runs on", history.Entries[0].Outcome)
+	}
+
+	// A later pass finds the record terminal and drives nothing.
+	if done, accepted := f.pass(t, uuid); !done || !accepted {
+		t.Fatalf("second pass: done=%v accepted=%v, want the closed record left alone", done, accepted)
+	}
+	if list := f.listPods(t); len(list) != 1 {
+		t.Fatalf("pods after the second pass = %d, want the rebuilt source alone", len(list))
+	}
+}
+
+// A gang none of whose members sits on the requested node any more has
+// already left it: the request is complete without a move, the record
+// names the requested node and the node the routable member runs on, and
+// no surge gang is built.
+func TestMigrate_GangOffTheRequestedNode_IsCompleteWithoutAMove(t *testing.T) {
 	f := newGangMigFixture(t)
 	f.recorder = record.NewFakeRecorder(16)
 	const uuid = "mig-gang-rebuilt"
 	f.records = []workload.MigrationRecord{mkMigRecord(uuid, 0, "node-gone")}
+	podsBefore := len(f.listPods(t))
 
-	surgePods := driveToSurgePods(t, f, uuid, 1)
+	done, accepted, err := f.passResult(t, uuid)
+	if err != nil || !done || !accepted {
+		t.Fatalf("execute accepted request: done=%v accepted=%v err=%v, want the request answered", done, accepted, err)
+	}
 	rec := f.record(t, uuid)
-	if rec.FromNode != "node-a" {
-		t.Fatalf("the record must name the leader's node: FromNode=%q", rec.FromNode)
+	if rec.Phase != workload.MigrationPhaseCompleted || rec.SurgeInstance != nil || rec.FromNode != "node-gone" {
+		t.Fatalf("record = %+v, want Completed with no surge and the requested node kept", rec)
 	}
-	for _, pod := range surgePods {
-		if got := hostnameNotInValues(pod); len(got) != 1 || got[0] != "node-a" {
-			t.Errorf("surge pod %s must be kept off the leader's node: NotIn=%v", pod.Name, got)
-		}
+	if !strings.Contains(rec.Message, "node-gone") || !strings.Contains(rec.Message, "node-a") {
+		t.Fatalf("record message %q must name the requested node and the leader's node", rec.Message)
 	}
-	renamed := 0
-	for _, event := range migWedgeEvents(t, f) {
+	if got := len(f.listPods(t)); got != podsBefore {
+		t.Fatalf("pods = %d, want the gang's own %d and no surge", got, podsBefore)
+	}
+	for _, event := range drainEvents(f.recorder) {
 		if strings.Contains(event, string(workload.EventReasonMigrationFromNodeMismatch)) {
-			renamed++
-			if !strings.HasPrefix(event, corev1.EventTypeNormal) || !strings.Contains(event, "node-gone") || !strings.Contains(event, "node-a") {
-				t.Errorf("the re-anchor names the requested and the observed node; got %q", event)
-			}
+			t.Errorf("no node is corrected on a move already made; got %q", event)
 		}
-	}
-	if renamed != 1 {
-		t.Errorf("re-anchor events = %d, want 1", renamed)
 	}
 }
 

@@ -290,7 +290,7 @@ func ensureNotBound(t *testing.T, tc *testContext, ns, name string, window time.
 
 // waitForPodRejected polls until the scheduler has recorded a failed attempt for
 // the pod (PodScheduled=False, reason Unschedulable) whose message contains
-// reason. It orders a test step after the pod has been popped and parked for a
+// reason. It orders a test step after the pod has been popped and held for a
 // specific cause, without relying on wall-clock sleeps.
 func waitForPodRejected(t *testing.T, tc *testContext, ns, name, reason string, timeout time.Duration) {
 	t.Helper()

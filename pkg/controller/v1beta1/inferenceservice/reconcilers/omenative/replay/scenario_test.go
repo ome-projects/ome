@@ -8,11 +8,12 @@ import (
 func testVocabulary() Vocabulary {
 	return Vocabulary{
 		Events: map[string][]string{
-			"ctrl.resync":    {},
-			"spec.revision":  {"new", "revert", "rejected"},
-			"ctrl.staleRead": {"missesOpen", "missesClose", "missesRepin", "anchorMissing", "phaseRegressed"},
-			"canary.parked":  {},
-			"pod.stableGone": {"last"},
+			"ctrl.resync":          {},
+			"ctrl.crash":           {},
+			"spec.revision":        {"new", "revert", "rejected"},
+			"ctrl.staleRead":       {"missesOpen", "missesClose", "missesRepin", "anchorMissing", "phaseRegressed"},
+			"canary.parked":        {},
+			"pod.replacementReady": {},
 		},
 		Cells: map[string]struct{}{"run/example-cell": {}},
 	}
@@ -49,12 +50,14 @@ func TestParseAcceptsTheThreeEventForms(t *testing.T) {
 // produce on their own, and what the driver cannot stage.
 func TestParseRefusesWhatCannotBeStaged(t *testing.T) {
 	cases := map[string]string{
-		"undeclared event":    "      - pod.exploded\n",
-		"undeclared variant":  "      - spec.revision[sideways]: {component: engine, image: x/y:z}\n",
-		"produced event":      "      - canary.parked\n",
-		"unapplied event":     "      - pod.stableGone[last]\n",
-		"unknown argument":    "      - spec.revision[new]: {component: engine, image: x/y:z, pod: 1}\n",
-		"clock without value": "      - clock.advance\n",
+		"undeclared event":       "      - pod.exploded\n",
+		"undeclared variant":     "      - spec.revision[sideways]: {component: engine, image: x/y:z}\n",
+		"produced event":         "      - canary.parked\n",
+		"unapplied event":        "      - pod.replacementReady\n",
+		"unknown argument":       "      - spec.revision[new]: {component: engine, image: x/y:z, pod: 1}\n",
+		"clock without value":    "      - clock.advance\n",
+		"restart with a slack":   "      - ctrl.crash: {slack: 1s}\n",
+		"restart with a variant": "      - ctrl.crash[hard]\n",
 	}
 	for name, event := range cases {
 		t.Run(name, func(t *testing.T) {

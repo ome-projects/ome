@@ -27,11 +27,13 @@ import (
 	"fmt"
 
 	rotator "github.com/open-policy-agent/cert-controller/pkg/rotator"
+
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 // Both rotators run in one process, and controller-runtime's controller-name
@@ -67,6 +69,12 @@ type Options struct {
 	// CAName and CAOrganization identify the generated CA in its subject.
 	CAName         string
 	CAOrganization string
+	// ClusterDomain is the cluster's DNS domain ("cluster.local" on most
+	// clusters). The certificate then also covers the fully qualified
+	// "<service>.<namespace>.svc.<ClusterDomain>" name. Empty covers only
+	// "<service>.<namespace>.svc", the name the apiserver dials; nothing in
+	// the code supplies a default.
+	ClusterDomain string
 }
 
 func (o Options) validate() error {
@@ -98,9 +106,7 @@ func newRotator(opts Options, controllerName string, certsReady chan struct{}) *
 		CAName:         opts.CAName,
 		CAOrganization: opts.CAOrganization,
 		DNSName:        fmt.Sprintf("%s.%s.svc", opts.ServiceName, opts.Namespace),
-		ExtraDNSNames: []string{
-			fmt.Sprintf("%s.%s.svc.cluster.local", opts.ServiceName, opts.Namespace),
-		},
+		ExtraDNSNames:  extraDNSNames(opts),
 		IsReady:        certsReady,
 		ControllerName: controllerName,
 		Webhooks: []rotator.WebhookInfo{{
@@ -108,19 +114,29 @@ func newRotator(opts Options, controllerName string, certsReady chan struct{}) *
 			Name: opts.WebhookConfigName,
 		}},
 		// Hold the caBundle injection until the serving cert is readable at
-		// CertDir. Two things go wrong without it. A caBundle published before
-		// the kubelet has projected the matching key advertises a CA this pod
-		// cannot yet present a cert for, so the apiserver dials and fails the
-		// handshake. And the injector refreshes the Secret from a second path,
-		// concurrently with the generator's own startup pass: one of the two
-		// loses an optimistic lock, and the other parses the empty Secret the
-		// chart created because its cache has not caught up.
+		// CertDir: a caBundle published before the kubelet has projected the
+		// matching key advertises a CA this pod cannot yet present a cert for,
+		// so the apiserver dials and fails the handshake. The hold does not
+		// make the Secret single-writer: the library's Secret reconciler
+		// refreshes it a second time whenever its informer still trails the
+		// startup pass's write, loses the optimistic lock, logs it and retries
+		// until the informer catches up. Bootstrap ends with one usable
+		// certificate either way.
 		EnableReadinessCheck: true,
 		// Every replica serves admission, so every replica needs the cert on
 		// disk — gating rotation on leadership would leave the followers unable
 		// to answer the apiserver.
 		RequireLeaderElection: false,
 	}
+}
+
+// extraDNSNames is the fully qualified Service name the certificate covers
+// besides "<service>.<namespace>.svc": none without a cluster domain.
+func extraDNSNames(opts Options) []string {
+	if opts.ClusterDomain == "" {
+		return nil
+	}
+	return []string{constants.ServiceHostname(opts.ServiceName, opts.Namespace, opts.ClusterDomain)}
 }
 
 // Bootstrap generates the serving cert and injects the caBundle, and blocks

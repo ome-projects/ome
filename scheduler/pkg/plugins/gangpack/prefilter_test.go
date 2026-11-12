@@ -87,7 +87,7 @@ func TestAssignGangDomain_MemberAlreadyBound_AdoptsItsDomain(t *testing.T) {
 // TestAssignGangDomain_AssignedDomainHasNoNodes_ReplansElsewhere: an assignment to a domain that no longer has any node (its
 // nodes drained/scaled away, or the topology key changed so the old domain value
 // matches nothing) is dropped and re-planned, instead of narrowing every
-// candidate away and wedging the gang forever.
+// candidate away and leaving the gang unplaceable forever.
 func TestAssignGangDomain_AssignedDomainHasNoNodes_ReplansElsewhere(t *testing.T) {
 	g := &GangPack{assignments: placement.New()}
 	g.assignments.Set(placement.Gang{Group: "team/pf"}, "gone", 0, nil) // assigned to a domain that no longer exists
@@ -106,6 +106,39 @@ func TestAssignGangDomain_AssignedDomainHasNoNodes_ReplansElsewhere(t *testing.T
 	}
 	if res == nil || !res.NodeNames.Equal(sets.New("b1", "b2")) {
 		t.Fatalf("narrowed to %v, want {b1,b2}", res.NodeNames)
+	}
+}
+
+// TestAssignGangDomain_StaleAssignmentWithMembersPlacedElsewhere_AdoptsTheirDomain:
+// an assignment to a domain with no node left is dropped, and a gang whose
+// member already sits in another domain adopts that domain with its free nodes:
+// the room is read over them, the candidates are its nodes, and the adopted
+// commitment reserves them by name.
+func TestAssignGangDomain_StaleAssignmentWithMembersPlacedElsewhere_AdoptsTheirDomain(t *testing.T) {
+	g := &GangPack{assignments: placement.New()}
+	g.assignments.Set(placement.Gang{Group: "team/pf"}, "gone", 0, nil) // assigned to a domain that no longer exists
+	nodes := []framework.NodeInfo{
+		nodeInfo(gpuNode("b1", "b", "4"), gangPod("team", "pf")), // a member already placed in b
+		nodeInfo(gpuNode("b2", "b", "4")),
+		nodeInfo(gpuNode("b3", "b", "4")),
+	}
+	st := newCycleState()
+
+	res, status := g.assignGangDomain(st, nodes, gangInfo{key: "team/pf", minMember: 3, topologyKey: testKey}, gangPod("team", "pf"))
+	if !status.IsSuccess() {
+		t.Fatalf("assignGangDomain status = %v, want Success (adopt the placed member's domain)", status)
+	}
+	if d, ok := assignedDomain(g.assignments, "team/pf"); !ok || d != "b" {
+		t.Fatalf("adopted assignment = %q,%v, want b,true", d, ok)
+	}
+	if res == nil || !res.NodeNames.Equal(sets.New("b1", "b2", "b3")) {
+		t.Fatalf("narrowed to %v, want {b1,b2,b3}", res.NodeNames)
+	}
+	if _, _, remaining, _ := g.assignments.GetOwned("team/pf"); remaining != 2 {
+		t.Fatalf("adopted reservation = %d remaining, want 2 missing members", remaining)
+	}
+	if !g.assignments.BlocksNode("b2", nil) {
+		t.Fatal("the adopted commitment must reserve the domain's nodes by name")
 	}
 }
 
@@ -138,7 +171,7 @@ func TestAssignGangDomain_PodGroupRecreated_UnwindsOldAttemptThenAssignsNew(t *t
 	if !status.IsSuccess() || readAssignment(state).domain != "new" {
 		t.Fatalf("recreated PodGroup assignment = %+v, %v, want new domain", readAssignment(state), status)
 	}
-	_, token, _, found, ownerMatch := g.assignments.GetOwnedBy("team/pf", "new-uid")
+	_, token, found, ownerMatch := g.assignments.GetOwnedBy("team/pf", "new-uid")
 	if !found || !ownerMatch || token == oldToken {
 		t.Fatalf("new commitment = token %d found=%v ownerMatch=%v; old token=%d", token, found, ownerMatch, oldToken)
 	}
@@ -184,7 +217,7 @@ func TestAssignGangDomain_AssignedDomainFilledBeforePlacement_ReplansAndReleases
 
 // TestAssignGangDomain_AssignedDomainCordoned_ReplansToSchedulableDomain: a gang assigned to a domain whose nodes have
 // become unschedulable (cordoned) — capacity intact but the framework's Filter
-// would reject them — must re-plan onto a schedulable domain, not wedge there.
+// would reject them — must re-plan onto a schedulable domain, not wait there forever.
 // freeByDomain excludes unschedulable nodes, so assignmentStale sees the assigned domain
 // as unusable and drops it.
 func TestAssignGangDomain_AssignedDomainCordoned_ReplansToSchedulableDomain(t *testing.T) {
@@ -206,8 +239,8 @@ func TestAssignGangDomain_AssignedDomainCordoned_ReplansToSchedulableDomain(t *t
 }
 
 // TestAssignGangDomain_FullDomainHoldsOwnMember_KeepsAssignmentAndWaits: an assigned domain that is full but already
-// holds one of the gang's own members is NOT stale — re-planning would strand that
-// member. The gang keeps its assignment and waits for capacity in its own domain.
+// holds one of the gang's own members is NOT stale — re-planning would split the
+// gang. The gang keeps its assignment and waits for capacity in its own domain.
 func TestAssignGangDomain_FullDomainHoldsOwnMember_KeepsAssignmentAndWaits(t *testing.T) {
 	g := &GangPack{assignments: placement.New()}
 	g.assignments.Set(placement.Gang{Group: "team/pf"}, "a", 0, nil)

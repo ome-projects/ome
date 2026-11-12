@@ -79,10 +79,11 @@ type RolloutSpec struct {
 	// target so routing pairs only engine and decoder revisions whose values
 	// are equal. Empty or unset pairs with anything, so setting or clearing the
 	// token is upgrade-neutral. Changing it between two non-empty values
-	// requires engine and decoder to roll as one blueGreen or canary group.
-	// While the service declares an encoder, whose revisions carry the token
-	// too, and in the edit that removes it, the value may only stay the same
-	// or be cleared.
+	// requires one rollout group listing both engine and decoder (rollingUpdate,
+	// blueGreen or canary), so the two sides roll together and a pairable pair
+	// keeps serving through the transition. While the service declares an
+	// encoder, whose revisions carry the token too, and in the edit that
+	// removes it, the value may only stay the same or be cleared.
 	// +optional
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`

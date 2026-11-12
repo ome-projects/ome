@@ -8,20 +8,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	ctrl "sigs.k8s.io/controller-runtime"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 )
-
-func TestNewPodSpecReconciler(t *testing.T) {
-	reconciler := &PodSpecReconciler{
-		Log: ctrl.Log.WithName("test"),
-	}
-
-	assert.NotNil(t, reconciler)
-	assert.NotNil(t, reconciler.Log)
-}
 
 func TestPodSpecReconciler_ReconcilePodSpec(t *testing.T) {
 	tests := []struct {
@@ -387,9 +377,7 @@ func TestPodSpecReconciler_ReconcilePodSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reconciler := &PodSpecReconciler{
-				Log: ctrl.Log.WithName("test"),
-			}
+			reconciler := &PodSpecReconciler{}
 
 			podSpec, err := reconciler.ReconcilePodSpec(
 				tt.isvc,
@@ -546,9 +534,7 @@ func TestPodSpecReconciler_ReconcileWorkerPodSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reconciler := &PodSpecReconciler{
-				Log: ctrl.Log.WithName("test"),
-			}
+			reconciler := &PodSpecReconciler{}
 
 			podSpec, err := reconciler.ReconcileWorkerPodSpec(
 				tt.isvc,
@@ -618,7 +604,7 @@ func TestPodSpecReconciler_ImagePrecedence(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := &PodSpecReconciler{Log: ctrl.Log.WithName("test")}
+			r := &PodSpecReconciler{}
 			isvc := &v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 			}

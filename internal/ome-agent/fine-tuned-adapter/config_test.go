@@ -23,13 +23,13 @@ func agentViper() *viper.Viper {
 // The webhook hands the adapter its weight location through the environment
 // alone: the bucket, namespace and object name of the nested `model` block.
 // Every start must read all three.
-func TestWithViper_ModelFromTheEnvironmentAlone_ReadOnEveryStart(t *testing.T) {
+func TestNewConfig_ModelFromTheEnvironmentAlone_ReadOnEveryStart(t *testing.T) {
 	t.Setenv(constants.AgentModelBucketNameEnvVarKey, "example-bucket")
 	t.Setenv(constants.AgentModelNamespaceEnvVarKey, "example-namespace")
 	t.Setenv(constants.AgentModelObjectName, "weights/adapter.zip")
 	for start := 1; start <= 64; start++ {
-		c := &Config{}
-		require.NoError(t, WithViper(agentViper())(c))
+		c, err := newConfig(agentViper(), fineTunedAdapterParams{})
+		require.NoError(t, err)
 		require.NotNil(t, c.FineTunedWeightURI, "start %d", start)
 		require.Equal(t, "example-bucket", c.FineTunedWeightURI.BucketName, "start %d read no bucket name", start)
 		require.Equal(t, "example-namespace", c.FineTunedWeightURI.Namespace, "start %d read no namespace", start)

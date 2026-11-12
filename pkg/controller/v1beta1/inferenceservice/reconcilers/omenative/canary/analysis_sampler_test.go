@@ -51,7 +51,7 @@ func TestResolveBearerToken(t *testing.T) {
 	})
 }
 
-// TestBuildSampleRequest_PlanHash pins the cache-identity contract: the key's
+// TestBuildSampleRequest_PlanHash checks the cache-identity contract: the key's
 // PlanHash is deterministic for identical inputs, changes when ANY part of the
 // effective analysis request changes (checks, source address, headers, auth
 // reference, or the token value behind it), and never embeds raw secret
@@ -164,7 +164,7 @@ func TestBuildSampleRequest_PlanHash(t *testing.T) {
 	}
 }
 
-// TestBuildSampleRequest_ReadsSecretViaReader pins that the auth Secret is read
+// TestBuildSampleRequest_ReadsSecretViaReader checks that the auth Secret is read
 // through ReconcileInputs.Reader (the live API reader), never the cached
 // Client — a cached Get would start a cluster-wide Secret informer.
 func TestBuildSampleRequest_ReadsSecretViaReader(t *testing.T) {

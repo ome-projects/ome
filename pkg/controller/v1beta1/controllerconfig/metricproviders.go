@@ -45,12 +45,6 @@ type MetricProviderBinding struct {
 // bindings.
 type MetricProvidersConfig map[string]MetricProviderBinding
 
-// NewMetricProvidersConfig loads the effective provider bindings once
-// (startup paths).
-func NewMetricProvidersConfig(clientset kubernetes.Interface) (MetricProvidersConfig, error) {
-	return loadBlock(clientset, parseMetricProvidersConfig)
-}
-
 // NewMetricProvidersConfigCached loads the effective provider bindings through
 // the TTL config cache, so binding edits take effect without a controller
 // restart.

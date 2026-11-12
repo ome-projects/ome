@@ -14,7 +14,20 @@ import (
 // the sets are disjoint, value domains, and canonical order are checked on
 // ranges.
 // On error no rows are returned. maxInstances has no default; zero fails.
+// The rows share nothing with the payload: its records are copied.
 func DecodeColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64) ([]v1beta1.OMENativeInstanceStatus, error) {
+	return decodeColumns(columns, maxInstances, copyRecords)
+}
+
+// consumeColumns is DecodeColumns for a payload nothing reads once the rows
+// exist: the rows take the entries' records instead of copying them, so the
+// decode allocates nothing per entry. The Decoder reads through it and then
+// drops the payload.
+func consumeColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64) ([]v1beta1.OMENativeInstanceStatus, error) {
+	return decodeColumns(columns, maxInstances, takeRecords)
+}
+
+func decodeColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64, transfer recordTransfer) ([]v1beta1.OMENativeInstanceStatus, error) {
 	if columns == nil {
 		return nil, newCodecError(ErrorReasonRepresentationUnion)
 	}
@@ -22,7 +35,7 @@ func DecodeColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64) 
 	if err != nil {
 		return nil, err
 	}
-	return plan.expand(columns), nil
+	return plan.expand(columns, transfer), nil
 }
 
 // decodePlan holds the parsed index sets of a validated payload so that
@@ -38,6 +51,7 @@ type decodePlan struct {
 	groups           [len(groupedColumns)][]indexSet
 	admitted         *indexSet
 	activeOrdinalOne *indexSet
+	readySince       *readySincePlan
 }
 
 func validateColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64) (*decodePlan, error) {
@@ -64,7 +78,10 @@ func validateColumns(columns *v1beta1.InstanceStatusColumns, maxInstances uint64
 	if plan.activeOrdinalOne, err = validateOptionalIndexSet(columns.ActiveOrdinalOne, members); err != nil {
 		return nil, err
 	}
-	if err = validateEntries(columns.Entries, members); err != nil {
+	if plan.readySince, err = validateReadySinceColumns(columns, members); err != nil {
+		return nil, err
+	}
+	if err = validateEntries(columns.Entries, members, plan.readySince != nil); err != nil {
 		return nil, err
 	}
 
@@ -94,8 +111,9 @@ func validateOptionalIndexSet(raw *string, members indexSet) (*indexSet, error) 
 
 // validateEntries checks that entries are in strictly ascending index order,
 // at most one per member, each referencing a member and carrying at least
-// one exceptional record.
-func validateEntries(entries []v1beta1.InstanceStatusEntry, members indexSet) error {
+// one exceptional record, and none carrying a readySince when the readySince
+// columns carry them.
+func validateEntries(entries []v1beta1.InstanceStatusEntry, members indexSet, readySinceInColumns bool) error {
 	if entries == nil {
 		return nil
 	}
@@ -119,6 +137,9 @@ func validateEntries(entries []v1beta1.InstanceStatusEntry, members indexSet) er
 			return newCodecError(ErrorReasonCoverage)
 		}
 		if !entryHasContent(entry) {
+			return newCodecError(ErrorReasonCoverage)
+		}
+		if readySinceInColumns && entry.ReadySince != nil {
 			return newCodecError(ErrorReasonCoverage)
 		}
 	}
@@ -155,9 +176,9 @@ func validateRowOrder(order []int32, members indexSet, offsets []uint64) error {
 	return nil
 }
 
-// expand materializes the rows of a validated payload. Nested records are
-// copied so the rows share nothing with the payload.
-func (p *decodePlan) expand(columns *v1beta1.InstanceStatusColumns) []v1beta1.OMENativeInstanceStatus {
+// expand materializes the rows of a validated payload; transfer fills each
+// row's nested records from its entry.
+func (p *decodePlan) expand(columns *v1beta1.InstanceStatusColumns, transfer recordTransfer) []v1beta1.OMENativeInstanceStatus {
 	rows := make([]v1beta1.OMENativeInstanceStatus, p.rowCount)
 	var positionByRank []int32
 	if p.rowOrder == nil {
@@ -191,18 +212,48 @@ func (p *decodePlan) expand(columns *v1beta1.InstanceStatusColumns) []v1beta1.OM
 	if p.activeOrdinalOne != nil {
 		p.activeOrdinalOne.forEach(func(index int32) { rowAt(index).ActiveOrdinal = 1 })
 	}
+	p.readySince.expand(rowAt)
 	for i := range columns.Entries {
 		entry := &columns.Entries[i]
-		row := rowAt(entry.Index)
-		if len(entry.Conditions) > 0 {
-			row.Conditions = cloneConditions(entry.Conditions)
-		}
-		row.ReadySince = entry.ReadySince.DeepCopy()
-		row.Operation = entry.Operation.DeepCopy()
-		row.LastFailure = entry.LastFailure.DeepCopy()
-		if len(entry.Announced) > 0 {
-			row.Announced = append([]string(nil), entry.Announced...)
-		}
+		transfer(rowAt(entry.Index), entry)
 	}
 	return rows
+}
+
+// recordTransfer fills a row's nested records from its entry: the
+// conditions, the readySince time of a payload without the readySince
+// columns, the operation, the failure record and the once-only messages
+// already delivered.
+type recordTransfer func(row *v1beta1.OMENativeInstanceStatus, entry *v1beta1.InstanceStatusEntry)
+
+// copyRecords copies the entry's records, so the row shares nothing with
+// the payload.
+func copyRecords(row *v1beta1.OMENativeInstanceStatus, entry *v1beta1.InstanceStatusEntry) {
+	if len(entry.Conditions) > 0 {
+		row.Conditions = cloneConditions(entry.Conditions)
+	}
+	if entry.ReadySince != nil {
+		row.ReadySince = entry.ReadySince.DeepCopy()
+	}
+	row.Operation = entry.Operation.DeepCopy()
+	row.LastFailure = entry.LastFailure.DeepCopy()
+	if len(entry.Announced) > 0 {
+		row.Announced = append([]string(nil), entry.Announced...)
+	}
+}
+
+// takeRecords hands the entry's records to the row as they are, for a
+// payload nothing reads once the rows exist.
+func takeRecords(row *v1beta1.OMENativeInstanceStatus, entry *v1beta1.InstanceStatusEntry) {
+	if len(entry.Conditions) > 0 {
+		row.Conditions = entry.Conditions
+	}
+	if entry.ReadySince != nil {
+		row.ReadySince = entry.ReadySince
+	}
+	row.Operation = entry.Operation
+	row.LastFailure = entry.LastFailure
+	if len(entry.Announced) > 0 {
+		row.Announced = entry.Announced
+	}
 }

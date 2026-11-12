@@ -161,7 +161,10 @@ func TestFailedRowIsNobodys(t *testing.T) {
 // TestInterruptible_OnlyTheTwoClocksEndAStep pins the interrupt event: the two clocks end an
 // in-flight step, and none of the six external holds does — a hold parks
 // the deadline and the owner keeps its row. A migration pair and a teardown
-// are their own timeout authority, so neither clock reaches them.
+// are their own timeout authority, so neither clock reaches them. The one
+// hold the table names is on a settled row: a Failed row with no step has
+// no deadline to pause, and the refusal of a pod of its own set at the
+// revision it runs is what re-opens the roll over it.
 func TestInterruptible_OnlyTheTwoClocksEndAStep(t *testing.T) {
 	clockStates := []RowState{
 		StateCreateCreatePods, StateUpdateSurge, StateUpdateSurgeDrain,
@@ -190,6 +193,12 @@ func TestInterruptible_OnlyTheTwoClocksEndAStep(t *testing.T) {
 	}
 	for _, state := range OwnershipStates() {
 		for _, event := range holds {
+			if state == StateFailed && event == EventUnschedulableSource {
+				if !StateInterruptible(state, event) {
+					t.Errorf("%s/%s: want interrupting, the refusal of its own set re-opens the roll over a settled row", state, event)
+				}
+				continue
+			}
 			if StateInterruptible(state, event) {
 				t.Errorf("%s/%s: a hold parks the deadline, it does not end the step", state, event)
 			}
@@ -512,5 +521,34 @@ func TestOffRunningRevisionKeepingSurge_TheEnginesFailedAndThePublicationsReady(
 		if got := PublishedReadyKeepingSurgeOffRunningRevision(tc.row); got != tc.ready {
 			t.Errorf("%s: PublishedReadyKeepingSurgeOffRunningRevision = %v, want %v", tc.name, got, tc.ready)
 		}
+	}
+}
+
+// TestRebuildComingUp names the rows a scale-down keeps ahead of a
+// serving one and a serving extra waits for: the recreate and the
+// in-place patch in flight, and nothing else.
+func TestRebuildComingUp(t *testing.T) {
+	cases := []struct {
+		name string
+		row  *InstanceStatus
+		want bool
+	}{
+		{"nil", nil, false},
+		{"Ready", rowFor(InstancePhaseReady, "", ""), false},
+		{"recreate in flight", rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepDrain), true},
+		{"in-place patch in flight", rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepInPlace), true},
+		{"surge source", rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepSurge), false},
+		{"surge drain", rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepSurgeDrain), false},
+		{"stopped attempt", rowFor(InstancePhaseUpdating, InstanceOperationUpdate, UpdateStepParked), false},
+		{"Failed with the attempt kept", rowFor(InstancePhaseFailed, InstanceOperationUpdate, UpdateStepDrain), false},
+		{"repair", rowFor(InstancePhaseRestarting, InstanceOperationRestart, RestartStepDrain), false},
+		{"delete", rowFor(InstancePhaseDeleting, InstanceOperationDelete, "Drain"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RebuildComingUp(c.row); got != c.want {
+				t.Fatalf("RebuildComingUp = %v, want %v", got, c.want)
+			}
+		})
 	}
 }

@@ -32,6 +32,11 @@ func pairingScheme(t *testing.T) *runtime.Scheme {
 	if err := appsv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add appsv1: %v", err)
 	}
+	// The unavailability gate lists the Component's pods, so a client with
+	// no pods must still answer the list with none.
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
 	return scheme
 }
 
@@ -502,7 +507,7 @@ func TestTrafficComparators_PairingProtocol(t *testing.T) {
 func TestEnsurePerRevisionServices_PairingLabel(t *testing.T) {
 	isvc := testISVC()
 	c := fakeClient(pairingCR(isvc.Namespace, isvc.Name, v1beta1.EngineComponent, "hash1", "nixl-v2"))
-	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -518,7 +523,7 @@ func TestEnsurePerRevisionServices_PairingLabel(t *testing.T) {
 	}
 
 	// No CR (pre-pairing / swept) → no label, no error.
-	out2, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash2", RevisionRoutingSelector{}, runnerPorts())
+	out2, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash2", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("ensure hash2: %v", err)
 	}

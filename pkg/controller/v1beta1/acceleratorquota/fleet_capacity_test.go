@@ -464,3 +464,31 @@ func TestReconcile_NoFleetConfigured_LeavesLocalCapacityAsIs(t *testing.T) {
 		})
 	}
 }
+
+// TestAggregateCapacity_RowsAreOrderedByResourceThenFlavor: two members report
+// six pools in no particular order; the aggregate lists them by resource name,
+// then flavor, on every call.
+func TestAggregateCapacity_RowsAreOrderedByResourceThenFlavor(t *testing.T) {
+	pairs := []capacityPair{{"z.example/chip", "flavor-c"}, {"a.example/chip", "flavor-b"}, {"z.example/chip", "flavor-a"}, {"a.example/chip", "flavor-c"}, {"a.example/chip", "flavor-a"}, {"z.example/chip", "flavor-b"}}
+	reports := map[string]memberCapacity{"cluster-a": {}, "cluster-b": {}}
+	for _, pair := range pairs {
+		for cluster := range reports {
+			reports[cluster][pair] = v1beta1.AcceleratorClusterCapacityStatus{Cluster: cluster, ReportAvailable: true, Allocatable: *resource.NewQuantity(1, resource.DecimalSI)}
+		}
+	}
+	want := []capacityPair{{"a.example/chip", "flavor-a"}, {"a.example/chip", "flavor-b"}, {"a.example/chip", "flavor-c"}, {"z.example/chip", "flavor-a"}, {"z.example/chip", "flavor-b"}, {"z.example/chip", "flavor-c"}}
+	for i := 0; i < 5; i++ {
+		var got []capacityPair
+		for _, row := range aggregateCapacity(reports, 2) {
+			got = append(got, capacityPair{row.ResourceName, row.ResourceFlavor})
+		}
+		if len(got) != len(want) {
+			t.Fatalf("call %d: %d rows, want %d", i, len(got), len(want))
+		}
+		for k := range want {
+			if got[k] != want[k] {
+				t.Fatalf("call %d: rows %v, want %v", i, got, want)
+			}
+		}
+	}
+}

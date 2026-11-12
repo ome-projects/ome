@@ -8,6 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/placement/affinity"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 )
 
@@ -128,7 +129,6 @@ func TestSplitRaisedShareWaitsForNewReplicas(t *testing.T) {
 func TestSplitPauseWaitsForAStaleDecoderMinimum(t *testing.T) {
 	f := singleFixture(t, true)
 	f.source.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)}
 	f.source.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 2, "member-b": 1})
 	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(6), 36
 	f.source.Spec.Decoder.MinReplicas, f.source.Spec.Decoder.MaxReplicas = ptr.To(30), 180
@@ -206,7 +206,9 @@ func setClusterReady(t *testing.T, f *backendFixture, name string, ready bool) {
 	}
 }
 
-// changeAutoscaledSplit applies change to the stored source.
+// changeAutoscaledSplit applies change to the stored source. Weights replace
+// the split block, so a change that sets weights drops it; each member's
+// maximum then comes from the source's maxReplicas and the max ratios.
 func changeAutoscaledSplit(t *testing.T, f *backendFixture, change func(*v1beta1.InferenceService)) {
 	t.Helper()
 	source := &v1beta1.InferenceService{}
@@ -214,6 +216,9 @@ func changeAutoscaledSplit(t *testing.T, f *backendFixture, change func(*v1beta1
 		t.Fatal(err)
 	}
 	change(source)
+	if affinity.UsesRatios(source.Spec.Placement.ClusterAffinity) {
+		source.Spec.Placement.Split = nil
+	}
 	if err := f.reconciler.Update(t.Context(), source); err != nil {
 		t.Fatal(err)
 	}

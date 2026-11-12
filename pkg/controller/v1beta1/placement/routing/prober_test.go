@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,6 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -66,7 +66,7 @@ func newTestProber(
 ) *Prober {
 	t.Helper()
 	executor, _, _ := startTestObserverExecutor(t, workers, queueCapacity)
-	prober, err := NewProber(executor, client, clk, maxResponseBytes, logr.Discard())
+	prober, err := NewProber(executor, client, clk, maxResponseBytes)
 	if err != nil {
 		t.Fatalf("NewProber() error = %v", err)
 	}
@@ -146,7 +146,7 @@ func TestNewProber_NilDependencyOrNonPositiveBound_ReturnsError(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := NewProber(tt.executor, tt.client, tt.clock, tt.bound, logr.Discard()); err == nil {
+			if _, err := NewProber(tt.executor, tt.client, tt.clock, tt.bound); err == nil {
 				t.Fatal("NewProber() error = nil")
 			}
 		})
@@ -863,20 +863,23 @@ func TestProberReconcile_RequestMissingAnIdentityField_ReturnsError(t *testing.T
 	tests := []struct {
 		name   string
 		mutate func(*ProbeReconcileRequest)
+		// wantErr is the text of the refusal, which names the missing field.
+		wantErr string
 	}{
-		{name: "empty request owner UID", mutate: func(request *ProbeReconcileRequest) { request.OwnerUID = "" }},
-		{name: "empty request map name", mutate: func(request *ProbeReconcileRequest) { request.Map.Name = "" }},
-		{name: "empty request map namespace", mutate: func(request *ProbeReconcileRequest) { request.Map.Namespace = "" }},
-		{name: "empty target owner UID", mutate: func(request *ProbeReconcileRequest) { request.Targets[0].OwnerUID = "" }},
-		{name: "empty target map", mutate: func(request *ProbeReconcileRequest) { request.Targets[0].Map = types.NamespacedName{} }},
-		{name: "empty target digest", mutate: func(request *ProbeReconcileRequest) { request.Targets[0].PolicyDigest = "" }},
+		{name: "empty request owner UID", mutate: func(request *ProbeReconcileRequest) { request.OwnerUID = "" }, wantErr: "probe reconcile owner UID is empty"},
+		{name: "empty request map name", mutate: func(request *ProbeReconcileRequest) { request.Map.Name = "" }, wantErr: "probe reconcile TrafficMap namespace and name are required"},
+		{name: "empty request map namespace", mutate: func(request *ProbeReconcileRequest) { request.Map.Namespace = "" }, wantErr: "probe reconcile TrafficMap namespace and name are required"},
+		{name: "empty target owner UID", mutate: func(request *ProbeReconcileRequest) { request.Targets[0].OwnerUID = "" }, wantErr: `probe target cluster "cluster-a" has an empty owner UID`},
+		{name: "empty target map", mutate: func(request *ProbeReconcileRequest) { request.Targets[0].Map = types.NamespacedName{} }, wantErr: `probe target cluster "cluster-a" has an empty TrafficMap identity`},
+		{name: "empty target digest", mutate: func(request *ProbeReconcileRequest) { request.Targets[0].PolicyDigest = "" }, wantErr: `probe target cluster "cluster-a" has an empty policy digest`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			request := testProbeRequest(policy, validTarget)
 			tt.mutate(&request)
-			if _, err := prober.Reconcile(context.Background(), request); err == nil {
-				t.Fatal("Reconcile() error = nil")
+			_, err := prober.Reconcile(context.Background(), request)
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("Reconcile() error = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}
@@ -921,7 +924,7 @@ func TestProber_RequestWaitsForAWorker_TimeoutStartsWhenItRuns(t *testing.T) {
 					}
 					return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
 				})}
-				prober, err := NewProber(executor, client, clocktesting.NewFakeClock(testProbeNow), testProbeResponseBytes, logr.Discard())
+				prober, err := NewProber(executor, client, clocktesting.NewFakeClock(testProbeNow), testProbeResponseBytes)
 				if err != nil {
 					t.Fatalf("NewProber() error = %v", err)
 				}
@@ -967,7 +970,7 @@ func TestObserverClient_EndpointRedirects_ProbeIsInconclusiveNoFollow(t *testing
 	if err != nil {
 		t.Fatalf("NewObserverExecutor() error = %v", err)
 	}
-	prober, err := NewProber(executor, NewObserverClient(), clocktesting.NewFakeClock(testProbeNow), testProbeResponseBytes, logr.Discard())
+	prober, err := NewProber(executor, NewObserverClient(), clocktesting.NewFakeClock(testProbeNow), testProbeResponseBytes)
 	if err != nil {
 		t.Fatalf("NewProber() error = %v", err)
 	}
@@ -1013,7 +1016,7 @@ func TestProbeOne_EndpointWithPathThenClosed_JoinsPathThenFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewObserverExecutor() error = %v", err)
 	}
-	prober, err := NewProber(executor, NewObserverClient(), clocktesting.NewFakeClock(testProbeNow), testProbeResponseBytes, logr.Discard())
+	prober, err := NewProber(executor, NewObserverClient(), clocktesting.NewFakeClock(testProbeNow), testProbeResponseBytes)
 	if err != nil {
 		t.Fatalf("NewProber() error = %v", err)
 	}
@@ -1070,7 +1073,7 @@ func TestProbeOne_LongResponseBody_ReadsOnlyTheBoundAndCloses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewObserverExecutor() error = %v", err)
 	}
-	prober, err := NewProber(executor, client, clocktesting.NewFakeClock(testProbeNow), responseBound, logr.Discard())
+	prober, err := NewProber(executor, client, clocktesting.NewFakeClock(testProbeNow), responseBound)
 	if err != nil {
 		t.Fatalf("NewProber() error = %v", err)
 	}
@@ -1086,53 +1089,9 @@ func TestProbeOne_LongResponseBody_ReadsOnlyTheBoundAndCloses(t *testing.T) {
 	}
 }
 
-func TestTargetsFromTrafficMaps_EntriesOutOfOrder_SortsByClusterWithIdentity(t *testing.T) {
-	mustURL := func(raw string) *apis.URL {
-		parsed, err := apis.ParseURL(raw)
-		if err != nil {
-			t.Fatalf("ParseURL(%q) error = %v", raw, err)
-		}
-		return parsed
-	}
-	controller := true
-	maps := []v1beta1.TrafficMap{{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      testMap.Name,
-			Namespace: testMap.Namespace,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: v1beta1.SchemeGroupVersion.String(),
-				Kind:       "InferenceService",
-				Name:       testMap.Name,
-				UID:        testOwnerUID,
-				Controller: &controller,
-			}},
-		},
-		Spec: v1beta1.TrafficMapSpec{Service: testMap.Name, Entries: []v1beta1.TrafficMapEntry{
-			{
-				Cluster:  "cluster-b",
-				Endpoint: mustURL("https://B.example.com/"),
-				Probe:    &v1beta1.TrafficMapProbe{PolicyDigest: "sha256:" + strings.Repeat("b", 64)},
-			},
-			{Cluster: "cluster-a", Endpoint: mustURL("https://A.example.com")},
-			{Cluster: "cluster-c"},
-		}},
-	}}
-	targets := TargetsFromTrafficMaps(maps)
-	if len(targets) != 2 {
-		t.Fatalf("targets = %d (%v), want 2", len(targets), targets)
-	}
-	if targets[0].Cluster != "cluster-a" || targets[1].Cluster != "cluster-b" {
-		t.Fatalf("targets not cluster-sorted: %v", targets)
-	}
-	if targets[0].OwnerUID != testOwnerUID || targets[0].Map != testMap {
-		t.Fatalf("target identity = %+v", targets[0])
-	}
-	if targets[1].URL != "https://b.example.com" || targets[1].PolicyDigest == "" {
-		t.Fatalf("canonical target = %+v", targets[1])
-	}
-}
-
-func TestTargetsFromTrafficMaps_OwnerReferenceOff_ReturnsNoTargets(t *testing.T) {
+// A TrafficMap belongs to the routing observers only when its controller owner
+// is the InferenceService of the same name and the map names that service.
+func TestTrafficMapOwnerUID_RefusesAMapAnotherOwnerWrote(t *testing.T) {
 	controller := true
 	valid := v1beta1.TrafficMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1154,6 +1113,9 @@ func TestTargetsFromTrafficMaps_OwnerReferenceOff_ReturnsNoTargets(t *testing.T)
 			}},
 		},
 	}
+	if uid, owned := trafficMapOwnerUID(&valid); !owned || uid != testOwnerUID {
+		t.Fatalf("trafficMapOwnerUID(valid) = %q, %v, want %q, true", uid, owned, testOwnerUID)
+	}
 	tests := []struct {
 		name   string
 		mutate func(*v1beta1.TrafficMap)
@@ -1170,8 +1132,8 @@ func TestTargetsFromTrafficMaps_OwnerReferenceOff_ReturnsNoTargets(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			trafficMap := valid.DeepCopy()
 			tt.mutate(trafficMap)
-			if targets := TargetsFromTrafficMaps([]v1beta1.TrafficMap{*trafficMap}); len(targets) != 0 {
-				t.Fatalf("TargetsFromTrafficMaps() = %+v, want none", targets)
+			if uid, owned := trafficMapOwnerUID(trafficMap); owned || uid != "" {
+				t.Fatalf("trafficMapOwnerUID() = %q, %v, want refused", uid, owned)
 			}
 		})
 	}
@@ -1184,4 +1146,149 @@ func mustAPISURL(t *testing.T, raw string) *apis.URL {
 		t.Fatalf("ParseURL(%q) error = %v", raw, err)
 	}
 	return parsed
+}
+
+// The pass refuses, before any probe runs, a nil context, a policy whose
+// recorded digest is not the digest of its configuration, and a configuration
+// the probe rules refuse; each refusal names its cause.
+func TestProberReconcile_NilContextWrongDigestOrInvalidConfiguration_RefusesThePass(t *testing.T) {
+	var noContext context.Context
+	policy := testProbePolicy(t, testProbeConfig())
+	wrongDigest := policy
+	wrongDigest.PolicyDigest = "sha256:" + strings.Repeat("0", 64)
+	invalid := testProbeConfig()
+	invalid.FailureThreshold = 0
+	invalidPolicy := testProbePolicy(t, invalid)
+	tests := []struct {
+		name    string
+		ctx     context.Context
+		policy  ResolvedProbePolicy
+		wantErr string
+	}{
+		{name: "nil context", ctx: noContext, policy: policy, wantErr: "probe reconcile context is nil"},
+		{name: "digest of another configuration", ctx: context.Background(), policy: wrongDigest, wantErr: fmt.Sprintf("probe policy digest %q does not match effective policy", wrongDigest.PolicyDigest)},
+		{name: "invalid configuration", ctx: context.Background(), policy: invalidPolicy, wantErr: "routing.probe.failureThreshold must be positive when routing.probe.path is set"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			prober := newTestProber(t, NewObserverClient(), clocktesting.NewFakeClock(testProbeNow), 1, 1, testProbeResponseBytes)
+			request := testProbeRequest(tt.policy, testProbeTarget("https://service.example.com", tt.policy.PolicyDigest))
+			_, err := prober.Reconcile(tt.ctx, request)
+			if err == nil || err.Error() != tt.wantErr {
+				t.Fatalf("Reconcile() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// A pass whose executor refuses the first probe reports the refusal and leaves
+// no probe recorded as in flight, so the next pass probes every target.
+func TestProberReconcile_ExecutorRefusesTheProbes_NextPassProbesEveryTarget(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	idle, err := NewObserverExecutor(1, 1)
+	if err != nil {
+		t.Fatalf("NewObserverExecutor() error = %v", err)
+	}
+	clk := clocktesting.NewFakeClock(testProbeNow)
+	prober, err := NewProber(idle, NewObserverClient(), clk, testProbeResponseBytes)
+	if err != nil {
+		t.Fatalf("NewProber() error = %v", err)
+	}
+	policy := testProbePolicy(t, testProbeConfig())
+	targets := []Target{testProbeTarget(server.URL, policy.PolicyDigest), testProbeTarget(server.URL+"/b", policy.PolicyDigest)}
+	targets[1].Cluster = "cluster-b"
+	request := ProbeReconcileRequest{OwnerUID: testOwnerUID, Map: testMap, Policy: policy, Targets: targets}
+
+	delay, err := prober.Reconcile(context.Background(), request)
+	want := `submit probe for cluster "cluster-a": observer executor is not running`
+	if err == nil || err.Error() != want || delay != 0 {
+		t.Fatalf("refused Reconcile() = %s, %v; want 0, %q", delay, err, want)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("requests after the refused pass = %d, want 0", got)
+	}
+
+	started, _, _ := startTestObserverExecutor(t, 1, 2)
+	prober.Executor = started
+	delay, err = prober.Reconcile(context.Background(), request)
+	if err != nil || delay != policy.Probe.Period {
+		t.Fatalf("next Reconcile() = %s, %v; want %s, nil", delay, err, policy.Probe.Period)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests after the next pass = %d, want 2", got)
+	}
+	for _, target := range targets {
+		if prober.Provenance(target) == nil {
+			t.Fatalf("Provenance(%s) = nil after the next pass", target.Cluster)
+		}
+	}
+}
+
+// A pass whose context ends while a probe is still queued reports the wait and
+// releases that probe, so the next pass probes its target again.
+func TestProberReconcile_ContextEndsWhileAProbeIsQueued_NextPassProbesItAgain(t *testing.T) {
+	firstStarted := make(chan struct{})
+	release := make(chan struct{})
+	var requestsB atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/b/") {
+			requestsB.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		select {
+		case firstStarted <- struct{}{}:
+		default:
+		}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	defer close(release)
+
+	clk := clocktesting.NewFakeClock(testProbeNow)
+	prober := newTestProber(t, NewObserverClient(), clk, 1, 1, testProbeResponseBytes)
+	policy := testProbePolicy(t, testProbeConfig())
+	targets := []Target{testProbeTarget(server.URL, policy.PolicyDigest), testProbeTarget(server.URL+"/b", policy.PolicyDigest)}
+	targets[1].Cluster = "cluster-b"
+	request := ProbeReconcileRequest{OwnerUID: testOwnerUID, Map: testMap, Policy: policy, Targets: targets}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := prober.Reconcile(ctx, request)
+		done <- err
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first probe never reached the server")
+	}
+	cancel()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Reconcile() did not return after its context ended")
+	}
+	if err == nil || !strings.Contains(err.Error(), `wait for probe of cluster "cluster-b": context canceled`) {
+		t.Fatalf("cancelled Reconcile() error = %v, want the wait for cluster-b reported", err)
+	}
+
+	release <- struct{}{}
+	clk.Step(policy.Probe.Period)
+	if _, err := prober.Reconcile(context.Background(), request); err != nil {
+		t.Fatalf("next Reconcile() error = %v", err)
+	}
+	if got := requestsB.Load(); got != 1 {
+		t.Fatalf("requests to cluster-b after the next pass = %d, want 1", got)
+	}
+	if prober.Provenance(targets[1]) == nil {
+		t.Fatal("Provenance(cluster-b) = nil after the next pass")
+	}
 }

@@ -317,62 +317,6 @@ func TestTrafficMapPublisher_OptionsResolverRejects_ReportsInvalidOptionsNoEffec
 	assert.NotContains(t, condition.Message, "protected option")
 }
 
-func TestTrafficMapPublisher_MapNameServiceOrGenerationOff_ReportsInvalidOwnerFirst(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*v1beta1.InferenceService, *v1beta1.TrafficMap)
-	}{
-		{
-			name: "map name",
-			mutate: func(_ *v1beta1.InferenceService, trafficMap *v1beta1.TrafficMap) {
-				trafficMap.Name = "different"
-			},
-		},
-		{
-			name: "service name",
-			mutate: func(_ *v1beta1.InferenceService, trafficMap *v1beta1.TrafficMap) {
-				trafficMap.Spec.Service = "different"
-			},
-		},
-		{
-			name: "observed owner generation",
-			mutate: func(owner *v1beta1.InferenceService, _ *v1beta1.TrafficMap) {
-				owner.Generation++
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			owner, trafficMap := publisherTestObjects()
-			tt.mutate(owner, trafficMap)
-			resolveCalls := 0
-			planCalls := 0
-			publisher := &recordingTrafficMapPublisher{
-				name: "example-publisher", stateful: true,
-				resolve: func(map[string]string, map[string]string) (map[string]string, error) {
-					resolveCalls++
-					return nil, nil
-				},
-				plan: func(*v1beta1.InferenceService, *v1beta1.TrafficMap, map[string]string) (TrafficMapPublishPlan, error) {
-					planCalls++
-					return testTrafficMapPublishPlan{}, nil
-				},
-			}
-			reconciler, kubeClient := newTrafficMapPublisherReconciler(t, publisher, owner, trafficMap)
-
-			_, err := reconcileTrafficMapPublisher(t, reconciler, trafficMap)
-			require.NoError(t, err)
-			assert.Zero(t, resolveCalls)
-			assert.Zero(t, planCalls)
-			assert.Empty(t, publisher.events)
-			current := getPublisherTrafficMap(t, kubeClient, trafficMap)
-			condition := apimeta.FindStatusCondition(current.Status.Conditions, v1beta1.TrafficMapPublished)
-			require.NotNil(t, condition)
-			assert.Equal(t, trafficMapPublisherReasonInvalidOwner, condition.Reason)
-		})
-	}
-}
-
 func TestTrafficMapPublisher_InactiveOrOwnerOptsOut_PlansNothingKeepsFinalizer(t *testing.T) {
 	falseValue := false
 	tests := []struct {

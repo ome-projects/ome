@@ -19,7 +19,7 @@ import (
 // (address, headers, auth), so editing any of them changes the key: the edited
 // plan starts a fresh query instead of consuming a cached or in-flight result
 // produced under the old configuration. Old keys (a finished step/revision, or
-// a superseded plan) stop being read and age out of the cache.
+// a replaced plan) stop being read and age out of the cache.
 type SampleKey struct {
 	Namespace string
 	ISVCName  string

@@ -25,7 +25,7 @@ unzipped_fine_tuned_weight_directory: /mnt/unzipped-ft-models
 	v.SetConfigType("yaml")
 	require.NoError(t, v.ReadConfig(strings.NewReader(configYAML)))
 
-	config, err := NewFineTunedAdapterConfig(WithViper(v))
+	config, err := newConfig(v, fineTunedAdapterParams{})
 
 	require.NoError(t, err)
 	require.NotNil(t, config.FineTunedWeightURI)

@@ -29,6 +29,7 @@ OME Resources and Controller
 | ome.controller.deploymentMode | string | `"RawDeployment"` |  |
 | ome.controller.image | string | `"ome-manager"` |  |
 | ome.controller.ingressGateway.additionalIngressDomains | string | `nil` |  |
+| ome.controller.ingressGateway.clusterDomain | string | `"cluster.local"` |  |
 | ome.controller.ingressGateway.disableIngressCreation | bool | `true` |  |
 | ome.controller.ingressGateway.domain | string | `"svc.cluster.local"` |  |
 | ome.controller.ingressGateway.domainTemplate | string | `"{{ .Name }}.{{ .Namespace }}.{{ .IngressDomain }}"` |  |
@@ -38,7 +39,13 @@ OME Resources and Controller
 | ome.controller.ingressGateway.ingressGateway.gatewayService | string | `"istio-ingressgateway.istio-system.svc.cluster.local"` |  |
 | ome.controller.ingressGateway.omeIngressGateway | string | `""` |  |
 | ome.controller.ingressGateway.pathTemplate | string | `""` |  |
+| ome.controller.ingressGateway.routeProviderCapabilities | object | `{}` |  |
 | ome.controller.ingressGateway.urlScheme | string | `"http"` |  |
+| ome.controller.leaderElection.releaseOnCancel | bool | `true` | Give up the leader lease at the end of a graceful stop, so a standby takes over at its next poll instead of waiting for the lease to expire. The manager needs leaseDuration, in whole seconds, above max(renewDeadline / 2, 1s) + retryPeriod + 2 x renewDeadline; the chart's 120s, 40s and 8s pass. A timing that fails the rule makes each new manager pod exit at start, as does an image older than the flag; move the chart and the image together. |
+| ome.controller.managerPodDisruptionBudget.enabled | bool | `false` | Add a PodDisruptionBudget for the controller manager pods. `ome.controller.podDisruptionBudget` is a different setting: it covers the workloads the controller creates. |
+| ome.controller.managerPodDisruptionBudget.maxUnavailable | int | `1` | How many manager pods a node drain may take down at a time. Must be at least 1, because 0 blocks the drain of any node running a manager pod. |
+| ome.controller.managerPodDisruptionBudget.unhealthyPodEvictionPolicy | string | `"AlwaysAllow"` | Eviction policy for manager pods that are not Ready. `AlwaysAllow` lets a drain evict them; empty leaves the Kubernetes default (`IfHealthyBudget`), which can hold a drain behind a pod that serves nothing. |
+| ome.controller.managerTerminationGracePeriodSeconds | int | `40` | Termination grace period of the controller manager pod. The manager releases the leader lease only after its stop, which controller-runtime bounds at 30s, so keep this above 30. `ome.controller.terminationGracePeriodSeconds` is a different setting: it is the default for the serving pods the controller creates. |
 | ome.controller.nodeSelector | object | `{}` |  |
 | ome.controller.pprofBindAddress | string | `""` | Address the manager serves net/http/pprof on. Empty disables it. Bind to loopback, for example `127.0.0.1:6060`, so profiles are reachable only through `kubectl port-forward`. |
 | ome.controller.replicaCount | int | `3` |  |
@@ -49,8 +56,17 @@ OME Resources and Controller
 | ome.controller.tag | string | `"v0.1.2"` |  |
 | ome.controller.tolerations | list | `[]` |  |
 | ome.controller.topologySpreadConstraints | list | `[]` |  |
+| ome.kedaConfig.customPromQuery | string | `""` |  |
+| ome.kedaConfig.enableKeda | bool | `true` |  |
+| ome.kedaConfig.promServerAddress | string | `"http://prometheus-operated.monitoring.svc.cluster.local:9090"` |  |
+| ome.kedaConfig.scalingOperator | string | `"GreaterThanOrEqual"` |  |
+| ome.kedaConfig.scalingThreshold | string | `"10"` |  |
+| ome.metricsaggregator.aggregatePort | int | `9088` | Port queue-proxy serves the aggregated metrics on. |
+| ome.metricsaggregator.containerPort | int | `8080` | Metrics port of the serving container when the pod's prometheus.ome.io/port annotation names none. |
 | ome.metricsaggregator.enableMetricAggregation | string | `"false"` |  |
 | ome.metricsaggregator.enablePrometheusScraping | string | `"false"` |  |
+| ome.metricsaggregator.path | string | `"/metrics"` | Metrics path of the serving container and of the pod scrape annotation. |
+| ome.metricsaggregator.podPrometheusPort | int | `9091` | Pod scrape port when aggregation is off. |
 | ome.multiclusterAccess.enabled | bool | `false` | Install the remote placement ClusterRole. |
 | ome.multiclusterAccess.subjects | list | `[]` | Bind existing identities; empty leaves bindings to the platform. |
 | ome.multicluster.config.placement.memberReadRetry.initialBackoff | string | `""` | Wait before the first re-read of a member after a transient failure; doubles per re-read. Required when `maxAttempts` exceeds 1. |
@@ -74,6 +90,11 @@ OME Resources and Controller
 | ome.omeAgent.region | string | `"ap-osaka-1"` |  |
 | ome.omeAgent.tag | string | `"v0.1.2"` |  |
 | ome.omeAgent.vaultId | string | `"ocid1.vault.oc1.ap-osaka-1.dummy.dummy-vault"` |  |
+| ome.rdma.defaultProfile | string | `""` | RDMA profile applied to a pod that sets ome.io/rdma-auto-inject without ome.io/rdma-profile. Empty until the cluster's values file names one. |
+| ome.rdma.profiles | object | `{}` | RDMA profile table: env, volumes, mounts, security context and Multus networks per profile name. The chart ships none; the per-cluster values file carries the fabric table. |
+| ome.runtimePresets | object | `sglang-pd` | ServingRuntime spec per ome.io/engine value, filled in by the preset webhook under the runtime's own fields. |
+| ome.runtimeProfiles.defaultPort | int | `30000` | Port the probe and observability profiles use when the pod names none. |
+| ome.runtimeProfiles.probes | object | readiness, liveness, startup | Timings of the three probes a probe profile injects. |
 | ome.version | string | `"v0.1.2"` |  |
 | prometheus.enabled | bool | `true` | Bundle a single-replica Prometheus for KEDA autoscaling input. See [Bundled Prometheus](#bundled-prometheus). |
 | prometheus.configReload.enabled | bool | `true` | Reload `prometheus.yml` in place when the ConfigMap changes instead of replacing the pod. Requires Prometheus v3.0 or later. See [Configuration changes](#configuration-changes). |

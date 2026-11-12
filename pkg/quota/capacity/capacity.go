@@ -93,8 +93,7 @@ const (
 // Result is what a cluster has, split into what is usable and what is not
 // accounted for.
 type Result struct {
-	// Capacities is sorted by (resource, flavor) so a caller can diff two
-	// snapshots without normalising first.
+	// Capacities is sorted by (resource, flavor).
 	Capacities []Capacity
 	// Unattributed is sorted by (node, resource).
 	Unattributed []Unattributed
@@ -152,8 +151,24 @@ func validateFlavors(flavors []Flavor) error {
 	return nil
 }
 
-// resourceFlavor is the (resource, flavor) pair a total is kept for.
+// resourceFlavor is the (resource, flavor) pair a total and a mark are kept
+// for, the granularity Kueue keys quota by.
 type resourceFlavor struct{ resource, flavor string }
+
+// less orders pairs by resource, then flavor: the order every list this
+// package returns is in, so a caller can diff two snapshots without
+// normalising first.
+func (k resourceFlavor) less(o resourceFlavor) bool {
+	if k.resource != o.resource {
+		return k.resource < o.resource
+	}
+	return k.flavor < o.flavor
+}
+
+// key is the pair the capacity is kept for.
+func (c Capacity) key() resourceFlavor {
+	return resourceFlavor{resource: c.ResourceName, flavor: c.ResourceFlavor}
+}
 
 // addNode adds one node's chips to the totals of the flavor it belongs to.
 // Each chip is a distinct resource, so the node counts once in every
@@ -198,12 +213,7 @@ func sortedResult(totals map[resourceFlavor]*Capacity, unattributed []Unattribut
 	for _, t := range totals {
 		out.Capacities = append(out.Capacities, *t)
 	}
-	sort.Slice(out.Capacities, func(i, j int) bool {
-		if out.Capacities[i].ResourceName != out.Capacities[j].ResourceName {
-			return out.Capacities[i].ResourceName < out.Capacities[j].ResourceName
-		}
-		return out.Capacities[i].ResourceFlavor < out.Capacities[j].ResourceFlavor
-	})
+	sort.Slice(out.Capacities, func(i, j int) bool { return out.Capacities[i].key().less(out.Capacities[j].key()) })
 	sort.Slice(unattributed, func(i, j int) bool {
 		if unattributed[i].Node != unattributed[j].Node {
 			return unattributed[i].Node < unattributed[j].Node

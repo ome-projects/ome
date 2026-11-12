@@ -439,7 +439,7 @@ func registerAutoscaledAllMember(t *testing.T, f *backendFixture, name string) {
 	if err := f.reconciler.Create(t.Context(), readyWC(name, nil)); err != nil {
 		t.Fatal(err)
 	}
-	f.workers[name] = emptyWorker(f.reconciler.Scheme)
+	f.workers[name] = emptyWorker(f.reconciler.Scheme())
 	f.connections.m[name] = workloadcluster.NewNeverCachingClient(f.workers[name])
 }
 

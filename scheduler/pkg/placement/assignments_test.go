@@ -142,9 +142,9 @@ func TestPlaceDrainsReservationNoDoubleCount(t *testing.T) {
 	}
 }
 
-// TestPlaceFloorsAtZero: Place never drives a reservation negative, and is a
+// TestPlaceNeverGoesBelowZero: Place never drives a reservation negative, and is a
 // no-op on an unassigned group.
-func TestPlaceFloorsAtZero(t *testing.T) {
+func TestPlaceNeverGoesBelowZero(t *testing.T) {
 	p := New()
 	place(p, "ghost") // unassigned: no panic, no effect
 	choose(p, "A", topology.FreeByDomain{"d": 1}, 1)
@@ -234,7 +234,7 @@ func TestCommitmentDoesNotMatchRecreatedOwner(t *testing.T) {
 	if !ok {
 		t.Fatal("old owner failed to take a domain")
 	}
-	_, _, _, found, ownerMatch := p.GetOwnedBy("team/pf", "new-uid")
+	_, _, found, ownerMatch := p.GetOwnedBy("team/pf", "new-uid")
 	if !found || ownerMatch {
 		t.Fatalf("GetOwnedBy recreated owner = found %v match %v, want true,false", found, ownerMatch)
 	}

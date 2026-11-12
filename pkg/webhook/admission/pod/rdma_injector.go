@@ -13,10 +13,9 @@ import (
 )
 
 const (
-	// DefaultRDMAProfile is the default RDMA profile to use if none is specified
-	DefaultRDMAProfile = "oci-roce"
-	// DevInfVolumeName is the name of the /dev/infiniband volume
-	DevInfVolumeName = "devinf"
+	// RDMAConfigKeyName is the inferenceservice-config key that holds the
+	// RDMA profile table.
+	RDMAConfigKeyName = "rdma"
 	// DshmVolumeName is the name of the /dev/shm volume
 	DshmVolumeName = "dshm"
 	// DefaultContainerName is the default container name to inject into if not specified
@@ -27,140 +26,20 @@ const (
 	MultusNetworksAnnotation = "k8s.v1.cni.cncf.io/networks"
 )
 
-// RDMAProfiles is a map of profile names to RDMA configurations
-var RDMAProfiles = map[string]RDMAProfile{
-	"oci-roce": {
-		// UCX_TLS and UCX_NET_DEVICES are deliberately absent. No NCCL
-		// path reads them, but UCX-based KV transfer (NIXL) does, and
-		// pinning them to tcp/eth0 quietly moved it off RDMA (#837).
-		// Runtimes that want a UCX restriction set it on the container.
-		EnvVars: map[string]string{
-			"NCCL_NET_PLUGIN":            "none",
-			"NCCL_DEBUG":                 "INFO",
-			"NCCL_CROSS_NIC":             "2",
-			"NCCL_SOCKET_NTHREADS":       "16",
-			"NCCL_CUMEM_ENABLE":          "0",
-			"NCCL_IB_SPLIT_DATA_ON_QPS":  "0",
-			"NCCL_IB_QPS_PER_CONNECTION": "16",
-			"NCCL_IB_GID_INDEX":          "3",
-			"NCCL_IB_HCA":                "=mlx5_0,mlx5_1,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10,mlx5_12,mlx5_13,mlx5_14,mlx5_15,mlx5_16,mlx5_17",
-			"NCCL_IB_TC":                 "41",
-			"NCCL_IB_SL":                 "0",
-			"NCCL_IB_TIMEOUT":            "22",
-			"HCOLL_ENABLE_MCAST_ALL":     "0",
-			"coll_hcoll_enable":          "0",
-			"RX_QUEUE_LEN":               "8192",
-			"IB_RX_QUEUE_LEN":            "8192",
-			"NCCL_SOCKET_IFNAME":         "eth0",
-			"NCCL_IGNORE_CPU_AFFINITY":   "1",
-			"GLOO_SOCKET_IFNAME":         "eth0",
-		},
-		VolumeMounts: []v1.VolumeMount{
-			{
-				Name:      DshmVolumeName,
-				MountPath: "/dev/shm",
-			},
-			{
-				Name:      DevInfVolumeName,
-				MountPath: "/dev/infiniband",
-			},
-		},
-		Volumes: []v1.Volume{
-			{
-				Name: DshmVolumeName,
-				VolumeSource: v1.VolumeSource{
-					EmptyDir: &v1.EmptyDirVolumeSource{
-						Medium: v1.StorageMediumMemory,
-					},
-				},
-			},
-			{
-				Name: DevInfVolumeName,
-				VolumeSource: v1.VolumeSource{
-					HostPath: &v1.HostPathVolumeSource{
-						Path: "/dev/infiniband",
-					},
-				},
-			},
-		},
-		// IPC_LOCK is what RDMA verbs need for pinned memory. Opening the
-		// HCA device nodes is not granted here: the /dev/infiniband mount
-		// above only makes them visible, and the device cgroup still
-		// denies them. Runtimes get that access by requesting their
-		// cluster's RDMA device-plugin resource, or by setting privileged
-		// explicitly — values already on the container win over the
-		// profile. The profile itself is deliberately not privileged:
-		// that bypasses the device cgroup and hands the pod every GPU on
-		// the node, not the ones the NVIDIA device plugin allocated (#833).
-		SecurityContext: &v1.SecurityContext{
-			Capabilities: &v1.Capabilities{
-				Add: []v1.Capability{"IPC_LOCK"},
-			},
-		},
-	},
-	// cks-gb-sglang: SGLang PD-serving env baseline.
-	// Volumes/mounts and securityContext match oci-roce so runtimes can
-	// swap profiles without touching the rest of the pod.
-	"cks-gb-sglang": {
-		EnvVars: map[string]string{
-			"MC_TE_METRIC":        "true",
-			"NCCL_MNNVL_ENABLE":   "1",
-			"NCCL_CUMEM_ENABLE":   "1",
-			"NCCL_IB_ADDR_FAMILY": "AF_INET6",
-			"NCCL_SOCKET_IFNAME":  "eth0",
-			"NCCL_SOCKET_FAMILY":  "AF_INET6",
-		},
-		VolumeMounts: []v1.VolumeMount{
-			{Name: DshmVolumeName, MountPath: "/dev/shm"},
-			{Name: DevInfVolumeName, MountPath: "/dev/infiniband"},
-		},
-		Volumes: []v1.Volume{
-			{
-				Name: DshmVolumeName,
-				VolumeSource: v1.VolumeSource{
-					EmptyDir: &v1.EmptyDirVolumeSource{Medium: v1.StorageMediumMemory},
-				},
-			},
-			{
-				Name: DevInfVolumeName,
-				VolumeSource: v1.VolumeSource{
-					HostPath: &v1.HostPathVolumeSource{Path: "/dev/infiniband"},
-				},
-			},
-		},
-		// Not privileged, for the same reason as oci-roce above.
-		SecurityContext: &v1.SecurityContext{
-			Capabilities: &v1.Capabilities{
-				Add: []v1.Capability{"IPC_LOCK"},
-			},
-		},
-	},
-	// cks-gb-rdma: Multus network attachments only (no env/volumes/security)
-	// for the GB-class CKS topology (GB200 + GB300 share 4 HCAs × 4 ports =
-	// 16 ibs*-macvlan attachments in cw-multus). CoreWeave provisions the
-	// NADs but does NOT auto-attach them, so each pod needing NIXL/UCX over
-	// RoCEv2 must request them explicitly. Workload-specific knobs
-	// (NCCL/UCX env, /dev/shm sizing, securityContext) stay in the runtime
-	// YAML — they vary per model.
-	"cks-gb-rdma": {
-		Networks: cksGbRdmaNetworks,
-	},
+// RDMAConfig is the rdma block of the inferenceservice-config ConfigMap: the
+// profiles a pod may name through ome.io/rdma-profile and the one applied
+// when it names none. Neither the binary nor the chart carries a profile;
+// the cluster's own values file describes its fabric.
+type RDMAConfig struct {
+	DefaultProfile string                 `json:"defaultProfile"`
+	Profiles       map[string]RDMAProfile `json:"profiles"`
 }
 
-// cksGbRdmaNetworks is the canonical 16-attachment list for CKS GB200/GB300
-// (4 HCAs × 4 ports), matching the node's net-device layout.
-var cksGbRdmaNetworks = func() []NetworkAttachment {
-	out := make([]NetworkAttachment, 0, 16)
-	for hca := 0; hca < 4; hca++ {
-		for port := 0; port < 4; port++ {
-			out = append(out, NetworkAttachment{
-				Name:      fmt.Sprintf("ibs%dp%d-macvlan", hca, port),
-				Namespace: "cw-multus",
-			})
-		}
-	}
-	return out
-}()
+// hasProfiles reports whether the table names at least one profile. An
+// absent block and a block without profiles both inject nothing.
+func (c *RDMAConfig) hasProfiles() bool {
+	return c != nil && len(c.Profiles) > 0
+}
 
 // NetworkAttachment is a Multus network reference. Serialized into
 // k8s.v1.cni.cncf.io/networks per the multus-cni JSON schema.
@@ -169,30 +48,53 @@ type NetworkAttachment struct {
 	Namespace string `json:"namespace,omitempty"`
 }
 
-// RDMAProfile represents configuration parameters for RDMA and NCCL
+// RDMAProfile is what one profile adds to a pod: environment for the
+// collective and transfer libraries, the device and shared-memory volumes
+// with their mounts, the capabilities RDMA verbs need, and the Multus
+// networks to attach. Values already on the container win over the profile.
 type RDMAProfile struct {
-	EnvVars         map[string]string
-	VolumeMounts    []v1.VolumeMount
-	Volumes         []v1.Volume
-	SecurityContext *v1.SecurityContext
+	EnvVars         map[string]string   `json:"env,omitempty"`
+	VolumeMounts    []v1.VolumeMount    `json:"volumeMounts,omitempty"`
+	Volumes         []v1.Volume         `json:"volumes,omitempty"`
+	SecurityContext *v1.SecurityContext `json:"securityContext,omitempty"`
 	// Networks are merged into the pod's k8s.v1.cni.cncf.io/networks
 	// annotation; dedup is by (name, namespace).
-	Networks []NetworkAttachment
+	Networks []NetworkAttachment `json:"networks,omitempty"`
 }
 
-// injectRDMA applies an RDMA profile (env / volumes / Multus
-// attachments) when the ome.io/rdma-auto-inject=true annotation is set.
-// The profile name defaults to DefaultRDMAProfile, overridable via
-// ome.io/rdma-profile.
-func injectRDMA(pod *v1.Pod) error {
+// newRDMAConfig parses the rdma block. An absent block is nil: pods that
+// ask for RDMA injection then get nothing.
+func newRDMAConfig(configMap *v1.ConfigMap) (*RDMAConfig, error) {
+	raw, ok := configMap.Data[RDMAConfigKeyName]
+	if !ok {
+		return nil, nil
+	}
+	config := &RDMAConfig{}
+	if err := json.Unmarshal([]byte(raw), config); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal %v json string: %w", RDMAConfigKeyName, err)
+	}
+	return config, nil
+}
+
+// injectRDMA applies an RDMA profile (env / volumes / Multus attachments)
+// when the ome.io/rdma-auto-inject=true annotation is set. The profile is
+// the one ome.io/rdma-profile names, else the table's default; a table with
+// no profiles injects nothing.
+func injectRDMA(pod *v1.Pod, table *RDMAConfig) error {
 	if autoInject, ok := pod.ObjectMeta.Annotations[constants.RDMAAutoInjectAnnotationKey]; !ok || autoInject != "true" {
 		return nil
 	}
-	profileName := DefaultRDMAProfile
+	if !table.hasProfiles() {
+		return nil
+	}
+	profileName := table.DefaultProfile
 	if profile, ok := pod.ObjectMeta.Annotations[constants.RDMAProfileAnnotationKey]; ok && profile != "" {
 		profileName = profile
 	}
-	profile, ok := RDMAProfiles[profileName]
+	if profileName == "" {
+		return fmt.Errorf("no RDMA profile: the pod names none and %s sets no defaultProfile", RDMAConfigKeyName)
+	}
+	profile, ok := table.Profiles[profileName]
 	if !ok {
 		return fmt.Errorf("unknown RDMA profile: %s", profileName)
 	}

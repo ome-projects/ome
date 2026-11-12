@@ -1,22 +1,33 @@
 package v1beta1
 
-import "testing"
-
-const (
-	ratioNoMixingRule  = "!has(self.clusterAffinity) || !(self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) && self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.default) || has(t.weights.engine) || has(t.weights.decoder) || has(t.weights.router))))"
-	ratioSplitOnlyRule = "!has(self.clusterAffinity) || !self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) || (self.mode == 'Split' && !has(self.split))"
+import (
+	"strings"
+	"testing"
 )
 
-func TestInferenceServiceCRD_RatioMixingRules(t *testing.T) {
+const ratioSplitOnlyRule = "!has(self.clusterAffinity) || !self.clusterAffinity.exists(t, has(t.weights)) || (self.mode == 'Split' && !has(self.split))"
+
+func TestInferenceServiceCRD_RatioRules(t *testing.T) {
 	root := loadInferenceServiceCRDSchema(t)
 	spec := requireSchemaProperty(t, root, "spec")
 	placement := requireSchemaProperty(t, spec, "placement")
-	requireSchemaRules(t, "spec.placement", placement, ratioNoMixingRule, ratioSplitOnlyRule)
+	requireSchemaRules(t, "spec.placement", placement, ratioSplitOnlyRule)
+	for _, v := range placement.XValidations {
+		if v.Rule != ratioSplitOnlyRule && containsAny(v.Rule, "has(t.weights.default)") {
+			t.Errorf("spec.placement keeps a rule that reads single weight keys: %q", v.Rule)
+		}
+	}
 
 	affinity := requireSchemaProperty(t, placement, "clusterAffinity")
 	weights := requireSchemaProperty(t, *affinity.Items.Schema, "weights")
-	for _, key := range []string{"defaultReplicas", "engineReplicas", "decoderReplicas", "routerReplicas"} {
+	if len(weights.Properties) != 4 {
+		t.Errorf("weights keys = %d, want 4: only default, engine, decoder and router hold a ratio", len(weights.Properties))
+	}
+	for _, key := range []string{"default", "engine", "decoder", "router"} {
 		ratio := requireSchemaProperty(t, weights, key)
+		if ratio.Type != "object" {
+			t.Errorf("%s type = %q, want object: every weight key holds a {min, max} ratio", key, ratio.Type)
+		}
 		if len(ratio.Required) != 0 {
 			t.Errorf("%s required = %v, want none: an omitted min or max counts as 1", key, ratio.Required)
 		}
@@ -27,4 +38,13 @@ func TestInferenceServiceCRD_RatioMixingRules(t *testing.T) {
 			}
 		}
 	}
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }

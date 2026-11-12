@@ -91,26 +91,15 @@ func NewReplicaAgent(config *Config) (*ReplicaAgent, error) {
 		return nil, fmt.Errorf("failed to validate required dependencies - %w", err)
 	}
 
-	sourceObjectURI, err := storage.NewObjectURI(config.Source.StorageURIStr)
+	source := replicationSide{role: "source", uriStr: config.Source.StorageURIStr, storageType: sourceStorageType, store: config.Source.OCIOSDataStore}
+	sourceObjectURI, err := source.objectURI()
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse source storage URI %s - %w", config.Source.StorageURIStr, err)
+		return nil, err
 	}
-	targetObjectURI, err := storage.NewObjectURI(config.Target.StorageURIStr)
+	target := replicationSide{role: "target", uriStr: config.Target.StorageURIStr, storageType: targetStorageType, store: config.Target.OCIOSDataStore}
+	targetObjectURI, err := target.objectURI()
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse target storage URI %s - %w", config.Target.StorageURIStr, err)
-	}
-
-	if sourceStorageType == storage.StorageTypeOCI {
-		sourceObjectURI.Region = config.Source.OCIOSDataStore.Config.Region
-		if !strings.HasSuffix(sourceObjectURI.Prefix, "/") && sourceObjectURI.Prefix != "" {
-			sourceObjectURI.Prefix += "/"
-		}
-	}
-	if targetStorageType == storage.StorageTypeOCI {
-		targetObjectURI.Region = config.Target.OCIOSDataStore.Config.Region
-		if !strings.HasSuffix(targetObjectURI.Prefix, "/") && targetObjectURI.Prefix != "" {
-			targetObjectURI.Prefix += "/"
-		}
+		return nil, err
 	}
 
 	return &ReplicaAgent{
@@ -123,6 +112,51 @@ func NewReplicaAgent(config *Config) (*ReplicaAgent, error) {
 			Target:            *targetObjectURI,
 		},
 	}, nil
+}
+
+// replicationSide is one end of a copy: the word for it in messages, the
+// storage URI the operator wrote, its storage type and, for OCI, the object
+// store configured for that end.
+type replicationSide struct {
+	role        string
+	uriStr      string
+	storageType storage.StorageType
+	store       *ociobjectstore.OCIOSDataStore
+}
+
+// objectURI parses the side's storage URI. An OCI side copies through its
+// configured object store, which reads only its own region: a region the URI
+// names must be that one. A prefix ends in a slash so the listing stays
+// inside it.
+func (s replicationSide) objectURI() (*ociobjectstore.ObjectURI, error) {
+	objectURI, err := storage.NewObjectURI(s.uriStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %s storage URI %s - %w", s.role, s.uriStr, err)
+	}
+	if s.storageType != storage.StorageTypeOCI {
+		return objectURI, nil
+	}
+	if err := s.regionMismatch(objectURI.Region); err != nil {
+		return nil, err
+	}
+	objectURI.Region = s.store.Config.Region
+	if objectURI.Prefix != "" && !strings.HasSuffix(objectURI.Prefix, "/") {
+		objectURI.Prefix += "/"
+	}
+	return objectURI, nil
+}
+
+// regionMismatch refuses a region the URI names that is not the object
+// store's configured region, naming both.
+func (s replicationSide) regionMismatch(uriRegion string) error {
+	configured := s.store.Config.Region
+	if uriRegion == "" || uriRegion == configured {
+		return nil
+	}
+	if configured == "" {
+		return fmt.Errorf("the %s storage URI %s names region %s, but the %s object store has no configured region", s.role, s.uriStr, uriRegion, s.role)
+	}
+	return fmt.Errorf("the %s storage URI %s names region %s, but the %s object store is configured for region %s", s.role, s.uriStr, uriRegion, s.role, configured)
 }
 
 // Start initiates the replication process.

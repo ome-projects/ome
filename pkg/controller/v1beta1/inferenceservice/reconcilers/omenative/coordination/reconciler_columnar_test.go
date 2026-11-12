@@ -13,7 +13,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
-// TestReconcile_GroupObservationDecodesColumnarV2 pins the observation read
+// TestReconcile_GroupObservationDecodesColumnarV2 checks the observation read
 // path at the reconcile level: the cached client carries no row decoder, so
 // the reconcile must pair it with the decoder the live reader carries. With a
 // ColumnarV2-stored InferenceReplica in a declared group, the pass succeeds

@@ -91,7 +91,7 @@ func TestNewInferenceServicesConfig(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			config, err := NewInferenceServicesConfig(clientset)
+			config, err := NewInferenceServicesConfigCached(NewConfigCache(0), clientset)
 			if tt.expectedError {
 				assert.Error(t, err)
 				return
@@ -505,10 +505,100 @@ func TestNewIngressConfig(t *testing.T) {
 				assert.True(t, cfg.PerISVCSubdomain)
 				assert.Equal(t, "serving", cfg.SharedHostPrefix)
 				assert.Equal(t, "internal", cfg.OmeIngressGatewayClass)
+				assert.Empty(t, cfg.ClusterDomain, "no in-code cluster domain")
 				require.Len(t, cfg.AdditionalIngressGateways, 1)
 				assert.Equal(t, "envoy-gateway-system/ext-gw", cfg.AdditionalIngressGateways[0].OmeIngressGateway)
 				assert.Equal(t, "ext.example.com", cfg.AdditionalIngressGateways[0].IngressDomain)
 				assert.Equal(t, "external", cfg.AdditionalIngressGateways[0].Class)
+			},
+		},
+		{
+			name: "route provider capabilities declared per provider",
+			configMapData: map[string]string{
+				IngressConfigKeyName: `{
+					"ingressGateway": "istio-ingress",
+					"ingressService": "istio-ingress",
+					"enableGatewayAPI": true,
+					"routeProviderCapabilities": {
+						"GatewayAPI": ["weightedRevisionRouting"],
+						"None": []
+					}
+				}`,
+			},
+			expectedError: false,
+			validateConfig: func(t *testing.T, cfg *IngressConfig) {
+				assert.Equal(t, RouteProviderGatewayAPI, cfg.RouteProvider())
+				caps := cfg.RouteCapabilities()
+				assert.True(t, caps.Known)
+				assert.Equal(t, string(RouteProviderGatewayAPI), caps.Provider)
+				assert.True(t, caps.Has(constants.RouteCapabilityWeightedRevisionRouting))
+
+				// The per-InferenceService override that disables ingress
+				// creation resolves to the None provider, declared incapable.
+				disabled := *cfg
+				disabled.DisableIngressCreation = true
+				assert.Equal(t, RouteProviderNone, disabled.RouteProvider())
+				none := disabled.RouteCapabilities()
+				assert.True(t, none.Known)
+				assert.False(t, none.Has(constants.RouteCapabilityWeightedRevisionRouting))
+
+				// A provider absent from the declaration has unknown capabilities.
+				plain := *cfg
+				plain.EnableGatewayAPI = false
+				assert.Equal(t, RouteProviderKubernetesIngress, plain.RouteProvider())
+				assert.False(t, plain.RouteCapabilities().Known)
+			},
+		},
+		{
+			name: "route provider capabilities absent leaves every provider unknown",
+			configMapData: map[string]string{
+				IngressConfigKeyName: `{
+					"ingressGateway": "istio-ingress",
+					"ingressService": "istio-ingress"
+				}`,
+			},
+			expectedError: false,
+			validateConfig: func(t *testing.T, cfg *IngressConfig) {
+				assert.Equal(t, RouteProviderKubernetesIngress, cfg.RouteProvider())
+				caps := cfg.RouteCapabilities()
+				assert.False(t, caps.Known)
+				assert.Equal(t, string(RouteProviderKubernetesIngress), caps.Provider)
+			},
+		},
+		{
+			name: "unknown route provider rejected",
+			configMapData: map[string]string{
+				IngressConfigKeyName: `{
+					"ingressGateway": "istio-ingress",
+					"ingressService": "istio-ingress",
+					"routeProviderCapabilities": {"Istio": ["weightedRevisionRouting"]}
+				}`,
+			},
+			expectedError: true,
+		},
+		{
+			name: "unknown route capability rejected",
+			configMapData: map[string]string{
+				IngressConfigKeyName: `{
+					"ingressGateway": "istio-ingress",
+					"ingressService": "istio-ingress",
+					"routeProviderCapabilities": {"GatewayAPI": ["weightedRevisions"]}
+				}`,
+			},
+			expectedError: true,
+		},
+		{
+			name: "cluster domain is read from the block",
+			configMapData: map[string]string{
+				IngressConfigKeyName: `{
+					"ingressGateway": "istio-ingress",
+					"ingressService": "istio-ingress",
+					"clusterDomain": "example.org"
+				}`,
+			},
+			expectedError: false,
+			validateConfig: func(t *testing.T, cfg *IngressConfig) {
+				assert.Equal(t, "example.org", cfg.ClusterDomain)
 			},
 		},
 		{
@@ -1354,6 +1444,38 @@ func TestDeployConfig_UpdateStrategyDefaults(t *testing.T) {
 			}
 			require.NoError(t, err)
 			tt.validate(t, cfg)
+		})
+	}
+}
+
+// ClusterDomainCached reads ingress.clusterDomain and nothing else of the
+// block, so a controller that only renders in-cluster hostnames is not held
+// to the block's other requirements; an absent block or domain reads empty.
+func TestClusterDomainCached(t *testing.T) {
+	cases := []struct {
+		name    string
+		data    map[string]string
+		want    string
+		wantErr bool
+	}{
+		{name: "configured", data: map[string]string{IngressConfigKeyName: `{"clusterDomain": "example.org"}`}, want: "example.org"},
+		{name: "block without a domain", data: map[string]string{IngressConfigKeyName: `{"ingressGateway": "a/b", "ingressService": "c"}`}},
+		{name: "no ingress block", data: map[string]string{}},
+		{name: "malformed block", data: map[string]string{IngressConfigKeyName: `{`}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientset := fake.NewSimpleClientset(&v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: constants.InferenceServiceConfigMapName, Namespace: constants.OMENamespace},
+				Data:       tc.data,
+			})
+			got, err := ClusterDomainCached(NewConfigCache(0), clientset)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
 		})
 	}
 }

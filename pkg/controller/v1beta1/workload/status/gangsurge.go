@@ -218,22 +218,9 @@ func StampGangSurgeTargetReady(
 			GangSurgeActiveTargetClaimMatches(&currentTarget, targetRevision)
 	})
 	mutation.Postcondition = func(row *types.InstanceStatus) bool {
-		return row != nil && row.Index == target.Index &&
-			row.Incarnation == target.Incarnation &&
-			row.ActiveOrdinal == target.ActiveOrdinal &&
-			row.Phase == types.InstancePhaseReady &&
-			row.RunningRevision == targetRevision &&
-			row.TargetRevision == "" && row.Operation == nil
+		return promotedRow(row, target, targetRevision)
 	}
-	mutation.OnCommit = write.recordCommit
-	promoted, err := write.commit(ctx, input, []types.InstanceMutation{mutation}, "", nil)
-	if err != nil || !promoted {
-		return false, err
-	}
-	if err := RetryBlockPruneOnPromote(ctx, input, targetRevision); err != nil {
-		return false, err
-	}
-	return true, nil
+	return write.promote(ctx, input, mutation, targetRevision)
 }
 
 // ResetGangSurgeSource releases a source claim whose target slot turned
@@ -251,13 +238,7 @@ func ResetGangSurgeSource(
 ) (bool, error) {
 	sourceIdentity := Capture(source)
 	targetIdentity := Capture(target)
-	reset := AbandonedSurgeSourceMutation(source.Index, source.RunningRevision, input.Now())
-	reset.Postcondition = func(row *types.InstanceStatus) bool {
-		return row != nil && row.Index == source.Index &&
-			row.Incarnation == source.Incarnation &&
-			AbandonedSurgeSourceSettled(row, source.RunningRevision) &&
-			row.ActiveOrdinal == source.ActiveOrdinal
-	}
+	reset := stoppedSurgeSourceReset(source, source.RunningRevision, input.Now())
 
 	if input.ApplyInstanceMutationsWithRetryBlock != nil {
 		write, err := newGuardedWrite(input)
@@ -319,11 +300,11 @@ func StampGangSurgeTargetCleanupStep(
 }
 
 // RestoreGangSurgeTargetCleanup closes the resumable gap between a
-// source whose surge is being abandoned and the cleanup marker its
-// target should carry: an absent slot gets the cleanup marker, a live
-// marker is moved to the cleanup step, and an existing cleanup marker
+// source whose surge is being abandoned and the cleanup claim its
+// target should carry: an absent slot gets the cleanup claim, a live
+// claim is moved to the cleanup step, and an existing cleanup claim
 // is confirmed. Fenced on the source identity. Reports whether the
-// cleanup marker is in place afterwards.
+// cleanup claim is in place afterwards.
 func RestoreGangSurgeTargetCleanup(
 	ctx context.Context,
 	input types.ReconcileInput,
@@ -336,47 +317,21 @@ func RestoreGangSurgeTargetCleanup(
 	if err != nil {
 		return false, err
 	}
-
-	desired := gangSurgeTargetRow(surgeIdx, targetRevision, types.UpdateStepGangSurgeTargetCleanup, timeout, metav1.NewTime(input.Now()))
-	sourceIdentity := Capture(source)
-	mutation := types.InstanceMutation{
-		Index: surgeIdx,
-		Mutate: func(row *types.InstanceStatus) bool {
-			if GangSurgeCleanupTargetClaimMatches(row, targetRevision) {
-				write.confirmed = true
-				return false
-			}
-			if GangSurgeActiveTargetClaimMatches(row, targetRevision) {
-				row.Operation.Step = types.UpdateStepGangSurgeTargetCleanup
-				return true
-			}
-			if !EmptyGangSurgeTargetSlot(row) {
-				return false
-			}
-			*row = Clone(desired)
-			return true
+	claim, err := write.restoreGangSurgeSlot(ctx, input, gangSurgeSlotRestore{
+		source:   source,
+		surgeIdx: surgeIdx,
+		revision: targetRevision,
+		step:     types.UpdateStepGangSurgeTargetCleanup,
+		timeout:  timeout,
+		moveClaim: func(row *types.InstanceStatus) {
+			row.Operation.Step = types.UpdateStepGangSurgeTargetCleanup
 		},
-		BatchPrecondition: write.guard(func(rows types.InstanceMutationSnapshot) bool {
-			if !sourceIdentity.holds(rows) {
-				return false
-			}
-			currentTarget, found := rows.Instances[surgeIdx]
-			if !found {
-				return true
-			}
-			if GangSurgeCleanupTargetClaimMatches(&currentTarget, targetRevision) {
-				write.confirmed = true
-				return true
-			}
-			return GangSurgeActiveTargetClaimMatches(&currentTarget, targetRevision)
-		}),
-		Postcondition: func(row *types.InstanceStatus) bool {
+		settled: func(row, _ *types.InstanceStatus) bool {
 			return row != nil && row.Index == surgeIdx &&
 				GangSurgeCleanupTargetClaimMatches(row, targetRevision)
 		},
-		OnCommit: write.recordCommit,
-	}
-	return write.commit(ctx, input, []types.InstanceMutation{mutation}, "", nil)
+	})
+	return claim != GangSurgeTargetMarkerUnclaimed, err
 }
 
 // ResetGangSurgeSourceAndRemoveMarker ends an abandoned gang surge in
@@ -402,32 +357,32 @@ func ResetGangSurgeSourceAndRemoveMarker(
 	if source == nil {
 		return false, nil
 	}
-	reset := AbandonedSurgeSourceMutation(source.Index, sourceRunningRev, input.Now())
+	reset := stoppedSurgeSourceReset(source, sourceRunningRev, input.Now())
+	var counted *countedFailure
+	if input.MutateRetryBlock != nil && failedTargetRev != "" {
+		failure := AttemptFailure{TargetRevision: failedTargetRev, Reason: failureReason, Cause: cause}
+		counted = failure.counted(input, metav1.NewTime(input.Now()))
+	}
+	committed, err := endGangSurgePair(ctx, deps, input, source, marker, surgeIdx, sourceRunningRev, reset, counted.revision(), counted.write())
+	if err == nil && committed && counted.heldAttempts() > 0 && input.WarnRetryHeld != nil {
+		input.WarnRetryHeld(failedTargetRev, counted.heldAttempts(), failureReason)
+	}
+	return committed, err
+}
+
+// stoppedSurgeSourceReset is the write that returns the source of a gang surge
+// that stopped to runningRevision, with the postcondition that the row written
+// is the source read, settled there: the same identity, Ready on the revision,
+// or Failed with no operation when it ran none.
+func stoppedSurgeSourceReset(source *types.InstanceStatus, runningRevision string, now time.Time) types.InstanceMutation {
+	reset := AbandonedSurgeSourceMutation(source.Index, runningRevision, now)
 	reset.Postcondition = func(row *types.InstanceStatus) bool {
 		return row != nil && row.Index == source.Index &&
 			row.Incarnation == source.Incarnation &&
-			AbandonedSurgeSourceSettled(row, sourceRunningRev) &&
+			AbandonedSurgeSourceSettled(row, runningRevision) &&
 			row.ActiveOrdinal == source.ActiveOrdinal
 	}
-	var retryRevision string
-	var mutateRetryBlock func(*types.RetryBlock) types.RetryBlockDisposition
-	heldAttempts := int32(0)
-	if input.MutateRetryBlock != nil && failedTargetRev != "" {
-		retryRevision = failedTargetRev
-		now := metav1.NewTime(input.Now())
-		mutateRetryBlock = func(block *types.RetryBlock) types.RetryBlockDisposition {
-			var disposition types.RetryBlockDisposition
-			disposition, heldAttempts = types.ApplyUpdateFailureToRetryBlock(
-				block, input.UpdateRetryPolicy, now, failureReason, cause,
-			)
-			return disposition
-		}
-	}
-	committed, err := endGangSurgePair(ctx, deps, input, source, marker, surgeIdx, sourceRunningRev, reset, retryRevision, mutateRetryBlock)
-	if err == nil && committed && heldAttempts > 0 && input.WarnRetryHeld != nil {
-		input.WarnRetryHeld(failedTargetRev, heldAttempts, failureReason)
-	}
-	return committed, err
+	return reset
 }
 
 // HoldGangSurgeSourceAndRemoveMarker ends a gang surge whose pinned
@@ -554,8 +509,8 @@ const (
 )
 
 // RestoreGangSurgeTarget closes the resumable gap between the source's
-// committed surge claim and its target marker. The result identifies the
-// authoritative marker state. The strong path binds target creation to
+// committed surge claim and its target claim. The result identifies the
+// authoritative claim state. The strong path binds target creation to
 // the exact source operation on every conflict retry.
 func RestoreGangSurgeTarget(
 	ctx context.Context,
@@ -581,63 +536,122 @@ func RestoreGangSurgeTarget(
 	if err != nil {
 		return GangSurgeTargetMarkerUnclaimed, err
 	}
+	return write.restoreGangSurgeSlot(ctx, input, gangSurgeSlotRestore{
+		source:   source,
+		surgeIdx: surgeIdx,
+		revision: targetRev,
+		step:     types.UpdateStepGangSurgeTarget,
+		timeout:  timeout,
+		settled:  sameRestoredGangSurgeTarget,
+	})
+}
 
-	desired := gangSurgeTargetRow(surgeIdx, targetRev, types.UpdateStepGangSurgeTarget, timeout, metav1.NewTime(input.Now()))
-	sourceIdentity := Capture(source)
-	resolution := GangSurgeTargetMarkerUnclaimed
-	confirm := func(marker GangSurgeTargetMarker) {
-		resolution = marker
-		write.confirmed = true
+// gangSurgeSlotRestore names the form a pair's replacement row takes at
+// the surge index: the claim at step for revision, under the source as
+// the pass read it, with the deadline timeout gives. moveClaim is what
+// the write does with the pair's claim found at the other step; nil
+// leaves such a claim as it stands and counts it done. settled is the
+// postcondition, asked with the row an empty slot is claimed with.
+type gangSurgeSlotRestore struct {
+	source    *types.InstanceStatus
+	surgeIdx  int32
+	revision  string
+	step      string
+	timeout   time.Duration
+	moveClaim func(*types.InstanceStatus)
+	settled   func(row, desired *types.InstanceStatus) bool
+}
+
+// restoreGangSurgeSlot is the write both restores share: it puts the
+// pair's replacement row at the surge index into the form r names,
+// fenced on the source identity. An empty slot is claimed; the pair's
+// claim already at r.step is confirmed; the pair's claim at the other
+// step is moved by r.moveClaim or, with none, confirmed as it stands;
+// any other occupant stops the write. Reports what the slot holds once
+// the write is done (the live claim, the cleanup claim, or the row this
+// pass wrote), Unclaimed when the rows moved under the write or it
+// failed.
+func (w *guardedWrite) restoreGangSurgeSlot(ctx context.Context, input types.ReconcileInput, r gangSurgeSlotRestore) (GangSurgeTargetMarker, error) {
+	desired := gangSurgeTargetRow(r.surgeIdx, r.revision, r.step, r.timeout, metav1.NewTime(input.Now()))
+	sourceIdentity := Capture(r.source)
+	wanted := gangSurgeClaimAt(r.step)
+	holds := GangSurgeTargetMarkerUnclaimed
+	// confirmed records that the slot already carries claim: the write is
+	// done without writing.
+	confirmed := func(claim GangSurgeTargetMarker) {
+		holds, w.confirmed = claim, true
+	}
+	// answer is what the write does with the row in the slot. Reports
+	// whether the row changed.
+	answer := func(row *types.InstanceStatus) bool {
+		switch claim := gangSurgeClaimOf(row, r.revision); {
+		case claim == GangSurgeTargetMarkerUnclaimed:
+			if !EmptyGangSurgeTargetSlot(row) {
+				return false
+			}
+			*row = Clone(desired)
+			return true
+		case claim != wanted && r.moveClaim != nil:
+			r.moveClaim(row)
+			return true
+		default:
+			confirmed(claim)
+			return false
+		}
 	}
 	mutation := types.InstanceMutation{
-		Index: surgeIdx,
-		Mutate: func(status *types.InstanceStatus) bool {
-			if GangSurgeActiveTargetClaimMatches(status, targetRev) {
-				confirm(GangSurgeTargetMarkerActive)
-				return false
-			}
-			if GangSurgeCleanupTargetClaimMatches(status, targetRev) {
-				confirm(GangSurgeTargetMarkerCleanup)
-				return false
-			}
-			if !EmptyGangSurgeTargetSlot(status) {
-				return false
-			}
-			*status = Clone(desired)
-			return true
-		},
-		BatchPrecondition: write.guard(func(rows types.InstanceMutationSnapshot) bool {
-			resolution = GangSurgeTargetMarkerUnclaimed
+		Index:  r.surgeIdx,
+		Mutate: answer,
+		BatchPrecondition: w.guard(func(rows types.InstanceMutationSnapshot) bool {
+			holds = GangSurgeTargetMarkerUnclaimed
 			if !sourceIdentity.holds(rows) {
 				return false
 			}
-			currentTarget, found := rows.Instances[surgeIdx]
+			current, found := rows.Instances[r.surgeIdx]
 			if !found {
 				return true
 			}
-			if GangSurgeActiveTargetClaimMatches(&currentTarget, targetRev) {
-				confirm(GangSurgeTargetMarkerActive)
-				return true
+			claim := gangSurgeClaimOf(&current, r.revision)
+			if claim == GangSurgeTargetMarkerUnclaimed {
+				return false
 			}
-			if GangSurgeCleanupTargetClaimMatches(&currentTarget, targetRev) {
-				confirm(GangSurgeTargetMarkerCleanup)
-				return true
+			if claim == wanted || r.moveClaim == nil {
+				confirmed(claim)
 			}
-			return false
+			return true
 		}),
-		Postcondition: func(status *types.InstanceStatus) bool {
-			return sameRestoredGangSurgeTarget(status, &desired)
+		Postcondition: func(row *types.InstanceStatus) bool {
+			return r.settled(row, &desired)
 		},
 		OnCommit: func(_, _ *types.InstanceStatus) {
-			resolution = GangSurgeTargetMarkerRestored
-			write.committed = true
+			holds, w.committed = GangSurgeTargetMarkerRestored, true
 		},
 	}
-	done, err := write.commit(ctx, input, []types.InstanceMutation{mutation}, "", nil)
+	done, err := w.commit(ctx, input, []types.InstanceMutation{mutation}, "", nil)
 	if err != nil || !done {
 		return GangSurgeTargetMarkerUnclaimed, err
 	}
-	return resolution, nil
+	return holds, nil
+}
+
+// gangSurgeClaimOf reports the pair's claim row carries for revision:
+// the live claim, the cleanup claim, or Unclaimed for anything else.
+func gangSurgeClaimOf(row *types.InstanceStatus, revision string) GangSurgeTargetMarker {
+	switch {
+	case GangSurgeActiveTargetClaimMatches(row, revision):
+		return GangSurgeTargetMarkerActive
+	case GangSurgeCleanupTargetClaimMatches(row, revision):
+		return GangSurgeTargetMarkerCleanup
+	}
+	return GangSurgeTargetMarkerUnclaimed
+}
+
+// gangSurgeClaimAt is the claim a target row at step reads as.
+func gangSurgeClaimAt(step string) GangSurgeTargetMarker {
+	if step == types.UpdateStepGangSurgeTargetCleanup {
+		return GangSurgeTargetMarkerCleanup
+	}
+	return GangSurgeTargetMarkerActive
 }
 
 // EmptyGangSurgeTargetSlot reports whether a slot carries nothing at all
@@ -666,18 +680,22 @@ func GangSurgeTargetClaimMatches(status *types.InstanceStatus, targetRevision st
 
 // GangSurgeActiveTargetClaimMatches reports the live target claim.
 func GangSurgeActiveTargetClaimMatches(status *types.InstanceStatus, targetRevision string) bool {
-	return status != nil && status.TargetRevision == targetRevision && status.Operation != nil &&
-		status.Operation.Type == types.InstanceOperationUpdate &&
-		status.Operation.Step == types.UpdateStepGangSurgeTarget &&
-		status.Operation.TargetRevision == targetRevision
+	return gangSurgeTargetClaim(status, targetRevision, types.UpdateStepGangSurgeTarget)
 }
 
 // GangSurgeCleanupTargetClaimMatches reports the cleanup claim: the
 // marker a collection of the surge slot is running under.
 func GangSurgeCleanupTargetClaimMatches(status *types.InstanceStatus, targetRevision string) bool {
+	return gangSurgeTargetClaim(status, targetRevision, types.UpdateStepGangSurgeTargetCleanup)
+}
+
+// gangSurgeTargetClaim reports a target slot's claim for targetRevision at
+// step: an Update operation at that step toward targetRevision, on a row
+// converging toward it.
+func gangSurgeTargetClaim(status *types.InstanceStatus, targetRevision, step string) bool {
 	return status != nil && status.TargetRevision == targetRevision && status.Operation != nil &&
 		status.Operation.Type == types.InstanceOperationUpdate &&
-		status.Operation.Step == types.UpdateStepGangSurgeTargetCleanup &&
+		status.Operation.Step == step &&
 		status.Operation.TargetRevision == targetRevision
 }
 
@@ -689,9 +707,11 @@ func sameRestoredGangSurgeTarget(current, desired *types.InstanceStatus) bool {
 
 // StampReplacementLost records on a gang surge SOURCE that its replacement
 // gang lost members after the hand-over: Phase Failed with the operation
-// kept, termination on LastFailure. The attempt that died is closed for the
-// ladder to count; a later pass re-arms or holds it. A row already Failed
-// on the same loss, or one with no operation left, is a no-op.
+// kept and its deadline cleared (keepOperationWithoutDeadline), termination
+// on LastFailure. The attempt that died is closed for the retry record to
+// count; a later pass starts the next attempt under a deadline of its own,
+// or holds the pair. A row already Failed on the same loss, or one with no
+// operation left, is a no-op.
 func StampReplacementLost(termination *types.InstanceTermination) func(*types.InstanceStatus) bool {
 	return func(s *types.InstanceStatus) bool {
 		if s.Phase == "" || s.Operation == nil {
@@ -700,7 +720,7 @@ func StampReplacementLost(termination *types.InstanceTermination) func(*types.In
 		changed := false
 		if s.Phase != types.InstancePhaseFailed {
 			s.Phase = types.InstancePhaseFailed
-			clearPlacementWait(s)
+			keepOperationWithoutDeadline(s)
 			changed = true
 		}
 		if termination != nil && !sameFailureIdentity(s.LastFailure, termination) {

@@ -68,36 +68,38 @@ func PeerEnvDeclared(isvc *v1beta1.InferenceService) bool {
 // pod for one peer Component. isvcName names the InferenceService, whose
 // stable per-Component Service the generic form resolves; peerPrefix is
 // the peer replica's name prefix (prefixFor), which its per-revision
-// Services are named with. peerRevisionHash, when non-empty, must be a
+// Services are named with. clusterDomain is the cluster's DNS domain from
+// the operator configuration (ingress.clusterDomain); empty renders the
+// namespaced short names. peerRevisionHash, when non-empty, must be a
 // revision hash of the PEER — each Component hashes its own template, so
 // the rendered pod's own hash never names a peer revision. Callers without
 // a peer hash pass "" and get only the generic form (InjectPeerEnv skips
 // the revision pair). The function does not do I/O.
-func BuildPeerEndpointEnv(isvcName, peerPrefix, namespace string, peer v1beta1.ComponentType, peerRevisionHash string) PeerEndpointEnv {
+func BuildPeerEndpointEnv(isvcName, peerPrefix, namespace, clusterDomain string, peer v1beta1.ComponentType, peerRevisionHash string) PeerEndpointEnv {
 	upper := strings.ToUpper(string(peer))
 	return PeerEndpointEnv{
 		Peer:          peer,
 		GenericName:   fmt.Sprintf("OME_%s_ENDPOINT", upper),
-		GenericValue:  genericPeerDNS(isvcName, peer, namespace),
+		GenericValue:  genericPeerDNS(isvcName, peer, namespace, clusterDomain),
 		RevisionName:  fmt.Sprintf("OME_%s_REVISION_ENDPOINT", upper),
-		RevisionValue: revisionPeerDNS(peerPrefix, peer, peerRevisionHash, namespace),
+		RevisionValue: revisionPeerDNS(peerPrefix, peer, peerRevisionHash, namespace, clusterDomain),
 	}
 }
 
 // genericPeerDNS returns the in-cluster DNS for the revision-agnostic
 // per-Component Service. The OMENative reconciler emits one of these
 // per Component (`<isvc>-<peer>`).
-func genericPeerDNS(isvc string, peer v1beta1.ComponentType, namespace string) string {
-	return fmt.Sprintf("%s-%s.%s.%s", isvc, peer, namespace, constants.ClusterLocalDomain)
+func genericPeerDNS(isvc string, peer v1beta1.ComponentType, namespace, clusterDomain string) string {
+	return constants.ServiceHostname(fmt.Sprintf("%s-%s", isvc, peer), namespace, clusterDomain)
 }
 
 // revisionPeerDNS returns the in-cluster DNS for the per-revision peer
 // Service. The OMENative coordination layer creates one of these per
 // (Component, revisionHash) pair under the peer replica's prefix.
-func revisionPeerDNS(peerPrefix string, peer v1beta1.ComponentType, revisionHash, namespace string) string {
+func revisionPeerDNS(peerPrefix string, peer v1beta1.ComponentType, revisionHash, namespace, clusterDomain string) string {
 	// Derive from PerRevisionServiceName so the peer DNS always matches
 	// the (bounded) routing Service name coordination actually creates.
-	return fmt.Sprintf("%s.%s.%s", PerRevisionServiceName(peerPrefix, peer, revisionHash), namespace, constants.ClusterLocalDomain)
+	return constants.ServiceHostname(PerRevisionServiceName(peerPrefix, peer, revisionHash), namespace, clusterDomain)
 }
 
 // InjectPeerEnv overlays the OME_<PEER>_ENDPOINT and
@@ -106,7 +108,8 @@ func revisionPeerDNS(peerPrefix string, peer v1beta1.ComponentType, revisionHash
 // vars with the same Name are replaced — coordination's values are
 // authoritative. Each peer's revision endpoint is named with that peer
 // replica's own prefix, so a referenced peer resolves as well as a
-// projected one.
+// projected one. clusterDomain is the cluster's DNS domain from the
+// operator configuration; empty renders the namespaced short names.
 //
 // If revisionHashFor is nil only the generic env var is emitted. A
 // non-nil revisionHashFor must return a revision hash of the PEER it is
@@ -114,7 +117,7 @@ func revisionPeerDNS(peerPrefix string, peer v1beta1.ComponentType, revisionHash
 //
 // The peers slice should be deduplicated and stable in order;
 // callers typically pass coordination.ServingPeers(...).
-func InjectPeerEnv(pod *corev1.Pod, isvc *v1beta1.InferenceService, peers []v1beta1.ComponentType, revisionHashFor func(v1beta1.ComponentType) string) {
+func InjectPeerEnv(pod *corev1.Pod, isvc *v1beta1.InferenceService, clusterDomain string, peers []v1beta1.ComponentType, revisionHashFor func(v1beta1.ComponentType) string) {
 	if pod == nil || isvc == nil || len(peers) == 0 {
 		return
 	}
@@ -125,7 +128,7 @@ func InjectPeerEnv(pod *corev1.Pod, isvc *v1beta1.InferenceService, peers []v1be
 		if revisionHashFor != nil {
 			hash = revisionHashFor(peer)
 		}
-		peerEnv := BuildPeerEndpointEnv(isvc.Name, prefixFor(isvc, peer), isvc.Namespace, peer, hash)
+		peerEnv := BuildPeerEndpointEnv(isvc.Name, prefixFor(isvc, peer), isvc.Namespace, clusterDomain, peer, hash)
 		envs = append(envs, corev1.EnvVar{Name: peerEnv.GenericName, Value: peerEnv.GenericValue})
 		owned[peerEnv.GenericName] = struct{}{}
 		if hash != "" {

@@ -184,14 +184,9 @@ func TestDiffusionPipelineMatching(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			compatible, err := matcher.IsCompatible(tt.runtime, tt.model, isvc, "diffusion-rt")
-			assert.NoError(t, err)
-			assert.Equal(t, tt.wantCompatible, compatible)
-
 			report, err := matcher.GetCompatibilityDetails(tt.runtime, tt.model, isvc, "diffusion-rt")
 			assert.NoError(t, err)
-			assert.Equal(t, tt.wantCompatible, report.IsCompatible,
-				"IsCompatible and GetCompatibilityDetails must agree")
+			assert.Equal(t, tt.wantCompatible, report.IsCompatible)
 
 			if tt.wantCompatible {
 				assert.Empty(t, report.IncompatibilityReasons)

@@ -21,21 +21,17 @@ type metadataParams struct {
 }
 
 // Module provides the model metadata extractor via fx
-var Module = fx.Provide(
-	func(params metadataParams) (*MetadataExtractor, error) {
-		config, err := NewConfig(
-			WithViper(params.Viper),
-			WithLogger(params.Logger),
-			WithAppParams(params),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error creating model metadata config: %w", err)
-		}
+var Module = fx.Provide(provideMetadataExtractor)
 
-		// Validate configuration
-		if err := config.Validate(); err != nil {
-			return nil, fmt.Errorf("invalid model metadata config: %w", err)
-		}
+func provideMetadataExtractor(params metadataParams) (*MetadataExtractor, error) {
+	config, err := newConfig(params)
+	if err != nil {
+		return nil, fmt.Errorf("error creating model metadata config: %w", err)
+	}
 
-		return NewMetadataExtractor(config, params.Client, params.Zap)
-	})
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid model metadata config: %w", err)
+	}
+
+	return NewMetadataExtractor(config, params.Client, params.Zap)
+}

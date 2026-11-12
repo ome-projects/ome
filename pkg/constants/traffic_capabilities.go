@@ -45,3 +45,27 @@ const (
 	// rejects the value until a translator declares this capability.
 	TrafficCapabilityEndpointOverrideMetadata = "spec.traffic.endpointOverride.type=Metadata"
 )
+
+// Route-provider capability tokens.
+//
+// Each token names one kind of per-revision traffic intent the route
+// provider can express. The route provider is whatever renders an
+// InferenceService's external route: Gateway API HTTPRoutes, a
+// Kubernetes Ingress, or nothing at all when ingress creation is
+// disabled and requests reach the external Service directly (or
+// through whatever the operator puts in front of it). Operators
+// declare the set per provider in the inferenceservice-config
+// ConfigMap (ingress.routeProviderCapabilities); the admission
+// webhook and the rollout run layer read the same declaration.
+const (
+	// RouteCapabilityWeightedRevisionRouting covers splitting a
+	// Component's external route across its revisions by percentage —
+	// what a canary step's traffic value asks of the provider.
+	RouteCapabilityWeightedRevisionRouting = "weightedRevisionRouting"
+)
+
+// KnownRouteCapabilities lists every route-provider capability token,
+// so a declaration can be checked for typos at config load.
+func KnownRouteCapabilities() []string {
+	return []string{RouteCapabilityWeightedRevisionRouting}
+}

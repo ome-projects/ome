@@ -29,8 +29,6 @@ import (
 type ResolvedUnit struct {
 	Runtime   *Runtime
 	Demand    capacity.UnitDemand
-	Engine    components.ReplicaTemplates
-	Decoder   *components.ReplicaTemplates
 	Rendering map[v1beta1.ComponentType]string
 	Modes     map[v1beta1.ComponentType]constants.DeploymentModeType
 }
@@ -46,8 +44,8 @@ func (u *ResolvedUnit) Check(ctx context.Context) error {
 // ResourceFlavor attribution and proof of member application remain required
 // before the result can authorize a capacity plan.
 func (r Resolver) ResolveUnit(ctx context.Context, desired, standing *v1beta1.InferenceService) (*ResolvedUnit, error) {
-	if r.OperatorNamespace == "" {
-		return nil, fmt.Errorf("replica rendering requires the member operator namespace")
+	if err := requireOperatorNamespace(r.OperatorNamespace, "replica rendering"); err != nil {
+		return nil, err
 	}
 	rt, err := r.Resolve(ctx, desired, standing)
 	if err != nil {
@@ -69,11 +67,9 @@ func (r Resolver) ResolveUnit(ctx context.Context, desired, standing *v1beta1.In
 	if err != nil {
 		return nil, err
 	}
-	out := &ResolvedUnit{Runtime: rt, Modes: member.resolved.Modes, Engine: rendered.engine.templates, Rendering: map[v1beta1.ComponentType]string{}}
+	out := &ResolvedUnit{Runtime: rt, Modes: member.resolved.Modes, Rendering: map[v1beta1.ComponentType]string{}}
 	unit := capacity.ReplicaUnit{Units: maps.Clone(r.ComponentUnits), Engine: rendered.engine.pods}
 	if rendered.decoder != nil {
-		templates := rendered.decoder.templates
-		out.Decoder = &templates
 		unit.Decoder = rendered.decoder.pods
 	}
 	for _, component := range rendered.components() {
@@ -109,18 +105,18 @@ type renderingConfig struct {
 // readRenderingConfig reads the operator configuration from the member; the
 // accelerator resource names must be configured for a demand to be measured.
 func (r Resolver) readRenderingConfig(ctx context.Context, reads client.Reader) (renderingConfig, error) {
-	cm := &corev1.ConfigMap{}
-	if err := reads.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: constants.InferenceServiceConfigMapName}, cm); err != nil {
+	configMap, err := r.operatorConfigMap(ctx, reads)
+	if err != nil {
 		return renderingConfig{}, err
 	}
-	settings, deploy, err := controllerconfig.RenderingConfig(cm)
+	settings, deploy, err := controllerconfig.RenderingConfig(configMap)
 	if err != nil {
 		return renderingConfig{}, err
 	}
 	if len(settings.AcceleratorResources) == 0 {
 		return renderingConfig{}, fmt.Errorf("replica rendering requires configured member accelerator resources")
 	}
-	return renderingConfig{configMap: cm, settings: settings, deploy: deploy}, nil
+	return renderingConfig{configMap: configMap, settings: settings, deploy: deploy}, nil
 }
 
 // memberRendering is what every component of the member service renders from:

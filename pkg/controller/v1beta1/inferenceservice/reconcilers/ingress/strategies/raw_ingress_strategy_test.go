@@ -134,7 +134,7 @@ func TestKubernetesIngressStrategy_Reconcile(t *testing.T) {
 			isvc: createTestInferenceServiceRaw("test-isvc", "default"),
 			ingressConfig: &controllerconfig.IngressConfig{
 				EnableGatewayAPI:       false,
-				IngressDomain:          constants.ClusterLocalDomain,
+				IngressDomain:          "svc.cluster.local",
 				IngressClassName:       ptr.To("nginx"),
 				DomainTemplate:         "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
 				UrlScheme:              "https",
@@ -175,7 +175,9 @@ func TestKubernetesIngressStrategy_Reconcile(t *testing.T) {
 				setComponentStatusReadyRaw(tt.isvc)
 			}
 
-			objs := []client.Object{tt.isvc}
+			// The URL names the target Service's port, so every pass that
+			// reaches it reads a Service that declares one.
+			objs := []client.Object{tt.isvc, targetServiceRaw(tt.isvc, 8080)}
 			if tt.existingIngress != nil {
 				objs = append(objs, tt.existingIngress)
 			}
@@ -257,29 +259,46 @@ func TestKubernetesIngressStrategy_CreateRawURL(t *testing.T) {
 
 func TestKubernetesIngressStrategy_GetRawServiceHost(t *testing.T) {
 	tests := []struct {
-		name         string
-		isvc         *v1beta1.InferenceService
-		expectedHost string
+		name          string
+		isvc          *v1beta1.InferenceService
+		clusterDomain string
+		expectedHost  string
 	}{
 		{
-			name:         "with router",
-			isvc:         createTestInferenceServiceWithRouterRaw("test-isvc", "default"),
-			expectedHost: "test-isvc-router.default.svc.cluster.local",
+			name:          "with router",
+			isvc:          createTestInferenceServiceWithRouterRaw("test-isvc", "default"),
+			clusterDomain: "cluster.local",
+			expectedHost:  "test-isvc-router.default.svc.cluster.local",
 		},
 		{
 			// Engine Service is named "<isvc>-engine" (constants.EngineServiceName);
 			// "<isvc>" resolves to no Service.
-			name:         "without router",
-			isvc:         createTestInferenceServiceRaw("test-isvc", "default"),
-			expectedHost: "test-isvc-engine.default.svc.cluster.local",
+			name:          "without router",
+			isvc:          createTestInferenceServiceRaw("test-isvc", "default"),
+			clusterDomain: "cluster.local",
+			expectedHost:  "test-isvc-engine.default.svc.cluster.local",
+		},
+		{
+			// The suffix is the cluster domain the ingress block names, not a
+			// value of the binary's own.
+			name:          "configured cluster domain",
+			isvc:          createTestInferenceServiceRaw("test-isvc", "default"),
+			clusterDomain: "example.org",
+			expectedHost:  "test-isvc-engine.default.svc.example.org",
+		},
+		{
+			name:          "no cluster domain renders the short name",
+			isvc:          createTestInferenceServiceRaw("test-isvc", "default"),
+			clusterDomain: "",
+			expectedHost:  "test-isvc-engine.default",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			strategy := createKubernetesIngressStrategy(t)
-			host := strategy.(*KubernetesIngressStrategy).getRawServiceHost(tt.isvc)
-			assert.Equal(t, tt.expectedHost, host)
+			strategy := createKubernetesIngressStrategy(t).(*KubernetesIngressStrategy)
+			strategy.ingressConfig.ClusterDomain = tt.clusterDomain
+			assert.Equal(t, tt.expectedHost, strategy.getRawServiceHost(tt.isvc))
 		})
 	}
 }
@@ -358,6 +377,7 @@ func createKubernetesIngressStrategy(t *testing.T) interfaces.IngressStrategy {
 		IngressConfig: &controllerconfig.IngressConfig{
 			EnableGatewayAPI: false,
 			IngressDomain:    "example.com",
+			ClusterDomain:    "cluster.local",
 			IngressClassName: ptr.To("nginx"),
 			DomainTemplate:   "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
 			UrlScheme:        "https",
@@ -439,6 +459,7 @@ func TestKubernetesIngressStrategy_URLWithPort(t *testing.T) {
 			name: "engine only with custom port",
 			isvc: createTestInferenceServiceRaw("test-isvc", "default"),
 			ingressConfig: &controllerconfig.IngressConfig{
+				ClusterDomain:          "cluster.local",
 				EnableGatewayAPI:       false,
 				IngressDomain:          "example.com",
 				IngressClassName:       ptr.To("nginx"),
@@ -468,6 +489,7 @@ func TestKubernetesIngressStrategy_URLWithPort(t *testing.T) {
 			name: "with router and custom port",
 			isvc: createTestInferenceServiceWithRouterRaw("test-isvc", "default"),
 			ingressConfig: &controllerconfig.IngressConfig{
+				ClusterDomain:          "cluster.local",
 				EnableGatewayAPI:       false,
 				IngressDomain:          "example.com",
 				IngressClassName:       ptr.To("nginx"),
@@ -490,21 +512,6 @@ func TestKubernetesIngressStrategy_URLWithPort(t *testing.T) {
 			},
 			expectedURLHost:     "test-isvc.default.example.com:8082",
 			expectedAddressHost: "test-isvc-router.default.svc.cluster.local:8082",
-		},
-		{
-			name: "service not found uses default port",
-			isvc: createTestInferenceServiceRaw("test-isvc", "default"),
-			ingressConfig: &controllerconfig.IngressConfig{
-				EnableGatewayAPI:       false,
-				IngressDomain:          "example.com",
-				IngressClassName:       ptr.To("nginx"),
-				DomainTemplate:         "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
-				UrlScheme:              "https",
-				DisableIngressCreation: true,
-			},
-			services:            []corev1.Service{}, // No services
-			expectedURLHost:     "test-isvc.default.example.com:8080",
-			expectedAddressHost: "test-isvc-engine.default.svc.cluster.local:8080",
 		},
 	}
 

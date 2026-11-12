@@ -53,6 +53,7 @@ func init() {
 		"pod.admissionRejected":    applyAdmissionRejected,
 		"pod.evicted":              applyEvicted,
 		"pod.nodeLost":             applyNodeLost,
+		"pod.nodeCordoned":         applyNodeCordoned,
 		"pod.waiting":              applyPodWaiting,
 		"pod.unschedulable":        applyUnschedulable,
 		"pod.schedulingGated":      applySchedulingGated,
@@ -68,6 +69,8 @@ func init() {
 		"api.throttled":            applyThrottled,
 		"api.namespaceTerminating": applyRejection(namespaceTerminating, "create"),
 		"api.conflict":             applyConflict,
+		"api.admissionUnavailable": applyAdmissionUnavailable,
+		"api.admissionRestored":    applyAdmissionRestored,
 		"spec.revision":            applySpecRevision,
 		"spec.annotationOnly":      applyAnnotationOnly,
 		"spec.strategy":            applySpecStrategy,
@@ -146,40 +149,57 @@ func requirePod(ev TimelineEvent) (PodRef, error) {
 	return *ev.Args.Pod, nil
 }
 
-// applyGateDeny is the pairing drain gate's answer for one pod: the other
-// pairing Component, which this lane does not model, still needs the pod
-// in rotation, so every drain question naming it is held under the
-// Pairing gate with the reason the scenario states. Only the Pairing
-// verdict is a drain-time answer; the other gates answer at a fresh start,
-// which the driver always admits, so staging them has nothing to hold.
+// applyGateDeny stages a coordination gate's answer. The Pairing answer
+// is the drain-time one, for one pod: the other pairing Component, which
+// this lane does not model, still needs the pod in rotation, so every
+// drain question naming it is held under the Pairing gate with the reason
+// the scenario states. The start-time gates (Ratio, Sequential, Budget)
+// answer a fresh start, so their answer names no pod: from then on every
+// fresh start the update gate is asked about is held under that gate with
+// the reason, the way a group holds a side for its peer; a start the
+// engine exempts from the consult never meets it. The plan gate's and the
+// retry record's answers are the engine's own and cannot be staged.
 func applyGateDeny(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
-	if ev.Variant != string(types.RolloutHoldGatePairing) {
-		return "", fmt.Errorf("replay: %s: only the Pairing verdict is a drain-time answer the driver can stage; the other gates answer at a fresh start, which the driver always admits", ev.Key())
-	}
-	ref, err := requirePod(ev)
-	if err != nil {
-		return "", err
-	}
 	if ev.Args.Message == "" {
 		return "", fmt.Errorf("replay: %s: needs the reason the gate would give (message)", ev.Key())
 	}
-	if d.pairingHolds == nil {
-		d.pairingHolds = map[string]string{}
+	gate := types.RolloutHoldGate(ev.Variant)
+	switch gate {
+	case types.RolloutHoldGatePairing:
+		ref, err := requirePod(ev)
+		if err != nil {
+			return "", err
+		}
+		if d.pairingHolds == nil {
+			d.pairingHolds = map[string]string{}
+		}
+		name := d.podName(ref)
+		d.pairingHolds[name] = ev.Args.Message
+		return "pod=" + name, nil
+	case types.RolloutHoldGateRatio, types.RolloutHoldGateSequential, types.RolloutHoldGateBudget:
+		if ev.Args.Pod != nil {
+			return "", fmt.Errorf("replay: %s: a start-time answer holds every fresh start and names no pod", ev.Key())
+		}
+		d.startHold = startTimeHold{gate: gate, reason: ev.Args.Message}
+		return "gate=" + ev.Variant, nil
 	}
-	name := d.podName(ref)
-	d.pairingHolds[name] = ev.Args.Message
-	return "pod=" + name, nil
+	return "", fmt.Errorf("replay: %s: only the Pairing answer (for a pod) and the start-time answers Ratio, Sequential and Budget can be staged; the plan gate's and the retry record's are the engine's own", ev.Key())
 }
 
-// applyGateAllow lifts the pairing hold on one pod: the other side can
-// pair without it now. A pod no hold names has nothing to lift and fails
-// the run.
+// applyGateAllow ends a staged answer: with a pod, the pairing hold on
+// that pod, since the other side can pair without it now; with none, the
+// start-time gate's standing answer. A hold that is not staged has
+// nothing to end and fails the run.
 func applyGateAllow(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
-	ref, err := requirePod(ev)
-	if err != nil {
-		return "", err
+	if ev.Args.Pod == nil {
+		if d.startHold.reason == "" {
+			return "", fmt.Errorf("replay: gate.allow: no start-time hold is staged to end")
+		}
+		gate := d.startHold.gate
+		d.startHold = startTimeHold{}
+		return "gate=" + string(gate), nil
 	}
-	name := d.podName(ref)
+	name := d.podName(*ev.Args.Pod)
 	if _, held := d.pairingHolds[name]; !held {
 		return "", fmt.Errorf("replay: gate.allow: pod %s carries no Pairing hold to lift", name)
 	}
@@ -407,6 +427,30 @@ func applyPhaseTerminal(ctx context.Context, d *driver, ev TimelineEvent) (strin
 // a pod's Ready condition when the node under it stops reporting.
 const nodeNotReadyReason = "NodeNotReady"
 
+// applyNodeCordoned is an operator cordoning the node under a pod: the
+// Node is marked unschedulable and nothing else changes, the pod keeps
+// running. The engine reads the cordon only while the Component holds more
+// Instances than it wants, as the order of its scale-down.
+func applyNodeCordoned(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
+	ref, err := requirePod(ev)
+	if err != nil {
+		return "", err
+	}
+	name := d.podName(ref)
+	pod, err := d.getPod(ctx, name)
+	if err != nil {
+		return "", err
+	}
+	if pod.Spec.NodeName == "" {
+		return "", fmt.Errorf("replay: pod.nodeCordoned: pod %s is not bound, so no node of its can be cordoned", name)
+	}
+	nodeName := pod.Spec.NodeName
+	if err := d.writeNode(ctx, nodeName, func(node *corev1.Node) { node.Spec.Unschedulable = true }); err != nil {
+		return "", err
+	}
+	return "pod=" + name + " node=" + nodeName + " unschedulable=true", nil
+}
+
 // applyNodeLost is the node under a bound pod dying, in the three forms
 // the force-delete evidence tells apart: the Node object gone, the
 // unreachable taint with its TimeAdded, and NodeReady False with its
@@ -434,6 +478,10 @@ func applyNodeLost(ctx context.Context, d *driver, ev TimelineEvent) (string, er
 		if err := d.staging(func() error { return client.IgnoreNotFound(d.cli.Delete(ctx, node)) }); err != nil {
 			return "", fmt.Errorf("replay: delete node %s: %w", nodeName, err)
 		}
+		if d.goneNodes == nil {
+			d.goneNodes = map[string]bool{}
+		}
+		d.goneNodes[nodeName] = true
 		return "pod=" + name + " node=" + nodeName + " evidence=gone", nil
 	case "UnreachableTaint":
 		err = d.writeNode(ctx, nodeName, func(node *corev1.Node) {
@@ -464,8 +512,11 @@ func applyNodeLost(ctx context.Context, d *driver, ev TimelineEvent) (string, er
 }
 
 // writeNode creates the Node if the cluster holds none and applies the
-// mutation. The fake cluster holds no Node until a scenario names one.
+// mutation. The fake cluster holds no Node until a scenario names one. A
+// node written again after a scenario deleted it is present again for
+// the engine's Node reading.
 func (d *driver) writeNode(ctx context.Context, name string, mutate func(*corev1.Node)) error {
+	delete(d.goneNodes, name)
 	return d.staging(func() error {
 		node := &corev1.Node{}
 		err := d.cli.Get(ctx, client.ObjectKey{Name: name}, node)
@@ -1038,6 +1089,76 @@ func applyConflict(_ context.Context, d *driver, ev TimelineEvent) (string, erro
 	return fmt.Sprintf("resource=%s write=%d count=%d", resource, ev.Args.Write, count), nil
 }
 
+// admissionOutageLabel is the key the webhook outage's standing refusals
+// are staged under; the restore clears the refusals carrying it.
+const admissionOutageLabel = "api.admissionUnavailable"
+
+// admissionRestoredEvent names the event that ends a standing outage.
+const admissionRestoredEvent = "api.admissionRestored"
+
+// standingRefusal is the remaining count of a refusal that answers every
+// matching write until it is cleared.
+const standingRefusal = -1
+
+// webhookUnavailable is the apiserver failing closed on a write an
+// admission webhook must see while the webhook cannot be called: an
+// InternalError whose message names the webhook and the call that failed,
+// in the dispatcher's own words. The engine's classifier reads the phrase,
+// not the code, so the same text classifies alike on a 503 or a timeout.
+func webhookUnavailable() error {
+	return apierrors.NewInternalError(errors.New(
+		`failed calling webhook "pod-mutator.example.com": failed to call webhook: Post "https://webhook-server.example.svc:443/mutate-pods?timeout=10s": service "webhook-server" not found`))
+}
+
+// applyAdmissionUnavailable stages the apiserver failing closed on the
+// engine's matching writes because it cannot call an admission webhook, as
+// a webhook configuration pointed at a Service that does not exist leaves
+// it: every matching write is refused with the dispatcher's own words
+// until api.admissionRestored, or for count writes when the scenario names
+// a count. The verb and the resource default to the create of a pod, the
+// write a pod webhook intercepts; a status write passes, as in a cluster.
+func applyAdmissionUnavailable(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	verb, resource, count := ev.Args.Verb, ev.Args.Resource, ev.Args.Count
+	if verb == "" {
+		verb = "create"
+	}
+	if resource == "" {
+		resource = "pods"
+	}
+	if count == 0 {
+		count = standingRefusal
+	}
+	d.rejections = append(d.rejections, &pendingRejection{
+		verb: verb, resource: resource, remaining: count, err: webhookUnavailable(), label: ev.Key(),
+	})
+	span := "until=" + admissionRestoredEvent
+	if count > 0 {
+		span = fmt.Sprintf("count=%d", count)
+	}
+	return fmt.Sprintf("verb=%s resource=%s %s", verb, resource, span), nil
+}
+
+// applyAdmissionRestored is the webhooks pointed back: every refusal the
+// outage staged that still stands is cleared, so the engine's next
+// matching write goes through admission. A restore with no outage
+// standing fails the run, since the scenario would be clearing nothing.
+func applyAdmissionRestored(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	cleared := 0
+	kept := d.rejections[:0]
+	for _, r := range d.rejections {
+		if r.label == admissionOutageLabel && r.remaining != 0 {
+			cleared++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	d.rejections = kept
+	if cleared == 0 {
+		return "", fmt.Errorf("replay: %s: no admission outage stands", ev.Key())
+	}
+	return fmt.Sprintf("cleared=%d", cleared), nil
+}
+
 // namespaceTerminating is the apiserver refusing a create because the
 // namespace is being deleted: a Forbidden carrying the NamespaceTerminating
 // cause, which is what the engine's classifier reads.
@@ -1086,8 +1207,17 @@ func applySpecRevision(ctx context.Context, d *driver, ev TimelineEvent) (string
 		d.spec.PodAnnotations = ev.Args.Annotations
 		detail += "annotations=" + renderMap(ev.Args.Annotations) + " "
 	}
-	if err := d.bumpGeneration(ctx); err != nil {
-		return "", err
+	switch ev.Args.RenderedFrom {
+	case "":
+		if err := d.bumpGeneration(ctx); err != nil {
+			return "", err
+		}
+	case "runtime":
+		// A replica that renders from the runtime it names gets the new
+		// template with no write of its own spec, so its generation stands.
+		detail += "renderedFrom=runtime "
+	default:
+		return "", fmt.Errorf("replay: spec.revision: renderedFrom is runtime or absent, got %q", ev.Args.RenderedFrom)
 	}
 	return fmt.Sprintf("%sgeneration=%d", detail, d.owner.Generation), nil
 }
@@ -1158,18 +1288,41 @@ func renderEnv(env map[string]string) string {
 	return "[" + strings.Join(parts, " ") + "]"
 }
 
-// applySpecStrategy rewrites lifecycle.updateStrategy. The strategy is not
-// part of the revision payload, so the edit retargets nothing: what it
-// tests is which machine owns a row that already has an attempt in flight.
+// applySpecStrategy rewrites lifecycle.updateStrategy: its type, or a
+// rollingUpdate budget under the same type. Neither is part of the
+// revision payload, so the edit retargets nothing. A type edit tests
+// which machine owns a row that already has an attempt in flight; a
+// budget edit tests how many starts the next pass admits beside the
+// attempts already open, which the engine reads from the spec on every
+// pass.
 func applySpecStrategy(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
-	if ev.Args.Strategy == "" {
-		return "", fmt.Errorf("replay: spec.strategy needs the new strategy")
+	edits := []struct {
+		name  string
+		value string
+		field *string
+	}{
+		{"strategy", ev.Args.Strategy, &d.spec.Strategy},
+		{"maxSurge", ev.Args.MaxSurge, &d.spec.MaxSurge},
+		{"maxUnavailable", ev.Args.MaxUnavailable, &d.spec.MaxUnavailable},
 	}
-	d.spec.Strategy = ev.Args.Strategy
+	var fields []string
+	for _, edit := range edits {
+		if edit.value == "" {
+			continue
+		}
+		if edit.name != "strategy" && !intOrPercent.MatchString(edit.value) {
+			return "", fmt.Errorf("replay: spec.strategy %s %q is not an integer or a percent", edit.name, edit.value)
+		}
+		*edit.field = edit.value
+		fields = append(fields, edit.name+"="+edit.value)
+	}
+	if len(fields) == 0 {
+		return "", fmt.Errorf("replay: spec.strategy needs the new strategy, maxSurge or maxUnavailable")
+	}
 	if err := d.bumpGeneration(ctx); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("strategy=%s generation=%d", ev.Args.Strategy, d.owner.Generation), nil
+	return fmt.Sprintf("%s generation=%d", strings.Join(fields, " "), d.owner.Generation), nil
 }
 
 func applyReplicas(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
@@ -1256,10 +1409,12 @@ func applyGangWidth(ctx context.Context, d *driver, ev TimelineEvent) (string, e
 	return fmt.Sprintf("workers=%d generation=%d", d.spec.Workers, d.owner.Generation), nil
 }
 
-// applyPartition rewrites rollingUpdate.partition, the canary hold that
-// keeps the Instances below it on their revision. The partition is not
+// applyPartition rewrites the partition that keeps the Instances below it
+// on their revision: the user's rollingUpdate.partition, or with canary the
+// partition a canary step projects on the Component. The partition is not
 // part of the revision payload, so the edit retargets nothing; what it
-// changes is which rows the next update pass may select.
+// changes is which rows the next update pass may select and, under a step,
+// which revision an Instance that has run none is built on.
 func applyPartition(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
 	if ev.Args.To == nil {
 		return "", fmt.Errorf("replay: spec.partition needs the new partition as to")
@@ -1268,11 +1423,17 @@ func applyPartition(ctx context.Context, d *driver, ev TimelineEvent) (string, e
 		return "", fmt.Errorf("replay: spec.partition: a partition is a count of held Instances and cannot be negative")
 	}
 	partition := *ev.Args.To
-	d.spec.Partition = &partition
+	field := "partition"
+	if ev.Args.Canary {
+		d.spec.CanaryPartition = &partition
+		field = "canaryPartition"
+	} else {
+		d.spec.Partition = &partition
+	}
 	if err := d.bumpGeneration(ctx); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("partition=%d generation=%d", partition, d.owner.Generation), nil
+	return fmt.Sprintf("%s=%d generation=%d", field, partition, d.owner.Generation), nil
 }
 
 // applyRollbackTarget pins the roll to a stored revision, named by the
@@ -1440,17 +1601,42 @@ func applyConfigChanged(_ context.Context, d *driver, ev TimelineEvent) (string,
 	return ev.Variant + "=" + knob.render(&d.cfg), nil
 }
 
-// applyCtrlCrash is the controller process restarting. The cluster and the
+// applyCtrlCrash is the manager process restarting. The cluster and the
 // owner status are durable and stay as they are; what the restarted engine
 // loses is the expectations cache, the one thing it keeps in memory between
 // passes, so its first pass reads every pending create and delete as
 // satisfied and re-derives the row's step from status and the pods alone.
+// leaseWait is how long the new manager waits for the leader Lease before
+// that first pass: the clock moves by it, so the pass of this tick runs at
+// the instant the new manager holds the Lease.
 func applyCtrlCrash(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	if ev.Variant != "" {
 		return "", fmt.Errorf("replay: ctrl.crash takes no variant")
 	}
+	wait, err := leaseWaitOf(ev)
+	if err != nil {
+		return "", err
+	}
 	d.expectations = types.NewExpectationsWithClock(d.clock)
-	return "expectations=dropped", nil
+	detail := "expectations=dropped"
+	if wait > 0 {
+		d.clock.Step(wait)
+		detail += " leaseWait=" + wait.String()
+	}
+	return detail, nil
+}
+
+// leaseWaitOf reads ctrl.crash's leaseWait: zero when the scenario names
+// none, which is a new manager that holds the Lease at once.
+func leaseWaitOf(ev TimelineEvent) (time.Duration, error) {
+	wait, err := ParseDuration("ctrl.crash.leaseWait", ev.Args.LeaseWait)
+	if err != nil {
+		return 0, err
+	}
+	if wait < 0 {
+		return 0, fmt.Errorf("replay: ctrl.crash.leaseWait: the clock does not run backwards")
+	}
+	return wait, nil
 }
 
 // applyMigrateRequest is the operator's migration mailbox, consumed: the

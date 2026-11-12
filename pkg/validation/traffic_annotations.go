@@ -8,6 +8,7 @@ package validation
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -30,7 +31,7 @@ const (
 	kindRetryOnList
 	kindPromoteTarget // canary revision hash
 	kindResumeTarget  // canary revision hash, optionally "<component>=<hash>"
-	kindTrafficDrain  // versioned JSON map of manual route-arm holds
+	kindTrafficDrain  // versioned JSON map of manual per-cluster traffic holds
 )
 
 // trafficAnnotationKinds is the authoritative classifier for every
@@ -121,7 +122,8 @@ func ValidateTrafficAnnotations(annotations map[string]string, traffic *v1beta1.
 		// those the active translator can honor.
 		if strings.HasPrefix(key, constants.PassthroughEnvoyGatewayPrefix) ||
 			strings.HasPrefix(key, constants.PassthroughIstioPrefix) {
-			if len(knownPassthroughPrefixes) > 0 && !hasMatchingPrefix(key, knownPassthroughPrefixes) {
+			keyHasPrefix := func(prefix string) bool { return strings.HasPrefix(key, prefix) }
+			if len(knownPassthroughPrefixes) > 0 && !slices.ContainsFunc(knownPassthroughPrefixes, keyHasPrefix) {
 				return warnings, fmt.Errorf(
 					"annotation %q uses a pass-through prefix the active Gateway-implementation translator does not honor; supported prefixes: %v (UnsupportedPassthrough)",
 					key, knownPassthroughPrefixes,
@@ -141,19 +143,13 @@ func ValidateTrafficAnnotations(annotations map[string]string, traffic *v1beta1.
 	}
 
 	// Cross-rules — only check if dependencies are present.
-	if w, err := crossRuleRetry(annotations); err != nil {
+	if err := crossRuleRetry(annotations); err != nil {
 		return warnings, err
-	} else if w != "" {
+	}
+	if w := crossRuleStickyEndpointCap(annotations, traffic); w != "" {
 		warnings = append(warnings, w)
 	}
-	if w, err := crossRuleStickyEndpointCap(annotations, traffic); err != nil {
-		return warnings, err
-	} else if w != "" {
-		warnings = append(warnings, w)
-	}
-	if w, err := crossRuleRolloutTimeoutSanity(annotations); err != nil {
-		return warnings, err
-	} else if w != "" {
+	if w := crossRuleRolloutTimeoutSanity(annotations); w != "" {
 		warnings = append(warnings, w)
 	}
 
@@ -241,59 +237,59 @@ func isRevisionHashToken(s string) bool {
 }
 
 // crossRuleRetry enforces "retry-attempts > 0 requires retry-on".
-func crossRuleRetry(annotations map[string]string) (string, error) {
+func crossRuleRetry(annotations map[string]string) error {
 	attemptsStr, hasAttempts := annotations[constants.RetryAttemptsAnnotation]
 	if !hasAttempts {
-		return "", nil
+		return nil
 	}
 	n, _ := strconv.Atoi(attemptsStr) // already validated as int above
 	if n <= 0 {
-		return "", nil
+		return nil
 	}
 	if _, hasOn := annotations[constants.RetryOnAnnotation]; !hasOn {
-		return "", fmt.Errorf("annotation %q set to %d requires %q to specify retry conditions (MissingRetryOn)",
+		return fmt.Errorf("annotation %q set to %d requires %q to specify retry conditions (MissingRetryOn)",
 			constants.RetryAttemptsAnnotation, n, constants.RetryOnAnnotation)
 	}
-	return "", nil
+	return nil
 }
 
 // crossRuleStickyEndpointCap warns when
 // circuit-breaker-per-endpoint-max-connections > 1 with
 // ConsistentHash — this combination usually defeats the purpose of
 // sticky routing.
-func crossRuleStickyEndpointCap(annotations map[string]string, traffic *v1beta1.TrafficSpec) (string, error) {
+func crossRuleStickyEndpointCap(annotations map[string]string, traffic *v1beta1.TrafficSpec) string {
 	if traffic == nil || traffic.Algorithm == nil || *traffic.Algorithm != v1beta1.LoadBalancingTypeConsistentHash {
-		return "", nil
+		return ""
 	}
 	capStr, ok := annotations[constants.CircuitBreakerPerEndpointMaxConnectionsAnnotation]
 	if !ok {
-		return "", nil
+		return ""
 	}
 	n, _ := strconv.Atoi(capStr) // validated above
 	if n > 1 {
 		return fmt.Sprintf("annotation %q=%d combined with traffic.algorithm=ConsistentHash usually defeats sticky routing; set to 1 to keep sessions on a single pod",
-			constants.CircuitBreakerPerEndpointMaxConnectionsAnnotation, n), nil
+			constants.CircuitBreakerPerEndpointMaxConnectionsAnnotation, n)
 	}
-	return "", nil
+	return ""
 }
 
 // crossRuleRolloutTimeoutSanity warns when rollout-ready-timeout is
 // set to less than 1 minute. Most LLM-runtime warmups need at least
 // minutes; a sub-minute timeout almost guarantees Failed rollouts.
-func crossRuleRolloutTimeoutSanity(annotations map[string]string) (string, error) {
+func crossRuleRolloutTimeoutSanity(annotations map[string]string) string {
 	v, ok := annotations[constants.RolloutReadyTimeoutAnnotation]
 	if !ok {
-		return "", nil
+		return ""
 	}
 	d, err := time.ParseDuration(v) // validated above
 	if err != nil {
-		return "", nil
+		return ""
 	}
 	if d > 0 && d < time.Minute {
 		return fmt.Sprintf("annotation %q=%s is less than 1 minute; most LLM runtimes need longer to reach Ready (RolloutTimeoutTooShort)",
-			constants.RolloutReadyTimeoutAnnotation, v), nil
+			constants.RolloutReadyTimeoutAnnotation, v)
 	}
-	return "", nil
+	return ""
 }
 
 // closestTrafficAnnotation returns the documented traffic
@@ -339,7 +335,7 @@ func levenshtein(a, b string) int {
 			if a[i-1] == b[j-1] {
 				cost = 0
 			}
-			curr[j] = min3(
+			curr[j] = min(
 				prev[j]+1,      // deletion
 				curr[j-1]+1,    // insertion
 				prev[j-1]+cost, // substitution
@@ -348,27 +344,4 @@ func levenshtein(a, b string) int {
 		prev, curr = curr, prev
 	}
 	return prev[lb]
-}
-
-func min3(a, b, c int) int {
-	m := a
-	if b < m {
-		m = b
-	}
-	if c < m {
-		m = c
-	}
-	return m
-}
-
-// hasMatchingPrefix reports whether key starts with any prefix in the
-// list. Used to gate ome.io/btp.* and ome.io/dr.* pass-throughs against
-// the active translator's SupportedPassthroughPrefixes.
-func hasMatchingPrefix(key string, prefixes []string) bool {
-	for _, p := range prefixes {
-		if strings.HasPrefix(key, p) {
-			return true
-		}
-	}
-	return false
 }

@@ -50,7 +50,7 @@ func TestTable_OneOrderedPair(t *testing.T) {
 }
 
 // TestTable_EveryTokenIsWrittenByExactlyOneAuthority: the table is the
-// one home for the eight tokens, so a duplicate row — two authorities
+// one home for the nine tokens, so a duplicate row — two authorities
 // writing one token — is a precedence nobody decides.
 func TestTable_EveryTokenIsWrittenByExactlyOneAuthority(t *testing.T) {
 	seen := make(map[string]int, len(table))
@@ -74,14 +74,17 @@ func TestTable_EveryTokenIsWrittenByExactlyOneAuthority(t *testing.T) {
 }
 
 // TestTable_TokensAreTheExternalHolds: every authority's token stops the
-// InstanceReadyTimeout clock except the source-rotation report, which
-// names a workload getting worse, so the table and the external-hold set
-// in types are one list.
+// InstanceReadyTimeout clock except two reports, so the table and the
+// external-hold set in types are one list: the source-rotation report
+// names a workload getting worse, and the retired-replacement report
+// names the engine's own deletion, which the delete grace bounds and
+// which stands on the two rows of a gang surge, rows that take no
+// deadline decision.
 func TestTable_TokensAreTheExternalHolds(t *testing.T) {
 	var want []string
 	for _, a := range table {
 		stopsClock := types.OperationExternallyHeld(&types.InstanceOperation{Waiting: a.token})
-		if a.token == types.WaitingReasonSourceUnrouted {
+		if a.token == types.WaitingReasonSourceUnrouted || a.token == types.WaitingReasonRetiredReplacementTerminating {
 			if stopsClock {
 				t.Errorf("%s must keep the clock running", a.token)
 			}
@@ -134,6 +137,9 @@ func TestTable_FactHoldsRefuseATeardown(t *testing.T) {
 			types.OwnerRestart: true, types.OwnerMigrate: true,
 		},
 		types.WaitingReasonSourceUnrouted: {
+			types.OwnerUpdate: true,
+		},
+		types.WaitingReasonRetiredReplacementTerminating: {
 			types.OwnerUpdate: true,
 		},
 		types.WaitingReasonPodGroupTerminating: {

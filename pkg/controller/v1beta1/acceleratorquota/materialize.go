@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -52,14 +51,16 @@ func (r *Reconciler) ensureFinalizer(ctx context.Context, quota *v1beta1.Acceler
 	if controllerutil.ContainsFinalizer(quota, v1beta1.AcceleratorQuotaFinalizer) {
 		return nil
 	}
+	return r.patchFinalizer(ctx, quota, controllerutil.AddFinalizer)
+}
+
+// patchFinalizer writes the node with its finalizer added or removed. A node
+// deleted or rewritten mid-pass is left to the next reconcile, which reads the
+// newer object.
+func (r *Reconciler) patchFinalizer(ctx context.Context, quota *v1beta1.AcceleratorQuota, change func(client.Object, string) bool) error {
 	updated := quota.DeepCopy()
-	controllerutil.AddFinalizer(updated, v1beta1.AcceleratorQuotaFinalizer)
-	if err := r.Patch(ctx, updated, client.MergeFrom(quota)); err != nil {
-		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-			// Deleted or rewritten mid-pass. The next reconcile reads the newer
-			// object; neither case is a failure of this one.
-			return nil
-		}
+	change(updated, v1beta1.AcceleratorQuotaFinalizer)
+	if err := r.Patch(ctx, updated, client.MergeFrom(quota)); err != nil && !goneOrRewritten(err) {
 		return err
 	}
 	return nil
@@ -98,15 +99,7 @@ func (r *Reconciler) finalize(ctx context.Context, quota *v1beta1.AcceleratorQuo
 	// tenant's allowance.
 	deleteQuotaSeries(quota.Name)
 
-	updated := quota.DeepCopy()
-	controllerutil.RemoveFinalizer(updated, v1beta1.AcceleratorQuotaFinalizer)
-	if err := r.Patch(ctx, updated, client.MergeFrom(quota)); err != nil {
-		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return r.patchFinalizer(ctx, quota, controllerutil.RemoveFinalizer)
 }
 
 // materialize renders the reachable, unfrozen part of the tree and applies it,

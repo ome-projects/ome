@@ -23,10 +23,13 @@ package audit
 const ReasonForceDelete = "ForceDelete"
 
 // OutcomeForceDeleteUnreachable is the Outcome stamped when the
-// escalation force-deleted (grace 0, UID-preconditioned) a Terminating
-// pod overdue past its own deletion deadline on a node that provably
-// could not acknowledge the termination — the audit evidence for "the
-// controller deleted an API object it could not verify dead".
+// force-delete policy removed a pod (grace 0, UID-preconditioned) whose
+// node could not finish it: a Terminating pod past its deletion deadline
+// plus the overdue slack, one still inside its grace period on a node
+// whose kubelet had stopped reporting for the threshold when the policy
+// skips the grace period there, or an unreported pod holding a name a
+// rebuild needs. It records that the controller deleted an API object
+// whose containers it never saw stop.
 const OutcomeForceDeleteUnreachable = "force-delete-unreachable"
 
 // OutcomeForceDeleteFinalizerReport is the Outcome stamped on the

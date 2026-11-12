@@ -1,14 +1,12 @@
 package status
 
 import (
-	"context"
 	"fmt"
 	"reflect"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -53,41 +51,6 @@ func CreatingMutation(idx int32, incarnation int64, timeout time.Duration, targe
 			Deadline:       types.DeadlineAt(now, timeout),
 			TargetRevision: targetRev,
 		}
-		return true
-	}}
-}
-
-// StampReady finishes an attempt at the row's known running revision.
-// An unknown revision leaves the operation intact rather than recording
-// success without the identity needed to rebuild or route the pod set.
-func StampReady(ctx context.Context, input types.ReconcileInput, idx int32) error {
-	mutation := ReadyMutation(idx, input.Now())
-	var revisionErr error
-	err := input.MutateInstance(ctx, mutation.Index, func(s *types.InstanceStatus) bool {
-		revisionErr = query.RequireNamedRevision(query.RevisionFromName(s.RunningRevision))
-		return revisionErr == nil && mutation.Mutate(s)
-	})
-	if err != nil {
-		return err
-	}
-	if revisionErr != nil {
-		return fmt.Errorf("instance %d cannot become Ready: %w", idx, revisionErr)
-	}
-	return nil
-}
-
-// ReadyMutation is StampReady as a mutation, for the pass that commits it
-// alongside other rows in one batch.
-func ReadyMutation(idx int32, now time.Time) types.InstanceMutation {
-	return types.InstanceMutation{Index: idx, Mutate: func(s *types.InstanceStatus) bool {
-		if s.Phase == types.InstancePhaseReady && s.Operation == nil && s.TargetRevision == "" {
-			return false
-		}
-		if !EnterReady(s, now) {
-			return false
-		}
-		s.Operation = nil
-		s.TargetRevision = ""
 		return true
 	}}
 }

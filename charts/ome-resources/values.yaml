@@ -9,14 +9,227 @@ global:
 
 ome:
   version: &defaultVersion v1.2.2
+  # metricsaggregator is the pod webhook's metrics wiring. The two switches
+  # are the pod defaults for ome.io/enable-metric-aggregation and
+  # ome.io/enable-prometheus-scraping. containerPort and path are where the
+  # serving container serves metrics (a pod's prometheus.ome.io annotations
+  # override them), aggregatePort is where queue-proxy serves the aggregate,
+  # podPrometheusPort is the pod's scrape port when aggregation is off. The
+  # manager has no built-in ports: without all four, aggregation and scraping
+  # inject nothing and the webhook logs it once.
   metricsaggregator:
     enableMetricAggregation: "false"
     enablePrometheusScraping: "false"
-  # podMonitor configures cluster-scope defaults for every PodMonitor OME
-  # generates per InferenceService Component. Omit (or leave empty) to keep the
-  # legacy behavior: PodMonitors carry only OME's own labels, so a
-  # label-selecting metrics collector will not scrape them and metrics flow only
-  # via the pod-annotation scrape path.
+    containerPort: 8080
+    path: /metrics
+    aggregatePort: 9088
+    podPrometheusPort: 9091
+  # rdma is the RDMA profile table the pod webhook applies to pods that set
+  # ome.io/rdma-auto-inject=true: ome.io/rdma-profile picks a profile, else
+  # defaultProfile. A profile is the env, volumes, mounts, security context
+  # and Multus networks of one fabric; values already on the container win.
+  # The manager has no built-in profile and this chart ships none: every
+  # cluster's fabric differs, so the per-cluster values file carries the
+  # table. Without one, such pods get nothing and the webhook logs it once.
+  # The shape of an overlay entry:
+  #   rdma:
+  #     defaultProfile: roce
+  #     profiles:
+  #       roce:
+  #         env: {NCCL_IB_HCA: "=mlx5_0,mlx5_1", NCCL_SOCKET_IFNAME: eth0}
+  #         volumes: [{name: devinf, hostPath: {path: /dev/infiniband}}]
+  #         volumeMounts: [{name: devinf, mountPath: /dev/infiniband}]
+  #         securityContext: {capabilities: {add: [IPC_LOCK]}}
+  #         networks: [{name: rdma0-macvlan, namespace: multus-system}]
+  rdma:
+    defaultProfile: ""
+    profiles: {}
+  # runtimeProfiles is the port the probe and observability profiles use when
+  # a pod names none, and the timings of the three probes a probe profile
+  # injects. Without it probe profiles inject nothing and observability
+  # profiles serve only pods that name a port; the webhook logs it once.
+  runtimeProfiles:
+    defaultPort: 30000
+    probes:
+      liveness:
+        failureThreshold: 5
+        initialDelaySeconds: 0
+        periodSeconds: 60
+        successThreshold: 0
+        timeoutSeconds: 30
+      readiness:
+        failureThreshold: 5
+        initialDelaySeconds: 60
+        periodSeconds: 30
+        successThreshold: 1
+        timeoutSeconds: 30
+      startup:
+        failureThreshold: 60
+        initialDelaySeconds: 60
+        periodSeconds: 30
+        successThreshold: 0
+        timeoutSeconds: 30
+  # runtimePresets is one ServingRuntime spec per ome.io/engine value. The
+  # preset webhook fills it in under the runtime's own fields. Without it, or
+  # for an engine it does not name, a runtime that names an engine is refused
+  # with a message that says so.
+  runtimePresets:
+    sglang-pd:
+      containers: null
+      decoderConfig:
+        runner:
+          command:
+            - python3
+            - -m
+            - sglang.launch_server
+            - --host
+            - 0.0.0.0
+            - --port
+            - "30000"
+            - --model-path
+            - $(MODEL_PATH)
+            - --disaggregation-mode
+            - decode
+            - --disaggregation-transfer-backend
+            - nixl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SGLANG_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          image: lmsysorg/sglang:latest
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 60
+            timeoutSeconds: 10
+          name: ome-container
+          ports:
+            - containerPort: 30000
+              name: http
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 30
+            timeoutSeconds: 10
+          resources: {}
+      engineConfig:
+        runner:
+          command:
+            - python3
+            - -m
+            - sglang.launch_server
+            - --host
+            - 0.0.0.0
+            - --port
+            - "30000"
+            - --model-path
+            - $(MODEL_PATH)
+            - --disaggregation-mode
+            - prefill
+            - --disaggregation-transfer-backend
+            - nixl
+            - --disaggregation-bootstrap-port
+            - "8998"
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: SGLANG_HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          image: lmsysorg/sglang:latest
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 60
+            timeoutSeconds: 10
+          name: ome-container
+          ports:
+            - containerPort: 30000
+              name: http
+              protocol: TCP
+            - containerPort: 8998
+              name: bootstrap
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 30
+            timeoutSeconds: 10
+          resources: {}
+      routerConfig:
+        runner:
+          args:
+            - --port
+            - "30080"
+            - --k8s-namespace
+            - $(NAMESPACE)
+            - --prefill-label-selector
+            - component=engine,ome.io/inferenceservice=$(INFERENCESERVICE_NAME)
+            - --decode-label-selector
+            - component=decoder,ome.io/inferenceservice=$(INFERENCESERVICE_NAME)
+            - --k8s-engine-port
+            - "30000"
+            - --bootstrap-port
+            - "8998"
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: INFERENCESERVICE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['ome.io/inferenceservice']
+          image: lmsysorg/sglang-router:latest
+          livenessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /liveness
+              port: 30080
+            periodSeconds: 30
+            timeoutSeconds: 10
+          name: router
+          ports:
+            - containerPort: 30080
+              name: http
+              protocol: TCP
+          readinessProbe:
+            failureThreshold: 5
+            httpGet:
+              path: /readiness
+              port: 30080
+            periodSeconds: 30
+            timeoutSeconds: 10
+          resources: {}
+  # podMonitor configures every PodMonitor OME generates per InferenceService
+  # Component. Nothing here has an in-code default.
+  #
+  # path, interval, port and fallbackPort are OME's own scrape endpoint: the
+  # HTTP path, scraped every interval (Prometheus duration form), on the
+  # container port named `port` when the Component's first container declares
+  # it, wherever it stands; a container without it is scraped on its first
+  # port when that port is named, else on `fallbackPort`. The endpoints a
+  # Component's prometheus.ome.io/extra-endpoints annotation declares follow
+  # at the same interval. Leave path, interval or the port names empty and OME
+  # adds no endpoint of its own: PodMonitors carry only the annotation-declared
+  # endpoints, and the manager logs that once.
+  #
+  # Leave `labels` empty to keep PodMonitors with only OME's own labels, so a
+  # label-selecting metrics collector will not scrape them and metrics flow
+  # only via the pod-annotation scrape path.
   #
   # Set `labels` to opt the generated PodMonitors into an external scrape
   # pipeline that selects monitors by label — e.g. an OpenTelemetry target
@@ -28,6 +241,10 @@ ome:
   # pod-annotation ("kubernetes-pods") label schema. Appended to every endpoint.
   #
   # podMonitor:
+  #   path: /metrics
+  #   interval: 10s
+  #   port: metrics
+  #   fallbackPort: http
   #   labels:
   #     monitoring.example.com/scrape-tier: cluster
   #   relabelings:
@@ -39,7 +256,11 @@ ome:
   #       targetLabel: serving_runtime
   #     - sourceLabels: ["__meta_kubernetes_namespace"]
   #       targetLabel: k8s_namespace_name
-  podMonitor: {}
+  podMonitor:
+    path: /metrics
+    interval: 10s
+    port: metrics
+    fallbackPort: http
   # Permissions for a remote placement controller. Authentication is supplied
   # by the platform through the WorkloadCluster kubeconfig.
   multiclusterAccess:
@@ -265,19 +486,43 @@ ome:
     memoryLimit: "2Gi"
 
   controller:
-    # Extension points for injecting deployment-specific configuration into the
-    # controller pod (mirrors the modelAgent extension points). All default to
-    # empty, so the rendered output is unchanged when unset.
     extraEnv: []
     extraVolumes: []
     extraVolumeMounts: []
     replicaCount: 3
+    # managerPodDisruptionBudget adds a PodDisruptionBudget for the controller
+    # manager pods when enabled. A node drain then takes down at most
+    # maxUnavailable of them at a time. The rest keep serving the admission
+    # webhooks, and one can take over as leader. The chart refuses a
+    # maxUnavailable below 1, because then no node running a manager pod could
+    # be drained. unhealthyPodEvictionPolicy AlwaysAllow lets a drain evict a
+    # manager pod that is not Ready, which serves nothing and would otherwise
+    # hold the drain. podDisruptionBudget below covers the workloads the
+    # controller creates, not these pods.
+    managerPodDisruptionBudget:
+      enabled: false
+      maxUnavailable: 1
+      unhealthyPodEvictionPolicy: AlwaysAllow
     # Additional annotations applied to the controller pod template.
     # Merged after the chart's default annotations (prometheus.io/scrape, etc.).
     # Typical use: metric-pipeline schema tagging, e.g.
     #   podAnnotations:
     #     metrics-schema: ome-controller
     podAnnotations: {}
+    # Termination grace period of the controller manager pod itself, in
+    # seconds. terminationGracePeriodSeconds below is a different setting: it
+    # is the default for the serving pods the controller creates. On SIGTERM
+    # the manager stops its controllers, webhooks and servers, waiting at most
+    # controller-runtime's 30s shutdown timeout, and only then releases the
+    # leader lease (leaderElection.releaseOnCancel). The kubelet sends SIGKILL
+    # when this grace period runs out, so keep it above that timeout plus the
+    # release, one read and one write of the Lease: 40 leaves 10s for them. A
+    # healthy stop takes about a second and the pod exits as soon as it is
+    # done; this value is only the ceiling. To measure the stop, read two
+    # manager log lines: "Stopping and waiting for non leader election
+    # runnables" comes at SIGTERM, and "Wait completed, proceeding to shutdown
+    # the manager" comes when the stop is done.
+    managerTerminationGracePeriodSeconds: 40
     deploymentMode: "RawDeployment"
     # Component replica defaults the reconciler fills when neither the
     # InferenceService nor its ServingRuntime sets minReplicas/maxReplicas;
@@ -377,15 +622,49 @@ ome:
     #
     # controller-runtime caps each renewal request at renewDeadline/2, so a
     # window holds two attempts and the leader survives exactly one hung
-    # apiserver request. At the defaults that is a ~10s budget, which a routine
-    # etcd stall exhausts — costing the leader its lease and restarting the pod.
-    # 40s buys two 20s attempts. The cost is failover latency: a standby waits up
-    # to leaseDuration before taking over, so raise these only as far as the
-    # cluster's apiserver actually needs.
+    # apiserver request. At controller-runtime's defaults that is a ~10s budget,
+    # which a routine etcd stall exhausts — costing the leader its lease and
+    # restarting the pod. 40s buys two 20s attempts, so the leader rides out an
+    # apiserver stall of up to 40s. The cost of a long lease is the wait after
+    # a crash: a standby waits up to leaseDuration before taking over, so raise
+    # these only as far as the cluster's apiserver actually needs. The
+    # releaseOnCancel rule below needs a lease above 108s beside a 40s
+    # renewDeadline; 120s leaves a margin.
     leaderElection:
-      leaseDuration: "60s"
+      leaseDuration: "120s"
       renewDeadline: "40s"
       retryPeriod: "8s"
+      # Give up the lease at the end of a graceful stop (a rollout, a node
+      # drain, a pod deletion), so a standby takes over at its next poll,
+      # within 2.2 retryPeriods (about 18s at 8s), instead of waiting for the
+      # lease to expire, which would leave the cluster with no manager
+      # reconciling for two minutes after every deploy. A crash or a lost node
+      # releases nothing, and the standby still waits for the lease to expire.
+      # Off is controller-runtime's own default; this chart turns it on.
+      #
+      # With the release on, the manager checks this rule at start:
+      # leaseDuration, in whole seconds, must exceed max(renewDeadline / 2, 1s)
+      # + retryPeriod + 2 x renewDeadline. The first term is the timeout of one
+      # leader election request. When renewals fail, the leader also tries to
+      # release the lease before it stops, so it can keep reconciling that long
+      # after a standby reads its last renewal. The timing above gives 20s + 8s
+      # + 80s = 108s, under 120s. A values file that sets a 60s lease beside the
+      # 40s renewDeadline fails the rule: raise its lease above 108s or set
+      # this to false. A timing that fails the rule makes each new manager pod
+      # exit at start with an error that lists each amount and says what to
+      # change; on an upgrade Kubernetes then stalls the rollout and the old
+      # manager pods keep running, and on a fresh install no manager runs and
+      # the admission webhooks (failurePolicy Fail) refuse creates and updates
+      # of InferenceServices, base models and serving runtimes.
+      #
+      # The release comes at the end of the stop, after the manager has
+      # stopped its controllers, webhooks and servers, which controller-runtime
+      # bounds at 30s. A stop that outlasts managerTerminationGracePeriodSeconds
+      # ends with SIGKILL before the release, and the lease then expires as
+      # usual. A manager image that does not know this flag exits at start;
+      # set this to false while such an image runs under this chart, and move
+      # the chart and the image together.
+      releaseOnCancel: true
     # TTL for the in-memory cache of the inferenceservice-config ConfigMap on the
     # InferenceService reconcile path. Collapses the per-reconcile config loads
     # (deploy/inferenceservice/ingress/canaryAnalysis) onto one apiserver GET per
@@ -658,6 +937,9 @@ ome:
       # Instance is failed as environment-caused (the scheduler message is
       # recorded; the revision is never blamed). While the pod is
       # unschedulable the InstanceReadyTimeout clock is parked either way.
+      # A pod with the kueue.x-k8s.io/queue-name label may have waited behind
+      # its queue's gate if its condition still shows its creation time. For
+      # such a pod, the grace runs from when OME first sees the refusal.
       # Removing this field disables the escalation, so an unplaceable pod
       # waits for an operator instead.
       unschedulableGracePeriod: 15m
@@ -675,6 +957,20 @@ ome:
       # Unset by default: such a member then waits on
       # unschedulableGracePeriod.
       # gangDomainFullGracePeriod: 5m
+      # schedulingRetry bounds how OME asks the scheduler again for a pod of a
+      # multi-pod Instance that stays Pending with no node while its attempt
+      # is open. Once the pod has waited `after` (measured from its creation,
+      # or from the scheduler's last PodScheduled ruling) OME writes a small
+      # record onto the pod. That write puts a pod the scheduler's queue has
+      # lost track of back into its active queue and leaves a pod the queue
+      # still holds where it is. The k-th write waits k times `after`;
+      # maxAttempts caps the writes per pod. Both fields are required when
+      # the block is present. The OME binary has NO built-in values: removing
+      # this block leaves such a pod to the scheduler's own queue and to the
+      # attempt's deadline.
+      schedulingRetry:
+        after: 5m
+        maxAttempts: 2
       # abandonedReplacementGracePeriod is the termination grace given to a
       # replacement pod a rollout abandons before it ever entered the serving
       # rotation: a surge replacement superseded by a newer revision, or
@@ -686,16 +982,19 @@ ome:
       # that has served keeps its own grace. Removing this field leaves every
       # abandoned replacement its own grace.
       abandonedReplacementGracePeriod: 30s
-      # gangScheduleTimeout bounds the PodGroup scheduleTimeoutSeconds a
-      # multi-pod Instance derives from its Component's instanceReadyTimeout,
-      # so gang admission releases an infeasible attempt on a cluster-wide
-      # schedule. min also covers Components whose instanceReadyTimeout is
-      # unusable as a gang deadline. Both fields are required when the block
-      # is present. The OME binary has NO built-in bounds: removing this block
-      # passes the derived timeout to the scheduler unclamped.
+      # gangScheduleTimeout is the range of PodGroup scheduleTimeoutSeconds the
+      # gang scheduler accepts. A gang's PodGroup carries unschedulableGracePeriod
+      # as its timeout, so the scheduler stops waiting for the gang in the same
+      # moment OME ends the attempt; a grace outside this range is raised to min
+      # or lowered to max, and the two clocks then part by the difference. The
+      # gang scheduler refuses a timeout of zero and the kube-scheduler's permit
+      # gate waits at most 15 minutes, so these are the scheduler's own limits.
+      # Both fields are required when the block is present. The OME binary has
+      # NO built-in bounds: removing this block passes the grace to the
+      # scheduler as it is.
       gangScheduleTimeout:
-        min: 60s
-        max: 600s
+        min: 1s
+        max: 15m
       # audit bounds migration EXECUTION on one InferenceService: how many
       # migrations may be executing at once, how many may be started inside
       # the trailing window, and the window itself. The window also bounds
@@ -727,14 +1026,31 @@ ome:
         maxAttempts: 3
       # forceDelete enables automated force-deletion (grace 0) of pods stuck
       # Terminating on unreachable/gone nodes — opt-in; leave commented out
-      # (the default) to disable the escalation entirely. Both fields are
-      # required when the block is present: overdueSlack is how long past a
-      # pod's own deletionTimestamp before it counts as wedged;
-      # nodeUnreachableThreshold is the minimum age of the node's
-      # unreachable evidence before acting.
+      # (the default) to disable the escalation entirely. overdueSlack and
+      # nodeUnreachableThreshold are required when the block is present.
+      # nodeUnreachableThreshold is how long a node must have been
+      # unreachable or NotReady before OME acts on a pod there. A deleted
+      # Node object needs no such wait. overdueSlack is how long past its
+      # own deletionTimestamp the pod must also be.
+      # skipGracePeriodOnUnreachableNode: true drops the wait for
+      # deletionTimestamp plus overdueSlack, the pod's grace period included,
+      # on a node whose kubelet has stopped reporting (Ready Unknown or the
+      # unreachable taint). Its pods then go once the node has been
+      # unreachable for nodeUnreachableThreshold, counted from the later of
+      # the two signs when the node shows both. overdueSlack still applies
+      # on a node that is gone or whose kubelet reports NotReady, and to the
+      # warning for a pod held by another controller's finalizer. The cost:
+      # the old pod's containers can keep running. That happens when the
+      # node is cut off from the network, or when its kubelet stops (it
+      # crashes or hangs, its certificate expires, or someone stops it). The
+      # old pod then runs beside its replacement until the kubelet reaches
+      # the API server again. A kubelet that kept running then stops the pod
+      # within its grace period. A restarted kubelet stops it with a
+      # one-second grace period.
       # forceDelete:
       #   overdueSlack: 2m
       #   nodeUnreachableThreshold: 5m
+      #   skipGracePeriodOnUnreachableNode: false
       # teardown bounds how long a deleting InferenceReplica may hold its
       # finalizer while draining pods. Past the deadline, the controller
       # warns and lifts the finalizer (degrading to plain GC). Absence (of
@@ -767,6 +1083,13 @@ ome:
         firstSide: decoder
     ingressGateway:
       disableIstioVirtualHost: false
+      # The cluster's DNS domain: the suffix of every in-cluster Service
+      # hostname OME renders ("<service>.<namespace>.svc.<clusterDomain>"):
+      # the prefill/decode peer addresses on every pod, status.address, the
+      # Istio route host. The OME binary has NO built-in default; this value
+      # is the source of truth. Empty renders the short "<service>.<namespace>"
+      # name and the controller logs that once.
+      clusterDomain: cluster.local
       domain: svc.cluster.local
       domainTemplate: "{{ .Name }}.{{ .Namespace }}.{{ .IngressDomain }}"
       urlScheme: http
@@ -823,6 +1146,25 @@ ome:
       #         - omeIngressGateway: "envoy-gateway-system/prod-ext-gw-https"
       #           ingressDomain: "ext-gw-https.example.com"
       namespaceIngressGateways: {}
+      # Per route provider, the per-revision traffic intent it can express — what
+      # a canary step's traffic percentage asks of the external route. Keys are the
+      # provider OME resolves an InferenceService to: GatewayAPI (enableGatewayAPI),
+      # KubernetesIngress (ingress creation on without Gateway API) or None (ingress
+      # creation disabled; whatever fronts the external Service). Values are
+      # capability tokens; the only one today is weightedRevisionRouting. The OME
+      # binary has NO built-in declaration — this chart value is the source of
+      # truth (override per-cluster via GitOps). A provider left out has unknown
+      # capabilities: canary traffic percentages are admitted and reported as
+      # unverified (TrafficIntentReady=Unknown). A provider listed with [] can
+      # express none: admission rejects such a canary, and a stored one holds its
+      # rollout (RolloutPlanReady=False/RouteProviderUnsupported) instead of
+      # running with the percentages dropped.
+      # Example:
+      #   routeProviderCapabilities:
+      #     GatewayAPI: ["weightedRevisionRouting"]
+      #     KubernetesIngress: []
+      #     None: []
+      routeProviderCapabilities: {}
       # Cluster-default Gateway API request timeout (seconds) applied to every
       # generated HTTPRoute whose ISVC doesn't set spec.<component>.timeoutSeconds.
       # The OME binary has NO built-in default — this chart value is the source of

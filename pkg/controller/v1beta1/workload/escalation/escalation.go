@@ -77,6 +77,12 @@ type PassInput struct {
 //     the row, and a group the gang scheduler failed ends nothing, because
 //     the PodGroup pass rebuilds it.
 //
+// One step writes without ending anything: a pod of a multi-pod Instance
+// that has waited for a node past lifecycle.schedulingRetry.after is
+// written so the scheduler looks at it again, at most
+// lifecycle.schedulingRetry.maxAttempts times. With no policy set, no pod
+// is written.
+//
 // What a row's owner permits comes first. The ownership table says whether
 // either clock may end the row's state: a migration pair ends through its
 // record and a teardown through the scale-down wave, so neither is written
@@ -253,6 +259,7 @@ func (r *rowEscalation) run(ctx context.Context) error {
 		r.keepServingSet,
 		r.endOnPodGroupOwnedElsewhere,
 		r.waitForPodGroupName,
+		r.repeatSchedulingRequest,
 		r.endOnSchedulerGrace,
 		r.requireInterruptibleState,
 		r.skipPausedAttempt,
@@ -318,6 +325,68 @@ func (r *rowEscalation) waitForPodGroupName(context.Context) (bool, error) {
 	return !r.podGroupHold || r.reading.StuckPod != nil, nil
 }
 
+// repeatSchedulingRequest writes the pods of a multi-pod Instance that
+// have waited for a node past lifecycle.schedulingRetry.after, so a pod
+// the scheduler's queue has lost track of is queued again well before the
+// deadline or the placement grace ends the attempt. It ends nothing and
+// never stops the walk. A row with no attempt, a teardown, a paused
+// attempt, a single-pod Instance, and a hold the placement grace ends in
+// this very pass are left alone.
+func (r *rowEscalation) repeatSchedulingRequest(ctx context.Context) (bool, error) {
+	p := r.pass
+	op := r.row.Operation
+	if p.input.SchedulingRetry == nil || op == nil || op.Type == types.InstanceOperationDelete ||
+		types.OperationPaused(op) || !r.multiPodRow() || r.schedulerGraceElapsed() {
+		return true, nil
+	}
+	if err := requestSchedulingAgain(ctx, p.deps, p.input, p.plan.Component, r.row.Index, p.podsByInstance[r.row.Index], p.now); err != nil {
+		return false, fmt.Errorf("ask the scheduler again (instance=%d): %w", r.row.Index, err)
+	}
+	return true, nil
+}
+
+// multiPodRow reports whether the row is a multi-pod Instance: planned
+// with more than one pod, or the row of a gang surge's replacement, which
+// the plan does not list.
+func (r *rowEscalation) multiPodRow() bool {
+	if r.desiredPods > 1 {
+		return true
+	}
+	op := r.row.Operation
+	return op != nil && op.Type == types.InstanceOperationUpdate && op.Step == types.UpdateStepGangSurgeTarget
+}
+
+// schedulerGraceElapsed reports whether the row's Unschedulable hold has
+// outlasted the placement grace it is measured against
+// (schedulerHoldGrace) from the moment it is measured from
+// (schedulerHoldSince): the pass then ends the attempt. A row with no
+// such hold, or no grace set, reads false. Every step that asks whether
+// this pass ends the hold reads it here.
+func (r *rowEscalation) schedulerGraceElapsed() bool {
+	if !r.unschedulableHold {
+		return false
+	}
+	p := r.pass
+	grace := schedulerHoldGrace(p.input, r.reading.UnschedulableMessage, r.pods)
+	since := schedulerHoldSince(p.input.ObservedState.InstanceStatuses, r.row, r.unschedulableSince())
+	return unschedulableGraceElapsed(since, p.now, grace)
+}
+
+// unschedulableSince returns the unplaceable pod's PodScheduled transition,
+// its own start for the grace. It returns now when that time may be the
+// pod's creation behind a queue's gate (evidence.UnschedulableSinceTheGate).
+// Such a pod has no start of its own, so its own time never ends the grace.
+// The hold pass records the attempt's placement wait at the first pass that
+// sees the refusal, and schedulerHoldSince measures the grace from that
+// start.
+func (r *rowEscalation) unschedulableSince() metav1.Time {
+	since := r.reading.UnschedulableSince
+	if evidence.UnschedulableSinceTheGate(r.reading.Unschedulable, since) {
+		return metav1.NewTime(r.pass.now)
+	}
+	return since
+}
+
 // endOnSchedulerGrace answers an Unschedulable hold. Inside the operator's
 // grace the row waits on cluster capacity, unless a pod of its own is held
 // in a terminal waiting reason, which the stuck-pod step reads. Past the
@@ -331,12 +400,10 @@ func (r *rowEscalation) endOnSchedulerGrace(ctx context.Context) (bool, error) {
 	if !r.unschedulableHold {
 		return true, nil
 	}
-	p := r.pass
-	grace := schedulerHoldGrace(p.input, r.reading.UnschedulableMessage, r.pods)
-	since := schedulerHoldSince(p.input.ObservedState.InstanceStatuses, r.row, r.reading.UnschedulableSince)
-	if !unschedulableGraceElapsed(since, p.now, grace) {
+	if !r.schedulerGraceElapsed() {
 		return r.reading.StuckPod != nil, nil
 	}
+	p := r.pass
 	if err := escalateSchedulerHold(ctx, p.deps, p.input, p.deadlineDeps, p.failedWrites, r.row, r.pods, r.desiredPods, r.reading, p.now); err != nil {
 		return false, fmt.Errorf("escalate scheduler hold (instance=%d): %w", r.row.Index, err)
 	}

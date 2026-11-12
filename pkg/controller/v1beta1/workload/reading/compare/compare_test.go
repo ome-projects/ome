@@ -105,7 +105,7 @@ func TestCompare_PlainFullyServingSetAgrees(t *testing.T) {
 func TestCompare_CraftedSetsDisagreePerReader(t *testing.T) {
 	// The persisted counts of a row whose pod served and then stopped: the
 	// publication one pass ago counted nothing serving.
-	darkRow := func() *types.InstanceStatus { return enteredReady(readyRow(0), now.Add(-30*time.Minute)) }
+	unservingRow := func() *types.InstanceStatus { return enteredReady(readyRow(0), now.Add(-30*time.Minute)) }
 	cases := []struct {
 		name    string
 		pods    []*corev1.Pod
@@ -159,7 +159,7 @@ func TestCompare_CraftedSetsDisagreePerReader(t *testing.T) {
 			},
 		},
 		{
-			name:    "Failed row whose persisted serving count trails the parked pod by a pass",
+			name:    "Failed row whose persisted serving count trails the held pod by a pass",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.ContainerWaiting("CrashLoopBackOff"))),
 			desired: 1,
 			row:     failedRow(1),
@@ -184,15 +184,15 @@ func TestCompare_CraftedSetsDisagreePerReader(t *testing.T) {
 		{
 			// The counter and the reading both read a pod still coming up
 			// as not serving; the grace the reading waits out before it
-			// calls a set out of service plays no part in a dark row.
-			name:    "Failed row dark on a pod still coming up",
+			// calls a set out of service plays no part in an unserving row.
+			name:    "Failed row unserving on a pod still coming up",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.NeverReady)),
 			desired: 1,
 			row:     failedRow(0),
 			want:    map[string]string{},
 		},
 		{
-			// A Failed row whose source pod still serves is not dark, by
+			// A Failed row whose source pod still serves is not unserving, by
 			// the counter it published and by the pods.
 			name:    "Failed row whose source still serves beside a failed replacement",
 			pods:    fixture.Pods(fixture.Pod(podName)),
@@ -274,52 +274,52 @@ func TestCompare_CraftedSetsDisagreePerReader(t *testing.T) {
 			// The runner restarted after Ready and has failed its
 			// readiness past the grace since: the roll reads a crash,
 			// which the repair owns, so the Instance keeps its slot; the
-			// composition reads a dark pod. The detector and the reading
-			// agree the pod is broken.
-			name:    "rolled Instance dark but for a runner restarted since Ready",
+			// composition reads a pod unready past the grace. The detector
+			// and the reading agree the pod is broken.
+			name:    "rolled Instance unserving but for a runner restarted since Ready",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.RestartedAt(now.Add(-5*time.Minute)), fixture.UnreadySince(now.Add(-2*time.Minute)))),
 			desired: 1,
-			row:     darkRow(),
+			row:     unservingRow(),
 			want: map[string]string{
-				compare.ReaderRolledInstanceDark: "rolledInstanceDark/ops=false/reading=true[crashed]",
+				compare.ReaderRolledInstanceDark: "rolledInstanceUnserving/ops=false/reading=true[crashed]",
 				compare.ReaderIsServing:          "gateWritten/podreadiness=true/reading=false[containers-not-ready]",
 			},
 		},
 		{
 			// The runner exited and the kubelet has not started it again:
-			// the roll reads no dark pod, the kubelet having named the
-			// failure; the composition reads a pod unready past the
-			// grace, and so does the reading beside the detector, which
-			// reads no restart on a container that has not run again.
-			name:    "rolled Instance dark but for a runner that exited",
+			// the roll reads no pod unready past the grace, the kubelet
+			// having named the failure; the composition reads one, and so
+			// does the reading beside the detector, which reads no restart
+			// on a container that has not run again.
+			name:    "rolled Instance unserving but for a runner that exited",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.ExitedAt(now.Add(-2*time.Minute)))),
 			desired: 1,
-			row:     darkRow(),
+			row:     unservingRow(),
 			want: map[string]string{
-				compare.ReaderRolledInstanceDark: "rolledInstanceDark/ops=false/reading=true[exited]",
+				compare.ReaderRolledInstanceDark: "rolledInstanceUnserving/ops=false/reading=true[exited]",
 				compare.ReaderIsServing:          "gateWritten/podreadiness=true/reading=false[containers-not-ready]",
 				compare.ReaderRunnerRestarted:    "runnerRestarted/ops=false/reading=out-of-service[no-restart]",
 			},
 		},
 		{
-			// A dark pod under an update attempt the roll continues: the
-			// attempt's own counts hold its slot, so the roll reads no
-			// dark Instance.
-			name:    "dark pod under an update attempt in flight",
+			// A pod unready past the grace under an update attempt the roll
+			// continues: the attempt's own counts hold its slot, so the
+			// roll reads no unserving Instance.
+			name:    "pod unready past the grace under an update attempt in flight",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.UnreadySince(now.Add(-2*time.Minute)))),
 			desired: 1,
 			row:     updatingRow(0, ""),
 			want: map[string]string{
-				compare.ReaderRolledInstanceDark: "rolledInstanceDark/ops=false/reading=true[continuation]",
+				compare.ReaderRolledInstanceDark: "rolledInstanceUnserving/ops=false/reading=true[continuation]",
 				compare.ReaderIsServing:          "gateWritten/podreadiness=true/reading=false[containers-not-ready]",
 			},
 		},
 		{
 			// A promoted pod that failed its readiness past the grace
 			// with its container running and no restart: the roll and
-			// the composition both read the Instance dark. The detector
-			// has no Ready anchor on the row and reads no restart.
-			name:    "dark pod the roll and the reading agree on",
+			// the composition both read the Instance unserving. The
+			// detector has no Ready anchor on the row and reads no restart.
+			name:    "pod unready past the grace the roll and the reading agree on",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.UnreadySince(now.Add(-2*time.Minute)))),
 			desired: 1,
 			row:     readyRow(0),
@@ -341,7 +341,7 @@ func TestCompare_CraftedSetsDisagreePerReader(t *testing.T) {
 			name:    "runner restarted since Ready, coming back inside the grace",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.RestartedAt(now.Add(-5*time.Minute)), fixture.UnreadySince(now.Add(-10*time.Second)))),
 			desired: 1,
-			row:     darkRow(),
+			row:     unservingRow(),
 			want: map[string]string{
 				compare.ReaderRunnerRestarted: "runnerRestarted/ops=true/reading=coming-up",
 				compare.ReaderIsServing:       "gateWritten/podreadiness=true/reading=false[containers-not-ready]",
@@ -350,11 +350,11 @@ func TestCompare_CraftedSetsDisagreePerReader(t *testing.T) {
 		{
 			// A pod created after the row entered Ready is a rebuild, not
 			// one of the pods that were Ready then: the detector reads no
-			// restart on it, however it is parked.
-			name:    "pod rebuilt after the row entered Ready, parked in a crash loop",
+			// restart on it, however it is held.
+			name:    "pod rebuilt after the row entered Ready, held in a crash loop",
 			pods:    fixture.Pods(fixture.Pod(podName, fixture.CreatedAt(now.Add(-10*time.Minute)), fixture.ContainerWaiting("CrashLoopBackOff"))),
 			desired: 1,
-			row:     darkRow(),
+			row:     unservingRow(),
 			want: map[string]string{
 				compare.ReaderRunnerRestarted: "runnerRestarted/ops=false/reading=out-of-service[rebuilt]",
 				compare.ReaderIsServing:       "gateWritten/podreadiness=true/reading=false[containers-not-ready]",
@@ -486,8 +486,8 @@ func TestCompare_EvidenceReadersNeverDisagree(t *testing.T) {
 		"unready past":      {fixture.UnreadySince(now.Add(-2 * time.Minute))},
 		"unready inside":    {fixture.UnreadySince(now.Add(-time.Second))},
 		"never ready":       {fixture.NeverReady},
-		"parked":            {fixture.ContainerWaiting("CrashLoopBackOff")},
-		"parked, deleting":  {fixture.ContainerWaiting("CrashLoopBackOff"), fixture.Terminating},
+		"held":              {fixture.ContainerWaiting("CrashLoopBackOff")},
+		"held, deleting":    {fixture.ContainerWaiting("CrashLoopBackOff"), fixture.Terminating},
 		"restarted":         {fixture.RestartedAt(now.Add(-5 * time.Minute))},
 		"exited":            {fixture.ExitedAt(now.Add(-2 * time.Minute))},
 		"failed":            {fixture.Failed},

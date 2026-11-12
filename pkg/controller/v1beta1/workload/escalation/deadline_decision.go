@@ -9,8 +9,6 @@ import (
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
@@ -97,7 +95,7 @@ func DecideExpiredAttempt(ctx context.Context, deps types.Deps, input types.Reco
 		return DeadlineDecisionHeldBack, nil
 	}
 	if heldRev != "" {
-		return holdRevision(ctx, input, inst, pods, causePod, causeReason, heldRev, now)
+		return holdRevision(ctx, deps, input, inst, pods, causePod, causeReason, heldRev, now)
 	}
 	attempt := readExpiredAttempt(input, inst, pods, causePod, causeReason, reason, now)
 	if attempt.unplaceable() {
@@ -110,9 +108,9 @@ func DecideExpiredAttempt(ctx context.Context, deps types.Deps, input types.Reco
 		return DeadlineDecisionTerminal, err
 	}
 	if relocated {
-		return endExpiredAttempt(ctx, input, attempt, DeadlineDecisionRelocate, relocatedEndSummary, "")
+		return endExpiredAttempt(ctx, deps, input, attempt, DeadlineDecisionRelocate, relocatedEndSummary, "")
 	}
-	return endTerminal(ctx, input, attempt)
+	return endTerminal(ctx, deps, input, attempt)
 }
 
 // workloadCausedRevision names the revision a workload-caused failure
@@ -147,13 +145,13 @@ func workloadCausedRevision(input types.ReconcileInput, inst types.InstanceStatu
 // second, so a crash between the two re-enters here and the record's
 // dedup keeps the count. The warning names the held revision; the
 // operator publishes a corrected one.
-func holdRevision(ctx context.Context, input types.ReconcileInput, inst types.InstanceStatus, pods []*corev1.Pod, causePod *corev1.Pod, causeReason, heldRev string, now metav1.Time) (DeadlineDecision, error) {
+func holdRevision(ctx context.Context, deps types.Deps, input types.ReconcileInput, inst types.InstanceStatus, pods []*corev1.Pod, causePod *corev1.Pod, causeReason, heldRev string, now metav1.Time) (DeadlineDecision, error) {
 	cause := types.FailureCauseOf(causeReason)
 	if err := types.RecordUpdateFailureInRetryBlock(ctx, input, heldRev, causeReason, cause); err != nil {
 		return DeadlineDecisionRevisionHeld, fmt.Errorf("record retry block for the expired attempt (instance=%d rev=%s): %w", inst.Index, heldRev, err)
 	}
 	termination := types.PodTerminationWithReason(causePod, causeReason, now)
-	ended, err := endAttempt(ctx, input, inst, pods, termination, parkedWaitAfterFailure(input, heldRev, causeReason, cause, now))
+	ended, err := endAttempt(ctx, deps, input, inst, pods, termination, parkedWaitAfterFailure(input, heldRev, causeReason, cause, now))
 	if err != nil {
 		return DeadlineDecisionRevisionHeld, fmt.Errorf("clear operation + stamp Failed (instance=%d): %w", inst.Index, err)
 	}
@@ -277,7 +275,7 @@ func nodeToAvoid(input types.ReconcileInput, dd types.DispositionDeps, a expired
 // not another revision's leftover. The record is written before the end,
 // so a crash between the two re-enters here and the record's dedup keeps
 // the count.
-func endTerminal(ctx context.Context, input types.ReconcileInput, a expiredAttempt) (DeadlineDecision, error) {
+func endTerminal(ctx context.Context, deps types.Deps, input types.ReconcileInput, a expiredAttempt) (DeadlineDecision, error) {
 	summary, parkedWait := terminalEndSummary, ""
 	if chargeRev := terminalChargeRevision(input, a.inst, a.evidencePod, a.shortReason); chargeRev != "" {
 		failureReason := countedFailureReason(a.shortReason, a.termination)
@@ -286,7 +284,7 @@ func endTerminal(ctx context.Context, input types.ReconcileInput, a expiredAttem
 		}
 		summary, parkedWait = terminalCountedEndSummary, parkedWaitAfterFailure(input, chargeRev, failureReason, types.CauseUnattributed, a.now)
 	}
-	return endExpiredAttempt(ctx, input, a, DeadlineDecisionTerminal, summary, parkedWait)
+	return endExpiredAttempt(ctx, deps, input, a, DeadlineDecisionTerminal, summary, parkedWait)
 }
 
 // endExpiredAttempt writes the end the relocate and terminal branches
@@ -296,8 +294,8 @@ func endTerminal(ctx context.Context, input types.ReconcileInput, a expiredAttem
 // observation, already names the class when the warning fired before.
 // parkedWait is the hold the stopped attempt stands behind, "" when the
 // failure was not counted.
-func endExpiredAttempt(ctx context.Context, input types.ReconcileInput, a expiredAttempt, decision DeadlineDecision, summary, parkedWait string) (DeadlineDecision, error) {
-	ended, err := endAttempt(ctx, input, a.inst, a.pods, a.termination, parkedWait)
+func endExpiredAttempt(ctx context.Context, deps types.Deps, input types.ReconcileInput, a expiredAttempt, decision DeadlineDecision, summary, parkedWait string) (DeadlineDecision, error) {
+	ended, err := endAttempt(ctx, deps, input, a.inst, a.pods, a.termination, parkedWait)
 	if err != nil {
 		return decision, fmt.Errorf("clear operation + stamp Failed (instance=%d): %w", a.inst.Index, err)
 	}
@@ -315,9 +313,15 @@ func endExpiredAttempt(ctx context.Context, input types.ReconcileInput, a expire
 // at step Parked, with the hold its next attempt waits on, so the row's
 // phase can follow a set the kubelet goes on retrying. An attempt whose
 // pods are gone, or whose failure was not counted, has its operation
-// cleared. Either write lands only while the fresh row still carries the
-// observed attempt; it reports whether the row changed.
-func endAttempt(ctx context.Context, input types.ReconcileInput, inst types.InstanceStatus, pods []*corev1.Pod, termination *types.InstanceTermination, wait string) (bool, error) {
+// cleared. A single-pod surge that took its source out of rotation hands
+// it back first, before the row is written, so the Instance serves from
+// the pod it had while nothing else serves for it. Either write lands
+// only while the fresh row still carries the observed attempt; it reports
+// whether the row changed.
+func endAttempt(ctx context.Context, deps types.Deps, input types.ReconcileInput, inst types.InstanceStatus, pods []*corev1.Pod, termination *types.InstanceTermination, wait string) (bool, error) {
+	if err := workloadops.RestoreSourceRotation(ctx, deps, inst, pods); err != nil {
+		return false, fmt.Errorf("return the ended surge's source to rotation (instance=%d): %w", inst.Index, err)
+	}
 	if wait != "" && attemptParkable(inst, pods) {
 		return status.StampFailedParkingAttempt(ctx, input, inst.Index, *inst.Operation, termination, wait)
 	}
@@ -456,115 +460,156 @@ func attemptTargetRevision(input types.ReconcileInput, inst types.InstanceStatus
 	return input.ObservedState.UpdateRevision
 }
 
+// relocationDirective is one node exclusion to record for an Instance whose
+// attempt expired: the revision the exclusion binds, the node the rebuild
+// avoids, the readiness detail that explains it, and the relocation budget.
+type relocationDirective struct {
+	component   string
+	instance    int32
+	revision    string
+	fromNode    string
+	detail      string
+	maxAttempts int32
+}
+
+// relocationRecord is a directive taken: the budget slot it takes, its
+// request UUID and the time it was written.
+type relocationRecord struct {
+	relocationDirective
+	attempt     int32
+	requestUUID string
+	at          metav1.Time
+}
+
 // recordRelocationDirective records the node exclusion: a completed
 // AutoRecover entry in the audit record with the node and the revision,
 // the only revision the exclusion binds. The entry is a record, not a
 // migration request: the migration work loop never selects it, and the
 // rebuild avoids the node through the node term it renders. Three guards
-// run first, in order:
-//
-//  1. An entry for this attempt already exists (same node, completed
-//     after the operation started): a pass wrote it and then lost the
-//     operation clear. It counts as recorded; no new entry, event or
-//     budget slot.
-//  2. The exclusions the rebuild would render, this node plus the newest
-//     ones kept for the revision, would leave the pod templates' required
-//     node affinity unsatisfiable: nothing is recorded.
-//  3. The relocation budget is spent: nothing is recorded and nothing is
-//     announced, because the cap warning fired once when the last slot
-//     was taken.
-//
-// After the audit record persists, a completed Auto migration record is
-// mirrored into the status for visibility. A failed mirror is logged and
-// never fails the decision.
+// run first, in order: a pass already wrote this attempt's entry
+// (recordedFor), the exclusions would leave the pod templates
+// unplaceable (leavesRebuildUnplaceable), the relocation budget is
+// spent. A spent budget publishes nothing, because the cap warning fired
+// once when the last slot was taken. After the audit record persists,
+// the completed Auto migration record is mirrored into the status and
+// the events are published.
 func recordRelocationDirective(ctx context.Context, deps types.Deps, input types.ReconcileInput, dd types.DispositionDeps, inst types.InstanceStatus, revision, fromNode, detail string) (recorded bool, err error) {
-	owner := auditRecordOwner(input)
-	ledger, err := audit.LoadLedgerForOwner(ctx, deps.Reader(), owner)
+	owner, ownerGVK := input.AuditOwner()
+	auditRecord, err := audit.LoadLedgerForOwner(ctx, deps.Reader(), owner)
 	if err != nil {
 		return false, fmt.Errorf("load audit ledger (instance=%d): %w", inst.Index, err)
 	}
-	component := string(input.Key.Component)
-
-	// Guard 1. An operation with no start time cannot prove the entry
-	// postdates it, so it records normally.
-	if newest := audit.NewestAutoRecoverEntry(ledger, component, inst.Index); newest != nil &&
-		inst.Operation != nil && !inst.Operation.StartedAt.IsZero() && newest.FromNode == fromNode {
-		if completed, ok := newest.CompletedAtTime(); ok && completed.After(inst.Operation.StartedAt.Time) {
-			return true, nil
-		}
+	directive := relocationDirective{
+		component: string(input.Key.Component), instance: inst.Index,
+		revision: revision, fromNode: fromNode, detail: detail, maxAttempts: dd.AutoMigrateMaxAttempts,
 	}
-
-	// Guard 2, over exactly the set the rebuild will render: fromNode
-	// plus the newest maxAttempts-1 nodes recorded for this revision.
-	exclusions := append(audit.NodesExcludedForRevision(audit.RecentAutoRecoverExclusions(ledger, component, inst.Index, dd.AutoMigrateMaxAttempts-1), revision), fromNode)
-	if workloadops.WouldExclusionsConflictWithNodeAffinity(dd.PodSpec, exclusions) ||
-		workloadops.WouldExclusionsConflictWithNodeAffinity(dd.WorkerPodSpec, exclusions) {
+	if directive.recordedFor(auditRecord, inst.Operation) {
+		return true, nil
+	}
+	if directive.leavesRebuildUnplaceable(auditRecord, dd) {
 		return false, nil
 	}
-
-	// Guard 3.
-	attempts := audit.CountAutoRecoverAttempts(ledger, component, inst.Index)
-	if attempts >= dd.AutoMigrateMaxAttempts {
+	attempts := audit.CountAutoRecoverAttempts(auditRecord, directive.component, directive.instance)
+	if attempts >= directive.maxAttempts {
 		return false, nil
 	}
+	record := relocationRecord{relocationDirective: directive, attempt: attempts + 1, requestUUID: uuid.NewString(), at: metav1.NewTime(input.Now())}
+	auditRecord.UpsertEntry(record.entry())
+	if err := audit.PersistLedgerForOwner(ctx, deps.Client, owner, ownerGVK, auditRecord); err != nil {
+		return false, fmt.Errorf("persist audit ledger (instance=%d): %w", inst.Index, err)
+	}
+	record.mirror(ctx, input)
+	record.publish(deps, input)
+	if dd.OnRelocationDirective != nil {
+		dd.OnRelocationDirective(directive.component)
+	}
+	return true, nil
+}
 
-	nowT := metav1.NewTime(input.Now())
-	now := nowT.UTC().Format(time.RFC3339)
-	reqUUID := uuid.NewString()
-	ledger.UpsertEntry(audit.Entry{
-		RequestUUID:    reqUUID,
-		Component:      component,
-		SourceInstance: inst.Index,
+// recordedFor reports whether a pass already wrote this attempt's exclusion
+// and then lost the operation clear: the newest AutoRecover entry names the
+// same node and completed after the operation started. An operation with no
+// start time cannot prove the entry postdates it.
+func (d relocationDirective) recordedFor(auditRecord *audit.Ledger, operation *types.InstanceOperation) bool {
+	if operation == nil || operation.StartedAt.IsZero() {
+		return false
+	}
+	newest := audit.NewestAutoRecoverEntry(auditRecord, d.component, d.instance)
+	if newest == nil || newest.FromNode != d.fromNode {
+		return false
+	}
+	completed, ok := newest.CompletedAtTime()
+	return ok && completed.After(operation.StartedAt.Time)
+}
+
+// leavesRebuildUnplaceable reports whether the exclusions the rebuild would
+// render, this node plus the newest maxAttempts-1 nodes recorded for the
+// revision, would leave a pod template's required node affinity
+// unsatisfiable.
+func (d relocationDirective) leavesRebuildUnplaceable(auditRecord *audit.Ledger, dd types.DispositionDeps) bool {
+	kept := audit.RecentAutoRecoverExclusions(auditRecord, d.component, d.instance, d.maxAttempts-1)
+	exclusions := append(audit.NodesExcludedForRevision(kept, d.revision), d.fromNode)
+	return workloadops.WouldExclusionsConflictWithNodeAffinity(dd.PodSpec, exclusions) ||
+		workloadops.WouldExclusionsConflictWithNodeAffinity(dd.WorkerPodSpec, exclusions)
+}
+
+// entry is the completed AutoRecover entry the audit record keeps for the
+// directive.
+func (r relocationRecord) entry() audit.Entry {
+	at := r.at.UTC().Format(time.RFC3339)
+	return audit.Entry{
+		RequestUUID:    r.requestUUID,
+		Component:      r.component,
+		SourceInstance: r.instance,
 		Phase:          audit.PhaseCompleted,
 		Reason:         audit.ReasonAutoRecover,
 		Outcome:        audit.OutcomeRelocateRecreate,
-		FromNode:       fromNode,
-		Revision:       revision,
-		StartedAt:      now,
-		CompletedAt:    now,
+		FromNode:       r.fromNode,
+		Revision:       r.revision,
+		StartedAt:      at,
+		CompletedAt:    at,
+	}
+}
+
+// mirror writes the completed Auto migration record into the status for
+// visibility. A failed mirror is logged and never fails the decision. The
+// record's Deadline is required by the schema and carries no meaning here.
+func (r relocationRecord) mirror(ctx context.Context, input types.ReconcileInput) {
+	if input.AppendMigration == nil {
+		return
+	}
+	completedAt := r.at
+	err := input.AppendMigration(ctx, types.MigrationRecord{
+		RequestUUID:    r.requestUUID,
+		Trigger:        types.MigrationTriggerAuto,
+		SourceInstance: r.instance,
+		FromNode:       r.fromNode,
+		Phase:          types.MigrationPhaseRelocated,
+		Attempt:        r.attempt,
+		Reason:         audit.ReasonAutoRecover,
+		Message:        relocationRecordMessage(r.fromNode, r.detail),
+		StartedAt:      r.at,
+		Deadline:       r.at,
+		CompletedAt:    &completedAt,
 	})
-	if err := audit.PersistLedgerForOwner(ctx, deps.Client, owner, auditRecordOwnerGVK(input), ledger); err != nil {
-		return false, fmt.Errorf("persist audit ledger (instance=%d): %w", inst.Index, err)
+	if err != nil {
+		logf.FromContext(ctx).V(1).Info("relocation status-record mirror failed; ledger remains authoritative",
+			"uuid", r.requestUUID, "instance", r.instance, "error", err.Error())
 	}
-	// The mirrored record is complete when written; its Deadline is
-	// required by the schema and carries no meaning here.
-	if input.AppendMigration != nil {
-		completedAt := nowT
-		if aerr := input.AppendMigration(ctx, types.MigrationRecord{
-			RequestUUID:    reqUUID,
-			Trigger:        types.MigrationTriggerAuto,
-			SourceInstance: inst.Index,
-			FromNode:       fromNode,
-			Phase:          types.MigrationPhaseRelocated,
-			Attempt:        attempts + 1,
-			Reason:         audit.ReasonAutoRecover,
-			Message:        relocationRecordMessage(fromNode, detail),
-			StartedAt:      nowT,
-			Deadline:       nowT,
-			CompletedAt:    &completedAt,
-		}); aerr != nil {
-			logf.FromContext(ctx).V(1).Info("relocation status-record mirror failed; ledger remains authoritative",
-				"uuid", reqUUID, "instance", inst.Index, "error", aerr.Error())
-		}
+}
+
+// publish emits the directive's event and, on the directive that takes the
+// last budget slot, the cap warning, once.
+func (r relocationRecord) publish(deps types.Deps, input types.ReconcileInput) {
+	target := types.EventTarget(input)
+	types.RecordNormal(deps.Recorder, target, types.EventReasonAutoMigrationTriggered,
+		"OMENative component=%s instance=%d relocation directive recorded: attempt %d/%d, rebuild steered off node %s (uuid=%s)",
+		r.component, r.instance, r.attempt, r.maxAttempts, r.fromNode, r.requestUUID)
+	if r.attempt == r.maxAttempts {
+		types.RecordWarning(deps.Recorder, target, types.EventReasonAutoMigrationCapReached,
+			"OMENative component=%s instance=%d relocation budget exhausted (%d/%d attempts); further expiries dispose terminal without relocation",
+			r.component, r.instance, r.attempt, r.maxAttempts)
 	}
-	if deps.Recorder != nil {
-		if target := types.EventTarget(input); target != nil {
-			deps.Recorder.Eventf(target, corev1.EventTypeNormal, string(types.EventReasonAutoMigrationTriggered),
-				"OMENative component=%s instance=%d relocation directive recorded: attempt %d/%d, rebuild steered off node %s (uuid=%s)",
-				component, inst.Index, attempts+1, dd.AutoMigrateMaxAttempts, fromNode, reqUUID)
-			// The cap warning fires once, on the directive that takes the
-			// last budget slot.
-			if attempts+1 == dd.AutoMigrateMaxAttempts {
-				deps.Recorder.Eventf(target, corev1.EventTypeWarning, string(types.EventReasonAutoMigrationCapReached),
-					"OMENative component=%s instance=%d relocation budget exhausted (%d/%d attempts); further expiries dispose terminal without relocation",
-					component, inst.Index, attempts+1, dd.AutoMigrateMaxAttempts)
-			}
-		}
-	}
-	if dd.OnRelocationDirective != nil {
-		dd.OnRelocationDirective(component)
-	}
-	return true, nil
 }
 
 // releaseNodeExclusions removes the node exclusions this Instance holds
@@ -573,7 +618,7 @@ func recordRelocationDirective(ctx context.Context, deps types.Deps, input types
 // no write and no event. A persist conflict is returned as the error the
 // reconcile retries on.
 func releaseNodeExclusions(ctx context.Context, deps types.Deps, input types.ReconcileInput, inst types.InstanceStatus, revision string) error {
-	owner := auditRecordOwner(input)
+	owner, ownerGVK := input.AuditOwner()
 	if deps.Client == nil || owner == nil || revision == "" {
 		return nil
 	}
@@ -586,35 +631,13 @@ func releaseNodeExclusions(ctx context.Context, deps types.Deps, input types.Rec
 	if len(released) == 0 {
 		return nil
 	}
-	if err := audit.PersistLedgerForOwner(ctx, deps.Client, owner, auditRecordOwnerGVK(input), ledger); err != nil {
+	if err := audit.PersistLedgerForOwner(ctx, deps.Client, owner, ownerGVK, ledger); err != nil {
 		return fmt.Errorf("persist audit ledger (instance=%d): %w", inst.Index, err)
 	}
-	if deps.Recorder != nil {
-		if target := types.EventTarget(input); target != nil {
-			deps.Recorder.Eventf(target, corev1.EventTypeNormal, string(types.EventReasonNodeExclusionReleased),
-				"OMENative component=%s instance=%d node exclusion released for revision %s: no other node had room for the rebuild; it may land on %s again",
-				component, inst.Index, revision, strings.Join(released, ", "))
-		}
-	}
+	types.RecordNormal(deps.Recorder, types.EventTarget(input), types.EventReasonNodeExclusionReleased,
+		"OMENative component=%s instance=%d node exclusion released for revision %s: no other node had room for the rebuild; it may land on %s again",
+		component, inst.Index, revision, strings.Join(released, ", "))
 	return nil
-}
-
-// auditRecordOwner and auditRecordOwnerGVK name the object the audit
-// record hangs off, resolved the way the migration verb resolves it: the
-// adapter may point LedgerOwner at the user-facing parent; nil means the
-// owner object itself.
-func auditRecordOwner(input types.ReconcileInput) client.Object {
-	if input.LedgerOwner != nil {
-		return input.LedgerOwner
-	}
-	return input.OwnerObject
-}
-
-func auditRecordOwnerGVK(input types.ReconcileInput) schema.GroupVersionKind {
-	if input.LedgerOwner != nil {
-		return input.LedgerOwnerGVK
-	}
-	return input.OwnerGVK
 }
 
 // relocationRecordMessage is the summary on the mirrored migration

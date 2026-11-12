@@ -949,9 +949,10 @@ func TestParkedReattemptsTheOpenEveryPass(t *testing.T) {
 	}
 }
 
-// A plan edit while parked is composed again on the next pass: an inline
-// arm added to the unresolvable reference, or a reshaped group list that
-// renders, opens the run; the edited body is what gets pinned.
+// A plan edit while the open is held is composed again on the next pass:
+// an inline body added to the unresolvable reference, a changed member
+// list, or a reshaped group list that renders, opens the run; the edited
+// body is what gets recorded.
 func TestParkedPlanEditIsComposedOnTheNextPass(t *testing.T) {
 	t.Run("inlineBody", func(t *testing.T) {
 		isvc := parkedOnMissingPolicy(t)
@@ -963,6 +964,22 @@ func TestParkedPlanEditIsComposedOnTheNextPass(t *testing.T) {
 		g := requirePinned(t, isvc).Plan.Groups[0]
 		if g.Source != v1beta1.RolloutPlanSourceInline || g.Group.Canary == nil || g.Group.Canary.Steps[0].Traffic != 25 {
 			t.Fatalf("pinned group = %+v, want the inline body", g)
+		}
+	})
+	t.Run("membersChanged", func(t *testing.T) {
+		isvc := parkedOnMissingPolicy(t)
+		isvc.Spec.Rollout.Groups[0].Components = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}
+		decoder := namedIR("llm-a-decoder", "llm-a-decoder-dddddddd", "llm-a-decoder-dddddddd")
+		if out := pass(t, isvc, divergedIR(oldRev, newRev), decoder); out.Opened {
+			t.Fatalf("outcome = %+v, want the open held while the policy is missing", out)
+		}
+		isvc.Spec.Rollout.Groups[0].Canary = canaryBody(25, 100)
+		out := pass(t, isvc, divergedIR(oldRev, newRev), decoder)
+		if !out.Opened {
+			t.Fatalf("outcome = %+v, want the plan with the added member to open the run once it renders", out)
+		}
+		if run := requirePinned(t, isvc); len(run.Plan.Groups[0].Group.Components) != 2 || len(run.TargetRevisions) != 2 {
+			t.Fatalf("recorded run = %+v, want both members", run)
 		}
 	})
 	t.Run("groupShape", func(t *testing.T) {
@@ -1315,5 +1332,79 @@ func TestAPlanHeldForAMissingPolicyOpensOnceThePolicyExists(t *testing.T) {
 	}
 	if c := planReady(isvc); c == nil || c.Status != corev1.ConditionTrue || c.Reason != v1beta1.RolloutPlanReasonPinned {
 		t.Fatalf("RolloutPlanReady = %+v, want True with reason %s", c, v1beta1.RolloutPlanReasonPinned)
+	}
+}
+
+// A unit past its last step whose primary has not read Stable is still in
+// flight: the last held Instance is rolling and the executor lands the
+// cutover on a later pass. A run lost at that moment is adopted in place,
+// so the cutover lands under an open run and the close is recorded once the
+// unit reads Stable with its replica promoted: the last run on file reads
+// Completed and RolloutPlanReady names it.
+func TestARunLostPastTheLastStepIsAdoptedAndClosesWithTheCutover(t *testing.T) {
+	isvc := isvcFixture(inlineCanary())
+	setEngineUnit(isvc, v1beta1.RolloutPhasePromoting, &v1beta1.CanaryStatus{
+		CanaryRevisionHash:    hashOf(t, newRev),
+		StableRevisionHash:    hashOf(t, oldRev),
+		CurrentStep:           2,
+		ObservedTrafficWeight: 100,
+	})
+	ir := settledIR(newRev)
+
+	out := pass(t, isvc, ir)
+	if !out.Opened || !out.Adopted || !v1beta1.RolloutRunActive(isvc) {
+		t.Fatalf("the lost run was not adopted around the pending cutover: %+v active=%v", out, v1beta1.RolloutRunActive(isvc))
+	}
+	if cs := isvc.Status.Components[v1beta1.EngineComponent].Canary; cs == nil || cs.CurrentStep != 2 {
+		t.Fatalf("the adoption moved the unit's record: %+v", cs)
+	}
+	if next := pass(t, isvc, ir); next.Opened || next.StateChanged || !v1beta1.RolloutRunActive(isvc) {
+		t.Fatalf("the adopted run did not wait for the cutover: %+v", next)
+	}
+
+	// The executor lands the cutover: the primary reads Stable.
+	engine := isvc.Status.Components[v1beta1.EngineComponent]
+	engine.RolloutPhase = v1beta1.RolloutPhaseStable
+	isvc.Status.Components[v1beta1.EngineComponent] = engine
+	out = pass(t, isvc, ir)
+	if !out.StateChanged || v1beta1.RolloutRunActive(isvc) {
+		t.Fatalf("the cutover did not close the adopted run: %+v", out)
+	}
+	if last := isvc.Status.Rollout.LastRun; last == nil || last.Outcome != v1beta1.RolloutRunCompleted {
+		t.Fatalf("lastRun = %+v, want Completed", last)
+	}
+	requireNoRun(t, isvc, v1beta1.RolloutPlanReasonNoRun)
+}
+
+// A unit found finished with no run on file, its record past the last
+// step with the pre-canary identity dropped and the replica promoted, opens
+// nothing: the run that presented the revision was lost after the cutover
+// landed, so no close is recorded. RolloutPlanReady reads True NoActiveRun
+// with no last run, and the record stands as the unit's done mark. The
+// phase a later write left on it does not matter: a finished unit whose
+// phase an outside writer set to Failed is still finished.
+func TestACanaryThatCompletedWithNoRunOnFileOpensNothing(t *testing.T) {
+	for name, phase := range map[string]v1beta1.RolloutPhase{"reading Stable": v1beta1.RolloutPhaseStable, "written Failed from outside": v1beta1.RolloutPhaseFailed} {
+		t.Run(name, func(t *testing.T) {
+			isvc := isvcFixture(inlineCanary())
+			setEngineUnit(isvc, phase, &v1beta1.CanaryStatus{
+				CanaryRevisionHash:    hashOf(t, newRev),
+				CurrentStep:           2,
+				ObservedTrafficWeight: 100,
+			})
+			ir := settledIR(newRev)
+			for i := 0; i < 3; i++ {
+				if out := pass(t, isvc, ir); out.Opened || out.Adopted || out.StateChanged || v1beta1.RolloutRunActive(isvc) {
+					t.Fatalf("pass %d opened a run around a finished unit: %+v", i, out)
+				}
+			}
+			requireNoRun(t, isvc, v1beta1.RolloutPlanReasonNoRun)
+			if isvc.Status.Rollout != nil && isvc.Status.Rollout.LastRun != nil {
+				t.Fatalf("a run was recorded for a cutover no run presented: %+v", isvc.Status.Rollout.LastRun)
+			}
+			if cs := isvc.Status.Components[v1beta1.EngineComponent].Canary; cs == nil || cs.CurrentStep != 2 {
+				t.Fatalf("the run layer rewrote the unit's record: %+v", cs)
+			}
+		})
 	}
 }

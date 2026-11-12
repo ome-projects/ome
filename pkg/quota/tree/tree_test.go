@@ -425,8 +425,8 @@ func TestBuildTreeShape(t *testing.T) {
 			if gotRoot != tc.wantRoot {
 				t.Errorf("Root = %q, want %q", gotRoot, tc.wantRoot)
 			}
-			if got := tr.Len(); got != len(tc.want) {
-				t.Errorf("Len = %d, want %d", got, len(tc.want))
+			if got := len(tr.Nodes()); got != len(tc.want) {
+				t.Errorf("Nodes = %d, want %d", got, len(tc.want))
 			}
 		})
 	}
@@ -889,16 +889,6 @@ func TestViolations(t *testing.T) {
 					t.Errorf("Error() mismatch (-want +got):\n%s", diff)
 				}
 			})
-		}
-	})
-
-	t.Run("OrNil converts only a non-empty set", func(t *testing.T) {
-		var empty Violations
-		if empty.OrNil() != nil {
-			t.Errorf("empty Violations must convert to a nil error")
-		}
-		if (Violations{{Node: "a", Message: "boom"}}).OrNil() == nil {
-			t.Errorf("non-empty Violations must convert to a non-nil error")
 		}
 	})
 

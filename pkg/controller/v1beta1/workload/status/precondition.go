@@ -10,106 +10,108 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// Identity is the row identity a stamp was decided against: the
-// incarnation it read, the operation that owns it (id, type, step,
-// request, retry count, reason, node hints, surge pointer) and the
-// revisions it runs between. Runtime counters, conditions, node history
-// and operation timestamps are deliberately outside it — they move
-// without transferring ownership of the action a stamp is completing.
+// Identity is the row identity a write was decided against: the attempt
+// it read (index, incarnation, phase, the revisions it runs between, the
+// active ordinal) and the operation that owns the row (id, type, step,
+// request, retry count, reason, node hints, surge index). Runtime
+// counters, conditions, node history and operation timestamps are
+// outside it: they move without transferring ownership of the action
+// the write completes.
 //
-// One type, one comparison, stated here rather than re-typed at every
-// call site: a stamp that lands on a row no longer answering to the
-// identity it was decided against is a write from a pass that has been
-// overtaken.
+// One type, one comparison: a write that lands on a row that reads to a
+// different identity than the one it was decided against comes from a
+// pass that was overtaken.
 type Identity struct {
+	rowIdentity
+	operation operationIdentity
+}
+
+// rowIdentity is the part of the identity read off the row itself.
+type rowIdentity struct {
 	index           int32
 	incarnation     int64
 	phase           types.InstancePhase
 	runningRevision string
 	targetRevision  string
 	activeOrdinal   int32
-	operation       operationIdentity
 }
 
+// operationIdentity is the part read off the row's operation. The node
+// hints sit beside the comparable fields because a slice has no equality
+// operator. A row without an operation reads to the zero value.
 type operationIdentity struct {
-	present         bool
-	id              string
-	operationType   types.InstanceOperationType
-	step            string
-	requestUUID     string
-	targetRevision  string
-	retryCount      int32
-	reason          string
-	fromNode        string
+	fields          operationFields
 	hintTargetNodes []string
-	surgeIndex      int32
-	hasSurgeIndex   bool
 }
 
-// Capture reads the identity off a row. A nil row captures the zero
-// identity, which matches only an equally empty row.
+type operationFields struct {
+	present        bool
+	id             string
+	operationType  types.InstanceOperationType
+	step           string
+	requestUUID    string
+	targetRevision string
+	retryCount     int32
+	reason         string
+	fromNode       string
+	surgeIndex     int32
+	hasSurgeIndex  bool
+}
+
+// Capture reads the identity off a row and keeps its own copy of the node
+// hints. A nil row captures the zero identity, which matches only an
+// equally empty row.
 func Capture(status *types.InstanceStatus) Identity {
-	identity := Identity{}
+	identity := readIdentity(status)
+	identity.operation.hintTargetNodes = append([]string(nil), identity.operation.hintTargetNodes...)
+	return identity
+}
+
+// readIdentity reads the identity fields off a row, sharing the row's
+// node hints. It is the one list of the fields an identity is made of.
+func readIdentity(status *types.InstanceStatus) Identity {
 	if status == nil {
-		return identity
+		return Identity{}
 	}
-	identity.index = status.Index
-	identity.incarnation = status.Incarnation
-	identity.phase = status.Phase
-	identity.runningRevision = status.RunningRevision
-	identity.targetRevision = status.TargetRevision
-	identity.activeOrdinal = status.ActiveOrdinal
+	identity := Identity{rowIdentity: rowIdentity{
+		index:           status.Index,
+		incarnation:     status.Incarnation,
+		phase:           status.Phase,
+		runningRevision: status.RunningRevision,
+		targetRevision:  status.TargetRevision,
+		activeOrdinal:   status.ActiveOrdinal,
+	}}
 	if status.Operation == nil {
 		return identity
 	}
 	identity.operation = operationIdentity{
-		present:         true,
-		id:              status.Operation.ID,
-		operationType:   status.Operation.Type,
-		step:            status.Operation.Step,
-		requestUUID:     status.Operation.RequestUUID,
-		targetRevision:  status.Operation.TargetRevision,
-		retryCount:      status.Operation.RetryCount,
-		reason:          status.Operation.Reason,
-		fromNode:        status.Operation.FromNode,
-		hintTargetNodes: append([]string(nil), status.Operation.HintTargetNodes...),
+		fields: operationFields{
+			present:        true,
+			id:             status.Operation.ID,
+			operationType:  status.Operation.Type,
+			step:           status.Operation.Step,
+			requestUUID:    status.Operation.RequestUUID,
+			targetRevision: status.Operation.TargetRevision,
+			retryCount:     status.Operation.RetryCount,
+			reason:         status.Operation.Reason,
+			fromNode:       status.Operation.FromNode,
+		},
+		hintTargetNodes: status.Operation.HintTargetNodes,
 	}
 	if status.Operation.SurgeIndex != nil {
-		identity.operation.hasSurgeIndex = true
-		identity.operation.surgeIndex = *status.Operation.SurgeIndex
+		identity.operation.fields.hasSurgeIndex = true
+		identity.operation.fields.surgeIndex = *status.Operation.SurgeIndex
 	}
 	return identity
 }
 
-// Matches reports whether status still answers to this identity.
+// Matches reports whether status still answers to this identity: the row
+// reads to the same identity, field for field.
 func (identity Identity) Matches(status types.InstanceStatus) bool {
-	if status.Index != identity.index ||
-		status.Incarnation != identity.incarnation ||
-		status.Phase != identity.phase ||
-		status.RunningRevision != identity.runningRevision ||
-		status.TargetRevision != identity.targetRevision ||
-		status.ActiveOrdinal != identity.activeOrdinal {
-		return false
-	}
-	if status.Operation == nil {
-		return !identity.operation.present
-	}
-	if !identity.operation.present ||
-		status.Operation.ID != identity.operation.id ||
-		status.Operation.Type != identity.operation.operationType ||
-		status.Operation.Step != identity.operation.step ||
-		status.Operation.RequestUUID != identity.operation.requestUUID ||
-		status.Operation.TargetRevision != identity.operation.targetRevision ||
-		status.Operation.RetryCount != identity.operation.retryCount ||
-		status.Operation.Reason != identity.operation.reason ||
-		status.Operation.FromNode != identity.operation.fromNode ||
-		!slices.Equal(status.Operation.HintTargetNodes, identity.operation.hintTargetNodes) {
-		return false
-	}
-	if status.Operation.SurgeIndex == nil {
-		return !identity.operation.hasSurgeIndex
-	}
-	return identity.operation.hasSurgeIndex && *status.Operation.SurgeIndex == identity.operation.surgeIndex
+	current := readIdentity(&status)
+	return identity.rowIdentity == current.rowIdentity &&
+		identity.operation.fields == current.operation.fields &&
+		slices.Equal(identity.operation.hintTargetNodes, current.operation.hintTargetNodes)
 }
 
 // holds reports whether the fresh rows still carry, at this identity's
@@ -119,11 +121,15 @@ func (identity Identity) holds(rows types.InstanceMutationSnapshot) bool {
 	return found && identity.Matches(current)
 }
 
-// WithStep is this identity with the operation's step replaced — the
-// shape a step transition expects to find after its own write.
+// WithStep is this identity with the operation's step replaced, the shape
+// a step transition expects to find after its own write. An identity
+// without an operation has no step to replace.
 func (identity Identity) WithStep(step string) Identity {
+	if !identity.operation.fields.present {
+		return identity
+	}
 	after := identity
-	after.operation.step = step
+	after.operation.fields.step = step
 	return after
 }
 

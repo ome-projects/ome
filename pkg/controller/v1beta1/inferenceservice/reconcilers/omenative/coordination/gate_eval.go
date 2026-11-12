@@ -30,8 +30,9 @@ import (
 // it), Held (the batch step's wait on a named first side whose retry
 // record is Held), Budget (surge or unavailability), or Sequential
 // accordingly. A member of a prefill/decode canary unit stops after the
-// pairing gate: the canary executor stages its capacity and its own budget
-// paces its starts.
+// batch step: the canary executor stages its capacity and its own budget
+// paces its starts. A member of a recorded group the spec no longer
+// declares stops after the pairing gate: its own budget paces its starts.
 //
 // The batch step takes the ratio gate's place for the members of a group
 // whose engine and decoder both step (readBatchStep): a drain-first member
@@ -58,7 +59,7 @@ import (
 // images) arrives as RecreatePod, so an in-place value here is a start
 // that patches the same pod. In-place starts (InPlaceIfPossible / InPlaceOnly)
 // consult only the new-revision lockstep half of the ratio gate
-// (CheckRatioLockstep): the patched Instance moves to the new revision like
+// (checkRatioLockstep): the patched Instance moves to the new revision like
 // any other, so a Component already rolled further than its peer by more
 // than the tolerance waits. The serving-capacity band is waived for them:
 // the drain is paired 1:1 with a same-pod return (mark-not-ready -> patch
@@ -96,11 +97,32 @@ func EvaluateUpdateGate(
 	strategy workloadtypes.UpdateStrategyType,
 	inFlightSurge, inFlightUnavail int32,
 ) (allowed bool, gate v1beta1.RolloutHoldGate, denyReason string) {
+	return EvaluateUpdateGateWithPods(ctx, reads, isvc, component, fromRevision, targetRevision, recorder, defaults, strategy, inFlightSurge, inFlightUnavail, nil)
+}
+
+// EvaluateUpdateGateWithPods is EvaluateUpdateGate with the Component's own
+// pods handed in: the unavailability gate reads them from pods instead of
+// listing them through reads, so a caller that consults the gate for several
+// Instances in one pass lists the pods once. A nil pods lists at each consult.
+func EvaluateUpdateGateWithPods(
+	ctx context.Context,
+	reads client.Reader,
+	isvc *v1beta1.InferenceService,
+	component v1beta1.ComponentType,
+	fromRevision string,
+	targetRevision *appsv1.ControllerRevision,
+	recorder record.EventRecorder,
+	defaults GroupDefaults,
+	strategy workloadtypes.UpdateStrategyType,
+	inFlightSurge, inFlightUnavail int32,
+	pods PodSource,
+) (allowed bool, gate v1beta1.RolloutHoldGate, denyReason string) {
 	// The gate context is resolved once so the shared prelude (ResolveGroups +
 	// MembershipFor + nil-isvc / no-coord short-circuit) runs once instead of
 	// four times -- see the coordination.GateContext docs.
 	gateCtx := ResolveGateContextWithDefaults(ctx, reads, isvc, component, defaults)
 	gateCtx.TargetRevision = targetRevision
+	gateCtx.ComponentPods = pods
 
 	// The plan gate precedes every content gate: with no pinned run there is
 	// no validated plan to evaluate the other gates against.
@@ -117,34 +139,65 @@ func EvaluateUpdateGate(
 		return false, v1beta1.RolloutHoldGatePairing, pairing.reason
 	}
 
-	// A member of a prefill/decode canary unit answers to the pairing gate
-	// alone: the canary executor stages its capacity through the partition
-	// and its own budget paces its starts, so the batch step, the ratio
-	// band, the group budgets and the Sequential gate are not consulted.
-	if gateCtx.CanaryUnit {
-		return true, "", ""
-	}
-
 	// The batch step reads every member's replica; a read it cannot make
 	// fails closed like the other gates, under the gate name its hold uses.
+	// A pairing peer the pairing gate holds still is not waited on.
 	batch, err := gateCtx.readBatchStep()
 	if err != nil {
 		return false, v1beta1.RolloutHoldGateRatio, err.Error()
 	}
+	var waived v1beta1.ComponentType
+	if pairing.peerHeldStill {
+		waived = pairingPeer(component)
+	}
 
+	switch gateCtx.Scope {
+	case CanaryUnit:
+		// A member of a prefill/decode canary unit answers to the pairing
+		// gate and to the batch step: the canary executor stages the unit's
+		// capacity through each member's partition, and inside a step, as
+		// under a revert, the two sides' starts are batched the way a plain
+		// roll's are, over the Instances the partition lets move. The ratio
+		// band, the group budgets and the Sequential gate read a coordination
+		// group and are not consulted; the member's own budget paces its
+		// starts.
+		if batch.governs {
+			if gate, reason := batch.hold(waived); gate != "" {
+				return false, gate, reason
+			}
+		}
+		return true, "", ""
+	case RecordedGroupPairing:
+		// A member of a recorded group the spec no longer declares answers to
+		// the pairing gate alone: the member's own budget paces its starts,
+		// so the batch step, the ratio band, the group budgets and the
+		// Sequential gate are not consulted.
+		return true, "", ""
+	}
+
+	if gate, reason := gateCtx.ratioHold(batch, waived, strategy, inFlightSurge, inFlightUnavail, recorder); gate != "" {
+		return false, gate, reason
+	}
+	return gateCtx.checkBudgetAndSequential(strategy, inFlightSurge, inFlightUnavail)
+}
+
+// ratioHold is the batch step's or the ratio band's hold on a start, and
+// "" when neither holds it: the batched members' lockstep when the batch
+// step governs (the engine and decoder both step, so the serving band is
+// not consulted for them); the serving band, projected by the strategy's
+// sign, for a start that changes capacity; and the new-revision lockstep
+// alone for an in-place start, whose band waiver is recorded once the start
+// is admitted. waived is the pairing peer the pairing gate holds still for
+// this start, which neither the batch step nor the lockstep waits on: that
+// peer moves only once this Component has, so a wait on it would be a wait
+// on this Component's own move.
+func (ctx GateContext) ratioHold(batch batchStep, waived v1beta1.ComponentType, strategy workloadtypes.UpdateStrategyType, inFlightSurge, inFlightUnavail int32, recorder record.EventRecorder) (v1beta1.RolloutHoldGate, string) {
 	inPlace := strategy == workloadtypes.UpdateStrategyInPlaceIfPossible ||
 		strategy == workloadtypes.UpdateStrategyInPlaceOnly
 	switch {
 	case batch.governs:
-		// The engine and decoder both step, so the batch step is the batched
-		// members' lockstep and the serving band is not consulted for them.
-		// A pairing peer the pairing gate holds still is not waited on.
-		var waived v1beta1.ComponentType
-		if pairing.peerHeldStill {
-			waived = pairingPeer(component)
-		}
 		if gate, reason := batch.hold(waived); gate != "" {
-			return false, gate, reason
+			return gate, reason
 		}
 	case !inPlace:
 		// Strategy-aware ratio projection. SurgeThenDrain adds a Ready pod
@@ -158,43 +211,43 @@ func EvaluateUpdateGate(
 		if strategy == workloadtypes.UpdateStrategySurgeThenDrain || strategy == "" {
 			projDelta = 1
 		}
-		ok, reason, outsideTolerance := gateCtx.checkRatio(inFlightSurge, inFlightUnavail, projDelta)
+		ok, reason, outsideTolerance := ctx.checkRatio(inFlightSurge, inFlightUnavail, projDelta, waived)
 		if !ok {
-			return false, v1beta1.RolloutHoldGateRatio, reason
+			return v1beta1.RolloutHoldGateRatio, reason
 		}
 		// A step no single step could keep inside the tolerance is admitted
 		// rather than held for good; the service says so with the numbers.
-		if outsideTolerance && recorder != nil && isvc != nil {
-			recorder.Eventf(isvc, corev1.EventTypeWarning, EventReasonRatioStepOutsideTolerance,
+		if outsideTolerance && recorder != nil && ctx.ISVC != nil {
+			recorder.Eventf(ctx.ISVC, corev1.EventTypeWarning, EventReasonRatioStepOutsideTolerance,
 				"%s: %s. The serving ratio is outside the tolerance while this step runs; the band admits one such step at a time rather than hold the roll for good. Widen the tolerance or resize the group to a shape one step keeps inside it.",
 				EventReasonRatioStepOutsideTolerance, reason)
 		}
 	default:
-		// A same-pod start keeps its serving capacity, so only the
-		// new-revision lockstep is consulted; the band waiver is recorded
-		// once the start is admitted.
-		if ok, reason := gateCtx.CheckRatioLockstep(); !ok {
-			return false, v1beta1.RolloutHoldGateRatio, reason
+		if ok, reason := ctx.checkRatioLockstep(waived); !ok {
+			return v1beta1.RolloutHoldGateRatio, reason
 		}
-		RecordRatioGateBypassed(string(component), string(strategy))
-		if recorder != nil && isvc != nil {
-			recorder.Eventf(isvc, corev1.EventTypeNormal, EventReasonRatioGateBypassed,
+		RecordRatioGateBypassed(string(ctx.Component), string(strategy))
+		if recorder != nil && ctx.ISVC != nil {
+			recorder.Eventf(ctx.ISVC, corev1.EventTypeNormal, EventReasonRatioGateBypassed,
 				"RatioGateBypassed: Component=%s, Strategy=%s. The RatioBalanced serving-capacity band is waived for an in-place start because the drain is paired 1:1 with a same-pod return; the new-revision lockstep still applies, and per-Component pacing (CoordinationPacing.PerComponent) still governs concurrent disruption.",
-				component, strategy)
+				ctx.Component, strategy)
 		}
 	}
+	return "", ""
+}
 
+// checkBudgetAndSequential is the group budget for the start's strategy (the
+// surge budget for a surge start, the unavailability budget for a
+// drain-first one) and then the Sequential order.
+func (ctx GateContext) checkBudgetAndSequential(strategy workloadtypes.UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (bool, v1beta1.RolloutHoldGate, string) {
 	if strategy == workloadtypes.UpdateStrategySurgeThenDrain || strategy == "" {
-		if ok, reason := gateCtx.CheckSurge(inFlightSurge); !ok {
+		if ok, reason := ctx.CheckSurge(inFlightSurge); !ok {
 			return false, v1beta1.RolloutHoldGateBudget, reason
 		}
-	} else {
-		if ok, reason := gateCtx.CheckUnavailability(inFlightUnavail); !ok {
-			return false, v1beta1.RolloutHoldGateBudget, reason
-		}
+	} else if ok, reason := ctx.CheckUnavailability(inFlightUnavail); !ok {
+		return false, v1beta1.RolloutHoldGateBudget, reason
 	}
-
-	if ok, reason := gateCtx.CheckSequential(); !ok {
+	if ok, reason := ctx.CheckSequential(); !ok {
 		return false, v1beta1.RolloutHoldGateSequential, reason
 	}
 	return true, "", ""

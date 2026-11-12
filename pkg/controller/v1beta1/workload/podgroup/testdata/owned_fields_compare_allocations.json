@@ -1,0 +1,12 @@
+{
+  "recordedOn": {
+    "date": "2026-11-05",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "One compare of a gang's PodGroup with the group the pass would write, over the six owned fields (the labels, the owner references, the topology key and whether it is set, the size, the timeout), read field by field: 0 allocations and 0 bytes, from the 29 allocations and 560 bytes of the semantic compare's reflection walk. The pass makes this compare for every gang on every pass over a Component at rest.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "one-gang/allocations": 0,
+    "one-gang/bytes": 0
+  }
+}

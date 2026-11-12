@@ -13,7 +13,7 @@ import (
 )
 
 // executeMigratePass runs the migrate pass over the Decision's
-// selection: the records parked on their source teardown are tended
+// selection: the records waiting on their source teardown are tended
 // first, oldest first, then the head record is driven. Each record goes
 // through Migrate, whose third return (accepted) distinguishes two
 // done=false modes:
@@ -22,10 +22,7 @@ import (
 //     surge index, statuses stamped). The record paces the pair at the
 //     Migrate interval and the passes after it have no work on a row the
 //     record owns, so the pass ends here rather than letting a later
-//     action set the wake-up. A parked record in flight ends the pass the
-//     same way, but only after the head has been driven: its drive only
-//     re-checks a source teardown the kubelet owns, so it is never what
-//     keeps the head waiting.
+//     action set the wake-up.
 //   - accepted=false: the migration was deferred without taking
 //     ownership (fresh record, source not yet steady-Ready because of an
 //     in-flight Update/Restart/Create). The pass continues to
@@ -34,7 +31,21 @@ import (
 //     the fall-through the dispatcher loops at the Migrate interval and
 //     the in-flight op never runs.
 //
-// stop=true means the pass consumed the reconcile: either a record
+// A record waiting on its source teardown is mid-flight too, but it
+// makes no progress of its own: every source pod is Terminating past its
+// own deletion deadline, and only its kubelet, an operator or the
+// force-delete escalation removes such a pod. Ending the pass on it
+// would hold every push and every scale-up of the Component for as long
+// as the kubelet stays away, so the pass goes on to Update/Create, which
+// refuse the pair's two rows on their own, and deposits the Migrate
+// interval as the wake-up it owes: the record is re-read, escalated and
+// completed on that cadence. Only the head, a move making progress,
+// ends the pass.
+//
+// A record waiting for the roll is driven by nothing: the pass writes the
+// wait on it once, with one event, and the reconcile goes on to the roll.
+//
+// stop=true means the pass consumed the reconcile: either the head
 // paces it, or Migrate completed and the plan is stale. A completed
 // Migrate removed the source InstanceStatus and promoted the surge to
 // Ready (or wrote a terminal Failed), and the plan was computed on the
@@ -42,7 +53,7 @@ import (
 // source-side index; the next reconcile rebuilds the plan from the
 // post-migration status.
 func executeMigratePass(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, selection MigrationSelection) (res ctrl.Result, stop bool, err error) {
-	pacing := false
+	waitingOnTeardown := false
 	for _, record := range selection.Parked {
 		done, accepted, err := driveMigration(ctx, deps, input, plan, target, record)
 		if err != nil {
@@ -51,7 +62,10 @@ func executeMigratePass(ctx context.Context, deps types.Deps, input types.Reconc
 		if done {
 			return types.RequeueNow(), true, nil
 		}
-		pacing = pacing || accepted
+		waitingOnTeardown = waitingOnTeardown || accepted
+	}
+	if waitingOnTeardown {
+		input.PassWake.Observe(workloadops.MigrateRequeueInterval(input))
 	}
 	if selection.Head != nil {
 		done, accepted, err := driveMigration(ctx, deps, input, plan, target, *selection.Head)
@@ -61,10 +75,14 @@ func executeMigratePass(ctx context.Context, deps types.Deps, input types.Reconc
 		if done {
 			return types.RequeueNow(), true, nil
 		}
-		pacing = pacing || accepted
+		if accepted {
+			return types.PassRequeue(workloadops.MigrateRequeueInterval(input)), true, nil
+		}
 	}
-	if pacing {
-		return types.PassRequeue(workloadops.MigrateRequeueInterval(input)), true, nil
+	if selection.WaitingForRoll != nil {
+		if err := workloadops.RecordMigrationWaitForRoll(ctx, deps, input, selection.WaitingForRoll.RequestUUID); err != nil {
+			return ctrl.Result{}, false, fmt.Errorf("workload.Reconcile: record the wait of migration %s for the roll: %w", selection.WaitingForRoll.RequestUUID, err)
+		}
 	}
 	return ctrl.Result{}, false, nil
 }

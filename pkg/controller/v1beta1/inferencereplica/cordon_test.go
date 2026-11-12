@@ -88,7 +88,8 @@ func TestReconcile_ScaleDownAdmitsTheInstanceOnACordonedNodeFirst(t *testing.T) 
 }
 
 // The cordon is read only while the replica holds more Instances than it
-// wants: a replica at its count lists no Nodes on any pass.
+// wants: a replica at its count lists no Nodes on any pass, so a cordon
+// landing in any state writes nothing by itself.
 func TestReconcile_CordonedNodesReadOnlyWhileScalingDown(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

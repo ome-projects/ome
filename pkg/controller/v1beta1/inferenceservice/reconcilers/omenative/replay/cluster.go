@@ -69,6 +69,11 @@ type cluster struct {
 	// snapshots marks a run that stages a stale read, which is what makes
 	// the driver snapshot the store at the end of every tick.
 	snapshots bool
+
+	// creations counts the admissions of each object name, so an object
+	// created again after a deletion gets a UID of its own, as the
+	// apiserver gives it.
+	creations map[string]int
 }
 
 // statusWriteState tells a retry of one logical status write from the next
@@ -257,7 +262,7 @@ func (c *cluster) interceptors() interceptor.Funcs {
 	return interceptor.Funcs{
 		Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 			if obj.GetUID() == "" {
-				obj.SetUID(k8stypes.UID(obj.GetName() + "-uid"))
+				obj.SetUID(c.admittedUID(obj))
 			}
 			if created := obj.GetCreationTimestamp(); created.IsZero() {
 				obj.SetCreationTimestamp(metav1.NewTime(c.clock.Now()))
@@ -330,6 +335,21 @@ func (c *cluster) interceptors() interceptor.Funcs {
 			return cl.SubResource(subResource).Update(ctx, obj, opts...)
 		},
 	}
+}
+
+// admittedUID is the UID the fake apiserver gives an object on admission:
+// its name on the first creation, as every golden reads it, and a numbered
+// one on each creation after a deletion.
+func (c *cluster) admittedUID(obj client.Object) k8stypes.UID {
+	if c.creations == nil {
+		c.creations = map[string]int{}
+	}
+	key := kindOf(obj) + "/" + obj.GetNamespace() + "/" + obj.GetName()
+	c.creations[key]++
+	if n := c.creations[key]; n > 1 {
+		return k8stypes.UID(fmt.Sprintf("%s-uid-%d", obj.GetName(), n))
+	}
+	return k8stypes.UID(obj.GetName() + "-uid")
 }
 
 // refuseStatusWrite answers an InferenceService status write with the

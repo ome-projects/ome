@@ -2,14 +2,18 @@ package inferencereplica
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -257,6 +261,21 @@ func TestPeerCounterPredicate_AdmitsOnlyCounterTransitions(t *testing.T) {
 		{"columnar rows move", func(ir *v1beta1.InferenceReplica) {
 			ir.Status.InstanceStatusColumns = &v1beta1.InstanceStatusColumns{Members: "1"}
 		}, true},
+		{"an instance's readySince moves in the dense rows", func(ir *v1beta1.InferenceReplica) {
+			later := metav1.NewTime(time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC))
+			ir.Status.InstanceStatuses[0].ReadySince = &later
+		}, true},
+		{"an instance's readySince moves in the columns", func(ir *v1beta1.InferenceReplica) {
+			later := metav1.NewTime(time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC))
+			ir.Status.InstanceStatusColumns = &v1beta1.InstanceStatusColumns{Members: "0-1",
+				Entries: []v1beta1.InstanceStatusEntry{{Index: 0, ReadySince: &later}}}
+		}, true},
+		{"an instance's readySince offset moves in the columns", func(ir *v1beta1.InferenceReplica) {
+			base := metav1.NewTime(time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC))
+			indexes := "0-1"
+			ir.Status.InstanceStatusColumns = &v1beta1.InstanceStatusColumns{Members: "0-1",
+				ReadySinceBase: &base, ReadySinceIndexes: &indexes, ReadySinceOffsets: []int32{0, 11}}
+		}, true},
 		{"a retry record turns Held", func(ir *v1beta1.InferenceReplica) {
 			ir.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: "llama-decoder-d2", State: v1beta1.RetryBlockHeld, AttemptsStarted: 3}}
 		}, true},
@@ -479,5 +498,53 @@ func TestReconcile_PeerServingCountReleasesARatioHold(t *testing.T) {
 	churned.Status.ReadyReplicas = 4
 	if got := peerWatchRequests(r, after, churned); got != nil {
 		t.Fatalf("counter churn on a peer nothing is held on maps to %v, want nothing", got)
+	}
+}
+
+// TestHeldPeerReplicasOf_EnqueuesAPeerItCannotRead: a peer whose hold cannot
+// be read is enqueued, because a pass it did not need costs less than a
+// release it missed; a peer that is gone is skipped.
+func TestHeldPeerReplicasOf_EnqueuesAPeerItCannotRead(t *testing.T) {
+	ctx := context.Background()
+	engine := projectedIR(v1beta1.EngineComponent, "7", "e1", "e2")
+	decoder := projectedIR(v1beta1.DecoderComponent, "7", "d1", "d1")
+	parent := pdParent()
+	parent.Spec.Router = &v1beta1.RouterSpec{}
+	r, c := newReconciler(t, engine, decoder, parent)
+	base, ok := c.(client.WithWatch)
+	if !ok {
+		t.Fatal("the fake client is not a WithWatch")
+	}
+	r.Client = interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == "llama-engine" {
+				return errors.New("refused")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	want := []reconcile.Request{requestFor("default", "llama-engine")}
+	if got := r.heldPeerReplicasOf(ctx, decoder); !reflect.DeepEqual(got, want) {
+		t.Errorf("decoder counters map to %v, want the unreadable engine %v and not the missing router", got, want)
+	}
+}
+
+// TestPeerPredicates_AdmitAnUpdateThatIsNotTwoReplicas: both peer predicates
+// let an update through when either object is not a replica, and leave the
+// decision to the mappers.
+func TestPeerPredicates_AdmitAnUpdateThatIsNotTwoReplicas(t *testing.T) {
+	replica := projectedIR(v1beta1.EngineComponent, "7", "e1", "e1")
+	for _, e := range []event.UpdateEvent{
+		{ObjectOld: &corev1.Pod{}, ObjectNew: replica},
+		{ObjectOld: replica, ObjectNew: &corev1.Pod{}},
+		{ObjectOld: nil, ObjectNew: nil},
+	} {
+		if !peerRevisionPredicate().Update(e) || !peerCounterPredicate().Update(e) {
+			t.Errorf("update %T -> %T must pass both predicates", e.ObjectOld, e.ObjectNew)
+		}
+	}
+	same := event.UpdateEvent{ObjectOld: replica, ObjectNew: replica.DeepCopy()}
+	if peerRevisionPredicate().Update(same) || peerCounterPredicate().Update(same) {
+		t.Error("an unchanged replica must pass neither predicate")
 	}
 }

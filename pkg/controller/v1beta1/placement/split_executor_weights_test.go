@@ -251,14 +251,14 @@ func memberARuns(routers int32, others map[v1beta1.ComponentType]int32) func(str
 func perMemberTerms(engine, decoder, router map[string]int32) []v1beta1.ClusterAffinityTerm {
 	var out []v1beta1.ClusterAffinityTerm
 	for _, name := range slices.Sorted(maps.Keys(engine)) {
-		term := v1beta1.ClusterAffinityTerm{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To(engine[name])}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}}
+		term := v1beta1.ClusterAffinityTerm{Weights: &v1beta1.ClusterAffinityWeights{Engine: &v1beta1.ReplicaRatio{Min: ptr.To(engine[name])}}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}}
 		d, hasDecoder := decoder[name]
 		r, hasRouter := router[name]
 		if hasDecoder {
-			term.Weights.Decoder = ptr.To(d)
+			term.Weights.Decoder = &v1beta1.ReplicaRatio{Min: ptr.To(d)}
 		}
 		if hasRouter {
-			term.Weights.Router = ptr.To(r)
+			term.Weights.Router = &v1beta1.ReplicaRatio{Min: ptr.To(r)}
 		}
 		out = append(out, term)
 	}
@@ -271,7 +271,7 @@ func defaultWeightsTerms(weights map[string]int32) []v1beta1.ClusterAffinityTerm
 	var out []v1beta1.ClusterAffinityTerm
 	for _, name := range slices.Sorted(maps.Keys(weights)) {
 		out = append(out, v1beta1.ClusterAffinityTerm{
-			Weights:     &v1beta1.ClusterAffinityWeights{Default: ptr.To(weights[name])},
+			Weights:     &v1beta1.ClusterAffinityWeights{Default: &v1beta1.ReplicaRatio{Min: ptr.To(weights[name])}},
 			MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}},
 		})
 	}

@@ -62,22 +62,6 @@ func TestParseDurationNamesTheFieldItRejected(t *testing.T) {
 	}
 }
 
-func TestSortedEventIDsIncludesTheClock(t *testing.T) {
-	ids := SortedEventIDs()
-	found := false
-	for i, id := range ids {
-		if id == ClockAdvance {
-			found = true
-		}
-		if i > 0 && ids[i-1] > id {
-			t.Fatalf("ids are not sorted at %d: %q then %q", i, ids[i-1], id)
-		}
-	}
-	if !found {
-		t.Errorf("%s is applicable and must be listed", ClockAdvance)
-	}
-}
-
 func TestPodRefRunnerNameDefaults(t *testing.T) {
 	if got := (PodRef{}).RunnerName(); got != DefaultRunner {
 		t.Errorf("unset runner: got %q want %q", got, DefaultRunner)

@@ -156,7 +156,7 @@ func (r *ExternalServiceReconciler) buildExternalService(ctx context.Context, is
 			Namespace: isvc.Namespace,
 			Labels: map[string]string{
 				constants.InferenceServicePodLabelKey: isvc.Name,
-				constants.OMEComponentLabel:           "external-service",
+				constants.OMEComponentLabel:           constants.ExternalServiceComponent,
 			},
 			Annotations: r.getServiceAnnotations(isvc),
 		},

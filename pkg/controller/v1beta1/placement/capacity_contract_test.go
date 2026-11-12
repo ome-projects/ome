@@ -60,7 +60,7 @@ func TestCapacityPlanRetainsOutgoingContract(t *testing.T) {
 			oldSample := plannedCapacitySample(*plannedTestRegistration(), 4)
 			oldSample.DemandContract.Components = append(oldSample.DemandContract.Components, v1beta1.PlacementComponentDemand{Component: v1beta1.DecoderComponent, RenderingHash: strings.Repeat("c", 64)})
 			var err error
-			outgoing.Capacity, err = capacityEvidence(oldSample)
+			outgoing.Capacity, err = recordedCapacitySample(oldSample)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -101,7 +101,7 @@ func attachCapacityContract(t *testing.T, source *v1beta1.InferenceService) {
 	t.Helper()
 	source.Spec.Placement.Mode = v1beta1.PlacementModeSplitByCapacity
 	sample := plannedCapacitySample(*plannedTestRegistration(), 4)
-	evidence, err := capacityEvidence(sample)
+	evidence, err := recordedCapacitySample(sample)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestPlannedMutationsRecheckCompleteAuthority(t *testing.T) {
 		run  func(*Reconciler, *v1beta1.InferenceService, v1beta1.CandidatePlacement) error
 	}{
 		{name: "apply", run: func(r *Reconciler, s *v1beta1.InferenceService, c v1beta1.CandidatePlacement) error {
-			return r.placePlannedOn(t.Context(), s, c)
+			return r.placePlannedMember(t.Context(), s, c, false, nil)
 		}},
 		{name: "pause", run: func(r *Reconciler, s *v1beta1.InferenceService, c v1beta1.CandidatePlacement) error {
 			return r.syncPlannedPolicy(t.Context(), s, c)
@@ -220,7 +220,7 @@ func TestPlannedContractTransport(t *testing.T) {
 			if tt.outgoing {
 				err = r.syncPlannedPolicy(t.Context(), source, candidate)
 			} else {
-				err = r.placePlannedOn(t.Context(), source, candidate)
+				err = r.placePlannedMember(t.Context(), source, candidate, false, nil)
 			}
 			if err != nil {
 				t.Fatal(err)

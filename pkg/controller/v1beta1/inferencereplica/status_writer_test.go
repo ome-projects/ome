@@ -473,8 +473,8 @@ func TestInferenceReplicaStatusUpdatesUseWriterBoundary(t *testing.T) {
 		}
 	}
 
-	if len(writerCalls) != 13 {
-		t.Fatalf("production status writes through %s = %d, want 13: %v", writer, len(writerCalls), writerCalls)
+	if len(writerCalls) != 11 {
+		t.Fatalf("production status writes through %s = %d, want 11: %v", writer, len(writerCalls), writerCalls)
 	}
 	if len(conversionCalls) != 1 || !strings.Contains(conversionCalls[0], "status_transition.go") {
 		t.Fatalf("conversion writes through %s must come from the transition gate alone: %v", conversion, conversionCalls)
@@ -600,7 +600,10 @@ const (
 	fixturePackagePath = codecPackagePath + "/irstatustest"
 	engineFixturePath  = "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	decodedAccessor    = "GetDecoded"
-	singleWriter       = "persistInferenceReplicaStatus"
+	// decodedCopyAccessor reads once for a caller that writes the object it
+	// read: the object stays as read, the rows are decoded on a copy.
+	decodedCopyAccessor = "GetDecodedCopy"
+	singleWriter        = "persistInferenceReplicaStatus"
 
 	projectorPackagePath               = "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	controllerRuntimeClientPackagePath = "sigs.k8s.io/controller-runtime/pkg/client"
@@ -675,10 +678,10 @@ var testOnlyFixturePackages = []string{fixturePackagePath, engineFixturePath}
 // single writer, keyed as the sweep prints a site, each with the reason it
 // stands: the one stand-in for the replica controller itself.
 var approvedStatusWriters = map[string]string{
-	"pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/replay/members.go:driver.publish (Status().Update)": replicaControllerStandIn,
-	"pkg/controller/v1beta1/workload/testfixture/service.go:MutateInstanceOnReplica (Status().Update)":                 engineTestFixtureStore,
-	"pkg/controller/v1beta1/workload/testfixture/service.go:RemoveInstanceOnReplica (Status().Update)":                 engineTestFixtureStore,
-	"pkg/controller/v1beta1/workload/testfixture/revision.go:SeedRunningRevisionWithMeta (Status().Update)":            engineTestFixtureStore,
+	"pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/replay/members.go:driver.writeStandInStatus (Status().Update)": replicaControllerStandIn,
+	"pkg/controller/v1beta1/workload/testfixture/service.go:MutateInstanceOnReplica (Status().Update)":                            engineTestFixtureStore,
+	"pkg/controller/v1beta1/workload/testfixture/service.go:RemoveInstanceOnReplica (Status().Update)":                            engineTestFixtureStore,
+	"pkg/controller/v1beta1/workload/testfixture/revision.go:SeedRunningRevisionWithMeta (Status().Update)":                       engineTestFixtureStore,
 }
 
 type accessCounts struct {
@@ -728,11 +731,18 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "instanceMutationPostconditionsHold", read(3), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "replaceInstanceStatuses", accessCounts{writes: 1}, inMemoryMirror, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "mirrorInstanceStatuses", accessCounts{reads: 4, writes: 1, readWrites: 2}, inMemoryMirror, rows)
-	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildPromoteCurrentRevision", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "currentRevisionWanted", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildRecordUpdateRevision", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/convert.go", "buildRemoveInstance", accessCounts{reads: 1, writes: 1}, decodedObjectRows, rows)
-	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.aggregateAndWriteStatus", accessCounts{reads: 4, readWrites: 8}, decodedObjectRows, rows)
-	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.reconcileHeldDeadlines", accessCounts{reads: 3, readWrites: 2}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.publicationSettledOnCopy", read(2), decodedObjectRows, rows)
+	// The status write's compare reads the rows of the pass's copy and of the
+	// recomputed status; its two writes set the rows of its own shallow copies
+	// aside so the fields beside them go to the semantic compare.
+	approve("pkg/controller/v1beta1/inferencereplica/status_compare.go", "publishedStatusEqual", accessCounts{reads: 2, writes: 2}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.publish", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.computePublication", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.publishBesideRows", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "Reconciler.reconcileHeldDeadlines", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", accessCounts{reads: 1, readWrites: 1}, inMemoryMirror, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "stagedAtPartition", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "computeRolloutStalledCondition", read(2), decodedObjectRows, rows)
@@ -743,7 +753,9 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "replicaPass.installStatusPublication", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.reconcileRelocationDirectives", accessCounts{reads: 3, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.stampAutoRelocationSuccess", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
-	approve("pkg/controller/v1beta1/inferencereplica/reset_instances.go", "Reconciler.resetInstances", accessCounts{reads: 2, readWrites: 2}, decodedObjectRows, rows)
+	// The reset sorts the requested Instances by their rows before it touches
+	// a pod; the teardown itself reads no row.
+	approve("pkg/controller/v1beta1/inferencereplica/reset_instances.go", "resetCandidates", accessCounts{reads: 2, readWrites: 2}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/retention.go", "Reconciler.sweepRevisions", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status_transition.go", "Reconciler.convertStoredRepresentation", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/peer_revisions.go", "awaitsPeerProjection", read(1), decodedObjectRows, rows)
@@ -767,7 +779,15 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing_drain.go", "pinnedCohort", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/batch_step.go", "readBatchMember", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "GateContext.ratioState", read(4), decodedObjectRows, rows)
+	// The serving Instance count nets a replacement gang serving beside its
+	// source out of the serving counter from the rows; the ratio rule, the
+	// unavailable budget and the group machine's observation read it.
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "servingInstanceCount", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "GateContext.CheckSurge", read(1), decodedObjectRows, rows)
+	// The unavailable budget's hold names the Instances it counts as out of
+	// rotation from the rows; the count itself is the serving Instance count.
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "GateContext.CheckUnavailability", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go", "GateContext.servingInstancesDown", read(4), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/sequential_gate.go", "observeSequentialComponentsForGate", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/reconciler.go", "buildComponentObservation", read(2), decodedObjectRows, rows)
 	// The canary dispatcher reads each member's rows through the decoded
@@ -776,7 +796,8 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/placement/admission.go", "admittedReplicaCount", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/admission.go", "componentHasAdmittedInstance", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/member_admission.go", "verifiedMemberAdmission", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows+" (filters admission on a deep copy; never persists rows)", rows)
-	approve("pkg/controller/v1beta1/placement/member_resources.go", "countMemberResources", read(1), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/placement/member_resources.go", "memberRows", read(2), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/placement/member_resources.go", "countReadyMemberRows", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/placement/failed.go", "IsTerminallyFailed", read(1), decodedObjectRows, rows)
 
 	// The kubectl-ome CLI still reads stored dense rows directly. Alfred has
@@ -809,6 +830,9 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	// The InferenceService replay driver builds the dense rows its replica
 	// stand-in publishes.
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/replay/members.go", "driver.publish", accessCounts{writes: 1}, replicaControllerStandIn, rows)
+	// The same driver's promotion tail reads the rows it published to compute
+	// the conditions it writes beside the promoted current revision.
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/replay/members.go", "driver.landPendingPromotion", read(1), replicaControllerStandIn, rows)
 	// The same driver's run check reads the dense rows its stand-in published,
 	// on the replica it built itself.
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/replay/invariants.go", "CheckRunOpensOnChange", read(1), replicaControllerStandIn, rows)
@@ -849,6 +873,7 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	}
 
 	approve("pkg/controller/v1beta1/irstatus/reader.go", decodedAccessor, "Get", 1, decodedBoundary)
+	approve("pkg/controller/v1beta1/irstatus/reader.go", decodedCopyAccessor, "Get", 1, decodedBoundary+" (the object as read is kept for a write beside the decoded copy)")
 	approve("pkg/controller/v1beta1/irstatus/transitionpreflight/preflight.go", "checkReplicas", "List", 1, administrativeCensus)
 	approve("pkg/controller/v1beta1/irstatus/statusrepair/repair.go", "Run", "Get", 1, breakGlassRepairRead)
 
@@ -875,9 +900,10 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	// ISVC-side raw accessors and their callers.
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/irstatus_read.go", "componentIRAt", "Get", 1, passThroughTopLevelStatus+" (raw accessor behind ComponentIR and ComponentIRFor, for callers that inspect no rows)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/status.go", "aggregateOneComponent", "Get", 1, passThroughTopLevelStatus+" (counters, revisions, RolloutHold, Conditions mirrored onto the ISVC)")
-	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/projector.go", "EnsureInferenceReplica", "Get", 1, passThroughSpecMetadata+" (spec projection)")
-	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/scaling/reconcile.go", "observe", "Get", 1, passThroughSpecMetadata+" (anchor and follower desired replica counts, ownership and autoscaler checks; no status rows)")
-	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/dispatch.go", "reconcileRollbackSignal", "Get", 1, passThroughTopLevelStatus+" (revision pointers and observedGeneration)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/projector.go", "projectOnLive", "Get", 1, passThroughSpecMetadata+" (spec projection)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/projector.go", "cachedCopyAtRest", "Get", 1, passThroughSpecMetadata+" (spec projection decided on the cached copy)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/scaling/reconcile.go", "readProjectedReplica", "Get", 1, passThroughSpecMetadata+" (anchor, follower and released-follower desired replica counts, ownership and autoscaler checks; no status rows)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/dispatch.go", "writeRollbackSignal", "Get", 1, passThroughTopLevelStatus+" (revision pointers and the revert target of a member the pass holds no observation of, or whose observed replica moved under the write)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun/observe.go", "observeGroupTargets", "Get", 1, passThroughTopLevelStatus+" (revision pointers and replica counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/pdb/cutover.go", "OMENativeCutoverReady", "Get", 1, passThroughTopLevelStatus+" (ready and available counters)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler/dispatch.go", "controlledByVerifiedModeBridge", "Get", 1, passThroughSpecMetadata+" (ownership: UID, labels, parentRef)")
@@ -942,8 +968,8 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 // client.Reader parameter that a caller filled under this same rule.
 func TestInferenceReplicaDecodedReadsCarryADecoder(t *testing.T) {
 	decodedAccessors := map[string]map[string]bool{
-		codecPackagePath:     {decodedAccessor: true},
-		projectorPackagePath: {"DecodedComponentIR": true, "DecodedComponentIRStatus": true, "DecodedComponentIRFor": true, "DecodedComponentIRStatusFor": true, "decodedComponentIRAt": true},
+		codecPackagePath:     {decodedAccessor: true, decodedCopyAccessor: true},
+		projectorPackagePath: {"DecodedComponentIR": true, "DecodedComponentIRFor": true, "decodedComponentIRAt": true},
 	}
 	inv := loadStatusInventory(t)
 	calls := 0

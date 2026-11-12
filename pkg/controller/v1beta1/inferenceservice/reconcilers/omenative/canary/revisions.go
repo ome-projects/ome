@@ -17,7 +17,7 @@ import (
 // publishReadyRevisions records, for every member whose target revision has
 // Ready capacity, that revision as the member's LatestReadyRevision. It runs
 // ahead of the capacity gate, so the field leads LatestRolledoutRevision
-// while the ladder is in flight.
+// while the canary is in flight.
 func publishReadyRevisions(in ReconcileInputs) {
 	if readyCanaryCapacity(in) > 0 {
 		setLatestReady(in.ISVC, in.Component, in.CanaryRevisionHash)
@@ -30,8 +30,8 @@ func publishReadyRevisions(in ReconcileInputs) {
 }
 
 // recordPromotedRevisions publishes a completed promotion on every member:
-// its target now fully owns its traffic, and the stable revision the ladder
-// shifted traffic from is the one it superseded. A member whose target is
+// its target now fully owns its traffic, and the stable revision the canary
+// shifted traffic from is the one it replaced. A member whose target is
 // its stable revision was not bumped and records that revision without
 // demoting it.
 func recordPromotedRevisions(in ReconcileInputs, stableHash string) {
@@ -52,12 +52,12 @@ func recordRolledBackRevisions(in ReconcileInputs, stableHash string) {
 	}
 }
 
-// recordSettledRevisions keeps the records of a unit with no ladder active
+// recordSettledRevisions keeps the records of a unit with no canary open
 // level with its InferenceReplicas: every member that has settled on one
 // revision is recorded on it, through the writer coordination uses for the
-// Components it owns. Outside an armed ladder a record is not the memory of
+// Components it owns. Outside an open canary a record is not the memory of
 // a traffic shift, and one left naming a revision no Instance runs would
-// resolve as the member's stable in the next run that pins it. A member
+// resolve as the member's stable in the next run that records it. A member
 // recorded on the revision already changes nothing.
 func recordSettledRevisions(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, primary v1beta1.ComponentType, primaryObserved observedCanaryRevisions, secondaryObserved map[v1beta1.ComponentType]observedCanaryRevisions, total, ready map[v1beta1.ComponentType]map[string]int32) {
 	for _, c := range configuredComponents(g) {
@@ -103,7 +103,7 @@ func setLatestReady(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, has
 }
 
 // recordRolledOut writes one member's LatestRolledoutRevision, named under
-// the member's replica prefix, demoting the superseded revision, and brings
+// the member's replica prefix, demoting the replaced revision, and brings
 // LatestReadyRevision level with it: a revision that owns the traffic is one
 // whose pods reached Ready. No hash writes nothing.
 func recordRolledOut(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, hash, supersededHash string) {

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"sigs.k8s.io/ome/pkg/webhook/admission/policyguard"
+
 	admissionv1 "k8s.io/api/admission/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
@@ -227,8 +229,8 @@ func TestHandleDelete(t *testing.T) {
 		if !strings.Contains(msg, "and 2 more") {
 			t.Errorf("denial %q does not summarize the overflow", msg)
 		}
-		if named := strings.Count(msg, "llm-"); named != maxNamedReferencingComponents {
-			t.Errorf("denial names %d components, want %d:\n%s", named, maxNamedReferencingComponents, msg)
+		if named := strings.Count(msg, "llm-"); named != policyguard.MaxNamedReferences {
+			t.Errorf("denial names %d components, want %d:\n%s", named, policyguard.MaxNamedReferences, msg)
 		}
 	})
 

@@ -16,7 +16,6 @@ import (
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
 	"sigs.k8s.io/ome/pkg/logging"
-	"sigs.k8s.io/ome/pkg/ociobjectstore"
 )
 
 const (
@@ -33,21 +32,7 @@ const (
 	OCIObjectSHA256MetadataKey = "opc-meta-sha256"
 )
 
-var (
-	downloadSnapHook = func(ctx context.Context, c *xet.Client, req *xet.SnapshotRequest) (string, error) {
-		return c.DownloadSnapshotWithContext(ctx, req)
-	}
-	setProgressHandlerHook = func(c *xet.Client, handler xet.ProgressHandler, throttle time.Duration) error {
-		return c.SetProgressHandler(handler, throttle)
-	}
-	disableProgressHook                   = func(c *xet.Client) error { return c.DisableProgress() }
-	downloadFromHFFunc                    = downloadFromHF
-	downloadObjectFunc                    = DownloadObject
-	uploadDirectoryToOCIOSDataStoreFunc   = uploadDirectoryToOCIOSDataStore
-	uploadObjectToOCIOSDataStoreFunc      = UploadObjectToOCIOSDataStore
-	getObjectMetadataWithChecksumFunc     = GetObjectMetadatWithFileChecksum
-	downloadObjectsFromOCIOSDataStoreFunc = downloadObjectsFromOCIOSDataStore
-)
+var getObjectMetadataWithChecksumFunc = GetObjectMetadatWithFileChecksum
 
 type hfDownloadOptions struct {
 	DownloadTimeout              time.Duration
@@ -67,7 +52,7 @@ type hfDownloadProgressSnapshot struct {
 }
 
 func downloadSnapshotWithTimeouts(
-	hubClient *xet.Client,
+	hubClient HubClient,
 	req *xet.SnapshotRequest,
 	opts hfDownloadOptions,
 	logger logging.Interface,
@@ -93,7 +78,7 @@ func downloadSnapshotWithTimeouts(
 		if opts.ProgressCallbackThrottleTime <= 0 {
 			opts.ProgressCallbackThrottleTime = 250 * time.Millisecond
 		}
-		if err := setProgressHandlerHook(hubClient, func(update xet.ProgressUpdate) {
+		if err := hubClient.SetProgressHandler(func(update xet.ProgressUpdate) {
 			current := hfDownloadProgressSnapshot{
 				completedBytes:            update.CompletedBytes,
 				completedFiles:            update.CompletedFiles,
@@ -123,7 +108,7 @@ func downloadSnapshotWithTimeouts(
 				if !downloadFinished {
 					return
 				}
-				if err := disableProgressHook(hubClient); err != nil {
+				if err := hubClient.DisableProgress(); err != nil {
 					logger.Warnf("Unable to disable HuggingFace/Xet progress watchdog: %v", err)
 				}
 			}()
@@ -164,12 +149,8 @@ func downloadSnapshotWithTimeouts(
 		req.RepoID, req.Revision, opts.DownloadTimeout, opts.StaleProgressTimeout)
 
 	resultCh := make(chan hfSnapshotDownloadResult, 1)
-	// Read the hook before starting the goroutine: on a timeout this function
-	// returns while the download may still be running, so a read inside the
-	// goroutine could race with a test restoring the hook.
-	download := downloadSnapHook
 	go func() {
-		path, err := download(ctx, hubClient, req)
+		path, err := hubClient.DownloadSnapshotWithContext(ctx, req)
 		resultCh <- hfSnapshotDownloadResult{path: path, err: err}
 	}()
 
@@ -204,51 +185,6 @@ func isStaleProgressTimeout(staleTimedOut <-chan struct{}) bool {
 	default:
 		return false
 	}
-}
-
-func UploadObjectToOCIOSDataStore(ociOSDataStore *ociobjectstore.OCIOSDataStore, object ociobjectstore.ObjectURI, filePath string) error {
-	if ociOSDataStore == nil {
-		return fmt.Errorf("target ociOSDataStore is nil")
-	}
-
-	err := ociOSDataStore.MultipartFileUpload(filePath, object, DefaultUploadChunkSizeInMB, DefaultUploadThreads)
-	if err != nil {
-		ociOSDataStore.Config.AnotherLogger.Errorf("Failed to upload %s: %+v", object.ObjectName, err)
-		return err
-	}
-	return nil
-}
-
-func DownloadObject(ociOSDataStore *ociobjectstore.OCIOSDataStore, srcObj ociobjectstore.ObjectURI, downloadPath string) error {
-	if ociOSDataStore == nil {
-		return fmt.Errorf("source ociOSDataStore is nil")
-	}
-
-	err := ociOSDataStore.MultipartDownload(srcObj, downloadPath,
-		ociobjectstore.WithChunkSize(DefaultDownloadChunkSizeInMB),
-		ociobjectstore.WithThreads(DefaultDownloadThreads))
-	if err != nil {
-		ociOSDataStore.Config.AnotherLogger.Errorf("Failed to download object %s: %+v", srcObj.ObjectName, err)
-		return err
-	}
-	return nil
-}
-
-func PrepareObjectChannel(objects []common.ReplicationObject) chan common.ReplicationObject {
-	objChan := make(chan common.ReplicationObject, len(objects))
-	go func() {
-		defer close(objChan)
-		for _, object := range objects {
-			objChan <- object
-		}
-	}()
-	return objChan
-}
-
-func LogProgress(successCount, errorCount, totalObjects int, startTime time.Time, logger logging.Interface) {
-	progress := float64(successCount+errorCount) / float64(totalObjects) * 100
-	elapsedTime := time.Since(startTime)
-	logger.Infof("Progress: %.2f%%, Success: %d, Errors: %d, Total: %d, Elapsed Time: %v", progress, successCount, errorCount, totalObjects, elapsedTime)
 }
 
 func GetFileChecksum(filePath string, algorithm string) (string, error) {

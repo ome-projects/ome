@@ -113,7 +113,13 @@ type TickSpec struct {
 	MaxUnavailable *intstr.IntOrString
 	MaxSurge       *intstr.IntOrString
 	Partition      *int32
-	Paused         bool
+	// HeldTo are the budgets, in Instances, the capacity and surge-ceiling
+	// invariants hold the tick to: the spec's, widened to the budget an
+	// attempt still open was admitted under, since an attempt keeps the
+	// budget it opened under until it lands. Nil reads the spec's budgets
+	// alone, as a view built by hand does.
+	HeldTo *BudgetsHeldTo
+	Paused bool
 	// Teardown marks the owner deleted: the plan carries no Instance and
 	// every pod is on its way out.
 	Teardown bool
@@ -252,8 +258,7 @@ func CheckCapacity(view TickView) []Finding {
 	if view.Spec.Teardown {
 		return nil
 	}
-	rolling := &types.RollingUpdate{MaxUnavailable: view.Spec.MaxUnavailable}
-	budget := escalation.PerComponentMaxUnavailableBudget(rolling, view.Spec.Replicas)
+	budget, specBudget := view.Spec.drainBudget()
 	if budget == escalation.BudgetNoLimit {
 		return nil
 	}
@@ -278,9 +283,39 @@ func CheckCapacity(view TickView) []Finding {
 		Invariant: InvariantCapacity,
 		Index:     ComponentWide,
 		Class:     fmt.Sprintf("%s/below-floor[%s]", InvariantCapacity, darkInstanceLabels(view, servingByIndex)),
-		Detail: fmt.Sprintf("%d pod(s) serve in a routed rotation; the floor is %d (replicas %d minus maxUnavailable %d)",
-			serving, floor, view.Spec.Replicas, budget),
+		Detail: fmt.Sprintf("%d pod(s) serve in a routed rotation; the floor is %d (replicas %d minus maxUnavailable %d%s)",
+			serving, floor, view.Spec.Replicas, budget, widenedClause(budget, specBudget)),
 	}}
+}
+
+// drainBudget is the unavailability budget the tick is held to and the
+// spec's own: the same number unless an attempt still open was admitted
+// under a wider one.
+func (s TickSpec) drainBudget() (budget, specBudget int32) {
+	specBudget = escalation.PerComponentMaxUnavailableBudget(&types.RollingUpdate{MaxUnavailable: s.MaxUnavailable}, s.Replicas)
+	if s.HeldTo == nil {
+		return specBudget, specBudget
+	}
+	return s.HeldTo.MaxUnavailable, specBudget
+}
+
+// surgeBudget is the surge allowance the tick is held to and the spec's
+// own, read as drainBudget reads the drain budget.
+func (s TickSpec) surgeBudget() (allowance, specAllowance int32) {
+	specAllowance = escalation.PerComponentMaxSurgeBudget(&types.RollingUpdate{MaxSurge: s.MaxSurge}, s.Replicas)
+	if s.HeldTo == nil {
+		return specAllowance, specAllowance
+	}
+	return s.HeldTo.MaxSurge, specAllowance
+}
+
+// widenedClause names the spec's own budget when an open attempt widened
+// the one the tick is held to, and is empty otherwise.
+func widenedClause(budget, specBudget int32) string {
+	if budget == specBudget {
+		return ""
+	}
+	return fmt.Sprintf(", widened from the spec's %d by an attempt still open", specBudget)
 }
 
 // servesInRotation reports whether a pod carries traffic: Ready and
@@ -324,8 +359,7 @@ func CheckSurgeCeiling(view TickView) []Finding {
 	if view.Spec.Teardown || view.Spec.PodsPerInstance <= 0 {
 		return nil
 	}
-	rolling := &types.RollingUpdate{MaxSurge: view.Spec.MaxSurge}
-	allowance := escalation.PerComponentMaxSurgeBudget(rolling, view.Spec.Replicas)
+	allowance, specAllowance := view.Spec.surgeBudget()
 	bound := "maxSurge"
 	if allowance == escalation.BudgetNoLimit {
 		allowance, bound = view.Spec.Replicas, "unbudgeted"
@@ -349,8 +383,8 @@ func CheckSurgeCeiling(view TickView) []Finding {
 		Index:     ComponentWide,
 		Class: fmt.Sprintf("%s/live-pods-over[%s][%s]", InvariantSurgeCeiling, bound,
 			surplusInstanceLabels(view, liveByIndex)),
-		Detail: fmt.Sprintf("%d live pod(s); the ceiling is %d (replicas %d plus a %s allowance of %d, %d pod(s) per Instance)",
-			live, ceiling, view.Spec.Replicas, bound, allowance, view.Spec.PodsPerInstance),
+		Detail: fmt.Sprintf("%d live pod(s); the ceiling is %d (replicas %d plus a %s allowance of %d%s, %d pod(s) per Instance)",
+			live, ceiling, view.Spec.Replicas, bound, allowance, widenedClause(allowance, specAllowance), view.Spec.PodsPerInstance),
 	}}
 }
 

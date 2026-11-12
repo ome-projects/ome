@@ -8,13 +8,13 @@ import (
 
 // PreserveNewerRun guards the run state across re-based status writes: when
 // a conflict retry copies an in-memory status onto a fresher live object, a
-// writer working from a stale cache would otherwise roll the pinned plan
-// back to a predecessor — and a rolled-back pin is unrecoverable, because
+// writer working from a stale cache would otherwise roll the recorded plan
+// back to a predecessor — and a rolled-back plan record is unrecoverable, because
 // the repin verb that produced it was one-shot and already consumed. Every
 // run boundary advances the state's monotonic clock (OpenedAt, PinnedAt,
 // LastRun.ClosedAt), so "newer" is well-defined: when the live side is
-// strictly newer, its ActiveRun/LastRun pair is kept, along with an armed
-// pre-step hold (the clamp that stops a repinned step from raising traffic —
+// strictly newer, its ActiveRun/LastRun pair is kept, along with an active
+// pre-step hold (the clamp that stops a step after a plan reread from raising traffic —
 // losing that bit would program the exposure the hold exists to block).
 // Ties keep dst: equal clocks mean the same boundary, and dst carries the
 // current pass's engine progress.

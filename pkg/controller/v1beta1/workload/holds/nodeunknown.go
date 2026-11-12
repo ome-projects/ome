@@ -13,13 +13,14 @@ import (
 
 // nodeUnknownHold is a name a pod with no report from its kubelet still
 // holds: a pod in phase Unknown, or one whose Ready the control plane
-// withdrew because its kubelet stopped heartbeating
-// (evidence.UnreportedTargetPods). Neither is terminal — the node stopped
-// reporting and the container may still be running — so recycling the
-// name the way a Failed or Succeeded occupant is recycled would risk two
-// pods of one identity. The name is freed only by the force-delete sweep,
-// on proven node death; until then the row reports the wait instead of
-// spending its deadline with no reason on the row.
+// took away because its kubelet stopped heartbeating
+// (evidence.UnreportedTargetPods). Neither is terminal, the node stopped
+// reporting and the container may still be running, so freeing the name
+// the way a Failed or Succeeded occupant's name is freed would risk two
+// pods of one identity. Only the force-delete sweep frees the name, once
+// the node is gone or has been unreachable or NotReady for the policy's
+// threshold. Until then the row reports the wait instead of spending its
+// deadline with no reason on the row.
 var nodeUnknownHold = authority{
 	token:  types.WaitingReasonNodeUnknown,
 	mayOwn: anyAttemptOwner,
@@ -34,7 +35,7 @@ var nodeUnknownHold = authority{
 // verb pass that needs it, and this reading is taken ahead of it. So it
 // asks the sweep's own question of every held pod and reports only the
 // names the sweep will leave: a pod force-deleted this pass is a name
-// freed, not a wait, and recording it would park the attempt's deadline
+// freed, not a wait, and recording it would stop the attempt's deadline
 // for one pass and restart it on the next. A pod whose node posts Ready
 // is the kubelet's own lag, not a wait either.
 //
@@ -49,7 +50,7 @@ func reportNodeUnknown(ctx context.Context, in PassInput, row Row) (reading, err
 	var held []*corev1.Pod
 	var nodeLost map[string]struct{}
 	for _, pod := range evidence.UnreportedTargetPods(own, targetPodNames(in, row), in.Input.ForceDelete) {
-		kind, err := evidence.ReadUnreportedPod(ctx, in.Deps.Reader(), pod, in.Input.ForceDelete, in.Input.Now())
+		kind, err := evidence.ReadUnreportedPod(ctx, in.Deps.NodeReaders(), pod, in.Input.ForceDelete, in.Input.Now())
 		if err != nil {
 			return reading{}, err
 		}
@@ -101,7 +102,7 @@ func targets(in PassInput, row Row) []target {
 	for _, runner := range row.Instance.Runners {
 		if runner.Size == 1 {
 			add(runner, row.Status.ActiveOrdinal)
-			if singlePodSurgeInFlight(row.Status) {
+			if singlePodSurgeInFlight(*row.Status) {
 				add(runner, 1-row.Status.ActiveOrdinal)
 			}
 			continue

@@ -32,7 +32,7 @@ func TestResolveHomeWithMemberStatusUpdates(t *testing.T) {
 					member.ManagedFields = []metav1.ManagedFieldsEntry{{Manager: "member-controller", Subresource: "status", Time: ptr.To(metav1.Now())}}
 				}
 			}))
-			resolved, floors, err := (Resolver{Client: cl, OperatorNamespace: f.namespace}).ResolveHome(t.Context(), f.service, f.standing)
+			resolved, floors, err := (Resolver{Client: cl, OperatorNamespace: f.namespace}).ResolveAssignedCluster(t.Context(), f.service, f.standing)
 			if err != nil {
 				t.Fatal(err)
 			}

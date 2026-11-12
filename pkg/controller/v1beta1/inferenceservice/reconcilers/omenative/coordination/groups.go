@@ -61,6 +61,16 @@ type GroupDefaults struct {
 	// operator's ConfigMap). The zero value keeps each side on its own
 	// budget, with no ratio rule between them.
 	PrefillDecode PrefillDecodeRules
+
+	// ProvingGrace is the operator's grace for a pod the kubelet keeps
+	// restarting (the lifecycle block of the ConfigMap), the span the
+	// workload grants such a pod to prove itself. The unavailability gate
+	// reads a pod that restarted or was rebuilt as serving again only once
+	// it has held Ready for this long, or for the Component's
+	// minReadySeconds when that is longer. Zero means unconfigured:
+	// minReadySeconds alone, and with that unset too a pod serves again as
+	// soon as it is Ready.
+	ProvingGrace time.Duration
 }
 
 // PrefillDecodeRules are the pacing rules of a group that lists both the
@@ -88,7 +98,8 @@ func (r PrefillDecodeRules) namedFirstSide() v1beta1.ComponentType {
 // ResolveGroups turns spec.rollout into a slice of ResolvedGroups in declaration
 // order, for the COORDINATION-style progressions only (blueGreen / rollingUpdate).
 // Canary groups are driven by the canary engine, not coordination, so they are
-// skipped here; canaryUnitGroup resolves one for the pairing gates alone.
+// skipped here; canaryUnitGroup resolves one for the batch step and the
+// pairing gates alone.
 // Returns nil when no rollout (or no coordination-style group) is declared. defaults carries the operator-configured fill-ins; callers without
 // access to operator configuration pass the zero value and get the documented
 // unconfigured behavior.
@@ -106,6 +117,12 @@ func ResolveGroups(spec *v1beta1.RolloutSpec, defaults GroupDefaults) []Resolved
 		if g.DeclaredProgression() == v1beta1.RolloutProgressionCanary {
 			continue // canary groups are the canary engine's responsibility
 		}
+		// A group with no members coordinates nothing: the recorded plan
+		// hands over a group the spec no longer declares this way, keeping
+		// its place so the groups after it keep their names.
+		if len(g.Components) == 0 {
+			continue
+		}
 		out = append(out, resolveGroup(i, g, defaults))
 	}
 	// v2 ordered groups roll one at a time, in list order. When the rollout is a
@@ -121,15 +138,17 @@ func ResolveGroups(spec *v1beta1.RolloutSpec, defaults GroupDefaults) []Resolved
 }
 
 // canaryUnitGroup is the canary group that lists both the engine and the
-// decoder, with component among its members, resolved for the pairing gates
-// alone: the members in declaration order, the default pacing standing in
-// for the pacing block a canary group does not carry, and no coordination
-// policy. The canary executor stages the unit's capacity through each
-// member's partition and each member's own budget paces its starts; the
-// pairing gates keep each side's pairable minimum during a
-// pairing-protocol change, the way they do for a blueGreen group, and read
-// each side's own maxUnavailable as its budget. A canary over one
-// Component, or over the router alone, has no second side to pair.
+// decoder, with component among its members, resolved for the batch step
+// and the pairing gates alone: the members in declaration order, the
+// default pacing standing in for the pacing block a canary group does not
+// carry, and no coordination policy. The canary executor stages the unit's
+// capacity through each member's partition; the batch step paces the two
+// sides' starts under that partition, and over the whole fleet under a
+// revert, so a step and a revert move both sides together; the pairing
+// gates keep each side's pairable minimum during a pairing-protocol change,
+// the way they do for a blueGreen group, and read each side's own
+// maxUnavailable as its budget. A canary over one Component, or over the
+// router alone, has no second side to pace.
 func canaryUnitGroup(spec *v1beta1.RolloutSpec, component v1beta1.ComponentType, defaults GroupDefaults) (ResolvedGroup, bool) {
 	if spec == nil {
 		return ResolvedGroup{}, false

@@ -27,20 +27,24 @@ const (
 	MigrationRoleSurge
 )
 
-// StampMigrationPin writes one side of the migration pair. Idempotent on
-// (Phase, Operation.Type, RequestUUID).
-func StampMigrationPin(ctx context.Context, input types.ReconcileInput, idx, siblingIdx int32, role MigrationRole, uuid string, timeout time.Duration) error {
-	mutation := MigrationPinMutation(input, idx, siblingIdx, role, uuid, timeout)
+// StampMigrationPin writes one side of the migration pair. revisionName
+// is the revision the replacement renders when that is not the source's
+// running revision; empty means the source's. Idempotent on (Phase,
+// Operation.Type, RequestUUID).
+func StampMigrationPin(ctx context.Context, input types.ReconcileInput, idx, siblingIdx int32, role MigrationRole, uuid, revisionName string, timeout time.Duration) error {
+	mutation := MigrationPinMutation(input, idx, siblingIdx, role, uuid, revisionName, timeout)
 	return input.MutateInstance(ctx, mutation.Index, mutation.Mutate)
 }
 
 // MigrationPinMutation is the migration pin as a mutation, for the pass
 // that commits both sides of the pair in one batch. The Operation it
 // writes is a pin — Type + RequestUUID (+ SurgeIndex for pair
-// correlation) plus the timing fields the deadline machinery reads;
-// migration facts (FromNode, hints, reason) live on the owner's
-// status.migrations record, not on the row.
-func MigrationPinMutation(input types.ReconcileInput, idx, siblingIdx int32, role MigrationRole, uuid string, timeout time.Duration) types.InstanceMutation {
+// correlation) plus the timing fields the deadline machinery reads, and
+// TargetRevision when the replacement renders a revision other than the
+// source's running one (a move admitted while a roll could take the
+// source builds on the roll's target); migration facts (FromNode, hints,
+// reason) live on the owner's status.migrations record, not on the row.
+func MigrationPinMutation(input types.ReconcileInput, idx, siblingIdx int32, role MigrationRole, uuid, revisionName string, timeout time.Duration) types.InstanceMutation {
 	now := metav1.NewTime(input.Now())
 	siblingPtr := siblingIdx
 	wantPhase := types.InstancePhaseMigrating
@@ -71,6 +75,7 @@ func MigrationPinMutation(input types.ReconcileInput, idx, siblingIdx int32, rol
 			Step:           types.MigrateStepCreateSurge,
 			RequestUUID:    uuid,
 			SurgeIndex:     &siblingPtr,
+			TargetRevision: revisionName,
 			StartedAt:      now,
 			LastProgressAt: now,
 			Deadline:       types.DeadlineAt(now, timeout),
@@ -81,8 +86,10 @@ func MigrationPinMutation(input types.ReconcileInput, idx, siblingIdx int32, rol
 
 // StartMigration commits both sides of the pair in one batch: the
 // source pin and the surge pin, fenced on the identities the pass
-// decided from. Reports whether the pair is established afterwards —
-// by this write, or because a previous pass already wrote it.
+// decided from, both naming revisionName as the replacement's revision
+// when it is not the source's running one. Reports whether the pair is
+// established afterwards — by this write, or because a previous pass
+// already wrote it.
 func StartMigration(
 	ctx context.Context,
 	input types.ReconcileInput,
@@ -90,6 +97,7 @@ func StartMigration(
 	surge *types.InstanceStatus,
 	requestUUID string,
 	surgeIdx int32,
+	revisionName string,
 	timeout time.Duration,
 ) (bool, error) {
 	write, err := newGuardedWrite(input)
@@ -117,12 +125,12 @@ func StartMigration(
 		return write.confirmed
 	})
 
-	sourceMutation := MigrationPinMutation(input, source.Index, surgeIdx, MigrationRoleSource, requestUUID, timeout)
+	sourceMutation := MigrationPinMutation(input, source.Index, surgeIdx, MigrationRoleSource, requestUUID, revisionName, timeout)
 	sourceMutation.BatchPrecondition = batchGuard
 	sourceMutation.Postcondition = func(row *types.InstanceStatus) bool {
 		return MigrationSourceOwnsRemoval(row, requestUUID, surgeIdx)
 	}
-	surgeMutation := MigrationPinMutation(input, surgeIdx, source.Index, MigrationRoleSurge, requestUUID, timeout)
+	surgeMutation := MigrationPinMutation(input, surgeIdx, source.Index, MigrationRoleSurge, requestUUID, revisionName, timeout)
 	surgeMutation.Postcondition = func(row *types.InstanceStatus) bool {
 		return MigrationSurgeOwnsPromotion(row, requestUUID, source.Index)
 	}
@@ -160,20 +168,9 @@ func StampMigrationSurgeReady(
 			MigrationSurgeOwnsPromotion(&currentSurge, requestUUID, source.Index)
 	})
 	mutation.Postcondition = func(row *types.InstanceStatus) bool {
-		return row != nil && row.Index == surge.Index &&
-			row.Incarnation == surge.Incarnation && row.ActiveOrdinal == surge.ActiveOrdinal &&
-			MigrationPromotedSurgeMatches(row, targetRevision)
+		return promotedRow(row, surge, targetRevision) && MigrationPromotedSurgeMatches(row, targetRevision)
 	}
-	mutation.OnCommit = write.recordCommit
-	promoted, err := write.commit(ctx, input, []types.InstanceMutation{mutation}, "", nil)
-	if err != nil || !promoted {
-		return false, err
-	}
-
-	if err := RetryBlockPruneOnPromote(ctx, input, targetRevision); err != nil {
-		return false, err
-	}
-	return true, nil
+	return write.promote(ctx, input, mutation, targetRevision)
 }
 
 // ClearMigrationPin drops the Migrate pin for uuid from the row at idx,

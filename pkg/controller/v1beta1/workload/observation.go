@@ -3,6 +3,7 @@ package workload
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -70,6 +71,15 @@ func (o PodObservation) PodsForInstance(index int32) []*corev1.Pod {
 	return o.byInstance[index]
 }
 
+// podCount is how many pods the observation holds over every Instance.
+func (o PodObservation) podCount() int {
+	n := 0
+	for _, pods := range o.byInstance {
+		n += len(pods)
+	}
+	return n
+}
+
 // ComponentObservation joins one persisted row set with one Pod observation.
 type ComponentObservation struct {
 	epoch                ObservationEpoch
@@ -123,7 +133,15 @@ func (o *ComponentObservation) PersistedStatuses() []types.InstanceStatus {
 // CurrentCounters returns index-keyed Pod facts and whether availability was
 // observed at this epoch.
 func (o *ComponentObservation) CurrentCounters(index int32) (status.InstanceCounters, bool) {
-	return status.CountersForInstance(o.pods.PodsForInstance(index), o.availableByPod, o.availabilityWindow), o.availabilityObserved
+	current, _ := o.counters(index, nil)
+	return current, o.availabilityObserved
+}
+
+// counters reads the Instance at index against the rotation set and the
+// availability rule, its node list appended to names; nil names gives the
+// Instance a list of its own.
+func (o *ComponentObservation) counters(index int32, names []string) (status.InstanceCounters, []string) {
+	return status.CountersForInstance(o.pods.PodsForInstance(index), o.availableByPod, o.availabilityWindow, names)
 }
 
 var errPublicationObservationRequired = errors.New("publication materialization requires a publication observation")
@@ -172,8 +190,12 @@ func (o *ComponentObservation) validatePublication() error {
 // and Operation fields are already final, Pod counts come from current — and
 // must treat the row as read-only.
 func (o *ComponentObservation) overlayInlineV1(out []types.InstanceStatus, observe func(*types.InstanceStatus, status.InstanceCounters)) {
+	// One array holds the node lists of every row; each row's is cut from
+	// it and capped at its own length.
+	names := make([]string, 0, o.pods.podCount())
 	for i := range out {
-		current, _ := o.CurrentCounters(out[i].Index)
+		var current status.InstanceCounters
+		current, names = o.counters(out[i].Index, names)
 		if observe != nil {
 			observe(&out[i], current)
 		}
@@ -342,16 +364,23 @@ func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]in
 // gate they still carry are stale and no Service publishes them. The set
 // they leave is short of the desired count, so the row publishes not
 // serving the moment the revocation lands, as its serving count already
-// reads, instead of Ready until a rebuild replaces the set.
+// reads, instead of Ready until a rebuild replaces the set. With no pod
+// left out the set is handed back as it is; its one reader,
+// query.PodSetFullyServing, only reads it. The pods kept are copied, never
+// compacted in place, so the bucket the pass shares is never written.
 func podsOnReportingNodes(pods []*corev1.Pod) []*corev1.Pod {
-	out := pods[:0:0]
-	for _, pod := range pods {
-		if podreadiness.ReadyRevokedByNode(pod) {
-			continue
-		}
-		out = append(out, pod)
+	first := slices.IndexFunc(pods, podreadiness.ReadyRevokedByNode)
+	if first < 0 {
+		return pods
 	}
-	return out
+	kept := make([]*corev1.Pod, first, len(pods)-1)
+	copy(kept, pods[:first])
+	for _, pod := range pods[first+1:] {
+		if !podreadiness.ReadyRevokedByNode(pod) {
+			kept = append(kept, pod)
+		}
+	}
+	return kept
 }
 
 // podsOnRevision keeps the pods whose revision label names rev: the pods

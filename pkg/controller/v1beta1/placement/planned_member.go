@@ -116,12 +116,6 @@ func checkPlannedAssignment(source *v1beta1.InferenceService, candidate v1beta1.
 	return nil
 }
 
-// placePlannedOn stamps member execution authority before any component can
-// acknowledge it. The member's later IR observation is the application signal.
-func (r *Reconciler) placePlannedOn(ctx context.Context, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement) error {
-	return r.placePlannedMember(ctx, source, candidate, false, nil)
-}
-
 // placePlannedMember applies the candidate's allocation. On a split member, holds
 // raise a component's apportioned floor while its replacements elsewhere start.
 func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement, existingOnly bool, holds map[v1beta1.ComponentType]int32) error {
@@ -132,8 +126,8 @@ func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.Inf
 		return err
 	}
 	assignment := candidate.Allocation
-	if assignment == nil || assignment.CurrentReplicas < 0 || (assignment.CurrentReplicas == 0 && (assignment.CurrentHome == nil || assignment.DrainRequested)) {
-		return fmt.Errorf("member creation requires a positive allocation or an active full home")
+	if err := checkPlannedCreation(assignment); err != nil {
+		return err
 	}
 	cl, transport, err := r.plannedTransport(ctx, candidate.Cluster, assignment.ClusterUID)
 	if err != nil {
@@ -148,36 +142,66 @@ func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.Inf
 		return err
 	}
 	if assignment.CurrentHome == nil {
-		standing, err := getMemberService(ctx, cl, client.ObjectKeyFromObject(source))
-		if err != nil {
+		if err := r.setPlannedMinimums(ctx, cl, source, candidate, desired, holds); err != nil {
 			return err
 		}
-		var held map[v1beta1.ComponentType]int32
-		switch {
-		case standing == nil:
-			held = map[v1beta1.ComponentType]int32{}
-		case isOurDerived(standing, source):
-			held = memberMinimums(standing)
-		}
-		bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate, held)
-		if err != nil {
-			return err
-		}
-		for component, floor := range holds {
-			if bound, ok := bounds[component]; ok && floor > bound.Floor {
-				bound.Floor = floor
-				bounds[component] = bound
-			}
-		}
-		setPlannedReplicas(desired, bounds)
 	} else if assignment.CurrentHome.InputDigest != source.Status.Placement.Plan.InputDigest || !equality.Semantic.DeepEqual(assignment.CurrentHome, assignment.DesiredHome) {
 		return r.syncPlannedPolicy(ctx, source, candidate)
 	}
 	if err := r.checkCapacityApplication(ctx, cl, source, desired, assignment); err != nil {
 		return err
 	}
-	policy := executionPolicy(source, assignment)
-	raw, err := protocol.Encode(policy)
+	if err := annotateExecutionPolicy(desired, source, assignment); err != nil {
+		return err
+	}
+	if err := r.checkPlanCurrent(ctx, source); err != nil {
+		return err
+	}
+	return r.applyDerived(ctx, candidate.Cluster, cl, source, desired, existingOnly)
+}
+
+// checkPlannedCreation refuses an allocation no member can stand on: a
+// negative count, or a zero count without an active full policy.
+func checkPlannedCreation(assignment *v1beta1.CandidateAllocationStatus) error {
+	if assignment == nil || assignment.CurrentReplicas < 0 || (assignment.CurrentReplicas == 0 && (assignment.CurrentHome == nil || assignment.DrainRequested)) {
+		return fmt.Errorf("member creation requires a positive allocation or an active full home")
+	}
+	return nil
+}
+
+// setPlannedMinimums gives a split member its component minimums: the bounds
+// its share allows over what a standing copy of ours already holds, raised
+// by any hold the caller carries.
+func (r *Reconciler) setPlannedMinimums(ctx context.Context, cl client.Client, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement, desired *v1beta1.InferenceService, holds map[v1beta1.ComponentType]int32) error {
+	standing, err := getMemberService(ctx, cl, client.ObjectKeyFromObject(source))
+	if err != nil {
+		return err
+	}
+	var held map[v1beta1.ComponentType]int32
+	switch {
+	case standing == nil:
+		held = map[v1beta1.ComponentType]int32{}
+	case isOurDerived(standing, source):
+		held = memberMinimums(standing)
+	}
+	bounds, err := splitPlannedBounds(source, source.Status.Placement.Candidates, candidate, held)
+	if err != nil {
+		return err
+	}
+	for component, floor := range holds {
+		if bound, ok := bounds[component]; ok && floor > bound.Floor {
+			bound.Floor = floor
+			bounds[component] = bound
+		}
+	}
+	setPlannedReplicas(desired, bounds)
+	return nil
+}
+
+// annotateExecutionPolicy writes the plan's execution policy for the
+// assignment onto the desired member.
+func annotateExecutionPolicy(desired, source *v1beta1.InferenceService, assignment *v1beta1.CandidateAllocationStatus) error {
+	raw, err := protocol.Encode(executionPolicy(source, assignment))
 	if err != nil {
 		return err
 	}
@@ -185,10 +209,7 @@ func (r *Reconciler) placePlannedMember(ctx context.Context, source *v1beta1.Inf
 		desired.Annotations = map[string]string{}
 	}
 	desired.Annotations[constants.PlacementExecution] = raw
-	if err := r.checkPlanCurrent(ctx, source); err != nil {
-		return err
-	}
-	return r.applyDerived(ctx, candidate.Cluster, cl, source, desired, existingOnly)
+	return nil
 }
 
 // syncPlannedPolicy updates coordination authority without a source refresh.
@@ -206,47 +227,18 @@ func (r *Reconciler) syncPlannedPolicy(ctx context.Context, source *v1beta1.Infe
 	if err != nil {
 		return err
 	}
-	member := &v1beta1.InferenceService{}
-	if err := cl.Get(ctx, client.ObjectKeyFromObject(source), member); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !isOurDerived(member, source) || member.UID == "" || !member.DeletionTimestamp.IsZero() {
-		return fmt.Errorf("member identity cannot authorize a surge pause")
-	}
-	previous, err := protocol.FromDerived(member)
-	if err != nil {
+	member, err := pausableMember(ctx, cl, source)
+	if member == nil || err != nil {
 		return err
 	}
-	if err := protocol.Authorize(previous, policy); err != nil {
-		return err
-	}
-	raw, err := protocol.Encode(policy)
+	raw, err := authorizedPolicy(member, policy)
 	if err != nil {
 		return err
 	}
 	base := member.DeepCopy()
 	if policy.PauseSurge && candidate.Allocation.CurrentHome != nil {
-		for _, floor := range candidate.Allocation.CurrentHome.ReplicaFloors {
-			var component *v1beta1.ComponentExtensionSpec
-			switch floor.Component {
-			case v1beta1.EngineComponent:
-				if member.Spec.Engine != nil {
-					component = &member.Spec.Engine.ComponentExtensionSpec
-				}
-			case v1beta1.DecoderComponent:
-				if member.Spec.Decoder != nil {
-					component = &member.Spec.Decoder.ComponentExtensionSpec
-				}
-			case v1beta1.RouterComponent:
-				if member.Spec.Router != nil {
-					component = &member.Spec.Router.ComponentExtensionSpec
-				}
-			}
-			if component == nil {
-				return fmt.Errorf("standing home is missing its accepted %s component", floor.Component)
-			}
-			value := int(floor.Replicas)
-			component.MinReplicas = &value
+		if err := holdAcceptedMinimums(member, candidate.Allocation.CurrentHome.ReplicaFloors); err != nil {
+			return err
 		}
 	}
 	if member.Annotations == nil {
@@ -262,8 +254,67 @@ func (r *Reconciler) syncPlannedPolicy(ctx context.Context, source *v1beta1.Infe
 	return cl.Patch(ctx, member, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
-// deletePlannedOn requires independently verified drain and rechecks member
-// authority before an identity-and-version conditional delete.
+// holdAcceptedMinimums writes each replica count the plan accepted as the
+// minimum of the member's component, so a paused member keeps that count
+// while its defaults change. A count for a component the member does not
+// declare is an error.
+func holdAcceptedMinimums(member *v1beta1.InferenceService, accepted []v1beta1.PlacementComponentFloor) error {
+	for _, minimum := range accepted {
+		component := acceptedComponentExtension(member, minimum.Component)
+		if component == nil {
+			return fmt.Errorf("standing home is missing its accepted %s component", minimum.Component)
+		}
+		value := int(minimum.Replicas)
+		component.MinReplicas = &value
+	}
+	return nil
+}
+
+// acceptedComponentExtension is the member's extension block for a component
+// a plan accepts a replica count for; nil when the protocol gives the
+// component no per-cluster count or the member does not declare it.
+func acceptedComponentExtension(member *v1beta1.InferenceService, component v1beta1.ComponentType) *v1beta1.ComponentExtensionSpec {
+	if !protocol.IsPlacementComponent(component) {
+		return nil
+	}
+	if view := v1beta1.SpecOf(&member.Spec, component); view != nil {
+		return view.Extension
+	}
+	return nil
+}
+
+// pausableMember reads the member a policy sync applies to: nil without an
+// error when it does not exist, an error when it is not this source's live
+// copy.
+func pausableMember(ctx context.Context, cl client.Client, source *v1beta1.InferenceService) (*v1beta1.InferenceService, error) {
+	member := &v1beta1.InferenceService{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(source), member); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if !isOurDerived(member, source) || member.UID == "" || !member.DeletionTimestamp.IsZero() {
+		return nil, fmt.Errorf("member identity cannot authorize a surge pause")
+	}
+	return member, nil
+}
+
+// authorizedPolicy checks that policy may succeed the one the member carries
+// and returns it encoded.
+func authorizedPolicy(member *v1beta1.InferenceService, policy *v1beta1.PlacementExecutionPolicy) (string, error) {
+	previous, err := protocol.FromDerived(member)
+	if err != nil {
+		return "", err
+	}
+	if err := protocol.Authorize(previous, policy); err != nil {
+		return "", err
+	}
+	return protocol.Encode(policy)
+}
+
+// deletePlannedOn removes a member whose allocation is drained to zero. It
+// checks the plan, the allocation and the drain, reads the member through
+// the transport bound to the accepted registration UID, checks the member's
+// identity and the policy it carries, rechecks the plan, and deletes under
+// the member's UID and version.
 func (r *Reconciler) deletePlannedOn(ctx context.Context, source *v1beta1.InferenceService, candidate v1beta1.CandidatePlacement, drained bool) error {
 	if err := r.checkPlanCurrent(ctx, source); err != nil {
 		return err
@@ -271,34 +322,59 @@ func (r *Reconciler) deletePlannedOn(ctx context.Context, source *v1beta1.Infere
 	if err := checkPlannedAssignment(source, candidate); err != nil {
 		return err
 	}
-	assignment := candidate.Allocation
-	if assignment == nil || assignment.CurrentReplicas != 0 || !assignment.DrainRequested || !drained {
-		return fmt.Errorf("member removal requires a drained zero allocation")
+	if err := checkDrainedRemoval(candidate.Allocation, drained); err != nil {
+		return err
 	}
-	cl, err := r.plannedClient(ctx, candidate.Cluster, assignment.ClusterUID)
+	cl, err := r.plannedClient(ctx, candidate.Cluster, candidate.Allocation.ClusterUID)
 	if err != nil {
 		return err
 	}
-	member := &v1beta1.InferenceService{}
-	if err := cl.Get(ctx, client.ObjectKeyFromObject(source), member); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	if !isOurDerived(member, source) || member.UID == "" || member.ResourceVersion == "" {
-		return fmt.Errorf("member identity cannot authorize removal")
-	}
-	policy, err := protocol.FromDerived(member)
-	if err != nil {
-		return err
-	}
-	// The zero-floor plan can follow the member's last positive-floor policy.
-	// A higher revision on the member means another plan already owns it.
-	if err := protocol.Authorize(policy, executionPolicy(source, assignment)); err != nil {
+	member, err := removableMember(ctx, cl, source, candidate.Allocation)
+	if member == nil || err != nil {
 		return err
 	}
 	if err := r.checkPlanCurrent(ctx, source); err != nil {
 		return err
 	}
-	err = cl.Delete(ctx, member, client.Preconditions{UID: &member.UID, ResourceVersion: &member.ResourceVersion})
+	return deleteIdentifiedMember(ctx, cl, member)
+}
+
+// checkDrainedRemoval refuses a removal unless the allocation is zero, the
+// plan asked for the drain, and the drain was verified independently.
+func checkDrainedRemoval(assignment *v1beta1.CandidateAllocationStatus, drained bool) error {
+	if assignment == nil || assignment.CurrentReplicas != 0 || !assignment.DrainRequested || !drained {
+		return fmt.Errorf("member removal requires a drained zero allocation")
+	}
+	return nil
+}
+
+// removableMember reads the member a removal applies to: nil without an
+// error when it is gone, an error when it is not this source's identified
+// copy or when its policy does not admit the plan's.
+func removableMember(ctx context.Context, cl client.Client, source *v1beta1.InferenceService, assignment *v1beta1.CandidateAllocationStatus) (*v1beta1.InferenceService, error) {
+	member := &v1beta1.InferenceService{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(source), member); err != nil {
+		return nil, client.IgnoreNotFound(err)
+	}
+	if !isOurDerived(member, source) || member.UID == "" || member.ResourceVersion == "" {
+		return nil, fmt.Errorf("member identity cannot authorize removal")
+	}
+	policy, err := protocol.FromDerived(member)
+	if err != nil {
+		return nil, err
+	}
+	// A plan at zero may follow the member's last policy with positive
+	// counts. A higher revision on the member means another plan owns it.
+	if err := protocol.Authorize(policy, executionPolicy(source, assignment)); err != nil {
+		return nil, err
+	}
+	return member, nil
+}
+
+// deleteIdentifiedMember deletes the member as it was read, and no other
+// object under its name; a member already gone is removed.
+func deleteIdentifiedMember(ctx context.Context, cl client.Client, member *v1beta1.InferenceService) error {
+	err := cl.Delete(ctx, member, client.Preconditions{UID: &member.UID, ResourceVersion: &member.ResourceVersion})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}

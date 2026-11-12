@@ -13,7 +13,7 @@ import (
 // does not run through the hold.
 //
 // The weakest authority on the row. Quota, the scheduler, the gang
-// scheduler and a node that went silent each hold an attempt for a wait
+// scheduler and a node that stopped reporting each hold an attempt for a wait
 // only they can end, and a pause is not a reason to stop reporting it; a
 // surge reporting its own source out of rotation outranks it too — "this
 // Instance is serving nothing" is the more urgent fact. When another
@@ -39,7 +39,7 @@ func reportPause(_ context.Context, in PassInput, row Row) (reading, error) {
 		return reading{release: true}, nil
 	}
 	if !types.TransientPhase(row.Status.Phase) ||
-		!pauseHeldOperation(types.Owner(&row.Status), in.Plan) {
+		!pauseHeldOperation(types.Owner(row.Status), in.Plan) {
 		return reading{}, nil
 	}
 	return reading{waiting: true}, nil

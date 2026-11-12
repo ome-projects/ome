@@ -1,6 +1,7 @@
 package pod
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -86,7 +87,7 @@ func TestShmInjector_TargetContainerMissing_NoOp(t *testing.T) {
 
 func TestProbeInjector_NoAnnotation_NoOp(t *testing.T) {
 	pod := makePod(nil, defaultContainer())
-	assert.NoError(t, injectProbes(pod))
+	assert.NoError(t, injectProbes(pod, shippedRuntimeProfiles(t)))
 	assert.Nil(t, pod.Spec.Containers[0].ReadinessProbe)
 	assert.Nil(t, pod.Spec.Containers[0].LivenessProbe)
 	assert.Nil(t, pod.Spec.Containers[0].StartupProbe)
@@ -96,12 +97,12 @@ func TestProbeInjector_SglangHttp_DefaultPort(t *testing.T) {
 	pod := makePod(map[string]string{
 		constants.RuntimeProbeProfileAnnotationKey: "sglang-http",
 	}, defaultContainer())
-	assert.NoError(t, injectProbes(pod))
+	assert.NoError(t, injectProbes(pod, shippedRuntimeProfiles(t)))
 	c := pod.Spec.Containers[0]
 	for _, probe := range []*v1.Probe{c.ReadinessProbe, c.LivenessProbe, c.StartupProbe} {
 		if assert.NotNil(t, probe) {
 			assert.Equal(t, "/health", probe.HTTPGet.Path)
-			assert.Equal(t, intstr.FromInt32(DefaultRuntimeProbePort), probe.HTTPGet.Port)
+			assert.Equal(t, intstr.FromInt32(shippedRuntimeProfiles(t).DefaultPort), probe.HTTPGet.Port)
 		}
 	}
 }
@@ -111,7 +112,7 @@ func TestProbeInjector_PortOverride(t *testing.T) {
 		constants.RuntimeProbeProfileAnnotationKey: "sglang-http",
 		constants.RuntimeProbePortAnnotationKey:    "8080",
 	}, defaultContainer())
-	assert.NoError(t, injectProbes(pod))
+	assert.NoError(t, injectProbes(pod, shippedRuntimeProfiles(t)))
 	assert.Equal(t, intstr.FromInt32(8080), pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port)
 }
 
@@ -121,7 +122,7 @@ func TestProbeInjector_InvalidPort_Errors(t *testing.T) {
 			constants.RuntimeProbeProfileAnnotationKey: "sglang-http",
 			constants.RuntimeProbePortAnnotationKey:    bad,
 		}, defaultContainer())
-		assert.Error(t, injectProbes(pod), "port=%q should error", bad)
+		assert.Error(t, injectProbes(pod, shippedRuntimeProfiles(t)), "port=%q should error", bad)
 	}
 }
 
@@ -134,7 +135,7 @@ func TestProbeInjector_DoesNotOverrideExistingProbe(t *testing.T) {
 	pod := makePod(map[string]string{
 		constants.RuntimeProbeProfileAnnotationKey: "sglang-http",
 	}, c)
-	assert.NoError(t, injectProbes(pod))
+	assert.NoError(t, injectProbes(pod, shippedRuntimeProfiles(t)))
 	got := pod.Spec.Containers[0].ReadinessProbe
 	assert.Equal(t, "/custom", got.HTTPGet.Path, "existing readinessProbe must not be overwritten")
 	assert.NotNil(t, pod.Spec.Containers[0].LivenessProbe, "missing liveness still gets injected")
@@ -144,7 +145,7 @@ func TestProbeInjector_UnknownProfile_Errors(t *testing.T) {
 	pod := makePod(map[string]string{
 		constants.RuntimeProbeProfileAnnotationKey: "bogus",
 	}, defaultContainer())
-	assert.Error(t, injectProbes(pod))
+	assert.Error(t, injectProbes(pod, shippedRuntimeProfiles(t)))
 }
 
 // =========================================================================
@@ -153,7 +154,7 @@ func TestProbeInjector_UnknownProfile_Errors(t *testing.T) {
 
 func TestObservabilityInjector_NoAnnotation_NoOp(t *testing.T) {
 	pod := makePod(nil, defaultContainer())
-	assert.NoError(t, injectObservability(pod))
+	assert.NoError(t, injectObservability(pod, shippedRuntimeProfiles(t)))
 	assert.Empty(t, pod.Annotations)
 }
 
@@ -162,7 +163,7 @@ func TestObservabilityInjector_PrometheusProfile_SetsAnnotations(t *testing.T) {
 		constants.RuntimeObservabilityProfileAnnotationKey: "prometheus",
 		constants.RuntimeObservabilityPortAnnotationKey:    "8080",
 	}, defaultContainer())
-	assert.NoError(t, injectObservability(pod))
+	assert.NoError(t, injectObservability(pod, shippedRuntimeProfiles(t)))
 	assert.Equal(t, "true", pod.Annotations[constants.PrometheusScrapeAnnotationKey])
 	assert.Equal(t, "8080", pod.Annotations[constants.PrometheusPortAnnotationKey])
 	assert.Equal(t, "/metrics", pod.Annotations[constants.PrometheusPathAnnotationKey])
@@ -172,8 +173,8 @@ func TestObservabilityInjector_DefaultPort(t *testing.T) {
 	pod := makePod(map[string]string{
 		constants.RuntimeObservabilityProfileAnnotationKey: "prometheus",
 	}, defaultContainer())
-	assert.NoError(t, injectObservability(pod))
-	assert.Equal(t, "30000", pod.Annotations[constants.PrometheusPortAnnotationKey])
+	assert.NoError(t, injectObservability(pod, shippedRuntimeProfiles(t)))
+	assert.Equal(t, strconv.Itoa(int(shippedRuntimeProfiles(t).DefaultPort)), pod.Annotations[constants.PrometheusPortAnnotationKey])
 }
 
 func TestObservabilityInjector_DoesNotOverrideExisting(t *testing.T) {
@@ -181,7 +182,7 @@ func TestObservabilityInjector_DoesNotOverrideExisting(t *testing.T) {
 		constants.RuntimeObservabilityProfileAnnotationKey: "prometheus",
 		constants.PrometheusPortAnnotationKey:              "9999", // operator-set
 	}, defaultContainer())
-	assert.NoError(t, injectObservability(pod))
+	assert.NoError(t, injectObservability(pod, shippedRuntimeProfiles(t)))
 	assert.Equal(t, "9999", pod.Annotations[constants.PrometheusPortAnnotationKey],
 		"operator-set port must be preserved")
 }
@@ -190,5 +191,5 @@ func TestObservabilityInjector_UnknownProfile_Errors(t *testing.T) {
 	pod := makePod(map[string]string{
 		constants.RuntimeObservabilityProfileAnnotationKey: "bogus",
 	}, defaultContainer())
-	assert.Error(t, injectObservability(pod))
+	assert.Error(t, injectObservability(pod, shippedRuntimeProfiles(t)))
 }

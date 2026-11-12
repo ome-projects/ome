@@ -38,7 +38,7 @@ func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			evidence, err := capacityEvidence(samples["member-a"])
+			evidence, err := recordedCapacitySample(samples["member-a"])
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -102,7 +102,7 @@ func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			r, _ := newPlacer(f.r.Scheme, f.r.Clusters, source, f.clusters[0].DeepCopy())
+			r, _ := newPlacer(f.r.Scheme(), f.r.Clusters, source, f.clusters[0].DeepCopy())
 			r.Capacity, r.CapacityClock = f.r.Capacity, f.clock
 			if tt.staleSource {
 				reads := 0
@@ -113,7 +113,7 @@ func TestRetiringCapacityMemberPreservesRendering(t *testing.T) {
 					}
 				}))
 			}
-			err = r.placePlannedOn(t.Context(), source, source.Status.Placement.Candidates[0])
+			err = r.placePlannedMember(t.Context(), source, source.Status.Placement.Candidates[0], false, nil)
 			if diff := cmp.Diff(tt.wantErr, err != nil); diff != "" {
 				t.Fatalf("retirement: %s: %v", diff, err)
 			}

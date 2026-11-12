@@ -15,13 +15,13 @@ const (
 )
 
 // PortableDigest hashes the policy spec in a canonical form: API defaults
-// applied first, then deterministic JSON. Defaulting-before-hashing is
-// load-bearing — the apiserver stores a defaulted object (e.g.
-// enforcement: Default filled by its schema default) while a raw GitOps file
-// omits the field; hashing raw bytes would make byte-identical files
-// digest-mismatch their own stored objects. Every consumer of the digest
-// (member controllers, the control-plane preflight, CI tooling) links this
-// function, so the values are comparable with no trust chain.
+// applied first, then deterministic JSON. Defaulting comes first because the
+// apiserver stores a defaulted object (enforcement: Default filled by its
+// schema default) while a raw file in a repository omits the field; hashing
+// raw bytes would make byte-identical files mismatch their own stored
+// objects. Every consumer of the digest (member controllers, the
+// control-plane preflight, CI tooling) links this function, so the values
+// are comparable with no trust chain.
 func PortableDigest(spec *v1beta1.AutoscalerPolicySpec) (string, error) {
 	canonical := canonicalizeSpec(spec)
 	encoded, err := json.Marshal(canonical)
@@ -45,9 +45,9 @@ func canonicalizeSpec(spec *v1beta1.AutoscalerPolicySpec) *v1beta1.AutoscalerPol
 
 // resolvedDigestFor hashes one component's rendered output together with the
 // inputs that vary per cluster: the effective bounds and the bound provider
-// endpoint. It differs across homes by design; its job is per-home
-// provenance ("did my policy edit land here?"), not cross-cluster equality —
-// that is the portable digest's job.
+// endpoint. It differs between member clusters by design; it answers "did my
+// policy edit land on this cluster?", while cross-cluster equality is the
+// portable digest's job.
 func resolvedDigestFor(rendered *v1beta1.ComponentAutoscaler, rctx Context, serverAddresses []string) (string, error) {
 	payload := struct {
 		Autoscaler      *v1beta1.ComponentAutoscaler `json:"autoscaler"`

@@ -20,6 +20,7 @@ data:
         "omeIngressGatewayClass" : "{{ .Values.ome.controller.ingressGateway.omeIngressGatewayClass | default "" }}",
         "consistentHashHeaders": {{ .Values.ome.controller.ingressGateway.consistentHashHeaders | default list | toJson }},
         "ingressDomain"  : "{{ .Values.ome.controller.ingressGateway.domain }}",
+        "clusterDomain": "{{ .Values.ome.controller.ingressGateway.clusterDomain | default "" }}",
         "ingressClassName" : "{{ .Values.ome.controller.ingressGateway.ingressGateway.className }}",
         "additionalIngressDomains" : {{ .Values.ome.controller.ingressGateway.additionalIngressDomains | default "null" }},
         "domainTemplate": "{{ .Values.ome.controller.ingressGateway.domainTemplate }}",
@@ -33,7 +34,8 @@ data:
         "defaultRouteTimeoutSeconds": {{ .Values.ome.controller.ingressGateway.defaultRouteTimeoutSeconds }},
         {{- end }}
         "additionalIngressGateways": {{ .Values.ome.controller.ingressGateway.additionalIngressGateways | default list | toJson }},
-        "namespaceIngressGateways": {{ .Values.ome.controller.ingressGateway.namespaceIngressGateways | default dict | toJson }}
+        "namespaceIngressGateways": {{ .Values.ome.controller.ingressGateway.namespaceIngressGateways | default dict | toJson }},
+        "routeProviderCapabilities": {{ .Values.ome.controller.ingressGateway.routeProviderCapabilities | default dict | toJson }}
     }
   deploy: |-
     {
@@ -162,6 +164,9 @@ data:
   {{- with .gangDomainFullGracePeriod }}
   {{- $fields = append $fields (dict "gangDomainFullGracePeriod" .) }}
   {{- end }}
+  {{- with .schedulingRetry }}
+  {{- $fields = append $fields (dict "schedulingRetry" (dict "after" .after "maxAttempts" .maxAttempts)) }}
+  {{- end }}
   {{- with .abandonedReplacementGracePeriod }}
   {{- $fields = append $fields (dict "abandonedReplacementGracePeriod" .) }}
   {{- end }}
@@ -178,7 +183,11 @@ data:
   {{- $fields = append $fields (dict "autoMigrate" (dict "maxAttempts" .maxAttempts)) }}
   {{- end }}
   {{- with .forceDelete }}
-  {{- $fields = append $fields (dict "forceDelete" (dict "overdueSlack" .overdueSlack "nodeUnreachableThreshold" .nodeUnreachableThreshold)) }}
+  {{- $forceDelete := dict "overdueSlack" .overdueSlack "nodeUnreachableThreshold" .nodeUnreachableThreshold }}
+  {{- if hasKey . "skipGracePeriodOnUnreachableNode" }}
+  {{- $_ := set $forceDelete "skipGracePeriodOnUnreachableNode" .skipGracePeriodOnUnreachableNode }}
+  {{- end }}
+  {{- $fields = append $fields (dict "forceDelete" $forceDelete) }}
   {{- end }}
   {{- with .teardown }}
   {{- $fields = append $fields (dict "teardown" (dict "deadline" .deadline)) }}
@@ -316,8 +325,24 @@ data:
   metricsAggregator: |-
     {
       "enableMetricAggregation": "{{ .Values.ome.metricsaggregator.enableMetricAggregation }}",
-      "enablePrometheusScraping" : "{{ .Values.ome.metricsaggregator.enablePrometheusScraping }}"
+      "enablePrometheusScraping" : "{{ .Values.ome.metricsaggregator.enablePrometheusScraping }}"{{- with .Values.ome.metricsaggregator.containerPort }},
+      "containerPort": {{ . }}{{- end }}{{- with .Values.ome.metricsaggregator.path }},
+      "path": {{ . | quote }}{{- end }}{{- with .Values.ome.metricsaggregator.aggregatePort }},
+      "aggregatePort": {{ . }}{{- end }}{{- with .Values.ome.metricsaggregator.podPrometheusPort }},
+      "podPrometheusPort": {{ . }}{{- end }}
     }
+{{- with .Values.ome.rdma }}
+  rdma: |-
+    {{- toJson . | nindent 4 }}
+{{- end }}
+{{- with .Values.ome.runtimeProfiles }}
+  runtimeProfiles: |-
+    {{- toJson . | nindent 4 }}
+{{- end }}
+{{- with .Values.ome.runtimePresets }}
+  runtimePresets: |-
+    {{- toJson . | nindent 4 }}
+{{- end }}
 {{- if .Values.ome.podMonitor }}
   podMonitor: |-
     {{- toJson .Values.ome.podMonitor | nindent 4 }}
@@ -365,21 +390,4 @@ data:
         "compartmentId": "{{ .Values.ome.omeAgent.compartmentId }}",
         "authType" : "{{ .Values.ome.omeAgent.authType }}",
         "region": "{{ .Values.ome.omeAgent.region }}"
-    }
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: benchmarkjob-config
-  namespace: ome
-data:
-  benchmarkjob: |
-    {
-      "podConfig": {
-        "image": "{{ include "ome.imageWithHub" (dict "values" .Values "repository" .Values.ome.benchmarkJob.image "tag" .Values.ome.benchmarkJob.tag) }}",
-        "cpuRequest": "{{ .Values.ome.benchmarkJob.cpuRequest }}",
-        "memoryRequest": "{{ .Values.ome.benchmarkJob.memoryRequest }}",
-        "cpuLimit": "{{ .Values.ome.benchmarkJob.cpuLimit }}",
-        "memoryLimit": "{{ .Values.ome.benchmarkJob.memoryLimit }}"
-      }
     }

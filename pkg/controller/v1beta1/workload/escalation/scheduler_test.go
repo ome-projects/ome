@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/holds"
@@ -244,6 +245,344 @@ func TestEscalation_UnschedulableGraceRunsFromCondition(t *testing.T) {
 
 	if rec.store[0].Phase != types.InstancePhaseCreating {
 		t.Errorf("Phase: got %q want Creating (one minute of hold against a ten minute grace)", rec.store[0].Phase)
+	}
+}
+
+// gatedUnschedulablePod builds a pod that a queue's gate held from its
+// creation until the queue admitted it, after which the scheduler found it
+// no node. PodScheduled keeps the time Kubernetes wrote at creation, because
+// the refusal leaves the status False.
+func gatedUnschedulablePod(name, message string, created time.Time) *corev1.Pod {
+	pod := unschedulablePod(name, created)
+	pod.CreationTimestamp = metav1.NewTime(created)
+	pod.Labels = map[string]string{constants.KueueQueueLabelKey: "queue-a"}
+	pod.Status.Conditions[0].Message = message
+	return pod
+}
+
+// gatedPasses runs one escalation pass per call on a fake clock, feeding each
+// pass the rows the previous one wrote, and returns row 0 after the pass.
+func gatedPasses(t *testing.T, clock *clocktesting.FakeClock, input types.ReconcileInput, rec *escalationRecorder,
+	plan types.ComponentPlan, pods map[int32][]*corev1.Pod) func(after time.Duration) types.InstanceStatus {
+	return func(after time.Duration) types.InstanceStatus {
+		t.Helper()
+		clock.Step(after)
+		input.ObservedState.InstanceStatuses = append([]types.InstanceStatus(nil), rec.store...)
+		if err := runEscalationPass(t, types.Deps{}, input, plan, pods); err != nil {
+			t.Fatalf("escalation pass: %v", err)
+		}
+		return rec.store[0]
+	}
+}
+
+// TestEscalation_UnschedulableGatedPodGraceRunsFromTheVerdict: a pod waits
+// two hours behind a queue's gate, the queue admits it, and the scheduler
+// finds it no node. Its PodScheduled time is its creation, so the ten minute
+// grace runs from the pass that first sees the refusal. That pass records
+// its time as the attempt's placement wait, and the Instance is failed
+// eleven minutes later, not the moment its pod is admitted.
+func TestEscalation_UnschedulableGatedPodGraceRunsFromTheVerdict(t *testing.T) {
+	now := time.Now()
+	clock := clocktesting.NewFakeClock(now)
+	input, rec := escalationFixture(creatingInstance(now.Add(30 * time.Minute)))
+	input.Clock = clock
+	input.UnschedulableGrace = 10 * time.Minute
+	input.ObservedState.UpdateRevision = "own-engine-newhash"
+	pass := gatedPasses(t, clock, input, rec, singleInstancePlan(0, 1),
+		map[int32][]*corev1.Pod{0: {gatedUnschedulablePod("engine-0-default-0", schedulerMessage, now.Add(-2*time.Hour))}})
+
+	got := pass(0)
+	if got.Phase != types.InstancePhaseCreating {
+		t.Fatalf("first pass Phase: got %q want Creating (the refusal is new, the gate is not)", got.Phase)
+	}
+	if got.Operation == nil || got.Operation.PlacementWaitSince == nil || !got.Operation.PlacementWaitSince.Time.Equal(now) {
+		t.Fatalf("first pass Operation: got %+v want the placement wait recorded at the first pass", got.Operation)
+	}
+	if got.LastFailure == nil || !got.LastFailure.Time.Time.Equal(now) {
+		t.Fatalf("first pass LastFailure: got %+v want the hold stamped at the first pass", got.LastFailure)
+	}
+	if got = pass(9 * time.Minute); got.Phase != types.InstancePhaseCreating {
+		t.Fatalf("nine minutes on Phase: got %q want Creating", got.Phase)
+	}
+	if !got.Operation.PlacementWaitSince.Time.Equal(now) || !got.LastFailure.Time.Time.Equal(now) {
+		t.Errorf("nine minutes on: got wait %v and record %v, want both at %v (the start stays put)",
+			got.Operation.PlacementWaitSince, got.LastFailure.Time, now)
+	}
+	if got = pass(2 * time.Minute); got.Phase != types.InstancePhaseFailed {
+		t.Errorf("eleven minutes on Phase: got %q want Failed", got.Phase)
+	}
+	if len(rec.warns) != 1 {
+		t.Errorf("WarnInstanceFailed: got %v want one call", rec.warns)
+	}
+	if len(rec.blocks) != 0 {
+		t.Errorf("RetryBlock: got %v want none (environment-caused)", rec.blocks)
+	}
+}
+
+// TestEscalation_UnschedulableGatedRestartKeepsTheExitAndFailsPastGrace: OME
+// opened a repair after the pod's container died, so the row's LastFailure
+// names the dead container. The rebuilt pod waits two hours behind its
+// queue's gate, and after admission the scheduler finds it no node. The
+// wait leaves the exit record in place for the retry schedule, so the start
+// of the wait cannot live there. The attempt's placement wait carries the
+// start instead. OME still holds the repair nine minutes on and fails it
+// once the ten minute grace has passed.
+func TestEscalation_UnschedulableGatedRestartKeepsTheExitAndFailsPastGrace(t *testing.T) {
+	now := time.Now()
+	clock := clocktesting.NewFakeClock(now)
+	insts := restartingInstance(now.Add(30 * time.Minute))
+	exitCode := int32(137)
+	exit := &types.InstanceTermination{
+		PodName: "engine-0-default-0", ContainerName: "main", Reason: "OOMKilled", ExitCode: &exitCode,
+		Time: metav1.NewTime(now.Add(-3 * time.Hour)),
+	}
+	recorded := *exit
+	insts[0].LastFailure = &recorded
+	input, rec := escalationFixture(insts)
+	input.Clock = clock
+	input.UnschedulableGrace = 10 * time.Minute
+	pass := gatedPasses(t, clock, input, rec, singleInstancePlan(0, 1),
+		map[int32][]*corev1.Pod{0: {gatedUnschedulablePod("engine-0-default-0", schedulerMessage, now.Add(-2*time.Hour))}})
+
+	got := pass(0)
+	if got.Phase != types.InstancePhaseRestarting || got.Operation == nil || got.Operation.Waiting != types.WaitingReasonUnschedulable {
+		t.Fatalf("first pass: got Phase=%q Operation=%+v want Restarting and held on the scheduler", got.Phase, got.Operation)
+	}
+	if got.LastFailure == nil || got.LastFailure.ContainerName != exit.ContainerName {
+		t.Fatalf("first pass LastFailure: got %+v want the exit record kept", got.LastFailure)
+	}
+	if got.Operation.PlacementWaitSince == nil || !got.Operation.PlacementWaitSince.Time.Equal(now) {
+		t.Fatalf("first pass PlacementWaitSince: got %v want the first pass", got.Operation.PlacementWaitSince)
+	}
+	if got = pass(9 * time.Minute); got.Phase != types.InstancePhaseRestarting {
+		t.Fatalf("nine minutes on Phase: got %q want Restarting", got.Phase)
+	}
+	if got = pass(2 * time.Minute); got.Phase != types.InstancePhaseFailed {
+		t.Errorf("eleven minutes on Phase: got %q want Failed (the grace has passed since the refusal was first seen)", got.Phase)
+	}
+	if len(rec.warns) != 1 {
+		t.Errorf("WarnInstanceFailed: got %v want one call", rec.warns)
+	}
+	if len(rec.blocks) != 0 {
+		t.Errorf("RetryBlock: got %v want none (environment-caused)", rec.blocks)
+	}
+}
+
+// TestEscalation_UnschedulableGatedGangWorkerIsHeldOnAdmission: a gang of a
+// leader and a worker waits two hours behind a queue's gate. On admission
+// the scheduler binds the leader first, and the worker still reads "waiting
+// for gang sibling". The pass records the worker's hold and fails nothing.
+func TestEscalation_UnschedulableGatedGangWorkerIsHeldOnAdmission(t *testing.T) {
+	now := time.Now()
+	created := now.Add(-2 * time.Hour)
+	insts := creatingInstance(now.Add(30 * time.Minute))
+	insts[0].PodCount = 2
+	input, rec := escalationFixture(insts)
+	input.Clock = clocktesting.NewFakeClock(now)
+	input.UnschedulableGrace = 10 * time.Minute
+	leader := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "engine-0-leader-0", CreationTimestamp: metav1.NewTime(created)},
+		Spec:       corev1.PodSpec{NodeName: "node-a"},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(now),
+			}},
+		},
+	}
+	worker := gatedUnschedulablePod("engine-0-worker-0", "waiting for gang sibling engine-0-leader-0 to be placed", created)
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 2),
+		map[int32][]*corev1.Pod{0: {leader, worker}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	got := rec.store[0]
+	if got.Phase != types.InstancePhaseCreating {
+		t.Errorf("Phase: got %q want Creating (the gang is being placed)", got.Phase)
+	}
+	if got.LastFailure == nil || got.LastFailure.PodName != worker.Name || !got.LastFailure.Time.Time.Equal(now) {
+		t.Errorf("LastFailure: got %+v want the worker's hold stamped now", got.LastFailure)
+	}
+	if got.Operation == nil || got.Operation.PlacementWaitSince == nil || !got.Operation.PlacementWaitSince.Time.Equal(now) {
+		t.Errorf("Operation: got %+v want the gang's placement wait recorded now", got.Operation)
+	}
+	if len(rec.warns) != 0 {
+		t.Errorf("WarnInstanceFailed: got %v want none", rec.warns)
+	}
+}
+
+// TestEscalation_UnschedulableGatedHoldIsEdgeTriggered: the scheduler refuses
+// a pod that waited behind its queue's gate, and passes run at zero, one and
+// three minutes. The first pass writes the waiting token and the start of the
+// placement wait in one write. It also writes the scheduler's record, unless
+// the row keeps a container's exit record on LastFailure. The next two
+// passes write nothing.
+func TestEscalation_UnschedulableGatedHoldIsEdgeTriggered(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit bool
+	}{{name: "no exit record"}, {name: "exit record kept", exit: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			clock := clocktesting.NewFakeClock(now)
+			insts := creatingInstance(now.Add(30 * time.Minute))
+			if tc.exit {
+				insts[0].LastFailure = &types.InstanceTermination{
+					PodName: "engine-0-default-0", ContainerName: "main", Reason: "Error", Time: metav1.NewTime(now.Add(-time.Hour)),
+				}
+			}
+			input, rec := escalationFixture(insts)
+			input.Clock = clock
+			writes := 0
+			inner := input.MutateInstance
+			input.MutateInstance = func(ctx context.Context, idx int32, mutate func(*types.InstanceStatus) bool) error {
+				return inner(ctx, idx, func(s *types.InstanceStatus) bool {
+					changed := mutate(s)
+					if changed {
+						writes++
+					}
+					return changed
+				})
+			}
+			pass := gatedPasses(t, clock, input, rec, singleInstancePlan(0, 1),
+				map[int32][]*corev1.Pod{0: {gatedUnschedulablePod("engine-0-default-0", schedulerMessage, now.Add(-2*time.Hour))}})
+
+			for i := 0; i < 3; i++ {
+				pass(time.Duration(i) * time.Minute)
+			}
+			if writes != 1 {
+				t.Errorf("status writes across three passes: got %d want 1 (edge-triggered)", writes)
+			}
+			if got := rec.store[0].Operation; got == nil || got.PlacementWaitSince == nil || !got.PlacementWaitSince.Time.Equal(now) {
+				t.Errorf("Operation: got %+v want the placement wait kept at the first pass", got)
+			}
+		})
+	}
+}
+
+// queuedPod builds a pod created behind a queue's gate that the queue has
+// not admitted yet.
+func queuedPod(name string, created time.Time) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			CreationTimestamp: metav1.NewTime(created),
+			Labels:            map[string]string{constants.KueueQueueLabelKey: "queue-a"},
+		},
+		Spec: corev1.PodSpec{SchedulingGates: []corev1.PodSchedulingGate{{Name: "kueue.x-k8s.io/admission"}}},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonSchedulingGated,
+				LastTransitionTime: metav1.NewTime(created),
+			}},
+		},
+	}
+}
+
+// TestEscalation_UnschedulableGatedRequeueStartsAFreshGrace: the queue
+// admits a pod and the scheduler finds it no node. Five minutes later the
+// queue evicts it, and OME creates the pod again behind the gate. Two hours
+// on, the queue admits it again and the scheduler refuses it again. The wait
+// behind the gate does not count. The pass that sees the pod gated retires
+// the recorded start, and the ten minute grace starts again at the second
+// refusal. OME still holds the Instance nine minutes on and fails it eleven
+// minutes on.
+func TestEscalation_UnschedulableGatedRequeueStartsAFreshGrace(t *testing.T) {
+	now := time.Now()
+	clock := clocktesting.NewFakeClock(now)
+	input, rec := escalationFixture(creatingInstance(now.Add(24 * time.Hour)))
+	input.Clock = clock
+	input.UnschedulableGrace = 10 * time.Minute
+	input.ObservedState.UpdateRevision = "own-engine-newhash"
+	pods := map[int32][]*corev1.Pod{0: {gatedUnschedulablePod("engine-0-default-0", schedulerMessage, now.Add(-time.Hour))}}
+	pass := gatedPasses(t, clock, input, rec, singleInstancePlan(0, 1), pods)
+
+	if got := pass(0); got.Operation == nil || got.Operation.PlacementWaitSince == nil {
+		t.Fatalf("first refusal: got Operation %+v want the placement wait recorded", got.Operation)
+	}
+	requeued := now.Add(5 * time.Minute)
+	pods[0] = []*corev1.Pod{queuedPod("engine-0-default-0", requeued)}
+	if got := pass(5 * time.Minute); got.Operation == nil || got.Operation.PlacementWaitSince != nil {
+		t.Fatalf("back behind the gate: got Operation %+v want the placement wait retired", got.Operation)
+	}
+	pods[0] = []*corev1.Pod{gatedUnschedulablePod("engine-0-default-0", schedulerMessage, requeued)}
+	got := pass(2 * time.Hour)
+	if got.Phase != types.InstancePhaseCreating {
+		t.Fatalf("second refusal Phase: got %q want Creating (the wait behind the gate does not count)", got.Phase)
+	}
+	if want := clock.Now(); got.Operation == nil || got.Operation.PlacementWaitSince == nil || !got.Operation.PlacementWaitSince.Time.Equal(want) {
+		t.Fatalf("second refusal Operation: got %+v want the placement wait recorded at %v", got.Operation, want)
+	}
+	if got = pass(9 * time.Minute); got.Phase != types.InstancePhaseCreating {
+		t.Fatalf("nine minutes on Phase: got %q want Creating", got.Phase)
+	}
+	if got = pass(2 * time.Minute); got.Phase != types.InstancePhaseFailed {
+		t.Errorf("eleven minutes on Phase: got %q want Failed", got.Phase)
+	}
+	if len(rec.warns) != 1 {
+		t.Errorf("WarnInstanceFailed: got %v want one call", rec.warns)
+	}
+}
+
+// TestEscalation_UnschedulableBesideAQueuedMemberFailsPastGrace: a queue
+// admits a gang's leader after two hours but not yet its worker, and the
+// scheduler refuses the leader. The leader's grace runs from the first pass
+// that sees the refusal, though the worker still waits behind the gate. OME
+// still holds the Instance nine minutes on and fails it eleven minutes on.
+func TestEscalation_UnschedulableBesideAQueuedMemberFailsPastGrace(t *testing.T) {
+	now := time.Now()
+	clock := clocktesting.NewFakeClock(now)
+	insts := creatingInstance(now.Add(24 * time.Hour))
+	insts[0].PodCount = 2
+	input, rec := escalationFixture(insts)
+	input.Clock = clock
+	input.UnschedulableGrace = 10 * time.Minute
+	created := now.Add(-2 * time.Hour)
+	leader := gatedUnschedulablePod("engine-0-default-0", "waiting for gang sibling engine-0-default-1 to be placed", created)
+	pass := gatedPasses(t, clock, input, rec, singleInstancePlan(0, 2),
+		map[int32][]*corev1.Pod{0: {leader, queuedPod("engine-0-default-1", created)}})
+
+	got := pass(0)
+	if got.Phase != types.InstancePhaseCreating {
+		t.Fatalf("first pass Phase: got %q want Creating (the refusal is new)", got.Phase)
+	}
+	if got.Operation == nil || got.Operation.PlacementWaitSince == nil || !got.Operation.PlacementWaitSince.Time.Equal(now) {
+		t.Fatalf("first pass Operation: got %+v want the placement wait recorded at the first pass", got.Operation)
+	}
+	if got = pass(9 * time.Minute); got.Phase != types.InstancePhaseCreating {
+		t.Fatalf("nine minutes on Phase: got %q want Creating", got.Phase)
+	}
+	if got = pass(2 * time.Minute); got.Phase != types.InstancePhaseFailed {
+		t.Errorf("eleven minutes on Phase: got %q want Failed (a refused pod keeps its grace beside a gated one)", got.Phase)
+	}
+	if len(rec.warns) != 1 {
+		t.Errorf("WarnInstanceFailed: got %v want one call", rec.warns)
+	}
+}
+
+// TestEscalation_UnschedulableUngatedPodKeepsItsConditionTime: a pod without
+// the queue-name label was refused at its creation an hour ago, under a ten
+// minute grace. Its PodScheduled time is the scheduler's refusal, so the
+// first pass that sees it fails the attempt, and no placement wait is
+// recorded for it.
+func TestEscalation_UnschedulableUngatedPodKeepsItsConditionTime(t *testing.T) {
+	now := time.Now()
+	input, rec := escalationFixture(creatingInstance(now.Add(30 * time.Minute)))
+	input.Clock = clocktesting.NewFakeClock(now)
+	input.UnschedulableGrace = 10 * time.Minute
+	input.ObservedState.UpdateRevision = "own-engine-newhash"
+	pod := gatedUnschedulablePod("engine-0-default-0", schedulerMessage, now.Add(-time.Hour))
+	pod.Labels = nil
+
+	if err := runEscalationPass(t, types.Deps{}, input, singleInstancePlan(0, 1),
+		map[int32][]*corev1.Pod{0: {pod}}); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	if got := rec.store[0]; got.Phase != types.InstancePhaseFailed {
+		t.Errorf("Phase: got %q want Failed (an hour of hold against a ten minute grace)", got.Phase)
 	}
 }
 

@@ -1,0 +1,7 @@
+# Values for the pre-commit `helm template` hook only. They switch on the
+# optional components that default to off so their templates render on every
+# commit; this is not a deployment profile.
+ome:
+  controller:
+    managerPodDisruptionBudget:
+      enabled: true

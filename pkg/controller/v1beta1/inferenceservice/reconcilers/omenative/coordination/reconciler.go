@@ -74,6 +74,11 @@ type ReconcileInputs struct {
 	// EnsurePerRevisionServices.
 	ComponentRunnerPorts map[v1beta1.ComponentType][]corev1.ContainerPort
 
+	// ComponentServicePortAppProtocols holds each Component's declared
+	// appProtocol per Service port name, from the merged spec its stable
+	// Service uses. A Component missing from the map publishes none.
+	ComponentServicePortAppProtocols map[v1beta1.ComponentType]map[string]string
+
 	// Now is the wall-clock used for LastTransitionTime; callers may
 	// override for tests. Zero defaults to time.Now().
 	// Already an injected-time seam; kept as time.Time (single snapshot per pass).
@@ -146,7 +151,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	groups := ResolveGroups(rollout.Effective(in.ISVC, in.Policies), GroupDefaults{RatioTolerancePercent: in.DefaultRatioTolerancePercent})
+	groups := ResolveGroups(rollout.EffectiveCoordination(in.ISVC, in.Policies), GroupDefaults{RatioTolerancePercent: in.DefaultRatioTolerancePercent})
 	result := &Result{}
 
 	// Bind a logger keyed to the ISVC so every downstream V(1)
@@ -238,7 +243,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 				continue
 			}
 			routing := perRevisionRouting[c][hash]
-			if _, err := EnsurePerRevisionServices(ctx, in.Client, in.ISVC, c, hash, routing, in.ComponentRunnerPorts[c]); err != nil {
+			if _, err := EnsurePerRevisionServices(ctx, in.Client, in.ISVC, c, hash, routing, in.ComponentRunnerPorts[c], in.ComponentServicePortAppProtocols[c]); err != nil {
 				// The namespace is being torn down (common during test
 				// teardown and any namespace-scoped delete): the create is
 				// forbidden and will never succeed, and the ISVC is going
@@ -255,14 +260,14 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		}
 
 		// Delete per-revision Service pairs whose revision-hash has no
-		// live pods and is not the Component's roll target. A hash with zero
-		// pods that is not the target is genuinely past retention. The
-		// target revision is protected even before its first pod exists:
-		// peer Components create its Services ahead of the pods whose
-		// OME_<PEER>_REVISION_ENDPOINT names them, and sweeping those would
-		// leave the pods with a dead peer endpoint until re-created. Pods
-		// added between the list and the delete re-Ensure on the next
-		// reconcile.
+		// live pods and is not the revision the Component's replica rolls
+		// toward. A hash with zero pods that is not that revision is
+		// genuinely past retention. The roll target is protected even
+		// before its first pod exists: peer Components create its Services
+		// ahead of the pods whose OME_<PEER>_REVISION_ENDPOINT names them,
+		// and sweeping those would leave the pods with a dead peer endpoint
+		// until re-created. Pods added between the list and the delete
+		// re-Ensure on the next reconcile.
 		//
 		// The sweep runs unconditionally. It cannot be gated on the live
 		// revision-hash set matching Status.Components.<c>.Traffic: the
@@ -272,11 +277,7 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		// the pass on which the two sets agree, so a gate would skip the
 		// only sweep that could collect that revision's Services. Cost is
 		// a cached-client List, not an apiserver round trip.
-		retained, err := retainedRevisionHashes(ctx, in.Reader, in.ISVC, c, perRevisionPods[c])
-		if err != nil {
-			return nil, fmt.Errorf("resolve retained revisions for %s: %w", c, err)
-		}
-		if err := gcOrphanedPerRevisionServices(ctx, in.Client, in.ISVC, c, retained); err != nil {
+		if err := SweepPerRevisionServices(ctx, in.Client, in.Reader, in.ISVC, c, perRevisionPods[c]); err != nil {
 			return nil, fmt.Errorf("gc per-revision services for %s: %w", c, err)
 		}
 	}
@@ -427,7 +428,10 @@ func collectOMENativeComponents(modes map[v1beta1.ComponentType]constants.Deploy
 // client (coordination's own observe — it has the field index registered) and
 // false for the live API reader (canary capacity gate — the apiserver has no
 // custom Pod field selector). Both modes return the identical pod set; useIndex
-// only picks how the set is fetched.
+// only picks how the set is fetched. With the cached client the pods handed
+// back are the informer cache's own objects (listObservedPods): read them
+// during the pass, write nothing through them, keep none past the pass, and
+// copy one before changing it.
 func observePerRevisionPods(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, components []v1beta1.ComponentType, useIndex bool) (map[v1beta1.ComponentType]map[string]int32, map[v1beta1.ComponentType]map[string]int32, map[v1beta1.ComponentType]map[string]RevisionRoutingSelector, map[v1beta1.ComponentType][]*corev1.Pod, error) {
 	total := make(map[v1beta1.ComponentType]map[string]int32, len(components))
 	ready := make(map[v1beta1.ComponentType]map[string]int32, len(components))
@@ -437,7 +441,7 @@ func observePerRevisionPods(ctx context.Context, reads client.Reader, isvc *v1be
 		return total, ready, routing, observedPods, nil
 	}
 	for _, c := range components {
-		pods, err := query.ListOMENativePodsByName(ctx, reads, isvc.Namespace, prefixFor(isvc, c), v1beta1convert.ComponentTypeToWorkload(c), useIndex)
+		pods, err := listObservedPods(ctx, reads, isvc, c, useIndex)
 		if err != nil {
 			return nil, nil, nil, nil, fmt.Errorf("list pods for %s/%s: %w", isvc.Namespace, c, err)
 		}
@@ -468,6 +472,19 @@ func observePerRevisionPods(ctx context.Context, reads client.Reader, isvc *v1be
 		routing[c] = routingByHash
 	}
 	return total, ready, routing, observedPods, nil
+}
+
+// listObservedPods lists one Component's pods for the observation. The cached
+// client hands out its own pods instead of a copy of each, which on a large Component
+// is most of what the list costs: every reader of the observed pods in this
+// package reads them during the pass and writes nothing through them, and
+// nothing keeps them past the pass. The live reader answers a plain list.
+func listObservedPods(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType, useIndex bool) ([]*corev1.Pod, error) {
+	component := v1beta1convert.ComponentTypeToWorkload(c)
+	if useIndex {
+		return query.ListCachedOMENativePodsByName(ctx, reads, isvc.Namespace, prefixFor(isvc, c), component)
+	}
+	return query.ListOMENativePodsByName(ctx, reads, isvc.Namespace, prefixFor(isvc, c), component, false)
 }
 
 // podReadyAndServing reports whether a pod is currently serving traffic: Running,
@@ -703,7 +720,9 @@ func buildComponentObservation(summary *v1beta1.InferenceReplicaStatus, c v1beta
 	out.DesiredReplicas = summary.Replicas
 	out.TotalPods = sumPodCounts(perRevisionPods)
 	out.ReadyPods = summary.ReadyReplicas
-	out.ServingPods = summary.ServingReplicas
+	// Serving Instances, a replacement gang serving beside its source
+	// counted once with that source, as the replica-side gates count them.
+	out.ServingPods = servingInstanceCount(summary)
 	out.NewRevisionPods = summary.UpdatedReplicas
 	out.NewRevisionReadyPods = summary.UpdatedReadyReplicas
 	cur := query.RevisionFromName(summary.CurrentRevision)
@@ -797,31 +816,6 @@ func sumPodCounts(in map[string]int32) int32 {
 		sum += n
 	}
 	return sum
-}
-
-// retainedRevisionHashes is the revision-hash set the orphan sweep must
-// keep for one Component: every hash with a live pod plus the Component's
-// roll-target hash from its IR status. The target is retained even with
-// zero pods because peer Components create its per-revision Services
-// ahead of the pods that name them. Returns liveHashes as-is when the IR
-// reports no target yet.
-func retainedRevisionHashes(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, liveHashes map[string]int32) (map[string]int32, error) {
-	target, err := latestRevisionHashChecked(ctx, reads, isvc, component)
-	if err != nil {
-		return nil, err
-	}
-	if target == "" {
-		return liveHashes, nil
-	}
-	if _, live := liveHashes[target]; live {
-		return liveHashes, nil
-	}
-	retained := make(map[string]int32, len(liveHashes)+1)
-	for h, n := range liveHashes {
-		retained[h] = n
-	}
-	retained[target] = 0
-	return retained, nil
 }
 
 // gcOrphanedPerRevisionServices deletes per-revision Service pairs

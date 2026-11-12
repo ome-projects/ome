@@ -216,7 +216,7 @@ func TestResolvePinnedRuntime_LiveDrifted_StopsThePass(t *testing.T) {
 		t.Fatalf("resolvePinnedRuntime returned error %v, want the drift reported as a condition", err)
 	}
 	if !pin.skipChildren {
-		t.Fatal("skipChildren = false; a drifted runtime revision stops the pass before its children (not decided yet; this test records the current behaviour and is updated when it changes)")
+		t.Fatal("skipChildren = false; a drifted runtime revision stops the pass before its children (left open; this test records the current behaviour)")
 	}
 	if pin.spec != nil {
 		t.Errorf("pin.spec = %+v, want none while the pass stops", pin.spec)

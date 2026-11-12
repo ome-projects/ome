@@ -1,6 +1,7 @@
 package replicator
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -13,42 +14,25 @@ import (
 	"sigs.k8s.io/ome/pkg/xet"
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
-	"sigs.k8s.io/ome/pkg/logging"
 
 	"github.com/stretchr/testify/assert"
 
+	"sigs.k8s.io/ome/pkg/logging"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
 	testingPkg "sigs.k8s.io/ome/pkg/testing"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
-func TestHFToOCIReplicator_Replicate_Success(t *testing.T) {
-	// Save original functions
-	origDownloadFromHF := downloadFromHFFunc
-	origUploadDirectoryToOCIOSDataStore := uploadDirectoryToOCIOSDataStoreFunc
-
-	t.Cleanup(func() {
-		downloadFromHFFunc = origDownloadFromHF
-		uploadDirectoryToOCIOSDataStoreFunc = origUploadDirectoryToOCIOSDataStore
-	})
-
-	downloadCalled := false
-	uploadCalled := false
-	downloadFromHFFunc = func(input common.ReplicationInput, hubClient *xet.Client, downloadDir string, opts hfDownloadOptions, logger logging.Interface) (string, error) {
-		downloadCalled = true
-		return "/tmp/model", nil
-	}
-	uploadDirectoryToOCIOSDataStoreFunc = func(ds *ociobjectstore.OCIOSDataStore, target ociobjectstore.ObjectURI, localPath string, checksumConfig *common.ChecksumConfig, numObjects int, numConnections int) error {
-		uploadCalled = true
-		return nil
-	}
-
+func newHFToOCIReplicator(localPath string, hub *fakeHubClient, transfer *fakeTransfer) *HFToOCIReplicator {
 	logger := testingPkg.SetupMockLogger()
-	replicator := &HFToOCIReplicator{
+	return &HFToOCIReplicator{
 		Logger: logger,
-		Config: HFToOCIReplicatorConfig{
-			LocalPath:      "/tmp/model",
-			NumConnections: 1,
+		Dependencies: Dependencies{
+			LocalPath:   localPath,
+			Connections: 1,
+			HubClient:   hub,
+			TargetStore: storeWithLogger(logger),
+			Transfer:    transfer,
 		},
 		ReplicationInput: common.ReplicationInput{
 			SourceStorageType: storage.StorageTypeHuggingFace,
@@ -57,63 +41,53 @@ func TestHFToOCIReplicator_Replicate_Success(t *testing.T) {
 			Target:            ociobjectstore.ObjectURI{BucketName: "target-bucket", Namespace: "target-bucket-ns", Prefix: "target-prefix/"},
 		},
 	}
-	objs := CreateCommonMockReplicationObjects(1)
-	err := replicator.Replicate(objs)
+}
+
+func TestHFToOCIReplicator_Replicate_Success(t *testing.T) {
+	localPath := t.TempDir()
+	workspace := filepath.Join(localPath, ReplicaWorkspacePath)
+	writeFiles(t, workspace, "config.json")
+	hub := &fakeHubClient{download: func(context.Context, *xet.SnapshotRequest) (string, error) {
+		return workspace, nil
+	}}
+	transfer := &fakeTransfer{}
+
+	err := newHFToOCIReplicator(localPath, hub, transfer).Replicate(CreateCommonMockReplicationObjects(1))
+
 	assert.NoError(t, err)
-	assert.True(t, downloadCalled, "downloadFromHF should be called")
-	assert.True(t, uploadCalled, "uploadDirectoryToOCIOSDataStore should be called")
+	assert.Equal(t, 1, hub.downloads, "the snapshot should be downloaded")
+	assert.Equal(t, []string{"target-prefix/config.json"}, transfer.uploaded(), "the downloaded file should be uploaded under the target prefix")
+	_, err = os.Stat(workspace)
+	assert.True(t, os.IsNotExist(err), "the workspace should be removed after the upload")
 }
 
 func TestHFToOCIReplicator_Replicate_Failure(t *testing.T) {
-	// Save original functions
-	origDownloadFromHF := downloadFromHFFunc
-	origUploadDirectoryToOCIOSDataStore := uploadDirectoryToOCIOSDataStoreFunc
-
-	t.Cleanup(func() {
-		downloadFromHFFunc = origDownloadFromHF
-		uploadDirectoryToOCIOSDataStoreFunc = origUploadDirectoryToOCIOSDataStore
-	})
-
-	logger := testingPkg.SetupMockLogger()
-	replicator := &HFToOCIReplicator{
-		Logger: logger,
-		Config: HFToOCIReplicatorConfig{
-			LocalPath:      "/tmp/model",
-			NumConnections: 1,
-		},
-		ReplicationInput: common.ReplicationInput{
-			SourceStorageType: storage.StorageTypeHuggingFace,
-			TargetStorageType: storage.StorageTypeOCI,
-			Source:            ociobjectstore.ObjectURI{BucketName: "meta-llama/llama-3-70b-instruct"},
-			Target:            ociobjectstore.ObjectURI{BucketName: "target-bucket", Namespace: "target-bucket-ns", Prefix: "target-prefix/"},
-		},
-	}
+	localPath := t.TempDir()
+	workspace := filepath.Join(localPath, ReplicaWorkspacePath)
+	writeFiles(t, workspace, "config.json")
+	hub := &fakeHubClient{}
+	transfer := &fakeTransfer{}
+	replicator := newHFToOCIReplicator(localPath, hub, transfer)
 	objs := CreateCommonMockReplicationObjects(1)
 
 	// Test download error
-	downloadFromHFFunc = func(input common.ReplicationInput, hubClient *xet.Client, downloadDir string, opts hfDownloadOptions, logger logging.Interface) (string, error) {
+	hub.download = func(context.Context, *xet.SnapshotRequest) (string, error) {
 		return "", errors.New("download error")
-	}
-	uploadCalled := false
-	uploadDirectoryToOCIOSDataStoreFunc = func(ds *ociobjectstore.OCIOSDataStore, target ociobjectstore.ObjectURI, localPath string, checksumConfig *common.ChecksumConfig, numObjects int, numConnections int) error {
-		uploadCalled = true
-		return nil
 	}
 	err := replicator.Replicate(objs)
 	assert.Error(t, err)
-	assert.False(t, uploadCalled, "uploadDirectoryToOCIOSDataStore should not be called if download fails")
+	assert.Empty(t, transfer.uploaded(), "nothing should be uploaded if the download fails")
 	assert.ErrorContains(t, err, "download error")
 
 	// Test upload error
-	downloadFromHFFunc = func(input common.ReplicationInput, hubClient *xet.Client, downloadDir string, opts hfDownloadOptions, logger logging.Interface) (string, error) {
-		return "/tmp/model", nil
+	hub.download = func(context.Context, *xet.SnapshotRequest) (string, error) {
+		return workspace, nil
 	}
-	uploadDirectoryToOCIOSDataStoreFunc = func(ds *ociobjectstore.OCIOSDataStore, target ociobjectstore.ObjectURI, localPath string, checksumConfig *common.ChecksumConfig, numObjects int, numConnections int) error {
-		return errors.New("upload error")
-	}
+	transfer.uploadErr = failEvery(errors.New("upload error"))
 	err = replicator.Replicate(objs)
 	assert.Error(t, err)
-	assert.ErrorContains(t, err, "upload error")
+	assert.ErrorContains(t, err, "some files failed to upload")
+	assert.Equal(t, []string{"target-prefix/config.json"}, transfer.uploaded(), "the upload should be attempted")
 }
 
 func TestEffectiveChecksumConcurrency(t *testing.T) {
@@ -125,10 +99,8 @@ func TestEffectiveChecksumConcurrency(t *testing.T) {
 
 func TestUploadDirectoryLimitsChecksumConcurrency(t *testing.T) {
 	originalChecksum := getObjectMetadataWithChecksumFunc
-	originalUpload := uploadObjectToOCIOSDataStoreFunc
 	t.Cleanup(func() {
 		getObjectMetadataWithChecksumFunc = originalChecksum
-		uploadObjectToOCIOSDataStoreFunc = originalUpload
 	})
 
 	directory := t.TempDir()
@@ -139,7 +111,6 @@ func TestUploadDirectoryLimitsChecksumConcurrency(t *testing.T) {
 
 	var active atomic.Int32
 	var maximum atomic.Int32
-	var uploaded atomic.Int32
 	started := make(chan struct{}, 4)
 	release := make(chan struct{})
 	var releaseOnce sync.Once
@@ -161,26 +132,25 @@ func TestUploadDirectoryLimitsChecksumConcurrency(t *testing.T) {
 		active.Add(-1)
 		return map[string]string{OCIObjectMD5MetadataKey: "checksum"}
 	}
-	uploadObjectToOCIOSDataStoreFunc = func(_ *ociobjectstore.OCIOSDataStore, object ociobjectstore.ObjectURI, _ string) error {
+	transfer := &fakeTransfer{uploadErr: func(object ociobjectstore.ObjectURI) error {
 		if object.Metadata[OCIObjectMD5MetadataKey] != "checksum" {
 			return errors.New("checksum metadata missing")
 		}
-		uploaded.Add(1)
 		return nil
-	}
+	}}
 
 	logger := testingPkg.SetupMockLogger()
-	dataStore := &ociobjectstore.OCIOSDataStore{
-		Config: &ociobjectstore.Config{AnotherLogger: logger},
-	}
 	result := make(chan error, 1)
 	go func() {
-		result <- uploadDirectoryToOCIOSDataStore(
-			dataStore,
+		result <- uploadDirectory(
+			Dependencies{
+				Connections: 4,
+				Checksum:    &common.ChecksumConfig{UploadEnabled: true, ChecksumAlgorithm: MD5ChecksumAlgorithm, Concurrency: 2},
+				TargetStore: storeWithLogger(logger),
+				Transfer:    transfer,
+			},
 			ociobjectstore.ObjectURI{BucketName: "bucket", Namespace: "namespace"},
 			directory,
-			&common.ChecksumConfig{UploadEnabled: true, ChecksumAlgorithm: MD5ChecksumAlgorithm, Concurrency: 2},
-			4,
 			4,
 		)
 	}()
@@ -201,5 +171,5 @@ func TestUploadDirectoryLimitsChecksumConcurrency(t *testing.T) {
 	releaseChecksums()
 	assert.NoError(t, <-result)
 	assert.Equal(t, int32(2), maximum.Load())
-	assert.Equal(t, int32(4), uploaded.Load())
+	assert.Len(t, transfer.uploaded(), 4)
 }

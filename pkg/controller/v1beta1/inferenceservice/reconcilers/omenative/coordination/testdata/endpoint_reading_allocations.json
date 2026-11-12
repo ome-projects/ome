@@ -1,0 +1,12 @@
+{
+  "recordedOn": {
+    "date": "2026-11-03",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "First recording: the endpoint reading over a service at rest, 1,000 and 4,000 single-pod Instances serving on one revision, every pod a Ready endpoint, the revision's slices already read by the rotation. The reading names the routed Service once per revision; what it builds per pod is nothing.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/one-revision": 50,
+    "4000x1/one-revision": 102
+  }
+}

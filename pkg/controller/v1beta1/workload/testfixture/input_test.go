@@ -4,8 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -16,9 +14,6 @@ func TestReconcileInput_ObservesTheStoredRowsAndWritesThemBack(t *testing.T) {
 	in := fixture.ReconcileInput(isvc, c, types.ComponentEngine)
 	if in.Key.Namespace != "ns" || in.Key.OwnerName != "svc" || in.Key.Component != types.ComponentEngine {
 		t.Fatalf("key = %+v, want ns/svc engine", in.Key)
-	}
-	if in.Key.SelectorLabels[constants.InferenceServicePodLabelKey] != "svc" || in.Key.SelectorLabels[query.LabelManagedBy] != query.ManagedByOMENative {
-		t.Errorf("selector = %v, want the service's managed pods", in.Key.SelectorLabels)
 	}
 	if rows := in.ObservedState.InstanceStatuses; len(rows) != 1 || rows[0].Phase != types.InstancePhaseReady {
 		t.Fatalf("observed rows = %+v, want the stored Ready row", rows)

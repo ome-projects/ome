@@ -74,7 +74,7 @@ func componentFloorsFor(source *v1beta1.InferenceService, observations map[strin
 // holds no primary component. Every other source clears it.
 func componentSharesCondition(source *v1beta1.InferenceService) policyCondition {
 	condition := policyCondition{condType: apis.ConditionType(v1beta1.PlacementComponentShares), clear: true}
-	if placementMode(source) != v1beta1.PlacementModeSplit || !affinity.SetsWeights(source.Spec.Placement.ClusterAffinity) || source.Status.Placement == nil {
+	if placementMode(source) != v1beta1.PlacementModeSplit || !affinity.UsesRatios(source.Spec.Placement.ClusterAffinity) || source.Status.Placement == nil {
 		return condition
 	}
 	minimums, err := splitComponentMinimums(source)

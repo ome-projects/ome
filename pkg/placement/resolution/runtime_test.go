@@ -266,7 +266,7 @@ func TestResolveRuntime(t *testing.T) {
 			if diff := cmp.Diff(!tt.wantNamespace, got.IsCluster); diff != "" {
 				t.Error(diff)
 			}
-			if diff := cmp.Diff([]v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}, got.Components()); diff != "" {
+			if diff := cmp.Diff([]v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent}, declaredComponents(got)); diff != "" {
 				t.Error(diff)
 			}
 			if diff := cmp.Diff([]int{2, 8, 4, 8, 1}, []int{*got.Engine.MinReplicas, got.Engine.MaxReplicas, *got.Decoder.MinReplicas, got.Decoder.MaxReplicas, *got.Router.MinReplicas}); diff != "" {
@@ -284,4 +284,19 @@ func TestResolveRuntime(t *testing.T) {
 			}
 		})
 	}
+}
+
+// declaredComponents lists the roles a resolved runtime carries, in role order.
+func declaredComponents(r *Runtime) []v1beta1.ComponentType {
+	var out []v1beta1.ComponentType
+	if r.Engine != nil {
+		out = append(out, v1beta1.EngineComponent)
+	}
+	if r.Decoder != nil {
+		out = append(out, v1beta1.DecoderComponent)
+	}
+	if r.Router != nil {
+		out = append(out, v1beta1.RouterComponent)
+	}
+	return out
 }

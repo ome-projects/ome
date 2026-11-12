@@ -8,7 +8,6 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,7 +34,6 @@ var gcRequestKey = types.NamespacedName{Name: "runtime-revision-gc"}
 type GCReconciler struct {
 	client.Client
 	Log                 logr.Logger
-	Scheme              *runtime.Scheme
 	OMENamespace        string
 	RetentionPerRuntime int
 	GracePeriod         time.Duration

@@ -192,7 +192,7 @@ func TestResolveComponentAutoscaler_PriorityMatrix(t *testing.T) {
 					setRuntimeAutoscaler(rt, component, runtimeAutoscalerBlock())
 				}
 
-				got, source := ResolveComponentAutoscaler(rt, isvc, component)
+				got, source, _ := ResolveComponentAutoscalerWithPolicy(rt, isvc, component, nil)
 				g.Expect(got).NotTo(gomega.BeNil(),
 					"resolver MUST always return a non-nil ComponentAutoscaler")
 				g.Expect(source).To(gomega.Equal(tc.wantSource),
@@ -220,7 +220,7 @@ func TestResolveComponentAutoscaler_PriorityMatrix(t *testing.T) {
 func TestResolveComponentAutoscaler_NilISVC(t *testing.T) {
 	g := gomega.NewWithT(t)
 
-	got, source := ResolveComponentAutoscaler(nil, nil, v1beta1.EngineComponent)
+	got, source, _ := ResolveComponentAutoscalerWithPolicy(nil, nil, v1beta1.EngineComponent, nil)
 	g.Expect(got).NotTo(gomega.BeNil(),
 		"resolver MUST tolerate nil ISVC + nil runtime — both fall to default")
 	g.Expect(source).To(gomega.Equal(SpecSourceDefault))
@@ -229,7 +229,7 @@ func TestResolveComponentAutoscaler_NilISVC(t *testing.T) {
 	// nil ISVC + runtime set → runtime wins.
 	rt := &v1beta1.ServingRuntimeSpec{}
 	setRuntimeAutoscaler(rt, v1beta1.EngineComponent, runtimeAutoscalerBlock())
-	got, source = ResolveComponentAutoscaler(rt, nil, v1beta1.EngineComponent)
+	got, source, _ = ResolveComponentAutoscalerWithPolicy(rt, nil, v1beta1.EngineComponent, nil)
 	g.Expect(source).To(gomega.Equal(SpecSourceRuntime))
 	g.Expect(got).To(gomega.Equal(runtimeAutoscalerBlock()))
 }
@@ -247,7 +247,7 @@ func TestResolveComponentAutoscaler_NilComponentSpec(t *testing.T) {
 			Router: &v1beta1.RouterSpec{},
 		},
 	}
-	got, source := ResolveComponentAutoscaler(nil, isvc, v1beta1.EngineComponent)
+	got, source, _ := ResolveComponentAutoscalerWithPolicy(nil, isvc, v1beta1.EngineComponent, nil)
 	g.Expect(source).To(gomega.Equal(SpecSourceDefault),
 		"missing Component spec falls through to default")
 	g.Expect(got.Class).To(gomega.Equal(v1beta1.AutoscalerHPA))
@@ -255,7 +255,7 @@ func TestResolveComponentAutoscaler_NilComponentSpec(t *testing.T) {
 	// Same shape but runtime declares an engine Autoscaler — runtime wins.
 	rt := &v1beta1.ServingRuntimeSpec{}
 	setRuntimeAutoscaler(rt, v1beta1.EngineComponent, runtimeAutoscalerBlock())
-	got, source = ResolveComponentAutoscaler(rt, isvc, v1beta1.EngineComponent)
+	got, source, _ = ResolveComponentAutoscalerWithPolicy(rt, isvc, v1beta1.EngineComponent, nil)
 	g.Expect(source).To(gomega.Equal(SpecSourceRuntime))
 	g.Expect(got.Keda).NotTo(gomega.BeNil(),
 		"runtime block must propagate even when the ISVC's Component spec is unset")
@@ -269,7 +269,7 @@ func TestResolveComponentAutoscaler_UnknownComponent(t *testing.T) {
 	isvc := &v1beta1.InferenceService{}
 	setISVCAutoscaler(isvc, v1beta1.EngineComponent, isvcAutoscalerBlock())
 
-	got, source := ResolveComponentAutoscaler(nil, isvc, v1beta1.ComponentType("unknown"))
+	got, source, _ := ResolveComponentAutoscalerWithPolicy(nil, isvc, v1beta1.ComponentType("unknown"), nil)
 	g.Expect(source).To(gomega.Equal(SpecSourceDefault),
 		"unknown Component value must NOT silently inherit the engine block")
 	g.Expect(got.Class).To(gomega.Equal(v1beta1.AutoscalerHPA))
@@ -289,7 +289,7 @@ func TestResolveComponentAutoscaler_DeepCopySemantics(t *testing.T) {
 	setISVCAutoscaler(isvc, v1beta1.EngineComponent, isvcAutoscalerBlock())
 	original := isvc.Spec.Engine.ComponentExtensionSpec.Autoscaler.DeepCopy()
 
-	got, _ := ResolveComponentAutoscaler(nil, isvc, v1beta1.EngineComponent)
+	got, _, _ := ResolveComponentAutoscalerWithPolicy(nil, isvc, v1beta1.EngineComponent, nil)
 	got.Class = v1beta1.AutoscalerNone
 	got.Keda.Triggers[0].Metadata["source"] = "mutated-by-caller"
 	got.HPA.Metrics[0].Resource.Name = "mutated"
@@ -302,7 +302,7 @@ func TestResolveComponentAutoscaler_DeepCopySemantics(t *testing.T) {
 	setRuntimeAutoscaler(rt, v1beta1.DecoderComponent, runtimeAutoscalerBlock())
 	originalRt := rt.DecoderConfig.ComponentExtensionSpec.Autoscaler.DeepCopy()
 
-	got, _ = ResolveComponentAutoscaler(rt, &v1beta1.InferenceService{}, v1beta1.DecoderComponent)
+	got, _, _ = ResolveComponentAutoscalerWithPolicy(rt, &v1beta1.InferenceService{}, v1beta1.DecoderComponent, nil)
 	got.Class = v1beta1.AutoscalerNone
 	got.Keda.Triggers = append(got.Keda.Triggers, kedav1.ScaleTriggers{Type: "mutated"})
 
@@ -318,10 +318,10 @@ func TestResolveComponentAutoscaler_DeepCopySemantics(t *testing.T) {
 func TestResolveComponentAutoscaler_DefaultBranchFreshAllocation(t *testing.T) {
 	g := gomega.NewWithT(t)
 
-	first, _ := ResolveComponentAutoscaler(nil, nil, v1beta1.EngineComponent)
+	first, _, _ := ResolveComponentAutoscalerWithPolicy(nil, nil, v1beta1.EngineComponent, nil)
 	first.Class = v1beta1.AutoscalerNone
 
-	second, source := ResolveComponentAutoscaler(nil, nil, v1beta1.EngineComponent)
+	second, source, _ := ResolveComponentAutoscalerWithPolicy(nil, nil, v1beta1.EngineComponent, nil)
 	g.Expect(source).To(gomega.Equal(SpecSourceDefault))
 	g.Expect(second.Class).To(gomega.Equal(v1beta1.AutoscalerHPA),
 		"each default-branch call must produce a fresh {Class: hpa} — no shared global")
@@ -340,17 +340,17 @@ func TestResolveComponentAutoscaler_PerComponentIsolation(t *testing.T) {
 	setRuntimeAutoscaler(rt, v1beta1.DecoderComponent, runtimeAutoscalerBlock())
 	// Router intentionally left to fall to default.
 
-	gotEngine, srcEngine := ResolveComponentAutoscaler(rt, isvc, v1beta1.EngineComponent)
+	gotEngine, srcEngine, _ := ResolveComponentAutoscalerWithPolicy(rt, isvc, v1beta1.EngineComponent, nil)
 	g.Expect(srcEngine).To(gomega.Equal(SpecSourceISVC),
 		"engine has ISVC block → engine source is isvc")
 	g.Expect(gotEngine.Class).To(gomega.Equal(v1beta1.AutoscalerKEDA))
 
-	gotDecoder, srcDecoder := ResolveComponentAutoscaler(rt, isvc, v1beta1.DecoderComponent)
+	gotDecoder, srcDecoder, _ := ResolveComponentAutoscalerWithPolicy(rt, isvc, v1beta1.DecoderComponent, nil)
 	g.Expect(srcDecoder).To(gomega.Equal(SpecSourceRuntime),
 		"decoder has no ISVC block but runtime has one → decoder source is runtime")
 	g.Expect(gotDecoder.Class).To(gomega.Equal(v1beta1.AutoscalerHPA))
 
-	gotRouter, srcRouter := ResolveComponentAutoscaler(rt, isvc, v1beta1.RouterComponent)
+	gotRouter, srcRouter, _ := ResolveComponentAutoscalerWithPolicy(rt, isvc, v1beta1.RouterComponent, nil)
 	g.Expect(srcRouter).To(gomega.Equal(SpecSourceDefault),
 		"router has no block anywhere → router source is default")
 	g.Expect(gotRouter.Class).To(gomega.Equal(v1beta1.AutoscalerHPA))
@@ -438,7 +438,7 @@ func TestResolveRawComponentAutoscaler_PriorityMatrix(t *testing.T) {
 					setRuntimeAutoscaler(runtimeSpec, component, tt.runtimeBlock.DeepCopy())
 				}
 
-				got, source, err := ResolveRawComponentAutoscaler(runtimeSpec, isvc, component, tt.annotations)
+				got, source, _, err := ResolveRawComponentAutoscalerWithPolicy(runtimeSpec, isvc, component, tt.annotations, nil)
 				g.Expect(err).NotTo(gomega.HaveOccurred())
 				g.Expect(got).NotTo(gomega.BeNil())
 				g.Expect(got.Class).To(gomega.Equal(tt.wantClass))
@@ -458,7 +458,7 @@ func TestResolveRawComponentAutoscaler_LegacyTargetUtilization(t *testing.T) {
 		constants.TargetUtilizationPercentage: "67",
 	}
 
-	got, source, err := ResolveRawComponentAutoscaler(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations)
+	got, source, _, err := ResolveRawComponentAutoscalerWithPolicy(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations, nil)
 
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(source).To(gomega.Equal(SpecSourceLegacy))
@@ -483,11 +483,11 @@ func TestResolveRawComponentAutoscaler_LegacyFreshAllocation(t *testing.T) {
 		constants.TargetUtilizationPercentage: "67",
 	}
 
-	first, _, err := ResolveRawComponentAutoscaler(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations)
+	first, _, _, err := ResolveRawComponentAutoscalerWithPolicy(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	*first.HPA.Metrics[0].Resource.Target.AverageUtilization = 10
 
-	second, source, err := ResolveRawComponentAutoscaler(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations)
+	second, source, _, err := ResolveRawComponentAutoscalerWithPolicy(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(source).To(gomega.Equal(SpecSourceLegacy))
 	g.Expect(second.HPA.Metrics[0].Resource.Target.AverageUtilization).NotTo(gomega.BeNil())
@@ -501,7 +501,7 @@ func TestResolveRawComponentAutoscaler_UnknownLegacyClassErrors(t *testing.T) {
 	g := gomega.NewWithT(t)
 	annotations := map[string]string{constants.AutoscalerClass: "mystery"}
 
-	got, source, err := ResolveRawComponentAutoscaler(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations)
+	got, source, _, err := ResolveRawComponentAutoscalerWithPolicy(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations, nil)
 
 	g.Expect(err).To(gomega.HaveOccurred())
 	g.Expect(err.Error()).To(gomega.ContainSubstring(constants.AutoscalerClass))
@@ -516,7 +516,7 @@ func TestResolveRawComponentAutoscaler_TargetUtilizationWithoutClass(t *testing.
 	g := gomega.NewWithT(t)
 	annotations := map[string]string{constants.TargetUtilizationPercentage: "61"}
 
-	got, source, err := ResolveRawComponentAutoscaler(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations)
+	got, source, _, err := ResolveRawComponentAutoscalerWithPolicy(nil, &v1beta1.InferenceService{}, v1beta1.EngineComponent, annotations, nil)
 
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(source).To(gomega.Equal(SpecSourceLegacy))

@@ -20,7 +20,7 @@ func (e *ComponentNotReadyError) Error() string {
 }
 
 // ClusterLocalEndpointClass is the conventional class tagged on the in-cluster
-// (<svc>.<ns>.svc.cluster.local) endpoint that status.address projects. It is a
+// (<svc>.<ns>.svc.<cluster domain>) endpoint that status.address projects. It is a
 // status taxonomy label (like a condition-type string), not a config-driven
 // behavioral value.
 const ClusterLocalEndpointClass = "cluster-local"

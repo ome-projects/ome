@@ -26,87 +26,87 @@ func TestWeights_AllocationReadinessAndFactors_ProportionalBoundedRatios(t *test
 		},
 		{
 			name:     "single healthy cluster always weight 1",
-			clusters: []ClusterCapacity{{Cluster: "a", Allocated: 7, Ready: 3}},
+			clusters: []ClusterCapacity{{Allocated: 7, Ready: 3}},
 			want:     []int32{1},
 		},
 		{
 			name: "equal allocation and factor splits evenly",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 4, Ready: 4},
-				{Cluster: "b", Allocated: 4, Ready: 4},
+				{Allocated: 4, Ready: 4},
+				{Allocated: 4, Ready: 4},
 			},
 			want: []int32{1, 1},
 		},
 		{
 			name: "proportional to allocation reduced by gcd",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 5, Ready: 5},
-				{Cluster: "b", Allocated: 2, Ready: 2},
+				{Allocated: 5, Ready: 5},
+				{Allocated: 2, Ready: 2},
 			},
 			want: []int32{5, 2},
 		},
 		{
 			name: "partial readiness lowers each cluster's share",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 4},
-				{Cluster: "b", Allocated: 3, Ready: 3},
+				{Allocated: 7, Ready: 4},
+				{Allocated: 3, Ready: 3},
 			},
 			want: []int32{4, 3},
 		},
 		{
 			name: "heterogeneous hardware weighted by capacity factor",
 			clusters: []ClusterCapacity{
-				{Cluster: "fast", Allocated: 100, Ready: 100, Factor: factor("2")},
-				{Cluster: "slow", Allocated: 100, Ready: 100, Factor: factor("1")},
+				{Allocated: 100, Ready: 100, Factor: factor("2")},
+				{Allocated: 100, Ready: 100, Factor: factor("1")},
 			},
 			want: []int32{2, 1},
 		},
 		{
 			name: "fractional factor kept exact via milli scale",
 			clusters: []ClusterCapacity{
-				{Cluster: "fast", Allocated: 100, Ready: 100, Factor: factor("1")},
-				{Cluster: "slow", Allocated: 100, Ready: 100, Factor: factor("0.5")},
+				{Allocated: 100, Ready: 100, Factor: factor("1")},
+				{Allocated: 100, Ready: 100, Factor: factor("0.5")},
 			},
 			want: []int32{2, 1},
 		},
 		{
 			name: "unhealthy cluster is gated to zero, others keep ratio",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 6, Ready: 6},
-				{Cluster: "b", Allocated: 4, Ready: 0},
-				{Cluster: "c", Allocated: 2, Ready: 2},
+				{Allocated: 6, Ready: 6},
+				{Allocated: 4, Ready: 0},
+				{Allocated: 2, Ready: 2},
 			},
 			want: []int32{3, 0, 1},
 		},
 		{
 			name: "all clusters unready stay at zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 5, Ready: 0},
-				{Cluster: "b", Allocated: 3, Ready: 0},
+				{Allocated: 5, Ready: 0},
+				{Allocated: 3, Ready: 0},
 			},
 			want: []int32{0, 0},
 		},
 		{
 			name: "nothing allocated stays at zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 0, Ready: 4},
-				{Cluster: "b", Allocated: 0, Ready: 4},
+				{Allocated: 0, Ready: 4},
+				{Allocated: 0, Ready: 4},
 			},
 			want: []int32{0, 0},
 		},
 		{
 			name: "nil factor treated as identity",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 3, Ready: 3, Factor: nil},
-				{Cluster: "b", Allocated: 1, Ready: 1, Factor: factor("1")},
+				{Allocated: 3, Ready: 3, Factor: nil},
+				{Allocated: 1, Ready: 1, Factor: factor("1")},
 			},
 			want: []int32{3, 1},
 		},
 		{
 			name: "non-positive factor treated as identity",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 2, Ready: 2, Factor: factor("0")},
-				{Cluster: "b", Allocated: 2, Ready: 2, Factor: factor("-3")},
+				{Allocated: 2, Ready: 2, Factor: factor("0")},
+				{Allocated: 2, Ready: 2, Factor: factor("-3")},
 			},
 			want: []int32{1, 1},
 		},
@@ -114,41 +114,41 @@ func TestWeights_AllocationReadinessAndFactors_ProportionalBoundedRatios(t *test
 			name: "heterogeneous with differing allocation and factor",
 			clusters: []ClusterCapacity{
 				// 4 replicas * 3.0 = 12 ; 6 replicas * 1.0 = 6 -> 2:1
-				{Cluster: "fast", Allocated: 4, Ready: 4, Factor: factor("3")},
-				{Cluster: "slow", Allocated: 6, Ready: 6, Factor: factor("1")},
+				{Allocated: 4, Ready: 4, Factor: factor("3")},
+				{Allocated: 6, Ready: 6, Factor: factor("1")},
 			},
 			want: []int32{2, 1},
 		},
 		{
 			name: "ratio at the publisher limit remains exact",
 			clusters: []ClusterCapacity{
-				{Cluster: "large", Allocated: 1, Ready: 1, Factor: factor("1000000")},
-				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+				{Allocated: 1, Ready: 1, Factor: factor("1000000")},
+				{Allocated: 1, Ready: 1, Factor: factor("1")},
 			},
 			want: []int32{maxTrafficMapWeight, 1},
 		},
 		{
 			name: "ratio one above the publisher limit is proportionally bounded",
 			clusters: []ClusterCapacity{
-				{Cluster: "large", Allocated: 1, Ready: 1, Factor: factor("1000001")},
-				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+				{Allocated: 1, Ready: 1, Factor: factor("1000001")},
+				{Allocated: 1, Ready: 1, Factor: factor("1")},
 			},
 			want: []int32{maxTrafficMapWeight, 1},
 		},
 		{
 			name: "ratio beyond the publisher limit is safely compressed",
 			clusters: []ClusterCapacity{
-				{Cluster: "large", Allocated: 1, Ready: 1, Factor: factor("3000000000")},
-				{Cluster: "gated", Allocated: 1, Ready: 0, Factor: factor("9000000000")},
-				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+				{Allocated: 1, Ready: 1, Factor: factor("3000000000")},
+				{Allocated: 1, Ready: 0, Factor: factor("9000000000")},
+				{Allocated: 1, Ready: 1, Factor: factor("1")},
 			},
 			want: []int32{maxTrafficMapWeight, 0, 1},
 		},
 		{
 			name: "factor and allocation multiplication cannot overflow",
 			clusters: []ClusterCapacity{
-				{Cluster: "large", Allocated: math.MaxInt32, Ready: math.MaxInt32, Factor: factor("9223372036854775807")},
-				{Cluster: "baseline", Allocated: 1, Ready: 1, Factor: factor("1")},
+				{Allocated: math.MaxInt32, Ready: math.MaxInt32, Factor: factor("9223372036854775807")},
+				{Allocated: 1, Ready: 1, Factor: factor("1")},
 			},
 			want: []int32{maxTrafficMapWeight, 1},
 		},
@@ -156,13 +156,13 @@ func TestWeights_AllocationReadinessAndFactors_ProportionalBoundedRatios(t *test
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Weights(tt.clusters)
+			got := weights(tt.clusters, AllFailedPolicyPreserveTraffic)
 			if len(got) != len(tt.want) {
-				t.Fatalf("len(Weights) = %d, want %d (%v)", len(got), len(tt.want), got)
+				t.Fatalf("len(weights) = %d, want %d (%v)", len(got), len(tt.want), got)
 			}
 			for i := range got {
 				if got[i] != tt.want[i] {
-					t.Errorf("Weights[%d] = %d, want %d (full: got %v want %v)", i, got[i], tt.want[i], got, tt.want)
+					t.Errorf("weights[%d] = %d, want %d (full: got %v want %v)", i, got[i], tt.want[i], got, tt.want)
 				}
 			}
 		})
@@ -184,8 +184,8 @@ func TestWeights_ReportedCapacityIsACeiling(t *testing.T) {
 			// planning: a cluster claiming more than the plan gets the plan.
 			name: "report above plan does not raise the share",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(100))},
-				{Cluster: "b", Allocated: 3, Ready: 3},
+				{Allocated: 7, Ready: 7, Reported: ptr(int32(100))},
+				{Allocated: 3, Ready: 3},
 			},
 			want: []int32{7, 3},
 		},
@@ -194,16 +194,16 @@ func TestWeights_ReportedCapacityIsACeiling(t *testing.T) {
 			// fewer usable prefill/decode pairs than its replica count implies.
 			name: "report below plan lowers the share",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 8, Ready: 8, Reported: ptr(int32(2))},
-				{Cluster: "b", Allocated: 2, Ready: 2},
+				{Allocated: 8, Ready: 8, Reported: ptr(int32(2))},
+				{Allocated: 2, Ready: 2},
 			},
 			want: []int32{1, 1},
 		},
 		{
 			name: "report equal to plan is a no-op",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(7))},
-				{Cluster: "b", Allocated: 3, Ready: 3},
+				{Allocated: 7, Ready: 7, Reported: ptr(int32(7))},
+				{Allocated: 3, Ready: 3},
 			},
 			want: []int32{7, 3},
 		},
@@ -211,8 +211,8 @@ func TestWeights_ReportedCapacityIsACeiling(t *testing.T) {
 			// Distinct from nil: the cluster actively says it can serve nothing.
 			name: "report of zero drops the cluster to weight 0",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(0))},
-				{Cluster: "b", Allocated: 3, Ready: 3},
+				{Allocated: 7, Ready: 7, Reported: ptr(int32(0))},
+				{Allocated: 3, Ready: 3},
 			},
 			want: []int32{0, 1},
 		},
@@ -220,16 +220,16 @@ func TestWeights_ReportedCapacityIsACeiling(t *testing.T) {
 			// Fail open: a malformed report must not black-hole a serving cluster.
 			name: "negative report falls back to the plan",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(-1))},
-				{Cluster: "b", Allocated: 3, Ready: 3},
+				{Allocated: 7, Ready: 7, Reported: ptr(int32(-1))},
+				{Allocated: 3, Ready: 3},
 			},
 			want: []int32{7, 3},
 		},
 		{
 			name: "every cluster reporting zero stays at zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(0))},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reported: ptr(int32(0))},
+				{Allocated: 7, Ready: 7, Reported: ptr(int32(0))},
+				{Allocated: 3, Ready: 3, Reported: ptr(int32(0))},
 			},
 			want: []int32{0, 0},
 		},
@@ -237,8 +237,8 @@ func TestWeights_ReportedCapacityIsACeiling(t *testing.T) {
 			// The ceiling applies to the count, so the factor still scales it.
 			name: "ceiling composes with the capacity factor",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 8, Ready: 8, Reported: ptr(int32(2)), Factor: factor("2")},
-				{Cluster: "b", Allocated: 4, Ready: 4},
+				{Allocated: 8, Ready: 8, Reported: ptr(int32(2)), Factor: factor("2")},
+				{Allocated: 4, Ready: 4},
 			},
 			want: []int32{1, 1},
 		},
@@ -259,16 +259,16 @@ func TestWeights_ProbeResultKnownOrNot_GatesOnlyAKnownUnreachable(t *testing.T) 
 		{
 			name: "nil reachable does not gate (probing off, or no verdict yet)",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7},
-				{Cluster: "b", Allocated: 3, Ready: 3},
+				{Allocated: 7, Ready: 7},
+				{Allocated: 3, Ready: 3},
 			},
 			want: []int32{7, 3},
 		},
 		{
 			name: "reachable true is a no-op",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(true)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(true)},
+				{Allocated: 7, Ready: 7, Reachable: ptr(true)},
+				{Allocated: 3, Ready: 3, Reachable: ptr(true)},
 			},
 			want: []int32{7, 3},
 		},
@@ -277,8 +277,8 @@ func TestWeights_ProbeResultKnownOrNot_GatesOnlyAKnownUnreachable(t *testing.T) 
 			// have kept this cluster at 70%.
 			name: "unreachable cluster is gated despite being ready",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(true)},
+				{Allocated: 7, Ready: 7, Reachable: ptr(false)},
+				{Allocated: 3, Ready: 3, Reachable: ptr(true)},
 			},
 			want: []int32{0, 1},
 		},
@@ -287,8 +287,8 @@ func TestWeights_ProbeResultKnownOrNot_GatesOnlyAKnownUnreachable(t *testing.T) 
 			// capacity-derived ratio.
 			name: "every cluster unreachable preserves capacity weights",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+				{Allocated: 7, Ready: 7, Reachable: ptr(false)},
+				{Allocated: 3, Ready: 3, Reachable: ptr(false)},
 			},
 			want: []int32{7, 3},
 		},
@@ -297,17 +297,17 @@ func TestWeights_ProbeResultKnownOrNot_GatesOnlyAKnownUnreachable(t *testing.T) 
 			// ready replicas.
 			name: "reachable but unready is still gated",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 0, Reachable: ptr(true)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(true)},
+				{Allocated: 7, Ready: 0, Reachable: ptr(true)},
+				{Allocated: 3, Ready: 3, Reachable: ptr(true)},
 			},
 			want: []int32{0, 1},
 		},
 		{
 			name: "probe gate composes with the reported ceiling",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 8, Ready: 8, Reported: ptr(int32(4))},
-				{Cluster: "b", Allocated: 4, Ready: 4, Reachable: ptr(false)},
-				{Cluster: "c", Allocated: 4, Ready: 4},
+				{Allocated: 8, Ready: 8, Reported: ptr(int32(4))},
+				{Allocated: 4, Ready: 4, Reachable: ptr(false)},
+				{Allocated: 4, Ready: 4},
 			},
 			want: []int32{1, 0, 1},
 		},
@@ -321,8 +321,8 @@ func TestWeights_ProbeResultKnownOrNot_GatesOnlyAKnownUnreachable(t *testing.T) 
 
 func TestWeights_DrainOnAllProbeFailures(t *testing.T) {
 	clusters := []ClusterCapacity{
-		{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
-		{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+		{Allocated: 7, Ready: 7, Reachable: ptr(false)},
+		{Allocated: 3, Ready: 3, Reachable: ptr(false)},
 	}
 
 	assertWeightsWithPolicy(t, clusters, AllFailedPolicyDrain, []int32{0, 0})
@@ -339,64 +339,64 @@ func TestWeights_PreserveTrafficOnlyIgnoresFleetWideProbeFailure(t *testing.T) {
 		{
 			name: "capacity minima and factors still apply",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 8, Ready: 6, Reported: ptr(int32(4)), Factor: factor("2"), Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 6, Ready: 3, Reachable: ptr(false)},
+				{Allocated: 8, Ready: 6, Reported: ptr(int32(4)), Factor: factor("2"), Reachable: ptr(false)},
+				{Allocated: 6, Ready: 3, Reachable: ptr(false)},
 			},
 			want: []int32{8, 3},
 		},
 		{
 			name: "unready cluster stays at zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 0, Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+				{Allocated: 7, Ready: 0, Reachable: ptr(false)},
+				{Allocated: 3, Ready: 3, Reachable: ptr(false)},
 			},
 			want: []int32{0, 1},
 		},
 		{
 			name: "unadmitted cluster stays at zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 0, Ready: 7, Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+				{Allocated: 0, Ready: 7, Reachable: ptr(false)},
+				{Allocated: 3, Ready: 3, Reachable: ptr(false)},
 			},
 			want: []int32{0, 1},
 		},
 		{
 			name: "zero reported capacity stays at zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(0)), Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reachable: ptr(false)},
+				{Allocated: 7, Ready: 7, Reported: ptr(int32(0)), Reachable: ptr(false)},
+				{Allocated: 3, Ready: 3, Reachable: ptr(false)},
 			},
 			want: []int32{0, 1},
 		},
 		{
 			name: "all unready stays all zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 0, Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 0, Reachable: ptr(false)},
+				{Allocated: 7, Ready: 0, Reachable: ptr(false)},
+				{Allocated: 3, Ready: 0, Reachable: ptr(false)},
 			},
 			want: []int32{0, 0},
 		},
 		{
 			name: "all reported capacity zero stays all zero",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reported: ptr(int32(0)), Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 3, Reported: ptr(int32(0)), Reachable: ptr(false)},
+				{Allocated: 7, Ready: 7, Reported: ptr(int32(0)), Reachable: ptr(false)},
+				{Allocated: 3, Ready: 3, Reported: ptr(int32(0)), Reachable: ptr(false)},
 			},
 			want: []int32{0, 0},
 		},
 		{
 			name: "unknown verdict prevents fallback",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 3, Ready: 0},
+				{Allocated: 7, Ready: 7, Reachable: ptr(false)},
+				{Allocated: 3, Ready: 0},
 			},
 			want: []int32{0, 0},
 		},
 		{
 			name: "passing verdict prevents fallback",
 			clusters: []ClusterCapacity{
-				{Cluster: "a", Allocated: 7, Ready: 7, Reachable: ptr(false)},
-				{Cluster: "b", Allocated: 0, Ready: 3, Reachable: ptr(true)},
+				{Allocated: 7, Ready: 7, Reachable: ptr(false)},
+				{Allocated: 0, Ready: 3, Reachable: ptr(true)},
 			},
 			want: []int32{0, 0},
 		},
@@ -473,7 +473,7 @@ func TestRoutableReplicas_AllocatedReadyAndReported_TakesTheMinimum(t *testing.T
 
 func TestEffectiveAllocated_ReportBelowAboveOrNegative_CapsAtThePlan(t *testing.T) {
 	// The caller records this as the entry's allocation provenance, so it has to
-	// agree with what Weights actually used.
+	// agree with what weights used.
 	tests := []struct {
 		name    string
 		cluster ClusterCapacity
@@ -496,13 +496,13 @@ func TestEffectiveAllocated_ReportBelowAboveOrNegative_CapsAtThePlan(t *testing.
 
 func assertWeights(t *testing.T, clusters []ClusterCapacity, want []int32) {
 	t.Helper()
-	got := Weights(clusters)
+	got := weights(clusters, AllFailedPolicyPreserveTraffic)
 	if len(got) != len(want) {
-		t.Fatalf("Weights() length = %d, want %d (%v)", len(got), len(want), got)
+		t.Fatalf("weights() length = %d, want %d (%v)", len(got), len(want), got)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("Weights() = %v, want %v", got, want)
+			t.Fatalf("weights() = %v, want %v", got, want)
 		}
 	}
 }

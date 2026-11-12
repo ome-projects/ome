@@ -62,7 +62,7 @@ func createPodMonitor(componentMeta metav1.ObjectMeta, podSpec *corev1.PodSpec) 
 		Path:     "/metrics",
 		Interval: "10s",
 	}}
-	endpoints = append(endpoints, ParseExtraEndpoints(componentMeta.Annotations)...)
+	endpoints = append(endpoints, ParseExtraEndpoints(componentMeta.Annotations, "10s")...)
 
 	return &monitoringv1.PodMonitor{
 		ObjectMeta: metav1.ObjectMeta{

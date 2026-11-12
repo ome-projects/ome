@@ -1,19 +1,37 @@
 {
   "recordedOn": {
-    "commit": "unrecorded",
-    "date": "2026-10-20",
-    "machine": "linux/amd64, 30 cores, go1.26"
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
   },
-  "reason": "First recording: the status codec at 4,000 rows, encode and decode of both stored shapes.",
+  "reason": "The readySince columns: a decode of 4,000 rows at rest expands one base time, one index set and one offset list into one slice of times, 74 allocations where the 4,000 entries cost 20,066 (16,066 through the Decoder), and the writer's selection serializes three columns instead of 4,000 entries, 4,192 allocations and 1.7 MB where it cost 12,188 and 3.2 MB at 4,000 rows (1,167 and 422 KB where it cost 3,158 and 646 KB at 1,000); the selected encode falls from 16,185 to 4,194. What remains at readySince/4000 is the deep copy of the logical status before the selection, one allocation per pointer time. Every other count stands as recorded.",
   "tolerancePercent": 10,
   "budgets": {
-    "decode/representative/4000/columnarV2": 429,
+    "decode/readySince/4000/columnarV2": 74,
+    "decode/readySince/4000/columnarV2/fetched": 74,
+    "decode/readySince/4000/denseV1": 24026,
+    "decode/representative/4000/columnarV2": 424,
+    "decode/representative/4000/columnarV2/fetched": 385,
     "decode/representative/4000/denseV1": 8526,
-    "decode/uniform/4000/columnarV2": 49,
+    "decode/uniform/4000/columnarV2": 50,
+    "decode/uniform/4000/columnarV2/fetched": 50,
     "decode/uniform/4000/denseV1": 8026,
+    "encode/readySince/4000/denseV1": 8003,
+    "encode/readySince/4000/selected": 4194,
     "encode/representative/4000/denseV1": 94,
-    "encode/representative/4000/selected": 9072,
+    "encode/representative/4000/selected": 627,
     "encode/uniform/4000/denseV1": 3,
-    "encode/uniform/4000/selected": 180
+    "encode/uniform/4000/selected": 169,
+    "select/readySince/1000": 1167,
+    "select/readySince/1000/bytes": 421704,
+    "select/readySince/4000": 4192,
+    "select/readySince/4000/bytes": 1699976,
+    "select/representative/1000": 510,
+    "select/representative/1000/bytes": 430344,
+    "select/representative/4000": 574,
+    "select/representative/4000/bytes": 1628488,
+    "select/uniform/1000": 147,
+    "select/uniform/1000/bytes": 329344,
+    "select/uniform/4000": 168,
+    "select/uniform/4000/bytes": 1271424
   }
 }

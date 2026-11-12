@@ -69,9 +69,10 @@ func pairableMinimumUnder(ir *v1beta1.InferenceReplica, desired, budget int32) p
 // pairableMinimumOf is the pairable minimum of one pairing side under this
 // context's group: desired minus the stricter of the side's own
 // maxUnavailable and the group's unavailability budget. A canary unit has
-// no group budget, so its members' minimums are their own.
+// no group budget, so its members' minimums are their own; a recorded group
+// the spec no longer declares keeps the budget the run opened with.
 func (ctx GateContext) pairableMinimumOf(ir *v1beta1.InferenceReplica) pairFloor {
-	if ctx.CanaryUnit {
+	if ctx.Scope == CanaryUnit {
 		return ownPairableMinimum(ir)
 	}
 	return resolvePairFloor(ir, ctx.Group.Pacing)

@@ -49,7 +49,13 @@ type batchMemberFixture struct {
 	surging     int32 // a surge toward the target is open, the source still serving
 	handingOver int32 // a surge whose replacement serves is draining its source
 	failed      int32 // the attempt toward the target ended Failed
-	parked      int32 // the attempt toward the target is parked
+	// Two attempts the escalation stopped with their pods kept, each at the
+	// step it records for that and with ImagePullBackOff as the last
+	// failure: an in-place attempt whose old pod still serves, Ready over
+	// it, and a recreate attempt whose new pod set serves nothing, Failed.
+	// Either counts on the retry record when the escalation stops it.
+	parked  int32
+	stopped int32
 	// failedSurge is a surge whose replacement failed while the old pod
 	// serves, as the replica publishes it: Ready, no operation, the target
 	// kept; failedGangSurge is the gang form, the attempt kept at Surge
@@ -60,10 +66,26 @@ type batchMemberFixture struct {
 	retiring        int32 // Ready on the old revision beyond the desired count: rows a scale-down has not yet retired
 	partition       int32 // the member's own rollingUpdate.partition: that many Instances stay on the old revision
 	held            int32 // the member's retry record for the target is Held after that many failed attempts
+	// backoff is the member's retry record for the target in Backoff after
+	// that many failed attempts the schedule counted: the next start waits
+	// on it.
+	backoff int32
+	// unplaceable is a recreate whose pod the scheduler cannot place: the
+	// attempt open at its drain step with the Unschedulable waiting token.
+	unplaceable int32
+	// graceEnded is an attempt the placement grace ended with nothing
+	// counted on the record: Failed with no operation and the target kept
+	// under a drain-first strategy, Ready over the old pod with the target
+	// kept under SurgeThenDrain, the last failure Unschedulable either way.
+	graceEnded int32
 }
 
 // heldRecordReason is the last failure the fixtures' Held retry records name.
 const heldRecordReason = "the image cannot be pulled"
+
+// stoppedAttemptReason is the last failure a stopped attempt's row records:
+// the kubelet gave up pulling the new image.
+const stoppedAttemptReason = "ImagePullBackOff"
 
 // movable is the number of Instances the roll may move: the desired count
 // less the Instances the partition holds on their revision.
@@ -124,19 +146,38 @@ func batchReplica(comp v1beta1.ComponentType, m batchMemberFixture) *v1beta1.Inf
 		endedStep = workloadtypes.UpdateStepSurge
 	}
 	add(m.failed, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceFailed, RunningRevision: old, TargetRevision: target, Operation: attempt(endedStep)})
-	add(m.parked, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, TargetRevision: target, PodCount: 1, ServingPodCount: 1, Operation: attempt(workloadtypes.UpdateStepParked)})
+	imagePull := &v1beta1.InstanceTermination{Reason: stoppedAttemptReason}
+	add(m.parked, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, TargetRevision: target, PodCount: 1, ServingPodCount: 1, Operation: attempt(workloadtypes.UpdateStepParked), LastFailure: imagePull})
+	add(m.stopped, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceFailed, RunningRevision: old, TargetRevision: target, PodCount: 1, Operation: attempt(workloadtypes.UpdateStepParked), LastFailure: imagePull})
+	unplaced := attempt(workloadtypes.UpdateStepDrain)
+	unplaced.Waiting = workloadtypes.WaitingReasonUnschedulable
+	add(m.unplaceable, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceUpdating, RunningRevision: old, TargetRevision: target, PodCount: 1, Operation: unplaced})
+	unschedulable := &v1beta1.InstanceTermination{Reason: workloadtypes.WaitingReasonUnschedulable}
+	graceEndedServing := int32(0)
+	if m.strategy == v1beta1.UpdateStrategySurgeThenDrain {
+		graceEndedServing = m.graceEnded
+		add(m.graceEnded, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, TargetRevision: target, PodCount: 2, ServingPodCount: 1, LastFailure: unschedulable})
+	} else {
+		add(m.graceEnded, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceFailed, RunningRevision: old, TargetRevision: target, PodCount: 1, LastFailure: unschedulable})
+	}
 	add(m.failedSurge, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, TargetRevision: target, PodCount: 2, ServingPodCount: 1})
 	add(m.failedGangSurge, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, TargetRevision: target, PodCount: 2, ServingPodCount: 1, Operation: attempt(workloadtypes.UpdateStepSurge)})
+	// A scale-up's new rows take the indices after the old ones, as the
+	// engine creates them; a scale-down's not-yet-retired rows sit above the
+	// desired count.
+	untouched := m.desired - m.creating - int32(len(rows))
+	add(untouched, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, PodCount: 1, ServingPodCount: 1})
 	add(m.creating, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceCreating, TargetRevision: target, Operation: &v1beta1.InstanceOperation{ID: "create", Type: v1beta1.InstanceOperationCreate, TargetRevision: target}})
-	untouched := m.desired - int32(len(rows))
-	add(untouched+m.retiring, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, PodCount: 1, ServingPodCount: 1})
+	add(m.retiring, v1beta1.OMENativeInstanceStatus{Phase: v1beta1.OMENativeInstanceReady, RunningRevision: old, PodCount: 1, ServingPodCount: 1})
 	ir.Status.InstanceStatuses = rows
 	if m.held > 0 {
 		ir.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: target, State: v1beta1.RetryBlockHeld, AttemptsStarted: m.held, Reason: heldRecordReason}}
+	} else if m.backoff > 0 {
+		ir.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: target, State: v1beta1.RetryBlockBackoff, AttemptsStarted: m.backoff, Reason: heldRecordReason}}
 	}
 	ir.Status.UpdatedReplicas = m.promoted
 	ir.Status.UpdatedReadyReplicas = m.promoted
-	ir.Status.ServingReplicas = m.promoted + m.surging + m.handingOver + m.parked + m.failedSurge + m.failedGangSurge + untouched + m.retiring
+	ir.Status.ServingReplicas = m.promoted + m.surging + m.handingOver + m.parked + m.failedSurge + m.failedGangSurge + graceEndedServing + untouched + m.retiring
 	ir.Status.ReadyReplicas = ir.Status.ServingReplicas
 	return ir
 }
@@ -154,6 +195,12 @@ type batchGroupFixture struct {
 	// blueGreen declares the group with the blueGreen progression instead
 	// of rollingUpdate; the gates read the same replicas either way.
 	blueGreen bool
+	// recordedBeside are further groups declared beside the group above
+	// when the run records the plan.
+	recordedBeside []v1beta1.RolloutGroup
+	// edit is the operator's change to the rollout block after the run
+	// recorded the plan; nil leaves the spec as recorded.
+	edit func(spec *v1beta1.RolloutSpec)
 }
 
 func batchService(g batchGroupFixture, members map[v1beta1.ComponentType]batchMemberFixture) *v1beta1.InferenceService {
@@ -193,10 +240,14 @@ func batchService(g batchGroupFixture, members map[v1beta1.ComponentType]batchMe
 			ObservedRatio: &v1beta1.RolloutCoordinationRatio{Original: original},
 		}}}
 	}
+	isvc.Spec.Rollout.Groups = append(isvc.Spec.Rollout.Groups, g.recordedBeside...)
 	isvc = pinActiveRun(isvc)
 	for _, comp := range components {
 		isvc.Status.Rollout.ActiveRun.TargetRevisions = append(isvc.Status.Rollout.ActiveRun.TargetRevisions,
 			v1beta1.RolloutRunTarget{Component: comp, Revision: "target", StableRevision: "old"})
+	}
+	if g.edit != nil {
+		g.edit(isvc.Spec.Rollout)
 	}
 	return isvc
 }
@@ -541,17 +592,17 @@ func TestEvaluateUpdateGate_BatchStepPacesDrainFirstMembers(t *testing.T) {
 			wantHold: true, wantReason: "decoder batch 2 waits for engine batch 1 to serve (2 of 3 serving)",
 		},
 		{
-			name: "a prefill whose attempt ended Failed counts as settled: the decoder goes on", group: "3",
-			engine: six(batchMemberFixture{promoted: 2, failed: 1}), decoder: two(batchMemberFixture{promoted: 1}), comp: dec,
+			name: "a prefill whose attempt ended Failed and waits on the schedule counts as settled: the decoder goes on", group: "3",
+			engine: six(batchMemberFixture{promoted: 2, failed: 1, backoff: 1}), decoder: two(batchMemberFixture{promoted: 1}), comp: dec,
 		},
 		{
 			name: "a prefill batch half served and half failed still waits for its last Instance", group: "3",
-			engine: six(batchMemberFixture{promoted: 1, failed: 1, inFlight: 1}), decoder: two(batchMemberFixture{promoted: 1}), comp: dec,
+			engine: six(batchMemberFixture{promoted: 1, failed: 1, inFlight: 1, backoff: 1}), decoder: two(batchMemberFixture{promoted: 1}), comp: dec,
 			wantHold: true, wantReason: "decoder batch 2 waits for engine batch 1 to serve (1 of 3 serving, 1 failed)",
 		},
 		{
-			name: "a parked prefill attempt counts as settled: the decoder goes on", group: "3",
-			engine: six(batchMemberFixture{promoted: 2, parked: 1}), decoder: two(batchMemberFixture{promoted: 1}), comp: dec,
+			name: "a parked prefill attempt whose record stands counts as settled: the decoder goes on", group: "3",
+			engine: six(batchMemberFixture{promoted: 2, parked: 1, backoff: 1}), decoder: two(batchMemberFixture{promoted: 1}), comp: dec,
 		},
 		{
 			name: "a finished decoder no longer paces the engine", group: "3",
@@ -656,7 +707,7 @@ func TestEvaluateUpdateGate_BatchStepReadsTheStepFromTheResizedCount(t *testing.
 		{name: "before-the-resize", engine: batchMemberFixture{desired: 12, step: "10%", strategy: recreate, promoted: 4},
 			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 3 waits for decoder batch 2 to serve (1 of 2 serving)"},
 		{name: "scaled-up-to-24", engine: batchMemberFixture{desired: 24, step: "10%", strategy: recreate, promoted: 4, creating: 12},
-			wantGate: v1beta1.RolloutHoldGateBudget, wantReason: "unavailable budget 6 exhausted (current 12, in-flight 0, would become 13)"},
+			wantGate: v1beta1.RolloutHoldGateBudget, wantReason: "unavailable budget 6 exhausted (current 12, in-flight 0, would become 13); counted as unavailable: Instances 12 to 23 still being created"},
 		{name: "scaled-down-to-8", engine: batchMemberFixture{desired: 8, step: "10%", strategy: recreate, promoted: 4, retiring: 4},
 			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 5 waits for decoder batch 4 to serve (1 of 4 serving)"},
 	}
@@ -1178,17 +1229,17 @@ func TestEvaluateUpdateGate_BatchStepPacesSurgingMembers(t *testing.T) {
 			wantHold: true, wantReason: "decoder batch 2 waits for decoder batch 1 to serve (0 of 2 serving)",
 		},
 		{
-			name:   "a surge whose replacement failed counts as settled: the decoder goes on",
-			engine: twelve(batchMemberFixture{promoted: 2, failed: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			name:   "a surge whose replacement failed and waits on the schedule counts as settled: the decoder goes on",
+			engine: twelve(batchMemberFixture{promoted: 2, failed: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "a prefill batch one served, one failed and one open still waits for its open Instance",
-			engine: twelve(batchMemberFixture{promoted: 1, failed: 1, surging: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: twelve(batchMemberFixture{promoted: 1, failed: 1, surging: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 			wantHold: true, wantReason: "decoder batch 2 waits for engine batch 1 to serve (1 of 3 serving, 1 failed)",
 		},
 		{
-			name:   "a parked surge counts as settled: the decoder goes on",
-			engine: twelve(batchMemberFixture{promoted: 2, parked: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			name:   "a parked attempt whose record stands counts as settled: the decoder goes on",
+			engine: twelve(batchMemberFixture{promoted: 2, parked: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "the last prefill batch waits for the third decode batch",
@@ -1335,8 +1386,8 @@ func TestEvaluateUpdateGate_BatchStepBatchesRoutersByStepKind(t *testing.T) {
 			comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
-			name:   "a drain-first router beside a surging pair rolls on its own gates",
-			engine: twelve(batchMemberFixture{surging: 3}), decoder: eight(batchMemberFixture{surging: 2}), router: routerFixture(recreate, batchMemberFixture{promoted: 1}),
+			name:   "a drain-first router beside a surging pair rolls on its own gates: its first drain is admitted while the pair's surges are still coming up",
+			engine: twelve(batchMemberFixture{surging: 3}), decoder: eight(batchMemberFixture{surging: 2}), router: routerFixture(recreate, batchMemberFixture{}),
 			comp: rtr, mechanism: workloadtypes.UpdateStrategyRecreatePod,
 		},
 		{
@@ -1426,7 +1477,10 @@ func TestEvaluateUpdateGate_BatchStepNeverHoldsAHandOver(t *testing.T) {
 // a time; with 12 prefill beside 8 decode one of the three prefill surges
 // fails and neither side stops. The gang form of the row, the attempt kept
 // at its Surge step while the replacement gang is retired, is never
-// batch-held either; its surge slot is the budget gate's to free.
+// batch-held either; its surge slot is the budget gate's to free. Every
+// failure here is one the side's retry schedule counted, so its record
+// stands in Backoff; an end the record does not count is started again
+// at once and read as still to start (batch_step_starts_again_test.go).
 func TestEvaluateUpdateGate_BatchStepReadsAFailedSurgeAsEnded(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	surge := v1beta1.UpdateStrategySurgeThenDrain
@@ -1445,46 +1499,46 @@ func TestEvaluateUpdateGate_BatchStepReadsAFailedSurgeAsEnded(t *testing.T) {
 	cases := []batchCase{
 		{
 			name:   "3:3 both first surges failed: the engine's retry re-opens its batch",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{failedSurge: 1, backoff: 1}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "3:3 both first surges failed: the decoder's retry re-opens its batch",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{failedSurge: 1, backoff: 1}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "3:3 one-sided: the decoder's first surge served, the engine's failed: the engine's retry is admitted",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{promoted: 1}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{promoted: 1}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "3:3 one-sided: the decoder's second surge is admitted beside the engine's failed first",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{promoted: 1}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{promoted: 1}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "3:3 the engine's retry is open: the decoder's retry waits for it, one attempt at a time",
-			engine: three(batchMemberFixture{surging: 1}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: three(batchMemberFixture{surging: 1}), decoder: three(batchMemberFixture{failedSurge: 1, backoff: 1}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 			wantHold: true, wantReason: "decoder batch 2 waits for engine batch 1 to serve (0 of 1 serving)",
 		},
 		{
 			name:   "3:3 the engine's retry is open: the engine's own next batch waits for it",
-			engine: three(batchMemberFixture{surging: 1}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: three(batchMemberFixture{surging: 1}), decoder: three(batchMemberFixture{failedSurge: 1, backoff: 1}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 			wantHold: true, wantReason: "engine batch 2 waits for engine batch 1 to serve (0 of 1 serving)",
 		},
 		{
 			name:   "12:8 one of the three prefill surges failed: the prefill side's next start is admitted",
-			engine: twelve(batchMemberFixture{promoted: 2, failedSurge: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: twelve(batchMemberFixture{promoted: 2, failedSurge: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: eng, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "12:8 one of the three prefill surges failed: the decode side's second batch is admitted",
-			engine: twelve(batchMemberFixture{promoted: 2, failedSurge: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: twelve(batchMemberFixture{promoted: 2, failedSurge: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 		},
 		{
 			name:   "12:8 a prefill batch one served, one failed and one open names its failed count",
-			engine: twelve(batchMemberFixture{promoted: 1, failedSurge: 1, surging: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: twelve(batchMemberFixture{promoted: 1, failedSurge: 1, surging: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 			wantHold: true, wantReason: "decoder batch 2 waits for engine batch 1 to serve (1 of 3 serving, 1 failed)",
 		},
 		{
 			name:   "12:8 the prefill ladder spent: the decode side's third batch waits for prefill batch 2 and names the failed Instance",
-			engine: twelve(batchMemberFixture{promoted: 2, failedSurge: 1}), decoder: eight(batchMemberFixture{promoted: 4}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
+			engine: twelve(batchMemberFixture{promoted: 2, failedSurge: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 4}), comp: dec, mechanism: workloadtypes.UpdateStrategySurgeThenDrain,
 			wantHold: true, wantReason: "decoder batch 3 waits for engine batch 2 to serve (2 of 6 serving, 1 failed)",
 		},
 	}
@@ -1498,15 +1552,15 @@ func TestEvaluateUpdateGate_BatchStepReadsAFailedSurgeAsEnded(t *testing.T) {
 	}{
 		{
 			name:   "3:3 both first gang surges failed: the engine's retry is not batch-held",
-			engine: three(batchMemberFixture{failedGangSurge: 1}), decoder: three(batchMemberFixture{failedGangSurge: 1}), comp: eng,
+			engine: three(batchMemberFixture{failedGangSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{failedGangSurge: 1, backoff: 1}), comp: eng,
 		},
 		{
 			name:   "3:3 both first gang surges failed: the decoder's retry is not batch-held",
-			engine: three(batchMemberFixture{failedGangSurge: 1}), decoder: three(batchMemberFixture{failedGangSurge: 1}), comp: dec,
+			engine: three(batchMemberFixture{failedGangSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{failedGangSurge: 1, backoff: 1}), comp: dec,
 		},
 		{
 			name:   "12:8 one of the three prefill gang surges failed: the decode side's second batch is not batch-held",
-			engine: twelve(batchMemberFixture{promoted: 2, failedGangSurge: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec,
+			engine: twelve(batchMemberFixture{promoted: 2, failedGangSurge: 1, backoff: 1}), decoder: eight(batchMemberFixture{promoted: 2}), comp: dec,
 		},
 	}
 	for _, tc := range gang {
@@ -1996,11 +2050,13 @@ func TestEvaluateUpdateGate_KeepRatioPlansOverTheMovableInstances(t *testing.T) 
 // Held. The engine's next start belongs to batch 2 and would wait for the
 // decoder's batch 2 to serve first, which a Held decoder never opens: the
 // gate reads Held, names the decoder and its record, and says what resumes
-// both sides. A release of the record puts the plain first-side wait back,
-// and the decoder's batch serving admits the engine. Every other wait is
-// as before: the named side's own answer, a Held side that is not the
-// named one (where a spent retry schedule leaves the other side is not
-// decided yet), and a group with no first side.
+// both sides. A release of the record lets the decoder start its ended
+// attempt again at once, so the engine waits on that attempt with the
+// Instance named, and the decoder's batch serving admits the engine. Every
+// other wait is as before: the named side's own answer, a Held side that
+// is not the named one (where a spent retry schedule leaves the other side
+// is left open), and a group with no first side. The engine's own
+// failed surge is one its schedule counted.
 func TestEvaluateUpdateGate_TheOtherSideReadsHeldWhenTheNamedSideIsHeld(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	surge := v1beta1.UpdateStrategySurgeThenDrain
@@ -2031,39 +2087,45 @@ func TestEvaluateUpdateGate_TheOtherSideReadsHeldWhenTheNamedSideIsHeld(t *testi
 	}{
 		{
 			name:   "decoder named and held: the engine's next start reads Held and names the decoder",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
 			wantGate: v1beta1.RolloutHoldGateHeld, wantReason: heldDecoder,
 		},
 		{
-			name:   "decoder named and held: the engine's first start opens beside the ended decoder attempt, as before",
+			name:   "decoder named and held: the engine's first start reads Held too, the ended decoder attempt settles nothing while the record is held",
 			engine: three(batchMemberFixture{}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
+			wantGate: v1beta1.RolloutHoldGateHeld, wantReason: "engine batch 1 waits for decoder batch 1 to serve first (0 of 1 serving, 1 failed), and the decoder is held: " +
+				"update to svc-decoder-target held after 3 failed attempt(s): the image cannot be pulled; " +
+				"a corrected revision, or a release of the held revision on the decoder, resumes both sides",
 		},
 		{
-			name:   "decoder named and held, both sides scaled to one: the engine's retry of its own batch opens beside the ended decoder attempt, as before",
-			engine: one(batchMemberFixture{failedSurge: 1}), decoder: one(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
+			name:   "decoder named and held, both sides scaled to one: the engine's retry of its own batch reads Held with the decoder's record",
+			engine: one(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: one(batchMemberFixture{failedSurge: 1, held: 3}), comp: eng, defaults: decoderFirst,
+			wantGate: v1beta1.RolloutHoldGateHeld, wantReason: "engine batch 2 waits for decoder batch 2 to serve first (0 of 1 serving, 1 failed), and the decoder is held: " +
+				"update to svc-decoder-target held after 3 failed attempt(s): the image cannot be pulled; " +
+				"a corrected revision, or a release of the held revision on the decoder, resumes both sides",
 		},
 		{
 			name:   "decoder named and held: the decoder's own answer is the gate's, not the retry schedule's",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: dec, defaults: decoderFirst,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{failedSurge: 1, held: 3}), comp: dec, defaults: decoderFirst,
 		},
 		{
 			name:   "engine named and held: the decoder's next start reads Held and names the engine",
-			engine: three(batchMemberFixture{failedSurge: 1, held: 3}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: dec, defaults: engineFirst,
+			engine: three(batchMemberFixture{failedSurge: 1, held: 3}), decoder: three(batchMemberFixture{failedSurge: 1, backoff: 1}), comp: dec, defaults: engineFirst,
 			wantGate: v1beta1.RolloutHoldGateHeld, wantReason: heldEngine,
 		},
 		{
-			name:   "the record released: the plain first-side wait is back",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: eng, defaults: decoderFirst,
-			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 2 waits for decoder batch 2 to serve first (0 of 2 serving, 1 failed)",
+			name:   "the record released: the decoder starts its ended attempt again at once and the engine's next start waits on it",
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{failedSurge: 1}), comp: eng, defaults: decoderFirst,
+			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 2 waits for decoder batch 1 to serve (0 of 1 serving; decoder Instance 0 starts again)",
 		},
 		{
 			name:   "the decoder's retry served and its second surge is open: the engine still waits for it",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{promoted: 1, surging: 1}), comp: eng, defaults: decoderFirst,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{promoted: 1, surging: 1}), comp: eng, defaults: decoderFirst,
 			wantGate: v1beta1.RolloutHoldGateRatio, wantReason: "engine batch 2 waits for decoder batch 2 to serve first (1 of 2 serving)",
 		},
 		{
 			name:   "the decoder's second batch serves: the engine's retry is admitted",
-			engine: three(batchMemberFixture{failedSurge: 1}), decoder: three(batchMemberFixture{promoted: 2}), comp: eng, defaults: decoderFirst,
+			engine: three(batchMemberFixture{failedSurge: 1, backoff: 1}), decoder: three(batchMemberFixture{promoted: 2}), comp: eng, defaults: decoderFirst,
 		},
 		{
 			name:   "decoder named, the engine held: the decoder waits on the engine's batch as before",

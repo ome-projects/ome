@@ -80,12 +80,18 @@ const migrationExpiredReason = "MigrationExpired"
 // down: op stamps only ever happen after the allocation write, so the
 // expiry is record + ledger + event only and the source is not touched.
 // Its outcome names the wait the drive last recorded on it, when any.
+//
+// A fresh record waiting for a roll is not expiry work while the roll's
+// surge replacements are in flight: its deadline stands still. When no
+// surge replacement is in flight and that deadline is already behind the
+// record, the pass starts the deadline again from now instead of closing
+// the record, so a move is never charged the time it waited for the roll.
 func ExpireMigrations(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan) (int, error) {
 	now := input.Now()
 	expired := 0
 	for i := range input.ObservedState.Migrations {
 		rec := &input.ObservedState.Migrations[i]
-		if !isExpiredMigrationCandidate(rec, now) {
+		if !isExpiredMigrationCandidate(rec, now, input.ObservedState.InstanceStatuses) {
 			continue
 		}
 		if input.MutateMigration == nil {
@@ -104,21 +110,27 @@ func ExpireMigrations(ctx context.Context, deps workload.Deps, input workload.Re
 
 // isExpiredMigrationCandidate reports whether rec is an expiry
 // candidate: a non-terminal Manual record whose Deadline has passed. A
-// zero Deadline never expires (mirrors the instance-op rule).
-func isExpiredMigrationCandidate(rec *workload.MigrationRecord, now time.Time) bool {
+// zero Deadline never expires (mirrors the instance-op rule), and a fresh
+// record waiting for a roll's surge replacements has no running deadline.
+// The rows are read only for a record whose deadline is behind it, so a
+// pass with no due record scans none.
+func isExpiredMigrationCandidate(rec *workload.MigrationRecord, now time.Time, statuses []workload.InstanceStatus) bool {
 	if rec.Trigger != workload.MigrationTriggerManual || rec.Phase.Terminal() {
 		return false
 	}
-	return !rec.Deadline.IsZero() && now.After(rec.Deadline.Time)
+	if rec.Deadline.IsZero() || !now.After(rec.Deadline.Time) {
+		return false
+	}
+	return !MigrationWaitsForRoll(*rec, statuses)
 }
 
 // HasExpiredMigrationCandidate reports whether any record is an expiry
 // candidate ExpireMigrations would consume. The dispatcher's decision
 // layer consults this so the (pure) selection and the (effectful)
 // consumption share one filter.
-func HasExpiredMigrationCandidate(records []workload.MigrationRecord, now time.Time) bool {
+func HasExpiredMigrationCandidate(records []workload.MigrationRecord, statuses []workload.InstanceStatus, now time.Time) bool {
 	for i := range records {
-		if isExpiredMigrationCandidate(&records[i], now) {
+		if isExpiredMigrationCandidate(&records[i], now, statuses) {
 			return true
 		}
 	}
@@ -174,6 +186,13 @@ func expireMigrationRecord(ctx context.Context, deps workload.Deps, input worklo
 			"OMENative migration uuid=%s complete: %s -> instance=%d (record closed at expiry after the completion tail)",
 			uuid, workload.InstanceKey(plan.Component, rec.SourceInstance), *rec.SurgeInstance)
 		return true, nil
+	}
+
+	// A record that waited for a roll reaches here only once no surge
+	// replacement is in flight: its deadline starts again from now, and the
+	// record stays open for the drive to pick up.
+	if !allocated && migrationWaitedForRoll(rec) {
+		return false, startMigrationDeadlineAfterRoll(ctx, input, rec, plan.InstanceReadyTimeout)
 	}
 
 	// Draining precedence: when the source is fully drained AND the
@@ -378,7 +397,8 @@ func closeMigrationRecord(ctx context.Context, input workload.ReconcileInput, uu
 // terminal ledger writes). The row is what blocks the trim + upgrade
 // import from resurrecting the UUID after the status entry ages out.
 func mirrorTerminalMigrationLedger(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, rec *workload.MigrationRecord, phase, outcome string) error {
-	ledger, err := audit.LoadLedgerForOwner(ctx, deps.Reader(), ledgerOwnerObject(input))
+	owner, ownerGVK := input.AuditOwner()
+	ledger, err := audit.LoadLedgerForOwner(ctx, deps.Reader(), owner)
 	if err != nil {
 		return fmt.Errorf("load ledger for terminal mirror (uuid=%s): %w", rec.RequestUUID, err)
 	}
@@ -391,7 +411,7 @@ func mirrorTerminalMigrationLedger(ctx context.Context, deps workload.Deps, inpu
 		Reason:          rec.Reason,
 	}
 	ledger.UpsertEntry(audit.NewTerminalEntry(*ledger.InFlightEntryOrSeed(rec.RequestUUID, req, ledgerSurgeIndex(rec)), phase, outcome))
-	if err := audit.PersistLedgerForOwner(ctx, deps.Client, ledgerOwnerObject(input), ledgerOwnerGVK(input), ledger); err != nil {
+	if err := audit.PersistLedgerForOwner(ctx, deps.Client, owner, ownerGVK, ledger); err != nil {
 		return fmt.Errorf("persist terminal ledger mirror (uuid=%s): %w", rec.RequestUUID, err)
 	}
 	return nil

@@ -52,8 +52,8 @@ func TestReconcileSplitInitialAllocation(t *testing.T) {
 			s.Spec.Engine.MinReplicas, s.Spec.Engine.MaxReplicas = ptr.To(20), 20
 			s.Spec.Placement.Split = nil
 			s.Spec.Placement.ClusterAffinity = []v1beta1.ClusterAffinityTerm{
-				{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To[int32](10)}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}},
-				{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To[int32](10)}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}}},
+				{Weights: &v1beta1.ClusterAffinityWeights{Engine: &v1beta1.ReplicaRatio{Min: ptr.To[int32](10)}}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}},
+				{Weights: &v1beta1.ClusterAffinityWeights{Engine: &v1beta1.ReplicaRatio{Min: ptr.To[int32](10)}}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}}},
 			}
 		}, wantDesired: map[string]int32{"a": 10, "b": 10}, wantCurrent: map[string]int32{"a": 10, "b": 10}, wantReason: "AwaitingMemberConvergence"},
 		{name: "not ready member retains assigned share", edit: func(_ *v1beta1.InferenceService, clusters []*v1beta1.WorkloadCluster) {

@@ -23,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
@@ -1000,11 +999,6 @@ func gangSurgeRejectionFixture(t *testing.T) (workload.ReconcileInput, *terminal
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -1782,11 +1776,19 @@ func newRefillFixture(t *testing.T, t0 time.Time, row v1beta1.OMENativeInstanceS
 	return &refillFixture{input: input, plan: plan, target: target, running: running, calls: calls, client: c, isvc: isvc}
 }
 
-// seedLeader leaves the gang's leader alive at the running revision.
+// seedLeader leaves the gang's leader up at the running revision: a member
+// that is runtime-ready, which the refill of the rest of the set joins.
 func (f *refillFixture) seedLeader(t *testing.T) {
 	t.Helper()
 	createGateGangPod(t, f.client, f.isvc, 0, "leader", 0)
 	pinPodRevision(t, f.client, f.isvc, f.podName("leader"), f.running)
+	pod := f.pod(t, f.podName("leader"))
+	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+		Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now()),
+	})
+	if err := f.client.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("mark the leader runtime-ready: %v", err)
+	}
 }
 
 // seedDeadWorker leaves the gang's worker on its stable name, exited
@@ -2040,6 +2042,58 @@ func TestCreate_PodlessDemotedRowRendersTheTarget(t *testing.T) {
 	}
 }
 
+// A row that lost every pod while the roll is held on its target is rebuilt
+// at the revision it ran, as a repair would rebuild it: the target's retry
+// schedule admits no start this pass (a backoff not yet due, or the record
+// Held), so a rebuild at the target would wait on the schedule or fail as
+// the last attempt did, and the Instance would stay down until the roll
+// moves. A target whose backoff is due is one the roll can start on, and
+// the rebuild renders it as before.
+func TestCreate_PodlessRowUnderAHeldRollRendersItsRevision(t *testing.T) {
+	now := time.Now()
+	at := func(d time.Duration) *metav1.Time { return ptr.To(metav1.NewTime(now.Add(d))) }
+	for _, tc := range []struct {
+		name  string
+		block workload.RetryBlock
+		// running is the revision the rebuild renders: the row's own while
+		// the schedule holds the roll, the target otherwise.
+		running bool
+	}{
+		{name: "backoff not yet due", block: workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: at(5 * time.Minute)}, running: true},
+		{name: "record held", block: workload.RetryBlock{State: workload.RetryBlockHeld}, running: true},
+		{name: "backoff due", block: workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: at(-time.Second)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRefillFixture(t, now, v1beta1.OMENativeInstanceStatus{
+				Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstancePending,
+			}, true)
+			tc.block.TargetRevision = f.target.Name
+			f.input.ObservedState.RetryBlocks = []workload.RetryBlock{tc.block}
+
+			f.run(t, legacyTestDeps(f.client))
+
+			pods := createGatePods(t, f.client, f.isvc.Namespace)
+			if len(pods) != 2 {
+				t.Fatalf("got %d pod(s) want the whole gang", len(pods))
+			}
+			rev, leaderImage, workerImage, protocol := f.target, "test:v1", "test:v1", "proto-v1"
+			if tc.running {
+				rev, leaderImage, workerImage, protocol = f.running, "test:v0", "test:v0-worker", "proto-v0"
+			}
+			for i := range pods {
+				image := leaderImage
+				if pods[i].Labels[query.LabelRunner] == "worker" {
+					image = workerImage
+				}
+				requireRenderedAt(t, &pods[i], rev, image, protocol)
+			}
+			if row := f.row(t); row.Operation == nil || row.Operation.TargetRevision != rev.Name || row.RunningRevision != runningRevisionName {
+				t.Errorf("the rebuild records %s and keeps the recorded revision, got %+v", rev.Name, row)
+			}
+		})
+	}
+}
+
 // A row that lost every pod while the roll's partition holds its Instance
 // is the held side of the split: the rebuild renders the revision the row
 // records and pins it, so the held set keeps its size and only a release of
@@ -2200,10 +2254,77 @@ func TestCreate_PodlessRowsRebuildOnTheirSideOfTheCanaryStep(t *testing.T) {
 	}
 }
 
-// A first materialization has no revision of its own to keep, so it renders
-// the roll target under a canary step's hold as it does without one: with no
-// row at all, and with a disposed attempt that never ran a revision.
-func TestCreate_FirstMaterializationUnderACanaryRendersTheTarget(t *testing.T) {
+// stepStableSideFixture is a Component mid-canary: the status reports the
+// running revision as current while the roll target is another one, and the
+// running revision is stored so an attempt can render it.
+type stepStableSideFixture struct {
+	input   *workload.ReconcileInput
+	plan    workload.ComponentPlan
+	target  *appsv1.ControllerRevision
+	running *appsv1.ControllerRevision
+	calls   *[]retryBlockCall
+	client  client.Client
+	isvc    *v1beta1.InferenceService
+}
+
+func newStepStableSideFixture(t *testing.T, rows ...v1beta1.OMENativeInstanceStatus) *stepStableSideFixture {
+	t.Helper()
+	input, _, target, calls, c, isvc := createGateFixture(t, time.Now(), rows...)
+	running := storedPayloadRevision(t, runningRevisionName, revision.DataPayload{
+		PodSpec:         legacyTargetSpecImage("test:v0"),
+		WorkerPodSpec:   legacyTargetSpecImage("test:v0-worker"),
+		PairingProtocol: ptr.To("proto-v0"),
+	})
+	if err := c.Create(context.Background(), running); err != nil {
+		t.Fatalf("seed the running revision: %v", err)
+	}
+	plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
+	plan.PairingProtocol = "proto-v1"
+	input.ObservedState.CurrentRevision = runningRevisionName
+	input.ObservedState.UpdateRevision = target.Name
+	return &stepStableSideFixture{input: input, plan: plan, target: target, running: running, calls: calls, client: c, isvc: isvc}
+}
+
+func (f *stepStableSideFixture) run(t *testing.T) {
+	t.Helper()
+	if _, err := Create(context.Background(), legacyTestDeps(f.client), *f.input, f.plan, f.target); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+}
+
+func (f *stepStableSideFixture) row(t *testing.T) v1beta1.OMENativeInstanceStatus {
+	t.Helper()
+	rows := legacyInstanceStatusesOnIR(f.client, f.isvc, workload.ComponentEngine)
+	if len(rows) == 0 {
+		t.Fatalf("no row written for Instance 0")
+	}
+	return rows[0]
+}
+
+// requireGangRenderedAt asserts Instance 0's whole gang was rendered at rev.
+func (f *stepStableSideFixture) requireGangRenderedAt(t *testing.T, rev *appsv1.ControllerRevision, leaderImage, workerImage, protocol string) {
+	t.Helper()
+	if pods := createGatePods(t, f.client, f.isvc.Namespace); len(pods) != 2 {
+		t.Fatalf("got %d pod(s) want the whole gang", len(pods))
+	}
+	for runner, image := range map[string]string{"leader": leaderImage, "worker": workerImage} {
+		pod := &corev1.Pod{}
+		name := query.PodName(f.isvc.Name, workload.ComponentEngine, 0, runner, 0)
+		if err := f.client.Get(context.Background(), client.ObjectKey{Namespace: f.isvc.Namespace, Name: name}, pod); err != nil {
+			t.Fatalf("get pod %s: %v", name, err)
+		}
+		requireRenderedAt(t, pod, rev, image, protocol)
+	}
+}
+
+// An Instance that has run no revision, built while a canary step holds the
+// Component, joins the step's stable side: with no row at all, which is what
+// a scale-up adds, and with a disposed attempt that never ran a revision, the
+// attempt renders the revision the status reports as current, records it
+// as its target and starts on that revision's retry record. The share of the fleet on the
+// canary revision then stays what the step set, and the step's roll, not the
+// Create pass, moves the Instance onto the target.
+func TestCreate_FirstMaterializationUnderACanaryStepJoinsTheStableSide(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		rows []v1beta1.OMENativeInstanceStatus
@@ -2212,28 +2333,117 @@ func TestCreate_FirstMaterializationUnderACanaryRendersTheTarget(t *testing.T) {
 		{name: "disposed attempt that never ran a revision", rows: []v1beta1.OMENativeInstanceStatus{disposedFreshStart()}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			input, _, target, _, c, isvc := createGateFixture(t, time.Now(), tc.rows...)
-			plan := legacyMultiPodComponentPlan(workload.UpdateStrategySurgeThenDrain)
-			plan.PairingProtocol = "proto-v1"
-			input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: ptr.To[int32](1)}
+			f := newStepStableSideFixture(t, tc.rows...)
+			f.input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: ptr.To[int32](1)}
 
-			if _, err := Create(context.Background(), legacyTestDeps(c), *input, plan, target); err != nil {
-				t.Fatalf("create: %v", err)
-			}
+			f.run(t)
 
-			pods := createGatePods(t, c, isvc.Namespace)
-			if len(pods) != 2 {
-				t.Fatalf("got %d pod(s) want the whole gang", len(pods))
+			f.requireGangRenderedAt(t, f.running, "test:v0", "test:v0-worker", "proto-v0")
+			s := f.row(t)
+			if s.Operation == nil || s.Operation.TargetRevision != runningRevisionName {
+				t.Errorf("the attempt must record the step's stable revision %s as its target, got %+v", runningRevisionName, s.Operation)
 			}
-			for i := range pods {
-				requireRenderedAt(t, &pods[i], target, "test:v1", "proto-v1")
+			if s.RunningRevision != "" {
+				t.Errorf("RunningRevision = %q, want none until the promote", s.RunningRevision)
 			}
-			s := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
-			if s.Operation == nil || s.Operation.TargetRevision != target.Name {
-				t.Errorf("a first materialization pins the target under the hold, got %+v", s.Operation)
+			if len(*f.calls) == 0 {
+				t.Errorf("the attempt start must be recorded on the record of %s", runningRevisionName)
+			}
+			for _, call := range *f.calls {
+				if call.rev != runningRevisionName {
+					t.Errorf("the attempt start touched the record of %s, want only %s", call.rev, runningRevisionName)
+				}
 			}
 		})
 	}
+}
+
+// A first materialization renders the roll target wherever no canary step
+// keeps a stable side for it: under the user's own rollingUpdate partition,
+// which is no step; under a step that released the Component; before the
+// Component has promoted any revision; and while the roll returns to the
+// revision the status reports as current.
+func TestCreate_FirstMaterializationRendersTheTargetWithNoStepStableSide(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// step is the canary step's projected partition; user is the
+		// user's own rollingUpdate partition. nil leaves either unset.
+		step, user *int32
+		// current is the revision the status reports as current: the
+		// running revision, the target, or none.
+		current string
+	}{
+		{name: "the user's own partition", user: ptr.To[int32](1), current: runningRevisionName},
+		{name: "the step released the Component", step: ptr.To[int32](0), current: runningRevisionName},
+		{name: "no revision promoted yet", step: ptr.To[int32](1)},
+		{name: "the roll returns to the current revision", step: ptr.To[int32](1), current: "target"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStepStableSideFixture(t)
+			f.input.ObservedState.CurrentRevision = tc.current
+			if tc.current == "target" {
+				f.input.ObservedState.CurrentRevision = f.target.Name
+			}
+			if tc.step != nil {
+				f.input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: tc.step}
+			}
+			if tc.user != nil {
+				f.plan.UpdateStrategy.RollingUpdate = &workload.RollingUpdate{Partition: tc.user}
+			}
+
+			f.run(t)
+
+			f.requireGangRenderedAt(t, f.target, "test:v1", "test:v1", "proto-v1")
+			if s := f.row(t); s.Operation == nil || s.Operation.TargetRevision != f.target.Name {
+				t.Errorf("a first materialization records the target here, got %+v", s.Operation)
+			}
+		})
+	}
+}
+
+// A committed attempt whose target is the step's stable revision is one the
+// pass finishes while the step holds the Component: its pods are rendered under
+// the same operation. Once the step releases the Component the attempt is
+// retired into a fresh one at the roll target, as any attempt off the target.
+func TestCreate_StableSideAttemptFinishesWhileTheStepHoldsAndIsRetiredOnRelease(t *testing.T) {
+	now := time.Now()
+	committed := func() v1beta1.OMENativeInstanceStatus {
+		return v1beta1.OMENativeInstanceStatus{
+			Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceCreating,
+			Operation: &v1beta1.InstanceOperation{
+				ID: "create-0-stable", Type: v1beta1.InstanceOperationCreate, Step: status.CreateStepCreatePods,
+				TargetRevision: runningRevisionName,
+				StartedAt:      metav1.NewTime(now), LastProgressAt: metav1.NewTime(now), Deadline: metav1.NewTime(now.Add(30 * time.Minute)),
+			},
+		}
+	}
+	t.Run("the step holds: the attempt finishes on the stable revision", func(t *testing.T) {
+		f := newStepStableSideFixture(t, committed())
+		f.input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: ptr.To[int32](1)}
+		if !createFinishableAt(*f.input, f.input.ObservedState.Instance(0), f.target) {
+			t.Fatalf("an attempt on the step's stable side is one to finish")
+		}
+
+		f.run(t)
+
+		f.requireGangRenderedAt(t, f.running, "test:v0", "test:v0-worker", "proto-v0")
+		if s := f.row(t); s.Operation == nil || s.Operation.ID != "create-0-stable" || s.Operation.TargetRevision != runningRevisionName {
+			t.Errorf("the attempt must be kept, got %+v", s.Operation)
+		}
+	})
+	t.Run("the step released: the attempt is retired to the target", func(t *testing.T) {
+		f := newStepStableSideFixture(t, committed())
+		f.input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: ptr.To[int32](0)}
+		if createFinishableAt(*f.input, f.input.ObservedState.Instance(0), f.target) {
+			t.Fatalf("an attempt off the target with no step holding is retired, not finished")
+		}
+
+		f.run(t)
+
+		if s := f.row(t); s.Operation == nil || s.Operation.ID == "create-0-stable" || s.Operation.TargetRevision != f.target.Name {
+			t.Errorf("the attempt must be retired into a fresh one at %s, got %+v", f.target.Name, s.Operation)
+		}
+	})
 }
 
 // A parked attempt is the fresh start a disposed attempt leaves behind: the
@@ -2602,5 +2812,39 @@ func TestCreate_RevisionVerificationIgnoresTheInactiveSurgePod(t *testing.T) {
 	rows := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)
 	if len(rows) != 1 || rows[0].Phase != v1beta1.OMENativeInstanceReady || rows[0].RunningRevision != row.RunningRevision || rows[0].ActiveOrdinal != row.ActiveOrdinal {
 		t.Fatalf("active version was not promoted: %+v", rows)
+	}
+}
+
+// TestSurgeFreeIndex_AFailedRowJoinsTheFreshScopeOnTheTargetOrUnderTheHold:
+// the fresh scope is for rows no Update of this pass could have moved. A
+// Failed row with no operation belongs to it when it runs the roll target,
+// or when the roll's partition holds it, so its own set can be proved again
+// on the revision it records. A Failed row the roll may take is the roll's,
+// one that keeps a target toward the roll is a failed surge source the roll
+// holds on, and one that keeps an operation is its owner's.
+func TestSurgeFreeIndex_AFailedRowJoinsTheFreshScopeOnTheTargetOrUnderTheHold(t *testing.T) {
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "svc-engine-target"}}
+	failed := func(rev, kept string, op *workload.InstanceOperation) workload.InstanceStatus {
+		return workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseFailed, RunningRevision: rev, TargetRevision: kept, Operation: op}
+	}
+	cases := []struct {
+		name string
+		row  workload.InstanceStatus
+		held bool
+		want bool
+	}{
+		{name: "on the target it is the fresh scope's", row: failed(target.Name, "", nil), want: true},
+		{name: "off the target and free it is the roll's", row: failed("svc-engine-prior", "", nil), want: false},
+		{name: "off the target and held it is proved again on its revision", row: failed("svc-engine-prior", "", nil), held: true, want: true},
+		{name: "held but keeping a target toward the roll it is the roll's", row: failed("svc-engine-prior", target.Name, nil), held: true, want: false},
+		{name: "with a kept operation it is its owner's", row: failed("svc-engine-prior", "", &workload.InstanceOperation{Type: workload.InstanceOperationRestart}), held: true, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := workload.ReconcileInput{ObservedState: workload.WorkloadObservedState{InstanceStatuses: []workload.InstanceStatus{tc.row}}}
+			if got := surgeFreeIndex(input, 0, target, tc.held); got != tc.want {
+				t.Fatalf("surgeFreeIndex = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

@@ -71,6 +71,28 @@ func TestAllocateSurgeIndexExcludesClaimedSlots(t *testing.T) {
 	}
 }
 
+// TestSurgeIndexAllocator_ListsTheIndexesThePassClaimed: the allocator
+// keeps the indexes the surges of its pass took apart from the ones the
+// rows held when it was built, so the create pass can leave them to the
+// surges; an index offered and never claimed is not among them.
+func TestSurgeIndexAllocator_ListsTheIndexesThePassClaimed(t *testing.T) {
+	surges := NewSurgeIndexAllocator([]InstanceStatus{{Index: 1}, {Index: 2}})
+	if got := surges.Claimed(); got != nil {
+		t.Fatalf("nothing claimed yet: got %v", got)
+	}
+	first := surges.Next()
+	surges.Claim(first)
+	second := surges.Next()
+	if first != 0 || second != 3 {
+		t.Fatalf("the pass takes 0 then is offered 3: got %d and %d", first, second)
+	}
+	if got := surges.Claimed(); len(got) != 1 {
+		t.Fatalf("one index claimed, the offered one not among them: got %v", got)
+	} else if _, ok := got[0]; !ok {
+		t.Fatalf("index 0 should be the claimed one: got %v", got)
+	}
+}
+
 // TestSurgeIndexAllocator_HandsOutTheLowestFreeIndexesInOrder: rows 0, 1,
 // 2, 4 and 6 serve, row 1's surge in flight has claimed 3 and row 4's has
 // claimed 8. The surges of one pass take 5, 7, 9, 10 and 11 in that order:
@@ -167,7 +189,7 @@ func TestComponentPlan_RunnersFor(t *testing.T) {
 		t.Fatalf("no revision renders the target's layout: got %+v", got)
 	}
 	if plan.Runners[1].Size != 3 {
-		t.Fatalf("RunnersFor must copy, not alias, the target layout: %+v", plan.Runners)
+		t.Fatalf("RunnersFor must leave the target layout as it was: %+v", plan.Runners)
 	}
 	bare := ComponentPlan{WorkerSizeByRevision: map[string]int32{"svc-engine-old00000": 2}}
 	if got := bare.RunnersFor(inst, "svc-engine-old00000"); got[1].Size != 2 {
@@ -177,4 +199,85 @@ func TestComponentPlan_RunnersFor(t *testing.T) {
 	if got := single.RunnersFor(InstancePlan{}, "svc-router-old00000"); len(got) != 1 || got[0].Size != 1 {
 		t.Fatalf("a single-pod layout has no width to set: got %+v", got)
 	}
+}
+
+// TestComponentPlan_TotalPodsFor holds the count of the layout an Instance
+// renders at a revision, read without building it: the target's layout at
+// the width the revision recorded, the target's own width for a revision
+// recording none or no revision, and the Instance's entry when the plan
+// carries no target layout.
+func TestComponentPlan_TotalPodsFor(t *testing.T) {
+	plan := ComponentPlan{
+		Runners:              []RunnerPlan{{Name: RunnerLeader, Size: 1}, {Name: RunnerWorker, Size: 3}},
+		WorkerSizeByRevision: map[string]int32{"svc-engine-old00000": 2, "": 7},
+	}
+	inst := InstancePlan{Index: 0, Runners: []RunnerPlan{{Name: RunnerLeader, Size: 1}, {Name: RunnerWorker, Size: 9}}}
+	cases := []struct {
+		name string
+		plan ComponentPlan
+		rev  string
+		want int32
+	}{
+		{name: "a recorded width is counted", plan: plan, rev: "svc-engine-old00000", want: 3},
+		{name: "a revision recording no width counts the target's", plan: plan, rev: "svc-engine-new00000", want: 4},
+		{name: "no revision counts the target's layout, whatever the map records under the empty name", plan: plan, rev: "", want: 4},
+		{name: "without a target layout the Instance's entry is counted at the recorded width",
+			plan: ComponentPlan{WorkerSizeByRevision: map[string]int32{"svc-engine-old00000": 2}}, rev: "svc-engine-old00000", want: 3},
+		{name: "without a target layout the Instance's entry is counted as it is",
+			plan: ComponentPlan{}, rev: "svc-engine-new00000", want: 10},
+		{name: "a single-pod layout has no width to set",
+			plan: ComponentPlan{Runners: []RunnerPlan{{Name: RunnerDefault, Size: 1}}, WorkerSizeByRevision: map[string]int32{"svc-router-old00000": 2}}, rev: "svc-router-old00000", want: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.plan.TotalPodsFor(inst, tc.rev); got != tc.want {
+				t.Errorf("TotalPodsFor = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestComponentPlan_TotalPodsFor_CountsTheLayoutRunnersForBuilds draws
+// 200,000 plans (a target layout of one default runner, a leader beside
+// zero to seven workers, two worker runners, or none; an Instance entry of
+// the same kinds; widths recorded for none, some or every revision, the
+// empty name included) and holds TotalPodsFor at every revision, the empty
+// and an unrecorded one included, to the pod count of the layout
+// RunnersFor builds.
+func TestComponentPlan_TotalPodsFor_CountsTheLayoutRunnersForBuilds(t *testing.T) {
+	r := rand.New(rand.NewSource(25))
+	layouts := func() []RunnerPlan {
+		switch r.Intn(5) {
+		case 0:
+			return nil
+		case 1:
+			return []RunnerPlan{{Name: RunnerDefault, Size: 1}}
+		case 2:
+			return []RunnerPlan{{Name: RunnerLeader, Size: 1}, {Name: RunnerWorker, Size: int32(r.Intn(8))}}
+		case 3:
+			return []RunnerPlan{{Name: RunnerLeader, Size: 1}, {Name: RunnerWorker, Size: int32(r.Intn(8))}, {Name: RunnerWorker, Size: int32(r.Intn(8))}}
+		default:
+			return []RunnerPlan{{Name: RunnerWorker, Size: int32(r.Intn(8))}, {Name: RunnerDefault, Size: int32(r.Intn(3))}}
+		}
+	}
+	revisions := []string{"", "svc-engine-rev-a", "svc-engine-rev-b", "svc-engine-rev-c"}
+	var draws, counted int
+	for draws < 200000 {
+		plan := ComponentPlan{Runners: layouts(), WorkerSizeByRevision: map[string]int32{}}
+		for _, rev := range revisions {
+			if r.Intn(2) == 0 {
+				plan.WorkerSizeByRevision[rev] = int32(r.Intn(9))
+			}
+		}
+		inst := InstancePlan{Index: int32(r.Intn(4)), Runners: layouts()}
+		for _, rev := range append(revisions, "svc-engine-rev-unrecorded") {
+			want := InstancePlan{Runners: plan.RunnersFor(inst, rev)}.TotalPods()
+			if got := plan.TotalPodsFor(inst, rev); got != want {
+				t.Fatalf("plan %+v, Instance %+v, revision %q: TotalPodsFor = %d, the layout RunnersFor builds has %d pods", plan, inst, rev, got, want)
+			}
+			counted += int(want)
+			draws++
+		}
+	}
+	t.Logf("%d readings, %d pods counted", draws, counted)
 }

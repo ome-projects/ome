@@ -65,13 +65,13 @@ func TestGangMembersCreatedBeforePodGroupHold(t *testing.T) {
 	}
 }
 
-// TestConcurrentGangBurst drives the burst shape that can wedge a scheduler:
+// TestConcurrentGangBurst drives the burst shape that can leave gangs unbound forever:
 // many gangs whose PodGroups and pods are all created at once, from many
 // goroutines, with the pods racing ahead of their PodGroups. This stresses two
 // paths the serial suite never exercises together — the PodGroup-cache-lag
 // hold/requeue, and the domain-contention race where a gang can take a domain
 // that then fills. Every gang must still converge: all members bind, and each
-// gang lands in exactly one domain. A regression (a wedged gang with free
+// gang lands in exactly one domain. A regression (a gang never binding with free
 // capacity, or an over-committed domain) fails via the never-binds wait or the
 // single-domain assertion.
 //
@@ -139,7 +139,7 @@ func TestConcurrentGangBurst(t *testing.T) {
 		t.Fatalf("burst setup: %v", err)
 	}
 
-	// Every pod must bind — a wedged gang (assigned to a full domain with free
+	// Every pod must bind — a gang that never binds (assigned to a full domain with free
 	// capacity elsewhere, never re-planning) would time out here.
 	type result struct {
 		gang int
@@ -159,7 +159,7 @@ func TestConcurrentGangBurst(t *testing.T) {
 				if !ok {
 					mu.Lock()
 					if firstFail == nil {
-						firstFail = fmt.Errorf("pod %s never bound within %s (possible wedged gang / over-commit)", podName(gi, mi), schedTimeout)
+						firstFail = fmt.Errorf("pod %s never bound within %s (a gang that never binds, or an over-commit)", podName(gi, mi), schedTimeout)
 					}
 					mu.Unlock()
 					return

@@ -134,54 +134,90 @@ func ParseInventory(data []byte) (*Inventory, error) {
 
 // Validate applies the same rules to the expected configuration that the
 // manager applies to its loaded configuration, and requires every locator.
+// The problems are named one per line in one order on every run: the image,
+// the status block, the locators, the page size, then each cluster in turn.
 func (inv *Inventory) Validate() error {
 	var problems []error
 	if inv.ManagerImage == "" {
 		problems = append(problems, errors.New("managerImage is required"))
 	}
-	switch inv.OMENativeStatus.InstanceStatusEncoding {
+	problems = append(problems, inv.OMENativeStatus.problems()...)
+	problems = append(problems, inv.Manager.missingLocators()...)
+	if inv.PageSize <= 0 {
+		problems = append(problems, errors.New("pageSize must be a positive integer"))
+	}
+	problems = append(problems, clusterProblems(inv.Clusters)...)
+	return errors.Join(problems...)
+}
+
+// problems names what keeps the block from being one the manager loads: an
+// encoding it does not serve, a bound of zero, or ColumnarV2 without a bound.
+func (c ExpectedStatusConfig) problems() []error {
+	var problems []error
+	switch c.InstanceStatusEncoding {
 	case irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2:
 	case "":
 		problems = append(problems, fmt.Errorf("omenativeStatus.instanceStatusEncoding is required (%s or %s)", irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2))
 	default:
-		problems = append(problems, fmt.Errorf("omenativeStatus.instanceStatusEncoding %q is not supported; use %s or %s", inv.OMENativeStatus.InstanceStatusEncoding, irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2))
+		problems = append(problems, fmt.Errorf("omenativeStatus.instanceStatusEncoding %q is not supported; use %s or %s", c.InstanceStatusEncoding, irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2))
 	}
-	if inv.OMENativeStatus.MaxDecodedInstances != nil && *inv.OMENativeStatus.MaxDecodedInstances == 0 {
+	if c.MaxDecodedInstances != nil && *c.MaxDecodedInstances == 0 {
 		problems = append(problems, errors.New("omenativeStatus.maxDecodedInstances must be a positive integer"))
 	}
-	if inv.OMENativeStatus.InstanceStatusEncoding == irstatus.EncodingColumnarV2 && inv.OMENativeStatus.MaxDecodedInstances == nil {
+	if c.InstanceStatusEncoding == irstatus.EncodingColumnarV2 && c.MaxDecodedInstances == nil {
 		problems = append(problems, fmt.Errorf("omenativeStatus.maxDecodedInstances is required when instanceStatusEncoding is %s", irstatus.EncodingColumnarV2))
 	}
-	for field, value := range map[string]string{
-		"manager.namespace":  inv.Manager.Namespace,
-		"manager.deployment": inv.Manager.Deployment,
-		"manager.container":  inv.Manager.Container,
-		"manager.configMap":  inv.Manager.ConfigMap,
+	return problems
+}
+
+// missingLocators names the locators left blank. A list, not a map: they are
+// named in this order on every run, so the same inventory always produces
+// the same message.
+func (m ManagerLocation) missingLocators() []error {
+	var problems []error
+	for _, locator := range []struct{ field, value string }{
+		{"manager.namespace", m.Namespace},
+		{"manager.deployment", m.Deployment},
+		{"manager.container", m.Container},
+		{"manager.configMap", m.ConfigMap},
 	} {
-		if value == "" {
-			problems = append(problems, fmt.Errorf("%s is required", field))
+		if locator.value == "" {
+			problems = append(problems, fmt.Errorf("%s is required", locator.field))
 		}
 	}
-	if inv.PageSize <= 0 {
-		problems = append(problems, errors.New("pageSize must be a positive integer"))
-	}
-	if len(inv.Clusters) == 0 {
+	return problems
+}
+
+// clusterProblems requires at least one cluster and names what each cluster
+// lacks, in list order.
+func clusterProblems(clusters []Cluster) []error {
+	var problems []error
+	if len(clusters) == 0 {
 		problems = append(problems, errors.New("clusters must list at least one cluster"))
 	}
-	seen := map[string]struct{}{}
-	for i, cluster := range inv.Clusters {
-		if cluster.Name == "" {
-			problems = append(problems, fmt.Errorf("clusters[%d].name is required", i))
-		} else if _, dup := seen[cluster.Name]; dup {
-			problems = append(problems, fmt.Errorf("clusters[%d].name %q is listed twice", i, cluster.Name))
-		}
-		seen[cluster.Name] = struct{}{}
-		if cluster.Kubeconfig == "" {
-			problems = append(problems, fmt.Errorf("clusters[%d].kubeconfig is required", i))
-		}
-		if cluster.Context == "" {
-			problems = append(problems, fmt.Errorf("clusters[%d].context is required", i))
-		}
+	listed := map[string]struct{}{}
+	for i, cluster := range clusters {
+		problems = append(problems, cluster.problems(i, listed)...)
+		listed[cluster.Name] = struct{}{}
 	}
-	return errors.Join(problems...)
+	return problems
+}
+
+// problems names what the cluster at index i lacks: a name no earlier
+// cluster carries, a kubeconfig and a context. listed holds the names of the
+// clusters before it.
+func (c Cluster) problems(i int, listed map[string]struct{}) []error {
+	var problems []error
+	if c.Name == "" {
+		problems = append(problems, fmt.Errorf("clusters[%d].name is required", i))
+	} else if _, dup := listed[c.Name]; dup {
+		problems = append(problems, fmt.Errorf("clusters[%d].name %q is listed twice", i, c.Name))
+	}
+	if c.Kubeconfig == "" {
+		problems = append(problems, fmt.Errorf("clusters[%d].kubeconfig is required", i))
+	}
+	if c.Context == "" {
+		problems = append(problems, fmt.Errorf("clusters[%d].context is required", i))
+	}
+	return problems
 }

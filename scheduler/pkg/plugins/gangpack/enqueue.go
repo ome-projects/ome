@@ -24,7 +24,7 @@ import (
 // Registering these is what makes a gang recover promptly instead of on the
 // periodic flush. Queueing hints keep unrelated pod/node/PodGroup churn from
 // waking every blocked gang at once. The queue only routes an Add for an
-// already-assigned pod; an unscheduled sibling's creation reaches parked members
+// already-assigned pod; an unscheduled sibling's creation reaches unschedulable members
 // through the plugin's own activation (see activateGangMembers). PodGroup events
 // are routed from the scheduler's own PodGroup watch, which can run ahead of the
 // informer PreFilter reads, so the plugin's informer also wakes a gang's members

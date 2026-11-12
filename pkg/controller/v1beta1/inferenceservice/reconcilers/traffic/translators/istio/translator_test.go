@@ -19,7 +19,7 @@ func newISVC(name, ns string) *v1beta1.InferenceService {
 
 func translate(t *testing.T, isvc *v1beta1.InferenceService, intent *traffic.ResolvedIntent) (*unstructured.Unstructured, []string) {
 	t.Helper()
-	obj, passes, err := New().Translate(isvc, nil, intent)
+	obj, passes, err := New("cluster.local").Translate(isvc, nil, intent)
 	if err != nil {
 		t.Fatalf("Translate err = %v", err)
 	}
@@ -49,7 +49,7 @@ func nestedInt64(t *testing.T, u *unstructured.Unstructured, path ...string) int
 }
 
 func TestName_AndWatches(t *testing.T) {
-	tr := New()
+	tr := New("cluster.local")
 	if tr.Name() != Name {
 		t.Fatalf("Name = %q, want %q", tr.Name(), Name)
 	}
@@ -68,7 +68,7 @@ func TestSupportedAnnotations_SubsetOfEG(t *testing.T) {
 	// VirtualService) or per-endpoint cb limits or max-connection
 	// duration. SupportedAnnotations must therefore be a STRICT subset
 	// of the EG translator's matrix.
-	got := New().SupportedAnnotations()
+	got := New("cluster.local").SupportedAnnotations()
 	for _, k := range []string{
 		constants.CircuitBreakerMaxConnectionsAnnotation,
 		constants.CircuitBreakerMaxParallelRequestsAnnotation,
@@ -97,7 +97,7 @@ func TestSupportedAnnotations_SubsetOfEG(t *testing.T) {
 }
 
 func TestSupportedPassthroughPrefixes(t *testing.T) {
-	got := New().SupportedPassthroughPrefixes()
+	got := New("cluster.local").SupportedPassthroughPrefixes()
 	if len(got) != 1 || got[0] != constants.PassthroughIstioPrefix {
 		t.Fatalf("got %v, want [%q]", got, constants.PassthroughIstioPrefix)
 	}
@@ -113,6 +113,24 @@ func TestTranslate_HostAndMetadata(t *testing.T) {
 	}
 	if got := nestedString(t, u, "spec", "host"); got != "isvc.ns.svc.cluster.local" {
 		t.Fatalf("host = %q", got)
+	}
+}
+
+// The DestinationRule host is the Service's in-cluster hostname under the
+// configured cluster domain. Without one it is the bare Service name, the
+// one form Istio expands itself; a dotted short name would match no Service.
+func TestTranslate_HostFollowsTheConfiguredClusterDomain(t *testing.T) {
+	for _, tc := range []struct{ clusterDomain, want string }{
+		{"example.org", "isvc.ns.svc.example.org"},
+		{"", "isvc"},
+	} {
+		obj, _, err := New(tc.clusterDomain).Translate(newISVC("isvc", "ns"), nil, &traffic.ResolvedIntent{})
+		if err != nil {
+			t.Fatalf("Translate err = %v", err)
+		}
+		if got := nestedString(t, obj.(*unstructured.Unstructured), "spec", "host"); got != tc.want {
+			t.Fatalf("clusterDomain %q: host = %q, want %q", tc.clusterDomain, got, tc.want)
+		}
 	}
 }
 
@@ -330,7 +348,7 @@ func TestObserveAcceptance_Reconciled_True(t *testing.T) {
 	u := drWithConditions([]map[string]interface{}{
 		{"type": "Reconciled", "status": "True", "reason": "Reconciled", "message": "policy accepted"},
 	})
-	got := New().ObserveAcceptance(u)
+	got := New("cluster.local").ObserveAcceptance(u)
 	if got.State != traffic.AcceptanceAccepted {
 		t.Fatalf("state = %d", got.State)
 	}
@@ -343,7 +361,7 @@ func TestObserveAcceptance_Reconciled_False(t *testing.T) {
 	u := drWithConditions([]map[string]interface{}{
 		{"type": "Reconciled", "status": "False", "reason": "Invalid", "message": "bad host"},
 	})
-	got := New().ObserveAcceptance(u)
+	got := New("cluster.local").ObserveAcceptance(u)
 	if got.State != traffic.AcceptanceRejected {
 		t.Fatalf("state = %d", got.State)
 	}
@@ -352,7 +370,7 @@ func TestObserveAcceptance_Reconciled_False(t *testing.T) {
 func TestObserveAcceptance_NoStatus_IsPending(t *testing.T) {
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(PolicyGVK)
-	got := New().ObserveAcceptance(u)
+	got := New("cluster.local").ObserveAcceptance(u)
 	if got.State != traffic.AcceptancePending {
 		t.Fatalf("state = %d", got.State)
 	}
@@ -362,14 +380,14 @@ func TestObserveAcceptance_OtherConditionTypes_Ignored(t *testing.T) {
 	u := drWithConditions([]map[string]interface{}{
 		{"type": "SomethingElse", "status": "True"},
 	})
-	got := New().ObserveAcceptance(u)
+	got := New("cluster.local").ObserveAcceptance(u)
 	if got.State != traffic.AcceptancePending {
 		t.Fatalf("state = %d", got.State)
 	}
 }
 
 func TestSupportedTrafficFields_DeclaresDestinationRuleCoverage(t *testing.T) {
-	got := New().SupportedTrafficFields()
+	got := New("cluster.local").SupportedTrafficFields()
 	want := []string{
 		constants.TrafficCapabilityAlgorithm,
 		constants.TrafficCapabilityHashHeader,

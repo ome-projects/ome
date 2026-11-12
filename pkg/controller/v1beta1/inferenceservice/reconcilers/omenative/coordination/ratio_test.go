@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -18,17 +20,22 @@ import (
 )
 
 // testScheme returns the runtime.Scheme for fake client builders in tests.
+// The unavailability gate lists the Component's pods, so the core types are
+// registered: a client with no pods answers the list with none.
 func testScheme() *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
 	return scheme
 }
 
 // pinActiveRun pins the ISVC's current spec.rollout as its active rollout run
 // (the state the run layer produces at run open). Gate tests pin because a
 // grouped Component fails closed (RolloutHoldGatePlan) while no run is open.
-// A pinned plan is inert to later spec edits — re-pin after mutating
-// spec.rollout when the edit should take effect.
+// A pinned plan is inert to later spec edits, except a group's ratio rule,
+// a rolling group's budgets and the group's presence, which the gates read
+// from the spec while the members stay as recorded; re-pin after any other
+// mutation of spec.rollout when the edit should take effect.
 func pinActiveRun(isvc *v1beta1.InferenceService) *v1beta1.InferenceService {
 	if isvc == nil || isvc.Spec.Rollout == nil {
 		return isvc
@@ -791,8 +798,8 @@ func TestCheckRatioGate_BlueGreenRatioBalancedDoesNotDeadlock(t *testing.T) {
 // shape an empty-status snapshot produces when status.OMENative.Replicas
 // is 0 at snapshot time), the gate rejects every drain on a fleet
 // whose live ratio differs from 1:1. This test documents the failure
-// mode so an empty-status snapshot trips here AND in the
-// ratiobalanced_kind / loadtest_kind KIND specs together.
+// mode so an empty-status snapshot trips here and in the
+// cluster-level suite alike.
 func TestCheckRatioGate_BogusOnePerComponentAnchorReproducesDeadlock(t *testing.T) {
 	tol := int32(25)
 	isvc := &v1beta1.InferenceService{
@@ -857,7 +864,7 @@ func TestCheckRatioGate_BogusOnePerComponentAnchorReproducesDeadlock(t *testing.
 //
 // v2: cross-Component ratio guarding rides on MaintainRatio on a
 // multi-Component rollingUpdate group. A nil argument makes the fixture
-// spell out tolerance 5 explicitly (the value production resolves from
+// spell out tolerance 5 explicitly (the value the manager resolves from
 // operator configuration).
 func mkPDFixture(tolerance *int32) *v1beta1.InferenceService {
 	tol := int32(5)
@@ -1588,7 +1595,7 @@ func mkRatioLockstepFixture(tol, origE, newE, origD, newD int32) *v1beta1.Infere
 	isvc := mkRatioProgressFixture(tol, origE, newE, origD, newD)
 	mu := intstr.FromInt(1)
 	isvc.Spec.Rollout.Groups[0].RollingUpdate.MaxUnavailable = &mu
-	return pinActiveRun(isvc) // re-pin: the budget edit must be part of the pinned plan
+	return pinActiveRun(isvc) // re-pin so the recorded plan carries the budget the fixture declares
 }
 
 // TestEvaluateUpdateGate_LockstepHoldsEveryStrategy pins the new-revision
@@ -1947,7 +1954,7 @@ func TestEvaluateUpdateGate_RecreatePodSymmetricCleared(t *testing.T) {
 	isvc := mkSymmetricRatioFixture(25)
 	mu := intstr.FromInt(3)
 	isvc.Spec.Rollout.Groups[0].RollingUpdate.MaxUnavailable = &mu
-	pinActiveRun(isvc) // re-pin: the budget edit must be part of the pinned plan
+	pinActiveRun(isvc) // re-pin so the recorded plan carries the budget the fixture declares
 	client := fakeClientForISVC(isvc)
 
 	if allowed, _, reason := EvaluateUpdateGate(context.Background(), client, isvc, v1beta1.EngineComponent, "", forwardTarget(isvc, v1beta1.EngineComponent), nil, GroupDefaults{},
@@ -1970,7 +1977,7 @@ func TestEvaluateUpdateGate_RatioWaiverFollowsTheMechanism(t *testing.T) {
 	isvc := mkRatioProgressFixture(25, 4, 0, 2, 0)
 	mu := intstr.FromInt(1)
 	isvc.Spec.Rollout.Groups[0].RollingUpdate.MaxUnavailable = &mu
-	pinActiveRun(isvc) // re-pin: the budget edit must be part of the pinned plan
+	pinActiveRun(isvc) // re-pin so the recorded plan carries the budget the fixture declares
 	client := fakeClientForISVC(isvc)
 	rec := record.NewFakeRecorder(10)
 	event := func() string {

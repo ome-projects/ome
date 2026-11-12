@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // Test file is in package ops_test so tests only see the workload.*
@@ -189,15 +190,9 @@ func buildTestInput(isvc *v1beta1.InferenceService, c client.Client, component w
 		OwnerGVK:    v1beta1.SchemeGroupVersion.WithKind("InferenceService"),
 		EventTarget: isvc,
 		Key: workload.Key{
-			Namespace:   isvc.Namespace,
-			OwnerName:   isvc.Name,
-			Component:   workload.ComponentType(component),
-			OwnerLabels: isvc.Labels,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvc.Name,
-				constants.OMEComponentLabel:           string(component),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
+			Namespace: isvc.Namespace,
+			OwnerName: isvc.Name,
+			Component: workload.ComponentType(component),
 		},
 		DesiredSpec: workload.WorkloadDesiredSpec{
 			PodSpec: &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "test:v1"}}},
@@ -327,7 +322,7 @@ func promotablePodForInstance(isvc *v1beta1.InferenceService, instanceIdx int32)
 	return pod
 }
 
-// podForInstance fabricates a pod matching what Render() would
+// podForInstance fabricates a pod matching what RenderWithRevision would
 // produce for the given (ISVC, instance) pair. The `ready` knob
 // synthesizes ContainersReady=True, not PodReady=True — PodReady
 // requires every readiness gate (including ome.io/serving), which is
@@ -821,10 +816,10 @@ func TestCreate_PromoteRecordsRunningRevision(t *testing.T) {
 // bump-during-bump rule in Create.reconcileInstance:
 // when existing pods are runtime-ready but carry a different revision
 // hash from target (e.g., they were created by an earlier surge cycle
-// pinned to a now-superseded target), the promote MUST NOT stamp
+// built for a target since replaced), the promote MUST NOT write
 // RunningRevision=target.Name — that would falsely advertise the pods
-// as on target. status.StampReady (no RunningRevision write)
-// preserves whatever revision the prior op recorded, so the next
+// as on target. The promote records the one revision every active pod
+// carries (podSetRevision), here the prior revision, so the next
 // reconcile's detectUpdateTrigger fires a fresh surge cycle to roll
 // the pods to target.
 func TestCreate_PromoteSkipsRunningRevisionForOffTargetPods(t *testing.T) {
@@ -1053,7 +1048,7 @@ func TestCreate_RecreateInstance_StillMaterializesFreshInstance(t *testing.T) {
 
 // seedMaterializedGang stamps a Create-owned gang Instance that was
 // already observed complete (PodCount == 2) at the given phase — the
-// production shape a drained node leaves behind.
+// reference shape a drained node leaves behind.
 func seedMaterializedGang(isvc *v1beta1.InferenceService, phase v1beta1.OMENativeInstancePhase, podCount int32) *v1beta1.InferenceReplica {
 	return instanceIR(isvc, workload.ComponentEngine, v1beta1.OMENativeInstanceStatus{
 		Index:           0,
@@ -3745,6 +3740,9 @@ type supersededFixture struct {
 	priorOp  v1beta1.InstanceOperation
 	// blocks seeds ObservedState.RetryBlocks for the pass.
 	blocks []workload.RetryBlock
+	// pacing seeds DesiredSpec.Pacing for the pass: a partition the roll
+	// holds on its revision, as a canary step holds its stable side.
+	pacing *workload.WorkloadPacing
 }
 
 const supersededPriorRevision = "llama-70b-engine-bad0bad0"
@@ -3800,6 +3798,7 @@ func (f *supersededFixture) run(t *testing.T) (writes int) {
 	t.Helper()
 	input := buildTestInput(f.isvc, f.client, workload.ComponentEngine)
 	input.ObservedState.RetryBlocks = f.blocks
+	input.DesiredSpec.Pacing = f.pacing
 	inner := input.MutateInstance
 	input.MutateInstance = func(ctx context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
 		writes++
@@ -4034,33 +4033,192 @@ func TestCreate_RetargetOntoBlockedRevisionDefersRetirement(t *testing.T) {
 	}
 }
 
-func TestCreate_PromotedInstanceRepairIsNotRetired(t *testing.T) {
-	// A promoted Instance whose pod is being rebuilt runs a Create attempt on
-	// a row that records a RunningRevision. Its pods belong to a serving
-	// materialization, so rolling them to a new target is the update
-	// machinery's business — and the Create pass's own cleanup declines them
-	// forever, which would leave the retirement announced and unfinished.
-	f := newSupersededFixture(t, false /* gang */)
+// backoffBlock is a Backoff retry record whose next try is due in from now.
+func backoffBlock(in time.Duration) *workload.RetryBlock {
+	next := metav1.NewTime(time.Now().Add(in))
+	return &workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: &next}
+}
+
+func TestCreate_PromotedInstanceAttemptUnderAMovedTarget(t *testing.T) {
+	// A promoted Instance rebuilding what it lost runs a Create attempt that
+	// names the revision it served while the target has moved. With no pod
+	// of the Instance up, the attempt is retired onto the pushed revision
+	// like a first materialization: nothing of the old revision serves, so
+	// building it first would only make the roll wait on a pod it would
+	// replace as soon as it served. The pass after deletes the retired
+	// attempt's pods and the one after builds the set at the target under
+	// the same operation. The attempt is kept as it is beside a member that
+	// is up (its revision is the set's), under a pause (which withholds a
+	// new operation), on the roll's held side (whose refill joins the
+	// revision the hold keeps), and whenever the target carries a retry
+	// record (a backoff not yet due, a backoff that is due, or the record
+	// Held): a revision whose last attempt failed is not one to move a
+	// refill onto, so the refill finishes on the revision it ran and the
+	// roll takes the Instance once its schedule admits a start.
+	for _, tc := range []movedTargetCase{
+		{name: "single pod, nothing up", retired: true},
+		{name: "gang, nothing up", gang: true, retired: true},
+		{name: "gang, the leader is up", gang: true, memberUp: true},
+		{name: "single pod, paused", paused: true},
+		{name: "single pod, held by the roll", held: true},
+		{name: "gang, the target's backoff is not yet due", gang: true, block: backoffBlock(time.Hour)},
+		{name: "single pod, the target's backoff is due", block: backoffBlock(-time.Minute)},
+		{name: "single pod, the target Held", block: &workload.RetryBlock{State: workload.RetryBlockHeld}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, pod := seedAttemptUnderAMovedTarget(t, tc)
+			writes := f.run(t)
+			if !tc.retired {
+				requireAttemptKeptOnItsRevision(t, f, pod)
+				return
+			}
+			requireRetiringPass(t, f, writes)
+			requireRetiredPodsRemoved(t, f)
+			requireSetBuiltAtTarget(t, f)
+		})
+	}
+}
+
+// movedTargetCase is one picture of a promoted Instance's Create attempt at
+// the revision it served while the roll target has moved: the Instance's
+// shape, what is up, and what holds the roll. retired says whether the pass
+// moves the attempt onto the target.
+type movedTargetCase struct {
+	name     string
+	gang     bool
+	memberUp bool
+	paused   bool
+	held     bool
+	// block seeds the target's retry record when set.
+	block   *workload.RetryBlock
+	retired bool
+}
+
+// seedAttemptUnderAMovedTarget builds the case's picture: the fixture's
+// half-built attempt on a row that served the attempt's revision, a member
+// brought up when the case says so, and the pause, the partition or the
+// target's retry record that holds the roll. It returns the fixture and the
+// attempt's one existing pod.
+func seedAttemptUnderAMovedTarget(t *testing.T, tc movedTargetCase) (*supersededFixture, *corev1.Pod) {
+	t.Helper()
+	f := newSupersededFixture(t, tc.gang)
 	ir := &v1beta1.InferenceReplica{}
 	key := client.ObjectKey{Namespace: "prod", Name: irName(f.isvc, workload.ComponentEngine)}
 	if err := f.client.Get(context.Background(), key, ir); err != nil {
 		t.Fatalf("re-read IR: %v", err)
 	}
-	ir.Status.InstanceStatuses[0].RunningRevision = supersededPriorRevision
+	ir.Status.InstanceStatuses[0].RunningRevision = f.priorOp.TargetRevision
 	if err := f.client.Status().Update(context.Background(), ir); err != nil {
 		t.Fatalf("seed the running revision: %v", err)
 	}
+	pod := f.onlyPod(t)
+	if tc.memberUp {
+		pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+			Type: corev1.ContainersReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(time.Now()),
+		})
+		if err := f.client.Status().Update(context.Background(), pod); err != nil {
+			t.Fatalf("bring the member up: %v", err)
+		}
+	}
+	f.plan.Paused = tc.paused
+	if tc.held {
+		held := int32(1)
+		f.pacing = &workload.WorkloadPacing{Partition: &held}
+	}
+	if tc.block != nil {
+		block := *tc.block
+		block.TargetRevision = f.target.Name
+		f.blocks = []workload.RetryBlock{block}
+	}
+	return f, pod
+}
 
-	f.run(t)
-
+// requireAttemptKeptOnItsRevision asserts the pass left the attempt as it
+// was: the same operation at the revision the Instance served, no
+// retirement event, the existing pod kept, and every pod the pass built on
+// the set's revision.
+func requireAttemptKeptOnItsRevision(t *testing.T, f *supersededFixture, pod *corev1.Pod) {
+	t.Helper()
 	s := findInstanceStatusOnIR(f.client, f.isvc, workload.ComponentEngine, 0)
-	if s.Operation == nil || s.Operation.TargetRevision != supersededPriorRevision {
-		t.Errorf("a promoted Instance's repair was retired by the Create pass: %+v", s.Operation)
+	if s.Operation == nil || s.Operation.ID != f.priorOp.ID || s.Operation.TargetRevision != f.priorOp.TargetRevision {
+		t.Errorf("the attempt was retired: %+v", s.Operation)
 	}
 	for _, e := range drainEvents(f.recorder) {
 		if strings.Contains(e, string(workload.EventReasonCreateAttemptSuperseded)) {
-			t.Errorf("retirement announced for a row the cleanup declines: %q", e)
+			t.Errorf("a retirement event was recorded: %q", e)
 		}
+	}
+	priorHash := query.RevisionHashFromControllerRevisionName(f.priorOp.TargetRevision)
+	pods := listPods(t, f.client, "prod")
+	survived := false
+	for i := range pods {
+		survived = survived || pods[i].Name == pod.Name
+		if got := pods[i].Labels[query.LabelRevisionHash]; got != priorHash {
+			t.Errorf("pod %s carries revision hash %q, want the set's %q", pods[i].Name, got, priorHash)
+		}
+	}
+	if !survived {
+		t.Errorf("the prior revision's pod %s was deleted", pod.Name)
+	}
+}
+
+// requireRetiringPass asserts the pass that found the moved target wrote the
+// row once, replaced the attempt with a fresh one at the target with the
+// served revision still recorded, and raised the one retirement event.
+func requireRetiringPass(t *testing.T, f *supersededFixture, writes int) {
+	t.Helper()
+	if writes != 1 {
+		t.Fatalf("status writes in the retiring pass: got %d, want exactly 1", writes)
+	}
+	s := findInstanceStatusOnIR(f.client, f.isvc, workload.ComponentEngine, 0)
+	requireRetiredIntoFreshAttempt(t, s, f.priorOp.ID, f.target.Name)
+	if s.RunningRevision != f.priorOp.TargetRevision {
+		t.Errorf("RunningRevision = %q, want the served revision kept until the set is promoted", s.RunningRevision)
+	}
+	events := drainEvents(f.recorder)
+	if len(events) != 1 || !strings.Contains(events[0], string(workload.EventReasonCreateAttemptSuperseded)) {
+		t.Fatalf("events after the retiring pass: got %v, want the one retirement event", events)
+	}
+}
+
+// requireRetiredPodsRemoved runs the pass after the retirement and asserts
+// the fresh attempt removes the pods the retired one built, which carry the
+// prior revision.
+func requireRetiredPodsRemoved(t *testing.T, f *supersededFixture) {
+	t.Helper()
+	f.run(t)
+	targetHash := query.RevisionHashFromControllerRevisionName(f.target.Name)
+	pods := listPods(t, f.client, "prod")
+	for i := range pods {
+		if pods[i].Labels[query.LabelRevisionHash] != targetHash && pods[i].DeletionTimestamp == nil {
+			t.Errorf("pod %s survived on the prior revision; the retargeted attempt must remove it", pods[i].Name)
+		}
+	}
+	drainEvents(f.recorder)
+}
+
+// requireSetBuiltAtTarget runs the pass after the removal and asserts the
+// whole set is built at the target under the retargeted attempt. The fake
+// client has no informer to observe the deletes, so the expectations they
+// recorded are cleared by hand first.
+func requireSetBuiltAtTarget(t *testing.T, f *supersededFixture) {
+	t.Helper()
+	resetExpectations(t)
+	f.run(t)
+	targetHash := query.RevisionHashFromControllerRevisionName(f.target.Name)
+	pods := listPods(t, f.client, "prod")
+	want := len(f.plan.Instances[0].Runners)
+	if got := len(pods); got != want {
+		t.Fatalf("pods after the rebuild pass: got %d, want %d at the target", got, want)
+	}
+	for i := range pods {
+		if got := pods[i].Labels[query.LabelRevisionHash]; got != targetHash {
+			t.Errorf("pod %s built at revision hash %q, want the target's %q", pods[i].Name, got, targetHash)
+		}
+	}
+	s := findInstanceStatusOnIR(f.client, f.isvc, workload.ComponentEngine, 0)
+	if s.Operation == nil || s.Operation.TargetRevision != f.target.Name || s.Phase != v1beta1.OMENativeInstanceCreating {
+		t.Errorf("the rebuild must run under the retargeted attempt, got %+v", s)
 	}
 }
 
@@ -4943,7 +5101,7 @@ func TestCreate_EmptyPlanNeedsNoRevision(t *testing.T) {
 // first attempt is, and the pass after deletes the pod the retired
 // attempt built. A refill beside live pods at the revision the Instance
 // serves is not this shape and is left to the roll
-// (TestCreate_PromotedInstanceRepairIsNotRetired).
+// (TestCreate_PromotedInstanceAttemptUnderAMovedTarget).
 func TestCreate_RebuildOffTheServedRevisionIsRetiredWithTheTarget(t *testing.T) {
 	const servedRevision = "llama-70b-engine-5e12ed00"
 	for _, gang := range []bool{false, true} {
@@ -4989,5 +5147,313 @@ func TestCreate_RebuildOffTheServedRevisionIsRetiredWithTheTarget(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+// TestCreate_FinishesFoundUnchangedOnTheCopyAreMarked: a finish that
+// promotes an Instance is handed to the writer as a change. On the next pass
+// every row is Ready on the revision its pod runs, and the same finishes are
+// handed over marked unchanged on the pass's copy, so the writer can answer
+// them without a live read.
+func TestCreate_FinishesFoundUnchangedOnTheCopyAreMarked(t *testing.T) {
+	resetExpectations(t)
+	isvc, c, input := newReadyBatchFixture(t, "batch-ready-unchanged", 3)
+	recorder := newBatchMutationRecorder(input.ObservedState.InstanceStatuses)
+	var marked [][]bool
+	input.MutateInstance = unexpectedPerInstanceMutation
+	input.ApplyInstanceMutations = func(ctx context.Context, mutations []workload.InstanceMutation) error {
+		flags := make([]bool, len(mutations))
+		for i := range mutations {
+			flags[i] = mutations[i].UnchangedOnCopy
+		}
+		marked = append(marked, flags)
+		return recorder.apply(ctx, mutations)
+	}
+	plan, target := buildPlanSinglePodEngine(3), fixtureRevision(t, isvc)
+	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if want := [][]bool{{false, false, false}}; !reflect.DeepEqual(marked, want) {
+		t.Fatalf("the promotions: got %v, want one batch of three changes %v", marked, want)
+	}
+
+	rows := make([]workload.InstanceStatus, 0, 3)
+	for idx := int32(0); idx < 3; idx++ {
+		rows = append(rows, recorder.statuses[idx])
+	}
+	input.ObservedState.InstanceStatuses = rows
+	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
+		t.Fatalf("Create at rest: %v", err)
+	}
+	if want := [][]bool{{false, false, false}, {true, true, true}}; !reflect.DeepEqual(marked, want) {
+		t.Fatalf("the finishes at rest: got %v, want the second batch found unchanged %v", marked, want)
+	}
+}
+
+// TestCreate_TakesThePassPodListUntilAPodIsWritten: the create pass reads
+// the Component's pods from the pass's cached list, the one the plan's
+// observation took, and lists nothing itself while the pass has written no
+// pod; after a pod write through the pass's client it lists again, once,
+// and promotes the same Instance either way.
+func TestCreate_TakesThePassPodListUntilAPodIsWritten(t *testing.T) {
+	resetExpectations(t)
+	ctx := context.Background()
+	isvc := minimalISVC("pass-list", "prod", 1)
+	pod := promotablePodForInstance(isvc, 0)
+	podLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&corev1.PodList{})
+	c := fakeclient.New(t, fakeclient.WithObjects(isvc, pod),
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}),
+		fakeclient.WithIndex(&corev1.Pod{}, query.OMENativePodIndexField, query.OMENativePodIndexExtractor),
+		podLists)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	plan, target := buildPlanSinglePodEngine(1), fixtureRevision(t, isvc)
+	cachedPods := workload.NewCachedPodList(c)
+	input.CachedPods = cachedPods
+	deps := workload.Deps{Client: cachedPods.Client()}
+	if _, err := cachedPods.Pods(ctx, func(ctx context.Context) ([]*corev1.Pod, error) {
+		return query.ListOMENativePodsByName(ctx, c, isvc.Namespace, isvc.Name, workload.ComponentEngine, true)
+	}); err != nil {
+		t.Fatalf("the plan's list: %v", err)
+	}
+	listsBefore := podLists.Count()
+	if _, err := ops.Create(ctx, deps, input, plan, target); err != nil {
+		t.Fatalf("Create from the pass's list: %v", err)
+	}
+	if lists := podLists.Count() - listsBefore; lists != 0 {
+		t.Fatalf("the create pass listed the pods %d times with the pass's list standing; want 0", lists)
+	}
+	if insts := instanceStatusesOnIR(c, isvc, workload.ComponentEngine); len(insts) != 1 || insts[0].Phase != v1beta1.OMENativeInstanceReady {
+		t.Fatalf("the pass over the list did not promote the Instance: %+v", insts)
+	}
+
+	if err := deps.Client.Patch(ctx, pod.DeepCopy(), client.RawPatch(types.MergePatchType, []byte(`{"metadata":{"labels":{"written":"yes"}}}`))); err != nil {
+		t.Fatalf("write the pod: %v", err)
+	}
+	input.ObservedState.InstanceStatuses = []workload.InstanceStatus{v1beta1convert.InstanceStatusToWorkload(instanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0])}
+	listsBefore = podLists.Count()
+	if _, err := ops.Create(ctx, deps, input, plan, target); err != nil {
+		t.Fatalf("Create after the pod write: %v", err)
+	}
+	if lists := podLists.Count() - listsBefore; lists != 1 {
+		t.Fatalf("the create pass listed the pods %d times after a pod write; want 1", lists)
+	}
+	if insts := instanceStatusesOnIR(c, isvc, workload.ComponentEngine); len(insts) != 1 || insts[0].Phase != v1beta1.OMENativeInstanceReady {
+		t.Fatalf("the pass after the write did not keep the Instance Ready: %+v", insts)
+	}
+}
+
+// gangPlanOfTwo is a plan of two leader-and-worker gangs under the given
+// restart policy: Instance 0 has been rebuilt once already and Instance 1
+// has not.
+func gangPlanOfTwo(restart workload.RestartPolicy) workload.ComponentPlan {
+	runners := func() []workload.RunnerPlan {
+		return []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}
+	}
+	return workload.ComponentPlan{
+		Component:            workload.ComponentEngine,
+		Replicas:             2,
+		RestartPolicy:        restart,
+		InstanceReadyTimeout: 30 * time.Minute,
+		Instances: []workload.InstancePlan{
+			{Index: 0, Incarnation: 2, Runners: runners()},
+			{Index: 1, Incarnation: 1, Runners: runners()},
+		},
+	}
+}
+
+// promotedGangShortBesideAnOpenSurge seeds the fresh scope's picture: gang
+// 0 is Ready on the roll target with its worker gone, and gang 1 is
+// mid-surge with both of its pods standing.
+func promotedGangShortBesideAnOpenSurge(t *testing.T, isvc *v1beta1.InferenceService, runningRevision string) (client.Client, *corev1.Pod) {
+	t.Helper()
+	ir := seedInstanceStatuses(isvc,
+		v1beta1.OMENativeInstanceStatus{Index: 0, Incarnation: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: runningRevision},
+		v1beta1.OMENativeInstanceStatus{Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceUpdating, RunningRevision: "llama-70b-engine-priorrev"},
+	)
+	leader := gangPod(isvc, 0, "leader", 0, 2, true /* ready */, true /* serving */)
+	return newFakeClient(t, isvc, ir, leader,
+		gangPod(isvc, 1, "leader", 0, 1, true, true),
+		gangPod(isvc, 1, "worker", 0, 1, true, true)), leader
+}
+
+// podNamesIn lists the names of every pod in the namespace.
+func podNamesIn(t *testing.T, c client.Client, ns string) map[string]bool {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace(ns)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	got := map[string]bool{}
+	for _, p := range pods.Items {
+		got[p.Name] = true
+	}
+	return got
+}
+
+// A promoted gang that lost a member while the roll is open is refilled at
+// the fresh scope: the gang holds a slot of the roll's budget as an
+// Instance on the target that does not serve it, and the start that slot
+// denies must not stand between the gang and its refill. Under restart
+// policy None nothing else rebuilds the member. The gang mid-surge beside
+// it is left to its attempt.
+func TestCreateFreshIndices_RefillsAPromotedGangShortOfAMember(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 2)
+	target := fixtureRevision(t, isvc)
+	c, leader := promotedGangShortBesideAnOpenSurge(t, isvc, target.Name)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+
+	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, gangPlanOfTwo(workload.RestartPolicyNone), target); err != nil {
+		t.Fatalf("CreateFreshIndices: %v", err)
+	}
+
+	got := podNamesIn(t, c, "prod")
+	worker := query.PodName(isvc.Name, workload.ComponentEngine, 0, "worker", 0)
+	if !got[worker] || !got[leader.Name] || len(got) != 4 {
+		t.Fatalf("the promoted gang's lost worker must be re-created beside its leader while the roll is open; got %v", got)
+	}
+	refilled := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
+	if refilled == nil || refilled.Phase != v1beta1.OMENativeInstanceCreating || refilled.Operation == nil ||
+		refilled.Operation.Type != v1beta1.InstanceOperationCreate || refilled.Operation.TargetRevision != target.Name ||
+		refilled.Incarnation != 2 || refilled.RunningRevision != target.Name {
+		t.Fatalf("the refill must open a Create on the gang as it stands, on the revision it runs, got %+v", refilled)
+	}
+	surging := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 1)
+	if surging == nil || surging.Phase != v1beta1.OMENativeInstanceUpdating || surging.Operation != nil {
+		t.Fatalf("the gang mid-surge must be left to its attempt, got %+v", surging)
+	}
+}
+
+// A short gang still on an older revision is the roll's to replace whole
+// at its surge index, so the fresh scope leaves it alone.
+func TestCreateFreshIndices_LeavesAShortGangOffTheTargetToTheRoll(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 2)
+	target := fixtureRevision(t, isvc)
+	c, _ := promotedGangShortBesideAnOpenSurge(t, isvc, "llama-70b-engine-priorrev")
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+
+	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, gangPlanOfTwo(workload.RestartPolicyNone), target); err != nil {
+		t.Fatalf("CreateFreshIndices: %v", err)
+	}
+
+	if got := podNamesIn(t, c, "prod"); len(got) != 3 {
+		t.Fatalf("a short gang off the target is the roll's; the fresh scope must create nothing for it, got %v", got)
+	}
+	if s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0); s == nil || s.Phase != v1beta1.OMENativeInstanceReady || s.Operation != nil {
+		t.Fatalf("the short gang off the target must stay Ready with no operation, got %+v", s)
+	}
+}
+
+// A gang on the target whose every member stands is outside the fresh
+// scope whatever its pods report: a member that lost its serving gate is
+// put back into service by the full pass once the roll lets it run, and
+// the fresh scope writes nothing for it.
+func TestCreateFreshIndices_LeavesAWholeReadyGangAlone(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 1)
+	target := fixtureRevision(t, isvc)
+	ir := seedInstanceStatuses(isvc, v1beta1.OMENativeInstanceStatus{Index: 0, Incarnation: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: target.Name})
+	worker := gangPod(isvc, 0, "worker", 0, 2, true /* ready */, false /* serving */)
+	c := newFakeClient(t, isvc, ir, gangPod(isvc, 0, "leader", 0, 2, true, true), worker)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	plan := buildPlanGangEngine(workload.RestartPolicyNone)
+	serving := func() bool {
+		live := &corev1.Pod{}
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(worker), live); err != nil {
+			t.Fatalf("get worker: %v", err)
+		}
+		return podreadiness.IsServing(live)
+	}
+
+	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
+		t.Fatalf("CreateFreshIndices: %v", err)
+	}
+	if serving() {
+		t.Fatalf("the fresh scope must not touch a whole gang; the worker's serving gate was written")
+	}
+	if s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0); s == nil || s.Phase != v1beta1.OMENativeInstanceReady || s.Operation != nil {
+		t.Fatalf("a whole gang must stay Ready with no operation at the fresh scope, got %+v", s)
+	}
+
+	if _, err := ops.Create(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if !serving() {
+		t.Fatalf("the full pass must put the worker back into service")
+	}
+}
+
+// Under RecreateInstanceOnPodRestart a gang short of a member is the
+// restart pass's, which rebuilds it whole: the fresh scope reaches the
+// gang and the refill is refused there, so no member is created pod by
+// pod and the row keeps its phase.
+func TestCreateFreshIndices_LeavesAShortGangToTheRepairUnderRecreateInstance(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 2)
+	target := fixtureRevision(t, isvc)
+	c, _ := promotedGangShortBesideAnOpenSurge(t, isvc, target.Name)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+
+	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, gangPlanOfTwo(workload.RestartPolicyRecreateInstance), target); err != nil {
+		t.Fatalf("CreateFreshIndices: %v", err)
+	}
+
+	if got := podNamesIn(t, c, "prod"); len(got) != 3 {
+		t.Fatalf("under RecreateInstanceOnPodRestart the member must not be refilled pod by pod, got %v", got)
+	}
+	if s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0); s == nil || s.Phase != v1beta1.OMENativeInstanceReady || s.Operation != nil {
+		t.Fatalf("the short gang must stay Ready for the restart pass, got %+v", s)
+	}
+}
+
+// A gang whose repair is in flight is its repair's whatever its pods
+// report: the fresh scope opens no Create over a Restarting row on the
+// target, short of a member or not.
+func TestCreateFreshIndices_LeavesARestartingGangToItsRepair(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 1)
+	target := fixtureRevision(t, isvc)
+	ir := seedInstanceStatuses(isvc, v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 2, Phase: v1beta1.OMENativeInstanceRestarting, RunningRevision: target.Name,
+		Operation: &v1beta1.InstanceOperation{ID: "restart-0", Type: v1beta1.InstanceOperationRestart, Step: "Drain", Reason: "pod lost"},
+	})
+	c := newFakeClient(t, isvc, ir, gangPod(isvc, 0, "leader", 0, 2, true, true))
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+
+	if _, err := ops.CreateFreshIndices(context.Background(), workload.Deps{Client: c}, input, buildPlanGangEngine(workload.RestartPolicyNone), target); err != nil {
+		t.Fatalf("CreateFreshIndices: %v", err)
+	}
+
+	if got := podNamesIn(t, c, "prod"); len(got) != 1 {
+		t.Fatalf("the repair owns the gang's pod set; the fresh scope must create nothing, got %v", got)
+	}
+	if s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0); s == nil || s.Phase != v1beta1.OMENativeInstanceRestarting || s.Operation == nil || s.Operation.Type != v1beta1.InstanceOperationRestart {
+		t.Fatalf("the Restarting row must be left to its repair, got %+v", s)
+	}
+}
+
+// A pause withholds every new operation, a member refill among them: the
+// paused scope finishes the creates already committed and leaves a short
+// gang on the target as it is until the operator resumes.
+func TestCreateCommittedIndices_LeavesAShortGangUnderThePause(t *testing.T) {
+	resetExpectations(t)
+	isvc := minimalISVC("llama-70b", "prod", 1)
+	target := fixtureRevision(t, isvc)
+	ir := seedInstanceStatuses(isvc, v1beta1.OMENativeInstanceStatus{Index: 0, Incarnation: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: target.Name})
+	c := newFakeClient(t, isvc, ir, gangPod(isvc, 0, "leader", 0, 2, true, true))
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	plan := buildPlanGangEngine(workload.RestartPolicyNone)
+	plan.Paused = true
+
+	if _, err := ops.CreateCommittedIndices(context.Background(), workload.Deps{Client: c}, input, plan, target); err != nil {
+		t.Fatalf("CreateCommittedIndices: %v", err)
+	}
+
+	if got := podNamesIn(t, c, "prod"); len(got) != 1 {
+		t.Fatalf("a pause withholds the refill; the paused scope must create nothing, got %v", got)
+	}
+	if s := findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0); s == nil || s.Phase != v1beta1.OMENativeInstanceReady || s.Operation != nil {
+		t.Fatalf("the short gang must stay Ready under the pause, got %+v", s)
 	}
 }

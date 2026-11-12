@@ -95,7 +95,7 @@ func heldRound(t *testing.T, g *GangPack, h *fakeHandle, nodes []framework.NodeI
 // unwinds the gang. Nothing changes between rounds. A wake-up bypasses backoff
 // and retries its target at once, so the gate must not wake the member that
 // entered it, and a veto in a domain no other could stand in for must wake
-// nobody: the one wake-up per round is the gate waking the parked leader.
+// nobody: the one wake-up per round is the gate waking the held leader.
 func TestActivation_GangHeldOverRounds_OnePerRoundForTheLeaderOnly(t *testing.T) {
 	g, h, nodes, leader, worker := heldGang("a1", "a2")
 	for round := 1; round <= 3; round++ {

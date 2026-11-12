@@ -48,6 +48,59 @@ func UniformRows(n int) []v1beta1.OMENativeInstanceStatus {
 	return rows
 }
 
+// ReadySinceSpacing separates the readySince of neighbouring rows in
+// ReadySinceRows. No two rows share a second, as pods that became Ready one
+// after another do not.
+const ReadySinceSpacing = 11 * time.Second
+
+// ReadySinceRows is the steady-state fixture as a reference replica at rest
+// stores it: every row Ready on one revision, and every row carrying the
+// time it became Ready, which no two rows share. The readySince columns
+// carry one offset per row, so none of these rows costs an entry.
+func ReadySinceRows(n int) []v1beta1.OMENativeInstanceStatus {
+	rows := UniformRows(n)
+	for i := range rows {
+		readySince := TimePlus(time.Duration(i) * ReadySinceSpacing)
+		rows[i].ReadySince = &readySince
+	}
+	return rows
+}
+
+// ReadySinceGangRows is ReadySinceRows for Instances of podsPerInstance pods
+// each: the three counts of every row are the gang size, the shape a
+// multi-node replica at rest stores.
+func ReadySinceGangRows(n, podsPerInstance int) []v1beta1.OMENativeInstanceStatus {
+	rows := ReadySinceRows(n)
+	pods := int32(podsPerInstance)
+	for i := range rows {
+		rows[i].PodCount, rows[i].ServingPodCount, rows[i].AvailablePodCount = pods, pods, pods
+	}
+	return rows
+}
+
+// GangWarnings are the once-only warnings a multi-node gang on the default
+// scheduler publishes on its first Instance when the gang is first built.
+var GangWarnings = []string{"GangSplitRisk@#1", "MaybeNoGangScheduler@#1"}
+
+// PublishedWarningsGangRows is ReadySinceGangRows with GangWarnings on the
+// first row: a settled multi-node replica at rest on the default scheduler.
+// Every readySince is in the columns, so the first row's entry carries
+// nothing but the list of its published warnings.
+func PublishedWarningsGangRows(n, podsPerInstance int) []v1beta1.OMENativeInstanceStatus {
+	rows := ReadySinceGangRows(n, podsPerInstance)
+	rows[0].Announced = append([]string(nil), GangWarnings...)
+	return rows
+}
+
+// PublishedMessageRows is UniformRows with one once-only message on the row
+// at index and no readySince anywhere: a payload without the readySince
+// columns whose one entry carries nothing but the list of published messages.
+func PublishedMessageRows(n, index int) []v1beta1.OMENativeInstanceStatus {
+	rows := UniformRows(n)
+	rows[index].Announced = []string{"ScaleDownWaitsForRebuild@#1"}
+	return rows
+}
+
 // The mass-failure fixture is a synthetic worst case: 4,000 single-pod rows
 // split into 2,812 Ready, 814 Restarting with an in-flight Restart and 374
 // Failed with a preserved Restart, a lastFailure on every row, and one row on

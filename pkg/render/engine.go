@@ -36,8 +36,7 @@ func RenderEngine(ctx context.Context, p *Piece, service *v1beta1.InferenceServi
 		return Rendered{}, err
 	}
 	t := Templates{ObjectMeta: meta, Primary: primary, Worker: worker, WorkerSize: EngineWorkerSize(spec), MultiPod: EngineIsMultiPod(spec)}
-	return Rendered{Templates: t, ComponentExt: &spec.ComponentExtensionSpec,
-		TopologyKey: spec.TopologyKey, TopologySpread: spec.TopologySpread, TopologySpreadKey: spec.TopologySpreadKey}, nil
+	return Rendered{Templates: t, ComponentExt: &spec.ComponentExtensionSpec}, nil
 }
 
 // EngineUsesLeaderTemplate reports whether the engine sources its primary pod
@@ -94,7 +93,7 @@ func EnginePodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Engin
 	}
 
 	// Merge the runner container into the pod spec.
-	podSpec, err := (&PodSpecReconciler{Log: p.Log}).ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
+	podSpec, err := (&PodSpecReconciler{}).ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +130,7 @@ func EngineWorkerPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1
 	}
 
 	// Merge the worker runner container into the worker pod spec.
-	workerPodSpec, err := (&PodSpecReconciler{Log: p.Log}).ReconcileWorkerPodSpec(isvc, objectMeta, &spec.Worker.PodSpec, workerRunner)
+	workerPodSpec, err := (&PodSpecReconciler{}).ReconcileWorkerPodSpec(isvc, objectMeta, &spec.Worker.PodSpec, workerRunner)
 	if err != nil {
 		return nil, err
 	}

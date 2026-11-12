@@ -31,7 +31,7 @@ func TestRenderingConfig_SameConfigMap_MatchesMemberLoadersInputUntouched(t *tes
 				t.Fatal(err)
 			}
 			cl := fake.NewSimpleClientset(cm.DeepCopy())
-			want, err := NewInferenceServicesConfig(cl)
+			want, err := NewInferenceServicesConfigCached(NewConfigCache(0), cl)
 			if err != nil {
 				t.Fatal(err)
 			}

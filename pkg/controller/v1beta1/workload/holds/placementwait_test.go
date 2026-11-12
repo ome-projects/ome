@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -166,6 +167,66 @@ func TestPlacementWait_NameFreedBySweep_KeepsTheStartUntilTheRebuildIsPlaced(t *
 	applyGangUnder(t, store, map[int32][]*corev1.Pod{0: {boundPod(gangLeader, "node-b"), boundPod(gangWorker, "node-c")}}, deps, policy)
 	if got := store.placementWaitOf(0); got != nil {
 		t.Errorf("placement wait = %v, want it retired once the rebuilt worker runs on a node", got)
+	}
+}
+
+// TestPlacementWait_PodBackBehindTheGate_RetiresTheStart: OME rebuilds a
+// gang's worker after its node stopped reporting, and a queue's gate holds
+// the new worker. Time behind the gate is not a refusal, so the hold pass
+// retires the attempt's placement wait in one write. Then the queue admits
+// the worker and the scheduler refuses it. The worker's PodScheduled time is
+// still its creation behind the gate, so the wait starts again at the first
+// pass that sees the refusal.
+func TestPlacementWait_PodBackBehindTheGate_RetiresTheStart(t *testing.T) {
+	since := metav1.NewTime(time.Now().Add(-14 * time.Minute).Truncate(time.Second))
+	row := gangRow()
+	row.Operation.PlacementWaitSince = &since
+	store, _ := newStore(row)
+	created := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
+	queued := fixture.UnschedulablePod(gangWorker, "", created)
+	queued.CreationTimestamp = metav1.NewTime(created)
+	queued.Labels = map[string]string{constants.KueueQueueLabelKey: "queue-a"}
+	queued.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "kueue.x-k8s.io/admission"}}
+	queued.Status.Conditions[0].Reason = corev1.PodReasonSchedulingGated
+
+	applyGang(t, store, map[int32][]*corev1.Pod{0: {boundPod(gangLeader, "node-b"), queued}})
+	if got := store.placementWaitOf(0); got != nil {
+		t.Fatalf("placement wait = %v, want it retired while the worker is behind the gate", got)
+	}
+	if store.writes != 1 {
+		t.Errorf("writes = %d, want 1", store.writes)
+	}
+
+	refused := queued.DeepCopy()
+	refused.Spec.SchedulingGates = nil
+	refused.Status.Conditions[0].Reason = types.WaitingReasonUnschedulable
+	refused.Status.Conditions[0].Message = schedulerMessage
+	before := time.Now()
+	applyGang(t, store, map[int32][]*corev1.Pod{0: {boundPod(gangLeader, "node-b"), refused}})
+	if got := store.placementWaitOf(0); got == nil || got.Time.Before(before) {
+		t.Errorf("placement wait = %v, want the moment the refusal was first seen", got)
+	}
+}
+
+// TestPlacementWait_DeletingGatedPod_KeepsTheStart: the worker's name is
+// freed after its node stopped reporting, and an old worker pod that still
+// carries a queue's gate is being deleted. That pod is no longer part of the
+// attempt, so the attempt keeps its start.
+func TestPlacementWait_DeletingGatedPod_KeepsTheStart(t *testing.T) {
+	since := metav1.NewTime(time.Now().Add(-14 * time.Minute).Truncate(time.Second))
+	row := gangRow()
+	row.Operation.PlacementWaitSince = &since
+	store, _ := newStore(row)
+	deleting := metav1.NewTime(time.Now())
+	leaving := boundPod(gangWorker, "")
+	leaving.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "kueue.x-k8s.io/admission"}}
+	leaving.Status.Phase = corev1.PodPending
+	leaving.DeletionTimestamp = &deleting
+	leaving.Finalizers = []string{"kueue.x-k8s.io/managed"}
+
+	applyGang(t, store, map[int32][]*corev1.Pod{0: {boundPod(gangLeader, "node-b"), leaving}})
+	if got := store.placementWaitOf(0); got == nil || !got.Equal(&since) {
+		t.Errorf("placement wait = %v, want it kept at %v: a pod being deleted is not part of the attempt", got, since)
 	}
 }
 

@@ -44,7 +44,9 @@ spec:
   commonName: {{ include "ome-quota-manager.serviceName" . }}.{{ .Release.Namespace }}.svc
   dnsNames:
   - {{ include "ome-quota-manager.serviceName" . }}.{{ .Release.Namespace }}.svc
-  - {{ include "ome-quota-manager.serviceName" . }}.{{ .Release.Namespace }}.svc.cluster.local
+  {{- with .Values.quotaManager.clusterDomain }}
+  - {{ include "ome-quota-manager.serviceName" $ }}.{{ $.Release.Namespace }}.svc.{{ . }}
+  {{- end }}
   issuerRef:
     kind: Issuer
     name: {{ .Values.quotaManager.name }}-selfsigned

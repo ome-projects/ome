@@ -11,7 +11,6 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -62,13 +61,9 @@ func CompileFor(terms []v1beta1.ClusterAffinityTerm, allowWeights bool, componen
 		if err != nil {
 			return nil, fmt.Errorf("clusterAffinity[%d]: %w", i, err)
 		}
-		if weight := termWeight(input, component); weight != nil {
+		if ratio := termRatio(input.Weights, component); ratio != nil {
 			selector.weighted = true
-			compiled.weight = int64(*weight)
-			compiled.maxWeight = compiled.weight
-			if ratio := termRatio(input, component); ratio != nil {
-				compiled.maxWeight = int64(ratio.MaxOrOne())
-			}
+			compiled.weight, compiled.maxWeight = int64(ratio.MinOrOne()), int64(ratio.MaxOrOne())
 		}
 		selector.ratios = selector.ratios || usesRatios(input.Weights)
 		selector.terms = append(selector.terms, compiled)
@@ -76,78 +71,44 @@ func CompileFor(terms []v1beta1.ClusterAffinityTerm, allowWeights bool, componen
 	return selector, nil
 }
 
-// termWeight returns the weight a term gives a component, or nil when it gives
-// none. The engine takes engine, then default; the decoder takes decoder, then
-// default, then the engine's; the router takes router, then default, then the
-// engine's.
-func termWeight(input v1beta1.ClusterAffinityTerm, component v1beta1.ComponentType) *int32 {
-	weights := input.Weights
-	if weights == nil {
+// termRatio is the replica ratio a term's weights block gives a component, or
+// nil when it gives none. The engine takes engine, then default; the decoder
+// and the router take their own key, then default, then the engine's.
+func termRatio(w *v1beta1.ClusterAffinityWeights, component v1beta1.ComponentType) *v1beta1.ReplicaRatio {
+	if w == nil {
 		return nil
 	}
-	if usesRatios(weights) {
-		if ratio := termRatio(input, component); ratio != nil {
-			return ptr.To(ratio.MinOrOne())
-		}
-		return nil
-	}
-	engine := cmp.Or(weights.Engine, weights.Default)
+	engine := cmp.Or(w.Engine, w.Default)
 	switch component {
 	case v1beta1.EngineComponent:
 		return engine
 	case v1beta1.DecoderComponent:
-		return cmp.Or(weights.Decoder, weights.Default, engine)
+		return cmp.Or(w.Decoder, w.Default, engine)
 	case v1beta1.RouterComponent:
-		return cmp.Or(weights.Router, weights.Default, engine)
+		return cmp.Or(w.Router, w.Default, engine)
 	}
 	return nil
 }
 
-// termRatio returns the ratio a term gives a component under the same
-// fallback order as termWeight, or nil when the term gives none.
-func termRatio(input v1beta1.ClusterAffinityTerm, component v1beta1.ComponentType) *v1beta1.ReplicaRatio {
-	weights := input.Weights
-	if weights == nil {
-		return nil
-	}
-	engine := cmp.Or(weights.EngineReplicas, weights.DefaultReplicas)
-	switch component {
-	case v1beta1.EngineComponent:
-		return engine
-	case v1beta1.DecoderComponent:
-		return cmp.Or(weights.DecoderReplicas, weights.DefaultReplicas, engine)
-	case v1beta1.RouterComponent:
-		return cmp.Or(weights.RouterReplicas, weights.DefaultReplicas, engine)
-	}
-	return nil
-}
-
+// usesRatios reports whether a weights block sets any key.
 func usesRatios(w *v1beta1.ClusterAffinityWeights) bool {
-	return w != nil && (w.DefaultReplicas != nil || w.EngineReplicas != nil || w.DecoderReplicas != nil || w.RouterReplicas != nil)
+	return w != nil && slices.ContainsFunc(weightKeys(w), func(key weightKey) bool { return key.value != nil })
 }
 
-// UsesRatios reports whether any term sets a replica ratio key.
+// UsesRatios reports whether any term sets a weight key.
 func UsesRatios(terms []v1beta1.ClusterAffinityTerm) bool {
 	return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool { return usesRatios(t.Weights) })
 }
 
-// SetsWeights reports whether any term holds a weights block, which can give
-// the decoder and router weights other than the engine's.
-func SetsWeights(terms []v1beta1.ClusterAffinityTerm) bool {
-	return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool { return t.Weights != nil })
-}
-
 // DividesRouters reports whether static Split divides routers across the
-// matched clusters: when no term sets weights, as a default weight of one on
-// every term would, or when a term sets a default or router weight. Weights
-// that name only the engine or decoder keep the full router policy on each.
+// matched clusters: when no term sets weights, or when a term sets a default
+// or router ratio. Ratios that name only the engine or decoder keep the full
+// router policy on each cluster.
 func DividesRouters(terms []v1beta1.ClusterAffinityTerm) bool {
-	if UsesRatios(terms) {
-		return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool {
-			return t.Weights != nil && (t.Weights.DefaultReplicas != nil || t.Weights.RouterReplicas != nil)
-		})
+	if !UsesRatios(terms) {
+		return true
 	}
-	return !SetsWeights(terms) || slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool {
+	return slices.ContainsFunc(terms, func(t v1beta1.ClusterAffinityTerm) bool {
 		return t.Weights != nil && (t.Weights.Default != nil || t.Weights.Router != nil)
 	})
 }
@@ -159,82 +120,90 @@ func compileTerm(input v1beta1.ClusterAffinityTerm, allowWeights bool) (term, er
 	if len(input.MatchExpressions) > v1beta1.MaxClusterSelectorRequirements || len(input.MatchFields) > v1beta1.MaxClusterSelectorRequirements {
 		return term{}, fmt.Errorf("matchExpressions and matchFields each allow at most %d requirements", v1beta1.MaxClusterSelectorRequirements)
 	}
-	out := term{labels: labels.Everything(), weight: 1, maxWeight: 1}
-	if err := validateWeights(input, allowWeights); err != nil {
+	if err := validateWeights(input.Weights, allowWeights); err != nil {
 		return term{}, err
 	}
-	for i, req := range input.MatchExpressions {
-		if len(req.Values) > v1beta1.MaxClusterSelectorValues {
-			return term{}, fmt.Errorf("matchExpressions[%d]: at most %d values are allowed", i, v1beta1.MaxClusterSelectorValues)
-		}
-		op, ok := labelOperators[req.Operator]
-		if !ok {
-			return term{}, fmt.Errorf("matchExpressions[%d]: unsupported operator %q", i, req.Operator)
-		}
-		parsed, err := labels.NewRequirement(req.Key, op, slices.Clone(req.Values))
-		if err != nil {
-			return term{}, fmt.Errorf("matchExpressions[%d]: %w", i, err)
-		}
-		out.labels = out.labels.Add(*parsed)
+	labelSelector, err := labelRequirements(input.MatchExpressions)
+	if err != nil {
+		return term{}, err
 	}
-	for i, req := range input.MatchFields {
-		if req.Key != metav1.ObjectNameField || (req.Operator != corev1.NodeSelectorOpIn && req.Operator != corev1.NodeSelectorOpNotIn) {
-			return term{}, fmt.Errorf("matchFields[%d]: only metadata.name with In or NotIn is supported", i)
+	fields, err := nameRequirements(input.MatchFields)
+	if err != nil {
+		return term{}, err
+	}
+	return term{labels: labelSelector, fields: fields, weight: 1, maxWeight: 1}, nil
+}
+
+// labelRequirements compiles matchExpressions into one label selector.
+func labelRequirements(reqs []v1beta1.ClusterSelectorRequirement) (labels.Selector, error) {
+	selector := labels.Everything()
+	for i, req := range reqs {
+		parsed, err := labelRequirement(req)
+		if err != nil {
+			return nil, fmt.Errorf("matchExpressions[%d]: %w", i, err)
 		}
-		if len(req.Values) == 0 || len(req.Values) > v1beta1.MaxClusterSelectorValues {
-			return term{}, fmt.Errorf("matchFields[%d]: between 1 and %d names are required", i, v1beta1.MaxClusterSelectorValues)
-		}
-		for _, name := range req.Values {
-			if problems := validation.IsDNS1123Subdomain(name); len(problems) > 0 {
-				return term{}, fmt.Errorf("matchFields[%d]: invalid WorkloadCluster name %q: %v", i, name, problems)
-			}
+		selector = selector.Add(*parsed)
+	}
+	return selector, nil
+}
+
+// labelRequirement compiles one matchExpressions entry under the Kubernetes
+// label selector rules.
+func labelRequirement(req v1beta1.ClusterSelectorRequirement) (*labels.Requirement, error) {
+	if len(req.Values) > v1beta1.MaxClusterSelectorValues {
+		return nil, fmt.Errorf("at most %d values are allowed", v1beta1.MaxClusterSelectorValues)
+	}
+	op, ok := labelOperators[req.Operator]
+	if !ok {
+		return nil, fmt.Errorf("unsupported operator %q", req.Operator)
+	}
+	return labels.NewRequirement(req.Key, op, slices.Clone(req.Values))
+}
+
+// nameRequirements compiles matchFields into requirements that own their
+// value lists, so a later edit of the source cannot change the selector.
+func nameRequirements(reqs []v1beta1.ClusterSelectorRequirement) ([]v1beta1.ClusterSelectorRequirement, error) {
+	var out []v1beta1.ClusterSelectorRequirement
+	for i, req := range reqs {
+		if err := validateNameRequirement(req); err != nil {
+			return nil, fmt.Errorf("matchFields[%d]: %w", i, err)
 		}
 		req.Values = slices.Clone(req.Values)
-		out.fields = append(out.fields, req)
+		out = append(out, req)
 	}
 	return out, nil
 }
 
+// validateNameRequirement checks one matchFields entry: metadata.name with In
+// or NotIn, one name up to the maximum, each a valid WorkloadCluster name.
+func validateNameRequirement(req v1beta1.ClusterSelectorRequirement) error {
+	if req.Key != metav1.ObjectNameField || (req.Operator != corev1.NodeSelectorOpIn && req.Operator != corev1.NodeSelectorOpNotIn) {
+		return fmt.Errorf("only metadata.name with In or NotIn is supported")
+	}
+	if len(req.Values) == 0 || len(req.Values) > v1beta1.MaxClusterSelectorValues {
+		return fmt.Errorf("between 1 and %d names are required", v1beta1.MaxClusterSelectorValues)
+	}
+	for _, name := range req.Values {
+		if problems := validation.IsDNS1123Subdomain(name); len(problems) > 0 {
+			return fmt.Errorf("invalid WorkloadCluster name %q: %v", name, problems)
+		}
+	}
+	return nil
+}
+
 // validateWeights checks a term's weights block against the same rules the
 // schema enforces, for objects admitted while a rule was absent.
-func validateWeights(input v1beta1.ClusterAffinityTerm, allowWeights bool) error {
-	w := input.Weights
+func validateWeights(w *v1beta1.ClusterAffinityWeights, allowWeights bool) error {
 	if w == nil {
 		return nil
 	}
 	if !allowWeights {
 		return fmt.Errorf("weights is permitted only in Split mode")
 	}
-	if usesRatios(w) {
-		return validateRatios(w)
-	}
-	set := 0
-	for _, field := range []struct {
-		name  string
-		value *int32
-	}{{"default", w.Default}, {"engine", w.Engine}, {"decoder", w.Decoder}, {"router", w.Router}} {
-		if field.value == nil {
-			continue
-		}
-		set++
-		if *field.value < 1 {
-			return fmt.Errorf("weights.%s must be positive", field.name)
-		}
-	}
-	if set == 0 {
+	if !usesRatios(w) {
 		return fmt.Errorf("weights must set at least one component")
 	}
-	return nil
-}
-
-func validateRatios(w *v1beta1.ClusterAffinityWeights) error {
-	if w.Default != nil || w.Engine != nil || w.Decoder != nil || w.Router != nil {
-		return fmt.Errorf("weights must use either integer weights or replica ratios, not both")
-	}
-	for _, field := range []struct {
-		name  string
-		value *v1beta1.ReplicaRatio
-	}{{"defaultReplicas", w.DefaultReplicas}, {"engineReplicas", w.EngineReplicas}, {"decoderReplicas", w.DecoderReplicas}, {"routerReplicas", w.RouterReplicas}} {
+	for _, field := range weightKeys(w) {
 		if field.value == nil {
 			continue
 		}
@@ -246,6 +215,18 @@ func validateRatios(w *v1beta1.ClusterAffinityWeights) error {
 		}
 	}
 	return nil
+}
+
+type weightKey struct {
+	name  string
+	value *v1beta1.ReplicaRatio
+}
+
+// weightKeys lists every key a weights block can set.
+func weightKeys(w *v1beta1.ClusterAffinityWeights) []weightKey {
+	return []weightKey{
+		{"default", w.Default}, {"engine", w.Engine}, {"decoder", w.Decoder}, {"router", w.Router},
+	}
 }
 
 var labelOperators = map[corev1.NodeSelectorOperator]selection.Operator{

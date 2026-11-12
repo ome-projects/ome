@@ -17,7 +17,7 @@ func componentSplitSource(engine, decoder int, engineWeights, decoderWeights map
 	source := ratioSplitSource(engine, ptr.To(decoder))
 	source.Spec.Placement.ClusterAffinity = weightedAffinity(engineWeights)
 	for i, name := range []string{"member-a", "member-b"} {
-		source.Spec.Placement.ClusterAffinity[i].Weights.Decoder = ptr.To(decoderWeights[name])
+		source.Spec.Placement.ClusterAffinity[i].Weights.Decoder = &v1beta1.ReplicaRatio{Min: ptr.To(decoderWeights[name])}
 	}
 	return source
 }
@@ -39,7 +39,7 @@ func settledFloors(t *testing.T, source *v1beta1.InferenceService) (map[string]c
 	candidates := settledCandidates(proposal.Assignments)
 	out := map[string]componentFloors{}
 	for _, candidate := range candidates {
-		floors, err := splitMemberFloors(source, candidates, candidate, nil)
+		floors, err := memberMinimumsFor(source, candidates, candidate, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", candidate.Cluster, err)
 		}
@@ -75,11 +75,6 @@ func TestSplitByComponentWeights(t *testing.T) {
 			want: map[string]componentFloors{"member-a": {3, 6}, "member-b": {1, 6}}},
 		{name: "a decoder weight on a cluster without an engine goes unused", source: func() *v1beta1.InferenceService { return componentSplitSource(1, 3, twoToOne, even) },
 			want: map[string]componentFloors{"member-a": {1, 3}, "member-b": {0, 0}}},
-		{name: "a decoder share above its scaled ceiling holds the plan", source: func() *v1beta1.InferenceService {
-			source := componentSplitSource(4, 12, even, map[string]int32{"member-a": 3, "member-b": 1})
-			source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(2)}
-			return source
-		}, wantErr: `decoder share 9 on cluster "member-a" exceeds its ceiling of 6 replicas`},
 		{name: "fewer decoders than engine members holds the plan", source: func() *v1beta1.InferenceService {
 			return componentSplitSource(2, 1, even, map[string]int32{"member-a": 3, "member-b": 1})
 		}, wantErr: "decoder minimum 1 cannot give each of the 2 homes"},
@@ -106,34 +101,27 @@ func TestSplitByComponentWeights(t *testing.T) {
 // weights make on their own: the same shares and the same member floors.
 func TestEqualDecoderWeightsMatchTheEngineWeightsAlone(t *testing.T) {
 	for _, tt := range []struct {
-		name             string
-		engine, decoder  int
-		weights          map[string]int32
-		maxPerCluster    int32
-		splitReplicasSet int32
+		name              string
+		engine, decoder   int
+		weights           map[string]int32
+		engineMaxReplicas int
 	}{
 		{name: "even weights", engine: 60, decoder: 40, weights: map[string]int32{"member-a": 1, "member-b": 1}},
 		{name: "weighted with a remainder", engine: 60, decoder: 40, weights: map[string]int32{"member-a": 2, "member-b": 1}},
 		{name: "prefill-heavy", engine: 5, decoder: 2, weights: map[string]int32{"member-a": 3, "member-b": 2}},
-		{name: "split replicas size the fleet", engine: 60, decoder: 40, weights: map[string]int32{"member-a": 2, "member-b": 1}, splitReplicasSet: 30},
-		{name: "a ceiling", engine: 12, decoder: 36, weights: map[string]int32{"member-a": 1, "member-b": 1}, maxPerCluster: 8},
+		{name: "an engine maxReplicas", engine: 12, decoder: 36, weights: map[string]int32{"member-a": 1, "member-b": 1}, engineMaxReplicas: 16},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			shared := ratioSplitSource(tt.engine, ptr.To(tt.decoder))
 			shared.Spec.Placement.ClusterAffinity = weightedAffinity(tt.weights)
 			perComponent := componentSplitSource(tt.engine, tt.decoder, tt.weights, tt.weights)
 			for _, source := range []*v1beta1.InferenceService{shared, perComponent} {
-				if tt.splitReplicasSet > 0 || tt.maxPerCluster > 0 {
-					source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(tt.maxPerCluster)}
-					if tt.splitReplicasSet > 0 {
-						source.Spec.Placement.Split.Replicas = ptr.To(tt.splitReplicasSet)
-					}
-				}
+				source.Spec.Engine.MaxReplicas = tt.engineMaxReplicas
 			}
 			want, wantErr := settledFloors(t, shared)
 			got, gotErr := settledFloors(t, perComponent)
-			if (wantErr == nil) != (gotErr == nil) {
-				t.Fatalf("errors differ: engine weights %v, decoder weights %v", wantErr, gotErr)
+			if wantErr != nil || gotErr != nil {
+				t.Fatalf("engine weights: %v; decoder weights: %v", wantErr, gotErr)
 			}
 			if diff := cmp.Diff(want, got); diff != "" {
 				t.Errorf("floors with decoder weights differ (-engine weights +decoder weights):\n%s", diff)
@@ -148,7 +136,7 @@ func TestComponentMatchesArePersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []v1beta1.ComponentAffinityMatch{{Component: v1beta1.DecoderComponent, Weight: ptr.To[int64](3), MinWeight: ptr.To[int64](3)}}
+	want := []v1beta1.ComponentAffinityMatch{{Component: v1beta1.DecoderComponent, Weight: ptr.To[int64](3), MinWeight: ptr.To[int64](3), MaxWeight: ptr.To[int64](1)}}
 	if diff := cmp.Diff(want, perComponent.Assignments["member-b"].ComponentMatches); diff != "" {
 		t.Errorf("member-b component matches (-want +got):\n%s", diff)
 	}
@@ -216,7 +204,7 @@ func TestServingFloorsFollowTheServiceRatio(t *testing.T) {
 			components := []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}
 			got := map[string]int32{}
 			for _, candidate := range candidates {
-				floors, err := splitMemberFloors(tt.source, candidates, candidate, nil)
+				floors, err := memberMinimumsFor(tt.source, candidates, candidate, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -267,7 +255,7 @@ func threeMemberMinimums(t *testing.T, engine, decoder int, decoderWeights [3]in
 	for i, name := range names {
 		term := v1beta1.ClusterAffinityTerm{MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}}
 		if decoderWeights[i] > 0 {
-			term.Weights = &v1beta1.ClusterAffinityWeights{Decoder: ptr.To(decoderWeights[i])}
+			term.Weights = &v1beta1.ClusterAffinityWeights{Decoder: &v1beta1.ReplicaRatio{Min: ptr.To(decoderWeights[i])}}
 		}
 		source.Spec.Placement.ClusterAffinity = append(source.Spec.Placement.ClusterAffinity, term)
 		clusters = append(clusters, wc(name, true, nil))

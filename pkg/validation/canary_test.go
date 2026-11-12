@@ -416,6 +416,40 @@ func TestValidateCanary_UnitEntrypointRequired(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), ReasonCanaryInvalid) {
 		t.Fatalf("decoder without the engine entrypoint must be rejected, got: %v", err)
 	}
+	// The decoder alone is the same shape: no Component in the group drives the roll.
+	err = ValidateCanary(build(v1beta1.DecoderComponent))
+	if err == nil || !strings.Contains(err.Error(), ReasonCanaryInvalid) {
+		t.Fatalf("decoder alone without the engine entrypoint must be rejected, got: %v", err)
+	}
+}
+
+// A canary readyTimeout of 0s would never bound the capacity wait; the plan
+// refuses it naming the field, and a positive one passes.
+func TestValidateCanary_ReadyTimeoutMustBePositive(t *testing.T) {
+	spec := canarySpec(
+		v1beta1.RolloutGroupStep{Capacity: intstr.FromString("50%"), Traffic: 50, Pause: &v1beta1.RolloutPause{Duration: &metav1.Duration{Duration: 20 * time.Second}}},
+		v1beta1.RolloutGroupStep{Capacity: intstr.FromString("100%"), Traffic: 100},
+	)
+	spec.Rollout.Groups[0].Canary.ReadyTimeout = &metav1.Duration{}
+	err := ValidateCanary(spec)
+	if err == nil || !strings.Contains(err.Error(), ReasonCanaryInvalid) || !strings.Contains(err.Error(), "readyTimeout") {
+		t.Fatalf("a readyTimeout of 0s must be rejected naming the field with %s, got: %v", ReasonCanaryInvalid, err)
+	}
+	spec.Rollout.Groups[0].Canary.ReadyTimeout = &metav1.Duration{Duration: 10 * time.Minute}
+	if err := ValidateCanary(spec); err != nil {
+		t.Fatalf("a positive readyTimeout must pass: %v", err)
+	}
+}
+
+// An analysis interval of 0s is a step that could never sample; refused
+// naming the field.
+func TestValidateCanary_AnalysisNonPositiveIntervalRejected(t *testing.T) {
+	a := goodAnalysis()
+	a.Interval = metav1.Duration{}
+	err := ValidateCanary(analysisCanary(a))
+	if err == nil || !strings.Contains(err.Error(), ReasonAnalysisInvalid) || !strings.Contains(err.Error(), "interval") {
+		t.Fatalf("an analysis interval of 0s must be rejected naming the field with %s, got: %v", ReasonAnalysisInvalid, err)
+	}
 }
 
 // TestValidateCanary_MaintainRatioRejected: the canary engine never reads

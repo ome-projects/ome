@@ -32,6 +32,8 @@ type Targets struct {
 	components map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec
 	modes      map[v1beta1.ComponentType]constants.DeploymentModeType
 	replicas   map[v1beta1.ComponentType]int32
+	// released are the Components that stopped following; see released.go.
+	released map[v1beta1.ComponentType]releasedFollower
 }
 
 // ResolveTargets reads the anchor and the followers and resolves each
@@ -44,6 +46,11 @@ func ResolveTargets(ctx context.Context, reader client.Reader, isvc *v1beta1.Inf
 	modes map[v1beta1.ComponentType]constants.DeploymentModeType) (*Targets, error) {
 	targets := &Targets{policy: policy, source: source, components: components, modes: modes,
 		replicas: map[v1beta1.ComponentType]int32{}}
+	released, err := releasedFollowers(ctx, reader, isvc, policy, components, modes)
+	if err != nil {
+		return nil, err
+	}
+	targets.released = released
 	if policy == nil {
 		return targets, nil
 	}
@@ -107,6 +114,22 @@ type observation struct {
 	missing   []string
 }
 
+// readProjectedReplica reads the replica the service projects for one Component.
+// The coordinator reads its spec only: the desired count, the autoscaler
+// block and the parent reference that proves the replica is this service's.
+func readProjectedReplica(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceService,
+	component v1beta1.ComponentType) (*v1beta1.InferenceReplica, error) {
+	ir := &v1beta1.InferenceReplica{}
+	key := client.ObjectKey{Namespace: isvc.Namespace, Name: irprojector.InferenceReplicaName(isvc.Name, component)}
+	if err := reader.Get(ctx, key, ir); err != nil {
+		return nil, err
+	}
+	if ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != isvc.Name || ir.Spec.Component != component {
+		return nil, fmt.Errorf("replica %s is not projected by this InferenceService", key)
+	}
+	return ir, nil
+}
+
 func observe(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceService,
 	policy *v1beta1.ScalingPolicy, components map[v1beta1.ComponentType]*v1beta1.ComponentExtensionSpec,
 	modes map[v1beta1.ComponentType]constants.DeploymentModeType) (*observation, error) {
@@ -146,18 +169,7 @@ func observe(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceS
 		eligible = append(eligible, component)
 	}
 	keys = eligible
-	get := func(component v1beta1.ComponentType) (*v1beta1.InferenceReplica, error) {
-		ir := &v1beta1.InferenceReplica{}
-		key := client.ObjectKey{Namespace: isvc.Namespace, Name: irprojector.InferenceReplicaName(isvc.Name, component)}
-		if err := reader.Get(ctx, key, ir); err != nil {
-			return nil, err
-		}
-		if ir.Spec.ParentRef == nil || ir.Spec.ParentRef.Name != isvc.Name || ir.Spec.Component != component {
-			return nil, fmt.Errorf("replica %s is not projected by this InferenceService", key)
-		}
-		return ir, nil
-	}
-	anchorIR, err := get(seen.anchor)
+	anchorIR, err := readProjectedReplica(ctx, reader, isvc, seen.anchor)
 	if apierrors.IsNotFound(err) || (err == nil && anchorIR.Spec.Replicas == nil) {
 		return holdCounts("AnchorUnavailable", "anchor desired count is unavailable; follower counts are held")
 	}
@@ -171,7 +183,7 @@ func observe(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceS
 	// A competing writer on any follower holds every follower.
 	current := make(map[v1beta1.ComponentType]*int32, len(keys))
 	for _, component := range keys {
-		ir, err := get(component)
+		ir, err := readProjectedReplica(ctx, reader, isvc, component)
 		if apierrors.IsNotFound(err) {
 			seen.missing = append(seen.missing, string(component))
 			continue
@@ -202,19 +214,22 @@ func observe(ctx context.Context, reader client.Reader, isvc *v1beta1.InferenceS
 
 // Reconcile publishes the coordinator's status once the projectors have run:
 // the anchor's count, each follower's target beside the count its replica
-// carries, the Ready condition and the warning events. It writes no replica:
-// a follower's count travels in its own projection, so a follower that does
-// not yet carry its target is reported pending and written by the next pass.
-// The caller flushes the status alongside the rest of InferenceService status.
+// carries, the Components that stopped following and keep their count, the
+// Ready condition and the warning events. It writes no replica: a follower's
+// count travels in its own projection, so a follower that does not yet carry
+// its target is reported pending and written by the next pass. The caller
+// flushes the status alongside the rest of InferenceService status.
 func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventRecorder,
 	isvc *v1beta1.InferenceService, targets *Targets) error {
-	if targets == nil || targets.policy == nil {
+	if targets == nil || (targets.policy == nil && len(targets.released) == 0) {
 		isvc.Status.ScalingPolicy = nil
 		return nil
 	}
-	policy := targets.policy
 	previous := isvc.Status.ScalingPolicy
-	status := &v1beta1.ScalingPolicyStatus{Mode: policy.Mode, Source: targets.source}
+	status := &v1beta1.ScalingPolicyStatus{Source: targets.source}
+	if targets.policy != nil {
+		status.Mode = targets.policy.Mode
+	}
 	if previous != nil {
 		status.Conditions = append(status.Conditions, previous.Conditions...)
 	}
@@ -229,6 +244,21 @@ func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventR
 			ObservedGeneration: isvc.Generation,
 		})
 	}
+	releasedEntries, releasedNotes, err := targets.releasedStatus(ctx, reader, recorder, isvc)
+	if err != nil {
+		return err
+	}
+	if targets.policy == nil {
+		// No policy: the block stands only for the counts the coordinator keeps.
+		if len(releasedEntries) == 0 {
+			isvc.Status.ScalingPolicy = nil
+			return nil
+		}
+		status.Followers = releasedEntries
+		setCondition(true, "Released", strings.Join(releasedNotes, "; "))
+		return nil
+	}
+	policy := targets.policy
 	seen, err := observe(ctx, reader, isvc, policy, targets.components, targets.modes)
 	if err != nil {
 		return err
@@ -248,7 +278,8 @@ func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventR
 			status.Followers = append(status.Followers, held...)
 			message = withNotes(message+"; "+heldCountsNote, standingNotes(previous, held, policy, targets.components))
 		}
-		setCondition(seen.hold.ready, seen.hold.reason, message)
+		status.Followers = append(status.Followers, releasedEntries...)
+		setCondition(seen.hold.ready, seen.hold.reason, withNotes(message, releasedNotes))
 		if seen.conflict != "" && recorder != nil && !samePreviousConflict(previous, seen.conflict) {
 			recorder.Event(isvc, corev1.EventTypeWarning, "FollowerAutoscalerConflict", seen.conflict)
 		}
@@ -293,6 +324,8 @@ func Reconcile(ctx context.Context, reader client.Reader, recorder record.EventR
 		}
 		status.Followers = append(status.Followers, entry)
 	}
+	status.Followers = append(status.Followers, releasedEntries...)
+	notes = append(notes, releasedNotes...)
 	switch {
 	case len(seen.skipped) > 0:
 		message := strings.Join(seen.skipped, "; ")

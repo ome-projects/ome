@@ -1,64 +1,32 @@
-// Package podreadiness implements the multi-writer readiness gate
-// protocol for OMENative's `ome.io/serving` pod condition.
+// Package podreadiness reads and writes the serving gate: the pod condition
+// ome.io/serving that every rendered pod lists as a readiness gate, so the
+// kubelet folds it into PodReady and a pod leaves its Service's endpoints
+// while the gate is False.
 //
-// Pattern ported from RBG (`sigs.k8s.io/rbgs/pkg/inplace/pod/readiness`).
-// The condition's Message field carries a JSON list of {UserAgent, Key}
-// entries — one per writer that wants the pod NotReady right now.
-// Status=True iff the list is empty AND containers are ready (the
-// latter is kubelet's responsibility via the standard readiness gate
-// machinery).
+// Several writers can hold one pod out of rotation at once: a drain for an
+// in-place update, a restart, a scale-down or a migration, and the
+// lifecycle hold on a fresh pod. The gate's message carries the JSON list
+// of {userAgent, key} entries, one per writer holding it, and the gate is
+// True exactly when the list is empty. A pod without the gate is held by
+// the lifecycle writer until the Instance's create flow promotes it, once
+// every pod of the Instance reports ContainersReady; that promotion covers
+// the whole Instance, so a gang never serves in part.
 //
-// Why multi-writer: OMENative has at least four overlapping reasons
-// to want a pod NotReady — migration source drain, in-place update
-// drain, restart drain, scale-down drain — that may be in flight on
-// the same pod simultaneously. A single binary True/False gate has
-// the writers race to overwrite each other; the multi-writer protocol
-// lets them coexist as independent message-list entries.
-//
-// All writes use Status().Patch with strategic merge on the condition
-// list (patch-merge-key=type), so kubelet's concurrent writes to
-// PodScheduled / ContainersReady / PodReady are preserved. Every patch
-// pins metadata.resourceVersion from the read it was computed against,
-// so a stale base 409s instead of silently overwriting another
-// writer's hold; retry.RetryOnConflict re-reads and re-applies. The
-// in-loop re-read goes through the caller-supplied live reader (the
-// AuthoritativeReader role): a watch-backed cache lagging the
-// controller's own preceding status patch would re-serve the stale
-// resourceVersion on every retry and the loop could never converge.
-//
-// # Gang readiness equivalence (multi-pod)
-//
-// Multi-pod Instances require gang-readiness: each pod should remain
-// NotReady until every sibling in the Instance reaches ContainersReady.
-// The multi-pod path carries no separately-keyed gang writer; the
-// gang-readiness contract is enforced instead by the Instance-create
-// flow, which calls MarkPodServing on the Instance's pods ONLY once
-// every leader and every worker reports ContainersReady=True. Before
-// that gate no pod in the gang has serving=True, so none receives
-// traffic.
-//
-// That gate is observably equivalent to a per-pod gang writer:
-//   - A new pod's WriterLifecycle/KeyLifecycleInstanceReady stays in
-//     the message list until the controller writes the MarkPodServing
-//     removal in the create flow's Ready promotion. (The condition
-//     starts non-existent on a fresh pod, which is treated as "writer
-//     is implicitly holding"; the first MarkPodServing creates it with
-//     Status=True.)
-//   - The gate covers the WHOLE Instance, so the flip happens
-//     atomically across leader and workers. There is no partial
-//     "leader serving, workers still warming" window.
-//
-// A per-pod gang hold — wanted, for instance, by a partial in-place
-// update on a multi-pod gang — is a separately-keyed writer the
-// multi-writer protocol already admits without re-architecting.
+// Every write patches the one condition with a strategic merge keyed on
+// the condition type, so the kubelet's own conditions are kept, and names
+// the resourceVersion of the fresh read it was computed from, so a
+// concurrent writer's entry is never dropped: a stale base is a conflict,
+// and the write re-reads through the live reader and applies again.
 package podreadiness
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -69,44 +37,63 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ConditionType is the controller-owned readiness gate OMENative
-// stamps on every managed pod. The same value Render appends to
-// pod.spec.readinessGates so kubelet AND's it into PodReady.
+// ConditionType is the serving gate: the controller-owned pod condition the
+// rendered pods list in spec.readinessGates.
 const ConditionType corev1.PodConditionType = "ome.io/serving"
 
-// Message identifies one writer that wants the pod NotReady. The
-// pair {UserAgent, Key} is unique per logical reason — e.g.,
-// {"Update-in-place", "0-3"} for an in-place update on Instance 0
-// incarnation 3.
+// Message identifies one writer holding a pod out of rotation. The pair
+// {UserAgent, Key} is unique per reason, such as the in-place update of
+// one Instance.
 type Message struct {
 	UserAgent string `json:"userAgent"`
 	Key       string `json:"key"`
 }
 
-// ErrPodIdentityChanged means a same-name Pod's UID differs from the caller's
-// observation. The replacement must not receive the stale effect.
+// ErrPodIdentityChanged means a pod with another UID now holds the name of
+// the caller's pod. The replacement never carried the caller's hold.
 var ErrPodIdentityChanged = errors.New("pod identity changed")
 
-// AddNotReadyKey appends msg to the readiness condition's message list
-// and sets Status=False. No-op if msg is already present AND the
-// condition Status is already False (the writer slot is already held).
-// Patches only the single condition slot so kubelet's concurrent
-// status writes are preserved; wrapped in retry.RetryOnConflict.
-//
-// reader is the live reader the RV-pinned patch base is read through
-// (nil falls back to c, acceptable only when c does not lag the API
-// server — e.g. tests).
-//
-// Self-healing branch: when the message list already contains msg but
-// Status is True we still issue a patch to flip Status back to False.
-// This resyncs a divergent shape — stale {UserAgent, Key} entries left
-// in the message while Status has already flipped True. Without this
-// recovery, a fresh in-place update reusing the same {idx, incarnation}
-// key would short-circuit as "already held", no NotReady patch fires,
-// drain.IsPodDrained sees the pod still Ready in the EndpointSlice,
-// and the Instance hangs at Phase=Updating forever. With this branch,
-// the first Add after a controller restart resyncs Status to match
-// the message-list reality.
+// Writer userAgents, one per reason a pod is held out of rotation.
+const (
+	// WriterLifecycle is the implicit hold on a fresh pod; its one key
+	// (KeyLifecycleInstanceReady) is removed when the Instance is promoted.
+	WriterLifecycle = "Lifecycle"
+
+	// WriterUpdateInPlace drains a pod for an in-place update and releases
+	// the same key once the pod is back.
+	WriterUpdateInPlace = "Update-in-place"
+
+	// WriterUpdateRecreateDrain drains the old pods of a recreate update;
+	// the new pods carry the lifecycle hold instead.
+	WriterUpdateRecreateDrain = "Update-recreate-drain"
+
+	// WriterRestartDrain drains the old pods of an Instance restart; the new
+	// pods carry the lifecycle hold instead.
+	WriterRestartDrain = "Restart-drain"
+
+	// WriterDeleteDrain drains a pod a scale-down deletes; the hold ends
+	// with the pod.
+	WriterDeleteDrain = "Delete-drain"
+
+	// WriterMigrateSourceDrain drains the source pods of a surge migration;
+	// the hold ends with the pods.
+	WriterMigrateSourceDrain = "Migrate-source-drain"
+
+	// WriterUpdateSurgeDrain drains the old pod of a SurgeThenDrain update
+	// once its replacement serves; the replacement carries the lifecycle
+	// hold instead.
+	WriterUpdateSurgeDrain = "Update-surge-drain"
+)
+
+// KeyLifecycleInstanceReady is the lifecycle writer's one key.
+const KeyLifecycleInstanceReady = "InstanceReady"
+
+// AddNotReadyKey records msg as a writer holding the pod out of rotation
+// and writes the gate False. A hold already recorded and in effect writes
+// nothing; a gate that reads True while its list still carries msg is
+// written False again, so a key reused by the same writer takes effect.
+// The pod is re-read through reader (c when nil) on every attempt; a pod
+// gone or replaced under its name is an error.
 func AddNotReadyKey(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, msg Message) error {
 	if pod == nil {
 		return fmt.Errorf("AddNotReadyKey: nil pod")
@@ -115,90 +102,64 @@ func AddNotReadyKey(ctx context.Context, c client.Client, reader client.Reader, 
 		reader = c
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		fresh := &corev1.Pod{}
-		if err := reader.Get(ctx, client.ObjectKeyFromObject(pod), fresh); err != nil {
-			return fmt.Errorf("re-read pod %s/%s: %w", pod.Namespace, pod.Name, err)
+		fresh, gate, err := freshGate(ctx, reader, pod)
+		if err != nil {
+			return err
 		}
-		if pod.UID != "" && fresh.UID != pod.UID {
-			return fmt.Errorf("%w: pod %s/%s", ErrPodIdentityChanged, pod.Namespace, pod.Name)
+		stored := corev1.PodCondition{}
+		if gate != nil {
+			stored = *gate
 		}
-		cond := findCondition(fresh, ConditionType)
-		var base string
-		var existingStatus corev1.ConditionStatus
-		if cond != nil {
-			base = cond.Message
-			existingStatus = cond.Status
-		}
-		changed, list, err := addMessage(base, msg)
+		added, list, err := addMessage(stored.Message, msg)
 		if err != nil {
 			return fmt.Errorf("pod %s/%s: %w", fresh.Namespace, fresh.Name, err)
 		}
-		if !changed && existingStatus == corev1.ConditionFalse {
-			// Nothing to do — key already in the list AND Status is
-			// already False (writer slot already held; everything
-			// consistent).
+		if !added && stored.Status == corev1.ConditionFalse {
 			return nil
 		}
-		return patchCondition(ctx, c, fresh, corev1.PodCondition{
-			Type:               ConditionType,
-			Status:             corev1.ConditionFalse,
-			Reason:             "NotReady",
-			Message:            list.dump(),
-			LastTransitionTime: transitionTime(cond, corev1.ConditionFalse),
-		})
+		return patchCondition(ctx, c, fresh, gateCondition(list, gate))
 	})
 }
 
-// transitionTime is the LastTransitionTime to stamp when writing status
-// onto cond. A write that only reshuffles the writer list must carry the
-// old timestamp forward, or every writer that joins or leaves resets the
-// "how long has this pod been NotReady" clock consumers read.
-func transitionTime(cond *corev1.PodCondition, status corev1.ConditionStatus) metav1.Time {
-	if cond != nil && cond.Status == status {
-		return cond.LastTransitionTime
-	}
-	return metav1.Now()
-}
-
-// RemoveNotReadyKey removes msg from the readiness condition's
-// message list. If the list becomes empty (or the condition doesn't
-// exist yet — fresh pod case), sets Status=True. Otherwise keeps
-// Status=False with the shrunken list.
-//
-// A pod that no longer exists is an ERROR (NotFound). This is the
-// promote-to-serving contract: callers flip a pod into rotation and
-// then act on that promotion (e.g. drain its predecessor in the same
-// pass), so a silently-vanished pod must abort the caller before it
-// removes the only serving replica. Drain-hold release paths, where
-// the hold genuinely dies with the pod, use
-// RemoveNotReadyKeyIgnoreNotFound instead.
-//
-// Pod names here are slot-based, so a same-name pod carrying a
-// different UID is a replacement, not the caller's pod: that is
-// ErrPodIdentityChanged, for the same reason.
-//
-// reader is the live reader the RV-pinned patch base is read through
-// (nil falls back to c). Wrapped in retry.RetryOnConflict; patches
-// only the single condition slot.
+// RemoveNotReadyKey removes msg from the writers holding the pod and writes
+// the gate True once none is left, False with the shorter list otherwise.
+// A pod without the gate is written True. Success means the pod is in
+// rotation, so a caller may act on that and drain the pod it replaces; a
+// pod gone, or replaced under its name by a pod with another UID
+// (ErrPodIdentityChanged), is therefore an error. The pod is re-read
+// through reader (c when nil) on every attempt.
 func RemoveNotReadyKey(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, msg Message) error {
-	_, err := removeNotReadyKey(ctx, c, reader, pod, msg, false)
+	_, err := removeNotReadyKey(ctx, c, reader, pod, msg, promotion)
 	return err
 }
 
-// RemoveNotReadyKeyIgnoreNotFound is RemoveNotReadyKey for drain-hold
-// release: a pod that no longer exists — vanished outright, or replaced
-// under the same name by a pod with a different UID — is a no-op (nil)
-// because the hold dies with the pod. Never use it on a
-// promote-to-serving path —
-// tolerating NotFound there turns "replacement is in rotation" into
-// "replacement may be gone" and lets the caller drain its predecessor
-// with nothing serving.
+// RemoveNotReadyKeyIgnoreNotFound is RemoveNotReadyKey for releasing a
+// drain hold. A hold dies with its pod, so a pod gone, replaced under its
+// name, or without the gate (the hold was never recorded on it) writes
+// nothing and returns nil. A promotion never uses it: success would not
+// mean the pod serves.
 func RemoveNotReadyKeyIgnoreNotFound(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, msg Message) error {
-	_, err := removeNotReadyKey(ctx, c, reader, pod, msg, true)
+	_, err := removeNotReadyKey(ctx, c, reader, pod, msg, holdRelease)
 	return err
 }
 
-func removeNotReadyKey(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, msg Message, ignoreNotFound bool) (bool, error) {
+// releaseRule is what a release does when the pod it was asked to write is
+// gone, is replaced under its name by a pod with another UID, or carries no
+// gate yet.
+type releaseRule int
+
+const (
+	// promotion acts on the pod being in rotation afterwards: a pod gone or
+	// replaced is an error, and a pod without the gate is written True.
+	promotion releaseRule = iota
+	// holdRelease ends a hold that died with its pod and was never recorded
+	// on a pod without the gate: nothing is written.
+	holdRelease
+)
+
+// removeNotReadyKey removes msg under rule and reports whether it changed
+// the gate: an entry removed or the status moved.
+func removeNotReadyKey(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, msg Message, rule releaseRule) (bool, error) {
 	if pod == nil {
 		return false, fmt.Errorf("RemoveNotReadyKey: nil pod")
 	}
@@ -208,225 +169,162 @@ func removeNotReadyKey(ctx context.Context, c client.Client, reader client.Reade
 	changed := false
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		changed = false
-		fresh := &corev1.Pod{}
-		if err := reader.Get(ctx, client.ObjectKeyFromObject(pod), fresh); err != nil {
-			if ignoreNotFound && apierrors.IsNotFound(err) {
+		fresh, gate, err := freshGate(ctx, reader, pod)
+		if err != nil {
+			if rule == holdRelease && (apierrors.IsNotFound(err) || errors.Is(err, ErrPodIdentityChanged)) {
 				return nil
 			}
-			return fmt.Errorf("re-read pod %s/%s: %w", pod.Namespace, pod.Name, err)
+			return err
 		}
-		if pod.UID != "" && fresh.UID != pod.UID {
-			// A same-name replacement occupies the slot. The caller's
-			// hold died with its pod, so releasing it here would clear
-			// a gate the replacement never earned. For the tolerant
-			// variant that is the same no-op as a vanished pod.
-			if ignoreNotFound {
+		if gate == nil {
+			if rule == holdRelease {
 				return nil
 			}
-			return fmt.Errorf("%w: pod %s/%s", ErrPodIdentityChanged, pod.Namespace, pod.Name)
-		}
-		cond := findCondition(fresh, ConditionType)
-		if cond == nil {
-			// An absent condition is the implicit Lifecycle hold on a
-			// fresh pod. Only the promote path may resolve it: that IS
-			// its Ready promotion. A drain-hold release has nothing to
-			// release here — its hold was never recorded — and writing
-			// Status=True would promote a pod no writer promoted,
-			// slipping past the Instance-wide gang gate.
-			if ignoreNotFound {
-				return nil
-			}
-			// Removing a key that isn't present is vacuously "no
-			// writers hold it NotReady" → write Status=True.
-			if err := patchCondition(ctx, c, fresh, corev1.PodCondition{
-				Type:               ConditionType,
-				Status:             corev1.ConditionTrue,
-				Reason:             "Serving",
-				LastTransitionTime: metav1.Now(),
-			}); err != nil {
+			if err := patchCondition(ctx, c, fresh, gateCondition(nil, nil)); err != nil {
 				return err
 			}
 			changed = true
 			return nil
 		}
-		messageChanged, list, err := removeMessage(cond.Message, msg)
+		removed, list, err := removeMessage(gate.Message, msg)
 		if err != nil {
 			return fmt.Errorf("pod %s/%s: %w", fresh.Namespace, fresh.Name, err)
 		}
-		if !messageChanged && cond.Status == corev1.ConditionTrue {
-			// Key wasn't in the list AND condition already True.
-			// Nothing to do.
+		if !removed && gate.Status == corev1.ConditionTrue {
 			return nil
 		}
-		status := corev1.ConditionTrue
-		reason := "Serving"
-		message := ""
-		if len(list) > 0 {
-			status = corev1.ConditionFalse
-			reason = "NotReady"
-			message = list.dump()
-		}
-		// If only the status field needs updating, still issue a
-		// patch — the list dedup is in the helper.
-		if err := patchCondition(ctx, c, fresh, corev1.PodCondition{
-			Type:               ConditionType,
-			Status:             status,
-			Reason:             reason,
-			Message:            message,
-			LastTransitionTime: transitionTime(cond, status),
-		}); err != nil {
+		next := gateCondition(list, gate)
+		if err := patchCondition(ctx, c, fresh, next); err != nil {
 			return err
 		}
-		changed = messageChanged || cond.Status != status
+		changed = removed || gate.Status != next.Status
 		return nil
 	})
 	return changed, err
 }
 
-// ContainsNotReadyKey reports whether the readiness condition holds
-// msg as a live hold — msg is in the message list AND Status is False.
-// Read-side check used by callers that want to skip a redundant Add.
-//
-// The Status=False requirement makes this "is the hold in effect", not
-// "is the entry present". A condition in the paradoxical Status=True
-// state with a non-empty list therefore reports false. That is what an
-// Add caller wants, since AddNotReadyKey repairs the paradox on its
-// next write. A Remove caller must NOT use this to skip its call: the
-// stale entry is exactly what needs removing, and skipping leaves it.
+// freshGate re-reads the pod through reader as the base of a patch and
+// returns the gate it carries, nil when it has none. A pod that cannot be
+// read is an error that still answers apierrors.IsNotFound; a pod with
+// another UID under the same name is ErrPodIdentityChanged.
+func freshGate(ctx context.Context, reader client.Reader, pod *corev1.Pod) (*corev1.Pod, *corev1.PodCondition, error) {
+	fresh := &corev1.Pod{}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(pod), fresh); err != nil {
+		return nil, nil, fmt.Errorf("re-read pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	if pod.UID != "" && fresh.UID != pod.UID {
+		return nil, nil, fmt.Errorf("%w: pod %s/%s", ErrPodIdentityChanged, pod.Namespace, pod.Name)
+	}
+	return fresh, findCondition(fresh, ConditionType), nil
+}
+
+// gateCondition is the gate as the writer list leaves it: False with the
+// list while a writer holds the pod, True with no message once none does.
+// The transition time carries over from the stored gate when the status
+// does not move, so a writer joining or leaving does not reset how long
+// the pod has been out of rotation.
+func gateCondition(list messageList, stored *corev1.PodCondition) corev1.PodCondition {
+	cond := corev1.PodCondition{Type: ConditionType, Status: corev1.ConditionTrue, Reason: "Serving"}
+	if len(list) > 0 {
+		cond.Status = corev1.ConditionFalse
+		cond.Reason = "NotReady"
+		cond.Message = list.dump()
+	}
+	cond.LastTransitionTime = transitionTime(stored, cond.Status)
+	return cond
+}
+
+// transitionTime is the time to record for a gate written with status: the
+// stored gate's own time when it already had that status, else now.
+func transitionTime(stored *corev1.PodCondition, status corev1.ConditionStatus) metav1.Time {
+	if stored != nil && stored.Status == status {
+		return stored.LastTransitionTime
+	}
+	return metav1.Now()
+}
+
+// ContainsNotReadyKey reports whether msg holds the pod out of rotation
+// now: the gate is not True and its list carries msg. An entry left on a
+// gate that reads True is not a hold, and AddNotReadyKey rewrites it; so a
+// writer about to add may skip on true, and a writer about to remove may
+// not skip on false, since that entry is what it removes.
 func ContainsNotReadyKey(pod *corev1.Pod, msg Message) bool {
-	if pod == nil {
-		return false
-	}
-	cond := findCondition(pod, ConditionType)
-	if cond == nil || cond.Status == corev1.ConditionTrue || cond.Message == "" {
-		return false
-	}
-	list, err := parseList(cond.Message)
-	if err != nil {
-		return false
-	}
-	for _, m := range list {
-		if m == msg {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(holdingWriters(pod), msg)
 }
 
-// IsServing reports whether the condition exists with Status=True —
-// true iff no writer currently holds the pod NotReady.
+// IsServing reports whether the gate is written True: no writer holds the
+// pod out of rotation.
 func IsServing(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-	cond := findCondition(pod, ConditionType)
-	return cond != nil && cond.Status == corev1.ConditionTrue
+	gate := findCondition(pod, ConditionType)
+	return gate != nil && gate.Status == corev1.ConditionTrue
 }
 
-// HeldNotServing reports whether a writer currently holds the pod out of
-// rotation: the condition exists with Status != True. A pod without the
-// condition is not held, which is what separates this from !IsServing: a
-// reader keyed on kubelet PodReady can honor the hold while PodReady still
-// reads True, since kubelet re-evaluates the gate asynchronously.
+// HeldNotServing reports whether a writer holds the pod out of rotation:
+// the gate exists and is not True. A pod without the gate is not held, so a
+// reader of PodReady can honour a hold the kubelet has not folded in yet.
 func HeldNotServing(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-	cond := findCondition(pod, ConditionType)
-	return cond != nil && cond.Status != corev1.ConditionTrue
+	gate := findCondition(pod, ConditionType)
+	return gate != nil && gate.Status != corev1.ConditionTrue
 }
 
-// HeldNotServingBy reports whether the named writer is among those
-// currently holding the pod out of rotation: the condition exists with
-// Status != True and its writer list carries an entry under userAgent.
+// HeldNotServingBy reports whether the named writer is among those holding
+// the pod out of rotation.
 func HeldNotServingBy(pod *corev1.Pod, userAgent string) bool {
+	return slices.ContainsFunc(holdingWriters(pod), func(m Message) bool { return m.UserAgent == userAgent })
+}
+
+// holdingWriters lists the writers holding the pod out of rotation: the
+// gate's list while the gate is not True. It is empty for a pod without the
+// gate, a gate that reads True, and a list that cannot be parsed.
+func holdingWriters(pod *corev1.Pod) messageList {
 	if !HeldNotServing(pod) {
-		return false
+		return nil
 	}
 	list, err := parseList(findCondition(pod, ConditionType).Message)
 	if err != nil {
-		return false
+		return nil
 	}
-	for _, m := range list {
-		if m.UserAgent == userAgent {
-			return true
-		}
-	}
-	return false
+	return list
 }
 
-// ReadyAndServing reports whether the pod is serving: its Ready condition
-// and the serving gate are both True. The gate is read on its own because
-// a drain flips it before the kubelet folds it into Ready; Ready is read on
-// its own because the node lifecycle controller revokes it on a pod whose
-// kubelet stopped reporting, leaving the container statuses and the gate at
-// their last values. Until both agree the pod is in no Service's endpoints.
+// ReadyAndServing reports whether the pod serves: PodReady and the gate are
+// both True. The gate is read on its own because a drain moves it before
+// the kubelet folds it into PodReady; PodReady is read on its own because
+// the node lifecycle controller revokes it on a pod whose kubelet stopped
+// reporting, leaving the container statuses and the gate at their last
+// values. Until both agree the pod is in no Service's endpoints.
 func ReadyAndServing(pod *corev1.Pod) bool {
 	return IsPodReady(pod) && IsServing(pod)
 }
 
-// IsContainersReady reports whether the kubelet-owned ContainersReady
-// condition is True — i.e., all containers in the pod have passed their
-// readiness probes.
-//
-// Distinct from corev1.PodReady (which ANDs ContainersReady with every
-// readiness gate including ome.io/serving). Gating MarkPodServing on
-// PodReady would deadlock: kubelet won't flip PodReady=True until
-// ome.io/serving=True, and OMENative won't write ome.io/serving=True
-// until PodReady=True. ContainersReady reflects only probe-level
-// readiness and is the correct signal that the runtime is healthy
-// enough to receive traffic.
+// IsContainersReady reports whether the kubelet's ContainersReady condition
+// is True: every container passes its readiness probe. It is the signal a
+// promotion waits for; PodReady cannot be, since the kubelet keeps PodReady
+// False until the gate is True.
 func IsContainersReady(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.ContainersReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
+	cond := findCondition(pod, corev1.ContainersReady)
+	return cond != nil && cond.Status == corev1.ConditionTrue
 }
 
-// IsPodReady reports whether the kubelet-owned PodReady condition is True —
-// containers ready AND every readiness gate (including ome.io/serving)
-// satisfied. This is the signal that the pod is actually in Service rotation,
-// distinct from IsContainersReady (probes only) and IsServing (the gate
-// condition alone, before kubelet re-evaluates PodReady). Use this to confirm
-// a freshly-served replacement is carrying traffic before draining its source.
+// IsPodReady reports whether the kubelet's PodReady condition is True:
+// the containers are ready and every readiness gate, this package's
+// included, is satisfied, so the pod is in its Service's rotation.
 func IsPodReady(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
+	cond := findCondition(pod, corev1.PodReady)
+	return cond != nil && cond.Status == corev1.ConditionTrue
 }
 
 // IsPodAvailable reports whether the pod is Available: PodReady is True and
-// the condition's lastTransitionTime plus minReadySeconds is not after now
-// (the Deployment minReadySeconds rule). A window <= 0 makes Available the
-// same as Ready. The duration is how much longer the pod must stay Ready
-// before it becomes Available; it is 0 when the pod already is, when it is
-// not Ready, and when a Ready condition carries no lastTransitionTime (its
-// age cannot be proven, so no later instant makes it Available). The status
-// aggregator folds the smallest pending duration into the reconcile requeue
-// so the Available counters refresh when the window elapses; the update
-// strategies discard it because an in-flight Update already polls.
+// its lastTransitionTime plus minReadySeconds is not after now (the
+// Deployment minReadySeconds rule). A window of zero or less makes
+// Available the same as Ready. The duration is how much longer the pod must
+// stay Ready before it is Available: 0 when it already is, when it is not
+// Ready, and when its Ready condition carries no lastTransitionTime (its age
+// cannot be proven, so no later instant makes it Available). The status
+// aggregator folds the smallest pending duration into its requeue; the
+// update strategies discard it, since an open update polls already.
 func IsPodAvailable(pod *corev1.Pod, minReadySeconds int32, now time.Time) (bool, time.Duration) {
-	if pod == nil {
-		return false, 0
-	}
-	var ready *corev1.PodCondition
-	for i := range pod.Status.Conditions {
-		if pod.Status.Conditions[i].Type == corev1.PodReady {
-			ready = &pod.Status.Conditions[i]
-			break
-		}
-	}
+	ready := findCondition(pod, corev1.PodReady)
 	if ready == nil || ready.Status != corev1.ConditionTrue {
 		return false, 0
 	}
@@ -436,114 +334,37 @@ func IsPodAvailable(pod *corev1.Pod, minReadySeconds int32, now time.Time) (bool
 	if ready.LastTransitionTime.IsZero() {
 		return false, 0
 	}
-	window := time.Duration(minReadySeconds) * time.Second
-	availableAt := ready.LastTransitionTime.Add(window)
+	availableAt := ready.LastTransitionTime.Add(time.Duration(minReadySeconds) * time.Second)
 	if !now.Before(availableAt) {
 		return true, 0
 	}
 	return false, availableAt.Sub(now)
 }
 
-// MarkPodServing removes the {userAgent, key} entry from the
-// ome.io/serving condition's writer list. If the resulting list is
-// empty (or the condition didn't exist yet — fresh pod case), the
-// condition is written with Status=True and the pod becomes eligible
-// for Service rotation.
-//
-// Idempotent: removing a key that isn't present is a no-op (no patch
-// issued) when the condition is already Status=True. A deleted pod is
-// an error (see RemoveNotReadyKey): success means the pod IS in
-// rotation, so promote-then-drain callers may safely act on it.
+// MarkPodServing is RemoveNotReadyKey for the {userAgent, key} writer:
+// success means the pod is in rotation.
 func MarkPodServing(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, userAgent, key string) error {
 	return RemoveNotReadyKey(ctx, c, reader, pod, Message{UserAgent: userAgent, Key: key})
 }
 
-// MarkPodServingWithChange is MarkPodServing plus whether this call committed
-// a condition change. Callers use the result when they may need to compensate
-// only the serving transition they own.
+// MarkPodServingWithChange is MarkPodServing plus whether this call changed
+// the gate, for a caller that compensates only the transition it made.
 func MarkPodServingWithChange(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, userAgent, key string) (bool, error) {
-	return removeNotReadyKey(ctx, c, reader, pod, Message{UserAgent: userAgent, Key: key}, false)
+	return removeNotReadyKey(ctx, c, reader, pod, Message{UserAgent: userAgent, Key: key}, promotion)
 }
 
-// MarkPodNotServing adds the {userAgent, key} entry to the
-// ome.io/serving condition's writer list. Status becomes False (because
-// the list is non-empty). The pod is removed from Service rotation via
-// kube-proxy's standard PodReady gate machinery.
-//
-// Idempotent: re-adding the same key is a no-op.
+// MarkPodNotServing is AddNotReadyKey for the {userAgent, key} writer: the
+// pod leaves its Service's rotation through the kubelet's PodReady gate.
 func MarkPodNotServing(ctx context.Context, c client.Client, reader client.Reader, pod *corev1.Pod, userAgent, key string) error {
 	return AddNotReadyKey(ctx, c, reader, pod, Message{UserAgent: userAgent, Key: key})
 }
 
-// Writer userAgents used across the OMENative ops. Centralized here so
-// a stray drift in any one site is easy to catch in `git grep`.
-const (
-	// WriterLifecycle flips a fresh pod's gate to Status=True once all
-	// Instance siblings reach ContainersReady. The key
-	// (KeyLifecycleInstanceReady) is the same across all sites — the
-	// userAgent + key tuple is the lookup; we never need to differentiate.
-	WriterLifecycle = "Lifecycle"
-
-	// WriterUpdateInPlace drains a pod for in-place container image
-	// update. Same key on Add (drain) and Remove (un-drain) on the
-	// same pod.
-	WriterUpdateInPlace = "Update-in-place"
-
-	// WriterUpdateRecreateDrain drains the OLD pods for a recreate
-	// update. The NEW pods are fresh and go through WriterLifecycle.
-	WriterUpdateRecreateDrain = "Update-recreate-drain"
-
-	// WriterRestartDrain drains the OLD pods for an Instance restart.
-	// The NEW pods are fresh and go through WriterLifecycle.
-	WriterRestartDrain = "Restart-drain"
-
-	// WriterDeleteDrain drains a pod for scale-down deletion. The key
-	// is removed by virtue of the pod being deleted; no explicit
-	// RemoveNotReadyKey is required.
-	WriterDeleteDrain = "Delete-drain"
-
-	// WriterMigrateSourceDrain drains the source pods of a surge
-	// migration. The key is removed by virtue of the source pods being
-	// deleted at the end of the migration.
-	WriterMigrateSourceDrain = "Migrate-source-drain"
-
-	// WriterUpdateSurgeDrain drains the OLD pod during a SurgeThenDrain
-	// rollout — after the surge pod (at the other ordinal slot) reaches
-	// Ready, the old pod is drained via this writer then deleted. The
-	// surge pod is fresh and goes through WriterLifecycle.
-	WriterUpdateSurgeDrain = "Update-surge-drain"
-)
-
-// KeyLifecycleInstanceReady is the universal Lifecycle key. Matches
-// RBG's convention. The pair (WriterLifecycle, KeyLifecycleInstanceReady)
-// always means "the gate is unheld; if no other writer holds it, status
-// is True".
-const KeyLifecycleInstanceReady = "InstanceReady"
-
-// patchCondition issues a strategic-merge patch updating only the
-// single ome.io/serving condition. Kubelet's concurrent writes to
-// the other Pod.Status.Conditions entries (PodScheduled, Initialized,
-// ContainersReady, Ready, ...) are preserved because patch-merge-key
-// on PodCondition is `type`.
-//
-// The patch is hand-marshaled (not via corev1.PodCondition) because
-// PodCondition.Message has `json:",omitempty"` — when the controller
-// removes the last writer and writes Status=True with Message="" the
-// typed Marshal omits the message field entirely, so strategic-merge
-// keeps the stale message list from the previous Status=False patch.
-// The next AddNotReadyKey call then sees the orphaned key still in
-// the list, addMessage returns changed=false, no patch fires, the
-// pod stays Status=True with a stale writer in the message, and
-// drain.IsPodDrained never observes the pod leaving rotation — the
-// in-place update stalls forever in Phase=Updating. Forcing the
-// "message" field into the patch payload (even when empty) makes
-// strategic-merge clear the stale list so the next writer cycle
-// starts from a clean slate.
-//
-// The patch pins pod's resourceVersion (the fresh read the new list
-// was computed from) so a stale base gets a 409 instead of silently
-// dropping a concurrent writer's entry; the callers' RetryOnConflict
-// then re-reads and recomputes.
+// patchCondition writes cond as the pod's gate with a strategic merge keyed
+// on the condition type, so the kubelet's conditions are kept. The patch is
+// built by hand so that an empty message is sent and clears the stored
+// list; the typed condition omits an empty message and the merge would
+// keep the last list. The patch names pod's resourceVersion, so a base that
+// is no longer current is a conflict and the caller re-reads.
 func patchCondition(ctx context.Context, c client.Client, pod *corev1.Pod, cond corev1.PodCondition) error {
 	condMap := map[string]any{
 		"type":               string(cond.Type),
@@ -570,9 +391,8 @@ func patchCondition(ctx context.Context, c client.Client, pod *corev1.Pod, cond 
 	return nil
 }
 
-// findCondition returns a pointer to the condition matching condType
-// in pod.Status.Conditions, or nil. Used by the multi-writer helpers
-// to extract the current message list.
+// findCondition returns the pod's condition of the given type, nil when the
+// pod is nil or carries none.
 func findCondition(pod *corev1.Pod, condType corev1.PodConditionType) *corev1.PodCondition {
 	if pod == nil {
 		return nil
@@ -585,25 +405,21 @@ func findCondition(pod *corev1.Pod, condType corev1.PodConditionType) *corev1.Po
 	return nil
 }
 
-// addMessage appends msg to the list parsed from base (an empty
-// string is treated as an empty list). Returns changed=false if msg
-// is already in the list.
+// addMessage adds msg to the list parsed from base and reports whether the
+// list grew; msg already listed leaves it as it is.
 func addMessage(base string, msg Message) (bool, messageList, error) {
 	list, err := parseList(base)
 	if err != nil {
 		return false, nil, err
 	}
-	for _, m := range list {
-		if m == msg {
-			return false, list, nil
-		}
+	if slices.Contains(list, msg) {
+		return false, list, nil
 	}
-	list = append(list, msg)
-	return true, list, nil
+	return true, append(list, msg), nil
 }
 
-// removeMessage drops msg from the list parsed from base. Returns
-// changed=false if msg isn't in the list.
+// removeMessage drops msg from the list parsed from base and reports
+// whether it was there.
 func removeMessage(base string, msg Message) (bool, messageList, error) {
 	list, err := parseList(base)
 	if err != nil {
@@ -621,11 +437,10 @@ func removeMessage(base string, msg Message) (bool, messageList, error) {
 	return removed, out, nil
 }
 
-// parseList decodes a message list from its JSON serialization. An
-// empty string yields nil ("no writers hold the gate"). A malformed
-// string is an error, NOT an empty list — treating corruption as
-// "no writers" would let RemoveNotReadyKey flip Status=True and
-// release every other writer's drain hold with zero signal.
+// parseList decodes a writer list from its JSON form. An empty string is
+// the empty list. A malformed string is an error, never the empty list: read
+// as "no writer holds the gate", it would let a release write the gate True
+// and release every other writer's hold.
 func parseList(raw string) (messageList, error) {
 	if raw == "" {
 		return nil, nil
@@ -637,27 +452,19 @@ func parseList(raw string) (messageList, error) {
 	return list, nil
 }
 
-// messageList is a sortable slice of Messages. Stored in a stable
-// order so the serialized form is deterministic — operators
-// inspecting `kubectl get pod -o yaml` see the same list across
-// reconciles when nothing changed.
+// messageList is the writers holding a gate. Its serialized form is sorted
+// by userAgent, then key, so the stored message is the same across passes
+// when nothing changed.
 type messageList []Message
 
-func (l messageList) Len() int      { return len(l) }
-func (l messageList) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
-func (l messageList) Less(i, j int) bool {
-	if l[i].UserAgent == l[j].UserAgent {
-		return l[i].Key < l[j].Key
-	}
-	return l[i].UserAgent < l[j].UserAgent
-}
-
-// dump serializes the list in stable {UserAgent, Key} sort order.
+// dump serializes the list in its sorted order; an empty list is "".
 func (l messageList) dump() string {
 	if len(l) == 0 {
 		return ""
 	}
-	sort.Sort(l)
+	slices.SortFunc(l, func(a, b Message) int {
+		return cmp.Or(strings.Compare(a.UserAgent, b.UserAgent), strings.Compare(a.Key, b.Key))
+	})
 	raw, _ := json.Marshal(l)
 	return string(raw)
 }
@@ -671,17 +478,9 @@ const NodeNotReadyReason = "NodeNotReady"
 // ReadyRevokedByNode reports whether the node lifecycle controller revoked
 // the pod's Ready condition: Ready is False under NodeNotReadyReason. The
 // kubelet is not reporting, so ContainersReady and the serving gate keep
-// their last values and prove nothing about the pod; a Ready condition
-// the kubelet has merely not folded the gate into yet carries no such
-// reason.
+// their last values and prove nothing about the pod; a Ready condition the
+// kubelet has merely not folded the gate into yet carries no such reason.
 func ReadyRevokedByNode(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionFalse && c.Reason == NodeNotReadyReason
-		}
-	}
-	return false
+	cond := findCondition(pod, corev1.PodReady)
+	return cond != nil && cond.Status == corev1.ConditionFalse && cond.Reason == NodeNotReadyReason
 }

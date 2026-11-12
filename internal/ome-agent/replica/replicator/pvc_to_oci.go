@@ -5,34 +5,19 @@ import (
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
 	"sigs.k8s.io/ome/pkg/logging"
-	"sigs.k8s.io/ome/pkg/ociobjectstore"
 )
 
 type PVCToOCIReplicator struct {
 	Logger           logging.Interface
-	Config           PVCToOCIReplicatorConfig
+	Dependencies     Dependencies
 	ReplicationInput common.ReplicationInput
-}
-
-type PVCToOCIReplicatorConfig struct {
-	LocalPath      string
-	NumConnections int
-	ChecksumConfig *common.ChecksumConfig
-	OCIOSDataStore *ociobjectstore.OCIOSDataStore
 }
 
 func (r *PVCToOCIReplicator) Replicate(objects []common.ReplicationObject) error {
 	r.Logger.Info("Starting replication to target")
 
-	sourceDirPath := filepath.Join(r.Config.LocalPath, r.ReplicationInput.Source.Prefix)
-	if err := uploadDirectoryToOCIOSDataStoreFunc(
-		r.Config.OCIOSDataStore,
-		r.ReplicationInput.Target,
-		sourceDirPath,
-		r.Config.ChecksumConfig,
-		len(objects),
-		r.Config.NumConnections,
-	); err != nil {
+	sourceDirPath := filepath.Join(r.Dependencies.LocalPath, r.ReplicationInput.Source.Prefix)
+	if err := uploadDirectory(r.Dependencies, r.ReplicationInput.Target, sourceDirPath, len(objects)); err != nil {
 		r.Logger.Errorf("Failed to upload files under %s to OCI Object Storage %v: %v", sourceDirPath, r.ReplicationInput.Target, err)
 		return err
 	}

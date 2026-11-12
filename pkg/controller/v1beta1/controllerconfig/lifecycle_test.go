@@ -802,6 +802,48 @@ func TestLifecycleConfig_ToGangDomainFullGracePeriod(t *testing.T) {
 	}
 }
 
+// TestLifecycleConfig_ToSchedulingRetryPolicy checks the validation contract
+// of the scheduling-retry block: a configured block parses, an absent block
+// yields nil (unconfigured, not an error), and a missing, unparsable or
+// non-positive field is an error the caller treats as unconfigured.
+func TestLifecycleConfig_ToSchedulingRetryPolicy(t *testing.T) {
+	t.Run("configured block parses", func(t *testing.T) {
+		cfg := &SchedulingRetryConfig{After: "5m", MaxAttempts: 2}
+		policy, err := cfg.ToPolicy()
+		require.NoError(t, err)
+		require.NotNil(t, policy)
+		assert.Equal(t, 5*time.Minute, policy.After)
+		assert.Equal(t, int32(2), policy.MaxAttempts)
+	})
+
+	t.Run("nil receiver yields nil, no error", func(t *testing.T) {
+		var cfg *SchedulingRetryConfig
+		policy, err := cfg.ToPolicy()
+		require.NoError(t, err)
+		assert.Nil(t, policy)
+	})
+
+	invalid := []struct {
+		name string
+		cfg  SchedulingRetryConfig
+	}{
+		{"missing after", SchedulingRetryConfig{MaxAttempts: 2}},
+		{"invalid after", SchedulingRetryConfig{After: "soon", MaxAttempts: 2}},
+		{"zero after", SchedulingRetryConfig{After: "0s", MaxAttempts: 2}},
+		{"negative after", SchedulingRetryConfig{After: "-1m", MaxAttempts: 2}},
+		{"missing maxAttempts", SchedulingRetryConfig{After: "5m"}},
+		{"negative maxAttempts", SchedulingRetryConfig{After: "5m", MaxAttempts: -1}},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.cfg
+			policy, err := cfg.ToPolicy()
+			assert.Error(t, err)
+			assert.Nil(t, policy)
+		})
+	}
+}
+
 // TestLifecycleConfig_ToAbandonedReplacementGracePeriod pins the
 // validation contract for the abandoned-replacement grace: a configured
 // duration parses, an absent key yields zero (unconfigured, not an
@@ -1045,6 +1087,17 @@ func TestNewLifecycleConfig_UnschedulableGracePeriod(t *testing.T) {
 	t.Run("lifecycle key without unschedulableGracePeriod yields empty field", func(t *testing.T) {
 		assert.Equal(t, "", load(t, `{}`).UnschedulableGracePeriod)
 	})
+
+	t.Run("schedulingRetry block loads both fields", func(t *testing.T) {
+		cfg := load(t, `{"schedulingRetry":{"after":"5m","maxAttempts":2}}`)
+		require.NotNil(t, cfg.SchedulingRetry)
+		assert.Equal(t, "5m", cfg.SchedulingRetry.After)
+		assert.Equal(t, int32(2), cfg.SchedulingRetry.MaxAttempts)
+	})
+
+	t.Run("lifecycle key without schedulingRetry yields nil block", func(t *testing.T) {
+		assert.Nil(t, load(t, `{}`).SchedulingRetry)
+	})
 }
 
 // TestAutoMigrateConfig_Validate pins the validation contract: the
@@ -1137,6 +1190,15 @@ func TestForceDeleteConfig_ToPolicy(t *testing.T) {
 		require.NotNil(t, policy)
 		assert.Equal(t, 2*time.Minute, policy.OverdueSlack)
 		assert.Equal(t, 5*time.Minute, policy.NodeUnreachableThreshold)
+		assert.False(t, policy.SkipGracePeriodOnUnreachableNode, "the grace period is kept unless the switch is set")
+	})
+
+	t.Run("the grace-period switch carries over", func(t *testing.T) {
+		cfg := &ForceDeleteConfig{OverdueSlack: "2m", NodeUnreachableThreshold: "5m", SkipGracePeriodOnUnreachableNode: true}
+		policy, err := cfg.ToPolicy()
+		require.NoError(t, err)
+		require.NotNil(t, policy)
+		assert.True(t, policy.SkipGracePeriodOnUnreachableNode)
 	})
 
 	invalid := []struct {
@@ -1185,6 +1247,28 @@ func TestNewLifecycleConfig_ForceDelete(t *testing.T) {
 		require.NotNil(t, cfg.ForceDelete)
 		assert.Equal(t, "2m", cfg.ForceDelete.OverdueSlack)
 		assert.Equal(t, "5m", cfg.ForceDelete.NodeUnreachableThreshold)
+		assert.False(t, cfg.ForceDelete.SkipGracePeriodOnUnreachableNode)
+	})
+
+	t.Run("forceDelete block with the grace-period switch", func(t *testing.T) {
+		clientset := fake.NewSimpleClientset()
+		configMap := &v1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      constants.InferenceServiceConfigMapName,
+				Namespace: constants.OMENamespace,
+			},
+			Data: map[string]string{
+				LifecycleConfigName: `{"forceDelete":{"overdueSlack":"2m","nodeUnreachableThreshold":"5m","skipGracePeriodOnUnreachableNode":true}}`,
+			},
+		}
+		_, err := clientset.CoreV1().ConfigMaps(constants.OMENamespace).Create(context.TODO(), configMap, metav1.CreateOptions{})
+		require.NoError(t, err)
+
+		cfg, err := NewLifecycleConfig(clientset)
+		require.NoError(t, err)
+		require.NotNil(t, cfg)
+		require.NotNil(t, cfg.ForceDelete)
+		assert.True(t, cfg.ForceDelete.SkipGracePeriodOnUnreachableNode)
 	})
 
 	t.Run("lifecycle key without forceDelete yields config with nil ForceDelete", func(t *testing.T) {

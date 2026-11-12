@@ -25,7 +25,13 @@ var fixtureTime = irstatustest.Time
 func fixtureTimePlus(d time.Duration) metav1.Time { return irstatustest.TimePlus(d) }
 
 func uniformRows(n int) []v1beta1.OMENativeInstanceStatus { return irstatustest.UniformRows(n) }
-func massFailureRows() []v1beta1.OMENativeInstanceStatus  { return irstatustest.MassFailureRows() }
+func readySinceRows(n int) []v1beta1.OMENativeInstanceStatus {
+	return irstatustest.ReadySinceRows(n)
+}
+func readySinceGangRows(n, podsPerInstance int) []v1beta1.OMENativeInstanceStatus {
+	return irstatustest.ReadySinceGangRows(n, podsPerInstance)
+}
+func massFailureRows() []v1beta1.OMENativeInstanceStatus { return irstatustest.MassFailureRows() }
 func representativeRows(n int) []v1beta1.OMENativeInstanceStatus {
 	return irstatustest.RepresentativeRows(n)
 }

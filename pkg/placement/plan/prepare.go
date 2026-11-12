@@ -110,7 +110,7 @@ func validateFullPolicy(name string, policy *v1beta1.PlacementHomePolicy, pauseS
 		return fmt.Errorf("cluster %q: %w", name, err)
 	}
 	if pauseSurge {
-		if _, err := protocol.ValidatePositiveReplicaFloors(policy.ReplicaFloors); err != nil {
+		if err := protocol.ValidatePositiveReplicaFloors(policy.ReplicaFloors); err != nil {
 			return fmt.Errorf("cluster %q: %w", name, err)
 		}
 	}
@@ -254,7 +254,7 @@ func normalizeComponentMatches(assignment *v1beta1.CandidateAllocationStatus) er
 	slices.SortFunc(assignment.ComponentMatches, func(a, b v1beta1.ComponentAffinityMatch) int { return cmp.Compare(a.Component, b.Component) })
 	for i := range assignment.ComponentMatches {
 		match := &assignment.ComponentMatches[i]
-		if match.Component != v1beta1.EngineComponent && match.Component != v1beta1.DecoderComponent && match.Component != v1beta1.RouterComponent {
+		if !placementComponent(match.Component) {
 			return fmt.Errorf("component match names unsupported component %q", match.Component)
 		}
 		if i > 0 && match.Component == assignment.ComponentMatches[i-1].Component {
@@ -270,6 +270,16 @@ func normalizeComponentMatches(assignment *v1beta1.CandidateAllocationStatus) er
 	return nil
 }
 
+// placementComponent reports a component a plan can match: the engine, the
+// decoder or the router.
+func placementComponent(component v1beta1.ComponentType) bool {
+	return component == v1beta1.EngineComponent || component == v1beta1.DecoderComponent || component == v1beta1.RouterComponent
+}
+
+// normalizeCapacity checks one cluster's capacity sample and puts its lists
+// in canonical order: the demand contract carries the sample's fingerprint,
+// every pool is identified and from the one report, no resource and flavor
+// repeats, and the sample's replica count is the smallest pool quotient.
 func normalizeCapacity(sample *v1beta1.PlacementCapacitySample) error {
 	if sample.DemandFingerprint == "" || sample.Replicas < 0 || len(sample.Pools) == 0 {
 		return fmt.Errorf("capacity requires a demand fingerprint, nonnegative replicas, and pool evidence")
@@ -283,23 +293,18 @@ func normalizeCapacity(sample *v1beta1.PlacementCapacitySample) error {
 	slices.SortFunc(sample.DemandContract.Components, func(a, b v1beta1.PlacementComponentDemand) int {
 		return cmp.Compare(a.Component, b.Component)
 	})
-	slices.SortFunc(sample.Pools, func(a, b v1beta1.PlacementCapacityPool) int {
-		if a.ResourceName != b.ResourceName {
-			return cmp.Compare(a.ResourceName, b.ResourceName)
-		}
-		return cmp.Compare(a.ResourceFlavor, b.ResourceFlavor)
-	})
+	slices.SortFunc(sample.Pools, comparePools)
 	capacity := int64(math.MaxInt64)
+	first := &sample.Pools[0]
 	for i := range sample.Pools {
 		pool := &sample.Pools[i]
-		if pool.ResourceName == "" || pool.ResourceFlavor == "" || pool.Demand <= 0 || pool.Allocatable < 0 || pool.ReportUID == "" || pool.ReportResourceVersion == "" || pool.ObservedAt.IsZero() || !pool.Attribution.Complete || pool.Attribution.FlavorUID == "" || pool.Attribution.FlavorSetHash == "" {
+		if !poolIdentified(pool) {
 			return fmt.Errorf("capacity pool requires identified hardware, demand, and complete attribution")
 		}
-		if i > 0 && pool.ResourceName == sample.Pools[i-1].ResourceName && pool.ResourceFlavor == sample.Pools[i-1].ResourceFlavor {
+		if i > 0 && comparePools(*pool, sample.Pools[i-1]) == 0 {
 			return fmt.Errorf("capacity contains duplicate resource/flavor evidence")
 		}
-		first := sample.Pools[0]
-		if pool.ReportUID != first.ReportUID || pool.ReportResourceVersion != first.ReportResourceVersion || pool.Attribution.FlavorSetHash != first.Attribution.FlavorSetHash {
+		if !sameReport(pool, first) {
 			return fmt.Errorf("capacity pools must belong to one report and attribution mapping")
 		}
 		if len(pool.Attribution.NodeLabels) == 0 {
@@ -313,7 +318,27 @@ func normalizeCapacity(sample *v1beta1.PlacementCapacitySample) error {
 	return nil
 }
 
-// CanonicalCapacity validates evidence and its rendering contract on an owned
+// comparePools orders pools by resource name, then by flavor.
+func comparePools(a, b v1beta1.PlacementCapacityPool) int {
+	return cmp.Or(cmp.Compare(a.ResourceName, b.ResourceName), cmp.Compare(a.ResourceFlavor, b.ResourceFlavor))
+}
+
+// poolIdentified reports a pool that names its hardware, carries a positive
+// demand and a nonnegative allocatable count, comes from an identified and
+// dated report, and has a complete attribution with its flavor identity.
+func poolIdentified(pool *v1beta1.PlacementCapacityPool) bool {
+	return pool.ResourceName != "" && pool.ResourceFlavor != "" &&
+		pool.Demand > 0 && pool.Allocatable >= 0 &&
+		pool.ReportUID != "" && pool.ReportResourceVersion != "" && !pool.ObservedAt.IsZero() &&
+		pool.Attribution.Complete && pool.Attribution.FlavorUID != "" && pool.Attribution.FlavorSetHash != ""
+}
+
+// sameReport reports two pools from one report and one attribution mapping.
+func sameReport(a, b *v1beta1.PlacementCapacityPool) bool {
+	return a.ReportUID == b.ReportUID && a.ReportResourceVersion == b.ReportResourceVersion && a.Attribution.FlavorSetHash == b.Attribution.FlavorSetHash
+}
+
+// CanonicalCapacity checks a capacity sample and its rendering contract on an owned
 // copy. Stable list ordering makes equivalent observations share plan identity.
 func CanonicalCapacity(sample *v1beta1.PlacementCapacitySample) (*v1beta1.PlacementCapacitySample, error) {
 	if sample == nil {
@@ -326,8 +351,10 @@ func CanonicalCapacity(sample *v1beta1.PlacementCapacitySample) (*v1beta1.Placem
 	return out, nil
 }
 
-// identity removes report liveness data, retaining the hardware, source report
-// incarnation, and demand mapping that actually determine an allocation.
+// identity is the part of a placement status that decides the plan ID: each
+// cluster's allocation with its hardware, report UID and demand mapping. The
+// report's liveness fields, the plan's own ID and revision, and the serving
+// state are left out.
 func identity(status *v1beta1.PlacementStatus) *v1beta1.PlacementStatus {
 	out := status.DeepCopy()
 	out.Cluster, out.Phase, out.Endpoint = "", "", nil
@@ -335,10 +362,9 @@ func identity(status *v1beta1.PlacementStatus) *v1beta1.PlacementStatus {
 	for i := range out.Candidates {
 		candidate := &out.Candidates[i]
 		*candidate = v1beta1.CandidatePlacement{Cluster: candidate.Cluster, Allocation: candidate.Allocation}
-		// The plan ID ignores MinWeight because, when present, it equals Weight,
-		// and plans stored without it keep their ID. When Weight is removed,
-		// identity() must hash MinWeight under the "weight" key, or every stored
-		// plan's ID changes.
+		// The plan ID leaves MinWeight out: when present it equals Weight, whose
+		// key the digest already carries, and plans stored before MinWeight
+		// existed keep their ID.
 		if candidate.Allocation != nil {
 			clearMinWeight(candidate.Allocation)
 		}
@@ -371,6 +397,8 @@ func WithoutMinWeight(a v1beta1.CandidateAllocationStatus) v1beta1.CandidateAllo
 	return *out
 }
 
+// equivalent reports whether proposed decides the same allocation as a
+// stored plan that has a revision, liveness fields aside.
 func equivalent(stored, proposed *v1beta1.PlacementStatus) bool {
 	if stored == nil || stored.Plan == nil || stored.Plan.Revision <= 0 {
 		return false

@@ -1,7 +1,9 @@
 package tree
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -94,15 +96,6 @@ func (vs Violations) Error() string {
 	return fmt.Sprintf("%d invariants violated: %s", len(vs), strings.Join(parts, "; "))
 }
 
-// OrNil returns vs as an error, or a nil error when empty. It exists because a
-// non-nil error interface holding an empty slice is the classic Go trap.
-func (vs Violations) OrNil() error {
-	if len(vs) == 0 {
-		return nil
-	}
-	return vs
-}
-
 // For returns the violations attributed to one node. Note this answers "what is
 // wrong with this node", not "what did writing this node break" — for the
 // latter, see Diff.
@@ -119,14 +112,10 @@ func (vs Violations) For(node string) Violations {
 // Primary returns the violation to report as a node's condition reason: the
 // highest-precedence one. Zero value when vs is empty.
 func (vs Violations) Primary() Violation {
-	var best Violation
-	first := true
-	for _, v := range vs {
-		if first || rankOf(v.Reason) < rankOf(best.Reason) {
-			best, first = v, false
-		}
+	if len(vs) == 0 {
+		return Violation{}
 	}
-	return best
+	return slices.MinFunc(vs, func(a, b Violation) int { return cmp.Compare(rankOf(a.Reason), rankOf(b.Reason)) })
 }
 
 // Diff returns the violations present in vs but absent from before, compared by
@@ -178,14 +167,8 @@ func (vs Violations) Nodes() []string {
 }
 
 func (vs Violations) sorted() Violations {
-	sort.SliceStable(vs, func(i, j int) bool {
-		if vs[i].Node != vs[j].Node {
-			return vs[i].Node < vs[j].Node
-		}
-		if ri, rj := rankOf(vs[i].Reason), rankOf(vs[j].Reason); ri != rj {
-			return ri < rj
-		}
-		return vs[i].Subject < vs[j].Subject
+	slices.SortStableFunc(vs, func(a, b Violation) int {
+		return cmp.Or(strings.Compare(a.Node, b.Node), cmp.Compare(rankOf(a.Reason), rankOf(b.Reason)), strings.Compare(a.Subject, b.Subject))
 	})
 	return vs
 }

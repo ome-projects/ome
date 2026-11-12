@@ -698,8 +698,8 @@ func TestComputeSurgeBudgetWithRatio_UsesServingPodsBaseline(t *testing.T) {
 			RatioTolerancePercent: &tol,
 		},
 	}
-	// Live state: 4 engine + 2 decoder pods, all serving, NO surge
-	// pods yet (NewRevisionPods=0). With Original={4, 2} and tol=25%
+	// Live state: both members rolling, 4 engine + 2 decoder pods, all
+	// serving, NO surge pods yet (NewRevisionPods=0). With Original={4, 2} and tol=25%
 	// the band is [1.5, 2.5]. A +1 engine surge against ServingPods
 	// projects to 5/2=2.5 — at the boundary, in band → ALLOW.
 	obs := GroupObservation{
@@ -707,6 +707,7 @@ func TestComputeSurgeBudgetWithRatio_UsesServingPodsBaseline(t *testing.T) {
 		Components: map[v1beta1.ComponentType]ComponentObservation{
 			v1beta1.EngineComponent: {
 				Component:       v1beta1.EngineComponent,
+				RolloutInFlight: true,
 				DesiredReplicas: 4,
 				TotalPods:       4,
 				ReadyPods:       4,
@@ -715,6 +716,7 @@ func TestComputeSurgeBudgetWithRatio_UsesServingPodsBaseline(t *testing.T) {
 			},
 			v1beta1.DecoderComponent: {
 				Component:       v1beta1.DecoderComponent,
+				RolloutInFlight: true,
 				DesiredReplicas: 2,
 				TotalPods:       2,
 				ReadyPods:       2,
@@ -745,7 +747,7 @@ func TestComputeSurgeBudgetWithRatio_UsesServingPodsBaseline(t *testing.T) {
 // zeroed even though the live cluster ratio sits in band. This test
 // exists as a tripwire — re-introducing the NewPods fallback (e.g.,
 // by reverting the ServingPods population in buildComponentObservation)
-// would break this test alongside the BlueGreen+RatioBalanced KIND specs.
+// would break this test alongside the cluster-level suite.
 func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) {
 	tol := int32(25)
 	g := ResolvedGroup{
@@ -757,13 +759,14 @@ func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) 
 			RatioTolerancePercent: &tol,
 		},
 	}
-	// Same fleet, but ServingPods left at zero — the {0, 0} shape a
-	// NewPods-based baseline would see at rollout start.
+	// Same fleet, both members rolling, but ServingPods left at zero — the
+	// {0, 0} shape a NewPods-based baseline would see at rollout start.
 	obs := GroupObservation{
 		Group: g,
 		Components: map[v1beta1.ComponentType]ComponentObservation{
 			v1beta1.EngineComponent: {
 				Component:       v1beta1.EngineComponent,
+				RolloutInFlight: true,
 				DesiredReplicas: 4,
 				TotalPods:       4,
 				ReadyPods:       4,
@@ -772,6 +775,7 @@ func TestComputeSurgeBudgetWithRatio_NewPodsBaselineWouldDeadlock(t *testing.T) 
 			},
 			v1beta1.DecoderComponent: {
 				Component:       v1beta1.DecoderComponent,
+				RolloutInFlight: true,
 				DesiredReplicas: 2,
 				TotalPods:       2,
 				ReadyPods:       2,
@@ -1104,6 +1108,9 @@ func TestComputeTransition_PhaseFollowsTheMembersFromEveryState(t *testing.T) {
 		{name: "waiting-member-joining-the-roll-reads-surging", obs: groupOf(bg, rollingTo(engine, 3, 1, 0), rollingTo(decoder, 2, 0, 0)), want: surging},
 		{name: "waiting-further-new-pod-keeps-waiting", obs: groupOf(bg, rollingTo(engine, 4, 2, 0), settled(decoder)), want: waiting},
 		{name: "waiting-new-pods-all-gone-reads-surging", obs: groupOf(bg, rollingTo(engine, 2, 0, 0), settled(decoder)), want: surging},
+		// The new-revision counts are the replica's updated rows, so the pods of two rebuilt
+		// Instances disappearing while their rows keep the target leaves the group Waiting.
+		{name: "waiting-new-pods-gone-while-their-rows-keep-the-target-keeps-waiting", obs: groupOf(bg, edited(rollingTo(engine, 2, 2, 0), func(m *ComponentObservation) { m.TotalPods, m.ReadyPods, m.ServingPods = 0, 0, 0 }), settled(decoder)), want: waiting},
 		{name: "waiting-old-capacity-lost-keeps-waiting", obs: groupOf(bg, edited(rollingTo(engine, 3, 1, 0), func(m *ComponentObservation) { m.ReadyPods, m.ServingPods = 0, 0 }), settled(decoder)), want: waiting},
 		{name: "waiting-old-pods-gone-keeps-waiting", obs: groupOf(bg, rollingTo(engine, 1, 1, 0), settled(decoder)), want: waiting},
 		{name: "waiting-dark-settled-member-keeps-waiting", obs: groupOf(bg, rollingTo(engine, 3, 1, 0), darkened(settled(decoder))), want: waiting},
@@ -1122,6 +1129,9 @@ func TestComputeTransition_PhaseFollowsTheMembersFromEveryState(t *testing.T) {
 		{name: "shifting-another-ready-pod-keeps-shifting", obs: groupOf(bg, rollingTo(engine, 4, 2, 2), settled(decoder)), want: shift},
 		{name: "shifting-new-pod-unready-reads-waiting", obs: groupOf(bg, rollingTo(engine, 4, 2, 1), settled(decoder)), want: waiting},
 		{name: "shifting-new-pods-all-gone-reads-surging", obs: groupOf(bg, rollingTo(engine, 2, 0, 0), settled(decoder)), want: surging},
+		{name: "shifting-new-pods-gone-while-their-rows-keep-the-target-reads-waiting", obs: groupOf(bg, edited(rollingTo(engine, 4, 2, 2), func(m *ComponentObservation) {
+			m.TotalPods, m.ReadyPods, m.ServingPods, m.NewRevisionReadyPods = 2, 2, 2, 0
+		}), settled(decoder)), want: waiting},
 		{name: "shifting-old-capacity-lost-keeps-shifting", obs: groupOf(bg, edited(rollingTo(engine, 4, 2, 2), func(m *ComponentObservation) { m.ReadyPods, m.ServingPods = 2, 2 }), settled(decoder)), want: shift},
 		// a failed surge replacement is a live pod that never serves beside the old pod it was to
 		// replace: the counters of Instances on the target stand, and the old pods keep the phase
@@ -1143,6 +1153,9 @@ func TestComputeTransition_PhaseFollowsTheMembersFromEveryState(t *testing.T) {
 		{name: "scalingdown-another-ready-pod-keeps-scalingdown", obs: groupOf(bg, rollingTo(engine, 2, 2, 2), settled(decoder)), want: scaling},
 		{name: "scalingdown-new-pod-unready-reads-waiting", obs: groupOf(bg, rollingTo(engine, 2, 2, 1), settled(decoder)), want: waiting},
 		{name: "scalingdown-new-pods-all-gone-reads-surging", obs: groupOf(bg, rollingTo(engine, 0, 0, 0), settled(decoder)), want: surging},
+		{name: "scalingdown-new-pods-gone-while-their-rows-keep-the-target-reads-waiting", obs: groupOf(bg, edited(rollingTo(engine, 2, 2, 2), func(m *ComponentObservation) {
+			m.TotalPods, m.ReadyPods, m.ServingPods, m.NewRevisionReadyPods = 0, 0, 0, 0
+		}), settled(decoder)), want: waiting},
 		{name: "scalingdown-dark-settled-member-reads-waiting", obs: groupOf(bg, rollingTo(engine, 2, 2, 2), darkened(settled(decoder))), want: waiting},
 		{name: "scalingdown-under-rollingupdate-reads-shifting", obs: groupOf(ru, rollingTo(engine, 2, 2, 2), settled(decoder)), want: shift},
 		// RollingUpdate between two batches: old pods still serve beside the promoted ones. The

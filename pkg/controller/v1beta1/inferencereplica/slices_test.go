@@ -683,7 +683,7 @@ func TestSliceReleaseDeferredIsReported(t *testing.T) {
 // a failed delete is.
 func TestRecoverLostSlices(t *testing.T) {
 	ctx := context.Background()
-	if err := (&Reconciler{}).recoverLostSlices(ctx, nil, workloadtypes.ReconcileInput{}, nil); err != nil {
+	if err := (&Reconciler{}).recoverLostSlices(ctx, nil, nil, workloadtypes.ReconcileInput{}, nil); err != nil {
 		t.Fatalf("a nil pass must recover nothing: %v", err)
 	}
 	failPodDeletes := func(err error) func(*Reconciler, client.WithWatch) {
@@ -799,7 +799,7 @@ func TestRecoverLostSlices(t *testing.T) {
 			}
 			before := irStatusMetric(t, "ome_tpu_slice_lost_total", lostSeries)
 
-			err = r.recoverLostSlices(ctx, ir, workloadtypes.ReconcileInput{OwnerObject: ir}, &slicePass{p: p})
+			err = r.recoverLostSlices(ctx, r.Client, ir, workloadtypes.ReconcileInput{OwnerObject: ir}, &slicePass{p: p})
 			if tc.wantErr == "" && err != nil || tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
 				t.Fatalf("recoverLostSlices error = %v, want %q", err, tc.wantErr)
 			}

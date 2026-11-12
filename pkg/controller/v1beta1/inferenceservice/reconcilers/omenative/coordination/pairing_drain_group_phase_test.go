@@ -56,6 +56,10 @@ type drainPicture struct {
 	// paused sets the pause annotation the coordination pass reads ahead
 	// of every member fact.
 	paused bool
+	// rollingUpdate reads the phase under a rollingUpdate group instead of
+	// a blueGreen one; admission lets a pairing-protocol change roll under
+	// either, as long as the one group lists both sides.
+	rollingUpdate bool
 }
 
 // drainHash names the revision hash a pairing protocol was minted under:
@@ -170,12 +174,16 @@ func drainObjects(p drainPicture) []client.Object {
 }
 
 // drainGroupPhase is the phase the coordination pass computes for the
-// picture under a blueGreen group, the only group kind admission lets a
-// pairing-protocol change roll in: each side's counters as its replica
-// publishes them and its pods counted per revision, as the pass lists them.
+// picture under a blueGreen group, or a rollingUpdate group when the picture
+// asks for one: each side's counters as its replica publishes them and its
+// pods counted per revision, as the pass lists them.
 func drainGroupPhase(p drainPicture) v1beta1.CoordinationPhase {
+	policy := v1beta1.CoordinationPolicyBlueGreen
+	if p.rollingUpdate {
+		policy = v1beta1.CoordinationPolicyRollingUpdate
+	}
 	obs := GroupObservation{
-		Group:        ResolvedGroup{Name: "0", Policy: v1beta1.CoordinationPolicyBlueGreen, Components: pairingComponents},
+		Group:        ResolvedGroup{Name: "0", Policy: policy, Components: pairingComponents},
 		Components:   map[v1beta1.ComponentType]ComponentObservation{},
 		PausedGlobal: p.paused,
 	}
@@ -220,7 +228,8 @@ func repeat(n int, inst drainInstance) []drainInstance {
 //     second decode's old pod is the last partner of the three old prefill,
 //     while the first new prefill still waits to leave its own old pod behind
 //     (Surging), while one promoted prefill is not Ready (Waiting), and while
-//     every new pod is Ready (Shifting).
+//     every new pod is Ready (Shifting; the same picture under a rollingUpdate
+//     group, the step between two batches, reads ScalingDown).
 //   - lastPair: the pod is the last keeping any serving engine and decoder
 //     pair serving. A second protocol change lands while the first is half
 //     done: the decode's replacement on the middle protocol is the only
@@ -271,6 +280,13 @@ func TestEvaluatePairingDrain_HoldsWhateverPhaseTheGroupReads(t *testing.T) {
 		p.paused = true
 		return p
 	}
+	// The gate's words for a drain that would leave a side under its
+	// pairable minimum.
+	belowMinimum := "below its floor"
+	rolling := func(p drainPicture) drainPicture {
+		p.rollingUpdate = true
+		return p
+	}
 
 	cases := []struct {
 		name    string
@@ -287,7 +303,7 @@ func TestEvaluatePairingDrain_HoldsWhateverPhaseTheGroupReads(t *testing.T) {
 		{
 			name:    "Surging/belowMinimum",
 			picture: sixTwo(append([]drainInstance{replacementServing}, repeat(5, oldServing)...), []drainInstance{newServing, replacementServing}),
-			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseSurging, reason: "below its floor",
+			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseSurging, reason: belowMinimum,
 		},
 		{
 			name:    "Surging/lastPair",
@@ -302,7 +318,7 @@ func TestEvaluatePairingDrain_HoldsWhateverPhaseTheGroupReads(t *testing.T) {
 		{
 			name:    "Waiting/belowMinimum",
 			picture: sixTwo(append([]drainInstance{newServing, newServing, newUnready}, repeat(3, oldServing)...), []drainInstance{newServing, replacementServing}),
-			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseWaiting, reason: "below its floor",
+			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseWaiting, reason: belowMinimum,
 		},
 		{
 			name: "Waiting/lastPair",
@@ -314,7 +330,12 @@ func TestEvaluatePairingDrain_HoldsWhateverPhaseTheGroupReads(t *testing.T) {
 		{
 			name:    "Shifting/belowMinimum",
 			picture: sixTwo(append(repeat(3, newServing), repeat(3, oldServing)...), []drainInstance{newServing, replacementServing}),
-			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseShifting, reason: "below its floor",
+			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseShifting, reason: belowMinimum,
+		},
+		{
+			name:    "ScalingDown/belowMinimum",
+			picture: rolling(sixTwo(append(repeat(3, newServing), repeat(3, oldServing)...), []drainInstance{newServing, replacementServing})),
+			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseScalingDown, reason: belowMinimum,
 		},
 		{
 			name:    "Failed/noPartner",
@@ -324,7 +345,7 @@ func TestEvaluatePairingDrain_HoldsWhateverPhaseTheGroupReads(t *testing.T) {
 		{
 			name:    "Failed/belowMinimum",
 			picture: sixTwo(append(append([]drainInstance{replacementServing}, repeat(4, oldServing)...), spent), []drainInstance{newServing, replacementServing}),
-			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseFailed, reason: "below its floor",
+			leaving: "llama-decoder-1-default-0", phase: v1beta1.CoordinationPhaseFailed, reason: belowMinimum,
 		},
 		{
 			name:    "Failed/lastPair",

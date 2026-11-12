@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
@@ -49,7 +50,7 @@ func applyAndDecode(t *testing.T, sr *v1beta1.ServingRuntime) (*v1beta1.ServingR
 	t.Helper()
 	raw := encodeSR(t, sr)
 	req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Object: runtime.RawExtension{Raw: raw}}}
-	m := &ServingRuntimeMutator{Decoder: newDecoder(t)}
+	m := &ServingRuntimeMutator{Decoder: newDecoder(t), Clientset: fake.NewClientset(shippedConfigMap(t))}
 	resp := m.Handle(context.Background(), req)
 	if !resp.Allowed || len(resp.Patches) == 0 {
 		return sr, resp
@@ -120,9 +121,9 @@ func TestMutator_SglangPD_InjectsEngineDefaults(t *testing.T) {
 	}
 	patched, resp := applyAndDecode(t, sr)
 	g.Expect(resp.Allowed).To(gomega.BeTrue())
-	g.Expect(patched.Spec.EngineConfig.Runner.Image).To(gomega.Equal(sglangEngineImage))
+	g.Expect(patched.Spec.EngineConfig.Runner.Image).To(gomega.Equal(shippedPresets(t)["sglang-pd"].EngineConfig.Runner.Image))
 	g.Expect(patched.Spec.DecoderConfig.Runner.Command).To(gomega.ContainElement("decode"))
-	g.Expect(patched.Spec.RouterConfig.Runner.Image).To(gomega.Equal(sglangRouterImage))
+	g.Expect(patched.Spec.RouterConfig.Runner.Image).To(gomega.Equal(shippedPresets(t)["sglang-pd"].RouterConfig.Runner.Image))
 }
 
 func TestMutator_SglangPD_RuntimeWinsOnCollision(t *testing.T) {
@@ -158,15 +159,16 @@ func TestClusterMutator_SglangPD_InjectsEngineDefaults(t *testing.T) {
 	}
 	raw := encodeCSR(t, csr)
 	req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Object: runtime.RawExtension{Raw: raw}}}
-	m := &ClusterServingRuntimeMutator{Decoder: newDecoder(t)}
+	m := &ClusterServingRuntimeMutator{Decoder: newDecoder(t), Clientset: fake.NewClientset(shippedConfigMap(t))}
 	resp := m.Handle(context.Background(), req)
 	g.Expect(resp.Allowed).To(gomega.BeTrue())
 	g.Expect(resp.Patches).NotTo(gomega.BeEmpty())
 }
 
-func TestKnownPresetNames_Sorted(t *testing.T) {
+func TestPresets_NamesAreSorted(t *testing.T) {
 	g := gomega.NewWithT(t)
-	g.Expect(knownPresetNames()).To(gomega.Equal([]string{"sglang-pd"}))
+	presets := Presets{"vllm": {}, "sglang-pd": {}, "trt": {}}
+	g.Expect(presets.names()).To(gomega.Equal([]string{"sglang-pd", "trt", "vllm"}))
 }
 
 // TestMutator_PreservesUnknownFields verifies the patch never removes
@@ -188,7 +190,7 @@ func TestMutator_PreservesUnknownFields(t *testing.T) {
 	g.Expect(err).To(gomega.BeNil())
 
 	req := admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Object: runtime.RawExtension{Raw: raw}}}
-	m := &ServingRuntimeMutator{Decoder: newDecoder(t)}
+	m := &ServingRuntimeMutator{Decoder: newDecoder(t), Clientset: fake.NewClientset(shippedConfigMap(t))}
 	resp := m.Handle(context.Background(), req)
 	g.Expect(resp.Allowed).To(gomega.BeTrue())
 	g.Expect(resp.Patches).NotTo(gomega.BeEmpty())

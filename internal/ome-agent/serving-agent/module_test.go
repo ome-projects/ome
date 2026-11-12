@@ -77,18 +77,7 @@ func TestModuleProvider(t *testing.T) {
 				ObjectStorageDataStores: mockDataStore,
 			}
 
-			// The provider function from Module (simplified to avoid fx dependencies)
-			sidecar, err := func(v *viper.Viper, params servingSidecarParams) (*ServingSidecar, error) {
-				config, err := NewServingSidecarConfig(
-					WithViper(v),
-					WithAnotherLog(params.AnotherLogger),
-					WithAppParams(params),
-				)
-				if err != nil {
-					return nil, err
-				}
-				return NewServingSidecar(config)
-			}(v, params)
+			sidecar, err := provideServingSidecar(v, params)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -127,11 +116,7 @@ func TestModuleIntegration(t *testing.T) {
 	}
 
 	// Test configuration creation
-	config, err := NewServingSidecarConfig(
-		WithViper(v),
-		WithAnotherLog(mockLogger),
-		WithAppParams(params),
-	)
+	config, err := newConfig(v, params)
 
 	require.NoError(t, err)
 	assert.NotNil(t, config)
@@ -162,11 +147,7 @@ func TestModuleErrorHandling(t *testing.T) {
 	}
 
 	// Test configuration creation
-	config, err := NewServingSidecarConfig(
-		WithViper(v),
-		WithAnotherLog(mockLogger),
-		WithAppParams(params),
-	)
+	config, err := newConfig(v, params)
 
 	require.NoError(t, err)
 	assert.NotNil(t, config)

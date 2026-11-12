@@ -53,73 +53,100 @@ func recycleFailedCreateContainerTarget(
 	row *workload.InstanceStatus,
 	oldPods, surgePods []*corev1.Pod,
 ) (bool, error) {
-	if row == nil || row.Phase != workload.InstancePhaseFailed || row.Operation != nil ||
-		row.LastFailure == nil || row.LastFailure.Reason != createContainerErrorReason ||
-		target == nil || row.TargetRevision == "" || row.TargetRevision != target.Name {
+	if !failedToCreateAContainerToward(row, target) {
 		return false, nil
 	}
-
-	if len(oldPods) != 1 || oldPods[0] == nil {
-		return true, nil
+	if serves, err := sourceServesOn(ctx, deps, oldPods, row.RunningRevision); err != nil || !serves {
+		return true, err
 	}
-	liveSource := &corev1.Pod{}
-	if err := deps.Reader().Get(ctx, client.ObjectKeyFromObject(oldPods[0]), liveSource); err != nil {
-		if apierrors.IsNotFound(err) {
-			return true, nil
-		}
-		return true, fmt.Errorf("read serving source before failed-target cleanup %s/%s: %w", oldPods[0].Namespace, oldPods[0].Name, err)
-	}
-	// Cleanup is safe only while the canonical source is still healthy and in
-	// rotation. A missing or unhealthy source requires operator attention rather
-	// than another automatic target recycle.
-	if liveSource.DeletionTimestamp != nil || !podreadiness.ReadyAndServing(liveSource) {
-		return true, nil
-	}
-	sourceRev := query.RevisionFromName(row.RunningRevision)
-	activePodRev := query.RevisionFromPod(liveSource)
-	if sourceRev.IsZero() || activePodRev.IsZero() || !activePodRev.Same(sourceRev) {
-		return true, nil
-	}
-
 	// An empty replacement slot means the earlier delete completed: the roll
 	// opens a fresh attempt and creates the replacement.
 	if len(surgePods) == 0 {
 		return false, nil
 	}
-	if len(surgePods) != 1 {
-		return true, nil
+	pod, holdsRoll, err := failedReplacementOf(ctx, deps, row, surgePods)
+	if pod == nil {
+		return holdsRoll, err
+	}
+	return removeFailedReplacement(ctx, deps, input, inst, pod)
+}
+
+// failedToCreateAContainerToward reports the row this step acts on: a
+// Failed row with no operation whose last failure is a container that
+// could not be created, toward target, the revision the row still names.
+func failedToCreateAContainerToward(row *workload.InstanceStatus, target *appsv1.ControllerRevision) bool {
+	return row != nil && row.Phase == workload.InstancePhaseFailed && row.Operation == nil &&
+		row.LastFailure != nil && row.LastFailure.Reason == createContainerErrorReason &&
+		target != nil && row.TargetRevision != "" && row.TargetRevision == target.Name
+}
+
+// sourceServesOn reports whether the Instance's one source pod, read live,
+// still serves on revision: in rotation, not on its way out, and labelled
+// with the revision's hash. Removing the replacement is safe only then; a
+// missing or unhealthy source needs an operator, not another removal. A
+// source that cannot be read is an error, except one that is gone.
+func sourceServesOn(ctx context.Context, deps workload.Deps, oldPods []*corev1.Pod, revision string) (bool, error) {
+	if len(oldPods) != 1 || oldPods[0] == nil {
+		return false, nil
+	}
+	liveSource := &corev1.Pod{}
+	if err := deps.Reader().Get(ctx, client.ObjectKeyFromObject(oldPods[0]), liveSource); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read serving source before failed-target cleanup %s/%s: %w", oldPods[0].Namespace, oldPods[0].Name, err)
+	}
+	if liveSource.DeletionTimestamp != nil || !podreadiness.ReadyAndServing(liveSource) {
+		return false, nil
+	}
+	sourceRev := query.RevisionFromName(revision)
+	activePodRev := query.RevisionFromPod(liveSource)
+	return !sourceRev.IsZero() && !activePodRev.IsZero() && activePodRev.Same(sourceRev), nil
+}
+
+// failedReplacementOf reads the replacement the surge slot holds, live:
+// the pod to remove when it is the one the row's failure names, on the
+// failed revision, neither serving nor ready, and waiting on the container
+// that could not be created; nil otherwise, with holdsRoll saying whether
+// the roll waits on this Instance (a slot this step cannot read, a pod on
+// its way out, or one the failure does not name) or goes on (a pod of
+// another revision, or one that serves, is ready or waits in another
+// reason). A pod that cannot be read is an error, except one that is gone.
+func failedReplacementOf(ctx context.Context, deps workload.Deps, row *workload.InstanceStatus, surgePods []*corev1.Pod) (pod *corev1.Pod, holdsRoll bool, err error) {
+	if len(surgePods) != 1 || surgePods[0] == nil {
+		return nil, true, nil
 	}
 	observedTarget := surgePods[0]
-	if observedTarget == nil {
-		return true, nil
-	}
-	pod := &corev1.Pod{}
+	pod = &corev1.Pod{}
 	if err := deps.Reader().Get(ctx, client.ObjectKeyFromObject(observedTarget), pod); err != nil {
 		if apierrors.IsNotFound(err) {
-			return true, nil
+			return nil, true, nil
 		}
-		return true, fmt.Errorf("read failed surge target %s/%s: %w", observedTarget.Namespace, observedTarget.Name, err)
+		return nil, true, fmt.Errorf("read failed surge target %s/%s: %w", observedTarget.Namespace, observedTarget.Name, err)
 	}
-	if pod.DeletionTimestamp != nil {
-		return true, nil
-	}
-	if row.LastFailure.PodName != "" && row.LastFailure.PodName != pod.Name {
-		return true, nil
+	if pod.DeletionTimestamp != nil || (row.LastFailure.PodName != "" && row.LastFailure.PodName != pod.Name) {
+		return nil, true, nil
 	}
 	failedRev := query.RevisionFromName(row.TargetRevision)
 	podRev := query.RevisionFromPod(pod)
 	if failedRev.IsZero() || podRev.IsZero() || !podRev.Same(failedRev) {
-		return false, nil
+		return nil, false, nil
 	}
 	if podreadiness.IsServing(pod) || podreadiness.IsPodReady(pod) || !podHasWaitingReason(pod, createContainerErrorReason) {
-		return false, nil
+		return nil, false, nil
 	}
+	return pod, true, nil
+}
 
-	// ExcludedNodes is read from the persisted node exclusions. The failed
-	// pod's node listed there, for the pod's own revision, means the deadline
-	// decision asked for a rebuild elsewhere. Once the exclusion budget is
-	// spent no new node is recorded, and the Instance waits here instead of
-	// churning pods.
+// removeFailedReplacement deletes the failed replacement once the node
+// exclusions the deadline decision persisted name the pod's node for the
+// pod's own revision (the decision asked for a rebuild elsewhere) and the
+// Instance's earlier deletes are seen. The delete goes under the pod's UID
+// and is recorded on the expectations first, and the operator is told.
+// Until the exclusion is recorded, and once the exclusion budget is spent
+// so no new node is recorded, the Instance waits here instead of churning
+// pods.
+func removeFailedReplacement(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, inst workload.InstancePlan, pod *corev1.Pod) (bool, error) {
 	if pod.Spec.NodeName == "" || !exclusionCoversPod(inst.ExcludedNodes, pod) {
 		return true, nil
 	}
@@ -639,8 +666,9 @@ func (s *singlePodSurge) waitForReplacement(ctx context.Context) (bool, error) {
 }
 
 // drainSource takes the source out of rotation once the replacement has
-// held Ready for the availability window and the step may move, then
-// stops the pass until the source has left its routed Service. The step
+// held Ready for the availability window and its routed Service lists it
+// for new traffic, and the step may move, then stops the pass until the
+// source has left its routed Service. The step
 // moves from Surge to SurgeDrain once. At the Surge step the source keeps
 // serving while the Component is paused or the drain gate holds, the one
 // place in the roll where a hold costs the Instance nothing. Past that
@@ -656,6 +684,13 @@ func (s *singlePodSurge) drainSource(ctx context.Context) (bool, error) {
 	}
 	if promotable, wait := query.PodSetPromotable(s.replacementPods, window, s.input.Now()); !promotable {
 		s.input.PromoteWindow.Observe(wait)
+		return true, nil
+	}
+	listed, err := s.replacementListedForTraffic(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !listed {
 		return true, nil
 	}
 	if surgeStepIs(s.input, s.inst.Index, workload.UpdateStepSurge) {
@@ -682,6 +717,39 @@ func (s *singlePodSurge) drainSource(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return !drained, nil
+}
+
+// replacementListedForTraffic reports whether the routed Service of the
+// attempt's revision publishes the replacement as an endpoint eligible for
+// new traffic, or has no Service for it to be published in. The source
+// leaves rotation, and is deleted, only behind a replacement that is
+// listed: the serving gate the kubelet folds into PodReady reaches the
+// Service after a delay of its own, and no request lands on the
+// replacement before then. A Service that exists and does not list the
+// replacement, or lists it as terminating, holds the pass with the source
+// where it stands; the EndpointSlice watch brings the next pass.
+func (s *singlePodSurge) replacementListedForTraffic(ctx context.Context) (bool, error) {
+	for _, pod := range s.replacementPods {
+		serviceName := drainServiceForPod(s.input, s.plan, pod)
+		if serviceName == "" {
+			continue
+		}
+		listed, err := s.drainer.IsPodInRotation(ctx, serviceName, pod)
+		if err != nil {
+			return false, fmt.Errorf("check rotation on surge replacement %s/%s: %w", pod.Namespace, pod.Name, err)
+		}
+		if listed {
+			continue
+		}
+		routesNothing, err := s.drainer.RoutesNothing(ctx, serviceName)
+		if err != nil {
+			return false, fmt.Errorf("check routed Service %s of surge replacement %s/%s: %w", serviceName, pod.Namespace, pod.Name, err)
+		}
+		if !routesNothing {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // deleteSource deletes the source once it has left rotation and ends the
@@ -784,6 +852,23 @@ func liftSurgeDrainHolds(ctx context.Context, deps workload.Deps, idx, activeOrd
 		}
 	}
 	return nil
+}
+
+// RestoreSourceRotation returns the source of a single-pod surge attempt
+// that is ending to rotation: the drain step took it out behind a serving
+// replacement, and an attempt that ends past that step leaves no
+// replacement to serve for it, so the source serves again on the revision
+// it runs while the next attempt, or the operator, decides what comes
+// next. The hold goes before the row is written, so a row that reads
+// Failed never stands over a healthy source nothing routes. Any other
+// attempt took no source out and nothing is written; a source already on
+// its way out is left alone.
+func RestoreSourceRotation(ctx context.Context, deps workload.Deps, row workload.InstanceStatus, pods []*corev1.Pod) error {
+	op := row.Operation
+	if op == nil || op.Type != workload.InstanceOperationUpdate || op.SurgeIndex != nil || !status.SurgeUpdateStep(op.Step) {
+		return nil
+	}
+	return liftSurgeDrainHolds(ctx, deps, row.Index, row.ActiveOrdinal, pods)
 }
 
 // endWithdrawnSurge ends a single-pod surge whose replacement is gone after

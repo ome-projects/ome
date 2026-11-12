@@ -143,3 +143,45 @@ func TestRecoverUnknownPhaseTargets_ReportsTheNextPolicyBoundary(t *testing.T) {
 		t.Errorf("requeue delay: got %v want a positive delay inside the threshold", wait)
 	}
 }
+
+// The sweep over a whole Component holds the Instance whose pod at one of
+// its target names has no report from its kubelet, and only that one: an
+// Instance whose pods all report is passed over without its names being
+// read, and a pod the plan does not ask for, at an ordinal beside the
+// target, holds nothing even when its kubelet stopped reporting.
+func TestRecoverUnknownPhaseInstances_HoldsOnlyAnInstanceWhoseTargetPodStoppedReporting(t *testing.T) {
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+	isvc := fdISVC("llama")
+	runners := []workload.RunnerPlan{{Name: workload.RunnerDefault, Size: 1}}
+	plan := workload.ComponentPlan{Component: workload.ComponentEngine, Replicas: 3, Instances: []workload.InstancePlan{
+		{Index: 0, Incarnation: 1, Runners: runners},
+		{Index: 1, Incarnation: 1, Runners: runners},
+		{Index: 2, Incarnation: 1, Runners: runners},
+	}}
+	reporting := reportedReadyPod(query.PodName(isvc.Name, plan.Component, 0, workload.RunnerDefault, 0))
+	unreportedAtTarget := fdUnknownPod(fdTerminatingPod(query.PodName(isvc.Name, plan.Component, 1, workload.RunnerDefault, 0), "unreachable-node", overdueTS))
+	unreportedAtTarget.DeletionTimestamp = nil
+	unreportedBeside := fdUnknownPod(fdTerminatingPod(query.PodName(isvc.Name, plan.Component, 2, workload.RunnerDefault, 1), "unreachable-node", overdueTS))
+	unreportedBeside.DeletionTimestamp = nil
+	unreportedBeside.UID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0002"
+	c := fdFakeClient(t, &funcs, isvc, reporting, unreportedAtTarget, unreportedBeside, fdNodeUnreachable("unreachable-node", 10*time.Minute))
+	deps := workload.Deps{Client: c, Recorder: record.NewFakeRecorder(16)}
+	input := fdInput(isvc, fdPolicy())
+	input.MutateInstance = func(context.Context, int32, func(*workload.InstanceStatus) bool) error { return nil }
+	byInstance := map[int32][]*corev1.Pod{0: {reporting}, 1: {unreportedAtTarget}, 2: {unreportedBeside}}
+
+	held, at, err := recoverUnknownPhaseInstances(context.Background(), deps, input, plan, byInstance)
+	if err != nil {
+		t.Fatalf("recoverUnknownPhaseInstances: %v", err)
+	}
+	if len(held) != 1 || !held[1] {
+		t.Errorf("held = %v, want Instance 1 alone", held)
+	}
+	if !at.IsZero() {
+		t.Errorf("next moment = %v, want none: the one unreported target was freed this pass", at)
+	}
+	if len(deletes) != 1 || deletes[0].name != unreportedAtTarget.Name {
+		t.Fatalf("deletes = %+v, want the unreported target %s alone", deletes, unreportedAtTarget.Name)
+	}
+}

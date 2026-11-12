@@ -23,8 +23,6 @@ package validation
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -85,57 +83,19 @@ func validateComponentLifecycle(name string, lc *v1beta1.LifecycleSpec) error {
 	return nil
 }
 
-// validateRollingUpdateNotBothZero rejects the unstartable configuration
-// where both MaxSurge and MaxUnavailable are EXPLICITLY set to zero on
-// the same Component's rollingUpdate block. With no surge headroom and
-// no drain headroom the rollout can never make progress — the operator
-// almost certainly mistyped one of the two.
-//
-// This applies to in-place strategies too. An in-place update marks the
-// pod not-ready while it patches the running container, which consumes the
-// per-Component MaxUnavailable budget — so maxUnavailable=0 stalls an
-// in-place roll exactly like a surge/drain one: the patch never starts and
-// the pods sit untouched. Exempting in-place on the premise that it
-// "neither surges nor drains" would be wrong — the mark-not-ready does
-// consume the budget, so an exemption only converts a fail-fast
-// admission error into a silent runtime deadlock.
-//
-// Either field nil (operator left it for the layer below to default)
-// does NOT trip this check; the per-Component layer treats nil as "no
-// cap" and defers to the coordination-group ceiling, which has its
-// own non-zero defaults (25% / 25%). The check only fires when the
-// operator wrote 0 on BOTH knobs intentionally.
-//
-// Mirrors the upstream appsv1.Deployment.Strategy.RollingUpdate
-// validation: see k/k pkg/apis/apps/validation/validation.go
-// ValidateRollingUpdateDeployment.
+// validateRollingUpdateNotBothZero rejects maxSurge and maxUnavailable
+// both set to zero on one Component's rollingUpdate block: with no surge
+// headroom and no drain headroom the rollout can never start. The rule
+// holds for in-place strategies too, because the pod is marked not ready
+// while its container is patched and that consumes maxUnavailable.
+// Either field nil does not trip the rule: nil means "no cap at this
+// layer" and the coordination-group layer's non-zero defaults apply.
+// Both values have passed validateBudgetIntOrString, so a budget that
+// resolves to zero is an explicit zero.
 func validateRollingUpdateNotBothZero(component string, maxSurge, maxUnavailable *intstr.IntOrString) error {
-	if !explicitZero(maxSurge) || !explicitZero(maxUnavailable) {
+	if !budgetResolvesToZero(maxSurge) || !budgetResolvesToZero(maxUnavailable) {
 		return nil
 	}
 	return fmt.Errorf("spec.%s.lifecycle.updateStrategy.rollingUpdate: maxSurge=0 and maxUnavailable=0 together yield an unstartable rollout (%s)",
 		component, ReasonRollingUpdateZeroBudget)
-}
-
-// explicitZero reports whether v is non-nil AND parses to the integer
-// 0 (either intstr.FromInt(0) or "0%"). A nil pointer is NOT explicit
-// — operator left it unset for upstream defaulting. Any positive
-// integer or percent fails the predicate.
-func explicitZero(v *intstr.IntOrString) bool {
-	if v == nil {
-		return false
-	}
-	if v.Type == intstr.Int {
-		return v.IntValue() == 0
-	}
-	s := v.StrVal
-	if !strings.HasSuffix(s, "%") {
-		return false
-	}
-	pctStr := strings.TrimSuffix(s, "%")
-	pct, err := strconv.Atoi(pctStr)
-	if err != nil {
-		return false
-	}
-	return pct == 0
 }

@@ -63,39 +63,160 @@ func TestObservePodGroups_OneListIndexesOwnedAndRetainsForeignNames(t *testing.T
 	}
 }
 
-func TestCachedOwnerHasPodGroups_UsesControllerUIDNotLabels(t *testing.T) {
+// TestObserveCachedPodGroups_ReadsTheOwnersGroupsThroughTheIndex: the
+// cache's inventory holds the groups this owner controls, found through
+// the controller-UID index whatever their labels say, and none of another
+// owner's, even one labelled as this owner's; it is one list and no get,
+// and it says it is the cache's picture.
+func TestObserveCachedPodGroups_ReadsTheOwnersGroupsThroughTheIndex(t *testing.T) {
 	owner := newOwner("prod", "llama")
-	foreignOwner := newOwner("prod", "other")
-	withoutGroups := newOwner("prod", "empty")
+	otherOwner := newOwner("prod", "other")
 	owned := inventoryPodGroup(t, owner, "llama", 7)
 	owned.Labels = nil
-	foreign := inventoryPodGroup(t, foreignOwner, "llama", 8)
-	foreign.Labels = map[string]string{
-		constants.InferenceServicePodLabelKey: withoutGroups.GetName(),
+	labelledAsOurs := inventoryPodGroup(t, otherOwner, "llama", 8)
+	labelledAsOurs.Labels = map[string]string{
+		constants.InferenceServicePodLabelKey: owner.GetName(),
 		constants.OMEComponentLabel:           string(types.ComponentEngine),
 		query.LabelManagedBy:                  query.ManagedByOMENative,
-		query.LabelInstanceIdx:                "7",
+		query.LabelInstanceIdx:                "8",
 	}
-	base := newGangClient(t, owner, foreignOwner, withoutGroups, owned, foreign)
+	base := newGangClient(t, owner, otherOwner, owned, labelledAsOurs)
+	lists := fakeclient.CountingVerb(fakeclient.List).OnKind(&schedulingv1alpha1.PodGroupList{})
+	gets := fakeclient.CountingVerb(fakeclient.Get).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, lists, gets)
 
-	for _, tc := range []struct {
-		name  string
-		owner client.Object
-		want  bool
-	}{
-		{name: "owned despite missing labels", owner: owner, want: true},
-		{name: "foreign owner has its own group", owner: foreignOwner, want: true},
-		{name: "foreign labels do not transfer ownership", owner: withoutGroups, want: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := CachedOwnerHasPodGroups(context.Background(), base, tc.owner)
-			if err != nil {
-				t.Fatalf("CachedOwnerHasPodGroups: %v", err)
-			}
-			if got != tc.want {
-				t.Fatalf("CachedOwnerHasPodGroups = %v, want %v", got, tc.want)
-			}
-		})
+	inv, err := ObserveCachedPodGroups(context.Background(), counting, owner)
+	if err != nil {
+		t.Fatalf("ObserveCachedPodGroups: %v", err)
+	}
+	if lists.Count() != 1 || gets.Count() != 0 {
+		t.Fatalf("inventory reads: lists=%d gets=%d, want exactly one LIST and zero GETs", lists.Count(), gets.Count())
+	}
+	if !inv.Available() || !inv.Cached() || inv.OwnerUID() != owner.GetUID() {
+		t.Fatalf("inventory identity: available=%v cached=%v ownerUID=%q", inv.Available(), inv.Cached(), inv.OwnerUID())
+	}
+	if _, found := inv.OwnedByName(owned.Name); !found {
+		t.Fatalf("the owned group with no labels is missing from the cache's inventory")
+	}
+	if _, found := inv.ByName(labelledAsOurs.Name); found {
+		t.Fatalf("another owner's group labelled as ours is in the cache's inventory; the index reads the controller UID")
+	}
+	if entries := inv.OwnedEntries(); len(entries) != 1 || entries[0].Name != owned.Name {
+		t.Fatalf("owned entries: %+v", entries)
+	}
+}
+
+// TestPodGroupInventory_ReadLiveTakesTheApiserversPicture: a cached
+// inventory that is behind the apiserver, a group created since and
+// another owner's object at one of this owner's names, reads both on
+// ReadLive, once; a second ReadLive lists nothing, and an inventory the
+// apiserver served lists nothing either.
+func TestPodGroupInventory_ReadLiveTakesTheApiserversPicture(t *testing.T) {
+	owner := newOwner("prod", "llama")
+	otherOwner := newOwner("prod", "other")
+	created := inventoryPodGroup(t, owner, "llama", 1)
+	occupied := inventoryPodGroup(t, otherOwner, "llama", 2)
+	cache := newGangClient(t, owner)
+	liveLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&schedulingv1alpha1.PodGroupList{})
+	live := fakeclient.Wrap(t, newGangClient(t, owner, otherOwner, created, occupied), liveLists)
+
+	inv, err := ObserveCachedPodGroups(context.Background(), cache, owner)
+	if err != nil {
+		t.Fatalf("ObserveCachedPodGroups: %v", err)
+	}
+	if _, found := inv.ByName(created.Name); found {
+		t.Fatalf("premise: the cache must not show the group yet")
+	}
+	for round := 1; round <= 2; round++ {
+		if err := inv.ReadLive(context.Background(), live); err != nil {
+			t.Fatalf("ReadLive %d: %v", round, err)
+		}
+	}
+	if liveLists.Count() != 1 {
+		t.Fatalf("ReadLive listed the apiserver %d time(s), want once", liveLists.Count())
+	}
+	if inv.Cached() || !inv.Available() {
+		t.Fatalf("after ReadLive: cached=%v available=%v, want the apiserver's available picture", inv.Cached(), inv.Available())
+	}
+	if _, found := inv.OwnedByName(created.Name); !found {
+		t.Fatalf("the group created since the cache's read is missing after ReadLive")
+	}
+	if pg, found := inv.ByName(occupied.Name); !found || podgroup.ControlledByUID(pg, owner.GetUID()) {
+		t.Fatalf("another owner's object at our name is not retained by name after ReadLive: found=%v", found)
+	}
+	fromLive, err := ObservePodGroups(context.Background(), live, owner)
+	if err != nil {
+		t.Fatalf("ObservePodGroups: %v", err)
+	}
+	before := liveLists.Count()
+	if err := fromLive.ReadLive(context.Background(), live); err != nil || liveLists.Count() != before {
+		t.Fatalf("ReadLive on the apiserver's own picture: err=%v lists=%d, want no list", err, liveLists.Count()-before)
+	}
+}
+
+// TestPodGroupInventory_DeletesRefuseTheCachesPicture: a reset and a
+// finalization through a cached inventory refuse, delete nothing and name
+// the reason; after ReadLive the same calls delete the group.
+func TestPodGroupInventory_DeletesRefuseTheCachesPicture(t *testing.T) {
+	owner := newOwner("prod", "llama")
+	pg := inventoryPodGroup(t, owner, "llama", 4)
+	base := newGangClient(t, owner, pg)
+	deletes := fakeclient.CountingVerb(fakeclient.Delete).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, deletes)
+
+	inv, err := ObserveCachedPodGroups(context.Background(), base, owner)
+	if err != nil {
+		t.Fatalf("ObserveCachedPodGroups: %v", err)
+	}
+	if err := inv.DeleteOwnedName(context.Background(), counting, pg.Name); !errors.Is(err, ErrInventoryCached) {
+		t.Fatalf("DeleteOwnedName on the cache's picture: got %v, want %v", err, ErrInventoryCached)
+	}
+	if _, err := inv.FinalizeOwnedName(context.Background(), counting, pg.Name); !errors.Is(err, ErrInventoryCached) {
+		t.Fatalf("FinalizeOwnedName on the cache's picture: got %v, want %v", err, ErrInventoryCached)
+	}
+	if deletes.Count() != 0 {
+		t.Fatalf("the cache's picture deleted %d group(s), want none", deletes.Count())
+	}
+	if err := inv.ReadLive(context.Background(), base); err != nil {
+		t.Fatalf("ReadLive: %v", err)
+	}
+	if err := inv.DeleteOwnedName(context.Background(), counting, pg.Name); err != nil {
+		t.Fatalf("DeleteOwnedName on the apiserver's picture: %v", err)
+	}
+	if deletes.Count() != 1 || !inv.DeleteAccepted(pg.Name) {
+		t.Fatalf("after ReadLive: deletes=%d accepted=%v, want one accepted delete", deletes.Count(), inv.DeleteAccepted(pg.Name))
+	}
+}
+
+// TestBuildFinalizeInstanceResources_ReadsACachedInventoryLiveFirst: the
+// finalizer built over a cached inventory lists the apiserver once before
+// its first delete, and the deletes that follow in the pass read nothing
+// more.
+func TestBuildFinalizeInstanceResources_ReadsACachedInventoryLiveFirst(t *testing.T) {
+	owner := newOwner("prod", "llama")
+	first := inventoryPodGroup(t, owner, "llama", 5)
+	second := inventoryPodGroup(t, owner, "llama", 6)
+	base := newGangClient(t, owner, first, second)
+	liveLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&schedulingv1alpha1.PodGroupList{})
+	deletes := fakeclient.CountingVerb(fakeclient.Delete).OnKind(&schedulingv1alpha1.PodGroup{})
+	counting := fakeclient.Wrap(t, base, liveLists, deletes)
+
+	inv, err := ObserveCachedPodGroups(context.Background(), base, owner)
+	if err != nil {
+		t.Fatalf("ObserveCachedPodGroups: %v", err)
+	}
+	finalize := BuildFinalizeInstanceResources(counting, counting, inv, owner, "llama", types.ComponentEngine)
+	for _, idx := range []int32{5, 6} {
+		complete, err := finalize(context.Background(), idx)
+		if err != nil {
+			t.Fatalf("finalize %d: %v", idx, err)
+		}
+		if complete {
+			t.Fatalf("finalize %d reported complete on the pass that requested the delete", idx)
+		}
+	}
+	if liveLists.Count() != 1 || deletes.Count() != 2 {
+		t.Fatalf("finalizer over a cached inventory: live lists=%d deletes=%d, want one list and two deletes", liveLists.Count(), deletes.Count())
 	}
 }
 
@@ -125,17 +246,17 @@ func TestPodGroupIndexRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func TestCachedOwnerHasPodGroups_RuntimeAPIRemovalIsSoftFail(t *testing.T) {
+func TestObserveCachedPodGroups_RuntimeAPIRemovalIsSoftFail(t *testing.T) {
 	owner := newOwner("prod", "llama")
 	base := newGangClient(t, owner)
 	reader := fakeclient.Wrap(t, base, fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall,
 		&apimeta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "scheduling.x-k8s.io", Kind: "PodGroup"}}))
-	hasGroups, err := CachedOwnerHasPodGroups(context.Background(), reader, owner)
+	inv, err := ObserveCachedPodGroups(context.Background(), reader, owner)
 	if err != nil {
 		t.Fatalf("runtime API removal must soft-fail: %v", err)
 	}
-	if hasGroups {
-		t.Fatal("runtime API removal reported cached PodGroups")
+	if inv.Available() || !inv.Cached() {
+		t.Fatalf("NoMatch through the cache: available=%v cached=%v, want an unavailable cached inventory", inv.Available(), inv.Cached())
 	}
 }
 
@@ -643,7 +764,7 @@ func countCalls(counters ...*fakeclient.Calls) int {
 func inventoryPodGroup(t *testing.T, owner client.Object, ownerName string, index int32) *schedulingv1alpha1.PodGroup {
 	t.Helper()
 	plan := planFor(types.ComponentEngine, []int32{index}, true, 1, 5*time.Minute)
-	pg, err := podgroup.BuildPodGroup(owner, testOwnerGVK, ownerName, plan, plan.Instances[0])
+	pg, err := podgroup.BuildPodGroup(owner, testOwnerGVK, ownerName, plan, 0, plan.Instances[0])
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}

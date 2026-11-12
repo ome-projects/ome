@@ -9,6 +9,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+// dimsOf lists a topology's dimensions in order.
+func dimsOf(t Topology) []int64 {
+	return append([]int64(nil), t.dims[:t.n]...)
+}
+
 func mustTopology(t *testing.T, s string) Topology {
 	t.Helper()
 	topo, err := ParseTopology(s)
@@ -56,8 +61,8 @@ func TestParseTopology(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseTopology(%q): %v", tt.in, err)
 			}
-			if diff := cmp.Diff(tt.wantDims, got.Dims()); diff != "" {
-				t.Fatalf("Dims() mismatch (-want +got):\n%s", diff)
+			if diff := cmp.Diff(tt.wantDims, dimsOf(got)); diff != "" {
+				t.Fatalf("dimensions mismatch (-want +got):\n%s", diff)
 			}
 			if got.String() != tt.in {
 				t.Fatalf("String() = %q, want round trip of %q", got.String(), tt.in)
@@ -85,8 +90,8 @@ func TestTopologyComparable(t *testing.T) {
 
 func TestZeroTopology(t *testing.T) {
 	var zero Topology
-	if !zero.IsZero() || zero.Chips() != 0 || zero.String() != "" || len(zero.Dims()) != 0 {
-		t.Fatalf("zero Topology = {chips %d, %q, %v}, want empty", zero.Chips(), zero.String(), zero.Dims())
+	if !zero.IsZero() || zero.Chips() != 0 || zero.String() != "" || len(dimsOf(zero)) != 0 {
+		t.Fatalf("zero Topology = {chips %d, %q, %v}, want empty", zero.Chips(), zero.String(), dimsOf(zero))
 	}
 	if _, err := zero.Hosts(4); err == nil {
 		t.Fatal("Hosts on the zero topology returned no error")

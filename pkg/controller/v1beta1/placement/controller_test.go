@@ -126,7 +126,7 @@ func workerWithAdmittedDerived(t *testing.T, s *runtime.Scheme) client.WithWatch
 
 func newPlacer(s *runtime.Scheme, clusters ClusterClients, objs ...client.Object) (*Reconciler, client.Client) {
 	c := fakeclient.NewClientBuilder().WithScheme(s).WithObjects(objs...).WithStatusSubresource(&v1beta1.InferenceService{}).Build()
-	return &Reconciler{Client: c, APIReader: c, Scheme: s, Log: log.Log, Clusters: clusters, Requeue: time.Second}, c
+	return &Reconciler{Client: c, APIReader: c, Log: log.Log, Clusters: clusters, Requeue: time.Second}, c
 }
 
 func req() ctrl.Request {
@@ -1817,7 +1817,7 @@ func TestIsvcsForClusterChange_EnqueuesOnlyMatchingCandidates(t *testing.T) {
 	noReq := srcISVCNamed("noreq")
 
 	c := indexedPlacementClient(t, s, match, noMatch, nameMatch, nameNoMatch, noReq)
-	r := &Reconciler{Client: c, Scheme: s, Log: log.Log}
+	r := &Reconciler{Client: c, Log: log.Log}
 
 	changed := readyWC("b", map[string]string{"gpu": "gb300", "metadata.name": "spoofed"})
 	reqs := r.isvcsForClusterChange(context.Background(), changed)
@@ -1844,7 +1844,7 @@ func TestIsvcsForClusterChange_EnqueuesStatusReferencedClusterOnLabelLoss(t *tes
 		Candidates: []v1beta1.CandidatePlacement{{Cluster: "b", Phase: v1beta1.CandidatePhaseAdmitted}},
 	}
 	c := indexedPlacementClient(t, s, placed)
-	r := &Reconciler{Client: c, Scheme: s, Log: log.Log}
+	r := &Reconciler{Client: c, Log: log.Log}
 
 	// Changed cluster "b" no longer carries gpu=gb300 (label removed).
 	changed := readyWC("b", map[string]string{"gpu": "h100"})
@@ -1901,7 +1901,7 @@ func TestModeOnlyPlacementClusterEvents(t *testing.T) {
 				t.Fatalf("index (-want +got):\n%s", diff)
 			}
 			scheme := testScheme(t)
-			r := &Reconciler{Client: indexedPlacementClient(t, scheme, source), Scheme: scheme, Log: log.Log}
+			r := &Reconciler{Client: indexedPlacementClient(t, scheme, source), Log: log.Log}
 			for _, cluster := range []*v1beta1.WorkloadCluster{
 				readyWC("member-a", map[string]string{"region": "east"}),
 				{ObjectMeta: metav1.ObjectMeta{Name: "member-b"}},

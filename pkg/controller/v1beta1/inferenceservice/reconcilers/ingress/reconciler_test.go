@@ -86,8 +86,13 @@ func TestIngressReconciler_Reconcile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create fake clients
-			fakeClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(tt.isvc))
+			// The Kubernetes Ingress pass names the engine Service's port in
+			// status.url, so the Service stands with a port before the pass.
+			engineService := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: constants.EngineServiceName(tt.isvc.Name), Namespace: tt.isvc.Namespace},
+				Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+			}
+			fakeClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(tt.isvc, engineService))
 			fakeClientset := fake.NewSimpleClientset()
 
 			// Create reconciler

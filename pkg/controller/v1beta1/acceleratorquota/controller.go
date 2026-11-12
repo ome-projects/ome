@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -544,15 +545,17 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, node *tree.Node, froze
 	if equalStatus(current.Status, updated.Status) {
 		return nil
 	}
-	if err := r.Status().Patch(ctx, updated, client.MergeFrom(current)); err != nil {
-		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-			// The node was deleted or rewritten mid-pass; the next reconcile
-			// sees the newer state. Neither is worth failing the pass over.
-			return nil
-		}
+	if err := r.Status().Patch(ctx, updated, client.MergeFrom(current)); err != nil && !goneOrRewritten(err) {
 		return err
 	}
 	return nil
+}
+
+// goneOrRewritten reports a write refused because the node was deleted or
+// rewritten mid-pass. The next reconcile reads the newer object, so neither
+// is worth failing the pass over.
+func goneOrRewritten(err error) bool {
+	return apierrors.IsNotFound(err) || apierrors.IsConflict(err)
 }
 
 // setConditions stamps Ready and Degraded as a mutually exclusive pair, so a
@@ -749,10 +752,8 @@ func fleetBudgets(authored []v1beta1.AcceleratorBudget,
 
 		// The totals come from the roll, which is what carries a leaf's figures
 		// up to the tiers above it.
-		if t, ok := rolled[usage.Key{ResourceName: b.ResourceName, ResourceFlavor: b.ResourceFlavor}]; ok {
-			row.Admitted = t.Admitted.DeepCopy()
-			row.Reserved = t.Reserved.DeepCopy()
-			row.Borrowed = t.Borrowed.DeepCopy()
+		if held, ok := rolled[totalsKey(b)]; ok {
+			setHeldTotals(&row, held)
 		}
 		out = append(out, row)
 	}
@@ -761,19 +762,16 @@ func fleetBudgets(authored []v1beta1.AcceleratorBudget,
 
 // equalPerCluster compares one budget's member rows.
 func equalPerCluster(a, b []v1beta1.AcceleratorClusterBudgetStatus) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Cluster != b[i].Cluster ||
-			a[i].Nominal.Cmp(b[i].Nominal) != 0 ||
-			a[i].Admitted.Cmp(b[i].Admitted) != 0 ||
-			a[i].Reserved.Cmp(b[i].Reserved) != 0 ||
-			a[i].Borrowed.Cmp(b[i].Borrowed) != 0 {
-			return false
-		}
-	}
-	return true
+	return slices.EqualFunc(a, b, sameClusterBudget)
+}
+
+// sameClusterBudget compares one member's row of a budget.
+func sameClusterBudget(x, y v1beta1.AcceleratorClusterBudgetStatus) bool {
+	return x.Cluster == y.Cluster &&
+		x.Nominal.Cmp(y.Nominal) == 0 &&
+		x.Admitted.Cmp(y.Admitted) == 0 &&
+		x.Reserved.Cmp(y.Reserved) == 0 &&
+		x.Borrowed.Cmp(y.Borrowed) == 0
 }
 
 // equalClusters compares the per-member rows, excluding AppliedTime. Including
@@ -781,18 +779,15 @@ func equalPerCluster(a, b []v1beta1.AcceleratorClusterBudgetStatus) bool {
 // the time whether or not anything moved -- and this status is watched, so a
 // write per pass is a reconcile per pass forever.
 func equalClusters(a, b []v1beta1.AcceleratorQuotaClusterStatus) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Cluster != b[i].Cluster ||
-			a[i].AppliedGeneration != b[i].AppliedGeneration ||
-			a[i].MaterializedGeneration != b[i].MaterializedGeneration ||
-			a[i].Message != b[i].Message {
-			return false
-		}
-	}
-	return true
+	return slices.EqualFunc(a, b, sameClusterStatus)
+}
+
+// sameClusterStatus compares one member's row, AppliedTime excluded.
+func sameClusterStatus(x, y v1beta1.AcceleratorQuotaClusterStatus) bool {
+	return x.Cluster == y.Cluster &&
+		x.AppliedGeneration == y.AppliedGeneration &&
+		x.MaterializedGeneration == y.MaterializedGeneration &&
+		x.Message == y.Message
 }
 
 // equalStatus compares the fields this controller owns. Condition timestamps are
@@ -800,41 +795,42 @@ func equalClusters(a, b []v1beta1.AcceleratorQuotaClusterStatus) bool {
 // the status actually flips, so comparing the rest is what makes a no-op pass a
 // genuine no-op.
 func equalStatus(a, b v1beta1.AcceleratorQuotaStatus) bool {
-	if a.ObservedGeneration != b.ObservedGeneration || a.Parent != b.Parent {
-		return false
-	}
-	if a.SourceGeneration != b.SourceGeneration {
-		return false
-	}
+	return a.ObservedGeneration == b.ObservedGeneration && a.Parent == b.Parent &&
+		a.SourceGeneration == b.SourceGeneration &&
+		equalMaterialization(a.Materialization, b.Materialization) &&
+		equalBudgets(a.Budgets, b.Budgets) &&
+		equalClusters(a.Clusters, b.Clusters) &&
+		equalConditions(a.Conditions, b.Conditions)
+}
 
-	if !equalMaterialization(a.Materialization, b.Materialization) {
-		return false
-	}
-	if !equalBudgets(a.Budgets, b.Budgets) {
-		return false
-	}
-	if !equalClusters(a.Clusters, b.Clusters) {
-		return false
-	}
-	for _, condType := range []string{
-		v1beta1.AcceleratorQuotaReady,
-		v1beta1.AcceleratorQuotaDegraded,
-		v1beta1.AcceleratorQuotaMaterialized,
-	} {
-		ca := apimeta.FindStatusCondition(a.Conditions, condType)
-		cb := apimeta.FindStatusCondition(b.Conditions, condType)
-		if ca == nil || cb == nil {
-			if ca != cb {
-				return false
-			}
-			continue
-		}
-		if ca.Status != cb.Status || ca.Reason != cb.Reason || ca.Message != cb.Message ||
-			ca.ObservedGeneration != cb.ObservedGeneration {
+// ownedConditionTypes are the conditions this controller writes, the ones a
+// status comparison reads.
+var ownedConditionTypes = []string{
+	v1beta1.AcceleratorQuotaReady,
+	v1beta1.AcceleratorQuotaDegraded,
+	v1beta1.AcceleratorQuotaMaterialized,
+}
+
+// equalConditions compares the owned conditions of two statuses, the
+// transition time excluded: SetStatusCondition moves it only when the status
+// flips, so the rest decides whether anything changed.
+func equalConditions(a, b []metav1.Condition) bool {
+	for _, condType := range ownedConditionTypes {
+		if !sameCondition(apimeta.FindStatusCondition(a, condType), apimeta.FindStatusCondition(b, condType)) {
 			return false
 		}
 	}
 	return true
+}
+
+// sameCondition compares two readings of one condition: absent on both sides
+// is the same reading, absent on one side is not.
+func sameCondition(x, y *metav1.Condition) bool {
+	if x == nil || y == nil {
+		return x == y
+	}
+	return x.Status == y.Status && x.Reason == y.Reason && x.Message == y.Message &&
+		x.ObservedGeneration == y.ObservedGeneration
 }
 
 // SetupWithManager wires the reconciler to watch AcceleratorQuotas.

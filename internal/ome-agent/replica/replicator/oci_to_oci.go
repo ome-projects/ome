@@ -1,11 +1,9 @@
 package replicator
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
@@ -16,125 +14,80 @@ import (
 
 type OCIToOCIReplicator struct {
 	Logger           logging.Interface
-	Config           OCIToOCIReplicatorConfig
+	Dependencies     Dependencies
 	ReplicationInput common.ReplicationInput
-}
 
-type OCIToOCIReplicatorConfig struct {
-	LocalPath            string
-	NumConnections       int
-	ChecksumConfig       *common.ChecksumConfig
-	SourceOCIOSDataStore *ociobjectstore.OCIOSDataStore
-	TargetOCIOSDataStore *ociobjectstore.OCIOSDataStore
-}
-
-type ReplicationResult struct {
-	source ociobjectstore.ObjectURI
-	target ociobjectstore.ObjectURI
-	error  error
+	// checksumLimiter caps how many checksums are computed at the same time; Replicate
+	// sizes it from the checksum config before the workers start.
+	checksumLimiter chan struct{}
 }
 
 func (r *OCIToOCIReplicator) Replicate(objects []common.ReplicationObject) error {
 	r.Logger.Info("Starting replication to target")
-
-	startTime := time.Now()
-	objChan := PrepareObjectChannel(objects)
-	resultChan := make(chan *ReplicationResult, len(objects))
-	checksumLimiter := newChecksumLimiter(r.Config.ChecksumConfig)
-
-	var wg sync.WaitGroup
-	for i := 0; i < r.Config.NumConnections; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			r.processObjectReplication(objChan, resultChan, checksumLimiter)
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	successCount, errorCount := 0, 0
-	for result := range resultChan {
-		if result.error != nil {
-			errorCount++
-			r.Logger.Errorf("Replication failed for %+v to %+v: %v", result.source, result.target, result.error)
-		} else {
-			successCount++
-			r.Logger.Infof("Replication succeeded for %+v to %+v", result.source, result.target)
-		}
-		LogProgress(successCount, errorCount, len(objects), startTime, r.Logger)
-	}
-
-	r.Logger.Infof("Replication completed with %d successes and %d errors in %v", successCount, errorCount, time.Since(startTime))
-	if errorCount > 0 {
-		return fmt.Errorf("%d/%d replications failed", errorCount, len(objects))
+	r.checksumLimiter = newChecksumLimiter(r.Dependencies.Checksum)
+	if err := replicateInParallel(objects, r.Dependencies.Connections, r, r.Logger); err != nil {
+		return err
 	}
 
 	// Cleanup
-	if err := os.RemoveAll(filepath.Join(r.Config.LocalPath, ReplicaWorkspacePath)); err != nil {
-		r.Logger.Warnf("Failed to clean up the temp local directory %s: %v", filepath.Join(r.Config.LocalPath, ReplicaWorkspacePath), err)
+	if err := os.RemoveAll(filepath.Join(r.Dependencies.LocalPath, ReplicaWorkspacePath)); err != nil {
+		r.Logger.Warnf("Failed to clean up the temp local directory %s: %v", filepath.Join(r.Dependencies.LocalPath, ReplicaWorkspacePath), err)
 	}
 	return nil
 }
 
-func (r *OCIToOCIReplicator) processObjectReplication(
-	objects <-chan common.ReplicationObject,
-	results chan<- *ReplicationResult,
-	checksumLimiter chan struct{},
-) {
-	for obj := range objects {
-		// Skip directories
-		if strings.HasSuffix(obj.GetName(), "/") {
-			continue
-		}
-
-		// Set up result object
-		srcObj := ociobjectstore.ObjectURI{
-			Namespace:  r.ReplicationInput.Source.Namespace,
-			BucketName: r.ReplicationInput.Source.BucketName,
-			ObjectName: obj.GetName(),
-		}
-		targetObj := r.getTargetObjectURI(obj.GetName())
-		result := ReplicationResult{
-			source: srcObj,
-			target: targetObj,
-		}
-
-		// Download
-		downloadStart := time.Now()
-		tempDirPath := filepath.Join(r.Config.LocalPath, ReplicaWorkspacePath)
-		err := downloadObjectFunc(r.Config.SourceOCIOSDataStore, srcObj, tempDirPath)
-		downloadDuration := time.Since(downloadStart)
-		if err != nil {
-			result.error = err
-			results <- &result
-			continue
-		}
-		r.Logger.Infof("Downloaded object %s in %v", srcObj.ObjectName, downloadDuration)
-
-		// Set up checksum as metadata
-		uploadedFilePath := filepath.Join(tempDirPath, obj.GetName())
-		targetObj.Metadata = getObjectMetadataWithChecksumLimit(
-			r.Config.ChecksumConfig,
-			uploadedFilePath,
-			r.Logger,
-			checksumLimiter,
-		)
-
-		// Upload
-		uploadStart := time.Now()
-		err = uploadObjectToOCIOSDataStoreFunc(r.Config.TargetOCIOSDataStore, targetObj, uploadedFilePath)
-		uploadDuration := time.Since(uploadStart)
-		if err != nil {
-			result.error = err
-		} else {
-			r.Logger.Infof("Uploaded object to %s in %v", targetObj.ObjectName, uploadDuration)
-		}
-		results <- &result
+// copyObject downloads one object into the workspace and uploads it to the target, with its
+// checksum as metadata.
+func (r *OCIToOCIReplicator) copyObject(object common.ReplicationObject) ReplicationResult {
+	srcObj := ociobjectstore.ObjectURI{
+		Namespace:  r.ReplicationInput.Source.Namespace,
+		BucketName: r.ReplicationInput.Source.BucketName,
+		ObjectName: object.GetName(),
 	}
+	targetObj := r.getTargetObjectURI(object.GetName())
+	result := ReplicationResult{
+		source: srcObj,
+		target: targetObj,
+	}
+
+	// Download
+	downloadStart := time.Now()
+	tempDirPath := filepath.Join(r.Dependencies.LocalPath, ReplicaWorkspacePath)
+	err := r.Dependencies.Transfer.Download(r.Dependencies.SourceStore, srcObj, tempDirPath)
+	downloadDuration := time.Since(downloadStart)
+	if err != nil {
+		result.error = err
+		return result
+	}
+	r.Logger.Infof("Downloaded object %s in %v", srcObj.ObjectName, downloadDuration)
+
+	// Set up checksum as metadata
+	uploadedFilePath := filepath.Join(tempDirPath, object.GetName())
+	targetObj.Metadata = getObjectMetadataWithChecksumLimit(
+		r.Dependencies.Checksum,
+		uploadedFilePath,
+		r.Logger,
+		r.checksumLimiter,
+	)
+
+	// Upload
+	uploadStart := time.Now()
+	err = r.Dependencies.Transfer.Upload(r.Dependencies.TargetStore, targetObj, uploadedFilePath)
+	uploadDuration := time.Since(uploadStart)
+	if err != nil {
+		result.error = err
+	} else {
+		r.Logger.Infof("Uploaded object to %s in %v", targetObj.ObjectName, uploadDuration)
+	}
+	return result
+}
+
+func (r *OCIToOCIReplicator) logOutcome(result ReplicationResult) {
+	if result.error != nil {
+		r.Logger.Errorf("Replication failed for %+v to %+v: %v", result.source, result.target, result.error)
+		return
+	}
+	r.Logger.Infof("Replication succeeded for %+v to %+v", result.source, result.target)
 }
 
 func (r *OCIToOCIReplicator) getTargetObjectURI(objName string) ociobjectstore.ObjectURI {

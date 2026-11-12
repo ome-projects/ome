@@ -82,8 +82,9 @@ var controlPlaneOnlyAnnotations = []string{
 	constants.RolloutPlanSourceAnnotation,
 }
 
-// controlPlaneOnlyAnnotationPrefixes are the bookkeeping families of whatever
-// deploys the SOURCE object. A derived copy belongs to the placer.
+// controlPlaneOnlyAnnotationPrefixes are annotation families only the control
+// plane reads. The first is the bookkeeping of whatever deploys the SOURCE
+// object. A derived copy belongs to the placer.
 //
 // The hazard is ownership, not rollout: ArgoCD reads tracking-id to decide
 // which application owns a resource, so copying the source's reassigns the
@@ -93,6 +94,11 @@ var controlPlaneOnlyAnnotations = []string{
 //
 // A prefix, not the one key: ArgoCD also writes sync-options, compare-options
 // and sync-wave, equally meaningless on a derived object.
+//
+// The second is the routing publisher options: they configure how the control
+// plane's TrafficMap publisher publishes the service, and a member publishes
+// nothing.
 var controlPlaneOnlyAnnotationPrefixes = []string{
 	"argocd.argoproj.io/",
+	constants.RoutingPublisherOptionAnnotationPrefix,
 }

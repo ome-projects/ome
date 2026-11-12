@@ -10,9 +10,10 @@ import (
 
 // ParseExtraEndpoints returns the additional PodMonitor scrape endpoints from
 // the prometheus.ome.io/extra-endpoints annotation (comma-separated
-// "portName:path"), to be appended to the default /metrics endpoint. Malformed
-// entries are skipped with a warning so a bad annotation never fails reconcile.
-func ParseExtraEndpoints(annotations map[string]string) []monitoringv1.PodMetricsEndpoint {
+// "portName:path"), each scraped every interval, to be appended after OME's
+// own endpoint. Malformed entries are skipped with a warning so a bad
+// annotation never fails reconcile.
+func ParseExtraEndpoints(annotations map[string]string, interval monitoringv1.Duration) []monitoringv1.PodMetricsEndpoint {
 	raw := strings.TrimSpace(annotations[constants.ExtraPodMetricsEndpointsAnnotationKey])
 	if raw == "" {
 		return nil
@@ -32,7 +33,7 @@ func ParseExtraEndpoints(annotations map[string]string) []monitoringv1.PodMetric
 			continue
 		}
 		portName := name // new var each iteration -> distinct pointer
-		out = append(out, monitoringv1.PodMetricsEndpoint{Port: &portName, Path: path, Interval: "10s"})
+		out = append(out, monitoringv1.PodMetricsEndpoint{Port: &portName, Path: path, Interval: interval})
 	}
 	return out
 }

@@ -13,12 +13,11 @@ const (
 // Multiple terms form a union; weights assign replica shares to each match.
 // +kubebuilder:validation:XValidation:rule="(has(self.matchExpressions) && size(self.matchExpressions) > 0) || (has(self.matchFields) && size(self.matchFields) > 0)",message="a cluster affinity term must contain a requirement"
 type ClusterAffinityTerm struct {
-	// Weights sets each component's replica weight on the clusters this term
-	// matches, and is permitted only for static Split. If any term gives a
-	// component a weight, the weights of matching terms add and a term that
-	// gives none contributes one. Weights are ratios, so they have no upper bound.
-	// With no weights on any term, every matched cluster weighs one and routers
-	// are divided, as a default weight of one on every term would.
+	// Weights sets each component's replica ratio on the clusters this term
+	// matches, and is permitted only for static Split without a split block.
+	// If any term gives a component a ratio, the ratios of matching terms add
+	// and a term that gives none contributes {min: 1, max: 1}. With no weights
+	// on any term, every matched cluster weighs one and routers are divided.
 	// +optional
 	Weights *ClusterAffinityWeights `json:"weights,omitempty"`
 
@@ -52,56 +51,33 @@ type ClusterSelectorRequirement struct {
 	Values []string `json:"values,omitempty"`
 }
 
-// ClusterAffinityWeights holds one term's weight per component. The engine
-// takes engine, then default. The decoder takes decoder, then default, then
-// the engine's weight. The router takes router, then default, then the
-// engine's weight. Routers are divided across clusters unless the terms set
-// weights that name only the engine or decoder; then every cluster runs the
-// full router policy. The integer keys and the *Replicas ratio keys are two
-// forms of the same weights; one placement uses only one form.
+// ClusterAffinityWeights holds one term's replica ratio per component. The
+// engine takes engine, then default. The decoder takes decoder, then default,
+// then the engine's ratio. The router takes router, then default, then the
+// engine's ratio. Routers are divided across clusters unless the terms name
+// only the engine or decoder; then every cluster runs the full router policy.
 // +kubebuilder:validation:MinProperties=1
 type ClusterAffinityWeights struct {
-	// Default is the weight of every component this term does not name.
+	// Default is the ratio of every component this term does not name.
 	// Setting it on any term divides router.minReplicas across the clusters,
 	// as router does.
 	// +optional
-	// +kubebuilder:validation:Minimum=1
-	Default *int32 `json:"default,omitempty"`
+	Default *ReplicaRatio `json:"default,omitempty"`
 
-	// Engine is the engine's weight.
+	// Engine is the engine's ratio.
 	// +optional
-	// +kubebuilder:validation:Minimum=1
-	Engine *int32 `json:"engine,omitempty"`
+	Engine *ReplicaRatio `json:"engine,omitempty"`
 
-	// Decoder is the decoder's weight.
+	// Decoder is the decoder's ratio.
 	// +optional
-	// +kubebuilder:validation:Minimum=1
-	Decoder *int32 `json:"decoder,omitempty"`
+	Decoder *ReplicaRatio `json:"decoder,omitempty"`
 
-	// Router is the router's weight. Setting it or default on any term divides
+	// Router is the router's ratio. Setting it or default on any term divides
 	// router.minReplicas across the clusters, as setting no weights does;
-	// weights that name only the engine or decoder keep the full router policy
+	// ratios that name only the engine or decoder keep the full router policy
 	// on every cluster.
 	// +optional
-	// +kubebuilder:validation:Minimum=1
-	Router *int32 `json:"router,omitempty"`
-
-	// DefaultReplicas is the ratio form of default. It applies to every
-	// component this term does not name.
-	// +optional
-	DefaultReplicas *ReplicaRatio `json:"defaultReplicas,omitempty"`
-
-	// EngineReplicas is the ratio form of engine.
-	// +optional
-	EngineReplicas *ReplicaRatio `json:"engineReplicas,omitempty"`
-
-	// DecoderReplicas is the ratio form of decoder.
-	// +optional
-	DecoderReplicas *ReplicaRatio `json:"decoderReplicas,omitempty"`
-
-	// RouterReplicas is the ratio form of router.
-	// +optional
-	RouterReplicas *ReplicaRatio `json:"routerReplicas,omitempty"`
+	Router *ReplicaRatio `json:"router,omitempty"`
 }
 
 // ReplicaRatio gives a cluster's share of a component's minimum and maximum

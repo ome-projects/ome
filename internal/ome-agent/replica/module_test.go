@@ -1,7 +1,6 @@
 package replica
 
 import (
-	"fmt"
 	"testing"
 
 	"sigs.k8s.io/ome/pkg/xet"
@@ -146,24 +145,7 @@ func TestModuleProvider(t *testing.T) {
 			v := tt.setupViper()
 			params := tt.setupParams()
 
-			// The provider function from Module (simplified to avoid fx dependencies)
-			agent, err := func(v *viper.Viper, params replicaParams) (*ReplicaAgent, error) {
-				config, err := NewReplicaConfig(
-					WithViper(v),
-					WithAnotherLog(params.AnotherLogger),
-					WithAppParams(params),
-				)
-				if err != nil {
-					return nil, err
-				}
-
-				// This is the new config.Validate() call that was added
-				if err = config.Validate(); err != nil {
-					return nil, fmt.Errorf("error validating replica config: %+v", err)
-				}
-
-				return NewReplicaAgent(config)
-			}(v, params)
+			agent, err := provideReplicaAgent(v, params)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -227,11 +209,7 @@ func TestModuleIntegration(t *testing.T) {
 		HubClient:          mockHubClient,
 	}
 
-	config, err := NewReplicaConfig(
-		WithViper(v),
-		WithAnotherLog(mockLogger),
-		WithAppParams(params),
-	)
+	config, err := newConfig(v, params)
 
 	require.NoError(t, err)
 	assert.NotNil(t, config)
@@ -300,22 +278,7 @@ func TestModuleProviderSpecificErrors(t *testing.T) {
 				AnotherLogger: mockLogger,
 			}
 
-			_, err := func(v *viper.Viper, params replicaParams) (*ReplicaAgent, error) {
-				config, err := NewReplicaConfig(
-					WithViper(v),
-					WithAnotherLog(params.AnotherLogger),
-					WithAppParams(params),
-				)
-				if err != nil {
-					return nil, err
-				}
-
-				if err = config.Validate(); err != nil {
-					return nil, fmt.Errorf("error validating replica config: %+v", err)
-				}
-
-				return NewReplicaAgent(config)
-			}(v, params)
+			_, err := provideReplicaAgent(v, params)
 
 			assert.Error(t, err)
 			assert.Contains(t, err.Error(), tt.expectedError)
@@ -338,22 +301,7 @@ func TestModuleWithNilDependencies(t *testing.T) {
 	}
 
 	// This should not panic and should handle nil dependencies
-	agent, err := func(v *viper.Viper, params replicaParams) (*ReplicaAgent, error) {
-		config, err := NewReplicaConfig(
-			WithViper(v),
-			WithAnotherLog(params.AnotherLogger),
-			WithAppParams(params),
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		if err = config.Validate(); err != nil {
-			return nil, fmt.Errorf("error validating replica config: %+v", err)
-		}
-
-		return NewReplicaAgent(config)
-	}(v, params)
+	agent, err := provideReplicaAgent(v, params)
 
 	// Should fail because HuggingFace source requires HubClient
 	assert.Error(t, err)

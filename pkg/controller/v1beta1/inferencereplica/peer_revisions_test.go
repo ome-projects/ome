@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 // pdParent is a PD parent ISVC with one blueGreen group spanning engine and
@@ -318,25 +319,48 @@ func TestResolvePeerRevisions_FreshnessFollowsTheTemplatesNotTheGeneration(t *te
 	}
 }
 
-// A metadata-only annotation written on the InferenceService reaches the
-// runner template of every projected replica, so each value the writer sets
-// advances every replica's generation without changing any revision. This
-// file drives the real replica pass over a 4:4 prefill/decode roll under
-// RecreatePod while such a writer runs, with and without a rollout group, and
-// counts the passes each roll needs and what held them.
+// A writer that patches an annotation on the InferenceService twice a second
+// must cost a roll nothing, with or without a rollout group. This file drives
+// the real replica pass over a 4:4 prefill/decode roll under RecreatePod while
+// such a writer runs and counts the passes each roll needs, what held them,
+// how many status publications were refused and how many generations moved.
 //
-// The writer and the projector are stand-ins: a tick rewrites the template
-// annotation on every replica and advances its generation, which is what the
-// projector's merge patch does on a live apiserver. The kubelet and the
+// The writer and the projector are stand-ins. A service annotation lands on
+// every replica what the production render puts in a pod template for a key
+// no Component declares (render.TemplateObjectMeta), and a replica whose
+// spec did not change is not written. A second kind of tick is a spec write
+// outside the pod templates (a count or a pacing field the projector
+// writes again): the generation advances and the templates stand, which is the
+// churn the peer freshness readers must tolerate. The kubelet and the
 // endpoint controller are stand-ins too: a pod becomes ContainersReady one
 // round after it appears, PodReady once the serving gate is open, and its
 // EndpointSlice follows PodReady. The gates, the status writers, the peer
 // freshness hold and the engine are production code.
 
 // churnWriterKey is the annotation the competing writer sets on the service;
-// the projector carries it into every runner template and lists it among the
-// keys the revision hash leaves out.
+// the projector lists it among the keys the revision hash leaves out, and the
+// render keeps it off every runner template.
 const churnWriterKey = "editor.example.com/write-counter"
+
+// churnWrite is what one tick of the competing writer changes.
+type churnWrite int
+
+const (
+	// churnWriteServiceAnnotation patches an annotation on the service that
+	// no Component declares; the replicas receive what the production render
+	// puts in a pod template for it.
+	churnWriteServiceAnnotation churnWrite = iota
+	// churnWriteOutsideTemplates is a spec write that changes no pod template:
+	// the generation advances and the templates stand.
+	churnWriteOutsideTemplates
+)
+
+// serviceAnnotationOnTemplate is what the production render puts in a pod
+// template for the writer's key at value: the template rule of
+// render.TemplateObjectMeta over a component that declares nothing.
+func serviceAnnotationOnTemplate(value string) map[string]string {
+	return render.TemplateObjectMeta(metav1.ObjectMeta{Annotations: map[string]string{churnWriterKey: value}}, nil).Annotations
+}
 
 type churnShape struct {
 	name       string
@@ -349,7 +373,8 @@ type churnShape struct {
 }
 
 type churnRegime struct {
-	name string
+	name  string
+	write churnWrite
 	// period is the writer's period in model time; 0 means no writer.
 	period time.Duration
 	// longPass is the model duration of a pass that writes, drains, promotes
@@ -359,9 +384,9 @@ type churnRegime struct {
 }
 
 type churnOutcome struct {
-	rounds, passes, held, refused, writes int
-	heldByKey                             map[string]int
-	done                                  bool
+	rounds, passes, held, refused, writes, generationMoves int
+	heldByKey                                              map[string]int
+	done                                                   bool
 }
 
 // churnModel owns the fake apiserver, the three stand-ins and the model
@@ -396,12 +421,14 @@ type churnModel struct {
 
 // TestGroupedRollUnderServiceAnnotationChurn measures a 4:4 RecreatePod roll
 // under a writer that rewrites a service annotation twice a second, with and
-// without a rollout group. The writer changes no pod template, so a peer's
-// status stays current for the roll target it records and no pass may be
-// held on it: with or without a group, the roll takes the same passes with
-// the writer as without it. A pass that spans a writer tick still has its
-// status publication refused, which costs nothing, because the engine's own
-// writes land.
+// without a rollout group, and under a spec write outside the pod templates
+// at the same cadence. The service annotation reaches no pod template, so it
+// moves no generation and the roll takes exactly the passes it takes without
+// the writer. The spec write moves the generation and changes no template, so
+// a peer's status stays current for the roll target it records and no pass
+// may be held on it: with or without a group, the roll takes the same passes
+// as without the writer, and a pass that spans a tick keeps its status
+// publication, since the spec changed in nothing the pass read.
 func TestGroupedRollUnderServiceAnnotationChurn(t *testing.T) {
 	shapes := []churnShape{
 		{name: "no-group", grouped: false},
@@ -412,8 +439,10 @@ func TestGroupedRollUnderServiceAnnotationChurn(t *testing.T) {
 	}
 	regimes := []churnRegime{
 		{name: "writer-off", period: 0, longPass: 250 * time.Millisecond, shortPass: 50 * time.Millisecond},
-		{name: "writer-500ms-long-pass-250ms", period: 500 * time.Millisecond, longPass: 250 * time.Millisecond, shortPass: 50 * time.Millisecond},
-		{name: "writer-500ms-long-pass-600ms", period: 500 * time.Millisecond, longPass: 600 * time.Millisecond, shortPass: 50 * time.Millisecond},
+		{name: "service-annotation-500ms-long-pass-250ms", write: churnWriteServiceAnnotation, period: 500 * time.Millisecond, longPass: 250 * time.Millisecond, shortPass: 50 * time.Millisecond},
+		{name: "service-annotation-500ms-long-pass-600ms", write: churnWriteServiceAnnotation, period: 500 * time.Millisecond, longPass: 600 * time.Millisecond, shortPass: 50 * time.Millisecond},
+		{name: "spec-write-outside-templates-500ms-long-pass-250ms", write: churnWriteOutsideTemplates, period: 500 * time.Millisecond, longPass: 250 * time.Millisecond, shortPass: 50 * time.Millisecond},
+		{name: "spec-write-outside-templates-500ms-long-pass-600ms", write: churnWriteOutsideTemplates, period: 500 * time.Millisecond, longPass: 600 * time.Millisecond, shortPass: 50 * time.Millisecond},
 	}
 	const maxRounds = 300
 
@@ -426,8 +455,8 @@ func TestGroupedRollUnderServiceAnnotationChurn(t *testing.T) {
 				m.push()
 				out := m.run(maxRounds)
 				results[name] = out
-				t.Logf("%s: done=%v rounds=%d passes=%d held-at-peer-check=%d refused-publications=%d writer-ticks=%d held-by-replica=%v",
-					name, out.done, out.rounds, out.passes, out.held, out.refused, out.writes, out.heldByKey)
+				t.Logf("%s: done=%v rounds=%d passes=%d held-at-peer-check=%d refused-publications=%d writer-ticks=%d generation-moves=%d held-by-replica=%v",
+					name, out.done, out.rounds, out.passes, out.held, out.refused, out.writes, out.generationMoves, out.heldByKey)
 				t.Logf("%s: first passes: %s", name, strings.Join(m.trace, " "))
 			})
 		}
@@ -444,9 +473,8 @@ func TestGroupedRollUnderServiceAnnotationChurn(t *testing.T) {
 				regime.name, got.held, got.passes, baseline.passes, got.done)
 		}
 	}
-	// A metadata-only annotation on the service changes no pod, so a grouped
-	// roll must take the same passes with the writer as without it, as the
-	// ungrouped roll does.
+	// Neither tick changes a pod, so a grouped roll must take the same passes
+	// with the writer as without it, as the ungrouped roll does.
 	for _, shape := range shapes[1:] {
 		own := results[shape.name+"/writer-off"]
 		if !own.done {
@@ -463,6 +491,22 @@ func TestGroupedRollUnderServiceAnnotationChurn(t *testing.T) {
 			if got.passes > own.passes*11/10 {
 				t.Errorf("%s: the writer slowed the roll from %d to %d passes (held at the peer check=%d, refused publications=%d)",
 					name, own.passes, got.passes, got.held, got.refused)
+			}
+		}
+	}
+	// A service annotation no Component declares lands nothing on a replica:
+	// no generation moves and the roll takes exactly the passes it takes
+	// without the writer.
+	for _, shape := range shapes {
+		own := results[shape.name+"/writer-off"]
+		for _, regime := range regimes {
+			if regime.period == 0 || regime.write != churnWriteServiceAnnotation {
+				continue
+			}
+			got := results[shape.name+"/"+regime.name]
+			if got.generationMoves != 0 || got.passes != own.passes {
+				t.Errorf("%s/%s: the service annotation moved %d generation(s) and the roll took %d passes against %d without the writer",
+					shape.name, regime.name, got.generationMoves, got.passes, own.passes)
 			}
 		}
 	}
@@ -623,7 +667,7 @@ func churnReplica(component v1beta1.ComponentType, replicas int32) *v1beta1.Infe
 	}
 	ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] = "1"
 	ir.Annotations[constants.RevisionExcludedAnnotationKeysAnnotationKey] = churnWriterKey
-	ir.Spec.Runners[0].Template.Annotations = map[string]string{churnWriterKey: "0"}
+	ir.Spec.Runners[0].Template.Annotations = serviceAnnotationOnTemplate("0")
 	writeTemplateHash(ir)
 	return ir
 }
@@ -692,9 +736,10 @@ func (m *churnModel) push() {
 	}
 }
 
-// applyWrite is one tick of the writer as the projector lands it: the
-// template annotation of every replica carries the new value and every
-// replica's generation advances.
+// applyWrite is one tick of the writer as the projector lands it. A service
+// annotation lands what the production render keeps of it in the template,
+// and a replica whose spec did not change is not written; a spec write
+// outside the templates advances the generation with the templates standing.
 func (m *churnModel) applyWrite(cl client.Client) {
 	m.writeSeq++
 	m.out.writes++
@@ -703,18 +748,41 @@ func (m *churnModel) applyWrite(cl client.Client) {
 		if err := cl.Get(m.ctx, key, ir); err != nil {
 			m.t.Fatalf("writer tick: get %s: %v", key.Name, err)
 		}
-		for i := range ir.Spec.Runners {
-			if ir.Spec.Runners[i].Template.Annotations == nil {
-				ir.Spec.Runners[i].Template.Annotations = map[string]string{}
-			}
-			ir.Spec.Runners[i].Template.Annotations[churnWriterKey] = strconv.Itoa(m.writeSeq)
+		if m.regime.write == churnWriteServiceAnnotation && !m.landServiceAnnotation(ir) {
+			continue
 		}
 		writeTemplateHash(ir)
 		ir.Generation++
+		m.out.generationMoves++
 		if err := cl.Update(m.ctx, ir); err != nil {
 			m.t.Fatalf("writer tick: update %s: %v", key.Name, err)
 		}
 	}
+}
+
+// landServiceAnnotation sets every runner template of ir to what the render
+// keeps of the writer's current value and reports whether any template
+// changed.
+func (m *churnModel) landServiceAnnotation(ir *v1beta1.InferenceReplica) bool {
+	value, kept := serviceAnnotationOnTemplate(strconv.Itoa(m.writeSeq))[churnWriterKey]
+	changed := false
+	for i := range ir.Spec.Runners {
+		annotations := ir.Spec.Runners[i].Template.Annotations
+		if had, ok := annotations[churnWriterKey]; ok == kept && had == value {
+			continue
+		}
+		if annotations == nil {
+			annotations = map[string]string{}
+			ir.Spec.Runners[i].Template.Annotations = annotations
+		}
+		if kept {
+			annotations[churnWriterKey] = value
+		} else {
+			delete(annotations, churnWriterKey)
+		}
+		changed = true
+	}
+	return changed
 }
 
 func (m *churnModel) run(maxRounds int) churnOutcome {

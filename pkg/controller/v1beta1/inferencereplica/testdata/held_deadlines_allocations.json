@@ -1,0 +1,25 @@
+{
+  "recordedOn": {
+    "date": "2026-11-05",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The deadline step at the end of one pass over a replica at rest (reconcileHeldDeadlines): every Instance Ready on the spec revision with no operation open and no move record open, so the step has no clock to stop or start. The step converts only the rows with an operation open to the engine's row shape, the rows a clock can run under, and reads nothing when no row has one and no move record is open: 0 allocations and 0 bytes at every shape. Before, it converted every row twice before it read one: 8,025 allocations and 1.8 MB per pass at 4,000 Instances, 2,013 and 461 KB at 1,000, 331 at 160 gangs of eight, 1,011 at 500 gangs of eight, 3,463 and 774 KB at 1,725 gangs of two. The live reads of the replica are exact and none: a replica with no clock to move is neither read live nor written.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/160x8/allocations": 0,
+    "gang/160x8/bytes": 0,
+    "gang/160x8/replica-live-reads": 0,
+    "gang/1725x2/allocations": 0,
+    "gang/1725x2/bytes": 0,
+    "gang/1725x2/replica-live-reads": 0,
+    "gang/500x8/allocations": 0,
+    "gang/500x8/bytes": 0,
+    "gang/500x8/replica-live-reads": 0,
+    "readySince/1000/allocations": 0,
+    "readySince/1000/bytes": 0,
+    "readySince/1000/replica-live-reads": 0,
+    "readySince/4000/allocations": 0,
+    "readySince/4000/bytes": 0,
+    "readySince/4000/replica-live-reads": 0
+  }
+}

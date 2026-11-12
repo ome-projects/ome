@@ -65,7 +65,7 @@ func (s *defaultSelector) SelectRuntime(ctx context.Context, model *v1beta1.Base
 		"namespace", namespace,
 		"candidates", len(evaluated.matches))
 
-	return &best.RuntimeSelection, nil
+	return &best, nil
 }
 
 func (s *defaultSelector) GetCompatibleRuntimes(ctx context.Context, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, namespace string) ([]RuntimeMatch, error) {
@@ -170,7 +170,6 @@ func (s *defaultSelector) ValidateRuntime(ctx context.Context, runtimeName strin
 	return &RuntimeCompatibilityError{
 		RuntimeName: runtimeName,
 		ModelName:   getModelName(model),
-		ModelFormat: model.ModelFormat.Name,
 		Reason:      report.IncompatibilityReasons[0],
 	}
 }
@@ -217,15 +216,7 @@ func (s *defaultSelector) evaluateRuntime(ctx context.Context, spec *v1beta1.Ser
 		return nil, report
 	}
 
-	return &RuntimeMatch{
-		RuntimeSelection: RuntimeSelection{
-			Name:      name,
-			Spec:      spec,
-			Score:     score,
-			IsCluster: isCluster,
-		},
-		MatchDetails: report.MatchDetails,
-	}, report
+	return &RuntimeMatch{Name: name, Spec: spec, Score: score, IsCluster: isCluster}, report
 }
 
 func (s *defaultSelector) sortMatches(matches []RuntimeMatch, model *v1beta1.BaseModelSpec) {
@@ -263,37 +254,19 @@ func getModelName(model *v1beta1.BaseModelSpec) string {
 	return "unknown"
 }
 
-// GetSupportedModelFormat picks the format the pod renders with. For an
-// auto-selected runtime it reads the formats as the ranking does, only those
-// marked autoSelect: true and each at its own priority, so the rendered
-// format is the one that gave the runtime its score. For a named runtime
-// every format counts at the default priority: naming the runtime overrides
-// the priorities.
-func (s *defaultSelector) GetSupportedModelFormat(ctx context.Context, runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, userSpecifiedRuntime bool) *v1beta1.SupportedModelFormat {
-	// Lean path (no model): downstream components treat a nil
-	// SupportedModelFormat as "no model-format metadata available", which is
-	// the right shape for runtime-only ISVCs that don't use model parsing.
+// GetSupportedModelFormat is the format the pod renders with: the best
+// format match of the runtime for the model, read as the ranking reads it
+// for an auto-selected runtime and over every format at the default priority
+// for a runtime the service named. It is nil without a model or a runtime (a
+// service with no model renders without format metadata) and when no format
+// scores above zero.
+func (s *defaultSelector) GetSupportedModelFormat(_ context.Context, runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, userSpecifiedRuntime bool) *v1beta1.SupportedModelFormat {
 	if model == nil || runtime == nil || runtime.SupportedModelFormats == nil {
 		return nil
 	}
-	maxScore := int64(0)
-	bestSupportedFormat := v1beta1.SupportedModelFormat{}
-	for _, supportedFormat := range runtime.SupportedModelFormats {
-		priority := int64(s.config.DefaultPriority)
-		if !userSpecifiedRuntime {
-			if !autoSelectEnabled(supportedFormat) {
-				continue
-			}
-			priority = formatPriority(supportedFormat, s.config.DefaultPriority)
-		}
-		score := s.scorer.CalculateFormatScore(model, supportedFormat, priority)
-		if score > maxScore {
-			maxScore = score
-			bestSupportedFormat = supportedFormat
-		}
+	format, score := bestFormat(s.scorer, runtime, model, userSpecifiedRuntime, s.config.DefaultPriority)
+	if score == 0 {
+		return nil
 	}
-	if maxScore > 0 {
-		return &bestSupportedFormat
-	}
-	return nil
+	return &format
 }

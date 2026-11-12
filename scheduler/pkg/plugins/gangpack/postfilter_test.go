@@ -87,7 +87,7 @@ func TestPostFilter_PartialReserveThenSecondFailure_KeepsBothDomainsFailed(t *te
 }
 
 // An assigned member another Filter vetoes is activated when the release records
-// a domain new to its gang: no event covers that retry, and a worker parked on
+// a domain new to its gang: no event covers that retry, and a worker held back by
 // its affinity to the unplaced leader cannot plan the next domain for it.
 func TestPostFilter_AssignedMemberVetoed_ActivatesItToPlanNextDomain(t *testing.T) {
 	ctx := context.Background()
@@ -178,7 +178,7 @@ func TestPostFilter_VetoInDomainHeldByBoundMember_ActivatesNobody(t *testing.T) 
 }
 
 // Each veto activates the member while a domain is untried; the veto of the
-// last fitting domain parks it, and an attempt after the lap wraps (an event
+// last fitting domain leaves it held, and an attempt after the lap wraps (an event
 // or the periodic flush) starts the sequence again.
 func TestPostFilter_VetoesAcrossDomains_ActivateOncePerUntriedDomain(t *testing.T) {
 	ctx := context.Background()

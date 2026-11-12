@@ -118,7 +118,7 @@ func appendSetReaders(out []Disagreement, pods []*corev1.Pod, desired, minReadyS
 	out = appendBoolReader(out, ReaderPodSetOutOfRotation, "outOfRotation", "evidence",
 		evidence.PodSetOutOfRotation(pods), r.OutOfRotation())
 	out = appendBoolReader(out, ReaderUnavailableOnParked, "unavailableOnParkedMember", "evidence",
-		evidence.PodSetUnavailableOnParkedMember(pods, desired, ctx.Now, ctx.UnreadyGrace), r.UnavailableOnParkedMember())
+		evidence.PodSetUnavailableOnParkedMember(pods, desired, ctx.Now, ctx.UnreadyGrace), r.UnavailableOnHeldMember())
 
 	// The publication's pod count is every pod listed, a pod being
 	// deleted or in a terminal phase included; the readers of the count
@@ -293,7 +293,7 @@ func appendRowReaders(out []Disagreement, pods []*corev1.Pod, desired int32, row
 		window := ops.ProvenWindowSeconds(minReadySeconds, ctx.UnreadyGrace)
 		unserving, _ := ops.RolledInstanceDark(row, row.RunningRevision, time.Time{}, pods, desired, window, ctx.UnreadyGrace, ctx.Now)
 		if composed := rolledInstanceUnserving(r, row.RunningRevision, desired); unserving != composed {
-			class := fmt.Sprintf("rolledInstanceDark/ops=%t/reading=%t", unserving, composed)
+			class := fmt.Sprintf("rolledInstanceUnserving/ops=%t/reading=%t", unserving, composed)
 			switch {
 			case unserving:
 			case types.UpdateContinuation(row) || row.Phase == types.InstancePhaseMigrating || types.ClaimOf(row) == types.OwnerMigrate:
@@ -306,7 +306,7 @@ func appendRowReaders(out []Disagreement, pods []*corev1.Pod, desired int32, row
 			out = append(out, Disagreement{
 				Reader: ReaderRolledInstanceDark,
 				Class:  class,
-				Detail: fmt.Sprintf("the roll reads the Instance on %s as dark=%t, the reading composes dark=%t from %d serving pods", row.RunningRevision, unserving, composed, r.Counts.Serving),
+				Detail: fmt.Sprintf("the roll reads the Instance on %s as unserving=%t, the reading composes unserving=%t from %d serving pods", row.RunningRevision, unserving, composed, r.Counts.Serving),
 			})
 		}
 	}
@@ -462,7 +462,7 @@ func rolledInstanceUnserving(r reading.InstanceReading, revision string, desired
 		own++
 		switch {
 		case p.Serving:
-		case p.Terminal, p.ParkedIn != "", !p.UnreadyPastGrace:
+		case p.Terminal, p.HeldIn != "", !p.UnreadyPastGrace:
 			return false
 		default:
 			unserving = true

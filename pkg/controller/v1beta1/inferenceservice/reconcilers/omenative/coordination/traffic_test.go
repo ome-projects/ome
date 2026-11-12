@@ -209,7 +209,7 @@ func TestTrafficDiffersMeaningfully_TagDriftIgnored(t *testing.T) {
 	}
 }
 
-// TestTrafficDiffersMeaningfully_LatestRevisionFlip pins the regression: when the engine's traffic[0] was
+// TestTrafficDiffersMeaningfully_LatestRevisionChangeReportsDiff checks the regression: when the engine's traffic[0] was
 // initially written with LatestRevision=false (because the IR Status had
 // not yet populated LifecycleStatus.UpdateRevision on the first
 // reconcile that observed pods), subsequent reconciles computed the
@@ -218,23 +218,23 @@ func TestTrafficDiffersMeaningfully_TagDriftIgnored(t *testing.T) {
 // entry permanently stuck without the flag while decoder/router (which
 // won the IR-Status race) had it set correctly.
 //
-// The fix: a LatestRevision flip is meaningful drift (operator-visible
+// The fix: a LatestRevision change is meaningful drift (operator-visible
 // and consumed by downstream HTTPRoute reconcilers) and MUST trigger a
 // write.
-func TestTrafficDiffersMeaningfully_LatestRevisionFlipReportsDiff(t *testing.T) {
+func TestTrafficDiffersMeaningfully_LatestRevisionChangeReportsDiff(t *testing.T) {
 	desired := []v1beta1.ComponentTrafficTarget{{RevisionName: "a", Percent: 100, LatestRevision: true}}
 	observed := []v1beta1.ComponentTrafficTarget{{RevisionName: "a", Percent: 100, LatestRevision: false}}
 	if !TrafficDiffersMeaningfully(desired, observed) {
-		t.Errorf("LatestRevision flip false->true: should report diff (otherwise the no-op short-circuit strands the stale flag)")
+		t.Errorf("LatestRevision change false->true: should report diff (otherwise the no-op short-circuit strands the stale flag)")
 	}
 	// Symmetric case: flipping true->false also matters (e.g., when the
 	// rollout advances and the prior LatestRolledoutRevision is demoted).
 	if !TrafficDiffersMeaningfully(observed, desired) {
-		t.Errorf("LatestRevision flip true->false: should report diff")
+		t.Errorf("LatestRevision change true->false: should report diff")
 	}
 }
 
-// TestTrafficDiffersMeaningfully_LatestRevisionSameNoDiff pins the
+// TestTrafficDiffersMeaningfully_LatestRevisionSameNoDiff checks the
 // no-op fast path: when LatestRevision matches across desired and
 // observed (most reconciles), the no-op short-circuit still kicks in
 // and the writer skips the apiserver round-trip.
@@ -246,10 +246,10 @@ func TestTrafficDiffersMeaningfully_LatestRevisionSameNoDiff(t *testing.T) {
 	}
 }
 
-// TestTrafficWithinDeadband_BlipSuppressed pins the core hysteresis fix:
+// TestTrafficWithinDeadband_BlipSuppressed checks the core hysteresis fix:
 // weights are derived from RAW live pod counts, so a single pod momentarily
 // Pending between reconciles shifts a revision's percent by a few points. With
-// a non-zero deadband, that sub-band jitter is treated as noise and the status
+// a non-zero deadband, that jitter inside the deadband is treated as noise and the status
 // write (and the HTTPRoute re-enqueue it would trigger) is suppressed.
 //
 // Scenario: a large Component already written at 80/20; one pod blips and the
@@ -291,17 +291,17 @@ func TestTrafficWithinDeadband_SustainedChangeConverges(t *testing.T) {
 	}
 }
 
-// TestTrafficWithinDeadband_ZeroDisablesBand pins the graceful-degradation
+// TestTrafficWithinDeadband_ZeroDisablesTheDeadband checks the graceful-degradation
 // contract: deadband <= 0 (absent config) restores the exact prior
 // write-on-any-diff behavior — TrafficWithinDeadband never suppresses.
-func TestTrafficWithinDeadband_ZeroDisablesBand(t *testing.T) {
+func TestTrafficWithinDeadband_ZeroDisablesTheDeadband(t *testing.T) {
 	observed := []v1beta1.ComponentTrafficTarget{{RevisionName: "a", Percent: 80}, {RevisionName: "b", Percent: 20}}
 	desired := []v1beta1.ComponentTrafficTarget{{RevisionName: "a", Percent: 79}, {RevisionName: "b", Percent: 21}}
 	if TrafficWithinDeadband(desired, observed, 0) {
-		t.Errorf("deadband 0: band disabled, must never suppress")
+		t.Errorf("deadband 0: the deadband is off, must never suppress")
 	}
 	if TrafficWithinDeadband(desired, observed, -3) {
-		t.Errorf("negative deadband: band disabled, must never suppress")
+		t.Errorf("negative deadband: the deadband is off, must never suppress")
 	}
 }
 
@@ -324,11 +324,11 @@ func TestTrafficWithinDeadband_RevisionSetChangeNotSuppressed(t *testing.T) {
 	}
 }
 
-// TestTrafficWithinDeadband_TerminalConvergenceNotSuppressed pins the
+// TestTrafficWithinDeadband_TerminalConvergenceNotSuppressed checks the
 // boundary-write fix: when an operator sets a deadband LARGER than the final
 // canary step, the terminal write to a clean single-revision split must still
 // happen. Last-written 95/5, target 100/0, deadband 10: both revisions move
-// only 5 (< band), so a naive band would suppress the write and stick traffic
+// only 5 (under the deadband), so a naive deadband would suppress the write and stick traffic
 // at 95/5 forever. A revision arriving at 100 (or leaving to 0) is terminal
 // convergence, never jitter, so the write must proceed.
 func TestTrafficWithinDeadband_TerminalConvergenceNotSuppressed(t *testing.T) {
@@ -340,21 +340,21 @@ func TestTrafficWithinDeadband_TerminalConvergenceNotSuppressed(t *testing.T) {
 		{RevisionName: "a", Percent: 100, LatestRevision: true},
 		{RevisionName: "b", Percent: 0},
 	}
-	// Sanity: both per-revision moves (5) are strictly under the band (10), so
+	// Sanity: both per-revision moves (5) are strictly under the deadband (10), so
 	// only the boundary carve-out keeps this from being suppressed.
 	if TrafficWithinDeadband(desired, observed, 10) {
 		t.Errorf("terminal convergence 95/5 -> 100/0 with deadband 10: must NOT be suppressed (traffic would stick at 95/5)")
 	}
 }
 
-// TestTrafficWithinDeadband_LatestRevisionFlipNotSuppressed: a LatestRevision
-// flag flip is operator-visible and consumed by HTTPRoute reconcilers, so it
-// must write even when the percents are within the band.
-func TestTrafficWithinDeadband_LatestRevisionFlipNotSuppressed(t *testing.T) {
+// TestTrafficWithinDeadband_LatestRevisionChangeNotSuppressed: a LatestRevision
+// flag change is operator-visible and consumed by HTTPRoute reconcilers, so it
+// must write even when the percents are within the deadband.
+func TestTrafficWithinDeadband_LatestRevisionChangeNotSuppressed(t *testing.T) {
 	observed := []v1beta1.ComponentTrafficTarget{{RevisionName: "a", Percent: 100, LatestRevision: false}}
 	desired := []v1beta1.ComponentTrafficTarget{{RevisionName: "a", Percent: 100, LatestRevision: true}}
 	if TrafficWithinDeadband(desired, observed, 5) {
-		t.Errorf("LatestRevision flip: must not be suppressed even with identical percent")
+		t.Errorf("LatestRevision change: must not be suppressed even with identical percent")
 	}
 }
 
@@ -421,7 +421,7 @@ func TestRecordRolledOutRevision(t *testing.T) {
 	}
 	if !RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "c", "z") ||
 		cs.LatestRolledoutRevision != "svc-engine-rev-c" || cs.PreviousRolledoutRevision != "svc-engine-rev-z" {
-		t.Fatalf("a known superseded revision is the one demoted: %+v", cs)
+		t.Fatalf("a known replaced revision is the one demoted: %+v", cs)
 	}
 	if !RecordRolledOutRevision(&cs, "svc", v1beta1.EngineComponent, "d", "d") ||
 		cs.LatestRolledoutRevision != "svc-engine-rev-d" || cs.PreviousRolledoutRevision != "svc-engine-rev-z" {

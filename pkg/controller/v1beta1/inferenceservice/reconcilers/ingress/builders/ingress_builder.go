@@ -19,7 +19,10 @@ import (
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
-// IngressBuilder builds Kubernetes Ingress resources
+// IngressBuilder builds Kubernetes Ingress resources. An Ingress backend
+// carries no weight, so every Component is routed to its aggregate Service;
+// the per-revision traffic targets on status stay a contract for the router
+// behind it.
 type IngressBuilder struct {
 	client        client.Client
 	scheme        *runtime.Scheme

@@ -48,11 +48,14 @@ type crdProbe func(cfg *rest.Config, groupVersion, kind string) (bool, error)
 // An error is returned only when a CRD probe itself fails (e.g.
 // network error talking to the API server). A clean "CRD not present"
 // answer is not an error; it advances to the next probe.
-func New(cfg *rest.Config) (traffic.Translator, error) {
-	return newWithProbe(cfg, utils.IsCrdAvailable)
+//
+// clusterDomain is the cluster's DNS domain from ingress.clusterDomain; the
+// Istio translator renders its DestinationRule host under it.
+func New(cfg *rest.Config, clusterDomain string) (traffic.Translator, error) {
+	return newWithProbe(cfg, clusterDomain, utils.IsCrdAvailable)
 }
 
-func newWithProbe(cfg *rest.Config, probe crdProbe) (traffic.Translator, error) {
+func newWithProbe(cfg *rest.Config, clusterDomain string, probe crdProbe) (traffic.Translator, error) {
 	// 1. Envoy Gateway BackendTrafficPolicy (preferred).
 	found, err := probe(cfg, envoygateway.PolicyGVK.GroupVersion().String(), envoygateway.PolicyGVK.Kind)
 	if err != nil {
@@ -68,7 +71,7 @@ func newWithProbe(cfg *rest.Config, probe crdProbe) (traffic.Translator, error) 
 		return nil, fmt.Errorf("probe %s: %w", istio.PolicyGVK.String(), err)
 	}
 	if found {
-		return istio.New(), nil
+		return istio.New(clusterDomain), nil
 	}
 
 	// 3. Noop fallback.

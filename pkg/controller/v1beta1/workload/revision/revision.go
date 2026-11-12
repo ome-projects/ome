@@ -4,8 +4,8 @@
 //
 // Boundary: this package is a leaf. It depends on Kubernetes API
 // machinery and the workload package's own type set; it does not
-// import v1beta1 — adapters convert from CRD-typed status into
-// workload.InstanceStatus before calling CollectLiveRevisionNames. The labels stamped on emitted CRs
+// import v1beta1 — an adapter hands LiveRevisionNames an iterator over
+// its own row type and converts nothing. The labels stamped on emitted CRs
 // are taken from the caller-supplied revision.Key so the same labels
 // carry through the pod-selector composition the rest of the workload
 // pipeline does.
@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"iter"
 	"sort"
 	"strconv"
 	"strings"
@@ -664,7 +665,7 @@ func EnsureControllerRevisionWithWorker(
 	if err != nil {
 		return nil, false, err
 	}
-	return EnsureControllerRevisionFromHash(ctx, c, reads, owner, ownerGVK, key, hash, raw)
+	return EnsureControllerRevisionFromHash(ctx, c, reads, owner, ownerGVK, key, hash, raw, nil)
 }
 
 // EnsureControllerRevisionFromHash is the create-or-reuse half of
@@ -679,6 +680,14 @@ func EnsureControllerRevisionWithWorker(
 //
 // All ownership / collision / race-on-Create semantics are identical to
 // EnsureControllerRevisionWithWorker; see that function for the rationale.
+//
+// scope is the object the owner's revision history belongs to beyond the
+// owner itself: the InferenceService that projects a replica (ScopeOwner).
+// A new revision names it as a plain owner, so the history stays when the
+// replica is deleted and leaves with the service; an existing revision the
+// scope owns is reused whichever replica minted it (RetainedBy), and one
+// the owner controls without the scope gains it. nil scopes the history to
+// the owner alone.
 func EnsureControllerRevisionFromHash(
 	ctx context.Context,
 	c client.Client,
@@ -688,6 +697,7 @@ func EnsureControllerRevisionFromHash(
 	key Key,
 	hash string,
 	raw []byte,
+	scope *metav1.OwnerReference,
 ) (cr *appsv1.ControllerRevision, collision bool, err error) {
 	if owner == nil {
 		return nil, false, fmt.Errorf("EnsureControllerRevision: nil owner")
@@ -702,16 +712,24 @@ func EnsureControllerRevisionFromHash(
 	name := Name(key, hash)
 	objKey := client.ObjectKey{Namespace: key.Namespace, Name: name}
 
+	if confirmed := confirmedFromCache(ctx, c, objKey, owner, scope, raw); confirmed != nil {
+		return confirmed, false, nil
+	}
 	existing := &appsv1.ControllerRevision{}
 	if getErr := reads.Get(ctx, objKey, existing); getErr == nil {
 		// Foreign ownership = collision: a CR left over from a
 		// previously-deleted-and-recreated owner of the same name would
-		// otherwise be silently adopted, mixing histories.
-		if !controllerOwnedBy(existing.OwnerReferences, owner.GetUID()) {
+		// otherwise be silently adopted, mixing histories. A revision the
+		// scope owns is this history, whichever replica of the service
+		// minted it.
+		if !RetainedBy(existing, owner.GetUID(), scope) {
 			return existing, true, nil
 		}
 		if !bytes.Equal(existing.Data.Raw, raw) {
 			return existing, true, nil
+		}
+		if err := EnsureScopeOwner(ctx, c, existing, scope); err != nil {
+			return nil, false, err
 		}
 		return existing, false, nil
 	} else if !apierrors.IsNotFound(getErr) {
@@ -729,7 +747,7 @@ func EnsureControllerRevisionFromHash(
 			Namespace:       key.Namespace,
 			Labels:          Labels(key),
 			Annotations:     revisionAnnotations(raw),
-			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, ownerGVK)},
+			OwnerReferences: historyOwners(owner, ownerGVK, scope),
 		},
 		Data:     runtime.RawExtension{Raw: raw},
 		Revision: nextRev,
@@ -744,7 +762,7 @@ func EnsureControllerRevisionFromHash(
 		if getErr := reads.Get(ctx, objKey, cr); getErr != nil {
 			return nil, false, fmt.Errorf("re-get after AlreadyExists: %w", getErr)
 		}
-		if !controllerOwnedBy(cr.OwnerReferences, owner.GetUID()) {
+		if !RetainedBy(cr, owner.GetUID(), scope) {
 			return cr, true, nil
 		}
 		if !bytes.Equal(cr.Data.Raw, raw) {
@@ -754,29 +772,33 @@ func EnsureControllerRevisionFromHash(
 	return cr, false, nil
 }
 
-// controllerOwnedBy reports whether refs contains a Controller=true
-// OwnerReference pointing at uid. Only a true controller ref asserts
-// the parent claim we care about.
-func controllerOwnedBy(refs []metav1.OwnerReference, uid types.UID) bool {
-	for _, ref := range refs {
-		if ref.Controller != nil && *ref.Controller && ref.UID == uid {
-			return true
-		}
+// confirmedFromCache reads the revision as the cache holds it and returns
+// that copy when the pass would confirm it without a write: the owner's or
+// its scope's, recording the same payload, and already naming the scope
+// owner. Nil for any other answer, a missing copy included: a collision, a
+// scope owner to add and a revision to mint are decided on the live object.
+// A revision deleted or re-owned after the copy was taken raises a revision
+// event on its owner, whose next pass reads the live object.
+func confirmedFromCache(ctx context.Context, cache client.Reader, key client.ObjectKey, owner client.Object, scope *metav1.OwnerReference, raw []byte) *appsv1.ControllerRevision {
+	cr := &appsv1.ControllerRevision{}
+	if err := cache.Get(ctx, key, cr); err != nil {
+		return nil
 	}
-	return false
+	if !RetainedBy(cr, owner.GetUID(), scope) || !bytes.Equal(cr.Data.Raw, raw) {
+		return nil
+	}
+	if scope != nil && scope.UID != "" && !ownedBy(cr.OwnerReferences, scope.UID) {
+		return nil
+	}
+	return cr
 }
 
-// RetainControllerRevisions sweeps the workload-scoped ControllerRevisions
-// and keeps the most recent maxNonLive non-live ones, in addition to any
-// revision named in liveNames. Older non-live revisions are deleted. Order
-// is by .Revision (highest = newest).
-//
-// reads is the live API reader used for the listing step so retention
-// decisions aren't made against a stale cache.
-//
-// liveNames typically holds CurrentRevision and UpdateRevision plus
-// every InstanceStatus.RunningRevision/TargetRevision. Empty entries
-// are ignored. The recommended default for maxNonLive is 10.
+// RetainControllerRevisions keeps the revisions liveNames protect and the
+// newest maxNonLive others, and deletes the rest. c is the manager's client
+// (reads from the cache, writes to the apiserver); reads is the live reader.
+// The cached history decides only that there is nothing to delete; a cached
+// history over the limit sends the sweep to the live list, which decides
+// every deletion; a revision in use is protected by name on both lists.
 func RetainControllerRevisions(
 	ctx context.Context,
 	c client.Client,
@@ -788,20 +810,46 @@ func RetainControllerRevisions(
 	if maxNonLive < 0 {
 		return fmt.Errorf("RetainControllerRevisions: maxNonLive must be >= 0")
 	}
+	live := liveNameSet(liveNames)
+	if cached, err := listControllerRevisions(ctx, c, key); err == nil && len(overTheLimit(cached, live, maxNonLive)) == 0 {
+		return nil
+	}
 	existing, err := listControllerRevisions(ctx, reads, key)
 	if err != nil {
 		return err
 	}
 
-	live := make(map[string]struct{}, len(liveNames))
-	for _, n := range liveNames {
+	// Don't bail on the first delete failure: a transient API error on
+	// the oldest CR would otherwise leave every newer non-live CR behind
+	// and starve retention until the failing one is hand-deleted. Collect
+	// errors and continue.
+	var sweepErr error
+	for _, cr := range overTheLimit(existing, live, maxNonLive) {
+		if derr := c.Delete(ctx, &cr); derr != nil && !apierrors.IsNotFound(derr) {
+			sweepErr = errors.Join(sweepErr, fmt.Errorf("delete ControllerRevision %s: %w", cr.Name, derr))
+		}
+	}
+	return sweepErr
+}
+
+// liveNameSet is the set of revision names the sweep protects; an empty
+// name is ignored.
+func liveNameSet(names []string) map[string]struct{} {
+	live := make(map[string]struct{}, len(names))
+	for _, n := range names {
 		if n != "" {
 			live[n] = struct{}{}
 		}
 	}
+	return live
+}
 
-	nonLive := make([]appsv1.ControllerRevision, 0, len(existing))
-	for _, cr := range existing {
+// overTheLimit is what the sweep deletes from one listing of the history:
+// the revisions no live name protects, past the maxNonLive newest of them,
+// oldest last. Nil when the history is within the limit.
+func overTheLimit(history []appsv1.ControllerRevision, live map[string]struct{}, maxNonLive int) []appsv1.ControllerRevision {
+	nonLive := make([]appsv1.ControllerRevision, 0, len(history))
+	for _, cr := range history {
 		if _, ok := live[cr.Name]; ok {
 			continue
 		}
@@ -819,19 +867,7 @@ func RetainControllerRevisions(
 	sort.Slice(nonLive, func(i, j int) bool {
 		return nonLive[i].Revision > nonLive[j].Revision
 	})
-
-	// Don't bail on the first delete failure: a transient API error on
-	// the oldest CR would otherwise leave every newer non-live CR behind
-	// and starve retention until the failing one is hand-deleted. Collect
-	// errors and continue.
-	var sweepErr error
-	for i := maxNonLive; i < len(nonLive); i++ {
-		cr := nonLive[i]
-		if derr := c.Delete(ctx, &cr); derr != nil && !apierrors.IsNotFound(derr) {
-			sweepErr = errors.Join(sweepErr, fmt.Errorf("delete ControllerRevision %s: %w", cr.Name, derr))
-		}
-	}
-	return sweepErr
+	return nonLive[maxNonLive:]
 }
 
 // listControllerRevisions returns every ControllerRevision matching the
@@ -875,31 +911,20 @@ func nextRevisionNumber(
 	return maxRev + 1, nil
 }
 
-// CollectLiveRevisionNames is the union retention must protect:
-// CurrentRevision + UpdateRevision plus every
-// InstanceStatus.RunningRevision/TargetRevision. Without the per-instance
-// union, an in-flight migration whose source RunningRevision points to
-// an older CR could have that CR swept mid-flight, then the migration
-// resume path returns nil and the migration bails forever.
-//
-// Takes the slice of InstanceStatuses + the two revision pointers
-// directly so the call works against either an LifecycleStatus
-// (ISVC path) or an InferenceReplicaStatus (IR path) without needing a
-// type-specific reader. Either adapter projects its status surface into
-// these primitive args.
-func CollectLiveRevisionNames(current, update string, instances []workload.InstanceStatus) []string {
+// LiveRevisionNames is the union retention must protect: the current and
+// update revisions and the two names every row carries, the revision the
+// Instance runs and the one it moves toward, each once, empty names left
+// out. A row's revision is kept whatever the history's limit: a move reads
+// its source's pod template from the revision the row names, and a swept
+// one would leave it no template. rows yields each row's two names, so a
+// caller walks its own row type without copying it into another.
+func LiveRevisionNames(current, update string, rows iter.Seq2[string, string]) []string {
 	seen := map[string]struct{}{}
-	add := func(name string) {
-		if name == "" {
-			return
-		}
-		seen[name] = struct{}{}
-	}
-	add(current)
-	add(update)
-	for _, inst := range instances {
-		add(inst.RunningRevision)
-		add(inst.TargetRevision)
+	addLiveName(seen, current)
+	addLiveName(seen, update)
+	for running, target := range rows {
+		addLiveName(seen, running)
+		addLiveName(seen, target)
 	}
 	if len(seen) == 0 {
 		return nil
@@ -909,6 +934,25 @@ func CollectLiveRevisionNames(current, update string, instances []workload.Insta
 		out = append(out, n)
 	}
 	return out
+}
+
+// addLiveName records a named revision; an empty name is no revision.
+func addLiveName(seen map[string]struct{}, name string) {
+	if name != "" {
+		seen[name] = struct{}{}
+	}
+}
+
+// RowRevisions yields, per engine row, the revision the Instance runs and
+// the one it moves toward.
+func RowRevisions(instances []workload.InstanceStatus) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		for i := range instances {
+			if !yield(instances[i].RunningRevision, instances[i].TargetRevision) {
+				return
+			}
+		}
+	}
 }
 
 // ReferencedRevisionNames returns, sorted, every revision name the rows
@@ -1046,15 +1090,17 @@ func WidthFreeTwinOf(t Template, collisionCount *int32, ownerUID types.UID) (twi
 // recordedTarget is the update revision the owner's status names. Once it
 // names the twin, the twin is confirmed from the cache alone and nothing is
 // read live; the live reads run only the first time, while the status still
-// names another revision.
-func AdoptRevisionWithoutWidth(ctx context.Context, cache, live client.Reader, owner client.Object, key Key, hash string, twin WidthFreeTwin, workerSize int32, recordedTarget string, observed func(revisionName string) (int32, bool)) (*appsv1.ControllerRevision, error) {
+// names another revision. scope is the history's scope beyond the owner, as
+// for EnsureControllerRevisionFromHash: a twin a previous replica of the
+// same service minted is this owner's too.
+func AdoptRevisionWithoutWidth(ctx context.Context, cache, live client.Reader, owner client.Object, scope *metav1.OwnerReference, key Key, hash string, twin WidthFreeTwin, workerSize int32, recordedTarget string, observed func(revisionName string) (int32, bool)) (*appsv1.ControllerRevision, error) {
 	if twin.Hash == "" || workerSize <= 0 || owner == nil || cache == nil || live == nil {
 		return nil, nil
 	}
 	name := Name(key, twin.Hash)
 	twinKey := client.ObjectKey{Namespace: key.Namespace, Name: name}
 	keeps := func(cr *appsv1.ControllerRevision) bool {
-		if !controllerOwnedBy(cr.OwnerReferences, owner.GetUID()) || !bytes.Equal(cr.Data.Raw, twin.Raw) {
+		if !RetainedBy(cr, owner.GetUID(), scope) || !bytes.Equal(cr.Data.Raw, twin.Raw) {
 			return false
 		}
 		if observed != nil {

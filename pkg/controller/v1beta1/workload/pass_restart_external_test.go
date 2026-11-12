@@ -6,8 +6,6 @@ import (
 	"math/rand"
 	"os"
 	"reflect"
-	goruntime "runtime"
-	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -39,6 +37,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/allocbudget"
 )
 
 // This file drives the real dispatcher (workload.Reconcile with its
@@ -223,6 +222,12 @@ type repairConfig struct {
 	// partition is how many Instances the roll holds on the old
 	// revision, as a canary step holds them.
 	partition int32
+	// moment is the moment of a roll the exploration starts at, one of
+	// rollMoments; empty starts at the idle Component.
+	moment string
+	// strategy is the Component's update strategy at a budget of 10
+	// percent; empty keeps RecreatePod at one Instance.
+	strategy workloadtypes.UpdateStrategyType
 }
 
 func (c repairConfig) String() string {
@@ -232,6 +237,12 @@ func (c repairConfig) String() string {
 	}
 	if c.partition > 0 {
 		s += fmt.Sprintf(" partition=%d", c.partition)
+	}
+	if c.strategy != "" {
+		s += " " + string(c.strategy)
+	}
+	if c.moment != "" {
+		s += " at " + c.moment
 	}
 	return s
 }
@@ -254,7 +265,7 @@ func (m repairMove) String() string {
 		s += ":" + m.arg
 	}
 	switch m.kind {
-	case "tick", "tick-all", "tick-1m", "node-back", "room-back", "no-room", "webhook-down", "webhook-back", "image-back", "recover-waiting", "node-pods-deleted":
+	case "tick", "tick-all", "tick-1m", "node-back", "room-back", "no-room", "webhook-down", "webhook-back", "image-back", "recover-waiting", "node-pods-deleted", "pause", "resume", "resize", "partition":
 	default:
 		s += fmt.Sprintf("@%d", m.idx)
 		if m.runner != "" {
@@ -283,10 +294,13 @@ type repairMemory struct {
 	heldInFlight map[string]map[int32]bool
 	gangSeen     map[int32]map[int64]map[types.UID]bool
 	eventsAt     int
+	// roll is the memory of the roll model: the faults standing in the
+	// world and the retry-record accounting.
+	roll rollMemory
 }
 
 func (m repairMemory) clone() repairMemory {
-	out := repairMemory{heldSeen: map[string]map[types.UID]bool{}, heldInFlight: map[string]map[int32]bool{}, gangSeen: map[int32]map[int64]map[types.UID]bool{}, eventsAt: m.eventsAt}
+	out := repairMemory{heldSeen: map[string]map[types.UID]bool{}, heldInFlight: map[string]map[int32]bool{}, gangSeen: map[int32]map[int64]map[types.UID]bool{}, eventsAt: m.eventsAt, roll: m.roll.clone()}
 	for rev, uids := range m.heldSeen {
 		out.heldSeen[rev] = cloneMap(uids)
 	}
@@ -328,7 +342,7 @@ type repairSnapshot struct {
 // snapshot copies each map and slice by hand, so a field added to the
 // harness must be added there too; this count is what makes the test
 // say so instead of sharing state between branches.
-const recoveryHarnessFields = 92
+const recoveryHarnessFields = 97
 
 func copyHarnessCollections(dst, src *recoveryHarness) {
 	dst.mutateErr = cloneMap(src.mutateErr)
@@ -354,6 +368,7 @@ func copyHarnessCollections(dst, src *recoveryHarness) {
 	dst.unplaceable = cloneMap(src.unplaceable)
 	dst.exitsCleanOnStop = cloneMap(src.exitsCleanOnStop)
 	dst.stillStopping = cloneMap(src.stillStopping)
+	dst.cut = nil
 	dst.blocks = append([]workloadtypes.RetryBlock(nil), src.blocks...)
 	dst.heldWarnings = append([]string(nil), src.heldWarnings...)
 	dst.failedWarnings = append([]string(nil), src.failedWarnings...)
@@ -478,6 +493,9 @@ type repairWorld struct {
 	passes   int
 	// settlePasses bounds the passes one settle may take.
 	settlePasses int
+	// startNode is the configuration's start state, built once and copied
+	// for every exploration and run.
+	startNode *repairNode
 }
 
 const (
@@ -499,7 +517,9 @@ func newRepairWorld(t *testing.T, cfg repairConfig) *repairWorld {
 // retarget points the harness at a revision rendered from image, keeping
 // the gang's worker count, which setTarget renders at one.
 func (w *repairWorld) retarget(h *recoveryHarness, rev *appsv1.ControllerRevision, image string) {
+	paused := h.desired.Paused
 	h.setTarget(rev, image)
+	h.desired.Paused = paused
 	if w.cfg.shape.pods > 1 {
 		h.desired.Runners = workloadtypes.RunnersWithWorkerSize(h.desired.Runners, w.cfg.shape.pods-1)
 	}
@@ -521,7 +541,14 @@ func (w *repairWorld) root() *repairNode {
 		partition := w.cfg.partition
 		rolling.Partition = &partition
 	}
-	h.lifecycle.UpdateStrategy = &workloadtypes.UpdateStrategy{Type: workloadtypes.UpdateStrategyRecreatePod, RollingUpdate: rolling}
+	strategy := workloadtypes.UpdateStrategyRecreatePod
+	if w.cfg.strategy != "" {
+		strategy, rolling = w.cfg.strategy, rollingUpdateFor(w.cfg.strategy, w.cfg.partition)
+	}
+	// The operator's resize needs the owner-aware batch writer, as
+	// the manager wires it; the idle model keeps the one-row path.
+	h.atomicStatus = w.cfg.moment != ""
+	h.lifecycle.UpdateStrategy = &workloadtypes.UpdateStrategy{Type: strategy, RollingUpdate: rolling}
 	h.lifecycle.InstanceReadyTimeout = &metav1.Duration{Duration: w.settings.readyTimeout}
 	h.retryPolicy = w.settings.retry
 	h.stuckGrace = w.settings.stuckGrace
@@ -542,7 +569,7 @@ func (w *repairWorld) root() *repairNode {
 	w.revImage[h.revBad.Name] = badImage
 	w.revImage[h.revFixed.Name] = fixedImage
 	w.retarget(h, h.revV1, goodImage)
-	node := &repairNode{mem: repairMemory{heldSeen: map[string]map[types.UID]bool{}, heldInFlight: map[string]map[int32]bool{}, gangSeen: map[int32]map[int64]map[types.UID]bool{}}, image: goodImage}
+	node := &repairNode{mem: repairMemory{heldSeen: map[string]map[types.UID]bool{}, heldInFlight: map[string]map[int32]bool{}, gangSeen: map[int32]map[int64]map[types.UID]bool{}, roll: newRollMemory()}, image: goodImage}
 	if !h.run(40+10*int(w.cfg.shape.instances), func() bool { return w.settled(h) }) {
 		h.dumpState("initial create")
 		w.t.Fatalf("[%s] the initial create never settled on the first revision", w.cfg)
@@ -737,6 +764,7 @@ func (w *repairWorld) observe(n *repairNode, h *recoveryHarness) {
 			}
 		}
 	}
+	w.observeCharges(n, h, rows)
 }
 
 // waitReason reports whether a failure record's reason is a wait's reading
@@ -820,6 +848,7 @@ func (w *repairWorld) key(h *recoveryHarness) string {
 			pod.DeletionTimestamp != nil, h.kubeletStopped(pod), h.wedgeReasonFor(pod) != "" || h.evicted[wedgeKey(pod)], h.killOnce[pod.Name])
 	}
 	fmt.Fprintf(&b, "#dead=%d room=%t webhook=%t fault=%s imageback=%t target=%s", len(h.deadNodes), h.placementHeld, h.admissionDown, h.wedge, h.badImageHeals, w.short(h.target.Name))
+	fmt.Fprintf(&b, " replicas=%d partition=%d paused=%t", h.replicas, partitionOf(h), h.desired.Paused)
 	for _, m := range h.migrations {
 		fmt.Fprintf(&b, " move=%s", m.Phase)
 	}
@@ -866,11 +895,15 @@ type repairTimer struct {
 // kubelet model's own termination grace.
 func (w *repairWorld) timers(h *recoveryHarness) []repairTimer {
 	now := h.clk.Now()
+	window := time.Duration(workloadops.ProvenWindowSeconds(h.minReadySeconds, w.settings.stuckGrace)) * time.Second
 	var out []repairTimer
-	// A timer due at this very instant is still pending: the kubelet and
-	// the engine act on it at the start of the next pass.
+	// The clock steps after each reconcile, so the last reconcile ran one
+	// step ago: a timer due since then, this very instant included, is
+	// still pending, and the kubelet and the engine act on it at the
+	// start of the next pass.
+	last := now.Add(-repairStep)
 	add := func(kind string, at time.Time) {
-		if !at.IsZero() && !at.Before(now) {
+		if !at.IsZero() && !at.Before(last) {
 			out = append(out, repairTimer{kind: kind, at: at})
 		}
 	}
@@ -907,11 +940,19 @@ func (w *repairWorld) timers(h *recoveryHarness) []repairTimer {
 			continue
 		}
 		if w.settings.stuckGrace > 0 && !(podConditionTrue(pod, corev1.PodReady) && podreadiness.IsServing(pod)) {
-			add("stuck-grace", pod.CreationTimestamp.Add(w.settings.stuckGrace))
+			add("start-grace", pod.CreationTimestamp.Add(w.settings.stuckGrace))
 			for _, cond := range pod.Status.Conditions {
 				if cond.Type == corev1.ContainersReady && cond.Status != corev1.ConditionTrue {
 					add("unready-grace", cond.LastTransitionTime.Add(w.settings.stuckGrace))
 				}
+			}
+		}
+		// A pod that is Ready counts as serving for the roll only once it
+		// has held Ready for the proven window, so a pod that came back
+		// after a restart holds its Instance's budget slot until then.
+		for _, cond := range pod.Status.Conditions {
+			if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+				add("comeback-window", cond.LastTransitionTime.Add(window))
 			}
 		}
 		if _, since, refused := workloadtypes.PodUnschedulable(pod); refused && w.settings.unschedulableGrace > 0 {
@@ -1043,6 +1084,11 @@ func (w *repairWorld) named(n *repairNode, h *recoveryHarness, s workloadtypes.I
 	if s.LastFailure != nil && strings.Contains(s.LastFailure.Message, "crash loop") {
 		return "crash-loop-named"
 	}
+	// The operator's pause withholds the next operation: a row with none
+	// waits for the resume, and the pause is what names it.
+	if h.desired.Paused && s.Operation == nil {
+		return "paused"
+	}
 	rev := s.RunningRevision
 	if rev == "" {
 		rev = s.TargetRevision
@@ -1121,9 +1167,21 @@ func (w *repairWorld) checkSettled(n *repairNode, h *recoveryHarness) {
 		n.found = append(n.found, repairFinding{class: class,
 			message: fmt.Sprintf("Instance %d (%s, %s, incarnation %d) does not serve, nothing names why, no deadline or grace is left to run", s.Index, s.Phase, w.short(s.RunningRevision), s.Incarnation)})
 	}
-	if int32(len(rows)) < w.cfg.shape.instances {
-		n.found = append(n.found, repairFinding{class: "rebuild-never-comes", message: fmt.Sprintf("only %d of %d Instances have a row", len(rows), w.cfg.shape.instances)})
+	if int32(len(rows)) < h.replicas {
+		class := "rebuild-never-comes"
+		if b := h.findBlock(h.target.Name); b != nil && b.State == workloadtypes.RetryBlockHeld {
+			// A new Instance is created on the target revision, and the
+			// target's retries are spent: the create waits for the
+			// operator to release the revision or push another.
+			class = "known-wait:scale-up-under-a-held-revision"
+		} else if h.desired.Paused {
+			// The operator's pause withholds the create of a new Instance
+			// as it withholds every other new operation.
+			class = "known-wait:scale-up-under-a-paused-roll"
+		}
+		n.found = append(n.found, repairFinding{class: class, message: fmt.Sprintf("only %d of %d Instances have a row", len(rows), h.replicas)})
 	}
+	w.checkFaultsCleared(n, h)
 }
 
 // knownWait names a wait the engine holds by design and this model does
@@ -1133,6 +1191,21 @@ func (w *repairWorld) checkSettled(n *repairNode, h *recoveryHarness) {
 // such a pod as the kubelet last reported it and waits for its node; the
 // study records what the operator sees meanwhile.
 func (w *repairWorld) knownWait(h *recoveryHarness, idx int32) string {
+	if w.attemptWaitsUnderThePause(h, idx) {
+		return "attempt-waits-under-the-pause"
+	}
+	if w.waitsBehindAHeldPod(h, idx) {
+		return "behind-a-pod-the-kubelet-holds-while-the-roll-is-open"
+	}
+	if w.attemptStandsOnAStoppedKubelet(h, idx) {
+		// Another Instance's attempt holds the budget or the surge slot
+		// and cannot finish: a pod of its old set sits on a kubelet that
+		// stopped reporting, which only the force-delete policy or an
+		// operator frees. This Instance's repair, or the roll's turn for
+		// it, waits behind that attempt, and the pass publishes no hold
+		// naming this Instance while the attempt is in flight.
+		return "repair-behind-an-attempt-on-a-lost-kubelet"
+	}
 	pods := h.podsOf(idx)
 	all := &corev1.PodList{}
 	if err := h.c.List(h.ctx, all, client.InNamespace(recoveryNS)); err != nil {
@@ -1178,6 +1251,23 @@ func (w *repairWorld) knownWait(h *recoveryHarness, idx int32) string {
 		return "lost-node-behind-another-attempt"
 	}
 	return ""
+}
+
+// attemptStandsOnAStoppedKubelet reports whether an Instance other than
+// idx has an attempt open (a repair or a roll's update) with a pod on a
+// kubelet that stopped reporting, so the attempt cannot finish on its own.
+func (w *repairWorld) attemptStandsOnAStoppedKubelet(h *recoveryHarness, idx int32) bool {
+	for _, s := range h.irStatuses() {
+		if s.Index == idx || s.Operation == nil {
+			continue
+		}
+		for _, pod := range podsOfEveryPhase(h, s.Index) {
+			if h.kubeletStopped(pod) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // anotherAttemptOpen reports whether an Instance other than idx carries an
@@ -1239,6 +1329,7 @@ func (w *repairWorld) picture(h *recoveryHarness) string {
 	if h.verdict != nil {
 		parts = append(parts, fmt.Sprintf("hold %s: %s", h.verdict.Gate, h.verdict.Reason))
 	}
+	parts = append(parts, fmt.Sprintf("spec replicas=%d partition=%d paused=%t target=%s", h.replicas, partitionOf(h), h.desired.Paused, w.short(h.target.Name)))
 	events := h.events
 	if len(events) > 6 {
 		events = events[len(events)-6:]
@@ -1323,6 +1414,7 @@ func (w *repairWorld) moves(n *repairNode, h *recoveryHarness, all bool) []repai
 	if story(storyMove) && len(h.migrations) == 0 && w.movable(h, 0) {
 		out = append(out, repairMove{kind: "move", idx: 0})
 	}
+	out = append(out, w.rollMoves(h, all)...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].String() < out[j].String() })
 	return out
 }
@@ -1334,21 +1426,29 @@ type repairTarget struct {
 }
 
 // targets picks the pods the walk puts faults on: the lowest-indexed
-// Instance that serves whole and the lowest-indexed one that does not,
-// and in a gang the leader and the first worker of each.
+// Instance that serves whole on the target revision, the lowest-indexed
+// one that serves whole on another revision, and the lowest-indexed one
+// that does not serve whole; in a gang the leader and the first worker
+// of each.
 func (w *repairWorld) targets(h *recoveryHarness) []repairTarget {
 	rows := h.irStatuses()
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Index < rows[j].Index })
-	chosen := map[bool]int32{}
+	chosen := map[string]int32{}
 	for _, s := range rows {
-		whole := s.Phase == workloadtypes.InstancePhaseReady && s.Operation == nil && w.servingSet(h, s.Index)
-		if _, ok := chosen[whole]; !ok {
-			chosen[whole] = s.Index
+		kind := "partial"
+		switch whole := s.Phase == workloadtypes.InstancePhaseReady && s.Operation == nil && w.servingSet(h, s.Index); {
+		case whole && s.RunningRevision == h.target.Name:
+			kind = "on-target"
+		case whole:
+			kind = "off-target"
+		}
+		if _, ok := chosen[kind]; !ok {
+			chosen[kind] = s.Index
 		}
 	}
 	var out []repairTarget
-	for _, whole := range []bool{true, false} {
-		idx, ok := chosen[whole]
+	for _, kind := range []string{"on-target", "off-target", "partial"} {
+		idx, ok := chosen[kind]
 		if !ok {
 			continue
 		}
@@ -1364,12 +1464,13 @@ func (w *repairWorld) targets(h *recoveryHarness) []repairTarget {
 // movable reports whether a move of Instance idx can be filed: a routed
 // pod of it is placed on a node.
 func (w *repairWorld) movable(h *recoveryHarness, idx int32) bool {
+	fromNode := ""
 	for _, pod := range h.podsOf(idx) {
-		if query.RoutedRunner(pod) && pod.Spec.NodeName != "" {
-			return true
+		if query.RoutedRunner(pod) {
+			fromNode = pod.Spec.NodeName
 		}
 	}
-	return false
+	return fromNode != ""
 }
 
 // podFor is the live pod of runner at idx a fault lands on, or nil.
@@ -1392,6 +1493,7 @@ func (w *repairWorld) apply(n *repairNode, mv repairMove) *repairNode {
 		w.pass(child, h)
 	}
 	w.play(child, h, mv)
+	child.mem.roll.noteMove(mv)
 	w.settle(child, h)
 	w.finish(child, h)
 	return child
@@ -1404,11 +1506,11 @@ func (w *repairWorld) play(n *repairNode, h *recoveryHarness, mv repairMove) {
 	switch mv.kind {
 	case "tick":
 		if timers := w.timers(h); len(timers) > 0 {
-			h.clk.Step(timers[0].at.Sub(h.clk.Now()) + time.Second)
+			stepPast(h, timers[0].at)
 		}
 	case "tick-all":
 		if timers := w.timers(h); len(timers) > 0 {
-			h.clk.Step(timers[len(timers)-1].at.Sub(h.clk.Now()) + time.Second)
+			stepPast(h, timers[len(timers)-1].at)
 		}
 	case "tick-1m":
 		h.clk.Step(time.Minute)
@@ -1478,7 +1580,17 @@ func (w *repairWorld) play(n *repairNode, h *recoveryHarness, mv repairMove) {
 			h.requestMove(fmt.Sprintf("move-%d-%d", mv.idx, len(n.path)), mv.idx)
 		}
 	default:
-		w.t.Fatalf("unknown move %s", mv.kind)
+		if !w.playRollMove(h, mv) {
+			w.t.Fatalf("unknown move %s", mv.kind)
+		}
+	}
+}
+
+// stepPast moves the clock one second past at; a timer already behind the
+// clock, due since the last reconcile, moves it nowhere.
+func stepPast(h *recoveryHarness, at time.Time) {
+	if d := at.Sub(h.clk.Now()) + time.Second; d > 0 {
+		h.clk.Step(d)
 	}
 }
 
@@ -1520,14 +1632,14 @@ func repairPath(path []repairMove) string {
 }
 
 // explore walks the configuration breadth-first to the bounds.
-func (w *repairWorld) explore(maxStates, maxDepth int, budget time.Duration) repairReport {
+func (w *repairWorld) explore(maxStates, maxDepth, passBudget int) repairReport {
 	rep := newRepairReport()
-	start := time.Now()
-	root := w.root()
+	root := w.start()
+	spent := w.passes
 	rep.take(root)
 	visited := map[string]bool{root.key: true}
 	queue := []*repairNode{root}
-	for len(queue) > 0 && rep.states < maxStates && time.Since(start) < budget {
+	for len(queue) > 0 && rep.states < maxStates && w.passes-spent < passBudget {
 		n := queue[0]
 		queue = queue[1:]
 		rep.states++
@@ -1555,13 +1667,13 @@ func (w *repairWorld) explore(maxStates, maxDepth int, budget time.Duration) rep
 
 // randomRuns plays whole runs from the start with a fixed seed, drawing
 // from every story's moves, to reach the depths the walk does not.
-func (w *repairWorld) randomRuns(rep *repairReport, seed int64, runs, maxDepth int, budget time.Duration) {
+func (w *repairWorld) randomRuns(rep *repairReport, seed int64, runs, maxDepth, passBudget int) {
 	rng := rand.New(rand.NewSource(seed))
-	start := time.Now()
-	for r := 0; r < runs && time.Since(start) < budget; r++ {
-		n := w.root()
+	spent := w.passes
+	for r := 0; r < runs && w.passes-spent < passBudget; r++ {
+		n := w.start()
 		rep.runs++
-		for depth := 0; depth < maxDepth && time.Since(start) < budget; depth++ {
+		for depth := 0; depth < maxDepth && w.passes-spent < passBudget; depth++ {
 			h := w.restore(n.snap)
 			moves := w.moves(n, h, true)
 			if len(moves) == 0 {
@@ -1656,6 +1768,9 @@ func repairConfigs(full bool, keep func(repairConfig) bool) []repairConfig {
 		}
 		add(repairConfig{shape: shape, policy: policy, knobs: knobs, story: repairStories[rng.Intn(len(repairStories))], lateExit: late, partition: partition})
 	}
+	for _, c := range rollConfigs(full) {
+		add(c)
+	}
 	return out
 }
 
@@ -1666,12 +1781,14 @@ func repairConfigs(full bool, keep func(repairConfig) bool) []repairConfig {
 // gang member rebuilt alone, unbounded churn and an engine error.
 func repairExplore(t *testing.T, keep func(repairConfig) bool) {
 	t.Helper()
+	t.Parallel()
 	full := os.Getenv("OME_REPAIR_HUNT") == "full"
-	maxStates, maxDepth, runs, runDepth := 24, 4, 2, 14
-	budget := 7 * time.Second
+	// Every bound is a count (states, depth, runs and engine passes), so
+	// two runs on two machines read the same states and find the same
+	// classes; the wall clock bounds nothing.
+	maxStates, maxDepth, runs, runDepth, passBudget := 24, 4, 2, 14, 300
 	if full {
-		maxStates, maxDepth, runs, runDepth = 50, 5, 3, 20
-		budget = 12 * time.Second
+		maxStates, maxDepth, runs, runDepth, passBudget = 50, 5, 3, 20, 2000
 	}
 	only := os.Getenv("OME_REPAIR_HUNT_ONLY")
 	configs := repairConfigs(full, func(c repairConfig) bool {
@@ -1685,19 +1802,36 @@ func repairExplore(t *testing.T, keep func(repairConfig) bool) {
 	examples := map[string][]example{}
 	var states, passes, allRuns int
 	started := time.Now()
-	for i, cfg := range configs {
-		w := newRepairWorld(t, cfg)
-		rep := w.explore(maxStates, maxDepth, budget*2/3)
-		w.randomRuns(&rep, int64(i+1), runs, runDepth, budget/3)
-		states += rep.states
-		passes += w.passes
-		allRuns += rep.runs
-		var parts []string
-		for class, c := range rep.counts {
-			parts = append(parts, fmt.Sprintf("%s=%d", class, c))
+	// Each configuration explores in a subtest of its own, in parallel
+	// with the others; the report below reads every result once all of
+	// them have ended.
+	type explored struct {
+		rep    repairReport
+		passes int
+	}
+	results := make([]explored, len(configs))
+	t.Run("configurations", func(t *testing.T) {
+		for i, cfg := range configs {
+			t.Run(fmt.Sprintf("%03d", i+1), func(t *testing.T) {
+				t.Parallel()
+				w := newRepairWorld(t, cfg)
+				rep := w.explore(maxStates, maxDepth, passBudget*2/3)
+				w.randomRuns(&rep, int64(i+1), runs, runDepth, passBudget/3)
+				results[i] = explored{rep: rep, passes: w.passes}
+				var parts []string
+				for class, c := range rep.counts {
+					parts = append(parts, fmt.Sprintf("%s=%d", class, c))
+				}
+				sort.Strings(parts)
+				t.Logf("config %d/%d [%s]: %d states, depth %d, %d runs, %d passes: %s", i+1, len(configs), cfg, rep.states, rep.depth, rep.runs, w.passes, strings.Join(parts, " "))
+			})
 		}
-		sort.Strings(parts)
-		t.Logf("config %d/%d [%s]: %d states, depth %d, %d runs, %d passes: %s", i+1, len(configs), cfg, rep.states, rep.depth, rep.runs, w.passes, strings.Join(parts, " "))
+	})
+	for i, cfg := range configs {
+		rep := results[i].rep
+		states += rep.states
+		passes += results[i].passes
+		allRuns += rep.runs
 		for class, n := range rep.counts {
 			totals[class] += n
 		}
@@ -1722,7 +1856,8 @@ func repairExplore(t *testing.T, keep func(repairConfig) bool) {
 			t.Logf("  [%s]\n    %s\n    path: %s\n    state:\n      %s", ex.cfg, ex.finding.message, ex.finding.path, ex.finding.picture)
 		}
 		switch class {
-		case "no-way-out", "rebuild-never-comes", "rebuild-without-record", "rebuilt-after-held", "gang-member-alone", "churn", "error":
+		case "no-way-out", "rebuild-never-comes", "rebuild-without-record", "rebuilt-after-held", "gang-member-alone", "churn", "error",
+			"failed-never-starts-again", "repair-never-starts", "wait-never-ends", "attempt-never-ends", "charged-twice":
 			t.Errorf("%s: %d states (first: %s: %s)", class, totals[class], examples[class][0].cfg, examples[class][0].finding.message)
 		}
 	}
@@ -1777,7 +1912,7 @@ func TestRepair_ReplayPath(t *testing.T) {
 	}
 	w := newRepairWorld(t, configs[0])
 	t.Logf("configuration: %s", configs[0])
-	n := w.root()
+	n := w.start()
 	for _, part := range strings.Split(text, "->") {
 		mv, err := parseRepairMove(strings.TrimSpace(part))
 		if err != nil {
@@ -1786,6 +1921,7 @@ func TestRepair_ReplayPath(t *testing.T) {
 		h := w.restore(n.snap)
 		child := &repairNode{mem: n.mem.clone(), path: append(append([]repairMove(nil), n.path...), mv)}
 		child.mem.eventsAt = len(h.events)
+		child.mem.roll.noteMove(mv)
 		for i := 0; i < mv.after; i++ {
 			w.pass(child, h)
 			t.Logf("after %d pass(es) before %s, clock +%s:\n      %s", i+1, mv, h.clk.Now().Sub(n.snap.now).Round(time.Second), w.picture(h))
@@ -1941,6 +2077,9 @@ func TestRepair_HarnessSnapshotCopiesEveryField(t *testing.T) {
 // pod deleted or evicted.
 func TestRepair_PodFaultsEndServingOrNamed(t *testing.T) {
 	repairExplore(t, func(c repairConfig) bool {
+		if c.moment != "" {
+			return false
+		}
 		switch c.story {
 		case storyExit, storyWaiting, storyLost:
 			return true
@@ -1954,6 +2093,9 @@ func TestRepair_PodFaultsEndServingOrNamed(t *testing.T) {
 // cluster with no room, and a move of an Instance.
 func TestRepair_NodeFaultsEndServingOrNamed(t *testing.T) {
 	repairExplore(t, func(c repairConfig) bool {
+		if c.moment != "" {
+			return false
+		}
 		switch c.story {
 		case storyNode, storySilent, storyRoom, storyMove:
 			return true
@@ -1967,6 +2109,9 @@ func TestRepair_NodeFaultsEndServingOrNamed(t *testing.T) {
 // their image or never become ready, with a corrective push after it.
 func TestRepair_PushesOfABrokenRevisionEndHeldOrNamed(t *testing.T) {
 	repairExplore(t, func(c repairConfig) bool {
+		if c.moment != "" {
+			return false
+		}
 		switch c.story {
 		case storyPushCrashOnce, storyPushCrashLoop, storyPushBadImage, storyPushNoReady:
 			return true
@@ -2058,53 +2203,59 @@ func (r podlessFleetRoll) podsCreated(ctx context.Context) (int, error) {
 // question once per row against one held set read once for the pass,
 // instead of rebuilding that set, one row lookup per planned Instance,
 // for every row it asks about; the one gang the roll rebuilds costs the
-// same at either size. The sampling is
-// TestBuildPlanCostGrowsWithTheInstanceCount's: each size is read as the
-// fastest of its interleaved samples, with the heap collected between
-// samples, so another process on the machine can only slow a sample
-// down and the fastest is the one it disturbed least.
+// same at either size. The cost is read as the pass's allocation count,
+// which is the same on every machine whatever else it runs, so one
+// ceiling gates everywhere; a duration would move with the load beside
+// the test.
 func TestPassOverAPodlessFleetCostGrowsWithTheInstanceCount(t *testing.T) {
 	if testing.Short() {
-		t.Skip("timing-backed gate; skipped under -short")
+		t.Skip("fleet-size gate; skipped under -short")
 	}
 	const small, large = 1000, 4000
-	// A cost that grows with the count gives a ratio near 4 between the two
-	// sizes and one that grows with its square gives 16; the ceiling sits
-	// between them, with room for a loaded machine.
-	const ceiling = 10.0
-	const samples = 9
-	previousGCPercent := debug.SetGCPercent(1000)
-	defer debug.SetGCPercent(previousGCPercent)
+	// A cost that grows with the count gives a ratio of 4 between the two
+	// sizes, less the pass's fixed share, and one that grows with its
+	// square gives 16. The ceiling sits just above the linear reading: the
+	// count does not move with the machine, so it needs no room for load.
+	const ceiling = 5.0
 	ctx := logr.NewContext(context.Background(), logr.Discard())
-	fastest := map[int]time.Duration{}
-	for i := 0; i < samples; i++ {
-		for _, n := range []int{small, large} {
-			roll := newPodlessFleetRoll(t, n)
-			goruntime.GC()
-			start := time.Now()
-			err := roll.reconcile(ctx)
-			elapsed := time.Since(start)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if opened := roll.repairsOpened(); opened != 0 {
-				t.Fatalf("%d gangs: the pass opened %d repairs on rows the roll takes", n, opened)
-			}
-			created, err := roll.podsCreated(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if created != roll.pods {
-				t.Fatalf("%d gangs: the pass created %d pods, not the %d of the one gang the roll rebuilds", n, created, roll.pods)
-			}
-			if i == 0 || elapsed < fastest[n] {
-				fastest[n] = elapsed
-			}
+	allocations := map[int]int64{}
+	for _, n := range []int{small, large} {
+		allocations[n] = podlessFleetPassAllocations(t, ctx, n)
+	}
+	ratio := float64(allocations[large]) / float64(allocations[small])
+	t.Logf("pass over gangs with no pods left: %d allocations at %d gangs, %d at %d, %.2fx (ceiling %.0fx)", allocations[small], small, allocations[large], large, ratio, ceiling)
+	if ratio > ceiling {
+		t.Errorf("the pass over %d gangs allocates %.2fx what the pass over %d allocates, above the ceiling of %.0fx: the cost grows faster than the count", large, ratio, small, ceiling)
+	}
+}
+
+// podlessFleetPassAllocations is the allocation count of one pass over a
+// fresh fleet of n gangs with no pods left: the smallest of
+// allocbudget.Samples passes, each over its own fleet built outside the
+// reading. Every pass must open no repair on the rows the roll takes and
+// create the pods of the one gang the roll rebuilds.
+func podlessFleetPassAllocations(t *testing.T, ctx context.Context, n int) int64 {
+	t.Helper()
+	best := int64(-1)
+	for i := 0; i < allocbudget.Samples; i++ {
+		roll := newPodlessFleetRoll(t, n)
+		reading, err := measureCall(func() error { return roll.reconcile(ctx) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opened := roll.repairsOpened(); opened != 0 {
+			t.Fatalf("%d gangs: the pass opened %d repairs on rows the roll takes", n, opened)
+		}
+		created, err := roll.podsCreated(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if created != roll.pods {
+			t.Fatalf("%d gangs: the pass created %d pods, not the %d of the one gang the roll rebuilds", n, created, roll.pods)
+		}
+		if count := int64(reading.allocs); best < 0 || count < best {
+			best = count
 		}
 	}
-	ratio := float64(fastest[large]) / float64(fastest[small])
-	t.Logf("pass over gangs with no pods left: %v at %d gangs, %v at %d, %.1fx (ceiling %.0fx)", fastest[small], small, fastest[large], large, ratio, ceiling)
-	if ratio > ceiling {
-		t.Errorf("the pass over %d gangs costs %.1fx the pass over %d, above the ceiling of %.0fx: the cost grows faster than the count", large, ratio, small, ceiling)
-	}
+	return best
 }

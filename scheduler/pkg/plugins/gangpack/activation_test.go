@@ -8,6 +8,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/kube-scheduler/framework"
 
 	"sigs.k8s.io/ome/scheduler/pkg/placement"
@@ -32,9 +33,13 @@ func twoMemberGang(members ...*v1.Pod) (*GangPack, *fakeHandle, []framework.Node
 	return g, h, nodes
 }
 
+// namedMember is a member of gang team/pf with a stable identity: its UID is
+// its name, so the gate finds it among the waiting pods by UID as the
+// framework's map does.
 func namedMember(name string) *v1.Pod {
 	p := gangGPUPod("team", "pf", "4")
 	p.Name = name
+	p.UID = types.UID(name)
 	return p
 }
 
@@ -62,7 +67,7 @@ func requiredAffinityTo(matchLabels map[string]string) *v1.Affinity {
 	}}
 }
 
-// TestPreFilter_MemberSetBecomesComplete_ActivatesHeldMembersOnce: a member parked because the
+// TestPreFilter_MemberSetBecomesComplete_ActivatesHeldMembersOnce: a member held because the
 // live set was short of minMember is activated by the first PreFilter that sees
 // the set complete, and only by that one. The observing member is in flight and
 // is left out of the activation. Later PreFilters of the same complete gang
@@ -72,7 +77,7 @@ func TestPreFilter_MemberSetBecomesComplete_ActivatesHeldMembersOnce(t *testing.
 	leader, worker := namedMember("leader"), namedMember("worker")
 	g, h, nodes := twoMemberGang(leader)
 
-	// Leader alone: parked on the incomplete set; nothing to wake yet.
+	// Leader alone: held back on the incomplete set; nothing to wake yet.
 	if _, st := g.PreFilter(ctx, newCycleState(), leader, nodes); st.Code() != framework.Unschedulable {
 		t.Fatalf("lone leader PreFilter = %v, want Unschedulable (templates incomplete)", st)
 	}
@@ -90,7 +95,7 @@ func TestPreFilter_MemberSetBecomesComplete_ActivatesHeldMembersOnce(t *testing.
 		t.Fatalf("activate calls after set completed = %d, want exactly 1", h.activateCalls)
 	}
 	if _, ok := h.activated["team/leader"]; !ok {
-		t.Fatalf("activated = %v, want the parked leader included", h.activated)
+		t.Fatalf("activated = %v, want the held leader included", h.activated)
 	}
 	if _, ok := h.activated["team/worker"]; ok {
 		t.Fatalf("activated = %v, want the in-flight observing worker left out", h.activated)
@@ -112,22 +117,22 @@ func TestPreFilter_MemberSetBecomesComplete_ActivatesHeldMembersOnce(t *testing.
 }
 
 // TestPreFilter_MemberSetCompletesAgain_ActivatesOnceMore: once the set is complete the
-// wake-up is spent; a member leaving (set incomplete again) re-arms it, and the
+// wake-up is spent; a member leaving (set incomplete again) sets it again, and the
 // next completion fires exactly one more activation.
 func TestPreFilter_MemberSetCompletesAgain_ActivatesOnceMore(t *testing.T) {
 	ctx := context.Background()
 	leader, worker := namedMember("leader"), namedMember("worker")
 	g, h, nodes := twoMemberGang(leader, worker)
 
-	// Complete from the start: nobody was ever parked, so nothing fires.
+	// Complete from the start: nobody was ever held, so nothing fires.
 	if _, st := g.PreFilter(ctx, newCycleState(), worker, nodes); !st.IsSuccess() {
 		t.Fatalf("worker PreFilter = %v, want Success", st)
 	}
 	if h.activateCalls != 0 {
-		t.Fatalf("activate calls on a never-parked gang = %d, want 0", h.activateCalls)
+		t.Fatalf("activate calls on a gang never held = %d, want 0", h.activateCalls)
 	}
 
-	// Worker gone: the leader parks again.
+	// Worker gone: the leader is held again.
 	g.podLister = fakeGangPodLister{pods: []*v1.Pod{leader}}
 	if _, st := g.PreFilter(ctx, newCycleState(), leader, nodes); st.Code() != framework.Unschedulable {
 		t.Fatalf("leader PreFilter after worker left = %v, want Unschedulable", st)
@@ -158,7 +163,7 @@ func TestPreFilter_MemberSetCompletesAgain_ActivatesOnceMore(t *testing.T) {
 // candidate rejected, unwound by PostFilter), never activate each other. The
 // wake-up is tied to the set-completion transition alone, so two failing
 // members cannot ping-pong through the backoff-bypassing Activate; a veto in
-// the only fitting domain parks the member without an activation of its own.
+// the only fitting domain leaves the member held without an activation of its own.
 func TestActivation_RepeatedCapacityFailures_ActivatesNoSibling(t *testing.T) {
 	ctx := context.Background()
 	leader, worker := namedMember("leader"), namedMember("worker")
@@ -280,7 +285,7 @@ func TestPreFilter_AffinityToUnplacedSibling_YieldsWithoutAssignment(t *testing.
 		}
 	}
 	if _, ok := h.activated["team/leader"]; !ok {
-		t.Fatalf("activated = %v, want the parked leader included", h.activated)
+		t.Fatalf("activated = %v, want the held leader included", h.activated)
 	}
 	if _, ok := h.activated["team/worker"]; ok {
 		t.Fatalf("activated = %v, want the in-flight worker left out", h.activated)
@@ -335,11 +340,11 @@ func TestPreFilter_AffinityTermNotOnUnplacedSibling_PlansDomain(t *testing.T) {
 }
 
 // TestPermit_IncompleteGang_ActivatesOnlyHeldSiblings: a member reaching Permit wakes the gang's
-// parked siblings and counts it under the permit trigger. A sibling whose
+// held siblings and counts it under the permit trigger. A sibling whose
 // Filter depends on this member being assumed has no cluster event to react to
 // otherwise. The member itself and siblings already waiting at the gate are
 // left out: they are placed, and a wake-up would only make a later gate
-// rejection retry at once instead of parking.
+// rejection retry at once instead of being held.
 func TestPermit_IncompleteGang_ActivatesOnlyHeldSiblings(t *testing.T) {
 	assignments := placement.New()
 	_, token, ok := assignments.Choose(placement.Gang{Group: "team/pf", TopologyKey: testKey},
@@ -347,9 +352,9 @@ func TestPermit_IncompleteGang_ActivatesOnlyHeldSiblings(t *testing.T) {
 	if !ok {
 		t.Fatal("failed to reserve gang")
 	}
-	leader, gated, parked := namedMember("leader"), namedMember("gated"), namedMember("parked")
+	leader, gated, held := namedMember("leader"), namedMember("gated"), namedMember("held")
 	h := &fakeHandle{waiting: []framework.WaitingPod{&fakeWaitingPod{pod: gated}}}
-	g := &GangPack{handle: h, assignments: assignments, podLister: fakeGangPodLister{pods: []*v1.Pod{leader, gated, parked}}}
+	g := &GangPack{handle: h, assignments: assignments, podLister: fakeGangPodLister{pods: []*v1.Pod{leader, gated, held}}}
 	state := newCycleState()
 	writeAssignment(state, "a", gangInfo{key: "team/pf", minMember: 3, topologyKey: testKey, timeout: time.Minute}, token)
 
@@ -361,8 +366,8 @@ func TestPermit_IncompleteGang_ActivatesOnlyHeldSiblings(t *testing.T) {
 	if h.activateCalls != 1 {
 		t.Fatalf("activate calls from Permit = %d, want 1", h.activateCalls)
 	}
-	if _, ok := h.activated["team/parked"]; !ok || len(h.activated) != 1 {
-		t.Fatalf("woken pods = %v, want only the parked sibling", wokenPods(h))
+	if _, ok := h.activated["team/held"]; !ok || len(h.activated) != 1 {
+		t.Fatalf("woken pods = %v, want only the held sibling", wokenPods(h))
 	}
 	if d := counterValue(t, gangActivationTotal.WithLabelValues(activationTriggerPermit)) - before; d != 1 {
 		t.Fatalf("permit activation counter delta = %v, want 1", d)
@@ -401,17 +406,17 @@ func TestGC_GangWithNoPods_DropsIncompleteSetRecord(t *testing.T) {
 }
 
 // TestPodGroupChange_MinMemberShrinks_ActivatesHeldMembers: a PodGroup change stored by the
-// plugin's own informer wakes the gang's parked members, and the retry it
+// plugin's own informer wakes the gang's held members, and the retry it
 // triggers reads the changed PodGroup. The scheduler requeues members on its own
 // PodGroup watch, which can run ahead of this informer; a member retried against
-// the older PodGroup parks again, so this is the wake-up tied to the cache
+// the older PodGroup is held again, so this is the wake-up tied to the cache
 // PreFilter actually reads.
 func TestPodGroupChange_MinMemberShrinks_ActivatesHeldMembers(t *testing.T) {
 	ctx := context.Background()
 	leader := namedMember("leader")
 	g, h, nodes := twoMemberGang(leader)
 
-	// Lone member of a 2-member gang: parked short of minMember.
+	// Lone member of a 2-member gang: held short of minMember.
 	if _, st := g.PreFilter(ctx, newCycleState(), leader, nodes); st.Code() != framework.Unschedulable {
 		t.Fatalf("lone leader PreFilter = %v, want Unschedulable (templates incomplete)", st)
 	}
@@ -427,7 +432,7 @@ func TestPodGroupChange_MinMemberShrinks_ActivatesHeldMembers(t *testing.T) {
 		t.Fatalf("activate calls after PodGroup change = %d, want 1", h.activateCalls)
 	}
 	if _, ok := h.activated["team/leader"]; !ok {
-		t.Fatalf("activated = %v, want the parked leader", h.activated)
+		t.Fatalf("activated = %v, want the held leader", h.activated)
 	}
 	if d := counterValue(t, gangActivationTotal.WithLabelValues(activationTriggerPodGroupChange)) - before; d != 1 {
 		t.Fatalf("podgroup_change activation counter delta = %v, want 1", d)

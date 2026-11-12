@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -61,6 +62,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workloadservice "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/service"
+	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	"sigs.k8s.io/ome/pkg/utils"
@@ -73,6 +75,7 @@ import (
 // +kubebuilder:rbac:groups=ome.io,resources=inferenceservices,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get;list;watch;create;update;patch;delete
@@ -146,6 +149,13 @@ type Reconciler struct {
 	// decoder bound. It has no default: SetupWithManager rejects an unset
 	// value and the writer refuses every write until it is set.
 	InstanceStatusTarget irstatus.Encoding
+
+	// ReadySinceForm is where every status write of this reconciler stores
+	// the time each Instance became Ready: the three readySince columns, or
+	// each Instance's entry when the served InferenceReplica schema lacks
+	// the columns, as the start-up schema preflight found it. The zero
+	// value writes the columns, the form of the schema this release ships.
+	ReadySinceForm irstatus.ReadySinceForm
 
 	// Expectations is the create/delete bookkeeping cache the
 	// workload pipeline uses to avoid re-issuing batches before the
@@ -402,11 +412,21 @@ type replicaPass struct {
 	// a hold recorded by an earlier pass only while this pass removed none
 	// of them.
 	instancesAtStart []int32
+	// nodes is the pass's Node reading: the engine's pod views and the
+	// status publication ask it whether the Node under each pod still
+	// exists, each name read once per pass.
+	nodes workloadtypes.NodePresence
 
 	peerRevisionFor   coordination.PeerRevisionFunc
 	deps              workloadtypes.Deps
 	podGroupInventory *workloadgang.PodGroupInventory
 	slices            *slicePass
+	// cachedPods is the pass's one cached list of the Component's pods: the
+	// engine takes it, and the slice recovery and the publication read it
+	// again when the pass wrote no pod since, with the buckets by Instance
+	// its first reader built. Nil until the engine's deps are built; the
+	// publication of a pass that ends before them lists on its own.
+	cachedPods *workloadtypes.CachedPodList
 }
 
 // passStep is one step of a pass. It reports whether the pass goes on; a
@@ -443,6 +463,7 @@ func (p *replicaPass) run(ctx context.Context) (result ctrl.Result, err error) {
 		p.readRevisionWidths,
 		p.buildPlan,
 		p.clearIdleScaleDownGauges,
+		p.openNodeReading,
 		p.installStatusPublication,
 		p.logRollbackTarget,
 		p.snapshotLivePodsForScaleDown,
@@ -741,6 +762,9 @@ func (p *replicaPass) readRevisionWidths(ctx context.Context) (bool, error) {
 // unclamped) and the readiness window (zero opens operations with no
 // deadline).
 func (p *replicaPass) buildPlan(context.Context) (bool, error) {
+	if p.rollTarget != nil {
+		p.input.ObservedState.RollTarget = p.rollTarget.Name
+	}
 	plan, err := workload.BuildPlan(v1beta1convert.ComponentTypeToWorkload(p.ir.Spec.Component), p.input.DesiredSpec, p.input.ObservedState)
 	if err != nil {
 		return false, fmt.Errorf("InferenceReplica reconciler: build plan (ir=%s/%s): %w",
@@ -760,6 +784,14 @@ func (p *replicaPass) clearIdleScaleDownGauges(context.Context) (bool, error) {
 	}
 	obsmetrics.SetScaleDownActivePods(p.ir.Namespace, p.ir.NamePrefix(), string(p.ir.Spec.Component), 0)
 	obsmetrics.SetScaleDownDeferredInstances(p.ir.Namespace, p.ir.NamePrefix(), string(p.ir.Spec.Component), 0)
+	return true, nil
+}
+
+// openNodeReading starts the pass's Node reading. The engine's pod views
+// and the status publication share it, so a pod bound to a Node that no
+// longer exists is gone for both, and each Node is read once per pass.
+func (p *replicaPass) openNodeReading(context.Context) (bool, error) {
+	p.nodes = query.NewNodeLookup(workloadtypes.NodeReaders{Cache: p.reconciler.Client, Live: p.reconciler.APIReader})
 	return true, nil
 }
 
@@ -831,7 +863,7 @@ func (p *replicaPass) recordUpdateRevision(ctx context.Context) (bool, error) {
 	if p.specTarget == nil || p.ir.Status.UpdateRevision == p.specTarget.Name {
 		return true, nil
 	}
-	if err := buildRecordUpdateRevision(p.reconciler.statusWriter(), p.reconciler.liveReader(), p.reconciler.Client, p.ir)(ctx, p.specTarget.Name); err != nil {
+	if err := buildRecordUpdateRevision(p.reconciler.statusWriter(), p.reconciler.liveReader(), p.reconciler.Client, p.ir, p.plan, p.nodes)(ctx, p.specTarget.Name); err != nil {
 		if errors.Is(err, workloadtypes.ErrStatusOwnerGone) {
 			return p.end(ctrl.Result{}, nil)
 		}
@@ -871,48 +903,57 @@ func (p *replicaPass) resolvePeerRevisions(ctx context.Context) (bool, error) {
 }
 
 // buildEngineDeps gathers what the engine calls out to: the clients, the
-// recorder, the expectations cache, the clock and the render hook. The hook
-// overlays each peer's endpoint and per-revision endpoint onto every
+// recorder, the expectations cache, the clock, the pass's Node reading and
+// the render hook. The client is the pass's cached pod list's, so every pod
+// write the engine makes is seen by the list the publication reads. The
+// hook overlays each peer's endpoint and per-revision endpoint onto every
 // rendered pod, so the prefill and decode sides address each other by
-// stable DNS and by the revision they pair with; it renders nothing when the
-// parent has no rollout groups or is nil.
+// stable DNS under the configured cluster domain and by the revision they
+// pair with; it renders nothing when the parent has no rollout groups or is
+// nil.
 func (p *replicaPass) buildEngineDeps(context.Context) (bool, error) {
+	clusterDomain, err := p.reconciler.clusterDomain(p.log)
+	if err != nil {
+		return false, fmt.Errorf("InferenceReplica reconciler: read ingress.clusterDomain (component=%s): %w", p.ir.Spec.Component, err)
+	}
+	p.cachedPods = workloadtypes.NewCachedPodList(p.reconciler.Client)
+	p.input.CachedPods = p.cachedPods
 	p.deps = workloadtypes.Deps{
-		Client:       p.reconciler.Client,
+		Client:       p.cachedPods.Client(),
 		APIReader:    p.reconciler.APIReader,
 		Recorder:     p.reconciler.Recorder,
 		Expectations: p.reconciler.Expectations,
 		Clock:        p.reconciler.Clock,
-		RenderHook:   ISVCRenderHook(p.parent, p.peerRevisionFor),
+		NodePresence: p.nodes,
+		RenderHook:   ISVCRenderHook(p.parent, clusterDomain, p.peerRevisionFor),
 	}
 	return true, nil
 }
 
-// observePodGroups reads the PodGroups this owner controls when a gang
-// decision needs the apiserver's picture, removes the PodGroups left by
-// Instances that became single-pod, and installs the per-Instance resource
-// finalization that removes an Instance's PodGroup with it. A removal still
-// in flight requeues on the scale-down cadence.
+// observePodGroups reads the PodGroups this owner controls, removes the
+// PodGroups left by Instances that became single-pod, and installs the
+// per-Instance resource finalization that removes an Instance's PodGroup
+// with it. The reading is the apiserver's when this pass may delete a group
+// on it alone, a pending scale-down or a row a teardown owns, or when the
+// last pass found the PodGroup API gone, and the informer cache's
+// otherwise; a gang's write, a stale group's deletion and a finalization
+// read the apiserver's before they decide. A removal still in flight
+// requeues on the scale-down cadence.
 func (p *replicaPass) observePodGroups(ctx context.Context) (bool, error) {
 	if !p.input.DesiredSpec.GangSchedulingAvailable {
 		return true, nil
 	}
-	observe, err := p.reconciler.requiresAuthoritativePodGroupInventory(ctx, p.input, p.plan)
+	inventory, err := p.observePodGroupInventory(ctx)
 	if err != nil {
-		return false, fmt.Errorf("InferenceReplica reconciler: check pod group inventory requirement (component=%s): %w", p.ir.Spec.Component, err)
+		return false, fmt.Errorf("InferenceReplica reconciler: observe pod groups (component=%s): %w", p.ir.Spec.Component, err)
 	}
-	if observe {
-		p.podGroupInventory, err = workloadgang.ObservePodGroups(ctx, p.deps.Reader(), p.input.OwnerObject)
-		if err != nil {
-			return false, fmt.Errorf("InferenceReplica reconciler: observe pod groups (component=%s): %w", p.ir.Spec.Component, err)
-		}
-		blocked, cleanupErr := p.reconciler.reconcileStaleSinglePodGroups(ctx, p.ir, &p.input, p.plan, p.podGroupInventory)
-		if cleanupErr != nil {
-			return false, cleanupErr
-		}
-		if blocked {
-			return p.end(scaleDownRequeueResult(p.reconciler.ScaleDownRequeueInterval), nil)
-		}
+	p.podGroupInventory = inventory
+	blocked, cleanupErr := p.reconciler.reconcileStaleSinglePodGroups(ctx, p.ir, &p.input, p.plan, p.podGroupInventory)
+	if cleanupErr != nil {
+		return false, cleanupErr
+	}
+	if blocked {
+		return p.end(scaleDownRequeueResult(p.reconciler.ScaleDownRequeueInterval), nil)
 	}
 	p.input.FinalizeInstanceResources = workloadgang.BuildFinalizeInstanceResources(
 		p.deps.Client, p.deps.Reader(), p.podGroupInventory, p.input.OwnerObject, p.input.Key.OwnerName, p.plan.Component)
@@ -966,7 +1007,7 @@ func (p *replicaPass) tendSlices(ctx context.Context) (bool, error) {
 	if p.err != nil {
 		return true, nil
 	}
-	if err := p.reconciler.recoverLostSlices(ctx, p.ir, p.input, p.slices); err != nil {
+	if err := p.reconciler.recoverLostSlices(ctx, p.deps.Client, p.ir, p.input, p.slices); err != nil {
 		p.result = ctrl.Result{}
 		p.err = fmt.Errorf("InferenceReplica reconciler: recover lost TPU slices (component=%s): %w", p.ir.Spec.Component, err)
 		return true, nil
@@ -997,19 +1038,35 @@ func (p *replicaPass) reconcileHeadlessService(ctx context.Context) (bool, error
 }
 
 // publishStatus is the end of every pass past installStatusPublication, run
-// on every return with the result the pass holds. It promotes the current
+// on every return with the result the pass holds. It reads the Component's
+// pods from the pass's cached list, the one the engine took when the pass
+// wrote no pod since and a fresh cached list otherwise, promotes the current
 // revision when every Instance is on the spec target, writes the counters,
 // the conditions and the hold, sweeps old revisions and logs the revision
-// transitions. A stale read behind a write requeues in place of the result;
-// a write failure is reported only when the pass had no error of its own,
-// so a status failure never hides an engine failure. A pass with no error
-// comes back for the earliest pod that crosses its minReadySeconds window,
-// which raises the Available counters with no watch event.
+// transitions. The promotion and the status write decide from the same
+// pods, read from the pass's list with the buckets by Instance the first
+// reader of the list built; a failed list fails the publication as a failed
+// write does. A stale
+// read behind a write requeues in place of the result; a write failure is
+// reported only when the pass had no error of its own, so a status failure
+// never hides an engine failure. A pass with no error comes back for the earliest pod that
+// crosses its minReadySeconds window, which raises the Available counters
+// with no watch event.
 func (p *replicaPass) publishStatus(ctx context.Context, result ctrl.Result, err error) (ctrl.Result, error) {
-	if ended, promoteResult, promoteErr := p.promoteCurrentRevision(ctx, err); ended {
-		return promoteResult, promoteErr
+	var nextAvailableIn time.Duration
+	// A pass that ended before the engine made its list reads one of its
+	// own here, taken once for both readers.
+	list := p.cachedPods
+	if list == nil {
+		list = workloadtypes.NewCachedPodList(p.reconciler.Client)
 	}
-	nextAvailableIn, serr := p.reconciler.aggregateAndWriteStatus(ctx, p.ir, p.plan, p.specTarget, p.holdObserved, p.hold, p.instancesAtStart)
+	pods, serr := list.Pods(ctx, componentPodLister(p.reconciler.Client, p.ir))
+	if serr == nil {
+		if ended, promoteResult, promoteErr := p.promoteCurrentRevision(ctx, err, list.ByInstance(pods, query.BucketPodsByInstanceIdx)); ended {
+			return promoteResult, promoteErr
+		}
+		nextAvailableIn, serr = p.reconciler.aggregateAndWriteStatus(ctx, p.ir, pods, list, p.plan, p.specTarget, p.nodes, p.holdObserved, p.hold, p.instancesAtStart)
+	}
 	if errors.Is(serr, workloadtypes.ErrStatusMutationPrecondition) {
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -1035,15 +1092,17 @@ func (p *replicaPass) publishStatus(ctx context.Context, result ctrl.Result, err
 
 // promoteCurrentRevision writes currentRevision against the spec target
 // before the status write, so the Ready condition reads the promoted value.
-// It ends the publication, in place of the pass's result, on a stale read
-// (requeue) and, when the pass had no error of its own, on a conflict
-// (requeue) or another failure (the error); behind a pass error the failure
-// is logged and the pass error stands.
-func (p *replicaPass) promoteCurrentRevision(ctx context.Context, passErr error) (bool, ctrl.Result, error) {
+// byInstance are the Component's pods the publication listed, bucketed by
+// Instance. It ends the
+// publication, in place of the pass's result, on a stale read (requeue)
+// and, when the pass had no error of its own, on a conflict (requeue) or
+// another failure (the error); behind a pass error the failure is logged
+// and the pass error stands.
+func (p *replicaPass) promoteCurrentRevision(ctx context.Context, passErr error, byInstance map[int32][]*corev1.Pod) (bool, ctrl.Result, error) {
 	if p.specTarget == nil {
 		return false, ctrl.Result{}, nil
 	}
-	perr := buildPromoteCurrentRevision(p.reconciler.statusWriter(), p.reconciler.liveReader(), p.reconciler.Client, p.ir)(ctx, p.specTarget.Name)
+	perr := promoteCurrentRevisionOverPods(ctx, p.reconciler.statusWriter(), p.reconciler.liveReader(), p.ir, p.specTarget.Name, workloadstatus.PodRevisionsByInstance(byInstance))
 	if perr == nil {
 		return false, ctrl.Result{}, nil
 	}
@@ -1154,25 +1213,23 @@ func foldRequeueAfter(result ctrl.Result, requeueAfter time.Duration) ctrl.Resul
 	return result
 }
 
-// requiresAuthoritativePodGroupInventory keeps steady single-pod workloads on
-// the owner-UID cache index while preserving live proofs for lifecycle work.
-func (r *Reconciler) requiresAuthoritativePodGroupInventory(
-	ctx context.Context,
-	input workloadtypes.ReconcileInput,
-	plan workloadtypes.ComponentPlan,
-) (bool, error) {
-	for _, instance := range plan.Instances {
-		if instance.TotalPods() > 1 {
-			return true, nil
-		}
+// observePodGroupInventory reads the PodGroups this owner controls through
+// the owner-UID cache index, and from the apiserver when the pass may
+// delete one on that reading alone, a scale-down pending or a row a
+// teardown owns, or while the replica's GangSchedulingUnavailable condition
+// is True. The manager found the PodGroup API at its start, so that
+// condition records a pass whose apiserver read found the API gone since;
+// the cache keeps answering without the API, and only the apiserver can
+// say whether it is back, so the pass takes the apiserver's answer and
+// writes the condition from it. The cache's picture settles a gang whose
+// group needs no write; every write, reset and deletion reads the
+// apiserver's first.
+func (p *replicaPass) observePodGroupInventory(ctx context.Context) (*workloadgang.PodGroupInventory, error) {
+	if scaleDownPodObservationRequired(p.input, p.plan) || len(TerminalFinalizationOwned(p.input.ObservedState)) > 0 ||
+		apimeta.IsStatusConditionTrue(p.ir.Status.Conditions, string(workloadtypes.ConditionGangSchedulingUnavailable)) {
+		return workloadgang.ObservePodGroups(ctx, p.deps.Reader(), p.input.OwnerObject)
 	}
-	if scaleDownPodObservationRequired(input, plan) {
-		return true, nil
-	}
-	if len(TerminalFinalizationOwned(input.ObservedState)) > 0 {
-		return true, nil
-	}
-	return workloadgang.CachedOwnerHasPodGroups(ctx, r.Client, input.OwnerObject)
+	return workloadgang.ObserveCachedPodGroups(ctx, p.deps.Client, p.input.OwnerObject)
 }
 
 func podsControlledBy(pods []*corev1.Pod, ownerUID types.UID) []*corev1.Pod {
@@ -1217,6 +1274,18 @@ func (r *Reconciler) reconcileStaleSinglePodGroups(
 			groups = append(groups, stalePodGroup{name: name, index: instance.Index})
 		}
 	}
+	if len(groups) == 0 {
+		return false, nil
+	}
+	// A deletion decides on the apiserver's inventory: a group the cache
+	// showed and the apiserver no longer holds is nothing to delete.
+	if err := inventory.ReadLive(ctx, r.APIReader); err != nil {
+		return false, fmt.Errorf("InferenceReplica reconciler: observe pod groups for stale PodGroup cleanup: %w", err)
+	}
+	groups = slices.DeleteFunc(groups, func(group stalePodGroup) bool {
+		_, found := inventory.OwnedByName(group.name)
+		return !found
+	})
 	if len(groups) == 0 {
 		return false, nil
 	}
@@ -1354,9 +1423,12 @@ type lifecycleSettings struct {
 	// pod a rollout abandons before it ever served. Zero leaves such a pod
 	// its own grace.
 	AbandonedReplacement time.Duration
-	// GangScheduleTimeout bounds the PodGroup schedule timeout derived
-	// from InstanceReadyTimeout. Nil passes the derived value through to
-	// the scheduler.
+	// SchedulingRetry bounds the writes that ask the scheduler again for
+	// a gang pod left Pending with no node. Nil never writes one.
+	SchedulingRetry *workloadtypes.SchedulingRetryPolicy
+	// GangScheduleTimeout is the range of PodGroup schedule timeouts the
+	// scheduler accepts, which bounds the placement grace a gang's
+	// PodGroup carries as its timeout. Nil passes the grace through.
 	GangScheduleTimeout *workloadtypes.GangScheduleTimeoutClamp
 	// MigrationAudit bounds migration admission and the status-record
 	// horizon. Nil holds every migration request and ages out no record.
@@ -1402,8 +1474,11 @@ func (r *Reconciler) resolveLifecycleSettings(log logr.Logger) lifecycleSettings
 	if settings.AbandonedReplacement == 0 {
 		log.V(1).Info("abandoned-replacement grace unconfigured (no lifecycle.abandonedReplacementGracePeriod); an abandoned replacement keeps its own termination grace")
 	}
+	if settings.SchedulingRetry, err = cfg.SchedulingRetry.ToPolicy(); err != nil {
+		log.V(1).Info("scheduling retry invalid; no pod is written for the scheduler this pass", "error", err.Error())
+	}
 	if settings.GangScheduleTimeout, err = cfg.GangScheduleTimeout.ToClamp(); err != nil {
-		log.V(1).Info("gang schedule timeout invalid; the derived timeout is unclamped this pass", "error", err.Error())
+		log.V(1).Info("gang schedule timeout invalid; the placement grace reaches the scheduler unbounded this pass", "error", err.Error())
 	}
 	if settings.MigrationAudit, err = cfg.Audit.ToPolicy(); err != nil {
 		log.V(1).Info("migration audit policy invalid; no migration is admitted this pass", "error", err.Error())
@@ -1415,7 +1490,7 @@ func (r *Reconciler) resolveLifecycleSettings(log logr.Logger) lifecycleSettings
 		log.V(1).Info("retry-block history limit invalid; historical blocks are kept this pass", "error", err.Error())
 	}
 	if settings.GangScheduleTimeout == nil {
-		log.V(1).Info("gang schedule timeout unconfigured (no lifecycle.gangScheduleTimeout); the timeout derived from InstanceReadyTimeout reaches the scheduler unclamped")
+		log.V(1).Info("gang schedule timeout unconfigured (no lifecycle.gangScheduleTimeout); the placement grace reaches the scheduler unbounded")
 	}
 	if settings.MigrationAudit == nil {
 		log.V(1).Info("migration capacity unconfigured (no lifecycle.audit); migration requests are held until it is set and terminal records are not aged out")
@@ -1448,7 +1523,7 @@ func (r *Reconciler) reportInstanceReadyTimeout(ctx context.Context, log logr.Lo
 		Status:             metav1.ConditionFalse,
 		Reason:             string(workloadtypes.ReasonInstanceReadyTimeoutConfigured),
 		Message:            fmt.Sprintf("Instance readiness deadline is %s", timeout),
-		LastTransitionTime: metav1.Now(),
+		LastTransitionTime: metav1.NewTime(r.now()),
 		ObservedGeneration: ir.Generation,
 	}
 	if timeout <= 0 {
@@ -1488,6 +1563,18 @@ func (r *Reconciler) resolveConfiguredInstanceReadyTimeout(log logr.Logger) time
 		log.V(1).Info("instance-ready timeout unconfigured (no lifecycle.instanceReadyTimeout); a Component that sets none of its own opens operations with no deadline")
 	}
 	return timeout
+}
+
+// clusterDomain reads ingress.clusterDomain from the operator ConfigMap
+// through the shared short-TTL cache: the DNS domain the peer addresses on
+// every rendered pod end with. Empty when the block names none, so the
+// addresses carry no domain suffix; nothing in the code supplies a default.
+func (r *Reconciler) clusterDomain(log logr.Logger) (string, error) {
+	if r.Clientset == nil {
+		log.V(1).Info("cluster domain unresolved: no clientset wired; peer addresses carry no domain suffix")
+		return "", nil
+	}
+	return controllerconfig.ClusterDomainCached(r.ConfigCache, r.Clientset)
 }
 
 // loadLifecycleConfig fetches the lifecycle block through the shared
@@ -1590,6 +1677,12 @@ func (r *Reconciler) resolveCoordinationGroupDefaults(log logr.Logger) coordinat
 			log.V(1).Info("prefill/decode roll firstSide invalid; both sides start their batch together this pass", "error", rerr.Error())
 		}
 		defaults.PrefillDecode = coordination.PrefillDecodeRules{KeepRatio: keepRatio, FirstSide: v1beta1.ComponentType(firstSide)}
+		// The gate proves a pod that came back over the same grace the
+		// workload reads; an invalid value is reported where the workload
+		// loads it and leaves minReadySeconds alone here.
+		if grace, gerr := lifecycle.ToGracePeriod(); gerr == nil {
+			defaults.ProvingGrace = grace
+		}
 	}
 	return defaults
 }
@@ -1839,11 +1932,13 @@ func newestUnsucceededAutoMigration(migrations []v1beta1.MigrationStatus, idx in
 const EventReasonRollbackRevisionForeign = "RollbackRevisionForeign"
 
 // rollbackRevision resolves spec.pacing.rollbackToRevision to a
-// ControllerRevision this replica controls. A missing revision yields nil
-// and the replica rolls to its spec. A revision this replica does not
-// control (another controller, or none) is refused the same way, so a
-// pacing block written by a user can never render another workload's pod
-// template, and the refusal is reported as a Warning.
+// ControllerRevision of this replica's history: one it controls, or one its
+// service owns (a revision a previous replica of the same service minted).
+// A missing revision yields nil and the replica rolls to its spec. A
+// revision outside the history (another controller, or none) is refused the
+// same way, so a pacing block written by a user can never render another
+// workload's pod template, and the refusal is reported as a Warning. A
+// revision of the history that does not yet name the service gains it.
 func (r *Reconciler) rollbackRevision(ctx context.Context, ir *v1beta1.InferenceReplica, eventTarget client.Object) (*appsv1.ControllerRevision, error) {
 	if ir.Spec.Pacing == nil || ir.Spec.Pacing.RollbackToRevision == nil || *ir.Spec.Pacing.RollbackToRevision == "" {
 		return nil, nil
@@ -1856,13 +1951,17 @@ func (r *Reconciler) rollbackRevision(ctx context.Context, ir *v1beta1.Inference
 		}
 		return nil, fmt.Errorf("get rollback revision %s: %w", name, err)
 	}
-	if !metav1.IsControlledBy(cr, ir) {
+	scope := revisionScope(ir)
+	if !revision.RetainedBy(cr, ir.UID, scope) {
 		if r.Recorder != nil {
 			r.Recorder.Eventf(eventTarget, corev1.EventTypeWarning, EventReasonRollbackRevisionForeign,
 				"InferenceReplica %s/%s: rollback revision %s is not controlled by this replica; rolling to the spec instead",
 				ir.Namespace, ir.Name, name)
 		}
 		return nil, nil
+	}
+	if err := revision.EnsureScopeOwner(ctx, r.Client, cr, scope); err != nil {
+		return nil, err
 	}
 	return cr, nil
 }
@@ -1994,6 +2093,14 @@ func irRevisionKey(ir *v1beta1.InferenceReplica) revision.Key {
 	}
 }
 
+// revisionScope is the owner a projected replica's revision history carries
+// beside the replica: the InferenceService that controls it, so the history
+// stays when the replica is deleted and projected again and leaves with the
+// service. nil for a standalone replica, whose history is its own.
+func revisionScope(ir *v1beta1.InferenceReplica) *metav1.OwnerReference {
+	return revision.ScopeOwner(ir, isvcGVK.GroupKind())
+}
+
 // revisionScopeUID returns the replica's scope UID. The scope UID feeds the
 // hash and therefore the revision name; listing, numbering and retention
 // select by the key's labels (irRevisionKey). A projected replica's revision
@@ -2039,10 +2146,13 @@ func (r *Reconciler) ensureRevisionWithCollisionRetry(ctx context.Context, ir *v
 	if err != nil {
 		return nil, err
 	}
+	// The history of a projected replica is its service's: every revision
+	// names the service as an owner, so it outlives the replica.
+	scope := revisionScope(ir)
 	// A multi-pod revision that records no width stays the target while its
 	// gangs run the desired width, so a deploy rolls no gang whose template
 	// did not change.
-	adopted, err := revision.AdoptRevisionWithoutWidth(ctx, r.Client, r.APIReader, ir, revKey, hash,
+	adopted, err := revision.AdoptRevisionWithoutWidth(ctx, r.Client, r.APIReader, ir, scope, revKey, hash,
 		twin, workloadtypes.WorkerSizeOf(input.DesiredSpec.Runners), ir.Status.UpdateRevision,
 		r.observedWorkerWidth(ctx, ir, input.ObservedState.InstanceStatuses))
 	if err != nil {
@@ -2053,7 +2163,7 @@ func (r *Reconciler) ensureRevisionWithCollisionRetry(ctx context.Context, ir *v
 	}
 	target, collision, err := revision.EnsureControllerRevisionFromHash(
 		ctx, r.Client, r.APIReader,
-		ir, irGVK, revKey, hash, raw,
+		ir, irGVK, revKey, hash, raw, scope,
 	)
 	if err != nil {
 		return nil, err
@@ -2078,7 +2188,7 @@ func (r *Reconciler) ensureRevisionWithCollisionRetry(ctx context.Context, ir *v
 	}
 	target, collision, err = revision.EnsureControllerRevisionFromHash(
 		ctx, r.Client, r.APIReader,
-		ir, irGVK, revKey, hash, raw,
+		ir, irGVK, revKey, hash, raw, scope,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("retry after CollisionCount bump: %w", err)

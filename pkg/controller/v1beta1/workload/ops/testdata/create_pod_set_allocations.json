@@ -1,0 +1,18 @@
+{
+  "recordedOn": {
+    "date": "2026-11-07",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "Reading every planned Instance's pod set in one Create pass over a Component at rest, every Instance Ready on the spec revision with every pod serving: the revision the attempt renders, the runners at that revision, the names the set asks for and the names no live pod holds. The set is read against the pods' names as they stand (query.PodNameIs) and the live pods are counted without a list (query.LivePodCount), so the reading allocates nothing at any shape; a name is built only for a pod the set is short of. Before, the pass built every name of the set to compare it with the pods' names (two allocations for a single-pod Instance, nine for a gang of eight, three for a gang of two) and a gang of eight copied and indexed its live pods for the compare: 2,000 / 8,000 / 1,760 / 5,175 allocations and 80,000 / 320,000 / 122,880 / 276,000 bytes at 1000x1 / 4000x1 / 160x8 / 1725x2.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/pod-set/allocations": 0,
+    "1000x1/pod-set/bytes": 0,
+    "160x8/pod-set/allocations": 0,
+    "160x8/pod-set/bytes": 0,
+    "1725x2/pod-set/allocations": 0,
+    "1725x2/pod-set/bytes": 0,
+    "4000x1/pod-set/allocations": 0,
+    "4000x1/pod-set/bytes": 0
+  }
+}

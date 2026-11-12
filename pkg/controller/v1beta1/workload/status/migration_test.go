@@ -16,15 +16,15 @@ import (
 // request's UUID with the deadline the timeout gives. A second pin of
 // the same request is a no-op, and a source slot the writer had to
 // append is never resurrected.
-func TestStampMigrationPin_PinsEachSideOnceAndResurrectsNoSource(t *testing.T) {
+func TestMigrationPairWrite_WritesEachSideOnceAndResurrectsNoSource(t *testing.T) {
 	now := time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC)
 	ctx := context.Background()
 	w := newRowWriter(types.InstanceStatus{Index: 0, Phase: types.InstancePhaseReady, Incarnation: 2})
 
-	if err := StampMigrationPin(ctx, w.input(now), 0, 1, MigrationRoleSource, "req-1", time.Hour); err != nil {
+	if err := StampMigrationPin(ctx, w.input(now), 0, 1, MigrationRoleSource, "req-1", "", time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if err := StampMigrationPin(ctx, w.input(now), 1, 0, MigrationRoleSurge, "req-1", time.Hour); err != nil {
+	if err := StampMigrationPin(ctx, w.input(now), 1, 0, MigrationRoleSurge, "req-1", "", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	source, surge := w.rows[0], w.rows[1]
@@ -43,10 +43,10 @@ func TestStampMigrationPin_PinsEachSideOnceAndResurrectsNoSource(t *testing.T) {
 	}
 
 	writes := w.writes
-	if err := StampMigrationPin(ctx, w.input(now), 0, 1, MigrationRoleSource, "req-1", time.Hour); err != nil {
+	if err := StampMigrationPin(ctx, w.input(now), 0, 1, MigrationRoleSource, "req-1", "", time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if err := StampMigrationPin(ctx, w.input(now), 1, 0, MigrationRoleSurge, "req-1", time.Hour); err != nil {
+	if err := StampMigrationPin(ctx, w.input(now), 1, 0, MigrationRoleSurge, "req-1", "", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if w.writes != writes {
@@ -54,7 +54,7 @@ func TestStampMigrationPin_PinsEachSideOnceAndResurrectsNoSource(t *testing.T) {
 	}
 
 	empty := newRowWriter()
-	if err := StampMigrationPin(ctx, empty.input(now), 4, 5, MigrationRoleSource, "req-2", time.Hour); err != nil {
+	if err := StampMigrationPin(ctx, empty.input(now), 4, 5, MigrationRoleSource, "req-2", "", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if empty.writes != 0 {
@@ -93,13 +93,41 @@ func migrationPair(store *terminalMutationStore) (source types.InstanceStatus, i
 	return source, input
 }
 
+// The operation written names the replacement's revision only when the
+// move was admitted while a roll could take the source: both sides then
+// carry the roll's target, and a write with no revision carries
+// none, which every reader takes as the source's running revision.
+func TestMigrationPairWrite_NamesTheReplacementsRevisionOnBothSides(t *testing.T) {
+	now := time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	w := newRowWriter(types.InstanceStatus{Index: 0, Phase: types.InstancePhaseReady, Incarnation: 2, RunningRevision: "svc-engine-old00000"})
+	if err := StampMigrationPin(ctx, w.input(now), 0, 1, MigrationRoleSource, "req-1", "svc-engine-new00000", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := StampMigrationPin(ctx, w.input(now), 1, 0, MigrationRoleSurge, "req-1", "svc-engine-new00000", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	source, surge := w.rows[0], w.rows[1]
+	for idx, row := range map[int32]types.InstanceStatus{0: source, 1: surge} {
+		if row.Operation == nil || row.Operation.TargetRevision != "svc-engine-new00000" {
+			t.Fatalf("row %d operation = %+v, want the roll target on the operation", idx, row.Operation)
+		}
+		if row.TargetRevision != "" {
+			t.Fatalf("row %d targetRevision = %q, want the row's own field untouched", idx, row.TargetRevision)
+		}
+	}
+	if !MigrationSourceOwnsRemoval(&source, "req-1", 1) || !MigrationSurgeOwnsPromotion(&surge, "req-1", 0) {
+		t.Fatalf("pair = %+v / %+v, want both sides still read as the live pair", source, surge)
+	}
+}
+
 // The pair is written once, fenced on the source the pass read; a source
 // whose lifecycle moved since, or an owner replaced since, writes nothing.
 func TestStartMigration_WritesThePairOnlyAgainstTheSourceItRead(t *testing.T) {
 	store := &terminalMutationStore{ownerUID: "owner-a"}
 	source, input := migrationPair(store)
 
-	started, err := StartMigration(context.Background(), input, &source, nil, "req-1", 1, time.Hour)
+	started, err := StartMigration(context.Background(), input, &source, nil, "req-1", 1, "", time.Hour)
 	if err != nil || !started || store.writes != 1 {
 		t.Fatalf("start = %v, %v (writes=%d), want the pair written once", started, err, store.writes)
 	}
@@ -112,14 +140,14 @@ func TestStartMigration_WritesThePairOnlyAgainstTheSourceItRead(t *testing.T) {
 	moved := drifted.statuses[0]
 	moved.Incarnation++
 	drifted.statuses[0] = moved
-	started, err = StartMigration(context.Background(), input, &source, nil, "req-1", 1, time.Hour)
+	started, err = StartMigration(context.Background(), input, &source, nil, "req-1", 1, "", time.Hour)
 	if err != nil || started || drifted.writes != 0 {
 		t.Fatalf("start against a drifted source = %v, %v (writes=%d), want nothing written", started, err, drifted.writes)
 	}
 
 	replaced := &terminalMutationStore{ownerUID: "owner-b"}
 	source, input = migrationPair(replaced)
-	started, err = StartMigration(context.Background(), input, &source, nil, "req-1", 1, time.Hour)
+	started, err = StartMigration(context.Background(), input, &source, nil, "req-1", 1, "", time.Hour)
 	if err != nil || started || replaced.writes != 0 {
 		t.Fatalf("start against a replaced owner = %v, %v (writes=%d), want nothing written", started, err, replaced.writes)
 	}
@@ -127,10 +155,10 @@ func TestStartMigration_WritesThePairOnlyAgainstTheSourceItRead(t *testing.T) {
 
 // The promote lands only while both sides are still the pair the pass
 // read; a surge that has since been re-pinned is left alone.
-func TestStampMigrationSurgeReady_RequiresBothSidesOfThePair(t *testing.T) {
+func TestMigrationSurgeReadyWrite_RequiresBothSidesOfThePair(t *testing.T) {
 	store := &terminalMutationStore{ownerUID: "owner-a"}
 	source, input := migrationPair(store)
-	if _, err := StartMigration(context.Background(), input, &source, nil, "req-1", 1, time.Hour); err != nil {
+	if _, err := StartMigration(context.Background(), input, &source, nil, "req-1", 1, "", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	pinnedSource, surge := store.statuses[0], store.statuses[1]

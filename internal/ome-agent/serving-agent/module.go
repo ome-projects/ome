@@ -17,18 +17,15 @@ type servingSidecarParams struct {
 	ObjectStorageDataStores *ociobjectstore.OCIOSDataStore
 }
 
-var Module = fx.Provide(
-	func(v *viper.Viper, params servingSidecarParams) (*ServingSidecar, error) {
-		config, err := NewServingSidecarConfig(
-			WithViper(v),
-			WithAnotherLog(params.AnotherLogger),
-			WithAppParams(params),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error creating serving sidecar config: %+v", err)
-		}
-		if err := config.Validate(); err != nil {
-			return nil, fmt.Errorf("error validating serving sidecar config: %w", err)
-		}
-		return NewServingSidecar(config)
-	})
+var Module = fx.Provide(provideServingSidecar)
+
+func provideServingSidecar(v *viper.Viper, params servingSidecarParams) (*ServingSidecar, error) {
+	config, err := newConfig(v, params)
+	if err != nil {
+		return nil, fmt.Errorf("error creating serving sidecar config: %+v", err)
+	}
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("error validating serving sidecar config: %w", err)
+	}
+	return NewServingSidecar(config)
+}

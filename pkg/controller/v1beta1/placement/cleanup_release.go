@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"slices"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/util/retry"
@@ -52,14 +54,20 @@ func releasesCleanupWait(source *v1beta1.InferenceService) bool {
 
 // planIntentAnnotations returns the source annotations a plan's input digest
 // covers. The cleanup release request names a plan revision, so setting or
-// removing it must not make a new one. The API server stores no empty
-// annotation map, so a map left empty counts as none.
+// removing it must not make a new one. The routing publisher options change
+// only how the TrafficMap publisher publishes the service, never where its
+// replicas run. The API server stores no empty annotation map, so a map left
+// empty counts as none.
 func planIntentAnnotations(annotations map[string]string) map[string]string {
-	if _, present := annotations[constants.PlacementReleaseCleanupWaitAnnotation]; !present {
+	excluded := func(key string) bool {
+		return key == constants.PlacementReleaseCleanupWaitAnnotation ||
+			strings.HasPrefix(key, constants.RoutingPublisherOptionAnnotationPrefix)
+	}
+	if !slices.ContainsFunc(slices.Collect(maps.Keys(annotations)), excluded) {
 		return annotations
 	}
 	out := maps.Clone(annotations)
-	delete(out, constants.PlacementReleaseCleanupWaitAnnotation)
+	maps.DeleteFunc(out, func(key, _ string) bool { return excluded(key) })
 	if len(out) == 0 {
 		return nil
 	}

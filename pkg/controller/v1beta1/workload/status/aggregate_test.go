@@ -350,9 +350,9 @@ func TestCurrentRevisionFor_AnAttemptInFlightKeepsTheRollbackOpen(t *testing.T) 
 			[]types.InstanceStatus{ready(0, prior), ready(1, prior), ready(2, prior)}, gangsOnPrior, "", prior, nil, prior, prior},
 		{"a rollback onto the current revision withdraws it while an attempt in flight still records an Instance on the superseded revision, whatever its pods carry",
 			lastGangStarting, gangsOnPrior, prior, prior, nil, "", ""},
-		{"an attempt in flight whose row already names the withdrawn revision does not hold the restore",
+		{"an attempt in flight whose row already names the cleared revision holds the restore until it promotes the Instance",
 			[]types.InstanceStatus{ready(0, prior), inFlight(1, types.UpdateStepInPlace, prior, prior)},
-			status.PodRevisions{0: on(prior), 1: on(prior)}, "", prior, nil, prior, prior},
+			status.PodRevisions{0: on(prior), 1: on(prior)}, "", prior, nil, prior, ""},
 		{"a spent attempt leaves the pods to decide: a Failed Instance whose pods carry the withdrawn revision does not hold the restore",
 			[]types.InstanceStatus{ready(0, prior), parked(1, next, prior)},
 			status.PodRevisions{0: on(prior), 1: on(prior)}, "", prior, heldPrior, prior, prior},
@@ -361,6 +361,93 @@ func TestCurrentRevisionFor_AnAttemptInFlightKeepsTheRollbackOpen(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			if got := status.CurrentRevisionFor(tc.rows, tc.current, tc.update, tc.blocks, tc.withdrawn, tc.pods); got != tc.want {
 				t.Errorf("CurrentRevisionFor(current=%q, update=%q, withdrawn=%q) = %q, want %q", tc.current, tc.update, tc.withdrawn, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCurrentRevisionFor_ARestoreWaitsForEveryAttemptInFlight: the current
+// revision, cleared because the update revision was pushed again while an
+// Instance was off it, comes back once no attempt a pass still drives is
+// open and every pod carries the revision. An Instance whose lost set is
+// built again toward the revision holds the restore while its new pods come
+// up, whatever label they carry, as does a repair in flight; a spent
+// attempt on a Failed Instance leaves the pods to decide, so a roll back
+// whose Instance comes back broken still lands. A push over the same rows
+// reads as it always has: the revision it had until every Instance is Ready
+// on the new one.
+func TestCurrentRevisionFor_ARestoreWaitsForEveryAttemptInFlight(t *testing.T) {
+	const one, two = "isvc-engine-aaaaaaaa", "isvc-engine-bbbbbbbb"
+	ready := func(idx int32, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, RunningRevision: rev}
+	}
+	// rebuilt is a row whose pods were lost and are created again toward
+	// target by the Create pass; the row keeps the revision it ran.
+	rebuilt := func(idx int32, running, target string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseCreating, RunningRevision: running, TargetRevision: target,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationCreate, Step: status.CreateStepCreatePods, TargetRevision: target}}
+	}
+	// lost is a row whose pods are gone before the Create pass has committed
+	// the rebuild: Pending, no operation.
+	lost := func(idx int32, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhasePending, RunningRevision: rev}
+	}
+	// repairing is a row the restart pass drives on its own revision.
+	repairing := func(idx int32, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseRestarting, RunningRevision: rev,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationRestart, Step: types.RestartStepDrain}}
+	}
+	// broken is a spent attempt: Failed on its revision, nothing driving it.
+	broken := func(idx int32, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseFailed, RunningRevision: rev}
+	}
+	// stopped is a recreate back onto target that ended on a pod that does
+	// not come up: Failed, the revision it ran still recorded.
+	stopped := func(idx int32, running, target string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseFailed, RunningRevision: running, TargetRevision: target,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepParked, TargetRevision: target}}
+	}
+	on := func(revs ...string) []query.RevisionID {
+		ids := make([]query.RevisionID, 0, len(revs))
+		for _, rev := range revs {
+			ids = append(ids, query.RevisionFromHash(query.RevisionFromName(rev).Hash()))
+		}
+		return ids
+	}
+	heldTwo := []types.RetryBlock{{TargetRevision: two, State: types.RetryBlockHeld, AttemptsStarted: 3}}
+	allOnTwo := status.PodRevisions{0: on(two), 1: on(two), 2: on(two)}
+	cases := []struct {
+		name            string
+		rows            []types.InstanceStatus
+		pods            status.PodRevisions
+		current, update string
+		blocks          []types.RetryBlock
+		cleared         string
+		want            string
+	}{
+		{"an Instance rebuilt toward the cleared revision holds the restore while its new pod comes up, whatever label the pod carries",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), rebuilt(2, one, two)}, allOnTwo, "", two, nil, two, ""},
+		{"an Instance that ran the cleared revision and lost its pods holds the restore until its rebuild ends",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), rebuilt(2, two, two)}, allOnTwo, "", two, nil, two, ""},
+		{"an Instance whose pods are gone before the rebuild is committed holds the restore",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), lost(2, two)}, status.PodRevisions{0: on(two), 1: on(two)}, "", two, nil, two, ""},
+		{"a repair in flight on the cleared revision holds the restore",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), repairing(2, two)}, allOnTwo, "", two, nil, two, ""},
+		{"a spent attempt on a Failed Instance leaves the pods to decide: a roll back over a broken Instance lands, its Held record notwithstanding",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), broken(2, two)}, allOnTwo, "", two, heldTwo, two, two},
+		{"a recreate that ended broken on the cleared revision leaves its pods to decide too",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), stopped(2, one, two)}, allOnTwo, "", two, heldTwo, two, two},
+		{"the restore lands once the last attempt ends with the Instance Ready",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), ready(2, two)}, allOnTwo, "", two, heldTwo, two, two},
+		{"a push over an Instance rebuilt toward the new revision keeps the revision it had",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), rebuilt(2, one, two)}, allOnTwo, one, two, nil, "", one},
+		{"a push lands once every Instance is Ready on the new revision",
+			[]types.InstanceStatus{ready(0, two), ready(1, two), ready(2, two)}, allOnTwo, one, two, nil, "", two},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.CurrentRevisionFor(tc.rows, tc.current, tc.update, tc.blocks, tc.cleared, tc.pods); got != tc.want {
+				t.Errorf("CurrentRevisionFor(current=%q, update=%q, cleared=%q) = %q, want %q", tc.current, tc.update, tc.cleared, got, tc.want)
 			}
 		})
 	}
@@ -464,7 +551,7 @@ func TestCountAvailablePods_MinReadySecondsWindow(t *testing.T) {
 	if got, wake := status.CountAvailablePods(pods, inRotation, window); got != 2 || wake != 0 {
 		t.Fatalf("20s window after it elapsed: got %d/%s want 2/0s", got, wake)
 	}
-	counters := status.CountersForInstance(pods, inRotation, status.AvailabilityWindow{MinReadySeconds: 20, Now: now})
+	counters, _ := status.CountersForInstance(pods, inRotation, status.AvailabilityWindow{MinReadySeconds: 20, Now: now}, nil)
 	if counters.AvailablePodCount != 1 || counters.ReadyPodCount != 0 || counters.NextAvailableIn != 15*time.Second {
 		t.Fatalf("counters: got available=%d ready=%d nextAvailableIn=%s want available=1 ready=0 nextAvailableIn=15s (Ready counts ContainersReady)",
 			counters.AvailablePodCount, counters.ReadyPodCount, counters.NextAvailableIn)
@@ -545,7 +632,7 @@ func TestCountServingPods_RequiresThePodReadyCondition(t *testing.T) {
 	}
 
 	lost := pod(containersReady, readyRevoked, gateOn)
-	counters := status.CountersForInstance([]*corev1.Pod{lost}, map[string]struct{}{}, status.AvailabilityWindow{})
+	counters, _ := status.CountersForInstance([]*corev1.Pod{lost}, map[string]struct{}{}, status.AvailabilityWindow{}, nil)
 	if counters.PodCount != 1 || counters.ServingPodCount != 0 {
 		t.Fatalf("counters under a revoked Ready: pods=%d serving=%d, want pods=1 serving=0", counters.PodCount, counters.ServingPodCount)
 	}
@@ -573,19 +660,19 @@ func TestCountServingPods_ExcludesAMemberLeavingTheGang(t *testing.T) {
 	gang := []*corev1.Pod{leader, worker}
 	desired := map[int32]int32{0: 2}
 
-	whole := status.CountersForInstance(gang, map[string]struct{}{leader.Name: {}, worker.Name: {}}, status.AvailabilityWindow{})
+	whole, _ := status.CountersForInstance(gang, map[string]struct{}{leader.Name: {}, worker.Name: {}}, status.AvailabilityWindow{}, nil)
 	if whole.PodCount != 2 || whole.ServingPodCount != 2 || whole.AvailablePodCount != 2 {
 		t.Fatalf("whole gang: %s, want pods=2 serving=2 available=2", whole)
 	}
-	if got := status.CountServingInstances([]types.InstanceStatus{{Index: 0, PodCount: whole.PodCount, ServingPodCount: whole.ServingPodCount}}, desired); got != 1 {
-		t.Fatalf("serving Instances with the whole gang = %d, want 1", got)
+	if !status.InstanceMeetsThreshold(whole.PodCount, whole.ServingPodCount, status.DesiredFor(desired, 0, whole.PodCount)) {
+		t.Fatalf("the whole gang is short of the serving threshold, want a serving Instance")
 	}
 
 	// The worker is deleted: still Ready, still gated on, already out of
 	// the endpoints. Its conditions do not change until its containers stop.
 	now := metav1.Now()
 	worker.DeletionTimestamp = &now
-	leaving := status.CountersForInstance(gang, map[string]struct{}{leader.Name: {}}, status.AvailabilityWindow{})
+	leaving, _ := status.CountersForInstance(gang, map[string]struct{}{leader.Name: {}}, status.AvailabilityWindow{}, nil)
 	if leaving.PodCount != 2 {
 		t.Fatalf("PodCount = %d, want 2: the leaving member is still a pod of the Instance", leaving.PodCount)
 	}
@@ -595,8 +682,8 @@ func TestCountServingPods_ExcludesAMemberLeavingTheGang(t *testing.T) {
 	if leaving.AvailablePodCount != 1 {
 		t.Fatalf("AvailablePodCount = %d, want 1", leaving.AvailablePodCount)
 	}
-	if got := status.CountServingInstances([]types.InstanceStatus{{Index: 0, PodCount: leaving.PodCount, ServingPodCount: leaving.ServingPodCount}}, desired); got != 0 {
-		t.Fatalf("serving Instances with a member leaving = %d, want 0", got)
+	if status.InstanceMeetsThreshold(leaving.PodCount, leaving.ServingPodCount, status.DesiredFor(desired, 0, leaving.PodCount)) {
+		t.Fatalf("a gang with a member leaving meets the serving threshold, want no serving Instance")
 	}
 }
 
@@ -690,25 +777,25 @@ func TestCountServingPods_ReadsAGangWithoutItsLeaderAsServingNothing(t *testing.
 		})
 	}
 
-	// The counters an Instance publishes and the Component's count of
-	// serving Instances follow the same rule: a gang with its leader gone is
-	// as far out of rotation as one with no pod at all, and a gang with a
-	// worker gone is short of its desired count as before.
+	// The counters an Instance publishes and the serving threshold the
+	// Component applies to them follow the same rule: a gang with its leader
+	// gone is as far out of rotation as one with no pod at all, and a gang
+	// with a worker gone is short of its desired count as before.
 	desired := map[int32]int32{0: 8}
-	servingInstances := func(c status.InstanceCounters) int32 {
-		return status.CountServingInstances([]types.InstanceStatus{{Index: 0, PodCount: c.PodCount, ServingPodCount: c.ServingPodCount}}, desired)
+	serving := func(c status.InstanceCounters) bool {
+		return status.InstanceMeetsThreshold(c.PodCount, c.ServingPodCount, status.DesiredFor(desired, 0, c.PodCount))
 	}
-	whole := status.CountersForInstance(withLeader(leader(), workers(7)), nil, status.AvailabilityWindow{})
-	if whole.PodCount != 8 || whole.ServingPodCount != 8 || servingInstances(whole) != 1 {
-		t.Fatalf("whole gang: %s, serving Instances %d; want pods=8 serving=8 and 1 serving Instance", whole, servingInstances(whole))
+	whole, _ := status.CountersForInstance(withLeader(leader(), workers(7)), nil, status.AvailabilityWindow{}, nil)
+	if whole.PodCount != 8 || whole.ServingPodCount != 8 || !serving(whole) {
+		t.Fatalf("whole gang: %s, serving %t; want pods=8 serving=8 and a serving Instance", whole, serving(whole))
 	}
-	workerGone := status.CountersForInstance(withLeader(leader(), workers(6)), nil, status.AvailabilityWindow{})
-	if workerGone.PodCount != 7 || workerGone.ServingPodCount != 7 || servingInstances(workerGone) != 0 {
-		t.Fatalf("gang with a worker gone: %s, serving Instances %d; want pods=7 serving=7 and no serving Instance", workerGone, servingInstances(workerGone))
+	workerGone, _ := status.CountersForInstance(withLeader(leader(), workers(6)), nil, status.AvailabilityWindow{}, nil)
+	if workerGone.PodCount != 7 || workerGone.ServingPodCount != 7 || serving(workerGone) {
+		t.Fatalf("gang with a worker gone: %s, serving %t; want pods=7 serving=7 and no serving Instance", workerGone, serving(workerGone))
 	}
-	leaderGone := status.CountersForInstance(workers(7), nil, status.AvailabilityWindow{})
-	if leaderGone.PodCount != 7 || leaderGone.ServingPodCount != 0 || servingInstances(leaderGone) != 0 {
-		t.Fatalf("gang with its leader gone: %s, serving Instances %d; want pods=7 serving=0 and no serving Instance", leaderGone, servingInstances(leaderGone))
+	leaderGone, _ := status.CountersForInstance(workers(7), nil, status.AvailabilityWindow{}, nil)
+	if leaderGone.PodCount != 7 || leaderGone.ServingPodCount != 0 || serving(leaderGone) {
+		t.Fatalf("gang with its leader gone: %s, serving %t; want pods=7 serving=0 and no serving Instance", leaderGone, serving(leaderGone))
 	}
 }
 

@@ -16,7 +16,6 @@
             "team": "a"
           },
           "annotations": {
-            "example.com/owner": "team-a",
             "ome.io/base-model-format": "safetensors",
             "ome.io/base-model-name": "model-a",
             "ome.io/serving-runtime": "runtime-a"

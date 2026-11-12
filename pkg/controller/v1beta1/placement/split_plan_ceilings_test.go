@@ -48,7 +48,7 @@ func memberBands(t *testing.T, source *v1beta1.InferenceService) map[string]map[
 }
 
 func TestSplitMaxPerClusterCapsEachComponent(t *testing.T) {
-	// Engines 3 and 1, decoders 9 and 3, routers 2 and 1.
+	// An unweighted source: engines 2 and 2, decoders 6 and 6, routers 2 and 1.
 	type band = map[v1beta1.ComponentType][2]int
 	e, d, r := v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent
 	for _, tt := range []struct {
@@ -59,31 +59,31 @@ func TestSplitMaxPerClusterCapsEachComponent(t *testing.T) {
 		{
 			name:  "without a cap every component is fixed at its share",
 			split: nil,
-			want:  map[string]band{"member-a": {e: {3, 3}, d: {9, 9}, r: {2, 2}}, "member-b": {e: {1, 1}, d: {3, 3}, r: {1, 1}}},
+			want:  map[string]band{"member-a": {e: {2, 2}, d: {6, 6}, r: {2, 2}}, "member-b": {e: {2, 2}, d: {6, 6}, r: {1, 1}}},
 		},
 		{
 			name:  "an engine key scales the other caps",
 			split: &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Engine: ptr.To[int32](3)}},
-			want:  map[string]band{"member-a": {e: {3, 3}, d: {9, 9}, r: {2, 3}}, "member-b": {e: {1, 3}, d: {3, 9}, r: {1, 3}}},
+			want:  map[string]band{"member-a": {e: {2, 3}, d: {6, 9}, r: {2, 3}}, "member-b": {e: {2, 3}, d: {6, 9}, r: {1, 3}}},
 		},
 		{
 			name:  "a router key replaces the scaled router cap",
 			split: &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Engine: ptr.To[int32](3), Router: ptr.To[int32](8)}},
-			want:  map[string]band{"member-a": {e: {3, 3}, d: {9, 9}, r: {2, 8}}, "member-b": {e: {1, 3}, d: {3, 9}, r: {1, 8}}},
+			want:  map[string]band{"member-a": {e: {2, 3}, d: {6, 9}, r: {2, 8}}, "member-b": {e: {2, 3}, d: {6, 9}, r: {1, 8}}},
 		},
 		{
 			name:  "a router key alone leaves the engine and decoder fixed",
 			split: &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Router: ptr.To[int32](8)}},
-			want:  map[string]band{"member-a": {e: {3, 3}, d: {9, 9}, r: {2, 8}}, "member-b": {e: {1, 1}, d: {3, 3}, r: {1, 8}}},
+			want:  map[string]band{"member-a": {e: {2, 2}, d: {6, 6}, r: {2, 8}}, "member-b": {e: {2, 2}, d: {6, 6}, r: {1, 8}}},
 		},
 		{
 			name:  "default caps every component the map does not name, without scaling",
 			split: &v1beta1.SplitSpec{MaxPerCluster: &v1beta1.SplitCeilings{Default: ptr.To[int32](10), Router: ptr.To[int32](4)}},
-			want:  map[string]band{"member-a": {e: {3, 10}, d: {9, 10}, r: {2, 4}}, "member-b": {e: {1, 10}, d: {3, 10}, r: {1, 4}}},
+			want:  map[string]band{"member-a": {e: {2, 10}, d: {6, 10}, r: {2, 4}}, "member-b": {e: {2, 10}, d: {6, 10}, r: {1, 4}}},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			source := dividedRouterSource(3, map[string]int32{"member-a": 3, "member-b": 1})
+			source := withoutWeights(dividedRouterSource(3, nil))
 			source.Spec.Placement.Split = tt.split
 			if diff := cmp.Diff(tt.want, memberBands(t, source)); diff != "" {
 				t.Errorf("member bands (-want +got):\n%s", diff)
@@ -99,11 +99,11 @@ func TestSplitMaxPerClusterHoldsAShareAboveItsCap(t *testing.T) {
 		wantErr  string
 	}{
 		{name: "router", ceilings: v1beta1.SplitCeilings{Router: ptr.To[int32](1)}, wantErr: `router share 2 on cluster "member-a" exceeds its ceiling of 1 replicas from split.maxPerCluster`},
-		{name: "decoder that follows the engine shares", ceilings: v1beta1.SplitCeilings{Decoder: ptr.To[int32](5)}, wantErr: `decoder share 9 on cluster "member-a" exceeds its ceiling of 5 replicas from split.maxPerCluster`},
-		{name: "engine, from default", ceilings: v1beta1.SplitCeilings{Default: ptr.To[int32](2)}},
+		{name: "decoder that follows the engine shares", ceilings: v1beta1.SplitCeilings{Decoder: ptr.To[int32](5)}, wantErr: `decoder share 6 on cluster "member-a" exceeds its ceiling of 5 replicas from split.maxPerCluster`},
+		{name: "engine, from default", ceilings: v1beta1.SplitCeilings{Default: ptr.To[int32](1)}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			source := dividedRouterSource(3, map[string]int32{"member-a": 3, "member-b": 1})
+			source := withoutWeights(dividedRouterSource(3, nil))
 			source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: &tt.ceilings}
 			_, err := desiredSplitPlan(source, twoMembers(), nil)
 			if err == nil {

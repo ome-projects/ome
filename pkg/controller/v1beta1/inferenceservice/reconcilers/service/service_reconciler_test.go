@@ -388,7 +388,7 @@ func TestServiceReconciler_OMENativeShape(t *testing.T) {
 	ns := "prod"
 	isvcName := "llama-70b"
 	component := v1beta1.EngineComponent
-	serviceName := isvcName + "-" + string(component) // matches query.StableServiceName
+	serviceName := isvcName + "-" + string(component) // matches constants.EngineServiceName
 
 	isvc := &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -400,7 +400,8 @@ func TestServiceReconciler_OMENativeShape(t *testing.T) {
 	c := fakeclient.New(t, fakeclient.WithObjects(isvc))
 
 	// componentMeta as the OMENative caller assembles it: name matches
-	// query.StableServiceName(isvcName, component), with the
+	// the per-Component Service name (constants.EngineServiceName and its
+	// decoder and router siblings), with the
 	// per-Component OwnerReferences stamped on it (mirrors the
 	// reconcileOMENativeSubresources wiring in
 	// components/{engine,decoder,router}.go).

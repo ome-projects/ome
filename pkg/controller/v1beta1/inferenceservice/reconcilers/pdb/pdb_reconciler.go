@@ -46,10 +46,8 @@ type PDBReconciler struct {
 	scheme *runtime.Scheme
 }
 
-func NewPDBReconciler(writer client.Client, scheme *runtime.Scheme) *PDBReconciler {
-	return NewPDBReconcilerWithReader(writer, writer, scheme)
-}
-
+// NewPDBReconcilerWithReader builds the reconciler on a writer and a live
+// reader; a nil reader reads through the writer.
 func NewPDBReconcilerWithReader(
 	writer client.Client,
 	reader client.Reader,
@@ -81,60 +79,68 @@ func (r *PDBReconciler) Preflight(ctx context.Context, request Request) error {
 	return validateDesiredExisting(existing, request.Owner)
 }
 
-// Reconcile ensures the requested PodDisruptionBudget state.
+// Reconcile ensures the requested PodDisruptionBudget state: a budget that
+// does not exist is created when one is requested, an existing one is
+// removed when none is, and otherwise it is brought to the requested shape.
 func (r *PDBReconciler) Reconcile(ctx context.Context, request Request) (*policyv1.PodDisruptionBudget, error) {
 	if err := validateRequest(request); err != nil {
 		return nil, err
 	}
-
-	key := requestKey(request)
 	existing := &policyv1.PodDisruptionBudget{}
-	if err := r.reader.Get(ctx, key, existing); err != nil {
+	if err := r.reader.Get(ctx, requestKey(request), existing); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return nil, err
 		}
-		if request.Budget == nil {
-			return nil, nil
-		}
-		desired, err := r.pdbForCreate(request)
-		if err != nil {
-			return nil, err
-		}
-		if err := r.client.Create(ctx, desired); err != nil {
-			return nil, err
-		}
-		return desired, nil
+		return r.createRequested(ctx, request)
 	}
-
-	owned := controlledBy(existing, request.Owner)
 	if request.Budget == nil {
-		if !owned {
-			return existing, nil
-		}
-		if selectorCutoverPending(request, existing) {
-			return existing, nil
-		}
-		uid := existing.UID
-		resourceVersion := existing.ResourceVersion
-		if err := r.client.Delete(ctx, existing, client.Preconditions{
-			UID:             &uid,
-			ResourceVersion: &resourceVersion,
-		}); err != nil && !apierrors.IsNotFound(err) {
-			return nil, err
-		}
+		return r.removeOwned(ctx, request, existing)
+	}
+	return r.updateExisting(ctx, request, existing)
+}
+
+// createRequested creates the budget the request asks for; a request for no
+// budget creates nothing.
+func (r *PDBReconciler) createRequested(ctx context.Context, request Request) (*policyv1.PodDisruptionBudget, error) {
+	if request.Budget == nil {
 		return nil, nil
 	}
+	desired, err := r.pdbForCreate(request)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.client.Create(ctx, desired); err != nil {
+		return nil, err
+	}
+	return desired, nil
+}
 
+// removeOwned deletes an existing budget when the request asks for none. A
+// budget another controller owns, or one the source mode's selector still
+// holds while the target workload becomes ready, is left as it is.
+func (r *PDBReconciler) removeOwned(ctx context.Context, request Request, existing *policyv1.PodDisruptionBudget) (*policyv1.PodDisruptionBudget, error) {
+	if !controlledBy(existing, request.Owner) || selectorCutoverPending(request, existing) {
+		return existing, nil
+	}
+	uid := existing.UID
+	resourceVersion := existing.ResourceVersion
+	err := r.client.Delete(ctx, existing, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// updateExisting brings an owned budget to the requested shape. A budget
+// already in that shape, or one the source mode's selector still holds, is
+// returned as it is.
+func (r *PDBReconciler) updateExisting(ctx context.Context, request Request, existing *policyv1.PodDisruptionBudget) (*policyv1.PodDisruptionBudget, error) {
 	if err := validateDesiredExisting(existing, request.Owner); err != nil {
 		return nil, err
 	}
-	if selectorCutoverPending(request, existing) {
+	if selectorCutoverPending(request, existing) || semanticPDBEquals(request, existing) {
 		return existing, nil
 	}
-	if semanticPDBEquals(request, existing) {
-		return existing, nil
-	}
-
 	updated := pdbForUpdate(request, existing)
 	if err := r.client.Update(ctx, updated); err != nil {
 		return nil, err

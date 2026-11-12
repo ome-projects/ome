@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -21,10 +22,10 @@ import (
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// unallocatedSurgeIndex marks a ledger Started row whose surge index
-// is not yet allocated. Accept only admits the request; the executor
-// stamps the real index on the row when it allocates the surge. -1 is
-// used (not 0) because 0 is a valid Instance index.
+// unallocatedSurgeIndex is the surge index of an audit row whose surge the
+// executor has not allocated yet: the intake admits the request, and the
+// executor writes the real index when it allocates the surge. -1, because 0
+// is a valid Instance index.
 const unallocatedSurgeIndex = int32(-1)
 
 // requestOutcome is what one pass does with one migration request
@@ -167,7 +168,7 @@ func (r *Reconciler) consumeMigrationRequests(ctx context.Context, log logr.Logg
 func migrationRequestKeys(parent *v1beta1.InferenceService) []string {
 	keys := make([]string, 0, len(parent.Annotations))
 	for k := range parent.Annotations {
-		if strings.HasPrefix(k, audit.MigrationRequestAnnotationPrefix) {
+		if isMigrationRequestKey(k) {
 			keys = append(keys, k)
 		}
 	}
@@ -175,12 +176,18 @@ func migrationRequestKeys(parent *v1beta1.InferenceService) []string {
 	return keys
 }
 
+// isMigrationRequestKey says whether an annotation key is a migration
+// request.
+func isMigrationRequestKey(key string) bool {
+	return strings.HasPrefix(key, audit.MigrationRequestAnnotationPrefix)
+}
+
 // classify reads one annotation and decides its outcome. The checks
 // repeat the webhook's, because annotations written before the webhook
 // or around it arrive here too.
 func (in *migrationIntake) classify(key, raw string) migrationRequest {
 	request := migrationRequest{key: key, uuid: audit.ExtractRequestUUID(key)}
-	if request.uuid != "" && (findMigrationStatus(in.ir, request.uuid) != nil || in.auditRecord.HasCompletedOrFailedRequest(request.uuid)) {
+	if request.uuid != "" && (hasMigrationRecord(in.ir, request.uuid) || in.auditRecord.HasCompletedOrFailedRequest(request.uuid)) {
 		request.outcome = requestKnown
 		return request
 	}
@@ -236,8 +243,7 @@ func (in *migrationIntake) answer(ctx context.Context, request migrationRequest)
 // nothing to deduplicate on) and a Warning event on the parent.
 func (in *migrationIntake) recordRejected(request migrationRequest) {
 	if request.uuid != "" {
-		in.auditRecord.UpsertEntry(failedAuditRow(request.uuid, request.body, request.reason, in.reconciler.now()))
-		in.auditRecordChanged = true
+		in.recordAudit(failedAuditRow(request.uuid, request.body, request.reason, in.reconciler.now()))
 	}
 	// An unsupported schema version keeps its own event reason, so
 	// version skew can be alerted on by itself.
@@ -263,8 +269,7 @@ func (in *migrationIntake) recordRefused(ctx context.Context, request migrationR
 	if err := in.appendStatusEntry(ctx, entry); err != nil {
 		return err
 	}
-	in.auditRecord.UpsertEntry(failedAuditRow(request.uuid, request.body, message, now.Time))
-	in.auditRecordChanged = true
+	in.recordAudit(failedAuditRow(request.uuid, request.body, message, now.Time))
 	in.rejectedEvent(workloadtypes.EventReasonMigrationRequestRejected, request.uuid, message)
 	in.log.V(1).Info("Migration request rejected: MigrationPolicy Mode=Never",
 		"uuid", request.uuid, "sourceInstance", request.body.Instance, "fromNode", request.body.FromNode)
@@ -278,14 +283,13 @@ func (in *migrationIntake) recordRefused(ctx context.Context, request migrationR
 func (in *migrationIntake) recordAccepted(ctx context.Context, request migrationRequest) error {
 	now := metav1.NewTime(in.reconciler.now())
 	entry := request.statusEntry(now)
-	entry.HintTargetNodes = append([]string(nil), request.body.HintTargetNodes...)
+	entry.HintTargetNodes = copiedNames(request.body.HintTargetNodes)
 	entry.Phase = v1beta1.MigrationPhaseAccepted
 	entry.Deadline = metav1.NewTime(now.Add(in.instanceReadyTimeout))
 	if err := in.appendStatusEntry(ctx, entry); err != nil {
 		return err
 	}
-	in.auditRecord.UpsertEntry(audit.NewStartedEntry(request.body, request.uuid, unallocatedSurgeIndex))
-	in.auditRecordChanged = true
+	in.recordAudit(audit.NewStartedEntry(request.body, request.uuid, unallocatedSurgeIndex))
 	in.accepted = true
 	in.log.V(1).Info("Migration request accepted into status.migrations",
 		"uuid", request.uuid, "sourceInstance", request.body.Instance, "fromNode", request.body.FromNode)
@@ -299,6 +303,13 @@ func (in *migrationIntake) appendStatusEntry(ctx context.Context, entry v1beta1.
 		return fmt.Errorf("append migration status entry (uuid=%s): %w", entry.RequestUUID, err)
 	}
 	return nil
+}
+
+// recordAudit adds or replaces one row of the audit record and notes that
+// the record is to be written at the end of the pass.
+func (in *migrationIntake) recordAudit(row audit.Entry) {
+	in.auditRecord.UpsertEntry(row)
+	in.auditRecordChanged = true
 }
 
 // rejectedEvent warns on the parent, where the operator wrote the request.
@@ -376,127 +387,67 @@ func (r *Reconciler) acknowledgeRequest(ctx context.Context, obj client.Object, 
 	return false, nil
 }
 
-// appendMigrationStatus appends one MigrationStatus entry to
-// ir.Status.Migrations under retry.RetryOnConflict, then mirrors the
-// committed slice onto the caller's in-memory IR — same persistence
-// discipline as buildMutateRetryBlock. Idempotent: an entry with the
-// same RequestUUID already present writes nothing.
+// appendMigrationStatus adds one record to the replica's status under
+// conflict retry and mirrors the committed records onto the pass's copy. A
+// record with the same request UUID already present writes nothing.
 func appendMigrationStatus(ctx context.Context, writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica, entry v1beta1.MigrationStatus) error {
-	key := client.ObjectKeyFromObject(ir)
-	ownerUID := ir.UID
-	var committed []v1beta1.MigrationStatus
-	wrote := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		wrote = false
-		fresh := &v1beta1.InferenceReplica{}
-		source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return workloadtypes.ErrStatusOwnerGone
-			}
-			return fmt.Errorf("re-read IR: %w", err)
-		}
-		if ownerUID == "" || fresh.UID != ownerUID {
-			return workloadtypes.ErrStatusOwnerGone
-		}
-		for i := range fresh.Status.Migrations {
-			if fresh.Status.Migrations[i].RequestUUID == entry.RequestUUID {
-				committed = fresh.Status.Migrations
-				wrote = true
-				return nil
-			}
-		}
-		fresh.Status.Migrations = append(fresh.Status.Migrations, entry)
-		if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
-			if apierrors.IsNotFound(err) {
-				return workloadtypes.ErrStatusOwnerGone
-			}
-			return fmt.Errorf("update IR status: %w", err)
-		}
-		wrote = true
-		committed = fresh.Status.Migrations
-		return nil
-	})
-	if err != nil {
+	write := newMigrationRecordWrite(writer, reads, ir)
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error { return write.appendOnce(ctx, entry) }); err != nil {
 		return err
 	}
-	if wrote {
-		out := make([]v1beta1.MigrationStatus, len(committed))
-		for i := range committed {
-			out[i] = *committed[i].DeepCopy()
-		}
-		ir.Status.Migrations = out
-	}
+	write.mirrorOnto(ir)
 	return nil
 }
 
-// migrationToWorkload converts one v1beta1.MigrationStatus to the
-// workload mirror. Field-for-field; pointers deep-copy so the workload
-// mirror never aliases the IR's status slice (same discipline as
-// retryBlockToWorkload).
+// migrationToWorkload reads one API migration record as the engine's record.
+// The two records share no memory: every pointer and list is copied. The
+// trigger and the phase cross as the strings they are, so a value this
+// manager does not know is written back unchanged.
 func migrationToWorkload(v v1beta1.MigrationStatus) workloadtypes.MigrationRecord {
-	out := workloadtypes.MigrationRecord{
-		RequestUUID:    v.RequestUUID,
-		Trigger:        workloadtypes.MigrationTrigger(v.Trigger),
-		SourceInstance: v.SourceInstance,
-		FromNode:       v.FromNode,
-		Phase:          workloadtypes.MigrationPhase(v.Phase),
-		Attempt:        v.Attempt,
-		Reason:         v.Reason,
-		Message:        v.Message,
-		StartedAt:      *v.StartedAt.DeepCopy(),
-		AllocatedAt:    v.AllocatedAt.DeepCopy(),
-		Deadline:       *v.Deadline.DeepCopy(),
-		CompletedAt:    v.CompletedAt.DeepCopy(),
+	return workloadtypes.MigrationRecord{
+		RequestUUID:     v.RequestUUID,
+		Trigger:         workloadtypes.MigrationTrigger(v.Trigger),
+		SourceInstance:  v.SourceInstance,
+		SurgeInstance:   copiedPointer(v.SurgeInstance),
+		AllocatedAt:     copiedPointer(v.AllocatedAt),
+		FromNode:        v.FromNode,
+		HintTargetNodes: copiedNames(v.HintTargetNodes),
+		Phase:           workloadtypes.MigrationPhase(v.Phase),
+		Attempt:         v.Attempt,
+		Reason:          v.Reason,
+		Message:         v.Message,
+		StartedAt:       v.StartedAt,
+		Deadline:        v.Deadline,
+		CompletedAt:     copiedPointer(v.CompletedAt),
+		Succeeded:       copiedPointer(v.Succeeded),
 	}
-	if v.SurgeInstance != nil {
-		s := *v.SurgeInstance
-		out.SurgeInstance = &s
-	}
-	if v.HintTargetNodes != nil {
-		out.HintTargetNodes = append([]string(nil), v.HintTargetNodes...)
-	}
-	if v.Succeeded != nil {
-		b := *v.Succeeded
-		out.Succeeded = &b
-	}
-	return out
 }
 
-// migrationFromWorkload is the inverse of migrationToWorkload.
+// migrationFromWorkload reads one engine migration record as the API record,
+// field for field as migrationToWorkload reads the other way.
 func migrationFromWorkload(w workloadtypes.MigrationRecord) v1beta1.MigrationStatus {
-	out := v1beta1.MigrationStatus{
-		RequestUUID:    w.RequestUUID,
-		Trigger:        v1beta1.MigrationTrigger(w.Trigger),
-		SourceInstance: w.SourceInstance,
-		FromNode:       w.FromNode,
-		Phase:          v1beta1.MigrationPhase(w.Phase),
-		Attempt:        w.Attempt,
-		Reason:         w.Reason,
-		Message:        w.Message,
-		StartedAt:      *w.StartedAt.DeepCopy(),
-		AllocatedAt:    w.AllocatedAt.DeepCopy(),
-		Deadline:       *w.Deadline.DeepCopy(),
-		CompletedAt:    w.CompletedAt.DeepCopy(),
+	return v1beta1.MigrationStatus{
+		RequestUUID:     w.RequestUUID,
+		Trigger:         v1beta1.MigrationTrigger(w.Trigger),
+		SourceInstance:  w.SourceInstance,
+		SurgeInstance:   copiedPointer(w.SurgeInstance),
+		AllocatedAt:     copiedPointer(w.AllocatedAt),
+		FromNode:        w.FromNode,
+		HintTargetNodes: copiedNames(w.HintTargetNodes),
+		Phase:           v1beta1.MigrationPhase(w.Phase),
+		Attempt:         w.Attempt,
+		Reason:          w.Reason,
+		Message:         w.Message,
+		StartedAt:       w.StartedAt,
+		Deadline:        w.Deadline,
+		CompletedAt:     copiedPointer(w.CompletedAt),
+		Succeeded:       copiedPointer(w.Succeeded),
 	}
-	if w.SurgeInstance != nil {
-		s := *w.SurgeInstance
-		out.SurgeInstance = &s
-	}
-	if w.HintTargetNodes != nil {
-		out.HintTargetNodes = append([]string(nil), w.HintTargetNodes...)
-	}
-	if w.Succeeded != nil {
-		b := *w.Succeeded
-		out.Succeeded = &b
-	}
-	return out
 }
 
-// migrationsFromIR mirrors IR.Status.Migrations onto the workload-side
-// MigrationRecord shape for ObservedState.Migrations (the shape the
-// dispatcher selects work from). Same mirror discipline as
-// retryBlocksFromIR.
+// migrationsFromIR reads the replica's migration records as the engine's
+// records, the list the engine selects migration work from; nil when the
+// replica carries none.
 func migrationsFromIR(ir *v1beta1.InferenceReplica) []workloadtypes.MigrationRecord {
 	if len(ir.Status.Migrations) == 0 {
 		return nil
@@ -508,226 +459,343 @@ func migrationsFromIR(ir *v1beta1.InferenceReplica) []workloadtypes.MigrationRec
 	return out
 }
 
-// buildMutateMigration wraps the workload-typed MigrationRecord mutate
-// callback with an IR-typed apiserver round-trip — the
-// ReconcileInput.MutateMigration capability. Same shape as
-// buildMutateRetryBlock: re-read under retry.RetryOnConflict, locate the
-// entry for requestUUID, convert to the workload mirror, apply the
-// callback (returning true persists, false writes nothing), persist via
-// Status().Update, and mirror the committed slice back onto the
-// caller's in-memory IR so later ops in the same pass observe the
-// post-write state.
-//
-// A missing entry is a clean no-op. Owner disappearance or replacement
-// returns ErrStatusOwnerGone so callers stop effects from a stale snapshot.
+// buildMutateMigration is the engine's MutateMigration capability: under
+// conflict retry, the replica is read live, the callback runs on the engine's
+// copy of the record named by requestUUID, one write follows when the
+// callback asks for it, and the committed records are mirrored onto the
+// pass's copy of the replica. A record that is not there is left alone; a
+// replica that is gone, or replaced under the same name, reads as
+// ErrStatusOwnerGone.
 func buildMutateMigration(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, requestUUID string, mutate func(*workloadtypes.MigrationRecord) bool) error {
-	key := client.ObjectKeyFromObject(ir)
-	ownerUID := ir.UID
 	return func(ctx context.Context, requestUUID string, mutate func(*workloadtypes.MigrationRecord) bool) error {
-		var committed []v1beta1.MigrationStatus
-		wrote := false
+		write := newMigrationRecordWrite(writer, reads, ir)
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			wrote = false
-			fresh := &v1beta1.InferenceReplica{}
-			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					return workloadtypes.ErrStatusOwnerGone
-				}
-				return fmt.Errorf("re-read IR: %w", err)
-			}
-			if ownerUID == "" || fresh.UID != ownerUID {
-				return workloadtypes.ErrStatusOwnerGone
-			}
-			pos := -1
-			for i := range fresh.Status.Migrations {
-				if fresh.Status.Migrations[i].RequestUUID == requestUUID {
-					pos = i
-					break
-				}
-			}
-			if pos == -1 {
-				return nil
-			}
-			w := migrationToWorkload(fresh.Status.Migrations[pos])
-			if !mutate(&w) {
-				return nil
-			}
-			// The subject key is fixed: a callback cannot re-key the entry.
-			w.RequestUUID = requestUUID
-			fresh.Status.Migrations[pos] = migrationFromWorkload(w)
-			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
-				if apierrors.IsNotFound(err) {
-					return workloadtypes.ErrStatusOwnerGone
-				}
-				return fmt.Errorf("update IR status: %w", err)
-			}
-			wrote = true
-			committed = make([]v1beta1.MigrationStatus, len(fresh.Status.Migrations))
-			for i := range fresh.Status.Migrations {
-				committed[i] = *fresh.Status.Migrations[i].DeepCopy()
-			}
-			return nil
+			return write.mutateOnce(ctx, requestUUID, mutate)
 		})
 		if err != nil {
 			return err
 		}
-		if wrote {
-			ir.Status.Migrations = committed
-		}
+		write.mirrorOnto(ir)
 		return nil
 	}
 }
 
-// buildAppendMigration wraps the idempotent status append as the
-// ReconcileInput.AppendMigration capability — the disposition's
-// born-terminal Auto visibility mirror lands through it. Delegates to
-// appendMigrationStatus (same RMW + in-memory-mirror discipline as the
-// accept path); an entry with the RequestUUID already present writes
-// nothing.
+// migrationRecordWrite is one conflict-retried write of a replica's
+// migration records: the replica it targets by key and identity, and after
+// an attempt, whether the attempt committed rows and which.
+type migrationRecordWrite struct {
+	writer    statusWriter
+	reads     client.Reader
+	key       client.ObjectKey
+	ownerUID  types.UID
+	wrote     bool
+	committed []v1beta1.MigrationStatus
+}
+
+func newMigrationRecordWrite(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) *migrationRecordWrite {
+	return &migrationRecordWrite{writer: writer, reads: reads, key: client.ObjectKeyFromObject(ir), ownerUID: ir.UID}
+}
+
+// readOwner reads the replica live and decodes its rows. A replica that is
+// gone, or another object under the same name, reads as ErrStatusOwnerGone.
+func (w *migrationRecordWrite) readOwner(ctx context.Context) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
+	fresh := &v1beta1.InferenceReplica{}
+	source, err := irstatus.GetDecoded(ctx, w.reads, w.key, fresh)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, "", workloadtypes.ErrStatusOwnerGone
+		}
+		return nil, "", fmt.Errorf("re-read IR: %w", err)
+	}
+	if w.ownerUID == "" || fresh.UID != w.ownerUID {
+		return nil, "", workloadtypes.ErrStatusOwnerGone
+	}
+	return fresh, source, nil
+}
+
+// write persists the rows of a freshly read replica. A replica deleted
+// between the read and the write reads as ErrStatusOwnerGone.
+func (w *migrationRecordWrite) write(ctx context.Context, fresh *v1beta1.InferenceReplica, source irstatus.Encoding) error {
+	if err := updateInferenceReplicaStatus(ctx, w.writer, fresh, source); err != nil {
+		if apierrors.IsNotFound(err) {
+			return workloadtypes.ErrStatusOwnerGone
+		}
+		return fmt.Errorf("update IR status: %w", err)
+	}
+	return nil
+}
+
+// mirrorOnto copies the committed rows onto the pass's copy of the replica,
+// so later work in the same pass reads the written state; an attempt that
+// committed nothing leaves the copy as it is.
+func (w *migrationRecordWrite) mirrorOnto(ir *v1beta1.InferenceReplica) {
+	if !w.wrote {
+		return
+	}
+	ir.Status.Migrations = copiedMigrations(w.committed)
+}
+
+// appendOnce is one attempt of the append: a fresh read and one write when
+// the record is not there yet. A record already present is kept as it is.
+func (w *migrationRecordWrite) appendOnce(ctx context.Context, entry v1beta1.MigrationStatus) error {
+	w.wrote = false
+	fresh, source, err := w.readOwner(ctx)
+	if err != nil {
+		return err
+	}
+	if migrationEntryIndex(fresh.Status.Migrations, entry.RequestUUID) == -1 {
+		fresh.Status.Migrations = append(fresh.Status.Migrations, entry)
+		if err := w.write(ctx, fresh, source); err != nil {
+			return err
+		}
+	}
+	w.wrote = true
+	w.committed = fresh.Status.Migrations
+	return nil
+}
+
+// mutateOnce is one attempt of the mutate capability: a fresh read, the
+// callback on the record's workload mirror, and one write when the callback
+// asks for it. A missing record is a clean no-op. The record's key is fixed:
+// a callback cannot re-key it.
+func (w *migrationRecordWrite) mutateOnce(ctx context.Context, requestUUID string, mutate func(*workloadtypes.MigrationRecord) bool) error {
+	w.wrote = false
+	fresh, source, err := w.readOwner(ctx)
+	if err != nil {
+		return err
+	}
+	pos := migrationEntryIndex(fresh.Status.Migrations, requestUUID)
+	if pos == -1 {
+		return nil
+	}
+	record := migrationToWorkload(fresh.Status.Migrations[pos])
+	if !mutate(&record) {
+		return nil
+	}
+	record.RequestUUID = requestUUID
+	fresh.Status.Migrations[pos] = migrationFromWorkload(record)
+	if err := w.write(ctx, fresh, source); err != nil {
+		return err
+	}
+	w.wrote = true
+	w.committed = fresh.Status.Migrations
+	return nil
+}
+
+// migrationEntryIndex is the position of the record for uuid among entries,
+// or -1 when there is none.
+func migrationEntryIndex(entries []v1beta1.MigrationStatus, uuid string) int {
+	for i := range entries {
+		if entries[i].RequestUUID == uuid {
+			return i
+		}
+	}
+	return -1
+}
+
+// copiedMigrations deep-copies a record slice, so the pass's copy never
+// aliases the rows of the written object.
+func copiedMigrations(entries []v1beta1.MigrationStatus) []v1beta1.MigrationStatus {
+	out := make([]v1beta1.MigrationStatus, len(entries))
+	for i := range entries {
+		out[i] = *entries[i].DeepCopy()
+	}
+	return out
+}
+
+// copiedPointer is a pointer to a copy of the value p points to, nil for nil.
+func copiedPointer[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+// copiedNames is a copy of a name list, nil when the list is empty.
+func copiedNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	return append([]string(nil), names...)
+}
+
+// buildAppendMigration is the engine's AppendMigration capability: the record
+// is added through appendMigrationStatus, so a record with the same request
+// UUID already present writes nothing.
 func buildAppendMigration(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, rec workloadtypes.MigrationRecord) error {
 	return func(ctx context.Context, rec workloadtypes.MigrationRecord) error {
 		return appendMigrationStatus(ctx, writer, reads, ir, migrationFromWorkload(rec))
 	}
 }
 
-// syncMigrationEntries runs the adapter-side status.migrations
-// bookkeeping that precedes the accept pass each reconcile:
-//
-//  1. UPGRADE IMPORT: ledger Started rows for this Component (Reason
-//     not AutoRecover/ForceDelete — records, never work orders) with no
-//     status entry for the UUID and no terminal counterpart row are
-//     synthesized into Accepted Manual entries so pre-upgrade in-flight
-//     migrations resume through the status-entry path. Idempotent:
-//     entry presence gates. SurgeInstance carries over when the row
-//     recorded a real index; the -1 accept sentinel imports as unset
-//     (fresh allocation path).
-//  2. TRIM: terminal entries whose CompletedAt is older than
-//     recordWindow are pruned (bounded-by-construction status; full
-//     history stays in the ledger + events). A zero window is
-//     unconfigured and trims nothing. Non-terminal entries are never
-//     trimmed; terminal entries lacking CompletedAt are kept.
-//     INVARIANT: status may forget only what the ledger remembers — an
-//     aged Completed/Failed entry whose UUID has no terminal ledger row
-//     is retained (logged at V(1), once per pass with the count),
-//     because trimming it would let step 1 re-synthesize the UUID from
-//     its Started row as fresh Accepted work. The expiry path's hard
-//     ledger mirror means this backstop should never trigger. Relocated
-//     entries are exempt: they are born terminal, step 1 never imports
-//     Auto rows, and the ledger prunes their AutoRecover rows once the
-//     rebuilt instance is Ready — so the window alone ages them out.
-//
-// One status write covers both; the committed slice mirrors onto the
-// caller's in-memory IR. Ledger read is best-effort — an unreadable
-// ledger defers the import AND the trim (nothing may be forgotten
-// against an unknown ledger) to the next pass.
+// syncMigrationEntries keeps the replica's migration records in step with
+// the audit record before the pass answers new requests. An audit row an
+// operator started for this Component and nothing finished becomes an
+// Accepted record when the replica has none for it, so a migration under
+// way across a manager restart goes on through its record. A finished
+// record older than recordWindow is dropped, but only when the audit record
+// holds it finished too: a record the audit record still shows started
+// would be imported again as new work, so it is kept and counted in one
+// V(1) line per pass. A zero window drops nothing. One status write covers
+// the import and the trim, and the committed records are mirrored onto the
+// pass's copy. An unreadable audit record defers both to the next pass, and
+// a replica at rest is neither read nor written here
+// (migrationRecordsNeedLiveRead).
 func (r *Reconciler) syncMigrationEntries(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, instanceReadyTimeout, recordWindow time.Duration) error {
 	if r.Client == nil || ir == nil {
 		return nil
 	}
+	auditRecord := r.loadMigrationAuditRecord(ctx, log, ir, parent)
+	imports := importableLedgerMigrations(auditRecord, string(ir.Spec.Component), metav1.NewTime(r.now()), instanceReadyTimeout)
+	if !migrationRecordsNeedLiveRead(ir, parent, imports) {
+		return nil
+	}
+	sync := &migrationRecordSync{
+		migrationRecordWrite: newMigrationRecordWrite(r.statusWriter(), r.liveReader(), ir),
+		auditRecord:          auditRecord,
+		imports:              imports,
+		window:               recordWindow,
+		now:                  r.now,
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error { return sync.syncOnce(ctx) }); err != nil {
+		return err
+	}
+	if sync.agedKept > 0 {
+		log.V(1).Info("migration trim: retained aged terminal entries with no terminal ledger row (backstop — the ledger must remember what status forgets)",
+			"count", sync.agedKept)
+	}
+	sync.mirrorOnto(ir)
+	return nil
+}
+
+// loadMigrationAuditRecord reads the audit record of the replica's owner,
+// the parent service when there is one. An unreadable record reads as
+// empty, so nothing is imported or trimmed this pass and the next pass
+// reads it again.
+func (r *Reconciler) loadMigrationAuditRecord(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService) *audit.Ledger {
 	owner := client.Object(ir)
 	if parent != nil {
 		owner = parent
 	}
-	ledger, err := audit.LoadLedgerForOwner(ctx, r.Client, owner)
+	auditRecord, err := audit.LoadLedgerForOwner(ctx, r.Client, owner)
 	if err != nil {
 		log.V(1).Info("migration upgrade import skipped: ledger load failed; retrying next pass", "error", err.Error())
-		ledger = &audit.Ledger{}
+		return &audit.Ledger{}
 	}
-	imports := importableLedgerMigrations(ledger, string(ir.Spec.Component), metav1.NewTime(r.now()), instanceReadyTimeout)
+	return auditRecord
+}
 
-	key := client.ObjectKeyFromObject(ir)
-	ownerUID := ir.UID
-	var committed []v1beta1.MigrationStatus
-	wrote := false
-	trimBlocked := 0
-	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		wrote = false
-		fresh := &v1beta1.InferenceReplica{}
-		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				return workloadtypes.ErrStatusOwnerGone
-			}
-			return fmt.Errorf("re-read IR: %w", err)
-		}
-		if ownerUID == "" || fresh.UID != ownerUID {
-			return workloadtypes.ErrStatusOwnerGone
-		}
-		changed := false
+// migrationRecordSync is one conflict-retried sync of a replica's migration
+// records with its audit record: the rows to import, the window terminal
+// records age out of, the clock the window is measured from, and the count
+// of aged records kept because the audit record does not hold them.
+type migrationRecordSync struct {
+	*migrationRecordWrite
+	auditRecord *audit.Ledger
+	imports     []v1beta1.MigrationStatus
+	window      time.Duration
+	now         func() time.Time
+	agedKept    int
+}
 
-		// Trim aged-out terminal entries. Completed/Failed entries need
-		// the ledger to record them terminally (see the invariant in the
-		// func doc); Relocated entries never do. A zero window is
-		// unconfigured: nothing ages out, because there is no
-		// operator-stated horizon to age against.
-		cutoff := r.now().Add(-recordWindow)
-		trimBlocked = 0
-		kept := fresh.Status.Migrations[:0]
-		for i := range fresh.Status.Migrations {
-			e := fresh.Status.Migrations[i]
-			if recordWindow > 0 && e.Phase.Terminal() && e.CompletedAt != nil && e.CompletedAt.Time.Before(cutoff) {
-				if e.Phase == v1beta1.MigrationPhaseRelocated || ledger.HasCompletedOrFailedRequest(e.RequestUUID) {
-					changed = true
-					continue
-				}
-				trimBlocked++
-			}
-			kept = append(kept, e)
-		}
-		fresh.Status.Migrations = kept
-
-		// Import ledger rows without an entry.
-		for i := range imports {
-			exists := false
-			for j := range fresh.Status.Migrations {
-				if fresh.Status.Migrations[j].RequestUUID == imports[i].RequestUUID {
-					exists = true
-					break
-				}
-			}
-			if !exists {
-				fresh.Status.Migrations = append(fresh.Status.Migrations, *imports[i].DeepCopy())
-				changed = true
-			}
-		}
-		if !changed {
-			committed = fresh.Status.Migrations
-			wrote = true
-			return nil
-		}
-		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
-			if apierrors.IsNotFound(err) {
-				return workloadtypes.ErrStatusOwnerGone
-			}
-			return fmt.Errorf("update IR status: %w", err)
-		}
-		committed = fresh.Status.Migrations
-		wrote = true
-		return nil
-	})
+// syncOnce is one attempt: a fresh read, the trim, the import, and one write
+// when either changed a row. An attempt that changes nothing still reports
+// the fresh rows as committed, so the pass's copy follows the live object.
+func (s *migrationRecordSync) syncOnce(ctx context.Context) error {
+	s.wrote = false
+	fresh, source, err := s.readOwner(ctx)
 	if err != nil {
 		return err
 	}
-	if trimBlocked > 0 {
-		log.V(1).Info("migration trim: retained aged terminal entries with no terminal ledger row (backstop — the ledger must remember what status forgets)",
-			"count", trimBlocked)
-	}
-	if wrote {
-		out := make([]v1beta1.MigrationStatus, len(committed))
-		for i := range committed {
-			out[i] = *committed[i].DeepCopy()
+	trimmed := s.trimAgedRecords(fresh)
+	imported := s.importAuditRows(fresh)
+	if trimmed || imported {
+		if err := s.write(ctx, fresh, source); err != nil {
+			return err
 		}
-		ir.Status.Migrations = out
 	}
+	s.wrote = true
+	s.committed = fresh.Status.Migrations
 	return nil
 }
 
-// importableLedgerMigrations selects the ledger Started rows the
-// upgrade import synthesizes entries for: this Component's rows whose
-// Reason marks operator work (not AutoRecover relocation directives,
-// not ForceDelete pod sweeps) and whose UUID has no terminal
-// counterpart row. The caller gates on entry absence.
+// trimAgedRecords drops the terminal records whose completion is older than
+// the window; a zero window is unconfigured and ages nothing out. A
+// Completed or Failed record goes only when the audit record holds it
+// terminally, because status may forget only what the audit record
+// remembers: a dropped record the audit record still shows as Started would
+// be imported again as fresh work. A Relocated record is born terminal and
+// goes on the window alone. Reports whether a record was dropped; the aged
+// records kept are counted.
+func (s *migrationRecordSync) trimAgedRecords(fresh *v1beta1.InferenceReplica) bool {
+	cutoff := s.now().Add(-s.window)
+	s.agedKept = 0
+	changed := false
+	kept := fresh.Status.Migrations[:0]
+	for i := range fresh.Status.Migrations {
+		e := fresh.Status.Migrations[i]
+		if s.agedOut(e, cutoff) {
+			if e.Phase == v1beta1.MigrationPhaseRelocated || s.auditRecord.HasCompletedOrFailedRequest(e.RequestUUID) {
+				changed = true
+				continue
+			}
+			s.agedKept++
+		}
+		kept = append(kept, e)
+	}
+	fresh.Status.Migrations = kept
+	return changed
+}
+
+// agedOut says whether a terminal record completed before the cutoff.
+func (s *migrationRecordSync) agedOut(e v1beta1.MigrationStatus, cutoff time.Time) bool {
+	return s.window > 0 && e.Phase.Terminal() && e.CompletedAt != nil && e.CompletedAt.Time.Before(cutoff)
+}
+
+// importAuditRows appends the audit rows that have no record yet. Reports
+// whether one was appended.
+func (s *migrationRecordSync) importAuditRows(fresh *v1beta1.InferenceReplica) bool {
+	changed := false
+	for i := range s.imports {
+		if migrationEntryIndex(fresh.Status.Migrations, s.imports[i].RequestUUID) != -1 {
+			continue
+		}
+		fresh.Status.Migrations = append(fresh.Status.Migrations, *s.imports[i].DeepCopy())
+		changed = true
+	}
+	return changed
+}
+
+// migrationRecordsNeedLiveRead says whether the sync must read the replica
+// live: the pass's copy carries a migration record, the audit record holds
+// a row to import, or the parent carries a migration request. A copy with
+// a record is read live on every pass, because the cache can be one write
+// behind the record's phase and the migrate pass must act on the live one.
+// A request on the parent is classified against the records the replica
+// carries live. A replica at rest meets none of the three.
+func migrationRecordsNeedLiveRead(ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, imports []v1beta1.MigrationStatus) bool {
+	return len(ir.Status.Migrations) > 0 || len(imports) > 0 || hasMigrationRequest(parent)
+}
+
+// hasMigrationRequest says whether the parent carries a migration request
+// annotation.
+func hasMigrationRequest(parent *v1beta1.InferenceService) bool {
+	if parent == nil {
+		return false
+	}
+	for k := range parent.Annotations {
+		if isMigrationRequestKey(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// importableLedgerMigrations lists the audit rows the sync turns into
+// records: this Component's started rows of operator work (not a
+// relocation, not a force delete) whose request has no finished row. The
+// caller skips the rows the replica already records.
 func importableLedgerMigrations(ledger *audit.Ledger, component string, now metav1.Time, instanceReadyTimeout time.Duration) []v1beta1.MigrationStatus {
 	if ledger == nil {
 		return nil
@@ -750,7 +818,7 @@ func importableLedgerMigrations(ledger *audit.Ledger, component string, now meta
 			Phase:           v1beta1.MigrationPhaseAccepted,
 			SourceInstance:  row.SourceInstance,
 			FromNode:        row.FromNode,
-			HintTargetNodes: append([]string(nil), row.HintTargetNodes...),
+			HintTargetNodes: copiedNames(row.HintTargetNodes),
 			Reason:          row.Reason,
 			StartedAt:       now,
 			Deadline:        metav1.NewTime(now.Add(instanceReadyTimeout)),
@@ -758,11 +826,10 @@ func importableLedgerMigrations(ledger *audit.Ledger, component string, now meta
 		if started, ok := parseLedgerTime(row.StartedAt); ok {
 			entry.StartedAt = metav1.NewTime(started)
 		}
-		// A real recorded surge index resumes in place; the accept-time
-		// -1 sentinel imports as unset so the executor allocates fresh.
-		// An allocated row is executing, so it gets an AllocatedAt for
-		// the capacity gate — the row's StartedAt is the best available
-		// execution timestamp.
+		// A row with a surge index resumes on that Instance and counts as
+		// executing since its start time, the allocation time the capacity
+		// gate reads; a row at unallocatedSurgeIndex imports with no surge,
+		// so the executor allocates one.
 		if row.SurgeInstance >= 0 {
 			s := row.SurgeInstance
 			entry.SurgeInstance = &s
@@ -789,15 +856,9 @@ func parseLedgerTime(raw string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// findMigrationStatus returns the ir.Status.Migrations entry for uuid,
-// or nil when absent.
-func findMigrationStatus(ir *v1beta1.InferenceReplica, uuid string) *v1beta1.MigrationStatus {
-	for i := range ir.Status.Migrations {
-		if ir.Status.Migrations[i].RequestUUID == uuid {
-			return &ir.Status.Migrations[i]
-		}
-	}
-	return nil
+// hasMigrationRecord reports whether the replica carries a record for uuid.
+func hasMigrationRecord(ir *v1beta1.InferenceReplica, uuid string) bool {
+	return migrationEntryIndex(ir.Status.Migrations, uuid) != -1
 }
 
 // parentHasComponent reports whether the parent ISVC declares the named
@@ -808,11 +869,8 @@ func parentHasComponent(parent *v1beta1.InferenceService, component string) bool
 	return c == v1beta1.EngineComponent || v1beta1.SpecOf(&parent.Spec, c) != nil
 }
 
-// now returns the injected clock's time, or wall-clock when no clock
-// is wired (mirrors ReconcileInput.Now).
+// now is the pass's clock: the injected clock's time, or the wall clock
+// when no clock is wired (mirrors ReconcileInput.Now).
 func (r *Reconciler) now() time.Time {
-	if r.Clock != nil {
-		return r.Clock.Now()
-	}
-	return time.Now()
+	return clockNow(r.Clock)
 }

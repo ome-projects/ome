@@ -13,7 +13,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
-	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // ComponentDeps are the dependencies shared by every component
@@ -22,18 +21,12 @@ import (
 // controller attaches per reconcile from the ConfigMap-backed cache.
 // Per-reconcile data goes in ComponentInputs instead.
 type ComponentDeps struct {
-	Client       client.Client
-	Clientset    kubernetes.Interface
-	APIReader    client.Reader // AuthoritativeReader role (see workload/types)
-	Expectations *workloadtypes.Expectations
-	Recorder     record.EventRecorder
-	Scheme       *runtime.Scheme
-	Config       *controllerconfig.InferenceServicesConfig
-	// GangSchedulingAvailable is the cluster-discovery boolean — true
-	// when the scheduler-plugins PodGroup CRD is installed. OMENative
-	// reads it to decide whether to emit PodGroups for multi-pod
-	// Instances; other deployment modes ignore it.
-	GangSchedulingAvailable bool
+	Client    client.Client
+	Clientset kubernetes.Interface
+	APIReader client.Reader // AuthoritativeReader role (see workload/types)
+	Recorder  record.EventRecorder
+	Scheme    *runtime.Scheme
+	Config    *controllerconfig.InferenceServicesConfig
 	// QuotaAcceleratorResources are the resource names that put a Component
 	// under the quota backend; see InferenceServiceReconciler for the full
 	// contract. Empty governs everything.
@@ -70,9 +63,17 @@ type ComponentInputs struct {
 	// InferenceReplica's spec.pacing.partition. nil when no canary governs
 	// the Component.
 	PacingPartition irprojector.PartitionResolver
+	// RollbackToRevision names the ControllerRevision of the stable side this
+	// Component's canary unit keeps, under a rollback, a step or a stop; a
+	// replica created this reconcile is created pointed at it. Empty when
+	// the unit keeps no stable side.
+	RollbackToRevision string
 	// CoordinatorFollower marks a Component whose desired count the scaling
 	// coordinator owns; CoordinatorTarget is the count it resolved for this
 	// reconcile, nil when it resolved none.
 	CoordinatorFollower bool
 	CoordinatorTarget   *int32
+	// FollowerReleased marks a Component that stopped following while
+	// nothing else owns its count; it keeps the count it carries.
+	FollowerReleased bool
 }

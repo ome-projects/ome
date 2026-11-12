@@ -74,3 +74,48 @@ func TestBindEnvs_StructWithoutSettings_IsOneSetting(t *testing.T) {
 	require.NoError(t, BindEnvs(v, &clockSettings{}))
 	assert.ElementsMatch(t, []string{"at"}, v.AllKeys())
 }
+
+type loadSettings struct {
+	LocalPath string `mapstructure:"local_path"`
+	Count     int    `mapstructure:"count"`
+	Nested    struct {
+		URI string `mapstructure:"uri"`
+	} `mapstructure:"nested"`
+}
+
+func TestLoad(t *testing.T) {
+	t.Run("an empty file keeps the defaults", func(t *testing.T) {
+		c, err := Load(viper.New(), loadSettings{Count: 10})
+		require.NoError(t, err)
+		assert.Equal(t, 10, c.Count)
+		assert.Empty(t, c.LocalPath)
+		assert.Empty(t, c.Nested.URI)
+	})
+
+	t.Run("the file overrides the defaults", func(t *testing.T) {
+		v := viper.New()
+		v.Set("count", 5)
+		v.Set("nested.uri", "pvc://models/example-model")
+		c, err := Load(v, loadSettings{Count: 10})
+		require.NoError(t, err)
+		assert.Equal(t, 5, c.Count)
+		assert.Equal(t, "pvc://models/example-model", c.Nested.URI)
+	})
+
+	t.Run("the environment fills a setting the file leaves out", func(t *testing.T) {
+		t.Setenv("OME_AGENT_LOCAL_PATH", "/models/example-model")
+		c, err := Load(agentViper(), loadSettings{Count: 10})
+		require.NoError(t, err)
+		assert.Equal(t, "/models/example-model", c.LocalPath)
+		assert.Equal(t, 10, c.Count)
+	})
+
+	t.Run("a value of the wrong type is an unmarshal error", func(t *testing.T) {
+		v := viper.New()
+		v.Set("count", "many")
+		c, err := Load(v, loadSettings{})
+		require.Error(t, err)
+		assert.Nil(t, c)
+		assert.Contains(t, err.Error(), "error occurred when unmarshalling config")
+	})
+}

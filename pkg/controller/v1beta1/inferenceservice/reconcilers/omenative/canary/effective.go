@@ -3,6 +3,7 @@ package canary
 import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
@@ -27,6 +28,12 @@ import (
 //   - A unit stopped Failed holds every Instance on the revision it runs
 //     (Partition = desired): the roll stands where the stop found it until a
 //     rollback, a resume or a new revision moves it.
+//   - A unit with no record that reads RollingBack under a run that records
+//     every member at its stable revision holds nothing (Partition 0): its
+//     Instances still off that revision roll back to it with no step, after
+//     a push the operator took back. A unit that sits such a run out whole
+//     reads Stable and keeps step 0's partition, so the next push rolls no
+//     more than step 0 stages before its record is written.
 //
 // Rollback (ome.io/rollout-rollback) is special-cased: when the status records
 // a rolled-back revision, this returns Partition 0 (hold nothing). Partition
@@ -62,6 +69,17 @@ func EffectivePartition(isvc *v1beta1.InferenceService, policies rollout.Policie
 	// onto the stable revision by the IR's RollbackToRevision target, not by the
 	// partition; a non-zero partition here would fight that revert.
 	if cs != nil && cs.RolledBackRevisionHash != "" {
+		zero := int32(0)
+		return &zero, true
+	}
+	// No record, reading RollingBack, under a run that records every member
+	// at its stable revision: the unit has no step to stage, and an
+	// Instance still off that revision is rolling back to it after a push
+	// the operator took back. Hold NOTHING (0): step 0's partition would
+	// keep that Instance where it stands, with the run open on it for good.
+	// A unit that sits such a run out whole reads Stable and keeps step 0's
+	// partition below, the hold a push lands on before its record is written.
+	if cs == nil && phase == v1beta1.RolloutPhaseRollingBack && v1beta1.RolloutRunActive(isvc) && !groupRetargeted(isvc, g, rollout.PrimaryOf(g)) {
 		zero := int32(0)
 		return &zero, true
 	}
@@ -117,6 +135,66 @@ func PartitionResolver(isvc *v1beta1.InferenceService, policies rollout.Policies
 		}
 		return PlanGateHoldPartition(isvc, policies, component, desiredReplicas)
 	}
+}
+
+// StableSideTarget is the ControllerRevision name of the revision a replica
+// the projection creates for the Component comes up on while its unit keeps
+// a stable side: under a standing rollback, the revision the operator rolled
+// back to, which every Instance runs while the rejected revision stays the
+// spec's; under a live step or a stop, the step's stable revision, because
+// a fleet that has run no revision has no side of its own for the step's
+// partition to hold it on. The service owns the revision, so it is there to
+// come back to. Empty when no canary governs the Component, when its unit
+// keeps no stable side (no record, the cutover's release, a stop for want
+// of a stable revision), when the run left the member at its stable
+// revision, or when no stable revision is recorded for the Component.
+func StableSideTarget(isvc *v1beta1.InferenceService, policies rollout.Policies, component v1beta1.ComponentType) string {
+	g := rollout.CanaryGroupFor(isvc, policies, component)
+	if g == nil || g.Canary == nil || !groupHasComponent(g, component) {
+		return ""
+	}
+	primary := rollout.PrimaryOf(g)
+	cs := rollout.GroupCanaryStatusFor(isvc, policies, component)
+	if cs == nil || !holdsStableSide(cs, isvc.Status.Components[primary].RolloutPhase, len(g.Canary.Steps)) {
+		return ""
+	}
+	if cs.RolledBackRevisionHash == "" && !memberRetargeted(isvc, component) {
+		return ""
+	}
+	stable := componentStableRevisionHash(isvc, component, primary)
+	if stable == "" {
+		return ""
+	}
+	return coordination.ControllerRevisionName(irprojector.RoleReplicaPrefix(isvc, component), component, stable)
+}
+
+// holdsStableSide reports whether the unit's state keeps a stable side: a
+// standing rollback (RollingBack, RolledBack), a step short of the last
+// that holds Instances on the stable revision (Staging, Serving, PreHold),
+// or a stop that holds every Instance where it stands (Failed). The final
+// step keeps none (its Staging and the drain, Draining): its share is the
+// whole fleet, and a member rebuilt on the stable side there would break
+// the unit's canary path and rest the other members' traffic on their one
+// held Instance for two load rounds. A unit with no record, one whose
+// cutover released the last held Instance (Done), and a stop for want of a
+// stable revision keep none either.
+func holdsStableSide(cs *v1beta1.CanaryStatus, phase v1beta1.RolloutPhase, steps int) bool {
+	switch rollout.StateOf(cs, phase, steps) {
+	case rollout.CanaryStateRollingBack, rollout.CanaryStateRolledBack,
+		rollout.CanaryStateServing, rollout.CanaryStatePreHold:
+		return true
+	case rollout.CanaryStateStaging:
+		return !finalStep(cs, steps)
+	case rollout.CanaryStateFailed:
+		return !stoppedWithoutStable(cs)
+	}
+	return false
+}
+
+// finalStep reports whether the record stands at its last step, whose
+// share is the whole fleet but for the Instances a hold keeps back.
+func finalStep(cs *v1beta1.CanaryStatus, steps int) bool {
+	return steps > 0 && int(cs.CurrentStep) == steps-1
 }
 
 // Governs reports whether a canary governs the Component's partition: an

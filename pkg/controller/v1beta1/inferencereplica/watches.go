@@ -121,6 +121,49 @@ func (r *Reconciler) endpointSliceToIR(ctx context.Context, obj client.Object) [
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: slice.Namespace, Name: irprojector.InferenceReplicaName(namePrefix, component)}}}
 }
 
+// replicasOnNode names the replicas with a pod bound to the Node that was
+// deleted, so the pass that reads those pods as gone and rebuilds their
+// Instances runs now rather than at the next pod event. The pods are read
+// through the cache under the node-name index.
+func (r *Reconciler) replicasOnNode(ctx context.Context, obj client.Object) []reconcile.Request {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return nil
+	}
+	pods, err := query.PodsOnNode(ctx, r.Client, node.Name)
+	if err != nil {
+		r.Log.V(1).Info("pods on the deleted node unreadable; its replicas wait for the next pod event", "node", node.Name, "error", err.Error())
+		return nil
+	}
+	seen := sets.New[types.NamespacedName]()
+	var requests []reconcile.Request
+	for _, pod := range pods {
+		owner := metav1.GetControllerOf(pod)
+		if owner == nil || schema.FromAPIVersionAndKind(owner.APIVersion, owner.Kind).GroupKind() != irGVK.GroupKind() {
+			continue
+		}
+		key := types.NamespacedName{Namespace: pod.Namespace, Name: owner.Name}
+		if seen.Has(key) {
+			continue
+		}
+		seen.Insert(key)
+		requests = append(requests, reconcile.Request{NamespacedName: key})
+	}
+	return requests
+}
+
+// nodeDeletePredicate passes a Node's deletion and nothing else: a Node's
+// other transitions reach the pods through the node lifecycle controller,
+// and the pod watch carries them.
+func nodeDeletePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc:  func(event.CreateEvent) bool { return false },
+		UpdateFunc:  func(event.UpdateEvent) bool { return false },
+		GenericFunc: func(event.GenericEvent) bool { return false },
+		DeleteFunc:  func(event.DeleteEvent) bool { return true },
+	}
+}
+
 // drainServiceRole parses an OMENative drain Service name into the name
 // prefix and the component it serves, or ok=false when the name isn't a
 // recognized OMENative drain Service.
@@ -318,38 +361,16 @@ func podReconcileRelevantChanged(oldPod, newPod *corev1.Pod) bool {
 	return routingLabelsChanged(oldPod, newPod)
 }
 
-// containerStatusesRelevantChanged reports whether old→new container
-// statuses differ in any field the IR reconcile / workload dispatcher
-// actually reads. It replaces a reflection-based DeepEqual over the whole
-// ContainerStatus slice — which walks ImageID, ContainerID, Resources,
-// Started, and every nested timestamp that churns on each kubelet
-// heartbeat — with a compare over only the read fields. The full set the
-// workload package reads (and why each matters for an enqueue):
-//
-//   - Name — the matching key; also read by termination + image-diff.
-//   - Image — in-place update convergence: ops.podRuntimeImagesMatch
-//     declares an in-place image roll done only once kubelet stamps the
-//     new image into Status.ContainerStatuses[*].Image, so that flip MUST
-//     wake the reconcile or the rollout stalls until the periodic resync.
-//   - State.Waiting (Reason+Message) — terminal-failure / stuck-pod
-//     escalation (evidence.PodStuckInTerminalWaiting, types.PodTermination);
-//     both fields feed types.IsTerminalWaiting.
-//   - State.Terminated (ExitCode+Reason+Message) — crash detection
-//     (types.PodTermination).
-//   - LastTerminationState.Terminated (ExitCode+Reason+Message) — a
-//     CrashLoopBackOff pod shows its crash here while live State is
-//     Waiting; types.nonZeroTerminated reads it.
-//
-// Fields deliberately NOT compared because nothing in the IR/workload
-// reconcile reads them, and they're the heartbeat churn this avoids:
-// ImageID, ContainerID, RestartCount, per-container Ready (readiness is
-// taken from the ContainersReady pod condition, compared separately
-// above), Resources, Started, and the Running/Terminated StartedAt/
-// FinishedAt timestamps.
-//
-// A length or per-name mismatch (containers added/removed/reordered)
-// always enqueues. A miss only ever delays a reconcile to the next
-// genuine change or the resync, never drops state permanently.
+// containerStatusesRelevantChanged compares the fields whose change alone
+// starts a replica pass: the container name, the image, the waiting reason
+// and message, and the exit code, reason and message of the current and
+// the last termination. RestartCount, per-container Ready, Started, the
+// state timestamps, Resources and the image and container ids are not
+// compared. The readers of the first four (the in-place transition record,
+// the crash-loop, never-ran and restart-after-Ready readings, the canary's
+// crash reading) run on a pass that a compared field, a pod condition or a
+// requeue cadence starts, so a change in one of them alone waits for that
+// pass. A container added, removed or renamed always starts a pass.
 func containerStatusesRelevantChanged(oldCS, newCS []corev1.ContainerStatus) bool {
 	if len(oldCS) != len(newCS) {
 		return true
@@ -594,9 +615,9 @@ func irRuntimeAutoSelectIndexExtractor(obj client.Object) []string {
 	return []string{irRuntimeAutoSelected}
 }
 
-// registerRefIndexes installs the runtime and model reference indexes the
-// watch mappers list through.
-func registerRefIndexes(ctx context.Context, indexer client.FieldIndexer) error {
+// RegisterReferenceIndexes installs the runtime and model reference indexes
+// the watch mappers list through. It runs before the cache starts.
+func RegisterReferenceIndexes(ctx context.Context, indexer client.FieldIndexer) error {
 	for field, extractor := range map[string]client.IndexerFunc{
 		irRuntimeRefIndexField:        irRuntimeRefIndexExtractor,
 		irModelRefIndexField:          irModelRefIndexExtractor,

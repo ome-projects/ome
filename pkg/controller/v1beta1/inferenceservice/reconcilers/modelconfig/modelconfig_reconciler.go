@@ -3,6 +3,7 @@ package multimodelconfig
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -11,7 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,127 +41,254 @@ type ModelSpecInfo struct {
 	ModelFrameworkVersion *string           `json:"modelFrameworkVersion,omitempty"`
 }
 
-// ModelConfigEntry defines the structure for a single model's configuration within the ConfigMap.
-// This structure will be part of an array in the ConfigMap's data to support multi-model configurations in the future.
+// ModelConfigEntry is one model's configuration in the ConfigMap, whose data
+// holds a list of entries. A service names one model, so its list has one.
 type ModelConfigEntry struct {
-	ModelName           string         `json:"modelName"` // e.g., "primary" or the actual model name from ModelRef
+	ModelName           string         `json:"modelName"`
 	ModelSpec           ModelSpecInfo  `json:"modelSpec"`
 	FineTunedWeightSpec *ModelSpecInfo `json:"fineTunedWeightSpec,omitempty"`
 }
 
-type ConfigMapReconciler struct {
-	client client.Client
-	scheme *runtime.Scheme
+// modelConfig is the content the ConfigMap of one service carries: the entries
+// and their JSON encoding, which is what the ConfigMap stores and the stored
+// entries are compared against.
+type modelConfig struct {
+	entries []ModelConfigEntry
+	data    []byte
 }
 
-func NewModelConfigReconciler(client client.Client, _ kubernetes.Interface, scheme *runtime.Scheme) *ConfigMapReconciler {
+// ModelConfigNotAdoptedReason is the reason of the event a service records
+// when the ConfigMap under its model ConfigMap name is controlled by
+// something else, so the service leaves it as it is.
+const ModelConfigNotAdoptedReason = "ModelConfigNotAdopted"
+
+type ConfigMapReconciler struct {
+	client   client.Client
+	scheme   *runtime.Scheme
+	recorder record.EventRecorder
+}
+
+func NewModelConfigReconciler(client client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) *ConfigMapReconciler {
 	return &ConfigMapReconciler{
-		client: client,
-		scheme: scheme,
+		client:   client,
+		scheme:   scheme,
+		recorder: recorder,
 	}
 }
 
+// Reconcile keeps the model ConfigMap of a service that names a model in step
+// with the model it names: the ConfigMap is created when absent, adopted when
+// found, and rewritten when its entries differ from the desired ones; one
+// another controller holds stays as it is. A service controls one model
+// ConfigMap, the one under its current name: any other it controls goes, and
+// a service that names no model loses them all.
 func (c *ConfigMapReconciler) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) (ctrl.Result, error) {
 	ctxLog := logf.FromContext(ctx)
-
-	// If no model is specified, we don't need a model config ConfigMap.
-	if isvc.Spec.Model == nil {
-		// TODO: Consider deleting an existing ConfigMap if the model spec is removed.
-		ctxLog.V(1).Info("No model specified in InferenceService, skipping ModelConfig reconciliation", "InferenceService", isvc.Name)
-		return ctrl.Result{}, nil
-	}
-
 	modelConfigName := constants.ModelConfigName(isvc.Name)
+	// The ConfigMap follows spec.model: a service that names no model has
+	// none, so one written for a model the service named earlier is removed.
+	if isvc.Spec.Model == nil {
+		if err := c.deleteModelConfig(ctx, isvc, modelConfigName); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, c.deleteModelConfigsUnderOtherNames(ctx, isvc, modelConfigName)
+	}
+	desired, err := c.desiredModelConfig(ctx, isvc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	existing := &corev1.ConfigMap{}
+	err = c.client.Get(ctx, types.NamespacedName{Name: modelConfigName, Namespace: isvc.Namespace}, existing)
+	switch {
+	case apierrors.IsNotFound(err):
+		ctxLog.Info("Creating new ModelConfig", "name", modelConfigName, "InferenceService", isvc.Name)
+		if err := c.createModelConfig(ctx, isvc, modelConfigName, desired.data); err != nil {
+			return ctrl.Result{}, err
+		}
+	case err != nil:
+		ctxLog.Error(err, "Failed to get ConfigMap", "configmap", modelConfigName)
+		return ctrl.Result{}, err
+	default:
+		if err := c.updateModelConfig(ctx, isvc, existing, desired); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	// The ConfigMap under the current name is settled before any other goes.
+	return ctrl.Result{}, c.deleteModelConfigsUnderOtherNames(ctx, isvc, modelConfigName)
+}
 
+// deleteModelConfigsUnderOtherNames removes the model ConfigMaps this service
+// controls under a name other than the one it writes today. A service
+// controls one model ConfigMap, so a change of the name rule leaves neither a
+// copy nor a leftover. The candidates are found by the service's label; one
+// another owner controls, or one without the models key, is not this
+// service's model ConfigMap and stays.
+func (c *ConfigMapReconciler) deleteModelConfigsUnderOtherNames(ctx context.Context, isvc *v1beta1.InferenceService, currentName string) error {
+	log := logf.FromContext(ctx)
+	labelled := &corev1.ConfigMapList{}
+	if err := c.client.List(ctx, labelled, client.InNamespace(isvc.Namespace), client.MatchingLabels{constants.InferenceServicePodLabelKey: isvc.Name}); err != nil {
+		log.Error(err, "Failed to list the ConfigMaps of the InferenceService", "InferenceService", isvc.Name)
+		return err
+	}
+	for i := range labelled.Items {
+		configMap := &labelled.Items[i]
+		_, holdsModels := configMap.Data[constants.ModelConfigKey]
+		if configMap.Name == currentName || !holdsModels || !metav1.IsControlledBy(configMap, isvc) {
+			continue
+		}
+		err := c.client.Delete(ctx, configMap, client.Preconditions{UID: &configMap.UID})
+		if err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to delete ConfigMap", "configmap", configMap.Name)
+			return err
+		}
+		log.Info("Deleted a model ConfigMap under another name", "configmap", configMap.Name, "current", currentName, "InferenceService", isvc.Name)
+	}
+	return nil
+}
+
+// desiredModelConfig reads the model the service names and renders its entry.
+func (c *ConfigMapReconciler) desiredModelConfig(ctx context.Context, isvc *v1beta1.InferenceService) (modelConfig, error) {
+	ctxLog := logf.FromContext(ctx)
 	model, err := c.resolveModelRef(ctx, isvc)
 	if err != nil {
 		ctxLog.Error(err, "Failed to generate ModelConfigEntry")
-		return ctrl.Result{}, err
+		return modelConfig{}, err
 	}
-
-	// For now, we are managing a single model entry based on InferenceService.Spec.Model
-	// In the future, this could be expanded to manage multiple models in the ConfigMap.
-	desiredEntries := []ModelConfigEntry{entryFrom(model)}
-	desiredData, err := json.Marshal(desiredEntries)
+	entries := []ModelConfigEntry{entryFrom(model)}
+	data, err := json.Marshal(entries)
 	if err != nil {
 		ctxLog.Error(err, "Failed to marshal desired ModelConfig data")
-		return ctrl.Result{}, err
+		return modelConfig{}, err
 	}
-
-	// Retrieve the ConfigMap
-	existingCm := &corev1.ConfigMap{}
-	err = c.client.Get(ctx, types.NamespacedName{Name: modelConfigName, Namespace: isvc.Namespace}, existingCm)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			// ConfigMap is not found, create a new one
-			ctxLog.Info("Creating new ModelConfig", "name", modelConfigName, "InferenceService", isvc.Name)
-			return c.createModelConfig(ctx, isvc, modelConfigName, desiredData)
-		}
-		// Unexpected error while retrieving ConfigMap
-		ctxLog.Error(err, "Failed to get ConfigMap", "configmap", modelConfigName)
-		return ctrl.Result{}, err
-	}
-
-	// ConfigMap exists, check if update is needed
-	// Unmarshal existing data to compare semantically with desired state (array of ModelConfigEntry)
-	var existingEntries []ModelConfigEntry
-	existingDataJSON, ok := existingCm.Data[constants.ModelConfigKey]
-	if ok && existingDataJSON != "" {
-		if errUnmarshal := json.Unmarshal([]byte(existingDataJSON), &existingEntries); errUnmarshal != nil {
-			ctxLog.Error(errUnmarshal, "Failed to unmarshal existing ModelConfig data, will overwrite", "name", modelConfigName)
-			ok = false // Treat as if data is not there or invalid
-		}
-	}
-
-	if !ok || !equality.Semantic.DeepEqual(existingEntries, desiredEntries) {
-		ctxLog.Info("ModelConfig exists but needs update", "name", modelConfigName)
-		updatedCm := existingCm.DeepCopy()
-		if updatedCm.Data == nil {
-			updatedCm.Data = make(map[string]string)
-		}
-		updatedCm.Data[constants.ModelConfigKey] = string(desiredData)
-
-		err = c.client.Update(ctx, updatedCm)
-		if err != nil {
-			ctxLog.Error(err, "Failed to update ConfigMap", "configmap", modelConfigName)
-			return ctrl.Result{}, err
-		}
-
-		ctxLog.Info("Successfully updated ModelConfig", "name", modelConfigName)
-	} else {
-		ctxLog.V(1).Info("ModelConfig already exists and is up-to-date", "configmap", modelConfigName)
-	}
-
-	return ctrl.Result{}, nil
+	return modelConfig{entries: entries, data: data}, nil
 }
 
-func (c *ConfigMapReconciler) createModelConfig(ctx context.Context, isvc *v1beta1.InferenceService, modelConfigName string, jsonData []byte) (ctrl.Result, error) {
+// storedEntries decodes the entries a ConfigMap holds. A missing key, an empty
+// value or one that does not decode reads as no stored entries, so the next
+// write replaces it.
+func storedEntries(ctx context.Context, configMap *corev1.ConfigMap) ([]ModelConfigEntry, bool) {
+	raw, ok := configMap.Data[constants.ModelConfigKey]
+	if !ok || raw == "" {
+		return nil, false
+	}
+	var entries []ModelConfigEntry
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to unmarshal existing ModelConfig data, will overwrite", "name", configMap.Name)
+		return nil, false
+	}
+	return entries, true
+}
+
+// updateModelConfig brings a ConfigMap found under the service's model
+// ConfigMap name in step with the service: the service becomes its
+// controller and the entries are rewritten when they differ from the desired
+// ones; its other keys stay. Nothing is written when nothing differs, and
+// nothing when another controller holds the ConfigMap.
+func (c *ConfigMapReconciler) updateModelConfig(ctx context.Context, isvc *v1beta1.InferenceService, existing *corev1.ConfigMap, desired modelConfig) error {
+	ctxLog := logf.FromContext(ctx)
+	updated := existing.DeepCopy()
+	if adopted, err := c.adoptModelConfig(ctx, isvc, updated); err != nil || !adopted {
+		return err
+	}
+	if stored, ok := storedEntries(ctx, existing); !ok || !equality.Semantic.DeepEqual(stored, desired.entries) {
+		if updated.Data == nil {
+			updated.Data = make(map[string]string)
+		}
+		updated.Data[constants.ModelConfigKey] = string(desired.data)
+	}
+	if equality.Semantic.DeepEqual(updated, existing) {
+		ctxLog.V(1).Info("ModelConfig already exists and is up-to-date", "configmap", existing.Name)
+		return nil
+	}
+	ctxLog.Info("ModelConfig exists but needs update", "name", existing.Name)
+	if err := c.client.Update(ctx, updated); err != nil {
+		ctxLog.Error(err, "Failed to update ConfigMap", "configmap", existing.Name)
+		return err
+	}
+	ctxLog.Info("Successfully updated ModelConfig", "name", existing.Name)
+	return nil
+}
+
+// ownModelConfig makes the service the ConfigMap's controller and labels the
+// ConfigMap with the service's name, the shape every model ConfigMap has. It
+// fails with an AlreadyOwnedError when another controller holds the ConfigMap.
+func (c *ConfigMapReconciler) ownModelConfig(isvc *v1beta1.InferenceService, configMap *corev1.ConfigMap) error {
+	if err := controllerutil.SetControllerReference(isvc, configMap, c.scheme); err != nil {
+		return err
+	}
+	if configMap.Labels == nil {
+		configMap.Labels = map[string]string{}
+	}
+	configMap.Labels[constants.InferenceServicePodLabelKey] = isvc.Name
+	return nil
+}
+
+// adoptModelConfig takes a ConfigMap found under the service's model
+// ConfigMap name. One with no controller, or controlled by an earlier
+// service of this name, becomes this service's and the call reports true.
+// One another controller holds stays as it is and the call reports false:
+// the service's event names that controller, and the pass goes on without
+// a model ConfigMap until the operator frees or removes that one.
+func (c *ConfigMapReconciler) adoptModelConfig(ctx context.Context, isvc *v1beta1.InferenceService, configMap *corev1.ConfigMap) (bool, error) {
+	err := c.ownModelConfig(isvc, configMap)
+	var owned *controllerutil.AlreadyOwnedError
+	if !errors.As(err, &owned) {
+		return err == nil, err
+	}
+	controller := owned.Owner.Kind + " " + owned.Owner.Name
+	c.recorder.Eventf(isvc, corev1.EventTypeWarning, ModelConfigNotAdoptedReason,
+		"OME did not take over ConfigMap %s: %s controls it. The service runs without a model ConfigMap until that ConfigMap is deleted or its controller reference removed.", configMap.Name, controller)
+	logf.FromContext(ctx).Info("ModelConfig is controlled by another owner and stays", "configmap", configMap.Name, "controller", controller, "InferenceService", isvc.Name)
+	return false, nil
+}
+
+// createModelConfig creates the ConfigMap, labelled with the service's name and
+// owned by the service, so it is removed with it.
+func (c *ConfigMapReconciler) createModelConfig(ctx context.Context, isvc *v1beta1.InferenceService, modelConfigName string, jsonData []byte) error {
 	log := logf.FromContext(ctx)
 	newModelConfig := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      modelConfigName,
-			Namespace: isvc.Namespace,
-			Labels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvc.Name,
-			},
-		},
-		Data: map[string]string{
-			constants.ModelConfigKey: string(jsonData),
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: modelConfigName, Namespace: isvc.Namespace},
+		Data:       map[string]string{constants.ModelConfigKey: string(jsonData)},
 	}
-
-	if err := controllerutil.SetControllerReference(isvc, newModelConfig, c.scheme); err != nil {
+	if err := c.ownModelConfig(isvc, newModelConfig); err != nil {
 		log.Error(err, "Failed to set controller reference for modelConfig", "configmap", modelConfigName)
-		return ctrl.Result{}, err
+		return err
 	}
-
 	if err := c.client.Create(ctx, newModelConfig); err != nil {
 		log.Error(err, "Failed to create ConfigMap", "configmap", modelConfigName)
-		return ctrl.Result{}, err
+		return err
 	}
-
 	log.Info("Successfully created modelConfig", "configmap", modelConfigName)
-	return ctrl.Result{}, nil
+	return nil
+}
+
+// deleteModelConfig removes the service's model ConfigMap when it exists and
+// this service controls it. A ConfigMap of that name under another owner, or
+// under none, is not this service's to delete and stays.
+func (c *ConfigMapReconciler) deleteModelConfig(ctx context.Context, isvc *v1beta1.InferenceService, modelConfigName string) error {
+	log := logf.FromContext(ctx)
+	existing := &corev1.ConfigMap{}
+	err := c.client.Get(ctx, types.NamespacedName{Name: modelConfigName, Namespace: isvc.Namespace}, existing)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		log.Error(err, "Failed to get ConfigMap", "configmap", modelConfigName)
+		return err
+	}
+	if !metav1.IsControlledBy(existing, isvc) {
+		log.V(1).Info("ModelConfig is not controlled by this InferenceService and stays", "configmap", modelConfigName, "InferenceService", isvc.Name)
+		return nil
+	}
+	// The precondition ties the delete to the object that was read, so a
+	// ConfigMap created under the same name since then is left alone.
+	err = c.client.Delete(ctx, existing, client.Preconditions{UID: &existing.UID})
+	if err != nil && !apierrors.IsNotFound(err) {
+		log.Error(err, "Failed to delete ConfigMap", "configmap", modelConfigName)
+		return err
+	}
+	log.Info("Deleted ModelConfig of an InferenceService without a model", "configmap", modelConfigName, "InferenceService", isvc.Name)
+	return nil
 }
 
 // resolvedModel is what Spec.Model names once the referenced objects are read:

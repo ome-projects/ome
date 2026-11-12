@@ -9,7 +9,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// A run opens for the whole InferenceService, so one group's retarget pins
+// A run opens for the whole InferenceService, so one group's retarget records
 // a target for every grouped Component. The tests here cover the Components
 // that did not move: their stable revision is read from the InferenceReplica
 // they stand on, and the status records answer only where the IR cannot.
@@ -24,7 +24,7 @@ const (
 )
 
 // groupedFixture is isvcFixture over several rollout groups, with a router
-// so a router group has a Component to pin.
+// so a router group has a Component to record.
 func groupedFixture(groups ...v1beta1.RolloutGroup) *v1beta1.InferenceService {
 	isvc := isvcFixture(groups[0])
 	concurrent := v1beta1.RolloutGroupOrderingConcurrent
@@ -49,10 +49,10 @@ func irCounted(comp v1beta1.ComponentType, current, target string, replicas, upd
 	}
 }
 
-func pinnedByComponent(t *testing.T, isvc *v1beta1.InferenceService) map[v1beta1.ComponentType]v1beta1.RolloutRunTarget {
+func recordedByComponent(t *testing.T, isvc *v1beta1.InferenceService) map[v1beta1.ComponentType]v1beta1.RolloutRunTarget {
 	t.Helper()
 	if isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
-		t.Fatal("no run pinned")
+		t.Fatal("no run recorded")
 	}
 	out := map[v1beta1.ComponentType]v1beta1.RolloutRunTarget{}
 	for _, target := range isvc.Status.Rollout.ActiveRun.TargetRevisions {
@@ -88,7 +88,7 @@ func openRouterRunBesideEngine(t *testing.T, engineStatus v1beta1.ComponentStatu
 }
 
 // unitIdleInRun mirrors the canary executor's arming rule: a unit whose
-// every pinned member has revision == stable has no work in the run.
+// every recorded member has revision == stable has no work in the run.
 func unitIdleInRun(active *v1beta1.RolloutRun, g *v1beta1.RolloutGroup) bool {
 	members := map[v1beta1.ComponentType]bool{}
 	for _, c := range g.Components {
@@ -108,22 +108,22 @@ func unitIdleInRun(active *v1beta1.RolloutRun, g *v1beta1.RolloutGroup) bool {
 }
 
 // The engine fleet stands whole on one revision and only the router moved.
-// The engine's pinned stable is the revision it stands on, not the one its
+// The engine's recorded stable is the revision it stands on, not the one its
 // rolled-out record remembers: the record would make a revision with no
-// Instance the engine's rollback target and arm a ladder with no work.
+// Instance the engine's rollback target and start a canary with no work.
 func TestOpenPinsSettledUnitAtItsOwnRevisionOverStaleRolledOutRecord(t *testing.T) {
 	isvc := openRouterRunBesideEngine(t, v1beta1.ComponentStatusSpec{
 		LatestRolledoutRevision: engineStaleRecord,
 	}, 4, 4)
 
-	pinned := pinnedByComponent(t, isvc)
-	engine := pinned[v1beta1.EngineComponent]
+	recorded := recordedByComponent(t, isvc)
+	engine := recorded[v1beta1.EngineComponent]
 	if engine.Revision != "cccccccc" || engine.StableRevision != "cccccccc" {
-		t.Fatalf("engine pinned %+v, want revision and stable both at the revision it stands on", engine)
+		t.Fatalf("engine recorded %+v, want revision and stable both at the revision it stands on", engine)
 	}
-	router := pinned[v1beta1.RouterComponent]
+	router := recorded[v1beta1.RouterComponent]
 	if router.Revision != "r2222222" || router.StableRevision != "r1111111" {
-		t.Fatalf("router pinned %+v, want r2222222 over stable r1111111", router)
+		t.Fatalf("router recorded %+v, want r2222222 over stable r1111111", router)
 	}
 }
 
@@ -133,15 +133,15 @@ func TestOpenPinsSettledUnitAtItsOwnRevisionOverStaleCanaryRecord(t *testing.T) 
 		Canary: &v1beta1.CanaryStatus{StableRevisionHash: "99999999"},
 	}, 4, 4)
 
-	engine := pinnedByComponent(t, isvc)[v1beta1.EngineComponent]
+	engine := recordedByComponent(t, isvc)[v1beta1.EngineComponent]
 	if engine.Revision != "cccccccc" || engine.StableRevision != "cccccccc" {
-		t.Fatalf("engine pinned %+v, want revision and stable both at the revision it stands on", engine)
+		t.Fatalf("engine recorded %+v, want revision and stable both at the revision it stands on", engine)
 	}
 }
 
-// Pinning revision == stable is what keeps the unit out of the run: the
-// executor arms a ladder only for a unit whose pinned revision differs from
-// its pinned stable.
+// Recording revision == stable is what keeps the unit out of the run: the
+// executor starts a canary only for a unit whose recorded revision differs from
+// its recorded stable.
 func TestSettledUnitHasNoWorkInAnotherGroupsRun(t *testing.T) {
 	isvc := openRouterRunBesideEngine(t, v1beta1.ComponentStatusSpec{
 		LatestRolledoutRevision: engineStaleRecord,
@@ -152,35 +152,35 @@ func TestSettledUnitHasNoWorkInAnotherGroupsRun(t *testing.T) {
 		t.Fatal("the settled engine unit must read idle in the router's run")
 	}
 	if unitIdleInRun(active, &isvc.Spec.Rollout.Groups[0]) {
-		t.Fatal("the router unit retargeted and must arm")
+		t.Fatal("the router unit retargeted and must start")
 	}
 }
 
 // A revision pair that agrees while Instances trail is a pending roll, the
 // state a mid-roll revert leaves behind, not a settled unit: its stable
-// still comes from the record, so the revert arms.
+// still comes from the record, so the revert starts.
 func TestStragglingUnitResolvesStableFromItsRecord(t *testing.T) {
 	isvc := openRouterRunBesideEngine(t, v1beta1.ComponentStatusSpec{
 		LatestRolledoutRevision: engineStaleRecord,
 	}, 4, 1)
 
-	engine := pinnedByComponent(t, isvc)[v1beta1.EngineComponent]
+	engine := recordedByComponent(t, isvc)[v1beta1.EngineComponent]
 	if engine.StableRevision != "99999999" {
 		t.Fatalf("straggling engine stable = %q, want the recorded 99999999", engine.StableRevision)
 	}
 }
 
-// A run adopting a ladder in flight keeps the records only for the unit
-// whose ladder it adopts. The router, rolled fully onto its canary revision
-// mid-ladder, resolves the stable it shifts traffic from out of its canary
-// record; the engine, settled on its revision in another unit, is pinned
+// A run adopting a canary in flight keeps the records only for the unit
+// whose canary it adopts. The router, rolled fully onto its canary revision
+// mid-canary, resolves the stable it shifts traffic from out of its canary
+// record; the engine, settled on its revision in another unit, is recorded
 // where it stands and sits the run out, whatever its rolled-out record says.
 func TestAdoptingRunKeepsRecordsOnlyForTheUnitInFlight(t *testing.T) {
 	isvc := groupedFixture(
 		v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: canaryBody(10, 100)},
 		v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: canaryBody(10, 100)},
 	)
-	// The router's ladder is live with no run pinned: the open adopts it.
+	// The router's canary is live with no run recorded: the open adopts it.
 	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
 		v1beta1.RouterComponent: {Canary: &v1beta1.CanaryStatus{CanaryRevisionHash: "r2222222", StableRevisionHash: "r1111111", CurrentStep: 0}},
 		v1beta1.EngineComponent: {LatestRolledoutRevision: engineStaleRecord},
@@ -194,23 +194,23 @@ func TestAdoptingRunKeepsRecordsOnlyForTheUnitInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !out.Opened || !out.Adopted {
-		t.Fatalf("a live ladder with no run must be adopted, got %+v", out)
+		t.Fatalf("a live canary with no run must be adopted, got %+v", out)
 	}
-	pinned := pinnedByComponent(t, isvc)
-	router := pinned[v1beta1.RouterComponent]
+	recorded := recordedByComponent(t, isvc)
+	router := recorded[v1beta1.RouterComponent]
 	if router.Revision != "r2222222" || router.StableRevision != "r1111111" {
-		t.Fatalf("adopted router pinned %+v, want r2222222 over the stable its record names, r1111111", router)
+		t.Fatalf("adopted router recorded %+v, want r2222222 over the stable its record names, r1111111", router)
 	}
-	engine := pinned[v1beta1.EngineComponent]
+	engine := recorded[v1beta1.EngineComponent]
 	if engine.Revision != "cccccccc" || engine.StableRevision != "cccccccc" {
-		t.Fatalf("engine pinned %+v, want revision and stable both at the revision it stands on", engine)
+		t.Fatalf("engine recorded %+v, want revision and stable both at the revision it stands on", engine)
 	}
 	active := isvc.Status.Rollout.ActiveRun
 	if !unitIdleInRun(active, &isvc.Spec.Rollout.Groups[1]) {
 		t.Fatal("the settled engine unit must read idle in the adopted run")
 	}
 	if unitIdleInRun(active, &isvc.Spec.Rollout.Groups[0]) {
-		t.Fatal("the adopted router unit has its ladder to finish")
+		t.Fatal("the adopted router unit has its canary to finish")
 	}
 }
 
@@ -244,64 +244,64 @@ func TestComponentStableRevision(t *testing.T) {
 	cases := []struct {
 		name     string
 		isvc     func() *v1beta1.InferenceService
-		pinned   string
+		recorded string
 		target   targetPair
 		adopting bool
 		want     string
 	}{{
-		name:   "a current revision off the pin is the stable",
-		pinned: "bbbbbbbb",
-		target: targetPair{current: "aaaaaaaa", target: "bbbbbbbb", replicas: 2, updated: 0},
-		want:   "aaaaaaaa",
+		name:     "a current revision off the pin is the stable",
+		recorded: "bbbbbbbb",
+		target:   targetPair{current: "aaaaaaaa", target: "bbbbbbbb", replicas: 2, updated: 0},
+		want:     "aaaaaaaa",
 	}, {
-		name:   "settled on the pin: the IR, not the record",
-		pinned: "cccccccc",
-		target: targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 4},
-		want:   "cccccccc",
+		name:     "settled on the pin: the IR, not the record",
+		recorded: "cccccccc",
+		target:   targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 4},
+		want:     "cccccccc",
 	}, {
-		name:   "settled with no Instance at all is still settled",
-		pinned: "cccccccc",
-		target: targetPair{current: "cccccccc", target: "cccccccc"},
-		want:   "cccccccc",
+		name:     "settled with no Instance at all is still settled",
+		recorded: "cccccccc",
+		target:   targetPair{current: "cccccccc", target: "cccccccc"},
+		want:     "cccccccc",
 	}, {
-		name:   "stragglers are a pending roll: the record stands",
-		pinned: "cccccccc",
-		target: targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 1},
-		want:   "99999999",
+		name:     "stragglers are a pending roll: the record stands",
+		recorded: "cccccccc",
+		target:   targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 1},
+		want:     "99999999",
 	}, {
 		name:     "an adopting run keeps the record",
-		pinned:   "cccccccc",
+		recorded: "cccccccc",
 		target:   targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 4},
 		adopting: true,
 		want:     "99999999",
 	}, {
-		name:   "no IR revision falls through to the record",
-		pinned: "cccccccc",
-		target: targetPair{},
-		want:   "99999999",
+		name:     "no IR revision falls through to the record",
+		recorded: "cccccccc",
+		target:   targetPair{},
+		want:     "99999999",
 	}, {
-		name:   "stragglers with no record fall back to the current revision",
-		isvc:   withoutRecord,
-		pinned: "cccccccc",
-		target: targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 1},
-		want:   "cccccccc",
+		name:     "stragglers with no record fall back to the current revision",
+		isvc:     withoutRecord,
+		recorded: "cccccccc",
+		target:   targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 1},
+		want:     "cccccccc",
 	}, {
-		name:   "no IR revision and no record pins no stable",
-		isvc:   withoutRecord,
-		pinned: "cccccccc",
-		target: targetPair{},
-		want:   "",
+		name:     "no IR revision and no record pins no stable",
+		isvc:     withoutRecord,
+		recorded: "cccccccc",
+		target:   targetPair{},
+		want:     "",
 	}, {
 		name:     "an adopting run with nothing on record pins no stable",
 		isvc:     withoutRecord,
-		pinned:   "cccccccc",
+		recorded: "cccccccc",
 		target:   targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 4},
 		adopting: true,
 		want:     "",
 	}, {
 		name:     "an adopting unit's stable identity answers before the record",
 		isvc:     withCanaryRecord,
-		pinned:   "cccccccc",
+		recorded: "cccccccc",
 		target:   targetPair{current: "cccccccc", target: "cccccccc", replicas: 4, updated: 4},
 		adopting: true,
 		want:     "77777777",
@@ -313,7 +313,7 @@ func TestComponentStableRevision(t *testing.T) {
 			if tc.isvc != nil {
 				isvc = tc.isvc
 			}
-			got := componentStableRevision(isvc(), v1beta1.EngineComponent, tc.pinned, tc.target, tc.adopting)
+			got := componentStableRevision(isvc(), v1beta1.EngineComponent, tc.recorded, tc.target, tc.adopting)
 			if got != tc.want {
 				t.Fatalf("componentStableRevision = %q, want %q", got, tc.want)
 			}

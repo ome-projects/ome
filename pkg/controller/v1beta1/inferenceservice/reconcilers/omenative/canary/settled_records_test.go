@@ -14,7 +14,7 @@ import (
 )
 
 // The rolled-out record of a canary-owned Component is the executor's to
-// write. Inside an armed ladder it is the memory of a traffic shift; outside
+// write. Inside an open canary it is the memory of a traffic shift; outside
 // one it mirrors the InferenceReplica, so a record cannot keep naming a
 // revision the fleet left.
 
@@ -31,8 +31,8 @@ func revisionServiceName(isvc *v1beta1.InferenceService, comp v1beta1.ComponentT
 	return coordination.PerRevisionServiceName(irprojector.RoleReplicaPrefix(isvc, comp), comp, hash)
 }
 
-// idleRecordFixture seeds a single-engine canary service with no ladder
-// armed, its engine settled on "cur" with two Ready pods, and a rolled-out
+// idleRecordFixture seeds a single-engine canary service with no canary
+// open, its engine settled on "cur" with two Ready pods, and a rolled-out
 // record still naming "stale".
 func idleRecordFixture(t *testing.T, name string, objects ...client.Object) (*v1beta1.InferenceService, client.Client) {
 	t.Helper()
@@ -59,9 +59,9 @@ func dispatchOnce(t *testing.T, isvc *v1beta1.InferenceService, c client.Client)
 	}
 }
 
-// With no ladder armed, a member settled on one revision is recorded on it:
+// With no canary open, a member settled on one revision is recorded on it:
 // the stale record is demoted to the previous revision and the ready
-// revision is brought level, and no canary state is armed in the process.
+// revision is brought level, and no canary state is opened in the process.
 func TestDispatch_IdleMemberRecordFollowsItsInferenceReplica(t *testing.T) {
 	isvc, c := idleRecordFixture(t, "idle-record")
 	dispatchOnce(t, isvc, c)
@@ -78,7 +78,7 @@ func TestDispatch_IdleMemberRecordFollowsItsInferenceReplica(t *testing.T) {
 		t.Fatalf("LatestReadyRevision = %q, want %q", cs.LatestReadyRevision, want)
 	}
 	if cs.Canary != nil {
-		t.Fatalf("an idle unit must arm no canary state, got %+v", cs.Canary)
+		t.Fatalf("an idle unit must open no canary state, got %+v", cs.Canary)
 	}
 }
 
@@ -168,11 +168,11 @@ func TestDispatch_IdlePairRecordsFollowBothInferenceReplicas(t *testing.T) {
 	}
 }
 
-// Inside an armed ladder the record is the ladder's: it names the stable
-// revision the ladder shifts traffic from until the promotion or the revert
+// Inside an open canary the record is the canary's: it names the stable
+// revision the canary shifts traffic from until the promotion or the revert
 // completes, even on a pass where every pod of the member runs the canary
 // revision.
-func TestDispatch_ArmedMemberRecordIsLeftToTheLadder(t *testing.T) {
+func TestDispatch_OpenCanaryKeepsTheMemberRecord(t *testing.T) {
 	ns := "default"
 	cases := []struct {
 		name string
@@ -183,7 +183,7 @@ func TestDispatch_ArmedMemberRecordIsLeftToTheLadder(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			name := "armed-record"
+			name := "open-record"
 			n4 := 4
 			isvc := canaryISVC(twoStep(), nil)
 			isvc.Namespace, isvc.Name = ns, name
@@ -212,7 +212,7 @@ func TestDispatch_ArmedMemberRecordIsLeftToTheLadder(t *testing.T) {
 			dispatchOnce(t, isvc, c)
 
 			if got := isvc.Status.Components[v1beta1.EngineComponent].LatestRolledoutRevision; got != old {
-				t.Fatalf("LatestRolledoutRevision = %q, want the ladder's %q", got, old)
+				t.Fatalf("LatestRolledoutRevision = %q, want the canary's %q", got, old)
 			}
 		})
 	}

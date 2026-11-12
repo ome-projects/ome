@@ -63,7 +63,7 @@ func kcSecret(data string) *corev1.Secret {
 func newReconciler(t *testing.T, s *runtime.Scheme, probe func(context.Context, []byte) error, objs ...client.Object) (*Reconciler, client.Client) {
 	t.Helper()
 	c := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithObjects(objs...), fakeclient.WithStatusSubresource(&v1beta1.WorkloadCluster{}))
-	return &Reconciler{Client: c, Scheme: s, Log: log.Log, Probe: probe}, c
+	return &Reconciler{Client: c, Log: log.Log, Probe: probe}, c
 }
 
 func readyCond(c client.Client, name string) *metav1.Condition {
@@ -242,7 +242,7 @@ func TestReconcile_BackoffHoldsConnectionOnTransientSecretReadFailure(t *testing
 		return &stubClient{id: "c1"}, func() {}, nil
 	}
 	r := &Reconciler{
-		Client: c, Scheme: s, Log: log.Log,
+		Client: c, Log: log.Log,
 		Probe:   func(context.Context, []byte) error { return nil },
 		Manager: mgr, ConnectionGracePeriod: time.Hour,
 	}

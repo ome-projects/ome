@@ -1,15 +1,12 @@
 package status
 
 import (
-	"context"
-	"errors"
 	"reflect"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -38,32 +35,27 @@ func TestCreatingMutation_ClaimsOnceAndPinsAnUnpinnedAttempt(t *testing.T) {
 	}
 }
 
-// The plain promote enters Ready once, clears the attempt and leaves the
-// running revision alone.
-// The promote clears the attempt and the target revision it was for; the
-// running revision stays as it was. A settled Ready row carries no target
-// revision, so the status publication's Ready over a Failed row off its
-// running revision is a shape no promote leaves.
-func TestStampReady_ClearsTheAttemptAndKeepsTheRevision(t *testing.T) {
+// The live promote enters Ready once, records the revision, clears the
+// attempt and the target revision it was for, and leaves a settled Ready row
+// alone: a second promote of the same revision changes nothing and keeps the
+// first ReadySince. A settled Ready row carries no target revision, so the
+// status publication's Ready over a Failed row off its running revision is a
+// shape no promote leaves.
+func TestReadyOnRevisionMutation_LeavesASettledReadyRowAlone(t *testing.T) {
 	now := time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC)
-	w := newRowWriter(types.InstanceStatus{
+	row := types.InstanceStatus{
 		Index: 0, Phase: types.InstancePhaseCreating, RunningRevision: "rev-old", TargetRevision: "rev-new",
 		Operation: &types.InstanceOperation{ID: "create-0", Type: types.InstanceOperationCreate},
-	})
-	if err := StampReady(context.Background(), w.input(now), 0); err != nil {
-		t.Fatal(err)
 	}
-	row := w.rows[0]
-	if row.Phase != types.InstancePhaseReady || row.Operation != nil || row.RunningRevision != "rev-old" ||
+	if !ReadyOnRevisionMutation(0, "rev-new", now).Mutate(&row) {
+		t.Fatal("a promotable row must change")
+	}
+	if row.Phase != types.InstancePhaseReady || row.Operation != nil || row.RunningRevision != "rev-new" ||
 		row.TargetRevision != "" || row.ReadySince == nil || !row.ReadySince.Time.Equal(now) {
-		t.Fatalf("row = %+v, want Ready since now on rev-old with no attempt and no target revision", row)
+		t.Fatalf("row = %+v, want Ready since now on rev-new with no attempt and no target revision", row)
 	}
-	writes := w.writes
-	if err := StampReady(context.Background(), w.input(now.Add(time.Minute)), 0); err != nil {
-		t.Fatal(err)
-	}
-	if w.writes != writes || !w.rows[0].ReadySince.Time.Equal(now) {
-		t.Fatal("a Ready row with no attempt must not be re-stamped")
+	if ReadyOnRevisionMutation(0, "rev-new", now.Add(time.Minute)).Mutate(&row) || !row.ReadySince.Time.Equal(now) {
+		t.Fatal("a Ready row with no attempt must not be written again")
 	}
 }
 
@@ -158,34 +150,17 @@ func TestCreateRollbackMutation_RestoresOnlyTheCommittedTransition(t *testing.T)
 	}
 }
 
-func TestReadyMutation_UnknownRevisionKeepsTheAttempt(t *testing.T) {
+func TestReadyOnRevisionMutation_RecordsTheRevisionBeforeClearingTheAttempt(t *testing.T) {
 	now := time.Now()
 	before := types.InstanceStatus{
 		Index: 0, Phase: types.InstancePhaseCreating,
 		Operation: &types.InstanceOperation{ID: "create-0", Type: types.InstanceOperationCreate, TargetRevision: "example-engine-v1"},
 	}
 	row := Clone(before)
-	if ReadyMutation(0, now).Mutate(&row) || !reflect.DeepEqual(row, before) {
-		t.Fatalf("unverified promotion changed the row: %+v", row)
-	}
 	if !ReadyOnRevisionMutation(0, before.Operation.TargetRevision, now).Mutate(&row) {
 		t.Fatal("a verified revision must permit promotion")
 	}
 	if row.Phase != types.InstancePhaseReady || row.RunningRevision != before.Operation.TargetRevision || row.Operation != nil {
 		t.Fatalf("promotion did not record its revision before clearing the attempt: %+v", row)
-	}
-}
-
-func TestStampReady_ValidatesTheFreshRowsRevision(t *testing.T) {
-	before := types.InstanceStatus{Index: 0, Phase: types.InstancePhaseRestarting,
-		Operation: &types.InstanceOperation{ID: "restart-0", Type: types.InstanceOperationRestart}}
-	w := newRowWriter(before)
-	input := w.input(time.Now())
-	input.ObservedState.InstanceStatuses[0].RunningRevision = "example-engine-v1"
-	if err := StampReady(context.Background(), input, 0); !errors.Is(err, query.ErrRevisionUnknown) {
-		t.Fatalf("error = %v, want unknown revision from the fresh row", err)
-	}
-	if w.writes != 0 || !reflect.DeepEqual(w.rows[0], before) {
-		t.Fatalf("rejected promotion changed the row: %+v", w.rows[0])
 	}
 }

@@ -1,0 +1,26 @@
+{
+  "recordedOn": {
+    "date": "2026-11-07",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The finishes of one Create pass over a Component at rest, every Instance Ready on the spec revision with every pod serving past its availability window: the decision over every planned Instance (the pod set, the promote bar, the row read against the revision its pods carry) and the commit of those finishes in one batch, which the writer answers without a read or a write because every mutation is marked unchanged on the pass's copy. Per Instance the decision builds nothing: the pod set is read against the pods' names as they stand, the pods a promote is decided on are the Instance's own list when every pod of it holds a name of the set, a finish found unchanged on the copy takes a record from the pass's one slice of them and the Ready mutation the pass built once for its revision, and the pod set's revision is read from an array the call holds. Six allocations per pass are the pass's own, whatever the shape. Before, the decision built every name of the set (two allocations for a single pod, nine for a gang of eight, three for a gang of two) and a gang of eight cut the pod set for the revision reading and the live pods for the names: 2,006 / 8,006 / 1,926 / 5,181 allocations and 360,472 / 1,411,480 / 178,712 / 748,984 bytes for the decision at 1000x1 / 4000x1 / 160x8 / 1725x2, 2,016 / 8,020 / 1,934 / 5,193 with the commit. Before that, each finish allocated its record, a copy of its row, the two closures of its mutation, its commit callback and its revision list: 8,002 / 32,002 / 2,882 / 15,527 for the decision, 8,012 / 32,016 / 2,890 / 15,539 with the commit.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/decide/allocations": 6,
+    "1000x1/decide/bytes": 280472,
+    "1000x1/pass/allocations": 16,
+    "1000x1/pass/bytes": 371672,
+    "160x8/decide/allocations": 6,
+    "160x8/decide/bytes": 45592,
+    "160x8/pass/allocations": 14,
+    "160x8/pass/bytes": 62296,
+    "1725x2/decide/allocations": 6,
+    "1725x2/decide/bytes": 472984,
+    "1725x2/pass/allocations": 18,
+    "1725x2/pass/bytes": 650200,
+    "4000x1/decide/allocations": 6,
+    "4000x1/decide/bytes": 1091480,
+    "4000x1/pass/allocations": 20,
+    "4000x1/pass/bytes": 1491928
+  }
+}

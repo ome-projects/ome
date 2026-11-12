@@ -7,6 +7,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -382,7 +383,7 @@ func TestInstancePlanIndices_ScaleUpTakesTheLowestUnusedIndexesInOrder(t *testin
 		{replicas: 9, want: []int32{0, 1, 2, 3, 4, 5, 6, 7, 8}},
 		{replicas: 10, want: []int32{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}},
 	} {
-		if diff := cmp.Diff(tc.want, instancePlanIndices(instances, tc.replicas, nil, nil)); diff != "" {
+		if diff := cmp.Diff(tc.want, instancePlanIndices(instances, tc.replicas, nil, nil, "")); diff != "" {
 			t.Errorf("replicas=%d (-want +got):\n%s", tc.replicas, diff)
 		}
 	}
@@ -396,7 +397,7 @@ func TestInstancePlanIndices_MultiReplicaMigrationPreservesUnrelatedInstance(t *
 		{Index: 1, Phase: types.InstancePhaseReady},
 		{Index: 2, Phase: types.InstancePhaseCreating, Operation: &types.InstanceOperation{Type: types.InstanceOperationMigrate}},
 	}
-	got := instancePlanIndices(instances, 2, nil, nil)
+	got := instancePlanIndices(instances, 2, nil, nil, "")
 	hit := map[int32]bool{}
 	for _, idx := range got {
 		hit[idx] = true
@@ -411,7 +412,7 @@ func TestInstancePlanIndices_PreservesSparseMigrationLayout(t *testing.T) {
 		{Index: 0, Phase: types.InstancePhaseMigrating},
 		{Index: 2, Phase: types.InstancePhaseCreating, Operation: &types.InstanceOperation{Type: types.InstanceOperationMigrate}},
 	}
-	got := instancePlanIndices(instances, 1, nil, nil)
+	got := instancePlanIndices(instances, 1, nil, nil, "")
 	// Both migration-in-flight indices must be in the plan even though
 	// replicas=1.
 	hit := map[int32]bool{}
@@ -431,7 +432,7 @@ func TestInstancePlanIndices_MigrationReadyTargetReplacesSource(t *testing.T) {
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationMigrate, RequestUUID: "request-a", SurgeIndex: &targetIndex}},
 		{Index: targetIndex, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: revision},
 	}
-	indices := instancePlanIndices(instances, 1, nil, nil)
+	indices := instancePlanIndices(instances, 1, nil, nil, "")
 	if diff := cmp.Diff([]int32{targetIndex}, indices); diff != "" {
 		t.Fatalf("promoted migration target must replace its source (-want +got):\n%s", diff)
 	}
@@ -457,7 +458,7 @@ func TestInstancePlanIndices_MigrationRetiringSourceDoesNotDisplaceSteadyInstanc
 		{Index: targetIndex, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: revision},
 	}
 	want := []int32{1, 2, 3, 4, 5, 6, 7, 8}
-	if diff := cmp.Diff(want, instancePlanIndices(instances, 8, nil, nil)); diff != "" {
+	if diff := cmp.Diff(want, instancePlanIndices(instances, 8, nil, nil, "")); diff != "" {
 		t.Fatalf("retiring migration source displaced a steady instance (-want +got):\n%s", diff)
 	}
 }
@@ -498,7 +499,7 @@ func TestInstancePlanIndices_MigrationSourceRequiresPromotedTargetProof(t *testi
 				test.target,
 			}
 			want := []int32{0, 1, 2}
-			if diff := cmp.Diff(want, instancePlanIndices(instances, 2, nil, nil)); diff != "" {
+			if diff := cmp.Diff(want, instancePlanIndices(instances, 2, nil, nil, "")); diff != "" {
 				t.Fatalf("unproven migration target released its source (-want +got):\n%s", diff)
 			}
 		})
@@ -517,7 +518,7 @@ func TestInstancePlanIndices_SharedMigrationTargetKeepsAllParticipants(t *testin
 		{Index: sharedTarget, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: revision},
 	}
 	want := []int32{0, 1, 2, 3}
-	if diff := cmp.Diff(want, instancePlanIndices(instances, 3, nil, nil)); diff != "" {
+	if diff := cmp.Diff(want, instancePlanIndices(instances, 3, nil, nil, "")); diff != "" {
 		t.Fatalf("shared migration target released a source or sibling (-want +got):\n%s", diff)
 	}
 }
@@ -534,7 +535,7 @@ func TestInstancePlanIndices_WrongPhaseMigrationReferenceBlocksRetirement(t *tes
 		{Index: sharedTarget, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: revision},
 	}
 	want := []int32{0, 1, 2, 3}
-	if diff := cmp.Diff(want, instancePlanIndices(instances, 2, nil, nil)); diff != "" {
+	if diff := cmp.Diff(want, instancePlanIndices(instances, 2, nil, nil, "")); diff != "" {
 		t.Fatalf("wrong-phase migration reference released a valid source (-want +got):\n%s", diff)
 	}
 }
@@ -555,7 +556,7 @@ func TestInstancePlanIndices_MixedHandoffsSharingTargetKeepAllParticipants(t *te
 		{Index: sharedTarget, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: newRevision},
 	}
 	want := []int32{0, 1, 2, 3}
-	if diff := cmp.Diff(want, instancePlanIndices(instances, 3, nil, nil)); diff != "" {
+	if diff := cmp.Diff(want, instancePlanIndices(instances, 3, nil, nil, "")); diff != "" {
 		t.Fatalf("mixed handoffs sharing one target released a participant (-want +got):\n%s", diff)
 	}
 }
@@ -572,7 +573,7 @@ func TestInstancePlanIndices_GangSurgePinsPair(t *testing.T) {
 		{Index: 1, Phase: types.InstancePhaseReady},
 		{Index: 3, Phase: types.InstancePhaseCreating, Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTarget}},
 	}
-	got := instancePlanIndices(instances, 2, nil, nil)
+	got := instancePlanIndices(instances, 2, nil, nil, "")
 	hit := map[int32]bool{}
 	for _, idx := range got {
 		hit[idx] = true
@@ -600,11 +601,11 @@ func TestInstancePlanIndices_GangCleanupMarkerPinnedWhileReferenced(t *testing.T
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTargetCleanup}},
 	}
 	hit := map[int32]bool{}
-	for _, idx := range instancePlanIndices(referenced, 1, nil, nil) {
+	for _, idx := range instancePlanIndices(referenced, 1, nil, nil, "") {
 		hit[idx] = true
 	}
 	if !hit[0] || !hit[1] {
-		t.Errorf("a referenced cleanup marker must stay pinned at replicas=1; got %v", instancePlanIndices(referenced, 1, nil, nil))
+		t.Errorf("a referenced cleanup marker must stay pinned at replicas=1; got %v", instancePlanIndices(referenced, 1, nil, nil, ""))
 	}
 
 	two := int32(2)
@@ -615,7 +616,7 @@ func TestInstancePlanIndices_GangCleanupMarkerPinnedWhileReferenced(t *testing.T
 		{Index: 2, Phase: types.InstancePhaseFailed,
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTargetCleanup, TargetRevision: "comp-rev-v2bbbbbb"}},
 	}
-	if diff := cmp.Diff([]int32{1}, instancePlanIndices(failedBehindReady, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{1}, instancePlanIndices(failedBehindReady, 1, nil, nil, "")); diff != "" {
 		t.Errorf("a failed pair loses the one slot to the Ready sibling and leaves together (-want +got):\n%s", diff)
 	}
 	if diff := cmp.Diff([]int32{0, 2}, ScaleDownExtras(failedBehindReady, types.ComponentPlan{Instances: []types.InstancePlan{{Index: 1}}})); diff != "" {
@@ -624,7 +625,7 @@ func TestInstancePlanIndices_GangCleanupMarkerPinnedWhileReferenced(t *testing.T
 
 	failedAlone := failedBehindReady[:1:1]
 	failedAlone = append(failedAlone, failedBehindReady[2])
-	if diff := cmp.Diff([]int32{0, 2}, instancePlanIndices(failedAlone, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 2}, instancePlanIndices(failedAlone, 1, nil, nil, "")); diff != "" {
 		t.Errorf("a failed pair with no Ready row to prefer is kept whole (-want +got):\n%s", diff)
 	}
 
@@ -633,7 +634,7 @@ func TestInstancePlanIndices_GangCleanupMarkerPinnedWhileReferenced(t *testing.T
 		{Index: 1, Phase: types.InstancePhaseCreating,
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTargetCleanup}},
 	}
-	if got := instancePlanIndices(orphan, 1, nil, nil); len(got) != 1 || got[0] != 0 {
+	if got := instancePlanIndices(orphan, 1, nil, nil, ""); len(got) != 1 || got[0] != 0 {
 		t.Errorf("an unreferenced cleanup marker must fall out for the scale-down pipeline; got %v", got)
 	}
 }
@@ -673,7 +674,7 @@ func TestInstancePlanIndices_FailedGangSurgePairFollowsItsSource(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if diff := cmp.Diff(tc.want, instancePlanIndices(tc.instances, tc.replicas, nil, nil)); diff != "" {
+			if diff := cmp.Diff(tc.want, instancePlanIndices(tc.instances, tc.replicas, nil, nil, "")); diff != "" {
 				t.Errorf("instancePlanIndices (-want +got):\n%s", diff)
 			}
 		})
@@ -693,7 +694,7 @@ func TestInstancePlanIndices_OrphanGangSurgeMarkerUnpinned(t *testing.T) {
 		{Index: 1, Phase: types.InstancePhaseFailed,
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTarget}},
 	}
-	got := instancePlanIndices(instances, 1, nil, nil)
+	got := instancePlanIndices(instances, 1, nil, nil, "")
 	if len(got) != 1 || got[0] != 0 {
 		t.Errorf("orphan marker must be unpinned (plan {0}, marker 1 becomes a scale-down extra); got %v", got)
 	}
@@ -703,7 +704,7 @@ func TestInstancePlanIndices_OrphanGangSurgeMarkerUnpinned(t *testing.T) {
 	k := int32(1)
 	instances[0] = types.InstanceStatus{Index: 0, Phase: types.InstancePhaseUpdating, RunningRevision: "comp-rev-v1aaaaaa",
 		Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: "Surge", SurgeIndex: &k}}
-	got = instancePlanIndices(instances, 1, nil, nil)
+	got = instancePlanIndices(instances, 1, nil, nil, "")
 	hit := map[int32]bool{}
 	for _, idx := range got {
 		hit[idx] = true
@@ -726,13 +727,13 @@ func TestInstancePlanIndices_GangSurgeReadyTargetRequiresDrainProof(t *testing.T
 	}
 
 	// A Ready occupant does not prove that a fresh claim owns the target.
-	if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(statuses("Surge"), 2, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(statuses("Surge"), 2, nil, nil, "")); diff != "" {
 		t.Fatalf("unconfirmed claim must stay pinned (-want +got):\n%s", diff)
 	}
 
 	// SurgeDrain follows target validation and is safe to release after the
 	// replacement is promoted.
-	if diff := cmp.Diff([]int32{0, 2}, instancePlanIndices(statuses(types.UpdateStepSurgeDrain), 2, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 2}, instancePlanIndices(statuses(types.UpdateStepSurgeDrain), 2, nil, nil, "")); diff != "" {
 		t.Fatalf("validated source should leave the steady plan (-want +got):\n%s", diff)
 	}
 }
@@ -791,7 +792,7 @@ func TestInstancePlanIndices_GangSurgeSourceRequiresPromotedTargetProof(t *testi
 				test.target,
 			}
 			want := []int32{0, 1, 2}
-			if diff := cmp.Diff(want, instancePlanIndices(instances, 2, nil, nil)); diff != "" {
+			if diff := cmp.Diff(want, instancePlanIndices(instances, 2, nil, nil, "")); diff != "" {
 				t.Fatalf("unproven gang-surge target released its source (-want +got):\n%s", diff)
 			}
 		})
@@ -818,7 +819,7 @@ func TestInstancePlanIndices_GangSurgeRetiringSourceDoesNotDisplaceSteadyInstanc
 		{Index: targetIndex, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: newRevision},
 	}
 	want := []int32{1, 2, 3, 4, 5, 6, 7, 8}
-	indices := instancePlanIndices(instances, 8, nil, nil)
+	indices := instancePlanIndices(instances, 8, nil, nil, "")
 	if diff := cmp.Diff(want, indices); diff != "" {
 		t.Fatalf("retiring gang-surge source displaced a steady instance (-want +got):\n%s", diff)
 	}
@@ -854,7 +855,7 @@ func TestInstancePlanIndices_ConcurrentRetiringSourcesDoNotDisplaceSteadyInstanc
 		{Index: targetNine, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: newRevision},
 	}
 	want := []int32{2, 3, 4, 5, 6, 7, 8, 9}
-	if diff := cmp.Diff(want, instancePlanIndices(instances, 8, nil, nil)); diff != "" {
+	if diff := cmp.Diff(want, instancePlanIndices(instances, 8, nil, nil, "")); diff != "" {
 		t.Fatalf("retiring gang-surge sources displaced steady instances (-want +got):\n%s", diff)
 	}
 }
@@ -876,7 +877,7 @@ func TestInstancePlanIndices_SharedUpdateTargetKeepsAllParticipants(t *testing.T
 		{Index: sharedTarget, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: newRevision},
 	}
 	want := []int32{0, 1, 2, 3}
-	if diff := cmp.Diff(want, instancePlanIndices(instances, 3, nil, nil)); diff != "" {
+	if diff := cmp.Diff(want, instancePlanIndices(instances, 3, nil, nil, "")); diff != "" {
 		t.Fatalf("shared update target released a source or sibling (-want +got):\n%s", diff)
 	}
 }
@@ -936,7 +937,7 @@ func TestInstancePlanIndices_ReadyRowOutOfRotationLeavesBeforeAHealthyOne(t *tes
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, nil, nil)); diff != "" {
+			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, nil, nil, "")); diff != "" {
 				t.Fatalf("a Ready row with a pod out of rotation must leave before a healthy one (-want +got):\n%s", diff)
 			}
 		})
@@ -1019,7 +1020,7 @@ func TestInstancePlanIndices_CordonedRowsLeaveFirst(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, test.blocks, test.cordoned)); diff != "" {
+			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, test.blocks, test.cordoned, "")); diff != "" {
 				t.Fatalf("a row on a cordoned node must leave before every other row (-want +got):\n%s", diff)
 			}
 		})
@@ -1044,11 +1045,11 @@ func TestInstancePlanIndices_CordonDoesNotUnpinAMigrationPair(t *testing.T) {
 	}
 
 	sourceCordoned := append([]types.InstanceStatus{ready(1)}, pair...)
-	if diff := cmp.Diff([]int32{0, 3}, instancePlanIndices(sourceCordoned, 1, nil, map[int32]struct{}{0: {}})); diff != "" {
+	if diff := cmp.Diff([]int32{0, 3}, instancePlanIndices(sourceCordoned, 1, nil, map[int32]struct{}{0: {}}, "")); diff != "" {
 		t.Errorf("the pair must stay pinned and the Ready sibling leave (-want +got):\n%s", diff)
 	}
 	siblingCordoned := append([]types.InstanceStatus{ready(1), ready(2)}, pair...)
-	if diff := cmp.Diff([]int32{0, 2, 3}, instancePlanIndices(siblingCordoned, 2, nil, map[int32]struct{}{1: {}})); diff != "" {
+	if diff := cmp.Diff([]int32{0, 2, 3}, instancePlanIndices(siblingCordoned, 2, nil, map[int32]struct{}{1: {}}, "")); diff != "" {
 		t.Errorf("the cordoned sibling must leave before the uncordoned one (-want +got):\n%s", diff)
 	}
 }
@@ -1078,7 +1079,7 @@ func TestInstancePlanIndices_FailedGangSurgePairCordonedByEitherHalf(t *testing.
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if diff := cmp.Diff(test.want, instancePlanIndices(instances, 2, nil, test.cordoned)); diff != "" {
+			if diff := cmp.Diff(test.want, instancePlanIndices(instances, 2, nil, test.cordoned, "")); diff != "" {
 				t.Fatalf("instancePlanIndices (-want +got):\n%s", diff)
 			}
 		})
@@ -1110,7 +1111,7 @@ func TestInstancePlanIndices_NonRetiringSelectionControls(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			want := []int32{0, 2}
-			if diff := cmp.Diff(want, instancePlanIndices(test.instances, 2, nil, nil)); diff != "" {
+			if diff := cmp.Diff(want, instancePlanIndices(test.instances, 2, nil, nil, "")); diff != "" {
 				t.Fatalf("non-retiring selection changed (-want +got):\n%s", diff)
 			}
 		})
@@ -1125,7 +1126,7 @@ func TestInstancePlanIndices_SinglePodSurgeNotPinnedAsPair(t *testing.T) {
 	instances := []types.InstanceStatus{
 		{Index: 0, Phase: types.InstancePhaseUpdating, Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: "Surge"}},
 	}
-	got := instancePlanIndices(instances, 1, nil, nil)
+	got := instancePlanIndices(instances, 1, nil, nil, "")
 	if len(got) != 1 || got[0] != 0 {
 		t.Errorf("single-pod surge must plan exactly {0}; got %v", got)
 	}
@@ -1306,7 +1307,7 @@ func TestInstancePlanIndices_ReplicaDropKeepsMigrationPair(t *testing.T) {
 		{Index: 3, Phase: types.InstancePhaseCreating,
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationMigrate, SurgeIndex: &back}},
 	}
-	if diff := cmp.Diff([]int32{0, 3}, instancePlanIndices(instances, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 3}, instancePlanIndices(instances, 1, nil, nil, "")); diff != "" {
 		t.Fatalf("replica drop must keep the in-flight migration pair and shed the Ready sibling (-want +got):\n%s", diff)
 	}
 }
@@ -1322,7 +1323,7 @@ func TestInstancePlanIndices_ReplicaDropKeepsGangSurgePair(t *testing.T) {
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTarget,
 				TargetRevision: "comp-rev-v2bbbbbb"}},
 	}
-	if diff := cmp.Diff([]int32{0, 3}, instancePlanIndices(instances, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 3}, instancePlanIndices(instances, 1, nil, nil, "")); diff != "" {
 		t.Fatalf("replica drop must keep the in-flight gang surge pair and shed the Ready sibling (-want +got):\n%s", diff)
 	}
 }
@@ -1338,7 +1339,7 @@ func TestInstancePlanIndices_MigrationTargetNotReadyKeepsSourcePinned(t *testing
 		{Index: 1, Phase: types.InstancePhaseCreating,
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationMigrate}},
 	}
-	if diff := cmp.Diff([]int32{0, 1}, instancePlanIndices(instances, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 1}, instancePlanIndices(instances, 1, nil, nil, "")); diff != "" {
 		t.Fatalf("a not-yet-Ready migration target must keep the source pinned (-want +got):\n%s", diff)
 	}
 }
@@ -1385,7 +1386,7 @@ func TestInstancePlanIndices_GangSurgeDrainReleaseDemandsExactTargetProof(t *tes
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			instances := []types.InstanceStatus{test.target, source, sibling}
-			if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(instances, 2, nil, nil)); diff != "" {
+			if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(instances, 2, nil, nil, "")); diff != "" {
 				t.Fatalf("unproven target must keep the drain-step source pinned (-want +got):\n%s", diff)
 			}
 		})
@@ -1404,7 +1405,7 @@ func TestInstancePlanIndices_GangSurgeDrainMissingTargetKeepsSourcePinned(t *tes
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurgeDrain,
 				SurgeIndex: &missing, TargetRevision: "comp-rev-newaaaa"}},
 	}
-	if diff := cmp.Diff([]int32{1}, instancePlanIndices(instances, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{1}, instancePlanIndices(instances, 1, nil, nil, "")); diff != "" {
 		t.Fatalf("missing target must keep the source pinned without inventing its index (-want +got):\n%s", diff)
 	}
 }
@@ -1422,12 +1423,12 @@ func TestInstancePlanIndices_OccupiedReferencedTargetStaysPinned(t *testing.T) {
 		{Index: 1, Phase: types.InstancePhaseReady, RunningRevision: "comp-rev-otherccc"},
 		{Index: 2, Phase: types.InstancePhaseReady, RunningRevision: "comp-rev-newaaaa"},
 	}
-	if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(instances, 2, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(instances, 2, nil, nil, "")); diff != "" {
 		t.Fatalf("occupied referenced target must stay pinned at replicas=2 (-want +got):\n%s", diff)
 	}
 	// Under a replica drop the pinned pair still wins; the unreferenced
 	// sibling is the scale-down extra.
-	if diff := cmp.Diff([]int32{0, 1}, instancePlanIndices(instances, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 1}, instancePlanIndices(instances, 1, nil, nil, "")); diff != "" {
 		t.Fatalf("occupied referenced target must stay pinned at replicas=1 (-want +got):\n%s", diff)
 	}
 }
@@ -1481,24 +1482,26 @@ func TestResolveInstanceReadyTimeout(t *testing.T) {
 	}
 }
 
-// A shrinking budget retires the row a recreate holds open before any
-// Ready row, at every count below the fleet: the attempt's Instance serves
-// nothing while the Ready rows serve, and the Ready rows are kept lowest
-// index first.
-func TestInstancePlanIndices_ShrinkingBudgetRetiresTheOpenRecreateFirst(t *testing.T) {
+// A shrinking count keeps the row a recreate is rebuilding ahead of every
+// Ready row, at every count below the fleet: the Ready rows the count no
+// longer covers are the scale-down's, lowest index kept first among them,
+// and the wave keeps each of them serving until the rebuild serves
+// (ops.DeleteBatch), so the Component gives up no serving Instance for a
+// rebuild it would owe anyway.
+func TestInstancePlanIndices_ShrinkingBudgetKeepsTheOpenRecreate(t *testing.T) {
 	instances := []types.InstanceStatus{
 		{Index: 0, Phase: types.InstancePhaseUpdating, RunningRevision: "v1",
 			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepDrain, TargetRevision: "v2"}},
 		{Index: 1, Phase: types.InstancePhaseReady, RunningRevision: "v1", PodCount: 1, ServingPodCount: 1},
 		{Index: 2, Phase: types.InstancePhaseReady, RunningRevision: "v1", PodCount: 1, ServingPodCount: 1},
 	}
-	if diff := cmp.Diff([]int32{1, 2}, instancePlanIndices(instances, 2, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 1}, instancePlanIndices(instances, 2, nil, nil, "")); diff != "" {
 		t.Fatalf("plan at two replicas (-want +got):\n%s", diff)
 	}
-	if diff := cmp.Diff([]int32{1}, instancePlanIndices(instances, 1, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0}, instancePlanIndices(instances, 1, nil, nil, "")); diff != "" {
 		t.Fatalf("plan at one replica (-want +got):\n%s", diff)
 	}
-	if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(instances, 3, nil, nil)); diff != "" {
+	if diff := cmp.Diff([]int32{0, 1, 2}, instancePlanIndices(instances, 3, nil, nil, "")); diff != "" {
 		t.Fatalf("plan at the full count (-want +got):\n%s", diff)
 	}
 }
@@ -1506,8 +1509,9 @@ func TestInstancePlanIndices_ShrinkingBudgetRetiresTheOpenRecreateFirst(t *testi
 // TestBuildPlan_InstanceKeepsTheWidthOfItsOwnRevision pins the plan's
 // layout rule: an Instance renders the width the revision it runs
 // recorded, so a gang settled on an older revision keeps its layout until
-// the roll takes it, while an index with no row, and a row converging to
-// the target, render the desired width.
+// the roll takes it, while a row converging to the target, and an index
+// with no row when no canary step holds the Component, render the desired
+// width.
 func TestBuildPlan_InstanceKeepsTheWidthOfItsOwnRevision(t *testing.T) {
 	desired := multiPodDesired(3, 2, types.Lifecycle{})
 	observed := types.WorkloadObservedState{
@@ -1533,7 +1537,7 @@ func TestBuildPlan_InstanceKeepsTheWidthOfItsOwnRevision(t *testing.T) {
 		t.Errorf("a recreating gang still renders its running revision's width on its entry: got %d pods want 5", widths[1])
 	}
 	if widths[2] != 3 {
-		t.Errorf("an index with no row renders the desired width: got %d pods want 3", widths[2])
+		t.Errorf("an index with no row renders the desired width when no step holds the Component: got %d pods want 3", widths[2])
 	}
 	if got := (types.InstancePlan{Runners: plan.Runners}).TotalPods(); got != 3 {
 		t.Errorf("the plan's target layout is the desired width: got %d pods want 3", got)
@@ -1569,46 +1573,147 @@ func TestBuildPlan_MigrationSurgeRendersTheSourceWidth(t *testing.T) {
 	}
 }
 
-// A row mid-recreate is not Ready, so it ranks behind every Ready row whose
-// pods are all in rotation, whatever its index: a scale-down that lands
-// mid-roll retires the Instance being rebuilt and keeps the one that serves.
-func TestInstancePlanIndices_RecreateInFlightLeavesBeforeAServingRow(t *testing.T) {
-	rebuilding := func(idx int32) types.InstanceStatus {
-		return types.InstanceStatus{
-			Index: idx, Phase: types.InstancePhaseUpdating, RunningRevision: "comp-rev-v1aaaaaa", TargetRevision: "comp-rev-v2bbbbbb",
-			PodCount: 2, ServingPodCount: 0,
-			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: types.UpdateStepDrain, TargetRevision: "comp-rev-v2bbbbbb", Strategy: types.UpdateStrategyRecreatePod},
+// TestBuildPlan_MigrationSurgeRendersTheRevisionItsOperationNames holds that a
+// migration's surge row whose operation names a revision renders that one: a
+// move admitted while a roll could take the source builds the replacement
+// on the roll's target, at the target's width, whatever the source runs.
+func TestBuildPlan_MigrationSurgeRendersTheRevisionItsOperationNames(t *testing.T) {
+	desired := multiPodDesired(1, 2, types.Lifecycle{})
+	surgeIdx, sourceIdx := int32(1), int32(0)
+	observed := types.WorkloadObservedState{
+		InstanceStatuses: []types.InstanceStatus{
+			{Index: 0, Incarnation: 1, Phase: types.InstancePhaseMigrating, RunningRevision: "svc-engine-old00000",
+				Operation: &types.InstanceOperation{Type: types.InstanceOperationMigrate, Step: "CreateSurge", RequestUUID: "u", SurgeIndex: &surgeIdx, TargetRevision: "svc-engine-new00000"}},
+			{Index: 1, Incarnation: 1, Phase: types.InstancePhaseCreating,
+				Operation: &types.InstanceOperation{Type: types.InstanceOperationMigrate, Step: "CreateSurge", RequestUUID: "u", SurgeIndex: &sourceIdx, TargetRevision: "svc-engine-new00000"}},
+		},
+		WorkerSizeByRevision: map[string]int32{"svc-engine-old00000": 4, "svc-engine-new00000": 2},
+	}
+	plan, err := BuildPlan(types.ComponentEngine, desired, observed)
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	want := map[int32]int32{sourceIdx: 5, surgeIdx: 3}
+	for _, inst := range plan.Instances {
+		if got := inst.TotalPods(); got != want[inst.Index] {
+			t.Errorf("Instance %d renders %d pods, want %d (the source at its own width, the surge at the recorded revision's)", inst.Index, got, want[inst.Index])
 		}
 	}
+}
+
+// A scale-down mid-roll keeps the Instances the roll has moved ahead of
+// the ones it has yet to move: a serving row on the roll's target first,
+// then an Instance whose rebuild is coming up on a sound revision, then a
+// Ready row on the target whose counts trail its pods, then the serving
+// rows on the old revision, whatever the indices. Retiring the Instance
+// being rebuilt would throw the rebuild away and leave a kept Instance
+// that still owes the same rebuild; the wave keeps the serving Instance
+// the scale retires in rotation until the rebuild serves
+// (ops.DeleteBatch). A rebuild toward a revision the retry schedule
+// holds, and a stopped attempt, rank behind the serving rows as before.
+func TestInstancePlanIndices_RebuildComingUpIsKeptAheadOfAServingRow(t *testing.T) {
+	const v1, v2 = "comp-rev-v1aaaaaa", "comp-rev-v2bbbbbb"
+	attempt := func(idx int32, step string) types.InstanceStatus {
+		return types.InstanceStatus{
+			Index: idx, Phase: types.InstancePhaseUpdating, RunningRevision: v1, TargetRevision: v2,
+			PodCount: 2, ServingPodCount: 0,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: step, TargetRevision: v2, Strategy: types.UpdateStrategyRecreatePod},
+		}
+	}
+	rebuilding := func(idx int32) types.InstanceStatus { return attempt(idx, types.UpdateStepDrain) }
 	serving := func(idx int32) types.InstanceStatus {
-		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, RunningRevision: "comp-rev-v1aaaaaa", PodCount: 2, ServingPodCount: 2}
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, RunningRevision: v1, PodCount: 2, ServingPodCount: 2}
+	}
+	held := []types.RetryBlock{{TargetRevision: v2, State: types.RetryBlockHeld, AttemptsStarted: 3}}
+	done := func(idx int32) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, RunningRevision: v2, PodCount: 2, ServingPodCount: 2}
+	}
+	// The counts of a row promoted on the previous pass still read the
+	// pods of the pass before it.
+	justPromoted := func(idx int32) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, RunningRevision: v2, PodCount: 2, ServingPodCount: 0}
 	}
 	tests := []struct {
-		name      string
-		instances []types.InstanceStatus
-		replicas  int32
-		want      []int32
+		name       string
+		instances  []types.InstanceStatus
+		replicas   int32
+		blocks     []types.RetryBlock
+		rollTarget string
+		want       []int32
 	}{
 		{
-			name:      "the lower index is being rebuilt: it leaves and the serving row stays",
-			instances: []types.InstanceStatus{rebuilding(0), serving(1)},
-			replicas:  1,
-			want:      []int32{1},
+			name:       "an Instance done on the roll's target stays ahead of one being rebuilt",
+			instances:  []types.InstanceStatus{done(0), rebuilding(1)},
+			replicas:   1,
+			rollTarget: v2,
+			want:       []int32{0},
 		},
 		{
-			name:      "the higher index is being rebuilt: it leaves and the serving row stays",
-			instances: []types.InstanceStatus{serving(0), rebuilding(1)},
+			name:       "an Instance promoted on the previous pass, its counts a pass behind, stays ahead of a serving row the roll has yet to move",
+			instances:  []types.InstanceStatus{serving(0), justPromoted(1)},
+			replicas:   1,
+			rollTarget: v2,
+			want:       []int32{1},
+		},
+		{
+			name:       "the serving Instances on the roll's target stay ahead of the ones on the old revision, whatever the indices",
+			instances:  []types.InstanceStatus{serving(0), serving(1), done(2), done(3)},
+			replicas:   3,
+			rollTarget: v2,
+			want:       []int32{0, 2, 3},
+		},
+		{
+			name:       "in a settled fleet a Ready row whose counts fall short of its pods leaves before a serving one",
+			instances:  []types.InstanceStatus{justPromoted(0), done(1)},
+			replicas:   1,
+			rollTarget: v2,
+			want:       []int32{1},
+		},
+		{
+			name:      "the lower index is being rebuilt: it stays and the serving row is the scale-down's",
+			instances: []types.InstanceStatus{rebuilding(0), serving(1)},
 			replicas:  1,
 			want:      []int32{0},
 		},
 		{
-			name:      "one of four is being rebuilt and the count drops by one: the rebuild leaves, the three serving rows stay",
-			instances: []types.InstanceStatus{rebuilding(0), serving(1), serving(2), serving(3)},
-			replicas:  3,
-			want:      []int32{1, 2, 3},
+			name:      "the higher index is being rebuilt: it stays, whatever its index",
+			instances: []types.InstanceStatus{serving(0), rebuilding(1)},
+			replicas:  1,
+			want:      []int32{1},
 		},
 		{
-			name:      "the rebuild is kept only when no serving row fills the count",
+			name:      "one of four is being rebuilt and the count drops by one: the rebuild and the two lowest serving rows stay",
+			instances: []types.InstanceStatus{rebuilding(0), serving(1), serving(2), serving(3)},
+			replicas:  3,
+			want:      []int32{0, 1, 2},
+		},
+		{
+			name:      "two rebuilds and the count drops to one: the lower rebuild stays",
+			instances: []types.InstanceStatus{rebuilding(0), rebuilding(1), serving(2)},
+			replicas:  1,
+			want:      []int32{0},
+		},
+		{
+			name:      "an in-place patch coming up is kept like a recreate",
+			instances: []types.InstanceStatus{serving(0), attempt(1, types.UpdateStepInPlace)},
+			replicas:  1,
+			want:      []int32{1},
+		},
+		{
+			name:      "a rebuild toward a held revision leaves before the serving row",
+			instances: []types.InstanceStatus{rebuilding(0), serving(1)},
+			replicas:  1,
+			blocks:    held,
+			want:      []int32{1},
+		},
+		{
+			name:      "a stopped attempt builds nothing and leaves before the serving row",
+			instances: []types.InstanceStatus{attempt(0, types.UpdateStepParked), serving(1)},
+			replicas:  1,
+			want:      []int32{1},
+		},
+		{
+			name:      "at the full count every row stays",
 			instances: []types.InstanceStatus{rebuilding(0), serving(1)},
 			replicas:  2,
 			want:      []int32{0, 1},
@@ -1616,8 +1721,8 @@ func TestInstancePlanIndices_RecreateInFlightLeavesBeforeAServingRow(t *testing.
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, nil, nil)); diff != "" {
-				t.Fatalf("a row mid-recreate must leave before a serving one (-want +got):\n%s", diff)
+			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, test.blocks, nil, test.rollTarget)); diff != "" {
+				t.Fatalf("the Instance being rebuilt must stay ahead of a serving one (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -1675,7 +1780,7 @@ func TestInstancePlanIndices_CreatingRowWithNoOperationLeavesFirst(t *testing.T)
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, test.blocks, test.cordoned)); diff != "" {
+			if diff := cmp.Diff(test.want, instancePlanIndices(test.instances, test.replicas, test.blocks, test.cordoned, "")); diff != "" {
 				t.Fatalf("a Creating row with no operation must leave before any row whose pod runs (-want +got):\n%s", diff)
 			}
 		})
@@ -1687,3 +1792,184 @@ func TestInstancePlanIndices_CreatingRowWithNoOperationLeavesFirst(t *testing.T)
 func failedAttemptAt(idx int32, running, pushed string) types.InstanceStatus {
 	return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseFailed, RunningRevision: running, TargetRevision: pushed, PodCount: 1}
 }
+
+const (
+	narrowRevisionName = "svc-engine-00000old"
+	wideRevisionName   = "svc-engine-00000new"
+)
+
+// twoWidthObserved is a Component rolling from a gang of a leader and one
+// worker (the current revision) to a gang of a leader and three workers:
+// Instances 0 and 1 still run the narrow revision, 2 and 3 the wide one.
+// The width table holds the revisions the rows reference, as the adapter
+// reads it, with rollTarget as the roll target.
+func twoWidthObserved(rollTarget string) types.WorkloadObservedState {
+	return types.WorkloadObservedState{
+		CurrentRevision: narrowRevisionName,
+		UpdateRevision:  wideRevisionName,
+		RollTarget:      rollTarget,
+		InstanceStatuses: []types.InstanceStatus{
+			{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: narrowRevisionName},
+			{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: narrowRevisionName},
+			{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: wideRevisionName},
+			{Index: 3, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: wideRevisionName},
+		},
+		WorkerSizeByRevision: map[string]int32{narrowRevisionName: 1, wideRevisionName: 3},
+	}
+}
+
+// plannedPods maps each planned index to the pods its entry renders.
+func plannedPods(plan types.ComponentPlan) map[int32]int32 {
+	pods := map[int32]int32{}
+	for _, inst := range plan.Instances {
+		pods[inst.Index] = inst.TotalPods()
+	}
+	return pods
+}
+
+// requireNewIndexRendersTheRevisionANewInstanceJoins holds the entry of an
+// index with no row to the revision the Create pass builds a new Instance
+// on, read from the function both share, and to the pod count given.
+func requireNewIndexRendersTheRevisionANewInstanceJoins(t *testing.T, desired types.WorkloadDesiredSpec, observed types.WorkloadObservedState, idx, wantPods int32) {
+	t.Helper()
+	plan, err := BuildPlan(types.ComponentEngine, desired, observed)
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	var added *types.InstancePlan
+	for i := range plan.Instances {
+		if plan.Instances[i].Index == idx {
+			added = &plan.Instances[i]
+		}
+	}
+	if added == nil {
+		t.Fatalf("index %d is not planned: %v", idx, plan.Instances)
+	}
+	joins := query.NewInstanceRevision(desired, &observed, observed.RollTarget)
+	if got := (types.InstancePlan{Runners: plan.RunnersFor(*added, joins)}).TotalPods(); got != added.TotalPods() {
+		t.Errorf("the new index renders %d pods, but the revision a new Instance is built on (%q) renders %d: the PodGroup and the pods would disagree", added.TotalPods(), joins, got)
+	}
+	if got := added.TotalPods(); got != wantPods {
+		t.Errorf("the new index renders %d pods, want %d", got, wantPods)
+	}
+}
+
+// A new index planned while a canary step holds the Component renders the
+// width of the step's stable revision, the revision the Create pass builds
+// the new Instance on, so the PodGroup pass sizes the new gang's group for
+// the pods that will exist. A step between a gang of two and a gang of
+// four, scaled up at the step, plans a gang of two.
+func TestBuildPlan_NewIndexUnderACanaryStepRendersTheStableWidth(t *testing.T) {
+	desired := multiPodDesired(5, 3, types.Lifecycle{})
+	desired.Pacing = &types.WorkloadPacing{Partition: intPtr32(3)}
+	observed := twoWidthObserved(wideRevisionName)
+
+	requireNewIndexRendersTheRevisionANewInstanceJoins(t, desired, observed, 4, 2)
+}
+
+// A new index planned under a plain roll renders the width of whichever
+// revision the Create pass builds a new Instance on; the plan reads that
+// revision from the function the Create pass reads, so the two agree
+// whichever side a plain roll's new Instance joins.
+func TestBuildPlan_NewIndexUnderAPlainRollRendersTheRevisionANewInstanceJoins(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		user *int32
+	}{
+		{name: "no partition"},
+		{name: "the user's own partition, which is no step", user: intPtr32(2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desired := multiPodDesired(5, 3, types.Lifecycle{})
+			if tc.user != nil {
+				desired.Lifecycle.UpdateStrategy = &types.UpdateStrategy{
+					Type:          types.UpdateStrategyRecreatePod,
+					RollingUpdate: &types.RollingUpdate{Partition: tc.user},
+				}
+			}
+			observed := twoWidthObserved(wideRevisionName)
+			joins := query.NewInstanceRevision(desired, &observed, observed.RollTarget)
+			want := (types.InstancePlan{Runners: types.ComponentPlan{
+				Runners:              runnersForInstance(true, 3),
+				WorkerSizeByRevision: observed.WorkerSizeByRevision,
+			}.RunnersFor(types.InstancePlan{}, joins)}).TotalPods()
+
+			requireNewIndexRendersTheRevisionANewInstanceJoins(t, desired, observed, 4, want)
+		})
+	}
+}
+
+// With no roll open a new index renders the target's width, which is the
+// desired one: every Instance runs the current revision, whether or not a
+// step's partition is still projected.
+func TestBuildPlan_NewIndexWithNoRollOpenRendersTheTargetWidth(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		step *int32
+	}{
+		{name: "no partition"},
+		{name: "a step's partition still projected", step: intPtr32(2)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			desired := multiPodDesired(3, 3, types.Lifecycle{})
+			if tc.step != nil {
+				desired.Pacing = &types.WorkloadPacing{Partition: tc.step}
+			}
+			observed := types.WorkloadObservedState{
+				CurrentRevision: wideRevisionName,
+				UpdateRevision:  wideRevisionName,
+				RollTarget:      wideRevisionName,
+				InstanceStatuses: []types.InstanceStatus{
+					{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: wideRevisionName},
+					{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: wideRevisionName},
+				},
+				WorkerSizeByRevision: map[string]int32{narrowRevisionName: 1},
+			}
+
+			requireNewIndexRendersTheRevisionANewInstanceJoins(t, desired, observed, 2, 4)
+		})
+	}
+}
+
+// Under a roll back to the current revision a new index renders that
+// revision's width: the roll target is the revision rolled back to, whose
+// width the adapter renders as the desired one, and a step's partition
+// names no other side.
+func TestBuildPlan_NewIndexUnderARollBackRendersTheRevisionRolledBackTo(t *testing.T) {
+	desired := multiPodDesired(5, 1, types.Lifecycle{})
+	desired.Pacing = &types.WorkloadPacing{Partition: intPtr32(2)}
+	observed := twoWidthObserved(narrowRevisionName)
+	// The adapter reads no width for the roll target itself.
+	observed.WorkerSizeByRevision = map[string]int32{wideRevisionName: 3}
+
+	requireNewIndexRendersTheRevisionANewInstanceJoins(t, desired, observed, 4, 2)
+}
+
+// A gang that already runs a revision keeps its own width under a canary
+// step, on whichever side of the step it stands: the step's partition holds
+// the narrow gangs at two pods and the wide gangs render four, while the
+// plan's target layout is the desired width.
+func TestBuildPlan_SettledGangsUnderACanaryStepKeepTheirOwnWidth(t *testing.T) {
+	desired := multiPodDesired(4, 3, types.Lifecycle{})
+	desired.Pacing = &types.WorkloadPacing{Partition: intPtr32(2)}
+	plan, err := BuildPlan(types.ComponentEngine, desired, twoWidthObserved(wideRevisionName))
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	pods := plannedPods(plan)
+	for _, idx := range []int32{0, 1} {
+		if pods[idx] != 2 {
+			t.Errorf("Instance %d on the stable side keeps its gang of two: got %d pods", idx, pods[idx])
+		}
+	}
+	for _, idx := range []int32{2, 3} {
+		if pods[idx] != 4 {
+			t.Errorf("Instance %d on the canary revision renders its gang of four: got %d pods", idx, pods[idx])
+		}
+	}
+	if got := (types.InstancePlan{Runners: plan.Runners}).TotalPods(); got != 4 {
+		t.Errorf("the plan's target layout is the desired width: got %d pods want 4", got)
+	}
+}
+
+func intPtr32(v int32) *int32 { return &v }

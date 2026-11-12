@@ -3,42 +3,9 @@ package constants
 import (
 	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
-
-func TestIsArtifactCompleteMarkerObjectName(t *testing.T) {
-	tests := []struct {
-		name       string
-		objectName string
-		want       bool
-	}{
-		{
-			name:       "marker at root",
-			objectName: ArtifactCompleteMarkerFileName,
-			want:       true,
-		},
-		{
-			name:       "marker under model prefix",
-			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/" + ArtifactCompleteMarkerFileName,
-			want:       true,
-		},
-		{
-			name:       "regular model file",
-			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/config.json",
-		},
-		{
-			name:       "similar suffix without path separator",
-			objectName: "customer-imported-basemodels/deepseek-ai/DeepSeek-V4-Pro/abc123/not-" + ArtifactCompleteMarkerFileName,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := IsArtifactCompleteMarkerObjectName(tt.objectName); got != tt.want {
-				t.Fatalf("IsArtifactCompleteMarkerObjectName(%q) = %v, want %v", tt.objectName, got, tt.want)
-			}
-		})
-	}
-}
 
 func TestLWSNameTruncates(t *testing.T) {
 	tests := []struct {
@@ -95,5 +62,49 @@ func TestLWSNameTruncates(t *testing.T) {
 				t.Fatalf("LWSName = %q, want %q", got, expected)
 			}
 		})
+	}
+}
+
+// ServiceHostname carries the configured cluster domain and, without one,
+// renders the namespaced short name rather than a suffix of its own.
+func TestServiceHostname(t *testing.T) {
+	cases := []struct{ name, namespace, clusterDomain, want string }{
+		{"svc-engine", "team-a", "cluster.local", "svc-engine.team-a.svc.cluster.local"},
+		{"svc-engine", "team-a", "example.org", "svc-engine.team-a.svc.example.org"},
+		{"svc-engine", "team-a", "", "svc-engine.team-a"},
+	}
+	for _, tc := range cases {
+		if got := ServiceHostname(tc.name, tc.namespace, tc.clusterDomain); got != tc.want {
+			t.Errorf("ServiceHostname(%q, %q, %q) = %q, want %q", tc.name, tc.namespace, tc.clusterDomain, got, tc.want)
+		}
+	}
+}
+
+// A service's model ConfigMap is named after the whole service name, so two
+// services never share one, and the name stays within the length Kubernetes
+// allows a ConfigMap name.
+func TestModelConfigNameCarriesTheWholeServiceName(t *testing.T) {
+	const prefix = "modelconfig-"
+	longest := validation.DNS1123SubdomainMaxLength - len(prefix)
+	for _, service := range []string{
+		"chat",
+		"llama-70b-instruct-chat-blue",
+		strings.Repeat("a", longest-1),
+		strings.Repeat("a", longest),
+	} {
+		if got, want := ModelConfigName(service), prefix+service; got != want {
+			t.Errorf("ModelConfigName of a %d-character name = %q, want %q", len(service), got, want)
+		}
+	}
+	blue, green := ModelConfigName("blue-llama-70b-instruct-chat-v2"), ModelConfigName("green-llama-70b-instruct-chat-v2")
+	if blue == green {
+		t.Fatalf("two services whose names share a long tail got one ConfigMap: %q", blue)
+	}
+	over := ModelConfigName(strings.Repeat("a", longest+1))
+	if errs := validation.IsDNS1123Subdomain(over); len(errs) > 0 {
+		t.Fatalf("ModelConfigName of a name over the limit = %q: %v", over, errs)
+	}
+	if !strings.HasPrefix(over, prefix) || over == ModelConfigName(strings.Repeat("a", longest)) {
+		t.Fatalf("ModelConfigName of a name over the limit = %q, want the prefix and a name of its own", over)
 	}
 }

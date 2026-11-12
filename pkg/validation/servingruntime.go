@@ -36,17 +36,24 @@ func ValidateRuntimeAutoscalerPolicyRefs(spec *v1beta1.ServingRuntimeSpec) error
 
 func ValidateModelFormatPrioritySame(spec *v1beta1.ServingRuntimeSpec) error {
 	nameToPriority := make(map[string]*int32)
-
 	for _, f := range spec.SupportedModelFormats {
-		if f.IsAutoSelectEnabled() {
-			if existingPriority, ok := nameToPriority[f.Name]; ok {
-				if existingPriority != nil && f.Priority != nil && (*existingPriority != *f.Priority) {
-					return fmt.Errorf(priorityIsNotSameError, f.Name)
-				}
-			} else {
-				nameToPriority[f.Name] = f.Priority
-			}
+		if !f.IsAutoSelectEnabled() {
+			continue
+		}
+		existing, seen := nameToPriority[f.Name]
+		if !seen {
+			nameToPriority[f.Name] = f.Priority
+			continue
+		}
+		if prioritiesDiffer(existing, f.Priority) {
+			return fmt.Errorf(priorityIsNotSameError, f.Name)
 		}
 	}
 	return nil
+}
+
+// prioritiesDiffer reports whether two set priorities disagree; an unset
+// priority on either side agrees with anything.
+func prioritiesDiffer(a, b *int32) bool {
+	return a != nil && b != nil && *a != *b
 }

@@ -237,10 +237,9 @@ func newGangDeadMemberFixture(t *testing.T, dead func(*corev1.Pod) *corev1.Pod) 
 	input := workload.ReconcileInput{
 		OwnerObject: &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{UID: "owner-a"}},
 		Key: workload.Key{
-			Namespace:      namespace,
-			OwnerName:      isvcName,
-			Component:      workload.ComponentEngine,
-			SelectorLabels: selector,
+			Namespace: namespace,
+			OwnerName: isvcName,
+			Component: workload.ComponentEngine,
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},

@@ -21,6 +21,25 @@ func complete() Options {
 	}
 }
 
+// The certificate covers the fully qualified Service name only under the
+// cluster domain the chart passes; without one it covers the name the
+// apiserver dials and nothing the binary made up.
+func TestRotatorCoversTheFullyQualifiedNameOnlyWithAClusterDomain(t *testing.T) {
+	withDomain := complete()
+	withDomain.ClusterDomain = "cluster.local"
+	r := newRotator(withDomain, "test", make(chan struct{}))
+	if r.DNSName != "quota-webhook.ome.svc" {
+		t.Fatalf("DNSName = %q, want quota-webhook.ome.svc", r.DNSName)
+	}
+	if len(r.ExtraDNSNames) != 1 || r.ExtraDNSNames[0] != "quota-webhook.ome.svc.cluster.local" {
+		t.Fatalf("ExtraDNSNames = %v, want [quota-webhook.ome.svc.cluster.local]", r.ExtraDNSNames)
+	}
+	r = newRotator(complete(), "test", make(chan struct{}))
+	if r.DNSName != "quota-webhook.ome.svc" || len(r.ExtraDNSNames) != 0 {
+		t.Fatalf("without a cluster domain: DNSName = %q ExtraDNSNames = %v, want quota-webhook.ome.svc and none", r.DNSName, r.ExtraDNSNames)
+	}
+}
+
 // Every name is supplied by the chart, so a missing one is a wiring bug that has
 // to surface at startup: the rotator would otherwise generate a cert nobody can
 // find, or inject a caBundle into nothing, and the webhook would just hang

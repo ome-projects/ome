@@ -3,6 +3,8 @@ package components
 import (
 	"testing"
 
+	"sigs.k8s.io/ome/pkg/render"
+
 	"github.com/go-logr/logr"
 	"github.com/onsi/gomega"
 	v1 "k8s.io/api/core/v1"
@@ -106,12 +108,12 @@ func TestMergeEngineSpec_RunnerResolvesForBothSuiteShapes(t *testing.T) {
 
 		engine := newRunnerTestEngine(t, mergedEngine)
 
-		podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+		podSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(podSpec.Containers).NotTo(gomega.BeEmpty(), "the engine pod spec must have a container from the runtime's runner")
 		g.Expect(podSpec.Containers[0].Image).NotTo(gomega.BeEmpty())
 
-		workerPodSpec, err := engine.reconcileWorkerPodSpec(isvc, objectMeta)
+		workerPodSpec, err := render.EngineWorkerPodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(workerPodSpec).To(gomega.BeNil(), "a single-pod engine must stay single-pod: no WorkerPodSpec")
 	})
@@ -137,12 +139,12 @@ func TestMergeEngineSpec_RunnerResolvesForBothSuiteShapes(t *testing.T) {
 
 		engine := newRunnerTestEngine(t, mergedEngine)
 
-		leaderPodSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+		leaderPodSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(leaderPodSpec.Containers).NotTo(gomega.BeEmpty(), "the leader pod spec must have a container from the runtime's leader runner")
 		g.Expect(leaderPodSpec.Containers[0].Image).NotTo(gomega.BeEmpty())
 
-		workerPodSpec, err := engine.reconcileWorkerPodSpec(isvc, objectMeta)
+		workerPodSpec, err := render.EngineWorkerPodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(workerPodSpec.Containers).NotTo(gomega.BeEmpty(), "the worker pod spec must have a container from the runtime's worker runner")
 		g.Expect(workerPodSpec.Containers[0].Image).NotTo(gomega.BeEmpty())

@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-06",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The read of the owner's PodGroups from the informer cache, the groups served uncopied so the count is the read's own. The read sizes its two maps and its owned entries to the list once and sorts the entries without a reflection swapper, so it costs the same few allocations whatever the gang count: 47 to 19 allocations and 46,904 to 19360 B at 160 gangs of eight, 56 to 19 and 147,128 to 71840 at 500, 69 to 23 and 411,992 to 167408 at 1,725 gangs of two. What remains is the maps and the entries themselves, the list, the inventory and its options. The groups' own copies are the cache's cost, not the read's.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "160x8/inventory-read/allocations": 19,
+    "160x8/inventory-read/bytes": 19360,
+    "1725x2/inventory-read/allocations": 23,
+    "1725x2/inventory-read/bytes": 167408,
+    "500x8/inventory-read/allocations": 19,
+    "500x8/inventory-read/bytes": 71840
+  }
+}

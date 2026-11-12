@@ -1,0 +1,17 @@
+{
+  "recordedOn": {
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The readySince columns: a replica of 4,000 rows at rest in the column form, every row with its own readySince, holds 7,512 B of live heap per 1,000 Instances in the informer cache where the 4,000 entries held 131,954 B; the cache keeps one base time, one index-set string and one int32 per Instance in place of a 48-byte entry with a pointer time per Instance. The plain list and the pod rows stand within their jitter (265,881 to 265,937 B per 1,000 Instances; the pod rows within 0.3 percent).",
+  "tolerancePercent": 5,
+  "budgets": {
+    "instance/live-heap-bytes-per-1000-instances/columns-ready-since": 7512,
+    "instance/live-heap-bytes-per-1000-instances/plain-list": 265937,
+    "pod/live-heap-bytes-per-pod/as-served": 24548,
+    "pod/live-heap-bytes-per-pod/as-the-manager-caches-it": 6732,
+    "pod/live-heap-bytes-per-pod/as-the-manager-caches-it/over-1000-pods": 6740,
+    "pod/live-heap-bytes-per-pod/as-the-manager-caches-it/over-4000-pods": 6737,
+    "pod/live-heap-bytes-per-pod/managed-fields-stripped-only": 16981
+  }
+}

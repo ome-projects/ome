@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The projection of one service pass over an engine replica at rest, every Instance Ready on the spec revision with its own readySince in the column form, at 1,000 and 4,000 Instances: one read of the replica from the cache (a deep copy) and no live read. With the readySince columns the copy carries one base time, one index-set string and one offset list in place of one entry per Instance, so the pass costs 226 allocations at both sizes where it cost 1,224 and 4,224 with the entries.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "readySince/1000/allocations": 226,
+    "readySince/1000/replica-cache-reads": 1,
+    "readySince/1000/replica-live-reads": 0,
+    "readySince/4000/allocations": 226,
+    "readySince/4000/replica-cache-reads": 1,
+    "readySince/4000/replica-live-reads": 0
+  }
+}

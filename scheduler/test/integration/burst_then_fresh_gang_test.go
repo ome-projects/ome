@@ -11,13 +11,13 @@ import (
 	schedutil "sigs.k8s.io/scheduler-plugins/test/util"
 )
 
-// TestBurstThenFreshGangConverges is the wedge convergence regression: fire a
+// TestBurstThenFreshGangConverges is the never-binds regression: fire a
 // burst of gangs at a perfectly-fitting fleet (one gang per domain, minMember 3,
-// whole-node), let it settle, then create ONE brand-new gang against a
+// whole-node), let it finish, then create ONE brand-new gang against a
 // physically-empty spare domain. Both the burst and the fresh gang must
 // converge.
 //
-// The wedge symptom this guards is a fresh gang getting PreFilter "no domain
+// The symptom this guards is a fresh gang getting PreFilter "no domain
 // has room" while whole domains sit empty — the tell of a capacity reservation
 // leaked by a burst gang that took a domain but never fully placed there. If a
 // leak ever poisoned the shared reservation aggregate globally, the post-burst
@@ -36,7 +36,7 @@ func TestBurstThenFreshGangConverges(t *testing.T) {
 	tc := startScheduler(t, globalKubeConfig, gangPackOptions(t)...)
 	defer tc.teardown(t)
 
-	const ns = "gang-wedge"
+	const ns = "gang-never-binds"
 	createNamespace(t, tc, ns)
 
 	domainName := func(d int) string { return fmt.Sprintf("wd-dom-%03d", d) }

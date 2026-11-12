@@ -19,7 +19,6 @@ import (
 )
 
 var _ Component = &Router{}
-var _ ComponentConfig = &Router{}
 
 // Router reconciles resources for the router component
 type Router struct {
@@ -171,8 +170,10 @@ func (r *Router) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 			PodSpec:                   podSpec,
 			MultiPod:                  false,
 			PacingPartition:           r.PacingPartition,
+			RollbackToRevision:        r.RollbackToRevision,
 			CoordinatorFollower:       r.CoordinatorFollower,
 			CoordinatorTarget:         r.CoordinatorTarget,
+			FollowerReleased:          r.FollowerReleased,
 			ResolvedAutoscaler:        res.Resolved,
 			PreserveAutoscaler:        res.Hold,
 			QuotaAcceleratorResources: r.QuotaAcceleratorResources,
@@ -215,31 +216,4 @@ func (r *Router) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 // updateRouterStatus updates the status of the router component
 func (r *Router) updateRouterStatus(isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta) error {
 	return UpdateComponentStatus(&r.BaseComponentFields, isvc, v1beta1.RouterComponent, objectMeta, &r.routerSpec.ComponentExtensionSpec)
-}
-
-// GetComponentType implements ComponentConfig interface
-func (r *Router) GetComponentType() v1beta1.ComponentType {
-	return v1beta1.RouterComponent
-}
-
-// GetComponentSpec implements ComponentConfig interface
-func (r *Router) GetComponentSpec() *v1beta1.ComponentExtensionSpec {
-	if r.routerSpec == nil {
-		return nil
-	}
-	return &r.routerSpec.ComponentExtensionSpec
-}
-
-// GetServiceSuffix implements ComponentConfig interface
-func (r *Router) GetServiceSuffix() string {
-	return "-router"
-}
-
-// ValidateSpec implements ComponentConfig interface
-func (r *Router) ValidateSpec() error {
-	if r.routerSpec == nil {
-		return errors.New("router spec is nil")
-	}
-	// Add more validation logic as needed
-	return nil
 }

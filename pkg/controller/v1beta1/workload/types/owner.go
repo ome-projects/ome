@@ -114,12 +114,15 @@ type ownership struct {
 // migration record's, which fails fast through itself, and a teardown is
 // DeleteBatch's, which paces its own removal past any grace. A settled
 // row (Empty, Ready, Pending) has no step to interrupt, and the stuck-pod
-// grace reaches it only as the leftover-pod escalation.
+// grace reaches it only as the leftover-pod escalation. A Failed row has
+// no deadline for a hold to pause, and the one event named on it is the
+// refusal of a pod of its own set at the revision it runs, which the roll
+// answers by opening a recreate over the set.
 var ownershipTable = map[RowState]ownership{
 	StateEmpty:   {owner: OwnerCreate},
 	StatePending: {owner: OwnerCreate, interrupts: interruptedBy(EventStuckPodGrace)},
 	StateReady:   {owner: OwnerNone, interrupts: interruptedBy(EventStuckPodGrace)},
-	StateFailed:  {owner: OwnerNone},
+	StateFailed:  {owner: OwnerNone, interrupts: interruptedBy(EventUnschedulableSource)},
 
 	StateCreateCreatePods: {owner: OwnerCreate, interrupts: interruptedBy(EventOperationDeadline, EventStuckPodGrace)},
 
@@ -296,6 +299,20 @@ func InFlight(s *InstanceStatus) bool {
 	return !settledState(StateOf(s))
 }
 
+// RebuildComingUp reports whether the row's update attempt is building
+// the pod set that serves for it next: Phase Updating with an Update
+// operation at step Drain (the recreate roll, the old pod set leaving and
+// the next one starting) or InPlace (the patch, the pod restarting under
+// it). Such an Instance serves nothing until the attempt promotes it on
+// its target revision. A surge source keeps serving while its replacement
+// comes up, and a stopped attempt builds nothing, so neither is one.
+func RebuildComingUp(s *InstanceStatus) bool {
+	if s == nil || s.Phase != InstancePhaseUpdating || s.Operation == nil || s.Operation.Type != InstanceOperationUpdate {
+		return false
+	}
+	return s.Operation.Step == UpdateStepDrain || s.Operation.Step == UpdateStepInPlace
+}
+
 // RecreateOfUnservingRow reports a fresh update start that takes nothing
 // further offline: a Failed row with no serving pod, recreated in place
 // on a non-surge strategy. A gang whose leader is gone publishes no
@@ -308,9 +325,14 @@ func InFlight(s *InstanceStatus) bool {
 // (evidence.PodSetServesNothing), because the counter trails the pods by
 // a pass.
 func RecreateOfUnservingRow(s *InstanceStatus, strategy UpdateStrategyType) bool {
-	return s != nil && !UpdateContinuation(s) &&
-		strategy != UpdateStrategySurgeThenDrain &&
-		s.Phase == InstancePhaseFailed && s.ServingPodCount == 0
+	return FailedWithNoServingPod(s) && !UpdateContinuation(s) &&
+		strategy != UpdateStrategySurgeThenDrain
+}
+
+// FailedWithNoServingPod reports a Failed row whose published serving
+// count is zero: by its own last word the Instance serves nothing.
+func FailedWithNoServingPod(s *InstanceStatus) bool {
+	return s != nil && s.Phase == InstancePhaseFailed && s.ServingPodCount == 0
 }
 
 // EndedByOwnershipVerdict reports whether the row keeps an attempt the
@@ -415,6 +437,24 @@ func surgeKeptOffRunningRevision(s *InstanceStatus) bool {
 // target other than it.
 func offRunningRevision(s *InstanceStatus) bool {
 	return s.RunningRevision != "" && s.TargetRevision != "" && s.TargetRevision != s.RunningRevision
+}
+
+// SurgeReplacementInFlight reports a row whose operation keeps a surge
+// replacement pod running beside its source: the Surge step, and the drain
+// half of the cycle (SurgeDrain, SurgeDrainSettle) while the old pod is
+// not yet deleted. Every reader that counts the Component's in-flight
+// surges, the budgets and the migrate pass alike, reads this; the
+// coordination gate's surgeInFlight counts the same steps on the
+// published rows, so both layers read one in-flight signal.
+func SurgeReplacementInFlight(s *InstanceStatus) bool {
+	if s == nil || s.Operation == nil {
+		return false
+	}
+	switch s.Operation.Step {
+	case UpdateStepSurge, UpdateStepSurgeDrain, UpdateStepSurgeDrainSettle:
+		return true
+	}
+	return false
 }
 
 // Interruptible reports whether the named event acts on this row

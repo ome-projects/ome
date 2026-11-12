@@ -39,6 +39,11 @@ type DeleteBatchResult struct {
 	Oversized         bool
 	RequeueAfter      time.Duration
 	PolicyDeadlineDue bool
+	// WaitingOnRebuild counts the serving extras the wave left in rotation
+	// because an Instance the plan keeps is still being rebuilt; each is
+	// admitted once that Instance serves. They hold no wave open: the
+	// passes after the scale-down run, and the rebuild among them.
+	WaitingOnRebuild int
 }
 
 type deleteBatchCandidate struct {
@@ -80,7 +85,11 @@ func DeleteBatch(
 		return DeleteBatchResult{}, err
 	}
 	defer wave.log(ctx)
-	if len(wave.selection.candidates) == 0 {
+	stop, err := wave.reportRetirementWaits(ctx)
+	if err != nil {
+		return DeleteBatchResult{}, err
+	}
+	if stop || len(wave.selection.candidates) == 0 {
 		return wave.result, nil
 	}
 	steps := []func(context.Context) (bool, error){
@@ -121,6 +130,10 @@ type scaleDownWave struct {
 	result    DeleteBatchResult
 	// admitted counts the Instances a fresh wave wrote Deleting this pass.
 	admitted int
+	// wait is the split of the leaving Instances between the ones this wave
+	// takes and the ones that keep serving until the Instance the roll is
+	// rebuilding serves again.
+	wait retirementWait
 
 	// expectationsSatisfied records, per selected row, whether the
 	// expectations cache has seen every delete the row expected.
@@ -144,7 +157,8 @@ func selectScaleDownWave(deps workload.Deps, input workload.ReconcileInput, plan
 	if err != nil {
 		return nil, fmt.Errorf("DeleteBatch: resolve scale-down Pod batch size: %w", err)
 	}
-	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, extrasNotParked(input, extras, podsByInstance), podsByInstance, budget, input.ObservedState.CordonedInstances)
+	wait := splitRetirementWait(input, plan, extrasNotParked(input, extras, podsByInstance), podsByInstance)
+	selection, err := selectDeleteBatch(input.ObservedState.InstanceStatuses, wait.taken, podsByInstance, budget, input.ObservedState.CordonedInstances)
 	if err != nil {
 		return nil, err
 	}
@@ -158,11 +172,13 @@ func selectScaleDownWave(deps workload.Deps, input workload.ReconcileInput, plan
 		selection:             selection,
 		expectationsSatisfied: make(map[int32]bool, len(selection.candidates)),
 		refused:               make(map[int32]struct{}),
+		wait:                  wait,
 	}
 	wave.result = DeleteBatchResult{
-		InProgress: len(selection.candidates) > 0 || selection.deferred > 0,
-		Deferred:   selection.deferred,
-		Oversized:  selection.oversized,
+		InProgress:       len(selection.candidates) > 0 || selection.deferred > 0,
+		Deferred:         selection.deferred,
+		Oversized:        selection.oversized,
+		WaitingOnRebuild: len(wait.waiting),
 	}
 	for _, candidate := range selection.candidates {
 		wave.result.SelectedPodCost += candidate.cost
@@ -192,7 +208,8 @@ func (w *scaleDownWave) log(ctx context.Context) {
 		"activePodCost", w.result.SelectedPodCost,
 		"activeInstances", len(w.selection.candidates),
 		"admittedInstances", w.admitted,
-		"deferredInstances", w.result.Deferred)
+		"deferredInstances", w.result.Deferred,
+		"waitingOnRebuild", w.result.WaitingOnRebuild)
 }
 
 // staleWrite reports whether a status write failed because the rows moved
@@ -216,81 +233,113 @@ func selectDeleteBatch(
 	if budget != nil && *budget <= 0 {
 		return deleteBatchSelection{}, fmt.Errorf("DeleteBatch: scale-down Pod batch size must be positive")
 	}
+	owned, fresh := deleteBatchCandidates(statuses, extras, podsByInstance)
+	selection := deleteBatchSelection{}
+	pool, blockedFresh := owned, len(fresh)
+	if len(owned) == 0 {
+		pool, blockedFresh = fresh, 0
+		selection.fresh = true
+		orderCordonedFirst(pool, cordoned)
+	} else {
+		orderOldestOperationFirst(pool)
+	}
+	selection.candidates, selection.oversized = takeWithinBudget(pool, budget)
+	selection.deferred = len(pool) - len(selection.candidates) + blockedFresh
+	return selection, nil
+}
+
+// deleteBatchCandidates reads every row into a candidate and splits them into
+// the rows the delete machine already owns and the fresh extras above the
+// plan's count; a row that is neither is not a candidate.
+func deleteBatchCandidates(statuses []workload.InstanceStatus, extras []int32, podsByInstance map[int32][]*corev1.Pod) (owned, fresh []deleteBatchCandidate) {
 	extraSet := make(map[int32]struct{}, len(extras))
 	for _, index := range extras {
 		extraSet[index] = struct{}{}
 	}
-
-	owned := make([]deleteBatchCandidate, 0)
-	fresh := make([]deleteBatchCandidate, 0, len(extras))
+	owned = make([]deleteBatchCandidate, 0)
+	fresh = make([]deleteBatchCandidate, 0, len(extras))
 	for _, original := range statuses {
-		row := status.CloneDeleteInstanceStatus(original)
-		candidate := deleteBatchCandidate{
-			status: row,
-			pods:   append([]*corev1.Pod(nil), podsByInstance[row.Index]...),
-		}
-		sort.SliceStable(candidate.pods, func(i, j int) bool {
-			left, right := candidate.pods[i], candidate.pods[j]
-			if left == nil || right == nil {
-				return left == nil && right != nil
-			}
-			if left.Namespace != right.Namespace {
-				return left.Namespace < right.Namespace
-			}
-			return left.Name < right.Name
-		})
-		candidate.cost = int32(len(candidate.pods))
-		if candidate.cost == 0 {
-			candidate.cost = 1
-		}
-		if deleteOwned(row) {
+		candidate := newDeleteBatchCandidate(original, podsByInstance[original.Index])
+		if deleteOwned(candidate.status) {
 			owned = append(owned, candidate)
 			continue
 		}
-		if _, ok := extraSet[row.Index]; ok {
+		if _, ok := extraSet[original.Index]; ok {
 			fresh = append(fresh, candidate)
 		}
 	}
+	return owned, fresh
+}
 
-	pool := owned
-	selection := deleteBatchSelection{}
-	blockedFresh := 0
-	if len(pool) == 0 {
-		pool = fresh
-		selection.fresh = true
-		sort.Slice(pool, func(i, j int) bool {
-			_, iCordoned := cordoned[pool[i].status.Index]
-			_, jCordoned := cordoned[pool[j].status.Index]
-			if iCordoned != jCordoned {
-				return iCordoned
-			}
-			return pool[i].status.Index > pool[j].status.Index
-		})
-	} else {
-		blockedFresh = len(fresh)
-		sort.SliceStable(pool, func(i, j int) bool {
-			iStarted := pool[i].status.Operation.StartedAt.Time
-			jStarted := pool[j].status.Operation.StartedAt.Time
-			if iStarted.Equal(jStarted) {
-				return pool[i].status.Index > pool[j].status.Index
-			}
-			return iStarted.Before(jStarted)
-		})
+// newDeleteBatchCandidate clones the row, copies its pods in namespace and
+// name order, and charges one pod slot for a row that has no pods.
+func newDeleteBatchCandidate(original workload.InstanceStatus, pods []*corev1.Pod) deleteBatchCandidate {
+	candidate := deleteBatchCandidate{
+		status: status.CloneDeleteInstanceStatus(original),
+		pods:   append([]*corev1.Pod(nil), pods...),
 	}
+	sort.SliceStable(candidate.pods, func(i, j int) bool { return podBefore(candidate.pods[i], candidate.pods[j]) })
+	candidate.cost = int32(len(candidate.pods))
+	if candidate.cost == 0 {
+		candidate.cost = 1
+	}
+	return candidate
+}
 
+// podBefore orders pods by namespace, then name; a nil entry sorts first.
+func podBefore(left, right *corev1.Pod) bool {
+	if left == nil || right == nil {
+		return left == nil && right != nil
+	}
+	if left.Namespace != right.Namespace {
+		return left.Namespace < right.Namespace
+	}
+	return left.Name < right.Name
+}
+
+// orderCordonedFirst sorts a fresh pool so the rows with a pod on a cordoned
+// node come first, then the highest index.
+func orderCordonedFirst(pool []deleteBatchCandidate, cordoned map[int32]struct{}) {
+	sort.Slice(pool, func(i, j int) bool {
+		_, iCordoned := cordoned[pool[i].status.Index]
+		_, jCordoned := cordoned[pool[j].status.Index]
+		if iCordoned != jCordoned {
+			return iCordoned
+		}
+		return pool[i].status.Index > pool[j].status.Index
+	})
+}
+
+// orderOldestOperationFirst sorts a Delete-owned pool by the operation's start
+// time, the highest index first among rows that started together.
+func orderOldestOperationFirst(pool []deleteBatchCandidate) {
+	sort.SliceStable(pool, func(i, j int) bool {
+		iStarted := pool[i].status.Operation.StartedAt.Time
+		jStarted := pool[j].status.Operation.StartedAt.Time
+		if iStarted.Equal(jStarted) {
+			return pool[i].status.Index > pool[j].status.Index
+		}
+		return iStarted.Before(jStarted)
+	})
+}
+
+// takeWithinBudget takes candidates from the front of the pool while their
+// pod cost fits the budget. The first candidate is always taken; one whose
+// cost alone exceeds the budget marks the wave oversized. A nil budget takes
+// the whole pool.
+func takeWithinBudget(pool []deleteBatchCandidate, budget *int32) (taken []deleteBatchCandidate, oversized bool) {
 	var selectedCost int32
 	for _, candidate := range pool {
-		if budget != nil && len(selection.candidates) > 0 && selectedCost+candidate.cost > *budget {
+		if budget != nil && len(taken) > 0 && selectedCost+candidate.cost > *budget {
 			break
 		}
-		if budget != nil && len(selection.candidates) == 0 && candidate.cost > *budget {
-			selection.oversized = true
+		if budget != nil && len(taken) == 0 && candidate.cost > *budget {
+			oversized = true
 		}
-		selection.candidates = append(selection.candidates, candidate)
+		taken = append(taken, candidate)
 		selectedCost += candidate.cost
 	}
-	selection.deferred = len(pool) - len(selection.candidates) + blockedFresh
-	return selection, nil
+	return taken, oversized
 }
 
 func admitDeleteBatch(ctx context.Context, input workload.ReconcileInput, plan workload.ComponentPlan, candidates []deleteBatchCandidate) (bool, error) {
@@ -788,6 +837,121 @@ func (w *scaleDownWave) removeRows(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// retirementWait is the split of the Instances leaving a Component
+// between the ones the scale-down wave takes now and the ones that wait:
+// a serving extra keeps serving while an Instance the plan keeps, kept,
+// serves nothing yet because the roll is rebuilding it. kept is -1 when
+// no Instance holds anybody.
+type retirementWait struct {
+	taken   []int32
+	waiting []int32
+	kept    int32
+}
+
+// splitRetirementWait splits the fresh extras into the ones the wave
+// takes now and the ones that wait. A serving extra waits while an
+// Instance the plan keeps serves nothing yet because the roll is
+// rebuilding it: its recreate or in-place patch is coming up on a sound
+// revision (RebuildComingUp). Retiring the extra now takes serving
+// capacity away that the kept Instance cannot give back yet, and the
+// roll would then drain the Component's last serving Instance at once.
+// It is taken once the kept Instance serves, or once its rebuild fails
+// on its revision. An extra that serves nothing, or that the delete verb
+// already owns, waits for nobody. A kept Instance that lost its pods
+// outside the roll holds nobody either: the repair owns it, and the plan
+// ranks a repair in flight below a serving row, so a wait on it would
+// change which Instance leaves on the next pass. The kept Instance waited
+// on is the lowest such index.
+func splitRetirementWait(input workload.ReconcileInput, plan workload.ComponentPlan, extras []int32, podsByInstance map[int32][]*corev1.Pod) retirementWait {
+	wait := retirementWait{taken: extras, kept: -1}
+	if len(extras) == 0 {
+		return wait
+	}
+	extraSet := make(map[int32]struct{}, len(extras))
+	for _, index := range extras {
+		extraSet[index] = struct{}{}
+	}
+	for _, inst := range plan.Instances {
+		if _, extra := extraSet[inst.Index]; extra {
+			continue
+		}
+		row := input.ObservedState.Instance(inst.Index)
+		if row == nil || anyPodServing(podsByInstance[inst.Index]) {
+			continue
+		}
+		if !workload.RebuildComingUp(row) || workload.RowOnFailingRevision(row, input.ObservedState.RetryBlocks) {
+			continue
+		}
+		wait.kept = inst.Index
+		break
+	}
+	if wait.kept < 0 {
+		return wait
+	}
+	wait.taken = make([]int32, 0, len(extras))
+	for _, index := range extras {
+		row := input.ObservedState.Instance(index)
+		if row != nil && !deleteOwned(*row) && anyPodServing(podsByInstance[index]) {
+			wait.waiting = append(wait.waiting, index)
+			continue
+		}
+		wait.taken = append(wait.taken, index)
+	}
+	return wait
+}
+
+// keptRevision is the revision the kept Instance's rebuild serves: its
+// attempt's target, else the revision it ran; empty with no kept Instance.
+func (w retirementWait) keptRevision(observed workload.WorkloadObservedState) string {
+	kept := observed.Instance(w.kept)
+	if kept == nil {
+		return ""
+	}
+	if kept.Operation != nil && kept.Operation.TargetRevision != "" {
+		return kept.Operation.TargetRevision
+	}
+	return kept.RunningRevision
+}
+
+func anyPodServing(pods []*corev1.Pod) bool {
+	for _, pod := range pods {
+		if podreadiness.IsServing(pod) {
+			return true
+		}
+	}
+	return false
+}
+
+// reportRetirementWaits tells the operator, once per Instance until it is
+// rebuilt, that the scale-down keeps a serving Instance in rotation until
+// the Instance the plan keeps is rebuilt. The record on the row lands
+// first and the event follows the write, so a refused write emits nothing
+// and the next pass says it again; a stale write ends the pass with a
+// fresh plan asked for.
+func (w *scaleDownWave) reportRetirementWaits(ctx context.Context) (bool, error) {
+	if len(w.wait.waiting) == 0 {
+		return false, nil
+	}
+	revision := w.wait.keptRevision(w.input.ObservedState)
+	for _, index := range w.wait.waiting {
+		recorded, err := status.Announce(ctx, w.input, index, workload.EventReasonScaleDownWaitsForRebuild)
+		if err != nil {
+			if staleWrite(err) {
+				w.result.ImmediateRequeue = true
+				return true, nil
+			}
+			return false, fmt.Errorf("DeleteBatch: record the scale-down wait (instance=%d): %w", index, err)
+		}
+		if !recorded {
+			continue
+		}
+		workload.RecordNormal(w.deps.Recorder, workload.EventTarget(w.input), workload.EventReasonScaleDownWaitsForRebuild,
+			"OMENative %s: scale-down keeps this Instance serving until %s serves revision %s",
+			workload.InstanceKey(w.plan.Component, index), workload.InstanceKey(w.plan.Component, w.wait.kept), revision)
+	}
+	return false, nil
+}
+
 // extrasNotParked drops the leaving rows whose own write the apiserver
 // refused: a row a permanent rejection ended, while the revision in force
 // denies a fresh attempt and the pod the rejection names still stands in
@@ -854,7 +1018,7 @@ func deleteOwned(status workload.InstanceStatus) bool {
 // whose drain is past its operation deadline. The record lands first
 // and the event fires from the commit callback, so an announcement
 // survives exactly as long as the write that earned it: a failed write
-// emits nothing and the next pass re-announces.
+// emits nothing and the next pass says it again.
 //
 // Every owned row, not only the wave this pass drives. A row deferred
 // behind the pod budget is the one an operator is least likely to

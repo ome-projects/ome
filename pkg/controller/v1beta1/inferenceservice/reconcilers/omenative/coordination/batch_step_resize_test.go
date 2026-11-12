@@ -88,7 +88,7 @@ func TestEvaluateUpdateGate_KeepRatioReplansTheBatchesFromTheResizedCounts(t *te
 		{
 			name:   "prefill-scaled-up-to-24",
 			engine: batchMemberFixture{desired: 24, step: "10%", strategy: recreate, promoted: 4, creating: 12}, decoder: decoder,
-			prefill: resizeAnswer{v1beta1.RolloutHoldGateBudget, "unavailable budget 3 exhausted (current 12, in-flight 0, would become 13)"},
+			prefill: resizeAnswer{v1beta1.RolloutHoldGateBudget, "unavailable budget 3 exhausted (current 12, in-flight 0, would become 13); counted as unavailable: Instances 12 to 23 still being created"},
 			decode:  resizeAnswer{v1beta1.RolloutHoldGateRatio, "decoder batch 3 waits for engine batch 2 to serve (4 of 6 serving)"},
 		},
 		{
@@ -105,7 +105,7 @@ func TestEvaluateUpdateGate_KeepRatioReplansTheBatchesFromTheResizedCounts(t *te
 			name:   "decode-scaled-up-to-16",
 			engine: engine, decoder: batchMemberFixture{desired: 16, step: "10%", strategy: recreate, promoted: 2, creating: 8},
 			prefill: resizeAnswer{v1beta1.RolloutHoldGateRatio, "engine batch 3 waits for decoder batch 2 to serve (2 of 4 serving)"},
-			decode:  resizeAnswer{v1beta1.RolloutHoldGateBudget, "unavailable budget 2 exhausted (current 8, in-flight 0, would become 9)"},
+			decode:  resizeAnswer{v1beta1.RolloutHoldGateBudget, "unavailable budget 2 exhausted (current 8, in-flight 0, would become 9); counted as unavailable: Instances 8 to 15 still being created"},
 		},
 	}
 	for _, tc := range cases {

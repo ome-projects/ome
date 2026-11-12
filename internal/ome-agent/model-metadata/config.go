@@ -5,11 +5,9 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"github.com/pkg/errors"
-	"github.com/spf13/viper"
-
-	"sigs.k8s.io/ome/pkg/logging"
 
 	"sigs.k8s.io/ome/pkg/agentconfig"
+	"sigs.k8s.io/ome/pkg/logging"
 )
 
 // Config defines the configuration for the model metadata extractor
@@ -22,73 +20,18 @@ type Config struct {
 	ClusterScoped      bool   `mapstructure:"cluster_scoped"`
 }
 
-// Option defines a function that applies configuration options
-type Option func(*Config) error
-
-// Apply applies the given options to the configuration
-func (c *Config) Apply(opts ...Option) error {
-	for _, o := range opts {
-		if o != nil {
-			if err := o(c); err != nil {
-				return err
-			}
-		}
+// newConfig reads the extractor's settings from params.Viper and takes its
+// logger from params.
+func newConfig(params metadataParams) (*Config, error) {
+	c, err := agentconfig.Load(params.Viper, Config{})
+	if err != nil {
+		return nil, err
 	}
-	return nil
-}
-
-// defaultConfig returns a new configuration with default values
-func defaultConfig() *Config {
-	return &Config{
-		ClusterScoped: false,
+	if params.Logger == nil {
+		return nil, errors.New("logger cannot be nil")
 	}
-}
-
-// NewConfig builds and returns a new configuration from the given options
-func NewConfig(opts ...Option) (*Config, error) {
-	c := defaultConfig()
-	if err := c.Apply(opts...); err != nil {
-		return nil, fmt.Errorf("failed to apply config options: %w", err)
-	}
+	c.Logger = params.Logger
 	return c, nil
-}
-
-// WithLogger sets the logger for the configuration
-func WithLogger(logger logging.Interface) Option {
-	return func(c *Config) error {
-		if logger == nil {
-			return errors.New("logger cannot be nil")
-		}
-		c.Logger = logger
-		return nil
-	}
-}
-
-// WithViper loads configuration using Viper
-func WithViper(v *viper.Viper) Option {
-	return func(c *Config) error {
-		*c = *defaultConfig()
-
-		// Bind environment variables
-		if err := agentconfig.BindEnvs(v, c); err != nil {
-			return fmt.Errorf("error binding envs: %w", err)
-		}
-
-		// Unmarshal configuration
-		if err := v.Unmarshal(c); err != nil {
-			return fmt.Errorf("error unmarshalling config: %w", err)
-		}
-
-		return nil
-	}
-}
-
-// WithAppParams applies configuration parameters from model-metadata-specific params
-func WithAppParams(params metadataParams) Option {
-	return func(c *Config) error {
-		// Currently no app params needed, but kept for consistency
-		return nil
-	}
 }
 
 // Validate checks if the configuration is valid

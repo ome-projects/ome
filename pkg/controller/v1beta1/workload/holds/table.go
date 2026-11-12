@@ -47,6 +47,12 @@ type reading struct {
 	// its own moment (the scheduler's PodScheduled transition). Zero when
 	// the wait carries none.
 	waitSince metav1.Time
+	// startsWhenSeen marks a scheduler wait whose PodScheduled time may be
+	// the pod's creation behind a queue's gate
+	// (evidence.UnschedulableSinceTheGate). That time says nothing about
+	// the refusal, so the wait has no moment of its own. decidePlacementWait
+	// starts the attempt's placement wait at the first pass that sees it.
+	startsWhenSeen bool
 	// nodeLost names the target pods whose node stopped reporting: the
 	// ones that still hold their name, and the ones the force-delete
 	// sweep frees in this pass. None of them counts as placed. Only the
@@ -54,7 +60,7 @@ type reading struct {
 	nodeLost map[string]struct{}
 }
 
-// table is the eight holds in the order they are consulted within one
+// table is the nine holds in the order they are consulted within one
 // pass. Order decides only who reaches an unheld row first when two
 // facts arrive on it in the same pass — an incumbent token is never taken
 // except by the one ordered pair in takesRowFrom. The order follows where
@@ -87,6 +93,12 @@ var table = []authority{
 	// Source unrouted: only a surge takes its source out of rotation, so
 	// only a row the update pass owns can report one out of it.
 	sourceUnroutedHold,
+	// Retired replacement: a gang surge's retired replacement gang has
+	// members still terminating. Recorded by the retirement's delete site
+	// on the source's kept surge and the replacement's cleanup step, so
+	// only a row the update pass owns can carry it; the pass releases it
+	// under a pause once no member stands.
+	retiredReplacementHold,
 	// Scheduler: the cluster has nowhere to put a pod. A teardown's pods
 	// need no placement and DeleteBatch paces its own removal past any
 	// grace, so a Delete row is refused; a row with no owner has no

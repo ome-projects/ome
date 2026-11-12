@@ -42,3 +42,6 @@ The quota role name and permissions are unchanged.
 
 See [the multicluster option audit](../ome-resources/multicluster-options.md)
 for the complete placement, transport, routing, and projection review.
+
+See [quota preemption](../../docs/quota-preemption.md) for per-leaf borrowing
+reclamation policies, their defaults, and the serving impact of enabling them.

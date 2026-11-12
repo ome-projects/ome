@@ -3,6 +3,8 @@ package inferencereplica
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"sort"
 	"testing"
 
 	"github.com/onsi/gomega"
@@ -16,6 +18,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
+	"sigs.k8s.io/ome/pkg/utils/testing/allocbudget"
 )
 
 // withRetentionConfig wires a fake clientset serving an
@@ -49,7 +54,7 @@ func withRetentionConfig(r *Reconciler, limit int32) {
 //
 // This exercises the real reconcile defer path (sweepRevisions →
 // resolveRevisionRetentionLimit → revision.RetainControllerRevisions +
-// revision.CollectLiveRevisionNames) against the fake client, so it
+// revision.LiveRevisionNames) against the fake client, so it
 // covers the call-site wiring the unit tests in workload/revision/
 // cannot reach. The per-Instance RunningRevision union is covered
 // separately by TestSweepRevisions_HonorsRunningRevisionUnion below
@@ -220,10 +225,10 @@ func TestSweepRevisions_NonFatalOnNilRecorder(t *testing.T) {
 // safety case at the helper boundary: a revision pinned ONLY by a
 // per-Instance RunningRevision (not CurrentRevision / UpdateRevision)
 // must survive retention even when it is the oldest CR and the bound is
-// exceeded. This proves sweepRevisions threads the per-Instance union
-// from ir.Status.InstanceStatuses into CollectLiveRevisionNames — the
-// guard that stops an in-flight migration's source CR from being swept
-// out from under it. Calls sweepRevisions directly so the workload
+// exceeded, and so must a revision only a row's TargetRevision names. This
+// proves sweepRevisions reads both names of every row into the names the
+// sweep protects — the guard that stops an in-flight migration's source CR
+// from being swept out from under it. Calls sweepRevisions directly so the workload
 // dispatcher (which would try to load the pinned CR's payload) stays out
 // of the picture. The limit rides the per-IR spec path here; the config
 // path is covered by TestReconcile_RetainsControllerRevisions.
@@ -234,18 +239,21 @@ func TestSweepRevisions_HonorsRunningRevisionUnion(t *testing.T) {
 
 	// migrationSource is the OLDEST CR, pinned ONLY via a per-Instance
 	// RunningRevision — recency would delete it; the union must save it.
+	// moveTarget is the next oldest, named only by the row's TargetRevision:
+	// no row runs it and neither revision field of the status names it.
 	migrationSource := seedControllerRevision(ir, "migsrc", 1)
+	moveTarget := seedControllerRevision(ir, "target", 2)
 	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
-		{Index: 0, Incarnation: 1, RunningRevision: migrationSource.Name},
+		{Index: 0, Incarnation: 1, RunningRevision: migrationSource.Name, TargetRevision: moveTarget.Name},
 	}
 
 	const extra = 3
 	nonLive := make([]*appsv1.ControllerRevision, 0, testRevisionRetention+extra)
 	for i := 0; i < testRevisionRetention+extra; i++ {
-		nonLive = append(nonLive, seedControllerRevision(ir, fmt.Sprintf("nl%02d", i), int64(i+2)))
+		nonLive = append(nonLive, seedControllerRevision(ir, fmt.Sprintf("nl%02d", i), int64(i+3)))
 	}
 
-	objs := []client.Object{ir, migrationSource}
+	objs := []client.Object{ir, migrationSource, moveTarget}
 	for _, cr := range nonLive {
 		objs = append(objs, cr)
 	}
@@ -256,6 +264,8 @@ func TestSweepRevisions_HonorsRunningRevisionUnion(t *testing.T) {
 	survivors := listRevisionNames(t, c, ir.Namespace)
 	g.Expect(survivors).To(gomega.HaveKey(migrationSource.Name),
 		"a revision pinned only by InstanceStatus.RunningRevision must survive retention")
+	g.Expect(survivors).To(gomega.HaveKey(moveTarget.Name),
+		"a revision named only by InstanceStatus.TargetRevision must survive retention")
 	// Oldest `extra` non-live trimmed; newest testRevisionRetention kept.
 	for i := 0; i < extra; i++ {
 		g.Expect(survivors).NotTo(gomega.HaveKey(nonLive[i].Name),
@@ -264,5 +274,45 @@ func TestSweepRevisions_HonorsRunningRevisionUnion(t *testing.T) {
 	for i := extra; i < len(nonLive); i++ {
 		g.Expect(survivors).To(gomega.HaveKey(nonLive[i].Name),
 			"newest non-live revision %s must be retained", nonLive[i].Name)
+	}
+}
+
+// TestRowRevisions_CarryTheNamesTheSweepProtects: the names the sweep reads
+// off the stored rows are the live names the fully converted rows yield,
+// over rows that run one revision, move toward a second, record an attempt
+// at a third, and run none.
+func TestRowRevisions_CarryTheNamesTheSweepProtects(t *testing.T) {
+	rows := []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, RunningRevision: "rev-a"},
+		{Index: 1, RunningRevision: "rev-a", TargetRevision: "rev-b"},
+		{Index: 2, RunningRevision: "rev-b", TargetRevision: "rev-b", Operation: &v1beta1.InstanceOperation{TargetRevision: "rev-c"}},
+		{Index: 3},
+	}
+	want := revision.LiveRevisionNames("rev-cur", "rev-upd", revision.RowRevisions(v1beta1convert.InstanceStatusSliceToWorkload(rows)))
+	got := revision.LiveRevisionNames("rev-cur", "rev-upd", rowRevisions(rows))
+	sort.Strings(want)
+	sort.Strings(got)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("the sweep protects %v; the converted rows name %v", got, want)
+	}
+}
+
+// TestRowRevisions_CostTheSameBytesWhateverTheRowCount: reading the names
+// the sweep protects off 4,000 rows allocates the bytes it allocates off
+// 1,000, over rows that carry a readySince and a node each: no row is
+// copied to read its two names. A copy of the rows, however small its
+// record, costs bytes per row and four times as many at 4,000.
+func TestRowRevisions_CostTheSameBytesWhateverTheRowCount(t *testing.T) {
+	now := metav1.Now()
+	cost := map[int]int64{}
+	for _, n := range []int{1000, 4000} {
+		rows := make([]v1beta1.OMENativeInstanceStatus, n)
+		for i := range rows {
+			rows[i] = v1beta1.OMENativeInstanceStatus{Index: int32(i), RunningRevision: "rev-a", TargetRevision: "rev-a", ReadySince: &now, NodesOccupied: []string{"node-1"}}
+		}
+		cost[n] = allocbudget.Bytes(func() { _ = revision.LiveRevisionNames("rev-cur", "rev-upd", rowRevisions(rows)) })
+	}
+	if cost[1000] != cost[4000] {
+		t.Errorf("reading the revision names of 1,000 rows allocates %d bytes and of 4,000 rows %d bytes; want the same, since no row is copied", cost[1000], cost[4000])
 	}
 }

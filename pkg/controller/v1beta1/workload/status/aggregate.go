@@ -8,6 +8,7 @@ package status
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -24,18 +25,24 @@ import (
 // in any EndpointSlice for serviceName. drain.EndpointAvailable
 // excludes terminating-but-Ready endpoints — they're not getting new
 // traffic. Single slice list avoids the N+1 reads
-// drain.IsPodInRotation per pod would do.
+// drain.IsPodInRotation per pod would do. The slices are the cache's own
+// objects: the reading keeps the names alone and writes nothing through
+// them.
 //
 // Adapter-agnostic: takes the namespace and headless-service name
 // directly, no v1beta1 ISVC handle needed.
 func AvailablePodSet(ctx context.Context, reads client.Reader, namespace, serviceName string) (map[string]struct{}, error) {
-	out := map[string]struct{}{}
 	slices, err := drain.EndpointSlicesForService(ctx, reads, namespace, serviceName)
 	if err != nil {
 		return nil, err
 	}
-	for _, slice := range slices {
-		for _, ep := range slice.Endpoints {
+	endpoints := 0
+	for i := range slices {
+		endpoints += len(slices[i].Endpoints)
+	}
+	out := make(map[string]struct{}, endpoints)
+	for i := range slices {
+		for _, ep := range slices[i].Endpoints {
 			if ep.TargetRef == nil || ep.TargetRef.Kind != "" && ep.TargetRef.Kind != "Pod" {
 				continue
 			}
@@ -142,25 +149,33 @@ func CountAvailablePods(pods []*corev1.Pod, availableByName map[string]struct{},
 // so NodesOccupied round-trips through nil ↔ nil rather than nil ↔
 // empty-slice.
 func UniqueNodes(pods []*corev1.Pod) []string {
-	if len(pods) == 0 {
-		return nil
+	nodes, _ := AppendUniqueNodes(nil, pods)
+	return nodes
+}
+
+// AppendUniqueNodes appends the set UniqueNodes returns for pods to names
+// and returns it beside the grown names. The set is cut from names and
+// capped at its own length, so one array can hold the sets of every
+// Instance of a publication and an append to one never writes into the
+// next; nil names gives the set an array of its own.
+func AppendUniqueNodes(names []string, pods []*corev1.Pod) (nodes, grown []string) {
+	if names == nil {
+		names = make([]string, 0, CountScheduledPods(pods))
 	}
-	seen := map[string]struct{}{}
+	start := len(names)
 	for _, p := range pods {
-		if p.Spec.NodeName == "" {
-			continue
+		if p.Spec.NodeName != "" {
+			names = append(names, p.Spec.NodeName)
 		}
-		seen[p.Spec.NodeName] = struct{}{}
 	}
-	if len(seen) == 0 {
-		return nil
+	if len(names) == start {
+		return nil, names
 	}
-	out := make([]string, 0, len(seen))
-	for n := range seen {
-		out = append(out, n)
-	}
-	sort.Strings(out)
-	return out
+	set := names[start:]
+	sort.Strings(set)
+	set = slices.Compact(set)
+	names = names[:start+len(set)]
+	return names[start:len(names):len(names)], names
 }
 
 // DesiredPodCountByInstance maps each planned Instance index to its
@@ -210,36 +225,6 @@ func InstanceMeetsThreshold(observedPodCount, observedSatisfying, desired int32)
 	return observedSatisfying >= desired
 }
 
-// CountServingInstances counts Instances whose desired-many pods are
-// Ready and serving (podreadiness.ReadyAndServing). This is the count the
-// coordination unavailability gate (GateContext.CheckUnavailability)
-// works from — "instances actually in the load balancer rotation
-// right now."
-func CountServingInstances(insts []types.InstanceStatus, desiredByIdx map[int32]int32) int32 {
-	var n int32
-	for _, s := range insts {
-		desired := DesiredFor(desiredByIdx, s.Index, s.PodCount)
-		if InstanceMeetsThreshold(s.PodCount, s.ServingPodCount, desired) {
-			n++
-		}
-	}
-	return n
-}
-
-// CountAvailableInstances counts Instances whose desired-many pods
-// are in EndpointSlice rotation. Strict sub-condition of Ready —
-// kube-proxy only publishes Ready pods.
-func CountAvailableInstances(insts []types.InstanceStatus, desiredByIdx map[int32]int32) int32 {
-	var n int32
-	for _, s := range insts {
-		desired := DesiredFor(desiredByIdx, s.Index, s.PodCount)
-		if InstanceMeetsThreshold(s.PodCount, s.AvailablePodCount, desired) {
-			n++
-		}
-	}
-	return n
-}
-
 // DemotableReady reports whether a settled Ready row — Ready with no
 // operation — is demoted to Pending once it has no pods. The demotion
 // keeps the running revision, so no recovery path keys on the phase: the
@@ -261,7 +246,7 @@ func DemotableReady(row *types.InstanceStatus) bool {
 // Pending as a row with no pods is, and the pass that owns the rebuild
 // deletes the terminal pods and rebuilds the Instance.
 func PodSetBacksRow(pods []*corev1.Pod) bool {
-	return len(query.ExcludeTerminalPods(pods)) > 0
+	return query.LivePodCount(pods) > 0
 }
 
 // ReachedDesiredShape reports whether insts rest at the shape a roll
@@ -331,18 +316,21 @@ func RolloutComplete(insts []types.InstanceStatus, targetRevName string) bool {
 // revision is in flight until the last superseded Instance returns and
 // the last withdrawn replacement is gone, and current equal to update is
 // what every reader takes for "no rollout in flight". A withdrawn current
-// is restored to the update revision once no Instance is off it any more,
-// whatever the ladder holds: the pods are back where they were promoted,
-// and a block on that revision gates the next attempt, not the rollup. An
-// attempt still in flight whose row records another revision keeps its
-// Instance off the update revision whatever its rebuilt pods carry, since
-// nothing has promoted the Instance onto it yet; a spent attempt leaves
-// the pods to decide. withdrawn names the revision the current
-// revision was withdrawn from while the status still records it, "" when
-// nothing was withdrawn or the update revision has moved on since, so the
-// restore reaches only that revision and a pushed revision whose attempts
-// failed stays unlanded. Any other row shape leaves current as recorded,
-// so a repair on the current revision never moves it.
+// is restored to the update revision once no attempt a pass still drives
+// is open on any Instance (anyAttemptInFlight) and no Instance is off it
+// any more, whatever the ladder holds: the pods are back where they were
+// promoted, and a block on that revision gates the next attempt, not the
+// rollup. An attempt still in flight whose row records another revision
+// keeps its Instance off the update revision whatever its rebuilt pods
+// carry, since nothing has promoted the Instance onto it yet, and an
+// attempt that rebuilds a lost set toward the revision keeps the restore
+// waiting while its new pods come up, however they are labelled; a spent
+// attempt leaves the pods to decide. withdrawn names the revision the
+// current revision was withdrawn from while the status still records it,
+// "" when nothing was withdrawn or the update revision has moved on since,
+// so the restore reaches only that revision and a pushed revision whose
+// attempts failed stays unlanded. Any other row shape leaves current as
+// recorded, so a repair on the current revision never moves it.
 func CurrentRevisionFor(insts []types.InstanceStatus, current, update string, blocks []types.RetryBlock, withdrawn string, pods PodRevisions) string {
 	if update == "" {
 		return current
@@ -353,7 +341,7 @@ func CurrentRevisionFor(insts []types.InstanceStatus, current, update string, bl
 	if current == update && anyInstanceOffRevision(insts, update, pods) {
 		return ""
 	}
-	if current == "" && withdrawn != "" && withdrawn == update && !anyInstanceOffRevision(insts, update, pods) {
+	if current == "" && withdrawn != "" && withdrawn == update && !anyAttemptInFlight(insts) && !anyInstanceOffRevision(insts, update, pods) {
 		return update
 	}
 	return current
@@ -379,14 +367,29 @@ func WithdrawnRevisionAfter(before, oldCurrent, current, update string) string {
 type PodRevisions map[int32][]query.RevisionID
 
 // PodRevisionsByInstance reads PodRevisions off pods bucketed by Instance
-// index, leaving out pods in a terminal phase.
+// index, leaving out pods in a terminal phase and pods with no revision
+// label; an Instance with no such pod has no entry. Every Instance's
+// revisions are cut from one array, each entry capped at its own length,
+// so an append to one never writes into the next.
 func PodRevisionsByInstance(byInstance map[int32][]*corev1.Pod) PodRevisions {
 	revs := make(PodRevisions, len(byInstance))
+	total := 0
+	for _, pods := range byInstance {
+		total += len(pods)
+	}
+	revisions := make([]query.RevisionID, 0, total)
 	for idx, pods := range byInstance {
-		for _, pod := range query.ExcludeTerminalPods(pods) {
-			if rev := query.RevisionFromPod(pod); !rev.IsZero() {
-				revs[idx] = append(revs[idx], rev)
+		start := len(revisions)
+		for _, pod := range pods {
+			if pod == nil || query.IsTerminalPod(pod) {
+				continue
 			}
+			if rev := query.RevisionFromPod(pod); !rev.IsZero() {
+				revisions = append(revisions, rev)
+			}
+		}
+		if end := len(revisions); end > start {
+			revs[idx] = revisions[start:end:end]
 		}
 	}
 	return revs
@@ -466,11 +469,28 @@ func attemptInFlightOffRevision(row *types.InstanceStatus, rev query.RevisionID)
 	return !query.RevisionFromName(row.RunningRevision).Same(rev)
 }
 
+// anyAttemptInFlight reports whether a verb pass still drives some row: a
+// Create, Update, Restart, Migrate or Delete attempt that has not ended, a
+// lost set being rebuilt included. A spent attempt, on a Failed row or with
+// its set still serving, is no pass's and decides nothing here.
+func anyAttemptInFlight(insts []types.InstanceStatus) bool {
+	for i := range insts {
+		if types.Owner(&insts[i]) != types.OwnerNone {
+			return true
+		}
+	}
+	return false
+}
+
 // CountersForInstance computes the per-Instance counter set from the
 // live pod bucket. availableByPod is the map returned by
-// AvailablePodSet; window is the Component's minReadySeconds rule.
-func CountersForInstance(pods []*corev1.Pod, availableByPod map[string]struct{}, window AvailabilityWindow) InstanceCounters {
+// AvailablePodSet; window is the Component's minReadySeconds rule. The
+// Instance's node list is appended to names (AppendUniqueNodes), so a
+// reader of many Instances carries one array for all their lists; nil
+// names gives the Instance a list of its own.
+func CountersForInstance(pods []*corev1.Pod, availableByPod map[string]struct{}, window AvailabilityWindow, names []string) (InstanceCounters, []string) {
 	available, nextAvailableIn := CountAvailablePods(pods, availableByPod, window)
+	nodes, names := AppendUniqueNodes(names, pods)
 	return InstanceCounters{
 		PodCount:          int32(len(pods)),
 		ReadyPodCount:     CountReadyPods(pods),
@@ -479,8 +499,8 @@ func CountersForInstance(pods []*corev1.Pod, availableByPod map[string]struct{},
 		AvailablePodCount: available,
 		NextAvailableIn:   nextAvailableIn,
 		Admitted:          instancePodsAdmitted(pods),
-		NodesOccupied:     UniqueNodes(pods),
-	}
+		NodesOccupied:     nodes,
+	}, names
 }
 
 func instancePodsAdmitted(pods []*corev1.Pod) bool {

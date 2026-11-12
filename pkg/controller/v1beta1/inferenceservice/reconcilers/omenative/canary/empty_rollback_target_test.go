@@ -16,18 +16,17 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/analysis"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // A rollback returns every Instance of the unit to its stable revision. A
-// stable revision with no live Instance while the ladder holds a floor for
-// it is not one the unit stood on in this ladder, so a rollback the
-// controller decides on its own parks instead of rebuilding the fleet onto
+// stable revision with no live Instance while the canary keeps a stable instance for
+// it is not one the unit stood on in this canary, so a rollback the
+// controller decides on its own stops instead of rebuilding the fleet onto
 // it; a rollback the operator requests proceeds, with the same warning.
 
 // breachingStep is an analysis-gated step whose first failing sample rolls
-// the ladder back.
+// the canary back.
 func breachingStep() v1beta1.RolloutGroupStep {
 	return v1beta1.RolloutGroupStep{
 		Capacity: intstr.FromString("50%"), Traffic: 50,
@@ -39,10 +38,10 @@ func breachingStep() v1beta1.RolloutGroupStep {
 	}
 }
 
-// servingLadder seeds a single-engine ladder serving its first step toward
+// servingCanary seeds a single-engine canary serving its first step toward
 // "new" from stable "old", with the unit's pods per revision as given, and
 // returns the inputs of a pass whose analysis sample fails.
-func servingLadder(t *testing.T, pods map[string]int32, desired int32) (*v1beta1.InferenceService, ReconcileInputs, *record.FakeRecorder) {
+func servingCanary(t *testing.T, pods map[string]int32, desired int32) (*v1beta1.InferenceService, ReconcileInputs, *record.FakeRecorder) {
 	t.Helper()
 	isvc := canaryISVC([]v1beta1.RolloutGroupStep{breachingStep(), {Capacity: intstr.FromString("100%"), Traffic: 100}}, nil)
 	t0 := time.Unix(100000, 0)
@@ -72,11 +71,11 @@ func emptyTargetEvents(rec *record.FakeRecorder) []string {
 	return out
 }
 
-// The gate fails on a unit whose stable revision runs no Instance: the ladder
-// parks where it stands, no revert is signaled, and the warning names the
+// The gate fails on a unit whose stable revision runs no Instance: the canary
+// stops where it stands, no revert is signaled, and the warning names the
 // revision and the Component.
-func TestReconcile_AutomaticRollbackToAnEmptyStableParks(t *testing.T) {
-	isvc, in, rec := servingLadder(t, map[string]int32{"new": 4}, 4)
+func TestReconcile_AutomaticRollbackToAnEmptyStableStops(t *testing.T) {
+	isvc, in, rec := servingCanary(t, map[string]int32{"new": 4}, 4)
 
 	res, err := Reconcile(context.Background(), in)
 	if err != nil {
@@ -84,7 +83,7 @@ func TestReconcile_AutomaticRollbackToAnEmptyStableParks(t *testing.T) {
 	}
 	cs := isvc.Status.Canary
 	if cs.Failed == nil || cs.Failed.Reason != v1beta1.CanaryFailureStableRevisionMissing {
-		t.Fatalf("the ladder must park Failed with the stable revision unavailable, got %+v", cs)
+		t.Fatalf("the canary must stop at Failed with the stable revision unavailable, got %+v", cs)
 	}
 	if phaseOf(isvc) != v1beta1.RolloutPhaseFailed {
 		t.Fatalf("phase %q, want Failed", phaseOf(isvc))
@@ -93,23 +92,23 @@ func TestReconcile_AutomaticRollbackToAnEmptyStableParks(t *testing.T) {
 		t.Fatalf("no revert may be signaled toward an empty stable revision, got hash %q rolledBack=%v", cs.RolledBackRevisionHash, res.RolledBack)
 	}
 	if res.RequeueAfter != failedRequeue {
-		t.Fatalf("a park keeps the parked cadence %v, got %v", failedRequeue, res.RequeueAfter)
+		t.Fatalf("a stop keeps a stopped canary's cadence %v, got %v", failedRequeue, res.RequeueAfter)
 	}
 	events := emptyTargetEvents(rec)
 	if len(events) != 1 || !strings.HasPrefix(events[0], "Warning") || !strings.Contains(events[0], "old") || !strings.Contains(events[0], string(v1beta1.EngineComponent)) {
 		t.Fatalf("want one Warning naming the stable revision and the Component, got %v", events)
 	}
 	if cs.CurrentStep != 0 {
-		t.Fatalf("the park keeps the step, got %d", cs.CurrentStep)
+		t.Fatalf("the stop keeps the step, got %d", cs.CurrentStep)
 	}
 	// The split is left on serving capacity: the empty stable revision
 	// carries no weight, the canary revision alone is named.
 	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"new": {percent: 100, latest: true}})
 }
 
-// The park is a terminal hold: later passes neither re-sample nor revert.
-func TestReconcile_EmptyStableParkHoldsAcrossPasses(t *testing.T) {
-	isvc, in, rec := servingLadder(t, map[string]int32{"new": 4}, 4)
+// The stop is a terminal hold: later passes neither re-sample nor revert.
+func TestReconcile_EmptyStableStopHoldsAcrossPasses(t *testing.T) {
+	isvc, in, rec := servingCanary(t, map[string]int32{"new": 4}, 4)
 	if _, err := Reconcile(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
@@ -122,17 +121,17 @@ func TestReconcile_EmptyStableParkHoldsAcrossPasses(t *testing.T) {
 		t.Fatal(err)
 	}
 	if sampler.calls != 0 || res.RolledBack || isvc.Status.Canary.Failed == nil {
-		t.Fatalf("a parked ladder must hold: calls=%d rolledBack=%v failed=%+v", sampler.calls, res.RolledBack, isvc.Status.Canary.Failed)
+		t.Fatalf("a stopped canary must hold: calls=%d rolledBack=%v failed=%+v", sampler.calls, res.RolledBack, isvc.Status.Canary.Failed)
 	}
 	if got := emptyTargetEvents(rec); len(got) != 0 {
-		t.Fatalf("the warning is recorded once, at the park, got %v", got)
+		t.Fatalf("the warning is recorded once, at the stop, got %v", got)
 	}
 }
 
 // A stable revision with a live Instance is a target the unit can return
 // to: the automatic rollback proceeds as before.
 func TestReconcile_AutomaticRollbackToAServedStableProceeds(t *testing.T) {
-	isvc, in, rec := servingLadder(t, map[string]int32{"new": 2, "old": 2}, 4)
+	isvc, in, rec := servingCanary(t, map[string]int32{"new": 2, "old": 2}, 4)
 
 	res, err := Reconcile(context.Background(), in)
 	if err != nil {
@@ -150,11 +149,11 @@ func TestReconcile_AutomaticRollbackToAServedStableProceeds(t *testing.T) {
 	}
 }
 
-// A single-Instance member stages in place: its ladder holds no floor, so
-// a stable revision with no Instance is the ladder's own doing and the
+// A single-Instance member stages in place: its canary keeps no stable instance, so
+// a stable revision with no Instance is the canary's own doing and the
 // rollback proceeds.
 func TestReconcile_AutomaticRollbackOfASingleInstanceUnitProceeds(t *testing.T) {
-	isvc, in, rec := servingLadder(t, map[string]int32{"new": 1}, 1)
+	isvc, in, rec := servingCanary(t, map[string]int32{"new": 1}, 1)
 
 	res, err := Reconcile(context.Background(), in)
 	if err != nil {
@@ -164,14 +163,14 @@ func TestReconcile_AutomaticRollbackOfASingleInstanceUnitProceeds(t *testing.T) 
 		t.Fatalf("a single-Instance unit rolls back, got %+v rolledBack=%v", isvc.Status.Canary, res.RolledBack)
 	}
 	if got := emptyTargetEvents(rec); len(got) != 0 {
-		t.Fatalf("no warning for a unit that holds no floor, got %v", got)
+		t.Fatalf("no warning for a unit that keeps no stable instance, got %v", got)
 	}
 }
 
 // The unit reverts as a whole: a secondary member whose stable revision runs
-// no Instance parks the unit too, and the warning names that member.
-func TestReconcile_AutomaticRollbackParksOnASecondarysEmptyStable(t *testing.T) {
-	isvc, in, rec := servingLadder(t, map[string]int32{"new": 2, "old": 2}, 4)
+// no Instance stops the unit too, and the warning names that member.
+func TestReconcile_AutomaticRollbackStopsOnASecondarysEmptyStable(t *testing.T) {
+	isvc, in, rec := servingCanary(t, map[string]int32{"new": 2, "old": 2}, 4)
 	in.Secondaries = map[v1beta1.ComponentType]MemberRevisions{
 		v1beta1.DecoderComponent: {CanaryRevisionHash: "dnew", StableRevisionHash: "dold", ReadyCanaryCapacity: 4, DesiredReplicas: 4},
 	}
@@ -186,22 +185,22 @@ func TestReconcile_AutomaticRollbackParksOnASecondarysEmptyStable(t *testing.T) 
 		t.Fatal(err)
 	}
 	if isvc.Status.Canary.Failed == nil || res.RolledBack || isvc.Status.Canary.RolledBackRevisionHash != "" {
-		t.Fatalf("the unit must park on the decoder's empty stable revision, got %+v rolledBack=%v", isvc.Status.Canary, res.RolledBack)
+		t.Fatalf("the unit must stop on the decoder's empty stable revision, got %+v rolledBack=%v", isvc.Status.Canary, res.RolledBack)
 	}
 	events := emptyTargetEvents(rec)
 	if len(events) != 1 || !strings.Contains(events[0], "dold") || !strings.Contains(events[0], string(v1beta1.DecoderComponent)) {
 		t.Fatalf("want one Warning naming the decoder and its stable revision, got %v", events)
 	}
-	// A member whose stable serves keeps the step's split; the member whose
-	// stable is empty names its target alone.
-	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"new": {percent: 50, latest: true}, "old": {percent: 50}})
+	// The unit has one stable side: with the decoder's stable revision
+	// serving nothing, both members name their target alone.
+	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"new": {percent: 100, latest: true}})
 	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{"dnew": {percent: 100, latest: true}})
 }
 
 // The operator's rollback is the operator's decision: it proceeds toward
 // the empty stable revision, and the same warning says what it returns to.
 func TestReconcile_OperatorRollbackToAnEmptyStableProceedsWithTheWarning(t *testing.T) {
-	isvc, in, rec := servingLadder(t, map[string]int32{"new": 4}, 4)
+	isvc, in, rec := servingCanary(t, map[string]int32{"new": 4}, 4)
 	isvc.Annotations = map[string]string{constants.RolloutRollbackAnnotation: "true"}
 	in.Sampler = nil
 
@@ -224,9 +223,9 @@ func TestReconcile_OperatorRollbackToAnEmptyStableProceedsWithTheWarning(t *test
 // a manual, timed or metric gate, the final step waiting for its capacity,
 // and the pre-step hold. The request runs ahead of the step's gate, so the
 // gate kind plays no part. Traffic moves only onto stable capacity that
-// serves: with none, the split the state held stands until the revert
-// brings a stable pod back, so a share keeps naming the stable revision
-// although no pod serves it.
+// serves: with none, the traffic rests on the rejected pods, the only ones
+// that serve, until the revert brings a stable pod back, and a Warning
+// names the stable revision no pod serves.
 func TestReconcile_OperatorRollbackToAnEmptyStableFromEveryLiveState(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -253,25 +252,28 @@ func TestReconcile_OperatorRollbackToAnEmptyStableFromEveryLiveState(t *testing.
 			if cs.RolledBackRevisionHash != in.CanaryRevisionHash || !res.RolledBack || cs.Failed != nil {
 				t.Fatalf("the operator's rollback must proceed, got %+v rolledBack=%v", cs, res.RolledBack)
 			}
-			events := emptyTargetEvents(rec)
+			all := eventsFrom(rec)
+			var events []string
+			for _, e := range all {
+				if strings.Contains(e, EventReasonCanaryStableRevisionEmpty) {
+					events = append(events, e)
+				}
+			}
 			if len(events) != 1 || !strings.HasPrefix(events[0], "Warning") || !strings.Contains(events[0], in.StableRevisionHash) || !strings.Contains(events[0], string(v1beta1.EngineComponent)) {
 				t.Fatalf("want one Warning naming the stable revision and the Component, got %v", events)
 			}
-			stableShare := int32(0)
-			for _, target := range isvc.Status.Components[v1beta1.EngineComponent].Traffic {
-				if query.RevisionFromName(target.RevisionName).Hash() == in.StableRevisionHash {
-					stableShare += target.Percent
-				}
+			if in.PerRevisionPods[in.StableRevisionHash] != 0 {
+				t.Fatalf("the picture is wrong: no stable pod may serve, got %v", in.PerRevisionPods)
 			}
-			if stableShare <= 0 || in.PerRevisionPods[in.StableRevisionHash] != 0 {
-				t.Fatalf("the split held before the request stands until a stable pod serves again, got %+v with pods %v",
-					isvc.Status.Components[v1beta1.EngineComponent].Traffic, in.PerRevisionPods)
+			expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{in.CanaryRevisionHash: {percent: 100, latest: true}})
+			if !hasEvent(all, EventReasonCanaryTrafficOffStable) {
+				t.Fatalf("want a %s Warning for the traffic resting on the rejected pods, got %v", EventReasonCanaryTrafficOffStable, all)
 			}
 		})
 	}
 }
 
-// Through the dispatcher: the gate's failing sample parks the unit and the
+// Through the dispatcher: the gate's failing sample stops the unit and the
 // InferenceReplica is never pointed at the empty stable revision, although
 // that revision's ControllerRevision is retained.
 func TestDispatch_AutomaticRollbackToAnEmptyStableLeavesTheReplicaUnsignaled(t *testing.T) {
@@ -316,7 +318,7 @@ func TestDispatch_AutomaticRollbackToAnEmptyStableLeavesTheReplicaUnsignaled(t *
 
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs == nil || cs.Failed == nil || cs.RolledBackRevisionHash != "" {
-		t.Fatalf("the failing gate must park the unit without a revert, got %+v", cs)
+		t.Fatalf("the failing gate must stop the unit without a revert, got %+v", cs)
 	}
 	if len(emptyTargetEvents(rec)) != 1 {
 		t.Fatalf("want the empty-stable warning once, got %v", eventsFrom(rec))

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"sigs.k8s.io/ome/pkg/render"
+
 	"github.com/go-logr/logr"
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/onsi/gomega"
@@ -765,8 +767,8 @@ func TestEngineReconcileObjectMeta(t *testing.T) {
 				engine.FineTunedWeights = tt.fineTunedWeights
 			}
 
-			// Test reconcileObjectMeta
-			objectMeta, err := engine.reconcileObjectMeta(context.TODO(), tt.isvc)
+			// Build the engine's object metadata
+			objectMeta, err := ReconcileComponentObjectMeta(&engine.BaseComponentFields, tt.isvc, v1beta1.EngineComponent, render.ComponentName(tt.isvc, v1beta1.EngineComponent), engine.engineSpec.Annotations, engine.engineSpec.Labels)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Validate name
@@ -886,7 +888,7 @@ func TestEngineWorkerPodSpec(t *testing.T) {
 				tt.engineSpec,
 			).(*Engine)
 
-			podSpec, err := engine.reconcileWorkerPodSpec(isvc, objectMeta)
+			podSpec, err := render.EngineWorkerPodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 
 			if tt.expectedError {
 				g.Expect(err).To(gomega.HaveOccurred())
@@ -965,7 +967,7 @@ func TestEngineUsesLeaderTemplate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			g.Expect(engineUsesLeaderTemplate(tt.spec)).To(gomega.Equal(tt.expected))
+			g.Expect(render.EngineUsesLeaderTemplate(tt.spec)).To(gomega.Equal(tt.expected))
 		})
 	}
 }
@@ -1021,7 +1023,7 @@ func TestEngineReconcilePodSpec_OMENativeWithLeader(t *testing.T) {
 		engineSpec,
 	).(*Engine)
 
-	podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+	podSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(podSpec).NotTo(gomega.BeNil())
 	g.Expect(podSpec.Containers).To(gomega.HaveLen(1))
@@ -1086,11 +1088,11 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 
 		engine := newEngineFromMerged(mergedEngine, constants.OMENative)
 
-		podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+		podSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(podSpec.SchedulerName).To(gomega.Equal("custom-scheduler"))
 
-		workerPodSpec, err := engine.reconcileWorkerPodSpec(isvc, objectMeta)
+		workerPodSpec, err := render.EngineWorkerPodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(workerPodSpec.SchedulerName).To(gomega.Equal("custom-scheduler"))
 	})
@@ -1102,11 +1104,11 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 
 		engine := newEngineFromMerged(mergedEngine, constants.OMENative)
 
-		podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+		podSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(podSpec.SchedulerName).To(gomega.Equal("leader-scheduler"))
 
-		workerPodSpec, err := engine.reconcileWorkerPodSpec(isvc, objectMeta)
+		workerPodSpec, err := render.EngineWorkerPodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(workerPodSpec.SchedulerName).To(gomega.Equal("custom-scheduler"),
 			"a worker level left unset must still fall back to the top-level name")
@@ -1125,7 +1127,7 @@ func TestEngineReconcilePodSpec_RuntimeSchedulerName(t *testing.T) {
 
 		engine := newEngineFromMerged(mergedEngine, constants.RawDeployment)
 
-		podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+		podSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 		g.Expect(err).NotTo(gomega.HaveOccurred())
 		g.Expect(podSpec.SchedulerName).To(gomega.Equal("custom-scheduler"))
 	})
@@ -1356,7 +1358,7 @@ func TestEngineReconcileOMENativeSubresources_ExtraEndpoints(t *testing.T) {
 	c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
 	clientset := fake.NewClientset()
 	engine := NewEngine(
-		&ComponentDeps{Client: c, Clientset: clientset, Scheme: scheme, Config: &controllerconfig.InferenceServicesConfig{}},
+		&ComponentDeps{Client: c, Clientset: clientset, Scheme: scheme, Config: chartScrapeValues(t)},
 		ComponentInputs{DeploymentMode: constants.OMENative},
 		engineSpec,
 	).(*Engine)
@@ -1370,7 +1372,7 @@ func TestEngineReconcileOMENativeSubresources_ExtraEndpoints(t *testing.T) {
 		pm)).To(gomega.Succeed())
 
 	g.Expect(pm.Spec.PodMetricsEndpoints).To(gomega.HaveLen(2))
-	// Default /metrics endpoint stays first, on the "metrics" port.
+	// OME's own endpoint, the configured /metrics, stays first, on the "metrics" port.
 	g.Expect(*pm.Spec.PodMetricsEndpoints[0].Port).To(gomega.Equal("metrics"))
 	g.Expect(pm.Spec.PodMetricsEndpoints[0].Path).To(gomega.Equal("/metrics"))
 	// Annotation-declared endpoint is appended after it.
@@ -1419,19 +1421,16 @@ func TestEngineReconcileOMENativeSubresources_ManagedScrapeConfig(t *testing.T) 
 			}}},
 	}
 
-	cfg := &controllerconfig.InferenceServicesConfig{
-		PodMonitor: controllerconfig.PodMonitorConfig{
-			Labels: map[string]string{"scrape.example.com/tier": "cluster"},
-			Relabelings: []controllerconfig.RelabelConfig{
-				{
-					SourceLabels: []string{"__meta_kubernetes_pod_label_ome_io_inferenceservice"},
-					TargetLabel:  "inferenceservice",
-				},
-				{
-					SourceLabels: []string{"__meta_kubernetes_namespace"},
-					TargetLabel:  "k8s_namespace_name",
-				},
-			},
+	cfg := chartScrapeValues(t)
+	cfg.PodMonitor.Labels = map[string]string{"scrape.example.com/tier": "cluster"}
+	cfg.PodMonitor.Relabelings = []controllerconfig.RelabelConfig{
+		{
+			SourceLabels: []string{"__meta_kubernetes_pod_label_ome_io_inferenceservice"},
+			TargetLabel:  "inferenceservice",
+		},
+		{
+			SourceLabels: []string{"__meta_kubernetes_namespace"},
+			TargetLabel:  "k8s_namespace_name",
 		},
 	}
 
@@ -1644,9 +1643,9 @@ func TestEngineResourceMerging(t *testing.T) {
 				tt.engineSpec,
 			).(*Engine)
 
-			// Call reconcilePodSpec which internally calls MergeRoleResources
+			// Render the primary pod, which merges the role resources
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
-			podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+			podSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Find the runner container
@@ -1820,9 +1819,9 @@ func TestEngineAffinityMerging(t *testing.T) {
 				tt.engineSpec,
 			).(*Engine)
 
-			// Call reconcilePodSpec which internally calls UpdateRoleAffinity
+			// Render the primary pod, which applies the role affinity
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
-			podSpec, err := engine.reconcilePodSpec(isvc, objectMeta)
+			podSpec, err := render.EnginePodSpec(&engine.Piece, isvc, engine.engineSpec, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Validate affinity

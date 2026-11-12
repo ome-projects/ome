@@ -35,10 +35,6 @@ import (
 
 var log = logf.Log.WithName("rolloutpolicy-validation-webhook")
 
-// maxNamedReferencingISVCs is the cap the shared guard puts on the
-// InferenceServices an in-use deletion denial names.
-const maxNamedReferencingISVCs = policyguard.MaxNamedReferences
-
 // +kubebuilder:webhook:verbs=create;update;delete,path=/validate-ome-io-v1beta1-rolloutpolicy,mutating=false,failurePolicy=fail,groups=ome.io,resources=rolloutpolicies,versions=v1beta1,name=rolloutpolicy.ome-webhook-server.validator,sideEffects=None,admissionReviewVersions=v1
 
 // +kubebuilder:object:generate=false

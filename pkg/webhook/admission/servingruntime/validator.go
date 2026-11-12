@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -24,7 +25,6 @@ const (
 	InvalidPriorityClusterServingRuntimeError   = "%s in the clusterservingruntimes %s and %s"
 	PriorityIsNotSameServingRuntimeError        = "%s under the servingruntime %s"
 	PriorityIsNotSameClusterServingRuntimeError = "%s under the clusterservingruntime %s"
-	ChainsawInjectAnnotationNotAllowError       = "chainsaw inject annotation is not allowed"
 	UnknownAcceleratorClassError                = "unknown accelerator classes referenced in AcceleratorRequirements: %v"
 )
 
@@ -59,69 +59,12 @@ func (sr *ServingRuntimeValidator) Handle(ctx context.Context, req admission.Req
 		return admission.Denied(err.Error())
 	}
 
-	// Scaling-policy modes no controller applies are rejected before the
-	// disabled-shortcut so a disabled runtime cannot store a policy the
-	// update ratchet would then treat as pre-existing on re-enable.
-	oldSRSpec := func() (*v1beta1.ServingRuntimeSpec, error) {
-		old := &v1beta1.ServingRuntime{}
-		if err := sr.Decoder.DecodeRaw(req.OldObject, old); err != nil {
-			return nil, err
-		}
-		return &old.Spec, nil
-	}
-	if resp := validateRuntimeScalingPolicy(req, &servingRuntime.Spec, oldSRSpec); resp != nil {
-		return *resp
-	}
-
-	// Policy refs attach on the InferenceService only; a ref stored on a
-	// runtime component config would be silently inert. Checked before the
-	// disabled-shortcut so a disabled runtime cannot store one either.
-	if err := validation.ValidateRuntimeAutoscalerPolicyRefs(&servingRuntime.Spec); err != nil {
-		return admission.Denied(err.Error())
-	}
-	if err := validation.ValidateRuntimeRouterCapacityEndpoint(&servingRuntime.Spec); err != nil {
-		return admission.Denied(err.Error())
-	}
-
-	existing := &v1beta1.ServingRuntimeList{}
-	if err := sr.Client.List(ctx, existing, client.InNamespace(servingRuntime.Namespace)); err != nil {
-		log.Error(err, "Failed to get serving runtime list", "namespace", servingRuntime.Namespace)
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
-	if servingRuntime.Spec.IsDisabled() {
-		return admission.Allowed("")
-	}
-
-	// Per-Component Autoscaler block validation. Same rules
-	// applied to the ISVC's blocks; ServingRuntime can declare
-	// autoscaler defaults that inherit to ISVCs, so the same shape
-	// constraints apply.
-	if err := validateRuntimeComponentAutoscalers(&servingRuntime.Spec); err != nil {
-		return admission.Denied(err.Error())
-	}
-
-	// Validate that all referenced accelerator classes exist
-	if err := validateAcceleratorClasses(ctx, sr.Client, &servingRuntime.Spec); err != nil {
-		log.Info("Accelerator class validation failed", "name", servingRuntime.Name, "namespace", servingRuntime.Namespace, "error", err)
-		return admission.Denied(err.Error())
-	}
-
-	// Spec-only checks run outside the loop so they still apply when the
-	// namespace has no other runtimes.
-	if err := validation.ValidateModelFormatPrioritySame(&servingRuntime.Spec); err != nil {
-		return admission.Denied(fmt.Sprintf(PriorityIsNotSameServingRuntimeError, err.Error(), servingRuntime.Name))
-	}
-	if err := validateServingRuntimeAnnotations(&servingRuntime.Spec); err != nil {
-		return admission.Denied(ChainsawInjectAnnotationNotAllowError)
-	}
-
-	for i := range existing.Items {
-		if err := validateServingRuntimePriority(&servingRuntime.Spec, &existing.Items[i].Spec, servingRuntime.Name, existing.Items[i].Name); err != nil {
-			return admission.Denied(fmt.Sprintf(InvalidPriorityServingRuntimeError, err.Error(), existing.Items[i].Name, servingRuntime.Name, servingRuntime.Namespace))
-		}
-	}
-	return admission.Allowed("")
+	return admitRuntime(ctx, req, sr, runtimeWrite{
+		name:      servingRuntime.Name,
+		namespace: servingRuntime.Namespace,
+		spec:      &servingRuntime.Spec,
+		logKeys:   []any{"name", servingRuntime.Name, "namespace", servingRuntime.Namespace},
+	})
 }
 
 func (csr *ClusterServingRuntimeValidator) Handle(ctx context.Context, req admission.Request) admission.Response {
@@ -138,68 +81,160 @@ func (csr *ClusterServingRuntimeValidator) Handle(ctx context.Context, req admis
 		return admission.Denied(err.Error())
 	}
 
-	// Scaling-policy check placement mirrors ServingRuntime.Handle: before
-	// the disabled-shortcut so the ratchet cannot be seeded while disabled.
-	oldCSRSpec := func() (*v1beta1.ServingRuntimeSpec, error) {
-		old := &v1beta1.ClusterServingRuntime{}
-		if err := csr.Decoder.DecodeRaw(req.OldObject, old); err != nil {
-			return nil, err
-		}
-		return &old.Spec, nil
-	}
-	if resp := validateRuntimeScalingPolicy(req, &clusterServingRuntime.Spec, oldCSRSpec); resp != nil {
+	return admitRuntime(ctx, req, csr, runtimeWrite{
+		name:    clusterServingRuntime.Name,
+		spec:    &clusterServingRuntime.Spec,
+		logKeys: []any{"name", clusterServingRuntime.Name},
+	})
+}
+
+// runtimeWrite is one ServingRuntime or ClusterServingRuntime create or
+// update whose kind-specific checks passed; the rules both kinds share read
+// it. namespace is empty for a cluster-scoped runtime, and logKeys are the
+// key-value pairs a log line names the runtime by.
+type runtimeWrite struct {
+	name      string
+	namespace string
+	spec      *v1beta1.ServingRuntimeSpec
+	logKeys   []any
+}
+
+// runtimePeer is a stored runtime of the write's kind and scope. A write
+// may not auto-select the same model format at the same priority as a peer.
+type runtimePeer struct {
+	name string
+	spec *v1beta1.ServingRuntimeSpec
+}
+
+// runtimeKind is what the shared rules ask of a runtime kind: a reader for
+// the cluster, the stored spec an update replaces, the peers a write
+// competes with, and the words of a refusal. Both validators implement it.
+type runtimeKind interface {
+	reader() client.Reader
+	priorSpec(raw runtime.RawExtension) (*v1beta1.ServingRuntimeSpec, error)
+	// peers lists the stored runtimes of the write's scope and logs a
+	// failed read.
+	peers(ctx context.Context, w runtimeWrite) ([]runtimePeer, error)
+	// samePriorityDenial words two formats of the write at one priority.
+	samePriorityDenial(w runtimeWrite, err error) string
+	// peerPriorityDenial words a priority tie between the write and peer.
+	peerPriorityDenial(w runtimeWrite, peer runtimePeer, err error) string
+}
+
+// admitRuntime runs the rules both runtime kinds share, in this order:
+// the scaling policy and its update ratchet, policy refs and the router
+// capacity endpoint (checked before the disabled-shortcut so a disabled
+// runtime cannot store them), the peer read, then for an enabled runtime
+// the autoscaler shapes, the accelerator classes, the priorities inside the
+// spec and the priority ties with its peers.
+func admitRuntime(ctx context.Context, req admission.Request, kind runtimeKind, w runtimeWrite) admission.Response {
+	priorSpec := func() (*v1beta1.ServingRuntimeSpec, error) { return kind.priorSpec(req.OldObject) }
+	if resp := validateRuntimeScalingPolicy(req, w.spec, priorSpec); resp != nil {
 		return *resp
 	}
 
-	// Policy refs attach on the InferenceService only; see ServingRuntime.Handle.
-	if err := validation.ValidateRuntimeAutoscalerPolicyRefs(&clusterServingRuntime.Spec); err != nil {
+	// Policy refs attach on the InferenceService only; a ref stored on a
+	// runtime component config would be silently inert.
+	if err := validation.ValidateRuntimeAutoscalerPolicyRefs(w.spec); err != nil {
 		return admission.Denied(err.Error())
 	}
-	if err := validation.ValidateRuntimeRouterCapacityEndpoint(&clusterServingRuntime.Spec); err != nil {
+	if err := validation.ValidateRuntimeRouterCapacityEndpoint(w.spec); err != nil {
 		return admission.Denied(err.Error())
 	}
 
-	existing := &v1beta1.ClusterServingRuntimeList{}
-	if err := csr.Client.List(ctx, existing); err != nil {
-		log.Error(err, "Failed to get cluster serving runtime list")
+	peers, err := kind.peers(ctx, w)
+	if err != nil {
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	if clusterServingRuntime.Spec.IsDisabled() {
+	if w.spec.IsDisabled() {
 		return admission.Allowed("")
 	}
 
-	// Per-Component Autoscaler block validation; see ServingRuntime.Handle.
-	if err := validateRuntimeComponentAutoscalers(&clusterServingRuntime.Spec); err != nil {
+	// A runtime's autoscaler blocks are inherited by its InferenceServices,
+	// so they meet the same shape rules.
+	if err := validateRuntimeComponentAutoscalers(w.spec); err != nil {
 		return admission.Denied(err.Error())
 	}
 
-	// Validate that all referenced accelerator classes exist
-	if err := validateAcceleratorClasses(ctx, csr.Client, &clusterServingRuntime.Spec); err != nil {
-		log.Info("Accelerator class validation failed", "name", clusterServingRuntime.Name, "error", err)
+	if err := validateAcceleratorClasses(ctx, kind.reader(), w.spec); err != nil {
+		log.Info("Accelerator class validation failed", append(w.logKeys, "error", err)...)
 		return admission.Denied(err.Error())
 	}
 
-	// Spec-only checks run outside the loop so they still apply when no
-	// other ClusterServingRuntimes exist.
-	if err := validation.ValidateModelFormatPrioritySame(&clusterServingRuntime.Spec); err != nil {
-		return admission.Denied(fmt.Sprintf(PriorityIsNotSameClusterServingRuntimeError, err.Error(), clusterServingRuntime.Name))
+	// The spec-only check runs outside the loop so it still applies when
+	// the write has no peers.
+	if err := validation.ValidateModelFormatPrioritySame(w.spec); err != nil {
+		return admission.Denied(kind.samePriorityDenial(w, err))
 	}
-	if err := validateServingRuntimeAnnotations(&clusterServingRuntime.Spec); err != nil {
-		return admission.Denied(ChainsawInjectAnnotationNotAllowError)
-	}
-
-	for i := range existing.Items {
-		// Pass the existing CSR's name from the loop as
-		// existingRuntimeName so the `existingRuntimeName ==
-		// newRuntimeName` early-exit in validateServingRuntimePriority
-		// only short-circuits self-update (the loop iteration that hits
-		// the same CSR we're admitting), not every cross-CSR pairing.
-		if err := validateServingRuntimePriority(&clusterServingRuntime.Spec, &existing.Items[i].Spec, existing.Items[i].Name, clusterServingRuntime.Name); err != nil {
-			return admission.Denied(fmt.Sprintf(InvalidPriorityClusterServingRuntimeError, err.Error(), existing.Items[i].Name, clusterServingRuntime.Name))
+	for _, peer := range peers {
+		if err := validateServingRuntimePriority(w.spec, peer.spec, peer.name, w.name); err != nil {
+			return admission.Denied(kind.peerPriorityDenial(w, peer, err))
 		}
 	}
 	return admission.Allowed("")
+}
+
+func (sr *ServingRuntimeValidator) reader() client.Reader { return sr.Client }
+
+func (sr *ServingRuntimeValidator) priorSpec(raw runtime.RawExtension) (*v1beta1.ServingRuntimeSpec, error) {
+	old := &v1beta1.ServingRuntime{}
+	if err := sr.Decoder.DecodeRaw(raw, old); err != nil {
+		return nil, err
+	}
+	return &old.Spec, nil
+}
+
+func (sr *ServingRuntimeValidator) peers(ctx context.Context, w runtimeWrite) ([]runtimePeer, error) {
+	existing := &v1beta1.ServingRuntimeList{}
+	if err := sr.Client.List(ctx, existing, client.InNamespace(w.namespace)); err != nil {
+		log.Error(err, "Failed to get serving runtime list", "namespace", w.namespace)
+		return nil, err
+	}
+	peers := make([]runtimePeer, len(existing.Items))
+	for i := range existing.Items {
+		peers[i] = runtimePeer{name: existing.Items[i].Name, spec: &existing.Items[i].Spec}
+	}
+	return peers, nil
+}
+
+func (sr *ServingRuntimeValidator) samePriorityDenial(w runtimeWrite, err error) string {
+	return fmt.Sprintf(PriorityIsNotSameServingRuntimeError, err.Error(), w.name)
+}
+
+func (sr *ServingRuntimeValidator) peerPriorityDenial(w runtimeWrite, peer runtimePeer, err error) string {
+	return fmt.Sprintf(InvalidPriorityServingRuntimeError, err.Error(), peer.name, w.name, w.namespace)
+}
+
+func (csr *ClusterServingRuntimeValidator) reader() client.Reader { return csr.Client }
+
+func (csr *ClusterServingRuntimeValidator) priorSpec(raw runtime.RawExtension) (*v1beta1.ServingRuntimeSpec, error) {
+	old := &v1beta1.ClusterServingRuntime{}
+	if err := csr.Decoder.DecodeRaw(raw, old); err != nil {
+		return nil, err
+	}
+	return &old.Spec, nil
+}
+
+func (csr *ClusterServingRuntimeValidator) peers(ctx context.Context, _ runtimeWrite) ([]runtimePeer, error) {
+	existing := &v1beta1.ClusterServingRuntimeList{}
+	if err := csr.Client.List(ctx, existing); err != nil {
+		log.Error(err, "Failed to get cluster serving runtime list")
+		return nil, err
+	}
+	peers := make([]runtimePeer, len(existing.Items))
+	for i := range existing.Items {
+		peers[i] = runtimePeer{name: existing.Items[i].Name, spec: &existing.Items[i].Spec}
+	}
+	return peers, nil
+}
+
+func (csr *ClusterServingRuntimeValidator) samePriorityDenial(w runtimeWrite, err error) string {
+	return fmt.Sprintf(PriorityIsNotSameClusterServingRuntimeError, err.Error(), w.name)
+}
+
+func (csr *ClusterServingRuntimeValidator) peerPriorityDenial(w runtimeWrite, peer runtimePeer, err error) string {
+	return fmt.Sprintf(InvalidPriorityClusterServingRuntimeError, err.Error(), peer.name, w.name)
 }
 
 func areSupportedModelFormatsEqual(m1, m2 v1beta1.SupportedModelFormat) bool {
@@ -227,14 +262,6 @@ func areModelSizeRangesEqual(range1, range2 *v1beta1.ModelSizeRangeSpec) bool {
 		return range1 == range2
 	}
 	return ptrDerefEqual(range1.Min, range2.Min) && ptrDerefEqual(range1.Max, range2.Max)
-}
-
-// validateServingRuntimeAnnotations is a placeholder for future
-// pod-template annotation validation. Today it accepts everything; the
-// caller still wraps the result so an enforcement path is available
-// without webhook rewiring.
-func validateServingRuntimeAnnotations(*v1beta1.ServingRuntimeSpec) error {
-	return nil
 }
 
 // validateServingRuntimePriority rejects two runtimes that auto-select on

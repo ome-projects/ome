@@ -32,12 +32,6 @@ func MakeInferenceService(name, namespace string) *InferenceServiceWrapper {
 // Obj returns the underlying API type pointer.
 func (w *InferenceServiceWrapper) Obj() *v1beta1.InferenceService { return &w.InferenceService }
 
-// Clone returns a deep copy wrapped, useful when the same baseline
-// needs minor variations across subtests.
-func (w *InferenceServiceWrapper) Clone() *InferenceServiceWrapper {
-	return &InferenceServiceWrapper{InferenceService: *w.InferenceService.DeepCopy()}
-}
-
 // Model sets spec.Model.Name. Defaults Kind to ClusterBaseModel and
 // APIGroup to ome.io to match the CRD's defaults.
 func (w *InferenceServiceWrapper) Model(name string) *InferenceServiceWrapper {

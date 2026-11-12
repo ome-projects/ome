@@ -16,7 +16,7 @@ func peerISVC() *v1beta1.InferenceService {
 }
 
 func TestBuildPeerEndpointEnv(t *testing.T) {
-	env := BuildPeerEndpointEnv("llama", "llama", "prod", v1beta1.DecoderComponent, "abcd1234")
+	env := BuildPeerEndpointEnv("llama", "llama", "prod", "cluster.local", v1beta1.DecoderComponent, "abcd1234")
 	if env.GenericName != "OME_DECODER_ENDPOINT" {
 		t.Errorf("GenericName: got %q want OME_DECODER_ENDPOINT", env.GenericName)
 	}
@@ -34,8 +34,32 @@ func TestBuildPeerEndpointEnv(t *testing.T) {
 // The generic endpoint names the service's stable Service; the revision
 // endpoint names the peer replica's per-revision Service, so a referenced
 // peer is addressed under its own prefix.
+// The peer addresses end with the cluster domain the operator configured;
+// a cluster whose DNS domain is not cluster.local gets its own suffix.
+func TestBuildPeerEndpointEnv_ConfiguredClusterDomain(t *testing.T) {
+	env := BuildPeerEndpointEnv("llama", "llama", "prod", "example.org", v1beta1.DecoderComponent, "abcd1234")
+	if env.GenericValue != "llama-decoder.prod.svc.example.org" {
+		t.Errorf("GenericValue: got %q want llama-decoder.prod.svc.example.org", env.GenericValue)
+	}
+	if env.RevisionValue != "llama-decoder-rev-abcd1234.prod.svc.example.org" {
+		t.Errorf("RevisionValue: got %q want llama-decoder-rev-abcd1234.prod.svc.example.org", env.RevisionValue)
+	}
+}
+
+// Without a configured cluster domain the addresses are the namespaced short
+// names, which a pod's DNS search path resolves; no suffix is invented.
+func TestBuildPeerEndpointEnv_NoClusterDomainRendersShortNames(t *testing.T) {
+	env := BuildPeerEndpointEnv("llama", "llama", "prod", "", v1beta1.DecoderComponent, "abcd1234")
+	if env.GenericValue != "llama-decoder.prod" {
+		t.Errorf("GenericValue: got %q want llama-decoder.prod", env.GenericValue)
+	}
+	if env.RevisionValue != "llama-decoder-rev-abcd1234.prod" {
+		t.Errorf("RevisionValue: got %q want llama-decoder-rev-abcd1234.prod", env.RevisionValue)
+	}
+}
+
 func TestBuildPeerEndpointEnv_ReferencedPeerPrefix(t *testing.T) {
-	env := BuildPeerEndpointEnv("svc", "pool-d", "team-a", v1beta1.DecoderComponent, "abcd1234")
+	env := BuildPeerEndpointEnv("svc", "pool-d", "team-a", "cluster.local", v1beta1.DecoderComponent, "abcd1234")
 	if env.GenericValue != "svc-decoder.team-a.svc.cluster.local" {
 		t.Errorf("GenericValue: got %q want svc-decoder.team-a.svc.cluster.local", env.GenericValue)
 	}
@@ -45,7 +69,7 @@ func TestBuildPeerEndpointEnv_ReferencedPeerPrefix(t *testing.T) {
 }
 
 func TestBuildPeerEndpointEnv_UpperCasesComponent(t *testing.T) {
-	env := BuildPeerEndpointEnv("llama", "llama", "prod", v1beta1.EngineComponent, "abcd")
+	env := BuildPeerEndpointEnv("llama", "llama", "prod", "cluster.local", v1beta1.EngineComponent, "abcd")
 	if env.GenericName != "OME_ENGINE_ENDPOINT" {
 		t.Errorf("uppercases component: got %q", env.GenericName)
 	}
@@ -60,7 +84,7 @@ func TestInjectPeerEnv_AddsGenericAndRevisionEnv(t *testing.T) {
 			},
 		},
 	}
-	InjectPeerEnv(pod, peerISVC(),
+	InjectPeerEnv(pod, peerISVC(), "cluster.local",
 		[]v1beta1.ComponentType{v1beta1.DecoderComponent},
 		func(v1beta1.ComponentType) string { return "rev1" },
 	)
@@ -88,7 +112,7 @@ func TestInjectPeerEnv_ReferencedPeer(t *testing.T) {
 			Containers: []corev1.Container{{Name: "main"}},
 		},
 	}
-	InjectPeerEnv(pod, isvc,
+	InjectPeerEnv(pod, isvc, "cluster.local",
 		[]v1beta1.ComponentType{v1beta1.DecoderComponent},
 		func(v1beta1.ComponentType) string { return "rev1" },
 	)
@@ -107,7 +131,7 @@ func TestInjectPeerEnv_EmptyHashOmitsRevisionEnv(t *testing.T) {
 			Containers: []corev1.Container{{Name: "main"}},
 		},
 	}
-	InjectPeerEnv(pod, peerISVC(),
+	InjectPeerEnv(pod, peerISVC(), "cluster.local",
 		[]v1beta1.ComponentType{v1beta1.DecoderComponent},
 		nil,
 	)
@@ -133,7 +157,7 @@ func TestInjectPeerEnv_OverridesUserSuppliedSameNameVar(t *testing.T) {
 			},
 		},
 	}
-	InjectPeerEnv(pod, peerISVC(),
+	InjectPeerEnv(pod, peerISVC(), "cluster.local",
 		[]v1beta1.ComponentType{v1beta1.DecoderComponent},
 		func(v1beta1.ComponentType) string { return "rev1" },
 	)
@@ -147,7 +171,7 @@ func TestInjectPeerEnv_OverridesUserSuppliedSameNameVar(t *testing.T) {
 }
 
 func TestInjectPeerEnv_NilPodNoOp(t *testing.T) {
-	InjectPeerEnv(nil, peerISVC(), []v1beta1.ComponentType{v1beta1.DecoderComponent}, nil)
+	InjectPeerEnv(nil, peerISVC(), "cluster.local", []v1beta1.ComponentType{v1beta1.DecoderComponent}, nil)
 }
 
 func TestInjectPeerEnv_EmptyPeersNoOp(t *testing.T) {
@@ -156,11 +180,11 @@ func TestInjectPeerEnv_EmptyPeersNoOp(t *testing.T) {
 			Containers: []corev1.Container{{Name: "main", Env: []corev1.EnvVar{{Name: "USER", Value: "x"}}}},
 		},
 	}
-	InjectPeerEnv(pod, peerISVC(), nil, nil)
+	InjectPeerEnv(pod, peerISVC(), "cluster.local", nil, nil)
 	if len(pod.Spec.Containers[0].Env) != 1 || pod.Spec.Containers[0].Env[0].Name != "USER" {
 		t.Errorf("empty peers should not touch env: got %+v", pod.Spec.Containers[0].Env)
 	}
-	InjectPeerEnv(pod, nil, []v1beta1.ComponentType{v1beta1.DecoderComponent}, nil)
+	InjectPeerEnv(pod, nil, "cluster.local", []v1beta1.ComponentType{v1beta1.DecoderComponent}, nil)
 	if len(pod.Spec.Containers[0].Env) != 1 {
 		t.Errorf("nil service should not touch env: got %+v", pod.Spec.Containers[0].Env)
 	}

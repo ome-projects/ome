@@ -237,7 +237,7 @@ func newControllerCapacityPoller(
 ) *CapacityPoller {
 	t.Helper()
 	executor, _, _ := startTestObserverExecutor(t, 1, 1)
-	poller, err := NewCapacityPoller(executor, client, clk, 1<<10, log.Log)
+	poller, err := NewCapacityPoller(executor, client, clk, 1<<10)
 	require.NoError(t, err)
 	return poller
 }
@@ -1607,9 +1607,9 @@ func TestReconcile(t *testing.T) {
 				cfg.Capacity = controllerTestCapacityConfig()
 				cfg.Capacity.Period = 8 * time.Second
 				executor, _, _ := startTestObserverExecutor(t, 1, 1)
-				prober, err := NewProber(executor, NewObserverClient(), clk, 1<<10, log.Log)
+				prober, err := NewProber(executor, NewObserverClient(), clk, 1<<10)
 				require.NoError(t, err)
-				capacity, err := NewCapacityPoller(executor, NewObserverClient(), clk, 1<<10, log.Log)
+				capacity, err := NewCapacityPoller(executor, NewObserverClient(), clk, 1<<10)
 				require.NoError(t, err)
 				return reconcileScenario{
 					config:  cfg,

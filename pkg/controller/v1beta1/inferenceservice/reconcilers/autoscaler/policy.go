@@ -59,16 +59,15 @@ func RawEffectiveComponentBounds(c *v1beta1.ComponentExtensionSpec) Bounds {
 	return Bounds{Min: minR, Max: maxR}
 }
 
-// PolicyOutcome is the result of resolving one component's policy ref.
+// PolicyOutcome is the result of resolving one component's policy ref; a
+// component with no ref gets a nil outcome and the ordinary chain applies.
 // Exactly one of these states holds:
-//   - Ref == nil: the component has no ref; the ordinary chain applies.
 //   - Rendered != nil: the policy rendered; Provenance carries the digests.
 //   - Hold == true: the ref is set but no block could be produced — the
 //     caller fails closed (keep the last-known-good scaler, raise the
 //     AutoscalerResolved condition with HoldReason, never fall through to a
 //     different scaler class).
 type PolicyOutcome struct {
-	Ref        *v1beta1.AutoscalerPolicyRef
 	Rendered   *v1beta1.ComponentAutoscaler
 	Provenance *v1beta1.AutoscalerPolicyProvenance
 
@@ -165,7 +164,7 @@ func (r *PolicyResolver) Resolve(ctx context.Context, isvc *v1beta1.InferenceSer
 	if ref == nil {
 		return nil, nil
 	}
-	outcome := &PolicyOutcome{Ref: ref.DeepCopy()}
+	outcome := &PolicyOutcome{}
 
 	if r == nil || !r.Enabled {
 		return hold(outcome, v1beta1.AutoscalerResolvedReasonPolicyNotFound,

@@ -86,7 +86,8 @@ func TestValidateModel(t *testing.T) {
 			err := selector.validateModel(tt.model)
 			if tt.wantErr {
 				assert.Error(t, err)
-				assert.True(t, IsModelValidationError(err))
+				var invalid *ModelValidationError
+				assert.ErrorAs(t, err, &invalid)
 			} else {
 				assert.NoError(t, err)
 			}
@@ -195,7 +196,6 @@ func TestErrorTypes(t *testing.T) {
 	err := &RuntimeCompatibilityError{
 		RuntimeName: "test-runtime",
 		ModelName:   "test-model",
-		ModelFormat: "pytorch",
 		Reason:      "version mismatch",
 	}
 	assert.Contains(t, err.Error(), "test-runtime")
@@ -507,42 +507,38 @@ func TestSortSupportedRuntime(t *testing.T) {
 			name: "sort by score - higher score wins",
 			runtimes: []RuntimeMatch{
 				{
-					RuntimeSelection: RuntimeSelection{
-						Name: "low-score-runtime",
-						Spec: &v1beta1.ServingRuntimeSpec{
-							SupportedModelFormats: []v1beta1.SupportedModelFormat{
-								{
-									ModelFormat: &v1beta1.ModelFormat{
-										Name:   "test-format",
-										Weight: 5,
-									},
-									Priority: ptr(int32(1)),
+					Name: "low-score-runtime",
+					Spec: &v1beta1.ServingRuntimeSpec{
+						SupportedModelFormats: []v1beta1.SupportedModelFormat{
+							{
+								ModelFormat: &v1beta1.ModelFormat{
+									Name:   "test-format",
+									Weight: 5,
 								},
+								Priority: ptr(int32(1)),
 							},
 						},
-						Score: 5,
 					},
+					Score: 5,
 				},
 				{
-					RuntimeSelection: RuntimeSelection{
-						Name: "high-score-runtime",
-						Spec: &v1beta1.ServingRuntimeSpec{
-							SupportedModelFormats: []v1beta1.SupportedModelFormat{
-								{
-									ModelFormat: &v1beta1.ModelFormat{
-										Name:   "test-format",
-										Weight: 10,
-									},
-									ModelFramework: &v1beta1.ModelFrameworkSpec{
-										Name:   "test-framework",
-										Weight: 8,
-									},
-									Priority: ptr(int32(2)),
+					Name: "high-score-runtime",
+					Spec: &v1beta1.ServingRuntimeSpec{
+						SupportedModelFormats: []v1beta1.SupportedModelFormat{
+							{
+								ModelFormat: &v1beta1.ModelFormat{
+									Name:   "test-format",
+									Weight: 10,
 								},
+								ModelFramework: &v1beta1.ModelFrameworkSpec{
+									Name:   "test-framework",
+									Weight: 8,
+								},
+								Priority: ptr(int32(2)),
 							},
 						},
-						Score: 36, // (10 + 8) * 2
 					},
+					Score: 36, // (10 + 8) * 2
 				},
 			},
 			expectedOrder: []string{"high-score-runtime", "low-score-runtime"},
@@ -551,28 +547,24 @@ func TestSortSupportedRuntime(t *testing.T) {
 			name: "sort by model size range when scores are equal",
 			runtimes: []RuntimeMatch{
 				{
-					RuntimeSelection: RuntimeSelection{
-						Name: "far-size-runtime",
-						Spec: &v1beta1.ServingRuntimeSpec{
-							ModelSizeRange: &v1beta1.ModelSizeRangeSpec{
-								Min: ptr("20B"),
-								Max: ptr("30B"),
-							},
+					Name: "far-size-runtime",
+					Spec: &v1beta1.ServingRuntimeSpec{
+						ModelSizeRange: &v1beta1.ModelSizeRangeSpec{
+							Min: ptr("20B"),
+							Max: ptr("30B"),
 						},
-						Score: 10,
 					},
+					Score: 10,
 				},
 				{
-					RuntimeSelection: RuntimeSelection{
-						Name: "close-size-runtime",
-						Spec: &v1beta1.ServingRuntimeSpec{
-							ModelSizeRange: &v1beta1.ModelSizeRangeSpec{
-								Min: ptr("5B"),
-								Max: ptr("10B"),
-							},
+					Name: "close-size-runtime",
+					Spec: &v1beta1.ServingRuntimeSpec{
+						ModelSizeRange: &v1beta1.ModelSizeRangeSpec{
+							Min: ptr("5B"),
+							Max: ptr("10B"),
 						},
-						Score: 10,
 					},
+					Score: 10,
 				},
 			},
 			expectedOrder: []string{"close-size-runtime", "far-size-runtime"},
@@ -581,18 +573,14 @@ func TestSortSupportedRuntime(t *testing.T) {
 			name: "prefer namespace-scoped over cluster-scoped when equal",
 			runtimes: []RuntimeMatch{
 				{
-					RuntimeSelection: RuntimeSelection{
-						Name:      "cluster-runtime",
-						IsCluster: true,
-						Score:     10,
-					},
+					Name:      "cluster-runtime",
+					IsCluster: true,
+					Score:     10,
 				},
 				{
-					RuntimeSelection: RuntimeSelection{
-						Name:      "namespace-runtime",
-						IsCluster: false,
-						Score:     10,
-					},
+					Name:      "namespace-runtime",
+					IsCluster: false,
+					Score:     10,
 				},
 			},
 			expectedOrder: []string{"namespace-runtime", "cluster-runtime"},
@@ -941,7 +929,8 @@ func TestValidateRuntime_DisabledAndNoAutoSelect(t *testing.T) {
 	// Disabled should return RuntimeDisabledError
 	err := selector.ValidateRuntime(ctx, "rt-disabled", model, isvc)
 	assert.Error(t, err)
-	assert.True(t, IsRuntimeDisabledError(err))
+	var disabledErr *RuntimeDisabledError
+	assert.ErrorAs(t, err, &disabledErr)
 
 	// NoAutoSelect should return nil (compatible), even though auto-select is false
 	assert.NoError(t, selector.ValidateRuntime(ctx, "rt-no-auto", model, isvc))

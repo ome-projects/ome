@@ -272,6 +272,91 @@ func TestFailedWithTheOperationKept_CarriesNoDeadline(t *testing.T) {
 	}
 }
 
+// A Failed write that keeps the operation leaves no deadline on it,
+// whichever path ended the attempt: the deadline backstop, the gang form's
+// ended attempt or the scheduler grace. A Failed row is outside every
+// pass that reads the clock, so a time left there would be one nobody acts
+// on. The identity, step and retry count stay for the pass that finishes
+// the attempt.
+func TestFailedWithTheAttemptEnded_CarriesNoDeadline(t *testing.T) {
+	now := metav1.NewTime(time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC))
+	surgeIndex := int32(1)
+	for name, tc := range map[string]struct {
+		row         types.InstanceStatus
+		termination *types.InstanceTermination
+	}{
+		"repair ended by the deadline backstop": {
+			row: types.InstanceStatus{Index: 0, Incarnation: 2, Phase: types.InstancePhaseRestarting, Operation: &types.InstanceOperation{
+				ID: "restart-0-1", Type: types.InstanceOperationRestart, Step: types.RestartStepDrain, RetryCount: 1,
+				StartedAt: now, Deadline: metav1.NewTime(now.Add(-time.Minute))}},
+			termination: &types.InstanceTermination{PodName: "engine-0-default-0", Reason: "DeadlineExceeded", Time: now},
+		},
+		"gang surge source ended by its gang form": {
+			row: types.InstanceStatus{Index: 0, Incarnation: 1, Phase: types.InstancePhaseUpdating, TargetRevision: "rev-b", Operation: &types.InstanceOperation{
+				ID: "update-0-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurge, TargetRevision: "rev-b", SurgeIndex: &surgeIndex,
+				StartedAt: now, Deadline: metav1.NewTime(now.Add(20 * time.Minute))}},
+			termination: types.GangTermination("PodGroupOwnershipConflict", "owned by another controller", now),
+		},
+	} {
+		row := tc.row
+		before := *row.Operation
+		if !StampFailedKeepingOperation(tc.termination)(&row) || row.Phase != types.InstancePhaseFailed || row.Operation == nil {
+			t.Fatalf("%s: row = %+v, want Failed with the operation kept", name, row)
+		}
+		if !row.Operation.Deadline.IsZero() {
+			t.Errorf("%s: deadline = %v, want none on a Failed row", name, row.Operation.Deadline)
+		}
+		if row.Operation.ID != before.ID || row.Operation.Step != before.Step || row.Operation.RetryCount != before.RetryCount ||
+			row.Operation.Type != before.Type || row.LastFailure == nil || row.LastFailure.Reason != tc.termination.Reason {
+			t.Errorf("%s: operation = %+v, want %+v with the failure recorded", name, *row.Operation, before)
+		}
+	}
+}
+
+// A permanent apiserver rejection that keeps the row's operation (a surge
+// replacement's row whose retirement delete was refused, a repair whose
+// rebuild create was refused) leaves no deadline on it, as every Failed row
+// with an operation: the attempt that starts again writes its own. The
+// identity, step and retry count stay, the rejection is recorded, and the
+// same rejection written again changes nothing.
+func TestRejectedWriteKeepingTheOperation_CarriesNoDeadline(t *testing.T) {
+	now := metav1.NewTime(time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC))
+	waitSince := metav1.NewTime(now.Add(-time.Minute))
+	termination := &types.InstanceTermination{PodName: "engine-1-leader-0", Reason: types.RejectionReasonInvalidPodSpec, Message: "Pod \"engine-1-leader-0\" is invalid", Time: now}
+	for name, seed := range map[string]types.InstanceStatus{
+		"surge replacement row at its cleanup step": {Index: 1, Incarnation: 1, Phase: types.InstancePhaseCreating, TargetRevision: "rev-b", Operation: &types.InstanceOperation{
+			ID: "gangsurgetarget-1-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepGangSurgeTargetCleanup, TargetRevision: "rev-b",
+			StartedAt: now, Deadline: metav1.NewTime(now.Add(30 * time.Minute)), PlacementWaitSince: &waitSince}},
+		"repair whose rebuild create was refused": {Index: 0, Incarnation: 2, Phase: types.InstancePhaseRestarting, RunningRevision: "rev-a", Operation: &types.InstanceOperation{
+			ID: "restart-0-1", Type: types.InstanceOperationRestart, Step: types.RestartStepDrain, RetryCount: 1,
+			StartedAt: now, Deadline: metav1.NewTime(now.Add(30 * time.Minute))}},
+	} {
+		row := seed
+		before := *row.Operation
+		input := types.ReconcileInput{MutateInstance: func(_ context.Context, _ int32, mutate func(*types.InstanceStatus) bool) error {
+			mutate(&row)
+			return nil
+		}}
+		changed, err := StampRejected(context.Background(), input, row.Index, termination, true)
+		if err != nil || !changed || row.Phase != types.InstancePhaseFailed || row.Operation == nil {
+			t.Fatalf("%s: changed=%t err=%v row=%+v, want Failed with the operation kept", name, changed, err, row)
+		}
+		if !row.Operation.Deadline.IsZero() {
+			t.Errorf("%s: deadline = %v, want none on a Failed row", name, row.Operation.Deadline)
+		}
+		if row.Operation.PlacementWaitSince != nil {
+			t.Errorf("%s: placement wait = %v, want none left on the ended attempt", name, row.Operation.PlacementWaitSince)
+		}
+		if row.Operation.ID != before.ID || row.Operation.Step != before.Step || row.Operation.RetryCount != before.RetryCount ||
+			row.Operation.Type != before.Type || row.LastFailure == nil || row.LastFailure.Reason != termination.Reason {
+			t.Errorf("%s: operation = %+v, want %+v with the rejection recorded", name, *row.Operation, before)
+		}
+		if again, err := StampRejected(context.Background(), input, row.Index, termination, true); err != nil || again {
+			t.Errorf("%s: the same rejection written again: changed=%t err=%v, want no write", name, again, err)
+		}
+	}
+}
+
 // A Restart stamped over a Failed row that already carries a Restart is
 // that repair's next attempt, so the new operation continues the spent
 // one's retry count; a Restart opened on any other row starts at zero.
@@ -436,7 +521,7 @@ func TestStampFailedOnStuckPod_WithholdsFromAPodTheRepairReplaced(t *testing.T) 
 	}
 }
 
-// ApplyStamp runs the stamp through the single-row seam and reports
+// ApplyStamp runs the write through the single-row seam and reports
 // whether it changed the row; the seam's own answer is not visible to
 // the caller otherwise.
 func TestApplyStamp_ReportsWhetherTheStampTook(t *testing.T) {
@@ -745,5 +830,98 @@ func TestFailedWriteHelpers_RetireThePlacementWait(t *testing.T) {
 	}
 	if ClearPlacementWaitMutation()(&cleared) {
 		t.Error("ClearPlacementWaitMutation reported a change on a row with nothing recorded")
+	}
+}
+
+// EnterReady writes the Ready time at whole seconds, the precision the
+// apiserver stores it with, so the row the pass holds is the row it reads
+// back and the write that records a promotion stores the time as the status
+// at rest does.
+func TestEnterReady_WritesAWholeSecond(t *testing.T) {
+	now := time.Date(2026, time.September, 21, 10, 11, 12, 845678901, time.UTC)
+	row := &types.InstanceStatus{Phase: types.InstancePhaseCreating, RunningRevision: "rev-a"}
+	if !EnterReady(row, now) {
+		t.Fatal("EnterReady refused a row with a named running revision")
+	}
+	want := now.Truncate(time.Second)
+	if row.ReadySince == nil || !row.ReadySince.Time.Equal(want) || row.ReadySince.Nanosecond() != 0 {
+		t.Fatalf("ReadySince = %v, want %v with no sub-second part", row.ReadySince, want)
+	}
+}
+
+// A pass that found a repair open on its copy of the rows goes on with
+// it only while the live row still carries it: a row promoted, ended or
+// taken by a roll since is read as not open and left as it is, and the
+// read writes nothing in any case.
+func TestResumeRestarting_LeavesARowThatMovedOnAlone(t *testing.T) {
+	now := time.Date(2026, time.November, 10, 0, 0, 0, 0, time.UTC)
+	openRepair := &types.InstanceOperation{ID: "restart-0-1", Type: types.InstanceOperationRestart, Step: types.RestartStepDrain}
+	openRecreate := &types.InstanceOperation{ID: "update-0-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepDrain, TargetRevision: "rev-b"}
+	cases := []struct {
+		name string
+		row  types.InstanceStatus
+		open bool
+	}{
+		{"still open", types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseRestarting, RunningRevision: "rev-a", Operation: openRepair}, true},
+		{"promoted since", types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseReady, RunningRevision: "rev-a"}, false},
+		{"ended since", types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseFailed, RunningRevision: "rev-a", Operation: openRepair}, false},
+		{"taken by a roll", types.InstanceStatus{Index: 0, Incarnation: 4, Phase: types.InstancePhaseUpdating, TargetRevision: "rev-b", Operation: openRecreate}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRowWriter(tc.row)
+			set, open, err := ResumeRestarting(context.Background(), w.input(now), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if open != tc.open || set != tc.row.Incarnation {
+				t.Errorf("open=%t set=%d, want open=%t set=%d", open, set, tc.open, tc.row.Incarnation)
+			}
+			if w.writes != 0 || w.rows[0].Phase != tc.row.Phase || w.rows[0].Incarnation != tc.row.Incarnation {
+				t.Errorf("the read wrote: writes=%d row=%+v", w.writes, w.rows[0])
+			}
+		})
+	}
+}
+
+// A pass that found a recreate open on its copy of the row goes on with
+// it only while the live row still carries it: the same attempt toward
+// the target goes on with nothing written, one toward another revision
+// is retargeted at the next set number, and a row promoted or ended
+// since is read as not open and left as it is. The first pass still
+// opens the attempt on a Ready row.
+func TestResumeRecreating_LeavesARowThatMovedOnAlone(t *testing.T) {
+	now := time.Date(2026, time.November, 10, 0, 0, 0, 0, time.UTC)
+	openRecreate := func(target string) *types.InstanceOperation {
+		return &types.InstanceOperation{ID: "update-0-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepDrain, TargetRevision: target}
+	}
+	cases := []struct {
+		name   string
+		row    types.InstanceStatus
+		open   bool
+		set    int64
+		writes int
+	}{
+		{"still open", types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseUpdating, TargetRevision: "rev-b", Operation: openRecreate("rev-b")}, true, 3, 0},
+		{"open toward an older target", types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseUpdating, TargetRevision: "rev-a", Operation: openRecreate("rev-a")}, true, 4, 1},
+		{"promoted since", types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseReady, RunningRevision: "rev-b"}, false, 3, 0},
+		{"ended since", types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseFailed, TargetRevision: "rev-b", Operation: openRecreate("rev-b")}, false, 3, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRowWriter(tc.row)
+			set, open, err := ResumeRecreating(context.Background(), w.input(now), 0, "rev-b", "revision rev-a -> rev-b", types.UpdateStrategyRecreatePod, time.Hour, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if open != tc.open || set != tc.set || w.writes != tc.writes {
+				t.Errorf("open=%t set=%d writes=%d, want open=%t set=%d writes=%d; row=%+v", open, set, w.writes, tc.open, tc.set, tc.writes, w.rows[0])
+			}
+		})
+	}
+	w := newRowWriter(types.InstanceStatus{Index: 0, Incarnation: 3, Phase: types.InstancePhaseReady, RunningRevision: "rev-a"})
+	set, err := StampRecreating(context.Background(), w.input(now), 0, "rev-b", "revision rev-a -> rev-b", types.UpdateStrategyRecreatePod, time.Hour, false)
+	if err != nil || set != 4 || w.writes != 1 || w.rows[0].Phase != types.InstancePhaseUpdating {
+		t.Errorf("the first pass on a Ready row: set=%d err=%v writes=%d row=%+v, want the attempt opened at set 4", set, err, w.writes, w.rows[0])
 	}
 }

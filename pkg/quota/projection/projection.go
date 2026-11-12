@@ -26,8 +26,12 @@
 package projection
 
 import (
+	"cmp"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -48,7 +52,7 @@ type Allowance struct {
 
 // Options carry the projector's identity.
 type Options struct {
-	// Origin identifies the management plane. It is stamped on every projection
+	// Origin identifies the management plane. It is written on every projection
 	// and is what tells a member's controller that a node was written from
 	// outside — and what lets one plane's sweep ignore another's copies.
 	Origin string
@@ -73,61 +77,66 @@ func For(t *tree.Tree, cluster string, allowances []Allowance, opts Options) ([]
 		// let the member's webhook admit edits to it.
 		return nil, fmt.Errorf("no origin configured, so a projection could not be told from a local node")
 	}
+	byLeaf, err := allowancesByLeaf(t, allowances)
+	if err != nil {
+		return nil, err
+	}
+	nodes := projectedNodes(t, byLeaf)
+	out := make([]*v1beta1.AcceleratorQuota, 0, len(nodes))
+	for _, node := range nodes {
+		rendered, err := render(node, cluster, byLeaf[node.Name()], opts)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rendered)
+	}
+	return out, nil
+}
 
-	byNode := map[string][]Allowance{}
+// allowancesByLeaf groups the allowances by the leaf each resolves. Only a leaf
+// materializes a queue that can hold anything, so an allowance on a grouping
+// tier has nowhere to go.
+func allowancesByLeaf(t *tree.Tree, allowances []Allowance) (map[string][]Allowance, error) {
+	byLeaf := map[string][]Allowance{}
 	for _, a := range allowances {
 		node, ok := t.Node(a.Node)
 		if !ok {
 			return nil, fmt.Errorf("allowance names %s, which is not in the tree", a.Node)
 		}
 		if !node.IsLeaf() {
-			// Only a leaf materializes a queue that can hold anything, so an
-			// allowance on a grouping tier has nowhere to go.
 			return nil, fmt.Errorf("allowance names %s, which is not a leaf", a.Node)
 		}
-		byNode[a.Node] = append(byNode[a.Node], a)
+		byLeaf[a.Node] = append(byLeaf[a.Node], a)
 	}
+	return byLeaf, nil
+}
 
+// projectedNodes is every leaf with an allowance and every tier between it and
+// the root, so parentRef resolves on the member, in the order the copies are
+// applied. The root itself is the member's to create.
+func projectedNodes(t *tree.Tree, byLeaf map[string][]Allowance) []*tree.Node {
 	include := map[string]*tree.Node{}
-	for name := range byNode {
+	for name := range byLeaf {
 		node, _ := t.Node(name)
 		include[name] = node
-		// Every tier between the leaf and the root, so parentRef resolves on the
-		// member. The root itself is the member's to create.
 		for _, ancestor := range node.Ancestors() {
-			if ancestor.Parent == nil {
-				continue
+			if ancestor.Parent != nil {
+				include[ancestor.Name()] = ancestor
 			}
-			include[ancestor.Name()] = ancestor
 		}
 	}
+	nodes := slices.Collect(maps.Values(include))
+	slices.SortFunc(nodes, parentFirst)
+	return nodes
+}
 
-	out := make([]*v1beta1.AcceleratorQuota, 0, len(include))
-	depth := make(map[string]int, len(include))
-	for name, node := range include {
-		rendered, err := render(node, cluster, byNode[name], opts)
-		if err != nil {
-			return nil, err
-		}
-		depth[name] = node.Depth
-		out = append(out, rendered)
-	}
-	// Shallowest first, so a parent is always applied before the children that
-	// name it. The member's webhook rejects a node whose parentRef resolves to
-	// nothing, and the copies are applied one at a time in this order — so an
-	// alphabetical sort denies every leaf that sorts before its own parent, and
-	// a tree converges a tier per pass instead of in one.
-	//
-	// Name breaks ties within a tier, which keeps the order stable: the objects
-	// come from a map, and an order that varied between passes would make a
-	// failure reproduce only sometimes.
-	sort.Slice(out, func(i, j int) bool {
-		if di, dj := depth[out[i].Name], depth[out[j].Name]; di != dj {
-			return di < dj
-		}
-		return out[i].Name < out[j].Name
-	})
-	return out, nil
+// parentFirst orders nodes shallowest first, so a parent is always applied
+// before the children that name it: the member's webhook rejects a node whose
+// parentRef resolves to nothing, and an alphabetical order would deny every
+// leaf that sorts before its own parent and converge a tier per pass. Name
+// breaks ties within a tier, so the order is the same on every pass.
+func parentFirst(a, b *tree.Node) int {
+	return cmp.Or(cmp.Compare(a.Depth, b.Depth), strings.Compare(a.Name(), b.Name()))
 }
 
 // render builds one node's projected copy.
@@ -168,6 +177,7 @@ func render(node *tree.Node, cluster string, given []Allowance, opts Options) (*
 	}
 
 	out.Spec.PriorityTier = src.Spec.PriorityTier
+	out.Spec.Preemption = src.Spec.Preemption.DeepCopy()
 
 	budgets, err := projectBudgets(src, given)
 	if err != nil {
@@ -180,15 +190,14 @@ func render(node *tree.Node, cluster string, given []Allowance, opts Options) (*
 // projectBudgets pairs each resolved share with the source budget it resolves,
 // keeping the pass-through limits and dropping everything that describes a split.
 func projectBudgets(src *v1beta1.AcceleratorQuota, given []Allowance) ([]v1beta1.AcceleratorBudget, error) {
-	sources := map[key]v1beta1.AcceleratorBudget{}
+	sources := map[budgetPair]v1beta1.AcceleratorBudget{}
 	for _, b := range src.Spec.Budgets {
-		sources[key{b.ResourceName, b.ResourceFlavor}] = b
+		sources[budgetPair{resource: b.ResourceName, flavor: b.ResourceFlavor}] = b
 	}
 
 	out := make([]v1beta1.AcceleratorBudget, 0, len(given))
 	for _, a := range given {
-		k := key{a.ResourceName, a.ResourceFlavor}
-		b, ok := sources[k]
+		b, ok := sources[budgetPair{resource: a.ResourceName, flavor: a.ResourceFlavor}]
 		if !ok {
 			return nil, fmt.Errorf("node %s has no budget for %s/%s to resolve",
 				src.Name, a.ResourceName, a.ResourceFlavor)
@@ -216,7 +225,8 @@ func projectBudgets(src *v1beta1.AcceleratorQuota, given []Allowance) ([]v1beta1
 	return out, nil
 }
 
-type key struct{ resource, flavor string }
+// budgetPair identifies one budget line: a resource on a flavor.
+type budgetPair struct{ resource, flavor string }
 
 func copyQuantity(q *resource.Quantity) *resource.Quantity {
 	if q == nil {

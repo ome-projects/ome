@@ -53,39 +53,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return ctrl.Result{}, err
 	}
-	handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, req.NamespacedName)
+	pending, err := r.legacyTrafficMapHandoffPending(ctx, req.NamespacedName)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if handoffPending {
+	if pending {
 		return ctrl.Result{}, nil
 	}
 
-	// Backend not configured: tear down anything already published — it carries no
-	// OwnerReferences, so dropping the finalizer without unpublishing leaks it —
-	// and release the object, deleted or not.
-	if !r.Config.IsEnabled() {
-		if controllerutil.ContainsFinalizer(isvc, EndpointFinalizer) {
-			handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if handoffPending {
-				return ctrl.Result{}, nil
-			}
-			if err := r.Publisher.Unpublish(ctx, isvc); err != nil {
-				return ctrl.Result{}, err
-			}
-			controllerutil.RemoveFinalizer(isvc, EndpointFinalizer)
-			if err := r.Update(ctx, isvc); err != nil {
-				return requeueOnConflict(err)
-			}
-		}
-		return ctrl.Result{}, nil
-	}
-
-	if !isvc.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, isvc)
+	// Backend not configured, or the service deleting: tear down anything
+	// already published, which carries no OwnerReferences and would leak if the
+	// finalizer were dropped without unpublishing, and release the object.
+	if !r.Config.IsEnabled() || !isvc.DeletionTimestamp.IsZero() {
+		return r.releasePublication(ctx, isvc)
 	}
 
 	target, ok, err := r.resolveTarget(isvc, nil)
@@ -97,20 +77,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	if !ok {
-		// Not placed (or no usable host yet): ensure any previously-published
-		// backend is removed, then drop the finalizer so an ISVC that never
-		// publishes is not held.
-		return r.reconcileUnpublish(ctx, isvc)
+		// Not placed, or no usable host yet: a service that does not publish
+		// is not held.
+		return r.releasePublication(ctx, isvc)
 	}
 
 	if err := r.ensureFinalizer(ctx, isvc); err != nil {
 		return requeueOnConflict(err)
 	}
-	handoffPending, err = r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
+	pending, err = r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if handoffPending {
+	if pending {
 		return ctrl.Result{}, nil
 	}
 	if err := r.Publisher.Publish(ctx, isvc, target); err != nil {
@@ -148,7 +127,6 @@ func (r *Reconciler) resolveTarget(isvc *v1beta1.InferenceService, weights map[s
 	}
 	weightsAuthoritative := applyTrafficMapWeights(clusters, weights)
 	return Target{
-		Service:              isvc.Name,
 		GlobalHost:           host,
 		Clusters:             clusters,
 		WeightsAuthoritative: weightsAuthoritative,
@@ -214,8 +192,9 @@ func servingClustersFromPlacement(pl *v1beta1.PlacementStatus) []ServingCluster 
 		c := &pl.Candidates[i]
 		if c.Phase == v1beta1.CandidatePhaseAdmitted && c.Endpoint != nil && c.Endpoint.Host != "" {
 			clusters = append(clusters, ServingCluster{
-				Cluster: c.Cluster, Endpoint: c.Endpoint.String(),
-				BackendHost: hostOnly(c.Endpoint.Host), Weight: c.ReadyReplicas,
+				Cluster:     c.Cluster,
+				BackendHost: hostOnly(c.Endpoint.Host),
+				Weight:      c.ReadyReplicas,
 			})
 		}
 	}
@@ -235,37 +214,20 @@ func hostOnly(h string) string {
 	return h
 }
 
-func (r *Reconciler) reconcileUnpublish(ctx context.Context, isvc *v1beta1.InferenceService) (ctrl.Result, error) {
-	if !controllerutil.ContainsFinalizer(isvc, EndpointFinalizer) {
-		// Never published; nothing to clean and no finalizer to drop.
-		return ctrl.Result{}, nil
-	}
-	handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if handoffPending {
-		return ctrl.Result{}, nil
-	}
-	if err := r.Publisher.Unpublish(ctx, isvc); err != nil {
-		return ctrl.Result{}, err
-	}
-	controllerutil.RemoveFinalizer(isvc, EndpointFinalizer)
-	if err := r.Update(ctx, isvc); err != nil {
-		return requeueOnConflict(err)
-	}
-	return ctrl.Result{}, nil
-}
-
-func (r *Reconciler) reconcileDelete(ctx context.Context, isvc *v1beta1.InferenceService) (ctrl.Result, error) {
+// releasePublication removes what the publisher wrote for a service that is
+// not to be published and drops the finalizer that held the service for it.
+// A service never published has nothing to remove and no finalizer to drop.
+// Pending work of the TrafficMap publisher keeps the service held until that
+// work is done, so the two publishers never undo each other.
+func (r *Reconciler) releasePublication(ctx context.Context, isvc *v1beta1.InferenceService) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(isvc, EndpointFinalizer) {
 		return ctrl.Result{}, nil
 	}
-	handoffPending, err := r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
+	pending, err := r.legacyTrafficMapHandoffPending(ctx, client.ObjectKeyFromObject(isvc))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if handoffPending {
+	if pending {
 		return ctrl.Result{}, nil
 	}
 	if err := r.Publisher.Unpublish(ctx, isvc); err != nil {

@@ -9,7 +9,6 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -144,7 +143,7 @@ func (m *Manager) SetReconnectBackoff(b reconnectBackoff) {
 
 // ReconnectBackoff returns the configured establish/retry backoff, falling back
 // to the package default when none was set. The watch-funnel reconnect path
-// consumes this via EstablishWatch / retryAfter.
+// consumes this via establishWatch / retryAfter.
 func (m *Manager) ReconnectBackoff() reconnectBackoff {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -152,25 +151,6 @@ func (m *Manager) ReconnectBackoff() reconnectBackoff {
 		return defaultReconnectBackoff()
 	}
 	return m.reconnect
-}
-
-// EstablishWatch opens a remote watch on the named cluster's client, bounded by
-// the configured establish timeout for the given (1-based) attempt. On timeout
-// the in-flight Watch is abandoned and errWatchEstablishTimeout is returned so
-// the caller falls back to the retry backoff (retryAfter). Returns (nil, false,
-// nil) when the cluster is not connected. This is the establish half of the
-// two-backoff reconnect scheme; the status-mirroring watch funnel consumes it.
-func (m *Manager) EstablishWatch(ctx context.Context, cluster string, list client.ObjectList, attempt int, opts ...client.ListOption) (watch.Interface, uint64, bool, error) {
-	cl, generation, ok := m.clientForGeneration(cluster)
-	if !ok {
-		return nil, 0, false, nil
-	}
-	timeout := m.ReconnectBackoff().establishWaitTime(attempt)
-	w, err := establishWatch(ctx, cl, list, timeout, opts...)
-	if err != nil {
-		return nil, generation, true, err
-	}
-	return w, generation, true, nil
 }
 
 // ClientFor returns the live client for a cluster, or (nil, false) if none is

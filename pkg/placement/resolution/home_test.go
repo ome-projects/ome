@@ -69,7 +69,7 @@ func TestResolveHome(t *testing.T) {
 				tt.edit(&f, cm)
 			}
 			before := f.service.DeepCopy()
-			_, got, err := (Resolver{Client: fixtureClient(t, f), OperatorNamespace: f.namespace}).ResolveHome(t.Context(), f.service, nil)
+			_, got, err := (Resolver{Client: fixtureClient(t, f), OperatorNamespace: f.namespace}).ResolveAssignedCluster(t.Context(), f.service, nil)
 			if diff := cmp.Diff(tt.wantErr, err != nil); diff != "" {
 				t.Fatalf("error (-want +got): %s: %v", diff, err)
 			}
@@ -93,7 +93,7 @@ func TestHomeConfigurationSnapshot(t *testing.T) {
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: constants.InferenceServiceConfigMapName, Namespace: f.namespace, UID: "config-uid"}, Data: map[string]string{"deploy": `{"defaultDeploymentMode":"RawDeployment","replicas":{"defaultMinReplicas":3}}`}}
 	f.extra = append(f.extra, cm)
 	cl := fixtureClient(t, f)
-	resolved, _, err := (Resolver{Client: cl, OperatorNamespace: f.namespace}).ResolveHome(t.Context(), f.service, nil)
+	resolved, _, err := (Resolver{Client: cl, OperatorNamespace: f.namespace}).ResolveAssignedCluster(t.Context(), f.service, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

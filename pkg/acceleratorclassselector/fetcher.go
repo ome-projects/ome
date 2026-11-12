@@ -23,25 +23,6 @@ func NewDefaultAcceleratorFetcher(client client.Client) AcceleratorFetcher {
 	}
 }
 
-// FetchAcceleratorClasses returns all cluster-scoped accelerator classes.
-func (f *DefaultAcceleratorFetcher) FetchAcceleratorClasses(ctx context.Context) (*AcceleratorCollection, error) {
-	logger := log.FromContext(ctx)
-	logger.V(1).Info("Fetching accelerator classes")
-
-	collection := &AcceleratorCollection{}
-
-	var clusterAcceleratorClasses v1beta1.AcceleratorClassList
-	if err := f.client.List(ctx, &clusterAcceleratorClasses); err != nil {
-		return nil, fmt.Errorf("failed to list cluster-scoped accelerator classes: %w", err)
-	}
-	collection.ClusterAcceleratorClasses = clusterAcceleratorClasses.Items
-
-	logger.V(1).Info("Fetched accelerator classes",
-		"clusterAcceleratorClasses", len(collection.ClusterAcceleratorClasses))
-
-	return collection, nil
-}
-
 // GetAcceleratorClass fetches an accelerator class by name. A missing class is
 // reported via found=false with a nil error so callers can distinguish "does
 // not exist" from transient read failures (throttling, timeouts), which are

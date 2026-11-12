@@ -49,8 +49,17 @@ func ObservedEncoding(status *v1beta1.InferenceReplicaStatus) (Encoding, error) 
 // with the representation they were read from. DenseV1 rows are the stored
 // slice itself and receive no new cardinality check; ColumnarV2 rows are
 // validated and expanded under maxInstances into a fresh slice. On error no
-// rows are returned.
+// rows are returned. The rows share nothing with the payload.
 func DecodeStatus(status *v1beta1.InferenceReplicaStatus, maxInstances uint64) ([]v1beta1.OMENativeInstanceStatus, Encoding, error) {
+	return decodeStatus(status, maxInstances, DecodeColumns)
+}
+
+// columnDecoder expands a ColumnarV2 payload into rows under a bound:
+// DecodeColumns for a payload that stays in use, consumeColumns for one the
+// caller drops once the rows exist.
+type columnDecoder func(*v1beta1.InstanceStatusColumns, uint64) ([]v1beta1.OMENativeInstanceStatus, error)
+
+func decodeStatus(status *v1beta1.InferenceReplicaStatus, maxInstances uint64, decode columnDecoder) ([]v1beta1.OMENativeInstanceStatus, Encoding, error) {
 	encoding, err := ObservedEncoding(status)
 	if err != nil {
 		return nil, "", err
@@ -61,7 +70,7 @@ func DecodeStatus(status *v1beta1.InferenceReplicaStatus, maxInstances uint64) (
 		}
 		return status.InstanceStatuses, EncodingDenseV1, nil
 	}
-	rows, err := DecodeColumns(status.InstanceStatusColumns, maxInstances)
+	rows, err := decode(status.InstanceStatusColumns, maxInstances)
 	if err != nil {
 		return nil, "", err
 	}

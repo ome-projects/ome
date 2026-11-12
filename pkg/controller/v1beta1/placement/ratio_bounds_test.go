@@ -14,8 +14,7 @@ import (
 
 type bounds = map[v1beta1.ComponentType]plannedBound
 
-// weightedTermsOn builds one term per named member with the given weights, in
-// either the integer or the ratio form.
+// weightedTermsOn builds one term per named member with the given weights.
 func weightedTermsOn(weights map[string]v1beta1.ClusterAffinityWeights) []v1beta1.ClusterAffinityTerm {
 	var out []v1beta1.ClusterAffinityTerm
 	for _, name := range sortedKeys(weights) {
@@ -41,7 +40,7 @@ func sortedKeys[V any](m map[string]V) []string {
 func engineRatios(ratios map[string]*v1beta1.ReplicaRatio) []v1beta1.ClusterAffinityTerm {
 	weights := map[string]v1beta1.ClusterAffinityWeights{}
 	for name, r := range ratios {
-		weights[name] = v1beta1.ClusterAffinityWeights{EngineReplicas: r}
+		weights[name] = v1beta1.ClusterAffinityWeights{Engine: r}
 	}
 	return weightedTermsOn(weights)
 }
@@ -250,7 +249,7 @@ func TestRatioBoundsUndividedRouterKeepsPolicy(t *testing.T) {
 		source.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(2), MaxReplicas: 6}}
 		if routerRatios {
 			for i := range source.Spec.Placement.ClusterAffinity {
-				source.Spec.Placement.ClusterAffinity[i].Weights.RouterReplicas = ratio(1)
+				source.Spec.Placement.ClusterAffinity[i].Weights.Router = ratio(1)
 			}
 		}
 		return source
@@ -271,9 +270,9 @@ func TestRatioBoundsUndividedRouterKeepsPolicy(t *testing.T) {
 	}
 }
 
-// TestRatioBoundsIntegerFormUnchanged: integer weights keep the cap from
-// split.maxPerCluster and ignore the source's maxReplicas.
-func TestRatioBoundsIntegerFormUnchanged(t *testing.T) {
+// TestRatioBoundsUnweightedSplitBlockUnchanged: a source without weights keeps
+// the cap from split.maxPerCluster and ignores the source's maxReplicas.
+func TestRatioBoundsUnweightedSplitBlockUnchanged(t *testing.T) {
 	source := ratioSplitSource(60, ptr.To(40))
 	source.Spec.Engine.MaxReplicas = 7
 	source.Spec.Decoder.MaxReplicas = 7

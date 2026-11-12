@@ -50,7 +50,7 @@ import (
 //
 // Execute runs the force-delete sweep, the hold pass, then the op
 // actions in the order executeActions numbers them (scale-down, demotion,
-// restart, migration expiry, migration, update, create), then escalation.
+// migration expiry, restart, migration, update, create), then escalation.
 // Which pass may advance a row is the ownership table's answer, never the
 // order's.
 //
@@ -124,16 +124,18 @@ func Reconcile(ctx context.Context, deps types.Deps, input types.ReconcileInput,
 	return types.NoSoonerThan(res, input.Pacing.Pending()), err
 }
 
-// Execute applies the Decision: the force-delete sweep over every
-// Terminating pod of the Component, the hold pass, then the op-pass action
-// loop, then the end-of-pass bookkeeping (endOfPassBookkeeping). A
-// scale-down status commit is a pass boundary because it invalidates the
-// plan. While an admitted wave is polling, escalation still runs for
-// retained Instances but excludes every scale-down extra; a leaving
-// Instance the wave has not admitted must receive no lifecycle mutation
-// before admission. Other operation requeues keep the escalation
-// running, so a surge or gang past its deadline can fail while its
-// operation keeps polling. Teardown never reaches Execute.
+// Execute applies the Decision: the removal of the pods the observation
+// read as bound to a Node that no longer exists, the force-delete sweep
+// over every Terminating pod of the Component, the hold pass, then the
+// op-pass action loop, then the end-of-pass bookkeeping
+// (endOfPassBookkeeping). A scale-down status commit is a pass boundary
+// because it invalidates the plan. While an admitted wave is polling,
+// escalation still runs for retained Instances but excludes every
+// scale-down extra; a leaving Instance the wave has not admitted must
+// receive no lifecycle mutation before admission. Other operation
+// requeues keep the escalation running, so a surge or gang past its
+// deadline can fail while its operation keeps polling. Teardown never
+// reaches Execute.
 //
 // An errored op pass does NOT suspend that bookkeeping. Both end-of-pass
 // steps are per-Instance and re-derive their own reading from the
@@ -155,6 +157,14 @@ func Execute(ctx context.Context, deps types.Deps, input types.ReconcileInput, p
 	if input.Held == nil {
 		input.Held = &types.HeldInstances{}
 	}
+	// The pods bound to a Node that no longer exists go first: the plan
+	// was decided without them, so their objects must be gone before any
+	// verb reuses a name. A failed removal ends the pass here, and the
+	// backoff supplies another reading.
+	freed, err := freePodsOnMissingNodes(ctx, deps, input, plan, snapshot, snapshot.CachedPods)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	// The force-delete sweep runs ahead of every pass, over every
 	// Terminating pod of the Component: a drained pod no operation waits
 	// on has no verb pass to re-read it, and the node under it raises no
@@ -168,7 +178,38 @@ func Execute(ctx context.Context, deps types.Deps, input types.ReconcileInput, p
 	if sweepErr != nil {
 		err = errors.Join(err, sweepErr)
 	}
-	return wakeForPolicyBoundary(res, input.Now(), sweepAt), err
+	return wakeForPolicyBoundary(requeueAfterFreedPods(res, freed), input.Now(), sweepAt), err
+}
+
+// freePodsOnMissingNodes removes the pods the snapshot's views read as
+// bound to a Node the cluster no longer holds, after taking the named
+// view so a pass that listed nothing yet still reads them. A view that
+// cannot be read frees nothing here; the passes that read it report the
+// failure, and this step never adds a reading of its own. Reports how
+// many pods it removed.
+func freePodsOnMissingNodes(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, snapshot *ObservedSnapshot, view func(context.Context) (map[int32][]*corev1.Pod, error)) (int, error) {
+	if _, err := view(ctx); err != nil {
+		return 0, nil
+	}
+	gone := snapshot.GonePods()
+	if len(gone) == 0 {
+		return 0, nil
+	}
+	if err := workloadops.FreePodsOnMissingNodes(ctx, deps, input, gone); err != nil {
+		return 0, fmt.Errorf("workload.Reconcile: missing-node sweep (component=%s): %w", plan.Component, err)
+	}
+	return len(gone), nil
+}
+
+// requeueAfterFreedPods asks for the controller's backoff when the pass
+// removed pods and had no requeue of its own: the verbs that list the
+// cache themselves may have read the objects still present this pass,
+// and the next pass finds the names free.
+func requeueAfterFreedPods(res ctrl.Result, freed int) ctrl.Result {
+	if freed == 0 || res.Requeue || res.RequeueAfter > 0 { //nolint:staticcheck // the bare backoff has no non-deprecated spelling
+		return res
+	}
+	return types.RequeueNow()
 }
 
 // executeDecision is Execute past the sweep: the hold pass, the action
@@ -332,14 +373,29 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 				return ctrl.Result{}, false, err
 			}
 
-		// 3. Per-Instance restart pass. Constraint: a repair opened or
+		// 3. Migration expiry pass, ahead of the restart pass: a repair in
+		// flight consumes the pass, and a record past its deadline closes
+		// the pass the deadline comes due whatever else the Instance set
+		// is doing. Constraint: the plan is stale when anything expired —
+		// ObservedState and plan carry the pre-expiry record (record
+		// terminal, pair ops cleared) — and the rebuilt plan drops the
+		// surge index the record released so the scale-down action (1)
+		// tears it down.
+		case ActionMigrateExpiry:
+			if expiredCount, err := workloadops.ExpireMigrations(ctx, deps, input, plan); err != nil {
+				return ctrl.Result{}, false, fmt.Errorf("workload.Reconcile: expire migrations: %w", err)
+			} else if expiredCount > 0 {
+				return types.RequeueNow(), false, nil
+			}
+
+		// 4. Per-Instance restart pass. Constraint: a repair opened or
 		// held owns the wake-up — nothing in the cluster changes while a
 		// denial stands, so no watch event is coming — and the pass ends
 		// on it after materializing the surge-free indices itself and
 		// advancing the update attempts already in flight elsewhere.
 		case ActionRestart:
 			createFollows := hasActionKind(decision.Actions[actionIndex+1:], ActionCreate)
-			res, stop, err := executeRestartPass(ctx, deps, input, plan, target, action.Restarts, createFollows)
+			res, stop, err := executeRestartPass(ctx, deps, input, plan, target, snapshot, action.Restarts, createFollows)
 			if err != nil {
 				return res, false, err
 			}
@@ -348,23 +404,14 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 				return res, false, err
 			}
 
-		// 4. Migration expiry pass. Constraint: the plan is stale when
-		// anything expired — ObservedState and plan carry the pre-expiry
-		// record (record terminal, pair ops cleared) — and the rebuilt plan
-		// drops the surge index the record released so the scale-down
-		// action (1) tears it down.
-		case ActionMigrateExpiry:
-			if expiredCount, err := workloadops.ExpireMigrations(ctx, deps, input, plan); err != nil {
-				return ctrl.Result{}, false, fmt.Errorf("workload.Reconcile: expire migrations: %w", err)
-			} else if expiredCount > 0 {
-				return types.RequeueNow(), false, nil
-			}
-
-		// 5. Per-Component migration pass: the records parked on their
+		// 5. Per-Component migration pass: the records waiting on their
 		// source teardown, tended in order, then the one head record.
-		// Constraint: a migration in flight paces the pass and a completed
-		// one leaves the plan stale, so both end it; a fresh-record defer
-		// falls through so the in-flight op it waits on converges.
+		// Constraint: a migration making progress paces the pass and a
+		// completed one leaves the plan stale, so both end it; a
+		// fresh-record defer falls through so the in-flight op it waits on
+		// converges, and a record waiting on its kubelet falls through with
+		// its cadence in PassWake, so one Instance's lost kubelet holds no
+		// other Instance's push or create.
 		case ActionMigrate:
 			res, stop, err := executeMigratePass(ctx, deps, input, plan, target, *action.Migration)
 			if err != nil {
@@ -384,11 +431,12 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 				return res, false, err
 			}
 			if stop {
-				// Surge-free indices — brand-new ones, and rows demoted for
-				// losing every pod — bypass the skip-Create gate:
-				// no Update this pass could have moved their ordinal or their
-				// running revision, so the stale-observation hazard does not
-				// apply — see ops.CreateFreshIndices. Materialize them now so a
+				// Surge-free indices — brand-new ones, rows demoted for
+				// losing every pod, and Failed rows the roll's partition
+				// holds — bypass the skip-Create gate: no Update this pass
+				// could have moved their ordinal or their running revision,
+				// so the stale-observation hazard does not apply — see
+				// ops.CreateFreshIndices. Materialize them now so a
 				// concurrent scale-up isn't starved behind the in-flight
 				// rollout, and so a row that lost its pods is rebuilt whether
 				// or not a start is admitted around it: a podless row on the
@@ -396,7 +444,7 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 				// nothing but its rebuild releases it. The full Create pass
 				// still owns surge-sensitive (touched) indices once the
 				// rollout drains.
-				if _, err := createPass(ctx, deps, input, plan, target, createScopeFresh); err != nil {
+				if _, err := createPass(ctx, deps, input, plan, target, createScopeFresh, indicesOpenedThisPass(input, action.Update)); err != nil {
 					return ctrl.Result{}, false, err
 				}
 				return res, false, nil
@@ -409,7 +457,7 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 		// have held.
 		case ActionCreate:
 			reportIdleUpdate(input, decision)
-			res, err := createPass(ctx, deps, input, plan, target, createScopeFull)
+			res, err := createPass(ctx, deps, input, plan, target, createScopeFull, nil)
 			if err != nil {
 				return res, false, err
 			}
@@ -417,8 +465,8 @@ func executeActions(ctx context.Context, deps types.Deps, input types.ReconcileI
 		}
 	}
 
-	// Only a paused Decision with no committed create ends without a
-	// Create action: scale-down (if any) has run, nothing else may.
+	// Every Decision ends with the Create action, so the loop returns from
+	// inside; a Decision without one has run what it planned.
 	return ctrl.Result{}, false, nil
 }
 
@@ -555,16 +603,58 @@ const (
 	createScopeFresh
 )
 
+// freshStartsOf lists the Instances the update selection opens a fresh
+// start on this pass. The Create pass at the fresh scope leaves them to
+// that start, admitted or held: the pass's observation still shows the
+// row the start replaces, a Failed row with no operation on the target
+// reads surge-free, and the start's drain empties the index at once when
+// its pods had no placement. A start the budget held leaves pods the
+// Create pass could only wait on, so leaving it out costs nothing.
+func freshStartsOf(selection *UpdateSelection) map[int32]struct{} {
+	var opened map[int32]struct{}
+	for _, item := range selection.Items {
+		if !item.StartingFresh {
+			continue
+		}
+		if opened == nil {
+			opened = map[int32]struct{}{}
+		}
+		opened[item.Instance.Index] = struct{}{}
+	}
+	return opened
+}
+
+// indicesOpenedThisPass lists the Instances the update pass opened this
+// pass, which the fresh scope leaves alone: the fresh starts of its
+// selection, and the replacement indexes its gang surges claimed, which
+// the plan was computed without. A fresh Instance the plan placed on a
+// claimed index is built on the next pass, at the index that pass's plan
+// finds free.
+func indicesOpenedThisPass(input types.ReconcileInput, selection *UpdateSelection) map[int32]struct{} {
+	opened := freshStartsOf(selection)
+	for idx := range input.SurgeIndexAllocator().Claimed() {
+		if opened == nil {
+			opened = map[int32]struct{}{}
+		}
+		opened[idx] = struct{}{}
+	}
+	return opened
+}
+
 // createPass runs the Create pass at the requested scope. A paused
 // Component narrows either scope to the indices whose create is already
 // committed: the pause finishes a materialization under way and begins
-// none, whichever caller reaches the pass.
-func createPass(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, scope createScope) (ctrl.Result, error) {
+// none, whichever caller reaches the pass. The sweep that frees a lost
+// node's names runs for every planned Instance at every scope, the paused
+// one included. opened lists the Instances the update pass opened this
+// pass, a fresh start or a surge's replacement index, which the fresh
+// scope leaves to that start.
+func createPass(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, target *appsv1.ControllerRevision, scope createScope, opened map[int32]struct{}) (ctrl.Result, error) {
 	switch {
 	case plan.Paused:
 		return workloadops.CreateCommittedIndices(ctx, deps, input, plan, target)
 	case scope == createScopeFresh:
-		return workloadops.CreateFreshIndices(ctx, deps, input, plan, target)
+		return workloadops.CreateFreshIndicesOutside(ctx, deps, input, plan, target, opened)
 	default:
 		return workloadops.Create(ctx, deps, input, plan, target)
 	}
@@ -604,13 +694,20 @@ func scaleDownResult(input types.ReconcileInput, outcome workloadops.DeleteBatch
 func reconcileTeardown(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan) (ctrl.Result, error) {
 	extras := TeardownExtras(input.ObservedState.InstanceStatuses)
 	snapshot := NewObservedSnapshot(deps, input, plan.Component, input.ObservedState.InstanceStatuses)
+	// The wave reads the live view without the pods on a Node that no
+	// longer exists; their objects are removed here so the teardown's own
+	// completion check, which lists every pod, does not wait on them.
+	freed, err := freePodsOnMissingNodes(ctx, deps, input, plan, snapshot, snapshot.LivePods)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	outcome, err := deleteExtraInstances(ctx, deps, input, plan, snapshot, extras)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	res, _, _ := scaleDownResult(input, outcome)
 	sweepAt, sweepErr := sweepStuckTerminatingPods(ctx, deps, input, plan, snapshot.LivePods)
-	return wakeForPolicyBoundary(res, input.Now(), sweepAt), sweepErr
+	return wakeForPolicyBoundary(requeueAfterFreedPods(res, freed), input.Now(), sweepAt), sweepErr
 }
 
 func scaleDownPollResult(input types.ReconcileInput, policyRequeueAfter time.Duration, policyDeadlineDue bool) ctrl.Result {

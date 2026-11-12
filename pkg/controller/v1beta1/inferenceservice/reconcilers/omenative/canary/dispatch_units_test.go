@@ -66,7 +66,7 @@ func (r *unitRun) openRun(targets ...v1beta1.RolloutRunTarget) {
 	pinActiveRun(r.isvc)
 	r.isvc.Status.Rollout.ActiveRun.TargetRevisions = targets
 	for _, g := range rollout.CanaryGroups(r.isvc, rollout.Policies{}) {
-		if err := BindRun(r.ctx, r.c, r.isvc, g, false); err != nil {
+		if err := BindRun(r.ctx, r.c, r.isvc, g, RunOpen{}); err != nil {
 			r.t.Fatal(err)
 		}
 	}
@@ -279,5 +279,56 @@ func TestDispatch_IdleUnitLeavesTheRequestForTheLiveUnit(t *testing.T) {
 				t.Fatalf("the router's request rolled the engine back on its first pass: %+v phase=%q", cs, r.phase(engine))
 			}
 		})
+	}
+}
+
+// A push to one unit closes the run and a fresh run opens over the
+// whole service. The other unit is recorded at the target it already holds,
+// so the bind keeps its record, its step and its split; only the pushed unit
+// starts over.
+func TestBindRunKeepsAUnitRecordedAtTheTargetItHolds(t *testing.T) {
+	router, engine := v1beta1.RouterComponent, v1beta1.EngineComponent
+	isvc := twoUnitService("default", "two-units", unitGroup(router), unitGroup(engine))
+	r := newTwoUnitRun(t, isvc)
+	r.setUpdateRevision(engine, "newrev")
+	if err := r.c.Create(r.ctx, canaryControllerRevision(isvc.Namespace, isvc.Name, "engine", "newrev", 2)); err != nil {
+		t.Fatal(err)
+	}
+	r.openRun(
+		v1beta1.RolloutRunTarget{Component: router, Revision: "rnew", StableRevision: "rold"},
+		v1beta1.RolloutRunTarget{Component: engine, Revision: "newrev", StableRevision: "oldrev"},
+	)
+	r.pass("start")
+	r.addPods(engine, "newrev", "newrev-2", "newrev-3")
+	r.pass("the engine's first step serves")
+	if r.phase(engine) != v1beta1.RolloutPhasePaused {
+		t.Fatalf("the engine must serve its first step, got phase %q", r.phase(engine))
+	}
+	annotateStored(t, r.c, isvc, constants.RolloutPromoteAnnotation, "newrev")
+	r.pass("the engine is promoted to its final step")
+	before := r.status(engine).DeepCopy()
+	if before.CurrentStep != 1 || before.PromotedThrough != "newrev" {
+		t.Fatalf("the engine must stand at its final step with the promote recorded, got %+v", before)
+	}
+
+	// The router is pushed again: the run layer closes the run and opens
+	// a fresh one with the engine's targets unchanged.
+	r.setUpdateRevision(router, "rnewer")
+	if err := r.c.Create(r.ctx, canaryControllerRevision(isvc.Namespace, isvc.Name, "router", "rnewer", 3)); err != nil {
+		t.Fatal(err)
+	}
+	r.openRun(
+		v1beta1.RolloutRunTarget{Component: router, Revision: "rnewer", StableRevision: "rold"},
+		v1beta1.RolloutRunTarget{Component: engine, Revision: "newrev", StableRevision: "oldrev"},
+	)
+	after := r.status(engine)
+	if after.CurrentStep != before.CurrentStep || after.TargetID != before.TargetID || after.PromotedThrough != before.PromotedThrough || !after.StepEnteredTime.Equal(before.StepEnteredTime) {
+		t.Fatalf("the router's push must leave the engine's record where it stands: before %+v, after %+v", before, after)
+	}
+	if r.phase(engine) != v1beta1.RolloutPhasePending {
+		t.Fatalf("the engine keeps its final step's phase, got %q", r.phase(engine))
+	}
+	if cs := r.status(router); cs.CanaryRevisionHash != "rnewer" || cs.CurrentStep != 0 {
+		t.Fatalf("the router unit must start over toward rnewer: %+v", cs)
 	}
 }

@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
-// The fixtures, events and readers of the grid rows about a stop on the
+// The fixtures, events and readers of the cases about a stop on the
 // reference prefill/decode shape: 24 engines beside 8 decoders under a
 // 10/30/60/100 canary. A unit that stops Failed holds the roll where it
 // stands: the partition projected for each member is its whole count, so no
@@ -26,11 +26,12 @@ import (
 func init() {
 	for id, reader := range map[string]func(t *testing.T, isvc *v1beta1.InferenceService){
 		"canary/Staging[final,pd24]/readyTimeout": stopHoldsTheRollUnderTheHeldSplit,
-		"canary/Draining[A,pd24]/sample[stalled]": stopHoldsTheRollUnderTheCutoverSplit,
+		"canary/Draining[A,pd24]/sample[stalled]": stopReturnsTheSplitToStableBothMembers,
 		"canary/Failed[pd24]/resync":              stopHoldsTheRollUnderTheHeldSplit,
 		"canary/Failed[pd24]/stableGone":          stopHoldsTheRollUnderTheHeldSplit,
+		"canary/Failed[pd24]/stableGone[last]":    stopHoldsTheRollWithTheUnitOnTheCanaryRevision,
 		"canary/Failed[pd24]/replicasUp":          stopHoldsTheScaledEngineWhole,
-		"canary/Failed[pd24]/resume":              resumeProjectsStepZero,
+		"canary/Failed[pd24]/resume":              resumeContinuesAtTheFinalStep,
 		"canary/Failed[pd24]/rollback":            rollbackReleasesThePartition,
 	} {
 		cellAlso[id] = reader
@@ -129,6 +130,13 @@ func evEngineStablePodGonePD24(_ *v1beta1.InferenceService, in *ReconcileInputs)
 	decoderOfEightServes(in, 6, 2, false)
 }
 
+// evEngineStablePodsGonePD24: all six of the engine's stable pods leave
+// rotation while the unit is stopped and the decoder keeps its two.
+func evEngineStablePodsGonePD24(_ *v1beta1.InferenceService, in *ReconcileInputs) {
+	in.PerRevisionPods = map[string]int32{"new": 18}
+	decoderOfEightServes(in, 6, 2, false)
+}
+
 // evEngineReplicasUpPD24: the engine is scaled from 24 to 26 while the unit
 // is stopped.
 func evEngineReplicasUpPD24(_ *v1beta1.InferenceService, in *ReconcileInputs) {
@@ -160,14 +168,7 @@ func rollHeldWhole(t *testing.T, isvc *v1beta1.InferenceService) {
 // both members: 60 to the canary revision, 40 to the stable one.
 func splitStandsAtSixtyBothMembers(t *testing.T, isvc *v1beta1.InferenceService) {
 	t.Helper()
-	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{
-		"new": {percent: 60, protocol: pdCanaryProtocol, latest: true},
-		"old": {percent: 40, protocol: pdStableProtocol},
-	})
-	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{
-		"decnew": {percent: 60, protocol: pdCanaryProtocol, latest: true},
-		"decold": {percent: 40, protocol: pdStableProtocol},
-	})
+	splitOnBothMembers(60)(t, isvc)
 }
 
 // splitAllOnCanaryBothMembers reads the cutover's split standing on both
@@ -183,9 +184,21 @@ func stopHoldsTheRollUnderTheHeldSplit(t *testing.T, isvc *v1beta1.InferenceServ
 	splitStandsAtSixtyBothMembers(t, isvc)
 }
 
-func stopHoldsTheRollUnderTheCutoverSplit(t *testing.T, isvc *v1beta1.InferenceService) {
+// stopHoldsTheRollWithTheUnitOnTheCanaryRevision reads the stop holding
+// the roll whole while both members' traffic rests on the canary revision:
+// the unit has one stable side, so the engine's stable pods all lost move
+// the decoder's share with the engine's.
+func stopHoldsTheRollWithTheUnitOnTheCanaryRevision(t *testing.T, isvc *v1beta1.InferenceService) {
 	rollHeldWhole(t, isvc)
-	splitAllOnCanaryBothMembers(t, isvc)
+	unitAllOnCanary(t, isvc)
+}
+
+// stopReturnsTheSplitToStableBothMembers reads a stop from the drain: the
+// cutover's split is handed back to the one stable Instance each member
+// kept, so the stable revision carries everything again.
+func stopReturnsTheSplitToStableBothMembers(t *testing.T, isvc *v1beta1.InferenceService) {
+	rollHeldWhole(t, isvc)
+	splitRestsOnStable(t, isvc)
 }
 
 // stopHoldsTheScaledEngineWhole reads the hold re-sized to the new count: the
@@ -197,12 +210,15 @@ func stopHoldsTheScaledEngineWhole(t *testing.T, isvc *v1beta1.InferenceService)
 	splitStandsAtSixtyBothMembers(t, isvc)
 }
 
-// resumeProjectsStepZero reads the hold ended by a resume: the record starts
-// again at step 0, whose partition stages 3 engines and 1 decoder.
-func resumeProjectsStepZero(t *testing.T, isvc *v1beta1.InferenceService) {
+// resumeContinuesAtTheFinalStep reads the hold ended by a resume: the record
+// continues at the final step, the step the stop interrupted, whose
+// partition releases every Instance but the one held per member, and the
+// split stands as the stop left it until the step writes its own.
+func resumeContinuesAtTheFinalStep(t *testing.T, isvc *v1beta1.InferenceService) {
 	t.Helper()
-	expectProjectedPartition(t, isvc, v1beta1.EngineComponent, pd24Engines, 21)
-	expectProjectedPartition(t, isvc, v1beta1.DecoderComponent, pd24Decoders, 7)
+	expectProjectedPartition(t, isvc, v1beta1.EngineComponent, pd24Engines, 1)
+	expectProjectedPartition(t, isvc, v1beta1.DecoderComponent, pd24Decoders, 1)
+	splitStandsAtSixtyBothMembers(t, isvc)
 }
 
 // rollbackReleasesThePartition reads the hold ended by a rollback: the revert

@@ -1,0 +1,40 @@
+{
+  "recordedOn": {
+    "date": "2026-11-10",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "Re-recorded: the coordination pass reads each Component's pods as the cache's own objects (query.ListCachedOMENativePodsByName), so the cache copies no pod for it. pods-copied 4,000 to 0 at engine/4000x1, 1,280 to 0 at 160x8, 1,000 to 0 at 1000x1, 24 and 44 to 0 on the prefill/decode shapes; the allocations fall by the copies' share (44,716 to 718 at 4000x1) and the bytes by the copied fields (15.7 to 9.5 MB; the list's own array of pods stays). The pods come from the cache stand-in through the OMENative pod index; the replica and the endpoints behind the split are read live from memory, so the apiserver's decode is not in the count.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "engine/1000x1/allocations": 560,
+    "engine/1000x1/bytes": 2388424,
+    "engine/1000x1/cache-reads": 7,
+    "engine/1000x1/live-reads": 2,
+    "engine/1000x1/pods-copied": 0,
+    "engine/1000x1/pods-listed": 1000,
+    "engine/160x8/allocations": 511,
+    "engine/160x8/bytes": 1691208,
+    "engine/160x8/cache-reads": 7,
+    "engine/160x8/live-reads": 2,
+    "engine/160x8/pods-copied": 0,
+    "engine/160x8/pods-listed": 1280,
+    "engine/4000x1/allocations": 718,
+    "engine/4000x1/bytes": 9542792,
+    "engine/4000x1/cache-reads": 7,
+    "engine/4000x1/live-reads": 2,
+    "engine/4000x1/pods-copied": 0,
+    "engine/4000x1/pods-listed": 4000,
+    "prefill-decode/12:8/allocations": 1486,
+    "prefill-decode/12:8/bytes": 174552,
+    "prefill-decode/12:8/cache-reads": 25,
+    "prefill-decode/12:8/live-reads": 6,
+    "prefill-decode/12:8/pods-copied": 0,
+    "prefill-decode/12:8/pods-listed": 24,
+    "prefill-decode/30:10/allocations": 1548,
+    "prefill-decode/30:10/bytes": 242552,
+    "prefill-decode/30:10/cache-reads": 25,
+    "prefill-decode/30:10/live-reads": 6,
+    "prefill-decode/30:10/pods-copied": 0,
+    "prefill-decode/30:10/pods-listed": 44
+  }
+}

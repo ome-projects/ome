@@ -14,14 +14,14 @@ import (
 // The drain-time pairing gate keeps a surging Instance's old pod in
 // rotation for one of three reasons: its replacement cannot pair because
 // no pod of the other side serves the new cohort yet while the old pod
-// does, the drain would push the other side below its pairable floor, or
+// does, the drain would push the other side below its pairable minimum, or
 // the pod is the last keeping any pair alive. Whatever the reason, only
 // the other side's own moves release it, so the start-time gate must read
-// a peer whose only open attempts are such hand-overs as held still; a
+// a peer whose only open attempts are such kept replacements as unable to move on its own; a
 // batch step that waits on an Instance the pairing gate is itself keeping
 // waits for ever. Three pictures of the first reason (the other side
 // surging, rebuilding its Instances, and down to the one partner the old
-// pod is) and one of the floor: the drain gate's hold is confirmed first,
+// pod is) and one of the pairable minimum: the drain gate's hold is confirmed first,
 // then the pairing verdict's reading of the peer from the other side's
 // start. TestCheckPairing_ReadsAPeerHeldStillWhoseOnlyStartItHolds is the
 // same reading for a peer that has not started.
@@ -66,7 +66,7 @@ func TestCheckPairing_ReadsAPeerHeldStillWhateverKeepsItsHandOver(t *testing.T) 
 			reason: `the replacement decoder cannot pair because no serving engine runs cohort "pair-v2" yet`,
 		},
 		{
-			name: "the other side's floor: 6 prefill beside 2 decode, the last old decode is the last partner of the old prefill",
+			name: "the other side's pairable minimum: 6 prefill beside 2 decode, the last old decode is the last partner of the old prefill",
 			replicas: []client.Object{
 				rolledPairingIR(eng, surge, 6, 1, revisionsOf(4, 6)...),
 				withHandOver(dec, rolledPairingIR(dec, surge, 2, 1, "target", "v1"), 1),
@@ -109,20 +109,20 @@ func TestCheckPairing_ReadsAPeerHeldStillWhateverKeepsItsHandOver(t *testing.T) 
 				t.Fatalf("the picture is wrong: the pairing gate must admit the %s's start: %s", tc.acting, v.reason)
 			}
 			if !v.peerHeldStill {
-				t.Fatalf("the %s's only open attempt is a hand-over the drain gate keeps (%s); the pairing gate must read it as held still, or the batch step waits on an Instance the pairing gate is itself keeping", tc.kept, tc.reason)
+				t.Fatalf("the %s's only open attempt is a replacement the drain gate keeps (%s); the pairing gate must read it as unable to move on its own, or the batch step waits on an Instance the pairing gate is itself keeping", tc.kept, tc.reason)
 			}
 		})
 	}
 }
 
-// A surging side of one Instance has no hand-over to keep yet: its only
+// A surging side of one Instance has no replacement to keep yet: its only
 // start is held by the start-time gate, because the picture after its
-// hand-over (its one Instance on the new cohort) leaves no pair until the
+// replacement (its one Instance on the new cohort) leaves no pair until the
 // other side serves the new cohort. That side moves only once the other
 // side has, like a drain-first side whose every start is held, so the
-// pairing verdict reads it as held still and the batch step does not wait
+// pairing gate reads it as unable to move on its own and the batch step does not wait
 // on its batch. With 2 prefill beside 1 decode, both surging, the decode's
-// start is held and the prefill's start reads the decode as held still.
+// start is held and the prefill's start reads the decode as unable to move on its own.
 func TestCheckPairing_ReadsAPeerHeldStillWhoseOnlyStartItHolds(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	surge := v1beta1.UpdateStrategySurgeThenDrain
@@ -140,7 +140,7 @@ func TestCheckPairing_ReadsAPeerHeldStillWhoseOnlyStartItHolds(t *testing.T) {
 		t.Fatalf("the picture is wrong: the pairing gate must admit the prefill's start: %s", v.reason)
 	}
 	if !v.peerHeldStill {
-		t.Fatalf("the decode has no attempt open and its only start is held until a prefill serves pair-v2; the pairing gate must read it as held still, or the batch step waits on a batch the pairing gate itself keeps from opening")
+		t.Fatalf("the decode has no attempt open and its only start is held until a prefill serves pair-v2; the pairing gate must read it as unable to move on its own, or the batch step waits on a batch the pairing gate itself keeps from opening")
 	}
 }
 
@@ -194,7 +194,7 @@ func gangPodSet(comp v1beta1.ComponentType, index int, proto string, ready bool,
 	return out
 }
 
-// gangPodNames are the pods of one gang Instance, the ones a hand-over
+// gangPodNames are the pods of one gang Instance, the ones a kept replacement
 // takes out of rotation.
 func gangPodNames(comp v1beta1.ComponentType, index int, pods int32) []string {
 	names := []string{fmt.Sprintf("llama-%s-%d-%s-0", comp, index, workloadtypes.RunnerLeader)}
@@ -210,7 +210,7 @@ func gangPodNames(comp v1beta1.ComponentType, index int, pods int32) []string {
 // the drain gate is asked with every pod of the source gang. The gate
 // keeps the old gang for the same three reasons it keeps a single old pod,
 // and the pairing verdict must read a peer whose only open attempt is such
-// a kept gang hand-over as held still, the slot's row included, whatever
+// a kept gang replacement as unable to move on its own, the slot's row included, whatever
 // the reason. One picture per reason reached with gangs (the first reason
 // twice, with the other side surging and with its old gang the only
 // partner), and one with single-pod prefill beside decode gangs.
@@ -247,7 +247,7 @@ func TestCheckPairing_ReadsAGangPeerHeldStillWhateverKeepsItsHandOver(t *testing
 			reason: `the replacement decoder cannot pair because no serving engine runs cohort "pair-v2" yet`,
 		},
 		{
-			name: "the other side's floor: 6 prefill beside 2 decode, gangs of 4, the last old decode gang is the last partner of the old prefill",
+			name: "the other side's pairable minimum: 6 prefill beside 2 decode, gangs of 4, the last old decode gang is the last partner of the old prefill",
 			replicas: []client.Object{
 				gangIR(eng, surge, 4, 6, 1, revisionsOf(4, 6)...),
 				withGangHandOver(gangIR(dec, surge, 4, 2, 1, "target", "v1"), dec, 1, 2, 4),
@@ -314,7 +314,7 @@ func TestCheckPairing_ReadsAGangPeerHeldStillWhateverKeepsItsHandOver(t *testing
 				t.Fatalf("the picture is wrong: the pairing gate must admit the %s's start: %s", tc.acting, v.reason)
 			}
 			if !v.peerHeldStill {
-				t.Fatalf("the %s's only open attempt is a gang hand-over the drain gate keeps (%s); the pairing gate must read it as held still, or the batch step waits on an Instance the pairing gate is itself keeping", tc.kept, tc.reason)
+				t.Fatalf("the %s's only open attempt is a gang replacement the drain gate keeps (%s); the pairing gate must read it as unable to move on its own, or the batch step waits on an Instance the pairing gate is itself keeping", tc.kept, tc.reason)
 			}
 		})
 	}

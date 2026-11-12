@@ -23,42 +23,71 @@ func ApplyRuntimeClass(ctx context.Context, reader client.Reader, pod *corev1.Po
 		}
 		return nil, nil
 	}
-	if *pod.RuntimeClassName == "" {
+	class, err := liveRuntimeClass(ctx, reader, *pod.RuntimeClassName)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyOverhead(pod, class); err != nil {
+		return nil, err
+	}
+	if err := applyScheduling(pod, class); err != nil {
+		return nil, err
+	}
+	return class, nil
+}
+
+// liveRuntimeClass reads the named RuntimeClass through the direct reader
+// and requires a live object with an identity and a version.
+func liveRuntimeClass(ctx context.Context, reader client.Reader, name string) (*nodev1.RuntimeClass, error) {
+	if name == "" {
 		return nil, fmt.Errorf("RuntimeClass name is empty")
 	}
 	if reader == nil {
 		return nil, fmt.Errorf("runtime class application requires a direct reader")
 	}
 	class := &nodev1.RuntimeClass{}
-	if err := reader.Get(ctx, client.ObjectKey{Name: *pod.RuntimeClassName}, class); err != nil {
+	if err := reader.Get(ctx, client.ObjectKey{Name: name}, class); err != nil {
 		return nil, err
 	}
 	if class.UID == "" || class.ResourceVersion == "" || !class.DeletionTimestamp.IsZero() {
 		return nil, fmt.Errorf("RuntimeClass %q has no verified live identity", class.Name)
 	}
+	return class, nil
+}
+
+// applyOverhead sets the class's pod overhead on the pod. An overhead the
+// author wrote must already equal the class's.
+func applyOverhead(pod *corev1.PodSpec, class *nodev1.RuntimeClass) error {
 	var overhead corev1.ResourceList
 	if class.Overhead != nil {
 		overhead = class.Overhead.PodFixed
 	}
 	if len(pod.Overhead) != 0 && !apiequality.Semantic.DeepEqual(pod.Overhead, overhead) {
-		return nil, fmt.Errorf("pod overhead differs from RuntimeClass %q", class.Name)
+		return fmt.Errorf("pod overhead differs from RuntimeClass %q", class.Name)
 	}
 	pod.Overhead = overhead.DeepCopy()
-	if class.Scheduling != nil {
-		for key, value := range class.Scheduling.NodeSelector {
-			if existing, ok := pod.NodeSelector[key]; ok && existing != value {
-				return nil, fmt.Errorf("pod node selector conflicts with RuntimeClass %q", class.Name)
-			}
-			if pod.NodeSelector == nil {
-				pod.NodeSelector = map[string]string{}
-			}
-			pod.NodeSelector[key] = value
+	return nil
+}
+
+// applyScheduling adds the class's node selector and tolerations to the
+// pod. A node-selector value the author wrote must agree with the class's.
+func applyScheduling(pod *corev1.PodSpec, class *nodev1.RuntimeClass) error {
+	if class.Scheduling == nil {
+		return nil
+	}
+	for key, value := range class.Scheduling.NodeSelector {
+		if existing, ok := pod.NodeSelector[key]; ok && existing != value {
+			return fmt.Errorf("pod node selector conflicts with RuntimeClass %q", class.Name)
 		}
-		for _, toleration := range class.Scheduling.Tolerations {
-			if !slices.ContainsFunc(pod.Tolerations, func(existing corev1.Toleration) bool { return apiequality.Semantic.DeepEqual(existing, toleration) }) {
-				pod.Tolerations = append(pod.Tolerations, *toleration.DeepCopy())
-			}
+		if pod.NodeSelector == nil {
+			pod.NodeSelector = map[string]string{}
+		}
+		pod.NodeSelector[key] = value
+	}
+	for _, toleration := range class.Scheduling.Tolerations {
+		if !slices.ContainsFunc(pod.Tolerations, func(existing corev1.Toleration) bool { return apiequality.Semantic.DeepEqual(existing, toleration) }) {
+			pod.Tolerations = append(pod.Tolerations, *toleration.DeepCopy())
 		}
 	}
-	return class, nil
+	return nil
 }

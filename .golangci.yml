@@ -77,3 +77,20 @@ issues:
       linters:
         - staticcheck
       text: "SA1019: .*client\\.Apply is deprecated"
+
+# Size and nesting limits. These four linters stay out of the default run:
+# `make lint-new-code` (the first step of `make ci-lint`) runs them alone over
+# the lines new since the merge base with the base branch, so a change meets
+# the limits in the code it adds without first rewriting the functions it did
+# not touch.
+linters-settings:
+  funlen:
+    lines: 80
+    statements: -1
+    ignore-comments: true
+  nestif:
+    min-complexity: 4
+  gocognit:
+    min-complexity: 30
+  dupl:
+    threshold: 100

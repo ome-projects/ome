@@ -78,8 +78,9 @@ func TestReconcile_SecondaryRollbackWaitsForItsServingStableCapacity(t *testing.
 }
 
 // The dispatcher-level rollback onto a stable revision with no serving pod:
-// the split stays programmed, and the replica is still signaled to revert,
-// since the revert is what brings stable capacity back.
+// the traffic rests on the rejected pods, the only ones that serve, and the
+// replica is still signaled to revert, since the revert is what brings
+// stable capacity back.
 func TestDispatch_RollbackKeepsTrafficOffAnEmptyStableRevision(t *testing.T) {
 	ns := "default"
 	n4 := 4
@@ -129,9 +130,9 @@ func TestDispatch_RollbackKeepsTrafficOffAnEmptyStableRevision(t *testing.T) {
 	if got := isvc.Status.Components[v1beta1.EngineComponent].RolloutPhase; got != v1beta1.RolloutPhaseRollingBack {
 		t.Fatalf("the rejected pods still serve, got phase %q", got)
 	}
-	if tr := isvc.Status.Components[v1beta1.EngineComponent].Traffic; len(tr) != 2 {
-		t.Fatalf("traffic must not move onto a stable revision with no serving pod, got %+v", tr)
-	}
+	// Traffic must not move onto a stable revision with no serving pod; it
+	// rests on the pods that serve.
+	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"new": {percent: 100, latest: true}})
 	got := &v1beta1.InferenceReplica{}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: engineIR.Name}, got); err != nil {
 		t.Fatal(err)

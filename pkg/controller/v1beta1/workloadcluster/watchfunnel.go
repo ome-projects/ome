@@ -236,7 +236,7 @@ func (f *StatusFunnel) watchCluster(ctx context.Context, cluster string) {
 	}
 }
 
-// watchListOpts builds the list options for EstablishWatch: scope the stream to
+// watchListOpts builds the list options for establishWatch: scope the stream to
 // this control plane's derived objects via the origin selector when supplied.
 func (f *StatusFunnel) watchListOpts() []client.ListOption {
 	if f.cfg.WatchSelector == nil {

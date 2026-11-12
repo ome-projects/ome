@@ -67,21 +67,21 @@ func liftGate(t *testing.T, tc *testContext, ns, name string) {
 	}
 }
 
-// TestGangParkedOnReservedDomainRetriesWhenReservationDrains: a forming gang
+// TestGangHeldOnReservedDomainRetriesWhenReservationDrains: a forming gang
 // exclusively holds its domain until its last member is assumed. A second gang
 // planned in that window finds room in the snapshot but no domain it may use,
-// and parks with "no domain has room". The holder's completion is plugin-internal
-// state: it produces no pod or node event the parked gang's requeue hints could
-// see, so the plugin must wake the parked members itself when the reservation
+// and is held with "no domain has room". The holder's completion is plugin-internal
+// state: it produces no pod or node event the held gang's requeue hints could
+// see, so the plugin must wake the held members itself when the reservation
 // drains. The tight bind window is the assertion: without that wake-up the
 // second gang sits in the unschedulable pool until the scheduler's periodic
 // flush, minutes later.
 //
 // The holder's formation window is held open by a scheduling gate on its
 // worker: the leader takes the domain and waits at Permit, the second gang is
-// created and parks, then the gate is lifted and the worker's Reserve drains
+// created and held, then the gate is lifted and the worker's Reserve drains
 // the reservation.
-func TestGangParkedOnReservedDomainRetriesWhenReservationDrains(t *testing.T) {
+func TestGangHeldOnReservedDomainRetriesWhenReservationDrains(t *testing.T) {
 	tc := startScheduler(t, globalKubeConfig, gangPackOptions(t)...)
 	defer tc.teardown(t)
 
@@ -98,7 +98,7 @@ func TestGangParkedOnReservedDomainRetriesWhenReservationDrains(t *testing.T) {
 	// Generous permit timeout: convergence must come from the wake-up, never
 	// from the holder timing out and unwinding.
 	longTimeout := int32(120)
-	for _, name := range []string{"holder", "parked"} {
+	for _, name := range []string{"holder", "held"} {
 		pg := schedutil.MakePG(name, ns, 2, nil, nil)
 		pg.Annotations = map[string]string{topologyKeyAnnotation: domainLabelKey}
 		pg.Spec.ScheduleTimeoutSeconds = &longTimeout
@@ -121,13 +121,13 @@ func TestGangParkedOnReservedDomainRetriesWhenReservationDrains(t *testing.T) {
 	}
 	waitForGateWait(t, tc, waitsBefore, 10*time.Second)
 
-	// The second gang is planned while the domain is held: both members park.
-	for _, name := range []string{"parked-0", "parked-1"} {
-		if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, makeGangPod(name, ns, "parked"), metav1.CreateOptions{}); err != nil {
+	// The second gang is planned while the holder has the domain: both members are held.
+	for _, name := range []string{"held-0", "held-1"} {
+		if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, makeGangPod(name, ns, "held"), metav1.CreateOptions{}); err != nil {
 			t.Fatalf("create pod %s: %v", name, err)
 		}
 	}
-	for _, name := range []string{"parked-0", "parked-1"} {
+	for _, name := range []string{"held-0", "held-1"} {
 		waitForPodRejected(t, tc, ns, name, "no domain has room", 10*time.Second)
 	}
 
@@ -135,7 +135,7 @@ func TestGangParkedOnReservedDomainRetriesWhenReservationDrains(t *testing.T) {
 	liftGate(t, tc, ns, "holder-worker")
 
 	const tight = 15 * time.Second
-	for _, name := range []string{"holder-leader", "holder-worker", "parked-0", "parked-1"} {
+	for _, name := range []string{"holder-leader", "holder-worker", "held-0", "held-1"} {
 		node := waitForPodBound(t, tc, ns, name, tight)
 		if node != "rw1" && node != "rw2" {
 			t.Errorf("pod %s bound to %s, want rw1/rw2", name, node)

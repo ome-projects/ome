@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -48,10 +47,8 @@ func TestAcceleratorClass_Reconcile_AddsFinalizerAndUpdatesStatus(t *testing.T) 
 	c := fakeclient.New(t, fakeclient.WithObjects(ac, node), fakeclient.WithStatusSubresource(&v1beta1.AcceleratorClass{}))
 
 	reconciler := &AcceleratorClassReconciler{
-		Client:   c,
-		Log:      ctrl.Log.WithName("AcceleratorClassTest"),
-		Scheme:   c.Scheme(),
-		Recorder: record.NewFakeRecorder(10),
+		Client: c,
+		Log:    ctrl.Log.WithName("AcceleratorClassTest"),
 	}
 
 	// Reconcile
@@ -87,7 +84,7 @@ func TestAcceleratorClass_Reconcile_MatchDiscovery(t *testing.T) {
 
 	c := fakeclient.New(t, fakeclient.WithObjects(ac, nodeA, nodeB), fakeclient.WithStatusSubresource(&v1beta1.AcceleratorClass{}))
 
-	reconciler := &AcceleratorClassReconciler{Client: c, Log: ctrl.Log.WithName("AcceleratorClassTest"), Scheme: c.Scheme(), Recorder: record.NewFakeRecorder(5)}
+	reconciler := &AcceleratorClassReconciler{Client: c, Log: ctrl.Log.WithName("AcceleratorClassTest")}
 
 	ctx := context.TODO()
 	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: ac.Name}})
@@ -135,7 +132,7 @@ func TestAcceleratorClass_Reconcile_MatchDeclaredResources(t *testing.T) {
 
 	c := fakeclient.New(t, fakeclient.WithObjects(ac, nodeA, nodeB), fakeclient.WithStatusSubresource(&v1beta1.AcceleratorClass{}))
 
-	reconciler := &AcceleratorClassReconciler{Client: c, Log: ctrl.Log.WithName("AcceleratorClassTest"), Scheme: c.Scheme(), Recorder: record.NewFakeRecorder(5)}
+	reconciler := &AcceleratorClassReconciler{Client: c, Log: ctrl.Log.WithName("AcceleratorClassTest")}
 
 	ctx := context.TODO()
 	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: ac.Name}})
@@ -169,7 +166,7 @@ func TestAcceleratorClass_Reconcile_DoesNotUpdateTimestampOnNoChange(t *testing.
 	statusWrites := func() int { return statusPatches.Count() + statusUpdates.Count() }
 	c := fakeclient.New(t, fakeclient.WithObjects(ac, node), fakeclient.WithStatusSubresource(&v1beta1.AcceleratorClass{}), statusPatches, statusUpdates)
 
-	reconciler := &AcceleratorClassReconciler{Client: c, Log: ctrl.Log.WithName("AcceleratorClassTest"), Scheme: c.Scheme(), Recorder: record.NewFakeRecorder(5)}
+	reconciler := &AcceleratorClassReconciler{Client: c, Log: ctrl.Log.WithName("AcceleratorClassTest")}
 
 	ctx := context.TODO()
 	_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: ac.Name}})

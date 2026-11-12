@@ -851,7 +851,7 @@ func TestDetectRestartTrigger_GangMemberLossAfterPodCountRefresh(t *testing.T) {
 }
 
 func TestDetectRestartTrigger_GangMemberLossBelowReady(t *testing.T) {
-	// The production shape: a Create-owned Instance at a frozen incarnation
+	// The reference shape: a Create-owned Instance at a frozen incarnation
 	// whose RunningRevision already equals its target.
 	createOwned := func(phase workload.InstancePhase, podCount int32) workload.InstanceStatus {
 		return workload.InstanceStatus{
@@ -2715,8 +2715,10 @@ func TestRepairYieldsToTarget(t *testing.T) {
 		{name: "a paused Component keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, paused: true, want: false},
 		{name: "a target the RetryBlock holds keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target,
 			blocks: []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockHeld}}, want: false},
-		{name: "a target in Backoff only paces the roll and yields", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target,
+		{name: "a target whose backoff is due yields", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target,
 			blocks: []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockBackoff}}, want: true},
+		{name: "a target whose backoff is not yet due keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target,
+			blocks: []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockBackoff, NextRetryAt: ptr.To(metav1.NewTime(time.Now().Add(time.Hour)))}}, want: false},
 		{name: "a row the canary step holds keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, pacing: ptr.To(int32(1)), want: false},
 		{name: "a row the user's partition holds keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, partition: ptr.To(int32(1)), want: false},
 		{name: "a Failed row the canary step holds keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseFailed, RunningRevision: running}, target: target, pacing: ptr.To(int32(1)), want: false},
@@ -3742,25 +3744,32 @@ func (h *pushedCrashLoop) input() workload.ReconcileInput {
 	in.ObservedState.RetryBlocks = append([]workload.RetryBlock(nil), h.blocks...)
 	in.DesiredSpec.PodSpec = &corev1.PodSpec{Containers: []corev1.Container{{Name: constants.MainContainerName, Image: "test:v1"}}}
 	in.UpdateRetryPolicy = &workload.RetryPolicy{MaxAttempts: 3, InitialDelay: 20 * time.Second, MaxDelay: time.Minute, Multiplier: 2}
+	retryBlockStore(&in, &h.blocks)
+	h.wake = &workload.PassWake{}
+	in.PassWake = h.wake
+	return in
+}
+
+// retryBlockStore wires in's retry-block writer to blocks, a test's
+// persisted records: a write that persists adds or updates the revision's
+// record, one that removes drops it, and any other leaves blocks as it is.
+func retryBlockStore(in *workload.ReconcileInput, blocks *[]workload.RetryBlock) {
 	in.MutateRetryBlock = func(_ context.Context, rev string, mutate func(*workload.RetryBlock) workload.RetryBlockDisposition) error {
-		for i := range h.blocks {
-			if h.blocks[i].TargetRevision != rev {
+		for i := range *blocks {
+			if (*blocks)[i].TargetRevision != rev {
 				continue
 			}
-			if mutate(&h.blocks[i]) == workload.RetryBlockRemove {
-				h.blocks = append(h.blocks[:i], h.blocks[i+1:]...)
+			if mutate(&(*blocks)[i]) == workload.RetryBlockRemove {
+				*blocks = append((*blocks)[:i], (*blocks)[i+1:]...)
 			}
 			return nil
 		}
 		block := workload.RetryBlock{TargetRevision: rev}
 		if mutate(&block) == workload.RetryBlockPersist {
-			h.blocks = append(h.blocks, block)
+			*blocks = append(*blocks, block)
 		}
 		return nil
 	}
-	h.wake = &workload.PassWake{}
-	in.PassWake = h.wake
-	return in
 }
 
 // pass runs the restart pass's selection and, when it selects the row,
@@ -4138,8 +4147,9 @@ func newPushedUnreadyAfterCrash(t *testing.T, policy workload.RestartPolicy) *pu
 // attempt's failure: under RecreateInstanceOnPodRestart the restart pass
 // reads the unready pod as the wedge, counts the crash on the pushed
 // revision's ladder, and once the backoff is due rebuilds the set as the
-// ladder's next attempt. Under None the crash is counted and the dark set
-// is left to the roll, as a pod that runs but fails readiness always is.
+// ladder's next attempt. Under None no repair answers a pod that runs but
+// fails readiness, so nothing is counted: the row remembers the crash and
+// the dark set is left to the roll.
 func TestRestart_PushedSetDarkAfterItsCrashIsTheLaddersWedge(t *testing.T) {
 	t.Run("under RecreateInstanceOnPodRestart the rebuild is the ladder's next attempt", func(t *testing.T) {
 		h := newPushedUnreadyAfterCrash(t, workload.RestartPolicyRecreateInstance)
@@ -4172,14 +4182,17 @@ func TestRestart_PushedSetDarkAfterItsCrashIsTheLaddersWedge(t *testing.T) {
 			t.Fatalf("the rebuild must be started as the ladder's attempt; got %+v", b)
 		}
 	})
-	t.Run("under None the crash is counted and the dark set is left to the roll", func(t *testing.T) {
+	t.Run("under None nothing counts and the dark set is left to the roll", func(t *testing.T) {
 		h := newPushedUnreadyAfterCrash(t, workload.RestartPolicyNone)
 		pods := []*corev1.Pod{h.pod}
 		if selected, done := h.pass(); !selected || done {
-			t.Fatalf("the first sighting counts the crash; got selected=%v done=%v", selected, done)
+			t.Fatalf("the first sighting remembers the crash on the row; got selected=%v done=%v", selected, done)
 		}
-		if b := h.ladder(); b == nil || b.State != workload.RetryBlockBackoff || b.AttemptsStarted != 1 {
-			t.Fatalf("the crash must count on the pushed revision's ladder; got %+v", b)
+		if row := h.row(); row.LastFailure == nil || row.LastFailure.PodName != h.pod.Name {
+			t.Fatalf("the row must remember the crash; got %+v", row.LastFailure)
+		}
+		if b := h.ladder(); b != nil {
+			t.Fatalf("no repair answers a pod that runs under None, so the crash spends no attempt; got %+v", b)
 		}
 
 		h.clk.Step(20 * time.Second)
@@ -4628,6 +4641,72 @@ func TestRestart_RebuildOnADroppedRevisionIsRebuiltAtTheTarget(t *testing.T) {
 			row = findInstanceStatusOnIR(c, isvc, workload.ComponentEngine, 0)
 			if row == nil || row.Phase != v1beta1.OMENativeInstanceRestarting || row.RunningRevision != target.Name {
 				t.Fatalf("row = %+v, want Restarting recording %s", row, target.Name)
+			}
+		})
+	}
+}
+
+// A roll held on its retry schedule cannot take a row this pass: its last
+// attempt at the target failed and the schedule admits no fresh start yet
+// (a backoff not due, an attempt already under way, or the record Held). A
+// lost Instance off such a target keeps its repair and is rebuilt at the
+// revision it runs, as under a pause or a partition hold, instead of
+// staying down until the schedule or an operator moves the roll. A target
+// with no retry record, or whose backoff is due with nothing in flight, is
+// one the roll can start on, and the roll takes the row as before. A row
+// that carries the roll's own attempt, kept for the retry the schedule
+// admits, stays the roll's under every schedule state: that retry
+// replaces its set.
+func TestRepairYieldsToTarget_RollHeldOnItsRetryScheduleKeepsTheRepair(t *testing.T) {
+	const running = "llama-70b-engine-" + testRevisionHash
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-0000next", Namespace: "prod"}}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	inst := workload.InstancePlan{Index: 0, Incarnation: 1, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}}
+	lost := workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: running}
+	// retrying is a peer whose attempt at the target is under way, the one
+	// attempt the schedule admits at a time.
+	retrying := workload.InstanceStatus{
+		Index: 1, Phase: workload.InstancePhaseUpdating, RunningRevision: running, TargetRevision: target.Name,
+		Operation: &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepDrain, TargetRevision: target.Name},
+	}
+	at := func(d time.Duration) *metav1.Time { return ptr.To(metav1.NewTime(now.Add(d))) }
+	// keptAttempt carries the roll's own attempt at the target, kept for the
+	// retry the schedule admits.
+	keptAttempt := workload.InstanceStatus{
+		Index: 0, Phase: workload.InstancePhaseFailed, RunningRevision: running, TargetRevision: target.Name,
+		Operation: &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepParked, TargetRevision: target.Name},
+	}
+	cases := []struct {
+		name   string
+		row    workload.InstanceStatus
+		block  *workload.RetryBlock
+		peers  []workload.InstanceStatus
+		yields bool
+	}{
+		{name: "no retry record: the roll takes the row", yields: true},
+		{name: "the roll's own kept attempt stays the roll's under a backoff not yet due", row: keptAttempt, block: &workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: at(5 * time.Minute)}, yields: true},
+		{name: "a backoff not yet due keeps the repair", block: &workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: at(5 * time.Minute)}},
+		{name: "a backoff that is due with nothing in flight: the roll takes the row", block: &workload.RetryBlock{State: workload.RetryBlockBackoff, NextRetryAt: at(-time.Second)}, yields: true},
+		{name: "an attempt under way at the target keeps the repair", block: &workload.RetryBlock{State: workload.RetryBlockRetryInProgress}, peers: []workload.InstanceStatus{retrying}},
+		{name: "a retry authorization nothing uses: the roll takes the row", block: &workload.RetryBlock{State: workload.RetryBlockRetryInProgress}, yields: true},
+		{name: "a Held record keeps the repair", block: &workload.RetryBlock{State: workload.RetryBlockHeld}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := workload.ReconcileInput{Clock: clocktesting.NewFakeClock(now)}
+			row := lost
+			if tc.row.Phase != "" {
+				row = tc.row
+			}
+			input.ObservedState.InstanceStatuses = append([]workload.InstanceStatus{row}, tc.peers...)
+			if tc.block != nil {
+				b := *tc.block
+				b.TargetRevision = target.Name
+				input.ObservedState.RetryBlocks = []workload.RetryBlock{b}
+			}
+			plan := workload.ComponentPlan{Component: workload.ComponentEngine, Instances: []workload.InstancePlan{inst}}
+			if got := ops.RepairYieldsToTarget(input, plan, inst, target, nil); got != tc.yields {
+				t.Fatalf("RepairYieldsToTarget = %v, want %v", got, tc.yields)
 			}
 		})
 	}

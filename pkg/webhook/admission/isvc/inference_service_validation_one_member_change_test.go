@@ -193,9 +193,10 @@ func TestValidateUpdate_UngroupedRouterChangeIsAdmittedSilently(t *testing.T) {
 }
 
 // A one-member change that also moves spec.rollout.pairingProtocol is judged
-// by the protocol rule: under a rollingUpdate group the protocol change is
-// refused with its own reason.
-func TestValidateUpdate_OneMemberChangeWithProtocolChangeIsRefusedByTheProtocolRule(t *testing.T) {
+// by the protocol rule, whatever the pod templates do: one rollingUpdate
+// group over engine and decoder admits the protocol change, and a group over
+// the engine alone refuses it with the protocol rule's own reason.
+func TestValidateUpdate_OneMemberChangeWithProtocolChangeFollowsTheProtocolRule(t *testing.T) {
 	v := &InferenceServiceValidator{}
 	old := groupedPDISVC(false, false)
 	old.Spec.Rollout.PairingProtocol = ptr.To("kv-v1")
@@ -203,6 +204,12 @@ func TestValidateUpdate_OneMemberChangeWithProtocolChangeIsRefusedByTheProtocolR
 	updated.Spec.Rollout.PairingProtocol = ptr.To("kv-v2")
 	podTemplateChanges["env"](updated, v1beta1.EngineComponent)
 	_, err := v.ValidateUpdate(context.Background(), old, updated)
+	require.NoError(t, err, "a protocol change under one rollingUpdate group over both members is admitted")
+
+	engineOnly := []v1beta1.ComponentType{v1beta1.EngineComponent}
+	old.Spec.Rollout.Groups[0].Components = engineOnly
+	updated.Spec.Rollout.Groups[0].Components = engineOnly
+	_, err = v.ValidateUpdate(context.Background(), old, updated)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), validation.ReasonPairingProtocolChangeUncoordinated)
 }

@@ -2,8 +2,10 @@ package canary
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
@@ -12,13 +14,6 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
-
-// terminalPhase reports whether a Component's phase is one of the two parked
-// terminals the step machine never leaves on its own: a Failed step and a
-// completed rollback both hold until an operator acts.
-func terminalPhase(p v1beta1.RolloutPhase) bool {
-	return p == v1beta1.RolloutPhaseFailed || p == v1beta1.RolloutPhaseRolledBack
-}
 
 // resumeRequest is a parsed ome.io/rollout-resume value: the parked canary
 // revision hash to resume, and the Component it is scoped to (empty when the
@@ -120,8 +115,14 @@ func (m memberTargets) String() string {
 }
 
 // handleResume applies the one-shot ome.io/rollout-resume verb: clear this
-// Component's terminal RolloutPhase and re-enter the step machine at step 0
-// against the revision that is already parked, without minting a revision.
+// Component's terminal RolloutPhase and re-enter the step machine against
+// the revision that is already parked, without minting a revision. A
+// unit stopped with no rejection continues at the step the stop
+// interrupted, or at a later step when the fleet already runs more of the
+// canary revision than that step stages (resumeStep); a unit holding a
+// rejection, settled or stopped for want of the stable revision, starts the
+// steps over at step 0, raised the same way for Instances still on the
+// rejected revision.
 //
 // It reports whether it resumed. A resume does NOT fall through to the step
 // machine on the same pass: the pass ends with the re-armed record, the
@@ -134,7 +135,7 @@ func (m memberTargets) String() string {
 // after the status flush that carries the re-arm: a lost flush then leaves
 // the verb in place to be applied again, and a verb still visible after a
 // successful flush finds nothing parked and is consumed with no effect.
-func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(string)) (bool, error) {
+func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary, take func(string)) (bool, error) {
 	value := in.ISVC.Annotations[constants.RolloutResumeAnnotation]
 	req, ok := parseResume(value)
 	if !ok {
@@ -157,51 +158,20 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 		return false, consume()
 	}
 
-	// The park is read from the status marker and the phase together, so a
-	// Failed hold whose phase was dropped by an external write still resumes.
+	// The stop is read from the recorded failure and the phase together, as
+	// the holds read it: a Failed hold whose phase was dropped by an external
+	// write still resumes, and a finished unit whose phase was written Failed
+	// from outside has nothing to resume.
 	phase := in.ISVC.Status.Components[in.Component].RolloutPhase
-	state := rollout.StateOf(cs, phase, 0)
+	state := rollout.StateOf(cs, phase, len(plan.Steps))
 	if cs == nil || !state.Terminal() {
 		// Nothing parked to clear. Consume rather than leave an addressed verb
 		// on the object waiting to fire at the next terminal hold.
 		return false, consume()
 	}
-	// Re-staging capacity and re-shifting traffic needs a pinned plan to do it
-	// against. A completed rollback CLOSES its run, so a RolledBack hold has
-	// none — and needs none: clearing the rejection is the whole job there,
-	// because the IR's rollback target then drops, the Component's target
-	// diverges from stable again, and the run layer opens a fresh run over the
-	// same revision. A Failed hold keeps its run open by construction, so a
-	// Failed hold WITHOUT one is the one combination where neither route
-	// exists, and walking the live spec ladder unpinned is not a substitute.
-	//
-	// What makes the RolledBack handoff work is that the run layer's sticky
-	// reject — the carve-out that stops a rejected target from re-opening a
-	// run forever — is keyed on the live cs.RolledBackRevisionHash this verb
-	// clears, NOT on the durable rolled-back run record, which stays behind.
-	// A reject lookup that consulted the record first would leave the hold
-	// asserted and strand the resume here, succeeding with no run to show for
-	// it. Locked by the run layer's cleared-reject reopen test.
-	if !in.RunActive && state != rollout.CanaryStateRolledBack {
+	if why := resumeRefusal(in, cs, req); why != "" {
 		recordResume(in.ISVC, in.Component, resumeRejected)
-		emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonRolloutResumeRejected,
-			"resume rejected for %s: no rollout run is pinned, so there is no plan to re-enter", in.Component)
-		return false, consume()
-	}
-	if req.hash != cs.CanaryRevisionHash {
-		recordResume(in.ISVC, in.Component, resumeRejected)
-		emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonRolloutResumeRejected,
-			"resume rejected for %s: %q is not the parked canary revision %q", in.Component, req.hash, cs.CanaryRevisionHash)
-		return false, consume()
-	}
-	// A resume re-enters the steps toward the stopped canary's revision, so a member of
-	// the unit must still target it. Once the spec went back to the stable
-	// revision nothing is left to roll: a re-entry would record the stable
-	// revision as its own canary and wait for a promote that moves nothing.
-	if targets := observedMemberTargets(in); !targets.names(req.hash) {
-		recordResume(in.ISVC, in.Component, resumeRejected)
-		emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonRolloutResumeRejected,
-			"resume rejected for %s: no member of the unit targets revision %q any more (%s); the request is removed", in.Component, req.hash, targets)
+		emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonRolloutResumeRejected, "resume rejected for %s: %s", in.Component, why)
 		return false, consume()
 	}
 
@@ -212,14 +182,103 @@ func handleResume(ctx context.Context, in ReconcileInputs, cs *v1beta1.CanarySta
 	if err := consumeAnnotation(ctx, in.Client, in.ISVC, constants.RolloutRollbackAnnotation); err != nil {
 		return false, err
 	}
-	// The record restarts the steps toward the stopped revision the value named; the
-	// member check above is what makes it a revision the unit still targets.
-	resetCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, cs.CanaryRevisionHash, in.Now)
+	applyResume(in, cs, plan, phase)
+	return true, consume()
+}
+
+// resumeRefusal is why a resume addressed to a stopped unit cannot be taken,
+// empty when it can: no run to re-enter, a value naming another revision, or
+// a revision no member targets any more.
+func resumeRefusal(in ReconcileInputs, cs *v1beta1.CanaryStatus, req resumeRequest) string {
+	// Re-staging capacity and re-shifting traffic needs a pinned plan to do it
+	// against. A stop that holds a rejection needs no open run to resume:
+	// clearing the rejection is the whole job there, because the replica's
+	// rollback target then drops, the Component's target diverges from
+	// stable again, and on its next pass the run layer takes over the record
+	// this verb writes (an adoption toward the same revision, not a fresh
+	// run). That is the settled RolledBack hold, whose completed revert
+	// closed its run, and the stop a rollback reaches when the stable
+	// revision it would return to is not retained, which can be written
+	// after the run closed. A stop with no rejection keeps its run open by
+	// construction, so one WITHOUT a run is the one combination where
+	// neither route exists, and walking the live spec's steps without a
+	// pinned plan is not a substitute.
+	//
+	// What makes the handoff work is that the run layer's sticky reject,
+	// the carve-out that stops a rejected target from re-opening a run
+	// forever, is keyed on the live cs.RolledBackRevisionHash this verb
+	// clears, NOT on the durable rolled-back run record, which stays behind.
+	// A reject lookup that consulted the record first would leave the hold
+	// asserted and strand the resume here, succeeding with no run to show for
+	// it. Locked by the run layer's cleared-reject reopen test.
+	if !in.RunActive && cs.RolledBackRevisionHash == "" {
+		return "no rollout run is pinned, so there is no plan to re-enter"
+	}
+	if req.hash != cs.CanaryRevisionHash {
+		return fmt.Sprintf("%q is not the parked canary revision %q", req.hash, cs.CanaryRevisionHash)
+	}
+	// A resume re-enters the steps toward the stopped canary's revision, so a member of
+	// the unit must still target it. Once the spec went back to the stable
+	// revision nothing is left to roll: a re-entry would record the stable
+	// revision as its own canary and wait for a promote that moves nothing.
+	if targets := observedMemberTargets(in); !targets.names(req.hash) {
+		return fmt.Sprintf("no member of the unit targets revision %q any more (%s); the request is removed", req.hash, targets)
+	}
+	return ""
+}
+
+// applyResume starts the record again toward the revision it names and
+// reports it. A stop with no rejection interrupted a step whose split the
+// fleet already serves, so the steps continue from there with that split
+// kept. A stop that holds a rejection is a rollback's end, whether the
+// revert settled or could not run for want of the stable revision: the
+// steps start over at step 0, raised only to cover the Instances still on
+// the rejected revision, with no split to keep.
+func applyResume(in ReconcileInputs, cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary, phase v1beta1.RolloutPhase) {
+	step, weight, resumedAt := resumeStep(in, plan.Steps, 0), int32(0), "starts its steps again at"
+	if cs.RolledBackRevisionHash == "" {
+		step, weight, resumedAt = resumeStep(in, plan.Steps, cs.CurrentStep), cs.ObservedTrafficWeight, "continues at"
+	}
+	resumeCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, step, weight, in.Now)
 	recordResume(in.ISVC, in.Component, resumeApplied)
 	emit(in.Recorder, in.ISVC, corev1.EventTypeNormal, EventReasonRolloutResumed,
-		"resumed %s from %s: re-entering the canary ladder at step 0 on revision %s; every gate re-runs",
-		in.Component, phase, cs.CanaryRevisionHash)
-	return true, consume()
+		"resumed %s from %s: the canary %s step %d of %d (%s); the step's capacity wait, gate and ready timeout run again from now",
+		in.Component, phase, resumedAt, step, len(plan.Steps), heldMembers(in))
+}
+
+// resumeStep is the step a stopped unit continues at: the step the stop
+// interrupted, raised to the first later step whose staged count covers the
+// Instances each member already runs on the canary revision, so a resumed
+// step never stages less than the fleet serves. The final step covers
+// everything a stop can leave behind.
+func resumeStep(in ReconcileInputs, steps []v1beta1.RolloutGroupStep, stopped int32) int32 {
+	last := int32(len(steps)) - 1
+	step := stopped
+	if step > last {
+		step = last
+	}
+	raise := func(desired, onCanary int32) {
+		for step < last && stepStagedCount(steps[step], desired) < onCanary {
+			step++
+		}
+	}
+	raise(in.DesiredReplicas, readyCanaryCapacity(in))
+	for _, m := range in.Secondaries {
+		if m.retargeted() {
+			raise(m.DesiredReplicas, m.ReadyCanaryCapacity)
+		}
+	}
+	return step
+}
+
+// resumeCanaryStatus starts a stopped or rolled-back record again at step
+// toward the revision it already names, keeping the identity pair and the
+// weight the split carries. The step's clock starts now and the capacity wait
+// is clocked again by the first short pass; every other field belonged to the
+// hold and goes with it.
+func resumeCanaryStatus(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, cs *v1beta1.CanaryStatus, targetID string, step, weight int32, now time.Time) {
+	resetCanaryStatus(isvc, c, cs, targetID, cs.CanaryRevisionHash, now)
+	cs.CurrentStep, cs.ObservedTrafficWeight = step, weight
 }
 
 // emit is best-effort observability; a nil recorder (tests) is fine.

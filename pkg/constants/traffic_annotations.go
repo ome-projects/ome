@@ -43,6 +43,16 @@ var (
 	// control-plane-only and is stripped from derived workload ISVCs.
 	TrafficDrainAnnotation = OMEAPIGroupName + "/traffic-drain"
 
+	// RoutingPublisherOptionAnnotationPrefix names per-InferenceService
+	// publisher options carried as annotations on a control-plane
+	// InferenceService: ome.io/routing-publisher.<option> sets <option> to the
+	// annotation's value. The TrafficMap publisher adds them to
+	// spec.routing.publisher.options under the same limits; an option set in
+	// both places is invalid. Unlike the spec field they change neither the
+	// InferenceService's generation nor its placement plan. They are
+	// control-plane-only and are stripped from derived workload ISVCs.
+	RoutingPublisherOptionAnnotationPrefix = OMEAPIGroupName + "/routing-publisher."
+
 	// ManagedByConflictAckedAnnotation, when set to "true" on the
 	// InferenceService, acknowledges a hand-authored backend policy
 	// with the conflicting name OME would use. Suppresses the GA
@@ -146,9 +156,11 @@ var (
 	// Component is in no terminal phase; a value that addresses no canary
 	// unit at all is removed without effect.
 	//
-	// Resume is deliberately NOT a waiver: the ladder restarts at step 0 and
-	// every gate re-runs, so a revision that failed analysis fails again
-	// unless the underlying cause is fixed.
+	// Resume is deliberately NOT a waiver: a stopped canary continues at the
+	// step the stop interrupted (or a later one the fleet already stands at)
+	// and that step's gate and ready timeout run again, so a revision that
+	// failed there fails again unless the underlying cause is fixed; a
+	// rolled-back canary starts its steps over.
 	//
 	// Like the other rollout verbs this is control-plane-only: it is stripped
 	// at derive, so on a placed InferenceService it must be applied directly

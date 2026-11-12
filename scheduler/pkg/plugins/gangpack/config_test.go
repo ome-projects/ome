@@ -1,6 +1,7 @@
 package gangpack
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -55,6 +56,33 @@ func TestDecodeArgs_InvalidOrMissingValues_ReturnsError(t *testing.T) {
 	} {
 		if _, err := decodeArgs(&runtime.Unknown{Raw: []byte(raw)}); err == nil {
 			t.Errorf("decodeArgs(%s) succeeded, want error", raw)
+		}
+	}
+}
+
+// TestDecodeArgs_ASecondsValueThatCannotBeADurationIsRefused: 9,223,372,037
+// seconds is one more than a time.Duration can hold; the largest value that
+// fits, 9,223,372,036, is accepted.
+func TestDecodeArgs_ASecondsValueThatCannotBeADurationIsRefused(t *testing.T) {
+	if _, err := decodeArgs(&runtime.Unknown{Raw: []byte(`{"gcIntervalSeconds":9223372037}`)}); err == nil || !strings.Contains(err.Error(), "gcIntervalSeconds is too large") {
+		t.Fatalf("one second past the largest duration: err = %v, want \"gcIntervalSeconds is too large\"", err)
+	}
+	if _, err := decodeArgs(&runtime.Unknown{Raw: []byte(`{"gcIntervalSeconds":9223372036}`)}); err != nil {
+		t.Fatalf("the largest duration: err = %v, want accepted", err)
+	}
+}
+
+// TestDecodeArgs_ARefusalNamesTheArgumentItRefuses: each of the three duration
+// settings is refused under its own name.
+func TestDecodeArgs_ARefusalNamesTheArgumentItRefuses(t *testing.T) {
+	for raw, want := range map[string]string{
+		`{"defaultPermitTimeoutSeconds":0,"gcIntervalSeconds":5}`: "defaultPermitTimeoutSeconds must be positive",
+		`{"podGroupSyncTimeoutSeconds":-1,"gcIntervalSeconds":5}`: "podGroupSyncTimeoutSeconds must be positive",
+		`{"defaultPermitTimeoutSeconds":5}`:                       "gcIntervalSeconds must be configured",
+	} {
+		_, err := decodeArgs(&runtime.Unknown{Raw: []byte(raw)})
+		if err == nil || err.Error() != want {
+			t.Errorf("decodeArgs(%s) err = %v, want %q", raw, err, want)
 		}
 	}
 }

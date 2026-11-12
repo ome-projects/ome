@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -32,18 +34,29 @@ import (
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
+// pairRules are the operator's prefill/decode settings as the chart renders
+// them, at the chart's default tolerance of 5: the ratio rule on and the
+// decoder named as the side that moves first inside every batch.
+var pairRules = coordination.GroupDefaults{
+	RatioTolerancePercent: ptr.To(int32(5)),
+	PrefillDecode:         coordination.PrefillDecodeRules{KeepRatio: true, FirstSide: v1beta1.DecoderComponent},
+}
+
 // This file drives a prefill/decode canary, the engine and the decoder in one
 // canary group, through the production code the controller runs in one pass,
 // in the controller's order: the run layer (rolloutrun.Reconcile and BindRun),
 // the partition the projector writes for each member (PartitionResolver), and
 // the canary dispatch (Dispatch) over a fake API that holds the replicas,
-// their pods and their revisions. The coordination gates are not asked: a
-// canary group's members belong to no coordination group
-// (coordination.ResolveGroups skips canary groups), so each side rolls on its
-// own budget, which is what the workload stand-in here does: it holds the
-// Instances the partition names, starts the rest toward the target under the
-// member's strategy and budget, follows a rollback target, and starts nothing
-// new while the rollout is paused.
+// their pods and their revisions. The workload stand-in does what the
+// replica controller does with the partition and the rollback target its
+// replica carries: it holds the Instances the partition names, asks the
+// coordination update gate (coordination.EvaluateUpdateGate, under the
+// chart's prefill/decode settings) before each start, starts the admitted
+// ones toward the target under the member's strategy and budget, follows a
+// rollback target, and starts nothing new while the rollout is paused. The
+// gate paces the two sides of the unit with the batch step: inside a step,
+// and inside a revert, the decoder's Instances of a batch move first and the
+// engine's wait until they serve.
 //
 // The configurations are the reference prefill/decode shapes (12:8, 15:15,
 // 16:8, 20:10, 24:8, 30:10 and 12:4) under RecreatePod and SurgeThenDrain at
@@ -470,12 +483,76 @@ func (w *pairWorld) client(st *pairState) client.Client {
 	return fake.NewClientBuilder().WithScheme(w.scheme).WithRuntimeObjects(w.objects(st)...).Build()
 }
 
+// memberReplicaReader serves a model's member replicas to the coordination
+// gate from the model's state, the way the replica controller's live
+// reader does: every start of the pass so far is written on its row before
+// the next start is asked about. The gate reads nothing else for a canary
+// unit. replica builds member i's replica from the state as it stands.
+type memberReplicaReader struct {
+	namespace, service string
+	comps              []v1beta1.ComponentType
+	replica            func(i int) *v1beta1.InferenceReplica
+}
+
+func (r memberReplicaReader) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	ir, ok := obj.(*v1beta1.InferenceReplica)
+	if !ok || key.Namespace != r.namespace {
+		return apierrors.NewNotFound(v1beta1.Resource("inferencereplicas"), key.Name)
+	}
+	for i, comp := range r.comps {
+		if key.Name == irprojector.InferenceReplicaName(r.service, comp) {
+			*ir = *r.replica(i)
+			return nil
+		}
+	}
+	return apierrors.NewNotFound(v1beta1.Resource("inferencereplicas"), key.Name)
+}
+
+func (r memberReplicaReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return nil
+}
+
+// replicaReader serves the pair's replicas from a state.
+func (w *pairWorld) replicaReader(st *pairState) memberReplicaReader {
+	comps := make([]v1beta1.ComponentType, len(st.members))
+	for i, m := range st.members {
+		comps[i] = m.comp
+	}
+	return memberReplicaReader{namespace: pairNamespace, service: pairService, comps: comps, replica: func(i int) *v1beta1.InferenceReplica { return w.replica(st, i) }}
+}
+
+// startAdmitted asks the coordination update gate about one more start of
+// a side toward target, with admitted starts already taken in this pass,
+// under the chart's prefill/decode settings; the plan gate, the batch step
+// and whatever else the gate consults for a canary unit answer.
+func (w *pairWorld) startAdmitted(st *pairState, i int, from, target string, admitted int32) bool {
+	m := st.members[i]
+	revision := canaryControllerRevision(pairNamespace, pairService, string(m.comp), target, int64(sort.SearchStrings(pairRevisions, target)+1))
+	return coordinationAdmits(w.ctx, w.replicaReader(st), st.isvc, m.comp, pairRevisionName(m.comp, from), revision, w.cfg.strategy, admitted)
+}
+
+// coordinationAdmits asks the coordination update gate about one more start
+// of a member from one revision toward a target, with admitted starts of
+// the pass already taken under the member's strategy, under the chart's
+// prefill/decode settings.
+func coordinationAdmits(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, from string, target *appsv1.ControllerRevision, strategy v1beta1.UpdateStrategyType, admitted int32) bool {
+	var inFlightSurge, inFlightUnavail int32
+	if strategy == v1beta1.UpdateStrategySurgeThenDrain {
+		inFlightSurge = admitted
+	} else {
+		inFlightUnavail = admitted
+	}
+	allowed, _, _ := coordination.EvaluateUpdateGate(ctx, reads, isvc, comp, from, target, nil, pairRules, workloadtypes.UpdateStrategyType(strategy), inFlightSurge, inFlightUnavail)
+	return allowed
+}
+
 // workloadStep is the workload engine's reaction to the partition and the
 // rollback target its replica carries: the lowest-indexed Instances off the
 // target are held, the partition's worth of them, and the rest start toward
-// the target under the side's strategy and budget. A paused rollout starts
-// nothing new. An attempt toward a revision that is no longer the target
-// turns toward the target.
+// the target under the side's strategy and budget, each start admitted by
+// the coordination update gate first. A paused rollout starts nothing new.
+// An attempt toward a revision that is no longer the target turns toward
+// the target.
 func (w *pairWorld) workloadStep(st *pairState, i int) {
 	m := &st.members[i]
 	target := m.updateRev
@@ -505,7 +582,7 @@ func (w *pairWorld) workloadStep(st *pairState, i int) {
 		return
 	}
 	budget := m.step()
-	var inFlight int32
+	var inFlight, admitted int32
 	for _, r := range m.rows {
 		switch {
 		case w.cfg.surges() && r.kind == pairRowSurging:
@@ -519,7 +596,7 @@ func (w *pairWorld) workloadStep(st *pairState, i int) {
 		if held[idx] || r.kind != pairRowServing || r.rev == target {
 			continue
 		}
-		if inFlight >= budget {
+		if inFlight >= budget || !w.startAdmitted(st, i, r.rev, target, admitted) {
 			break
 		}
 		r.kind = pairRowRecreating
@@ -528,6 +605,7 @@ func (w *pairWorld) workloadStep(st *pairState, i int) {
 		}
 		r.target = target
 		inFlight++
+		admitted++
 	}
 }
 
@@ -559,14 +637,21 @@ type pairUnit struct {
 
 // unit reads the one canary group's record; nil when the service has none.
 func (w *pairWorld) unit(st *pairState) *pairUnit {
-	groups := rollout.CanaryGroups(st.isvc, rollout.Policies{})
+	return canaryUnitOf(st.isvc)
+}
+
+// canaryUnitOf reads a service's one canary group as the pass left it: the
+// group, its primary's record and phase, and the state they make; nil when
+// the service has no canary group.
+func canaryUnitOf(isvc *v1beta1.InferenceService) *pairUnit {
+	groups := rollout.CanaryGroups(isvc, rollout.Policies{})
 	if len(groups) == 0 {
 		return nil
 	}
 	g := groups[0]
 	primary := rollout.PrimaryOf(g)
-	cs := rollout.CanaryStatusFor(&st.isvc.Status, primary)
-	phase := st.isvc.Status.Components[primary].RolloutPhase
+	cs := rollout.CanaryStatusFor(&isvc.Status, primary)
+	phase := isvc.Status.Components[primary].RolloutPhase
 	return &pairUnit{group: g, record: cs, phase: phase, state: rollout.StateOf(cs, phase, len(g.Canary.Steps))}
 }
 
@@ -603,7 +688,7 @@ func (w *pairWorld) pass(st *pairState) {
 	policies := out.Policies
 	if out.Opened {
 		for _, g := range rollout.CanaryGroups(isvc, policies) {
-			if err := BindRun(w.ctx, c, isvc, g, out.Adopted); err != nil {
+			if err := BindRun(w.ctx, c, isvc, g, RunOpen{Adopted: out.Adopted, Closed: out.Closed}); err != nil {
 				w.fail("bind run: %v", err)
 			}
 		}
@@ -1125,18 +1210,24 @@ func (w *pairWorld) check(st *pairState) []pairFinding {
 		add("reopen-after-complete", 1, "a run opened toward %s right after the run that closed Completed on the same targets", st.reopened)
 	}
 	u := w.unit(st)
-	held := false
+	held, heldStable := false, ""
 	if u != nil {
 		switch u.state {
 		case rollout.CanaryStateFailed, rollout.CanaryStateRollingBack, rollout.CanaryStateRolledBack:
 			held = true
+			if u.record != nil {
+				heldStable = u.record.StableRevisionHash
+			}
 		}
 	}
 	engine, decoder := st.members[0], st.members[1]
-	// (c) traffic names only revisions that serve. A rollback and a Failed
-	// hold keep the last split they wrote, and a member with nothing in
-	// rotation keeps the step's weight; both are a split that names an unserving
-	// revision, not decided yet.
+	// (c) traffic names only revisions that serve. A member with nothing in
+	// rotation keeps the step's weight, a split that names an unserving
+	// revision by rule. A rollback or a Failed hold moves a stable share with
+	// no pod behind it onto the revision that serves, so a split left on an
+	// empty stable revision under a hold fails; a stopped canary whose canary
+	// pod is lost keeps the step's share on the canary revision until the
+	// workload rebuilds the pod, which is reported apart.
 	for _, m := range st.members {
 		var total int32
 		for _, hash := range pairRevisions {
@@ -1151,8 +1242,10 @@ func (w *pairWorld) check(st *pairState) []pairFinding {
 			switch {
 			case total == 0:
 				class = "traffic-empty-revision-nothing-serves"
+			case held && hash == heldStable:
+				class = "traffic-empty-stable-revision-under-a-hold"
 			case held:
-				class = "traffic-empty-revision-under-a-hold"
+				class = "traffic-empty-canary-revision-under-a-hold"
 			}
 			add(class, float64(weight), "%s traffic sends %d percent to revision %s, which has no pod in rotation (%d pods of the member serve)", m.comp, weight, hash, total)
 		}
@@ -1231,9 +1324,10 @@ func (w *pairWorld) check(st *pairState) []pairFinding {
 		}
 	}
 	// The held share of the fleet is what the step asks for. After a scale
-	// the created Instances run the canary revision, and after a resume the
-	// step counter returns to 0 while the Instances a later step moved stay
-	// where they are; both are reported under their own names.
+	// the created Instances run the canary revision, a known picture named
+	// apart; after a resume the unit continues at a step whose staged count
+	// covers the fleet, so a share off the step there is named apart and
+	// not known.
 	suffix := ""
 	switch {
 	case st.scaled:
@@ -1757,41 +1851,40 @@ func pairConfigs(full bool) []pairConfig {
 }
 
 // pairKnownClasses are the readings the explorer reports without failing,
-// each in words: behaviour not decided yet, and pictures rather than holds.
+// each in words: behaviour left open, and pictures rather than holds.
 var pairKnownClasses = map[string]string{
-	"traffic-empty-revision-under-a-hold":   "a Failed or rolled-back unit keeps the last split it wrote (a split naming an unserving revision; not decided yet)",
-	"traffic-empty-revision-nothing-serves": "a member with nothing in rotation keeps the step's weight (the same, not decided yet)",
-	"held-short-after-scale":                "a scale under a step changes the staged share: a created Instance runs the canary revision, a removed one was a staged one (not decided yet)",
-	"share-exceeded-after-scale":            "a created Instance runs the canary revision, so the unit runs more on it than the step stages (not decided yet)",
-	"held-short-after-resume":               "a resume returns the step counter to 0 while the Instances a later step moved stay where they are (not decided yet)",
-	"share-exceeded-after-resume":           "the same picture read from the staged side",
-	"promoted-short-forced":                 "a forced promote opens the step without its capacity by the operator's own word (the CanaryStepForced event)",
-	"one-sided-version-beyond-a-batch":      "the two sides stage a step at their own pace, so one side's new Instances serve a version the other side has none on, past one batch, with no traffic on it yet",
-	"one-sided-version-with-traffic":        "the canary side of a split is held for the whole unit, the stable side per member: when one member's last stable pod is lost at the final step, that member moves its whole split onto the canary revision while the other member keeps the previous step's weight on a version the first member no longer runs",
-	"traffic-on-a-thin-version":             "a version carries the weight of the step it last served while its Instances on one side are rebuilt or retired, so the ones left carry more than twice their share",
-	"ratio-drift-5":                         "a version's engine:decoder ratio drifts more than 5 percent from the fleet's while Instances build: the two sides stage at their own budgets",
-	"ratio-drift-10":                        "the same at 10 percent",
-	"ratio-drift-20":                        "the same at 20 percent",
-	"ratio-drift-5-at-rest":                 "a version's engine:decoder ratio drifts more than 5 percent from the fleet's with nothing building: the step's own rounding per side",
-	"ratio-drift-10-at-rest":                "the same at 10 percent",
-	"ratio-drift-20-at-rest":                "the same at 20 percent",
-	"share-skew-5":                          "the two sides' shares of a version sit more than 5 percent apart while Instances build (the paired batch plan's reading of a tolerance)",
-	"share-skew-10":                         "the same at 10 percent",
-	"share-skew-20":                         "the same at 20 percent",
-	"share-skew-5-at-rest":                  "the two sides' shares of a version sit more than 5 percent apart with nothing building",
-	"share-skew-10-at-rest":                 "the same at 10 percent",
-	"share-skew-20-at-rest":                 "the same at 20 percent",
+	"traffic-empty-revision-nothing-serves":      "a member with nothing in rotation keeps the step's weight: a loss with nothing to move onto is the workload's repair, not a traffic decision",
+	"traffic-empty-canary-revision-under-a-hold": "a stopped canary whose canary pod is lost keeps the step's share on the canary revision until the workload rebuilds the pod: the stop leaves the split where it stood, and only an empty stable revision moves it (left open)",
+	"held-short-after-scale":                     "a scale under a step changes the staged share: a created Instance runs the canary revision, a removed one was a staged one (left open)",
+	"share-exceeded-after-scale":                 "a created Instance runs the canary revision, so the unit runs more on it than the step stages (left open)",
+	"promoted-short-forced":                      "a forced promote opens the step without its capacity by the operator's own word (the CanaryStepForced event)",
+	"one-sided-version-beyond-a-batch":           "one side's new Instances serve a version the other side has none on, past one batch of that side, with no traffic on it yet: the batch step moves the decoder first inside every batch, so this picture is left by an event (a decoder's new Instance lost or scaled away, a budget lowered under a batch already open, a push), not by the staging",
+	"one-sided-version-with-traffic":             "a push before the cutover names version 1 stable: each member sends its whole traffic to its one version 1 pod, and a member with no version 1 pod left sends it to the revision serving most of its pods, so a version one side alone still runs carries weight (the open decision on the stable identity of a run opened over an unfinished canary); a stable pod lost on one member makes no such picture, since the unit has one stable side and both members move together",
+	"traffic-on-a-thin-version":                  "a version carries the weight of the step it last served while its Instances on one side are rebuilt or retired, so the ones left carry more than twice their share",
+	"ratio-drift-5":                              "a version's engine:decoder ratio drifts more than 5 percent from the fleet's while Instances build: inside a batch the decoder, the named side, moves first and the engines follow once it serves, so version 2 is one decoder ahead and version 1 one decoder behind until the batch closes; the batches themselves are planned to the tolerance in the share sense (the gap of the two sides' shares), which the ratio sense reads as a drift on the small counts",
+	"ratio-drift-10":                             "the same at 10 percent",
+	"ratio-drift-20":                             "the same at 20 percent",
+	"ratio-drift-5-at-rest":                      "a version's engine:decoder ratio drifts more than 5 percent from the fleet's with nothing building: the step's own rounding per side (12 prefill and 4 decode at 10 percent stage 2:1, the first picture a plain roll of that shape takes too), or a side the plan has moved one batch ahead between two steps",
+	"ratio-drift-10-at-rest":                     "the same at 10 percent",
+	"ratio-drift-20-at-rest":                     "the same at 20 percent",
+	"share-skew-5":                               "the two sides' shares of a version sit more than 5 percent apart while Instances build (the paired batch plan's reading of a tolerance): the decoder's Instance of a batch serves before the engines' start, so the picture inside a batch is one decoder, a quarter of a side of 4, ahead",
+	"share-skew-10":                              "the same at 10 percent",
+	"share-skew-20":                              "the same at 20 percent",
+	"share-skew-5-at-rest":                       "the two sides' shares of a version sit more than 5 percent apart with nothing building: the step's rounding (12:4 at 10 percent: 17 and 25 percent, the closest batch to the line the planner can take), or an event (a pod lost, a scale, a push) that moved one side",
+	"share-skew-10-at-rest":                      "the same at 10 percent",
+	"share-skew-20-at-rest":                      "the same at 20 percent",
 }
 
 // pairFailingClasses are the readings that fail the test: a quiet state
 // with no way out, traffic on a revision that has no pod while the unit is
-// live, a step left before both sides served it without a force, a held
+// live or on an empty stable revision while it is held, a step left before
+// both sides served it without a force, a held
 // share short of the step's, a run closed twice or reopened after it
 // completed, a play that reaches no end, a controller that does not settle,
 // and an error inside the production code. A class in neither list is one
 // nobody tracks yet and fails too.
 var pairFailingClasses = map[string]bool{
-	"no-way-out": true, "traffic-empty-revision": true, "promoted-short": true,
+	"no-way-out": true, "traffic-empty-revision": true, "traffic-empty-stable-revision-under-a-hold": true, "promoted-short": true,
 	"held-short": true, "share-exceeded": true, "run-closed-twice": true, "reopen-after-complete": true,
 	"unsettled": true, "depth": true, "model-error": true,
 }
@@ -1960,25 +2053,72 @@ func (w *pairWorld) serveSide(st *pairState, member int) *pairState {
 	return st
 }
 
+// playUntil plays the straight run from a state, the sides coming up in
+// turns, until the state satisfies until, and returns that state.
+func (w *pairWorld) playUntil(st *pairState, until func(*pairState) bool) *pairState {
+	for depth := 0; depth < 400; depth++ {
+		if until(st) {
+			return st
+		}
+		mv, ok := w.nextStraightMove(st, depth)
+		if !ok {
+			break
+		}
+		st = w.apply(st, mv)
+	}
+	w.t.Fatalf("the straight run never reached the picture asked for: %s", w.describe(st))
+	return st
+}
+
+// serveInTurns brings the two sides' building Instances up in turns, the
+// decoder's first, leaving a lost pod lost, until the state satisfies until,
+// and returns that state.
+func (w *pairWorld) serveInTurns(st *pairState, until func(*pairState) bool) *pairState {
+	for round := 0; round < 400; round++ {
+		if until(st) {
+			return st
+		}
+		moved := false
+		for _, member := range []int{1, 0} {
+			for idx, r := range st.members[member].rows {
+				if r.inFlight() {
+					st = w.apply(st, pairMove{kind: "serve", member: member, idx: idx})
+					moved = true
+					break
+				}
+			}
+			if moved {
+				break
+			}
+		}
+		if !moved {
+			break
+		}
+	}
+	w.t.Fatalf("serving the sides in turns never reached the picture asked for: %s", st)
+	return st
+}
+
 // TestPrefillDecodeCanary_TheFinalStepKeepsThePreviousWeightOnAThinningStableVersion
 // records the current behaviour on the reference shape. 12 prefill and 8 decode
 // under RecreatePod at 10 percent run a 10/30/60/100 canary. At the final
-// step the version 1 Instances are rebuilt two engines and one decoder at a
-// time, and the split stays at the step before (60 percent to version 2, 40
-// to version 1) until both sides reach the final step's capacity. With the
-// decoder side rebuilt down to its one kept Instance and the engine side still
-// rebuilding, version 1 is 2 engines and 1 decoder carrying 40 percent of
-// the traffic: a ratio 33 percent off the fleet's 3:2, and that one decoder
-// carrying 3.2 times its even share. Whether the weight should follow the
-// capacity is not decided yet; this test records the current behaviour and
-// is updated when it changes.
+// step the version 1 Instances are rebuilt in batches of two engines beside
+// one decoder, the decoder first, and the split stays at the step before (60
+// percent to version 2, 40 to version 1) until both sides reach the final
+// step's capacity. With the decoder side rebuilt down to its one kept
+// Instance and the engine side on its last batch, version 1 is that decoder
+// and at most three engines carrying 40 percent of the traffic: the one
+// decoder carries 3.2 times its even share. Whether the weight should
+// follow the capacity is left open; this test records the current
+// behaviour.
 func TestPrefillDecodeCanary_TheFinalStepKeepsThePreviousWeightOnAThinningStableVersion(t *testing.T) {
 	w := newPairWorld(t, pairConfigFor([2]int32{12, 8}, v1beta1.UpdateStrategyRecreatePod, "four-manual", 0, false), canaryScheme(t))
 	st := w.playTo("staging-3")
-	st = w.serveSide(st, 1)
+	st = w.playUntil(st, func(st *pairState) bool { return st.members[1].servingOn("r1") == 1 })
 	engine, decoder := st.members[0], st.members[1]
-	if e, d := engine.servingOn("r1"), decoder.servingOn("r1"); e != 2 || d != 1 {
-		t.Fatalf("the picture is wrong: version 1 must stand at 2 engines and 1 decoder, got %d:%d (%s)", e, d, st)
+	e, d := engine.servingOn("r1"), decoder.servingOn("r1")
+	if d != 1 || e < 1 || e > 3 {
+		t.Fatalf("the picture is wrong: version 1 must stand at its last decoder beside at most one engine batch, got %d:%d (%s)", e, d, st)
 	}
 	if w := w.trafficOn(st, decoder, "r1"); w != 40 {
 		t.Fatalf("the decoder split sends %d percent to version 1; the current behaviour keeps the previous step's 40; update this test when it changes", w)
@@ -1986,69 +2126,65 @@ func TestPrefillDecodeCanary_TheFinalStepKeepsThePreviousWeightOnAThinningStable
 	if w := w.trafficOn(st, engine, "r1"); w != 40 {
 		t.Fatalf("the engine split sends %d percent to version 1; the current behaviour keeps the previous step's 40", w)
 	}
-	if drift := ratioDriftPercent(2, 1, 12, 8); drift < 33 || drift > 34 {
-		t.Fatalf("version 1 at 2:1 against 12:8 reads %.1f percent off; the arithmetic is wrong", drift)
-	}
-	t.Logf("version 1 at 2 engines and 1 decoder carries 40 percent of the traffic: the decoder at %.1f times its even share, the engines at %.1f", 40*8.0/(100*1), 40*12.0/(100*2))
+	t.Logf("version 1 at %d engines and 1 decoder carries 40 percent of the traffic: the decoder at %.1f times its even share, the engines at %.1f", e, 40*8.0/(100*1), 40*12.0/(100*float64(e)))
 }
 
-// TestPrefillDecodeCanary_AFasterSideRetiresItsOldPodsUnderTheStepsWeight
+// TestPrefillDecodeCanary_TheFinalStepKeepsThePreviousWeightOnTheLastStableDecoderUnderSurge
 // records the current behaviour under SurgeThenDrain. 20 prefill and 10 decode at
-// 10 percent run a 25/50/100 canary with timed gates. At the final step the
-// decoder's replacements come up one at a time and each old pod leaves as
-// its replacement serves, while the engine side, twice as many Instances at
-// two at a time, is still coming up. With the decoder side down to its held
-// Instance, version 1 is 10 engines (8 serving plus 2 whose replacements are
-// building) and 1 decoder, carrying the 50 percent of the step before: the
-// one decoder answers ten engines' worth of prefill at 5 times its even
-// share. Whether the weight should follow the capacity is not decided yet;
-// this test records the current behaviour and is updated when it changes.
-func TestPrefillDecodeCanary_AFasterSideRetiresItsOldPodsUnderTheStepsWeight(t *testing.T) {
+// 10 percent run a 25/50/100 canary with timed gates. At the final step each
+// old pod leaves as its replacement serves, in batches of two engines beside
+// one decoder, the decoder first. With the decoder side down to its held
+// Instance, version 1 is 1 decoder beside at most three engines (the held
+// one and the last batch, whose replacements may still be building),
+// carrying the 50 percent of the step before: the one decoder answers at 5
+// times its even share. Whether the weight should follow the capacity is not
+// decided yet; this test records the current behaviour.
+func TestPrefillDecodeCanary_TheFinalStepKeepsThePreviousWeightOnTheLastStableDecoderUnderSurge(t *testing.T) {
 	w := newPairWorld(t, pairConfigFor([2]int32{20, 10}, v1beta1.UpdateStrategySurgeThenDrain, "three-timed", 600, false), canaryScheme(t))
 	st := w.playTo("staging-2")
-	st = w.serveSide(st, 1)
+	st = w.playUntil(st, func(st *pairState) bool { return st.members[1].servingOn("r1") == 1 })
 	engine, decoder := st.members[0], st.members[1]
-	if e, d := engine.servingOn("r1"), decoder.servingOn("r1"); e != 10 || d != 1 {
-		t.Fatalf("the picture is wrong: version 1 must stand at 10 engines and 1 decoder, got %d:%d (%s)", e, d, st)
+	e, d := engine.servingOn("r1"), decoder.servingOn("r1")
+	if d != 1 || e < 1 || e > 3 {
+		t.Fatalf("the picture is wrong: version 1 must stand at its last decoder beside at most one engine batch, got %d:%d (%s)", e, d, st)
 	}
 	if w := w.trafficOn(st, decoder, "r1"); w != 50 {
 		t.Fatalf("the decoder split sends %d percent to version 1; the current behaviour keeps the previous step's 50; update this test when it changes", w)
 	}
-	t.Logf("version 1 at 10 engines and 1 decoder carries 50 percent of the traffic: the decoder at %.1f times its even share, a ratio %.0f percent off the fleet's 2:1", 50*10.0/(100*1), ratioDriftPercent(10, 1, 20, 10))
+	t.Logf("version 1 at %d engines and 1 decoder carries 50 percent of the traffic: the decoder at %.1f times its even share", e, 50*10.0/(100*1))
 }
 
-// TestPrefillDecodeCanary_ALostStableEnginePodMovesOnlyTheEnginesSplit
-// records the current behaviour of the two splits when one member's stable side
-// empties. 12 prefill and 8 decode under RecreatePod at 10 percent, a
-// 10/30/60/100 canary at its final step: the engine's held version 1 pod is
-// lost while its other version 1 Instances are being rebuilt, so no engine
-// serves version 1. The engine's split moves wholly onto version 2, as the
-// per-member rule says; the decoder's split keeps 40 percent on version 1,
-// which has no engine. The canary side of a split is held for the unit
-// (one member's missing canary pod zeroes every member's canary weight);
-// the stable side is not. Whether the stable side should follow a unit-wide
-// rule is not decided yet; this test records the current behaviour and is
-// updated when it changes.
-func TestPrefillDecodeCanary_ALostStableEnginePodMovesOnlyTheEnginesSplit(t *testing.T) {
+// TestPrefillDecodeCanary_ALostStableEnginePodMovesTheUnitsSplitTogether
+// reads the two splits when one member's stable side loses its last pod on
+// the reference shape. 12 prefill and 8 decode under RecreatePod at 10
+// percent run a 10/30/60/100 canary; the final step is staging and the step
+// before left 60 percent on version 2 and 40 on version 1. The engine's
+// held version 1 pod is lost, and the two sides go on rebuilding in turns
+// until the engine's last batch is being rebuilt, so no engine serves
+// version 1 while the decoder's kept Instance still does. The unit has one
+// stable side: with no engine behind it, the 40 percent moves onto version
+// 2 on both members, so no request is split between a version 2 engine and
+// a version 1 decoder. A rule that reads the stable side per member sends
+// the engine 100 and leaves the decoder's 40 on a version no engine runs.
+func TestPrefillDecodeCanary_ALostStableEnginePodMovesTheUnitsSplitTogether(t *testing.T) {
 	w := newPairWorld(t, pairConfigFor([2]int32{12, 8}, v1beta1.UpdateStrategyRecreatePod, "four-manual", 0, false), canaryScheme(t))
 	st := w.playTo("staging-3")
 	st = w.apply(st, pairMove{kind: "podloss", member: 0, idx: 0})
-	// The engine's two rebuilds in flight come up, so its last serving
-	// version 1 Instance starts its own rebuild; the lost pod is still gone.
-	for _, idx := range []int{1, 2} {
-		st = w.apply(st, pairMove{kind: "serve", member: 0, idx: idx})
-	}
+	st = w.serveInTurns(st, func(st *pairState) bool {
+		engine := st.members[0]
+		return engine.servingOn("r1") == 0 && engine.inFlightCount() > 0
+	})
 	engine, decoder := st.members[0], st.members[1]
 	if e, d := engine.servingOn("r1"), decoder.servingOn("r1"); e != 0 || d == 0 {
 		t.Fatalf("the picture is wrong: no engine and some decoder must serve version 1, got %d:%d (%s)", e, d, st)
 	}
 	if w := w.trafficOn(st, engine, "r2"); w != 100 {
-		t.Fatalf("the engine split sends %d percent to version 2; with no engine on version 1 the per-member rule sends it 100", w)
+		t.Fatalf("the engine split sends %d percent to version 2; with no engine on version 1 it must send 100", w)
 	}
-	if w := w.trafficOn(st, decoder, "r1"); w != 40 {
-		t.Fatalf("the decoder split sends %d percent to version 1; the current behaviour keeps the previous step's 40 there while no engine runs version 1; update this test when it changes", w)
+	if r1, r2 := w.trafficOn(st, decoder, "r1"), w.trafficOn(st, decoder, "r2"); r1 != 0 || r2 != 100 {
+		t.Fatalf("the decoder split sends %d percent to version 1 and %d to version 2; the unit has one stable side, so with no engine on version 1 the decoder's 40 moves to version 2 with the engine's", r1, r2)
 	}
-	t.Logf("engine split: version 2 at 100; decoder split: version 1 at 40 with no engine on version 1 (%s)", st)
+	t.Logf("engine split: version 2 at 100; decoder split: version 2 at 100 while one decoder still serves version 1 (%s)", st)
 }
 
 // TestPrefillDecodeCanary_RunsReachAnEnd explores a canary over the engine
@@ -2090,8 +2226,8 @@ func TestPrefillDecodeCanary_EveryConfigurationCompletesWhenNothingGoesWrong(t *
 // version 2 are rebuilt three and one at a time: the one version 1 engine
 // carries 30 times its even share and the one decoder 10 times until the
 // revert brings the others back. Whether the rollback should move the weight
-// with the reverted capacity is not decided yet; this test records the
-// current behaviour and is updated when it changes.
+// with the reverted capacity is left open; this test records the
+// current behaviour.
 func TestPrefillDecodeCanary_ARollbackAtTheFinalStepSendsAllTrafficToTheKeptInstances(t *testing.T) {
 	w := newPairWorld(t, pairConfigFor([2]int32{30, 10}, v1beta1.UpdateStrategySurgeThenDrain, "four-timed", 600, false), canaryScheme(t))
 	st := w.playTo("draining")
@@ -2121,8 +2257,7 @@ func TestPrefillDecodeCanary_ARollbackAtTheFinalStepSendsAllTrafficToTheKeptInst
 // 1: each member sends 100 percent of its traffic to its one version 1 pod
 // and nothing to its 14 version 2 Instances until a version 3 pod serves.
 // Whether the stable identity should follow the Instances that serve is not
-// decided yet; this test records the current behaviour and is updated when
-// it changes.
+// decided yet; this test records the current behaviour.
 func TestPrefillDecodeCanary_ASecondPushBeforeTheCutoverNamesVersionOneStable(t *testing.T) {
 	w := newPairWorld(t, pairConfigFor([2]int32{15, 15}, v1beta1.UpdateStrategySurgeThenDrain, "four-timed", 600, false), canaryScheme(t))
 	st := w.playTo("draining")
@@ -2142,73 +2277,102 @@ func TestPrefillDecodeCanary_ASecondPushBeforeTheCutoverNamesVersionOneStable(t 
 	t.Logf("after the push both splits send 100 percent to version 1, one pod per side, and nothing to version 2 (%s)", st)
 }
 
-// TestPrefillDecodeCanary_APauseLongerThanTheReadyTimeoutStopsTheUnitAndTheResumeRestartsAtStepZero
-// records a long pause on the reference shape. 24 prefill and 8 decode
+// TestPrefillDecodeCanary_APauseLongerThanTheReadyTimeoutStopsTheClockAndTheResumeContinuesAtTheStoppedStep
+// drives the reference shape through a long pause. 24 prefill and 8 decode
 // under RecreatePod at 10 percent run a 10/30/60/100 canary; the final step
 // is staging with 15 engines and 5 decoders on version 2 and three engines
-// and one decoder mid-rebuild. The operator pauses the rollout: the rebuilds
-// in flight finish (18 and 6 on version 2) and nothing new starts. The
-// operator comes back after the ready timeout. The capacity wait's clock ran
-// through the pause (not decided yet), so the pass
-// after the unpause stops the unit Failed with CapacityTimeout. That pass had
-// already projected the step's partition before it stopped, so one more
-// batch starts (three engines and one decoder); from the next pass on the
-// stop holds the roll where it stands, with each member's partition its
-// whole count: 21 engines and 7 decoders on version 2, 3 and 1 on version 1,
-// and the split still 60 to version 2 and 40 to version 1. The operator
-// resumes: the unit starts again at step 0 (not decided yet), whose split
-// sends 90 percent to version 1, the three engines and the one decoder the
-// stop kept there, 7.2 times their even share. Both readings record the
-// current behaviour and are updated when it changes.
-func TestPrefillDecodeCanary_APauseLongerThanTheReadyTimeoutStopsTheUnitAndTheResumeRestartsAtStepZero(t *testing.T) {
+// mid-rebuild: the batch step plans the step over the Instances it may
+// move (23 and 7), the decoder's share is ahead of the engine's, so the
+// engines catch up first and the decoder's next Instance waits for them.
+// The operator pauses the rollout: the rebuilds in flight finish (18 and 5
+// on version 2) and nothing new starts. The operator comes back after the
+// ready timeout. The pause stopped the capacity wait's clock, so the pass
+// after the unpause keeps the unit staging the final step and clocks the
+// wait again from that pass: no time spent paused counts toward the ready
+// timeout, and the pods have the whole timeout from the unpause. That pass
+// projects the step's partition, so one more start opens, the decoder's
+// next Instance, with the engines' next batch waiting on it. A whole ready
+// timeout after the unpause, with six engines still to come up, the unit
+// stops Failed with CapacityTimeout; from then on the stop holds the roll
+// where it stands, with each member's partition its whole count: 18 engines
+// and 6 decoders on version 2, 6 and 2 on version 1, and the split still 60
+// to version 2 and 40 to version 1. The operator resumes: the unit continues
+// at the final step, the step the stop interrupted, so no split sends the
+// first step's 90 percent back to the six engines and two decoders the stop
+// kept on version 1; the split stands at 60/40 while the rest of the fleet
+// is rebuilt, and once the final step's capacity is up its 100 percent lands
+// and the cutover follows.
+func TestPrefillDecodeCanary_APauseLongerThanTheReadyTimeoutStopsTheClockAndTheResumeContinuesAtTheStoppedStep(t *testing.T) {
 	w := newPairWorld(t, pairConfigFor([2]int32{24, 8}, v1beta1.UpdateStrategyRecreatePod, "four-manual", 0, false), canaryScheme(t))
 	st := w.playTo("staging-3")
 	st = w.apply(st, pairMove{kind: "pause"})
 	st = w.serveSide(st, 0)
 	st = w.serveSide(st, 1)
-	expectPairCounts(t, w, st, 18, 6, 6, 2, "under the pause, with the rebuilds in flight finished")
+	expectPairCounts(t, w, st, 18, 6, 5, 3, "under the pause, with the rebuilds in flight finished")
 	st = w.apply(st, pairMove{kind: "clock-all"})
 	st = w.apply(st, pairMove{kind: "unpause"})
 	u := w.unit(st)
-	if u == nil || u.state != rollout.CanaryStateFailed || u.record.Failed == nil || u.record.Failed.Reason != v1beta1.CanaryFailureCapacityTimeout {
-		t.Fatalf("the unit must read Failed with CapacityTimeout after a pause longer than the ready timeout; got %s", w.describe(st))
+	if u == nil || u.record == nil || u.state != rollout.CanaryStateStaging || u.record.CurrentStep != 3 || u.record.Failed != nil {
+		t.Fatalf("the unit must still stage the final step after a pause longer than the ready timeout; got %s", w.describe(st))
 	}
-	// The stop holds the roll where it stands: the batch the stopping pass
+	if since := u.record.CapacityWaitSince; since == nil || !since.Time.Equal(st.now) {
+		t.Fatalf("the capacity wait must be clocked again from the first pass after the pause, got %v at %s", since, st.now)
+	}
+	// A whole ready timeout after the unpause, with the engines still short,
+	// the unit stops: the pods had the whole timeout from the unpause.
+	st = w.apply(st, pairMove{kind: "clock-all"})
+	u = w.unit(st)
+	if u == nil || u.state != rollout.CanaryStateFailed || u.record.Failed == nil || u.record.Failed.Reason != v1beta1.CanaryFailureCapacityTimeout {
+		t.Fatalf("the unit must read Failed with CapacityTimeout a whole ready timeout after the pause ended; got %s", w.describe(st))
+	}
+	stopped := u.record.CurrentStep
+	if stopped != 3 {
+		t.Fatalf("the picture is wrong: the stop must interrupt the final step, got step %d (%s)", stopped, w.describe(st))
+	}
+	// The stop holds the roll where it stands: the start the unpause pass
 	// had already released finishes, and nothing moves after it.
 	st = w.serveSide(st, 0)
 	st = w.serveSide(st, 1)
-	expectPairCounts(t, w, st, 21, 3, 7, 1, "after the stop")
+	expectPairCounts(t, w, st, 18, 6, 6, 2, "after the stop")
 	expectPairPartitions(t, st, 24, 8, "after the stop")
 	expectPairSplit(t, w, st, 40, 60, "after the stop")
 	st = w.apply(st, pairMove{kind: "resume"})
 	u = w.unit(st)
-	if u == nil || u.record == nil || u.record.CurrentStep != 0 {
-		t.Fatalf("the picture is wrong: the resume must start the unit again at step 0, got %s", w.describe(st))
+	if u == nil || u.record == nil || u.record.CurrentStep != stopped {
+		t.Fatalf("the resume must continue at step %d, the step the stop interrupted, got %s", stopped, w.describe(st))
 	}
-	expectPairCounts(t, w, st, 21, 3, 7, 1, "after the resume")
-	engine := st.members[0]
-	if weight := w.trafficOn(st, engine, "r1"); weight != 90 {
-		t.Fatalf("the engine split sends %d percent to version 1; the current behaviour is step 0's 90; update this test when it changes", weight)
+	expectPairSplit(t, w, st, 40, 60, "after the resume")
+	// The rest of the fleet comes up in the batch step's turns, the
+	// decoder's Instances of each batch first; the final step then shifts
+	// everything to version 2 and the cutover completes.
+	st = w.serveInTurns(st, func(st *pairState) bool {
+		return st.members[0].servingOn("r2") == 24 && st.members[1].servingOn("r2") == 8
+	})
+	if !w.finished(st) {
+		t.Fatalf("the resumed canary must reach its end once the final step's capacity is up, got %s", w.describe(st))
 	}
-	t.Logf("after the resume the engine split sends 90 percent to the three version 1 engines, %.1f times their even share (%s)", 90*24.0/(100*3), w.describe(st))
+	expectPairSplit(t, w, st, 0, 100, "after the cutover")
+	t.Logf("after the resume the unit continued at step %d and completed (%s)", stopped, w.describe(st))
 }
 
 // TestPrefillDecodeCanary_AStopAtTheFinalStepHoldsTheRollWhereItStands drives
 // the reference shape through a final step whose capacity never comes up.
 // 24 prefill and 8 decode under RecreatePod at 10 percent run a 10/30/60/100
 // canary; the final step is staging with 15 engines and 5 decoders on
-// version 2, three engines and one decoder mid-rebuild, and the rest on
-// version 1 under the split of the step before (60 to version 2, 40 to
-// version 1). The ready timeout passes and the unit stops Failed with
-// CapacityTimeout. The stop holds the roll where it stands: the rebuilds in
-// flight finish and no further Instance moves (18 engines and 6 decoders on
-// version 2, 6 and 2 on version 1), each member's partition is its whole
-// count, and the split stays at 60/40 on the pods that serve. The operator's
-// rollback ends the hold and returns every Instance to version 1.
+// version 2, three engines mid-rebuild (the batch step plans the step over
+// the 23 and 7 Instances it may move, the decoder's share is ahead, so the
+// engines catch up first and the decoder's next Instance waits for them),
+// and the rest on version 1 under the split of the step before (60 to
+// version 2, 40 to version 1). The ready timeout passes and the unit stops
+// Failed with CapacityTimeout. The stop holds the roll where it stands: the
+// rebuilds in flight finish and no further Instance moves (18 engines and 5
+// decoders on version 2, 6 and 3 on version 1), each member's partition is
+// its whole count, and the split stays at 60/40 on the pods that serve. The
+// operator's rollback ends the hold and returns every Instance to version 1.
 func TestPrefillDecodeCanary_AStopAtTheFinalStepHoldsTheRollWhereItStands(t *testing.T) {
 	w := newPairWorld(t, pairConfigFor([2]int32{24, 8}, v1beta1.UpdateStrategyRecreatePod, "four-manual", 0, false), canaryScheme(t))
 	st := w.playTo("staging-3")
-	expectPairCounts(t, w, st, 15, 6, 5, 2, "at the final step's staging")
+	expectPairCounts(t, w, st, 15, 6, 5, 3, "at the final step's staging")
 	st = w.apply(st, pairMove{kind: "clock-all"})
 	u := w.unit(st)
 	if u == nil || u.state != rollout.CanaryStateFailed || u.record.Failed == nil || u.record.Failed.Reason != v1beta1.CanaryFailureCapacityTimeout {
@@ -2216,15 +2380,18 @@ func TestPrefillDecodeCanary_AStopAtTheFinalStepHoldsTheRollWhereItStands(t *tes
 	}
 	st = w.serveSide(st, 0)
 	st = w.serveSide(st, 1)
-	expectPairCounts(t, w, st, 18, 6, 6, 2, "after the stop")
+	expectPairCounts(t, w, st, 18, 6, 5, 3, "after the stop")
 	expectPairPartitions(t, st, 24, 8, "after the stop")
 	expectPairSplit(t, w, st, 40, 60, "after the stop")
 	if u := w.unit(st); u == nil || u.state != rollout.CanaryStateFailed {
 		t.Fatalf("the hold must stand until the operator acts, got %s", w.describe(st))
 	}
 	st = w.apply(st, pairMove{kind: "rollback"})
-	st = w.serveSide(st, 0)
-	st = w.serveSide(st, 1)
+	// The revert comes back in the batch step's turns, the decoder's
+	// Instances of each batch first.
+	st = w.serveInTurns(st, func(st *pairState) bool {
+		return st.members[0].servingOn("r1") == 24 && st.members[1].servingOn("r1") == 8
+	})
 	if u := w.unit(st); u == nil || u.state != rollout.CanaryStateRolledBack {
 		t.Fatalf("the rollback must end the hold and settle, got %s", w.describe(st))
 	}
@@ -2265,4 +2432,95 @@ func expectPairSplit(t *testing.T, w *pairWorld, st *pairState, onOld, onNew int
 			t.Fatalf("%s the %s split must send %d percent to version 1 and %d to version 2, got %d and %d (%s)", when, m.comp, onOld, onNew, w1, w2, w.describe(st))
 		}
 	}
+}
+
+// onVersion counts a side's Instances still standing on a revision: serving
+// it, or taken down from it by an attempt that has not come back yet.
+func (m pairMemberState) onVersion(hash string) int32 {
+	var n int32
+	for _, r := range m.rows {
+		if r.rev == hash {
+			n++
+		}
+	}
+	return n
+}
+
+// inFlightCount counts a side's Instances with an attempt open.
+func (m pairMemberState) inFlightCount() int32 {
+	var n int32
+	for _, r := range m.rows {
+		if r.inFlight() {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPrefillDecodeCanary_AStepStartsTheDecoderBeforeTheEngines holds a
+// step's staging to the batch step. 12 prefill and 4 decode under
+// RecreatePod at 10 percent run a 10/30/60/100 canary; the first step
+// stages 2 engines and 1 decoder. The decoder's Instance moves first and the
+// two engines start only once it serves, so version 2 never stands on
+// engines alone. At rest the step reads 2:1 against the fleet's 3:1, the
+// step's own rounding on each side (10 percent of 12 and of 4, rounded up),
+// the same first picture a plain roll of this shape takes. Without the
+// batch step both sides start in the same pass.
+func TestPrefillDecodeCanary_AStepStartsTheDecoderBeforeTheEngines(t *testing.T) {
+	w := newPairWorld(t, pairConfigFor([2]int32{12, 4}, v1beta1.UpdateStrategyRecreatePod, "four-manual", 0, false), canaryScheme(t))
+	st := w.initial()
+	w.settle(st)
+	if e, d := st.members[0].inFlightCount(), st.members[1].inFlightCount(); e != 0 || d != 1 {
+		t.Fatalf("after the push the decoder's Instance must move alone and the engines wait for it; got %d engines and %d decoders moving (%s)", e, d, st)
+	}
+	st = w.serveSide(st, 1)
+	if e := st.members[0].inFlightCount(); e != 2 {
+		t.Fatalf("once the decoder's Instance serves the two engines of the step must start; got %d moving (%s)", e, st)
+	}
+	st = w.serveSide(st, 0)
+	engine, decoder := st.members[0], st.members[1]
+	if e, d := engine.servingOn("r2"), decoder.servingOn("r2"); e != 2 || d != 1 {
+		t.Fatalf("at rest the step must stand at 2 engines and 1 decoder on version 2, got %d:%d (%s)", e, d, st)
+	}
+	t.Logf("at rest version 2 stands at 2 engines beside 1 decoder, %.0f percent off the fleet's 3:1: the step's rounding on each side, the first picture a plain roll of this shape takes too", ratioDriftPercent(2, 1, 12, 4))
+}
+
+// TestPrefillDecodeCanary_ARevertMovesBothSidesTogether holds a late
+// rollback to the batch step. 30 prefill and 10 decode under SurgeThenDrain
+// at 10 percent run a 10/30/60/100 timed canary with a ten-minute drain
+// window; the final step has shifted 100 percent to version 2 and keeps one
+// Instance per side on version 1. The operator rolls back and the two sides
+// come back one Instance at a time in turns. The revert is planned in
+// batches of 3 engines beside 1 decoder, the decoder first, so at no moment
+// is version 2 more than one engine batch off the fleet's 3:1: with e
+// engines and d decoders still on version 2, |e - 3d| stays at 3 or below.
+// With each side reverting at its own pace the same play reads version 2 at
+// 21 engines beside 1 decoder.
+func TestPrefillDecodeCanary_ARevertMovesBothSidesTogether(t *testing.T) {
+	w := newPairWorld(t, pairConfigFor([2]int32{30, 10}, v1beta1.UpdateStrategySurgeThenDrain, "four-timed", 600, false), canaryScheme(t))
+	st := w.playTo("draining")
+	st = w.apply(st, pairMove{kind: "rollback"})
+	var worst int32
+	worstPicture := ""
+	for depth := 0; !w.finished(st); depth++ {
+		if depth > 400 {
+			t.Fatalf("the revert did not end in 400 moves: %s", w.describe(st))
+		}
+		e, d := st.members[0].onVersion("r2"), st.members[1].onVersion("r2")
+		if off := e - 3*d; off > worst || -off > worst {
+			if off < 0 {
+				off = -off
+			}
+			worst, worstPicture = off, fmt.Sprintf("%d engines beside %d decoders still on version 2 (path: %s)", e, d, pairPath(st))
+		}
+		mv, ok := w.nextStraightMove(st, depth)
+		if !ok {
+			t.Fatalf("the revert cannot move on: %s", w.describe(st))
+		}
+		st = w.apply(st, mv)
+	}
+	if worst > 3 {
+		t.Fatalf("the revert left one side far ahead of the other: at worst %s, %d engines off the fleet's 3:1 where one engine batch is 3", worstPicture, worst)
+	}
+	t.Logf("through the revert version 2 stayed within one engine batch of 3:1 (at worst %s)", worstPicture)
 }

@@ -47,6 +47,7 @@ func TestSplitCleanupWaitFollowsMovesOnly(t *testing.T) {
 			routerWeights := map[string]int32{"a": 1, "b": 3}
 			s.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(4), MaxReplicas: 8}}
 			s.Spec.Placement.ClusterAffinity = perMemberTerms(map[string]int32{"a": 1, "b": 1}, nil, routerWeights)
+			withRatioHeadroom(s)
 			for _, candidate := range s.Status.Placement.Candidates {
 				candidate.Allocation.Weight = ptr.To[int64](1)
 				candidate.Allocation.ComponentMatches = []v1beta1.ComponentAffinityMatch{{Component: v1beta1.RouterComponent, Weight: ptr.To(int64(routerWeights[candidate.Cluster]))}}
@@ -126,9 +127,10 @@ func TestSplitCleanupWaitFollowsMovesOnly(t *testing.T) {
 		{name: "member asked to drain", want: waiting, edit: assigned("b", func(a *v1beta1.CandidateAllocationStatus) { a.DrainRequested = true })},
 		{name: "component weights", want: ends, edit: func(s *v1beta1.InferenceService, _ map[string]plannedMemberObservation) {
 			s.Spec.Placement.ClusterAffinity = []v1beta1.ClusterAffinityTerm{{
-				Weights:     &v1beta1.ClusterAffinityWeights{Default: ptr.To[int32](1)},
+				Weights:     &v1beta1.ClusterAffinityWeights{Default: &v1beta1.ReplicaRatio{Min: ptr.To[int32](1)}},
 				MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{"a", "b"}}},
 			}}
+			withRatioHeadroom(s)
 		}},
 		{name: "divided routers at their shares", want: ends, edit: dividedRouters(map[string]int32{"a": 1, "b": 3}, map[string]int32{"a": 1, "b": 3})},
 		{name: "member below its router share", want: waiting, edit: dividedRouters(map[string]int32{"a": 1, "b": 3}, map[string]int32{"a": 1, "b": 2})},
@@ -269,6 +271,7 @@ func TestSplitPauseWaitsForADecoderReplacement(t *testing.T) {
 	}
 	source.Spec.Engine.MinReplicas = ptr.To(10)
 	source.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 3, "member-b": 2})
+	source.Spec.Placement.Split = nil
 	if err := f.reconciler.Update(t.Context(), source); err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +320,6 @@ func TestSplitPauseWaitsForADecoderReplacement(t *testing.T) {
 func TestSplitPauseWaitsForUnequalDecoderShares(t *testing.T) {
 	f := singleFixture(t, true)
 	f.source.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)}
 	f.source.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 2, "member-b": 1})
 	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(6), 36
 	f.source.Spec.Decoder.MinReplicas, f.source.Spec.Decoder.MaxReplicas = ptr.To(30), 180
@@ -384,7 +386,6 @@ func TestSplitPauseWaitsForUnequalDecoderShares(t *testing.T) {
 func TestSplitPauseWaitsForAnIneligibleMember(t *testing.T) {
 	f := singleFixture(t, true)
 	f.source.Spec.Placement.Mode = v1beta1.PlacementModeSplit
-	f.source.Spec.Placement.Split = &v1beta1.SplitSpec{MaxPerCluster: engineCap(18)}
 	f.source.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 2, "member-b": 1})
 	f.source.Spec.Engine.MinReplicas, f.source.Spec.Engine.MaxReplicas = ptr.To(6), 36
 	f.source.Spec.Decoder.MinReplicas, f.source.Spec.Decoder.MaxReplicas = ptr.To(30), 180
@@ -492,6 +493,14 @@ func TestSplitLowerMinimumKeepsServingCapacity(t *testing.T) {
 	if *healthy.Spec.Engine.MinReplicas < 6 {
 		t.Fatalf("the healthy member fell to %d while the other member serves nothing: %s", *healthy.Spec.Engine.MinReplicas, describeAutoscaledAll(t, f, got))
 	}
+}
+
+// withRatioHeadroom drops the split block, which weights replace, and gives
+// the engine a maxReplicas of 36, so each of two members may run up to 18
+// engines, the per-member headroom engineCap(18) gives an unweighted source.
+func withRatioHeadroom(s *v1beta1.InferenceService) {
+	s.Spec.Placement.Split = nil
+	s.Spec.Engine.MaxReplicas = 36
 }
 
 // autoscaledSplitFixture converges a Split service with an engine, a decoder

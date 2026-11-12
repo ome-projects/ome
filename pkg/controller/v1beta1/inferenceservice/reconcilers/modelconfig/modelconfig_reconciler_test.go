@@ -12,8 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	kubefake "k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -234,9 +233,7 @@ func TestModelConfigReconciler_Reconcile(t *testing.T) {
 				isvcToUpdate.Spec.Model.Name = "updated-base-model"
 				g.Expect(c.Update(ctx, isvcToUpdate)).To(gomega.Succeed())
 
-				// Get the reconciler from the test setup (it's not directly passed to validate func)
-				kubeClient := kubefake.NewSimpleClientset() // This is the clientset, not controller-runtime client
-				r := NewModelConfigReconciler(c, kubeClient, scheme.Scheme)
+				r := NewModelConfigReconciler(c, s, record.NewFakeRecorder(8))
 
 				// Second reconcile: This should trigger an update to the ConfigMap
 				_, err := r.Reconcile(ctx, isvcToUpdate)
@@ -406,9 +403,7 @@ func TestModelConfigReconciler_Reconcile(t *testing.T) {
 			// reconciler fetches and names as the owner.
 			c := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithObjects(tc.existingObjects...), fakeclient.WithObjects(tc.isvc))
 
-			// Create reconciler
-			kubeClient := kubefake.NewSimpleClientset()
-			reconciler := NewModelConfigReconciler(c, kubeClient, s)
+			reconciler := NewModelConfigReconciler(c, s, record.NewFakeRecorder(8))
 
 			// Reconcile
 			_, err := reconciler.Reconcile(ctx, tc.isvc)
@@ -422,4 +417,126 @@ func TestModelConfigReconciler_Reconcile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// modelLessService is a service that names no model, as it stands after an
+// operator removed spec.model.
+func modelLessService(uid types.UID) *v1beta1.InferenceService {
+	return &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-isvc", Namespace: "test-ns", UID: uid},
+		Spec:       v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}},
+	}
+}
+
+// modelConfigControlledBy is the service's model ConfigMap, naming one model,
+// under a controller reference to the given owner UID; no reference when the
+// UID is empty.
+func modelConfigControlledBy(isvc *v1beta1.InferenceService, ownerUID types.UID) *corev1.ConfigMap {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      constants.ModelConfigName(isvc.Name),
+			Namespace: isvc.Namespace,
+			UID:       "configmap-uid",
+		},
+		Data: map[string]string{constants.ModelConfigKey: `[{"modelName":"old-model","modelSpec":{}}]`},
+	}
+	if ownerUID == "" {
+		return cm
+	}
+	controller := true
+	cm.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: v1beta1.SchemeGroupVersion.String(),
+		Kind:       "InferenceService",
+		Name:       isvc.Name,
+		UID:        ownerUID,
+		Controller: &controller,
+	}}
+	return cm
+}
+
+// A service named a model and then dropped it: the ConfigMap written for the
+// model goes with the field, and naming a model again writes it again.
+func TestModelConfigReconciler_RemovingTheModelDeletesTheConfigMapItWrote(t *testing.T) {
+	logf.SetLogger(logr.Discard())
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+	s := fakeclient.Scheme(t)
+
+	model := &v1beta1.ClusterBaseModel{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-cluster-base-model"},
+		Spec:       v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "safetensors"}},
+	}
+	isvc := modelLessService("isvc-uid")
+	isvc.Spec.Model = &v1beta1.ModelRef{Name: model.Name}
+	deletes := fakeclient.CountingVerb(fakeclient.Delete)
+	c := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithObjects(model, isvc), deletes)
+	reconciler := NewModelConfigReconciler(c, s, record.NewFakeRecorder(8))
+	key := types.NamespacedName{Name: constants.ModelConfigName(isvc.Name), Namespace: isvc.Namespace}
+
+	_, err := reconciler.Reconcile(ctx, isvc)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	written := &corev1.ConfigMap{}
+	g.Expect(c.Get(ctx, key, written)).To(gomega.Succeed())
+
+	isvc.Spec.Model = nil
+	_, err = reconciler.Reconcile(ctx, isvc)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(apierrors.IsNotFound(c.Get(ctx, key, &corev1.ConfigMap{}))).To(gomega.BeTrue(), "the ConfigMap outlives the model field")
+	options := fakeclient.OptionsOf[client.DeleteOptions](deletes)
+	g.Expect(options).To(gomega.HaveLen(1))
+	g.Expect(options[0].Preconditions).NotTo(gomega.BeNil())
+	g.Expect(options[0].Preconditions.UID).To(gomega.HaveValue(gomega.Equal(written.UID)), "the delete names the object that was read")
+
+	_, err = reconciler.Reconcile(ctx, isvc)
+	g.Expect(err).NotTo(gomega.HaveOccurred(), "a second pass without the model and without the ConfigMap")
+	g.Expect(deletes.Count()).To(gomega.Equal(1))
+
+	isvc.Spec.Model = &v1beta1.ModelRef{Name: model.Name}
+	_, err = reconciler.Reconcile(ctx, isvc)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	again := &corev1.ConfigMap{}
+	g.Expect(c.Get(ctx, key, again)).To(gomega.Succeed())
+	g.Expect(again.Data[constants.ModelConfigKey]).To(gomega.ContainSubstring(model.Name))
+}
+
+// A ConfigMap of the service's name that this service does not control stays:
+// it belongs to another owner, or to nobody.
+func TestModelConfigReconciler_AServiceWithoutAModelLeavesAConfigMapItDoesNotControl(t *testing.T) {
+	logf.SetLogger(logr.Discard())
+	for name, ownerUID := range map[string]types.UID{
+		"controlled by another service": "another-service-uid",
+		"without an owner":              "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			ctx := context.Background()
+			s := fakeclient.Scheme(t)
+			isvc := modelLessService("isvc-uid")
+			cm := modelConfigControlledBy(isvc, ownerUID)
+			deletes := fakeclient.CountingVerb(fakeclient.Delete)
+			c := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithObjects(isvc, cm), deletes)
+
+			_, err := NewModelConfigReconciler(c, s, record.NewFakeRecorder(8)).Reconcile(ctx, isvc)
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(c.Get(ctx, client.ObjectKeyFromObject(cm), &corev1.ConfigMap{})).To(gomega.Succeed())
+			g.Expect(deletes.Count()).To(gomega.BeZero())
+		})
+	}
+}
+
+// The ConfigMap the service controls is deleted even when its data is not
+// the entry list the reconciler writes.
+func TestModelConfigReconciler_AServiceWithoutAModelDeletesTheConfigMapItControls(t *testing.T) {
+	logf.SetLogger(logr.Discard())
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+	s := fakeclient.Scheme(t)
+	isvc := modelLessService("isvc-uid")
+	cm := modelConfigControlledBy(isvc, isvc.UID)
+	cm.Data[constants.ModelConfigKey] = "not a list"
+	c := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithObjects(isvc, cm))
+
+	_, err := NewModelConfigReconciler(c, s, record.NewFakeRecorder(8)).Reconcile(ctx, isvc)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(apierrors.IsNotFound(c.Get(ctx, client.ObjectKeyFromObject(cm), &corev1.ConfigMap{}))).To(gomega.BeTrue())
 }

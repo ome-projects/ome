@@ -87,6 +87,9 @@ func renderClusterQueue(node *tree.Node, flavors map[string]struct{}, opts Optio
 	if group := resourceGroup(budgets, opts); group != nil {
 		spec = spec.WithResourceGroups(group)
 	}
+	if preemption := renderPreemption(node.Quota.Spec.Preemption); preemption != nil {
+		spec = spec.WithPreemption(preemption)
+	}
 
 	return kueueac.ClusterQueue(node.Name()).
 		WithLabels(labelsFor(node, opts)).
@@ -154,11 +157,8 @@ func resourceQuota(name corev1.ResourceName, funded map[string]v1beta1.Accelerat
 	// "at least this much, plus whatever the cohort is not using". Leaving the
 	// field off translates a ceiling into a floor.
 	//
-	// It reads worse than it sounds, because this plane sets no preemption and
-	// Kueue defaults reclaimWithinCohort to Never: an unbounded borrower cannot
-	// be made to give a share back, so nominal would be neither a ceiling for
-	// the borrower nor a floor for the lender. Burst stays available, per
-	// budget, by authoring the limit.
+	// Borrowing requires an explicit budget limit. Reclaiming borrowed quota
+	// also requires a preemption policy on the incoming queue.
 	limit := zero
 	if budget.BorrowingLimit != nil {
 		limit = *budget.BorrowingLimit

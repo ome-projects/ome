@@ -266,24 +266,50 @@ func (b *HTTPRouteBuilder) addIsvcHeaders(name string, namespace string) gateway
 	}
 }
 
-func (b *HTTPRouteBuilder) createHTTPRouteRule(routeMatches []gatewayapiv1.HTTPRouteMatch, filters []gatewayapiv1.HTTPRouteFilter,
-	serviceName, namespace string, port int32, timeout *gatewayapiv1.Duration,
-) gatewayapiv1.HTTPRouteRule {
-	var backendRefs []gatewayapiv1.HTTPBackendRef
-	if serviceName != "" {
-		backendRefs = []gatewayapiv1.HTTPBackendRef{
-			{
-				BackendRef: gatewayapiv1.BackendRef{
-					BackendObjectReference: gatewayapiv1.BackendObjectReference{
-						Kind:      ptr.To(gatewayapiv1.Kind(constants.ServiceKind)),
-						Name:      gatewayapiv1.ObjectName(serviceName),
-						Namespace: (*gatewayapiv1.Namespace)(&namespace),
-						Port:      (*gatewayapiv1.PortNumber)(&port),
-					},
-				},
-			},
+// componentBackendRefs renders the backends of one Component's route from the
+// traffic targets its rollout engine publishes on status.components.<c>.traffic:
+// one weighted backendRef per target, on the per-revision Service the target
+// names, so the percentages in status and the weights the gateway applies are
+// one value. A Component that publishes no targets routes to its aggregate
+// Service alone, unweighted. A target's port is its own Service's port; while
+// that Service cannot be read, the Component's port stands in.
+func (b *HTTPRouteBuilder) componentBackendRefs(ctx context.Context, isvc *v1beta1.InferenceService, component v1beta1.ComponentType,
+	serviceName string, port int32,
+) []gatewayapiv1.HTTPBackendRef {
+	targets := isvc.Status.Components[component].Traffic
+	refs := make([]gatewayapiv1.HTTPBackendRef, 0, len(targets))
+	for _, target := range targets {
+		if target.RevisionName == "" || target.Percent <= 0 {
+			continue
 		}
+		targetPort := b.resolveServicePort(ctx, isvc.Namespace, target.RevisionName, port)
+		refs = append(refs, serviceBackendRef(target.RevisionName, isvc.Namespace, targetPort, ptr.To(target.Percent)))
 	}
+	if len(refs) == 0 {
+		return []gatewayapiv1.HTTPBackendRef{serviceBackendRef(serviceName, isvc.Namespace, port, nil)}
+	}
+	return refs
+}
+
+// serviceBackendRef is one Service backend of a route rule; a nil weight
+// leaves the gateway's default.
+func serviceBackendRef(serviceName, namespace string, port int32, weight *int32) gatewayapiv1.HTTPBackendRef {
+	return gatewayapiv1.HTTPBackendRef{
+		BackendRef: gatewayapiv1.BackendRef{
+			BackendObjectReference: gatewayapiv1.BackendObjectReference{
+				Kind:      ptr.To(gatewayapiv1.Kind(constants.ServiceKind)),
+				Name:      gatewayapiv1.ObjectName(serviceName),
+				Namespace: (*gatewayapiv1.Namespace)(&namespace),
+				Port:      (*gatewayapiv1.PortNumber)(&port),
+			},
+			Weight: weight,
+		},
+	}
+}
+
+func (b *HTTPRouteBuilder) createHTTPRouteRule(routeMatches []gatewayapiv1.HTTPRouteMatch, filters []gatewayapiv1.HTTPRouteFilter,
+	backendRefs []gatewayapiv1.HTTPBackendRef, timeout *gatewayapiv1.Duration,
+) gatewayapiv1.HTTPRouteRule {
 	rule := gatewayapiv1.HTTPRouteRule{
 		Matches:     routeMatches,
 		Filters:     filters,
@@ -325,7 +351,7 @@ func (b *HTTPRouteBuilder) buildEngineHTTPRoute(ctx context.Context, isvc *v1bet
 	port := b.resolveServicePort(ctx, isvc.Namespace, engineName, EngineDefaultPort)
 	routeMatch := []gatewayapiv1.HTTPRouteMatch{b.createPathPrefixMatch(prefix)}
 	httpRouteRules := []gatewayapiv1.HTTPRouteRule{
-		b.createHTTPRouteRule(routeMatch, filters, engineName, isvc.Namespace, port, timeout),
+		b.createHTTPRouteRule(routeMatch, filters, b.componentBackendRefs(ctx, isvc, v1beta1.EngineComponent, engineName, port), timeout),
 	}
 
 	return b.buildHTTPRouteResource(isvc, engineName, httpRouteRules)
@@ -348,7 +374,7 @@ func (b *HTTPRouteBuilder) buildRouterHTTPRoute(ctx context.Context, isvc *v1bet
 	port := b.resolveServicePort(ctx, isvc.Namespace, routerName, RouterDefaultPort)
 	routeMatch := []gatewayapiv1.HTTPRouteMatch{b.createPathPrefixMatch(prefix)}
 	httpRouteRules := []gatewayapiv1.HTTPRouteRule{
-		b.createHTTPRouteRule(routeMatch, filters, routerName, isvc.Namespace, port, timeout),
+		b.createHTTPRouteRule(routeMatch, filters, b.componentBackendRefs(ctx, isvc, v1beta1.RouterComponent, routerName, port), timeout),
 	}
 
 	return b.buildHTTPRouteResource(isvc, constants.RouterServiceName(isvc.Name), httpRouteRules)
@@ -371,7 +397,7 @@ func (b *HTTPRouteBuilder) buildDecoderHTTPRoute(ctx context.Context, isvc *v1be
 	port := b.resolveServicePort(ctx, isvc.Namespace, decoderName, DecoderDefaultPort)
 	routeMatch := []gatewayapiv1.HTTPRouteMatch{b.createPathPrefixMatch(prefix)}
 	httpRouteRules := []gatewayapiv1.HTTPRouteRule{
-		b.createHTTPRouteRule(routeMatch, filters, decoderName, isvc.Namespace, port, timeout),
+		b.createHTTPRouteRule(routeMatch, filters, b.componentBackendRefs(ctx, isvc, v1beta1.DecoderComponent, decoderName, port), timeout),
 	}
 
 	return b.buildHTTPRouteResource(isvc, constants.DecoderServiceName(isvc.Name), httpRouteRules)
@@ -380,11 +406,16 @@ func (b *HTTPRouteBuilder) buildDecoderHTTPRoute(ctx context.Context, isvc *v1be
 func (b *HTTPRouteBuilder) buildTopLevelHTTPRoute(ctx context.Context, isvc *v1beta1.InferenceService) (*gatewayapiv1.HTTPRoute, error) {
 	filters := b.componentFilters(isvc)
 
+	// The top-level route backs onto the entrypoint Component, the router
+	// when there is one and the engine otherwise, and carries that
+	// Component's traffic targets.
+	var backendComponent v1beta1.ComponentType
 	var serviceName string
 	var port int32
 	var timeout *gatewayapiv1.Duration
 
 	if irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) {
+		backendComponent = v1beta1.RouterComponent
 		serviceName = constants.RouterServiceName(isvc.Name)
 		port = b.resolveServicePort(ctx, isvc.Namespace, serviceName, RouterDefaultPort)
 		timeout = b.defaultTimeout()
@@ -400,6 +431,7 @@ func (b *HTTPRouteBuilder) buildTopLevelHTTPRoute(ctx context.Context, isvc *v1b
 		// PredictorServiceName (returns isvc.Name). The PredictorServiceName
 		// path pointed at a backend Service that no longer exists in the
 		// Engine-architecture post-Predictor world.
+		backendComponent = v1beta1.EngineComponent
 		serviceName = constants.EngineServiceName(isvc.Name)
 		port = b.resolveServicePort(ctx, isvc.Namespace, serviceName, EngineDefaultPort)
 		timeout = b.defaultTimeout()
@@ -411,7 +443,7 @@ func (b *HTTPRouteBuilder) buildTopLevelHTTPRoute(ctx context.Context, isvc *v1b
 	prefix := b.pathPrefix(isvc, isvc.Name)
 	routeMatch := []gatewayapiv1.HTTPRouteMatch{b.createPathPrefixMatch(prefix)}
 	httpRouteRules := []gatewayapiv1.HTTPRouteRule{
-		b.createHTTPRouteRule(routeMatch, filters, serviceName, isvc.Namespace, port, timeout),
+		b.createHTTPRouteRule(routeMatch, filters, b.componentBackendRefs(ctx, isvc, backendComponent, serviceName, port), timeout),
 	}
 	if irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) {
 		if rule, ok := b.capacityEndpointRule(ctx, isvc, serviceName, timeout); ok {
@@ -460,7 +492,11 @@ func (b *HTTPRouteBuilder) capacityEndpointRule(ctx context.Context, isvc *v1bet
 			Value: ptr.To(matchPath),
 		},
 	}
-	return b.createHTTPRouteRule([]gatewayapiv1.HTTPRouteMatch{match}, filters, routerService, isvc.Namespace, endpoint.Port, timeout), true
+	// The capacity endpoint is the router's own account of its fleet, so it
+	// backs onto the aggregate Service alone, whatever split the serving
+	// rule carries.
+	backend := []gatewayapiv1.HTTPBackendRef{serviceBackendRef(routerService, isvc.Namespace, endpoint.Port, nil)}
+	return b.createHTTPRouteRule([]gatewayapiv1.HTTPRouteMatch{match}, filters, backend, timeout), true
 }
 
 func (b *HTTPRouteBuilder) buildHTTPRouteResource(isvc *v1beta1.InferenceService, name string, httpRouteRules []gatewayapiv1.HTTPRouteRule) (*gatewayapiv1.HTTPRoute, error) {

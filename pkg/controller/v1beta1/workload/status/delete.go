@@ -33,6 +33,55 @@ type AttemptFailure struct {
 	Cause          types.FailureCause
 }
 
+// countedFailure is the retry-record half of a write that ends a failed
+// attempt with its row: the revision's record takes the failure under the
+// policy, in the same status write as the rows. All methods are nil-safe:
+// a nil countedFailure names no revision and writes nothing.
+type countedFailure struct {
+	failure AttemptFailure
+	policy  *types.RetryPolicy
+	now     metav1.Time
+	// held is the attempt count a transition into Held carries, zero
+	// otherwise, as the last try of the write left it.
+	held int32
+}
+
+// counted is the failure as the write counts it on the retry record at
+// now, under the policy input carries.
+func (f AttemptFailure) counted(input types.ReconcileInput, now metav1.Time) *countedFailure {
+	return &countedFailure{failure: f, policy: input.UpdateRetryPolicy, now: now}
+}
+
+// revision is the revision whose record takes the failure.
+func (c *countedFailure) revision() string {
+	if c == nil {
+		return ""
+	}
+	return c.failure.TargetRevision
+}
+
+// write is the retry-record mutation of the status write, nil when there
+// is no failure to count.
+func (c *countedFailure) write() func(*types.RetryBlock) types.RetryBlockDisposition {
+	if c == nil {
+		return nil
+	}
+	return func(block *types.RetryBlock) types.RetryBlockDisposition {
+		var decision types.RetryBlockDisposition
+		decision, c.held = types.ApplyUpdateFailureToRetryBlock(block, c.policy, c.now, c.failure.Reason, c.failure.Cause)
+		return decision
+	}
+}
+
+// heldAttempts is the attempt count a transition into Held carried, read
+// after the write landed; zero otherwise.
+func (c *countedFailure) heldAttempts() int32 {
+	if c == nil {
+		return 0
+	}
+	return c.held
+}
+
 // StampDeletingBatch admits one scale-down wave: every row goes to
 // Phase=Deleting with a fresh Delete operation at Step=Drain and the
 // deadline timeout gives, committed together or not at all. The guard is
@@ -47,48 +96,48 @@ func StampDeletingBatch(ctx context.Context, input types.ReconcileInput, timeout
 	expected := make(map[int32]types.InstanceStatus, len(rows))
 	for _, row := range rows {
 		expected[row.Index] = CloneDeleteInstanceStatus(row)
-		now := metav1.NewTime(input.Now())
-		operation := types.InstanceOperation{
-			ID:             fmt.Sprintf("delete-%d-%d", row.Index, now.Unix()),
-			Type:           types.InstanceOperationDelete,
-			Step:           types.DeleteStepDrain,
-			StartedAt:      now,
-			LastProgressAt: now,
-			Deadline:       types.DeadlineAt(now, timeout),
-		}
-		index := row.Index
-		incarnation := row.Incarnation
-		mutation := types.InstanceMutation{
-			Index: index,
-			Mutate: func(status *types.InstanceStatus) bool {
-				status.Phase = types.InstancePhaseDeleting
-				status.Operation = cloneDeleteOperation(&operation)
-				return true
-			},
-			Postcondition: func(status *types.InstanceStatus) bool {
-				return status != nil && status.Index == index && status.Incarnation == incarnation &&
-					status.Phase == types.InstancePhaseDeleting && status.Operation != nil &&
-					status.Operation.ID == operation.ID && status.Operation.Type == operation.Type && status.Operation.Step == operation.Step
-			},
-		}
-		mutations = append(mutations, mutation)
+		mutations = append(mutations, deletingMutation(row, metav1.NewTime(input.Now()), timeout))
 	}
 	mutations[0].BatchPrecondition = deleteAdmissionGuard(input, expected, input.ObservedState.InstanceStatuses)
 	if failure == nil {
 		committed, err := applyDeleteBatch(ctx, input, mutations, "", nil)
 		return committed, 0, err
 	}
-	now := metav1.NewTime(input.Now())
-	var heldAttempts int32
-	committed, err := applyDeleteBatch(ctx, input, mutations, failure.TargetRevision, func(b *types.RetryBlock) types.RetryBlockDisposition {
-		disposition, held := types.ApplyUpdateFailureToRetryBlock(b, input.UpdateRetryPolicy, now, failure.Reason, failure.Cause)
-		heldAttempts = held
-		return disposition
-	})
+	counted := failure.counted(input, metav1.NewTime(input.Now()))
+	committed, err := applyDeleteBatch(ctx, input, mutations, counted.revision(), counted.write())
 	if !committed {
-		heldAttempts = 0
+		return false, 0, err
 	}
-	return committed, heldAttempts, err
+	return true, counted.heldAttempts(), err
+}
+
+// deletingMutation admits one row of a wave: Deleting under a fresh Delete
+// operation at its drain step, opened at now with the deadline timeout
+// gives, and the postcondition that the row written is the row read under
+// that operation.
+func deletingMutation(row types.InstanceStatus, now metav1.Time, timeout time.Duration) types.InstanceMutation {
+	operation := types.InstanceOperation{
+		ID:             fmt.Sprintf("delete-%d-%d", row.Index, now.Unix()),
+		Type:           types.InstanceOperationDelete,
+		Step:           types.DeleteStepDrain,
+		StartedAt:      now,
+		LastProgressAt: now,
+		Deadline:       types.DeadlineAt(now, timeout),
+	}
+	index, incarnation := row.Index, row.Incarnation
+	return types.InstanceMutation{
+		Index: index,
+		Mutate: func(status *types.InstanceStatus) bool {
+			status.Phase = types.InstancePhaseDeleting
+			status.Operation = cloneDeleteOperation(&operation)
+			return true
+		},
+		Postcondition: func(status *types.InstanceStatus) bool {
+			return status != nil && status.Index == index && status.Incarnation == incarnation &&
+				status.Phase == types.InstancePhaseDeleting && status.Operation != nil &&
+				status.Operation.ID == operation.ID && status.Operation.Type == operation.Type && status.Operation.Step == operation.Step
+		},
+	}
 }
 
 // RemoveDeletedBatch completes one scale-down wave: every row is removed,

@@ -361,10 +361,12 @@ func renderThroughProjector(t *testing.T, ctx context.Context, c client.Client, 
 	if err != nil {
 		t.Fatalf("render %s: %v", tc.component, err)
 	}
+	// The projector takes the topology from the role spec, as the components do.
+	role := specs.View(tc.component)
 	ir, err := irprojector.EnsureInferenceReplica(ctx, irprojector.Params{
 		ISVC: service, Component: tc.component, ComponentExt: rendered.ComponentExt,
 		ObjectMeta: rendered.ObjectMeta, PodSpec: rendered.Primary, WorkerPodSpec: rendered.Worker, WorkerSize: rendered.WorkerSize,
-		MultiPod: rendered.MultiPod, TopologyKey: rendered.TopologyKey, TopologySpread: rendered.TopologySpread, TopologySpreadKey: rendered.TopologySpreadKey, Client: c,
+		MultiPod: rendered.MultiPod, TopologyKey: role.TopologyKey, TopologySpread: role.TopologySpread, TopologySpreadKey: role.TopologySpreadKey, Client: c,
 	})
 	if err != nil {
 		t.Fatalf("project %s: %v", tc.component, err)

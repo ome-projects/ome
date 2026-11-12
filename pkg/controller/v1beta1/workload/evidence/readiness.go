@@ -121,12 +121,22 @@ func GateNotFoldedTermination(pod *corev1.Pod, now metav1.Time) *types.InstanceT
 	if gates := unsatisfiedReadinessGates(pod); len(gates) > 0 {
 		t.Message += "; unsatisfied gates: " + strings.Join(gates, ", ")
 	}
+	addConditionDetail(t, pod, corev1.PodReady)
+	return t
+}
+
+// addConditionDetail appends what the pod's condition of the given type
+// says to the record's message, its reason and then its message, and
+// dates the record by the condition's last transition when the kubelet
+// wrote one. The first condition of the type is read; a pod without it
+// leaves the record as it is.
+func addConditionDetail(t *types.InstanceTermination, pod *corev1.Pod, condType corev1.PodConditionType) {
 	for _, cond := range pod.Status.Conditions {
-		if cond.Type != corev1.PodReady {
+		if cond.Type != condType {
 			continue
 		}
 		if cond.Reason != "" {
-			t.Message += "; Ready=False (" + cond.Reason + ")"
+			t.Message += "; " + string(condType) + "=False (" + cond.Reason + ")"
 		}
 		if cond.Message != "" {
 			t.Message += ": " + cond.Message
@@ -134,9 +144,8 @@ func GateNotFoldedTermination(pod *corev1.Pod, now metav1.Time) *types.InstanceT
 		if !cond.LastTransitionTime.IsZero() {
 			t.Time = cond.LastTransitionTime
 		}
-		break
+		return
 	}
-	return t
 }
 
 // unsatisfiedReadinessGates lists the condition types the pod declares as
@@ -216,21 +225,7 @@ func ContainersNotReadyTermination(pod *corev1.Pod, now metav1.Time) *types.Inst
 		t.ContainerName = names[0]
 		t.Message += "; not ready: " + strings.Join(names, ", ")
 	}
-	for _, cond := range pod.Status.Conditions {
-		if cond.Type != corev1.ContainersReady {
-			continue
-		}
-		if cond.Reason != "" {
-			t.Message += "; ContainersReady=False (" + cond.Reason + ")"
-		}
-		if cond.Message != "" {
-			t.Message += ": " + cond.Message
-		}
-		if !cond.LastTransitionTime.IsZero() {
-			t.Time = cond.LastTransitionTime
-		}
-		break
-	}
+	addConditionDetail(t, pod, corev1.ContainersReady)
 	return t
 }
 

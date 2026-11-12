@@ -18,6 +18,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary"
 	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/validation"
 )
@@ -77,6 +78,13 @@ type driver struct {
 	service ServiceState
 	cfg     ConfigState
 	members map[v1beta1.ComponentType]*member
+	// runtime is the ServingRuntime the service names, nil when it names
+	// none.
+	runtime *runtimeFixture
+	// departed names the Components a scenario moved out of the OMENative
+	// mode: still declared by the service, projected and published no
+	// more, and handed to the pass under another mode.
+	departed map[v1beta1.ComponentType]bool
 	// removedPolicies keeps the body of a policy a scenario removed, for
 	// the event that restores it.
 	removedPolicies map[string]*v1beta1.RolloutPolicy
@@ -91,6 +99,9 @@ type driver struct {
 	// tickRun is what the run layer did in the current pass, kept for the
 	// observer.
 	tickRun RunView
+	// tickPolicies are the policies the current pass resolved, kept for
+	// the observer with tickRun.
+	tickPolicies rollout.Policies
 	// samples is the metric gate's stand-in, wired only when the scenario
 	// stages analysis.sample; nil runs every analysis step with no sampler.
 	samples *sampleScript
@@ -122,8 +133,12 @@ func newDriver(ctx context.Context, s *Scenario, opts Options) (*driver, error) 
 		service:         cloneService(s.Initial.Service),
 		cfg:             s.Initial.Config,
 		members:         map[v1beta1.ComponentType]*member{},
+		departed:        map[v1beta1.ComponentType]bool{},
 		removedPolicies: map[string]*v1beta1.RolloutPolicy{},
 		collected:       map[v1beta1.ComponentType]map[string]bool{},
+	}
+	if d.service.Runtime != nil {
+		d.runtime = newRuntimeFixture(d.service.Runtime)
 	}
 	d.recorder = &traceRecorder{trace: d.trace}
 	cl.observe = func(w writeRecord) {
@@ -167,7 +182,27 @@ func cloneService(in ServiceState) ServiceState {
 		out.PairingProtocol = &protocol
 	}
 	out.RevisionProtocols = copyMap(in.RevisionProtocols)
+	if in.Runtime != nil {
+		runtime := *in.Runtime
+		if in.Runtime.AutoSync != nil {
+			autoSync := *in.Runtime.AutoSync
+			runtime.AutoSync = &autoSync
+		}
+		out.Runtime = &runtime
+	}
 	return out
+}
+
+// imageOf is the image a Component's template renders: the service's own
+// when it declares one, else the piece of the runtime the service names.
+func (d *driver) imageOf(c v1beta1.ComponentType) string {
+	if cs := d.service.Components[string(c)]; cs.Image != "" {
+		return cs.Image
+	}
+	if d.runtime != nil {
+		return d.runtime.rendered(c)
+	}
+	return ""
 }
 
 func nonEmpty(parts ...string) []string {
@@ -191,9 +226,23 @@ func copyMap(m map[string]string) map[string]string {
 	return out
 }
 
-// components lists the declared Components in the order the controller
-// walks them, the order of v1beta1.Roles.
+// components lists the Components in the OMENative mode in the order the
+// controller walks them, the order of v1beta1.Roles. A Component that left
+// the mode is declared still, but no replica is projected or published
+// for it.
 func (d *driver) components() []v1beta1.ComponentType {
+	var out []v1beta1.ComponentType
+	for _, c := range d.declaredComponents() {
+		if !d.departed[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// declaredComponents lists every Component the service declares, in the
+// controller's order, whatever mode each runs under.
+func (d *driver) declaredComponents() []v1beta1.ComponentType {
 	var out []v1beta1.ComponentType
 	for _, c := range v1beta1.RoleTypes() {
 		if _, ok := d.members[c]; ok {
@@ -241,8 +290,15 @@ func (d *driver) isvcSpec() v1beta1.InferenceServiceSpec {
 		}
 		v1beta1.DeclareRole(&spec, c)
 		view := v1beta1.SpecOf(&spec, c)
-		view.PodSpec.Containers = d.podTemplate(cs.Image).Containers
+		// A Component that renders the runtime's piece names no container
+		// of its own, so a runtime edit moves no field of the service.
+		if cs.Image != "" {
+			view.PodSpec.Containers = d.podTemplate(cs.Image).Containers
+		}
 		*view.Extension = *d.componentExt(c)
+	}
+	if d.runtime != nil {
+		spec.Runtime = &v1beta1.ServingRuntimeRef{Name: d.runtime.name, AutoSync: d.runtime.autoSync}
 	}
 	if len(d.service.Groups) > 0 || d.service.PairingProtocol != nil {
 		spec.Rollout = &v1beta1.RolloutSpec{Groups: append([]v1beta1.RolloutGroup(nil), d.service.Groups...), PairingProtocol: d.service.PairingProtocol}
@@ -353,17 +409,18 @@ func (d *driver) seed(ctx context.Context, s *Scenario) error {
 	sort.Strings(names)
 	for _, name := range names {
 		cs := d.service.Components[name]
-		if cs.Image == "" {
-			return fmt.Errorf("replay: component %s declares no image", name)
+		image := d.imageOf(v1beta1.ComponentType(name))
+		if image == "" {
+			return fmt.Errorf("replay: component %s declares no image and the service names no runtime", name)
 		}
 		if cs.Replicas <= 0 {
 			return fmt.Errorf("replay: component %s declares no replicas", name)
 		}
 		d.members[v1beta1.ComponentType(name)] = &member{
 			component: v1beta1.ComponentType(name),
-			image:     cs.Image,
-			current:   cs.Image,
-			target:    cs.Image,
+			image:     image,
+			current:   image,
+			target:    image,
 			revisions: map[string]*appsv1.ControllerRevision{},
 		}
 	}
@@ -375,7 +432,7 @@ func (d *driver) seed(ctx context.Context, s *Scenario) error {
 	}
 	for _, c := range d.components() {
 		if err := d.cluster.staging(func() error {
-			_, err := d.project(ctx, d.cluster.cli, d.cluster.cli, isvc, c, d.partitionFor(isvc, policies, c))
+			_, err := d.project(ctx, d.cluster.cli, d.cluster.cli, isvc, c, policies)
 			return err
 		}); err != nil {
 			return err
@@ -399,8 +456,9 @@ const noCurrentRevision = "none"
 
 // seedMember fills a member from the scenario's initial replica state: one
 // Ready row and pod per replica on the current revision unless the
-// scenario says otherwise; with no current revision, one Pending row per
-// replica on the target with a pod that is not Ready.
+// scenario says otherwise; with no current revision, one Create attempt per
+// replica toward the target with a pod that is not Ready, as the replica
+// controller's first pass leaves a new replica.
 func (d *driver) seedMember(ctx context.Context, m *member, state ReplicaState) error {
 	unpromoted := state.Current == noCurrentRevision
 	current := ""
@@ -425,11 +483,11 @@ func (d *driver) seedMember(ctx context.Context, m *member, state ReplicaState) 
 	replicas := d.service.Components[string(m.component)].Replicas
 	if len(state.Rows) == 0 {
 		for i := int32(0); i < replicas; i++ {
-			row := rowState{index: i, phase: v1beta1.OMENativeInstanceReady, running: m.current, readySince: d.opts.Start}
+			row := rowState{index: i, phase: v1beta1.OMENativeInstanceReady, running: m.current, readySince: d.opts.Start, served: true}
 			if unpromoted {
-				// A creating Instance: its row names the target it is coming
-				// up on and its pod is not Ready yet.
-				row = rowState{index: i, phase: v1beta1.OMENativeInstancePending, running: m.target}
+				// A creating Instance: its attempt names the target it is
+				// coming up on and its pod is not Ready yet.
+				row = creatingRow(i, m.target)
 			}
 			m.rows = append(m.rows, row)
 		}
@@ -439,6 +497,7 @@ func (d *driver) seedMember(ctx context.Context, m *member, state ReplicaState) 
 		if row.phase == "" {
 			row.phase = v1beta1.OMENativeInstanceReady
 		}
+		row.served = row.phase == v1beta1.OMENativeInstanceReady
 		if row.running, err = m.resolveImage(spec.RunningRevision); err != nil {
 			return err
 		}
@@ -461,7 +520,7 @@ func (d *driver) seedMember(ctx context.Context, m *member, state ReplicaState) 
 	}
 	if len(state.Pods) == 0 {
 		for _, row := range m.rows {
-			m.pods = append(m.pods, podState{index: row.index, image: row.running, ready: row.phase == v1beta1.OMENativeInstanceReady, serving: row.phase == v1beta1.OMENativeInstanceReady})
+			m.pods = append(m.pods, podState{index: row.index, image: row.attemptImage(), ready: row.phase == v1beta1.OMENativeInstanceReady, serving: row.phase == v1beta1.OMENativeInstanceReady})
 		}
 	}
 	for _, spec := range state.Pods {
@@ -483,30 +542,33 @@ func (d *driver) seedMember(ctx context.Context, m *member, state ReplicaState) 
 	return nil
 }
 
-// rowRunning is the running revision of the row at index, the current
-// revision when no row carries the index.
+// rowRunning is the revision the row at index renders (its running
+// revision, or its Create attempt's), the current revision when no row
+// carries the index.
 func (m *member) rowRunning(index int32) string {
 	for _, row := range m.rows {
 		if row.index == index {
-			return row.running
+			return row.attemptImage()
 		}
 	}
 	return m.current
 }
 
 // project runs the production projector for one Component: the replica
-// spec the controller's component reconciler writes on every pass.
-func (d *driver) project(ctx context.Context, cached client.Client, live client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType, partition irprojector.PartitionResolver) (*v1beta1.InferenceReplica, error) {
-	cs := d.service.Components[string(c)]
+// spec the controller's component reconciler writes on every pass, with the
+// canary step's partition and the stable revision the Component's unit
+// keeps a side on.
+func (d *driver) project(ctx context.Context, cached client.Client, live client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType, policies rollout.Policies) (*v1beta1.InferenceReplica, error) {
 	ir, err := irprojector.EnsureInferenceReplica(ctx, irprojector.Params{
-		ISVC:            isvc,
-		Component:       c,
-		ComponentExt:    d.componentExt(c),
-		ObjectMeta:      metav1.ObjectMeta{Labels: d.selectorLabels(c)},
-		PodSpec:         d.podTemplate(cs.Image),
-		PacingPartition: partition,
-		Client:          cached,
-		Reader:          live,
+		ISVC:               isvc,
+		Component:          c,
+		ComponentExt:       d.componentExt(c),
+		ObjectMeta:         metav1.ObjectMeta{Labels: d.selectorLabels(c)},
+		PodSpec:            d.podTemplate(d.imageOf(c)),
+		PacingPartition:    d.partitionFor(isvc, policies, c),
+		RollbackToRevision: canary.StableSideTarget(isvc, policies, c),
+		Client:             cached,
+		Reader:             live,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("replay: project %s: %w", c, err)
@@ -533,11 +595,20 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 	if err := d.checkStaleClaim(ctx); err != nil {
 		return err
 	}
-	if err := d.cluster.prepareSnapshot(ctx, tick.Tick); err != nil {
-		return err
-	}
-	if err := d.runPass(ctx); err != nil {
-		return err
+	// A drifted recorded runtime ends the controller's pass before the
+	// rollout stages, so no pass runs and the cache view a later stale
+	// read serves stays the one the last pass found.
+	if d.runtime != nil && d.runtime.drifted() {
+		if err := d.skipDriftedPass(); err != nil {
+			return err
+		}
+	} else {
+		if err := d.cluster.prepareSnapshot(ctx, tick.Tick); err != nil {
+			return err
+		}
+		if err := d.runPass(ctx); err != nil {
+			return err
+		}
 	}
 	d.cluster.finishPass()
 	if unfired := d.cluster.unfiredConflicts(); len(unfired) > 0 {
@@ -565,6 +636,7 @@ func (d *driver) observe(ctx context.Context, tick int) error {
 		Replicas: map[v1beta1.ComponentType]*v1beta1.InferenceReplica{},
 		Pods:     map[v1beta1.ComponentType][]*corev1.Pod{},
 		Run:      d.tickRun,
+		Policies: d.tickPolicies,
 	}
 	revisions := &appsv1.ControllerRevisionList{}
 	if err := d.cluster.cli.List(ctx, revisions, client.InNamespace(d.opts.Namespace)); err != nil {

@@ -704,8 +704,10 @@ func TestGetCompatibilityDetails(t *testing.T) {
 		report, err := matcher.GetCompatibilityDetails(runtime, baseModel, isvc, "test-runtime")
 		assert.NoError(t, err)
 		assert.True(t, report.IsCompatible) // Runtime is compatible, just not auto-selectable
-		assert.NotEmpty(t, report.Warnings)
-		assert.Contains(t, report.Warnings[0], "runtime does not have auto-select enabled for any supported format")
+		assert.Empty(t, report.IncompatibilityReasons)
+		score, err := NewDefaultRuntimeScorer(NewConfig(nil)).CalculateScore(runtime, baseModel)
+		assert.NoError(t, err)
+		assert.Zero(t, score, "a runtime with no auto-select format scores nothing")
 	})
 
 	t.Run("model size warning", func(t *testing.T) {
@@ -733,15 +735,7 @@ func TestGetCompatibilityDetails(t *testing.T) {
 		report, err := matcher.GetCompatibilityDetails(runtime, baseModel, isvc, "test-runtime")
 		assert.NoError(t, err)
 		assert.True(t, report.IsCompatible)
-		assert.NotEmpty(t, report.Warnings)
-		found := false
-		for _, warning := range report.Warnings {
-			if strings.Contains(warning, "model does not specify size") {
-				found = true
-				break
-			}
-		}
-		assert.True(t, found, "Expected warning about model size not found")
+		assert.Empty(t, report.IncompatibilityReasons, "a model without a size fits every size range")
 	})
 }
 
@@ -790,7 +784,7 @@ func TestGetCompatibilityDetailsRequiresModelCacheProviderForShardedModels(t *te
 
 		assert.NoError(t, err)
 		assert.True(t, report.IsCompatible)
-		assert.True(t, report.MatchDetails.ModelCacheProviderMatch)
+		assert.Empty(t, report.IncompatibilityReasons)
 	})
 
 	t.Run("rejects cache-capable runtime when no provider is configured", func(t *testing.T) {
@@ -852,13 +846,13 @@ func TestMatcherPicksRuntimeByModelSize(t *testing.T) {
 	smallReport, err := matcher.GetCompatibilityDetails(smallRuntime, model, isvc, "small-runtime")
 	assert.NoError(t, err)
 	assert.False(t, smallReport.IsCompatible)
-	assert.False(t, smallReport.MatchDetails.SizeMatch)
 	assert.NotEmpty(t, smallReport.IncompatibilityReasons)
+	assert.Contains(t, smallReport.IncompatibilityReasons[0], "is outside supported range")
 
 	midReport, err := matcher.GetCompatibilityDetails(midRuntime, model, isvc, "mid-runtime")
 	assert.NoError(t, err)
 	assert.True(t, midReport.IsCompatible)
-	assert.True(t, midReport.MatchDetails.SizeMatch)
+	assert.Empty(t, midReport.IncompatibilityReasons)
 
 	selected := ""
 	if smallReport.IsCompatible {
@@ -950,7 +944,7 @@ func TestGetCompatibilityDetails_AcceleratorClasses(t *testing.T) {
 	})
 }
 
-func TestIsCompatible_DisabledAndAcceleratorErrors(t *testing.T) {
+func TestServiceRefusal_DisabledAndAcceleratorErrors(t *testing.T) {
 	matcher := NewDefaultRuntimeMatcher(NewConfig(nil))
 
 	baseModel := &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "pytorch"}}
@@ -958,10 +952,13 @@ func TestIsCompatible_DisabledAndAcceleratorErrors(t *testing.T) {
 
 	t.Run("disabled runtime returns error", func(t *testing.T) {
 		rt := &v1beta1.ServingRuntimeSpec{Disabled: ptr(true)}
-		ok, err := matcher.IsCompatible(rt, baseModel, isvc, "rt")
-		assert.False(t, ok)
-		assert.Error(t, err)
-		assert.True(t, IsRuntimeDisabledError(err))
+		report, err := matcher.GetCompatibilityDetails(rt, baseModel, isvc, "rt")
+		assert.NoError(t, err)
+		assert.False(t, report.IsCompatible)
+		refusal := report.serviceRefusal("rt", baseModel)
+		assert.Error(t, refusal)
+		var disabled *RuntimeDisabledError
+		assert.ErrorAs(t, refusal, &disabled)
 	})
 
 	t.Run("accelerator mismatch returns compatibility error", func(t *testing.T) {
@@ -972,10 +969,12 @@ func TestIsCompatible_DisabledAndAcceleratorErrors(t *testing.T) {
 		cls := "H100"
 		isvc := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{AcceleratorSelector: &v1beta1.AcceleratorSelector{AcceleratorClass: &cls}}}
 
-		ok, err := matcher.IsCompatible(rt, baseModel, isvc, "rt")
-		assert.False(t, ok)
-		assert.Error(t, err)
-		assert.True(t, IsRuntimeCompatibilityError(err))
+		report, err := matcher.GetCompatibilityDetails(rt, baseModel, isvc, "rt")
+		assert.NoError(t, err)
+		assert.False(t, report.IsCompatible)
+		refusal := report.serviceRefusal("rt", baseModel)
+		assert.Error(t, refusal)
+		assert.True(t, IsRuntimeCompatibilityError(refusal))
 	})
 
 	t.Run("size mismatch does not return error, only false", func(t *testing.T) {
@@ -985,18 +984,17 @@ func TestIsCompatible_DisabledAndAcceleratorErrors(t *testing.T) {
 			AcceleratorRequirements: &v1beta1.AcceleratorRequirements{},
 		}
 		model := &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "pytorch"}, ModelParameterSize: ptr("70B")}
-		ok, err := matcher.IsCompatible(rt, model, isvc, "rt")
-		assert.False(t, ok)
+		report, err := matcher.GetCompatibilityDetails(rt, model, isvc, "rt")
 		assert.NoError(t, err)
+		assert.False(t, report.IsCompatible)
+		assert.NoError(t, report.serviceRefusal("rt", model))
 	})
 }
 
 // TestFormatAndFrameworkVersionsMatchByOneRule drives validation.VersionsMatch, the one rule
-// behind compareModelFormatVersions and compareModelFrameworkVersions, through the rule itself
-// and both wrappers, so every row reads the same on all three.
+// behind versionsMatch, through the rule itself and through the wrapper as the format and the
+// framework entries call it, so every row reads the same on all three.
 func TestFormatAndFrameworkVersionsMatchByOneRule(t *testing.T) {
-	matcher := NewDefaultRuntimeMatcher(NewConfig(nil)).(*DefaultRuntimeMatcher)
-
 	tests := []struct {
 		name             string
 		supportedVersion string
@@ -1022,13 +1020,13 @@ func TestFormatAndFrameworkVersionsMatchByOneRule(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gotRaw := validation.VersionsMatch(tt.modelVersion, tt.supportedVersion, tt.operator)
-			gotFormat := matcher.compareModelFormatVersions(fmtVersion(tt.supportedVersion, tt.operator),
-				&v1beta1.ModelFormat{Name: "pytorch", Version: ptr(tt.modelVersion)})
-			gotFramework := matcher.compareModelFrameworkVersions(fwVersion(tt.supportedVersion, tt.operator),
-				&v1beta1.ModelFrameworkSpec{Name: "transformers", Version: ptr(tt.modelVersion)})
+			format := fmtVersion(tt.supportedVersion, tt.operator)
+			gotFormat := versionsMatch(ptr(tt.modelVersion), format.Version, format.Operator)
+			framework := fwVersion(tt.supportedVersion, tt.operator)
+			gotFramework := versionsMatch(ptr(tt.modelVersion), framework.Version, framework.Operator)
 			assert.Equal(t, tt.expected, gotRaw, "validation.VersionsMatch")
-			assert.Equal(t, tt.expected, gotFormat, "compareModelFormatVersions")
-			assert.Equal(t, tt.expected, gotFramework, "compareModelFrameworkVersions")
+			assert.Equal(t, tt.expected, gotFormat, "versionsMatch for the format")
+			assert.Equal(t, tt.expected, gotFramework, "versionsMatch for the framework")
 		})
 	}
 }
@@ -1228,31 +1226,22 @@ func TestModelSizeRangePartialBounds(t *testing.T) {
 				report, err := matcher.GetCompatibilityDetails(runtime, model, isvc, "rt")
 				assert.NoError(t, err)
 				assert.Equal(t, tt.want, report.IsCompatible, "GetCompatibilityDetails IsCompatible")
-				assert.Equal(t, tt.want, report.MatchDetails.SizeMatch, "GetCompatibilityDetails SizeMatch")
+				assert.Equal(t, tt.want, len(report.IncompatibilityReasons) == 0, "GetCompatibilityDetails reasons")
 			})
 
-			// Site 2: the size check, reached through IsCompatible.
-			assert.NotPanics(t, func() {
-				ok, err := matcher.IsCompatible(runtime, model, isvc, "rt")
-				assert.NoError(t, err)
-				assert.Equal(t, tt.want, ok, "IsCompatible")
-			})
-
-			// Site 3: calculateSizeScore, reached through CompareRuntimes
+			// Site 2: calculateSizeScore, reached through CompareRuntimes
 			// (scorer.go ~155-156). The actual ordering is irrelevant here;
 			// we only need it not to panic on a partial range.
 			assert.NotPanics(t, func() {
 				rm := RuntimeMatch{
-					RuntimeSelection: RuntimeSelection{Name: "rt", Spec: runtime, Score: 10},
+					Name: "rt", Spec: runtime, Score: 10,
 				}
 				other := RuntimeMatch{
-					RuntimeSelection: RuntimeSelection{
-						Name: "other",
-						Spec: &v1beta1.ServingRuntimeSpec{
-							ModelSizeRange: &v1beta1.ModelSizeRangeSpec{Min: ptr("1B"), Max: ptr("13B")},
-						},
-						Score: 10,
+					Name: "other",
+					Spec: &v1beta1.ServingRuntimeSpec{
+						ModelSizeRange: &v1beta1.ModelSizeRangeSpec{Min: ptr("1B"), Max: ptr("13B")},
 					},
+					Score: 10,
 				}
 				scorer.CompareRuntimes(rm, other, model)
 			})
@@ -1299,10 +1288,8 @@ func TestCalculateSizeScorePartialBounds(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			rm := RuntimeMatch{
-				RuntimeSelection: RuntimeSelection{
-					Name: "rt",
-					Spec: &v1beta1.ServingRuntimeSpec{ModelSizeRange: tt.sizeRange},
-				},
+				Name: "rt",
+				Spec: &v1beta1.ServingRuntimeSpec{ModelSizeRange: tt.sizeRange},
 			}
 			var got float64
 			assert.NotPanics(t, func() {
@@ -1561,8 +1548,6 @@ func TestCompareModelFormatVersions(t *testing.T) {
 		return &op
 	}
 
-	matcher := NewDefaultRuntimeMatcher(NewConfig(nil)).(*DefaultRuntimeMatcher)
-
 	tests := []struct {
 		name            string
 		supportedFormat *v1beta1.ModelFormat
@@ -1741,7 +1726,7 @@ func TestCompareModelFormatVersions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := matcher.compareModelFormatVersions(tt.supportedFormat, tt.modelFormat)
+			result := versionsMatch(tt.modelFormat.Version, tt.supportedFormat.Version, tt.supportedFormat.Operator)
 			assert.Equal(t, tt.expected, result, "Test case: %s", tt.name)
 		})
 	}
@@ -1753,8 +1738,6 @@ func TestCompareModelFrameworkVersions(t *testing.T) {
 		op := v1beta1.RuntimeSelectorOperator(s)
 		return &op
 	}
-
-	matcher := NewDefaultRuntimeMatcher(NewConfig(nil)).(*DefaultRuntimeMatcher)
 
 	tests := []struct {
 		name               string
@@ -1922,26 +1905,29 @@ func TestCompareModelFrameworkVersions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := matcher.compareModelFrameworkVersions(tt.supportedFramework, tt.modelFramework)
+			result := versionsMatch(tt.modelFramework.Version, tt.supportedFramework.Version, tt.supportedFramework.Operator)
 			assert.Equal(t, tt.expected, result, "Test case: %s", tt.name)
 		})
 	}
 }
 
-func TestIsCompatible_DisabledRuntime(t *testing.T) {
+func TestServiceRefusal_DisabledRuntime(t *testing.T) {
 	matcher := NewDefaultRuntimeMatcher(NewConfig(nil))
 
 	baseModel := &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "pytorch"}}
 	isvc := &v1beta1.InferenceService{}
 
 	rt := &v1beta1.ServingRuntimeSpec{Disabled: ptr(true)}
-	ok, err := matcher.IsCompatible(rt, baseModel, isvc, "rt")
-	assert.False(t, ok)
-	assert.Error(t, err)
-	assert.True(t, IsRuntimeDisabledError(err))
+	report, err := matcher.GetCompatibilityDetails(rt, baseModel, isvc, "rt")
+	assert.NoError(t, err)
+	assert.False(t, report.IsCompatible)
+	refusal := report.serviceRefusal("rt", baseModel)
+	assert.Error(t, refusal)
+	var disabled *RuntimeDisabledError
+	assert.ErrorAs(t, refusal, &disabled)
 }
 
-func TestIsCompatible_SizeMismatchNoError(t *testing.T) {
+func TestServiceRefusal_SizeMismatchNoError(t *testing.T) {
 	matcher := NewDefaultRuntimeMatcher(NewConfig(nil))
 
 	isvc := &v1beta1.InferenceService{}
@@ -1950,7 +1936,8 @@ func TestIsCompatible_SizeMismatchNoError(t *testing.T) {
 		ModelSizeRange:        &v1beta1.ModelSizeRangeSpec{Min: ptr("1B"), Max: ptr("2B")},
 	}
 	model := &v1beta1.BaseModelSpec{ModelFormat: v1beta1.ModelFormat{Name: "pytorch"}, ModelParameterSize: ptr("70B")}
-	ok, err := matcher.IsCompatible(rt, model, isvc, "rt")
-	assert.False(t, ok)
+	report, err := matcher.GetCompatibilityDetails(rt, model, isvc, "rt")
 	assert.NoError(t, err)
+	assert.False(t, report.IsCompatible)
+	assert.NoError(t, report.serviceRefusal("rt", model))
 }

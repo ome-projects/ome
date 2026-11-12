@@ -95,7 +95,7 @@ func (r *InferenceServiceReconciler) reconcileReferencedReplicas(ctx context.Con
 			return reconcile.Result{}, errors.Wrapf(err, "fails to set external service URL")
 		}
 	}
-	if err := r.updateStatus(isvc, deploymentMode, base); err != nil {
+	if err := r.updateStatus(isvc, deploymentMode, base, groupEntriesFromCache); err != nil {
 		if apierrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}

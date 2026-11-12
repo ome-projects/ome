@@ -8,8 +8,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/constants"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -24,15 +22,9 @@ func ReconcileInput(isvc *v1beta1.InferenceService, c client.Client, component t
 		OwnerGVK:    v1beta1.SchemeGroupVersion.WithKind("InferenceService"),
 		EventTarget: isvc,
 		Key: types.Key{
-			Namespace:   isvc.Namespace,
-			OwnerName:   isvc.Name,
-			Component:   component,
-			OwnerLabels: isvc.Labels,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvc.Name,
-				constants.OMEComponentLabel:           string(component),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
+			Namespace: isvc.Namespace,
+			OwnerName: isvc.Name,
+			Component: component,
 		},
 		DesiredSpec: types.WorkloadDesiredSpec{
 			PodSpec: &corev1.PodSpec{Containers: []corev1.Container{{Name: ContainerName, Image: "test:v1"}}},

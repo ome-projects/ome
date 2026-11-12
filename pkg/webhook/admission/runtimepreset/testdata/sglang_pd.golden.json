@@ -1,0 +1,196 @@
+{
+  "routerConfig": {
+    "runner": {
+      "name": "router",
+      "image": "lmsysorg/sglang-router:latest",
+      "args": [
+        "--port",
+        "30080",
+        "--k8s-namespace",
+        "$(NAMESPACE)",
+        "--prefill-label-selector",
+        "component=engine,ome.io/inferenceservice=$(INFERENCESERVICE_NAME)",
+        "--decode-label-selector",
+        "component=decoder,ome.io/inferenceservice=$(INFERENCESERVICE_NAME)",
+        "--k8s-engine-port",
+        "30000",
+        "--bootstrap-port",
+        "8998"
+      ],
+      "ports": [
+        {
+          "name": "http",
+          "containerPort": 30080,
+          "protocol": "TCP"
+        }
+      ],
+      "env": [
+        {
+          "name": "NAMESPACE",
+          "valueFrom": {
+            "fieldRef": {
+              "fieldPath": "metadata.namespace"
+            }
+          }
+        },
+        {
+          "name": "INFERENCESERVICE_NAME",
+          "valueFrom": {
+            "fieldRef": {
+              "fieldPath": "metadata.labels['ome.io/inferenceservice']"
+            }
+          }
+        }
+      ],
+      "resources": {},
+      "livenessProbe": {
+        "httpGet": {
+          "path": "/liveness",
+          "port": 30080
+        },
+        "timeoutSeconds": 10,
+        "periodSeconds": 30,
+        "failureThreshold": 5
+      },
+      "readinessProbe": {
+        "httpGet": {
+          "path": "/readiness",
+          "port": 30080
+        },
+        "timeoutSeconds": 10,
+        "periodSeconds": 30,
+        "failureThreshold": 5
+      }
+    }
+  },
+  "engineConfig": {
+    "runner": {
+      "name": "ome-container",
+      "image": "lmsysorg/sglang:latest",
+      "command": [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "30000",
+        "--model-path",
+        "$(MODEL_PATH)",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "nixl",
+        "--disaggregation-bootstrap-port",
+        "8998"
+      ],
+      "ports": [
+        {
+          "name": "http",
+          "containerPort": 30000,
+          "protocol": "TCP"
+        },
+        {
+          "name": "bootstrap",
+          "containerPort": 8998,
+          "protocol": "TCP"
+        }
+      ],
+      "env": [
+        {
+          "name": "PYTHONUNBUFFERED",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_HOST_IP",
+          "valueFrom": {
+            "fieldRef": {
+              "fieldPath": "status.podIP"
+            }
+          }
+        }
+      ],
+      "resources": {},
+      "livenessProbe": {
+        "httpGet": {
+          "path": "/health",
+          "port": 30000
+        },
+        "timeoutSeconds": 10,
+        "periodSeconds": 60,
+        "failureThreshold": 5
+      },
+      "readinessProbe": {
+        "httpGet": {
+          "path": "/health",
+          "port": 30000
+        },
+        "timeoutSeconds": 10,
+        "periodSeconds": 30,
+        "failureThreshold": 5
+      }
+    }
+  },
+  "decoderConfig": {
+    "runner": {
+      "name": "ome-container",
+      "image": "lmsysorg/sglang:latest",
+      "command": [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "30000",
+        "--model-path",
+        "$(MODEL_PATH)",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "nixl"
+      ],
+      "ports": [
+        {
+          "name": "http",
+          "containerPort": 30000,
+          "protocol": "TCP"
+        }
+      ],
+      "env": [
+        {
+          "name": "PYTHONUNBUFFERED",
+          "value": "1"
+        },
+        {
+          "name": "SGLANG_HOST_IP",
+          "valueFrom": {
+            "fieldRef": {
+              "fieldPath": "status.podIP"
+            }
+          }
+        }
+      ],
+      "resources": {},
+      "livenessProbe": {
+        "httpGet": {
+          "path": "/health",
+          "port": 30000
+        },
+        "timeoutSeconds": 10,
+        "periodSeconds": 60,
+        "failureThreshold": 5
+      },
+      "readinessProbe": {
+        "httpGet": {
+          "path": "/health",
+          "port": 30000
+        },
+        "timeoutSeconds": 10,
+        "periodSeconds": 30,
+        "failureThreshold": 5
+      }
+    }
+  },
+  "containers": null
+}

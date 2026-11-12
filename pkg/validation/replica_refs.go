@@ -78,10 +78,23 @@ func ValidateReplicaRefs(spec *v1beta1.InferenceServiceSpec) error {
 	if len(spec.ReplicaRefs.Engine) == 0 {
 		return fmt.Errorf("%s is required when spec.replicaRefs is set; a service has an engine", ReplicaRefsField(v1beta1.EngineComponent))
 	}
+	if err := validateReplicaRefNames(spec.ReplicaRefs); err != nil {
+		return err
+	}
+	if inline := declaredRoles(spec); len(inline) > 0 {
+		return fmt.Errorf("%s and spec.replicaRefs cannot both be set; a service references all of its roles or none", inline[0].field)
+	}
+	return firstFieldBesideReplicaRefs(spec)
+}
+
+// validateReplicaRefNames checks the names spec.replicaRefs carries: one
+// entry per role, each the name of a standalone replica, no name in two
+// roles. The roles are walked in the order every rule uses.
+func validateReplicaRefNames(refs *v1beta1.ReplicaRefs) error {
 	named := map[string]string{}
 	for _, c := range ComponentRoles {
 		field := ReplicaRefsField(c)
-		names := roleReplicaRefs(spec.ReplicaRefs, c)
+		names := roleReplicaRefs(refs, c)
 		if len(names) > 1 {
 			return fmt.Errorf("%s names %d replicas; one entry per role is accepted", field, len(names))
 		}
@@ -95,35 +108,49 @@ func ValidateReplicaRefs(spec *v1beta1.InferenceServiceSpec) error {
 			named[name] = field
 		}
 	}
-	if inline := declaredRoles(spec); len(inline) > 0 {
-		return fmt.Errorf("%s and spec.replicaRefs cannot both be set; a service references all of its roles or none", inline[0].field)
-	}
-	if spec.Rollout != nil {
-		return fmt.Errorf("spec.rollout is not accepted with spec.replicaRefs; a referenced replica rolls on its own")
-	}
+	return nil
+}
+
+// fieldBesideReplicaRefs is one spec field the referenced form cannot honor:
+// the field as the refusal names it, whether the spec sets it, and the reason
+// the refusal gives.
+type fieldBesideReplicaRefs struct {
+	field  string
+	set    bool
+	reason string
+}
+
+// fieldsBesideReplicaRefs lists the fields that cannot ride with
+// spec.replicaRefs, in the order a refusal names them.
+func fieldsBesideReplicaRefs(spec *v1beta1.InferenceServiceSpec) []fieldBesideReplicaRefs {
 	const (
 		ownModelAndRuntime = "the referenced replicas carry their own model and runtime"
 		nothingRendered    = "the service writes nothing on, and renders nothing for, a referenced replica"
 		thisClusterOnly    = "the referenced replicas exist in this cluster only"
 	)
-	for _, f := range []struct {
-		field  string
-		set    bool
-		reason string
-	}{
+	var mode constants.DeploymentModeType
+	if spec.DeploymentMode != nil {
+		mode = *spec.DeploymentMode
+	}
+	return []fieldBesideReplicaRefs{
+		{"spec.rollout", spec.Rollout != nil, "a referenced replica rolls on its own"},
 		{"spec.model", spec.Model != nil, ownModelAndRuntime},
 		{"spec.runtime", spec.Runtime != nil, ownModelAndRuntime},
 		{"spec.scalingPolicy", spec.ScalingPolicy != nil, nothingRendered},
 		{"spec.acceleratorSelector", spec.AcceleratorSelector != nil, nothingRendered},
 		{"spec.placement", spec.Placement != nil, thisClusterOnly},
 		{"spec.routing", spec.Routing != nil, thisClusterOnly},
-	} {
+		{"spec.deploymentMode " + string(mode), spec.DeploymentMode != nil && mode != constants.OMENative, "a referenced replica is OMENative"},
+	}
+}
+
+// firstFieldBesideReplicaRefs refuses the first set field that cannot ride
+// with spec.replicaRefs.
+func firstFieldBesideReplicaRefs(spec *v1beta1.InferenceServiceSpec) error {
+	for _, f := range fieldsBesideReplicaRefs(spec) {
 		if f.set {
 			return fmt.Errorf("%s is not accepted with spec.replicaRefs; %s", f.field, f.reason)
 		}
-	}
-	if spec.DeploymentMode != nil && *spec.DeploymentMode != constants.OMENative {
-		return fmt.Errorf("spec.deploymentMode %s is not accepted with spec.replicaRefs; a referenced replica is OMENative", *spec.DeploymentMode)
 	}
 	return nil
 }

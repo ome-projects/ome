@@ -20,7 +20,7 @@ import (
 )
 
 // sourceFront is a TCP relay standing in for a Service without a selector:
-// the gate is pinned to the front's address and the test re-aims what sits
+// the gate is fixed at the front's address and the test re-aims what sits
 // behind it. As through a cluster's service proxy, a connection already
 // established keeps flowing to wherever it was opened; only a new connection
 // sees the current target, and with nothing behind the front a new
@@ -46,7 +46,7 @@ func newSourceFront(t *testing.T, target string) *sourceFront {
 	return f
 }
 
-// url is the address the gate is pinned to; it never changes.
+// url is the address the gate is fixed at; it never changes.
 func (f *sourceFront) url() string { return "http://" + f.addr }
 
 // point aims the front at target (host:port). An empty target takes the
@@ -101,7 +101,7 @@ func (f *sourceFront) serve(ln net.Listener) {
 func hostPort(serverURL string) string { return strings.TrimPrefix(serverURL, "http://") }
 
 // TestAnalysisLifecycle_SourceUnusableMidStep drives the gate through the
-// production sampling stack against a source pinned behind a front, and
+// production sampling stack against a source fixed behind a front, and
 // breaks what sits behind the front while the step samples: the source
 // answers nothing, or answers something that is not a metric. Every sample
 // reaches the source as it is at that moment. The gate records an
@@ -110,7 +110,7 @@ func hostPort(serverURL string) string { return strings.TrimPrefix(serverURL, "h
 // and once the source answers again it reads health and the step proceeds.
 func TestAnalysisLifecycle_SourceUnusableMidStep(t *testing.T) {
 	garbage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		// A serving pod answering on the pinned port: a 200 that is not a
+		// A serving pod answering on the fixed port: a 200 that is not a
 		// metrics API response.
 		w.Header().Set("Content-Type", "text/html")
 		_, _ = io.WriteString(w, "<html><body>model server</body></html>")

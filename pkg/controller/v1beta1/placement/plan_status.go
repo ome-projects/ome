@@ -20,51 +20,115 @@ func placementInputCondition(source *v1beta1.InferenceService) policyCondition {
 	return condition
 }
 
+// placementSatisfactionConditions is the PlacementSatisfied condition of a
+// source with an accepted plan: Unknown while the plan cannot be decided yet or
+// its members are not all known to have applied it, False while an assigned
+// minimum is short or replicas are unassigned, True when every assigned
+// minimum is admitted. A source without a plan carries no condition.
 func placementSatisfactionConditions(source *v1beta1.InferenceService) []policyCondition {
 	status := source.Status.Placement
 	if status == nil || status.Plan == nil {
 		return nil
 	}
-	accepted := status.Plan
-	if accepted.SingleMove != nil && accepted.SingleMove.Selected == "" {
-		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingReplacementAdmission)}
+	if reason := planAwaitingReason(source, status.Plan); reason != "" {
+		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reason)}
 	}
-	if accepted.Mode == v1beta1.PlacementModeSingle && accepted.Winner == "" {
-		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingChosenCluster)}
-	}
-	if source.UID == "" || accepted.ID == "" || accepted.Revision <= 0 || accepted.SourceUID != source.UID || accepted.ObservedGeneration != source.Generation {
-		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingCurrentPlan)}
-	}
-	known, shortfall := true, accepted.UnassignedReplicas > 0
-	var assigned int64
-	for _, candidate := range status.Candidates {
-		if candidate.Allocation == nil {
-			known = false
-			continue
-		}
-		if accepted.Mode == v1beta1.PlacementModeAll && (candidate.Allocation.InventoryPending || candidate.Allocation.HomeInputsPending || (candidate.Allocation.Matched && (candidate.Allocation.DesiredHome == nil || candidate.Allocation.DesiredHome.InputDigest != accepted.InputDigest))) {
-			known = false
-		}
-		desiredReplicas := candidate.Allocation.DesiredReplicas
-		assigned += int64(desiredReplicas)
-		if desiredReplicas == 0 && candidate.Allocation.DesiredHome == nil {
-			continue
-		}
-		if candidate.Allocation.ClusterUID == "" || !candidate.ObservationKnown || candidate.AppliedPlanID != accepted.ID {
-			known = false
-			continue
-		}
-		shortfall = shortfall || candidate.AdmittedReplicas < desiredReplicas
-	}
+	admission := readCandidateAdmission(status.Plan, status.Candidates)
+	return []policyCondition{admission.condition(status.Plan)}
+}
+
+// planAwaitingReason is why the accepted plan cannot be decided yet: a bounded
+// replacement with no chosen cluster, a Single plan with no chosen cluster, or
+// a plan that is not the current source's. Empty when the plan can be decided.
+func planAwaitingReason(source *v1beta1.InferenceService, accepted *v1beta1.PlacementPlanStatus) string {
 	switch {
-	case assigned != accepted.AssignedReplicas || accepted.RequestedReplicas != assigned+int64(accepted.UnassignedReplicas):
-		return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAllocationObservationIncomplete)}
-	case shortfall:
-		return []policyCondition{satisfactionCondition(corev1.ConditionFalse, reasonAllocationShortfall)}
-	case known:
-		return []policyCondition{satisfactionCondition(corev1.ConditionTrue, reasonAssignedMinimumsAdmitted)}
+	case accepted.SingleMove != nil && accepted.SingleMove.Selected == "":
+		return reasonAwaitingReplacementAdmission
+	case accepted.Mode == v1beta1.PlacementModeSingle && accepted.Winner == "":
+		return reasonAwaitingChosenCluster
+	case !acceptedPlanCurrent(source, accepted):
+		return reasonAwaitingCurrentPlan
 	}
-	return []policyCondition{satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingMemberApplication)}
+	return ""
+}
+
+// acceptedPlanCurrent reports whether the plan was accepted for the source as
+// it is now: an identified plan with a revision, recorded for the source's UID
+// and its current generation.
+func acceptedPlanCurrent(source *v1beta1.InferenceService, accepted *v1beta1.PlacementPlanStatus) bool {
+	return source.UID != "" && accepted.ID != "" && accepted.Revision > 0 &&
+		accepted.SourceUID == source.UID && accepted.ObservedGeneration == source.Generation
+}
+
+// planAccountsFor reports whether the plan's totals add up over the replica
+// units its candidates are assigned: the assigned total it records, and the
+// requested total as assigned plus unassigned.
+func planAccountsFor(accepted *v1beta1.PlacementPlanStatus, assigned int64) bool {
+	return assigned == accepted.AssignedReplicas && accepted.RequestedReplicas == assigned+int64(accepted.UnassignedReplicas)
+}
+
+// candidateAdmission is what the stored candidates say about the accepted
+// plan: the replica units assigned to them, whether every assigned member is
+// known to have applied the plan, and whether an assigned minimum is short.
+type candidateAdmission struct {
+	assigned  int64
+	known     bool
+	shortfall bool
+}
+
+// readCandidateAdmission reads the candidates against the accepted plan;
+// unassigned replicas count as a shortfall from the start.
+func readCandidateAdmission(accepted *v1beta1.PlacementPlanStatus, candidates []v1beta1.CandidatePlacement) candidateAdmission {
+	admission := candidateAdmission{known: true, shortfall: accepted.UnassignedReplicas > 0}
+	for _, candidate := range candidates {
+		admission.add(accepted, candidate)
+	}
+	return admission
+}
+
+// add reads one candidate. A candidate without an allocation, or whose
+// observation does not identify the accepted plan, leaves the plan unknown; a
+// member assigned nothing needs no admission unless it holds a desired
+// placement.
+func (a *candidateAdmission) add(accepted *v1beta1.PlacementPlanStatus, candidate v1beta1.CandidatePlacement) {
+	allocation := candidate.Allocation
+	if allocation == nil {
+		a.known = false
+		return
+	}
+	if accepted.Mode == v1beta1.PlacementModeAll && allInputsUnsettled(allocation, accepted.InputDigest) {
+		a.known = false
+	}
+	a.assigned += int64(allocation.DesiredReplicas)
+	if allocation.DesiredReplicas == 0 && allocation.DesiredHome == nil {
+		return
+	}
+	if allocation.ClusterUID == "" || !candidate.ObservationKnown || candidate.AppliedPlanID != accepted.ID {
+		a.known = false
+		return
+	}
+	a.shortfall = a.shortfall || candidate.AdmittedReplicas < allocation.DesiredReplicas
+}
+
+// allInputsUnsettled reports whether an All-mode allocation is still being
+// worked out: its inventory or placement inputs are pending, or it matched but
+// its desired placement was derived from other inputs than the plan's.
+func allInputsUnsettled(allocation *v1beta1.CandidateAllocationStatus, inputDigest string) bool {
+	return allocation.InventoryPending || allocation.HomeInputsPending ||
+		(allocation.Matched && (allocation.DesiredHome == nil || allocation.DesiredHome.InputDigest != inputDigest))
+}
+
+// condition is the PlacementSatisfied condition the admission reading gives.
+func (a candidateAdmission) condition(accepted *v1beta1.PlacementPlanStatus) policyCondition {
+	switch {
+	case !planAccountsFor(accepted, a.assigned):
+		return satisfactionCondition(corev1.ConditionUnknown, reasonAllocationObservationIncomplete)
+	case a.shortfall:
+		return satisfactionCondition(corev1.ConditionFalse, reasonAllocationShortfall)
+	case a.known:
+		return satisfactionCondition(corev1.ConditionTrue, reasonAssignedMinimumsAdmitted)
+	}
+	return satisfactionCondition(corev1.ConditionUnknown, reasonAwaitingMemberApplication)
 }
 
 // satisfactionCondition is the PlacementSatisfied condition for one reason,

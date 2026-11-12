@@ -16,7 +16,7 @@ import (
 // reporting is not supported — so admitting None would silently behave
 // like AllPodReady. Single-pod Components keep accepting None (identical
 // to AllPodReady at size 1), and shapes that only become multi-pod
-// through runtime resolution are not judged here: the check considers
+// through runtime resolution are not checked here: the check considers
 // only the Leader+Worker pair the InferenceService itself declares.
 //
 // The check ratchets on UPDATE: a Component is rejected only when the
@@ -48,22 +48,23 @@ func validateMultiPodReadyPolicyNone(oldIsvc, isvc *v1beta1.InferenceService) er
 // multiPodReadyPolicyNoneComponents returns the names of Components that
 // set lifecycle.readyPolicy=None while resolving to a multi-pod OMENative
 // shape from the InferenceService spec alone (a declared Leader+Worker
-// pair with positive Worker.Size). It applies the same shape and mode
-// resolution as dispatch, so the set of Components rejected here is
-// exactly the set the workload engine runs as AllPodReady. Router is
-// always single-pod and never reported.
+// pair with positive Worker.Size). It reads every declared role in the
+// order of v1beta1.Roles, the order a refusal names them; only a role
+// whose block declares a Leader+Worker pair can qualify, so the encoder
+// and the router, single pod by their API, are never named. The
+// service-level mode is resolved as the controller resolves it
+// (annotation, then spec.deploymentMode, then the declared shape), so the
+// Components rejected here are exactly the ones the workload engine runs
+// as AllPodReady.
 func multiPodReadyPolicyNoneComponents(isvc *v1beta1.InferenceService) []string {
-	mode := effectiveDeploymentModeForValidation(isvc)
+	serviceMode := isvcutils.InferenceServiceDeploymentMode(isvc, "")
 	var names []string
-	if isvc.Spec.Engine != nil && declaredMultiPod(isvc.Spec.Engine.Leader, isvc.Spec.Engine.Worker) &&
-		componentReadyPolicyIsNone(&isvc.Spec.Engine.ComponentExtensionSpec) &&
-		componentResolvesToOMENative(isvc.Spec.Engine.Annotations, mode) {
-		names = append(names, "engine")
-	}
-	if isvc.Spec.Decoder != nil && declaredMultiPod(isvc.Spec.Decoder.Leader, isvc.Spec.Decoder.Worker) &&
-		componentReadyPolicyIsNone(&isvc.Spec.Decoder.ComponentExtensionSpec) &&
-		componentResolvesToOMENative(isvc.Spec.Decoder.Annotations, mode) {
-		names = append(names, "decoder")
+	for _, role := range v1beta1.ServiceRoles(&isvc.Spec).Declared() {
+		if validation.DeclaredMultiPod(role.Leader, role.Worker) &&
+			componentReadyPolicyIsNone(role.Extension) &&
+			componentResolvesToOMENative(role.Extension.Annotations, serviceMode) {
+			names = append(names, string(role.Type))
+		}
 	}
 	return names
 }
@@ -71,38 +72,16 @@ func multiPodReadyPolicyNoneComponents(isvc *v1beta1.InferenceService) []string 
 // componentReadyPolicyIsNone reports whether the Component explicitly
 // sets lifecycle.readyPolicy=None.
 func componentReadyPolicyIsNone(ext *v1beta1.ComponentExtensionSpec) bool {
-	return ext != nil && ext.Lifecycle != nil && ext.Lifecycle.ReadyPolicy != nil &&
+	return ext.Lifecycle != nil && ext.Lifecycle.ReadyPolicy != nil &&
 		*ext.Lifecycle.ReadyPolicy == v1beta1.InstanceReadyPolicyNone
-}
-
-// effectiveDeploymentModeForValidation resolves the InferenceService-level
-// mode the same way the controller does (annotation, then
-// spec.deploymentMode, then the declared shape); nil when none of them
-// names a mode.
-func effectiveDeploymentModeForValidation(isvc *v1beta1.InferenceService) *constants.DeploymentModeType {
-	mode := isvcutils.InferenceServiceDeploymentMode(isvc, "")
-	if mode == "" {
-		return nil
-	}
-	return &mode
-}
-
-// declaredMultiPod reports whether a Component declares a Leader+Worker pair
-// whose size is unset or positive; one definition serves every admission rule
-// that keys on a gang shape.
-func declaredMultiPod(leader *v1beta1.LeaderSpec, worker *v1beta1.WorkerSpec) bool {
-	return validation.DeclaredMultiPod(leader, worker)
 }
 
 // componentResolvesToOMENative reports whether a Component dispatches to
 // the OMENative backend: the per-Component ome.io/deploymentMode annotation
-// wins, then the InferenceService-level mode.
-func componentResolvesToOMENative(annotations map[string]string, specMode *constants.DeploymentModeType) bool {
+// wins, then the service-level mode; an empty mode names no backend.
+func componentResolvesToOMENative(annotations map[string]string, serviceMode constants.DeploymentModeType) bool {
 	if annotations[constants.DeploymentMode] != "" {
 		return annotations[constants.DeploymentMode] == string(constants.OMENative)
 	}
-	if specMode != nil {
-		return *specMode == constants.OMENative
-	}
-	return false
+	return serviceMode == constants.OMENative
 }

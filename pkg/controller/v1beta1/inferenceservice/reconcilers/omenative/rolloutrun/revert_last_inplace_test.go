@@ -16,7 +16,7 @@ func readyOn(index int32, running string) workloadtypes.InstanceStatus {
 	return workloadtypes.InstanceStatus{Index: index, Phase: workloadtypes.InstancePhaseReady, RunningRevision: running}
 }
 
-func patchingTo(index int32, running, pinned string) workloadtypes.InstanceStatus {
+func patchingTo(index int32, running, recorded string) workloadtypes.InstanceStatus {
 	return workloadtypes.InstanceStatus{
 		Index:           index,
 		Phase:           workloadtypes.InstancePhaseUpdating,
@@ -24,7 +24,7 @@ func patchingTo(index int32, running, pinned string) workloadtypes.InstanceStatu
 		Operation: &workloadtypes.InstanceOperation{
 			Type:           workloadtypes.InstanceOperationUpdate,
 			Step:           workloadtypes.UpdateStepInPlace,
-			TargetRevision: pinned,
+			TargetRevision: recorded,
 		},
 	}
 }
@@ -32,9 +32,9 @@ func patchingTo(index int32, running, pinned string) workloadtypes.InstanceStatu
 // TestRevertAtTheLastInPlaceInstanceClosesTheRunSuperseded: a rolling
 // group rolls four Instances in place. With three Ready on the new
 // revision and the last mid-patch, the spec returns to the old revision.
-// The Component's current revision is withdrawn while Instances still run
-// the superseded one, so the run that targeted it closes as superseded
-// and a fresh run pinned at the old revision carries the group back; once
+// The Component's current revision is retired while Instances still run
+// the replaced one, so the run that targeted it closes Superseded
+// and a fresh run recorded at the old revision carries the group back; once
 // every Instance is Ready on the old revision that run closes Completed
 // and nothing reopens.
 func TestRevertAtTheLastInPlaceInstanceClosesTheRunSuperseded(t *testing.T) {
@@ -44,12 +44,12 @@ func TestRevertAtTheLastInPlaceInstanceClosesTheRunSuperseded(t *testing.T) {
 	})
 	// current mirrors the IR controller's rollup: it follows
 	// CurrentRevisionFor over the rows the pass publishes, with the
-	// withdrawal carried from pass to pass as the stored record is.
-	current, withdrawn := oldRev, ""
+	// retired revision carried from pass to pass as the stored record is.
+	current, retired := oldRev, ""
 	pass := func(t *testing.T, target string, rows []workloadtypes.InstanceStatus) {
 		t.Helper()
-		next := workloadstatus.CurrentRevisionFor(rows, current, target, nil, withdrawn, nil)
-		withdrawn = workloadstatus.WithdrawnRevisionAfter(withdrawn, current, next, target)
+		next := workloadstatus.CurrentRevisionFor(rows, current, target, nil, retired, nil)
+		retired = workloadstatus.WithdrawnRevisionAfter(retired, current, next, target)
 		current = next
 		local := isvc.DeepCopy()
 		local.ObjectMeta.ResourceVersion = ""
@@ -86,7 +86,7 @@ func TestRevertAtTheLastInPlaceInstanceClosesTheRunSuperseded(t *testing.T) {
 	pass(t, newRev, []workloadtypes.InstanceStatus{patchingTo(0, oldRev, newRev), readyOn(1, oldRev), readyOn(2, oldRev), readyOn(3, oldRev)})
 	rolling := runID(t, "roll to the new revision")
 	if got := active().TargetRevisions[0].Revision; got != query.RevisionFromName(newRev).Hash() {
-		t.Fatalf("roll pinned %q, want the new revision %q", got, query.RevisionFromName(newRev).Hash())
+		t.Fatalf("roll recorded %q, want the new revision %q", got, query.RevisionFromName(newRev).Hash())
 	}
 
 	pass(t, newRev, []workloadtypes.InstanceStatus{readyOn(0, newRev), readyOn(1, newRev), readyOn(2, newRev), patchingTo(3, oldRev, newRev)})
@@ -106,7 +106,7 @@ func TestRevertAtTheLastInPlaceInstanceClosesTheRunSuperseded(t *testing.T) {
 		t.Fatalf("the revert kept the run that targeted the new revision open: %s", reverting)
 	}
 	if got := active().TargetRevisions[0].Revision; got != query.RevisionFromName(oldRev).Hash() {
-		t.Fatalf("the fresh run pinned %q, want the old revision %q", got, query.RevisionFromName(oldRev).Hash())
+		t.Fatalf("the fresh run recorded %q, want the old revision %q", got, query.RevisionFromName(oldRev).Hash())
 	}
 
 	// The group comes back one Instance at a time under the fresh run.
@@ -135,18 +135,18 @@ func TestRevertAtTheLastInPlaceInstanceClosesTheRunSuperseded(t *testing.T) {
 // members report the roll complete. A run judged against them would
 // close Completed and a fresh run would open for the revert; instead the
 // pass waits, and once the projection reaches the members and their
-// target returns to the old revision the run closes as superseded.
+// target returns to the old revision the run closes Superseded.
 func TestRevertAtTheLastInstanceWaitsForTheProjectionBeforeJudgingTheRun(t *testing.T) {
 	isvc := isvcFixture(v1beta1.RolloutGroup{
 		Components:    []v1beta1.ComponentType{v1beta1.EngineComponent},
 		RollingUpdate: &v1beta1.GroupRollingUpdate{},
 	})
 	isvc.Generation = 1
-	current, withdrawn := oldRev, ""
+	current, retired := oldRev, ""
 	pass := func(t *testing.T, target string, projectedFrom int64, rows []workloadtypes.InstanceStatus) {
 		t.Helper()
-		next := workloadstatus.CurrentRevisionFor(rows, current, target, nil, withdrawn, nil)
-		withdrawn = workloadstatus.WithdrawnRevisionAfter(withdrawn, current, next, target)
+		next := workloadstatus.CurrentRevisionFor(rows, current, target, nil, retired, nil)
+		retired = workloadstatus.WithdrawnRevisionAfter(retired, current, next, target)
 		current = next
 		local := isvc.DeepCopy()
 		local.ObjectMeta.ResourceVersion = ""
@@ -201,6 +201,6 @@ func TestRevertAtTheLastInstanceWaitsForTheProjectionBeforeJudgingTheRun(t *test
 		t.Fatalf("the revert opened no fresh run: %+v", active())
 	}
 	if got := active().TargetRevisions[0].Revision; got != query.RevisionFromName(oldRev).Hash() {
-		t.Fatalf("the fresh run pinned %q, want the old revision %q", got, query.RevisionFromName(oldRev).Hash())
+		t.Fatalf("the fresh run recorded %q, want the old revision %q", got, query.RevisionFromName(oldRev).Hash())
 	}
 }

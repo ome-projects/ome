@@ -1,14 +1,13 @@
 {
   "recordedOn": {
-    "commit": "unrecorded",
-    "date": "2026-10-20",
-    "machine": "linux/amd64, 30 cores, go1.26"
+    "date": "2026-11-03",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
   },
-  "reason": "First recording: one ask of the gate stack at 150:100 and 300:100 under surge and 12:8 under RecreatePod.",
+  "reason": "The unavailability gate reads the member's decoded rows on every drain-first ask and lists its pods when the ask hands it no list (a pass hands one list to all of its asks), to count an Instance up only inside the proven window and an attempt the published counters do not show yet; the 12:8 RecreatePod ask carries that cost, the surge asks do not consult it.",
   "tolerancePercent": 10,
   "budgets": {
-    "12:8/recreate10": 51,
-    "150:100/surge10": 69,
-    "300:100/surge10": 99
+    "12:8/recreate10": 65,
+    "150:100/surge10": 68,
+    "300:100/surge10": 98
   }
 }

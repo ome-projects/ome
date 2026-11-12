@@ -1,0 +1,28 @@
+{
+  "recordedOn": {
+    "date": "2026-11-06",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The proof of a gang's key from its pods walks the generated worker-to-leader terms once and keeps the first key it meets, comparing the Instance index as text from a stack buffer: no set, no sorted list, no formatted index, so each reading allocates nothing at every shape (790, 2,734 and 10,084 allocations and 14,000, 43,920 and 151,720 bytes before, at 160 gangs of eight, 500 and 1,725 gangs of two). The keys are collected, for the error that names them, only once two terms disagree.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "160x8/decision/allocations": 0,
+    "160x8/decision/bytes": 0,
+    "160x8/proof/allocations": 0,
+    "160x8/proof/bytes": 0,
+    "160x8/published-keys/allocations": 0,
+    "160x8/published-keys/bytes": 0,
+    "1725x2/decision/allocations": 0,
+    "1725x2/decision/bytes": 0,
+    "1725x2/proof/allocations": 0,
+    "1725x2/proof/bytes": 0,
+    "1725x2/published-keys/allocations": 0,
+    "1725x2/published-keys/bytes": 0,
+    "500x8/decision/allocations": 0,
+    "500x8/decision/bytes": 0,
+    "500x8/proof/allocations": 0,
+    "500x8/proof/bytes": 0,
+    "500x8/published-keys/allocations": 0,
+    "500x8/published-keys/bytes": 0
+  }
+}

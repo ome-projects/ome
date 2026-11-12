@@ -251,7 +251,7 @@ func TestArtifactLockOwnerIDFromEnvironment(t *testing.T) {
 	v.SetEnvPrefix("OME_AGENT")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
-	config, err := NewReplicaConfig(WithViper(v))
+	config, err := newConfig(v, replicaParams{})
 	require.NoError(t, err)
 	assert.Equal(t, "operation-a", config.ArtifactUploadLockOwnerID)
 	require.NoError(t, config.validateArtifactLockOwner())

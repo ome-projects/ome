@@ -145,7 +145,7 @@ func TestExplainProductionAcquisitionIsBoundReadOnlyAndUsesOneDeadline(t *testin
 	require.True(t, omeClient.gets[0].hasDeadline)
 	assert.WithinDuration(t, omeClient.gets[0].observedAt.Add(10*time.Second), omeClient.gets[0].deadline, 150*time.Millisecond)
 	assert.Empty(t, kubeClient.Actions(), "AutoSync must not read or list ControllerRevisions")
-	require.Len(t, runtimeReads, 3, "runtime resolution and both inheritance observations are bounded GETs")
+	require.Len(t, runtimeReads, 2, "runtime resolution and the inheritance observation are bounded GETs")
 	for _, read := range runtimeReads {
 		assert.Equal(t, "get", read.verb)
 		assert.Equal(t, "*v1beta1.ServingRuntime", read.objectType)
@@ -280,7 +280,7 @@ func TestExplainFailsClosedWhenRuntimeChangesOnInheritanceObservation(t *testing
 			if err := client.Get(ctx, key, object, opts...); err != nil {
 				return err
 			}
-			if getCalls > 2 {
+			if getCalls > 1 {
 				object.SetResourceVersion(secretResourceVersion)
 				object.SetGeneration(3)
 			}
@@ -297,7 +297,7 @@ func TestExplainFailsClosedWhenRuntimeChangesOnInheritanceObservation(t *testing
 	err := cmd.Execute()
 
 	require.ErrorIs(t, err, effective.ErrRuntimeSnapshotChanged)
-	assert.GreaterOrEqual(t, getCalls, 3)
+	assert.GreaterOrEqual(t, getCalls, 2)
 	assert.Empty(t, out.String())
 	assert.NotContains(t, err.Error(), secretResourceVersion)
 }

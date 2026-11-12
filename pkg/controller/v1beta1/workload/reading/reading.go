@@ -1,6 +1,7 @@
 package reading
 
 import (
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +35,13 @@ type Context struct {
 // Rotation is the set of pod names a routed Service currently sends new
 // traffic to.
 type Rotation map[string]struct{}
+
+// publishes reports whether the routed Service sends new traffic to the
+// named pod.
+func (r Rotation) publishes(podName string) bool {
+	_, ok := r[podName]
+	return ok
+}
 
 // Pairing is what the Pairable level needs from the peer Component.
 type Pairing struct {
@@ -87,9 +95,9 @@ type PodReading struct {
 	// Component while a pairing-protocol transition is in flight.
 	Pairable bool
 
-	// ParkedIn names the terminal kubelet waiting reason a container of the
-	// pod is parked in; empty when none is.
-	ParkedIn string
+	// HeldIn names the terminal kubelet waiting reason a container of the
+	// pod is held in; empty when none is.
+	HeldIn string
 	// UnreadyPastGrace: the pod served, then failed its readiness for at
 	// least the unready grace.
 	UnreadyPastGrace bool
@@ -99,10 +107,10 @@ type PodReading struct {
 }
 
 // OutOfService reports whether the pod provably serves nothing and will not
-// on its own: parked in a terminal kubelet waiting reason, or served and
+// on its own: held in a terminal kubelet waiting reason, or served and
 // then unready past the grace. A pod still coming up reads false.
 func (p PodReading) OutOfService() bool {
-	return p.ParkedIn != "" || p.UnreadyPastGrace
+	return p.HeldIn != "" || p.UnreadyPastGrace
 }
 
 // Counts is how many pods of the Instance reach each level. Pods counts
@@ -187,13 +195,11 @@ func ReadPod(pod *corev1.Pod, ctx Context) PodReading {
 	}
 	p.RuntimeReady = podreadiness.IsContainersReady(pod)
 	p.Serving = podreadiness.ReadyAndServing(pod)
-	if _, inRotation := ctx.Rotation[pod.Name]; inRotation && !p.Worker && p.RevisionHash != "" {
-		p.Routed = true
-	}
+	p.Routed = ctx.Rotation.publishes(pod.Name) && !p.Worker && p.RevisionHash != ""
 	p.Available = p.Serving && heldReadyForWindow(pod, ctx.AvailabilityWindow, ctx.Now)
 	p.Pairable = p.Serving && (!ctx.Pairing.TransitionInFlight || p.Protocol == "" ||
 		pairsWithPeer(ctx.Pairing.PeerServingByProtocol, p.Protocol))
-	p.ParkedIn = parkedIn(pod)
+	p.HeldIn = heldIn(pod)
 	p.UnreadyPastGrace = unreadyPastGrace(pod, ctx.Now, ctx.UnreadyGrace)
 	p.ContainersUnreadyPastGrace = containersUnreadyPastGrace(pod, ctx.Now, ctx.UnreadyGrace)
 	return p
@@ -209,17 +215,9 @@ func (r InstanceReading) FullyServing() bool {
 	if r.Desired <= 0 {
 		return false
 	}
-	var live int32
-	for _, p := range r.Pods {
-		if p.Terminating || p.SurgeDraining {
-			continue
-		}
-		if p.Terminal || !p.Serving {
-			return false
-		}
-		live++
-	}
-	return live >= r.Desired
+	staying := r.staying()
+	return allPods(staying, func(p PodReading) bool { return !p.Terminal && p.Serving }) &&
+		int32(len(staying)) >= r.Desired
 }
 
 // ServesNothing reports whether a non-empty Instance provably serves
@@ -228,79 +226,80 @@ func (r InstanceReading) FullyServing() bool {
 // the grace, may yet serve and reads false. Workers are ignored; a terminal
 // pod is a member that serves nothing.
 func (r InstanceReading) ServesNothing() bool {
-	members := 0
-	for _, p := range r.Pods {
-		if p.Terminating {
-			continue
-		}
-		members++
-		if p.Terminal || p.Worker {
-			continue
-		}
-		if p.Serving || !p.OutOfService() {
-			return false
-		}
-	}
-	return members > 0
+	m := r.members()
+	return m.count > 0 && allPods(m.routable, func(p PodReading) bool { return !p.Serving && p.OutOfService() })
 }
 
 // OutOfRotation reports whether a non-empty Instance has no live routable
 // pod Serving right now, whatever the reason and for however long. Workers
 // are ignored; a terminal pod is a member that serves nothing.
 func (r InstanceReading) OutOfRotation() bool {
-	members := 0
+	m := r.members()
+	return m.count > 0 && allPods(m.routable, func(p PodReading) bool { return !p.Serving })
+}
+
+// ContainersUnreadyPastGrace reports whether the Instance runs but fails
+// its readiness: every live routable pod has had ContainersReady False for
+// at least the grace, whatever its serving gate reads, so a set a pass has
+// already drained still reads unready past the grace. There must be at least one such pod;
+// workers are ignored and a terminal pod is neither unready past the grace
+// nor serving.
+func (r InstanceReading) ContainersUnreadyPastGrace() bool {
+	m := r.members()
+	return m.count > 0 && len(m.routable) > 0 &&
+		allPods(m.routable, func(p PodReading) bool { return p.ContainersUnreadyPastGrace })
+}
+
+// UnavailableOnHeldMember reports whether the Instance is short of its
+// desired Serving count because a member is held out of service: fewer
+// live pods are Serving than desired, and a live pod that is not Serving
+// is OutOfService. A member merely coming up, or unready inside the
+// grace, is not held.
+func (r InstanceReading) UnavailableOnHeldMember() bool {
+	held := slices.ContainsFunc(r.Pods, func(p PodReading) bool { return p.Live && !p.Serving && p.OutOfService() })
+	return held && r.Counts.Serving < r.Desired
+}
+
+// membership is the one membership rule the rotation readings share: every
+// pod not being deleted is a member, and the members that are neither
+// terminal nor workers are the routable ones, the only pods that can
+// serve.
+type membership struct {
+	count    int
+	routable []PodReading
+}
+
+// members reads the Instance's pods by the membership rule.
+func (r InstanceReading) members() membership {
+	var m membership
 	for _, p := range r.Pods {
 		if p.Terminating {
 			continue
 		}
-		members++
-		if p.Terminal || p.Worker {
-			continue
-		}
-		if p.Serving {
-			return false
+		m.count++
+		if !p.Terminal && !p.Worker {
+			m.routable = append(m.routable, p)
 		}
 	}
-	return members > 0
+	return m
 }
 
-// Dark reports whether the Instance runs but fails its readiness: every live
-// routable pod has had ContainersReady False for at least the grace,
-// whatever its serving gate reads, so a set a pass has already drained
-// still reads dark. There must be at least one such pod; workers are
-// ignored and a terminal pod is neither dark nor serving.
-func (r InstanceReading) Dark() bool {
-	members, routable := 0, 0
+// staying are the pods that are neither being deleted nor held out of
+// rotation by the surge drain ahead of their deletion: the pods a full
+// rotation is read over.
+func (r InstanceReading) staying() []PodReading {
+	var out []PodReading
 	for _, p := range r.Pods {
-		if p.Terminating {
-			continue
-		}
-		members++
-		if p.Terminal || p.Worker {
-			continue
-		}
-		routable++
-		if !p.ContainersUnreadyPastGrace {
-			return false
+		if !p.Terminating && !p.SurgeDraining {
+			out = append(out, p)
 		}
 	}
-	return members > 0 && routable > 0
+	return out
 }
 
-// UnavailableOnParkedMember reports whether the Instance is short of its
-// desired Serving count because a member is out of service: fewer live
-// pods are Serving than desired, and a live pod that is not Serving is
-// OutOfService. A member merely coming up, or unready inside the grace,
-// parks nothing.
-func (r InstanceReading) UnavailableOnParkedMember() bool {
-	parked := false
-	for _, p := range r.Pods {
-		if p.Live && !p.Serving && p.OutOfService() {
-			parked = true
-			break
-		}
-	}
-	return parked && r.Counts.Serving < r.Desired
+// allPods reports whether every pod holds the predicate; true of none.
+func allPods(pods []PodReading, holds func(PodReading) bool) bool {
+	return !slices.ContainsFunc(pods, func(p PodReading) bool { return !holds(p) })
 }
 
 // PairableServing is how many pods are Serving and Pairable.
@@ -327,17 +326,14 @@ func heldReadyForWindow(pod *corev1.Pod, window time.Duration, now time.Time) bo
 	if window <= 0 {
 		return true
 	}
-	ready := condition(pod, corev1.PodReady)
-	if ready == nil || ready.Status != corev1.ConditionTrue || ready.LastTransitionTime.IsZero() {
-		return false
-	}
-	return !now.Before(ready.LastTransitionTime.Add(window))
+	since, known := conditionSince(pod, corev1.PodReady, corev1.ConditionTrue)
+	return known && !now.Before(since.Add(window))
 }
 
-// parkedIn names the terminal kubelet waiting reason a container of the
-// pod, regular or init, is parked in (types.IsTerminalWaiting); empty when
+// heldIn names the terminal kubelet waiting reason a container of the
+// pod, regular or init, is held in (types.IsTerminalWaiting); empty when
 // none is.
-func parkedIn(pod *corev1.Pod) string {
+func heldIn(pod *corev1.Pod) string {
 	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
 		for _, cs := range statuses {
 			if types.IsTerminalWaiting(cs.State.Waiting) {
@@ -376,19 +372,18 @@ func containersUnreadyPastGrace(pod *corev1.Pod, now time.Time, grace time.Durat
 // containersUnreadySince reports whether ContainersReady is False with a
 // transition time at least grace ago.
 func containersUnreadySince(pod *corev1.Pod, now time.Time, grace time.Duration) bool {
-	cond := condition(pod, corev1.ContainersReady)
-	if cond == nil || cond.Status != corev1.ConditionFalse || cond.LastTransitionTime.IsZero() {
-		return false
-	}
-	return now.Sub(cond.LastTransitionTime.Time) >= grace
+	since, known := conditionSince(pod, corev1.ContainersReady, corev1.ConditionFalse)
+	return known && now.Sub(since) >= grace
 }
 
-// condition returns the pod's condition of the given type, or nil.
-func condition(pod *corev1.Pod, t corev1.PodConditionType) *corev1.PodCondition {
-	for i := range pod.Status.Conditions {
-		if pod.Status.Conditions[i].Type == t {
-			return &pod.Status.Conditions[i]
-		}
+// conditionSince is when the pod's condition of the given type last moved
+// to status. known is false when the pod has no such condition, it reads
+// another status, or its transition time is unset, so its age cannot be
+// proven.
+func conditionSince(pod *corev1.Pod, t corev1.PodConditionType, status corev1.ConditionStatus) (since time.Time, known bool) {
+	i := slices.IndexFunc(pod.Status.Conditions, func(c corev1.PodCondition) bool { return c.Type == t })
+	if i < 0 || pod.Status.Conditions[i].Status != status || pod.Status.Conditions[i].LastTransitionTime.IsZero() {
+		return time.Time{}, false
 	}
-	return nil
+	return pod.Status.Conditions[i].LastTransitionTime.Time, true
 }

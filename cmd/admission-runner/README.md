@@ -22,15 +22,19 @@ The versioned input layout contains:
 
 - `plan.json`: destination identifier, `omeRevision`, `managerNamespace`,
   `managerRole` (empty or `control-plane`).
-- `baseline.yaml`, `proposed.yaml`: the five supported OME resource kinds.
-- `catalog.yaml`: models/runtimes provided by the selected charts.
+- `baseline.yaml`, `proposed.yaml`: InferenceService, ServingRuntime,
+  ClusterServingRuntime, BaseModel, ClusterBaseModel, RolloutPolicy and
+  AutoscalerPolicy.
+  `proposed.yaml` may also hold WorkloadClusters, which are stored before
+  the probes so a control plane plans Split services against them.
+- `catalog.yaml`: models, runtimes and policies provided by the selected charts.
 - `configmap.yaml`: the selected `inferenceservice-config` ConfigMap.
 - `config/crd/full/*.yaml`: installed OME schemas.
 - `config/webhook/manifests.yaml`: selected validating and mutating webhook configurations.
 
 [manifest_validation.go](manifest_validation.go) loads retained baseline resources
 and chart defaults into the private API with runtime preset mutation enabled,
-before validating webhooks start. Models and parent
+before validating webhooks start. Policies precede models and runtimes, and parent
 runtimes precede services. Validated dependencies
 are stored only in the private API. CREATE/UPDATE dry runs must leave stored
 service objects unchanged. A read-only manager identity and checks for workload
@@ -40,11 +44,16 @@ The ServingRuntime and ClusterServingRuntime preset mutators fill missing engine
 decoder and router settings when a runtime sets `ome.io/engine`. Explicit runtime
 settings take precedence. Mutation runs before validation on each dry run, and
 accepted runtime changes are stored with the populated fields for later lookups.
-Unknown engine names are rejected. The Pod mutator is excluded because this runner
+The presets are the `runtimePresets` key of the input ConfigMap; an engine name
+that key does not hold is rejected. The Pod mutator is excluded because this runner
 does not submit Pods.
 
 Control-plane role preserves its disabled InferenceService webhook. Those
-services receive strict CRD validation. Other admission handlers retain their
+services receive strict CRD validation and, when the webhook manifests carry
+it, the Split plan validator at
+`/validate-ome-io-v1beta1-inferenceservice-splitplan`. That validator refuses
+a ClusterAffinity Split service the placement planner would hold across the
+stored WorkloadClusters. Other admission handlers retain their
 normal configuration. The input ConfigMap is not rewritten for controller
 routing, because webhook-only startup does not initialize those controllers.
 
@@ -54,6 +63,9 @@ routing, because webhook-only startup does not initialize those controllers.
 per-resource allow/reject decisions, webhook calls, dry-run state and object
 immutability. Invalid proposed resources exit nonzero. Setup failures write
 logs. The caller decides whether failures block deployment or remain advisory.
+Clients can pass `--require-kinds RolloutPolicy,AutoscalerPolicy` to reject a
+binary that cannot probe those kinds. Policy probes require their webhook trace;
+a chart without that policy webhook does not establish semantic coverage.
 
 File names in this input/output layout and webhook paths are protocol
 identifiers. Addresses, limits, identity names and executable paths are caller

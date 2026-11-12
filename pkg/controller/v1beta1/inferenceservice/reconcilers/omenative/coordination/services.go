@@ -17,6 +17,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/service"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -89,6 +90,14 @@ func PerRevisionServiceName(prefix string, component v1beta1.ComponentType, revi
 	return query.PerRevisionServiceName(prefix, workload.ComponentType(component), revisionHash)
 }
 
+// ControllerRevisionName is the name of the ControllerRevision a
+// Component's replica mints for one revision hash, `<prefix>-<component>-<hash>`;
+// prefix is the Component's replica prefix (prefixFor). Delegates to the
+// workload/query composer the replica controller names its revisions with.
+func ControllerRevisionName(prefix string, component v1beta1.ComponentType, revisionHash string) string {
+	return query.ControllerRevisionName(prefix, workload.ComponentType(component), revisionHash)
+}
+
 // PerRevisionHeadlessServiceName returns the per-revision headless
 // Service name. Format: `<prefix>-<component>-rev-<hash>-headless`,
 // bounded to the DNS1035 label limit.
@@ -122,6 +131,37 @@ func SortedRevisionHashes(byHash map[string]int32) []string {
 	return out
 }
 
+// checkPerRevisionInputs is the guard both builders start with: a Service
+// needs an owner to name it under and a revision to select.
+func checkPerRevisionInputs(isvc *v1beta1.InferenceService, revisionHash string) error {
+	if isvc == nil {
+		return fmt.Errorf("nil InferenceService")
+	}
+	if revisionHash == "" {
+		return fmt.Errorf("empty revisionHash")
+	}
+	return nil
+}
+
+// perRevisionServiceObject is what the two Services of a revision share: a
+// ClusterIP Service in the InferenceService's namespace, labelled with the
+// revision's label set and owned by the InferenceService, so a deleted
+// service takes its per-revision Services with it. The caller sets what
+// tells the two apart: the selector, the ports and the ClusterIP.
+func perRevisionServiceObject(isvc *v1beta1.InferenceService, name string, labels map[string]string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: isvc.Namespace,
+			Labels:    labels,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(isvc, isvcGroupVersionKind),
+			},
+		},
+		Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeClusterIP},
+	}
+}
+
 // BuildPerRevisionRoutingService produces the ClusterIP per-revision
 // Service for one (component, revisionHash). Pure compute; idempotent.
 //
@@ -130,22 +170,26 @@ func SortedRevisionHashes(byHash map[string]int32) []string {
 // perRevisionRoutingPorts). Returns ErrNoServingPort when the set is
 // empty — the Service is not buildable without a port the pods listen on.
 //
+// `appProtocols` maps Service port names to the appProtocol the Component
+// declares for them. Each published port gets the value declared for its own
+// name, by the stable Service's rule (service.AppProtocolForPort), or none.
+//
 // `routing` may restrict the selector to leader pods and, when supported by
 // the observed revision, leader ordinal 0. Revisions without ordinal labels
 // retain a reachable leader-only selector.
 //
 // The routing Service's label map intentionally excludes optional runner and
 // ordinal filters. Labels describe the Service; the Selector gates pod membership.
-func BuildPerRevisionRoutingService(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort) (*corev1.Service, error) {
-	if isvc == nil {
-		return nil, fmt.Errorf("nil InferenceService")
-	}
-	if revisionHash == "" {
-		return nil, fmt.Errorf("empty revisionHash")
+func BuildPerRevisionRoutingService(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort, appProtocols map[string]string) (*corev1.Service, error) {
+	if err := checkPerRevisionInputs(isvc, revisionHash); err != nil {
+		return nil, err
 	}
 	ports, err := perRevisionRoutingPorts(runnerPorts)
 	if err != nil {
 		return nil, err
+	}
+	for i := range ports {
+		ports[i].AppProtocol = service.AppProtocolForPort(appProtocols, ports[i].Name)
 	}
 	prefix := prefixFor(isvc, component)
 	labels := perRevisionServiceSelector(prefix, component, revisionHash)
@@ -153,22 +197,10 @@ func BuildPerRevisionRoutingService(isvc *v1beta1.InferenceService, component v1
 	if routing.LeaderOnly {
 		selector = query.LeaderRoutingSelector(labels, routing.PodOrdinal)
 	}
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      PerRevisionServiceName(prefix, component, revisionHash),
-			Namespace: isvc.Namespace,
-			Labels:    labels,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(isvc, isvcGroupVersionKind),
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Type:                     corev1.ServiceTypeClusterIP,
-			Selector:                 selector,
-			PublishNotReadyAddresses: false,
-			Ports:                    ports,
-		},
-	}, nil
+	svc := perRevisionServiceObject(isvc, PerRevisionServiceName(prefix, component, revisionHash), labels)
+	svc.Spec.Selector = selector
+	svc.Spec.Ports = ports
+	return svc, nil
 }
 
 // perRevisionRoutingPorts maps a Component's effective serving container ports
@@ -182,7 +214,7 @@ func BuildPerRevisionRoutingService(isvc *v1beta1.InferenceService, component v1
 // TargetPort follows the container port's NAME when it has one. Kubernetes
 // resolves a named targetPort per endpoint pod, so a revision whose pods
 // were rendered from an older spec still receives traffic on the port that
-// revision actually opened; a numeric targetPort would pin every revision
+// revision actually opened; a numeric targetPort would tie every revision
 // to the current spec's number. Unnamed ports fall back to the number.
 //
 // ClusterIP Services require at least one port (k8s validation), so an
@@ -234,30 +266,16 @@ func servingContainerPort(ports []corev1.ContainerPort) (corev1.ContainerPort, b
 // requires every pod to be addressable via per-pod DNS. Only the
 // per-revision routing Service adds leader and ordinal filters.
 func BuildPerRevisionHeadlessService(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string) (*corev1.Service, error) {
-	if isvc == nil {
-		return nil, fmt.Errorf("nil InferenceService")
-	}
-	if revisionHash == "" {
-		return nil, fmt.Errorf("empty revisionHash")
+	if err := checkPerRevisionInputs(isvc, revisionHash); err != nil {
+		return nil, err
 	}
 	prefix := prefixFor(isvc, component)
 	selector := perRevisionServiceSelector(prefix, component, revisionHash)
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      PerRevisionHeadlessServiceName(prefix, component, revisionHash),
-			Namespace: isvc.Namespace,
-			Labels:    selector,
-			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(isvc, isvcGroupVersionKind),
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Type:                     corev1.ServiceTypeClusterIP,
-			ClusterIP:                corev1.ClusterIPNone,
-			Selector:                 selector,
-			PublishNotReadyAddresses: true,
-		},
-	}, nil
+	svc := perRevisionServiceObject(isvc, PerRevisionHeadlessServiceName(prefix, component, revisionHash), selector)
+	svc.Spec.ClusterIP = corev1.ClusterIPNone
+	svc.Spec.Selector = selector
+	svc.Spec.PublishNotReadyAddresses = true
+	return svc, nil
 }
 
 // perRevisionServiceSelector is the label set per-revision Services
@@ -273,6 +291,62 @@ func perRevisionServiceSelector(prefix string, component v1beta1.ComponentType, 
 		query.LabelRevisionHash:               revisionHash,
 		query.LabelManagedBy:                  query.ManagedByOMENative,
 	}
+}
+
+// serviceBuilder renders one of the two Services of a revision from the
+// InferenceService, the Component and the revision hash.
+type serviceBuilder func(*v1beta1.InferenceService, v1beta1.ComponentType, string) (*corev1.Service, error)
+
+// perRevisionServiceWrite is one Service of a revision's pair as a writer
+// handles it: its name, how to render the desired object, and whether it is
+// the headless one, whose ClusterIP is None and immutable once created.
+type perRevisionServiceWrite struct {
+	isvc         *v1beta1.InferenceService
+	component    v1beta1.ComponentType
+	revisionHash string
+	name         string
+	build        serviceBuilder
+	headless     bool
+}
+
+// desired renders the Service as it should be.
+func (w perRevisionServiceWrite) desired() (*corev1.Service, error) {
+	return w.build(w.isvc, w.component, w.revisionHash)
+}
+
+// perRevisionPair is the routing and headless Service of one (component,
+// revisionHash) as a writer handles them. The routing Service carries the
+// revision's pairing protocol as a metadata label, never in the selector:
+// pod selection stays purely revision-hash based, and the label lets
+// routing consumers pair engine and decoder Services without decoding
+// revisions. Both writers resolve the pair the same way and differ only in
+// how they write each Service.
+type perRevisionPair struct {
+	routing  perRevisionServiceWrite
+	headless perRevisionServiceWrite
+}
+
+// resolvePerRevisionPair names the pair under the Component's replica
+// prefix and reads the revision's pairing protocol from its
+// ControllerRevision. A missing ControllerRevision degrades to no label
+// (pairs with anything); the ensure path corrects the label on every pass.
+func resolvePerRevisionPair(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort, appProtocols map[string]string) (perRevisionPair, error) {
+	prefix := prefixFor(isvc, component)
+	protocol, _, err := PairingProtocolForRevision(ctx, reads, isvc.Namespace, prefix, component, revisionHash)
+	if err != nil {
+		return perRevisionPair{}, err
+	}
+	names := PerRevisionServiceNames(prefix, component, revisionHash)
+	return perRevisionPair{
+		routing: perRevisionServiceWrite{
+			isvc: isvc, component: component, revisionHash: revisionHash,
+			name: names.RoutingName, build: perRevisionRoutingBuilder(protocol, routing, runnerPorts, appProtocols),
+		},
+		headless: perRevisionServiceWrite{
+			isvc: isvc, component: component, revisionHash: revisionHash,
+			name: names.HeadlessName, build: BuildPerRevisionHeadlessService, headless: true,
+		},
+	}, nil
 }
 
 // EnsurePerRevisionServices ensures both the routing and headless
@@ -291,26 +365,22 @@ func perRevisionServiceSelector(prefix string, component v1beta1.ComponentType, 
 // ready) and silently drops every request. The headless Service is still
 // ensured — peer DNS for distributed init does not depend on the serving
 // port. The reconcile does not fail: coordination is a producer layer, and
-// one Component's missing port declaration must not wedge the rest of the
+// one Component's missing port declaration must not hold up the rest of the
 // InferenceService.
-func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort) (PerRevisionService, error) {
-	prefix := prefixFor(isvc, component)
-	out := PerRevisionServiceNames(prefix, component, revisionHash)
+//
+// `appProtocols` is applied as in BuildPerRevisionRoutingService. Every call
+// rewrites the routing Service's ports, so an existing Service gains or drops
+// an appProtocol when the argument changes.
+func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort, appProtocols map[string]string) (PerRevisionService, error) {
+	out := PerRevisionServiceNames(prefixFor(isvc, component), component, revisionHash)
 	if c == nil {
 		return out, fmt.Errorf("EnsurePerRevisionServices: nil client")
 	}
-
-	// The revision's pairing protocol rides the routing Service as a metadata
-	// label (never the selector — pod selection stays purely revision-hash
-	// based) so routing consumers can pair engine/decoder Services without
-	// decoding revisions. A missing CR degrades to no label (pairs with
-	// anything); the label is drift-corrected on every ensure.
-	protocol, _, perr := PairingProtocolForRevision(ctx, c, isvc.Namespace, prefix, component, revisionHash)
-	if perr != nil {
-		return out, perr
+	pair, err := resolvePerRevisionPair(ctx, c, isvc, component, revisionHash, routing, runnerPorts, appProtocols)
+	if err != nil {
+		return out, err
 	}
-	routingBuild := perRevisionRoutingBuilder(protocol, routing, runnerPorts)
-	switch err := ensureService(ctx, c, isvc, routingBuild, component, revisionHash, out.RoutingName, false); {
+	switch err := ensureService(ctx, c, pair.routing); {
 	case errors.Is(err, ErrNoServingPort):
 		log.FromContext(ctx).Info("Skipping per-revision routing Service: component serving template declares no container port",
 			"component", component, "revisionHash", revisionHash, "service", out.RoutingName)
@@ -318,7 +388,7 @@ func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1bet
 	case err != nil:
 		return out, err
 	}
-	if err := ensureService(ctx, c, isvc, BuildPerRevisionHeadlessService, component, revisionHash, out.HeadlessName, true); err != nil {
+	if err := ensureService(ctx, c, pair.headless); err != nil {
 		return out, err
 	}
 	return out, nil
@@ -333,34 +403,33 @@ func EnsurePerRevisionServices(ctx context.Context, c client.Client, isvc *v1bet
 // revision's observed pods; this path derives it from the peer's declared
 // Runners (RoutingSelectorForRunners) and never overwrites, so the two
 // writers cannot fight. A missing serving port skips the routing Service
-// the same way the ensure path does.
-func CreatePerRevisionServicesIfAbsent(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort) error {
+// the same way the ensure path does. `appProtocols` is applied as in
+// BuildPerRevisionRoutingService. A Service created here without an
+// appProtocol keeps none until EnsurePerRevisionServices rewrites its ports.
+func CreatePerRevisionServicesIfAbsent(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, revisionHash string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort, appProtocols map[string]string) error {
 	if c == nil {
 		return fmt.Errorf("CreatePerRevisionServicesIfAbsent: nil client")
 	}
 	if isvc == nil || revisionHash == "" {
 		return nil
 	}
-	prefix := prefixFor(isvc, component)
-	protocol, _, perr := PairingProtocolForRevision(ctx, c, isvc.Namespace, prefix, component, revisionHash)
-	if perr != nil {
-		return perr
-	}
-	names := PerRevisionServiceNames(prefix, component, revisionHash)
-	routingBuild := perRevisionRoutingBuilder(protocol, routing, runnerPorts)
-	if err := createServiceIfAbsent(ctx, c, isvc, routingBuild, component, revisionHash, names.RoutingName); err != nil && !errors.Is(err, ErrNoServingPort) {
+	pair, err := resolvePerRevisionPair(ctx, c, isvc, component, revisionHash, routing, runnerPorts, appProtocols)
+	if err != nil {
 		return err
 	}
-	return createServiceIfAbsent(ctx, c, isvc, BuildPerRevisionHeadlessService, component, revisionHash, names.HeadlessName)
+	if err := createServiceIfAbsent(ctx, c, pair.routing); err != nil && !errors.Is(err, ErrNoServingPort) {
+		return err
+	}
+	return createServiceIfAbsent(ctx, c, pair.headless)
 }
 
 // perRevisionRoutingBuilder returns the routing-Service builder for one
-// revision with the revision's pairing protocol stamped as a metadata label.
+// revision with the revision's pairing protocol written as a metadata label.
 // The label never enters the selector: the builder may alias Labels and
 // Spec.Selector, so the label map is replaced rather than mutated.
-func perRevisionRoutingBuilder(protocol string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort) func(*v1beta1.InferenceService, v1beta1.ComponentType, string) (*corev1.Service, error) {
+func perRevisionRoutingBuilder(protocol string, routing RevisionRoutingSelector, runnerPorts []corev1.ContainerPort, appProtocols map[string]string) serviceBuilder {
 	return func(i *v1beta1.InferenceService, comp v1beta1.ComponentType, hash string) (*corev1.Service, error) {
-		svc, err := BuildPerRevisionRoutingService(i, comp, hash, routing, runnerPorts)
+		svc, err := BuildPerRevisionRoutingService(i, comp, hash, routing, runnerPorts, appProtocols)
 		if err != nil || svc == nil {
 			return svc, err
 		}
@@ -417,53 +486,38 @@ func ServingPortsFromRunners(runners []v1beta1.Runner) []corev1.ContainerPort {
 	return ports
 }
 
-// createServiceIfAbsent creates the built Service only when no Service of
-// that name exists; an existing one is left exactly as found.
-func createServiceIfAbsent(
-	ctx context.Context,
-	c client.Client,
-	isvc *v1beta1.InferenceService,
-	build func(*v1beta1.InferenceService, v1beta1.ComponentType, string) (*corev1.Service, error),
-	component v1beta1.ComponentType,
-	revisionHash, name string,
-) error {
+// createServiceIfAbsent creates the Service only when no Service of that
+// name exists; an existing one is left exactly as found.
+func createServiceIfAbsent(ctx context.Context, c client.Client, w perRevisionServiceWrite) error {
 	existing := &corev1.Service{}
-	err := c.Get(ctx, client.ObjectKey{Namespace: isvc.Namespace, Name: name}, existing)
+	err := c.Get(ctx, client.ObjectKey{Namespace: w.isvc.Namespace, Name: w.name}, existing)
 	if err == nil {
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
-		return fmt.Errorf("get per-revision service %s/%s: %w", isvc.Namespace, name, err)
+		return fmt.Errorf("get per-revision service %s/%s: %w", w.isvc.Namespace, w.name, err)
 	}
-	desired, err := build(isvc, component, revisionHash)
+	desired, err := w.desired()
 	if err != nil {
 		if errors.Is(err, ErrNoServingPort) {
 			return err
 		}
-		return fmt.Errorf("build per-revision service %s: %w", name, err)
+		return fmt.Errorf("build per-revision service %s: %w", w.name, err)
 	}
 	if err := c.Create(ctx, desired); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create per-revision service %s/%s: %w", isvc.Namespace, name, err)
+		return fmt.Errorf("create per-revision service %s/%s: %w", w.isvc.Namespace, w.name, err)
 	}
 	return nil
 }
 
-// ensureService is the shared CreateOrUpdate helper for the routing /
-// headless pair. headless distinguishes the ClusterIP semantics so the
-// patch back to the desired shape doesn't try to flip an immutable
-// ClusterIP after create.
-func ensureService(
-	ctx context.Context,
-	c client.Client,
-	isvc *v1beta1.InferenceService,
-	build func(*v1beta1.InferenceService, v1beta1.ComponentType, string) (*corev1.Service, error),
-	component v1beta1.ComponentType,
-	revisionHash, name string,
-	headless bool,
-) error {
-	desired, err := build(isvc, component, revisionHash)
+// ensureService creates the Service or patches an existing one back to the
+// desired shape. The ClusterIP and the type are set only at create: a
+// headless Service's ClusterIP is None and immutable after, so the patch
+// never tries to change it.
+func ensureService(ctx context.Context, c client.Client, w perRevisionServiceWrite) error {
+	desired, err := w.desired()
 	if err != nil {
-		return fmt.Errorf("build per-revision service %s: %w", name, err)
+		return fmt.Errorf("build per-revision service %s: %w", w.name, err)
 	}
 	target := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -473,7 +527,7 @@ func ensureService(
 	}
 	_, err = controllerutil.CreateOrUpdate(ctx, c, target, func() error {
 		if target.CreationTimestamp.IsZero() {
-			if headless {
+			if w.headless {
 				target.Spec.ClusterIP = corev1.ClusterIPNone
 			}
 			target.Spec.Type = desired.Spec.Type

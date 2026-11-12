@@ -1,0 +1,878 @@
+{
+  "columns/fullFeature": {
+    "replicas": 8,
+    "currentRevision": "example-engine-2f32f6fe",
+    "labelSelector": "ome.io/inferenceservice=llama-70b,ome.io/component=engine",
+    "instanceStatusEncoding": "ColumnarV2",
+    "instanceStatusColumns": {
+      "members": "0-3,5,7,20,2147483647",
+      "rowOrder": [
+        5,
+        0,
+        1,
+        2,
+        3,
+        20,
+        7,
+        2147483647
+      ],
+      "phases": [
+        {
+          "value": "Creating",
+          "indexes": "1"
+        },
+        {
+          "value": "Deleting",
+          "indexes": "2147483647"
+        },
+        {
+          "value": "Failed",
+          "indexes": "7"
+        },
+        {
+          "value": "Migrating",
+          "indexes": "20"
+        },
+        {
+          "value": "Pending",
+          "indexes": "0"
+        },
+        {
+          "value": "Ready",
+          "indexes": "5"
+        },
+        {
+          "value": "Restarting",
+          "indexes": "3"
+        },
+        {
+          "value": "Updating",
+          "indexes": "2"
+        }
+      ],
+      "runningRevisions": [
+        {
+          "value": "example-engine-2f32f6fe",
+          "indexes": "2-3,5,20"
+        },
+        {
+          "value": "example-engine-9b1c0d2e",
+          "indexes": "7,2147483647"
+        }
+      ],
+      "targetRevisions": [
+        {
+          "value": "example-engine-2f32f6fe",
+          "indexes": "1"
+        },
+        {
+          "value": "example-engine-9b1c0d2e",
+          "indexes": "2"
+        }
+      ],
+      "incarnations": [
+        {
+          "value": -1,
+          "indexes": "2"
+        },
+        {
+          "value": 1,
+          "indexes": "0,20"
+        },
+        {
+          "value": 2,
+          "indexes": "3"
+        },
+        {
+          "value": 3,
+          "indexes": "5"
+        },
+        {
+          "value": 4,
+          "indexes": "7"
+        },
+        {
+          "value": 9223372036854775807,
+          "indexes": "2147483647"
+        }
+      ],
+      "podCounts": [
+        {
+          "value": 8,
+          "indexes": "2-3,5,20"
+        },
+        {
+          "value": 2147483647,
+          "indexes": "2147483647"
+        }
+      ],
+      "servingPodCounts": [
+        {
+          "value": 1,
+          "indexes": "2147483647"
+        },
+        {
+          "value": 4,
+          "indexes": "2"
+        },
+        {
+          "value": 8,
+          "indexes": "5,20"
+        }
+      ],
+      "availablePodCounts": [
+        {
+          "value": 8,
+          "indexes": "5,20"
+        },
+        {
+          "value": 2147483647,
+          "indexes": "2147483647"
+        }
+      ],
+      "admitted": "2-3,5,7,20",
+      "activeOrdinalOne": "5,7",
+      "readySinceBase": "2026-03-04T04:06:07Z",
+      "readySinceIndexes": "5",
+      "readySinceOffsets": [
+        0
+      ],
+      "entries": [
+        {
+          "index": 1,
+          "operation": {
+            "id": "op-create",
+            "type": "Create",
+            "step": "WaitReady",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          }
+        },
+        {
+          "index": 2,
+          "operation": {
+            "id": "op-update",
+            "type": "Update",
+            "step": "Drain",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          }
+        },
+        {
+          "index": 3,
+          "operation": {
+            "id": "op-restart",
+            "type": "Restart",
+            "step": "DeletePods",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          },
+          "lastFailure": {
+            "podName": "example-engine-3-2",
+            "containerName": "ome-container",
+            "reason": "Error",
+            "exitCode": 143,
+            "message": "exit status 143",
+            "time": "2026-03-04T05:06:07Z"
+          }
+        },
+        {
+          "index": 5,
+          "conditions": [
+            {
+              "type": "AllPodsReady",
+              "status": "True",
+              "observedGeneration": 3,
+              "lastTransitionTime": "2026-03-04T05:06:07Z",
+              "reason": "Ready",
+              "message": "Ready observed"
+            },
+            {
+              "type": "AllPodsAvailable",
+              "status": "True",
+              "observedGeneration": 3,
+              "lastTransitionTime": "2026-03-04T05:06:07Z",
+              "reason": "Available",
+              "message": "Available observed"
+            }
+          ]
+        },
+        {
+          "index": 7,
+          "conditions": [
+            {
+              "type": "Failed",
+              "status": "True",
+              "observedGeneration": 3,
+              "lastTransitionTime": "2026-03-04T05:06:07Z",
+              "reason": "PodFailed",
+              "message": "PodFailed observed"
+            }
+          ],
+          "lastFailure": {
+            "podName": "example-engine-7-0",
+            "reason": "PodFailed",
+            "time": "2026-03-04T05:06:07Z"
+          }
+        },
+        {
+          "index": 20,
+          "operation": {
+            "id": "op-migrate",
+            "type": "Migrate",
+            "step": "SurgeReady",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout",
+            "surgeIndex": 21,
+            "fromNode": "node-a",
+            "hintTargetNodes": [
+              "node-c",
+              "node-b"
+            ],
+            "requestUUID": "9c0d1e2f-0000-4000-8000-000000000001"
+          }
+        },
+        {
+          "index": 2147483647,
+          "operation": {
+            "id": "op-delete",
+            "type": "Delete",
+            "step": "Drain",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          }
+        }
+      ]
+    }
+  },
+  "columns/readySince/50": {
+    "replicas": 50,
+    "currentRevision": "example-engine-2f32f6fe",
+    "labelSelector": "ome.io/inferenceservice=llama-70b,ome.io/component=engine",
+    "instanceStatusEncoding": "ColumnarV2",
+    "instanceStatusColumns": {
+      "members": "0-49",
+      "phases": [
+        {
+          "value": "Ready",
+          "indexes": "0-49"
+        }
+      ],
+      "runningRevisions": [
+        {
+          "value": "example-engine-2f32f6fe",
+          "indexes": "0-49"
+        }
+      ],
+      "incarnations": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "podCounts": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "servingPodCounts": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "availablePodCounts": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "admitted": "0-49",
+      "readySinceBase": "2026-03-04T05:06:07Z",
+      "readySinceIndexes": "0-49",
+      "readySinceOffsets": [
+        0,
+        11,
+        22,
+        33,
+        44,
+        55,
+        66,
+        77,
+        88,
+        99,
+        110,
+        121,
+        132,
+        143,
+        154,
+        165,
+        176,
+        187,
+        198,
+        209,
+        220,
+        231,
+        242,
+        253,
+        264,
+        275,
+        286,
+        297,
+        308,
+        319,
+        330,
+        341,
+        352,
+        363,
+        374,
+        385,
+        396,
+        407,
+        418,
+        429,
+        440,
+        451,
+        462,
+        473,
+        484,
+        495,
+        506,
+        517,
+        528,
+        539
+      ]
+    }
+  },
+  "entries/fullFeature": {
+    "replicas": 8,
+    "currentRevision": "example-engine-2f32f6fe",
+    "labelSelector": "ome.io/inferenceservice=llama-70b,ome.io/component=engine",
+    "instanceStatusEncoding": "ColumnarV2",
+    "instanceStatusColumns": {
+      "members": "0-3,5,7,20,2147483647",
+      "rowOrder": [
+        5,
+        0,
+        1,
+        2,
+        3,
+        20,
+        7,
+        2147483647
+      ],
+      "phases": [
+        {
+          "value": "Creating",
+          "indexes": "1"
+        },
+        {
+          "value": "Deleting",
+          "indexes": "2147483647"
+        },
+        {
+          "value": "Failed",
+          "indexes": "7"
+        },
+        {
+          "value": "Migrating",
+          "indexes": "20"
+        },
+        {
+          "value": "Pending",
+          "indexes": "0"
+        },
+        {
+          "value": "Ready",
+          "indexes": "5"
+        },
+        {
+          "value": "Restarting",
+          "indexes": "3"
+        },
+        {
+          "value": "Updating",
+          "indexes": "2"
+        }
+      ],
+      "runningRevisions": [
+        {
+          "value": "example-engine-2f32f6fe",
+          "indexes": "2-3,5,20"
+        },
+        {
+          "value": "example-engine-9b1c0d2e",
+          "indexes": "7,2147483647"
+        }
+      ],
+      "targetRevisions": [
+        {
+          "value": "example-engine-2f32f6fe",
+          "indexes": "1"
+        },
+        {
+          "value": "example-engine-9b1c0d2e",
+          "indexes": "2"
+        }
+      ],
+      "incarnations": [
+        {
+          "value": -1,
+          "indexes": "2"
+        },
+        {
+          "value": 1,
+          "indexes": "0,20"
+        },
+        {
+          "value": 2,
+          "indexes": "3"
+        },
+        {
+          "value": 3,
+          "indexes": "5"
+        },
+        {
+          "value": 4,
+          "indexes": "7"
+        },
+        {
+          "value": 9223372036854775807,
+          "indexes": "2147483647"
+        }
+      ],
+      "podCounts": [
+        {
+          "value": 8,
+          "indexes": "2-3,5,20"
+        },
+        {
+          "value": 2147483647,
+          "indexes": "2147483647"
+        }
+      ],
+      "servingPodCounts": [
+        {
+          "value": 1,
+          "indexes": "2147483647"
+        },
+        {
+          "value": 4,
+          "indexes": "2"
+        },
+        {
+          "value": 8,
+          "indexes": "5,20"
+        }
+      ],
+      "availablePodCounts": [
+        {
+          "value": 8,
+          "indexes": "5,20"
+        },
+        {
+          "value": 2147483647,
+          "indexes": "2147483647"
+        }
+      ],
+      "admitted": "2-3,5,7,20",
+      "activeOrdinalOne": "5,7",
+      "entries": [
+        {
+          "index": 1,
+          "operation": {
+            "id": "op-create",
+            "type": "Create",
+            "step": "WaitReady",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          }
+        },
+        {
+          "index": 2,
+          "operation": {
+            "id": "op-update",
+            "type": "Update",
+            "step": "Drain",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          }
+        },
+        {
+          "index": 3,
+          "operation": {
+            "id": "op-restart",
+            "type": "Restart",
+            "step": "DeletePods",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          },
+          "lastFailure": {
+            "podName": "example-engine-3-2",
+            "containerName": "ome-container",
+            "reason": "Error",
+            "exitCode": 143,
+            "message": "exit status 143",
+            "time": "2026-03-04T05:06:07Z"
+          }
+        },
+        {
+          "index": 5,
+          "conditions": [
+            {
+              "type": "AllPodsReady",
+              "status": "True",
+              "observedGeneration": 3,
+              "lastTransitionTime": "2026-03-04T05:06:07Z",
+              "reason": "Ready",
+              "message": "Ready observed"
+            },
+            {
+              "type": "AllPodsAvailable",
+              "status": "True",
+              "observedGeneration": 3,
+              "lastTransitionTime": "2026-03-04T05:06:07Z",
+              "reason": "Available",
+              "message": "Available observed"
+            }
+          ],
+          "readySince": "2026-03-04T04:06:07Z"
+        },
+        {
+          "index": 7,
+          "conditions": [
+            {
+              "type": "Failed",
+              "status": "True",
+              "observedGeneration": 3,
+              "lastTransitionTime": "2026-03-04T05:06:07Z",
+              "reason": "PodFailed",
+              "message": "PodFailed observed"
+            }
+          ],
+          "lastFailure": {
+            "podName": "example-engine-7-0",
+            "reason": "PodFailed",
+            "time": "2026-03-04T05:06:07Z"
+          }
+        },
+        {
+          "index": 20,
+          "operation": {
+            "id": "op-migrate",
+            "type": "Migrate",
+            "step": "SurgeReady",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout",
+            "surgeIndex": 21,
+            "fromNode": "node-a",
+            "hintTargetNodes": [
+              "node-c",
+              "node-b"
+            ],
+            "requestUUID": "9c0d1e2f-0000-4000-8000-000000000001"
+          }
+        },
+        {
+          "index": 2147483647,
+          "operation": {
+            "id": "op-delete",
+            "type": "Delete",
+            "step": "Drain",
+            "startedAt": "2026-03-04T05:06:07Z",
+            "lastProgressAt": "2026-03-04T05:07:07Z",
+            "deadline": "2026-03-04T06:06:07Z",
+            "retryCount": 1,
+            "targetRevision": "example-engine-9b1c0d2e",
+            "reason": "rollout"
+          }
+        }
+      ]
+    }
+  },
+  "entries/readySince/50": {
+    "replicas": 50,
+    "currentRevision": "example-engine-2f32f6fe",
+    "labelSelector": "ome.io/inferenceservice=llama-70b,ome.io/component=engine",
+    "instanceStatusEncoding": "ColumnarV2",
+    "instanceStatusColumns": {
+      "members": "0-49",
+      "phases": [
+        {
+          "value": "Ready",
+          "indexes": "0-49"
+        }
+      ],
+      "runningRevisions": [
+        {
+          "value": "example-engine-2f32f6fe",
+          "indexes": "0-49"
+        }
+      ],
+      "incarnations": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "podCounts": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "servingPodCounts": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "availablePodCounts": [
+        {
+          "value": 1,
+          "indexes": "0-49"
+        }
+      ],
+      "admitted": "0-49",
+      "entries": [
+        {
+          "index": 0,
+          "readySince": "2026-03-04T05:06:07Z"
+        },
+        {
+          "index": 1,
+          "readySince": "2026-03-04T05:06:18Z"
+        },
+        {
+          "index": 2,
+          "readySince": "2026-03-04T05:06:29Z"
+        },
+        {
+          "index": 3,
+          "readySince": "2026-03-04T05:06:40Z"
+        },
+        {
+          "index": 4,
+          "readySince": "2026-03-04T05:06:51Z"
+        },
+        {
+          "index": 5,
+          "readySince": "2026-03-04T05:07:02Z"
+        },
+        {
+          "index": 6,
+          "readySince": "2026-03-04T05:07:13Z"
+        },
+        {
+          "index": 7,
+          "readySince": "2026-03-04T05:07:24Z"
+        },
+        {
+          "index": 8,
+          "readySince": "2026-03-04T05:07:35Z"
+        },
+        {
+          "index": 9,
+          "readySince": "2026-03-04T05:07:46Z"
+        },
+        {
+          "index": 10,
+          "readySince": "2026-03-04T05:07:57Z"
+        },
+        {
+          "index": 11,
+          "readySince": "2026-03-04T05:08:08Z"
+        },
+        {
+          "index": 12,
+          "readySince": "2026-03-04T05:08:19Z"
+        },
+        {
+          "index": 13,
+          "readySince": "2026-03-04T05:08:30Z"
+        },
+        {
+          "index": 14,
+          "readySince": "2026-03-04T05:08:41Z"
+        },
+        {
+          "index": 15,
+          "readySince": "2026-03-04T05:08:52Z"
+        },
+        {
+          "index": 16,
+          "readySince": "2026-03-04T05:09:03Z"
+        },
+        {
+          "index": 17,
+          "readySince": "2026-03-04T05:09:14Z"
+        },
+        {
+          "index": 18,
+          "readySince": "2026-03-04T05:09:25Z"
+        },
+        {
+          "index": 19,
+          "readySince": "2026-03-04T05:09:36Z"
+        },
+        {
+          "index": 20,
+          "readySince": "2026-03-04T05:09:47Z"
+        },
+        {
+          "index": 21,
+          "readySince": "2026-03-04T05:09:58Z"
+        },
+        {
+          "index": 22,
+          "readySince": "2026-03-04T05:10:09Z"
+        },
+        {
+          "index": 23,
+          "readySince": "2026-03-04T05:10:20Z"
+        },
+        {
+          "index": 24,
+          "readySince": "2026-03-04T05:10:31Z"
+        },
+        {
+          "index": 25,
+          "readySince": "2026-03-04T05:10:42Z"
+        },
+        {
+          "index": 26,
+          "readySince": "2026-03-04T05:10:53Z"
+        },
+        {
+          "index": 27,
+          "readySince": "2026-03-04T05:11:04Z"
+        },
+        {
+          "index": 28,
+          "readySince": "2026-03-04T05:11:15Z"
+        },
+        {
+          "index": 29,
+          "readySince": "2026-03-04T05:11:26Z"
+        },
+        {
+          "index": 30,
+          "readySince": "2026-03-04T05:11:37Z"
+        },
+        {
+          "index": 31,
+          "readySince": "2026-03-04T05:11:48Z"
+        },
+        {
+          "index": 32,
+          "readySince": "2026-03-04T05:11:59Z"
+        },
+        {
+          "index": 33,
+          "readySince": "2026-03-04T05:12:10Z"
+        },
+        {
+          "index": 34,
+          "readySince": "2026-03-04T05:12:21Z"
+        },
+        {
+          "index": 35,
+          "readySince": "2026-03-04T05:12:32Z"
+        },
+        {
+          "index": 36,
+          "readySince": "2026-03-04T05:12:43Z"
+        },
+        {
+          "index": 37,
+          "readySince": "2026-03-04T05:12:54Z"
+        },
+        {
+          "index": 38,
+          "readySince": "2026-03-04T05:13:05Z"
+        },
+        {
+          "index": 39,
+          "readySince": "2026-03-04T05:13:16Z"
+        },
+        {
+          "index": 40,
+          "readySince": "2026-03-04T05:13:27Z"
+        },
+        {
+          "index": 41,
+          "readySince": "2026-03-04T05:13:38Z"
+        },
+        {
+          "index": 42,
+          "readySince": "2026-03-04T05:13:49Z"
+        },
+        {
+          "index": 43,
+          "readySince": "2026-03-04T05:14:00Z"
+        },
+        {
+          "index": 44,
+          "readySince": "2026-03-04T05:14:11Z"
+        },
+        {
+          "index": 45,
+          "readySince": "2026-03-04T05:14:22Z"
+        },
+        {
+          "index": 46,
+          "readySince": "2026-03-04T05:14:33Z"
+        },
+        {
+          "index": 47,
+          "readySince": "2026-03-04T05:14:44Z"
+        },
+        {
+          "index": 48,
+          "readySince": "2026-03-04T05:14:55Z"
+        },
+        {
+          "index": 49,
+          "readySince": "2026-03-04T05:15:06Z"
+        }
+      ]
+    }
+  }
+}

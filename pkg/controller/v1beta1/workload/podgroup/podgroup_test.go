@@ -3,7 +3,6 @@ package podgroup
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +56,7 @@ func TestIsMultiPodInstance(t *testing.T) {
 func TestBuildPodGroup_NilISVC(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	if _, err := BuildPodGroup(nil, testPodGroupOwnerGVK, "", plan, inst); err == nil {
+	if _, err := BuildPodGroup(nil, testPodGroupOwnerGVK, "", plan, 0, inst); err == nil {
 		t.Fatal("expected error for nil owner")
 	}
 }
@@ -66,7 +65,7 @@ func TestBuildPodGroup_SinglePodRejected(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}}
-	if _, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst); err == nil {
+	if _, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst); err == nil {
 		t.Fatal("expected single-pod build to error (caller must guard with IsMultiPodInstance)")
 	}
 }
@@ -84,7 +83,7 @@ func TestBuildPodGroup_NameUsesOwnerNameNotOwnerObject(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 15 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
 
-	pg, err := BuildPodGroup(irOwner, testPodGroupOwnerGVK, "gang", plan, inst) // ownerName = ISVC name (Key.OwnerName)
+	pg, err := BuildPodGroup(irOwner, testPodGroupOwnerGVK, "gang", plan, 0, inst) // ownerName = ISVC name (Key.OwnerName)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -103,7 +102,7 @@ func TestBuildPodGroup_Shape(t *testing.T) {
 	isvc := newPodGroupISVC("prod-models", "llama-engine")
 	plan := workload.ComponentPlan{
 		Component:            workload.ComponentEngine,
-		InstanceReadyTimeout: 15 * time.Minute,
+		InstanceReadyTimeout: 30 * time.Minute,
 		TopologyKey:          "network.example.com/fabric-domain",
 	}
 	inst := workload.InstancePlan{
@@ -114,7 +113,7 @@ func TestBuildPodGroup_Shape(t *testing.T) {
 		},
 	}
 
-	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 15*time.Minute, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -132,7 +131,8 @@ func TestBuildPodGroup_Shape(t *testing.T) {
 		t.Errorf("MinMember: got %d want 4", pg.Spec.MinMember)
 	}
 
-	// ScheduleTimeoutSeconds: 15m = 900s, unclamped (no operator bounds).
+	// ScheduleTimeoutSeconds: the 15m placement grace = 900s, unbounded (no
+	// operator bounds); the 30m ready timeout never reaches the group.
 	if pg.Spec.ScheduleTimeoutSeconds == nil {
 		t.Fatal("ScheduleTimeoutSeconds: nil pointer")
 	}
@@ -189,7 +189,7 @@ func TestBuildPodGroup_TopologyKeyAnnotation(t *testing.T) {
 			InstanceReadyTimeout: 5 * time.Minute,
 			TopologyKey:          "cloud.google.com/gke-tpu-partition-2x2x2-id",
 		}
-		pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+		pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 		if err != nil {
 			t.Fatalf("BuildPodGroup: %v", err)
 		}
@@ -203,7 +203,7 @@ func TestBuildPodGroup_TopologyKeyAnnotation(t *testing.T) {
 			Component:            workload.ComponentEngine,
 			InstanceReadyTimeout: 5 * time.Minute,
 		}
-		pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+		pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 		if err != nil {
 			t.Fatalf("BuildPodGroup: %v", err)
 		}
@@ -213,30 +213,33 @@ func TestBuildPodGroup_TopologyKeyAnnotation(t *testing.T) {
 	})
 }
 
-func TestBuildPodGroup_TimeoutClamp(t *testing.T) {
-	clamp := &workload.GangScheduleTimeoutClamp{Min: time.Minute, Max: 10 * time.Minute}
+func TestBuildPodGroup_TimeoutIsTheGraceInsideTheBounds(t *testing.T) {
+	bounds := &workload.GangScheduleTimeoutClamp{Min: time.Minute, Max: 10 * time.Minute}
 	cases := []struct {
 		name    string
-		clamp   *workload.GangScheduleTimeoutClamp
-		in      time.Duration
+		bounds  *workload.GangScheduleTimeoutClamp
+		grace   time.Duration
 		wantSec int32
 		wantSet bool
 	}{
-		{"zero takes the configured floor", clamp, 0, 60, true},
-		{"30s rounded up to the floor", clamp, 30 * time.Second, 60, true},
-		{"3 minutes pass through", clamp, 3 * time.Minute, 180, true},
-		{"10 minutes at the ceiling", clamp, 10 * time.Minute, 600, true},
-		{"30 minutes lowered to the ceiling", clamp, 30 * time.Minute, 600, true},
-		{"unconfigured passes the derived value through", nil, 30 * time.Minute, 1800, true},
-		{"unconfigured sub-second leaves the field unset", nil, 0, 0, false},
+		{"2 minutes pass through", bounds, 2 * time.Minute, 120, true},
+		{"30s raised to the minimum", bounds, 30 * time.Second, 60, true},
+		{"10 minutes at the ceiling", bounds, 10 * time.Minute, 600, true},
+		{"30 minutes lowered to the ceiling", bounds, 30 * time.Minute, 600, true},
+		{"no grace leaves the field unset even inside bounds", bounds, 0, 0, false},
+		{"unbounded passes the grace through", nil, 30 * time.Minute, 1800, true},
+		{"unbounded with no grace leaves the field unset", nil, 0, 0, false},
+		{"unbounded sub-second grace leaves the field unset", nil, 500 * time.Millisecond, 0, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			isvc := newPodGroupISVC("prod", "llama")
+			isvc := newPodGroupISVC("prod", "svc")
+			// The ready timeout is set in every case and must never reach
+			// the group: the grace is the one clock.
 			plan := workload.ComponentPlan{
 				Component:            workload.ComponentEngine,
-				InstanceReadyTimeout: tc.in,
-				GangScheduleTimeout:  tc.clamp,
+				InstanceReadyTimeout: 3 * time.Minute,
+				GangScheduleTimeout:  tc.bounds,
 			}
 			inst := workload.InstancePlan{
 				Index: 0,
@@ -245,7 +248,7 @@ func TestBuildPodGroup_TimeoutClamp(t *testing.T) {
 					{Name: "worker", Size: 1},
 				},
 			}
-			pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+			pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, tc.grace, inst)
 			if err != nil {
 				t.Fatalf("BuildPodGroup: %v", err)
 			}
@@ -260,8 +263,7 @@ func TestBuildPodGroup_TimeoutClamp(t *testing.T) {
 				t.Fatal("ScheduleTimeoutSeconds: nil")
 			}
 			if *pg.Spec.ScheduleTimeoutSeconds != tc.wantSec {
-				t.Errorf("ScheduleTimeoutSeconds: got %d want %d (in=%v)",
-					*pg.Spec.ScheduleTimeoutSeconds, tc.wantSec, tc.in)
+				t.Fatalf("ScheduleTimeoutSeconds: got %d want %d", *pg.Spec.ScheduleTimeoutSeconds, tc.wantSec)
 			}
 		})
 	}
@@ -279,7 +281,7 @@ func TestBuildPodGroup_HighWorkerCount(t *testing.T) {
 			{Name: "worker", Size: 7}, // tensor-parallel-8 setup
 		},
 	}
-	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -304,7 +306,8 @@ func TestEnsurePodGroup_SinglePodNoOp(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "default", Size: 1}}}
 
-	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	existing, found := groupAt(t, c, isvc, plan, inst)
+	if _, _, err := ensurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 
@@ -328,7 +331,8 @@ func TestEnsurePodGroup_CreatesWhenAbsent(t *testing.T) {
 	}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 3}}}
 
-	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	existing, found := groupAt(t, c, isvc, plan, inst)
+	if _, _, err := ensurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 
@@ -352,15 +356,15 @@ func TestEnsurePodGroupForPodsFromObservation_TerminatingBlocksReuse(t *testing.
 	c := newPodGroupClient(t, isvc)
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	existing, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	existing, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
 	now := metav1.Now()
 	existing.DeletionTimestamp = &now
 
-	_, _, err = EnsurePodGroupForPodsFromObservation(context.Background(), c, isvc,
-		testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil, existing, true)
+	_, _, err = ensurePodGroup(context.Background(), c, isvc,
+		testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, true)
 	if !errors.Is(err, ErrPodGroupTerminating) {
 		t.Fatalf("terminating PodGroup error: got %v want ErrPodGroupTerminating", err)
 	}
@@ -376,13 +380,13 @@ func TestEnsurePodGroupForPodsFromObservation_ForeignCollisionIsNeverAdopted(t *
 	c := newPodGroupClient(t, isvc)
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	existing, err := BuildPodGroup(foreign, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	existing, err := BuildPodGroup(foreign, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
 
-	_, _, err = EnsurePodGroupForPodsFromObservation(context.Background(), c, isvc,
-		testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil, existing, true)
+	_, _, err = ensurePodGroup(context.Background(), c, isvc,
+		testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, true)
 	if !errors.Is(err, ErrPodGroupOwnershipConflict) {
 		t.Fatalf("foreign collision error: got %v want ErrPodGroupOwnershipConflict", err)
 	}
@@ -414,12 +418,13 @@ func TestEnsurePodGroup_DriftCorrected(t *testing.T) {
 	c := newPodGroupClient(t, isvc, stale)
 	plan := workload.ComponentPlan{
 		Component:            workload.ComponentEngine,
-		InstanceReadyTimeout: 3 * time.Minute,
+		InstanceReadyTimeout: 30 * time.Minute,
 		TopologyKey:          "network.example.com/fabric-domain",
 	}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
 
-	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	existing, found := groupAt(t, c, isvc, plan, inst)
+	if _, _, err := ensurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 3*time.Minute, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 
@@ -431,7 +436,7 @@ func TestEnsurePodGroup_DriftCorrected(t *testing.T) {
 		t.Errorf("MinMember: got %d want 2 (drift not corrected)", got.Spec.MinMember)
 	}
 	if got.Spec.ScheduleTimeoutSeconds == nil || *got.Spec.ScheduleTimeoutSeconds != 180 {
-		t.Errorf("ScheduleTimeoutSeconds: want 180 (3m), got %v", got.Spec.ScheduleTimeoutSeconds)
+		t.Errorf("ScheduleTimeoutSeconds: want 180 (the 3m placement grace), got %v", got.Spec.ScheduleTimeoutSeconds)
 	}
 	if got.Labels[constants.OMEComponentLabel] != "engine" {
 		t.Errorf("Labels: want engine label set, got %#v", got.Labels)
@@ -451,7 +456,7 @@ func TestEnsurePodGroup_UnsetTopologyKeyRemovesOwnedAnnotationOnly(t *testing.T)
 	isvc := newPodGroupISVC("prod", "llama")
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 3 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	existing, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	existing, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -461,7 +466,8 @@ func TestEnsurePodGroup_UnsetTopologyKeyRemovesOwnedAnnotationOnly(t *testing.T)
 	}
 	c := newPodGroupClient(t, isvc, existing)
 
-	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	existing, found := groupAt(t, c, isvc, plan, inst)
+	if _, _, err := ensurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 	got := &schedulingv1alpha1.PodGroup{}
@@ -484,7 +490,7 @@ func TestEnsurePodGroup_TopologyAnnotationDriftTriggersUpdate(t *testing.T) {
 		TopologyKey:          "network.example.com/fabric-domain",
 	}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	existing, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	existing, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -492,7 +498,8 @@ func TestEnsurePodGroup_TopologyAnnotationDriftTriggersUpdate(t *testing.T) {
 	existing.Annotations["example.com/preserve"] = "yes"
 	cc, calls := countedClient(t, newPodGroupClient(t, isvc, existing))
 
-	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	existing, found := groupAt(t, cc, isvc, plan, inst)
+	if _, _, err := ensurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 	if calls.updates.Count() != 1 {
@@ -515,7 +522,7 @@ func TestEnsurePodGroup_HealsLegacyComponentLabelKey(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 3 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	legacy, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	legacy, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -527,7 +534,8 @@ func TestEnsurePodGroup_HealsLegacyComponentLabelKey(t *testing.T) {
 	}
 	c := newPodGroupClient(t, isvc, legacy)
 
-	if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	existing, found := groupAt(t, c, isvc, plan, inst)
+	if _, _, err := ensurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup: %v", err)
 	}
 	got := &schedulingv1alpha1.PodGroup{}
@@ -539,41 +547,6 @@ func TestEnsurePodGroup_HealsLegacyComponentLabelKey(t *testing.T) {
 	}
 	if _, stale := got.Labels["ome.io/component"]; stale {
 		t.Errorf("legacy ome.io/component key not removed: got %#v", got.Labels)
-	}
-}
-
-// TestEnsurePodGroup_TransientGetErrorSurfaces — a non-NotFound Get
-// failure must be returned as the read error, not fall through to the
-// live-pod topology proof and masquerade as an unprovable-topology
-// ("no PodGroup annotation") error.
-func TestEnsurePodGroup_TransientGetErrorSurfaces(t *testing.T) {
-	isvc := newPodGroupISVC("prod", "llama")
-	base := newPodGroupClient(t, isvc)
-	boom := apierrors.NewServiceUnavailable("apiserver overloaded")
-	failing := fakeclient.Wrap(t, base,
-		fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, boom).OnKind(&schedulingv1alpha1.PodGroup{}))
-	plan := workload.ComponentPlan{
-		Component:            workload.ComponentEngine,
-		InstanceReadyTimeout: 3 * time.Minute,
-		TopologyKey:          "network.example.com/fabric-domain",
-	}
-	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	// A live pod with no provable OME-generated topology: before the
-	// early return this combination produced the misleading
-	// "cannot prove active topology ... no PodGroup annotation" error.
-	pods := []*corev1.Pod{{
-		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{query.LabelRunner: "worker"}},
-	}}
-
-	_, err := EnsurePodGroupForPods(context.Background(), failing, failing, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, pods)
-	if err == nil {
-		t.Fatal("expected error from failing Get")
-	}
-	if !apierrors.IsServiceUnavailable(err) {
-		t.Errorf("expected the transient Get error to surface, got: %v", err)
-	}
-	if strings.Contains(err.Error(), "cannot prove active topology") {
-		t.Errorf("Get error masked as a topology-proof error: %v", err)
 	}
 }
 
@@ -706,7 +679,8 @@ func TestEnsurePodGroup_Idempotent(t *testing.T) {
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 2}}}
 
 	for i := 0; i < 2; i++ {
-		if _, err := EnsurePodGroupForPods(context.Background(), c, c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+		existing, found := groupAt(t, c, isvc, plan, inst)
+		if _, _, err := ensurePodGroup(context.Background(), c, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 			t.Fatalf("EnsurePodGroup pass %d: %v", i, err)
 		}
 	}
@@ -722,11 +696,12 @@ func TestEnsurePodGroup_Idempotent(t *testing.T) {
 	}
 }
 
-// TestEnsurePodGroup_FastPathReadsBeforeWriteAndSkipsNoDrift pins the
-// steady-state fast path: EnsurePodGroup must do its own cache Get up
-// front and, on the no-drift re-ensure, return after that Get without
-// touching the write path (no Create/Update/Patch).
-func TestEnsurePodGroup_FastPathReadsBeforeWriteAndSkipsNoDrift(t *testing.T) {
+// TestEnsurePodGroupFromObservation_ReadsNothingAndWritesOnlyOnDrift holds
+// the steady state: the write works from what the caller found at the
+// name, so it reads nothing itself, creates once when the name is free,
+// and on a second pass over a group whose owned fields are all in place
+// touches the write path not at all (no Create/Update/Patch).
+func TestEnsurePodGroupFromObservation_ReadsNothingAndWritesOnlyOnDrift(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	store := newPodGroupClient(t, isvc)
 	plan := workload.ComponentPlan{
@@ -736,19 +711,19 @@ func TestEnsurePodGroup_FastPathReadsBeforeWriteAndSkipsNoDrift(t *testing.T) {
 	}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 2}}}
 
-	// First ensure: object absent -> must be created. The fast path runs
-	// its NotFound probe Get before the direct Create, so we expect one Get
-	// and exactly one Create. Each ensure runs through its own counted view
-	// of the store, so a phase counts only its own calls.
+	// First ensure: the name is free, so the write is exactly one Create.
+	// The name is read through the store, and each ensure runs through its
+	// own counted view of it, so a phase counts only the write's own calls.
+	existing, found := groupAt(t, store, isvc, plan, inst)
 	cc, calls := countedClient(t, store)
-	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	if _, _, err := ensurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup (create): %v", err)
 	}
 	if calls.creates.Count() != 1 {
 		t.Errorf("create ensure: Create count = %d, want 1", calls.creates.Count())
 	}
-	if calls.gets.Count() != 1 {
-		t.Errorf("create ensure: Get count = %d, want 1 fast-path probe", calls.gets.Count())
+	if calls.gets.Count() != 0 {
+		t.Errorf("create ensure: Get count = %d, want 0 (the caller's read is the only one)", calls.gets.Count())
 	}
 
 	// Add an unrelated annotation between passes. It is outside this
@@ -763,18 +738,19 @@ func TestEnsurePodGroup_FastPathReadsBeforeWriteAndSkipsNoDrift(t *testing.T) {
 		t.Fatalf("add unrelated annotation: %v", err)
 	}
 
-	// Second ensure: all owned fields match desired -> the fast path must
-	// short-circuit after a single Get with NO write.
+	// Second ensure: every owned field matches desired -> no read and no
+	// write.
+	existing, found = groupAt(t, store, isvc, plan, inst)
 	cc, calls = countedClient(t, store)
-	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	if _, _, err := ensurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup (no-drift): %v", err)
 	}
 	if calls.writes() != 0 {
 		t.Errorf("no-drift ensure issued a write: creates=%d updates=%d patches=%d, want all 0",
 			calls.creates.Count(), calls.updates.Count(), calls.patches.Count())
 	}
-	if calls.gets.Count() != 1 {
-		t.Errorf("no-drift ensure: Get count = %d, want 1 (fast-path probe only, no write)", calls.gets.Count())
+	if calls.gets.Count() != 0 {
+		t.Errorf("no-drift ensure: Get count = %d, want 0", calls.gets.Count())
 	}
 
 	// Sanity: the PodGroup that survives the no-drift pass still carries
@@ -791,11 +767,10 @@ func TestEnsurePodGroup_FastPathReadsBeforeWriteAndSkipsNoDrift(t *testing.T) {
 	}
 }
 
-// TestEnsurePodGroup_DriftStillWrites is the
-// counterpart to the fast-path skip: when the cached object drifts from
-// desired, podGroupMatches must return false and EnsurePodGroup must
-// fall through to the update path and issue exactly one write. Pins that
-// the fast path never swallows a real drift.
+// TestEnsurePodGroup_DriftStillWrites is the counterpart to the no-drift
+// skip: when the object the caller found drifts from desired, the write
+// path runs and issues a write. Pins that the drift check never swallows a
+// real drift.
 func TestEnsurePodGroup_DriftStillWrites(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	stale := &schedulingv1alpha1.PodGroup{
@@ -813,7 +788,8 @@ func TestEnsurePodGroup_DriftStillWrites(t *testing.T) {
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 2}}}
 
-	if _, err := EnsurePodGroupForPods(context.Background(), cc, cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst, nil); err != nil {
+	existing, found := groupAt(t, cc, isvc, plan, inst)
+	if _, _, err := ensurePodGroup(context.Background(), cc, isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst, nil, existing, found); err != nil {
 		t.Fatalf("EnsurePodGroup (drift): %v", err)
 	}
 	if calls.writes() == 0 {
@@ -857,7 +833,7 @@ func TestDeleteObservedPodGroup_ForeignObjectIsNeverDeleted(t *testing.T) {
 	foreign := newPodGroupISVC("prod", "foreign")
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	pg, err := BuildPodGroup(foreign, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	pg, err := BuildPodGroup(foreign, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -878,7 +854,7 @@ func TestDeleteObservedPodGroup_TerminatingIsAcceptedWithoutDelete(t *testing.T)
 	isvc := newPodGroupISVC("prod", "llama")
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -898,7 +874,7 @@ func TestDeleteObservedPodGroup_RuntimeAPIRemovalIsAccepted(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	pg, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -919,7 +895,7 @@ func TestDeleteObservedPodGroup_UIDPreconditionProtectsNameReuse(t *testing.T) {
 	isvc := newPodGroupISVC("prod", "llama")
 	plan := workload.ComponentPlan{Component: workload.ComponentEngine, InstanceReadyTimeout: 5 * time.Minute}
 	inst := workload.InstancePlan{Index: 0, Runners: []workload.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}}
-	observed, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, inst)
+	observed, err := BuildPodGroup(isvc, testPodGroupOwnerGVK, isvc.GetName(), plan, 0, inst)
 	if err != nil {
 		t.Fatalf("BuildPodGroup: %v", err)
 	}
@@ -1023,4 +999,39 @@ func newPodGroupClient(t *testing.T, objs ...client.Object) client.WithWatch {
 		fakeclient.WithObjects(objs...))
 }
 
+// groupAt reads what holds the Instance's PodGroup name through reader,
+// the way a caller of the observation form does before it writes: the
+// object and true, or nil and false when nothing holds the name.
+func groupAt(t *testing.T, reader client.Reader, isvc *v1beta1.InferenceService, plan workload.ComponentPlan, inst workload.InstancePlan) (*schedulingv1alpha1.PodGroup, bool) {
+	t.Helper()
+	key := client.ObjectKey{Namespace: isvc.GetNamespace(), Name: query.PodGroupName(isvc.GetName(), plan.Component, inst.Index)}
+	existing := &schedulingv1alpha1.PodGroup{}
+	err := reader.Get(context.Background(), key, existing)
+	if apierrors.IsNotFound(err) {
+		return nil, false
+	}
+	if err != nil {
+		t.Fatalf("get PodGroup %s: %v", key, err)
+	}
+	return existing, true
+}
+
 func int32Ptr(n int32) *int32 { return &n }
+
+// ensurePodGroup writes the group DesiredPodGroup builds for one multi-pod
+// Instance from what the test found at its name, and returns the topology
+// key the written group records. A single-pod Instance writes nothing.
+func ensurePodGroup(ctx context.Context, c client.Client, owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, unschedulableGrace time.Duration, inst workload.InstancePlan, pods []*corev1.Pod, existing *schedulingv1alpha1.PodGroup, found bool) (string, *schedulingv1alpha1.PodGroup, error) {
+	if !IsMultiPodInstance(inst) {
+		return "", nil, nil
+	}
+	desired, err := DesiredPodGroup(owner, ownerGVK, ownerName, plan, unschedulableGrace, inst, pods, existing, found)
+	if err != nil {
+		return "", nil, err
+	}
+	reconciled, err := WritePodGroup(ctx, c, desired, existing, found)
+	if err != nil {
+		return "", nil, err
+	}
+	return TopologyKeyOf(desired), reconciled, nil
+}

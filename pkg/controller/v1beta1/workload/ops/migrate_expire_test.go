@@ -988,8 +988,8 @@ func TestMigrateExpiry_CompletedTailCrashRejectsStatusDrift(t *testing.T) {
 
 // TestMigrateExpiry_AcceptedNeverAllocated pins the queued-record
 // expiry: an Accepted record that never allocated a surge (here
-// because the source never left an in-flight Update) expires as a
-// record-only transition — no instance ops exist to clear, no surge to
+// because the source never left an in-flight in-place Update) expires as
+// a record-only transition — no instance ops exist to clear, no surge to
 // tear down, and the source is left entirely alone.
 func TestMigrateExpiry_AcceptedNeverAllocated(t *testing.T) {
 	f := newSinglePodMigFixture(t)
@@ -997,11 +997,13 @@ func TestMigrateExpiry_AcceptedNeverAllocated(t *testing.T) {
 	const uuid = "mig-queued"
 
 	// The source is mid-Update — the reason the record never allocated.
+	// An in-place attempt holds no surge replacement, so the record is
+	// not waiting for a roll and its deadline runs.
 	ir := f.getIR(t)
 	ir.Status.InstanceStatuses[0].Phase = v1beta1.OMENativeInstanceUpdating
 	ir.Status.InstanceStatuses[0].Operation = &v1beta1.InstanceOperation{
 		Type: v1beta1.InstanceOperationType(workload.InstanceOperationUpdate),
-		Step: "Surge",
+		Step: workload.UpdateStepInPlace,
 	}
 	if err := f.c.Status().Update(context.Background(), ir); err != nil {
 		t.Fatalf("seed Updating source: %v", err)
@@ -1079,7 +1081,7 @@ func TestMigrateExpiry_AcceptedRecordNamesTheCauseItWaitedOn(t *testing.T) {
 			if !strings.Contains(waited, tc.want) {
 				t.Fatalf("record Message = %q, want the cause %q named", waited, tc.want)
 			}
-			migWedgeEvents(t, f)
+			recordedEvents(t, f)
 			sourceBefore := *findInstanceStatusOnIRForFixture(t, f, 0)
 
 			clk.SetTime(clk.Now().Add(2 * time.Hour))
@@ -1096,7 +1098,7 @@ func TestMigrateExpiry_AcceptedRecordNamesTheCauseItWaitedOn(t *testing.T) {
 			if row := ledgerRow(t, f, uuid); row.Phase != audit.PhaseFailed || row.Outcome != rec.Message {
 				t.Errorf("the ledger row must carry the same outcome; got %+v", row)
 			}
-			events := migWedgeEvents(t, f)
+			events := recordedEvents(t, f)
 			if countEventsWithReason(events, workload.EventReasonMigrationExpired) != 1 || !strings.Contains(events[0], waited) {
 				t.Errorf("want one %s event naming the cause; got %v", workload.EventReasonMigrationExpired, events)
 			}
@@ -1107,12 +1109,154 @@ func TestMigrateExpiry_AcceptedRecordNamesTheCauseItWaitedOn(t *testing.T) {
 	}
 }
 
+// A move requested while a roll's surge replacements are in flight waits
+// for the roll, and its deadline stands still while it waits: thirty-one
+// minutes after a thirty-minute acceptance the record is still Accepted,
+// naming the roll. The first pass with no surge replacement in flight
+// measures the same window again from then, whichever pass meets the
+// record first: the expiry when
+// the accepted window is already behind it, the drive otherwise. The move
+// then starts with that deadline.
+func TestMigrateExpiry_WaitForARollKeepsTheDeadlineStill_TheReleasedSurgeStartsIt(t *testing.T) {
+	const window = 30 * time.Minute
+	stories := []struct {
+		name    string
+		elapsed time.Duration
+	}{
+		{"the surge is released after the accepted window has passed", window + time.Minute},
+		{"the surge is released before the accepted window has passed", 10 * time.Minute},
+	}
+	for _, story := range stories {
+		t.Run(story.name, func(t *testing.T) {
+			waitForRollStory(t, window, story.elapsed)
+		})
+	}
+}
+
+// waitForRollStory drives one story of the wait: a move accepted with the
+// window while its source is one of the roll's surging Instances, elapsed
+// passing with the roll in flight, then the surge released and the move
+// started.
+func waitForRollStory(t *testing.T, window, elapsed time.Duration) {
+	t.Helper()
+	const target = "svc-engine-bbbbbbbb"
+	const uuid = "mig-waits-for-roll"
+	f := newSinglePodMigFixture(t)
+	clk := f.withFakeClock()
+	f.recorder = record.NewFakeRecorder(16)
+	ctx := context.Background()
+
+	// The source is one of the roll's surging Instances.
+	waitForRollSetSourceOperation(ctx, t, f, v1beta1.OMENativeInstanceUpdating, &v1beta1.InstanceOperation{
+		Type:           v1beta1.InstanceOperationType(workload.InstanceOperationUpdate),
+		Step:           workload.UpdateStepSurge,
+		TargetRevision: target,
+	})
+	accepted := clk.Now()
+	rec := mkMigRecordWithDeadline(uuid, 0, "node-a", accepted.Add(window))
+	rec.StartedAt = metav1.NewTime(accepted)
+	f.records = []workload.MigrationRecord{rec}
+
+	waiting := waitForRollRecordTheWaitTwice(ctx, t, f, uuid, target)
+
+	// Time passes with the roll in flight: the record is not expiry work.
+	clk.SetTime(accepted.Add(elapsed))
+	waitForRollExpiryLeavesTheRecord(t, f, uuid, waiting, accepted.Add(window))
+
+	// The surge is released. The first pass to meet the record starts
+	// its deadline again from now; the drive then starts the move.
+	waitForRollSetSourceOperation(ctx, t, f, v1beta1.OMENativeInstanceReady, nil)
+	surgeReleased := clk.Now()
+	waitForRollReleasedExpiryLeavesItOpen(t, f, uuid, surgeReleased.Add(window), elapsed > window)
+	waitForRollDriveStartsTheMove(t, f, uuid, surgeReleased.Add(window))
+}
+
+// waitForRollSetSourceOperation writes the source Instance's phase and
+// operation on the replica, as the roll would have.
+func waitForRollSetSourceOperation(ctx context.Context, t *testing.T, f *migFixture, phase v1beta1.OMENativeInstancePhase, op *v1beta1.InstanceOperation) {
+	t.Helper()
+	ir := f.getIR(t)
+	ir.Status.InstanceStatuses[0].Phase = phase
+	ir.Status.InstanceStatuses[0].Operation = op
+	if err := f.c.Status().Update(ctx, ir); err != nil {
+		t.Fatalf("seed the source: %v", err)
+	}
+}
+
+// waitForRollRecordTheWaitTwice runs the wait pass twice: the first names
+// the wait on the record and in one event, the second writes nothing and
+// says nothing. It returns the waiting record.
+func waitForRollRecordTheWaitTwice(ctx context.Context, t *testing.T, f *migFixture, uuid, target string) *workload.MigrationRecord {
+	t.Helper()
+	for pass := 0; pass < 2; pass++ {
+		if err := RecordMigrationWaitForRoll(ctx, f.deps(), f.input(t), uuid); err != nil {
+			t.Fatalf("record the wait: %v", err)
+		}
+	}
+	waiting := f.record(t, uuid)
+	if waiting.Phase != workload.MigrationPhaseAccepted || !strings.Contains(waiting.Message, "waiting for the roll") || !strings.Contains(waiting.Message, target) {
+		t.Fatalf("the record must say it waits for the roll to %s; got %+v", target, *waiting)
+	}
+	if events := recordedEvents(t, f); countEventsWithReason(events, workload.EventReasonMigrationDeferred) != 1 || !strings.Contains(events[0], "waiting for the roll") {
+		t.Fatalf("want one %s event naming the roll; got %v", workload.EventReasonMigrationDeferred, events)
+	}
+	return waiting
+}
+
+// waitForRollExpiryLeavesTheRecord runs the expiry while the roll is in
+// flight: it closes nothing, and the record keeps its message and the
+// deadline it was accepted with.
+func waitForRollExpiryLeavesTheRecord(t *testing.T, f *migFixture, uuid string, waiting *workload.MigrationRecord, deadline time.Time) {
+	t.Helper()
+	if n := f.expire(t); n != 0 {
+		t.Fatalf("the expiry closed a move waiting for the roll: %+v", *f.record(t, uuid))
+	}
+	if got := f.record(t, uuid); got.Message != waiting.Message || !got.Deadline.Time.Equal(deadline) {
+		t.Fatalf("a wait pass must leave the record as it was; got %+v", *got)
+	}
+}
+
+// waitForRollReleasedExpiryLeavesItOpen runs the expiry in the pass the
+// surge was released: it closes nothing, and when the accepted window is
+// already behind the record it starts the deadline again from the release
+// and leaves the record open.
+func waitForRollReleasedExpiryLeavesItOpen(t *testing.T, f *migFixture, uuid string, deadline time.Time, windowPassed bool) {
+	t.Helper()
+	if n := f.expire(t); n != 0 {
+		t.Fatalf("the expiry closed the move in the pass the surge was released: %+v", *f.record(t, uuid))
+	}
+	if !windowPassed {
+		return
+	}
+	if got := f.record(t, uuid); got.Phase != workload.MigrationPhaseAccepted || got.Message != "" || !got.Deadline.Time.Equal(deadline) {
+		t.Fatalf("the expiry must start the deadline again from the surge's release (%s) and leave the record open; got %+v", deadline, *got)
+	}
+}
+
+// waitForRollDriveStartsTheMove runs the drive: the move starts once no
+// surge is in flight, with the accepted window measured from the surge's
+// release as its deadline.
+func waitForRollDriveStartsTheMove(t *testing.T, f *migFixture, uuid string, deadline time.Time) {
+	t.Helper()
+	if done, acceptedByDrive := f.pass(t, uuid); done || !acceptedByDrive {
+		t.Fatalf("the drive must start the move: done=%v accepted=%v record=%+v", done, acceptedByDrive, *f.record(t, uuid))
+	}
+	started := f.record(t, uuid)
+	if started.Phase != workload.MigrationPhaseSurgePending || started.SurgeInstance == nil {
+		t.Fatalf("the move must start once no surge is in flight; got %+v", *started)
+	}
+	if !started.Deadline.Time.Equal(deadline) {
+		t.Fatalf("the move's deadline = %s, want the accepted window measured from the surge's release, %s", started.Deadline.Time, deadline)
+	}
+}
+
 // The expiry pass consumes exactly the records the dispatcher's
 // decision layer selects on: non-terminal Manual records with a set,
 // elapsed Deadline. Everything else — Auto records (born terminal by
 // contract, but the trigger filter must hold even for a malformed
-// non-terminal one), zero Deadlines, unelapsed Deadlines, and records
-// already terminal — must never be treated as expiry work.
+// non-terminal one), zero Deadlines, unelapsed Deadlines, records
+// already terminal, and a fresh record waiting for a roll's surge
+// replacements — must never be treated as expiry work.
 func TestHasExpiredMigrationCandidate_FiltersTriggerPhaseAndDeadline(t *testing.T) {
 	now := time.Date(2024, 5, 1, 12, 0, 0, 0, time.UTC)
 	past := metav1.NewTime(now.Add(-time.Minute))
@@ -1126,13 +1270,36 @@ func TestHasExpiredMigrationCandidate_FiltersTriggerPhaseAndDeadline(t *testing.
 			Deadline:    deadline,
 		}
 	}
+	allocated := func(deadline metav1.Time) workload.MigrationRecord {
+		rec := record(workload.MigrationTriggerManual, workload.MigrationPhaseSurgePending, deadline)
+		surge := int32(1)
+		rec.SurgeInstance = &surge
+		return rec
+	}
+	surging := []workload.InstanceStatus{{
+		Index: 0, Phase: workload.InstancePhaseUpdating,
+		Operation: &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepSurge},
+	}}
 
 	tests := []struct {
-		name    string
-		records []workload.MigrationRecord
-		want    bool
+		name     string
+		records  []workload.MigrationRecord
+		statuses []workload.InstanceStatus
+		want     bool
 	}{
 		{name: "no records", records: nil, want: false},
+		{
+			name:     "fresh record past deadline waits for the roll's surge",
+			records:  []workload.MigrationRecord{record(workload.MigrationTriggerManual, workload.MigrationPhaseAccepted, past)},
+			statuses: surging,
+			want:     false,
+		},
+		{
+			name:     "allocated record past deadline beside the roll's surge",
+			records:  []workload.MigrationRecord{allocated(past)},
+			statuses: surging,
+			want:     true,
+		},
 		{
 			name:    "manual non-terminal past deadline",
 			records: []workload.MigrationRecord{record(workload.MigrationTriggerManual, workload.MigrationPhaseSurgePending, past)},
@@ -1185,7 +1352,7 @@ func TestHasExpiredMigrationCandidate_FiltersTriggerPhaseAndDeadline(t *testing.
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := HasExpiredMigrationCandidate(test.records, now); got != test.want {
+			if got := HasExpiredMigrationCandidate(test.records, test.statuses, now); got != test.want {
 				t.Fatalf("HasExpiredMigrationCandidate = %v, want %v", got, test.want)
 			}
 		})

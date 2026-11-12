@@ -79,60 +79,73 @@ func scaleCeil(count, numerator, denominator int64) int64 {
 	return (count*numerator + denominator - 1) / denominator
 }
 
-// splitComponentMinimums reads the source's fleet minimums. The primary floor
-// is split.replicas or the engine minimum. A declared decoder minimum follows
-// the engine minimum in their declared ratio, scaled to the primary floor and
-// rounded up; without a declared ratio it is used as declared. An undeclared
-// decoder minimum pairs one decoder with each primary unit. A router divided
-// across members contributes its minimum, scaled the same way.
+// splitComponentMinimums reads the source's fleet minimums: the primary
+// component's planned count, the decoder's minimum beside an engine primary,
+// and the router's minimum when routers are divided across members. A
+// secondary minimum declared beside the primary's declared minimum keeps
+// their ratio at the planned count (followsPrimary).
 func splitComponentMinimums(source *v1beta1.InferenceService) (splitMinimums, error) {
-	primaryFloor := splitDesiredReplicas(source)
-	if primaryFloor <= 0 {
+	planned := splitDesiredReplicas(source)
+	if planned <= 0 {
 		return splitMinimums{}, replicaCountUnresolved(source)
 	}
-	out := splitMinimums{floors: map[v1beta1.ComponentType]int32{}}
-	for _, component := range placementScaleComponents(source) {
-		if component != v1beta1.EngineComponent && component != v1beta1.DecoderComponent {
-			continue
-		}
-		if out.primary == "" {
-			out.primary = component
-			out.floors[component] = primaryFloor
-			continue
-		}
-		minimum := int64(primaryFloor)
-		if component == v1beta1.DecoderComponent && source.Spec.Decoder.MinReplicas != nil {
-			declared := int64(*source.Spec.Decoder.MinReplicas)
-			if declared < 0 || declared > math.MaxInt32 {
-				return splitMinimums{}, fmt.Errorf("decoder.minReplicas must be a nonnegative replica count")
-			}
-			minimum = declared
-			if engine := source.Spec.Engine.MinReplicas; engine != nil && *engine > 0 && int64(*engine) != int64(primaryFloor) {
-				minimum = scaleCeil(declared, int64(primaryFloor), int64(*engine))
-			}
-		}
-		out.floors[component] = int32(min(minimum, math.MaxInt32))
-	}
-	if out.primary == "" {
+	primary := primaryScaleComponent(declaredComponents(source))
+	if primary == "" {
 		return splitMinimums{}, fmt.Errorf("placement requires an engine or decoder component")
 	}
+	out := splitMinimums{primary: primary, floors: map[v1beta1.ComponentType]int32{primary: planned}}
+	if primary == v1beta1.EngineComponent && source.Spec.Decoder != nil {
+		minimum, err := out.decoderMinimum(source)
+		if err != nil {
+			return splitMinimums{}, err
+		}
+		out.floors[v1beta1.DecoderComponent] = minimum
+	}
 	if routerDivided(source) {
-		if source.Spec.Router.MinReplicas == nil || *source.Spec.Router.MinReplicas <= 0 {
-			return splitMinimums{}, fmt.Errorf("router.minReplicas must be positive to divide routers across homes")
+		minimum, err := out.routerMinimum(source)
+		if err != nil {
+			return splitMinimums{}, err
 		}
-		minimum := int64(*source.Spec.Router.MinReplicas)
-		var declared *int
-		if out.primary == v1beta1.EngineComponent {
-			declared = source.Spec.Engine.MinReplicas
-		} else {
-			declared = source.Spec.Decoder.MinReplicas
-		}
-		if declared != nil && *declared > 0 && int64(*declared) != int64(primaryFloor) {
-			minimum = scaleCeil(minimum, int64(primaryFloor), int64(*declared))
-		}
-		out.floors[v1beta1.RouterComponent] = int32(min(minimum, math.MaxInt32))
+		out.floors[v1beta1.RouterComponent] = minimum
 	}
 	return out, nil
+}
+
+// decoderMinimum is the decoder's fleet minimum beside an engine primary: the
+// declared minimum following the engine's, or one decoder per primary unit
+// when none is declared.
+func (m splitMinimums) decoderMinimum(source *v1beta1.InferenceService) (int32, error) {
+	declared := source.Spec.Decoder.MinReplicas
+	if declared == nil {
+		return m.floors[m.primary], nil
+	}
+	if *declared < 0 || int64(*declared) > math.MaxInt32 {
+		return 0, fmt.Errorf("decoder.minReplicas must be a nonnegative replica count")
+	}
+	return m.followsPrimary(int64(*declared), source), nil
+}
+
+// routerMinimum is the fleet minimum of routers divided across members: the
+// declared minimum following the primary's.
+func (m splitMinimums) routerMinimum(source *v1beta1.InferenceService) (int32, error) {
+	declared := source.Spec.Router.MinReplicas
+	if declared == nil || *declared <= 0 {
+		return 0, fmt.Errorf("router.minReplicas must be positive to divide routers across homes")
+	}
+	return m.followsPrimary(int64(*declared), source), nil
+}
+
+// followsPrimary scales a minimum declared beside the primary component's
+// declared minimum to the primary's planned count: when the primary declares
+// a positive minimum other than the planned count, the minimum keeps their
+// ratio, rounded up; otherwise it is used as declared. The result is capped
+// at the largest replica count.
+func (m splitMinimums) followsPrimary(minimum int64, source *v1beta1.InferenceService) int32 {
+	planned := int64(m.floors[m.primary])
+	if declared := declaredMinimum(source, m.primary); declared != nil && *declared > 0 && int64(*declared) != planned {
+		minimum = scaleCeil(minimum, planned, int64(*declared))
+	}
+	return int32(min(minimum, math.MaxInt32))
 }
 
 // routerDivided reports whether the source divides its routers across Split
@@ -142,18 +155,6 @@ func splitComponentMinimums(source *v1beta1.InferenceService) (splitMinimums, er
 func routerDivided(source *v1beta1.InferenceService) bool {
 	return source.Spec.Router != nil && placementMode(source) == v1beta1.PlacementModeSplit &&
 		affinity.DividesRouters(source.Spec.Placement.ClusterAffinity)
-}
-
-// splitMemberFloors reads the source's fleet minimums and apportions them to
-// the named member, trimmed as memberShares describes. held is what the
-// member's copy holds now.
-func splitMemberFloors(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement, held map[v1beta1.ComponentType]int32) ([]v1beta1.PlacementComponentFloor, error) {
-	minimums, err := splitComponentMinimums(source)
-	if err != nil {
-		return nil, err
-	}
-	trimmed, _, err := minimums.memberShares(source, candidates, member, held)
-	return trimmed, err
 }
 
 // memberShare apportions every secondary component's minimum over the
@@ -232,8 +233,8 @@ func (m splitMinimums) memberShares(source *v1beta1.InferenceService, candidates
 type splitWeights struct {
 	primary    map[string]int64
 	components map[v1beta1.ComponentType]map[string]int64
-	// maxPrimary and maxComponents hold the maximum ratios of the ratio form;
-	// both stay empty in the integer form.
+	// maxPrimary and maxComponents hold the maximum ratios when the terms set
+	// weights; both stay empty for an unweighted source.
 	maxPrimary    map[string]int64
 	maxComponents map[v1beta1.ComponentType]map[string]int64
 }

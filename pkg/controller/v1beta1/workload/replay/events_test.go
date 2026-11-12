@@ -2,13 +2,16 @@ package replay
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	clocktesting "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
@@ -543,6 +546,22 @@ func TestApplyPartitionRewritesTheCanaryHold(t *testing.T) {
 	if desired.Lifecycle.UpdateStrategy.RollingUpdate == nil || desired.Lifecycle.UpdateStrategy.RollingUpdate.Partition == nil || *desired.Lifecycle.UpdateStrategy.RollingUpdate.Partition != 1 {
 		t.Fatalf("the partition must reach the plan: %+v", desired.Lifecycle.UpdateStrategy)
 	}
+	if desired.Pacing != nil {
+		t.Fatalf("the user's partition projects no step hold: %+v", desired.Pacing)
+	}
+	two := int32(2)
+	if detail, err := applyPartition(ctx, d, TimelineEvent{ID: "spec.partition", Args: EventArgs{To: &two, Canary: true}}); err != nil || detail != "canaryPartition=2 generation=2" {
+		t.Fatalf("canary edit: (%q, %v)", detail, err)
+	}
+	if desired, err = d.desiredSpec(); err != nil {
+		t.Fatal(err)
+	}
+	if desired.Pacing == nil || desired.Pacing.Partition == nil || *desired.Pacing.Partition != 2 {
+		t.Fatalf("the step's partition must reach the plan as pacing: %+v", desired.Pacing)
+	}
+	if *desired.Lifecycle.UpdateStrategy.RollingUpdate.Partition != 1 {
+		t.Fatalf("the step's partition leaves the user's own where it was: %+v", desired.Lifecycle.UpdateStrategy)
+	}
 	if _, err := applyPartition(ctx, d, TimelineEvent{ID: "spec.partition"}); err == nil {
 		t.Fatal("the edit names the new partition")
 	}
@@ -962,22 +981,28 @@ timeline:
 	}
 }
 
-// TestApplyGateDenyStagesOnlyThePairingVerdict keeps the staged gate an
-// honest drain-time answer: the Pairing hold is the one verdict the engine
-// asks for mid-operation, it names a pod, and it carries the reason the
-// gate would give; a verdict of another gate, or a hold with no reason,
-// fails the run.
-func TestApplyGateDenyStagesOnlyThePairingVerdict(t *testing.T) {
+// TestApplyGateDenyStagesADrainAnswerForAPodAndAStartAnswerForEveryStart
+// keeps gate.deny an honest answer: the Pairing hold is the drain-time
+// answer, it names a pod and carries the reason the gate would give; a
+// start-time answer (Ratio, Sequential, Budget) names no pod and stands
+// for every fresh start; a hold with no reason, a start-time answer with
+// a pod, or an answer of the plan gate or the retry record fails the run.
+func TestApplyGateDenyStagesADrainAnswerForAPodAndAStartAnswerForEveryStart(t *testing.T) {
 	d := &driver{opts: DefaultOptions()}
 	pod := &PodRef{Index: 0, Ordinal: 1}
-	if _, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Budget", Args: EventArgs{Pod: pod, Message: "x"}}); err == nil || !strings.Contains(err.Error(), "only the Pairing verdict") {
-		t.Fatalf("expected the Pairing-only error, got %v", err)
+	for _, variant := range []string{"RetryBlock", "Held", "Plan"} {
+		if _, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: variant, Args: EventArgs{Message: "x"}}); err == nil || !strings.Contains(err.Error(), "can be staged") {
+			t.Fatalf("%s: expected the cannot-be-staged error, got %v", variant, err)
+		}
 	}
 	if _, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Pairing", Args: EventArgs{Message: "x"}}); err == nil || !strings.Contains(err.Error(), "needs a pod reference") {
 		t.Fatalf("expected the missing-pod error, got %v", err)
 	}
 	if _, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Pairing", Args: EventArgs{Pod: pod}}); err == nil || !strings.Contains(err.Error(), "needs the reason") {
 		t.Fatalf("expected the missing-reason error, got %v", err)
+	}
+	if _, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Ratio", Args: EventArgs{Pod: pod, Message: "x"}}); err == nil || !strings.Contains(err.Error(), "names no pod") {
+		t.Fatalf("expected the no-pod error for a start-time answer, got %v", err)
 	}
 	detail, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Pairing", Args: EventArgs{Pod: pod, Message: "the other side still pairs with it"}})
 	if err != nil {
@@ -987,24 +1012,230 @@ func TestApplyGateDenyStagesOnlyThePairingVerdict(t *testing.T) {
 	if detail != "pod="+name || d.pairingHolds[name] != "the other side still pairs with it" {
 		t.Fatalf("the hold must be recorded under the pod's name with its reason, got detail=%q holds=%v", detail, d.pairingHolds)
 	}
+	detail, err = applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Ratio", Args: EventArgs{Message: "engine batch 1 waits for decoder batch 1 to serve first (0 of 1 serving)"}})
+	if err != nil {
+		t.Fatalf("stage a start-time hold: %v", err)
+	}
+	if detail != "gate=Ratio" || d.startHold.gate != types.RolloutHoldGateRatio || d.startHold.reason != "engine batch 1 waits for decoder batch 1 to serve first (0 of 1 serving)" {
+		t.Fatalf("the start-time hold must be recorded with its gate and reason, got detail=%q hold=%+v", detail, d.startHold)
+	}
 }
 
-// TestApplyGateAllowLiftsAStagedHoldOnly keeps gate.allow an answer about a
-// hold that exists: lifting a hold no pod carries fails the run, and
-// lifting a staged one removes it.
-func TestApplyGateAllowLiftsAStagedHoldOnly(t *testing.T) {
+// TestApplyGateAllowEndsAStagedHoldOnly keeps gate.allow an answer about a
+// hold that exists: ending a hold no pod carries, or a start-time hold
+// none staged, fails the run, and ending a staged one removes it.
+func TestApplyGateAllowEndsAStagedHoldOnly(t *testing.T) {
 	d := &driver{opts: DefaultOptions()}
 	pod := &PodRef{Index: 0}
 	if _, err := applyGateAllow(context.Background(), d, TimelineEvent{ID: "gate.allow", Args: EventArgs{Pod: pod}}); err == nil || !strings.Contains(err.Error(), "no Pairing hold to lift") {
 		t.Fatalf("expected the no-hold error, got %v", err)
 	}
+	if _, err := applyGateAllow(context.Background(), d, TimelineEvent{ID: "gate.allow"}); err == nil || !strings.Contains(err.Error(), "no start-time hold") {
+		t.Fatalf("expected the no-start-time-hold error, got %v", err)
+	}
 	if _, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Pairing", Args: EventArgs{Pod: pod, Message: "held"}}); err != nil {
 		t.Fatalf("stage a Pairing hold: %v", err)
 	}
-	if _, err := applyGateAllow(context.Background(), d, TimelineEvent{ID: "gate.allow", Args: EventArgs{Pod: pod}}); err != nil {
-		t.Fatalf("lift the hold: %v", err)
+	if _, err := applyGateDeny(context.Background(), d, TimelineEvent{ID: "gate.deny", Variant: "Budget", Args: EventArgs{Message: "held"}}); err != nil {
+		t.Fatalf("stage a start-time hold: %v", err)
 	}
-	if len(d.pairingHolds) != 0 {
-		t.Fatalf("the hold must be gone, got %v", d.pairingHolds)
+	if _, err := applyGateAllow(context.Background(), d, TimelineEvent{ID: "gate.allow", Args: EventArgs{Pod: pod}}); err != nil {
+		t.Fatalf("end the pairing hold: %v", err)
+	}
+	if len(d.pairingHolds) != 0 || d.startHold.reason == "" {
+		t.Fatalf("the pairing hold must be gone and the start-time hold kept, got %v and %+v", d.pairingHolds, d.startHold)
+	}
+	if detail, err := applyGateAllow(context.Background(), d, TimelineEvent{ID: "gate.allow"}); err != nil || detail != "gate=Budget" {
+		t.Fatalf("end the start-time hold: detail=%q err=%v", detail, err)
+	}
+	if d.startHold.reason != "" {
+		t.Fatalf("the start-time hold must be gone, got %+v", d.startHold)
+	}
+}
+
+// TestApplySpecRevisionRenderedFromTheRuntimeKeepsTheOwnerGeneration holds
+// what a runtime render changes about a template edit: the template moves
+// and the owner's generation does not, on the driver's spec and on the
+// stored owner alike; a write of the spec moves it, and a source other than
+// the runtime is refused.
+func TestApplySpecRevisionRenderedFromTheRuntimeKeepsTheOwnerGeneration(t *testing.T) {
+	ctx := context.Background()
+	d := mustDriver(t, minimalScenario)
+	before := d.owner.Generation
+	detail, err := applySpecRevision(ctx, d, TimelineEvent{ID: "spec.revision", Args: EventArgs{Image: "registry.example.com/runtime:v2", RenderedFrom: "runtime"}})
+	if err != nil || detail != fmt.Sprintf("image=registry.example.com/runtime:v2 renderedFrom=runtime generation=%d", before) {
+		t.Fatalf("runtime render: (%q, %v)", detail, err)
+	}
+	stored := &v1beta1.InferenceReplica{}
+	if err := d.cli.Get(ctx, client.ObjectKeyFromObject(d.owner), stored); err != nil {
+		t.Fatal(err)
+	}
+	if d.spec.Image != "registry.example.com/runtime:v2" || d.owner.Generation != before || stored.Generation != before {
+		t.Fatalf("image=%s generation=%d stored=%d, want the image moved at generation %d", d.spec.Image, d.owner.Generation, stored.Generation, before)
+	}
+	detail, err = applySpecRevision(ctx, d, TimelineEvent{ID: "spec.revision", Args: EventArgs{Image: "registry.example.com/runtime:v3"}})
+	if err != nil || detail != fmt.Sprintf("image=registry.example.com/runtime:v3 generation=%d", before+1) {
+		t.Fatalf("spec write: (%q, %v)", detail, err)
+	}
+	if _, err := applySpecRevision(ctx, d, TimelineEvent{ID: "spec.revision", Args: EventArgs{Image: "registry.example.com/runtime:v4", RenderedFrom: "operator"}}); err == nil || !strings.Contains(err.Error(), "renderedFrom is runtime or absent") {
+		t.Fatalf("unknown source: %v", err)
+	}
+}
+
+// TestApplyCtrlCrashDropsTheExpectationsAndWaitsForTheLease holds the
+// restart to the two things it is: the expectations cache is gone, so a
+// pending delete reads as satisfied, and the clock moves by the Lease wait
+// the scenario names, and by nothing when it names none.
+func TestApplyCtrlCrashDropsTheExpectationsAndWaitsForTheLease(t *testing.T) {
+	opts := DefaultOptions()
+	clk := clocktesting.NewFakeClock(opts.Start)
+	d := &driver{opts: opts, clock: clk, expectations: types.NewExpectationsWithClock(clk)}
+	d.expectations.ExpectDeletes(opts.Namespace, opts.OwnerName, opts.Component, 0, 1)
+	if d.expectations.Satisfied(opts.Namespace, opts.OwnerName, opts.Component, 0) {
+		t.Fatal("a pending delete reads as unsatisfied before the restart")
+	}
+
+	detail, err := applyCtrlCrash(context.Background(), d, TimelineEvent{ID: "ctrl.crash"})
+	if err != nil || detail != "expectations=dropped" {
+		t.Fatalf("restart with no Lease wait: detail %q, err %v", detail, err)
+	}
+	if !clk.Now().Equal(opts.Start) {
+		t.Fatalf("a restart with no Lease wait moved the clock to %s", clk.Now())
+	}
+	if !d.expectations.Satisfied(opts.Namespace, opts.OwnerName, opts.Component, 0) {
+		t.Fatal("the restarted engine still waits on a delete the stopped manager issued")
+	}
+
+	detail, err = applyCtrlCrash(context.Background(), d, TimelineEvent{ID: "ctrl.crash", Args: EventArgs{LeaseWait: "1m"}})
+	if err != nil || detail != "expectations=dropped leaseWait=1m0s" {
+		t.Fatalf("restart with a Lease wait: detail %q, err %v", detail, err)
+	}
+	if got := clk.Now().Sub(opts.Start); got != time.Minute {
+		t.Fatalf("the Lease wait moved the clock by %s, want 1m", got)
+	}
+
+	_, err = applyCtrlCrash(context.Background(), d, TimelineEvent{ID: "ctrl.crash", Args: EventArgs{LeaseWait: "-1s"}})
+	if err == nil || !strings.Contains(err.Error(), "does not run backwards") {
+		t.Fatalf("a negative Lease wait: %v", err)
+	}
+	_, err = applyCtrlCrash(context.Background(), d, TimelineEvent{ID: "ctrl.crash", Variant: "hard"})
+	if err == nil || !strings.Contains(err.Error(), "takes no variant") {
+		t.Fatalf("a restart with a variant: %v", err)
+	}
+}
+
+// TestApplySpecStrategyRewritesTheTypeOrABudget states what a spec.strategy
+// edit writes: the strategy type, a rollingUpdate budget under the same
+// type, or both, each read by the next pass through the desired spec, and
+// each a write of the owner spec that moves its generation. The trace
+// names only the fields the edit carried, so an edit of the type alone
+// reads as it always has.
+func TestApplySpecStrategyRewritesTheTypeOrABudget(t *testing.T) {
+	ctx := context.Background()
+	d := mustDriver(t, minimalScenario)
+	edit := func(args EventArgs) (string, error) {
+		return applySpecStrategy(ctx, d, TimelineEvent{ID: "spec.strategy", Args: args})
+	}
+	text, err := edit(EventArgs{MaxSurge: "25%"})
+	if err != nil {
+		t.Fatalf("budget edit: %v", err)
+	}
+	if text != "maxSurge=25% generation=1" || d.spec.MaxSurge != "25%" || d.spec.Strategy != "" {
+		t.Fatalf("a surge budget edit rewrites the budget alone: text %q, spec %+v", text, d.spec)
+	}
+	desired, err := d.desiredSpec()
+	if err != nil {
+		t.Fatalf("desiredSpec: %v", err)
+	}
+	if rolling := desired.Lifecycle.UpdateStrategy.RollingUpdate; rolling == nil || rolling.MaxSurge == nil || rolling.MaxSurge.String() != "25%" {
+		t.Fatalf("the next pass reads the edited budget off the desired spec, got %+v", desired.Lifecycle.UpdateStrategy)
+	}
+	text, err = edit(EventArgs{Strategy: "RecreatePod", MaxUnavailable: "2"})
+	if err != nil {
+		t.Fatalf("type and budget edit: %v", err)
+	}
+	if text != "strategy=RecreatePod maxUnavailable=2 generation=2" || d.spec.Strategy != "RecreatePod" || d.spec.MaxUnavailable != "2" || d.spec.MaxSurge != "25%" {
+		t.Fatalf("an edit of the type beside a drain budget keeps the other budget: text %q, spec %+v", text, d.spec)
+	}
+	text, err = edit(EventArgs{Strategy: "SurgeThenDrain"})
+	if err != nil || text != "strategy=SurgeThenDrain generation=3" {
+		t.Fatalf("an edit of the type alone reads as it always has: text %q, err %v", text, err)
+	}
+	for _, tc := range []struct {
+		args EventArgs
+		want string
+	}{
+		{EventArgs{}, "needs the new strategy, maxSurge or maxUnavailable"},
+		{EventArgs{MaxUnavailable: "many"}, "not an integer or a percent"},
+		{EventArgs{MaxSurge: "-1"}, "not an integer or a percent"},
+	} {
+		if _, err := edit(tc.args); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("%+v: want an error naming %q, got %v", tc.args, tc.want, err)
+		}
+	}
+	if d.owner.Generation != 3 {
+		t.Fatalf("a refused edit moves no generation: got %d", d.owner.Generation)
+	}
+}
+
+// TestApplyAdmissionUnavailableIsWhatTheEngineClassifierReads holds the
+// outage against the engine's own classifier: a standing outage refuses
+// every matching create and nothing else, the error reads as an admission
+// outage and not as a quota or a throttle, the restore clears it and
+// reports what it cleared, a restore of nothing fails, and a counted
+// outage ends on its own after as many refusals.
+func TestApplyAdmissionUnavailableIsWhatTheEngineClassifierReads(t *testing.T) {
+	const settled = `
+scenario: settled-pods
+cells: [instance/Ready/ctrl.resync/before]
+initial:
+  spec: {replicas: 1, image: registry.example.com/runtime:v1}
+  rows:
+    - {index: 0, phase: Ready, runningRevision: current}
+  pods:
+    - {index: 0, ready: true}
+timeline:
+  - tick: 1
+`
+	ctx := context.Background()
+	d := mustDriver(t, settled)
+	outage := TimelineEvent{ID: "api.admissionUnavailable"}
+	detail, err := applyAdmissionUnavailable(ctx, d, outage)
+	if err != nil || detail != "verb=create resource=pods until=api.admissionRestored" {
+		t.Fatalf("staging the outage: %q, %v", detail, err)
+	}
+	for i := 0; i < 3; i++ {
+		err, label := d.takeRejection("create", &corev1.Pod{})
+		if err == nil || label != "api.admissionUnavailable" {
+			t.Fatalf("create %d under the outage: err=%v label=%q, want every create refused", i+1, err, label)
+		}
+		if class := evidence.ClassifyAPIError(err).Class; class != types.APIRejectionAdmissionUnavailable {
+			t.Fatalf("the engine reads the refusal as %v, want an admission outage", class)
+		}
+	}
+	if err, _ := d.takeRejection("delete", &corev1.Pod{}); err != nil {
+		t.Fatalf("a delete is no write a pod webhook sees: %v", err)
+	}
+	detail, err = applyAdmissionRestored(ctx, d, TimelineEvent{ID: "api.admissionRestored"})
+	if err != nil || detail != "cleared=1" {
+		t.Fatalf("the restore: %q, %v", detail, err)
+	}
+	if err, _ := d.takeRejection("create", &corev1.Pod{}); err != nil {
+		t.Fatalf("a create after the restore: %v", err)
+	}
+	if _, err := applyAdmissionRestored(ctx, d, TimelineEvent{ID: "api.admissionRestored"}); err == nil || !strings.Contains(err.Error(), "no admission outage stands") {
+		t.Fatalf("a restore of nothing must fail the run: %v", err)
+	}
+	counted := TimelineEvent{ID: "api.admissionUnavailable", Args: EventArgs{Count: 2}}
+	if detail, err := applyAdmissionUnavailable(ctx, d, counted); err != nil || detail != "verb=create resource=pods count=2" {
+		t.Fatalf("staging a counted outage: %q, %v", detail, err)
+	}
+	for i := 0; i < 2; i++ {
+		if err, _ := d.takeRejection("create", &corev1.Pod{}); err == nil {
+			t.Fatalf("create %d of a counted outage was not refused", i+1)
+		}
+	}
+	if err, _ := d.takeRejection("create", &corev1.Pod{}); err != nil {
+		t.Fatalf("a counted outage ends after its count: %v", err)
 	}
 }

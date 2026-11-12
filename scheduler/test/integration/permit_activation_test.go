@@ -10,11 +10,11 @@ import (
 	schedutil "sigs.k8s.io/scheduler-plugins/test/util"
 )
 
-// leaderMarkerLabel is the label a gang's anchor pod carries so a worker's
+// roleLabel is the label a gang's leader pod carries so a worker's
 // required podAffinity term can target it specifically — mirroring how OME's
 // real multi-node gangs mark their leader Runner (see spread_tsc_test.go's
 // "runner" convention).
-const leaderMarkerLabel = "runner"
+const roleLabel = "runner"
 
 // affinityToLeader is the worker side of the worker-follows-leader shape: a
 // REQUIRED podAffinity term that matches only the gang's leader, within the
@@ -24,8 +24,8 @@ func affinityToLeader(pgName string) *v1.Affinity {
 		RequiredDuringSchedulingIgnoredDuringExecution: []v1.PodAffinityTerm{{
 			TopologyKey: domainLabelKey,
 			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-				podGroupLabel:     pgName,
-				leaderMarkerLabel: "leader",
+				podGroupLabel: pgName,
+				roleLabel:     "leader",
 			}},
 		}},
 	}}
@@ -34,11 +34,11 @@ func affinityToLeader(pgName string) *v1.Affinity {
 // TestPermitActivationRescuesAffinityBlockedWorker locks prompt convergence of
 // the worker-first ordering of a multi-pod gang: the worker carries a REQUIRED
 // podAffinity term to its leader (worker-follows-leader, never mutual — a
-// mutual requirement would deadlock the very first pod scheduled), gated
+// mutual requirement would block the very first pod scheduled forever), gated
 // together by the same PodGroup. Created first, the worker's earliest attempt
-// can only park: its leader does not exist yet, and until the leader is
+// can only fail: its leader does not exist yet, and until the leader is
 // assumed on a node no node can satisfy the term. Nothing in the cluster
-// reports the leader's later arrival or assumption to the parked worker, so
+// reports the leader's later arrival or assumption to the held worker, so
 // the plugin's own activations (on the member set completing, and on a member
 // reaching Permit) are what bring it back.
 //
@@ -70,10 +70,10 @@ func TestPermitActivationRescuesAffinityBlockedWorker(t *testing.T) {
 	}
 
 	leader := makeGangPod("sw-leader", ns, "gang")
-	leader.Labels[leaderMarkerLabel] = "leader"
+	leader.Labels[roleLabel] = "leader"
 
 	worker := makeGangPod("sw-worker", ns, "gang")
-	worker.Labels[leaderMarkerLabel] = "worker"
+	worker.Labels[roleLabel] = "worker"
 	worker.Spec.Affinity = affinityToLeader("gang")
 
 	// Worker first: its earliest attempt(s) can only fail — the leader either
@@ -98,14 +98,14 @@ func TestPermitActivationRescuesAffinityBlockedWorker(t *testing.T) {
 // TestTemplateCompletionRescuesLeaderFirstGang locks the opposite creation order
 // of the same worker-follows-leader shape, which is how a multi-node controller
 // typically creates a gang: leader first, then the worker. The leader is popped
-// before the worker exists and parks waiting for the full member template set.
+// before the worker exists and is held short of the full member template set.
 // An unscheduled pod's creation is not a scheduling-queue move event, so the
 // worker's arrival on its own wakes nobody; and the worker's own attempt cannot
 // succeed, because its required affinity needs the leader assumed on a node
 // first. Neither member reaches Permit, so Permit's sibling activation never
 // runs either. The plugin must therefore treat "the member set became complete"
 // as an explicit wake-up: the worker's PreFilter, the first to observe the full
-// set, activates the parked leader; the leader then takes the domain, waits at
+// set, activates the held leader; the leader then takes the domain, waits at
 // Permit, and its activation pulls the worker through.
 //
 // The tight bind window is the assertion: without that wake-up both pods sit in
@@ -134,17 +134,17 @@ func TestTemplateCompletionRescuesLeaderFirstGang(t *testing.T) {
 	}
 
 	leader := makeGangPod("lf-leader", ns, "gang")
-	leader.Labels[leaderMarkerLabel] = "leader"
+	leader.Labels[roleLabel] = "leader"
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, leader, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create leader: %v", err)
 	}
-	// The leader must have been popped and parked on the incomplete member set
+	// The leader must have been popped and held back on the incomplete member set
 	// before the worker exists; creating the worker any earlier could let the
 	// leader's first attempt see the full set and hide the ordering under test.
 	waitForPodRejected(t, tc, ns, "lf-leader", "waiting for all PodGroup member templates", 10*time.Second)
 
 	worker := makeGangPod("lf-worker", ns, "gang")
-	worker.Labels[leaderMarkerLabel] = "worker"
+	worker.Labels[roleLabel] = "worker"
 	worker.Spec.Affinity = affinityToLeader("gang")
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, worker, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create worker: %v", err)
@@ -196,14 +196,14 @@ func TestLeaderFirstGangKeepsBestFitDomain(t *testing.T) {
 	}
 
 	leader := makeGangPod("bf-leader", ns, "gang")
-	leader.Labels[leaderMarkerLabel] = "leader"
+	leader.Labels[roleLabel] = "leader"
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, leader, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create leader: %v", err)
 	}
 	waitForPodRejected(t, tc, ns, "bf-leader", "waiting for all PodGroup member templates", 10*time.Second)
 
 	worker := makeGangPod("bf-worker", ns, "gang")
-	worker.Labels[leaderMarkerLabel] = "worker"
+	worker.Labels[roleLabel] = "worker"
 	worker.Spec.Affinity = affinityToLeader("gang")
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, worker, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create worker: %v", err)

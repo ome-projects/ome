@@ -13,85 +13,27 @@ import (
 	"sigs.k8s.io/ome/pkg/logging"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
 	testingPkg "sigs.k8s.io/ome/pkg/testing"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
-type TestReplicator struct {
-	*OCIToOCIReplicator
-	mockPrepareObjectChannel     func(objects []common.ReplicationObject) chan common.ReplicationObject
-	mockProcessObjectReplication func(objChan chan common.ReplicationObject, resultChan chan *ReplicationResult, total int)
-	mockLogProgress              func(successCount, errorCount, total int, start time.Time)
-	prepChan                     chan common.ReplicationObject
-	resultSet                    []*ReplicationResult
-	logs                         []string
-	logMu                        sync.Mutex
-}
-
-func (t *TestReplicator) Replicate(objects []common.ReplicationObject) error {
-	t.Logger.Info("Starting replication to target")
-
-	startTime := time.Now()
-	objChan := t.mockPrepareObjectChannel(objects)
-	resultChan := make(chan *ReplicationResult, len(objects))
-
-	var wg sync.WaitGroup
-	for i := 0; i < t.Config.NumConnections; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			t.mockProcessObjectReplication(objChan, resultChan, len(objects))
-		}()
-	}
-
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	successCount, errorCount := 0, 0
-	for result := range resultChan {
-		if result.error != nil {
-			errorCount++
-			t.Logger.Errorf("Replication failed for %s to %s: %v", result.source, result.target, result.error)
-		} else {
-			successCount++
-			t.Logger.Infof("Replication succeeded for %s to %s", result.source, result.target)
-		}
-		t.mockLogProgress(successCount, errorCount, len(objects), startTime)
-	}
-
-	t.Logger.Infof("Replication completed with %d successes and %d errors in %v", successCount, errorCount, time.Since(startTime))
-	return nil
-}
-
 func TestReplicate(t *testing.T) {
-	logger := testingPkg.SetupMockLogger()
-
 	objects := []common.ReplicationObject{
-		NewCustomMockReplicationObject("file1", "file1", 123),
-		NewCustomMockReplicationObject("file2", "file2", 456),
+		NewCustomMockReplicationObject("src-prefix/file1", "src-prefix/file1", 123),
+		NewCustomMockReplicationObject("src-prefix/file2", "src-prefix/file2", 456),
+		NewCustomMockReplicationObject("src-prefix/", "src-prefix/", 0),
 	}
-	objectChan := make(chan common.ReplicationObject, len(objects))
-	for _, obj := range objects {
-		objectChan <- obj
-	}
-	close(objectChan)
-
-	results := []*ReplicationResult{
-		{source: ociobjectstore.ObjectURI{ObjectName: "file1"}, target: ociobjectstore.ObjectURI{ObjectName: "target1"}, error: nil},
-		{source: ociobjectstore.ObjectURI{ObjectName: "file2"}, target: ociobjectstore.ObjectURI{ObjectName: "target2"}, error: errors.New("failed")},
-	}
-
-	logs := []string{}
-	logMu := &sync.Mutex{}
-
-	testRep := &TestReplicator{
-		OCIToOCIReplicator: &OCIToOCIReplicator{
-			Logger: logger,
-			Config: OCIToOCIReplicatorConfig{
-				LocalPath: "/tmp/model",
+	newReplicator := func(transfer *fakeTransfer) *OCIToOCIReplicator {
+		localPath := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(localPath, ReplicaWorkspacePath), 0o755))
+		return &OCIToOCIReplicator{
+			Logger: testingPkg.SetupMockLogger(),
+			Dependencies: Dependencies{
+				LocalPath:   localPath,
+				Connections: 2,
+				Transfer:    transfer,
 			},
 			ReplicationInput: common.ReplicationInput{
 				SourceStorageType: storage.StorageTypeOCI,
@@ -107,45 +49,32 @@ func TestReplicate(t *testing.T) {
 					Prefix:     "tgt-prefix/",
 				},
 			},
-		},
-		mockPrepareObjectChannel: func(objects []common.ReplicationObject) chan common.ReplicationObject { return objectChan },
-		mockProcessObjectReplication: func(objChan chan common.ReplicationObject, resultChan chan *ReplicationResult, total int) {
-			for _, result := range results {
-				resultChan <- result
-			}
-		},
-		mockLogProgress: func(successCount, errorCount, total int, start time.Time) {
-			logMu.Lock()
-			defer logMu.Unlock()
-			logs = append(logs, "progress called")
-		},
-		prepChan:  objectChan,
-		resultSet: results,
-		logs:      logs,
-		logMu:     sync.Mutex{},
+		}
 	}
 
-	err := testRep.Replicate(objects)
-	assert.NoError(t, err)
+	// Every file is downloaded and uploaded under the target prefix, the directory entry is
+	// skipped, and the workspace is removed afterwards.
+	transfer := &fakeTransfer{}
+	replicator := newReplicator(transfer)
+	assert.NoError(t, replicator.Replicate(objects))
+	assert.ElementsMatch(t, []string{"src-prefix/file1", "src-prefix/file2"}, transfer.downloaded())
+	assert.ElementsMatch(t, []string{"tgt-prefix/file1", "tgt-prefix/file2"}, transfer.uploaded())
+	_, err := os.Stat(filepath.Join(replicator.Dependencies.LocalPath, ReplicaWorkspacePath))
+	assert.True(t, os.IsNotExist(err), "the workspace should be removed after a successful run")
+
+	// A file whose download fails is not uploaded, and the run fails with the count over every
+	// listed object.
+	transfer = &fakeTransfer{downloadErr: failObject("src-prefix/file2", errors.New("download failed"))}
+	err = newReplicator(transfer).Replicate(objects)
+	assert.EqualError(t, err, "1/3 replications failed")
+	assert.ElementsMatch(t, []string{"tgt-prefix/file1"}, transfer.uploaded())
 }
 
 func TestOCIToOCIReplicatorLimitsChecksumConcurrency(t *testing.T) {
-	originalDownload := downloadObjectFunc
 	originalChecksum := getObjectMetadataWithChecksumFunc
-	originalUpload := uploadObjectToOCIOSDataStoreFunc
 	t.Cleanup(func() {
-		downloadObjectFunc = originalDownload
 		getObjectMetadataWithChecksumFunc = originalChecksum
-		uploadObjectToOCIOSDataStoreFunc = originalUpload
 	})
-
-	downloadObjectFunc = func(_ *ociobjectstore.OCIOSDataStore, object ociobjectstore.ObjectURI, downloadPath string) error {
-		filePath := filepath.Join(downloadPath, object.ObjectName)
-		if err := os.MkdirAll(filepath.Dir(filePath), 0750); err != nil {
-			return err
-		}
-		return os.WriteFile(filePath, []byte("test"), 0600)
-	}
 
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
@@ -160,21 +89,22 @@ func TestOCIToOCIReplicatorLimitsChecksumConcurrency(t *testing.T) {
 		<-release
 		return map[string]string{OCIObjectMD5MetadataKey: "checksum"}
 	}
-	uploadObjectToOCIOSDataStoreFunc = func(_ *ociobjectstore.OCIOSDataStore, object ociobjectstore.ObjectURI, _ string) error {
+	transfer := &fakeTransfer{uploadErr: func(object ociobjectstore.ObjectURI) error {
 		if object.Metadata[OCIObjectMD5MetadataKey] != "checksum" {
 			return errors.New("checksum metadata missing")
 		}
 		return nil
-	}
+	}}
 
 	replicator := &OCIToOCIReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: OCIToOCIReplicatorConfig{
-			LocalPath:            t.TempDir(),
-			NumConnections:       2,
-			ChecksumConfig:       &common.ChecksumConfig{UploadEnabled: true, ChecksumAlgorithm: MD5ChecksumAlgorithm, Concurrency: 1},
-			SourceOCIOSDataStore: &ociobjectstore.OCIOSDataStore{},
-			TargetOCIOSDataStore: &ociobjectstore.OCIOSDataStore{},
+		Dependencies: Dependencies{
+			LocalPath:   t.TempDir(),
+			Connections: 2,
+			Checksum:    &common.ChecksumConfig{UploadEnabled: true, ChecksumAlgorithm: MD5ChecksumAlgorithm, Concurrency: 1},
+			SourceStore: &ociobjectstore.OCIOSDataStore{},
+			TargetStore: &ociobjectstore.OCIOSDataStore{},
+			Transfer:    transfer,
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{Namespace: "source-namespace", BucketName: "source-bucket"},

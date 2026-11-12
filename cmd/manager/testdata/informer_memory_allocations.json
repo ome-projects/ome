@@ -1,0 +1,14 @@
+{
+  "recordedOn": {
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The readySince columns: admitting a replica of 4,000 rows at rest in the column form, every row with its own readySince, costs about 80 allocations per 1,000 Instances where the 4,000 entries cost 4,086; one base time, one index set and one offset list are decoded into the cache in place of one entry per row, so nothing is allocated per Instance and the reading has no slope a percent tolerance can hold (it read 81 and 90 on one machine): it is reported and not locked, and its bytes are. The plain list and the pod rows stand within their jitter (2,080 to 2,075 and 381 to 382).",
+  "tolerancePercent": 10,
+  "budgets": {
+    "instance/allocations-per-1000-instances/plain-list": 2076,
+    "pod/allocations-per-pod/list": 365,
+    "pod/allocations-per-pod/watch-added": 378,
+    "pod/allocations-per-pod/watch-modified": 383
+  }
+}

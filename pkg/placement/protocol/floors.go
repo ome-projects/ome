@@ -11,15 +11,16 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// ValidateReplicaFloors returns the whole-replica count represented by a full
-// home policy: the engine floor when declared, otherwise the decoder floor.
-// Engine and decoder floors are independent; router has its own per-home floor.
+// ValidateReplicaFloors returns the whole-replica count a complete policy for
+// one placement cluster represents: the engine minimum when declared,
+// otherwise the decoder minimum. Engine and decoder minimums are independent;
+// the router has its own per-cluster minimum.
 func ValidateReplicaFloors(floors []v1beta1.PlacementComponentFloor) (int32, error) {
 	seen := map[v1beta1.ComponentType]bool{}
 	var replicas int32
 	var hasReplicaComponent, hasEngine bool
 	for _, floor := range floors {
-		if (floor.Component != v1beta1.EngineComponent && floor.Component != v1beta1.DecoderComponent && floor.Component != v1beta1.RouterComponent) || seen[floor.Component] || floor.Replicas < 0 {
+		if !IsPlacementComponent(floor.Component) || seen[floor.Component] || floor.Replicas < 0 {
 			return 0, fmt.Errorf("placement replica floors require distinct components and nonnegative counts")
 		}
 		seen[floor.Component] = true
@@ -38,19 +39,31 @@ func ValidateReplicaFloors(floors []v1beta1.PlacementComponentFloor) (int32, err
 	return replicas, nil
 }
 
-// ValidatePositiveReplicaFloors requires a guaranteed floor for every component
-// before a home can participate in bounded placement movement.
-func ValidatePositiveReplicaFloors(floors []v1beta1.PlacementComponentFloor) (int32, error) {
-	replicas, err := ValidateReplicaFloors(floors)
-	if err != nil {
-		return 0, err
+// IsPlacementComponent reports whether a component carries a per-cluster
+// replica minimum: the engine, the decoder and the router.
+func IsPlacementComponent(component v1beta1.ComponentType) bool {
+	return component == v1beta1.EngineComponent || component == v1beta1.DecoderComponent || component == v1beta1.RouterComponent
+}
+
+// isPrimaryComponent reports whether a component's count can lead a
+// placement: the engine or the decoder.
+func isPrimaryComponent(component v1beta1.ComponentType) bool {
+	return component == v1beta1.EngineComponent || component == v1beta1.DecoderComponent
+}
+
+// ValidatePositiveReplicaFloors requires a positive minimum for every
+// component before a placement cluster can take part in bounded placement
+// movement.
+func ValidatePositiveReplicaFloors(floors []v1beta1.PlacementComponentFloor) error {
+	if _, err := ValidateReplicaFloors(floors); err != nil {
+		return err
 	}
 	for _, floor := range floors {
 		if floor.Replicas == 0 {
-			return 0, fmt.Errorf("placement movement requires a positive %s floor", floor.Component)
+			return fmt.Errorf("placement movement requires a positive %s floor", floor.Component)
 		}
 	}
-	return replicas, nil
+	return nil
 }
 
 // HasZeroReplicaFloor distinguishes an accepted scale-to-zero contract from
@@ -68,7 +81,7 @@ func HasZeroReplicaFloor(policy *v1beta1.PlacementExecutionPolicy, component v1b
 }
 
 // ResolveReplicaFloors reads the resolved component policy without injecting
-// defaults. Zero is an explicit floor; an omitted count remains unresolved.
+// defaults. Zero is an explicit minimum; an omitted count remains unresolved.
 func ResolveReplicaFloors(engine *v1beta1.EngineSpec, decoder *v1beta1.DecoderSpec, router *v1beta1.RouterSpec) ([]v1beta1.PlacementComponentFloor, error) {
 	var floors []v1beta1.PlacementComponentFloor
 	for _, component := range resolvedFloorComponents(engine, decoder, router) {
@@ -101,10 +114,11 @@ func CheckReplicaFloors(floors []v1beta1.PlacementComponentFloor, engine *v1beta
 		return fmt.Errorf("placement replica floors differ from the resolved component inventory")
 	}
 	for _, component := range resolvedFloorComponents(engine, decoder, router) {
-		if component.spec != nil {
-			if err := CheckComponentReplicaFloor(floors, component.name, component.spec); err != nil {
-				return err
-			}
+		if component.spec == nil {
+			continue
+		}
+		if err := CheckComponentReplicaFloor(floors, component.name, component.spec); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -126,65 +140,37 @@ func CheckComponentReplicaFloor(floors []v1beta1.PlacementComponentFloor, compon
 	return fmt.Errorf("placement replica floors have no %s component", component)
 }
 
-// ApportionReplicaFloors spreads each secondary component's minimum over homes
-// in proportion to their primary targets: largest remainder, ties by home
-// name, and at least one replica on every positive-target home whenever the
-// minimum is positive. The minimums describe the fleet at primaryMinimum
-// primary replicas; targets that sum to another count carry each secondary
-// total along in the same ratio, rounded up. A total below the number of
-// positive-target homes cannot satisfy the guarantee and is an error. Router
-// is apportioned only when the caller passes its minimum, which a source does
-// when it divides its routers across homes.
+// ApportionReplicaFloors spreads each secondary component's minimum over the
+// placement clusters in proportion to their primary targets: largest
+// remainder, ties by cluster name, and at least one replica on every cluster
+// with a positive target whenever the minimum is positive. The minimums
+// describe the fleet at primaryMinimum primary replicas; targets that sum to
+// another count carry each secondary total along in the same ratio, rounded
+// up. A total below the number of clusters with a positive target cannot
+// satisfy the guarantee and is an error. The router is apportioned only when
+// the caller passes its minimum, which a source does when it divides its
+// routers across clusters.
 func ApportionReplicaFloors(primary v1beta1.ComponentType, primaryMinimum int32, targets map[string]int32, minimums map[v1beta1.ComponentType]int32) (map[string][]v1beta1.PlacementComponentFloor, error) {
-	if primary != v1beta1.EngineComponent && primary != v1beta1.DecoderComponent {
+	if !isPrimaryComponent(primary) {
 		return nil, fmt.Errorf("placement primary component must be the engine or decoder")
 	}
 	if primaryMinimum <= 0 {
 		return nil, fmt.Errorf("placement %s minimum must be positive", primary)
 	}
-	names := slices.Sorted(maps.Keys(targets))
-	weights := make(map[string]int64, len(targets))
-	positive := 0
-	var sum int64
-	for _, name := range names {
-		if name == "" {
-			return nil, fmt.Errorf("placement homes require a name")
-		}
-		if targets[name] < 0 {
-			return nil, fmt.Errorf("placement %s targets must be nonnegative", primary)
-		}
-		weights[name] = int64(targets[name])
-		sum += int64(targets[name])
-		if targets[name] > 0 {
-			positive++
-		}
+	weights, err := readPrimaryTargets(primary, primaryMinimum, targets)
+	if err != nil {
+		return nil, err
 	}
 	out := make(map[string][]v1beta1.PlacementComponentFloor, len(targets))
-	for _, name := range names {
+	for _, name := range weights.names {
 		out[name] = []v1beta1.PlacementComponentFloor{{Component: primary, Replicas: targets[name]}}
 	}
 	for _, component := range slices.Sorted(maps.Keys(minimums)) {
-		minimum := minimums[component]
-		switch {
-		case component == primary:
-			return nil, fmt.Errorf("placement primary %s floors are the targets and cannot be apportioned", primary)
-		case component != v1beta1.EngineComponent && component != v1beta1.DecoderComponent && component != v1beta1.RouterComponent:
-			return nil, fmt.Errorf("placement cannot apportion component %q", component)
-		case minimum < 0:
-			return nil, fmt.Errorf("placement %s minimum must be nonnegative", component)
-		}
-		total, err := ratioTotal(sum, minimum, primaryMinimum)
+		shares, err := weights.secondaryShares(component, minimums[component])
 		if err != nil {
-			return nil, fmt.Errorf("placement %s total: %w", component, err)
+			return nil, err
 		}
-		if total > 0 && int(total) < positive {
-			return nil, fmt.Errorf("%s minimum %d cannot give each of the %d homes with a positive %s share at least one replica", component, total, positive, primary)
-		}
-		shares := largestRemainder(total, weights)
-		if total > 0 {
-			liftZeroShares(shares, weights)
-		}
-		for _, name := range names {
+		for _, name := range weights.names {
 			out[name] = append(out[name], v1beta1.PlacementComponentFloor{Component: component, Replicas: shares[name]})
 		}
 	}
@@ -194,14 +180,71 @@ func ApportionReplicaFloors(primary v1beta1.ComponentType, primaryMinimum int32,
 	return out, nil
 }
 
+// primaryWeights are the primary targets read as the weights a secondary
+// component is spread by: the primary component and the fleet count its
+// minimums describe, the cluster names in order, each target as a weight,
+// their sum, and how many are positive.
+type primaryWeights struct {
+	component v1beta1.ComponentType
+	minimum   int32
+	names     []string
+	byName    map[string]int64
+	sum       int64
+	positive  int
+}
+
+// readPrimaryTargets validates the targets in cluster-name order and reads
+// them as weights.
+func readPrimaryTargets(primary v1beta1.ComponentType, primaryMinimum int32, targets map[string]int32) (primaryWeights, error) {
+	weights := primaryWeights{component: primary, minimum: primaryMinimum, names: slices.Sorted(maps.Keys(targets)), byName: make(map[string]int64, len(targets))}
+	for _, name := range weights.names {
+		if name == "" {
+			return primaryWeights{}, fmt.Errorf("placement homes require a name")
+		}
+		if targets[name] < 0 {
+			return primaryWeights{}, fmt.Errorf("placement %s targets must be nonnegative", primary)
+		}
+		weights.byName[name] = int64(targets[name])
+		weights.sum += int64(targets[name])
+		if targets[name] > 0 {
+			weights.positive++
+		}
+	}
+	return weights, nil
+}
+
+// secondaryShares spreads one secondary component's minimum over the primary
+// weights: the minimum scaled to the targeted primary count, then largest
+// remainder with every positive-target cluster given at least one. The
+// primary itself and a component outside the placement set are refused.
+func (w primaryWeights) secondaryShares(component v1beta1.ComponentType, minimum int32) (map[string]int32, error) {
+	switch {
+	case component == w.component:
+		return nil, fmt.Errorf("placement primary %s floors are the targets and cannot be apportioned", w.component)
+	case !IsPlacementComponent(component):
+		return nil, fmt.Errorf("placement cannot apportion component %q", component)
+	case minimum < 0:
+		return nil, fmt.Errorf("placement %s minimum must be nonnegative", component)
+	}
+	total, err := ratioTotal(w.sum, minimum, w.minimum)
+	if err != nil {
+		return nil, fmt.Errorf("placement %s total: %w", component, err)
+	}
+	if total > 0 && int(total) < w.positive {
+		return nil, fmt.Errorf("%s minimum %d cannot give each of the %d homes with a positive %s share at least one replica", component, total, w.positive, w.component)
+	}
+	return apportionShares(total, w.byName, w.byName), nil
+}
+
 // ApportionWeightedReplicaFloor spreads one secondary component's minimum by
-// its own weights, over only the homes with a positive primary target. The
-// total follows the primary targets as in ApportionReplicaFloors. Every such
-// home receives at least one replica whenever the total is positive, and a
-// total below the number of those homes is an error. When none of those homes
-// carries a positive weight, the primary targets serve as the weights.
+// its own weights, over only the placement clusters with a positive primary
+// target. The total follows the primary targets as in ApportionReplicaFloors.
+// Every such cluster receives at least one replica whenever the total is
+// positive, and a total below the number of those clusters is an error. When
+// none of those clusters carries a positive weight, the primary targets serve
+// as the weights.
 func ApportionWeightedReplicaFloor(component v1beta1.ComponentType, primaryMinimum int32, targets map[string]int32, minimum int32, weights map[string]int64) (map[string]int32, error) {
-	if component != v1beta1.EngineComponent && component != v1beta1.DecoderComponent && component != v1beta1.RouterComponent {
+	if !IsPlacementComponent(component) {
 		return nil, fmt.Errorf("placement cannot apportion component %q by weight", component)
 	}
 	if primaryMinimum <= 0 {
@@ -210,44 +253,18 @@ func ApportionWeightedReplicaFloor(component v1beta1.ComponentType, primaryMinim
 	if minimum < 0 {
 		return nil, fmt.Errorf("placement %s minimum must be nonnegative", component)
 	}
-	var sum, weightSum int64
-	positive := 0
-	held := map[string]int64{}
-	hosts := map[string]int64{}
-	for name, target := range targets {
-		if name == "" || target < 0 {
-			return nil, fmt.Errorf("placement homes require a name and a nonnegative target")
-		}
-		sum += int64(target)
-		if target == 0 {
-			continue
-		}
-		positive++
-		hosts[name] = int64(target)
-		weight := weights[name]
-		if weight < 0 {
-			return nil, fmt.Errorf("placement %s weight for home %q must be nonnegative", component, name)
-		}
-		if weight > math.MaxInt64-weightSum {
-			return nil, fmt.Errorf("placement %s weights exceed int64", component)
-		}
-		held[name] = weight
-		weightSum += weight
+	hosts, err := readWeightedHosts(component, targets, weights)
+	if err != nil {
+		return nil, err
 	}
-	total, err := ratioTotal(sum, minimum, primaryMinimum)
+	total, err := ratioTotal(hosts.targetSum, minimum, primaryMinimum)
 	if err != nil {
 		return nil, fmt.Errorf("placement %s total: %w", component, err)
 	}
-	if total > 0 && int(total) < positive {
-		return nil, fmt.Errorf("%s minimum %d cannot give each of the %d homes holding the primary component at least one replica", component, total, positive)
+	if total > 0 && int(total) < len(hosts.targets) {
+		return nil, fmt.Errorf("%s minimum %d cannot give each of the %d homes holding the primary component at least one replica", component, total, len(hosts.targets))
 	}
-	if weightSum == 0 {
-		held = hosts
-	}
-	shares := largestRemainder(total, held)
-	if total > 0 {
-		liftZeroShares(shares, hosts)
-	}
+	shares := apportionShares(total, hosts.spreadBy(), hosts.targets)
 	out := make(map[string]int32, len(targets))
 	for name := range targets {
 		out[name] = shares[name]
@@ -255,9 +272,66 @@ func ApportionWeightedReplicaFloor(component v1beta1.ComponentType, primaryMinim
 	return out, nil
 }
 
+// weightedHosts are the clusters holding the primary component: each one's
+// target and its own weight, the sum of every target (zero targets included)
+// and the sum of the weights.
+type weightedHosts struct {
+	targets   map[string]int64
+	weights   map[string]int64
+	targetSum int64
+	weightSum int64
+}
+
+// readWeightedHosts validates every target, and the weight of every cluster
+// with a positive target, and reads them.
+func readWeightedHosts(component v1beta1.ComponentType, targets map[string]int32, weights map[string]int64) (weightedHosts, error) {
+	hosts := weightedHosts{targets: map[string]int64{}, weights: map[string]int64{}}
+	for name, target := range targets {
+		if name == "" || target < 0 {
+			return weightedHosts{}, fmt.Errorf("placement homes require a name and a nonnegative target")
+		}
+		hosts.targetSum += int64(target)
+		if target == 0 {
+			continue
+		}
+		hosts.targets[name] = int64(target)
+		weight := weights[name]
+		if weight < 0 {
+			return weightedHosts{}, fmt.Errorf("placement %s weight for home %q must be nonnegative", component, name)
+		}
+		if weight > math.MaxInt64-hosts.weightSum {
+			return weightedHosts{}, fmt.Errorf("placement %s weights exceed int64", component)
+		}
+		hosts.weights[name] = weight
+		hosts.weightSum += weight
+	}
+	return hosts, nil
+}
+
+// spreadBy is the weights the shares follow: the clusters' own weights, or
+// their primary targets when no host carries a positive weight.
+func (h weightedHosts) spreadBy() map[string]int64 {
+	if h.weightSum == 0 {
+		return h.targets
+	}
+	return h.weights
+}
+
+// apportionShares spreads total over the weights by largest remainder and,
+// when total is positive, raises every zero share of a cluster with a positive
+// stake in hosts to one.
+func apportionShares(total int32, weights, hosts map[string]int64) map[string]int32 {
+	shares := largestRemainder(total, weights)
+	if total > 0 {
+		raiseZeroShares(shares, hosts)
+	}
+	return shares
+}
+
 // ratioTotal scales a component minimum from the fleet's primary minimum to
-// the primary replicas actually targeted, rounding up so the ratio stays a
-// floor. Targets at the fleet minimum keep the minimum exactly.
+// the primary replicas actually targeted, rounding up so the scaled count
+// never falls below the ratio. Targets at the fleet minimum keep the minimum
+// exactly.
 func ratioTotal(targets int64, minimum, primaryMinimum int32) (int32, error) {
 	if targets == int64(primaryMinimum) || minimum == 0 {
 		return minimum, nil
@@ -310,27 +384,34 @@ func largestRemainder(total int32, weights map[string]int64) map[string]int32 {
 	return shares
 }
 
-// liftZeroShares gives every positive-weight home at least one replica by
-// taking one from the largest share, so the total stays exact. The caller has
-// checked that the total covers every positive-weight home.
-func liftZeroShares(shares map[string]int32, weights map[string]int64) {
+// raiseZeroShares gives every cluster with a positive stake at least one
+// replica by taking one from the largest share, so the total stays exact. The
+// caller has checked that the total covers every such cluster.
+func raiseZeroShares(shares map[string]int32, hosts map[string]int64) {
 	names := slices.Sorted(maps.Keys(shares))
 	for _, name := range names {
-		if weights[name] <= 0 || shares[name] > 0 {
+		if hosts[name] <= 0 || shares[name] > 0 {
 			continue
 		}
-		largest := ""
-		for _, candidate := range names {
-			if shares[candidate] > 1 && (largest == "" || shares[candidate] > shares[largest]) {
-				largest = candidate
-			}
-		}
+		largest := largestShareAboveOne(names, shares)
 		if largest == "" {
 			return
 		}
 		shares[largest]--
 		shares[name]++
 	}
+}
+
+// largestShareAboveOne is the first cluster, in name order, whose share is the
+// largest of those above one; empty when no share can give one away.
+func largestShareAboveOne(names []string, shares map[string]int32) string {
+	largest := ""
+	for _, candidate := range names {
+		if shares[candidate] > 1 && (largest == "" || shares[candidate] > shares[largest]) {
+			largest = candidate
+		}
+	}
+	return largest
 }
 
 // ReplicaUnitRatio reduces the component minimums to the smallest whole

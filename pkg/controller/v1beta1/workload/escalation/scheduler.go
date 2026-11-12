@@ -2,16 +2,24 @@
 // pass. A pod the scheduler reports it cannot place is waiting on
 // cluster capacity, not failing: the hold (holds/scheduler.go) parks the
 // InstanceReadyTimeout clock, and only an operator-configured grace
-// turns the wait into a terminal failure. This is that grace.
+// turns the wait into a terminal failure. This is that grace, and beside
+// it the bounded writes that ask the scheduler again for a gang pod left
+// Pending with no node (lifecycle.schedulingRetry).
 package escalation
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apitypes "k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -202,4 +210,133 @@ func blamedForHold(row *types.InstanceStatus, pods []*corev1.Pod, desired int32,
 		return []*corev1.Pod{rowEvidence.Unschedulable}
 	}
 	return pods
+}
+
+// schedulingRetryAnnotation is the pod record of the writes that asked the
+// scheduler to look at the pod again.
+var schedulingRetryAnnotation = constants.InferenceServicePodSchedulingRetryAnnotationKey
+
+// schedulingRetryRecord is that record: how many times the pod was
+// written for the scheduler.
+type schedulingRetryRecord struct {
+	Count int32 `json:"count"`
+}
+
+// schedulingRetryCount reads the record off the pod. A missing or
+// unreadable record counts as no write yet.
+func schedulingRetryCount(pod *corev1.Pod) int32 {
+	raw, ok := pod.Annotations[schedulingRetryAnnotation]
+	if !ok {
+		return 0
+	}
+	var rec schedulingRetryRecord
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil || rec.Count < 0 {
+		return 0
+	}
+	return rec.Count
+}
+
+// waitingForNode reports whether a live pod is still waiting for the
+// scheduler: no node, no scheduling gate holding it back, not being
+// deleted, and nothing on its status that says it was placed or ran. A
+// pod with no phase yet counts as Pending, the phase the apiserver gives
+// every new pod.
+func waitingForNode(pod *corev1.Pod) bool {
+	if pod == nil || pod.DeletionTimestamp != nil || pod.Spec.NodeName != "" || len(pod.Spec.SchedulingGates) > 0 {
+		return false
+	}
+	switch pod.Status.Phase {
+	case corev1.PodRunning, corev1.PodSucceeded, corev1.PodFailed:
+		return false
+	}
+	for _, cond := range pod.Status.Conditions {
+		if cond.Status != corev1.ConditionTrue {
+			continue
+		}
+		if cond.Type == corev1.PodScheduled || cond.Type == corev1.ContainersReady || cond.Type == corev1.PodReady {
+			return false
+		}
+	}
+	return true
+}
+
+// nodeWaitStart is when the pod's wait for a node began: its creation,
+// or the scheduler's later PodScheduled ruling when there is one. The
+// ruling is the later mark, so a pod the scheduler is visibly working on
+// is given the whole wait again from that point.
+func nodeWaitStart(pod *corev1.Pod) time.Time {
+	start := pod.CreationTimestamp.Time
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodScheduled && cond.LastTransitionTime.After(start) {
+			start = cond.LastTransitionTime.Time
+		}
+	}
+	return start
+}
+
+// schedulingRetryDue reports whether the next write is due: the k-th
+// write waits k times the configured wait from the start of the pod's
+// wait, and no write follows the configured limit.
+func schedulingRetryDue(policy *types.SchedulingRetryPolicy, count int32, start, now time.Time) bool {
+	if policy == nil || policy.After <= 0 || count >= policy.MaxAttempts {
+		return false
+	}
+	return now.Sub(start) > time.Duration(count+1)*policy.After
+}
+
+// requestSchedulingAgain writes every pod of the Instance that has waited
+// for a node past the configured wait, one record per pod, and tells the
+// operator about each write. The write moves the pod's resourceVersion and changes
+// nothing the scheduler reads as a placement input: that is what puts a
+// pod the scheduler's queue has lost back in its active queue, and what
+// leaves a pod the queue still holds exactly where it is.
+func requestSchedulingAgain(ctx context.Context, deps types.Deps, input types.ReconcileInput, component types.ComponentType, idx int32, pods []*corev1.Pod, now time.Time) error {
+	policy := input.SchedulingRetry
+	for _, pod := range pods {
+		if !waitingForNode(pod) {
+			continue
+		}
+		count := schedulingRetryCount(pod)
+		start := nodeWaitStart(pod)
+		if !schedulingRetryDue(policy, count, start, now) {
+			continue
+		}
+		if err := writeSchedulingRetry(ctx, deps.Client, pod, count+1); err != nil {
+			return err
+		}
+		eventSchedulingRetry(deps, input, component, idx, pod, now.Sub(start), count+1, policy.MaxAttempts)
+	}
+	return nil
+}
+
+// writeSchedulingRetry records the write on the pod. The patch names the
+// one annotation this pass owns and nothing else, so it never contends
+// with the scheduler's own status writes; a pod that is gone needs
+// nothing.
+func writeSchedulingRetry(ctx context.Context, c client.Client, pod *corev1.Pod, count int32) error {
+	if c == nil {
+		return fmt.Errorf("ask the scheduler again for pod %s/%s: the pass has no client", pod.Namespace, pod.Name)
+	}
+	value, err := json.Marshal(schedulingRetryRecord{Count: count})
+	if err != nil {
+		return fmt.Errorf("marshal scheduling retry record for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]string{schedulingRetryAnnotation: string(value)}},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal scheduling retry patch for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	if err := c.Patch(ctx, pod.DeepCopy(), client.RawPatch(apitypes.MergePatchType, raw)); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("ask the scheduler again for pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	return nil
+}
+
+// eventSchedulingRetry tells the operator which pod was written, how long
+// it had waited, and how many writes remain.
+func eventSchedulingRetry(deps types.Deps, input types.ReconcileInput, component types.ComponentType, idx int32, pod *corev1.Pod, waited time.Duration, attempt, limit int32) {
+	types.RecordNormal(deps.Recorder, types.EventTarget(input), types.EventReasonSchedulingRequestedAgain,
+		"OMENative %s pod %s has waited %s for a node; the pod was written so the scheduler looks at it again (%d of %d)",
+		types.InstanceKey(component, idx), pod.Name, waited.Truncate(time.Second), attempt, limit)
 }

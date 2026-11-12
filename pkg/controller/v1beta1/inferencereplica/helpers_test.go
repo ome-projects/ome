@@ -15,6 +15,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -24,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/uuid"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
+	clocktesting "k8s.io/utils/clock/testing"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -271,7 +273,7 @@ func decisionsFor(t *testing.T, r *Reconciler, key client.ObjectKey) readerDecis
 	ready := computeReadyCondition(&ir.Status, ir.Spec.Replicas, ir.Spec.Lifecycle, ir.Spec.Pacing)
 	stalled := computeRolloutStalledCondition(&ir.Status)
 	ready.LastTransitionTime, stalled.LastTransitionTime = metav1.Time{}, metav1.Time{}
-	live := revision.CollectLiveRevisionNames(ir.Status.CurrentRevision, ir.Status.UpdateRevision, observedFromIR(ir).InstanceStatuses)
+	live := revision.LiveRevisionNames(ir.Status.CurrentRevision, ir.Status.UpdateRevision, revision.RowRevisions(observedFromIR(ir).InstanceStatuses))
 	sort.Strings(live)
 	staged, _ := stagedAtPartition(&ir.Status, ir.Spec.Lifecycle, ir.Spec.Pacing)
 	return readerDecisions{
@@ -436,6 +438,30 @@ func newReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Cli
 		Expectations:             workloadtypes.NewExpectations(),
 		ScaleDownRequeueInterval: testScaleDownRequeueInterval,
 	}, c
+}
+
+// clockedReconciler is newReconciler with the reconciler's clock standing
+// at publicationClock, so a test can tell a time read from the pass's clock
+// from one read from the wall clock.
+func clockedReconciler(t *testing.T, objs ...client.Object) (*Reconciler, client.Client) {
+	t.Helper()
+	r, c := newReconciler(t, objs...)
+	r.Clock = clocktesting.NewFakeClock(publicationClock)
+	return r, c
+}
+
+// expectTransitionAtThePassClock fails unless conditions carry a condition
+// of type condType that transitioned at publicationClock, the clock a
+// clockedReconciler's pass reads.
+func expectTransitionAtThePassClock(t *testing.T, conditions []metav1.Condition, condType string) {
+	t.Helper()
+	cond := apimeta.FindStatusCondition(conditions, condType)
+	if cond == nil {
+		t.Fatalf("no %s condition was written: %+v", condType, conditions)
+	}
+	if !cond.LastTransitionTime.Time.Equal(publicationClock) {
+		t.Errorf("condition %s transitioned at %s, want the pass's clock %s", condType, cond.LastTransitionTime.Time, publicationClock)
+	}
 }
 
 type podListFailingReader struct {
@@ -1101,4 +1127,17 @@ func sliceNames(t *testing.T, c client.Client) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// passListOf is the pass's cached list of the Component's pods holding
+// pods, as the list stands once the first reader of the pass took it,
+// and the slice it hands every reader.
+func passListOf(tb testing.TB, c client.Client, pods []*corev1.Pod) (*workloadtypes.CachedPodList, []*corev1.Pod) {
+	tb.Helper()
+	list := workloadtypes.NewCachedPodList(c)
+	taken, err := list.Pods(context.Background(), func(context.Context) ([]*corev1.Pod, error) { return pods, nil })
+	if err != nil {
+		tb.Fatalf("take the pass's list: %v", err)
+	}
+	return list, taken
 }

@@ -25,6 +25,10 @@ import (
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 )
 
+// TargetServicePortNotAvailable is the IngressReady=False reason written
+// while the target Service's port cannot be read.
+const TargetServicePortNotAvailable = "TargetServicePortNotAvailable"
+
 // KubernetesIngressStrategy handles Kubernetes Ingress (raw deployment mode)
 type KubernetesIngressStrategy struct {
 	client        client.Client
@@ -56,64 +60,83 @@ func (k *KubernetesIngressStrategy) GetName() string {
 }
 
 func (k *KubernetesIngressStrategy) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) error {
-	var err error
-
 	if !k.ingressConfig.DisableIngressCreation {
-		desired, err := k.builder.BuildIngress(ctx, isvc)
-		var notReady *interfaces.ComponentNotReadyError
-		if errors.As(err, &notReady) {
-			isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
-				Type:    v1beta1.IngressReady,
-				Status:  corev1.ConditionFalse,
-				Reason:  "ComponentNotReady",
-				Message: "Target service not ready for ingress creation",
-			})
-			klog.V(1).InfoS("Component not ready; Ingress not built", "isvc", isvc.Name, "component", notReady.Component)
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("builder error: %w", err)
-		}
-
-		// A builder that hands back no Ingress without saying why broke its
-		// contract; refuse it instead of dereferencing a nil object below.
-		ingress, ok := desired.(*netv1.Ingress)
-		if !ok || ingress == nil {
-			return fmt.Errorf("builder returned %T, expected a non-nil *netv1.Ingress", desired)
-		}
-
-		// reconcile ingress
-		existingIngress := &netv1.Ingress{}
-		err = k.client.Get(ctx, types.NamespacedName{
-			Namespace: isvc.Namespace,
-			Name:      isvc.Name,
-		}, existingIngress)
-		if err != nil {
-			if apierr.IsNotFound(err) {
-				err = k.client.Create(ctx, ingress)
-			} else {
-				return err
-			}
-		} else {
-			if !k.semanticIngressEquals(ingress, existingIngress) {
-				// Set ResourceVersion which is required for update operation
-				ingress.ResourceVersion = existingIngress.ResourceVersion
-				err = k.client.Update(ctx, ingress)
-			}
-		}
-		if err != nil {
+		built, err := k.reconcileIngress(ctx, isvc)
+		if err != nil || !built {
 			return err
 		}
 	}
 
-	// Get the service port
+	// status.url names the target Service's port. A port that cannot be
+	// read yet, because the Service is absent or declares none, leaves the
+	// URL unset and ends the pass with the error so the next pass reads it
+	// again: a URL with a guessed port would name a port no Service declares.
 	servicePort, err := isvcutils.TargetServicePort(ctx, k.client, isvc, irprojector.RoleDeclared(isvc, v1beta1.RouterComponent))
 	if err != nil {
-		klog.Warning("Failed to get target service port, using default", "error", err)
-		servicePort = constants.CommonISVCPort
+		return k.markPortNotAvailable(isvc, err)
+	}
+	return k.setStatusEndpoints(isvc, servicePort)
+}
+
+// markPortNotAvailable writes IngressReady=False with the reason the target
+// Service's port could not be read and hands the error back to the pass.
+func (k *KubernetesIngressStrategy) markPortNotAvailable(isvc *v1beta1.InferenceService, err error) error {
+	isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
+		Type:    v1beta1.IngressReady,
+		Status:  corev1.ConditionFalse,
+		Reason:  TargetServicePortNotAvailable,
+		Message: fmt.Sprintf("target Service port not read: %v", err),
+	})
+	return fmt.Errorf("target service port: %w", err)
+}
+
+// reconcileIngress brings the service's Ingress to the desired spec and
+// reports whether one stands. A Component that cannot back a rule yet writes
+// IngressReady=False and ends the pass without a URL.
+func (k *KubernetesIngressStrategy) reconcileIngress(ctx context.Context, isvc *v1beta1.InferenceService) (bool, error) {
+	desired, err := k.builder.BuildIngress(ctx, isvc)
+	var notReady *interfaces.ComponentNotReadyError
+	if errors.As(err, &notReady) {
+		isvc.Status.SetCondition(v1beta1.IngressReady, &apis.Condition{
+			Type:    v1beta1.IngressReady,
+			Status:  corev1.ConditionFalse,
+			Reason:  "ComponentNotReady",
+			Message: "Target service not ready for ingress creation",
+		})
+		klog.V(1).InfoS("Component not ready; Ingress not built", "isvc", isvc.Name, "component", notReady.Component)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("builder error: %w", err)
 	}
 
-	// Set status URL and Address
+	// A builder that hands back no Ingress without saying why broke its
+	// contract; refuse it instead of dereferencing a nil object below.
+	ingress, ok := desired.(*netv1.Ingress)
+	if !ok || ingress == nil {
+		return false, fmt.Errorf("builder returned %T, expected a non-nil *netv1.Ingress", desired)
+	}
+
+	existing := &netv1.Ingress{}
+	err = k.client.Get(ctx, types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}, existing)
+	switch {
+	case apierr.IsNotFound(err):
+		return true, k.client.Create(ctx, ingress)
+	case err != nil:
+		return false, err
+	}
+	if k.semanticIngressEquals(ingress, existing) {
+		return true, nil
+	}
+	// Set ResourceVersion which is required for update operation
+	ingress.ResourceVersion = existing.ResourceVersion
+	return true, k.client.Update(ctx, ingress)
+}
+
+// setStatusEndpoints writes status.url, the domain name on the target
+// Service's port, and status.address, the in-cluster hostname on that port,
+// then IngressReady=True.
+func (k *KubernetesIngressStrategy) setStatusEndpoints(isvc *v1beta1.InferenceService, servicePort int32) error {
 	serviceHost, err := k.createRawURL(isvc)
 	if err != nil {
 		return err
@@ -147,13 +170,16 @@ func (k *KubernetesIngressStrategy) createRawURL(isvc *v1beta1.InferenceService)
 	return url, nil
 }
 
+// getRawServiceHost is the in-cluster hostname of the Service that fronts
+// the InferenceService: the router's when one is declared, else the engine's
+// ("<isvc>-engine", constants.EngineServiceName, the same name
+// TargetServicePort resolves the port from). The domain suffix comes from
+// ingress.clusterDomain.
 func (k *KubernetesIngressStrategy) getRawServiceHost(isvc *v1beta1.InferenceService) string {
 	if irprojector.RoleDeclared(isvc, v1beta1.RouterComponent) {
-		return constants.RouterServiceName(isvc.Name) + "." + isvc.Namespace + ".svc.cluster.local"
+		return constants.ServiceHostname(constants.RouterServiceName(isvc.Name), isvc.Namespace, k.ingressConfig.ClusterDomain)
 	}
-	// Engine Service is named "<isvc>-engine" (constants.EngineServiceName) —
-	// the same name GetTargetServicePort resolves the port from.
-	return constants.EngineServiceName(isvc.Name) + "." + isvc.Namespace + ".svc.cluster.local"
+	return constants.ServiceHostname(constants.EngineServiceName(isvc.Name), isvc.Namespace, k.ingressConfig.ClusterDomain)
 }
 
 func (k *KubernetesIngressStrategy) semanticIngressEquals(desired, existing *netv1.Ingress) bool {

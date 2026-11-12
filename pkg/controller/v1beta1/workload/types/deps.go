@@ -80,6 +80,12 @@ type Deps struct {
 	// timestamps. nil falls back to the real clock — inject a fake
 	// (k8s.io/utils/clock/testing) for deterministic boundary tests.
 	Clock clock.Clock
+
+	// NodePresence answers whether a Node the pods are bound to still
+	// exists; a pod on a Node that does not is read as gone and its object
+	// removed ahead of every pass. nil reads the Nodes through Client and
+	// confirms a missing one on the live reader (query.NewNodeLookup).
+	NodePresence NodePresence
 }
 
 // RenderHook is the optional adapter-specific render-time mutator.
@@ -100,6 +106,19 @@ func (d *Deps) Reader() client.Reader {
 		return d.APIReader
 	}
 	return d.Client
+}
+
+// NodeReaders are the two readers a Node is read through. Cache costs no
+// API call and may lag, so it only screens. Live decides, so a lagging
+// cache can delay a force-delete but never cause one.
+type NodeReaders struct {
+	Cache ObservationReader
+	Live  AuthoritativeReader
+}
+
+// NodeReaders pairs the cached Client with Reader.
+func (d *Deps) NodeReaders() NodeReaders {
+	return NodeReaders{Cache: d.Client, Live: d.Reader()}
 }
 
 // ExpectationsCache returns the per-controller cache threaded through

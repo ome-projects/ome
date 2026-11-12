@@ -85,11 +85,17 @@ func (t *TestReplicaAgent) Start() error {
 
 // createMockOCIOSDataStore creates a properly initialized OCIOSDataStore for testing
 func createMockOCIOSDataStore() *ociobjectstore.OCIOSDataStore {
+	return createMockOCIOSDataStoreInRegion("us-ashburn-1")
+}
+
+// createMockOCIOSDataStoreInRegion is createMockOCIOSDataStore with the
+// store's configured region chosen by the test.
+func createMockOCIOSDataStoreInRegion(region string) *ociobjectstore.OCIOSDataStore {
 	authType := principals.InstancePrincipal
 	config := &ociobjectstore.Config{
 		Name:     "test-config",
 		AuthType: &authType,
-		Region:   "us-ashburn-1",
+		Region:   region,
 	}
 
 	return &ociobjectstore.OCIOSDataStore{
@@ -122,6 +128,20 @@ func (f *fakeReplicator) Replicate(objects []common.ReplicationObject) error {
 		return f.onReplicate(objects)
 	}
 	return f.err
+}
+
+// ociToOCIConfig is a replica configuration that copies from one OCI object
+// store to another, with each side's URI and store chosen by the test.
+func ociToOCIConfig(source SourceStruct, target TargetStruct) *Config {
+	return &Config{
+		AnotherLogger:        testingPkg.SetupMockLogger(),
+		LocalPath:            "/tmp/replica",
+		DownloadSizeLimitGB:  10,
+		EnableSizeLimitCheck: true,
+		NumConnections:       5,
+		Source:               source,
+		Target:               target,
+	}
 }
 
 func TestNewReplicaAgent(t *testing.T) {
@@ -253,6 +273,55 @@ func TestNewReplicaAgent(t *testing.T) {
 			},
 			expectError: false,
 			description: "Should successfully create agent with PVC source and PVC target",
+		},
+		{
+			name: "source URI names a region other than the source object store's",
+			config: ociToOCIConfig(
+				SourceStruct{StorageURIStr: "oci://src-ns@us-phoenix-1/src-bucket/models", OCIOSDataStore: createMockOCIOSDataStoreInRegion("us-ashburn-1")},
+				TargetStruct{StorageURIStr: "oci://n/tgt-ns/b/tgt-bucket/o/models", OCIOSDataStore: createMockOCIOSDataStore()},
+			),
+			expectError: true,
+			errorMsg:    "the source storage URI oci://src-ns@us-phoenix-1/src-bucket/models names region us-phoenix-1, but the source object store is configured for region us-ashburn-1",
+			description: "Should refuse a source URI whose region is not the source object store's",
+		},
+		{
+			name: "target URI names a region other than the target object store's",
+			config: ociToOCIConfig(
+				SourceStruct{StorageURIStr: "oci://n/src-ns/b/src-bucket/o/models", OCIOSDataStore: createMockOCIOSDataStore()},
+				TargetStruct{StorageURIStr: "oci://tgt-ns@eu-frankfurt-1/tgt-bucket/models", OCIOSDataStore: createMockOCIOSDataStoreInRegion("us-ashburn-1")},
+			),
+			expectError: true,
+			errorMsg:    "the target storage URI oci://tgt-ns@eu-frankfurt-1/tgt-bucket/models names region eu-frankfurt-1, but the target object store is configured for region us-ashburn-1",
+			description: "Should refuse a target URI whose region is not the target object store's",
+		},
+		{
+			name: "source URI names a region while the source object store has none configured",
+			config: ociToOCIConfig(
+				SourceStruct{StorageURIStr: "oci://src-ns@us-phoenix-1/src-bucket/models", OCIOSDataStore: createMockOCIOSDataStoreInRegion("")},
+				TargetStruct{StorageURIStr: "oci://n/tgt-ns/b/tgt-bucket/o/models", OCIOSDataStore: createMockOCIOSDataStore()},
+			),
+			expectError: true,
+			errorMsg:    "the source storage URI oci://src-ns@us-phoenix-1/src-bucket/models names region us-phoenix-1, but the source object store has no configured region",
+			description: "Should refuse a URI region the agent cannot compare with a configured one",
+		},
+		{
+			name: "source URI names the source object store's own region",
+			config: ociToOCIConfig(
+				SourceStruct{StorageURIStr: "oci://src-ns@us-ashburn-1/src-bucket/models", OCIOSDataStore: createMockOCIOSDataStoreInRegion("us-ashburn-1")},
+				TargetStruct{StorageURIStr: "oci://n/tgt-ns/b/tgt-bucket/o/models", OCIOSDataStore: createMockOCIOSDataStore()},
+			),
+			expectError: false,
+			description: "Should accept a source URI whose region is the source object store's",
+		},
+		{
+			name: "source URI names no bucket",
+			config: ociToOCIConfig(
+				SourceStruct{StorageURIStr: "oci://n/src-ns/b//o/models", OCIOSDataStore: createMockOCIOSDataStore()},
+				TargetStruct{StorageURIStr: "oci://n/tgt-ns/b/tgt-bucket/o/models", OCIOSDataStore: createMockOCIOSDataStore()},
+			),
+			expectError: true,
+			errorMsg:    "the OCI storage URI oci://n/src-ns/b//o/models names no bucket",
+			description: "Should refuse a source URI with an empty bucket before any object store call",
 		},
 		{
 			name: "invalid target storage URI",
@@ -1676,4 +1745,17 @@ func newTestAgentForCompletionMarker(t *testing.T) (*ReplicaAgent, func()) {
 			},
 		},
 	}, cleanup
+}
+
+func TestNewReplicaAgentKeepsAURIRegionThatMatchesTheObjectStore(t *testing.T) {
+	agent, err := NewReplicaAgent(ociToOCIConfig(
+		SourceStruct{StorageURIStr: "oci://src-ns@us-ashburn-1/src-bucket/models", OCIOSDataStore: createMockOCIOSDataStoreInRegion("us-ashburn-1")},
+		TargetStruct{StorageURIStr: "oci://n/tgt-ns/b/tgt-bucket/o/models", OCIOSDataStore: createMockOCIOSDataStoreInRegion("us-ashburn-1")},
+	))
+	assert.NoError(t, err)
+	assert.Equal(t, "us-ashburn-1", agent.ReplicationInput.Source.Region)
+	assert.Equal(t, "src-ns", agent.ReplicationInput.Source.Namespace)
+	assert.Equal(t, "src-bucket", agent.ReplicationInput.Source.BucketName)
+	assert.Equal(t, "models/", agent.ReplicationInput.Source.Prefix)
+	assert.Equal(t, "us-ashburn-1", agent.ReplicationInput.Target.Region)
 }

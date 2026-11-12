@@ -5,7 +5,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -36,7 +36,7 @@ func BuildPlan(component types.ComponentType, desired types.WorkloadDesiredSpec,
 	// The plan grows beyond replicas during the surge phase of a
 	// migration; scale-down logic is responsible for picking the right
 	// deletion target after that surge resolves.
-	indices := instancePlanIndices(observed.InstanceStatuses, replicas, observed.RetryBlocks, observed.CordonedInstances)
+	indices := instancePlanIndices(observed.InstanceStatuses, replicas, observed.RetryBlocks, observed.CordonedInstances, observed.RollTarget)
 	// The rows are indexed once here, so each planned Instance finds its
 	// row in one read whatever the fleet's size.
 	observed.IndexRows()
@@ -45,11 +45,12 @@ func BuildPlan(component types.ComponentType, desired types.WorkloadDesiredSpec,
 	layout := types.ComponentPlan{Runners: runners, WorkerSizeByRevision: observed.WorkerSizeByRevision}
 	for i, idx := range indices {
 		// An Instance renders the width its own revision recorded, so a gang
-		// settled on an older revision keeps its layout until the roll takes it.
+		// settled on an older revision keeps its layout until the roll takes it,
+		// and a new Instance the width of the revision it is built on.
 		instances[i] = types.InstancePlan{
 			Index:       idx,
 			Incarnation: incarnationForIndex(&observed, idx),
-			Runners:     layout.RunnersFor(types.InstancePlan{Runners: runners}, renderedRevision(&observed, idx)),
+			Runners:     layout.RunnersFor(types.InstancePlan{Runners: runners}, renderedRevision(desired, &observed, idx)),
 			// Relocation-directive memory: the adapter projects the
 			// per-instance node-exclusion list from the audit ledger;
 			// Render turns it into a required NotIn hostname term so
@@ -87,18 +88,29 @@ func BuildPlan(component types.ComponentType, desired types.WorkloadDesiredSpec,
 
 // renderedRevision names the revision the pods of the row at idx render
 // at: the revision it runs, else the one it converges to, else the one its
-// attempt pinned; a migration's surge marker renders its source's. Empty
-// when no row records one, which renders the roll target.
-func renderedRevision(observed *types.WorkloadObservedState, idx int32) string {
+// attempt names; the row a migration's surge claims renders the revision
+// its operation names (the roll's target, for a move admitted while the
+// roll could take the source), else its source's. A row that records no
+// revision, and an index with no row, render the revision a new Instance
+// is built on, read from the same function the Create pass reads: the
+// stable side of a canary step that holds the Component, else the roll
+// target, which an empty name renders.
+func renderedRevision(desired types.WorkloadDesiredSpec, observed *types.WorkloadObservedState, idx int32) string {
 	row := observed.Instance(idx)
-	if row == nil {
-		return ""
+	if row != nil && migrationSurgeRow(row) {
+		return migrationSurgeRevision(observed, row)
 	}
-	if row.Phase == types.InstancePhaseCreating && row.Operation != nil &&
-		row.Operation.Type == types.InstanceOperationMigrate && row.Operation.SurgeIndex != nil {
-		if source := observed.Instance(*row.Operation.SurgeIndex); source != nil && source.Index != idx {
-			return source.RunningRevision
-		}
+	if rev := recordedRevision(row); rev != "" {
+		return rev
+	}
+	return query.NewInstanceRevision(desired, observed, observed.RollTarget)
+}
+
+// recordedRevision names the revision a row records for its pods: the one
+// it runs, else the one it converges to, else the one its attempt names.
+// Empty for no row and for a row that records none.
+func recordedRevision(row *types.InstanceStatus) string {
+	if row == nil {
 		return ""
 	}
 	if row.RunningRevision != "" {
@@ -109,6 +121,26 @@ func renderedRevision(observed *types.WorkloadObservedState, idx int32) string {
 	}
 	if row.Operation != nil {
 		return row.Operation.TargetRevision
+	}
+	return ""
+}
+
+// migrationSurgeRow reports the row a migration's surge claims: a Creating
+// row whose Migrate operation names the source it moves.
+func migrationSurgeRow(row *types.InstanceStatus) bool {
+	return row.Phase == types.InstancePhaseCreating && row.Operation != nil &&
+		row.Operation.Type == types.InstanceOperationMigrate && row.Operation.SurgeIndex != nil
+}
+
+// migrationSurgeRevision names the revision a migration's surge renders:
+// the one its operation names, else the one its source runs. Empty when
+// the source is gone, which renders the desired width.
+func migrationSurgeRevision(observed *types.WorkloadObservedState, row *types.InstanceStatus) string {
+	if row.Operation.TargetRevision != "" {
+		return row.Operation.TargetRevision
+	}
+	if source := observed.Instance(*row.Operation.SurgeIndex); source != nil && source.Index != row.Index {
+		return source.RunningRevision
 	}
 	return ""
 }
@@ -206,15 +238,17 @@ func MigrationModeOrDefault(p *types.MigrationPolicy) types.MigrationMode {
 // fills no slot. Add: new indexes round a scale-up out, lowest unused
 // first. blocks lists the Component's retry blocks, which the rank reads a
 // row's revision by; cordoned holds the indices with a pod on a cordoned
-// node, which rank below every other row.
+// node, which rank below every other row; rollTarget names the revision
+// the roll converges to, which the rank keeps the rows already on ahead
+// of the rest.
 //
 // A gang surge whose source has failed keeps nothing by itself: the pair
 // competes for the count behind the Ready rows as one unit, the source
 // charged like any steady row and its replacement row following it in or
 // out, so a scale-down retires the two together instead of taking a
 // healthy sibling. The pair counts as cordoned when either half is.
-func instancePlanIndices(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock, cordoned map[int32]struct{}) []int32 {
-	sel := readIndexSelection(instances, replicas, blocks, cordoned)
+func instancePlanIndices(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock, cordoned map[int32]struct{}, rollTarget string) []int32 {
+	sel := readIndexSelection(instances, replicas, blocks, cordoned, rollTarget)
 	sel.keepPairsInFlight()
 	sel.fillCountByRank()
 	sel.addNewIndexes()
@@ -228,7 +262,10 @@ type indexSelection struct {
 	replicas int32
 	// existing lists every recorded index, ascending.
 	existing []int32
-	rows     map[int32]types.InstanceStatus
+	// position is where each recorded index's row sits in the rows, the
+	// last row of an index when two record it; the rows themselves are
+	// read in place and never copied.
+	position map[int32]int
 	rank     map[int32]int
 
 	// pairMembers holds both halves of every surge pair in flight, kept
@@ -250,41 +287,53 @@ type indexSelection struct {
 	charged int32
 }
 
-// readIndexSelection reads the rows once: the indexes they record, the
-// surge pairs in flight and the rank of every row.
-func readIndexSelection(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock, cordoned map[int32]struct{}) *indexSelection {
-	used := existingInstanceIndices(instances)
+// readIndexSelection reads the rows once: where each index's row sits, the
+// surge pairs in flight and the rank of every row. The failed gang surge
+// sources are read once and handed to every reading that excludes them.
+func readIndexSelection(instances []types.InstanceStatus, replicas int32, blocks []types.RetryBlock, cordoned map[int32]struct{}, rollTarget string) *indexSelection {
+	position := rowPositions(instances)
 	sel := &indexSelection{
 		replicas:    replicas,
-		existing:    make([]int32, 0, len(used)),
-		rows:        make(map[int32]types.InstanceStatus, len(instances)),
+		existing:    make([]int32, 0, len(position)),
+		position:    position,
 		rank:        make(map[int32]int, len(instances)),
 		pairMembers: migrationInFlightIndices(instances),
 		pairSources: migrationSourceIndices(instances),
 		retiring:    map[int32]struct{}{},
-		chosen:      make([]int32, 0, len(used)),
-		picked:      map[int32]struct{}{},
+		chosen:      make([]int32, 0, len(position)),
+		picked:      make(map[int32]struct{}, len(position)),
 	}
-	for idx := range used {
+	for idx := range position {
 		sel.existing = append(sel.existing, idx)
 	}
 	slices.Sort(sel.existing)
-	for idx := range updateSurgeInFlightIndices(instances) {
+	unpinned := failedGangSurgeSources(instances, position)
+	for idx := range updateSurgeInFlightIndices(instances, unpinned) {
 		sel.pairMembers[idx] = struct{}{}
 	}
-	for idx := range updateSurgeSourceIndices(instances) {
+	for idx := range updateSurgeSourceIndices(instances, unpinned) {
 		sel.pairSources[idx] = struct{}{}
 	}
-	sel.failedTargetOf, sel.failedSourceOf = failedGangSurgeFollowers(instances)
-	claims := sel.claimReplacements(instances)
-	sel.rankRows(instances, blocks, cordoned)
+	sel.failedTargetOf, sel.failedSourceOf = failedGangSurgeFollowers(instances, unpinned, position)
+	claims := sel.claimReplacements(instances, unpinned)
+	sel.rankRows(instances, blocks, cordoned, rollTarget)
 	sel.releasePromotedSources(instances, claims)
 	return sel
 }
 
+// rowPositions is where each recorded index's row sits in the rows: the
+// last row of an index when two record it.
+func rowPositions(instances []types.InstanceStatus) map[int32]int {
+	position := make(map[int32]int, len(instances))
+	for i := range instances {
+		position[instances[i].Index] = i
+	}
+	return position
+}
+
 // claimsReplacement reports whether the row's attempt claims a replacement
 // index: a migration or an update with a surge index.
-func claimsReplacement(s types.InstanceStatus) bool {
+func claimsReplacement(s *types.InstanceStatus) bool {
 	if s.Operation == nil || s.Operation.SurgeIndex == nil {
 		return false
 	}
@@ -294,13 +343,13 @@ func claimsReplacement(s types.InstanceStatus) bool {
 // claimReplacements counts the sources that claim each replacement index
 // and keeps the replacement of every source that has not failed beside its
 // source. Every claim counts, so an index two sources name promotes
-// neither; a failed source's claim keeps nothing. Whether a source has
-// proof enough to retire is decided after the rows are read
+// neither; a claim of a source in failed keeps nothing. Whether a source
+// has proof enough to retire is decided after the rows are read
 // (releasePromotedSources).
-func (sel *indexSelection) claimReplacements(instances []types.InstanceStatus) map[int32]int {
-	failed := failedGangSurgeSources(instances)
+func (sel *indexSelection) claimReplacements(instances []types.InstanceStatus, failed map[int32]struct{}) map[int32]int {
 	claims := map[int32]int{}
-	for _, s := range instances {
+	for i := range instances {
+		s := &instances[i]
 		if !claimsReplacement(s) {
 			continue
 		}
@@ -313,19 +362,18 @@ func (sel *indexSelection) claimReplacements(instances []types.InstanceStatus) m
 	return claims
 }
 
-// rankRows records every row by its index and ranks it for a scale-down.
-// A failed gang surge pair counts as cordoned when either half has a pod
-// on a cordoned node.
-func (sel *indexSelection) rankRows(instances []types.InstanceStatus, blocks []types.RetryBlock, cordoned map[int32]struct{}) {
-	for _, s := range instances {
-		sel.rows[s.Index] = s
+// rankRows ranks every row for a scale-down. A failed gang surge pair
+// counts as cordoned when either half has a pod on a cordoned node.
+func (sel *indexSelection) rankRows(instances []types.InstanceStatus, blocks []types.RetryBlock, cordoned map[int32]struct{}, rollTarget string) {
+	for i := range instances {
+		s := &instances[i]
 		_, onCordonedNode := cordoned[s.Index]
 		if target, paired := sel.failedTargetOf[s.Index]; paired {
 			if _, targetCordoned := cordoned[target]; targetCordoned {
 				onCordonedNode = true
 			}
 		}
-		sel.rank[s.Index] = scaleDownRank(s, blocks, onCordonedNode)
+		sel.rank[s.Index] = scaleDownRank(s, blocks, onCordonedNode, rollTarget)
 	}
 }
 
@@ -333,13 +381,14 @@ func (sel *indexSelection) rankRows(instances []types.InstanceStatus, blocks []t
 // promoted: the pair keeps neither half any more, and the source is
 // terminal cleanup that fills no slot of the count.
 func (sel *indexSelection) releasePromotedSources(instances []types.InstanceStatus, claims map[int32]int) {
-	for _, s := range instances {
+	for i := range instances {
+		s := &instances[i]
 		if s.Operation == nil || s.Operation.SurgeIndex == nil {
 			continue
 		}
 		target := *s.Operation.SurgeIndex
-		row, found := sel.rows[target]
-		if !found || !replacementPromoted(s, row, claims[target]) {
+		at, found := sel.position[target]
+		if !found || !replacementPromoted(s, &instances[at], claims[target]) {
 			continue
 		}
 		delete(sel.pairMembers, s.Index)
@@ -352,7 +401,7 @@ func (sel *indexSelection) releasePromotedSources(instances []types.InstanceStat
 // replacementPromoted reports whether a source's replacement carries the
 // proof its verb demands: a gang update's drain step and the attempt's
 // recorded revision, a migration's Ready target on the source's revision.
-func replacementPromoted(source, target types.InstanceStatus, claims int) bool {
+func replacementPromoted(source, target *types.InstanceStatus, claims int) bool {
 	if source.Operation.Type == types.InstanceOperationUpdate {
 		return updateHandoffPromoted(source, target, claims)
 	}
@@ -425,8 +474,11 @@ func (sel *indexSelection) choose(idx int32) {
 // lowest first. An index a row records stays taken whether or not the
 // plan keeps the row. Every index below a slot just taken is in use, so
 // the search resumes at that slot and a scale-up of any size pays one
-// pass over the indexes in all.
+// pass over the indexes in all; a count already filled reads none.
 func (sel *indexSelection) addNewIndexes() {
+	if sel.charged >= sel.replicas {
+		return
+	}
 	taken := make(map[int32]struct{}, len(sel.existing))
 	for _, idx := range sel.existing {
 		taken[idx] = struct{}{}
@@ -441,44 +493,86 @@ func (sel *indexSelection) addNewIndexes() {
 }
 
 // scaleDownRank orders the steady rows a scale-down keeps, lowest kept
-// first. A row left Creating with no operation ranks below every other
-// row: nothing drives it and it has never served, so keeping it would
-// retire an Instance whose pod still runs. Among the rest, a row with a
-// pod on a cordoned node ranks below every row without one: its node is
-// being emptied, so keeping it means moving it later, while dropping it
-// frees the node now. Within each half: a serving row on a sound
-// revision, any other row on a sound revision, a serving row on a
-// failing revision, then the rest. A row on a failing revision ranks
-// below every row on a sound one: its Ready is the pause between crashes
-// of a revision the ladder reads as failed, not capacity the Component
-// can keep.
-func scaleDownRank(s types.InstanceStatus, blocks []types.RetryBlock, onCordonedNode bool) int {
+// first. A scale-down removes the Instances the roll has yet to move
+// before the ones it has moved, and never throws a replacement or a
+// rebuild in progress away for an Instance that still owes the same
+// work. A source whose SurgeThenDrain replacement is coming up on a sound
+// revision ranks above every other row: the steady Instance kept in its
+// place still owes a surge and a drain. Then, on a sound revision: a
+// serving row on the roll's target; a row whose rebuild is coming up (the
+// scale-down wave keeps a serving Instance it retires in rotation until
+// that rebuild serves, ops.DeleteBatch, so the Component never serves
+// less through the scale than the roll alone would leave it); a Ready row
+// on the roll's target whose published counts fall short of its pods (the
+// counts trail the pods by a pass after a promotion, and a set broken
+// after it is the repair's); a serving row on any other revision; then
+// the rest. A row on a failing revision ranks below every row on a sound
+// one: its Ready is the pause between crashes of a revision the retry
+// schedule reads as failed, not capacity the Component can keep. A row
+// with a pod on a cordoned node ranks below every row without one: its
+// node is being emptied, so keeping it means moving it later, while
+// dropping it frees the node now; a rebuild coming up keeps its place
+// whatever old set it leaves there. A row left Creating with no operation
+// ranks below every other row: nothing drives it and it has never served,
+// so keeping it would retire an Instance whose pod still runs.
+func scaleDownRank(s *types.InstanceStatus, blocks []types.RetryBlock, onCordonedNode bool, rollTarget string) int {
 	if creatingWithNoOperation(s) {
 		return lowestScaleDownRank
 	}
-	rank := 0
-	if !keepsPreference(s) {
-		rank++
+	failing := types.RowOnFailingRevision(s, blocks)
+	if replacementComingUp(s) && !failing {
+		return 0
 	}
-	if rowOnFailingRevision(s, blocks) {
-		rank += 2
+	onTarget := rollTarget != "" && s.Phase == types.InstancePhaseReady && s.RunningRevision == rollTarget
+	rank := 1
+	switch {
+	case onTarget && keepsPreference(s):
+	case types.RebuildComingUp(s) && !failing:
+		return 2
+	case onTarget:
+		rank = 3
+	case keepsPreference(s):
+		rank = 4
+	default:
+		rank = 5
+	}
+	if failing {
+		rank += 5
 	}
 	if onCordonedNode {
-		rank += 4
+		rank += 10
 	}
 	return rank
 }
 
 // lowestScaleDownRank is the last rank scaleDownRank assigns, the one a
-// row nothing drives takes.
-const lowestScaleDownRank = 8
+// row nothing drives takes; the ranked rows end one below it.
+const lowestScaleDownRank = 21
+
+// replacementComingUp reports whether the row is the source of a
+// SurgeThenDrain update whose replacement is being created, or is up
+// with the old pod set draining: Phase Updating with an Update
+// operation at the Surge or SurgeDrain step. A gang source at those
+// steps is kept through the protected pair, so the rank never decides
+// it; a Failed source, or an attempt its deadline ended, has no
+// replacement coming up.
+func replacementComingUp(s *types.InstanceStatus) bool {
+	if s.Phase != types.InstancePhaseUpdating || s.Operation == nil || s.Operation.Type != types.InstanceOperationUpdate {
+		return false
+	}
+	switch s.Operation.Step {
+	case types.UpdateStepSurge, types.UpdateStepSurgeDrain, types.UpdateStepSurgeDrainSettle:
+		return true
+	}
+	return false
+}
 
 // creatingWithNoOperation reports a row left in phase Creating with no
 // operation: a move's replacement the record's expiry released, or a
 // status write applied in part. No pass owns the shape and no deadline
 // runs on it; it fills the count only when no other row can, and a
 // scale-down retires it first.
-func creatingWithNoOperation(s types.InstanceStatus) bool {
+func creatingWithNoOperation(s *types.InstanceStatus) bool {
 	return s.Phase == types.InstancePhaseCreating && s.Operation == nil
 }
 
@@ -487,43 +581,14 @@ func creatingWithNoOperation(s types.InstanceStatus) bool {
 // rotation. A Ready row that serves fewer pods than it has serves nothing
 // the Component can count on, whatever its phase says. A row with no
 // published pods is read by its phase alone.
-func keepsPreference(s types.InstanceStatus) bool {
+func keepsPreference(s *types.InstanceStatus) bool {
 	if s.Phase != types.InstancePhaseReady {
 		return false
 	}
 	return s.PodCount == 0 || s.ServingPodCount >= s.PodCount
 }
 
-// rowOnFailingRevision reports whether the row stands on a revision the
-// retry ladder reads as failing: the revision its attempt is pinned to,
-// else the one it runs, carries a Held or Backoff RetryBlock — a failed
-// attempt no later attempt has answered — or an attempt in flight that
-// answers a crash this row remembers of its promoted set
-// (types.RemembersCrash). A revision with no block is sound whatever the
-// row's failure record says: that record also names expired migrations
-// and overdue drains, which say nothing about the revision.
-func rowOnFailingRevision(s types.InstanceStatus, blocks []types.RetryBlock) bool {
-	rev := s.TargetRevision
-	if rev == "" {
-		rev = s.RunningRevision
-	}
-	if rev == "" {
-		return false
-	}
-	b := types.FindRetryBlock(blocks, rev)
-	if b == nil {
-		return false
-	}
-	switch b.State {
-	case types.RetryBlockHeld, types.RetryBlockBackoff:
-		return true
-	case types.RetryBlockRetryInProgress:
-		return types.RemembersCrash(&s)
-	}
-	return false
-}
-
-func migrationHandoffPromoted(source, target types.InstanceStatus, targetReferences int) bool {
+func migrationHandoffPromoted(source, target *types.InstanceStatus, targetReferences int) bool {
 	return targetReferences == 1 &&
 		source.Phase == types.InstancePhaseMigrating && source.RunningRevision != "" && source.TargetRevision == "" &&
 		source.Operation != nil && source.Operation.Type == types.InstanceOperationMigrate &&
@@ -533,7 +598,7 @@ func migrationHandoffPromoted(source, target types.InstanceStatus, targetReferen
 		target.RunningRevision == source.RunningRevision && target.TargetRevision == "" && target.Operation == nil
 }
 
-func updateHandoffPromoted(source, target types.InstanceStatus, targetReferences int) bool {
+func updateHandoffPromoted(source, target *types.InstanceStatus, targetReferences int) bool {
 	return targetReferences == 1 &&
 		source.Phase == types.InstancePhaseUpdating && source.RunningRevision != "" && source.TargetRevision != "" &&
 		source.Operation != nil && source.Operation.Type == types.InstanceOperationUpdate &&
@@ -580,9 +645,9 @@ func migrationPinned(s *types.InstanceStatus) bool {
 // replica being relocated.
 func migrationSourceIndices(instances []types.InstanceStatus) map[int32]struct{} {
 	out := map[int32]struct{}{}
-	for _, s := range instances {
-		if s.Phase == types.InstancePhaseMigrating {
-			out[s.Index] = struct{}{}
+	for i := range instances {
+		if instances[i].Phase == types.InstancePhaseMigrating {
+			out[instances[i].Index] = struct{}{}
 		}
 	}
 	return out
@@ -599,17 +664,18 @@ func migrationSourceIndices(instances []types.InstanceStatus) map[int32]struct{}
 // gang surge (new index) from a single-pod surge (ActiveOrdinal toggle,
 // SurgeIndex nil).
 //
-// A target is pinned only while a live source references it. This includes
+// A target is kept only while a live source references it. This includes
 // an occupied target discovered during recovery: the source and occupant
 // remain intact until gangSurgeUpdate can reset the claim. An unreferenced
-// marker is left for the scale-down pipeline to reap. A source that has
-// failed pins nothing, itself included: the failed pair competes for the
-// steady budget as one unit (instancePlanIndices).
-func updateSurgeInFlightIndices(instances []types.InstanceStatus) map[int32]struct{} {
+// surge-target row is left for the scale-down pipeline to reap. A source
+// in unpinned (failedGangSurgeSources) keeps nothing, itself included: the
+// failed pair competes for the steady budget as one unit
+// (instancePlanIndices).
+func updateSurgeInFlightIndices(instances []types.InstanceStatus, unpinned map[int32]struct{}) map[int32]struct{} {
 	out := map[int32]struct{}{}
 	referenced := map[int32]struct{}{}
-	unpinned := failedGangSurgeSources(instances)
-	for _, s := range instances {
+	for i := range instances {
+		s := &instances[i]
 		if s.Operation == nil || s.Operation.Type != types.InstanceOperationUpdate {
 			continue
 		}
@@ -621,22 +687,23 @@ func updateSurgeInFlightIndices(instances []types.InstanceStatus) map[int32]stru
 			referenced[*s.Operation.SurgeIndex] = struct{}{}
 		}
 	}
-	for _, s := range instances {
-		if _, live := referenced[s.Index]; live {
-			out[s.Index] = struct{}{}
+	for i := range instances {
+		if _, live := referenced[instances[i].Index]; live {
+			out[instances[i].Index] = struct{}{}
 		}
 	}
 	return out
 }
 
 // updateSurgeSourceIndices returns the source-side indices of a live gang
-// surge (Op.Type=Update with SurgeIndex set, not Failed). These count
-// toward the steady replica budget — the source IS the user-facing
-// replica being rolled; the surge target is the transient +1.
-func updateSurgeSourceIndices(instances []types.InstanceStatus) map[int32]struct{} {
+// surge (Op.Type=Update with SurgeIndex set, not in unpinned, the failed
+// sources). These count toward the steady replica budget — the source IS
+// the user-facing replica being rolled; the surge target is the transient
+// +1.
+func updateSurgeSourceIndices(instances []types.InstanceStatus, unpinned map[int32]struct{}) map[int32]struct{} {
 	out := map[int32]struct{}{}
-	unpinned := failedGangSurgeSources(instances)
-	for _, s := range instances {
+	for i := range instances {
+		s := &instances[i]
 		if _, failed := unpinned[s.Index]; failed {
 			continue
 		}
@@ -648,26 +715,26 @@ func updateSurgeSourceIndices(instances []types.InstanceStatus) map[int32]struct
 }
 
 // failedGangSurgeSources is the set of gang surge sources whose attempt
-// has failed and whose claim pins nothing: Phase=Failed with the surge
+// has failed and whose claim keeps nothing: Phase=Failed with the surge
 // operation preserved, the shape the escalation leaves for the gang
-// abandon, naming an index that holds the replacement's marker or
-// nothing at all. A failed source whose index is occupied by any other
-// row keeps its pin: source and occupant stay intact until
-// gangSurgeUpdate resets the claim.
-func failedGangSurgeSources(instances []types.InstanceStatus) map[int32]struct{} {
-	byIndex := make(map[int32]*types.InstanceStatus, len(instances))
-	for i := range instances {
-		byIndex[instances[i].Index] = &instances[i]
-	}
-	out := map[int32]struct{}{}
+// abandon, naming an index that holds the replacement's surge-target row
+// or nothing at all. A failed source whose index is occupied by any other
+// row keeps its claim: source and occupant stay intact until
+// gangSurgeUpdate resets the claim. position is where each index's row
+// sits (rowPositions). Nil when no source has failed.
+func failedGangSurgeSources(instances []types.InstanceStatus, position map[int32]int) map[int32]struct{} {
+	var out map[int32]struct{}
 	for i := range instances {
 		s := &instances[i]
 		if s.Phase != types.InstancePhaseFailed || s.Operation == nil ||
 			s.Operation.Type != types.InstanceOperationUpdate || s.Operation.SurgeIndex == nil {
 			continue
 		}
-		if occupant, found := byIndex[*s.Operation.SurgeIndex]; found && !gangSurgeTargetMarker(occupant) {
+		if at, found := position[*s.Operation.SurgeIndex]; found && !gangSurgeTargetMarker(&instances[at]) {
 			continue
+		}
+		if out == nil {
+			out = map[int32]struct{}{}
 		}
 		out[s.Index] = struct{}{}
 	}
@@ -681,39 +748,29 @@ func gangSurgeTargetMarker(s *types.InstanceStatus) bool {
 		(s.Operation.Step == types.UpdateStepGangSurgeTarget || s.Operation.Step == types.UpdateStepGangSurgeTargetCleanup)
 }
 
-// failedGangSurgeFollowers pairs each unpinned failed gang surge source
-// with the marker it still references: markerOf by source index,
-// sourceOf by marker index. A source whose marker is already gone has no
-// follower; a marker claimed by two failed sources follows the first.
-func failedGangSurgeFollowers(instances []types.InstanceStatus) (markerOf, sourceOf map[int32]int32) {
-	markerOf, sourceOf = map[int32]int32{}, map[int32]int32{}
-	unpinned := failedGangSurgeSources(instances)
-	present := existingInstanceIndices(instances)
+// failedGangSurgeFollowers pairs each source in unpinned (the failed gang
+// surge sources) with the surge-target row it still references: targetOf
+// by source index, sourceOf by the replacement's index. A source whose
+// replacement's index no row records (position, rowPositions) has no
+// follower; a replacement two failed sources claim follows the first.
+func failedGangSurgeFollowers(instances []types.InstanceStatus, unpinned map[int32]struct{}, position map[int32]int) (targetOf, sourceOf map[int32]int32) {
+	targetOf, sourceOf = map[int32]int32{}, map[int32]int32{}
 	for i := range instances {
 		s := &instances[i]
 		if _, failed := unpinned[s.Index]; !failed {
 			continue
 		}
-		marker := *s.Operation.SurgeIndex
-		if _, found := present[marker]; !found {
+		target := *s.Operation.SurgeIndex
+		if _, found := position[target]; !found {
 			continue
 		}
-		if _, taken := sourceOf[marker]; taken {
+		if _, taken := sourceOf[target]; taken {
 			continue
 		}
-		markerOf[s.Index] = marker
-		sourceOf[marker] = s.Index
+		targetOf[s.Index] = target
+		sourceOf[target] = s.Index
 	}
-	return markerOf, sourceOf
-}
-
-// existingInstanceIndices returns the set of recorded indices.
-func existingInstanceIndices(instances []types.InstanceStatus) map[int32]struct{} {
-	out := map[int32]struct{}{}
-	for _, s := range instances {
-		out[s.Index] = struct{}{}
-	}
-	return out
+	return targetOf, sourceOf
 }
 
 // lowestUnusedIndex returns the smallest int32 at or above from that is

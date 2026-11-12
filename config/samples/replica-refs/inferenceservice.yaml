@@ -1,0 +1,17 @@
+# A service that fronts the two replicas in standalone-replicas.yaml. It
+# carries no model, no runtime and no inline role: the replicas have their
+# own. OME creates the Services chat-engine and chat-router and the route in
+# front of the replicas' pods, mirrors their counters onto the service's
+# status, and writes nothing on the replicas. Deleting the service leaves the
+# replicas and their pods running.
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: chat
+  namespace: team-a
+spec:
+  replicaRefs:
+    engine:
+      - pool-a
+    router:
+      - router-a

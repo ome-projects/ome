@@ -788,6 +788,7 @@ func addressName(a duckv1.Addressable) string {
 func TestGatewayAPIStrategy_setStatusEndpoints(t *testing.T) {
 	base := func() *controllerconfig.IngressConfig {
 		return &controllerconfig.IngressConfig{
+			ClusterDomain:     "cluster.local",
 			EnableGatewayAPI:  true,
 			IngressDomain:     "int-gw-https.cluster.example",
 			DomainTemplate:    "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
@@ -846,29 +847,46 @@ func TestGatewayAPIStrategy_setStatusEndpoints(t *testing.T) {
 
 func TestGatewayAPIStrategy_GetRawServiceHost(t *testing.T) {
 	tests := []struct {
-		name         string
-		isvc         *v1beta1.InferenceService
-		expectedHost string
+		name          string
+		isvc          *v1beta1.InferenceService
+		clusterDomain string
+		expectedHost  string
 	}{
 		{
-			name:         "with router",
-			isvc:         createTestInferenceServiceWithRouterGateway("test-isvc", "default"),
-			expectedHost: "test-isvc-router.default.svc.cluster.local",
+			name:          "with router",
+			isvc:          createTestInferenceServiceWithRouterGateway("test-isvc", "default"),
+			clusterDomain: "cluster.local",
+			expectedHost:  "test-isvc-router.default.svc.cluster.local",
 		},
 		{
 			// Engine Service is named "<isvc>-engine" (constants.EngineServiceName);
 			// "<isvc>" resolves to no Service.
-			name:         "without router",
-			isvc:         createTestInferenceServiceGateway("test-isvc", "default"),
-			expectedHost: "test-isvc-engine.default.svc.cluster.local",
+			name:          "without router",
+			isvc:          createTestInferenceServiceGateway("test-isvc", "default"),
+			clusterDomain: "cluster.local",
+			expectedHost:  "test-isvc-engine.default.svc.cluster.local",
+		},
+		{
+			// The suffix is the cluster domain the ingress block names, not a
+			// value of the binary's own.
+			name:          "configured cluster domain",
+			isvc:          createTestInferenceServiceGateway("test-isvc", "default"),
+			clusterDomain: "example.org",
+			expectedHost:  "test-isvc-engine.default.svc.example.org",
+		},
+		{
+			name:          "no cluster domain renders the short name",
+			isvc:          createTestInferenceServiceGateway("test-isvc", "default"),
+			clusterDomain: "",
+			expectedHost:  "test-isvc-engine.default",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			strategy := createGatewayAPIStrategy(t)
-			host := strategy.(*GatewayAPIStrategy).getRawServiceHost(tt.isvc)
-			assert.Equal(t, tt.expectedHost, host)
+			strategy := createGatewayAPIStrategy(t).(*GatewayAPIStrategy)
+			strategy.ingressConfig.ClusterDomain = tt.clusterDomain
+			assert.Equal(t, tt.expectedHost, strategy.getRawServiceHost(tt.isvc))
 		})
 	}
 }
@@ -1012,6 +1030,7 @@ func createGatewayAPIStrategy(t *testing.T) interfaces.IngressStrategy {
 		IngressConfig: &controllerconfig.IngressConfig{
 			EnableGatewayAPI:  true,
 			IngressDomain:     "example.com",
+			ClusterDomain:     "cluster.local",
 			OmeIngressGateway: "istio-system/gateway",
 			DomainTemplate:    "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
 			UrlScheme:         "https",
@@ -1042,6 +1061,7 @@ func gatewayTestIngressConfig() *controllerconfig.IngressConfig {
 	return &controllerconfig.IngressConfig{
 		EnableGatewayAPI:  true,
 		IngressDomain:     "example.com",
+		ClusterDomain:     "cluster.local",
 		OmeIngressGateway: "istio-system/gateway",
 		DomainTemplate:    "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
 		UrlScheme:         "https",
@@ -1348,5 +1368,87 @@ func TestGatewayAPIStrategy_CheckBackendTrafficPolicyStatus(t *testing.T) {
 				assert.Contains(t, condition.Message, "BackendTrafficPolicy")
 			}
 		})
+	}
+}
+
+// TestGatewayAPIStrategy_Reconcile_RoutesFollowTrafficTargets holds the
+// data-plane side of a rollout: when a Component's traffic targets change, the
+// routes that already exist are re-rendered with that split as weighted
+// backendRefs on the per-revision Services, and collapse back onto the
+// aggregate Service once the targets are gone.
+func TestGatewayAPIStrategy_Reconcile_RoutesFollowTrafficTargets(t *testing.T) {
+	const (
+		stableRev = "test-isvc-engine-rev-a1b2c3d4"
+		canaryRev = "test-isvc-engine-rev-e5f6a7b8"
+	)
+	isvc := createTestInferenceServiceGateway("test-isvc", "default")
+	setComponentStatusReadyGateway(isvc)
+	setEngineTraffic := func(targets ...v1beta1.ComponentTrafficTarget) {
+		if isvc.Status.Components == nil {
+			isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
+		}
+		cs := isvc.Status.Components[v1beta1.EngineComponent]
+		cs.Traffic = targets
+		isvc.Status.Components[v1beta1.EngineComponent] = cs
+	}
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	require.NoError(t, gatewayapiv1.Install(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	routes := []client.Object{
+		createReadyHTTPRoute(constants.EngineServiceName(isvc.Name), isvc.Namespace),
+		createReadyHTTPRoute(isvc.Name, isvc.Namespace),
+	}
+	makeHTTPRouteSpecsCurrent(t, isvc, gatewayTestIngressConfig(), routes)
+	c := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(routes...).Build()
+	strategy := createGatewayAPIStrategyWithClient(t, c)
+
+	type backend struct {
+		name   string
+		weight *int32
+	}
+	backendsOf := func(name string) []backend {
+		route := &gatewayapiv1.HTTPRoute{}
+		require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: isvc.Namespace}, route))
+		require.Len(t, route.Spec.Rules, 1)
+		out := make([]backend, 0, len(route.Spec.Rules[0].BackendRefs))
+		for _, ref := range route.Spec.Rules[0].BackendRefs {
+			out = append(out, backend{name: string(ref.Name), weight: ref.Weight})
+		}
+		return out
+	}
+	weight := func(w int32) *int32 { return &w }
+
+	require.NoError(t, strategy.Reconcile(context.Background(), isvc))
+	assert.Equal(t, []backend{{name: "test-isvc-engine"}}, backendsOf("test-isvc-engine"),
+		"premise: with no targets the route backs onto the aggregate Service")
+	assert.Equal(t, corev1.ConditionTrue, isvc.Status.GetCondition(v1beta1.IngressReady).Status,
+		"premise: the accepted routes are current")
+
+	setEngineTraffic(
+		v1beta1.ComponentTrafficTarget{RevisionName: stableRev, Percent: 90},
+		v1beta1.ComponentTrafficTarget{RevisionName: canaryRev, Percent: 10, LatestRevision: true},
+	)
+	require.NoError(t, strategy.Reconcile(context.Background(), isvc))
+	for _, name := range []string{"test-isvc-engine", "test-isvc"} {
+		assert.Equal(t, []backend{{name: stableRev, weight: weight(90)}, {name: canaryRev, weight: weight(10)}},
+			backendsOf(name), "%s must carry the step's split", name)
+	}
+	assert.Equal(t, corev1.ConditionFalse, isvc.Status.GetCondition(v1beta1.IngressReady).Status,
+		"a reprogrammed route is not ready until its gateway accepts the new generation")
+
+	setEngineTraffic(v1beta1.ComponentTrafficTarget{RevisionName: canaryRev, Percent: 100, LatestRevision: true})
+	require.NoError(t, strategy.Reconcile(context.Background(), isvc))
+	for _, name := range []string{"test-isvc-engine", "test-isvc"} {
+		assert.Equal(t, []backend{{name: canaryRev, weight: weight(100)}}, backendsOf(name),
+			"%s must follow the cutover", name)
+	}
+
+	setEngineTraffic()
+	require.NoError(t, strategy.Reconcile(context.Background(), isvc))
+	for _, name := range []string{"test-isvc-engine", "test-isvc"} {
+		assert.Equal(t, []backend{{name: "test-isvc-engine"}}, backendsOf(name),
+			"%s must return to the aggregate Service once no targets are published", name)
 	}
 }

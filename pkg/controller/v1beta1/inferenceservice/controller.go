@@ -63,9 +63,9 @@ import (
 	isvcstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus/crdskew"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
-	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 	"sigs.k8s.io/ome/pkg/render"
 	"sigs.k8s.io/ome/pkg/rollout"
@@ -151,14 +151,13 @@ type InferenceServiceReconciler struct {
 	// the operator-configured ColumnarV2 row bound. The zero value carries no
 	// bound: DenseV1 decodes unchanged and any ColumnarV2 object fails closed.
 	InstanceStatusDecoder irstatus.Decoder
-	// Expectations is the OMENative create/delete bookkeeping cache.
-	// SetupWithManager initializes it (if nil) and registers the Pod
-	// event handler against the same instance the component builders
-	// receive.
-	Expectations *workloadtypes.Expectations
-	Log          logr.Logger
-	Scheme       *runtime.Scheme
-	Recorder     record.EventRecorder
+	// CRDSchema is the manager's picture of the installed CRDs against this
+	// release's schema, written on every service as the CRDSchemaCurrent
+	// condition; nil when nothing compared them.
+	CRDSchema *crdskew.Report
+	Log       logr.Logger
+	Scheme    *runtime.Scheme
+	Recorder  record.EventRecorder
 	// Clock measures spec.ttlSecondsAfterCreation. Nil means the real clock.
 	Clock           clock.PassiveClock
 	RuntimeSelector runtimeselector.Selector
@@ -171,15 +170,6 @@ type InferenceServiceReconciler struct {
 	// active translator is selected by traffic/factory.New based on
 	// installed Gateway-implementation CRDs.
 	TrafficReconciler *traffic.Reconciler
-	// GangSchedulingAvailable is the cluster-discovery boolean — true
-	// when the scheduler-plugins `scheduling.x-k8s.io/v1alpha1/PodGroup`
-	// CRD is installed at controller startup. Threaded through the
-	// component builder factory to OMENative's reconciler so the gang-
-	// scheduling code path runs only when the CRD is actually present.
-	// When false, multi-pod OMENative Instances still create pods but
-	// the controller stamps a `GangSchedulingUnavailable=True`
-	// Component condition.
-	GangSchedulingAvailable bool
 	// QuotaAcceleratorResources are the resource names whose presence in a
 	// Component's pods puts it under the quota backend (--accelerator-resources).
 	// A Component requesting none of them is projected without the Kueue
@@ -297,6 +287,10 @@ type servicePass struct {
 	// componentRunnerPorts is the port each Component serves on; the
 	// per-revision Services of the rollout layers publish it.
 	componentRunnerPorts map[v1beta1.ComponentType][]v1.ContainerPort
+	// componentServicePortAppProtocols is the appProtocol each Component
+	// declares per Service port name. The per-revision Services of the
+	// rollout layers publish it the way the stable Service does.
+	componentServicePortAppProtocols map[v1beta1.ComponentType]map[string]string
 
 	scalingPolicy   *v1beta1.ScalingPolicy
 	scalingSource   string
@@ -325,8 +319,17 @@ type servicePass struct {
 	// effect has landed.
 	canaryConsume []string
 	// resolvedIngressConfig is the ingress config with the service's
-	// annotation overrides applied; set on a settled pass.
+	// annotation overrides applied; set by the route render.
 	resolvedIngressConfig *controllerconfig.IngressConfig
+	// hadTrafficTargets says whether the service entered the pass with
+	// traffic targets published; with the state after the flush, it decides
+	// whether the routes are rendered before a requeue.
+	hadTrafficTargets bool
+	// componentWriteErr is the first write a component reconciler could not
+	// make this pass. The pass still runs the steps that only read the
+	// world (the coordination pass, the status flush with its route render),
+	// skips the steps that build on this pass's projections, and returns it.
+	componentWriteErr error
 }
 
 // passStep is one step of a pass. It reports whether the pass goes on; a
@@ -345,6 +348,7 @@ func (p *servicePass) run(ctx context.Context) (ctrl.Result, error) {
 		p.finishDeletion,
 		p.serveVirtualDeployment,
 		p.prepareStatus,
+		p.reportCRDSchema,
 		p.loadServiceConfig,
 		p.frontReferencedReplicas,
 		p.reconcileModelConfig,
@@ -364,10 +368,10 @@ func (p *servicePass) run(ctx context.Context) (ctrl.Result, error) {
 		p.buildComponentReconcilers,
 		p.chooseIngressMode,
 		p.runComponentReconcilers,
-		p.removeReplacedBackendObjects,
-		p.runScalingCoordinator,
-		p.dispatchCanaryGroups,
-		p.releaseUndeclaredUnits,
+		p.unlessAComponentWriteFailed(p.removeReplacedBackendObjects),
+		p.unlessAComponentWriteFailed(p.runScalingCoordinator),
+		p.unlessAComponentWriteFailed(p.dispatchCanaryGroups),
+		p.unlessAComponentWriteFailed(p.releaseUndeclaredUnits),
 		p.reconcileCoordination,
 		p.flushRequeueingPass,
 		p.reconcileIngress,
@@ -377,7 +381,23 @@ func (p *servicePass) run(ctx context.Context) (ctrl.Result, error) {
 		p.cleanupUndeclaredComponents,
 		p.flushSettledPass,
 	})
+	if err == nil && p.componentWriteErr != nil {
+		// The refused write is the pass's result: the controller retries it
+		// with backoff, with the traffic and the status of this pass landed.
+		return ctrl.Result{}, p.componentWriteErr
+	}
 	return requeueBy(p.result, err, p.requeueNoLaterThan), err
+}
+
+// unlessAComponentWriteFailed runs step only on a pass in which every
+// component write landed; step builds on the projections of this pass.
+func (p *servicePass) unlessAComponentWriteFailed(step passStep) passStep {
+	return func(ctx context.Context) (bool, error) {
+		if p.componentWriteErr != nil {
+			return true, nil
+		}
+		return step(ctx)
+	}
 }
 
 // runPassSteps runs the steps in order and reports whether every one let
@@ -540,6 +560,7 @@ func (p *servicePass) serveVirtualDeployment(ctx context.Context) (bool, error) 
 // copy, and gives the component status writers their map.
 func (p *servicePass) prepareStatus(context.Context) (bool, error) {
 	p.base = canary.NewBase(p.isvc)
+	p.hadTrafficTargets = publishesTrafficTargets(p.isvc)
 	if p.isvc.Status.Components == nil {
 		p.isvc.Status.Components = make(map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec)
 	}
@@ -571,7 +592,7 @@ func (p *servicePass) frontReferencedReplicas(ctx context.Context) (bool, error)
 // reconcileModelConfig writes the mounted model configuration of a local
 // service. A placement member's waits for the member rules.
 func (p *servicePass) reconcileModelConfig(ctx context.Context) (bool, error) {
-	p.modelConfig = multimodelconfig.NewModelConfigReconciler(p.reconciler.Client, p.reconciler.Clientset, p.reconciler.Scheme)
+	p.modelConfig = multimodelconfig.NewModelConfigReconciler(p.reconciler.Client, p.reconciler.Scheme, p.reconciler.Recorder)
 	if p.placementMember {
 		return true, nil
 	}
@@ -618,7 +639,7 @@ func (p *servicePass) buildPolicyResolver(context.Context) (bool, error) {
 func (p *servicePass) resolveModel(ctx context.Context) (bool, error) {
 	p.in = render.Inputs{Service: p.isvc, Client: p.reconciler.Client, Runtimes: p.reconciler.RuntimeSelector, Accelerators: p.reconciler.AcceleratorClassSelector, Config: p.isvcConfig, Log: p.reconciler.Log}
 	var err error
-	p.in.Model, p.in.ModelMeta, p.in.ModelStatus, err = render.ResolveModel(ctx, p.in)
+	p.in.Model, p.in.ModelMeta, err = render.ResolveModel(ctx, p.in)
 	if err != nil {
 		var notReady *render.ModelNotReadyError
 		if errors.As(err, &notReady) {
@@ -711,6 +732,7 @@ func (p *servicePass) resolveRuntime(ctx context.Context) (bool, error) {
 		p.log.Info("Auto-selected runtime", "runtime", resolved.RuntimeName, "model", p.isvc.Spec.Model.Name)
 	}
 	p.componentRunnerPorts = isvcutils.MergedRunnerPorts(resolved.Specs)
+	p.componentServicePortAppProtocols = isvcutils.MergedServicePortAppProtocols(resolved.Specs)
 	return true, nil
 }
 
@@ -821,13 +843,22 @@ func (p *servicePass) reconcileRolloutRun(ctx context.Context) (bool, error) {
 	for name := range p.metricProviders {
 		bound[name] = struct{}{}
 	}
+	// The route provider this service's traffic intent targets is the
+	// ingress config with the service's own ingress annotations applied,
+	// the same resolution the route render and the admission webhook use.
+	routeConfig, err := controllerconfig.NewIngressConfigCached(p.reconciler.ConfigCache, p.reconciler.Clientset)
+	if err != nil {
+		return false, errors.Wrapf(err, "fails to create IngressConfig")
+	}
 	outcome, err := rolloutrun.Reconcile(ctx, rolloutrun.Inputs{
-		Client:         p.reconciler.Client,
-		Reader:         p.reconciler.APIReader,
-		Recorder:       p.reconciler.Recorder,
-		ISVC:           p.isvc,
-		FeatureEnabled: p.reconciler.RolloutPolicyEnabled,
-		BoundProviders: bound,
+		Client:                   p.reconciler.Client,
+		Reader:                   p.reconciler.APIReader,
+		Recorder:                 p.reconciler.Recorder,
+		ISVC:                     p.isvc,
+		FeatureEnabled:           p.reconciler.RolloutPolicyEnabled,
+		BoundProviders:           bound,
+		RouteCapabilities:        isvcutils.ResolveIngressConfig(routeConfig, p.isvc.Annotations).RouteCapabilities(),
+		ComponentDeploymentModes: p.resolved.Modes,
 	})
 	if err != nil {
 		p.log.Error(err, "Failed to reconcile rollout run")
@@ -848,7 +879,8 @@ func (p *servicePass) bindCanaryToOpenedRun(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	for _, group := range rollout.CanaryGroups(p.isvc, p.policies) {
-		if err := canary.BindRun(ctx, p.reconciler.Client, p.isvc, group, p.runOutcome.Adopted); err != nil {
+		open := canary.RunOpen{Adopted: p.runOutcome.Adopted, Closed: p.runOutcome.Closed}
+		if err := canary.BindRun(ctx, p.reconciler.Client, p.isvc, group, open); err != nil {
 			p.log.Error(err, "Failed to bind canary state to the rollout run")
 			return false, errors.Wrapf(err, "fails to bind canary state to the rollout run")
 		}
@@ -860,14 +892,15 @@ func (p *servicePass) bindCanaryToOpenedRun(ctx context.Context) (bool, error) {
 // closed or re-recorded a run. The recorded plan steers the update gates
 // and the partition; a later step that failed would otherwise drop it from
 // memory, reopen the run on the next pass and move the projected spec under
-// the executors. A pass that read a stale canary record decides nothing
-// further: the flush kept the live record, and the next pass decides from
-// it.
+// the executors. The coordination step has not run yet, so the write keeps
+// the live group entries. A pass that read a stale canary record decides
+// nothing further: the flush kept the live record, and the next pass
+// decides from it.
 func (p *servicePass) flushRunBoundary(context.Context) (bool, error) {
 	if p.runOutcome == nil || !p.runOutcome.StateChanged {
 		return true, nil
 	}
-	if err := p.reconciler.updateStatus(p.isvc, p.deploymentMode, p.base); err != nil {
+	if err := p.reconciler.FlushRunBoundary(p.isvc, p.deploymentMode, p.base); err != nil {
 		p.reconciler.Recorder.Event(p.isvc, v1.EventTypeWarning, "InternalError", err.Error())
 		return false, err
 	}
@@ -946,11 +979,16 @@ func (p *servicePass) buildComponentReconcilers(ctx context.Context) (bool, erro
 // inputsFor is one role's per-pass inputs: its render piece, the policy
 // resolver, the canary's partition resolver, which sizes the current step's
 // hold against the count the projector writes so the partition and the
-// replica count describe the same fleet, the follower flag and the count the
-// scaling coordinator resolved for the role.
+// replica count describe the same fleet, the follower flag, the count the
+// scaling coordinator resolved for the role, whether the role stopped
+// following and keeps its count, and the stable revision the role's canary
+// unit keeps a side on, so a replica created under a rollback, a step or a
+// stop comes up on that revision.
 func (p *servicePass) inputsFor(piece *render.Piece, component v1beta1.ComponentType) components.ComponentInputs {
-	return componentInputs(piece, p.policyResolver, canary.PartitionResolver(p.isvc, p.policies, component), p.follows(component),
-		p.scalingTargets.Replicas(component))
+	in := componentInputs(piece, p.policyResolver, canary.PartitionResolver(p.isvc, p.policies, component), p.follows(component),
+		p.scalingTargets.Replicas(component), p.scalingTargets.Released(component))
+	in.RollbackToRevision = canary.StableSideTarget(p.isvc, p.policies, component)
+	return in
 }
 
 // chooseIngressMode takes the ingress deployment mode from the router, else
@@ -970,12 +1008,16 @@ func (p *servicePass) chooseIngressMode(context.Context) (bool, error) {
 }
 
 // runComponentReconcilers runs the component reconcilers in order. The
-// first error ends the pass. A failure is often a write the apiserver
-// rejects, which only a change to the service fixes, so it is recorded as
-// an event on the service; a conflict is retried at once and gets no event,
-// and an error of a pass the manager's shutdown stopped gets neither event
-// nor error log. A requeue request does not end the pass, because the
-// rollout layers must run on every pass; the soonest request is kept.
+// first error ends the loop and becomes the pass's result, but not the
+// pass: the replica controllers drain and build pods on their own clock,
+// so the per-revision Services, the traffic weights and the status must
+// follow the pods on this pass as on any other. A failure is often a write
+// the apiserver rejects, which only a change to the service fixes, so it is
+// recorded as an event on the service; a conflict is retried at once and
+// gets no event, and an error of a pass the manager's shutdown stopped ends
+// the pass with neither event nor error log. A requeue request does not
+// end the loop, because the rollout layers must run on every pass; the
+// soonest request is kept.
 func (p *servicePass) runComponentReconcilers(ctx context.Context) (bool, error) {
 	for _, reconciler := range p.reconcilers {
 		result, err := reconciler.Reconcile(ctx, p.isvc)
@@ -990,7 +1032,9 @@ func (p *servicePass) runComponentReconcilers(ctx context.Context) (bool, error)
 			}
 			p.log.Error(err, "Failed to reconcile component",
 				"component", fmt.Sprintf("%T", reconciler))
-			return p.end(result, err)
+			p.componentWriteErr = err
+			p.pendingRequeue.Requeue = true
+			return true, nil
 		}
 		p.pendingRequeue = SoonestRequeue(p.pendingRequeue, result)
 	}
@@ -1073,6 +1117,9 @@ func (p *servicePass) canaryDispatchDeps(group *v1beta1.RolloutGroup, analysisCo
 		ComponentRunnerPorts:     p.componentRunnerPorts,
 		Policies:                 p.policies,
 		Group:                    group,
+		Base:                     p.base,
+		// Same declarations as the stable Service, so both Services agree.
+		ComponentServicePortAppProtocols: p.componentServicePortAppProtocols,
 	}
 	if p.rolloutConfig != nil {
 		deps.DefaultReadyTimeout = p.rolloutConfig.DefaultReadyTimeout
@@ -1115,6 +1162,8 @@ func (p *servicePass) reconcileCoordination(ctx context.Context) (bool, error) {
 		DefaultRatioTolerancePercent: coordinationConfig.DefaultRatioTolerancePercent,
 		ComponentDeploymentModes:     p.resolved.Modes,
 		ComponentRunnerPorts:         p.componentRunnerPorts,
+		// Same declarations as the stable Service, so both Services agree.
+		ComponentServicePortAppProtocols: p.componentServicePortAppProtocols,
 	}); err != nil {
 		p.log.Error(err, "Failed to reconcile cross-Component coordination")
 		return false, errors.Wrapf(err, "fails to reconcile coordination")
@@ -1127,8 +1176,14 @@ func (p *servicePass) reconcileCoordination(ctx context.Context) (bool, error) {
 // service and writes the status, so the Component conditions the rollout
 // layers gate on and the coordination's traffic entries land on every pass;
 // a projection that only ran on settled passes would stay stale while the
-// held rollout kept requeueing. Ingress, the external Service and traffic wait
-// for a settled pass. A stale canary record adds an immediate requeue.
+// held rollout kept requeueing. The external Service and traffic wait for a
+// settled pass. A stale canary record adds an immediate requeue.
+//
+// A service whose Components publish traffic targets renders its routes on
+// this path too, after the flush: a rollout moves its targets on requeueing
+// passes, and the flush is what decides whether this pass's targets stand or
+// the live record is kept, so the routes read status once that is settled.
+// The conditions the render sets ride the next pass that reaches the tail.
 func (p *servicePass) flushRequeueingPass(ctx context.Context) (bool, error) {
 	requeueing := p.pendingRequeue.Requeue || p.pendingRequeue.RequeueAfter > 0
 	if !requeueing {
@@ -1145,12 +1200,20 @@ func (p *servicePass) flushRequeueingPass(ctx context.Context) (bool, error) {
 	if p.base.Stale() {
 		p.pendingRequeue.Requeue = true
 	}
+	if p.hadTrafficTargets || publishesTrafficTargets(p.isvc) {
+		if _, err := p.reconcileIngress(ctx); err != nil {
+			return false, err
+		}
+	}
 	return p.end(p.pendingRequeue, nil)
 }
 
-// reconcileIngress runs on a settled pass, once the Components have created
-// their Services: it loads the ingress config, applies the service's
-// annotation overrides and reconciles the route for the ingress mode.
+// reconcileIngress renders the routes OME owns for the service from its
+// status: the Components that can back a route, and the traffic targets each
+// one's rollout engine publishes. It runs on a settled pass, once the
+// Components have created their Services, and before a requeue when the
+// service publishes traffic targets: it loads the ingress config, applies the
+// service's annotation overrides and reconciles the route for the ingress mode.
 func (p *servicePass) reconcileIngress(ctx context.Context) (bool, error) {
 	ingressConfig, err := controllerconfig.NewIngressConfigCached(p.reconciler.ConfigCache, p.reconciler.Clientset)
 	if err != nil {
@@ -1221,30 +1284,32 @@ func (p *servicePass) setURLWhenIngressDisabled(ctx context.Context) (bool, erro
 	return true, nil
 }
 
-// cleanupUndeclaredComponents removes the objects and the status entry of a
-// Component the spec no longer declares. A failed object removal does not
-// end the pass, so the status flush still lands; it is logged as an error so
-// a lasting permission failure is visible.
+// cleanupUndeclaredComponents removes the objects, the status entry and the
+// ready condition of a Component the spec no longer declares, so the Component
+// stops gating the service's Ready. A failed object removal does not end the
+// pass, so the status flush still lands; it is logged as an error so a lasting
+// permission failure is visible.
 func (p *servicePass) cleanupUndeclaredComponents(ctx context.Context) (bool, error) {
 	specs := p.resolved.Specs
 	if err := p.reconciler.cleanupRemovedComponents(ctx, p.isvc, specs); err != nil {
 		p.log.Error(err, "Failed to cleanup removed components")
-	}
-	if p.isvc.Status.Components == nil {
-		return true, nil
 	}
 	p.log.V(1).Info("Cleaning up component status",
 		"mergedEngine", specs.Engine != nil,
 		"mergedDecoder", specs.Decoder != nil,
 		"mergedRouter", specs.Router != nil,
 		"statusComponents", len(p.isvc.Status.Components))
-	for _, c := range v1beta1.RoleTypes() {
-		if specs.View(c) != nil {
+	for _, role := range v1beta1.Roles {
+		if specs.View(role.Type) != nil {
 			continue
 		}
-		if _, present := p.isvc.Status.Components[c]; present {
-			delete(p.isvc.Status.Components, c)
-			p.log.Info(fmt.Sprintf("Deleted %s from status", c))
+		// The engine's condition always gates Ready and stays.
+		if role.Type != v1beta1.EngineComponent {
+			p.isvc.Status.RemoveCondition(role.ReadyCondition)
+		}
+		if _, present := p.isvc.Status.Components[role.Type]; present {
+			delete(p.isvc.Status.Components, role.Type)
+			p.log.Info(fmt.Sprintf("Deleted %s from status", role.Type))
 		}
 	}
 	return true, nil
@@ -1273,10 +1338,22 @@ func (p *servicePass) flushSettledPass(ctx context.Context) (bool, error) {
 	return p.end(ctrl.Result{}, nil)
 }
 
+// publishesTrafficTargets reports whether any Component of the service
+// carries traffic targets on its status. The routes of such a service follow
+// the targets, so they are rendered on every pass and not only on the tail.
+func publishesTrafficTargets(isvc *v1beta1.InferenceService) bool {
+	for _, cs := range isvc.Status.Components {
+		if len(cs.Traffic) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // componentInputs carries one role's render inputs, with the reconcile's
 // policy resolver, the role's canary partition and the count the scaling
 // coordinator resolved for it, into its component reconciler.
-func componentInputs(p *render.Piece, policies *autoscaler.PolicyResolver, partition irprojector.PartitionResolver, follower bool, target *int32) components.ComponentInputs {
+func componentInputs(p *render.Piece, policies *autoscaler.PolicyResolver, partition irprojector.PartitionResolver, follower bool, target *int32, released bool) components.ComponentInputs {
 	return components.ComponentInputs{
 		DeploymentMode:       p.DeploymentMode,
 		BaseModel:            p.BaseModel,
@@ -1290,6 +1367,7 @@ func componentInputs(p *render.Piece, policies *autoscaler.PolicyResolver, parti
 		PolicyResolver:       policies,
 		CoordinatorFollower:  follower,
 		CoordinatorTarget:    target,
+		FollowerReleased:     released,
 		PacingPartition:      partition,
 	}
 }
@@ -1401,7 +1479,7 @@ func (r *InferenceServiceReconciler) handleVirtualDeployment(ctx context.Context
 		Message:            "InferenceService is in VirtualDeployment mode",
 	}})
 
-	if err := r.updateStatus(isvc, constants.VirtualDeployment, nil); err != nil {
+	if err := r.updateStatus(isvc, constants.VirtualDeployment, nil, groupEntriesFromCache); err != nil {
 		// A terminal status conflict is benign — requeue and re-reconcile
 		// off fresh state instead of surfacing an ERROR-level failure.
 		if apierrors.IsConflict(err) {
@@ -1435,17 +1513,17 @@ func (r *InferenceServiceReconciler) markRuntimeUnresolved(isvc *v1beta1.Inferen
 		Reason:  "RuntimeNotFound",
 		Message: cause.Error(),
 	})
-	if err := r.updateStatus(isvc, deploymentMode, nil); err != nil {
+	if err := r.updateStatus(isvc, deploymentMode, nil, groupEntriesFromCache); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
 }
 
 // holdEncoderModes reports a service with an encoder whose roles do not all
-// resolve to OMENative and changes nothing else. EncoderReady is not part of
-// the aggregate Ready, so a serving service stays Ready on its running pods.
-// The status is persisted and the reconcile returns without an error; an edit
-// of the service or its runtime starts the next pass.
+// resolve to OMENative and changes nothing else: EncoderReady reads False
+// naming the role, and Ready follows it. The status is persisted and the
+// reconcile returns without an error; an edit of the service or its runtime
+// starts the next pass.
 func (r *InferenceServiceReconciler) holdEncoderModes(isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, cause error) (reconcile.Result, error) {
 	r.Recorder.Event(isvc, v1.EventTypeWarning, validation.ReasonEncoderRequiresOMENative, cause.Error())
 	isvc.Status.SetCondition(v1beta1.EncoderReady, &knapis.Condition{
@@ -1454,7 +1532,7 @@ func (r *InferenceServiceReconciler) holdEncoderModes(isvc *v1beta1.InferenceSer
 		Reason:  validation.ReasonEncoderRequiresOMENative,
 		Message: cause.Error(),
 	})
-	if err := r.updateStatus(isvc, deploymentMode, nil); err != nil {
+	if err := r.updateStatus(isvc, deploymentMode, nil, groupEntriesFromCache); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
@@ -1483,7 +1561,7 @@ func (r *InferenceServiceReconciler) clearRuntimeUnresolved(isvc *v1beta1.Infere
 // rather than re-applied. It is the pass's flush; the replay driver enters
 // it with the pass's own base and verbs.
 func (r *InferenceServiceReconciler) FlushStatusThenConsume(ctx context.Context, isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, consume []string, base *canary.Base) error {
-	if err := r.updateStatus(isvc, deploymentMode, base); err != nil {
+	if err := r.updateStatus(isvc, deploymentMode, base, groupEntriesComputed); err != nil {
 		return err
 	}
 	// Decisions made from a stale record were not written, so the verbs they
@@ -1498,7 +1576,33 @@ func (r *InferenceServiceReconciler) FlushStatusThenConsume(ctx context.Context,
 	return nil
 }
 
-func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, base *canary.Base) error {
+// FlushRunBoundary writes the status at the run boundary: as soon as the
+// run layer opened, closed or re-recorded a run, before the pass's
+// coordination step. The group entries the pass carries at that point are
+// its cached copy's, so the write keeps the live ones. The replay driver
+// enters it at the same point of its pass.
+func (r *InferenceServiceReconciler) FlushRunBoundary(isvc *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, base *canary.Base) error {
+	return r.updateStatus(isvc, deploymentMode, base, groupEntriesFromCache)
+}
+
+// groupEntries says what a status write carries for the coordination group
+// entries, status.rolloutCoordination and the RolloutCoordinationReady
+// condition. The pass computes them in its coordination step. A write made
+// before that step carries them as the pass's cached copy held them, which
+// is never newer than the live object (the cache trails the previous pass's
+// write, never leads it), so such a write keeps the live entries.
+type groupEntries int
+
+const (
+	// groupEntriesComputed marks a write after the coordination step: the
+	// entries are the pass's own.
+	groupEntriesComputed groupEntries = iota
+	// groupEntriesFromCache marks a write before the coordination step: the
+	// live entries are kept and the pass's copy reads them from then on.
+	groupEntriesFromCache
+)
+
+func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.InferenceService, deploymentMode constants.DeploymentModeType, base *canary.Base, entries groupEntries) error {
 	namespacedName := types.NamespacedName{Name: desiredService.Name, Namespace: desiredService.Namespace}
 
 	// Mirror the existing-status snapshot OUTSIDE the retry loop —
@@ -1557,69 +1661,88 @@ func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.Infere
 			return err
 		}
 		preWriteReady = latest.Status.GetCondition(knapis.ConditionReady)
-		preserved := preserveLifecycleStatus(latest.Status.Components)
-		// Snapshot the live run state before the overwrite: the rollout
-		// run's pinned plan must never move BACKWARD under a writer that
-		// reconciled from a stale cache (a rolled-back pin is unrecoverable
-		// — its repin verb was one-shot). The reconciler doesn't own that
-		// subtree any more than it owns Lifecycle when another pass's write
-		// is newer.
-		liveRollout := latest.Status.Rollout.DeepCopy()
-		// Any unit holding pre-step is enough: the hold exists so a repin
-		// cannot raise traffic before the operator sees the new ladder, and
-		// that is true whichever unit armed it.
-		livePreStepHold := false
-		for _, cs := range latest.Status.Components {
-			if cs.Canary != nil && cs.Canary.PreStepHold {
-				livePreStepHold = true
-				break
-			}
-		}
-		if !livePreStepHold && latest.Status.Canary != nil {
-			livePreStepHold = latest.Status.Canary.PreStepHold
-		}
-		// The canary executor's record is guarded like the run pin: a pass
-		// that read a stale copy keeps the live record, phase and traffic,
-		// re-synced into its working copy so nothing after this write
-		// decides from the stale one.
-		base.PreserveFresh(&desiredService.Status, &latest.Status)
-		latest.Status = desiredService.Status
-		mergeLifecycleStatus(&latest.Status, preserved)
-		rolloutrun.PreserveNewerRun(&latest.Status, liveRollout, livePreStepHold)
+		mergeStatusOverLive(desiredService, latest, base, entries)
 		if err := r.Status().Update(context.TODO(), latest); err != nil {
 			return err
 		}
 		base.Advance(&latest.Status)
 		return nil
 	}); err != nil {
-		// Same race as the top-of-function Get: if the ISVC vanished
-		// during the retry loop, there's nothing to update — drop the
-		// work item silently. Only log + retry on other errors.
-		if apierrors.IsNotFound(err) {
-			obsmetrics.RecordStatusUpdate(obsmetrics.ControllerISVC, obsmetrics.ResultNotFound)
-			return nil
-		}
-		// Exhausted RetryOnConflict still surfaces a Conflict error —
-		// bucket it separately so the OMENative 409 churn hotspot stays
-		// visible apart from other write failures.
-		if apierrors.IsConflict(err) {
-			obsmetrics.RecordStatusUpdate(obsmetrics.ControllerISVC, obsmetrics.ResultConflict)
-			// Benign: a concurrent writer bumped the ISVC. The next
-			// reconcile re-reads fresh state, so log at V(1) and surface the
-			// conflict for the caller to map to a requeue rather than an
-			// ERROR-level "Reconciler error".
-			r.Log.V(1).Info("InferenceService status write lost an optimistic-lock race; requeueing",
-				"InferenceService", desiredService.Name)
-			return errors.Wrapf(err, "fails to update InferenceService status")
-		}
-		obsmetrics.RecordStatusUpdate(obsmetrics.ControllerISVC, obsmetrics.ResultError)
-		r.Log.Error(err, "Failed to update InferenceService status", "InferenceService", desiredService.Name)
-		r.Recorder.Eventf(desiredService, v1.EventTypeWarning, "UpdateFailed",
-			"Failed to update status for InferenceService %q: %v", desiredService.Name, err)
-		return errors.Wrapf(err, "fails to update InferenceService status")
+		return r.recordStatusWriteFailure(desiredService, err)
 	}
 	obsmetrics.RecordStatusUpdate(obsmetrics.ControllerISVC, obsmetrics.ResultSuccess)
+	r.recordReadinessChange(desiredService, wasReady, preWriteReady)
+	return nil
+}
 
+// mergeStatusOverLive puts the pass's status onto the live object the
+// flush is about to write, keeping what the pass does not own or has not
+// computed: each Component's lifecycle, a newer run record, a newer canary
+// record and, for a write made before the coordination step, the group
+// entries.
+func mergeStatusOverLive(desiredService, latest *v1beta1.InferenceService, base *canary.Base, entries groupEntries) {
+	preserved := preserveLifecycleStatus(latest.Status.Components)
+	// Snapshot the live run state before the overwrite: the rollout
+	// run's pinned plan must never move BACKWARD under a writer that
+	// reconciled from a stale cache (a rolled-back pin is unrecoverable
+	// — its repin verb was one-shot). The reconciler doesn't own that
+	// subtree any more than it owns Lifecycle when another pass's write
+	// is newer.
+	liveRollout := latest.Status.Rollout.DeepCopy()
+	// The group entries and their readiness condition as the live object
+	// holds them: a phase the pass computed again keeps the instants the
+	// live entry records for it.
+	liveEntries := coordination.SnapshotLiveGroupEntries(&latest.Status)
+	livePreStepHold := preStepHoldOf(&latest.Status)
+	// The canary executor's record is guarded like the run pin: a pass
+	// that read a stale copy keeps the live record, phase and traffic,
+	// re-synced into its working copy so nothing after this write
+	// decides from the stale one.
+	base.PreserveFresh(&desiredService.Status, &latest.Status)
+	if entries == groupEntriesFromCache {
+		coordination.KeepLiveEntries(&desiredService.Status, &latest.Status)
+	}
+	latest.Status = desiredService.Status
+	mergeLifecycleStatus(&latest.Status, preserved)
+	rolloutrun.PreserveNewerRun(&latest.Status, liveRollout, livePreStepHold)
+	liveEntries.KeepPhaseTimes(&latest.Status)
+}
+
+// recordStatusWriteFailure counts a failed status write by its kind and
+// says what the caller returns: nothing for a service that vanished, the
+// conflict for a lost optimistic-lock race the next pass retries, and the
+// error, logged and recorded as an event, for anything else.
+func (r *InferenceServiceReconciler) recordStatusWriteFailure(desiredService *v1beta1.InferenceService, err error) error {
+	// Same race as the top-of-function Get: if the ISVC vanished
+	// during the retry loop, there's nothing to update — drop the
+	// work item silently. Only log + retry on other errors.
+	if apierrors.IsNotFound(err) {
+		obsmetrics.RecordStatusUpdate(obsmetrics.ControllerISVC, obsmetrics.ResultNotFound)
+		return nil
+	}
+	// Exhausted RetryOnConflict still surfaces a Conflict error —
+	// bucket it separately so the OMENative 409 churn hotspot stays
+	// visible apart from other write failures.
+	if apierrors.IsConflict(err) {
+		obsmetrics.RecordStatusUpdate(obsmetrics.ControllerISVC, obsmetrics.ResultConflict)
+		// Benign: a concurrent writer bumped the ISVC. The next
+		// reconcile re-reads fresh state, so log at V(1) and surface the
+		// conflict for the caller to map to a requeue rather than an
+		// ERROR-level "Reconciler error".
+		r.Log.V(1).Info("InferenceService status write lost an optimistic-lock race; requeueing",
+			"InferenceService", desiredService.Name)
+		return errors.Wrapf(err, "fails to update InferenceService status")
+	}
+	obsmetrics.RecordStatusUpdate(obsmetrics.ControllerISVC, obsmetrics.ResultError)
+	r.Log.Error(err, "Failed to update InferenceService status", "InferenceService", desiredService.Name)
+	r.Recorder.Eventf(desiredService, v1.EventTypeWarning, "UpdateFailed",
+		"Failed to update status for InferenceService %q: %v", desiredService.Name, err)
+	return errors.Wrapf(err, "fails to update InferenceService status")
+}
+
+// recordReadinessChange fires the Ready and NotReady events and the
+// time-to-ready sample after a status write that flipped readiness.
+func (r *InferenceServiceReconciler) recordReadinessChange(desiredService *v1beta1.InferenceService, wasReady bool, preWriteReady *knapis.Condition) {
 	// Ready / NotReady transition events fire only after a successful
 	// status write that actually flipped readiness.
 	isReady := inferenceServiceReadiness(desiredService.Status)
@@ -1633,7 +1756,18 @@ func (r *InferenceServiceReconciler) updateStatus(desiredService *v1beta1.Infere
 		r.Recorder.Eventf(desiredService, v1.EventTypeNormal, string(InferenceServiceReadyState),
 			"InferenceService [%v] is Ready", desiredService.GetName())
 	}
-	return nil
+}
+
+// preStepHoldOf reports whether any canary unit of the status holds its
+// pre-step: the hold exists so a replaced plan cannot raise traffic before
+// the operator sees it, and that is true whichever unit set it.
+func preStepHoldOf(status *v1beta1.InferenceServiceStatus) bool {
+	for _, cs := range status.Components {
+		if cs.Canary != nil && cs.Canary.PreStepHold {
+			return true
+		}
+	}
+	return status.Canary != nil && status.Canary.PreStepHold
 }
 
 func inferenceServiceReadiness(status v1beta1.InferenceServiceStatus) bool {
@@ -1708,27 +1842,20 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := r.validateWiring(); err != nil {
 		return err
 	}
-	if r.Expectations == nil {
-		r.Expectations = workloadtypes.NewExpectations()
-	}
 	// scheduler-plugins PodGroup detection. Optional CRD; absence is a
-	// degradation surface, not a hard fail. The component builders receive
-	// the cached flag; the workload engine stamps a
-	// `GangSchedulingUnavailable=True` Component Condition when a multi-pod
-	// Component is requested without the CRD.
+	// degradation surface, not a hard fail: the PodGroup watch below is
+	// registered only when the CRD is present. The InferenceReplica
+	// controller runs its own detection for the gang-scheduling path.
 	podGroupFound, err := utils.IsCrdAvailable(r.ClientConfig, schedulingv1alpha1.SchemeGroupVersion.String(), constants.PodGroupKind)
 	if err != nil {
 		return err
 	}
-	r.GangSchedulingAvailable = podGroupFound
 	r.componentDeps = &components.ComponentDeps{
 		Client:                    r.Client,
 		Clientset:                 r.Clientset,
 		APIReader:                 r.APIReader,
-		Expectations:              r.Expectations,
 		Recorder:                  r.Recorder,
 		Scheme:                    r.Scheme,
-		GangSchedulingAvailable:   r.GangSchedulingAvailable,
 		QuotaAcceleratorResources: r.QuotaAcceleratorResources,
 	}
 	// Short-TTL cache for the inferenceservice-config ConfigMap so a reconcile
@@ -1743,7 +1870,7 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// fan out to referencing ISVCs through the cache index instead of
 	// scanning every cached InferenceService — see
 	// isvcsReferencingRuntime.
-	if err := registerISVCRuntimeNameIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
+	if err := RegisterRuntimeIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		return err
 	}
 
@@ -1872,7 +1999,7 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.AutoscalerPolicyEnabled {
 		// One field index carries every distinct per-component ref name, so a
 		// policy event fans out to exactly its same-namespace consumers.
-		if err := mgr.GetFieldIndexer().IndexField(context.TODO(), &v1beta1.InferenceService{}, autoscalerPolicyRefIndexField, autoscalerPolicyRefIndexer); err != nil {
+		if err := RegisterAutoscalerPolicyIndex(context.TODO(), mgr.GetFieldIndexer()); err != nil {
 			return err
 		}
 		ctrlBuilder = ctrlBuilder.Watches(&v1beta1.AutoscalerPolicy{}, handler.EnqueueRequestsFromMapFunc(r.mapAutoscalerPolicyToInferenceServices))
@@ -1885,7 +2012,7 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// policy-to-consumers fan-out (a parked plan recovers watch-driven
 		// when its policy appears) and the status controller's attached-group
 		// accounting.
-		if err := mgr.GetFieldIndexer().IndexField(context.TODO(), &v1beta1.InferenceService{}, rolloutpolicycontroller.PolicyRefIndexField, rolloutpolicycontroller.PolicyRefIndexer); err != nil {
+		if err := RegisterRolloutPolicyIndex(context.TODO(), mgr.GetFieldIndexer()); err != nil {
 			return err
 		}
 		ctrlBuilder = ctrlBuilder.Watches(&v1beta1.RolloutPolicy{}, handler.EnqueueRequestsFromMapFunc(r.mapRolloutPolicyToInferenceServices))
@@ -1986,7 +2113,7 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // change event lists every cached InferenceService and scans for those
 // referencing the runtime; with it MatchingFields narrows the list to
 // the referencing ISVCs in O(matched). Registered on the manager cache
-// in SetupWithManager (see registerISVCRuntimeNameIndex).
+// in SetupWithManager (see RegisterRuntimeIndexes).
 //
 // The field name is an internal index identifier (a code constant), not
 // a behavioral/user-facing value — no config surface is required.
@@ -2035,12 +2162,12 @@ func isvcRuntimeUnresolvedIndexExtractor(obj client.Object) []string {
 	return []string{isvcRuntimeUnresolvedIndexValue}
 }
 
-// registerISVCRuntimeNameIndex installs the runtime fan-out indexes on the
-// supplied indexer (mgr.GetFieldIndexer()). Call once during manager
-// setup, before Start, so isvcsReferencingRuntime resolves
-// referencing ISVCs through the indexes instead of scanning every cached
-// InferenceService.
-func registerISVCRuntimeNameIndex(ctx context.Context, indexer client.FieldIndexer) error {
+// RegisterRuntimeIndexes installs the runtime fan-out indexes: the name of
+// the runtime an InferenceService references, and the services whose runtime
+// is not resolved. It runs before the cache starts, so isvcsReferencingRuntime
+// resolves referencing services through the indexes instead of scanning every
+// cached InferenceService.
+func RegisterRuntimeIndexes(ctx context.Context, indexer client.FieldIndexer) error {
 	if err := indexer.IndexField(ctx, &v1beta1.InferenceService{}, isvcRuntimeNameIndexField, isvcRuntimeNameIndexExtractor); err != nil {
 		return err
 	}
@@ -2241,10 +2368,8 @@ func (r *InferenceServiceReconciler) buildComponentDeps(cfg *controllerconfig.In
 			Client:                    r.Client,
 			Clientset:                 r.Clientset,
 			APIReader:                 r.APIReader,
-			Expectations:              r.Expectations,
 			Recorder:                  r.Recorder,
 			Scheme:                    r.Scheme,
-			GangSchedulingAvailable:   r.GangSchedulingAvailable,
 			QuotaAcceleratorResources: r.QuotaAcceleratorResources,
 			Config:                    cfg,
 		}
@@ -2289,6 +2414,19 @@ func (r *InferenceServiceReconciler) mapRolloutPolicyToInferenceServices(ctx con
 // AutoscalerPolicy names their components reference, powering the
 // policy-to-consumers watch fan-out and the attached-component accounting.
 const autoscalerPolicyRefIndexField = "spec.autoscalerPolicyRefs"
+
+// RegisterAutoscalerPolicyIndex installs the index that lists the
+// InferenceServices referencing an AutoscalerPolicy by its name.
+func RegisterAutoscalerPolicyIndex(ctx context.Context, indexer client.FieldIndexer) error {
+	return indexer.IndexField(ctx, &v1beta1.InferenceService{}, autoscalerPolicyRefIndexField, autoscalerPolicyRefIndexer)
+}
+
+// RegisterRolloutPolicyIndex installs the index that lists the
+// InferenceServices whose rollout groups reference a RolloutPolicy by its
+// name.
+func RegisterRolloutPolicyIndex(ctx context.Context, indexer client.FieldIndexer) error {
+	return indexer.IndexField(ctx, &v1beta1.InferenceService{}, rolloutpolicycontroller.PolicyRefIndexField, rolloutpolicycontroller.PolicyRefIndexer)
+}
 
 func autoscalerPolicyRefIndexer(obj client.Object) []string {
 	isvc, ok := obj.(*v1beta1.InferenceService)

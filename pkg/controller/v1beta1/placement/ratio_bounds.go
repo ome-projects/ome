@@ -27,10 +27,10 @@ func usesRatioForm(source *v1beta1.InferenceService) bool {
 // accepted plan gives replicas, by their max ratios, and returns the named
 // member's part. A secondary component without max ratios of its own uses the
 // primary's. A member the plan gives no replicas or no max ratio, or a
-// component without maxReplicas, gets its share. A part below the share is raised to the share,
-// and raised reports by how much, so the members' maximums never cut into the
-// fleet minimum. shares are the member's planned minimums, one per bounded
-// component.
+// component without maxReplicas, gets its share. A part below the share is
+// raised to the share, and raised reports by how much, so the members'
+// maximums never cut into the fleet minimum. shares are the member's planned
+// minimums, one per bounded component.
 func ratioCeilings(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement, shares []v1beta1.PlacementComponentFloor) (ceilings map[v1beta1.ComponentType]int32, raised map[v1beta1.ComponentType]int32, err error) {
 	if member.Cluster == "" || member.Allocation == nil {
 		return nil, nil, fmt.Errorf("split member maximums require an identified allocation")
@@ -39,6 +39,25 @@ func ratioCeilings(source *v1beta1.InferenceService, candidates []v1beta1.Candid
 	if err != nil {
 		return nil, nil, err
 	}
+	allocations := allocationsByCluster(candidates, member)
+	divider := ceilingDivider{source: source, member: member, primary: minimums.primary, allocations: allocations, weights: splitWeightsOf(source, allocations)}
+	ceilings, raised = map[v1beta1.ComponentType]int32{}, map[v1beta1.ComponentType]int32{}
+	for _, share := range shares {
+		ceiling, raise, err := divider.ceiling(share)
+		if err != nil {
+			return nil, nil, err
+		}
+		ceilings[share.Component] = ceiling
+		if raise > 0 {
+			raised[share.Component] = raise
+		}
+	}
+	return ceilings, raised, nil
+}
+
+// allocationsByCluster indexes the identified candidates' allocations by
+// cluster; the member's own allocation is authoritative for its cluster.
+func allocationsByCluster(candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement) map[string]v1beta1.CandidateAllocationStatus {
 	allocations := map[string]v1beta1.CandidateAllocationStatus{}
 	for _, candidate := range candidates {
 		if candidate.Allocation != nil && candidate.Cluster != "" {
@@ -46,41 +65,60 @@ func ratioCeilings(source *v1beta1.InferenceService, candidates []v1beta1.Candid
 		}
 	}
 	allocations[member.Cluster] = *member.Allocation
-	weights := splitWeightsOf(source, allocations)
-	ceilings, raised = map[v1beta1.ComponentType]int32{}, map[v1beta1.ComponentType]int32{}
-	for _, share := range shares {
-		component := share.Component
-		total := componentMaxReplicas(source, component)
-		maxWeights := weights.maxComponents[component]
-		if component == minimums.primary || len(maxWeights) == 0 {
-			maxWeights = weights.maxPrimary
-		}
-		assigned := map[string]int64{}
-		for name, weight := range maxWeights {
-			if allocations[name].DesiredReplicas > 0 {
-				assigned[name] = weight
-			}
-		}
-		if _, recorded := assigned[member.Cluster]; total <= 0 || member.Allocation.DesiredReplicas <= 0 || !recorded {
-			ceilings[component] = share.Replicas
-			continue
-		}
-		plan, err := allocation.Apportion(total, assigned, 0)
-		if err != nil {
-			return nil, nil, err
-		}
-		if plan.Unassigned > 0 {
-			// No assigned cluster has a positive max ratio to divide by.
-			ceilings[component] = share.Replicas
-			continue
-		}
-		part := plan.Targets[member.Cluster]
-		if part < share.Replicas {
-			raised[component] = share.Replicas - part
-		}
-		ceilings[component] = max(part, share.Replicas)
+	return allocations
+}
+
+// ceilingDivider divides a source's component maximums over a plan's
+// allocations for one member, by the max ratios the allocations record.
+type ceilingDivider struct {
+	source      *v1beta1.InferenceService
+	member      v1beta1.CandidatePlacement
+	primary     v1beta1.ComponentType
+	allocations map[string]v1beta1.CandidateAllocationStatus
+	weights     splitWeights
+}
+
+// ceiling is the member's part of one component's maxReplicas, raised to the
+// member's share of the minimum, and the amount it was raised by. The share
+// alone is the ceiling when the source declares no maximum, the member or
+// its cluster holds no replicas or no max ratio, or no cluster with replicas
+// has a positive max ratio to divide by.
+func (d ceilingDivider) ceiling(share v1beta1.PlacementComponentFloor) (ceiling, raised int32, err error) {
+	total := componentMaxReplicas(d.source, share.Component)
+	assigned := d.assignedMaxWeights(share.Component)
+	if _, recorded := assigned[d.member.Cluster]; total <= 0 || d.member.Allocation.DesiredReplicas <= 0 || !recorded {
+		return share.Replicas, 0, nil
 	}
-	return ceilings, raised, nil
+	plan, err := allocation.Apportion(total, assigned, 0)
+	if err != nil {
+		return 0, 0, err
+	}
+	if plan.Unassigned > 0 {
+		return share.Replicas, 0, nil
+	}
+	part := plan.Targets[d.member.Cluster]
+	if part < share.Replicas {
+		return share.Replicas, share.Replicas - part, nil
+	}
+	return part, 0, nil
+}
+
+// assignedMaxWeights are the max ratios the component is divided by, kept
+// for the clusters the plan gives replicas: the component's own max ratios,
+// or the primary's for the primary component and for a component without
+// any of its own.
+func (d ceilingDivider) assignedMaxWeights(component v1beta1.ComponentType) map[string]int64 {
+	maxWeights := d.weights.maxComponents[component]
+	if component == d.primary || len(maxWeights) == 0 {
+		maxWeights = d.weights.maxPrimary
+	}
+	assigned := map[string]int64{}
+	for name, weight := range maxWeights {
+		if d.allocations[name].DesiredReplicas > 0 {
+			assigned[name] = weight
+		}
+	}
+	return assigned
 }
 
 // componentMaxReplicas reads a component's maxReplicas from the source, or 0.
@@ -97,17 +135,23 @@ func componentMaxReplicas(source *v1beta1.InferenceService, component v1beta1.Co
 	return int32(min(max(declared, 0), math.MaxInt32))
 }
 
-// componentMinReplicas reads a component's minReplicas from the source, or 0.
-func componentMinReplicas(source *v1beta1.InferenceService, component v1beta1.ComponentType) int32 {
-	var declared *int
+// declaredMinimum is the minReplicas the source declares for a component it
+// declares, or nil.
+func declaredMinimum(source *v1beta1.InferenceService, component v1beta1.ComponentType) *int {
 	switch {
 	case component == v1beta1.EngineComponent && source.Spec.Engine != nil:
-		declared = source.Spec.Engine.MinReplicas
+		return source.Spec.Engine.MinReplicas
 	case component == v1beta1.DecoderComponent && source.Spec.Decoder != nil:
-		declared = source.Spec.Decoder.MinReplicas
+		return source.Spec.Decoder.MinReplicas
 	case component == v1beta1.RouterComponent && source.Spec.Router != nil:
-		declared = source.Spec.Router.MinReplicas
+		return source.Spec.Router.MinReplicas
 	}
+	return nil
+}
+
+// componentMinReplicas reads a component's minReplicas from the source, or 0.
+func componentMinReplicas(source *v1beta1.InferenceService, component v1beta1.ComponentType) int32 {
+	declared := declaredMinimum(source, component)
 	if declared == nil {
 		return 0
 	}
@@ -145,21 +189,8 @@ func splitCeilingRaisedNotes(source *v1beta1.InferenceService) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
-	var candidates []v1beta1.CandidatePlacement
-	for _, candidate := range source.Status.Placement.Candidates {
-		if candidate.Allocation == nil || candidate.Cluster == "" {
-			continue
-		}
-		settled := *candidate.Allocation.DeepCopy()
-		settled.CurrentReplicas = settled.DesiredReplicas
-		candidates = append(candidates, v1beta1.CandidatePlacement{Cluster: candidate.Cluster, Allocation: &settled})
-	}
-	type raise struct {
-		cluster  string
-		from, to int32
-	}
-	totals := map[v1beta1.ComponentType]int64{}
-	raisedOn := map[v1beta1.ComponentType][]raise{}
+	candidates := settledStatusCandidates(source.Status.Placement.Candidates)
+	raises := ceilingRaises{totals: map[v1beta1.ComponentType]int64{}, byComponent: map[v1beta1.ComponentType][]ceilingRaise{}}
 	for _, member := range candidates {
 		if member.Allocation.DesiredReplicas <= 0 {
 			continue
@@ -172,24 +203,63 @@ func splitCeilingRaisedNotes(source *v1beta1.InferenceService) ([]string, error)
 		if err != nil {
 			return nil, err
 		}
-		for component, ceiling := range ceilings {
-			totals[component] += int64(ceiling)
+		raises.add(member.Cluster, ceilings, raised)
+	}
+	return raises.notes(source), nil
+}
+
+// settledStatusCandidates copies the identified candidates with every member at its
+// desired share, where the plan settles.
+func settledStatusCandidates(candidates []v1beta1.CandidatePlacement) []v1beta1.CandidatePlacement {
+	var settled []v1beta1.CandidatePlacement
+	for _, candidate := range candidates {
+		if candidate.Allocation == nil || candidate.Cluster == "" {
+			continue
 		}
-		for component, amount := range raised {
-			if amount > 0 {
-				raisedOn[component] = append(raisedOn[component], raise{cluster: member.Cluster, from: ceilings[component] - amount, to: ceilings[component]})
-			}
+		allocation := *candidate.Allocation.DeepCopy()
+		allocation.CurrentReplicas = allocation.DesiredReplicas
+		settled = append(settled, v1beta1.CandidatePlacement{Cluster: candidate.Cluster, Allocation: &allocation})
+	}
+	return settled
+}
+
+// ceilingRaise is one member's maxReplicas raised to its minReplicas.
+type ceilingRaise struct {
+	cluster  string
+	from, to int32
+}
+
+// ceilingRaises collects, per component, what the members' maxReplicas add
+// up to and which of them were raised.
+type ceilingRaises struct {
+	totals      map[v1beta1.ComponentType]int64
+	byComponent map[v1beta1.ComponentType][]ceilingRaise
+}
+
+// add records one member's ceilings and the raises among them.
+func (r ceilingRaises) add(cluster string, ceilings, raised map[v1beta1.ComponentType]int32) {
+	for component, ceiling := range ceilings {
+		r.totals[component] += int64(ceiling)
+	}
+	for component, amount := range raised {
+		if amount > 0 {
+			r.byComponent[component] = append(r.byComponent[component], ceilingRaise{cluster: cluster, from: ceilings[component] - amount, to: ceilings[component]})
 		}
 	}
+}
+
+// notes describes every raise, components in order and clusters by name,
+// each with how far the members' maximums exceed the source's.
+func (r ceilingRaises) notes(source *v1beta1.InferenceService) []string {
 	var notes []string
-	for _, component := range slices.Sorted(maps.Keys(raisedOn)) {
-		raises := raisedOn[component]
-		slices.SortFunc(raises, func(a, b raise) int { return strings.Compare(a.cluster, b.cluster) })
+	for _, component := range slices.Sorted(maps.Keys(r.byComponent)) {
+		raises := r.byComponent[component]
+		slices.SortFunc(raises, func(a, b ceilingRaise) int { return strings.Compare(a.cluster, b.cluster) })
 		declared := componentMaxReplicas(source, component)
-		for _, r := range raises {
+		for _, raise := range raises {
 			notes = append(notes, fmt.Sprintf("%s maxReplicas on cluster %s raised from %d to its minReplicas %d; the members' maxReplicas add up to %d, %d more than the service's maxReplicas %d",
-				component, r.cluster, r.from, r.to, totals[component], totals[component]-int64(declared), declared))
+				component, raise.cluster, raise.from, raise.to, r.totals[component], r.totals[component]-int64(declared), declared))
 		}
 	}
-	return notes, nil
+	return notes
 }

@@ -19,7 +19,7 @@ func TestValidatePlacementIntent_SplitMaxPerCluster(t *testing.T) {
 		return `{"spec":{` + components + `,"placement":{"policy":"ClusterAffinity",` + selection + `,"split":` + split + `}}}`
 	}
 	pdr := `"engine":{},"decoder":{},"router":{"minReplicas":2}`
-	engineOnly := `"mode":"Split","clusterAffinity":[{"weights":{"engine":1},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]`
+	engineOnly := `"mode":"Split","clusterAffinity":[{"weights":{"engine":{"min":1}},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]`
 	for _, tt := range []struct {
 		name, payload, wantErr string
 	}{
@@ -36,16 +36,20 @@ func TestValidatePlacementIntent_SplitMaxPerCluster(t *testing.T) {
 			wantErr: "spec.placement.split.maxPerCluster.router names a component the service does not declare",
 		},
 		{
-			name:    "a router cap is rejected when weights keep the full router policy",
+			name:    "a cap beside weights is rejected, because weights replace the split block",
 			payload: service(pdr, `{"maxPerCluster":{"router":4}}`, engineOnly),
-			wantErr: "spec.placement.split.maxPerCluster.router applies only when Split divides the routers",
+			wantErr: "clusterAffinity weights are allowed only in Split and replace spec.placement.split; remove split",
 		},
 		{
 			name:    "a router cap is rejected in SplitByCapacity, which never divides the routers",
 			payload: service(pdr, `{"maxPerCluster":{"router":4}}`, `"mode":"SplitByCapacity"`),
 			wantErr: "spec.placement.split.maxPerCluster.router applies only when Split divides the routers",
 		},
-		{name: "default is valid when the routers are not divided", payload: service(pdr, `{"maxPerCluster":{"default":4}}`, engineOnly)},
+		{
+			name:    "a default cap beside weights is rejected",
+			payload: service(pdr, `{"maxPerCluster":{"default":4}}`, engineOnly),
+			wantErr: "remove split",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := &v1beta1.InferenceService{}

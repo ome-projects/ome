@@ -81,8 +81,7 @@ func TestResolveIngressConfig(t *testing.T) {
 		{
 			name: "boolean overrides",
 			annotations: map[string]string{
-				constants.IngressDisableIstioVirtualHost: "true",
-				constants.IngressDisableCreation:         "true",
+				constants.IngressDisableCreation: "true",
 			},
 			expected: &controllerconfig.IngressConfig{
 				IngressGateway:         "istio-system/ingress-gateway",
@@ -112,13 +111,12 @@ func TestResolveIngressConfig(t *testing.T) {
 		{
 			name: "comprehensive override",
 			annotations: map[string]string{
-				constants.IngressDomainTemplate:          "{{ .Name }}-prod.company.com",
-				constants.IngressDomain:                  "company.com",
-				constants.IngressURLScheme:               "https",
-				constants.IngressPathTemplate:            "/ml/{{ .Name }}",
-				constants.IngressAdditionalDomains:       "backup.com,mirror.net",
-				constants.IngressDisableIstioVirtualHost: "false",
-				constants.IngressDisableCreation:         "false",
+				constants.IngressDomainTemplate:    "{{ .Name }}-prod.company.com",
+				constants.IngressDomain:            "company.com",
+				constants.IngressURLScheme:         "https",
+				constants.IngressPathTemplate:      "/ml/{{ .Name }}",
+				constants.IngressAdditionalDomains: "backup.com,mirror.net",
+				constants.IngressDisableCreation:   "false",
 			},
 			expected: &controllerconfig.IngressConfig{
 				IngressGateway:           "istio-system/ingress-gateway",

@@ -21,9 +21,9 @@ func TestAssignGangDomain_AssignedAndNoFit_CountsEachResult(t *testing.T) {
 	}
 	pod := gpuPod("4")
 
-	pinnedBefore := counterValue(t, gangAssignmentTotal.WithLabelValues("pinned"))
+	assignedBefore := counterValue(t, gangAssignmentTotal.WithLabelValues("pinned"))
 	g.assignGangDomain(newCycleState(), nodes, gangInfo{key: "team/pf", minMember: 2, topologyKey: testKey}, pod)
-	if d := counterValue(t, gangAssignmentTotal.WithLabelValues("pinned")) - pinnedBefore; d != 1 {
+	if d := counterValue(t, gangAssignmentTotal.WithLabelValues("pinned")) - assignedBefore; d != 1 {
 		t.Fatalf("pinned counter delta = %v, want 1", d)
 	}
 	if v := gaugeValue(t, assignedGroups); v < 1 {

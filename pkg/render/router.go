@@ -43,7 +43,7 @@ func RouterPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Route
 		}
 	}
 	// Merge the runner container into the pod spec.
-	podSpec, err := (&PodSpecReconciler{Log: p.Log}).ReconcilePodSpec(isvc, objectMeta, &spec.PodSpec, spec.Runner)
+	podSpec, err := (&PodSpecReconciler{}).ReconcilePodSpec(isvc, objectMeta, &spec.PodSpec, spec.Runner)
 	if err != nil {
 		return nil, err
 	}

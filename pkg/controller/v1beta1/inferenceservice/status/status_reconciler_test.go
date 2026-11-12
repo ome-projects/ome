@@ -443,17 +443,13 @@ func TestPropagateModelStatus(t *testing.T) {
 	tests := []struct {
 		name          string
 		status        *v1beta1.InferenceServiceStatus
-		statusSpec    v1beta1.ComponentStatusSpec
 		podList       *corev1.PodList
-		rawDeployment bool
 		expectedState v1beta1.ModelState
 	}{
 		{
 			name:          "no pods available",
 			status:        &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}},
-			statusSpec:    v1beta1.ComponentStatusSpec{},
 			podList:       &corev1.PodList{Items: []corev1.Pod{}},
-			rawDeployment: false,
 			expectedState: v1beta1.Pending,
 		},
 		{
@@ -466,7 +462,6 @@ func TestPropagateModelStatus(t *testing.T) {
 				},
 				ModelStatus: v1beta1.ModelStatus{},
 			},
-			statusSpec: v1beta1.ComponentStatusSpec{},
 			podList: &corev1.PodList{
 				Items: []corev1.Pod{
 					{
@@ -486,11 +481,10 @@ func TestPropagateModelStatus(t *testing.T) {
 					},
 				},
 			},
-			rawDeployment: false,
 			expectedState: v1beta1.Loaded,
 		},
 		{
-			name: "raw deployment ready",
+			name: "service ready with a pod reporting no containers",
 			status: &v1beta1.InferenceServiceStatus{
 				Status: duckv1.Status{
 					Conditions: duckv1.Conditions{
@@ -499,7 +493,6 @@ func TestPropagateModelStatus(t *testing.T) {
 				},
 				ModelStatus: v1beta1.ModelStatus{},
 			},
-			statusSpec: v1beta1.ComponentStatusSpec{},
 			podList: &corev1.PodList{
 				Items: []corev1.Pod{
 					{
@@ -510,7 +503,6 @@ func TestPropagateModelStatus(t *testing.T) {
 					},
 				},
 			},
-			rawDeployment: true,
 			expectedState: v1beta1.Loaded,
 		},
 	}
@@ -519,7 +511,7 @@ func TestPropagateModelStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			manager := NewStatusReconciler()
 
-			manager.PropagateModelStatus(tt.status, tt.statusSpec, tt.podList, tt.rawDeployment)
+			manager.PropagateModelStatus(tt.status, tt.podList)
 
 			if tt.status.ModelStatus.ModelRevisionStates != nil {
 				assert.Equal(t, tt.expectedState, tt.status.ModelStatus.ModelRevisionStates.TargetModelState)
@@ -571,44 +563,6 @@ func TestUpdateModelRevisionStates(t *testing.T) {
 
 			assert.Equal(t, tt.expectedTransitionStatus, tt.status.ModelStatus.TransitionStatus)
 			assert.Equal(t, tt.modelState, tt.status.ModelStatus.ModelRevisionStates.TargetModelState)
-			if tt.info != nil {
-				assert.Equal(t, tt.info, tt.status.ModelStatus.LastFailureInfo)
-			}
-		})
-	}
-}
-
-func TestUpdateModelTransitionStatus(t *testing.T) {
-	tests := []struct {
-		name                     string
-		status                   *v1beta1.InferenceServiceStatus
-		transitionStatus         v1beta1.TransitionStatus
-		info                     *v1beta1.FailureInfo
-		expectedTransitionStatus v1beta1.TransitionStatus
-	}{
-		{
-			name:                     "update transition status to invalid spec",
-			status:                   &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}},
-			transitionStatus:         v1beta1.InvalidSpec,
-			info:                     &v1beta1.FailureInfo{Reason: v1beta1.ModelLoadFailed, Message: "Invalid spec"},
-			expectedTransitionStatus: v1beta1.InvalidSpec,
-		},
-		{
-			name:                     "update transition status to in progress",
-			status:                   &v1beta1.InferenceServiceStatus{ModelStatus: v1beta1.ModelStatus{}},
-			transitionStatus:         v1beta1.InProgress,
-			info:                     nil,
-			expectedTransitionStatus: v1beta1.InProgress,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
-
-			manager.UpdateModelTransitionStatus(tt.status, tt.transitionStatus, tt.info)
-
-			assert.Equal(t, tt.expectedTransitionStatus, tt.status.ModelStatus.TransitionStatus)
 			if tt.info != nil {
 				assert.Equal(t, tt.info, tt.status.ModelStatus.LastFailureInfo)
 			}
@@ -669,4 +623,74 @@ func TestSetModelFailureInfo(t *testing.T) {
 			assert.Equal(t, tt.expectedInfo, tt.status.ModelStatus.LastFailureInfo)
 		})
 	}
+}
+
+// The component URL is recorded only while the workload is Available; a
+// workload that is not keeps the URL it had.
+func TestPropagate_URLRecordedOnlyWhenAvailable(t *testing.T) {
+	url := &apis.URL{Scheme: "http", Host: "engine.default.svc.cluster.local"}
+	deploymentAvailable := func(status corev1.ConditionStatus) *appsv1.Deployment {
+		return &appsv1.Deployment{Status: appsv1.DeploymentStatus{
+			Conditions: []appsv1.DeploymentCondition{{Type: appsv1.DeploymentAvailable, Status: status}},
+		}}
+	}
+	lwsAvailable := func(status metav1.ConditionStatus) *lwsspec.LeaderWorkerSet {
+		return &lwsspec.LeaderWorkerSet{Status: lwsspec.LeaderWorkerSetStatus{
+			Conditions: []metav1.Condition{{Type: string(lwsspec.LeaderWorkerSetAvailable), Status: status}},
+		}}
+	}
+
+	t.Run("deployment", func(t *testing.T) {
+		status := &v1beta1.InferenceServiceStatus{}
+		NewStatusReconciler().PropagateRawStatus(status, v1beta1.EngineComponent, deploymentAvailable(corev1.ConditionFalse), url)
+		assert.Nil(t, status.Components[v1beta1.EngineComponent].URL, "no URL while the deployment is not available")
+
+		NewStatusReconciler().PropagateRawStatus(status, v1beta1.EngineComponent, deploymentAvailable(corev1.ConditionTrue), url)
+		assert.Equal(t, url, status.Components[v1beta1.EngineComponent].URL)
+	})
+
+	t.Run("leaderworkerset", func(t *testing.T) {
+		status := &v1beta1.InferenceServiceStatus{}
+		NewStatusReconciler().PropagateMultiNodeStatus(status, v1beta1.EngineComponent, lwsAvailable(metav1.ConditionFalse), url)
+		assert.Nil(t, status.Components[v1beta1.EngineComponent].URL, "no URL while the set is not available")
+
+		NewStatusReconciler().PropagateMultiNodeStatus(status, v1beta1.EngineComponent, lwsAvailable(metav1.ConditionTrue), url)
+		assert.Equal(t, url, status.Components[v1beta1.EngineComponent].URL)
+	})
+}
+
+// A component's ready condition is rewritten to Initializing only when the
+// status holds one that is False; a True, Unknown or missing condition stays
+// as it is.
+func TestInitializeComponentCondition(t *testing.T) {
+	tests := []struct {
+		name           string
+		existing       *apis.Condition
+		expectedStatus corev1.ConditionStatus
+		expectedReason string
+	}{
+		{name: "false", existing: &apis.Condition{Status: corev1.ConditionFalse, Reason: "Failed"}, expectedStatus: corev1.ConditionFalse, expectedReason: "Initializing"},
+		{name: "unknown", existing: &apis.Condition{Status: corev1.ConditionUnknown, Reason: "Pending"}, expectedStatus: corev1.ConditionUnknown, expectedReason: "Pending"},
+		{name: "true", existing: &apis.Condition{Status: corev1.ConditionTrue, Reason: "Ready"}, expectedStatus: corev1.ConditionTrue, expectedReason: "Ready"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status := &v1beta1.InferenceServiceStatus{}
+			status.SetCondition(v1beta1.EngineReady, tt.existing)
+
+			NewStatusReconciler().InitializeComponentCondition(status, v1beta1.EngineComponent)
+
+			condition := status.GetCondition(v1beta1.EngineReady)
+			assert.NotNil(t, condition)
+			assert.Equal(t, tt.expectedStatus, condition.Status)
+			assert.Equal(t, tt.expectedReason, condition.Reason)
+		})
+	}
+
+	t.Run("missing", func(t *testing.T) {
+		status := &v1beta1.InferenceServiceStatus{}
+		NewStatusReconciler().InitializeComponentCondition(status, v1beta1.EngineComponent)
+		assert.Nil(t, status.GetCondition(v1beta1.EngineReady), "a missing condition is not written")
+	})
 }

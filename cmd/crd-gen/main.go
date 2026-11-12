@@ -43,6 +43,11 @@ func main() {
 	switch os.Args[1] {
 	case "removecrdvalidation":
 		removeCRDValidation(os.Args[2])
+	case "shippedschema":
+		if err := runShippedSchema(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "helmchart":
 		if err := runHelmChart(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "crd-gen helmchart:", err)

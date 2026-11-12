@@ -40,7 +40,6 @@ func TestValidateRuntimeErrorPaths(t *testing.T) {
 
 		err := selector.ValidateRuntime(ctx, "rt-cluster-disabled", model, isvc)
 		assert.Error(t, err)
-		assert.True(t, IsRuntimeDisabledError(err))
 		var disabledErr *RuntimeDisabledError
 		assert.True(t, errors.As(err, &disabledErr))
 		assert.True(t, disabledErr.IsCluster)
@@ -202,7 +201,6 @@ func TestErrorMessageRendering(t *testing.T) {
 	t.Run("ModelValidationError and ConfigurationError render their subjects", func(t *testing.T) {
 		mv := &ModelValidationError{Field: "modelFormat.name", Message: "model format name is required"}
 		assert.Contains(t, mv.Error(), "modelFormat.name")
-		assert.True(t, IsModelValidationError(mv))
 
 		ce := &ConfigurationError{Component: "scorer", Message: "weights must be positive"}
 		assert.Contains(t, ce.Error(), "configuration error in scorer")

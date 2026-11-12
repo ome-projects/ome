@@ -9,6 +9,21 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Load returns defaults overwritten by every setting the environment or the
+// configuration file in v names; a setting neither one names keeps its
+// default. The settings are bound to their environment variables first, so
+// the environment is read for a setting the file leaves out.
+func Load[T any](v *viper.Viper, defaults T) (*T, error) {
+	c := &defaults
+	if err := BindEnvs(v, c); err != nil {
+		return nil, fmt.Errorf("error occurred when binding environment variables: %w", err)
+	}
+	if err := v.Unmarshal(c); err != nil {
+		return nil, fmt.Errorf("error occurred when unmarshalling config: %w", err)
+	}
+	return c, nil
+}
+
 // BindEnvs binds every setting of c, a pointer to a struct, to its
 // environment variable, so v.Unmarshal reads the environment for a setting
 // the configuration file leaves out. A setting's key is its mapstructure tag,

@@ -1,0 +1,18 @@
+{
+  "recordedOn": {
+    "date": "2026-11-06",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The update selection's rolled-set reading over a Component at rest, every planned Instance read once as a pass reads it (recordRolledSet: the pod count of the Instance's set at the target's recorded layout, then whether the live pods on the target serve it), at 1,000 and 4,000 single-pod Instances, 160 gangs of a leader and seven workers and 1,725 gangs of a leader and one worker; every row Ready on the spec revision, every pod serving on it, nothing recorded and no wake asked for. The layout is counted without a copy (ComponentPlan.TotalPodsFor) and the set of an Instance whose every pod is on the target is the list itself (ops.rolledSetPods), so the reading allocates three times per pass, in its own setup, whatever the Instance count. Before, it allocated twice per Instance, the copy of the target's layout and the copy of the Instance's pods: 2,003 / 8,003 / 323 / 3,453 allocations and 42,032 / 162,608 / 21,168 / 126,576 bytes at the four shapes, recorded on main's code on the same day and machine.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/rolled-set/allocations": 3,
+    "1000x1/rolled-set/bytes": 10032,
+    "160x8/rolled-set/allocations": 3,
+    "160x8/rolled-set/bytes": 3248,
+    "1725x2/rolled-set/allocations": 3,
+    "1725x2/rolled-set/bytes": 16176,
+    "4000x1/rolled-set/allocations": 3,
+    "4000x1/rolled-set/bytes": 34608
+  }
+}

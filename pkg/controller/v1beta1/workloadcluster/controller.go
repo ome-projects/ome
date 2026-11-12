@@ -11,7 +11,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -51,8 +50,7 @@ const kubeConfigSecretRefIndex = "spec.clusterSource.kubeConfig.secretRef"
 // read capacity — that is a placer concern.
 type Reconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-	Log    logr.Logger
+	Log logr.Logger
 	// Probe reports whether the cluster described by these kubeconfig bytes is
 	// reachable. Defaults to probeViaServerVersion; overridden in tests.
 	Probe func(ctx context.Context, kubeconfig []byte) error

@@ -9,7 +9,6 @@ import (
 type RuntimeCompatibilityError struct {
 	RuntimeName   string
 	ModelName     string
-	ModelFormat   string
 	Reason        string
 	DetailedError error
 }
@@ -127,15 +126,5 @@ func IsNoRuntimeFoundError(err error) bool {
 
 func IsRuntimeNotFoundError(err error) bool {
 	_, ok := err.(*RuntimeNotFoundError)
-	return ok
-}
-
-func IsRuntimeDisabledError(err error) bool {
-	_, ok := err.(*RuntimeDisabledError)
-	return ok
-}
-
-func IsModelValidationError(err error) bool {
-	_, ok := err.(*ModelValidationError)
 	return ok
 }

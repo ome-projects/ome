@@ -124,13 +124,17 @@ func recreateUpdate(ctx context.Context, deps workload.Deps, input workload.Reco
 // listed by the recreation count the row then names. The row's reason is
 // the cause, which tells a revision roll's recreate from a pod-failure
 // repair in status: Type Update against Type Restart, and a revision pair
-// against a termination reason. The first pass reports the start.
+// against a termination reason. The first pass reports the start. A pass
+// whose copy of the row carried the attempt in flight goes on with it
+// only while the live row still does (recordAttempt); a Failed row that
+// kept its recreate is driven again as a continuation.
 func (r *recreateRoll) openAttempt(ctx context.Context) (bool, error) {
 	row := r.input.ObservedState.Instance(r.inst.Index)
 	// The first pass of a recreate finds no Update operation at the drain
 	// step; recording the attempt puts the row there.
 	firstPass := row == nil || row.Operation == nil ||
 		row.Operation.Type != workload.InstanceOperationUpdate || row.Operation.Step != workload.UpdateStepDrain
+	inFlight := !firstPass && row.Phase == workload.InstancePhaseUpdating
 	cause := recreateRevisionCause(r.input, r.inst.Index, r.target.Name)
 	// The row is written on the first pass and on a retarget; only then does
 	// its running revision need reading against the revision's own age.
@@ -142,9 +146,12 @@ func (r *recreateRoll) openAttempt(ctx context.Context) (bool, error) {
 		}
 		runningNeverServed = unserved
 	}
-	count, err := status.StampRecreating(ctx, r.input, r.inst.Index, r.target.Name, cause, r.plan.UpdateStrategy.Type, r.plan.InstanceReadyTimeout, runningNeverServed)
+	count, open, err := r.recordAttempt(ctx, inFlight, cause, runningNeverServed)
 	if err != nil {
 		return false, fmt.Errorf("bump Incarnation (instance=%d): %w", r.inst.Index, err)
+	}
+	if !open {
+		return true, nil
 	}
 	r.recreationCount = count
 	if firstPass {
@@ -154,6 +161,21 @@ func (r *recreateRoll) openAttempt(ctx context.Context) (bool, error) {
 	}
 	r.oldPods, r.newPods, r.unlabelledPods = query.PartitionPodsByIncarnation(r.pods, count)
 	return false, nil
+}
+
+// recordAttempt writes the attempt on the row. A pass that found the
+// attempt in flight on its copy of the row goes on with it only while the
+// live row still carries it, and reads the row as not open once the pass
+// before promoted or ended it, so a copy a write behind the row opens
+// nothing on a row it did not read. Every other pass opens the attempt:
+// the first pass, and the pass that drives a Failed row's kept recreate
+// again.
+func (r *recreateRoll) recordAttempt(ctx context.Context, inFlight bool, cause string, runningNeverServed bool) (int64, bool, error) {
+	if !inFlight {
+		count, err := status.StampRecreating(ctx, r.input, r.inst.Index, r.target.Name, cause, r.plan.UpdateStrategy.Type, r.plan.InstanceReadyTimeout, runningNeverServed)
+		return count, true, err
+	}
+	return status.ResumeRecreating(ctx, r.input, r.inst.Index, r.target.Name, cause, r.plan.UpdateStrategy.Type, r.plan.InstanceReadyTimeout, runningNeverServed)
 }
 
 // refuseUnlabelledPods ends the pass while a pod of the Instance names no

@@ -22,9 +22,6 @@ import (
 // backend translates it into its own resource(s). Single mode yields exactly one
 // ServingCluster; All/Split yield one per serving cluster.
 type Target struct {
-	// Service is the logical service represented by the target.
-	Service string
-
 	// GlobalHost is the externally-addressable hostname used by publishers that
 	// create a global endpoint. It is empty for backends that consume only Clusters.
 	GlobalHost string
@@ -43,9 +40,6 @@ type Target struct {
 type ServingCluster struct {
 	// Cluster is the WorkloadCluster name (labels/logging).
 	Cluster string
-	// Endpoint is the complete client-facing URL reported by this cluster. Backends
-	// that need more than a Kubernetes Service hostname can consume it directly.
-	Endpoint string
 	// BackendHost is that cluster's ingress hostname the global host resolves to —
 	// the host of the cluster's status endpoint. A bare hostname (no scheme/port);
 	// the backend supplies the port from Config.

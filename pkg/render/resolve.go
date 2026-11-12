@@ -31,12 +31,11 @@ type Inputs struct {
 	Config       *controllerconfig.InferenceServicesConfig
 	Log          logr.Logger
 
-	// Model, ModelMeta and ModelStatus are authoritative when ModelRead is
-	// set, including a nil Model for a service without spec.model.
-	Model       *v1beta1.BaseModelSpec
-	ModelMeta   *metav1.ObjectMeta
-	ModelStatus *v1beta1.ModelStatusSpec
-	ModelRead   bool
+	// Model and ModelMeta are authoritative when ModelRead is set,
+	// including a nil Model for a service without spec.model.
+	Model     *v1beta1.BaseModelSpec
+	ModelMeta *metav1.ObjectMeta
+	ModelRead bool
 
 	// Overlays are authoritative when OverlaysRead is set.
 	Overlays     []isvcutils.ResolvedOverlay
@@ -51,10 +50,9 @@ type Inputs struct {
 
 // Resolved is what Resolve read and merged.
 type Resolved struct {
-	Model       *v1beta1.BaseModelSpec
-	ModelMeta   *metav1.ObjectMeta
-	ModelStatus *v1beta1.ModelStatusSpec
-	Overlays    []isvcutils.ResolvedOverlay
+	Model     *v1beta1.BaseModelSpec
+	ModelMeta *metav1.ObjectMeta
+	Overlays  []isvcutils.ResolvedOverlay
 
 	Runtime              *v1beta1.ServingRuntimeSpec
 	RuntimeName          string
@@ -99,20 +97,20 @@ func (e *MergeError) Unwrap() error { return e.Err }
 // ResolveModel reads spec.model (BaseModel in the namespace, else
 // ClusterBaseModel) and gates a sharded model on readiness. A service without
 // spec.model resolves to a nil model.
-func ResolveModel(ctx context.Context, in Inputs) (*v1beta1.BaseModelSpec, *metav1.ObjectMeta, *v1beta1.ModelStatusSpec, error) {
+func ResolveModel(ctx context.Context, in Inputs) (*v1beta1.BaseModelSpec, *metav1.ObjectMeta, error) {
 	if in.Service == nil {
-		return nil, nil, nil, errors.New("model resolution requires a service")
+		return nil, nil, errors.New("model resolution requires a service")
 	}
 	model, meta, status, err := isvcutils.ReconcileBaseModelWithStatus(in.Client, in.Service)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	if model != nil && isvcutils.IsShardedBaseModel(model) {
 		if ready, message := isvcutils.ShardedBaseModelReady(status, meta.Generation); !ready {
-			return nil, nil, nil, &ModelNotReadyError{Model: in.Service.Spec.Model.Name, Message: message}
+			return nil, nil, &ModelNotReadyError{Model: in.Service.Spec.Model.Name, Message: message}
 		}
 	}
-	return model, meta, status, nil
+	return model, meta, nil
 }
 
 // ResolveOverlays reads spec.model.overlays in order. An overlay that cannot
@@ -132,13 +130,13 @@ func Resolve(ctx context.Context, in Inputs) (*Resolved, error) {
 	if service == nil {
 		return nil, errors.New("resolution requires a service")
 	}
-	res := &Resolved{Model: in.Model, ModelMeta: in.ModelMeta, ModelStatus: in.ModelStatus, Overlays: in.Overlays}
+	res := &Resolved{Model: in.Model, ModelMeta: in.ModelMeta, Overlays: in.Overlays}
 	if !in.ModelRead {
-		model, meta, status, err := ResolveModel(ctx, in)
+		model, meta, err := ResolveModel(ctx, in)
 		if err != nil {
 			return nil, err
 		}
-		res.Model, res.ModelMeta, res.ModelStatus = model, meta, status
+		res.Model, res.ModelMeta = model, meta
 	}
 	if !in.OverlaysRead {
 		overlays, err := ResolveOverlays(ctx, in)
@@ -147,42 +145,10 @@ func Resolve(ctx context.Context, in Inputs) (*Resolved, error) {
 		}
 		res.Overlays = overlays
 	}
-
 	res.UserSpecifiedRuntime = service.Spec.Runtime != nil && service.Spec.Runtime.Name != ""
-	switch {
-	case in.Runtime != nil:
-		res.Runtime, res.RuntimeName, res.RuntimeIsCluster = in.Runtime, in.RuntimeName, in.RuntimeIsCluster
-	case !res.UserSpecifiedRuntime && res.Model == nil:
-		return nil, ErrNoTemplateSource
-	case in.Runtimes == nil:
-		return nil, errors.New("runtime resolution requires a runtime selector")
-	case res.UserSpecifiedRuntime:
-		name := service.Spec.Runtime.Name
-		if res.Model != nil {
-			if err := in.Runtimes.ValidateRuntime(ctx, name, res.Model, service); err != nil {
-				// A named runtime serves the model even when its declared
-				// formats do not list it; the mismatch is advisory. A sharded
-				// model keeps the check: it cannot load without a runtime
-				// that supports the configured cache provider.
-				if !runtimeselector.IsRuntimeCompatibilityError(err) || isvcutils.IsShardedBaseModel(res.Model) {
-					return nil, err
-				}
-				res.CompatibilityAdvisory = err
-			}
-		}
-		spec, isCluster, err := in.Runtimes.GetRuntime(ctx, name, service.Namespace, runtimeselector.RefKind(service.Spec.Runtime))
-		if err != nil {
-			return nil, err
-		}
-		res.Runtime, res.RuntimeName, res.RuntimeIsCluster = spec, name, isCluster
-	default:
-		selection, err := in.Runtimes.SelectRuntime(ctx, res.Model, service)
-		if err != nil {
-			return nil, err
-		}
-		res.Runtime, res.RuntimeName, res.RuntimeIsCluster = selection.Spec, selection.Name, selection.IsCluster
+	if err := resolveRuntime(ctx, in, res); err != nil {
+		return nil, err
 	}
-
 	if err := validateResolvedRuntimeEnabled(res.Runtime, res.RuntimeName, res.RuntimeIsCluster); err != nil {
 		return nil, err
 	}
@@ -192,6 +158,65 @@ func Resolve(ctx context.Context, in Inputs) (*Resolved, error) {
 	}
 	res.Specs = specs
 	return res, nil
+}
+
+// resolveRuntime fills in the runtime of res: the one supplied with the
+// inputs, else the one the service names, else the selector's choice for the
+// model. With neither a named runtime nor a model there is nothing to render
+// from.
+func resolveRuntime(ctx context.Context, in Inputs, res *Resolved) error {
+	switch {
+	case in.Runtime != nil:
+		res.Runtime, res.RuntimeName, res.RuntimeIsCluster = in.Runtime, in.RuntimeName, in.RuntimeIsCluster
+		return nil
+	case !res.UserSpecifiedRuntime && res.Model == nil:
+		return ErrNoTemplateSource
+	case in.Runtimes == nil:
+		return errors.New("runtime resolution requires a runtime selector")
+	case res.UserSpecifiedRuntime:
+		return resolveNamedRuntime(ctx, in, res)
+	}
+	selection, err := in.Runtimes.SelectRuntime(ctx, res.Model, in.Service)
+	if err != nil {
+		return err
+	}
+	res.Runtime, res.RuntimeName, res.RuntimeIsCluster = selection.Spec, selection.Name, selection.IsCluster
+	return nil
+}
+
+// resolveNamedRuntime reads the runtime the service names, after checking it
+// against the model when one was read.
+func resolveNamedRuntime(ctx context.Context, in Inputs, res *Resolved) error {
+	service := in.Service
+	name := service.Spec.Runtime.Name
+	if err := validateNamedRuntime(ctx, in, res, name); err != nil {
+		return err
+	}
+	spec, isCluster, err := in.Runtimes.GetRuntime(ctx, name, service.Namespace, runtimeselector.RefKind(service.Spec.Runtime))
+	if err != nil {
+		return err
+	}
+	res.Runtime, res.RuntimeName, res.RuntimeIsCluster = spec, name, isCluster
+	return nil
+}
+
+// validateNamedRuntime checks a named runtime against the model. A named
+// runtime serves the model even when its declared formats do not list it; the
+// mismatch is kept on res as an advisory. A sharded model keeps the check: it
+// cannot load without a runtime that supports the configured cache provider.
+func validateNamedRuntime(ctx context.Context, in Inputs, res *Resolved, name string) error {
+	if res.Model == nil {
+		return nil
+	}
+	err := in.Runtimes.ValidateRuntime(ctx, name, res.Model, in.Service)
+	if err == nil {
+		return nil
+	}
+	if !runtimeselector.IsRuntimeCompatibilityError(err) || isvcutils.IsShardedBaseModel(res.Model) {
+		return err
+	}
+	res.CompatibilityAdvisory = err
+	return nil
 }
 
 func validateResolvedRuntimeEnabled(runtimeSpec *v1beta1.ServingRuntimeSpec, runtimeName string, isCluster bool) error {

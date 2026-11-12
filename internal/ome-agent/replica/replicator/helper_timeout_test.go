@@ -11,18 +11,16 @@ import (
 	testingPkg "sigs.k8s.io/ome/pkg/testing"
 )
 
+// waitForCancel is a scripted snapshot download that only returns when its context ends.
+func waitForCancel(ctx context.Context, _ *xet.SnapshotRequest) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
 func TestDownloadSnapshotWithTimeouts_EndToEndTimeout(t *testing.T) {
-	origDownloadSnapHook := downloadSnapHook
-	t.Cleanup(func() {
-		downloadSnapHook = origDownloadSnapHook
-	})
+	hub := &fakeHubClient{download: waitForCancel}
 
-	downloadSnapHook = func(ctx context.Context, client *xet.Client, req *xet.SnapshotRequest) (string, error) {
-		<-ctx.Done()
-		return "", ctx.Err()
-	}
-
-	_, err := downloadSnapshotWithTimeouts(nil, &xet.SnapshotRequest{
+	_, err := downloadSnapshotWithTimeouts(hub, &xet.SnapshotRequest{
 		RepoID:   "org/model",
 		Revision: "main",
 	}, hfDownloadOptions{
@@ -35,27 +33,9 @@ func TestDownloadSnapshotWithTimeouts_EndToEndTimeout(t *testing.T) {
 }
 
 func TestDownloadSnapshotWithTimeouts_StaleProgressTimeout(t *testing.T) {
-	origDownloadSnapHook := downloadSnapHook
-	origSetProgressHandlerHook := setProgressHandlerHook
-	origDisableProgressHook := disableProgressHook
-	t.Cleanup(func() {
-		downloadSnapHook = origDownloadSnapHook
-		setProgressHandlerHook = origSetProgressHandlerHook
-		disableProgressHook = origDisableProgressHook
-	})
+	hub := &fakeHubClient{download: waitForCancel}
 
-	setProgressHandlerHook = func(client *xet.Client, handler xet.ProgressHandler, throttle time.Duration) error {
-		return nil
-	}
-	disableProgressHook = func(client *xet.Client) error {
-		return nil
-	}
-	downloadSnapHook = func(ctx context.Context, client *xet.Client, req *xet.SnapshotRequest) (string, error) {
-		<-ctx.Done()
-		return "", ctx.Err()
-	}
-
-	_, err := downloadSnapshotWithTimeouts(nil, &xet.SnapshotRequest{
+	_, err := downloadSnapshotWithTimeouts(hub, &xet.SnapshotRequest{
 		RepoID:   "org/model",
 		Revision: "main",
 	}, hfDownloadOptions{
@@ -69,36 +49,20 @@ func TestDownloadSnapshotWithTimeouts_StaleProgressTimeout(t *testing.T) {
 }
 
 func TestDownloadSnapshotWithTimeouts_ProgressPreventsStaleTimeout(t *testing.T) {
-	origDownloadSnapHook := downloadSnapHook
-	origSetProgressHandlerHook := setProgressHandlerHook
-	origDisableProgressHook := disableProgressHook
-	t.Cleanup(func() {
-		downloadSnapHook = origDownloadSnapHook
-		setProgressHandlerHook = origSetProgressHandlerHook
-		disableProgressHook = origDisableProgressHook
-	})
-
-	var progressHandler xet.ProgressHandler
-	setProgressHandlerHook = func(client *xet.Client, handler xet.ProgressHandler, throttle time.Duration) error {
-		progressHandler = handler
-		return nil
-	}
-	disableProgressHook = func(client *xet.Client) error {
-		return nil
-	}
-	downloadSnapHook = func(ctx context.Context, client *xet.Client, req *xet.SnapshotRequest) (string, error) {
+	hub := &fakeHubClient{}
+	hub.download = func(ctx context.Context, _ *xet.SnapshotRequest) (string, error) {
 		for i := uint64(1); i <= 5; i++ {
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
 			case <-time.After(15 * time.Millisecond):
-				progressHandler(xet.ProgressUpdate{CompletedBytes: i})
+				hub.progressHandler(xet.ProgressUpdate{CompletedBytes: i})
 			}
 		}
 		return "/tmp/model", nil
 	}
 
-	path, err := downloadSnapshotWithTimeouts(nil, &xet.SnapshotRequest{
+	path, err := downloadSnapshotWithTimeouts(hub, &xet.SnapshotRequest{
 		RepoID:   "org/model",
 		Revision: "main",
 	}, hfDownloadOptions{

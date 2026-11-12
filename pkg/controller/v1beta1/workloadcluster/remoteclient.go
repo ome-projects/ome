@@ -259,70 +259,128 @@ func NewSelectivelyCachingClient(
 	if cachedKinds.Has(podGroupKind) {
 		return nil, fmt.Errorf("refusing to cache kind %s: the remote cache must never hold cluster-wide Pods", podGroupKind.String())
 	}
-
 	streams := &sync.Map{}
+	remoteCache, err := newRemoteCache(restConfig, directClient, scheme, defaultSelector, syncTimeout, streams)
+	if err != nil {
+		return nil, err
+	}
+	if err := registerCacheIndexes(ctx, remoteCache, indexes); err != nil {
+		return nil, err
+	}
+	if err := registerCachedKinds(ctx, remoteCache, scheme, cachedKinds); err != nil {
+		return nil, err
+	}
+	runCtx, err := startRemoteCache(ctx, remoteCache, syncTimeout)
+	if err != nil {
+		return nil, err
+	}
+	var synced atomic.Bool
+	synced.Store(true)
+	return &selectivelyCachingClient{
+		WithWatch:    directClient,
+		cachedReader: remoteCache,
+		cache:        remoteCache,
+		// Cache exit and connection teardown both invalidate this reader.
+		cacheCtx:    runCtx,
+		scheme:      scheme,
+		cachedKinds: cachedKinds,
+		synced:      &synced,
+		streams:     streams,
+	}, nil
+}
+
+// newRemoteCache builds the informer cache behind the client. Every cached
+// object loses its managedFields, as in the manager's own cache. The cache's
+// own requests carry no deadline, since a short request deadline would
+// expire a healthy watch over and over: LIST and watch establishment keep
+// their own bounds, and discovery keeps the direct client's deadline through
+// its shared REST mapper.
+func newRemoteCache(
+	restConfig *rest.Config,
+	directClient client.WithWatch,
+	scheme *runtime.Scheme,
+	defaultSelector labels.Selector,
+	syncTimeout time.Duration,
+	streams *sync.Map,
+) (cache.Cache, error) {
 	cacheOpts := cache.Options{
 		Scheme:                      scheme,
 		ReaderFailOnMissingInformer: true,
-		NewInformer: func(lw toolscache.ListerWatcher, object runtime.Object, resync time.Duration, indexes toolscache.Indexers) toolscache.SharedIndexInformer {
-			stream := &cacheStream{}
-			if obj, ok := object.(client.Object); ok {
-				if gvk, err := apiutil.GVKForObject(obj, scheme); err == nil {
-					streams.Store(gvk.GroupKind(), stream)
-				}
-			}
-			return toolscache.NewSharedIndexInformer(&trackedListWatch{
-				ListerWatcher: lw, stream: stream, listTimeout: restConfig.Timeout, watchEstablishTimeout: syncTimeout,
-			}, object, resync, indexes)
-		},
-		// Strip managedFields from every cached object (typically a large
-		// fraction of each object's serialized size and never read here),
-		// mirroring the manager cache in cmd/manager/main.go.
-		DefaultTransform: cache.TransformStripManagedFields(),
+		NewInformer:                 trackedInformerFactory(restConfig, scheme, syncTimeout, streams),
+		DefaultTransform:            cache.TransformStripManagedFields(),
+		Mapper:                      directClient.RESTMapper(),
 	}
 	if defaultSelector != nil {
 		cacheOpts.DefaultLabelSelector = defaultSelector
 	}
-
-	// Short request deadlines must not repeatedly expire a healthy watch.
-	// LIST and watch establishment have separate bounds; discovery keeps the
-	// direct client's request timeout through its shared REST mapper.
-	cacheOpts.Mapper = directClient.RESTMapper()
 	cacheConfig := rest.CopyConfig(restConfig)
 	cacheConfig.Timeout = 0
 	remoteCache, err := cache.New(cacheConfig, cacheOpts)
 	if err != nil {
 		return nil, fmt.Errorf("creating remote cache: %w", err)
 	}
+	return remoteCache, nil
+}
 
-	for _, opt := range indexes {
-		err = remoteCache.IndexField(ctx, opt.Object, opt.Field, opt.ExtractValue)
-		if err != nil {
-			return nil, fmt.Errorf("registering index for %s on %s: %w", opt.Field, opt.Object.GetObjectKind().GroupVersionKind().Kind, err)
-		}
-	}
-
-	// Eager registration makes initial synchronization cover every configured
-	// kind, including kinds with no index or event handler yet.
-	for kind := range cachedKinds {
-		var object client.Object
-		for _, version := range scheme.PrioritizedVersionsForGroup(kind.Group) {
-			candidate, err := scheme.New(kind.WithVersion(version.Version))
-			if err == nil {
-				object, _ = candidate.(client.Object)
-				break
+// trackedInformerFactory is the cache's informer constructor: each informer
+// lists and watches through a trackedListWatch whose stream, kept by kind,
+// tells the client whether that kind's watch is established.
+func trackedInformerFactory(restConfig *rest.Config, scheme *runtime.Scheme, syncTimeout time.Duration, streams *sync.Map) func(toolscache.ListerWatcher, runtime.Object, time.Duration, toolscache.Indexers) toolscache.SharedIndexInformer {
+	return func(lw toolscache.ListerWatcher, object runtime.Object, resync time.Duration, indexes toolscache.Indexers) toolscache.SharedIndexInformer {
+		stream := &cacheStream{}
+		if obj, ok := object.(client.Object); ok {
+			if gvk, err := apiutil.GVKForObject(obj, scheme); err == nil {
+				streams.Store(gvk.GroupKind(), stream)
 			}
 		}
-		if object == nil {
-			return nil, fmt.Errorf("cached kind %s is not registered in the scheme", kind)
-		}
-		if _, err := remoteCache.GetInformer(ctx, object, cache.BlockUntilSynced(false)); err != nil {
-			return nil, fmt.Errorf("registering informer for %s: %w", kind, err)
+		return toolscache.NewSharedIndexInformer(&trackedListWatch{
+			ListerWatcher: lw, stream: stream, listTimeout: restConfig.Timeout, watchEstablishTimeout: syncTimeout,
+		}, object, resync, indexes)
+	}
+}
+
+// registerCacheIndexes adds the caller's field indexes before the cache starts.
+func registerCacheIndexes(ctx context.Context, remoteCache cache.Cache, indexes []CacheIndexOption) error {
+	for _, opt := range indexes {
+		if err := remoteCache.IndexField(ctx, opt.Object, opt.Field, opt.ExtractValue); err != nil {
+			return fmt.Errorf("registering index for %s on %s: %w", opt.Field, opt.Object.GetObjectKind().GroupVersionKind().Kind, err)
 		}
 	}
+	return nil
+}
 
-	var synced atomic.Bool
+// registerCachedKinds opens an informer for every cached kind up front, so
+// the initial synchronization covers kinds with no index or event handler yet.
+func registerCachedKinds(ctx context.Context, remoteCache cache.Cache, scheme *runtime.Scheme, cachedKinds sets.Set[schema.GroupKind]) error {
+	for kind := range cachedKinds {
+		object := objectOfKind(scheme, kind)
+		if object == nil {
+			return fmt.Errorf("cached kind %s is not registered in the scheme", kind)
+		}
+		if _, err := remoteCache.GetInformer(ctx, object, cache.BlockUntilSynced(false)); err != nil {
+			return fmt.Errorf("registering informer for %s: %w", kind, err)
+		}
+	}
+	return nil
+}
 
+// objectOfKind is an empty object of the kind in its preferred registered
+// version; nil when the scheme knows no version of it.
+func objectOfKind(scheme *runtime.Scheme, kind schema.GroupKind) client.Object {
+	for _, version := range scheme.PrioritizedVersionsForGroup(kind.Group) {
+		if candidate, err := scheme.New(kind.WithVersion(version.Version)); err == nil {
+			object, _ := candidate.(client.Object)
+			return object
+		}
+	}
+	return nil
+}
+
+// startRemoteCache starts the cache and waits for its first synchronization,
+// bounded by syncTimeout when positive and by ctx otherwise. It returns the
+// context that ends when the cache stops; a cache that stops before it
+// synchronizes, or fails to synchronize, is stopped and reported.
+func startRemoteCache(ctx context.Context, remoteCache cache.Cache, syncTimeout time.Duration) (context.Context, error) {
 	runCtx, cancelRun := context.WithCancel(ctx)
 	startErr := make(chan error, 1)
 	go func() {
@@ -352,21 +410,7 @@ func NewSelectivelyCachingClient(
 			}
 			return nil, errors.New("synchronizing remote cache failed")
 		}
-		synced.Store(true)
-		ctrl.LoggerFrom(ctx).V(2).Info("Remote cache successfully synchronized")
 	}
-
-	cachedClient := &selectivelyCachingClient{
-		WithWatch:    directClient,
-		cachedReader: remoteCache,
-		cache:        remoteCache,
-		// Cache exit and connection teardown both invalidate this reader.
-		cacheCtx:    runCtx,
-		scheme:      scheme,
-		cachedKinds: cachedKinds,
-		synced:      &synced,
-		streams:     streams,
-	}
-
-	return cachedClient, nil
+	ctrl.LoggerFrom(ctx).V(2).Info("Remote cache successfully synchronized")
+	return runCtx, nil
 }

@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -139,6 +141,13 @@ func (r cacheReader) Get(_ context.Context, key client.ObjectKey, obj client.Obj
 	return nil
 }
 
-func (r cacheReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
-	return errors.New("the benchmark reader serves single objects only")
+// List answers a pod list with no pods, as a cache with none would: the
+// unavailability gate lists the Component's pods on an ask that hands it no
+// list, and the shapes here hold none. Any other list is not served.
+func (r cacheReader) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
+	if pods, ok := list.(*corev1.PodList); ok {
+		pods.Items = nil
+		return nil
+	}
+	return errors.New("the benchmark reader serves single objects and pod lists only")
 }

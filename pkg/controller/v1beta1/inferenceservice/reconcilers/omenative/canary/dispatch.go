@@ -2,13 +2,13 @@ package canary
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/rollout"
 	"sigs.k8s.io/ome/pkg/utils"
@@ -80,10 +81,19 @@ type DispatchDeps struct {
 	// The per-revision routing Service publishes the port resolved from this set
 	// so it targets the port the pods actually listen on.
 	ComponentRunnerPorts map[v1beta1.ComponentType][]corev1.ContainerPort
+	// ComponentServicePortAppProtocols holds each Component's declared
+	// appProtocol per Service port name, from the merged spec its stable
+	// Service uses. A Component missing from the map publishes none.
+	ComponentServicePortAppProtocols map[v1beta1.ComponentType]map[string]string
 	// Group is the canary group this dispatch drives. One group owns one canary
 	// unit -- the router, or engine+decoder -- so concurrent dispatches touch
 	// disjoint Components and cannot contend for a revision or step counter.
 	Group *v1beta1.RolloutGroup
+	// Base is the executor-owned state the pass read, as the status flush
+	// guards it. The dispatch reads the live record through Reader before
+	// it writes a replica's revert target and writes none when the pass's
+	// copy is stale. nil guards nothing.
+	Base *Base
 }
 
 // Outcome is what one canary dispatch hands the controller.
@@ -143,6 +153,19 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 	}
 	canaryHash := revisions.targetHash
 
+	now := d.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+
+	// The secondaries are observed before the Services are kept, so the
+	// sweep below and the rollback signal both work from the replica each
+	// member's observation read: a pass reads a member's replica once.
+	secondaryReady, secondaryFresh, secondaryObserved, secondaryWait, err := secondaryCapacityReady(ctx, d.Reader, d.ISVC, perRev, observedPods, primary, d.Group, now)
+	if err != nil {
+		return Outcome{}, err
+	}
+
 	// Ensure the per-revision Services the canary references, for EVERY Component
 	// in the canary group — not just the primary. The downstream weighted-route
 	// consumer references these by name, and coordination skips canary-owned
@@ -163,17 +186,24 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 				continue
 			}
 			routing := routingRev[comp][hash]
-			if _, err := coordination.EnsurePerRevisionServices(ctx, d.Client, d.ISVC, comp, hash, routing, d.ComponentRunnerPorts[comp]); err != nil {
+			if _, err := coordination.EnsurePerRevisionServices(ctx, d.Client, d.ISVC, comp, hash, routing, d.ComponentRunnerPorts[comp], d.ComponentServicePortAppProtocols[comp]); err != nil {
 				return Outcome{}, err
 			}
 		}
-		// The orphan sweep runs unconditionally, mirroring coordination.
-		// Gating it on the live revision-hash set matching
-		// Status.Components.<c>.Traffic is unsound: perRev counts TOTAL
-		// pods while Traffic is written from READY pods, so the pass on
-		// which a drained pod disappears is exactly the pass on which the
-		// two sets agree — skipping it strands that revision's Services.
-		if err := coordination.GCOrphanedPerRevisionServices(ctx, d.Client, d.ISVC, comp, perRev[comp]); err != nil {
+		// The sweep of unused per-revision Services runs unconditionally,
+		// through the rule coordination prunes by: a revision keeps its
+		// Services while a pod runs it or the member's replica rolls toward
+		// it. A canary whose pods never came up, or whose pods are gone
+		// while its revision is still the replica's target, keeps them; the
+		// replica controller creates that revision's Services ahead of its
+		// pods, and deleting them here would have the two controllers
+		// create and delete them pass after pass. Gating the sweep on the
+		// live revision-hash set matching Status.Components.<c>.Traffic is
+		// unsound: perRev counts TOTAL pods while Traffic is written from
+		// READY pods, so the pass on which a drained pod disappears is
+		// exactly the pass on which the two sets agree, and skipping it
+		// strands that revision's Services.
+		if err := sweepMemberServices(ctx, d, comp, memberObservation(comp, primary, revisions, secondaryObserved), perRev[comp]); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -186,21 +216,16 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 
 	// A live non-current revision can appear before the IR status publishes its
 	// new target. Wait for that revision pair so their roles cannot be inverted.
+	// A run that records the unit at its stable revision starts no steps, so
+	// its pass is not waited for: the pods of the other revision are Instances
+	// rolling back to the revision the run names, and the split follows them.
 	if revisions.fromIR && revisions.currentHash != "" && revisions.currentHash == canaryHash &&
 		otherRevision(pods, canaryHash) != "" &&
-		(rollout.CanaryStatusFor(&d.ISVC.Status, primary) == nil || rollout.CanaryStatusFor(&d.ISVC.Status, primary).StableRevisionHash == "") {
+		(rollout.CanaryStatusFor(&d.ISVC.Status, primary) == nil || rollout.CanaryStatusFor(&d.ISVC.Status, primary).StableRevisionHash == "") &&
+		(!v1beta1.RolloutRunActive(d.ISVC) || groupRetargeted(d.ISVC, d.Group, primary)) {
 		return d.wait(), nil
 	}
 
-	now := d.Now
-	if now.IsZero() {
-		now = time.Now()
-	}
-
-	secondaryReady, secondaryFresh, secondaryObserved, secondaryWait, err := secondaryCapacityReady(ctx, d.Reader, d.ISVC, perRev, observedPods, primary, d.Group, now)
-	if err != nil {
-		return Outcome{}, err
-	}
 	if !secondaryFresh {
 		return d.wait(), nil
 	}
@@ -247,6 +272,11 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
+	// The names a stop at the cutover reports are built only on the pass
+	// that stops, so the roll's other passes pay nothing for them.
+	offTarget := func() map[v1beta1.ComponentType][]string {
+		return instancesOffTarget(d.ISVC, d.Group, primary, revisions, secondaryObserved, observedPods)
+	}
 	in := ReconcileInputs{
 		Client:                    d.Client,
 		Reader:                    d.Reader,
@@ -260,6 +290,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 		CanaryPairingProtocol:     canaryProtocol,
 		StablePairingProtocol:     stableProtocol,
 		ReadyCanaryInstances:      revisions.servingTargetInstances(),
+		ReadyStableInstances:      revisions.servingInstances(stableHash),
 		CapacityWindowWait:        soonestWait(revisions.windowWait(observedPods[primary], now), secondaryWait),
 		DesiredReplicas:           DesiredReplicas(revisions.replicas, componentExtension(d.ISVC, primary)),
 		PerRevisionPods:           readyRev[primary],
@@ -268,6 +299,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 		GroupReadyPerRevisionPods: readyRev,
 		Crash:                     canaryCrash(d.ISVC, d.Group, primary, revisions, secondaryObserved, observedPods, now),
 		CanaryRestartedAt:         canaryRestartedAt(d.ISVC, d.Group, primary, revisions, secondaryObserved, observedPods),
+		InstancesOffTarget:        offTarget,
 		SecondaryCapacityReady:    secondaryReady,
 		Secondaries:               secondaries,
 		Now:                       now,
@@ -303,10 +335,31 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 	// stages capacity on all group Components, so a PD rollback must revert all of
 	// them — signaling only the primary leaves the engine/decoder serving the
 	// rejected revision behind the rolled-back router.
+	// A replica created pointed at the unit's stable side keeps that target
+	// until every Instance of it has run a revision, so the step's partition
+	// has a revision to hold the Instances on before the roll stages its share.
+	// The signal is written before the status flush, so it follows the live
+	// record alone: a pass whose copy of the record is stale decides from a
+	// record a later pass has moved, the flush keeps the live record over its
+	// decisions, and the revert targets are left as they stand for the pass
+	// that reads the live record.
+	current, err := d.recordCurrent(ctx)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if !current {
+		log.FromContext(ctx).V(1).Info("canary record read by this pass is stale; the replicas' revert targets are left as they stand",
+			"InferenceService", d.ISVC.Name, "unit", primary)
+		recordDispatch(d.Recorder, d.ISVC, primary, res)
+		return Outcome{RequeueAfter: res.RequeueAfter, Requeue: res.Requeue, Consume: res.Consume}, nil
+	}
+	holdsSide := unitKeepsStableSide(d.ISVC, d.Group, primary)
 	missingStable := false
 	for _, comp := range configuredComponents(d.Group) {
 		persistedStable := componentStableRevisionHash(d.ISVC, comp, primary)
-		missing, err := reconcileRollbackSignal(ctx, d.Client, d.Reader, d.ISVC, comp, persistedStable, res.RolledBack)
+		observed := memberObservation(comp, primary, revisions, secondaryObserved)
+		keep := holdsSide && anInstanceHasNotRun(observed.rows)
+		missing, err := reconcileRollbackSignal(ctx, d.Client, d.Reader, d.ISVC, comp, observed.stored, persistedStable, res.RolledBack, keep)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -333,12 +386,43 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 	return Outcome{RequeueAfter: res.RequeueAfter, Requeue: res.Requeue, Consume: res.Consume}, nil
 }
 
+// recordCurrent reports whether the canary record this pass read is still
+// the live one, read through the live reader. A service that is gone has no
+// live record to follow, so nothing is written for it either.
+func (d DispatchDeps) recordCurrent(ctx context.Context) (bool, error) {
+	if d.Base == nil || d.Reader == nil {
+		return true, nil
+	}
+	live := &v1beta1.InferenceService{}
+	if err := d.Reader.Get(ctx, client.ObjectKeyFromObject(d.ISVC), live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read the live record before the revert targets: %w", err)
+	}
+	return d.Base.Current(&live.Status), nil
+}
+
+// sweepMemberServices is the sweep of one member's unused per-revision
+// Services, worked from the replica the member's observation read; a
+// member the pass holds no observation of is read by the sweep itself.
+func sweepMemberServices(ctx context.Context, d DispatchDeps, comp v1beta1.ComponentType, observed observedCanaryRevisions, liveHashes map[string]int32) error {
+	if observed.stored == nil {
+		return coordination.SweepPerRevisionServices(ctx, d.Client, d.Reader, d.ISVC, comp, liveHashes)
+	}
+	return coordination.SweepPerRevisionServicesOfReplica(ctx, d.Client, d.Reader, d.ISVC, comp, observed.stored, liveHashes)
+}
+
 // reconcileRollbackSignal sets (rolledBack) or clears one Component IR's
 // Spec.Pacing.RollbackToRevision. When rolling back it points at the STABLE
 // pre-canary ControllerRevision so the IR reconciler overrides its desired
 // template with that revision and rolls every Instance back to it. stableHash
 // is the persisted stable identity for this Component ("" when none is
-// recorded). Idempotent — only writes on a change.
+// recorded). A standing hold writes its target once: a target already on
+// the replica that names a retained ControllerRevision of the stable
+// revision is read and left, with no history lookup and no write. The
+// history is consulted only for a replica that carries no target, one
+// naming another revision, or one whose ControllerRevision is gone.
 //
 // The target is resolved from the IR's ControllerRevision history, NOT from
 // ir.Status.CurrentRevision: CurrentRevision is promoted to the canary revision
@@ -354,23 +438,56 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 // ControllerRevision is not retained: there is nothing to point the
 // workload at, and the caller parks the canary rather than leave the revert
 // reported as in progress.
-func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, stableHash string, rolledBack bool) (missingStable bool, err error) {
+//
+// keepStableSide keeps a target that names the stable revision on a replica
+// no rollback holds: the projection created the replica pointed at the
+// stable side its unit keeps, and an Instance of it has still to run a
+// revision, so the target stays until the fleet has a side of its own.
+//
+// stored is the replica as the pass read it, and the object a write
+// carries; a member the pass holds no observation of is read here. The
+// write is guarded by the replica's resourceVersion, and the pass read the
+// replica before it listed the pods and ran the steps: a replica another
+// writer moved in between answers the write with a conflict, and the signal
+// then decides once more from a fresh read, as it does for an unobserved
+// member. A conflict on that read's write is the caller's.
+func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, stored *v1beta1.InferenceReplica, stableHash string, rolledBack, keepStableSide bool) (missingStable bool, err error) {
 	if c == nil || reads == nil {
 		return false, nil
 	}
-	ir := &v1beta1.InferenceReplica{}
-	key := irprojector.RoleReplicaKey(isvc, comp)
-	if err := reads.Get(ctx, key, ir); err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, nil
+	missingStable, err = writeRollbackSignal(ctx, c, reads, isvc, comp, stored, stableHash, rolledBack, keepStableSide)
+	if stored == nil || !apierrors.IsConflict(err) {
+		return missingStable, err
+	}
+	return writeRollbackSignal(ctx, c, reads, isvc, comp, nil, stableHash, rolledBack, keepStableSide)
+}
+
+// writeRollbackSignal is one decision and write of the rollback signal on
+// stored, or on a fresh live read of the member when stored is nil.
+func writeRollbackSignal(ctx context.Context, c client.Client, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, stored *v1beta1.InferenceReplica, stableHash string, rolledBack, keepStableSide bool) (missingStable bool, err error) {
+	ir := stored
+	if ir == nil {
+		ir = &v1beta1.InferenceReplica{}
+		key := irprojector.RoleReplicaKey(isvc, comp)
+		if err := reads.Get(ctx, key, ir); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
 		}
-		return false, err
 	}
 	var want *string
 	if rolledBack {
 		// An unknown stable identity must not clear a rollback signal that may
 		// already carry the correct target, or guess from revision ordering.
 		if stableHash == "" {
+			return false, nil
+		}
+		retained, err := revertTargetRetained(ctx, c, ir, stableHash)
+		if err != nil {
+			return false, err
+		}
+		if retained {
 			return false, nil
 		}
 		stable, err := stableRevisionName(ctx, reads, isvc, comp, ir, stableHash)
@@ -385,6 +502,8 @@ func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.
 			return true, nil
 		}
 		want = &stable
+	} else if keepStableSide && revertTargetNamesStable(ir, stableHash) {
+		return false, nil
 	}
 	var cur *string
 	if ir.Spec.Pacing != nil {
@@ -400,6 +519,67 @@ func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.
 	return false, c.Update(ctx, ir)
 }
 
+// revertTargetRetained reports whether the replica's revert target already
+// names a ControllerRevision of the stable revision that is retained and
+// that the replica controls. The ControllerRevision is read through the
+// cache: it is immutable from create, so the cache can only lag its loss,
+// which the next pass then reads from the history as the live reader does.
+func revertTargetRetained(ctx context.Context, c client.Client, ir *v1beta1.InferenceReplica, stableHash string) (bool, error) {
+	if !revertTargetNamesStable(ir, stableHash) {
+		return false, nil
+	}
+	name := *ir.Spec.Pacing.RollbackToRevision
+	cr := &appsv1.ControllerRevision{}
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ir.Namespace, Name: name}, cr); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return metav1.IsControlledBy(cr, ir), nil
+}
+
+// revertTargetNamesStable reports whether the replica's revert target names
+// a ControllerRevision of the stable revision.
+func revertTargetNamesStable(ir *v1beta1.InferenceReplica, stableHash string) bool {
+	if stableHash == "" || ir.Spec.Pacing == nil || ir.Spec.Pacing.RollbackToRevision == nil {
+		return false
+	}
+	return query.RevisionFromName(*ir.Spec.Pacing.RollbackToRevision).Same(query.RevisionFromHash(stableHash))
+}
+
+// unitKeepsStableSide reports whether the unit keeps a stable side as this
+// pass left it, read from the primary's record and rollout phase under the
+// group's step count: a rollback, a step short of the last, or a stop with a
+// stable revision.
+func unitKeepsStableSide(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, primary v1beta1.ComponentType) bool {
+	cs := rollout.CanaryStatusFor(&isvc.Status, primary)
+	return cs != nil && holdsStableSide(cs, isvc.Status.Components[primary].RolloutPhase, len(g.Canary.Steps))
+}
+
+// memberObservation is a member's observation: the primary's own, else the
+// secondary's; empty for a member no replica was observed for.
+func memberObservation(comp, primary v1beta1.ComponentType, primaryObserved observedCanaryRevisions, secondaryObserved map[v1beta1.ComponentType]observedCanaryRevisions) observedCanaryRevisions {
+	if comp == primary {
+		return primaryObserved
+	}
+	return secondaryObserved[comp]
+}
+
+// anInstanceHasNotRun reports whether some row of a replica records no
+// revision run: an Instance still being built for the first time, or one
+// whose first build failed and awaits its retry, which the create pass
+// opens as a fresh start. Neither has a revision of its own for a partition
+// to hold it on, so the replica's target decides what they are built on.
+func anInstanceHasNotRun(rows []v1beta1.OMENativeInstanceStatus) bool {
+	for i := range rows {
+		if rows[i].RunningRevision == "" {
+			return true
+		}
+	}
+	return false
+}
+
 // stableRevisionName resolves the ControllerRevision name of an exact stable
 // revision hash. Rollback safety requires an explicit identity: revision
 // ordering cannot distinguish a promoted revision from a newer transient one.
@@ -409,36 +589,33 @@ func reconcileRollbackSignal(ctx context.Context, c client.Client, reads client.
 // status nor the live pod set still names the stable revision, but its
 // ControllerRevision is retained.
 //
-// Only a revision the Component's replica controls qualifies: the labels also
-// match revisions another object controls, and the replica refuses a rollback
-// target it does not control.
+// Only a revision of the replica's history qualifies: one the replica
+// controls, or one its service owns, which a replica projected again after
+// a deletion reads as its own. The labels also match revisions another
+// object controls, and the replica refuses a rollback target outside its
+// history.
 func stableRevisionName(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType, ir *v1beta1.InferenceReplica, stableHash string) (string, error) {
 	if stableHash == "" {
 		return "", nil
 	}
-	list := &appsv1.ControllerRevisionList{}
-	sel := labels.SelectorFromSet(labels.Set{
-		constants.InferenceServicePodLabelKey: irprojector.RoleReplicaPrefix(isvc, comp),
-		constants.OMEComponentLabel:           string(comp),
-		query.LabelManagedBy:                  query.ManagedByOMENative,
-	})
-	if err := reads.List(ctx, list, client.InNamespace(isvc.Namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
+	history, err := memberRevisionHistory(ctx, reads, isvc, comp)
+	if err != nil {
 		return "", err
 	}
 	want := query.RevisionFromHash(stableHash)
-	for i := range list.Items {
-		cr := &list.Items[i]
+	for i := range history {
+		cr := &history[i]
 		if !query.RevisionOf(cr).Same(want) {
 			continue
 		}
-		if metav1.IsControlledBy(cr, ir) {
+		if revision.RetainedBy(cr, ir.UID, irprojector.HistoryScope(ir)) {
 			return cr.Name, nil
 		}
 		var controllerKind, controllerName, controllerUID string
 		if ref := metav1.GetControllerOf(cr); ref != nil {
 			controllerKind, controllerName, controllerUID = ref.Kind, ref.Name, string(ref.UID)
 		}
-		log.FromContext(ctx).V(1).Info("Revision matches the stable hash but the replica does not control it; not pinning it",
+		log.FromContext(ctx).V(1).Info("Revision matches the stable hash but belongs to neither the replica nor its service; not used as the rollback target",
 			"revision", cr.Name, "controllerKind", controllerKind, "controllerName", controllerName,
 			"controllerUID", controllerUID, "inferenceReplica", ir.Name, "inferenceReplicaUID", string(ir.UID))
 	}
@@ -522,10 +699,11 @@ func secondaryRevisions(ctx context.Context, reads client.Reader, isvc *v1beta1.
 		}
 		target := observed[comp].targetHash
 		m := MemberRevisions{
-			CanaryRevisionHash:  target,
-			StableRevisionHash:  stable[comp],
-			ReadyCanaryCapacity: canaryCapacity(observed[comp].servingTargetInstances(), readyPerRev[comp][target]),
-			DesiredReplicas:     DesiredReplicas(observed[comp].replicas, componentExtension(isvc, comp)),
+			CanaryRevisionHash:   target,
+			StableRevisionHash:   stable[comp],
+			ReadyCanaryCapacity:  canaryCapacity(observed[comp].servingTargetInstances(), readyPerRev[comp][target]),
+			DesiredReplicas:      DesiredReplicas(observed[comp].replicas, componentExtension(isvc, comp)),
+			ReadyStableInstances: observed[comp].servingInstances(stable[comp]),
 		}
 		prefix := irprojector.RoleReplicaPrefix(isvc, comp)
 		var err error
@@ -725,7 +903,11 @@ type observedCanaryRevisions struct {
 	// rows are the IR's per-Instance rows in the dense shape, the capacity
 	// gate's count and the crash reading's anchors; empty when the
 	// observation is not an IR's.
-	rows        []v1beta1.OMENativeInstanceStatus
+	rows []v1beta1.OMENativeInstanceStatus
+	// stored is the replica as the live reader handed it, the form a write
+	// of it carries and the object the Services sweep reads; nil when the
+	// observation is not an IR's.
+	stored      *v1beta1.InferenceReplica
 	fromIR      bool
 	statusFresh bool
 }
@@ -740,26 +922,74 @@ func (r observedCanaryRevisions) servingTargetInstances() *int32 {
 	if !r.fromIR {
 		return nil
 	}
-	serving := int32(0)
 	if r.targetHash == "" {
+		serving := int32(0)
 		return &serving
 	}
-	target := query.RevisionFromHash(r.targetHash)
-	shape := instanceShape(r.runners)
+	return r.servingInstances(r.targetHash)
+}
+
+// servingInstances is the replica's account of the capacity one revision
+// has, counted as servingTargetInstances counts the target's. A non-IR
+// observation or no revision returns nil.
+func (r observedCanaryRevisions) servingInstances(hash string) *int32 {
+	if !r.fromIR || hash == "" {
+		return nil
+	}
+	serving := int32(0)
+	revision, shape := query.RevisionFromHash(hash), instanceShape(r.runners)
 	for i := range r.rows {
-		row := &r.rows[i]
-		if !query.RevisionFromName(row.RunningRevision).Same(target) {
-			continue
+		if r.rowServesTarget(&r.rows[i], revision, shape) {
+			serving++
 		}
-		if !workloadstatus.InstanceMeetsThreshold(row.PodCount, row.ServingPodCount, shape) {
-			continue
-		}
-		if r.minReadySeconds > 0 && !workloadstatus.InstanceMeetsThreshold(row.PodCount, row.AvailablePodCount, shape) {
-			continue
-		}
-		serving++
 	}
 	return &serving
+}
+
+// rowServesTarget reports whether one Instance row counts as capacity on
+// the target revision: it runs target with the declared pod set (shape) in
+// rotation and, under the Component's minReadySeconds, reported available.
+// target and shape are the observation's own, resolved once for every row.
+func (r observedCanaryRevisions) rowServesTarget(row *v1beta1.OMENativeInstanceStatus, target query.RevisionID, shape int32) bool {
+	if !query.RevisionFromName(row.RunningRevision).Same(target) {
+		return false
+	}
+	if !workloadstatus.InstanceMeetsThreshold(row.PodCount, row.ServingPodCount, shape) {
+		return false
+	}
+	return r.minReadySeconds <= 0 || workloadstatus.InstanceMeetsThreshold(row.PodCount, row.AvailablePodCount, shape)
+}
+
+// instancesOffTarget names the Instances the replica does not count as
+// serving on its target revision, each with the phase its row reports, in
+// index order: the Instances a stop at the cutover names. Empty for a
+// non-IR observation or a replica with no target.
+func (r observedCanaryRevisions) instancesOffTarget() []string {
+	if !r.fromIR || r.targetHash == "" {
+		return nil
+	}
+	target, shape := query.RevisionFromHash(r.targetHash), instanceShape(r.runners)
+	var names []string
+	for i := range r.rows {
+		row := &r.rows[i]
+		if !r.rowServesTarget(row, target, shape) {
+			names = append(names, fmt.Sprintf("Instance %d (%s)", row.Index, row.Phase))
+		}
+	}
+	return names
+}
+
+// instancesOffTarget collects, per retargeted member, the Instances that do
+// not serve the member's target revision, the primary first.
+func instancesOffTarget(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, primary v1beta1.ComponentType, primaryObserved observedCanaryRevisions, secondaryObserved map[v1beta1.ComponentType]observedCanaryRevisions, pods map[v1beta1.ComponentType][]*corev1.Pod) map[v1beta1.ComponentType][]string {
+	out := map[v1beta1.ComponentType][]string{}
+	canaryMembers(isvc, g, primary, primaryObserved, secondaryObserved, pods, func(comp v1beta1.ComponentType, observed observedCanaryRevisions, _ []*corev1.Pod) bool {
+		if names := observed.instancesOffTarget(); len(names) > 0 {
+			out[comp] = names
+		}
+		return true
+	})
+	return out
 }
 
 // instanceShape is the pod count one Instance of the declared runner set
@@ -807,27 +1037,30 @@ func (r observedCanaryRevisions) windowWait(pods []*corev1.Pod, now time.Time) t
 // The per-Instance rows are decoded with the decoder the reader carries, so
 // the capacity gate and the crash reading read each Instance as the replica
 // published it; a payload that cannot be decoded is an error, as it is for
-// every reader of the rows.
+// every reader of the rows. The rows are decoded on a copy: the replica as
+// read is kept for the Services sweep and the rollback signal, so a pass
+// reads each member's replica once.
 func observeCanaryRevisions(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (observedCanaryRevisions, error) {
 	if reads != nil {
 		ir := &v1beta1.InferenceReplica{}
 		key := irprojector.RoleReplicaKey(isvc, c)
-		switch _, err := irstatus.GetDecoded(ctx, reads, key, ir); {
+		switch decoded, _, err := irstatus.GetDecodedCopy(ctx, reads, key, ir); {
 		case err == nil:
-			currentHash := query.RevisionFromName(ir.Status.CurrentRevision).Hash()
-			targetHash := query.RevisionFromName(ir.Status.UpdateRevision).Hash()
+			currentHash := query.RevisionFromName(decoded.Status.CurrentRevision).Hash()
+			targetHash := query.RevisionFromName(decoded.Status.UpdateRevision).Hash()
 			if targetHash == "" {
 				targetHash = currentHash
 			}
 			observed := observedCanaryRevisions{
 				currentHash:     currentHash,
 				targetHash:      targetHash,
-				replicas:        ir.Spec.Replicas,
-				runners:         ir.Spec.Runners,
-				minReadySeconds: ir.Spec.MinReadySeconds,
-				rows:            ir.Status.InstanceStatuses,
+				replicas:        decoded.Spec.Replicas,
+				runners:         decoded.Spec.Runners,
+				minReadySeconds: decoded.Spec.MinReadySeconds,
+				rows:            decoded.Status.InstanceStatuses,
+				stored:          ir,
 				fromIR:          true,
-				statusFresh:     ir.Status.ObservedGeneration == ir.Generation,
+				statusFresh:     decoded.Status.ObservedGeneration == decoded.Generation,
 			}
 			if !observed.statusFresh || targetHash != "" {
 				return observed, nil

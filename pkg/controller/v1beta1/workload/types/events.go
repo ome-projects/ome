@@ -117,6 +117,14 @@ const (
 	// rolls toward the newer target from there. Normal, not a failure.
 	EventReasonSurgeKeptForPairing EventReason = "SurgeKeptForPairing"
 
+	// EventReasonInPlaceKeptForPairing fires when an in-place attempt whose
+	// revision the desired state no longer names promotes onto it anyway:
+	// its pod serves that revision's pairing protocol, the one the
+	// coordination gate admitted the patch onto, and the newer target names
+	// another protocol. The Instance rolls toward the newer target from
+	// there, through the gate again. Normal, not a failure.
+	EventReasonInPlaceKeptForPairing EventReason = "InPlaceKeptForPairing"
+
 	// Restart (workload/ops/restart.go).
 	EventReasonRestartTriggered EventReason = "RestartTriggered"
 	EventReasonRestartCompleted EventReason = "RestartCompleted"
@@ -169,6 +177,13 @@ const (
 	// directives spent stays spent.
 	EventReasonNodeExclusionReleased EventReason = "NodeExclusionReleased"
 
+	// EventReasonSchedulingRequestedAgain fires when the escalation pass
+	// writes a pod of a multi-pod Instance that has waited for a node past
+	// lifecycle.schedulingRetry.after. The write puts a pod the scheduler's
+	// queue has lost track of back in its active queue and leaves a pod the
+	// queue still holds where it is.
+	EventReasonSchedulingRequestedAgain EventReason = "SchedulingRequestedAgain"
+
 	// EventReasonInstanceFailed fires when an escalation backstop (the
 	// stuck-pod fast path or the deadline disposition) stamps an
 	// Instance Phase=Failed. Emitted by adapters through
@@ -217,12 +232,26 @@ const (
 	// Pending. Status-only; recovery stays with the ordinary passes.
 	EventReasonInstanceDemoted EventReason = "InstanceDemoted"
 
-	// EventReasonPodForceDeleted fires when a teardown escalation
-	// force-deletes (grace 0, UID-preconditioned) a Terminating pod
-	// overdue past its own deletion deadline on a node that provably
-	// cannot acknowledge the termination (gone, or unreachable-tainted /
-	// NotReady beyond the configured threshold). Names the pod, node,
-	// evidence branch, and overdue duration.
+	// EventReasonScaleDownWaitsForRebuild fires once per Instance a
+	// scale-down retires while it still serves and another Instance the
+	// plan keeps is being rebuilt (workload/ops/delete_batch.go). The
+	// retirement waits for that rebuild to serve, so the Component keeps
+	// serving what it served through the scale; the message names the
+	// Instance waited on and its revision. Normal, not a failure: the
+	// scale lands one rebuild later.
+	EventReasonScaleDownWaitsForRebuild EventReason = "ScaleDownWaitsForRebuild"
+
+	// EventReasonPodForceDeleted fires when the force-delete policy
+	// removes a pod (grace 0, UID-preconditioned) whose node cannot finish
+	// it. That is a Terminating pod past its deletion deadline plus the
+	// overdue slack on a node gone or unreachable-tainted / NotReady beyond
+	// the threshold, or a pod its kubelet stopped reporting that holds a
+	// name a rebuild needs. When the policy skips the grace period on an
+	// unreachable node, it is also a pod inside its grace period on a node
+	// whose kubelet has stopped reporting for the threshold. Names the pod,
+	// node, evidence branch and, for a Terminating pod, how far it was from
+	// its deletion deadline. For a pod that went before that deadline plus
+	// the slack, the text also says that OME did not wait.
 	EventReasonPodForceDeleted EventReason = "PodForceDeleted"
 
 	// EventReasonRepairHeld fires when a crash-loop repair is denied by
@@ -313,11 +342,11 @@ const (
 	// The row stays Failed until an operator resets it or a new revision
 	// arrives.
 	EventReasonRepairRetriesExhausted EventReason = "RepairRetriesExhausted"
-	// EventReasonRepairWaitingOnWorkload is a Warning fired once per parked
-	// attempt when a repair is parked on a cause the kubelet retries in
+	// EventReasonRepairWaitingOnWorkload is a Warning fired once per stopped
+	// attempt when a repair stopped on a cause the kubelet retries in
 	// place and a fresh pod set cannot clear: a container config or image
-	// the pod template names (IsWorkloadCausedReason). The retry ladder
-	// owes the park no re-arm; the row stays Failed with its reason until
+	// the pod template names (KubeletRetriesInPlace). The retry schedule
+	// owes it no new attempt; the row stays Failed with its reason until
 	// the configuration or image is fixed and resumes on its own once the
 	// kubelet starts the pod.
 	EventReasonRepairWaitingOnWorkload EventReason = "RepairWaitingOnWorkload"

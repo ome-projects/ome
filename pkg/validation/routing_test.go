@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 func TestValidateRouting_PolicyShapes_RequiresPositiveCapacityFactors(t *testing.T) {
@@ -216,6 +217,61 @@ func TestValidateRouting_PublisherOptions_RejectsBlankLongOrTooMany(t *testing.T
 			assert.Contains(t, err.Error(), tt.wantContain)
 		})
 	}
+}
+
+func TestValidateRoutingPublisherOptionAnnotations_SameLimitsAsSpecOptions(t *testing.T) {
+	annotation := func(option string) string {
+		return constants.RoutingPublisherOptionAnnotationPrefix + option
+	}
+	atLimit := make(map[string]string, v1beta1.MaxRoutingPublisherOptions)
+	for i := 0; i < v1beta1.MaxRoutingPublisherOptions; i++ {
+		atLimit[annotation(fmt.Sprintf("key-%d", i))] = "value"
+	}
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		spec        map[string]string
+		wantContain string
+	}{
+		{name: "no annotations"},
+		{name: "unrelated annotations", annotations: map[string]string{"example.com/key": ""}},
+		{name: "an option", annotations: map[string]string{annotation("routingClass"): "premium"}},
+		{name: "an option beside a different spec option",
+			annotations: map[string]string{annotation("routingClass"): "premium"},
+			spec:        map[string]string{"tier": "a"}},
+		{name: "empty value", annotations: map[string]string{annotation("routingClass"): ""},
+			wantContain: "must not be empty"},
+		{name: "whitespace value", annotations: map[string]string{annotation("routingClass"): " \t"},
+			wantContain: "must not be empty"},
+		{name: "value too long",
+			annotations: map[string]string{annotation("routingClass"): strings.Repeat("v", v1beta1.MaxRoutingPublisherOptionValueBytes+1)},
+			wantContain: "byte value limit"},
+		{name: "the same option in the spec",
+			annotations: map[string]string{annotation("routingClass"): "premium"},
+			spec:        map[string]string{"routingClass": "standard"},
+			wantContain: "is set both in spec.routing.publisher.options and in annotation"},
+		{name: "more options than the limit with the spec's",
+			annotations: atLimit,
+			spec:        map[string]string{"tier": "a"},
+			wantContain: "at most"},
+		{name: "exactly the limit", annotations: atLimit},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := routingSpec(nil)
+			if tt.spec != nil {
+				spec = routingSpec(&v1beta1.RoutingSpec{Publisher: &v1beta1.RoutingPublisherSpec{Options: tt.spec}})
+			}
+			err := ValidateRoutingPublisherOptionAnnotations(tt.annotations, spec)
+			if tt.wantContain == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantContain)
+		})
+	}
+	require.NoError(t, ValidateRoutingPublisherOptionAnnotations(map[string]string{annotation("routingClass"): "premium"}, nil))
 }
 
 func routingSpec(routing *v1beta1.RoutingSpec) *v1beta1.InferenceServiceSpec {

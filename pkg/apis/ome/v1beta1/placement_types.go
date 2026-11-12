@@ -41,8 +41,7 @@ const (
 
 // PlacementSpec declares explicit multi-cluster matching and allocation intent.
 // +kubebuilder:validation:XValidation:rule="!has(self.replacementTimeout) || (has(self.policy) && self.policy == 'ClusterAffinity' && has(self.mode) && self.mode == 'Single')",message="replacementTimeout requires Single placement"
-// +kubebuilder:validation:XValidation:rule="!has(self.clusterAffinity) || !(self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) && self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.default) || has(t.weights.engine) || has(t.weights.decoder) || has(t.weights.router))))",message="clusterAffinity weights use either default/engine/decoder/router or the *Replicas ratios, not both"
-// +kubebuilder:validation:XValidation:rule="!has(self.clusterAffinity) || !self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) || (self.mode == 'Split' && !has(self.split))",message="*Replicas ratios are allowed only in Split and replace spec.placement.split; remove split"
+// +kubebuilder:validation:XValidation:rule="!has(self.clusterAffinity) || !self.clusterAffinity.exists(t, has(t.weights)) || (self.mode == 'Split' && !has(self.split))",message="clusterAffinity weights are allowed only in Split and replace spec.placement.split; remove split"
 type PlacementSpec struct {
 	// Policy selects affinity matching and persisted allocation plans.
 	// +required

@@ -249,11 +249,11 @@ func (p *ModelConfigParser) updateParsedModelMetadata(baseModel *v1beta1.BaseMod
 // config.json → transformer, hf_quant_config.json → standalone quant
 // config, safetensors / .index.json → counting helper. When several
 // folders hold a model_index.json, config.json or hf_quant_config.json,
-// the one nearest the model root wins (see locationRank), so a
-// sentence-transformers module's 1_Pooling/config.json does not shadow
-// the model's own. A config_sentence_transformers.json beside the chosen
-// config.json rides along with it. Files outside the recognized basename
-// set are dropped silently.
+// the one nearest the model root wins (see locationRank), so the model's
+// own config.json is read rather than a sentence-transformers module's
+// 1_Pooling/config.json. A config_sentence_transformers.json beside the
+// chosen config.json rides along with it. Files outside the recognized
+// basename set are dropped silently.
 func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInput) (*modelconfig.ModelConfigInput, []modelconfig.SafetensorsFileInput, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -313,21 +313,28 @@ func splitModelConfigFileInputs(ctx context.Context, files []ModelConfigFileInpu
 		return modelIndexInput, safetensorsFiles, hfQuantConfigBytes, nil
 	}
 	if configInput != nil {
-		stConfigPath := path.Join(path.Dir(configInput.Path), modelconfig.SentenceTransformersConfigFileName)
-		for _, file := range normalized {
-			if file.Path == stConfigPath {
-				configInput.SentenceTransformersConfig = file.Data
-				break
-			}
-		}
+		configInput.SentenceTransformersConfig = sentenceTransformersConfigBeside(configInput.Path, normalized)
 	}
 	return configInput, safetensorsFiles, hfQuantConfigBytes, nil
 }
 
-// locationRank orders input paths that share a base name the way the
-// directory path searches: the model root first, then commonConfigSubdirs
-// in order (findInCommonLocations), then any other folder, shallowest
-// first. Lower ranks win; on a tie the path that sorts first is kept.
+// sentenceTransformersConfigBeside returns the data of the
+// config_sentence_transformers.json in the same directory as configPath,
+// or nil. The file describes only the config.json beside it.
+func sentenceTransformersConfigBeside(configPath string, files []ModelConfigFileInput) []byte {
+	want := path.Join(path.Dir(configPath), modelconfig.SentenceTransformersConfigFileName)
+	for _, file := range files {
+		if file.Path == want {
+			return file.Data
+		}
+	}
+	return nil
+}
+
+// locationRank orders input paths that share a base name: the model root
+// first, then commonConfigSubdirs in order (as findFile searches a
+// directory), then any other folder, shallowest first. Lower ranks win;
+// on a tie the path that sorts first is kept.
 func locationRank(filePath string) int {
 	dir := path.Dir(filePath)
 	if dir == "." {

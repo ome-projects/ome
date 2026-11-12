@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // TickView is the read-only picture of one tick an observer receives once
@@ -40,6 +41,9 @@ type TickView struct {
 	Revisions []*appsv1.ControllerRevision
 	// Run is what the run layer did in the pass.
 	Run RunView
+	// Policies are the RolloutPolicy objects the pass composed its plan
+	// from, so a reader can resolve the effective groups as the pass did.
+	Policies rollout.Policies
 }
 
 // RunView is the run layer's outcome for one pass.

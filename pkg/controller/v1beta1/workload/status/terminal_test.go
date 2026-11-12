@@ -487,3 +487,63 @@ func TestRecordRecycleAttempt_KeepsTheRecordedFailureAcrossRecyclesOfTheSamePod(
 		t.Fatalf("LastFailure = %+v, want the new failure %+v recorded", got, other)
 	}
 }
+
+// A repair opened for a runner's exit keeps that exit on the row while it
+// rebuilds the set: a member the kubelet refuses before any container
+// runs is deleted for its replacement, and its pod-level record must not
+// replace the exit the rebuilt set's next death is read against. A later
+// record that names a container replaces the exit, as the newest exit
+// always has.
+func TestRecordOfAMemberThatNeverRan_KeepsTheRunnerExit(t *testing.T) {
+	exitAt := time.Date(2026, time.November, 2, 0, 0, 0, 0, time.UTC)
+	exitCode := int32(1)
+	exit := types.InstanceTermination{PodName: "engine-0-leader-0", ContainerName: "ome-container", Reason: "Error", ExitCode: &exitCode, Time: metav1.NewTime(exitAt)}
+	w := newRowWriter(types.InstanceStatus{
+		Index: 0, Phase: types.InstancePhaseRestarting, LastFailure: &exit,
+		Operation: &types.InstanceOperation{ID: "restart-0-1", Type: types.InstanceOperationRestart},
+	})
+	record := func(at time.Time, termination *types.InstanceTermination) {
+		t.Helper()
+		if _, err := RecordRecycleAttempt(context.Background(), w.input(at), 0, types.InstanceOperationRestart, metav1.NewTime(at), termination, metav1.NewTime(at.Add(-time.Second))); err != nil {
+			t.Fatalf("record at %s: %v", at, err)
+		}
+	}
+
+	refusedAt := exitAt.Add(10 * time.Second)
+	record(refusedAt, &types.InstanceTermination{PodName: "engine-0-worker-0", Reason: "UnexpectedAdmissionError", Time: metav1.NewTime(refusedAt)})
+	got := w.rows[0]
+	if got.Operation.RetryCount != 1 || !got.Operation.LastProgressAt.Time.Equal(refusedAt) {
+		t.Fatalf("Operation = %+v, want the retry count raised and anchored at %s", got.Operation, refusedAt)
+	}
+	if got.LastFailure == nil || *got.LastFailure != exit {
+		t.Fatalf("LastFailure = %+v, want the leader's exit kept over the refused worker", got.LastFailure)
+	}
+
+	crashedAt := refusedAt.Add(10 * time.Second)
+	crashCode := int32(137)
+	crash := types.InstanceTermination{PodName: "engine-0-worker-0", ContainerName: "ome-container", Reason: "OOMKilled", ExitCode: &crashCode, Time: metav1.NewTime(crashedAt)}
+	record(crashedAt, &crash)
+	if got := w.rows[0].LastFailure; got == nil || *got != crash {
+		t.Fatalf("LastFailure = %+v, want the worker's own exit %+v recorded", got, crash)
+	}
+}
+
+// A pod-level record replaces a pod-level record: a set whose members
+// never ran keeps the newest refusal, since neither names an exit the
+// rebuilt set's death could be read against.
+func TestRecordOfAMemberThatNeverRan_ANewerRefusalReplacesARefusal(t *testing.T) {
+	first := time.Date(2026, time.November, 2, 0, 0, 0, 0, time.UTC)
+	w := newRowWriter(types.InstanceStatus{
+		Index: 0, Phase: types.InstancePhaseRestarting,
+		LastFailure: &types.InstanceTermination{PodName: "engine-0-worker-0", Reason: "UnexpectedAdmissionError", Time: metav1.NewTime(first)},
+		Operation:   &types.InstanceOperation{ID: "restart-0-1", Type: types.InstanceOperationRestart},
+	})
+	later := first.Add(10 * time.Second)
+	fresh := types.InstanceTermination{PodName: "engine-0-worker-0", Reason: "OutOfcpu", Time: metav1.NewTime(later)}
+	if _, err := RecordRecycleAttempt(context.Background(), w.input(later), 0, types.InstanceOperationRestart, metav1.NewTime(later), &fresh, metav1.NewTime(later.Add(-time.Second))); err != nil {
+		t.Fatalf("record at %s: %v", later, err)
+	}
+	if got := w.rows[0].LastFailure; got == nil || *got != fresh {
+		t.Fatalf("LastFailure = %+v, want the newer refusal %+v recorded", got, fresh)
+	}
+}

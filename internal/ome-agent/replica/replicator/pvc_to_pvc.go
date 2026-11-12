@@ -12,14 +12,8 @@ import (
 
 type PVCToPVCReplicator struct {
 	Logger           logging.Interface
-	Config           PVCToPVCReplicatorConfig
+	Dependencies     Dependencies
 	ReplicationInput common.ReplicationInput
-}
-
-type PVCToPVCReplicatorConfig struct {
-	LocalPath           string
-	SourcePVCFileSystem *afero.OsFs
-	TargetPVCFileSystem *afero.OsFs
 }
 
 func (r *PVCToPVCReplicator) Replicate(objects []common.ReplicationObject) error {
@@ -36,10 +30,10 @@ func (r *PVCToPVCReplicator) Replicate(objects []common.ReplicationObject) error
 		return nil
 	}
 
-	sourceDirPath := filepath.Join(r.Config.LocalPath, r.ReplicationInput.Source.Prefix)
-	targetDirPath := filepath.Join(r.Config.LocalPath, r.ReplicationInput.Target.BucketName, r.ReplicationInput.Target.Prefix)
+	sourceDirPath := filepath.Join(r.Dependencies.LocalPath, r.ReplicationInput.Source.Prefix)
+	targetDirPath := filepath.Join(r.Dependencies.LocalPath, r.ReplicationInput.Target.BucketName, r.ReplicationInput.Target.Prefix)
 
-	err := afero.Walk(r.Config.SourcePVCFileSystem, sourceDirPath, func(path string, info os.FileInfo, err error) error {
+	err := afero.Walk(r.Dependencies.SourceFiles, sourceDirPath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return fmt.Errorf("error accessing %q: %w", path, err)
 		}
@@ -52,10 +46,10 @@ func (r *PVCToPVCReplicator) Replicate(objects []common.ReplicationObject) error
 		destPath := filepath.Join(targetDirPath, relPath)
 
 		if info.IsDir() {
-			return r.Config.TargetPVCFileSystem.MkdirAll(destPath, info.Mode())
+			return r.Dependencies.TargetFiles.MkdirAll(destPath, info.Mode())
 		}
 
-		return afero.CopyFileBetweenFS(r.Config.SourcePVCFileSystem, r.Config.TargetPVCFileSystem, path, destPath, info.Mode())
+		return afero.CopyFileBetweenFS(r.Dependencies.SourceFiles, r.Dependencies.TargetFiles, path, destPath, info.Mode())
 	})
 
 	if err != nil {

@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 	"sigs.k8s.io/ome/pkg/validation"
+	"sigs.k8s.io/ome/pkg/webhook/admission/policyguard"
 )
 
 const testNamespace = "llm-serving"
@@ -150,6 +151,16 @@ func TestHandleCreate(t *testing.T) {
 		msg := denialMessage(t, v.Handle(context.Background(), writeRequest(t, admissionv1.Create, policy)))
 		if !strings.Contains(msg, validation.ReasonCanaryInvalid) {
 			t.Errorf("denial %q does not carry reason %s", msg, validation.ReasonCanaryInvalid)
+		}
+	})
+
+	t.Run("absolute step capacity denied as service-specific", func(t *testing.T) {
+		policy := validCanaryPolicy("canary-std-v1")
+		policy.Spec.Canary.Steps[0].Capacity = intstr.FromInt32(1)
+		v := newValidator(t)
+		msg := denialMessage(t, v.Handle(context.Background(), writeRequest(t, admissionv1.Create, policy)))
+		if !strings.Contains(msg, validation.ReasonRolloutPolicyInvalid) || !strings.Contains(msg, "spec.canary.steps[0].capacity") {
+			t.Errorf("denial %q does not name spec.canary.steps[0].capacity with reason %s", msg, validation.ReasonRolloutPolicyInvalid)
 		}
 	})
 
@@ -289,19 +300,19 @@ func TestHandleDelete(t *testing.T) {
 
 	t.Run("denial names at most the cap and counts the rest", func(t *testing.T) {
 		live := []client.Object{activeNamespace(), validCanaryPolicy(policyName)}
-		for i := 0; i < maxNamedReferencingISVCs+2; i++ {
+		for i := 0; i < policyguard.MaxNamedReferences+2; i++ {
 			live = append(live, consumer(fmt.Sprintf("llm-%02d", i), ref))
 		}
 		v := newValidator(t, live...)
 		msg := denialMessage(t, v.Handle(context.Background(), deleteRequest(t, validCanaryPolicy(policyName), true)))
-		if !strings.Contains(msg, fmt.Sprintf("%d InferenceService(s)", maxNamedReferencingISVCs+2)) {
+		if !strings.Contains(msg, fmt.Sprintf("%d InferenceService(s)", policyguard.MaxNamedReferences+2)) {
 			t.Errorf("denial %q does not carry the total count", msg)
 		}
 		if !strings.Contains(msg, "and 2 more") {
 			t.Errorf("denial %q does not summarize the overflow", msg)
 		}
-		if named := strings.Count(msg, "llm-"); named != maxNamedReferencingISVCs {
-			t.Errorf("denial names %d consumers, want %d:\n%s", named, maxNamedReferencingISVCs, msg)
+		if named := strings.Count(msg, "llm-"); named != policyguard.MaxNamedReferences {
+			t.Errorf("denial names %d consumers, want %d:\n%s", named, policyguard.MaxNamedReferences, msg)
 		}
 	})
 

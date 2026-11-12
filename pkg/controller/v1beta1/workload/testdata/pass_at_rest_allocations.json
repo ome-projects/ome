@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-07",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "One engine pass over a Component at rest at 1,000 and 4,000 single-pod Instances, every row Ready on the spec revision with its pod serving on a Node the cluster holds: the plan's observation takes the pass's one cached list of the Component's pods and the create pass reads the same list, since the pass wrote no pod between them; every finish is found unchanged on the pass's copy; no write. The pass groups its pods by Instance from one array after one count per Instance, twice per pass, reads the hold pass's readings into one buffer for every row, and writes the selection's debug line about an Instance only when a sink takes it: 116,404 allocations and 16.2 MB at 1,000 Instances, 464,527 and 67.1 MB at 4,000, from 134,665 / 17.3 MB and 539,808 / 71.7 MB recorded before the pod names were built once (9,500 and 39,500 of the difference) and before this change (8,800 and 35,800). Each reading follows a pass that fills the stand-in's buffer pools, so it is the pass's own cost and not the pools' state. The fake client encodes and decodes every pod it serves as JSON, so most of the count is the stand-in's: one list of 4,000 pods is about 400,000 allocations and 55 MB. Re-recorded from 116,404 / 16,189,096 B at 1,000 and 464,527 / 67,056,504 B at 4,000 with the create pass reading each Instance's layout in place and the hold pass's rows reading the observed rows in place instead of copying them: 2,996 and 12,007 allocations and about 244 KB and 962 KB less per pass. Re-recorded with the create pass's finish of an Instance already Ready on the revision its pods carry built without a record, a row copy, closures, a callback or a revision list of its own: 113,408 / 452,520 allocations and 15,944,960 / 66,094,784 bytes at 1000x1 / 4000x1 before, a saving inside the band at both shapes and recorded all the same so that the next saving at this site is not read against a budget it no longer measures. Re-recorded with the create pass reading each Instance's pod set against the pods' names as they stand, no name built at rest: from 107,410 / 428,525 allocations and 15,623,256 / 64,783,144 bytes at 1000x1 / 4000x1, a saving inside the band at both shapes and recorded all the same.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/allocations": 105412,
+    "1000x1/bytes": 15551256,
+    "1000x1/pod-lists": 1,
+    "4000x1/allocations": 420525,
+    "4000x1/bytes": 64471504,
+    "4000x1/pod-lists": 1
+  }
+}

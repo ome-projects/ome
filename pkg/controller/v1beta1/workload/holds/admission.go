@@ -9,8 +9,8 @@ import (
 // admissionHold is the apiserver unable to consult an admission webhook
 // on a pod write the operation issued. Admission gave no answer about
 // the object, so the Instance is waiting on infrastructure an operator
-// repairs, not stuck: the token parks the InstanceReadyTimeout clock
-// and nothing escalates while it stands.
+// repairs: the token stops the InstanceReadyTimeout clock and nothing
+// escalates while it stands.
 //
 // Like the quota refusal, the condition is an apiserver answer to a
 // write the create or patch site made, and no later pass can ask for it
@@ -23,7 +23,7 @@ import (
 // retire it: a surge or in-place roll writes to a row that is in
 // rotation, so rotation says nothing about whether admission took the
 // write, and a pass that retired the token on it would have the site
-// re-enter the wait, rewrite the row and announce it again every pass.
+// re-enter the wait, rewrite the row and publish it again every pass.
 var admissionHold = authority{
 	token:  types.RejectionReasonAdmissionUnavailable,
 	mayOwn: anyOwner,
@@ -39,7 +39,7 @@ func reportAdmission(_ context.Context, _ PassInput, row Row) (reading, error) {
 	if !types.OperationWaitingOn(row.Status.Operation, types.RejectionReasonAdmissionUnavailable) {
 		return reading{}, nil
 	}
-	return reading{waiting: true, evidence: admissionEvidence(row.Status)}, nil
+	return reading{waiting: true, evidence: admissionEvidence(*row.Status)}, nil
 }
 
 // admissionEvidence is the record the row already carries for this wait,
@@ -55,7 +55,7 @@ func admissionEvidence(s types.InstanceStatus) *types.InstanceTermination {
 // RecordAdmissionRefusal records, from the create or patch site, that
 // the apiserver could not take podName's write to admission, with the
 // apiserver's message as the row's evidence. It reports entered: the
-// transition INTO the wait, which is the one edge the caller announces,
+// transition INTO the wait, which is the one edge the caller publishes,
 // so an operator hears of the outage once per episode and not once per
 // pass, and not at all for a row another authority already reports.
 //

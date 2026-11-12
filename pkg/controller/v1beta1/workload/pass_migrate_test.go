@@ -9,13 +9,18 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/record"
 	clocktesting "k8s.io/utils/clock/testing"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
@@ -242,8 +247,13 @@ func newParkedDrainFixture(t *testing.T, withQueued bool) *parkedDrainFixture {
 	}
 	queuedCR := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: queuedRevision, Namespace: "prod"}}
 	queuedCR.Data.Raw = raw
+	// The nodes the pods are bound to exist: a pod on a Node the cluster
+	// does not hold is read as gone, which is not this fixture's story.
 	c := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(parkedSource, parkedSurge, queuedSource, queuedCR).Build()
+		WithObjects(parkedSource, parkedSurge, queuedSource, queuedCR,
+			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}},
+			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-b"}},
+			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-c"}}).Build()
 	if err := c.Delete(context.Background(), parkedSource); err != nil {
 		t.Fatalf("delete the parked source pod: %v", err)
 	}
@@ -348,12 +358,12 @@ func TestReconcile_ParkedDrainTendsTheRecordAndDispatchesTheNext(t *testing.T) {
 	}
 }
 
-// TestReconcile_ParkedDrainAlonePacesThePass: a parked record with
-// nothing queued behind it is still a migration in flight. It paces the
-// pass at the Migrate interval and ends it there — the Update and Create
-// passes do not run against the pair it still owns — exactly as a record
-// at the head does; only the head is what it gives up.
-func TestReconcile_ParkedDrainAlonePacesThePass(t *testing.T) {
+// A record waiting on its source teardown with nothing queued behind it
+// is still a migration in flight, and it still paces the pass at the
+// Migrate interval. It does not end the pass: it waits on a kubelet, not
+// on anything the engine does, so the Create pass runs beside the pair it
+// owns and a newly planned index is materialized without waiting for it.
+func TestReconcile_DrainWaitingOnItsKubeletAloneLetsTheCreatePassRun(t *testing.T) {
 	f := newParkedDrainFixture(t, false)
 	createReached := false
 	f.input.MutateInstance = func(_ context.Context, idx int32, _ func(*types.InstanceStatus) bool) error {
@@ -362,22 +372,337 @@ func TestReconcile_ParkedDrainAlonePacesThePass(t *testing.T) {
 		}
 		return nil
 	}
-	// Index 2 has no row in the observed state, so a Create pass that ran
-	// would materialize it.
+	// Index 2 has neither a row nor a pod, so the Create pass materializes
+	// it when it runs.
 	f.input.ObservedState.InstanceStatuses = f.input.ObservedState.InstanceStatuses[:2]
-	res, err := workload.Reconcile(context.Background(), f.deps, f.input, f.plan, nil)
+	if err := f.client.Delete(context.Background(), enginePod(f.input.Key.OwnerName, f.input.Key.Namespace, 2)); err != nil {
+		t.Fatalf("empty index 2: %v", err)
+	}
+	res, err := workload.Reconcile(context.Background(), f.deps, f.input, f.plan, desiredRevisionForTest(t, f.client, f.input))
 	if err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	if res.RequeueAfter != testRequeueIntervals.Operation {
-		t.Fatalf("a parked record paces the pass at the Migrate interval; got %+v", res)
+		t.Fatalf("a record waiting on its kubelet still paces the pass at the Migrate interval; got %+v", res)
 	}
-	if createReached {
-		t.Fatalf("a migration in flight ends the pass ahead of the Create pass, parked or not")
+	if !createReached {
+		t.Fatalf("a record waiting on its kubelet lets the Create pass run beside it")
 	}
 	if got := f.record(t, "u-parked"); got.Phase != types.MigrationPhaseDraining {
-		t.Fatalf("the parked record keeps its Draining phase; got %+v", got)
+		t.Fatalf("the waiting record keeps its Draining phase; got %+v", got)
 	}
+}
+
+// teardownWaitFixture is a four-Instance engine under SurgeThenDrain maxSurge
+// 1 whose Instance 0 is being moved: the replacement serves at index 4,
+// the source pod sits Terminating on a node whose kubelet is gone, and the
+// record reads Draining. With the source pod past its own deletion
+// deadline the move waits on that kubelet; inFlight leaves the pod inside
+// its grace, which is a move still making progress. Instances 1 to 3 serve the prior
+// revision. replicas above 4 plans the extra indices after the pair's.
+type teardownWaitFixture struct {
+	client  client.Client
+	deps    types.Deps
+	input   types.ReconcileInput
+	plan    types.ComponentPlan
+	target  *appsv1.ControllerRevision
+	records []types.MigrationRecord
+	// created lists the indices the Create pass wrote, in order.
+	created []int32
+}
+
+const teardownWaitUUID = "u-teardown-wait"
+
+func newTeardownWaitFixture(t *testing.T, replicas int32, inFlight bool) *teardownWaitFixture {
+	t.Helper()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	clk := clocktesting.NewFakeClock(now)
+	in := minimalInput(t)
+	in.Clock = clk
+	in.DesiredSpec.Replicas = replicas
+	in.MigrationAudit = &types.MigrationAuditPolicy{MaxInFlight: 3, MaxPerWindow: 10, Window: time.Hour}
+
+	prior := in.Key.OwnerName + "-engine-priorrev"
+	c := fake.NewClientBuilder().WithScheme(makeScheme(t)).WithObjects(teardownWaitObjects(t, in, prior, inFlight)...).Build()
+
+	f := &teardownWaitFixture{
+		client: c,
+		deps:   types.Deps{Client: c, Clock: clk, Expectations: types.NewExpectations()},
+	}
+	in.ObservedState.InstanceStatuses = teardownWaitRows(prior)
+	f.records = []types.MigrationRecord{teardownWaitRecord(now)}
+	in.ObservedState.Migrations = append([]types.MigrationRecord(nil), f.records...)
+	f.input = in
+	f.routeWrites()
+	f.plan = teardownWaitPlan(replicas)
+	f.target = desiredRevisionForTest(t, c, f.input)
+	return f
+}
+
+// teardownWaitObjects is the cluster the fixture reads: the source pod of
+// Instance 0 Terminating on node-a with a finalizer holding it, the prior
+// revision, the serving pods of Instances 1 to 4, and the replacement's
+// routed Service listing it as a Ready endpoint, which the move's tail
+// gate reads every pass. inFlight leaves the source pod inside its
+// deletion grace; otherwise it is past its own deletion deadline.
+func teardownWaitObjects(t *testing.T, in types.ReconcileInput, prior string, inFlight bool) []client.Object {
+	t.Helper()
+	now := in.Clock.Now()
+	source := enginePod(in.Key.OwnerName, in.Key.Namespace, 0)
+	source.Spec.NodeName = "node-a"
+	source.Finalizers = []string{"example.com/hold"}
+	deadline := now.Add(-time.Minute)
+	if inFlight {
+		deadline = now.Add(time.Minute)
+	}
+	deleted := metav1.NewTime(deadline)
+	source.DeletionTimestamp = &deleted
+	priorPayload, err := json.Marshal(revision.DataPayload{PodSpec: &corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "main", Image: "test:v1"}},
+	}})
+	if err != nil {
+		t.Fatalf("marshal revision payload: %v", err)
+	}
+	priorCR := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: prior, Namespace: in.Key.Namespace}}
+	priorCR.Data.Raw = priorPayload
+	// The node the source pod is bound to exists with its kubelet gone: a pod
+	// on a Node the cluster does not hold is read as gone, which is not this
+	// fixture's story.
+	objs := []client.Object{source, priorCR, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}}
+	for _, idx := range []int32{1, 2, 3, 4} {
+		objs = append(objs, servingEnginePod(idx))
+	}
+	// The replacement is in rotation: its routed Service lists it as a
+	// Ready endpoint, which the move's tail gate reads every pass.
+	replacement := servingEnginePod(4)
+	ready := true
+	return append(objs, &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "replacement-slice", Namespace: in.Key.Namespace,
+			Labels: map[string]string{discoveryv1.LabelServiceName: query.PerRevisionServiceName(in.Key.OwnerName, types.ComponentEngine, replacement.Labels[query.LabelRevisionHash])},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{"10.0.0.4"},
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready, Serving: &ready},
+			TargetRef:  &corev1.ObjectReference{Kind: "Pod", Namespace: replacement.Namespace, Name: replacement.Name},
+		}},
+	})
+}
+
+// The pair of the fixture's move: Instance 0 is the source, index 4 the
+// replacement.
+const (
+	teardownWaitSourceIdx int32 = 0
+	teardownWaitSurgeIdx  int32 = 4
+)
+
+// teardownWaitMove is the move's operation as one row of the pair carries
+// it, naming the other row as its sibling.
+func teardownWaitMove(sibling int32) *types.InstanceOperation {
+	return &types.InstanceOperation{Type: types.InstanceOperationMigrate, Step: "CreateSurge", RequestUUID: teardownWaitUUID, SurgeIndex: &sibling}
+}
+
+// teardownWaitRows is the Component's status: the source Migrating on the
+// prior revision, Instances 1 to 3 Ready on it, and the replacement
+// Creating with its one pod Ready and available.
+func teardownWaitRows(prior string) []types.InstanceStatus {
+	return []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseMigrating, RunningRevision: prior, Operation: teardownWaitMove(teardownWaitSurgeIdx)},
+		{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: prior},
+		{Index: 2, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: prior},
+		{Index: 3, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: prior},
+		{Index: 4, Incarnation: 1, Phase: types.InstancePhaseCreating, Operation: teardownWaitMove(teardownWaitSourceIdx), PodCount: 1, ReadyPodCount: 1, AvailablePodCount: 1},
+	}
+}
+
+// teardownWaitRecord is the move's record, Draining for an hour with an
+// hour left before its deadline.
+func teardownWaitRecord(now time.Time) types.MigrationRecord {
+	surgeIdx := teardownWaitSurgeIdx
+	return types.MigrationRecord{
+		RequestUUID: teardownWaitUUID, Trigger: types.MigrationTriggerManual,
+		Phase: types.MigrationPhaseDraining, SourceInstance: teardownWaitSourceIdx, SurgeInstance: &surgeIdx, FromNode: "node-a",
+		StartedAt: metav1.NewTime(now.Add(-time.Hour)), Deadline: metav1.NewTime(now.Add(time.Hour)),
+	}
+}
+
+// routeWrites lands the pass's writes in the fixture: a record mutation on
+// the record with that uuid in f.records, a row mutation on the row with
+// that index, and a mutation of an index with no row creates the row and
+// notes the index in created.
+func (f *teardownWaitFixture) routeWrites() {
+	f.input.MutateMigration = func(_ context.Context, uuid string, mutate func(*types.MigrationRecord) bool) error {
+		for i := range f.records {
+			if f.records[i].RequestUUID == uuid {
+				r := f.records[i]
+				if mutate(&r) {
+					f.records[i] = r
+				}
+				return nil
+			}
+		}
+		return nil
+	}
+	f.input.MutateInstance = func(_ context.Context, idx int32, fn func(*types.InstanceStatus) bool) error {
+		for i := range f.input.ObservedState.InstanceStatuses {
+			if f.input.ObservedState.InstanceStatuses[i].Index == idx {
+				_ = fn(&f.input.ObservedState.InstanceStatuses[i])
+				return nil
+			}
+		}
+		row := types.InstanceStatus{Index: idx}
+		if fn(&row) {
+			f.created = append(f.created, idx)
+			f.input.ObservedState.InstanceStatuses = append(f.input.ObservedState.InstanceStatuses, row)
+		}
+		return nil
+	}
+}
+
+// teardownWaitPlan plans the engine under SurgeThenDrain maxSurge 1 with
+// the pair's two indices beside the count, the way the planner keeps a
+// move's replacement above the replica cap; a count above four plans the
+// next free indices after them.
+func teardownWaitPlan(replicas int32) types.ComponentPlan {
+	plan := types.ComponentPlan{
+		Component:            types.ComponentEngine,
+		Replicas:             replicas,
+		MigrationMode:        types.MigrationModeAuto,
+		InstanceReadyTimeout: 30 * time.Minute,
+		UpdateStrategy: types.UpdateStrategy{
+			Type:          types.UpdateStrategySurgeThenDrain,
+			RollingUpdate: &types.RollingUpdate{MaxSurge: intOrStringInt(1), MaxUnavailable: intOrStringInt(0)},
+		},
+	}
+	indices := []int32{0, 1, 2, 3, 4}
+	for idx := int32(5); idx <= replicas; idx++ {
+		indices = append(indices, idx)
+	}
+	for _, idx := range indices {
+		plan.Instances = append(plan.Instances, types.InstancePlan{Index: idx, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}})
+	}
+	return plan
+}
+
+// keepRunningRevision puts every serving Instance on the target, so the
+// pass carries no push.
+func (f *teardownWaitFixture) keepRunningRevision() {
+	for i := range f.input.ObservedState.InstanceStatuses {
+		if f.input.ObservedState.InstanceStatuses[i].Phase == types.InstancePhaseReady {
+			f.input.ObservedState.InstanceStatuses[i].RunningRevision = f.target.Name
+		}
+	}
+}
+
+func (f *teardownWaitFixture) pass(t *testing.T) ctrl.Result {
+	t.Helper()
+	res, err := workload.Reconcile(context.Background(), f.deps, f.input, f.plan, f.target)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	return res
+}
+
+// started lists the serving Instances whose row now carries an Update.
+func (f *teardownWaitFixture) started() []int32 {
+	var out []int32
+	for _, idx := range []int32{1, 2, 3} {
+		if row := f.input.ObservedState.Instance(idx); row != nil && row.Operation != nil && row.Operation.Type == types.InstanceOperationUpdate {
+			out = append(out, idx)
+		}
+	}
+	return out
+}
+
+// requirePairKept fails unless both rows of the move still carry its
+// operation and the record still reads Draining.
+func (f *teardownWaitFixture) requirePairKept(t *testing.T) {
+	t.Helper()
+	source := f.input.ObservedState.Instance(0)
+	if source == nil || source.Phase != types.InstancePhaseMigrating || source.Operation == nil || source.Operation.Type != types.InstanceOperationMigrate {
+		t.Fatalf("the source row stays the move's; got %+v", source)
+	}
+	surge := f.input.ObservedState.Instance(4)
+	if surge == nil || surge.Phase != types.InstancePhaseCreating || surge.Operation == nil || surge.Operation.Type != types.InstanceOperationMigrate {
+		t.Fatalf("the replacement row stays the move's; got %+v", surge)
+	}
+	if got := f.records[0]; got.Phase != types.MigrationPhaseDraining {
+		t.Fatalf("the record keeps its Draining phase; got %+v", got)
+	}
+}
+
+// Four Instances serve version 1 and the move of Instance 0 waits on a
+// kubelet that is gone: its source pod is Terminating past its own
+// deletion deadline on that node, and nothing but that kubelet or an
+// operator can remove it. The operator pushes version 2: one of the other three Instances
+// starts its surge under the budget of one in the same pass, while the
+// pair's two rows and the record stay the move's. The operator raises the
+// count from 4 to 6: the two new Instances are created in the same pass.
+// The record still names its wait and keeps the pass's cadence.
+func TestReconcile_MoveWaitingOnItsKubeletYieldsToThePushAndTheScaleUp(t *testing.T) {
+	t.Run("push", func(t *testing.T) {
+		f := newTeardownWaitFixture(t, 4, false)
+		res := f.pass(t)
+		if got := f.started(); len(got) != 1 {
+			t.Fatalf("the push starts one Instance beside the waiting move under maxSurge 1; started %v", got)
+		}
+		f.requirePairKept(t)
+		if !strings.Contains(f.records[0].Message, "parked on source teardown") {
+			t.Fatalf("the record names its wait; got %q", f.records[0].Message)
+		}
+		if res.RequeueAfter <= 0 || res.RequeueAfter > testRequeueIntervals.Operation {
+			t.Fatalf("the pass keeps the waiting record's cadence; got %+v", res)
+		}
+	})
+	t.Run("scale-up", func(t *testing.T) {
+		f := newTeardownWaitFixture(t, 6, false)
+		f.keepRunningRevision()
+		res := f.pass(t)
+		if len(f.created) != 2 || f.created[0] != 5 || f.created[1] != 6 {
+			t.Fatalf("the scale-up creates its two Instances beside the waiting move; created %v", f.created)
+		}
+		for _, idx := range []int32{5, 6} {
+			pod := &corev1.Pod{}
+			key := client.ObjectKey{Namespace: f.input.Key.Namespace, Name: enginePod(f.input.Key.OwnerName, f.input.Key.Namespace, idx).Name}
+			if err := f.client.Get(context.Background(), key, pod); err != nil {
+				t.Fatalf("the new Instance %d has its pod requested: %v", idx, err)
+			}
+		}
+		f.requirePairKept(t)
+		if res.RequeueAfter <= 0 || res.RequeueAfter > testRequeueIntervals.Operation {
+			t.Fatalf("the pass keeps the waiting record's cadence; got %+v", res)
+		}
+	})
+}
+
+// The same move with its source pod still inside its deletion grace is a
+// move making progress: it serializes the Component's pass, so a push
+// starts nothing and a scale-up creates nothing until the move ends.
+func TestReconcile_MoveInFlightStillSerializesThePass(t *testing.T) {
+	t.Run("push", func(t *testing.T) {
+		f := newTeardownWaitFixture(t, 4, true)
+		res := f.pass(t)
+		if got := f.started(); len(got) != 0 {
+			t.Fatalf("a move in flight ends the pass ahead of the roll; started %v", got)
+		}
+		f.requirePairKept(t)
+		if res.RequeueAfter != testRequeueIntervals.Operation {
+			t.Fatalf("a move in flight paces the pass at the Migrate interval; got %+v", res)
+		}
+	})
+	t.Run("scale-up", func(t *testing.T) {
+		f := newTeardownWaitFixture(t, 6, true)
+		f.keepRunningRevision()
+		res := f.pass(t)
+		if len(f.created) != 0 {
+			t.Fatalf("a move in flight ends the pass ahead of the Create pass; created %v", f.created)
+		}
+		f.requirePairKept(t)
+		if res.RequeueAfter != testRequeueIntervals.Operation {
+			t.Fatalf("a move in flight paces the pass at the Migrate interval; got %+v", res)
+		}
+	})
 }
 
 // A pause does not spend a move's window. Three single-pod Instances serve
@@ -504,5 +829,336 @@ func TestReconcile_MovePausedPastItsWindowKeepsTheMoveAndRunsAFreshWindow(t *tes
 	}
 	if source := h.instance(moved); source == nil || source.Phase != types.InstancePhaseReady {
 		t.Fatalf("the source must be restored to Ready when the move closes; got %+v", source)
+	}
+}
+
+// A move's deadline comes due while another Instance's repair is in
+// flight. Three single-pod Instances serve; the operator asks the third
+// off its node, so a replacement is surged at a fourth index and never
+// comes up; then the second Instance loses its pod, so the restart policy
+// rebuilds it, and the rebuilt pod is still coming up when the move's
+// deadline passes. The move is closed in the pass its deadline comes due:
+// the record reads Failed naming the deadline, the source returns to
+// Ready on the revision it kept serving, the replacement index is
+// released and torn down, and the repair goes on untouched until its
+// rebuilt pod serves. A repair in flight consumes the pass, so the expiry
+// stands ahead of it.
+func TestReconcile_MoveDeadlineDueBesideARepairClosesTheMoveThatPass(t *testing.T) {
+	const move = "move-off-node"
+	const repaired, moved = int32(1), int32(2)
+	h := newRecoveryHarness(t, false)
+	h.recorder = record.NewFakeRecorder(256)
+	h.atomicStatus = true
+	h.routed = true
+	h.replicas = 3
+	recreate := types.RestartPolicyRecreateInstance
+	h.lifecycle.RestartPolicy = &recreate
+	h.useNodes("node-a", "node-b", "node-c", "node-d")
+	h.migrationAudit = &types.MigrationAuditPolicy{MaxInFlight: 1, MaxPerWindow: 10, Window: time.Hour}
+	h.setTarget(h.revV1, goodImage)
+	if !h.run(40, func() bool { return h.settledOn(h.revV1, 3) }) {
+		h.dumpState("initial create")
+		t.Fatalf("the Component never settled on v1")
+	}
+
+	h.requestMove(move, moved)
+	h.step()
+	rec := h.migration(move)
+	if rec == nil || rec.Phase != types.MigrationPhaseSurgePending || rec.SurgeInstance == nil {
+		h.dumpState("after the move request")
+		t.Fatalf("the move did not surge a replacement: %+v", rec)
+	}
+	replacement := *rec.SurgeInstance
+	// The replacement runs but never passes its readiness probe, so the
+	// move never gets past waiting for it. No repair reading acts on that
+	// shape; only the clock moves the move.
+	h.failReadiness(replacement, "")
+
+	generation := h.instance(repaired).Incarnation
+	h.losePods(repaired)
+	h.step()
+	row := h.instance(repaired)
+	if row == nil || row.Phase != types.InstancePhaseRestarting || row.Operation == nil || row.Operation.Type != types.InstanceOperationRestart {
+		h.dumpState("after the pod loss")
+		t.Fatalf("the restart policy did not open a repair on instance %d: %+v", repaired, row)
+	}
+	if pods := h.podsOf(repaired); len(pods) != 1 || podConditionTrue(pods[0], corev1.PodReady) {
+		h.dumpState("after the pod loss")
+		t.Fatalf("instance %d should have one rebuilt pod still coming up; got %d pod(s)", repaired, len(pods))
+	}
+	if n := h.restartsRecorded(); n != 1 {
+		t.Fatalf("restarts recorded = %d, want the one repair the pod loss opened: %v", n, h.events)
+	}
+	// The rebuilt pod runs but fails its readiness probe until the fault
+	// is removed, so the repair stays in flight.
+	h.failReadiness(repaired, "")
+
+	// The deadline comes due with the rebuilt pod still coming up.
+	h.migration(move).Deadline = metav1.NewTime(h.clk.Now().Add(-time.Second))
+	h.events = nil
+	h.step()
+	rec = h.migration(move)
+	if !rec.Phase.Terminal() {
+		phaseAtDeadline := rec.Phase
+		openPasses := 0
+		for openPasses < 5 && !h.migration(move).Phase.Terminal() {
+			h.step()
+			openPasses++
+		}
+		stillOpen := !h.migration(move).Phase.Terminal()
+		h.restoreReadiness(repaired, "")
+		closedAfter := 0
+		for closedAfter < 10 && !h.migration(move).Phase.Terminal() {
+			h.step()
+			closedAfter++
+		}
+		h.dumpState("the move outlived its deadline")
+		t.Fatalf("the move read %s in the pass its deadline came due; still open after %d more passes with the repair in flight: %v; closed %d pass(es) after the rebuilt pod was let start, with the repair complete: %v (record %+v)",
+			phaseAtDeadline, openPasses, stillOpen, closedAfter, !h.repairInFlight(), *h.migration(move))
+	}
+	if rec.Phase != types.MigrationPhaseFailed || rec.CompletedAt == nil ||
+		rec.Message != "deadline exceeded in phase SurgePending: surge pods never became ready" {
+		t.Fatalf("the move must close Failed naming its deadline; got %+v", *rec)
+	}
+	if !h.sawEventWith(types.EventReasonMigrationExpired, "deadline exceeded in phase SurgePending") {
+		t.Fatalf("no MigrationExpired event named the deadline: %v", h.events)
+	}
+	if source := h.instance(moved); source == nil || source.Phase != types.InstancePhaseReady || source.Operation != nil || source.RunningRevision != h.revV1.Name {
+		h.dumpState("after the expiry")
+		t.Fatalf("the source must return to Ready on the revision it kept serving; got %+v", source)
+	}
+	if surge := h.instance(replacement); surge == nil || surge.Operation != nil {
+		h.dumpState("after the expiry")
+		t.Fatalf("the replacement index must be released by the expiry; got %+v", surge)
+	}
+	if row := h.instance(repaired); row == nil || row.Phase != types.InstancePhaseRestarting || row.Operation == nil ||
+		row.Operation.Type != types.InstanceOperationRestart || row.Incarnation != generation+1 {
+		h.dumpState("after the expiry")
+		t.Fatalf("the repair must go on untouched beside the expiry; got %+v", row)
+	}
+
+	// The released replacement is torn down while the repair still waits.
+	if !h.run(10, func() bool { return h.instance(replacement) == nil && len(podObjectsOf(h, replacement)) == 0 }) {
+		h.dumpState("tearing down the replacement")
+		t.Fatalf("the released replacement %d was not torn down", replacement)
+	}
+	if row := h.instance(repaired); row == nil || row.Phase != types.InstancePhaseRestarting || row.Incarnation != generation+1 {
+		h.dumpState("after the teardown")
+		t.Fatalf("the repair must still be the one that opened on the pod loss; got %+v", row)
+	}
+
+	// The rebuilt pod passes its readiness probe: the repair completes and
+	// the Component is whole.
+	h.restoreReadiness(repaired, "")
+	if !h.run(20, func() bool { return h.settledOn(h.revV1, 3) }) {
+		h.dumpState("after the rebuilt pod started")
+		t.Fatalf("the Component never settled back on three Instances")
+	}
+	if row := h.instance(repaired); row.Incarnation != generation+1 {
+		t.Fatalf("instance %d generation number = %d, want %d: the Instance is rebuilt once", repaired, row.Incarnation, generation+1)
+	}
+	if n := h.restartsRecorded(); n != 0 {
+		t.Fatalf("%d repair(s) opened after the pod loss's, want none: %v", n, h.events)
+	}
+	if !h.sawEvent(types.EventReasonRestartCompleted) {
+		t.Fatalf("the repair never reported complete: %v", h.events)
+	}
+}
+
+// A move requested while a roll is in flight waits for the roll. Four
+// single-pod Instances serve version 1 under SurgeThenDrain with a surge
+// budget of two. The operator pushes version 2, so Instances 0 and 1
+// surge replacements that run but stay not Ready, and then asks Instance
+// 2 off its node. The request is recorded, and the record and one event
+// say it waits for the roll. Its deadline does not run while the roll is
+// in flight: thirty-one minutes later the record is still Accepted. Once
+// both surge replacements are released the move starts on the next pass,
+// ahead of the roll's next surge, with its deadline measured from then,
+// and the push waits for the move as it always has.
+func TestReconcile_MoveRequestedDuringARollWaitsUntilNoSurgeIsInFlight(t *testing.T) {
+	const move = "move-off-node"
+	const moved = int32(2)
+	const window = 30 * time.Minute
+	h := newMoveWaitsForRollHarness(t)
+	moveWaitsForRollPush(t, h)
+	moveWaitsForRollRequest(t, h, move, moved, window)
+	moveWaitsForRollWindowPasses(t, h, move, window)
+	surgesReleased := moveWaitsForRollSurgesReleased(t, h, move)
+	moveWaitsForRollStarts(t, h, move, moved, window, surgesReleased)
+	moveWaitsForRollFinishes(t, h, move)
+}
+
+// newMoveWaitsForRollHarness builds the story's Component: four single-pod
+// Instances settled on version 1 under SurgeThenDrain with a surge budget of
+// two, nodes for a move and a migration capacity policy.
+func newMoveWaitsForRollHarness(t *testing.T) *recoveryHarness {
+	t.Helper()
+	h := newRecoveryHarness(t, false)
+	h.recorder = record.NewFakeRecorder(256)
+	h.atomicStatus = true
+	h.routed = true
+	h.replicas = 4
+	maxSurge := intstr.FromInt32(2)
+	maxUnavailable := intstr.FromInt32(0)
+	h.lifecycle = types.Lifecycle{
+		UpdateStrategy: &types.UpdateStrategy{
+			Type:          types.UpdateStrategySurgeThenDrain,
+			RollingUpdate: &types.RollingUpdate{MaxSurge: &maxSurge, MaxUnavailable: &maxUnavailable},
+		},
+		// Long enough that the roll's own attempts outlive the move's
+		// thirty-minute window.
+		InstanceReadyTimeout: &metav1.Duration{Duration: 2 * time.Hour},
+	}
+	h.useNodes("node-a", "node-b", "node-c", "node-d", "node-e")
+	h.migrationAudit = &types.MigrationAuditPolicy{MaxInFlight: 1, MaxPerWindow: 10, Window: time.Hour}
+	h.setTarget(h.revV1, goodImage)
+	if !h.run(40, func() bool { return h.settledOn(h.revV1, 4) }) {
+		h.dumpState("initial create")
+		t.Fatalf("the Component never settled on v1")
+	}
+	return h
+}
+
+// moveWaitsForRollSurging counts the roll's surge replacements in flight.
+func moveWaitsForRollSurging(h *recoveryHarness) int32 {
+	return escalation.CurrentSurgeInFlight(h.irStatuses())
+}
+
+// moveWaitsForRollReplacementsReady lets the first two Instances'
+// replacements pass readiness, or holds them short of it.
+func moveWaitsForRollReplacementsReady(t *testing.T, h *recoveryHarness, ready bool) {
+	t.Helper()
+	for _, idx := range []int32{0, 1} {
+		pods := h.podsOfOnImage(idx, fixedImage)
+		if len(pods) == 0 {
+			t.Fatalf("instance %d has no replacement on the pushed image", idx)
+		}
+		for _, pod := range pods {
+			if ready {
+				delete(h.readinessFails, pod.UID)
+			} else {
+				h.readinessFails[pod.UID] = true
+			}
+		}
+	}
+}
+
+// moveWaitsForRollPush pushes version 2: the first two Instances surge
+// replacements under the budget of two; the replacements run but never
+// pass readiness, so the roll holds both slots.
+func moveWaitsForRollPush(t *testing.T, h *recoveryHarness) {
+	t.Helper()
+	h.setTarget(h.revFixed, fixedImage)
+	h.step()
+	if n := moveWaitsForRollSurging(h); n != 2 {
+		h.dumpState("after the push")
+		t.Fatalf("%d surge(s) in flight after the push, want 2", n)
+	}
+	moveWaitsForRollReplacementsReady(t, h, false)
+}
+
+// moveWaitsForRollRequest asks the Instance off its node while the roll's
+// surges are in flight: the request is recorded with the window as its
+// deadline, and the record and one event say the move waits for the roll.
+func moveWaitsForRollRequest(t *testing.T, h *recoveryHarness, move string, moved int32, window time.Duration) {
+	t.Helper()
+	h.requestMove(move, moved)
+	accepted := h.clk.Now()
+	h.migration(move).Deadline = metav1.NewTime(accepted.Add(window))
+	h.events = nil
+	h.step()
+	rec := h.migration(move)
+	if rec.Phase != types.MigrationPhaseAccepted || rec.SurgeInstance != nil {
+		h.dumpState("after the move request")
+		t.Fatalf("the move must wait for the roll, not start beside it; got %+v", *rec)
+	}
+	if !strings.Contains(rec.Message, "waiting for the roll") || !strings.Contains(rec.Message, h.revFixed.Name) {
+		t.Fatalf("the record must say it waits for the roll to %s; got %q", h.revFixed.Name, rec.Message)
+	}
+	if !h.sawEventWith(types.EventReasonMigrationDeferred, "waiting for the roll") {
+		t.Fatalf("no event said the move waits for the roll: %v", h.events)
+	}
+}
+
+// moveWaitsForRollWindowPasses lets thirty-one minutes pass with the roll
+// still in flight. The window the request was accepted with is behind the
+// record, and the record is still open: its deadline does not run while it
+// waits for the roll, and a pass of the wait says nothing.
+func moveWaitsForRollWindowPasses(t *testing.T, h *recoveryHarness, move string, window time.Duration) {
+	t.Helper()
+	h.clk.Step(window + time.Minute)
+	h.events = nil
+	h.step()
+	rec := h.migration(move)
+	if rec.Phase.Terminal() {
+		t.Fatalf("the move was closed while the roll was in flight: %s", rec.Message)
+	}
+	if rec.Phase != types.MigrationPhaseAccepted || rec.SurgeInstance != nil {
+		t.Fatalf("the move must still wait for the roll; got %+v", *rec)
+	}
+	if n := moveWaitsForRollSurging(h); n != 2 {
+		h.dumpState("while the move waits")
+		t.Fatalf("%d surge(s) in flight while the move waits, want the roll's 2", n)
+	}
+	if n := len(h.events); n != 0 {
+		t.Fatalf("a pass of the wait raised %d event(s), want none: %v", n, h.events)
+	}
+}
+
+// moveWaitsForRollSurgesReleased lets the replacements pass readiness: the
+// roll's first two Instances promote and both surge slots are released. It
+// returns the time of the release; the record has not moved yet.
+func moveWaitsForRollSurgesReleased(t *testing.T, h *recoveryHarness, move string) time.Time {
+	t.Helper()
+	moveWaitsForRollReplacementsReady(t, h, true)
+	if !h.run(20, func() bool { return moveWaitsForRollSurging(h) == 0 }) {
+		h.dumpState("the roll never released its surges")
+		t.Fatalf("the roll's surges were never released")
+	}
+	surgesReleased := h.clk.Now()
+	if rec := h.migration(move); rec.Phase != types.MigrationPhaseAccepted {
+		t.Fatalf("the move changed phase before the pass after the surges were released; got %+v", *rec)
+	}
+	return surgesReleased
+}
+
+// moveWaitsForRollStarts runs the pass after the release: the move starts,
+// its replacement is allocated and its deadline is the accepted window
+// measured from the surges' release. The push waits for the move, so no
+// further surge opens in that pass.
+func moveWaitsForRollStarts(t *testing.T, h *recoveryHarness, move string, moved int32, window time.Duration, surgesReleased time.Time) {
+	t.Helper()
+	h.step()
+	rec := h.migration(move)
+	if rec.Phase != types.MigrationPhaseSurgePending || rec.SurgeInstance == nil {
+		h.dumpState("the pass after the surges were released")
+		t.Fatalf("the move must start in the pass after the surges were released; got %+v", *rec)
+	}
+	if rec.Deadline.Time.Before(surgesReleased.Add(window)) {
+		t.Fatalf("the move's deadline = %s, want at least %s: the window measured from the surges' release", rec.Deadline.Time, surgesReleased.Add(window))
+	}
+	if n := moveWaitsForRollSurging(h); n != 0 {
+		h.dumpState("the pass after the surges were released")
+		t.Fatalf("%d surge(s) opened beside the move, want none: the push waits for the move", n)
+	}
+	if source := h.instance(moved); source == nil || source.Phase != types.InstancePhaseMigrating {
+		t.Fatalf("the source must be Migrating once the move starts; got %+v", source)
+	}
+}
+
+// moveWaitsForRollFinishes drives the move to completion; the roll then
+// finishes on every Instance.
+func moveWaitsForRollFinishes(t *testing.T, h *recoveryHarness, move string) {
+	t.Helper()
+	if !h.run(60, func() bool { return h.migration(move).Phase.Terminal() }) {
+		h.dumpState("the move never finished")
+		t.Fatalf("the move did not finish; record=%+v", *h.migration(move))
+	}
+	if rec := h.migration(move); rec.Phase != types.MigrationPhaseCompleted {
+		t.Fatalf("the move must complete; got %+v", *rec)
+	}
+	if !h.run(80, func() bool { return h.settledOn(h.revFixed, 4) }) {
+		h.dumpState("the roll never finished")
+		t.Fatalf("the push did not land on every Instance after the move")
 	}
 }

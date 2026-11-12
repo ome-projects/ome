@@ -36,8 +36,10 @@ const (
 
 // StateOf resolves a unit's state. stepCount is the pinned ladder length.
 // A rollback request outranks a failure park: rolling back is the operator's
-// explicit decision about a parked canary. A Failed phase with no marker is
-// status written before the marker existed and still parks.
+// explicit decision about a parked canary. A Failed phase with no recorded
+// failure is status written from outside the controller: it stops a unit
+// short of its last step, and a unit at or past its done mark outranks it,
+// since a finished unit has nothing a stop could protect.
 func StateOf(cs *v1beta1.CanaryStatus, phase v1beta1.RolloutPhase, stepCount int) CanaryState {
 	if cs == nil {
 		return CanaryStateIdle
@@ -53,11 +55,14 @@ func StateOf(cs *v1beta1.CanaryStatus, phase v1beta1.RolloutPhase, stepCount int
 		}
 		return CanaryStateRollingBack
 	}
-	if cs.Failed != nil || phase == v1beta1.RolloutPhaseFailed {
+	if cs.Failed != nil {
 		return CanaryStateFailed
 	}
 	if stepCount > 0 && int(cs.CurrentStep) >= stepCount {
 		return CanaryStateDone
+	}
+	if phase == v1beta1.RolloutPhaseFailed {
+		return CanaryStateFailed
 	}
 	if cs.PreStepHold {
 		return CanaryStatePreHold
@@ -95,6 +100,31 @@ func StepOf(cs *v1beta1.CanaryStatus, phase v1beta1.RolloutPhase, steps []v1beta
 		}
 	}
 	return step
+}
+
+// ClampStep keeps a record's step inside steps once ranUnder, the list the
+// step indexes, is replaced by it. A unit past the end of ranUnder stays past
+// the end of steps; a live index beyond the last of steps lands on that last
+// step; and the pre-step hold is set when the step at the kept index serves
+// more traffic than the record does, so the raise waits for a promote. A
+// negative index is read as StepOf reads it, against ranUnder. A record with
+// no steps to land on is left as it is.
+func ClampStep(cs *v1beta1.CanaryStatus, phase v1beta1.RolloutPhase, ranUnder, steps []v1beta1.RolloutGroupStep) {
+	if cs == nil || len(steps) == 0 {
+		return
+	}
+	step := StepOf(cs, phase, ranUnder)
+	if len(ranUnder) > 0 && int(step) >= len(ranUnder) {
+		cs.CurrentStep = int32(len(steps))
+		return
+	}
+	cs.CurrentStep = step
+	if int(cs.CurrentStep) >= len(steps) {
+		cs.CurrentStep = int32(len(steps)) - 1
+	}
+	if steps[cs.CurrentStep].Traffic > cs.ObservedTrafficWeight {
+		cs.PreStepHold = true
+	}
 }
 
 // Terminal reports the two parked states an operator must act on.

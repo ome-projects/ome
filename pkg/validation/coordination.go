@@ -13,6 +13,7 @@ package validation
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -157,15 +158,16 @@ func CoordinationUpdateWarnings(oldSpec, newSpec *v1beta1.InferenceServiceSpec) 
 	return warnings
 }
 
-// ValidatePairingProtocolUpdate rejects a pairing-protocol change between two
-// non-empty values unless engine and decoder roll as ONE group under blueGreen
-// or canary. Any other shape — independent Components, separate groups, or a
-// rollingUpdate group — reaches a step where every serving engine speaks a
-// protocol no serving decoder does (or vice versa), leaving routing with no
-// valid pair. Without an encoder, transitions to or from the empty value are
-// always admitted: empty pairs with anything, so every intermediate mix stays
-// routable. So is a change on a spec without both engine and decoder — there
-// is no pair to break.
+// ValidatePairingProtocolUpdate admits a change between two non-empty pairing
+// protocols only when one rollout group lists both engine and decoder
+// (rollingUpdate, blueGreen or canary), the shape under which the two sides
+// roll together and a pairable engine+decoder pair keeps serving. Independent
+// Components or separate groups reach a step where every serving engine
+// speaks a protocol no serving decoder does (or vice versa), leaving routing
+// with no valid pair. Without an encoder, transitions to or from the empty
+// value are always admitted: empty pairs with anything, so every intermediate
+// mix stays routable. So is a change on a spec without both engine and
+// decoder — there is no pair to break.
 //
 // While the old or the new spec declares an encoder, the value may only stay
 // the same or be cleared. The rollout gate keeps only the engine and the
@@ -185,40 +187,45 @@ func ValidatePairingProtocolUpdate(oldSpec, newSpec *v1beta1.InferenceServiceSpe
 		return nil
 	}
 	if newSpec.Encoder != nil || oldSpec.Encoder != nil {
-		allowed := fmt.Sprintf("stay %q or be cleared", oldProtocol)
-		if oldProtocol == "" {
-			allowed = "stay empty"
-		}
-		return fmt.Errorf("spec.rollout.pairingProtocol: setting the pairing protocol to %q is refused while the service declares an encoder, or in the edit that removes it; the value may only %s, since only the engine and the decoder are kept pairable through a change (%s)",
-			newProtocol, allowed, ReasonPairingProtocolChangeWithEncoder)
+		return pairingProtocolChangeWithEncoder(oldProtocol, newProtocol)
 	}
 	if oldProtocol == "" {
 		return nil
 	}
 	if newSpec.Engine == nil || newSpec.Decoder == nil {
+		return nil // no pair to break
+	}
+	if aGroupRollsEngineWithDecoder(newSpec.GetRolloutGroups()) {
 		return nil
 	}
-	for _, g := range newSpec.GetRolloutGroups() {
-		// Kind-resolved: a declared blueGreen/canary policyRef keeps the pair
-		// atomic exactly like the inline arm would.
-		if kind := rolloutGroupKind(&g); kind != v1beta1.RolloutProgressionBlueGreen && kind != v1beta1.RolloutProgressionCanary {
-			continue
-		}
-		hasEngine, hasDecoder := false, false
-		for _, c := range g.Components {
-			switch c {
-			case v1beta1.EngineComponent:
-				hasEngine = true
-			case v1beta1.DecoderComponent:
-				hasDecoder = true
-			}
-		}
-		if hasEngine && hasDecoder {
-			return nil
+	return fmt.Errorf("spec.rollout.pairingProtocol: changing the pairing protocol (%q -> %q) requires engine and decoder to roll together: declare one spec.rollout group that lists both components (rollingUpdate, blueGreen or canary); when they roll independently or in separate groups nothing holds one side back for the other, so a step can leave every serving engine on a protocol no serving decoder speaks (%s)",
+		oldProtocol, newProtocol, ReasonPairingProtocolChangeUncoordinated)
+}
+
+// pairingProtocolChangeWithEncoder refuses a new protocol value while the
+// service declares an encoder, or in the edit that removes it: the value may
+// only stay as it was, or be cleared.
+func pairingProtocolChangeWithEncoder(oldProtocol, newProtocol string) error {
+	allowed := fmt.Sprintf("stay %q or be cleared", oldProtocol)
+	if oldProtocol == "" {
+		allowed = "stay empty"
+	}
+	return fmt.Errorf("spec.rollout.pairingProtocol: setting the pairing protocol to %q is refused while the service declares an encoder, or in the edit that removes it; the value may only %s, since only the engine and the decoder are kept pairable through a change (%s)",
+		newProtocol, allowed, ReasonPairingProtocolChangeWithEncoder)
+}
+
+// aGroupRollsEngineWithDecoder reports whether one rollout group lists both
+// the engine and the decoder. Every group kind keeps the pair: the pairing
+// gates and the batch step pace a rollingUpdate or blueGreen group through
+// the transition, and the canary steps pair traffic by cohort. A
+// policyRef-declared group lists its components the same way.
+func aGroupRollsEngineWithDecoder(groups []v1beta1.RolloutGroup) bool {
+	for _, g := range groups {
+		if slices.Contains(g.Components, v1beta1.EngineComponent) && slices.Contains(g.Components, v1beta1.DecoderComponent) {
+			return true
 		}
 	}
-	return fmt.Errorf("spec.rollout.pairingProtocol: changing the pairing protocol (%q -> %q) requires engine and decoder to roll as one blueGreen or canary group; declare a spec.rollout group listing both components (rollingUpdate groups and independent rollouts cannot keep a pairable engine+decoder pair serving through the transition) (%s)",
-		oldProtocol, newProtocol, ReasonPairingProtocolChangeUncoordinated)
+	return false
 }
 
 // CoordinationRatioToleranceWarning returns a warning when any group sets a

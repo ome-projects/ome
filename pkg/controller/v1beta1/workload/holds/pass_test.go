@@ -114,3 +114,48 @@ func TestRun_NoWaitTouchesNoRow(t *testing.T) {
 		t.Errorf("writes = %d, want 0 on a row nothing is waiting on", store.writes)
 	}
 }
+
+// TestRun_ARowsReadingNeverReachesTheRowAfterIt: what an authority reads
+// on one row is that row's alone. The first row's attempt was refused for
+// quota and waits on it; the row after it is one the quota hold never
+// reads, a Failed row or a leaving Instance the wave has not admitted, and
+// it carries no token after the pass.
+func TestRun_ARowsReadingNeverReachesTheRowAfterIt(t *testing.T) {
+	cases := map[string]struct {
+		phase    types.InstancePhase
+		excluded bool
+	}{
+		"a Failed row": {phase: types.InstancePhaseFailed},
+		"a leaving Instance the wave has not admitted": {phase: types.InstancePhaseCreating, excluded: true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			second := creatingRow("")
+			second.Index = 1
+			second.Phase = c.phase
+			second.Operation = operation("create-1", types.InstanceOperationCreate, "CreatePods", "")
+			store, in := newStore(refused(creatingRow("")), second)
+			rows := rowsFor(in, 1)
+			rows[1].Excluded = c.excluded
+			if _, err := Run(context.Background(), PassInput{
+				Input: in,
+				Plan:  types.ComponentPlan{},
+				Rows:  rows,
+				Pods: func(context.Context) (map[int32][]*corev1.Pod, error) {
+					return nil, nil
+				},
+			}); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if got := store.waiting(0); got != types.RejectionReasonQuotaExceeded {
+				t.Errorf("waiting(0) = %q, want the quota refusal recorded", got)
+			}
+			if got := store.waiting(1); got != "" {
+				t.Errorf("waiting(1) = %q, want no token on a row the quota hold never read", got)
+			}
+			if store.writes != 1 {
+				t.Errorf("writes = %d, want 1 (the first row's record)", store.writes)
+			}
+		})
+	}
+}

@@ -3,6 +3,7 @@ package replay
 import (
 	"context"
 	"fmt"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -98,6 +99,11 @@ func applyPodGroup(ctx context.Context, d *driver, ev TimelineEvent) (string, er
 			return "", fmt.Errorf("replay: reassign podgroup %s: %w", name, err)
 		}
 	case "PhaseFailed":
+		// The group's own timeout is the clock a scheduler fails it on, so
+		// the trace names it beside the phase when the group carries one.
+		if seconds := group.Spec.ScheduleTimeoutSeconds; seconds != nil {
+			detail += " scheduleTimeout=" + (time.Duration(*seconds) * time.Second).String()
+		}
 		// The fake apiserver serves no status subresource for PodGroups, so
 		// the phase is written through the object itself.
 		if err := d.staging(func() error {

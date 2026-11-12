@@ -94,6 +94,39 @@ func TestDecoderDecodeColumnarRewritesToLogicalShape(t *testing.T) {
 	}
 }
 
+// The decoder drops the payload once the rows exist, so each row takes its
+// entry's records as they are instead of copying them: every record kind
+// arrives whole, and a decode allocates nothing per entry.
+func TestDecoderRowsTakeEveryRecordWithoutACopy(t *testing.T) {
+	rows := fullFeatureRows()
+	ir := columnarFixture(t, rows)
+	columns := ir.Status.InstanceStatusColumns
+	if _, err := NewDecoder(uint64(len(rows))).Decode(ir); err != nil {
+		t.Fatalf("decode columnar: %v", err)
+	}
+	if !equality.Semantic.DeepEqual(ir.Status.InstanceStatuses, rows) {
+		t.Fatalf("decoded rows differ:\n got: %#v\nwant: %#v", ir.Status.InstanceStatuses, rows)
+	}
+	byIndex := map[int32]*v1beta1.OMENativeInstanceStatus{}
+	for i := range ir.Status.InstanceStatuses {
+		row := &ir.Status.InstanceStatuses[i]
+		byIndex[row.Index] = row
+	}
+	if len(columns.Entries) == 0 {
+		t.Fatal("the full-feature rows encode to no entries; the test reads nothing")
+	}
+	for i := range columns.Entries {
+		entry := &columns.Entries[i]
+		row := byIndex[entry.Index]
+		if (entry.ReadySince != nil && row.ReadySince != entry.ReadySince) || row.Operation != entry.Operation || row.LastFailure != entry.LastFailure {
+			t.Fatalf("row %d copied a record of a payload the decoder drops", entry.Index)
+		}
+		if len(entry.Conditions) > 0 && &row.Conditions[0] != &entry.Conditions[0] {
+			t.Fatalf("row %d copied the conditions of a payload the decoder drops", entry.Index)
+		}
+	}
+}
+
 func TestDecoderZeroValueFailsClosedOnColumnar(t *testing.T) {
 	ir := columnarFixture(t, readerRows())
 	before := ir.DeepCopy()
@@ -166,6 +199,42 @@ func TestGetDecodedColumnarAndDenseAgree(t *testing.T) {
 	}
 	if gotColumnar.Status.InstanceStatusColumns != nil || gotColumnar.Status.InstanceStatusEncoding != nil {
 		t.Fatal("GetDecoded left the ColumnarV2 representation on the object")
+	}
+}
+
+// GetDecodedCopy reads once for a caller that writes the object it read:
+// the object stays in the form the apiserver served, and a copy carries the
+// decoded rows alone. A fetch error keeps its identity, and an unbounded
+// reader fails closed with no copy.
+func TestGetDecodedCopyKeepsTheStoredFormBesideTheDecodedCopy(t *testing.T) {
+	ctx := context.Background()
+	rows := readerRows()
+	columnar := columnarFixture(t, rows)
+	c := fake.NewClientBuilder().WithScheme(readerTestScheme(t)).
+		WithObjects(columnar).
+		WithStatusSubresource(&v1beta1.InferenceReplica{}).
+		Build()
+	reads := NewReader(c, NewDecoder(uint64(len(rows))))
+	stored := &v1beta1.InferenceReplica{}
+	decoded, encoding, err := GetDecodedCopy(ctx, reads, client.ObjectKeyFromObject(columnar), stored)
+	if err != nil || encoding != EncodingColumnarV2 {
+		t.Fatalf("GetDecodedCopy: encoding=%q err=%v", encoding, err)
+	}
+	if stored.Status.InstanceStatusColumns == nil || stored.Status.InstanceStatusEncoding == nil || len(stored.Status.InstanceStatuses) != 0 {
+		t.Fatal("the object read must keep the stored ColumnarV2 representation")
+	}
+	if !equality.Semantic.DeepEqual(decoded.Status.InstanceStatuses, denseFixture(rows).Status.InstanceStatuses) || decoded.Status.InstanceStatusColumns != nil || decoded.Status.InstanceStatusEncoding != nil {
+		t.Fatalf("the copy must carry the decoded rows alone, got %#v", decoded.Status)
+	}
+	if decoded.Name != stored.Name || decoded.ResourceVersion != stored.ResourceVersion || decoded.Status.Replicas != stored.Status.Replicas {
+		t.Fatal("the copy must be the object as read, beside its rows")
+	}
+	if _, _, err := GetDecodedCopy(ctx, reads, client.ObjectKey{Namespace: "default", Name: "absent"}, &v1beta1.InferenceReplica{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("missing object error = %v, want NotFound", err)
+	}
+	var target *codecError
+	if decoded, _, err := GetDecodedCopy(ctx, c, client.ObjectKeyFromObject(columnar), &v1beta1.InferenceReplica{}); !errors.As(err, &target) || decoded != nil {
+		t.Fatalf("unbounded reader must fail closed with a codec error and no copy, got %v", err)
 	}
 }
 

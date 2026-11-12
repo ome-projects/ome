@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -87,38 +88,11 @@ func (r *Reconciler) Reconcile(
 ) (*v1beta1.TrafficStatus, error) {
 	intent := Resolve(isvc)
 	if !intent.HasIntent() {
-		if err := r.cleanupPriorPolicy(ctx, isvc); err != nil {
-			return nil, err
-		}
-		return nil, nil
+		return nil, r.cleanupPriorPolicy(ctx, isvc)
 	}
 
 	emitted, passthroughs, translateErr := r.translator.Translate(isvc, targetHTTPRoutes, intent)
-
-	// Apply the emitted resource only when the translator succeeded
-	// and produced something to apply. An apply failure folds into the
-	// translateErr surface for the status writer.
-	var conflictMessage string
-	if translateErr == nil && emitted != nil {
-		if applyErr := r.applyPolicy(ctx, isvc, emitted); applyErr != nil {
-			translateErr = applyErr
-			if errors.Is(applyErr, ErrConflictingPolicy) {
-				conflictMessage = applyErr.Error()
-			}
-		}
-	}
-
-	// Observe gateway acceptance from the post-apply state on the
-	// server. Only meaningful when we successfully applied something
-	// — on first reconcile we usually get Pending (gateway hasn't
-	// run yet) and the next .Owns()-driven re-enqueue surfaces the
-	// real signal. Skip the observe step when we hit a conflict
-	// (we didn't write anything; existing object's status is not
-	// ours to interpret).
-	acceptance := AcceptanceObservation{State: AcceptancePending}
-	if translateErr == nil && emitted != nil {
-		acceptance = r.observeAcceptance(ctx, emitted)
-	}
+	written := r.writeEmitted(ctx, isvc, emitted, translateErr)
 
 	out := status.Build(status.BuildArgs{
 		TranslatorName:           r.translator.Name(),
@@ -127,19 +101,51 @@ func (r *Reconciler) Reconcile(
 		EmittedPolicy:            emitted,
 		TargetedRoutes:           targetHTTPRoutes,
 		Passthroughs:             passthroughs,
-		TranslateErr:             translateErr,
-		ConflictDetected:         conflictMessage != "",
-		ConflictMessage:          conflictMessage,
+		TranslateErr:             written.err,
+		ConflictDetected:         written.conflictMessage != "",
+		ConflictMessage:          written.conflictMessage,
 		ObservedGeneration:       isvc.Generation,
 		Now:                      r.now(),
-		GatewayAcceptance:        acceptance.State,
-		GatewayAcceptanceReason:  acceptance.Reason,
-		GatewayAcceptanceMessage: acceptance.Message,
+		GatewayAcceptance:        written.acceptance.State,
+		GatewayAcceptanceReason:  written.acceptance.Reason,
+		GatewayAcceptanceMessage: written.acceptance.Message,
 		UnsupportedAnnotations:   ComputeUnsupportedAnnotations(isvc.Annotations, r.translator),
 		UnsupportedFields:        ComputeUnsupportedTrafficFields(intent.Traffic, r.translator),
 	})
 
-	return out, translateErr
+	return out, written.err
+}
+
+// policyWrite is what came of the emitted policy: the error the pass
+// reports (the translation error, or the apply error in its place), the
+// conflict text when another owner holds the name, and the gateway's
+// acceptance of what was written.
+type policyWrite struct {
+	err             error
+	conflictMessage string
+	acceptance      AcceptanceObservation
+}
+
+// writeEmitted applies the emitted policy when the translator produced
+// one without error, then reads the gateway's acceptance of it. Nothing
+// is observed after a failed apply: on a conflict the live object is
+// another owner's, and otherwise nothing of ours was written. On the
+// first pass the gateway has usually not run yet, so the acceptance
+// reads Pending until the policy's own watch re-enqueues the ISVC.
+func (r *Reconciler) writeEmitted(ctx context.Context, isvc *v1beta1.InferenceService, emitted client.Object, translateErr error) policyWrite {
+	out := policyWrite{err: translateErr, acceptance: AcceptanceObservation{State: AcceptancePending}}
+	if translateErr != nil || emitted == nil {
+		return out
+	}
+	if applyErr := r.applyPolicy(ctx, isvc, emitted); applyErr != nil {
+		out.err = applyErr
+		if errors.Is(applyErr, ErrConflictingPolicy) {
+			out.conflictMessage = applyErr.Error()
+		}
+		return out
+	}
+	out.acceptance = r.observeAcceptance(ctx, emitted)
+	return out
 }
 
 // cleanupPriorPolicy deletes the previously-emitted backend policy
@@ -159,22 +165,18 @@ func (r *Reconciler) cleanupPriorPolicy(ctx context.Context, isvc *v1beta1.Infer
 	if isvc.Status.Traffic == nil || isvc.Status.Traffic.BackendPolicyResource == nil {
 		return nil
 	}
-	// Noop translator never emits anything, so there's nothing to
-	// clean up. Defensive — in practice the gate above already short-
-	// circuits because the noop branch never sets BackendPolicyResource.
+	// The noop translator emits nothing, so there is nothing to delete.
 	watch := r.translator.Watches()
 	if watch == nil {
 		return nil
 	}
-	obj, ok := watch.DeepCopyObject().(client.Object)
+	// The status carries the name the translator emitted, so a translator
+	// with another naming rule is cleaned up by the same path.
+	key := client.ObjectKey{Namespace: isvc.Namespace, Name: isvc.Status.Traffic.BackendPolicyResource.Name}
+	obj, ok := fetchTarget(watch, key)
 	if !ok {
 		return fmt.Errorf("translator.Watches() did not produce a client.Object")
 	}
-	// Translator emits with isvc.Name; the status mirrors that, so
-	// either works. Going through status keeps us robust to future
-	// translators that pick a different name convention.
-	obj.SetName(isvc.Status.Traffic.BackendPolicyResource.Name)
-	obj.SetNamespace(isvc.Namespace)
 	if err := r.client.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("delete prior backend policy %s/%s: %w", isvc.Namespace, obj.GetName(), err)
 	}
@@ -182,17 +184,12 @@ func (r *Reconciler) cleanupPriorPolicy(ctx context.Context, isvc *v1beta1.Infer
 }
 
 // observeAcceptance fetches the freshly-applied policy resource and
-// asks the translator to interpret its status. Errors fetching the
-// object degrade silently to Pending — the next reconcile will retry.
+// asks the translator to interpret its status. A fetch that fails reads
+// as Pending; the next reconcile retries.
 func (r *Reconciler) observeAcceptance(ctx context.Context, desired client.Object) AcceptanceObservation {
-	fetched, ok := desired.DeepCopyObject().(client.Object)
-	if !ok {
-		return AcceptanceObservation{State: AcceptancePending}
-	}
-	// Strip the desired spec; Get fills it in (including status).
-	fetched.SetName(desired.GetName())
-	fetched.SetNamespace(desired.GetNamespace())
-	if err := r.client.Get(ctx, client.ObjectKeyFromObject(desired), fetched); err != nil {
+	key := client.ObjectKeyFromObject(desired)
+	fetched, ok := fetchTarget(desired, key)
+	if !ok || r.client.Get(ctx, key, fetched) != nil {
 		return AcceptanceObservation{State: AcceptancePending}
 	}
 	return r.translator.ObserveAcceptance(fetched)
@@ -205,29 +202,22 @@ func algorithmOf(intent *ResolvedIntent) string {
 	return string(*intent.Traffic.Algorithm)
 }
 
-// applyPolicy sets controller reference and create-or-updates the
-// emitted policy resource. The translator guarantees deterministic
-// output, so the update path can be a coarse Update; finer
-// reconciliation lives in the translator (e.g. semantic equality
-// helpers) when needed.
+// applyPolicy sets the controller reference and creates or updates the
+// emitted policy resource. A live object of the same name that this
+// InferenceService does not own is left alone and reported as
+// ErrConflictingPolicy. The translator's output is deterministic, so
+// the update is a coarse Update of the whole desired object.
 func (r *Reconciler) applyPolicy(ctx context.Context, isvc *v1beta1.InferenceService, desired client.Object) error {
 	if err := controllerutil.SetControllerReference(isvc, desired, r.scheme); err != nil {
 		return fmt.Errorf("set controller reference on backend policy: %w", err)
 	}
-
-	// We need an empty instance of the same type to fetch into.
-	existingObj, ok := desired.DeepCopyObject().(client.Object)
+	key := client.ObjectKeyFromObject(desired)
+	existing, ok := fetchTarget(desired, key)
 	if !ok {
 		return errors.New("backend policy resource does not implement client.Object")
 	}
-	// Strip the desired fields out of the fetch target — Get fills it
-	// in from the API server. Leaving the desired spec in place would
-	// shadow the live state on a not-found path.
-	existingObj.SetName(desired.GetName())
-	existingObj.SetNamespace(desired.GetNamespace())
 
-	key := client.ObjectKeyFromObject(desired)
-	err := r.client.Get(ctx, key, existingObj)
+	err := r.client.Get(ctx, key, existing)
 	switch {
 	case apierrors.IsNotFound(err):
 		if createErr := r.client.Create(ctx, desired); createErr != nil {
@@ -236,28 +226,38 @@ func (r *Reconciler) applyPolicy(ctx context.Context, isvc *v1beta1.InferenceSer
 		return nil
 	case err != nil:
 		return fmt.Errorf("get backend policy %s: %w", key, err)
+	case !ownedBy(existing, isvc):
+		return fmt.Errorf("%w: %s already exists with %s", ErrConflictingPolicy, key, describeController(existing))
 	}
 
-	// ConflictingPolicy guard: if the existing object isn't owned by
-	// this InferenceService, refuse to overwrite. This defers to hand-
-	// authored policies of the same name (alpha-phase behavior); later
-	// phases will warn (beta) or reject without an ack annotation (GA).
-	if !ownedBy(existingObj, isvc) {
-		return fmt.Errorf(
-			"%w: %s already exists with %s",
-			ErrConflictingPolicy, key, describeController(existingObj),
-		)
-	}
-
-	// Update path. Preserve ResourceVersion so the Update doesn't lose
-	// the optimistic-concurrency token. The translator's deterministic-
-	// output contract means identical desired states across reconciles
-	// — Update is idempotent for our purposes.
-	desired.SetResourceVersion(existingObj.GetResourceVersion())
+	// The live resource version keeps the optimistic-concurrency token
+	// on the Update.
+	desired.SetResourceVersion(existing.GetResourceVersion())
 	if updateErr := r.client.Update(ctx, desired); updateErr != nil {
 		return fmt.Errorf("update backend policy %s: %w", key, updateErr)
 	}
 	return nil
+}
+
+// fetchTarget is an empty object of obj's Go type that carries only
+// obj's kind and key's name and namespace, for Get to fill in. It starts
+// empty because a typed read straight from the API server keeps every
+// field the server did not send: a target copied from the desired object
+// would show the desired controller reference on a hand-authored policy,
+// or on nothing at all when the read finds no object.
+func fetchTarget(obj client.Object, key client.ObjectKey) (client.Object, bool) {
+	objType := reflect.TypeOf(obj)
+	if objType == nil || objType.Kind() != reflect.Pointer {
+		return nil, false
+	}
+	target, ok := reflect.New(objType.Elem()).Interface().(client.Object)
+	if !ok {
+		return nil, false
+	}
+	target.GetObjectKind().SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+	target.SetName(key.Name)
+	target.SetNamespace(key.Namespace)
+	return target, true
 }
 
 // ownedBy reports whether obj's controller owner reference points at

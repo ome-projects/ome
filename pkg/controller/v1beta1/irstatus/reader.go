@@ -34,12 +34,14 @@ func (d Decoder) MaxDecodedInstances() uint64 {
 // DenseV1 object is returned unchanged. A ColumnarV2 payload is validated and
 // expanded under the bound, the rows replace instanceStatuses, and the marker
 // and columns are cleared so the object carries exactly one representation.
-// On error the object is not modified and must not drive any effect.
+// The rows take the payload's records rather than copying them: the payload
+// is dropped here, so no reader reaches them through it. On error the object
+// is not modified and must not drive any effect.
 func (d Decoder) Decode(ir *v1beta1.InferenceReplica) (Encoding, error) {
 	if ir == nil {
 		return EncodingDenseV1, nil
 	}
-	rows, encoding, err := DecodeStatus(&ir.Status, d.maxInstances)
+	rows, encoding, err := decodeStatus(&ir.Status, d.maxInstances, consumeColumns)
 	if err != nil {
 		return "", err
 	}
@@ -68,11 +70,6 @@ func NewReader(reads client.Reader, decoder Decoder) client.Reader {
 	return Reader{Reader: reads, decoder: decoder}
 }
 
-// Decoder returns the Decoder this reader carries.
-func (r Reader) Decoder() Decoder {
-	return r.decoder
-}
-
 // DecoderOf returns the Decoder carried by reads. Any other reader carries
 // the zero Decoder, which has no bound and therefore fails closed on
 // ColumnarV2.
@@ -93,4 +90,22 @@ func GetDecoded(ctx context.Context, reads client.Reader, key client.ObjectKey, 
 		return "", err
 	}
 	return DecoderOf(reads).Decode(ir)
+}
+
+// GetDecodedCopy is GetDecoded for a caller that writes the object it read:
+// it reads key into stored through reads and leaves stored in the form the
+// apiserver served, the one a write of it carries, and returns a copy in the
+// dense logical shape beside the encoding the rows were read from. One read
+// serves both a reader of the rows and a later write of the same object. A
+// fetch error is returned before any decode and keeps its API error identity.
+func GetDecodedCopy(ctx context.Context, reads client.Reader, key client.ObjectKey, stored *v1beta1.InferenceReplica) (*v1beta1.InferenceReplica, Encoding, error) {
+	if err := reads.Get(ctx, key, stored); err != nil {
+		return nil, "", err
+	}
+	decoded := stored.DeepCopy()
+	encoding, err := DecoderOf(reads).Decode(decoded)
+	if err != nil {
+		return nil, "", err
+	}
+	return decoded, encoding, nil
 }

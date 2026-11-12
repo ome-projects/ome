@@ -164,40 +164,71 @@ func (r *Reconciler) checkCapacityApplication(ctx context.Context, cl client.Cli
 	if err != nil {
 		return err
 	}
-	contract := demand.Contract.DeepCopy()
-	slices.SortFunc(contract.Components, func(a, b v1beta1.PlacementComponentDemand) int { return cmp.Compare(a.Component, b.Component) })
-	if !equality.Semantic.DeepEqual(assignment.Capacity.DemandContract, contract) {
+	if !equality.Semantic.DeepEqual(assignment.Capacity.DemandContract, sortedDemandContract(demand)) {
 		return fmt.Errorf("member rendering differs from accepted capacity demand")
 	}
 	for _, pool := range assignment.Capacity.Pools {
-		if pool.ReportUID != demand.Report.UID {
-			return fmt.Errorf("accepted member capacity report changed before application")
-		}
-		matched := false
-		for _, hardware := range demand.Hardware {
-			if hardware.ResourceName != pool.ResourceName || hardware.ResourceFlavor != pool.ResourceFlavor {
-				continue
-			}
-			attribution := hardware.Attribution.DeepCopy()
-			if attribution != nil && len(attribution.NodeLabels) == 0 {
-				attribution.NodeLabels = nil
-			}
-			// Accepted evidence counts hardware in primary units of the ratio.
-			units := max(demand.Demand.PrimaryUnits, 1)
-			scaled := hardware.Allocatable.DeepCopy()
-			scaled.Mul(units)
-			if matched || scaled.Cmp(*resource.NewQuantity(pool.Allocatable, resource.DecimalSI)) != 0 || !equality.Semantic.DeepEqual(attribution, &pool.Attribution) {
-				return fmt.Errorf("accepted member hardware changed before application")
-			}
-			now := r.capacityNow()
-			if hardware.ObservedAt == nil || hardware.ObservedAt.After(now) || now.Sub(hardware.ObservedAt.Time) >= r.Capacity.MaxAge {
-				return fmt.Errorf("member hardware report is stale before application")
-			}
-			matched = true
-		}
-		if !matched {
-			return fmt.Errorf("accepted member hardware pool is missing before application")
+		if err := r.checkAcceptedPool(pool, demand); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// sortedDemandContract is the resolved contract with its components in name
+// order, the order the accepted sample stores them in.
+func sortedDemandContract(demand *resolution.ResolvedDemand) *v1beta1.PlacementDemandContract {
+	contract := demand.Contract.DeepCopy()
+	slices.SortFunc(contract.Components, func(a, b v1beta1.PlacementComponentDemand) int { return cmp.Compare(a.Component, b.Component) })
+	return contract
+}
+
+// checkAcceptedPool checks one accepted hardware pool against the member's
+// current report: the same report, exactly one row of the pool's resource and
+// flavor, with the accepted amount and attribution, observed recently enough.
+func (r *Reconciler) checkAcceptedPool(pool v1beta1.PlacementCapacityPool, demand *resolution.ResolvedDemand) error {
+	if pool.ReportUID != demand.Report.UID {
+		return fmt.Errorf("accepted member capacity report changed before application")
+	}
+	matched := false
+	for _, hardware := range demand.Hardware {
+		if hardware.ResourceName != pool.ResourceName || hardware.ResourceFlavor != pool.ResourceFlavor {
+			continue
+		}
+		if matched || !hardwareMatchesPool(hardware, pool, demand.Demand.PrimaryUnits) {
+			return fmt.Errorf("accepted member hardware changed before application")
+		}
+		if !r.hardwareObservedWithinAge(hardware) {
+			return fmt.Errorf("member hardware report is stale before application")
+		}
+		matched = true
+	}
+	if !matched {
+		return fmt.Errorf("accepted member hardware pool is missing before application")
+	}
+	return nil
+}
+
+// hardwareMatchesPool reports whether a hardware row still carries the
+// accepted amount, counted in primary units of the demand ratio, under the
+// accepted attribution. An attribution without node labels equals one with
+// an empty label set.
+func hardwareMatchesPool(hardware v1beta1.AcceleratorCapacityStatus, pool v1beta1.PlacementCapacityPool, primaryUnits int64) bool {
+	attribution := hardware.Attribution.DeepCopy()
+	if attribution != nil && len(attribution.NodeLabels) == 0 {
+		attribution.NodeLabels = nil
+	}
+	// Accepted evidence counts hardware in primary units of the ratio.
+	units := max(primaryUnits, 1)
+	scaled := hardware.Allocatable.DeepCopy()
+	scaled.Mul(units)
+	return scaled.Cmp(*resource.NewQuantity(pool.Allocatable, resource.DecimalSI)) == 0 &&
+		equality.Semantic.DeepEqual(attribution, &pool.Attribution)
+}
+
+// hardwareObservedWithinAge reports whether a row was observed at a known
+// time that is not in the future and younger than the configured maximum age.
+func (r *Reconciler) hardwareObservedWithinAge(hardware v1beta1.AcceleratorCapacityStatus) bool {
+	now := r.capacityNow()
+	return hardware.ObservedAt != nil && !hardware.ObservedAt.After(now) && now.Sub(hardware.ObservedAt.Time) < r.Capacity.MaxAge
 }

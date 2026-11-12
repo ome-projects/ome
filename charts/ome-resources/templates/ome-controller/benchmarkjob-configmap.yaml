@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: benchmarkjob-config
+  namespace: ome
+data:
+  benchmarkjob: |
+    {
+      "podConfig": {
+        "image": "{{ include "ome.imageWithHub" (dict "values" .Values "repository" .Values.ome.benchmarkJob.image "tag" .Values.ome.benchmarkJob.tag) }}",
+        "cpuRequest": "{{ .Values.ome.benchmarkJob.cpuRequest }}",
+        "memoryRequest": "{{ .Values.ome.benchmarkJob.memoryRequest }}",
+        "cpuLimit": "{{ .Values.ome.benchmarkJob.cpuLimit }}",
+        "memoryLimit": "{{ .Values.ome.benchmarkJob.memoryLimit }}"
+      }
+    }

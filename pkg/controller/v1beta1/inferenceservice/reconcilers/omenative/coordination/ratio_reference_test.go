@@ -76,7 +76,7 @@ func TestCheckRatio_ResizedDecodeSideIsFinishedAtItsNewCount(t *testing.T) {
 	if _, reason := gate.CheckRatio(0, 0, +1); strings.Contains(reason, "outpace") {
 		t.Fatalf("10 of 10 decoders are finished at the decode side's current count, so the lockstep must not hold the prefill surge: %s", reason)
 	}
-	if allowed, reason := gate.CheckRatioLockstep(); !allowed {
+	if allowed, reason := gate.checkRatioLockstep(""); !allowed {
 		t.Fatalf("the lockstep alone must not hold the prefill side either: %s", reason)
 	}
 

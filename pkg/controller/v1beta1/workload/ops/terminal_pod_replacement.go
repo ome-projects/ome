@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -14,10 +15,9 @@ import (
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// terminalTargetPods returns the terminal pods among existing that occupy
-// one of the desired target names — the dead occupants that block
-// recreating those targets under their stable names.
-func terminalTargetPods(existing []*corev1.Pod, targets []podTarget) []*corev1.Pod {
+// occupantsThat returns the pods among existing that hold one of the desired
+// target names and that the predicate reports as never running again.
+func occupantsThat(existing []*corev1.Pod, targets []podTarget, neverRunsAgain func(*corev1.Pod) bool) []*corev1.Pod {
 	if len(existing) == 0 || len(targets) == 0 {
 		return nil
 	}
@@ -25,16 +25,23 @@ func terminalTargetPods(existing []*corev1.Pod, targets []podTarget) []*corev1.P
 	for _, t := range targets {
 		wanted[t.Name] = struct{}{}
 	}
-	var dead []*corev1.Pod
+	var occupants []*corev1.Pod
 	for _, pod := range existing {
-		if !query.IsTerminalPod(pod) {
+		if !neverRunsAgain(pod) {
 			continue
 		}
 		if _, ok := wanted[pod.Name]; ok {
-			dead = append(dead, pod)
+			occupants = append(occupants, pod)
 		}
 	}
-	return dead
+	return occupants
+}
+
+// terminalTargetPods returns the terminal pods among existing that occupy
+// one of the desired target names — the dead occupants that block
+// recreating those targets under their stable names.
+func terminalTargetPods(existing []*corev1.Pod, targets []podTarget) []*corev1.Pod {
+	return occupantsThat(existing, targets, query.IsTerminalPod)
 }
 
 // admissionRejectedTargetPods returns the pods occupying one of the
@@ -44,23 +51,10 @@ func terminalTargetPods(existing []*corev1.Pod, targets []podTarget) []*corev1.P
 // operation placed there, so the name can be rebuilt immediately even on
 // the paths that otherwise leave a terminal occupant to the deadline.
 func admissionRejectedTargetPods(existing []*corev1.Pod, targets []podTarget) []*corev1.Pod {
-	if len(existing) == 0 || len(targets) == 0 {
-		return nil
-	}
-	wanted := make(map[string]struct{}, len(targets))
-	for _, t := range targets {
-		wanted[t.Name] = struct{}{}
-	}
-	var dead []*corev1.Pod
-	for _, pod := range existing {
-		if _, rejected := query.PodAdmissionRejected(pod); !rejected {
-			continue
-		}
-		if _, ok := wanted[pod.Name]; ok {
-			dead = append(dead, pod)
-		}
-	}
-	return dead
+	return occupantsThat(existing, targets, func(pod *corev1.Pod) bool {
+		_, rejected := query.PodAdmissionRejected(pod)
+		return rejected
+	})
 }
 
 // recycleTerminalTargets frees the target names a terminal pod is holding
@@ -104,6 +98,9 @@ func recycleAdmissionRejectedTargets(ctx context.Context, deps workload.Deps, in
 // there is no ladder to follow, so the next recycle happens on the next
 // pass. Either way the attempt's Operation.Deadline remains the outer
 // bound: past it nothing is recycled, and escalation owns the attempt.
+// A Failed row carries no deadline, so a terminal replacement member of
+// a gang source that failed at its drain step is replaced under the
+// pacing alone.
 //
 // The bookkeeping (RetryCount, LastProgressAt, LastFailure from the dead
 // pod's diagnostics) is written ahead of the deletes so a crash between
@@ -113,17 +110,8 @@ func recycleTerminalPods(ctx context.Context, deps workload.Deps, input workload
 		return false, nil
 	}
 	now := input.Now()
-	if s := input.ObservedState.Instance(statusIdx); s != nil && s.Operation != nil && s.Operation.Type == opType {
-		op := s.Operation
-		if !op.Deadline.IsZero() && now.After(op.Deadline.Time) {
-			return true, nil
-		}
-		if op.RetryCount > 0 && input.UpdateRetryPolicy != nil {
-			notBefore := op.LastProgressAt.Add(input.UpdateRetryPolicy.NextRetryDelay(op.RetryCount))
-			if now.Before(notBefore) {
-				return true, nil
-			}
-		}
+	if replacementHeldBack(input.ObservedState.Instance(statusIdx), opType, input.UpdateRetryPolicy, now) {
+		return true, nil
 	}
 	if !deps.ExpectationsCache().Satisfied(input.Key.Namespace, input.Key.OwnerName, input.Key.Component, podIdx) {
 		return true, nil
@@ -134,10 +122,40 @@ func recycleTerminalPods(ctx context.Context, deps workload.Deps, input workload
 	if err != nil {
 		return true, fmt.Errorf("record terminal pod recycle (instance=%d): %w", statusIdx, err)
 	}
+	if err := deleteTerminalPods(ctx, deps, input, podIdx, dead); err != nil {
+		return true, err
+	}
+	workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonTerminalPodRecycled,
+		"OMENative %s deleted terminal pod(s) %s for recreate (%s recycle %d)",
+		workload.InstanceKey(input.Key.Component, podIdx), describeTerminalPods(dead), opType, recycle)
+	return true, nil
+}
 
-	// EXPECT-ORDER: per-pod ExpectDeletes BEFORE Delete, rollback via
-	// ObservedDelete on error — a failed RPC fires no event to decrement.
-	for _, pod := range dead {
+// replacementHeldBack reports whether the attempt that owns opType on row s
+// must not delete its terminal pods now: its deadline has passed, so
+// escalation owns the attempt, or the retry schedule's delay since its last
+// attempt has not elapsed. An attempt's first delete, an attempt with no
+// schedule configured and a row under another operation are never held back.
+func replacementHeldBack(s *workload.InstanceStatus, opType workload.InstanceOperationType, schedule *workload.RetryPolicy, now time.Time) bool {
+	if s == nil || s.Operation == nil || s.Operation.Type != opType {
+		return false
+	}
+	op := s.Operation
+	if !op.Deadline.IsZero() && now.After(op.Deadline.Time) {
+		return true
+	}
+	if op.RetryCount > 0 && schedule != nil {
+		return now.Before(op.LastProgressAt.Add(schedule.NextRetryDelay(op.RetryCount)))
+	}
+	return false
+}
+
+// deleteTerminalPods deletes every pod not already on its way out. Each
+// delete is recorded in the expectations before the request and taken back
+// when the request fails, because a failed request fires no event to
+// release it; a pod already gone counts as deleted.
+func deleteTerminalPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, podIdx int32, pods []*corev1.Pod) error {
+	for _, pod := range pods {
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
@@ -147,13 +165,10 @@ func recycleTerminalPods(ctx context.Context, deps workload.Deps, input workload
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return true, fmt.Errorf("delete terminal pod %s/%s: %w", pod.Namespace, pod.Name, err)
+			return fmt.Errorf("delete terminal pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
-	workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonTerminalPodRecycled,
-		"OMENative %s deleted terminal pod(s) %s for recreate (%s recycle %d)",
-		workload.InstanceKey(input.Key.Component, podIdx), describeTerminalPods(dead), opType, recycle)
-	return true, nil
+	return nil
 }
 
 // terminalPodTermination captures the diagnostics of a terminal pod for

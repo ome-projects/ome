@@ -2,13 +2,13 @@ package inferencereplica
 
 import (
 	"context"
+	"iter"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 )
 
@@ -40,10 +40,10 @@ func (r *Reconciler) sweepRevisions(ctx context.Context, ir *v1beta1.InferenceRe
 	// liveNames union protects in-flight migrations: an Instance whose
 	// RunningRevision points at an older CR must keep that CR, or the
 	// migration resume path can't find its source payload and bails.
-	liveNames := revision.CollectLiveRevisionNames(
+	liveNames := revision.LiveRevisionNames(
 		ir.Status.CurrentRevision,
 		ir.Status.UpdateRevision,
-		v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses),
+		rowRevisions(ir.Status.InstanceStatuses),
 	)
 
 	if err := revision.RetainControllerRevisions(
@@ -55,6 +55,19 @@ func (r *Reconciler) sweepRevisions(ctx context.Context, ir *v1beta1.InferenceRe
 			r.Recorder.Eventf(ir, corev1.EventTypeWarning, "RevisionRetentionFailed",
 				"InferenceReplica %s/%s ControllerRevision retention sweep failed: %v",
 				ir.Namespace, ir.Name, err)
+		}
+	}
+}
+
+// rowRevisions yields, per stored row, the two revision names the sweep
+// protects: the one the Instance runs and the one it moves toward. The
+// sweep reads nothing else of a row, so no row is copied for it.
+func rowRevisions(rows []v1beta1.OMENativeInstanceStatus) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		for i := range rows {
+			if !yield(rows[i].RunningRevision, rows[i].TargetRevision) {
+				return
+			}
 		}
 	}
 }

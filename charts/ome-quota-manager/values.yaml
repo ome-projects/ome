@@ -59,15 +59,43 @@ quotaManager:
   #
   # controller-runtime caps each renewal request at renewDeadline/2, so a window
   # holds two attempts and the leader survives exactly one hung apiserver
-  # request. At the defaults that is a ~10s budget, which a routine etcd stall
-  # exhausts — costing the leader its lease and restarting the pod. 40s buys two
-  # 20s attempts. The cost is failover latency: the standby waits up to
-  # leaseDuration before taking over, so raise these only as far as the cluster's
-  # apiserver actually needs.
+  # request. At controller-runtime's defaults that is a ~10s budget, which a
+  # routine etcd stall exhausts — costing the leader its lease and restarting
+  # the pod. 40s buys two 20s attempts, so the leader rides out an apiserver
+  # stall of up to 40s. The cost of a long lease is the wait after a crash: the
+  # standby waits up to leaseDuration before taking over, so raise these only
+  # as far as the cluster's apiserver actually needs. The releaseOnCancel rule
+  # below needs a lease above 108s beside a 40s renewDeadline; 120s leaves a
+  # margin.
   leaderElection:
-    leaseDuration: "60s"
+    leaseDuration: "120s"
     renewDeadline: "40s"
     retryPeriod: "8s"
+    # Give up the lease at the end of a graceful stop (a rollout, a node drain,
+    # a pod deletion), so the standby takes over at its next poll, within 2.2
+    # retryPeriods (about 18s at 8s), instead of waiting for the lease to
+    # expire. A crash or a lost node releases nothing, and the standby still
+    # waits for the lease to expire. Off is controller-runtime's own default;
+    # this chart turns it on. With the release on and leaderElect true, the
+    # binary refuses to start unless leaseDuration, in whole seconds, exceeds
+    # max(renewDeadline / 2, 1s) + retryPeriod + 2 x renewDeadline (20s + 8s +
+    # 80s = 108s above); its error lists each amount and says what to change.
+    # A values file that sets a 60s lease beside the 40s renewDeadline fails the
+    # rule: raise its lease above 108s or set this to false. With leaderElect
+    # false this flag does nothing. A quota manager image that does not know
+    # this flag exits at start; set this to false while such an image runs
+    # under this chart, and move the chart and the image together.
+    releaseOnCancel: true
+
+  # Termination grace period of the quota manager pod, in seconds. On SIGTERM
+  # the binary stops its controllers and servers, waiting at most
+  # controller-runtime's 30s shutdown timeout, and only then releases the
+  # leader lease. The kubelet sends SIGKILL when this grace period runs out, so
+  # keep it above that timeout plus the release, one read and one write of the
+  # Lease: 40 leaves 10s for them. A healthy stop takes about a second and the
+  # pod exits as soon as it is done; this value is only the ceiling. Unset
+  # leaves the Kubernetes default of 30, the same as the stop timeout.
+  terminationGracePeriodSeconds: 40
 
   # maxTreeDepth bounds a node's distance from the root, in edges (the root is 0,
   # a top-tier grouping is 1). 0 disables the check rather than assuming a bound;
@@ -213,6 +241,14 @@ quotaManager:
     # at one cluster MUST NOT share it, or each treats the other's objects as
     # its own and they will fight. Empty uses the component name.
     fieldManager: ""
+
+  # The cluster's DNS domain ("cluster.local" on most clusters). The webhook
+  # serving certificate covers the fully qualified
+  # <service>.<namespace>.svc.<clusterDomain> name under both certificate
+  # paths: the binary reads it from --cluster-domain under internal cert
+  # management, and the cert-manager Certificate lists it as a DNS name. The
+  # binary has NO built-in value; this value is the source of truth.
+  clusterDomain: cluster.local
 
   # webhook serves admission validation for AcceleratorQuota, turning a
   # tree-breaking write into a rejected kubectl apply instead of a Degraded

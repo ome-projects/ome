@@ -11,7 +11,6 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -19,6 +18,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/autoscaler"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/podmonitor"
@@ -26,7 +26,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
-	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/render"
 )
 
@@ -39,30 +38,16 @@ type BaseComponentFields struct {
 
 	// Client serves the reconcilers; Piece.Client is the reader the render
 	// helpers use, and both are set from the same deps client.
-	Client    client.Client
-	Clientset kubernetes.Interface
-	// APIReader is the live (uncached) reader, typically mgr.GetAPIReader().
-	// Intended for reads where cache lag would be a correctness problem.
-	// Currently unread on the ISVC side — the InferenceReplica controller
-	// owns revision bookkeeping, audit ledger dedup, and EndpointSlice
-	// drain checks.
+	Client client.Client
+	// APIReader is the live (uncached) reader, typically mgr.GetAPIReader(),
+	// for reads where cache lag would be a correctness problem: the
+	// placement demand fingerprint, the disruption budget and the paired
+	// role's rows.
 	APIReader client.Reader
-	// Expectations is the OMENative per-controller create/delete
-	// bookkeeping cache. Currently unread on the ISVC side — the
-	// InferenceReplica controller owns its own instance. nil for
-	// non-OMENative modes.
-	Expectations *workloadtypes.Expectations
 	// Recorder is the parent controller's event recorder.
-	Recorder record.EventRecorder
-	// GangSchedulingAvailable is the cluster-discovery boolean threaded
-	// from the InferenceServiceReconciler — true when the cluster has
-	// the scheduler-plugins `scheduling.x-k8s.io/v1alpha1/PodGroup` CRD
-	// installed. Currently unread on the ISVC side — the projected IR
-	// carries the flag and the IR controller consults it. Other
-	// deployment modes (Raw / MultiNode / PD) ignore this field.
-	GangSchedulingAvailable bool
-	Scheme                  *runtime.Scheme
-	StatusManager           *status.StatusReconciler
+	Recorder      record.EventRecorder
+	Scheme        *runtime.Scheme
+	StatusManager *status.StatusReconciler
 
 	// PolicyResolver renders per-component autoscalerPolicyRef attachments;
 	// threaded from ComponentInputs (per reconcile). May be nil only in
@@ -78,9 +63,14 @@ type BaseComponentFields struct {
 	// PacingPartition sizes the canary machine's rollout-control partition
 	// for this Component, threaded from ComponentInputs to the
 	// InferenceReplica projector. nil when no canary governs the Component.
-	PacingPartition     irprojector.PartitionResolver
+	PacingPartition irprojector.PartitionResolver
+	// RollbackToRevision is the stable revision this Component's canary unit
+	// keeps a side on, threaded from ComponentInputs to the projector for the
+	// replica it creates. Empty when the unit keeps no stable side.
+	RollbackToRevision  string
 	CoordinatorFollower bool
 	CoordinatorTarget   *int32
+	FollowerReleased    bool
 }
 
 // newBaseComponentFields is the ONE place BaseComponentFields is
@@ -88,7 +78,7 @@ type BaseComponentFields struct {
 // logger name; nothing else differs per component. The fine-tuned
 // serving fields (FineTunedServing / FineTunedServingWithMergedWeights /
 // FineTunedWeights) are populated at reconcile time by
-// ReconcileFineTunedWeights, never at construction.
+// render.ReconcileFineTunedWeights, never at construction.
 func newBaseComponentFields(deps *ComponentDeps, in ComponentInputs, loggerName string) BaseComponentFields {
 	return BaseComponentFields{
 		Piece: render.Piece{
@@ -106,37 +96,26 @@ func newBaseComponentFields(deps *ComponentDeps, in ComponentInputs, loggerName 
 			Overlays:               in.Overlays,
 		},
 		Client:                    deps.Client,
-		Clientset:                 deps.Clientset,
 		APIReader:                 deps.APIReader,
-		Expectations:              deps.Expectations,
 		Recorder:                  deps.Recorder,
-		GangSchedulingAvailable:   deps.GangSchedulingAvailable,
 		QuotaAcceleratorResources: deps.QuotaAcceleratorResources,
 		Scheme:                    deps.Scheme,
 		StatusManager:             status.NewStatusReconciler(),
 		PolicyResolver:            in.PolicyResolver,
 		PacingPartition:           in.PacingPartition,
+		RollbackToRevision:        in.RollbackToRevision,
 		CoordinatorFollower:       in.CoordinatorFollower,
 		CoordinatorTarget:         in.CoordinatorTarget,
+		FollowerReleased:          in.FollowerReleased,
 	}
-}
-
-// pieceOf returns b's rendering inputs, or nil when b itself is nil, so the
-// overlay forwarders accept the nil bag the overlay helpers tolerate.
-func pieceOf(b *BaseComponentFields) *render.Piece {
-	if b == nil {
-		return nil
-	}
-	return &b.Piece
 }
 
 // Common methods as functions that operate on BaseComponentFields
 
 // ComponentAutoscaling is one component's autoscaler resolution for a single
-// reconcile pass: the policy outcome (nil without a ref), the chain result,
-// and the fail-closed hold flag.
+// reconcile pass: the resolved autoscaler, where it came from, and the
+// fail-closed hold flag.
 type ComponentAutoscaling struct {
-	Outcome  *autoscaler.PolicyOutcome
 	Resolved *v1beta1.ComponentAutoscaler
 	Source   autoscaler.SpecSource
 	Hold     bool
@@ -162,7 +141,7 @@ func resolveComponentAutoscaling(ctx context.Context, b *BaseComponentFields, is
 	}
 	resolved, source, hold := autoscaler.ResolveComponentAutoscalerWithPolicy(b.Runtime, isvc, componentType, outcome)
 	resolved = coordinatorFollowerAutoscaler(b, resolved, source, hold)
-	res := ComponentAutoscaling{Outcome: outcome, Resolved: resolved, Source: source, Hold: hold}
+	res := ComponentAutoscaling{Resolved: resolved, Source: source, Hold: hold}
 	if hold {
 		emitHoldEvent(b, isvc, componentType, outcome)
 		res.RequeueAfter = policyHoldRequeueAfter(b)
@@ -311,77 +290,15 @@ func resolveRawComponentAutoscaling(ctx context.Context, b *BaseComponentFields,
 	return res, nil
 }
 
-// The rendering helpers operate on the embedded render.Piece. These
-// forwarders let callers holding a *BaseComponentFields use them without
-// naming the piece.
-
-// ReconcileFineTunedWeights reconciles fine-tuned weights for any component.
-func ReconcileFineTunedWeights(b *BaseComponentFields, isvc *v1beta1.InferenceService) error {
-	return render.ReconcileFineTunedWeights(&b.Piece, isvc)
-}
-
-// UpdateVolumeMounts updates volume mounts for the container.
-func UpdateVolumeMounts(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container, objectMeta *metav1.ObjectMeta) {
-	render.UpdateVolumeMounts(&b.Piece, isvc, container, objectMeta)
-}
-
-// UpdateEnvVariables updates environment variables for the container.
-func UpdateEnvVariables(b *BaseComponentFields, isvc *v1beta1.InferenceService, container *corev1.Container, objectMeta *metav1.ObjectMeta) {
-	render.UpdateEnvVariables(&b.Piece, isvc, container, objectMeta)
-}
-
-// UpdatePodSpecNodeSelector updates pod spec node selectors for scheduling.
-func UpdatePodSpecNodeSelector(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, componentType v1beta1.ComponentType) {
-	render.UpdatePodSpecNodeSelector(&b.Piece, isvc, podSpec, componentType)
-}
-
-// UpdatePodSpecVolumes updates pod spec with common volumes.
-func UpdatePodSpecVolumes(b *BaseComponentFields, isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, objectMeta *metav1.ObjectMeta) {
-	render.UpdatePodSpecVolumes(&b.Piece, isvc, podSpec, objectMeta)
-}
-
-// MergeRuntimeArgumentsOverride merges the accelerator class's runtime
-// argument overrides into the container args.
-func MergeRuntimeArgumentsOverride(b *BaseComponentFields, container *corev1.Container) {
-	render.MergeRuntimeArgumentsOverride(&b.Piece, container)
-}
-
-// MergeResources merges resource requests and limits from the runtime and
-// accelerator class into the container.
-func MergeResources(b *BaseComponentFields, container *corev1.Container) {
-	render.MergeResources(&b.Piece, container)
-}
-
-// ProcessBaseAnnotations processes common annotations.
-func ProcessBaseAnnotations(b *BaseComponentFields, isvc *v1beta1.InferenceService, annotations map[string]string) (map[string]string, error) {
-	return render.ProcessBaseAnnotations(&b.Piece, isvc, annotations)
-}
-
-// ProcessBaseLabels processes common labels.
-func ProcessBaseLabels(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, labels map[string]string) (map[string]string, error) {
-	return render.ProcessBaseLabels(&b.Piece, isvc, componentType, labels)
-}
-
 // ReconcileComponentObjectMeta builds the common ObjectMeta block (Name,
 // Namespace, Annotations, Labels) shared by engine / decoder / router.
 func ReconcileComponentObjectMeta(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, componentName string, componentAnnotations map[string]string, componentLabels map[string]string) (metav1.ObjectMeta, error) {
 	return render.ReconcileComponentObjectMeta(&b.Piece, isvc, componentType, componentName, componentAnnotations, componentLabels)
 }
 
-// ProcessComponentAnnotations performs the per-Component annotation build.
-func ProcessComponentAnnotations(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentAnnotations map[string]string) (map[string]string, error) {
-	return render.ProcessComponentAnnotations(&b.Piece, isvc, componentAnnotations)
-}
-
-// ProcessComponentLabels performs the per-Component label build.
-func ProcessComponentLabels(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, componentLabels map[string]string) (map[string]string, error) {
-	return render.ProcessComponentLabels(&b.Piece, isvc, componentType, componentLabels)
-}
-
-// UpdateComponentStatus updates component status based on deployment mode.
-// Every deployment mode (RawDeployment, MultiNode, OMENative) emits pods
-// carrying the raw-deployment app label, so one constant label pair serves
-// the engine, decoder and router alike.
+// UpdateComponentStatus writes a Component's status: its ready condition,
+// the autoscaler mirror and, for a service with a model, the model-loading
+// state read from the Component's pods.
 func UpdateComponentStatus(b *BaseComponentFields, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, objectMeta metav1.ObjectMeta, componentExt *v1beta1.ComponentExtensionSpec) error {
 	// Always initialize the component ready condition to ensure it's visible from the start
 	// The deployment reconciler will update the condition based on the actual deployment status:
@@ -413,19 +330,25 @@ func UpdateComponentStatus(b *BaseComponentFields, isvc *v1beta1.InferenceServic
 		return nil
 	}
 
-	// Update model status for all deployment modes based on actual pod information
-	rawDeployment := b.DeploymentMode == constants.RawDeployment
-	statusSpec := isvc.Status.Components[componentType]
-	podLabelKey := constants.RawDeploymentAppLabel
-	podLabelValue := constants.GetRawServiceLabel(objectMeta.Name)
-
-	pods, err := isvcutils.ListPodsByLabel(b.Client, isvc.ObjectMeta.Namespace, podLabelKey, podLabelValue)
+	pods, err := modelStatusPods(b, isvc, objectMeta)
 	if err != nil {
 		return errors.Wrapf(err, "failed to list %s pods by label", componentType)
 	}
-	b.StatusManager.PropagateModelStatus(&isvc.Status, statusSpec, pods, rawDeployment)
-
+	b.StatusManager.PropagateModelStatus(&isvc.Status, pods)
 	return nil
+}
+
+// modelStatusPods lists the pods the model-loading state is read from: the
+// Component's pods that carry the raw app label. Every RawDeployment pod and
+// the MultiNode leader carry it. An OMENative pod carries the workload's
+// ome.io labels and never the app label, so for that mode the list is not
+// made: it would walk every pod of the namespace and return none, and the
+// state is written as for no pod either way.
+func modelStatusPods(b *BaseComponentFields, isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta) (*corev1.PodList, error) {
+	if b.DeploymentMode == constants.OMENative {
+		return &corev1.PodList{}, nil
+	}
+	return isvcutils.ListPodsByLabel(b.Client, isvc.Namespace, constants.RawDeploymentAppLabel, constants.GetRawServiceLabel(objectMeta.Name))
 }
 
 // writeComponentAutoscalerStatus resolves the per-Component autoscaler and
@@ -634,9 +557,10 @@ func canonicalScaleTargetRef(mode constants.DeploymentModeType, isvc *v1beta1.In
 // so the stable Service + PodMonitor scope to OMENative-stamped pods
 // only — a same-Component mode switch (engine OMENative -> engine
 // RawDeployment) doesn't strand traffic on the wrong pod set during
-// the transition. PodMonitor scrape port matches the Raw fallback
-// rules: prefer a port named "metrics", else the first declared port,
-// else "http".
+// the transition. The PodMonitor's own scrape endpoint (path, interval
+// and port names) comes from the podMonitor block of
+// inferenceservice-config; a block without them writes only the
+// endpoints the extra-endpoints annotation declares.
 //
 // multiPod is the effective shape of the Component: the runtime's
 // leader/worker blocks with the ISVC's merged over them, the same
@@ -702,49 +626,54 @@ func ReconcileStableSubresources(
 	objectMeta metav1.ObjectMeta,
 	podSpec *corev1.PodSpec,
 ) error {
-	// Base selector — narrows to OMENative-managed pods of this (ISVC,
-	// Component) pair. Used as-is for PodMonitor; narrowed to the leader
-	// for the stable Service of a multi-pod Component (see function-level
-	// docstring for rationale).
+	// The PodMonitor scrapes every pod of the role; the stable Service
+	// narrows to each Instance's leader when the role has one.
 	baseSelector := omeNativePodSelector(podPrefix, componentType)
 	stableSelector := baseSelector
 	if leaderOnly {
 		stableSelector = query.LeaderRoutingSelector(baseSelector, true)
 	}
-	componentMeta := objectMeta.DeepCopy()
-	componentMeta.OwnerReferences = []metav1.OwnerReference{
-		*metav1.NewControllerRef(isvc, v1beta1.SchemeGroupVersion.WithKind("InferenceService")),
+	if err := reconcileStableService(b, isvc, componentExt, objectMeta, podSpec, stableSelector); err != nil {
+		return err
 	}
+	return reconcileScrapeMonitor(ctx, b, isvc, objectMeta, podSpec, baseSelector)
+}
 
-	// Stable Service via the SAME top-level reconciler RawDeployment and
-	// MultiNode use; only the selector + owner refs are OMENative-shaped.
-	sr := service.NewServiceReconciler(b.Client, b.Scheme, *componentMeta, componentExt, podSpec, stableSelector)
+// reconcileStableService writes the role's stable Service through the
+// reconciler every deployment mode shares; only the selector and the owner
+// reference are OMENative-shaped.
+func reconcileStableService(
+	b *BaseComponentFields,
+	isvc *v1beta1.InferenceService,
+	componentExt *v1beta1.ComponentExtensionSpec,
+	objectMeta metav1.ObjectMeta,
+	podSpec *corev1.PodSpec,
+	selector map[string]string,
+) error {
+	componentMeta := objectMeta.DeepCopy()
+	componentMeta.OwnerReferences = []metav1.OwnerReference{isvcControllerRef(isvc)}
+	sr := service.NewServiceReconciler(b.Client, b.Scheme, *componentMeta, componentExt, podSpec, selector)
 	if _, err := sr.Reconcile(); err != nil {
 		return errors.Wrap(err, "stable service")
 	}
+	return nil
+}
 
-	// PodMonitor is optional: its scheme is registered only when the Prometheus
-	// operator CRD is present (manager startup). On a cluster without it, skip
-	// creation rather than failing the whole reconcile.
+// reconcileScrapeMonitor writes the role's PodMonitor. The monitoring API is
+// registered only when the Prometheus operator CRD is installed; without it
+// the role runs unscraped instead of failing the reconcile.
+func reconcileScrapeMonitor(
+	ctx context.Context,
+	b *BaseComponentFields,
+	isvc *v1beta1.InferenceService,
+	objectMeta metav1.ObjectMeta,
+	podSpec *corev1.PodSpec,
+	selector map[string]string,
+) error {
 	if !b.Scheme.Recognizes(monitoringv1.SchemeGroupVersion.WithKind(constants.PodMonitorKind)) {
 		return nil
 	}
-
-	// PodMonitor scrape port follows the Raw fallback rules: prefer a
-	// port named "metrics", else the first declared port, else "http".
-	portName := "http"
-	if len(podSpec.Containers) > 0 {
-		ports := podSpec.Containers[0].Ports
-		for _, p := range ports {
-			if p.Name == "metrics" {
-				portName = "metrics"
-				break
-			}
-		}
-		if portName == "http" && len(ports) > 0 && ports[0].Name != "" {
-			portName = ports[0].Name
-		}
-	}
+	scrape := scrapeConfig(b)
 	target := &monitoringv1.PodMonitor{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      objectMeta.Name,
@@ -755,34 +684,36 @@ func ReconcileStableSubresources(
 		target.Spec.NamespaceSelector = monitoringv1.NamespaceSelector{
 			MatchNames: []string{objectMeta.Namespace},
 		}
-		target.Spec.Selector = metav1.LabelSelector{MatchLabels: baseSelector}
-		endpoints := []monitoringv1.PodMetricsEndpoint{{
-			Port:     &portName,
-			Path:     "/metrics",
-			Interval: "10s",
-		}}
-		endpoints = append(endpoints, podmonitor.ParseExtraEndpoints(objectMeta.Annotations)...)
-		target.Spec.PodMetricsEndpoints = endpoints
-		// Own copy of baseSelector for metadata.labels: ApplyManagedScrapeConfig
-		// merges cfg.Labels into it, and spec.selector.MatchLabels must NOT gain
-		// those labels (pods don't carry them).
-		target.Labels = maps.Clone(baseSelector)
-		// Cluster-scope PodMonitor defaults (metadata labels + endpoint
-		// relabelings) from the inferenceservice-config ConfigMap. Applied
-		// AFTER target.Labels/endpoints are set: labels merge into
-		// metadata.labels only (spec.selector keeps selecting pods by
-		// baseSelector), relabelings append to every endpoint. Without this the
-		// PodMonitor carries only OME's own labels and a label-selecting
-		// collector (e.g. an external target allocator) never scrapes it.
-		if b.InferenceServiceConfig != nil {
-			podmonitor.ApplyManagedScrapeConfig(target, b.InferenceServiceConfig.PodMonitor)
-		}
-		target.OwnerReferences = []metav1.OwnerReference{
-			*metav1.NewControllerRef(isvc, v1beta1.SchemeGroupVersion.WithKind("InferenceService")),
-		}
+		target.Spec.Selector = metav1.LabelSelector{MatchLabels: selector}
+		target.Spec.PodMetricsEndpoints = podmonitor.ScrapeEndpoints(scrape, podSpec, objectMeta.Annotations)
+		// metadata.labels gets its own copy: the cluster-scope scrape config
+		// merges its labels into it, while spec.selector keeps selecting pods
+		// by the bare selector (pods do not carry those labels).
+		target.Labels = maps.Clone(selector)
+		// The cluster-scope defaults (metadata labels and endpoint
+		// relabelings) from the inferenceservice-config ConfigMap apply after
+		// the labels and endpoints are set; without them a label-selecting
+		// collector never scrapes the PodMonitor.
+		podmonitor.ApplyManagedScrapeConfig(target, scrape)
+		target.OwnerReferences = []metav1.OwnerReference{isvcControllerRef(isvc)}
 		return nil
 	}); err != nil {
 		return errors.Wrapf(err, "pod monitor %s/%s", target.Namespace, target.Name)
 	}
 	return nil
+}
+
+// scrapeConfig is the podMonitor block of the operator configuration, or
+// an empty block when the reconciler runs without one.
+func scrapeConfig(b *BaseComponentFields) controllerconfig.PodMonitorConfig {
+	if b.InferenceServiceConfig == nil {
+		return controllerconfig.PodMonitorConfig{}
+	}
+	return b.InferenceServiceConfig.PodMonitor
+}
+
+// isvcControllerRef is the owner reference that makes the InferenceService
+// the controller of one of its subresources.
+func isvcControllerRef(isvc *v1beta1.InferenceService) metav1.OwnerReference {
+	return *metav1.NewControllerRef(isvc, v1beta1.SchemeGroupVersion.WithKind("InferenceService"))
 }

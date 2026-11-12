@@ -1,0 +1,49 @@
+# Two replicas their owner created and keeps: an engine pool and a router.
+# Neither names an InferenceService. Each carries its own pod template,
+# replica count and update strategy, and rolls on its own when its owner
+# changes it. The service in inferenceservice.yaml fronts them.
+apiVersion: ome.io/v1beta1
+kind: InferenceReplica
+metadata:
+  name: pool-a
+  namespace: team-a
+spec:
+  component: engine
+  replicas: 2
+  runners:
+    - name: default
+      size: 1
+      template:
+        spec:
+          containers:
+            - name: ome-container
+              image: example.com/serving:1.0
+              ports:
+                - name: http
+                  containerPort: 8080
+---
+apiVersion: ome.io/v1beta1
+kind: InferenceReplica
+metadata:
+  name: router-a
+  namespace: team-a
+spec:
+  component: router
+  replicas: 1
+  runners:
+    - name: default
+      size: 1
+      template:
+        spec:
+          containers:
+            - name: ome-container
+              image: example.com/router:1.0
+              ports:
+                - name: http
+                  containerPort: 8080
+              # The service writes nothing on a referenced replica, so its
+              # owner points the router at the engine through the stable
+              # Service the service creates: <service>-engine.
+              env:
+                - name: OME_ENGINE_ENDPOINT
+                  value: http://chat-engine:8080

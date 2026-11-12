@@ -17,7 +17,7 @@ import (
 // leader starts with an empty in-memory assignment store and must rebuild from the
 // cluster. Members that were assumed but not yet bound by the old leader are lost
 // (assume is in-memory), so their gangs re-plan on the new leader. This asserts the
-// whole fleet still converges — no gang stranded, no domain over-committed — after
+// whole fleet still converges — no gang short of a node, no domain over-committed — after
 // the assignment store is reset under contention.
 //
 // Reproduced by starting one scheduler, firing the burst, then cancelling it and

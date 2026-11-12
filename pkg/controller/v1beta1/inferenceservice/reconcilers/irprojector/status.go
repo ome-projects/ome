@@ -98,29 +98,22 @@ func AggregateIRStatus(ctx context.Context, c client.Client, reads client.Reader
 	return nil
 }
 
-// aggregateOneComponent fetches one IR, computes the desired
-// LifecycleStatus, and writes it to the live ISVC via
-// Status().Update under retry.RetryOnConflict.
+// aggregateOneComponent copies one role's replica status onto its service:
+// it reads the replica as the cache holds it, writes the lifecycle block and
+// the role's ready condition onto the live service when they changed, counts
+// a time to ready when that write first made the service Ready, and leaves
+// the same block and condition on the pass's own copy of the service.
 //
-// On apierrors.IsNotFound for the IR Get: returns nil so the outer
-// loop keeps going. The next reconcile picks up the IR's fresh
-// status once the cache observes it.
-//
-// On apierrors.IsNotFound for the ISVC Update: returns nil so a
-// race with ISVC deletion drops cleanly.
+// A replica the cache does not hold is not an error: the next pass reads it
+// once the cache has it. A service gone before or during the write is not an
+// error either: the deletion takes the status with it.
 func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Reader, isvc *v1beta1.InferenceService, component v1beta1.ComponentType) error {
 	key := RoleReplicaKey(isvc, component)
-	name := key.Name
 	ir := &v1beta1.InferenceReplica{}
 	if err := c.Get(ctx, key, ir); err != nil {
 		if apierrors.IsNotFound(err) {
-			// First-reconcile race: the projector's CreateOrUpdate
-			// landed but the cache hasn't observed it yet, OR the
-			// IR was deleted between writes. Leave the status entry
-			// empty and let the next reconcile pick it up. Log at
-			// V(1) so a *persistent* NotFound (projector failing to
-			// create) is visible in operator logs — otherwise this
-			// state is invisible from the ISVC status surface.
+			// Logged at V(1): a replica that never appears is visible in the
+			// operator's logs, where the service status cannot show it.
 			log.FromContext(ctx).V(1).Info("InferenceReplica not found; leaving ISVC status entry empty until next reconcile",
 				"isvc", client.ObjectKeyFromObject(isvc),
 				"inferencereplica", key,
@@ -128,74 +121,68 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 			return nil
 		}
 		return fmt.Errorf("AggregateIRStatus: get IR %s/%s for component=%s: %w",
-			isvc.Namespace, name, component, err)
+			isvc.Namespace, key.Name, component, err)
 	}
+	write := roleStatusWrite{
+		component: component,
+		replica:   ir,
+		// The pass's copy seeds the carried generation for the paths that
+		// never read the live service; the write settles it on the live read.
+		lifecycle: IRStatusToComponentStatus(ir, isvc.Status.Components[component].Lifecycle),
+	}
+	// The role's ready condition follows from the lifecycle block alone, so
+	// it is derived once and written on every attempt. The replica's desired
+	// count sizes the serving minimum, so a surge does not raise it.
+	write.ready = status.TopLevelComponentReadyFromLifecycle(component, write.lifecycle, ir.Spec.Lifecycle, ir.Spec.Replicas)
+	flip, err := write.persist(ctx, c, reads, client.ObjectKeyFromObject(isvc))
+	if err != nil {
+		return fmt.Errorf("AggregateIRStatus: persist component=%s status: %w", component, err)
+	}
+	if flip.happened {
+		status.ObserveTimeToReady(isvc, flip.before)
+	}
+	write.mirrorOnto(isvc)
+	return nil
+}
 
-	// ObservedGeneration is settled against the live ISVC inside the retry
-	// closure; the caller's snapshot only seeds it for the early-return
-	// paths that never read the live object.
-	desired := IRStatusToComponentStatus(ir, isvc.Status.Components[component].Lifecycle)
-	// topCond is the standard top-level Component-ready condition
-	// (EngineReady / DecoderReady / RouterReady) derived from the
-	// OMENative counters. Computed once
-	// outside the retry closure: the derivation is a pure function of
-	// `desired`, which is recomputed only when the IR changes (a
-	// separate reconcile would re-enter AggregateIRStatus). On a peer
-	// status-write conflict we re-Get the ISVC and re-stamp, but the
-	// condition itself is stable for this pass.
-	// The committed IR carries the merged Instance lifecycle policy. Pod-level
-	// disruption policy on the parent ISVC is independent of this readiness floor.
-	// ir.Spec.Replicas supplies the desired count so surge does not inflate it.
-	topCond := status.TopLevelComponentReadyFromLifecycle(component, desired, ir.Spec.Lifecycle, ir.Spec.Replicas)
-	isvcKey := client.ObjectKeyFromObject(isvc)
-	// Stamping topCond recomputes the aggregate Ready condition, so for an
-	// OMENative ISVC this write is usually the one that first flips Ready
-	// True — the reconciler's own status flush then sees it already set.
-	// Capture the transition here so end-to-end deployment latency is not
-	// systematically dropped for the components that use this path.
-	var (
-		readyFlipped bool
-		prevReady    *knapis.Condition
-	)
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+// roleStatusWrite is one role's status on its way onto the service: the
+// replica it was read from, the lifecycle block and the ready condition to
+// write.
+type roleStatusWrite struct {
+	component v1beta1.ComponentType
+	replica   *v1beta1.InferenceReplica
+	lifecycle *v1beta1.LifecycleStatus
+	ready     *knapis.Condition
+}
+
+// readinessFlip says whether a write made the service Ready, and what the
+// aggregate Ready condition on the live service was before that write.
+type readinessFlip struct {
+	happened bool
+	before   *knapis.Condition
+}
+
+// persist writes the block and the condition onto the live service under a
+// conflict retry: every attempt re-reads the service live, settles the
+// carried generation on that read, and writes only when the status changed.
+// A service gone before or during the write ends the attempt with nothing
+// written.
+func (w *roleStatusWrite) persist(ctx context.Context, c client.Client, reads client.Reader, key client.ObjectKey) (readinessFlip, error) {
+	var flip readinessFlip
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &v1beta1.InferenceService{}
-		if err := reads.Get(ctx, isvcKey, fresh); err != nil {
+		if err := reads.Get(ctx, key, fresh); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil
 			}
 			return fmt.Errorf("re-read ISVC: %w", err)
 		}
-		if fresh.Status.Components == nil {
-			fresh.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
-		}
-		// Snapshot the live status before mutation so a no-op rollup
-		// (IR.Status unchanged since the last pass) skips the
-		// Status().Update below. Each ISVC status write re-triggers the
-		// ISVC reconciler, so at steady state the unconditional write
-		// amplified idle reconciles. SetCondition (knative conditionSet)
-		// preserves LastTransitionTime when the condition value is
-		// unchanged, so an unchanged status DeepEquals its prior snapshot.
 		before := fresh.Status.DeepCopy()
-		cs := fresh.Status.Components[component]
-		// The carried generation must come from this attempt's read of the
-		// live ISVC, not from the caller's snapshot, so a conflict retry
-		// never rolls it back.
-		desired.ObservedGeneration = lifecycleObservedGeneration(ir, cs.Lifecycle, fresh.Generation)
-		cs.Lifecycle = desired.DeepCopy()
-		fresh.Status.Components[component] = cs
-		// Emit the top-level component-ready condition in the same
-		// Status().Update round-trip as the subtree write. Without this,
-		// the OMENative counters land but no EngineReady / DecoderReady /
-		// RouterReady ever flips True, so the aggregate Ready rollup and
-		// `kubectl wait --for=condition=Ready` see Status=Unknown
-		// indefinitely.
-		if topCond != nil {
-			fresh.Status.SetCondition(topCond.Type, topCond)
-		}
-		// Skip the write when the recomputed status matches what's already
-		// live: a no-op rollup must perform ZERO writes so it triggers
-		// nothing downstream. The in-memory mirror after the retry loop
-		// still runs so callers in this pass observe the fresh subtree.
+		w.applyTo(fresh, fresh.Generation)
+		// An unchanged status costs zero writes, so an idle pass triggers
+		// nothing downstream. The condition set keeps LastTransitionTime for
+		// an unchanged condition, so such a status is deep-equal to its
+		// snapshot.
 		if equality.Semantic.DeepEqual(*before, fresh.Status) {
 			return nil
 		}
@@ -205,37 +192,55 @@ func aggregateOneComponent(ctx context.Context, c client.Client, reads client.Re
 			}
 			return fmt.Errorf("update ISVC status: %w", err)
 		}
-		prevReady = before.GetCondition(knapis.ConditionReady)
-		readyFlipped = status.IsReadyTrue(fresh.Status) &&
-			(prevReady == nil || prevReady.Status != v1.ConditionTrue)
+		flip = readinessFlipOf(before, fresh.Status)
 		return nil
-	}); err != nil {
-		return fmt.Errorf("AggregateIRStatus: persist component=%s status: %w", component, err)
-	}
-	if readyFlipped {
-		status.ObserveTimeToReady(isvc, prevReady)
-	}
+	})
+	return flip, err
+}
 
-	// Mirror onto the caller's in-memory ISVC so downstream code in
-	// the same reconcile pass observes the post-write state. Without
-	// the mirror, the outer reconciler's status-equality short-circuit
-	// (inferenceServiceStatusEqual) may incorrectly skip the next
-	// updateStatus call because its baseline doesn't reflect what we
-	// just committed.
+// applyTo writes the block and the condition onto a service. The carried
+// generation is settled against that service's generation and the block it
+// holds already, so a retry never writes a generation from an older read.
+func (w *roleStatusWrite) applyTo(isvc *v1beta1.InferenceService, generation int64) {
 	if isvc.Status.Components == nil {
 		isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
 	}
-	cs := isvc.Status.Components[component]
-	cs.Lifecycle = desired.DeepCopy()
-	isvc.Status.Components[component] = cs
-	// Mirror the just-committed top-level condition onto the cached
-	// ISVC so the outer reconciler's updateStatus flush — which copies
-	// p.ISVC.Status onto a fresh re-read of the cluster — doesn't clobber
-	// it on the next pass.
-	if topCond != nil {
-		isvc.Status.SetCondition(topCond.Type, topCond)
+	cs := isvc.Status.Components[w.component]
+	w.lifecycle.ObservedGeneration = lifecycleObservedGeneration(w.replica, cs.Lifecycle, generation)
+	cs.Lifecycle = w.lifecycle.DeepCopy()
+	isvc.Status.Components[w.component] = cs
+	// Without the role's condition no EngineReady, DecoderReady or
+	// RouterReady ever turns True and the aggregate Ready stays Unknown.
+	if w.ready != nil {
+		isvc.Status.SetCondition(w.ready.Type, w.ready)
 	}
-	return nil
+}
+
+// mirrorOnto leaves the block and the condition on the pass's own copy of
+// the service, so the reconciler's final status flush, which compares its
+// copy with the cluster, does not undo the write on the next pass.
+func (w *roleStatusWrite) mirrorOnto(isvc *v1beta1.InferenceService) {
+	if isvc.Status.Components == nil {
+		isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
+	}
+	cs := isvc.Status.Components[w.component]
+	cs.Lifecycle = w.lifecycle.DeepCopy()
+	isvc.Status.Components[w.component] = cs
+	if w.ready != nil {
+		isvc.Status.SetCondition(w.ready.Type, w.ready)
+	}
+}
+
+// readinessFlipOf reads whether a committed write took the service from not
+// Ready to Ready. The baseline is the live status the write replaced, never
+// the pass's copy: the reconciler's own flush writes readiness too, and a
+// stale baseline would count one path's transition for the other.
+func readinessFlipOf(before *v1beta1.InferenceServiceStatus, after v1beta1.InferenceServiceStatus) readinessFlip {
+	prev := before.GetCondition(knapis.ConditionReady)
+	return readinessFlip{
+		happened: status.IsReadyTrue(after) && (prev == nil || prev.Status != v1.ConditionTrue),
+		before:   prev,
+	}
 }
 
 // IRStatusToComponentStatus projects the IR.Status fields onto a
@@ -268,9 +273,9 @@ func IRStatusToComponentStatus(ir *v1beta1.InferenceReplica, live *v1beta1.Lifec
 		out.CollisionCount = &cc
 	}
 	out.RolloutHold = ir.Status.RolloutHold.DeepCopy()
-	// Per-Instance detail is intentionally NOT projected onto the ISVC
-	// summary — the authoritative source is the IR's own status, read
-	// directly by in-cluster consumers via ComponentIRStatus.
+	// Per-Instance detail is not projected onto the ISVC summary. The
+	// replica's own status is the source, and in-cluster consumers read its
+	// rows through DecodedComponentIRFor, which decodes a compacted status.
 	// Conditions follow the same deep-copy contract.
 	if len(ir.Status.Conditions) > 0 {
 		out.Conditions = make([]metav1.Condition, len(ir.Status.Conditions))

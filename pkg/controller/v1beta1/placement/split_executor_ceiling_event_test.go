@@ -50,10 +50,10 @@ func TestSplitCeilingRaisedEventOncePerPlan(t *testing.T) {
 	}
 }
 
-// TestSplitCeilingRaisedEventNotRaised divides 12 to 40 engines by ratios
-// {2, 3} and {1, 1}: members get 8 to 30 and 4 to 10, and no maximum is raised.
-func TestSplitCeilingRaisedEventNotRaised(t *testing.T) {
-	f, recorder := ratioEventFixture(t, 12, 40, map[string]*v1beta1.ReplicaRatio{"member-a": ratio(2, 3), "member-b": ratio(1, 1)})
+// expectNoSplitCeilingWarning reconciles the service twice and fails when no
+// plan was accepted or any event was recorded.
+func expectNoSplitCeilingWarning(t *testing.T, f *backendFixture, recorder *record.FakeRecorder) {
+	t.Helper()
 	got := f.reconcile(t)
 	f.reconcile(t)
 	if got.Status.Placement == nil || got.Status.Placement.Plan == nil {
@@ -62,6 +62,13 @@ func TestSplitCeilingRaisedEventNotRaised(t *testing.T) {
 	if events := recordedEvents(recorder); len(events) > 0 {
 		t.Fatalf("unexpected events: %q", events)
 	}
+}
+
+// TestSplitCeilingRaisedEventNotRaised divides 12 to 40 engines by ratios
+// {2, 3} and {1, 1}: members get 8 to 30 and 4 to 10, and no maximum is raised.
+func TestSplitCeilingRaisedEventNotRaised(t *testing.T) {
+	f, recorder := ratioEventFixture(t, 12, 40, map[string]*v1beta1.ReplicaRatio{"member-a": ratio(2, 3), "member-b": ratio(1, 1)})
+	expectNoSplitCeilingWarning(t, f, recorder)
 }
 
 // TestSplitCeilingRaisedEventOmittedMax divides 8 engines by ratios {min 3}
@@ -76,4 +83,12 @@ func TestSplitCeilingRaisedEventOmittedMax(t *testing.T) {
 	if diff := cmp.Diff(want, recordedEvents(recorder)); diff != "" {
 		t.Fatalf("events (-want +got):\n%s", diff)
 	}
+}
+
+// TestSplitCeilingRaisedEventNoMaximumDeclared divides 8 engines by min ratios
+// 3 and 1 (6 and 2) for a service that declares no maxReplicas: each member's
+// maximum is its minimum and nothing is raised, so no warning is recorded.
+func TestSplitCeilingRaisedEventNoMaximumDeclared(t *testing.T) {
+	f, recorder := ratioEventFixture(t, 8, 0, map[string]*v1beta1.ReplicaRatio{"member-a": ratio(3, 1), "member-b": ratio(1, 3)})
+	expectNoSplitCeilingWarning(t, f, recorder)
 }

@@ -31,10 +31,6 @@ type ClusterCapacity struct {
 	Mode           v1beta1.RoutingCapacityMode
 	ReportedWeight *resource.Quantity
 
-	// Cluster is the cluster name; carried through so a caller can associate the
-	// index-aligned output weight back to its cluster.
-	Cluster string
-
 	// Allocated is the intended replica count — the count basis of the weight
 	// (Split apportionment intersected with the cluster's quota-admitted count).
 	// A usable ReportedWeight replaces it.
@@ -100,7 +96,7 @@ func (h ClusterCapacity) RoutableReplicas() int32 {
 	return allocated
 }
 
-// Weights computes the final, apply-verbatim traffic weights for a set of
+// weights computes the final, apply-verbatim traffic weights for a set of
 // serving clusters, index-aligned with clusters.
 //
 // Ceiling mode uses min(effectiveAllocated, ready) * factor. Reported mode uses
@@ -108,19 +104,14 @@ func (h ClusterCapacity) RoutableReplicas() int32 {
 // one. A failed probe gates either to zero. The raw values are then reduced to
 // their smallest whole-number ratio, yielding relative non-negative integers
 // matching Gateway API and Envoy weighted-cluster semantics — a consumer
-// applies them verbatim or divides by their sum for a percentage. A ratio that cannot fit the strictest built-in publisher limit is
-// scaled proportionally into that range while preserving every positive arm.
+// applies them verbatim or divides by their sum for a percentage. A ratio that
+// cannot fit the strictest built-in publisher limit is scaled proportionally
+// into that range while preserving every positive share.
 //
-// An all-zero capacity result remains all-zero. PreserveTraffic may ignore only
-// probe gates, and only when every cluster has a conclusive failing verdict; the
-// fallback still honors the selected capacity mode.
-func Weights(clusters []ClusterCapacity) []int32 {
-	return weights(clusters, AllFailedPolicyPreserveTraffic)
-}
-
-// weights applies PreserveTraffic only when every cluster has a conclusive failing
-// probe verdict. Unknown probe state never authorizes the fallback, and Drain
-// preserves the all-zero result.
+// An all-zero capacity result remains all-zero. allFailedPolicy applies
+// PreserveTraffic only when every cluster has a conclusive failing probe
+// result: unknown probe state never authorizes the fallback, Drain keeps the
+// all-zero result, and the fallback still honors the selected capacity mode.
 func weights(clusters []ClusterCapacity, allFailedPolicy AllFailedPolicy) []int32 {
 	if len(clusters) == 0 {
 		return []int32{}

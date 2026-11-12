@@ -40,7 +40,7 @@ func TestRemoveInstanceForgetsTheExpectation(t *testing.T) {
 
 	input := types.ReconcileInput{OwnerObject: d.owner}
 	d.store.Install(&input)
-	d.wrapCallbacks(&input)
+	d.wrapCallbacks(t.Context(), &input, nil)
 	if _, err := input.RemoveInstance(ctx, 0); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
@@ -147,6 +147,35 @@ func TestSeededOperationIsTheEngineStamp(t *testing.T) {
 	}
 	if d.currentRevision != row.RunningRevision {
 		t.Fatalf("initial.currentRevision must resolve to the previous image's revision: got %q", d.currentRevision)
+	}
+}
+
+// TestSeededFailedRowKeepsItsOperationWithoutAClock holds the seed to the
+// engine's rule for a Failed row: the kept operation carries no deadline
+// and no placement wait, and a seed that sets either names a shape the
+// engine never writes.
+func TestSeededFailedRowKeepsItsOperationWithoutAClock(t *testing.T) {
+	failedSurge := strings.Replace(resumedSurge, "phase: Updating", "phase: Failed", 1)
+	d := mustDriver(t, failedSurge)
+	rows := d.store.Rows()
+	if len(rows) != 1 || rows[0].Operation == nil {
+		t.Fatalf("expected one row with an operation, got %+v", rows)
+	}
+	row, op := rows[0], rows[0].Operation
+	if types.StateOf(&row) != types.StateFailed {
+		t.Fatalf("state: got %q", types.StateOf(&row))
+	}
+	if !op.Deadline.IsZero() || op.PlacementWaitSince != nil {
+		t.Fatalf("a Failed row's operation carries no clock: deadline=%v placementWaitSince=%v", op.Deadline, op.PlacementWaitSince)
+	}
+	if op.Type != types.InstanceOperationUpdate || op.StartedAt.IsZero() || op.TargetRevision != row.TargetRevision {
+		t.Fatalf("every other field of the operation stays: %+v", op)
+	}
+	for _, clock := range []string{"deadline: 5m", "placementWaitSince: 1m"} {
+		withClock := strings.Replace(failedSurge, "operation: {", "operation: {"+clock+", ", 1)
+		if err := driverError(t, withClock); err == nil || !strings.Contains(err.Error(), "without a deadline or a placement wait") {
+			t.Fatalf("a Failed row seeded with %q must fail the run: %v", clock, err)
+		}
 	}
 }
 

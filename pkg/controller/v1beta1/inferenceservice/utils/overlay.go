@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -22,8 +21,6 @@ const (
 type ResolvedOverlay struct {
 	Ref        v1beta1.ModelOverlayRef
 	Spec       *v1beta1.BaseModelSpec
-	Meta       *metav1.ObjectMeta
-	Status     *v1beta1.ModelStatusSpec
 	SkipReason string
 }
 
@@ -63,8 +60,6 @@ func ResolveOverlays(cl client.Client, isvc *v1beta1.InferenceService) ([]Resolv
 			}
 		}
 		resolved.Spec = spec
-		resolved.Meta = modelMeta
-		resolved.Status = status
 		out = append(out, resolved)
 	}
 	return out, nil

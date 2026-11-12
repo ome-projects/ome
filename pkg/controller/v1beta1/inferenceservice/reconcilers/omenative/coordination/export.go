@@ -19,6 +19,11 @@ import (
 // useIndex MUST match the reader (see observePerRevisionPods): the canary capacity
 // gate passes the LIVE API reader, which has no Pod field index, so it MUST pass
 // useIndex=false.
+//
+// With the cached client and useIndex=true the pods handed back are the
+// informer cache's own objects: read them during the pass, write nothing
+// through them, keep none past the pass, and copy one before changing it.
+// A live reader hands back a plain list.
 func ObservePerRevisionPods(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, components []v1beta1.ComponentType, useIndex bool) (total, ready map[v1beta1.ComponentType]map[string]int32, routing map[v1beta1.ComponentType]map[string]RevisionRoutingSelector, pods map[v1beta1.ComponentType][]*corev1.Pod, err error) {
 	return observePerRevisionPods(ctx, reads, isvc, components, useIndex)
 }
@@ -27,12 +32,4 @@ func ObservePerRevisionPods(ctx context.Context, reads client.Reader, isvc *v1be
 // returned by ObservePerRevisionPods.
 func PodReadyAndServing(pod *corev1.Pod) bool {
 	return podReadyAndServing(pod)
-}
-
-// GCOrphanedPerRevisionServices deletes per-revision Service pairs whose revision
-// hash has no live pods (liveHashes is the per-revision pod-count map). Exported
-// so sibling rollout executors (e.g. canary) that ensure per-revision Services
-// outside the coordination loop can prune orphans the same way.
-func GCOrphanedPerRevisionServices(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, component v1beta1.ComponentType, liveHashes map[string]int32) error {
-	return gcOrphanedPerRevisionServices(ctx, c, isvc, component, liveHashes)
 }

@@ -46,9 +46,12 @@ runtime, model, quota, or configuration writes.
 
 In `Split`, every component runs on the clusters that hold an Engine. Each
 affinity term can carry a `weights` block that shares the Decoder and the
-Router out differently from the Engine. For example, a service with 4 Engines
-and 12 Decoders wants three quarters of its Engines on `cluster-a` but its
-Decoders shared evenly:
+Router out differently from the Engine. Each key of the block holds a replica
+ratio `{min, max}`, described in
+[Per-cluster replica ratios](#per-cluster-replica-ratios). The `min` ratio is
+the component's weight for its share of `minReplicas`. For example, a service
+with 4 Engines and 12 Decoders wants three quarters of its Engines on
+`cluster-a` but its Decoders shared evenly:
 
 ```yaml
 engine:  {minReplicas: 4}
@@ -57,24 +60,24 @@ placement:
   policy: ClusterAffinity
   mode: Split
   clusterAffinity:
-  - weights: {engine: 3, decoder: 1}
+  - weights: {engine: {min: 3}, decoder: {min: 1}}
     matchFields: [{key: metadata.name, operator: In, values: [cluster-a]}]
-  - weights: {engine: 1, decoder: 1}
+  - weights: {engine: {min: 1}, decoder: {min: 1}}
     matchFields: [{key: metadata.name, operator: In, values: [cluster-b]}]
 ```
 
 `cluster-a` runs 3 Engines and 6 Decoders, and `cluster-b` runs 1 Engine and 6
-Decoders. Each term gives each component a weight:
+Decoders. Each term gives each component a ratio:
 
-| Component | Weight a term gives it |
+| Component | Ratio a term gives it |
 |---|---|
 | Engine | `weights.engine`, else `weights.default` |
-| Decoder | `weights.decoder`, else `weights.default`, else the Engine's weight |
-| Router | `weights.router`, else `weights.default`, else the Engine's weight; read only when routers are divided |
+| Decoder | `weights.decoder`, else `weights.default`, else the Engine's ratio |
+| Router | `weights.router`, else `weights.default`, else the Engine's ratio; read only when routers are divided |
 
-A cluster's weight for a component is the sum over the terms it matches, as
-in [Static shares](#static-shares). If any term gives a component a weight, a
-term that gives it none contributes one.
+A cluster's ratio for a component is the sum over the terms it matches, as
+in [Static shares](#static-shares). If any term gives a component a ratio, a
+term that gives it none contributes `{min: 1, max: 1}`.
 
 A term weighs components only through `weights`; it has no scalar `weight`
 field. Under strict field validation, which `kubectl` uses by default, the API
@@ -87,8 +90,7 @@ term sets `decoder` and no term sets `default` beside `engine`. A Decoder with
 different weights is split by them over the clusters that hold an Engine. Each
 such cluster gets at least one Decoder, and the plan holds when there are fewer
 Decoders than clusters. A Decoder weight on a cluster that holds no Engine goes
-unused. A Decoder share above its cap (see
-[Per-cluster caps](#per-cluster-caps)) holds the plan. A cluster that no longer matches any term has no Decoder
+unused. A cluster that no longer matches any term has no Decoder
 weight, so while it drains its share can fall to the one Decoder every cluster
 with Engines receives. Placement counts the Decoders it still runs against the
 larger of that share and the Decoder minimum its copy holds, so they do not
@@ -117,25 +119,28 @@ Decoders between clusters follows [Moving replicas](#moving-replicas): a
 cluster keeps its Decoders until their replacements elsewhere are ready.
 
 A Split source whose terms set no weights divides `router.minReplicas` across
-the clusters that hold an Engine, by the Engine shares, as `weights.default: 1`
-on every term would. With 4 Engines on two clusters and `router.minReplicas: 3`,
-the clusters run 2 Engines each, and 2 and 1 routers; the extra router goes to
-the cluster whose name sorts first. Setting `weights.default` or
-`weights.router` on any term divides the routers by the same rules as the
-Decoder. With default weights 3 and 1 and `router.minReplicas: 3`, the
-clusters run 2 and 1 routers. Weights that name only the Engine or the Decoder
+the clusters that hold an Engine, by the Engine shares, as
+`weights.default: {min: 1}` on every term would. With 4 Engines on two
+clusters and `router.minReplicas: 3`, the clusters run 2 Engines each, and 2
+and 1 routers; the extra router goes to the cluster whose name sorts first.
+Setting `weights.default` or `weights.router` on any term divides the routers
+by the same rules as the Decoder. With default ratios `{min: 3}` and
+`{min: 1}` and `router.minReplicas: 3`, the clusters run 2 and 1 routers. Weights that name only the Engine or the Decoder
 keep the full router policy on every cluster: to weigh the Engine without
 dividing routers, set `weights.engine` instead of `weights.default`. The
 Decoder then follows the Engine's weight. Each cluster gets at least one
 router, and the plan holds when there are fewer routers than clusters. Prefer
 two or more per cluster, because a cluster whose only router restarts serves
 nothing until it returns. Dividing routers requires a positive
-`router.minReplicas`. Each cluster's routers are
-pinned at its share, or bounded by their cap (see
+`router.minReplicas`. Each cluster's routers run between its share and its
+part of `router.maxReplicas` (see
+[Per-cluster replica ratios](#per-cluster-replica-ratios)), or between its
+share and its cap when no term sets weights (see
 [Per-cluster caps](#per-cluster-caps)).
 
-`weights` is valid only in static `Split`. `Single`, `All`, and
-`SplitByCapacity` reject it; `SplitByCapacity` shares every component by
+`weights` is valid only in static `Split`, and it replaces
+`spec.placement.split`: a service sets one or the other. `Single`, `All`, and
+`SplitByCapacity` reject `weights`; `SplitByCapacity` shares every component by
 capacity and runs the full router policy on each cluster.
 
 Status shows how the split came out. In both Split modes, each candidate with
@@ -152,36 +157,37 @@ no Engine. Neither changes placement or readiness.
 
 ```yaml
 spec:
+  engine:
+    minReplicas: 8
   placement:
     policy: ClusterAffinity
     mode: Split
     clusterAffinity:
-      - weights: {default: 3}
+      - weights: {default: {min: 3}}
         matchExpressions:
           - key: region
             operator: In
             values: [west]
-      - weights: {default: 1}
+      - weights: {default: {min: 1}}
         matchExpressions:
           - key: region
             operator: In
             values: [east]
-    split:
-      replicas: 8
     maxSurge: 1
 ```
 
 With one matching registration per region, this assigns six replicas to the
 west member and two to the east member. Multiple registrations in either region
-each receive that term's weight. Terms are ORed, and requirements within a term
-are ANDed. When weights are present, all matching term weights add; an omitted
-weight contributes one. With no explicit weights, every matching registration
-has equal weight, including one matched by several terms.
+each receive that term's ratio. Terms are ORed, and requirements within a term
+are ANDed. When weights are present, all matching term ratios add; a term
+without a ratio for the component contributes `{min: 1, max: 1}`. With no
+weights, every matching registration has equal weight, including one matched
+by several terms.
 
 `matchExpressions` supports `In`, `NotIn`, `Exists`, `DoesNotExist`, `Gt`, and
 `Lt` with Kubernetes node-selector semantics. `matchFields` supports `In` and
-`NotIn` against the actual `metadata.name`. Weights are valid only for `Split`
-and have no upper bound. Omitting affinity is unconstrained. An explicit empty
+`NotIn` against the actual `metadata.name`. Weights are valid only for `Split`,
+and their ratios have no upper bound. Omitting affinity is unconstrained. An explicit empty
 or null affinity is invalid.
 
 Shares use largest remainders, with cluster-name order breaking ties. Three
@@ -189,12 +195,13 @@ replicas across two equally weighted registrations produce two and one, never
 two each. A zero share creates no member workload. An unreachable matched
 registration retains its desired share; spare quota elsewhere cannot absorb it.
 
-In Split, the ratios in [Per-cluster replica ratios](#per-cluster-replica-ratios)
-are an alternative to `split.replicas`, `split.maxPerCluster` and the integer
-weights. Each service uses one form or the other.
+In Split, the weights in [Per-cluster replica ratios](#per-cluster-replica-ratios)
+are an alternative to `split.replicas` and `split.maxPerCluster`. Each service
+uses one or the other.
 
 The fleet floor comes from `split.replicas`, or an explicitly positive
-`engine.minReplicas` when that override is absent. An unresolved floor holds the
+`engine.minReplicas` when that override is absent. When the terms set weights,
+it is the Engine's `minReplicas`, or the Decoder's without an Engine. An unresolved floor holds the
 plan. One replica unit is a complete Engine instance; a multi-pod instance stays
 together on its member. Routers are divided by the Engine shares unless the
 terms set weights that name only the Engine or the Decoder (see
@@ -239,7 +246,7 @@ the routing table.
 ### Per-cluster caps
 
 `split.maxPerCluster` caps how many replicas of each component one member may
-run. A Split service in the ratio form uses the max ratios of
+run. A Split service whose terms set weights uses the max ratios of
 [Per-cluster replica ratios](#per-cluster-replica-ratios) instead. Its keys are the
 components, plus `default`:
 
@@ -260,10 +267,11 @@ member whose shares are 6 Engines and 2 routers can autoscale to 18 Engines and
 8 routers. Its Decoders can grow to 18 scaled by their ratio of minimums.
 `maxPerCluster: {default: 18}` caps all three at 18, without scaling.
 
-`router` applies only when Split divides the routers (see
-[Component weights](#component-weights)). A router that keeps the full router
-policy keeps the source's own bounds, so validation rejects a `router` key
-there. It also rejects a key for a component the service does not declare.
+`router` applies only in `Split`, which divides the routers of a service
+without weights (see [Component weights](#component-weights)).
+`SplitByCapacity` keeps the full router policy and the source's own router
+bounds on every cluster, so validation rejects a `router` key there. It also
+rejects a key for a component the service does not declare.
 
 `split.maxReplicasPerCluster` is removed. `maxPerCluster: {engine: 18}` caps
 exactly as `maxReplicasPerCluster: 18` did; for a service without an Engine, use
@@ -297,11 +305,11 @@ spec:
     mode: Split
     clusterAffinity:
       - weights:
-          engineReplicas: {min: 2, max: 3}
+          engine: {min: 2, max: 3}
         matchFields:
           - {key: metadata.name, operator: In, values: [cluster-a]}
       - weights:
-          engineReplicas: {min: 1, max: 1}
+          engine: {min: 1, max: 1}
         matchFields:
           - {key: metadata.name, operator: In, values: [cluster-b]}
 ```
@@ -314,13 +322,17 @@ and their maximums add up to its 40.
 
 Each term's `weights` block takes four optional keys. Each holds a ratio
 `{min, max}`. Both numbers are optional, and a number that is set is at least 1.
+A key holds only a ratio: an integer such as `engine: 3` is refused.
 
 | Key | Applies to |
 |---|---|
-| `engineReplicas` | Engine |
-| `decoderReplicas` | Decoder |
-| `routerReplicas` | Router |
-| `defaultReplicas` | Any component without its own key |
+| `engine` | Engine |
+| `decoder` | Decoder |
+| `router` | Router |
+| `default` | Any component without its own key |
+
+Any other key, such as `engineReplicas`, is an unknown field and the API
+server refuses it.
 
 - `min` divides the component's `minReplicas`. `max` divides its `maxReplicas`.
 - `{min: 2}` on one cluster and `{min: 1}` on another give the first cluster
@@ -329,13 +341,12 @@ Each term's `weights` block takes four optional keys. Each holds a ratio
   own: `{min: 2}` is `{min: 2, max: 1}`, `{max: 3}` is `{min: 1, max: 3}`, and
   `{}` is `{min: 1, max: 1}`. So `{min: 2}` beside `{min: 1}` divides the
   minimum 2 to 1 but the maximum 1 to 1. Write `max` to divide the maximum too.
-- Each component looks up its ratio in the order it uses for integer weights.
-  Engine uses `engineReplicas`, then `defaultReplicas`. Decoder uses
-  `decoderReplicas`, then `defaultReplicas`, then the Engine's. Router uses
-  `routerReplicas`, then `defaultReplicas`, then the Engine's.
+- Engine uses `engine`, then `default`. Decoder uses `decoder`, then
+  `default`, then the Engine's. Router uses `router`, then `default`, then the
+  Engine's.
 - When several terms match one cluster, their ratios add. A matching term with
   no ratio for the component counts as `{min: 1, max: 1}`.
-- Routers are divided when any term sets `defaultReplicas` or `routerReplicas`.
+- Routers are divided when any term sets `default` or `router`.
   Otherwise every cluster runs the service's full router policy.
 
 ### How a member's bounds are set
@@ -375,7 +386,7 @@ spec:
     mode: Split
     clusterAffinity:
       - weights:
-          defaultReplicas: {min: 1}
+          default: {min: 1}
         matchFields:
           - {key: metadata.name, operator: In, values: [cluster-a, cluster-b, cluster-c]}
 ```
@@ -403,40 +414,40 @@ spec:
     mode: Split
     clusterAffinity:
       - weights:
-          engineReplicas: {min: 2, max: 2}
-          decoderReplicas: {min: 1, max: 2}
+          engine: {min: 2, max: 2}
+          decoder: {min: 1, max: 2}
         matchFields:
           - {key: metadata.name, operator: In, values: [cluster-a]}
       - weights:
-          engineReplicas: {min: 1, max: 1}
-          decoderReplicas: {min: 1, max: 1}
+          engine: {min: 1, max: 1}
+          decoder: {min: 1, max: 1}
         matchFields:
           - {key: metadata.name, operator: In, values: [cluster-b]}
 ```
 
-### One form per service
+### What the API server refuses
 
-A service uses either the integer form or the ratio form, never both. The API
-server refuses a service that:
+The API server refuses a service that:
 
-- sets a `*Replicas` key and an integer weight (`default`, `engine`, `decoder`
-  or `router`), on one term or on different terms;
-- sets a `*Replicas` key together with any `spec.placement.split` block, even an
-  empty one, because the ratios replace `spec.placement.split`;
-- sets a `*Replicas` key outside `mode: Split`.
+- sets `weights` together with any `spec.placement.split` block, even an empty
+  one, because the weights replace `spec.placement.split`;
+- sets `weights` outside `mode: Split`;
+- gives a weight key an integer, for example `default: 3`.
 
-Admission applies the same check in Go. Every YAML example in this page is
-tested against it, so a copied example never mixes the forms.
+Admission applies the same checks in Go. Every YAML example in this page is
+tested against them.
 
-### Moving from the integer form
+### Moving from integer weights or the split block
 
-A service keeps its members when each integer weight becomes a `min` ratio,
-every `max` is 1, and each `maxReplicas` is the old cap times the number of
-matched clusters.
+Weights hold only ratios. OME cannot read a stored service whose weights hold
+integers, so rewrite each one before upgrading OME. A service
+keeps its members when each integer weight becomes a `min` ratio, every `max`
+is 1, and each `maxReplicas` is the old cap times the number of matched
+clusters.
 
-| Integer form | Ratio form |
+| Integer weights and split block | Ratios |
 |---|---|
-| `weights: {default: 3, decoder: 2, router: 1}` | `weights: {defaultReplicas: {min: 3, max: 1}, decoderReplicas: {min: 2, max: 1}, routerReplicas: {min: 1, max: 1}}` |
+| `weights: {default: 3, decoder: 2, router: 1}` | `weights: {default: {min: 3, max: 1}, decoder: {min: 2, max: 1}, router: {min: 1, max: 1}}` |
 | `split.replicas: R` | the Engine's `minReplicas: R` |
 | `split.maxPerCluster: {engine: 6, decoder: 4, router: 6}` over 3 clusters | `engine.maxReplicas: 18`, `decoder.maxReplicas: 12`, `router.maxReplicas: 18` |
 | no `maxPerCluster` for a component | leave that component's `maxReplicas` unset |
@@ -449,6 +460,14 @@ Two cases need more care:
 - When two terms match one cluster, their ratios add, so with every `max` at 1
   that cluster gets twice the maximum. Rewrite the terms so each cluster
   matches exactly one, or set each term's `max` so every cluster's sum is equal.
+
+A service without weights may keep its split block; it is planned as before.
+A service written with `defaultReplicas`, `engineReplicas`, `decoderReplicas`
+or `routerReplicas` must rename each to `default`, `engine`, `decoder` or
+`router` before upgrading OME; its members stay the same. OME drops the
+unknown keys when it reads such a service, and a term left with no key is
+refused, so the service stops being planned until it is renamed. The rename
+changes the spec, so OME records a new plan with the same shares.
 
 ## Moving replicas
 
@@ -495,6 +514,50 @@ floor until ready Decoders on serving homes exceed the Decoder minimum by the
 replicas it would release; Decoders that are not ready leave at once. While a
 floor is held, `PlacementConverged` is False with reason `ReplacementNotReady`
 and a message that names each held home.
+
+In the Split modes, OME counts a cluster's ready Engines in units, measured
+against the minimums OME sets on the cluster. An Engine counts as a ready unit
+only while its pods are ready and no update or migration is in progress on it.
+It also needs a ready Decoder on the cluster to pair with. For example, a
+cluster asked for 6 Engines and 4 Decoders that runs 6 ready Engines and 2
+ready Decoders counts 3 ready units.
+
+When a serving cluster's Engine target falls, it gives up its Engines above
+both its new target and its ready units. It does this only once no cluster
+still waits to grow. Every cluster whose target rises must have reached it.
+Every cluster at its new target, and every cluster that ends with more Engines
+than it started with, must also serve its whole new target in ready units.
+Until then the cluster keeps those Engines, because an Engine that is not a
+ready unit can still serve. The old copy of an Engine that is being updated or
+migrated serves until the new copy is ready. The cluster keeps such an Engine
+at any Engine count, so a lower count removes one of its ready units instead.
+
+A cluster's own scale-down can also remove a ready Engine first, for example
+one on a node that is being drained. So OME assumes that each Engine it gives
+up this way may be a ready unit. It gives up no more of them than the ready
+units above the smaller of the old and new Engine minimums. It also gives them
+up only in a reconcile in which no other Engine leaves. Suppose a move raises
+the Engine minimum from 12 to 15 and lowers the example cluster's target to 3.
+Once the other clusters serve, the ready units add up to 15. That is 3 above
+12, so the cluster drops from 6 Engines to 3 at once. With fewer ready units to
+spare, it gives up fewer Engines at a time, and it waits while the ready units
+add up to 12 or less. Engines that crash-loop or are only restarting leave this
+way too, and the cluster does not wait for them to come back. The cluster never
+drops below its new target. It keeps the Engines OME counts as ready until
+their replacements serve, unless its own scale-down removes ready Engines
+first. In that case, during a move that raises the Engine minimum, the ready
+units can fall below the new minimum, down to the old minimum.
+
+If a growing cluster never serves its whole new target in ready units, for
+example because its accelerator quota is full, the move never finishes.
+`PlacementConverged` stays False with reason `ReplacementNotReady`, and
+autoscaler growth stays paused on every cluster. To find what holds a move that
+does not finish, look for a cluster that does not serve its whole new target in
+ready units. That can also be a cluster that already shrank. A cluster with no
+ready unit keeps all its original Engines until their replacements serve. It
+keeps them because a fault across the whole cluster, such as a router outage,
+can hide Engines that come back. A move that also raises the Engine minimum can
+wait until such a cluster serves again.
 
 A cluster that OME holds above its new Decoder share keeps those Decoders until
 the replacements serve. The move's surge allowance counts them as part of that
@@ -578,8 +641,9 @@ minimums are compared with where the pause began: a raised Decoder minimum with 
 lowered Engine minimum also ends the pause. In `All`, a raised Engine minimum, or
 a member that joins, leaves or drains, keeps the wait.
 
-In `Split`, an Engine cap (see [Per-cluster caps](#per-cluster-caps)) lets
-autoscalers keep a member above its share. A change in which no member leaves or drains then ends
+In `Split`, an Engine cap (see [Per-cluster caps](#per-cluster-caps)), or with
+weights an Engine `maxReplicas` above its `minReplicas`, lets autoscalers keep a
+member above its share. A change in which no member leaves or drains then ends
 the pause once every member serves at least its new Engine and Decoder shares,
 even while autoscalers keep more replicas than those shares. This applies whether
 the change raises, lowers or moves the shares, through `split.replicas`, the

@@ -20,7 +20,7 @@ import (
 // phase and its recorded share while the split rests on the stable
 // Instances, nothing moves to a revision with no serving pod, the stable
 // Instances stay held until the engine is rebuilt on the canary revision,
-// and the ladder then lands the canary revision on every Instance of both
+// and the steps then land the canary revision on every Instance of both
 // members. The two orderings an operator can produce are both covered: the
 // deletion while the hold stands, and the deletion in the same second as
 // the promote, where the pass that applies the promote still counts the
@@ -186,7 +186,7 @@ func (p *pdPodLoss) expectCanaryOnly() {
 	})
 }
 
-// expectHeld asserts a pass that holds the ladder on the engine's lost
+// expectHeld asserts a pass that holds the canary on the engine's lost
 // capacity: the step and its recorded share stand, the wait is recorded,
 // the stable Instances stay held and the split rests on them.
 func (p *pdPodLoss) expectHeld(step int32, phase v1beta1.RolloutPhase, when string) {
@@ -204,19 +204,19 @@ func (p *pdPodLoss) expectHeld(step int32, phase v1beta1.RolloutPhase, when stri
 	p.expectRestingOnStable()
 }
 
-// expectDone asserts the ladder finished with every Instance of both
+// expectDone asserts the canary finished with every Instance of both
 // members on its canary revision.
 func (p *pdPodLoss) expectDone() {
 	p.t.Helper()
 	cs := p.status()
 	if cs.CurrentStep != 2 || p.phase() != v1beta1.RolloutPhaseStable {
-		p.t.Fatalf("the ladder must complete on the canary revision, got %+v phase=%q", cs, p.phase())
+		p.t.Fatalf("the steps must complete on the canary revision, got %+v phase=%q", cs, p.phase())
 	}
 	if n := p.readyCanaryEnginePods(); n != 2 {
 		p.t.Fatalf("every engine Instance must serve the canary revision, got %d of 2", n)
 	}
 	if e, d := p.partition(v1beta1.EngineComponent), p.partition(v1beta1.DecoderComponent); e != 0 || d != 0 {
-		p.t.Fatalf("a finished ladder holds nothing, got partitions engine=%d decoder=%d", e, d)
+		p.t.Fatalf("a finished canary holds nothing, got partitions engine=%d decoder=%d", e, d)
 	}
 	p.expectCanaryOnly()
 }
@@ -318,7 +318,7 @@ func TestDispatch_PDManualHoldKeepsItsDecoderThroughACanaryPodDeletion(t *testin
 // applies the promote still counts the pod; the pass after it finds the pod
 // on its way out and holds the final step with the stable Instances still
 // held. No traffic and no release lands on a revision with no serving pod,
-// and the rebuilt engine carries the ladder to completion.
+// and the rebuilt engine carries the canary to completion.
 func TestDispatch_PDManualCanaryKeepsItsEngineWhenThePodIsDeletedAtPromote(t *testing.T) {
 	p := newPDPodLoss(t, "pdrace")
 
@@ -338,7 +338,7 @@ func TestDispatch_PDManualCanaryKeepsItsEngineWhenThePodIsDeletedAtPromote(t *te
 	p.tick("pod gone")
 	p.expectHeld(1, v1beta1.RolloutPhasePending, "pod gone")
 
-	// Inside the ready timeout the hold stands; nothing parks.
+	// Inside the ready timeout the hold stands; nothing stops.
 	p.deps.Now = p.deps.Now.Add(cellReadyTimeout / 2)
 	p.tick("still gone")
 	p.expectHeld(1, v1beta1.RolloutPhasePending, "half the ready timeout in")

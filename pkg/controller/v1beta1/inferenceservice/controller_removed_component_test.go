@@ -37,7 +37,7 @@ func TestUpdateStatus_ComponentRemovedFromTheSpec_LeavesNoStatusEntry(t *testing
 	fresh.Status.Components[v1beta1.EngineComponent] = engine
 	require.NoError(t, c.Status().Update(ctx, fresh))
 
-	require.NoError(t, r.updateStatus(desired, constants.OMENative, nil))
+	require.NoError(t, r.updateStatus(desired, constants.OMENative, nil, groupEntriesComputed))
 
 	after := &v1beta1.InferenceService{}
 	require.NoError(t, c.Get(ctx, key, after))

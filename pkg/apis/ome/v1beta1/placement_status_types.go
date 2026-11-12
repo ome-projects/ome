@@ -136,7 +136,7 @@ type CandidateAllocationStatus struct {
 	// +kubebuilder:validation:Minimum=0
 	MinWeight *int64 `json:"minWeight,omitempty"`
 	// MaxWeight is the primary component's summed max ratio. It is set only
-	// when the source uses the *Replicas ratio form.
+	// when the affinity terms set weights.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxWeight *int64 `json:"maxWeight,omitempty"`
@@ -249,7 +249,7 @@ type ComponentAffinityMatch struct {
 	// +kubebuilder:validation:Minimum=0
 	MinWeight *int64 `json:"minWeight,omitempty"`
 	// MaxWeight is the component's summed max ratio. It is set only when the
-	// source uses the *Replicas ratio form.
+	// affinity terms set weights.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	MaxWeight *int64 `json:"maxWeight,omitempty"`

@@ -12,29 +12,13 @@ import (
 	"sigs.k8s.io/ome/pkg/utils"
 )
 
-// ProcessBaseAnnotations processes common annotations
+// ProcessBaseAnnotations adds the annotations every component carries: the
+// fine-tuned weight and its strategy, merged-weight serving, the base model's
+// name, vendor and format, and the runtime's name.
 func ProcessBaseAnnotations(p *Piece, isvc *v1beta1.InferenceService, annotations map[string]string) (map[string]string, error) {
-	// Add fine-tuned weight annotations if applicable
-	if p.FineTunedServing && len(p.FineTunedWeights) > 0 {
-		// Inject ft adapter for single/non-stacked fine-tuned weight downloading
-		annotations[constants.FineTunedAdapterInjectionKey] = p.FineTunedWeights[0].Name
-
-		// Add fine-tuned weight ft strategy
-		fineTunedWeightFTStrategy, err := isvcutils.GetValueFromRawExtension(p.FineTunedWeights[0].Spec.HyperParameters, constants.StrategyConfigKey)
-		if err != nil {
-			p.Log.Error(err, "Error getting hyper-parameter strategy from FineTunedWeight", "FineTunedWeight", p.FineTunedWeights[0].Name, "namespace", isvc.Namespace)
-			return nil, err
-		}
-		if fineTunedWeightFTStrategy == nil {
-			return nil, fmt.Errorf("hyper-parameter %q not set on FineTunedWeight %s", constants.StrategyConfigKey, p.FineTunedWeights[0].Name)
-		}
-		strategy, ok := fineTunedWeightFTStrategy.(string)
-		if !ok {
-			return nil, fmt.Errorf("hyper-parameter %q on FineTunedWeight %s must be a string, got %T", constants.StrategyConfigKey, p.FineTunedWeights[0].Name, fineTunedWeightFTStrategy)
-		}
-		annotations[constants.FineTunedWeightFTStrategyKey] = strategy
+	if err := addFineTunedAnnotations(p, isvc, annotations); err != nil {
+		return nil, err
 	}
-
 	if p.FineTunedServingWithMergedWeights {
 		p.Log.V(1).Info("Fine-tuned serving with merged weights", "namespace", isvc.Namespace)
 		annotations[constants.FTServingWithMergedWeightsAnnotationKey] = "true"
@@ -48,82 +32,122 @@ func ProcessBaseAnnotations(p *Piece, isvc *v1beta1.InferenceService, annotation
 			annotations[constants.BaseModelDecryptionSecretName] = secretName
 		}
 	}
-
-	// Add base model specific annotations
-	if p.BaseModel != nil && p.BaseModelMeta != nil {
-		annotations[constants.BaseModelName] = p.BaseModelMeta.Name
-		if p.BaseModel.Vendor != nil {
-			annotations[constants.BaseModelVendorAnnotationKey] = *p.BaseModel.Vendor
-		}
-		annotations[constants.BaseModelFormat] = p.BaseModel.ModelFormat.Name
-		if p.BaseModel.ModelFormat.Version != nil {
-			annotations[constants.BaseModelFormatVersion] = *p.BaseModel.ModelFormat.Version
-		}
-	}
-
+	addBaseModelAnnotations(p, annotations)
 	if p.RuntimeName != "" {
 		annotations[constants.ServingRuntimeKeyName] = p.RuntimeName
 	}
-
 	return annotations, nil
 }
 
-// ProcessBaseLabels processes common labels
+// addFineTunedAnnotations names the fine-tuned weight the adapter injects and
+// the strategy its hyper-parameters declare; a weight without a strategy is
+// refused. Only a fine-tuned serving with at least one weight carries them.
+func addFineTunedAnnotations(p *Piece, isvc *v1beta1.InferenceService, annotations map[string]string) error {
+	if !p.FineTunedServing || len(p.FineTunedWeights) == 0 {
+		return nil
+	}
+	annotations[constants.FineTunedAdapterInjectionKey] = p.FineTunedWeights[0].Name
+	strategy, set, err := fineTunedStrategy(p, isvc)
+	if err != nil {
+		return err
+	}
+	if !set {
+		return fmt.Errorf("hyper-parameter %q not set on FineTunedWeight %s", constants.StrategyConfigKey, p.FineTunedWeights[0].Name)
+	}
+	annotations[constants.FineTunedWeightFTStrategyKey] = strategy
+	return nil
+}
+
+// addBaseModelAnnotations names the base model, its vendor, its format and
+// the format's version when the piece carries a model.
+func addBaseModelAnnotations(p *Piece, annotations map[string]string) {
+	if p.BaseModel == nil || p.BaseModelMeta == nil {
+		return
+	}
+	annotations[constants.BaseModelName] = p.BaseModelMeta.Name
+	if p.BaseModel.Vendor != nil {
+		annotations[constants.BaseModelVendorAnnotationKey] = *p.BaseModel.Vendor
+	}
+	annotations[constants.BaseModelFormat] = p.BaseModel.ModelFormat.Name
+	if p.BaseModel.ModelFormat.Version != nil {
+		annotations[constants.BaseModelFormatVersion] = *p.BaseModel.ModelFormat.Version
+	}
+}
+
+// fineTunedStrategy reads the strategy hyper-parameter of the first
+// fine-tuned weight: its value and whether the weight sets it. Hyper-parameters
+// that do not parse, or a strategy that is not a string, are an error.
+func fineTunedStrategy(p *Piece, isvc *v1beta1.InferenceService) (string, bool, error) {
+	weight := p.FineTunedWeights[0]
+	value, err := isvcutils.GetValueFromRawExtension(weight.Spec.HyperParameters, constants.StrategyConfigKey)
+	if err != nil {
+		p.Log.Error(err, "Error getting hyper-parameter strategy from FineTunedWeight", "FineTunedWeight", weight.Name, "namespace", isvc.Namespace)
+		return "", false, err
+	}
+	if value == nil {
+		return "", false, nil
+	}
+	strategy, ok := value.(string)
+	if !ok {
+		return "", false, fmt.Errorf("hyper-parameter %q on FineTunedWeight %s must be a string, got %T", constants.StrategyConfigKey, weight.Name, value)
+	}
+	return strategy, true, nil
+}
+
+// ProcessBaseLabels adds the labels every component carries: the service,
+// component and runtime names, the fine-tuned serving flag, the base model's
+// name, size, kind and vendor, and the fine-tuned weight's strategy.
 func ProcessBaseLabels(p *Piece, isvc *v1beta1.InferenceService, componentType v1beta1.ComponentType, labels map[string]string) (map[string]string, error) {
-	baseModelCategory := "SMALL"
-	if p.BaseModelMeta != nil {
-		if category, ok := p.BaseModelMeta.Annotations[constants.ModelCategoryAnnotation]; ok {
-			baseModelCategory = category
-		}
-	}
-
-	baseLabels := map[string]string{
-		constants.InferenceServicePodLabelKey: isvc.Name,
-		constants.OMEComponentLabel:           string(componentType),
-		constants.ServingRuntimeLabelKey:      p.RuntimeName,
-		constants.FTServingLabelKey:           strconv.FormatBool(p.FineTunedServing),
-	}
-
-	// Merge with provided labels
 	if labels == nil {
 		labels = make(map[string]string)
 	}
-	for k, v := range baseLabels {
-		labels[k] = v
+	labels[constants.InferenceServicePodLabelKey] = isvc.Name
+	labels[constants.OMEComponentLabel] = string(componentType)
+	labels[constants.ServingRuntimeLabelKey] = p.RuntimeName
+	labels[constants.FTServingLabelKey] = strconv.FormatBool(p.FineTunedServing)
+	addBaseModelLabels(p, labels)
+	if err := addFineTunedLabels(p, isvc, labels); err != nil {
+		return nil, err
 	}
+	return labels, nil
+}
 
+// addBaseModelLabels names the base model, its size category (SMALL unless
+// the model's annotation says otherwise), its kind and its vendor.
+func addBaseModelLabels(p *Piece, labels map[string]string) {
 	if p.BaseModelMeta != nil {
 		labels[constants.InferenceServiceBaseModelNameLabelKey] = p.BaseModelMeta.Name
-		labels[constants.InferenceServiceBaseModelSizeLabelKey] = baseModelCategory
+		labels[constants.InferenceServiceBaseModelSizeLabelKey] = baseModelCategory(p.BaseModelMeta)
 		labels[constants.BaseModelTypeLabelKey] = string(constants.ServingBaseModel)
 	}
-
 	if p.BaseModel != nil && p.BaseModel.Vendor != nil {
 		labels[constants.BaseModelVendorLabelKey] = *p.BaseModel.Vendor
 	}
+}
 
-	// Add fine-tuned serving related labels
-	if p.FineTunedServing && len(p.FineTunedWeights) > 0 {
-		ftStrategyParameter, err := isvcutils.GetValueFromRawExtension(p.FineTunedWeights[0].Spec.HyperParameters, constants.StrategyConfigKey)
-		if err != nil {
-			p.Log.Error(err, "Error getting hyper-parameter strategy from FineTunedWeight", "FineTunedWeight", p.FineTunedWeights[0].Name, "namespace", isvc.Namespace)
-			return nil, err
-		}
-
-		fineTunedWeightFTStrategy := ""
-		if ftStrategyParameter != nil {
-			s, ok := ftStrategyParameter.(string)
-			if !ok {
-				return nil, fmt.Errorf("hyper-parameter %q on FineTunedWeight %s must be a string, got %T", constants.StrategyConfigKey, p.FineTunedWeights[0].Name, ftStrategyParameter)
-			}
-			fineTunedWeightFTStrategy = s
-		}
-		labels[constants.FineTunedWeightFTStrategyLabelKey] = fineTunedWeightFTStrategy
-
-		labels[constants.FTServingWithMergedWeightsLabelKey] = strconv.FormatBool(p.FineTunedServingWithMergedWeights)
+// baseModelCategory is the size category the model's annotation declares,
+// SMALL when it declares none.
+func baseModelCategory(meta *metav1.ObjectMeta) string {
+	if category, ok := meta.Annotations[constants.ModelCategoryAnnotation]; ok {
+		return category
 	}
+	return "SMALL"
+}
 
-	return labels, nil
+// addFineTunedLabels records the fine-tuned weight's strategy (empty when its
+// hyper-parameters name none) and whether the weights are served merged. Only
+// a fine-tuned serving with at least one weight carries them.
+func addFineTunedLabels(p *Piece, isvc *v1beta1.InferenceService, labels map[string]string) error {
+	if !p.FineTunedServing || len(p.FineTunedWeights) == 0 {
+		return nil
+	}
+	strategy, _, err := fineTunedStrategy(p, isvc)
+	if err != nil {
+		return err
+	}
+	labels[constants.FineTunedWeightFTStrategyLabelKey] = strategy
+	labels[constants.FTServingWithMergedWeightsLabelKey] = strconv.FormatBool(p.FineTunedServingWithMergedWeights)
+	return nil
 }
 
 // ReconcileComponentObjectMeta builds the common ObjectMeta block
@@ -174,7 +198,10 @@ func ReconcileComponentObjectMeta(
 // build: filter the ISVC-level annotations against the disallowed
 // list, union them with the Component-level annotations, then hand
 // off to ProcessBaseAnnotations for the FT / BaseModel / runtime
-// annotations the base layer adds.
+// annotations the base layer adds. The result is the component's object
+// metadata, which its Service and the other objects built from it carry
+// whole; the pod template takes only the keys AnnotationReachesPods
+// admits (TemplateObjectMeta).
 func ProcessComponentAnnotations(
 	p *Piece,
 	isvc *v1beta1.InferenceService,

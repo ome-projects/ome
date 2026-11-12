@@ -259,8 +259,10 @@ func TestPlan_ScaleDownPrecedesRestart(t *testing.T) {
 
 // TestPlan_FullPrecedenceOrder pins the complete precedence: with
 // every pass triggered at once, the Decision lists scale-down >
-// restart > migration expiry > migration > update > create, in that
-// order. Selection is not execution — the executor stops at the first
+// migration expiry > restart > migration > update > create, in that
+// order: the expiry stands ahead of the restart pass so a repair in
+// flight, which consumes the pass, never holds a deadline that has come
+// due. Selection is not execution — the executor stops at the first
 // action whose op outcome requires a requeue, so a later-listed
 // selection may not run this reconcile.
 func TestPlan_FullPrecedenceOrder(t *testing.T) {
@@ -302,8 +304,8 @@ func TestPlan_FullPrecedenceOrder(t *testing.T) {
 	d := planTargetOrFail(t, in, plan, target, planSnapshot(in, pods))
 	want := []workload.ActionKind{
 		workload.ActionScaleDown,
-		workload.ActionRestart,
 		workload.ActionMigrateExpiry,
+		workload.ActionRestart,
 		workload.ActionMigrate,
 		workload.ActionUpdate,
 		workload.ActionCreate,
@@ -319,23 +321,22 @@ func TestPlan_FullPrecedenceOrder(t *testing.T) {
 	}
 }
 
-// TestPlan_Create_AlwaysPlannedUnlessPaused asserts the create pass
-// closes every non-paused decision, last in precedence.
-func TestPlan_Create_AlwaysPlannedUnlessPaused(t *testing.T) {
+// TestPlan_Create_AlwaysPlanned asserts the create pass closes every
+// decision, last in precedence, the paused one included: the pause
+// narrows what the pass builds, and the pass still frees the names a
+// lost node holds.
+func TestPlan_Create_AlwaysPlanned(t *testing.T) {
 	in := minimalInput(t)
 	forbidMutations(t, &in)
 	plan := minimalPlan()
 
-	d := planOrFail(t, in, plan, planSnapshot(in, nil))
-	kinds := actionKinds(d)
-	if len(kinds) == 0 || kinds[len(kinds)-1] != workload.ActionCreate {
-		t.Errorf("decision = %v, want Create last", kinds)
-	}
-
-	plan.Paused = true
-	d = planOrFail(t, in, plan, planSnapshot(in, nil))
-	if findAction(d, workload.ActionCreate) != nil {
-		t.Errorf("paused decision must not plan Create, got %v", actionKinds(d))
+	for _, paused := range []bool{false, true} {
+		plan.Paused = paused
+		d := planOrFail(t, in, plan, planSnapshot(in, nil))
+		kinds := actionKinds(d)
+		if len(kinds) == 0 || kinds[len(kinds)-1] != workload.ActionCreate {
+			t.Errorf("paused=%v: decision = %v, want Create last", paused, kinds)
+		}
 	}
 }
 
@@ -515,6 +516,10 @@ func TestPlan_Migrate_ParkedDrainYieldsTheHead(t *testing.T) {
 	}
 }
 
+// A fresh migration record is not driven while an update surge is in
+// flight: the plan selects it as waiting for the roll, so the pass names
+// the wait on it, and drives it once no surge is counted. An allocated
+// record resumes whatever is in flight.
 func TestPlan_MigrationSurgeWaitsForUpdateSurge(t *testing.T) {
 	minusOne := int32(-1)
 	allocated := int32(3)
@@ -522,13 +527,13 @@ func TestPlan_MigrationSurgeWaitsForUpdateSurge(t *testing.T) {
 		name          string
 		updateStep    string
 		surgeInstance *int32
-		wantMigrate   bool
+		wantDriven    bool
 	}{
-		{name: "fresh record waits", updateStep: "Surge", wantMigrate: false},
-		{name: "legacy fresh record waits", updateStep: "Surge", surgeInstance: &minusOne, wantMigrate: false},
-		{name: "allocated record resumes", updateStep: "Surge", surgeInstance: &allocated, wantMigrate: true},
-		{name: "non-surge update does not block", updateStep: "InPlace", wantMigrate: true},
-		{name: "no update operation", wantMigrate: true},
+		{name: "fresh record waits", updateStep: "Surge", wantDriven: false},
+		{name: "legacy fresh record waits", updateStep: "Surge", surgeInstance: &minusOne, wantDriven: false},
+		{name: "allocated record resumes", updateStep: "Surge", surgeInstance: &allocated, wantDriven: true},
+		{name: "non-surge update does not block", updateStep: "InPlace", wantDriven: true},
+		{name: "no update operation", wantDriven: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -571,8 +576,12 @@ func TestPlan_MigrationSurgeWaitsForUpdateSurge(t *testing.T) {
 			}
 
 			decision := planTargetOrFail(t, input, plan, updateTarget(), planSnapshot(input, nil))
-			if got := findAction(decision, workload.ActionMigrate) != nil; got != test.wantMigrate {
-				t.Errorf("Migrate selected = %v, want %v; actions=%v", got, test.wantMigrate, actionKinds(decision))
+			ma := findAction(decision, workload.ActionMigrate)
+			if driven := ma != nil && ma.Migration != nil && ma.Migration.Head != nil; driven != test.wantDriven {
+				t.Errorf("Migrate driven = %v, want %v; actions=%v", driven, test.wantDriven, actionKinds(decision))
+			}
+			if !test.wantDriven && (ma == nil || ma.Migration == nil || ma.Migration.WaitingForRoll == nil) {
+				t.Errorf("a fresh record under a surge must be selected as waiting for the roll; actions=%v", actionKinds(decision))
 			}
 			if test.updateStep != "" && findAction(decision, workload.ActionUpdate) == nil {
 				t.Errorf("Update continuation missing; actions=%v", actionKinds(decision))
@@ -1528,6 +1537,63 @@ func TestPlan_Update_CleanupOnly_RollBackWreckage(t *testing.T) {
 	}
 }
 
+// A partition keeps a held Instance on the revision it serves and nothing
+// else. A Failed row the partition holds whose attempt was toward a revision
+// the roll has since left lists the pods of that revision for cleanup, and
+// once they are gone lists itself once more so the cleanup returns it to
+// Ready on its running revision. A failed attempt toward the roll target
+// stays as it is under the hold, and the hold the roll stands behind names
+// the Instance, its failed replacement and the exit.
+func TestPlan_Update_HeldInstanceCleansUpAFailedAttemptOfALeftRevision(t *testing.T) {
+	target := updateTarget()
+	partition := int32(1)
+	plan := minimalPlan()
+	plan.UpdateStrategy = types.UpdateStrategy{
+		Type:          types.UpdateStrategySurgeThenDrain,
+		RollingUpdate: &types.RollingUpdate{Partition: &partition},
+	}
+	source := enginePod("llama-70b", "prod", 0)
+	leftPod := enginePod("llama-70b", "prod", 0)
+	leftPod.Name += "-1"
+	leftPod.Labels[query.LabelPodOrdinal] = "1"
+	leftPod.Labels[query.LabelRevisionHash] = "leftrev"
+	in := minimalInput(t)
+	forbidMutations(t, &in)
+	in.ObservedState.InstanceStatuses = []types.InstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: types.InstancePhaseFailed, RunningRevision: "llama-70b-engine-priorrev", TargetRevision: "llama-70b-engine-leftrev"},
+	}
+
+	wantCleanup := func(d workload.Decision, picture string) {
+		t.Helper()
+		ua := findAction(d, workload.ActionUpdate)
+		if ua == nil || len(ua.Update.Items) != 1 || !ua.Update.Items[0].CleanupOnly ||
+			ua.Update.Items[0].StartingFresh || ua.Update.Items[0].Instance.Index != 0 {
+			t.Fatalf("%s: want one CleanupOnly item for the held Instance 0, got %v", picture, actionKinds(d))
+		}
+	}
+	wantCleanup(planTargetOrFail(t, in, plan, target, planSnapshot(in, map[int32][]*corev1.Pod{0: {source, leftPod}})), "the failed replacement of the left revision stands")
+	wantCleanup(planTargetOrFail(t, in, plan, target, planSnapshot(in, map[int32][]*corev1.Pod{0: {source}})), "the failed replacement of the left revision is gone")
+
+	// The same attempt toward the roll target is the roll's own: the pod
+	// stays, nothing is listed, and the hold names the Instance and the exit.
+	in.ObservedState.InstanceStatuses[0].TargetRevision = target.Name
+	wanted := leftPod.DeepCopy()
+	wanted.Labels[query.LabelRevisionHash] = query.RevisionFromName(target.Name).Hash()
+	d := planTargetOrFail(t, in, plan, target, planSnapshot(in, map[int32][]*corev1.Pod{0: {source, wanted}}))
+	if ua := findAction(d, workload.ActionUpdate); ua != nil {
+		t.Fatalf("a failed attempt toward the roll target stays under the hold, got %+v", ua.Update.Items)
+	}
+	hold := d.StandingHold
+	if hold == nil || hold.Gate != types.RolloutHoldGateRetryBlock || hold.Target != target.Name ||
+		!strings.Contains(hold.Reason, "Instance 0") || !strings.Contains(hold.Reason, "failed replacement") ||
+		!strings.Contains(hold.Reason, "partition of 1") || !strings.Contains(hold.Reason, "lower the partition") {
+		t.Fatalf("the hold must name Instance 0, its failed replacement and the exit, got %v", hold)
+	}
+	if d.UpdateIdle {
+		t.Fatalf("a roll holding on a held Instance's failed replacement is not idle")
+	}
+}
+
 // TestPlan_LiveSurgeUntouchedByCleanup pins the mid-flight safety of
 // the wreckage-cleanup machinery: a LIVE (non-Failed) gang surge with its
 // marker correctly pinned — source Op.SurgeIndex referencing the
@@ -1595,10 +1661,11 @@ func TestPlan_LiveSurgeUntouchedByCleanup(t *testing.T) {
 // TestPlan_Paused_RepairRunsFleetChangesDoNot pins the pause matrix.
 // A standard pause keeps the scale-down selection AND the restart pass
 // (repair of existing Instances at their current revision) while
-// planning no MigrateExpiry / Migrate / Update / Create work and
-// suspending escalation. A frozen pause (PauseFreeze) truncates after
-// scale-down — repair is suspended too. RestartPolicy None plans no
-// repair under either depth.
+// planning no MigrateExpiry / Migrate / Update work and suspending
+// escalation; the Create pass is still planned, narrowed by Execute to
+// the committed creates it finishes and the lost-node names it frees. A
+// frozen pause (PauseFreeze) truncates after scale-down — repair is
+// suspended too. RestartPolicy None plans no repair under either depth.
 func TestPlan_Paused_RepairRunsFleetChangesDoNot(t *testing.T) {
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	// The all-passes fixture: pod-lost + prior-revision Instance
@@ -1629,10 +1696,10 @@ func TestPlan_Paused_RepairRunsFleetChangesDoNot(t *testing.T) {
 		return in, plan
 	}
 
-	t.Run("standard pause plans scale-down and repair only", func(t *testing.T) {
+	t.Run("standard pause plans scale-down, repair and the narrowed create", func(t *testing.T) {
 		in, plan := build(t)
 		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
-		want := []workload.ActionKind{workload.ActionScaleDown, workload.ActionRestart}
+		want := []workload.ActionKind{workload.ActionScaleDown, workload.ActionRestart, workload.ActionCreate}
 		if !kindsEqual(actionKinds(d), want) {
 			t.Errorf("paused decision = %v, want %v", actionKinds(d), want)
 		}
@@ -1651,7 +1718,7 @@ func TestPlan_Paused_RepairRunsFleetChangesDoNot(t *testing.T) {
 		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
 		// Index 0 is Ready with no pods: the freeze suspends the repair
 		// that a plain pause would open, so the truth pass demotes it.
-		want := []workload.ActionKind{workload.ActionScaleDown, workload.ActionDemote}
+		want := []workload.ActionKind{workload.ActionScaleDown, workload.ActionDemote, workload.ActionCreate}
 		if !kindsEqual(actionKinds(d), want) {
 			t.Errorf("frozen decision = %v, want %v", actionKinds(d), want)
 		}
@@ -1666,7 +1733,7 @@ func TestPlan_Paused_RepairRunsFleetChangesDoNot(t *testing.T) {
 		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, nil))
 		// Index 0 is Ready with no pods and no operation: with no restart
 		// pass to own it, the truth pass demotes it — even while paused.
-		want := []workload.ActionKind{workload.ActionScaleDown, workload.ActionDemote}
+		want := []workload.ActionKind{workload.ActionScaleDown, workload.ActionDemote, workload.ActionCreate}
 		if !kindsEqual(actionKinds(d), want) {
 			t.Errorf("paused None-policy decision = %v, want %v", actionKinds(d), want)
 		}
@@ -1736,8 +1803,8 @@ func maximalPlanInput(t *testing.T, now time.Time) (types.ReconcileInput, types.
 // so the purity/determinism assertions on it are not vacuous.
 var maximalPlanKinds = []workload.ActionKind{
 	workload.ActionScaleDown,
-	workload.ActionRestart,
 	workload.ActionMigrateExpiry,
+	workload.ActionRestart,
 	workload.ActionMigrate,
 	workload.ActionUpdate,
 	workload.ActionCreate,
@@ -1849,7 +1916,9 @@ func TestPlan_MaximalFixture_NoWrites(t *testing.T) {
 // every pause depth when no op pass will act; the pass never fires for
 // RecreateInstanceOnPodRestart components (their restart pass owns
 // Ready-with-pod-loss), never for Instances with pods or an Operation,
-// and never for scale-down extras.
+// and never for scale-down extras. The Create pass is planned on every
+// decision, the paused ones included, and starts nothing new there, so
+// it closes each paused list below.
 func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 	unbacked := func(t *testing.T) types.ReconcileInput {
 		in := minimalInput(t)
@@ -1866,8 +1935,8 @@ func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 		plan.Paused = true
 		plan.PauseFreeze = true
 		d := planOrFail(t, in, plan, planSnapshot(in, nil))
-		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionDemote}) {
-			t.Errorf("frozen decision = %v, want [Demote] only", actionKinds(d))
+		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionDemote, workload.ActionCreate}) {
+			t.Errorf("frozen decision = %v, want [Demote Create]", actionKinds(d))
 		}
 	})
 
@@ -1876,8 +1945,8 @@ func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 		plan := minimalPlan()
 		plan.Paused = true
 		d := planOrFail(t, in, plan, planSnapshot(in, nil))
-		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionDemote}) {
-			t.Errorf("paused decision = %v, want [Demote] only", actionKinds(d))
+		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionDemote, workload.ActionCreate}) {
+			t.Errorf("paused decision = %v, want [Demote Create]", actionKinds(d))
 		}
 	})
 
@@ -1915,8 +1984,8 @@ func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 		plan.PauseFreeze = true
 		plan.RestartPolicy = types.RestartPolicyRecreateInstance
 		d := planOrFail(t, in, plan, planSnapshot(in, nil))
-		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionDemote}) {
-			t.Errorf("frozen recreate-policy decision = %v, want [Demote] only: freeze suspends the repair, never the truth", actionKinds(d))
+		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionDemote, workload.ActionCreate}) {
+			t.Errorf("frozen recreate-policy decision = %v, want [Demote Create]: freeze suspends the repair, never the truth", actionKinds(d))
 		}
 	})
 
@@ -1952,8 +2021,8 @@ func TestPlan_Demote_UnbackedReadyInstances(t *testing.T) {
 		plan.PauseFreeze = true
 		plan.RestartPolicy = types.RestartPolicyRecreateInstance
 		d := planOrFail(t, in, plan, planSnapshot(in, nil))
-		if len(d.Actions) != 0 {
-			t.Errorf("frozen decision = %v, want nothing: no repair starts and nothing is left to demote", actionKinds(d))
+		if !kindsEqual(actionKinds(d), []workload.ActionKind{workload.ActionCreate}) {
+			t.Errorf("frozen decision = %v, want [Create] alone: no repair starts and nothing is left to demote", actionKinds(d))
 		}
 	})
 
@@ -2085,13 +2154,16 @@ func TestPlan_Paused_AdvancesInFlightAttemptsOnly(t *testing.T) {
 		}
 	})
 
-	t.Run("no committed create means no Create pass", func(t *testing.T) {
+	t.Run("no committed create still plans the Create pass", func(t *testing.T) {
+		// Execute narrows the paused pass to the committed creates it
+		// finishes, none here; the pass still runs, for the names a lost
+		// node holds.
 		in, plan := build(t)
 		plan.Paused = true
 		in.ObservedState.InstanceStatuses = in.ObservedState.InstanceStatuses[:2]
 		d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods(in)))
-		if findAction(d, workload.ActionCreate) != nil {
-			t.Errorf("paused decision with nothing committed must not plan Create, got %v", actionKinds(d))
+		if findAction(d, workload.ActionCreate) == nil {
+			t.Errorf("paused decision with nothing committed must still plan Create, got %v", actionKinds(d))
 		}
 	})
 
@@ -2578,10 +2650,11 @@ func servingEnginePod(idx int32) *corev1.Pod {
 
 // TestPlan_Update_CoordGateExempt_ReadyRowServingNothing: a fresh update
 // start on a Ready row whose pod set is provably out of service takes
-// nothing further offline, so it skips the coordination gate consult on
-// a non-surge strategy exactly as a dark Failed row does. A surge start
-// keeps the consult, and so does a row that still serves or whose pod is
-// merely not yet Ready.
+// nothing further offline, so it skips the coordination gate consult
+// under every strategy, exactly as a dark Failed row does under a
+// drain-first one; a surge replaces a set that serves nothing already. A
+// row that still serves, or whose pod is merely not yet Ready, keeps the
+// consult.
 func TestPlan_Update_CoordGateExempt_ReadyRowServingNothing(t *testing.T) {
 	target := updateTarget()
 	notReady := enginePod("llama-70b", "prod", 0)
@@ -2597,7 +2670,7 @@ func TestPlan_Update_CoordGateExempt_ReadyRowServingNothing(t *testing.T) {
 	}{
 		{name: "crash loop, recreate", strategy: types.UpdateStrategyRecreatePod, pods: []*corev1.Pod{wedgedEnginePod(0)}, exempt: true},
 		{name: "crash loop, in-place", strategy: types.UpdateStrategyInPlaceIfPossible, pods: []*corev1.Pod{wedgedEnginePod(0)}, exempt: true},
-		{name: "crash loop, surge", strategy: types.UpdateStrategySurgeThenDrain, pods: []*corev1.Pod{wedgedEnginePod(0)}, exempt: false},
+		{name: "crash loop, surge", strategy: types.UpdateStrategySurgeThenDrain, pods: []*corev1.Pod{wedgedEnginePod(0)}, exempt: true},
 		{name: "serving pod, recreate", strategy: types.UpdateStrategyRecreatePod, pods: []*corev1.Pod{servingEnginePod(0)}, exempt: false},
 		{name: "running not ready, recreate", strategy: types.UpdateStrategyRecreatePod, pods: []*corev1.Pod{notReady}, exempt: false},
 	}
@@ -2762,11 +2835,11 @@ func TestPlan_Update_DarkGangIsReadOnItsLeader(t *testing.T) {
 // a member parked in a terminal waiting reason is already inside the
 // gate's unavailability whichever member it is. A fresh drain-first start
 // on such a gang takes nothing further out of the gate's count and skips
-// the consult; the start keeps its place in plan order when the leader
-// still serves, because the per-Component budget still pays for the
-// leader leaving rotation. A gang whose member is merely not yet Ready,
-// a gang fully in rotation, and any start on a surge strategy keep the
-// consult.
+// the consult, and so does a surge start, whose replacement serves in
+// place of a gang that serves nothing; the start keeps its place in plan
+// order when the leader still serves, because the per-Component budget
+// still pays for the leader leaving rotation. A gang whose member is
+// merely not yet Ready and a gang fully in rotation keep the consult.
 func TestPlan_Update_CoordGateExempt_GangWithParkedMember(t *testing.T) {
 	target := updateTarget()
 	member := func(pod *corev1.Pod, runner string) *corev1.Pod {
@@ -2795,7 +2868,7 @@ func TestPlan_Update_CoordGateExempt_GangWithParkedMember(t *testing.T) {
 		{name: "worker parked beside a serving leader, in-place", strategy: types.UpdateStrategyInPlaceIfPossible,
 			pods: []*corev1.Pod{member(servingEnginePod(0), "leader"), member(wedgedEnginePod(0), "worker")}, serving: 1, exempt: true},
 		{name: "worker parked beside a serving leader, surge", strategy: types.UpdateStrategySurgeThenDrain,
-			pods: []*corev1.Pod{member(servingEnginePod(0), "leader"), member(wedgedEnginePod(0), "worker")}, serving: 1, exempt: false},
+			pods: []*corev1.Pod{member(servingEnginePod(0), "leader"), member(wedgedEnginePod(0), "worker")}, serving: 1, exempt: true},
 		{name: "leader parked beside a serving worker, recreate", strategy: types.UpdateStrategyRecreatePod,
 			pods: []*corev1.Pod{member(wedgedEnginePod(0), "leader"), member(servingEnginePod(0), "worker")}, serving: 1, exempt: true, dark: true},
 		{name: "worker booting beside a serving leader, recreate", strategy: types.UpdateStrategyRecreatePod,
@@ -2833,11 +2906,13 @@ func TestPlan_Update_CoordGateExempt_GangWithParkedMember(t *testing.T) {
 // gate counts a gang as serving only when every member is, so a gang
 // whose member is gone, being deleted or in a terminal phase is already
 // inside the gate's unavailability whichever member it is, and a fresh
-// drain-first start on it takes nothing further out of the count: it
-// skips the consult and pays no unavailability budget for itself. A gang
-// whose member is merely booting keeps the consult, as does any start on
-// a surge strategy, where the replacement genuinely adds a pod. A gang
-// whose leader is gone serves nothing and is dark as well.
+// start on it takes nothing further out of the count: it skips the
+// consult under every strategy and pays no unavailability budget for
+// itself; a surge replaces a gang that serves nothing until its set is
+// whole again, and a gate that holds its side for a peer would otherwise
+// leave it short for the whole hold. A gang whose member is merely
+// booting keeps the consult. A gang whose leader is gone serves nothing
+// and is dark as well.
 func TestPlan_Update_CoordGateExempt_GangShortOfMember(t *testing.T) {
 	target := updateTarget()
 	member := func(pod *corev1.Pod, runner string) *corev1.Pod {
@@ -2872,7 +2947,7 @@ func TestPlan_Update_CoordGateExempt_GangShortOfMember(t *testing.T) {
 		{name: "worker gone beside a serving leader, in-place", strategy: types.UpdateStrategyInPlaceIfPossible,
 			pods: []*corev1.Pod{member(servingEnginePod(0), "leader")}, serving: 1, exempt: true},
 		{name: "worker gone beside a serving leader, surge", strategy: types.UpdateStrategySurgeThenDrain,
-			pods: []*corev1.Pod{member(servingEnginePod(0), "leader")}, serving: 1, exempt: false},
+			pods: []*corev1.Pod{member(servingEnginePod(0), "leader")}, serving: 1, exempt: true},
 		{name: "worker being deleted beside a serving leader, recreate", strategy: types.UpdateStrategyRecreatePod,
 			pods: []*corev1.Pod{member(servingEnginePod(0), "leader"), terminating(member(servingEnginePod(0), "worker"))}, serving: 1, exempt: true},
 		{name: "leader gone beside a serving worker, recreate", strategy: types.UpdateStrategyRecreatePod,
@@ -2915,7 +2990,9 @@ func TestPlan_Update_CoordGateExempt_GangShortOfMember(t *testing.T) {
 // it skips the coordination gate consult and is listed out of rotation,
 // ahead of the starts on Instances that still serve, as a gang short of
 // a member is. A row whose only pod serves keeps the consult, and so does
-// any start on a surge strategy, whose replacement adds a pod.
+// a surge start on a row with no pod left: the status publication writes
+// such a row Pending and the Create pass rebuilds it with no gate asked,
+// so the surge has no source to keep beside its replacement.
 func TestPlan_Update_CoordGateExempt_ReadyRowWithNoPodLeft(t *testing.T) {
 	target := updateTarget()
 	terminating := func(pod *corev1.Pod) *corev1.Pod {
@@ -2929,20 +3006,20 @@ func TestPlan_Update_CoordGateExempt_ReadyRowWithNoPodLeft(t *testing.T) {
 		return pod
 	}
 	for _, tc := range []struct {
-		name          string
-		strategy      types.UpdateStrategyType
-		pods          []*corev1.Pod
-		exempt        bool
-		outOfRotation bool
+		name     string
+		strategy types.UpdateStrategyType
+		pods     []*corev1.Pod
+		exempt   bool
+		rank     workload.StartRank
 	}{
-		{name: "no pod left, recreate", strategy: types.UpdateStrategyRecreatePod, pods: nil, exempt: true, outOfRotation: true},
-		{name: "no pod left, surge", strategy: types.UpdateStrategySurgeThenDrain, pods: nil, exempt: false, outOfRotation: true},
+		{name: "no pod left, recreate", strategy: types.UpdateStrategyRecreatePod, pods: nil, exempt: true, rank: workload.StartRankServesNothing},
+		{name: "no pod left, surge", strategy: types.UpdateStrategySurgeThenDrain, pods: nil, exempt: false, rank: workload.StartRankServesNothing},
 		{name: "the only pod on its way out, recreate", strategy: types.UpdateStrategyRecreatePod,
-			pods: []*corev1.Pod{terminating(servingEnginePod(0))}, exempt: true, outOfRotation: true},
+			pods: []*corev1.Pod{terminating(servingEnginePod(0))}, exempt: true, rank: workload.StartRankServesNothing},
 		{name: "the only pod in a terminal phase, recreate", strategy: types.UpdateStrategyRecreatePod,
-			pods: []*corev1.Pod{terminal(servingEnginePod(0))}, exempt: true, outOfRotation: true},
+			pods: []*corev1.Pod{terminal(servingEnginePod(0))}, exempt: true, rank: workload.StartRankServesNothing},
 		{name: "the only pod serving, recreate", strategy: types.UpdateStrategyRecreatePod,
-			pods: []*corev1.Pod{servingEnginePod(0)}, exempt: false, outOfRotation: false},
+			pods: []*corev1.Pod{servingEnginePod(0)}, exempt: false, rank: workload.StartRankServing},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			in := minimalInput(t)
@@ -2962,8 +3039,8 @@ func TestPlan_Update_CoordGateExempt_ReadyRowWithNoPodLeft(t *testing.T) {
 				t.Fatalf("the off-target row must be a fresh update start; actions = %v", actionKinds(d))
 			}
 			item := ua.Update.Items[0]
-			if item.CoordGateExempt != tc.exempt || item.OutOfRotation != tc.outOfRotation {
-				t.Fatalf("CoordGateExempt = %v, OutOfRotation = %v, want %v and %v", item.CoordGateExempt, item.OutOfRotation, tc.exempt, tc.outOfRotation)
+			if item.CoordGateExempt != tc.exempt || item.Rank != tc.rank {
+				t.Fatalf("CoordGateExempt = %v, Rank = %v, want %v and %v", item.CoordGateExempt, item.Rank, tc.exempt, tc.rank)
 			}
 		})
 	}
@@ -2990,9 +3067,9 @@ func unreadyEnginePod(idx int32, unreadyFor time.Duration) *corev1.Pod {
 // TestPlan_Update_CoordGateExempt_ReadyRowUnreadyPastTheWindow: a fresh
 // update start on a Ready row whose promoted pod has failed readiness for
 // longer than the stuck-pod grace replaces an Instance that serves
-// nothing: it skips the coordination gate consult on a drain-first
-// strategy, as a parked pod does, and is listed as a dark start under
-// every strategy. Inside the grace, with no grace configured, or on a pod
+// nothing: it skips the coordination gate consult under every strategy,
+// as a parked pod does, and is listed as a dark start under every
+// strategy. Inside the grace, with no grace configured, or on a pod
 // that never served, the start is consulted and charged like any other.
 // A gang reads the same way through its routed leader, and a worker
 // unready past the grace skips the consult as a parked worker does.
@@ -3025,7 +3102,7 @@ func TestPlan_Update_CoordGateExempt_ReadyRowUnreadyPastTheWindow(t *testing.T) 
 		{name: "past the window, in-place", strategy: types.UpdateStrategyInPlaceIfPossible, grace: time.Minute, runners: single,
 			pods: []*corev1.Pod{unreadyEnginePod(0, 2*time.Minute)}, exempt: true, dark: true},
 		{name: "past the window, surge", strategy: types.UpdateStrategySurgeThenDrain, grace: time.Minute, runners: single,
-			pods: []*corev1.Pod{unreadyEnginePod(0, 2*time.Minute)}, dark: true},
+			pods: []*corev1.Pod{unreadyEnginePod(0, 2*time.Minute)}, exempt: true, dark: true},
 		{name: "inside the window, recreate", strategy: types.UpdateStrategyRecreatePod, grace: time.Minute, runners: single,
 			pods: []*corev1.Pod{unreadyEnginePod(0, 10*time.Second)}},
 		{name: "no window configured, recreate", strategy: types.UpdateStrategyRecreatePod, runners: single,
@@ -3167,7 +3244,7 @@ func TestPlan_Update_InstancesOutOfRotationListedFirst(t *testing.T) {
 					if dark := shape.dark[item.Instance.Index]; item.ReplacesUnservingPodSet != dark {
 						t.Errorf("instance %d: ReplacesUnservingPodSet = %v, want %v: the order is read on rotation, the budget on the grace", item.Instance.Index, item.ReplacesUnservingPodSet, dark)
 					}
-					if exempt := shape.dark[item.Instance.Index] && sc.strategy != types.UpdateStrategySurgeThenDrain; item.CoordGateExempt != exempt {
+					if exempt := shape.dark[item.Instance.Index]; item.CoordGateExempt != exempt {
 						t.Errorf("instance %d: CoordGateExempt = %v, want %v: a start inside the grace is consulted like any other", item.Instance.Index, item.CoordGateExempt, exempt)
 					}
 				}
@@ -3176,6 +3253,174 @@ func TestPlan_Update_InstancesOutOfRotationListedFirst(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// startRankPicture builds the rows and the gangs of a start-rank case:
+// every row entered Ready ten minutes ago on the crash-loop repair
+// revision, and a remembered crash of a promoted set is dated a minute
+// ago.
+type startRankPicture struct {
+	readySince metav1.Time
+	crash      *types.InstanceTermination
+}
+
+func newStartRankPicture() startRankPicture {
+	return startRankPicture{
+		readySince: metav1.NewTime(time.Now().Add(-10 * time.Minute)),
+		crash:      &types.InstanceTermination{PodName: "engine-crashed", ContainerName: constants.MainContainerName, Reason: "Error", Time: metav1.NewTime(time.Now().Add(-time.Minute))},
+	}
+}
+
+// ready is a Ready gang row publishing serving pods in rotation.
+func (p startRankPicture) ready(idx, serving int32) types.InstanceStatus {
+	return types.InstanceStatus{Index: idx, Incarnation: 1, Phase: types.InstancePhaseReady, PodCount: 2, ServingPodCount: serving, RunningRevision: crashLoopRepairRevision, ReadySince: &p.readySince}
+}
+
+// failed is a gang row written Failed with no serving pod for its crash.
+func (p startRankPicture) failed(idx int32) types.InstanceStatus {
+	return types.InstanceStatus{Index: idx, Incarnation: 1, Phase: types.InstancePhaseFailed, PodCount: 2, RunningRevision: crashLoopRepairRevision, ReadySince: &p.readySince, LastFailure: p.crash}
+}
+
+// remembering is a Ready gang row that remembers a crash of its set.
+func (p startRankPicture) remembering(idx, serving int32) types.InstanceStatus {
+	row := p.ready(idx, serving)
+	row.LastFailure = p.crash
+	return row
+}
+
+// leaderDown is a gang whose leader waits in CrashLoopBackOff beside a
+// serving worker.
+func (startRankPicture) leaderDown(idx int32) []*corev1.Pod {
+	return []*corev1.Pod{gangMember(crashLoopingEnginePod(idx, time.Now().Add(-30*time.Second)), "leader"), gangMember(servingEnginePod(idx), "worker")}
+}
+
+// leaderUp is a gang with both members serving.
+func (startRankPicture) leaderUp(idx int32) []*corev1.Pod {
+	return []*corev1.Pod{gangMember(servingEnginePod(idx), "leader"), gangMember(servingEnginePod(idx), "worker")}
+}
+
+// gangMember names an engine pod as one runner of its gang.
+func gangMember(pod *corev1.Pod, runner string) *corev1.Pod {
+	pod.Name += "-" + runner
+	pod.Labels[query.LabelRunner] = runner
+	return pod
+}
+
+// startRankGang is one gang of a start-rank case: its row and its pods.
+type startRankGang struct {
+	row  types.InstanceStatus
+	pods []*corev1.Pod
+}
+
+// plannedStartOrder plans a corrected push over gangs whose revision's
+// record holds, under RecreatePod at maxUnavailable 1, and returns the
+// fresh starts in the order the pass lists them with each start's rank.
+func plannedStartOrder(t *testing.T, gangs []startRankGang) ([]int32, map[int32]workload.StartRank) {
+	t.Helper()
+	in := minimalInput(t)
+	forbidMutations(t, &in)
+	maxSurge, maxUnavailable := intstr.FromInt32(0), intstr.FromInt32(1)
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
+		Replicas:  int32(len(gangs)),
+		UpdateStrategy: types.UpdateStrategy{Type: types.UpdateStrategyRecreatePod,
+			RollingUpdate: &types.RollingUpdate{MaxSurge: &maxSurge, MaxUnavailable: &maxUnavailable}},
+		RestartPolicy: types.RestartPolicyRecreateInstance,
+	}
+	pods := map[int32][]*corev1.Pod{}
+	runners := []types.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}
+	for _, gang := range gangs {
+		plan.Instances = append(plan.Instances, types.InstancePlan{Index: gang.row.Index, Incarnation: 1, Runners: runners})
+		pods[gang.row.Index] = gang.pods
+		in.ObservedState.InstanceStatuses = append(in.ObservedState.InstanceStatuses, gang.row)
+	}
+	in.ObservedState.RetryBlocks = []types.RetryBlock{{TargetRevision: crashLoopRepairRevision, State: types.RetryBlockHeld, AttemptsStarted: 1}}
+	d := planTargetOrFail(t, in, plan, updateTarget(), planSnapshot(in, pods))
+	ua := findAction(d, workload.ActionUpdate)
+	if ua == nil {
+		t.Fatalf("expected an Update action, got %v", actionKinds(d))
+	}
+	var order []int32
+	ranks := map[int32]workload.StartRank{}
+	for _, item := range ua.Update.Items {
+		if !item.StartingFresh {
+			t.Errorf("instance %d: every off-target row is a fresh start", item.Instance.Index)
+		}
+		order = append(order, item.Instance.Index)
+		ranks[item.Instance.Index] = item.Rank
+	}
+	return order, ranks
+}
+
+// TestPlan_Update_StartsRankServesNothingThenNotSteadyThenServing: the
+// fresh starts of a pass are listed by what each Instance serves, read
+// from the row and its pods together since each lags the other by a
+// pass. A Failed row with no serving pod whose set is out of rotation
+// now serves nothing and goes first; a row out of rotation on this pass,
+// or Failed with no serving pod while its set is back up, or one that
+// remembers a crash of its promoted set while it serves between crashes,
+// is not steady and goes next; the serving rows follow in plan order.
+// So a corrected push over a gang nobody can reach and a gang in a crash
+// loop takes the unreachable gang first on the pass the other gang's
+// leader is down as well, and takes a crash loop that serves at this
+// pass before a steady peer.
+func TestPlan_Update_StartsRankServesNothingThenNotSteadyThenServing(t *testing.T) {
+	p := newStartRankPicture()
+	for _, tc := range []struct {
+		name  string
+		gangs []startRankGang
+		want  []int32
+		ranks map[int32]workload.StartRank
+	}{
+		{
+			// The corrected push lands as the crash loop's leader dies again:
+			// both gangs are out of rotation, and the one whose row already
+			// reads Failed with no serving pod goes first.
+			name: "the gang nobody can reach before a crash loop down on this pass",
+			gangs: []startRankGang{
+				{row: p.remembering(0, 2), pods: p.leaderDown(0)},
+				{row: p.failed(1), pods: p.leaderDown(1)},
+				{row: p.ready(2, 2), pods: p.leaderUp(2)},
+			},
+			want:  []int32{1, 0, 2},
+			ranks: map[int32]workload.StartRank{0: workload.StartRankNotSteady, 1: workload.StartRankServesNothing, 2: workload.StartRankServing},
+		},
+		{
+			// The push lands as the crash loop's leader comes back: its row
+			// still reads Failed with no serving pod, but its set is in
+			// rotation, so it is not the one that serves nothing.
+			name: "the gang nobody can reach before a crash loop back up on this pass",
+			gangs: []startRankGang{
+				{row: p.failed(0), pods: p.leaderUp(0)},
+				{row: p.failed(1), pods: p.leaderDown(1)},
+				{row: p.ready(2, 2), pods: p.leaderUp(2)},
+			},
+			want:  []int32{1, 0, 2},
+			ranks: map[int32]workload.StartRank{0: workload.StartRankNotSteady, 1: workload.StartRankServesNothing, 2: workload.StartRankServing},
+		},
+		{
+			// A set that serves between crashes is taken before a steady peer
+			// whatever it reads on this pass.
+			name: "a crash loop that serves on this pass before its steady peers",
+			gangs: []startRankGang{
+				{row: p.ready(0, 2), pods: p.leaderUp(0)},
+				{row: p.ready(1, 2), pods: p.leaderUp(1)},
+				{row: p.remembering(2, 2), pods: p.leaderUp(2)},
+			},
+			want:  []int32{2, 0, 1},
+			ranks: map[int32]workload.StartRank{0: workload.StartRankServing, 1: workload.StartRankServing, 2: workload.StartRankNotSteady},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ranks := plannedStartOrder(t, tc.gangs)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("update items = %v, want %v: the Instance that serves nothing, then the ones not serving steadily, then plan order", got, tc.want)
+			}
+			if !reflect.DeepEqual(ranks, tc.ranks) {
+				t.Errorf("ranks = %v, want %v", ranks, tc.ranks)
+			}
+		})
 	}
 }
 
@@ -3575,14 +3820,19 @@ func BenchmarkPlanFleet(b *testing.B) {
 	}
 }
 
-// TestFleetPlanAllocationsStayWithinBudget holds the allocations of one plan
-// per shape and moment to the recorded golden, so a change in the plan's
-// cost is made on purpose and carries its reason.
-func TestFleetPlanAllocationsStayWithinBudget(t *testing.T) {
+// TestFleetAllocationsStayWithinBudget holds the allocations of one plan per
+// shape and moment, and the allocations and the bytes of one publication per
+// shape and row set, to the recorded golden, so a change in a pass's cost is
+// made on purpose and carries its reason.
+func TestFleetAllocationsStayWithinBudget(t *testing.T) {
 	golden := allocbudget.Open(t, filepath.Join("testdata", "fleet_allocations.json"), *updateFleetAllocations)
 	defer golden.Close()
 	for _, c := range fleetPlanCases(t) {
 		golden.Check(c.name, func() { c.run(t) })
+	}
+	for _, c := range fleetPublicationCases() {
+		golden.Check(c.name, func() { c.run(t) })
+		golden.CheckBytes(c.name+"/bytes", func() { c.run(t) })
 	}
 }
 
@@ -3742,7 +3992,190 @@ func TestPlan_Update_ListsTheInstancesDownOutsideTheRoll(t *testing.T) {
 	if got, want := ua.Update.NotServingOutsideRoll, []int32{0, 4, 5}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("NotServingOutsideRoll = %v, want %v", got, want)
 	}
+	for _, idx := range ua.Update.NotServingOutsideRoll {
+		if ua.Update.NotServingOutsideRollReasons[idx] == "" {
+			t.Fatalf("Instance %d is listed down outside the roll with no reason for the hold to carry; reasons = %v", idx, ua.Update.NotServingOutsideRollReasons)
+		}
+	}
 	if got, want := ua.Update.RolledNotServing, []int32{3}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("RolledNotServing = %v, want %v", got, want)
+	}
+}
+
+// TestPlan_Update_ASecondPushTakesTheInstanceStillOnTheOldestRevisionFirst:
+// a push that lands while an earlier push is still rolling lists the
+// Instances still on the oldest revision ahead of the ones the earlier
+// push already moved, on the prefill side and on the decode side alike,
+// with plan order inside each group, under a recreate, a surge and an
+// in-place strategy. 3 prefill and 3 decode, one Instance at a time:
+// version 2 has rolled on every Instance but one when version 3 is
+// pushed, so the first start on each side is the one Instance still on
+// version 1, and version 1 stands with one side only for no longer than
+// that side's first batch. Two Instances still on version 1 keep plan
+// order between them; an Instance out of rotation still comes before
+// every serving one; an Instance whose revision is gone ranks with the
+// newest. The ages are the ControllerRevision numbers, read through the
+// plan's client as a pass reads them.
+func TestPlan_Update_ASecondPushTakesTheInstanceStillOnTheOldestRevisionFirst(t *testing.T) {
+	const versionOne, versionTwo, versionThree = "svc-engine-rev-1", "svc-engine-rev-2", "svc-engine-rev-3"
+	shapes := []struct {
+		name         string
+		component    types.ComponentType
+		onVersionOne []int32
+		// unready lists the Instances whose pod stopped passing readiness:
+		// out of rotation, and still charged like any other.
+		unready []int32
+		// revisionGone drops version 1's ControllerRevision, so its age is unknown.
+		revisionGone bool
+		want         []int32
+	}{
+		{name: "prefill side, engine 2 still on version 1", component: types.ComponentEngine, onVersionOne: []int32{2}, want: []int32{2, 0, 1}},
+		{name: "decode side, decoder 1 still on version 1", component: types.ComponentDecoder, onVersionOne: []int32{1}, want: []int32{1, 0, 2}},
+		{name: "two Instances still on version 1 keep plan order", component: types.ComponentEngine, onVersionOne: []int32{1, 2}, want: []int32{1, 2, 0}},
+		{name: "an Instance out of rotation comes before the oldest revision", component: types.ComponentEngine, onVersionOne: []int32{2}, unready: []int32{0}, want: []int32{0, 2, 1}},
+		{name: "a revision that is gone ranks with the newest", component: types.ComponentEngine, onVersionOne: []int32{2}, revisionGone: true, want: []int32{0, 1, 2}},
+	}
+	for _, sc := range []struct {
+		strategy       types.UpdateStrategyType
+		surge, unavail int32
+	}{
+		{types.UpdateStrategyRecreatePod, 0, 1},
+		{types.UpdateStrategySurgeThenDrain, 1, 0},
+		{types.UpdateStrategyInPlaceIfPossible, 0, 1},
+	} {
+		for _, shape := range shapes {
+			t.Run(string(sc.strategy)+"/"+shape.name, func(t *testing.T) {
+				in := minimalInput(t)
+				forbidMutations(t, &in)
+				in.Key.Component = shape.component
+				maxSurge, maxUnavailable := intstr.FromInt32(sc.surge), intstr.FromInt32(sc.unavail)
+				plan := types.ComponentPlan{
+					Component: shape.component,
+					Replicas:  3,
+					UpdateStrategy: types.UpdateStrategy{Type: sc.strategy,
+						RollingUpdate: &types.RollingUpdate{MaxSurge: &maxSurge, MaxUnavailable: &maxUnavailable}},
+				}
+				// The running revisions' templates differ from the desired one
+				// by their image alone, the diff an in-place strategy keeps in place.
+				running := in.DesiredSpec.PodSpec.DeepCopy()
+				running.Containers[0].Image = "test:v0"
+				var objects []client.Object
+				for number, name := range []string{versionOne, versionTwo, versionThree} {
+					if name == versionOne && shape.revisionGone {
+						continue
+					}
+					cr := revisionWithPodSpec(t, name, "prod", running)
+					cr.Revision = int64(number + 1)
+					objects = append(objects, cr)
+				}
+				onVersionOne := map[int32]bool{}
+				for _, idx := range shape.onVersionOne {
+					onVersionOne[idx] = true
+				}
+				unready := map[int32]bool{}
+				for _, idx := range shape.unready {
+					unready[idx] = true
+				}
+				for idx := int32(0); idx < 3; idx++ {
+					plan.Instances = append(plan.Instances, types.InstancePlan{Index: idx, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}})
+					pod, serving := servingEnginePod(idx), int32(1)
+					if unready[idx] {
+						pod, serving = unreadyEnginePod(idx, 10*time.Second), 0
+					}
+					pod.Name = query.PodName(in.Key.OwnerName, shape.component, idx, "default", 0)
+					pod.Labels[constants.OMEComponentLabel] = string(shape.component)
+					objects = append(objects, pod)
+					revision := versionTwo
+					if onVersionOne[idx] {
+						revision = versionOne
+					}
+					in.ObservedState.InstanceStatuses = append(in.ObservedState.InstanceStatuses, types.InstanceStatus{
+						Index: idx, Incarnation: 1, Phase: types.InstancePhaseReady, PodCount: 1, ServingPodCount: serving, RunningRevision: revision,
+					})
+				}
+				c := fake.NewClientBuilder().WithScheme(makeScheme(t)).WithObjects(objects...).Build()
+				target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: versionThree, Namespace: "prod"}}
+				snapshot := workload.NewObservedSnapshot(types.Deps{Client: c, APIReader: c}, in, shape.component, in.ObservedState.InstanceStatuses)
+				d := planTargetOrFail(t, in, plan, target, snapshot)
+				ua := findAction(d, workload.ActionUpdate)
+				if ua == nil {
+					t.Fatalf("expected an Update action, got %v", actionKinds(d))
+				}
+				var got []int32
+				for _, item := range ua.Update.Items {
+					got = append(got, item.Instance.Index)
+					if !item.StartingFresh {
+						t.Errorf("instance %d: every Ready row off the target is a fresh start", item.Instance.Index)
+					}
+				}
+				if !reflect.DeepEqual(got, shape.want) {
+					t.Fatalf("update items = %v, want %v: the Instances out of rotation first, then the Instances on the oldest revision, then plan order", got, shape.want)
+				}
+			})
+		}
+	}
+}
+
+// Every rank has a name, and a value outside the three ranks reads Unknown
+// on the log path instead of stopping the pass.
+func TestStartRank_StringNamesEveryRankAndAnUnknownValue(t *testing.T) {
+	for rank, want := range map[workload.StartRank]string{
+		workload.StartRankServesNothing: "ServesNothing",
+		workload.StartRankNotSteady:     "NotSteady",
+		workload.StartRankServing:       "Serving",
+		workload.StartRank(3):           "Unknown",
+		workload.StartRank(-1):          "Unknown",
+	} {
+		if got := rank.String(); got != want {
+			t.Errorf("StartRank(%d).String() = %q, want %q", int(rank), got, want)
+		}
+	}
+}
+
+// TestPlan_Update_CoordGateExempt_ReadyRowUpOnlyInsideTheWindow: a fresh
+// drain-first start on a Ready row whose routed pod restarted since Ready
+// and is Ready again for less than the window takes over the slot its own
+// outage holds: the group's unavailability gate counts such an Instance as
+// down already, so the start skips the consult as a start on a row whose
+// set serves nothing does. Once the pod has held Ready for the window the
+// start keeps the consult, and a surge start keeps it either way.
+func TestPlan_Update_CoordGateExempt_ReadyRowUpOnlyInsideTheWindow(t *testing.T) {
+	target := updateTarget()
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name          string
+		strategy      types.UpdateStrategyType
+		readyAgainFor time.Duration
+		exempt        bool
+	}{
+		{name: "Ready again for 5 s of a 30 s window, recreate", strategy: types.UpdateStrategyRecreatePod, readyAgainFor: 5 * time.Second, exempt: true},
+		{name: "Ready again for the whole window, recreate", strategy: types.UpdateStrategyRecreatePod, readyAgainFor: 40 * time.Second},
+		{name: "Ready again for 5 s of a 30 s window, surge", strategy: types.UpdateStrategySurgeThenDrain, readyAgainFor: 5 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := minimalInput(t)
+			forbidMutations(t, &in)
+			in.Clock = clocktesting.NewFakeClock(now)
+			in.ObservedState.InstanceStatuses = []types.InstanceStatus{{
+				Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, PodCount: 1, ServingPodCount: 1,
+				RunningRevision: crashLoopRepairRevision, ReadySince: &metav1.Time{Time: now.Add(-10 * time.Minute)},
+			}}
+			plan := minimalPlan()
+			plan.UpdateStrategy = types.UpdateStrategy{Type: tc.strategy}
+			plan.MinReadySeconds = 30
+			running := in.DesiredSpec.PodSpec.DeepCopy()
+			running.Containers[0].Image = "test:v0"
+			pods := []*corev1.Pod{restartedEnginePod(0, now, tc.readyAgainFor, "")}
+			d := planTargetOrFail(t, in, plan, target, planSnapshotWithRevisions(in,
+				map[int32][]*corev1.Pod{0: pods}, map[string]*corev1.PodSpec{crashLoopRepairRevision: running}))
+			ua := findAction(d, workload.ActionUpdate)
+			if ua == nil || len(ua.Update.Items) != 1 || !ua.Update.Items[0].StartingFresh {
+				t.Fatalf("the row must be a fresh update start; actions = %v", actionKinds(d))
+			}
+			if got := ua.Update.Items[0].CoordGateExempt; got != tc.exempt {
+				t.Fatalf("CoordGateExempt = %v, want %v", got, tc.exempt)
+			}
+		})
 	}
 }

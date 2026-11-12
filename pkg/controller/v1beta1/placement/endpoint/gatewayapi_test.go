@@ -3,6 +3,7 @@ package endpoint
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1260,5 +1261,84 @@ func TestBoundedResourceName_InputStartsWithDigit_StartsWithLetterWithinLimit(t 
 		if len(got) > validation.DNS1035LabelMaxLength {
 			t.Fatalf("boundedResourceName(%q) = %q exceeds the DNS label limit", in, got)
 		}
+	}
+}
+
+// The EndpointSlices of one cluster: one per address family, IPv4 first,
+// each address once in its canonical form; an address of the wrong shape or
+// a cluster without one usable address refuses the build and names why.
+func TestBuildEndpointSlices_AddressShapes_OneSlicePerFamilyOrARefusal(t *testing.T) {
+	p := NewGatewayAPIPublisher(nil, gatewayBackendConfig())
+	isvc := testISVC()
+	cluster := ServingCluster{Cluster: "cluster-a", BackendHost: "svc.prod.cloud-a.example"}
+	v4 := func(a string) BackendAddress { return BackendAddress{Address: a, Type: discoveryv1.AddressTypeIPv4} }
+	v6 := func(a string) BackendAddress { return BackendAddress{Address: a, Type: discoveryv1.AddressTypeIPv6} }
+	for _, tc := range []struct {
+		name      string
+		addresses []BackendAddress
+		// want lists each slice as "<name suffix> <addresses>", in build order.
+		want    []string
+		wantErr string
+	}{
+		{name: "both families, IPv4 first", addresses: []BackendAddress{v6("2001:db8::10"), v4("192.0.2.10")}, want: []string{"-ipv4 [192.0.2.10]", "-ipv6 [2001:db8::10]"}},
+		{name: "repeats and letter case fold to one endpoint", addresses: []BackendAddress{v6("2001:DB8::10"), v6("2001:db8::10"), v4("192.0.2.10"), v4("192.0.2.10")}, want: []string{"-ipv4 [192.0.2.10]", "-ipv6 [2001:db8::10]"}},
+		{name: "an IPv4-mapped IPv6 address is an IPv4 address", addresses: []BackendAddress{v4("::ffff:192.0.2.10")}, want: []string{"-ipv4 [192.0.2.10]"}},
+		{name: "a family other than IPv4 or IPv6", addresses: []BackendAddress{{Address: "svc.example", Type: discoveryv1.AddressTypeFQDN}}, wantErr: `build EndpointSlice for cluster "cluster-a": unsupported address type "FQDN"`},
+		{name: "a zone", addresses: []BackendAddress{v6("fe80::1%eth0")}, wantErr: `build EndpointSlice for cluster "cluster-a": invalid IPv6 address "fe80::1%eth0"`},
+		{name: "not an address", addresses: []BackendAddress{v4("192.0.2.300")}, wantErr: `build EndpointSlice for cluster "cluster-a": invalid IPv4 address "192.0.2.300"`},
+		{name: "an IPv6 address declared IPv4", addresses: []BackendAddress{v4("2001:db8::10")}, wantErr: `build EndpointSlice for cluster "cluster-a": address "2001:db8::10" does not match type "IPv4"`},
+		{name: "no address", addresses: nil, wantErr: `build EndpointSlice for cluster "cluster-a": no IPv4 or IPv6 addresses`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			built, err := p.buildEndpointSlices(isvc, "svc-global-cluster-a", cluster, tc.addresses)
+			if tc.wantErr != "" {
+				if err == nil || err.Error() != tc.wantErr {
+					t.Fatalf("buildEndpointSlices() error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			require.NoError(t, err)
+			var got []string
+			for _, s := range built {
+				var addresses []string
+				for _, e := range s.Endpoints {
+					addresses = append(addresses, e.Addresses...)
+				}
+				got = append(got, strings.TrimPrefix(s.Name, "svc-global-cluster-a")+" "+fmt.Sprint(addresses))
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// The preflight reads the published objects in the configured route
+// namespace, not in the service's own: an object of another source under the
+// backend name there stops the publication, one in the service's namespace
+// does not.
+func TestPreflightPublishedObjects_RouteNamespaceSet_ReadsTheObjectsThere(t *testing.T) {
+	cfg := gatewayBackendConfig()
+	cfg.RouteNamespace = "edge"
+	isvc := testISVC()
+	otherOwner := map[string]string{PlacementEndpointISVCLabel: "other", PlacementEndpointISVCNamespaceLabel: isvc.Namespace}
+	for _, tc := range []struct {
+		name      string
+		namespace string
+		wantErr   string
+	}{
+		{name: "in the route namespace", namespace: "edge", wantErr: `global backend Service edge/svc-5973a5bb-global-cluster-a belongs to another source`},
+		{name: "in the service namespace", namespace: isvc.Namespace},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taken := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: tc.namespace, Name: "svc-5973a5bb-global-cluster-a", Labels: otherOwner}}
+			p := NewGatewayAPIPublisher(gatewayClient(t, fakeclient.WithObjects(taken)), cfg)
+			err := p.preflightResourceKeys(context.Background(), isvc, oneCluster("svc.prod.global.example", "cluster-a", "svc.prod.cloud-a.example"))
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			if err == nil || err.Error() != tc.wantErr {
+				t.Fatalf("preflightResourceKeys() error = %v, want %q", err, tc.wantErr)
+			}
+		})
 	}
 }

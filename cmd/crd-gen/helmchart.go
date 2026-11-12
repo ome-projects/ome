@@ -43,49 +43,66 @@ var markerLine = regexp.MustCompile(`(?m)^([ ]*)([^ \n][^\n]*?):[ ]+"?` + includ
 // CRD, named like the input, plus opts.PartialsFile holding every schema
 // subtree that repeats. Expanding the includes yields the input schema.
 func buildHelmChart(inputs []string, opts helmChartOptions) (map[string][]byte, error) {
-	if opts.MinBytes <= 0 {
-		return nil, errors.New("min-bytes must be positive")
-	}
-	if opts.PartialsFile == "" || opts.Prefix == "" {
-		return nil, errors.New("partials file and prefix are required")
-	}
-	if len(inputs) == 0 {
-		return nil, errors.New("at least one CRD file is required")
+	if err := checkChartOptions(inputs, opts); err != nil {
+		return nil, err
 	}
 	sorted := append([]string(nil), inputs...)
 	sort.Strings(sorted)
+	docs, names, err := readChartInputs(sorted, opts.PartialsFile)
+	if err != nil {
+		return nil, err
+	}
+	repeats := newRepeatedNodes(opts.MinBytes)
+	for _, doc := range docs {
+		for _, holder := range schemaHolders(doc) {
+			repeats.count(holder["openAPIV3Schema"], true)
+		}
+	}
+	partials := repeats.partials(opts.Prefix)
+	return renderChartFiles(docs, names, partials, repeats.nodes, opts.PartialsFile)
+}
 
-	docs := make([]map[string]interface{}, 0, len(sorted))
-	names := make([]string, 0, len(sorted))
-	seen := map[string]bool{opts.PartialsFile: true}
-	for _, in := range sorted {
+// checkChartOptions refuses a size that cannot select a partial, an unnamed
+// partials file or prefix, and an empty input list.
+func checkChartOptions(inputs []string, opts helmChartOptions) error {
+	if opts.MinBytes <= 0 {
+		return errors.New("min-bytes must be positive")
+	}
+	if opts.PartialsFile == "" || opts.Prefix == "" {
+		return errors.New("partials file and prefix are required")
+	}
+	if len(inputs) == 0 {
+		return errors.New("at least one CRD file is required")
+	}
+	return nil
+}
+
+// readChartInputs reads every CRD in order and names its output after the
+// input's base name; a base name taken twice, or by the partials file, is an
+// error.
+func readChartInputs(inputs []string, partialsFile string) ([]map[string]interface{}, []string, error) {
+	docs := make([]map[string]interface{}, 0, len(inputs))
+	names := make([]string, 0, len(inputs))
+	seen := map[string]bool{partialsFile: true}
+	for _, in := range inputs {
 		base := filepath.Base(in)
 		if seen[base] {
-			return nil, fmt.Errorf("%s: output name %s is already taken", in, base)
+			return nil, nil, fmt.Errorf("%s: output name %s is already taken", in, base)
 		}
 		seen[base] = true
 		doc, err := readCRD(in)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		docs = append(docs, doc)
 		names = append(names, base)
 	}
+	return docs, names, nil
+}
 
-	counts := map[string]int{}
-	nodes := map[string]map[string]interface{}{}
-	for _, doc := range docs {
-		for _, holder := range schemaHolders(doc) {
-			countNodes(holder["openAPIV3Schema"], true, opts.MinBytes, counts, nodes)
-		}
-	}
-	partials := map[string]string{}
-	for canon, n := range counts {
-		if n >= 2 {
-			partials[canon] = opts.Prefix + "." + digest.Short([]byte(canon), partialHashLength)
-		}
-	}
-
+// renderChartFiles replaces every partial occurrence in the schemas with an
+// include and renders one template per CRD and the partials file.
+func renderChartFiles(docs []map[string]interface{}, names []string, partials map[string]string, nodes map[string]map[string]interface{}, partialsFile string) (map[string][]byte, error) {
 	out := make(map[string][]byte, len(docs)+1)
 	for i, doc := range docs {
 		for _, holder := range schemaHolders(doc) {
@@ -101,7 +118,7 @@ func buildHelmChart(inputs []string, opts helmChartOptions) (map[string][]byte, 
 	if err != nil {
 		return nil, err
 	}
-	out[opts.PartialsFile] = data
+	out[partialsFile] = data
 	return out, nil
 }
 
@@ -150,23 +167,11 @@ func schemaHolders(doc map[string]interface{}) []map[string]interface{} {
 func findTemplateDelimiter(node interface{}) string {
 	switch n := node.(type) {
 	case string:
-		if strings.Contains(n, "{{") || strings.Contains(n, "}}") {
+		if hasTemplateDelimiter(n) {
 			return n
 		}
 	case map[string]interface{}:
-		keys := make([]string, 0, len(n))
-		for k := range n {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if strings.Contains(k, "{{") || strings.Contains(k, "}}") {
-				return k
-			}
-			if s := findTemplateDelimiter(n[k]); s != "" {
-				return s
-			}
-		}
+		return findTemplateDelimiterInMap(n)
 	case []interface{}:
 		for _, v := range n {
 			if s := findTemplateDelimiter(v); s != "" {
@@ -175,6 +180,29 @@ func findTemplateDelimiter(node interface{}) string {
 		}
 	}
 	return ""
+}
+
+// findTemplateDelimiterInMap reads the keys in sorted order, each key before
+// its value, so the same document always names the same delimiter.
+func findTemplateDelimiterInMap(n map[string]interface{}) string {
+	keys := make([]string, 0, len(n))
+	for k := range n {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if hasTemplateDelimiter(k) {
+			return k
+		}
+		if s := findTemplateDelimiter(n[k]); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func hasTemplateDelimiter(s string) bool {
+	return strings.Contains(s, "{{") || strings.Contains(s, "}}")
 }
 
 // canonical is the identity of a subtree: compact JSON with sorted keys.
@@ -193,28 +221,61 @@ func childEligible(key string) bool {
 	return key != "properties"
 }
 
-// countNodes tallies every object node large enough to become a partial. A
+// repeatedNodes tallies every object node of the schemas that is large enough
+// to become a partial, by its canonical form, and keeps one copy of each. A
 // node is eligible only as the value of a mapping key, never as a list
 // element, so every include lands on a "key:" line.
-func countNodes(node interface{}, eligible bool, minBytes int, counts map[string]int, nodes map[string]map[string]interface{}) {
+type repeatedNodes struct {
+	minBytes int
+	counts   map[string]int
+	nodes    map[string]map[string]interface{}
+}
+
+func newRepeatedNodes(minBytes int) *repeatedNodes {
+	return &repeatedNodes{minBytes: minBytes, counts: map[string]int{}, nodes: map[string]map[string]interface{}{}}
+}
+
+// count walks node and tallies its eligible object nodes.
+func (r *repeatedNodes) count(node interface{}, eligible bool) {
 	switch n := node.(type) {
 	case map[string]interface{}:
 		if eligible {
-			if c := canonical(n); len(c) >= minBytes {
-				counts[c]++
-				if _, ok := nodes[c]; !ok {
-					nodes[c] = n
-				}
-			}
+			r.countObject(n)
 		}
 		for k, v := range n {
-			countNodes(v, childEligible(k), minBytes, counts, nodes)
+			r.count(v, childEligible(k))
 		}
 	case []interface{}:
 		for _, v := range n {
-			countNodes(v, false, minBytes, counts, nodes)
+			r.count(v, false)
 		}
 	}
+}
+
+// countObject tallies one object node when its canonical form is at least
+// minBytes, keeping the first copy met; equal canonical forms are equal
+// nodes, so which copy is kept changes nothing.
+func (r *repeatedNodes) countObject(n map[string]interface{}) {
+	c := canonical(n)
+	if len(c) < r.minBytes {
+		return
+	}
+	r.counts[c]++
+	if _, ok := r.nodes[c]; !ok {
+		r.nodes[c] = n
+	}
+}
+
+// partials names every node seen at least twice: the prefix and a short
+// content hash.
+func (r *repeatedNodes) partials(prefix string) map[string]string {
+	partials := map[string]string{}
+	for canon, n := range r.counts {
+		if n >= 2 {
+			partials[canon] = prefix + "." + digest.Short([]byte(canon), partialHashLength)
+		}
+	}
+	return partials
 }
 
 // rewriteNode returns node with every partial occurrence replaced by an

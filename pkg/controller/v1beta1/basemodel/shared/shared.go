@@ -60,13 +60,6 @@ type DownloadProgress struct {
 	LastUpdated      string  `json:"lastUpdated"`
 }
 
-func (p *DownloadProgress) Percentage() float64 {
-	if p == nil || p.TotalBytes == 0 {
-		return 0
-	}
-	return float64(p.CompletedBytes) / float64(p.TotalBytes) * 100
-}
-
 // ModelEntry is the top-level per-model record in the node ConfigMap.
 type ModelEntry struct {
 	Name     string            `json:"name"`

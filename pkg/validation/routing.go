@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 )
 
 // ValidateRouting validates the per-InferenceService routing policy.
@@ -210,6 +211,44 @@ func isSafeRoutingHTTPMethod(method string) bool {
 	default:
 		return false
 	}
+}
+
+// ValidateRoutingPublisherOptionAnnotations checks the
+// ome.io/routing-publisher.<option> annotations under the limits that apply to
+// spec.routing.publisher.options, counted together with it. An option set both
+// in the spec and by an annotation is refused, because the publisher could not
+// tell which one the operator meant. The admission webhook runs it, and so does
+// the control plane's TrafficMap publisher before it reads the options, because
+// the control plane runs no InferenceService admission webhook.
+func ValidateRoutingPublisherOptionAnnotations(annotations map[string]string, spec *v1beta1.InferenceServiceSpec) error {
+	var specOptions map[string]string
+	if spec != nil && spec.Routing != nil && spec.Routing.Publisher != nil {
+		specOptions = spec.Routing.Publisher.Options
+	}
+	count := len(specOptions)
+	for key, value := range annotations {
+		option, found := strings.CutPrefix(key, constants.RoutingPublisherOptionAnnotationPrefix)
+		if !found {
+			continue
+		}
+		count++
+		if _, inSpec := specOptions[option]; inSpec {
+			return fmt.Errorf("publisher option %q is set both in spec.routing.publisher.options and in annotation %q",
+				option, key)
+		}
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("annotation %q must not be empty or whitespace-only", key)
+		}
+		if len(value) > v1beta1.MaxRoutingPublisherOptionValueBytes {
+			return fmt.Errorf("annotation %q exceeds the %d-byte value limit",
+				key, v1beta1.MaxRoutingPublisherOptionValueBytes)
+		}
+	}
+	if count > v1beta1.MaxRoutingPublisherOptions {
+		return fmt.Errorf("spec.routing.publisher.options and the %s annotations must set at most %d options together, got %d",
+			constants.RoutingPublisherOptionAnnotationPrefix, v1beta1.MaxRoutingPublisherOptions, count)
+	}
+	return nil
 }
 
 func validateRoutingPublisher(publisher *v1beta1.RoutingPublisherSpec) error {

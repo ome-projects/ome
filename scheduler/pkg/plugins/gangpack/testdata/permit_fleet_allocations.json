@@ -1,0 +1,28 @@
+{
+  "recordedOn": {
+    "date": "2026-11-04",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The gate reads the gang's members from the informer's list and looks each up at the gate by UID instead of scanning the waiting set: a held member's decision allocates 7 (10 to 12 before) and the completing member's 5 (9 to 11), for the one list, the slice of waiting siblings and the map of members to requeue. PreFilter's budgets are unchanged.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "nodes=504/gang=2/pending=100/filter": 0,
+    "nodes=504/gang=2/pending=100/gang": 747,
+    "nodes=504/gang=2/pending=100/permit-admit": 5,
+    "nodes=504/gang=2/pending=100/permit-wait": 7,
+    "nodes=504/gang=2/pending=100/prefilter-first": 588,
+    "nodes=504/gang=2/pending=100/prefilter-follower": 75,
+    "nodes=504/gang=4/pending=100/filter": 0,
+    "nodes=504/gang=4/pending=100/gang": 1189,
+    "nodes=504/gang=4/pending=100/permit-admit": 5,
+    "nodes=504/gang=4/pending=100/permit-wait": 7,
+    "nodes=504/gang=4/pending=100/prefilter-first": 682,
+    "nodes=504/gang=4/pending=100/prefilter-follower": 73,
+    "nodes=504/gang=8/pending=56/filter": 0,
+    "nodes=504/gang=8/pending=56/gang": 2117,
+    "nodes=504/gang=8/pending=56/permit-admit": 5,
+    "nodes=504/gang=8/pending=56/permit-wait": 7,
+    "nodes=504/gang=8/pending=56/prefilter-first": 850,
+    "nodes=504/gang=8/pending=56/prefilter-follower": 67
+  }
+}

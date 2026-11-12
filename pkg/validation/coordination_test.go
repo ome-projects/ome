@@ -368,42 +368,112 @@ func TestValidateCoordination_ZeroBudgetPacingRejected(t *testing.T) {
 }
 
 // TestValidateCoordination_WaitAfterReadinessOnMultiMemberGroup_Rejected: a multi-Component
-// blueGreen group with a soak does not collapse to the Sequential state machine,
-// so the engine would drop the soak. Admission rejects it.
+// blueGreen group with a wait after readiness does not collapse to the Sequential
+// state machine, so the engine would drop the wait. Admission rejects it.
 func TestValidateCoordination_WaitAfterReadinessOnMultiMemberGroup_Rejected(t *testing.T) {
 	mode := constants.OMENative
-	soak := &metav1.Duration{Duration: 10 * time.Minute}
+	wait := &metav1.Duration{Duration: 10 * time.Minute}
 	spec := &v1beta1.InferenceServiceSpec{
 		DeploymentMode: &mode,
 		Engine:         &v1beta1.EngineSpec{},
 		Decoder:        &v1beta1.DecoderSpec{},
 		Router:         &v1beta1.RouterSpec{},
 		Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{
-			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}, Soak: soak},
+			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}, Soak: wait},
 			{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}},
 		}},
 	}
 	if err := ValidateCoordination(spec); err == nil || !strings.Contains(err.Error(), ReasonSoakNotHonored) {
-		t.Fatalf("soak on a non-collapsing group must be rejected, got: %v", err)
+		t.Fatalf("a wait after readiness on a non-collapsing group must be rejected, got: %v", err)
 	}
 }
 
 // TestValidateCoordination_WaitAfterReadinessOnSingleMemberRun_Accepted: a run of single-Component
-// blueGreen groups collapses to Sequential, which honors soak, so it passes.
+// blueGreen groups collapses to Sequential, which honours the wait after readiness, so it passes.
 func TestValidateCoordination_WaitAfterReadinessOnSingleMemberRun_Accepted(t *testing.T) {
 	mode := constants.OMENative
-	soak := &metav1.Duration{Duration: 10 * time.Minute}
+	wait := &metav1.Duration{Duration: 10 * time.Minute}
 	spec := &v1beta1.InferenceServiceSpec{
 		DeploymentMode: &mode,
 		Engine:         &v1beta1.EngineSpec{},
 		Decoder:        &v1beta1.DecoderSpec{},
 		Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{
-			{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, Soak: soak},
+			{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, Soak: wait},
 			{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}},
 		}},
 	}
 	if err := ValidateCoordination(spec); err != nil {
-		t.Fatalf("soak on a collapsing single-Component sequence must pass: %v", err)
+		t.Fatalf("a wait after readiness on a collapsing single-Component sequence must pass: %v", err)
+	}
+}
+
+// A wait after readiness on a canary group is never honoured: the canary's
+// steps gate the roll, so admission refuses it rather than let the operator
+// believe the wait is enforced.
+func TestValidateCoordination_WaitAfterReadinessOnACanaryGroup_Rejected(t *testing.T) {
+	spec := omeNativeEngineOnlySpec()
+	spec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		Soak:       &metav1.Duration{Duration: 30 * time.Second},
+		Canary: &v1beta1.GroupCanary{Steps: []v1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("50%"), Traffic: 50, Pause: &v1beta1.RolloutPause{Duration: &metav1.Duration{Duration: 20 * time.Second}}},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		}},
+	}}}
+	refusedWaitAfterReadiness(t, spec, "a wait after readiness on a canary group")
+}
+
+// One blueGreen group is not a chain of single-Component groups, so its wait
+// after readiness would be dropped; admission refuses it.
+func TestValidateCoordination_WaitAfterReadinessOnASingleBlueGreenGroup_Rejected(t *testing.T) {
+	spec := omeNativeEngineOnlySpec()
+	spec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		BlueGreen:  &v1beta1.GroupBlueGreen{},
+		Soak:       &metav1.Duration{Duration: 30 * time.Second},
+	}}}
+	refusedWaitAfterReadiness(t, spec, "a wait after readiness on a single blueGreen group")
+}
+
+// refusedWaitAfterReadiness checks that admission refuses the spec with the
+// reason that names the dropped wait.
+func refusedWaitAfterReadiness(t *testing.T, spec *v1beta1.InferenceServiceSpec, shape string) {
+	t.Helper()
+	if err := ValidateCoordination(spec); err == nil || !strings.Contains(err.Error(), ReasonSoakNotHonored) {
+		t.Fatalf("%s must be rejected with %s, got: %v", shape, ReasonSoakNotHonored, err)
+	}
+}
+
+// An order that names a Component twice is refused by the duplicate rule,
+// which answers before the order itself is read.
+func TestValidateCoordination_OrderNamingAComponentTwice_Rejected(t *testing.T) {
+	spec := omeNativeEngineOnlySpec()
+	spec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+		Order:      []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.EngineComponent},
+		BlueGreen:  &v1beta1.GroupBlueGreen{},
+	}}}
+	err := ValidateCoordination(spec)
+	if err == nil || !strings.Contains(err.Error(), ReasonSequentialDuplicateOrder) {
+		t.Fatalf("an order naming the engine twice must be rejected with %s, got: %v", ReasonSequentialDuplicateOrder, err)
+	}
+}
+
+// A blueGreen group over an engine deployed as RawDeployment is refused: every
+// member of a group must be OMENative.
+func TestValidateCoordination_BlueGreenGroupOnARawDeploymentEngine_Rejected(t *testing.T) {
+	spec := &v1beta1.InferenceServiceSpec{
+		Engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{
+			Annotations: map[string]string{constants.DeploymentMode: string(constants.RawDeployment)},
+		}},
+		Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{
+			Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
+			BlueGreen:  &v1beta1.GroupBlueGreen{},
+		}}},
+	}
+	err := ValidateCoordination(spec)
+	if err == nil || !strings.Contains(err.Error(), ReasonCoordinationRequiresOMENative) {
+		t.Fatalf("a blueGreen group on a RawDeployment engine must be rejected with %s, got: %v", ReasonCoordinationRequiresOMENative, err)
 	}
 }
 

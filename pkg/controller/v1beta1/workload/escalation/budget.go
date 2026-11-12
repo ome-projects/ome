@@ -82,25 +82,14 @@ func PerComponentMaxUnavailableBudget(ru *types.RollingUpdate, replicas int32) i
 	return utils.ScaledCountFromIntOrString(ru.MaxUnavailable, replicas, true)
 }
 
-// surgeSteps are the Update steps during which the roll keeps an extra
-// pod beside the Instance's own: the replacement runs before the source
-// pod is deleted. The coordination gate's surgeInFlight in
-// pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/ratio.go
-// counts the same steps, so both layers read one in-flight signal.
-var surgeSteps = map[string]bool{
-	types.UpdateStepSurge:            true,
-	types.UpdateStepSurgeDrain:       true,
-	types.UpdateStepSurgeDrainSettle: true,
-}
-
 // CurrentSurgeInFlight counts the Instances whose roll already holds an
 // extra pod from an earlier pass. The dispatcher reads it before starting
 // one more surge in this pass. The other steps (Drain for a recreate,
 // InPlace for an in-place patch) add no pod.
 func CurrentSurgeInFlight(statuses []types.InstanceStatus) int32 {
 	var n int32
-	for _, s := range statuses {
-		if s.Operation != nil && surgeSteps[s.Operation.Step] {
+	for i := range statuses {
+		if types.SurgeReplacementInFlight(&statuses[i]) {
 			n++
 		}
 	}
@@ -131,7 +120,7 @@ func CurrentUnavailableInFlight(statuses []types.InstanceStatus) int32 {
 		if !updating && !failedUpdate {
 			continue
 		}
-		if s.Operation != nil && (surgeSteps[s.Operation.Step] || replacementGangSteps[s.Operation.Step]) {
+		if types.SurgeReplacementInFlight(&s) || (s.Operation != nil && replacementGangSteps[s.Operation.Step]) {
 			// A surge keeps the Instance's own pod serving, and a
 			// replacement gang's row is its source's attempt seen from the
 			// other index: it has no set of its own to take offline.
@@ -160,7 +149,10 @@ var replacementGangSteps = map[string]bool{
 // operation is counted by neither anchor, so a repair that failed
 // releases the budget while its Instance stays down. The RetryBlock
 // against the revision is what bounds repeated failures there. The
-// update arm differs: it does charge a Failed row's preserved Update.
+// restart pass adds to the two anchors the Ready Instances up only inside
+// the proven window after a restart (ops.InstanceServingUnproven), which
+// no phase shows. The update arm differs: it does charge a Failed row's
+// preserved Update.
 func CurrentRestartingInFlight(statuses []types.InstanceStatus) int32 {
 	var n int32
 	for _, s := range statuses {
@@ -231,7 +223,7 @@ func ExtraPodSurgeInFlight(plan types.ComponentPlan, statuses []types.InstanceSt
 	for i := range statuses {
 		runningRevision[statuses[i].Index] = query.RevisionFromName(statuses[i].RunningRevision)
 		op := statuses[i].Operation
-		if op == nil || !surgeSteps[op.Step] {
+		if !types.SurgeReplacementInFlight(&statuses[i]) {
 			continue
 		}
 		charged[statuses[i].Index] = struct{}{}

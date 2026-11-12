@@ -37,7 +37,7 @@ func primaryMember(in ReconcileInputs) sampledMember {
 
 // sampledMembers lists the members the gate samples, each on its own canary
 // revision: the primary first, then each secondary in name order. A member
-// is read when the pinned run moved it to a new revision. A member the run
+// is read when the recorded run moved it to a new revision. A member the run
 // left alone serves its stable revision on its target, so a sample of it
 // would grade the revision the unit keeps, not the one it brings in; it is
 // not read, and on a push that moved only a secondary the primary is not
@@ -52,7 +52,7 @@ func sampledMembers(in ReconcileInputs) []sampledMember {
 	}
 	for _, c := range slices.Sorted(maps.Keys(in.Secondaries)) {
 		m := in.Secondaries[c]
-		if m.CanaryRevisionHash == "" || m.CanaryRevisionHash == m.StableRevisionHash || !memberRetargeted(in.ISVC, c) {
+		if !m.retargeted() || !memberRetargeted(in.ISVC, c) {
 			continue
 		}
 		out = append(out, sampledMember{component: c, canaryHash: m.CanaryRevisionHash, stableHash: m.StableRevisionHash})
@@ -144,7 +144,7 @@ func buildSampleRequest(in ReconcileInputs, src sampleSource, m sampledMember, a
 // token — never the raw secret material). It keys the sample cache and its
 // in-flight dedup, so any edit to the plan or its source changes the key: the
 // edited plan kicks a fresh query instead of consuming a result produced under
-// the previous configuration, and the superseded entry ages out unread. The
+// the previous configuration, and the replaced entry ages out unread. The
 // fingerprint is an internal cache key only, never surfaced in status or logs.
 func analysisFingerprint(a *v1beta1.RolloutAnalysis, addr string, headers map[string]string, authRef *corev1.SecretKeySelector, token string) string {
 	h := sha256.New()

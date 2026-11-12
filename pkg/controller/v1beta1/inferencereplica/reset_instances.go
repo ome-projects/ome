@@ -84,11 +84,7 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 	if perr != nil {
 		log.Info("Instance reset requested with a malformed value; consuming as no-op",
 			"value", val, "error", perr.Error())
-		if r.Recorder != nil {
-			r.Recorder.Eventf(eventTarget, corev1.EventTypeWarning, string(workloadtypes.EventReasonInstancesResetRejected),
-				"InferenceReplica %s/%s component=%s: %s=%q rejected: %v; nothing reset",
-				ir.Namespace, ir.Name, ir.Spec.Component, constants.ResetInstancesAnnotationKey, val, perr)
-		}
+		r.recordResetRejected(eventTarget, ir, val, perr)
 	} else {
 		reset, skipped, rerr := r.resetInstances(ctx, log, ir, req)
 		if rerr != nil {
@@ -96,23 +92,7 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 			// next pass; every step above is idempotent on re-delivery.
 			return false, fmt.Errorf("reset instances (%s=%q): %w", constants.ResetInstancesAnnotationKey, val, rerr)
 		}
-		if r.Recorder != nil {
-			if len(reset) > 0 {
-				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesReset),
-					"InferenceReplica %s/%s component=%s: reset instance(s) %s at operator request (%s annotation): pods deleted and preserved operation cleared; the lifecycle passes rebuild them",
-					ir.Namespace, ir.Name, ir.Spec.Component, formatIndices(reset), constants.ResetInstancesAnnotationKey)
-			}
-			switch {
-			case len(skipped) > 0:
-				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesResetSkipped),
-					"InferenceReplica %s/%s component=%s: reset skipped for instance(s) %s",
-					ir.Namespace, ir.Name, ir.Spec.Component, formatSkips(skipped))
-			case len(reset) == 0:
-				r.Recorder.Eventf(eventTarget, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesResetSkipped),
-					"InferenceReplica %s/%s component=%s: reset requested for all instances but none is Failed; nothing to reset",
-					ir.Namespace, ir.Name, ir.Spec.Component)
-			}
-		}
+		r.recordResetOutcome(eventTarget, ir, reset, skipped)
 	}
 
 	key := client.ObjectKeyFromObject(ir)
@@ -120,6 +100,40 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 		fresh := &v1beta1.InferenceReplica{}
 		return fresh, r.APIReader.Get(ctx, key, fresh)
 	}, constants.ResetInstancesAnnotationKey)
+}
+
+// recordResetRejected publishes the one Warning a malformed request earns.
+func (r *Reconciler) recordResetRejected(target client.Object, ir *v1beta1.InferenceReplica, val string, perr error) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(target, corev1.EventTypeWarning, string(workloadtypes.EventReasonInstancesResetRejected),
+		"InferenceReplica %s/%s component=%s: %s=%q rejected: %v; nothing reset",
+		ir.Namespace, ir.Name, ir.Spec.Component, constants.ResetInstancesAnnotationKey, val, perr)
+}
+
+// recordResetOutcome publishes what a well-formed request did: one event
+// naming the Instances reset, and one naming the Instances skipped or, when
+// nothing was reset and nothing skipped, that no Instance was Failed.
+func (r *Reconciler) recordResetOutcome(target client.Object, ir *v1beta1.InferenceReplica, reset []int32, skipped []resetSkip) {
+	if r.Recorder == nil {
+		return
+	}
+	if len(reset) > 0 {
+		r.Recorder.Eventf(target, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesReset),
+			"InferenceReplica %s/%s component=%s: reset instance(s) %s at operator request (%s annotation): pods deleted and preserved operation cleared; the lifecycle passes rebuild them",
+			ir.Namespace, ir.Name, ir.Spec.Component, formatIndices(reset), constants.ResetInstancesAnnotationKey)
+	}
+	switch {
+	case len(skipped) > 0:
+		r.Recorder.Eventf(target, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesResetSkipped),
+			"InferenceReplica %s/%s component=%s: reset skipped for instance(s) %s",
+			ir.Namespace, ir.Name, ir.Spec.Component, formatSkips(skipped))
+	case len(reset) == 0:
+		r.Recorder.Eventf(target, corev1.EventTypeNormal, string(workloadtypes.EventReasonInstancesResetSkipped),
+			"InferenceReplica %s/%s component=%s: reset requested for all instances but none is Failed; nothing to reset",
+			ir.Namespace, ir.Name, ir.Spec.Component)
+	}
 }
 
 // resetInstances tears down every requested Instance that is Failed,
@@ -137,6 +151,61 @@ func (r *Reconciler) consumeResetInstancesRequest(ctx context.Context, log logr.
 // in. Stops at the first error; Instances already handled stay
 // consistent because every step is idempotent.
 func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1beta1.InferenceReplica, req resetInstancesRequest) (reset []int32, skipped []resetSkip, err error) {
+	var candidates []int32
+	candidates, skipped = resetCandidates(ir, req)
+	if len(candidates) == 0 {
+		return nil, skipped, nil
+	}
+
+	key := buildKey(ir)
+	expectations := r.Expectations
+	if expectations == nil {
+		expectations = workloadtypes.DefaultExpectations
+	}
+	mutateInstance := buildMutateInstance(r.statusWriter(), r.liveReader(), ir)
+	for _, idx := range candidates {
+		// Live list: a stale cache view of "pods gone" must not skip a
+		// pod the apiserver still holds.
+		pods, lerr := query.LiveListPodsForInstance(ctx, r.APIReader, key.Namespace, key.OwnerName, key.Component, idx)
+		if lerr != nil {
+			return reset, skipped, fmt.Errorf("list pods (instance=%d): %w", idx, lerr)
+		}
+		// Serving capacity is never removed here: a Failed Instance still
+		// in rotation is the rollout machinery's to drain.
+		if anyPodServing(pods) {
+			skipped = append(skipped, resetSkip{index: idx, reason: "still serving"})
+			continue
+		}
+		deleted, derr := r.deleteInstancePods(ctx, expectations, key, idx, pods)
+		if derr != nil {
+			return reset, skipped, derr
+		}
+
+		// The transition write itself belongs to the workload layer; the
+		// seam re-checks Phase=Failed and the Operation owner on the
+		// fresh read.
+		cleared, merr := status.ClearFailedInstanceOperation(ctx, mutateInstance, idx)
+		if merr != nil {
+			return reset, skipped, fmt.Errorf("clear preserved operation (instance=%d): %w", idx, merr)
+		}
+
+		if deleted == 0 && !cleared {
+			skipped = append(skipped, resetSkip{index: idx, reason: "nothing to reset"})
+			continue
+		}
+		log.Info("Failed Instance reset at operator request",
+			"instance", idx, "podsDeleted", deleted, "operationCleared", cleared)
+		reset = append(reset, idx)
+	}
+	return reset, skipped, nil
+}
+
+// resetCandidates sorts the requested Instances into the ones the reset may
+// tear down and the ones it leaves alone with the reason: an index no row
+// carries, a row that is neither Failed nor an Update attempt waiting in
+// place, and an attempt another owner continues. "all" walks the Failed rows
+// in index order; a list keeps the request's order.
+func resetCandidates(ir *v1beta1.InferenceReplica, req resetInstancesRequest) (candidates []int32, skipped []resetSkip) {
 	statuses := make(map[int32]*v1beta1.OMENativeInstanceStatus, len(ir.Status.InstanceStatuses))
 	for i := range ir.Status.InstanceStatuses {
 		statuses[ir.Status.InstanceStatuses[i].Index] = &ir.Status.InstanceStatuses[i]
@@ -145,7 +214,6 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 	// classify admits a Failed Instance whose parked attempt the reset
 	// owns; a continuation owned by the rollout or migration machinery is
 	// skipped with its owner named.
-	var candidates []int32
 	classify := func(idx int32, s *v1beta1.OMENativeInstanceStatus) {
 		row := v1beta1convert.InstanceStatusToWorkload(*s)
 		if !status.ResetOwnsRow(&row) {
@@ -172,75 +240,43 @@ func (r *Reconciler) resetInstances(ctx context.Context, log logr.Logger, ir *v1
 		for _, idx := range failed {
 			classify(idx, statuses[idx])
 		}
-	} else {
-		for _, idx := range req.indices {
-			s, ok := statuses[idx]
-			switch {
-			case !ok:
-				skipped = append(skipped, resetSkip{index: idx, reason: "no such instance"})
-			case !addressable(s):
-				skipped = append(skipped, resetSkip{index: idx, reason: "Phase=" + string(s.Phase)})
-			default:
-				classify(idx, s)
-			}
+		return candidates, skipped
+	}
+	for _, idx := range req.indices {
+		s, ok := statuses[idx]
+		switch {
+		case !ok:
+			skipped = append(skipped, resetSkip{index: idx, reason: "no such instance"})
+		case !addressable(s):
+			skipped = append(skipped, resetSkip{index: idx, reason: "Phase=" + string(s.Phase)})
+		default:
+			classify(idx, s)
 		}
 	}
-	if len(candidates) == 0 {
-		return nil, skipped, nil
-	}
+	return candidates, skipped
+}
 
-	key := buildKey(ir)
-	expectations := r.Expectations
-	if expectations == nil {
-		expectations = workloadtypes.DefaultExpectations
-	}
-	mutateInstance := buildMutateInstance(r.statusWriter(), r.liveReader(), ir)
-	for _, idx := range candidates {
-		// Live list: a stale cache view of "pods gone" must not skip a
-		// pod the apiserver still holds.
-		pods, lerr := query.LiveListPodsForInstance(ctx, r.APIReader, key.Namespace, key.OwnerName, key.Component, idx)
-		if lerr != nil {
-			return reset, skipped, fmt.Errorf("list pods (instance=%d): %w", idx, lerr)
-		}
-		// Serving capacity is never removed here: a Failed Instance still
-		// in rotation is the rollout machinery's to drain.
-		if anyPodServing(pods) {
-			skipped = append(skipped, resetSkip{index: idx, reason: "still serving"})
+// deleteInstancePods deletes every pod of the Instance that is not already
+// terminating and counts the deletes that landed. The expectation is
+// recorded before each delete and taken back when the delete fails; a pod
+// that was already gone is not counted and stops nothing.
+func (r *Reconciler) deleteInstancePods(ctx context.Context, expectations *workloadtypes.Expectations, key workloadtypes.Key, idx int32, pods []*corev1.Pod) (int, error) {
+	deleted := 0
+	for _, pod := range pods {
+		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		deleted := 0
-		for _, pod := range pods {
-			if pod.DeletionTimestamp != nil {
+		expectations.ExpectDeletes(key.Namespace, key.OwnerName, key.Component, idx, 1)
+		if derr := r.Delete(ctx, pod); derr != nil {
+			expectations.ObservedDelete(key.Namespace, key.OwnerName, key.Component, idx)
+			if apierrors.IsNotFound(derr) {
 				continue
 			}
-			expectations.ExpectDeletes(key.Namespace, key.OwnerName, key.Component, idx, 1)
-			if derr := r.Delete(ctx, pod); derr != nil {
-				expectations.ObservedDelete(key.Namespace, key.OwnerName, key.Component, idx)
-				if apierrors.IsNotFound(derr) {
-					continue
-				}
-				return reset, skipped, fmt.Errorf("delete pod %s/%s (instance=%d): %w", pod.Namespace, pod.Name, idx, derr)
-			}
-			deleted++
+			return deleted, fmt.Errorf("delete pod %s/%s (instance=%d): %w", pod.Namespace, pod.Name, idx, derr)
 		}
-
-		// The transition write itself belongs to the workload layer; the
-		// seam re-checks Phase=Failed and the Operation owner on the
-		// fresh read.
-		cleared, merr := status.ClearFailedInstanceOperation(ctx, mutateInstance, idx)
-		if merr != nil {
-			return reset, skipped, fmt.Errorf("clear preserved operation (instance=%d): %w", idx, merr)
-		}
-
-		if deleted == 0 && !cleared {
-			skipped = append(skipped, resetSkip{index: idx, reason: "nothing to reset"})
-			continue
-		}
-		log.Info("Failed Instance reset at operator request",
-			"instance", idx, "podsDeleted", deleted, "operationCleared", cleared)
-		reset = append(reset, idx)
+		deleted++
 	}
-	return reset, skipped, nil
+	return deleted, nil
 }
 
 // anyPodServing reports whether any pod is in the serving rotation

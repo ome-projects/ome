@@ -3,83 +3,67 @@ package replica
 import (
 	"fmt"
 
+	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
 	"sigs.k8s.io/ome/internal/ome-agent/replica/replicator"
+	"sigs.k8s.io/ome/pkg/logging"
 	"sigs.k8s.io/ome/pkg/utils/storage"
 )
 
+// storagePair is the storage kinds of a replication's source and target.
+type storagePair struct {
+	source, target storage.StorageType
+}
+
+// replicators holds the replicator of every supported storage pair.
+var replicators = map[storagePair]func(logging.Interface, replicator.Dependencies, common.ReplicationInput) replicator.Replicator{
+	{storage.StorageTypeHuggingFace, storage.StorageTypeOCI}: func(logger logging.Interface, dependencies replicator.Dependencies, input common.ReplicationInput) replicator.Replicator {
+		return &replicator.HFToOCIReplicator{Logger: logger, Dependencies: dependencies, ReplicationInput: input}
+	},
+	{storage.StorageTypeOCI, storage.StorageTypeOCI}: func(logger logging.Interface, dependencies replicator.Dependencies, input common.ReplicationInput) replicator.Replicator {
+		return &replicator.OCIToOCIReplicator{Logger: logger, Dependencies: dependencies, ReplicationInput: input}
+	},
+	{storage.StorageTypePVC, storage.StorageTypeOCI}: func(logger logging.Interface, dependencies replicator.Dependencies, input common.ReplicationInput) replicator.Replicator {
+		return &replicator.PVCToOCIReplicator{Logger: logger, Dependencies: dependencies, ReplicationInput: input}
+	},
+	{storage.StorageTypeHuggingFace, storage.StorageTypePVC}: func(logger logging.Interface, dependencies replicator.Dependencies, input common.ReplicationInput) replicator.Replicator {
+		return &replicator.HFToPVCReplicator{Logger: logger, Dependencies: dependencies, ReplicationInput: input}
+	},
+	{storage.StorageTypeOCI, storage.StorageTypePVC}: func(logger logging.Interface, dependencies replicator.Dependencies, input common.ReplicationInput) replicator.Replicator {
+		return &replicator.OCIToPVCReplicator{Logger: logger, Dependencies: dependencies, ReplicationInput: input}
+	},
+	{storage.StorageTypePVC, storage.StorageTypePVC}: func(logger logging.Interface, dependencies replicator.Dependencies, input common.ReplicationInput) replicator.Replicator {
+		return &replicator.PVCToPVCReplicator{Logger: logger, Dependencies: dependencies, ReplicationInput: input}
+	},
+}
+
+// NewReplicator picks the replicator of the agent's storage pair and hands it the agent's
+// dependencies.
 func NewReplicator(r *ReplicaAgent) (replicator.Replicator, error) {
-	sourceStorageType := r.ReplicationInput.SourceStorageType
-	targetStorageType := r.ReplicationInput.TargetStorageType
-	switch {
-	case sourceStorageType == storage.StorageTypeHuggingFace && targetStorageType == storage.StorageTypeOCI:
-		return &replicator.HFToOCIReplicator{
-			Logger: r.Logger,
-			Config: replicator.HFToOCIReplicatorConfig{
-				LocalPath:                      r.Config.LocalPath,
-				NumConnections:                 r.Config.NumConnections,
-				ChecksumConfig:                 r.Config.Target.ChecksumConfig,
-				HubClient:                      r.Config.Source.HubClient,
-				OCIOSDataStore:                 r.Config.Target.OCIOSDataStore,
-				HFDownloadTimeout:              r.Config.HFDownloadTimeout,
-				HFDownloadStaleProgressTimeout: r.Config.HFDownloadStaleProgressTimeout,
-			},
-			ReplicationInput: r.ReplicationInput,
-		}, nil
-	case sourceStorageType == storage.StorageTypeOCI && targetStorageType == storage.StorageTypeOCI:
-		return &replicator.OCIToOCIReplicator{
-			Logger: r.Logger,
-			Config: replicator.OCIToOCIReplicatorConfig{
-				LocalPath:            r.Config.LocalPath,
-				NumConnections:       r.Config.NumConnections,
-				ChecksumConfig:       r.Config.Target.ChecksumConfig,
-				SourceOCIOSDataStore: r.Config.Source.OCIOSDataStore,
-				TargetOCIOSDataStore: r.Config.Target.OCIOSDataStore,
-			},
-			ReplicationInput: r.ReplicationInput,
-		}, nil
-	case sourceStorageType == storage.StorageTypePVC && targetStorageType == storage.StorageTypeOCI:
-		return &replicator.PVCToOCIReplicator{
-			Logger: r.Logger,
-			Config: replicator.PVCToOCIReplicatorConfig{
-				LocalPath:      r.Config.LocalPath,
-				NumConnections: r.Config.NumConnections,
-				ChecksumConfig: r.Config.Target.ChecksumConfig,
-				OCIOSDataStore: r.Config.Target.OCIOSDataStore,
-			},
-			ReplicationInput: r.ReplicationInput,
-		}, nil
-	case sourceStorageType == storage.StorageTypeHuggingFace && targetStorageType == storage.StorageTypePVC:
-		return &replicator.HFToPVCReplicator{
-			Logger: r.Logger,
-			Config: replicator.HFToPVCReplicatorConfig{
-				LocalPath:                      r.Config.LocalPath,
-				HubClient:                      r.Config.Source.HubClient,
-				HFDownloadTimeout:              r.Config.HFDownloadTimeout,
-				HFDownloadStaleProgressTimeout: r.Config.HFDownloadStaleProgressTimeout,
-			},
-			ReplicationInput: r.ReplicationInput,
-		}, nil
-	case sourceStorageType == storage.StorageTypeOCI && targetStorageType == storage.StorageTypePVC:
-		return &replicator.OCIToPVCReplicator{
-			Logger: r.Logger,
-			Config: replicator.OCIToPVCReplicatorConfig{
-				LocalPath:      r.Config.LocalPath,
-				NumConnections: r.Config.NumConnections,
-				OCIOSDataStore: r.Config.Source.OCIOSDataStore,
-			},
-			ReplicationInput: r.ReplicationInput,
-		}, nil
-	case sourceStorageType == storage.StorageTypePVC && targetStorageType == storage.StorageTypePVC:
-		return &replicator.PVCToPVCReplicator{
-			Logger: r.Logger,
-			Config: replicator.PVCToPVCReplicatorConfig{
-				LocalPath:           r.Config.LocalPath,
-				SourcePVCFileSystem: r.Config.Source.PVCFileSystem,
-				TargetPVCFileSystem: r.Config.Target.PVCFileSystem,
-			},
-			ReplicationInput: r.ReplicationInput,
-		}, nil
-	default:
-		return nil, fmt.Errorf("unsupported replication: %s → %s", sourceStorageType, targetStorageType)
+	pair := storagePair{r.ReplicationInput.SourceStorageType, r.ReplicationInput.TargetStorageType}
+	build, ok := replicators[pair]
+	if !ok {
+		return nil, fmt.Errorf("unsupported replication: %s → %s", pair.source, pair.target)
 	}
+	return build(r.Logger, dependenciesFrom(r.Config), r.ReplicationInput), nil
+}
+
+// dependenciesFrom collects what the replicators need from the agent's config. A hub client
+// that is not configured stays nil rather than becoming a non-nil interface around a nil pointer.
+func dependenciesFrom(config Config) replicator.Dependencies {
+	dependencies := replicator.Dependencies{
+		LocalPath:            config.LocalPath,
+		Connections:          config.NumConnections,
+		Checksum:             config.Target.ChecksumConfig,
+		DownloadTimeout:      config.HFDownloadTimeout,
+		StaleProgressTimeout: config.HFDownloadStaleProgressTimeout,
+		SourceStore:          config.Source.OCIOSDataStore,
+		TargetStore:          config.Target.OCIOSDataStore,
+		SourceFiles:          config.Source.PVCFileSystem,
+		TargetFiles:          config.Target.PVCFileSystem,
+		Transfer:             replicator.MultipartTransfer{},
+	}
+	if config.Source.HubClient != nil {
+		dependencies.HubClient = config.Source.HubClient
+	}
+	return dependencies
 }

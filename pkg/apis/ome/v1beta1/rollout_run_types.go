@@ -8,7 +8,10 @@
 // and the step counters can never be observed out of sync. Executors consume
 // the pinned plan for the duration of the run; spec and policy edits are
 // inert mid-run (surfaced via the RolloutPlanDrift condition) and take effect
-// at the next run open.
+// at the next run open. Three facts are read from the spec as it is now by
+// the coordination gates alone: a rolling or blue-green group's ratio rule
+// (maintainRatio), a rolling group's budgets (maxSurge, maxUnavailable), and
+// whether the spec still declares the group.
 package v1beta1
 
 import (
@@ -94,7 +97,9 @@ type RolloutRun struct {
 	TargetRevisions []RolloutRunTarget `json:"targetRevisions,omitempty"`
 
 	// Plan is the effective groups list, frozen for this run. Executors index
-	// it — never the live spec — while the run is open.
+	// it — never the live spec — while the run is open; the coordination
+	// gates read a group's ratio rule, a rolling group's budgets and the
+	// group's presence from the live spec.
 	Plan RolloutRunPlan `json:"plan"`
 }
 
@@ -152,6 +157,11 @@ type RolloutRunGroup struct {
 // RolloutRunRecord is the bounded record of a closed run.
 type RolloutRunRecord struct {
 	Outcome RolloutRunOutcome `json:"outcome"`
+	// RunID is the id the run carried while it was open. The next run folds
+	// it into its own id, so two runs of one service never share an id even
+	// when one closes and the next opens within the same second.
+	// +optional
+	RunID string `json:"runID,omitempty"`
 	// +optional
 	OpenedAt *metav1.Time `json:"openedAt,omitempty"`
 	// +optional
@@ -232,6 +242,10 @@ const (
 	RolloutPlanReasonProgressionMismatch = "ProgressionMismatch"
 	RolloutPlanReasonPlanInvalid         = "PlanInvalid"
 	RolloutPlanReasonProviderUnbound     = "ProviderUnbound"
+	// RolloutPlanReasonRouteProviderUnsupported: a canary group's traffic
+	// percentages need a capability the configured route provider declares
+	// it does not have, so the run does not open.
+	RolloutPlanReasonRouteProviderUnsupported = "RouteProviderUnsupported"
 
 	// RolloutPlanDriftCondition is True while the live render of the effective
 	// plan differs from the pinned one: an edit landed mid-run and is inert

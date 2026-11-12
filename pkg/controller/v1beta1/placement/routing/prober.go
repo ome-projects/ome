@@ -9,13 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
@@ -81,11 +79,28 @@ type Prober struct {
 	Client           *http.Client
 	Clock            clock.Clock
 	MaxResponseBytes int64
-	Log              logr.Logger
 
 	mu        sync.RWMutex
 	state     map[probeIdentity]*targetProbeState
 	nextToken uint64
+}
+
+// checkObserverInputs refuses a missing executor, HTTP client or clock and a
+// response bound that is not positive; kind names the observer in the message.
+func checkObserverInputs(kind string, executor *ObserverExecutor, client *http.Client, clk clock.Clock, maxResponseBytes int64) error {
+	if executor == nil {
+		return fmt.Errorf("%s observer executor is nil", kind)
+	}
+	if client == nil {
+		return fmt.Errorf("%s HTTP client is nil", kind)
+	}
+	if clk == nil {
+		return fmt.Errorf("%s clock is nil", kind)
+	}
+	if maxResponseBytes <= 0 {
+		return fmt.Errorf("%s maximum response bytes must be positive, got %d", kind, maxResponseBytes)
+	}
+	return nil
 }
 
 // NewProber builds a reconcile-driven prober with explicit process-wide
@@ -95,26 +110,15 @@ func NewProber(
 	client *http.Client,
 	clk clock.Clock,
 	maxResponseBytes int64,
-	log logr.Logger,
 ) (*Prober, error) {
-	if executor == nil {
-		return nil, errors.New("probe observer executor is nil")
-	}
-	if client == nil {
-		return nil, errors.New("probe HTTP client is nil")
-	}
-	if clk == nil {
-		return nil, errors.New("probe clock is nil")
-	}
-	if maxResponseBytes <= 0 {
-		return nil, fmt.Errorf("probe maximum response bytes must be positive, got %d", maxResponseBytes)
+	if err := checkObserverInputs("probe", executor, client, clk, maxResponseBytes); err != nil {
+		return nil, err
 	}
 	return &Prober{
 		Executor:         executor,
 		Client:           client,
 		Clock:            clk,
 		MaxResponseBytes: maxResponseBytes,
-		Log:              log,
 		state:            map[probeIdentity]*targetProbeState{},
 	}, nil
 }
@@ -134,39 +138,70 @@ func NewObserverClient() *http.Client {
 // returns the delay until its earliest absolute probe deadline. A zero delay
 // with an enabled non-empty request means the deadline is already due.
 func (p *Prober) Reconcile(ctx context.Context, req ProbeReconcileRequest) (time.Duration, error) {
-	if p == nil {
-		return 0, errors.New("prober is nil")
-	}
-	if ctx == nil {
-		return 0, errors.New("probe reconcile context is nil")
-	}
-	if req.OwnerUID == "" {
-		return 0, errors.New("probe reconcile owner UID is empty")
-	}
-	if req.Map.Namespace == "" || req.Map.Name == "" {
-		return 0, errors.New("probe reconcile TrafficMap namespace and name are required")
+	if err := p.checkReconcileInputs(ctx, req); err != nil {
+		return 0, err
 	}
 	if !req.Policy.IsEnabled() {
 		p.Forget(req.Map)
 		return 0, nil
 	}
-	if err := req.Policy.Probe.Validate(); err != nil {
+	if err := checkProbePolicy(req.Policy); err != nil {
 		return 0, err
 	}
-	wantDigest, err := probePolicyDigest(req.Policy.Probe)
-	if err != nil {
-		return 0, err
-	}
-	if req.Policy.PolicyDigest != wantDigest {
-		return 0, fmt.Errorf("probe policy digest %q does not match effective policy", req.Policy.PolicyDigest)
-	}
-
 	targets, err := normalizeProbeTargets(req)
 	if err != nil {
 		return 0, err
 	}
-	jobs := p.prepare(req, targets)
+	accepted, submitErr := p.submitProbes(ctx, req, p.prepare(req, targets))
 	var reconcileErrs []error
+	if submitErr != nil {
+		reconcileErrs = append(reconcileErrs, submitErr)
+	}
+	reconcileErrs = append(reconcileErrs, p.awaitProbes(ctx, accepted)...)
+	if len(reconcileErrs) != 0 {
+		return 0, errors.Join(reconcileErrs...)
+	}
+	return p.nextDelay(req.OwnerUID, req.Map, targets, p.Clock.Now()), nil
+}
+
+// checkReconcileInputs refuses a nil prober or context and a request that
+// does not name its owner and TrafficMap.
+func (p *Prober) checkReconcileInputs(ctx context.Context, req ProbeReconcileRequest) error {
+	if p == nil {
+		return errors.New("prober is nil")
+	}
+	if ctx == nil {
+		return errors.New("probe reconcile context is nil")
+	}
+	if req.OwnerUID == "" {
+		return errors.New("probe reconcile owner UID is empty")
+	}
+	if req.Map.Namespace == "" || req.Map.Name == "" {
+		return errors.New("probe reconcile TrafficMap namespace and name are required")
+	}
+	return nil
+}
+
+// checkProbePolicy refuses an enabled policy whose probe configuration is
+// invalid or whose recorded digest is not the digest of that configuration.
+func checkProbePolicy(policy ResolvedProbePolicy) error {
+	if err := policy.Probe.Validate(); err != nil {
+		return err
+	}
+	wantDigest, err := probePolicyDigest(policy.Probe)
+	if err != nil {
+		return err
+	}
+	if policy.PolicyDigest != wantDigest {
+		return fmt.Errorf("probe policy digest %q does not match effective policy", policy.PolicyDigest)
+	}
+	return nil
+}
+
+// submitProbes hands every prepared probe to the executor, in order, and
+// returns the accepted ones. The first refusal ends the pass: that probe and
+// every later one are released so the next pass may probe them again.
+func (p *Prober) submitProbes(ctx context.Context, req ProbeReconcileRequest, jobs []scheduledProbe) ([]*scheduledProbe, error) {
 	accepted := make([]*scheduledProbe, 0, len(jobs))
 	for i := range jobs {
 		job := &jobs[i]
@@ -176,29 +211,29 @@ func (p *Prober) Reconcile(ctx context.Context, req ProbeReconcileRequest) (time
 			return nil
 		})
 		if submitErr != nil {
-			p.abandon(job.identity, job.generation)
-			reconcileErrs = append(reconcileErrs,
-				fmt.Errorf("submit probe for cluster %q: %w", job.target.Cluster, submitErr))
-			for j := i + 1; j < len(jobs); j++ {
+			for j := i; j < len(jobs); j++ {
 				p.abandon(jobs[j].identity, jobs[j].generation)
 			}
-			break
+			return accepted, fmt.Errorf("submit probe for cluster %q: %w", job.target.Cluster, submitErr)
 		}
 		job.future = future
 		accepted = append(accepted, job)
 	}
+	return accepted, nil
+}
 
+// awaitProbes waits for every accepted probe. A probe whose wait ends before
+// its result was recorded is released so the next pass may probe it again,
+// and the wait's error is reported.
+func (p *Prober) awaitProbes(ctx context.Context, accepted []*scheduledProbe) []error {
+	var waitErrs []error
 	for _, job := range accepted {
 		if waitErr := job.future.Wait(ctx); waitErr != nil && !job.recorded.Load() {
 			p.abandon(job.identity, job.generation)
-			reconcileErrs = append(reconcileErrs,
-				fmt.Errorf("wait for probe of cluster %q: %w", job.target.Cluster, waitErr))
+			waitErrs = append(waitErrs, fmt.Errorf("wait for probe of cluster %q: %w", job.target.Cluster, waitErr))
 		}
 	}
-	if len(reconcileErrs) != 0 {
-		return 0, errors.Join(reconcileErrs...)
-	}
-	return p.nextDelay(req.OwnerUID, req.Map, targets, p.Clock.Now()), nil
+	return waitErrs
 }
 
 type scheduledProbe struct {
@@ -553,47 +588,6 @@ func CanonicalEndpoint(raw string) (string, error) {
 	parsed.Path = decodedPath
 	parsed.RawPath = escapedPath
 	return parsed.String(), nil
-}
-
-// TargetsFromTrafficMaps builds the observer target list from addressable
-// TrafficMap entries.
-func TargetsFromTrafficMaps(maps []v1beta1.TrafficMap) []Target {
-	var targets []Target
-	for i := range maps {
-		trafficMap := &maps[i]
-		ownerUID, owned := trafficMapOwnerUID(trafficMap)
-		if !owned {
-			continue
-		}
-		for j := range trafficMap.Spec.Entries {
-			entry := &trafficMap.Spec.Entries[j]
-			if entry.Endpoint == nil || entry.Endpoint.Host == "" {
-				continue
-			}
-			endpoint := entry.Endpoint.String()
-			if canonical, err := CanonicalEndpoint(endpoint); err == nil {
-				endpoint = canonical
-			}
-			var policyDigest string
-			if entry.Probe != nil {
-				policyDigest = entry.Probe.PolicyDigest
-			}
-			targets = append(targets, Target{
-				OwnerUID:     ownerUID,
-				Map:          types.NamespacedName{Name: trafficMap.Name, Namespace: trafficMap.Namespace},
-				Cluster:      entry.Cluster,
-				URL:          endpoint,
-				PolicyDigest: policyDigest,
-			})
-		}
-	}
-	sort.Slice(targets, func(i, j int) bool {
-		if targets[i].Map != targets[j].Map {
-			return targets[i].Map.String() < targets[j].Map.String()
-		}
-		return targets[i].Cluster < targets[j].Cluster
-	})
-	return targets
 }
 
 func trafficMapOwnerUID(trafficMap *v1beta1.TrafficMap) (types.UID, bool) {

@@ -5,6 +5,8 @@ package leaderelection
 import (
 	"flag"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"k8s.io/client-go/tools/leaderelection"
@@ -78,6 +80,82 @@ func (t *Timing) Validate() error {
 			"otherwise a window holds no complete attempt", t.RenewDeadline, leaderelection.JitterFactor, jittered)
 	}
 	return nil
+}
+
+// ValidateReleaseOnCancel refuses a timing under which a standby can take the
+// lease while a leader whose renewals fail still reconciles. Counted from the
+// last renewal the standby reads, that leader can wait one request timeout for
+// the reply, one retry period, one renew deadline of failed retries and one
+// more renew deadline to release the lease. The lease, in the whole seconds
+// client-go writes, must outlast that sum. All three durations are required,
+// because this package does not copy controller-runtime's defaults.
+func (t *Timing) ValidateReleaseOnCancel() error {
+	flags := []struct {
+		name  string
+		value time.Duration
+	}{
+		{"--leader-elect-lease-duration", t.LeaseDuration},
+		{"--leader-elect-renew-deadline", t.RenewDeadline},
+		{"--leader-elect-retry-period", t.RetryPeriod},
+	}
+	var notPositive []string
+	for _, f := range flags {
+		if f.value <= 0 {
+			notPositive = append(notPositive, f.name)
+		}
+	}
+	if len(notPositive) > 0 {
+		target := "positive durations"
+		if len(notPositive) == 1 {
+			target = "a positive duration"
+		}
+		return fmt.Errorf("--leader-elect-release-on-cancel needs --leader-elect-lease-duration, "+
+			"--leader-elect-renew-deadline and --leader-elect-retry-period, because it checks the lease against "+
+			"the other two. Set %s to %s", joinNames(notPositive), target)
+	}
+	timeout := requestTimeout(t.RenewDeadline)
+	lease := wholeSeconds(t.LeaseDuration)
+	acting := timeout + t.RetryPeriod + 2*t.RenewDeadline
+	if lease > acting {
+		return nil
+	}
+	fraction := ""
+	if lease != t.LeaseDuration {
+		fraction = fmt.Sprintf(" client-go stores the lease in whole seconds, so %s counts as %s.",
+			seconds(t.LeaseDuration), seconds(lease))
+	}
+	return fmt.Errorf("--leader-elect-release-on-cancel needs --leader-elect-lease-duration above %s, and it is %s: "+
+		"%s (request timeout, half of --leader-elect-renew-deadline and at least 1s) + %s "+
+		"(--leader-elect-retry-period) + %s (twice --leader-elect-renew-deadline).%s Raise "+
+		"--leader-elect-lease-duration above %s or lower --leader-elect-renew-deadline",
+		seconds(acting), seconds(lease), seconds(timeout), seconds(t.RetryPeriod), seconds(2*t.RenewDeadline),
+		fraction, seconds(acting))
+}
+
+// requestTimeout is the timeout controller-runtime gives each leader election
+// request: half the renew deadline, and at least one second.
+func requestTimeout(renewDeadline time.Duration) time.Duration {
+	return max(renewDeadline/2, time.Second)
+}
+
+// wholeSeconds is the lease client-go writes, which drops any fraction of a
+// second.
+func wholeSeconds(lease time.Duration) time.Duration {
+	return lease.Truncate(time.Second)
+}
+
+// seconds prints d in seconds alone, such as 108s or 1.5s, where
+// Duration.String prints 1m48s, so the amounts in an error add up as written.
+func seconds(d time.Duration) string {
+	return strconv.FormatFloat(d.Seconds(), 'f', -1, 64) + "s"
+}
+
+// joinNames lists names as "a", "a and b" or "a, b and c".
+func joinNames(names []string) string {
+	if len(names) == 1 {
+		return names[0]
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
 }
 
 // Apply copies the supplied durations onto opts, leaving any that were not

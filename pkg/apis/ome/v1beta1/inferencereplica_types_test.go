@@ -148,6 +148,7 @@ func columnarStatusFixture() InferenceReplicaStatus {
 	encoding := InstanceStatusEncodingColumnarV2
 	admitted := "0-3,7"
 	activeOrdinalOne := "1"
+	readySinceIndexes := "0-3"
 	exitCode := int32(143)
 	return InferenceReplicaStatus{
 		Replicas:               5,
@@ -174,13 +175,15 @@ func columnarStatusFixture() InferenceReplicaStatus {
 			AvailablePodCounts: []InstanceStatusCountGroup{{Value: 1, Indexes: "0-3"}},
 			Admitted:           &admitted,
 			ActiveOrdinalOne:   &activeOrdinalOne,
+			ReadySinceBase:     &at,
+			ReadySinceIndexes:  &readySinceIndexes,
+			ReadySinceOffsets:  []int32{0, 11, 22, 3600},
 			Entries: []InstanceStatusEntry{
 				{
 					Index: 3,
 					Conditions: []metav1.Condition{{
 						Type: "AllPodsReady", Status: metav1.ConditionTrue, Reason: "Ready", LastTransitionTime: at,
 					}},
-					ReadySince: &at,
 				},
 				{
 					Index: 7,
@@ -250,6 +253,9 @@ func TestInstanceStatusColumns_JSONShape(t *testing.T) {
 		AvailablePodCounts: []InstanceStatusCountGroup{{Value: 1, Indexes: "0-499"}},
 		Admitted:           &admitted,
 		ActiveOrdinalOne:   &activeOrdinalOne,
+		ReadySinceBase:     &at,
+		ReadySinceIndexes:  &admitted,
+		ReadySinceOffsets:  []int32{0, 11},
 		Entries: []InstanceStatusEntry{{
 			Index:       9,
 			LastFailure: &InstanceTermination{PodName: "example-engine-9", ContainerName: "ome-container", Reason: "Error", ExitCode: &exitCode, Time: at},
@@ -267,6 +273,7 @@ func TestInstanceStatusColumns_JSONShape(t *testing.T) {
 		`"servingPodCounts":[{"value":1,"indexes":"0-499"}],` +
 		`"availablePodCounts":[{"value":1,"indexes":"0-499"}],` +
 		`"admitted":"0-499","activeOrdinalOne":"6,43,175",` +
+		`"readySinceBase":"2026-01-02T03:04:05Z","readySinceIndexes":"0-499","readySinceOffsets":[0,11],` +
 		`"entries":[{"index":9,"lastFailure":{"podName":"example-engine-9","containerName":"ome-container","reason":"Error","exitCode":143,"time":"2026-01-02T03:04:05Z"}}]}`
 	if string(data) != want {
 		t.Errorf("InstanceStatusColumns JSON shape changed:\n want %s\n got  %s", want, data)
@@ -297,13 +304,14 @@ func TestInstanceStatusColumns_ExplicitEmptyIsDistinguishable(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"members":"0","phases":[{"value":"Ready","indexes":"0"}]}`), &absent); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if err := json.Unmarshal([]byte(`{"members":"0","phases":[{"value":"Ready","indexes":"0"}],"rowOrder":[],"entries":[],"admitted":""}`), &explicit); err != nil {
+	if err := json.Unmarshal([]byte(`{"members":"0","phases":[{"value":"Ready","indexes":"0"}],"rowOrder":[],"entries":[],"admitted":"","readySinceOffsets":[]}`), &explicit); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if absent.RowOrder != nil || absent.Entries != nil || absent.Admitted != nil {
+	if absent.RowOrder != nil || absent.Entries != nil || absent.Admitted != nil || absent.ReadySinceOffsets != nil {
 		t.Fatalf("absent fields decoded as present: %+v", absent)
 	}
-	if explicit.RowOrder == nil || len(explicit.RowOrder) != 0 || explicit.Entries == nil || len(explicit.Entries) != 0 || explicit.Admitted == nil || *explicit.Admitted != "" {
+	if explicit.RowOrder == nil || len(explicit.RowOrder) != 0 || explicit.Entries == nil || len(explicit.Entries) != 0 || explicit.Admitted == nil || *explicit.Admitted != "" ||
+		explicit.ReadySinceOffsets == nil || len(explicit.ReadySinceOffsets) != 0 {
 		t.Fatalf("explicit empty fields decoded as absent: %+v", explicit)
 	}
 }

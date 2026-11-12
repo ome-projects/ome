@@ -125,18 +125,29 @@ func buildServicePorts(podSpec *corev1.PodSpec, appProtocols map[string]string) 
 
 	container := podSpec.Containers[0]
 	if len(container.Ports) == 0 {
-		return []corev1.ServicePort{buildDefaultServicePort(container.Name, appProtocols[container.Name])}
+		return []corev1.ServicePort{buildDefaultServicePort(container.Name, AppProtocolForPort(appProtocols, container.Name))}
 	}
 
 	servicePorts := make([]corev1.ServicePort, 0, len(container.Ports))
 	for _, port := range container.Ports {
-		servicePorts = append(servicePorts, buildServicePort(port, appProtocols[port.Name]))
+		servicePorts = append(servicePorts, buildServicePort(port, AppProtocolForPort(appProtocols, port.Name)))
 	}
 	return servicePorts
 }
 
+// AppProtocolForPort returns the appProtocol declared for the Service port
+// named exactly portName, or nil when none or an empty value is declared.
+// The stable Service and BuildPerRevisionRoutingService both use this rule.
+func AppProtocolForPort(appProtocols map[string]string, portName string) *string {
+	appProtocol := appProtocols[portName]
+	if appProtocol == "" {
+		return nil
+	}
+	return &appProtocol
+}
+
 // buildServicePort creates a ServicePort from a ContainerPort
-func buildServicePort(containerPort corev1.ContainerPort, appProtocol string) corev1.ServicePort {
+func buildServicePort(containerPort corev1.ContainerPort, appProtocol *string) corev1.ServicePort {
 	protocol := containerPort.Protocol
 	if protocol == "" {
 		protocol = corev1.ProtocolTCP
@@ -149,16 +160,14 @@ func buildServicePort(containerPort corev1.ContainerPort, appProtocol string) co
 			Type:   intstr.Int,
 			IntVal: containerPort.ContainerPort,
 		},
-		Protocol: protocol,
-	}
-	if appProtocol != "" {
-		servicePort.AppProtocol = &appProtocol
+		Protocol:    protocol,
+		AppProtocol: appProtocol,
 	}
 	return servicePort
 }
 
 // buildDefaultServicePort creates a default ServicePort
-func buildDefaultServicePort(name, appProtocol string) corev1.ServicePort {
+func buildDefaultServicePort(name string, appProtocol *string) corev1.ServicePort {
 	port, _ := strconv.ParseInt(constants.InferenceServiceDefaultHttpPort, 10, 32)
 	servicePort := corev1.ServicePort{
 		Name: name,
@@ -167,10 +176,8 @@ func buildDefaultServicePort(name, appProtocol string) corev1.ServicePort {
 			Type:   intstr.Int,
 			IntVal: int32(port),
 		},
-		Protocol: corev1.ProtocolTCP,
-	}
-	if appProtocol != "" {
-		servicePort.AppProtocol = &appProtocol
+		Protocol:    corev1.ProtocolTCP,
+		AppProtocol: appProtocol,
 	}
 	return servicePort
 }

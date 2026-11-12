@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-05",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The compare the status write makes at the end of one pass over a replica at rest: the pass's copy of the status against the status recomputed over the pods, which at rest is the same status, every Instance Ready on the spec revision with a readySince of its own. The rows are read field by field, so the compare allocates the same 38 times whatever the row count: the two statuses beside their rows copied into interface values for the apiserver's semantic compare, and the few dozen fields of theirs that compare walks. While the semantic compare walked the rows too, by reflection, copying every scalar field of every row into an interface value on the way, the compare cost 26,084 allocations and 982 KB at 1,000 Instances, 104,182 and 3.9 MB at 4,000, 4,213 and 125 KB at 160 gangs of eight.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/160x8/allocations": 38,
+    "gang/160x8/bytes": 1112,
+    "readySince/1000/allocations": 38,
+    "readySince/1000/bytes": 1112,
+    "readySince/4000/allocations": 38,
+    "readySince/4000/bytes": 1112
+  }
+}

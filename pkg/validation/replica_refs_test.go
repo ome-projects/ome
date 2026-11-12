@@ -40,6 +40,8 @@ func TestValidateReplicaRefs_RefShapes_RequiresOneEngineAndNoInlineFields(t *tes
 		{name: "placement", spec: v1beta1.InferenceServiceSpec{ReplicaRefs: refs([]string{"pool-a"}, nil, nil), Placement: &v1beta1.PlacementSpec{}}, wantErr: "spec.placement is not accepted with spec.replicaRefs; the referenced replicas exist in this cluster only"},
 		{name: "routing", spec: v1beta1.InferenceServiceSpec{ReplicaRefs: refs([]string{"pool-a"}, nil, nil), Routing: &v1beta1.RoutingSpec{}}, wantErr: "spec.routing is not accepted with spec.replicaRefs; the referenced replicas exist in this cluster only"},
 		{name: "raw deployment mode", spec: v1beta1.InferenceServiceSpec{ReplicaRefs: refs([]string{"pool-a"}, nil, nil), DeploymentMode: ptr.To(constants.RawDeployment)}, wantErr: "spec.deploymentMode RawDeployment is not accepted with spec.replicaRefs"},
+		{name: "an inline role is named before the fields beside it", spec: v1beta1.InferenceServiceSpec{ReplicaRefs: refs([]string{"pool-a"}, nil, nil), Engine: &v1beta1.EngineSpec{}, Rollout: &v1beta1.RolloutSpec{}, Model: &v1beta1.ModelRef{Name: "example-model"}, DeploymentMode: ptr.To(constants.RawDeployment)}, wantErr: "spec.engine and spec.replicaRefs cannot both be set"},
+		{name: "the rollout is named before the model", spec: v1beta1.InferenceServiceSpec{ReplicaRefs: refs([]string{"pool-a"}, nil, nil), Rollout: &v1beta1.RolloutSpec{}, Model: &v1beta1.ModelRef{Name: "example-model"}, Placement: &v1beta1.PlacementSpec{}}, wantErr: "spec.rollout is not accepted with spec.replicaRefs"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidateReplicaRefs(&tc.spec)

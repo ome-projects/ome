@@ -2,6 +2,7 @@ package canary
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -59,6 +60,42 @@ func TestEffectivePartition_MembersFollowTheGroupRollback(t *testing.T) {
 		if !ok || p == nil || *p != 0 {
 			t.Errorf("%s: partition during the group's rollback = %v, want 0", c, p)
 		}
+	}
+}
+
+// A push the operator took back while an Instance still ran the canary
+// revision: the run records the unit at its stable revision, the record is
+// gone and the unit reads RollingBack while that Instance is still off the
+// stable revision. The unit holds nothing, so the Instance rolls back; step
+// 0's partition would keep it where it stands, with the run open on it for
+// good. A unit that sits such a run out whole reads Stable and keeps step
+// 0's partition, as it does with no run open and under a run that offers
+// it a target it has no record for yet.
+func TestEffectivePartition_AUnitTheRunRecordsAtItsStableHoldsNothing(t *testing.T) {
+	show := func(p *int32, ok bool) string {
+		if !ok || p == nil {
+			return fmt.Sprintf("(%v, ok=%t)", p, ok)
+		}
+		return fmt.Sprint(*p)
+	}
+	isvc := canaryISVC(twoStep(), nil)
+	runWithTargets(isvc, v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "old", StableRevision: "old"})
+	setPhase(isvc, v1beta1.EngineComponent, v1beta1.RolloutPhaseRollingBack)
+	if p, ok := EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4); !ok || p == nil || *p != 0 {
+		t.Fatalf("partition under a run that records the unit at its stable revision, an Instance still off it = %s, want 0", show(p, ok))
+	}
+	setPhase(isvc, v1beta1.EngineComponent, v1beta1.RolloutPhaseStable)
+	if p, ok := EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4); !ok || p == nil || *p != 2 {
+		t.Fatalf("partition of a unit that sits the run out whole = %s, want step 0's 2", show(p, ok))
+	}
+	setPhase(isvc, v1beta1.EngineComponent, v1beta1.RolloutPhaseRollingBack)
+	isvc.Status.Rollout.ActiveRun = nil
+	if p, ok := EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4); !ok || p == nil || *p != 2 {
+		t.Fatalf("partition with no run open = %s, want step 0's 2", show(p, ok))
+	}
+	runWithTargets(isvc, v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: ""})
+	if p, ok := EffectivePartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, 4); !ok || p == nil || *p != 2 {
+		t.Fatalf("partition under a run that offers a target with no record yet = %s, want step 0's 2", show(p, ok))
 	}
 }
 

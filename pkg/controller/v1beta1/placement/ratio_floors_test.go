@@ -25,7 +25,7 @@ func ratioSplitSource(engine int, decoder *int) *v1beta1.InferenceService {
 func weightedAffinity(weights map[string]int32) []v1beta1.ClusterAffinityTerm {
 	var out []v1beta1.ClusterAffinityTerm
 	for _, name := range []string{"member-a", "member-b"} {
-		out = append(out, v1beta1.ClusterAffinityTerm{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To(weights[name])}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}})
+		out = append(out, v1beta1.ClusterAffinityTerm{Weights: &v1beta1.ClusterAffinityWeights{Engine: &v1beta1.ReplicaRatio{Min: ptr.To(weights[name])}}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}})
 	}
 	return out
 }
@@ -91,7 +91,7 @@ func TestSplitMemberFloorsFollowTheRatio(t *testing.T) {
 			candidates := settledCandidates(proposal.Assignments)
 			got := map[string]member{}
 			for _, candidate := range candidates {
-				floors, err := splitMemberFloors(source, candidates, candidate, nil)
+				floors, err := memberMinimumsFor(source, candidates, candidate, nil)
 				if err != nil {
 					t.Fatalf("%s: %v", candidate.Cluster, err)
 				}
@@ -194,7 +194,7 @@ func TestSplitMemberFloorsFollowCurrentShares(t *testing.T) {
 						held[v1beta1.DecoderComponent] = decoders
 					}
 				}
-				floors, err := splitMemberFloors(source, candidates, candidate, held)
+				floors, err := memberMinimumsFor(source, candidates, candidate, held)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -350,4 +350,16 @@ func TestPrimaryUnitsFollowRatioFloors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// memberMinimumsFor reads the source's fleet minimums and apportions them to
+// the named member, trimmed as memberShares describes. held is what the
+// member's copy holds now.
+func memberMinimumsFor(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement, member v1beta1.CandidatePlacement, held map[v1beta1.ComponentType]int32) ([]v1beta1.PlacementComponentFloor, error) {
+	minimums, err := splitComponentMinimums(source)
+	if err != nil {
+		return nil, err
+	}
+	trimmed, _, err := minimums.memberShares(source, candidates, member, held)
+	return trimmed, err
 }

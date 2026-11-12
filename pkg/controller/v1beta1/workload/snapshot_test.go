@@ -330,3 +330,147 @@ func TestObservedSnapshot_RunningRevisionPodSpecMemoizedByRevision(t *testing.T)
 		t.Errorf("a gone revision costs one read and a row without a revision none: got %d reads, want 2", live.gets)
 	}
 }
+
+// snapshotBoundPod is a Running pod of Instance index bound to node.
+func snapshotBoundPod(name, index, node string) *corev1.Pod {
+	pod := snapshotPod(name, index)
+	pod.UID = k8stypes.UID("uid-" + name)
+	pod.Spec.NodeName = node
+	pod.Status.Phase = corev1.PodRunning
+	return pod
+}
+
+// TestObservedSnapshot_PodBoundToAMissingNodeIsLeftOutOfBothViews: a pod
+// whose Node object no longer exists runs nowhere, so neither the cached
+// nor the live view counts it; a pod on a Node the cluster holds, and an
+// unbound pod, stay.
+func TestObservedSnapshot_PodBoundToAMissingNodeIsLeftOutOfBothViews(t *testing.T) {
+	scheme := snapshotScheme(t)
+	onHeld := snapshotBoundPod("on-held", "0", "node-a")
+	onMissing := snapshotBoundPod("on-missing", "1", "node-b")
+	unbound := snapshotBoundPod("unbound", "2", "")
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(onHeld, onMissing, unbound, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}).
+		WithIndex(&corev1.Pod{}, query.OMENativePodIndexField, query.OMENativePodIndexExtractor).
+		Build()
+	input := types.ReconcileInput{Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"}}
+
+	snapshot := workload.NewObservedSnapshot(types.Deps{Client: c, APIReader: c}, input, types.ComponentEngine, nil)
+	for name, view := range map[string]func(context.Context) (map[int32][]*corev1.Pod, error){
+		"cached": snapshot.CachedPods, "live": snapshot.LivePods,
+	} {
+		pods, err := view(context.Background())
+		if err != nil {
+			t.Fatalf("%s view: %v", name, err)
+		}
+		if len(pods[0]) != 1 || len(pods[2]) != 1 {
+			t.Fatalf("%s view lost a pod it must keep: instance 0 has %d, instance 2 has %d", name, len(pods[0]), len(pods[2]))
+		}
+		if len(pods[1]) != 0 {
+			t.Fatalf("%s view still counts pod %s, bound to a Node the cluster does not hold", name, pods[1][0].Name)
+		}
+	}
+}
+
+// TestObservedSnapshot_PodsLeftOutForAMissingNodeAreKeptAsideInNameOrder:
+// the pods a view left out are what the pass removes, named once each
+// across both views and in a fixed order.
+func TestObservedSnapshot_PodsLeftOutForAMissingNodeAreKeptAsideInNameOrder(t *testing.T) {
+	scheme := snapshotScheme(t)
+	second := snapshotBoundPod("b-on-missing", "1", "node-b")
+	first := snapshotBoundPod("a-on-missing", "2", "node-c")
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(snapshotBoundPod("on-held", "0", "node-a"), second, first, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}).
+		WithIndex(&corev1.Pod{}, query.OMENativePodIndexField, query.OMENativePodIndexExtractor).
+		Build()
+	input := types.ReconcileInput{Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"}}
+
+	snapshot := workload.NewObservedSnapshot(types.Deps{Client: c, APIReader: c}, input, types.ComponentEngine, nil)
+	if got := snapshot.GonePods(); len(got) != 0 {
+		t.Fatalf("before any view is taken nothing is kept aside, got %d", len(got))
+	}
+	if _, err := snapshot.CachedPods(context.Background()); err != nil {
+		t.Fatalf("cached view: %v", err)
+	}
+	if _, err := snapshot.LivePods(context.Background()); err != nil {
+		t.Fatalf("live view: %v", err)
+	}
+	gone := snapshot.GonePods()
+	if len(gone) != 2 || gone[0].Name != "a-on-missing" || gone[1].Name != "b-on-missing" {
+		names := make([]string, 0, len(gone))
+		for _, pod := range gone {
+			names = append(names, pod.Name)
+		}
+		t.Fatalf("kept aside = %v; want the two pods on missing nodes once each, in name order", names)
+	}
+}
+
+// TestObservedSnapshot_PreloadedPodsAreReadTheSameWay: the live view over
+// the pods the adapter preloaded applies the same Node reading and keeps
+// the adapter's buckets when nothing is gone.
+func TestObservedSnapshot_PreloadedPodsAreReadTheSameWay(t *testing.T) {
+	scheme := snapshotScheme(t)
+	onHeld := snapshotBoundPod("on-held", "0", "node-a")
+	onMissing := snapshotBoundPod("on-missing", "1", "node-b")
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}).Build()
+	input := types.ReconcileInput{
+		Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "own"},
+		AuthoritativePods: &types.ComponentPodSnapshot{
+			Pods:       []*corev1.Pod{onHeld, onMissing},
+			ByInstance: query.BucketPodsByInstanceIdx([]*corev1.Pod{onHeld, onMissing}),
+		},
+	}
+	snapshot := workload.NewObservedSnapshot(types.Deps{Client: c, APIReader: c}, input, types.ComponentEngine, nil)
+	pods, err := snapshot.LivePods(context.Background())
+	if err != nil {
+		t.Fatalf("live view: %v", err)
+	}
+	if len(pods[0]) != 1 || len(pods[1]) != 0 {
+		t.Fatalf("preloaded view: instance 0 has %d pods, instance 1 has %d; want 1 and 0", len(pods[0]), len(pods[1]))
+	}
+	if gone := snapshot.GonePods(); len(gone) != 1 || gone[0] != onMissing {
+		t.Fatalf("kept aside %d pods, want the preloaded pod on the missing node", len(gone))
+	}
+}
+
+// TestObservedSnapshot_RevisionNumberMemoizedByName: a revision's number
+// is read once per name through the revision-bookkeeping role (the live
+// reader), however many times Plan asks; a revision that is gone reads as
+// not found with no error, at one read; a snapshot built without a reader
+// knows no numbers and reads nothing.
+func TestObservedSnapshot_RevisionNumberMemoizedByName(t *testing.T) {
+	scheme := snapshotScheme(t)
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add appsv1: %v", err)
+	}
+	second := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "svc-engine-second", Namespace: "ns"}, Revision: 2}
+	live := &revisionGetCounter{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(second).Build()}
+	cached := fake.NewClientBuilder().WithScheme(scheme).Build()
+	input := types.ReconcileInput{Key: types.Key{Namespace: "ns", Component: types.ComponentEngine, OwnerName: "svc"}}
+	snap := workload.NewObservedSnapshot(types.Deps{Client: cached, APIReader: live}, input, types.ComponentEngine, nil)
+
+	for range 3 {
+		number, found, err := snap.RevisionNumber(context.Background(), "svc-engine-second")
+		if err != nil || !found || number != 2 {
+			t.Fatalf("RevisionNumber(second) = (%d, %v, %v), want (2, true, nil)", number, found, err)
+		}
+	}
+	if live.gets != 1 {
+		t.Errorf("one revision read %d times across repeated calls, want 1 (memoized)", live.gets)
+	}
+	for range 2 {
+		number, found, err := snap.RevisionNumber(context.Background(), "svc-engine-gone")
+		if err != nil || found || number != 0 {
+			t.Fatalf("RevisionNumber(gone) = (%d, %v, %v), want (0, false, nil)", number, found, err)
+		}
+	}
+	if live.gets != 2 {
+		t.Errorf("a gone revision costs one read: got %d reads, want 2", live.gets)
+	}
+
+	readerless := workload.NewObservedSnapshot(types.Deps{}, input, types.ComponentEngine, nil)
+	if number, found, err := readerless.RevisionNumber(context.Background(), "svc-engine-second"); err != nil || found || number != 0 {
+		t.Errorf("RevisionNumber without a reader = (%d, %v, %v), want (0, false, nil)", number, found, err)
+	}
+}

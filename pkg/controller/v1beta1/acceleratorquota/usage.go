@@ -3,6 +3,7 @@ package acceleratorquota
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/quota/backend"
@@ -65,27 +66,33 @@ func (r *Reconciler) rollUsage(ctx context.Context, built *tree.Tree) (usageRead
 // written once — on the first pass, riding along with the path and conditions —
 // and never move again.
 func equalBudgets(a, b []v1beta1.AcceleratorBudgetStatus) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		x, y := a[i], b[i]
-		if x.ResourceName != y.ResourceName || x.ResourceFlavor != y.ResourceFlavor ||
-			x.Nominal.Cmp(y.Nominal) != 0 ||
-			x.Admitted.Cmp(y.Admitted) != 0 ||
-			x.Reserved.Cmp(y.Reserved) != 0 ||
-			x.Borrowed.Cmp(y.Borrowed) != 0 {
-			return false
-		}
-		// The per-member breakdown moves independently of the totals it sums
-		// to: two members can trade admitted work between them and leave the
-		// fleet figure unchanged. Comparing only the totals would freeze the
-		// breakdown at whatever it held the first time it was written.
-		if !equalPerCluster(x.PerCluster, y.PerCluster) {
-			return false
-		}
-	}
-	return true
+	return slices.EqualFunc(a, b, sameBudget)
+}
+
+// sameBudget compares one budget row: the pair it names, the nominal, the
+// totals held against it and the per-member breakdown. The breakdown moves
+// independently of the totals it sums to: two members can trade admitted work
+// between them and leave the fleet figure unchanged, so comparing only the
+// totals would keep the breakdown at whatever it held when first written.
+func sameBudget(x, y v1beta1.AcceleratorBudgetStatus) bool {
+	return x.ResourceName == y.ResourceName && x.ResourceFlavor == y.ResourceFlavor &&
+		x.Nominal.Cmp(y.Nominal) == 0 &&
+		x.Admitted.Cmp(y.Admitted) == 0 &&
+		x.Reserved.Cmp(y.Reserved) == 0 &&
+		x.Borrowed.Cmp(y.Borrowed) == 0 &&
+		equalPerCluster(x.PerCluster, y.PerCluster)
+}
+
+// totalsKey is the (resource, flavor) pair a budget's totals are kept under.
+func totalsKey(b v1beta1.AcceleratorBudget) usage.Key {
+	return usage.Key{ResourceName: b.ResourceName, ResourceFlavor: b.ResourceFlavor}
+}
+
+// setHeldTotals copies the totals held against a budget onto its status row.
+func setHeldTotals(row *v1beta1.AcceleratorBudgetStatus, held usage.Total) {
+	row.Admitted = held.Admitted.DeepCopy()
+	row.Reserved = held.Reserved.DeepCopy()
+	row.Borrowed = held.Borrowed.DeepCopy()
 }
 
 // budgetStatus pairs each authored budget with what is being held against it.
@@ -112,10 +119,8 @@ func budgetStatus(node *tree.Node, totals map[usage.Key]usage.Total) []v1beta1.A
 			ResourceFlavor: b.ResourceFlavor,
 			Nominal:        b.Nominal.DeepCopy(),
 		}
-		if held, ok := totals[usage.Key{ResourceName: b.ResourceName, ResourceFlavor: b.ResourceFlavor}]; ok {
-			status.Admitted = held.Admitted.DeepCopy()
-			status.Reserved = held.Reserved.DeepCopy()
-			status.Borrowed = held.Borrowed.DeepCopy()
+		if held, ok := totals[totalsKey(b)]; ok {
+			setHeldTotals(&status, held)
 		}
 		out = append(out, status)
 	}

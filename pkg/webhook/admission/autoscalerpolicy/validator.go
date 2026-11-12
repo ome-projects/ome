@@ -28,10 +28,6 @@ import (
 
 var log = logf.Log.WithName("autoscalerpolicy-validation-webhook")
 
-// maxNamedReferencingComponents is the cap the shared guard puts on the
-// components an in-use deletion denial names.
-const maxNamedReferencingComponents = policyguard.MaxNamedReferences
-
 // +kubebuilder:webhook:verbs=create;update;delete,path=/validate-ome-io-v1beta1-autoscalerpolicy,mutating=false,failurePolicy=fail,groups=ome.io,resources=autoscalerpolicies,versions=v1beta1,name=autoscalerpolicy.ome-webhook-server.validator,sideEffects=None,admissionReviewVersions=v1
 
 // +kubebuilder:object:generate=false

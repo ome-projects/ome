@@ -26,8 +26,8 @@ const (
 )
 
 // newRetargetRollbackSim is a single-Component [engine] canary group after a
-// mid-canary retarget: stable a, the first target b superseded by c while the
-// first step held, the run pinned toward c over stable a, two ready pods on
+// mid-canary retarget: stable a, the first target b replaced by c while the
+// first step held, the run recorded toward c over stable a, two ready pods on
 // each of a and c, and the first step's partition projected on the replica.
 func newRetargetRollbackSim(t *testing.T, name string) *passSim {
 	t.Helper()
@@ -81,7 +81,7 @@ func (s *passSim) pods() []corev1.Pod {
 	return list.Items
 }
 
-// revertObserved reports whether the replica has observed a rollback pin: the
+// revertObserved reports whether the replica has observed a rollback write: the
 // state in which its controller drains pods off the stable revision.
 func (s *passSim) revertObserved(comp v1beta1.ComponentType) bool {
 	r := s.replica(comp)
@@ -148,7 +148,7 @@ func (s *passSim) persistedPhase() v1beta1.RolloutPhase {
 // re-enqueued by the replica's own events before the pass's status write
 // reaches the informer, so every pass reads the version before the last
 // write, and the pass right after the rollback runs before the replica
-// controller has observed the pin. The replica's spec moves twice, the pin
+// controller has observed the write. The replica's spec moves twice, the stable write
 // and the released partition, so its status catches its generation while
 // the revert runs and the terminal write lands when the pods are back.
 func TestRetargetRollbackWritesRolledBackAsReplicaConverges(t *testing.T) {
@@ -164,7 +164,7 @@ func TestRetargetRollbackWritesRolledBackAsReplicaConverges(t *testing.T) {
 		t.Fatalf("the rollback must record the rejected revision and hold RollingBack, got %+v phase=%q", cs, s.persistedPhase())
 	}
 	if !s.pinnedAtStable(v1beta1.EngineComponent, simRetargetStable) {
-		t.Fatal("the rollback pass must pin the replica at stable")
+		t.Fatal("the rollback pass must set the replica to stable")
 	}
 
 	const budget = 24
@@ -172,7 +172,7 @@ func TestRetargetRollbackWritesRolledBackAsReplicaConverges(t *testing.T) {
 	var trace []string
 	for i := 0; i < budget; i++ {
 		// The replica controller observes the last spec write between passes,
-		// except that the pass re-enqueued by the pin write runs first.
+		// except that the pass re-enqueued by the stable write runs first.
 		if i > 0 {
 			s.catchUp(v1beta1.EngineComponent)
 		}
@@ -219,10 +219,10 @@ func TestRetargetRollbackWritesRolledBackAsReplicaConverges(t *testing.T) {
 		t.Fatalf("the hold must keep its rejection, got %+v", cs)
 	}
 	if !s.pinnedAtStable(v1beta1.EngineComponent, simRetargetStable) {
-		t.Fatal("the rolled-back hold must keep the replica pinned at stable")
+		t.Fatal("the rolled-back hold must keep the replica at stable")
 	}
 	if s.specWrites[v1beta1.EngineComponent] != 2 {
-		t.Fatalf("the replica's spec moves once per decided change, the pin and the released partition, got %d writes:\n%s",
+		t.Fatalf("the replica's spec moves once per decided change, the stable write and the released partition, got %d writes:\n%s",
 			s.specWrites[v1beta1.EngineComponent], strings.Join(trace, "\n"))
 	}
 	t.Logf("converged at pass %d, RolledBack persisted at pass %d\n%s", converged, landed, strings.Join(trace, "\n"))

@@ -711,7 +711,7 @@ func TestUpdateStatusFlushesCoordinationWrites(t *testing.T) {
 		}},
 	}
 
-	err := reconciler.updateStatus(desired, constants.RawDeployment, nil)
+	err := reconciler.updateStatus(desired, constants.RawDeployment, nil, groupEntriesComputed)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
 	// Re-fetch from the fake apiserver and verify both coordination
@@ -830,7 +830,7 @@ func TestUpdateStatusPersistsCanaryStepDespiteStaleCache(t *testing.T) {
 	desired.Status.Canary.CurrentStep = 1
 	desired.Status.Canary.PromotedThrough = canaryHash
 
-	err := reconciler.updateStatus(desired, constants.OMENative, nil)
+	err := reconciler.updateStatus(desired, constants.OMENative, nil, groupEntriesComputed)
 	g.Expect(err).NotTo(gomega.HaveOccurred(),
 		"status flush must not lose an optimistic-lock race to a concurrent metadata patch")
 
@@ -1494,7 +1494,7 @@ func TestUpdateStatusKeepsTheLiveCanaryRecordOverAStalePass(t *testing.T) {
 		entry.ScaleTargetRef = &v1beta1.ScaleTargetRef{APIVersion: "ome.io/v1beta1", Kind: "InferenceReplica", Name: nn.Name + "-engine"}
 		working.Status.Components[v1beta1.EngineComponent] = entry
 
-		g.Expect(reconciler.updateStatus(working, constants.OMENative, base)).NotTo(gomega.HaveOccurred())
+		g.Expect(reconciler.updateStatus(working, constants.OMENative, base, groupEntriesComputed)).NotTo(gomega.HaveOccurred())
 		g.Expect(base.Stale()).To(gomega.BeTrue(), "a pass that read a stale record must report it")
 		got := persisted(live)
 		g.Expect(engine(got).Canary.CanaryRevisionHash).To(gomega.Equal("new"))
@@ -1600,7 +1600,7 @@ func TestUpdateStatusWritesAnEmptyCopyOverACoordinationOwnedRecord(t *testing.T)
 			working.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{v1beta1.EngineComponent: tc.copy}
 			base := canary.NewBase(working)
 
-			g.Expect(reconciler.updateStatus(working, constants.OMENative, base)).NotTo(gomega.HaveOccurred())
+			g.Expect(reconciler.updateStatus(working, constants.OMENative, base, groupEntriesComputed)).NotTo(gomega.HaveOccurred())
 			g.Expect(base.Stale()).To(gomega.BeFalse(), "no canary unit owns the record, so the base keeps nothing")
 			got := &v1beta1.InferenceService{}
 			g.Expect(live.Get(context.TODO(), nn, got)).NotTo(gomega.HaveOccurred())

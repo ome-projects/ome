@@ -4,8 +4,8 @@
 // A PodReading places one pod on six levels: Live, RuntimeReady, Serving,
 // Routed, Available and Pairable. An InstanceReading holds the readings of
 // one Instance's pods, counts them per level and gives the verdicts the
-// passes act on: FullyServing, ServesNothing, OutOfRotation, Dark,
-// UnavailableOnParkedMember and PairableServing.
+// passes act on: FullyServing, ServesNothing, OutOfRotation,
+// ContainersUnreadyPastGrace, UnavailableOnHeldMember and PairableServing.
 //
 // The package is pure. It takes the pods, the pass's clock, the Component's
 // windows, the rotation set of the routed Service and the peer Component's

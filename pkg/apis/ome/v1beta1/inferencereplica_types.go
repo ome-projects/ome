@@ -583,6 +583,12 @@ const (
 // are in canonical value order: bytewise for phases and revisions, signed
 // numeric for incarnations and counts. A member absent from every group of
 // an optional column takes that column's documented default.
+//
+// The time an Instance became Ready is stored once per Instance either way:
+// as an offset in whole seconds from one base time, in readySinceBase,
+// readySinceIndexes and readySinceOffsets, or, in a payload without those
+// three, as the readySince of the Instance's entry.
+// +kubebuilder:validation:XValidation:rule="has(self.readySinceBase) == has(self.readySinceIndexes) && has(self.readySinceIndexes) == has(self.readySinceOffsets)",message="readySinceBase, readySinceIndexes and readySinceOffsets are present together or not at all"
 type InstanceStatusColumns struct {
 	// Members is the index set of every Instance that has a row.
 	// +kubebuilder:validation:MinLength=1
@@ -660,10 +666,46 @@ type InstanceStatusColumns struct {
 	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
 	ActiveOrdinalOne *string `json:"activeOrdinalOne,omitempty"`
 
-	// Entries carries the per-Instance records that are not grouped:
-	// conditions, readySince, operation, and lastFailure. At most one entry
-	// per member, in ascending index order, each carrying at least one of
-	// those records. A member without an entry has none of them.
+	// ReadySinceBase is the earliest readySince among the Instances of
+	// readySinceIndexes. Each of those Instances became Ready at this time
+	// plus its value of readySinceOffsets. Present exactly when
+	// readySinceIndexes and readySinceOffsets are present. A manager whose
+	// served schema lacks any of the three columns stores each readySince
+	// in its Instance's entry instead, and no time is lost. A manager built
+	// without the three readySince columns reads every Instance as having
+	// no readySince and removes the columns on its first status write; the
+	// validation rule accepts that write, so the apiserver cannot refuse
+	// it. A rollback to such a build keeps the times only by writing every
+	// object as DenseV1 first, the rule the representation union follows.
+	// +optional
+	ReadySinceBase *metav1.Time `json:"readySinceBase,omitempty"`
+
+	// ReadySinceIndexes is the index set of the Instances whose readySince
+	// the three readySince columns carry. When the columns are present, a
+	// member outside this set has no readySince and no entry carries one.
+	// A manager built without the three columns removes them on its first
+	// status write, and no validation rule refuses it; see readySinceBase.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$`
+	ReadySinceIndexes *string `json:"readySinceIndexes,omitempty"`
+
+	// ReadySinceOffsets lists, for the Instances of readySinceIndexes in
+	// ascending index order, the whole seconds from readySinceBase to the
+	// time each became Ready. The earliest Instance's offset is 0. A
+	// manager built without the three columns removes them on its first
+	// status write, and no validation rule refuses it; see readySinceBase.
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:items:Minimum=0
+	// +listType=atomic
+	ReadySinceOffsets []int32 `json:"readySinceOffsets,omitempty"`
+
+	// Entries carries the per-Instance records that have no column of their
+	// own and, in a payload without the readySince columns, each Instance's
+	// readySince. At most one entry per member, in ascending index order,
+	// each carrying at least one of those records. A member without an entry
+	// has none of them.
 	// +optional
 	// +kubebuilder:validation:MinItems=1
 	// +listType=atomic
@@ -736,7 +778,9 @@ type InstanceStatusEntry struct {
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// ReadySince is the Instance's readySince.
+	// ReadySince is the Instance's readySince in a payload without the
+	// readySince columns. A payload with those columns carries every
+	// readySince there, and no entry carries one.
 	// +optional
 	ReadySince *metav1.Time `json:"readySince,omitempty"`
 

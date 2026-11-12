@@ -30,8 +30,7 @@ func RenderEncoder(ctx context.Context, p *Piece, service *v1beta1.InferenceServ
 	if err != nil {
 		return Rendered{}, err
 	}
-	return Rendered{Templates: Templates{ObjectMeta: meta, Primary: primary}, ComponentExt: &spec.ComponentExtensionSpec,
-		TopologySpread: spec.TopologySpread, TopologySpreadKey: spec.TopologySpreadKey}, nil
+	return Rendered{Templates: Templates{ObjectMeta: meta, Primary: primary}, ComponentExt: &spec.ComponentExtensionSpec}, nil
 }
 
 // EncoderPodSpec renders the encoder's pod the way a single-pod decoder's is
@@ -54,7 +53,7 @@ func EncoderPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Enco
 		}
 	}
 
-	podSpec, err := (&PodSpecReconciler{Log: p.Log}).ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
+	podSpec, err := (&PodSpecReconciler{}).ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
 	if err != nil {
 		return nil, err
 	}

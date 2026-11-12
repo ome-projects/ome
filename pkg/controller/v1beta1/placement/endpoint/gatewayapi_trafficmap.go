@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 
@@ -108,6 +109,9 @@ func (p *gatewayAPITrafficMapPlan) Claims() []string {
 
 // Plan implements TrafficMapPublisher. The returned plan owns all mutable
 // values it contains, so later cache or caller mutations cannot alter Apply.
+// The plan removes the publication when the publisher is off or the owner
+// has no global host, and otherwise carries one serving cluster per entry,
+// sorted by cluster name. The checks run in the order they are listed.
 func (p *GatewayAPITrafficMapPublisher) Plan(
 	owner *v1beta1.InferenceService,
 	trafficMap *v1beta1.TrafficMap,
@@ -116,32 +120,9 @@ func (p *GatewayAPITrafficMapPublisher) Plan(
 	if p == nil || p.publisher == nil {
 		return nil, errors.New("Gateway API publisher is not configured")
 	}
-	if owner == nil {
-		return nil, errors.New("InferenceService owner must not be nil")
-	}
-	if trafficMap == nil {
-		return nil, errors.New("TrafficMap must not be nil")
-	}
-	if len(effectiveOptions) != 0 {
-		return nil, unsupportedGatewayAPIOptions("effective", effectiveOptions)
-	}
-	ownerKey := client.ObjectKeyFromObject(owner)
-	if err := validateGatewayAPISourceKey(ownerKey); err != nil {
+	if err := checkTrafficMapPlanInputs(owner, trafficMap, effectiveOptions); err != nil {
 		return nil, err
 	}
-	for _, finalizer := range owner.Finalizers {
-		if finalizer == EndpointFinalizer {
-			return nil, fmt.Errorf(
-				"InferenceService %s still has legacy endpoint finalizer %q; complete its cleanup before publishing its TrafficMap",
-				ownerKey, EndpointFinalizer,
-			)
-		}
-	}
-	if trafficMap.Namespace != owner.Namespace || trafficMap.Name != owner.Name || trafficMap.Spec.Service != owner.Name {
-		return nil, fmt.Errorf("TrafficMap %s/%s does not identify InferenceService %s/%s",
-			trafficMap.Namespace, trafficMap.Name, owner.Namespace, owner.Name)
-	}
-
 	ownerCopy := owner.DeepCopy()
 	routeKey := types.NamespacedName{
 		Namespace: p.publisher.routeNamespace(ownerCopy),
@@ -150,89 +131,172 @@ func (p *GatewayAPITrafficMapPublisher) Plan(
 	if err := validateGatewayAPIRouteKey(routeKey); err != nil {
 		return nil, err
 	}
-
 	target := Target{
-		Service:              trafficMap.Spec.Service,
 		WeightsAuthoritative: true,
 	}
-	if !p.publisher.config.IsEnabled() {
-		return newGatewayAPIWithdrawalPlan(ownerCopy, target, routeKey), nil
-	}
-	globalHost, err := p.publisher.config.GlobalHostFor(ownerCopy)
+	globalHost, err := p.publishHost(ownerCopy)
 	if err != nil {
 		return nil, err
 	}
 	if globalHost == "" {
 		return newGatewayAPIWithdrawalPlan(ownerCopy, target, routeKey), nil
 	}
-	if err := validateGatewayAPIHostname(globalHost, true); err != nil {
-		return nil, fmt.Errorf("global hostname: %w", err)
-	}
-	if err := validateGatewayAPIPublishConfig(p.publisher.config); err != nil {
+	if err := p.checkPublishInputs(ownerCopy, globalHost, len(trafficMap.Spec.Entries)); err != nil {
 		return nil, err
 	}
-	if err := validateGatewayAPIResourceLabels(p.publisher.baseLabels(ownerCopy)); err != nil {
-		return nil, err
-	}
-	if len(trafficMap.Spec.Entries) > maxGatewayAPIBackendRefs {
-		return nil, fmt.Errorf("TrafficMap has %d entries, Gateway API HTTPRoute rules support at most %d backendRefs",
-			len(trafficMap.Spec.Entries), maxGatewayAPIBackendRefs)
-	}
-
 	target.GlobalHost = globalHost
-	target.Clusters = make([]ServingCluster, 0, len(trafficMap.Spec.Entries))
-	seenClusters := make(map[string]struct{}, len(trafficMap.Spec.Entries))
-	seenServices := make(map[string]string, len(trafficMap.Spec.Entries))
-	for _, entry := range trafficMap.Spec.Entries {
-		if entry.Cluster == "" {
-			return nil, errors.New("TrafficMap entry cluster must not be empty")
-		}
-		if problems := validation.IsDNS1123Subdomain(entry.Cluster); len(problems) != 0 {
-			return nil, fmt.Errorf("TrafficMap entry cluster %q is invalid: %s",
-				entry.Cluster, strings.Join(problems, "; "))
-		}
-		if _, duplicate := seenClusters[entry.Cluster]; duplicate {
-			return nil, fmt.Errorf("TrafficMap contains more than one entry for cluster %q", entry.Cluster)
-		}
-		seenClusters[entry.Cluster] = struct{}{}
-		if entry.Endpoint == nil || entry.Endpoint.Host == "" {
-			return nil, fmt.Errorf("TrafficMap entry %q has no valid endpoint", entry.Cluster)
-		}
-		if entry.Weight < 0 || entry.Weight > maxGatewayAPIBackendWeight {
-			return nil, fmt.Errorf("TrafficMap entry %q weight %d must be between 0 and %d",
-				entry.Cluster, entry.Weight, maxGatewayAPIBackendWeight)
-		}
-		backendHost := hostOnly(entry.Endpoint.Host)
-		if err := validateGatewayAPIHostname(backendHost, false); err != nil {
-			return nil, fmt.Errorf("TrafficMap entry %q backend hostname: %w", entry.Cluster, err)
-		}
-		serviceName := p.publisher.serviceName(ownerCopy, entry.Cluster)
-		if problems := validation.IsDNS1035Label(serviceName); len(problems) != 0 {
-			return nil, fmt.Errorf("TrafficMap entry %q generates invalid backend Service name %q: %s",
-				entry.Cluster, serviceName, strings.Join(problems, "; "))
-		}
-		if err := validateGatewayAPIResourceLabels(p.publisher.serviceLabels(ownerCopy, entry.Cluster)); err != nil {
-			return nil, fmt.Errorf("TrafficMap entry %q: %w", entry.Cluster, err)
-		}
-		if otherCluster, duplicate := seenServices[serviceName]; duplicate {
-			return nil, fmt.Errorf("TrafficMap entries %q and %q generate the same backend Service name %q",
-				otherCluster, entry.Cluster, serviceName)
-		}
-		seenServices[serviceName] = entry.Cluster
-		target.Clusters = append(target.Clusters, ServingCluster{
-			Cluster:     entry.Cluster,
-			Endpoint:    entry.Endpoint.String(),
-			BackendHost: backendHost,
-			Weight:      entry.Weight,
-		})
+	if target.Clusters, err = p.servingClusters(ownerCopy, trafficMap.Spec.Entries); err != nil {
+		return nil, err
 	}
-	sort.Slice(target.Clusters, func(i, j int) bool { return target.Clusters[i].Cluster < target.Clusters[j].Cluster })
 	return &gatewayAPITrafficMapPlan{
 		owner:    ownerCopy,
 		target:   target,
 		routeKey: routeKey,
 		publish:  true,
 	}, nil
+}
+
+// checkTrafficMapPlanInputs refuses a missing owner or TrafficMap, options the
+// publisher does not read, an owner whose key cannot label its resources or
+// that still carries the endpoint finalizer, and a TrafficMap that names
+// another service.
+func checkTrafficMapPlanInputs(owner *v1beta1.InferenceService, trafficMap *v1beta1.TrafficMap, effectiveOptions map[string]string) error {
+	if owner == nil {
+		return errors.New("InferenceService owner must not be nil")
+	}
+	if trafficMap == nil {
+		return errors.New("TrafficMap must not be nil")
+	}
+	if len(effectiveOptions) != 0 {
+		return unsupportedGatewayAPIOptions("effective", effectiveOptions)
+	}
+	ownerKey := client.ObjectKeyFromObject(owner)
+	if err := validateGatewayAPISourceKey(ownerKey); err != nil {
+		return err
+	}
+	if slices.Contains(owner.Finalizers, EndpointFinalizer) {
+		return fmt.Errorf(
+			"InferenceService %s still has legacy endpoint finalizer %q; complete its cleanup before publishing its TrafficMap",
+			ownerKey, EndpointFinalizer,
+		)
+	}
+	if trafficMap.Namespace != owner.Namespace || trafficMap.Name != owner.Name || trafficMap.Spec.Service != owner.Name {
+		return fmt.Errorf("TrafficMap %s/%s does not identify InferenceService %s/%s",
+			trafficMap.Namespace, trafficMap.Name, owner.Namespace, owner.Name)
+	}
+	return nil
+}
+
+// publishHost is the global host the owner publishes under, or "" when the
+// publisher is off or the owner has no host, which removes the publication.
+func (p *GatewayAPITrafficMapPublisher) publishHost(owner *v1beta1.InferenceService) (string, error) {
+	if !p.publisher.config.IsEnabled() {
+		return "", nil
+	}
+	return p.publisher.config.GlobalHostFor(owner)
+}
+
+// checkPublishInputs refuses a global host that is not a DNS name, a publisher
+// config or label set the resources cannot carry, and more entries than one
+// HTTPRoute rule holds.
+func (p *GatewayAPITrafficMapPublisher) checkPublishInputs(owner *v1beta1.InferenceService, globalHost string, entryCount int) error {
+	if err := validateGatewayAPIHostname(globalHost, true); err != nil {
+		return fmt.Errorf("global hostname: %w", err)
+	}
+	if err := validateGatewayAPIPublishConfig(p.publisher.config); err != nil {
+		return err
+	}
+	if err := validateGatewayAPIResourceLabels(p.publisher.baseLabels(owner)); err != nil {
+		return err
+	}
+	if entryCount > maxGatewayAPIBackendRefs {
+		return fmt.Errorf("TrafficMap has %d entries, Gateway API HTTPRoute rules support at most %d backendRefs",
+			entryCount, maxGatewayAPIBackendRefs)
+	}
+	return nil
+}
+
+// servingClusters turns the TrafficMap's entries into serving clusters sorted
+// by cluster name. It refuses an entry no backend can be built for, and a
+// cluster or a backend Service name that two entries share.
+func (p *GatewayAPITrafficMapPublisher) servingClusters(owner *v1beta1.InferenceService, entries []v1beta1.TrafficMapEntry) ([]ServingCluster, error) {
+	clusters := make([]ServingCluster, 0, len(entries))
+	seenClusters := make(map[string]struct{}, len(entries))
+	seenServices := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if err := checkEntryCluster(entry.Cluster); err != nil {
+			return nil, err
+		}
+		if _, duplicate := seenClusters[entry.Cluster]; duplicate {
+			return nil, fmt.Errorf("TrafficMap contains more than one entry for cluster %q", entry.Cluster)
+		}
+		seenClusters[entry.Cluster] = struct{}{}
+		backendHost, err := entryBackendHost(entry)
+		if err != nil {
+			return nil, err
+		}
+		serviceName, err := p.entryServiceName(owner, entry.Cluster)
+		if err != nil {
+			return nil, err
+		}
+		if otherCluster, duplicate := seenServices[serviceName]; duplicate {
+			return nil, fmt.Errorf("TrafficMap entries %q and %q generate the same backend Service name %q",
+				otherCluster, entry.Cluster, serviceName)
+		}
+		seenServices[serviceName] = entry.Cluster
+		clusters = append(clusters, ServingCluster{
+			Cluster:     entry.Cluster,
+			BackendHost: backendHost,
+			Weight:      entry.Weight,
+		})
+	}
+	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Cluster < clusters[j].Cluster })
+	return clusters, nil
+}
+
+// checkEntryCluster refuses an entry with no cluster or with a cluster name
+// that is not a DNS subdomain.
+func checkEntryCluster(cluster string) error {
+	if cluster == "" {
+		return errors.New("TrafficMap entry cluster must not be empty")
+	}
+	if problems := validation.IsDNS1123Subdomain(cluster); len(problems) != 0 {
+		return fmt.Errorf("TrafficMap entry cluster %q is invalid: %s",
+			cluster, strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// entryBackendHost is the bare hostname of an entry's endpoint. An entry with
+// no endpoint, a weight outside the backendRef range or a host that is not a
+// DNS name is refused.
+func entryBackendHost(entry v1beta1.TrafficMapEntry) (string, error) {
+	if entry.Endpoint == nil || entry.Endpoint.Host == "" {
+		return "", fmt.Errorf("TrafficMap entry %q has no valid endpoint", entry.Cluster)
+	}
+	if entry.Weight < 0 || entry.Weight > maxGatewayAPIBackendWeight {
+		return "", fmt.Errorf("TrafficMap entry %q weight %d must be between 0 and %d",
+			entry.Cluster, entry.Weight, maxGatewayAPIBackendWeight)
+	}
+	backendHost := hostOnly(entry.Endpoint.Host)
+	if err := validateGatewayAPIHostname(backendHost, false); err != nil {
+		return "", fmt.Errorf("TrafficMap entry %q backend hostname: %w", entry.Cluster, err)
+	}
+	return backendHost, nil
+}
+
+// entryServiceName is the backend Service name of one cluster, refused when it
+// is not a DNS label or when its labels are not valid.
+func (p *GatewayAPITrafficMapPublisher) entryServiceName(owner *v1beta1.InferenceService, cluster string) (string, error) {
+	serviceName := p.publisher.serviceName(owner, cluster)
+	if problems := validation.IsDNS1035Label(serviceName); len(problems) != 0 {
+		return "", fmt.Errorf("TrafficMap entry %q generates invalid backend Service name %q: %s",
+			cluster, serviceName, strings.Join(problems, "; "))
+	}
+	if err := validateGatewayAPIResourceLabels(p.publisher.serviceLabels(owner, cluster)); err != nil {
+		return "", fmt.Errorf("TrafficMap entry %q: %w", cluster, err)
+	}
+	return serviceName, nil
 }
 
 func newGatewayAPIWithdrawalPlan(
@@ -261,23 +325,46 @@ func (p *GatewayAPITrafficMapPublisher) Preflight(ctx context.Context, plan Traf
 	if err := p.publisher.validateIO(); err != nil {
 		return err
 	}
+	if err := p.checkDesiredRoute(ctx, gatewayPlan); err != nil {
+		return err
+	}
+	if err := p.checkHostnameFree(ctx, gatewayPlan); err != nil {
+		return err
+	}
+	if err := p.publisher.preflightResourceKeys(ctx, gatewayPlan.owner, gatewayPlan.target); err != nil {
+		var ownership *gatewayResourceOwnershipError
+		if errors.As(err, &ownership) {
+			return &terminalPublisherError{err: ownership}
+		}
+		return err
+	}
+	return nil
+}
 
+// checkDesiredRoute reads the HTTPRoute at the plan's key: absent is free,
+// another source's is a terminal refusal, and this source's must not be
+// terminating.
+func (p *GatewayAPITrafficMapPublisher) checkDesiredRoute(ctx context.Context, gatewayPlan *gatewayAPITrafficMapPlan) error {
 	desiredRoute := &gatewayapiv1.HTTPRoute{}
 	err := p.publisher.apiReader.Get(ctx, gatewayPlan.routeKey, desiredRoute)
 	switch {
 	case apierrors.IsNotFound(err):
-		// The exact desired route is available.
+		return nil
 	case err != nil:
 		return fmt.Errorf("read desired global HTTPRoute %s: %w", gatewayPlan.routeKey, err)
 	case !p.publisher.ownsResource(desiredRoute, gatewayPlan.owner):
 		return &terminalPublisherError{err: fmt.Errorf(
 			"global HTTPRoute %s belongs to another source", gatewayPlan.routeKey)}
-	default:
-		if err := requireActiveGatewayResource(desiredRoute, "HTTPRoute"); err != nil {
-			return err
-		}
 	}
+	return requireActiveGatewayResource(desiredRoute, "HTTPRoute")
+}
 
+// checkHostnameFree lists every HTTPRoute and refuses, terminally, one at the
+// plan's own key that another source owns, or one elsewhere that already
+// publishes the plan's hostname on the shared Gateway. The route at the
+// plan's key is never excused by its name alone: an unrelated object there
+// is a collision even when its hostname differs.
+func (p *GatewayAPITrafficMapPublisher) checkHostnameFree(ctx context.Context, gatewayPlan *gatewayAPITrafficMapPlan) error {
 	routes := &gatewayapiv1.HTTPRouteList{}
 	if err := p.publisher.apiReader.List(ctx, routes); err != nil {
 		return fmt.Errorf("list HTTPRoutes for Gateway hostname ownership: %w", err)
@@ -287,8 +374,6 @@ func (p *GatewayAPITrafficMapPublisher) Preflight(ctx context.Context, plan Traf
 		route := &routes.Items[i]
 		routeKey := client.ObjectKeyFromObject(route)
 		if routeKey == gatewayPlan.routeKey {
-			// Never exclude the desired key solely by name: an unrelated object at
-			// that key is a collision even when its hostname happens to differ.
 			if !p.publisher.ownsResource(route, gatewayPlan.owner) {
 				return &terminalPublisherError{err: fmt.Errorf(
 					"global HTTPRoute %s belongs to another source", routeKey)}
@@ -300,14 +385,6 @@ func (p *GatewayAPITrafficMapPublisher) Preflight(ctx context.Context, plan Traf
 				"Gateway hostname %q on %s is already published by HTTPRoute %s",
 				gatewayPlan.target.GlobalHost, gatewayKey, routeKey)}
 		}
-	}
-
-	if err := p.publisher.preflightResourceKeys(ctx, gatewayPlan.owner, gatewayPlan.target); err != nil {
-		var ownership *gatewayResourceOwnershipError
-		if errors.As(err, &ownership) {
-			return &terminalPublisherError{err: ownership}
-		}
-		return err
 	}
 	return nil
 }

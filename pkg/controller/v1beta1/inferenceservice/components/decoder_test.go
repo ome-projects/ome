@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"sigs.k8s.io/ome/pkg/render"
+
 	policyv1 "k8s.io/api/policy/v1"
 
 	"github.com/go-logr/logr"
@@ -603,8 +605,8 @@ func TestDecoderReconcileObjectMeta(t *testing.T) {
 				tt.decoderSpec,
 			).(*Decoder)
 
-			// Test reconcileObjectMeta
-			objectMeta, err := decoder.reconcileObjectMeta(context.TODO(), tt.isvc)
+			// Build the decoder's object metadata
+			objectMeta, err := ReconcileComponentObjectMeta(&decoder.BaseComponentFields, tt.isvc, v1beta1.DecoderComponent, render.ComponentName(tt.isvc, v1beta1.DecoderComponent), decoder.decoderSpec.Annotations, decoder.decoderSpec.Labels)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Validate name
@@ -703,7 +705,7 @@ func TestDecoderWorkerPodSpec(t *testing.T) {
 				tt.decoderSpec,
 			).(*Decoder)
 
-			podSpec, err := decoder.reconcileWorkerPodSpec(isvc, objectMeta)
+			podSpec, err := render.DecoderWorkerPodSpec(&decoder.Piece, isvc, decoder.decoderSpec, objectMeta)
 
 			if tt.expectedError {
 				g.Expect(err).To(gomega.HaveOccurred())
@@ -712,92 +714,6 @@ func TestDecoderWorkerPodSpec(t *testing.T) {
 				if tt.validatePodSpec != nil {
 					tt.validatePodSpec(podSpec)
 				}
-			}
-		})
-	}
-}
-
-func TestDecoderComponentConfig(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
-
-	tests := []struct {
-		name                    string
-		decoderSpec             *v1beta1.DecoderSpec
-		expectedComponentType   v1beta1.ComponentType
-		expectedServiceSuffix   string
-		expectedValidationError bool
-	}{
-		{
-			name: "Valid decoder spec",
-			decoderSpec: &v1beta1.DecoderSpec{
-				ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{
-					MinReplicas: intPtr(1),
-					MaxReplicas: 3,
-				},
-				PodSpec: v1beta1.PodSpec{
-					Containers: []v1.Container{
-						{
-							Name:  "decoder-container",
-							Image: "decoder:latest",
-						},
-					},
-				},
-			},
-			expectedComponentType:   v1beta1.DecoderComponent,
-			expectedServiceSuffix:   "-decoder",
-			expectedValidationError: false,
-		},
-		{
-			name:                    "Nil decoder spec",
-			decoderSpec:             nil,
-			expectedComponentType:   v1beta1.DecoderComponent,
-			expectedServiceSuffix:   "-decoder",
-			expectedValidationError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create scheme
-			scheme := runtime.NewScheme()
-			g.Expect(v1.AddToScheme(scheme)).NotTo(gomega.HaveOccurred())
-			clientset := fake.NewClientset()
-			c := ctrlclientfake.NewClientBuilder().WithScheme(scheme).Build()
-
-			// Create decoder using the constructor
-			decoder := NewDecoder(
-				&ComponentDeps{Client: c, Clientset: clientset, Scheme: scheme, Config: &controllerconfig.InferenceServicesConfig{}},
-				ComponentInputs{
-					DeploymentMode: constants.RawDeployment,
-					RuntimeName:    "test-runtime",
-				},
-				tt.decoderSpec,
-			).(*Decoder)
-
-			// Test GetComponentType
-			componentType := decoder.GetComponentType()
-			g.Expect(componentType).To(gomega.Equal(tt.expectedComponentType))
-
-			// Test GetServiceSuffix
-			serviceSuffix := decoder.GetServiceSuffix()
-			g.Expect(serviceSuffix).To(gomega.Equal(tt.expectedServiceSuffix))
-
-			// Test GetComponentSpec
-			componentSpec := decoder.GetComponentSpec()
-			if tt.decoderSpec != nil {
-				g.Expect(componentSpec).NotTo(gomega.BeNil())
-				g.Expect(componentSpec).To(gomega.Equal(&tt.decoderSpec.ComponentExtensionSpec))
-			} else {
-				g.Expect(componentSpec).To(gomega.BeNil())
-			}
-
-			// Test ValidateSpec
-			err := decoder.ValidateSpec()
-			if tt.expectedValidationError {
-				g.Expect(err).To(gomega.HaveOccurred())
-				g.Expect(err.Error()).To(gomega.ContainSubstring("decoder spec is nil"))
-			} else {
-				g.Expect(err).NotTo(gomega.HaveOccurred())
 			}
 		})
 	}
@@ -910,8 +826,8 @@ func TestDecoderAcceleratorOverride(t *testing.T) {
 			// Create fake clientset
 			clientset := fake.NewClientset()
 
-			// Create decoder component
-			decoder := NewDecoder(
+			// The decoder component builds from these inputs.
+			g.Expect(NewDecoder(
 				&ComponentDeps{Client: c, Clientset: clientset, Scheme: scheme, Config: &controllerconfig.InferenceServicesConfig{}},
 				ComponentInputs{
 					DeploymentMode: constants.RawDeployment,
@@ -919,12 +835,7 @@ func TestDecoderAcceleratorOverride(t *testing.T) {
 					RuntimeName:    "test-runtime",
 				},
 				tt.decoderSpec,
-			)
-
-			// Test that decoder implements ComponentConfig interface
-			componentConfig, ok := decoder.(ComponentConfig)
-			g.Expect(ok).To(gomega.BeTrue())
-			g.Expect(componentConfig.GetComponentType()).To(gomega.Equal(v1beta1.DecoderComponent))
+			)).NotTo(gomega.BeNil())
 
 			// Run validations
 			if tt.validate != nil {
@@ -1213,7 +1124,7 @@ func TestDecoderUsesLeaderTemplate(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			g.Expect(decoderUsesLeaderTemplate(tt.spec)).To(gomega.Equal(tt.expected))
+			g.Expect(render.DecoderUsesLeaderTemplate(tt.spec)).To(gomega.Equal(tt.expected))
 		})
 	}
 }
@@ -1362,9 +1273,9 @@ func TestDecoderResourceMerging(t *testing.T) {
 				tt.decoderSpec,
 			).(*Decoder)
 
-			// Call reconcilePodSpec which internally calls MergeRoleResources
+			// Render the primary pod, which merges the role resources
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
-			podSpec, err := decoder.reconcilePodSpec(isvc, objectMeta)
+			podSpec, err := render.DecoderPodSpec(&decoder.Piece, isvc, decoder.decoderSpec, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Find the runner container
@@ -1538,9 +1449,9 @@ func TestDecoderAffinityMerging(t *testing.T) {
 				tt.decoderSpec,
 			).(*Decoder)
 
-			// Call reconcilePodSpec which internally calls UpdateRoleAffinity
+			// Render the primary pod, which applies the role affinity
 			objectMeta := &metav1.ObjectMeta{Name: "test", Namespace: "default"}
-			podSpec, err := decoder.reconcilePodSpec(isvc, objectMeta)
+			podSpec, err := render.DecoderPodSpec(&decoder.Piece, isvc, decoder.decoderSpec, objectMeta)
 			g.Expect(err).NotTo(gomega.HaveOccurred())
 
 			// Validate affinity

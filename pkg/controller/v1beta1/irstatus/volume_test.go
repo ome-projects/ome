@@ -113,8 +113,15 @@ func generatedRows(source *rand.Rand, document int) []v1beta1.OMENativeInstanceS
 			row.Admitted = source.IntN(3) != 0
 			row.ActiveOrdinal = int32(source.IntN(2))
 			if source.IntN(8) == 0 {
-				stamp := fixtureTimePlus(time.Duration(source.Int64N(int64(time.Hour))))
-				row.ReadySince = &stamp
+				// Half the documents carry whole-second times, the form
+				// the readySince columns store; the rest keep sub-second
+				// times, which stay in the entries.
+				sinceReady := time.Duration(source.Int64N(int64(time.Hour)))
+				if document%2 == 0 {
+					sinceReady = sinceReady.Truncate(time.Second)
+				}
+				readySince := fixtureTimePlus(sinceReady)
+				row.ReadySince = &readySince
 			}
 			if source.IntN(10) == 0 {
 				row.Operation = &v1beta1.InstanceOperation{

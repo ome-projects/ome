@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-05",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The sweep reads the two revision names off each stored row as it walks them, through an iterator the collector ranges over, and copies no row into an engine row: its bytes are the history's list and the names' set, the same at every Instance count. Before, it projected every row into an engine row first, 192 bytes per row: 202,440 bytes at 1,000 Instances, 775,880 at 4,000 and 38,600 at 160 gangs of eight, 81 allocations at each. The history's list is the fake apiserver's JSON round trip of one revision, the same at every shape; the cache and the live reader are one store. The sweep finds nothing over the limit and writes nothing.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/160x8/allocations": 84,
+    "gang/160x8/bytes": 6128,
+    "readySince/1000/allocations": 84,
+    "readySince/1000/bytes": 6128,
+    "readySince/4000/allocations": 84,
+    "readySince/4000/bytes": 6128
+  }
+}

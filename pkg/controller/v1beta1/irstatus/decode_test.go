@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -13,7 +14,8 @@ import (
 )
 
 // decodeBaseColumns is a valid ten-member payload with two phases, two
-// revisions, two incarnations, counts, admission, an ordinal, and entries.
+// revisions, two incarnations, counts, admission, an ordinal, the readySince
+// columns for one row, and two entries.
 func decodeBaseColumns(t *testing.T) *v1beta1.InstanceStatusColumns {
 	t.Helper()
 	rows := uniformRows(10)
@@ -24,6 +26,8 @@ func decodeBaseColumns(t *testing.T) *v1beta1.InstanceStatusColumns {
 	rows[7].ActiveOrdinal = 1
 	rows[8].Admitted = false
 	rows[2].ReadySince = &fixtureTime
+	rows[2].Conditions = []metav1.Condition{{Type: "AllPodsReady", Status: metav1.ConditionTrue, Reason: "Ready", LastTransitionTime: fixtureTime}}
+	rows[2].Announced = []string{"GangPodGroupRebuilt@1"}
 	rows[5].LastFailure = &v1beta1.InstanceTermination{PodName: "example-engine-5-0", Reason: "Error", Time: fixtureTime}
 	return mustEncode(t, rows, testLimit)
 }
@@ -171,6 +175,31 @@ func TestDecodeColumnsRejectsInvalidPayloads(t *testing.T) {
 			}
 		}, wantReason: ErrorReasonCardinalityLimit},
 
+		// The readySince columns.
+		{name: "readySince base missing", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceBase = nil }, wantReason: ErrorReasonValueDomain},
+		{name: "readySince indexes missing", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceIndexes = nil }, wantReason: ErrorReasonValueDomain},
+		{name: "readySince offsets missing", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceOffsets = nil }, wantReason: ErrorReasonValueDomain},
+		{name: "explicit empty readySince offsets", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceOffsets = []int32{} }, wantReason: ErrorReasonValueDomain},
+		{name: "readySince indexes outside members", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceIndexes = str("12") }, wantReason: ErrorReasonCoverage},
+		{name: "readySince indexes above members", mutate: func(c *v1beta1.InstanceStatusColumns) {
+			c.ReadySinceIndexes = str("0-10")
+			c.ReadySinceOffsets = make([]int32, 11)
+		}, wantReason: ErrorReasonCardinalityLimit},
+		{name: "readySince indexes noncanonical", mutate: func(c *v1beta1.InstanceStatusColumns) {
+			c.ReadySinceIndexes = str("2,3")
+			c.ReadySinceOffsets = []int32{0, 1}
+		}, wantReason: ErrorReasonCanonicalOrder},
+		{name: "fewer readySince offsets than indexes", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceIndexes = str("2,7") }, wantReason: ErrorReasonCoverage},
+		{name: "more readySince offsets than indexes", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceOffsets = []int32{0, 5} }, wantReason: ErrorReasonCoverage},
+		{name: "negative readySince offset", mutate: func(c *v1beta1.InstanceStatusColumns) {
+			c.ReadySinceIndexes = str("2,7")
+			c.ReadySinceOffsets = []int32{0, -1}
+		}, wantReason: ErrorReasonValueDomain},
+		{name: "readySince base later than the earliest time", mutate: func(c *v1beta1.InstanceStatusColumns) { c.ReadySinceOffsets = []int32{11} }, wantReason: ErrorReasonCanonicalOrder},
+		{name: "an entry readySince beside the readySince columns", mutate: func(c *v1beta1.InstanceStatusColumns) {
+			c.Entries[1].ReadySince = &fixtureTime
+		}, wantReason: ErrorReasonCoverage},
+
 		// Row order.
 		{name: "explicit empty row order", mutate: func(c *v1beta1.InstanceStatusColumns) { c.RowOrder = []int32{} }, wantReason: ErrorReasonValueDomain},
 		{name: "redundant ascending row order", mutate: func(c *v1beta1.InstanceStatusColumns) {
@@ -234,8 +263,24 @@ func TestDecodeColumnsAcceptsCanonicalVariants(t *testing.T) {
 		{name: "entry with empty conditions and a record", mutate: func(c *v1beta1.InstanceStatusColumns) {
 			c.Entries[0].Conditions = []metav1.Condition{}
 		}, check: func(t *testing.T, rows []v1beta1.OMENativeInstanceStatus) {
-			if rows[2].Conditions != nil || rows[2].ReadySince == nil {
+			if rows[2].Conditions != nil || rows[2].ReadySince == nil || len(rows[2].Announced) != 1 {
 				t.Fatalf("entry normalization failed: %+v", rows[2])
+			}
+		}},
+		{name: "readySince columns over several Instances", mutate: func(c *v1beta1.InstanceStatusColumns) {
+			c.ReadySinceIndexes = str("2,7,9")
+			c.ReadySinceOffsets = []int32{0, 11, 3600}
+		}, check: func(t *testing.T, rows []v1beta1.OMENativeInstanceStatus) {
+			if rows[2].ReadySince == nil || !rows[2].ReadySince.Equal(&fixtureTime) {
+				t.Fatalf("Instance 2 readySince = %v, want the base", rows[2].ReadySince)
+			}
+			for index, want := range map[int]metav1.Time{7: fixtureTimePlus(11 * time.Second), 9: fixtureTimePlus(time.Hour)} {
+				if rows[index].ReadySince == nil || !rows[index].ReadySince.Equal(&want) {
+					t.Fatalf("Instance %d readySince = %v, want %v", index, rows[index].ReadySince, want)
+				}
+			}
+			if rows[3].ReadySince != nil {
+				t.Fatalf("Instance 3 is outside readySinceIndexes and carries %v", rows[3].ReadySince)
 			}
 		}},
 		{name: "non-ascending row order", mutate: func(c *v1beta1.InstanceStatusColumns) {

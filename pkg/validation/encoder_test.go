@@ -193,6 +193,12 @@ func TestValidatePairingProtocolUpdate_Encoder(t *testing.T) {
 			reason: ReasonEncoderAddedWithPairingProtocol,
 		},
 		{
+			name:   "adding the encoder while setting a value from empty is refused as an encoder added with a value",
+			old:    withProtocol(pd(), nil, pairedGroup("blueGreen")),
+			new:    withProtocol(encoderSpec(true), ptr.To("v1"), pairedGroup("blueGreen")),
+			reason: ReasonEncoderAddedWithPairingProtocol,
+		},
+		{
 			name: "adding the encoder while clearing the value is admitted",
 			old:  withProtocol(pd(), ptr.To("v1"), pairedGroup("blueGreen")),
 			new:  withProtocol(encoderSpec(true), nil, pairedGroup("blueGreen")),
@@ -320,5 +326,28 @@ func TestRolloutRefusalsListEveryRole(t *testing.T) {
 	err := ValidateCoordination(spec)
 	if err == nil || !strings.Contains(err.Error(), "is not one of router/engine/decoder/encoder") {
 		t.Fatalf("got %v, want the refusal to list every role", err)
+	}
+}
+
+// The refusal of a value changed beside an encoder says what the value may
+// do: stay empty when it was empty, else stay as it was or be cleared.
+func TestValidatePairingProtocolUpdate_EncoderRefusalSaysWhatTheValueMayDo(t *testing.T) {
+	withProtocol := func(protocol *string) *v1beta1.InferenceServiceSpec {
+		return &v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}, Encoder: &v1beta1.EncoderSpec{}, Rollout: &v1beta1.RolloutSpec{PairingProtocol: protocol}}
+	}
+	for _, tc := range []struct {
+		name     string
+		old, new *string
+		wantText string
+	}{
+		{name: "from empty", old: nil, new: ptr.To("v2"), wantText: "the value may only stay empty, since"},
+		{name: "from a value", old: ptr.To("v1"), new: ptr.To("v2"), wantText: `the value may only stay "v1" or be cleared, since`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePairingProtocolUpdate(withProtocol(tc.old), withProtocol(tc.new))
+			if err == nil || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("got %v, want a refusal saying %q", err, tc.wantText)
+			}
+		})
 	}
 }

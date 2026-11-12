@@ -616,32 +616,46 @@ func (p *GatewayAPIPublisher) preflightPublishedObjects(
 	if err := p.requireOwnedOrAbsent(ctx, route, "HTTPRoute", isvc); err != nil {
 		return err
 	}
-	namespace := p.routeNamespace(isvc)
-	clusters := append([]ServingCluster(nil), target.Clusters...)
-	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Cluster < clusters[j].Cluster })
-	for _, cluster := range clusters {
-		serviceName := p.serviceName(isvc, cluster.Cluster)
-		service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: serviceName}}
-		if err := p.requireOwnedOrAbsent(ctx, service, "backend Service", isvc); err != nil {
+	for _, cluster := range sortedClusters(target) {
+		if err := p.preflightClusterObjects(ctx, isvc, cluster, sliceNames); err != nil {
 			return err
 		}
-		if p.config.GatewayBackend.EndpointSlices.Enabled {
-			names, err := sliceNames(serviceName, cluster)
-			if err != nil {
+	}
+	return nil
+}
+
+// preflightClusterObjects reads one cluster's backend Service, then the
+// EndpointSlices sliceNames returns for it when direct addresses are
+// enabled, then its BackendTLSPolicy when backend TLS is enabled, and fails
+// on the first that belongs to another source or is terminating.
+func (p *GatewayAPIPublisher) preflightClusterObjects(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	cluster ServingCluster,
+	sliceNames func(serviceName string, cluster ServingCluster) ([]string, error),
+) error {
+	namespace := p.routeNamespace(isvc)
+	serviceName := p.serviceName(isvc, cluster.Cluster)
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: serviceName}}
+	if err := p.requireOwnedOrAbsent(ctx, service, "backend Service", isvc); err != nil {
+		return err
+	}
+	if p.config.GatewayBackend.EndpointSlices.Enabled {
+		names, err := sliceNames(serviceName, cluster)
+		if err != nil {
+			return err
+		}
+		for _, name := range names {
+			endpointSlice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+			if err := p.requireOwnedOrAbsent(ctx, endpointSlice, "backend EndpointSlice", isvc); err != nil {
 				return err
-			}
-			for _, name := range names {
-				endpointSlice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
-				if err := p.requireOwnedOrAbsent(ctx, endpointSlice, "backend EndpointSlice", isvc); err != nil {
-					return err
-				}
 			}
 		}
-		if p.config.GatewayBackend.TLS.Enabled {
-			policy := &gatewayapiv1.BackendTLSPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: serviceName}}
-			if err := p.requireOwnedOrAbsent(ctx, policy, "BackendTLSPolicy", isvc); err != nil {
-				return err
-			}
+	}
+	if p.config.GatewayBackend.TLS.Enabled {
+		policy := &gatewayapiv1.BackendTLSPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: serviceName}}
+		if err := p.requireOwnedOrAbsent(ctx, policy, "BackendTLSPolicy", isvc); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -724,8 +738,7 @@ func (p *GatewayAPIPublisher) buildHTTPRoute(isvc *v1beta1.InferenceService, tar
 		parentRef.Namespace = ptr.To(gatewayapiv1.Namespace(gwNS))
 	}
 
-	clusters := append([]ServingCluster(nil), target.Clusters...)
-	sort.Slice(clusters, func(i, j int) bool { return clusters[i].Cluster < clusters[j].Cluster })
+	clusters := sortedClusters(target)
 
 	// Traffic weight per cluster, resolved upstream: the TrafficMap's capacity-aware
 	// weight when routing is on, else the reactive ready-replica count (a cluster

@@ -184,7 +184,7 @@ func TestStandalonePackingLeavesGangsIntact(t *testing.T) {
 // (e.g. a 2x2x1 pool when the configured key is the 2x2x2 partition label): a
 // standalone replica whose candidate nodes carry no domain label still schedules.
 // The packing score is inert for label-less nodes (they score 0 / PreScore skips),
-// so the pod is not steered away or stranded — even though a partly-used labeled
+// so the pod is not steered away or left unplaced — even though a partly-used labeled
 // domain, where packing IS active, exists elsewhere in the cluster.
 func TestStandaloneOnUnlabeledNodesSchedulesNeutrally(t *testing.T) {
 	tc := startScheduler(t, globalKubeConfig, standalonePackOptions(t)...)

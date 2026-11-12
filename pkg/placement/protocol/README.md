@@ -7,16 +7,16 @@ contract: the resolved resource/flavor fingerprint and exactly one rendering
 hash for each declared Engine/Decoder component. These versions identify fixed
 wire formats; they are not operator configuration or behavior defaults.
 
-Version `3` carries each resolved component's replica floor and may also carry
-the demand contract. Engine and Decoder floors are independent counts whose
-ratio follows the source minimums; the Engine count is the home's replica unit,
-and Router has an independent floor. An unpaused contract accepts explicit zero
-floors so members can retain their service and external autoscaler while no
-replicas are running. Omitted, negative, or mismatched floors do not authorize
-projection. A surge pause requires positive floors for every component;
+Version `3` carries each resolved component's replica count and may also carry
+the demand contract. The Engine and Decoder counts are independent, and their
+ratio follows the source minimums; the Engine count is the member cluster's replica unit,
+and Router has an independent count. An unpaused contract accepts explicit zero
+counts so members can retain their service and external autoscaler while no
+replicas are running. Omitted, negative, or mismatched counts do not authorize
+projection. A surge pause requires a positive count for every component;
 observed autoscaled replicas do not substitute for that guarantee.
 
-The member CRD must accept zero floor values before such a contract is written.
+The member CRD must accept zero replica counts before such a contract is written.
 A positive-only member reader rejects it, so source placement must wait for a
 complete policy acknowledgment before crediting application. Ordinary local
 services ignore the execution annotation and retain their scaling policy.
@@ -40,7 +40,7 @@ deployment mode, pod-set names and counts, complete pod specs, and live
 RuntimeClass identity and configuration. RuntimeClass overhead, required node
 selection, and tolerations are normalized on copies. Changed or unavailable
 classes, conflicting authored values, and mismatched renderings stop projection.
-The replica floor is excluded so allocation changes can reuse one unit contract.
+The replica count is excluded so allocation changes can reuse one unit contract.
 The `primary` and `workers` pod-set names and SHA-256 encoding are part of this
 comparison format, not scheduling defaults.
 
@@ -48,7 +48,7 @@ Install the member CRD and controller role (including RuntimeClass `get` access)
 and upgrade member controllers before the source emits version `2`.
 A schema that lacks demand prunes it from InferenceReplica storage;
 an application observation must compare the complete stored policy with the
-expected policy and must not credit that partial result. Version `1` readers
+expected policy and must not accept that partial result. Version `1` readers
 reject version `2`; flat-only readers cannot validate either envelope.
 
 The source persists a demand contract inside each capacity allocation. Its
@@ -58,7 +58,7 @@ fresh computation cannot replace it without a new plan. Before writing, the
 source rereads the complete allocation, including its pool evidence and contract.
 A matching plan ID and revision alone cannot authorize a partially pruned plan.
 
-An outgoing capacity home retains its last contract while its existing spec
+An outgoing capacity member cluster retains its last contract while its existing spec
 drains. This allows the member to acknowledge pause or release even when the
 source's current component inventory differs. A switch to static Split removes
 capacity authority through a new execution revision. Serving observations can
