@@ -44,11 +44,30 @@ jobs:
         run: make helm-lint
 
   test:
-    name: Test
+    name: Test (${{ matrix.shard }})
     runs-on: ubuntu-latest
+    # The in-process rollout models are CPU-bound and scale with cores; on a
+    # four-core runner the whole suite needs several hours, so the heaviest
+    # packages run in shards of their own (make test-packages).
+    timeout-minutes: 180
     strategy:
+      fail-fast: false
       matrix:
-        test-suite: [unit]  # TODO: Add 'integration' back once fixed
+        include:
+          - shard: workload
+            packages: ./pkg/controller/v1beta1/workload/...
+          - shard: coordination
+            packages: ./pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/...
+          - shard: canary-scaling
+            packages: >-
+              ./pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/...
+              ./pkg/controller/v1beta1/inferenceservice/reconcilers/scaling/...
+              ./pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun/...
+          - shard: rest
+            packages: ''
+    env:
+      # The packages the other shards run, dropped from the rest shard.
+      HEAVY_PACKAGES: pkg/controller/v1beta1/workload|reconcilers/omenative/coordination|reconcilers/omenative/canary|reconcilers/scaling|reconcilers/omenative/rolloutrun
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -78,24 +97,68 @@ jobs:
             ${{ runner.os }}-rust-
 
       - name: Build the xet library
-        if: matrix.test-suite == 'unit'
-        # make test vets before it builds the library; a restored
-        # pkg/xet/target may hold an archive with LLVM bitcode, which
-        # go vet refuses to link, so build (and strip) it first.
+        # The shard vets and builds before it tests; a restored pkg/xet/target
+        # may hold an archive with LLVM bitcode, which go vet refuses to link,
+        # so build (and strip) it first.
         run: make xet-build
 
-      - name: Run unit tests
-        if: matrix.test-suite == 'unit'
-        run: |
-          make test
-          make coverage
+      - name: Vet
+        if: matrix.shard == 'rest'
+        run: make fmt vet
 
-      - name: Run integration tests
-        if: matrix.test-suite == 'integration'
-        run: make integration-test
+      - name: Run tests
+        run: |
+          if [ "${{ matrix.shard }}" = rest ]; then
+            make test-packages TEST_SHARD=rest TEST_EXCLUDE="$HEAVY_PACKAGES"
+          else
+            make test-packages TEST_SHARD="${{ matrix.shard }}" TEST_PACKAGES="${{ matrix.packages }}"
+          fi
+
+      - name: Upload the shard's coverage profile
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: coverage-${{ matrix.shard }}.out
+          retention-days: 7
+
+  coverage:
+    name: Coverage
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Download the shard profiles
+        uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-*
+          path: profiles
+          merge-multiple: true
+
+      - name: Assemble one profile per package group
+        # The shards test disjoint packages, so their blocks never overlap and
+        # make coverage reads the three group profiles it always has.
+        run: |
+          module="$(go list -m)"
+          for group in cmd pkg internal; do
+            { echo "mode: atomic"; grep -h -v '^mode:' profiles/*.out | grep "^${module}/${group}/" || true; } > "coverage-${group}.out"
+          done
+
+      - name: Check coverage threshold
+        run: |
+          echo "::group::Coverage Report"
+          make coverage
+          echo "::endgroup::"
 
       - name: Upload coverage reports
-        if: matrix.test-suite == 'unit'
         uses: actions/upload-artifact@v7
         with:
           name: coverage-reports
@@ -105,7 +168,6 @@ jobs:
             coverage-internal.out
 
       - name: Upload coverage to Codecov
-        if: matrix.test-suite == 'unit'
         uses: codecov/codecov-action@v5
         with:
           files: coverage-cmd.out,coverage-pkg.out,coverage-internal.out
@@ -254,7 +316,7 @@ jobs:
 
   all-checks-passed:
     name: All CI Checks Passed
-    needs: [lint, test, build, docker-build, security-scan, license-check]
+    needs: [lint, test, coverage, build, docker-build, security-scan, license-check]
     runs-on: ubuntu-latest
     if: always()
     steps:
