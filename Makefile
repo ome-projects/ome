@@ -720,6 +720,18 @@ test: fmt vet manifests envtest xet-build ## 🧪 Run all tests with coverage
 	$(call run_go_test,$(INTERNAL_PACKAGES),internal)
 	@echo "\n🎉 All tests completed successfully!"
 
+# One shard of the test suite, for a CI machine that cannot hold the whole
+# suite in one job: TEST_PACKAGES names the packages (default: everything
+# `make test` runs), TEST_EXCLUDE drops the ones matching a regular
+# expression, and TEST_SHARD names the profile, coverage-$(TEST_SHARD).out.
+TEST_PACKAGES ?= $(CMD_PACKAGES) $(PKG_PACKAGES) $(INTERNAL_PACKAGES)
+TEST_EXCLUDE  ?=
+TEST_SHARD    ?= shard
+TEST_SHARD_PACKAGES = $(if $(TEST_EXCLUDE),$(shell printf '%s\n' $(TEST_PACKAGES) | grep -v -E '$(TEST_EXCLUDE)'),$(TEST_PACKAGES))
+.PHONY: test-packages
+test-packages: manifests envtest xet-build ## 🧪 Run one shard of the test suite
+	$(call run_go_test,$(TEST_SHARD_PACKAGES),$(TEST_SHARD))
+
 .PHONY: test-no-xet
 test-no-xet: fmt vet manifests envtest ## 🧪 Run tests excluding ome-agent
 	@echo "\n🧪 Running test suite (excluding ome-agent, Toolchain: $(GOTOOLCHAIN))..."
