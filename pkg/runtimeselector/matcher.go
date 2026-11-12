@@ -22,11 +22,6 @@ func NewDefaultRuntimeMatcher(config *Config) RuntimeMatcher {
 	}
 }
 
-func (m *DefaultRuntimeMatcher) IsCompatible(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (bool, error) {
-	report := m.evaluate(runtime, model, isvc)
-	return report.IsCompatible, report.serviceRefusal(runtimeName, model)
-}
-
 func (m *DefaultRuntimeMatcher) GetCompatibilityDetails(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, _ string) (*CompatibilityReport, error) {
 	return m.evaluate(runtime, model, isvc), nil
 }
@@ -37,10 +32,7 @@ func (m *DefaultRuntimeMatcher) GetCompatibilityDetails(runtime *v1beta1.Serving
 // modes agree with the service's, one of its supported formats fits the
 // model, and the model's size lies in its size range.
 func (m *DefaultRuntimeMatcher) evaluate(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService) *CompatibilityReport {
-	report := &CompatibilityReport{
-		IncompatibilityReasons: []string{},
-		Warnings:               []string{},
-	}
+	report := &CompatibilityReport{IncompatibilityReasons: []string{}}
 
 	if runtime.IsDisabled() {
 		return report.incompatible(runtimeDisabled, "runtime is disabled")
@@ -52,35 +44,18 @@ func (m *DefaultRuntimeMatcher) evaluate(runtime *v1beta1.ServingRuntimeSpec, mo
 		return report.incompatible(deploymentModeMismatch, reason)
 	}
 
-	format, mismatches := m.firstSupportedFormat(runtime, model)
-	if format == nil {
+	if format, mismatches := m.firstSupportedFormat(runtime, model); format == nil {
 		return report.incompatible(modelFormatNotSupported, formatNotSupportedReason(model, mismatches))
 	}
-	report.MatchDetails = m.evaluateFormatMatch(model, *format)
 
 	if model.ModelParameterSize != nil && runtime.ModelSizeRange != nil &&
 		!modelSizeInRange(*model.ModelParameterSize, runtime.ModelSizeRange) {
-		report.MatchDetails.SizeMatch = false
 		return report.incompatible(modelSizeOutOfRange,
 			fmt.Sprintf("model size %s is outside supported range %s",
 				*model.ModelParameterSize, modelSizeRangeLabel(runtime.ModelSizeRange)))
 	}
 
 	report.IsCompatible = true
-
-	// AutoSelect=false makes the runtime ineligible for auto-selection but
-	// the runtime can still be picked explicitly via spec.runtime.name —
-	// hence "warning", not "incompatible".
-	if !runtimeHasAutoSelectFormat(runtime) {
-		report.Warnings = append(report.Warnings,
-			"runtime does not have auto-select enabled for any supported format")
-	}
-
-	if model.ModelParameterSize == nil && runtime.ModelSizeRange != nil {
-		report.Warnings = append(report.Warnings,
-			"model does not specify size, but runtime has size constraints")
-	}
-
 	return report
 }
 
@@ -105,7 +80,6 @@ func (r *CompatibilityReport) serviceRefusal(runtimeName string, model *v1beta1.
 	case acceleratorClassNotServed, deploymentModeMismatch:
 		return &RuntimeCompatibilityError{
 			RuntimeName: runtimeName,
-			ModelFormat: model.ModelFormat.Name,
 			Reason:      r.IncompatibilityReasons[0],
 		}
 	}
@@ -136,89 +110,6 @@ func formatNotSupportedReason(model *v1beta1.BaseModelSpec, mismatches []string)
 	}
 	return fmt.Sprintf("model format '%s' not in supported formats: %s",
 		getModelFormatLabel(model), strings.Join(mismatches, "; "))
-}
-
-// evaluateFormatMatch runs only after compareSupportedModelFormats has
-// already confirmed compatibility, so the cross-cutting matches (cache
-// provider, diffusion pipeline, architecture, quantization) start true
-// and the reason-collection branches act as defense in depth in case a
-// future caller invokes this directly.
-func (m *DefaultRuntimeMatcher) evaluateFormatMatch(model *v1beta1.BaseModelSpec, format v1beta1.SupportedModelFormat) MatchDetails {
-	match := MatchDetails{
-		ArchitectureMatch:       true,
-		DiffusionPipelineMatch:  true,
-		QuantizationMatch:       true,
-		ModelCacheProviderMatch: true,
-		SizeMatch:               true,
-		Priority:                m.config.DefaultPriority,
-		Reasons:                 []string{},
-	}
-
-	if format.Priority != nil {
-		match.Priority = *format.Priority
-	}
-	if format.AutoSelect != nil {
-		match.AutoSelectEnabled = *format.AutoSelect
-	}
-
-	if validation.ModelRequiresCacheProvider(model) {
-		match.ModelCacheProviderMatch = validation.FormatSupportsModelCacheProvider(format, m.config.ModelCacheProvider)
-		if !match.ModelCacheProviderMatch {
-			match.Reasons = append(match.Reasons, validation.ModelCacheProviderMismatchReason(m.config.ModelCacheProvider, format))
-		}
-	}
-
-	pipelineMatch, pipelineReason := validation.CompareDiffusionPipeline(model.DiffusionPipeline, format.DiffusionPipeline)
-	match.DiffusionPipelineMatch = pipelineMatch
-	if !pipelineMatch && pipelineReason != "" {
-		match.Reasons = append(match.Reasons, pipelineReason)
-	}
-
-	match.ArchitectureMatch = optionalEqual(model.ModelArchitecture, format.ModelArchitecture)
-	if !match.ArchitectureMatch {
-		if model.ModelArchitecture != nil && format.ModelArchitecture != nil {
-			match.Reasons = append(match.Reasons,
-				fmt.Sprintf("architecture mismatch: model=%s, runtime=%s",
-					*model.ModelArchitecture, *format.ModelArchitecture))
-		} else {
-			match.Reasons = append(match.Reasons, "architecture requirement mismatch")
-		}
-	}
-
-	match.QuantizationMatch = optionalEqual(model.Quantization, format.Quantization)
-	if !match.QuantizationMatch {
-		if model.Quantization != nil && format.Quantization != nil {
-			match.Reasons = append(match.Reasons,
-				fmt.Sprintf("quantization mismatch: model=%s, runtime=%s",
-					*model.Quantization, *format.Quantization))
-		} else {
-			match.Reasons = append(match.Reasons, "quantization requirement mismatch")
-		}
-	}
-
-	if format.ModelFormat != nil && format.ModelFormat.Name == model.ModelFormat.Name {
-		match.FormatMatch = matchOptionalVersions(model.ModelFormat.Version, format.ModelFormat.Version, func() bool {
-			return m.compareModelFormatVersions(format.ModelFormat, &model.ModelFormat)
-		})
-		if match.FormatMatch && format.ModelFormat.Weight > 0 {
-			match.Weight += format.ModelFormat.Weight * int64(match.Priority)
-		}
-	}
-
-	if format.ModelFramework != nil && model.ModelFramework != nil {
-		if format.ModelFramework.Name == model.ModelFramework.Name {
-			match.FrameworkMatch = matchOptionalVersions(model.ModelFramework.Version, format.ModelFramework.Version, func() bool {
-				return m.compareModelFrameworkVersions(format.ModelFramework, model.ModelFramework)
-			})
-			if match.FrameworkMatch && format.ModelFramework.Weight > 0 {
-				match.Weight += format.ModelFramework.Weight * int64(match.Priority)
-			}
-		}
-	} else if format.ModelFramework == nil && model.ModelFramework == nil {
-		match.FrameworkMatch = true
-	}
-
-	return match
 }
 
 // compareAcceleratorClass checks if the runtime supports the required accelerator class.
@@ -276,14 +167,6 @@ func (m *DefaultRuntimeMatcher) getFormatMismatchReason(model *v1beta1.BaseModel
 	return validation.GetFormatMismatchReason(model, format, validation.WithModelCacheProvider(m.config.ModelCacheProvider))
 }
 
-func (m *DefaultRuntimeMatcher) compareModelFormatVersions(supportedFormat *v1beta1.ModelFormat, modelFormat *v1beta1.ModelFormat) bool {
-	return validation.VersionsMatch(*modelFormat.Version, *supportedFormat.Version, supportedFormat.Operator)
-}
-
-func (m *DefaultRuntimeMatcher) compareModelFrameworkVersions(supportedFramework *v1beta1.ModelFrameworkSpec, modelFramework *v1beta1.ModelFrameworkSpec) bool {
-	return validation.VersionsMatch(*modelFramework.Version, *supportedFramework.Version, supportedFramework.Operator)
-}
-
 // modelSizeInRange reports whether the parsed model size falls within the
 // runtime's ModelSizeRange. Min and Max are each +optional in the CRD: a nil
 // Min means "no lower bound" and a nil Max means "no upper bound", so a range
@@ -315,28 +198,10 @@ func modelSizeRangeLabel(sizeRange *v1beta1.ModelSizeRangeSpec) string {
 	return fmt.Sprintf("%s, %s", lower, upper)
 }
 
+// runtimeHasAutoSelectFormat reports whether any supported format of the
+// runtime is marked autoSelect: true, the condition for automatic selection.
 func runtimeHasAutoSelectFormat(runtime *v1beta1.ServingRuntimeSpec) bool {
 	return slices.ContainsFunc(runtime.SupportedModelFormats, autoSelectEnabled)
-}
-
-// optionalEqual treats "both nil" and "both equal" as matches; a mixed
-// presence (one side requires the field, the other doesn't specify it) is
-// considered a mismatch — opposite of standard pointer equality.
-func optionalEqual[T comparable](a, b *T) bool {
-	if a == nil || b == nil {
-		return a == b
-	}
-	return *a == *b
-}
-
-// matchOptionalVersions: both versions set -> compare via cmp; both nil ->
-// match; exactly one set -> no match. Shared between ModelFormat.Version and
-// ModelFrameworkSpec.Version.
-func matchOptionalVersions(modelVersion, supportedVersion *string, cmp func() bool) bool {
-	if modelVersion != nil && supportedVersion != nil {
-		return cmp()
-	}
-	return modelVersion == nil && supportedVersion == nil
 }
 
 // parseModelSize converts the HuggingFace-style parameter count suffix

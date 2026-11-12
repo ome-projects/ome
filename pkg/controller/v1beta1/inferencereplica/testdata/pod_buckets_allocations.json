@@ -1,0 +1,22 @@
+{
+  "recordedOn": {
+    "date": "2026-11-09",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The readers of the pass's pods at the end of a pass over a replica at rest, at 1,000 and 4,000 Instances, each over the list the pass took and listing nothing: the current-revision promotion, which buckets the list by Instance (query.BucketPodsByInstanceIdx) to read the revision each Instance's pods carry and finds the current revision already the spec target, 2,018 / 8,042 allocations and 454 KB / 1.80 MB; the status write, which buckets the list again, publishes the counters it finds already published and writes nothing, 18,248 / 67,200 allocations and 1.81 MB / 6.60 MB; and the publication that runs both, 20,268 / 75,244 allocations and 2.26 MB / 8.40 MB. The band is 4 percent: one bucketing of the list is about 5 percent of the publication's bytes, and the golden holds how many times the end of the pass buckets its pods. Re-recorded with the pass's list handing its buckets to every reader that asks for the same list, so the promotion and the status write read the buckets the first reader of the list built: the promotion 2,018 / 8,042 to 2,009 / 8,021 allocations and 454 KB / 1.80 MB to 351 KB / 1.39 MB, the status write 18,248 / 67,200 to 18,239 / 67,179 allocations and 1.81 MB / 6.60 MB to 1.71 MB / 6.19 MB, the publication that runs both 20,268 / 75,244 to 20,250 / 75,202 allocations and 2.26 MB / 8.40 MB to 2.06 MB / 7.58 MB. Re-recorded with the publication building no list per Instance (status.AppendUniqueNodes cuts every row's node list from one array, the pods that report are read in place when none is left out, and the live pods are counted without a list), two allocations per Instance fewer in the status write and the pass tail: readySince/1000/status-write/allocations 18,239 \u2192 16,241, readySince/1000/status-write/bytes 1,707,312 \u2192 1,699,704, readySince/1000/pass-tail/allocations 20,250 \u2192 18,252, readySince/1000/pass-tail/bytes 2,058,824 \u2192 2,051,216, readySince/4000/status-write/allocations 67,179 \u2192 59,181, readySince/4000/status-write/bytes 6,189,632 \u2192 6,159,176, readySince/4000/pass-tail/allocations 75,202 \u2192 67,204, readySince/4000/pass-tail/bytes 7,578,888 \u2192 7,548,432; the other rows as recorded.",
+  "tolerancePercent": 4,
+  "budgets": {
+    "readySince/1000/pass-tail/allocations": 18252,
+    "readySince/1000/pass-tail/bytes": 2051216,
+    "readySince/1000/promotion/allocations": 2009,
+    "readySince/1000/promotion/bytes": 351448,
+    "readySince/1000/status-write/allocations": 16241,
+    "readySince/1000/status-write/bytes": 1699704,
+    "readySince/4000/pass-tail/allocations": 67204,
+    "readySince/4000/pass-tail/bytes": 7548432,
+    "readySince/4000/promotion/allocations": 8021,
+    "readySince/4000/promotion/bytes": 1389192,
+    "readySince/4000/status-write/allocations": 59181,
+    "readySince/4000/status-write/bytes": 6159176
+  }
+}

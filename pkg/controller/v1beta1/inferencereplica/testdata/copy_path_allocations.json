@@ -1,0 +1,20 @@
+{
+  "recordedOn": {
+    "date": "2026-11-09",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The mirror of the publication's counters onto the copy's rows allocates once, the array their node lists are cut from, in place of two allocations per Instance: 12,076 allocations and 1.11 MB at 4,000 Instances (from 20,092 and 2.02 MB), 3,064 and 283 KB at 1,000 (from 5,068 and 512 KB), 1,178 and 114 KB at 160 gangs of eight (from 1,500 and 148 KB), 3,560 and 344 KB at 500 gangs of eight (from 4,562 and 457 KB), 6,963 and 553 KB at 1,725 gangs of two (from 10,417 and 0.92 MB). The status write's decision on the pass's copy over a replica at rest (publicationSettledOnCopy): every Instance Ready on the spec revision with every pod serving and a Ready endpoint, the pods and the EndpointSlices served from memory uncopied, so the count is the decision's own. The decision computes the publication over the pods, compares each row with its publication entry in place (a write sets five fields of a row and clears three) and recomputes the fields beside the rows on a copy that shares the rows and clones the conditions and the hold; what remains is the publication's own cost over the pods: 20,092 allocations and 2.02 MB at 4,000 Instances, 5,068 and 512 KB at 1,000, 1,500 and 148 KB at 160 gangs of eight, 4,562 and 457 KB at 500 gangs of eight, 10,417 and 0.92 MB at 1,725 gangs of two. Before, the decision deep-copied the whole status, the rows' slice and one readySince per row: 24,093 allocations and 2.89 MB at 4,000 Instances, 6,069 and 732 KB at 1,000, 1,661 and 185 KB at 160 gangs of eight, 5,063 and 568 KB at 500 gangs of eight, 12,143 and 1.30 MB at 1,725 gangs of two. Beside the golden: the decision settles and the live object is neither read nor written. Re-recorded with the publication building no list per Instance (status.AppendUniqueNodes cuts every row's node list from one array, the pods that report are read in place when none is left out, and the live pods are counted without a list): 12,076 → 4,078 allocations and 1,106,680 → 1,076,224 bytes at 4,000 Instances, 3,064 → 1,066 and 283,016 → 275,408 at 1,000, 1,178 → 222 and 113,576 → 85,472 at 160 gangs of eight, 3,560 → 564 and 344,296 → 253,888 at 500 gangs of eight, 6,963 → 1,791 and 553,224 → 513,992 at 1,725 gangs of two; what remains per Instance is the converter's copy of its readySince.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/160x8/allocations": 222,
+    "gang/160x8/bytes": 85472,
+    "gang/1725x2/allocations": 1791,
+    "gang/1725x2/bytes": 513992,
+    "gang/500x8/allocations": 564,
+    "gang/500x8/bytes": 253888,
+    "readySince/1000/allocations": 1066,
+    "readySince/1000/bytes": 275408,
+    "readySince/4000/allocations": 4078,
+    "readySince/4000/bytes": 1076224
+  }
+}

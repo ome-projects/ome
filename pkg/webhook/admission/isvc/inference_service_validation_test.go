@@ -2492,43 +2492,6 @@ func TestResolveModelAndRuntime_NamespacePrecedence(t *testing.T) {
 }
 
 // =============================================================================
-// UTILITY TESTS
-// =============================================================================
-
-// Test GetIntReference function (0% coverage)
-func TestGetIntReference(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    int
-		expected int
-	}{
-		{
-			name:     "positive number",
-			input:    42,
-			expected: 42,
-		},
-		{
-			name:     "zero",
-			input:    0,
-			expected: 0,
-		},
-		{
-			name:     "negative number",
-			input:    -10,
-			expected: -10,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := GetIntReference(tt.input)
-			assert.NotNil(t, result)
-			assert.Equal(t, tt.expected, *result)
-		})
-	}
-}
-
-// =============================================================================
 // MODEL EXISTS VALIDATION TESTS
 // =============================================================================
 
@@ -2699,7 +2662,7 @@ func TestValidateModelExists(t *testing.T) {
 				RuntimeSelector: runtimeselector.New(fakeClient),
 			}
 
-			err := validator.validateModelExists(context.Background(), tt.isvc)
+			err := validator.validateModelExists(tt.isvc)
 
 			if tt.wantErr {
 				assert.Error(t, err)

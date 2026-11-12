@@ -61,8 +61,7 @@ func flatten(t *testing.T, got map[string]map[Key]Total) map[string]map[string]r
 	out := map[string]map[string]rendered{}
 	for node, totals := range got {
 		out[node] = map[string]rendered{}
-		for _, k := range SortedKeys(totals) {
-			v := totals[k]
+		for k, v := range totals {
 			out[node][k.ResourceName+" on "+k.ResourceFlavor] = rendered{
 				Admitted: v.Admitted.String(),
 				Reserved: v.Reserved.String(),
@@ -288,43 +287,6 @@ func TestRollDoesNotMutateInput(t *testing.T) {
 			}
 			if diff := cmp.Diff(before, after); diff != "" {
 				t.Errorf("Roll() mutated the caller's readings (-before +after):\n%s", diff)
-			}
-		})
-	}
-}
-
-// Status is rewritten only when it changes, so the key order has to be stable
-// across rolls or an idle fleet spins its own watch.
-func TestSortedKeysIsStable(t *testing.T) {
-	tests := []struct {
-		name   string
-		totals map[Key]Total
-		want   []string
-	}{
-		{
-			name:   "empty",
-			totals: map[Key]Total{},
-			want:   []string{},
-		},
-		{
-			name: "ordered by resource then flavor",
-			totals: map[Key]Total{
-				{ResourceName: "z.com/tpu", ResourceFlavor: "a"}: {},
-				{ResourceName: gpu, ResourceFlavor: "h100"}:      {},
-				{ResourceName: gpu, ResourceFlavor: "a100"}:      {},
-			},
-			want: []string{"nvidia.com/gpu|a100", "nvidia.com/gpu|h100", "z.com/tpu|a"},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := []string{}
-			for _, k := range SortedKeys(tc.totals) {
-				got = append(got, k.ResourceName+"|"+k.ResourceFlavor)
-			}
-			if diff := cmp.Diff(tc.want, got); diff != "" {
-				t.Errorf("SortedKeys() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

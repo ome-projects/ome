@@ -14,10 +14,10 @@ import (
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
-// parkedWithoutStable reports a rollback that parked because the stable
+// stoppedWithoutStable reports a rollback that stopped Failed because the stable
 // revision it would return to is not retained: the rejected hash stays
 // recorded, but nothing is draining and nothing will.
-func parkedWithoutStable(cs *v1beta1.CanaryStatus) bool {
+func stoppedWithoutStable(cs *v1beta1.CanaryStatus) bool {
 	return cs.Failed != nil && cs.Failed.Reason == v1beta1.CanaryFailureStableRevisionMissing
 }
 
@@ -62,7 +62,7 @@ func ignoreForce(in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(string)
 // holds, or one another unit's canary can still apply, is that unit's and is
 // left for it.
 func refuseRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(string)) {
-	if !parkedWithoutStable(cs) || !rollbackRequestSpendable(in.ISVC, in.Policies, in.Component, cs) {
+	if !stoppedWithoutStable(cs) || !rollbackRequestSpendable(in.ISVC, in.Policies, in.Component, cs) {
 		return
 	}
 	emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonCanaryRollbackIgnored,
@@ -74,10 +74,11 @@ func refuseRollback(in ReconcileInputs, cs *v1beta1.CanaryStatus, take func(stri
 // re-arms when the run's TargetID changed for a target the run offered the
 // unit; the hash test is the fallback for status recorded before targets
 // carried an id, and its exclusions differ by state because the observed
-// target means different things there: in a live canary a target equal to
-// the stable revision is a revert to apply, while a parked or rolled-back
-// unit observes the stable revision as the hold it already sits in, and
-// must not re-arm toward it.
+// target means different things there: a parked or rolled-back unit
+// observes the stable revision as the hold it already sits in, and treats
+// it as no new target. A record holding no rejection never meets a run that
+// offers the unit no target: such a run is the operator taking the push
+// back, and the record ends before this rule is asked (rollTakenBack).
 type rearmRule struct {
 	// excludeCurrent: the recorded canary hash is not a new target.
 	excludeCurrent bool
@@ -136,7 +137,8 @@ func shouldRearm(in ReconcileInputs, cs *v1beta1.CanaryStatus, targetChanged boo
 // on the target it has now with no pod on another revision. A push
 // reverted before any Instance moved reads so on the pass that closes its
 // run; with Instances still trailing, the run layer opens a run toward the
-// restored revision instead and the record is reset under it.
+// restored revision instead, and the record ends under it as a roll the
+// operator took back (rollTakenBack).
 func targetReverted(in ReconcileInputs, g *v1beta1.RolloutGroup, cs *v1beta1.CanaryStatus) bool {
 	if in.RunActive || cs == nil {
 		return false
@@ -170,6 +172,27 @@ func observedTargetID(in ReconcileInputs, g *v1beta1.RolloutGroup) string {
 	})
 }
 
+// rollTakenBack reports a record whose roll the operator took back: a run
+// is open that records every member of the unit at its stable revision, so
+// it offers the unit no target, and the record names a target the run does
+// not. The spec went back to the stable revision while Instances still run
+// another, which is what makes the run open. A unit holding a rejection is
+// not read here: its hold stands until a resume or a target the run offers.
+// A record whose target the run still names, by the run's own id and
+// revision, is the run's own and keeps its steps: the id is a fingerprint of
+// the targets alone, so a finished unit under a run another group opened
+// over it carries the new run's id and finishes its cutover, and a record
+// that already names the stable revision as its target walks on as one.
+func rollTakenBack(in ReconcileInputs, cs *v1beta1.CanaryStatus) bool {
+	if cs == nil || cs.RolledBackRevisionHash != "" || !in.RunActive || in.TargetID == "" || in.CanaryRevisionHash == "" {
+		return false
+	}
+	if cs.TargetID == in.TargetID && cs.CanaryRevisionHash == in.CanaryRevisionHash {
+		return false
+	}
+	return !unitRetargeted(in)
+}
+
 // endCanary ends a record whose roll no longer exists: the unit reads
 // Stable with no record, as before its push, and a split a step wrote is
 // moved onto the revision every member runs.
@@ -179,12 +202,84 @@ func endCanary(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
 	if unitHoldsSplit(in) {
 		applyCutoverTraffic(in)
 	}
+	return clearRecord(in, v1beta1.RolloutPhaseStable)
+}
+
+// endTakenBackCanary ends a record whose push the operator took back while
+// Instances still run another revision: the unit keeps no record, those
+// Instances roll back under the run with no canary step, with the phase
+// reading RollingBack until the last of them lands, and each member's split
+// moves onto the stable revision where a pod of it serves, resting on the
+// revision that serves until one does.
+func endTakenBackCanary(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
+	emit(in.Recorder, in.ISVC, corev1.EventTypeNormal, EventReasonCanaryTargetReverted,
+		"%s canary toward revision %s ended: the spec returned to its stable revision %s while Instances still run another revision; they roll back to it with no canary step, and the traffic follows the Instances that serve it", in.Component, cs.CanaryRevisionHash, in.CanaryRevisionHash)
+	settleTrafficOnTarget(in)
+	return clearRecord(in, idlePhase(in))
+}
+
+// clearRecord removes the unit's record and projects the phase a unit with
+// no record reads: Stable, as before its push, or RollingBack while the
+// Instances of a roll the operator took back are still coming back.
+func clearRecord(in ReconcileInputs, phase v1beta1.RolloutPhase) *Result {
 	rollout.SetCanaryStatusFor(&in.ISVC.Status, in.Component, nil)
 	if !anyUnitRecord(in.ISVC) {
 		in.ISVC.Status.Canary = nil
 	}
-	setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
+	setPhase(in.ISVC, in.Component, phase)
 	return &Result{Active: false}
+}
+
+// sitsOut reports a unit under an open run that records every member at
+// its stable revision: the run offers it no target, so no step starts.
+func sitsOut(in ReconcileInputs) bool {
+	return in.RunActive && in.TargetID != "" && in.CanaryRevisionHash != "" && !unitRetargeted(in)
+}
+
+// idlePhase is the phase a unit with no record projects: RollingBack while
+// it sits a run out with a pod still on a revision the run does not record
+// for its member, the Instances of a roll the operator took back rolling
+// back with no step, else Stable. The projector holds none of a unit that
+// reads RollingBack with no record; a unit that sits a run out whole keeps
+// step 0's hold, which the next push lands on before its record is written.
+func idlePhase(in ReconcileInputs) v1beta1.RolloutPhase {
+	if sitsOut(in) && instancesTrail(in) {
+		return v1beta1.RolloutPhaseRollingBack
+	}
+	return v1beta1.RolloutPhaseStable
+}
+
+// instancesTrail reports whether a pod of the unit, ready or not, runs a
+// revision other than the one the run records for its member.
+func instancesTrail(in ReconcileInputs) bool {
+	if podsOff(memberPods(in, in.Component, in.PerRevisionPods), in.CanaryRevisionHash) {
+		return true
+	}
+	for c, m := range in.Secondaries {
+		if podsOff(memberPods(in, c, in.GroupReadyPerRevisionPods[c]), m.CanaryRevisionHash) {
+			return true
+		}
+	}
+	return false
+}
+
+// memberPods is every pod of a member per revision when the dispatcher
+// counted them, else the ready pods that stand in for them.
+func memberPods(in ReconcileInputs, c v1beta1.ComponentType, ready map[string]int32) map[string]int32 {
+	if total, ok := in.GroupTotalPerRevisionPods[c]; ok {
+		return total
+	}
+	return ready
+}
+
+// podsOff reports a pod on a revision other than the one named.
+func podsOff(pods map[string]int32, revision string) bool {
+	for h, n := range pods {
+		if h != "" && h != revision && n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // unitHoldsSplit reports whether any member of the unit has a traffic split
@@ -215,10 +310,11 @@ func planHoldClause(isvc *v1beta1.InferenceService) string {
 }
 
 // applyHolds runs the verbs and holds of the canary grid in the order they
-// take precedence: a live canary's retarget, the rollback hold, a rollback
-// request, the Failed hold, the done sentinel, then arming. It returns the
-// status the step machine runs against (freshly armed when it was nil) and
-// a non-nil Result when the pass ends inside a hold.
+// take precedence: the end of a roll the operator took back, a live
+// canary's retarget, the rollback hold, a rollback request, the Failed
+// hold, the done sentinel, then arming. It returns the status the step
+// machine runs against (freshly armed when it was nil) and a non-nil
+// Result when the pass ends inside a hold.
 func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup, cs *v1beta1.CanaryStatus, plan *v1beta1.GroupCanary, targetChanged bool, take func(string)) (*v1beta1.CanaryStatus, *Result, error) {
 	steps := len(plan.Steps)
 
@@ -227,6 +323,15 @@ func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup
 	// stays.
 	if cs != nil && cs.RollbackRequested && !isRollbackRequested(in.ISVC) {
 		cs.RollbackRequested = false
+	}
+
+	// The operator set the spec back to the unit's stable revision while
+	// Instances still run another: the run opened for them records every
+	// member at its stable, so the roll the record names is gone. The
+	// record ends and the Instances roll back with no canary step; a unit
+	// holding a rejection keeps its hold instead.
+	if rollTakenBack(in, cs) {
+		return nil, endTakenBackCanary(in, cs), nil
 	}
 
 	// A live canary binds to the IR's authoritative target before any verb
@@ -265,7 +370,7 @@ func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup
 					return cs, nil, err
 				}
 				resetCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, in.CanaryRevisionHash, in.Now)
-			} else if !parkedWithoutStable(cs) {
+			} else if !stoppedWithoutStable(cs) {
 				why := "the canary is rolling back"
 				if in.ISVC.Status.Components[in.Component].RolloutPhase == v1beta1.RolloutPhaseRolledBack {
 					why = "the canary is held rolled back"
@@ -303,10 +408,15 @@ func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup
 			// exists leaves nothing to hold.
 			return nil, endCanary(in, cs), nil
 		} else {
-			// The marker is the record; the phase is re-projected from it
-			// every pass, so a status write that dropped the phase cannot
-			// un-park the canary.
-			setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseFailed)
+			// The recorded failure is the record, and the phase is projected
+			// from it every pass, so a status write that dropped the phase
+			// cannot end the hold. A Failed phase with no recorded failure
+			// is a stop written from outside the controller: it is kept,
+			// recorded with its own reason and reported once with
+			// CanaryRollHeld, as any stop. The split it left follows the
+			// pods only where a stable revision has none serving.
+			parkFailed(in, cs, v1beta1.CanaryFailurePhaseWritten)
+			holdStoppedTraffic(in, cs)
 			refuseRollback(in, cs, take)
 			ignoreForce(in, cs, take, "the canary is parked Failed")
 			return cs, (&Result{Active: true}).wake(in.ParkedRequeue), nil
@@ -321,7 +431,9 @@ func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup
 	// while the last stable instance rolls and reads Stable once every
 	// member serves on its target alone. A rollback request reaches this
 	// branch only once the cutover has landed, with no stable revision left
-	// to return to.
+	// to return to. A Failed phase written onto a finished unit from outside
+	// the controller reads Done (StateOf), so the pass projects the phase
+	// from the record again and holds nothing.
 	if cs != nil && int(cs.CurrentStep) >= steps {
 		if shouldRearm(in, cs, targetChanged, rearmDone) {
 			resetCanaryStatus(in.ISVC, in.Component, cs, in.TargetID, in.CanaryRevisionHash, in.Now)
@@ -331,7 +443,7 @@ func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup
 			// a done canary evaluates no gates.
 			syncPromotedThrough(in, cs, take)
 			ignoreRollback(in, cs, take)
-			return cs, finishCutover(in, cs), nil
+			return cs, finishCutover(in, cs, plan, true), nil
 		}
 	}
 
@@ -352,14 +464,21 @@ func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup
 	// revision to shift traffic from, toward a target the unit does not
 	// already serve. A unit the run did not retarget sits the run out: arming
 	// it would walk a full ladder, spend its analysis budget on a no-op, and
-	// could reach a rollback for a rollout that never happened.
+	// could reach a rollback for a rollout that never happened. While such a
+	// run is open its Instances may still be rolling back to the revision
+	// the run names, after a push the operator took back: the phase says so
+	// while they do, and a split a member still carries follows the pods
+	// onto that revision.
 	if cs == nil {
 		ignoreRollback(in, nil, take)
 		if in.CanaryRevisionHash == "" || in.StableRevisionHash == "" ||
 			(in.TargetID == "" && readyCanaryCapacity(in) >= in.DesiredReplicas) ||
 			!unitRetargeted(in) {
+			if sitsOut(in) {
+				settleTrafficOnTarget(in)
+			}
 			if in.CanaryRevisionHash != "" && in.DesiredReplicas > 0 {
-				setPhase(in.ISVC, in.Component, v1beta1.RolloutPhaseStable)
+				setPhase(in.ISVC, in.Component, idlePhase(in))
 			}
 			return nil, &Result{Active: false}, nil
 		}

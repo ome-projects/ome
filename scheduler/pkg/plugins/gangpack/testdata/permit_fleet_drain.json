@@ -1,0 +1,26 @@
+{
+  "recordedOn": {
+    "date": "2026-11-04",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The gate's scans of the waiting set and its waiting-pod reads are zero in every drain; its lookups by UID are seven per gate decision, 1,344 per drain of 24 gangs of 8 in either order. Cycles, requeues, node reads, gang lists and activations are unchanged.",
+  "tolerancePercent": 0.5,
+  "budgets": {
+    "nodes=216/gang=8/pending=24/gang-major/activations": 168,
+    "nodes=216/gang=8/pending=24/gang-major/cycles": 192,
+    "nodes=216/gang=8/pending=24/gang-major/gang-lists": 384,
+    "nodes=216/gang=8/pending=24/gang-major/node-reads": 41664,
+    "nodes=216/gang=8/pending=24/gang-major/requeues": 0,
+    "nodes=216/gang=8/pending=24/gang-major/waiting-pod-lookups": 1344,
+    "nodes=216/gang=8/pending=24/gang-major/waiting-pod-reads": 0,
+    "nodes=216/gang=8/pending=24/gang-major/waiting-set-scans": 0,
+    "nodes=216/gang=8/pending=24/interleaved/activations": 169,
+    "nodes=216/gang=8/pending=24/interleaved/cycles": 276,
+    "nodes=216/gang=8/pending=24/interleaved/gang-lists": 468,
+    "nodes=216/gang=8/pending=24/interleaved/node-reads": 59808,
+    "nodes=216/gang=8/pending=24/interleaved/requeues": 0,
+    "nodes=216/gang=8/pending=24/interleaved/waiting-pod-lookups": 1344,
+    "nodes=216/gang=8/pending=24/interleaved/waiting-pod-reads": 0,
+    "nodes=216/gang=8/pending=24/interleaved/waiting-set-scans": 0
+  }
+}

@@ -3,6 +3,7 @@ package workload_test
 import (
 	"context"
 	"encoding/json"
+	"runtime"
 	"testing"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 
 // revisionWithPodSpec is a ControllerRevision whose payload records spec as
 // its pod template: the baseline an in-place start's diff is judged against.
-func revisionWithPodSpec(t *testing.T, name, ns string, spec *corev1.PodSpec) *appsv1.ControllerRevision {
+func revisionWithPodSpec(t testing.TB, name, ns string, spec *corev1.PodSpec) *appsv1.ControllerRevision {
 	t.Helper()
 	raw, err := json.Marshal(revision.DataPayload{PodSpec: spec})
 	if err != nil {
@@ -265,4 +266,30 @@ func probesNeverReadyPath(pod *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// allocationReading is what one measured call allocated: heap objects and
+// bytes.
+type allocationReading struct {
+	allocs, bytes uint64
+}
+
+// measureCall runs run once and reads what it allocated, the way
+// testing.AllocsPerRun reads a call: on one scheduler thread, with the heap
+// collected first. Another goroutine can add to a reading, never take from
+// it, so the smallest of several readings over fresh fixtures is the
+// call's own.
+func measureCall(run func() error) (allocationReading, error) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	runtime.GC()
+	return readCall(run)
+}
+
+// readCall reads what one run allocates: heap objects and bytes.
+func readCall(run func() error) (allocationReading, error) {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	err := run()
+	runtime.ReadMemStats(&after)
+	return allocationReading{allocs: after.Mallocs - before.Mallocs, bytes: after.TotalAlloc - before.TotalAlloc}, err
 }

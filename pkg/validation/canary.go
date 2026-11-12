@@ -166,7 +166,9 @@ func validateCanaryUnits(gi int, g *v1beta1.RolloutGroup, declared map[v1beta1.C
 // same function validates an inline group's canary, a RolloutPolicy body, and
 // the composed effective plan at run open. where names the body's field path
 // in errors (e.g. "spec.rollout.groups[2].canary" or, for a policy,
-// "spec.canary").
+// "spec.canary"). The plan-wide rules come first (steps present, every
+// analysis well formed, a positive readyTimeout, full traffic on the last
+// step), then each step in order.
 func ValidateCanaryPlan(where string, c *v1beta1.GroupCanary) error {
 	if len(c.Steps) == 0 {
 		return fmt.Errorf("%s.steps must not be empty (%s)", where, ReasonCanaryInvalid)
@@ -177,38 +179,57 @@ func ValidateCanaryPlan(where string, c *v1beta1.GroupCanary) error {
 	if c.ReadyTimeout != nil && c.ReadyTimeout.Duration <= 0 {
 		return fmt.Errorf("%s.readyTimeout must be > 0 when set (%s)", where, ReasonCanaryInvalid)
 	}
-	last := c.Steps[len(c.Steps)-1]
-	if last.Traffic != 100 {
+	if last := c.Steps[len(c.Steps)-1]; last.Traffic != 100 {
 		return fmt.Errorf("%s final step traffic must be 100, got %d (%s)", where, last.Traffic, ReasonCanaryInvalid)
 	}
-	var prevWeight int32
-	for i, s := range c.Steps {
-		// Strict capacity parsing: the runtime resolver maps anything it cannot
-		// parse to zero new capacity, so admission must reject every such form
-		// instead of letting a step silently stage nothing.
-		val, isPercent, perr := parseCanaryCapacity(s.Capacity)
-		if perr != nil {
-			return fmt.Errorf("%s.steps[%d].capacity: %v (%s)", where, i, perr, ReasonCanaryInvalid)
+	var previous int32
+	for i, step := range c.Steps {
+		if err := validateCanaryStep(where, i, step, previous, i == len(c.Steps)-1); err != nil {
+			return err
 		}
-		if s.Traffic < 0 || s.Traffic > 100 {
-			return fmt.Errorf("%s.steps[%d].traffic: traffic %d must be in [0,100] (%s)", where, i, s.Traffic, ReasonCanaryInvalid)
-		}
-		if s.Traffic < prevWeight {
-			return fmt.Errorf("%s.steps[%d].traffic: traffic %d must be >= the previous step's %d (canary weights are non-decreasing) (%s)",
-				where, i, s.Traffic, prevWeight, ReasonCanaryInvalid)
-		}
-		prevWeight = s.Traffic
-		if s.Traffic > 0 && val == 0 {
-			return fmt.Errorf("%s.steps[%d].capacity: capacity %q resolves to zero new capacity but traffic is %d — a step cannot send traffic to zero capacity (%s)",
-				where, i, s.Capacity.String(), s.Traffic, ReasonCanaryInvalid)
-		}
-		// Only the percentage form of the final capacity is checkable at
-		// admission (absolute counts need the desired replica count); the done
-		// sentinel also forces partition 0.
-		if i == len(c.Steps)-1 && isPercent && val != 100 {
-			return fmt.Errorf("%s.steps[%d].capacity: final step capacity must be 100%% (rollout completes at full capacity), got %q (%s)",
-				where, i, s.Capacity.String(), ReasonCanaryInvalid)
-		}
+		previous = step.Traffic
+	}
+	return nil
+}
+
+// validateCanaryStep checks one step against the traffic of the step before
+// it: a capacity in a form the resolver reads, traffic within range and not
+// falling, no traffic to zero capacity, and on the final step a percentage
+// of 100.
+func validateCanaryStep(where string, i int, step v1beta1.RolloutGroupStep, previous int32, final bool) error {
+	// Strict capacity parsing: the runtime resolver maps anything it cannot
+	// parse to zero new capacity, so admission must reject every such form
+	// instead of letting a step silently stage nothing.
+	capacity, isPercent, err := parseCanaryCapacity(step.Capacity)
+	if err != nil {
+		return fmt.Errorf("%s.steps[%d].capacity: %v (%s)", where, i, err, ReasonCanaryInvalid)
+	}
+	if err := validateCanaryTraffic(where, i, step.Traffic, previous); err != nil {
+		return err
+	}
+	if step.Traffic > 0 && capacity == 0 {
+		return fmt.Errorf("%s.steps[%d].capacity: capacity %q resolves to zero new capacity but traffic is %d — a step cannot send traffic to zero capacity (%s)",
+			where, i, step.Capacity.String(), step.Traffic, ReasonCanaryInvalid)
+	}
+	// Only the percentage form of the final capacity is checkable at
+	// admission (absolute counts need the desired replica count); a finished
+	// run also drives the partition to 0.
+	if final && isPercent && capacity != 100 {
+		return fmt.Errorf("%s.steps[%d].capacity: final step capacity must be 100%% (rollout completes at full capacity), got %q (%s)",
+			where, i, step.Capacity.String(), ReasonCanaryInvalid)
+	}
+	return nil
+}
+
+// validateCanaryTraffic keeps a step's traffic within 0 to 100 and at or
+// above the previous step's: canary weights never fall.
+func validateCanaryTraffic(where string, i int, traffic, previous int32) error {
+	if traffic < 0 || traffic > 100 {
+		return fmt.Errorf("%s.steps[%d].traffic: traffic %d must be in [0,100] (%s)", where, i, traffic, ReasonCanaryInvalid)
+	}
+	if traffic < previous {
+		return fmt.Errorf("%s.steps[%d].traffic: traffic %d must be >= the previous step's %d (canary weights are non-decreasing) (%s)",
+			where, i, traffic, previous, ReasonCanaryInvalid)
 	}
 	return nil
 }

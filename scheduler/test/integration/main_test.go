@@ -24,7 +24,7 @@ var globalKubeConfig *rest.Config
 
 // discardedPods counts the scheduler log line for a pod its queue dropped as
 // tracked twice. Every scheduler and plugin log line passes through it.
-var discardedPods = &logCounter{out: os.Stderr, marker: []byte(discardedPodMarker)}
+var discardedPods = &logCounter{out: os.Stderr, pattern: []byte(discardedPodLogLine)}
 
 func TestMain(m *testing.M) {
 	klog.SetLoggerWithOptions(textlogger.NewLogger(textlogger.NewConfig(textlogger.Output(discardedPods))), klog.ContextualLogger(true))

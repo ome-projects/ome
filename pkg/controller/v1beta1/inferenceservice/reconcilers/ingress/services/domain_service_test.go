@@ -223,61 +223,6 @@ func TestDefaultDomainService_GenerateDomainName(t *testing.T) {
 	}
 }
 
-func TestDefaultDomainService_GenerateInternalDomainName(t *testing.T) {
-	tests := []struct {
-		name           string
-		serviceName    string
-		obj            interface{}
-		ingressConfig  *controllerconfig.IngressConfig
-		expectedDomain string
-		expectedError  bool
-	}{
-		{
-			name:        "internal domain with InferenceService",
-			serviceName: "test-service",
-			obj: &v1beta1.InferenceService{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-service",
-					Namespace: "default",
-				},
-			},
-			ingressConfig: &controllerconfig.IngressConfig{
-				DomainTemplate: "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
-			},
-			expectedDomain: "test-service.default.cluster.local", // Uses cluster domain
-			expectedError:  false,
-		},
-		{
-			name:        "internal domain with ObjectMeta",
-			serviceName: "internal-service",
-			obj: metav1.ObjectMeta{
-				Name:      "internal-service",
-				Namespace: "system",
-			},
-			ingressConfig: &controllerconfig.IngressConfig{
-				DomainTemplate: "{{.Name}}.{{.Namespace}}.{{.IngressDomain}}",
-			},
-			expectedDomain: "internal-service.system.cluster.local",
-			expectedError:  false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			service := NewDomainService()
-
-			domain, err := service.GenerateInternalDomainName(tt.serviceName, tt.obj, tt.ingressConfig)
-
-			if tt.expectedError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, tt.expectedDomain, domain)
-			}
-		})
-	}
-}
-
 func TestDefaultDomainService_GetAdditionalHosts(t *testing.T) {
 	tests := []struct {
 		name               string

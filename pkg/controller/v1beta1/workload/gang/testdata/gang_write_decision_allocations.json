@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-05",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The decision for one gang at rest reads the cached group against the plan field by field, builds nothing and copies nothing onto the inventory: 0 at every shape. Before, the decision built the group the plan asks for and the key its pods prove through a set and a sorted list, to compare them with the cached group, about 20 allocations per gang of eight, 3,180 at 160 gangs and 10,712 at 500, and 22 per gang of a leader and one worker, 38,887 at 1,725; the write that followed sent nothing and still copied the group onto the inventory, 8 per gang: 1,280, 4,000 and 13,800.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "160x8/decision/allocations": 0,
+    "160x8/write-at-rest/allocations": 0,
+    "1725x2/decision/allocations": 0,
+    "1725x2/write-at-rest/allocations": 0,
+    "500x8/decision/allocations": 0,
+    "500x8/write-at-rest/allocations": 0
+  }
+}

@@ -23,7 +23,6 @@ import (
 	schedulingv1alpha1 "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/gang"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
@@ -108,11 +107,6 @@ func gangAbandonInput(isvc, ns string, src *workload.InstanceStatus, removed *[]
 			Namespace: ns,
 			OwnerName: isvc,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvc,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		MutateInstance: func(_ context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
 			if idx == src.Index {
@@ -336,11 +330,6 @@ func TestAbandonFailedGangSurge_NeverPromotedSourceEndsFailed(t *testing.T) {
 				Namespace: namespace,
 				OwnerName: isvcName,
 				Component: workload.ComponentEngine,
-				SelectorLabels: map[string]string{
-					constants.InferenceServicePodLabelKey: isvcName,
-					constants.OMEComponentLabel:           string(workload.ComponentEngine),
-					query.LabelManagedBy:                  query.ManagedByOMENative,
-				},
 			},
 			ObservedState: workload.WorkloadObservedState{
 				InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -984,11 +973,6 @@ func TestGangSurge_RestoresMissingTargetMarkerBeforeEffects(t *testing.T) {
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source)},
@@ -1075,11 +1059,6 @@ func TestGangSurge_CachedTargetMissingAuthoritativelyRestoresBeforeEffects(t *te
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -1170,11 +1149,6 @@ func TestGangSurge_RestartAfterTargetStampFailureRestoresCleanupBeforeRedirects(
 					Namespace: namespace,
 					OwnerName: isvcName,
 					Component: workload.ComponentEngine,
-					SelectorLabels: map[string]string{
-						constants.InferenceServicePodLabelKey: isvcName,
-						constants.OMEComponentLabel:           string(workload.ComponentEngine),
-						query.LabelManagedBy:                  query.ManagedByOMENative,
-					},
 				},
 				ObservedState: workload.WorkloadObservedState{
 					InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source)},
@@ -1285,11 +1259,6 @@ func gangSurgeRecoveryInput(
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		DesiredSpec: workload.WorkloadDesiredSpec{
 			PodSpec:       &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "example/leader:latest"}}},
@@ -1730,11 +1699,6 @@ func TestGangSurge_PodlessSourcePersistsTerminalMarkerBeforeFinalization(t *test
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(surge)},
@@ -1839,11 +1803,6 @@ func TestAbandonFailedGangSurge_PersistsCleanupMarkerAcrossRemovalFailure(t *tes
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -2044,11 +2003,6 @@ func TestAbandonFailedGangSurge_AtomicallyRemovesMarkerAndResetsSource(t *testin
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -2147,11 +2101,6 @@ func TestGangSurge_CleanupMarkerRemainsTerminalWhenDesiredRevisionReturns(t *tes
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -2236,11 +2185,6 @@ func TestGangSurge_StaleCachedCleanupDoesNotDeletePods(t *testing.T) {
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -2324,11 +2268,6 @@ func atomicAbandonWave(t *testing.T, store *terminalMutationStore, t0 time.Time,
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			InstanceStatuses: []workload.InstanceStatus{cloneTerminalStatus(source), cloneTerminalStatus(marker)},
@@ -3617,6 +3556,7 @@ func gangCleanupRejectionFixture(t *testing.T) (workload.ReconcileInput, *termin
 			Type:           workload.InstanceOperationUpdate,
 			Step:           workload.UpdateStepGangSurgeTarget,
 			TargetRevision: retired,
+			Deadline:       metav1.NewTime(time.Now().Add(30 * time.Minute)),
 		},
 	}
 	store := &terminalMutationStore{
@@ -3635,11 +3575,6 @@ func gangCleanupRejectionFixture(t *testing.T) (workload.ReconcileInput, *termin
 			Namespace: namespace,
 			OwnerName: isvcName,
 			Component: workload.ComponentEngine,
-			SelectorLabels: map[string]string{
-				constants.InferenceServicePodLabelKey: isvcName,
-				constants.OMEComponentLabel:           string(workload.ComponentEngine),
-				query.LabelManagedBy:                  query.ManagedByOMENative,
-			},
 		},
 		ObservedState: workload.WorkloadObservedState{
 			UpdateRevision:   currentRev,
@@ -3742,6 +3677,9 @@ func TestAbandonFailedGangSurge_RejectedDeleteParksRetirementOnce(t *testing.T) 
 	}
 	if marker.LastFailure == nil || marker.LastFailure.Reason != workload.RejectionReasonInvalidPodSpec {
 		t.Fatalf("marker LastFailure: got %+v want reason %s", marker.LastFailure, workload.RejectionReasonInvalidPodSpec)
+	}
+	if !marker.Operation.Deadline.IsZero() {
+		t.Fatalf("kept cleanup operation deadline: got %v want none on a Failed row", marker.Operation.Deadline)
 	}
 	if b, held := blocks[currentRev]; !held || b.State != workload.RetryBlockHeld {
 		t.Fatalf("RetryBlock for %s: got %+v want Held (the revision in force is blamed)", currentRev, blocks)

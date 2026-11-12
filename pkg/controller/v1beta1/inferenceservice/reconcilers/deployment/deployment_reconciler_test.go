@@ -921,3 +921,97 @@ func TestReconcile_ExternalClassUpdateKeepsLiveCountBelowMinReplicas(t *testing.
 		assert.Equal(t, int32(2), *stored.Spec.Replicas)
 	}
 }
+
+// TestCreateRawDeploymentTemplateCarriesDeclaredAndOMEAnnotationsOnly shows
+// which annotations of the component metadata reach the Deployment's pod
+// template: a key the Component declares, OME's own keys and the pod-level
+// prefixes do; a service annotation the Component does not declare stays on
+// the Deployment's own metadata only.
+func TestCreateRawDeploymentTemplateCarriesDeclaredAndOMEAnnotationsOnly(t *testing.T) {
+	componentMeta := metav1.ObjectMeta{
+		Name:      "service-engine",
+		Namespace: "team-a",
+		Labels:    map[string]string{"app": "service-engine"},
+		Annotations: map[string]string{
+			"editor.example.com/write-counter": "1",
+			"example.com/owner":                "team-a",
+			"ome.io/local-queue":               "queue-a",
+			"prometheus.io/scrape":             "true",
+			"example.com/declared":             "component",
+		},
+	}
+	componentExt := &v1beta1.ComponentExtensionSpec{Annotations: map[string]string{"example.com/declared": "component"}}
+	podSpec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "runner", Image: "example.com/serving:v1"}}}
+
+	deployment := createRawDeployment(componentMeta, componentExt, podSpec)
+
+	got := deployment.Spec.Template.Annotations
+	for key, want := range map[string]string{
+		"ome.io/local-queue":   "queue-a",
+		"prometheus.io/scrape": "true",
+		"example.com/declared": "component",
+	} {
+		assert.Equal(t, want, got[key], "template annotation %s", key)
+	}
+	for _, key := range []string{"editor.example.com/write-counter", "example.com/owner"} {
+		value, ok := got[key]
+		assert.False(t, ok, "a service annotation the Component does not declare reached the pod template: %s=%q", key, value)
+		assert.Equal(t, componentMeta.Annotations[key], deployment.Annotations[key], "the Deployment's own metadata keeps %s", key)
+	}
+	assert.Equal(t, "1", componentMeta.Annotations["editor.example.com/write-counter"], "the caller's metadata is left alone")
+}
+
+// TestReconcileServiceAnnotationValueWritesNoNewTemplate shows what a writer
+// that rewrites a service annotation does to a RawDeployment: the second
+// value builds the same pod template, the stored Deployment is not written
+// (its resourceVersion stands) and no ReplicaSet rolls. A declared Component
+// annotation still moves the template.
+func TestReconcileServiceAnnotationValueWritesNoNewTemplate(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, appsv1.AddToScheme(scheme))
+	const key = "editor.example.com/write-counter"
+	componentMeta := func(value string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{
+			Name:        "service-engine",
+			Namespace:   "team-a",
+			Labels:      map[string]string{"app": "service-engine"},
+			Annotations: map[string]string{key: value, "ome.io/local-queue": "queue-a"},
+		}
+	}
+	componentExt := &v1beta1.ComponentExtensionSpec{}
+	podSpec := func() *corev1.PodSpec {
+		return &corev1.PodSpec{Containers: []corev1.Container{{Name: "runner", Image: "example.com/serving:v1"}}}
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	deploymentKey := types.NamespacedName{Name: "service-engine", Namespace: "team-a"}
+
+	_, err := NewDeploymentReconciler(cl, scheme, componentMeta("1"), componentExt, podSpec(), nil).Reconcile()
+	assert.NoError(t, err)
+	stored := &appsv1.Deployment{}
+	assert.NoError(t, cl.Get(context.TODO(), deploymentKey, stored))
+	firstVersion := stored.ResourceVersion
+	_, carried := stored.Spec.Template.Annotations[key]
+	assert.False(t, carried, "the service annotation must stay off the pod template")
+
+	second := NewDeploymentReconciler(cl, scheme, componentMeta("2"), componentExt, podSpec(), nil)
+	result, _, err := second.checkDeploymentExist()
+	assert.NoError(t, err)
+	assert.Equal(t, constants.CheckResultExisted, result, "the second value must build the same Deployment spec")
+	_, err = second.Reconcile()
+	assert.NoError(t, err)
+	assert.NoError(t, cl.Get(context.TODO(), deploymentKey, stored))
+	assert.Equal(t, firstVersion, stored.ResourceVersion, "the second value must not write the Deployment")
+	_, carried = stored.Spec.Template.Annotations[key]
+	assert.False(t, carried, "the second value must stay off the pod template")
+
+	declared := &v1beta1.ComponentExtensionSpec{Annotations: map[string]string{"example.com/declared": "1"}}
+	declaredMeta := componentMeta("2")
+	declaredMeta.Annotations["example.com/declared"] = "1"
+	_, err = NewDeploymentReconciler(cl, scheme, declaredMeta, declared, podSpec(), nil).Reconcile()
+	assert.NoError(t, err)
+	assert.NoError(t, cl.Get(context.TODO(), deploymentKey, stored))
+	assert.NotEqual(t, firstVersion, stored.ResourceVersion, "a declared Component annotation writes the Deployment")
+	assert.Equal(t, "1", stored.Spec.Template.Annotations["example.com/declared"], "a declared Component annotation reaches the pod template")
+	_, carried = stored.Spec.Template.Annotations[key]
+	assert.False(t, carried, "the service annotation stays off the template through a declared change")
+}

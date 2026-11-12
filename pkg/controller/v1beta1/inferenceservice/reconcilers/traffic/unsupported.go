@@ -1,6 +1,7 @@
 package traffic
 
 import (
+	"slices"
 	"sort"
 	"strings"
 
@@ -12,25 +13,14 @@ import (
 )
 
 // BackendAnnotationKeys is the canonical set of ome.io/* keys that
-// flow through a translator. The Envoy Gateway translator honors all
-// of them; a translator MAY support a subset (e.g. an implementation
-// that doesn't model per-endpoint circuit-breaker limits), and
+// flow through a translator: the circuit-breaker, retry and timeout
+// groups Resolve reads. The Envoy Gateway translator honors all of
+// them; a translator MAY support a subset (e.g. an implementation that
+// doesn't model per-endpoint circuit-breaker limits), and
 // operator-declared keys in this set that the active translator does
 // NOT support are surfaced as UnsupportedField on the InferenceService.
 func BackendAnnotationKeys() sets.Set[string] {
-	return sets.New(
-		constants.CircuitBreakerMaxConnectionsAnnotation,
-		constants.CircuitBreakerMaxParallelRequestsAnnotation,
-		constants.CircuitBreakerMaxPendingRequestsAnnotation,
-		constants.CircuitBreakerMaxParallelRetriesAnnotation,
-		constants.CircuitBreakerPerEndpointMaxConnectionsAnnotation,
-		constants.RetryAttemptsAnnotation,
-		constants.RetryOnAnnotation,
-		constants.RetryPerTryTimeoutAnnotation,
-		constants.TimeoutIdleAnnotation,
-		constants.TimeoutMaxConnectionDurationAnnotation,
-		constants.TimeoutTCPConnectAnnotation,
-	)
+	return sets.New(slices.Concat(circuitBreakerKeys, retryKeys, timeoutKeys)...)
 }
 
 // allPassthroughPrefixes is the canonical set of ome.io/* pass-through
@@ -62,29 +52,37 @@ func ComputeUnsupportedAnnotations(annotations map[string]string, translator Tra
 	if len(annotations) == 0 {
 		return nil
 	}
-	supported := translator.SupportedAnnotations()
-	if supported == nil {
-		supported = sets.New[string]()
+	support := annotationSupport{
+		backend:  BackendAnnotationKeys(),
+		honored:  translator.SupportedAnnotations(),
+		prefixes: translator.SupportedPassthroughPrefixes(),
 	}
-	ownedPrefixes := translator.SupportedPassthroughPrefixes()
-	allKnownBackend := BackendAnnotationKeys()
-
 	var unsupported []string
 	for key := range annotations {
-		// Bucket 1: per-key annotation flowing through the translator.
-		if allKnownBackend.Has(key) {
-			if !supported.Has(key) {
-				unsupported = append(unsupported, key)
-			}
-			continue
-		}
-		// Bucket 2: pass-through annotation under a known prefix.
-		if isPassthroughKey(key) && !hasMatchingPrefix(key, ownedPrefixes) {
+		if support.drops(key) {
 			unsupported = append(unsupported, key)
 		}
 	}
 	sort.Strings(unsupported)
 	return unsupported
+}
+
+// annotationSupport is what the active translator honors: of the backend
+// keys, the honored ones, and the pass-through prefixes it owns.
+type annotationSupport struct {
+	backend  sets.Set[string]
+	honored  sets.Set[string]
+	prefixes []string
+}
+
+// drops reports whether the translator ignores key: a backend key it does
+// not honor, or a pass-through under a prefix it does not own. Any other
+// annotation is not the translator's to honor.
+func (s annotationSupport) drops(key string) bool {
+	if s.backend.Has(key) {
+		return !s.honored.Has(key)
+	}
+	return underPrefix(key, allPassthroughPrefixes()) && !underPrefix(key, s.prefixes)
 }
 
 // ComputeUnsupportedTrafficFields returns the sorted list of typed
@@ -111,20 +109,7 @@ func ComputeUnsupportedTrafficFields(spec *v1beta1.TrafficSpec, translator Trans
 	return unsupported
 }
 
-func isPassthroughKey(key string) bool {
-	for _, p := range allPassthroughPrefixes() {
-		if strings.HasPrefix(key, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func hasMatchingPrefix(key string, prefixes []string) bool {
-	for _, p := range prefixes {
-		if strings.HasPrefix(key, p) {
-			return true
-		}
-	}
-	return false
+// underPrefix reports whether key starts with one of prefixes.
+func underPrefix(key string, prefixes []string) bool {
+	return slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(key, p) })
 }

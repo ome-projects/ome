@@ -1718,6 +1718,21 @@ spec:
                     minItems: 1
                     type: array
                     x-kubernetes-list-type: atomic
+                  readySinceBase:
+                    format: date-time
+                    type: string
+                  readySinceIndexes:
+                    minLength: 1
+                    pattern: ^(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?(,(0|[1-9][0-9]*)(-(0|[1-9][0-9]*))?)*$
+                    type: string
+                  readySinceOffsets:
+                    items:
+                      format: int32
+                      minimum: 0
+                      type: integer
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
                   rowOrder:
                     items:
                       format: int32
@@ -1782,6 +1797,11 @@ spec:
                 - members
                 - phases
                 type: object
+                x-kubernetes-validations:
+                - message: readySinceBase, readySinceIndexes and readySinceOffsets
+                    are present together or not at all
+                  rule: has(self.readySinceBase) == has(self.readySinceIndexes) &&
+                    has(self.readySinceIndexes) == has(self.readySinceOffsets)
               instanceStatusEncoding:
                 enum:
                 - ColumnarV2

@@ -56,12 +56,6 @@ func GetFineTunedWeight(cl client.Client, name string) (*v1beta1.FineTunedWeight
 	return nil, goerrors.New("No FineTunedWeight with the name: " + name)
 }
 
-// ReconcileBaseModel retrieves and validates the base model for an InferenceService
-func ReconcileBaseModel(cl client.Client, isvc *v1beta1.InferenceService) (*v1beta1.BaseModelSpec, *metav1.ObjectMeta, error) {
-	spec, meta, _, err := ReconcileBaseModelWithStatus(cl, isvc)
-	return spec, meta, err
-}
-
 // ReconcileBaseModelWithStatus retrieves and validates the base model for an
 // InferenceService and also returns the model status for readiness checks.
 // Returns (nil, nil, nil, nil) when the ISVC has no model reference — the

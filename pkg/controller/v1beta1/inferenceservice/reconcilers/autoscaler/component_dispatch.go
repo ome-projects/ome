@@ -87,26 +87,8 @@ type RawDispatchInput struct {
 // DispatchForRawComponent targets the Component's Deployment and owner-refs
 // the generated autoscaler to the live InferenceService.
 func DispatchForRawComponent(ctx context.Context, input RawDispatchInput) error {
-	if input.ISVC == nil {
-		return fmt.Errorf("DispatchForRawComponent: nil ISVC (refusing to stamp orphaned autoscaler)")
-	}
-	if input.ISVC.Name == "" {
-		return fmt.Errorf("DispatchForRawComponent: empty ISVC name")
-	}
-	if input.ISVC.Namespace == "" {
-		return fmt.Errorf("DispatchForRawComponent: empty ISVC namespace")
-	}
-	if input.ISVC.UID == "" {
-		return fmt.Errorf("DispatchForRawComponent: ISVC %s/%s has empty UID (refusing to stamp orphaned autoscaler)", input.ISVC.Namespace, input.ISVC.Name)
-	}
-	if input.ComponentMeta.Name == "" {
-		return fmt.Errorf("DispatchForRawComponent: empty component name")
-	}
-	if input.ComponentMeta.Namespace == "" {
-		return fmt.Errorf("DispatchForRawComponent: empty component namespace")
-	}
-	if input.ComponentMeta.Namespace != input.ISVC.Namespace {
-		return fmt.Errorf("DispatchForRawComponent: namespace mismatch: component %q, ISVC %q", input.ComponentMeta.Namespace, input.ISVC.Namespace)
+	if err := checkRawDispatchInput(input); err != nil {
+		return err
 	}
 
 	if input.PolicyHold {
@@ -152,25 +134,56 @@ func DispatchForRawComponent(ctx context.Context, input RawDispatchInput) error 
 	if dispatchErr != nil && !IsTransitionPending(dispatchErr) {
 		return dispatchErr
 	}
-
-	switch {
-	case input.PolicyHold:
-	case input.PolicySourced:
-		if err := stampRawLastRendered(ctx, input.Client, input.ComponentMeta.Namespace, input.ComponentMeta.Name, input.ResolvedAutoscaler); err != nil {
-			return err
-		}
-	case dispatchErr != nil:
-		// The policy's scaler may be all that runs until the switch finishes,
-		// so a hold in this window must still be able to restore it.
-	default:
-		// The record describes a scaler a policy rendered. Once the Component's
-		// scaler comes from anywhere else, a later hold must keep that scaler
-		// instead of bringing the old policy's scaler back.
-		if err := clearRawLastRendered(ctx, input.Client, input.ComponentMeta.Namespace, input.ComponentMeta.Name); err != nil {
-			return err
-		}
+	if err := recordRawRender(ctx, input, dispatchErr); err != nil {
+		return err
 	}
 	return dispatchErr
+}
+
+// checkRawDispatchInput refuses an input that does not name the service and
+// the Deployment the autoscaler is written for: a scaler owned by a service
+// without a UID, or named for another namespace, could never be collected.
+func checkRawDispatchInput(input RawDispatchInput) error {
+	if input.ISVC == nil {
+		return fmt.Errorf("DispatchForRawComponent: nil ISVC (refusing to stamp orphaned autoscaler)")
+	}
+	if input.ISVC.Name == "" {
+		return fmt.Errorf("DispatchForRawComponent: empty ISVC name")
+	}
+	if input.ISVC.Namespace == "" {
+		return fmt.Errorf("DispatchForRawComponent: empty ISVC namespace")
+	}
+	if input.ISVC.UID == "" {
+		return fmt.Errorf("DispatchForRawComponent: ISVC %s/%s has empty UID (refusing to stamp orphaned autoscaler)", input.ISVC.Namespace, input.ISVC.Name)
+	}
+	if input.ComponentMeta.Name == "" {
+		return fmt.Errorf("DispatchForRawComponent: empty component name")
+	}
+	if input.ComponentMeta.Namespace == "" {
+		return fmt.Errorf("DispatchForRawComponent: empty component namespace")
+	}
+	if input.ComponentMeta.Namespace != input.ISVC.Namespace {
+		return fmt.Errorf("DispatchForRawComponent: namespace mismatch: component %q, ISVC %q", input.ComponentMeta.Namespace, input.ISVC.Namespace)
+	}
+	return nil
+}
+
+// recordRawRender keeps the Deployment's last-known-good record in step with
+// the scaler that was just dispatched. A hold changes nothing. A policy's
+// render is recorded. A scaler from anywhere else clears the record, so a
+// later hold keeps that scaler instead of bringing the old policy's back,
+// unless a switch is still pending: the policy's scaler may be all that runs
+// until the switch finishes, so a hold in that window must still restore it.
+func recordRawRender(ctx context.Context, input RawDispatchInput, dispatchErr error) error {
+	switch {
+	case input.PolicyHold:
+		return nil
+	case input.PolicySourced:
+		return stampRawLastRendered(ctx, input.Client, input.ComponentMeta.Namespace, input.ComponentMeta.Name, input.ResolvedAutoscaler)
+	case dispatchErr != nil:
+		return nil
+	}
+	return clearRawLastRendered(ctx, input.Client, input.ComponentMeta.Namespace, input.ComponentMeta.Name)
 }
 
 // rawLastRendered reads the last-known-good policy render off the

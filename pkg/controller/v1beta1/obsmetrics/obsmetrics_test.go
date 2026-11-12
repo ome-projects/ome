@@ -516,3 +516,19 @@ func TestRecordIRStatusConversion(t *testing.T) {
 		t.Fatalf("got delta %v want 1", end-start)
 	}
 }
+
+func TestSetIRStatusReadySinceColumnsMissing(t *testing.T) {
+	const name = "ome_omenative_ir_status_readysince_columns_missing"
+	SetIRStatusReadySinceColumnsMissing(3)
+	if got, ok := gaugeFor(name, prometheus.Labels{}); !ok || got != 3 {
+		t.Fatalf("%s = %v (present %v), want 3", name, got, ok)
+	}
+	SetIRStatusReadySinceColumnsMissing(0)
+	if got, ok := gaugeFor(name, prometheus.Labels{}); !ok || got != 0 {
+		t.Fatalf("%s = %v (present %v), want 0", name, got, ok)
+	}
+	SetIRStatusReadySinceColumnsMissing(-2)
+	if got, _ := gaugeFor(name, prometheus.Labels{}); got != 0 {
+		t.Fatalf("%s = %v after a negative count, want 0", name, got)
+	}
+}

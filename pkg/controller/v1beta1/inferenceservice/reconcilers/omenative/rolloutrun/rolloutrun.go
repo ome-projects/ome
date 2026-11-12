@@ -6,7 +6,10 @@
 // state lives in — one status flush carries both, so the pinned plan and the
 // step counters can never be observed out of sync. Executors consume the
 // pinned plan (rollout.Effective); spec and policy edits are inert
-// mid-run and take effect at the next open. Failure to resolve a plan PARKS
+// mid-run and take effect at the next open, except that the coordination
+// gates read a group's ratio rule, a rolling group's budgets and the
+// group's presence from the spec as it is now, the members staying as
+// recorded (rollout.EffectiveCoordination). Failure to resolve a plan PARKS
 // the rollout (condition + held update gates) — it never falls back to the
 // default progression, because silently removing a declared gate is the
 // failure class this layer exists to prevent.
@@ -16,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -62,6 +66,21 @@ type Inputs struct {
 	// (a deterministic config error must not start a roll whose gate cannot
 	// sample).
 	BoundProviders map[string]struct{}
+	// RouteCapabilities is the declared capability set of the route provider
+	// the InferenceService's external route resolves to. A canary whose
+	// traffic percentages need a capability the provider declares it lacks
+	// is held at open, and the TrafficIntentReady condition reports the
+	// provider's standing every pass; a provider with no declared set gates
+	// nothing and is reported as unverified.
+	RouteCapabilities validation.RouteProviderCapabilities
+	// ComponentDeploymentModes is the deployment mode of every Component the
+	// spec declares, as the controller resolved it for this pass. A recorded
+	// member whose Component is missing from the map, or runs under another
+	// mode, has left the run: admission takes such a Component out of every
+	// rollout group in the same write and the cleanup deletes its replica,
+	// so nothing of it can retarget or converge again. nil reads every
+	// member as OMENative.
+	ComponentDeploymentModes map[v1beta1.ComponentType]constants.DeploymentModeType
 }
 
 // Outcome reports the pass result. Parked means the effective plan could not
@@ -80,6 +99,11 @@ type Outcome struct {
 	// be bound to the run without being reset.
 	Opened  bool
 	Adopted bool
+	// Closed is the run this pass closed ahead of the run it opened, with the
+	// plan it pinned: a unit the fresh run keeps where it stands reads its
+	// recorded step against that plan. Nil when the pass opened over no run,
+	// or over a run closed on an earlier pass.
+	Closed *v1beta1.RolloutRun
 	// Policies is the set of referenced RolloutPolicy objects this pass
 	// observed: the set the executors' effective view resolves through, so
 	// they read every reference the way the run opener did.
@@ -123,6 +147,7 @@ func reconcile(ctx context.Context, in Inputs, policies rollout.Policies) (Outco
 	if err := writeResolutionView(isvc, policies); err != nil {
 		return Outcome{}, err
 	}
+	reportTrafficIntent(in, now)
 
 	active := activeRun(isvc)
 	// closedRun is the run a retarget closed on this pass. Its close event
@@ -135,7 +160,8 @@ func reconcile(ctx context.Context, in Inputs, policies rollout.Policies) (Outco
 		return Outcome{}, nil
 	}
 
-	targets, fresh, err := observeGroupTargets(ctx, in.Reader, isvc, active)
+	left := departedMembers(in, active)
+	targets, fresh, err := observeGroupTargets(ctx, in.Reader, isvc, active, left)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -148,6 +174,15 @@ func reconcile(ctx context.Context, in Inputs, policies rollout.Policies) (Outco
 				return Outcome{}, err
 			}
 			return Outcome{StateChanged: changed, RequeueAfter: shortRequeue}, nil
+		}
+		// A run whose every recorded member left the OMENative mode has nothing
+		// left to read: no replica of those members will ever report the
+		// recorded revision. It closes on the spec alone, so a group that took
+		// the members' place can open its own run on the next pass.
+		if len(left) > 0 && noRecordedMemberRemains(active, left) {
+			closeAndRest(in, active, v1beta1.RolloutRunSuperseded, now,
+				"run %s closed: %s left the OMENative mode and every rollout group, and no other recorded member remains", active.RunID, membersLabel(departedList(active, left)))
+			return Outcome{StateChanged: true}, nil
 		}
 		if !fresh {
 			return Outcome{RequeueAfter: shortRequeue}, nil
@@ -174,7 +209,7 @@ func reconcile(ctx context.Context, in Inputs, policies rollout.Policies) (Outco
 			recordRunClosed(isvc, v1beta1.RolloutRunSuperseded)
 			closedRun, active = active, nil
 			// fall through to the open path with a fresh render.
-		} else if outcome, done := closedOutcome(isvc, active, targets); done {
+		} else if outcome, done := closedOutcome(isvc, active, targets, left); done {
 			closeAndRest(in, active, outcome, now, "run %s closed: %s", active.RunID, outcome)
 			return Outcome{StateChanged: true}, nil
 		} else {
@@ -244,7 +279,7 @@ func reconcile(ctx context.Context, in Inputs, policies rollout.Policies) (Outco
 		emit(in.Recorder, isvc, corev1.EventTypeNormal, EventRunOpened,
 			"run %s opened (%s)", isvc.Status.Rollout.ActiveRun.RunID, combinedPlanDigest(plan.digests))
 	}
-	return Outcome{StateChanged: true, RequeueAfter: shortRequeue, Opened: true, Adopted: adopting}, nil
+	return Outcome{StateChanged: true, RequeueAfter: shortRequeue, Opened: true, Adopted: adopting, Closed: closedRun}, nil
 }
 
 // emitRetargetClose records the close of a run whose target moved on, with
@@ -268,17 +303,19 @@ func closeAndRest(in Inputs, active *v1beta1.RolloutRun, outcome v1beta1.Rollout
 }
 
 // reportGroupsRemoved records the drift of a run whose spec declares no
-// rollout group any more. The run keeps executing the plan it recorded and
-// closes when that plan finishes, rolls back or is superseded by a new
-// target; the rollback verb ends it sooner and the repin verb closes it at
-// once.
+// rollout group any more. The run keeps the revisions it recorded and
+// closes when every recorded member reaches them, rolls back or is
+// superseded by a new target; a canary keeps its recorded steps, a rolling
+// or blue-green group stops pacing its members at once while the pairing
+// gates keep its pairable minimum; the rollback verb ends the run sooner
+// and the repin verb closes it at once.
 func reportGroupsRemoved(in Inputs, active *v1beta1.RolloutRun, now metav1.Time) {
 	isvc := in.ISVC
 	recordDrift(isvc, true)
 	if setPlanDrift(isvc, true, v1beta1.RolloutPlanDriftReasonSpecNewerThanRun,
-		"spec.rollout removed mid-run; the run continues on its recorded plan and closes when that plan finishes or rolls back — end it sooner with ome.io/rollout-rollback, or close it at once with ome.io/rollout-repin", now) {
+		"spec.rollout removed mid-run; the run keeps its recorded revisions and closes when every member reaches them or rolls back; a canary keeps its recorded steps, a rolling or blue-green group stops pacing at once (a pairing-protocol change in flight keeps its pairable minimum) — end the run sooner with ome.io/rollout-rollback, or close it at once with ome.io/rollout-repin", now) {
 		emit(in.Recorder, isvc, corev1.EventTypeWarning, EventGroupRemoved,
-			"spec.rollout was removed while run %s is open; the run continues on its recorded plan and closes when that plan finishes or rolls back (ome.io/rollout-rollback ends it sooner, ome.io/rollout-repin closes it at once)", active.RunID)
+			"spec.rollout was removed while run %s is open; the run keeps its recorded revisions and closes when every member reaches them or rolls back; a canary keeps its recorded steps, a rolling or blue-green group stops pacing at once and a pairing-protocol change in flight keeps its pairable minimum (ome.io/rollout-rollback ends the run sooner, ome.io/rollout-repin closes it at once)", active.RunID)
 	}
 	setPlanReady(isvc, corev1.ConditionTrue, v1beta1.RolloutPlanReasonPinned,
 		fmt.Sprintf("run %s pinned", active.RunID), now)
@@ -324,6 +361,15 @@ func composePlan(in Inputs, policies rollout.Policies) (composedPlan, string, st
 		if composed.Canary != nil {
 			if verr := validation.ValidateCanaryPlan(fmt.Sprintf("groups[%d].canary (composed)", gi), composed.Canary); verr != nil {
 				return plan, v1beta1.RolloutPlanReasonPlanInvalid, verr.Error(), nil
+			}
+			// A canary on the externally routed unit programs its traffic
+			// percentages onto the route. A provider declared unable to split
+			// a route between revisions would run the steps with those
+			// percentages dropped, so the run does not open.
+			required := validation.RouteRequirementsOfGroup(fmt.Sprintf("groups[%d]", gi), &composed, validation.RouteEntrypoint(&isvc.Spec))
+			if unsupported := validation.UnsupportedRouteCapabilities(required, in.RouteCapabilities); len(unsupported) > 0 {
+				return plan, v1beta1.RolloutPlanReasonRouteProviderUnsupported,
+					validation.RouteCapabilityUnsupportedError(unsupported[0], in.RouteCapabilities).Error(), nil
 			}
 			if pr := composed.Canary.Prometheus; pr != nil && pr.ProviderRef != nil {
 				if _, bound := in.BoundProviders[pr.ProviderRef.Name]; !bound {
@@ -419,7 +465,7 @@ func openRun(isvc *v1beta1.InferenceService, plan composedPlan, targets map[v1be
 		isvc.Status.Rollout = &v1beta1.RolloutStatus{}
 	}
 	isvc.Status.Rollout.ActiveRun = &v1beta1.RolloutRun{
-		RunID:           runID(isvc, pinned, plan.digests, now.UTC().Format(time.RFC3339)),
+		RunID:           runID(isvc, pinned, plan.digests, now.UTC().Format(time.RFC3339), closedRunID(isvc)),
 		OpenedAt:        now,
 		PinnedAt:        now,
 		TargetRevisions: pinned,
@@ -443,6 +489,7 @@ func closeRun(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, outcom
 	opened := active.OpenedAt
 	isvc.Status.Rollout.LastRun = &v1beta1.RolloutRunRecord{
 		Outcome:         outcome,
+		RunID:           active.RunID,
 		OpenedAt:        &opened,
 		ClosedAt:        &now,
 		TargetRevisions: append([]v1beta1.RolloutRunTarget(nil), active.TargetRevisions...),
@@ -513,12 +560,21 @@ func retargeted(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, targ
 // closedOutcome decides whether the run reached a terminal state: RolledBack
 // (the canary's sticky hold settled) or Completed — every pinned group's
 // members converged to the pinned target (a canary unit also reports Stable),
-// or the group rests Staged (a lifecycle partition deliberately holds mixed
-// revisions; keying completion on full convergence alone would pin such a
-// run's plan forever).
-func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, targets map[v1beta1.ComponentType]targetPair) (v1beta1.RolloutRunOutcome, bool) {
+// or every member short of the target rests at its own partition in a group
+// that rests Staged (a lifecycle partition deliberately holds mixed
+// revisions; keying completion on full convergence alone would keep such a
+// run open forever). A member short of the target for another reason (an
+// Instance still being created, a retry record keeping its current revision
+// behind) keeps the run open: the open reads that member's divergence, so a
+// close over it would open a run again on the next pass. A member in left is
+// not read: it has left the OMENative mode, so the run is decided on the
+// members that remain.
+func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, targets map[v1beta1.ComponentType]targetPair, left map[v1beta1.ComponentType]bool) (v1beta1.RolloutRunOutcome, bool) {
 	pinnedFor := map[v1beta1.ComponentType]string{}
 	for _, t := range active.TargetRevisions {
+		if left[t.Component] {
+			continue
+		}
 		pinnedFor[t.Component] = t.Revision
 	}
 	pinnedSpec := active.Plan.AsRolloutSpec(isvc.Spec.Rollout)
@@ -534,7 +590,7 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 				// is done once every member rests on the pinned revision.
 				for _, comp := range g.Components {
 					pinnedRev := pinnedFor[comp]
-					if pinnedRev == "" {
+					if pinnedRev == "" || left[comp] {
 						continue
 					}
 					obs := targets[comp]
@@ -545,18 +601,14 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 				continue
 			}
 			if cs.RolledBackRevisionHash != "" {
-				// Only a rollback of what THIS run presented is this run's
-				// outcome. A group still holding an older rejection was pinned
-				// at its stable revision and is inert here; letting its
-				// standing failure close the run would end every other group's
-				// rollout for a revision this run never offered.
-				if pinnedFor[primary] != cs.RolledBackRevisionHash {
-					continue
-				}
-				if rollout.StateOf(cs, primaryPhase(isvc, g), len(g.Canary.Steps)) == rollout.CanaryStateRolledBack {
+				switch decideRejectedUnit(isvc, g, cs, closeReading{recorded: pinnedFor, observed: targets, left: left}) {
+				case rejectedUnitHoldsRunOpen:
+					return "", false
+				case rejectedUnitClosesRolledBack:
 					return v1beta1.RolloutRunRolledBack, true
+				case rejectedUnitInert:
 				}
-				return "", false
+				continue
 			}
 			if stepShortOfEnd(isvc, primary, cs, g.Canary.Steps) {
 				return "", false
@@ -572,11 +624,10 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 			// trail, and current is promoted only once every Instance is Ready on
 			// the pin. A close before the pair agrees would reopen at once.
 			for _, comp := range g.Components {
-				obs := targets[comp]
-				if obs.straggling() {
-					return "", false
+				if left[comp] {
+					continue
 				}
-				if pinnedRev := pinnedFor[comp]; pinnedRev != "" && obs.current != pinnedRev {
+				if trailsRecordedRevision(targets[comp], pinnedFor[comp]) {
 					return "", false
 				}
 			}
@@ -584,19 +635,97 @@ func closedOutcome(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, t
 		}
 		for _, comp := range g.Components {
 			pinnedRev := pinnedFor[comp]
-			if pinnedRev == "" {
+			if pinnedRev == "" || left[comp] {
 				continue
 			}
 			obs := targets[comp]
 			if obs.current == pinnedRev && obs.target == pinnedRev && (obs.replicas == 0 || obs.updated >= obs.replicas) {
 				continue
 			}
-			if !groupStaged(isvc, resolved, comp) {
+			if !obs.stagedByPartition() || !groupStaged(isvc, resolved, comp) {
 				return "", false
 			}
 		}
 	}
 	return v1beta1.RolloutRunCompleted, true
+}
+
+// rejectedUnitDecision is what a canary unit holding a rejection says about
+// the close of the run.
+type rejectedUnitDecision int
+
+const (
+	// rejectedUnitHoldsRunOpen: the revert is still draining, or an Instance
+	// still trails the revision the run recorded for a member of the unit.
+	rejectedUnitHoldsRunOpen rejectedUnitDecision = iota
+	// rejectedUnitClosesRolledBack: the revert of the revision this run
+	// recorded for the unit settled.
+	rejectedUnitClosesRolledBack
+	// rejectedUnitInert: the unit holds the rejection of a revision this run
+	// does not name and rests on its stable revision; the other groups decide.
+	rejectedUnitInert
+)
+
+// closeReading is what the close reads per member: the revision the run
+// recorded for it, its replica's observed revision pair with its counters,
+// and whether it left the OMENative mode.
+type closeReading struct {
+	recorded map[v1beta1.ComponentType]string
+	observed map[v1beta1.ComponentType]targetPair
+	left     map[v1beta1.ComponentType]bool
+}
+
+// decideRejectedUnit reads a canary unit holding a rejection for the close.
+// Only a rollback of the revision this run recorded for the unit is this
+// run's outcome: the run closes RolledBack once the revert settles. A unit
+// holding the rejection of a revision this run does not name was recorded
+// at its stable revision, and its rejection never closes the run: that
+// would end every other group's rollout for a revision this run never
+// offered. It still keeps the run open while its revert drains, and while
+// an Instance trails the recorded revision after the operator set the
+// template back to the stable: the roll back needs a recorded run, and a
+// close over it would be followed by an adoption on the next pass, every
+// pass until the Instances land.
+func decideRejectedUnit(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup, cs *v1beta1.CanaryStatus, reading closeReading) rejectedUnitDecision {
+	primary := primaryOfGroup(g)
+	state := rollout.StateOf(cs, primaryPhase(isvc, g), len(g.Canary.Steps))
+	if reading.recorded[primary] == cs.RolledBackRevisionHash {
+		if state == rollout.CanaryStateRolledBack {
+			return rejectedUnitClosesRolledBack
+		}
+		return rejectedUnitHoldsRunOpen
+	}
+	if state == rollout.CanaryStateRollingBack || reading.unitTrails(g) {
+		return rejectedUnitHoldsRunOpen
+	}
+	return rejectedUnitInert
+}
+
+// unitTrails reports a member of the group whose replica's update revision
+// is the revision the run recorded for it while an Instance still runs
+// another. A member whose update revision is not the recorded one tells
+// nothing about it: a settled rejection keeps the rejected revision as the
+// replica's target with every Instance on the stable revision.
+func (r closeReading) unitTrails(g *v1beta1.RolloutGroup) bool {
+	for _, comp := range g.Components {
+		recorded := r.recorded[comp]
+		if recorded == "" || r.left[comp] {
+			continue
+		}
+		obs := r.observed[comp]
+		if obs.target == recorded && trailsRecordedRevision(obs, recorded) {
+			return true
+		}
+	}
+	return false
+}
+
+// trailsRecordedRevision reports a member whose Instances have not all
+// reached the revision the run recorded for it: some still run another
+// revision, or the replica has not promoted its current revision to it,
+// which it does only once every Instance is Ready there.
+func trailsRecordedRevision(obs targetPair, recorded string) bool {
+	return obs.straggling() || (recorded != "" && obs.current != recorded)
 }
 
 // groupStaged reports whether the coordination status group owning comp
@@ -626,35 +755,56 @@ func primaryPhase(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) v1bet
 	return ""
 }
 
-// updateDrift compares each spec group's live render digest against the
-// pinned one and stamps RolloutPlanDrift. A canary group disappearing from
-// the spec gets a pointed event: only the rollback and repin verbs abort a
-// pinned run.
+// updateDrift compares each spec group's live render digest and members
+// against the recorded group's and sets RolloutPlanDrift. A group whose
+// members changed under an unchanged progression body is drift too: the
+// recorded plan still governs the members it names, and a plan reread
+// replaces it with the members the spec names now. A group's ratio rule and
+// a rolling group's budgets are not plan content: the coordination gates
+// read them from the spec, so the live digest is compared with the digest
+// of the group as it executes and an edit of them is no drift, while a
+// change of the progression kind or of a canary body is. A canary group
+// disappearing from the spec gets a pointed event: only the rollback and
+// repin verbs abort a recorded run.
 func updateDrift(in Inputs, policies rollout.Policies, active *v1beta1.RolloutRun, now metav1.Time) error {
 	isvc := in.ISVC
 	specGroups := isvc.Spec.Rollout.Groups
-	pinned := active.Plan.Groups
+	recorded := active.Plan.Groups
+	executing := rollout.EffectiveCoordination(isvc, policies)
 
-	if len(specGroups) != len(pinned) {
-		canaryGone := pinnedHasCanary(pinned) && !specHasCanaryKind(isvc.Spec.Rollout)
-		msg := "spec.rollout group shape changed mid-run; the pinned plan continues until the next run or a repin"
+	if len(specGroups) != len(recorded) {
+		canaryGone := pinnedHasCanary(recorded) && !specHasCanaryKind(isvc.Spec.Rollout)
+		msg := "spec.rollout group shape changed mid-run; the run keeps its recorded revisions, a rolling or blue-green group that shares no member with any spec group stops pacing at once (a pairing-protocol change in flight keeps its pairable minimum), and the rest of the recorded plan continues until the next run or a repin"
 		if canaryGone {
-			msg = "the canary group was removed mid-run; the pinned canary continues — abort with ome.io/rollout-rollback, or repin with ome.io/rollout-repin"
+			msg = "the canary group was removed mid-run; the recorded canary continues — abort with ome.io/rollout-rollback, or repin with ome.io/rollout-repin"
 		}
 		recordDrift(isvc, true)
 		if setPlanDrift(isvc, true, v1beta1.RolloutPlanDriftReasonSpecNewerThanRun, msg, now) && canaryGone {
 			emit(in.Recorder, isvc, corev1.EventTypeWarning, EventGroupRemoved,
-				"canary group removed while run %s is pinned; deleting the group does not abort a pinned run — use ome.io/rollout-rollback or ome.io/rollout-repin", active.RunID)
+				"canary group removed while run %s is recorded; deleting the group does not abort a recorded run — use ome.io/rollout-rollback or ome.io/rollout-repin", active.RunID)
 		}
 		return nil
 	}
 
 	for gi := range specGroups {
+		if !sameMembers(specGroups[gi].Components, recorded[gi].Group.Components) {
+			setPlanDrift(isvc, true, v1beta1.RolloutPlanDriftReasonSpecNewerThanRun,
+				fmt.Sprintf("groups[%d]: members changed from %s to %s; the edit applies at the next run (or via ome.io/rollout-repin)",
+					gi, membersLabel(recorded[gi].Group.Components), membersLabel(specGroups[gi].Components)), now)
+			recordDrift(isvc, true)
+			return nil
+		}
 		live, err := liveSourceDigest(&specGroups[gi], policies)
 		if err != nil {
 			return err
 		}
-		if live == pinned[gi].PortableDigest {
+		executingDigest := recorded[gi].PortableDigest
+		if gi < len(executing.Groups) {
+			if digest, derr := rolloutpolicy.ProgressionDigest(&executing.Groups[gi]); derr == nil && digest != "" {
+				executingDigest = digest
+			}
+		}
+		if live == executingDigest {
 			continue
 		}
 		reason := v1beta1.RolloutPlanDriftReasonSpecNewerThanRun
@@ -666,8 +816,8 @@ func updateDrift(in Inputs, policies rollout.Policies, active *v1beta1.RolloutRu
 			liveLabel = "(unresolvable)"
 		}
 		setPlanDrift(isvc, true, reason,
-			fmt.Sprintf("groups[%d]: live render %s differs from pinned %s; the edit applies at the next run (or via ome.io/rollout-repin)",
-				gi, liveLabel, pinned[gi].PortableDigest), now)
+			fmt.Sprintf("groups[%d]: live render %s differs from recorded %s; the edit applies at the next run (or via ome.io/rollout-repin)",
+				gi, liveLabel, executingDigest), now)
 		recordDrift(isvc, true)
 		return nil
 	}
@@ -729,10 +879,11 @@ func handleRepin(ctx context.Context, in Inputs, active *v1beta1.RolloutRun, now
 	// Idempotence is what makes the verb safe under cache lag: a pass that
 	// still sees the annotation after a prior pass already swapped (the
 	// removal patch outran the informer) re-renders to exactly the pinned
-	// digests and must be pure cleanup — re-applying would re-stamp
-	// PinnedAt and re-clamp for no reason, and claiming a state change
-	// would trigger a spurious flush.
-	if fresh == oldDigest {
+	// digests and members and must be pure cleanup — re-applying would
+	// re-stamp PinnedAt and re-clamp for no reason, and claiming a state
+	// change would trigger a spurious flush. The digests cover the
+	// progression bodies alone, so the members are compared beside them.
+	if fresh == oldDigest && sameGroupMembers(plan.groups, active.Plan.Groups) {
 		return false, consumeAnnotation(ctx, in.Client, isvc, constants.RolloutRepinAnnotation)
 	}
 	if want != "now" && want != fresh {
@@ -751,65 +902,56 @@ func handleRepin(ctx context.Context, in Inputs, active *v1beta1.RolloutRun, now
 		return true, consumeAnnotation(ctx, in.Client, isvc, constants.RolloutRepinAnnotation)
 	}
 
-	oldSteps := pinnedCanarySteps(active)
+	ranUnder := canaryStepsByUnit(active)
+	oldMembers := groupMembersLabel(active.Plan.Groups)
 	active.Plan = v1beta1.RolloutRunPlan{Groups: plan.groups}
 	active.PinnedAt = now
-	clampCanary(isvc, active, oldSteps)
+	clampCanary(isvc, active, ranUnder)
 	recordRepin(isvc, true)
+	change := fmt.Sprintf("%s -> %s", oldDigest, fresh)
+	if fresh == oldDigest {
+		change = fmt.Sprintf("the progression bodies are unchanged (%s), the members are now %s (were %s)", fresh, groupMembersLabel(plan.groups), oldMembers)
+	}
 	emit(in.Recorder, isvc, corev1.EventTypeNormal, EventPlanRepinned,
-		"run %s repinned: %s -> %s", active.RunID, oldDigest, fresh)
+		"run %s repinned: %s", active.RunID, change)
 	setPlanDrift(isvc, false, v1beta1.RolloutPlanDriftReasonInSync, "", now)
 	return true, consumeAnnotation(ctx, in.Client, isvc, constants.RolloutRepinAnnotation)
 }
 
-// clampCanary bounds the persisted step counter into the repinned ladder and
-// arms the pre-step hold when the clamped step would raise traffic: the
-// executor programs traffic as soon as the capacity gate passes — before any
-// pause — so a bare index-clamp onto a higher-traffic step (always the case
-// when a shorter ladder clamps onto the final 100% step) would be immediate
-// exposure, not a hold.
-func clampCanary(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, oldSteps []v1beta1.RolloutGroupStep) {
+// clampCanary keeps every canary unit's recorded step inside the step list
+// the plan verb recorded for that unit, each against the list the unit ran
+// under: a unit finished under its old list stays finished, an index past
+// the new list's end lands on its last step, and the pre-step hold is set
+// when the kept step would raise traffic, since the executor writes a
+// step's traffic as soon as its capacity gate passes. A unit with no old
+// list on record is clamped into its new list alone.
+func clampCanary(isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, ranUnder map[v1beta1.ComponentType][]v1beta1.RolloutGroupStep) {
 	for i := range active.Plan.Groups {
 		g := &active.Plan.Groups[i].Group
 		c := g.Canary
 		if c == nil {
 			continue
 		}
-		cs := rollout.CanaryStatusFor(&isvc.Status, primaryOfGroup(g))
+		primary := primaryOfGroup(g)
+		cs := rollout.CanaryStatusFor(&isvc.Status, primary)
 		if cs == nil {
 			continue
 		}
-		// Done stays done: a canary that finished under the OLD ladder must
-		// not be resurrected by a repin. Done is judged against the old
-		// plan's length — an in-flight index merely beyond the NEW ladder is
-		// the shrink case and clamps to the last step instead. A negative
-		// step is an external status write, read the way the canary executor
-		// reads it, against the ladder the unit ran under.
-		step := rollout.StepOf(cs, primaryPhase(isvc, g), oldSteps)
-		if len(oldSteps) > 0 && int(step) >= len(oldSteps) {
-			cs.CurrentStep = int32(len(c.Steps))
-			return
-		}
-		cs.CurrentStep = step
-		if int(cs.CurrentStep) >= len(c.Steps) {
-			cs.CurrentStep = int32(len(c.Steps)) - 1
-		}
-		if c.Steps[cs.CurrentStep].Traffic > cs.ObservedTrafficWeight {
-			cs.PreStepHold = true
-		}
-		return
+		rollout.ClampStep(cs, primaryPhase(isvc, g), ranUnder[primary], c.Steps)
 	}
 }
 
-// pinnedCanarySteps is the pinned canary ladder's steps, nil when the
-// pinned plan carries no canary group.
-func pinnedCanarySteps(active *v1beta1.RolloutRun) []v1beta1.RolloutGroupStep {
+// canaryStepsByUnit is each canary unit's step list in the recorded plan,
+// by the unit's primary; empty when the plan carries no canary group.
+func canaryStepsByUnit(active *v1beta1.RolloutRun) map[v1beta1.ComponentType][]v1beta1.RolloutGroupStep {
+	out := map[v1beta1.ComponentType][]v1beta1.RolloutGroupStep{}
 	for i := range active.Plan.Groups {
-		if c := active.Plan.Groups[i].Group.Canary; c != nil {
-			return c.Steps
+		g := &active.Plan.Groups[i].Group
+		if g.Canary != nil {
+			out[primaryOfGroup(g)] = g.Canary.Steps
 		}
 	}
-	return nil
+	return out
 }
 
 func pinnedDigests(active *v1beta1.RolloutRun) []string {
@@ -818,6 +960,96 @@ func pinnedDigests(active *v1beta1.RolloutRun) []string {
 		out = append(out, active.Plan.Groups[i].PortableDigest)
 	}
 	return out
+}
+
+// departedMembers is the set of recorded members whose Component has left the
+// OMENative mode or the spec, read from the modes the controller resolved
+// for this pass. With no modes handed in, no member has left.
+func departedMembers(in Inputs, active *v1beta1.RolloutRun) map[v1beta1.ComponentType]bool {
+	left := map[v1beta1.ComponentType]bool{}
+	if active == nil || in.ComponentDeploymentModes == nil {
+		return left
+	}
+	for _, target := range active.TargetRevisions {
+		mode, declared := in.ComponentDeploymentModes[target.Component]
+		if !declared || mode != constants.OMENative {
+			left[target.Component] = true
+		}
+	}
+	return left
+}
+
+// noRecordedMemberRemains reports whether every member the run recorded has left.
+func noRecordedMemberRemains(active *v1beta1.RolloutRun, left map[v1beta1.ComponentType]bool) bool {
+	for _, target := range active.TargetRevisions {
+		if !left[target.Component] {
+			return false
+		}
+	}
+	return len(active.TargetRevisions) > 0
+}
+
+// departedList is the recorded members in left, in the run's order.
+func departedList(active *v1beta1.RolloutRun, left map[v1beta1.ComponentType]bool) []v1beta1.ComponentType {
+	var out []v1beta1.ComponentType
+	for _, target := range active.TargetRevisions {
+		if left[target.Component] {
+			out = append(out, target.Component)
+		}
+	}
+	return out
+}
+
+// sameMembers reports whether two member lists name the same set of
+// Components, in any order.
+func sameMembers(a, b []v1beta1.ComponentType) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := make(map[v1beta1.ComponentType]bool, len(a))
+	for _, c := range a {
+		seen[c] = true
+	}
+	for _, c := range b {
+		if !seen[c] {
+			return false
+		}
+	}
+	return true
+}
+
+// sameGroupMembers reports whether a fresh render names, group by group,
+// the members the recorded plan names.
+func sameGroupMembers(fresh, recorded []v1beta1.RolloutRunGroup) bool {
+	if len(fresh) != len(recorded) {
+		return false
+	}
+	for i := range fresh {
+		if !sameMembers(fresh[i].Group.Components, recorded[i].Group.Components) {
+			return false
+		}
+	}
+	return true
+}
+
+// membersLabel renders a member list for a condition or an event, as
+// "[engine, decoder]".
+func membersLabel(members []v1beta1.ComponentType) string {
+	names := make([]string, 0, len(members))
+	for _, c := range members {
+		names = append(names, string(c))
+	}
+	return "[" + strings.Join(names, ", ") + "]"
+}
+
+// groupMembersLabel renders every group's members, as
+// "groups[0]=[engine] groups[1]=[decoder]".
+func groupMembersLabel(groups []v1beta1.RolloutRunGroup) string {
+	parts := make([]string, 0, len(groups))
+	for i := range groups {
+		parts = append(parts, fmt.Sprintf("groups[%d]=%s", i, membersLabel(groups[i].Group.Components)))
+	}
+	return strings.Join(parts, " ")
 }
 
 // writeResolutionView refreshes status.rollout.groups[] — the always-current

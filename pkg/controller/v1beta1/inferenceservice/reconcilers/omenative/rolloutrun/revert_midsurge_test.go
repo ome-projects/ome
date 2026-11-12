@@ -43,20 +43,20 @@ func rowOn(index int32, running string) workloadtypes.InstanceStatus {
 	return workloadtypes.InstanceStatus{Index: index, RunningRevision: running}
 }
 
-func rowRollingTo(index int32, running, pinned string) workloadtypes.InstanceStatus {
+func rowRollingTo(index int32, running, recorded string) workloadtypes.InstanceStatus {
 	return workloadtypes.InstanceStatus{
 		Index:           index,
 		RunningRevision: running,
-		Operation:       &workloadtypes.InstanceOperation{Type: workloadtypes.InstanceOperationUpdate, TargetRevision: pinned},
+		Operation:       &workloadtypes.InstanceOperation{Type: workloadtypes.InstanceOperationUpdate, TargetRevision: recorded},
 	}
 }
 
 // A revert issued while one Instance is mid-surge must not read as
 // converged. The surging row still runs the revision the revert restores,
 // but it owes a roll: its runtime-ready replacement promotes onto the
-// pinned revision first and only then rolls back. Closing the run on that
+// recorded revision first and only then rolls back. Closing the run on that
 // false convergence hands the promote-then-roll-back sequence to a second
-// run, which is the churn this pins against.
+// run, which is the churn this test guards against.
 func TestRevertMidSurgeKeepsOneRunOpen(t *testing.T) {
 	isvc := isvcFixture(v1beta1.RolloutGroup{
 		Components: []v1beta1.ComponentType{v1beta1.EngineComponent},
@@ -101,20 +101,20 @@ func TestRevertMidSurgeKeepsOneRunOpen(t *testing.T) {
 	rolling := runID(t, "roll to the new revision")
 
 	// Revert while index 1 is still surging. Every row runs the restored
-	// revision, so only the pin distinguishes this from convergence.
+	// revision, so only the recorded target distinguishes this from convergence.
 	pass(t, irPublished(t, oldRev, oldRev, []workloadtypes.InstanceStatus{
 		rowOn(0, oldRev), rowRollingTo(1, oldRev, newRev), rowOn(2, oldRev),
 	}))
 	reverting := runID(t, "revert mid-surge")
 
-	// The surge promotes its replacement onto the pinned revision, then
+	// The surge promotes its replacement onto the recorded revision, then
 	// rolls that replacement back. Both steps belong to the run the
 	// revert is already running.
 	pass(t, irPublished(t, oldRev, oldRev, []workloadtypes.InstanceStatus{
 		rowOn(0, oldRev), rowOn(1, newRev), rowOn(2, oldRev),
 	}))
 	if got := runID(t, "surge promoted"); got != reverting {
-		t.Fatalf("promote opened a second run: got %s want %s (superseded %s)", got, reverting, rolling)
+		t.Fatalf("promote opened a second run: got %s want %s (replaced %s)", got, reverting, rolling)
 	}
 	pass(t, irPublished(t, oldRev, oldRev, []workloadtypes.InstanceStatus{
 		rowOn(0, oldRev), rowRollingTo(1, newRev, oldRev), rowOn(2, oldRev),

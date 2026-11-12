@@ -444,10 +444,6 @@ func TestEffectiveUsesOnlyBoundedReadRequests(t *testing.T) {
 					verb: "get", objectType: "*v1beta1.ClusterServingRuntime",
 					key: ctrlclient.ObjectKey{Name: "cluster-runtime"},
 				},
-				{
-					verb: "get", objectType: "*v1beta1.ClusterServingRuntime",
-					key: ctrlclient.ObjectKey{Name: "cluster-runtime"},
-				},
 			}, runtimeClient.operations)
 			assert.NotContains(t, out.String(), "private.example/runtime:secret")
 			assert.Contains(t, out.String(), "RevisionMissing")

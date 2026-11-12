@@ -73,13 +73,6 @@ func canonicalDim(p string) bool {
 // IsZero reports whether t is the absent topology.
 func (t Topology) IsZero() bool { return t.n == 0 }
 
-// Dims returns the dimensions in order.
-func (t Topology) Dims() []int64 {
-	out := make([]int64, t.n)
-	copy(out, t.dims[:t.n])
-	return out
-}
-
 // String returns the canonical form, which ParseTopology round-trips.
 func (t Topology) String() string {
 	parts := make([]string, t.n)

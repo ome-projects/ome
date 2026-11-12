@@ -830,6 +830,35 @@ func TestCheckSequentialGate_StatusAheadOfIRGenerationHolds(t *testing.T) {
 	}
 }
 
+// A replica whose parent-generation annotation is missing or unreadable
+// counts as rolling: the projector has not written this pass's projection
+// to it, so its settled-looking status says nothing about the service in
+// hand, and the next member in the Order waits on it. After a controller
+// upgrade every replica reads this way until the projector's first pass.
+func TestCheckSequentialGate_AReplicaWithoutAParentGenerationAnnotationReadsInFlight(t *testing.T) {
+	cases := map[string]map[string]string{
+		"missing":    nil,
+		"unreadable": {constants.InferenceReplicaParentGenerationAnnotationKey: "x"},
+	}
+	for name, annotations := range cases {
+		t.Run(name, func(t *testing.T) {
+			isvc := mkSequentialFixture("seq-isvc", 0)
+			isvc.Generation = 3
+			decoder := seqReadyIR(isvc.Name, v1beta1.DecoderComponent, "rev1", "rev1", "rev1", 2, 3)
+			decoder.Annotations = annotations
+			engine := seqReadyIR(isvc.Name, v1beta1.EngineComponent, "rev1", "rev1", "rev1", 2, 3)
+			reads := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(decoder, engine).Build()
+			allowed, reason := CheckSequentialGate(context.Background(), reads, isvc, v1beta1.EngineComponent)
+			if allowed {
+				t.Fatalf("the engine must wait on a decoder whose projection the gate cannot place: %s", reason)
+			}
+			if !strings.Contains(reason, "waiting on decoder") {
+				t.Fatalf("reason = %q, want the gate waiting on the decoder", reason)
+			}
+		})
+	}
+}
+
 func TestCheckSequentialGate_GenerationCaughtUpAndIdleBypasses(t *testing.T) {
 	// Once every Component's ObservedGeneration matches isvc.Generation
 	// AND revisions are converged, the gate must bypass (no rollout in
@@ -883,30 +912,23 @@ func TestCheckSequentialGate_NoOrderBypasses(t *testing.T) {
 // stamped on its fake IR spec (withIRSpecPartition) — the effective
 // value the gate reads — so the ISVC itself carries no lifecycle.
 func mkSequentialFixtureEngineFirst(name string) *v1beta1.InferenceService {
-	isvc := &v1beta1.InferenceService{
-		Spec: v1beta1.InferenceServiceSpec{
-			Engine:  &v1beta1.EngineSpec{},
-			Decoder: &v1beta1.DecoderSpec{},
-			Rollout: &v1beta1.RolloutSpec{
-				Groups: []v1beta1.RolloutGroup{
-					{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}},
-					{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}},
-				},
-			},
-		},
-	}
-	isvc.Name = name
-	return pinActiveRun(isvc)
+	isvc := mkSequentialFixtureInOrder(name, v1beta1.EngineComponent, v1beta1.DecoderComponent)
+	isvc.Spec.Engine, isvc.Spec.Decoder = &v1beta1.EngineSpec{}, &v1beta1.DecoderSpec{}
+	return isvc
 }
 
 // seqIR builds an InferenceReplica carrying the instance-level status
 // the desired-shape convergence check reads (Replicas + InstanceStatuses)
 // on top of the revision names. Namespace is empty to match the
-// namespace-less fixtures ComponentIRStatus reads with isvc.Namespace="".
+// namespace-less fixtures: DecodedComponentIRFor keys the read by the
+// service's namespace, "" here.
+// The recorded parent generation is the fixture service's, as the
+// projector writes it, so the replica reads as projected for the service.
 func seqIR(isvcName string, c v1beta1.ComponentType, currentHash, updateHash string, replicas int32, insts []v1beta1.OMENativeInstanceStatus) *v1beta1.InferenceReplica {
 	return &v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: isvcName + "-" + string(c),
+			Name:        isvcName + "-" + string(c),
+			Annotations: parentGenAnnotation(0),
 		},
 		Status: v1beta1.InferenceReplicaStatus{
 			CurrentRevision:  isvcName + "-" + string(c) + "-" + currentHash,
@@ -1607,4 +1629,89 @@ func TestCheckSequentialGate_TheWaitRunsFromTheRecordedFinishThroughAReadinessLo
 			t.Fatalf("the decoder is Ready again and the wait elapsed during the loss; the gate still holds: %s", reason)
 		}
 	})
+}
+
+// mkSequentialFixtureInOrder returns an ISVC whose rollout is a run of
+// single-Component blueGreen groups in the given order, recorded as the
+// active run, which ResolveGroups folds into one Sequential group.
+func mkSequentialFixtureInOrder(name string, order ...v1beta1.ComponentType) *v1beta1.InferenceService {
+	groups := make([]v1beta1.RolloutGroup, 0, len(order))
+	for _, c := range order {
+		groups = append(groups, v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{c}, BlueGreen: &v1beta1.GroupBlueGreen{}})
+	}
+	isvc := &v1beta1.InferenceService{Spec: v1beta1.InferenceServiceSpec{Rollout: &v1beta1.RolloutSpec{Groups: groups}}}
+	isvc.Name = name
+	return pinActiveRun(isvc)
+}
+
+// TestCheckSequentialGate_ALaterComponentWaitsUntilTheStagedOneRecordsThePush
+// 12 engines, then 8 decoders with 2 kept on version 1, then 2 routers.
+// Version 2 rolled and the decoder rests at its staged shape: 6 Instances
+// on version 2, 2 held, its current revision still version 1. The operator
+// pushes version 3 for the decoder and the router. While the decoder's
+// status was not written for the spec it holds, or its projection not for
+// the service in hand, the router waits on the decoder; once the status
+// records version 3 the router waits on the 6 decoders still to move. A
+// decoder the push did not touch rests done at its staged shape and the
+// router starts.
+func TestCheckSequentialGate_ALaterComponentWaitsUntilTheStagedOneRecordsThePush(t *testing.T) {
+	const name = "seq-isvc"
+	eng, dec, rtr := v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent
+	isvc := mkSequentialFixtureInOrder(name, eng, dec, rtr)
+	isvc.Generation = 4
+	staged := func() *v1beta1.InferenceReplica {
+		return stagedIR(name, dec, "v1", "v2", 8, 2, 4, time.Now().Add(-time.Hour))
+	}
+	for _, tc := range []struct {
+		name       string
+		decoder    *v1beta1.InferenceReplica
+		wantAllow  bool
+		wantReason string
+	}{
+		{
+			name: "the decoder's status still records the previous push",
+			decoder: func() *v1beta1.InferenceReplica {
+				ir := staged()
+				ir.Status.ObservedGeneration = 3 // the spec moved to generation 4; the status was written for 3
+				return ir
+			}(),
+			wantReason: "Sequential waiting on decoder",
+		},
+		{
+			name: "the decoder's projection trails the service",
+			decoder: func() *v1beta1.InferenceReplica {
+				ir := staged()
+				ir.Generation, ir.Status.ObservedGeneration = 3, 3
+				ir.Annotations = parentGenAnnotation(3) // the service is at generation 4
+				return ir
+			}(),
+			wantReason: "Sequential waiting on decoder",
+		},
+		{
+			name: "the decoder's status records the push with nothing moved yet",
+			decoder: func() *v1beta1.InferenceReplica {
+				ir := staged()
+				ir.Status.UpdateRevision = revName(name, dec, "v3")
+				return ir
+			}(),
+			wantReason: "Sequential waiting on decoder",
+		},
+		{
+			name:       "the push did not touch the decoder",
+			decoder:    staged(),
+			wantAllow:  true,
+			wantReason: "Sequential active Component",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine := seqReadyIR(name, eng, "v2", "v2", "v2", 12, 4)
+			router := seqReadyIR(name, rtr, "v2", "v3", "v2", 2, 4)
+			router.Status.ReadyReplicas, router.Status.ServingReplicas = 2, 2
+			cl := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(engine, tc.decoder, router).Build()
+			allowed, reason := CheckSequentialGate(context.Background(), cl, isvc, rtr)
+			if allowed != tc.wantAllow || reason != tc.wantReason {
+				t.Fatalf("router: allowed=%v reason=%q, want allowed=%v reason=%q", allowed, reason, tc.wantAllow, tc.wantReason)
+			}
+		})
+	}
 }

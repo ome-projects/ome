@@ -67,15 +67,11 @@ func FuzzParseIndexSet(f *testing.F) {
 		if set.Cardinality() == 0 || set.Cardinality() > limit {
 			t.Fatalf("accepted cardinality %d with limit %d", set.Cardinality(), limit)
 		}
-		values, err := set.Values(limit)
-		if err != nil {
-			t.Fatalf("Values() error = %v", err)
-		}
-		rebuilt, err := indexSetFromIndices(values, limit)
+		rebuilt, err := indexSetFromIndices(valuesOf(set), limit)
 		if err != nil {
 			t.Fatalf("indexSetFromIndices() error = %v", err)
 		}
-		if !rebuilt.Equal(set) || rebuilt.String() != raw {
+		if rebuilt.String() != raw {
 			t.Fatalf("round trip changed %q to %q", raw, rebuilt.String())
 		}
 	})
@@ -116,10 +112,7 @@ func FuzzEncodeIndexSet(f *testing.F) {
 		if err != nil {
 			t.Fatalf("parse encoded %q: %v", encoded, err)
 		}
-		values, err := parsed.Values(limit)
-		if err != nil {
-			t.Fatalf("Values() error = %v", err)
-		}
+		values := valuesOf(parsed)
 		if len(values) != len(indices) {
 			t.Fatalf("round trip length = %d, want %d", len(values), len(indices))
 		}

@@ -91,11 +91,14 @@ type ConfigReport struct {
 	transport bool
 }
 
-// SchemaReport is the outcome of the schema preflight.
+// SchemaReport is the outcome of the schema preflight. A schema that lacks
+// the readySince columns is OK, since a manager starts under it, and names
+// them: that manager stores each Instance's readySince in its entry.
 type SchemaReport struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
-	stale bool
+	OK                       bool     `json:"ok"`
+	Error                    string   `json:"error,omitempty"`
+	MissingReadySinceColumns []string `json:"missingReadySinceColumns,omitempty"`
+	stale                    bool
 }
 
 // ReplicaReport is the representation census of one cluster.
@@ -202,7 +205,10 @@ func (c ConfigReport) summary() string {
 }
 
 func (s SchemaReport) summary() string {
-	if s.OK {
+	switch {
+	case s.OK && len(s.MissingReadySinceColumns) > 0:
+		return fmt.Sprintf("ok; the schema lacks %s, so the manager stores each Instance's readySince in its entry", strings.Join(s.MissingReadySinceColumns, ", "))
+	case s.OK:
 		return "ok"
 	}
 	return "error: " + s.Error

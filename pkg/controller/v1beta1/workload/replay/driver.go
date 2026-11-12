@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
@@ -108,6 +109,9 @@ type driver struct {
 	// rejections are the injected apiserver refusals still owed to a
 	// matching write.
 	rejections []*pendingRejection
+	// quota is the namespace's pod-count quota the run enforces, nil when
+	// the scenario names none.
+	quota *QuotaSpec
 	// collisionCount salts the revision hash; the driver never bumps it,
 	// but the engine's hash inputs include it.
 	collisionCount *int32
@@ -130,6 +134,12 @@ type driver struct {
 	// open — the instant each landed on the injected clock, and whether a
 	// dead kubelet is what keeps the object from leaving.
 	terminating map[string]*podTeardown
+	// goneNodes names the Nodes a scenario has deleted under a bound pod.
+	// The fake cluster holds no Node until a scenario names one, so the
+	// engine's reading of which Nodes exist is answered from this set: a
+	// node the scenario never deleted is present, whatever the cluster
+	// holds, and one it deleted is missing until a scenario writes it again.
+	goneNodes map[string]bool
 	// migrations is the owner's persisted status.migrations list.
 	migrations []types.MigrationRecord
 	// published is what the status publication after the previous pass
@@ -167,6 +177,12 @@ type driver struct {
 	// until a scenario stages a gate verdict; the drain gate is wired only
 	// then, so a scenario that stages none sees no gate, as before.
 	pairingHolds map[string]string
+	// startHold is a start-time gate's standing answer for every fresh
+	// start the update gate is asked about: the gate and the reason a
+	// scenario staged with gate.deny[<gate>] and no pod. Empty while none
+	// is staged; a start the engine exempts from the consult never meets
+	// it.
+	startHold startTimeHold
 	// tickHolds, tickCommits, tickRetryCommits and tickMigrationWrites are
 	// the rollout holds the pass recorded and the row, retry-block and
 	// migration record writes resolved in the current tick, kept for the
@@ -183,7 +199,11 @@ type driver struct {
 	// the clock does not move inside a pass. ttl is the expectation
 	// cache's time-to-live once a scenario has asked for it.
 	passClocks []time.Time
-	ttl        time.Duration
+	// budgetEpochs are the rolling-update budgets the spec has carried, in
+	// Instances, one entry per change, for the budgets-held-to reading the
+	// observer's view carries.
+	budgetEpochs []budgetEpoch
+	ttl          time.Duration
 }
 
 // commitLog is the row sink the store writes through: every resolved write
@@ -235,6 +255,7 @@ func newDriver(ctx context.Context, s *Scenario, opts Options) (*driver, error) 
 		spec:         s.Initial.Spec,
 		cfg:          s.Initial.Config,
 		terminating:  map[string]*podTeardown{},
+		goneNodes:    map[string]bool{},
 	}
 	d.recorder = &traceRecorder{trace: d.trace}
 
@@ -272,6 +293,9 @@ func newDriver(ctx context.Context, s *Scenario, opts Options) (*driver, error) 
 		return nil, fmt.Errorf("replay: reconcile headless service: %w", err)
 	}
 
+	if err := d.seedQuota(ctx, s.Initial.Quota); err != nil {
+		return nil, err
+	}
 	if err := d.seedMigrations(s.Initial.Migrations); err != nil {
 		return nil, err
 	}
@@ -333,10 +357,9 @@ func (d *driver) selectorLabels() map[string]string {
 
 func (d *driver) key() types.Key {
 	return types.Key{
-		Namespace:      d.opts.Namespace,
-		Component:      d.opts.Component,
-		OwnerName:      d.opts.OwnerName,
-		SelectorLabels: d.selectorLabels(),
+		Namespace: d.opts.Namespace,
+		Component: d.opts.Component,
+		OwnerName: d.opts.OwnerName,
 	}
 }
 
@@ -457,6 +480,10 @@ func (d *driver) desiredSpec() (types.WorkloadDesiredSpec, error) {
 		PauseFreeze:             d.spec.PauseFreeze,
 		GangSchedulingAvailable: d.spec.GangScheduling,
 	}
+	if d.spec.CanaryPartition != nil {
+		partition := *d.spec.CanaryPartition
+		desired.Pacing = &types.WorkloadPacing{Partition: &partition}
+	}
 	// A worker count is what makes the Component multi-pod: the plan
 	// splits an Instance into one leader and that many workers, which is
 	// the unit a gang is scheduled in.
@@ -519,7 +546,10 @@ func (d *driver) ensureRevision(ctx context.Context, image string) (*appsv1.Cont
 	if err != nil {
 		return nil, fmt.Errorf("replay: hash width-free revision: %w", err)
 	}
-	adopted, err := revision.AdoptRevisionWithoutWidth(ctx, d.cli, d.cli, d.owner, key, hash, twin, tmpl.WorkerSize, d.recordedTarget, d.observedWorkerWidth(ctx))
+	// The owner is a projected replica, so its history names the service
+	// that controls it, as the adapter's does.
+	scope := revision.ScopeOwner(d.owner, v1beta1.SchemeGroupVersion.WithKind("InferenceService").GroupKind())
+	adopted, err := revision.AdoptRevisionWithoutWidth(ctx, d.cli, d.cli, d.owner, scope, key, hash, twin, tmpl.WorkerSize, d.recordedTarget, d.observedWorkerWidth(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("replay: adopt revision minted without a width: %w", err)
 	}
@@ -528,7 +558,7 @@ func (d *driver) ensureRevision(ctx context.Context, image string) (*appsv1.Cont
 	}
 	target, collision, err := revision.EnsureControllerRevisionFromHash(
 		ctx, d.cli, d.cli, d.owner, v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"),
-		key, hash, raw,
+		key, hash, raw, scope,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("replay: ensure revision: %w", err)
@@ -662,20 +692,6 @@ func (d *driver) seedOperation(ctx context.Context, spec RowSpec, row types.Inst
 			return nil, err
 		}
 	}
-	var deadline metav1.Time
-	if o.Deadline != "" {
-		at, err := d.offset(field+".deadline", o.Deadline)
-		if err != nil {
-			return nil, err
-		}
-		deadline = metav1.NewTime(at)
-	} else {
-		timeout, err := ParseDuration("spec.instanceReadyTimeout", d.spec.InstanceReadyTimeout)
-		if err != nil {
-			return nil, err
-		}
-		deadline = types.DeadlineAt(metav1.NewTime(startedAt), timeout)
-	}
 	target, err := d.revisionFor(ctx, o.TargetRevision)
 	if err != nil {
 		return nil, err
@@ -691,19 +707,13 @@ func (d *driver) seedOperation(ctx context.Context, spec RowSpec, row types.Inst
 		RetryCount:     o.RetryCount,
 		StartedAt:      metav1.NewTime(startedAt),
 		LastProgressAt: metav1.NewTime(lastProgressAt),
-		Deadline:       deadline,
 	}
 	if o.SurgeIndex != nil {
 		sibling := *o.SurgeIndex
 		op.SurgeIndex = &sibling
 	}
-	if o.PlacementWaitSince != "" {
-		at, err := d.offset(field+".placementWaitSince", o.PlacementWaitSince)
-		if err != nil {
-			return nil, err
-		}
-		since := metav1.NewTime(at)
-		op.PlacementWaitSince = &since
+	if err := d.seedClocks(field, spec, op); err != nil {
+		return nil, err
 	}
 	switch op.Type {
 	case types.InstanceOperationUpdate:
@@ -723,6 +733,47 @@ func (d *driver) seedOperation(ctx context.Context, spec RowSpec, row types.Inst
 	}
 	op.ID = seededOperationID(op, spec.Index, types.InstancePhase(spec.Phase))
 	return op, nil
+}
+
+// seedClocks sets the clocks a seeded operation carries: the deadline and
+// the placement wait. An attempt in flight carries the scenario's
+// deadline, or startedAt plus the spec's instanceReadyTimeout as the
+// engine derives it, and the placement wait the scenario names. A Failed
+// row keeps its operation with both cleared, as the engine writes it
+// (status.keepOperationWithoutDeadline): the row is outside every pass
+// that reads the clock, and the attempt that starts again writes its own.
+// A scenario that sets either on a Failed row asks for a shape the engine
+// never writes, and fails the run.
+func (d *driver) seedClocks(field string, spec RowSpec, op *types.InstanceOperation) error {
+	o := spec.Operation
+	if types.InstancePhase(spec.Phase) == types.InstancePhaseFailed {
+		if o.Deadline != "" || o.PlacementWaitSince != "" {
+			return fmt.Errorf("replay: %s: a Failed row keeps its operation without a deadline or a placement wait, as the engine writes it", field)
+		}
+		return nil
+	}
+	if o.Deadline != "" {
+		at, err := d.offset(field+".deadline", o.Deadline)
+		if err != nil {
+			return err
+		}
+		op.Deadline = metav1.NewTime(at)
+	} else {
+		timeout, err := ParseDuration("spec.instanceReadyTimeout", d.spec.InstanceReadyTimeout)
+		if err != nil {
+			return err
+		}
+		op.Deadline = types.DeadlineAt(op.StartedAt, timeout)
+	}
+	if o.PlacementWaitSince != "" {
+		at, err := d.offset(field+".placementWaitSince", o.PlacementWaitSince)
+		if err != nil {
+			return err
+		}
+		since := metav1.NewTime(at)
+		op.PlacementWaitSince = &since
+	}
+	return nil
 }
 
 // seededOperationID mints the id in the shape the engine's own stamp for
@@ -1020,6 +1071,7 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 	observed := types.WorkloadObservedState{
 		CurrentRevision:  d.currentRevision,
 		UpdateRevision:   specTarget.Name,
+		RollTarget:       target.Name,
 		InstanceStatuses: rows,
 		RetryBlocks:      d.store.RetryBlocks(),
 		Migrations:       append([]types.MigrationRecord(nil), d.migrations...),
@@ -1031,24 +1083,35 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 	if err != nil {
 		return fmt.Errorf("replay: read revision widths: %w", err)
 	}
+	if observed.CordonedInstances, err = d.cordonedInstances(ctx, desired, observed); err != nil {
+		return err
+	}
 	plan, err := workload.BuildPlan(d.opts.Component, desired, observed)
 	if err != nil {
 		return fmt.Errorf("replay: build plan: %w", err)
 	}
 	d.desiredPodsByInstance = status.DesiredPodCountByInstance(plan)
 
-	input, err := d.buildInput(desired, observed)
+	input, err := d.buildInput(ctx, desired, observed, target)
 	if err != nil {
 		return err
 	}
 	// The engine's two readers: the cache, which a staged stale read
 	// serves from the previous tick, and the live reader, always current.
+	// The cache is read through the pass's cached pod list, as the adapter
+	// wires it: the pods are listed once per pass and again after a pod
+	// write. The Nodes are answered from the scenario's own record of the
+	// ones it deleted (goneNodes), since the cluster holds none it did not
+	// name.
+	cachedPods := types.NewCachedPodList(d.cachedClient())
+	input.CachedPods = cachedPods
 	deps := types.Deps{
-		Client:       d.cachedClient(),
+		Client:       cachedPods.Client(),
 		APIReader:    d.cli,
 		Recorder:     d.recorder,
 		Expectations: d.expectations,
 		Clock:        d.clock,
+		NodePresence: scenarioNodes{gone: d.goneNodes},
 	}
 	if err := d.reconcileGangs(ctx, &deps, input, plan); err != nil {
 		return err
@@ -1119,12 +1182,15 @@ func (d *driver) observe(ctx context.Context, tick int, desired types.WorkloadDe
 	if err != nil {
 		return err
 	}
+	rows := d.overlayPublished(d.store.Rows())
+	d.recordBudgetEpoch(desired)
 	spec := TickSpec{
 		Replicas:        desired.Replicas,
 		PodsPerInstance: podsPerInstance(desired),
 		MinReadySeconds: desired.MinReadySeconds,
 		Paused:          desired.Paused,
 		Teardown:        d.teardown,
+		HeldTo:          d.budgetsHeldTo(rows, pods, podsPerInstance(desired)),
 	}
 	if strategy := desired.Lifecycle.UpdateStrategy; strategy != nil && strategy.RollingUpdate != nil {
 		spec.MaxUnavailable = strategy.RollingUpdate.MaxUnavailable
@@ -1142,7 +1208,7 @@ func (d *driver) observe(ctx context.Context, tick int, desired types.WorkloadDe
 	d.opts.Observer(TickView{
 		Tick:            tick,
 		Now:             d.clock.Now(),
-		Rows:            d.overlayPublished(d.store.Rows()),
+		Rows:            rows,
 		RetryBlocks:     d.store.RetryBlocks(),
 		Migrations:      migrations,
 		Pods:            pods,
@@ -1374,7 +1440,49 @@ func (d *driver) publishedRows(ctx context.Context) ([]types.InstanceStatus, wor
 	if err != nil {
 		return nil, workload.PodObservation{}, fmt.Errorf("replay: list pods for the publication: %w", err)
 	}
+	// The publication counts what the adapter's does: a pod bound to a
+	// Node that no longer exists is gone for it too.
+	pods, _, err = query.SplitPodsOnMissingNodes(ctx, scenarioNodes{gone: d.goneNodes}, pods)
+	if err != nil {
+		return nil, workload.PodObservation{}, fmt.Errorf("replay: read the nodes under the pods: %w", err)
+	}
 	return d.overlayPublished(d.store.Rows()), workload.NewCachedSelectorPodObservation(pods, nil), nil
+}
+
+// cordonedInstances is the adapter's reading of cordoned nodes, as
+// inferencereplica.cordonedInstances makes it: nothing is read unless the
+// rows outnumber the desired count, and then every Instance with a pod on
+// a Node marked unschedulable is handed to the plan, which retires those
+// first at a scale-down.
+func (d *driver) cordonedInstances(ctx context.Context, desired types.WorkloadDesiredSpec, observed types.WorkloadObservedState) (map[int32]struct{}, error) {
+	if int32(len(observed.InstanceStatuses)) <= desired.Replicas {
+		return nil, nil
+	}
+	nodes, err := query.CordonedNodes(ctx, d.cachedClient())
+	if err != nil {
+		return nil, fmt.Errorf("replay: list cordoned nodes: %w", err)
+	}
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+	pods, err := query.ListOMENativePodsByName(ctx, d.cachedClient(), d.opts.Namespace, d.opts.OwnerName, d.opts.Component, false)
+	if err != nil {
+		return nil, fmt.Errorf("replay: list pods for the cordon reading: %w", err)
+	}
+	return query.CordonedInstances(query.BucketPodsByInstanceIdx(pods), nodes), nil
+}
+
+// scenarioNodes answers the engine's Node reading from the Nodes a
+// scenario has deleted: the fake cluster holds no Node a scenario did not
+// name, so absence from the cluster proves nothing, and only a staged
+// pod.nodeLost[NodeGone] makes a node missing.
+type scenarioNodes struct {
+	gone map[string]bool
+}
+
+// NodeExists implements types.NodePresence.
+func (n scenarioNodes) NodeExists(_ context.Context, name string) (bool, error) {
+	return !n.gone[name], nil
 }
 
 // publish runs the adapter's status publication over the pass's pod
@@ -1482,7 +1590,7 @@ func retryPolicyOf(field string, spec *RetrySpec) (*types.RetryPolicy, error) {
 	}, nil
 }
 
-func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.WorkloadObservedState) (types.ReconcileInput, error) {
+func (d *driver) buildInput(ctx context.Context, desired types.WorkloadDesiredSpec, observed types.WorkloadObservedState, target *appsv1.ControllerRevision) (types.ReconcileInput, error) {
 	requeueOperation, err := ParseDuration("config.requeueOperation", d.cfg.RequeueOperation)
 	if err != nil {
 		return types.ReconcileInput{}, err
@@ -1495,7 +1603,7 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 	if err != nil {
 		return types.ReconcileInput{}, err
 	}
-	stuckPodGrace, err := ParseDuration("config.stuckPodGrace", d.cfg.StuckPodGrace)
+	grace, err := ParseDuration("config.stuckPodGrace", d.cfg.StuckPodGrace)
 	if err != nil {
 		return types.ReconcileInput{}, err
 	}
@@ -1520,7 +1628,7 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 		DesiredSpec:               desired,
 		ObservedState:             observed,
 		ScaleDownRequeueInterval:  scaleDown,
-		StuckPodGrace:             stuckPodGrace,
+		StuckPodGrace:             grace,
 		UnschedulableGrace:        unschedulableGrace,
 		GangDomainFullGrace:       gangDomainFullGrace,
 		AbandonedReplacementGrace: abandonedReplacementGrace,
@@ -1540,21 +1648,47 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 	if budget := d.cfg.GroupMaxUnavailable; budget != "" && !intOrPercent.MatchString(budget) {
 		return types.ReconcileInput{}, fmt.Errorf("replay: config.groupMaxUnavailable %q is not an integer or a percent", budget)
 	}
+	if batch := d.cfg.ScaleDownPodBatchSize; batch != "" {
+		if !intOrPercent.MatchString(batch) {
+			return types.ReconcileInput{}, fmt.Errorf("replay: config.scaleDownPodBatchSize %q is not an integer or a percent", batch)
+		}
+		size := intstr.Parse(batch)
+		input.ScaleDownPodBatchSize = &size
+	}
+	if err := d.installPolicies(&input); err != nil {
+		return types.ReconcileInput{}, err
+	}
+
+	d.store.Install(&input)
+	d.wrapCallbacks(ctx, &input, target)
+	return input, nil
+}
+
+// installPolicies parses the scenario's optional force-delete and
+// migration-audit policies onto the input.
+func (d *driver) installPolicies(input *types.ReconcileInput) error {
 	if policy := d.cfg.ForceDelete; policy != nil {
 		slack, err := ParseDuration("config.forceDelete.overdueSlack", policy.OverdueSlack)
 		if err != nil {
-			return types.ReconcileInput{}, err
+			return err
 		}
 		threshold, err := ParseDuration("config.forceDelete.nodeUnreachableThreshold", policy.NodeUnreachableThreshold)
 		if err != nil {
-			return types.ReconcileInput{}, err
+			return err
 		}
 		input.ForceDelete = &types.ForceDeletePolicy{OverdueSlack: slack, NodeUnreachableThreshold: threshold}
+	}
+	if policy := d.cfg.SchedulingRetry; policy != nil {
+		after, err := ParseDuration("config.schedulingRetry.after", policy.After)
+		if err != nil {
+			return err
+		}
+		input.SchedulingRetry = &types.SchedulingRetryPolicy{After: after, MaxAttempts: policy.MaxAttempts}
 	}
 	if policy := d.cfg.MigrationAudit; policy != nil {
 		window, err := ParseDuration("config.migrationAudit.window", policy.Window)
 		if err != nil {
-			return types.ReconcileInput{}, err
+			return err
 		}
 		input.MigrationAudit = &types.MigrationAuditPolicy{
 			MaxInFlight:  policy.MaxInFlight,
@@ -1562,16 +1696,13 @@ func (d *driver) buildInput(desired types.WorkloadDesiredSpec, observed types.Wo
 			Window:       window,
 		}
 	}
-
-	d.store.Install(&input)
-	d.wrapCallbacks(&input)
-	return input, nil
+	return nil
 }
 
 // wrapCallbacks records every seam the engine reaches back through, so a
 // trace shows what the engine asked of its caller as well as what it
 // wrote.
-func (d *driver) wrapCallbacks(input *types.ReconcileInput) {
+func (d *driver) wrapCallbacks(ctx context.Context, input *types.ReconcileInput, target *appsv1.ControllerRevision) {
 	// A row that really left the owner status takes its expectation with
 	// it: the adapter forgets the entry so a later index reusing the slot
 	// does not inherit a create or delete nobody is waiting for.
@@ -1646,64 +1777,125 @@ func (d *driver) wrapCallbacks(input *types.ReconcileInput) {
 		d.trace.callback("migration uuid=%s append %s", d.norm.uid(rec.RequestUUID), d.migrationDiff(nil, &rec))
 		return nil
 	}
-	// The update gate admits every fresh start, as a Component in no group
-	// is admitted, unless the scenario stands in for a group's
-	// unavailability budget (config.groupMaxUnavailable); the consult is
-	// traced either way.
-	rows := input.ObservedState.InstanceStatuses
+	d.wrapGateCallbacks(ctx, input, target)
+}
+
+// wrapGateCallbacks installs the stand-ins for the coordination gates. The
+// update gate admits every fresh start, as a Component in no group is
+// admitted, unless the scenario has staged a start-time gate's standing
+// answer (gate.deny[<gate>] with no pod) or stands in for a group's
+// unavailability budget (config.groupMaxUnavailable). The drain-time gate answers from the
+// staged pairing holds: a question naming a held pod is denied under the
+// Pairing gate, any other is admitted. Every consult is traced, so a golden
+// shows what the engine asked before it started an Instance or took pods
+// out of rotation.
+func (d *driver) wrapGateCallbacks(ctx context.Context, input *types.ReconcileInput, target *appsv1.ControllerRevision) {
+	gate := groupGateStandIn{
+		rows:   input.ObservedState.InstanceStatuses,
+		window: workloadops.ProvenWindowSeconds(d.spec.MinReadySeconds, input.StuckPodGrace),
+		target: target,
+	}
+	if d.cfg.GroupMaxUnavailable != "" {
+		gate.pods, gate.podsErr = d.podsByInstance(ctx)
+	}
 	input.UpdateGate = func(_ string, strategy types.UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (bool, types.RolloutHoldGate, string) {
-		if held, reason := d.groupUnavailabilityHold(rows, strategy, inFlightUnavail); held {
-			d.trace.callback("gate consult strategy=%s surge=%d unavail=%d verdict=deny gate=%s reason=%s",
-				strategy, inFlightSurge, inFlightUnavail, types.RolloutHoldGateBudget, reason)
-			return false, types.RolloutHoldGateBudget, reason
+		consult := fmt.Sprintf("gate consult strategy=%s surge=%d unavail=%d", strategy, inFlightSurge, inFlightUnavail)
+		if hold, text, held := d.updateGateHold(gate, strategy, inFlightUnavail); held {
+			d.trace.callback("%s verdict=deny gate=%s reason=%s", consult, hold.gate, text)
+			return false, hold.gate, hold.reason
 		}
-		d.trace.callback("gate consult strategy=%s surge=%d unavail=%d verdict=allow", strategy, inFlightSurge, inFlightUnavail)
+		d.trace.callback("%s verdict=allow", consult)
 		return true, "", ""
 	}
-	// The drain-time gate answers from the staged pairing holds: a question
-	// naming a held pod is denied under the Pairing gate, any other is
-	// admitted. The consult is traced either way, so a golden shows which
-	// pods the engine asked about before taking them out of rotation.
-	if d.pairingHolds != nil {
-		input.DrainGate = func(pods []string) (bool, types.RolloutHoldGate, string) {
-			for _, name := range pods {
-				if reason, held := d.pairingHolds[name]; held {
-					d.trace.callback("gate consult drain pods=[%s] verdict=deny gate=%s reason=%s",
-						strings.Join(pods, " "), types.RolloutHoldGatePairing, d.norm.text(reason))
-					return false, types.RolloutHoldGatePairing, reason
-				}
-			}
-			d.trace.callback("gate consult drain pods=[%s] verdict=allow", strings.Join(pods, " "))
-			return true, "", ""
-		}
+	if d.pairingHolds == nil {
+		return
 	}
+	input.DrainGate = func(pods []string) (bool, types.RolloutHoldGate, string) {
+		for _, name := range pods {
+			if reason, held := d.pairingHolds[name]; held {
+				d.trace.callback("gate consult drain pods=[%s] verdict=deny gate=%s reason=%s",
+					strings.Join(pods, " "), types.RolloutHoldGatePairing, d.norm.text(reason))
+				return false, types.RolloutHoldGatePairing, reason
+			}
+		}
+		d.trace.callback("gate consult drain pods=[%s] verdict=allow", strings.Join(pods, " "))
+		return true, "", ""
+	}
+}
+
+// startTimeHold is the standing answer a scenario staged for the update
+// gate: the start-time gate that holds and the reason it gives.
+type startTimeHold struct {
+	gate   types.RolloutHoldGate
+	reason string
+}
+
+// updateGateHold is the stand-in update gate's answer for one consult:
+// the staged start-time hold first, else the group's unavailability
+// budget. The text is the reason as the trace spells it.
+func (d *driver) updateGateHold(gate groupGateStandIn, strategy types.UpdateStrategyType, inFlightUnavail int32) (startTimeHold, string, bool) {
+	if hold := d.startHold; hold.reason != "" {
+		return hold, d.norm.text(hold.reason), true
+	}
+	if held, reason := d.groupUnavailabilityHold(gate, strategy, inFlightUnavail); held {
+		return startTimeHold{gate: types.RolloutHoldGateBudget, reason: reason}, reason, true
+	}
+	return startTimeHold{}, "", false
 }
 
 // intOrPercent is the shape of a budget string: an integer or a percent.
 var intOrPercent = regexp.MustCompile(`^[0-9]+%?$`)
 
+// groupGateStandIn is what the stand-in group gate reads for one pass: the
+// rows as the pass observed them, which stand for the published counters;
+// the Component's pods listed once before the pass writes, as the adapter
+// hands the gate one list per pass from a cache that has not seen the
+// pass's own writes, so an Instance the gate counts as down at its first
+// consult stays counted at every later one; the proven window; and the
+// target the roll moves to.
+type groupGateStandIn struct {
+	rows    []types.InstanceStatus
+	pods    map[int32][]*corev1.Pod
+	podsErr error
+	window  int32
+	target  *appsv1.ControllerRevision
+}
+
 // groupUnavailabilityHold is the stand-in group gate's answer for a
 // drain-first start: held while the Instances the published counters do
-// not count as serving, plus the starts this pass opened, plus this one,
-// exceed config.groupMaxUnavailable resolved against the replica count,
-// the way the group's unavailability gate projects a start. A surge
-// start, or a scenario with no group budget, is never held.
-func (d *driver) groupUnavailabilityHold(rows []types.InstanceStatus, strategy types.UpdateStrategyType, inFlightUnavail int32) (bool, string) {
+// not count as serving, plus the Instances those counters carry as
+// serving whose own pods say otherwise (workloadops.ServingInstancesDown:
+// a routed pod that came back and has not held Ready for the window, or
+// one that left rotation since the publication), plus the starts this
+// pass opened, plus this one, exceed config.groupMaxUnavailable resolved
+// against the replica count, the way the group's unavailability gate
+// projects a start and in its words. A surge start, or a scenario with no
+// group budget, is never held; a pod list the gate could not make fails
+// closed, as the gate's does.
+func (d *driver) groupUnavailabilityHold(gate groupGateStandIn, strategy types.UpdateStrategyType, inFlightUnavail int32) (bool, string) {
 	if d.cfg.GroupMaxUnavailable == "" || strategy == types.UpdateStrategySurgeThenDrain || strategy == "" {
 		return false, ""
 	}
 	budgetSpec := intstr.Parse(d.cfg.GroupMaxUnavailable)
 	budget := utils.ScaledCountFromIntOrString(&budgetSpec, d.spec.Replicas, true)
 	var serving int32
-	for i := range rows {
-		if status.InstanceMeetsThreshold(rows[i].PodCount, rows[i].ServingPodCount, d.desiredPodsByInstance[rows[i].Index]) {
+	for i := range gate.rows {
+		if status.InstanceMeetsThreshold(gate.rows[i].PodCount, gate.rows[i].ServingPodCount, d.desiredPodsByInstance[gate.rows[i].Index]) {
 			serving++
 		}
 	}
-	unavailable := max(d.spec.Replicas-serving, 0)
-	projected := unavailable + inFlightUnavail + 1
-	if projected > budget {
-		return true, fmt.Sprintf("unavailable budget %d exhausted (current %d, in-flight %d, would become %d)", budget, unavailable, inFlightUnavail, projected)
+	if gate.podsErr != nil {
+		return true, fmt.Sprintf("cannot list %s pods, failing closed: %v", d.opts.Component, gate.podsErr)
+	}
+	targetName, targetBorn := "", time.Time{}
+	if gate.target != nil {
+		targetName, targetBorn = gate.target.Name, gate.target.CreationTimestamp.Time
+	}
+	down, reasons, _ := workloadops.ServingInstancesDown(gate.rows, gate.pods,
+		func(row *types.InstanceStatus) int32 { return d.desiredPodsByInstance[row.Index] }, targetName, targetBorn, gate.window, d.clock.Now())
+	unavailable := max(d.spec.Replicas-serving, 0) + int32(len(down))
+	if unavailable+inFlightUnavail+1 > budget {
+		return true, coordination.UnavailableBudgetHold(budget, unavailable, inFlightUnavail, "", reasons)
 	}
 	return false, ""
 }

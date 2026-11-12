@@ -5,9 +5,6 @@ import (
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -32,13 +29,19 @@ import (
 type peerRevisions struct {
 	// ownTarget is this Component's roll-target revision hash.
 	ownTarget string
-	// target is each peer's roll-target revision hash.
-	target map[v1beta1.ComponentType]string
-	// current is each peer's last fully rolled revision hash ("" until
-	// the peer has completed a roll).
-	current map[v1beta1.ComponentType]string
-	// irs holds each resolved peer's IR, for Service-shape derivation.
-	irs map[v1beta1.ComponentType]*v1beta1.InferenceReplica
+	// peers holds every peer whose IR resolved this pass; a peer without an
+	// entry resolves to no revision.
+	peers map[v1beta1.ComponentType]peerRevision
+}
+
+// peerRevision is what one peer's IR reported: the revision hash its
+// reconciler is rolling onto, the hash of its last fully rolled revision ("" until
+// it has completed a roll) and the IR itself, whose Runners give the peer's
+// per-revision Services their shape.
+type peerRevision struct {
+	target  string
+	current string
+	replica *v1beta1.InferenceReplica
 }
 
 // hashFor is the coordination.PeerRevisionFunc the render hook consumes.
@@ -46,13 +49,14 @@ func (p *peerRevisions) hashFor(peer v1beta1.ComponentType, podRevisionHash stri
 	if p == nil {
 		return ""
 	}
+	rev := p.peers[peer]
 	if podRevisionHash == "" || podRevisionHash == p.ownTarget {
-		return p.target[peer]
+		return rev.target
 	}
-	if cur := p.current[peer]; cur != "" {
-		return cur
+	if rev.current != "" {
+		return rev.current
 	}
-	return p.target[peer]
+	return rev.target
 }
 
 // resolvePeerRevisions reads every serving peer's IR and resolves the
@@ -81,11 +85,7 @@ func (p *peerRevisions) hashFor(peer v1beta1.ComponentType, podRevisionHash stri
 // travel on the same object, so a stale copy can only fail a freshness
 // check (a conservative hold), never pass one against outdated status.
 func (r *Reconciler) resolvePeerRevisions(ctx context.Context, ir *v1beta1.InferenceReplica, parent *v1beta1.InferenceService, ownTarget *appsv1.ControllerRevision) (*peerRevisions, string, error) {
-	out := &peerRevisions{
-		target:  map[v1beta1.ComponentType]string{},
-		current: map[v1beta1.ComponentType]string{},
-		irs:     map[v1beta1.ComponentType]*v1beta1.InferenceReplica{},
-	}
+	out := &peerRevisions{peers: map[v1beta1.ComponentType]peerRevision{}}
 	if ownTarget != nil {
 		out.ownTarget = query.RevisionFromName(ownTarget.Name).Hash()
 	}
@@ -111,9 +111,11 @@ func (r *Reconciler) resolvePeerRevisions(ctx context.Context, ir *v1beta1.Infer
 		if err != nil {
 			return nil, "", err
 		}
-		out.target[peer] = target
-		out.current[peer] = query.RevisionFromName(peerIR.Status.CurrentRevision).Hash()
-		out.irs[peer] = peerIR
+		out.peers[peer] = peerRevision{
+			target:  target,
+			current: query.RevisionFromName(peerIR.Status.CurrentRevision).Hash(),
+			replica: peerIR,
+		}
 	}
 	return out, "", nil
 }
@@ -134,26 +136,13 @@ func awaitsPeerProjection(ir *v1beta1.InferenceReplica, parent *v1beta1.Inferenc
 }
 
 // peerRollTargetHash is the revision hash a peer's reconciler is rolling
-// its Instances onto: the rollback revision while a rollback is pinned to
-// a ControllerRevision that still exists and the peer controls, else the
-// spec target its status reports. Matches the peer's ownership and
-// existence checks for the revision.
+// its Instances onto, by the one rule the sweep of per-revision Services
+// keeps a revision by (coordination.ReplicaRollTargetHash): the rollback
+// revision while a rollback is pinned to a ControllerRevision that still
+// exists and belongs to the peer's history, else the spec target its
+// status reports.
 func (r *Reconciler) peerRollTargetHash(ctx context.Context, peerIR *v1beta1.InferenceReplica) (string, error) {
-	if peerIR.Spec.Pacing != nil && peerIR.Spec.Pacing.RollbackToRevision != nil && *peerIR.Spec.Pacing.RollbackToRevision != "" {
-		name := *peerIR.Spec.Pacing.RollbackToRevision
-		cr := &appsv1.ControllerRevision{}
-		switch err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: peerIR.Namespace, Name: name}, cr); {
-		case err == nil && !metav1.IsControlledBy(cr, peerIR):
-			// The peer's reconciler ignores a revision it does not control, as if it were missing.
-		case err == nil:
-			return query.RevisionFromName(name).Hash(), nil
-		case apierrors.IsNotFound(err):
-			// Rollback target swept; the peer falls through to its spec target.
-		default:
-			return "", fmt.Errorf("get %s rollback revision %s: %w", peerIR.Spec.Component, name, err)
-		}
-	}
-	return query.RevisionFromName(peerIR.Status.UpdateRevision).Hash(), nil
+	return coordination.ReplicaRollTargetHash(ctx, r.APIReader, peerIR)
 }
 
 // ensurePeerRevisionServices creates, before any pod of this pass is
@@ -166,18 +155,17 @@ func (r *Reconciler) ensurePeerRevisionServices(ctx context.Context, parent *v1b
 	if peers == nil {
 		return nil
 	}
-	for peer, hash := range peers.target {
-		if hash == "" {
+	for peer, rev := range peers.peers {
+		if rev.target == "" {
 			continue
 		}
-		peerIR := peers.irs[peer]
-		if peerIR == nil {
-			continue
-		}
-		if err := coordination.CreatePerRevisionServicesIfAbsent(ctx, r.Client, parent, peer, hash,
-			coordination.RoutingSelectorForRunners(peerIR.Spec.Runners),
-			coordination.ServingPortsFromRunners(peerIR.Spec.Runners)); err != nil {
-			return fmt.Errorf("create %s per-revision services for revision %s: %w", peer, hash, err)
+		// The replica does not carry its Component's Service port declarations,
+		// so this create passes none. The Component's own writer rewrites the
+		// ports through EnsurePerRevisionServices before a route sends it traffic.
+		if err := coordination.CreatePerRevisionServicesIfAbsent(ctx, r.Client, parent, peer, rev.target,
+			coordination.RoutingSelectorForRunners(rev.replica.Spec.Runners),
+			coordination.ServingPortsFromRunners(rev.replica.Spec.Runners), nil); err != nil {
+			return fmt.Errorf("create %s per-revision services for revision %s: %w", peer, rev.target, err)
 		}
 	}
 	return nil

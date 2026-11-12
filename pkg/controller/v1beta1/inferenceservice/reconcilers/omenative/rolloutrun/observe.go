@@ -60,8 +60,10 @@ func (t targetPair) stagedByPartition() bool {
 // target). fresh is false while any observed IR's status lags its
 // generation — revision names from an older IR generation describe a
 // different desired workload, so the caller waits for one consistent
-// snapshot rather than opening a run against it.
-func observeGroupTargets(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun) (map[v1beta1.ComponentType]targetPair, bool, error) {
+// snapshot rather than opening a run against it. A recorded member in left
+// has left the OMENative mode: its replica, if one is still being deleted,
+// is not read and never holds the pass.
+func observeGroupTargets(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, active *v1beta1.RolloutRun, left map[v1beta1.ComponentType]bool) (map[v1beta1.ComponentType]targetPair, bool, error) {
 	out := map[v1beta1.ComponentType]targetPair{}
 	fresh := true
 	observe := func(comp v1beta1.ComponentType) error {
@@ -105,6 +107,9 @@ func observeGroupTargets(ctx context.Context, reads client.Reader, isvc *v1beta1
 	}
 	if active != nil {
 		for _, target := range active.TargetRevisions {
+			if left[target.Component] {
+				continue
+			}
 			if err := observe(target.Component); err != nil {
 				return nil, false, err
 			}
@@ -315,12 +320,16 @@ func divergedMember(isvc *v1beta1.InferenceService, targets map[v1beta1.Componen
 // in-progress. A record written for targets the members no longer have is
 // not in progress either: its roll was taken back, and the executor ends
 // the record once every member rests on the target it has now (a member
-// still trailing is a divergence, which opens a run of its own). The done
-// sentinel is read against the effective body. A group whose reference
-// does not resolve has none, so the unit's phase answers instead: a unit
-// that reads Stable finished its cutover and keeps its record as the done
-// mark, so nothing is in flight; any other phase is a canary short of its
-// last step, whose open is then held on the reference. The step is read
+// still trailing is a divergence, which opens a run of its own). A record
+// past its last step counts while its cutover is still to land, with the
+// pre-canary stable identity still on record and the primary not yet
+// reading Stable: the last held Instance is rolling and the executor lands
+// the cutover on a later pass, and the run that presented the revision is
+// the one whose close records it. The done sentinel is read against the effective body. A group whose
+// reference does not resolve has none, so the unit's phase answers instead:
+// a unit that reads Stable finished its cutover and keeps its record as the
+// done mark, so nothing is in flight; any other phase is a canary short of
+// its last step, whose open is then held on the reference. The step is read
 // the way the canary executor reads it, so a negative step written onto a
 // unit that reads Stable is past the last step, not a step still to run.
 func canaryMidFlight(isvc *v1beta1.InferenceService, policies rollout.Policies, targets map[v1beta1.ComponentType]targetPair) bool {
@@ -346,7 +355,7 @@ func canaryMidFlight(isvc *v1beta1.InferenceService, policies rollout.Policies, 
 		return false
 	}
 	if g != nil {
-		return stepShortOfEnd(isvc, primary, cs, g.Canary.Steps)
+		return stepShortOfEnd(isvc, primary, cs, g.Canary.Steps) || cutoverPending(isvc, primary, cs)
 	}
 	return isvc.Status.Components[primary].RolloutPhase != v1beta1.RolloutPhaseStable
 }
@@ -363,6 +372,15 @@ func recordTargetsStand(g *v1beta1.RolloutGroup, primary v1beta1.ComponentType, 
 		return observed == "" || observed == cs.TargetID
 	}
 	return cs.CanaryRevisionHash == "" || targets[primary].target == "" || targets[primary].target == cs.CanaryRevisionHash
+}
+
+// cutoverPending reports a unit past its last step whose cutover is still to
+// land: the record still carries the pre-canary stable identity, which the
+// completion drops, and the primary has not read Stable. Such a canary is in
+// flight whatever the step counter says. A finished unit, its identity
+// dropped, is not, whatever phase a later write left on it.
+func cutoverPending(isvc *v1beta1.InferenceService, primary v1beta1.ComponentType, cs *v1beta1.CanaryStatus) bool {
+	return cs.StableRevisionHash != "" && isvc.Status.Components[primary].RolloutPhase != v1beta1.RolloutPhaseStable
 }
 
 // stepShortOfEnd reports whether a unit's recorded step is below its plan's
@@ -400,9 +418,10 @@ func revertInFlight(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) boo
 }
 
 // unitLadderInFlight reports whether a canary group's own ladder is one a
-// run adopts: its primary carries a canary record short of the ladder's end,
-// or a revert still draining. A group whose unit is idle, or finished, has
-// nothing in flight whatever another group's ladder is doing.
+// run adopts: its primary carries a canary record short of the ladder's end
+// or past its last step with the cutover still to land (the pre-canary
+// stable identity still on record), or a revert still draining. A group whose unit is idle, or finished, has nothing in flight
+// whatever another group's ladder is doing.
 func unitLadderInFlight(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) bool {
 	if g == nil || g.Canary == nil {
 		return false
@@ -414,7 +433,7 @@ func unitLadderInFlight(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup)
 	if cs.RolledBackRevisionHash != "" {
 		return revertInFlight(isvc, g)
 	}
-	return stepShortOfEnd(isvc, primaryOfGroup(g), cs, g.Canary.Steps)
+	return stepShortOfEnd(isvc, primaryOfGroup(g), cs, g.Canary.Steps) || cutoverPending(isvc, primaryOfGroup(g), cs)
 }
 
 // derivedProvenance parses the derive-time plan-source annotation
@@ -522,15 +541,28 @@ func combinedPlanDigest(digests []string) string {
 	return rolloutpolicy.CombinedDigest(digests)
 }
 
-// runID names one run: a short stable hash over the pinned targets and plan
-// digests plus the open timestamp, prefixed by the ISVC name for
-// greppability.
-func runID(isvc *v1beta1.InferenceService, targets []v1beta1.RolloutRunTarget, digests []string, openedAt string) string {
+// runID names one run: a short stable hash over the recorded targets, the
+// plan digests, the opening second and the id of the run that closed before
+// it (previous, "" when none has), prefixed by the ISVC name for
+// greppability. The previous id keeps two runs apart when a close and an
+// open toward the same targets land in one second; the id is made once at
+// the open and read from status after that, so it holds across passes and
+// restarts.
+func runID(isvc *v1beta1.InferenceService, targets []v1beta1.RolloutRunTarget, digests []string, openedAt, previous string) string {
 	var b strings.Builder
 	for _, t := range targets {
 		fmt.Fprintf(&b, "%s=%s;", t.Component, t.Revision)
 	}
 	b.WriteString(strings.Join(digests, ","))
 	b.WriteString(openedAt)
+	b.WriteString(previous)
 	return isvc.Name + "-" + rolloutpolicy.ShortHash([]byte(b.String()))
+}
+
+// closedRunID is the id of the run that closed last, "" when none has.
+func closedRunID(isvc *v1beta1.InferenceService) string {
+	if isvc.Status.Rollout == nil || isvc.Status.Rollout.LastRun == nil {
+		return ""
+	}
+	return isvc.Status.Rollout.LastRun.RunID
 }

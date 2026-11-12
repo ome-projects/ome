@@ -30,29 +30,66 @@ func (r *Reconciler) prepareAllZeroFloors(ctx context.Context, source *v1beta1.I
 	if proposal.PauseSurge {
 		return false, errPositiveMovementFloor
 	}
+	adopting, err := allZeroAdoption(source, proposal)
+	if err != nil {
+		return false, err
+	}
+	moving, err := allZeroMovement(proposal, adopting)
+	if err != nil {
+		return false, err
+	}
+	if moving {
+		return r.prepareAllMovementFloors(ctx, source, proposal)
+	}
+	acceptAllZeroPolicies(proposal)
+	return false, nil
+}
+
+// allZeroAdoption reports whether members are still being adopted: before any
+// plan exists, or while the inventory digest equals the current intent. An
+// inventory taken under other intent must finish before the intent changes.
+func allZeroAdoption(source *v1beta1.InferenceService, proposal *plan.Proposal) (bool, error) {
 	initial := source.Status.Placement == nil || source.Status.Placement.Plan == nil
 	adopting := initial || (proposal.AdoptionDigest != "" && proposal.AdoptionDigest == proposal.InputDigest)
 	if proposal.AdoptionDigest != "" && !adopting {
 		return false, fmt.Errorf("home inventory must complete before changing placement intent")
 	}
+	return adopting, nil
+}
+
+// allZeroMovement reports whether any member moves. An unmatched member whose
+// inventory is still pending cannot be placed either way and is refused.
+func allZeroMovement(proposal *plan.Proposal, adopting bool) (bool, error) {
 	moving := false
 	for _, a := range proposal.Assignments {
 		if !a.Matched && a.InventoryPending {
 			return false, fmt.Errorf("unmatched home inventory is unresolved")
 		}
-		moving = moving || a.DrainRequested || (a.CurrentHome != nil && !a.Matched)
-		// Positive additions need shared accounting once initial fan-out ends.
-		moving = moving || (!adopting && a.CurrentHome == nil && a.DesiredReplicas > 0)
+		moving = moving || assignmentMoves(a, adopting)
 	}
-	if moving {
-		return r.prepareAllMovementFloors(ctx, source, proposal)
+	return moving, nil
+}
+
+// assignmentMoves reports a member that moves capacity between clusters: a
+// requested drain, a retained member the current intent does not select, or,
+// once initial fan-out ends, a new member with replicas.
+func assignmentMoves(a v1beta1.CandidateAllocationStatus, adopting bool) bool {
+	if a.DrainRequested || (a.CurrentHome != nil && !a.Matched) {
+		return true
 	}
+	// Positive additions need shared accounting once initial fan-out ends.
+	return !adopting && a.CurrentHome == nil && a.DesiredReplicas > 0
+}
+
+// acceptAllZeroPolicies takes each resolved desired policy of the current
+// intent as its member's current policy. An authored floor change on a
+// retained member is local scaling: its autoscaler remains authoritative
+// while no placement move is active.
+func acceptAllZeroPolicies(proposal *plan.Proposal) {
 	for name, a := range proposal.Assignments {
-		if a.InventoryPending || a.HomeInputsPending || !a.Matched || a.DesiredHome == nil || a.DesiredHome.InputDigest != proposal.InputDigest {
+		if !acceptsDesiredPolicy(a, proposal.InputDigest) {
 			continue
 		}
-		// An authored floor change on a retained member is local scaling. Its
-		// autoscaler remains authoritative while no placement move is active.
 		if a.CurrentHome != nil && a.CurrentReplicas != a.DesiredReplicas {
 			a.OriginalReplicas = a.DesiredReplicas
 		}
@@ -60,7 +97,13 @@ func (r *Reconciler) prepareAllZeroFloors(ctx context.Context, source *v1beta1.I
 		a.CurrentReplicas = a.DesiredReplicas
 		proposal.Assignments[name] = a
 	}
-	return false, nil
+}
+
+// acceptsDesiredPolicy reports whether an assignment's desired policy can be
+// taken as current: its inputs are resolved, it is matched, and the policy
+// was resolved for the current intent.
+func acceptsDesiredPolicy(a v1beta1.CandidateAllocationStatus, digest string) bool {
+	return !a.InventoryPending && !a.HomeInputsPending && a.Matched && a.DesiredHome != nil && a.DesiredHome.InputDigest == digest
 }
 
 func (r *Reconciler) prepareAllMovementFloors(ctx context.Context, source *v1beta1.InferenceService, proposal *plan.Proposal) (bool, error) {

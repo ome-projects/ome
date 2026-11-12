@@ -39,6 +39,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -52,6 +53,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 	"sigs.k8s.io/ome/pkg/render"
 )
@@ -73,6 +75,15 @@ func IsIRManagedComponent(deploymentMode constants.DeploymentModeType) bool {
 // emitted InferenceReplicas. Declared here so the package is
 // self-contained and doesn't need a cross-package import.
 var isvcGVK = v1beta1.SchemeGroupVersion.WithKind("InferenceService")
+
+// HistoryScope is the owner a projected replica's revision history carries
+// beside the replica: the InferenceService that controls it, so every
+// ControllerRevision the replica mints stays when the replica is deleted
+// and projected again, and leaves with the service. nil for a standalone
+// replica, whose history is its own.
+func HistoryScope(ir *v1beta1.InferenceReplica) *metav1.OwnerReference {
+	return revision.ScopeOwner(ir, isvcGVK.GroupKind())
+}
 
 // projectedBy reports whether the live replica is the one isvc projects: it
 // is controlled by isvc, or it carries isvc as parentRef and no controller
@@ -124,6 +135,10 @@ type Params struct {
 	// count on update and projects the declared minimum on create.
 	CoordinatorFollower bool
 	CoordinatorTarget   *int32
+	// FollowerReleased marks a Component that stopped following the scaling
+	// policy while nothing else owns its count: it keeps the count it
+	// carries until its minReplicas is edited or a policy names it again.
+	FollowerReleased bool
 
 	// ISVC is the parent InferenceService. The projector reads
 	// ISVC.Name / Namespace / UID for IR naming + owner-ref, and
@@ -192,6 +207,17 @@ type Params struct {
 	// Instance for the duration of the plan.
 	PacingPartition PartitionResolver
 
+	// RollbackToRevision names the ControllerRevision of the stable side the
+	// Component's canary unit keeps: the revision a standing rollback holds
+	// the Component on, or the stable revision a live step or a stop holds
+	// Instances on. A replica this projection creates is created pointed at
+	// it, so its Instances come up on that revision and not on the spec's
+	// canary or rejected one; the revision outlives the deleted replica
+	// because the service owns it. A replica that already exists keeps the
+	// target the canary executor writes on it. Empty when the unit keeps no
+	// stable side.
+	RollbackToRevision string
+
 	// ResolvedAutoscaler is the authoritative per-Component
 	// ComponentAutoscaler the autoscaler.ResolveComponentAutoscaler
 	// helper picked from the ISVC → runtime → default chain. The
@@ -237,124 +263,39 @@ type Params struct {
 // caller can read IR.Status downstream (status.go uses this).
 //
 // Idempotent: the second invocation with the same Params produces the
-// same Spec and no-ops (projectionUnchanged skips the write). On a real
-// change it patches only the diffed fields. Placement-managed projections
-// use an optimistic lock so concurrent writes cannot regress plan authority.
-// Ordinary local projections do not contend with IR status writes. A live
-// replica the ISVC does not project (see projectedBy) is left untouched and
-// reported as an error.
+// same Spec and no-ops (projectionUnchanged skips the write). That answer is
+// taken from the replica as the cache holds it (cachedCopyAtRest); the live
+// object is read only when the cached copy calls for a write, an error or a
+// create, and every write is decided on it. On a real change it patches only
+// the diffed fields. Placement-managed projections use an optimistic lock so
+// concurrent writes cannot regress plan authority. Ordinary local projections
+// do not contend with IR status writes. A live replica the ISVC does not
+// project (see projectedBy) is left untouched and reported as an error.
 //
 // Errors are wrapped with the offending IR namespace/name for grep-
 // ability in operator logs — except apierrors.IsConflict, which callers
 // treat as a benign requeue rather than a hard error.
 func EnsureInferenceReplica(ctx context.Context, p Params) (*v1beta1.InferenceReplica, error) {
-	if err := validateParams(p); err != nil {
-		return nil, err
-	}
-	policy, err := protocol.FromDerived(p.ISVC)
+	p, policy, err := admitProjection(p)
 	if err != nil {
 		return nil, err
 	}
-	p.placementExecution = policy
-	if policy != nil && len(policy.ReplicaFloors) > 0 {
-		if err := protocol.CheckComponentReplicaFloor(policy.ReplicaFloors, p.Component, p.ComponentExt); err != nil {
-			return nil, err
-		}
-	}
-	if policy != nil && policy.PauseSurge && (p.ComponentExt == nil || p.ComponentExt.MinReplicas == nil || *p.ComponentExt.MinReplicas <= 0 || int64(*p.ComponentExt.MinReplicas) > math.MaxInt32) {
-		return nil, fmt.Errorf("placement pause requires a resolved positive component floor")
-	}
-	p = applyQuotaGovernance(p)
-
 	name := InferenceReplicaName(p.ISVC.Name, p.Component)
 	key := types.NamespacedName{Namespace: p.ISVC.Namespace, Name: name}
-
 	logger := log.FromContext(ctx).WithValues(
 		"isvc", client.ObjectKey{Namespace: p.ISVC.Namespace, Name: p.ISVC.Name},
 		"component", p.Component,
 		"inferencereplica", key)
 
-	var committed *v1beta1.InferenceReplica
-	reads := client.Reader(p.Client)
-	if p.Reader != nil {
-		reads = p.Reader
+	if atRest := cachedCopyAtRest(ctx, p, key, name, policy); atRest != nil {
+		return atRest, nil
 	}
+
+	var committed *v1beta1.InferenceReplica
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		ir := &v1beta1.InferenceReplica{}
-		getErr := reads.Get(ctx, key, ir)
-		switch {
-		case apierrors.IsNotFound(getErr):
-			p.placementReplicaLimit = placementReplicaLimit(ir, p)
-			ir = newInferenceReplica(p, name)
-			if err := p.Client.Create(ctx, ir); err != nil {
-				if apierrors.IsAlreadyExists(err) {
-					// Cache lag: the Get said NotFound but the
-					// apiserver already has the IR (the projector's
-					// own previous Create just landed, or a racing
-					// peer wrote it). Log so repeated firings of this
-					// branch — a real symptom of cache desync — surface
-					// in operator logs at V(1).
-					logger.V(1).Info("InferenceReplica racing-create resolved as Conflict; retrying",
-						"parentUID", p.ISVC.UID)
-					return apierrors.NewConflict(
-						schema.GroupResource{Group: v1beta1.SchemeGroupVersion.Group, Resource: "inferencereplicas"},
-						name,
-						fmt.Errorf("racing create"),
-					)
-				}
-				return fmt.Errorf("create IR %s/%s: %w", p.ISVC.Namespace, name, err)
-			}
-			committed = ir
-			return nil
-		case getErr != nil:
-			return fmt.Errorf("get IR %s/%s: %w", p.ISVC.Namespace, name, getErr)
-		}
-		if !projectedBy(ir, p.ISVC) {
-			return notProjectedError(ir, p.ISVC)
-		}
-		if err := protocol.Authorize(ir.Spec.PlacementExecution, policy); err != nil {
-			return fmt.Errorf("project IR %s/%s: %w", p.ISVC.Namespace, name, err)
-		}
-
-		// IR exists - apply the desired spec on top of the live object. The
-		// pacing partition is projected; the rest of the pacing block (the
-		// canary executor's rollback target) is preserved. Paused is projected
-		// from the parent ISVC's operator-facing rollout-paused annotation below.
-		original := ir.DeepCopy()
-		p.placementReplicaLimit = placementReplicaLimit(ir, p)
-		applyDesiredSpec(ir, p, name)
-
-		// No-op guard: skip the write entirely when nothing the projector
-		// owns changed. In steady state — including a workload stuck in
-		// CrashLoopBackOff — the desired spec is constant, so an
-		// unconditional write would churn the IR's ResourceVersion every
-		// reconcile and fight the IR controller's rapid status writes,
-		// producing a conflict hot-loop.
-		if projectionUnchanged(original, ir) {
-			committed = ir
-			return nil
-		}
-
-		patch := client.MergeFrom(original)
-		if policy != nil {
-			patch = client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
-		}
-
-		// Every write bumps the IR's generation, and a write on every pass
-		// starves each fresh-snapshot consumer downstream — ObservedGeneration
-		// never catches Generation. So a write must be attributable to a
-		// field: log the patch that justifies it. Only on the changed path;
-		// the no-op guard above returns before this point.
-		logKV := []any{"generation", original.Generation}
-		if data, dataErr := patch.Data(ir); dataErr == nil {
-			logKV = append(logKV, "patch", boundPatchForLog(data))
-		} else {
-			logKV = append(logKV, "patchRenderError", dataErr.Error())
-		}
-		logger.V(1).Info("InferenceReplica projection changed; patching", logKV...)
-
-		if err := p.Client.Patch(ctx, ir, patch); err != nil {
-			return fmt.Errorf("patch IR %s/%s: %w", p.ISVC.Namespace, name, err)
+		ir, err := projectOnLive(ctx, p, policy, key, name, logger)
+		if err != nil {
+			return err
 		}
 		committed = ir
 		return nil
@@ -363,6 +304,167 @@ func EnsureInferenceReplica(ctx context.Context, p Params) (*v1beta1.InferenceRe
 		return nil, err
 	}
 	return committed, nil
+}
+
+// admitProjection checks the parameters and the placement policy the service
+// carries before anything is read. A missing client, service, extension or
+// pod spec, a policy that cannot be decoded, a component minimum that differs
+// from the policy's, or a paused placement without a positive minimum is
+// refused. It hands back the parameters with the policy and the quota
+// governance applied.
+func admitProjection(p Params) (Params, *v1beta1.PlacementExecutionPolicy, error) {
+	if err := validateParams(p); err != nil {
+		return p, nil, err
+	}
+	policy, err := protocol.FromDerived(p.ISVC)
+	if err != nil {
+		return p, nil, err
+	}
+	p.placementExecution = policy
+	if policy != nil && len(policy.ReplicaFloors) > 0 {
+		if err := protocol.CheckComponentReplicaFloor(policy.ReplicaFloors, p.Component, p.ComponentExt); err != nil {
+			return p, nil, err
+		}
+	}
+	if policy != nil && policy.PauseSurge && !positiveComponentMinimum(p.ComponentExt) {
+		return p, nil, fmt.Errorf("placement pause requires a resolved positive component floor")
+	}
+	return applyQuotaGovernance(p), policy, nil
+}
+
+// positiveComponentMinimum reports a resolved minimum that is positive and
+// fits a 32-bit count.
+func positiveComponentMinimum(ext *v1beta1.ComponentExtensionSpec) bool {
+	return ext != nil && ext.MinReplicas != nil && *ext.MinReplicas > 0 && int64(*ext.MinReplicas) <= math.MaxInt32
+}
+
+// projectOnLive is one attempt on the live replica. A missing replica is
+// created. A replica this service does not project, or whose placement
+// identity differs from the policy's, is refused and left as it is. Any
+// other is patched where the projection changed it.
+func projectOnLive(ctx context.Context, p Params, policy *v1beta1.PlacementExecutionPolicy, key types.NamespacedName, name string, logger logr.Logger) (*v1beta1.InferenceReplica, error) {
+	reads := client.Reader(p.Client)
+	if p.Reader != nil {
+		reads = p.Reader
+	}
+	ir := &v1beta1.InferenceReplica{}
+	getErr := reads.Get(ctx, key, ir)
+	switch {
+	case apierrors.IsNotFound(getErr):
+		return createReplica(ctx, p, ir, name, logger)
+	case getErr != nil:
+		return nil, fmt.Errorf("get IR %s/%s: %w", p.ISVC.Namespace, name, getErr)
+	}
+	if !projectedBy(ir, p.ISVC) {
+		return nil, notProjectedError(ir, p.ISVC)
+	}
+	if err := protocol.Authorize(ir.Spec.PlacementExecution, policy); err != nil {
+		return nil, fmt.Errorf("project IR %s/%s: %w", p.ISVC.Namespace, name, err)
+	}
+	return patchReplica(ctx, p, policy, ir, name, logger)
+}
+
+// createReplica creates the replica the live read found missing. A create
+// the apiserver refuses as already existing is a peer's write, or this
+// controller's own that the cache had not shown: it is reported as a
+// conflict so the pass reads the live replica again, and logged at V(1)
+// because a cache that keeps lagging shows up as repeated firings.
+func createReplica(ctx context.Context, p Params, missing *v1beta1.InferenceReplica, name string, logger logr.Logger) (*v1beta1.InferenceReplica, error) {
+	p.placementReplicaLimit = placementReplicaLimit(missing, p)
+	ir := newInferenceReplica(p, name)
+	err := p.Client.Create(ctx, ir)
+	switch {
+	case err == nil:
+		return ir, nil
+	case apierrors.IsAlreadyExists(err):
+		logger.V(1).Info("InferenceReplica racing-create resolved as Conflict; retrying",
+			"parentUID", p.ISVC.UID)
+		return nil, apierrors.NewConflict(
+			schema.GroupResource{Group: v1beta1.SchemeGroupVersion.Group, Resource: "inferencereplicas"},
+			name,
+			fmt.Errorf("racing create"),
+		)
+	default:
+		return nil, fmt.Errorf("create IR %s/%s: %w", p.ISVC.Namespace, name, err)
+	}
+}
+
+// patchReplica applies the desired spec on top of the live replica and
+// writes the difference as one merge patch. The pacing partition is
+// projected; the rest of the pacing block is kept. Nothing is written when
+// the projection changed nothing the projector owns, so a steady desired
+// spec never raises the replica's version. A placement-managed projection
+// locks the patch on the live version so a racing writer is not regressed.
+func patchReplica(ctx context.Context, p Params, policy *v1beta1.PlacementExecutionPolicy, ir *v1beta1.InferenceReplica, name string, logger logr.Logger) (*v1beta1.InferenceReplica, error) {
+	original := projectionBase(ir)
+	p.placementReplicaLimit = placementReplicaLimit(ir, p)
+	applyDesiredSpec(ir, p, name)
+	if projectionUnchanged(original, ir) {
+		return ir, nil
+	}
+	patch := client.MergeFrom(original)
+	if policy != nil {
+		patch = client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})
+	}
+	logProjectionPatch(logger, original, ir, patch)
+	if err := p.Client.Patch(ctx, ir, patch); err != nil {
+		return nil, fmt.Errorf("patch IR %s/%s: %w", p.ISVC.Namespace, name, err)
+	}
+	return ir, nil
+}
+
+// logProjectionPatch names the fields a write is for. Every write raises
+// the replica's generation and a write on every pass starves the readers
+// of a fresh generation, so each write must be attributable to a change.
+func logProjectionPatch(logger logr.Logger, original, ir *v1beta1.InferenceReplica, patch client.Patch) {
+	logKV := []any{"generation", original.Generation}
+	if data, dataErr := patch.Data(ir); dataErr == nil {
+		logKV = append(logKV, "patch", boundPatchForLog(data))
+	} else {
+		logKV = append(logKV, "patchRenderError", dataErr.Error())
+	}
+	logger.V(1).Info("InferenceReplica projection changed; patching", logKV...)
+}
+
+// cachedCopyAtRest reads the replica as the cache holds it and returns that
+// copy when the projection would write nothing to it: the copy is the one
+// this service projects, the placement policy admits it, and the desired
+// spec leaves every field the projector owns as it is. Nil for any other
+// answer, a missing or unreadable copy included: the live object decides
+// then, as it decides every write. A write of this controller the cache has
+// not shown yet differs from the copy, so the live object is read; a write
+// of another owner the copy does not show yet reaches this controller as a
+// replica event, which runs the next pass over it.
+func cachedCopyAtRest(ctx context.Context, p Params, key types.NamespacedName, name string, policy *v1beta1.PlacementExecutionPolicy) *v1beta1.InferenceReplica {
+	ir := &v1beta1.InferenceReplica{}
+	if err := p.Client.Get(ctx, key, ir); err != nil {
+		return nil
+	}
+	if !projectedBy(ir, p.ISVC) || protocol.Authorize(ir.Spec.PlacementExecution, policy) != nil {
+		return nil
+	}
+	base := projectionBase(ir)
+	p.placementReplicaLimit = placementReplicaLimit(ir, p)
+	applyDesiredSpec(ir, p, name)
+	if !projectionUnchanged(base, ir) {
+		return nil
+	}
+	return ir
+}
+
+// projectionBase is the object the projection is compared and patched
+// against: the metadata and the spec, which the projector rewrites, copied;
+// the status, which it never writes, shared. The merge patch is rendered
+// from the difference between the base and the projected object, so a
+// status one and the same on both sides keeps the rows out of the copy and
+// out of the patch.
+func projectionBase(ir *v1beta1.InferenceReplica) *v1beta1.InferenceReplica {
+	return &v1beta1.InferenceReplica{
+		TypeMeta:   ir.TypeMeta,
+		ObjectMeta: *ir.ObjectMeta.DeepCopy(),
+		Spec:       *ir.Spec.DeepCopy(),
+		Status:     ir.Status,
+	}
 }
 
 // InferenceReplicaName returns the name of the replica an InferenceService
@@ -424,128 +526,155 @@ func newInferenceReplica(p Params, name string) *v1beta1.InferenceReplica {
 		},
 	}
 	applyDesiredSpec(ir, p, name)
+	if p.RollbackToRevision != "" {
+		if ir.Spec.Pacing == nil {
+			ir.Spec.Pacing = &v1beta1.InferenceReplicaPacing{}
+		}
+		target := p.RollbackToRevision
+		ir.Spec.Pacing.RollbackToRevision = &target
+	}
 	return ir
 }
 
-// applyDesiredSpec stamps the projected fields onto the IR. Split out
-// so the Create + Update branches in EnsureInferenceReplica produce
-// the same Spec (the only difference between Create and Update is
-// whether the apiserver assigns a UID — and Spec.Replicas, which is
-// autoscaler-owned on Update; see desiredReplicas).
-//
-// Projects Spec.Pacing.Partition and preserves the rest of Spec.Pacing on
-// Update (see projectedPacing). Spec.Paused follows the parent ISVC's
-// operator-facing rollout-paused annotation, because admission denies an
-// operator's direct spec edits to a projected replica; removing the
-// annotation clears the circuit breaker on every projected replica. A
-// standalone replica is the user's and never reaches this function.
-//
-// Preserves Spec.Replicas on Update when the Component is autoscaler-
-// managed — the IR's /scale subresource is the HPA / KEDA / external
-// scale target, so the autoscaler is the authoritative writer of
-// spec.replicas. Re-stamping MinReplicas every reconcile would clobber
-// the autoscaler's value and make the ISVC controller and the autoscaler
-// fight over the count. See desiredReplicas for the full decision.
+// applyDesiredSpec writes the projected spec onto the replica in named
+// steps: the service's claim on the replica, the role, what it runs and how
+// many, the rollout settings, the topology, the pacing and pairing a rollout
+// asks for, the autoscaler, and last the hash of what the templates became.
+// The same steps run on create and on update, so both produce the same spec;
+// a step that keeps a live value says so. A step that reads a field another
+// step writes comes after it: the partition is sized at the count written in
+// this pass, and the hash is taken over the runners, the topology key, the
+// pairing protocol and the excluded keys as written.
 func applyDesiredSpec(ir *v1beta1.InferenceReplica, p Params, name string) {
-	// Stamp the annotation keys the projector owns and keep every other
-	// key: operators annotate a projected replica directly (to release a
-	// held revision, for one), and the merge patch carries only the keys
-	// that changed.
+	projectOwnership(ir, p)
+	projectRole(ir, p)
+	projectWorkload(ir, p)
+	projectRolloutSettings(ir, p)
+	projectTopology(ir, p)
+	projectPacingAndPairing(ir, p)
+	projectAutoscaler(ir, p)
+	projectTemplateHash(ir)
+}
+
+// projectOwnership writes the service's claim on the replica: the
+// controller-write key admission gates on, the parent generation this
+// projection reflects, the inherited annotation keys the revision hash
+// leaves out, the Component's labels and the owner reference.
+func projectOwnership(ir *v1beta1.InferenceReplica, p Params) {
+	// The projector owns its own annotation keys and keeps every other key:
+	// operators annotate a projected replica directly (to release a held
+	// revision, for one), and the merge patch carries only the keys that
+	// changed.
 	if ir.Annotations == nil {
 		ir.Annotations = map[string]string{}
 	}
 	ir.Annotations[constants.InferenceReplicaControllerWriteAnnotationKey] = constants.InferenceReplicaControllerWriteAnnotationVal
-
-	// Stamp the parent ISVC generation this projection reflects. The
-	// stamp lands on every projector pass — including passes that leave
-	// the Spec untouched — so coordination gates can tell a Component
-	// whose projection is still catching up with an ISVC bump apart
-	// from one that genuinely has nothing to roll. Object-level
-	// annotation only: it never reaches pod templates or the revision
-	// hash (revisionHash covers pod-template inputs, not IR metadata).
+	// The parent generation lands on every pass, including passes that leave
+	// the spec untouched, so coordination gates can tell a projection still
+	// catching up with a service change from one with nothing to roll. It is
+	// object metadata only: it never reaches the pod templates or the
+	// revision hash.
 	ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey] =
 		strconv.FormatInt(p.ISVC.Generation, 10)
-
-	// Record inherited ISVC annotation keys so revision hashing can ignore object-only
-	// metadata without changing pod metadata propagation.
+	// The inherited service annotation keys the revision hash leaves out.
+	// The render keeps the ones outside OME's own and the pod-level prefixes
+	// off the pod template, so stripping those before hashing is a no-op.
 	if excluded := objectScopedAnnotationKeys(p); len(excluded) > 0 {
 		ir.Annotations[constants.RevisionExcludedAnnotationKeysAnnotationKey] = strings.Join(excluded, ",")
 	} else {
 		delete(ir.Annotations, constants.RevisionExcludedAnnotationKeysAnnotationKey)
 	}
-
-	// Labels track the per-Component ObjectMeta stamped on the
-	// Component's pods — copying them onto the IR itself gives
-	// kubectl-side filterability without changing the pod label-set the
-	// IR controller emits. Unlike annotations, the label set is replaced
-	// wholesale on every pass, so a label added by hand is removed on the
-	// next reconcile while foreign annotation keys are kept.
+	// The labels are the per-Component ObjectMeta's, replaced wholesale on
+	// every pass: a label added by hand is removed on the next reconcile,
+	// while annotation keys of another owner are kept.
 	ir.Labels = copyMap(p.ObjectMeta.Labels)
-
-	// Owner-ref must stamp the live ISVC so GC cascades the IR on ISVC
-	// delete. On Update the re-stamp applies to a replica projectedBy
-	// already accepted: owner refs edited by hand on it are replaced on the
-	// next reconcile, intentionally.
+	// The owner reference is the live service, so GC cascades the replica on
+	// service delete; one edited by hand is replaced on the next reconcile.
 	ir.OwnerReferences = []metav1.OwnerReference{
 		*metav1.NewControllerRef(p.ISVC, isvcGVK),
 	}
+}
 
-	// ParentRef + Component are immutable post-create per the IR
-	// webhook. On Update we re-stamp the same values — no-op for a
-	// well-formed IR, defense-in-depth if someone manually edited
-	// the live object.
+// projectRole writes which service and role the replica belongs to and the
+// placement policy that admits it. ParentRef and Component are immutable
+// after create per the replica webhook; on update the same values are
+// written again, a no-op for a well-formed replica.
+func projectRole(ir *v1beta1.InferenceReplica, p Params) {
 	ir.Spec.ParentRef = &v1beta1.ParentReference{
 		Name: p.ISVC.Name,
 	}
 	ir.Spec.PlacementExecution = p.placementExecution.DeepCopy()
 	ir.Spec.PlacementReplicaLimit = p.placementReplicaLimit
 	ir.Spec.Component = p.Component
+}
+
+// projectWorkload writes what the replica runs and how many: the count (see
+// desiredReplicas for who owns it on update), the runners rendered from the
+// Component's templates, a copy of the lifecycle and minReadySeconds.
+func projectWorkload(ir *v1beta1.InferenceReplica, p Params) {
 	ir.Spec.Replicas = desiredReplicas(ir, p)
 	ir.Spec.Runners = runnersFromParams(p)
 	ir.Spec.Lifecycle = lifecycleFromComponentExt(p.ComponentExt)
 	ir.Spec.MinReadySeconds = minReadySecondsFromComponentExt(p.ComponentExt)
-	paused, freeze := constants.RolloutPauseState(p.ISVC.Annotations)
+}
+
+// projectRolloutSettings writes the pause and the revision history limit
+// from the service's operator-facing annotations. Admission denies an
+// operator's direct spec edits to a projected replica, so the pause follows
+// the parent's annotation, and removing the annotation clears the pause on
+// every projected replica.
+func projectRolloutSettings(ir *v1beta1.InferenceReplica, p Params) {
+	paused, fullStop := constants.RolloutPauseState(p.ISVC.Annotations)
 	ir.Spec.Paused = paused
 	ir.Spec.PauseMode = ""
-	if freeze {
+	if fullStop {
 		ir.Spec.PauseMode = v1beta1.PauseModeFreeze
 	}
 	ir.Spec.RevisionHistoryLimit = revisionHistoryLimitFromISVC(p.ISVC)
-	// Project the resolved gang co-location key verbatim. The IR
-	// controller reads it to auto-generate the worker→leader podAffinity
-	// for multi-node Components; nil is a no-op there.
+}
+
+// projectTopology writes the resolved gang co-location key and the spread
+// policy as given. The replica controller reads the key to build the
+// worker-to-leader pod affinity of multi-node Components; nil is a no-op
+// there.
+func projectTopology(ir *v1beta1.InferenceReplica, p Params) {
 	ir.Spec.TopologyKey = p.TopologyKey
 	ir.Spec.TopologySpread = p.TopologySpread
 	ir.Spec.TopologySpreadKey = p.TopologySpreadKey
+}
+
+// projectPacingAndPairing writes the pacing block a canary asks for, sized
+// at the count written in this pass (see projectedPacing), and the pairing
+// protocol on the roles that pair. The protocol rides each pairing role's
+// revision hash so a protocol change rolls them all; the router does not
+// pair and must not re-roll on a protocol change.
+func projectPacingAndPairing(ir *v1beta1.InferenceReplica, p Params) {
 	ir.Spec.Pacing = projectedPacing(ir.Spec.Pacing, p.PacingPartition, ir.Spec.Replicas)
-	// Project the pairing protocol onto the Components that pair. The token
-	// rides each pairing role's revision hash so a protocol change rolls them
-	// all; the router does not participate in pairing and must not re-roll on
-	// a protocol change.
 	ir.Spec.PairingProtocol = nil
 	if role, _ := v1beta1.RoleOf(p.Component); role.Pairs {
 		if proto := p.ISVC.Spec.RolloutPairingProtocol(); proto != "" {
 			ir.Spec.PairingProtocol = &proto
 		}
 	}
-	// Project the resolved Autoscaler onto the IR. Whole-block replace
-	// semantics — operator-side changes to isvc.spec.<comp>.autoscaler
-	// always win over any drifted IR.spec.autoscaler. DeepCopy keeps the
-	// IR's pointer disjoint from the resolver's return value so a downstream
-	// caller mutating the IR cannot corrupt the next reconcile's resolution.
-	// nil ResolvedAutoscaler clears ir.Spec.Autoscaler — defensive against a
-	// dispatch site that doesn't run the resolver (no spurious empty block
-	// lands on the IR) — unless PreserveAutoscaler holds the stored block as
-	// the policy layer's last-known-good.
+}
+
+// projectAutoscaler replaces the autoscaler block whole with a copy of the
+// resolved one, so an operator's edit to the service or the runtime always
+// wins over a drifted block, and a caller mutating the replica cannot
+// corrupt the next resolution. A nil resolved block clears the field. Under
+// a policy hold the live block is the last known good and is kept as it is.
+func projectAutoscaler(ir *v1beta1.InferenceReplica, p Params) {
 	if !p.PreserveAutoscaler {
 		ir.Spec.Autoscaler = p.ResolvedAutoscaler.DeepCopy()
 	}
+}
 
-	// Stamp the hash of the pod templates in the same write as the
-	// templates. The replica repeats it in status once its update revision
-	// was computed from them, so a reader can tell a status written for
-	// these templates from one that predates them without the generation,
-	// which also moves on writes the revision leaves out.
+// projectTemplateHash writes the hash of the pod templates in the same
+// write as the templates. The replica repeats it in status once its update
+// revision was computed from them, so a reader can tell a status written for
+// these templates from one that predates them without the generation, which
+// also moves on writes the revision leaves out.
+func projectTemplateHash(ir *v1beta1.InferenceReplica) {
 	if hash := v1beta1convert.TemplateHash(ir, ir.Spec.Runners); hash != "" {
 		ir.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey] = hash
 	} else {
@@ -658,6 +787,10 @@ func boundPatchForLog(data []byte) string {
 //     count: CoordinatorTarget when it resolved one this pass, on create
 //     and on update alike, else the live count it already carries.
 //
+//   - A Component that stopped following (FollowerReleased) keeps the live
+//     count the coordinator left it at; writing MinReplicas again would
+//     drop it there in one write with no budget.
+//
 // ir is the object applyDesiredSpec is mutating — on the Update path it is
 // the live IR fetched via Get (so ResourceVersion + the autoscaler-written
 // Spec.Replicas are populated); on the Create path it is a freshly built
@@ -680,13 +813,13 @@ func desiredReplicas(ir *v1beta1.InferenceReplica, p Params) *int32 {
 		return &target
 	}
 	if protocol.HasZeroReplicaFloor(p.placementExecution, p.Component) {
-		if !creating && (isAutoscalerManaged(effective) || p.CoordinatorFollower) && ir.Spec.Replicas != nil && *ir.Spec.Replicas >= 0 {
+		if !creating && (isAutoscalerManaged(effective) || p.CoordinatorFollower || p.FollowerReleased) && ir.Spec.Replicas != nil && *ir.Spec.Replicas >= 0 {
 			return ir.Spec.Replicas
 		}
 		floor := int32(*p.ComponentExt.MinReplicas)
 		return &floor
 	}
-	if !creating && p.CoordinatorFollower && ir.Spec.Replicas != nil && *ir.Spec.Replicas > 0 {
+	if !creating && (p.CoordinatorFollower || p.FollowerReleased) && ir.Spec.Replicas != nil && *ir.Spec.Replicas > 0 {
 		return ir.Spec.Replicas
 	}
 	if creating || !isAutoscalerManaged(effective) {

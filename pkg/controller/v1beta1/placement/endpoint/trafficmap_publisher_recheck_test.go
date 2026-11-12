@@ -60,12 +60,6 @@ func TestTrafficMapPublisher_OwnerOrSourceChangesAfterPlanning_AppliesNothing(t 
 			},
 		},
 		{
-			name: "owner generation changed",
-			mutateOwner: func(owner *v1beta1.InferenceService) {
-				owner.Generation++
-			},
-		},
-		{
 			name: "owner labels changed",
 			mutateOwner: func(owner *v1beta1.InferenceService) {
 				owner.Labels = map[string]string{"example.com/publish": "disabled"}

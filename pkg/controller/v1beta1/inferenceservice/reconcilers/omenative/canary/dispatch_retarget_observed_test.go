@@ -102,7 +102,7 @@ func TestDispatch_RetargetWhileRollingBackWithTerminatingReplacement(t *testing.
 	if err := c.Create(ctx, canaryControllerRevision(ns, isvc.Name, "engine", "v3", 3)); err != nil {
 		t.Fatal(err)
 	}
-	if err := BindRun(ctx, c, isvc, deps.Group, false); err != nil {
+	if err := BindRun(ctx, c, isvc, deps.Group, RunOpen{}); err != nil {
 		t.Fatal(err)
 	}
 	for _, pass := range []string{"reopen", "wait", "wait-again"} {

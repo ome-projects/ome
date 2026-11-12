@@ -52,20 +52,6 @@ func (r *Runtime) Check(ctx context.Context) error {
 	return r.reads.check(ctx)
 }
 
-func (r *Runtime) Components() []v1beta1.ComponentType {
-	var out []v1beta1.ComponentType
-	if r.Engine != nil {
-		out = append(out, v1beta1.EngineComponent)
-	}
-	if r.Decoder != nil {
-		out = append(out, v1beta1.DecoderComponent)
-	}
-	if r.Router != nil {
-		out = append(out, v1beta1.RouterComponent)
-	}
-	return out
-}
-
 // Resolve follows the member's explicit, automatic, or pinned runtime path.
 // desired carries the intended member spec. standing identifies the owned member
 // service whose pin state may be read; nil requires that service to be absent.
@@ -104,18 +90,17 @@ func (r Resolver) Resolve(ctx context.Context, desired, standing *v1beta1.Infere
 	return out, nil
 }
 
-// resolvedModel is the service's base model as the member reads it: the spec,
-// its object metadata and its status, all nil when the service names no model.
+// resolvedModel is the service's base model as the member reads it: the spec
+// and its object metadata, both nil when the service names no model.
 type resolvedModel struct {
-	spec   *v1beta1.BaseModelSpec
-	meta   *metav1.ObjectMeta
-	status *v1beta1.ModelStatusSpec
+	spec *v1beta1.BaseModelSpec
+	meta *metav1.ObjectMeta
 }
 
 // readModel reads the service's model through the dependency-recording client.
 // A sharded model that is not ready is reported with the reason it waits on.
 func readModel(ctx context.Context, reads client.Client, service *v1beta1.InferenceService) (resolvedModel, error) {
-	spec, meta, status, err := render.ResolveModel(ctx, render.Inputs{Service: service, Client: reads})
+	spec, meta, err := render.ResolveModel(ctx, render.Inputs{Service: service, Client: reads})
 	if err != nil {
 		var notReady *render.ModelNotReadyError
 		if errors.As(err, &notReady) {
@@ -123,7 +108,7 @@ func readModel(ctx context.Context, reads client.Client, service *v1beta1.Infere
 		}
 		return resolvedModel{}, err
 	}
-	return resolvedModel{spec: spec, meta: meta, status: status}, nil
+	return resolvedModel{spec: spec, meta: meta}, nil
 }
 
 // runtimeSelector builds the member's catalog reader.
@@ -203,7 +188,7 @@ func validateLiveRuntime(ctx context.Context, selector runtimeselector.Selector,
 func renderSpecs(ctx context.Context, reads client.Client, selector runtimeselector.Selector, service *v1beta1.InferenceService, model resolvedModel, out *Runtime) error {
 	resolved, err := render.Resolve(ctx, render.Inputs{
 		Service: service, Client: reads, Runtimes: selector, Log: logr.Discard(),
-		Model: model.spec, ModelMeta: model.meta, ModelStatus: model.status, ModelRead: true,
+		Model: model.spec, ModelMeta: model.meta, ModelRead: true,
 		OverlaysRead: true,
 		Runtime:      out.Spec, RuntimeName: out.Name, RuntimeIsCluster: out.IsCluster,
 	})
@@ -289,8 +274,8 @@ func resolvePin(ctx context.Context, reads client.Client, selector runtimeselect
 		}
 		return source.live, source.isCluster, nil
 	}
-	if namespace == "" {
-		return nil, false, fmt.Errorf("runtime pin resolution requires the member operator namespace")
+	if err := requireOperatorNamespace(namespace, "runtime pin resolution"); err != nil {
+		return nil, false, err
 	}
 	recorded, isCluster, err := readRecordedRevision(ctx, reads, namespace, service.Namespace, source)
 	if err != nil {

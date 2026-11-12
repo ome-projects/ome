@@ -235,12 +235,16 @@ type InstanceOperation struct {
 	CapacityRefusedAt *metav1.Time
 
 	// PlacementWaitSince is when the attempt started waiting for its pods
-	// to be placed, recorded once a pod name the attempt needs is held by a
-	// node that stopped reporting (holds/placementwait.go). The hold pass
-	// keeps it while the attempt waits, even as the waiting pod changes,
-	// and clears it once every pod the attempt asks for runs on a node or
-	// the attempt ends. The unschedulable grace is measured from it when it
-	// is earlier than the unplaceable pod's own wait.
+	// to be placed (holds/placementwait.go). The hold pass records it when
+	// a node that stopped reporting holds a pod name the attempt needs. It
+	// also records it when the scheduler refuses a pod whose PodScheduled
+	// time may be its creation behind a queue's gate. The hold pass keeps it
+	// while the attempt waits, even as the waiting pod changes. OME clears
+	// it once every pod the attempt asks for runs on a node, or once the
+	// attempt ends. The hold pass also clears it when a pod of the attempt
+	// sits behind a scheduling gate while no other pod is refused or held by
+	// a node that stopped reporting. The unschedulable grace is measured
+	// from it when it is earlier than the unplaceable pod's own wait.
 	PlacementWaitSince *metav1.Time
 
 	// Strategy is the update strategy the operation runs under, pinned
@@ -288,10 +292,11 @@ type InstanceStatus struct {
 	PodCount int32
 	// ReadyPodCount counts pods reporting Ready=True.
 	ReadyPodCount int32
-	// ServingPodCount counts pods in rotation: Ready by the control plane
-	// AND serving=True on the controller-managed readiness gate. An
-	// Instance with no routable serving pod serves nothing and publishes
-	// 0, whatever its workers read: a gang whose leader is gone counts 0.
+	// ServingPodCount counts the Instance's pods that are Ready with
+	// serving=True on the controller-managed readiness gate, a gang's
+	// workers included. An Instance with no routable serving pod serves
+	// nothing and publishes 0, whatever its workers read: a gang whose
+	// leader is gone counts 0.
 	ServingPodCount int32
 	// AvailablePodCount counts pods in rotation on the Component's
 	// headless Service that, when MinReadySeconds is set, have been Ready
@@ -309,7 +314,8 @@ type InstanceStatus struct {
 
 	Conditions []metav1.Condition
 
-	// ReadySince is when the Instance last entered Ready. It anchors
+	// ReadySince is when the Instance last entered Ready, at whole
+	// seconds, the precision the apiserver stores it with. It anchors
 	// post-Ready failure detection: container restarts that finished
 	// before this time belong to boot and are never restart triggers.
 	ReadySince *metav1.Time
@@ -376,16 +382,6 @@ type Key struct {
 	// (ISVC.Name or IR.Name). workload composes pod / Service names
 	// from this — never reaches back into OwnerObject for the field.
 	OwnerName string
-
-	// OwnerLabels is the seed label set stamped on every emitted
-	// ControllerRevision / PodGroup / pod's metadata labels block.
-	// Read-only from workload code.
-	OwnerLabels map[string]string
-
-	// SelectorLabels is the seed label set used in every pod LIST
-	// selector and per-revision Service selector. Read-only from
-	// workload code.
-	SelectorLabels map[string]string
 }
 
 // AdapterPublished reads the row's published pod counters: how many
@@ -402,14 +398,6 @@ func AdapterPublished(s *InstanceStatus) (pods, available int32) {
 		return 0, 0
 	}
 	return s.PodCount, s.AvailablePodCount
-}
-
-// WorkloadName is the composed identity used for ControllerRevision
-// naming and as the prefix on emitted pod / PodGroup / PDB names.
-// Always "<OwnerName>-<Component>" — the pod-naming convention every
-// adapter shares so existing selectors keep matching.
-func (k Key) WorkloadName() string {
-	return k.OwnerName + "-" + string(k.Component)
 }
 
 // Lifecycle is the workload-owned mirror of the v1beta1 LifecycleSpec.
@@ -509,25 +497,4 @@ const (
 type MigrationPolicy struct {
 	// Mode selects the migration disposition. Empty defaults to Auto.
 	Mode MigrationMode
-}
-
-// ComponentTrafficTarget describes the percentage of traffic routed to
-// one revision of one Component. Workload-owned mirror of
-// v1beta1.ComponentTrafficTarget; serialized field-for-field by the
-// adapter when projecting onto ISVC status.
-type ComponentTrafficTarget struct {
-	// RevisionName is the per-revision Service name for this target.
-	RevisionName string
-
-	// Percent is the percentage of traffic the consumer should route to
-	// RevisionName. Sum across all entries for one Component is 100.
-	Percent int32
-
-	// Tag is an optional short identifier for the target (e.g.
-	// "latest", "prev"). Cosmetic; not used by the consumer.
-	Tag string
-
-	// LatestRevision is true when this entry corresponds to the
-	// LatestRolledoutRevision for the Component.
-	LatestRevision bool
 }

@@ -56,11 +56,6 @@ func (m *MockLogger) WithField(key string, value interface{}) logging.Interface 
 	return args.Get(0).(logging.Interface)
 }
 
-func (m *MockLogger) WithFields(fields map[string]interface{}) logging.Interface {
-	args := m.Called(fields)
-	return args.Get(0).(logging.Interface)
-}
-
 func (m *MockLogger) WithError(err error) logging.Interface {
 	args := m.Called(err)
 	return args.Get(0).(logging.Interface)
@@ -74,7 +69,6 @@ func SetupMockLogger() *MockLogger {
 
 	// Setup common expectations for logger chaining
 	mockLogger.On("WithField", mock.Anything, mock.Anything).Return(mockLogger).Maybe()
-	mockLogger.On("WithFields", mock.Anything).Return(mockLogger).Maybe()
 	mockLogger.On("WithError", mock.Anything).Return(mockLogger).Maybe()
 
 	// Setup common logging calls to not fail tests

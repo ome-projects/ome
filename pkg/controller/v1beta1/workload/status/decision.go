@@ -70,8 +70,11 @@ func StampFailedEndingAttempt(ctx context.Context, input types.ReconcileInput, i
 // StampRejected records a permanent apiserver rejection as the row's
 // failure: Phase=Failed, the operation cleared unless keepOperation, and
 // LastFailure the rejection, naming the pod the refused write was for
-// when it made one. A row already Failed on this same rejection of the
-// same pod is left as it is, so a repeated disposition writes nothing.
+// when it made one. A kept operation (a surge replacement row's cleanup,
+// a repair's refused rebuild) carries no deadline, as every Failed row
+// with an operation (keepOperationWithoutDeadline). A row already Failed
+// on this same rejection of the same pod is left as it is, so a repeated
+// disposition writes nothing.
 func StampRejected(ctx context.Context, input types.ReconcileInput, idx int32, termination *types.InstanceTermination, keepOperation bool) (bool, error) {
 	return ApplyStamp(ctx, input, idx, func(s *types.InstanceStatus) bool {
 		if s.Phase == "" {
@@ -83,10 +86,12 @@ func StampRejected(ctx context.Context, input types.ReconcileInput, idx int32, t
 			return false
 		}
 		s.Phase = types.InstancePhaseFailed
-		if !keepOperation {
+		switch {
+		case !keepOperation:
 			s.Operation = nil
+		case s.Operation != nil:
+			keepOperationWithoutDeadline(s)
 		}
-		clearPlacementWait(s)
 		captured := *termination
 		s.LastFailure = &captured
 		return true
@@ -130,9 +135,12 @@ func attemptOnRow(s *types.InstanceStatus, attempt types.InstanceOperation) bool
 	return s.Phase != "" && s.Operation != nil && SameAttempt(*s.Operation, attempt)
 }
 
-// StampFailedKeepingOperation is the deadline backstop's stamp: Phase=Failed
+// StampFailedKeepingOperation writes an attempt ended on the row itself
+// (the deadline backstop, the gang form, the scheduler grace): Phase=Failed
 // with the Operation left in place, because an operator reading the row
-// wants to see WHAT was in flight when the deadline elapsed.
+// wants to see WHAT was in flight when the attempt ended.
+// The kept operation carries no deadline (keepOperationWithoutDeadline):
+// the clock that ended the attempt has nothing left to measure.
 //
 // A slot whose Operation is already gone is a no-op — the attempt
 // concluded, or was disposed, since the deadline was observed, so there
@@ -150,7 +158,7 @@ func StampFailedKeepingOperation(termination *types.InstanceTermination) func(*t
 			return false
 		}
 		s.Phase = types.InstancePhaseFailed
-		clearPlacementWait(s)
+		keepOperationWithoutDeadline(s)
 		captured := *termination
 		s.LastFailure = &captured
 		return true
@@ -231,12 +239,16 @@ func StampFailedParkingAttempt(ctx context.Context, input types.ReconcileInput, 
 
 // keepOperationWithoutDeadline leaves the row's operation in place with its
 // deadline cleared and returns the copy it wrote, for a row written Failed
-// with the operation kept because its pod set still stands. A Failed row is
-// outside every pass that reads the clock, so a deadline left on it would
-// name a time nobody acts on; the zero deadline reads as "never expires".
-// The attempt's placement wait goes with it: the attempt after this one
-// waits on its own. Every other field stays: the step, the identity and
-// the retry count the repair's retry schedule reads survive the write.
+// with the operation kept, whichever path ended or stopped the attempt: the
+// deadline backstop, the gang form, the scheduler and pod graces, the
+// stopped attempt, a rejected pod write and a replacement gang's loss all
+// write through it. A Failed row is outside every pass that reads the clock,
+// so a deadline left on it would name a time nobody acts on; the zero
+// deadline reads as "never expires", and the attempt that starts again
+// writes its own. The attempt's placement wait goes with it: the attempt
+// after this one waits on its own. Every other field stays: the step, the
+// identity and the retry count the pass that finishes the attempt reads
+// survive the write.
 func keepOperationWithoutDeadline(s *types.InstanceStatus) *types.InstanceOperation {
 	op := *s.Operation
 	op.Deadline = metav1.Time{}
@@ -329,12 +341,15 @@ func ApplyStamp(ctx context.Context, input types.ReconcileInput, idx int32, stam
 // EnterReady requires a known running revision and stamps the Ready entry
 // time. A rejected transition leaves the row untouched, including its
 // operation and the timestamp used to distinguish boot from later crashes.
+// The time is a whole second, the precision the apiserver stores it with,
+// so the row the pass holds equals the row it reads back and the write that
+// records the promotion stores the time as the status at rest does.
 func EnterReady(s *types.InstanceStatus, now time.Time) bool {
 	if s == nil || query.RequireNamedRevision(query.RevisionFromName(s.RunningRevision)) != nil {
 		return false
 	}
 	if s.Phase != types.InstancePhaseReady {
-		t := metav1.NewTime(now)
+		t := metav1.NewTime(now.Truncate(time.Second))
 		s.ReadySince = &t
 	}
 	s.Phase = types.InstancePhaseReady
@@ -475,17 +490,43 @@ func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx i
 // The recreate tears that set down, so the same write drops the record
 // and the row names no running revision until a set of its own promotes.
 func StampRecreating(ctx context.Context, input types.ReconcileInput, idx int32, targetRev, reason string, strategy types.UpdateStrategyType, timeout time.Duration, runningNeverServed bool) (int64, error) {
+	count, _, err := recreateEntry(ctx, input, idx, targetRev, reason, strategy, timeout, runningNeverServed, false)
+	return count, err
+}
+
+// ResumeRecreating is the entry write of a pass that found the recreate
+// open on its copy of the row. The copy comes from a cache that can be a
+// write behind the row, so the live row decides: one still open toward
+// targetRev goes on at its set number with nothing written; one open
+// toward another revision is retargeted as the first pass's write
+// retargets; one that carries no open recreate, promoted or ended by the
+// pass before, is left as it is and reported not open, so the pass that
+// read the copy opens nothing on a row it did not read.
+func ResumeRecreating(ctx context.Context, input types.ReconcileInput, idx int32, targetRev, reason string, strategy types.UpdateStrategyType, timeout time.Duration, runningNeverServed bool) (int64, bool, error) {
+	return recreateEntry(ctx, input, idx, targetRev, reason, strategy, timeout, runningNeverServed, true)
+}
+
+// recreateEntry is the write the two entries above share; resumed says
+// the caller's copy of the row carried the open recreate. It returns the
+// set number after the write and whether the attempt is open on the live
+// row.
+func recreateEntry(ctx context.Context, input types.ReconcileInput, idx int32, targetRev, reason string, strategy types.UpdateStrategyType, timeout time.Duration, runningNeverServed, resumed bool) (int64, bool, error) {
 	var observedIncarnation int64
 	var openSince *metav1.Time
+	open := true
 	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
-		openSince = nil
-		if s.Phase == types.InstancePhaseUpdating &&
+		openSince, open = nil, true
+		observedIncarnation = s.Incarnation
+		carries := s.Phase == types.InstancePhaseUpdating &&
 			s.Operation != nil && s.Operation.Type == types.InstanceOperationUpdate &&
-			s.Operation.Step == types.UpdateStepDrain &&
-			s.TargetRevision == targetRev && s.Incarnation > 0 {
-			observedIncarnation = s.Incarnation
+			s.Operation.Step == types.UpdateStepDrain
+		if carries && s.TargetRevision == targetRev && s.Incarnation > 0 {
 			started := s.Operation.StartedAt
 			openSince = &started
+			return false
+		}
+		if resumed && !carries {
+			open = false
 			return false
 		}
 		if s.Incarnation == 0 {
@@ -512,10 +553,10 @@ func StampRecreating(ctx context.Context, input types.ReconcileInput, idx int32,
 		}
 		return true
 	})
-	if err != nil {
-		return observedIncarnation, err
+	if err != nil || !open {
+		return observedIncarnation, open, err
 	}
-	return observedIncarnation, entryStampAttemptStarted(ctx, input, targetRev, openSince)
+	return observedIncarnation, true, entryStampAttemptStarted(ctx, input, targetRev, openSince)
 }
 
 // StampRestarting idempotently stamps Phase=Restarting + Restart/Drain
@@ -581,6 +622,24 @@ func StampRestarting(ctx context.Context, input types.ReconcileInput, idx int32,
 		return true
 	})
 	return observedIncarnation, err
+}
+
+// ResumeRestarting reads whether the live row still carries the open
+// repair a pass found on its copy of the rows, and the set number the
+// attempt is at. The copy comes from a cache that can be a write behind
+// the row: a row promoted, ended or taken by a roll since carries no
+// attempt, and the pass that read the copy opens nothing on it; the next
+// pass reads the row as it is. Writes nothing.
+func ResumeRestarting(ctx context.Context, input types.ReconcileInput, idx int32) (int64, bool, error) {
+	var set int64
+	open := false
+	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
+		set = s.Incarnation
+		open = s.Phase == types.InstancePhaseRestarting &&
+			s.Operation != nil && s.Operation.Type == types.InstanceOperationRestart
+		return false
+	})
+	return set, open, err
 }
 
 // RestartReplacesItsRebuiltSet moves an open repair's Incarnation from
@@ -759,13 +818,7 @@ func ReadyOnRevisionMutation(idx int32, rev string, now time.Time) types.Instanc
 	return types.InstanceMutation{Index: idx, Precondition: func(*types.InstanceStatus) bool {
 		return query.RequireNamedRevision(query.RevisionFromName(rev)) == nil
 	}, Mutate: func(s *types.InstanceStatus) bool {
-		if query.RequireNamedRevision(query.RevisionFromName(rev)) != nil {
-			return false
-		}
-		if s.Phase == types.InstancePhaseReady &&
-			s.Operation == nil &&
-			s.RunningRevision == rev &&
-			s.TargetRevision == "" {
+		if ReadyOnRevisionUnchanged(s, rev) {
 			return false
 		}
 		s.RunningRevision = rev
@@ -774,6 +827,22 @@ func ReadyOnRevisionMutation(idx int32, rev string, now time.Time) types.Instanc
 		s.Operation = nil
 		return true
 	}}
+}
+
+// ReadyOnRevisionUnchanged reports whether ReadyOnRevisionMutation leaves
+// the row as it is: rev is not a named revision, or the row is already
+// Ready on rev with no operation and no target. A nil row is the empty row
+// the mutation would be tried on, which a named revision changes. A pass
+// that finds a finish unchanged here hands the writer the mutation without
+// trying it on a copy of the row.
+func ReadyOnRevisionUnchanged(s *types.InstanceStatus, rev string) bool {
+	if query.RequireNamedRevision(query.RevisionFromName(rev)) != nil {
+		return true
+	}
+	return s != nil && s.Phase == types.InstancePhaseReady &&
+		s.Operation == nil &&
+		s.RunningRevision == rev &&
+		s.TargetRevision == ""
 }
 
 // AbandonedSurgeSourceMutation resets the source of an abandoned gang

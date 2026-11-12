@@ -150,54 +150,102 @@ func recordPlacement(isvc *v1beta1.InferenceService, res placementResult) {
 	recordCapacity(isvc, res.candidates)
 }
 
-// recordCapacity preserves the accepted target when a member disappears.
-// Unknown observations must not reuse the Ready count retained during grace.
+// recordCapacity publishes the accepted plan's requested total, each member's
+// desired count, and whether every member's capacity observation is known.
+// The series are cleared first. The total is published for a current plan, the
+// member counts only when the members account for the plan's totals, so a
+// member that disappears never leaves its target behind. An unknown
+// observation must not reuse the Ready count retained during grace.
 func recordCapacity(source *v1beta1.InferenceService, candidates []v1beta1.CandidatePlacement) {
 	ns, name := source.Namespace, source.Name
 	match := prometheus.Labels{"namespace": ns, "isvc": name}
 	placementTotalDesiredReplicas.DeletePartialMatch(match)
 	placementCandidateDesiredReplicas.DeletePartialMatch(match)
 	placementCapacityObservationKnown.WithLabelValues(ns, name).Set(0)
-	if source.Status.Placement == nil || source.Status.Placement.Plan == nil {
-		return
-	}
-	accepted := source.Status.Placement.Plan
-	if source.UID == "" || accepted.SourceUID != source.UID || accepted.ID == "" || accepted.Revision <= 0 || accepted.ObservedGeneration != source.Generation || accepted.RequestedReplicas < 0 || accepted.AssignedReplicas < 0 || accepted.UnassignedReplicas < 0 {
+	accepted, ok := publishableCapacityPlan(source)
+	if !ok {
 		return
 	}
 	placementTotalDesiredReplicas.WithLabelValues(ns, name).Set(float64(accepted.RequestedReplicas))
-	var assigned int64
-	known := true
-	desired := make(map[string]int32, len(candidates))
-	seen := make(map[string]bool, len(candidates))
-	for _, candidate := range candidates {
-		allocation := candidate.Allocation
-		if candidate.Cluster == "" || seen[candidate.Cluster] || allocation == nil || allocation.DesiredReplicas < 0 || allocation.CurrentReplicas < 0 {
-			return
-		}
-		seen[candidate.Cluster] = true
-		assigned += int64(allocation.DesiredReplicas)
-		desired[candidate.Cluster] = allocation.DesiredReplicas
-		// Unknown retired members contribute no capacity. A trusted positive
-		// Ready count contradicts a fully retired allocation.
-		if allocation.DesiredReplicas == 0 && allocation.CurrentReplicas == 0 && allocation.DesiredHome == nil && allocation.CurrentHome == nil {
-			known = known && (!candidate.ObservationKnown || candidate.ReadyReplicas == 0)
-			continue
-		}
-		if allocation.ClusterUID == "" {
-			return
-		}
-		known = known && candidate.ObservationKnown && candidate.ReadyReplicas >= 0
-	}
-	if assigned != accepted.AssignedReplicas || accepted.RequestedReplicas != assigned+int64(accepted.UnassignedReplicas) {
+	targets, ok := readMemberCapacityTargets(accepted, candidates)
+	if !ok {
 		return
 	}
-	for cluster, replicas := range desired {
+	for cluster, replicas := range targets.desired {
 		placementCandidateDesiredReplicas.WithLabelValues(ns, name, cluster).Set(float64(replicas))
 	}
-	if known {
+	if targets.known {
 		placementCapacityObservationKnown.WithLabelValues(ns, name).Set(1)
 	}
+}
+
+// publishableCapacityPlan is the accepted plan the capacity series describe:
+// one accepted for the source as it is now, with nonnegative counts.
+func publishableCapacityPlan(source *v1beta1.InferenceService) (*v1beta1.PlacementPlanStatus, bool) {
+	if source.Status.Placement == nil || source.Status.Placement.Plan == nil {
+		return nil, false
+	}
+	accepted := source.Status.Placement.Plan
+	if source.UID == "" || accepted.SourceUID != source.UID || accepted.ID == "" || accepted.Revision <= 0 || accepted.ObservedGeneration != source.Generation || accepted.RequestedReplicas < 0 || accepted.AssignedReplicas < 0 || accepted.UnassignedReplicas < 0 {
+		return nil, false
+	}
+	return accepted, true
+}
+
+// memberCapacityTargets is what the candidates say about the accepted plan's
+// capacity: each member's desired count, their sum, and whether every
+// member's observation is known.
+type memberCapacityTargets struct {
+	desired  map[string]int32
+	assigned int64
+	known    bool
+}
+
+// readMemberCapacityTargets reads the candidates' targets. It reports false
+// when a candidate cannot be measured (unnamed, repeated, without an
+// allocation or with a negative count, or placed without an identified
+// cluster) or when the counts do not add up to the plan's.
+func readMemberCapacityTargets(accepted *v1beta1.PlacementPlanStatus, candidates []v1beta1.CandidatePlacement) (memberCapacityTargets, bool) {
+	targets := memberCapacityTargets{desired: make(map[string]int32, len(candidates)), known: true}
+	for _, candidate := range candidates {
+		if !targets.add(candidate) {
+			return targets, false
+		}
+	}
+	if targets.assigned != accepted.AssignedReplicas || accepted.RequestedReplicas != targets.assigned+int64(accepted.UnassignedReplicas) {
+		return targets, false
+	}
+	return targets, true
+}
+
+// add reads one candidate's target; false when the candidate cannot be
+// measured. A retired member contributes no capacity, and a trusted positive
+// Ready count contradicts its retirement.
+func (t *memberCapacityTargets) add(candidate v1beta1.CandidatePlacement) bool {
+	allocation := candidate.Allocation
+	if candidate.Cluster == "" || allocation == nil || allocation.DesiredReplicas < 0 || allocation.CurrentReplicas < 0 {
+		return false
+	}
+	if _, repeated := t.desired[candidate.Cluster]; repeated {
+		return false
+	}
+	t.desired[candidate.Cluster] = allocation.DesiredReplicas
+	t.assigned += int64(allocation.DesiredReplicas)
+	if allocationRetired(allocation) {
+		t.known = t.known && (!candidate.ObservationKnown || candidate.ReadyReplicas == 0)
+		return true
+	}
+	if allocation.ClusterUID == "" {
+		return false
+	}
+	t.known = t.known && candidate.ObservationKnown && candidate.ReadyReplicas >= 0
+	return true
+}
+
+// allocationRetired reports an allocation with nothing assigned, nothing
+// running and no placement recorded either way.
+func allocationRetired(allocation *v1beta1.CandidateAllocationStatus) bool {
+	return allocation.DesiredReplicas == 0 && allocation.CurrentReplicas == 0 && allocation.DesiredHome == nil && allocation.CurrentHome == nil
 }
 
 // recordPolicy publishes the spec-side placement policy. Split-only numeric

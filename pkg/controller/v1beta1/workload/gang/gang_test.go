@@ -2,6 +2,7 @@ package gang
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -49,6 +50,13 @@ func newOwner(ns, name string) client.Object {
 
 func newGangClient(t *testing.T, initObjs ...client.Object) client.WithWatch {
 	t.Helper()
+	return newGangClientWith(t, nil, initObjs...)
+}
+
+// newGangClientWith is newGangClient with the client's own options, such as
+// a counter of the lists it serves, layered on the store.
+func newGangClientWith(t *testing.T, opts []fakeclient.Option, initObjs ...client.Object) client.WithWatch {
+	t.Helper()
 	var owner client.Object
 	for _, obj := range initObjs {
 		if _, isPodGroup := obj.(*schedulingv1alpha1.PodGroup); !isPodGroup {
@@ -67,10 +75,12 @@ func newGangClient(t *testing.T, initObjs ...client.Object) client.WithWatch {
 			pg.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(owner, testOwnerGVK)}
 		}
 	}
-	return fakeclient.New(t,
+	opts = append([]fakeclient.Option{
 		fakeclient.WithTypes(schedulingv1alpha1.AddToScheme),
 		fakeclient.WithObjects(initObjs...),
-		fakeclient.WithIndex(&schedulingv1alpha1.PodGroup{}, PodGroupControllerUIDIndexField, PodGroupControllerUIDIndexExtractor))
+		fakeclient.WithIndex(&schedulingv1alpha1.PodGroup{}, PodGroupControllerUIDIndexField, PodGroupControllerUIDIndexExtractor),
+	}, opts...)
+	return fakeclient.New(t, opts...)
 }
 
 // inputWithConditionStore returns a ReconcileInput wired to record
@@ -236,6 +246,55 @@ func TestEnsurePodGroups_MultiPodCRDAvailableCreatesGang(t *testing.T) {
 
 	// Condition=False (gang available, not degraded).
 	assertCondition(t, store, metav1.ConditionFalse, string(workloadtypes.ReasonGangSchedulingAvailable))
+}
+
+// TestEnsurePodGroups_TimeoutIsThePlacementGrace: a gang's PodGroup carries
+// the operator's placement grace as its schedule timeout, not the Component's
+// ready timeout, so the scheduler stops waiting for the gang in the pass OME
+// ends the attempt. The Component pass and the surge callback write the same
+// clock.
+func TestEnsurePodGroups_TimeoutIsThePlacementGrace(t *testing.T) {
+	const grace = 2 * time.Minute
+	const readyTimeout = 3 * time.Minute
+	bounds := &workloadtypes.GangScheduleTimeoutClamp{Min: time.Minute, Max: 10 * time.Minute}
+	cases := []struct {
+		name  string
+		write func(t *testing.T, deps workloadtypes.Deps, input workloadtypes.ReconcileInput, plan workloadtypes.ComponentPlan)
+	}{
+		{"the Component pass", func(t *testing.T, deps workloadtypes.Deps, input workloadtypes.ReconcileInput, plan workloadtypes.ComponentPlan) {
+			if _, err := EnsurePodGroupsWithState(context.Background(), deps, input, plan, PodGroupReconcileState{}); err != nil {
+				t.Fatalf("EnsurePodGroupsWithState: %v", err)
+			}
+		}},
+		{"the surge callback", func(t *testing.T, deps workloadtypes.Deps, input workloadtypes.ReconcileInput, plan workloadtypes.ComponentPlan) {
+			if _, err := EnsureSurgePodGroupWithState(deps, PodGroupReconcileState{})(context.Background(), input, plan, plan.Instances[0]); err != nil {
+				t.Fatalf("EnsureSurgePodGroupWithState: %v", err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := newOwner("prod", "svc")
+			c := newGangClient(t, owner)
+			input, _ := inputWithConditionStore(owner, true, 1, true, "")
+			input.UnschedulableGrace = grace
+			plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, readyTimeout)
+			plan.GangScheduleTimeout = bounds
+
+			tc.write(t, workloadtypes.Deps{Client: c}, input, plan)
+
+			pg := &schedulingv1alpha1.PodGroup{}
+			if err := c.Get(context.Background(), client.ObjectKey{Namespace: "prod", Name: "svc-engine-0"}, pg); err != nil {
+				t.Fatalf("expected PodGroup created, got %v", err)
+			}
+			if pg.Spec.ScheduleTimeoutSeconds == nil {
+				t.Fatalf("ScheduleTimeoutSeconds: unset, want the placement grace %s", grace)
+			}
+			if got := time.Duration(*pg.Spec.ScheduleTimeoutSeconds) * time.Second; got != grace {
+				t.Fatalf("ScheduleTimeoutSeconds: got %s want the placement grace %s (the ready timeout is %s)", got, grace, readyTimeout)
+			}
+		})
+	}
 }
 
 func TestEnsurePodGroups_HoldsLivePodTopologyUntilGroupIsEmpty(t *testing.T) {
@@ -485,6 +544,144 @@ func TestEnsureSurgePodGroup_UsesAPIReaderForTopologySafety(t *testing.T) {
 	}
 	if key != oldTopology {
 		t.Fatalf("surge effective topology from live reader: got %q want %q", key, oldTopology)
+	}
+}
+
+// TestEnsureSurgePodGroup_WithoutInventoryRecordsAnUnusableName: the surge
+// callback without an inventory reads the name itself and answers like the
+// callback with one: the Instance's gang reading says why its members are
+// withheld, the error the op reads is the workload's, and nothing is written.
+func TestEnsureSurgePodGroup_WithoutInventoryRecordsAnUnusableName(t *testing.T) {
+	const idx = int32(6)
+	for _, tc := range []struct {
+		name      string
+		occupy    func(t *testing.T, c client.Client, pg *schedulingv1alpha1.PodGroup)
+		wantState workloadtypes.GangState
+	}{
+		{
+			name: "another controller holds the name",
+			occupy: func(t *testing.T, c client.Client, pg *schedulingv1alpha1.PodGroup) {
+				otherOwner := newOwner("prod", "other")
+				pg.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(otherOwner, testOwnerGVK)}
+				if err := c.Create(context.Background(), pg); err != nil {
+					t.Fatalf("create the other owner's group: %v", err)
+				}
+			},
+			wantState: workloadtypes.GangStateOwnershipConflict,
+		},
+		{
+			name: "the owned group is terminating",
+			occupy: func(t *testing.T, c client.Client, pg *schedulingv1alpha1.PodGroup) {
+				pg.Finalizers = []string{"example.com/keep"}
+				if err := c.Create(context.Background(), pg); err != nil {
+					t.Fatalf("create group: %v", err)
+				}
+				if err := c.Delete(context.Background(), pg); err != nil {
+					t.Fatalf("delete group behind its finalizer: %v", err)
+				}
+			},
+			wantState: workloadtypes.GangStateTerminating,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := newOwner("prod", "llama")
+			base := newGangClient(t, owner)
+			tc.occupy(t, base, inventoryPodGroup(t, owner, "llama", idx))
+			writes := fakeclient.CountingWrites().OnKind(&schedulingv1alpha1.PodGroup{})
+			counting := fakeclient.Wrap(t, base, writes)
+			input, _ := inputWithConditionStore(owner, true, 1, true, "custom-scheduler")
+			input.AuthoritativePods = &workloadtypes.ComponentPodSnapshot{ByInstance: map[int32][]*corev1.Pod{}}
+			input.Gangs = workloadtypes.NewGangObservations()
+			plan := planFor(workloadtypes.ComponentEngine, []int32{idx}, true, 1, 5*time.Minute)
+
+			_, err := EnsureSurgePodGroupWithState(workloadtypes.Deps{Client: counting}, PodGroupReconcileState{})(
+				context.Background(), input, plan, plan.Instances[0])
+			if !errors.Is(err, workloadtypes.ErrGangNameUnusable) {
+				t.Fatalf("surge callback without an inventory: got %v want %v", err, workloadtypes.ErrGangNameUnusable)
+			}
+			if got := input.Gangs.For(idx); got.State != tc.wantState {
+				t.Errorf("instance %d gang state: got %q want %q", idx, got.State, tc.wantState)
+			}
+			if !input.Gangs.BlocksPods(idx) {
+				t.Errorf("instance %d must not accept pods while its PodGroup name is unusable", idx)
+			}
+			if writes.Count() != 0 {
+				t.Errorf("PodGroup writes on an unusable name: got %d want 0", writes.Count())
+			}
+		})
+	}
+}
+
+// TestEnsureSurgePodGroup_WithoutInventoryReadsTheNameOnce: the surge
+// callback without an inventory reads the gang's name once per call and
+// writes only what that read shows missing or drifted: one read and one
+// create while the name is free, one read and no write once the group
+// matches the plan.
+func TestEnsureSurgePodGroup_WithoutInventoryReadsTheNameOnce(t *testing.T) {
+	const idx = int32(3)
+	owner := newOwner("prod", "llama")
+	store := newGangClient(t, owner)
+	input, _ := inputWithConditionStore(owner, true, 1, true, "custom-scheduler")
+	input.AuthoritativePods = &workloadtypes.ComponentPodSnapshot{ByInstance: map[int32][]*corev1.Pod{}}
+	input.Gangs = workloadtypes.NewGangObservations()
+	plan := planFor(workloadtypes.ComponentEngine, []int32{idx}, true, 1, 5*time.Minute)
+	ensure := func(t *testing.T) (reads, writes int) {
+		t.Helper()
+		readCalls := fakeclient.CountingVerb(fakeclient.Get).OnKind(&schedulingv1alpha1.PodGroup{})
+		writeCalls := fakeclient.CountingWrites().OnKind(&schedulingv1alpha1.PodGroup{})
+		counting := fakeclient.Wrap(t, store, readCalls, writeCalls)
+		if _, err := EnsureSurgePodGroupWithState(workloadtypes.Deps{Client: counting}, PodGroupReconcileState{})(
+			context.Background(), input, plan, plan.Instances[0]); err != nil {
+			t.Fatalf("surge callback without an inventory: %v", err)
+		}
+		return readCalls.Count(), writeCalls.Count()
+	}
+
+	if reads, writes := ensure(t); reads != 1 || writes != 1 {
+		t.Errorf("free name: got %d reads and %d writes, want 1 read and 1 create", reads, writes)
+	}
+	if reads, writes := ensure(t); reads != 1 || writes != 0 {
+		t.Errorf("matching group: got %d reads and %d writes, want 1 read and no write", reads, writes)
+	}
+}
+
+// TestEnsureSurgePodGroup_WithoutInventoryReadErrorSurfaces: a read of the
+// name that fails for any reason but "not found" ends the callback with
+// that error. The name is not taken as free, which would write a group
+// over an object the read could not see, nothing is recorded on the row,
+// and the error is not reported as a topology the live pods cannot prove.
+func TestEnsureSurgePodGroup_WithoutInventoryReadErrorSurfaces(t *testing.T) {
+	const idx = int32(3)
+	owner := newOwner("prod", "llama")
+	pgName := query.PodGroupName("llama", workloadtypes.ComponentEngine, idx)
+	// A live member with no provable topology: taken as a free name, the
+	// write would fail the topology proof instead of reporting the read.
+	member := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: "llama-engine-3-worker-0", Namespace: "prod",
+		Labels: map[string]string{query.LabelPodGroup: pgName, query.LabelRunner: "worker"},
+	}}
+	boom := apierrors.NewServiceUnavailable("apiserver overloaded")
+	writes := fakeclient.CountingWrites().OnKind(&schedulingv1alpha1.PodGroup{})
+	failing := fakeclient.Wrap(t, newGangClient(t, owner, member),
+		fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, boom).OnKind(&schedulingv1alpha1.PodGroup{}), writes)
+	input, _ := inputWithConditionStore(owner, true, 1, true, "custom-scheduler")
+	input.Gangs = workloadtypes.NewGangObservations()
+	plan := planFor(workloadtypes.ComponentEngine, []int32{idx}, true, 1, 5*time.Minute)
+	plan.TopologyKey = "topology.example.com/desired"
+
+	_, err := EnsureSurgePodGroupWithState(workloadtypes.Deps{Client: failing}, PodGroupReconcileState{})(
+		context.Background(), input, plan, plan.Instances[0])
+	if !apierrors.IsServiceUnavailable(err) {
+		t.Fatalf("surge callback with a failing read: got %v, want the read's error", err)
+	}
+	if strings.Contains(err.Error(), "cannot prove active topology") {
+		t.Errorf("read error reported as a topology proof: %v", err)
+	}
+	if got := input.Gangs.For(idx); got.State != workloadtypes.GangStateNone {
+		t.Errorf("instance %d gang reading after a failed read: got %q, want none", idx, got.State)
+	}
+	if writes.Count() != 0 {
+		t.Errorf("PodGroup writes after a failed read: got %d, want 0", writes.Count())
 	}
 }
 

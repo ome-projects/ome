@@ -912,3 +912,95 @@ func TestBatcher_IsPodRoutedRejectsInvalidInput(t *testing.T) {
 		t.Errorf("invalid inputs must perform no reads, got LIST=%d GET=%d", cr.sliceLists, cr.serviceGets)
 	}
 }
+
+// --- Batcher: RoutesNothing, the absence rule asked on its own ---
+
+func TestBatcher_RoutesNothing_NoSlicesAndNoService(t *testing.T) {
+	// Nothing is labelled for the Service and the Service does not exist:
+	// no request can reach any pod through it.
+	cr := &countingReader{Reader: newDrainTestClient(t)}
+	b := NewBatcher(cr, "ns")
+	routesNothing, err := b.RoutesNothing(context.Background(), "svc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !routesNothing {
+		t.Fatalf("expected routesNothing=true with no slices and no Service")
+	}
+	if cr.sliceLists != 1 || cr.serviceGets != 1 {
+		t.Fatalf("expected one slice LIST and one Service GET, got %d and %d", cr.sliceLists, cr.serviceGets)
+	}
+}
+
+func TestBatcher_RoutesNothing_ServiceExistsWithoutSlices(t *testing.T) {
+	// The Service exists and its slices are not written yet: the endpoints
+	// controller is behind, and a pod may be published any moment.
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "ns"}}
+	b := NewBatcher(newDrainTestClient(t, svc), "ns")
+	routesNothing, err := b.RoutesNothing(context.Background(), "svc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if routesNothing {
+		t.Fatalf("a Service with no slice yet routes; got routesNothing=true")
+	}
+}
+
+func TestBatcher_RoutesNothing_SliceWithoutThePodRoutes(t *testing.T) {
+	// A slice labelled for the Service stands, naming no pod or another
+	// pod: the Service routes, whatever it says about the pod asked about.
+	cr := &countingReader{Reader: newDrainTestClient(t, sliceForService("ns", "svc-1", "svc"))}
+	b := NewBatcher(cr, "ns")
+	routesNothing, err := b.RoutesNothing(context.Background(), "svc")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if routesNothing {
+		t.Fatalf("a Service with a slice routes; got routesNothing=true")
+	}
+	if cr.serviceGets != 0 {
+		t.Fatalf("a non-empty slice list must not GET the Service, got %d GETs", cr.serviceGets)
+	}
+}
+
+func TestBatcher_RoutesNothing_ReadsOnceBesideTheRotationReading(t *testing.T) {
+	// The rotation reading and the absence rule read the same list and the
+	// same Service lookup: one LIST and one GET for the pass, however many
+	// times either is asked.
+	pod := testPod("ns", "p1")
+	cr := &countingReader{Reader: newDrainTestClient(t)}
+	b := NewBatcher(cr, "ns")
+	for i := 0; i < 2; i++ {
+		inRotation, err := b.IsPodInRotation(context.Background(), "svc", pod)
+		if err != nil || inRotation {
+			t.Fatalf("IsPodInRotation with no slices: got (%v, %v) want (false, nil)", inRotation, err)
+		}
+		routesNothing, err := b.RoutesNothing(context.Background(), "svc")
+		if err != nil || !routesNothing {
+			t.Fatalf("RoutesNothing with no slices and no Service: got (%v, %v) want (true, nil)", routesNothing, err)
+		}
+	}
+	if cr.sliceLists != 1 || cr.serviceGets != 1 {
+		t.Fatalf("expected one slice LIST and one Service GET, got %d and %d", cr.sliceLists, cr.serviceGets)
+	}
+}
+
+func TestBatcher_RoutesNothing_EmptyServiceNameRejected(t *testing.T) {
+	b := NewBatcher(newDrainTestClient(t), "ns")
+	if _, err := b.RoutesNothing(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty service name")
+	}
+}
+
+func TestBatcher_RoutesNothing_ReturnsTheReadErrors(t *testing.T) {
+	listFailed := errors.New("list failed")
+	cr := &countingReader{Reader: newDrainTestClient(t), listErr: listFailed}
+	if _, err := NewBatcher(cr, "ns").RoutesNothing(context.Background(), "svc"); !errors.Is(err, listFailed) {
+		t.Fatalf("expected the slice list error, got %v", err)
+	}
+	getFailed := errors.New("get failed")
+	cr = &countingReader{Reader: newDrainTestClient(t), getErr: getFailed}
+	if _, err := NewBatcher(cr, "ns").RoutesNothing(context.Background(), "svc"); !errors.Is(err, getFailed) {
+		t.Fatalf("expected the Service lookup error, got %v", err)
+	}
+}

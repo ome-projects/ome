@@ -90,3 +90,27 @@ func TestCoordinatorTargetIsWrittenBesideItsPartition(t *testing.T) {
 	g.Expect(got.Spec.Replicas).To(gomega.HaveValue(gomega.Equal(int32(*isvc.Spec.Engine.MinReplicas))),
 		"a Component the coordinator does not own is projected from its declared minimum")
 }
+
+// A Component that stopped following keeps the count it carries under
+// autoscaler class None; the same Component with nothing marking it released
+// is written from its minReplicas, and a fresh replica starts there.
+func TestReleasedFollowerKeepsItsLiveCount(t *testing.T) {
+	minimum := 2
+	twelve := int32(12)
+	params := Params{ComponentExt: &v1beta1.ComponentExtensionSpec{MinReplicas: &minimum},
+		ResolvedAutoscaler: &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerNone}, FollowerReleased: true}
+	ir := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{ResourceVersion: "1"}}
+	ir.Spec.Replicas = &twelve
+	if got := ptr.Deref(desiredReplicas(ir, params), -1); got != 12 {
+		t.Fatalf("released follower count = %d; want the 12 it carries", got)
+	}
+	params.FollowerReleased = false
+	if got := ptr.Deref(desiredReplicas(ir, params), -1); got != 2 {
+		t.Fatalf("fixed-count projection = %d; want minReplicas 2", got)
+	}
+	params.FollowerReleased = true
+	ir.ResourceVersion = ""
+	if got := ptr.Deref(desiredReplicas(ir, params), -1); got != 2 {
+		t.Fatalf("initial projection = %d; want minReplicas 2", got)
+	}
+}

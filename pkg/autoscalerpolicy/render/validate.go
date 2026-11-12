@@ -43,28 +43,47 @@ var sampleContext = Context{
 	TargetName:  "sample-isvc-engine",
 }
 
-// ValidateSpec runs every check that needs no cluster state: structural
-// coherence, the reserved-shape rejections, template parse + allowlist, a
-// sample render, and a PromQL parse of each rendered prometheus query. The
-// parse catches malformed queries (unbalanced parentheses, bad selectors); a
-// targeted AST lint additionally flags the known precedence trap
-// `sum(x) > bool 0 * N`, which is syntactically valid but multiplies inside
-// the comparison instead of scaling its result.
+// ValidateSpec runs every check that needs no cluster state: the reserved
+// enforcement shape, the template the class requires, each trigger's rules,
+// the fallback's one value source, then a sample render whose rendered
+// prometheus queries must parse as PromQL. The parse catches malformed
+// queries; findPrecedenceTrap also flags `sum(x) > bool 0 * N`, which parses
+// but multiplies inside the comparison instead of scaling its result.
 // The returned issues are admission-blocking; an empty slice means valid.
 //
-// Rendered output additionally passes the same per-ISVC autoscaler
-// validation an inline block faces at reconcile time — ValidateSpec is the
-// policy-shaped front door, not the only door.
+// Rendered output also passes the per-ISVC autoscaler validation an inline
+// block faces at reconcile time; ValidateSpec is the policy-shaped front
+// door, not the only door.
 func ValidateSpec(spec *v1beta1.AutoscalerPolicySpec) []Issue {
 	var issues []Issue
-
-	// Reserved shape: rejecting Required outright means an old controller
-	// can never encounter a Required policy it would misread as Default.
+	// Refusing Required outright means an older controller never meets a
+	// Required policy it would read as Default.
 	if spec.Enforcement == v1beta1.PolicyEnforcementRequired {
 		issues = append(issues, Issue{ReasonEnforcementReserved,
 			"enforcement Required is a reserved shape and not implemented; use Default"})
 	}
+	issues = append(issues, classTemplateIssues(spec)...)
+	if spec.Keda == nil {
+		return issues
+	}
+	for i := range spec.Keda.Triggers {
+		issues = append(issues, validateTrigger(i, &spec.Keda.Triggers[i])...)
+	}
+	issues = append(issues, fallbackIssues(spec.Keda.Fallback)...)
+	// The sample render gives every trigger a stand-in provider binding, so
+	// it tests the templates and the typed derivation, not provider
+	// resolution. A policy that fails this render fails for every consumer.
+	if len(issues) == 0 {
+		issues = append(issues, sampleRender(spec)...)
+	}
+	return issues
+}
 
+// classTemplateIssues requires the template the class names and no other:
+// KEDA needs a keda template and forbids an hpa one, HPA forbids a keda
+// one, and every other class is inline-only.
+func classTemplateIssues(spec *v1beta1.AutoscalerPolicySpec) []Issue {
+	var issues []Issue
 	switch spec.Class {
 	case v1beta1.AutoscalerKEDA:
 		if spec.Keda == nil {
@@ -81,35 +100,25 @@ func ValidateSpec(spec *v1beta1.AutoscalerPolicySpec) []Issue {
 		issues = append(issues, Issue{ReasonClassTemplate,
 			fmt.Sprintf("class %q is not allowed in policies (External and None are inline-only)", spec.Class)})
 	}
-
-	if spec.Keda == nil {
-		return issues
-	}
-
-	for i := range spec.Keda.Triggers {
-		issues = append(issues, validateTrigger(i, &spec.Keda.Triggers[i])...)
-	}
-	if fb := spec.Keda.Fallback; fb != nil {
-		set := 0
-		if fb.Replicas.Value != nil {
-			set++
-		}
-		if fb.Replicas.FromComponent != nil {
-			set++
-		}
-		if set != 1 {
-			issues = append(issues, Issue{ReasonValueSourceInvalid,
-				"fallback.replicas: exactly one of value or fromComponent must be set"})
-		}
-	}
-
-	// Sample render: every trigger gets a dummy provider binding so provider
-	// resolution itself is not under test here — only templates and typed
-	// derivation. A policy that fails this render fails for every consumer.
-	if !hasBlocking(issues) {
-		issues = append(issues, sampleRender(spec)...)
-	}
 	return issues
+}
+
+// fallbackIssues requires exactly one source for the fallback replica count.
+func fallbackIssues(fallback *v1beta1.FallbackTemplate) []Issue {
+	if fallback == nil {
+		return nil
+	}
+	set := 0
+	if fallback.Replicas.Value != nil {
+		set++
+	}
+	if fallback.Replicas.FromComponent != nil {
+		set++
+	}
+	if set != 1 {
+		return []Issue{{ReasonValueSourceInvalid, "fallback.replicas: exactly one of value or fromComponent must be set"}}
+	}
+	return nil
 }
 
 func validateTrigger(index int, trigger *v1beta1.KedaTriggerTemplate) []Issue {
@@ -192,14 +201,11 @@ func templateIssueReason(err error) string {
 	return v1beta1.AutoscalerPolicyReasonParseError
 }
 
-func hasBlocking(issues []Issue) bool { return len(issues) > 0 }
-
-// findPrecedenceTrap walks a parsed query for the one known-lethal shape:
-// a bool-modified comparison whose right-hand side is an arithmetic
-// expression over number literals, e.g. `sum(x) > bool 0 * 8`. `*` binds
-// tighter than `>`, so that parses as `sum(x) > bool (0*8)` and returns 0/1
-// instead of 0/8 — the author almost certainly meant
-// `(sum(x) > bool 0) * 8`. Returns an operator-facing message, or "".
+// findPrecedenceTrap walks a parsed query for one shape: a bool-modified
+// comparison whose right-hand side is arithmetic over number literals, such
+// as `sum(x) > bool 0 * 8`. `*` binds tighter than `>`, so that parses as
+// `sum(x) > bool (0*8)` and returns 0 or 1 instead of 0 or 8; the author
+// meant `(sum(x) > bool 0) * 8`. Returns an operator-facing message, or "".
 func findPrecedenceTrap(expr parser.Expr) string {
 	var found string
 	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {

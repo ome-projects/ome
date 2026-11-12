@@ -2,8 +2,6 @@ package workload_test
 
 import (
 	"context"
-	"runtime"
-	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/allocbudget"
 )
 
 // Two gangs of one leader and one worker serve version 1 under
@@ -800,49 +799,162 @@ func TestUpdatePass_SurgesOfAFleetPassTakeTheNextFreeIndexesInOrder(t *testing.T
 // opens 400 gang surges over 4,000 gangs costs about eight times the pass
 // that opens 50 over 500, not sixty-four: every surge of the pass takes
 // its index from one set of the taken indexes, resumed where the last
-// surge took its own, instead of each surge reading every row again. The
-// sampling is TestBuildPlanCostGrowsWithTheInstanceCount's: each size is
-// read as the fastest of its interleaved samples, with the heap collected
-// between samples, so another process on the machine can only slow a
-// sample down and the fastest is the one it disturbed least.
+// surge took its own, instead of each surge reading every row into a set
+// of its own. The cost is read as the bytes the pass allocates, which are
+// the same on every machine whatever else it runs, so one ceiling gates
+// everywhere; a duration moves with the load beside the test. Bytes
+// rather than the allocation count, because a set read per surge is a few
+// dozen allocations holding two entries per row: it barely moves the
+// count and multiplies the bytes.
 func TestUpdatePassOpeningSurgesCostGrowsWithTheInstanceCount(t *testing.T) {
 	if testing.Short() {
-		t.Skip("timing-backed gate; skipped under -short")
+		t.Skip("fleet-size gate; skipped under -short")
 	}
 	const small, large = 500, 4000
-	// A cost that grows with the count gives a ratio near 8 between the two
-	// sizes and one that grows with its square gives 64; the ceiling sits
-	// between them, with room for a loaded machine.
-	const ceiling = 20.0
-	const samples = 9
-	previousGCPercent := debug.SetGCPercent(1000)
-	defer debug.SetGCPercent(previousGCPercent)
+	// A cost that grows with the count gives a ratio of 8 between the two
+	// sizes, less the pass's fixed share, and one that grows with its
+	// square gives 64. The ceiling sits just above the linear reading: the
+	// bytes do not move with the machine, so it needs no room for load.
+	const ceiling = 10.0
 	ctx := logr.NewContext(context.Background(), logr.Discard())
-	fastest := map[int]time.Duration{}
-	for i := 0; i < samples; i++ {
-		for _, n := range []int{small, large} {
-			// A fresh roll per sample: the pass reserves the surges it opens
-			// in the snapshot, so a second pass over the same rows would
-			// open none.
-			roll := newGangFleetRoll(ctx, t, n)
-			runtime.GC()
-			start := time.Now()
-			err := roll.execute(ctx)
-			elapsed := time.Since(start)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if opened := len(roll.surgesOpened()); opened != n/10 {
-				t.Fatalf("%d gangs: the pass opened %d surges, want %d", n, opened, n/10)
-			}
-			if i == 0 || elapsed < fastest[n] {
-				fastest[n] = elapsed
-			}
+	allocated := map[int]uint64{}
+	for _, n := range []int{small, large} {
+		allocated[n] = gangFleetPassBytes(t, ctx, n)
+	}
+	ratio := float64(allocated[large]) / float64(allocated[small])
+	t.Logf("update pass opening %d surges: %d bytes at %d gangs, %d at %d, %.2fx (ceiling %.0fx)", large/10, allocated[small], small, allocated[large], large, ratio, ceiling)
+	if ratio > ceiling {
+		t.Errorf("the pass over %d gangs allocates %.2fx the bytes of the pass over %d, above the ceiling of %.0fx: the cost grows faster than the count", large, ratio, small, ceiling)
+	}
+}
+
+// gangFleetPassBytes is the bytes one pass allocates opening the surges of
+// a roll over n gangs: the smallest of allocbudget.Samples passes, each
+// over its own roll built outside the reading, since the pass reserves the
+// surges it opens in the snapshot and a second pass over the same rows
+// would open none. Every pass must open a surge on a tenth of the gangs.
+func gangFleetPassBytes(t *testing.T, ctx context.Context, n int) uint64 {
+	t.Helper()
+	var best uint64
+	for i := 0; i < allocbudget.Samples; i++ {
+		roll := newGangFleetRoll(ctx, t, n)
+		reading, err := measureCall(func() error { return roll.execute(ctx) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opened := len(roll.surgesOpened()); opened != n/10 {
+			t.Fatalf("%d gangs: the pass opened %d surges, want %d", n, opened, n/10)
+		}
+		if i == 0 || reading.bytes < best {
+			best = reading.bytes
 		}
 	}
-	ratio := float64(fastest[large]) / float64(fastest[small])
-	t.Logf("update pass opening %d surges: %v at %d gangs, %v at %d, %.1fx (ceiling %.0fx)", large/10, fastest[small], small, fastest[large], large, ratio, ceiling)
-	if ratio > ceiling {
-		t.Errorf("the pass over %d gangs costs %.1fx the pass over %d, above the ceiling of %.0fx: the cost grows faster than the count", large, ratio, small, ceiling)
+	return best
+}
+
+// TestReconcile_FailedInstanceOnItsRevisionWithARefusedSet_RollRebuildsItUnderItsOwnBudgetSlot:
+// two single-pod Instances serve version 1 under RecreatePod with an
+// unavailability budget of one. The operator pushes version 2 while the
+// cluster has no room: Instance 0's pod is drained and deleted and the pod
+// rebuilt for version 2 is refused by the scheduler. The operator then
+// pushes version 1 back, so the recreate reopens at version 1 and the pod
+// it rebuilds is refused as well. Once the placement grace has passed the
+// attempt is ended: the row reads Failed with no operation on the revision
+// it targets, with its refused pod still live. That is not a resting
+// state. The next pass opens a fresh recreate at the same revision under
+// the budget slot the Instance's own outage already holds, deletes the
+// refused pod and rebuilds it, while Instance 1 keeps serving untouched;
+// once the cluster has room again Instance 0 serves version 1. The same
+// holds for a gang under InPlaceIfPossible, which every in-place strategy
+// rebuilds as a recreate: an in-place patch never unbinds a pod, so a
+// refused set of a promoted row comes only from a rebuild.
+func TestReconcile_FailedInstanceOnItsRevisionWithARefusedSet_RollRebuildsItUnderItsOwnBudgetSlot(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		gang     bool
+		strategy workloadtypes.UpdateStrategyType
+	}{
+		{name: "single pod under RecreatePod", strategy: workloadtypes.UpdateStrategyRecreatePod},
+		{name: "gang under InPlaceIfPossible", gang: true, strategy: workloadtypes.UpdateStrategyInPlaceIfPossible},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failedInstanceOnItsRevisionWithARefusedSetIsRebuilt(t, tc.gang, tc.strategy)
+		})
+	}
+}
+
+func failedInstanceOnItsRevisionWithARefusedSetIsRebuilt(t *testing.T, gang bool, strategy workloadtypes.UpdateStrategyType) {
+	t.Helper()
+	const noRoom = "0/4 nodes are available: 4 node(s) had untolerated taint(s)."
+	const replicas = 2
+	h := offTargetCrashHarness(t, gang, strategy, 0, 1, workloadtypes.RestartPolicyNone, replicas)
+	h.unschedulableGrace = 2 * time.Minute
+
+	// refusedPodOn is Instance 0's live pod on rev that the scheduler refused.
+	refusedPodOn := func(rev *appsv1.ControllerRevision) *corev1.Pod {
+		for _, pod := range h.podsOf(0) {
+			if pod.Labels[query.LabelRevisionHash] != query.RevisionOf(rev).Hash() {
+				continue
+			}
+			if _, _, refused := workloadtypes.PodUnschedulable(pod); refused {
+				return pod
+			}
+		}
+		return nil
+	}
+	// otherUntouched is the promise every step keeps: Instance 1 serves
+	// version 1 and the roll stays within its budget.
+	otherUntouched := func() {
+		t.Helper()
+		rollStaysWithinBudget(t, h, strategy, 0, 1)
+		if !h.untouchedOn(1, h.revV1) || !h.instanceServes(1) {
+			h.dumpState("other Instance")
+			t.Fatalf("Instance 1 was taken while Instance 0 serves nothing: the Instance that is down is the one the budget allows down")
+		}
+	}
+
+	h.holdPlacement(noRoom)
+	h.setTarget(h.revFixed, fixedImage)
+	if !h.runWithInvariant(40, func() bool { return refusedPodOn(h.revFixed) != nil }, otherUntouched) {
+		h.dumpState("push with no room")
+		t.Fatalf("the pod rebuilt for version 2 was never refused placement")
+	}
+	h.setTarget(h.revV1, goodImage)
+	if !h.runWithInvariant(40, func() bool { return refusedPodOn(h.revV1) != nil }, otherUntouched) {
+		h.dumpState("push back with no room")
+		t.Fatalf("the pod rebuilt for version 1 was never refused placement")
+	}
+
+	endedOnItsRevision := func() bool {
+		row := h.instance(0)
+		return row != nil && row.Phase == workloadtypes.InstancePhaseFailed && row.Operation == nil &&
+			row.RunningRevision == h.revV1.Name && refusedPodOn(h.revV1) != nil
+	}
+	if !h.runWithInvariant(80, endedOnItsRevision, otherUntouched) {
+		h.dumpState("grace")
+		t.Fatalf("the placement grace never ended the attempt on the revision the row already runs")
+	}
+	refused := refusedPodOn(h.revV1).UID
+	reopened := func() bool {
+		row := h.instance(0)
+		return row != nil && row.Phase == workloadtypes.InstancePhaseUpdating && row.Operation != nil && row.Operation.Type == workloadtypes.InstanceOperationUpdate
+	}
+	if !h.runWithInvariant(3, reopened, otherUntouched) {
+		h.dumpState("resting Failed")
+		t.Fatalf("a Failed row with no operation and a live refused pod rested instead of re-opening its recreate; last hold %+v", h.lastHold())
+	}
+	if hold := h.lastHold(); hold != nil && hold.Gate == workloadtypes.RolloutHoldGateBudget && strings.Contains(hold.Reason, "Instance 0 on revision") {
+		t.Fatalf("the start was held by the slot its own outage holds: %+v", hold)
+	}
+
+	h.releasePlacement()
+	if !h.runWithInvariant(120, func() bool { return h.settledOn(h.revV1, replicas) }, otherUntouched) {
+		h.dumpState("room back")
+		t.Fatalf("Instance 0 never served version 1 again once the cluster had room; last hold %+v", h.lastHold())
+	}
+	for _, pod := range h.livePods() {
+		if pod.UID == refused {
+			t.Fatalf("the refused pod %s is still in the API; the recreate did not replace it", pod.Name)
+		}
 	}
 }

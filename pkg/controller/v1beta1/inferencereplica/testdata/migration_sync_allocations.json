@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "A replica at rest is not read live: the pass's copy carries no migration record, the audit record holds nothing to import and the parent carries no request, so the sync returns before the live read with the audit record's load and the import scan (13 allocations, 0 reads). A pass with a record in flight reads the replica live once and decodes it: with the readySince columns that decode expands one base time, one index set and one offset list, 180 allocations at readySince/4000 where the 4,000 entries cost 24,169.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "readySince/4000/at-rest/allocations": 13,
+    "readySince/4000/at-rest/live-reads": 0,
+    "readySince/4000/in-flight/allocations": 180,
+    "readySince/4000/in-flight/live-reads": 1,
+    "uniform/4000/at-rest/allocations": 13,
+    "uniform/4000/at-rest/live-reads": 0
+  }
+}

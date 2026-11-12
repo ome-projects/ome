@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -62,57 +63,44 @@ func Resolve(ctx context.Context, start *RuntimeRef, fetch Fetcher, maxDepth int
 		return nil, nil, errors.New("runtimeinheritance.Resolve: start is nil")
 	}
 
+	// The walk collects the chain child first; the errors report it in
+	// that order.
 	visited := map[string]bool{start.Name: true}
-	chainChildFirst := []string{start.Name}
-	specsChildFirst := []*v1beta1.ServingRuntimeSpec{start.Spec}
+	chain := []string{start.Name}
+	specs := []*v1beta1.ServingRuntimeSpec{start.Spec}
 
 	current := start
 	for current.ParentName != "" {
-		if len(chainChildFirst) >= maxDepth {
-			return nil, nil, &MaxDepthExceededError{MaxDepth: maxDepth, Chain: chainChildFirst}
+		if len(chain) >= maxDepth {
+			return nil, nil, &MaxDepthExceededError{MaxDepth: maxDepth, Chain: chain}
 		}
 		if visited[current.ParentName] {
-			return nil, nil, &CycleError{Cycle: append(chainChildFirst, current.ParentName)}
+			return nil, nil, &CycleError{Cycle: append(chain, current.ParentName)}
 		}
 		parent, err := fetch(ctx, current.ParentName)
 		if err != nil {
 			if errors.Is(err, ErrParentNotFound) {
-				return nil, nil, &ParentNotFoundError{Parent: current.ParentName, Chain: chainChildFirst}
+				return nil, nil, &ParentNotFoundError{Parent: current.ParentName, Chain: chain}
 			}
 			return nil, nil, fmt.Errorf("fetch parent %q: %w", current.ParentName, err)
 		}
 		visited[parent.Name] = true
-		chainChildFirst = append(chainChildFirst, parent.Name)
-		specsChildFirst = append(specsChildFirst, parent.Spec)
+		chain = append(chain, parent.Name)
+		specs = append(specs, parent.Spec)
 		current = parent
 	}
 
-	chain := reverseStrings(chainChildFirst)
-	specsRootFirst := reverseSpecs(specsChildFirst)
+	// The merge runs root first, each child over the merged ancestors.
+	slices.Reverse(chain)
+	slices.Reverse(specs)
 
-	effective := specsRootFirst[0].DeepCopy()
-	for i := 1; i < len(specsRootFirst); i++ {
-		merged, err := Merge(effective, specsRootFirst[i])
+	effective := specs[0].DeepCopy()
+	for i := 1; i < len(specs); i++ {
+		merged, err := Merge(effective, specs[i])
 		if err != nil {
 			return nil, nil, fmt.Errorf("merge %s onto effective: %w", chain[i], err)
 		}
 		effective = merged
 	}
 	return effective, chain, nil
-}
-
-func reverseStrings(in []string) []string {
-	out := make([]string, len(in))
-	for i, v := range in {
-		out[len(in)-1-i] = v
-	}
-	return out
-}
-
-func reverseSpecs(in []*v1beta1.ServingRuntimeSpec) []*v1beta1.ServingRuntimeSpec {
-	out := make([]*v1beta1.ServingRuntimeSpec, len(in))
-	for i, v := range in {
-		out[len(in)-1-i] = v
-	}
-	return out
 }

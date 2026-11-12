@@ -347,6 +347,7 @@ func omeNativeComponentStatus() v1beta1.ComponentStatusSpec {
 		LatestReadyRevision:     modeChangeISVC + "-engine-rev-abc123",
 		LatestRolledoutRevision: modeChangeISVC + "-engine-rev-abc123",
 		Traffic:                 []v1beta1.ComponentTrafficTarget{{RevisionName: modeChangeISVC + "-engine-rev-abc123", Percent: 100}},
+		Canary:                  &v1beta1.CanaryStatus{CanaryRevisionHash: "abc123", StableRevisionHash: "def456", CurrentStep: 1},
 	}
 }
 
@@ -358,12 +359,15 @@ func TestCleanupReplacedBackendsClearsTheOMENativeStatus(t *testing.T) {
 	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
 		v1beta1.EngineComponent: omeNativeComponentStatus(),
 	}
+	// The alias copies the engine's canary record, as the executor derives it.
+	isvc.Status.Canary = isvc.Status.Components[v1beta1.EngineComponent].Canary
 	r, c, _ := newModeChangeReconciler(t, isvc)
 	ctx := modeChangeContext()
 
 	t.Run("a Component still on OMENative keeps it", func(t *testing.T) {
 		require.NoError(t, r.cleanupReplacedBackends(ctx, isvc, modeMap{v1beta1.EngineComponent: constants.OMENative}))
 		assert.NotNil(t, isvc.Status.Components[v1beta1.EngineComponent].Lifecycle)
+		assert.NotNil(t, isvc.Status.Components[v1beta1.EngineComponent].Canary)
 	})
 
 	t.Run("a Component on RawDeployment loses it live and in memory", func(t *testing.T) {
@@ -382,9 +386,14 @@ func TestCleanupReplacedBackendsClearsTheOMENativeStatus(t *testing.T) {
 			assert.Empty(t, cs.LatestReadyRevision, "%s latest ready revision", name)
 			assert.Empty(t, cs.LatestRolledoutRevision, "%s latest rolled-out revision", name)
 			assert.Empty(t, cs.Traffic, "%s traffic", name)
+			assert.Nil(t, cs.Canary, "%s canary record", name)
 			require.NotNil(t, cs.URL, "%s url is not OMENative's to clear", name)
 			assert.Equal(t, "engine.example.com", cs.URL.Host, "%s url", name)
 		}
+		live := &v1beta1.InferenceService{}
+		require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(isvc), live))
+		assert.Nil(t, live.Status.Canary, "live alias: no record is left for it to copy")
+		assert.Nil(t, isvc.Status.Canary, "in-memory alias: no record is left for it to copy")
 	})
 
 	t.Run("a second pass has nothing to clear", func(t *testing.T) {
@@ -395,6 +404,33 @@ func TestCleanupReplacedBackendsClearsTheOMENativeStatus(t *testing.T) {
 		require.NoError(t, c.Get(ctx, client.ObjectKeyFromObject(isvc), after))
 		assert.Equal(t, before.ResourceVersion, after.ResourceVersion, "no write when nothing changes")
 	})
+}
+
+// The canary record is one of the fields only OMENative writes: a Component
+// that carries nothing but a record is still read as one to clear, and the
+// clear takes the record with the other fields, so a canary group that
+// names the Component again later starts a fresh run instead of adopting
+// the record the Component left the mode with.
+func TestWithoutOMENativeStatusClearsTheCanaryRecord(t *testing.T) {
+	recordOnly := v1beta1.ComponentStatusSpec{Canary: &v1beta1.CanaryStatus{CanaryRevisionHash: "abc123", CurrentStep: 1}}
+	assert.True(t, hasOMENativeStatus(recordOnly), "a record alone is OMENative status")
+	assert.Nil(t, withoutOMENativeStatus(recordOnly).Canary)
+	assert.False(t, hasOMENativeStatus(withoutOMENativeStatus(omeNativeComponentStatus())))
+}
+
+// The alias status.canary is a copy of a unit's record: it goes once no
+// Component carries a record, and stays while another unit still has one.
+func TestDropCanaryAliasWithoutRecord(t *testing.T) {
+	record := &v1beta1.CanaryStatus{CanaryRevisionHash: "abc123"}
+	status := &v1beta1.InferenceServiceStatus{
+		Canary:     record,
+		Components: map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{v1beta1.RouterComponent: {Canary: record}},
+	}
+	dropCanaryAliasWithoutRecord(status)
+	assert.NotNil(t, status.Canary, "the router's record keeps the alias")
+	status.Components[v1beta1.RouterComponent] = v1beta1.ComponentStatusSpec{}
+	dropCanaryAliasWithoutRecord(status)
+	assert.Nil(t, status.Canary)
 }
 
 // A VirtualDeployment selects no backend: every object a backend projected

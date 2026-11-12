@@ -14,7 +14,13 @@ import (
 	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
-func TestComponentIRStatus_ReturnsAuthoritativeStatus(t *testing.T) {
+// projectedService is a service that projects its own replicas: its role
+// readers resolve to the projected replica names in its namespace.
+func projectedService(namespace, name string) *v1beta1.InferenceService {
+	return &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
+}
+
+func TestComponentIRStatusFor_ReturnsAuthoritativeStatus(t *testing.T) {
 	ir := &v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: InferenceReplicaName("svc", v1beta1.EngineComponent)},
 		Status: v1beta1.InferenceReplicaStatus{
@@ -24,7 +30,7 @@ func TestComponentIRStatus_ReturnsAuthoritativeStatus(t *testing.T) {
 	}
 	c := fakeclient.New(t, fakeclient.WithObjects(ir))
 
-	got, err := ComponentIRStatus(context.Background(), c, "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRStatusFor(context.Background(), c, projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -33,9 +39,9 @@ func TestComponentIRStatus_ReturnsAuthoritativeStatus(t *testing.T) {
 	}
 }
 
-func TestComponentIRStatus_MissingIRReturnsNil(t *testing.T) {
+func TestComponentIRStatusFor_MissingIRReturnsNil(t *testing.T) {
 	c := fakeclient.New(t)
-	got, err := ComponentIRStatus(context.Background(), c, "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRStatusFor(context.Background(), c, projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err != nil {
 		t.Fatalf("missing IR must not error; got %v", err)
 	}
@@ -44,10 +50,10 @@ func TestComponentIRStatus_MissingIRReturnsNil(t *testing.T) {
 	}
 }
 
-func TestComponentIRStatus_NilReaderReturnsNil(t *testing.T) {
+func TestComponentIRStatusFor_NilReaderReturnsNil(t *testing.T) {
 	// A nil reader must degrade to "no authoritative status" (nil, nil)
 	// rather than panicking a reconcile.
-	got, err := ComponentIRStatus(context.Background(), nil, "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRStatusFor(context.Background(), nil, projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err != nil || got != nil {
 		t.Fatalf("nil reader must return (nil, nil); got (%+v, %v)", got, err)
 	}
@@ -58,11 +64,11 @@ func erroringReader(t *testing.T) client.Reader {
 	return fakeclient.New(t, fakeclient.FailingVerb(fakeclient.Get, fakeclient.EveryCall, errors.New("simulated apiserver failure")))
 }
 
-func TestComponentIRStatus_ReadErrorPropagatesWrapped(t *testing.T) {
+func TestComponentIRStatusFor_ReadErrorPropagatesWrapped(t *testing.T) {
 	// Only NotFound maps to (nil, nil). Any other read failure must
 	// surface as a wrapped error so gate callers can fail closed instead
 	// of mistaking a flaky read for "no observation yet".
-	got, err := ComponentIRStatus(context.Background(), erroringReader(t), "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRStatusFor(context.Background(), erroringReader(t), projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err == nil || got != nil {
 		t.Fatalf("read error must propagate with nil status; got (%+v, %v)", got, err)
 	}
@@ -71,7 +77,7 @@ func TestComponentIRStatus_ReadErrorPropagatesWrapped(t *testing.T) {
 	}
 }
 
-func TestComponentIRPartition_ReadsProjectedSpec(t *testing.T) {
+func TestComponentIRPartitionFor_ReadsProjectedSpec(t *testing.T) {
 	// The partition comes from the projected IR spec — the merged
 	// ISVC↔runtime lifecycle — so a value the operator only set on the
 	// ServingRuntime is still visible here.
@@ -88,7 +94,7 @@ func TestComponentIRPartition_ReadsProjectedSpec(t *testing.T) {
 	}
 	c := fakeclient.New(t, fakeclient.WithObjects(ir))
 
-	got, err := ComponentIRPartition(context.Background(), c, "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRPartitionFor(context.Background(), c, projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -97,7 +103,7 @@ func TestComponentIRPartition_ReadsProjectedSpec(t *testing.T) {
 	}
 }
 
-func TestComponentIRPartition_UnsetLifecycleIsZero(t *testing.T) {
+func TestComponentIRPartitionFor_UnsetLifecycleIsZero(t *testing.T) {
 	// Every level of the lifecycle chain may be nil; all resolve to the
 	// API-defined partition 0 ("update every Instance").
 	for name, lc := range map[string]*v1beta1.LifecycleSpec{
@@ -111,32 +117,32 @@ func TestComponentIRPartition_UnsetLifecycleIsZero(t *testing.T) {
 			Spec:       v1beta1.InferenceReplicaSpec{Lifecycle: lc},
 		}
 		c := fakeclient.New(t, fakeclient.WithObjects(ir))
-		got, err := ComponentIRPartition(context.Background(), c, "ns", "svc", v1beta1.EngineComponent)
+		got, err := ComponentIRPartitionFor(context.Background(), c, projectedService("ns", "svc"), v1beta1.EngineComponent)
 		if err != nil || got != 0 {
 			t.Errorf("%s: got (%d, %v) want (0, nil)", name, got, err)
 		}
 	}
 }
 
-func TestComponentIRPartition_MissingIRIsZero(t *testing.T) {
+func TestComponentIRPartitionFor_MissingIRIsZero(t *testing.T) {
 	c := fakeclient.New(t)
-	got, err := ComponentIRPartition(context.Background(), c, "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRPartitionFor(context.Background(), c, projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err != nil || got != 0 {
 		t.Fatalf("missing IR must return (0, nil); got (%d, %v)", got, err)
 	}
 }
 
-func TestComponentIRPartition_NilReaderIsZero(t *testing.T) {
-	got, err := ComponentIRPartition(context.Background(), nil, "ns", "svc", v1beta1.EngineComponent)
+func TestComponentIRPartitionFor_NilReaderIsZero(t *testing.T) {
+	got, err := ComponentIRPartitionFor(context.Background(), nil, projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err != nil || got != 0 {
 		t.Fatalf("nil reader must return (0, nil); got (%d, %v)", got, err)
 	}
 }
 
-func TestComponentIRPartition_ReadErrorPropagatesWrapped(t *testing.T) {
+func TestComponentIRPartitionFor_ReadErrorPropagatesWrapped(t *testing.T) {
 	// A transient read failure must not read as "no partition" — the
 	// coordination callers fail closed on it.
-	got, err := ComponentIRPartition(context.Background(), erroringReader(t), "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRPartitionFor(context.Background(), erroringReader(t), projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err == nil {
 		t.Fatalf("read error must propagate; got (%d, nil)", got)
 	}
@@ -176,11 +182,11 @@ func TestEffectivePartition_PacingWinsOverLifecycle(t *testing.T) {
 	}
 }
 
-// TestComponentIRPartition_ReadsPacingFirst pins that the coordination-side
+// TestComponentIRPartitionFor_ReadsPacingFirst pins that the coordination-side
 // reader sees the same number the engine holds at: a projected canary
 // partition on spec.pacing is reported even when the user's lifecycle
 // carries a different partition.
-func TestComponentIRPartition_ReadsPacingFirst(t *testing.T) {
+func TestComponentIRPartitionFor_ReadsPacingFirst(t *testing.T) {
 	user, canary := int32(1), int32(3)
 	ir := &v1beta1.InferenceReplica{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: InferenceReplicaName("svc", v1beta1.EngineComponent)},
@@ -191,7 +197,7 @@ func TestComponentIRPartition_ReadsPacingFirst(t *testing.T) {
 		},
 	}
 	c := fakeclient.New(t, fakeclient.WithObjects(ir))
-	got, err := ComponentIRPartition(context.Background(), c, "ns", "svc", v1beta1.EngineComponent)
+	got, err := ComponentIRPartitionFor(context.Background(), c, projectedService("ns", "svc"), v1beta1.EngineComponent)
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -240,8 +246,8 @@ func TestReadersFor_ResolveThroughRoleReplica(t *testing.T) {
 	if ir, _, err := DecodedComponentIRFor(ctx, reads, isvc, v1beta1.DecoderComponent); err != nil || ir == nil || ir.Name != "pool-d" {
 		t.Fatalf("decoded referenced decoder: got (%v, %v), want pool-d", ir, err)
 	}
-	if st, err := DecodedComponentIRStatusFor(ctx, reads, isvc, v1beta1.RouterComponent); err != nil || st == nil || st.Replicas != 3 {
-		t.Fatalf("decoded projected router status: got (%+v, %v), want 3 replicas", st, err)
+	if ir, _, err := DecodedComponentIRFor(ctx, reads, isvc, v1beta1.RouterComponent); err != nil || ir == nil || ir.Status.Replicas != 3 {
+		t.Fatalf("decoded projected router: got (%+v, %v), want 3 replicas", ir, err)
 	}
 	if p, err := ComponentIRPartitionFor(ctx, reads, isvc, v1beta1.DecoderComponent); err != nil || p != 2 {
 		t.Fatalf("referenced decoder partition: got (%d, %v), want 2", p, err)

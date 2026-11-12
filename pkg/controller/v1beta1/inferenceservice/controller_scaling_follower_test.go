@@ -53,6 +53,10 @@ type followerOptions struct {
 	// decoderPatchConflicts makes every patch of the decoder replica fail
 	// with a conflict, the way a write against a stale copy fails.
 	decoderPatchConflicts bool
+	// decoderFixedCount declares autoscaler class None on the decoder, so
+	// the projector writes spec.decoder.minReplicas on it whenever nothing
+	// else owns its count.
+	decoderFixedCount bool
 }
 
 const (
@@ -71,6 +75,10 @@ func newFollowerFixture(t *testing.T, opts followerOptions) *followerFixture {
 	if opts.anchorByProjector {
 		engineExt.Autoscaler = &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerNone}
 	}
+	var decoderAutoscaler *v1beta1.ComponentAutoscaler
+	if opts.decoderFixedCount {
+		decoderAutoscaler = &v1beta1.ComponentAutoscaler{Class: v1beta1.AutoscalerNone}
+	}
 	isvc := &v1beta1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: followerService, Namespace: followerNamespace,
 			UID: types.UID(followerService + "-uid"), Generation: 1},
@@ -79,7 +87,7 @@ func newFollowerFixture(t *testing.T, opts followerOptions) *followerFixture {
 			Runtime:        &v1beta1.ServingRuntimeRef{Name: "pair-runtime", Kind: ptr.To("ServingRuntime")},
 			Engine:         &v1beta1.EngineSpec{Runner: runner("fake-serving:v1"), ComponentExtensionSpec: engineExt},
 			Decoder: &v1beta1.DecoderSpec{Runner: runner("fake-serving:v1"),
-				ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(1), MaxReplicas: 16}},
+				ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(1), MaxReplicas: 16, Autoscaler: decoderAutoscaler}},
 			ScalingPolicy: &v1beta1.ScalingPolicy{Mode: v1beta1.ScalingProportional,
 				Proportional: &v1beta1.ProportionalPolicy{Anchor: v1beta1.EngineComponent,
 					Ratios: map[v1beta1.ComponentType]resource.Quantity{v1beta1.DecoderComponent: resource.MustParse("1")}}},
@@ -217,6 +225,55 @@ func (f *followerFixture) scaleAnchor(t *testing.T, replicas int32) {
 	if err := f.client.Update(context.TODO(), ir); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// editService applies one spec edit to the stored service.
+func (f *followerFixture) editService(t *testing.T, edit func(isvc *v1beta1.InferenceService)) {
+	t.Helper()
+	isvc := f.service(t)
+	edit(isvc)
+	if err := f.client.Update(context.TODO(), isvc); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// events drains every event recorded so far.
+func (f *followerFixture) events() []string {
+	var out []string
+	for {
+		select {
+		case event := <-f.recorder.Events:
+			out = append(out, event)
+		default:
+			return out
+		}
+	}
+}
+
+// eventsNaming returns the recorded events that carry the reason.
+func (f *followerFixture) eventsNaming(reason string) []string {
+	var out []string
+	for _, event := range f.events() {
+		if strings.Contains(event, reason) {
+			out = append(out, event)
+		}
+	}
+	return out
+}
+
+// shapeOfTheDecision moves the fixture to 18 engines and 12 decoders: the
+// decoder follows at 0.666 above a minReplicas of 2 (ceil(18 x 0.666) = 12).
+func (f *followerFixture) shapeOfTheDecision(t *testing.T) {
+	t.Helper()
+	f.editService(t, func(isvc *v1beta1.InferenceService) {
+		isvc.Spec.Decoder.MinReplicas = ptr.To(2)
+		isvc.Spec.ScalingPolicy.Proportional.Ratios[v1beta1.DecoderComponent] = resource.MustParse("0.666")
+	})
+	f.scaleAnchor(t, 18)
+	f.pass(t)
+	expectReplica(t, f.replica(t, v1beta1.DecoderComponent), 12, "none")
+	expectFollowerStatus(t, f.scalingStatus(t), 18, 12, 12, "Applied")
+	f.events()
 }
 
 func (f *followerFixture) service(t *testing.T) *v1beta1.InferenceService {
@@ -385,5 +442,95 @@ func TestFollowerWhoseProjectionFailsReportsThePendingCount(t *testing.T) {
 	}
 	if f.scaleWrites != 0 {
 		t.Fatalf("scale subresource writes = %d; want none", f.scaleWrites)
+	}
+}
+
+// expectReleasedStatus reads the record of one Component that stopped
+// following: the count it keeps beside the count its spec names.
+func expectReleasedStatus(t *testing.T, status *v1beta1.ScalingPolicyStatus, named, kept int32) {
+	t.Helper()
+	if len(status.Followers) != 1 || status.Followers[0].Component != v1beta1.DecoderComponent || !status.Followers[0].Released ||
+		status.Followers[0].Target != named || status.Followers[0].Current != kept || status.Mode != "" {
+		t.Fatalf("status = %+v; want the decoder released at %d Instances with %d named by its spec, and no mode", status, kept, named)
+	}
+	condition := meta.FindStatusCondition(status.Conditions, "Ready")
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Released" {
+		t.Fatalf("Ready = %+v; want True with reason Released", condition)
+	}
+	for _, want := range []string{"decoder", fmt.Sprint(kept), fmt.Sprint(named)} {
+		if !strings.Contains(condition.Message, want) {
+			t.Fatalf("message %q does not name %q", condition.Message, want)
+		}
+	}
+}
+
+// 18 engines and 12 decoders under a Proportional policy at 0.666; the
+// decoder declares autoscaler class None above a minReplicas of 2. The
+// operator removes the policy block. The decoder keeps its 12 Instances, the
+// status records it as released beside the 2 its spec names, one Warning
+// names the release, and the operator's later minReplicas edit is what
+// moves the count.
+func TestReleasedFollowerKeepsItsCount(t *testing.T) {
+	f := newFollowerFixture(t, followerOptions{decoderFixedCount: true})
+	f.shapeOfTheDecision(t)
+
+	f.editService(t, func(isvc *v1beta1.InferenceService) { isvc.Spec.ScalingPolicy = nil })
+	f.pass(t)
+	expectReplica(t, f.replica(t, v1beta1.DecoderComponent), 12, "none")
+	expectReleasedStatus(t, f.scalingStatus(t), 2, 12)
+	if events := f.eventsNaming("ScalingFollowerReleased"); len(events) != 1 || !strings.Contains(events[0], "Warning") ||
+		!strings.Contains(events[0], "12") || !strings.Contains(events[0], "minReplicas") {
+		t.Fatalf("release events = %q; want one Warning naming the 12 Instances kept and minReplicas", events)
+	}
+
+	f.pass(t)
+	expectReplica(t, f.replica(t, v1beta1.DecoderComponent), 12, "none")
+	expectReleasedStatus(t, f.scalingStatus(t), 2, 12)
+	if events := f.eventsNaming("ScalingFollowerReleased"); len(events) != 0 {
+		t.Fatalf("a standing release warned again: %q", events)
+	}
+
+	f.editService(t, func(isvc *v1beta1.InferenceService) { isvc.Spec.Decoder.MinReplicas = ptr.To(10) })
+	f.pass(t)
+	expectReplica(t, f.replica(t, v1beta1.DecoderComponent), 10, "none")
+	if status := f.service(t).Status.ScalingPolicy; status != nil {
+		t.Fatalf("with no policy and nothing kept the status block must be absent, got %+v", status)
+	}
+}
+
+// A follower the policy still names keeps following when the policy is
+// edited: the ratio drops from 0.666 to 0.5 and the decoder moves from 12 to
+// 9 with nothing released and no Warning.
+func TestFollowerStillNamedByAnEditedPolicyKeepsFollowing(t *testing.T) {
+	f := newFollowerFixture(t, followerOptions{decoderFixedCount: true})
+	f.shapeOfTheDecision(t)
+
+	f.editService(t, func(isvc *v1beta1.InferenceService) {
+		isvc.Spec.ScalingPolicy.Proportional.Ratios[v1beta1.DecoderComponent] = resource.MustParse("0.5")
+	})
+	f.pass(t)
+	expectReplica(t, f.replica(t, v1beta1.DecoderComponent), 9, "none")
+	expectFollowerStatus(t, f.scalingStatus(t), 18, 9, 9, "Applied")
+	if events := f.eventsNaming("ScalingFollowerReleased"); len(events) != 0 {
+		t.Fatalf("a follower still named by the policy was reported released: %q", events)
+	}
+}
+
+// A released follower with no autoscaler block of its own gets its default
+// autoscaler back, and that autoscaler keeps the count it finds. OME keeps
+// nothing by its own rule, so the status block is cleared with the policy;
+// the one Warning says which owner the count has now.
+func TestReleasedFollowerWithoutABlockKeepsItsCountUnderItsAutoscaler(t *testing.T) {
+	f := newFollowerFixture(t, followerOptions{})
+	f.shapeOfTheDecision(t)
+
+	f.editService(t, func(isvc *v1beta1.InferenceService) { isvc.Spec.ScalingPolicy = nil })
+	f.pass(t)
+	expectReplica(t, f.replica(t, v1beta1.DecoderComponent), 12, "none")
+	if status := f.service(t).Status.ScalingPolicy; status != nil {
+		t.Fatalf("an autoscaler owns the released count; the status block must be absent, got %+v", status)
+	}
+	if events := f.eventsNaming("ScalingFollowerReleased"); len(events) != 1 || !strings.Contains(events[0], "autoscaler") {
+		t.Fatalf("release events = %q; want one naming the decoder's autoscaler as the owner of its count", events)
 	}
 }

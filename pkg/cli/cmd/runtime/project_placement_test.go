@@ -31,10 +31,10 @@ spec:
     clusterAffinity:
     - matchFields:
       - {key: metadata.name, operator: In, values: [member-a]}
-      weights: {default: 2}
+      weights: {default: {min: 2, max: 2}}
     - matchFields:
       - {key: metadata.name, operator: In, values: [member-b]}
-      weights: {default: 1}
+      weights: {default: {min: 1, max: 1}}
   engine: {minReplicas: 60, maxReplicas: 60}
   decoder: {minReplicas: 40, maxReplicas: 40}
   router: {minReplicas: 3, maxReplicas: 3}
@@ -146,23 +146,21 @@ func TestProjectPlacementEmptyAllocation(t *testing.T) {
 
 func TestProjectPlacementCurrentContract(t *testing.T) {
 	ratios := strings.NewReplacer(
-		"weights: {default: 2}", "weights: {defaultReplicas: {min: 2, max: 1}}",
-		"weights: {default: 1}", "weights: {defaultReplicas: {min: 1, max: 3}}",
+		"weights: {default: {min: 2, max: 2}}", "weights: {default: {min: 2, max: 1}}",
+		"weights: {default: {min: 1, max: 1}}", "weights: {default: {min: 1, max: 3}}",
 		"maxReplicas: 60", "maxReplicas: 180", "maxReplicas: 40", "maxReplicas: 120", "maxReplicas: 3}", "maxReplicas: 12}",
 	).Replace(placementSource)
 	components := strings.NewReplacer(
-		"weights: {default: 2}", "weights: {engineReplicas: {min: 2, max: 1}, decoderReplicas: {min: 1, max: 3}, routerReplicas: {min: 1, max: 1}}",
-		"weights: {default: 1}", "weights: {engineReplicas: {min: 1, max: 3}, decoderReplicas: {min: 3, max: 1}, routerReplicas: {min: 1, max: 1}}",
+		"weights: {default: {min: 2, max: 2}}", "weights: {engine: {min: 2, max: 1}, decoder: {min: 1, max: 3}, router: {min: 1, max: 1}}",
+		"weights: {default: {min: 1, max: 1}}", "weights: {engine: {min: 1, max: 3}, decoder: {min: 3, max: 1}, router: {min: 1, max: 1}}",
 		"maxReplicas: 60", "maxReplicas: 120", "maxReplicas: 40", "maxReplicas: 80", "router: {minReplicas: 3, maxReplicas: 3}", "router: {minReplicas: 6, maxReplicas: 12}",
 	).Replace(placementSource)
-	caps := strings.Replace(placementSource, "mode: Split\n", "mode: Split\n    split: {maxPerCluster: {engine: 50, decoder: 30, router: 4}}\n", 1)
 	for _, tc := range []struct {
 		name, source string
 		bounds       [3][2]int
 	}{
 		{"default ratios", ratios, [3][2]int{{40, 45}, {27, 30}, {2, 3}}},
 		{"component ratios", components, [3][2]int{{40, 40}, {10, 60}, {3, 6}}},
-		{"component caps", caps, [3][2]int{{40, 50}, {27, 30}, {2, 4}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := projectionFiles()
@@ -187,8 +185,9 @@ func TestProjectPlacementRejectsInvalidInputAtomically(t *testing.T) {
 		{"duplicate registrations", "clusters.yaml", placementClusters + "---\n" + placementClusters, "ambiguous file input"},
 		{"unknown registration field", "clusters.yaml", placementClusters + "spec: {typo: true}\n", "unknown field"},
 		{"unsupported mode", "sources.yaml", strings.Replace(placementSource, "mode: Split", "mode: All", 1), "supports only explicit ClusterAffinity"},
-		{"removed scalar weight", "sources.yaml", strings.Replace(placementSource, "weights: {default: 2}", "weight: 2", 1), `unknown field "weight"`},
+		{"removed scalar weight", "sources.yaml", strings.Replace(placementSource, "weights: {default: {min: 2, max: 2}}", "weight: 2", 1), `unknown field "weight"`},
 		{"removed replica cap", "sources.yaml", strings.Replace(placementSource, "mode: Split\n", "mode: Split\n    split: {maxReplicasPerCluster: 50}\n", 1), `unknown field "maxReplicasPerCluster"`},
+		{"weights beside split", "sources.yaml", strings.Replace(placementSource, "mode: Split\n", "mode: Split\n    split: {maxPerCluster: {engine: 50, decoder: 30, router: 4}}\n", 1), "replace spec.placement.split"},
 		{"zero component cap", "sources.yaml", strings.Replace(placementSource, "mode: Split\n", "mode: Split\n    split: {maxPerCluster: {engine: 0}}\n", 1), "greater than or equal to 1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -249,7 +248,7 @@ const memberReplicaLimitCRD = renderFileInferenceServiceCRD + `
 func TestRuntimeRenderValidatesProjectionItems(t *testing.T) {
 	for _, tc := range []struct{ name, want string }{
 		{"removed placement field", `unknown field "weight"`},
-		{"mixed placement weights", "not both"},
+		{"scalar placement weight", "cannot unmarshal number"},
 		{"member schema limit", "less than or equal to 39"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -263,7 +262,7 @@ func TestRuntimeRenderValidatesProjectionItems(t *testing.T) {
 				if tc.name == "removed placement field" {
 					term["weight"] = 2
 				} else {
-					term["weights"] = map[string]any{"engine": 1, "decoderReplicas": map[string]any{"min": 1, "max": 1}}
+					term["weights"] = map[string]any{"engine": 1, "decoder": map[string]any{"min": 1, "max": 1}}
 				}
 				item["spec"].(map[string]any)["placement"] = map[string]any{
 					"policy": "ClusterAffinity", "mode": "Split",
@@ -291,7 +290,7 @@ func TestRuntimeRenderProjectionValidationIsPerDocument(t *testing.T) {
 	projection.Items = projection.Items[:1]
 	data, err := json.Marshal(projection)
 	require.NoError(t, err)
-	ordinary := strings.Replace(placementSource, "weights: {default: 2}", "weight: 2", 1)
+	ordinary := strings.Replace(placementSource, "weights: {default: {min: 2, max: 2}}", "weight: 2", 1)
 	files["mixed.yaml"] = string(data) + "\n---\n" + ordinary
 	files["isvc-crd.yaml"] = memberReplicaLimitCRD
 	out, _, err := executeRenderArgs(t, renderFactory(t, false), files,

@@ -3,7 +3,7 @@ package tree
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -93,9 +93,7 @@ func (n *Node) Ancestors() []*Node {
 		seen[cur.Name()] = struct{}{}
 		up = append(up, cur)
 	}
-	for i, j := 0, len(up)-1; i < j; i, j = i+1, j-1 {
-		up[i], up[j] = up[j], up[i]
-	}
+	slices.Reverse(up)
 	return up
 }
 
@@ -114,8 +112,8 @@ func (t *Tree) Node(name string) (*Node, bool) {
 	return n, ok
 }
 
-// Len is the number of nodes.
-func (t *Tree) Len() int { return len(t.nodes) }
+// byName orders nodes by CR name.
+func byName(a, b *Node) int { return strings.Compare(a.Name(), b.Name()) }
 
 // Nodes returns every node, sorted by name.
 func (t *Tree) Nodes() []*Node {
@@ -123,7 +121,7 @@ func (t *Tree) Nodes() []*Node {
 	for _, n := range t.nodes {
 		out = append(out, n)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name() < out[j].Name() })
+	slices.SortFunc(out, byName)
 	return out
 }
 
@@ -221,6 +219,7 @@ func Build(quotas []v1beta1.AcceleratorQuota, opts Options) (*Tree, Violations, 
 	vs = append(vs, checkUnreachable(t, vs)...)
 	vs = append(vs, checkDepth(t, opts.MaxDepth)...)
 	vs = append(vs, checkNodeKind(t)...)
+	vs = append(vs, checkPreemption(t)...)
 	vs = append(vs, checkContainment(t)...)
 
 	return t, vs.sorted(), nil
@@ -257,7 +256,7 @@ func linkParents(t *Tree) Violations {
 		parent.Children = append(parent.Children, n)
 	}
 	for _, n := range t.Nodes() {
-		sort.Slice(n.Children, func(i, j int) bool { return n.Children[i].Name() < n.Children[j].Name() })
+		slices.SortFunc(n.Children, byName)
 	}
 	return append(vs, reportCycles(t)...)
 }
@@ -277,12 +276,7 @@ func reportCycles(t *Tree) Violations {
 		if members == nil {
 			continue
 		}
-		id := members[0]
-		for _, m := range members[1:] {
-			if m < id {
-				id = m
-			}
-		}
+		id := slices.Min(members)
 		msg := fmt.Sprintf("node is inside the parentRef cycle through %q", id)
 		if !rendered[id] {
 			rendered[id] = true
@@ -471,10 +465,10 @@ func checkCohortNode(n *Node) Violations {
 		if !carriesLeafOnlyFields(b) {
 			continue
 		}
-		key := budgetKey(b.ResourceName, b.ResourceFlavor)
-		vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonNodeKindInvalid, key,
+		pair := pairOf(b)
+		vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonNodeKindInvalid, pair.String(),
 			"budget %s carries leaf-only fields; a Cohort budget is an authoring "+
-				"guardrail that never materializes, so it holds only resourceName, resourceFlavor, and nominal", key))
+				"guardrail that never materializes, so it holds only resourceName, resourceFlavor, and nominal", pair))
 	}
 	return vs
 }
@@ -499,40 +493,71 @@ func carriesLeafOnlyFields(b v1beta1.AcceleratorBudget) bool {
 func checkContainment(t *Tree) Violations {
 	var vs Violations
 	for _, n := range t.Nodes() {
-		// A leaf may not have children at all; charging it for ones it was
-		// illegally given would blame it twice for someone else's write.
-		if n.IsLeaf() || len(n.Children) == 0 || len(n.Quota.Spec.Budgets) == 0 {
+		if !constrainsChildren(n) {
 			continue
 		}
-		sums := map[string]*resource.Quantity{}
-		for _, c := range n.Children {
-			for _, b := range c.Quota.Spec.Budgets {
-				k := budgetKey(b.ResourceName, b.ResourceFlavor)
-				if cur, ok := sums[k]; ok {
-					cur.Add(b.Nominal)
-					continue
-				}
-				q := b.Nominal.DeepCopy()
-				sums[k] = &q
-			}
-		}
-		for _, b := range n.Quota.Spec.Budgets {
-			k := budgetKey(b.ResourceName, b.ResourceFlavor)
-			sum, ok := sums[k]
-			if !ok {
-				continue
-			}
-			if b.Nominal.Cmp(*sum) < 0 {
-				vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonContainmentViolated, k,
-					"budget %s is %s but its children total %s", k, b.Nominal.String(), sum.String()))
-			}
-		}
+		vs = append(vs, exceededBudgets(n, childrenTotals(n))...)
 	}
 	return vs
 }
 
-func budgetKey(resourceName, flavor string) string {
-	return resourceName + " on " + flavor
+// constrainsChildren reports whether a node's budget bounds its children: a
+// grouping with children and at least one budget line. A leaf may not have
+// children at all; charging it for ones it was illegally given would blame it
+// twice for someone else's write.
+func constrainsChildren(n *Node) bool {
+	return !n.IsLeaf() && len(n.Children) > 0 && len(n.Quota.Spec.Budgets) > 0
+}
+
+// exceededBudgets reports each budget line of n that its children's total
+// exceeds.
+func exceededBudgets(n *Node, totals budgetTotals) Violations {
+	var vs Violations
+	for _, b := range n.Quota.Spec.Budgets {
+		pair := pairOf(b)
+		sum, ok := totals[pair]
+		if !ok || b.Nominal.Cmp(*sum) >= 0 {
+			continue
+		}
+		vs = append(vs, violation(n.Name(), v1beta1.AcceleratorQuotaReasonContainmentViolated, pair.String(),
+			"budget %s is %s but its children total %s", pair, b.Nominal.String(), sum.String()))
+	}
+	return vs
+}
+
+// budgetPair identifies one budget line: a resource on a flavor.
+type budgetPair struct{ resource, flavor string }
+
+func pairOf(b v1beta1.AcceleratorBudget) budgetPair {
+	return budgetPair{resource: b.ResourceName, flavor: b.ResourceFlavor}
+}
+
+// String is the pair as a violation names it.
+func (p budgetPair) String() string { return p.resource + " on " + p.flavor }
+
+// budgetTotals sums budget lines per pair. Each total is its own copy, so
+// adding never changes a quantity in a caller's spec.
+type budgetTotals map[budgetPair]*resource.Quantity
+
+func (t budgetTotals) add(b v1beta1.AcceleratorBudget) {
+	pair := pairOf(b)
+	if sum, ok := t[pair]; ok {
+		sum.Add(b.Nominal)
+		return
+	}
+	sum := b.Nominal.DeepCopy()
+	t[pair] = &sum
+}
+
+// childrenTotals sums the budget lines of a node's children per pair.
+func childrenTotals(n *Node) budgetTotals {
+	totals := budgetTotals{}
+	for _, c := range n.Children {
+		for _, b := range c.Quota.Spec.Budgets {
+			totals.add(b)
+		}
+	}
+	return totals
 }
 
 // Splice returns existing with incoming replacing the entry of the same name,

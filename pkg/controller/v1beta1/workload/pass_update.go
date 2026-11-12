@@ -211,23 +211,28 @@ type updateAdmission struct {
 	// a start admitted this pass replaces: that start is charged for the
 	// slot, so the pods stop holding it against the starts after it.
 	replacedExtraSlots int32
-	// replacedDownOutsideRoll counts the Instances down outside the roll
-	// (selection.NotServingOutsideRoll) that starts admitted this pass
-	// replace: each such start is charged as in flight, so its Instance
-	// stops counting as down beside the starts after it.
-	replacedDownOutsideRoll int32
+	// replacedDownOutsideRoll names the Instances down outside the roll
+	// (selection.NotServingOutsideRoll) whose start this pass admitted:
+	// each such start is charged as in flight, so its Instance stops
+	// counting as down beside the starts after it.
+	replacedDownOutsideRoll map[int32]struct{}
 	// gateUnavail is the coordination gate's within-pass delta: fresh
 	// starts that pull a SERVING pod from rotation. It diverges from
 	// inFlightUnavail on CoordGateExempt starts — a Failed zero-serving
 	// Instance's recreate takes nothing additional offline, and its
 	// outage is already inside the gate's serving-based count, so
 	// charging it here would over-project every later consult in the
-	// same pass.
+	// same pass. A start on an Instance Ready only inside the proven
+	// window (UpdateItem.ServingUnproven) is not charged either: the gate
+	// reads that Instance as down on its own, through the pass's one pod
+	// list and through the row once the attempt is written on it, so a
+	// charge would count it twice and a Component allowed two down would
+	// open one start.
 	gateUnavail int32
 }
 
 func newUpdateAdmission(input types.ReconcileInput, selection *UpdateSelection, target *appsv1.ControllerRevision) *updateAdmission {
-	return &updateAdmission{selection: selection, target: target, observed: input.ObservedState, gate: input.UpdateGate, planGate: input.PlanGate}
+	return &updateAdmission{selection: selection, target: target, observed: input.ObservedState, gate: input.UpdateGate, planGate: input.PlanGate, replacedDownOutsideRoll: map[int32]struct{}{}}
 }
 
 // fromRevision is the ControllerRevision the candidate's row runs now, the
@@ -295,10 +300,12 @@ func (a *updateAdmission) admit(ctx context.Context, plan types.ComponentPlan, i
 			}
 		}
 	default:
-		if projected, denied := escalation.BudgetDenies(a.selection.UnavailBudget, a.selection.PriorUnavailInFlight+rolled+a.downOutsideRollBeside(item), a.inFlightUnavail); denied {
+		beside := a.downOutsideRollBeside(item)
+		if projected, denied := escalation.BudgetDenies(a.selection.UnavailBudget, a.selection.PriorUnavailInFlight+a.rolledBeside(item)+int32(len(beside)), a.inFlightUnavail); denied {
 			return false, &types.RolloutHold{
-				Gate:   types.RolloutHoldGateBudget,
-				Reason: fmt.Sprintf("per-Component unavailability budget %d exhausted (would become %d)%s", a.selection.UnavailBudget, projected, types.InstancesNotServingClause(a.selection.RolledNotServing, a.target.Name)),
+				Gate: types.RolloutHoldGateBudget,
+				Reason: fmt.Sprintf("per-Component unavailability budget %d exhausted (would become %d)%s%s", a.selection.UnavailBudget, projected,
+					types.InstancesNotServingClause(a.selection.RolledNotServing, a.target.Name), instancesDownClause(beside, a.selection.NotServingOutsideRollReasons)),
 				Target: a.target.Name,
 			}
 		}
@@ -427,12 +434,14 @@ func retryScheduleHold(input types.ReconcileInput, target *appsv1.ControllerRevi
 // while one of them crashed after promotion, and the budget's only while
 // one of those is out of rotation: a crashed set back in rotation is
 // unproven, not down, and the window it has yet to hold Ready for paces
-// a further start at the admission, which reports its own denial. Nil
-// otherwise, or when a further start would still be admitted: the roll
-// is then moving or complete, and holds nothing.
-func standingHold(selection *UpdateSelection, target *appsv1.ControllerRevision) *types.RolloutHold {
+// a further start at the admission, which reports its own denial. With
+// no crashed Instance on the target, it is the hold on the Instances the
+// partition holds whose failed replacement the roll still wants
+// (heldAttemptHold). Nil otherwise, or when a further start would still
+// be admitted: the roll is then moving or complete, and holds nothing.
+func standingHold(selection *UpdateSelection, target *appsv1.ControllerRevision, partition *int32) *types.RolloutHold {
 	if len(selection.CrashedNotServing) == 0 {
-		return nil
+		return heldAttemptHold(selection.HeldFailedAttempts, target, partition)
 	}
 	if selection.RetryScheduleHold != nil {
 		return selection.RetryScheduleHold
@@ -445,15 +454,36 @@ func standingHold(selection *UpdateSelection, target *appsv1.ControllerRevision)
 	}
 	rolled := int32(len(selection.RolledNotServing))
 	budgetName, budget, prior := "unavailability", selection.UnavailBudget, selection.PriorUnavailInFlight+rolled+int32(len(selection.NotServingOutsideRoll))
+	downBeside := instancesDownClause(selection.NotServingOutsideRoll, selection.NotServingOutsideRollReasons)
 	if selection.Strategy == types.UpdateStrategySurgeThenDrain {
 		budgetName, budget, prior = "surge", selection.SurgeBudget, selection.PriorSurgeInFlight+rolled+selection.ExtraPodSurge.Slots
+		downBeside = ""
 	}
 	if _, denied := escalation.BudgetDenies(budget, prior, 0); !denied {
 		return nil
 	}
 	return &types.RolloutHold{
 		Gate:   types.RolloutHoldGateBudget,
-		Reason: fmt.Sprintf("per-Component %s budget %d exhausted%s", budgetName, budget, types.InstancesNotServingClause(selection.RolledNotServing, target.Name)),
+		Reason: fmt.Sprintf("per-Component %s budget %d exhausted%s%s", budgetName, budget, types.InstancesNotServingClause(selection.RolledNotServing, target.Name), downBeside),
+		Target: target.Name,
+	}
+}
+
+// heldAttemptHold is the hold on the Instances the partition holds whose
+// failed replacement toward the target still stands (HeldFailedAttempts):
+// the retry is a start on the Instance, which the partition refuses, so the
+// hold names the Instances and the two exits. It is reported under the
+// RetryBlock gate, the gate of a retry that waits. Nil when the partition
+// holds no such Instance.
+func heldAttemptHold(indices []int32, target *appsv1.ControllerRevision, partition *int32) *types.RolloutHold {
+	if len(indices) == 0 || target == nil || partition == nil {
+		return nil
+	}
+	noun, list := types.InstanceNoun(indices)
+	return &types.RolloutHold{
+		Gate: types.RolloutHoldGateRetryBlock,
+		Reason: fmt.Sprintf("update to %s waits on %s %s, which the partition of %d holds with a failed replacement toward it; lower the partition to retry it, or push another revision to remove the failed pod",
+			target.Name, noun, list, *partition),
 		Target: target.Name,
 	}
 }
@@ -469,16 +499,58 @@ func retryRebuildsClause(rebuilds []int32) string {
 	return fmt.Sprintf("; the attempt rebuilds %s %s", noun, indices)
 }
 
-// downOutsideRollBeside is what the Instances down outside the roll hold
-// against the unavailability budget when item is consulted: every one the
-// selection listed, less the ones starts admitted this pass replace, and
-// none of them when item's own Instance is one: that start takes over the
-// slot its outage holds, so it is charged as any start and no further.
-func (a *updateAdmission) downOutsideRollBeside(item UpdateItem) int32 {
-	if a.selection.downOutsideRoll(item.Instance.Index) {
-		return 0
+// rolledBeside is what the Instances already on the target that do not
+// serve it hold against the unavailability budget when item is consulted
+// for a drain-first start: every one the selection listed, less item's
+// own Instance when it is one. That start replaces the set whose outage
+// holds the slot, so it is charged as any start and no further; charging
+// both would deny the rebuild of the one Instance the budget already
+// allows down.
+func (a *updateAdmission) rolledBeside(item UpdateItem) int32 {
+	rolled := int32(len(a.selection.RolledNotServing))
+	if a.selection.rolledNotServing(item.Instance.Index) {
+		rolled--
 	}
-	return int32(len(a.selection.NotServingOutsideRoll)) - a.replacedDownOutsideRoll
+	return rolled
+}
+
+// downOutsideRollBeside lists the Instances down outside the roll that hold
+// a slot against the unavailability budget when item is consulted, in plan
+// order: every one the selection listed, less the ones starts admitted this
+// pass replace, and none of them when item's own Instance is one: that
+// start takes over the slot its outage holds, so it is charged as any
+// start and no further.
+func (a *updateAdmission) downOutsideRollBeside(item UpdateItem) []int32 {
+	if a.selection.downOutsideRoll(item.Instance.Index) {
+		return nil
+	}
+	var beside []int32
+	for _, idx := range a.selection.NotServingOutsideRoll {
+		if _, replaced := a.replacedDownOutsideRoll[idx]; !replaced {
+			beside = append(beside, idx)
+		}
+	}
+	return beside
+}
+
+// instancesDownClause names the Instances down beside the roll that a hold
+// counts, each with why, in the order given: "; Instance 0 not serving (pod
+// X restarted since Ready, Ready again for less than the 30s window (25s
+// left)); Instance 4 not serving (the Instance has no pod set yet)". Empty
+// when the hold counts none.
+func instancesDownClause(indices []int32, reasons map[int32]string) string {
+	if len(indices) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(indices))
+	for _, idx := range indices {
+		if why := reasons[idx]; why != "" {
+			parts = append(parts, fmt.Sprintf("Instance %d not serving (%s)", idx, why))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("Instance %d not serving", idx))
+	}
+	return "; " + strings.Join(parts, "; ")
 }
 
 // unreplacedExtraSlots is what the Component's extra pods hold against
@@ -535,7 +607,7 @@ func (a *updateAdmission) charge(item UpdateItem) {
 	}
 	a.inFlightUnavail++
 	if a.selection.downOutsideRoll(item.Instance.Index) {
-		a.replacedDownOutsideRoll++
+		a.replacedDownOutsideRoll[item.Instance.Index] = struct{}{}
 	}
 	if !item.CoordGateExempt {
 		a.gateUnavail++

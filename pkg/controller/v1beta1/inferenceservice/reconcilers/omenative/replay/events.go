@@ -11,10 +11,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
@@ -55,18 +57,18 @@ var producedEvents = map[string]string{
 	"write.canaryPromoted":   "a canary write the pass makes on its own",
 	"write.canaryRolledBack": "a canary write the pass makes on its own",
 	"write.canarySettled":    "a canary write the pass makes on its own",
-	"write.modeSwitch":       "a Component never leaves OMENative in a replay",
+	"write.modeSwitch":       "the cleanup's status write; the operator's switch is staged as spec.modeSwitch",
 	"read.pinStable":         "a read the run layer makes on its own",
 	"read.rollbackStable":    "a read the canary dispatch makes on its own",
 	"read.stableCR":          "a read the canary dispatch makes on its own",
 	"read.rollbackCR":        "a read the replica controller makes, which the replay does not run",
 	"read.statusTrails":      "a read every stage makes on its own; stage ir.stale",
 	"cr.collision":           "a hash collision is minted by the replica controller, which the replay does not run",
-	"scope.rotated":          "a replica is never deleted and re-projected in a replay",
+	"scope.rotated":          "a replica recreated under a new owner UID is not modelled; a projected replica deleted and projected again under the same service is staged as replica.reprojected",
 	"ir.readError":           "the fake apiserver answers every replica read",
 	"analysis.unavailable":   "the gate's miss is the pass's own: stage no analysis.sample anywhere for no sampler, none for a member for no fresh sample",
 	"member.staged":          "a staged member needs the user partition flow, which is not modelled",
-	"ir.staged":              "the replica rests at its staged shape on its own; stage the partition, ir.straggling and replica.currentWithdrawn",
+	"ir.staged":              "the replica rests at its staged shape on its own; stage the partition and ir.straggling, and the current revision stays behind the update revision by the engine's rule",
 	"timer.pauseElapsed":     "a timed soak is not modelled",
 	"timer.drainElapsed":     "a drain window is not modelled",
 	"pod.canaryRestarted":    "the restart reading is not modelled",
@@ -76,6 +78,21 @@ var producedEvents = map[string]string{
 	"verb.unpause":           "the unpause is staged as spec.unpause",
 	"spec.groupEdited":       "a group edit is staged as spec.planEdit",
 	"policy.changed":         "a policy body edit is not modelled",
+}
+
+// Produced reports whether the engines produce an event inside the pass,
+// so no scenario stages it, with the note saying what a scenario stages
+// instead.
+func Produced(id string) (note string, ok bool) {
+	note, ok = producedEvents[id]
+	return note, ok
+}
+
+// Stageable reports whether a scenario may stage the event: an applier
+// exists for it.
+func Stageable(id string) bool {
+	_, ok := eventAppliers[id]
+	return ok
 }
 
 // staleReadEvents are the events that stage a pass over the previous
@@ -89,10 +106,14 @@ var staleReadEvents = map[string]struct{}{
 func init() {
 	eventAppliers = map[string]eventApplier{
 		"ctrl.resync":              applyResync,
+		"ctrl.crash":               applyCtrlCrash,
 		"pass.resync":              applyResync,
 		"spec.revision":            applyTargetChange,
 		"member.targetChanged":     applyTargetChange,
-		"replica.targetBumped":     applyTargetChange,
+		"replica.targetBumped":     applyTargetChangeOrRuntimeEdit,
+		"runtime.drifted":          applyRuntimeDrift,
+		"runtime.synced":           applyRuntimeSync,
+		"runtime.editRefused":      applyRuntimeEditRefused,
 		"member.rollback":          applyMemberRollback,
 		"ir.converged":             applyConverged,
 		"ir.straggling":            applyStraggling,
@@ -104,7 +125,7 @@ func init() {
 		"replica.currentPromoted":  applyPromote,
 		"replica.currentWithdrawn": applyWithdraw,
 		"member.capacityLost":      applyCapacityLost,
-		"member.failed":            applyRowPhase(v1beta1.OMENativeInstanceFailed),
+		"member.failed":            applyFailed,
 		"member.surgeFailed":       applySurgeFailed,
 		"member.held":              applyHeld,
 		"member.recovered":         applyRowPhase(v1beta1.OMENativeInstanceReady),
@@ -112,6 +133,7 @@ func init() {
 		"ir.missing":               applyReplicaMissing,
 		"capacity.reached":         applyCapacityReached,
 		"capacity.dropped":         applyCapacityDropped,
+		"pod.stableGone":           applyStablePodGone,
 		"pod.canaryCrashed":        applyCanaryCrash,
 		"analysis.sample":          applyAnalysisSample,
 		"record.legacy":            applyRecordLegacy,
@@ -119,6 +141,7 @@ func init() {
 		"pod.lastStableRolled":     applyLastStableRolled,
 		"stable.crMissing":         applyCollected,
 		"cr.collected":             applyCollected,
+		"replica.reprojected":      applyReprojected,
 		"verb.repin":               applyRepin,
 		"plan.repin":               applyRepin,
 		"verb.rollback":            applyAnnotation(constants.RolloutRollbackAnnotation, "true"),
@@ -129,6 +152,7 @@ func init() {
 		"spec.unpause":             applyAnnotation(constants.PausedRolloutAnnotation, ""),
 		"plan.drift":               applyPlanEdit,
 		"spec.planEdit":            applyPlanEdit,
+		"spec.modeSwitch":          applyModeSwitch,
 		"plan.unresolved":          applyPolicyRemoved,
 		"policy.unresolved":        applyPolicyRemoved,
 		"policy.resolved":          applyPolicyResolved,
@@ -144,6 +168,7 @@ func init() {
 		"api.serviceWriteFailed":   applyServiceWriteFailed,
 		"timer.soak":               applySoakTimer,
 		"timer.readyTimeout":       applyReadyTimeoutTimer,
+		PeerServicesCreated:        applyPeerServicesCreated,
 	}
 }
 
@@ -151,28 +176,33 @@ func init() {
 // map takes no arguments.
 var eventArgKeys = map[string][]string{
 	ClockAdvance:               {"duration"},
+	PeerServicesCreated:        {"component"},
 	"spec.revision":            {"component", "image", "protocol"},
 	"member.targetChanged":     {"component", "image", "protocol"},
 	"replica.targetBumped":     {"component", "image", "protocol"},
+	"runtime.drifted":          {"component", "image"},
+	"runtime.synced":           {"value"},
+	"runtime.editRefused":      {"component", "image", "reason"},
 	"member.rollback":          {"component"},
 	"ir.converged":             {"component"},
 	"ir.straggling":            {"component", "trailing"},
 	"ir.stale":                 {"component", "lag"},
-	"member.surgePodCreated":   {"component", "index", "replacement"},
+	"member.surgePodCreated":   {"component", "index", "replacement", "ordinal", "waiting"},
 	"member.readyOnTarget":     {"component", "index", "listedAfter"},
 	"member.oldPodsGone":       {"component", "index"},
 	"member.converged":         {"component"},
 	"replica.currentPromoted":  {"component"},
 	"replica.currentWithdrawn": {"component"},
-	"member.capacityLost":      {"component", "gone"},
-	"member.failed":            {"component", "index"},
-	"member.surgeFailed":       {"component", "index"},
+	"member.capacityLost":      {"component", "index", "gone", "image"},
+	"member.failed":            {"component", "index", "reason"},
+	"member.surgeFailed":       {"component", "index", "reason"},
 	"member.held":              {"component", "attempts"},
 	"member.recovered":         {"component", "index"},
 	"member.dark":              {"component"},
 	"ir.missing":               {"component"},
 	"capacity.reached":         {"component"},
 	"capacity.dropped":         {"component", "index"},
+	"pod.stableGone":           {"component", "index", "gone"},
 	"pod.canaryCrashed":        {"component", "index"},
 	"analysis.sample":          {"component", "outcome"},
 	"record.legacy":            {"component"},
@@ -180,6 +210,7 @@ var eventArgKeys = map[string][]string{
 	"pod.lastStableRolled":     {"component"},
 	"stable.crMissing":         {"component", "image"},
 	"cr.collected":             {"component", "image"},
+	"replica.reprojected":      {"component"},
 	"verb.repin":               {"value"},
 	"plan.repin":               {"value"},
 	"verb.promote":             {"component", "image"},
@@ -187,6 +218,7 @@ var eventArgKeys = map[string][]string{
 	"verb.resume":              {"component", "image"},
 	"plan.drift":               {"groups"},
 	"spec.planEdit":            {"groups"},
+	"spec.modeSwitch":          {"component", "groups"},
 	"plan.unresolved":          {"name"},
 	"policy.unresolved":        {"name"},
 	"policy.resolved":          {"name"},
@@ -197,6 +229,7 @@ var eventArgKeys = map[string][]string{
 	"api.serviceWriteFailed":   {"count"},
 	"timer.soak":               {"slack"},
 	"timer.readyTimeout":       {"slack"},
+	"ctrl.crash":               {"leaseWait"},
 }
 
 // apply stages one event and records it.
@@ -252,6 +285,32 @@ func applyResync(context.Context, *driver, TimelineEvent) (string, error) {
 	return "", nil
 }
 
+// applyCtrlCrash is the manager process restarting between two passes.
+// The service, its replicas, the policies, the revisions and the pods are
+// durable, and no stage keeps anything between passes that outranks them:
+// the run layer, the canary executor and the coordination pass each read
+// their state back from status, so the pass that follows is the
+// new manager's first and reads what the apiserver holds. What the restart
+// costs is time: leaseWait is how long the new manager waits for the
+// leader Lease before that pass, and the clock moves by it.
+func applyCtrlCrash(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	if ev.Variant != "" {
+		return "", fmt.Errorf("replay: ctrl.crash takes no variant")
+	}
+	wait, err := ParseDuration("ctrl.crash.leaseWait", ev.Args.LeaseWait)
+	if err != nil {
+		return "", err
+	}
+	if wait < 0 {
+		return "", fmt.Errorf("replay: ctrl.crash.leaseWait: the clock does not run backwards")
+	}
+	if wait == 0 {
+		return "", nil
+	}
+	d.clock.Step(wait)
+	return "leaseWait=" + wait.String(), nil
+}
+
 // applyTargetChange edits a Component's template image: the service spec
 // moves, the projection targets the new revision, and the replica records
 // it as its update revision. With a protocol the revision the image mints
@@ -268,8 +327,24 @@ func applyTargetChange(ctx context.Context, d *driver, ev TimelineEvent) (string
 	cs := d.service.Components[string(m.component)]
 	cs.Image = image
 	d.service.Components[string(m.component)] = cs
-	m.image, m.target = image, image
+	m.image = image
 	detail := fmt.Sprintf("component=%s image=%s", m.component, image)
+	// While the recorded runtime revision has drifted the controller ends
+	// its pass before the projection, so the replica keeps its template and
+	// mints no revision; the member records the pushed target on the first
+	// publication after the projection carries it, as it does a runtime edit.
+	if d.runtime != nil && d.runtime.drifted() {
+		m.pendingTarget = image
+		detail += " projection=after-sync"
+	} else {
+		m.retarget(image)
+		ir, err := d.replica(ctx, m.component)
+		if err != nil {
+			return "", err
+		}
+		m.retargetCreateAttempts(image, d.stepStableImage(m, ir, image))
+		m.retargetUnservedUpdateAttempts(image)
+	}
 	if ev.Args.Protocol != "" {
 		if d.service.RevisionProtocols == nil {
 			d.service.RevisionProtocols = map[string]string{}
@@ -300,27 +375,109 @@ func applyMemberRollback(ctx context.Context, d *driver, ev TimelineEvent) (stri
 	return applyTargetChange(ctx, d, ev)
 }
 
-// applyConverged settles a member on its target: every row Ready on it
-// with one Ready pod, and the current revision promoted.
-func applyConverged(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+// applyConverged settles a member on its roll target: every row Ready on it
+// with one Ready pod, and the current revision promoted in the same
+// publication. The roll target is the revision the replica's rollback
+// target names while that revision is retained for it, as the replica
+// controller rolls; else the spec target. The publication promotes by the
+// engine's rule, so a Held retry record on the target keeps the current
+// revision where it was.
+func applyConverged(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
 		return "", err
 	}
-	m.current = m.target
+	target, err := d.rollTargetImage(ctx, m)
+	if err != nil {
+		return "", err
+	}
+	m.current = target
+	m.promoteStaged = true
+	m.failedAttempts = 0
 	m.pods = m.pods[:0]
 	for i := range m.rows {
 		m.rows[i].phase = v1beta1.OMENativeInstanceReady
-		m.rows[i].running = m.target
+		m.rows[i].running = target
+		m.rows[i].served = true
 		m.rows[i].target = ""
 		m.rows[i].readySince = d.clock.Now()
-		m.pods = append(m.pods, podState{index: m.rows[i].index, image: m.target, ready: true, serving: true})
+		m.pods = append(m.pods, podState{index: m.rows[i].index, image: target, ready: true, serving: true})
 	}
-	return fmt.Sprintf("component=%s revision=%s", m.component, m.target), nil
+	return fmt.Sprintf("component=%s revision=%s", m.component, target), nil
 }
 
-// applyStraggling promotes a member's current revision while the named
-// number of its lowest Instances still run the previous revision.
+// applyReprojected deletes a member's replica, as an operator's delete does:
+// its pods leave with it, and the garbage collector keeps every
+// ControllerRevision the service still owns and drops the rest. The member
+// has no rows until the pass projects the replica again, and then comes up
+// Pending on the replica's roll target before any pod runs.
+func applyReprojected(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
+	m, err := requireMember(d, ev)
+	if err != nil {
+		return "", err
+	}
+	ir, err := d.replica(ctx, m.component)
+	if err != nil {
+		return "", err
+	}
+	kept, dropped, err := d.collectAfterDelete(ctx, m, ir.UID)
+	if err != nil {
+		return "", err
+	}
+	if err := d.cluster.staging(func() error { return d.cluster.cli.Delete(ctx, ir) }); err != nil {
+		return "", fmt.Errorf("replay: delete replica %s: %w", ir.Name, err)
+	}
+	pods := len(m.pods)
+	m.rows, m.pods = nil, nil
+	m.current, m.target = "", m.image
+	m.reprojected = true
+	return fmt.Sprintf("component=%s replica=%s pods=%d revisions-kept=%d revisions-collected=%d", m.component, ir.Name, pods, kept, dropped), nil
+}
+
+// collectAfterDelete is the garbage collector's pass over a member's
+// ControllerRevisions once its replica is deleted: a revision another live
+// owner holds stays with the deleted replica's reference removed, and one
+// the replica alone owned is deleted. It reports how many stayed and how
+// many went.
+func (d *driver) collectAfterDelete(ctx context.Context, m *member, replicaUID k8stypes.UID) (kept, dropped int, err error) {
+	for image, cr := range m.revisions {
+		live := &appsv1.ControllerRevision{}
+		if err := d.cluster.cli.Get(ctx, client.ObjectKeyFromObject(cr), live); err != nil {
+			if apierrors.IsNotFound(err) {
+				delete(m.revisions, image)
+				continue
+			}
+			return 0, 0, fmt.Errorf("replay: read revision %s: %w", cr.Name, err)
+		}
+		owners := make([]metav1.OwnerReference, 0, len(live.OwnerReferences))
+		for _, ref := range live.OwnerReferences {
+			if ref.UID != replicaUID {
+				owners = append(owners, ref)
+			}
+		}
+		if len(owners) == 0 {
+			if err := d.cluster.staging(func() error { return d.cluster.cli.Delete(ctx, live) }); err != nil {
+				return 0, 0, fmt.Errorf("replay: collect revision %s: %w", live.Name, err)
+			}
+			delete(m.revisions, image)
+			dropped++
+			continue
+		}
+		live.OwnerReferences = owners
+		if err := d.cluster.staging(func() error { return d.cluster.cli.Update(ctx, live) }); err != nil {
+			return 0, 0, fmt.Errorf("replay: remove the deleted replica from revision %s: %w", live.Name, err)
+		}
+		m.revisions[image] = live
+		kept++
+	}
+	return kept, dropped, nil
+}
+
+// applyStraggling stands every Instance of a member but the named number
+// of its lowest ones Ready on the target, the rest on the previous
+// revision, and names the target as the member's stable image. The
+// publication decides the current revision by the engine's rule, which
+// keeps the previous revision while an Instance trails the target.
 func applyStraggling(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
@@ -331,6 +488,8 @@ func applyStraggling(_ context.Context, d *driver, ev TimelineEvent) (string, er
 	}
 	previous := m.current
 	m.current = m.target
+	m.promoteStaged = true
+	m.failedAttempts = 0
 	m.pods = m.pods[:0]
 	for i := range m.rows {
 		running := m.target
@@ -339,6 +498,7 @@ func applyStraggling(_ context.Context, d *driver, ev TimelineEvent) (string, er
 		}
 		m.rows[i].phase = v1beta1.OMENativeInstanceReady
 		m.rows[i].running = running
+		m.rows[i].served = true
 		m.rows[i].target = ""
 		m.pods = append(m.pods, podState{index: m.rows[i].index, image: running, ready: true, serving: true})
 	}
@@ -346,9 +506,9 @@ func applyStraggling(_ context.Context, d *driver, ev TimelineEvent) (string, er
 }
 
 // applyStale publishes the member's next status behind its generation, or
-// with lag=status publishes nothing, so the last written status stands,
-// revision pair and rows included, as it does while the replica controller
-// has not run since the spec moved.
+// with lag=status publishes nothing beyond a promotion the stored rows
+// earned, so the last written status stands, rows included, as it does
+// while the replica controller has not run since the spec moved.
 func applyStale(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
@@ -372,7 +532,9 @@ func applyStale(_ context.Context, d *driver, ev TimelineEvent) (string, error) 
 // applySurgePod creates an Instance's first pod on the target revision, not
 // yet Ready, and marks the row updating toward it; without an index every
 // Instance surges. A start on an Instance whose failed replacement still
-// stands takes that pod's slot: the Instance keeps one replacement.
+// stands takes that pod's slot: the Instance keeps one replacement. An
+// Instance whose row is an open Create attempt gets the attempt's pod
+// instead, on the attempt's revision.
 func applySurgePod(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
@@ -392,15 +554,30 @@ func applySurgePod(_ context.Context, d *driver, ev TimelineEvent) (string, erro
 			indexes = append(indexes, row.index)
 		}
 	}
+	ordinal, detail := int32(1), ""
+	if ev.Args.Ordinal != nil {
+		ordinal, detail = *ev.Args.Ordinal, fmt.Sprintf(" ordinal=%d", *ev.Args.Ordinal)
+	}
 	for _, index := range indexes {
 		row := m.row(index)
-		row.phase = v1beta1.OMENativeInstanceUpdating
-		row.target = m.target
-		if m.podOn(index, m.target) == nil {
-			m.pods = append(m.pods, podState{index: index, ordinal: 1, image: m.target, ready: false})
+		image := m.target
+		if row.createAttempt() {
+			// The attempt's own pod: the row stays a Create attempt toward
+			// its revision until the pod is Ready.
+			image = row.target
+		} else {
+			row.phase = v1beta1.OMENativeInstanceUpdating
+			row.target = m.target
+		}
+		row.waiting = ev.Args.Waiting
+		if m.podOn(index, image) == nil {
+			m.pods = append(m.pods, podState{index: index, ordinal: ordinal, image: image, ready: false})
 		}
 	}
-	return fmt.Sprintf("component=%s instances=%d revision=%s", m.component, len(indexes), m.target), nil
+	if ev.Args.Waiting != "" {
+		detail += " waiting=" + ev.Args.Waiting
+	}
+	return fmt.Sprintf("component=%s instances=%d revision=%s%s", m.component, len(indexes), m.target, detail), nil
 }
 
 // applyGangSurge opens a gang surge on one Instance: the replacement gang
@@ -474,7 +651,47 @@ func applySurgeFailed(_ context.Context, d *driver, ev TimelineEvent) (string, e
 		return "", fmt.Errorf("replay: %s: Instance %d of %s has no serving pod on its running revision; the publication writes Ready over a failed replacement only while the old pod serves", ev.Key(), row.index, m.component)
 	}
 	row.phase = v1beta1.OMENativeInstanceReady
-	return fmt.Sprintf("component=%s index=%d revision=%s", m.component, row.index, row.target), nil
+	row.served = true
+	detail := fmt.Sprintf("component=%s index=%d revision=%s", m.component, row.index, row.target)
+	return detail + m.recordFailure(row, ev.Args.Reason), nil
+}
+
+// recordFailure records an ended attempt on its row and on the member's
+// retry record, as the replica controller does: the row's last failure
+// names the reason, the open attempt waits on nothing any more, and a
+// failure the environment caused (the scheduler could not place the pod)
+// counts nothing on the record, so the next pass starts the attempt
+// again at once, while any other failure is one the schedule counted. It
+// returns the apply detail the reason adds, empty when none was named.
+func (m *member) recordFailure(row *rowState, reason string) string {
+	row.waiting = ""
+	row.failureReason = reason
+	if !types.IsEnvironmentCausedReason(reason) {
+		m.failedAttempts++
+	}
+	if reason == "" {
+		return ""
+	}
+	return " reason=" + reason
+}
+
+// applyFailed sets a row Failed, as the replica publishes an attempt that
+// ended without serving, and records the failure (recordFailure).
+func applyFailed(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	m, err := requireMember(d, ev)
+	if err != nil {
+		return "", err
+	}
+	if ev.Args.Index == nil {
+		return "", fmt.Errorf("replay: %s needs the row index", ev.Key())
+	}
+	row := m.row(*ev.Args.Index)
+	if row == nil {
+		return "", fmt.Errorf("replay: %s: no row %d", ev.Key(), *ev.Args.Index)
+	}
+	row.phase = v1beta1.OMENativeInstanceFailed
+	detail := fmt.Sprintf("component=%s index=%d phase=%s", m.component, row.index, row.phase)
+	return detail + m.recordFailure(row, ev.Args.Reason), nil
 }
 
 // applyHeld sets or clears a member's retry record for its target as the
@@ -502,7 +719,7 @@ func applyHeld(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 		if m.heldAttempts == 0 {
 			return "", fmt.Errorf("replay: %s: %s has no Held record to release", ev.Key(), m.component)
 		}
-		m.heldAttempts = 0
+		m.heldAttempts, m.failedAttempts = 0, 0
 		return fmt.Sprintf("component=%s revision=%s", m.component, m.target), nil
 	}
 	return "", fmt.Errorf("replay: %s: the variant is set or released", ev.Key())
@@ -541,6 +758,11 @@ func applyReadyOnTarget(_ context.Context, d *driver, ev TimelineEvent) (string,
 	}
 	if n == 0 {
 		return "", fmt.Errorf("replay: member.readyOnTarget: %s has no pod on its target revision", m.component)
+	}
+	for i := range m.rows {
+		if ev.Args.Index == nil || m.rows[i].index == *ev.Args.Index {
+			m.rows[i].waiting = ""
+		}
 	}
 	detail := fmt.Sprintf("component=%s pods=%d", m.component, n)
 	if listedAfter > 0 {
@@ -590,11 +812,14 @@ func applyOldPodsGone(_ context.Context, d *driver, ev TimelineEvent) (string, e
 		if m.podOn(promoted.index, m.target) == nil {
 			return "", fmt.Errorf("replay: %s: Instance %d of %s has no pod on the target revision; stage member.surgePodCreated for it first", ev.Key(), promoted.index, m.component)
 		}
+		onTarget, readyOnTarget := m.podsOn(promoted.index, m.target)
+		promoted.served = onTarget > 0 && readyOnTarget == onTarget
 		promoted.running = m.target
 		promoted.target = ""
 		promoted.phase = v1beta1.OMENativeInstanceReady
 		promoted.readySince = d.clock.Now()
 		promoted.replaces = nil
+		m.promotedOn(m.target)
 	}
 	if len(ended) > 0 {
 		rows := m.rows[:0]
@@ -612,17 +837,27 @@ func applyOldPodsGone(_ context.Context, d *driver, ev TimelineEvent) (string, e
 	return detail, nil
 }
 
-// applyPromote promotes the replica's current revision to its target.
+// applyPromote stands for the replica controller's promotion write: the
+// next publication lands the promotion the rows have earned by the engine's
+// rule (every Instance Ready on the update revision and no retry record
+// naming it) instead of leaving it for the publication after, and the
+// member's stable image moves to the target.
 func applyPromote(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
 		return "", err
 	}
 	m.current = m.target
+	m.failedAttempts = 0
+	m.promoteStaged = true
 	return fmt.Sprintf("component=%s revision=%s", m.component, m.target), nil
 }
 
-// applyWithdraw withdraws the replica's current revision to empty.
+// applyWithdraw names the moment the replica controller empties its
+// current revision. The publication empties it by the engine's rule, when
+// the current revision names the update revision while an Instance is off
+// it, and keeps the current revision otherwise; the member's stable image
+// reads empty for the events that name it.
 func applyWithdraw(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
@@ -634,7 +869,14 @@ func applyWithdraw(_ context.Context, d *driver, ev TimelineEvent) (string, erro
 
 // applyCapacityLost takes a member's pods of one revision out of readiness,
 // the target's or the current's, or with gone removes them: the rows keep
-// their revision and wait for the replica to rebuild them.
+// their revision and wait for the replica to rebuild them, and the
+// publication writes their phase from the pods (Restarting over pods that
+// serve nothing, Pending over none). With an index
+// only that Instance's pods of the revision are taken, the one pod a
+// kubelet loses; without one the whole revision goes. An image names the
+// revision outright where the variant cannot: after a push back the target
+// and the current revision agree while an Instance still runs the revision
+// the push came back from.
 func applyCapacityLost(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
@@ -644,10 +886,19 @@ func applyCapacityLost(_ context.Context, d *driver, ev TimelineEvent) (string, 
 	if ev.Variant == "oldRevision" {
 		image = m.current
 	}
+	if ev.Args.Image != "" {
+		if image, err = m.resolveImage(ev.Args.Image); err != nil {
+			return "", err
+		}
+	}
+	covers := func(index int32) bool { return ev.Args.Index == nil || *ev.Args.Index == index }
+	if ev.Args.Index != nil && m.row(*ev.Args.Index) == nil {
+		return "", fmt.Errorf("replay: %s: no row %d", ev.Key(), *ev.Args.Index)
+	}
 	n := 0
 	kept := m.pods[:0]
 	for i := range m.pods {
-		if m.pods[i].image != image {
+		if m.pods[i].image != image || !covers(m.pods[i].index) {
 			kept = append(kept, m.pods[i])
 			continue
 		}
@@ -659,12 +910,13 @@ func applyCapacityLost(_ context.Context, d *driver, ev TimelineEvent) (string, 
 		kept = append(kept, m.pods[i])
 	}
 	m.pods = kept
-	for i := range m.rows {
-		if m.rows[i].running == image && m.rows[i].phase == v1beta1.OMENativeInstanceReady {
-			m.rows[i].phase = v1beta1.OMENativeInstancePending
-		}
-	}
 	detail := fmt.Sprintf("component=%s revision=%s pods=%d", m.component, image, n)
+	if ev.Args.Index != nil {
+		if n == 0 {
+			return "", fmt.Errorf("replay: %s: Instance %d of %s has no pod on that revision", ev.Key(), *ev.Args.Index, m.component)
+		}
+		detail = fmt.Sprintf("component=%s instance=%d revision=%s pods=%d", m.component, *ev.Args.Index, image, n)
+	}
 	if ev.Args.Gone {
 		detail += " gone"
 	}
@@ -686,6 +938,9 @@ func applyRowPhase(phase v1beta1.OMENativeInstancePhase) eventApplier {
 			return "", fmt.Errorf("replay: %s: no row %d", ev.Key(), *ev.Args.Index)
 		}
 		row.phase = phase
+		if phase == v1beta1.OMENativeInstanceReady && row.running != "" {
+			m.promotedOn(row.running)
+		}
 		return fmt.Sprintf("component=%s index=%d phase=%s", m.component, *ev.Args.Index, phase), nil
 	}
 }
@@ -710,8 +965,8 @@ func applyReplicaMissing(ctx context.Context, d *driver, ev TimelineEvent) (stri
 	return fmt.Sprintf("component=%s replica=%s", m.component, ir.Name), nil
 }
 
-// applyDark takes every pod of a member out of rotation and demotes its
-// rows, with no row reading Failed.
+// applyDark takes every pod of a member out of rotation; the publication
+// writes its settled rows Restarting from the pods, and no row reads Failed.
 func applyDark(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
@@ -719,9 +974,6 @@ func applyDark(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
 	}
 	for i := range m.pods {
 		m.pods[i].ready, m.pods[i].serving = false, false
-	}
-	for i := range m.rows {
-		m.rows[i].phase = v1beta1.OMENativeInstancePending
 	}
 	return "component=" + string(m.component), nil
 }
@@ -762,13 +1014,9 @@ func (m *member) setInstance(index int32, image string, now time.Time) {
 	row.running = image
 	row.target = ""
 	row.readySince = now
-	kept := m.pods[:0]
-	for _, p := range m.pods {
-		if p.index != index {
-			kept = append(kept, p)
-		}
-	}
-	m.pods = append(kept, podState{index: index, image: image, ready: true, serving: true})
+	row.served = true
+	m.removePodsOf(index)
+	m.pods = append(m.pods, podState{index: index, image: image, ready: true, serving: true})
 }
 
 // applyCapacityDropped takes one Instance's target pod out of readiness.
@@ -791,6 +1039,43 @@ func applyCapacityDropped(_ context.Context, d *driver, ev TimelineEvent) (strin
 		return "", fmt.Errorf("replay: %s: Instance %d has no pod on the target revision", ev.Key(), *ev.Args.Index)
 	}
 	return fmt.Sprintf("component=%s index=%d", m.component, *ev.Args.Index), nil
+}
+
+// applyStablePodGone takes one Instance's pod on the current revision, the
+// stable side of a canary split, out of readiness (a crash loop, a lost
+// probe) or, with gone, removes it (a deletion the replica has yet to
+// rebuild); the row keeps its revision either way.
+func applyStablePodGone(_ context.Context, d *driver, ev TimelineEvent) (string, error) {
+	m, err := requireMember(d, ev)
+	if err != nil {
+		return "", err
+	}
+	if ev.Args.Index == nil {
+		return "", fmt.Errorf("replay: %s needs the index of the stable Instance", ev.Key())
+	}
+	n := 0
+	kept := m.pods[:0]
+	for i := range m.pods {
+		if m.pods[i].index != *ev.Args.Index || m.pods[i].image != m.current {
+			kept = append(kept, m.pods[i])
+			continue
+		}
+		n++
+		if ev.Args.Gone {
+			continue
+		}
+		m.pods[i].ready, m.pods[i].serving = false, false
+		kept = append(kept, m.pods[i])
+	}
+	m.pods = kept
+	if n == 0 {
+		return "", fmt.Errorf("replay: %s: Instance %d has no pod on the current revision", ev.Key(), *ev.Args.Index)
+	}
+	detail := fmt.Sprintf("component=%s index=%d", m.component, *ev.Args.Index)
+	if ev.Args.Gone {
+		detail += " gone"
+	}
+	return detail, nil
 }
 
 // applyCanaryCrash puts the runner of one Instance's target-revision pod
@@ -962,18 +1247,24 @@ func applyCollected(ctx context.Context, d *driver, ev TimelineEvent) (string, e
 }
 
 // disownRevision rewrites a ControllerRevision's controller reference to
-// another object, so the Component's replica does not control it.
+// another object and drops the service's ownership, so the revision is
+// outside the Component's history: neither the replica controls it nor the
+// service owns it.
 func (d *driver) disownRevision(ctx context.Context, m *member, image string, cr *appsv1.ControllerRevision) (string, error) {
 	live := &appsv1.ControllerRevision{}
 	if err := d.cluster.cli.Get(ctx, client.ObjectKeyFromObject(cr), live); err != nil {
 		return "", fmt.Errorf("replay: read revision %s: %w", cr.Name, err)
 	}
-	for i := range live.OwnerReferences {
-		if live.OwnerReferences[i].Controller != nil && *live.OwnerReferences[i].Controller {
-			live.OwnerReferences[i].Name = live.OwnerReferences[i].Name + "-previous"
-			live.OwnerReferences[i].UID = live.OwnerReferences[i].UID + "-previous"
+	owners := live.OwnerReferences[:0]
+	for _, ref := range live.OwnerReferences {
+		if ref.Controller == nil || !*ref.Controller {
+			continue
 		}
+		ref.Name += "-previous"
+		ref.UID += "-previous"
+		owners = append(owners, ref)
 	}
+	live.OwnerReferences = owners
 	if err := d.cluster.staging(func() error { return d.cluster.cli.Update(ctx, live) }); err != nil {
 		return "", fmt.Errorf("replay: disown revision %s: %w", cr.Name, err)
 	}
@@ -1032,6 +1323,40 @@ func applyPlanEdit(ctx context.Context, d *driver, ev TimelineEvent) (string, er
 	return fmt.Sprintf("groups=%d generation=%d", len(d.service.Groups), generation), nil
 }
 
+// applyModeSwitch moves a Component out of the OMENative mode and, as
+// admission requires of a member that is not OMENative, replaces
+// spec.rollout.groups with groups that do not name it, in one write. From
+// this tick the pass resolves the Component to RawDeployment: no replica
+// is projected or published for it, and the cleanup stage removes what
+// OMENative had projected and clears its OMENative status.
+func applyModeSwitch(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
+	m, err := requireMember(d, ev)
+	if err != nil {
+		return "", err
+	}
+	if d.departed[m.component] {
+		return "", fmt.Errorf("replay: %s: %s has already left the OMENative mode", ev.Key(), m.component)
+	}
+	groups := d.service.Groups
+	if ev.Args.Groups != nil {
+		groups = append([]v1beta1.RolloutGroup(nil), ev.Args.Groups...)
+	}
+	for gi := range groups {
+		for _, c := range groups[gi].Components {
+			if c == m.component {
+				return "", fmt.Errorf("replay: %s: groups[%d] still names %s; admission refuses a group member that is not OMENative, so the switch must take it out of every group", ev.Key(), gi, m.component)
+			}
+		}
+	}
+	d.departed[m.component] = true
+	d.service.Groups = groups
+	generation, err := d.writeSpec(ctx)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("component=%s mode=%s groups=%d generation=%d", m.component, constants.RawDeployment, len(groups), generation), nil
+}
+
 // applyPolicyRemoved deletes a referenced RolloutPolicy.
 func applyPolicyRemoved(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
 	if ev.Args.Name == "" {
@@ -1072,8 +1397,11 @@ func applyPolicyResolved(ctx context.Context, d *driver, ev TimelineEvent) (stri
 }
 
 // applyReplicas rewrites a Component's desired replica count. A new
-// Instance appears as a Pending row with no pod yet; a removed one takes
-// its row and pods with it.
+// Instance appears as a Create attempt with no pod yet, the row the replica
+// controller's create pass writes for an Instance it has no row for: the
+// attempt names the revision the pass chooses (scaleUpImage) and the
+// running revision is recorded when the Instance is promoted Ready. A
+// removed Instance takes its row and pods with it.
 func applyReplicas(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
 	m, err := requireMember(d, ev)
 	if err != nil {
@@ -1086,8 +1414,12 @@ func applyReplicas(ctx context.Context, d *driver, ev TimelineEvent) (string, er
 	cs := d.service.Components[string(m.component)]
 	cs.Replicas = to
 	d.service.Components[string(m.component)] = cs
+	image, err := d.scaleUpImage(ctx, m)
+	if err != nil {
+		return "", err
+	}
 	for int32(len(m.rows)) < to {
-		m.rows = append(m.rows, rowState{index: int32(len(m.rows)), phase: v1beta1.OMENativeInstancePending, running: m.target})
+		m.rows = append(m.rows, creatingRow(int32(len(m.rows)), image))
 	}
 	for int32(len(m.rows)) > to {
 		last := m.rows[len(m.rows)-1].index

@@ -3,6 +3,8 @@ package types
 import (
 	"testing"
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestNextRetryDelay(t *testing.T) {
@@ -49,5 +51,42 @@ func TestFindRetryBlock(t *testing.T) {
 	FindRetryBlock(blocks, "a").AttemptsStarted = 7
 	if blocks[0].AttemptsStarted != 7 {
 		t.Error("FindRetryBlock must return a pointer into the slice")
+	}
+}
+
+// TestRowOnFailingRevision names the revision a row is read on and the
+// records that make it failing: the attempt's target first, else the running
+// revision; Held and Backoff always, an attempt in flight only when the
+// row remembers a crash of its promoted set, and nothing with no record.
+func TestRowOnFailingRevision(t *testing.T) {
+	readyAt := metav1.NewTime(time.Date(2026, 2, 3, 4, 0, 0, 0, time.UTC))
+	crashedAfter := metav1.NewTime(readyAt.Add(time.Minute))
+	crashedBefore := metav1.NewTime(readyAt.Add(-time.Minute))
+	block := func(rev string, state RetryBlockState) []RetryBlock {
+		return []RetryBlock{{TargetRevision: rev, State: state, AttemptsStarted: 1}}
+	}
+	cases := []struct {
+		name   string
+		row    *InstanceStatus
+		blocks []RetryBlock
+		want   bool
+	}{
+		{"nil row", nil, block("v2", RetryBlockHeld), false},
+		{"no revision on the row", &InstanceStatus{}, block("v2", RetryBlockHeld), false},
+		{"no record for the revision", &InstanceStatus{RunningRevision: "v1"}, block("v2", RetryBlockHeld), false},
+		{"running revision held", &InstanceStatus{RunningRevision: "v2"}, block("v2", RetryBlockHeld), true},
+		{"running revision in backoff", &InstanceStatus{RunningRevision: "v2"}, block("v2", RetryBlockBackoff), true},
+		{"the target decides over the running revision", &InstanceStatus{RunningRevision: "v1", TargetRevision: "v2"}, block("v2", RetryBlockHeld), true},
+		{"a sound target over a held running revision", &InstanceStatus{RunningRevision: "v1", TargetRevision: "v2"}, block("v1", RetryBlockHeld), false},
+		{"attempt in flight, no crash remembered", &InstanceStatus{RunningRevision: "v2", ReadySince: &readyAt}, block("v2", RetryBlockRetryInProgress), false},
+		{"attempt in flight, a crash of the set it replaced", &InstanceStatus{RunningRevision: "v2", ReadySince: &readyAt, LastFailure: &InstanceTermination{Time: crashedBefore}}, block("v2", RetryBlockRetryInProgress), false},
+		{"attempt in flight, a crash after Ready", &InstanceStatus{RunningRevision: "v2", ReadySince: &readyAt, LastFailure: &InstanceTermination{Time: crashedAfter}}, block("v2", RetryBlockRetryInProgress), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RowOnFailingRevision(c.row, c.blocks); got != c.want {
+				t.Fatalf("RowOnFailingRevision = %v, want %v", got, c.want)
+			}
+		})
 	}
 }

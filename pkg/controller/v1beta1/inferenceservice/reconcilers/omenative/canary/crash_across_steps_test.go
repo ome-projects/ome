@@ -314,8 +314,8 @@ func parkByRememberedDeaths(t *testing.T, t0 time.Time) *timedCanaryWire {
 // TestDispatch_ParkByRememberedDeathsLeavesOnEachExit walks the exits of a
 // park for deaths remembered across a step: a rollback drains the rejected
 // revision and completes, a new push arms a fresh canary toward the pushed
-// revision, a resume re-enters the ladder and the deaths the pods still
-// carry park it again, and a promote is not an exit.
+// revision, a resume continues the steps at the stopped step and the deaths
+// the pods still carry park it again, and a promote is not an exit.
 func TestDispatch_ParkByRememberedDeathsLeavesOnEachExit(t *testing.T) {
 	t0 := time.Unix(100000, 0)
 
@@ -390,8 +390,8 @@ func TestDispatch_ParkByRememberedDeathsLeavesOnEachExit(t *testing.T) {
 			t.Fatal(err)
 		}
 		cs, phase := w.status()
-		if phase != v1beta1.RolloutPhasePending || cs.CurrentStep != 0 || cs.Failed != nil {
-			t.Fatalf("a resume must re-enter the ladder at step 0, got phase %q status %+v", phase, cs)
+		if phase != v1beta1.RolloutPhasePending || cs.CurrentStep != 1 || cs.Failed != nil {
+			t.Fatalf("a resume must continue the steps at the step the stop interrupted, got phase %q status %+v", phase, cs)
 		}
 		if len(out.Consume) != 1 || out.Consume[0] != constants.RolloutResumeAnnotation {
 			t.Fatalf("the resume must be handed back for removal, got consume %v", out.Consume)
@@ -399,7 +399,7 @@ func TestDispatch_ParkByRememberedDeathsLeavesOnEachExit(t *testing.T) {
 		// The pods still carry their deaths, and the run is the same: the
 		// re-entered ladder parks again where it stands.
 		w.dispatchAt(t, t0.Add(70*time.Second))
-		w.expectParked(t, 0, "target-3", "the pass after the resume")
+		w.expectParked(t, 1, "target-3", "the pass after the resume")
 	})
 
 	t.Run("promote is not an exit", func(t *testing.T) {

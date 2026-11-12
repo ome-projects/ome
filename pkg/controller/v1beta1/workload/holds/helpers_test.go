@@ -95,8 +95,8 @@ func (s *rowStore) lastFailure(idx int32) *types.InstanceTermination {
 // the dispatcher does.
 func rowsFor(in types.ReconcileInput, desired int32) []Row {
 	out := make([]Row, 0, len(in.ObservedState.InstanceStatuses))
-	for _, s := range in.ObservedState.InstanceStatuses {
-		out = append(out, Row{Status: s, Desired: desired})
+	for i := range in.ObservedState.InstanceStatuses {
+		out = append(out, Row{Status: &in.ObservedState.InstanceStatuses[i], Desired: desired})
 	}
 	return out
 }

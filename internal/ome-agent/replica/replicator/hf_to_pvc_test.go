@@ -1,39 +1,30 @@
 package replicator
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	"sigs.k8s.io/ome/pkg/xet"
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
-	"sigs.k8s.io/ome/pkg/logging"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
 	testingPkg "sigs.k8s.io/ome/pkg/testing"
 )
 
 func TestHFToPVCReplicator_Replicate_Success(t *testing.T) {
-	// Save the original function so we can restore it later
-	originalDownloadFunc := downloadFromHFFunc
-
-	// Defer restoring original function
-	defer func() {
-		downloadFromHFFunc = originalDownloadFunc
-	}()
-
-	// Replace downloadFromHFFunc with a mock version
-	downloadFromHFFunc = func(input common.ReplicationInput, client *xet.Client, path string, opts hfDownloadOptions, logger logging.Interface) (string, error) {
-		if path != "/mnt/data/meta/lama-Guard-4-12B" {
-			t.Errorf("unexpected path: got %s, want /mnt/data/meta/lama-Guard-4-12B", path)
+	hub := &fakeHubClient{download: func(_ context.Context, req *xet.SnapshotRequest) (string, error) {
+		if req.LocalDir != "/mnt/data/meta/lama-Guard-4-12B" {
+			t.Errorf("unexpected path: got %s, want /mnt/data/meta/lama-Guard-4-12B", req.LocalDir)
 		}
 		return "/mock/downloaded_path", nil
-	}
+	}}
 
 	replicator := &HFToPVCReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: HFToPVCReplicatorConfig{
+		Dependencies: Dependencies{
 			LocalPath: "/mnt/data/",
-			HubClient: &xet.Client{},
+			HubClient: hub,
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{
@@ -53,23 +44,21 @@ func TestHFToPVCReplicator_Replicate_Success(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
+	if hub.downloads != 1 {
+		t.Errorf("expected one snapshot download, got %d", hub.downloads)
+	}
 }
 
 func TestHFToPVCReplicator_Replicate_Failure(t *testing.T) {
-	originalDownloadFunc := downloadFromHFFunc
-	defer func() {
-		downloadFromHFFunc = originalDownloadFunc
-	}()
-
-	downloadFromHFFunc = func(input common.ReplicationInput, client *xet.Client, path string, opts hfDownloadOptions, logger logging.Interface) (string, error) {
+	hub := &fakeHubClient{download: func(context.Context, *xet.SnapshotRequest) (string, error) {
 		return "", fmt.Errorf("mock error")
-	}
+	}}
 
 	replicator := &HFToPVCReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: HFToPVCReplicatorConfig{
-			LocalPath: "/tmp",
-			HubClient: &xet.Client{},
+		Dependencies: Dependencies{
+			LocalPath: t.TempDir(),
+			HubClient: hub,
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{

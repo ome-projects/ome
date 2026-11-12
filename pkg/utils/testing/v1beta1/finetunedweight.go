@@ -42,11 +42,6 @@ func MakeFineTunedWeight(name string) *FineTunedWeightWrapper {
 // Obj returns the underlying API type pointer.
 func (w *FineTunedWeightWrapper) Obj() *v1beta1.FineTunedWeight { return &w.FineTunedWeight }
 
-// Clone deep-copies the wrapped FTW for variations across subtests.
-func (w *FineTunedWeightWrapper) Clone() *FineTunedWeightWrapper {
-	return &FineTunedWeightWrapper{FineTunedWeight: *w.FineTunedWeight.DeepCopy()}
-}
-
 // StorageURI sets spec.Storage.StorageUri.
 func (w *FineTunedWeightWrapper) StorageURI(uri string) *FineTunedWeightWrapper {
 	if w.Spec.Storage == nil {

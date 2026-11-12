@@ -44,10 +44,18 @@ func EscalateFromEvidenceForTest(ctx context.Context, deps types.Deps, input typ
 	return Run(ctx, PassInput{Deps: deps, Input: input, Plan: plan, Target: target, Pods: pods, Held: held})
 }
 
-// observedPodReader is a reader holding the bucketed pods under the
+// ObservedPodClientForTest is the store the seam above reads through when
+// a fixture names none, handed out as a client: a test that expects the
+// pass to write a pod wires it as Deps.Client and reads the result back
+// through it.
+func ObservedPodClientForTest(input types.ReconcileInput, plan types.ComponentPlan, byIdx map[int32][]*corev1.Pod) client.Client {
+	return observedPodReader(input, plan, byIdx)
+}
+
+// observedPodReader is a store holding the bucketed pods under the
 // labels the live lister selects by, so a pass that re-reads an
 // Instance's pods finds the ones it observed.
-func observedPodReader(input types.ReconcileInput, plan types.ComponentPlan, byIdx map[int32][]*corev1.Pod) client.Reader {
+func observedPodReader(input types.ReconcileInput, plan types.ComponentPlan, byIdx map[int32][]*corev1.Pod) client.Client {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		panic(err)

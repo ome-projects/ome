@@ -51,6 +51,36 @@ grep -Fq 'resourceNames: ["aq-mgr-webhook-cert"]' <<<"${renamed}" ||
 grep -Fq -- '--webhook-config-name=aq-mgr.ome.io' <<<"${renamed}" ||
   fail "the binary flag did not follow the rename"
 
+# --- leader election: a clean stop gives the lease back ---
+
+# The quota manager stopped on purpose gives the leader lease back by default,
+# so the standby takes over at its next poll. The lease renders beside it long
+# enough to outlast a leader whose renewals fail (the release rule), and the
+# renew deadline long enough to ride out a 40s apiserver stall.
+grep -Fq -- '- "--leader-elect-release-on-cancel"' <<<"${default}" ||
+  fail "the quota manager does not release the leader lease on a clean stop by default"
+grep -Fq -- '- "--leader-elect-lease-duration=120s"' <<<"${default}" ||
+  fail "the quota manager's lease does not outlast a leader whose renewals fail under the release rule"
+grep -Fq -- '- "--leader-elect-renew-deadline=40s"' <<<"${default}" ||
+  fail "the quota manager's renew deadline does not keep two 20s renewal attempts"
+grep -Fq -- '- "--leader-elect-retry-period=8s"' <<<"${default}" ||
+  fail "the quota manager's retry period was not passed"
+kept_lease="$(render --set quotaManager.mode=workload --set quotaManager.leaderElection.releaseOnCancel=false)"
+if grep -Fq -- '--leader-elect-release-on-cancel' <<<"${kept_lease}"; then
+  fail "quotaManager.leaderElection.releaseOnCancel=false still releases the leader lease"
+fi
+# The lease is released only after the stop, which controller-runtime bounds
+# at 30s; the pod's grace period must outlast that, or SIGKILL comes first.
+grep -Eq '^ +terminationGracePeriodSeconds: 40$' <<<"${default}" ||
+  fail "the quota manager pod's termination grace period does not outlast the 30 second stop timeout by default"
+grace="$(render --set quotaManager.mode=workload --set quotaManager.terminationGracePeriodSeconds=45)"
+grep -Eq '^ +terminationGracePeriodSeconds: 45$' <<<"${grace}" ||
+  fail "quotaManager.terminationGracePeriodSeconds was not applied to the pod"
+no_grace="$(render --set quotaManager.mode=workload --set quotaManager.terminationGracePeriodSeconds=null)"
+if grep -Eq '^ +terminationGracePeriodSeconds:' <<<"${no_grace}"; then
+  fail "an unset quotaManager.terminationGracePeriodSeconds still renders a grace period"
+fi
+
 # --- internal cert management: the out-of-the-box default ---
 
 grep -Fq -- '--internal-cert-management=true' <<<"${default}" ||
@@ -560,6 +590,11 @@ grep -Fq 'name: ome-quota-manager-service' <<<"${default}" ||
 # Service safe on a live cluster.
 grep -Fq -- '--webhook-service-name=ome-quota-manager-service' <<<"${default}" ||
   fail "the cert flag does not point at the Service"
+# The binary has no built-in cluster domain: the fully qualified name the
+# rotator adds to the cert comes from this flag, from the same chart value the
+# cert-manager path renders below.
+grep -Fq -- '--cluster-domain=cluster.local' <<<"${default}" ||
+  fail "the cluster domain was not passed to the rotator"
 
 # On the cert-manager path the SANs are explicit, and must cover the same name.
 certmgr="$(render --set quotaManager.mode=workload \

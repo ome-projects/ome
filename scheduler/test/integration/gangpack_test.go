@@ -119,7 +119,7 @@ func TestGangLandsInOneDomain(t *testing.T) {
 // must NOT bind while its gang is incomplete, and both members bind the moment
 // the gang is whole. This is what makes it a gang scheduler rather than a
 // bin-packer — without the Permit gate, the first pod would bind immediately and
-// strand the workload half-scheduled.
+// leave the workload half-scheduled.
 //
 // Two nodes in one domain, a 2-member PodGroup. Creating just one pod, it best-
 // fits, takes a domain, and gates — but stays unbound. Adding the second opens the gate and
@@ -337,12 +337,12 @@ func TestAssumedWaitersDoNotOpenPermitGate(t *testing.T) {
 // and must still schedule once it becomes completable.
 //
 // A 2-member PodGroup with a short gate timeout, but only one pod. PreFilter
-// parks the lone member because the live member set is short of minMember, so
+// holds the lone member because the live member set is short of minMember, so
 // it never reaches the gate, and it stays unbound across a window of several
 // gate timeouts. Then the gang is made completable by dropping minMember to 1 —
 // a single-pod recovery, so there is no two-pod realignment to race — and the
-// member binds. The edit is ordered after the member is observed parked, so what
-// is exercised is the requeue of a parked member on a PodGroup change, not a
+// member binds. The edit is ordered after the member is observed held, so what
+// is exercised is the requeue of a held member on a PodGroup change, not a
 // race with its first attempt.
 func TestIncompleteGangTimesOutThenRecovers(t *testing.T) {
 	tc := startScheduler(t, globalKubeConfig, gangPackOptions(t)...)
@@ -370,7 +370,7 @@ func TestIncompleteGangTimesOutThenRecovers(t *testing.T) {
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, makeGangPod("gp-0", ns, "gang"), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create pod gp-0: %v", err)
 	}
-	// The lone member is parked short of minMember; the edit below is ordered
+	// The lone member is held short of minMember; the edit below is ordered
 	// after that.
 	waitForPodRejected(t, tc, ns, "gp-0", "waiting for all PodGroup member templates", 10*time.Second)
 	// Across two gate timeouts it must never bind.
@@ -405,7 +405,7 @@ func TestIncompleteGangTimesOutThenRecovers(t *testing.T) {
 //
 // Domain "a" has 3 nodes, domain "b" has 4. Both gangs need 3, and "a" is the
 // tightest fit for 3 — so without the reservation both would take "a", leaving 6
-// pods to fight over 3 nodes and stranding the loser. With it, whichever gang
+// pods to fight over 3 nodes and leaving the losing gang short of nodes. With it, whichever gang
 // takes "a" first reserves all of it; the other lands wholly in "b". The invariant
 // asserted (robust to arrival order): every pod binds, each gang sits in a single
 // domain, and the two gangs occupy different domains.
@@ -475,7 +475,7 @@ func TestTwoGangsDoNotOverCommitDomain(t *testing.T) {
 // TestGangRecoversAfterSchedulerRestart is the failover guarantee: after a
 // scheduler restart the in-memory assignments are gone, but a gang that was already
 // partially placed must still complete — its straggler adopts the domain its
-// bound siblings sit in (not a fresh best-fit that could strand them), and the
+// bound siblings sit in (not a fresh best-fit that could split the gang), and the
 // rebuilt reservation accounts for those already-bound members at the gate.
 //
 // We model "a prior instance placed 2 of a 3-member gang" by creating those two
@@ -534,7 +534,7 @@ func TestGangRecoversAfterSchedulerRestart(t *testing.T) {
 // TestSurplusPodJoinsCompletedGang: once a gang has met minMember and bound, a
 // further member (a pod beyond minMember, or one recreated into the running gang
 // by a controller) must still schedule — the gate counts the already-bound
-// siblings of the now-committed gang instead of wedging the newcomer. Without
+// siblings of the now-committed gang instead of leaving the newcomer waiting forever. Without
 // the committed-gang bound-count, such a pod would wait out its timeout forever
 // because it sees zero waiting siblings.
 func TestSurplusPodJoinsCompletedGang(t *testing.T) {
@@ -567,11 +567,11 @@ func TestSurplusPodJoinsCompletedGang(t *testing.T) {
 		waitForPodBound(t, tc, ns, name, 30*time.Second)
 	}
 
-	// Now the surplus 3rd member: must join the committed gang, not wedge.
+	// Now the surplus 3rd member: must join the committed gang, not wait forever.
 	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, makeGangPod("sp-2", ns, "gang"), metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create surplus pod sp-2: %v", err)
 	}
-	// It must bind (not wedge) into the gang's domain; which of a's free nodes it
+	// It must bind (not wait forever) into the gang's domain; which of a's free nodes it
 	// lands on is the scheduler's choice.
 	node := waitForPodBound(t, tc, ns, "sp-2", 30*time.Second)
 	if d := domainOfNode(t, tc, node); d != "a" {
@@ -581,11 +581,11 @@ func TestSurplusPodJoinsCompletedGang(t *testing.T) {
 
 // TestNoFitGangReschedulesWhenCapacityFrees is the availability guarantee: a gang
 // that fits no domain is Unschedulable (resolvable), so when real capacity frees
-// it reschedules PROMPTLY via the requeue hints — it is not stuck until the slow
+// it reschedules PROMPTLY via the requeue hints — it does not wait for the slow
 // periodic flush.
 //
 // Note the FORCE delete (grace 0): envtest has no kubelet, so an ordinary delete
-// leaves a pod stuck Terminating and its resources never free — the capacity has
+// leaves a pod in Terminating forever and its resources never free — the capacity has
 // to be removed for real for this to test anything.
 func TestNoFitGangReschedulesWhenCapacityFrees(t *testing.T) {
 	const ns = "gang-nofit-recover"

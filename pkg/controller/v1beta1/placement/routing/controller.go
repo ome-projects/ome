@@ -709,7 +709,6 @@ func buildSpec(
 		// share for heterogeneous hardware. A nil reachability verdict does not
 		// gate — probing off, or no verdict yet.
 		clusters[i] = ClusterCapacity{
-			Cluster:   c.Cluster,
 			Allocated: c.AdmittedReplicas,
 			Ready:     c.ReadyReplicas,
 			Factor:    capacityFactor(isvc, c.Cluster),

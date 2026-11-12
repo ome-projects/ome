@@ -129,7 +129,7 @@ func TestPlannedMemberAuthority(t *testing.T) {
 			if tt.editCandidate != nil {
 				tt.editCandidate(candidate)
 			}
-			err := r.placePlannedOn(ctx, source, *candidate)
+			err := r.placePlannedMember(ctx, source, *candidate, false, nil)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("apply error = %v, want error %t", err, tt.wantErr)
 			}

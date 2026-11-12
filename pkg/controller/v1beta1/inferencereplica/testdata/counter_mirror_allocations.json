@@ -1,0 +1,20 @@
+{
+  "recordedOn": {
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The mirror of the publication's phase and pod counters onto the rows of the pass's copy at the end of one status write over a replica at rest, every Instance Ready on the spec revision with every pod serving, allocates once whatever the shape: the array the rows' node lists are cut from, each list capped at its own length, 66 KB at 4,000 single-pod Instances and 66 KB at 500 gangs of eight (4,000 names each), 16 KB at 1,000, 22 KB at 160 gangs of eight, 57 KB at 1,725 gangs of two. A publication built from the rows lists them in their stored order, so each row's entry is read at the row's own position, with no index built. Before, the mirror copied every entry into a map by Instance, one allocation per entry since an entry is larger than a map holds in place, and copied each entry's node list onto its row: 8,017 allocations and 980 KB at 4,000 Instances, 2,005 and 245 KB at 1,000, 323 and 56 KB at 160 gangs of eight, 1,003 and 178 KB at 500 gangs of eight, 3,455 and 423 KB at 1,725 gangs of two.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/160x8/allocations": 1,
+    "gang/160x8/bytes": 21760,
+    "gang/1725x2/allocations": 1,
+    "gang/1725x2/bytes": 57344,
+    "gang/500x8/allocations": 1,
+    "gang/500x8/bytes": 65536,
+    "readySince/1000/allocations": 1,
+    "readySince/1000/bytes": 16384,
+    "readySince/4000/allocations": 1,
+    "readySince/4000/bytes": 65536
+  }
+}

@@ -46,27 +46,40 @@ func ClusterRuntimeFetcher(c client.Reader) Fetcher {
 // never a parent, so it reads as not found.
 func NamespacedRuntimeFetcher(c client.Reader, namespace string) Fetcher {
 	return func(ctx context.Context, name string) (*RuntimeRef, error) {
-		sr := &v1beta1.ServingRuntime{}
-		err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, sr)
-		if err == nil {
-			return NamespacedRuntimeRef(sr), nil
+		ref, err := fetchNamespacedRuntime(ctx, c, namespace, name)
+		if errors.Is(err, ErrParentNotFound) {
+			return fetchClusterRuntime(ctx, c, name)
 		}
-		if !apierrors.IsNotFound(err) {
-			return nil, err
-		}
-		return fetchClusterRuntime(ctx, c, name)
+		return ref, err
 	}
 }
 
-// fetchClusterRuntime reads one ClusterServingRuntime. A missing runtime
-// reads as ErrParentNotFound; any other read error passes through as it is.
+// fetchNamespacedRuntime reads one ServingRuntime. A missing runtime reads
+// as ErrParentNotFound; any other read error passes through as it is.
+func fetchNamespacedRuntime(ctx context.Context, c client.Reader, namespace, name string) (*RuntimeRef, error) {
+	sr := &v1beta1.ServingRuntime{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, sr); err != nil {
+		return nil, missingAsParentNotFound(err)
+	}
+	return NamespacedRuntimeRef(sr), nil
+}
+
+// fetchClusterRuntime reads one ClusterServingRuntime with the same
+// not-found rule.
 func fetchClusterRuntime(ctx context.Context, c client.Reader, name string) (*RuntimeRef, error) {
 	csr := &v1beta1.ClusterServingRuntime{}
 	if err := c.Get(ctx, types.NamespacedName{Name: name}, csr); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil, errors.Join(ErrParentNotFound, err)
-		}
-		return nil, err
+		return nil, missingAsParentNotFound(err)
 	}
 	return ClusterRuntimeRef(csr), nil
+}
+
+// missingAsParentNotFound turns a not-found read error into one that
+// errors.Is matches as ErrParentNotFound; any other error passes through
+// as it is.
+func missingAsParentNotFound(err error) error {
+	if apierrors.IsNotFound(err) {
+		return errors.Join(ErrParentNotFound, err)
+	}
+	return err
 }

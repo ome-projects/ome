@@ -1008,7 +1008,7 @@ func TestDetectUpdateTrigger_PhaseUpdatingAlwaysTrue(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v1")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1030,7 +1030,7 @@ func TestDetectUpdateTrigger_PhaseMigratingSuppressed(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v2")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1056,7 +1056,7 @@ func TestDetectUpdateTrigger_OperationMigrateSuppressed(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v2")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1084,7 +1084,7 @@ func TestDetectUpdateTrigger_FailedMigrateRowStaysClaimed(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v2")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1122,7 +1122,7 @@ func TestDetectUpdateTrigger_GangSurgeTargetMarkerSuppressed(t *testing.T) {
 	target := legacyTargetSpecImage("llama:v2")
 	tcr := legacyEnsureTargetCR(t, c, isvc, target)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1147,7 +1147,7 @@ func TestDetectUpdateTrigger_RunningRevisionMatchesTarget(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1175,7 +1175,7 @@ func TestDetectUpdateTrigger_PhaseFailedRetriggersOnMismatch(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1198,7 +1198,7 @@ func TestDetectUpdateTrigger_PodOnOtherRevisionTriggersUpdate(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1220,7 +1220,7 @@ func TestDetectUpdateTrigger_UnlabelledPodTriggersUpdate(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1245,7 +1245,7 @@ func TestDetectUpdateTrigger_TargetRevisionPodsBackfillRunningRevision(t *testin
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -1272,7 +1272,7 @@ func TestDetectUpdateTrigger_PhaseCreatingNotInterruptible(t *testing.T) {
 	input := legacyTestInput(isvc, c, workload.ComponentEngine)
 	plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 
-	trigger, _, err := DetectUpdateTrigger(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr)
+	trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
 	if err != nil {
 		t.Fatalf("detect: %v", err)
 	}
@@ -3226,6 +3226,54 @@ func TestRolledInstanceNotServing_RestartedRunnerServesOnceItHoldsReadyForTheWin
 	}
 }
 
+// TestRolledInstanceNotServing_NoReadyAnchorReadsTheRunnersRestarts covers
+// the serving bar for a promoted pod whose row records no time of entry
+// into Ready. Nothing places a restart against that entry, so any restart
+// on the pod's record is read as the runner come back: it holds the slot
+// while the pod is down and while it is Ready again for less than the
+// window, and serves once it has held Ready for the window; with no
+// window configured, Ready again is serving. A pod with no restart on
+// record is read off its serving state alone.
+func TestRolledInstanceNotServing_NoReadyAnchorReadsTheRunnersRestarts(t *testing.T) {
+	const target = "llama-70b-engine-v2hash"
+	readyAgain := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	row := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: target}
+	cases := []struct {
+		name      string
+		restarted bool
+		down      bool
+		window    int32
+		now       time.Time
+		held      bool
+		wait      time.Duration
+		reason    string
+	}{
+		{name: "restarted, Ready again for less than the window", restarted: true, window: 30, now: readyAgain.Add(15 * time.Second),
+			held: true, wait: 15 * time.Second, reason: "restarted, with no record of when the Instance entered Ready, Ready again for less than the 30s window"},
+		{name: "restarted, the new run not Ready yet", restarted: true, down: true, window: 30, now: readyAgain.Add(15 * time.Second),
+			held: true, reason: "restarted, with no record of when the Instance entered Ready"},
+		{name: "restarted, Ready again for the window", restarted: true, window: 30, now: readyAgain.Add(30 * time.Second)},
+		{name: "restarted, no window configured", restarted: true, now: readyAgain.Add(time.Second)},
+		{name: "never restarted, Ready for less than the window", window: 30, now: readyAgain.Add(15 * time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := restartedRunnerPod(readyAgain.Add(-45*time.Second), readyAgain, false, tc.down)
+			if !tc.restarted {
+				pod.Status.ContainerStatuses[0].RestartCount = 0
+				pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{}
+			}
+			held, wait, reason := RolledInstanceNotServing(row, target, time.Time{}, []*corev1.Pod{pod}, 1, tc.window, tc.now)
+			if held != tc.held || wait != tc.wait {
+				t.Fatalf("RolledInstanceNotServing = (%v, %s, %q), want held=%v wait=%s", held, wait, reason, tc.held, tc.wait)
+			}
+			if !strings.Contains(reason, tc.reason) {
+				t.Fatalf("the reason must name %q, got %q", tc.reason, reason)
+			}
+		})
+	}
+}
+
 // TestRolledInstanceNotServing_RebuiltSetIsReadByItsOwnServing pins the
 // roll's reading of a set built after the row entered Ready. A row
 // mid-rebuild keeps the ReadySince of the set it lost until the new set is
@@ -3906,6 +3954,323 @@ func TestRebuiltAfterFailure_WindowBoundsTheRollAndNotTheRetryRecord(t *testing.
 			}
 			if record != tc.record {
 				t.Fatalf("the retry record's reading (window=%d) = %v, want %v", tc.window, record, tc.record)
+			}
+		})
+	}
+}
+
+// TestRevisionNumber_ReadsTheNumberAndReportsAGoneRevision: the number a
+// ControllerRevision was minted with is read through the reader, a
+// revision that is gone reads as not found with no error, and any other
+// read failure is returned.
+func TestRevisionNumber_ReadsTheNumberAndReportsAGoneRevision(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add appsv1: %v", err)
+	}
+	minted := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "svc-engine-second", Namespace: "ns"}, Revision: 2}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(minted).Build()
+
+	number, found, err := RevisionNumber(context.Background(), c, "ns", "svc-engine-second")
+	if err != nil || !found || number != 2 {
+		t.Fatalf("RevisionNumber(minted) = (%d, %v, %v), want (2, true, nil)", number, found, err)
+	}
+	number, found, err = RevisionNumber(context.Background(), c, "ns", "svc-engine-gone")
+	if err != nil || found || number != 0 {
+		t.Fatalf("RevisionNumber(gone) = (%d, %v, %v), want (0, false, nil)", number, found, err)
+	}
+
+	failing := fake.NewClientBuilder().WithScheme(scheme).WithObjects(minted).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return errors.New("apiserver unavailable")
+		}}).Build()
+	if _, _, err := RevisionNumber(context.Background(), failing, "ns", "svc-engine-second"); err == nil || !strings.Contains(err.Error(), "apiserver unavailable") {
+		t.Fatalf("RevisionNumber over a failing reader = %v, want the read failure", err)
+	}
+}
+
+// TestInstanceNotServingOutsideRoll_NoReadyAnchorReadsTheRunnersRestarts
+// covers the window reading for a stable Instance whose row records no time
+// of entry into Ready: a runner with a restart on record counts as down
+// while it is Ready again for less than the window, with the time left as
+// the wait, and serves once it has held Ready for the window; with no
+// window configured, Ready again is serving. A runner with no restart on
+// record is read off its serving state alone.
+func TestInstanceNotServingOutsideRoll_NoReadyAnchorReadsTheRunnersRestarts(t *testing.T) {
+	const target = "llama-70b-engine-v2hash"
+	readyAgain := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	row := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: "llama-70b-engine-v1hash"}
+	cases := []struct {
+		name      string
+		restarted bool
+		down      bool
+		window    int32
+		now       time.Time
+		held      bool
+		wait      time.Duration
+	}{
+		{name: "restarted, Ready again for less than the window", restarted: true, window: 30, now: readyAgain.Add(10 * time.Second), held: true, wait: 20 * time.Second},
+		{name: "restarted, the new run not Ready yet", restarted: true, down: true, window: 30, now: readyAgain.Add(10 * time.Second), held: true},
+		{name: "restarted, Ready again for the window", restarted: true, window: 30, now: readyAgain.Add(30 * time.Second)},
+		{name: "restarted, no window configured", restarted: true, now: readyAgain.Add(time.Second)},
+		{name: "never restarted, Ready for less than the window", window: 30, now: readyAgain.Add(10 * time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := restartedRunnerPod(readyAgain.Add(-45*time.Second), readyAgain, false, tc.down)
+			if !tc.restarted {
+				pod.Status.ContainerStatuses[0].RestartCount = 0
+				pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{}
+			}
+			held, wait, reason := InstanceNotServingOutsideRoll(row, target, []*corev1.Pod{pod}, tc.window, tc.now)
+			if held != tc.held || wait != tc.wait {
+				t.Fatalf("InstanceNotServingOutsideRoll = (%v, %s, %q), want held=%v wait=%s", held, wait, reason, tc.held, tc.wait)
+			}
+		})
+	}
+}
+
+// TestDetectUpdateTrigger_FailedRowOnItsRevisionReadsItsPods: a Failed row
+// that claims no verb and runs the revision it targets has nothing for the
+// revision comparison to roll, so its pods decide. A live pod the scheduler
+// still refuses is the set of a recreate attempt the placement grace ended,
+// and the roll opens a fresh attempt over it at the same revision. A set
+// with a placement is left to the Create pass to prove, and an empty set to
+// its fresh start.
+func TestDetectUpdateTrigger_FailedRowOnItsRevisionReadsItsPods(t *testing.T) {
+	refused := func(pod *corev1.Pod) {
+		pod.Status.Phase = corev1.PodPending
+		pod.Status.Conditions = []corev1.PodCondition{{
+			Type:               corev1.PodScheduled,
+			Status:             corev1.ConditionFalse,
+			Reason:             corev1.PodReasonUnschedulable,
+			Message:            "0/4 nodes are available: 4 Insufficient example.com/accelerator.",
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-20 * time.Minute)),
+		}}
+	}
+	placed := func(pod *corev1.Pod) {
+		pod.Status.Phase = corev1.PodPending
+		pod.Spec.NodeName = "node-0"
+		pod.Status.Conditions = []corev1.PodCondition{{
+			Type:               corev1.PodScheduled,
+			Status:             corev1.ConditionTrue,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-20 * time.Minute)),
+		}}
+	}
+	cases := []struct {
+		name    string
+		shape   func(*corev1.Pod)
+		trigger bool
+		// leftover adds a refused pod of a replaced revision beside the set.
+		leftover bool
+	}{
+		{name: "a pod the scheduler refuses re-opens the roll", shape: refused, trigger: true},
+		{name: "a pod with a placement waits for the Create pass", shape: placed, trigger: false},
+		{name: "a refused pod of a replaced revision beside a placed set moves nothing", shape: placed, leftover: true, trigger: false},
+		{name: "no pod at all is the fresh start's", shape: nil, trigger: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			isvc, ir := legacyISVCReadyAtIncarnation("llama-70b", "prod", 3)
+			objs := []client.Object{isvc, ir}
+			var pod *corev1.Pod
+			if tc.shape != nil {
+				pod = legacyPodAtIncarnation(isvc, 0, 3, false, false)
+				tc.shape(pod)
+				objs = append(objs, pod)
+			}
+			if tc.leftover {
+				left := legacyPodAtIncarnation(isvc, 0, 2, false, false)
+				left.Name += "-replaced"
+				left.Labels[query.LabelRevisionHash] = "0ldrev0ld"
+				refused(left)
+				objs = append(objs, left)
+			}
+			c := legacyNewFakeClient(t, objs...)
+			tcr := legacyEnsureTargetCR(t, c, isvc, legacyTargetSpecImage("llama:v1"))
+			if pod != nil {
+				legacyStampPodRevisionHash(t, c, pod, tcr.Name)
+			}
+			st := ir.Status.InstanceStatuses
+			st[0].Phase = v1beta1.OMENativeInstanceFailed
+			st[0].RunningRevision = tcr.Name
+			st[0].Operation = nil
+			if err := c.Status().Update(context.Background(), ir); err != nil {
+				t.Fatalf("seed status: %v", err)
+			}
+			input := legacyTestInput(isvc, c, workload.ComponentEngine)
+			plan := legacyComponentPlan(workload.UpdateStrategyRecreatePod, nil)
+
+			trigger, _, err := DetectUpdateTriggerWithPods(context.Background(), legacyTestDeps(c), input, plan, plan.Instances[0], tcr, nil)
+			if err != nil {
+				t.Fatalf("detect: %v", err)
+			}
+			if trigger != tc.trigger {
+				t.Errorf("trigger = %v, want %v", trigger, tc.trigger)
+			}
+		})
+	}
+}
+
+// TestServingInstancesDown_ReadsAnInstanceUpOnlyInsideTheWindow covers the
+// Instances a published serving count carries as serving that are down
+// all the same: a runner Ready again for less than the window after a
+// restart since Ready is listed with the time left; one Ready again for
+// the window is not; an update attempt or a repair opened on the row
+// since the counters were written is listed, a surge or a stopped attempt
+// is not; a pod that left rotation with no attempt on its row is left to
+// the published count and the caller's own delta; one the counters do not
+// carry as serving is not listed whatever its pods say; a runner that
+// never restarted is read off its serving state alone.
+func TestServingInstancesDown_ReadsAnInstanceUpOnlyInsideTheWindow(t *testing.T) {
+	readySince := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	readyAgain := readySince.Add(45 * time.Second)
+	row := func(serving int32) workload.InstanceStatus {
+		return workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: "llama-70b-engine-v1hash",
+			PodCount: 1, ServingPodCount: serving, ReadySince: &metav1.Time{Time: readySince}}
+	}
+	attempt := func(phase workload.InstancePhase, step string) workload.InstanceStatus {
+		r := row(1)
+		r.Phase = phase
+		if step != "" {
+			r.Operation = &workload.InstanceOperation{ID: "attempt", Type: workload.InstanceOperationUpdate, Step: step, TargetRevision: "llama-70b-engine-v2hash"}
+		}
+		return r
+	}
+	one := func(*workload.InstanceStatus) int32 { return 1 }
+	cases := []struct {
+		name      string
+		row       workload.InstanceStatus
+		restarted bool
+		down      bool
+		now       time.Time
+		listed    bool
+		wait      time.Duration
+		reason    string
+	}{
+		{name: "Ready again for less than the window", row: row(1), restarted: true, now: readyAgain.Add(10 * time.Second), listed: true, wait: 20 * time.Second,
+			reason: "Instance 0 not serving (pod llama-70b-engine-0-0 restarted since Ready, Ready again for less than the 30s window (20s left))"},
+		{name: "Ready again for the window", row: row(1), restarted: true, now: readyAgain.Add(30 * time.Second)},
+		{name: "a drain-first update attempt the counters do not show", row: attempt(workload.InstancePhaseUpdating, workload.UpdateStepDrain), down: true, now: readyAgain.Add(10 * time.Second), listed: true,
+			reason: "Instance 0 not serving (an update attempt in flight takes its pods out of rotation)"},
+		{name: "a repair the counters do not show", row: attempt(workload.InstancePhaseRestarting, ""), down: true, now: readyAgain.Add(10 * time.Second), listed: true,
+			reason: "Instance 0 not serving (a repair in flight rebuilds its pods)"},
+		{name: "a surge attempt keeps its old pod in rotation", row: attempt(workload.InstancePhaseUpdating, workload.UpdateStepSurge), now: readyAgain.Add(10 * time.Second)},
+		{name: "a stopped attempt moves nothing", row: attempt(workload.InstancePhaseUpdating, workload.UpdateStepParked), now: readyAgain.Add(10 * time.Second)},
+		{name: "left rotation with no attempt on its row", row: row(1), restarted: true, down: true, now: readyAgain.Add(10 * time.Second)},
+		{name: "published as not serving", row: row(0), restarted: true, now: readyAgain.Add(10 * time.Second)},
+		{name: "never restarted", row: row(1), now: readyAgain.Add(10 * time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := restartedRunnerPod(readySince, readyAgain, false, tc.down)
+			if !tc.restarted {
+				pod.Status.ContainerStatuses[0].RestartCount = 0
+				pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{}
+				pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(readySince.Add(-time.Minute))
+			}
+			indices, reasons, wait := ServingInstancesDown([]workload.InstanceStatus{tc.row}, map[int32][]*corev1.Pod{0: {pod}}, one, "", time.Time{}, 30, tc.now)
+			if !tc.listed {
+				if len(indices) != 0 || len(reasons) != 0 || wait != 0 {
+					t.Fatalf("ServingInstancesDown = (%v, %q, %s), want nothing listed", indices, reasons, wait)
+				}
+				return
+			}
+			if len(indices) != 1 || indices[0] != 0 || wait != tc.wait || len(reasons) != 1 || reasons[0] != tc.reason {
+				t.Fatalf("ServingInstancesDown = (%v, %q, %s), want Instance 0 with wait %s and %q", indices, reasons, wait, tc.wait, tc.reason)
+			}
+		})
+	}
+}
+
+// TestInstanceServingUnproven_ReadsARunnerUpOnlyInsideTheWindow covers the
+// reading a drain-first start skips the group gate on: a Ready row whose
+// routed pod is Ready again for less than the window after a restart since
+// Ready is up only between its crashes; one Ready again for the window is
+// serving; one whose pod is down is down outright, not unproven; a row not
+// Ready is never read this way.
+func TestInstanceServingUnproven_ReadsARunnerUpOnlyInsideTheWindow(t *testing.T) {
+	readySince := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	readyAgain := readySince.Add(45 * time.Second)
+	ready := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: "llama-70b-engine-v1hash", ReadySince: &metav1.Time{Time: readySince}}
+	failed := &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseFailed, RunningRevision: "llama-70b-engine-v1hash", ReadySince: &metav1.Time{Time: readySince}}
+	cases := []struct {
+		name     string
+		row      *workload.InstanceStatus
+		down     bool
+		now      time.Time
+		unproven bool
+	}{
+		{name: "Ready again for less than the window", row: ready, now: readyAgain.Add(10 * time.Second), unproven: true},
+		{name: "Ready again for the window", row: ready, now: readyAgain.Add(30 * time.Second)},
+		{name: "the new run not Ready yet", row: ready, down: true, now: readyAgain.Add(10 * time.Second)},
+		{name: "a row not Ready", row: failed, now: readyAgain.Add(10 * time.Second)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := restartedRunnerPod(readySince, readyAgain, false, tc.down)
+			got, wait, reason := InstanceServingUnproven(tc.row, []*corev1.Pod{pod}, 30, tc.now)
+			if got != tc.unproven {
+				t.Fatalf("InstanceServingUnproven = (%v, %s, %q), want %v", got, wait, reason, tc.unproven)
+			}
+			if got && (wait != 20*time.Second || !strings.Contains(reason, "restarted since Ready, Ready again for less than the 30s window (20s left)")) {
+				t.Fatalf("InstanceServingUnproven = (%v, %s, %q), want the 20s left and the pod named", got, wait, reason)
+			}
+		})
+	}
+}
+
+// TestServingInstancesDown_ReadsAFailureAgainstTheTargetsBirth covers a
+// serving row whose record names a death of an earlier set: a gang
+// repaired on the old revision, then rolled, carries that failure on its
+// row while its fresh set on the target comes up inside the window. On the
+// target the failure is read against the target's birth, as the roll reads
+// it, so a death older than the target belongs to the set of an earlier
+// revision and the Instance is read off its serving state; a death after the target was born
+// is a rebuild still proving itself, listed with the time left. Off the
+// target, or with no target known, every failure the row records is placed.
+func TestServingInstancesDown_ReadsAFailureAgainstTheTargetsBirth(t *testing.T) {
+	const target = "llama-70b-engine-v2hash"
+	failedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	created := failedAt.Add(21 * time.Second)
+	readyAgain := created.Add(6 * time.Second)
+	now := readyAgain.Add(10 * time.Second)
+	row := func(running string) workload.InstanceStatus {
+		return workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: running,
+			PodCount: 1, ServingPodCount: 1, ReadySince: &metav1.Time{Time: readyAgain},
+			LastFailure: &workload.InstanceTermination{PodName: "llama-70b-engine-0-0", ContainerName: constants.MainContainerName, Reason: "Error", Time: metav1.NewTime(failedAt)}}
+	}
+	one := func(*workload.InstanceStatus) int32 { return 1 }
+	rebuilt := "Instance 0 not serving (pod llama-70b-engine-0-0 rebuilt after the failure recorded at 2026-01-02T03:04:05Z, Ready again for less than the 30s window (20s left))"
+	cases := []struct {
+		name       string
+		row        workload.InstanceStatus
+		target     string
+		targetBorn time.Time
+		listed     bool
+	}{
+		{name: "on the target, the failure older than the target", row: row(target), target: target, targetBorn: failedAt.Add(10 * time.Second)},
+		{name: "on the target, the failure after the target was born", row: row(target), target: target, targetBorn: failedAt.Add(-time.Minute), listed: true},
+		{name: "off the target", row: row("llama-70b-engine-v1hash"), target: target, targetBorn: failedAt.Add(10 * time.Second), listed: true},
+		{name: "no target known", row: row(target), listed: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := restartedRunnerPod(readyAgain, readyAgain, false, false)
+			pod.CreationTimestamp = metav1.NewTime(created)
+			pod.Status.ContainerStatuses[0].RestartCount = 0
+			pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{}
+			pod.Status.ContainerStatuses[0].State.Running.StartedAt = metav1.NewTime(created)
+			indices, reasons, wait := ServingInstancesDown([]workload.InstanceStatus{tc.row}, map[int32][]*corev1.Pod{0: {pod}}, one, tc.target, tc.targetBorn, 30, now)
+			if !tc.listed {
+				if len(indices) != 0 || len(reasons) != 0 || wait != 0 {
+					t.Fatalf("ServingInstancesDown = (%v, %q, %s), want nothing listed: the failure belongs to the set of an earlier revision", indices, reasons, wait)
+				}
+				return
+			}
+			if len(indices) != 1 || indices[0] != 0 || wait != 20*time.Second || len(reasons) != 1 || reasons[0] != rebuilt {
+				t.Fatalf("ServingInstancesDown = (%v, %q, %s), want Instance 0 with wait 20s and %q", indices, reasons, wait, rebuilt)
 			}
 		})
 	}

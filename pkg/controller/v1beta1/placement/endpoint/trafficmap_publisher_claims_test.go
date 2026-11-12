@@ -363,7 +363,7 @@ func TestTrafficMapPublisher_SecondMapClaimsATakenTarget_RejectedFromLiveState(t
 
 func TestTrafficMapPublisher_ClaimsRecordedButFinalizerMissing_RestoresItFirst(t *testing.T) {
 	owner, trafficMap := publisherTestObjects()
-	owner.Generation++
+	trafficMap.Spec.ObservedISVCGeneration = owner.Generation + 1
 	trafficMap.Status.Publisher = &v1beta1.TrafficMapPublisherStatus{
 		PublisherName: "example-publisher", ClaimedTargets: []string{"target"},
 	}

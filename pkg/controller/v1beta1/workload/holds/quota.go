@@ -8,14 +8,14 @@ import (
 
 // quotaHold is admission refusing the operation's pod creates for lack
 // of quota. The Instance is queued behind capacity an operator controls,
-// not stuck, so the token parks the InstanceReadyTimeout clock.
+// so the token stops the InstanceReadyTimeout clock.
 //
 // The one authority whose condition is not readable from the cluster: it
 // is an apiserver answer to a call the create pass made, and no later
 // pass can ask for it again. The create site records the refusal on the
 // operation (status.RecordCapacityRefusal) and this reads the record, which
 // is why the token lands on the pass after the refusal. The deadline
-// does not wait for it — the park is anchored to the recorded refusal
+// does not wait for it: the stop is anchored to the recorded refusal
 // (types.OperationCapacityRefused), so the clock stops from the moment
 // admission said no.
 var quotaHold = authority{

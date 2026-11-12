@@ -5,42 +5,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"time"
 
 	"sigs.k8s.io/ome/pkg/xet"
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
 
-	"sigs.k8s.io/ome/pkg/hfutil/hub"
 	"sigs.k8s.io/ome/pkg/logging"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
 )
 
 type HFToOCIReplicator struct {
 	Logger           logging.Interface
-	Config           HFToOCIReplicatorConfig
+	Dependencies     Dependencies
 	ReplicationInput common.ReplicationInput
-}
-
-type HFToOCIReplicatorConfig struct {
-	LocalPath                      string
-	NumConnections                 int
-	ChecksumConfig                 *common.ChecksumConfig
-	HubClient                      *xet.Client
-	OCIOSDataStore                 *ociobjectstore.OCIOSDataStore
-	HFDownloadTimeout              time.Duration
-	HFDownloadStaleProgressTimeout time.Duration
 }
 
 func (r *HFToOCIReplicator) Replicate(objects []common.ReplicationObject) error {
 	r.Logger.Info("Starting replication to target")
 	// Download
-	tempDirPath := filepath.Join(r.Config.LocalPath, ReplicaWorkspacePath)
-	downloadPath, err := downloadFromHFFunc(r.ReplicationInput, r.Config.HubClient, tempDirPath, hfDownloadOptions{
-		DownloadTimeout:      r.Config.HFDownloadTimeout,
-		StaleProgressTimeout: r.Config.HFDownloadStaleProgressTimeout,
-	}, r.Logger)
+	tempDirPath := filepath.Join(r.Dependencies.LocalPath, ReplicaWorkspacePath)
+	downloadPath, err := downloadFromHF(r.ReplicationInput, r.Dependencies, tempDirPath, r.Logger)
 	if err != nil {
 		r.Logger.Errorf("Failed to download model %s from HuggingFace: %v", r.ReplicationInput.Source.BucketName, err)
 		return err
@@ -48,14 +32,7 @@ func (r *HFToOCIReplicator) Replicate(objects []common.ReplicationObject) error 
 	r.Logger.Infof("Successfully downloaded model %s from HF to %s ", r.ReplicationInput.Source.BucketName, downloadPath)
 
 	// Upload
-	if err = uploadDirectoryToOCIOSDataStoreFunc(
-		r.Config.OCIOSDataStore,
-		r.ReplicationInput.Target,
-		tempDirPath,
-		r.Config.ChecksumConfig,
-		len(objects),
-		r.Config.NumConnections,
-	); err != nil {
+	if err = uploadDirectory(r.Dependencies, r.ReplicationInput.Target, tempDirPath, len(objects)); err != nil {
 		r.Logger.Errorf("Failed to upload files under %s to OCI Object Storage %v: %v", tempDirPath, r.ReplicationInput.Target, err)
 		return err
 	}
@@ -69,33 +46,36 @@ func (r *HFToOCIReplicator) Replicate(objects []common.ReplicationObject) error 
 	return nil
 }
 
-func downloadFromHF(input common.ReplicationInput, hubClient *xet.Client, downloadDir string, opts hfDownloadOptions, logger logging.Interface) (string, error) {
+// downloadFromHF downloads the snapshot of the source repository at the source revision into
+// downloadDir, under the dependencies' timeouts.
+func downloadFromHF(input common.ReplicationInput, dependencies Dependencies, downloadDir string, logger logging.Interface) (string, error) {
 	req := &xet.SnapshotRequest{
 		RepoID:   input.Source.BucketName,
-		RepoType: hub.RepoTypeModel,
+		RepoType: xet.RepoTypeModel,
 		Revision: input.Source.Prefix,
 		LocalDir: downloadDir,
 	}
 
-	path, err := downloadSnapshotWithTimeouts(hubClient, req, opts, logger)
+	path, err := downloadSnapshotWithTimeouts(dependencies.HubClient, req, hfDownloadOptions{
+		DownloadTimeout:      dependencies.DownloadTimeout,
+		StaleProgressTimeout: dependencies.StaleProgressTimeout,
+	}, logger)
 	if err != nil {
 		logger.Errorf("Failed to download snapshot: %v", err)
 	}
 	return path, err
 }
 
-type UploadTask struct {
+type uploadTask struct {
 	targetObj ociobjectstore.ObjectURI
 	filePath  string
 }
 
-func uploadDirectoryToOCIOSDataStore(
-	ociOSDataStore *ociobjectstore.OCIOSDataStore,
-	object ociobjectstore.ObjectURI,
-	localDirectoryPath string,
-	checksumConfig *common.ChecksumConfig,
-	numberOfObjects int,
-	numberOfConnections int) error {
+// uploadDirectory uploads every file under localDirectoryPath to the target store, under the
+// object's prefix and with its checksum as metadata, on as many workers as there are
+// connections. numberOfObjects is the source's object count; nothing is uploaded when it is zero.
+func uploadDirectory(dependencies Dependencies, object ociobjectstore.ObjectURI, localDirectoryPath string, numberOfObjects int) error {
+	ociOSDataStore := dependencies.TargetStore
 	if ociOSDataStore == nil {
 		return fmt.Errorf("target ociOSDataStore is nil")
 	}
@@ -106,30 +86,21 @@ func uploadDirectoryToOCIOSDataStore(
 		return nil
 	}
 
-	tasks := make(chan UploadTask, numberOfObjects)
+	tasks := make(chan uploadTask, numberOfObjects)
 	errCh := make(chan error, numberOfObjects)
-	checksumLimiter := newChecksumLimiter(checksumConfig)
+	checksumLimiter := newChecksumLimiter(dependencies.Checksum)
+	runWorkers(tasks, dependencies.Connections, func(task uploadTask) {
+		task.targetObj.Metadata = getObjectMetadataWithChecksumLimit(
+			dependencies.Checksum,
+			task.filePath,
+			ociOSDataStore.Config.AnotherLogger,
+			checksumLimiter,
+		)
 
-	var wg sync.WaitGroup
-	// Start worker goroutines
-	for i := 0; i < numberOfConnections; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for task := range tasks {
-				task.targetObj.Metadata = getObjectMetadataWithChecksumLimit(
-					checksumConfig,
-					task.filePath,
-					ociOSDataStore.Config.AnotherLogger,
-					checksumLimiter,
-				)
-
-				if err := uploadObjectToOCIOSDataStoreFunc(ociOSDataStore, task.targetObj, task.filePath); err != nil {
-					errCh <- fmt.Errorf("upload failed for %s: %w", task.filePath, err)
-				}
-			}
-		}()
-	}
+		if err := dependencies.Transfer.Upload(ociOSDataStore, task.targetObj, task.filePath); err != nil {
+			errCh <- fmt.Errorf("upload failed for %s: %w", task.filePath, err)
+		}
+	}, func() { close(errCh) })
 
 	err := filepath.WalkDir(localDirectoryPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -164,22 +135,25 @@ func uploadDirectoryToOCIOSDataStore(
 			ObjectName: objectName,
 		}
 
-		tasks <- UploadTask{targetObj: targetObj, filePath: filePath}
+		tasks <- uploadTask{targetObj: targetObj, filePath: filePath}
 		return nil
 	})
-
 	close(tasks) // signal no more work
-	wg.Wait()    // wait for workers to finish
-	close(errCh) // no more errors to collect
+
+	// errCh closes once every worker has finished; draining it waits for them.
+	var uploadErrors []error
+	for uploadErr := range errCh {
+		uploadErrors = append(uploadErrors, uploadErr)
+	}
 
 	if err != nil {
 		ociOSDataStore.Config.AnotherLogger.Errorf("Failed to upload files: %+v", err)
 		return err
 	}
 
-	if len(errCh) > 0 {
-		for err := range errCh {
-			ociOSDataStore.Config.AnotherLogger.Errorf("error when uploading a file: %+v", err)
+	if len(uploadErrors) > 0 {
+		for _, uploadErr := range uploadErrors {
+			ociOSDataStore.Config.AnotherLogger.Errorf("error when uploading a file: %+v", uploadErr)
 		}
 		return fmt.Errorf("some files failed to upload")
 	}

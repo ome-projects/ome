@@ -12,9 +12,9 @@ package workload_test
 //     escalation, disposition, deadline parking, migrate).
 //   - The component-level revision pair — CurrentRevision /
 //     UpdateRevision — is specTarget-scoped and written ONLY by the IR
-//     controller: CurrentRevision in buildPromoteCurrentRevision and,
+//     controller: CurrentRevision in promoteCurrentRevisionOverPods and,
 //     beside a moving UpdateRevision, in buildRecordUpdateRevision;
-//     UpdateRevision in aggregateAndWriteStatus and
+//     UpdateRevision in publish and
 //     buildRecordUpdateRevision, plus their in-memory mirror sites. The
 //     pair is written as one pair wherever UpdateRevision moves, so no
 //     stored status reads current equal to update while an Instance is
@@ -87,17 +87,17 @@ type allowedTransitionWrite struct {
 // an owned decision, never a second decision-maker.
 var transitionWriteAllowlist = []allowedTransitionWrite{
 	{
+		file: "inferenceservice/reconcilers/omenative/replay/members.go", fn: "landPendingPromotion", field: "CurrentRevision", count: 1,
+		why: "the InferenceService replay driver's stand-in for the replica controller lands that " +
+			"controller's own promotion write, the current revision the rows earned at the previous " +
+			"publication, as the controller's status tail writes it; the driver is a test-only " +
+			"package no binary links and decides nothing the engine does not",
+	},
+	{
 		file: "inferenceservice/reconcilers/omenative/replay/members.go", fn: "applyPodStatus", field: "Phase", count: 1,
 		why: "the kubelet's phase on a pod the InferenceService replay driver renders for the replica " +
 			"controller it stands in for: a corev1.PodStatus field, not an Instance row's; the driver " +
 			"is a test-only package no binary links",
-	},
-	{
-		file: "inferenceservice/reconcilers/omenative/replay/members.go", fn: "publish", field: "Operation", count: 1,
-		why: "the replica controller's stand-in in the InferenceService replay driver publishes a " +
-			"surging row's attempt at step Surge, the shape the controller publishes from the " +
-			"workload's own stamp, so the pairing gates the replay driver reads treat the row as " +
-			"they treat a live one; a test-only package no binary links, deciding nothing for the workload",
 	},
 	{
 		file: "workload/escalation/escalation.go", fn: "Run", field: "UpdateRevision", count: 1,
@@ -106,14 +106,14 @@ var transitionWriteAllowlist = []allowedTransitionWrite{
 			"UpdateRevision; never persisted — not a component-pair decision",
 	},
 	{
-		file: "inferencereplica/convert.go", fn: "buildPromoteCurrentRevision", field: "CurrentRevision", count: 2,
+		file: "inferencereplica/convert.go", fn: "promoteCurrentRevisionOverPods", field: "CurrentRevision", count: 2,
 		why: "the per-pass rollup site: stamps CurrentRevision from status.CurrentRevisionFor " +
 			"(the spec target once every Instance is Ready on it, withdrawn while an Instance still " +
 			"runs another revision; persisted write), then mirrors the committed value onto the " +
 			"caller's in-memory IR (second assignment) so the deferred aggregator observes it",
 	},
 	{
-		file: "inferencereplica/convert.go", fn: "buildPromoteCurrentRevision", field: "UpdateRevision", count: 2,
+		file: "inferencereplica/convert.go", fn: "promoteCurrentRevisionOverPods", field: "UpdateRevision", count: 2,
 		why: "the rollup writes the pair as one pair: the write that moves CurrentRevision records " +
 			"the spec target as UpdateRevision too, so the withdrawal it records names the revision " +
 			"the pass writes rather than a stale one (persisted write), then mirrors the committed " +
@@ -139,13 +139,13 @@ var transitionWriteAllowlist = []allowedTransitionWrite{
 			"persisted — not a component-pair decision",
 	},
 	{
-		file: "inferencereplica/status.go", fn: "aggregateAndWriteStatus", field: "UpdateRevision", count: 1,
+		file: "inferencereplica/status.go", fn: "publishBesideRows", field: "UpdateRevision", count: 1,
 		why: "the publication's UpdateRevision stamp: restates the spec/canary target the record " +
 			"ahead of dispatch named on the component pair, and names it when that record did not " +
 			"run; per-instance transition fields stay untouched",
 	},
 	{
-		file: "inferencereplica/status.go", fn: "aggregateAndWriteStatus", field: "Phase", count: 1,
+		file: "inferencereplica/status.go", fn: "publishRows", field: "Phase", count: 1,
 		why: "persists the phase the workload publication view returned (TakeInlineV1Publication " +
 			"reads a settled Ready row by status.DemotableReady against its pods: Pending with no " +
 			"pods, Restarting while the set serves nothing; and a Failed row off its running revision, " +

@@ -1,0 +1,18 @@
+{
+  "recordedOn": {
+    "date": "2026-11-08",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The bytes of one replica's status in the form the writer selects, at 1,000 and 4,000 Instances, single-pod and gangs of eight, every row Ready. At rest with every row equal, 555 B at 1,000 and 563 B at 4,000. At rest as the manager stores it, every row carrying its own readySince, 5,633 B at 1,000 and 23,642 B at 4,000: the readySince columns store each time as whole seconds from the earliest, 5.8 B per row, where an entry per row cost 50.7 B (50,457 and 203,465 B); a gang of eight costs the same bytes per Instance as a single pod, because the three pod counts group. Mid-roll with the representative mix, 14,663 B at 1,000 and 46,458 B at 4,000. The tolerance is half a percent: the bytes are deterministic, one more byte per row on the readySince shape is 4,000 B and fails, and on the 563 B shape any change of three bytes fails, which is what that shape is for.",
+  "tolerancePercent": 0.5,
+  "budgets": {
+    "gangReadySince/1000/selected": 5633,
+    "gangReadySince/4000/selected": 23642,
+    "readySince/1000/selected": 5633,
+    "readySince/4000/selected": 23642,
+    "representative/1000/selected": 14663,
+    "representative/4000/selected": 46458,
+    "uniform/1000/selected": 555,
+    "uniform/4000/selected": 563
+  }
+}

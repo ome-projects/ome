@@ -9,7 +9,7 @@ import (
 
 // unitState is what the executor projects for one Component: the canary
 // record, the phase and traffic derived from it, and the rolled-out revision
-// fields it publishes at the ladder's edges.
+// fields it publishes at the canary's start and end.
 type unitState struct {
 	canary    *v1beta1.CanaryStatus
 	phase     v1beta1.RolloutPhase
@@ -118,6 +118,19 @@ func (b *Base) equal(o *Base) bool {
 	return true
 }
 
+// Current reports whether the live executor state still matches the base.
+// A pass whose copy no longer matches it decided from a stale copy of the
+// record: its decisions are not written, and nothing it decided reaches a
+// replica. A nil Base guards nothing and reads as current.
+func (b *Base) Current(live *v1beta1.InferenceServiceStatus) bool {
+	if b == nil || live == nil {
+		return true
+	}
+	current := &Base{}
+	current.snapshot(live)
+	return b.equal(current)
+}
+
 // PreserveFresh keeps the live executor state in dst when it no longer
 // matches the base: the pass decided from a stale copy of the record, and a
 // decision made from a stale record is not written; the next pass makes it
@@ -126,11 +139,11 @@ func (b *Base) PreserveFresh(dst, live *v1beta1.InferenceServiceStatus) bool {
 	if b == nil || dst == nil || live == nil {
 		return false
 	}
-	current := &Base{}
-	current.snapshot(live)
-	if b.equal(current) {
+	if b.Current(live) {
 		return false
 	}
+	current := &Base{}
+	current.snapshot(live)
 	if dst.Components == nil {
 		dst.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
 	}

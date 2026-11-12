@@ -1,0 +1,24 @@
+{{- $budget := .Values.ome.controller.managerPodDisruptionBudget | default dict -}}
+{{- if and $budget.enabled (lt (int $budget.maxUnavailable) 1) -}}
+{{- fail "ome.controller.managerPodDisruptionBudget.maxUnavailable must be an integer of at least 1 so voluntary maintenance can make progress" -}}
+{{- end }}
+{{- if $budget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: ome-controller-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ome.labels" . | nindent 4 }}
+    control-plane: ome-controller-manager
+    controller-tools.k8s.io: "1.0"
+spec:
+  maxUnavailable: {{ int $budget.maxUnavailable }}
+  {{- with $budget.unhealthyPodEvictionPolicy }}
+  unhealthyPodEvictionPolicy: {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      control-plane: ome-controller-manager
+      controller-tools.k8s.io: "1.0"
+{{- end }}

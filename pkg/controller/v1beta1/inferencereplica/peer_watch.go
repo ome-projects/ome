@@ -47,15 +47,19 @@ func (r *Reconciler) peerReplicasOf(ctx context.Context, obj client.Object) []re
 // and deletes pass: a peer appearing or vanishing changes what its
 // siblings pair with.
 func peerRevisionPredicate() predicate.Predicate {
-	return predicate.Funcs{
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldIR, ok1 := e.ObjectOld.(*v1beta1.InferenceReplica)
-			newIR, ok2 := e.ObjectNew.(*v1beta1.InferenceReplica)
-			if !ok1 || !ok2 {
-				return true
-			}
-			return peerRevisionInputsChanged(oldIR, newIR)
-		},
+	return predicate.Funcs{UpdateFunc: replicaUpdate(peerRevisionInputsChanged)}
+}
+
+// replicaUpdate admits an update whose two objects are not both replicas,
+// and otherwise answers what changed says of the old and the new replica.
+func replicaUpdate(changed func(oldIR, newIR *v1beta1.InferenceReplica) bool) func(event.UpdateEvent) bool {
+	return func(e event.UpdateEvent) bool {
+		oldIR, ok1 := e.ObjectOld.(*v1beta1.InferenceReplica)
+		newIR, ok2 := e.ObjectNew.(*v1beta1.InferenceReplica)
+		if !ok1 || !ok2 {
+			return true
+		}
+		return changed(oldIR, newIR)
 	}
 }
 
@@ -83,40 +87,31 @@ func peerRevisionInputsChanged(oldIR, newIR *v1beta1.InferenceReplica) bool {
 		oldIR.Status.CurrentRevision != newIR.Status.CurrentRevision
 }
 
-// heldPeerReplicasOf maps an InferenceReplica event to the serving peers of
-// the same parent whose recorded RolloutHold waits on this replica's
+// heldPeerReplicasOf maps an InferenceReplica event to those of its serving
+// peers (peerReplicasOf) whose recorded RolloutHold waits on this replica's
 // serving counters or retry records (coordination.GateWaitsOnPeerCounters).
 // Nothing but this transition lifts such a denial before the denied
 // replica's own requeue, which rides the rate-limited backoff unless a gate
-// cadence is configured. Reading each peer's hold from the cache bounds the wake-ups:
-// a peer's counter churn enqueues nothing while no sibling is held on it.
-// A peer that cannot be read is enqueued rather than skipped; a spurious
-// pass costs less than a missed release.
+// cadence is configured. Reading each peer's hold from the cache bounds the
+// wake-ups: a peer's counter churn enqueues nothing while no sibling is held
+// on it. A peer that cannot be read is enqueued rather than skipped; a
+// spurious pass costs less than a missed release.
 func (r *Reconciler) heldPeerReplicasOf(ctx context.Context, obj client.Object) []reconcile.Request {
-	ir, ok := obj.(*v1beta1.InferenceReplica)
-	if !ok {
-		return nil
-	}
-	parent := r.resolveParentFrom(ctx, r.Client, ir)
-	if !coordination.PeerEnvDeclared(parent) {
-		return nil
-	}
-	var reqs []reconcile.Request
-	for _, peer := range coordination.ServingPeers(parent, ir.Spec.Component) {
-		key := irprojector.RoleReplicaKey(parent, peer)
+	var held []reconcile.Request
+	for _, req := range r.peerReplicasOf(ctx, obj) {
 		sibling := &v1beta1.InferenceReplica{}
-		if err := r.Client.Get(ctx, key, sibling); err != nil {
+		if err := r.Client.Get(ctx, req.NamespacedName, sibling); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			reqs = append(reqs, reconcile.Request{NamespacedName: key})
+			held = append(held, req)
 			continue
 		}
 		if hold := sibling.Status.RolloutHold; hold != nil && coordination.GateWaitsOnPeerCounters(hold.Gate) {
-			reqs = append(reqs, reconcile.Request{NamespacedName: key})
+			held = append(held, req)
 		}
 	}
-	return reqs
+	return held
 }
 
 // peerCounterPredicate admits the InferenceReplica transitions a held
@@ -129,14 +124,7 @@ func peerCounterPredicate() predicate.Predicate {
 		CreateFunc:  func(event.CreateEvent) bool { return false },
 		DeleteFunc:  func(event.DeleteEvent) bool { return false },
 		GenericFunc: func(event.GenericEvent) bool { return false },
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			oldIR, ok1 := e.ObjectOld.(*v1beta1.InferenceReplica)
-			newIR, ok2 := e.ObjectNew.(*v1beta1.InferenceReplica)
-			if !ok1 || !ok2 {
-				return true
-			}
-			return peerCountersChanged(oldIR, newIR)
-		},
+		UpdateFunc:  replicaUpdate(peerCountersChanged),
 	}
 }
 

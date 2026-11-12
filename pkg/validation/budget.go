@@ -12,12 +12,35 @@
 package validation
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+// The two ways a budget string fails to read as "<n>%".
+var (
+	errNoPercentSign     = errors.New("budget string does not end in %")
+	errPercentNotANumber = errors.New("budget percent is not a number")
+)
+
+// intOrPercent reads a budget value as a number: an integer as itself, a
+// "<n>%" string as n with percent set. Each caller adds its own range rule.
+func intOrPercent(v *intstr.IntOrString) (n int, percent bool, err error) {
+	if v.Type == intstr.Int {
+		return v.IntValue(), false, nil
+	}
+	if !strings.HasSuffix(v.StrVal, "%") {
+		return 0, true, errNoPercentSign
+	}
+	n, err = strconv.Atoi(strings.TrimSuffix(v.StrVal, "%"))
+	if err != nil {
+		return 0, true, errPercentNotANumber
+	}
+	return n, true, nil
+}
 
 // validateBudgetIntOrString enforces the semantic rules for a
 // rolling-update budget value:
@@ -32,50 +55,35 @@ func validateBudgetIntOrString(path string, v *intstr.IntOrString) error {
 	if v == nil {
 		return nil
 	}
-	if v.Type == intstr.Int {
-		if v.IntValue() < 0 {
-			return fmt.Errorf("%s=%d must be >= 0 (%s)",
-				path, v.IntValue(), ReasonInvalidRollingUpdateInteger)
-		}
-		return nil
-	}
-	// String form — must be "<n>%" with 0 <= n <= 100.
-	s := v.StrVal
-	if !strings.HasSuffix(s, "%") {
+	n, percent, err := intOrPercent(v)
+	switch {
+	case errors.Is(err, errNoPercentSign):
 		return fmt.Errorf("%s=%q must be an integer count or a percent string like \"25%%\" (%s)",
-			path, s, ReasonInvalidRollingUpdatePercent)
-	}
-	pctStr := strings.TrimSuffix(s, "%")
-	pct, err := strconv.Atoi(pctStr)
-	if err != nil {
+			path, v.StrVal, ReasonInvalidRollingUpdatePercent)
+	case err != nil:
 		return fmt.Errorf("%s=%q has a malformed percent value (%s)",
-			path, s, ReasonInvalidRollingUpdatePercent)
-	}
-	if pct < 0 || pct > 100 {
+			path, v.StrVal, ReasonInvalidRollingUpdatePercent)
+	case percent && (n < 0 || n > 100):
 		return fmt.Errorf("%s=%q percent must be between 0%% and 100%% (%s)",
-			path, s, ReasonInvalidRollingUpdatePercent)
+			path, v.StrVal, ReasonInvalidRollingUpdatePercent)
+	case !percent && n < 0:
+		return fmt.Errorf("%s=%d must be >= 0 (%s)",
+			path, n, ReasonInvalidRollingUpdateInteger)
 	}
 	return nil
 }
 
 // budgetResolvesToZero reports whether the runtime budget resolver
-// (ScaledCountFromIntOrString) turns v into a zero budget: explicit
-// zeros ("0%" or integer 0), negative integers (floored to 0), and
-// malformed strings (parse error yields 0) all qualify. A positive
-// percent is never zero here — its scaled value depends on the replica
-// count, which admission cannot know. nil is NOT zero: nil means "use
-// default", and every defaulting layer fills a non-zero budget.
+// (ScaledCountFromIntOrString) turns v into a zero budget: an explicit
+// zero ("0%" or integer 0), a negative integer and a string it cannot
+// read all do. A positive percent is never zero here: its scaled value
+// depends on the replica count, which admission cannot know. nil is not
+// zero: nil means "use default", and every defaulting layer fills a
+// non-zero budget.
 func budgetResolvesToZero(v *intstr.IntOrString) bool {
 	if v == nil {
 		return false
 	}
-	if v.Type == intstr.Int {
-		return v.IntValue() <= 0
-	}
-	s := v.StrVal
-	if !strings.HasSuffix(s, "%") {
-		return true
-	}
-	pct, err := strconv.Atoi(strings.TrimSuffix(s, "%"))
-	return err != nil || pct <= 0
+	n, _, err := intOrPercent(v)
+	return err != nil || n <= 0
 }

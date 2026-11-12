@@ -3,6 +3,7 @@ package canary
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -348,12 +349,16 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 	cs.LastEvaluationTime = &metav1.Time{Time: at}
 	cs.MetricResults = toStatusMetricResults(res.Metrics, at)
 	dec := decHold
+	// cause says, for a rollback, why the gate decided it; the deciding pass
+	// records it on the object so the reason is not read from status alone.
+	var cause string
 	switch res.Outcome {
 	case analysis.Fail:
 		cs.LastConclusiveEvaluationTime = &metav1.Time{Time: at}
 		cs.AnalysisFailedChecks++
 		if cs.AnalysisFailedChecks >= a.FailureLimit {
 			dec = decRollback
+			cause = fmt.Sprintf("failing samples reached the limit (%d of %d)", cs.AnalysisFailedChecks, a.FailureLimit)
 		}
 	case analysis.Pass:
 		cs.LastConclusiveEvaluationTime = &metav1.Time{Time: at}
@@ -361,14 +366,17 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 			dec = decAdvance
 		}
 	default: // analysis.Inconclusive
+		timeout := resolveReadyTimeout(in, effectiveCanaryPlan(in))
 		if a.OnInconclusive != nil && *a.OnInconclusive == v1beta1.OnInconclusiveRollback {
 			dec = decRollback
-		} else if analysisStalled(cs, resolveReadyTimeout(in, effectiveCanaryPlan(in)), in.Now) {
+			cause = fmt.Sprintf("the sample could not be read and onInconclusive is %s", *a.OnInconclusive)
+		} else if analysisStalled(cs, timeout, in.Now) {
 			// A stall is terminal either way; RollbackOnStall reverts instead of
 			// parking, so an unreadable gate cannot leave the fleet split.
 			dec = decFailed
 			if a.OnInconclusive != nil && *a.OnInconclusive == v1beta1.OnInconclusiveRollbackOnStall {
 				dec = decRollback
+				cause = fmt.Sprintf("no sample could be read for %s and onInconclusive is %s", timeout, *a.OnInconclusive)
 			}
 		}
 	}
@@ -379,8 +387,54 @@ func consumeSample(in ReconcileInputs, cs *v1beta1.CanaryStatus, step v1beta1.Ro
 	}
 	if dec == decRollback {
 		recordRollback(in.ISVC, in.Component, "analysis")
+		emitAnalysisRollbackEvent(in, cs, res.Outcome, cause, samples)
 	}
 	return dec
+}
+
+// emitAnalysisRollbackEvent records the Warning for a rollback the metric
+// gate decided: the step, the cause, and the checks of the deciding sample
+// that failed or could not be read, each with the member it was read on,
+// its value and its threshold. It is written on the deciding pass, whether
+// the unit then reverts or stops because its stable revision runs nothing.
+func emitAnalysisRollbackEvent(in ReconcileInputs, cs *v1beta1.CanaryStatus, outcome analysis.Outcome, cause string, samples []memberSample) {
+	label := "failing checks"
+	if outcome == analysis.Inconclusive {
+		label = "unread checks"
+	}
+	emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonCanaryAnalysisRolledBack,
+		"%s canary step %d: the metric gate decides a rollback, %s; %s: %s",
+		in.Component, cs.CurrentStep, cause, label, describeChecks(samples))
+}
+
+// describeChecks lists every check of the sample that did not pass as
+// "<member> <name>=<value> (threshold <operator> <limit>)". A check that
+// could not be read carries its message in place of the threshold, and a
+// check with no value recorded is named without one.
+func describeChecks(samples []memberSample) string {
+	parts := []string{}
+	for _, s := range samples {
+		for _, m := range s.result.Metrics {
+			if m.Passed {
+				continue
+			}
+			part := fmt.Sprintf("%s %s", s.component, m.Name)
+			if m.Value != "" {
+				part += "=" + m.Value
+			}
+			switch {
+			case m.Message != "":
+				part += " (" + m.Message + ")"
+			case m.Threshold != "":
+				part += fmt.Sprintf(" (threshold %s %s)", m.Operator, m.Threshold)
+			}
+			parts = append(parts, part)
+		}
+	}
+	if len(parts) == 0 {
+		return "none recorded"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // analysisStalled reports whether analysis has been unable to read health for

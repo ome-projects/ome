@@ -44,9 +44,6 @@ Abstracts accelerator class resource fetching:
 
 ```go
 type AcceleratorFetcher interface {
-    // Fetch all accelerator classes
-    FetchAcceleratorClasses(ctx context.Context) (*AcceleratorCollection, error)
-
     // Get specific accelerator class by name
     GetAcceleratorClass(ctx context.Context, name string) (*v1beta1.AcceleratorClass, bool, error)
 }
@@ -75,6 +72,7 @@ The selector follows a prioritized selection logic:
      - Component-specific override policy
      - InferenceService-level policy
      - If neither is set, no accelerator class is selected
+   - Filter and score the candidates with the component-specific override's constraints when it states a block, else the InferenceService-level constraints
    - Apply policy logic:
      - **FirstAvailable**: Return the first eligible accelerator from runtime requirements
      - **BestFit**: Select based on best resource match (memory + compute scoring)
@@ -101,6 +99,8 @@ Policy-based selection:
     ↓
 Lowest Priority
 ```
+
+Constraints follow the same order: the policy filters and scores the candidates with the constraints block of the component's `AcceleratorOverride` when it states one, else the InferenceService's `AcceleratorSelector` block; the block is taken whole, not merged with the service's. An empty override block (`constraints: {}`) counts as stated and clears the service's constraints for this component.
 
 ## Usage Examples
 
@@ -226,9 +226,6 @@ The package supports configuration through the `Config` struct:
 type Config struct {
     // Client is the Kubernetes client (uses controller-runtime cache)
     Client client.Client
-
-    // EnableDetailedLogging enables verbose logging for debugging
-    EnableDetailedLogging bool
 }
 ```
 
@@ -236,8 +233,7 @@ type Config struct {
 
 ```go
 config := &acceleratorclassselector.Config{
-    Client:                mgr.GetClient(),
-    EnableDetailedLogging: true,
+    Client: mgr.GetClient(),
 }
 
 selector := acceleratorclassselector.NewWithConfig(config)
@@ -245,27 +241,18 @@ selector := acceleratorclassselector.NewWithConfig(config)
 
 ## Error Handling
 
-The package provides custom error types for clear error reporting:
+The package reports a missing class with one error type callers can test for:
 
 ### AcceleratorNotFoundError
 
 ```go
-if acceleratorclassselector.IsAcceleratorNotFoundError(err) {
-    e := err.(*acceleratorclassselector.AcceleratorNotFoundError)
+var e *acceleratorclassselector.AcceleratorNotFoundError
+if errors.As(err, &e) {
     log.Error(err, "Accelerator class not found",
         "acceleratorClass", e.AcceleratorClassName)
 
     // Handle missing accelerator class
     // Perhaps fall back to default or fail the deployment
-}
-```
-
-### ConfigurationError
-
-```go
-if err != nil {
-    log.Error(err, "Configuration error in accelerator selector",
-        "component", "acceleratorclassselector")
 }
 ```
 

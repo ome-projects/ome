@@ -100,18 +100,56 @@ func createRejectionHandled(err error) bool {
 	return ok
 }
 
+// refusedCreateReading is what a create path says a permanent apiserver
+// refusal of the pods it creates means: whose answer the refusal is, and
+// what the row does next.
+type refusedCreateReading int
+
+const (
+	// refusalEndsTheAttempt: the refused object is a faithful render of
+	// the attempt's revision, so the attempt ends and an invalid pod spec
+	// charges that revision's retry block. A push's create and a first
+	// create at a new revision read this way.
+	refusalEndsTheAttempt refusedCreateReading = iota
+	// refusalEndsTheAttemptBlamingNoRevision: the refused object carries
+	// a placement overlay the revision never asked for (a migration
+	// surge), so the attempt ends and no revision is charged.
+	refusalEndsTheAttemptBlamingNoRevision
+	// refusalIsTheRepairsToRetry: the refused object rebuilds the
+	// revision the Instance already ran, under a repair. That revision
+	// served, so the refusal is the cluster's answer (a webhook, a
+	// policy) and charges no block; the repair keeps its attempt at
+	// Failed with the refusal as its failure and retries the create on
+	// its own schedule (RepairRetryAt).
+	refusalIsTheRepairsToRetry
+)
+
+// refusedCreateReadingOf resolves what a permanent refusal of inst's pods
+// rendered from tmpl means: the template's reading when it carries one,
+// else no revision charged for a migration surge's pod, whose placement
+// overlay the revision never asked for, else the attempt ends with the
+// revision charged.
+func refusedCreateReadingOf(inst workload.InstancePlan, tmpl podTemplate) refusedCreateReading {
+	if tmpl.refusal != refusalEndsTheAttempt {
+		return tmpl.refusal
+	}
+	if inst.MigrationOverlay != nil {
+		return refusalEndsTheAttemptBlamingNoRevision
+	}
+	return refusalEndsTheAttempt
+}
+
 // disposeRejectedAttempt ends the Instance's attempt on a permanent
 // apiserver rejection of one of its pods — a create or an in-place
 // patch: LastFailure from the rejection, the Operation cleared,
-// Phase=Failed, plus a RetryBlock against the target revision when
-// blameRevision allows it. Emits the operator-facing Warning naming the
-// pod and the apiserver's own explanation.
+// Phase=Failed, plus a RetryBlock against the target revision when the
+// reading allows it. Emits the operator-facing Warning naming the pod
+// and the apiserver's own explanation.
 //
-// blameRevision is false where the rejected pod is not a faithful render
-// of the target revision — a migration surge carries a placement overlay
-// the revision never asked for, so a 422 there may be the overlay's
-// fault and must not hold an otherwise-good revision.
-func disposeRejectedAttempt(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, targetRevision string, podName string, rejection workload.APIRejection, blameRevision bool) error {
+// Under refusalIsTheRepairsToRetry the Operation is kept instead of
+// cleared, so the row is the spent repair the restart pass retries, and
+// no revision is charged.
+func disposeRejectedAttempt(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, targetRevision string, podName string, rejection workload.APIRejection, reading refusedCreateReading) error {
 	inst := workload.InstanceStatus{Index: idx}
 	if observed := input.ObservedState.Instance(idx); observed != nil {
 		inst = *observed
@@ -127,12 +165,21 @@ func disposeRejectedAttempt(ctx context.Context, deps workload.Deps, input workl
 		op.TargetRevision = targetRevision
 		inst.Operation = &op
 	}
-	held, err := disposeAPIRejection(ctx, input, inst, rejection, blameRevision)
+	held, err := disposeAPIRejection(ctx, input, inst, rejection, reading)
 	if err != nil {
 		return err
 	}
-	announceRejected(deps, input, idx, podName, rejection, held)
+	announceRejected(deps, input, idx, podName, rejection, held, repairRetriesRefusedCreate(rejection, reading))
 	return nil
+}
+
+// repairRetriesRefusedCreate reports whether a refusal leaves the repair
+// its attempt to retry: the reading says the create rebuilt the revision
+// the Instance already ran, and the refusal is of the pod object itself.
+// A refusal the environment gives (a terminating namespace) ends the
+// attempt whatever the reading, since nothing retried can succeed.
+func repairRetriesRefusedCreate(rejection workload.APIRejection, reading refusedCreateReading) bool {
+	return reading == refusalIsTheRepairsToRetry && rejection.Class == workload.APIRejectionPermanentWorkload
 }
 
 // disposeRejectedRowWrite reads the apiserver's refusal of a pod write
@@ -157,18 +204,21 @@ func disposeRejectedRowWrite(ctx context.Context, deps workload.Deps, input work
 		return true, derr
 	}
 	if changed {
-		announceRejected(deps, input, idx, podName, rejection, heldRevision)
+		announceRejected(deps, input, idx, podName, rejection, heldRevision, false)
 	}
 	return true, nil
 }
 
 // announceRejected is the operator-facing Warning for a permanently
 // rejected pod write: the pod, the apiserver's own explanation and
-// whether a revision was held.
-func announceRejected(deps workload.Deps, input workload.ReconcileInput, idx int32, podName string, rejection workload.APIRejection, held string) {
+// whether a revision was held, or that the repair retries the create.
+func announceRejected(deps workload.Deps, input workload.ReconcileInput, idx int32, podName string, rejection workload.APIRejection, held string, repairRetries bool) {
 	detail := "no revision is blamed"
-	if held != "" {
+	switch {
+	case held != "":
 		detail = fmt.Sprintf("revision %s held for retry", held)
+	case repairRetries:
+		detail = "no revision is blamed: the Instance already ran it, so the repair retries on its own schedule"
 	}
 	workload.RecordWarning(deps.Recorder, workload.EventTarget(input), workload.EventReasonInstanceRejected,
 		"OMENative %s: apiserver rejected pod %s (%s: %s); %s",
@@ -177,8 +227,9 @@ func announceRejected(deps workload.Deps, input workload.ReconcileInput, idx int
 
 // rejectionParked reports whether row is an Instance a permanent apiserver
 // rejection disposed while the revision in force still denies a fresh
-// attempt; the passes that drive no attempt leave such a row as it
-// stands. retryAfter is the ladder's next due time when it has one.
+// attempt, or a repair whose refused rebuild its own schedule retries;
+// the passes that drive no attempt leave such a row as it stands.
+// retryAfter is the next due time when there is one.
 func rejectionParked(input workload.ReconcileInput, row *workload.InstanceStatus) (parked bool, retryAfter time.Duration) {
 	if row == nil || row.Phase != workload.InstancePhaseFailed || row.LastFailure == nil {
 		return false, 0
@@ -187,6 +238,9 @@ func rejectionParked(input workload.ReconcileInput, row *workload.InstanceStatus
 	case workload.RejectionReasonInvalidPodSpec, workload.RejectionReasonNamespaceTerminating:
 	default:
 		return false, 0
+	}
+	if repairRebuildRefused(row) {
+		return true, repairRetryWait(input, row)
 	}
 	rev := input.ObservedState.UpdateRevision
 	block := workload.FindRetryBlock(input.ObservedState.RetryBlocks, rev)
@@ -258,10 +312,12 @@ func observedCapacityRefused(input workload.ReconcileInput, idx int32) bool {
 // dedup refreshes the block without recounting. An environment-caused
 // rejection blames no revision and records no block.
 //
-// blameRevision lets a caller withhold that blame when the rejected pod
-// is not a faithful render of the target revision — a migration surge
+// The reading lets a caller withhold that blame: a migration surge
 // carries a placement overlay the revision never asked for, so holding
-// the revision for the overlay's fault would wedge an innocent rollout.
+// the revision for the overlay's fault would stop a sound rollout;
+// a repair rebuilding the revision the Instance already ran reads the
+// refusal as the cluster's answer, keeps its Operation so the restart
+// pass retries the create on the repair's schedule, and charges nothing.
 //
 // The target revision is the attempt's Operation.TargetRevision, falling
 // back to the owner's UpdateRevision for an unpinned Create (the revision
@@ -270,19 +326,37 @@ func observedCapacityRefused(input workload.ReconcileInput, idx int32) bool {
 //
 // Non-permanent classes are a no-op: they carry their own pacing at the
 // call site and the attempt is still alive.
-func disposeAPIRejection(ctx context.Context, input workload.ReconcileInput, inst workload.InstanceStatus, rejection workload.APIRejection, blameRevision bool) (heldRevision string, err error) {
+func disposeAPIRejection(ctx context.Context, input workload.ReconcileInput, inst workload.InstanceStatus, rejection workload.APIRejection, reading refusedCreateReading) (heldRevision string, err error) {
 	if !rejection.Class.Permanent() {
 		return "", nil
 	}
-	if rejection.Class == workload.APIRejectionPermanentWorkload && blameRevision {
+	if rejection.Class == workload.APIRejectionPermanentWorkload && reading == refusalEndsTheAttempt {
 		heldRevision = rejectionTargetRevision(input, inst)
 	}
 	// A rejected create made no pod, so the failure names none: the row's
 	// set holds nothing the rejection refers to.
-	if _, err := disposeRejection(ctx, input, inst.Index, heldRevision, rejection, "", false); err != nil {
+	if _, err := disposeRejection(ctx, input, inst.Index, heldRevision, rejection, "", repairRetriesRefusedCreate(rejection, reading)); err != nil {
 		return "", err
 	}
 	return heldRevision, nil
+}
+
+// repairRetryWait is how long a repair whose rebuild the apiserver
+// refused still waits before its schedule retries the create: zero when
+// the retry is due, or when nothing automatic retries it (a Held block on
+// its revision, every retry spent, no schedule configured).
+func repairRetryWait(input workload.ReconcileInput, row *workload.InstanceStatus) time.Duration {
+	if rebuildRetryBlockDenies(input, row) {
+		return 0
+	}
+	at, owed := RepairRetryAt(input, row)
+	if !owed {
+		return 0
+	}
+	if wait := at.Sub(input.Now()); wait > 0 {
+		return wait
+	}
+	return 0
 }
 
 // disposeRejection is the one ending every permanently rejected pod write

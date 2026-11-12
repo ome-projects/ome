@@ -411,7 +411,6 @@ func (s *multiClusterSetup) setupWorkloadClusterController() error {
 	setupLog.Info("Setting up WorkloadCluster controller")
 	err := (&workloadcluster.Reconciler{
 		Client:                s.mgr.GetClient(),
-		Scheme:                s.mgr.GetScheme(),
 		Log:                   ctrl.Log.WithName("controllers").WithName("WorkloadCluster"),
 		Manager:               s.clusterManager,
 		ExecPolicy:            s.execPolicy,
@@ -480,7 +479,6 @@ func (s *multiClusterSetup) setupPlacementController() error {
 		Client:                  s.mgr.GetClient(),
 		APIReader:               s.mgr.GetAPIReader(),
 		InstanceStatusDecoder:   s.instanceStatusDecoder,
-		Scheme:                  s.mgr.GetScheme(),
 		Log:                     ctrl.Log.WithName("controllers").WithName("Placement"),
 		Clusters:                s.clusterManager,
 		Requeue:                 s.wiring.requeue,
@@ -626,7 +624,6 @@ func (s *multiClusterSetup) buildRoutingObservers() error {
 		observerClient,
 		clock.RealClock{},
 		s.wiring.routing.Observer.MaxResponseBytes,
-		ctrl.Log.WithName("controllers").WithName("PlacementRoutingProbe"),
 	)
 	if err != nil {
 		return fmt.Errorf("create routing endpoint prober: %w", err)
@@ -636,7 +633,6 @@ func (s *multiClusterSetup) buildRoutingObservers() error {
 		observerClient,
 		clock.RealClock{},
 		s.wiring.routing.Observer.MaxResponseBytes,
-		ctrl.Log.WithName("controllers").WithName("PlacementRoutingCapacity"),
 	)
 	if err != nil {
 		return fmt.Errorf("create routing capacity poller: %w", err)

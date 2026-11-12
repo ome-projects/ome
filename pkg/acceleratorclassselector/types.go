@@ -16,52 +16,23 @@ type Selector interface {
 	GetAcceleratorClass(ctx context.Context, isvc *v1beta1.InferenceService, runtime *v1beta1.ServingRuntimeSpec, component v1beta1.ComponentType) (*v1beta1.AcceleratorClass, string, error)
 }
 
-// AcceleratorSelection represents the selected accelerator class with metadata.
-type AcceleratorSelection struct {
-	// Name is the name of the selected accelerator class
-	Name string
-
-	// Spec is the accelerator class specification
-	Spec *v1beta1.AcceleratorClassSpec
-
-	// NodeSelector that should be applied to pods
-	NodeSelector map[string]string
-
-	// ResourceRequests that should be applied to pods
-	ResourceRequests map[string]string
-}
-
 // AcceleratorFetcher abstracts the fetching of accelerator class resources.
 type AcceleratorFetcher interface {
-	// FetchAcceleratorClasses returns all cluster-scoped accelerator classes.
-	FetchAcceleratorClasses(ctx context.Context) (*AcceleratorCollection, error)
-
 	// GetAcceleratorClass fetches an accelerator class by name. A missing
 	// class is reported as found=false with a nil error; a non-nil error
 	// means the read itself failed.
 	GetAcceleratorClass(ctx context.Context, name string) (*v1beta1.AcceleratorClass, bool, error)
 }
 
-// AcceleratorCollection holds the cluster-scoped accelerator classes.
-type AcceleratorCollection struct {
-
-	// ClusterAcceleratorClasses contains cluster-scoped AcceleratorClasses
-	ClusterAcceleratorClasses []v1beta1.AcceleratorClass
-}
-
 // Config holds configuration for the accelerator class selector.
 type Config struct {
 	// Client is the Kubernetes client (uses controller-runtime cache)
 	Client client.Client
-
-	// EnableDetailedLogging enables verbose logging for debugging
-	EnableDetailedLogging bool
 }
 
 // NewConfig creates a new Config with default values.
 func NewConfig(client client.Client) *Config {
 	return &Config{
-		Client:                client,
-		EnableDetailedLogging: false,
+		Client: client,
 	}
 }

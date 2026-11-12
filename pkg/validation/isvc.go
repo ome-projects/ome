@@ -3,6 +3,7 @@ package validation
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -84,24 +85,17 @@ func ValidateEngineDecoderConfig(spec *v1beta1.InferenceServiceSpec) error {
 	return nil
 }
 
-// ValidateLeaderWorkerPairing enforces that the Leader / Worker spec
-// pair on each Component (Engine, Decoder) is internally consistent:
-// either both are absent (single-pod) or both are present (multi-pod)
-// with Worker.Size positive when set. An unset size is legal: it resolves
-// at reconcile time to the runtime's value, or to one worker. Rejects
-// orphan-leader, orphan-worker, and explicit non-positive sizes.
+// ValidateLeaderWorkerPairing enforces that the Leader / Worker spec pair of
+// each declared Component is consistent: either both are absent (single-pod)
+// or both are present (multi-pod) with Worker.Size positive when set. An
+// unset size is legal: it resolves at reconcile time to the runtime's value,
+// or to one worker. Only the engine and the decoder can declare the pair.
 //
-// Error strings embed both the legacy "InvalidLeaderWorkerPairing"
-// reason (for back-compat with operators / tests grepping for it) and
-// a more-specific reason from the reason constants above.
+// Each refusal carries the shared "InvalidLeaderWorkerPairing" reason and the
+// specific reason from the constants above.
 func ValidateLeaderWorkerPairing(spec *v1beta1.InferenceServiceSpec) error {
-	if spec.Engine != nil {
-		if err := validateLeaderWorkerPairing("engine", spec.Engine.Leader, spec.Engine.Worker); err != nil {
-			return err
-		}
-	}
-	if spec.Decoder != nil {
-		if err := validateLeaderWorkerPairing("decoder", spec.Decoder.Leader, spec.Decoder.Worker); err != nil {
+	for _, r := range declaredRoles(spec) {
+		if err := validateLeaderWorkerPairing(string(r.kind), r.leader, r.worker); err != nil {
 			return err
 		}
 	}
@@ -197,22 +191,13 @@ func ValidateMultiPodLeanRunner(spec *v1beta1.InferenceServiceSpec) error {
 	if modelSet || runtimeSet {
 		return nil
 	}
-	// Lean path: at least one of model/runtime must end up set per
-	// ValidateInferenceService elsewhere; if both are absent the user
-	// is in the "spec.engine carries the runner config end-to-end"
-	// path. Multi-pod variants in that path need both leader and
-	// worker runner images present.
-	if err := validateMultiPodLeanRunnerImages(
-		"engine",
-		engineLeader(spec.Engine), engineWorker(spec.Engine),
-	); err != nil {
-		return err
-	}
-	if err := validateMultiPodLeanRunnerImages(
-		"decoder",
-		decoderLeader(spec.Decoder), decoderWorker(spec.Decoder),
-	); err != nil {
-		return err
+	// A lean spec carries the runner configuration itself, so a role that
+	// declares a leader and workers must name both images. Only the engine
+	// and the decoder can declare the pair.
+	for _, r := range declaredRoles(spec) {
+		if err := validateMultiPodLeanRunnerImages(string(r.kind), r.leader, r.worker); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -239,34 +224,6 @@ func validateMultiPodLeanRunnerImages(component string, leader *v1beta1.LeaderSp
 		ReasonMultiPodLeanModelNeedsRunner,
 		component, component, leaderImg, component, workerImg,
 	)
-}
-
-func engineLeader(e *v1beta1.EngineSpec) *v1beta1.LeaderSpec {
-	if e == nil {
-		return nil
-	}
-	return e.Leader
-}
-
-func engineWorker(e *v1beta1.EngineSpec) *v1beta1.WorkerSpec {
-	if e == nil {
-		return nil
-	}
-	return e.Worker
-}
-
-func decoderLeader(d *v1beta1.DecoderSpec) *v1beta1.LeaderSpec {
-	if d == nil {
-		return nil
-	}
-	return d.Leader
-}
-
-func decoderWorker(d *v1beta1.DecoderSpec) *v1beta1.WorkerSpec {
-	if d == nil {
-		return nil
-	}
-	return d.Worker
 }
 
 // ValidateEngineDecoderDeploymentMode enforces that when both Engine and
@@ -389,31 +346,26 @@ func ValidateScaleToZero(isvc *v1beta1.InferenceService) error {
 func ValidateAutoscalerConfig(isvc *v1beta1.InferenceService) ([]string, error) {
 	annotations := isvc.ObjectMeta.Annotations
 	value, ok := annotations[constants.AutoscalerClass]
+	if !ok {
+		return nil, nil
+	}
 	class := constants.AutoscalerClassType(value)
-	if ok {
-		for _, item := range constants.AutoscalerAllowedClassList {
-			if class == item {
-				switch class {
-				case constants.AutoscalerClassHPA:
-					if metric, ok := annotations[constants.AutoscalerMetrics]; ok {
-						return nil, ValidateHPAMetrics(metric)
-					}
-					return nil, nil
-				case constants.AutoscalerClassKEDA:
-					// Per-Component Autoscaler.Keda shape is validated
-					// by ValidateAutoscaler; the annotation path accepts
-					// class=keda without further validation here.
-					return nil, nil
-				case constants.AutoscalerClassExternal:
-					return nil, nil
-				default:
-					return nil, fmt.Errorf("unknown autoscaler class [%s]", class)
-				}
-			}
-		}
+	if !slices.Contains(constants.AutoscalerAllowedClassList, class) {
 		return nil, fmt.Errorf("[%s] is not a supported autoscaler class type", value)
 	}
-	return nil, nil
+	switch class {
+	case constants.AutoscalerClassHPA:
+		if metric, ok := annotations[constants.AutoscalerMetrics]; ok {
+			return nil, ValidateHPAMetrics(metric)
+		}
+		return nil, nil
+	case constants.AutoscalerClassKEDA, constants.AutoscalerClassExternal:
+		// The per-Component Autoscaler.Keda shape is validated by
+		// ValidateAutoscaler; the annotation path accepts class=keda as is.
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unknown autoscaler class [%s]", class)
+	}
 }
 
 func ValidateAutoscalerTargetUtilizationPercentage(isvc *v1beta1.InferenceService) error {
@@ -538,93 +490,65 @@ func ValidateComponentsAutoscalers(checks []ComponentAutoscalerCheck) error {
 	return nil
 }
 
-// ValidateAutoscaler is the core per-Component Autoscaler shape check:
-//
-//   - `none` and `external` are status-field twins; both are
-//     accepted at the webhook layer with no Class-specific shape
-//     requirements.
-//   - There is no KEDA-installed probe; the cluster
-//     contract is "KEDA is always present". The webhook does not
-//     validate KEDA availability.
-//
-// Rules enforced:
-//
-//  1. Class must be one of {hpa, keda, external, none} (defense-in-depth
-//     against the CRD enum, in case of a stale-CRD client).
-//  2. class=keda requires Keda.Triggers to be set with at least one
-//     entry (defense-in-depth against MinItems=1 on the CRD, plus the
-//     nil-Keda-pointer case that MinItems can't express).
-//  3. class=hpa with HPA.Metrics: every entry's declared Type must have
-//     the corresponding pointer-field populated (Type=Resource ⇒
-//     Resource != nil, etc.). HPA.Metrics empty/nil is allowed — the
-//     controller defaults to CPU=80%.
-//  4. class=keda with both Keda.IdleReplicaCount and the supplied
-//     minReplicas set: IdleReplicaCount must be strictly less than
-//     minReplicas.
-//  5. class=keda with advanced.horizontalPodAutoscalerConfig.name set: the
-//     name must be a DNS label, as KEDA's admission requires.
-//
-// Returns nil when autoscaler is nil — every Component-level Autoscaler
-// block is optional.
-//
-// minReplicas is the effective per-Component MinReplicas floor; pass
-// nil if the caller cannot determine it (e.g., the IR webhook may pass
-// the IR's spec.replicas, the ISVC webhook passes
-// ComponentExtensionSpec.MinReplicas). The IdleReplicaCount-vs-MinReplicas
-// check is skipped when either side is nil.
+// ValidateAutoscaler checks one Component's Autoscaler block: the class is
+// one of HPA, KEDA, External or None; a KEDA block has a trigger, an idle
+// replica count below minReplicas and an HPA name that is a DNS label; an
+// HPA block's metrics each carry the source their type reads. A nil block
+// is valid, and a nil minReplicas skips the idle check.
 func ValidateAutoscaler(autoscaler *v1beta1.ComponentAutoscaler, minReplicas *int) error {
 	if autoscaler == nil {
 		return nil
 	}
-	as := autoscaler
-
-	// Rule 1: class enum (defense-in-depth against the CRD marker).
-	if _, ok := validAutoscalerClasses[as.Class]; !ok {
+	// The class enum, kept beside the CRD marker for clients that bypass it.
+	if _, ok := validAutoscalerClasses[autoscaler.Class]; !ok {
 		return fmt.Errorf(
 			"%s: autoscaler.class %q is not one of HPA|KEDA|External|None",
-			ReasonAutoscalerClassUnknown, as.Class,
+			ReasonAutoscalerClassUnknown, autoscaler.Class,
 		)
 	}
-
-	// Rule 2: class=keda requires at least one trigger.
-	if as.Class == v1beta1.AutoscalerKEDA {
-		if as.Keda == nil || len(as.Keda.Triggers) == 0 {
-			return fmt.Errorf(
-				"%s: class=keda requires at least 1 trigger",
-				ReasonKedaTriggersRequired,
-			)
-		}
+	switch autoscaler.Class {
+	case v1beta1.AutoscalerKEDA:
+		return validateKedaAutoscaler(autoscaler.Keda, minReplicas)
+	case v1beta1.AutoscalerHPA:
+		return validateHPAAutoscaler(autoscaler.HPA)
 	}
+	return nil
+}
 
-	// Rule 3: class=hpa with malformed metric entries.
-	if as.Class == v1beta1.AutoscalerHPA && as.HPA != nil {
-		for i, m := range as.HPA.Metrics {
-			if err := validateHPAMetricSpec(i, m); err != nil {
-				return err
-			}
-		}
+// validateKedaAutoscaler checks a class=keda block: at least one trigger, an
+// idle replica count below the Component's minReplicas when both are set,
+// and a requested HPA name that is a DNS label.
+func validateKedaAutoscaler(keda *v1beta1.KedaAutoscaler, minReplicas *int) error {
+	if keda == nil || len(keda.Triggers) == 0 {
+		return fmt.Errorf(
+			"%s: class=keda requires at least 1 trigger",
+			ReasonKedaTriggersRequired,
+		)
 	}
-
-	// Rule 4: KEDA IdleReplicaCount < minReplicas.
-	if as.Class == v1beta1.AutoscalerKEDA && as.Keda != nil &&
-		as.Keda.IdleReplicaCount != nil && minReplicas != nil {
-		idle := int(*as.Keda.IdleReplicaCount)
-		min := *minReplicas
-		if idle >= min {
+	if keda.IdleReplicaCount != nil && minReplicas != nil {
+		idle, minimum := int(*keda.IdleReplicaCount), *minReplicas
+		if idle >= minimum {
 			return fmt.Errorf(
 				"%s: keda.idleReplicaCount must be < minReplicas (got idleReplicaCount=%d, minReplicas=%d)",
-				ReasonKedaIdleBelowMin, idle, min,
+				ReasonKedaIdleBelowMin, idle, minimum,
 			)
 		}
 	}
+	return ValidateKedaHPAName(keda.Advanced)
+}
 
-	// Rule 5: a requested KEDA HPA name must be a DNS label.
-	if as.Class == v1beta1.AutoscalerKEDA && as.Keda != nil {
-		if err := ValidateKedaHPAName(as.Keda.Advanced); err != nil {
+// validateHPAAutoscaler checks a class=hpa block: every metrics entry names
+// an accepted source type and carries the source that type reads. An absent
+// block is valid; the controller then renders its default HPA.
+func validateHPAAutoscaler(hpa *v1beta1.HPAAutoscaler) error {
+	if hpa == nil {
+		return nil
+	}
+	for i, m := range hpa.Metrics {
+		if err := validateHPAMetricSpec(i, m); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -646,73 +570,50 @@ func ValidateKedaHPAName(advanced *kedav1.AdvancedConfig) error {
 	return nil
 }
 
-// ValidateComponentAutoscaler is a back-compat thin wrapper around
-// ValidateAutoscaler that pulls the Autoscaler block + MinReplicas out
-// of a ComponentExtensionSpec. New callers should prefer
-// ValidateAutoscaler (or ValidateComponentsAutoscalers for the
-// per-Component dispatch) so they don't have to synthesize a parent
-// ComponentExtensionSpec (cf. the IR webhook, which carries Replicas
-// on the IR spec rather than a nested ComponentExtensionSpec).
-func ValidateComponentAutoscaler(componentExt *v1beta1.ComponentExtensionSpec) error {
-	if componentExt == nil {
-		return nil
-	}
-	return ValidateAutoscaler(componentExt.Autoscaler, componentExt.MinReplicas)
+// hpaMetricSource is one metric source type the HPA accepts: the field of the
+// MetricSpec that carries the source and the name a refusal reports.
+type hpaMetricSource struct {
+	kind  autoscalingv2.MetricSourceType
+	field string
+	set   func(*autoscalingv2.MetricSpec) bool
 }
 
-// validateHPAMetricSpec checks that a single MetricSpec entry has its
-// Type field populated and the matching pointer field set. Returns a
-// formatted error including the entry index for operator legibility.
+// hpaMetricSources lists the accepted source types in the order the refusals
+// name them.
+var hpaMetricSources = []hpaMetricSource{
+	{kind: autoscalingv2.ResourceMetricSourceType, field: "resource", set: func(m *autoscalingv2.MetricSpec) bool { return m.Resource != nil }},
+	{kind: autoscalingv2.PodsMetricSourceType, field: "pods", set: func(m *autoscalingv2.MetricSpec) bool { return m.Pods != nil }},
+	{kind: autoscalingv2.ObjectMetricSourceType, field: "object", set: func(m *autoscalingv2.MetricSpec) bool { return m.Object != nil }},
+	{kind: autoscalingv2.ExternalMetricSourceType, field: "external", set: func(m *autoscalingv2.MetricSpec) bool { return m.External != nil }},
+	{kind: autoscalingv2.ContainerResourceMetricSourceType, field: "containerResource", set: func(m *autoscalingv2.MetricSpec) bool { return m.ContainerResource != nil }},
+}
+
+// hpaMetricTypeNames is the accepted source types as a refusal lists them.
+var hpaMetricTypeNames = func() string {
+	names := make([]string, 0, len(hpaMetricSources))
+	for _, source := range hpaMetricSources {
+		names = append(names, string(source.kind))
+	}
+	return strings.Join(names, "|")
+}()
+
+// validateHPAMetricSpec checks that one metrics entry names an accepted source
+// type and carries the source that type reads. The refusal names the entry's
+// index.
 func validateHPAMetricSpec(idx int, m autoscalingv2.MetricSpec) error {
 	if m.Type == "" {
-		return fmt.Errorf(
-			"%s: hpa.metrics[%d].type is empty; must be one of Resource|Pods|Object|External|ContainerResource",
-			ReasonHPAMetricMalformed, idx,
-		)
+		return fmt.Errorf("%s: hpa.metrics[%d].type is empty; must be one of %s", ReasonHPAMetricMalformed, idx, hpaMetricTypeNames)
 	}
-	switch m.Type {
-	case autoscalingv2.ResourceMetricSourceType:
-		if m.Resource == nil {
-			return fmt.Errorf(
-				"%s: hpa.metrics[%d].type=Resource but hpa.metrics[%d].resource is nil",
-				ReasonHPAMetricMalformed, idx, idx,
-			)
+	for _, source := range hpaMetricSources {
+		if source.kind != m.Type {
+			continue
 		}
-	case autoscalingv2.PodsMetricSourceType:
-		if m.Pods == nil {
-			return fmt.Errorf(
-				"%s: hpa.metrics[%d].type=Pods but hpa.metrics[%d].pods is nil",
-				ReasonHPAMetricMalformed, idx, idx,
-			)
+		if !source.set(&m) {
+			return fmt.Errorf("%s: hpa.metrics[%d].type=%s but hpa.metrics[%d].%s is nil", ReasonHPAMetricMalformed, idx, source.kind, idx, source.field)
 		}
-	case autoscalingv2.ObjectMetricSourceType:
-		if m.Object == nil {
-			return fmt.Errorf(
-				"%s: hpa.metrics[%d].type=Object but hpa.metrics[%d].object is nil",
-				ReasonHPAMetricMalformed, idx, idx,
-			)
-		}
-	case autoscalingv2.ExternalMetricSourceType:
-		if m.External == nil {
-			return fmt.Errorf(
-				"%s: hpa.metrics[%d].type=External but hpa.metrics[%d].external is nil",
-				ReasonHPAMetricMalformed, idx, idx,
-			)
-		}
-	case autoscalingv2.ContainerResourceMetricSourceType:
-		if m.ContainerResource == nil {
-			return fmt.Errorf(
-				"%s: hpa.metrics[%d].type=ContainerResource but hpa.metrics[%d].containerResource is nil",
-				ReasonHPAMetricMalformed, idx, idx,
-			)
-		}
-	default:
-		return fmt.Errorf(
-			"%s: hpa.metrics[%d].type %q is not one of Resource|Pods|Object|External|ContainerResource",
-			ReasonHPAMetricMalformed, idx, m.Type,
-		)
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%s: hpa.metrics[%d].type %q is not one of %s", ReasonHPAMetricMalformed, idx, m.Type, hpaMetricTypeNames)
 }
 
 // ValidateAutoscalerAnnotationConflict rejects an InferenceService that
@@ -934,9 +835,9 @@ func ValidateAutoscalerPolicyRefs(isvc *v1beta1.InferenceService, featureEnabled
 // rejection) when placement splits replicas and a Component that references
 // an AutoscalerPolicy has no per-cluster cap. A component is capped by its
 // split.maxPerCluster key or default, or by the primary component's cap, which
-// scales to the others. Policy templates render against each home's derived
+// scales to the others. Policy templates render against each cluster's derived
 // replica bounds; without a per-cluster cap that ceiling is unbounded, so a
-// fail-to-max fallback on one home can fabricate the whole fleet's count.
+// fail-to-max fallback on one cluster can fabricate the whole fleet's count.
 // Empty string when the combination is absent.
 func AutoscalerPolicySplitCeilingWarning(isvc *v1beta1.InferenceService) string {
 	if isvc == nil || isvc.Spec.Placement == nil || (isvc.Spec.Placement.Mode != v1beta1.PlacementModeSplit && isvc.Spec.Placement.Mode != v1beta1.PlacementModeSplitByCapacity) {
@@ -953,12 +854,7 @@ func AutoscalerPolicySplitCeilingWarning(isvc *v1beta1.InferenceService) string 
 	if split.Ceiling(primary) > 0 {
 		return ""
 	}
-	var referencing []string
-	for _, c := range isvcAutoscalerPolicyRefChecks(isvc) {
-		if component := v1beta1.ComponentType(c.name); split.Ceiling(component) == 0 {
-			referencing = append(referencing, c.name)
-		}
-	}
+	referencing := policyReferrersLacking(isvc, func(component string) bool { return split.Ceiling(v1beta1.ComponentType(component)) == 0 })
 	if len(referencing) == 0 {
 		return ""
 	}
@@ -969,6 +865,18 @@ func AutoscalerPolicySplitCeilingWarning(isvc *v1beta1.InferenceService) string 
 	)
 }
 
+// policyReferrersLacking lists the Components that reference an
+// AutoscalerPolicy and lack what the test asks for, in declaration order.
+func policyReferrersLacking(isvc *v1beta1.InferenceService, lacks func(component string) bool) []string {
+	var referencing []string
+	for _, c := range isvcAutoscalerPolicyRefChecks(isvc) {
+		if lacks(c.name) {
+			referencing = append(referencing, c.name)
+		}
+	}
+	return referencing
+}
+
 // ratioFormCeilingWarning covers a ratio-form source, whose per-cluster
 // ceiling is a share of the component's maxReplicas: a component that
 // references an AutoscalerPolicy without maxReplicas has no ceiling to share.
@@ -977,12 +885,7 @@ func ratioFormCeilingWarning(isvc *v1beta1.InferenceService) string {
 	for _, r := range declaredRoles(&isvc.Spec) {
 		maxReplicas[string(r.kind)] = r.extension.MaxReplicas
 	}
-	var referencing []string
-	for _, c := range isvcAutoscalerPolicyRefChecks(isvc) {
-		if maxReplicas[c.name] == 0 {
-			referencing = append(referencing, c.name)
-		}
-	}
+	referencing := policyReferrersLacking(isvc, func(component string) bool { return maxReplicas[component] == 0 })
 	if len(referencing) == 0 {
 		return ""
 	}
@@ -991,4 +894,18 @@ func ratioFormCeilingWarning(isvc *v1beta1.InferenceService) string {
 			"each cluster's ceiling is its share of maxReplicas, and without maxReplicas that ceiling is unbounded (%s)",
 		isvc.Spec.Placement.Mode, strings.Join(referencing, ", "), v1beta1.PlacementPolicyPreflightReasonUnboundedSplitCeiling,
 	)
+}
+
+// ValidateComponentAutoscaler is a back-compat thin wrapper around
+// ValidateAutoscaler that pulls the Autoscaler block + MinReplicas out
+// of a ComponentExtensionSpec. New callers should prefer
+// ValidateAutoscaler (or ValidateComponentsAutoscalers for the
+// per-Component dispatch) so they don't have to synthesize a parent
+// ComponentExtensionSpec (cf. the IR webhook, which carries Replicas
+// on the IR spec rather than a nested ComponentExtensionSpec).
+func ValidateComponentAutoscaler(componentExt *v1beta1.ComponentExtensionSpec) error {
+	if componentExt == nil {
+		return nil
+	}
+	return ValidateAutoscaler(componentExt.Autoscaler, componentExt.MinReplicas)
 }

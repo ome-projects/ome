@@ -54,7 +54,6 @@ func placementIR(component v1beta1.ComponentType, phase v1beta1.OMENativeInstanc
 }
 
 type placementDecisions struct {
-	anyAdmitted      bool
 	allAdmitted      bool
 	admittedReplicas int32
 	terminallyFailed bool
@@ -69,7 +68,6 @@ func placementDecisionsFor(t *testing.T, reads client.Reader, isvc *v1beta1.Infe
 		t.Fatalf("componentIRStatuses: %v", err)
 	}
 	return placementDecisions{
-		anyAdmitted:      AnyInstanceAdmitted(statuses),
 		allAdmitted:      AllComponentsAdmitted(isvc, statuses),
 		admittedReplicas: placementAdmittedReplicas(declaredComponents(isvc), statuses, nil),
 		terminallyFailed: IsTerminallyFailed(isvc, statuses),
@@ -105,7 +103,7 @@ func TestPlacementPredicatesDecodeColumnarV2Identically(t *testing.T) {
 	if diff := cmp.Diff(want, got, cmp.AllowUnexported(placementDecisions{})); diff != "" {
 		t.Fatalf("placement decisions differ by stored encoding (-want +got):\n%s", diff)
 	}
-	if !want.anyAdmitted || !want.allAdmitted || want.admittedReplicas != 1 || !want.terminallyFailed {
+	if !want.allAdmitted || want.admittedReplicas != 1 || !want.terminallyFailed {
 		t.Fatalf("fixture does not exercise the predicates as intended: %+v", want)
 	}
 }

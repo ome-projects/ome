@@ -1,9 +1,11 @@
 package inferencereplica
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -159,80 +161,210 @@ const (
 	ReasonRenderFailed = "RenderFailed"
 )
 
-// aggregateAndWriteStatus publishes cached Pod and EndpointSlice facts over
-// freshly read lifecycle rows, then computes the IR summaries and conditions.
-// Lifecycle fields and CurrentRevision retain their dedicated writers, with
-// one exception the publication owns: the phase of a settled row follows
-// the pods published beside it, so the phase never contradicts the
-// counters. A Ready row (workloadstatus.DemotableReady) reads Pending with
-// no pods and Restarting while its set serves nothing; a Failed row off the
-// revision it runs, its attempt spent (workloadtypes.FailedOffRunningRevision)
-// or still kept at its surge step
-// (workloadtypes.FailedKeepingSurgeOffRunningRevision), reads Ready while
-// the pods on that revision serve. A nil target leaves revision pointers
-// untouched while counters still publish.
+// aggregateAndWriteStatus publishes the pods and the EndpointSlices the pass
+// read over the replica's rows: the phase and the counters of every
+// Instance, the Component counters, the revision pair, the Ready,
+// RolloutStalled and DrainOverdue conditions and the hold. Lifecycle fields
+// and CurrentRevision keep their own writers, with one exception the
+// publication owns: the phase of a settled row follows the pods published
+// beside it, so the phase never contradicts the counters. A Ready row
+// (workloadstatus.DemotableReady) reads Pending with no pods and Restarting
+// while its set serves nothing; a Failed row off the revision it runs, its
+// attempt spent (workloadtypes.FailedOffRunningRevision) or still kept at
+// its surge step (workloadtypes.FailedKeepingSurgeOffRunningRevision), reads
+// Ready while the pods on that revision serve. A nil target leaves the
+// revision pointers untouched while counters still publish.
 //
-// holdObserved/hold carry this pass's Update-pass rollout-hold verdict
-// (ReconcileInput.RecordRolloutHold): holdObserved is true when the Update
-// pass ran at all this reconcile, and hold is its verdict (nil clears).
-// When the Update pass did not run (holdObserved is false — the pass ended
-// before it, nothing needed updating, or Plan selected no target), the
+// The pass's copy of the replica decides first. It carries every row and
+// condition this controller wrote, this pass's writes included, so when the
+// status recomputed over it equals it, the live object needs no write, and
+// nothing is read live or written. Any other answer takes the live object:
+// every write is decided on a live read under the conflict retry, with the
+// owner and stale-spec checks. The copy can trail the live object by a
+// write of this controller the cache has not shown yet, or by a write of
+// another owner; either raises an event on the replica, and its own watch
+// passes every change of the object, so the pass that event brings decides
+// on a copy that shows the write.
+//
+// holdObserved and hold carry what this pass's update pass reported about the
+// rollout hold (ReconcileInput.RecordRolloutHold): holdObserved is true when
+// the update pass ran at all this reconcile, and hold is what it reported (nil
+// clears). When the update pass did not run (holdObserved is false — the pass
+// ended before it, nothing needed updating, or Plan selected no target), the
 // same-target RetryBlock/Held state persisted in status is the hold (a
-// RetryBlock-denied Instance is never selected for the Update pass and the
-// pass reports the block only when it runs for other Instances), else the
-// persisted hold stands until a pass that runs the Update pass replaces or
-// clears it, unless this pass removed an Instance. instancesAtStart lists
-// the Instances that had a row when the pass began; a recorded hold
-// describes those Instances, so the write that removes one of them carries
-// no hold the pass did not observe — see effectiveRolloutHold.
+// RetryBlock-denied Instance is never selected for the Update pass and the pass
+// reports the block only when it runs for other Instances), else the persisted
+// hold stands until a pass that runs the Update pass replaces or clears it,
+// unless this pass removed an Instance. instancesAtStart lists the Instances
+// that had a row when the pass began; a recorded hold describes those
+// Instances, so the write that removes one of them carries no hold the pass did
+// not observe — see effectiveRolloutHold.
+//
+// nodes is the pass's Node reading: a pod bound to a Node that no longer
+// exists is gone for the counters, as it is for the engine's own views.
+// nil reads the Nodes through the cache and the live reader.
+//
+// pods are the Component's pods as the cache lists them, read once at the
+// end of the pass and shared with the promotion, so both decide from the
+// same pods; list is the pass's list they came from, which holds their
+// buckets by Instance (a nil list buckets them here). The split on missing
+// Nodes happens here, and a list it cuts short is bucketed on its own.
 //
 // The returned duration is how long until the earliest in-rotation pod still
 // inside the spec.minReadySeconds window becomes Available (0 when none is
 // pending). That raises the Available counters without any watch event, so
 // the caller folds it into the reconcile result to publish them on time.
-func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workloadtypes.RolloutHold, instancesAtStart []int32) (time.Duration, error) {
+func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.InferenceReplica, pods []*corev1.Pod, list *workloadtypes.CachedPodList, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, nodes workloadtypes.NodePresence, holdObserved bool, hold *workloadtypes.RolloutHold, instancesAtStart []int32) (time.Duration, error) {
 	if r.Client == nil {
 		return 0, fmt.Errorf("aggregateAndWriteStatus: nil client")
 	}
-	key := client.ObjectKeyFromObject(ir)
-	ownerUID := ir.UID
-	ownerGeneration := ir.Generation
-	desiredByIdx := workloadstatus.DesiredPodCountByInstance(plan)
+	if nodes == nil {
+		nodes = query.NewNodeLookup(workloadtypes.NodeReaders{Cache: r.Client, Live: r.APIReader})
+	}
 	component := v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component)
 
-	// List pods + EndpointSlices via the CACHED client (r.Client), outside
-	// the retry closure: both reads are idempotent (no apiserver-side
-	// mutation), so on a status conflict we just re-stamp the same counters
-	// onto the re-read IR.
-	//
-	// This aggregator is observability-only COUNTING — the manager cache is
-	// scoped to OME pods, has the OMENative Pod field index registered, and
-	// watches EndpointSlices, so cache-served counts are both correct and
-	// cheap. Going live (r.APIReader) on every reconcile would be the dominant
-	// hot-path cost: an uncached LIST per IR reconcile purely for counters,
-	// plus a MatchingFields probe the live reader can't serve. r.APIReader
-	// stays reserved for the destructive/correctness-critical paths
-	// (drain/delete/recreate confirm) that genuinely need a live read.
-	pods, err := query.ListOMENativePodsByName(ctx, r.Client, ir.Namespace, ir.NamePrefix(), component, true)
-	if err != nil {
-		return 0, fmt.Errorf("aggregateAndWriteStatus: list pods: %w", err)
+	// The pods and the EndpointSlices are cached reads taken once, outside
+	// the conflict retry: both are idempotent, so on a status conflict the
+	// same counters are published again onto the re-read object. The manager
+	// cache is scoped to OME pods, carries the OMENative Pod field index and
+	// watches EndpointSlices, so cache-served counts are correct and cheap;
+	// r.APIReader is for the paths that decide a write.
+	var err error
+	if pods, _, err = query.SplitPodsOnMissingNodes(ctx, nodes, pods); err != nil {
+		return 0, fmt.Errorf("aggregateAndWriteStatus: read the nodes under the pods: %w", err)
 	}
-	byIndex := query.BucketPodsByInstanceIdx(pods)
-	podObservation := workload.NewCachedSelectorPodObservation(pods, byIndex)
-	serviceName := query.HeadlessServiceName(ir.NamePrefix(), component)
-	availableByPod, err := workloadstatus.AvailablePodSet(ctx, r.Client, ir.Namespace, serviceName)
+	byInstance := list.ByInstance(pods, query.BucketPodsByInstanceIdx)
+	availableByPod, err := workloadstatus.AvailablePodSet(ctx, r.Client, ir.Namespace, query.HeadlessServiceName(ir.NamePrefix(), component))
 	if err != nil {
 		return 0, fmt.Errorf("aggregateAndWriteStatus: compute availability: %w", err)
 	}
+	publication := statusPublication{
+		plan:             plan,
+		target:           target,
+		desiredByIdx:     workloadstatus.DesiredPodCountByInstance(plan),
+		pods:             workload.NewCachedSelectorPodObservation(pods, byInstance),
+		availableByPod:   availableByPod,
+		templateHash:     templateHashOf(ir),
+		holdObserved:     holdObserved,
+		hold:             hold,
+		instancesAtStart: instancesAtStart,
+	}
 
-	ownerUnavailable := false
-	var nextAvailableIn time.Duration
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	nextAvailableIn, ownerUnavailable, err := r.decidePublication(ctx, ir, publication)
+	if err != nil || ownerUnavailable {
+		return 0, err
+	}
+
+	// A held Instance runs no InstanceReadyTimeout clock: its pods wait on a
+	// scheduling gate (queued for admission, by Kueue for one) or on an
+	// operator pause, and a queued workload is waiting, not failing. The
+	// escalation pass inside workload.Reconcile honours the cleared deadline
+	// and skips gated Instances; once the pods clear the gate the clock
+	// restarts from admission.
+	if err := r.reconcileHeldDeadlines(ctx, ir, byInstance, plan.Paused, plan.InstanceReadyTimeout); err != nil {
+		return 0, err
+	}
+	return nextAvailableIn, nil
+}
+
+// statusPublication is what one status write reads and publishes: the pods
+// and the rotation set the pass took, the plan, the roll target, the hold
+// the update pass reported and the Instances the pass began with.
+type statusPublication struct {
+	plan             workloadtypes.ComponentPlan
+	target           *appsv1.ControllerRevision
+	desiredByIdx     map[int32]int32
+	pods             workload.PodObservation
+	availableByPod   map[string]struct{}
+	templateHash     string
+	holdObserved     bool
+	hold             *workloadtypes.RolloutHold
+	instancesAtStart []int32
+}
+
+// decidePublication decides the status write on the pass's copy first and on
+// the live object otherwise. A publication that cannot be built from the
+// pass's reading is a failed status write on either path: counted as one,
+// nothing read live, nothing written.
+func (r *Reconciler) decidePublication(ctx context.Context, ir *v1beta1.InferenceReplica, p statusPublication) (nextAvailableIn time.Duration, ownerUnavailable bool, err error) {
+	nextAvailableIn, settled, err := r.publicationSettledOnCopy(ir, p)
+	if err != nil {
+		recordPublicationFailure(err)
+		return 0, false, err
+	}
+	if settled {
+		return nextAvailableIn, false, nil
+	}
+	return r.publishOnLiveObject(ctx, ir, p)
+}
+
+// publicationSettledOnCopy decides on the pass's copy whether the status
+// write has anything to write. The publication is computed over the pods
+// and its rows are compared with the copy's rows in place: a write sets
+// five fields of a row and clears three, so no row need be copied to know
+// whether it moves. With the rows settled, the fields beside them are
+// recomputed on a copy that shares the rows and clones the conditions and
+// the hold, the two the recompute writes in place, and compared with the
+// copy's. Equal: the live object needs no write, and the publication's
+// counters are mirrored onto the copy for the rest of the pass. Different:
+// the live object decides.
+func (r *Reconciler) publicationSettledOnCopy(ir *v1beta1.InferenceReplica, p statusPublication) (time.Duration, bool, error) {
+	// The three pod-derived row fields are the pass's view of its pods, never
+	// stored: the writer clears them before every write, so the copy is
+	// compared as the store holds it.
+	irstatus.ClearPodDerivedObservations(ir.Status.InstanceStatuses)
+	publication, counters, err := r.computePublication(ir, p)
+	if err != nil {
+		return 0, false, err
+	}
+	if !publishedRowsSettled(ir.Status.InstanceStatuses, publication) {
+		return 0, false, nil
+	}
+	trial := *ir
+	trial.Status.Conditions = slices.Clone(ir.Status.Conditions)
+	trial.Status.RolloutHold = ir.Status.RolloutHold.DeepCopy()
+	r.publishBesideRows(&trial, counters, p)
+	if !publishedStatusEqual(&ir.Status, &trial.Status) {
+		return 0, false, nil
+	}
+	mirrorBack(ir, &trial, publication)
+	return counters.NextAvailableIn, true, nil
+}
+
+// publishedRowsSettled reports whether writing the publication over the
+// rows would change none of them. A write sets a row's phase, pod count,
+// serving and available counts and admission from its publication entry
+// and clears the three pod-derived fields, so a row is settled when it
+// carries those five values and the three cleared. The rows and the
+// publication are the same Instances in the same order.
+func publishedRowsSettled(rows []v1beta1.OMENativeInstanceStatus, publication []workloadtypes.InstanceStatus) bool {
+	for i := range rows {
+		row, published := &rows[i], &publication[i]
+		if row.Phase != v1beta1convert.InstancePhaseFromWorkload(published.Phase) ||
+			row.PodCount != published.PodCount ||
+			row.ServingPodCount != published.ServingPodCount ||
+			row.AvailablePodCount != published.AvailablePodCount ||
+			row.Admitted != published.Admitted ||
+			row.ReadyPodCount != 0 || row.ScheduledPodCount != 0 || len(row.NodesOccupied) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// publishOnLiveObject reads the replica live under the conflict retry,
+// recomputes the published fields on it and writes it when they moved. A
+// deleted or replaced owner ends the write with ownerUnavailable; a spec the
+// pass did not plan against ends it with ErrStatusMutationPrecondition. The
+// committed values, or the unchanged ones, are mirrored onto the pass's copy.
+func (r *Reconciler) publishOnLiveObject(ctx context.Context, ir *v1beta1.InferenceReplica, p statusPublication) (nextAvailableIn time.Duration, ownerUnavailable bool, err error) {
+	key := client.ObjectKeyFromObject(ir)
+	ownerUID, ownerGeneration := ir.UID, ir.Generation
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		fresh := &v1beta1.InferenceReplica{}
 		source, err := irstatus.GetDecoded(ctx, r.liveReader(), key, fresh)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				// IR deleted under us; nothing to aggregate into.
 				obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultNotFound)
 				ownerUnavailable = true
 				return nil
@@ -246,110 +378,20 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 		if fresh.Generation != ownerGeneration && specChangedSincePlanned(ir, fresh) {
 			return workloadtypes.ErrStatusMutationPrecondition
 		}
-
-		// Snapshot the live status before recomputation so a no-op
-		// reconcile (computed == live) skips the Status().Update below.
-		// Every status write re-triggers this controller AND the
-		// irprojector rollup onto the parent ISVC, so at steady state the
-		// unconditional write amplified idle reconciles into a write
-		// storm. apimeta.SetStatusCondition preserves LastTransitionTime
-		// when the condition value is unchanged, so an unchanged status
-		// DeepEquals its prior snapshot.
+		// An unchanged status is not written: every status write re-triggers
+		// this controller and the parent's rollup. apimeta.SetStatusCondition
+		// keeps LastTransitionTime while a condition's value stands, so an
+		// unchanged status equals the copy taken before the recomputation.
 		before := fresh.Status.DeepCopy()
-
-		observation, err := workload.NewOwnedPublicationObservation(
-			v1beta1convert.InstanceStatusSliceToWorkload(fresh.Status.InstanceStatuses),
-			podObservation,
-			availableByPod,
-			workloadstatus.AvailabilityWindow{MinReadySeconds: plan.MinReadySeconds, Now: r.now()},
-		)
+		publication, counters, err := r.publish(fresh, p)
 		if err != nil {
-			return fmt.Errorf("aggregateAndWriteStatus: build publication observation: %w", err)
-		}
-		var targetName string
-		if target != nil {
-			targetName = target.Name
-		}
-		publication, counters, err := observation.TakeInlineV1Publication(desiredByIdx, targetName)
-		if err != nil {
-			return fmt.Errorf("aggregateAndWriteStatus: consume publication observation: %w", err)
+			return err
 		}
 		nextAvailableIn = counters.NextAvailableIn
-		for i := range fresh.Status.InstanceStatuses {
-			fresh.Status.InstanceStatuses[i].Phase = v1beta1convert.InstancePhaseFromWorkload(publication[i].Phase)
-			fresh.Status.InstanceStatuses[i].PodCount = publication[i].PodCount
-			fresh.Status.InstanceStatuses[i].ReadyPodCount = publication[i].ReadyPodCount
-			fresh.Status.InstanceStatuses[i].ServingPodCount = publication[i].ServingPodCount
-			fresh.Status.InstanceStatuses[i].AvailablePodCount = publication[i].AvailablePodCount
-			fresh.Status.InstanceStatuses[i].ScheduledPodCount = publication[i].ScheduledPodCount
-			fresh.Status.InstanceStatuses[i].Admitted = publication[i].Admitted
-			fresh.Status.InstanceStatuses[i].NodesOccupied = publication[i].NodesOccupied
-		}
-
-		// Component-level counters consume the same publication observation.
-		fresh.Status.Replicas = counters.Replicas
-		fresh.Status.ServingReplicas = counters.ServingReplicas
-		// ReadyReplicas + AvailableReplicas use the publication
-		// observation above. The surge-tolerant classifier
-		// (InstanceMeetsThreshold) means an Instance with the canonical
-		// pod ContainersReady is counted even mid-surge or mid-drain,
-		// while availability follows EndpointSlice membership plus the
-		// spec.minReadySeconds Ready-age window.
-		fresh.Status.ReadyReplicas = counters.ReadyReplicas
-		fresh.Status.AvailableReplicas = counters.AvailableReplicas
-		if target != nil {
-			fresh.Status.UpdatedReplicas = counters.UpdatedReplicas
-			fresh.Status.UpdatedReadyReplicas = counters.UpdatedReadyReplicas
-			withdrawn := withdrawnRevisionFor(&fresh.Status)
-			fresh.Status.UpdateRevision = target.Name
-			fresh.Status.ObservedTemplateHash = templateHashOf(ir)
-			recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, fresh.Status.CurrentRevision)
-		}
-		irstatus.ClearPodDerivedObservations(fresh.Status.InstanceStatuses)
-
-		fresh.Status.ObservedGeneration = fresh.Generation
-		fresh.Status.PlacementObservedGeneration = 0
-		if ir.Spec.PlacementExecution != nil {
-			fresh.Status.PlacementObservedGeneration = fresh.Generation
-		}
-		fresh.Status.LabelSelector = irLabelSelectorString(fresh.NamePrefix(), fresh.Spec.Component)
-
-		// Top-level Ready condition. Two-axis rule:
-		//   Status=True    when ReadyReplicas == Replicas AND
-		//                  CurrentRevision == UpdateRevision (fully
-		//                  converged, no rollout in flight).
-		//   Status=False   when any Instance has Phase=Failed OR the
-		//                  serving Instance count is below the availability
-		//                  floor (lifecycle rollingUpdate.maxUnavailable)
-		//                  with no in-flight rollout.
-		//   Status=Unknown when CurrentRevision != UpdateRevision —
-		//                  explicit "churning, check back" so
-		//                  `kubectl wait --for=condition=Ready` doesn't
-		//                  short-circuit mid-rollout.
-		apimeta.SetStatusCondition(&fresh.Status.Conditions, computeReadyCondition(&fresh.Status, fresh.Spec.Replicas, fresh.Spec.Lifecycle, fresh.Spec.Pacing))
-		// Advisory RolloutStalled condition — surfaces a rollout wedged on
-		// failing Instances (e.g. new-rev CrashLoopBackOff) without affecting
-		// the Ready condition above (old-rev pods keep serving).
-		apimeta.SetStatusCondition(&fresh.Status.Conditions, computeRolloutStalledCondition(&fresh.Status))
-		// Advisory DrainOverdue condition — surfaces Instances stuck on
-		// their way out past the deadline of the delete operation
-		// draining them. Derived from the rows themselves, so it clears
-		// on its own once no Instance is overdue.
-		apimeta.SetStatusCondition(&fresh.Status.Conditions, computeDrainOverdueCondition(&fresh.Status))
-		now := r.now()
-		removed := anyInstanceRemoved(instancesAtStart, fresh.Status.InstanceStatuses)
-		fresh.Status.RolloutHold = nextRolloutHold(fresh.Status.RolloutHold,
-			effectiveRolloutHold(holdObserved, hold, &fresh.Status, removed, now), metav1.NewTime(now))
-
-		// Skip the write when the recomputed status matches what's
-		// already live: a no-op reconcile must perform ZERO writes so it
-		// triggers nothing downstream. The in-memory mirror below still
-		// runs so callers in this pass observe the fresh counters.
-		if equality.Semantic.DeepEqual(*before, fresh.Status) {
+		if publishedStatusEqual(before, &fresh.Status) {
 			mirrorBack(ir, fresh, publication)
 			return nil
 		}
-
 		if err := updateInferenceReplicaStatus(ctx, r.statusWriter(), fresh, source); err != nil {
 			if apierrors.IsNotFound(err) {
 				obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultNotFound)
@@ -358,39 +400,125 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 			}
 			return fmt.Errorf("aggregateAndWriteStatus: update IR status: %w", err)
 		}
-
-		// Mirror committed Component fields and Conditions together with the
-		// transient publication counters needed by the rest of this pass.
 		mirrorBack(ir, fresh, publication)
 		obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultSuccess)
 		return nil
-	}); err != nil {
-		// A generation change replans without a write outcome. Other terminal
-		// retry failures retain their status-write classification.
-		if !errors.Is(err, workloadtypes.ErrStatusMutationPrecondition) {
-			if apierrors.IsConflict(err) {
-				obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultConflict)
-			} else {
-				obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultError)
-			}
-		}
-		return 0, err
+	})
+	if err != nil {
+		recordPublicationFailure(err)
+		return 0, false, err
 	}
-	if ownerUnavailable {
-		return 0, nil
+	return nextAvailableIn, ownerUnavailable, nil
+}
+
+// recordPublicationFailure counts a failed status write by its kind. A
+// generation change replans without a write outcome and is not counted.
+func recordPublicationFailure(err error) {
+	switch {
+	case errors.Is(err, workloadtypes.ErrStatusMutationPrecondition):
+	case apierrors.IsConflict(err):
+		obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultConflict)
+	default:
+		obsmetrics.RecordStatusUpdate(obsmetrics.ControllerIR, obsmetrics.ResultError)
+	}
+}
+
+// publish recomputes the published part of ir's status in place: the rows'
+// phases and counters over the pods, the Component counters, the revision
+// pair, the observed generations, the selector, the three conditions and
+// the hold. It returns the publication rows the mirror reads and the
+// counters.
+func (r *Reconciler) publish(ir *v1beta1.InferenceReplica, p statusPublication) ([]workloadtypes.InstanceStatus, workload.ComponentCounters, error) {
+	publication, counters, err := r.computePublication(ir, p)
+	if err != nil {
+		return nil, workload.ComponentCounters{}, err
+	}
+	publishRows(ir.Status.InstanceStatuses, publication)
+	r.publishBesideRows(ir, counters, p)
+	return publication, counters, nil
+}
+
+// computePublication reads the rows against the pods: each Instance's
+// publication row and the Component counters, as the write would publish
+// them, with nothing written.
+func (r *Reconciler) computePublication(ir *v1beta1.InferenceReplica, p statusPublication) ([]workloadtypes.InstanceStatus, workload.ComponentCounters, error) {
+	observation, err := workload.NewOwnedPublicationObservation(
+		v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses),
+		p.pods,
+		p.availableByPod,
+		workloadstatus.AvailabilityWindow{MinReadySeconds: p.plan.MinReadySeconds, Now: r.now()},
+	)
+	if err != nil {
+		return nil, workload.ComponentCounters{}, fmt.Errorf("aggregateAndWriteStatus: build publication observation: %w", err)
+	}
+	var targetName string
+	if p.target != nil {
+		targetName = p.target.Name
+	}
+	publication, counters, err := observation.TakeInlineV1Publication(p.desiredByIdx, targetName)
+	if err != nil {
+		return nil, workload.ComponentCounters{}, fmt.Errorf("aggregateAndWriteStatus: consume publication observation: %w", err)
+	}
+	return publication, counters, nil
+}
+
+// publishRows writes each row's publication entry onto it: the phase, the
+// pod count, the serving and available counts and the admission. The three
+// pod-derived fields are cleared: the store never holds them.
+func publishRows(rows []v1beta1.OMENativeInstanceStatus, publication []workloadtypes.InstanceStatus) {
+	for i := range rows {
+		row := &rows[i]
+		row.Phase = v1beta1convert.InstancePhaseFromWorkload(publication[i].Phase)
+		row.PodCount = publication[i].PodCount
+		row.ServingPodCount = publication[i].ServingPodCount
+		row.AvailablePodCount = publication[i].AvailablePodCount
+		row.Admitted = publication[i].Admitted
+	}
+	irstatus.ClearPodDerivedObservations(rows)
+}
+
+// publishBesideRows writes the published fields beside the rows: the
+// Component counters, the revision pair and the condition it keeps, the
+// observed generations, the selector, the three conditions and the hold.
+// It reads the rows as they stand.
+func (r *Reconciler) publishBesideRows(ir *v1beta1.InferenceReplica, counters workload.ComponentCounters, p statusPublication) {
+	// Ready counts the Instances whose canonical pod is ContainersReady,
+	// mid-surge or mid-drain included (InstanceMeetsThreshold); Available
+	// follows EndpointSlice membership and the spec.minReadySeconds window.
+	ir.Status.Replicas = counters.Replicas
+	ir.Status.ServingReplicas = counters.ServingReplicas
+	ir.Status.ReadyReplicas = counters.ReadyReplicas
+	ir.Status.AvailableReplicas = counters.AvailableReplicas
+	if p.target != nil {
+		ir.Status.UpdatedReplicas = counters.UpdatedReplicas
+		ir.Status.UpdatedReadyReplicas = counters.UpdatedReadyReplicas
+		withdrawn := withdrawnRevisionFor(&ir.Status)
+		ir.Status.UpdateRevision = p.target.Name
+		ir.Status.ObservedTemplateHash = p.templateHash
+		recordCurrentRevisionWithdrawal(&ir.Status, withdrawn, ir.Status.CurrentRevision, r.now())
 	}
 
-	// Park the InstanceReadyTimeout clock for any Instance whose pods are
-	// held by a scheduling gate (queued for admission, e.g. by Kueue) or
-	// by an operator pause: a gated/paused workload is queued, not stuck,
-	// so the wait must not count against the deadline. The escalation
-	// pass inside workload.Reconcile honors the parked (zeroed) deadline
-	// and additionally skips gated Instances outright; once the pods
-	// clear the gate the clock restarts from admission.
-	if err := r.reconcileHeldDeadlines(ctx, ir, byIndex, plan.Paused, plan.InstanceReadyTimeout); err != nil {
-		return 0, err
+	ir.Status.ObservedGeneration = ir.Generation
+	ir.Status.PlacementObservedGeneration = 0
+	if ir.Spec.PlacementExecution != nil {
+		ir.Status.PlacementObservedGeneration = ir.Generation
 	}
-	return nextAvailableIn, nil
+	ir.Status.LabelSelector = irLabelSelectorString(ir.NamePrefix(), ir.Spec.Component)
+
+	// Ready is True when every Instance is Ready and the revision pair is
+	// equal, False on a Failed Instance or a serving count under the
+	// lifecycle minimum with no roll in flight, and Unknown while a roll is
+	// in flight, so `kubectl wait --for=condition=Ready` does not end early.
+	// RolloutStalled and DrainOverdue are advisory, beside Ready. Every
+	// time the publication writes is the pass's clock, so two publications
+	// of one reading agree to the second whenever they run.
+	now := r.now()
+	setConditionAt(&ir.Status.Conditions, computeReadyCondition(&ir.Status, ir.Spec.Replicas, ir.Spec.Lifecycle, ir.Spec.Pacing), now)
+	setConditionAt(&ir.Status.Conditions, computeRolloutStalledCondition(&ir.Status), now)
+	setConditionAt(&ir.Status.Conditions, computeDrainOverdueCondition(&ir.Status), now)
+	removed := anyInstanceRemoved(p.instancesAtStart, ir.Status.InstanceStatuses)
+	ir.Status.RolloutHold = nextRolloutHold(ir.Status.RolloutHold,
+		effectiveRolloutHold(p.holdObserved, p.hold, &ir.Status, removed, now), metav1.NewTime(now))
 }
 
 // specChangedSincePlanned reports whether the live spec differs from the one
@@ -453,65 +581,94 @@ func mirrorBack(ir, fresh *v1beta1.InferenceReplica, publication []workloadtypes
 	}
 }
 
-// reconcileHeldDeadlines parks/restarts InstanceReadyTimeout around either
-// admission gating or an operator pause. Pausing holds every in-flight
-// Instance and every open move record; unpausing rearms each parked deadline
-// from that point unless its pods remain admission-gated.
+// reconcileHeldDeadlines stops and starts the InstanceReadyTimeout clocks
+// of the Instances a hold covers: a pause, an admission gate on one of an
+// Instance's pods, or the gate on the surge bucket a gang-surge source's
+// attempt pods run in. A held Instance's clock stops; a released one starts
+// again from now. The open move records' clocks follow the pause the same
+// way. Only a row with an operation open carries a clock, so the step reads
+// nothing when no row has one and no move record is open.
 func (r *Reconciler) reconcileHeldDeadlines(ctx context.Context, ir *v1beta1.InferenceReplica, byIndex map[int32][]*corev1.Pod, paused bool, timeout time.Duration) error {
 	if ir == nil {
 		return nil
 	}
-	held := make(map[int32]bool, len(byIndex))
+	rows := rowsWithAnOperation(ir.Status.InstanceStatuses)
+	if len(rows) == 0 && len(ir.Status.Migrations) == 0 {
+		return nil
+	}
+	input := r.buildDeadlineInput(ir, rows)
+	if err := escalation.ReconcileGatedDeadlines(ctx, input, rows, heldInstances(rows, byIndex, paused), timeout); err != nil {
+		return err
+	}
+	return escalation.ReconcilePausedMigrationDeadlines(ctx, input, paused, timeout)
+}
+
+// rowsWithAnOperation converts the rows with an operation open to the
+// engine's row shape: the rows the deadline step reads, since a clock runs
+// only under an operation and a surge row is looked up for its operation
+// alone. Nil when no row has one.
+func rowsWithAnOperation(statuses []v1beta1.OMENativeInstanceStatus) []workloadtypes.InstanceStatus {
+	count := 0
+	for i := range statuses {
+		if statuses[i].Operation != nil {
+			count++
+		}
+	}
+	if count == 0 {
+		return nil
+	}
+	rows := make([]workloadtypes.InstanceStatus, 0, count)
+	for i := range statuses {
+		if statuses[i].Operation != nil {
+			rows = append(rows, v1beta1convert.InstanceStatusToWorkload(statuses[i]))
+		}
+	}
+	return rows
+}
+
+// heldInstances is the set of Instances whose clock stops: an Instance
+// with a pod behind an admission gate, a gang-surge source whose attempt
+// pods run in its surge bucket while that bucket has one, and every
+// Instance under a pause.
+func heldInstances(rows []workloadtypes.InstanceStatus, byIndex map[int32][]*corev1.Pod, paused bool) map[int32]bool {
+	held := make(map[int32]bool, len(rows))
 	for idx, pods := range byIndex {
-		for _, p := range pods {
-			if workloadtypes.PodAdmissionGated(p) {
+		for _, pod := range pods {
+			if workloadtypes.PodAdmissionGated(pod) {
 				held[idx] = true
 				break
 			}
 		}
 	}
-	// A gang-surge source's attempt pods live in its Operation.SurgeIndex
-	// bucket: while they queue for admission, the source's deadline must
-	// park too, or it expires during a legitimate wait.
-	for i := range ir.Status.InstanceStatuses {
-		s := &ir.Status.InstanceStatuses[i]
-		op := s.Operation
-		if op == nil || op.Type != v1beta1.InstanceOperationUpdate || op.SurgeIndex == nil {
+	for i := range rows {
+		op := rows[i].Operation
+		if op == nil || op.Type != workloadtypes.InstanceOperationUpdate || op.SurgeIndex == nil {
 			continue
 		}
 		if held[*op.SurgeIndex] {
-			held[s.Index] = true
+			held[rows[i].Index] = true
 		}
 	}
 	if paused {
-		for i := range ir.Status.InstanceStatuses {
-			held[ir.Status.InstanceStatuses[i].Index] = true
+		for i := range rows {
+			held[rows[i].Index] = true
 		}
 	}
-	input := r.buildDeadlineParkInput(ir)
-	if err := escalation.ReconcileGatedDeadlines(ctx, input,
-		v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses), held, timeout); err != nil {
-		return err
-	}
-	// The move records' clocks follow the pause the same way: a paused
-	// Component drives no record, so none of them runs out under it.
-	return escalation.ReconcilePausedMigrationDeadlines(ctx, input, paused, timeout)
+	return held
 }
 
-// buildDeadlineParkInput builds the minimal workload.ReconcileInput the
-// InstanceReadyTimeout parking step (escalation.ReconcileGatedDeadlines and
-// ReconcilePausedMigrationDeadlines) consumes: the deadline writes go
-// through MutateInstance and MutateMigration (same retry +
-// in-memory-mirror semantics as dispatch-time writes) and the clock seam
-// supplies now. The remaining callbacks satisfy the ReconcileInput
-// must-be-set contract as explicit no-ops — parking never removes
-// instances, writes conditions, or emits events.
-func (r *Reconciler) buildDeadlineParkInput(ir *v1beta1.InferenceReplica) workloadtypes.ReconcileInput {
+// buildDeadlineInput is the input the deadline step writes through: the
+// rows it reads and the move records as the observed state, the deadline
+// writes through MutateInstance and MutateMigration (the retry and the
+// in-memory mirror every status write has) and the pass's clock. The other
+// callbacks do nothing, as the input's contract asks: the step removes no
+// Instance, writes no condition and emits no event.
+func (r *Reconciler) buildDeadlineInput(ir *v1beta1.InferenceReplica, rows []workloadtypes.InstanceStatus) workloadtypes.ReconcileInput {
 	return workloadtypes.ReconcileInput{
 		OwnerObject:             ir,
 		OwnerGVK:                irGVK,
 		Key:                     buildKey(ir),
-		ObservedState:           observedFromIR(ir),
+		ObservedState:           workloadtypes.WorkloadObservedState{InstanceStatuses: rows, Migrations: migrationsFromIR(ir)},
 		Clock:                   r.Clock,
 		MutateInstance:          buildMutateInstance(r.statusWriter(), r.liveReader(), ir),
 		MutateMigration:         buildMutateMigration(r.statusWriter(), r.liveReader(), ir),
@@ -523,18 +680,18 @@ func (r *Reconciler) buildDeadlineParkInput(ir *v1beta1.InferenceReplica) worklo
 
 // mirrorInstanceCounters copies the published phase and the transient Pod
 // counters by Instance index. Other lifecycle fields and admission remain
-// untouched.
+// untouched. The rows' node lists are cut from one array for the whole
+// mirror, each capped at its own length, so a row's list is its own and
+// never the publication's or a neighbour's.
 func mirrorInstanceCounters(status *v1beta1.InferenceReplicaStatus, publication []workloadtypes.InstanceStatus) {
 	if status == nil {
 		return
 	}
-	publicationByIdx := make(map[int32]workloadtypes.InstanceStatus, len(publication))
-	for _, instance := range publication {
-		publicationByIdx[instance.Index] = instance
-	}
+	entries := indexPublication(publication)
+	names := make([]string, 0, entries.nodeNames)
 	for i := range status.InstanceStatuses {
 		s := &status.InstanceStatuses[i]
-		observed, ok := publicationByIdx[s.Index]
+		observed, ok := entries.of(i, s.Index)
 		if !ok {
 			continue
 		}
@@ -544,12 +701,81 @@ func mirrorInstanceCounters(status *v1beta1.InferenceReplicaStatus, publication 
 		s.ServingPodCount = observed.ServingPodCount
 		s.ScheduledPodCount = observed.ScheduledPodCount
 		s.AvailablePodCount = observed.AvailablePodCount
-		if observed.NodesOccupied != nil {
-			s.NodesOccupied = append([]string(nil), observed.NodesOccupied...)
-		} else {
-			s.NodesOccupied = nil
+		s.NodesOccupied, names = cutNodeNames(names, observed.NodesOccupied)
+	}
+}
+
+// publicationEntries finds a row's entry in a publication by Instance
+// index, the last entry when an index repeats. A publication built from the
+// rows lists them in their stored order, ascending by index, and is read in
+// place; a publication in any other order is indexed once.
+type publicationEntries struct {
+	entries   []workloadtypes.InstanceStatus
+	ascending bool
+	// last is the position of each index's last entry, built only when the
+	// indexes do not ascend.
+	last map[int32]int
+	// nodeNames is how many node names the entries carry in all.
+	nodeNames int
+}
+
+// indexPublication reads the publication once: whether its indexes ascend,
+// the position of each index's last entry when they do not, and the node
+// names its entries carry.
+func indexPublication(publication []workloadtypes.InstanceStatus) publicationEntries {
+	p := publicationEntries{entries: publication, ascending: true}
+	for i := range publication {
+		p.nodeNames += len(publication[i].NodesOccupied)
+		if i > 0 && publication[i].Index <= publication[i-1].Index {
+			p.ascending = false
 		}
 	}
+	if p.ascending {
+		return p
+	}
+	p.last = make(map[int32]int, len(publication))
+	for i := range publication {
+		p.last[publication[i].Index] = i
+	}
+	return p
+}
+
+// of is the entry of the Instance at index for the row at position: the
+// entry at the row's own position when the publication lists it there, the
+// one its index finds otherwise.
+func (p publicationEntries) of(position int, index int32) (*workloadtypes.InstanceStatus, bool) {
+	if !p.ascending {
+		i, found := p.last[index]
+		if !found {
+			return nil, false
+		}
+		return &p.entries[i], true
+	}
+	if position < len(p.entries) && p.entries[position].Index == index {
+		return &p.entries[position], true
+	}
+	i, found := slices.BinarySearchFunc(p.entries, index, compareEntryIndex)
+	if !found {
+		return nil, false
+	}
+	return &p.entries[i], true
+}
+
+// compareEntryIndex orders a publication entry against an Instance index.
+func compareEntryIndex(entry workloadtypes.InstanceStatus, index int32) int {
+	return cmp.Compare(entry.Index, index)
+}
+
+// cutNodeNames copies a node list onto the end of names and hands back the
+// copy, capped at its own length, with the grown names; a list of no name
+// is none.
+func cutNodeNames(names, nodes []string) (cut, grown []string) {
+	if len(nodes) == 0 {
+		return nil, names
+	}
+	start := len(names)
+	names = append(names, nodes...)
+	return names[start:len(names):len(names)], names
 }
 
 // hasFailedInstance reports whether at least one Instance has been
@@ -577,18 +803,29 @@ func withdrawnRevisionFor(st *v1beta1.InferenceReplicaStatus) string {
 
 // recordCurrentRevisionWithdrawal keeps the CurrentRevisionWithdrawn
 // condition in step with the revision pair a write is about to persist,
-// given the withdrawal on record and the current revision it replaces.
-func recordCurrentRevisionWithdrawal(st *v1beta1.InferenceReplicaStatus, before, oldCurrent string) {
+// given the withdrawal on record and the current revision it replaces. A
+// condition this write raises transitions at now, the pass's clock; a
+// standing one keeps its stored time.
+func recordCurrentRevisionWithdrawal(st *v1beta1.InferenceReplicaStatus, before, oldCurrent string, now time.Time) {
 	if workloadstatus.WithdrawnRevisionAfter(before, oldCurrent, st.CurrentRevision, st.UpdateRevision) == "" {
 		apimeta.RemoveStatusCondition(&st.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn)
 		return
 	}
 	apimeta.SetStatusCondition(&st.Conditions, metav1.Condition{
-		Type:    InferenceReplicaConditionCurrentRevisionWithdrawn,
-		Status:  metav1.ConditionTrue,
-		Reason:  ReasonInstanceOffRevision,
-		Message: "current revision withdrawn while an Instance still runs, or is pinned to, another revision",
+		Type:               InferenceReplicaConditionCurrentRevisionWithdrawn,
+		Status:             metav1.ConditionTrue,
+		Reason:             ReasonInstanceOffRevision,
+		Message:            "current revision withdrawn while an Instance still runs, or is pinned to, another revision",
+		LastTransitionTime: metav1.NewTime(now),
 	})
+}
+
+// setConditionAt merges cond into conditions with now as its transition
+// time: a new condition and a status that changed take now, a standing
+// condition keeps its stored time. The merge never reads the wall clock.
+func setConditionAt(conditions *[]metav1.Condition, cond metav1.Condition, now time.Time) {
+	cond.LastTransitionTime = metav1.NewTime(now)
+	apimeta.SetStatusCondition(conditions, cond)
 }
 
 // computeReadyCondition derives the Ready condition for the IR from
@@ -605,10 +842,9 @@ func recordCurrentRevisionWithdrawal(st *v1beta1.InferenceReplicaStatus, before,
 //  6. MinimumAvailable/ReplicaMismatch  — lifecycle availability floor
 //
 // Returns a metav1.Condition with ObservedGeneration stamped off
-// status.ObservedGeneration so consumers can correlate. The caller is
-// responsible for invoking apimeta.SetStatusCondition to merge the
-// returned condition into status.Conditions (which handles
-// LastTransitionTime correctly).
+// status.ObservedGeneration so consumers can correlate. The caller merges
+// the returned condition into status.Conditions with setConditionAt, which
+// gives a transition the pass's clock.
 // effectivePartition returns the partition the IR holds Instances at — the
 // projected spec.pacing.partition when set, else the user's lifecycle
 // rollingUpdate partition — or 0 when neither is set. It is the same source

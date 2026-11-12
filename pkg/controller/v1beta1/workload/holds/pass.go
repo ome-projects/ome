@@ -17,9 +17,10 @@ import (
 
 // Row is one observed Instance as the hold pass sees it.
 type Row struct {
-	// Status is the pass-start row. Every authority judges on it; the
-	// write itself is re-judged against the fresh row inside mark.
-	Status types.InstanceStatus
+	// Status is the pass-start row, read in place from the pass's
+	// observation. Every authority judges on it and none writes into it;
+	// the write itself is re-judged against the fresh row inside mark.
+	Status *types.InstanceStatus
 
 	// Desired is the row's desired canonical pod count.
 	Desired int32
@@ -58,7 +59,7 @@ func (in PassInput) rowPods(ctx context.Context, row Row) (own, attributed []*co
 	if err != nil {
 		return nil, nil, err
 	}
-	return byIdx[row.Status.Index], evidence.PodsForStuckCheck(row.Status, byIdx), nil
+	return byIdx[row.Status.Index], evidence.PodsForStuckCheck(*row.Status, byIdx), nil
 }
 
 // serving reports whether the row is already in rotation at its desired
@@ -79,10 +80,12 @@ func (in PassInput) serving(ctx context.Context, row Row) (bool, error) {
 // itself carries no time of its own: the one already recorded when the
 // row holds the token, otherwise now.
 //
-// Nothing measures a window from it — a hold stamped this way resolves
-// itself and never escalates. It is re-read so that re-observing an
-// unchanged hold produces an identical record and the status no-op guard
-// keeps the pass write-free.
+// Nothing measures a window from it. The escalation pass measures a
+// scheduler wait stamped this way from the attempt's placement wait, which
+// decidePlacementWait records. Every other hold stamped this way resolves
+// itself and never escalates.
+// It is re-read so that re-observing an unchanged hold produces an
+// identical record and the status no-op guard keeps the pass write-free.
 func heldSince(s types.InstanceStatus, token string, now time.Time) metav1.Time {
 	if s.Operation != nil && s.Operation.Waiting == token &&
 		s.LastFailure != nil && s.LastFailure.Reason == token && !s.LastFailure.Time.IsZero() {
@@ -124,7 +127,8 @@ func RowsForPlan(plan types.ComponentPlan, statuses []types.InstanceStatus, excl
 		planned[plan.Instances[i].Index] = &plan.Instances[i]
 	}
 	rows := make([]Row, 0, len(statuses))
-	for _, row := range statuses {
+	for i := range statuses {
+		row := &statuses[i]
 		_, skip := excluded[row.Index]
 		rows = append(rows, Row{
 			Status:   row,
@@ -148,23 +152,28 @@ func RowsForPlan(plan types.ComponentPlan, statuses []types.InstanceStatus, excl
 func Run(ctx context.Context, in PassInput) (Result, error) {
 	in.drainer = drain.NewBatcher(in.Deps.Reader(), in.Input.Key.Namespace)
 	var out Result
+	// The readings of one row at a time, in the pass's one buffer: nothing
+	// reads a row's readings once its row is done.
+	readings := make([]reading, len(table))
 	for _, row := range in.Rows {
-		if err := runRow(ctx, in, row, &out); err != nil {
+		clear(readings)
+		if err := runRow(ctx, in, row, readings, &out); err != nil {
 			return out, err
 		}
 	}
 	return out, nil
 }
 
-// runRow runs read, then release, then record for one row. The
+// runRow runs read, then release, then record for one row, with readings
+// as its scratch: one slot per authority in table order, every slot zero
+// on entry, and a slot left zero for an authority the row skips. The
 // attempt's placement wait (placementWait) is written once when it is
 // recorded and once when it is retired, never pass after pass. Each rides
 // on the write of a placement hold recorded or released in the same pass
 // when there is one, and is a status write of its own otherwise: retiring
 // it once the member rebuilt for a name the sweep freed is placed, with no
 // hold left to release, is one.
-func runRow(ctx context.Context, in PassInput, row Row, out *Result) error {
-	readings := make([]reading, len(table))
+func runRow(ctx context.Context, in PassInput, row Row, readings []reading, out *Result) error {
 	for i, a := range table {
 		if row.skips(a) {
 			continue
@@ -215,5 +224,5 @@ func (r Row) skips(a authority) bool {
 	if a.everyRow {
 		return false
 	}
-	return r.Excluded || types.Owner(&r.Status) == types.OwnerNone
+	return r.Excluded || types.Owner(r.Status) == types.OwnerNone
 }

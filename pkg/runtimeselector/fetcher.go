@@ -2,9 +2,9 @@ package runtimeselector
 
 import (
 	"context"
+	"errors"
 	"sort"
 
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -67,25 +67,21 @@ func (f *DefaultRuntimeFetcher) FetchRuntimes(ctx context.Context, namespace str
 //   - empty: namespace-scoped takes precedence over cluster-scoped on name
 //     collision.
 func (f *DefaultRuntimeFetcher) GetRuntime(ctx context.Context, name string, namespace string, kind string) (*v1beta1.ServingRuntimeSpec, bool, error) {
-	clusterFirst := []bool{true, false}
-	namespacedFirst := []bool{false, true}
-	namespacedOnly := []bool{false}
-
-	scopes := namespacedFirst
+	scopes := []scope{namespaceScope, clusterScope}
 	switch kind {
 	case KindClusterServingRuntime:
-		scopes = clusterFirst
+		scopes = []scope{clusterScope, namespaceScope}
 	case KindServingRuntime:
-		scopes = namespacedOnly
+		scopes = []scope{namespaceScope}
 	}
 
-	for _, cluster := range scopes {
-		spec, found, err := f.resolveScope(ctx, name, namespace, cluster)
+	for _, s := range scopes {
+		spec, found, err := f.resolveScope(ctx, name, namespace, s)
 		if err != nil {
 			return nil, false, err
 		}
 		if found {
-			return spec, cluster, nil
+			return spec, s == clusterScope, nil
 		}
 	}
 	return nil, false, &RuntimeNotFoundError{
@@ -95,43 +91,34 @@ func (f *DefaultRuntimeFetcher) GetRuntime(ctx context.Context, name string, nam
 	}
 }
 
-// resolveScope resolves name in a single scope; found=false (with nil
-// error) means the runtime does not exist in that scope.
-func (f *DefaultRuntimeFetcher) resolveScope(ctx context.Context, name string, namespace string, cluster bool) (*v1beta1.ServingRuntimeSpec, bool, error) {
-	if cluster {
-		if _, err := f.getClusterHead(ctx, name); err != nil {
-			if errors.IsNotFound(err) {
-				return nil, false, nil
-			}
-			return nil, false, err
-		}
-		spec, _, err := runtimeinheritance.ResolveClusterRuntime(ctx, f.client, name)
-		return spec, true, err
+// scope is one of the two places a runtime may live.
+type scope int
+
+const (
+	namespaceScope scope = iota
+	clusterScope
+)
+
+// resolveScope resolves name in a single scope through the inheritance
+// resolver, which reads the runtime once and merges its inherit-from chain.
+// A runtime missing from the scope reads as ErrParentNotFound: found=false,
+// nil error. A missing parent further up the chain is a *ParentNotFoundError,
+// which does not match ErrParentNotFound, so it returns as the error.
+func (f *DefaultRuntimeFetcher) resolveScope(ctx context.Context, name string, namespace string, s scope) (*v1beta1.ServingRuntimeSpec, bool, error) {
+	var spec *v1beta1.ServingRuntimeSpec
+	var err error
+	if s == clusterScope {
+		spec, _, err = runtimeinheritance.ResolveClusterRuntime(ctx, f.client, name)
+	} else {
+		spec, _, err = runtimeinheritance.ResolveNamespacedRuntime(ctx, f.client, namespace, name)
 	}
-	if _, err := f.getNamespacedHead(ctx, namespace, name); err != nil {
-		if errors.IsNotFound(err) {
-			return nil, false, nil
-		}
+	if errors.Is(err, runtimeinheritance.ErrParentNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
 		return nil, false, err
 	}
-	spec, _, err := runtimeinheritance.ResolveNamespacedRuntime(ctx, f.client, namespace, name)
-	return spec, true, err
-}
-
-func (f *DefaultRuntimeFetcher) getNamespacedHead(ctx context.Context, namespace, name string) (*v1beta1.ServingRuntime, error) {
-	sr := &v1beta1.ServingRuntime{}
-	if err := f.client.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, sr); err != nil {
-		return nil, err
-	}
-	return sr, nil
-}
-
-func (f *DefaultRuntimeFetcher) getClusterHead(ctx context.Context, name string) (*v1beta1.ClusterServingRuntime, error) {
-	csr := &v1beta1.ClusterServingRuntime{}
-	if err := f.client.Get(ctx, client.ObjectKey{Name: name}, csr); err != nil {
-		return nil, err
-	}
-	return csr, nil
+	return spec, true, nil
 }
 
 func sortServingRuntimeList(runtimes *v1beta1.ServingRuntimeList) {

@@ -62,31 +62,9 @@ type RuntimeSelection struct {
 	IsCluster bool
 }
 
-// RuntimeMatch is a RuntimeSelection enriched with the per-dimension match
-// details that drove its score, useful for debugging selection decisions.
-type RuntimeMatch struct {
-	RuntimeSelection
-	MatchDetails MatchDetails
-}
-
-// MatchDetails records which dimensions of runtime-model compatibility
-// contributed to (or excluded) a match. Fields default to true for
-// dimensions that the matcher silently accepts when neither side specifies
-// them (e.g. ArchitectureMatch is true when both model and runtime omit
-// ModelArchitecture).
-type MatchDetails struct {
-	FormatMatch             bool
-	FrameworkMatch          bool
-	SizeMatch               bool
-	ArchitectureMatch       bool
-	DiffusionPipelineMatch  bool
-	QuantizationMatch       bool
-	ModelCacheProviderMatch bool
-	Priority                int32
-	Weight                  int64
-	AutoSelectEnabled       bool
-	Reasons                 []string
-}
+// RuntimeMatch is one ranked candidate for the model. It is the selection
+// record itself: a candidate carries nothing the chosen runtime does not.
+type RuntimeMatch = RuntimeSelection
 
 // RuntimeFetcher abstracts the fetching of runtime resources.
 type RuntimeFetcher interface {
@@ -116,29 +94,17 @@ func (c *RuntimeCollection) forEach(fn func(name string, spec *v1beta1.ServingRu
 // RuntimeMatcher answers whether a runtime serves a model for a service,
 // and why not.
 type RuntimeMatcher interface {
-	// IsCompatible is GetCompatibilityDetails's answer as a bool. The error
-	// is set only when the runtime will not serve the service at all: a
-	// RuntimeDisabledError for a disabled runtime, a RuntimeCompatibilityError
-	// for one that does not declare the service's accelerator class or
-	// deployment mode. A model that no format or the size range fits gives
-	// false and a nil error.
-	IsCompatible(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (bool, error)
-
 	// GetCompatibilityDetails runs the compatibility checks in order and
-	// reports the first one the runtime failed with its reason, or the
-	// format match that made the runtime compatible. The reasons are the
-	// texts NoRuntimeFoundError lists per excluded runtime.
+	// reports the first one the runtime failed with its reason. The reasons
+	// are the texts NoRuntimeFoundError lists per excluded runtime.
 	GetCompatibilityDetails(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (*CompatibilityReport, error)
 }
 
 // CompatibilityReport is one runtime's answer for one model and service:
-// compatible, with the details of the format match, or the first failed
-// check with its reason.
+// compatible, or the first failed check with its reason.
 type CompatibilityReport struct {
 	IsCompatible           bool
-	MatchDetails           MatchDetails
 	IncompatibilityReasons []string
-	Warnings               []string
 
 	failedCheck compatibilityCheck
 }
@@ -173,11 +139,6 @@ type RuntimeScorer interface {
 // Config holds configuration for the runtime selector.
 type Config struct {
 	Client client.Client
-
-	// EnableDetailedLogging is retained for backward compatibility with
-	// external callers; it is currently a no-op (verbose logs use
-	// log.V() levels driven by the global log config instead).
-	EnableDetailedLogging bool
 
 	// DefaultPriority is the multiplier used when a SupportedModelFormat
 	// doesn't set Priority explicitly.

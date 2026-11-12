@@ -515,7 +515,7 @@ func (r *inPlaceRoll) recordRefusedPatch(ctx context.Context, pod *corev1.Pod, e
 	if !rejection.Class.Permanent() {
 		return false, nil
 	}
-	if derr := disposeRejectedAttempt(ctx, r.deps, r.input, r.inst.Index, r.target.Name, pod.Name, rejection, true); derr != nil {
+	if derr := disposeRejectedAttempt(ctx, r.deps, r.input, r.inst.Index, r.target.Name, pod.Name, rejection, refusalEndsTheAttempt); derr != nil {
 		return true, fmt.Errorf("dispose rejected in-place patch (instance=%d, pod=%s): %w", r.inst.Index, pod.Name, derr)
 	}
 	return true, nil
@@ -621,10 +621,7 @@ func imagePatchTargets(pod *corev1.Pod, target *corev1.PodSpec) map[string]strin
 	if pod == nil || target == nil {
 		return nil
 	}
-	currentImages := make(map[string]string, len(pod.Spec.Containers))
-	for _, container := range pod.Spec.Containers {
-		currentImages[container.Name] = container.Image
-	}
+	currentImages := containerImages(&pod.Spec)
 	patches := make(map[string]string)
 	for _, container := range target.Containers {
 		if current, found := currentImages[container.Name]; found && current != container.Image {
@@ -639,13 +636,11 @@ func imagePatchTargets(pod *corev1.Pod, target *corev1.PodSpec) map[string]strin
 
 // ensureInPlaceImageTransition persists, before any image patch is issued,
 // the images the patch moves each container to and the restart count the
-// container has at that point. Pending container names survive a retarget,
-// with their expected values rewritten from the current target and their
-// count re-recorded. A recorded count is refreshed only for a Ready
-// container whose count has moved since: its readiness could promote the
-// row, so its baseline must be the count the patch is issued against. A
-// container that is not Ready keeps its baseline, so a crash loop that
-// restarts it between passes never defers the patch.
+// container has at that point. The record pod carries is carried over to
+// the target (carriedImageTransition) or started over, the patched
+// containers are added (recordPatches), and the record is written when it
+// differs from the one the pod carries. Reports whether the record is in
+// place: a write ends the pass, and the next pass finds it.
 func ensureInPlaceImageTransition(ctx context.Context, c client.Client, pod *corev1.Pod, target *corev1.PodSpec, patches map[string]string) (bool, error) {
 	if pod == nil || target == nil {
 		return false, nil
@@ -654,38 +649,14 @@ func ensureInPlaceImageTransition(ctx context.Context, c client.Client, pod *cor
 	if !present && len(patches) == 0 {
 		return true, nil
 	}
-	targetImages := make(map[string]string, len(target.Containers))
-	for _, container := range target.Containers {
-		targetImages[container.Name] = container.Image
+	targetImages := containerImages(target)
+	carried := carriedImageTransition(current, present && valid, targetImages)
+	desired := carried
+	if desired == nil {
+		desired = startedOverImageTransition(present, targetImages)
 	}
-	desired := &inPlaceImageTransition{TargetImages: make(map[string]string), RestartCounts: make(map[string]int32)}
-	if present && valid {
-		for name := range current.TargetImages {
-			image, found := targetImages[name]
-			if !found {
-				valid = false
-				break
-			}
-			desired.TargetImages[name] = image
-			if count, recorded := current.RestartCounts[name]; recorded {
-				desired.RestartCounts[name] = count
-			}
-		}
-	}
-	if present && !valid {
-		desired.TargetImages = maps.Clone(targetImages)
-		desired.RestartCounts = make(map[string]int32)
-	}
-	for name, image := range patches {
-		live := containerRestartCount(pod, name)
-		recorded, known := desired.RestartCounts[name]
-		sameTarget := known && desired.TargetImages[name] == image
-		if !sameTarget || (recorded != live && containerReady(pod, name)) {
-			desired.RestartCounts[name] = live
-		}
-		desired.TargetImages[name] = image
-	}
-	if present && valid && maps.Equal(current.TargetImages, desired.TargetImages) && maps.Equal(current.RestartCounts, desired.RestartCounts) {
+	desired.recordPatches(pod, patches)
+	if carried != nil && current.equal(desired) {
 		return true, nil
 	}
 	if err := patchInPlaceImageTransition(ctx, c, pod, desired); err != nil {
@@ -694,14 +665,78 @@ func ensureInPlaceImageTransition(ctx context.Context, c client.Client, pod *cor
 	return false, nil
 }
 
+// carriedImageTransition is the readable record a pod carries, carried
+// over to the target: each container it names at the target's image for
+// it, with its recorded restart count kept, so a pending container
+// survives a retarget. nil when the record is not readable or names a
+// container the target no longer has; the record then starts over.
+func carriedImageTransition(current *inPlaceImageTransition, readable bool, targetImages map[string]string) *inPlaceImageTransition {
+	if !readable {
+		return nil
+	}
+	carried := &inPlaceImageTransition{TargetImages: make(map[string]string), RestartCounts: make(map[string]int32)}
+	for name := range current.TargetImages {
+		image, found := targetImages[name]
+		if !found {
+			return nil
+		}
+		carried.TargetImages[name] = image
+		if count, recorded := current.RestartCounts[name]; recorded {
+			carried.RestartCounts[name] = count
+		}
+	}
+	return carried
+}
+
+// startedOverImageTransition is the record of a pod whose record cannot be
+// carried over: every target image with no count when the pod carried an
+// unreadable record, empty when it carried none.
+func startedOverImageTransition(present bool, targetImages map[string]string) *inPlaceImageTransition {
+	fresh := &inPlaceImageTransition{TargetImages: make(map[string]string), RestartCounts: make(map[string]int32)}
+	if present {
+		fresh.TargetImages = maps.Clone(targetImages)
+	}
+	return fresh
+}
+
+// recordPatches adds each patched container to the record: the image it
+// moves to and, unless the record already names that image for it with
+// the same count or the container is not Ready, the restart count it has
+// now. A Ready container's readiness could promote the row, so its
+// baseline must be the count the patch is issued against; a container
+// that is not Ready keeps its baseline, so a crash loop that restarts it
+// between passes never defers the patch.
+func (t *inPlaceImageTransition) recordPatches(pod *corev1.Pod, patches map[string]string) {
+	for name, image := range patches {
+		live := containerRestartCount(pod, name)
+		recorded, known := t.RestartCounts[name]
+		sameTarget := known && t.TargetImages[name] == image
+		if !sameTarget || (recorded != live && containerReady(pod, name)) {
+			t.RestartCounts[name] = live
+		}
+		t.TargetImages[name] = image
+	}
+}
+
+// equal reports whether two records name the same images and counts.
+func (t *inPlaceImageTransition) equal(other *inPlaceImageTransition) bool {
+	return maps.Equal(t.TargetImages, other.TargetImages) && maps.Equal(t.RestartCounts, other.RestartCounts)
+}
+
+// containerImages is each container's image in spec, by container name.
+func containerImages(spec *corev1.PodSpec) map[string]string {
+	images := make(map[string]string, len(spec.Containers))
+	for _, container := range spec.Containers {
+		images[container.Name] = container.Image
+	}
+	return images
+}
+
 func inPlaceImageTransitionMatchesTarget(transition *inPlaceImageTransition, target *corev1.PodSpec) bool {
 	if transition == nil || target == nil {
 		return false
 	}
-	targetImages := make(map[string]string, len(target.Containers))
-	for _, container := range target.Containers {
-		targetImages[container.Name] = container.Image
-	}
+	targetImages := containerImages(target)
 	for name, image := range transition.TargetImages {
 		if targetImages[name] != image {
 			return false

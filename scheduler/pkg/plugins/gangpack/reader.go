@@ -109,7 +109,7 @@ func newInformerReader(ctx context.Context, cfg *rest.Config, topologyKeyAnnotat
 // placementChanged reports whether a PodGroup update touched the facts
 // placement reads: the spec (minMember, gate timeout), the annotations (topology
 // key) or the labels (placement group). Status and metadata-only writes do not
-// count, so a controller refreshing status cannot wake parked members through
+// count, so a controller refreshing status cannot wake held members through
 // the backoff-bypassing activation.
 func placementChanged(oldPG, newPG *schedv1alpha1.PodGroup) bool {
 	if oldPG == nil || newPG == nil {

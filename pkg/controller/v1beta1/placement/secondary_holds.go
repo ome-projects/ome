@@ -53,13 +53,14 @@ func secondaryFloorHolds(minimum int32, members map[string]secondaryMember) map[
 	return out
 }
 
-// splitSecondaryHolds returns, per split member, the secondary floors that stay
-// above the step's apportionment until replacements elsewhere are ready. The
-// transition gates primary targets on readiness, but a secondary floor also
-// falls when the apportionment shifts under an unchanged target. A member with
-// no target or asked to drain is retired by the transition and is not held.
+// splitSecondaryHolds returns, per split member, the secondary minimums that
+// stay above the step's apportionment until replacements elsewhere are
+// ready. The transition gates primary targets on readiness, but a secondary
+// minimum also falls when the apportionment shifts under an unchanged
+// target. A member with no target or asked to drain is retired by the
+// transition and is not held.
 func splitSecondaryHolds(source *v1beta1.InferenceService, observations map[string]plannedMemberObservation) (map[string]map[v1beta1.ComponentType]int32, error) {
-	if mode := placementMode(source); mode != v1beta1.PlacementModeSplit && mode != v1beta1.PlacementModeSplitByCapacity {
+	if !dividesAcrossMembers(source) {
 		return nil, nil
 	}
 	minimums, err := splitComponentMinimums(source)
@@ -70,40 +71,75 @@ func splitSecondaryHolds(source *v1beta1.InferenceService, observations map[stri
 	if len(secondaries) == 0 {
 		return nil, nil
 	}
+	members, err := secondaryMembersOf(source, minimums, secondaries, observations)
+	if err != nil {
+		return nil, err
+	}
+	return secondaryHoldsPerMember(secondaries, members), nil
+}
+
+// dividesAcrossMembers reports whether the source's placement mode
+// apportions component minimums over several members.
+func dividesAcrossMembers(source *v1beta1.InferenceService) bool {
+	mode := placementMode(source)
+	return mode == v1beta1.PlacementModeSplit || mode == v1beta1.PlacementModeSplitByCapacity
+}
+
+// standsOnItsShare reports whether an allocation is a split member the step
+// keeps: it runs replicas under its share, not under a full policy (one that
+// runs the whole service), and is not asked to drain.
+func standsOnItsShare(assignment *v1beta1.CandidateAllocationStatus) bool {
+	return assignment != nil && assignment.CurrentHome == nil && assignment.CurrentReplicas > 0 && !assignment.DrainRequested
+}
+
+// secondaryMembersOf builds, per secondary component, every standing
+// member's view: the minimum its copy carries, the one the step apportions,
+// and its ready instances as observed.
+func secondaryMembersOf(source *v1beta1.InferenceService, minimums splitMinimums, secondaries map[v1beta1.ComponentType]int32, observations map[string]plannedMemberObservation) (map[v1beta1.ComponentType]map[string]secondaryMember, error) {
 	candidates := source.Status.Placement.Candidates
 	members := map[v1beta1.ComponentType]map[string]secondaryMember{}
 	for _, candidate := range candidates {
-		assignment := candidate.Allocation
-		if assignment == nil || assignment.CurrentHome != nil || assignment.CurrentReplicas <= 0 || assignment.DrainRequested {
+		if !standsOnItsShare(candidate.Allocation) {
 			continue
 		}
 		observed := observations[candidate.Cluster]
 		applied := memberFloors(observed.Member)
-		floors, _, err := minimums.memberShares(source, candidates, candidate, applied)
+		shares, _, err := minimums.memberShares(source, candidates, candidate, applied)
 		if err != nil {
 			return nil, err
 		}
-		next := floorMap(floors)
+		next := floorMap(shares)
 		for component := range secondaries {
 			if members[component] == nil {
 				members[component] = map[string]secondaryMember{}
 			}
-			members[component][candidate.Cluster] = secondaryMember{
-				Applied: applied[component], Next: next[component], Ready: observed.ComponentReady[component],
-				Known: observed.MemberState.Known, Serving: observed.MemberState.Routable,
-			}
+			members[component][candidate.Cluster] = secondaryMemberView(observed, component, applied[component], next[component])
 		}
 	}
+	return members, nil
+}
+
+// secondaryMemberView is one member's view of a secondary component.
+func secondaryMemberView(observed plannedMemberObservation, component v1beta1.ComponentType, applied, next int32) secondaryMember {
+	return secondaryMember{
+		Applied: applied, Next: next, Ready: observed.ComponentReady[component],
+		Known: observed.MemberState.Known, Serving: observed.MemberState.Routable,
+	}
+}
+
+// secondaryHoldsPerMember regroups each component's holds under the member
+// that keeps them.
+func secondaryHoldsPerMember(secondaries map[v1beta1.ComponentType]int32, members map[v1beta1.ComponentType]map[string]secondaryMember) map[string]map[v1beta1.ComponentType]int32 {
 	out := map[string]map[v1beta1.ComponentType]int32{}
 	for component, minimum := range secondaries {
-		for name, floor := range secondaryFloorHolds(minimum, members[component]) {
+		for name, held := range secondaryFloorHolds(minimum, members[component]) {
 			if out[name] == nil {
 				out[name] = map[v1beta1.ComponentType]int32{}
 			}
-			out[name][component] = floor
+			out[name][component] = held
 		}
 	}
-	return out, nil
+	return out
 }
 
 // memberFloors reads the floors written on a member copy, including the router

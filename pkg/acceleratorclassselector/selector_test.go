@@ -34,10 +34,6 @@ func (m *mockAcceleratorFetcher) GetAcceleratorClass(ctx context.Context, name s
 	return ac, found, nil
 }
 
-func (m *mockAcceleratorFetcher) FetchAcceleratorClasses(ctx context.Context) (*AcceleratorCollection, error) {
-	return &AcceleratorCollection{}, nil
-}
-
 // createRealisticAccelerators creates H100, A100, and T4 AcceleratorClass specs with realistic data
 func createRealisticAccelerators() map[string]*v1beta1.AcceleratorClassSpec {
 	return map[string]*v1beta1.AcceleratorClassSpec{
@@ -569,28 +565,7 @@ func TestGetAcceleratorClassByPolicy_AllPolicies(t *testing.T) {
 			}
 
 			// Create selector
-			config := &Config{
-				Client:                nil,
-				EnableDetailedLogging: false,
-			}
-			selector := &defaultSelector{
-				config:  config,
-				fetcher: mockFetcher,
-			}
-
-			// Create InferenceService
-			isvc := &v1beta1.InferenceService{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-isvc",
-					Namespace: "default",
-				},
-				Spec: v1beta1.InferenceServiceSpec{
-					AcceleratorSelector: &v1beta1.AcceleratorSelector{
-						Policy:      tt.policy,
-						Constraints: tt.constraints,
-					},
-				},
-			}
+			selector := &defaultSelector{fetcher: mockFetcher}
 
 			// Create ServingRuntime
 			runtime := &v1beta1.ServingRuntimeSpec{
@@ -602,7 +577,7 @@ func TestGetAcceleratorClassByPolicy_AllPolicies(t *testing.T) {
 			ctx := context.Background()
 
 			// Call getAcceleratorClassByPolicy
-			selected, err := selector.getAcceleratorClassByPolicy(ctx, isvc, runtime, tt.policy)
+			selected, err := selector.getAcceleratorClassByPolicy(ctx, runtime, tt.policy, tt.constraints)
 			if err != nil {
 				t.Fatalf("%s: getAcceleratorClassByPolicy() error: %v", tt.description, err)
 			}
@@ -644,24 +619,15 @@ func TestGetAcceleratorClassByPolicy_BestFitWithoutConstraints(t *testing.T) {
 					Performance: &v1beta1.AcceleratorPerformance{Fp16Tflops: ptr.To[int64](312)},
 				},
 			})
-			selector := &defaultSelector{config: &Config{}, fetcher: mockFetcher}
+			selector := &defaultSelector{fetcher: mockFetcher}
 
-			isvc := &v1beta1.InferenceService{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"},
-				Spec: v1beta1.InferenceServiceSpec{
-					AcceleratorSelector: &v1beta1.AcceleratorSelector{
-						Policy:      v1beta1.BestFitPolicy,
-						Constraints: tt.constraints,
-					},
-				},
-			}
 			runtime := &v1beta1.ServingRuntimeSpec{
 				AcceleratorRequirements: &v1beta1.AcceleratorRequirements{
 					AcceleratorClasses: []string{"memory-only", "with-compute-figures"},
 				},
 			}
 
-			selected, err := selector.getAcceleratorClassByPolicy(context.Background(), isvc, runtime, v1beta1.BestFitPolicy)
+			selected, err := selector.getAcceleratorClassByPolicy(context.Background(), runtime, v1beta1.BestFitPolicy, tt.constraints)
 			if err != nil {
 				t.Fatalf("getAcceleratorClassByPolicy() error: %v", err)
 			}
@@ -672,6 +638,123 @@ func TestGetAcceleratorClassByPolicy_BestFitWithoutConstraints(t *testing.T) {
 				t.Errorf("getAcceleratorClassByPolicy() = %s, want with-compute-figures", *selected)
 			}
 		})
+	}
+}
+
+// realisticSelector is a selector over the H100, A100 and T4 classes.
+func realisticSelector() *defaultSelector {
+	mockFetcher := newMockFetcher()
+	for name, spec := range createRealisticAccelerators() {
+		mockFetcher.addAccelerator(name, spec)
+	}
+	return &defaultSelector{fetcher: mockFetcher}
+}
+
+// selectedEngineClass is the class GetAcceleratorClass names for the engine of a
+// service with the given service-level selector and engine override, on a runtime
+// that lists the classes in order; "" when it names none.
+func selectedEngineClass(t *testing.T, selector *defaultSelector, service, override *v1beta1.AcceleratorSelector, classes []string) string {
+	t.Helper()
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"},
+		Spec: v1beta1.InferenceServiceSpec{
+			AcceleratorSelector: service,
+			Engine:              &v1beta1.EngineSpec{AcceleratorOverride: override},
+		},
+	}
+	runtime := &v1beta1.ServingRuntimeSpec{
+		AcceleratorRequirements: &v1beta1.AcceleratorRequirements{AcceleratorClasses: classes},
+	}
+	_, name, err := selector.GetAcceleratorClass(context.Background(), isvc, runtime, v1beta1.EngineComponent)
+	if err != nil {
+		t.Fatalf("GetAcceleratorClass() error: %v", err)
+	}
+	return name
+}
+
+// TestGetAcceleratorClass_OverrideConstraintsGovernThePolicyChoice: the policy
+// filters and scores the runtime's classes with the constraints of the first
+// selector that states a block, the component's override before the service's
+// selector; the block is taken whole, never merged with the service's, and an
+// empty block counts as stated.
+func TestGetAcceleratorClass_OverrideConstraintsGovernThePolicyChoice(t *testing.T) {
+	minMemory := func(gb int64) *v1beta1.AcceleratorConstraints {
+		return &v1beta1.AcceleratorConstraints{MinMemory: ptr.To(gb)}
+	}
+	tests := []struct {
+		name     string
+		service  *v1beta1.AcceleratorSelector
+		override *v1beta1.AcceleratorSelector
+		want     string
+	}{
+		{
+			name:     "the override's minMemory excludes the class the service's block admits",
+			service:  &v1beta1.AcceleratorSelector{Policy: v1beta1.CheapestPolicy, Constraints: minMemory(16)},
+			override: &v1beta1.AcceleratorSelector{Constraints: minMemory(40)},
+			want:     "nvidia-a100-40gb",
+		},
+		{
+			name:     "an override without a block falls back to the service's block",
+			service:  &v1beta1.AcceleratorSelector{Constraints: minMemory(40)},
+			override: &v1beta1.AcceleratorSelector{Policy: v1beta1.CheapestPolicy},
+			want:     "nvidia-a100-40gb",
+		},
+		{
+			name:     "an empty override block clears the service's constraints for this component",
+			service:  &v1beta1.AcceleratorSelector{Policy: v1beta1.CheapestPolicy, Constraints: minMemory(40)},
+			override: &v1beta1.AcceleratorSelector{Constraints: &v1beta1.AcceleratorConstraints{}},
+			want:     "nvidia-t4",
+		},
+		{
+			name:     "the override's block replaces the service's whole and is not merged with it",
+			service:  &v1beta1.AcceleratorSelector{Policy: v1beta1.CheapestPolicy, Constraints: minMemory(40)},
+			override: &v1beta1.AcceleratorSelector{Constraints: &v1beta1.AcceleratorConstraints{ExcludedClasses: []string{"nvidia-a100-40gb"}}},
+			want:     "nvidia-t4",
+		},
+		{
+			name:     "BestFit scores the memory fit against the override's minMemory",
+			service:  &v1beta1.AcceleratorSelector{Policy: v1beta1.BestFitPolicy},
+			override: &v1beta1.AcceleratorSelector{Constraints: minMemory(40)},
+			want:     "nvidia-a100-40gb",
+		},
+	}
+	classes := []string{"nvidia-h100-80gb", "nvidia-a100-40gb", "nvidia-t4"}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := selectedEngineClass(t, realisticSelector(), tt.service, tt.override, classes); got != tt.want {
+				t.Errorf("GetAcceleratorClass() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetAcceleratorClass_OverridePrecisionsGovernMostCapable: MostCapable ranks
+// compute at the precision the component's override prefers, not the one the
+// service's selector prefers.
+func TestGetAcceleratorClass_OverridePrecisionsGovernMostCapable(t *testing.T) {
+	mockFetcher := newMockFetcher()
+	mockFetcher.addAccelerator("fp32-class", &v1beta1.AcceleratorClassSpec{
+		Capabilities: v1beta1.AcceleratorCapabilities{
+			MemoryGB:    resource.NewQuantity(80*1024*1024*1024, resource.BinarySI),
+			Performance: &v1beta1.AcceleratorPerformance{Fp32Tflops: ptr.To[int64](100)},
+		},
+	})
+	mockFetcher.addAccelerator("fp8-class", &v1beta1.AcceleratorClassSpec{
+		Capabilities: v1beta1.AcceleratorCapabilities{
+			MemoryGB:    resource.NewQuantity(80*1024*1024*1024, resource.BinarySI),
+			Performance: &v1beta1.AcceleratorPerformance{Int8Tops: ptr.To[int64](100)},
+		},
+	})
+	selector := &defaultSelector{fetcher: mockFetcher}
+	service := &v1beta1.AcceleratorSelector{
+		Policy:      v1beta1.MostCapablePolicy,
+		Constraints: &v1beta1.AcceleratorConstraints{PreferredPrecisions: []string{"fp32"}},
+	}
+	override := &v1beta1.AcceleratorSelector{
+		Constraints: &v1beta1.AcceleratorConstraints{PreferredPrecisions: []string{"fp8"}},
+	}
+	if got := selectedEngineClass(t, selector, service, override, []string{"fp32-class", "fp8-class"}); got != "fp8-class" {
+		t.Errorf("GetAcceleratorClass() = %q, want %q", got, "fp8-class")
 	}
 }
 

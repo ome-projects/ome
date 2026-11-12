@@ -11,6 +11,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -59,6 +60,22 @@ func inPlaceEngineRatioGroupISVC(engineReplicas, decoderReplicas int, tolerance 
 	return isvc
 }
 
+// undeclaredEngineRatioGroupISVC is ratioGroupISVC with an engine that
+// declares no update strategy beside the RecreatePod decoder: the engine
+// rolls by the operator's fill for it, else as SurgeThenDrain, the rollout's
+// reading of no strategy.
+func undeclaredEngineRatioGroupISVC(engineReplicas, decoderReplicas int, tolerance *int32) *v1beta1.InferenceService {
+	isvc := ratioGroupISVC(engineReplicas, decoderReplicas, tolerance)
+	isvc.Spec.Engine.Lifecycle = nil
+	return isvc
+}
+
+// engineFill is a deploy block that fills the engine's update strategy type
+// alone.
+func engineFill(strategy v1beta1.UpdateStrategyType) *controllerconfig.UpdateStrategyDefaultsConfig {
+	return &controllerconfig.UpdateStrategyDefaultsConfig{Engine: &controllerconfig.ComponentUpdateStrategyDefaults{Type: string(strategy)}}
+}
+
 // withSurgingRouters adds two routers under SurgeThenDrain to the group. A
 // router does not decide whether the batch step paces the engine and the
 // decoder: one that surges rolls on the ratio and surge gates.
@@ -89,7 +106,9 @@ func TestValidateCreate_RatioDrainFeasibility(t *testing.T) {
 		isvc               *v1beta1.InferenceService
 		defaultTolerance   *int32
 		defaultMinReplicas *int
-		wantErr            bool
+		// defaultUpdateStrategy is the operator's per-Component strategy fill.
+		defaultUpdateStrategy *controllerconfig.UpdateStrategyDefaultsConfig
+		wantErr               bool
 	}{
 		{
 			name: "6:2 RecreatePod on both sides at tolerance 20 is admitted: the batch step paces the group",
@@ -107,6 +126,27 @@ func TestValidateCreate_RatioDrainFeasibility(t *testing.T) {
 		{
 			name: "the same in-place pair at tolerance 50 is admitted",
 			isvc: inPlaceEngineRatioGroupISVC(6, 2, ptr.To[int32](50)),
+		},
+		{
+			name: "6:2 with an engine that declares no strategy and a RecreatePod decoder at tolerance 20 is admitted: the engine rolls as SurgeThenDrain, the rollout's reading of no strategy, and the batch step paces the pair",
+			isvc: undeclaredEngineRatioGroupISVC(6, 2, ptr.To[int32](20)),
+		},
+		{
+			name:                  "the same pair under an operator fill of InPlaceIfPossible for the engine is refused: the fill makes the engine patch single pods in place, which does not step",
+			isvc:                  undeclaredEngineRatioGroupISVC(6, 2, ptr.To[int32](20)),
+			defaultUpdateStrategy: engineFill(v1beta1.UpdateStrategyInPlaceIfPossible),
+			wantErr:               true,
+		},
+		{
+			name:                  "the same pair under an operator fill of RecreatePod for the engine is admitted: both roll drain-first and the batch step paces the pair",
+			isvc:                  undeclaredEngineRatioGroupISVC(6, 2, ptr.To[int32](20)),
+			defaultUpdateStrategy: engineFill(v1beta1.UpdateStrategyRecreatePod),
+		},
+		{
+			name:                  "the in-place pair under an operator fill of RecreatePod for the engine is still refused: the declared in-place strategy wins over the fill",
+			isvc:                  inPlaceEngineRatioGroupISVC(6, 2, ptr.To[int32](20)),
+			defaultUpdateStrategy: engineFill(v1beta1.UpdateStrategyRecreatePod),
+			wantErr:               true,
 		},
 		{
 			name: "6:2 RecreatePod on both sides with two SurgeThenDrain routers in the group at tolerance 20 is admitted: the routers do not decide the batch step",
@@ -162,7 +202,7 @@ func TestValidateCreate_RatioDrainFeasibility(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v := &InferenceServiceValidator{DefaultRatioTolerancePercent: tt.defaultTolerance, DefaultMinReplicas: tt.defaultMinReplicas}
+			v := &InferenceServiceValidator{DefaultRatioTolerancePercent: tt.defaultTolerance, DefaultMinReplicas: tt.defaultMinReplicas, DefaultUpdateStrategy: tt.defaultUpdateStrategy}
 			_, err := v.ValidateCreate(context.Background(), tt.isvc)
 			if tt.wantErr {
 				require.Error(t, err)
@@ -197,4 +237,17 @@ func TestValidateUpdate_RatioDrainFeasibilityScaleDown(t *testing.T) {
 		_, err = v.ValidateUpdate(context.Background(), batched, pair(4, 1, ptr.To[int32](20)))
 		assert.NoError(t, err, "under %s the batch step paces the group, so the scale to one is admitted", name)
 	}
+}
+
+// configuredUpdateStrategyTypes hands the drain feasibility rule the type
+// the deploy block fills per Component: a nil block fills nothing, an entry
+// with no type fills nothing for its Component, and only typed entries
+// reach the rule.
+func TestConfiguredUpdateStrategyTypes_DeployBlock_FillsOnlyTypedEntries(t *testing.T) {
+	assert.Nil(t, configuredUpdateStrategyTypes(nil))
+	got := configuredUpdateStrategyTypes(&controllerconfig.UpdateStrategyDefaultsConfig{
+		Engine:  &controllerconfig.ComponentUpdateStrategyDefaults{Type: string(v1beta1.UpdateStrategyRecreatePod)},
+		Decoder: &controllerconfig.ComponentUpdateStrategyDefaults{},
+	})
+	assert.Equal(t, map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: v1beta1.UpdateStrategyRecreatePod}, got)
 }

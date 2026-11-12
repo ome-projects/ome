@@ -152,71 +152,82 @@ func (b *Backend) flavors(ctx context.Context) (map[string]struct{}, error) {
 
 // Sweep deletes objects this manager owns whose node is no longer written.
 //
-// keep is every node the plan wrote plus every node it retained: a frozen
-// subtree's objects must survive, which is exactly what distinguishes a freeze
-// from a deletion. Objects without this manager's label are never touched, so a
+// keep is every node the plan wrote plus every node it retained: a retained
+// subtree keeps its objects, which is what tells a retained node from one that
+// is gone. Objects without this manager's label are never touched, so a
 // hand-authored queue outlives any sweep.
 func (b *Backend) Sweep(ctx context.Context, keep sets.Set[string]) (int, error) {
-	selector := client.MatchingLabels{v1beta1.AcceleratorQuotaManagedByLabel: b.Options.FieldManager}
-
-	var deleted int
-	var errs []string
+	sweep := &managedSweep{backend: b, keep: keep}
 
 	var localQueues kueuev1beta2.LocalQueueList
-	if err := b.Reader.List(ctx, &localQueues, selector); err != nil && !apimeta.IsNoMatchError(err) {
-		return deleted, err
+	if err := b.listManaged(ctx, &localQueues); err != nil {
+		return sweep.deleted, err
 	}
-	for i := range localQueues.Items {
-		lq := &localQueues.Items[i]
-		if keep.Has(lq.Labels[v1beta1.AcceleratorQuotaNodeLabel]) {
-			continue
-		}
-		if err := b.deleteObject(ctx, lq); err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		deleted++
-	}
+	deleteUnkept(ctx, sweep, localQueues.Items)
 
 	// ClusterQueues before Cohorts: deleting a parent first would reparent its
 	// children onto an implicit cohort for as long as the sweep takes.
 	var clusterQueues kueuev1beta2.ClusterQueueList
-	if err := b.Reader.List(ctx, &clusterQueues, selector); err != nil && !apimeta.IsNoMatchError(err) {
-		return deleted, err
+	if err := b.listManaged(ctx, &clusterQueues); err != nil {
+		return sweep.deleted, err
 	}
-	for i := range clusterQueues.Items {
-		cq := &clusterQueues.Items[i]
-		if keep.Has(cq.Labels[v1beta1.AcceleratorQuotaNodeLabel]) {
-			continue
-		}
-		if err := b.deleteObject(ctx, cq); err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		deleted++
-	}
+	deleteUnkept(ctx, sweep, clusterQueues.Items)
 
 	var cohorts kueuev1beta2.CohortList
-	if err := b.Reader.List(ctx, &cohorts, selector); err != nil && !apimeta.IsNoMatchError(err) {
-		return deleted, err
+	if err := b.listManaged(ctx, &cohorts); err != nil {
+		return sweep.deleted, err
 	}
-	for i := range cohorts.Items {
-		c := &cohorts.Items[i]
-		if keep.Has(c.Labels[v1beta1.AcceleratorQuotaNodeLabel]) {
-			continue
-		}
-		if err := b.deleteObject(ctx, c); err != nil {
-			errs = append(errs, err.Error())
-			continue
-		}
-		deleted++
-	}
+	deleteUnkept(ctx, sweep, cohorts.Items)
 
-	if len(errs) > 0 {
-		sort.Strings(errs)
-		return deleted, fmt.Errorf("sweep: %v", errs)
+	return sweep.outcome()
+}
+
+// managedSweep carries one sweep's count of deleted objects and its failures
+// across the kinds it visits.
+type managedSweep struct {
+	backend  *Backend
+	keep     sets.Set[string]
+	deleted  int
+	failures []string
+}
+
+// outcome is the deleted count and, when any delete failed, one error naming
+// every failure in sorted order.
+func (s *managedSweep) outcome() (int, error) {
+	if len(s.failures) > 0 {
+		sort.Strings(s.failures)
+		return s.deleted, fmt.Errorf("sweep: %v", s.failures)
 	}
-	return deleted, nil
+	return s.deleted, nil
+}
+
+// listManaged lists one kind under this manager's label. A cluster without
+// the kind installed lists nothing rather than failing.
+func (b *Backend) listManaged(ctx context.Context, list client.ObjectList) error {
+	selector := client.MatchingLabels{v1beta1.AcceleratorQuotaManagedByLabel: b.Options.FieldManager}
+	if err := b.Reader.List(ctx, list, selector); err != nil && !apimeta.IsNoMatchError(err) {
+		return err
+	}
+	return nil
+}
+
+// deleteUnkept deletes every listed object whose node is not kept, counting
+// the deletions and recording the failures without stopping.
+func deleteUnkept[T any, PT interface {
+	*T
+	client.Object
+}](ctx context.Context, s *managedSweep, items []T) {
+	for i := range items {
+		obj := PT(&items[i])
+		if s.keep.Has(obj.GetLabels()[v1beta1.AcceleratorQuotaNodeLabel]) {
+			continue
+		}
+		if err := s.backend.deleteObject(ctx, obj); err != nil {
+			s.failures = append(s.failures, err.Error())
+			continue
+		}
+		s.deleted++
+	}
 }
 
 func (b *Backend) deleteObject(ctx context.Context, obj client.Object) error {

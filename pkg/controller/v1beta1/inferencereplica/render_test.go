@@ -708,7 +708,7 @@ func renderInline(t *testing.T, ctx context.Context, r *Reconciler, svc *v1beta1
 	ir, err := irprojector.EnsureInferenceReplica(ctx, irprojector.Params{
 		ISVC: svc, Component: v1beta1.EngineComponent, ComponentExt: &res.Specs.Engine.ComponentExtensionSpec,
 		ObjectMeta: rendered.ObjectMeta, PodSpec: rendered.Primary, WorkerPodSpec: rendered.Worker, WorkerSize: rendered.WorkerSize,
-		MultiPod: rendered.MultiPod, TopologyKey: rendered.TopologyKey, TopologySpread: rendered.TopologySpread, TopologySpreadKey: rendered.TopologySpreadKey,
+		MultiPod: rendered.MultiPod, TopologyKey: res.Specs.Engine.TopologyKey, TopologySpread: res.Specs.Engine.TopologySpread, TopologySpreadKey: res.Specs.Engine.TopologySpreadKey,
 		Client: r.Client,
 	})
 	if err != nil {
@@ -746,8 +746,10 @@ func mustJSON(t *testing.T, v any) string {
 // whether an InferenceService projects them onto its replica or a standalone
 // replica renders them from its refs, and the replica
 // controller derives the same revision hash from either under one scope UID:
-// the owner's annotation is inherited pod metadata excluded from the hash on
-// both, through the projector's stamp on one and the refs rule on the other.
+// the owner's annotation stays off the pod template on both (the render keeps
+// a service key no Component declares off the pods) and is listed as outside
+// the hash on both, through the record the projector writes on one and the
+// refs rule on the other.
 func TestInlineAndRefsRenderingAgree(t *testing.T) {
 	ctx := context.Background()
 	r := parityReconciler(t)
@@ -764,13 +766,14 @@ func TestInlineAndRefsRenderingAgree(t *testing.T) {
 		t.Fatalf("inline and refs runners differ (-inline +refs):\n%s", diff)
 	}
 	// The fixture exercises the metadata both forms derive from their owner:
-	// the service label from the shared name and the owner's own annotation.
+	// the service label from the shared name reaches the template, the
+	// owner's own annotation does not.
 	template := projected.Spec.Runners[0].Template
 	if template.Labels[constants.InferenceServicePodLabelKey] != svc.Name {
 		t.Fatalf("template labels = %v, want %s=%s", template.Labels, constants.InferenceServicePodLabelKey, svc.Name)
 	}
-	if template.Annotations["example.com/owner"] != svc.Annotations["example.com/owner"] {
-		t.Fatalf("template annotations = %v, want the owner's example.com/owner annotation", template.Annotations)
+	if value, ok := template.Annotations["example.com/owner"]; ok {
+		t.Fatalf("template annotations = %v; the owner's example.com/owner annotation must stay off the pods, got %q", template.Annotations, value)
 	}
 
 	if stamped := projected.Annotations[constants.RevisionExcludedAnnotationKeysAnnotationKey]; stamped != "example.com/owner" {
@@ -874,7 +877,7 @@ func pairedWithDecoder(decoderHash string, asked *[]string) coordination.PeerRev
 func TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent(t *testing.T) {
 	isvc := coordinatedISVC()
 	var asked []string
-	hook := ISVCRenderHook(isvc, pairedWithDecoder("dec456", &asked))
+	hook := ISVCRenderHook(isvc, "cluster.local", pairedWithDecoder("dec456", &asked))
 	if hook == nil {
 		t.Fatal("ISVCRenderHook returned nil for a coordination-enabled ISVC")
 	}
@@ -907,11 +910,35 @@ func TestISVCRenderHook_InjectsPeerEnvForCoordinatedComponent(t *testing.T) {
 	}
 }
 
+// TestISVCRenderHook_PeerAddressesCarryTheConfiguredClusterDomain: the hook
+// renders every peer address under the cluster domain it is given, and the
+// namespaced short name when there is none; it never writes a suffix of its
+// own.
+func TestISVCRenderHook_PeerAddressesCarryTheConfiguredClusterDomain(t *testing.T) {
+	for _, tc := range []struct{ clusterDomain, generic, revision string }{
+		{"example.org", "llama-decoder.prod.svc.example.org", "llama-decoder-rev-dec456.prod.svc.example.org"},
+		{"", "llama-decoder.prod", "llama-decoder-rev-dec456.prod"},
+	} {
+		var asked []string
+		hook := ISVCRenderHook(coordinatedISVC(), tc.clusterDomain, pairedWithDecoder("dec456", &asked))
+		pod := renderedPod(v1beta1.EngineComponent)
+		hook(pod, "runner-0", 0, "eng123")
+		for _, ctr := range pod.Spec.Containers {
+			if got, _ := envValue(ctr, "OME_DECODER_ENDPOINT"); got != tc.generic {
+				t.Errorf("clusterDomain %q, container %q: OME_DECODER_ENDPOINT = %q, want %q", tc.clusterDomain, ctr.Name, got, tc.generic)
+			}
+			if got, _ := envValue(ctr, "OME_DECODER_REVISION_ENDPOINT"); got != tc.revision {
+				t.Errorf("clusterDomain %q, container %q: OME_DECODER_REVISION_ENDPOINT = %q, want %q", tc.clusterDomain, ctr.Name, got, tc.revision)
+			}
+		}
+	}
+}
+
 // TestISVCRenderHook_NoResolverEmitsGenericOnly pins the degraded shape: with
 // no resolver the hook must inject only the revision-agnostic endpoint, never
 // a per-revision DNS name derived from the pod's own hash.
 func TestISVCRenderHook_NoResolverEmitsGenericOnly(t *testing.T) {
-	hook := ISVCRenderHook(coordinatedISVC(), nil)
+	hook := ISVCRenderHook(coordinatedISVC(), "cluster.local", nil)
 	pod := renderedPod(v1beta1.EngineComponent)
 	hook(pod, "runner-0", 0, "eng123")
 	for _, ctr := range pod.Spec.Containers {
@@ -929,10 +956,10 @@ func TestISVCRenderHook_NoResolverEmitsGenericOnly(t *testing.T) {
 // single-component / non-coordinated boxes are unaffected by the wiring.
 func TestISVCRenderHook_NilForNonCoordinatedISVC(t *testing.T) {
 	isvc := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "solo", Namespace: "prod"}}
-	if ISVCRenderHook(isvc, nil) != nil {
+	if ISVCRenderHook(isvc, "cluster.local", nil) != nil {
 		t.Error("ISVCRenderHook should return nil when the ISVC has no rolloutCoordination")
 	}
-	if ISVCRenderHook(nil, nil) != nil {
+	if ISVCRenderHook(nil, "cluster.local", nil) != nil {
 		t.Error("ISVCRenderHook(nil) should return nil")
 	}
 }
@@ -941,7 +968,7 @@ func TestISVCRenderHook_NilForNonCoordinatedISVC(t *testing.T) {
 // path still asks the resolver, which pairs it as a target-revision pod.
 func TestISVCRenderHook_EmptyHashStillPairs(t *testing.T) {
 	var asked []string
-	hook := ISVCRenderHook(coordinatedISVC(), pairedWithDecoder("dec456", &asked))
+	hook := ISVCRenderHook(coordinatedISVC(), "cluster.local", pairedWithDecoder("dec456", &asked))
 	pod := renderedPod(v1beta1.EngineComponent)
 	hook(pod, "runner-0", 0, "")
 
@@ -961,7 +988,7 @@ func TestISVCRenderHook_EmptyHashStillPairs(t *testing.T) {
 // endpoint regardless of how the rollout sequences them.
 func TestISVCRenderHook_SeparateGroupsStillServingPeers(t *testing.T) {
 	var asked []string
-	hook := ISVCRenderHook(decoupledISVC(), pairedWithDecoder("dec456", &asked))
+	hook := ISVCRenderHook(decoupledISVC(), "cluster.local", pairedWithDecoder("dec456", &asked))
 	if hook == nil {
 		t.Fatal("hook nil for an ISVC with rollout groups")
 	}

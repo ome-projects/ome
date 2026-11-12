@@ -1,8 +1,8 @@
-// Package runtimepreset implements a mutating webhook that injects
-// engine defaults from a Go-defined preset when ome.io/engine: <name>
-// names a known engine. The runtime-inheritance resolver composes on
-// top at consumer call sites; $(VAR) placeholders are substituted by
-// Kubernetes at pod-create time.
+// Package runtimepreset implements a mutating webhook that injects engine
+// defaults from the preset the runtimePresets block of the
+// inferenceservice-config ConfigMap holds for the engine ome.io/engine: <name>
+// names. The runtime-inheritance resolver composes on top at consumer call
+// sites; $(VAR) placeholders are substituted by Kubernetes at pod-create time.
 package runtimepreset
 
 import (
@@ -10,9 +10,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -27,44 +28,52 @@ import (
 
 var log = logf.Log.WithName("runtimepreset-mutator")
 
-// presets is the registry — adding a new engine is one preset file +
-// one map entry.
-var presets = map[string]func() *v1beta1.ServingRuntimeSpec{
-	"sglang-pd": sglangPDPreset,
-}
-
 type ServingRuntimeMutator struct {
-	Decoder admission.Decoder
+	Decoder   admission.Decoder
+	Clientset kubernetes.Interface
 }
 
-func (m *ServingRuntimeMutator) Handle(_ context.Context, req admission.Request) admission.Response {
+func (m *ServingRuntimeMutator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	sr := &v1beta1.ServingRuntime{}
-	return mutate(m.Decoder, req, sr, &sr.Spec)
+	return mutate(ctx, m.Decoder, m.Clientset, req, sr, &sr.Spec)
 }
 
 type ClusterServingRuntimeMutator struct {
-	Decoder admission.Decoder
+	Decoder   admission.Decoder
+	Clientset kubernetes.Interface
 }
 
-func (m *ClusterServingRuntimeMutator) Handle(_ context.Context, req admission.Request) admission.Response {
+func (m *ClusterServingRuntimeMutator) Handle(ctx context.Context, req admission.Request) admission.Response {
 	csr := &v1beta1.ClusterServingRuntime{}
-	return mutate(m.Decoder, req, csr, &csr.Spec)
+	return mutate(ctx, m.Decoder, m.Clientset, req, csr, &csr.Spec)
 }
 
 // mutate decodes the request into runtime, merges the preset its engine
 // annotation names into spec (the field inside runtime) and answers with
-// the patch from the decoded object to the merged one.
-func mutate(decoder admission.Decoder, req admission.Request, runtime client.Object, spec *v1beta1.ServingRuntimeSpec) admission.Response {
+// the patch from the decoded object to the merged one. The preset table is
+// read from the ConfigMap only when the runtime names an engine.
+func mutate(ctx context.Context, decoder admission.Decoder, clientset kubernetes.Interface, req admission.Request, runtime client.Object, spec *v1beta1.ServingRuntimeSpec) admission.Response {
 	if err := decoder.Decode(req, runtime); err != nil {
 		log.Error(err, "decode "+req.Kind.Kind, "name", runtime.GetName(), "namespace", runtime.GetNamespace())
 		return admission.Errored(http.StatusBadRequest, err)
 	}
-	merged, resp := applyPreset(runtime.GetAnnotations(), spec)
+	engine, ok := runtime.GetAnnotations()[constants.RuntimeEngineAnnotationKey]
+	if !ok || engine == "" {
+		return admission.Allowed("no engine preset annotation")
+	}
+	configMap, err := clientset.CoreV1().ConfigMaps(constants.OMENamespace).Get(ctx,
+		constants.InferenceServiceConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		log.Error(err, "Failed to find config map", "name", constants.InferenceServiceConfigMapName)
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	presets, err := parsePresets(configMap)
+	if err != nil {
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	merged, resp := applyPreset(engine, spec, presets)
 	if resp != nil {
 		return *resp
-	}
-	if merged == nil {
-		return admission.Allowed("no engine preset annotation")
 	}
 	original, err := encodeWithoutNulls(runtime)
 	if err != nil {
@@ -80,19 +89,19 @@ func mutate(decoder admission.Decoder, req admission.Request, runtime client.Obj
 	return admission.PatchResponseFromRaw(original, mutated)
 }
 
-// applyPreset returns (merged, nil) on success, (nil, &resp) on
-// passthrough or rejection. merged==nil && resp==nil means no
-// annotation set — caller should pass through.
-func applyPreset(annotations map[string]string, spec *v1beta1.ServingRuntimeSpec) (*v1beta1.ServingRuntimeSpec, *admission.Response) {
-	engine, ok := annotations[constants.RuntimeEngineAnnotationKey]
-	if !ok || engine == "" {
-		return nil, nil
-	}
-	factory, known := presets[engine]
+// applyPreset returns (merged, nil) on success and (nil, &resp) when the
+// engine is refused: one the table does not name, or any engine while the
+// table is empty.
+func applyPreset(engine string, spec *v1beta1.ServingRuntimeSpec, presets Presets) (*v1beta1.ServingRuntimeSpec, *admission.Response) {
+	preset, known := presets[engine]
 	if !known {
+		names := strings.Join(presets.names(), ", ")
+		if names == "" {
+			names = fmt.Sprintf("none; the %s block of %s names no engine", PresetsConfigKeyName, constants.InferenceServiceConfigMapName)
+		}
 		resp := admission.Denied(fmt.Sprintf(
 			"unknown %s value %q (known: %s)",
-			constants.RuntimeEngineAnnotationKey, engine, strings.Join(knownPresetNames(), ", "),
+			constants.RuntimeEngineAnnotationKey, engine, names,
 		))
 		return nil, &resp
 	}
@@ -100,7 +109,7 @@ func applyPreset(annotations map[string]string, spec *v1beta1.ServingRuntimeSpec
 	// positions. Same contract as the runtime-inheritance resolver, so
 	// preset + inheritance compose commutatively for any field set by
 	// exactly one source.
-	merged, err := runtimeinheritance.Merge(factory(), spec)
+	merged, err := runtimeinheritance.Merge(preset, spec)
 	if err != nil {
 		resp := admission.Errored(http.StatusInternalServerError, fmt.Errorf("merge %s preset: %w", engine, err))
 		return nil, &resp
@@ -120,13 +129,4 @@ func encodeWithoutNulls(runtime any) ([]byte, error) {
 		return nil, err
 	}
 	return runtimeinheritance.StripJSONNulls(out)
-}
-
-func knownPresetNames() []string {
-	out := make([]string, 0, len(presets))
-	for k := range presets {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

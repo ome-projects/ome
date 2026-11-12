@@ -3,6 +3,7 @@ set -euo pipefail
 
 chart_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 helm_bin="${HELM_BIN:-helm}"
+yq_bin="${YQ_BIN:-yq}"
 
 fail() {
   echo "ome-resources chart test: $*" >&2
@@ -71,6 +72,105 @@ pprof_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
   --show-only templates/ome-controller/deployment.yaml)"
 grep -Fq -- '- "--pprof-bind-address=127.0.0.1:6060"' <<<"${pprof_controller}" ||
   fail "pprofBindAddress was not passed to the controller"
+# The cluster DNS domain reaches the binary only through this block: the
+# controller has no built-in value for the suffix of its in-cluster hostnames.
+grep -Fq '"clusterDomain": "cluster.local"' <<<"${controller_config}" ||
+  fail "ingress.clusterDomain was not rendered from ingressGateway.clusterDomain"
+# A manager stopped on purpose gives the leader lease back by default, so the
+# next manager takes over at its next poll. The lease renders beside it long
+# enough to outlast a leader whose renewals fail (the release rule), and the
+# renew deadline long enough to ride out a 40s apiserver stall.
+grep -Fq -- '- "--leader-elect-release-on-cancel"' <<<"${controller}" ||
+  fail "the controller does not release the leader lease on a clean stop by default"
+grep -Fq -- '- "--leader-elect-lease-duration=120s"' <<<"${controller}" ||
+  fail "the controller's lease does not outlast a leader whose renewals fail under the release rule"
+grep -Fq -- '- "--leader-elect-renew-deadline=40s"' <<<"${controller}" ||
+  fail "the controller's renew deadline does not keep two 20s renewal attempts"
+grep -Fq -- '- "--leader-elect-retry-period=8s"' <<<"${controller}" ||
+  fail "the controller's retry period was not passed"
+kept_lease_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.leaderElection.releaseOnCancel=false \
+  --show-only templates/ome-controller/deployment.yaml)"
+if grep -Fq -- '--leader-elect-release-on-cancel' <<<"${kept_lease_controller}"; then
+  fail "leaderElection.releaseOnCancel=false still releases the leader lease"
+fi
+# The lease is released only after the stop, which controller-runtime bounds
+# at 30s; the pod's grace period must outlast that, or SIGKILL comes first.
+grep -Eq '^ +terminationGracePeriodSeconds: 40$' <<<"${controller}" ||
+  fail "the controller pod's termination grace period does not outlast the 30 second stop timeout by default"
+grace_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.managerTerminationGracePeriodSeconds=45 \
+  --show-only templates/ome-controller/deployment.yaml)"
+grep -Eq '^ +terminationGracePeriodSeconds: 45$' <<<"${grace_controller}" ||
+  fail "managerTerminationGracePeriodSeconds was not applied to the controller pod"
+
+# The manager's own PodDisruptionBudget is opt-in. Enabled, it selects exactly
+# the pods the controller Deployment selects and lets a drain take one at a time.
+if grep -Fq 'templates/ome-controller/poddisruptionbudget.yaml' <<<"${rendered}"; then
+  fail "the manager PodDisruptionBudget rendered without managerPodDisruptionBudget.enabled"
+fi
+# match_labels <rendered>: the entries of the first matchLabels map, sorted.
+match_labels() {
+  awk '
+    { match($0, /^ */); depth = RLENGTH }
+    !found && /^ *matchLabels:$/ { found = 1; map_depth = depth; next }
+    found && depth > map_depth { sub(/^ +/, ""); print; next }
+    found { exit }
+  ' <<<"$1" | sort
+}
+manager_pdb="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace team-a \
+  --set ome.controller.managerPodDisruptionBudget.enabled=true \
+  --show-only templates/ome-controller/poddisruptionbudget.yaml)"
+grep -Fxq '  maxUnavailable: 1' <<<"${manager_pdb}" ||
+  fail "the enabled manager PodDisruptionBudget does not allow one disruption at a time"
+grep -Fxq '  namespace: team-a' <<<"${manager_pdb}" ||
+  fail "the manager PodDisruptionBudget is not in the release namespace"
+grep -Fxq '  unhealthyPodEvictionPolicy: AlwaysAllow' <<<"${manager_pdb}" ||
+  fail "the manager PodDisruptionBudget does not let a drain evict a manager pod that is not Ready"
+# A single-replica install can turn the budget on: one pod may still be drained.
+grep -Fxq '  maxUnavailable: 1' <<<"$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.replicaCount=1 \
+  --set ome.controller.managerPodDisruptionBudget.enabled=true \
+  --show-only templates/ome-controller/poddisruptionbudget.yaml)" ||
+  fail "the manager PodDisruptionBudget did not render for a single-replica install"
+grep -Fxq '  maxUnavailable: 2' <<<"$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.managerPodDisruptionBudget.enabled=true \
+  --set ome.controller.managerPodDisruptionBudget.maxUnavailable=2 \
+  --show-only templates/ome-controller/poddisruptionbudget.yaml)" ||
+  fail "the manager PodDisruptionBudget ignored maxUnavailable"
+if grep -Fq 'unhealthyPodEvictionPolicy' <<<"$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.managerPodDisruptionBudget.enabled=true \
+  --set-string ome.controller.managerPodDisruptionBudget.unhealthyPodEvictionPolicy= \
+  --show-only templates/ome-controller/poddisruptionbudget.yaml)"; then
+  fail "an empty unhealthyPodEvictionPolicy still rendered the field"
+fi
+manager_pdb_selector="$(match_labels "${manager_pdb}")"
+[[ -n "${manager_pdb_selector}" && "${manager_pdb_selector}" == "$(match_labels "${controller}")" ]] ||
+  fail "the manager PodDisruptionBudget selector differs from the controller Deployment selector"
+# The workload budgets live under ome.controller.podDisruptionBudget, which the
+# controller reads from its ConfigMap. The manager budget must not reach it.
+[[ "$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.managerPodDisruptionBudget.enabled=true \
+  --show-only templates/ome-controller/configmap.yaml)" == "${controller_config}" ]] ||
+  fail "enabling the manager PodDisruptionBudget changed the controller ConfigMap"
+# A budget below one blocks the drain of any node running a manager pod, so the
+# chart refuses it.
+if manager_pdb_error="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.managerPodDisruptionBudget.enabled=true \
+  --set ome.controller.managerPodDisruptionBudget.maxUnavailable=0 2>&1)"; then
+  fail "a manager PodDisruptionBudget that blocks every drain rendered"
+fi
+grep -Fq 'managerPodDisruptionBudget.maxUnavailable must be an integer of at least 1' <<<"${manager_pdb_error}" ||
+  fail "the zero manager disruption budget failed for another reason: ${manager_pdb_error}"
+
 grep -Fq '"scaleUpPodBatchSize":100' <<<"${controller_config}" ||
   fail "default OMENative scale-up Pod batch size was not rendered"
 grep -Fq '"scaleDownPodBatchSize":100' <<<"${controller_config}" ||
@@ -96,6 +196,24 @@ grep -Fq '"slice":{"annotations":{},"readyStates":["READY"]}' <<<"${tpu_slice_co
 if grep -Fq 'minReadySeconds' <<<"${controller_config}"; then
   fail "deploy.minReadySeconds was rendered when unset"
 fi
+
+# The pod and preset webhooks read their tables from the ConfigMap and carry
+# none of their own, so the chart's blocks and the kustomize profile's must be
+# the same tables.
+kustomize_config="${chart_dir}/../../config/configmap/inferenceservice.yaml"
+for key in metricsAggregator rdma runtimeProfiles runtimePresets; do
+  chart_block="$("${yq_bin}" -o=json -I=0 ".data.${key} | fromjson | sort_keys(..)" <<<"${controller_config}")"
+  kustomize_block="$("${yq_bin}" -o=json -I=0 ".data.${key} | fromjson | sort_keys(..)" "${kustomize_config}")"
+  [[ -n "${chart_block}" && "${chart_block}" == "${kustomize_block}" ]] ||
+    fail "${key} block differs between the chart and config/configmap/inferenceservice.yaml"
+done
+
+# The chart ships no RDMA profile: every cluster's fabric differs, so the
+# per-cluster values file carries the table and a default install injects
+# nothing. A profile written here would name one operator's fabric.
+rdma_block="$("${yq_bin}" -o=json -I=0 '.data.rdma | fromjson' <<<"${controller_config}")"
+[[ "${rdma_block}" == '{"defaultProfile":"","profiles":{}}' ]] ||
+  fail "the chart's rdma block must ship empty, got ${rdma_block}"
 
 # The InferenceReplica admission webhook admits spec writes on projected
 # replicas only from the controller identity, so the chart always lists the
@@ -280,6 +398,13 @@ control_plane_rendered="$("${helm_bin}" template ome-resources "${chart_dir}" \
   fail "ValidatingWebhookConfiguration inferenceservice.ome.io was not rendered by default"
 [[ -z "$(webhook_paths "$(validating_webhook "${control_plane_rendered}" inferenceservice.ome.io)")" ]] ||
   fail "ValidatingWebhookConfiguration inferenceservice.ome.io was rendered under the control-plane role"
+# The Split plan validator renders only under the control-plane role, which
+# alone holds the WorkloadCluster registrations it plans against.
+split_plan_webhook_path='/validate-ome-io-v1beta1-inferenceservice-splitplan'
+[[ "$(webhook_paths "$(validating_webhook "${control_plane_rendered}" inferenceservice-splitplan.ome.io)")" == "${split_plan_webhook_path}" ]] ||
+  fail "ValidatingWebhookConfiguration inferenceservice-splitplan.ome.io was not rendered with path ${split_plan_webhook_path} under the control-plane role"
+[[ -z "$(webhook_paths "$(validating_webhook "${rendered}" inferenceservice-splitplan.ome.io)")" ]] ||
+  fail "ValidatingWebhookConfiguration inferenceservice-splitplan.ome.io was rendered by default"
 
 # cert-manager injects the CA bundle from the Certificate in the release
 # namespace. Naming any other namespace leaves the bundle empty, and the
@@ -403,6 +528,27 @@ if grep -Fq 'repairBatchSize' <<<"${repair_batch_omitted}"; then
 fi
 grep -Fq '"scaleDownPodBatchSize":100' <<<"${repair_batch_omitted}" ||
   fail "omitting the repair batch size unexpectedly removed the scale-down Pod batch size"
+
+if grep -Fq 'forceDelete' <<<"${controller_config}"; then
+  fail "the force-delete policy was rendered although the chart leaves it unset"
+fi
+
+force_delete_policy="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-string ome.controller.lifecycle.forceDelete.overdueSlack=2m \
+  --set-string ome.controller.lifecycle.forceDelete.nodeUnreachableThreshold=5m \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"forceDelete":{"nodeUnreachableThreshold":"5m","overdueSlack":"2m"}' <<<"${force_delete_policy}" ||
+  fail "a force-delete policy without skipGracePeriodOnUnreachableNode was not rendered as written"
+
+force_delete_skip_grace="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-string ome.controller.lifecycle.forceDelete.overdueSlack=2m \
+  --set-string ome.controller.lifecycle.forceDelete.nodeUnreachableThreshold=5m \
+  --set ome.controller.lifecycle.forceDelete.skipGracePeriodOnUnreachableNode=true \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"forceDelete":{"nodeUnreachableThreshold":"5m","overdueSlack":"2m","skipGracePeriodOnUnreachableNode":true}' <<<"${force_delete_skip_grace}" ||
+  fail "force-delete skipGracePeriodOnUnreachableNode was not rendered"
 
 default_controller_checksum="$(grep -m1 'checksum/config:' <<<"${controller}" | awk '{print $2}')"
 scale_down_controller="$("${helm_bin}" template ome-resources "${chart_dir}" \

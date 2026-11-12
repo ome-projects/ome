@@ -13,7 +13,7 @@ import (
 
 // A step at 0% traffic whose canary capacity is Ready is the capacity-ahead
 // warm-up: the canary is validated in-cluster before it takes traffic. It is
-// an ordinary step of the ladder, Paused while its gate holds, with the
+// an ordinary canary step, Paused while its gate holds, with the
 // stable revision still the only routed target; it has no phase of its own.
 func TestReconcile_CapacityAheadStepIsAPausedStep(t *testing.T) {
 	steps := []v1beta1.RolloutGroupStep{
@@ -31,7 +31,7 @@ func TestReconcile_CapacityAheadStepIsAPausedStep(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The step stages its capacity on every instance but the held stable one:
-	// the stable revision keeps its last instance (the held floor) while it
+	// the stable revision keeps its last instance (the serving minimum) while it
 	// still carries traffic, so 100% capacity on 4 instances is partition 1.
 	if !res.Active || res.Partition != 1 {
 		t.Fatalf("a Ready capacity-ahead step is an active step staged on all but the held stable instance, got %+v", res)

@@ -3,12 +3,10 @@ package types
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// WorkloadDesiredSpec.Lifecycle and WorkloadAggregateStatus.Traffic
-// use workload-owned mirror types. Adapters project the CRD-shape
-// values into these structs at the boundary.
+// WorkloadDesiredSpec.Lifecycle uses a workload-owned mirror type.
+// Adapters project the CRD-shape values into it at the boundary.
 
 // WorkloadDesiredSpec is the per-reconcile projection of the source
 // spec the workload pipeline drives toward. Read-only from workload
@@ -108,14 +106,6 @@ type WorkloadDesiredSpec struct {
 // WorkloadObservedState is the per-reconcile snapshot of the source
 // status subtree the reconciler reasons about.
 type WorkloadObservedState struct {
-	// ObservedGeneration is the spec generation the last status flush
-	// reflects.
-	ObservedGeneration int64
-
-	// CollisionCount is the ControllerRevision-hash salt. nil on the
-	// first reconcile.
-	CollisionCount *int32
-
 	// CurrentRevision names the ControllerRevision currently serving
 	// traffic.
 	CurrentRevision string
@@ -123,12 +113,17 @@ type WorkloadObservedState struct {
 	// UpdateRevision names the ControllerRevision being rolled out.
 	UpdateRevision string
 
+	// RollTarget names the ControllerRevision the roll converges to this
+	// pass: the spec's revision, or the one a rollback names, where
+	// UpdateRevision keeps naming the spec's. The adapter fills it beside
+	// the plan's other target-derived inputs; a scale-down reads it to keep
+	// the Instances already there ahead of the ones the roll has yet to
+	// move. Empty when the pass has no roll target, as under teardown.
+	RollTarget string
+
 	// InstanceStatuses reports per-Instance state. Read-only here;
 	// writes go through ReconcileInput.MutateInstance.
 	InstanceStatuses []InstanceStatus
-
-	// Conditions reports component-level conditions.
-	Conditions []metav1.Condition
 
 	// RetryBlocks mirrors the owner's persisted per-revision retry
 	// authority. Read-only from workload code; writes go through
@@ -236,37 +231,16 @@ func (o WorkloadObservedState) Instance(idx int32) *InstanceStatus {
 	return nil
 }
 
-// WorkloadAggregateStatus is the per-reconcile flush of counters,
-// conditions, and traffic that the reconciler hands off to
-// Source.WriteAggregateStatus.
-type WorkloadAggregateStatus struct {
-	ObservedGeneration   int64
-	Replicas             int32
-	ReadyReplicas        int32
-	ServingReplicas      int32
-	AvailableReplicas    int32
-	UpdatedReplicas      int32
-	UpdatedReadyReplicas int32
-	CurrentRevision      string
-	UpdateRevision       string
-	LabelSelector        string
-	Conditions           []metav1.Condition
-	Traffic              []ComponentTrafficTarget
-}
-
 // WorkloadPacing is the projected rollout pacing: the rollout-control
 // values a composer (the ISVC controller's canary machine) owns, kept
 // apart from the user's Lifecycle so a step never writes into the
 // user's update strategy. Adapters compute it once per reconcile from
-// IR spec.pacing.
-//
-// Only Partition is read by the engine (ops.EffectivePartition:
-// it takes precedence over the user's RollingUpdate.Partition).
-// MaxUnavailable has no producer and is not read — the per-Component
-// budget comes from RollingUpdate.MaxUnavailable and the group ceiling
-// from the UpdateGate callback. Decisions is never constructed in
-// production. (IR spec.pacing.rollbackToRevision is handled by the IR
-// reconciler, not carried here.)
+// IR spec.pacing. The engine reads Partition (ops.EffectivePartition:
+// it takes precedence over the user's RollingUpdate.Partition); the
+// per-Component disruption budget comes from RollingUpdate.MaxUnavailable
+// and the group ceiling from the UpdateGate callback. (IR
+// spec.pacing.rollbackToRevision is handled by the IR reconciler, not
+// carried here.)
 type WorkloadPacing struct {
 	// Partition holds back updates for the lowest-indexed `Partition`
 	// Instances still off the target revision. 0 releases every
@@ -274,35 +248,6 @@ type WorkloadPacing struct {
 	// nil defers to the user's RollingUpdate.Partition. Used for canary
 	// step holds.
 	Partition *int32
-
-	// MaxUnavailable caps in-rollout disruption. Nothing projects it
-	// and the engine does not read it; the budget comes from
-	// RollingUpdate.MaxUnavailable.
-	MaxUnavailable *intstr.IntOrString
-
-	// Decisions is the projected per-gate allow/deny map for this
-	// reconcile. The ISVC adapter fills it from coordination gates;
-	// the IR adapter leaves it nil. nil means allowed.
-	Decisions *PacingDecisions
-}
-
-// PacingDecisions is the workload-facing projection of cross-Component
-// coordination gates. Plain data — adapters compute it outside the
-// workload package.
-type PacingDecisions struct {
-	// UpdateAllowed is false when the reconciler MUST NOT start any
-	// fresh Update operations this reconcile.
-	UpdateAllowed bool
-
-	// UpdateDenyReason is the operator-visible reason recorded onto
-	// events / conditions when UpdateAllowed is false.
-	UpdateDenyReason string
-
-	// SurgeBudgetRemaining is the upper bound on in-flight surge pods
-	// the reconciler may keep alive concurrently. The dispatcher
-	// tracks its own in-flight count within a pass; this is a
-	// per-reconcile ceiling.
-	SurgeBudgetRemaining int32
 }
 
 // Runner is a named role within an Instance with a per-Instance pod

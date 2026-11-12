@@ -780,16 +780,19 @@ func TestParseModelConfigFromFiles_HFQuantConfigUnknownAlgoLeavesEmpty(t *testin
 	}
 }
 
-// qwen3EmbeddingConfigJSON is the config.json shape of Qwen3-Embedding:
-// indistinguishable from a Qwen3 causal LM without the
+// qwen3EmbeddingConfigJSON is the config.json of a decoder-based embedding
+// model: the same shape as a causal LM, told apart only by the
 // config_sentence_transformers.json shipped beside it.
 var qwen3EmbeddingConfigJSON = []byte(`{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"],"max_position_embeddings":40960}`)
 
 func TestParseModelConfigDir_SentenceTransformersEmbedding(t *testing.T) {
-	// Agent path: the model dir on disk holds config.json and
-	// config_sentence_transformers.json. parseModelConfigDir must read
-	// the latter to classify the model as an embedding model.
-	tempDir := t.TempDir()
+	// PVC agent path: the model dir on disk holds config.json and
+	// config_sentence_transformers.json. ParseModelConfig must read the
+	// latter to classify the model as an embedding model.
+	tempDir, err := os.MkdirTemp("", "sentence-transformers")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+
 	require.NoError(t, os.WriteFile(
 		filepath.Join(tempDir, DefaultConfigFileName),
 		qwen3EmbeddingConfigJSON,
@@ -801,18 +804,23 @@ func TestParseModelConfigDir_SentenceTransformersEmbedding(t *testing.T) {
 		0o644,
 	))
 
+	logger := zap.NewNop().Sugar()
 	parser := &ModelConfigParser{
-		logger:          zap.NewNop().Sugar(),
+		logger:          logger,
 		loadModelConfig: modelconfig.LoadModelConfig,
 	}
 
 	metadata, err := parser.ParseModelConfig(tempDir, nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, metadata)
-	assert.Equal(t, []string{string(v1beta1.ModelCapabilityEmbedding)}, metadata.ModelCapabilities)
+	assert.Equal(t, []string{string(v1beta1.ModelCapabilityEmbedding)}, metadata.ModelCapabilities,
+		"config_sentence_transformers.json on disk should classify the model as an embedding model")
 }
 
 func TestParseModelConfigFromFiles_SentenceTransformersEmbedding(t *testing.T) {
+	// In-memory path: config_sentence_transformers.json describes only
+	// the config.json in its own directory, so it rides along with the
+	// chosen config.json and counts for nothing anywhere else.
 	cases := []struct {
 		name        string
 		sidecarPath string
@@ -824,8 +832,6 @@ func TestParseModelConfigFromFiles_SentenceTransformersEmbedding(t *testing.T) {
 			want:        v1beta1.ModelCapabilityEmbedding,
 		},
 		{
-			// A sentence-transformers config describes only the
-			// config.json in its own directory.
 			name:        "in another directory",
 			sidecarPath: "other/" + modelconfig.SentenceTransformersConfigFileName,
 			want:        v1beta1.ModelCapabilityTextToText,
@@ -862,7 +868,8 @@ func TestParseModelConfigFromFiles_PrefersRootConfig(t *testing.T) {
 	metadata, err := parser.ParseModelConfigFromFiles(context.Background(), files, nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, metadata)
-	assert.Equal(t, "Qwen3ForCausalLM", metadata.ModelArchitecture)
+	assert.Equal(t, "Qwen3ForCausalLM", metadata.ModelArchitecture,
+		"the model's own config.json must win over a module folder's")
 	assert.Equal(t, []string{string(v1beta1.ModelCapabilityEmbedding)}, metadata.ModelCapabilities)
 }
 
@@ -917,6 +924,9 @@ func TestParseModelConfigFromFiles_CountsOnlyConfigDirectory(t *testing.T) {
 }
 
 func TestSplitModelConfigFileInputs_PrefersFileNearestRoot(t *testing.T) {
+	// Among in-memory inputs that share a base name, the one nearest the
+	// model root wins: root, then the common subdirectories in order,
+	// then any other folder, shallowest first; ties keep sort order.
 	cases := []struct {
 		name      string
 		paths     []string
@@ -1018,33 +1028,6 @@ func mustReadSafetensorsHeader(t *testing.T, filePath string) []byte {
 	return data
 }
 
-func TestPopulateArtifactAttribute_SetsFields(t *testing.T) {
-	parser := &ModelConfigParser{logger: zap.NewNop().Sugar()}
-
-	orig := &ModelMetadata{}
-	artifact := &Artifact{
-		Sha:        "abc123",
-		ParentPath: map[string]string{"parentModel": "/models/model1"},
-	}
-
-	out := parser.PopulateArtifactAttribute(artifact, orig)
-	require.NotNil(t, out)
-	assert.Equal(t, "abc123", out.Artifact.Sha)
-	assert.Equal(t, map[string]string{"parentModel": "/models/model1"}, out.Artifact.ParentPath)
-	assert.Nil(t, out.Artifact.ChildrenPaths)
-}
-
-func TestPopulateArtifactAttribute_NilInput(t *testing.T) {
-	parser := &ModelConfigParser{logger: zap.NewNop().Sugar()}
-
-	original := &ModelMetadata{ModelType: "ClusterBaseModel"}
-	out := parser.PopulateArtifactAttribute(nil, original)
-	assert.Empty(t, out.Artifact.Sha)
-	assert.Nil(t, out.Artifact.ParentPath)
-	assert.Nil(t, out.Artifact.ChildrenPaths)
-	assert.Equal(t, original, out, "nil artifact must be a no-op")
-}
-
 // syntheticQuantConfig wraps a bare quant_method string in the unified
 // HFQuantConfig shape so TestExtractModelMetadataFromHF (which mocks
 // only the legacy GetQuantizationType()) can still drive the new
@@ -1057,21 +1040,6 @@ func syntheticQuantConfig(quantMethod string) *modelconfig.HFQuantConfig {
 	return &modelconfig.HFQuantConfig{
 		Quantization: modelconfig.HFQuantConfigDetails{QuantAlgo: quantMethod},
 	}
-}
-
-func TestBuildArtifactAttribute_Basic(t *testing.T) {
-	parser := &ModelConfigParser{logger: zap.NewNop().Sugar()}
-
-	sha := "commit-sha-123"
-	parentName := "clusterbasemodel.parentModel"
-	parentPath := "/models/parent1"
-	childrenPaths := []string{"/models/child1"}
-
-	artifact := parser.BuildArtifactAttribute(sha, parentName, parentPath, childrenPaths)
-	require.NotNil(t, artifact)
-	assert.Equal(t, sha, artifact.Sha)
-	assert.Equal(t, map[string]string{parentName: parentPath}, artifact.ParentPath)
-	assert.Equal(t, childrenPaths, artifact.ChildrenPaths)
 }
 
 // TestUpdateModelSpecPreservesModelConfiguration guards the preserve-if-unset

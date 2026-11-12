@@ -1,23 +1,20 @@
 package replica
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 	"time"
 
-	"sigs.k8s.io/ome/pkg/xet"
-
-	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
-
-	"sigs.k8s.io/ome/pkg/afero"
-
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
+	"sigs.k8s.io/ome/pkg/afero"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
 	testingPkg "sigs.k8s.io/ome/pkg/testing"
 	"sigs.k8s.io/ome/pkg/utils/storage"
+	"sigs.k8s.io/ome/pkg/xet"
 )
 
 // Define reusable struct types to avoid repetition
@@ -35,125 +32,24 @@ type TargetStruct struct {
 	ChecksumConfig *common.ChecksumConfig `mapstructure:"checksum"`
 }
 
-func TestNewReplicaConfig(t *testing.T) {
-	tests := []struct {
-		name        string
-		options     []Option
-		expectError bool
-		errorMsg    string
-	}{
-		{
-			name:        "empty config",
-			options:     []Option{},
-			expectError: false,
-		},
-		{
-			name: "config with logger",
-			options: []Option{
-				WithAnotherLog(testingPkg.SetupMockLogger()),
-			},
-			expectError: false,
-		},
-		{
-			name: "config with viper",
-			options: []Option{
-				WithViper(viper.New()),
-			},
-			expectError: false,
-		},
-		{
-			name: "option returns error",
-			options: []Option{
-				func(c *Config) error { return fmt.Errorf("fail") },
-			},
-			expectError: true,
-			errorMsg:    "fail",
-		},
+func TestNewConfig(t *testing.T) {
+	sourceDataStore := &ociobjectstore.OCIOSDataStore{
+		Config: &ociobjectstore.Config{Name: ociobjectstore.SourceOsConfigName},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			config, err := NewReplicaConfig(tt.options...)
-
-			if tt.expectError {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errorMsg)
-				assert.Nil(t, config)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, config)
-			}
-		})
+	targetDataStore := &ociobjectstore.OCIOSDataStore{
+		Config: &ociobjectstore.Config{Name: ociobjectstore.TargetOsConfigName},
 	}
-}
-
-func TestConfig_Apply(t *testing.T) {
-	tests := []struct {
-		name        string
-		options     []Option
-		expectError bool
-	}{
-		{
-			name:        "apply empty options",
-			options:     []Option{},
-			expectError: false,
-		},
-		{
-			name: "apply valid options",
-			options: []Option{
-				WithAnotherLog(testingPkg.SetupMockLogger()),
-			},
-			expectError: false,
-		},
-		{
-			name: "apply nil option",
-			options: []Option{
-				nil,
-				WithAnotherLog(testingPkg.SetupMockLogger()),
-			},
-			expectError: false,
-		},
-		{
-			name: "apply option that returns error",
-			options: []Option{
-				func(c *Config) error {
-					return assert.AnError
-				},
-			},
-			expectError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			config := &Config{}
-			err := config.Apply(tt.options...)
-
-			if tt.expectError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestWithAnotherLog(t *testing.T) {
+	mockHubClient := &xet.Client{}
+	sourcePVCFileSystem := afero.NewOsFs().(*afero.OsFs)
+	targetPVCFileSystem := afero.NewOsFs().(*afero.OsFs)
 	mockLogger := testingPkg.SetupMockLogger()
-	config := &Config{}
-	option := WithAnotherLog(mockLogger)
 
-	err := option(config)
-	assert.NoError(t, err)
-	assert.Equal(t, mockLogger, config.AnotherLogger)
-}
-
-func TestWithViper(t *testing.T) {
 	tests := []struct {
-		name         string
-		setupViper   func() *viper.Viper
-		expectError  bool
-		validateFunc func(*testing.T, *Config)
+		name        string
+		setupViper  func() *viper.Viper
+		params      replicaParams
+		expectError bool
+		check       func(*testing.T, *Config)
 	}{
 		{
 			name: "valid viper config",
@@ -173,8 +69,7 @@ func TestWithViper(t *testing.T) {
 				v.Set("target.checksum.concurrency", 3)
 				return v
 			},
-			expectError: false,
-			validateFunc: func(t *testing.T, c *Config) {
+			check: func(t *testing.T, c *Config) {
 				assert.Equal(t, "/test/path", c.LocalPath)
 				assert.Equal(t, 5, c.NumConnections)
 				assert.Equal(t, 100, c.DownloadSizeLimitGB)
@@ -203,18 +98,13 @@ func TestWithViper(t *testing.T) {
 				v.Set("target.checksum.concurrency", v.Get("target.checksum.concurrency"))
 				return v
 			},
-			expectError: false,
-			validateFunc: func(t *testing.T, c *Config) {
+			check: func(t *testing.T, c *Config) {
 				assert.Equal(t, 6, c.Target.ChecksumConfig.Concurrency)
 			},
 		},
 		{
 			name: "empty viper config",
-			setupViper: func() *viper.Viper {
-				return viper.New()
-			},
-			expectError: false,
-			validateFunc: func(t *testing.T, c *Config) {
+			check: func(t *testing.T, c *Config) {
 				// Should set defaults
 				assert.Equal(t, 10, c.NumConnections)
 				assert.Equal(t, 650, c.DownloadSizeLimitGB)
@@ -232,101 +122,78 @@ func TestWithViper(t *testing.T) {
 				v.Set("num_connections", "invalid_int_value")
 				return v
 			},
-			expectError:  true,
-			validateFunc: nil,
+			expectError: true,
+		},
+		{
+			name: "both source OCI data store and target OCI data store present",
+			params: replicaParams{
+				OCIOSDataStoreList: []*ociobjectstore.OCIOSDataStore{sourceDataStore, targetDataStore},
+			},
+			check: func(t *testing.T, c *Config) {
+				assert.Equal(t, sourceDataStore, c.Source.OCIOSDataStore)
+				assert.Equal(t, targetDataStore, c.Target.OCIOSDataStore)
+				assert.Nil(t, c.Source.HubClient)
+			},
+		},
+		{
+			name: "hub client and target OCI data store present",
+			params: replicaParams{
+				OCIOSDataStoreList: []*ociobjectstore.OCIOSDataStore{targetDataStore},
+				HubClient:          mockHubClient,
+			},
+			check: func(t *testing.T, c *Config) {
+				assert.Nil(t, c.Source.OCIOSDataStore)
+				assert.Equal(t, targetDataStore, c.Target.OCIOSDataStore)
+				assert.Equal(t, mockHubClient, c.Source.HubClient)
+			},
+		},
+		{
+			name: "source and target PVC file systems present",
+			params: replicaParams{
+				SourcePVCFileSystem: sourcePVCFileSystem,
+				TargetPVCFileSystem: targetPVCFileSystem,
+			},
+			check: func(t *testing.T, c *Config) {
+				assert.Equal(t, sourcePVCFileSystem, c.Source.PVCFileSystem)
+				assert.Equal(t, targetPVCFileSystem, c.Target.PVCFileSystem)
+				assert.Nil(t, c.Source.OCIOSDataStore)
+				assert.Nil(t, c.Target.OCIOSDataStore)
+			},
+		},
+		{
+			name: "mixed OCI and PVC storage",
+			params: replicaParams{
+				OCIOSDataStoreList:  []*ociobjectstore.OCIOSDataStore{sourceDataStore},
+				TargetPVCFileSystem: targetPVCFileSystem,
+			},
+			check: func(t *testing.T, c *Config) {
+				assert.Equal(t, sourceDataStore, c.Source.OCIOSDataStore)
+				assert.Nil(t, c.Source.PVCFileSystem)
+				assert.Nil(t, c.Target.OCIOSDataStore)
+				assert.Equal(t, targetPVCFileSystem, c.Target.PVCFileSystem)
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			v := tt.setupViper()
-			config := &Config{}
+			v := viper.New()
+			if tt.setupViper != nil {
+				v = tt.setupViper()
+			}
+			params := tt.params
+			params.AnotherLogger = mockLogger
 
-			option := WithViper(v)
-			err := option(config)
+			config, err := newConfig(v, params)
 
 			if tt.expectError {
 				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-				if tt.validateFunc != nil {
-					tt.validateFunc(t, config)
-				}
+				assert.Nil(t, config)
+				return
 			}
-		})
-	}
-}
-
-func TestWithAppParams(t *testing.T) {
-	sourceDataStore := &ociobjectstore.OCIOSDataStore{
-		Config: &ociobjectstore.Config{Name: ociobjectstore.SourceOsConfigName},
-	}
-	targetDataStore := &ociobjectstore.OCIOSDataStore{
-		Config: &ociobjectstore.Config{Name: ociobjectstore.TargetOsConfigName},
-	}
-	mockHubClient := &xet.Client{}
-	sourcePVCFileSystem := afero.NewOsFs().(*afero.OsFs)
-	targetPVCFileSystem := afero.NewOsFs().(*afero.OsFs)
-
-	tests := []struct {
-		name                string
-		dataStores          []*ociobjectstore.OCIOSDataStore
-		hubClient           *xet.Client
-		sourcePVCFileSystem *afero.OsFs
-		targetPVCFileSystem *afero.OsFs
-		expectSource        *ociobjectstore.OCIOSDataStore
-		expectTarget        *ociobjectstore.OCIOSDataStore
-		expectHubClient     *xet.Client
-		expectSourcePVC     *afero.OsFs
-		expectTargetPVC     *afero.OsFs
-	}{
-		{
-			name:         "both source OCI data store and target OCI data store present",
-			dataStores:   []*ociobjectstore.OCIOSDataStore{sourceDataStore, targetDataStore},
-			expectSource: sourceDataStore,
-			expectTarget: targetDataStore,
-		},
-		{
-			name:            "hub client and target OCI data store present",
-			dataStores:      []*ociobjectstore.OCIOSDataStore{targetDataStore},
-			hubClient:       mockHubClient,
-			expectSource:    nil,
-			expectTarget:    targetDataStore,
-			expectHubClient: mockHubClient,
-		},
-		{
-			name:                "source and target PVC file systems present",
-			sourcePVCFileSystem: sourcePVCFileSystem,
-			targetPVCFileSystem: targetPVCFileSystem,
-			expectSourcePVC:     sourcePVCFileSystem,
-			expectTargetPVC:     targetPVCFileSystem,
-		},
-		{
-			name:                "mixed OCI and PVC storage",
-			dataStores:          []*ociobjectstore.OCIOSDataStore{sourceDataStore},
-			targetPVCFileSystem: targetPVCFileSystem,
-			expectSource:        sourceDataStore,
-			expectTargetPVC:     targetPVCFileSystem,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			params := replicaParams{
-				AnotherLogger:       testingPkg.SetupMockLogger(),
-				OCIOSDataStoreList:  tt.dataStores,
-				HubClient:           tt.hubClient,
-				SourcePVCFileSystem: tt.sourcePVCFileSystem,
-				TargetPVCFileSystem: tt.targetPVCFileSystem,
-			}
-			config := &Config{}
-			err := WithAppParams(params)(config)
-			assert.NoError(t, err)
-			assert.Equal(t, tt.expectSource, config.Source.OCIOSDataStore)
-			assert.Equal(t, tt.expectTarget, config.Target.OCIOSDataStore)
-			assert.Equal(t, tt.expectHubClient, config.Source.HubClient)
-			assert.Equal(t, tt.expectSourcePVC, config.Source.PVCFileSystem)
-			assert.Equal(t, tt.expectTargetPVC, config.Target.PVCFileSystem)
+			require.NoError(t, err)
+			assert.Equal(t, mockLogger, config.AnotherLogger)
+			tt.check(t, config)
 		})
 	}
 }
@@ -359,6 +226,24 @@ func TestConfig_Validate(t *testing.T) {
 				}
 			},
 			expectError: false,
+		},
+		{
+			name: "source URI names no bucket",
+			setupConfig: func() *Config {
+				return &Config{
+					LocalPath:            "/test/path",
+					DownloadSizeLimitGB:  100,
+					EnableSizeLimitCheck: true,
+					NumConnections:       5,
+					Source: SourceStruct{
+						StorageURIStr: "oci://n/src-ns/b//o/models",
+					},
+					Target: TargetStruct{
+						StorageURIStr: validTargetURI,
+					},
+				}
+			},
+			expectError: true,
 		},
 		{
 			name: "missing LocalPath",

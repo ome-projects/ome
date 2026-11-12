@@ -54,6 +54,9 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.quotaManager.podSecurityContext | nindent 8 }}
+      {{- if not (kindIs "invalid" .Values.quotaManager.terminationGracePeriodSeconds) }}
+      terminationGracePeriodSeconds: {{ .Values.quotaManager.terminationGracePeriodSeconds }}
+      {{- end }}
       containers:
       - name: quota-manager
         image: {{ include "ome-quota-manager.image" (dict "values" .Values "repository" .Values.quotaManager.image.repository "tag" .Values.quotaManager.image.tag) }}
@@ -68,6 +71,9 @@ spec:
         - "--leader-elect-lease-duration={{ .leaseDuration }}"
         - "--leader-elect-renew-deadline={{ .renewDeadline }}"
         - "--leader-elect-retry-period={{ .retryPeriod }}"
+        {{- end }}
+        {{- if .releaseOnCancel }}
+        - "--leader-elect-release-on-cancel"
         {{- end }}
         {{- end }}
         - "--zap-log-level={{ .Values.quotaManager.logLevel }}"
@@ -122,6 +128,7 @@ spec:
         - "--webhook-config-name={{ .Values.quotaManager.name }}.ome.io"
         - "--ca-name={{ .Values.quotaManager.name }}-ca"
         - "--ca-organization=ome"
+        - "--cluster-domain={{ .Values.quotaManager.clusterDomain }}"
         {{- end }}
         {{- end }}
         ports:

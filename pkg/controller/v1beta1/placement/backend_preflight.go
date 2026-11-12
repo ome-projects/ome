@@ -132,7 +132,7 @@ func (r *Reconciler) resolveStandingBackend(ctx context.Context, cl client.Clien
 		return nil, err
 	}
 	if policy != nil && len(policy.ReplicaFloors) > 0 {
-		backend, _, err := resolver.ResolveHome(ctx, desired, standing)
+		backend, _, err := resolver.ResolveAssignedCluster(ctx, desired, standing)
 		if err != nil {
 			return nil, err
 		}

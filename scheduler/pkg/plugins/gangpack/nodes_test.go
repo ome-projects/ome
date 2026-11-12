@@ -37,7 +37,7 @@ func gpuPod(req string) *v1.Pod {
 }
 
 // gangGPUPod is a gpuPod that is also a gang member (namespace + pod-group label),
-// so placement's inspectBoundGangMembers can match it while free-ness still comes from its
+// so the snapshot pass can match it as a placed member while free-ness still comes from its
 // gpu request.
 func gangGPUPod(ns, pg, req string) *v1.Pod {
 	p := gpuPod(req)
@@ -84,7 +84,7 @@ func TestNodeSchedulable_CordonedOrUntoleratedTaint_IsFalse(t *testing.T) {
 
 // TestFreeByDomain_CordonedOrTaintedNodes_CountsThemNotFree: a cordoned (or untolerated-taint) node
 // has capacity but is NOT counted free — otherwise Choose would take a domain the
-// framework's Filter then rejects, wedging the gang.
+// framework's Filter then rejects, and the gang would never bind.
 func TestFreeByDomain_CordonedOrTaintedNodes_CountsThemNotFree(t *testing.T) {
 	pod := gpuPod("4")
 	nodes := []framework.NodeInfo{
@@ -142,33 +142,33 @@ func TestFreeByDomain_MixedSnapshot_CountsNodesWherePodFits(t *testing.T) {
 	}
 }
 
-func TestNodeFitsPod_CPUOrPodSlotsExhausted_IsFalse(t *testing.T) {
+func TestMemberFit_CPUOrPodSlotsExhausted_IsFalse(t *testing.T) {
 	node := gpuNode("n", "a", "4")
 	node.Status.Allocatable[v1.ResourceCPU] = resource.MustParse("2")
 	node.Status.Allocatable[v1.ResourceMemory] = resource.MustParse("2Gi")
 	pod := gangGPUPod("team", "pf", "4")
 	pod.Spec.Containers[0].Resources.Requests[v1.ResourceCPU] = resource.MustParse("1500m")
 	pod.Spec.Containers[0].Resources.Requests[v1.ResourceMemory] = resource.MustParse("1Gi")
-	if !nodeFitsPod(nodeInfo(node), pod) {
+	if !needOf(pod).fits(nodeInfo(node), node) {
 		t.Fatal("pod should fit all advertised resources")
 	}
 	cpuUsed := gpuPod("0")
 	cpuUsed.Spec.Containers[0].Resources.Requests[v1.ResourceCPU] = resource.MustParse("1")
-	if nodeFitsPod(nodeInfo(node, cpuUsed), pod) {
+	if needOf(pod).fits(nodeInfo(node, cpuUsed), node) {
 		t.Fatal("remaining CPU is insufficient")
 	}
 	node.Status.Allocatable[v1.ResourcePods] = resource.MustParse("1")
-	if nodeFitsPod(nodeInfo(node, &v1.Pod{}), gpuPod("1")) {
+	if needOf(gpuPod("1")).fits(nodeInfo(node, &v1.Pod{}), node) {
 		t.Fatal("node pod capacity is exhausted")
 	}
 }
 
-func TestNodeFitsPod_SelectorOrRequiredAffinityMismatch_IsFalse(t *testing.T) {
+func TestMemberFit_SelectorOrRequiredAffinityMismatch_IsFalse(t *testing.T) {
 	node := gpuNode("n", "a", "4")
 	node.Labels["pool"] = "serving"
 	pod := gpuPod("4")
 	pod.Spec.NodeSelector = map[string]string{"pool": "other"}
-	if nodeFitsPod(nodeInfo(node), pod) {
+	if needOf(pod).fits(nodeInfo(node), node) {
 		t.Fatal("nodeSelector mismatch must reject the node")
 	}
 	pod.Spec.NodeSelector = nil
@@ -177,9 +177,21 @@ func TestNodeFitsPod_SelectorOrRequiredAffinityMismatch_IsFalse(t *testing.T) {
 			MatchExpressions: []v1.NodeSelectorRequirement{{Key: "pool", Operator: v1.NodeSelectorOpIn, Values: []string{"other"}}},
 		}}},
 	}}
-	if nodeFitsPod(nodeInfo(node), pod) {
+	if needOf(pod).fits(nodeInfo(node), node) {
 		t.Fatal("required node affinity mismatch must reject the node")
 	}
+}
+
+// feasibleAtLeastByDomain reads the room per domain over a plain node slice,
+// as the planning step does after its one pass over the snapshot.
+func feasibleAtLeastByDomain(nodeInfos []framework.NodeInfo, topologyKey string, pods []*v1.Pod, need int) topology.FreeByDomain {
+	return roomByDomain(scanSnapshot(nodeInfos, nil, topologyKey, everyDomain).byDomain, membersOf(pods), need)
+}
+
+// matchingCandidateNodesForNeed narrows the current member to the domain's
+// nodes over a plain node slice, as the planning step does.
+func matchingCandidateNodesForNeed(nodeInfos []framework.NodeInfo, topologyKey, domain string, templates []*v1.Pod, need int) sets.Set[string] {
+	return candidateNodes(scanSnapshot(nodeInfos, nil, topologyKey, domain).byDomain[domain], membersOf(templates), need)
 }
 
 // feasibleByDomain is feasibleAtLeastByDomain with every member required.
@@ -358,5 +370,61 @@ func TestFeasibleByDomain_MembersWithMutualAntiAffinity_NeverShareANode(t *testi
 	twoNodes := []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "2")), nodeInfo(gpuNode("a2", "a", "1"))}
 	if free := feasibleByDomain(twoNodes, testKey, gang); free["a"] != 2 {
 		t.Fatalf("free = %v, want a:2 (one member per node)", free)
+	}
+}
+
+// TestScanSnapshot_GroupsTheScopeAndFindsPlacedMembersEverywhere: one pass
+// over the snapshot finds the gang's placed members on every node, in a
+// domain or outside every one, and groups the nodes of the scope alone, or of
+// every domain, each read once; entries without a node are left out.
+func TestScanSnapshot_GroupsTheScopeAndFindsPlacedMembersEverywhere(t *testing.T) {
+	pod := gangPod("team", "pf")
+	member := func(name string) *v1.Pod {
+		p := gangPod("team", "pf")
+		p.Name = name
+		return p
+	}
+	nodes := []framework.NodeInfo{
+		nodeInfo(gpuNode("a1", "a", "4")),
+		nodeInfo(gpuNode("a2", "a", "4"), gangPod("team", "other")),
+		nodeInfo(gpuNode("b1", "b", "4"), member("pf-1")),
+		nodeInfo(gpuNode("x1", "", "4"), member("pf-2")),
+		nil,
+		schedulerframework.NewNodeInfo(),
+	}
+	names := func(group []domainNode) []string {
+		out := []string{}
+		for _, dn := range group {
+			if dn.info.Node() != dn.node {
+				t.Fatalf("entry %s carries another node", dn.node.Name)
+			}
+			out = append(out, dn.node.Name)
+		}
+		return out
+	}
+
+	one := scanSnapshot(nodes, pod, testKey, "a")
+	if got := names(one.byDomain["a"]); !reflect.DeepEqual(got, []string{"a1", "a2"}) || len(one.byDomain) != 1 {
+		t.Fatalf("scope a grouped %v in %d domains, want a1 and a2 in one", got, len(one.byDomain))
+	}
+	if one.placed.count != 2 || !one.placed.split || one.placed.domain != "b" || len(one.placed.placed) != 2 {
+		t.Fatalf("placed = %+v, want two members, split, last seen in b", one.placed)
+	}
+
+	every := scanSnapshot(nodes, pod, testKey, everyDomain)
+	if got := names(every.byDomain["b"]); !reflect.DeepEqual(got, []string{"b1"}) || len(every.byDomain) != 2 {
+		t.Fatalf("every domain grouped %v in %d domains, want b1 in b beside a", got, len(every.byDomain))
+	}
+	if planning := every.planning("a"); len(planning) != 1 || len(planning["a"]) != 2 {
+		t.Fatalf("planning a = %v, want a's two nodes alone", planning)
+	}
+	if got := every.names("a"); !reflect.DeepEqual(got, []string{"a1", "a2"}) {
+		t.Fatalf("names(a) = %v, want a1 and a2", got)
+	}
+	if got := every.namesByDomain(); !reflect.DeepEqual(got, map[string][]string{"a": {"a1", "a2"}, "b": {"b1"}}) {
+		t.Fatalf("namesByDomain = %v, want a and b", got)
+	}
+	if none := scanSnapshot(nodes, gpuPod("4"), testKey, everyDomain); none.placed.count != 0 || none.placed.placed != nil {
+		t.Fatalf("a pod outside every gang has placed members: %+v", none.placed)
 	}
 }

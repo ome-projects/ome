@@ -29,7 +29,7 @@ func TestUpdatePodSpecVolumes_PVC(t *testing.T) {
 	b := newPVCBaseComponent("pvc://my-pvc/models/llama")
 
 	podSpec := &v1.PodSpec{}
-	UpdatePodSpecVolumes(b, &v1beta1.InferenceService{}, podSpec, &metav1.ObjectMeta{})
+	render.UpdatePodSpecVolumes(&b.Piece, &v1beta1.InferenceService{}, podSpec, &metav1.ObjectMeta{})
 
 	g.Expect(podSpec.Volumes).To(gomega.HaveLen(1))
 	vol := podSpec.Volumes[0]
@@ -45,7 +45,7 @@ func TestUpdatePodSpecVolumes_PVC_ClusterScoped(t *testing.T) {
 	b := newPVCBaseComponent("pvc://shared:my-pvc/models/llama")
 
 	podSpec := &v1.PodSpec{}
-	UpdatePodSpecVolumes(b, &v1beta1.InferenceService{}, podSpec, &metav1.ObjectMeta{})
+	render.UpdatePodSpecVolumes(&b.Piece, &v1beta1.InferenceService{}, podSpec, &metav1.ObjectMeta{})
 
 	g.Expect(podSpec.Volumes).To(gomega.HaveLen(1))
 	g.Expect(podSpec.Volumes[0].PersistentVolumeClaim.ClaimName).To(gomega.Equal("my-pvc"))
@@ -64,7 +64,7 @@ func TestUpdatePodSpecVolumes_HostPath_Unchanged(t *testing.T) {
 	}}
 
 	podSpec := &v1.PodSpec{}
-	UpdatePodSpecVolumes(b, &v1beta1.InferenceService{}, podSpec, &metav1.ObjectMeta{})
+	render.UpdatePodSpecVolumes(&b.Piece, &v1beta1.InferenceService{}, podSpec, &metav1.ObjectMeta{})
 
 	g.Expect(podSpec.Volumes).To(gomega.HaveLen(1))
 	g.Expect(podSpec.Volumes[0].HostPath).NotTo(gomega.BeNil())
@@ -77,7 +77,7 @@ func TestUpdateVolumeMounts_PVC(t *testing.T) {
 	b := newPVCBaseComponent("pvc://my-pvc/models/llama")
 
 	container := &v1.Container{Name: "main"}
-	UpdateVolumeMounts(b, &v1beta1.InferenceService{}, container, &metav1.ObjectMeta{})
+	render.UpdateVolumeMounts(&b.Piece, &v1beta1.InferenceService{}, container, &metav1.ObjectMeta{})
 
 	g.Expect(container.VolumeMounts).To(gomega.HaveLen(1))
 	vm := container.VolumeMounts[0]
@@ -92,7 +92,7 @@ func TestUpdatePodSpecNodeSelector_PVC_Skipped(t *testing.T) {
 	b := newPVCBaseComponent("pvc://my-pvc/models/llama")
 
 	podSpec := &v1.PodSpec{}
-	UpdatePodSpecNodeSelector(b, &v1beta1.InferenceService{}, podSpec, "")
+	render.UpdatePodSpecNodeSelector(&b.Piece, &v1beta1.InferenceService{}, podSpec, "")
 
 	if podSpec.NodeSelector != nil {
 		for k := range podSpec.NodeSelector {
@@ -111,7 +111,7 @@ func TestUpdateEnvVariables_PVC_SetsModelPath(t *testing.T) {
 	b := newPVCBaseComponent("pvc://my-pvc/models/llama")
 
 	container := &v1.Container{Name: "main"}
-	UpdateEnvVariables(b, &v1beta1.InferenceService{}, container, &metav1.ObjectMeta{})
+	render.UpdateEnvVariables(&b.Piece, &v1beta1.InferenceService{}, container, &metav1.ObjectMeta{})
 
 	var got string
 	for _, e := range container.Env {

@@ -184,7 +184,7 @@ func TestDispatch_AnotherGroupsRunKeepsTheRolledBackUnitHeld(t *testing.T) {
 		}
 	}
 	for _, g := range rollout.CanaryGroups(isvc, rollout.Policies{}) {
-		if err := BindRun(ctx, c, isvc, g, out.Adopted); err != nil {
+		if err := BindRun(ctx, c, isvc, g, RunOpen{Adopted: out.Adopted, Closed: out.Closed}); err != nil {
 			t.Fatalf("bind %v: %v", g.Components, err)
 		}
 	}

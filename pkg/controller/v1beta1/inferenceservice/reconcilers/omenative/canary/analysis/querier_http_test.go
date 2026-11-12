@@ -97,7 +97,7 @@ func mustQuerier(t *testing.T, addr, token string, headers map[string]string) Qu
 	return q
 }
 
-// TestQuerierHTTP_ResultShapes pins the decode path for every Prometheus result
+// TestQuerierHTTP_ResultShapes checks the decode path for every Prometheus result
 // shape the wire can produce: vectors (including NaN/Inf series), scalars,
 // strings, empties, and the unsupported matrix type.
 func TestQuerierHTTP_ResultShapes(t *testing.T) {
@@ -180,7 +180,7 @@ func TestQuerierHTTP_ResultShapes(t *testing.T) {
 	}
 }
 
-// TestQuerierHTTP_ServerErrors pins that HTTP-level and Prometheus-level errors
+// TestQuerierHTTP_ServerErrors checks that HTTP-level and Prometheus-level errors
 // come back as transport errors — never as ErrNoData, whose "no data" reading
 // would mask a broken source as a quiet canary.
 func TestQuerierHTTP_ServerErrors(t *testing.T) {
@@ -222,7 +222,7 @@ func TestQuerierHTTP_ServerErrors(t *testing.T) {
 	}
 }
 
-// TestQuerierHTTP_Unreachable pins that a connection failure surfaces as an
+// TestQuerierHTTP_Unreachable checks that a connection failure surfaces as an
 // error, not ErrNoData.
 func TestQuerierHTTP_Unreachable(t *testing.T) {
 	prom := newFakeProm(t)
@@ -239,7 +239,7 @@ func TestQuerierHTTP_Unreachable(t *testing.T) {
 	}
 }
 
-// TestQuerierHTTP_AuthOnTheWire pins that NewQuerier wires the bearer token and
+// TestQuerierHTTP_AuthOnTheWire checks that NewQuerier wires the bearer token and
 // custom headers into the requests the client actually sends — the round-tripper
 // unit alone cannot prove the client was built with it.
 func TestQuerierHTTP_AuthOnTheWire(t *testing.T) {
@@ -271,7 +271,7 @@ func TestQuerierHTTP_AuthOnTheWire(t *testing.T) {
 	}
 }
 
-// TestQuerierHTTP_NoAuthByDefault pins that an unauthenticated querier (the
+// TestQuerierHTTP_NoAuthByDefault checks that an unauthenticated querier (the
 // bundled-Prometheus path) sends no Authorization header at all.
 func TestQuerierHTTP_NoAuthByDefault(t *testing.T) {
 	prom := newFakeProm(t)
@@ -288,7 +288,7 @@ func TestQuerierHTTP_NoAuthByDefault(t *testing.T) {
 	}
 }
 
-// TestQuerierHTTP_ContextTimeout pins that a hung Prometheus is bounded by the
+// TestQuerierHTTP_ContextTimeout checks that a hung Prometheus is bounded by the
 // caller's context: Query returns a deadline error instead of blocking.
 func TestQuerierHTTP_ContextTimeout(t *testing.T) {
 	release := make(chan struct{})
@@ -374,7 +374,7 @@ func TestEvaluateHTTP_EndToEnd(t *testing.T) {
 	})
 }
 
-// TestQuerierHTTP_EachQueryDialsAnew pins that no connection is carried from
+// TestQuerierHTTP_EachQueryDialsAnew checks that no connection is carried from
 // one query to the next: every query dials the server address afresh and so
 // reaches whatever that address resolves to now, not a peer connected before
 // the address was re-aimed. One Querier per query, as the sampler builds them.

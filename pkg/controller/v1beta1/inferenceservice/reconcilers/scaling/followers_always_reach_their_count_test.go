@@ -351,6 +351,20 @@ func statusDigest(s *v1beta1.ScalingPolicyStatus) string {
 	return b.String()
 }
 
+// releasedEntry is the status entry that records a Component the coordinator
+// keeps the count for after it stopped following, nil when there is none.
+func releasedEntry(s *v1beta1.ScalingPolicyStatus, comp v1beta1.ComponentType) *v1beta1.FollowerScalingStatus {
+	if s == nil {
+		return nil
+	}
+	for i := range s.Followers {
+		if s.Followers[i].Component == comp && s.Followers[i].Released {
+			return &s.Followers[i]
+		}
+	}
+	return nil
+}
+
 func readyReason(s *v1beta1.ScalingPolicyStatus) string {
 	if s == nil {
 		return ""
@@ -638,6 +652,7 @@ func (w *modelWorld) pass(st *modelState) passResult {
 			ResolvedAutoscaler:  resolved,
 			CoordinatorFollower: follows,
 			CoordinatorTarget:   targets.Replicas(m.comp),
+			FollowerReleased:    targets.Released(m.comp),
 			Client:              store,
 			Reader:              store,
 		})
@@ -1168,8 +1183,8 @@ func (w *modelWorld) checkPass(st *modelState, res passResult) []modelFinding {
 
 // checkSettled reads the invariants that hold once the replicas stop
 // changing: every follower carries the count the policy asks for, a
-// released follower carries what the spec asks for now, a roll on any
-// member can still finish, and the settle took few passes.
+// released follower keeps the count it carried, a roll on any member can
+// still finish, and the settle took few passes.
 func (w *modelWorld) checkSettled(st *modelState) []modelFinding {
 	var out []modelFinding
 	add := func(class, format string, args ...any) {
@@ -1215,11 +1230,13 @@ func (w *modelWorld) checkSettled(st *modelState) []modelFinding {
 		}
 		add("released-follower", "%s released at %d Instances with minReplicas %d and maxReplicas %s now carries %d Instances and autoscaler %q (the default HPA's bounds would be [%d, %d])",
 			m.comp, st.releasedFrom, min, maxText, ms.replicas(), ms.scalerClass(), min, hpaMax)
-		if m.scaler == scalerNone && ms.replicas() != int32(min) {
-			add("count-wrong", "%s released with autoscaler None carries %d Instances; the spec asks for minReplicas %d", m.comp, ms.replicas(), min)
+		if ms.replicas() != st.releasedFrom {
+			add("count-wrong", "%s released with autoscaler %q carries %d Instances; a Component that stops following keeps the %d it carried", m.comp, ms.scalerClass(), ms.replicas(), st.releasedFrom)
 		}
-		if m.scaler == scalerDefault && ms.replicas() != st.releasedFrom {
-			add("count-wrong", "%s released with no autoscaler block carries %d Instances; the projector keeps the live count %d for an autoscaler-managed Component", m.comp, ms.replicas(), st.releasedFrom)
+		if recorded := releasedEntry(st.status, m.comp); (recorded != nil) != (m.scaler == scalerNone && st.releasedFrom != int32(min)) {
+			add("released-record-wrong", "%s released with autoscaler %q at %d Instances with minReplicas %d has released record %v; the coordinator records a Component it keeps the count for (autoscaler None above its minReplicas) and nothing else", m.comp, ms.scalerClass(), st.releasedFrom, min, recorded)
+		} else if recorded != nil && (recorded.Current != st.releasedFrom || recorded.Target != int32(min)) {
+			add("released-record-wrong", "%s released record reads current %d, target %d; want the %d it keeps and the %d its minReplicas names", m.comp, recorded.Current, recorded.Target, st.releasedFrom, min)
 		}
 	}
 	if len(w.progressMoves(st)) == 0 {
@@ -1456,8 +1473,8 @@ func modelConfigs(full bool) []modelConfig {
 // modelExplore explores every configuration keep admits and reports each
 // class of finding with the shortest path to it. count-wrong,
 // partition-wrong, waits-forever, no-fixpoint, pass-error,
-// follower-without-a-maximum and partition-lags-count fail the test;
-// held-by-follower-conflict, released-follower,
+// follower-without-a-maximum, partition-lags-count and
+// released-record-wrong fail the test; held-by-follower-conflict, released-follower,
 // scale-up-creates-on-canary-revision, scale-down-removes-staged,
 // duplicate-clamped-warning, slow-settle and depth are reported only.
 func modelExplore(t *testing.T, keep func(modelConfig) bool) {
@@ -1518,7 +1535,7 @@ func modelExplore(t *testing.T, keep func(modelConfig) bool) {
 			t.Logf("  [%s]\n    %s\n    path: %s\n    state: %s", ex.cfg.name, ex.finding.message, modelPath(ex.finding.state), ex.finding.state)
 		}
 		switch class {
-		case "count-wrong", "partition-wrong", "waits-forever", "no-fixpoint", "pass-error", "follower-without-a-maximum", "partition-lags-count":
+		case "count-wrong", "partition-wrong", "waits-forever", "no-fixpoint", "pass-error", "follower-without-a-maximum", "partition-lags-count", "released-record-wrong":
 			t.Errorf("%s: %d states (first: %s: %s)", class, totals[class], examples[class][0].cfg.name, examples[class][0].finding.message)
 		}
 	}
@@ -1624,24 +1641,22 @@ func TestScalingModel_AFollowerCountAndItsCanaryPartitionLandWithinOnePass(t *te
 	}
 }
 
-// TestScalingModel_AReleasedFollowerCarriesTheCountTheSpecAsksFor records
-// what a follower does when its policy is removed: 18 engines, the decoder
-// following at 0.666 to 12 with minReplicas 2 and maxReplicas 16. A decoder
-// with autoscaler None is written to 2 in the next pass, ten Instances
-// leaving through the ordinary scale-down with no budget. A decoder with
-// no autoscaler block keeps 12 and its replica carries the default HPA
-// again, whose bounds are the declared [2, 16]. The reading is recorded
-// here so a change is noticed; which of the two the operator should get is
-// not decided yet, and this test is updated when it changes.
-func TestScalingModel_AReleasedFollowerCarriesTheCountTheSpecAsksFor(t *testing.T) {
+// TestScalingModel_AReleasedFollowerKeepsItsCount: 18 engines, the decoder
+// following at 0.666 to 12 with minReplicas 2 and maxReplicas 16; the policy
+// is removed. A decoder with autoscaler None keeps 12: the coordinator
+// records it as released, with the 12 it keeps and the 2 its minReplicas
+// names, and the projector keeps the count. A decoder with no autoscaler
+// block keeps 12 under the default HPA, whose bounds are the declared
+// [2, 16]; nothing is recorded.
+func TestScalingModel_AReleasedFollowerKeepsItsCount(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		scaler modelScaler
-		want   int32
-		class  v1beta1.AutoscalerClass
+		name     string
+		scaler   modelScaler
+		class    v1beta1.AutoscalerClass
+		recorded bool
 	}{
-		{name: "autoscaler None", scaler: scalerNone, want: 2, class: v1beta1.AutoscalerNone},
-		{name: "no autoscaler block", scaler: scalerDefault, want: 12, class: v1beta1.AutoscalerHPA},
+		{name: "autoscaler None", scaler: scalerNone, class: v1beta1.AutoscalerNone, recorded: true},
+		{name: "no autoscaler block", scaler: scalerDefault, class: v1beta1.AutoscalerHPA},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newModelWorld(t, picture(18, scalerExternal, "0.666", 2, 16, rollIdle, tc.scaler))
@@ -1651,14 +1666,21 @@ func TestScalingModel_AReleasedFollowerCarriesTheCountTheSpecAsksFor(t *testing.
 			}
 			next, findings := w.apply(st, modelMove{kind: "policy-off"})
 			decoder := next.members[1]
-			if decoder.replicas() != tc.want || decoder.scalerClass() != tc.class {
-				t.Fatalf("after the policy is removed the decoder carries %d Instances with autoscaler %q; want %d with %q", decoder.replicas(), decoder.scalerClass(), tc.want, tc.class)
+			if decoder.replicas() != 12 || decoder.scalerClass() != tc.class {
+				t.Fatalf("after the policy is removed the decoder carries %d Instances with autoscaler %q; want 12 kept with %q", decoder.replicas(), decoder.scalerClass(), tc.class)
 			}
 			if next.settledIn > settledPassesAllowed {
 				t.Fatalf("the release took %d passes to settle", next.settledIn)
 			}
+			record := releasedEntry(next.status, v1beta1.DecoderComponent)
+			switch {
+			case tc.recorded && (record == nil || record.Current != 12 || record.Target != 2 || readyReason(next.status) != "Released"):
+				t.Fatalf("status = %+v; want the decoder recorded as released, keeping 12 with minReplicas 2, under Ready/Released", next.status)
+			case !tc.recorded && next.status != nil:
+				t.Fatalf("status = %+v; want no block: the decoder's autoscaler owns its count", next.status)
+			}
 			for _, f := range findings {
-				if f.class == "count-wrong" {
+				if f.class == "count-wrong" || f.class == "released-record-wrong" {
 					t.Fatal(f.message)
 				}
 				t.Logf("%s: %s", f.class, f.message)

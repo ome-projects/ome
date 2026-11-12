@@ -60,16 +60,7 @@ func TestMutator_Handle(t *testing.T) {
 					Name:      constants.InferenceServiceConfigMapName,
 					Namespace: constants.OMENamespace,
 				},
-				Immutable: nil,
-				Data: map[string]string{
-					constants.AgentConfigMapKeyName: `{
-        				"image" : "ome/agent:latest",
-        				"memoryRequest": "100Mi",
-        				"memoryLimit": "1Gi",
-        				"cpuRequest": "100m",
-        				"cpuLimit": "1"
-    				}`,
-				},
+				Immutable:  nil,
 				BinaryData: nil,
 			},
 			request: admission.Request{
@@ -143,16 +134,7 @@ func TestMutator_Handle(t *testing.T) {
 					Name:      constants.InferenceServiceConfigMapName,
 					Namespace: constants.OMENamespace,
 				},
-				Immutable: nil,
-				Data: map[string]string{
-					constants.AgentConfigMapKeyName: `{
-        				"image" : "ome/agent:latest",
-        				"memoryRequest": "100Mi",
-        				"memoryLimit": "1Gi",
-        				"cpuRequest": "100m",
-        				"cpuLimit": "1"
-    				}`,
-				},
+				Immutable:  nil,
 				BinaryData: nil,
 			},
 			request: admission.Request{
@@ -244,16 +226,7 @@ func TestMutator_Handle(t *testing.T) {
 					Name:      constants.InferenceServiceConfigMapName,
 					Namespace: constants.OMENamespace,
 				},
-				Immutable: nil,
-				Data: map[string]string{
-					constants.AgentConfigMapKeyName: `{
-        				"image" : "ome/agent:latest",
-        				"memoryRequest": "100Mi",
-        				"memoryLimit": "1Gi",
-        				"cpuRequest": "100m",
-        				"cpuLimit": "1"
-    				}`,
-				},
+				Immutable:  nil,
 				BinaryData: nil,
 			},
 			request: admission.Request{
@@ -470,7 +443,7 @@ func TestMutator_Handle_MissingConfigMap(t *testing.T) {
 func TestMutatorChain_ReinvocationIdempotent(t *testing.T) {
 	mutator := Mutator{Client: fakeclient.New(t)}
 
-	configMap := &v1.ConfigMap{Data: map[string]string{}}
+	configMap := configMapWithRDMAFixture(t, shippedConfigMap(t))
 	pod := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "chain-pod",

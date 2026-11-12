@@ -29,9 +29,11 @@ const WaitingReasonUnschedulable = corev1.PodReasonUnschedulable
 // still being collected, a node stopped reporting a pod the operation
 // needs, a provisioner has not readied capacity for a withheld pod, or
 // an operator pause holds the attempt at a step boundary. The hold
-// authorities write exactly these tokens plus the source-rotation
-// report, which names a workload getting worse and keeps the clock
-// running.
+// authorities write exactly these tokens plus two reports that keep the
+// clock running: the source-rotation report, which names a workload
+// getting worse, and the retired-replacement report, which names the
+// engine's own deletion of a retired gang replacement, bounded by the
+// delete grace.
 var externalHoldTokens = map[string]struct{}{
 	RejectionReasonQuotaExceeded:        {},
 	RejectionReasonAdmissionUnavailable: {},

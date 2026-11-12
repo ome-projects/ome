@@ -42,7 +42,9 @@ type CanaryStatus struct {
 
 	// ObservedTrafficWeight is the external traffic weight currently programmed
 	// for the canary revision (mirrors the active step's TrafficWeight once
-	// applied).
+	// applied). It is the weight written to the Component's traffic targets;
+	// whether the gateway has accepted the route carrying it is reported by
+	// the IngressReady condition.
 	ObservedTrafficWeight int32 `json:"observedTrafficWeight"`
 
 	// PromotedThrough is the ome.io/rollout-promote value the most recent step
@@ -116,6 +118,19 @@ type CanaryStatus struct {
 	// +optional
 	CapacityWaitSince *metav1.Time `json:"capacityWaitSince,omitempty"`
 
+	// StableSideShortSince is when the executor first read the stable side
+	// short under the split the current step serves: a member runs fewer
+	// Ready Instances on its stable revision than the step keeps there, at
+	// least one, so the canary revision carries a larger share of the Ready
+	// capacity than the split's weight. The event CanaryStableSideShort is
+	// recorded on the pass that sets it, not on every pass it stands.
+	// Cleared when every member's stable side is whole again, when no Ready
+	// Instance is left on a stable side (the split itself moves then), and
+	// when the split moves on: a step advance, the cutover, a hold, a stop,
+	// a rollback, a start toward a new target.
+	// +optional
+	StableSideShortSince *metav1.Time `json:"stableSideShortSince,omitempty"`
+
 	// Failed records that the canary is parked at CurrentStep: the capacity
 	// gate stayed unmet past the ready timeout, analysis stayed inconclusive
 	// past the stall timeout, or a rollback found no stable revision to
@@ -165,8 +180,8 @@ type AnalysisMetricResult struct {
 
 // CanaryFailure is why and when a canary parked.
 type CanaryFailure struct {
-	// Reason names the gate that gave up.
-	// +kubebuilder:validation:Enum=CapacityTimeout;AnalysisStalled;StableRevisionMissing
+	// Reason names the gate that gave up, or the write that stopped the unit.
+	// +kubebuilder:validation:Enum=CapacityTimeout;AnalysisStalled;StableRevisionMissing;PhaseWritten
 	Reason CanaryFailureReason `json:"reason"`
 
 	// Time is when the canary parked.
@@ -187,4 +202,8 @@ const (
 	// CanaryFailureStableRevisionMissing: a rollback found no retained
 	// ControllerRevision for the stable revision to point the workload at.
 	CanaryFailureStableRevisionMissing CanaryFailureReason = "StableRevisionMissing"
+	// CanaryFailurePhaseWritten: the unit's rollout phase was written Failed
+	// from outside the controller while the canary was short of its last
+	// step, with no reason of its own; the stop is kept and named so.
+	CanaryFailurePhaseWritten CanaryFailureReason = "PhaseWritten"
 )

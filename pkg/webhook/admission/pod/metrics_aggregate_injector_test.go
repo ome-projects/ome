@@ -11,22 +11,21 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
-const sklearnPrometheusPort = "8080"
-
 func TestInjectMetricsAggregator_AnnotationOnOffOrUnset_InjectsOnlyWhenOn(t *testing.T) {
+	shipped := shippedMetrics(t)
 	userMetricPort := v1.ContainerPort{Name: "http-usermetric", ContainerPort: 9091, Protocol: "TCP"}
 	// aggregated is the queue-proxy once the aggregator is injected: the three
 	// metrics env vars and the aggregate port beside the user-metric port.
 	aggregated := v1.Container{
 		Name: "queue-proxy",
 		Env: []v1.EnvVar{
-			{Name: constants.ContainerPrometheusMetricsPortEnvVarKey, Value: sklearnPrometheusPort},
-			{Name: constants.ContainerPrometheusMetricsPathEnvVarKey, Value: constants.DefaultPrometheusPath},
-			{Name: constants.QueueProxyAggregatePrometheusMetricsPortEnvVarKey, Value: strconv.Itoa(constants.QueueProxyAggregatePrometheusMetricsPort)},
+			{Name: constants.ContainerPrometheusMetricsPortEnvVarKey, Value: strconv.Itoa(int(shipped.ContainerPort))},
+			{Name: constants.ContainerPrometheusMetricsPathEnvVarKey, Value: shipped.Path},
+			{Name: constants.QueueProxyAggregatePrometheusMetricsPortEnvVarKey, Value: strconv.Itoa(int(shipped.AggregatePort))},
 		},
 		Ports: []v1.ContainerPort{
 			userMetricPort,
-			{Name: constants.AggregateMetricsPortName, ContainerPort: int32(constants.QueueProxyAggregatePrometheusMetricsPort), Protocol: "TCP"},
+			{Name: constants.AggregateMetricsPortName, ContainerPort: shipped.AggregatePort, Protocol: "TCP"},
 		},
 	}
 	untouched := v1.Container{Name: "queue-proxy", Ports: []v1.ContainerPort{userMetricPort}}
@@ -76,11 +75,7 @@ func TestInjectMetricsAggregator_AnnotationOnOffOrUnset_InjectsOnlyWhenOn(t *tes
 		},
 	}
 
-	cfgMap := v1.ConfigMap{Data: map[string]string{"enableMetricAggregation": "false", "enablePrometheusScraping": "false"}}
-	ma, err := newMetricsAggregator(&cfgMap)
-	if err != nil {
-		t.Fatalf("Error creating the metrics aggregator %v", err)
-	}
+	ma := shipped
 
 	for _, scenario := range scenarios {
 		t.Run(scenario.name, func(t *testing.T) {
@@ -145,10 +140,7 @@ func TestInjectMetricsAggregator_RunTwice_ConvergesWithoutDuplicates(t *testing.
 		return values
 	}
 
-	ma, err := newMetricsAggregator(&v1.ConfigMap{Data: map[string]string{}})
-	if err != nil {
-		t.Fatalf("Error creating the metrics aggregator %v", err)
-	}
+	ma := shippedMetrics(t)
 
 	t.Run("second invocation is a no-op", func(t *testing.T) {
 		pod := newPod()

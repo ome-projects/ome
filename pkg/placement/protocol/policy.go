@@ -76,23 +76,46 @@ func Decode(raw string) (*v1beta1.PlacementExecutionPolicy, error) {
 	_, hasVersion := fields["version"]
 	_, hasPolicy := fields["policy"]
 	if hasVersion || hasPolicy {
-		var envelope executionEnvelope
-		if err := decoder.Decode(&envelope); err != nil {
-			return nil, err
-		}
-		if envelope.Version != executionVersion && envelope.Version != demandVersion && envelope.Version != floorsVersion {
-			return nil, fmt.Errorf("unsupported execution policy version %d", envelope.Version)
-		}
-		hasDemand := envelope.Policy != nil && envelope.Policy.Demand != nil
-		hasFloors := envelope.Policy != nil && len(envelope.Policy.ReplicaFloors) > 0
-		if (envelope.Version == floorsVersion) != hasFloors {
-			return nil, fmt.Errorf("execution policy version does not match its replica floor contract")
-		}
-		if envelope.Version != floorsVersion && (envelope.Version == demandVersion) != hasDemand {
-			return nil, fmt.Errorf("execution policy version does not match its demand contract")
-		}
-		return envelope.Policy, nil
+		return decodeEnvelope(decoder)
 	}
+	return decodeBarePolicy(decoder)
+}
+
+// decodeEnvelope reads a versioned envelope and accepts a version it knows
+// whose policy carries the contract that version names.
+func decodeEnvelope(decoder *json.Decoder) (*v1beta1.PlacementExecutionPolicy, error) {
+	var envelope executionEnvelope
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Version != executionVersion && envelope.Version != demandVersion && envelope.Version != floorsVersion {
+		return nil, fmt.Errorf("unsupported execution policy version %d", envelope.Version)
+	}
+	if err := checkEnvelopeContract(envelope); err != nil {
+		return nil, err
+	}
+	return envelope.Policy, nil
+}
+
+// checkEnvelopeContract matches the version to the policy's contents: the
+// third version carries per-component replica minimums and the others do
+// not; of the others, the second carries a demand and the first does not.
+func checkEnvelopeContract(envelope executionEnvelope) error {
+	hasDemand := envelope.Policy != nil && envelope.Policy.Demand != nil
+	hasFloors := envelope.Policy != nil && len(envelope.Policy.ReplicaFloors) > 0
+	if (envelope.Version == floorsVersion) != hasFloors {
+		return fmt.Errorf("execution policy version does not match its replica floor contract")
+	}
+	if envelope.Version != floorsVersion && (envelope.Version == demandVersion) != hasDemand {
+		return fmt.Errorf("execution policy version does not match its demand contract")
+	}
+	return nil
+}
+
+// decodeBarePolicy reads the flat policy of the first transport. A demand or
+// per-component replica minimums need the versioned envelope, so a bare
+// policy carrying either is refused.
+func decodeBarePolicy(decoder *json.Decoder) (*v1beta1.PlacementExecutionPolicy, error) {
 	var policy v1beta1.PlacementExecutionPolicy
 	if err := decoder.Decode(&policy); err != nil {
 		return nil, err
@@ -116,8 +139,7 @@ func Validate(policy *v1beta1.PlacementExecutionPolicy) error {
 	}
 	if len(policy.ReplicaFloors) > 0 {
 		if policy.PauseSurge {
-			_, err := ValidatePositiveReplicaFloors(policy.ReplicaFloors)
-			return err
+			return ValidatePositiveReplicaFloors(policy.ReplicaFloors)
 		}
 		_, err := ValidateReplicaFloors(policy.ReplicaFloors)
 		return err

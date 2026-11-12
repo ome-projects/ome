@@ -17,18 +17,15 @@ type fineTunedAdapterParams struct {
 	ObjectStorageDataStores *ociobjectstore.OCIOSDataStore
 }
 
-var Module = fx.Provide(
-	func(v *viper.Viper, params fineTunedAdapterParams) (*FineTunedAdapter, error) {
-		config, err := NewFineTunedAdapterConfig(
-			WithViper(v),
-			WithAnotherLog(params.AnotherLogger),
-			WithAppParams(params),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("error creating fine-tuned adapter config: %+v", err)
-		}
-		if err := config.Validate(); err != nil {
-			return nil, fmt.Errorf("error validating fine-tuned adapter config: %w", err)
-		}
-		return NewFineTunedAdapter(config)
-	})
+var Module = fx.Provide(provideFineTunedAdapter)
+
+func provideFineTunedAdapter(v *viper.Viper, params fineTunedAdapterParams) (*FineTunedAdapter, error) {
+	config, err := newConfig(v, params)
+	if err != nil {
+		return nil, fmt.Errorf("error creating fine-tuned adapter config: %+v", err)
+	}
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("error validating fine-tuned adapter config: %w", err)
+	}
+	return NewFineTunedAdapter(config)
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"sync"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,6 +25,9 @@ type Mutator struct {
 	Client    client.Client
 	Clientset kubernetes.Interface
 	Decoder   admission.Decoder
+	// reported holds the ConfigMap blocks already logged as absent or
+	// incomplete, so each is reported once per process, not once per pod.
+	reported sync.Map
 }
 
 func (mutator *Mutator) Handle(ctx context.Context, req admission.Request) admission.Response {
@@ -82,6 +86,10 @@ func (mutator *Mutator) mutate(pod *v1.Pod, configMap *v1.ConfigMap) error {
 	if err != nil {
 		return err
 	}
+	if !metricsAggregator.portsConfigured() {
+		mutator.reportOnce(MetricsAggregatorConfigMapKeyName,
+			"metrics aggregation and scraping inject nothing until containerPort, path, aggregatePort and podPrometheusPort are set")
+	}
 
 	fineTunedAdapterInjector, err := newFineTunedAdapterInjector(configMap, mutator.Client)
 	if err != nil {
@@ -93,15 +101,33 @@ func (mutator *Mutator) mutate(pod *v1.Pod, configMap *v1.ConfigMap) error {
 		return err
 	}
 
+	rdma, err := newRDMAConfig(configMap)
+	if err != nil {
+		return err
+	}
+	if !rdma.hasProfiles() {
+		mutator.reportOnce(RDMAConfigKeyName,
+			"pods that ask for RDMA injection get nothing until rdma.profiles names a profile; a chart install ships none, the cluster's values file carries its fabric table")
+	}
+
+	runtimeProfiles, err := newRuntimeProfilesConfig(configMap)
+	if err != nil {
+		return err
+	}
+	if runtimeProfiles == nil {
+		mutator.reportOnce(RuntimeProfilesConfigKeyName,
+			"probe profiles inject nothing, and observability profiles serve only pods that name a port, until it is set")
+	}
+
 	mutators := []func(pod *v1.Pod) error{
 		modelInitInjector.InjectModelInit,
 		metricsAggregator.InjectMetricsAggregator,
 		fineTunedAdapterInjector.InjectFineTunedAdapter,
 		servingSidecarInjector.InjectServingSidecar,
-		injectRDMA,
+		func(pod *v1.Pod) error { return injectRDMA(pod, rdma) },
 		injectShm,
-		injectProbes,
-		injectObservability,
+		func(pod *v1.Pod) error { return injectProbes(pod, runtimeProfiles) },
+		func(pod *v1.Pod) error { return injectObservability(pod, runtimeProfiles) },
 	}
 
 	for _, mutator := range mutators {
@@ -123,6 +149,17 @@ func (mutator *Mutator) mutate(pod *v1.Pod, configMap *v1.ConfigMap) error {
 	})
 
 	return nil
+}
+
+// reportOnce logs, once per process, that a block of the ConfigMap is
+// absent or incomplete and what the webhook leaves out because of it. It
+// reports whether this call wrote the line.
+func (mutator *Mutator) reportOnce(block, effect string) bool {
+	if _, seen := mutator.reported.LoadOrStore(block, struct{}{}); seen {
+		return false
+	}
+	log.Info("inferenceservice-config block absent or incomplete", "block", block, "effect", effect)
+	return true
 }
 
 func getPodName(pod *v1.Pod) string {

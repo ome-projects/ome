@@ -12,6 +12,9 @@ import "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 // resolver produced at run open, so a group's body reads the same in every
 // phase of a run's life. PairingProtocol is always read live — it is
 // per-service wire-contract state and an operator input, not plan content.
+// The coordination gates read EffectiveCoordination instead, which keeps
+// the recorded members and takes a group's ratio rule, a rolling group's
+// budgets and the group's presence from the spec as it is now.
 func Effective(isvc *v1beta1.InferenceService, policies Policies) *v1beta1.RolloutSpec {
 	if isvc == nil {
 		return nil
@@ -20,6 +23,74 @@ func Effective(isvc *v1beta1.InferenceService, policies Policies) *v1beta1.Rollo
 		return isvc.Status.Rollout.ActiveRun.Plan.AsRolloutSpec(isvc.Spec.Rollout)
 	}
 	return resolveLive(isvc.Spec.Rollout, policies)
+}
+
+// EffectiveCoordination returns the rollout view the coordination gates and
+// the group phase machine consume. With no run open it is the live view.
+// While a run is open it is the recorded plan: every recorded group keeps
+// the members it recorded, and every recorded group that is not a canary
+// takes two facts from the spec group that still lists any of its members,
+// as that group reads now: the ratio rule (maintainRatio, with its
+// tolerance) and, when both are rollingUpdate, the budgets (maxSurge and
+// maxUnavailable). A recorded group that shares no member with any spec
+// group any more is handed over with no members, so it takes no part in
+// coordination and the groups after it keep their names; its members roll
+// on their own budgets, and the pairing gates alone keep reading it from
+// the recorded plan. A changed member list is drift that applies at the
+// next run: the recorded group continues with the members it names. The
+// group order, each group's progression kind and every canary group stay
+// as recorded until the run closes or the operator asks for the plan to be
+// read again.
+func EffectiveCoordination(isvc *v1beta1.InferenceService, policies Policies) *v1beta1.RolloutSpec {
+	if isvc == nil {
+		return nil
+	}
+	if isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
+		return resolveLive(isvc.Spec.Rollout, policies)
+	}
+	recorded := isvc.Status.Rollout.ActiveRun.Plan.AsRolloutSpec(isvc.Spec.Rollout)
+	for i := range recorded.Groups {
+		g := &recorded.Groups[i]
+		if g.DeclaredProgression() == v1beta1.RolloutProgressionCanary {
+			continue
+		}
+		live := declaredGroupSharing(isvc.Spec.Rollout, g.Components)
+		if live == nil {
+			g.Components = nil
+			continue
+		}
+		g.MaintainRatio = live.MaintainRatio.DeepCopy()
+		if g.RollingUpdate != nil && live.RollingUpdate != nil {
+			g.RollingUpdate = live.RollingUpdate.DeepCopy()
+		}
+	}
+	return recorded
+}
+
+// declaredGroupSharing is the first spec group that lists any of the given
+// Components, or nil when the spec declares none.
+func declaredGroupSharing(spec *v1beta1.RolloutSpec, components []v1beta1.ComponentType) *v1beta1.RolloutGroup {
+	if spec == nil {
+		return nil
+	}
+	for i := range spec.Groups {
+		if sharesAMember(spec.Groups[i].Components, components) {
+			return &spec.Groups[i]
+		}
+	}
+	return nil
+}
+
+// sharesAMember reports whether two member lists name a Component in common.
+func sharesAMember(a, b []v1beta1.ComponentType) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if x == y {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CanaryGroups returns every effective rollout group carrying an EXECUTABLE

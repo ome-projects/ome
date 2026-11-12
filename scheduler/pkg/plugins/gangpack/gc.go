@@ -66,7 +66,7 @@ func (g *GangPack) gcAssignments() {
 		if !stale {
 			continue
 		}
-		domain, token, _, found, ownerMatch := g.assignments.GetOwnedBy(group, owner)
+		domain, token, found, ownerMatch := g.assignments.GetOwnedBy(group, owner)
 		if !found || !ownerMatch {
 			continue
 		}

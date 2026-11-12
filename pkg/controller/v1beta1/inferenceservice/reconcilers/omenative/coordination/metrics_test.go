@@ -172,7 +172,7 @@ func TestGaugeDecrementOnLowerSet(t *testing.T) {
 }
 
 func TestPhaseLabelMatchesEnumString(t *testing.T) {
-	// Pin: dashboards keyed on the phase string break if the enum is
+	// Kept on purpose: dashboards keyed on the phase string break if the enum is
 	// renamed. Force a deliberate decision by failing here when an
 	// existing enum value stops being writable as-is.
 	for _, p := range []v1beta1.CoordinationPhase{

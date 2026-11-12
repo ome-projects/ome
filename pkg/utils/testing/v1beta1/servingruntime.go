@@ -39,10 +39,6 @@ func MakeServingRuntime(name, namespace string) *ServingRuntimeWrapper {
 
 func (w *ServingRuntimeWrapper) Obj() *v1beta1.ServingRuntime { return &w.ServingRuntime }
 
-func (w *ServingRuntimeWrapper) Clone() *ServingRuntimeWrapper {
-	return &ServingRuntimeWrapper{ServingRuntime: *w.ServingRuntime.DeepCopy()}
-}
-
 // SupportsModelFormat appends an entry to spec.SupportedModelFormats.
 // autoSelect controls whether the runtime is eligible for the
 // runtime-selector's automatic-pick path (false = selector skips this
@@ -57,39 +53,6 @@ func (w *ServingRuntimeWrapper) SupportsModelFormat(formatName string, autoSelec
 		AutoSelect:     &auto,
 		Priority:       &prio,
 	})
-	return w
-}
-
-// SupportsArchitecture appends a SupportedModelFormat keyed on the
-// model's architecture (e.g. "LlamaForCausalLM"). The runtime
-// selector matches on this when an InferenceService's referenced
-// BaseModel has spec.modelArchitecture set.
-func (w *ServingRuntimeWrapper) SupportsArchitecture(arch string, autoSelect bool, priority int32) *ServingRuntimeWrapper {
-	auto := autoSelect
-	prio := priority
-	a := arch
-	w.Spec.SupportedModelFormats = append(w.Spec.SupportedModelFormats, v1beta1.SupportedModelFormat{
-		Name:              arch,
-		ModelFormat:       &v1beta1.ModelFormat{Name: arch},
-		ModelFramework:    defaultModelFramework(),
-		ModelArchitecture: &a,
-		AutoSelect:        &auto,
-		Priority:          &prio,
-	})
-	return w
-}
-
-// Disabled toggles spec.Disabled (filters the runtime from auto-
-// select even if SupportsModelFormat declared autoSelect=true).
-func (w *ServingRuntimeWrapper) Disabled(d bool) *ServingRuntimeWrapper {
-	val := d
-	w.Spec.Disabled = &val
-	return w
-}
-
-// Container appends to spec.Containers (the inline ServingRuntimePodSpec).
-func (w *ServingRuntimeWrapper) Container(c corev1.Container) *ServingRuntimeWrapper {
-	w.Spec.Containers = append(w.Spec.Containers, c)
 	return w
 }
 

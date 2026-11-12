@@ -11,11 +11,13 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/prometheus/common/model"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"golang.org/x/sync/singleflight"
 
@@ -52,12 +54,6 @@ const (
 
 var DefaultConsistentHashHeaders = []string{"x-routing-key"}
 
-type SecretConfig struct {
-	WriteToCommonNamespace bool   `json:"writeToCommonNamespace"`
-	Namespace              string `json:"namespace"`
-	SecretName             string `json:"secretName"`
-}
-
 // +kubebuilder:object:generate=false
 type InferenceServicesConfig struct {
 	// PodMonitor carries cluster-scope defaults applied to every generated
@@ -68,7 +64,7 @@ type InferenceServicesConfig struct {
 	PodDisruptionBudget PodDisruptionBudgetConfig `json:"podDisruptionBudget,omitempty"`
 	// AcceleratorResources are the extended resource names OME recognizes as
 	// GPU/accelerator capacity when inspecting a container's resources (e.g.
-	// utils.IsGPUEnabled, isvcutils.GetGpuCountFromContainer). Exact names, no
+	// utils.PodRequestsAccelerator, isvcutils.GetGpuCountFromContainer). Exact names, no
 	// patterns — mirrors quota/capacity.Options.AcceleratorResources, e.g.
 	// "nvidia.com/gpu", "amd.com/gpu", "google.com/tpu".
 	//
@@ -110,12 +106,31 @@ type PodDisruptionBudgetConfig struct {
 }
 
 // PodMonitorConfig configures the PodMonitor objects OME generates for each
-// InferenceService Component. Both fields have NO in-code default — they are
-// supplied via the inferenceservice-config ConfigMap (Helm chart / GitOps), so
-// scrape-pipeline-specific values are never hardcoded magic strings.
+// InferenceService Component. No field has an in-code default: every value
+// is supplied via the inferenceservice-config ConfigMap (Helm chart / GitOps),
+// so scrape-pipeline-specific values are never hardcoded magic strings.
 //
 // +kubebuilder:object:generate=false
 type PodMonitorConfig struct {
+	// Path is the HTTP path of the scrape endpoint OME adds to every generated
+	// PodMonitor, for example "/metrics". OME's own endpoint needs Path,
+	// Interval and a port name; when one of them is missing OME adds no
+	// endpoint of its own, writes only the endpoints a Component's
+	// extra-endpoints annotation declares, and says so once in the manager log.
+	Path string `json:"path,omitempty"`
+	// Interval is the scrape interval of every endpoint OME writes, its own and
+	// the annotation-declared ones, in the Prometheus duration form, for
+	// example "10s".
+	Interval string `json:"interval,omitempty"`
+	// Port is the name of the container port OME scrapes when a Component's
+	// first container declares it, wherever it stands among the ports, for
+	// example "metrics". A container that does not declare it is scraped on
+	// its first port when that port is named.
+	Port string `json:"port,omitempty"`
+	// FallbackPort is the port name OME's endpoint carries when the first
+	// container declares no named port, for example "http"; the collector
+	// scrapes nothing until a pod declares a port of that name.
+	FallbackPort string `json:"fallbackPort,omitempty"`
 	// Labels are merged into each generated PodMonitor's metadata.labels (NOT
 	// its spec.selector, which continues to select pods by the component's own
 	// labels). Use this to opt the PodMonitor into an external scrape pipeline
@@ -171,8 +186,17 @@ type IngressConfig struct {
 	// constraint). Must match the RFC-1123 label form so it is safe as a
 	// selector / metrics / path token; invalid values are rejected at config-load.
 	// Empty ⇒ the primary endpoint carries no class.
-	OmeIngressGatewayClass   string    `json:"omeIngressGatewayClass,omitempty"`
-	IngressDomain            string    `json:"ingressDomain,omitempty"`
+	OmeIngressGatewayClass string `json:"omeIngressGatewayClass,omitempty"`
+	IngressDomain          string `json:"ingressDomain,omitempty"`
+	// ClusterDomain is the cluster's DNS domain ("cluster.local" on most
+	// clusters): the suffix of every in-cluster Service hostname the
+	// controller renders, "<service>.<namespace>.svc.<ClusterDomain>" (the
+	// prefill/decode peer addresses, status.address, the Istio route host).
+	// There is intentionally NO in-code default — the value is supplied via
+	// the inferenceservice-config ConfigMap (set by the Helm chart / GitOps).
+	// Empty renders the namespaced short name "<service>.<namespace>" and is
+	// logged once.
+	ClusterDomain            string    `json:"clusterDomain,omitempty"`
 	IngressClassName         *string   `json:"ingressClassName,omitempty"`
 	AdditionalIngressDomains *[]string `json:"additionalIngressDomains,omitempty"`
 	DomainTemplate           string    `json:"domainTemplate,omitempty"`
@@ -220,6 +244,74 @@ type IngressConfig struct {
 	// A per-ISVC "ome.io/ingress-gateway" (or "ome.io/ingress-additional-gateways")
 	// annotation still takes precedence over this namespace default.
 	NamespaceIngressGateways map[string]NamespaceIngressGateway `json:"namespaceIngressGateways,omitempty"`
+	// RouteProviderCapabilities declares, per route provider, the per-revision
+	// traffic intent that provider can express, keyed by the provider name this
+	// config resolves to once an InferenceService's own ingress annotations are
+	// applied (RouteProvider): "GatewayAPI", "KubernetesIngress" or "None".
+	// Values are pkg/constants RouteCapability* tokens; an unknown provider or
+	// token is rejected at config-load. There is intentionally NO in-code
+	// default. A provider absent from the map has unknown capabilities: intent
+	// that needs one is admitted and reported as unverified. A provider present
+	// with an empty list can express none: admission rejects intent it cannot
+	// honor, and a stored InferenceService carrying such intent holds its
+	// rollout instead of running it with the intent dropped.
+	RouteProviderCapabilities map[string][]string `json:"routeProviderCapabilities,omitempty"`
+}
+
+// RouteProvider names what renders an InferenceService's external route; it
+// is the key of IngressConfig.RouteProviderCapabilities.
+type RouteProvider string
+
+const (
+	// RouteProviderGatewayAPI renders Gateway API HTTPRoutes (enableGatewayAPI).
+	RouteProviderGatewayAPI RouteProvider = "GatewayAPI"
+	// RouteProviderKubernetesIngress renders a Kubernetes Ingress (ingress
+	// creation enabled without Gateway API).
+	RouteProviderKubernetesIngress RouteProvider = "KubernetesIngress"
+	// RouteProviderNone renders no route: ingress creation is disabled and
+	// requests reach the external Service directly or through whatever the
+	// operator puts in front of it.
+	RouteProviderNone RouteProvider = "None"
+)
+
+// RouteProviders lists every provider name a capability declaration may key on.
+func RouteProviders() []RouteProvider {
+	return []RouteProvider{RouteProviderGatewayAPI, RouteProviderKubernetesIngress, RouteProviderNone}
+}
+
+// RouteProvider resolves the provider this config renders routes with. Call
+// it on the effective config (the cluster config with the InferenceService's
+// ingress annotations applied) so a per-InferenceService override that
+// disables ingress creation resolves to RouteProviderNone. Nil-safe.
+func (c *IngressConfig) RouteProvider() RouteProvider {
+	switch {
+	case c == nil:
+		return ""
+	case c.DisableIngressCreation:
+		return RouteProviderNone
+	case c.EnableGatewayAPI:
+		return RouteProviderGatewayAPI
+	default:
+		return RouteProviderKubernetesIngress
+	}
+}
+
+// RouteCapabilities returns the declared capability set of the provider this
+// config resolves to. Known is false when the provider is absent from
+// RouteProviderCapabilities. Nil-safe.
+func (c *IngressConfig) RouteCapabilities() omevalidation.RouteProviderCapabilities {
+	provider := c.RouteProvider()
+	out := omevalidation.RouteProviderCapabilities{Provider: string(provider)}
+	if c == nil || provider == "" {
+		return out
+	}
+	caps, known := c.RouteProviderCapabilities[string(provider)]
+	if !known {
+		return out
+	}
+	out.Known = true
+	out.Capabilities = append([]string(nil), caps...)
+	return out
 }
 
 // IngressGatewaySpec identifies one gateway an HTTPRoute attaches to, plus the
@@ -565,9 +657,15 @@ type LifecycleConfig struct {
 	// environment-caused. A duration string ("10m"), measured from the
 	// condition's last transition, or from the attempt's placement wait when
 	// that began earlier (a pod name the attempt needs was held by a node
-	// that stopped reporting). There is intentionally NO in-code default:
-	// absence means the escalation does not exist and an unplaceable pod
-	// only parks the InstanceReadyTimeout clock.
+	// that stopped reporting). A pod with the Kueue queue-name label may
+	// have waited behind its queue's gate if its condition still shows its
+	// creation time. For such a pod, the grace runs from when OME first sees
+	// the refusal. A gang's PodGroup carries the same value as its
+	// scheduleTimeoutSeconds, so the scheduler stops waiting for the gang
+	// when OME does. There is intentionally NO in-code default: absence
+	// means the escalation does not exist, an unplaceable pod only parks the
+	// InstanceReadyTimeout clock, and the PodGroup's timeout is left to the
+	// scheduler's own default.
 	UnschedulableGracePeriod string `json:"unschedulableGracePeriod,omitempty"`
 	// GangDomainFullGracePeriod is the shorter grace for an unschedulable
 	// gang member when the scheduler reports that the gang is held to the
@@ -581,6 +679,12 @@ type LifecycleConfig struct {
 	// is still terminating. There is intentionally NO in-code default:
 	// absence leaves such a hold on UnschedulableGracePeriod.
 	GangDomainFullGracePeriod string `json:"gangDomainFullGracePeriod,omitempty"`
+	// SchedulingRetry bounds the writes that ask the scheduler again for a
+	// pod of a multi-pod Instance left Pending with no node while its
+	// attempt is open. There are intentionally NO in-code values: absence
+	// means no such write ever happens, and the pod waits on the
+	// scheduler's own queue and the attempt's deadline.
+	SchedulingRetry *SchedulingRetryConfig `json:"schedulingRetry,omitempty"`
 	// AbandonedReplacementGracePeriod is the termination grace a rollout
 	// gives a replacement pod it abandons before the pod ever entered the
 	// serving rotation (a surge replacement superseded by a newer revision,
@@ -591,11 +695,11 @@ type LifecycleConfig struct {
 	// in-code default: absence leaves every abandoned replacement its own
 	// grace.
 	AbandonedReplacementGracePeriod string `json:"abandonedReplacementGracePeriod,omitempty"`
-	// GangScheduleTimeout bounds the per-PodGroup schedule timeout a
-	// multi-pod Instance derives from its Component's
-	// InstanceReadyTimeout. Absence means the escalation does not exist —
-	// there are intentionally NO in-code bounds: the derived timeout
-	// reaches the scheduler unclamped.
+	// GangScheduleTimeout is the range of PodGroup schedule timeouts the
+	// gang scheduler accepts; the placement grace a gang's PodGroup
+	// carries as its timeout is kept inside it. Absence means no range —
+	// there are intentionally NO in-code bounds: the grace reaches the
+	// scheduler as it is.
 	GangScheduleTimeout *GangScheduleTimeoutConfig `json:"gangScheduleTimeout,omitempty"`
 	// Audit bounds migration admission against the owner's migration
 	// records, and how far back terminal records are kept in status.
@@ -750,8 +854,9 @@ type AutoMigrateConfig struct {
 }
 
 // ForceDeleteConfig configures the stuck-Terminating force-delete
-// escalation. Both fields are duration strings ("2m", "5m") and are
+// escalation. The two durations are duration strings ("2m", "5m") and are
 // REQUIRED when the block is present — there are no in-code defaults.
+// SkipGracePeriodOnUnreachableNode is optional, and absent means false.
 //
 // +kubebuilder:object:generate=false
 type ForceDeleteConfig struct {
@@ -764,28 +869,36 @@ type ForceDeleteConfig struct {
 	// LastTransitionTime, or the Node object gone) before the
 	// escalation may act.
 	NodeUnreachableThreshold string `json:"nodeUnreachableThreshold"`
+	// SkipGracePeriodOnUnreachableNode, when true, force-deletes a pod
+	// still inside its grace period once its node's kubelet has stopped
+	// reporting (NodeReady Unknown or the unreachable taint) for
+	// NodeUnreachableThreshold. A node cut off from the network, or one
+	// whose kubelet stopped, may still run the old pod beside its
+	// replacement until the kubelet reaches the API server again. A
+	// kubelet that kept running then stops the pod within its own grace
+	// period. A restarted kubelet stops it with a one-second grace period.
+	// False keeps every pod waiting for OverdueSlack past its own
+	// deletionTimestamp.
+	SkipGracePeriodOnUnreachableNode bool `json:"skipGracePeriodOnUnreachableNode,omitempty"`
 }
 
-// GangScheduleTimeoutConfig bounds the PodGroup ScheduleTimeoutSeconds
-// derived from a Component's InstanceReadyTimeout. Both fields are
-// duration strings ("60s", "10m") and are REQUIRED when the block is
-// present — there are no in-code bounds.
+// GangScheduleTimeoutConfig is the range of PodGroup ScheduleTimeoutSeconds
+// the gang scheduler accepts, which bounds the placement grace a gang's
+// PodGroup carries as its timeout. Both fields are duration strings ("1s",
+// "15m") and are REQUIRED when the block is present — there are no in-code
+// bounds.
 //
 // +kubebuilder:object:generate=false
 type GangScheduleTimeoutConfig struct {
-	// Min is the floor the derived timeout is raised to. It is also what
-	// an Instance whose Component sets no usable InstanceReadyTimeout
-	// gets.
+	// Min is the floor a positive grace is raised to.
 	Min string `json:"min"`
-	// Max is the ceiling the derived timeout is lowered to, so gang
-	// admission releases an infeasible attempt on a cluster-wide
-	// schedule.
+	// Max is the ceiling the grace is lowered to.
 	Max string `json:"max"`
 }
 
 // ToClamp validates the config and converts it to the workload-side
 // GangScheduleTimeoutClamp. A nil receiver (absent block) yields
-// (nil, nil) — unconfigured, the derived timeout is passed through. Any
+// (nil, nil) — unconfigured, the grace is passed through as it is. Any
 // violation — either field missing, unparsable, non-positive, or min
 // above max — is an error; callers treat an invalid clamp as
 // unconfigured, never patch it up with fallback bounds.
@@ -811,6 +924,44 @@ func (c *GangScheduleTimeoutConfig) ToClamp() (*workloadtypes.GangScheduleTimeou
 		return nil, fmt.Errorf("invalid lifecycle.gangScheduleTimeout: max %s must be >= min %s", maxTimeout, minTimeout)
 	}
 	return &workloadtypes.GangScheduleTimeoutClamp{Min: minTimeout, Max: maxTimeout}, nil
+}
+
+// SchedulingRetryConfig bounds how the controller asks the scheduler
+// again for a pod of a multi-pod Instance that stays Pending with no node
+// while its attempt is open. Both fields are REQUIRED when the block is
+// present — there are no in-code values.
+//
+// +kubebuilder:object:generate=false
+type SchedulingRetryConfig struct {
+	// After is how long the pod may wait for a node, measured from its
+	// creation or from the scheduler's last PodScheduled ruling, before
+	// the first write. A duration string ("5m"); the k-th write waits k
+	// times as long.
+	After string `json:"after"`
+	// MaxAttempts caps the writes per pod.
+	MaxAttempts int32 `json:"maxAttempts"`
+}
+
+// ToPolicy validates the block and converts it to the workload-side
+// SchedulingRetryPolicy. A nil receiver (absent block) yields (nil, nil):
+// unconfigured, no pod is ever written. A missing, unparsable or
+// non-positive field is an error; callers treat an invalid block as
+// unconfigured and never fill it in with fallback values.
+func (c *SchedulingRetryConfig) ToPolicy() (*workloadtypes.SchedulingRetryPolicy, error) {
+	if c == nil {
+		return nil, nil
+	}
+	after, err := time.ParseDuration(c.After)
+	if err != nil {
+		return nil, fmt.Errorf("invalid lifecycle.schedulingRetry: after %q: %w", c.After, err)
+	}
+	if after <= 0 {
+		return nil, fmt.Errorf("invalid lifecycle.schedulingRetry: after must be > 0, got %s", after)
+	}
+	if c.MaxAttempts <= 0 {
+		return nil, fmt.Errorf("invalid lifecycle.schedulingRetry: maxAttempts must be > 0, got %d", c.MaxAttempts)
+	}
+	return &workloadtypes.SchedulingRetryPolicy{After: after, MaxAttempts: c.MaxAttempts}, nil
 }
 
 // AuditConfig bounds migration EXECUTION on one owner. All three fields
@@ -967,8 +1118,9 @@ func (c *ForceDeleteConfig) ToPolicy() (*workloadtypes.ForceDeletePolicy, error)
 		return nil, fmt.Errorf("invalid lifecycle.forceDelete: nodeUnreachableThreshold must be > 0, got %s", threshold)
 	}
 	return &workloadtypes.ForceDeletePolicy{
-		OverdueSlack:             overdue,
-		NodeUnreachableThreshold: threshold,
+		OverdueSlack:                     overdue,
+		NodeUnreachableThreshold:         threshold,
+		SkipGracePeriodOnUnreachableNode: c.SkipGracePeriodOnUnreachableNode,
 	}, nil
 }
 
@@ -1424,25 +1576,29 @@ func (c *ConfigCache) get(clientset kubernetes.Interface) (*v1.ConfigMap, error)
 	return v.(*v1.ConfigMap), nil
 }
 
-// NewInferenceServicesConfig verifies that the inferenceservice ConfigMap
-// exists (callers fail fast otherwise) and returns an empty config struct.
-// ModelCache is loaded separately via NewModelCacheConfig.
-func NewInferenceServicesConfig(clientset kubernetes.Interface) (*InferenceServicesConfig, error) {
-	cm, err := getInferenceServiceConfigMap(clientset)
-	if err != nil {
-		return nil, err
-	}
-	return inferenceServicesConfigFromConfigMap(cm)
-}
-
-// NewInferenceServicesConfigCached is the ConfigCache-backed variant of
-// NewInferenceServicesConfig used on the reconcile hot path.
+// NewInferenceServicesConfigCached loads the InferenceService configuration
+// through the ConfigCache, the path every reconciler reads it by.
 func NewInferenceServicesConfigCached(cache *ConfigCache, clientset kubernetes.Interface) (*InferenceServicesConfig, error) {
 	cm, err := cache.get(clientset)
 	if err != nil {
 		return nil, err
 	}
 	return inferenceServicesConfigFromConfigMap(cm)
+}
+
+// validatePodMonitorConfig refuses a scrape path that is not an HTTP path or
+// an interval that is not a Prometheus duration at load, so the PodMonitor
+// writes of every Component do not fail on them later.
+func validatePodMonitorConfig(cfg PodMonitorConfig) error {
+	if cfg.Path != "" && !strings.HasPrefix(cfg.Path, "/") {
+		return fmt.Errorf("path %q must start with /", cfg.Path)
+	}
+	if cfg.Interval != "" {
+		if _, err := model.ParseDuration(cfg.Interval); err != nil {
+			return fmt.Errorf("interval %q: %w", cfg.Interval, err)
+		}
+	}
+	return nil
 }
 
 // inferenceServicesConfigFromConfigMap builds the InferenceServicesConfig from
@@ -1455,6 +1611,9 @@ func inferenceServicesConfigFromConfigMap(cm *v1.ConfigMap) (*InferenceServicesC
 	if data, ok := cm.Data[PodMonitorConfigName]; ok && strings.TrimSpace(data) != "" {
 		if err := json.Unmarshal([]byte(data), &cfg.PodMonitor); err != nil {
 			return nil, fmt.Errorf("unable to parse %q config json: %w", PodMonitorConfigName, err)
+		}
+		if err := validatePodMonitorConfig(cfg.PodMonitor); err != nil {
+			return nil, fmt.Errorf("invalid %q config: %w", PodMonitorConfigName, err)
 		}
 	}
 	if data, ok := cm.Data[AcceleratorResourcesConfigName]; ok && strings.TrimSpace(data) != "" {
@@ -1661,6 +1820,9 @@ func parseIngressConfig(configMap *v1.ConfigMap) (*IngressConfig, error) {
 		if err := validateIngressGatewayClasses(ingressConfig); err != nil {
 			return nil, err
 		}
+		if err := validateRouteProviderCapabilities(ingressConfig); err != nil {
+			return nil, err
+		}
 	}
 
 	if ingressConfig.DomainTemplate == "" {
@@ -1679,7 +1841,43 @@ func parseIngressConfig(configMap *v1.ConfigMap) (*IngressConfig, error) {
 		ingressConfig.ConsistentHashHeaders = DefaultConsistentHashHeaders
 	}
 
+	noteClusterDomain(ingressConfig.ClusterDomain)
 	return ingressConfig, nil
+}
+
+// ClusterDomainCached returns ingress.clusterDomain from the
+// inferenceservice-config ConfigMap through the shared short-TTL cache,
+// without the rest of the ingress block's validation, for controllers that
+// render in-cluster hostnames and nothing else of the block. Empty when the
+// ConfigMap or the block names no domain.
+func ClusterDomainCached(cache *ConfigCache, clientset kubernetes.Interface) (string, error) {
+	configMap, err := cache.get(clientset)
+	if err != nil {
+		return "", err
+	}
+	ingressConfig := &IngressConfig{}
+	if ingress, ok := configMap.Data[IngressConfigKeyName]; ok {
+		if err := json.Unmarshal([]byte(ingress), ingressConfig); err != nil {
+			return "", fmt.Errorf("unable to parse ingress config json: %w", err)
+		}
+	}
+	noteClusterDomain(ingressConfig.ClusterDomain)
+	return ingressConfig.ClusterDomain, nil
+}
+
+var clusterDomainUnsetOnce sync.Once
+
+// noteClusterDomain logs once per process that the ingress block names no
+// cluster domain, so every in-cluster hostname renders as the namespaced
+// short name. A set domain is never logged.
+func noteClusterDomain(domain string) {
+	if domain != "" {
+		return
+	}
+	clusterDomainUnsetOnce.Do(func() {
+		logf.Log.WithName("controllerconfig").Info(
+			"ingress.clusterDomain is not set in inferenceservice-config; in-cluster hostnames render as <service>.<namespace> without a domain suffix")
+	})
 }
 
 // validateIngressGatewayClasses rejects any endpoint class that is not a valid
@@ -1719,6 +1917,34 @@ func validateIngressClass(field, class string) error {
 	if errs := validation.IsDNS1123Label(class); len(errs) > 0 {
 		return fmt.Errorf("invalid ingress config - %s %q must be an RFC-1123 label: %s",
 			field, class, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// validateRouteProviderCapabilities rejects a capability declaration keyed
+// on a provider OME never resolves to, or naming a capability token OME does
+// not know. Either would be a typo that silently declared a provider
+// incapable (or capable) of something else than intended.
+func validateRouteProviderCapabilities(cfg *IngressConfig) error {
+	providers := map[string]struct{}{}
+	for _, p := range RouteProviders() {
+		providers[string(p)] = struct{}{}
+	}
+	tokens := map[string]struct{}{}
+	for _, t := range constants.KnownRouteCapabilities() {
+		tokens[t] = struct{}{}
+	}
+	for provider, caps := range cfg.RouteProviderCapabilities {
+		if _, ok := providers[provider]; !ok {
+			return fmt.Errorf("invalid ingress config - routeProviderCapabilities[%q]: unknown route provider (one of %v)",
+				provider, RouteProviders())
+		}
+		for _, c := range caps {
+			if _, ok := tokens[c]; !ok {
+				return fmt.Errorf("invalid ingress config - routeProviderCapabilities[%q]: unknown capability %q (one of %v)",
+					provider, c, constants.KnownRouteCapabilities())
+			}
+		}
 	}
 	return nil
 }

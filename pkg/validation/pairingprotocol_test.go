@@ -36,6 +36,8 @@ func pairedGroup(progression string) v1beta1.RolloutGroup {
 		g.Canary = &v1beta1.GroupCanary{}
 	case "rollingUpdate":
 		g.RollingUpdate = &v1beta1.GroupRollingUpdate{}
+	case "policyRef-rollingUpdate":
+		g.PolicyRef = &v1beta1.RolloutPolicyRef{Name: "paced", Progression: v1beta1.RolloutProgressionRollingUpdate}
 	}
 	return g
 }
@@ -78,10 +80,14 @@ func TestValidatePairingProtocolUpdate(t *testing.T) {
 			new:  pairingSpec(ptr.To("nixl-v2"), pairedGroup("canary")),
 		},
 		{
-			name:    "change under a shared rollingUpdate group denied",
-			old:     pairingSpec(ptr.To("nixl-v1"), pairedGroup("rollingUpdate")),
-			new:     pairingSpec(ptr.To("nixl-v2"), pairedGroup("rollingUpdate")),
-			wantErr: true,
+			name: "change under a shared rollingUpdate group admitted",
+			old:  pairingSpec(ptr.To("nixl-v1"), pairedGroup("rollingUpdate")),
+			new:  pairingSpec(ptr.To("nixl-v2"), pairedGroup("rollingUpdate")),
+		},
+		{
+			name: "change under a shared rollingUpdate group declared by policyRef admitted",
+			old:  pairingSpec(ptr.To("nixl-v1"), pairedGroup("policyRef-rollingUpdate")),
+			new:  pairingSpec(ptr.To("nixl-v2"), pairedGroup("policyRef-rollingUpdate")),
 		},
 		{
 			name: "change with engine and decoder in separate groups denied",
@@ -92,6 +98,28 @@ func TestValidatePairingProtocolUpdate(t *testing.T) {
 			new: pairingSpec(ptr.To("nixl-v2"),
 				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}},
 				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}},
+			),
+			wantErr: true,
+		},
+		{
+			name: "change with engine and decoder in separate rollingUpdate groups denied",
+			old: pairingSpec(ptr.To("nixl-v1"),
+				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
+				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
+			),
+			new: pairingSpec(ptr.To("nixl-v2"),
+				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
+				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
+			),
+			wantErr: true,
+		},
+		{
+			name: "change with a rollingUpdate group over the engine alone denied",
+			old: pairingSpec(ptr.To("nixl-v1"),
+				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
+			),
+			new: pairingSpec(ptr.To("nixl-v2"),
+				v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, RollingUpdate: &v1beta1.GroupRollingUpdate{}},
 			),
 			wantErr: true,
 		},

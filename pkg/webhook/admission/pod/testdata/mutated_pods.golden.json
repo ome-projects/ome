@@ -1,0 +1,769 @@
+[
+  {
+    "name": "rdma default profile",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "rdma.ome.io/auto-inject": "true"
+        }
+      },
+      "spec": {
+        "volumes": [
+          {
+            "name": "dshm",
+            "emptyDir": {
+              "medium": "Memory"
+            }
+          },
+          {
+            "name": "devinf",
+            "hostPath": {
+              "path": "/dev/infiniband"
+            }
+          }
+        ],
+        "containers": [
+          {
+            "name": "ome-container",
+            "env": [
+              {
+                "name": "NCCL_DEBUG",
+                "value": "INFO"
+              },
+              {
+                "name": "NCCL_IB_HCA",
+                "value": "=mlx5_0,mlx5_1"
+              },
+              {
+                "name": "NCCL_IB_TC",
+                "value": "41"
+              },
+              {
+                "name": "NCCL_SOCKET_IFNAME",
+                "value": "eth0"
+              }
+            ],
+            "resources": {},
+            "volumeMounts": [
+              {
+                "name": "dshm",
+                "mountPath": "/dev/shm"
+              },
+              {
+                "name": "devinf",
+                "mountPath": "/dev/infiniband"
+              }
+            ],
+            "securityContext": {
+              "capabilities": {
+                "add": [
+                  "IPC_LOCK"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "rdma default profile merges with the container's own values",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "rdma.ome.io/auto-inject": "true"
+        }
+      },
+      "spec": {
+        "volumes": [
+          {
+            "name": "dshm",
+            "emptyDir": {
+              "medium": "Memory"
+            }
+          },
+          {
+            "name": "devinf",
+            "hostPath": {
+              "path": "/dev/infiniband"
+            }
+          }
+        ],
+        "containers": [
+          {
+            "name": "ome-container",
+            "env": [
+              {
+                "name": "NCCL_DEBUG",
+                "value": "WARN"
+              },
+              {
+                "name": "NCCL_IB_HCA",
+                "value": "=mlx5_0,mlx5_1"
+              },
+              {
+                "name": "NCCL_IB_TC",
+                "value": "41"
+              },
+              {
+                "name": "NCCL_SOCKET_IFNAME",
+                "value": "eth0"
+              }
+            ],
+            "resources": {},
+            "volumeMounts": [
+              {
+                "name": "dshm",
+                "mountPath": "/dev/shm"
+              },
+              {
+                "name": "devinf",
+                "mountPath": "/dev/infiniband"
+              }
+            ],
+            "securityContext": {
+              "capabilities": {
+                "add": [
+                  "SYS_PTRACE",
+                  "IPC_LOCK"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "rdma default profile on a named container",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "rdma.ome.io/auto-inject": "true",
+          "rdma.ome.io/container-name": "engine"
+        }
+      },
+      "spec": {
+        "volumes": [
+          {
+            "name": "dshm",
+            "emptyDir": {
+              "medium": "Memory"
+            }
+          },
+          {
+            "name": "devinf",
+            "hostPath": {
+              "path": "/dev/infiniband"
+            }
+          }
+        ],
+        "containers": [
+          {
+            "name": "engine",
+            "env": [
+              {
+                "name": "NCCL_DEBUG",
+                "value": "INFO"
+              },
+              {
+                "name": "NCCL_IB_HCA",
+                "value": "=mlx5_0,mlx5_1"
+              },
+              {
+                "name": "NCCL_IB_TC",
+                "value": "41"
+              },
+              {
+                "name": "NCCL_SOCKET_IFNAME",
+                "value": "eth0"
+              }
+            ],
+            "resources": {},
+            "volumeMounts": [
+              {
+                "name": "dshm",
+                "mountPath": "/dev/shm"
+              },
+              {
+                "name": "devinf",
+                "mountPath": "/dev/infiniband"
+              }
+            ],
+            "securityContext": {
+              "capabilities": {
+                "add": [
+                  "IPC_LOCK"
+                ]
+              }
+            }
+          },
+          {
+            "name": "sidecar",
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "rdma default profile skips a pod without the container",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "rdma.ome.io/auto-inject": "true"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "other",
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "rdma named env-only profile",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "rdma.ome.io/auto-inject": "true",
+          "rdma.ome.io/profile": "collective-env"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "env": [
+              {
+                "name": "NCCL_IB_ADDR_FAMILY",
+                "value": "AF_INET6"
+              },
+              {
+                "name": "NCCL_SOCKET_IFNAME",
+                "value": "eth0"
+              }
+            ],
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "rdma named networks-only profile merges the existing annotation",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "k8s.v1.cni.cncf.io/networks": "[{\"name\":\"rdma0-macvlan\",\"namespace\":\"multus-system\"},{\"name\":\"other\",\"namespace\":\"net\"},{\"name\":\"rdma1-macvlan\",\"namespace\":\"multus-system\"}]",
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "rdma.ome.io/auto-inject": "true",
+          "rdma.ome.io/profile": "multus-attachments"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "probe profile with the default port",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "runtime.ome.io/probe-profile": "sglang-http"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {},
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "timeoutSeconds": 30,
+              "periodSeconds": 60,
+              "failureThreshold": 5
+            },
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "initialDelaySeconds": 60,
+              "timeoutSeconds": 30,
+              "periodSeconds": 30,
+              "successThreshold": 1,
+              "failureThreshold": 5
+            },
+            "startupProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "initialDelaySeconds": 60,
+              "timeoutSeconds": 30,
+              "periodSeconds": 30,
+              "failureThreshold": 60
+            }
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "probe profile with a named port keeps an existing probe",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "runtime.ome.io/probe-port": "8080",
+          "runtime.ome.io/probe-profile": "vllm-http"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {},
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 8080
+              },
+              "timeoutSeconds": 30,
+              "periodSeconds": 60,
+              "failureThreshold": 5
+            },
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/custom",
+                "port": 1234
+              }
+            },
+            "startupProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 8080
+              },
+              "initialDelaySeconds": 60,
+              "timeoutSeconds": 30,
+              "periodSeconds": 30,
+              "failureThreshold": 60
+            }
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "observability profile with the default port",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "prometheus.io/path": "/metrics",
+          "prometheus.io/port": "30000",
+          "prometheus.io/scrape": "true",
+          "runtime.ome.io/observability-profile": "prometheus"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "observability profile with a named port keeps an existing annotation",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false",
+          "prometheus.io/path": "/own",
+          "prometheus.io/port": "9090",
+          "prometheus.io/scrape": "true",
+          "runtime.ome.io/observability-port": "9090",
+          "runtime.ome.io/observability-profile": "prometheus"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "metrics aggregation and scraping on",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "true",
+          "ome.io/enable-prometheus-scraping": "true",
+          "prometheus.io/path": "/metrics",
+          "prometheus.io/port": "9088"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          },
+          {
+            "name": "queue-proxy",
+            "ports": [
+              {
+                "name": "http-usermetric",
+                "containerPort": 9091,
+                "protocol": "TCP"
+              },
+              {
+                "name": "aggr-metric",
+                "containerPort": 9088,
+                "protocol": "TCP"
+              }
+            ],
+            "env": [
+              {
+                "name": "CONTAINER_PROMETHEUS_METRICS_PORT",
+                "value": "8080"
+              },
+              {
+                "name": "CONTAINER_PROMETHEUS_METRICS_PATH",
+                "value": "/metrics"
+              },
+              {
+                "name": "AGGREGATE_PROMETHEUS_METRICS_PORT",
+                "value": "9088"
+              }
+            ],
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "metrics aggregation on with the container's own port and path",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "true",
+          "ome.io/enable-prometheus-scraping": "true",
+          "prometheus.io/path": "/metrics",
+          "prometheus.io/port": "9088",
+          "prometheus.ome.io/path": "/stats",
+          "prometheus.ome.io/port": "9500"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          },
+          {
+            "name": "queue-proxy",
+            "ports": [
+              {
+                "name": "http-usermetric",
+                "containerPort": 9091,
+                "protocol": "TCP"
+              },
+              {
+                "name": "aggr-metric",
+                "containerPort": 9088,
+                "protocol": "TCP"
+              }
+            ],
+            "env": [
+              {
+                "name": "CONTAINER_PROMETHEUS_METRICS_PORT",
+                "value": "9500"
+              },
+              {
+                "name": "CONTAINER_PROMETHEUS_METRICS_PATH",
+                "value": "/stats"
+              },
+              {
+                "name": "AGGREGATE_PROMETHEUS_METRICS_PORT",
+                "value": "9088"
+              }
+            ],
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "metrics scraping on without aggregation",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "true",
+          "prometheus.io/path": "/metrics",
+          "prometheus.io/port": "9091"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          },
+          {
+            "name": "queue-proxy",
+            "ports": [
+              {
+                "name": "http-usermetric",
+                "containerPort": 9091,
+                "protocol": "TCP"
+              }
+            ],
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "metrics aggregation on without a queue-proxy",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "true",
+          "ome.io/enable-prometheus-scraping": "true",
+          "prometheus.io/path": "/metrics",
+          "prometheus.io/port": "9088"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "metrics switches left to the ConfigMap",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "false",
+          "ome.io/enable-prometheus-scraping": "false"
+        }
+      },
+      "spec": {
+        "containers": [
+          {
+            "name": "ome-container",
+            "resources": {}
+          },
+          {
+            "name": "queue-proxy",
+            "ports": [
+              {
+                "name": "http-usermetric",
+                "containerPort": 9091,
+                "protocol": "TCP"
+              }
+            ],
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  },
+  {
+    "name": "the whole chain on one pod",
+    "pod": {
+      "metadata": {
+        "annotations": {
+          "ome.io/enable-metric-aggregation": "true",
+          "ome.io/enable-prometheus-scraping": "true",
+          "prometheus.io/path": "/metrics",
+          "prometheus.io/port": "9088",
+          "prometheus.io/scrape": "true",
+          "rdma.ome.io/auto-inject": "true",
+          "runtime.ome.io/observability-profile": "prometheus",
+          "runtime.ome.io/probe-profile": "sglang-http",
+          "runtime.ome.io/shm-profile": "default"
+        }
+      },
+      "spec": {
+        "volumes": [
+          {
+            "name": "dshm",
+            "emptyDir": {
+              "medium": "Memory"
+            }
+          },
+          {
+            "name": "devinf",
+            "hostPath": {
+              "path": "/dev/infiniband"
+            }
+          }
+        ],
+        "containers": [
+          {
+            "name": "ome-container",
+            "env": [
+              {
+                "name": "NCCL_DEBUG",
+                "value": "INFO"
+              },
+              {
+                "name": "NCCL_IB_HCA",
+                "value": "=mlx5_0,mlx5_1"
+              },
+              {
+                "name": "NCCL_IB_TC",
+                "value": "41"
+              },
+              {
+                "name": "NCCL_SOCKET_IFNAME",
+                "value": "eth0"
+              }
+            ],
+            "resources": {},
+            "volumeMounts": [
+              {
+                "name": "dshm",
+                "mountPath": "/dev/shm"
+              },
+              {
+                "name": "devinf",
+                "mountPath": "/dev/infiniband"
+              }
+            ],
+            "livenessProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "timeoutSeconds": 30,
+              "periodSeconds": 60,
+              "failureThreshold": 5
+            },
+            "readinessProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "initialDelaySeconds": 60,
+              "timeoutSeconds": 30,
+              "periodSeconds": 30,
+              "successThreshold": 1,
+              "failureThreshold": 5
+            },
+            "startupProbe": {
+              "httpGet": {
+                "path": "/health",
+                "port": 30000
+              },
+              "initialDelaySeconds": 60,
+              "timeoutSeconds": 30,
+              "periodSeconds": 30,
+              "failureThreshold": 60
+            },
+            "securityContext": {
+              "capabilities": {
+                "add": [
+                  "IPC_LOCK"
+                ]
+              }
+            }
+          },
+          {
+            "name": "queue-proxy",
+            "ports": [
+              {
+                "name": "http-usermetric",
+                "containerPort": 9091,
+                "protocol": "TCP"
+              },
+              {
+                "name": "aggr-metric",
+                "containerPort": 9088,
+                "protocol": "TCP"
+              }
+            ],
+            "env": [
+              {
+                "name": "CONTAINER_PROMETHEUS_METRICS_PORT",
+                "value": "8080"
+              },
+              {
+                "name": "CONTAINER_PROMETHEUS_METRICS_PATH",
+                "value": "/metrics"
+              },
+              {
+                "name": "AGGREGATE_PROMETHEUS_METRICS_PORT",
+                "value": "9088"
+              }
+            ],
+            "resources": {}
+          }
+        ]
+      },
+      "status": {}
+    }
+  }
+]

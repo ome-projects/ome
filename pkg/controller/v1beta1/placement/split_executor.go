@@ -540,8 +540,8 @@ func splitSharesChangedInPlace(source *v1beta1.InferenceService, observations ma
 }
 
 // primaryHeadroom reports whether a member's autoscaler may run the primary
-// component above its share: in the ratio form, when the source's maxReplicas
-// for it exceeds its minReplicas; otherwise, under a cap in split.maxPerCluster.
+// component above its share. With weights, that needs the source's maxReplicas
+// above its minReplicas. Without weights, it needs a cap in split.maxPerCluster.
 func primaryHeadroom(source *v1beta1.InferenceService, primary v1beta1.ComponentType) bool {
 	if usesRatioForm(source) {
 		return componentMaxReplicas(source, primary) > componentMinReplicas(source, primary)

@@ -25,7 +25,7 @@ func TestInvalidPlacementCannotAcquireFinalizer(t *testing.T) {
 		{name: "empty affinity", placement: `{"mode":"Single","clusterAffinity":[]}`},
 		{name: "unsupported mode", placement: `{"mode":"Unexpected"}`},
 		{name: "obsolete annotation beside typed intent", placement: `{"mode":"Single"}`, legacyAnnotation: true},
-		{name: "a Split router weight needs a router minimum", placement: `{"mode":"Split","clusterAffinity":[{"weights":{"router":2},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]}`,
+		{name: "a Split router weight needs a router minimum", placement: `{"mode":"Split","clusterAffinity":[{"weights":{"router":{"min":2}},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]}`,
 			router: true, wantMessage: "set a positive router.minReplicas"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

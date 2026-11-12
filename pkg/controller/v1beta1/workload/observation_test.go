@@ -15,6 +15,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus/irstatustest"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
@@ -423,10 +425,13 @@ func TestRemovableObservationFieldsHaveNoUnauditedDirectProductionAccess(t *test
 		approve("pkg/controller/v1beta1/v1beta1convert/convert.go", function, read, "wire conversion", "ReadyPodCount", "ScheduledPodCount")
 		approve("pkg/controller/v1beta1/v1beta1convert/convert.go", function, removableFieldAccessCounts{reads: 2, writes: 1}, "wire conversion", "NodesOccupied")
 	}
-	approve("pkg/controller/v1beta1/inferencereplica/status.go", "aggregateAndWriteStatus", readWrite, "transient publication materialization", allFields...)
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "publishedRowsSettled", removableFieldAccessCounts{reads: 1}, "the status write's decision on the pass's copy reads the three fields as cleared, the way the store holds them", allFields...)
+	approve("pkg/controller/v1beta1/inferencereplica/status_compare.go", "instanceStatusEqual", removableFieldAccessCounts{reads: 2}, "the status write's compare of the pass's copy with the recomputed status reads every row field", allFields...)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", readWrite, "transient same-pass mirror", "ReadyPodCount", "ScheduledPodCount")
-	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", removableFieldAccessCounts{reads: 2, writes: 2}, "transient same-pass mirror", "NodesOccupied")
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "mirrorInstanceCounters", readWrite, "transient same-pass mirror", "NodesOccupied")
+	approve("pkg/controller/v1beta1/inferencereplica/status.go", "indexPublication", read, "transient same-pass mirror: the publication's node names counted once to size the rows' lists", "NodesOccupied")
 	approve("pkg/controller/v1beta1/irstatus/encoding.go", "ClearPodDerivedObservations", write, "status persistence boundary", allFields...)
+	approve("pkg/controller/v1beta1/irstatus/densesize.go", "rowSize", removableFieldAccessCounts{reads: 2}, "status size counted over every row field", allFields...)
 	approve("pkg/controller/v1beta1/workload/status/precondition.go", "Clone", readWrite, "isolated status copy", "NodesOccupied")
 	approve("pkg/controller/v1beta1/workload/status/create.go", "sameCreateTransitionOwnerState", removableFieldAccessCounts{writes: 2}, "rollback comparison normalization", allFields...)
 	approve("pkg/controller/v1beta1/workload/status/create.go", "restoreCreateTransitionState", readWrite, "transient rollback observation preservation", "ReadyPodCount", "ScheduledPodCount")
@@ -1300,4 +1305,84 @@ func TestTakeInlineV1PublicationReadsRestartingWhenTheNodeRevokedReady(t *testin
 			t.Errorf("gang = phase %s, %d pod(s), %d serving; want Restarting with two pods and none serving", row.Phase, row.PodCount, row.ServingPodCount)
 		}
 	})
+}
+
+// fleetPublicationCase is one pass's publication over a fleet: the name the
+// benchmark and the allocation golden share, and the pass.
+type fleetPublicationCase struct {
+	name string
+	run  func(testing.TB)
+}
+
+// fleetPublicationCases run the publication, the pass that converts the
+// decoded rows, reads each against its pods and writes the published phase
+// and the counters, at the benchmark's largest shapes, 4,000 single-pod
+// Instances and 160 gangs of one leader and seven workers, and at a quarter
+// of the largest, 1,000 single-pod Instances, every pod serving and in
+// rotation. Each shape runs over rows with no readySince (uniform) and over
+// rows each carrying its own (readySince), as a replica at rest stores them.
+func fleetPublicationCases() []fleetPublicationCase {
+	shapes := []struct {
+		name            string
+		instances, pods int
+	}{
+		{name: "1000x1", instances: 1000, pods: 1},
+		{name: "4000x1", instances: 4000, pods: 1},
+		{name: "160x8", instances: 160, pods: 8},
+	}
+	rowSets := []struct {
+		name string
+		rows func(int) []v1beta1.OMENativeInstanceStatus
+	}{
+		{name: "uniform", rows: irstatustest.UniformRows},
+		{name: "readySince", rows: irstatustest.ReadySinceRows},
+	}
+	var cases []fleetPublicationCase
+	for _, s := range shapes {
+		byIdx := fleetPods(s.instances, s.pods)
+		pods := workload.NewCachedSelectorPodObservation(nil, byIdx)
+		available := make(map[string]struct{}, s.instances*s.pods)
+		desired := make(map[int32]int32, s.instances)
+		for index, set := range byIdx {
+			desired[index] = int32(s.pods)
+			for _, pod := range set {
+				available[pod.Name] = struct{}{}
+			}
+		}
+		for _, rowSet := range rowSets {
+			stored := rowSet.rows(s.instances)
+			for i := range stored {
+				stored[i].PodCount, stored[i].ServingPodCount, stored[i].AvailablePodCount = int32(s.pods), int32(s.pods), int32(s.pods)
+			}
+			cases = append(cases, fleetPublicationCase{name: s.name + "/" + rowSet.name + "/publication", run: func(tb testing.TB) {
+				observation, err := workload.NewOwnedPublicationObservation(
+					v1beta1convert.InstanceStatusSliceToWorkload(stored), pods, available, status.AvailabilityWindow{})
+				if err != nil {
+					tb.Fatal(err)
+				}
+				published, counters, err := observation.TakeInlineV1Publication(desired, irstatustest.Revision)
+				if err != nil {
+					tb.Fatal(err)
+				}
+				if int(counters.ServingReplicas) != s.instances || int(counters.UpdatedReadyReplicas) != s.instances {
+					tb.Fatalf("%s: %d serving and %d updated ready of %d Instances", s.name, counters.ServingReplicas, counters.UpdatedReadyReplicas, s.instances)
+				}
+				benchmarkObservationRows = published
+			}})
+		}
+	}
+	return cases
+}
+
+// BenchmarkPublicationFleet is the cost of one pass's publication per shape
+// and row set.
+func BenchmarkPublicationFleet(b *testing.B) {
+	for _, c := range fleetPublicationCases() {
+		b.Run(c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				c.run(b)
+			}
+		})
+	}
 }

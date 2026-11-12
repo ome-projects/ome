@@ -2,6 +2,7 @@
 package allocation
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -38,19 +39,9 @@ func Apportion(desired int32, weights map[string]int64, maxPerCluster int32) (Pl
 		return Plan{}, errors.New("per-cluster limit must be nonnegative")
 	}
 	names := slices.Sorted(maps.Keys(weights))
-	var total int64
-	for _, name := range names {
-		weight := weights[name]
-		if name == "" {
-			return Plan{}, errors.New("cluster name must not be empty")
-		}
-		if weight < 0 {
-			return Plan{}, fmt.Errorf("cluster %q weight must be nonnegative", name)
-		}
-		if weight > math.MaxInt64-total {
-			return Plan{}, errors.New("sum of cluster weights exceeds int64")
-		}
-		total += weight
+	total, err := weightTotal(names, weights)
+	if err != nil {
+		return Plan{}, err
 	}
 	plan := Plan{Targets: make(map[string]int32, len(weights)), Unassigned: desired}
 	for _, name := range names {
@@ -59,11 +50,45 @@ func Apportion(desired int32, weights map[string]int64, maxPerCluster int32) (Pl
 	if total == 0 {
 		return plan, nil
 	}
-	type remainder struct {
-		cluster string
-		value   uint64
+	assignByLargestRemainder(&plan, desired, names, weights, total)
+	if err := checkPerClusterLimit(plan, names, maxPerCluster); err != nil {
+		return Plan{}, err
 	}
-	remainders := make([]remainder, 0, len(weights))
+	return plan, nil
+}
+
+// weightTotal sums the weights in name order and refuses an empty cluster
+// name, a negative weight and a sum past int64.
+func weightTotal(names []string, weights map[string]int64) (int64, error) {
+	var total int64
+	for _, name := range names {
+		weight := weights[name]
+		if name == "" {
+			return 0, errors.New("cluster name must not be empty")
+		}
+		if weight < 0 {
+			return 0, fmt.Errorf("cluster %q weight must be nonnegative", name)
+		}
+		if weight > math.MaxInt64-total {
+			return 0, errors.New("sum of cluster weights exceeds int64")
+		}
+		total += weight
+	}
+	return total, nil
+}
+
+// remainder is the part of a cluster's exact share that whole units do not
+// cover; the largest remainders, then the first names, take the units left.
+type remainder struct {
+	cluster string
+	value   uint64
+}
+
+// assignByLargestRemainder gives every cluster the whole units of its share
+// of desired, then one more unit each to the clusters with the largest
+// remainders until nothing is left unassigned.
+func assignByLargestRemainder(plan *Plan, desired int32, names []string, weights map[string]int64, total int64) {
+	remainders := make([]remainder, 0, len(names))
 	for _, name := range names {
 		// The product may exceed 64 bits, but the quotient is bounded by desired
 		// because each weight is at most total. Div64 therefore cannot overflow.
@@ -74,23 +99,21 @@ func Apportion(desired int32, weights map[string]int64, maxPerCluster int32) (Pl
 		remainders = append(remainders, remainder{cluster: name, value: rest})
 	}
 	slices.SortStableFunc(remainders, func(a, b remainder) int {
-		switch {
-		case a.value > b.value:
-			return -1
-		case a.value < b.value:
-			return 1
-		default:
-			return 0
-		}
+		return cmp.Compare(b.value, a.value)
 	})
 	for i := int32(0); i < plan.Unassigned; i++ {
 		plan.Targets[remainders[i].cluster]++
 	}
 	plan.Unassigned = 0
+}
+
+// checkPerClusterLimit refuses the plan when a positive limit is below any
+// cluster's target.
+func checkPerClusterLimit(plan Plan, names []string, maxPerCluster int32) error {
 	for _, name := range names {
 		if maxPerCluster > 0 && plan.Targets[name] > maxPerCluster {
-			return Plan{}, &TargetLimitError{Cluster: name, Target: plan.Targets[name], Limit: maxPerCluster}
+			return &TargetLimitError{Cluster: name, Target: plan.Targets[name], Limit: maxPerCluster}
 		}
 	}
-	return plan, nil
+	return nil
 }

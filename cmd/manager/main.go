@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	kedav1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
@@ -15,10 +16,10 @@ import (
 	zaplog "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/labels"
+	apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/selection"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
@@ -29,7 +30,6 @@ import (
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -56,7 +56,10 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic"
 	trafficfactory "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic/factory"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus/crdskew"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus/schemapreflight"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/managercache"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
 	v1beta1runtimerevisioncontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/runtimerevision"
 	v1beta1servingruntimecontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/servingruntime"
@@ -76,6 +79,7 @@ import (
 	"sigs.k8s.io/ome/pkg/webhook/admission/runtimepreset"
 	runtimerevisionwebhook "sigs.k8s.io/ome/pkg/webhook/admission/runtimerevision"
 	"sigs.k8s.io/ome/pkg/webhook/admission/servingruntime"
+	"sigs.k8s.io/ome/pkg/webhook/admission/splitplan"
 )
 
 const (
@@ -165,6 +169,9 @@ type Options struct {
 	// pprofAddr serves net/http/pprof for profiling a live manager. Empty
 	// disables it; the chart supplies the address.
 	pprofAddr string
+	// leaderElectionReleaseOnCancel gives up the leader lease at the end of a
+	// graceful stop, so a standby takes over without waiting for it to expire.
+	leaderElectionReleaseOnCancel bool
 	// Timing of the leader election loop. Supplied by the chart, because the
 	// margin a leader needs depends on the apiserver latency of the cluster.
 	leaderElectionTiming        leaderelection.Timing
@@ -246,6 +253,7 @@ func GetOptions() Options {
 			"Enabling this will ensure there is only one active ome controller manager.")
 	flag.StringVar(&opts.leaderElectionNamespace, "leader-election-namespace", opts.leaderElectionNamespace, "The namespace in which the leader election configmap will be created.")
 	opts.leaderElectionTiming.BindFlags(flag.CommandLine)
+	leaderelection.BindReleaseOnCancel(flag.CommandLine, &opts.leaderElectionReleaseOnCancel)
 	flag.BoolVar(&opts.enableWebhook, "webhook", opts.enableWebhook, "Enable the webhook server.")
 	flag.BoolVar(&opts.webhookOnly, "webhook-only", opts.webhookOnly, "Serve admission webhooks without registering controllers. Requires --webhook and disabled leader election.")
 	flag.StringVar(&opts.webhookCertDir, "webhook-cert-dir", opts.webhookCertDir, "Directory containing webhook tls.crt and tls.key; empty uses controller-runtime's certificate directory.")
@@ -353,6 +361,19 @@ type startup struct {
 	// every reader in the process shares.
 	omenativeStatusConfig *controllerconfig.OMENativeStatusConfig
 	instanceStatusDecoder irstatus.Decoder
+	// readySinceForm is where every InferenceReplica status write stores the
+	// time each Instance became Ready, as the served schema allows: the
+	// readySince columns, or each Instance's entry when the installed CRD
+	// lacks the columns.
+	readySinceForm irstatus.ReadySinceForm
+	// servedDocument is the OpenAPI v3 document the apiserver serves for the
+	// manager's API group, read once for the schema preflight and the CRD
+	// comparison. shippedSchema is the schema this release ships and
+	// crdSchema the picture of the installed CRDs against it, which the
+	// service status writer and the CRD watch share.
+	servedDocument []byte
+	shippedSchema  crdskew.Shipped
+	crdSchema      *crdskew.Report
 	// eventRecorderSettings is the per-object event budget every recorder in
 	// the process shares; eventBroadcaster records for the InferenceService and
 	// InferenceReplica controllers.
@@ -404,6 +425,7 @@ func (s *startup) run() bool {
 		s.configureAPIClient,
 		s.createClientset,
 		s.configureInstanceStatusDecoding,
+		s.compareInstalledCRDSchemas,
 		s.disableHTTP2UnlessEnabled,
 		s.createManager,
 		s.registerPodIndex,
@@ -420,6 +442,7 @@ func (s *startup) run() bool {
 		s.loadTPUSliceConfig,
 		s.startEventBroadcaster,
 		s.setupInferenceServiceController,
+		s.followCRDSchemaChanges,
 		s.addControllerIdentityCheck,
 		s.setupPolicyStatusControllers,
 		s.setupBaseModelControllers,
@@ -501,10 +524,16 @@ func (s *startup) admissionDecoder() admission.Decoder {
 	return admission.NewDecoder(s.mgr.GetScheme())
 }
 
-// validateLeaderElectionTiming refuses a lease, renew and retry timing under
-// which a leader cannot keep its lease.
+// validateLeaderElectionTiming refuses a leader election the elector would
+// reject, or one under which a stopping leader's release could let two
+// managers act at once (leaderelection.Settings).
 func (s *startup) validateLeaderElectionTiming() bool {
-	if err := s.options.leaderElectionTiming.Validate(); err != nil {
+	settings := leaderelection.Settings{
+		Enabled:         s.options.enableLeaderElection,
+		ReleaseOnCancel: s.options.leaderElectionReleaseOnCancel,
+		Timing:          s.options.leaderElectionTiming,
+	}
+	if err := settings.Validate(); err != nil {
 		return stop(err, "Invalid leader election timing")
 	}
 	return true
@@ -537,20 +566,76 @@ func (s *startup) createClientset() bool {
 // stored, refuses a cluster whose InferenceReplica CRD cannot store or
 // validate the columnar form, and builds the one decoder every reader
 // shares. The bound is read once, before the manager exists, so every reader
-// decodes under the same bound for the life of the process.
+// decodes under the same bound for the life of the process. A CRD that
+// lacks only the readySince columns does not stop the manager: it starts,
+// says so in the log and the gauge, and stores each Instance's readySince
+// in its entry until a start finds the columns.
 func (s *startup) configureInstanceStatusDecoding() bool {
 	config, err := controllerconfig.NewOMENativeStatusConfig(s.clientSet)
 	if err != nil {
 		return stop(err, "Failed to initialize OMENative status configuration")
 	}
-	if err := schemapreflight.Verify(s.clientSet.Discovery().OpenAPIV3()); err != nil {
+	document, err := schemapreflight.Document(s.clientSet.Discovery().OpenAPIV3())
+	if err != nil {
 		return stop(err, "InferenceReplica status schema preflight failed")
 	}
+	capabilities, err := schemapreflight.VerifyDocument(document)
+	if err != nil {
+		return stop(err, "InferenceReplica status schema preflight failed")
+	}
+	s.servedDocument = document
 	s.omenativeStatusConfig = config
 	s.instanceStatusDecoder = irstatus.NewDecoder(config.DecodeBound())
+	s.readySinceForm = capabilities.ReadySinceForm()
+	if missing := capabilities.MissingReadySinceColumns; len(missing) > 0 {
+		obsmetrics.SetIRStatusReadySinceColumnsMissing(len(missing))
+		setupLog.Info("The installed InferenceReplica CRD lacks readySince columns; every status write stores each Instance's Ready time in its own entry, the larger form, until a manager start finds the columns",
+			"missingColumns", missing)
+	}
 	setupLog.Info("Configured InferenceReplica status representation",
 		"instanceStatusEncoding", config.InstanceStatusEncoding,
-		"maxDecodedInstances", config.DecodeBound())
+		"maxDecodedInstances", config.DecodeBound(),
+		"readySinceForm", s.readySinceForm.String())
+	return true
+}
+
+// compareInstalledCRDSchemas compares the served schema of every kind in the
+// manager's API group with the schema this release ships and keeps the
+// picture the service status writer and the CRD watch share. A CRD that
+// lacks a field this release knows is named here in the log and, once the
+// manager runs, in an event. It does not stop start-up: the manager serves
+// with the fields the CRD has, and the operator is told which are dropped.
+func (s *startup) compareInstalledCRDSchemas() bool {
+	s.crdSchema = &crdskew.Report{}
+	shipped, err := crdskew.ShippedSchemas()
+	if err != nil {
+		setupLog.Error(err, "The installed CRD schemas were not compared with this release's")
+		return true
+	}
+	s.shippedSchema = shipped
+	resources, err := utils.GetAvailableResourcesForApi(s.cfg, v1beta1.SchemeGroupVersion.String())
+	if err != nil {
+		setupLog.Error(err, "The installed CRD schemas were not compared with this release's")
+		return true
+	}
+	if resources == nil {
+		setupLog.Info("The installed CRD schemas were not compared with this release's: discovery does not list the manager's API group")
+		return true
+	}
+	findings, err := shipped.CompareServed(s.servedDocument, resources.APIResources)
+	if err != nil {
+		setupLog.Error(err, "The installed CRD schemas were not compared with this release's")
+		return true
+	}
+	lagging := 0
+	for _, finding := range findings {
+		s.crdSchema.Set(finding)
+		if finding.Lagging() {
+			lagging++
+			setupLog.Info(finding.Sentence(), "crd", finding.CRD, "missingFields", finding.MissingFields)
+		}
+	}
+	setupLog.Info("Compared the installed CRD schemas with this release's", "kinds", len(findings), "lagging", lagging)
 	return true
 }
 
@@ -568,24 +653,25 @@ func (s *startup) disableHTTP2UnlessEnabled() bool {
 	return true
 }
 
-// createManager builds the controller manager. Its cache holds only the pods
-// that carry the ome.io/inferenceservice label key, its leader lock is
-// LeaderLockName, and the recorders it hands out share the per-object event
-// budget, which is read here so every recorder built later shares it too.
+// createManager builds the controller manager. Its cache has the shape
+// managercache.Options describes, the one the integration suites build their
+// managers from too; its leader lock is LeaderLockName, and the recorders it
+// hands out share the per-object event budget, which is read here so every
+// recorder built later shares it too.
 func (s *startup) createManager() bool {
 	setupLog.Info("Initializing controller manager",
 		"metricsAddr", s.options.metricsAddr,
 		"pprofAddr", s.options.pprofAddr,
 		"webhookPort", s.options.webhookPort,
 		"leaderElection", s.options.enableLeaderElection, "webhookOnly", s.options.webhookOnly)
-	omePodReq, err := labels.NewRequirement(constants.InferenceServicePodLabelKey, selection.Exists, nil)
+	cacheOptions, err := managercache.Options()
 	if err != nil {
 		return stop(err, "Failed to build OME pod cache selector")
 	}
 	if s.eventRecorderSettings, err = controllerconfig.LoadEventRecorderSettings(s.clientSet); err != nil {
 		return stop(err, "Failed to initialize event recorder configuration")
 	}
-	mgr, err := manager.New(s.cfg, s.managerOptions(labels.NewSelector().Add(*omePodReq)))
+	mgr, err := manager.New(s.cfg, s.managerOptions(cacheOptions))
 	if err != nil {
 		return stop(err, "Failed to initialize controller manager")
 	}
@@ -593,21 +679,12 @@ func (s *startup) createManager() bool {
 	return true
 }
 
-// managerOptions is the manager's configuration. Pods are the one
-// cluster-scale type, and an unscoped informer holds every pod in the cluster
-// before any reconcile runs, so the pod cache holds only OME-owned pods; every
-// pod OME creates carries the label key, so the scope hides nothing the
-// controllers read. managedFields are stripped from every cached object; OME
-// never reads them.
-func (s *startup) managerOptions(omePodSelector labels.Selector) manager.Options {
+// managerOptions is the manager's configuration around cacheOptions, the
+// cache shape of managercache.Options.
+func (s *startup) managerOptions(cacheOptions cache.Options) manager.Options {
 	opts := manager.Options{
 		Scheme: scheme,
-		Cache: cache.Options{
-			DefaultTransform: cache.TransformStripManagedFields(),
-			ByObject: map[client.Object]cache.ByObject{
-				&v1.Pod{}: {Label: omePodSelector},
-			},
-		},
+		Cache:  cacheOptions,
 		Metrics: metricsserver.Options{
 			BindAddress:   s.options.metricsAddr,
 			TLSOpts:       s.tlsOptions,
@@ -618,12 +695,13 @@ func (s *startup) managerOptions(omePodSelector labels.Selector) manager.Options
 			CertDir: s.options.webhookCertDir,
 			TLSOpts: s.tlsOptions,
 		}),
-		LeaderElection:          s.options.enableLeaderElection,
-		LeaderElectionID:        LeaderLockName,
-		LeaderElectionNamespace: s.options.leaderElectionNamespace,
-		HealthProbeBindAddress:  s.options.probeAddr,
-		PprofBindAddress:        s.options.pprofAddr,
-		EventBroadcaster:        newEventBroadcaster(s.eventRecorderSettings), //nolint:staticcheck // the manager-owned recorders must share the configured per-object event budget
+		LeaderElection:                s.options.enableLeaderElection,
+		LeaderElectionID:              LeaderLockName,
+		LeaderElectionNamespace:       s.options.leaderElectionNamespace,
+		LeaderElectionReleaseOnCancel: s.options.leaderElectionReleaseOnCancel,
+		HealthProbeBindAddress:        s.options.probeAddr,
+		PprofBindAddress:              s.options.pprofAddr,
+		EventBroadcaster:              newEventBroadcaster(s.eventRecorderSettings), //nolint:staticcheck // the manager-owned recorders must share the configured per-object event budget
 	}
 	s.options.leaderElectionTiming.Apply(&opts)
 	return opts
@@ -719,7 +797,7 @@ func (s *startup) registerOptionalSchemes() bool {
 // the traffic reconciler on it.
 func (s *startup) selectTrafficTranslator() bool {
 	setupLog.Info("Selecting traffic translator")
-	translator, err := trafficfactory.New(s.cfg)
+	translator, err := trafficfactory.New(s.cfg, s.ingressConfig.ClusterDomain)
 	if err != nil {
 		return stop(err, "Failed to select traffic translator")
 	}
@@ -835,6 +913,7 @@ func (s *startup) setupInferenceServiceController() bool {
 		Scheme:                    s.mgr.GetScheme(),
 		Recorder:                  s.controllerRecorder(s.eventBroadcaster),
 		InstanceStatusDecoder:     s.instanceStatusDecoder,
+		CRDSchema:                 s.crdSchema,
 		TrafficReconciler:         s.trafficReconciler,
 		MaxConcurrentReconciles:   s.options.isvcMaxConcurrentReconciles,
 		ConfigCacheTTL:            s.options.configCacheTTL,
@@ -844,6 +923,66 @@ func (s *startup) setupInferenceServiceController() bool {
 		return stop(err, "Failed to create InferenceService controller")
 	}
 	return true
+}
+
+// followCRDSchemaChanges adds the runnable that reports the start-up
+// picture of the installed CRDs as events once the manager runs and keeps
+// it current as CRDs change. The control plane writes the same objects, so
+// it follows too.
+func (s *startup) followCRDSchemaChanges() bool {
+	if s.shippedSchema == nil {
+		return true
+	}
+	crds, err := apiextensionsclient.NewForConfig(s.cfg)
+	if err != nil {
+		return stop(err, "Failed to create the CustomResourceDefinition client")
+	}
+	watcher := &crdskew.Watcher{
+		Shipped:   s.shippedSchema,
+		Report:    s.crdSchema,
+		CRDs:      crds.ApiextensionsV1().CustomResourceDefinitions(),
+		Informers: s.mgr.GetCache(),
+		Log:       ctrl.Log.WithName("CRDSchema"),
+		Changed:   s.tellCRDSchemaFinding(s.controllerRecorder(s.eventBroadcaster)),
+	}
+	if err := s.mgr.Add(watcher); err != nil {
+		return stop(err, "Failed to register the CRD schema watch")
+	}
+	return true
+}
+
+// tellCRDSchemaFinding logs a CRD's picture and records it as an event
+// on the manager Pod named after this host, where an operator looks first.
+// A process that is not such a Pod, a local run, has the log line alone.
+func (s *startup) tellCRDSchemaFinding(recorder record.EventRecorder) func(crdskew.Finding) {
+	log := ctrl.Log.WithName("CRDSchema")
+	var (
+		lookup sync.Once
+		pod    *v1.Pod
+	)
+	return func(finding crdskew.Finding) {
+		lookup.Do(func() {
+			hostname, err := os.Hostname()
+			if err != nil {
+				return
+			}
+			found, err := s.clientSet.CoreV1().Pods(constants.OMENamespace).Get(context.Background(), hostname, metav1.GetOptions{})
+			if err != nil {
+				log.Info("No manager Pod is named after this host; CRD schema findings stay in the log", "namespace", constants.OMENamespace, "host", hostname)
+				return
+			}
+			pod = found
+		})
+		log.Info(finding.Sentence(), "crd", finding.CRD, "missingFields", finding.MissingFields)
+		if pod == nil {
+			return
+		}
+		if finding.Lagging() {
+			recorder.Event(pod, v1.EventTypeWarning, crdskew.ReasonLagging, finding.Sentence())
+			return
+		}
+		recorder.Event(pod, v1.EventTypeNormal, crdskew.ReasonCurrent, finding.Sentence())
+	}
 }
 
 // addControllerIdentityCheck adds the runnable that, once the manager runs
@@ -962,7 +1101,6 @@ func (s *startup) setupServingRuntimeControllers() bool {
 	if err := (&v1beta1servingruntimecontroller.InheritanceReconciler{
 		Client:   s.mgr.GetClient(),
 		Log:      ctrl.Log.WithName("ServingRuntimeInheritance"),
-		Scheme:   s.mgr.GetScheme(),
 		Recorder: s.controllerRecorder(s.newRecordingBroadcaster()),
 	}).SetupWithManager(s.mgr); err != nil {
 		return stop(err, "Failed to create ServingRuntime inheritance controller")
@@ -973,7 +1111,6 @@ func (s *startup) setupServingRuntimeControllers() bool {
 	if err := (&v1beta1runtimerevisioncontroller.GCReconciler{
 		Client:              s.mgr.GetClient(),
 		Log:                 ctrl.Log.WithName("RuntimeRevisionGC"),
-		Scheme:              s.mgr.GetScheme(),
 		OMENamespace:        constants.OMENamespace,
 		RetentionPerRuntime: s.options.runtimeRevisionRetention,
 		GracePeriod:         s.options.runtimeRevisionGracePeriod,
@@ -1013,6 +1150,7 @@ func (s *startup) setupInferenceReplicaController() bool {
 		RuntimeSelector:          s.runtimeSelector,
 		InstanceStatusDecoder:    s.instanceStatusDecoder,
 		InstanceStatusTarget:     s.omenativeStatusConfig.InstanceStatusEncoding,
+		ReadySinceForm:           s.readySinceForm,
 		Recorder:                 s.controllerRecorder(s.eventBroadcaster),
 		MaxConcurrentReconciles:  s.options.irMaxConcurrentReconciles,
 		ConfigCacheTTL:           s.options.configCacheTTL,
@@ -1052,10 +1190,8 @@ func (s *startup) setupAcceleratorClassController() bool {
 	}
 	setupLog.Info("Setting up AcceleratorClass controller")
 	if err := (&v1beta1acceleratorclasscontroller.AcceleratorClassReconciler{
-		Client:   s.mgr.GetClient(),
-		Log:      ctrl.Log.WithName("AcceleratorClass"),
-		Scheme:   s.mgr.GetScheme(),
-		Recorder: s.controllerRecorder(s.newRecordingBroadcaster()),
+		Client: s.mgr.GetClient(),
+		Log:    ctrl.Log.WithName("AcceleratorClass"),
 	}).SetupWithManager(s.mgr); err != nil {
 		return stop(err, "Failed to create AcceleratorClass controller")
 	}
@@ -1086,10 +1222,10 @@ func (s *startup) registerPodAndRuntimeWebhooks() bool {
 	})
 	setupLog.Info("Registering serving runtime engine-preset mutator webhooks to the webhook server")
 	hookServer.Register("/mutate-ome-io-v1beta1-servingruntime-preset", &webhook.Admission{
-		Handler: &runtimepreset.ServingRuntimeMutator{Decoder: decoder},
+		Handler: &runtimepreset.ServingRuntimeMutator{Decoder: decoder, Clientset: s.clientSet},
 	})
 	hookServer.Register("/mutate-ome-io-v1beta1-clusterservingruntime-preset", &webhook.Admission{
-		Handler: &runtimepreset.ClusterServingRuntimeMutator{Decoder: decoder},
+		Handler: &runtimepreset.ClusterServingRuntimeMutator{Decoder: decoder, Clientset: s.clientSet},
 	})
 	setupLog.Info("Registering ControllerRevision immutability validator webhook to the webhook server")
 	hookServer.Register("/validate-apps-v1-controllerrevision", &webhook.Admission{
@@ -1180,13 +1316,17 @@ func (s *startup) registerPolicyWebhooks() bool {
 // InferenceService validator. It selects runtimes against the local catalog,
 // which is empty on the control plane, where it would refuse every service;
 // the workload clusters' own webhooks validate the copies placement sends
-// them, so the control plane skips it.
+// them, so the control plane skips it. The control plane serves the Split
+// plan validator instead, since only it holds the WorkloadCluster
+// registrations a Split plan divides replicas across.
 func (s *startup) registerInferenceServiceWebhook() bool {
 	if !s.options.enableWebhook {
 		return true
 	}
 	if s.isControlPlane {
-		setupLog.Info("control-plane role: InferenceService validator webhook disabled (runtime selection runs on workload clusters)")
+		setupLog.Info("control-plane role: InferenceService validator webhook disabled (runtime selection runs on workload clusters); registering the Split plan validator")
+		s.mgr.GetWebhookServer().Register(splitplan.ValidatorPath,
+			admission.WithValidator[*v1beta1.InferenceService](s.mgr.GetScheme(), &splitplan.Validator{Reader: s.mgr.GetAPIReader()}))
 		return true
 	}
 	if err := ctrl.NewWebhookManagedBy(s.mgr, &v1beta1.InferenceService{}).
@@ -1218,11 +1358,20 @@ func (s *startup) inferenceServiceValidator() *isvc.InferenceServiceValidator {
 		// minReplicas, so a member with no replica fields is sized as the
 		// rollout will size it.
 		DefaultMinReplicas: s.deployConfig.Replicas.Min(),
+		// The strategy fill the reconciler applies to a Component with no
+		// update strategy, so a member with none is read as the rollout
+		// will roll it.
+		DefaultUpdateStrategy: s.deployConfig.UpdateStrategy,
 		// The passthrough prefixes and the typed traffic fields the active
 		// translator supports, so admission refuses what the reconciler could
 		// not apply.
 		KnownPassthroughPrefixes: s.trafficTranslator.SupportedPassthroughPrefixes(),
 		SupportedTrafficFields:   sets.List(s.trafficTranslator.SupportedTrafficFields()),
+		// The route provider and its declared capabilities
+		// (routeProviderCapabilities) come from the same ingress config the
+		// controller renders routes from, so a canary the provider cannot
+		// carry is refused here and held there under one declaration.
+		IngressConfig: s.ingressConfig,
 	}
 }
 
@@ -1240,7 +1389,9 @@ func (s *startup) addHealthChecks() bool {
 	return true
 }
 
-// startManager runs the manager until it is told to stop.
+// startManager runs the manager until it is told to stop. The process exits
+// as soon as Start returns: with --leader-elect-release-on-cancel the lease
+// may already be released by then, so a standby may be leading.
 func (s *startup) startManager() bool {
 	setupLog.Info("Starting manager")
 	managerCtx := signals.SetupSignalHandler()

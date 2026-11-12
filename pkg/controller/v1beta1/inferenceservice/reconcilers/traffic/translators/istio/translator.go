@@ -2,7 +2,7 @@
 // (networking.istio.io/v1).
 //
 // The translator emits an unstructured.Unstructured object so OME does
-// not vendor the Istio API. Field paths are pinned by the Istio
+// not vendor the Istio API. Field paths are those of the Istio
 // DestinationRule API; control-plane schema errors surface as
 // GatewayRejected via the post-apply observation.
 //
@@ -62,10 +62,16 @@ var algorithmToIstioSimple = map[v1beta1.LoadBalancingType]string{
 }
 
 // Translator emits a DestinationRule per InferenceService.
-type Translator struct{}
+type Translator struct {
+	// clusterDomain is the cluster's DNS domain from ingress.clusterDomain;
+	// the DestinationRule host is the Service's in-cluster hostname under it.
+	clusterDomain string
+}
 
-// New returns a ready-to-use Translator.
-func New() *Translator { return &Translator{} }
+// New returns a ready-to-use Translator. clusterDomain is the cluster's DNS
+// domain from the operator configuration; empty renders the bare Service
+// name as the host, which Istio expands itself.
+func New(clusterDomain string) *Translator { return &Translator{clusterDomain: clusterDomain} }
 
 // Name returns the stable identifier "istio".
 func (t *Translator) Name() string { return Name }
@@ -114,6 +120,18 @@ func (t *Translator) SupportedTrafficFields() sets.Set[string] {
 	)
 }
 
+// host is the DestinationRule host: the Service's fully qualified in-cluster
+// name under the configured cluster domain. Without a domain it is the bare
+// Service name: Istio takes a dotted host as fully qualified and ignores a
+// rule whose host matches no Service, but expands a bare name with the
+// rule's namespace and its own cluster domain.
+func (t *Translator) host(isvc *v1beta1.InferenceService) string {
+	if t.clusterDomain == "" {
+		return isvc.Name
+	}
+	return constants.ServiceHostname(isvc.Name, isvc.Namespace, t.clusterDomain)
+}
+
 // Translate produces the DestinationRule for the InferenceService.
 // Deterministic — same inputs produce byte-identical output.
 func (t *Translator) Translate(
@@ -129,29 +147,17 @@ func (t *Translator) Translate(
 	// Istio DR targets a Service hostname, not HTTPRoutes. We target
 	// the top-level Service; per-Component coverage would require
 	// multiple DRs (deferred).
-	host := fmt.Sprintf("%s.%s.svc.cluster.local", isvc.Name, isvc.Namespace)
-	if err := unstructured.SetNestedField(dr.Object, host, "spec", "host"); err != nil {
+	if err := unstructured.SetNestedField(dr.Object, t.host(isvc), "spec", "host"); err != nil {
 		return nil, nil, fmt.Errorf("set host: %w", err)
 	}
 
-	if intent.Traffic != nil {
-		if err := applyLoadBalancer(dr, intent.Traffic); err != nil {
-			return nil, nil, err
-		}
+	fields, err := intentFields(intent)
+	if err != nil {
+		return nil, nil, err
 	}
-	if intent.CircuitBreaker != nil {
-		if err := applyCircuitBreaker(dr, intent.CircuitBreaker); err != nil {
-			return nil, nil, err
-		}
+	if err := writeFields(dr, fields); err != nil {
+		return nil, nil, err
 	}
-	if intent.Timeout != nil {
-		if err := applyTimeout(dr, intent.Timeout); err != nil {
-			return nil, nil, err
-		}
-	}
-	// retry intent is intentionally ignored — Istio's DR doesn't model
-	// retries (those live on VirtualService). The reconciler surfaces
-	// the dropped retry-* annotations as UnsupportedField.
 
 	passthroughs, err := applyPassthroughs(dr, intent.PassthroughIstio)
 	if err != nil {
@@ -201,129 +207,139 @@ func (t *Translator) ObserveAcceptance(obj client.Object) traffic.AcceptanceObse
 	return traffic.AcceptanceObservation{State: traffic.AcceptancePending}
 }
 
-func applyLoadBalancer(dr *unstructured.Unstructured, spec *v1beta1.TrafficSpec) error {
+// policyField is one field of spec.trafficPolicy: its path under it, the value
+// written there, and the name an error reports.
+type policyField struct {
+	name  string
+	path  []string
+	value interface{}
+}
+
+// policyFieldAt is the field at a dotted path under trafficPolicy; an error
+// names the path.
+func policyFieldAt(dotted string, value interface{}) policyField {
+	return policyField{name: dotted, path: strings.Split(dotted, "."), value: value}
+}
+
+// consistentHashField is a field under loadBalancer.consistentHash; an error
+// names it from consistentHash down.
+func consistentHashField(dotted string, value interface{}) policyField {
+	field := policyFieldAt("loadBalancer.consistentHash."+dotted, value)
+	field.name = "consistentHash." + dotted
+	return field
+}
+
+// writeFields sets each field on the DestinationRule, in order.
+func writeFields(dr *unstructured.Unstructured, fields []policyField) error {
+	for _, f := range fields {
+		path := append([]string{"spec", "trafficPolicy"}, f.path...)
+		if err := unstructured.SetNestedField(dr.Object, f.value, path...); err != nil {
+			return fmt.Errorf("set %s: %w", f.name, err)
+		}
+	}
+	return nil
+}
+
+// intentFields are the trafficPolicy fields the intent asks for, in the order
+// they are written: load balancing, the circuit breaker, then timeouts. Retry
+// intent has no DestinationRule field (retries live on the VirtualService);
+// the reconciler reports the dropped retry-* annotations as UnsupportedField.
+func intentFields(intent *traffic.ResolvedIntent) ([]policyField, error) {
+	var fields []policyField
+	if intent.Traffic != nil {
+		loadBalancer, err := loadBalancerFields(intent.Traffic)
+		if err != nil {
+			return nil, err
+		}
+		fields = append(fields, loadBalancer...)
+	}
+	if intent.CircuitBreaker != nil {
+		fields = append(fields, circuitBreakerFields(intent.CircuitBreaker)...)
+	}
+	if intent.Timeout != nil {
+		fields = append(fields, timeoutFields(intent.Timeout)...)
+	}
+	return fields, nil
+}
+
+// loadBalancerFields are the loadBalancer fields of a traffic spec: the simple
+// algorithm, then the consistent hash. EndpointOverride has no DestinationRule
+// analogue; SupportedTrafficFields does not declare it, so the reconciler
+// reports it as an unsupported typed field.
+func loadBalancerFields(spec *v1beta1.TrafficSpec) ([]policyField, error) {
+	var fields []policyField
 	if spec.Algorithm != nil && *spec.Algorithm != v1beta1.LoadBalancingTypeConsistentHash {
 		simple, ok := algorithmToIstioSimple[*spec.Algorithm]
 		if !ok {
-			return fmt.Errorf("unsupported algorithm %q for Istio DR", *spec.Algorithm)
+			return nil, fmt.Errorf("unsupported algorithm %q for Istio DR", *spec.Algorithm)
 		}
-		if err := unstructured.SetNestedField(
-			dr.Object, simple,
-			"spec", "trafficPolicy", "loadBalancer", "simple",
-		); err != nil {
-			return fmt.Errorf("set loadBalancer.simple: %w", err)
-		}
+		fields = append(fields, policyFieldAt("loadBalancer.simple", simple))
 	}
 	if spec.ConsistentHash != nil {
-		if err := applyConsistentHash(dr, spec.ConsistentHash); err != nil {
-			return err
+		hash, err := consistentHashFields(spec.ConsistentHash)
+		if err != nil {
+			return nil, err
 		}
+		fields = append(fields, hash...)
 	}
-	// EndpointOverride has no DestinationRule analogue. The intent is
-	// dropped here; SupportedTrafficFields does not declare it, so the
-	// reconciler surfaces it as an unsupported typed field.
-	return nil
+	return fields, nil
 }
 
-func applyConsistentHash(dr *unstructured.Unstructured, ch *v1beta1.ConsistentHashSpec) error {
+// consistentHashFields are the consistentHash fields of a hashing spec. Istio's
+// httpHeaderName is a single string, so only the first header is emitted;
+// admission refuses multi-header specs while this translator is active, and
+// the reconciler reports one that slips through as an unsupported typed field.
+func consistentHashFields(ch *v1beta1.ConsistentHashSpec) ([]policyField, error) {
 	switch ch.Type {
 	case v1beta1.HashTypeHeader:
 		if len(ch.Headers) == 0 {
-			return errors.New("consistentHash.type=Header requires at least one header")
+			return nil, errors.New("consistentHash.type=Header requires at least one header")
 		}
-		// Istio's httpHeaderName is a single string, so only the first
-		// header is emitted. Admission rejects multi-header specs when
-		// this translator is active (SupportedTrafficFields omits the
-		// multi-header capability); the reconciler surfaces any that
-		// slip through as an unsupported typed field.
-		if err := unstructured.SetNestedField(
-			dr.Object, ch.Headers[0].Name,
-			"spec", "trafficPolicy", "loadBalancer", "consistentHash", "httpHeaderName",
-		); err != nil {
-			return fmt.Errorf("set consistentHash.httpHeaderName: %w", err)
-		}
+		return []policyField{consistentHashField("httpHeaderName", ch.Headers[0].Name)}, nil
 	case v1beta1.HashTypeCookie:
 		if ch.Cookie == nil {
-			return errors.New("consistentHash.type=Cookie requires cookie")
+			return nil, errors.New("consistentHash.type=Cookie requires cookie")
 		}
-		if err := unstructured.SetNestedField(
-			dr.Object, ch.Cookie.Name,
-			"spec", "trafficPolicy", "loadBalancer", "consistentHash", "httpCookie", "name",
-		); err != nil {
-			return fmt.Errorf("set consistentHash.httpCookie.name: %w", err)
-		}
+		fields := []policyField{consistentHashField("httpCookie.name", ch.Cookie.Name)}
 		if ch.Cookie.TTLSeconds != nil && *ch.Cookie.TTLSeconds > 0 {
-			if err := unstructured.SetNestedField(
-				dr.Object, fmt.Sprintf("%ds", *ch.Cookie.TTLSeconds),
-				"spec", "trafficPolicy", "loadBalancer", "consistentHash", "httpCookie", "ttl",
-			); err != nil {
-				return fmt.Errorf("set consistentHash.httpCookie.ttl: %w", err)
-			}
+			fields = append(fields, consistentHashField("httpCookie.ttl", fmt.Sprintf("%ds", *ch.Cookie.TTLSeconds)))
 		}
+		return fields, nil
 	case v1beta1.HashTypeSourceIP:
-		if err := unstructured.SetNestedField(
-			dr.Object, true,
-			"spec", "trafficPolicy", "loadBalancer", "consistentHash", "useSourceIp",
-		); err != nil {
-			return fmt.Errorf("set consistentHash.useSourceIp: %w", err)
-		}
+		return []policyField{consistentHashField("useSourceIp", true)}, nil
 	}
-	return nil
+	return nil, nil
 }
 
-func applyCircuitBreaker(dr *unstructured.Unstructured, cb *traffic.CircuitBreakerIntent) error {
+// circuitBreakerFields are the connectionPool fields of a circuit breaker.
+// Istio's closest analogue of a cap on in-flight requests is http2MaxRequests.
+// MaxParallelRetries and PerEndpointMaxConnections have no DestinationRule
+// analogue; the reconciler reports them as UnsupportedField.
+func circuitBreakerFields(cb *traffic.CircuitBreakerIntent) []policyField {
+	var fields []policyField
 	if cb.MaxConnections != nil {
-		if err := unstructured.SetNestedField(
-			dr.Object, int64(*cb.MaxConnections),
-			"spec", "trafficPolicy", "connectionPool", "tcp", "maxConnections",
-		); err != nil {
-			return fmt.Errorf("set connectionPool.tcp.maxConnections: %w", err)
-		}
+		fields = append(fields, policyFieldAt("connectionPool.tcp.maxConnections", int64(*cb.MaxConnections)))
 	}
 	if cb.MaxParallelRequests != nil {
-		// Istio's closest analogue is http2MaxRequests (TCP-level
-		// concurrent request cap). Operators want a "max in-flight
-		// requests" cap; this is it.
-		if err := unstructured.SetNestedField(
-			dr.Object, int64(*cb.MaxParallelRequests),
-			"spec", "trafficPolicy", "connectionPool", "http", "http2MaxRequests",
-		); err != nil {
-			return fmt.Errorf("set connectionPool.http.http2MaxRequests: %w", err)
-		}
+		fields = append(fields, policyFieldAt("connectionPool.http.http2MaxRequests", int64(*cb.MaxParallelRequests)))
 	}
 	if cb.MaxPendingRequests != nil {
-		if err := unstructured.SetNestedField(
-			dr.Object, int64(*cb.MaxPendingRequests),
-			"spec", "trafficPolicy", "connectionPool", "http", "http1MaxPendingRequests",
-		); err != nil {
-			return fmt.Errorf("set connectionPool.http.http1MaxPendingRequests: %w", err)
-		}
+		fields = append(fields, policyFieldAt("connectionPool.http.http1MaxPendingRequests", int64(*cb.MaxPendingRequests)))
 	}
-	// MaxParallelRetries and PerEndpointMaxConnections have no direct
-	// Istio DR analogue; the reconciler surfaces them as
-	// UnsupportedField.
-	return nil
+	return fields
 }
 
-func applyTimeout(dr *unstructured.Unstructured, to *traffic.TimeoutIntent) error {
+// timeoutFields are the connectionPool timeouts. MaxConnectionDuration has no
+// DestinationRule analogue.
+func timeoutFields(to *traffic.TimeoutIntent) []policyField {
+	var fields []policyField
 	if to.Idle != nil {
-		if err := unstructured.SetNestedField(
-			dr.Object, to.Idle.String(),
-			"spec", "trafficPolicy", "connectionPool", "http", "idleTimeout",
-		); err != nil {
-			return fmt.Errorf("set connectionPool.http.idleTimeout: %w", err)
-		}
+		fields = append(fields, policyFieldAt("connectionPool.http.idleTimeout", to.Idle.String()))
 	}
 	if to.TCPConnect != nil {
-		if err := unstructured.SetNestedField(
-			dr.Object, to.TCPConnect.String(),
-			"spec", "trafficPolicy", "connectionPool", "tcp", "connectTimeout",
-		); err != nil {
-			return fmt.Errorf("set connectionPool.tcp.connectTimeout: %w", err)
-		}
+		fields = append(fields, policyFieldAt("connectionPool.tcp.connectTimeout", to.TCPConnect.String()))
 	}
-	// MaxConnectionDuration has no Istio DR analogue.
-	return nil
+	return fields
 }
 
 // applyPassthroughs writes each ome.io/dr.<path>=<value> annotation
@@ -334,19 +350,18 @@ func applyPassthroughs(dr *unstructured.Unstructured, paths map[string]string) (
 	if len(paths) == 0 {
 		return nil, nil
 	}
-	sortedKeys := make([]string, 0, len(paths))
+	applied := make([]string, 0, len(paths))
 	for k := range paths {
-		sortedKeys = append(sortedKeys, k)
-	}
-	sort.Strings(sortedKeys)
-
-	applied := make([]string, 0, len(sortedKeys))
-	for _, k := range sortedKeys {
-		segments := append([]string{"spec", "trafficPolicy"}, strings.Split(k, ".")...)
-		if err := unstructured.SetNestedField(dr.Object, parseScalar(paths[k]), segments...); err != nil {
-			return nil, fmt.Errorf("set passthrough %q: %w", k, err)
-		}
 		applied = append(applied, k)
+	}
+	sort.Strings(applied)
+
+	fields := make([]policyField, 0, len(applied))
+	for _, k := range applied {
+		fields = append(fields, policyField{name: fmt.Sprintf("passthrough %q", k), path: strings.Split(k, "."), value: parseScalar(paths[k])})
+	}
+	if err := writeFields(dr, fields); err != nil {
+		return nil, err
 	}
 	return applied, nil
 }

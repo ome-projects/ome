@@ -537,7 +537,7 @@ func (r *Reconciler) sweepMember(ctx context.Context, remote client.Client,
 		if err := remote.Delete(ctx, obj, client.Preconditions{
 			UID:             &obj.UID,
 			ResourceVersion: &obj.ResourceVersion,
-		}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		}); err != nil && !goneOrRewritten(err) {
 			errs = append(errs, fmt.Errorf("reaping %s on %s: %w", obj.Name, cluster, err))
 		}
 	}
@@ -666,7 +666,6 @@ func (r *Reconciler) fleetCapacity(ctx context.Context, clusters []string,
 				ResourceFlavor: c.ResourceFlavor,
 				Allocatable:    c.Allocatable.DeepCopy(),
 				HighWaterMark:  c.HighWaterMark.DeepCopy(),
-				ObservedAt:     c.ObservedAt.DeepCopy(),
 			})
 		}
 	}

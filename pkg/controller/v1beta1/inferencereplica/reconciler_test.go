@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -268,7 +269,7 @@ func TestReconcile_TerminatingPodGroupHoldsWithoutPods(t *testing.T) {
 		UID:               "terminating-pg",
 		DeletionTimestamp: &now,
 		Finalizers:        []string{"example.com/hold"},
-		OwnerReferences:   []metav1.OwnerReference{*metav1.NewControllerRef(ir, IRGVK())},
+		OwnerReferences:   []metav1.OwnerReference{*metav1.NewControllerRef(ir, irGVK)},
 	}}
 	r, c := newReconciler(t, ir, pg)
 	r.APIReader = c
@@ -521,7 +522,7 @@ func TestReconcile_GangCleanupRetainsStatusUntilPodGroupAbsent(t *testing.T) {
 		Namespace:       ir.Namespace,
 		UID:             "target-pg",
 		Finalizers:      []string{"example.com/hold"},
-		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ir, IRGVK())},
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ir, irGVK)},
 	}}
 	r, c := newReconciler(t, ir, targetPG)
 	r.APIReader = c
@@ -1302,9 +1303,22 @@ func TestReconcile_SteadySinglePodSkipsAuthoritativePodGroupInventory(t *testing
 	}
 }
 
-func TestRequiresAuthoritativePodGroupInventoryLifecycleTriggers(t *testing.T) {
+// TestObservePodGroupInventory_ReadsTheApiserverOnlyWhenAGroupMayBeDeleted:
+// a pass over a steady single-pod plan or a planned gang reads the owner's
+// PodGroups from the cache; a pass with a scale-down pending or a row a
+// teardown owns reads them from the apiserver, and so does a pass whose
+// replica says gang scheduling is unavailable, since only the apiserver can
+// say whether the PodGroup API is back.
+func TestObservePodGroupInventory_ReadsTheApiserverOnlyWhenAGroupMayBeDeleted(t *testing.T) {
 	ir := baselineIR("llama-engine", "podgroup-inventory-triggers", 1)
-	r, _ := newReconciler(t, ir)
+	_, c := newReconciler(t, ir)
+	deps := workloadtypes.Deps{Client: c, APIReader: c}
+	apiGoneIR := ir.DeepCopy()
+	apiGoneIR.Status.Conditions = []metav1.Condition{{
+		Type:   string(workloadtypes.ConditionGangSchedulingUnavailable),
+		Status: metav1.ConditionTrue,
+		Reason: string(workloadtypes.ReasonPodGroupCRDNotInstalled),
+	}}
 	singlePlan := workloadtypes.ComponentPlan{
 		Component: workloadtypes.ComponentEngine,
 		Instances: []workloadtypes.InstancePlan{{
@@ -1338,23 +1352,26 @@ func TestRequiresAuthoritativePodGroupInventoryLifecycleTriggers(t *testing.T) {
 	}}
 
 	for _, tc := range []struct {
-		name  string
-		input workloadtypes.ReconcileInput
-		plan  workloadtypes.ComponentPlan
-		want  bool
+		name       string
+		ir         *v1beta1.InferenceReplica
+		input      workloadtypes.ReconcileInput
+		plan       workloadtypes.ComponentPlan
+		wantCached bool
 	}{
-		{name: "steady single pod", input: steadyInput, plan: singlePlan, want: false},
-		{name: "planned gang", input: steadyInput, plan: multiPlan, want: true},
-		{name: "scale down", input: scaleDownInput, plan: singlePlan, want: true},
-		{name: "terminal finalization", input: terminalInput, plan: singlePlan, want: true},
+		{name: "steady single pod", ir: ir, input: steadyInput, plan: singlePlan, wantCached: true},
+		{name: "planned gang", ir: ir, input: steadyInput, plan: multiPlan, wantCached: true},
+		{name: "scale down", ir: ir, input: scaleDownInput, plan: singlePlan, wantCached: false},
+		{name: "terminal finalization", ir: ir, input: terminalInput, plan: singlePlan, wantCached: false},
+		{name: "the last pass found the PodGroup API gone", ir: apiGoneIR, input: steadyInput, plan: multiPlan, wantCached: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := r.requiresAuthoritativePodGroupInventory(context.Background(), tc.input, tc.plan)
+			pass := &replicaPass{ir: tc.ir, deps: deps, input: tc.input, plan: tc.plan}
+			inventory, err := pass.observePodGroupInventory(context.Background())
 			if err != nil {
-				t.Fatalf("requiresAuthoritativePodGroupInventory: %v", err)
+				t.Fatalf("observePodGroupInventory: %v", err)
 			}
-			if got != tc.want {
-				t.Fatalf("requiresAuthoritativePodGroupInventory = %v, want %v", got, tc.want)
+			if inventory.Cached() != tc.wantCached {
+				t.Fatalf("observePodGroupInventory read the cache = %v, want %v", inventory.Cached(), tc.wantCached)
 			}
 		})
 	}
@@ -2525,6 +2542,17 @@ func gangMigSimulate(t *testing.T, c client.Client, ns, isvcName string) {
 			node := gangMigOtherNode
 			if p.Labels[query.LabelRunner] == "leader" && p.Labels[query.LabelInstanceIdx] == "0" {
 				node = gangMigSourceNode
+			}
+			// A kubelet implies a Node: a pod bound to a Node the cluster
+			// does not hold is read as gone and removed. The simulated
+			// nodes stopped reporting long ago, so a force-delete policy
+			// reads a pod left Terminating on either as unreachable; nothing else in
+			// these stories reads node health.
+			nodeObj := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: node}, Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{{
+				Type: corev1.NodeReady, Status: corev1.ConditionUnknown, LastTransitionTime: metav1.NewTime(time.Unix(0, 0)),
+			}}}}
+			if err := c.Create(ctx, nodeObj); err != nil && !apierrors.IsAlreadyExists(err) {
+				t.Fatalf("sim create node: %v", err)
 			}
 			p.Spec.NodeName = node
 			if err := c.Update(ctx, p); err != nil {
@@ -4371,6 +4399,361 @@ func TestReconcile_TargetRevisionIsRecordedBeforeItsFirstPod(t *testing.T) {
 	}
 }
 
+// TestReconcile_TargetRecordCountsNoInstanceOnTheNewRevision states what the
+// early record carries beside the new target: the Instances counted as
+// updated are the ones that run the new revision, none when the first pod of
+// it is created, never the count the previous publication made against the
+// previous target. A reader between the record and the publication at the
+// end of the pass then sees a roll that has not started, not one whose every
+// Instance is already on the new revision and Ready.
+func TestReconcile_TargetRecordCountsNoInstanceOnTheNewRevision(t *testing.T) {
+	ir, objs, prior, next := rollingSingletonIR(t)
+	// The previous publication, made while prior was the target: the one
+	// Instance counted as updated and Ready.
+	ir.Status.Replicas = 1
+	ir.Status.ReadyReplicas = 1
+	ir.Status.ServingReplicas = 1
+	ir.Status.AvailableReplicas = 1
+	ir.Status.UpdatedReplicas = 1
+	ir.Status.UpdatedReadyReplicas = 1
+	r, base := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.Recorder = record.NewFakeRecorder(64)
+	var atCreate []v1beta1.InferenceReplicaStatus
+	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if _, isPod := obj.(*corev1.Pod); isPod {
+				stored := &v1beta1.InferenceReplica{}
+				if err := base.Get(ctx, client.ObjectKeyFromObject(ir), stored); err != nil {
+					return err
+				}
+				atCreate = append(atCreate, stored.Status)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+
+	for pass := 0; pass < 6 && len(atCreate) == 0; pass++ {
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if len(atCreate) == 0 {
+		t.Fatalf("the spec edit never opened a roll: no pod was created")
+	}
+	got := atCreate[0]
+	if got.UpdateRevision != next {
+		t.Fatalf("the first pod of %s was created while status.updateRevision named %q (prior %s)", next, got.UpdateRevision, prior)
+	}
+	if got.UpdatedReplicas != 0 || got.UpdatedReadyReplicas != 0 {
+		t.Fatalf("status at the first pod of %s: updatedReplicas=%d updatedReadyReplicas=%d, want 0 and 0: no Instance runs the new revision yet, and the record must not keep the count made against %s",
+			next, got.UpdatedReplicas, got.UpdatedReadyReplicas, prior)
+	}
+	if got.Replicas != 1 || got.ReadyReplicas != 1 {
+		t.Fatalf("status at the first pod of %s: replicas=%d readyReplicas=%d, want 1 and 1: the counts that do not depend on the target keep the previous publication's values",
+			next, got.Replicas, got.ReadyReplicas)
+	}
+}
+
+// rollingPairIRWithWorkers is two Instances of one leader and `workers`
+// workers, Ready on the revision of their stored spec, with the spec then
+// edited to a second image so the next pass opens a SurgeThenDrain roll onto
+// a new revision. Returns the IR, the objects backing its Instances, and the
+// prior and next revision names.
+func rollingPairIRWithWorkers(t *testing.T, workers int32) (*v1beta1.InferenceReplica, []client.Object, string, string) {
+	t.Helper()
+	ir := baselineIR("llama-engine", "prod", 2)
+	if workers > 0 {
+		ir.Spec.Runners = append(ir.Spec.Runners, v1beta1.Runner{
+			Name: v1beta1.RunnerNameWorker, Size: workers,
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "worker", Image: "sgl:1.0"}}}},
+		})
+	}
+	ir.Spec.Lifecycle = &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{
+		Type:          v1beta1.UpdateStrategySurgeThenDrain,
+		RollingUpdate: &v1beta1.RollingUpdate{MaxSurge: ptr.To(intstr.FromInt32(1))},
+	}}
+	prior := targetRevisionNameFor(t, ir)
+	ir.Spec.Runners[0].Template.Spec.Containers[0].Image = "sgl:2.0"
+	ir.Generation = 2
+	next := targetRevisionNameFor(t, ir)
+	if next == prior {
+		t.Fatalf("the image edit must cut a new revision; both resolve to %s", prior)
+	}
+	width := 1 + workers
+	ir.Status.CurrentRevision = prior
+	ir.Status.UpdateRevision = prior
+	ir.Status.ObservedGeneration = 1
+	ir.Status.Replicas, ir.Status.ReadyReplicas, ir.Status.ServingReplicas, ir.Status.AvailableReplicas = 2, 2, 2, 2
+	ir.Status.UpdatedReplicas, ir.Status.UpdatedReadyReplicas = 2, 2
+	var objs []client.Object
+	for idx := int32(0); idx < 2; idx++ {
+		ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, v1beta1.OMENativeInstanceStatus{
+			Index: idx, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady,
+			RunningRevision: prior, PodCount: width, ServingPodCount: width, AvailablePodCount: width,
+		})
+		leader := podForIR(ir, idx, "default", 0, true, true)
+		leader.Labels[query.LabelRevisionHash] = query.RevisionFromName(prior).Hash()
+		objs = append(objs, leader, sliceForIRPod(ir, leader, true))
+		for o := int32(0); o < workers; o++ {
+			w := podForIR(ir, idx, string(v1beta1.RunnerNameWorker), o, true, true)
+			w.Labels[query.LabelRevisionHash] = query.RevisionFromName(prior).Hash()
+			objs = append(objs, w)
+		}
+	}
+	return ir, objs, prior, next
+}
+
+// rollingPairIR is the single-pod pair: two Instances of one pod each.
+func rollingPairIR(t *testing.T) (*v1beta1.InferenceReplica, []client.Object, string, string) {
+	t.Helper()
+	return rollingPairIRWithWorkers(t, 0)
+}
+
+// rollingGangPairIR is the gang pair: two Instances of a leader and three workers.
+func rollingGangPairIR(t *testing.T) (*v1beta1.InferenceReplica, []client.Object, string, string) {
+	t.Helper()
+	return rollingPairIRWithWorkers(t, 3)
+}
+
+// recordedStatusWrite is one status write of a pass as the apiserver saw it.
+type recordedStatusWrite struct {
+	update, current       string
+	updated, updatedReady int32
+	replicas, ready       int32
+}
+
+// recordStatusWrites is the interceptor that keeps every status write of the
+// replica as the apiserver saw it.
+func recordStatusWrites(writes *[]recordedStatusWrite) func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
+	return func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+		if w, ok := obj.(*v1beta1.InferenceReplica); ok && sub == "status" {
+			*writes = append(*writes, recordedStatusWrite{
+				update: w.Status.UpdateRevision, current: w.Status.CurrentRevision,
+				updated: w.Status.UpdatedReplicas, updatedReady: w.Status.UpdatedReadyReplicas,
+				replicas: w.Status.Replicas, ready: w.Status.ReadyReplicas,
+			})
+		}
+		return c.SubResource(sub).Update(ctx, obj, opts...)
+	}
+}
+
+// firstWriteNaming returns the first recorded write whose target is the named
+// revision, nil when none is.
+func firstWriteNaming(writes []recordedStatusWrite, revision string) *recordedStatusWrite {
+	for i := range writes {
+		if writes[i].update == revision {
+			return &writes[i]
+		}
+	}
+	return nil
+}
+
+// openRollOnto reconciles until a pod of the next revision exists.
+func openRollOnto(t *testing.T, r *Reconciler, c client.Client, ir *v1beta1.InferenceReplica, next string) {
+	t.Helper()
+	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	for pass := 0; pass < 8 && podsOnRevision(t, c, ir.Namespace, next) == 0; pass++ {
+		if _, err := r.Reconcile(context.Background(), request); err != nil {
+			t.Fatalf("roll pass %d: %v", pass, err)
+		}
+	}
+	if podsOnRevision(t, c, ir.Namespace, next) == 0 {
+		t.Fatalf("the spec edit never opened a roll: no pod of %s exists", next)
+	}
+}
+
+// revertPass checks the open roll records next as its target, sets the stored
+// spec's image back to the prior template and runs one pass, keeping that
+// pass's status writes alone in writes.
+func revertPass(t *testing.T, r *Reconciler, c client.Client, ir *v1beta1.InferenceReplica, next string, writes *[]recordedStatusWrite) {
+	t.Helper()
+	rolling := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), rolling); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	if rolling.Status.UpdateRevision != next {
+		t.Fatalf("an open roll must record its target: updateRevision=%q want %s", rolling.Status.UpdateRevision, next)
+	}
+	rolling.Spec.Runners[0].Template.Spec.Containers[0].Image = "sgl:1.0"
+	rolling.Generation = 3
+	if err := c.Update(context.Background(), rolling); err != nil {
+		t.Fatalf("roll the spec back: %v", err)
+	}
+	r.Expectations = workloadtypes.NewExpectations()
+	*writes = nil
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}); err != nil {
+		t.Fatalf("rollback pass: %v", err)
+	}
+}
+
+// untouchedInstanceOn returns the lowest Instance that rests on the named
+// revision with no update operation.
+func untouchedInstanceOn(t *testing.T, c client.Client, ir *v1beta1.InferenceReplica, revision string) int32 {
+	t.Helper()
+	stored := &v1beta1.InferenceReplica{}
+	if _, err := irstatus.GetDecoded(context.Background(), c, client.ObjectKeyFromObject(ir), stored); err != nil {
+		t.Fatalf("decode the stored replica: %v", err)
+	}
+	best := int32(-1)
+	for _, row := range stored.Status.InstanceStatuses {
+		if row.RunningRevision == revision && row.Operation == nil && (best < 0 || row.Index < best) {
+			best = row.Index
+		}
+	}
+	if best < 0 {
+		t.Fatalf("no untouched Instance on %s", revision)
+	}
+	return best
+}
+
+// oneWorkerOf returns one worker pod of the Instance.
+func oneWorkerOf(t *testing.T, c client.Client, ir *v1beta1.InferenceReplica, idx int32) *corev1.Pod {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := c.List(context.Background(), pods, client.InNamespace(ir.Namespace)); err != nil {
+		t.Fatalf("list pods: %v", err)
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.Labels[query.LabelInstanceIdx] == strconv.Itoa(int(idx)) && p.Labels[query.LabelRunner] == string(v1beta1.RunnerNameWorker) {
+			return p
+		}
+	}
+	t.Fatalf("Instance %d has no worker pod", idx)
+	return nil
+}
+
+// deleteOneWorkerOf removes one worker pod of the Instance.
+func deleteOneWorkerOf(t *testing.T, c client.Client, ir *v1beta1.InferenceReplica, idx int32) {
+	t.Helper()
+	p := oneWorkerOf(t, c, ir, idx)
+	if err := c.Delete(context.Background(), p); err != nil {
+		t.Fatalf("delete worker %s: %v", p.Name, err)
+	}
+}
+
+// bindOneWorkerToAMissingNode binds one worker pod of the Instance to a Node
+// the cluster does not hold; the pod keeps reporting ContainersReady.
+func bindOneWorkerToAMissingNode(t *testing.T, c client.Client, ir *v1beta1.InferenceReplica, idx int32) {
+	t.Helper()
+	p := oneWorkerOf(t, c, ir, idx)
+	p.Spec.NodeName = "node-the-cluster-lost"
+	if err := c.Update(context.Background(), p); err != nil {
+		t.Fatalf("bind worker %s: %v", p.Name, err)
+	}
+}
+
+// pauseEveryMove sets the stored replica paused in the mode that holds every
+// lifecycle move, so a pass changes no pod.
+func pauseEveryMove(t *testing.T, c client.Client, ir *v1beta1.InferenceReplica) {
+	t.Helper()
+	stored := &v1beta1.InferenceReplica{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(ir), stored); err != nil {
+		t.Fatalf("get IR: %v", err)
+	}
+	stored.Spec.Paused = true
+	stored.Spec.PauseMode = v1beta1.PauseModeFreeze
+	if err := c.Update(context.Background(), stored); err != nil {
+		t.Fatalf("pause the replica: %v", err)
+	}
+}
+
+// TestReconcile_RevertRecordCountsTheInstancesOnTheRevertedToRevision reads
+// the target record of a revert: two Instances Ready on the prior revision,
+// one of them mid-surge onto the next, and the spec back on the prior
+// template. The record names the prior revision as the target again and
+// counts exactly the untouched Instance as on it and as Ready: it rests on
+// the prior revision with its one live pod Ready. The Instance mid-surge is
+// not counted, since its update still names the revision the spec left.
+func TestReconcile_RevertRecordCountsTheInstancesOnTheRevertedToRevision(t *testing.T) {
+	ir, objs, prior, next := rollingPairIR(t)
+	r, base := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.Recorder = record.NewFakeRecorder(64)
+	var writes []recordedStatusWrite
+	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: recordStatusWrites(&writes)})
+	openRollOnto(t, r, base, ir, next)
+	revertPass(t, r, base, ir, next, &writes)
+	rec := firstWriteNaming(writes, prior)
+	if rec == nil {
+		t.Fatalf("no status write of the rollback pass named %s as the target", prior)
+	}
+	last := writes[len(writes)-1]
+	if rec.updated != 1 || rec.updatedReady != 1 {
+		t.Fatalf("the target record of the revert to %s wrote updatedReplicas=%d updatedReadyReplicas=%d, want 1 and 1: the untouched Instance rests on %s with its only pod Ready and the Instance mid-surge is not counted (the last write of the pass, the publication, says updated=%d updatedReady=%d)",
+			prior, rec.updated, rec.updatedReady, prior, last.updated, last.updatedReady)
+	}
+	if rec.replicas != 2 || rec.ready != 2 {
+		t.Fatalf("the target record of the revert wrote replicas=%d readyReplicas=%d, want 2 and 2: the counts that do not depend on the target keep the previous publication's values", rec.replicas, rec.ready)
+	}
+}
+
+// TestReconcile_RevertRecordCountsAGangShortOfAWorkerAsNotReady reads the
+// target record of a revert on gangs: two Instances of a leader and three
+// workers Ready on the prior revision, one of them mid-surge onto the next,
+// one worker of the untouched gang gone, and the replica paused in the mode
+// that holds every move, so the pass changes no pod. At the write that names
+// the prior revision again the untouched gang counts as updated and not as
+// Ready: three of the four pods its plan asks for are Ready, the publication's
+// own threshold, and the publication of the same pass writes the same counts.
+func TestReconcile_RevertRecordCountsAGangShortOfAWorkerAsNotReady(t *testing.T) {
+	ir, objs, prior, next := rollingGangPairIR(t)
+	r, base := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.Recorder = record.NewFakeRecorder(256)
+	var writes []recordedStatusWrite
+	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: recordStatusWrites(&writes)})
+	openRollOnto(t, r, base, ir, next)
+	idx := untouchedInstanceOn(t, base, ir, prior)
+	deleteOneWorkerOf(t, base, ir, idx)
+	pauseEveryMove(t, base, ir)
+	revertPass(t, r, base, ir, next, &writes)
+	rec := firstWriteNaming(writes, prior)
+	if rec == nil {
+		t.Fatalf("no status write of the rollback pass named %s as the target", prior)
+	}
+	last := writes[len(writes)-1]
+	if rec.updated != 1 || rec.updatedReady != 0 {
+		t.Fatalf("the target record of the revert to %s wrote updatedReplicas=%d updatedReadyReplicas=%d, want 1 and 0: gang %d rests on %s with three of the four pods its plan asks for Ready (the publication of the same pass says updated=%d updatedReady=%d)",
+			prior, rec.updated, rec.updatedReady, idx, prior, last.updated, last.updatedReady)
+	}
+	if last.updated != rec.updated || last.updatedReady != rec.updatedReady {
+		t.Fatalf("no pod moved in the pass, yet the record wrote updated=%d updatedReady=%d and the publication updated=%d updatedReady=%d",
+			rec.updated, rec.updatedReady, last.updated, last.updatedReady)
+	}
+}
+
+// TestReconcile_RevertRecordCountsAGangWithAPodOnAMissingNodeAsNotReady reads
+// the target record of a revert on gangs when one worker of the untouched
+// gang sits on a Node the cluster no longer holds and still reports
+// ContainersReady: that pod is gone for the engine and for the publication,
+// so the gang is short and counts as updated and not as Ready in the record
+// too, and the publication of the same pass writes the same counts.
+func TestReconcile_RevertRecordCountsAGangWithAPodOnAMissingNodeAsNotReady(t *testing.T) {
+	ir, objs, prior, next := rollingGangPairIR(t)
+	r, base := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.Recorder = record.NewFakeRecorder(256)
+	var writes []recordedStatusWrite
+	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: recordStatusWrites(&writes)})
+	openRollOnto(t, r, base, ir, next)
+	idx := untouchedInstanceOn(t, base, ir, prior)
+	bindOneWorkerToAMissingNode(t, base, ir, idx)
+	pauseEveryMove(t, base, ir)
+	revertPass(t, r, base, ir, next, &writes)
+	rec := firstWriteNaming(writes, prior)
+	if rec == nil {
+		t.Fatalf("no status write of the rollback pass named %s as the target", prior)
+	}
+	last := writes[len(writes)-1]
+	if rec.updated != 1 || rec.updatedReady != 0 {
+		t.Fatalf("the target record of the revert to %s wrote updatedReplicas=%d updatedReadyReplicas=%d, want 1 and 0: a worker of gang %d sits on a Node the cluster lost, so the gang is short of the four pods its plan asks for (the publication of the same pass says updated=%d updatedReady=%d)",
+			prior, rec.updated, rec.updatedReady, idx, last.updated, last.updatedReady)
+	}
+	if last.updated != rec.updated || last.updatedReady != rec.updatedReady {
+		t.Fatalf("no pod moved in the pass, yet the record wrote updated=%d updatedReady=%d and the publication updated=%d updatedReady=%d",
+			rec.updated, rec.updatedReady, last.updated, last.updatedReady)
+	}
+}
+
 // TestReconcile_TargetRevisionFollowsTheSpecBackToThePriorRevision is the
 // exit of the early record: it is not a ratchet. Once a roll onto a new
 // revision is open, a spec that returns to the prior template moves the
@@ -4814,11 +5197,12 @@ func conditionOf(ir *v1beta1.InferenceReplica, condType string) metav1.Condition
 // attempt, so the rollup withdraws the current revision while the attempt
 // is still pinned to the pushed one. The next pass retargets the attempt
 // onto the starting revision: every Instance is then on that revision and
-// none is pinned elsewhere, so the current revision comes back, while the
-// attempt is still open and the Instance is not Ready. The stuck-pod grace
+// none is pinned elsewhere, but the attempt is still open on a pod that is
+// not Ready, so the current revision stays cleared. The stuck-pod grace
 // then elapses, the Instance escalates Failed with a Held block on the
-// starting revision, and the current revision stays: Ready reads False on
-// the Failed Instance and RolloutStalled reports no rollout in flight.
+// starting revision, and the current revision comes back, since nothing
+// drives the Instance now: Ready reads False on the Failed Instance and
+// RolloutStalled reports no rollout in flight.
 func TestReconcile_RollbackOverABrokenInstanceRestoresTheCurrentRevisionOnceEveryInstanceIsBackOnIt(t *testing.T) {
 	const replicas = 4
 	ir := baselineIR("llama-engine", "prod", replicas)
@@ -4911,13 +5295,12 @@ func TestReconcile_RollbackOverABrokenInstanceRestoresTheCurrentRevisionOnceEver
 
 	// The attempt retargets onto the starting revision and its pod is
 	// patched back: every Instance is on the starting revision and none is
-	// pinned elsewhere, so the current revision comes back although the
-	// attempt is still open on a pod that is not Ready.
+	// pinned elsewhere, but the attempt is still open on a pod that is not
+	// Ready, so the current revision stays cleared.
 	var back *v1beta1.InferenceReplica
 	for i := 0; i < 6; i++ {
 		back = mustPass("retarget")
-		if row := rowAt(back, 0); pinnedTo(row, prior) && row.PodCount == 1 && podsOnRevision(t, c, ir.Namespace, next) == 0 &&
-			back.Status.CurrentRevision == prior {
+		if row := rowAt(back, 0); pinnedTo(row, prior) && row.PodCount == 1 && podsOnRevision(t, c, ir.Namespace, next) == 0 {
 			break
 		}
 	}
@@ -4926,16 +5309,17 @@ func TestReconcile_RollbackOverABrokenInstanceRestoresTheCurrentRevisionOnceEver
 		t.Fatalf("the retarget must pin Instance 0 to %s and rebuild its pod off %s while the attempt stays open, got row=%+v pods on %s=%d",
 			prior, next, row, next, podsOnRevision(t, c, ir.Namespace, next))
 	}
-	if back.Status.CurrentRevision != prior {
-		t.Fatalf("currentRevision=%q want %s: every Instance is back on the withdrawn revision and none is pinned to another, so the withdrawal is over",
-			back.Status.CurrentRevision, prior)
+	if back.Status.CurrentRevision != "" {
+		t.Fatalf("currentRevision=%q want it cleared: the retargeted attempt is still open on a pod that is not Ready, so the roll back has not landed",
+			back.Status.CurrentRevision)
 	}
 
 	// The break is kept: the pod the attempt rebuilt is dark too. No kubelet
 	// stands behind the fake client, so the test stands the rebuilt pod up
 	// as a broken one reports itself, older than the grace. The attempt is
 	// disposed, the Instance escalates Failed with a Held block on the
-	// starting revision, and the restored current revision stays.
+	// starting revision, and the current revision comes back: the spent
+	// attempt is no pass's and every pod carries the starting revision.
 	stoodUp := 0
 	for _, pod := range listPods(t, c, ir.Namespace) {
 		if pod.Labels[query.LabelInstanceIdx] != intToLabel(0) {
@@ -5461,5 +5845,162 @@ func TestRunPassSteps_StopsAtTheFirstStepThatEndsThePass(t *testing.T) {
 	}, step("never", true, nil))
 	if err != nil || done || order != "first,ends" || pass.result != requeue {
 		t.Fatalf("a step ended the pass with a result: done=%v err=%v ran=%q result=%+v, want done=false err=nil ran=first,ends result=%+v", done, err, order, pass.result, requeue)
+	}
+}
+
+// A replica projected again after a deletion rolls back onto a revision
+// its predecessor minted: the service owns that revision, so the new
+// replica reads it as its own history, renders its stored template and
+// gives it the service as an owner when it lacked one. A revision only
+// another service's replica controls is still refused.
+func TestRollbackRevision_ARevisionTheServiceOwnsAfterItsReplicaWasReplacedIsAccepted(t *testing.T) {
+	service := &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "team-a", UID: "service-uid"}}
+	controlledBy := func(replicaUID string) metav1.OwnerReference {
+		return *metav1.NewControllerRef(&v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: "svc-engine", UID: types.UID(replicaUID)}}, irGVK)
+	}
+	serviceOwner := metav1.OwnerReference{APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceService", Name: service.Name, UID: service.UID}
+	replica := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc-engine", Namespace: "team-a", UID: "replica-2",
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(service, isvcGVK)},
+		},
+		Spec: v1beta1.InferenceReplicaSpec{
+			Component: v1beta1.EngineComponent,
+			ParentRef: &v1beta1.ParentReference{Name: service.Name},
+			Pacing:    &v1beta1.InferenceReplicaPacing{RollbackToRevision: ptr.To("svc-engine-aaaa")},
+		},
+	}
+	predecessors := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Name: "svc-engine-aaaa", Namespace: "team-a",
+		OwnerReferences: []metav1.OwnerReference{controlledBy("replica-1"), serviceOwner},
+	}}
+	own := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Name: "svc-engine-bbbb", Namespace: "team-a",
+		OwnerReferences: []metav1.OwnerReference{controlledBy("replica-2")},
+	}}
+	otherService := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{
+		Name: "svc-engine-cccc", Namespace: "team-a",
+		OwnerReferences: []metav1.OwnerReference{controlledBy("replica-9"), {APIVersion: serviceOwner.APIVersion, Kind: serviceOwner.Kind, Name: "svc", UID: "other-service-uid"}},
+	}}
+	recorder := record.NewFakeRecorder(4)
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(predecessors, own, otherService).Build()
+	r := &Reconciler{Client: c, APIReader: c, Recorder: recorder}
+
+	cr, err := r.rollbackRevision(context.Background(), replica, replica)
+	if err != nil || cr == nil || cr.Name != predecessors.Name {
+		t.Fatalf("the predecessor's revision the service owns: cr=%v err=%v, want %s", cr, err, predecessors.Name)
+	}
+
+	replica.Spec.Pacing.RollbackToRevision = ptr.To(own.Name)
+	cr, err = r.rollbackRevision(context.Background(), replica, replica)
+	if err != nil || cr == nil || cr.Name != own.Name {
+		t.Fatalf("the replica's own revision: cr=%v err=%v, want %s", cr, err, own.Name)
+	}
+	stored := &appsv1.ControllerRevision{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(own), stored); err != nil {
+		t.Fatal(err)
+	}
+	owned := false
+	for _, ref := range stored.OwnerReferences {
+		owned = owned || (ref.UID == service.UID && ref.Controller == nil)
+	}
+	if !owned {
+		t.Fatalf("a revision of the replica's own minted without the service must gain it as an owner, got %+v", stored.OwnerReferences)
+	}
+
+	replica.Spec.Pacing.RollbackToRevision = ptr.To(otherService.Name)
+	cr, err = r.rollbackRevision(context.Background(), replica, replica)
+	if err != nil || cr != nil {
+		t.Fatalf("another service's revision: cr=%v err=%v, want nil", cr, err)
+	}
+	select {
+	case ev := <-recorder.Events:
+		if !strings.Contains(ev, EventReasonRollbackRevisionForeign) {
+			t.Fatalf("another service's revision must be refused with %s, got %q", EventReasonRollbackRevisionForeign, ev)
+		}
+	default:
+		t.Fatal("another service's revision must raise a warning")
+	}
+}
+
+// The history of a projected replica belongs to its service; a standalone
+// replica's belongs to itself.
+func TestRevisionScopeFollowsTheForm(t *testing.T) {
+	projected := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{
+		Name: "svc-engine", Namespace: "team-a", UID: "replica-uid",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceService",
+			Name: "svc", UID: "isvc-uid", Controller: ptr.To(true),
+		}},
+	}}
+	scope := revisionScope(projected)
+	if scope == nil || scope.UID != "isvc-uid" || scope.Name != "svc" || scope.Controller != nil {
+		t.Fatalf("projected scope = %+v, want the service as a plain owner", scope)
+	}
+	standalone := &v1beta1.InferenceReplica{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "team-a", UID: "replica-uid"}}
+	if got := revisionScope(standalone); got != nil {
+		t.Fatalf("standalone scope = %+v, want none", got)
+	}
+}
+
+// TestGangWidth_ScaleUpUnderACanaryStepSizesTheGroupForTheStablePods: a
+// Component whose gang is widened from one worker to three under a canary
+// step that holds its settled Instance on the narrow revision, and that is
+// scaled up at the step. The new Instance is built on the step's stable
+// side as a gang of two, and the PodGroup written for it is sized for those
+// two pods, so the gang scheduler admits the gang it is given; the PodGroup
+// pass and the Create pass read the new Instance's revision from one
+// function.
+func TestGangWidth_ScaleUpUnderACanaryStepSizesTheGroupForTheStablePods(t *testing.T) {
+	ir := gangWidthIR("llama-engine", "prod", 1, v1beta1.UpdateStrategyRecreatePod)
+	narrow := targetRevisionNameFor(t, ir)
+	objs := seedReadyGang(ir, narrow, 1)
+	r, c := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.GangSchedulingAvailable = true
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+
+	// The pass at the narrow width records the narrow revision beside the
+	// settled gang, as a cluster that has run it for a while has.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("pass at the narrow width: %v", err)
+	}
+
+	// The gang is widened to three workers under a canary step that keeps
+	// Instance 0 on the narrow revision, and a second Instance is added.
+	edited := &v1beta1.InferenceReplica{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(ir), edited); err != nil {
+		t.Fatal(err)
+	}
+	setGangWidth(edited, 3)
+	edited.Spec.Replicas = ptr.To[int32](2)
+	edited.Spec.Pacing = &v1beta1.InferenceReplicaPacing{Partition: ptr.To[int32](1)}
+	if err := c.Update(ctx, edited); err != nil {
+		t.Fatalf("widen the gang and scale up under the step: %v", err)
+	}
+	for pass := 0; pass < 3; pass++ {
+		r.Expectations = workloadtypes.NewExpectations() // the watch has confirmed the last pass's writes
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("pass %d after the edit: %v", pass, err)
+		}
+		if pods := gangPodsByInstance(t, c, ir.Namespace); len(pods["1"]) > 0 {
+			break
+		}
+	}
+
+	pods := gangPodsByInstance(t, c, ir.Namespace)
+	if got := pods["1"]; len(got) != 2 || countOnRevision(got, narrow) != 2 {
+		t.Fatalf("the new Instance must be built on the step's stable side as a gang of two on %s, got %v", narrow, pods)
+	}
+	group := &schedulingv1alpha1.PodGroup{}
+	name := query.PodGroupName(ir.Spec.ParentRef.Name, workloadtypes.ComponentEngine, 1)
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ir.Namespace, Name: name}, group); err != nil {
+		t.Fatalf("the new gang's PodGroup %s: %v", name, err)
+	}
+	if group.Spec.MinMember != int32(len(pods["1"])) {
+		t.Fatalf("the new gang's PodGroup asks for %d members while the Create pass rendered %d pods; the gang scheduler never admits such a gang", group.Spec.MinMember, len(pods["1"]))
+	}
+	if group.Spec.MinMember != 2 {
+		t.Fatalf("the new gang's PodGroup must be sized for a gang of two on the stable side, got MinMember %d", group.Spec.MinMember)
 	}
 }

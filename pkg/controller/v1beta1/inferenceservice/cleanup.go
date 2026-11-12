@@ -91,8 +91,8 @@ func (r *InferenceServiceReconciler) cleanupRemovedComponents(ctx context.Contex
 	for _, c := range v1beta1.RoleTypes() {
 		active[c] = specs.View(c) != nil
 	}
-	_, err := r.deleteOrphanedResourcesByOwnerRef(ctx, isvc, active)
-	return err
+	r.deleteOrphanedResourcesByOwnerRef(ctx, isvc, active)
+	return nil
 }
 
 // cleanupReplacedBackends removes, for each Component in modes, the objects
@@ -118,6 +118,42 @@ func (r *InferenceServiceReconciler) cleanupReplacedBackends(
 		return nil
 	}
 	var errs []error
+	errs = append(errs, r.removeReplacedWorkloads(ctx, isvc, modes)...)
+	errs = append(errs, r.removeReplacedRevisionServices(ctx, isvc, modes)...)
+	errs = append(errs, r.clearReplacedOMENativeStatus(ctx, isvc, modes)...)
+	return errors.Join(errs...)
+}
+
+// replacedBackend names the Component and mode of a workload object that
+// belongs to a backend other than the one the Component's mode selects.
+// False for an object of a Component modes does not declare, of a mode that
+// projects no workload, or of the selected backend itself.
+func replacedBackend(
+	obj client.Object,
+	modes map[v1beta1.ComponentType]constants.DeploymentModeType,
+	gvk schema.GroupVersionKind,
+) (v1beta1.ComponentType, constants.DeploymentModeType, bool) {
+	component := componentOf(obj)
+	mode, declared := modes[component]
+	if !declared {
+		return "", "", false
+	}
+	selected, known := backendWorkloadKind(mode)
+	if !known || selected == gvk {
+		return "", "", false
+	}
+	return component, mode, true
+}
+
+// removeReplacedWorkloads deletes, kind by kind, the workload objects of the
+// backends the Components left. A kind that cannot be listed is reported and
+// the other kinds are still swept.
+func (r *InferenceServiceReconciler) removeReplacedWorkloads(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	modes map[v1beta1.ComponentType]constants.DeploymentModeType,
+) []error {
+	var errs []error
 	selector := labels.Set{constants.InferenceServicePodLabelKey: isvc.Name}.AsSelector()
 	for _, workload := range r.backendWorkloadLists() {
 		owned, err := r.listOwnedObjects(ctx, workload.list, isvc, selector)
@@ -126,35 +162,53 @@ func (r *InferenceServiceReconciler) cleanupReplacedBackends(
 			continue
 		}
 		for _, obj := range owned {
-			component := v1beta1.ComponentType(obj.GetLabels()[constants.OMEComponentLabel])
-			mode, declared := modes[component]
-			if !declared {
+			component, mode, replaced := replacedBackend(obj, modes, workload.gvk)
+			if !replaced {
 				continue
 			}
-			selected, known := backendWorkloadKind(mode)
-			if !known || selected == workload.gvk {
-				continue
-			}
-			deleted, err := r.deleteReplacedBackendObject(ctx, isvc, obj, workload.gvk, component, mode)
-			if err != nil {
+			if err := r.removeReplacedWorkload(ctx, isvc, obj, workload.gvk, component, mode); err != nil {
 				errs = append(errs, err)
-				continue
-			}
-			if !deleted {
-				continue
-			}
-			if condType, ok := componentReadyCondition(component); ok {
-				isvc.Status.SetCondition(condType, &knapis.Condition{
-					Type:    condType,
-					Status:  v1.ConditionFalse,
-					Reason:  deploymentModeChangedReason,
-					Message: fmt.Sprintf("%s now runs as %s; its %s %s is being removed", component, mode, workload.gvk.Kind, obj.GetName()),
-				})
 			}
 		}
 	}
+	return errs
+}
 
-	// Per-revision routing and headless Services exist only under OMENative.
+// removeReplacedWorkload deletes one workload object of a replaced backend
+// and, once the deletion is requested, reads the Component's ready condition
+// False until the selected backend reports readiness itself.
+func (r *InferenceServiceReconciler) removeReplacedWorkload(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	obj client.Object,
+	gvk schema.GroupVersionKind,
+	component v1beta1.ComponentType,
+	mode constants.DeploymentModeType,
+) error {
+	deleted, err := r.deleteReplacedBackendObject(ctx, isvc, obj, gvk, component, mode)
+	if err != nil || !deleted {
+		return err
+	}
+	if condType, ok := componentReadyCondition(component); ok {
+		isvc.Status.SetCondition(condType, &knapis.Condition{
+			Type:    condType,
+			Status:  v1.ConditionFalse,
+			Reason:  deploymentModeChangedReason,
+			Message: fmt.Sprintf("%s now runs as %s; its %s %s is being removed", component, mode, gvk.Kind, obj.GetName()),
+		})
+	}
+	return nil
+}
+
+// removeReplacedRevisionServices deletes the per-revision routing and
+// headless Services, which exist only under OMENative, of every Component
+// that runs under another backend.
+func (r *InferenceServiceReconciler) removeReplacedRevisionServices(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	modes map[v1beta1.ComponentType]constants.DeploymentModeType,
+) []error {
+	var errs []error
 	revisionSelector := labels.Set{
 		constants.InferenceServicePodLabelKey: isvc.Name,
 		query.LabelManagedBy:                  query.ManagedByOMENative,
@@ -164,7 +218,7 @@ func (r *InferenceServiceReconciler) cleanupReplacedBackends(
 		errs = append(errs, err)
 	}
 	for _, svc := range services {
-		component := v1beta1.ComponentType(svc.GetLabels()[constants.OMEComponentLabel])
+		component := componentOf(svc)
 		mode, declared := modes[component]
 		if !declared || mode == constants.OMENative {
 			continue
@@ -173,7 +227,17 @@ func (r *InferenceServiceReconciler) cleanupReplacedBackends(
 			errs = append(errs, err)
 		}
 	}
+	return errs
+}
 
+// clearReplacedOMENativeStatus drops the OMENative status footprint of every
+// Component that runs under another backend.
+func (r *InferenceServiceReconciler) clearReplacedOMENativeStatus(
+	ctx context.Context,
+	isvc *v1beta1.InferenceService,
+	modes map[v1beta1.ComponentType]constants.DeploymentModeType,
+) []error {
+	var errs []error
 	for component, mode := range modes {
 		if mode == constants.OMENative {
 			continue
@@ -182,7 +246,14 @@ func (r *InferenceServiceReconciler) cleanupReplacedBackends(
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...)
+	return errs
+}
+
+// RemoveReplacedBackends is the pass's removal of the objects of a backend
+// a Component left (cleanupReplacedBackends); the replay driver enters it
+// with the modes the pass resolved, as the controller does.
+func (r *InferenceServiceReconciler) RemoveReplacedBackends(ctx context.Context, isvc *v1beta1.InferenceService, modes map[v1beta1.ComponentType]constants.DeploymentModeType) error {
+	return r.cleanupReplacedBackends(ctx, isvc, modes)
 }
 
 // cleanupVirtualDeployment removes every object a backend projected for an
@@ -190,10 +261,7 @@ func (r *InferenceServiceReconciler) cleanupReplacedBackends(
 // runs no workload, and clears the OMENative status footprint that the
 // removed objects wrote.
 func (r *InferenceServiceReconciler) cleanupVirtualDeployment(ctx context.Context, isvc *v1beta1.InferenceService) error {
-	deleted, err := r.deleteOrphanedResourcesByOwnerRef(ctx, isvc, nil)
-	if err != nil {
-		return err
-	}
+	deleted := r.deleteOrphanedResourcesByOwnerRef(ctx, isvc, nil)
 	for _, obj := range deleted {
 		r.recordDeploymentModeChange(isvc, fmt.Sprintf("the InferenceService is a VirtualDeployment and runs no workload; deleted %s %s of its %s",
 			obj.gvk.Kind, obj.name, obj.component))
@@ -258,7 +326,9 @@ func (r *InferenceServiceReconciler) recordDeploymentModeChange(isvc *v1beta1.In
 // clearOMENativeStatus drops the OMENative projection from the status of a
 // Component that runs under another backend. The status flush keeps the
 // live lifecycle block over the pass's copy, so the live object is cleared
-// first and the in-memory copy after it.
+// first and the in-memory copy after it. The canary record goes with the
+// rest: a record left behind would be adopted as a run in flight the day
+// a canary group names the Component again.
 func (r *InferenceServiceReconciler) clearOMENativeStatus(ctx context.Context, isvc *v1beta1.InferenceService, component v1beta1.ComponentType) error {
 	if !hasOMENativeStatus(isvc.Status.Components[component]) {
 		return nil
@@ -281,12 +351,27 @@ func (r *InferenceServiceReconciler) clearOMENativeStatus(ctx context.Context, i
 			return nil
 		}
 		live.Status.Components[component] = withoutOMENativeStatus(cs)
+		dropCanaryAliasWithoutRecord(&live.Status)
 		return r.Status().Update(ctx, live)
 	}); err != nil {
 		return fmt.Errorf("clear the OMENative status of %s on %s: %w", component, key, err)
 	}
 	isvc.Status.Components[component] = withoutOMENativeStatus(isvc.Status.Components[component])
+	dropCanaryAliasWithoutRecord(&isvc.Status)
 	return nil
+}
+
+// dropCanaryAliasWithoutRecord clears status.canary once no Component
+// carries a canary record: the alias is a copy of a unit's record, and a
+// copy that outlives every record would be read as a run of whichever unit
+// asks first.
+func dropCanaryAliasWithoutRecord(status *v1beta1.InferenceServiceStatus) {
+	for _, cs := range status.Components {
+		if cs.Canary != nil {
+			return
+		}
+	}
+	status.Canary = nil
 }
 
 // hasOMENativeStatus reports whether a Component status carries fields only
@@ -297,7 +382,8 @@ func hasOMENativeStatus(cs v1beta1.ComponentStatusSpec) bool {
 		cs.LatestReadyRevision != "" ||
 		cs.LatestRolledoutRevision != "" ||
 		cs.PreviousRolledoutRevision != "" ||
-		len(cs.Traffic) > 0
+		len(cs.Traffic) > 0 ||
+		cs.Canary != nil
 }
 
 // withoutOMENativeStatus returns the Component status with the fields only
@@ -309,6 +395,7 @@ func withoutOMENativeStatus(cs v1beta1.ComponentStatusSpec) v1beta1.ComponentSta
 	cs.LatestRolledoutRevision = ""
 	cs.PreviousRolledoutRevision = ""
 	cs.Traffic = nil
+	cs.Canary = nil
 	return cs
 }
 
@@ -318,7 +405,7 @@ func (r *InferenceServiceReconciler) deleteOrphanedResourcesByOwnerRef(
 	ctx context.Context,
 	isvc *v1beta1.InferenceService,
 	activeComponents map[v1beta1.ComponentType]bool,
-) ([]removedObject, error) {
+) []removedObject {
 	log := log.FromContext(ctx)
 
 	selector := labels.Set{
@@ -335,7 +422,7 @@ func (r *InferenceServiceReconciler) deleteOrphanedResourcesByOwnerRef(
 		}
 		deleted = append(deleted, objs...)
 	}
-	return deleted, nil
+	return deleted
 }
 
 // cleanupResourcesOfType deletes the owned objects of one kind whose
@@ -360,23 +447,10 @@ func (r *InferenceServiceReconciler) cleanupResourcesOfType(
 
 	var deleted []removedObject
 	for _, obj := range owned {
-		component := v1beta1.ComponentType(obj.GetLabels()[constants.OMEComponentLabel])
-		if component == "" || activeComponents[component] {
+		component := componentOf(obj)
+		if r.sweepKeeps(isvc, gvk, obj, component, activeComponents) {
 			continue
 		}
-		// An object whose deletion is already requested is left to finish.
-		if obj.GetDeletionTimestamp() != nil {
-			continue
-		}
-
-		// Special handling for external service
-		if component == "external-service" && gvk.Kind == "Service" {
-			// External service should exist if ingress is disabled and there are active components
-			if r.shouldKeepExternalService(isvc, activeComponents) {
-				continue
-			}
-		}
-
 		log.Info("Deleting orphaned resource", "gvk", gvk, "name", obj.GetName(), "component", component)
 		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 			return deleted, fmt.Errorf("delete %s/%s: %w", gvk.Kind, obj.GetName(), err)
@@ -384,6 +458,32 @@ func (r *InferenceServiceReconciler) cleanupResourcesOfType(
 		deleted = append(deleted, removedObject{gvk: gvk, name: obj.GetName(), component: component})
 	}
 	return deleted, nil
+}
+
+// sweepKeeps reports whether the owner-reference sweep leaves an object
+// alone: an object of an active Component or of no Component, one whose
+// deletion is already requested, and the external Service while it is still
+// the way into the service.
+func (r *InferenceServiceReconciler) sweepKeeps(
+	isvc *v1beta1.InferenceService,
+	gvk schema.GroupVersionKind,
+	obj client.Object,
+	component v1beta1.ComponentType,
+	activeComponents map[v1beta1.ComponentType]bool,
+) bool {
+	if component == "" || activeComponents[component] {
+		return true
+	}
+	if obj.GetDeletionTimestamp() != nil {
+		return true
+	}
+	return gvk == serviceGVK && component == constants.ExternalServiceComponent && r.shouldKeepExternalService(isvc, activeComponents)
+}
+
+// componentOf is the Component an object's label names; empty for an object
+// of no Component.
+func componentOf(obj metav1.Object) v1beta1.ComponentType {
+	return v1beta1.ComponentType(obj.GetLabels()[constants.OMEComponentLabel])
 }
 
 // listOwnedObjects fills list with the objects of its kind in the namespace
@@ -435,11 +535,12 @@ func (r *InferenceServiceReconciler) isOwnedBy(obj metav1.Object, isvc *v1beta1.
 	return false
 }
 
-// shouldKeepExternalService determines if the external service should be kept based on active components
+// shouldKeepExternalService reports whether the external Service stays: the
+// service's annotation disables ingress creation, so the Service is the way
+// in, and a Component that serves traffic, the router or the engine, is
+// active.
 func (r *InferenceServiceReconciler) shouldKeepExternalService(isvc *v1beta1.InferenceService, activeComponents map[v1beta1.ComponentType]bool) bool {
-	// Check if ingress creation is disabled via annotation
-	if val, ok := isvc.Annotations["ome.io/ingress-disable-creation"]; ok && val == "true" {
-		// Keep external service if any component that can serve traffic is active
+	if val, ok := isvc.Annotations[constants.IngressDisableCreation]; ok && val == "true" {
 		return activeComponents[v1beta1.RouterComponent] ||
 			activeComponents[v1beta1.EngineComponent]
 	}

@@ -67,54 +67,57 @@ func Track(mark, observed resource.Quantity, bandPercent int32) resource.Quantit
 // exists for, and dropping the entry would lose the only record that the pair
 // was ever larger.
 func TrackAll(previous []Mark, observed []Capacity, bandPercent int32) []Mark {
-	type key struct{ resource, flavor string }
-	marks := make(map[key]resource.Quantity, len(previous))
-	order := make([]key, 0, len(previous)+len(observed))
-	for _, p := range previous {
-		k := key{p.ResourceName, p.ResourceFlavor}
-		if _, dup := marks[k]; dup {
-			continue
-		}
-		marks[k] = p.HighWaterMark
-		order = append(order, k)
-	}
-
-	out := make([]Mark, 0, len(order)+len(observed))
-	seen := map[key]struct{}{}
+	carried := carriedMarks(previous)
+	out := make([]Mark, 0, len(carried.order)+len(observed))
+	seen := map[resourceFlavor]struct{}{}
 	for _, c := range observed {
-		k := key{c.ResourceName, c.ResourceFlavor}
 		out = append(out, Mark{
 			ResourceName:   c.ResourceName,
 			ResourceFlavor: c.ResourceFlavor,
 			Allocatable:    c.Allocatable,
-			HighWaterMark:  Track(marks[k], installed(c), bandPercent),
+			HighWaterMark:  Track(carried.marks[c.key()], installed(c), bandPercent),
 		})
-		seen[k] = struct{}{}
+		seen[c.key()] = struct{}{}
 	}
-	for _, k := range order {
-		if _, ok := seen[k]; ok {
+	out = append(out, carried.unobserved(seen)...)
+	sort.Slice(out, func(i, j int) bool { return out[i].key().less(out[j].key()) })
+	return out
+}
+
+// marksByPair is the marks carried in status, one per (resource, flavor)
+// pair, in the order status listed them.
+type marksByPair struct {
+	marks map[resourceFlavor]resource.Quantity
+	order []resourceFlavor
+}
+
+// carriedMarks reads the marks in status; a pair listed twice keeps its
+// first mark.
+func carriedMarks(previous []Mark) marksByPair {
+	carried := marksByPair{marks: make(map[resourceFlavor]resource.Quantity, len(previous))}
+	for _, p := range previous {
+		if _, dup := carried.marks[p.key()]; dup {
 			continue
 		}
-		// Carried forward so a pair that stops reporting still shows what it
-		// once held — but dropped once the mark itself has reached zero, or a
-		// renamed flavor would leave a dead entry in status for the life of the
-		// cluster.
-		mark := marks[k]
-		if mark.IsZero() {
+		carried.marks[p.key()] = p.HighWaterMark
+		carried.order = append(carried.order, p.key())
+	}
+	return carried
+}
+
+// unobserved carries forward the marks of the pairs the observation did not
+// report, so a pair that stops reporting still shows what it once held. A
+// mark that has reached zero is dropped, or a renamed flavor would leave a
+// dead entry in status for the life of the cluster.
+func (m marksByPair) unobserved(seen map[resourceFlavor]struct{}) []Mark {
+	var out []Mark
+	for _, k := range m.order {
+		mark := m.marks[k]
+		if _, ok := seen[k]; ok || mark.IsZero() {
 			continue
 		}
-		out = append(out, Mark{
-			ResourceName:   k.resource,
-			ResourceFlavor: k.flavor,
-			HighWaterMark:  mark,
-		})
+		out = append(out, Mark{ResourceName: k.resource, ResourceFlavor: k.flavor, HighWaterMark: mark})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].ResourceName != out[j].ResourceName {
-			return out[i].ResourceName < out[j].ResourceName
-		}
-		return out[i].ResourceFlavor < out[j].ResourceFlavor
-	})
 	return out
 }
 
@@ -133,4 +136,9 @@ type Mark struct {
 	ResourceFlavor string
 	Allocatable    resource.Quantity
 	HighWaterMark  resource.Quantity
+}
+
+// key is the pair the mark is kept for.
+func (m Mark) key() resourceFlavor {
+	return resourceFlavor{resource: m.ResourceName, flavor: m.ResourceFlavor}
 }

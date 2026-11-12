@@ -610,38 +610,94 @@ func TestDispatch_RebuiltCanaryPodsRestTheSplitOnStableUntilOneServes(t *testing
 	expectTargets(t, w.isvc, v1beta1.EngineComponent, half)
 }
 
-// The canary's share stands while the canary path serves, and while the
-// stable side has nothing to carry it; it falls back to nothing only when
-// the path is broken and the stable side serves.
+// The unit has one canary path and one stable side, and a side with no
+// serving pod carries no weight. Everything while the canary path serves on
+// every member and some member's stable side has no pod, whatever this
+// member's own pods say. Otherwise the member's own pods decide: the step
+// weight while both of its sides serve, nothing while the path is broken and
+// its stable side serves, everything while its stable side has no pod and
+// its target serves; with no pod view, no stable side, or nothing serving
+// on either side the step weight stands.
 func TestServedWeight(t *testing.T) {
+	stableGone, canaryBroken, neither := sidesServing{canaryPath: true, stableGone: true}, sidesServing{}, sidesServing{stableGone: true}
 	for _, tc := range []struct {
-		name       string
-		weight     int32
-		pathServes bool
-		stable     string
-		pods       map[string]int32
-		want       int32
+		name   string
+		weight int32
+		unit   sidesServing
+		stable string
+		pods   map[string]int32
+		want   int32
 	}{
-		{"the canary path serves", 30, true, "old", map[string]int32{"new": 1, "old": 1}, 30},
-		{"the path is broken and the stable side serves", 30, false, "old", map[string]int32{"old": 1}, 0},
-		{"the path is broken and the stable side has no pod", 30, false, "old", map[string]int32{"old": 0}, 30},
-		{"the path is broken with no pod view", 30, false, "old", nil, 30},
-		{"the path is broken with no stable side", 30, false, "", map[string]int32{"new": 0}, 30},
-		{"a substitute for the stable revision carries the share", 30, false, "mid", map[string]int32{"mid": 2}, 0},
-		{"the final step falls back like any other", 100, false, "old", map[string]int32{"old": 1}, 0},
-		{"a step with no share has none to move", 0, false, "old", map[string]int32{"old": 1}, 0},
-		// The rule is symmetric: a stable side with no serving pod carries no
-		// weight while the canary path serves, and the target carries the rest.
-		{"the path serves and the stable side has no pod", 30, true, "old", map[string]int32{"new": 1, "old": 0}, 100},
-		{"the path serves and the stable side is absent from the pod view", 30, true, "old", map[string]int32{"new": 1}, 100},
-		{"the path serves with no pod view", 30, true, "old", nil, 30},
-		{"the path serves with no stable side", 30, true, "", map[string]int32{"new": 1}, 30},
-		{"a substitute serving in the stable's place keeps the step's share", 30, true, "mid", map[string]int32{"new": 1, "mid": 1}, 30},
-		{"a step with no share hands it all to the only serving side", 0, true, "old", map[string]int32{"new": 1, "old": 0}, 100},
+		{"both sides serve on every member", 30, bothSidesServe, "old", map[string]int32{"new": 1, "old": 1}, 30},
+		{"the canary path is broken on some member and this member's stable side serves", 30, canaryBroken, "old", map[string]int32{"old": 1}, 0},
+		{"the canary path is broken and nothing serves on either side", 30, canaryBroken, "old", map[string]int32{"old": 0}, 30},
+		{"the canary path is broken with no pod view", 30, canaryBroken, "old", nil, 30},
+		{"the canary path is broken with no stable side", 30, canaryBroken, "", map[string]int32{"new": 0}, 30},
+		{"a substitute for the stable revision carries the share", 30, canaryBroken, "mid", map[string]int32{"mid": 2}, 0},
+		{"the final step falls back like any other", 100, canaryBroken, "old", map[string]int32{"old": 1}, 0},
+		{"a step with no share has none to move", 0, canaryBroken, "old", map[string]int32{"old": 1}, 0},
+		// The unit has one stable side: some member's stable side with no
+		// serving pod moves every member's share onto its target while the
+		// canary path serves on every member.
+		{"the stable side is gone on some member and this member's own stable serves", 30, stableGone, "old", map[string]int32{"new": 1, "old": 1}, 100},
+		{"the stable side is gone on this member", 30, stableGone, "old", map[string]int32{"new": 1, "old": 0}, 100},
+		{"the stable side is gone on some member and this member has no pod view", 30, stableGone, "old", nil, 100},
+		{"the stable side is gone on some member and this member has no stable side", 30, stableGone, "", map[string]int32{"new": 1}, 100},
+		{"a step with no share hands it all to the canary revision while the stable side is gone", 0, stableGone, "old", map[string]int32{"new": 1, "old": 1}, 100},
+		{"the path serves with no pod view", 30, bothSidesServe, "old", nil, 30},
+		{"the path serves with no stable side", 30, bothSidesServe, "", map[string]int32{"new": 1}, 30},
+		{"a substitute serving in the stable's place keeps the step's share", 30, bothSidesServe, "mid", map[string]int32{"new": 1, "mid": 1}, 30},
+		// With the canary path broken on some member, a member whose own
+		// stable side has no pod still hands everything to its serving
+		// target: the only pods this member has are its target's.
+		{"the path is broken elsewhere, this member's stable side has no pod and its target serves", 30, neither, "old", map[string]int32{"new": 1, "old": 0}, 100},
+		{"a step with no share hands it all to the serving target while the path is broken elsewhere", 0, neither, "old", map[string]int32{"new": 7}, 100},
+		{"the path is broken elsewhere and this member's stable side serves", 30, neither, "old", map[string]int32{"new": 1, "old": 1}, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := servedWeight(tc.weight, tc.pathServes, tc.stable, tc.pods); got != tc.want {
+			if got := servedWeight(tc.weight, tc.unit, "new", tc.stable, tc.pods); got != tc.want {
 				t.Fatalf("servedWeight = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// The stable side serves while every member has a serving pod on its stable
+// revision, or on the revision serving in its place: the primary's loss and
+// a secondary's loss each break it; a member with no pod view, a member
+// whose target is its stable revision and a member with no stable revision
+// cannot.
+func TestStableSideServes(t *testing.T) {
+	decoder := bumpedDecoder()
+	unit := func(engine map[string]int32, decoder MemberRevisions, decoderPods map[string]int32) ReconcileInputs {
+		in := ReconcileInputs{CanaryRevisionHash: "new", StableRevisionHash: "old", PerRevisionPods: engine}
+		if decoder.CanaryRevisionHash != "" {
+			in.Secondaries = map[v1beta1.ComponentType]MemberRevisions{v1beta1.DecoderComponent: decoder}
+			in.GroupReadyPerRevisionPods = map[v1beta1.ComponentType]map[string]int32{v1beta1.DecoderComponent: decoderPods}
+		}
+		return in
+	}
+	for _, tc := range []struct {
+		name string
+		in   ReconcileInputs
+		want bool
+	}{
+		{"the primary's stable serves", unit(map[string]int32{"new": 1, "old": 1}, MemberRevisions{}, nil), true},
+		{"the primary's stable has no pod", unit(map[string]int32{"new": 1}, MemberRevisions{}, nil), false},
+		{"a revision serving in the primary's stable's place", unit(map[string]int32{"new": 1, "mid": 1}, MemberRevisions{}, nil), true},
+		{"the primary has no pod view", unit(nil, MemberRevisions{}, nil), true},
+		{"a primary whose target is its stable revision", ReconcileInputs{CanaryRevisionHash: "same", StableRevisionHash: "same", PerRevisionPods: map[string]int32{"other": 1}}, true},
+		{"every member serves", unit(map[string]int32{"new": 1, "old": 1}, decoder, map[string]int32{"decnew": 1, "decold": 1}), true},
+		{"a secondary's stable has no pod", unit(map[string]int32{"new": 1, "old": 1}, decoder, map[string]int32{"decnew": 1}), false},
+		{"a secondary has no pod view", unit(map[string]int32{"new": 1, "old": 1}, decoder, nil), true},
+		{"a secondary whose target is its stable revision, with no pod", unit(map[string]int32{"new": 1, "old": 1},
+			MemberRevisions{CanaryRevisionHash: "decold", StableRevisionHash: "decold"}, map[string]int32{"decold": 0}), true},
+		{"a secondary with no stable revision", unit(map[string]int32{"new": 1, "old": 1},
+			MemberRevisions{CanaryRevisionHash: "decnew"}, map[string]int32{"decnew": 1}), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stableSideServes(tc.in); got != tc.want {
+				t.Fatalf("stableSideServes = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -687,30 +743,36 @@ func TestCanaryPathServes(t *testing.T) {
 
 // A bumped member whose unit's canary path is broken writes its share on
 // its stable revision while that revision serves, and keeps it on its target
-// while the stable revision has no pod; an unbumped member and a member with
-// no stable revision serve their target alone either way.
+// while the stable revision has no pod; a member of a unit whose stable side
+// is gone on some member hands its share to its target; an unbumped member
+// and a member with no stable revision serve their target alone either way.
 func TestMemberWeightsFallBack(t *testing.T) {
 	bumped := bumpedDecoder()
-	if w := memberWeights(bumped, 30, false, map[string]int32{"decold": 1}); len(w) != 2 ||
+	canaryBroken, stableGone := sidesServing{}, sidesServing{canaryPath: true, stableGone: true}
+	if w := memberWeights(bumped, 30, canaryBroken, map[string]int32{"decold": 1}); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 0 || w[1].RevisionHash != "decold" || w[1].Percent != 100 {
 		t.Fatalf("a broken path rests the member's share on its serving stable revision, got %+v", w)
 	}
-	if w := memberWeights(bumped, 30, false, map[string]int32{"decold": 0}); len(w) != 2 ||
+	if w := memberWeights(bumped, 30, canaryBroken, map[string]int32{"decold": 0}); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 30 || w[1].RevisionHash != "decold" || w[1].Percent != 70 {
 		t.Fatalf("a stable revision with no pod leaves the member's share standing, got %+v", w)
 	}
-	if w := memberWeights(bumped, 30, false, map[string]int32{"decmid": 1}); len(w) != 2 ||
+	if w := memberWeights(bumped, 30, canaryBroken, map[string]int32{"decmid": 1}); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 0 || w[1].RevisionHash != "decmid" || w[1].Percent != 100 {
 		t.Fatalf("a broken path rests the member's share on the revision serving in its stable's place, got %+v", w)
 	}
-	if w := memberWeights(bumped, 30, true, map[string]int32{"decnew": 1, "decold": 0}); len(w) != 2 ||
+	if w := memberWeights(bumped, 30, stableGone, map[string]int32{"decnew": 1, "decold": 0}); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 100 || w[1].RevisionHash != "decold" || w[1].Percent != 0 {
 		t.Fatalf("a stable revision with no pod while the target serves hands the member's share to the target, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "d", StableRevisionHash: "d"}, 30, false, map[string]int32{"d": 1}); len(w) != 1 || w[0].Percent != 100 {
+	if w := memberWeights(bumped, 30, stableGone, map[string]int32{"decnew": 1, "decold": 1}); len(w) != 2 ||
+		w[0].RevisionHash != "decnew" || w[0].Percent != 100 || w[1].RevisionHash != "decold" || w[1].Percent != 0 {
+		t.Fatalf("a unit whose stable side is gone on another member hands this member's share to its target too, got %+v", w)
+	}
+	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "d", StableRevisionHash: "d"}, 30, canaryBroken, map[string]int32{"d": 1}); len(w) != 1 || w[0].Percent != 100 {
 		t.Fatalf("an unbumped member serves its revision alone, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "decnew"}, 30, false, map[string]int32{"decold": 1}); len(w) != 1 || w[0].RevisionHash != "decnew" || w[0].Percent != 100 {
+	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "decnew"}, 30, canaryBroken, map[string]int32{"decold": 1}); len(w) != 1 || w[0].RevisionHash != "decnew" || w[0].Percent != 100 {
 		t.Fatalf("a member with no stable revision has nothing to fall back to, got %+v", w)
 	}
 }

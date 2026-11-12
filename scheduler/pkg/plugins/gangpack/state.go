@@ -46,14 +46,21 @@ func markSoleFit(state framework.CycleState) {
 // none was recorded (the pod is not an assigned gang member — Filter then
 // imposes no domain constraint).
 func readAssignment(state framework.CycleState) *assignmentState {
+	return cycleStateValue[assignmentState](state, assignmentStateKey)
+}
+
+// cycleStateValue reads the value this plugin stored under key for the cycle,
+// or nil when there is no state, nothing under the key, or a value of another
+// type.
+func cycleStateValue[T any](state framework.CycleState, key framework.StateKey) *T {
 	if state == nil {
 		return nil
 	}
-	v, err := state.Read(assignmentStateKey)
+	v, err := state.Read(key)
 	if err != nil {
 		return nil
 	}
-	s, ok := v.(*assignmentState)
+	s, ok := any(v).(*T)
 	if !ok {
 		return nil
 	}

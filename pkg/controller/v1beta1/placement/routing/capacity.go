@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -124,7 +123,7 @@ func (st *capacityState) estimate(config CapacityConfig) (float64, bool) {
 // expire removes evidence that has reached its producer timestamp's maximum
 // age and recomputes the estimate from the remaining fresh samples. Samples can
 // arrive with out-of-order timestamps, so every entry is checked.
-func (st *capacityState) expire(config CapacityConfig, now time.Time) bool {
+func (st *capacityState) expire(config CapacityConfig, now time.Time) {
 	kept := st.window[:0]
 	for _, sample := range st.window {
 		if sample.expires.After(now) {
@@ -132,7 +131,7 @@ func (st *capacityState) expire(config CapacityConfig, now time.Time) bool {
 		}
 	}
 	if len(kept) == len(st.window) {
-		return false
+		return
 	}
 	st.window = kept
 	if v, ok := st.estimate(config); ok {
@@ -149,7 +148,6 @@ func (st *capacityState) expire(config CapacityConfig, now time.Time) bool {
 			)
 		}
 	}
-	return true
 }
 
 // CapacityPoller collects capacity using the prober's HTTP client and worker
@@ -157,7 +155,6 @@ func (st *capacityState) expire(config CapacityConfig, now time.Time) bool {
 // keeps fresh accepted samples through a failed poll; without them the cluster
 // falls back to its replica count.
 type CapacityPoller struct {
-	Log    logr.Logger
 	Client *http.Client
 	Clock  clock.Clock
 	// Executor owns the fixed worker and queue bounds shared by active routing
@@ -178,22 +175,11 @@ func NewCapacityPoller(
 	client *http.Client,
 	clk clock.Clock,
 	maxResponseBytes int64,
-	log logr.Logger,
 ) (*CapacityPoller, error) {
-	if executor == nil {
-		return nil, errors.New("capacity observer executor is nil")
-	}
-	if client == nil {
-		return nil, errors.New("capacity HTTP client is nil")
-	}
-	if clk == nil {
-		return nil, errors.New("capacity clock is nil")
-	}
-	if maxResponseBytes <= 0 {
-		return nil, fmt.Errorf("capacity maximum response bytes must be positive, got %d", maxResponseBytes)
+	if err := checkObserverInputs("capacity", executor, client, clk, maxResponseBytes); err != nil {
+		return nil, err
 	}
 	return &CapacityPoller{
-		Log:              log,
 		Client:           client,
 		Clock:            clk,
 		Executor:         executor,
@@ -402,17 +388,9 @@ func normalizeCapacityTargets(req CapacityReconcileRequest) ([]Target, error) {
 	return targets, nil
 }
 
-// pollOne fetches and validates one cluster's capacity report. It returns the
-// accepted count, or nil plus the reason the plan stands instead.
-func (c *CapacityPoller) pollOne(
-	ctx context.Context,
-	tgt Target,
-	config CapacityConfig,
-) (*float64, string) {
-	reported, _, reason := c.pollOneDetailed(ctx, tgt, config)
-	return reported, reason
-}
-
+// pollOneDetailed fetches and validates one cluster's capacity report. It
+// returns the accepted count with the time it was observed, or nil plus the
+// reason the plan stands instead.
 func (c *CapacityPoller) pollOneDetailed(
 	ctx context.Context,
 	tgt Target,
@@ -722,6 +700,8 @@ func (c *CapacityPoller) recordCurrent(
 	return true
 }
 
+// recordLocked folds one poll's outcome into the cluster's state under the
+// poller's lock and reports whether the applied value or the reason moved.
 func (c *CapacityPoller) recordLocked(
 	st *capacityState,
 	config CapacityConfig,
@@ -732,50 +712,81 @@ func (c *CapacityPoller) recordLocked(
 ) bool {
 	previousReported := st.reported
 	previousReason := st.reason
+	reported, observedAt, reason = st.admitReport(config, reported, observedAt, reason, now)
 	var applied *float64
-	if reported != nil {
-		if observedAt.IsZero() {
-			observedAt = now
-		}
-		expires := observedAt.Add(config.MaxAge)
-		if !expires.After(now) {
-			reported = nil
-			reason = capacityStaleReason(config.MaxAge)
-		} else {
-			st.expire(config, now)
-		}
-	}
-	if reported != nil {
-		if v, ok := st.observe(*reported, observedAt.Add(config.MaxAge), config); ok {
-			applied = &v
-			reason = ""
-		} else if reason == "" {
-			reason = fmt.Sprintf("capacity report awaiting quorum (%d/%d accepted samples)",
-				len(st.window), config.quorum())
-		}
-	} else if config.Mode == v1beta1.RoutingCapacityModeReported {
-		// A failed poll cannot refresh a report. Samples inside their original age
-		// bound still stand; once they expire the cluster keeps its replica count.
-		st.expire(config, now)
-		if v, ok := st.estimate(config); ok {
-			applied = &v
-		}
-		if reason == "" {
-			reason = "capacity report unavailable"
-		}
-	} else {
-		// A failed poll falls open and releases the ceiling, so the window must
-		// not survive it: retaining readings would keep constraining a cluster we
-		// can no longer observe, which is the opposite of failing open.
-		st.window = nil
-		if reason == "" {
-			reason = "capacity report unavailable"
-		}
+	switch {
+	case reported != nil:
+		applied, reason = st.acceptReport(*reported, observedAt.Add(config.MaxAge), config, reason)
+	case config.Mode == v1beta1.RoutingCapacityModeReported:
+		applied, reason = st.keepFreshEstimate(config, reason, now)
+	default:
+		applied, reason = st.releaseCeiling(reason)
 	}
 	changed := !sameReport(previousReported, applied) || previousReason != reason
 	st.reported = applied
 	st.reason = reason
 	return changed
+}
+
+// admitReport is the report as the record admits it: one without a timestamp
+// was observed now; one already past the maximum age is dropped as stale,
+// with that as the reason; a fresh one first drops the samples past their
+// age.
+func (st *capacityState) admitReport(config CapacityConfig, reported *float64, observedAt time.Time, reason string, now time.Time) (*float64, time.Time, string) {
+	if reported == nil {
+		return nil, observedAt, reason
+	}
+	if observedAt.IsZero() {
+		observedAt = now
+	}
+	if !observedAt.Add(config.MaxAge).After(now) {
+		return nil, observedAt, capacityStaleReason(config.MaxAge)
+	}
+	st.expire(config, now)
+	return reported, observedAt, reason
+}
+
+// acceptReport joins a fresh report to the window. At quorum the estimate is
+// applied and any reason the poll gave is cleared; below it the poll's
+// reason stands, else the state says the window awaits quorum.
+func (st *capacityState) acceptReport(v float64, expires time.Time, config CapacityConfig, reason string) (*float64, string) {
+	if applied, ok := st.observe(v, expires, config); ok {
+		return &applied, ""
+	}
+	if reason == "" {
+		reason = fmt.Sprintf("capacity report awaiting quorum (%d/%d accepted samples)", len(st.window), config.quorum())
+	}
+	return nil, reason
+}
+
+// keepFreshEstimate is a failed poll in Reported mode. A failed poll cannot
+// refresh a report: the samples inside their age bound still stand and their
+// estimate stays applied; once they expire the cluster keeps its replica
+// count.
+func (st *capacityState) keepFreshEstimate(config CapacityConfig, reason string, now time.Time) (*float64, string) {
+	st.expire(config, now)
+	var applied *float64
+	if v, ok := st.estimate(config); ok {
+		applied = &v
+	}
+	return applied, reasonOrUnavailable(reason)
+}
+
+// releaseCeiling is a failed poll in Ceiling mode: the ceiling falls open and
+// the window goes with it, since a reading kept would constrain a cluster the
+// poller can no longer observe, the opposite of failing open.
+func (st *capacityState) releaseCeiling(reason string) (*float64, string) {
+	st.window = nil
+	return nil, reasonOrUnavailable(reason)
+}
+
+// reasonOrUnavailable is the poll's reason where it gave one, else the plain
+// statement that no report is available.
+func reasonOrUnavailable(reason string) string {
+	if reason == "" {
+		return "capacity report unavailable"
+	}
+	return reason
 }
 
 func (c *CapacityPoller) abandon(key capacityKey, generation uint64) {

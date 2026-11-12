@@ -2,6 +2,7 @@ package coordination
 
 import (
 	"fmt"
+	"strings"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -45,6 +46,24 @@ import (
 // attempt, so that wait would never end: it reads under the Held gate
 // instead, naming the held side and its record, and the roll is held as a
 // whole until a corrected revision or a release of the record on that side.
+// While the record is Held only the named side's served Instances settle
+// its batches for the other side: an ended attempt no retry will re-open
+// settles nothing, so the other side's start of the same batch reads Held
+// too instead of opening beside a held side.
+//
+// An attempt that ended without serving is settled for its peers only
+// while a retry record for the target stands on the member: the schedule
+// counted the failure and owns the next start, after a backoff, one
+// attempt at a time, or never while Held. With no record, as when the
+// placement grace ended a pod the scheduler could not place, the member's
+// next pass starts the attempt again at once; the Instance reads as still
+// to start, neither started nor settled, so a peer keeps waiting on its
+// batch and the member's own next start, that attempt, asks as the batch
+// it belongs to. An attempt the escalation stopped with its pods kept is
+// one such ended attempt: it is settled while its record stands and still
+// to start once a release or a prune removes it. A hold
+// that waits on such a member names the Instance and why it waits, as it
+// names an open attempt the scheduler or admission holds.
 //
 // A member's batches cover the Instances the roll may move: its count less
 // the Instances its partition holds on their revision, read with the same
@@ -85,11 +104,17 @@ type batchMember struct {
 	promoted  int32   // Instances running the target revision
 	offTarget int32   // Instances not running it: still to move, moving, ended, held, or awaiting retirement
 	open      int32   // Instances with an update attempt toward the target in flight
-	ended     int32   // Instances whose attempt toward the target ended without serving
+	ended     int32   // Instances whose attempt toward the target ended without serving, with a retry record standing
 	// heldReason is the member's retry record for the target while it is
 	// Held, in the record's own words: no fresh start opens on the member
 	// until a new revision or an operator release. Empty otherwise.
 	heldReason string
+	// waits names the member's Instances whose attempt waits on the
+	// cluster rather than on the roll, in index order: an open attempt
+	// with a waiting token and an ended attempt the member starts again
+	// at once, each with its reason. A hold that waits on the member
+	// carries them.
+	waits []string
 }
 
 // movable is the number of Instances the roll may move: the desired count
@@ -102,15 +127,29 @@ func (m batchMember) movable() int32 {
 }
 
 // started is the number of starts the member has opened, counted from zero:
-// every Instance on the target, moving to it, or whose move ended. The
-// starts of the current wake-up are among them, since each is stamped on
-// its row, where the gate reads, before the next start is consulted.
+// every Instance on the target, moving to it, or whose move ended with a
+// retry record standing. The starts of the current pass are among them,
+// since each is written on its row, where the gate reads, before the next
+// start is consulted. An ended attempt the member starts again at once
+// is not among them: its next start is that attempt.
 func (m batchMember) started() int32 { return m.promoted + m.open + m.ended }
 
 // settled is what a peer may stop waiting on: Instances serving on the
-// target, plus attempts that ended, which the escalation reports and the
-// retry ladder reopens as a fresh start that counts as open again.
+// target, plus attempts that ended with a retry record standing, which
+// the schedule starts again later as a fresh start that counts as open
+// again.
 func (m batchMember) settled() int32 { return m.promoted + m.ended }
+
+// settledForTheOtherSide is what the other pairing side may stop waiting
+// on when this member is the named first side: settled, unless the
+// member's retry record is Held, when no retry re-opens an ended attempt
+// and only the Instances serving the target count.
+func (m batchMember) settledForTheOtherSide() int32 {
+	if m.heldReason != "" {
+		return m.promoted
+	}
+	return m.settled()
+}
 
 // mark is the cumulative count batch b should have started: the planned
 // mark when the ratio rule planned the batches, else b steps, either way
@@ -195,10 +234,11 @@ func stepKindOf(ir *v1beta1.InferenceReplica) stepKind {
 // another kind is batched when it steps the way some pairing member does and
 // is left out otherwise. Under keepRatio a pairing member that patches
 // single pods in place steps on drains too, and the pairing members' marks
-// are planned to the group's tolerance. A read error is returned for the
-// caller to fail closed on.
+// are planned to the group's tolerance. A recorded group the spec no longer
+// declares is read by the pairing gates alone and is not batched. A read
+// error is returned for the caller to fail closed on.
 func (ctx GateContext) readBatchStep() (batchStep, error) {
-	if ctx.ShortCircuit || ctx.Group.Policy == v1beta1.CoordinationPolicySequential || !groupPairsEngineAndDecoder(ctx.Group) {
+	if ctx.ShortCircuit || ctx.Scope == RecordedGroupPairing || ctx.Group.Policy == v1beta1.CoordinationPolicySequential || !groupPairsEngineAndDecoder(ctx.Group) {
 		return batchStep{}, nil
 	}
 	rules := ctx.Defaults.PrefillDecode
@@ -328,10 +368,11 @@ func (ctx GateContext) batchTolerance() *int32 {
 // every member's batch b-1 but waived's must have settled first, and the
 // first short, peers before self, names the hold under the Ratio gate.
 // When a first side is named, a start of the other pairing side also
-// waits until the named side's batch b has settled. A wait on the named
-// side while its retry record is Held reads under the Held gate instead
-// (batchStep.wait). A released member is held by neither wait. An empty
-// gate is no hold.
+// waits until the named side's batch b has settled, by its served
+// Instances alone while that side's retry record is Held
+// (settledForTheOtherSide). A wait on the named side while its record is
+// Held reads under the Held gate instead (batchStep.wait). A released
+// member is held by neither wait. An empty gate is no hold.
 func (s batchStep) hold(waived v1beta1.ComponentType) (gate v1beta1.RolloutHoldGate, reason string) {
 	if s.released {
 		return "", ""
@@ -361,7 +402,7 @@ func (s batchStep) hold(waived v1beta1.ComponentType) (gate v1beta1.RolloutHoldG
 			if x.component != s.firstSide || x.component == waived {
 				continue
 			}
-			if mark := x.mark(b); x.settled() < mark {
+			if mark := x.mark(b); x.settledForTheOtherSide() < mark {
 				return s.wait(me, b, x, b, mark)
 			}
 		}
@@ -381,8 +422,8 @@ func (s batchStep) wait(me batchMember, b int32, x batchMember, on, mark int32) 
 	if on == b {
 		first = " first"
 	}
-	text := fmt.Sprintf("%s batch %d waits for %s batch %d to serve%s (%d of %d serving%s%s)",
-		me.component, b, x.component, on, first, x.promoted, mark, failedNote(x), movableNote(x))
+	text := fmt.Sprintf("%s batch %d waits for %s batch %d to serve%s (%d of %d serving%s%s%s)",
+		me.component, b, x.component, on, first, x.promoted, mark, failedNote(x), movableNote(x), waitsNote(x))
 	if x.heldReason != "" && x.component == s.firstSide && x.component != me.component {
 		return v1beta1.RolloutHoldGateHeld, fmt.Sprintf("%s, and the %s is held: %s; a corrected revision, or a release of the held revision on the %s, resumes both sides",
 			text, x.component, x.heldReason, x.component)
@@ -396,6 +437,15 @@ func failedNote(m batchMember) string {
 		return fmt.Sprintf(", %d failed", m.ended)
 	}
 	return ""
+}
+
+// waitsNote names, in a hold reason, the member's Instances whose attempt
+// waits on the cluster: "; decoder Instance 0 Unschedulable, starts again".
+func waitsNote(m batchMember) string {
+	if len(m.waits) == 0 {
+		return ""
+	}
+	return "; " + strings.Join(m.waits, ", ")
 }
 
 // movableNote names the Instances a member's partition lets the roll move
@@ -412,7 +462,9 @@ func movableNote(m batchMember) string {
 // the budget gates resolve it. An Instance the partition holds is counted
 // as held and nowhere else. A member with no roll target has nothing to
 // move and reads as settled. The member's Held retry record for the
-// target, when one stands, travels with it.
+// target, when one stands, travels with it. An ended attempt counts as
+// ended only while a retry record for the target stands; otherwise the
+// member starts it again at once and the Instance is still to start.
 func readBatchMember(ir *v1beta1.InferenceReplica, comp v1beta1.ComponentType, target string, pacing v1beta1.CoordinationPacing, kind stepKind) batchMember {
 	m := batchMember{component: comp, target: target}
 	if kind == stepSurge {
@@ -428,24 +480,77 @@ func readBatchMember(ir *v1beta1.InferenceReplica, comp v1beta1.ComponentType, t
 	m.heldReason = heldUpdateReason(ir, target)
 	rows := ir.Status.InstanceStatuses
 	held := partitionHeldRows(ir, rows, target)
+	classes := make([]batchRowClass, len(rows))
 	for i := range rows {
 		if held[rows[i].Index] {
 			m.held++
 			m.offTarget++
 			continue
 		}
-		switch classifyBatchRow(&rows[i], target) {
-		case batchRowPromoted:
+		classes[i] = classifyBatchRow(&rows[i], target)
+		if classes[i] == batchRowPromoted {
 			m.promoted++
 			continue
-		case batchRowOpen:
+		}
+		if classes[i] == batchRowOpen {
 			m.open++
-		case batchRowEnded:
-			m.ended++
 		}
 		m.offTarget++
 	}
+	recorded := retryRecordStands(ir, target)
+	for i := range rows {
+		if classes[i] == batchRowEnded && recorded {
+			m.ended++
+			continue
+		}
+		if note, ok := rowWaitNote(&rows[i], comp, classes[i]); ok {
+			m.waits = append(m.waits, note)
+		}
+	}
 	return m
+}
+
+// retryRecordStands reports whether a retry record for the target stands
+// on the member, in any of its states: the schedule counted a failure
+// there and owns the next start of an ended attempt. With no record the
+// member's next pass starts the attempt again at once.
+func retryRecordStands(ir *v1beta1.InferenceReplica, target string) bool {
+	if ir == nil {
+		return false
+	}
+	_, ok := irprojector.RetryBlockFor(&ir.Status, target)
+	return ok
+}
+
+// attemptStoppedWithItsPods reports a row whose attempt the escalation
+// stopped while its pod set still ran and kept on the row at the step it
+// records for that: an attempt that ended without serving, read like a
+// Failed row.
+// Whether it settles its batch is the retry record's to say, as for every
+// ended attempt; the operator's release of a Held record, or a promote on
+// the side that pruned it, leaves the row with none and still to start.
+func attemptStoppedWithItsPods(row *v1beta1.OMENativeInstanceStatus) bool {
+	op := row.Operation
+	return op != nil && op.Type == v1beta1.InstanceOperationUpdate && op.Step == workloadtypes.UpdateStepParked
+}
+
+// rowWaitNote names an Instance whose attempt waits on the cluster: an
+// open attempt with a waiting token ("decoder Instance 0 Unschedulable"),
+// or an ended attempt the member starts again at once, with the reason
+// its last failure recorded ("decoder Instance 0 Unschedulable, starts
+// again"). The token alone is named, never the cluster's message, which
+// moves from pass to pass and would churn the hold.
+func rowWaitNote(row *v1beta1.OMENativeInstanceStatus, comp v1beta1.ComponentType, class batchRowClass) (string, bool) {
+	switch {
+	case class == batchRowOpen && row.Operation != nil && row.Operation.Waiting != "":
+		return fmt.Sprintf("%s Instance %d %s", comp, row.Index, row.Operation.Waiting), true
+	case class == batchRowEnded:
+		if row.LastFailure != nil && row.LastFailure.Reason != "" {
+			return fmt.Sprintf("%s Instance %d %s, starts again", comp, row.Index, row.LastFailure.Reason), true
+		}
+		return fmt.Sprintf("%s Instance %d starts again", comp, row.Index), true
+	}
+	return "", false
 }
 
 // heldUpdateReason is the text of a replica's Held retry record for the
@@ -550,7 +655,7 @@ func classifyBatchRow(row *v1beta1.OMENativeInstanceStatus, target string) batch
 		return batchRowUntouched
 	}
 	phase := v1beta1convert.InstanceStatusToWorkload(*row).Phase
-	if phase == workloadtypes.InstancePhaseFailed || (update && op.Step == workloadtypes.UpdateStepParked) {
+	if phase == workloadtypes.InstancePhaseFailed || attemptStoppedWithItsPods(row) {
 		return batchRowEnded
 	}
 	return batchRowOpen

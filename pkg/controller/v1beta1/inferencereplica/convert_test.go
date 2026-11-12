@@ -38,7 +38,9 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 // buildRemoveInstance must Forget the SAME expectations bucket the
@@ -1593,6 +1595,11 @@ func TestRetryClosuresReReadThroughLiveReader(t *testing.T) {
 
 	t.Run("PromoteCurrentRevision", func(t *testing.T) {
 		r, live, ir := newFixture(t)
+		// The copy's rows call for the promotion; the write is decided live.
+		ir.Status.UpdateRevision = "llama-engine-abc123"
+		ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+			Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "llama-engine-abc123",
+		}}
 		if err := buildPromoteCurrentRevision(r.statusWriter(), r.APIReader, r.Client, ir)(ctx, "llama-engine-abc123"); err != nil {
 			t.Fatalf("promote: %v", err)
 		}
@@ -2042,10 +2049,11 @@ func TestWireCoordinationGates_GateFreshPeerReleasesWhenBalanced(t *testing.T) {
 			"1.25 in band), even though the parent projection lags at 3/4: "+reason)
 }
 
-// TestWireCoordinationGates_RatioRecoveryStartsFromAuthoritativeZero verifies
-// that authoritative positive desired state at zero serving admits one
-// recovery surge and serializes a second same-Component start in the wake-up.
-func TestWireCoordinationGates_RatioRecoveryStartsFromAuthoritativeZero(t *testing.T) {
+// TestWireCoordinationGates_RatioRecoveryFromZeroStartsUpToTheRecordedSurgeBudget
+// verifies that authoritative positive desired state at zero serving admits
+// recovery surges up to the surge budget the run recorded for the group, and
+// that the budget is the only thing that paces them in one pass.
+func TestWireCoordinationGates_RatioRecoveryFromZeroStartsUpToTheRecordedSurgeBudget(t *testing.T) {
 	g := gomega.NewWithT(t)
 	engineIR := peerIR(v1beta1.EngineComponent, 4, 0)
 	decoderIR := peerIR(v1beta1.DecoderComponent, 4, 0)
@@ -2064,6 +2072,7 @@ func TestWireCoordinationGates_RatioRecoveryStartsFromAuthoritativeZero(t *testi
 	parent := mkRatioParent(25, 4, 1)
 	maxSurge := intstr.FromInt32(4)
 	parent.Spec.Rollout.Groups[0].RollingUpdate.MaxSurge = &maxSurge
+	parent.Status.Rollout.ActiveRun.Plan.Groups[0].Group.RollingUpdate.MaxSurge = &maxSurge // the run recorded the budget of 4
 	input := r.buildReconcileInput(context.Background(), engineIR, engineIR.Spec.Runners, parent, nil, nil, lifecycleSettings{}, 0, coordination.GroupDefaults{})
 	r.wireCoordinationGates(context.Background(), &input, engineIR, parent, coordination.GroupDefaults{}, specTargetRevision(engineIR))
 	g.Expect(input.UpdateGate).NotTo(gomega.BeNil())
@@ -2073,8 +2082,12 @@ func TestWireCoordinationGates_RatioRecoveryStartsFromAuthoritativeZero(t *testi
 		"positive authoritative shape at 0:0 serving must admit one recovery bootstrap: "+reason)
 
 	allowed, _, reason = input.UpdateGate("", workloadtypes.UpdateStrategySurgeThenDrain, 1, 0)
-	g.Expect(allowed).To(gomega.BeFalse(),
-		"same-wakeup recovery must serialize per Component even when MaxSurge permits more: "+reason)
+	g.Expect(allowed).To(gomega.BeTrue(),
+		"a second recovery surge in the same pass is admitted under a recorded surge budget of 4: "+reason)
+
+	allowed, gate, reason := input.UpdateGate("", workloadtypes.UpdateStrategySurgeThenDrain, 4, 0)
+	g.Expect(allowed).To(gomega.BeFalse(), "a fifth surge in the same pass exceeds the recorded budget of 4: "+reason)
+	g.Expect(gate).To(gomega.Equal(workloadtypes.RolloutHoldGateBudget))
 }
 
 // TestWireCoordinationGates_SequentialGateReadsFreshPeerStatus is the
@@ -2436,10 +2449,15 @@ func TestPromoteCurrentRevision_HeldRevisionDoesNotLandByAttrition(t *testing.T)
 	g.Expect(hold).NotTo(gomega.BeNil(), "the Held hold must be reported while the push has not landed")
 	g.Expect(hold.Gate).To(gomega.Equal(v1beta1.RolloutHoldGateHeld))
 
-	// The operator releases the block: the same rows land the push.
-	released := getFreshIR(t, r, ir)
-	released.Status.RetryBlocks = nil
-	g.Expect(r.Client.Status().Update(context.Background(), released)).To(gomega.Succeed())
+	// The operator releases the block: the pass answers the release through
+	// its own retry record writer, which mirrors the committed records onto
+	// the pass's copy, and the same rows land the push at the end of that
+	// pass.
+	release := buildMutateRetryBlock(r.statusWriter(), r.Client, ir, nil)
+	g.Expect(release(context.Background(), promoteTargetRev, func(*workloadtypes.RetryBlock) workloadtypes.RetryBlockDisposition {
+		return workloadtypes.RetryBlockRemove
+	})).To(gomega.Succeed())
+	g.Expect(ir.Status.RetryBlocks).To(gomega.BeEmpty(), "the release is mirrored onto the pass's copy")
 	g.Expect(promote(context.Background(), promoteTargetRev)).To(gomega.Succeed())
 	g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.Equal(promoteTargetRev),
 		"once the ladder records no failure, every Instance Ready on the revision lands it")
@@ -2573,18 +2591,20 @@ func TestPromoteCurrentRevision_UsesAuthoritativeStatusAfterLifecycleWrite(t *te
 	g.Expect(stale.Status.CurrentRevision).To(gomega.Equal(promotePriorRev))
 }
 
+// TestPromoteCurrentRevision_SameNameReplacementAborts: a copy whose rows
+// call for a promotion over a replica that was deleted and created again
+// under the same name writes nothing on the new object and says so.
 func TestPromoteCurrentRevision_SameNameReplacementAborts(t *testing.T) {
 	g := gomega.NewWithT(t)
 	stale := baselineIR("llama-engine", "prod", 1)
 	stale.Status.CurrentRevision = promotePriorRev
+	stale.Status.UpdateRevision = promoteTargetRev
+	stale.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
+		Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: promoteTargetRev,
+	}}
 
 	replacement := stale.DeepCopy()
 	replacement.UID = types.UID("replacement-uid")
-	replacement.Status.CurrentRevision = promotePriorRev
-	replacement.Status.UpdateRevision = promoteTargetRev
-	replacement.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{{
-		Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: promoteTargetRev,
-	}}
 	live, writes := newCountingStatusClient(t, 0, replacement)
 
 	promote := buildPromoteCurrentRevision(testStatusWriter(live), live, live, stale)
@@ -2693,7 +2713,7 @@ func TestRecordUpdateRevision_WritesTheRevisionPairAsOnePair(t *testing.T) {
 	t.Run("a rollback onto the current revision over a pinned surge withdraws it in the same write", func(t *testing.T) {
 		ir := withPair(promotePriorRev, promoteTargetRev, pinnedSource(promoteTargetRev), readyOn(1, promotePriorRev))
 		r, _ := newReconciler(t, ir)
-		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir)
+		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir, workloadtypes.ComponentPlan{}, nil)
 		gomega.NewWithT(t).Expect(record(context.Background(), promotePriorRev)).To(gomega.Succeed())
 		expectPair(t, r, ir, "", promotePriorRev)
 	})
@@ -2706,7 +2726,7 @@ func TestRecordUpdateRevision_WritesTheRevisionPairAsOnePair(t *testing.T) {
 			Operation: &v1beta1.InstanceOperation{ID: "gangsurgetarget-2", Type: v1beta1.InstanceOperationUpdate, Step: workloadtypes.UpdateStepGangSurgeTarget, TargetRevision: promoteTargetRev}}
 		ir := withPair(promotePriorRev, promoteTargetRev, source, readyOn(1, promotePriorRev), marker)
 		r, _ := newReconciler(t, ir)
-		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir)
+		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir, workloadtypes.ComponentPlan{}, nil)
 		gomega.NewWithT(t).Expect(record(context.Background(), promotePriorRev)).To(gomega.Succeed())
 		expectPair(t, r, ir, "", promotePriorRev)
 	})
@@ -2714,7 +2734,7 @@ func TestRecordUpdateRevision_WritesTheRevisionPairAsOnePair(t *testing.T) {
 	t.Run("a forward roll keeps the recorded current revision", func(t *testing.T) {
 		ir := withPair(promotePriorRev, promotePriorRev, readyOn(0, promotePriorRev), readyOn(1, promotePriorRev))
 		r, _ := newReconciler(t, ir)
-		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir)
+		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir, workloadtypes.ComponentPlan{}, nil)
 		gomega.NewWithT(t).Expect(record(context.Background(), promoteTargetRev)).To(gomega.Succeed())
 		expectPair(t, r, ir, promotePriorRev, promoteTargetRev)
 	})
@@ -2722,7 +2742,7 @@ func TestRecordUpdateRevision_WritesTheRevisionPairAsOnePair(t *testing.T) {
 	t.Run("a rollback no Instance ever left keeps the current revision", func(t *testing.T) {
 		ir := withPair(promotePriorRev, promoteTargetRev, readyOn(0, promotePriorRev), readyOn(1, promotePriorRev))
 		r, _ := newReconciler(t, ir)
-		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir)
+		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir, workloadtypes.ComponentPlan{}, nil)
 		gomega.NewWithT(t).Expect(record(context.Background(), promotePriorRev)).To(gomega.Succeed())
 		expectPair(t, r, ir, promotePriorRev, promotePriorRev)
 	})
@@ -2732,7 +2752,7 @@ func TestRecordUpdateRevision_WritesTheRevisionPairAsOnePair(t *testing.T) {
 		ir := withPair(promotePriorRev, promotePriorRev, pinnedSource(promoteTargetRev), readyOn(1, promotePriorRev))
 		r, _ := newReconciler(t, ir)
 		before := getFreshIR(t, r, ir).ResourceVersion
-		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir)
+		record := buildRecordUpdateRevision(r.statusWriter(), r.Client, r.Client, ir, workloadtypes.ComponentPlan{}, nil)
 		g.Expect(record(context.Background(), promotePriorRev)).To(gomega.Succeed())
 		g.Expect(getFreshIR(t, r, ir).ResourceVersion).To(gomega.Equal(before), "the record is not the per-pass rollup; an unchanged target writes nothing")
 	})
@@ -3147,9 +3167,6 @@ func TestStandaloneReplicaDerivesNamesFromItsOwnName(t *testing.T) {
 	if key.OwnerName != "pool-a" {
 		t.Fatalf("Key.OwnerName = %q, want pool-a", key.OwnerName)
 	}
-	if got := key.SelectorLabels[constants.InferenceServicePodLabelKey]; got != "pool-a" {
-		t.Fatalf("selector label = %q, want pool-a", got)
-	}
 
 	svc := buildHeadlessServiceSpec(ir)
 	if svc.Name != "pool-a-engine-headless" {
@@ -3459,6 +3476,172 @@ func TestPromoteCurrentRevision_WaitsForTheLastInstanceToPromoteAfterARollback(t
 		"the restoring write drops the withdrawal record")
 }
 
+// TestPromoteCurrentRevision_ARestoreWaitsForARebuiltInstanceToBeReady:
+// version 2 landed on three Instances, the operator pushed back to version
+// 1 and, with Instance 2 already back on version 1, pushed version 2 again.
+// That push clears the current revision while Instance 2 is off version 2.
+// Instance 2 then loses its pod before its turn and the Create pass rebuilds
+// it toward version 2: its row keeps version 1 as running until the promote
+// and its new pod carries version 2 before it is Ready. The current revision
+// comes back only once that attempt ends with Instance 2 promoted Ready on
+// version 2; a reader of the pair would otherwise take the roll for done
+// while that Instance is still coming up.
+func TestPromoteCurrentRevision_ARestoreWaitsForARebuiltInstanceToBeReady(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+	pushedAgain, rolledBackTo := promoteTargetRev, promotePriorRev
+	ir := baselineIR("llama-engine", "prod", 3)
+	ir.Status.CurrentRevision = pushedAgain
+	ir.Status.UpdateRevision = pushedAgain
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: pushedAgain, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: pushedAgain, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+		{Index: 2, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: rolledBackTo, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+	}
+	podOn := func(idx int32, rev string, ready bool) *corev1.Pod {
+		pod := podForIR(ir, idx, "default", 0, ready, ready)
+		pod.Labels[query.LabelRevisionHash] = query.RevisionFromName(rev).Hash()
+		return pod
+	}
+	backOnOne := podOn(2, rolledBackTo, true)
+	r, c := newReconciler(t, ir, podOn(0, pushedAgain, true), podOn(1, pushedAgain, true), backOnOne)
+
+	g.Expect(buildPromoteCurrentRevision(r.statusWriter(), r.Client, r.Client, ir)(ctx, pushedAgain)).To(gomega.Succeed())
+	cleared := getFreshIR(t, r, ir)
+	g.Expect(cleared.Status.CurrentRevision).To(gomega.BeEmpty(),
+		"version 2 pushed again while Instance 2 runs version 1: the current revision is cleared")
+	g.Expect(apimeta.IsStatusConditionTrue(cleared.Status.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn)).To(gomega.BeTrue(),
+		"the clearing is recorded")
+
+	// Instance 2 loses its pod before its turn; the Create pass rebuilds it
+	// toward version 2 under a Create attempt, the row naming version 1 as
+	// running until the promote, the new pod labelled version 2 and not Ready.
+	g.Expect(c.Delete(ctx, backOnOne)).To(gomega.Succeed())
+	g.Expect(c.Create(ctx, podOn(2, pushedAgain, false))).To(gomega.Succeed())
+	cleared.Status.InstanceStatuses[2] = v1beta1.OMENativeInstanceStatus{Index: 2, Phase: v1beta1.OMENativeInstanceCreating,
+		RunningRevision: rolledBackTo, TargetRevision: pushedAgain, PodCount: 1,
+		Operation: &v1beta1.InstanceOperation{ID: "create-2", Type: v1beta1.InstanceOperationCreate,
+			Step: workloadstatus.CreateStepCreatePods, TargetRevision: pushedAgain}}
+	g.Expect(c.Status().Update(ctx, cleared)).To(gomega.Succeed())
+	before := getFreshIR(t, r, ir).ResourceVersion
+	g.Expect(buildPromoteCurrentRevision(r.statusWriter(), r.Client, r.Client, cleared)(ctx, pushedAgain)).To(gomega.Succeed())
+	rebuilding := getFreshIR(t, r, ir)
+	g.Expect(rebuilding.Status.CurrentRevision).To(gomega.BeEmpty(),
+		"every pod carries version 2 but the attempt rebuilding Instance 2 is still open: the current revision stays cleared")
+	g.Expect(apimeta.IsStatusConditionTrue(rebuilding.Status.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn)).To(gomega.BeTrue(),
+		"the record of the cleared revision stands while the Instance comes up")
+	g.Expect(rebuilding.ResourceVersion).To(gomega.Equal(before), "nothing to write while the Instance comes up")
+
+	// The rebuilt Instance is promoted Ready on version 2: the attempt is
+	// over, the current revision comes back and the record drops.
+	rebuilding.Status.InstanceStatuses[2] = v1beta1.OMENativeInstanceStatus{Index: 2, Phase: v1beta1.OMENativeInstanceReady,
+		RunningRevision: pushedAgain, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1}
+	g.Expect(c.Status().Update(ctx, rebuilding)).To(gomega.Succeed())
+	g.Expect(buildPromoteCurrentRevision(r.statusWriter(), r.Client, r.Client, rebuilding)(ctx, pushedAgain)).To(gomega.Succeed())
+	back := getFreshIR(t, r, ir)
+	g.Expect(back.Status.CurrentRevision).To(gomega.Equal(pushedAgain), "every Instance is Ready on version 2: the push has landed again")
+	g.Expect(apimeta.FindStatusCondition(back.Status.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn)).To(gomega.BeNil(),
+		"the restoring write drops the record")
+}
+
+// TestPromoteCurrentRevision_APushKeepsThePriorRevisionWhileAnInstanceIsRebuilt
+// is the same three Instances under a plain push of version 2 over version
+// 1: two Instances Ready on version 2, the third rebuilt toward it with its
+// new pod labelled version 2 and not Ready. The push lands only once that
+// Instance is Ready, so a push reads the same whether or not a cleared
+// revision is ever restored.
+func TestPromoteCurrentRevision_APushKeepsThePriorRevisionWhileAnInstanceIsRebuilt(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+	pushed, prior := promoteTargetRev, promotePriorRev
+	ir := baselineIR("llama-engine", "prod", 3)
+	ir.Status.CurrentRevision = prior
+	ir.Status.UpdateRevision = pushed
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: pushed, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: pushed, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+		{Index: 2, Phase: v1beta1.OMENativeInstanceCreating, RunningRevision: prior, TargetRevision: pushed, PodCount: 1,
+			Operation: &v1beta1.InstanceOperation{ID: "create-2", Type: v1beta1.InstanceOperationCreate,
+				Step: workloadstatus.CreateStepCreatePods, TargetRevision: pushed}},
+	}
+	podOn := func(idx int32, rev string, ready bool) *corev1.Pod {
+		pod := podForIR(ir, idx, "default", 0, ready, ready)
+		pod.Labels[query.LabelRevisionHash] = query.RevisionFromName(rev).Hash()
+		return pod
+	}
+	r, c := newReconciler(t, ir, podOn(0, pushed, true), podOn(1, pushed, true), podOn(2, pushed, false))
+	before := getFreshIR(t, r, ir).ResourceVersion
+
+	g.Expect(buildPromoteCurrentRevision(r.statusWriter(), r.Client, r.Client, ir)(ctx, pushed)).To(gomega.Succeed())
+	fresh := getFreshIR(t, r, ir)
+	g.Expect(fresh.Status.CurrentRevision).To(gomega.Equal(prior), "the push has not landed while Instance 2 is still coming up")
+	g.Expect(fresh.ResourceVersion).To(gomega.Equal(before), "no write while the push has not landed")
+
+	fresh.Status.InstanceStatuses[2] = v1beta1.OMENativeInstanceStatus{Index: 2, Phase: v1beta1.OMENativeInstanceReady,
+		RunningRevision: pushed, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1}
+	g.Expect(c.Status().Update(ctx, fresh)).To(gomega.Succeed())
+	g.Expect(buildPromoteCurrentRevision(r.statusWriter(), r.Client, r.Client, fresh)(ctx, pushed)).To(gomega.Succeed())
+	g.Expect(getFreshIR(t, r, ir).Status.CurrentRevision).To(gomega.Equal(pushed), "every Instance is Ready on version 2: the push lands")
+}
+
+// TestPromoteCurrentRevision_ARollbackOverABrokenInstanceLandsOnceItsAttemptEnds:
+// version 2 was pushed over three Instances on version 1 and pushed back
+// before it landed, which cleared the current revision while Instance 2 ran
+// version 2. Instance 2's recreate back onto version 1 is open on a pod
+// that does not come up: the current revision stays cleared while that
+// attempt runs, and comes back the moment the attempt ends with the
+// Instance Failed, its pod on version 1 and a Held record on that revision.
+// A roll back over a broken Instance reads landed; the Held record gates
+// the next attempt, not the rollup.
+func TestPromoteCurrentRevision_ARollbackOverABrokenInstanceLandsOnceItsAttemptEnds(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ctx := context.Background()
+	starting, pushed := promotePriorRev, promoteTargetRev
+	ir := baselineIR("llama-engine", "prod", 3)
+	ir.Status.CurrentRevision = ""
+	ir.Status.UpdateRevision = starting
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: starting, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+		{Index: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: starting, PodCount: 1, ReadyPodCount: 1, ServingPodCount: 1},
+		{Index: 2, Phase: v1beta1.OMENativeInstanceUpdating, RunningRevision: pushed, TargetRevision: starting, PodCount: 1,
+			Operation: &v1beta1.InstanceOperation{ID: "update-2", Type: v1beta1.InstanceOperationUpdate,
+				Step: workloadtypes.UpdateStepDrain, TargetRevision: starting}},
+	}
+	apimeta.SetStatusCondition(&ir.Status.Conditions, metav1.Condition{
+		Type: InferenceReplicaConditionCurrentRevisionWithdrawn, Status: metav1.ConditionTrue, Reason: ReasonInstanceOffRevision,
+		Message: "the record the push back left"})
+	podOn := func(idx int32, rev string, ready bool) *corev1.Pod {
+		pod := podForIR(ir, idx, "default", 0, ready, ready)
+		pod.Labels[query.LabelRevisionHash] = query.RevisionFromName(rev).Hash()
+		return pod
+	}
+	r, c := newReconciler(t, ir, podOn(0, starting, true), podOn(1, starting, true), podOn(2, starting, false))
+	before := getFreshIR(t, r, ir).ResourceVersion
+
+	g.Expect(buildPromoteCurrentRevision(r.statusWriter(), r.Client, r.Client, ir)(ctx, starting)).To(gomega.Succeed())
+	open := getFreshIR(t, r, ir)
+	g.Expect(open.Status.CurrentRevision).To(gomega.BeEmpty(), "the recreate of Instance 2 back onto version 1 is still open: the roll back has not landed")
+	g.Expect(apimeta.IsStatusConditionTrue(open.Status.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn)).To(gomega.BeTrue(),
+		"the record stands while the attempt runs")
+	g.Expect(open.ResourceVersion).To(gomega.Equal(before), "nothing to write while the attempt runs")
+
+	// The attempt ends on the pod that does not come up: the Instance is
+	// Failed with the attempt kept, the revision it ran still recorded, and
+	// the retry record holds version 1.
+	open.Status.InstanceStatuses[2] = v1beta1.OMENativeInstanceStatus{Index: 2, Phase: v1beta1.OMENativeInstanceFailed,
+		RunningRevision: pushed, TargetRevision: starting, PodCount: 1,
+		Operation: &v1beta1.InstanceOperation{ID: "update-2", Type: v1beta1.InstanceOperationUpdate,
+			Step: workloadtypes.UpdateStepParked, TargetRevision: starting}}
+	open.Status.RetryBlocks = []v1beta1.RetryBlock{{TargetRevision: starting, State: v1beta1.RetryBlockHeld, AttemptsStarted: 3}}
+	g.Expect(c.Status().Update(ctx, open)).To(gomega.Succeed())
+	g.Expect(buildPromoteCurrentRevision(r.statusWriter(), r.Client, r.Client, open)(ctx, starting)).To(gomega.Succeed())
+	landed := getFreshIR(t, r, ir)
+	g.Expect(landed.Status.CurrentRevision).To(gomega.Equal(starting),
+		"no attempt is open and every pod carries version 1: the roll back has landed with Instance 2 Failed, the Held record notwithstanding")
+	g.Expect(apimeta.FindStatusCondition(landed.Status.Conditions, InferenceReplicaConditionCurrentRevisionWithdrawn)).To(gomega.BeNil(),
+		"the restoring write drops the record")
+}
+
 // The status publication writes Ready over a Failed row that still keeps
 // the surge attempt it failed at, while the pods it runs serve beside the
 // crash-looping replacement. A mutation reads that row as Failed; one that
@@ -3543,4 +3726,95 @@ func TestBuildReconcileInput_SchedulerGracesFromSettings(t *testing.T) {
 	input := r.buildReconcileInput(context.Background(), ir, ir.Spec.Runners, nil, nil, nil, settings, 0, coordination.GroupDefaults{})
 	g.Expect(input.UnschedulableGrace).To(gomega.Equal(15 * time.Minute))
 	g.Expect(input.GangDomainFullGrace).To(gomega.Equal(5 * time.Minute))
+}
+
+// TestBuildApplyInstanceMutationsWithRetryBlock_UnchangedBatchIsNotReadLive
+// holds the writer's answer to a batch whose every mutation the caller found
+// unchanged on the pass's copy: no live read, no write, no Mutate call and
+// no commit callback. One mutation without the finding, or a retry record to
+// move, reads the replica live as every batch does.
+func TestBuildApplyInstanceMutationsWithRetryBlock_UnchangedBatchIsNotReadLive(t *testing.T) {
+	g := gomega.NewWithT(t)
+	ir := baselineIR("llama-engine", "prod", 2)
+	ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+		{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "llama-engine-aaaaaaaa"},
+		{Index: 1, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: "llama-engine-aaaaaaaa"},
+	}
+	c, writes := newCountingStatusClient(t, 0, ir)
+	live := &countingReader{Reader: c}
+	apply := buildApplyInstanceMutationsWithRetryBlockFromReader(testStatusWriter(c), live, ir, nil)
+
+	mutateCalls, commitCalls := 0, 0
+	foundUnchanged := func(idx int32) workloadtypes.InstanceMutation {
+		return workloadtypes.InstanceMutation{
+			Index:           idx,
+			UnchangedOnCopy: true,
+			Mutate:          func(*workloadtypes.InstanceStatus) bool { mutateCalls++; return false },
+			OnCommit:        func(_, _ *workloadtypes.InstanceStatus) { commitCalls++ },
+		}
+	}
+	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{foundUnchanged(0), foundUnchanged(1)}, "", nil)).To(gomega.Succeed())
+	g.Expect(live.gets).To(gomega.Equal(0), "a batch found unchanged on the pass's copy is not read live")
+	g.Expect(*writes).To(gomega.Equal(0), "a batch found unchanged on the pass's copy writes nothing")
+	g.Expect(mutateCalls).To(gomega.Equal(0), "the writer takes the caller's finding; Mutate does not run again")
+	g.Expect(commitCalls).To(gomega.Equal(0), "nothing committed, so no commit callback runs")
+
+	// One mutation without the finding: the batch is read live and applied
+	// to the live rows, the found-unchanged mutations with it.
+	unmarked := workloadtypes.InstanceMutation{Index: 1, Mutate: func(*workloadtypes.InstanceStatus) bool { mutateCalls++; return false }}
+	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{foundUnchanged(0), unmarked}, "", nil)).To(gomega.Succeed())
+	g.Expect(live.gets).To(gomega.Equal(1), "a batch with one mutation not found unchanged is read live")
+	g.Expect(mutateCalls).To(gomega.Equal(2), "every mutation of a batch read live is applied")
+	g.Expect(*writes).To(gomega.Equal(0))
+
+	// A retry record to move: the batch is read live whatever its mutations
+	// were found to be.
+	g.Expect(apply(context.Background(), []workloadtypes.InstanceMutation{foundUnchanged(0)}, "llama-engine-bbbbbbbb",
+		func(*workloadtypes.RetryBlock) workloadtypes.RetryBlockDisposition {
+			return workloadtypes.RetryBlockUnchanged
+		},
+	)).To(gomega.Succeed())
+	g.Expect(live.gets).To(gomega.Equal(2), "a batch that moves a retry record is read live")
+	g.Expect(*writes).To(gomega.Equal(0))
+}
+
+// TestWireCoordinationGates_ListsTheComponentsPodsOncePerPass proves the gate
+// the pass wires reads the Component's own pods, for the group's unavailability
+// budget, from one cached list: three drain-first consults in one pass list
+// the pods once, and every consult reads the same picture.
+func TestWireCoordinationGates_ListsTheComponentsPodsOncePerPass(t *testing.T) {
+	g := gomega.NewWithT(t)
+	router := peerIR(v1beta1.RouterComponent, 4, 4)
+	engineIR := baselineIR("llama-engine", "default", 4)
+	engineIR.Status.Replicas = 4
+	engineIR.Status.ServingReplicas = 4
+	objs := []client.Object{router, engineIR}
+	for idx := int32(0); idx < 4; idx++ {
+		engineIR.Status.InstanceStatuses = append(engineIR.Status.InstanceStatuses, v1beta1.OMENativeInstanceStatus{
+			Index: idx, Phase: v1beta1.OMENativeInstanceReady, PodCount: 1, ServingPodCount: 1,
+			ReadySince: &metav1.Time{Time: time.Now().Add(-10 * time.Minute)},
+		})
+		objs = append(objs, podForIR(engineIR, idx, "default", 0, true, true))
+	}
+	podLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&corev1.PodList{})
+	cache := fakeclient.New(t,
+		fakeclient.WithObjects(objs...),
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceReplica{}),
+		fakeclient.WithIndex(&corev1.Pod{}, query.OMENativePodIndexField, query.OMENativePodIndexExtractor),
+		podLists)
+	r, _ := newReconciler(t)
+	r.Client, r.APIReader = cache, cache
+	base := mkRatioParent(25, 4, 4)
+	base.Spec.Rollout.Groups[0].RollingUpdate.MaxUnavailable = ptr.To(intstr.FromInt32(1))
+	parent := withRouterPeer(base)
+
+	input := r.buildReconcileInput(context.Background(), engineIR, engineIR.Spec.Runners, parent, nil, nil, lifecycleSettings{}, 0, coordination.GroupDefaults{})
+	r.wireCoordinationGates(context.Background(), &input, engineIR, parent, coordination.GroupDefaults{}, specTargetRevision(engineIR))
+	g.Expect(input.UpdateGate).NotTo(gomega.BeNil())
+	listsBefore := podLists.Count()
+	for consult := 0; consult < 3; consult++ {
+		allowed, gate, reason := input.UpdateGate("", workloadtypes.UpdateStrategyRecreatePod, 0, 0)
+		g.Expect(allowed).To(gomega.BeTrue(), "consult %d held under %q: %s", consult, gate, reason)
+	}
+	g.Expect(podLists.Count()-listsBefore).To(gomega.Equal(1), "three consults of the gate in one pass must list the Component's pods once")
 }

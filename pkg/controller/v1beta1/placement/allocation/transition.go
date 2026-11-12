@@ -114,6 +114,12 @@ type transition struct {
 	// budgetBlocked records a whole-member growth it could not fit.
 	growthAllowance int64
 	budgetBlocked   bool
+	// growthPending reports a member that stillGrows. While one does,
+	// trimUnready gives up none of a serving member's replicas. A replica OME
+	// does not count as ready can still serve, such as the old copy of one
+	// being updated. The member keeps that copy at any count, so a lower count
+	// removes a ready replica instead.
+	growthPending bool
 }
 
 // memberView is one cluster as the transition reads it: its target in the
@@ -212,10 +218,12 @@ func (t *transition) readBudget() error {
 
 // countMember adds one member to the budget: its occupied replicas to the
 // replicas in use, its retired and drained originals out of the retirement
-// allowance, and its serving replicas above the original count into it.
+// allowance, and its serving replicas above the original count into it. It
+// also notes whether the member still grows.
 func (t *transition) countMember(member memberView) error {
 	t.targetsGrow = t.targetsGrow || member.goal > member.current
 	t.targetsShrink = t.targetsShrink || member.goal < member.current
+	t.growthPending = t.growthPending || member.stillGrows()
 	occupied := int64(max(member.current, member.state.Occupied))
 	if occupied > math.MaxInt64-t.inUse {
 		return fmt.Errorf("occupied replicas exceed int64")
@@ -292,6 +300,28 @@ func (m memberView) growable() bool {
 		(m.current == 0 || m.state.Applied)
 }
 
+// stillGrows reports a member whose serving capacity the move still waits to
+// grow. Its target is below its goal, or it does not yet serve its goal with
+// replicas OME counts as ready, for example while its routers are down. A
+// member that shrinks toward a goal no higher than its original count does not
+// grow, and neither does a member with no goal.
+func (m memberView) stillGrows() bool {
+	switch {
+	case m.goal > m.current:
+		return true
+	case m.goal == 0 || (m.goal < m.current && m.goal <= m.original):
+		return false
+	}
+	return !m.state.serving() || m.state.Ready < m.goal
+}
+
+// trimmable reports a serving member above its goal with a ready replica. A
+// member with none keeps its replicas, because a fault across a whole cluster,
+// such as a router outage, can hide replicas that come back.
+func (m memberView) trimmable() bool {
+	return m.current > m.goal && m.state.serving() && m.state.Ready > 0
+}
+
 // unsettled reports a member whose applied target is not yet in effect, or
 // that still holds replicas under a zero target.
 func (m memberView) unsettled() bool {
@@ -306,12 +336,15 @@ func (m memberView) unsettled() bool {
 //     publishes again before anything else moves.
 //  3. AwaitingMemberConvergence, reducing: the drains and reductions the
 //     allowances fund.
-//  4. AwaitingMemberConvergence, growing: the targets the surge allowance funds.
-//  5. ReplacementNotReady, or SurgeBudgetExhausted when growth could not be
+//  4. AwaitingMemberConvergence, trimming: once no member still grows, serving
+//     members give up replicas above their goals that OME does not count as
+//     ready.
+//  5. AwaitingMemberConvergence, growing: the targets the surge allowance funds.
+//  6. ReplacementNotReady, or SurgeBudgetExhausted when growth could not be
 //     funded: targets still differ from their goals and nothing moves yet.
-//  6. AwaitingMemberConvergence: every target is at its goal, but a member has
+//  7. AwaitingMemberConvergence: every target is at its goal, but a member has
 //     not applied its target or has not emptied.
-//  7. Complete.
+//  8. Complete.
 func (t *transition) decide() (Step, error) {
 	if t.hasUnknownStandingMember() {
 		return t.step.withReason("ObservationUnknown"), nil
@@ -320,6 +353,10 @@ func (t *transition) decide() (Step, error) {
 		return t.step.withReason("AwaitingMemberConvergence"), nil
 	}
 	t.planReductions()
+	if t.movesReplicas() {
+		return t.step.withReason("AwaitingMemberConvergence"), nil
+	}
+	t.trimUnready()
 	if t.movesReplicas() {
 		return t.step.withReason("AwaitingMemberConvergence"), nil
 	}
@@ -470,6 +507,24 @@ func (t *transition) unbackedReplicas(member memberView) int32 {
 		return max(int32(0), member.current-max(member.original, member.state.Ready))
 	}
 	return 0
+}
+
+// trimUnready lowers serving members toward the larger of goal and ready count
+// once no member still grows. Members can remove ready replicas first, so every
+// trimmed replica spends serving capacity above the smaller plan total. Funded
+// reductions expect unready replicas to go first, so the two never share a pass.
+func (t *transition) trimUnready() {
+	if t.growthPending || t.wholeMembers {
+		return
+	}
+	for _, member := range t.members {
+		if !member.trimmable() {
+			continue
+		}
+		trim := int32(min(int64(max(int32(0), member.current-max(member.goal, member.state.Ready))), t.servingAboveMinimum))
+		t.servingAboveMinimum -= int64(trim)
+		t.step.Targets[member.name] -= trim
+	}
 }
 
 // planGrowth raises members below their goals by what the surge allowance

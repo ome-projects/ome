@@ -51,10 +51,10 @@ func TestPVCToPVCReplicator_Replicate_Success(t *testing.T) {
 
 	replicator := &PVCToPVCReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: PVCToPVCReplicatorConfig{
-			LocalPath:           tmpDir,
-			SourcePVCFileSystem: afero.NewOsFs().(*afero.OsFs),
-			TargetPVCFileSystem: afero.NewOsFs().(*afero.OsFs),
+		Dependencies: Dependencies{
+			LocalPath:   tmpDir,
+			SourceFiles: afero.NewOsFs().(*afero.OsFs),
+			TargetFiles: afero.NewOsFs().(*afero.OsFs),
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{
@@ -128,10 +128,10 @@ func TestPVCToPVCReplicator_Replicate_WalkFunctionCalledCorrectly(t *testing.T) 
 
 	replicator := &PVCToPVCReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: PVCToPVCReplicatorConfig{
-			LocalPath:           tmpDir,
-			SourcePVCFileSystem: afero.NewOsFs().(*afero.OsFs),
-			TargetPVCFileSystem: afero.NewOsFs().(*afero.OsFs),
+		Dependencies: Dependencies{
+			LocalPath:   tmpDir,
+			SourceFiles: afero.NewOsFs().(*afero.OsFs),
+			TargetFiles: afero.NewOsFs().(*afero.OsFs),
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{
@@ -187,10 +187,10 @@ func TestPVCToPVCReplicator_Replicate_WalkFunctionCalledCorrectly(t *testing.T) 
 func TestPVCToPVCReplicator_Replicate_SameSourceAndTarget(t *testing.T) {
 	replicator := &PVCToPVCReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: PVCToPVCReplicatorConfig{
-			LocalPath:           "/tmp",
-			SourcePVCFileSystem: afero.NewOsFs().(*afero.OsFs),
-			TargetPVCFileSystem: afero.NewOsFs().(*afero.OsFs),
+		Dependencies: Dependencies{
+			LocalPath:   "/tmp",
+			SourceFiles: afero.NewOsFs().(*afero.OsFs),
+			TargetFiles: afero.NewOsFs().(*afero.OsFs),
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{
@@ -220,10 +220,10 @@ func TestPVCToPVCReplicator_Replicate_SourceDirectoryNotExists(t *testing.T) {
 
 	replicator := &PVCToPVCReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: PVCToPVCReplicatorConfig{
-			LocalPath:           tmpDir,
-			SourcePVCFileSystem: afero.NewOsFs().(*afero.OsFs),
-			TargetPVCFileSystem: afero.NewOsFs().(*afero.OsFs),
+		Dependencies: Dependencies{
+			LocalPath:   tmpDir,
+			SourceFiles: afero.NewOsFs().(*afero.OsFs),
+			TargetFiles: afero.NewOsFs().(*afero.OsFs),
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{
@@ -252,10 +252,10 @@ func TestPVCToPVCReplicator_Replicate_FileSystemError(t *testing.T) {
 	// which will cause the Walk function to fail
 	replicator := &PVCToPVCReplicator{
 		Logger: testingPkg.SetupMockLogger(),
-		Config: PVCToPVCReplicatorConfig{
-			LocalPath:           "/tmp",
-			SourcePVCFileSystem: afero.NewOsFs().(*afero.OsFs),
-			TargetPVCFileSystem: afero.NewOsFs().(*afero.OsFs),
+		Dependencies: Dependencies{
+			LocalPath:   "/tmp",
+			SourceFiles: afero.NewOsFs().(*afero.OsFs),
+			TargetFiles: afero.NewOsFs().(*afero.OsFs),
 		},
 		ReplicationInput: common.ReplicationInput{
 			Source: ociobjectstore.ObjectURI{

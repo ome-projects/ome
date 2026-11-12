@@ -15,9 +15,9 @@ import (
 
 // A canary-owned Component carries the same rolled-out revision fields a
 // coordination-owned one does, published by the canary executor: the
-// revision whose pods reached Ready leads while the ladder is in flight, and
+// revision whose pods reached Ready leads while the canary is in flight, and
 // a completed promotion or rollback records the revision that owns the
-// member's traffic and the one it superseded.
+// member's traffic and the one it replaced.
 
 // revisionWant is one member's expected rolled-out revision fields, by hash.
 type revisionWant struct {
@@ -55,7 +55,7 @@ func TestDispatch_MembersRecordTheRolledOutRevisions(t *testing.T) {
 	f.dispatch("shift") // 100% traffic moves; the release reads the next pass's count
 	f.dispatch("cut over")
 	if f.phase() != v1beta1.RolloutPhaseStable {
-		t.Fatalf("the ladder must complete, got %q", f.phase())
+		t.Fatalf("the canary must complete, got %q", f.phase())
 	}
 	done := func() {
 		t.Helper()
@@ -69,7 +69,7 @@ func TestDispatch_MembersRecordTheRolledOutRevisions(t *testing.T) {
 }
 
 // After a completed promotion the run closes Completed, and the next run
-// may pin a member with no stable revision. A rollback then resolves each
+// may record a member with no stable revision. A rollback then resolves each
 // member's stable revision from its LatestRolledoutRevision: the secondary
 // has no canary record of its own, and a completed run's record is not a
 // rollback's to use.
@@ -83,11 +83,11 @@ func TestDispatch_RollbackStableResolvesFromTheRolledOutRevision(t *testing.T) {
 	f.dispatch("shift") // 100% traffic moves; the release reads the next pass's count
 	f.dispatch("cut over")
 	if f.phase() != v1beta1.RolloutPhaseStable {
-		t.Fatalf("the ladder must complete, got %q", f.phase())
+		t.Fatalf("the canary must complete, got %q", f.phase())
 	}
 
 	// The run closes, each IR promotes its current revision and names the
-	// next target, and the fresh run pins the targets with no stable revision.
+	// next target, and the fresh run records the targets with no stable revision.
 	closed := f.isvc.Status.Rollout.ActiveRun
 	f.isvc.Status.Rollout.LastRun = &v1beta1.RolloutRunRecord{
 		Outcome:         v1beta1.RolloutRunCompleted,
@@ -107,9 +107,9 @@ func TestDispatch_RollbackStableResolvesFromTheRolledOutRevision(t *testing.T) {
 			ir.Status.UpdateRevision = f.name + "-" + string(comp) + "-" + pair[1]
 		})
 	}
-	f.dispatch("arm")
+	f.dispatch("start")
 	if cs := rollout.CanaryStatusFor(&f.isvc.Status, v1beta1.EngineComponent); cs == nil || cs.CanaryRevisionHash != "engnext" || cs.CurrentStep != 0 {
-		t.Fatalf("the new target must arm a fresh ladder, got %+v", cs)
+		t.Fatalf("the new target must start a fresh canary, got %+v", cs)
 	}
 	if got := componentStableRevisionHash(f.isvc, v1beta1.DecoderComponent, v1beta1.EngineComponent); got != "decnew" {
 		t.Fatalf("the decoder's stable revision = %q, want dNew from its LatestRolledoutRevision", got)
@@ -179,7 +179,7 @@ func TestReconcile_UnreadyTargetPublishesNoReadyRevision(t *testing.T) {
 // into PreviousRolledoutRevision, and the hold re-records nothing.
 func TestReconcile_RollbackCompletionRecordsTheStableRevision(t *testing.T) {
 	isvc, in := pdInputs(map[string]int32{"new": 2, "old": 2}, pdReadyDecoder())
-	// The engine's record still names a revision the stable one superseded;
+	// The engine's record still names a revision the stable one replaced;
 	// the decoder carries none.
 	isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
 		v1beta1.EngineComponent: {LatestRolledoutRevision: coordination.PerRevisionServiceName(isvc.Name, v1beta1.EngineComponent, "older")},
@@ -223,7 +223,7 @@ func TestReconcile_UnbumpedMemberRecordsItsRevisionWithoutDemotion(t *testing.T)
 	expectRevisions(t, isvc, v1beta1.DecoderComponent, revisionWant{ready: "decold", latest: "decold"})
 }
 
-// With no ladder active, each member is recorded on the one revision its
+// With no canary open, each member is recorded on the one revision its
 // replica has settled on: the pair agrees at the replica's generation, a pod
 // of it is Ready and no pod of another revision exists. A member recorded
 // there already changes nothing; one recorded elsewhere moves to it and the

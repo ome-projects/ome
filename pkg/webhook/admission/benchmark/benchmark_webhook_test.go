@@ -271,11 +271,11 @@ func TestValidateStorage(t *testing.T) {
 			},
 			expected: gomega.HaveOccurred(),
 		},
-		"Invalid storage URI format - missing n": {
+		"Short storage URI form - bucket and prefix": {
 			storage: &v1beta1.StorageSpec{
 				StorageUri: ptr("oci://mynamespace/b/mybucket/o/object"),
 			},
-			expected: gomega.HaveOccurred(),
+			expected: gomega.Succeed(),
 		},
 		"Invalid storage URI format - missing b": {
 			storage: &v1beta1.StorageSpec{

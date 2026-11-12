@@ -862,6 +862,52 @@ func TestEscalation_RestartDeadlineElapsed_FailsInstance(t *testing.T) {
 	}
 }
 
+// The deadline backstop writes the Failed row with its operation kept and
+// no deadline on it, while a sibling attempt whose clock still runs is left
+// alone with its deadline: a Failed row is outside every pass that reads
+// the clock, a live attempt is inside them.
+func TestEscalation_RestartDeadlineElapsed_FailedRowCarriesNoDeadline(t *testing.T) {
+	now := time.Now()
+	live := metav1.NewTime(now.Add(20 * time.Minute))
+	insts := []workloadtypes.InstanceStatus{
+		{Index: 0, Incarnation: 2, Phase: workloadtypes.InstancePhaseRestarting, PodCount: 1,
+			Operation: &workloadtypes.InstanceOperation{Type: workloadtypes.InstanceOperationRestart, Step: "Drain", RetryCount: 1,
+				Deadline: metav1.NewTime(now.Add(-time.Minute))}},
+		{Index: 1, Incarnation: 2, Phase: workloadtypes.InstancePhaseRestarting, PodCount: 1,
+			Operation: &workloadtypes.InstanceOperation{Type: workloadtypes.InstanceOperationRestart, Step: "Drain", Deadline: live}},
+	}
+	input, rec := escalationFixture(insts)
+	plan := workloadtypes.ComponentPlan{Instances: []workloadtypes.InstancePlan{
+		{Index: 0, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
+		{Index: 1, Runners: []workloadtypes.RunnerPlan{{Name: "default", Size: 1}}},
+	}}
+	pods := map[int32][]*corev1.Pod{
+		0: {waitingPod("engine-0-default-0", "PodInitializing", "node-a", now.Add(-time.Hour))},
+		1: {waitingPod("engine-1-default-0", "PodInitializing", "node-a", now.Add(-time.Minute))},
+	}
+	if err := runEscalationPass(t, workloadtypes.Deps{}, input, plan, pods); err != nil {
+		t.Fatalf("escalation pass: %v", err)
+	}
+
+	ended := rec.store[0]
+	if ended.Phase != workloadtypes.InstancePhaseFailed || ended.Operation == nil || ended.Operation.Type != workloadtypes.InstanceOperationRestart {
+		t.Fatalf("row 0 = %+v, want Failed with the Restart kept", ended)
+	}
+	if !ended.Operation.Deadline.IsZero() {
+		t.Errorf("row 0 deadline = %v, want none on a Failed row", ended.Operation.Deadline)
+	}
+	if ended.Operation.RetryCount != 1 || ended.Operation.Step != "Drain" {
+		t.Errorf("row 0 operation = %+v, want the step and retry count kept", *ended.Operation)
+	}
+	kept := rec.store[1]
+	if kept.Phase != workloadtypes.InstancePhaseRestarting || kept.Operation == nil || !kept.Operation.Deadline.Equal(&live) {
+		t.Errorf("row 1 = %+v, want Restarting with its deadline %v untouched", kept, live)
+	}
+	if len(rec.warns) != 1 {
+		t.Errorf("WarnInstanceFailed: got %v want one call", rec.warns)
+	}
+}
+
 // A Restart's elapsed deadline parks a set, and the pass reads which set
 // there is off the live pods, not off the observation the deadline was
 // judged on: the repair's drain may have deleted that set since. With the
@@ -1169,8 +1215,11 @@ func TestEscalation_SourceTheSurgeDrainedCountsBesideItsServingReplacement(t *te
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			input, rec := escalationFixture(surgeDrainInstance())
-			if err := runEscalationPass(t, workloadtypes.Deps{}, input, singleInstancePlan(0, 1),
-				map[int32][]*corev1.Pod{0: tc.pods}); err != nil {
+			// An ending past the drain step writes the source's serving
+			// gate, so the pass needs a store it can write the pods to.
+			plan, byIdx := singleInstancePlan(0, 1), map[int32][]*corev1.Pod{0: tc.pods}
+			deps := workloadtypes.Deps{Client: escalation.ObservedPodClientForTest(input, plan, byIdx)}
+			if err := runEscalationPass(t, deps, input, plan, byIdx); err != nil {
 				t.Fatalf("escalation pass: %v", err)
 			}
 			failed := rec.store[0].Phase == workloadtypes.InstancePhaseFailed

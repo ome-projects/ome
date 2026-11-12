@@ -35,7 +35,7 @@ func matchFor(t *testing.T, terms []v1beta1.ClusterAffinityTerm, component v1bet
 
 func TestCompileForRatioLookup(t *testing.T) {
 	full := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{
-		EngineReplicas: ratio(2, 3), DecoderReplicas: ratio(1, 2), DefaultReplicas: ratio(4, 5),
+		Engine: ratio(2, 3), Decoder: ratio(1, 2), Default: ratio(4, 5),
 	})}
 	for component, want := range map[v1beta1.ComponentType][2]int64{
 		v1beta1.EngineComponent: {2, 3}, v1beta1.DecoderComponent: {1, 2}, v1beta1.RouterComponent: {4, 5},
@@ -44,8 +44,8 @@ func TestCompileForRatioLookup(t *testing.T) {
 		require.Equal(t, want, [2]int64{m.Weight, m.MaxWeight}, component)
 	}
 
-	onlyDefault := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{DefaultReplicas: ratio(4)})}
-	onlyEngine := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: ratio(2)})}
+	onlyDefault := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Default: ratio(4)})}
+	onlyEngine := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Engine: ratio(2)})}
 	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent, v1beta1.RouterComponent} {
 		m := matchFor(t, onlyDefault, component)
 		require.Equal(t, [2]int64{4, 1}, [2]int64{m.Weight, m.MaxWeight}, component)
@@ -56,7 +56,7 @@ func TestCompileForRatioLookup(t *testing.T) {
 
 func TestMatchSumsRatiosOverTerms(t *testing.T) {
 	terms := []v1beta1.ClusterAffinityTerm{
-		ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: ratio(2, 3)}),
+		ratioTerm(v1beta1.ClusterAffinityWeights{Engine: ratio(2, 3)}),
 		nameTerm("cluster-a"),
 	}
 	m := matchFor(t, terms, v1beta1.EngineComponent)
@@ -75,7 +75,7 @@ func TestMaxWeightIsZeroWithoutRatios(t *testing.T) {
 }
 
 func TestRatioSelectorWithoutComponentRatioMatchesOne(t *testing.T) {
-	terms := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{DecoderReplicas: ratio(3, 4)})}
+	terms := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Decoder: ratio(3, 4)})}
 	m := matchFor(t, terms, v1beta1.EngineComponent)
 	require.Equal(t, Match{TermIndexes: []int32{0}, Weight: 1, MaxWeight: 1}, m)
 }
@@ -83,42 +83,37 @@ func TestRatioSelectorWithoutComponentRatioMatchesOne(t *testing.T) {
 func TestUsesRatios(t *testing.T) {
 	require.False(t, UsesRatios(nil))
 	require.False(t, UsesRatios([]v1beta1.ClusterAffinityTerm{nameTerm("cluster-a")}))
-	require.False(t, UsesRatios([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Default: ptr.To[int32](1)})}))
 	for _, w := range []v1beta1.ClusterAffinityWeights{
-		{DefaultReplicas: ratio(1)}, {EngineReplicas: ratio(1)}, {DecoderReplicas: ratio(1)}, {RouterReplicas: ratio(1)},
+		{Default: ratio(1)}, {Engine: ratio(1)}, {Decoder: ratio(1)}, {Router: ratio(1)},
+		{Default: ratio(1)}, {Engine: ratio(1)}, {Decoder: ratio(1)}, {Router: ratio(1)},
 	} {
 		require.True(t, UsesRatios([]v1beta1.ClusterAffinityTerm{nameTerm("cluster-b"), ratioTerm(w)}))
 	}
 }
 
 func TestDividesRoutersRatioForm(t *testing.T) {
-	for _, w := range []v1beta1.ClusterAffinityWeights{{EngineReplicas: ratio(1)}, {DecoderReplicas: ratio(1)}} {
+	for _, w := range []v1beta1.ClusterAffinityWeights{{Engine: ratio(1)}, {Decoder: ratio(1)}} {
 		require.False(t, DividesRouters([]v1beta1.ClusterAffinityTerm{ratioTerm(w)}))
 	}
-	for _, w := range []v1beta1.ClusterAffinityWeights{{DefaultReplicas: ratio(1)}, {RouterReplicas: ratio(1)}} {
+	for _, w := range []v1beta1.ClusterAffinityWeights{{Default: ratio(1)}, {Router: ratio(1)}} {
 		require.True(t, DividesRouters([]v1beta1.ClusterAffinityTerm{ratioTerm(w)}))
 	}
 	require.True(t, DividesRouters([]v1beta1.ClusterAffinityTerm{nameTerm("cluster-a")}))
 }
 
-func TestCompileRejectsMixedWeightsOnOneTerm(t *testing.T) {
-	_, err := Compile([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{
-		Default: ptr.To[int32](1), EngineReplicas: ratio(1),
-	})}, true)
-	require.ErrorContains(t, err, "either")
+func TestCompileRejectsBadRatios(t *testing.T) {
+	_, err := Compile([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Engine: ratio(0)})}, true)
+	require.ErrorContains(t, err, "weights.engine.min must be positive")
 
-	_, err = Compile([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: ratio(0)})}, true)
+	_, err = Compile([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Engine: ratio(1, 0)})}, true)
 	require.Error(t, err)
 
-	_, err = Compile([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: ratio(1, 0)})}, true)
-	require.Error(t, err)
-
-	_, err = Compile([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: ratio(1)})}, false)
+	_, err = Compile([]v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Engine: ratio(1)})}, false)
 	require.ErrorContains(t, err, "weights is permitted only in Split mode")
 }
 
 func TestMaxRatioBelowMinIsNotClamped(t *testing.T) {
-	terms := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: ratio(3, 1)})}
+	terms := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Engine: ratio(3, 1)})}
 	m := matchFor(t, terms, v1beta1.EngineComponent)
 	require.Equal(t, int64(3), m.Weight)
 	require.Equal(t, int64(1), m.MaxWeight)
@@ -133,15 +128,15 @@ func TestOmittedRatioBoundsCountAsOne(t *testing.T) {
 		"max omitted":  {&v1beta1.ReplicaRatio{Min: ptr.To[int32](2)}, [2]int64{2, 1}},
 		"both omitted": {&v1beta1.ReplicaRatio{}, [2]int64{1, 1}},
 	} {
-		terms := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: tt.ratio})}
+		terms := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Engine: tt.ratio})}
 		m := matchFor(t, terms, v1beta1.EngineComponent)
 		require.Equal(t, tt.want, [2]int64{m.Weight, m.MaxWeight}, name)
 	}
 }
 
 func TestEmptyRatioWeighsAsATermWithoutRatio(t *testing.T) {
-	empty := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{EngineReplicas: &v1beta1.ReplicaRatio{}})}
+	empty := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Engine: &v1beta1.ReplicaRatio{}})}
 	require.True(t, UsesRatios(empty))
-	plain := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{DecoderReplicas: ratio(3, 4)})}
+	plain := []v1beta1.ClusterAffinityTerm{ratioTerm(v1beta1.ClusterAffinityWeights{Decoder: ratio(3, 4)})}
 	require.Equal(t, matchFor(t, plain, v1beta1.EngineComponent), matchFor(t, empty, v1beta1.EngineComponent))
 }

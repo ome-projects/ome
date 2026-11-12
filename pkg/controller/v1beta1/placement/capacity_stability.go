@@ -26,40 +26,66 @@ type capacityPending struct {
 // stableCapacity debounces hardware changes while retaining accepted authority.
 // Restarting resets a pending window; persisted accepted hardware needs no wait.
 func (r *Reconciler) stableCapacity(source *v1beta1.InferenceService, samples map[string]capacity.Sample, now time.Time) error {
-	current := map[string]*v1beta1.CandidateAllocationStatus{}
-	previous := map[string]*v1beta1.CandidateAllocationStatus{}
-	if source.Status.Placement != nil {
-		for _, candidate := range source.Status.Placement.Candidates {
-			previous[candidate.Cluster] = candidate.Allocation
-		}
-	}
-	for name, sample := range samples {
-		evidence, err := capacityEvidence(sample)
-		if err != nil {
-			return err
-		}
-		current[name] = &v1beta1.CandidateAllocationStatus{ClusterUID: sample.ClusterUID, Capacity: evidence}
-	}
-	// Removed members do not contribute to the new matched-set hardware ratios.
-	for name := range previous {
-		if _, matched := current[name]; !matched {
-			delete(previous, name)
-		}
+	current, err := recordedHardware(samples)
+	if err != nil {
+		return err
 	}
 	digest := hardwareDigest(current)
 	key := client.ObjectKeyFromObject(source)
 	r.capacityMu.Lock()
 	defer r.capacityMu.Unlock()
-	if source.Status.Placement == nil || source.Status.Placement.Plan == nil || digest == hardwareDigest(previous) {
+	if !hasAcceptedPlan(source) || digest == hardwareDigest(acceptedHardware(source, current)) {
 		delete(r.capacityPending, key)
 		return nil
 	}
+	return r.waitForStableHardware(key, source.UID, digest, now)
+}
+
+// recordedHardware is each sampled member's hardware as the plan records it.
+func recordedHardware(samples map[string]capacity.Sample) (map[string]*v1beta1.CandidateAllocationStatus, error) {
+	current := map[string]*v1beta1.CandidateAllocationStatus{}
+	for name, sample := range samples {
+		recorded, err := recordedCapacitySample(sample)
+		if err != nil {
+			return nil, err
+		}
+		current[name] = &v1beta1.CandidateAllocationStatus{ClusterUID: sample.ClusterUID, Capacity: recorded}
+	}
+	return current, nil
+}
+
+// hasAcceptedPlan reports whether the source carries a plan whose hardware
+// a change is measured against.
+func hasAcceptedPlan(source *v1beta1.InferenceService) bool {
+	return source.Status.Placement != nil && source.Status.Placement.Plan != nil
+}
+
+// acceptedHardware is the hardware the plan accepted for the members the
+// match still names. Removed members do not contribute to the new
+// matched-set hardware ratios.
+func acceptedHardware(source *v1beta1.InferenceService, matched map[string]*v1beta1.CandidateAllocationStatus) map[string]*v1beta1.CandidateAllocationStatus {
+	previous := map[string]*v1beta1.CandidateAllocationStatus{}
+	if source.Status.Placement == nil {
+		return previous
+	}
+	for _, candidate := range source.Status.Placement.Candidates {
+		if _, stillMatched := matched[candidate.Cluster]; stillMatched {
+			previous[candidate.Cluster] = candidate.Allocation
+		}
+	}
+	return previous
+}
+
+// waitForStableHardware holds a changed digest until it has stood for the
+// stability window. A digest, source or clock that differs from the pending
+// record starts the window again. The caller holds capacityMu.
+func (r *Reconciler) waitForStableHardware(key types.NamespacedName, uid types.UID, digest string, now time.Time) error {
 	pending, exists := r.capacityPending[key]
-	if !exists || pending.uid != source.UID || pending.digest != digest || now.Before(pending.since) {
+	if !exists || pending.uid != uid || pending.digest != digest || now.Before(pending.since) {
 		if r.capacityPending == nil {
 			r.capacityPending = map[types.NamespacedName]capacityPending{}
 		}
-		r.capacityPending[key] = capacityPending{uid: source.UID, digest: digest, since: now}
+		r.capacityPending[key] = capacityPending{uid: uid, digest: digest, since: now}
 		return fmt.Errorf("hardware change is waiting for the configured stability window")
 	}
 	if now.Sub(pending.since) < r.Capacity.StabilityWindow {

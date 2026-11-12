@@ -19,9 +19,7 @@ type IngressStrategy interface {
 // DomainService handles domain name generation logic
 type DomainService interface {
 	GenerateDomainName(name string, obj interface{}, ingressConfig *controllerconfig.IngressConfig) (string, error)
-	GenerateInternalDomainName(name string, obj interface{}, ingressConfig *controllerconfig.IngressConfig) (string, error)
 	GetAdditionalHosts(domainList *[]string, serviceHost string, config *controllerconfig.IngressConfig) *[]string
-	GetAdditionalHostsWithAnnotations(domainList *[]string, serviceHost string, config *controllerconfig.IngressConfig, annotations map[string]string) *[]string
 }
 
 // PathService handles URL path generation

@@ -3,7 +3,7 @@
 `MeasureUnit` measures the configured accelerator resources in a rendered
 Engine/Decoder replica unit. Each component supplies named sets of identical
 pods and an explicit count. A leader and its workers are separate sets. Router
-is absent from this input because it follows a per-home replica policy.
+is absent from this input because it follows a per-cluster replica policy.
 
 The caller must supply the complete member rendering, including runtime and
 service overrides, accelerator selection, worker counts, and any admission

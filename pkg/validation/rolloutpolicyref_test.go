@@ -205,8 +205,8 @@ func TestCoordinationUpdateWarnings_DeclaredRollingUpdateRefOneMemberBump(t *tes
 	}
 }
 
-// A pairing-protocol change is coordinated by a declared blueGreen/canary
-// ref group holding both components, and NOT by a declared-rollingUpdate one.
+// A pairing-protocol change is coordinated by a declared ref group of any
+// kind holding both components, and NOT by one holding only one of them.
 func TestValidatePairingProtocolUpdate_DeclaredKinds(t *testing.T) {
 	specWithProtocol := func(protocol string, groups ...v1beta1.RolloutGroup) *v1beta1.InferenceServiceSpec {
 		spec := omeNativeSpecWithGroups(groups...)
@@ -216,14 +216,16 @@ func TestValidatePairingProtocolUpdate_DeclaredKinds(t *testing.T) {
 	pair := []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}
 
 	oldSpec := specWithProtocol("kvproto-v1")
-	newSpec := specWithProtocol("kvproto-v2", refGroup(v1beta1.RolloutProgressionBlueGreen, pair...))
-	if err := ValidatePairingProtocolUpdate(oldSpec, newSpec); err != nil {
-		t.Errorf("declared-blueGreen ref pair group must coordinate the change: %v", err)
+	for _, kind := range []v1beta1.RolloutProgressionKind{v1beta1.RolloutProgressionBlueGreen, v1beta1.RolloutProgressionRollingUpdate, v1beta1.RolloutProgressionCanary} {
+		newSpec := specWithProtocol("kvproto-v2", refGroup(kind, pair...))
+		if err := ValidatePairingProtocolUpdate(oldSpec, newSpec); err != nil {
+			t.Errorf("declared-%s ref pair group must coordinate the change: %v", kind, err)
+		}
 	}
 
-	newSpec = specWithProtocol("kvproto-v2", refGroup(v1beta1.RolloutProgressionRollingUpdate, pair...))
+	newSpec := specWithProtocol("kvproto-v2", refGroup(v1beta1.RolloutProgressionRollingUpdate, v1beta1.EngineComponent))
 	wantReason(t, ValidatePairingProtocolUpdate(oldSpec, newSpec),
-		ReasonPairingProtocolChangeUncoordinated, "declared-rollingUpdate ref pair group")
+		ReasonPairingProtocolChangeUncoordinated, "declared-rollingUpdate ref group over the engine alone")
 }
 
 func TestValidateRolloutPolicyRefs(t *testing.T) {

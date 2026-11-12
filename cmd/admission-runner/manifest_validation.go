@@ -76,6 +76,13 @@ func seedBaseline(ctx context.Context, api client.Client, root string) error {
 	for _, obj := range catalog {
 		seeds[resourceKey(obj)] = obj
 	}
+	// A control plane plans each Split service against the proposed
+	// WorkloadCluster registrations.
+	for _, obj := range proposed {
+		if obj.GetKind() == "WorkloadCluster" {
+			seeds[resourceKey(obj)] = obj
+		}
+	}
 	for _, obj := range seeds {
 		if err := api.Create(ctx, obj, client.FieldValidation(metav1.FieldValidationStrict)); err != nil {
 			return fmt.Errorf("baseline %s is incompatible with selected CRD schema: %w", resourceKey(obj), err)
@@ -113,12 +120,14 @@ func authoredOrder(objects []*unstructured.Unstructured) {
 	}
 	rank := func(obj *unstructured.Unstructured) int {
 		switch obj.GetKind() {
-		case "ClusterBaseModel", "BaseModel":
+		case "RolloutPolicy", "AutoscalerPolicy":
 			return 0
-		case "ClusterServingRuntime", "ServingRuntime":
+		case "ClusterBaseModel", "BaseModel":
 			return 1
-		default:
+		case "ClusterServingRuntime", "ServingRuntime":
 			return 2
+		default:
+			return 3
 		}
 	}
 	sort.SliceStable(objects, func(i, j int) bool {
@@ -144,6 +153,12 @@ func validateAuthored(ctx context.Context, api client.Client, calls *trace, root
 		return nil, err
 	}
 	authoredOrder(objects)
+	servicesHooked := role != "control-plane"
+	if !servicesHooked {
+		if servicesHooked, err = splitPlanValidatorInstalled(ctx, api); err != nil {
+			return nil, err
+		}
+	}
 	var results []result
 	for _, obj := range objects {
 		if !supported[obj.GetKind()] {
@@ -158,7 +173,7 @@ func validateAuthored(ctx context.Context, api client.Client, calls *trace, root
 		} else if !apierrors.IsNotFound(getErr) {
 			return nil, getErr
 		}
-		one, err := probeResource(ctx, api, calls, obj, !(role == "control-plane" && obj.GetKind() == "InferenceService"))
+		one, err := probeResource(ctx, api, calls, obj, obj.GetKind() != "InferenceService" || servicesHooked)
 		if err != nil {
 			return nil, err
 		}

@@ -175,17 +175,26 @@ func expectHold(t *testing.T, allowed bool, gate v1beta1.RolloutHoldGate, reason
 // phase the engine's batch waits for the decoder's new Instances of that
 // batch under the Ratio gate with the first-side words, and the decoder's
 // own start is admitted; an attempt of the named side's batch that ended
-// Failed settles that batch, so the engine's batch opens on it while the
-// decoder's own next start waits for the engine's batch as any start does.
+// Failed and waits on the schedule settles that batch, so the engine's
+// batch opens on it while the decoder's own next start waits for the
+// engine's batch as any start does. An attempt that ended with nothing
+// counted on the record, as the placement grace ends one, is started
+// again at once: the side's next start is that attempt and asks as its
+// own batch, and the other side keeps waiting on it with the Instance
+// named.
 func TestEvaluateUpdateGate_FirstSideHoldsWhateverPhaseTheGroupReads(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	ru, bg := v1beta1.CoordinationPolicyRollingUpdate, v1beta1.CoordinationPolicyBlueGreen
 	type picture struct {
-		name       string
-		build      func(engine, decoder batchMemberFixture) referencePicture
-		policy     v1beta1.CoordinationPolicy
-		wantPhase  v1beta1.CoordinationPhase
-		wantReason string // the engine's hold, or admitted when empty
+		name      string
+		build     func(engine, decoder batchMemberFixture) referencePicture
+		policy    v1beta1.CoordinationPolicy
+		wantPhase v1beta1.CoordinationPhase
+		// wantPhaseSurge is the phase on the surge path when it differs: a
+		// surge that ended while its old pod serves publishes Ready with the
+		// target kept, and the group reads no Failed row for it.
+		wantPhaseSurge v1beta1.CoordinationPhase
+		wantReason     string // the engine's hold, or admitted when empty
 		// decoderWait is the hold on the decoder's own start, admitted when
 		// empty; the first-side rule never holds the named side, so a hold
 		// here is the previous-batch rule's or the budget's.
@@ -226,22 +235,40 @@ func TestEvaluateUpdateGate_FirstSideHoldsWhateverPhaseTheGroupReads(t *testing.
 			wantReason: "engine batch 2 waits for decoder batch 2 to serve first (1 of 2 serving)",
 		},
 		{
-			name: "a prefill attempt of the batch ended Failed",
+			name: "a prefill attempt of the batch ended Failed and waits on the schedule",
 			build: func(e, d batchMemberFixture) referencePicture {
-				e.promoted, e.failed, d.promoted = 1, 1, 1
+				e.promoted, e.failed, e.backoff, d.promoted = 1, 1, 1, 1
 				return referencePicture{engine: e, decoder: d}
 			},
 			policy: ru, wantPhase: v1beta1.CoordinationPhaseFailed,
 			wantReason: "engine batch 2 waits for decoder batch 2 to serve first (1 of 2 serving)",
 		},
 		{
-			name: "the decoder's first attempt ended Failed: an ended attempt settles the batch, so the engine's first batch opens",
+			name: "the decoder's first attempt ended Failed and waits on the schedule: the ended attempt settles the batch, so the engine's first batch opens",
 			build: func(e, d batchMemberFixture) referencePicture {
-				d.failed = 1
+				d.failed, d.backoff = 1, 1
 				return referencePicture{engine: e, decoder: d}
 			},
 			policy: ru, wantPhase: v1beta1.CoordinationPhaseFailed,
 			decoderWait: "decoder batch 2 waits for engine batch 1 to serve (0 of 2 serving)",
+		},
+		{
+			name: "a prefill attempt of the batch ended with nothing counted: the prefill's next start is that attempt again and the decoder waits on it",
+			build: func(e, d batchMemberFixture) referencePicture {
+				e.promoted, e.graceEnded, d.promoted = 1, 1, 1
+				return referencePicture{engine: e, decoder: d}
+			},
+			policy: ru, wantPhase: v1beta1.CoordinationPhaseFailed, wantPhaseSurge: v1beta1.CoordinationPhaseScalingDown,
+			decoderWait: "decoder batch 2 waits for engine batch 1 to serve (1 of 2 serving; engine Instance 1 Unschedulable, starts again)",
+		},
+		{
+			name: "the decoder's first attempt ended with nothing counted: the decoder starts it again and the engine's first batch waits on it",
+			build: func(e, d batchMemberFixture) referencePicture {
+				d.graceEnded = 1
+				return referencePicture{engine: e, decoder: d}
+			},
+			policy: ru, wantPhase: v1beta1.CoordinationPhaseFailed, wantPhaseSurge: v1beta1.CoordinationPhaseSurging,
+			wantReason: "engine batch 1 waits for decoder batch 1 to serve first (0 of 1 serving; decoder Instance 0 Unschedulable, starts again)",
 		},
 	}
 	for _, shape := range referenceShapes {
@@ -257,8 +284,12 @@ func TestEvaluateUpdateGate_FirstSideHoldsWhateverPhaseTheGroupReads(t *testing.
 					}
 					engine, decoder := shape.build(strategy.strategy)
 					p := pic.build(engine, decoder)
-					if got := p.phase(pic.policy); got != pic.wantPhase {
-						t.Fatalf("the group reads %s, want %s", got, pic.wantPhase)
+					wantPhase := pic.wantPhase
+					if pic.wantPhaseSurge != "" && strategy.strategy == v1beta1.UpdateStrategySurgeThenDrain {
+						wantPhase = pic.wantPhaseSurge
+					}
+					if got := p.phase(pic.policy); got != wantPhase {
+						t.Fatalf("the group reads %s, want %s", got, wantPhase)
 					}
 					allowed, gate, reason := p.ask(t, group, eng, strategy.mechanism, referenceRules())
 					expectHold(t, allowed, gate, reason, v1beta1.RolloutHoldGateRatio, pic.wantReason)
@@ -295,7 +326,7 @@ func TestEvaluateUpdateGate_FirstSideHoldsWhateverPhaseTheGroupReads(t *testing.
 func TestEvaluateUpdateGate_BatchStepReadsALostPodInsideABatch(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	ru := v1beta1.CoordinationPolicyRollingUpdate
-	budgetHold := "unavailable budget 1 exhausted (current 1, in-flight 0, would become 2)"
+	budgetHold := "unavailable budget 1 exhausted (current 1, in-flight 0, would become 2); counted as unavailable: Instance 0 being rebuilt"
 	type picture struct {
 		name       string
 		build      func(engine, decoder batchMemberFixture) referencePicture
@@ -384,10 +415,12 @@ func TestEvaluateUpdateGate_BatchStepReadsALostPodInsideABatch(t *testing.T) {
 // plan one and one, so the prefill side's four started read as four batches
 // and it waits for the decoder's fourth; the decode side's budget raised to
 // a quarter plans 2, 2, 2, 2, 2 prefill beside 2, 2, 1, 1, 2 decode, so the
-// engine waits for a decoder batch of two. The group's own budget edited
-// mid-run is read from the plan recorded at the run's open until the run
-// closes, so the steps stand. The phase the pass computes from the same
-// replicas does not move on any of the edits.
+// engine waits for a decoder batch of two. The group's own budget lowered
+// to one Instance mid-run is read from the spec at the next consult too,
+// while the run keeps the plan it recorded: both steps read one, so the
+// sides wait as they do under the prefill side's own budget of one. The
+// phase the pass computes from the same replicas does not move on any of
+// the edits.
 func TestEvaluateUpdateGate_AMemberBudgetEditedMidBatchResizesTheStep(t *testing.T) {
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
 	ru := v1beta1.CoordinationPolicyRollingUpdate
@@ -452,18 +485,24 @@ func TestEvaluateUpdateGate_AMemberBudgetEditedMidBatchResizesTheStep(t *testing
 				expectHold(t, allowed, gate, reason, v1beta1.RolloutHoldGateRatio, e.decodeWait)
 			})
 		}
-		t.Run(strategy.name+"/the group's budget lowered mid-run stands recorded until the run closes", func(t *testing.T) {
+		t.Run(strategy.name+"/the group's budget lowered to one mid-run resizes both steps from the next start", func(t *testing.T) {
 			engine, decoder := twelveEight(strategy.strategy)
 			engine.promoted, decoder.promoted = 2, 1
 			p := referencePicture{engine: started(engine, 2), decoder: started(decoder, 1)}
-			isvc := batchService(quarter[strategy.strategy], p.members())
-			one := intstr.FromInt32(1)
-			isvc.Spec.Rollout.Groups[0].RollingUpdate.MaxUnavailable = &one
-			isvc.Spec.Rollout.Groups[0].RollingUpdate.MaxSurge = &one
+			lowered := quarter[strategy.strategy]
+			lowered.edit = func(spec *v1beta1.RolloutSpec) {
+				one := intstr.FromInt32(1)
+				spec.Groups[0].RollingUpdate.MaxUnavailable = &one
+				spec.Groups[0].RollingUpdate.MaxSurge = &one
+			}
+			isvc := batchService(lowered, p.members())
+			if recorded := isvc.Status.Rollout.ActiveRun.Plan.Groups[0].Group.RollingUpdate; recorded.MaxSurge != nil && recorded.MaxSurge.String() == "1" {
+				t.Fatal("the run must keep the budget it recorded")
+			}
 			allowed, gate, reason := batchGateWith(t, isvc, p.client(t), eng, strategy.mechanism, 0, referenceRules())
-			expectHold(t, allowed, gate, reason, v1beta1.RolloutHoldGateRatio, edits[0].engineWait)
+			expectHold(t, allowed, gate, reason, v1beta1.RolloutHoldGateRatio, "engine batch 5 waits for decoder batch 4 to serve (1 of 4 serving)")
 			allowed, gate, reason = batchGateWith(t, isvc, p.client(t), dec, strategy.mechanism, 0, referenceRules())
-			expectHold(t, allowed, gate, reason, v1beta1.RolloutHoldGateRatio, edits[0].decodeWait)
+			expectHold(t, allowed, gate, reason, v1beta1.RolloutHoldGateRatio, "decoder batch 3 waits for decoder batch 2 to serve (1 of 2 serving)")
 		})
 	}
 }

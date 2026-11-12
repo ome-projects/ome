@@ -129,9 +129,9 @@ func checkConfig(ctx context.Context, kube kubernetes.Interface, inventory *Inve
 // checkSchema runs the manager's startup schema preflight through the
 // cluster's discovery endpoint.
 func checkSchema(client openapi.Client) SchemaReport {
-	err := schemapreflight.Verify(client)
+	capabilities, err := schemapreflight.Verify(client)
 	if err == nil {
-		return SchemaReport{OK: true}
+		return SchemaReport{OK: true, MissingReadySinceColumns: capabilities.MissingReadySinceColumns}
 	}
 	return SchemaReport{Error: err.Error(), stale: errors.Is(err, schemapreflight.ErrSchemaIncompatible)}
 }

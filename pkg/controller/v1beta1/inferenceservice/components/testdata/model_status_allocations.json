@@ -1,0 +1,28 @@
+{
+  "recordedOn": {
+    "date": "2026-11-04",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The component status writer of one service pass, per deployment mode, over an engine of 1,000 and 4,000 pods: it initialises the ready condition, mirrors the autoscaler status (class none) and reads the model-loading state from the Component's pods that carry the raw app label. The pod list is answered the way the informer cache answers it: every pod of the namespace is walked and the matches are deep-copied, five allocations per copied pod. Every RawDeployment pod carries the label; of a MultiNode group of eight only the leader does. An OMENative pod never does, so the writer makes no list for that mode and writes the state as for no pod: 11 allocations, the writer's own. Before, it listed for every mode: the OMENative list walked every pod of the namespace, copied none and cost 20 allocations and 150 microseconds at 4,000 pods.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "MultiNode/1000/allocations": 665,
+    "MultiNode/1000/app-label-pod-lists": 1,
+    "MultiNode/1000/pods-copied": 125,
+    "MultiNode/4000/allocations": 2542,
+    "MultiNode/4000/app-label-pod-lists": 1,
+    "MultiNode/4000/pods-copied": 500,
+    "OMENative/1000/allocations": 11,
+    "OMENative/1000/app-label-pod-lists": 0,
+    "OMENative/1000/pods-copied": 0,
+    "OMENative/4000/allocations": 11,
+    "OMENative/4000/app-label-pod-lists": 0,
+    "OMENative/4000/pods-copied": 0,
+    "RawDeployment/1000/allocations": 5045,
+    "RawDeployment/1000/app-label-pod-lists": 1,
+    "RawDeployment/1000/pods-copied": 1000,
+    "RawDeployment/4000/allocations": 20049,
+    "RawDeployment/4000/app-label-pod-lists": 1,
+    "RawDeployment/4000/pods-copied": 4000
+  }
+}

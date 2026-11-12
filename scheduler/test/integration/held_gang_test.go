@@ -7,7 +7,7 @@ import (
 
 // A gang the cluster cannot place yet is watched for holdWindow from the
 // moment its pods exist. The scheduler tries each pod, finds the gang cannot
-// form, and parks both until a registered event or a backoff says otherwise:
+// form, and holds both until a registered event or a backoff says otherwise:
 // a few attempts in all. A gang that cycles instead shows hundreds of attempts
 // and status patches per second here, and loses a pod when the scheduler's
 // queue pops a copy it still tracks as in flight.
@@ -50,7 +50,7 @@ func watchHeldGang(t *testing.T, patches *statusPatchCounter, window time.Durati
 // b; a fourth gang's leader is vetoed in rack a by its spread constraint while
 // rack b has no room. The worker takes rack a and waits at the gate, the leader
 // is vetoed there, and the gang unwinds. Nothing in the cluster changes after
-// that, so the scheduler must park both pods after a few attempts, send a few
+// that, so the scheduler must hold both pods after a few attempts, send a few
 // status patches at most, and discard no pod.
 func TestHeldGangWaitsForAChange(t *testing.T) {
 	patches := &statusPatchCounter{}

@@ -80,6 +80,8 @@ func TestValidateRatioDrainFeasibility_GroupShapes_RefusesDrainsPastTwiceToleran
 		spec               *v1beta1.InferenceServiceSpec
 		defaultTolerance   *int32
 		defaultMinReplicas *int
+		// defaultStrategies is the operator's per-Component strategy fill.
+		defaultStrategies map[v1beta1.ComponentType]v1beta1.UpdateStrategyType
 		// wantSubstrings are all expected in the rejection; empty accepts.
 		wantSubstrings []string
 	}{
@@ -96,10 +98,42 @@ func TestValidateRatioDrainFeasibility_GroupShapes_RefusesDrainsPastTwiceToleran
 			spec: ratioSpec(&ratioMemberShape{6, surge, false}, &ratioMemberShape{2, recreate, false}, nil, ptr.To[int32](50)),
 		},
 		{
-			name: "a RecreatePod decoder beside an engine with an unset strategy at tolerance 20: the unset member does not step at admission, so the ratio check keeps the decoder",
+			name: "a RecreatePod decoder beside an engine with no declared strategy at tolerance 20: the engine rolls as SurgeThenDrain, the rollout's reading of no strategy, so the batch step paces the pair, admitted",
 			spec: ratioSpec(&ratioMemberShape{6, "", false}, &ratioMemberShape{2, recreate, false}, nil, ptr.To[int32](20)),
+		},
+		{
+			name:              "the same pair under an operator fill of InPlaceIfPossible for the engine: the fill makes the engine patch single pods in place, which does not step, so the ratio check keeps the decoder",
+			spec:              ratioSpec(&ratioMemberShape{6, "", false}, &ratioMemberShape{2, recreate, false}, nil, ptr.To[int32](20)),
+			defaultStrategies: map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: inPlace},
 			wantSubstrings: []string{"the decoder rolls drain-first (RecreatePod)", "100 points off",
 				"give the engine a SurgeThenDrain or RecreatePod update strategy, which hands the pacing to the batch step", ReasonRatioDrainInfeasible},
+		},
+		{
+			name:              "the same pair under an operator fill of RecreatePod for the engine: both roll drain-first, so the batch step paces the pair, admitted",
+			spec:              ratioSpec(&ratioMemberShape{6, "", false}, &ratioMemberShape{2, recreate, false}, nil, ptr.To[int32](20)),
+			defaultStrategies: map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: recreate},
+		},
+		{
+			name:              "a fill for the decoder alone leaves the engine with no declared strategy rolling as SurgeThenDrain: the batch step paces the pair, admitted",
+			spec:              ratioSpec(&ratioMemberShape{6, "", false}, &ratioMemberShape{2, recreate, false}, nil, ptr.To[int32](20)),
+			defaultStrategies: map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.DecoderComponent: inPlace},
+		},
+		{
+			name:              "a declared SurgeThenDrain engine under an operator fill of InPlaceIfPossible keeps surging: the declared strategy wins over the fill, so the batch step paces the pair, admitted",
+			spec:              ratioSpec(&ratioMemberShape{6, surge, false}, &ratioMemberShape{2, recreate, false}, nil, ptr.To[int32](20)),
+			defaultStrategies: map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: inPlace},
+		},
+		{
+			name:              "a decoder with no declared strategy under an operator fill of RecreatePod beside an in-place single-pod engine at tolerance 20: the decoder rolls drain-first by the fill and the engine does not step, so its first drain is read and refused",
+			spec:              ratioSpec(&ratioMemberShape{6, inPlace, false}, &ratioMemberShape{2, "", false}, nil, ptr.To[int32](20)),
+			defaultStrategies: map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.DecoderComponent: recreate},
+			wantSubstrings:    []string{"the decoder rolls drain-first (RecreatePod)", "100 points off", ReasonRatioDrainInfeasible},
+		},
+		{
+			name:              "a gang engine of 2 with no declared strategy under an operator fill of InPlaceIfPossible beside an in-place single-pod decoder of 6 at tolerance 20: the fill's in-place update rebuilds the whole gang, read as a drain, and the decoder does not step, refused",
+			spec:              ratioSpec(&ratioMemberShape{2, "", true}, &ratioMemberShape{6, inPlace, false}, nil, ptr.To[int32](20)),
+			defaultStrategies: map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: inPlace},
+			wantSubstrings:    []string{"the engine rolls drain-first (InPlaceIfPossible on multi-node gangs, which rebuilds the whole gang)", "100 points off", ReasonRatioDrainInfeasible},
 		},
 		{
 			name: "a RecreatePod decoder beside an in-place single-pod engine at tolerance 20: the engine keeps its pods and does not step, so the ratio check keeps the decoder",
@@ -117,6 +151,11 @@ func TestValidateRatioDrainFeasibility_GroupShapes_RefusesDrainsPastTwiceToleran
 		{
 			name: "a single-replica RecreatePod decoder beside a SurgeThenDrain engine: the batch step takes the side of one in its first batch, admitted",
 			spec: ratioSpec(&ratioMemberShape{4, surge, false}, &ratioMemberShape{1, recreate, false}, nil, ptr.To[int32](100)),
+		},
+		{
+			name:           "a single-replica RecreatePod engine beside an in-place decoder of two at tolerance 20 is rejected: the engine's one drain leaves nothing serving and the decoder does not step",
+			spec:           ratioSpec(&ratioMemberShape{1, recreate, false}, &ratioMemberShape{2, inPlace, false}, nil, ptr.To[int32](20)),
+			wantSubstrings: []string{"single replica", "nothing serving", ReasonRatioDrainInfeasible},
 		},
 		{
 			name: "a single-replica RecreatePod decoder beside an in-place single-pod engine is rejected even at tolerance 100",
@@ -265,7 +304,7 @@ func TestValidateRatioDrainFeasibility_GroupShapes_RefusesDrainsPastTwiceToleran
 			defaultTolerance: ptr.To[int32](20),
 		},
 		{
-			name: "an unset update strategy is not classified drain-first at admission",
+			name: "no declared strategy on either side at tolerance 20: both roll as SurgeThenDrain and the batch step paces the pair, admitted",
 			spec: ratioSpec(&ratioMemberShape{6, "", false}, &ratioMemberShape{2, "", false}, nil, ptr.To[int32](20)),
 		},
 		{
@@ -312,7 +351,7 @@ func TestValidateRatioDrainFeasibility_GroupShapes_RefusesDrainsPastTwiceToleran
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateRatioDrainFeasibility(tt.spec, RatioDrainDefaults{TolerancePercent: tt.defaultTolerance, MinReplicas: tt.defaultMinReplicas})
+			err := ValidateRatioDrainFeasibility(tt.spec, RatioDrainDefaults{TolerancePercent: tt.defaultTolerance, MinReplicas: tt.defaultMinReplicas, UpdateStrategyTypes: tt.defaultStrategies})
 			if len(tt.wantSubstrings) == 0 {
 				if err != nil {
 					t.Fatalf("expected the spec to be admitted, got %v", err)
@@ -427,8 +466,9 @@ func TestValidateRatioDrainFeasibility_NoDecoder_WaysOutOmitTheBatchStep(t *test
 
 // batchStepGoverns reads the engine's rule off the declared members: the
 // engine and the decoder both listed and each stepping, drain-first or
-// SurgeThenDrain; a member with no declared strategy or one that patches
-// single pods in place does not step, and a router does not decide it.
+// SurgeThenDrain; a member with no declared strategy rolls as SurgeThenDrain
+// and steps, one that patches single pods in place does not step, and a
+// router does not decide it.
 func TestBatchStepGoverns_MemberStrategies_TrueOnlyWhenEngineAndDecoderStep(t *testing.T) {
 	recreate, surge, inPlace := v1beta1.UpdateStrategyRecreatePod, v1beta1.UpdateStrategySurgeThenDrain, v1beta1.UpdateStrategyInPlaceIfPossible
 	shape := func(strategy v1beta1.UpdateStrategyType) *ratioMemberShape {
@@ -444,7 +484,7 @@ func TestBatchStepGoverns_MemberStrategies_TrueOnlyWhenEngineAndDecoderStep(t *t
 		{"a surging engine steps on its surges: paced by the batch step", shape(surge), shape(recreate), nil, true},
 		{"engine and decoder both surging: paced by the batch step", shape(surge), shape(surge), nil, true},
 		{"a decoder that patches single pods in place keeps the ratio check in charge", shape(recreate), shape(inPlace), nil, false},
-		{"a decoder with no declared strategy keeps the ratio check in charge at admission", shape(recreate), shape(""), nil, false},
+		{"a decoder with no declared strategy rolls as SurgeThenDrain and steps on its surges: paced by the batch step", shape(recreate), shape(""), nil, true},
 		{"an engine that patches single pods in place keeps the ratio check in charge", shape(inPlace), shape(surge), nil, false},
 		{"a single member has no peer to batch with", shape(recreate), nil, nil, false},
 		{"an in-place router does not decide it", shape(recreate), shape(recreate), shape(inPlace), true},
@@ -457,7 +497,40 @@ func TestBatchStepGoverns_MemberStrategies_TrueOnlyWhenEngineAndDecoderStep(t *t
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			spec := ratioSpec(tt.engine, tt.decoder, tt.router, ptr.To[int32](20))
-			members := ratioGroupMembers(spec, spec.Rollout.Groups[0].Components, nil)
+			members := ratioGroupMembers(spec, spec.Rollout.Groups[0].Components, RatioDrainDefaults{})
+			if got := batchStepGoverns(members); got != tt.want {
+				t.Fatalf("batchStepGoverns = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A member with no declared strategy rolls by the operator's fill for its
+// Component when one is configured: the fill decides whether it steps the
+// way a declared strategy would, and a declared strategy wins over the fill.
+func TestBatchStepGoverns_OperatorFill_ResolvesAnUndeclaredStrategy(t *testing.T) {
+	recreate, surge, inPlace := v1beta1.UpdateStrategyRecreatePod, v1beta1.UpdateStrategySurgeThenDrain, v1beta1.UpdateStrategyInPlaceIfPossible
+	shape := func(strategy v1beta1.UpdateStrategyType, gang bool) *ratioMemberShape {
+		return &ratioMemberShape{2, strategy, gang}
+	}
+	tests := []struct {
+		name            string
+		engine, decoder *ratioMemberShape
+		fill            map[v1beta1.ComponentType]v1beta1.UpdateStrategyType
+		want            bool
+	}{
+		{"no fill: an undeclared decoder surges and steps", shape(recreate, false), shape("", false), nil, true},
+		{"a SurgeThenDrain fill: the decoder surges and steps", shape(recreate, false), shape("", false), map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.DecoderComponent: surge}, true},
+		{"a RecreatePod fill: the decoder drains first and steps", shape(recreate, false), shape("", false), map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.DecoderComponent: recreate}, true},
+		{"an in-place fill on a single-pod decoder: it patches pods in place and keeps the ratio check in charge", shape(recreate, false), shape("", false), map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.DecoderComponent: inPlace}, false},
+		{"an in-place fill on a gang engine: the rebuild is a drain, so it steps", shape("", true), shape(recreate, false), map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: inPlace}, true},
+		{"a fill for the other Component does not reach an undeclared decoder", shape(recreate, false), shape("", false), map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: inPlace}, true},
+		{"a declared SurgeThenDrain engine keeps surging under an in-place fill", shape(surge, false), shape(recreate, false), map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{v1beta1.EngineComponent: inPlace}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := ratioSpec(tt.engine, tt.decoder, nil, ptr.To[int32](20))
+			members := ratioGroupMembers(spec, spec.Rollout.Groups[0].Components, RatioDrainDefaults{UpdateStrategyTypes: tt.fill})
 			if got := batchStepGoverns(members); got != tt.want {
 				t.Fatalf("batchStepGoverns = %v, want %v", got, tt.want)
 			}

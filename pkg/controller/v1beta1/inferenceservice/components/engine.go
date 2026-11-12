@@ -18,7 +18,6 @@ import (
 )
 
 var _ Component = &Engine{}
-var _ ComponentConfig = &Engine{}
 
 // Engine reconciles resources for the engine component
 type Engine struct {
@@ -28,10 +27,9 @@ type Engine struct {
 }
 
 // NewEngine creates a new Engine component instance. deps carries the
-// process-lifetime wiring (client, live APIReader, Expectations cache,
-// recorder — any may be nil; the OMENative backend falls back to the
-// cached client, the DefaultExpectations singleton, and a no-op event
-// recorder respectively); in carries the per-reconcile pipeline output.
+// process-lifetime wiring (client, live APIReader, recorder; any may be
+// nil, and the OMENative backend then falls back to the cached client and
+// a no-op event recorder); in carries the per-reconcile pipeline output.
 func NewEngine(deps *ComponentDeps, in ComponentInputs, engineSpec *v1beta1.EngineSpec) Component {
 	base := newBaseComponentFields(deps, in, "EngineReconciler")
 
@@ -181,8 +179,10 @@ func (e *Engine) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 			TopologySpread:            e.engineSpec.TopologySpread,
 			TopologySpreadKey:         e.engineSpec.TopologySpreadKey,
 			PacingPartition:           e.PacingPartition,
+			RollbackToRevision:        e.RollbackToRevision,
 			CoordinatorFollower:       e.CoordinatorFollower,
 			CoordinatorTarget:         e.CoordinatorTarget,
+			FollowerReleased:          e.FollowerReleased,
 			ResolvedAutoscaler:        res.Resolved,
 			PreserveAutoscaler:        res.Hold,
 			QuotaAcceleratorResources: e.QuotaAcceleratorResources,
@@ -228,63 +228,4 @@ func (e *Engine) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 // updateEngineStatus updates the status of the engine
 func (e *Engine) updateEngineStatus(isvc *v1beta1.InferenceService, objectMeta metav1.ObjectMeta) error {
 	return UpdateComponentStatus(&e.BaseComponentFields, isvc, v1beta1.EngineComponent, objectMeta, &e.engineSpec.ComponentExtensionSpec)
-}
-
-// The render steps below expose the library one step at a time for the tests
-// that exercise them in isolation; Reconcile renders through
-// render.RenderEngine. Unlike RenderEngine, they complete the runner
-// containers in place on the engine spec.
-
-// reconcileObjectMeta builds the engine's object metadata.
-func (e *Engine) reconcileObjectMeta(_ context.Context, isvc *v1beta1.InferenceService) (metav1.ObjectMeta, error) {
-	var engineAnnotations, engineLabels map[string]string
-	if e.engineSpec != nil {
-		engineAnnotations = e.engineSpec.Annotations
-		engineLabels = e.engineSpec.Labels
-	}
-
-	return ReconcileComponentObjectMeta(&e.BaseComponentFields, isvc, v1beta1.EngineComponent, render.ComponentName(isvc, v1beta1.EngineComponent), engineAnnotations, engineLabels)
-}
-
-// engineUsesLeaderTemplate reports whether the engine sources its primary
-// pod template from the Leader block.
-func engineUsesLeaderTemplate(spec *v1beta1.EngineSpec) bool {
-	return render.EngineUsesLeaderTemplate(spec)
-}
-
-// reconcilePodSpec renders the engine's primary pod.
-func (e *Engine) reconcilePodSpec(isvc *v1beta1.InferenceService, objectMeta *metav1.ObjectMeta) (*v1.PodSpec, error) {
-	return render.EnginePodSpec(&e.Piece, isvc, e.engineSpec, objectMeta)
-}
-
-// reconcileWorkerPodSpec renders the engine's worker pod, nil without a worker.
-func (e *Engine) reconcileWorkerPodSpec(isvc *v1beta1.InferenceService, objectMeta *metav1.ObjectMeta) (*v1.PodSpec, error) {
-	return render.EngineWorkerPodSpec(&e.Piece, isvc, e.engineSpec, objectMeta)
-}
-
-// GetComponentType implements ComponentConfig interface
-func (e *Engine) GetComponentType() v1beta1.ComponentType {
-	return v1beta1.EngineComponent
-}
-
-// GetComponentSpec implements ComponentConfig interface
-func (e *Engine) GetComponentSpec() *v1beta1.ComponentExtensionSpec {
-	if e.engineSpec == nil {
-		return nil
-	}
-	return &e.engineSpec.ComponentExtensionSpec
-}
-
-// GetServiceSuffix implements ComponentConfig interface
-func (e *Engine) GetServiceSuffix() string {
-	return "-engine"
-}
-
-// ValidateSpec implements ComponentConfig interface
-func (e *Engine) ValidateSpec() error {
-	if e.engineSpec == nil {
-		return errors.New("engine spec is nil")
-	}
-	// Add more validation logic as needed
-	return nil
 }

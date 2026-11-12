@@ -588,6 +588,16 @@ func TestValidateMultiPodLeanRunner_LeanMultiPod_RequiresLeaderAndWorkerImages(t
 			},
 		},
 		{
+			name: "lean multi-pod engine, no runner on either role — REJECT",
+			spec: &v1beta1.InferenceServiceSpec{
+				Engine: &v1beta1.EngineSpec{
+					Leader: &v1beta1.LeaderSpec{},
+					Worker: &v1beta1.WorkerSpec{Size: sizePtr(1)},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name: "lean multi-pod engine, leader image missing — REJECT",
 			spec: &v1beta1.InferenceServiceSpec{
 				Engine: &v1beta1.EngineSpec{
@@ -834,10 +844,6 @@ func TestValidateComponentAutoscaler_ClassShapes_AcceptsCompleteBlocksOnly(t *te
 			wantErrContains: "is not one of HPA|KEDA|External|None",
 		},
 		{
-			name: "nil componentExt — no error",
-			ext:  nil,
-		},
-		{
 			name: "nil Autoscaler block — no error",
 			ext: &v1beta1.ComponentExtensionSpec{
 				MinReplicas: ptr.To[int](1),
@@ -848,7 +854,7 @@ func TestValidateComponentAutoscaler_ClassShapes_AcceptsCompleteBlocksOnly(t *te
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateComponentAutoscaler(tc.ext)
+			err := ValidateAutoscaler(tc.ext.Autoscaler, tc.ext.MinReplicas)
 			if tc.wantErr && err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -864,14 +870,11 @@ func TestValidateComponentAutoscaler_ClassShapes_AcceptsCompleteBlocksOnly(t *te
 	}
 }
 
-// TestValidateAutoscaler_KedaIdleCountVsMinReplicas_RejectsIdleAtOrAboveMin covers the (autoscaler, minReplicas) core
-// signature that lets callers without a parent ComponentExtensionSpec
-// (notably the InferenceReplica webhook) validate without synthesizing
-// one to fit the ValidateComponentAutoscaler shape.
-//
-// The behaviour parity with ValidateComponentAutoscaler is covered by
-// TestValidateComponentAutoscaler_ClassShapes_AcceptsCompleteBlocksOnly above — this test asserts the cases
-// that are only reachable through the direct signature.
+// TestValidateAutoscaler_KedaIdleCountVsMinReplicas_RejectsIdleAtOrAboveMin covers the idle-count
+// rule against minReplicas, which every caller passes beside the block (the
+// InferenceReplica webhook carries replicas on the IR spec, not in a
+// ComponentExtensionSpec). The class shapes are covered by
+// TestValidateComponentAutoscaler_ClassShapes_AcceptsCompleteBlocksOnly above.
 func TestValidateAutoscaler_KedaIdleCountVsMinReplicas_RejectsIdleAtOrAboveMin(t *testing.T) {
 	validKedaTriggers := []kedav1.ScaleTriggers{{
 		Type:     "prometheus",

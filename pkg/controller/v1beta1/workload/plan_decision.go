@@ -101,8 +101,15 @@ type MigrationSelection struct {
 
 	// Head is the record the pass drives: the oldest one that is not
 	// parked. Nil when every record is parked, or when the oldest one
-	// is a fresh record the surge gate holds back.
+	// is a fresh record waiting for the roll.
 	Head *types.MigrationRecord
+
+	// WaitingForRoll is the record the pass would otherwise drive, when it is a
+	// fresh record and a roll's surge replacement is in flight: a move
+	// surges one more Instance, so it waits for a pass with no surge
+	// replacement in flight. The pass records the wait on it and drives
+	// nothing.
+	WaitingForRoll *types.MigrationRecord
 }
 
 // UpdateItem is one Instance the update pass touches, in plan order.
@@ -122,22 +129,25 @@ type UpdateItem struct {
 	// out of service — evidence.PodSetServesNothing — or one the count
 	// already excludes on a member held in a waiting state or missing —
 	// evidence.PodSetUnavailableOnParkedMember, evidence.PodSetShortOfMember —
-	// or with no pod left that could serve — PodSetLost); the plan gate
-	// and the per-Component budget still apply.
+	// or with no pod left that could serve — PodSetLost — or one the gate
+	// reads as down by the window, ServingUnproven); the plan gate and the
+	// per-Component budget still apply.
 	CoordGateExempt bool
+	// ServingUnproven: the fresh drain-first start's Instance is Ready only
+	// as a comeback inside the proven window (workloadops.InstanceServingUnproven),
+	// which the gate counts as down already, so the start skips the consult
+	// and, like every other exempt start, is not charged to the gate's
+	// within-pass delta: the gate keeps counting the Instance on its own,
+	// through the pass's pod list and then through the attempt on its row.
+	ServingUnproven bool
 	// ReplacesUnservingPodSet: the fresh start replaces an Instance that
 	// serves nothing by the graced reading the budgets and the gate share
 	// (replacesUnservingPodSet).
 	ReplacesUnservingPodSet bool
-	// OutOfRotation: the fresh start's Instance serves nothing at this
-	// pass — an unserving one (ReplacesUnservingPodSet), a pod set with
-	// no routed pod in rotation, its grace run or not
-	// (evidence.PodSetOutOfRotation), or one with no pod left that could
-	// serve (PodSetLost).
-	// Taking it first costs no capacity, so such starts are listed ahead
-	// of the rest and the budget reaches them before any serving Instance
-	// is taken offline; the budgets and the gate still read the grace.
-	OutOfRotation bool
+	// Rank is the place the fresh start takes in the pass's order, read
+	// from what its Instance serves (startRank). The budgets and the gate
+	// still read the grace.
+	Rank StartRank
 	// RecreateFallback: the Component's in-place strategy runs as a
 	// recreate on this Instance (ops.InPlaceFallsBackToRecreate: a gang, or
 	// a single-pod diff beyond container images), so the fresh start is
@@ -157,14 +167,50 @@ type UpdateItem struct {
 	CleanupOnly bool
 }
 
+// StartRank is the place a fresh start takes in the pass's order, read
+// from what its Instance serves: the roll takes the Instances that serve
+// nothing first, then the ones not serving steadily, then the ones that
+// serve.
+type StartRank int
+
+const (
+	// StartRankServesNothing: no pod of the set could serve, or no routed
+	// pod of the set is in rotation now and the row published no serving
+	// pod. The start restores capacity.
+	StartRankServesNothing StartRank = iota
+	// StartRankNotSteady: no routed pod of the set is in rotation now
+	// under a row that published a serving pod, or the row reads Failed
+	// with no serving pod while its set is back, or the row remembers a
+	// crash of its promoted set, which serves between crashes and leaves
+	// rotation again on its own.
+	StartRankNotSteady
+	// StartRankServing: the Instance serves and remembers no crash. A
+	// continuation keeps this rank: it is listed with the rest, neither
+	// admitted nor charged again.
+	StartRankServing
+)
+
+var startRankNames = [...]string{"ServesNothing", "NotSteady", "Serving"}
+
+// String names the rank for logs; a value outside the three ranks reads
+// Unknown rather than stopping the pass.
+func (r StartRank) String() string {
+	if r < 0 || int(r) >= len(startRankNames) {
+		return "Unknown"
+	}
+	return startRankNames[r]
+}
+
 // UpdateSelection carries the update pass's per-Instance selections
 // plus the pure budget inputs the executor's within-pass counters
 // project against.
 type UpdateSelection struct {
-	// Items in the order the executor admits them: the fresh starts of an
-	// Instance out of rotation first (OutOfRotation), then plan order.
-	// Instances held by the effective partition (canary) and Instances
-	// with no trigger are not listed.
+	// Items in the order the executor admits them: by Rank, the fresh
+	// starts of an Instance that serves nothing first, then of one not
+	// serving steadily, then of one that serves; inside a rank the
+	// Instances on the oldest revision first, then plan order
+	// (orderStarts). Instances held by the effective partition (canary)
+	// and Instances with no trigger are not listed.
 	Items []UpdateItem
 	// Strategy is the resolved update strategy (empty Type defaults to
 	// SurgeThenDrain — matches workload.BuildPlan's defaulting).
@@ -208,6 +254,12 @@ type UpdateSelection struct {
 	// on an Instance that still serves; a start on one of them takes over
 	// the slot its own outage holds and is charged as any start.
 	NotServingOutsideRoll []int32
+	// NotServingOutsideRollReasons says, for each Instance
+	// NotServingOutsideRoll lists, why it is down, in the reader's words
+	// ("pod X restarted since Ready, Ready again for less than the 30s
+	// window (25s left)", "no routed pod in rotation"), for the Budget hold
+	// to carry.
+	NotServingOutsideRollReasons map[int32]string
 	// RetryBlockDenied lists, in plan order, the Instances the target's
 	// RetryBlock denied a fresh start at the trigger stage: a block in
 	// the Held state, an attempt already in flight, or a Backoff not yet due.
@@ -232,9 +284,16 @@ type UpdateSelection struct {
 	// (ops.RolledSetInRotation): a pod down, restarting or not yet
 	// serving. The rest are back in rotation and merely unproven for the
 	// window, which paces a further start and nothing else. It is the
-	// standing hold's reading alone: an item's OutOfRotation ordering key
-	// asks whether the Instance serves nothing now, a different question.
+	// standing hold's reading alone: an item's Rank ordering key asks
+	// what the Instance serves now, a different question.
 	CrashedOutOfRotation []int32
+	// HeldFailedAttempts lists, in plan order, the Instances the partition
+	// holds whose Failed row's attempt was toward the target while their
+	// source still serves (ops.HeldInstanceKeepsAFailedAttempt): a failed
+	// replacement the roll still wants, which only a start on the Instance
+	// replaces, and which the partition keeps from starting. The roll holds
+	// on them when nothing else holds it, with the exit named.
+	HeldFailedAttempts []int32
 	// StandingHold is the hold the roll stands behind on account of the
 	// Instances already on the target that do not serve it, whether or
 	// not a start reaches the admission this pass: the retry schedule's
@@ -245,10 +304,12 @@ type UpdateSelection struct {
 	// (CrashedOutOfRotation): a rolled Instance short of serving for
 	// another reason is repaired or stopped by a pass that says so itself,
 	// and one back in rotation leaves a roll with nothing to start nothing
-	// to stand behind. Nil otherwise, when a further start would still be
-	// admitted, or while paused. The update pass reports it when it admits
-	// nothing, a roll with nothing selected reports it at the update
-	// position (Decision.StandingHold), and a pass the restart pass
+	// to stand behind. With none of those, it is the hold on the held
+	// Instances whose failed replacement the roll still wants
+	// (HeldFailedAttempts). Nil otherwise, when a further start would
+	// still be admitted, or while paused. The update pass reports it when
+	// it admits nothing, a roll with nothing selected reports it at the
+	// update position (Decision.StandingHold), and a pass the restart pass
 	// consumes reports it in the update pass's place.
 	StandingHold *types.RolloutHold
 }
@@ -277,7 +338,7 @@ type PlannedAction struct {
 
 // Decision is the outcome of Plan for one reconcile: the ordered
 // pass-level actions to run. Ordering is the pass precedence
-// (scale-down > restart > migration expiry > migration > update >
+// (scale-down > migration expiry > restart > migration > update >
 // create); Execute runs the actions in order and stops at the first
 // one whose op outcome requires a requeue, so the ordering IS the
 // precedence. The ops are step machines advanced once per reconcile —
@@ -445,33 +506,35 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 		decision.Escalate = true
 	}
 
+	// Migration expiry selection — the deadline consumer. Planned ahead
+	// of the restart pass, which a repair in flight consumes, so a record
+	// past its deadline is closed the pass the deadline comes due whatever
+	// else the Instance set is doing: the expiry opens nothing and only
+	// closes a record and releases its surge index. Planned BEFORE the
+	// drive pass so an expired record is consumed before the drive writes
+	// it again, and regardless of MigrationMode so a mode flip to Never
+	// can never strand a non-terminal record.
+	if !plan.Paused && workloadops.HasExpiredMigrationCandidate(input.ObservedState.Migrations, input.ObservedState.InstanceStatuses, input.Now()) {
+		decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionMigrateExpiry})
+	}
+
 	if len(restarts) > 0 {
 		decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionRestart, Restarts: restarts})
 	}
 
-	if !plan.Paused {
-		// Migration expiry selection — the deadline consumer. Planned
-		// BEFORE the drive pass so an expired record is consumed before
-		// the drive writes it again, and regardless of MigrationMode so a
-		// mode flip to Never can never strand a non-terminal record.
-		if workloadops.HasExpiredMigrationCandidate(input.ObservedState.Migrations, input.Now()) {
-			decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionMigrateExpiry})
+	// Migration drive selection. Work comes from the owner's
+	// status.migrations records, oldest first: the records parked on
+	// their source teardown are tended, and the oldest record that is
+	// not parked is the head the pass drives. Terminal records and
+	// Auto records (born terminal) are excluded structurally —
+	// records, never work. Skip when paused or when mode is Never.
+	if !plan.Paused && plan.MigrationMode != types.MigrationModeNever {
+		selection, err := planMigrationDrive(ctx, input, snapshot)
+		if err != nil {
+			return Decision{}, err
 		}
-
-		// Migration drive selection. Work comes from the owner's
-		// status.migrations records, oldest first: the records parked on
-		// their source teardown are tended, and the oldest record that is
-		// not parked is the head the pass drives. Terminal records and
-		// Auto records (born terminal) are excluded structurally —
-		// records, never work. Skip when mode is Never.
-		if plan.MigrationMode != types.MigrationModeNever {
-			selection, err := planMigrationDrive(ctx, input, snapshot)
-			if err != nil {
-				return Decision{}, err
-			}
-			if selection != nil {
-				decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionMigrate, Migration: selection})
-			}
+		if selection != nil {
+			decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionMigrate, Migration: selection})
 		}
 	}
 
@@ -515,16 +578,15 @@ func Plan(ctx context.Context, input types.ReconcileInput, plan types.ComponentP
 		}
 	}
 
-	// Create — always planned on a non-paused reconcile: the op is the
-	// pass's own detector (it lists and diffs per planned Instance) and
-	// a nil target returns immediately. While paused it is planned only
-	// for an index whose committed create the pass would finish, and
-	// Execute narrows the pass to those: an index with no row stays
-	// empty, but a set already being materialized is completed and
-	// promoted rather than held incomplete with the Instance short of it.
-	if !plan.Paused || workloadops.HasCommittedCreate(input, plan, target) {
-		decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionCreate})
-	}
+	// Create — always planned, last: the op is the pass's own detector (it
+	// lists and diffs per planned Instance) and a nil target returns
+	// immediately. A pause narrows what the pass builds, not whether it
+	// runs: Execute keeps a paused pass to the indices whose committed
+	// create it would finish, so an index with no row stays empty while a
+	// set already being materialized is completed and promoted, and the
+	// pass still frees the names a lost node holds for every planned
+	// Instance, which no other pass reads.
+	decision.Actions = append(decision.Actions, PlannedAction{Kind: ActionCreate})
 
 	return decision, nil
 }
@@ -799,7 +861,11 @@ type updateSelectionPass struct {
 	plan     types.ComponentPlan
 	target   *appsv1.ControllerRevision
 	snapshot *ObservedSnapshot
-	log      logr.Logger
+	// log is the pass's debug logger, at verbosity one. A line about one
+	// Instance is written only once Enabled says a sink takes it: the
+	// values of a line nobody reads would still be copied into their
+	// interface records, for every Instance on every pass.
+	log logr.Logger
 	// strategy is the resolved update strategy; an empty type reads as
 	// SurgeThenDrain, as BuildPlan defaults it.
 	strategy types.UpdateStrategyType
@@ -854,7 +920,7 @@ func readUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 		strategy:     strategy,
 		pods:         pods,
 		held:         workloadops.RollHeldIndices(input, plan, target),
-		provenWindow: workloadops.ProvenWindowSeconds(plan.MinReadySeconds, input.StuckPodGrace),
+		provenWindow: provenWindowSeconds(input, plan),
 		selection:    selection,
 	}, nil
 }
@@ -863,8 +929,10 @@ func readUpdateSelection(ctx context.Context, input types.ReconcileInput, plan t
 //
 //  1. Every planned Instance, in plan order: the partition, the rolled
 //     set, the trigger and the start it selects (selectInstance).
-//  2. The order of the starts: Instances out of rotation first, then
-//     plan order (orderStarts).
+//  2. The order of the starts: the Instances that serve nothing, then
+//     the ones not serving steadily, then the ones that serve; inside a
+//     rank the Instances on the oldest revision first, then plan order
+//     (orderStarts).
 //  3. The surge slots the Component's extra pods hold, under a capped
 //     surge budget (countExtraPodSurge).
 //  4. The two holds a roll with nothing admitted stands behind: the
@@ -875,7 +943,9 @@ func (p *updateSelectionPass) run(ctx context.Context) error {
 			return err
 		}
 	}
-	p.orderStarts()
+	if err := p.orderStarts(ctx); err != nil {
+		return err
+	}
 	p.countExtraPodSurge()
 	// Budgets are decided here but spent in Execute, so they are logged
 	// with the selection they apply to: a selection that is non-empty yet
@@ -894,7 +964,8 @@ func (p *updateSelectionPass) run(ctx context.Context) error {
 		"notServingOutsideRoll", p.selection.NotServingOutsideRoll,
 		"crashedNotServing", p.selection.CrashedNotServing,
 		"crashedOutOfRotation", p.selection.CrashedOutOfRotation,
-		"retryBlockDenied", p.selection.RetryBlockDenied)
+		"retryBlockDenied", p.selection.RetryBlockDenied,
+		"heldFailedAttempts", p.selection.HeldFailedAttempts)
 	p.readHolds()
 	return nil
 }
@@ -931,9 +1002,10 @@ func (p *updateSelectionPass) heldByPartition(c updateCandidate) bool {
 }
 
 // rolledPods is the pod count of the set an Instance runs at the target:
-// the target's Runner layout at the width the target records.
+// the target's Runner layout at the width the target records, counted
+// without building the layout.
 func (p *updateSelectionPass) rolledPods(c updateCandidate) int32 {
-	return types.InstancePlan{Runners: p.plan.RunnersFor(c.inst, p.target.Name)}.TotalPods()
+	return p.plan.TotalPodsFor(c.inst, p.target.Name)
 }
 
 // crashedAfterPromotion reports an Instance on the target whose pushed
@@ -951,7 +1023,12 @@ func (p *updateSelectionPass) rolledSetInRotation(c updateCandidate, rolledPods 
 // selectInstance decides what the roll does with one planned Instance,
 // the first of these that applies:
 //
-//  1. The partition holds the Instance: nothing is listed.
+//  1. The partition holds the Instance: no start is listed. The partition
+//     keeps the Instance on the revision it serves and nothing else, so
+//     the pods of a revision the roll has since left, and the Failed row
+//     their failed attempt left, are listed for cleanup
+//     (ops.HeldInstanceCleanup), and a failed attempt toward the target
+//     is recorded for the hold to name (ops.HeldInstanceKeepsAFailedAttempt).
 //  2. The pods already run the target: an AdoptRevision item.
 //  3. The trigger declines: the retry wait is kept, and the pods of a
 //     replaced revision are listed for cleanup (declineStart).
@@ -968,8 +1045,17 @@ func (p *updateSelectionPass) rolledSetInRotation(c updateCandidate, rolledPods 
 func (p *updateSelectionPass) selectInstance(ctx context.Context, c updateCandidate) error {
 	p.recordDownOutsideRoll(c)
 	if p.heldByPartition(c) {
-		p.log.Info("update not selected: held by partition",
-			"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name)
+		cleanup := workloadops.HeldInstanceCleanup(c.row, p.target, c.pods)
+		if cleanup {
+			p.selection.Items = append(p.selection.Items, UpdateItem{Instance: c.inst, CleanupOnly: true})
+		}
+		if workloadops.HeldInstanceKeepsAFailedAttempt(c.row, p.target, c.pods) {
+			p.selection.HeldFailedAttempts = append(p.selection.HeldFailedAttempts, c.inst.Index)
+		}
+		if p.log.Enabled() {
+			p.log.Info("update not selected: held by partition",
+				"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "cleanupOnly", cleanup)
+		}
 		return nil
 	}
 	p.recordRolledSet(c)
@@ -1002,8 +1088,10 @@ func (p *updateSelectionPass) recordRolledSet(c updateCandidate) {
 	}
 	unserving, graceLeft := workloadops.RolledInstanceDark(c.row, p.target.Name, p.target.CreationTimestamp.Time, c.pods, rolledPods, p.provenWindow, p.input.StuckPodGrace, p.input.Now())
 	if unserving {
-		p.log.Info("rolled Instance serves nothing: not the roll's open work",
-			"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "reason", why)
+		if p.log.Enabled() {
+			p.log.Info("rolled Instance serves nothing: not the roll's open work",
+				"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "reason", why)
+		}
 		return
 	}
 	p.selection.RolledNotServing = append(p.selection.RolledNotServing, c.inst.Index)
@@ -1013,8 +1101,10 @@ func (p *updateSelectionPass) recordRolledSet(c updateCandidate) {
 			p.selection.CrashedOutOfRotation = append(p.selection.CrashedOutOfRotation, c.inst.Index)
 		}
 	}
-	p.log.Info("rolled Instance not serving",
-		"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "reason", why, "wait", wait, "graceLeft", graceLeft)
+	if p.log.Enabled() {
+		p.log.Info("rolled Instance not serving",
+			"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "reason", why, "wait", wait, "graceLeft", graceLeft)
+	}
 	if wait > 0 {
 		p.input.PassWake.Observe(wait)
 	}
@@ -1035,8 +1125,14 @@ func (p *updateSelectionPass) recordDownOutsideRoll(c updateCandidate) {
 		return
 	}
 	p.selection.NotServingOutsideRoll = append(p.selection.NotServingOutsideRoll, c.inst.Index)
-	p.log.Info("Instance not serving outside the roll",
-		"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "reason", why, "wait", wait)
+	if p.selection.NotServingOutsideRollReasons == nil {
+		p.selection.NotServingOutsideRollReasons = map[int32]string{}
+	}
+	p.selection.NotServingOutsideRollReasons[c.inst.Index] = why
+	if p.log.Enabled() {
+		p.log.Info("Instance not serving outside the roll",
+			"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name, "reason", why, "wait", wait)
+	}
 	if wait > 0 {
 		p.input.PassWake.Observe(wait)
 	}
@@ -1045,8 +1141,10 @@ func (p *updateSelectionPass) recordDownOutsideRoll(c updateCandidate) {
 // adoptRevision lists an Instance whose runtime-ready pods already run the
 // target: Execute writes Ready on the target instead of running an update.
 func (p *updateSelectionPass) adoptRevision(c updateCandidate) {
-	p.log.Info("update not selected: adopting revision in place",
-		"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name)
+	if p.log.Enabled() {
+		p.log.Info("update not selected: adopting revision in place",
+			"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name)
+	}
 	p.selection.Items = append(p.selection.Items, UpdateItem{Instance: c.inst, AdoptRevision: true})
 }
 
@@ -1070,6 +1168,9 @@ func (p *updateSelectionPass) declineStart(c updateCandidate, trigger workloadop
 	// The trigger declining is the most common reason a roll makes no
 	// progress, and the phase and revision it read are not recoverable
 	// after the fact.
+	if !p.log.Enabled() {
+		return
+	}
 	if c.row == nil {
 		p.log.Info("update not triggered: no observed status",
 			"component", p.plan.Component, "instance", c.inst.Index,
@@ -1091,6 +1192,10 @@ func (p *updateSelectionPass) keepEarliestRetryWait(retryAfter time.Duration) {
 	}
 }
 
+// replacesUnservingPodSetLogKey is the key the "update selected" line
+// carries the ReplacesUnservingPodSet flag under.
+const replacesUnservingPodSetLogKey = "replacesDarkPodSet"
+
 // listStart lists an Instance the trigger selected. A fresh start carries
 // the mechanism it runs on and the flags the admission reads: whether it
 // skips the coordination gate, whether it replaces an unserving pod set,
@@ -1098,7 +1203,7 @@ func (p *updateSelectionPass) keepEarliestRetryWait(retryAfter time.Duration) {
 // continuation is listed as it is: it is neither admitted nor charged
 // again.
 func (p *updateSelectionPass) listStart(ctx context.Context, c updateCandidate) error {
-	item := UpdateItem{Instance: c.inst, StartingFresh: p.startsFresh(c)}
+	item := UpdateItem{Instance: c.inst, StartingFresh: p.startsFresh(c), Rank: StartRankServing}
 	if item.StartingFresh {
 		recreate, err := p.recreateFallback(ctx, c)
 		if err != nil {
@@ -1106,15 +1211,29 @@ func (p *updateSelectionPass) listStart(ctx context.Context, c updateCandidate) 
 		}
 		item.RecreateFallback = recreate
 		item.ReplacesUnservingPodSet = replacesUnservingPodSet(p.input, c.row, c.pods)
-		item.OutOfRotation = p.outOfRotation(c, item.ReplacesUnservingPodSet)
+		item.Rank = startRank(c.row, c.pods)
 	}
-	item.CoordGateExempt = p.skipsCoordinationGate(c, item.mechanism(p.strategy), item.StartingFresh)
-	p.log.Info("update selected",
-		"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name,
-		"startingFresh", item.StartingFresh, "coordGateExempt", item.CoordGateExempt, "recreateFallback", item.RecreateFallback,
-		"replacesDarkPodSet", item.ReplacesUnservingPodSet, "outOfRotation", item.OutOfRotation)
+	mechanism := item.mechanism(p.strategy)
+	item.ServingUnproven = p.servingUnproven(c, mechanism, item.StartingFresh)
+	item.CoordGateExempt = item.ServingUnproven || p.skipsCoordinationGate(c, mechanism, item.StartingFresh)
+	if p.log.Enabled() {
+		p.log.Info("update selected",
+			"component", p.plan.Component, "instance", c.inst.Index, "target", p.target.Name,
+			"startingFresh", item.StartingFresh, "coordGateExempt", item.CoordGateExempt, "servingUnproven", item.ServingUnproven,
+			"recreateFallback", item.RecreateFallback, replacesUnservingPodSetLogKey, item.ReplacesUnservingPodSet, "rank", item.Rank)
+	}
 	p.selection.Items = append(p.selection.Items, item)
 	return nil
+}
+
+// provenWindowSeconds is how long, in whole seconds, a pod that restarted
+// or was rebuilt must hold Ready before the budgets read its Instance as
+// serving again: the Component's minReadySeconds or the operator's grace
+// for a pod the kubelet keeps restarting, whichever is longer
+// (workloadops.ProvenWindowSeconds). The update selection and the repair
+// budget read the same window.
+func provenWindowSeconds(input types.ReconcileInput, plan types.ComponentPlan) int32 {
+	return workloadops.ProvenWindowSeconds(plan.MinReadySeconds, input.StuckPodGrace)
 }
 
 // mechanism is the strategy a start is consulted as: RecreatePod when the
@@ -1167,16 +1286,27 @@ func (p *updateSelectionPass) mechanismError(c updateCandidate, err error) error
 	return fmt.Errorf("workload.Reconcile: resolve update mechanism (instance=%d): %w", c.inst.Index, err)
 }
 
-// skipsCoordinationGate reports a fresh drain-first start on a row the
-// gate's serving count already leaves out: a Failed row with no serving
-// pod (types.RecreateOfUnservingRow), or a Ready row outside the count
-// (readyRowOutsideServingCount). The consult would count the Instance's
-// own outage a second time, so the start skips it; the plan gate and the
-// per-Component budget still apply, and a surge start keeps the consult
-// because its replacement adds a pod.
+// skipsCoordinationGate reports a fresh start on a row the gate's serving
+// count already leaves out: a Failed row with no serving pod under a
+// drain-first mechanism (types.RecreateOfUnservingRow; under a surge such
+// a row still keeps the consult), or a Ready row outside the count
+// (readyRowOutsideServingCount) under every mechanism. The consult would
+// count the Instance's own outage a second time, so the start skips it,
+// under a surge as under a recreate: a gang short of a member serves
+// nothing until its set is whole again, and a gate that holds its side
+// for a peer would leave it short for the whole hold. The plan gate and
+// the per-Component budget still apply. A surge start on a row with no
+// pod left keeps the consult: the status publication writes such a row
+// Pending and the Create pass rebuilds it on the target with no gate
+// asked, so the surge has nothing to keep beside its replacement.
 func (p *updateSelectionPass) skipsCoordinationGate(c updateCandidate, mechanism types.UpdateStrategyType, fresh bool) bool {
-	return types.RecreateOfUnservingRow(c.row, mechanism) ||
-		(fresh && mechanism != types.UpdateStrategySurgeThenDrain && p.readyRowOutsideServingCount(c))
+	if types.RecreateOfUnservingRow(c.row, mechanism) {
+		return true
+	}
+	if !fresh || !p.readyRowOutsideServingCount(c) {
+		return false
+	}
+	return mechanism != types.UpdateStrategySurgeThenDrain || !evidence.PodSetLost(c.pods)
 }
 
 // readyRowOutsideServingCount reports a Ready row whose pod set the
@@ -1198,29 +1328,126 @@ func (p *updateSelectionPass) readyRowOutsideServingCount(c updateCandidate) boo
 		evidence.PodSetShortOfMember(c.pods, c.inst.TotalPods())
 }
 
-// outOfRotation reports a fresh start whose Instance serves nothing at
-// this pass: it replaces an unserving pod set, no routed pod of the set
-// is in rotation, whatever the reason and for however long
-// (evidence.PodSetOutOfRotation), or no pod is left that could serve
-// (PodSetLost). Such a start restores capacity, so it is listed ahead of
-// the rest.
-func (p *updateSelectionPass) outOfRotation(c updateCandidate, replacesUnserving bool) bool {
-	return replacesUnserving ||
-		evidence.PodSetLost(c.pods) ||
-		evidence.PodSetOutOfRotation(c.pods)
+// startRank reads the rank of a fresh start on row. The row and its pods
+// are read together because each lags the other by a pass: the row
+// publishes what the pass before saw, and a set that serves between
+// crashes is up on one pass and down on the next. An Instance ranks as
+// serving nothing only when no pod of its set could serve, or when the
+// pods are out of rotation now and the row published no serving pod;
+// pods out of rotation under a row that published a serving pod, a
+// Failed row with no serving pod whose pods are back, or a crash of the
+// promoted set the row remembers, rank it as not steady.
+func startRank(row *types.InstanceStatus, pods []*corev1.Pod) StartRank {
+	outOfRotation := evidence.PodSetOutOfRotation(pods)
+	publishedNoServingPod := row == nil || row.ServingPodCount == 0
+	switch {
+	case evidence.PodSetLost(pods), outOfRotation && publishedNoServingPod:
+		return StartRankServesNothing
+	case outOfRotation, types.FailedWithNoServingPod(row), types.RemembersCrash(row):
+		return StartRankNotSteady
+	}
+	return StartRankServing
 }
 
-// orderStarts puts the starts on Instances out of rotation first and
-// keeps plan order inside each group. Such a start restores capacity
-// while every other start spends it, so the budget is offered to those
-// first, from the moment the Instance left rotation rather than once
-// its grace has run. The order is all this decides: the budgets and the
-// gate admit or deny each start on their own terms, and the partition
-// has already chosen who is listed.
-func (p *updateSelectionPass) orderStarts() {
-	sort.SliceStable(p.selection.Items, func(i, j int) bool {
-		return p.selection.Items[i].OutOfRotation && !p.selection.Items[j].OutOfRotation
+// servingUnproven reports a fresh drain-first start on a Ready row whose
+// routed pods are in rotation only as comebacks that have not held Ready
+// for the window (workloadops.InstanceServingUnproven). The gate counts
+// such an Instance as down already, so the start skips the consult as a
+// start on a row outside the serving count does, and is charged to the
+// gate's within-pass delta by nothing (UpdateItem.ServingUnproven).
+func (p *updateSelectionPass) servingUnproven(c updateCandidate, mechanism types.UpdateStrategyType, fresh bool) bool {
+	if !fresh || mechanism == types.UpdateStrategySurgeThenDrain {
+		return false
+	}
+	unproven, _, _ := workloadops.InstanceServingUnproven(c.row, c.pods, p.provenWindow, p.input.Now())
+	return unproven
+}
+
+// orderStarts puts the starts in rank order, then the starts on the
+// oldest revision, and keeps plan order inside each group. A start on an
+// Instance that serves nothing restores capacity while a start on a
+// serving one spends it, so the budget is offered to those first, from
+// the moment the Instance left rotation rather than once its grace has
+// run, and a set that serves between crashes is taken before a steady
+// one whatever it reads on this pass. A push that lands while an earlier
+// push is still rolling finds Instances on more than one revision; the
+// ones on the oldest go first, on every Component alike, so the last
+// Instance of a version leaves before a newer version is touched and no
+// version stands with one side of a prefill/decode pair only. The order
+// is all this decides: the budgets and the gate admit or deny each start
+// on their own terms, and the partition has already chosen who is listed.
+func (p *updateSelectionPass) orderStarts(ctx context.Context) error {
+	age, err := p.revisionAges(ctx)
+	if err != nil {
+		return err
+	}
+	items := p.selection.Items
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Rank != items[j].Rank {
+			return items[i].Rank < items[j].Rank
+		}
+		return age[items[i].Instance.Index] < age[items[j].Instance.Index]
 	})
+	return nil
+}
+
+// revisionAges ranks the listed Instances by the age of the revision each
+// runs now, read as its ControllerRevision number: a smaller number is an
+// older revision. Nil when the listed Instances run one revision, the
+// usual push, so nothing is read; the numbers are read once per revision
+// otherwise. An Instance whose row names no revision, or whose revision
+// is gone, ranks with the newest.
+func (p *updateSelectionPass) revisionAges(ctx context.Context) (map[int32]int64, error) {
+	running := ""
+	mixed := false
+	for _, item := range p.selection.Items {
+		name := p.runningRevision(item)
+		switch {
+		case name == "":
+		case running == "":
+			running = name
+		case name != running:
+			mixed = true
+		}
+	}
+	if !mixed {
+		return nil, nil
+	}
+	numbers := map[string]int64{}
+	newest := int64(0)
+	for _, item := range p.selection.Items {
+		name := p.runningRevision(item)
+		if _, read := numbers[name]; name == "" || read {
+			continue
+		}
+		number, found, err := p.snapshot.RevisionNumber(ctx, name)
+		if err != nil {
+			return nil, fmt.Errorf("workload.Reconcile: read the revision instance %d runs (revision=%s): %w", item.Instance.Index, name, err)
+		}
+		if !found {
+			continue
+		}
+		numbers[name] = number
+		newest = max(newest, number)
+	}
+	ages := make(map[int32]int64, len(p.selection.Items))
+	for _, item := range p.selection.Items {
+		age, known := numbers[p.runningRevision(item)]
+		if !known {
+			age = newest
+		}
+		ages[item.Instance.Index] = age
+	}
+	return ages, nil
+}
+
+// runningRevision is the revision an item's Instance runs now by its row;
+// empty when the row records none.
+func (p *updateSelectionPass) runningRevision(item UpdateItem) string {
+	if row := p.input.ObservedState.Instance(item.Instance.Index); row != nil {
+		return row.RunningRevision
+	}
+	return ""
 }
 
 // countExtraPodSurge counts, under a capped surge budget, the surge
@@ -1243,10 +1470,11 @@ func (p *updateSelectionPass) countExtraPodSurge() {
 // behind: the retry schedule's, when the target's RetryBlock denies a
 // fresh start or counts the crash of an Instance already on the target,
 // and the standing hold of the Instances on the target that do not
-// serve it.
+// serve it, or of the held Instances whose failed replacement the roll
+// still wants.
 func (p *updateSelectionPass) readHolds() {
 	p.selection.RetryScheduleHold = retryScheduleHold(p.input, p.target, p.selection.RolledNotServing, p.selection.CrashedNotServing, retryRebuilds(p.input, p.plan, p.target, p.pods))
-	p.selection.StandingHold = standingHold(&p.selection, p.target)
+	p.selection.StandingHold = standingHold(&p.selection, p.target, workloadops.EffectivePartition(p.input.DesiredSpec.Pacing, p.plan.UpdateStrategy.RollingUpdate))
 }
 
 // retryRebuilds lists, in plan order, the Instances whose crashed set the
@@ -1285,6 +1513,17 @@ func (s *UpdateSelection) downOutsideRoll(idx int32) bool {
 	return false
 }
 
+// rolledNotServing reports whether the Instance at idx is one the
+// selection lists as on the target revision and not serving it.
+func (s *UpdateSelection) rolledNotServing(idx int32) bool {
+	for _, rolled := range s.RolledNotServing {
+		if rolled == idx {
+			return true
+		}
+	}
+	return false
+}
+
 // anyFreshStart reports whether the selection carries a start the pass
 // would admit against the budget.
 func anyFreshStart(items []UpdateItem) bool {
@@ -1303,10 +1542,7 @@ func anyFreshStart(items []UpdateItem) bool {
 // row unserving). Replacing such an Instance takes no capacity out of
 // rotation.
 func replacesUnservingPodSet(input types.ReconcileInput, row *types.InstanceStatus, pods []*corev1.Pod) bool {
-	if row != nil && row.Phase == types.InstancePhaseFailed && row.ServingPodCount == 0 {
-		return true
-	}
-	return evidence.PodSetServesNothing(pods, input.Now(), input.StuckPodGrace)
+	return types.FailedWithNoServingPod(row) || evidence.PodSetServesNothing(pods, input.Now(), input.StuckPodGrace)
 }
 
 // planMigrationDrive selects the migrate pass's work in dispatch order:
@@ -1337,15 +1573,18 @@ func planMigrationDrive(ctx context.Context, input types.ReconcileInput, snapsho
 			}
 		}
 		// A fresh migration adds one surge Instance. Let an existing update
-		// surge finish first so the two operations do not stack extra capacity.
-		// Allocated migrations always resume from their durable record.
-		if record.SurgeAllocated() || escalation.CurrentSurgeInFlight(input.ObservedState.InstanceStatuses) == 0 {
-			head := record
-			selection.Head = &head
+		// surge finish first so the two operations do not stack extra capacity;
+		// the pass names that wait on the record. Allocated migrations always
+		// resume from their durable record.
+		oldest := record
+		if workloadops.MigrationWaitsForRoll(record, input.ObservedState.InstanceStatuses) {
+			selection.WaitingForRoll = &oldest
+		} else {
+			selection.Head = &oldest
 		}
 		break
 	}
-	if len(selection.Parked) == 0 && selection.Head == nil {
+	if len(selection.Parked) == 0 && selection.Head == nil && selection.WaitingForRoll == nil {
 		return nil, nil
 	}
 	return &selection, nil

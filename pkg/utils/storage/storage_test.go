@@ -48,6 +48,27 @@ func TestParseOCIStorageURI(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name: "empty namespace is left for the tenancy to fill",
+			uri:  "oci://n//b/mybucket/o/mypath",
+			want: &OCIStorageComponents{
+				Bucket: "mybucket",
+				Prefix: "mypath",
+			},
+			wantErr: false,
+		},
+		{
+			name:        "empty bucket segment",
+			uri:         "oci://n/myns/b//o/mypath",
+			wantErr:     true,
+			errContains: "the OCI storage URI oci://n/myns/b//o/mypath names no bucket",
+		},
+		{
+			name:        "empty object path behind the trailing slash",
+			uri:         "oci://n/myns/b/mybucket/o/",
+			wantErr:     true,
+			errContains: "the OCI storage URI oci://n/myns/b/mybucket/o/ names no object path",
+		},
+		{
 			name:        "missing oci prefix",
 			uri:         "n/myns/b/mybucket/o/mypath",
 			wantErr:     true,
@@ -141,13 +162,13 @@ func TestValidateOCIStorageURI(t *testing.T) {
 			name:        "invalid uri",
 			uri:         "invalid://uri",
 			wantErr:     true,
-			errContains: "missing oci:// prefix",
+			errContains: "must start with 'oci://'",
 		},
 		{
 			name:        "empty uri",
 			uri:         "",
 			wantErr:     true,
-			errContains: "missing oci:// prefix",
+			errContains: "must start with 'oci://'",
 		},
 	}
 
@@ -594,8 +615,8 @@ func TestValidateStorageURI(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "invalid oci uri",
-			uri:     "oci://invalid",
+			name:    "invalid oci uri - missing object label",
+			uri:     "oci://n/myns/b/mybucket",
 			wantErr: true,
 		},
 		{
@@ -635,6 +656,41 @@ func TestValidateStorageURI(t *testing.T) {
 			err := ValidateStorageURI(tt.uri)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateStorageURI() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// The agent validates a storage URI before it parses it, so the validator
+// must accept every OCI form the parser reads and refuse every form it does
+// not. The rows are the documented forms and their malformed neighbours.
+func TestValidateStorageURIAgreesWithNewObjectURIOnOCIForms(t *testing.T) {
+	forms := []struct {
+		name     string
+		uri      string
+		accepted bool
+	}{
+		{name: "namespace, bucket and object path", uri: "oci://n/myns/b/mybucket/o/models/v1", accepted: true},
+		{name: "namespace and bucket with no object path", uri: "oci://n/myns/b/mybucket/o", accepted: true},
+		{name: "namespace and bucket with an empty object path", uri: "oci://n/myns/b/mybucket/o/", accepted: true},
+		{name: "namespace at a region, bucket and prefix", uri: "oci://myns@us-phoenix-1/mybucket/models", accepted: true},
+		{name: "namespace at a region and bucket", uri: "oci://myns@us-phoenix-1/mybucket", accepted: true},
+		{name: "bucket and prefix", uri: "oci://mybucket/models", accepted: true},
+		{name: "bucket only", uri: "oci://mybucket", accepted: true},
+		{name: "scheme only", uri: "oci://", accepted: false},
+		{name: "namespace and bucket without the object label", uri: "oci://n/myns/b/mybucket", accepted: false},
+		{name: "unknown label after the bucket", uri: "oci://n/myns/b/mybucket/x/extra", accepted: false},
+		{name: "namespace at a region without a bucket", uri: "oci://myns@us-phoenix-1", accepted: false},
+	}
+	for _, form := range forms {
+		t.Run(form.name, func(t *testing.T) {
+			_, parseErr := NewObjectURI(form.uri)
+			if (parseErr == nil) != form.accepted {
+				t.Fatalf("NewObjectURI(%q) error = %v, want accepted %v", form.uri, parseErr, form.accepted)
+			}
+			validateErr := ValidateStorageURI(form.uri)
+			if (validateErr == nil) != form.accepted {
+				t.Fatalf("ValidateStorageURI(%q) error = %v, want accepted %v", form.uri, validateErr, form.accepted)
 			}
 		})
 	}
@@ -1011,7 +1067,7 @@ func TestNewObjectURI(t *testing.T) {
 			name:        "namespace@region missing bucket",
 			uri:         "oci://myns@us-phoenix-1",
 			wantErr:     true,
-			errContains: "missing bucket name",
+			errContains: "names no bucket",
 		},
 		{
 			name:        "empty string",
@@ -1023,7 +1079,13 @@ func TestNewObjectURI(t *testing.T) {
 			name:        "oci:// only",
 			uri:         "oci://",
 			wantErr:     true,
-			errContains: "missing bucket name",
+			errContains: "names no bucket",
+		},
+		{
+			name:        "n/namespace/b/bucket/o/prefix with an empty bucket",
+			uri:         "oci://n/myns/b//o/myprefix",
+			wantErr:     true,
+			errContains: "the OCI storage URI oci://n/myns/b//o/myprefix names no bucket",
 		},
 		{
 			name:    "oci://n/namespace/b/bucket/o/ (empty prefix)",
@@ -1301,6 +1363,48 @@ func TestParseGitHubStorageURI(t *testing.T) {
 			}
 			assert.NoError(t, err)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestOCIStorageURIFormsByParser locks every OCI URI form against the two
+// parsers: the replica agent's (NewObjectURI, the check ValidateStorageURI
+// runs) and the fine-tuned adapter injector's (ParseOCIStorageURI). Neither
+// reads a URI that names no bucket; the injector also needs an object path,
+// since the adapter container downloads one object.
+func TestOCIStorageURIFormsByParser(t *testing.T) {
+	forms := []struct {
+		uri      string
+		agent    bool
+		injector bool
+	}{
+		{uri: "oci://n/myns/b/mybucket/o/models/v1", agent: true, injector: true},
+		{uri: "oci://n/myns/b/mybucket/o/", agent: true, injector: false},
+		{uri: "oci://n/myns/b/mybucket/o", agent: true, injector: false},
+		{uri: "oci://n/myns/b/mybucket", agent: false, injector: false},
+		{uri: "oci://n/myns/b/mybucket/x/extra", agent: false, injector: false},
+		{uri: "oci://n//b/mybucket/o/models", agent: true, injector: true},
+		{uri: "oci://n/myns/b//o/models", agent: false, injector: false},
+		{uri: "oci://myns@us-phoenix-1/mybucket/models", agent: true, injector: false},
+		{uri: "oci://myns@us-phoenix-1/mybucket", agent: true, injector: false},
+		{uri: "oci://myns@us-phoenix-1", agent: false, injector: false},
+		{uri: "oci://myns@us-phoenix-1//models", agent: false, injector: false},
+		{uri: "oci://mybucket/models", agent: true, injector: false},
+		{uri: "oci://mybucket", agent: true, injector: false},
+		{uri: "oci://my-registry/my-model:v1", agent: true, injector: false},
+		{uri: "oci://", agent: false, injector: false},
+		{uri: "oci:///models", agent: false, injector: false},
+	}
+	for _, form := range forms {
+		t.Run(form.uri, func(t *testing.T) {
+			_, agentErr := NewObjectURI(form.uri)
+			if (agentErr == nil) != form.agent {
+				t.Errorf("NewObjectURI(%q) error = %v, want accepted %v", form.uri, agentErr, form.agent)
+			}
+			_, injectorErr := ParseOCIStorageURI(form.uri)
+			if (injectorErr == nil) != form.injector {
+				t.Errorf("ParseOCIStorageURI(%q) error = %v, want accepted %v", form.uri, injectorErr, form.injector)
+			}
 		})
 	}
 }

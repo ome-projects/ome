@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -518,5 +520,27 @@ func TestNodeCapacityChanged_NodeEdits_TrueOnlyForCapacityOrLabelMoves(t *testin
 				t.Errorf("nodeCapacityChanged (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// TestReconcileCapacity_PublishesTheAllocatableGauge: one node with 4 chips of
+// one flavor; after the pass the allocatable gauge for that pool reads 4.
+func TestReconcileCapacity_PublishesTheAllocatableGauge(t *testing.T) {
+	s := fakeclient.Scheme(t, kueuev1beta2.AddToScheme)
+	root := cohort(rootName, "")
+	node := workerNode("node-a", withLabels(map[string]string{"accelerator": "flavor-a"}), withAllocatable(map[string]string{"cpu": "8", "example.com/chip": "4"}))
+	flavor := resourceFlavor("flavor-a", map[string]string{"accelerator": "flavor-a"})
+	c := fakeclient.New(t, fakeclient.WithScheme(s), fakeclient.WithObjects(root, node, flavor), fakeclient.WithStatusSubresource(&v1beta1.AcceleratorQuota{}))
+	r := &Reconciler{Client: c, Scheme: s, Log: logf.Log.WithName("gauge"), APIReader: c, Options: tree.Options{RootName: rootName, MaxDepth: 5}, Capacity: CapacityOptions{Resources: []string{"example.com/chip"}}}
+	capacityAllocatable.Reset()
+	var live v1beta1.AcceleratorQuota
+	if err := c.Get(context.Background(), client.ObjectKey{Name: rootName}, &live); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileCapacity(context.Background(), &live); err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.ToFloat64(capacityAllocatable.WithLabelValues("example.com/chip", "flavor-a")); got != 4 {
+		t.Fatalf("ome_quota_capacity_allocatable{example.com/chip,flavor-a} = %v, want 4", got)
 	}
 }

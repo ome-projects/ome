@@ -331,14 +331,9 @@ func TestHTTPRouteBuilder_BuildHTTPRoute_TopLevelComponent(t *testing.T) {
 	}
 }
 
-// ----- Weighted backendRefs from status.traffic[] -----
-
-// TestHTTPRouteBuilder_WeightedBackends_FromStatusTraffic verifies the
-// HTTPRoute builder reads status.components[<c>].traffic[] and emits
-// weighted backendRefs. Single-entry status collapses to one
-// backendRef (today's behavior). Multi-entry status produces weighted
-// backendRefs in the same order. Per-mode reconcilers populate the
-// status; this commit only wires the builder to consume it.
+// TestHTTPRouteBuilder_TopLevelRoutesToRouterEvenWhenNotReady: the top-level
+// route backs onto the router Service as soon as the router is declared,
+// before RouterReady is True.
 func TestHTTPRouteBuilder_TopLevelRoutesToRouterEvenWhenNotReady(t *testing.T) {
 	builder := createHTTPRouteBuilder()
 	isvc := createTestInferenceServiceWithRouterHTTPRoute("test-isvc", "default")
@@ -534,7 +529,8 @@ func TestHTTPRouteBuilder_CreateHTTPRouteRule(t *testing.T) {
 	}
 	timeout := toGatewayAPIDuration(30)
 
-	rule := builder.createHTTPRouteRule(matches, filters, "test-service", "test-namespace", 8080, timeout)
+	rule := builder.createHTTPRouteRule(matches, filters,
+		[]gatewayapiv1.HTTPBackendRef{serviceBackendRef("test-service", "test-namespace", 8080, nil)}, timeout)
 
 	assert.Len(t, rule.Matches, 1)
 	assert.Len(t, rule.Filters, 1)
@@ -1282,4 +1278,223 @@ func TestHTTPRouteBuilder_CapacityEndpointOnlyOnTheTopLevelRoute(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, result.(*gatewayapiv1.HTTPRoute).Spec.Rules, 1, component)
 	}
+}
+
+// ----- backends rendered from status traffic targets -----
+
+// backendExpectation is one expected backendRef: a nil weight means the
+// backend is unweighted.
+type backendExpectation struct {
+	name   string
+	weight *int32
+	port   int32
+}
+
+func assertBackends(t *testing.T, route *gatewayapiv1.HTTPRoute, want []backendExpectation) {
+	t.Helper()
+	require.Len(t, route.Spec.Rules, 1)
+	refs := route.Spec.Rules[0].BackendRefs
+	require.Len(t, refs, len(want), "backendRefs: %+v", refs)
+	for i, w := range want {
+		assert.Equal(t, w.name, string(refs[i].Name), "backend %d name", i)
+		assert.Equal(t, w.port, int32(*refs[i].Port), "backend %d port", i)
+		if w.weight == nil {
+			assert.Nil(t, refs[i].Weight, "backend %d must be unweighted", i)
+		} else {
+			require.NotNil(t, refs[i].Weight, "backend %d must carry a weight", i)
+			assert.Equal(t, *w.weight, *refs[i].Weight, "backend %d weight", i)
+		}
+	}
+}
+
+func setComponentTraffic(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, targets []v1beta1.ComponentTrafficTarget) {
+	if isvc.Status.Components == nil {
+		isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
+	}
+	cs := isvc.Status.Components[c]
+	cs.Traffic = targets
+	isvc.Status.Components[c] = cs
+}
+
+func target(revisionName string, percent int32) v1beta1.ComponentTrafficTarget {
+	return v1beta1.ComponentTrafficTarget{RevisionName: revisionName, Percent: percent}
+}
+
+// TestHTTPRouteBuilder_BackendsFollowComponentTrafficTargets holds the route's
+// backends to the traffic targets the Component publishes: one weighted
+// backendRef per target on the per-revision Service it names, and the
+// aggregate Service alone when there are none.
+func TestHTTPRouteBuilder_BackendsFollowComponentTrafficTargets(t *testing.T) {
+	const (
+		aggregatePort   int32 = 8000
+		perRevisionPort int32 = 9000
+		stableRev             = "test-isvc-engine-rev-a1b2c3d4"
+		canaryRev             = "test-isvc-engine-rev-e5f6a7b8"
+	)
+	for _, tc := range []struct {
+		name    string
+		targets []v1beta1.ComponentTrafficTarget
+		want    []backendExpectation
+	}{
+		{
+			name: "no targets: the aggregate Service, unweighted",
+			want: []backendExpectation{{name: "test-isvc-engine", port: aggregatePort}},
+		},
+		{
+			name:    "a step splits traffic across the two revisions",
+			targets: []v1beta1.ComponentTrafficTarget{target(stableRev, 90), target(canaryRev, 10)},
+			want: []backendExpectation{
+				{name: stableRev, weight: ptr.To(int32(90)), port: perRevisionPort},
+				{name: canaryRev, weight: ptr.To(int32(10)), port: perRevisionPort},
+			},
+		},
+		{
+			name:    "the final step routes to the canary revision alone",
+			targets: []v1beta1.ComponentTrafficTarget{target(canaryRev, 100)},
+			want:    []backendExpectation{{name: canaryRev, weight: ptr.To(int32(100)), port: perRevisionPort}},
+		},
+		{
+			name:    "a step at zero routes to the stable revision alone",
+			targets: []v1beta1.ComponentTrafficTarget{target(stableRev, 100)},
+			want:    []backendExpectation{{name: stableRev, weight: ptr.To(int32(100)), port: perRevisionPort}},
+		},
+		{
+			name:    "entries without a share or a Service name are not backends",
+			targets: []v1beta1.ComponentTrafficTarget{target(stableRev, 100), target(canaryRev, 0), target("", 50)},
+			want:    []backendExpectation{{name: stableRev, weight: ptr.To(int32(100)), port: perRevisionPort}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := createTestInferenceServiceHTTPRoute("test-isvc", "default")
+			setEngineReady(isvc)
+			setComponentTraffic(isvc, v1beta1.EngineComponent, tc.targets)
+			c := fakeClientWithServices(t,
+				newServicePort("test-isvc-engine", "default", aggregatePort),
+				newServicePort(stableRev, "default", perRevisionPort),
+				newServicePort(canaryRev, "default", perRevisionPort),
+			)
+			builder := createHTTPRouteBuilderWithClient(c)
+
+			for _, component := range []string{EngineComponent, TopLevelComponent} {
+				result, err := builder.BuildHTTPRoute(context.Background(), isvc, component)
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assertBackends(t, result.(*gatewayapiv1.HTTPRoute), tc.want)
+			}
+		})
+	}
+}
+
+// TestHTTPRouteBuilder_EachComponentRouteCarriesItsOwnTargets: a
+// Component's route carries that Component's targets only, and the top-level
+// route carries the entrypoint Component's, the router's when there is one.
+func TestHTTPRouteBuilder_EachComponentRouteCarriesItsOwnTargets(t *testing.T) {
+	const port int32 = 8000
+	isvc := createTestInferenceServiceWithRouterAndDecoderHTTPRoute("test-isvc", "default")
+	setEngineReady(isvc)
+	setRouterReady(isvc)
+	setDecoderReady(isvc)
+	setComponentTraffic(isvc, v1beta1.EngineComponent, []v1beta1.ComponentTrafficTarget{
+		target("test-isvc-engine-rev-a", 90), target("test-isvc-engine-rev-b", 10)})
+	setComponentTraffic(isvc, v1beta1.DecoderComponent, []v1beta1.ComponentTrafficTarget{
+		target("test-isvc-decoder-rev-a", 80), target("test-isvc-decoder-rev-b", 20)})
+	setComponentTraffic(isvc, v1beta1.RouterComponent, []v1beta1.ComponentTrafficTarget{
+		target("test-isvc-router-rev-a", 70), target("test-isvc-router-rev-b", 30)})
+	builder := createHTTPRouteBuilderWithClient(fakeClientWithServices(t,
+		newServicePort("test-isvc-engine", "default", port),
+		newServicePort("test-isvc-decoder", "default", port),
+		newServicePort("test-isvc-router", "default", port),
+	))
+
+	for component, want := range map[string][]backendExpectation{
+		EngineComponent: {
+			{name: "test-isvc-engine-rev-a", weight: ptr.To(int32(90)), port: port},
+			{name: "test-isvc-engine-rev-b", weight: ptr.To(int32(10)), port: port},
+		},
+		DecoderComponent: {
+			{name: "test-isvc-decoder-rev-a", weight: ptr.To(int32(80)), port: port},
+			{name: "test-isvc-decoder-rev-b", weight: ptr.To(int32(20)), port: port},
+		},
+		RouterComponent: {
+			{name: "test-isvc-router-rev-a", weight: ptr.To(int32(70)), port: port},
+			{name: "test-isvc-router-rev-b", weight: ptr.To(int32(30)), port: port},
+		},
+		TopLevelComponent: {
+			{name: "test-isvc-router-rev-a", weight: ptr.To(int32(70)), port: port},
+			{name: "test-isvc-router-rev-b", weight: ptr.To(int32(30)), port: port},
+		},
+	} {
+		t.Run(component, func(t *testing.T) {
+			result, err := builder.BuildHTTPRoute(context.Background(), isvc, component)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assertBackends(t, result.(*gatewayapiv1.HTTPRoute), want)
+		})
+	}
+
+	t.Run("top-level without a router carries the engine's targets", func(t *testing.T) {
+		engineOnly := createTestInferenceServiceHTTPRoute("test-isvc", "default")
+		setEngineReady(engineOnly)
+		setComponentTraffic(engineOnly, v1beta1.EngineComponent, isvc.Status.Components[v1beta1.EngineComponent].Traffic)
+		result, err := builder.BuildHTTPRoute(context.Background(), engineOnly, TopLevelComponent)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assertBackends(t, result.(*gatewayapiv1.HTTPRoute), []backendExpectation{
+			{name: "test-isvc-engine-rev-a", weight: ptr.To(int32(90)), port: port},
+			{name: "test-isvc-engine-rev-b", weight: ptr.To(int32(10)), port: port},
+		})
+	})
+}
+
+// TestHTTPRouteBuilder_WeightedBackendPortFallsBackToComponentPort: a target
+// whose per-revision Service cannot be read yet is published on the
+// Component's own port rather than the built-in default.
+func TestHTTPRouteBuilder_WeightedBackendPortFallsBackToComponentPort(t *testing.T) {
+	const componentPort int32 = 8000
+	isvc := createTestInferenceServiceHTTPRoute("test-isvc", "default")
+	setEngineReady(isvc)
+	setComponentTraffic(isvc, v1beta1.EngineComponent, []v1beta1.ComponentTrafficTarget{
+		target("test-isvc-engine-rev-a", 90), target("test-isvc-engine-rev-b", 10)})
+	builder := createHTTPRouteBuilderWithClient(fakeClientWithServices(t,
+		newServicePort("test-isvc-engine", "default", componentPort)))
+
+	result, err := builder.BuildHTTPRoute(context.Background(), isvc, EngineComponent)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assertBackends(t, result.(*gatewayapiv1.HTTPRoute), []backendExpectation{
+		{name: "test-isvc-engine-rev-a", weight: ptr.To(int32(90)), port: componentPort},
+		{name: "test-isvc-engine-rev-b", weight: ptr.To(int32(10)), port: componentPort},
+	})
+}
+
+// TestHTTPRouteBuilder_RenderFollowsTargetChanges: the same builder renders
+// each change of the targets, including their removal, so a route re-rendered
+// after a step change carries that step's split.
+func TestHTTPRouteBuilder_RenderFollowsTargetChanges(t *testing.T) {
+	isvc := createTestInferenceServiceHTTPRoute("test-isvc", "default")
+	setEngineReady(isvc)
+	builder := createHTTPRouteBuilder()
+	render := func() *gatewayapiv1.HTTPRoute {
+		result, err := builder.BuildHTTPRoute(context.Background(), isvc, EngineComponent)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		return result.(*gatewayapiv1.HTTPRoute)
+	}
+
+	setComponentTraffic(isvc, v1beta1.EngineComponent, []v1beta1.ComponentTrafficTarget{
+		target("test-isvc-engine-rev-a", 90), target("test-isvc-engine-rev-b", 10)})
+	assertBackends(t, render(), []backendExpectation{
+		{name: "test-isvc-engine-rev-a", weight: ptr.To(int32(90)), port: EngineDefaultPort},
+		{name: "test-isvc-engine-rev-b", weight: ptr.To(int32(10)), port: EngineDefaultPort},
+	})
+
+	setComponentTraffic(isvc, v1beta1.EngineComponent, []v1beta1.ComponentTrafficTarget{
+		target("test-isvc-engine-rev-a", 50), target("test-isvc-engine-rev-b", 50)})
+	assertBackends(t, render(), []backendExpectation{
+		{name: "test-isvc-engine-rev-a", weight: ptr.To(int32(50)), port: EngineDefaultPort},
+		{name: "test-isvc-engine-rev-b", weight: ptr.To(int32(50)), port: EngineDefaultPort},
+	})
+
+	setComponentTraffic(isvc, v1beta1.EngineComponent, nil)
+	assertBackends(t, render(), []backendExpectation{{name: "test-isvc-engine", port: EngineDefaultPort}})
 }

@@ -1,0 +1,26 @@
+{
+  "recordedOn": {
+    "date": "2026-11-07",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The create pass groups the pods it lists by Instance from one array after one count per Instance: 9,047 / 36,087 / 3,079 / 17,299 allocations at 1,000 and 4,000 single-pod Instances, 160 gangs of eight and 1,725 gangs of two, from 10,060 / 40,114 / 3,725 / 20,762 with one slice per Instance and the map grown from nothing; the bytes 991 KB / 3.99 MB / 303 KB / 1.84 MB from 1.06 MB / 4.27 MB / 310 KB / 1.89 MB. The create pass of one pass over a replica at rest, every Instance Ready on the spec revision with every pod serving: one list of the Component's pods, served from memory uncopied so the count is the pass's own, and the commit of the Ready batch, every finish found unchanged on the pass's copy, which the writer answers without a live read. No write. The pass reads each Instance's pod names once, to compare them with the pods it lists, each name written into one allocation of its own length; the sweep of pods with no report from their kubelet reads an Instance's names only when one of its pods has no report, so at rest it reads none. Before, the pass read every Instance's names twice, once for that sweep and once for the compare, each name through the formatting library: 19,548 allocations and 1.24 MB at 1,000 Instances, 79,602 and 5.0 MB at 4,000, 13,805 and 636 KB at 160 gangs of eight, 55,963 and 2.69 MB at 1,725 gangs of two. Earlier, before the writer answered a batch of unchanged finishes from the copy, the pass read the replica live once and applied one Ready mutation per Instance to find no change: 32,709 allocations at 1,000 Instances and 131,828 at 4,000. Re-recorded with the layout of each planned Instance read in place (ComponentPlan.RunnersFor hands the plan's own layout back when the revision changes no width in it): one allocation and 24 bytes less per Instance, from 9,047 / 36,087 / 3,079 / 17,299 allocations and 990,808 / 3,991,464 / 303,152 / 1,836,192 bytes at readySince/1000, readySince/4000, gang/160x8 and gang/1725x2. Re-recorded with the finish of an Instance already Ready on the revision its pods carry read as unchanged on the pass's copy before anything is built for it: its record comes from the pass's one slice of finish records, its mutation is the one the pass built once for that revision, marked unchanged, and the pod set's revision is read from an array the call holds; before, every such finish allocated its record, a copy of its row, the mutation's two closures, a commit callback and a revision list, six allocations per Instance: from 8,047 / 32,087 / 2,919 / 15,574 allocations and 966,808 / 3,895,464 / 295,472 / 1,753,392 bytes at readySince/1000, readySince/4000, gang/160x8 and gang/1725x2. Re-recorded with the pod set of each Instance read against the pods' names as they stand, a name built only for a pod the set is short of, the pods a promote is decided on handed back as the Instance's own list, and the live pods counted without a list: from 2,051 / 8,091 / 1,963 / 5,228 allocations and 645,104 / 2,583,616 / 243,144 / 1,188,512 bytes at readySince/1000, readySince/4000, gang/160x8 and gang/1725x2; what remains is the pass's own, about fifty allocations whatever the shape.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/160x8/allocations": 43,
+    "gang/160x8/bytes": 116424,
+    "gang/160x8/pod-lists": 1,
+    "gang/160x8/replica-live-reads": 0,
+    "gang/1725x2/allocations": 53,
+    "gang/1725x2/bytes": 914112,
+    "gang/1725x2/pod-lists": 1,
+    "gang/1725x2/replica-live-reads": 0,
+    "readySince/1000/allocations": 51,
+    "readySince/1000/bytes": 565184,
+    "readySince/1000/pod-lists": 1,
+    "readySince/1000/replica-live-reads": 0,
+    "readySince/4000/allocations": 91,
+    "readySince/4000/bytes": 2263696,
+    "readySince/4000/pod-lists": 1,
+    "readySince/4000/replica-live-reads": 0
+  }
+}

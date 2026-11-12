@@ -217,6 +217,14 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&discoveryv1.EndpointSlice{},
 			handler.EnqueueRequestsFromMapFunc(r.endpointSliceToIR),
 		).
+		// A Node deleted under a replica's pods raises no pod event, and
+		// the pods on it are read as gone only by a pass; the deletion
+		// enqueues every replica with a pod on it so that pass runs now.
+		Watches(
+			&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.replicasOnNode),
+			builder.WithPredicates(nodeDeletePredicate()),
+		).
 		// A replica that renders from modelRef or runtimeRef re-renders when
 		// the runtime it names (or one it inherits from), any runtime it may
 		// select, or its model changes. Status changes count: a sharded model
@@ -230,13 +238,18 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	// The mappers of the runtime and model watches list through these
 	// indexes; the cache accepts them until the manager starts.
-	if err := registerRefIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
+	if err := RegisterReferenceIndexes(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		return fmt.Errorf("inferencereplica: %w", err)
 	}
 	// A scale-down reads the cordoned nodes through this index, so the
 	// read costs the cordoned nodes, not every Node in the cluster.
 	if err := query.RegisterNodeUnschedulableIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		return fmt.Errorf("inferencereplica: register Node unschedulable index: %w", err)
+	}
+	// The Node watch maps a deleted Node to the replicas with a pod on it
+	// through this index, so the read costs those pods, not every pod.
+	if err := query.RegisterPodNodeNameIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
+		return fmt.Errorf("inferencereplica: register Pod node-name index: %w", err)
 	}
 	return nil
 }

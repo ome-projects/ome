@@ -28,10 +28,13 @@ import (
 
 // runPass is one InferenceService reconcile in the controller's OMENative
 // order: the pass copy from the cache, the run layer, the canary bind and
-// the boundary flush, the replica projection, the canary dispatch, the
-// coordination pass, the aggregate, and the final flush with its verb
-// consumption. Engine errors end the pass as they end the controller's,
-// and are recorded rather than returned.
+// the boundary flush, the replica projection, the removal of what a
+// Component that left the mode had, the canary dispatch, the coordination
+// pass, the aggregate, and the final flush with its verb consumption.
+// Engine errors end the pass as they end the controller's, and are
+// recorded rather than returned; a refused projection ends the projection
+// loop and skips the cleanup and the dispatch, while the coordination
+// pass, the aggregate and the flush still run, as the controller's do.
 func (d *driver) runPass(ctx context.Context) error {
 	cached := d.cluster.cachedClient()
 	live := client.Reader(d.cluster.cli)
@@ -54,17 +57,20 @@ func (d *driver) runPass(ctx context.Context) error {
 	var pending ctrl.Result
 	var policies rollout.Policies
 	var consume []string
+	modes := d.modes()
 	d.tickRun = RunView{}
+	d.tickPolicies = rollout.Policies{}
 	if isvc.Spec.Rollout != nil || isvc.Status.Rollout != nil {
 		d.stage = "run"
 		out, err := rolloutrun.Reconcile(ctx, rolloutrun.Inputs{
-			Client:         cached,
-			Reader:         live,
-			Recorder:       d.recorder,
-			ISVC:           isvc,
-			Now:            d.clock.Now(),
-			FeatureEnabled: d.cfg.RolloutPolicyEnabled,
-			BoundProviders: d.boundProviders(),
+			Client:                   cached,
+			Reader:                   live,
+			Recorder:                 d.recorder,
+			ISVC:                     isvc,
+			Now:                      d.clock.Now(),
+			FeatureEnabled:           d.cfg.RolloutPolicyEnabled,
+			BoundProviders:           d.boundProviders(),
+			ComponentDeploymentModes: modes,
 		})
 		d.traceRun(isvc, out, err)
 		d.tickRun = runViewOf(isvc, out)
@@ -73,10 +79,11 @@ func (d *driver) runPass(ctx context.Context) error {
 		}
 		pending = inferenceservice.SoonestRequeue(pending, ctrl.Result{RequeueAfter: out.RequeueAfter})
 		policies = out.Policies
+		d.tickPolicies = policies
 		if out.Opened {
 			d.stage = "bind"
 			for _, g := range rollout.CanaryGroups(isvc, policies) {
-				if err := canary.BindRun(ctx, cached, isvc, g, out.Adopted); err != nil {
+				if err := canary.BindRun(ctx, cached, isvc, g, canary.RunOpen{Adopted: out.Adopted, Closed: out.Closed}); err != nil {
 					return d.endPass(ctrl.Result{}, err)
 				}
 				d.traceBind(isvc, g)
@@ -93,15 +100,27 @@ func (d *driver) runPass(ctx context.Context) error {
 	}
 
 	d.stage = "project"
+	var projectionErr error
 	for _, c := range d.components() {
-		if _, err := d.project(ctx, cached, live, isvc, c, d.partitionFor(isvc, policies, c)); err != nil {
-			return d.endPass(ctrl.Result{}, err)
+		if _, err := d.project(ctx, cached, live, isvc, c, policies); err != nil {
+			projectionErr = err
+			pending.Requeue = true
+			break
 		}
 	}
 
-	modes := d.modes()
+	if projectionErr == nil && len(d.departed) > 0 {
+		d.stage = "cleanup"
+		if err := reconciler.RemoveReplacedBackends(ctx, isvc, modes); err != nil {
+			return d.endPass(ctrl.Result{}, err)
+		}
+		if err := d.tearDownDepartedMembers(ctx); err != nil {
+			return err
+		}
+	}
+
 	canaryGroups := rollout.CanaryGroups(isvc, policies)
-	if len(canaryGroups) > 0 {
+	if projectionErr == nil && len(canaryGroups) > 0 {
 		d.stage = "dispatch"
 		requeue, parked, readyTimeout, err := d.cadences()
 		if err != nil {
@@ -120,6 +139,7 @@ func (d *driver) runPass(ctx context.Context) error {
 				ComponentRunnerPorts: d.runnerPorts(),
 				Policies:             policies,
 				Group:                g,
+				Base:                 base,
 			}
 			if d.samples != nil {
 				deps.StepSampler = d.samples
@@ -133,7 +153,7 @@ func (d *driver) runPass(ctx context.Context) error {
 			consume = append(consume, out.Consume...)
 		}
 	}
-	if released := canary.ReleaseUndeclaredUnits(isvc, policies); len(released) > 0 {
+	if released := canary.ReleaseUndeclaredUnits(isvc, policies); projectionErr == nil && len(released) > 0 {
 		d.traceRelease(released)
 	}
 
@@ -165,6 +185,9 @@ func (d *driver) runPass(ctx context.Context) error {
 			return d.endPass(ctrl.Result{Requeue: true}, nil)
 		}
 		return d.endPass(ctrl.Result{}, err)
+	}
+	if projectionErr != nil {
+		return d.endPass(ctrl.Result{}, projectionErr)
 	}
 	if base.Stale() {
 		pending.Requeue = true
@@ -202,14 +225,38 @@ func (d *driver) endPass(result ctrl.Result, err error) error {
 	return nil
 }
 
-// modes resolves every declared Component to OMENative; a scenario never
-// moves a Component to another backend.
+// modes is the deployment mode of every declared Component as the pass
+// resolves it: OMENative, or RawDeployment for a Component a scenario
+// moved out of the mode (spec.modeSwitch).
 func (d *driver) modes() map[v1beta1.ComponentType]constants.DeploymentModeType {
 	out := map[v1beta1.ComponentType]constants.DeploymentModeType{}
-	for _, c := range d.components() {
+	for _, c := range d.declaredComponents() {
+		if d.departed[c] {
+			out[c] = constants.RawDeployment
+			continue
+		}
 		out[c] = constants.OMENative
 	}
 	return out
+}
+
+// tearDownDepartedMembers stands in for the replica controller's teardown
+// of a deleted InferenceReplica: the pods of a Component that left the
+// mode are deleted and its rows forgotten, silently, as the driver's own
+// hand. The replica's deletion itself is the controller's, traced at the
+// cleanup stage.
+func (d *driver) tearDownDepartedMembers(ctx context.Context) error {
+	for _, c := range d.declaredComponents() {
+		m := d.members[c]
+		if !d.departed[c] || (len(m.pods) == 0 && len(m.rows) == 0) {
+			continue
+		}
+		m.rows, m.pods = nil, nil
+		if err := d.syncPods(ctx, m); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // cadences reads the configured canary cadences and the capacity timeout.
@@ -228,7 +275,8 @@ func (d *driver) cadences() (requeue, parked, readyTimeout time.Duration, err er
 // one Component, sized by the projector against the replica count it
 // stamps: the canary step's when a canary plan is effective, the full
 // plan-gate hold when a canary-kind group has no executable body, nil when
-// no canary governs the Component.
+// no canary governs the Component. The projection also carries the revision
+// a standing rollback holds the Component on (project).
 func (d *driver) partitionFor(isvc *v1beta1.InferenceService, policies rollout.Policies, c v1beta1.ComponentType) irprojector.PartitionResolver {
 	return canary.PartitionResolver(isvc, policies, c)
 }
@@ -250,7 +298,12 @@ func (d *driver) flush(ctx context.Context, r *inferenceservice.InferenceService
 	shortCircuit := equality.Semantic.DeepEqual(cachedCopy.Status, *desired)
 	writesBefore := d.cluster.statusWrites
 	d.stage = "flush:" + which
-	ferr := r.FlushStatusThenConsume(ctx, isvc, constants.OMENative, consume, base)
+	var ferr error
+	if which == "boundary" {
+		ferr = r.FlushRunBoundary(isvc, constants.OMENative, base)
+	} else {
+		ferr = r.FlushStatusThenConsume(ctx, isvc, constants.OMENative, consume, base)
+	}
 	liveAfter, err := d.liveService(ctx)
 	if err != nil {
 		return err
@@ -592,6 +645,9 @@ func (d *driver) canaryRecord(cs *v1beta1.CanaryStatus) string {
 	if cs.CapacityWaitSince != nil {
 		parts = append(parts, "capacityWaitSince="+d.norm.atMeta(cs.CapacityWaitSince))
 	}
+	if cs.StableSideShortSince != nil {
+		parts = append(parts, "stableSideShortSince="+d.norm.atMeta(cs.StableSideShortSince))
+	}
 	if cs.Failed != nil {
 		parts = append(parts, fmt.Sprintf("failed=%s@%s", cs.Failed.Reason, d.norm.atMeta(cs.Failed.Time)))
 	}
@@ -684,10 +740,12 @@ func (d *driver) groupEntry(g *v1beta1.RolloutCoordinationGroupStatus) string {
 	return entry + "}"
 }
 
-// traceRevisions records every Component's rolled-out revision record and
-// projected phase as the pass holds them before the final flush.
+// traceRevisions records every declared Component's rolled-out revision
+// record and projected phase as the pass holds them before the final
+// flush; a Component that left the mode shows the fields the cleanup
+// cleared.
 func (d *driver) traceRevisions(isvc *v1beta1.InferenceService) {
-	for _, c := range d.components() {
+	for _, c := range d.declaredComponents() {
 		cs := isvc.Status.Components[c]
 		d.trace.line("revisions component=%s ready=%s latest=%s previous=%s phase=%s", c,
 			orNil(revisionHashOfService(cs.LatestReadyRevision)), orNil(revisionHashOfService(cs.LatestRolledoutRevision)),

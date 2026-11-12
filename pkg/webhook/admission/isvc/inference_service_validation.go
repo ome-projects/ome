@@ -13,8 +13,10 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/runtimerevision"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	"sigs.k8s.io/ome/pkg/utils/storage"
@@ -64,6 +66,19 @@ type InferenceServiceValidator struct {
 	// active translator's SupportedTrafficFields().
 	SupportedTrafficFields []string
 
+	// IngressConfig is the cluster's ingress configuration. The route
+	// provider an InferenceService resolves to — and that provider's
+	// declared capabilities (routeProviderCapabilities) — are read from
+	// it with the InferenceService's own ingress annotations applied,
+	// exactly as the controller resolves them. It feeds
+	// validation.ValidateRouteCapabilities: a canary whose traffic
+	// percentages need weighted revision routing is rejected when the
+	// provider declares it cannot split a route between revisions. nil
+	// (test wiring) disables the gate; the controller then reports the
+	// intent through the TrafficIntentReady condition. Production
+	// passes the startup-loaded config.
+	IngressConfig *controllerconfig.IngressConfig
+
 	// RolloutPolicyEnabled reports whether the RolloutPolicy CRD is
 	// installed; with it false, any groups[].policyRef is rejected outright —
 	// a ref on a non-feature cluster would otherwise park every rollout with
@@ -100,6 +115,16 @@ type InferenceServiceValidator struct {
 	// member with no replica fields by it; nil means unconfigured, and such
 	// a member is sized at the API default of one.
 	DefaultMinReplicas *int
+
+	// DefaultUpdateStrategy is the operator-configured update strategy fill
+	// per Component (the deploy.updateStrategy block of the operator
+	// ConfigMap, read once at startup), the fill the reconciler applies to a
+	// Component that declares no strategy type. The drain feasibility rule
+	// reads a member with no declared strategy by it, so admission reads the
+	// member as the rollout will roll it; a Component the block leaves
+	// without a type rolls as SurgeThenDrain, the rollout's reading of an
+	// unset strategy.
+	DefaultUpdateStrategy *controllerconfig.UpdateStrategyDefaultsConfig
 }
 
 // +kubebuilder:webhook:verbs=create;update,path=/validate-ome-io-v1beta1-inferenceservice,mutating=false,failurePolicy=fail,groups=ome.io,resources=inferenceservices,versions=v1beta1,name=inferenceservice.ome-webhook-server.validator
@@ -143,6 +168,12 @@ func (v *InferenceServiceValidator) ValidateCreate(ctx context.Context, isvc *v1
 	if err := validation.ValidateRolloutOrderingEnforced(&isvc.Spec); err != nil {
 		return warnings, err
 	}
+	// Route-provider capability gate: a well-formed canary is still
+	// rejected when the provider its traffic percentages target declares
+	// it cannot carry them.
+	if err := validation.ValidateRouteCapabilities(&isvc.Spec, v.routeCapabilities(isvc)); err != nil {
+		return warnings, err
+	}
 	return warnings, nil
 }
 
@@ -170,6 +201,13 @@ func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc,
 		return nil, err
 	}
 	if err := validation.ValidatePairingProtocolUpdate(&oldIsvc.Spec, &isvc.Spec); err != nil {
+		return nil, err
+	}
+	// A Component the open run names keeps its backend until the run
+	// closes; the refusal comes before the group rules so the operator
+	// reads why the mode is held rather than that the member must be
+	// OMENative.
+	if err := validateDeploymentModeChangeUnderOpenRun(oldIsvc, isvc); err != nil {
 		return nil, err
 	}
 	if err := v.validateReplicaRefs(ctx, oldIsvc, isvc); err != nil {
@@ -204,7 +242,26 @@ func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc,
 	if err := validation.ValidateRolloutOrderingEnforcedUpdate(&oldIsvc.Spec, &isvc.Spec); err != nil {
 		return warnings, err
 	}
+	// Ratcheted route-provider capability gate: applied only when the update
+	// changes the intent or the provider it targets, so a stored object whose
+	// provider was declared incapable after it was written keeps accepting
+	// unrelated edits while the controller holds and reports its rollout.
+	if err := validation.ValidateRouteCapabilitiesUpdate(&oldIsvc.Spec, &isvc.Spec, v.routeCapabilities(oldIsvc), v.routeCapabilities(isvc)); err != nil {
+		return warnings, err
+	}
 	return warnings, nil
+}
+
+// routeCapabilities resolves the declared capability set of the route
+// provider isvc's external route is rendered by: the cluster ingress config
+// with isvc's own ingress annotations applied, the same resolution the
+// controller performs. A validator without an IngressConfig reports an
+// unknown provider, which gates nothing.
+func (v *InferenceServiceValidator) routeCapabilities(isvc *v1beta1.InferenceService) validation.RouteProviderCapabilities {
+	if v.IngressConfig == nil {
+		return validation.RouteProviderCapabilities{}
+	}
+	return isvcutils.ResolveIngressConfig(v.IngressConfig, isvc.Annotations).RouteCapabilities()
 }
 
 // validateNoStandaloneReplicaCollision rejects an InferenceService whose
@@ -308,12 +365,6 @@ func validateLegacyAutoscalerFieldsFromCtx(ctx context.Context) error {
 
 func (v *InferenceServiceValidator) ValidateDelete(_ context.Context, _ *v1beta1.InferenceService) (admission.Warnings, error) {
 	return nil, nil
-}
-
-// GetIntReference returns the pointer for the integer input
-func GetIntReference(number int) *int {
-	num := number
-	return &num
 }
 
 // deploymentStrategyWarnings flags components that set deploymentStrategy while
@@ -441,6 +492,9 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 	if err := validation.ValidateRouting(&isvc.Spec); err != nil {
 		return allWarnings, err
 	}
+	if err := validation.ValidateRoutingPublisherOptionAnnotations(isvc.Annotations, &isvc.Spec); err != nil {
+		return allWarnings, err
+	}
 
 	// Traffic block: typed core load-balancing config + ome.io/* annotations.
 	if err := validation.ValidateTrafficSpec(isvc.Spec.Traffic); err != nil {
@@ -474,7 +528,8 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 		return allWarnings, err
 	}
 	if err := validation.ValidateRatioDrainFeasibility(&isvc.Spec, validation.RatioDrainDefaults{
-		TolerancePercent: v.DefaultRatioTolerancePercent, MinReplicas: v.DefaultMinReplicas}); err != nil {
+		TolerancePercent: v.DefaultRatioTolerancePercent, MinReplicas: v.DefaultMinReplicas,
+		UpdateStrategyTypes: configuredUpdateStrategyTypes(v.DefaultUpdateStrategy)}); err != nil {
 		return allWarnings, err
 	}
 	if warning := validation.CoordinationRatioToleranceWarning(&isvc.Spec); warning != "" {
@@ -510,7 +565,7 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 	if err := validateRuntimePin(isvc); err != nil {
 		return allWarnings, err
 	}
-	if err := v.validateModelExists(ctx, isvc); err != nil {
+	if err := v.validateModelExists(isvc); err != nil {
 		return allWarnings, err
 	}
 	if err := v.validateOverlays(isvc); err != nil {
@@ -530,7 +585,7 @@ func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context
 // validateModelExists ensures the referenced BaseModel/ClusterBaseModel
 // (and each overlay) is reachable in the ISVC's namespace, and that
 // cross-namespace PVC rules pass per-overlay.
-func (v *InferenceServiceValidator) validateModelExists(ctx context.Context, isvc *v1beta1.InferenceService) error {
+func (v *InferenceServiceValidator) validateModelExists(isvc *v1beta1.InferenceService) error {
 	if isvc.Spec.Model == nil || isvc.Spec.Model.Name == "" {
 		return nil
 	}
@@ -868,4 +923,20 @@ func hasFullRunnerConfig(engine *v1beta1.EngineSpec) bool {
 		return leaderHasRunner && workerHasRunner
 	}
 	return false
+}
+
+// configuredUpdateStrategyTypes is the strategy type the operator's deploy
+// block fills on each Component that declares none, keyed by Component; a
+// Component the block leaves without a type is absent.
+func configuredUpdateStrategyTypes(cfg *controllerconfig.UpdateStrategyDefaultsConfig) map[v1beta1.ComponentType]v1beta1.UpdateStrategyType {
+	if cfg == nil {
+		return nil
+	}
+	types := map[v1beta1.ComponentType]v1beta1.UpdateStrategyType{}
+	for _, c := range validation.ComponentRoles {
+		if entry := cfg.ForComponent(workloadtypes.ComponentType(c)); entry != nil && entry.Type != "" {
+			types[c] = v1beta1.UpdateStrategyType(entry.Type)
+		}
+	}
+	return types
 }

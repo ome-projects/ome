@@ -371,6 +371,11 @@ func (d *driver) interceptors() interceptor.Funcs {
 			return nil
 		},
 		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, isQuota := list.(*corev1.ResourceQuotaList); isQuota {
+				if err := d.publishQuotaUsage(ctx, c); err != nil {
+					return err
+				}
+			}
 			if err := c.List(ctx, list, opts...); err != nil {
 				return err
 			}
@@ -418,6 +423,10 @@ func (d *driver) interceptors() interceptor.Funcs {
 					d.trace.object(kindOf(obj), "create-rejected", obj.GetName(), "rejection="+label)
 				}
 				return d.createRejectionEffect(ctx, c, obj, err)
+			}
+			if err := d.quotaRefusal(ctx, c, obj); err != nil {
+				d.trace.object(kindOf(obj), "create-rejected", obj.GetName(), "rejection=quota")
+				return err
 			}
 			if err := c.Create(ctx, obj, opts...); err != nil {
 				if d.traced(obj) {
@@ -953,14 +962,29 @@ func setPodCondition(pod *corev1.Pod, condType corev1.PodConditionType, status c
 // setContainerStatusesReady mirrors the kubelet's running-container
 // report for the pod's declared containers.
 func setContainerStatusesReady(pod *corev1.Pod) {
+	// The kubelet keeps a container's restart count, its last termination
+	// and the start of its current run across readiness changes, so a
+	// status already reported carries them into the Ready one.
+	previous := make(map[string]corev1.ContainerStatus, len(pod.Status.ContainerStatuses))
+	for _, cs := range pod.Status.ContainerStatuses {
+		previous[cs.Name] = cs
+	}
 	statuses := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
 	for _, c := range pod.Spec.Containers {
-		statuses = append(statuses, corev1.ContainerStatus{
+		cs := corev1.ContainerStatus{
 			Name:  c.Name,
 			Image: c.Image,
 			Ready: true,
 			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
-		})
+		}
+		if prev, ok := previous[c.Name]; ok {
+			cs.RestartCount = prev.RestartCount
+			cs.LastTerminationState = prev.LastTerminationState
+			if prev.State.Running != nil {
+				cs.State = prev.State
+			}
+		}
+		statuses = append(statuses, cs)
 	}
 	pod.Status.ContainerStatuses = statuses
 }

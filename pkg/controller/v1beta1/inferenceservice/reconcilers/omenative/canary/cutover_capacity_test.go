@@ -24,13 +24,13 @@ import (
 // a later pass writes the done sentinel only on canary capacity it has
 // itself counted. A cutover whose canary capacity vanished between the two
 // holds in the drain with the stable instance still held, until the capacity
-// is back or the ready timeout parks it with the traffic returned to that
+// is back or the ready timeout stops it with the traffic returned to that
 // instance.
 
-// twoInstanceManualLadder is the manual two-step ladder on a two-instance
+// twoInstanceManualCanary is the manual two-step canary on a two-instance
 // Component, brought to its first step with the split serving: one instance
 // held on the stable revision, one serving the canary.
-func twoInstanceManualLadder(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
+func twoInstanceManualCanary(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
 	t.Helper()
 	isvc := pinActiveRun(canaryISVC(twoStep(), nil))
 	in := baseInputs(isvc, map[string]int32{"old": 2})
@@ -90,11 +90,11 @@ func expectHeldAtFinalStep(t *testing.T, isvc *v1beta1.InferenceService, res *Re
 
 // Promote consumed while the canary's only serving pod is gone: the step
 // holds on capacity, the split it inherited rests on the stable instance
-// while no canary pod serves, and the ladder resumes once capacity is back.
+// while no canary pod serves, and the canary resumes once capacity is back.
 // The resume moves traffic to 100% on the capacity the pass counted and
 // leaves the release to a later pass with its own count.
 func TestReconcile_PromoteConsumedWhileTheOnlyCanaryPodIsGone(t *testing.T) {
-	isvc, in := twoInstanceManualLadder(t)
+	isvc, in := twoInstanceManualCanary(t)
 	promoteToFinalStep(t, isvc, in)
 
 	// The only canary pod is gone when the final step first runs: the step
@@ -135,7 +135,7 @@ func TestReconcile_PromoteConsumedWhileTheOnlyCanaryPodIsGone(t *testing.T) {
 // that finds the canary pod gone holds the drain with the stable instance
 // still held until the capacity is back.
 func TestReconcile_CutoverReReadsCapacityBeforeReleasingTheStableInstance(t *testing.T) {
-	isvc, in := twoInstanceManualLadder(t)
+	isvc, in := twoInstanceManualCanary(t)
 	promoteToFinalStep(t, isvc, in)
 
 	// The pass still counts the canary pod: traffic moves to 100%, the
@@ -155,14 +155,14 @@ func TestReconcile_CutoverReReadsCapacityBeforeReleasingTheStableInstance(t *tes
 	waitSince := cs.CapacityWaitSince.Time
 
 	// The wait keeps its anchor: a later pass of the hold neither re-stamps
-	// it nor parks before the ready timeout has run from it.
+	// it nor stops before the ready timeout has run from it.
 	in.Now = in.Now.Add(in.DefaultReadyTimeout / 2)
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
 	if cs.Failed != nil || !cs.CapacityWaitSince.Time.Equal(waitSince) {
 		t.Fatalf("a drain's capacity wait keeps its anchor inside the timeout, got failed=%+v wait=%v", cs.Failed, cs.CapacityWaitSince)
 	}
 
-	// Capacity is back: the release reads it and the ladder finishes.
+	// Capacity is back: the release reads it and the canary finishes.
 	in.PerRevisionPods = map[string]int32{"new": 1, "old": 1}
 	in.Now = in.Now.Add(time.Second)
 	expectReleased(t, isvc, mustReconcile(t, isvc, in), 2)
@@ -242,12 +242,12 @@ func TestDispatch_ADeletedPodStillInTheCacheIsNotCapacity(t *testing.T) {
 }
 
 // heldFinalStep is the final step held on capacity after its traffic write
-// landed: the two-instance manual ladder promoted to the final step, 100%
+// landed: the two-instance manual canary promoted to the final step, 100%
 // traffic moved onto the one canary instance, and that instance's only pod
 // gone before the release. The stable instance is still held under it.
 func heldFinalStep(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
 	t.Helper()
-	isvc, in := twoInstanceManualLadder(t)
+	isvc, in := twoInstanceManualCanary(t)
 	promoteToFinalStep(t, isvc, in)
 	in.Now = in.Now.Add(time.Second)
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
@@ -283,7 +283,7 @@ func TestReconcile_HeldFinalStepRollsBackOnRequest(t *testing.T) {
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.Failed != nil {
-		t.Fatalf("the hold does not park, got %+v", cs.Failed)
+		t.Fatalf("the hold does not stop, got %+v", cs.Failed)
 	}
 
 	// A replacement pod on the rejected revision is still coming up, which
@@ -310,9 +310,9 @@ func TestReconcile_HeldFinalStepRollsBackOnRequest(t *testing.T) {
 }
 
 // A held final step is left by a new push like any live step: the unit
-// re-arms at step 0 toward the new target, keeps the pre-canary stable
+// starts again at step 0 toward the new target, keeps the pre-canary stable
 // identity, and the split it owned returns to the stable revision.
-func TestReconcile_HeldFinalStepReArmsOnANewPush(t *testing.T) {
+func TestReconcile_HeldFinalStepStartsAgainOnANewPush(t *testing.T) {
 	isvc, in := heldFinalStep(t)
 	in.CanaryRevisionHash, in.TargetID = "newer", "t2"
 	in.Now = in.Now.Add(time.Second)
@@ -320,7 +320,7 @@ func TestReconcile_HeldFinalStepReArmsOnANewPush(t *testing.T) {
 	expectUnitState(t, isvc, 2, rollout.CanaryStateStaging, "after the push")
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.CurrentStep != 0 || cs.CanaryRevisionHash != "newer" || cs.StableRevisionHash != "old" || cs.TargetID != "t2" {
-		t.Fatalf("the re-arm starts the ladder over toward the new target, got %+v", cs)
+		t.Fatalf("the fresh start runs the canary over toward the new target, got %+v", cs)
 	}
 	if !res.Active || res.Partition != 1 {
 		t.Fatalf("the first step stages against the held stable instance, got %+v", res)
@@ -329,11 +329,11 @@ func TestReconcile_HeldFinalStepReArmsOnANewPush(t *testing.T) {
 }
 
 // The crash rules read the held final step like any live step: a canary pod
-// that keeps dying parks the ladder at the final step with the traffic back
-// on the stable revision and the stable instance still held, and the park
+// that keeps dying stops the canary at the final step with the traffic back
+// on the stable revision and the stable instance still held, and the stop
 // keeps its exits: a rollback request, a new push, and a resume.
-func TestReconcile_HeldFinalStepParksOnACrashLoop(t *testing.T) {
-	parked := func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
+func TestReconcile_HeldFinalStepStopsOnACrashLoop(t *testing.T) {
+	stopped := func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
 		t.Helper()
 		isvc, in := heldFinalStep(t)
 		rec := record.NewFakeRecorder(8)
@@ -343,40 +343,40 @@ func TestReconcile_HeldFinalStepParksOnACrashLoop(t *testing.T) {
 		res := mustReconcile(t, isvc, in)
 		cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 		if cs.Failed == nil || cs.Failed.Reason != v1beta1.CanaryFailureCapacityTimeout || phaseOf(isvc) != v1beta1.RolloutPhaseFailed || cs.CurrentStep != 1 {
-			t.Fatalf("a crash loop parks the held final step, got phase=%q status=%+v", phaseOf(isvc), cs)
+			t.Fatalf("a crash loop stops the held final step, got phase=%q status=%+v", phaseOf(isvc), cs)
 		}
 		if !res.Active || res.Partition != in.DesiredReplicas || res.RequeueAfter != failedRequeue {
-			t.Fatalf("the stop holds every Instance where it stands at the parked cadence, got %+v", res)
+			t.Fatalf("the stop holds every Instance where it stands at a stopped canary's cadence, got %+v", res)
 		}
 		expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")
 		select {
 		case ev := <-rec.Events:
 			if !strings.Contains(ev, EventReasonCanaryPodCrashed) {
-				t.Fatalf("the park names the pod that keeps dying, got %q", ev)
+				t.Fatalf("the stop names the pod that keeps dying, got %q", ev)
 			}
 		default:
-			t.Fatal("the park must be announced")
+			t.Fatal("the stop must be announced")
 		}
 		in.Crash, in.Recorder = nil, nil
 		return isvc, in
 	}
 
-	expectParkKeepsItsExits(t, parked)
+	expectStopKeepsItsExits(t, stopped)
 }
 
-// expectParkKeepsItsExits runs the exits every park at the final step keeps,
-// each against a fresh park from parked: the park holds with the stable
-// instance, a rollback request ends it, a new push re-arms, a resume
-// re-enters the ladder.
-func expectParkKeepsItsExits(t *testing.T, parked func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs)) {
+// expectStopKeepsItsExits runs the exits every stop at the final step keeps,
+// each against a fresh stop from stopped: the stop holds with the stable
+// instance, a rollback request ends it, a new push starts it again, a resume
+// re-enters the steps at the final step the stop interrupted.
+func expectStopKeepsItsExits(t *testing.T, stopped func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs)) {
 	t.Helper()
-	t.Run("the park holds with the stable instance", func(t *testing.T) {
-		isvc, in := parked(t)
+	t.Run("the stop holds with the stable instance", func(t *testing.T) {
+		isvc, in := stopped(t)
 		in.Now = in.Now.Add(time.Hour)
 		res := mustReconcile(t, isvc, in)
-		expectUnitState(t, isvc, 2, rollout.CanaryStateFailed, "an hour into the park")
+		expectUnitState(t, isvc, 2, rollout.CanaryStateFailed, "an hour into the stop")
 		if !res.Active || res.RequeueAfter != failedRequeue {
-			t.Fatalf("the park holds at its cadence, got %+v", res)
+			t.Fatalf("the stop holds at its cadence, got %+v", res)
 		}
 		ext := &v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(2)}
 		if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, DesiredReplicas(nil, ext)); p == nil || *p != 2 {
@@ -384,34 +384,34 @@ func expectParkKeepsItsExits(t *testing.T, parked func(t *testing.T) (*v1beta1.I
 		}
 		expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")
 	})
-	t.Run("a rollback request ends the park", func(t *testing.T) {
-		isvc, in := parked(t)
+	t.Run("a rollback request ends the stop", func(t *testing.T) {
+		isvc, in := stopped(t)
 		annotate(isvc, constants.RolloutRollbackAnnotation, "true")
 		res := mustReconcile(t, isvc, in)
 		cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 		if !res.RolledBack || cs.RolledBackRevisionHash != "new" || cs.Failed != nil {
-			t.Fatalf("the rollback must end the park and reject the canary revision, got res=%+v status=%+v", res, cs)
+			t.Fatalf("the rollback must end the stop and reject the canary revision, got res=%+v status=%+v", res, cs)
 		}
 		expectUnitState(t, isvc, 2, rollout.CanaryStateRolledBack, "after the rollback")
 		expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")
 	})
-	t.Run("a new push re-arms", func(t *testing.T) {
-		isvc, in := parked(t)
+	t.Run("a new push starts the canary again", func(t *testing.T) {
+		isvc, in := stopped(t)
 		in.CanaryRevisionHash, in.TargetID = "newer", "t2"
 		mustReconcile(t, isvc, in)
 		expectUnitState(t, isvc, 2, rollout.CanaryStateStaging, "after the push")
 		cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 		if cs.CurrentStep != 0 || cs.CanaryRevisionHash != "newer" || cs.Failed != nil {
-			t.Fatalf("the push re-arms at step 0, got %+v", cs)
+			t.Fatalf("the push starts the canary again at step 0, got %+v", cs)
 		}
 	})
-	t.Run("a resume re-enters the ladder", func(t *testing.T) {
-		isvc, in := parked(t)
+	t.Run("a resume re-enters the steps at the final step", func(t *testing.T) {
+		isvc, in := stopped(t)
 		annotate(isvc, constants.RolloutResumeAnnotation, "new")
 		res := mustReconcile(t, isvc, in)
 		cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
-		if len(res.Consume) != 1 || res.Consume[0] != constants.RolloutResumeAnnotation || cs.CurrentStep != 0 || cs.Failed != nil {
-			t.Fatalf("the resume re-enters at step 0 and is handed back, got res=%+v status=%+v", res, cs)
+		if len(res.Consume) != 1 || res.Consume[0] != constants.RolloutResumeAnnotation || cs.CurrentStep != 1 || cs.Failed != nil {
+			t.Fatalf("the resume continues at the final step the stop interrupted and is handed back, got res=%+v status=%+v", res, cs)
 		}
 		expectUnitState(t, isvc, 2, rollout.CanaryStateStaging, "after the resume")
 	})
@@ -419,10 +419,10 @@ func expectParkKeepsItsExits(t *testing.T, parked func(t *testing.T) (*v1beta1.I
 
 // The held final step is bounded by the ready timeout, measured from the
 // capacity wait as the pre-shift wait is: once the canary capacity has not
-// returned within it, the canary parks Failed at the final step and the
+// returned within it, the canary stops at Failed at the final step and the
 // traffic goes back to the still-held stable instance.
-func TestReconcile_HeldFinalStepTimesOutIntoThePark(t *testing.T) {
-	isvc, in := twoInstanceManualLadder(t)
+func TestReconcile_HeldFinalStepTimesOutIntoAStop(t *testing.T) {
+	isvc, in := twoInstanceManualCanary(t)
 	promoteToFinalStep(t, isvc, in)
 	in.Now = in.Now.Add(time.Second)
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
@@ -444,20 +444,20 @@ func TestReconcile_HeldFinalStepTimesOutIntoThePark(t *testing.T) {
 	in.Now = waitSince.Add(in.DefaultReadyTimeout)
 	res := mustReconcile(t, isvc, in)
 	if cs.Failed == nil || cs.Failed.Reason != v1beta1.CanaryFailureCapacityTimeout || !cs.Failed.Time.Time.Equal(in.Now) || phaseOf(isvc) != v1beta1.RolloutPhaseFailed || cs.CurrentStep != 1 {
-		t.Fatalf("the hold must park at the final step on the ready timeout, got phase=%q status=%+v", phaseOf(isvc), cs)
+		t.Fatalf("the hold must stop at the final step on the ready timeout, got phase=%q status=%+v", phaseOf(isvc), cs)
 	}
 	if !res.Active || res.Partition != in.DesiredReplicas || res.RequeueAfter != failedRequeue {
-		t.Fatalf("the stop holds every Instance where it stands at the parked cadence, got %+v", res)
+		t.Fatalf("the stop holds every Instance where it stands at a stopped canary's cadence, got %+v", res)
 	}
 	expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")
 
-	// The park is not re-evaluated: capacity returning does not release it.
+	// The stop is not re-evaluated: capacity returning does not release it.
 	in.PerRevisionPods = map[string]int32{"new": 1, "old": 1}
 	in.Now = in.Now.Add(time.Minute)
 	res = mustReconcile(t, isvc, in)
 	expectUnitState(t, isvc, 2, rollout.CanaryStateFailed, "after the capacity returned")
 	if !res.Active || res.RequeueAfter != failedRequeue || cs.CurrentStep != 1 {
-		t.Fatalf("a park is not re-evaluated, got res=%+v status=%+v", res, cs)
+		t.Fatalf("a stop is not re-evaluated, got res=%+v status=%+v", res, cs)
 	}
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: intPtr(2)}
 	if p := StepPartition(isvc, rollout.Policies{}, v1beta1.EngineComponent, DesiredReplicas(nil, ext)); p == nil || *p != 2 {
@@ -475,22 +475,22 @@ func TestReconcile_HeldFinalStepReleasesWhenCapacityReturnsBeforeTheTimeout(t *t
 	in.Now = cs.CapacityWaitSince.Time.Add(in.DefaultReadyTimeout - time.Second)
 	expectReleased(t, isvc, mustReconcile(t, isvc, in), 2)
 	if cs.Failed != nil || cs.CapacityWaitSince != nil {
-		t.Fatalf("the release clears the wait and parks nothing, got failed=%+v wait=%v", cs.Failed, cs.CapacityWaitSince)
+		t.Fatalf("the release clears the wait and stops nothing, got failed=%+v wait=%v", cs.Failed, cs.CapacityWaitSince)
 	}
 	in.PerRevisionPods = map[string]int32{"new": 2}
 	expectStableAfterRoll(t, isvc, mustReconcile(t, isvc, in))
 }
 
-// The timeout park at the final step keeps the exits every park has.
-func TestReconcile_HeldFinalStepTimeoutParkKeepsItsExits(t *testing.T) {
-	expectParkKeepsItsExits(t, func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
+// The timeout stop at the final step keeps the exits every stop has.
+func TestReconcile_HeldFinalStepTimeoutStopKeepsItsExits(t *testing.T) {
+	expectStopKeepsItsExits(t, func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
 		t.Helper()
 		isvc, in := heldFinalStep(t)
 		in.Now = in.Now.Add(in.DefaultReadyTimeout + time.Second)
 		mustReconcile(t, isvc, in)
 		cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 		if cs.Failed == nil || cs.Failed.Reason != v1beta1.CanaryFailureCapacityTimeout || cs.CurrentStep != 1 {
-			t.Fatalf("the hold must have parked on the ready timeout, got %+v", cs)
+			t.Fatalf("the hold must have stopped on the ready timeout, got %+v", cs)
 		}
 		expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")
 		return isvc, in
@@ -500,7 +500,7 @@ func TestReconcile_HeldFinalStepTimeoutParkKeepsItsExits(t *testing.T) {
 // With no ready timeout configured anywhere the held final step waits as
 // the pre-shift wait does: untimed, released by the capacity when it returns.
 func TestReconcile_HeldFinalStepIsUntimedWithoutAReadyTimeout(t *testing.T) {
-	isvc, in := twoInstanceManualLadder(t)
+	isvc, in := twoInstanceManualCanary(t)
 	in.DefaultReadyTimeout = 0
 	promoteToFinalStep(t, isvc, in)
 	in.Now = in.Now.Add(time.Second)
@@ -512,7 +512,7 @@ func TestReconcile_HeldFinalStepIsUntimedWithoutAReadyTimeout(t *testing.T) {
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.Failed != nil || cs.CapacityWaitSince == nil {
-		t.Fatalf("an unconfigured timeout never parks the wait, got %+v", cs)
+		t.Fatalf("an unconfigured timeout never stops the wait, got %+v", cs)
 	}
 	in.PerRevisionPods = map[string]int32{"new": 1, "old": 1}
 	in.Now = in.Now.Add(time.Second)
@@ -553,7 +553,7 @@ func TestReconcile_SecondPromoteAtTheHeldFinalStepWaitsWithIt(t *testing.T) {
 
 // heldFinalGate is a manual gate on the final step holding for the
 // operator with 100% traffic moved and the canary's only pod gone under it:
-// the two-instance ladder with a manual hold on both steps, promoted once.
+// the two-instance canary with a manual hold on both steps, promoted once.
 func heldFinalGate(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
 	t.Helper()
 	steps := []v1beta1.RolloutGroupStep{
@@ -601,7 +601,7 @@ func TestReconcile_PromoteOpensAHeldFinalGateOnlyOntoCountedCapacity(t *testing.
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.Failed != nil {
-		t.Fatalf("the wait inside the ready timeout is not a park, got %+v", cs.Failed)
+		t.Fatalf("the wait inside the ready timeout is not a stop, got %+v", cs.Failed)
 	}
 
 	// Capacity is back: the release reads it and records the promote.
@@ -618,26 +618,26 @@ func TestReconcile_PromoteOpensAHeldFinalGateOnlyOntoCountedCapacity(t *testing.
 }
 
 // A held final gate is bounded the same way: the capacity wait under a gate
-// still holding for the operator runs the ready timeout, and the park
+// still holding for the operator runs the ready timeout, and the stop
 // returns the traffic to the held stable instance.
-func TestReconcile_HeldFinalGateTimesOutIntoThePark(t *testing.T) {
+func TestReconcile_HeldFinalGateTimesOutIntoAStop(t *testing.T) {
 	isvc, in := heldFinalGate(t)
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	in.Now = cs.CapacityWaitSince.Time.Add(in.DefaultReadyTimeout)
 	res := mustReconcile(t, isvc, in)
 	if cs.Failed == nil || cs.Failed.Reason != v1beta1.CanaryFailureCapacityTimeout || phaseOf(isvc) != v1beta1.RolloutPhaseFailed || cs.CurrentStep != 1 {
-		t.Fatalf("the held gate must park on the ready timeout of its capacity wait, got phase=%q status=%+v", phaseOf(isvc), cs)
+		t.Fatalf("the held gate must stop on the ready timeout of its capacity wait, got phase=%q status=%+v", phaseOf(isvc), cs)
 	}
 	if !res.Active || res.Partition != in.DesiredReplicas || res.RequeueAfter != failedRequeue {
-		t.Fatalf("the stop holds every Instance where it stands at the parked cadence, got %+v", res)
+		t.Fatalf("the stop holds every Instance where it stands at a stopped canary's cadence, got %+v", res)
 	}
 	expectSoleTarget(t, isvc, v1beta1.EngineComponent, "old")
 }
 
-// twoInstanceTimedLadderAtFinalStep brings a timed two-step ladder on a
+// twoInstanceTimedCanaryAtFinalStep brings a timed two-step canary on a
 // two-instance Component through its soak to the final step, entered and
 // staging with its capacity already up; finalPause gates the final step.
-func twoInstanceTimedLadderAtFinalStep(t *testing.T, finalPause *v1beta1.RolloutPause) (*v1beta1.InferenceService, ReconcileInputs) {
+func twoInstanceTimedCanaryAtFinalStep(t *testing.T, finalPause *v1beta1.RolloutPause) (*v1beta1.InferenceService, ReconcileInputs) {
 	t.Helper()
 	soak := &metav1.Duration{Duration: 20 * time.Second}
 	steps := []v1beta1.RolloutGroupStep{
@@ -657,12 +657,12 @@ func twoInstanceTimedLadderAtFinalStep(t *testing.T, finalPause *v1beta1.Rollout
 	return isvc, in
 }
 
-// The automatic ladder's final step follows the same rule: the pass that
+// The timed canary's final step follows the same rule: the pass that
 // moves traffic to 100% ends there, the release reads the capacity on a
 // later pass, and a canary pod gone in between holds the release with the
 // stable instance until the pod serves again.
-func TestReconcile_TimedLadderFinalStepReleasesOnItsOwnCount(t *testing.T) {
-	isvc, in := twoInstanceTimedLadderAtFinalStep(t, nil)
+func TestReconcile_TimedCanaryFinalStepReleasesOnItsOwnCount(t *testing.T) {
+	isvc, in := twoInstanceTimedCanaryAtFinalStep(t, nil)
 	in.Now = in.Now.Add(time.Second)
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
 	expectSoleTarget(t, isvc, v1beta1.EngineComponent, "new")
@@ -674,7 +674,7 @@ func TestReconcile_TimedLadderFinalStepReleasesOnItsOwnCount(t *testing.T) {
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting)
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.Failed != nil || cs.CapacityWaitSince == nil {
-		t.Fatalf("the hold records its wait and does not park inside the timeout, got %+v", cs)
+		t.Fatalf("the hold records its wait and does not stop inside the timeout, got %+v", cs)
 	}
 
 	// The pod serves again. The ungated final step has no soak to measure
@@ -692,7 +692,7 @@ func TestReconcile_TimedLadderFinalStepReleasesOnItsOwnCount(t *testing.T) {
 // waits for the capacity, and the pod that comes back soaks a full window
 // again before the release reads it.
 func TestReconcile_TimedFinalGateReleasesOnlyOntoCountedCapacity(t *testing.T) {
-	isvc, in := twoInstanceTimedLadderAtFinalStep(t, &v1beta1.RolloutPause{Duration: &metav1.Duration{Duration: 20 * time.Second}})
+	isvc, in := twoInstanceTimedCanaryAtFinalStep(t, &v1beta1.RolloutPause{Duration: &metav1.Duration{Duration: 20 * time.Second}})
 	in.Now = in.Now.Add(time.Second)
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePaused) // 100% moves, the gate soaks
 	expectSoleTarget(t, isvc, v1beta1.EngineComponent, "new")
@@ -704,7 +704,7 @@ func TestReconcile_TimedFinalGateReleasesOnlyOntoCountedCapacity(t *testing.T) {
 	expectHeldAtFinalStep(t, isvc, mustReconcile(t, isvc, in), v1beta1.RolloutPhasePromoting) // the gate opened, the release waits
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.Failed != nil {
-		t.Fatalf("the wait does not park, got %+v", cs.Failed)
+		t.Fatalf("the wait does not stop, got %+v", cs.Failed)
 	}
 
 	// The pod serves again: the soak measures from its restart before the

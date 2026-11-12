@@ -10,10 +10,10 @@ import (
 )
 
 // Context is the closed, controller-derived variable set one render sees.
-// All values come from the consuming InferenceService and its component's
-// EFFECTIVE bounds — on a placement-derived object, the per-home bounds —
-// never from user-supplied free-form strings, so no escaping layer exists to
-// get wrong.
+// Every value comes from the consuming InferenceService and its component's
+// effective bounds (on a placement-derived object, the bounds of that member
+// cluster), never from user-supplied free-form strings, so there is no
+// escaping layer to get wrong.
 type Context struct {
 	Namespace   string
 	ISVCName    string
@@ -47,7 +47,7 @@ type Result struct {
 	Autoscaler *v1beta1.ComponentAutoscaler
 	// PortableDigest identifies the policy content (cluster-portable).
 	PortableDigest string
-	// ResolvedDigest identifies this render (per-home provenance).
+	// ResolvedDigest identifies this render on this member cluster.
 	ResolvedDigest string
 }
 
@@ -61,10 +61,10 @@ func IsEndpointTriggerType(triggerType string) bool {
 }
 
 // Render materializes one component's ComponentAutoscaler from a policy.
-// Pure and deterministic: same policy generation + context + providers →
-// same output. Errors are fail-closed signals — the caller must keep the
-// component's last-known-good scaler and raise a condition, never fall
-// through to a different scaler class.
+// Pure and deterministic: the same policy generation, context and providers
+// give the same output. An error is a fail-closed signal: the caller keeps
+// the component's last-known-good scaler and raises a condition, and never
+// falls through to a different scaler class.
 func Render(policy *v1beta1.AutoscalerPolicy, providers Providers, rctx Context) (*Result, error) {
 	return RenderWithCache(DefaultCache, policy, providers, rctx)
 }
@@ -117,12 +117,25 @@ func RenderWithCache(cache *Cache, policy *v1beta1.AutoscalerPolicy, providers P
 	return &Result{Autoscaler: rendered, PortableDigest: portable, ResolvedDigest: resolved}, nil
 }
 
+// kedaRender is one render of a KEDA template: the policy's compiled
+// metadata templates, the cluster's provider bindings and the variables.
+type kedaRender struct {
+	compiled  *compiledPolicy
+	providers Providers
+	rctx      Context
+}
+
+// renderKeda renders the policy's KEDA template for one component: the
+// scaler settings copied, every trigger rendered, and the fallback count
+// resolved against the bounds. It also returns the server addresses the
+// endpoint triggers were bound to, which enter the resolved digest.
 func renderKeda(cache *Cache, policy *v1beta1.AutoscalerPolicy, providers Providers, rctx Context) (*v1beta1.KedaAutoscaler, []string, error) {
 	spec := policy.Spec.Keda
 	compiled, err := cache.compiledFor(policy)
 	if err != nil {
 		return nil, nil, err
 	}
+	render := kedaRender{compiled: compiled, providers: providers, rctx: rctx}
 
 	out := &v1beta1.KedaAutoscaler{
 		Advanced:         spec.Advanced.DeepCopy(),
@@ -133,55 +146,14 @@ func renderKeda(cache *Cache, policy *v1beta1.AutoscalerPolicy, providers Provid
 
 	var serverAddresses []string
 	for i := range spec.Triggers {
-		trigger := &spec.Triggers[i]
-		metadata := make(map[string]string, len(trigger.Metadata)+1)
-		for key, value := range trigger.Metadata {
-			// Provider-owned keys are rejected at admission; refuse them here
-			// too so a skew-admitted policy cannot smuggle an endpoint in.
-			if IsForbiddenMetadataKey(key) {
-				return nil, nil, fmt.Errorf("trigger %d metadata key %q is provider-owned and not allowed in policies", i, key)
-			}
-			tmpl, ok := compiled.templates[templateKey(i, key)]
-			if !ok {
-				// Cache entries are compiled from the same generation; a miss
-				// means the caller bypassed compilation — compile on the spot.
-				tmpl, err = parseMetadataTemplate(templateKey(i, key), value)
-				if err != nil {
-					return nil, nil, fmt.Errorf("trigger %d metadata %q: %w", i, key, err)
-				}
-			}
-			var sb strings.Builder
-			if err := tmpl.Execute(&sb, rctx); err != nil {
-				return nil, nil, fmt.Errorf("trigger %d metadata %q: render: %w", i, key, err)
-			}
-			metadata[key] = sb.String()
+		trigger, serverAddress, err := render.trigger(i, &spec.Triggers[i])
+		if err != nil {
+			return nil, nil, err
 		}
-
-		renderedTrigger := kedav1.ScaleTriggers{
-			Type:       trigger.Type,
-			Metadata:   metadata,
-			MetricType: trigger.MetricType,
+		if serverAddress != "" {
+			serverAddresses = append(serverAddresses, serverAddress)
 		}
-
-		if IsEndpointTriggerType(trigger.Type) {
-			if trigger.ProviderRef == nil || trigger.ProviderRef.Name == "" {
-				return nil, nil, fmt.Errorf("trigger %d (%s): providerRef is required for endpoint trigger types", i, trigger.Type)
-			}
-			binding, ok := providers[trigger.ProviderRef.Name]
-			if !ok || binding.ServerAddress == "" {
-				return nil, nil, fmt.Errorf("trigger %d (%s): metric provider %q is not bound on this cluster", i, trigger.Type, trigger.ProviderRef.Name)
-			}
-			metadata["serverAddress"] = binding.ServerAddress
-			serverAddresses = append(serverAddresses, binding.ServerAddress)
-			if binding.AuthenticationName != "" {
-				renderedTrigger.AuthenticationRef = &kedav1.AuthenticationRef{Name: binding.AuthenticationName}
-				// The provider binding owns auth wholesale: the mode is fixed
-				// to bearer alongside the materialized TriggerAuthentication.
-				metadata["authModes"] = "bearer"
-			}
-		}
-
-		out.Triggers = append(out.Triggers, renderedTrigger)
+		out.Triggers = append(out.Triggers, trigger)
 	}
 
 	if spec.Fallback != nil {
@@ -197,10 +169,89 @@ func renderKeda(cache *Cache, policy *v1beta1.AutoscalerPolicy, providers Provid
 	return out, serverAddresses, nil
 }
 
+// trigger renders one trigger: its metadata through the templates, then,
+// for an endpoint trigger, the provider's address and authentication. The
+// bound server address is returned beside the trigger, empty when the
+// trigger reaches no endpoint.
+func (r kedaRender) trigger(index int, trigger *v1beta1.KedaTriggerTemplate) (kedav1.ScaleTriggers, string, error) {
+	metadata, err := r.metadata(index, trigger.Metadata)
+	if err != nil {
+		return kedav1.ScaleTriggers{}, "", err
+	}
+	rendered := kedav1.ScaleTriggers{
+		Type:       trigger.Type,
+		Metadata:   metadata,
+		MetricType: trigger.MetricType,
+	}
+	if !IsEndpointTriggerType(trigger.Type) {
+		return rendered, "", nil
+	}
+	binding, err := r.boundProvider(index, trigger)
+	if err != nil {
+		return kedav1.ScaleTriggers{}, "", err
+	}
+	metadata["serverAddress"] = binding.ServerAddress
+	if binding.AuthenticationName != "" {
+		rendered.AuthenticationRef = &kedav1.AuthenticationRef{Name: binding.AuthenticationName}
+		// The provider binding owns authentication as a whole: the mode is
+		// bearer, beside the TriggerAuthentication the controller materializes.
+		metadata["authModes"] = "bearer"
+	}
+	return rendered, binding.ServerAddress, nil
+}
+
+// metadata renders one trigger's metadata values against the variables. A
+// provider-owned key is refused here as well as at admission, so a policy
+// an older webhook admitted cannot carry an endpoint.
+func (r kedaRender) metadata(index int, values map[string]string) (map[string]string, error) {
+	metadata := make(map[string]string, len(values)+1)
+	for key, value := range values {
+		if IsForbiddenMetadataKey(key) {
+			return nil, fmt.Errorf("trigger %d metadata key %q is provider-owned and not allowed in policies", index, key)
+		}
+		rendered, err := r.value(index, key, value)
+		if err != nil {
+			return nil, err
+		}
+		metadata[key] = rendered
+	}
+	return metadata, nil
+}
+
+// value executes one metadata template. The cache compiles every template
+// of a policy generation; a key it does not hold is compiled on the spot.
+func (r kedaRender) value(index int, key, value string) (string, error) {
+	tmpl, ok := r.compiled.templates[templateKey(index, key)]
+	if !ok {
+		var err error
+		tmpl, err = parseMetadataTemplate(templateKey(index, key), value)
+		if err != nil {
+			return "", fmt.Errorf("trigger %d metadata %q: %w", index, key, err)
+		}
+	}
+	var sb strings.Builder
+	if err := tmpl.Execute(&sb, r.rctx); err != nil {
+		return "", fmt.Errorf("trigger %d metadata %q: render: %w", index, key, err)
+	}
+	return sb.String(), nil
+}
+
+// boundProvider is the cluster-local binding of an endpoint trigger's
+// provider; the trigger must name one and the cluster must bind it.
+func (r kedaRender) boundProvider(index int, trigger *v1beta1.KedaTriggerTemplate) (ProviderBinding, error) {
+	if trigger.ProviderRef == nil || trigger.ProviderRef.Name == "" {
+		return ProviderBinding{}, fmt.Errorf("trigger %d (%s): providerRef is required for endpoint trigger types", index, trigger.Type)
+	}
+	binding, ok := r.providers[trigger.ProviderRef.Name]
+	if !ok || binding.ServerAddress == "" {
+		return ProviderBinding{}, fmt.Errorf("trigger %d (%s): metric provider %q is not bound on this cluster", index, trigger.Type, trigger.ProviderRef.Name)
+	}
+	return binding, nil
+}
+
 // resolveReplicaValue materializes a typed ReplicaValueSource against the
-// effective bounds. Typed resolution, never string templates: the target
-// fields are int32 and round-tripping numbers through templates would add a
-// parse failure mode for no expressiveness.
+// effective bounds. The target fields are int32, so the value is resolved
+// as a number and never through a string template.
 func resolveReplicaValue(source *v1beta1.ReplicaValueSource, rctx Context) (int32, error) {
 	switch {
 	case source.Value != nil && source.FromComponent == nil:

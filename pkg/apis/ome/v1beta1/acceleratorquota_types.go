@@ -298,6 +298,7 @@ type AcceleratorQuotaList struct {
 //
 // +kubebuilder:validation:XValidation:rule="self.role != 'ClusterQueue' || has(self.parentRef)",message="a ClusterQueue node must set parentRef; only the reserved root node is parent-less"
 // +kubebuilder:validation:XValidation:rule="self.role != 'Cohort' || (!has(self.priorityTier) && !has(self.distribution))",message="a Cohort node must not set priorityTier or distribution; no workload binds to a grouping"
+// +kubebuilder:validation:XValidation:rule="self.role == 'ClusterQueue' || !has(self.preemption)",message="only a ClusterQueue node may set preemption"
 // +kubebuilder:validation:XValidation:rule="self.role != 'Cohort' || !has(self.budgets) || self.budgets.all(b, !has(b.policy) && !has(b.borrowingLimit) && !has(b.lendingLimit) && !has(b.perCluster))",message="a Cohort node's budgets carry only resourceName, resourceFlavor, and nominal"
 // +kubebuilder:validation:XValidation:rule="self.role != 'ClusterQueue' || (has(self.budgets) && size(self.budgets) > 0)",message="a ClusterQueue node must carry at least one budget"
 // +kubebuilder:validation:XValidation:rule="!has(self.budgets) || self.budgets.all(b, !(has(b.policy) ? b.policy == 'Explicit' : (has(self.distribution) && has(self.distribution.policy) && self.distribution.policy == 'Explicit')) || has(b.perCluster))",message="a budget whose effective distribution policy is Explicit must set perCluster"
@@ -326,6 +327,12 @@ type AcceleratorQuotaSpec struct {
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	PriorityTier string `json:"priorityTier,omitempty"`
+
+	// Preemption controls when this leaf's pending workloads may evict other
+	// workloads. The settings apply to its ClusterQueue on every member.
+	// Unset fields keep Kueue's defaults, which disable preemption.
+	// +optional
+	Preemption *AcceleratorQuotaPreemption `json:"preemption,omitempty"`
 
 	// Distribution is this leaf's default split policy, overridable per budget
 	// entry. Unset means the operator-level default from the quota config
@@ -419,10 +426,9 @@ type AcceleratorBudget struct {
 	// Borrowing is cluster-local, so setting it turns nominal from a ceiling
 	// into a floor plus overage, and the relaxed ceiling is reported in status.
 	//
-	// WARNING: overage is not currently reclaimable. This plane sets no
-	// preemption policy, so a borrower holds what it took until its own work
-	// finishes -- a leaf that bursts can leave a sibling waiting for the share
-	// that sibling was guaranteed. Leaves only.
+	// An owner's preemption.reclaimWithinCohort policy controls whether it can
+	// evict borrowers to recover its share. Without reclamation, an owner may
+	// wait until borrowed workloads finish. Leaves only.
 	// +optional
 	BorrowingLimit *resource.Quantity `json:"borrowingLimit,omitempty"`
 

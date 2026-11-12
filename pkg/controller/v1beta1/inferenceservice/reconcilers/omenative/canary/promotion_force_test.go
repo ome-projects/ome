@@ -225,8 +225,9 @@ func expectForceIgnored(t *testing.T, res *Result, cs *v1beta1.CanaryStatus, rec
 }
 
 // A force never overrides a rollout pause or a freeze: the ladder stays
-// where the pause found it, clocks untouched, and the force is consumed
-// with the reason so it cannot open the first gate the resumed ladder meets.
+// where the pause found it, its step clock untouched and its capacity wait
+// stopped, and the force is consumed with the reason so it cannot open the
+// first gate the resumed ladder meets.
 func TestReconcile_PausedRolloutConsumesTheForce(t *testing.T) {
 	for _, tc := range []struct{ depth, why string }{
 		{"true", "the rollout is paused"},
@@ -234,7 +235,7 @@ func TestReconcile_PausedRolloutConsumesTheForce(t *testing.T) {
 	} {
 		t.Run(tc.depth, func(t *testing.T) {
 			isvc, in, rec := stagingShort(t)
-			clock := isvc.Status.Canary.CapacityWaitSince.Time
+			entered := isvc.Status.Canary.StepEnteredTime.Time
 			annotate(isvc, constants.PausedRolloutAnnotation, tc.depth)
 			annotate(isvc, constants.RolloutPromoteForceAnnotation, "new")
 
@@ -244,8 +245,11 @@ func TestReconcile_PausedRolloutConsumesTheForce(t *testing.T) {
 			}
 			cs := isvc.Status.Canary
 			expectForceIgnored(t, res, cs, rec, 0, tc.why)
-			if phaseOf(isvc) != v1beta1.RolloutPhasePending || cs.CapacityWaitSince == nil || !cs.CapacityWaitSince.Time.Equal(clock) {
-				t.Fatalf("a paused ladder keeps its phase and clocks, got phase=%q clock=%v", phaseOf(isvc), cs.CapacityWaitSince)
+			if phaseOf(isvc) != v1beta1.RolloutPhasePending || cs.StepEnteredTime == nil || !cs.StepEnteredTime.Time.Equal(entered) {
+				t.Fatalf("a paused ladder keeps its phase and step clock, got phase=%q entered=%v", phaseOf(isvc), cs.StepEnteredTime)
+			}
+			if cs.CapacityWaitSince != nil {
+				t.Fatalf("a pause stops the capacity wait, got clock=%v", cs.CapacityWaitSince)
 			}
 			if got := revisionPercent(isvc, v1beta1.EngineComponent, "new"); got != 0 {
 				t.Fatalf("a paused ladder writes no traffic, got %d%% on the canary", got)

@@ -24,7 +24,7 @@ func ratioTerms(engine, decoder map[string]*v1beta1.ReplicaRatio) []v1beta1.Clus
 	var out []v1beta1.ClusterAffinityTerm
 	for _, name := range []string{"member-a", "member-b"} {
 		out = append(out, v1beta1.ClusterAffinityTerm{
-			Weights:     &v1beta1.ClusterAffinityWeights{EngineReplicas: engine[name], DecoderReplicas: decoder[name]},
+			Weights:     &v1beta1.ClusterAffinityWeights{Engine: engine[name], Decoder: decoder[name]},
 			MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}},
 		})
 	}
@@ -74,7 +74,8 @@ func TestDesiredSplitPlanRecordsMaxWeight(t *testing.T) {
 	}
 }
 
-func TestDesiredSplitPlanIntegerFormHasNoMaxWeight(t *testing.T) {
+// A plain key without max records a max ratio of 1, as its alias does.
+func TestDesiredSplitPlanPlainKeysRecordMaxWeight(t *testing.T) {
 	source := componentSplitSource(12, 12, map[string]int32{"member-a": 2, "member-b": 1}, map[string]int32{"member-a": 1, "member-b": 1})
 	proposal, err := desiredSplitPlan(source, twoMembers(), nil)
 	if err != nil {
@@ -83,21 +84,34 @@ func TestDesiredSplitPlanIntegerFormHasNoMaxWeight(t *testing.T) {
 	if len(proposal.Assignments) != 2 {
 		t.Fatalf("want two assignments, got %d", len(proposal.Assignments))
 	}
-	want := map[string][2]int64{"member-a": {2, 8}, "member-b": {1, 4}}
+	want := map[string][3]int64{"member-a": {2, 1, 8}, "member-b": {1, 1, 4}}
 	for name, a := range proposal.Assignments {
-		if a.MaxWeight != nil {
-			t.Errorf("%s: MaxWeight = %d, want nil", name, *a.MaxWeight)
+		if a.MaxWeight == nil {
+			t.Fatalf("%s: MaxWeight is nil, want 1", name)
 		}
-		if got := [2]int64{*a.Weight, int64(a.DesiredReplicas)}; got != want[name] {
-			t.Errorf("%s: weight and desired = %v, want %v", name, got, want[name])
+		if got := [3]int64{*a.Weight, *a.MaxWeight, int64(a.DesiredReplicas)}; got != want[name] {
+			t.Errorf("%s: weight, max weight and desired = %v, want %v", name, got, want[name])
 		}
 		if len(a.ComponentMatches) == 0 {
 			t.Errorf("%s: want component matches", name)
 		}
 		for _, m := range a.ComponentMatches {
-			if m.MaxWeight != nil {
-				t.Errorf("%s/%s: component MaxWeight = %d, want nil", name, m.Component, *m.MaxWeight)
+			if m.MaxWeight == nil || *m.MaxWeight != 1 {
+				t.Errorf("%s/%s: component MaxWeight = %v, want 1", name, m.Component, m.MaxWeight)
 			}
+		}
+	}
+}
+
+// An unweighted source records no max ratio and no component matches.
+func TestDesiredSplitPlanUnweightedHasNoMaxWeight(t *testing.T) {
+	proposal, err := desiredSplitPlan(srcISVCSplit("accelerator=gpu-a", 6), twoMembers(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, a := range proposal.Assignments {
+		if a.MaxWeight != nil || a.ComponentMatches != nil {
+			t.Errorf("%s: MaxWeight = %v, component matches = %v; want neither", name, a.MaxWeight, a.ComponentMatches)
 		}
 	}
 }

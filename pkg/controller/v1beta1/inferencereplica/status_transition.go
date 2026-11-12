@@ -36,7 +36,7 @@ func (r *Reconciler) reconcileStoredRepresentation(ctx context.Context, log logr
 		return false, ctrl.Result{}, nil
 	}
 	if r.InstanceStatusTarget == irstatus.EncodingColumnarV2 && source == irstatus.EncodingDenseV1 {
-		selection, err := irstatus.SelectCandidate(&ir.Status, r.InstanceStatusDecoder.MaxDecodedInstances())
+		selection, err := irstatus.SelectCandidateStoring(&ir.Status, r.InstanceStatusDecoder.MaxDecodedInstances(), r.ReadySinceForm)
 		if err != nil {
 			return true, ctrl.Result{}, r.instanceStatusDecodeError(ir, err)
 		}

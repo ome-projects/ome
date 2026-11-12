@@ -1,0 +1,37 @@
+{
+  "recordedOn": {
+    "date": "2026-11-07",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "First recording: the three writes beside the status write at the end of one pass over a replica at rest, every Instance Ready on the spec revision with every pod serving, at 1,000 and 4,000 single-pod Instances and 160 gangs of eight: the gang pass's GangSchedulingUnavailable condition (False on a Component whose gangs the cluster can schedule, or that has none), the InstanceReadyTimeoutUnconfigured condition (False under a configured deadline) and the current revision's promotion over the pass's pods. Each reads the replica live once, through the fake apiserver's JSON round trip of the whole object and the column decode of its rows, to find the condition already recorded as asked, or the current revision already the one the rows, the retry records and the pods call for, and writes nothing. The pass's copy carries both conditions and names the revision, as a copy decoded at the start of a pass at rest does. The three writes decide on the pass's copy first: a condition the copy records as asked, and a current revision the copy already names, are answered with no live read, and a changed condition the write commits is mirrored onto the copy; the promotion's per-Instance records (each Instance's pod revisions and the terminal-pod filter's list) are cut from one array. Each write 1 \u2192 0 live reads at every shape; the gang scheduling condition 6,178 / 24,183 / 1,142 \u2192 0 allocations at 1,000 and 4,000 single-pod Instances and 160 gangs of eight, the readiness deadline condition 6,181 / 24,186 / 1,145 \u2192 3 (its message), the promotion 8,195 / 32,224 / 2,115 \u2192 1,018 / 4,042 / 174 (the copy's rows converted for the reading, one time copy per row, and the pods bucketed by Instance).",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/160x8/gang-scheduling-condition/allocations": 0,
+    "gang/160x8/gang-scheduling-condition/bytes": 0,
+    "gang/160x8/gang-scheduling-condition/replica-live-reads": 0,
+    "gang/160x8/promotion/allocations": 174,
+    "gang/160x8/promotion/bytes": 118472,
+    "gang/160x8/promotion/replica-live-reads": 0,
+    "gang/160x8/ready-timeout-condition/allocations": 3,
+    "gang/160x8/ready-timeout-condition/bytes": 64,
+    "gang/160x8/ready-timeout-condition/replica-live-reads": 0,
+    "readySince/1000/gang-scheduling-condition/allocations": 0,
+    "readySince/1000/gang-scheduling-condition/bytes": 0,
+    "readySince/1000/gang-scheduling-condition/replica-live-reads": 0,
+    "readySince/1000/promotion/allocations": 1018,
+    "readySince/1000/promotion/bytes": 437976,
+    "readySince/1000/promotion/replica-live-reads": 0,
+    "readySince/1000/ready-timeout-condition/allocations": 3,
+    "readySince/1000/ready-timeout-condition/bytes": 64,
+    "readySince/1000/ready-timeout-condition/replica-live-reads": 0,
+    "readySince/4000/gang-scheduling-condition/allocations": 0,
+    "readySince/4000/gang-scheduling-condition/bytes": 0,
+    "readySince/4000/gang-scheduling-condition/replica-live-reads": 0,
+    "readySince/4000/promotion/allocations": 4042,
+    "readySince/4000/promotion/bytes": 1735160,
+    "readySince/4000/promotion/replica-live-reads": 0,
+    "readySince/4000/ready-timeout-condition/allocations": 3,
+    "readySince/4000/ready-timeout-condition/bytes": 64,
+    "readySince/4000/ready-timeout-condition/replica-live-reads": 0
+  }
+}

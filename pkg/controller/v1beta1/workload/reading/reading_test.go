@@ -156,7 +156,7 @@ func TestPodReading_KeepsTheShape(t *testing.T) {
 	if p.Name != podName || p.Protocol != "v1" || p.RevisionHash != fixture.RevisionHashB || p.Runner != types.RunnerLeader || p.Worker {
 		t.Fatalf("labels not kept: %+v", p)
 	}
-	if p.Terminal || p.Terminating || p.SurgeDraining || p.ParkedIn != "" {
+	if p.Terminal || p.Terminating || p.SurgeDraining || p.HeldIn != "" {
 		t.Fatalf("healthy pod reads a lifecycle flag: %+v", p)
 	}
 	if w := reading.ReadPod(fixture.Pod(podName, fixture.AsWorker), base()); !w.Worker {
@@ -174,8 +174,8 @@ func TestPodReading_KeepsTheShape(t *testing.T) {
 	if o := reading.ReadPod(fixture.Pod(podName, fixture.GateHeldBy(podreadiness.WriterUpdateInPlace, "0-1")), base()); o.SurgeDraining {
 		t.Fatalf("in-place drain read as the surge drain: %+v", o)
 	}
-	if c := reading.ReadPod(fixture.Pod(podName, fixture.ContainerWaiting("CrashLoopBackOff")), base()); c.ParkedIn != "CrashLoopBackOff" {
-		t.Fatalf("parked pod: %+v", c)
+	if c := reading.ReadPod(fixture.Pod(podName, fixture.ContainerWaiting("CrashLoopBackOff")), base()); c.HeldIn != "CrashLoopBackOff" {
+		t.Fatalf("held pod: %+v", c)
 	}
 }
 
@@ -183,28 +183,28 @@ func TestPodReading_OutOfService(t *testing.T) {
 	noGrace := base()
 	noGrace.UnreadyGrace = 0
 	for _, tc := range []struct {
-		name          string
-		pod           *corev1.Pod
-		ctx           reading.Context
-		out           bool
-		unready, dark bool
+		name                       string
+		pod                        *corev1.Pod
+		ctx                        reading.Context
+		out                        bool
+		unready, containersUnready bool
 	}{
 		{name: "serving", pod: fixture.Pod(podName), ctx: base()},
-		{name: "parked in CrashLoopBackOff", pod: fixture.Pod(podName, fixture.ContainerWaiting("CrashLoopBackOff")), ctx: base(), out: true, unready: true, dark: true},
-		{name: "parked, no grace configured", pod: fixture.Pod(podName, fixture.ContainerWaiting("ImagePullBackOff")), ctx: noGrace, out: true},
-		{name: "served, then unready past the grace", pod: fixture.Pod(podName, fixture.UnreadySince(now.Add(-2*time.Minute))), ctx: base(), out: true, unready: true, dark: true},
+		{name: "held in CrashLoopBackOff", pod: fixture.Pod(podName, fixture.ContainerWaiting("CrashLoopBackOff")), ctx: base(), out: true, unready: true, containersUnready: true},
+		{name: "held, no grace configured", pod: fixture.Pod(podName, fixture.ContainerWaiting("ImagePullBackOff")), ctx: noGrace, out: true},
+		{name: "served, then unready past the grace", pod: fixture.Pod(podName, fixture.UnreadySince(now.Add(-2*time.Minute))), ctx: base(), out: true, unready: true, containersUnready: true},
 		{name: "served, then unready inside the grace", pod: fixture.Pod(podName, fixture.UnreadySince(now.Add(-30*time.Second))), ctx: base()},
 		{name: "unready past the grace, no grace configured", pod: fixture.Pod(podName, fixture.UnreadySince(now.Add(-2*time.Minute))), ctx: noGrace},
-		{name: "never promoted, unready past the grace", pod: fixture.Pod(podName, fixture.NeverReady), ctx: base(), dark: true},
-		{name: "drained, then unready past the grace", pod: fixture.Pod(podName, fixture.GateHeldBy(podreadiness.WriterUpdateInPlace, "0-1"), fixture.UnreadySince(now.Add(-2*time.Minute))), ctx: base(), dark: true},
+		{name: "never promoted, unready past the grace", pod: fixture.Pod(podName, fixture.NeverReady), ctx: base(), containersUnready: true},
+		{name: "drained, then unready past the grace", pod: fixture.Pod(podName, fixture.GateHeldBy(podreadiness.WriterUpdateInPlace, "0-1"), fixture.UnreadySince(now.Add(-2*time.Minute))), ctx: base(), containersUnready: true},
 		{name: "node lost", pod: fixture.Pod(podName, fixture.NodeLost), ctx: base()},
-		{name: "parked but being deleted", pod: fixture.Pod(podName, fixture.ContainerWaiting("CrashLoopBackOff"), fixture.Terminating), ctx: base()},
+		{name: "held but being deleted", pod: fixture.Pod(podName, fixture.ContainerWaiting("CrashLoopBackOff"), fixture.Terminating), ctx: base()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := reading.ReadPod(tc.pod, tc.ctx)
-			if p.OutOfService() != tc.out || p.UnreadyPastGrace != tc.unready || p.ContainersUnreadyPastGrace != tc.dark {
+			if p.OutOfService() != tc.out || p.UnreadyPastGrace != tc.unready || p.ContainersUnreadyPastGrace != tc.containersUnready {
 				t.Fatalf("OutOfService=%v UnreadyPastGrace=%v ContainersUnreadyPastGrace=%v, want %v %v %v",
-					p.OutOfService(), p.UnreadyPastGrace, p.ContainersUnreadyPastGrace, tc.out, tc.unready, tc.dark)
+					p.OutOfService(), p.UnreadyPastGrace, p.ContainersUnreadyPastGrace, tc.out, tc.unready, tc.containersUnready)
 			}
 		})
 	}
@@ -287,19 +287,19 @@ func TestInstanceReading_FullyServing(t *testing.T) {
 }
 
 func TestInstanceReading_ServesNothing(t *testing.T) {
-	parked := fixture.Pod("a", fixture.ContainerWaiting("CrashLoopBackOff"))
+	held := fixture.Pod("a", fixture.ContainerWaiting("CrashLoopBackOff"))
 	runVerdict(t, "ServesNothing", base(), reading.InstanceReading.ServesNothing, []verdictCase{
-		{name: "parked pod", pods: fixture.Pods(parked), desired: 1, want: true},
+		{name: "held pod", pods: fixture.Pods(held), desired: 1, want: true},
 		{name: "terminal pod alone", pods: fixture.Pods(fixture.Pod("a", fixture.Failed)), desired: 1, want: true},
-		{name: "parked beside terminal", pods: fixture.Pods(parked, fixture.Pod("b", fixture.Failed)), desired: 2, want: true},
+		{name: "held beside terminal", pods: fixture.Pods(held, fixture.Pod("b", fixture.Failed)), desired: 2, want: true},
 		{name: "served, then unready past the grace", pods: fixture.Pods(fixture.Pod("a", fixture.UnreadySince(now.Add(-2*time.Minute)))), desired: 1, want: true},
 		{name: "served, then unready inside the grace", pods: fixture.Pods(fixture.Pod("a", fixture.UnreadySince(now.Add(-30*time.Second)))), desired: 1},
 		{name: "serving pod", pods: fixture.Pods(fixture.Pod("a")), desired: 1},
-		{name: "parked beside serving", pods: fixture.Pods(parked, fixture.Pod("b")), desired: 2},
+		{name: "held beside serving", pods: fixture.Pods(held, fixture.Pod("b")), desired: 2},
 		{name: "still coming up", pods: fixture.Pods(fixture.Pod("a", fixture.NeverReady)), desired: 1},
 		{name: "node lost under a serving pod", pods: fixture.Pods(fixture.Pod("a", fixture.NodeLost)), desired: 1},
-		{name: "parked leader beside a serving worker", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader, fixture.ContainerWaiting("CrashLoopBackOff")), fixture.Pod("b", fixture.AsWorker)), desired: 2, want: true},
-		{name: "serving leader beside a parked worker", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.ContainerWaiting("CrashLoopBackOff"))), desired: 2},
+		{name: "held leader beside a serving worker", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader, fixture.ContainerWaiting("CrashLoopBackOff")), fixture.Pod("b", fixture.AsWorker)), desired: 2, want: true},
+		{name: "serving leader beside a held worker", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.ContainerWaiting("CrashLoopBackOff"))), desired: 2},
 		{name: "only a serving worker is left", pods: fixture.Pods(fixture.Pod("b", fixture.AsWorker)), desired: 2, want: true},
 		{name: "only a deleting pod", pods: fixture.Pods(fixture.Pod("a", fixture.ContainerWaiting("CrashLoopBackOff"), fixture.Terminating)), desired: 1},
 		{name: "no pods", pods: nil, desired: 1},
@@ -319,33 +319,33 @@ func TestInstanceReading_OutOfRotation(t *testing.T) {
 	})
 }
 
-func TestInstanceReading_Dark(t *testing.T) {
-	darkFor := fixture.UnreadySince(now.Add(-2 * time.Minute))
-	runVerdict(t, "Dark", base(), reading.InstanceReading.Dark, []verdictCase{
-		{name: "served, then unready past the grace", pods: fixture.Pods(fixture.Pod("a", darkFor)), desired: 1, want: true},
-		{name: "drained, then unready past the grace", pods: fixture.Pods(fixture.Pod("a", fixture.GateHeldBy(podreadiness.WriterUpdateInPlace, "0-1"), darkFor)), desired: 1, want: true},
+func TestInstanceReading_ContainersUnreadyPastGrace(t *testing.T) {
+	unreadyFor := fixture.UnreadySince(now.Add(-2 * time.Minute))
+	runVerdict(t, "ContainersUnreadyPastGrace", base(), reading.InstanceReading.ContainersUnreadyPastGrace, []verdictCase{
+		{name: "served, then unready past the grace", pods: fixture.Pods(fixture.Pod("a", unreadyFor)), desired: 1, want: true},
+		{name: "drained, then unready past the grace", pods: fixture.Pods(fixture.Pod("a", fixture.GateHeldBy(podreadiness.WriterUpdateInPlace, "0-1"), unreadyFor)), desired: 1, want: true},
 		{name: "never promoted, unready past the grace", pods: fixture.Pods(fixture.Pod("a", fixture.NeverReady)), desired: 1, want: true},
 		{name: "unready inside the grace", pods: fixture.Pods(fixture.Pod("a", fixture.UnreadySince(now.Add(-time.Second)))), desired: 1},
 		{name: "serving pod", pods: fixture.Pods(fixture.Pod("a")), desired: 1},
-		{name: "one dark beside one serving", pods: fixture.Pods(fixture.Pod("a", darkFor), fixture.Pod("b")), desired: 2},
-		{name: "dark leader beside a serving worker", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader, darkFor), fixture.Pod("b", fixture.AsWorker)), desired: 2, want: true},
-		{name: "serving leader beside a dark worker", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, darkFor)), desired: 2},
+		{name: "one unready past the grace beside one serving", pods: fixture.Pods(fixture.Pod("a", unreadyFor), fixture.Pod("b")), desired: 2},
+		{name: "leader unready past the grace beside a serving worker", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader, unreadyFor), fixture.Pod("b", fixture.AsWorker)), desired: 2, want: true},
+		{name: "serving leader beside a worker unready past the grace", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, unreadyFor)), desired: 2},
 		{name: "terminal pod alone", pods: fixture.Pods(fixture.Pod("a", fixture.Failed)), desired: 1},
-		{name: "only a worker, dark", pods: fixture.Pods(fixture.Pod("b", fixture.AsWorker, darkFor)), desired: 2},
+		{name: "only a worker, unready past the grace", pods: fixture.Pods(fixture.Pod("b", fixture.AsWorker, unreadyFor)), desired: 2},
 		{name: "no pods", pods: nil, desired: 1},
 	})
 }
 
-func TestInstanceReading_UnavailableOnParkedMember(t *testing.T) {
-	parked := fixture.Pod("b", fixture.AsWorker, fixture.ContainerWaiting("CrashLoopBackOff"))
-	runVerdict(t, "UnavailableOnParkedMember", base(), reading.InstanceReading.UnavailableOnParkedMember, []verdictCase{
-		{name: "one serving, one parked, two desired", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), parked), desired: 2, want: true},
+func TestInstanceReading_UnavailableOnHeldMember(t *testing.T) {
+	held := fixture.Pod("b", fixture.AsWorker, fixture.ContainerWaiting("CrashLoopBackOff"))
+	runVerdict(t, "UnavailableOnHeldMember", base(), reading.InstanceReading.UnavailableOnHeldMember, []verdictCase{
+		{name: "one serving, one held, two desired", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), held), desired: 2, want: true},
 		{name: "one serving, one unready past the grace, two desired", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.UnreadySince(now.Add(-2*time.Minute)))), desired: 2, want: true},
-		{name: "one serving, one parked, one desired", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), parked), desired: 1},
+		{name: "one serving, one held, one desired", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), held), desired: 1},
 		{name: "one serving, one coming up, two desired", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.NeverReady)), desired: 2},
 		{name: "one serving, one unready inside the grace", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.UnreadySince(now.Add(-time.Second)))), desired: 2},
 		{name: "one serving, one terminal, two desired", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.Failed)), desired: 2},
-		{name: "one serving, one parked but deleting", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.ContainerWaiting("CrashLoopBackOff"), fixture.Terminating)), desired: 2},
+		{name: "one serving, one held but deleting", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker, fixture.ContainerWaiting("CrashLoopBackOff"), fixture.Terminating)), desired: 2},
 		{name: "both serving", pods: fixture.Pods(fixture.Pod("a", fixture.AsLeader), fixture.Pod("b", fixture.AsWorker)), desired: 2},
 	})
 }

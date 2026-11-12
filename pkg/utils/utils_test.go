@@ -1,8 +1,6 @@
 package utils
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -17,21 +15,6 @@ import (
 
 	"sigs.k8s.io/ome/pkg/constants"
 )
-
-func TestRetryPreservesLastError(t *testing.T) {
-	for _, cause := range []error{context.Canceled, context.DeadlineExceeded, errors.New("download failed")} {
-		t.Run(cause.Error(), func(t *testing.T) {
-			attempts := 0
-			err := Retry(3, 0, func() error {
-				attempts++
-				return fmt.Errorf("download interrupted: %w", cause)
-			})
-			assert.Equal(t, 3, attempts)
-			assert.ErrorIs(t, err, cause)
-			assert.EqualError(t, err, fmt.Sprintf("after 3 attempts, last error: download interrupted: %s", cause))
-		})
-	}
-}
 
 func TestFilter_PredicateAlwaysTrueOrFalse_KeepsAllOrNoEntries(t *testing.T) {
 	scenarios := map[string]struct {
@@ -282,104 +265,6 @@ func TestMergeEnvs_OverlappingOrNewNames_OverridesReplaceAndNewNamesAppend(t *te
 	}
 }
 
-func TestIsGPUEnabled_VendorListSetEmptyOrAbsent_ReadsLimitsForListedOrNvidia(t *testing.T) {
-	g := gomega.NewGomegaWithT(t)
-	multiVendor := []string{constants.NvidiaGPUResourceType, "amd.com/gpu", "google.com/tpu"}
-	scenarios := map[string]struct {
-		resource             v1.ResourceRequirements
-		acceleratorResources []string
-		expected             bool
-	}{
-		"NvidiaGpuEnabled_WithConfiguredList": {
-			resource: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					"cpu":                           resource.Quantity{Format: "100"},
-					constants.NvidiaGPUResourceType: resource.MustParse("1"),
-				},
-				Requests: v1.ResourceList{
-					"cpu":                           resource.Quantity{Format: "90"},
-					constants.NvidiaGPUResourceType: resource.MustParse("1"),
-				},
-			},
-			acceleratorResources: multiVendor,
-			expected:             true,
-		},
-		"AmdGpuEnabled_WithConfiguredList": {
-			resource: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					"cpu":         resource.Quantity{Format: "100"},
-					"amd.com/gpu": resource.MustParse("1"),
-				},
-			},
-			acceleratorResources: multiVendor,
-			expected:             true,
-		},
-		"TpuEnabled_WithConfiguredList": {
-			resource: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					"google.com/tpu": resource.MustParse("4"),
-				},
-			},
-			acceleratorResources: multiVendor,
-			expected:             true,
-		},
-		"GPUDisabled_EmptyLimits": {
-			resource: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					"cpu": resource.Quantity{Format: "100"},
-				},
-				Requests: v1.ResourceList{
-					"cpu": resource.Quantity{Format: "90"},
-				},
-			},
-			acceleratorResources: multiVendor,
-			expected:             false,
-		},
-		"AbsentConfig_PreservesNvidiaOnlyBehavior": {
-			resource: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					constants.NvidiaGPUResourceType: resource.MustParse("1"),
-				},
-			},
-			acceleratorResources: nil,
-			expected:             true,
-		},
-		"AbsentConfig_DoesNotRecognizeAmd": {
-			resource: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					"amd.com/gpu": resource.MustParse("1"),
-				},
-			},
-			acceleratorResources: nil,
-			expected:             false,
-		},
-		"EmptyConfiguredList_AlsoFallsBackToNvidiaOnly": {
-			resource: v1.ResourceRequirements{
-				Limits: v1.ResourceList{
-					constants.NvidiaGPUResourceType: resource.MustParse("1"),
-				},
-			},
-			acceleratorResources: []string{},
-			expected:             true,
-		},
-		"RequestsOnlyNeverCounts_EvenWithMatchingConfig": {
-			resource: v1.ResourceRequirements{
-				Requests: v1.ResourceList{
-					constants.NvidiaGPUResourceType: resource.MustParse("1"),
-				},
-			},
-			acceleratorResources: multiVendor,
-			expected:             false,
-		},
-	}
-	for name, scenario := range scenarios {
-		t.Run(name, func(t *testing.T) {
-			res := IsGPUEnabled(scenario.resource, scenario.acceleratorResources)
-			g.Expect(res).To(gomega.Equal(scenario.expected))
-		})
-	}
-}
-
 func TestPodRequestsAccelerator_AnyContainerRequestOrLimit_TrueForListedVendorsOnly(t *testing.T) {
 	multiVendor := []string{
 		constants.NvidiaGPUResourceType,
@@ -419,9 +304,8 @@ func TestPodRequestsAccelerator_AnyContainerRequestOrLimit_TrueForListedVendorsO
 			expected:             true,
 		},
 		{
-			// Unlike IsGPUEnabled, which reads Limits alone, this predicate
-			// also reads Requests: a pod holding a chip through requests is
-			// under accelerator budget just the same.
+			// The predicate reads Requests as well as Limits: a pod holding a
+			// chip through requests is under accelerator budget just the same.
 			name: "accelerator in requests only",
 			spec: &v1.PodSpec{Containers: []v1.Container{
 				container("engine", v1.ResourceList{constants.NvidiaGPUResourceType: resource.MustParse("8")}, nil),

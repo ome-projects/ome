@@ -32,7 +32,6 @@ func newReconciler(t *testing.T, objs ...client.Object) (*InheritanceReconciler,
 	return &InheritanceReconciler{
 		Client:   c,
 		Log:      testr.New(t),
-		Scheme:   c.Scheme(),
 		Recorder: &record.FakeRecorder{},
 	}, c
 }

@@ -117,7 +117,7 @@ func TestEvaluate_Outcomes(t *testing.T) {
 	}
 }
 
-// TestEvaluate_MultiSeriesWorstValue pins the operator-aware reduction: a
+// TestEvaluate_MultiSeriesWorstValue checks the operator-aware reduction: a
 // multi-series vector passes only when EVERY series satisfies the condition, so
 // the compared (and surfaced) value is the maximum for upper bounds (LT/LTE)
 // and the minimum for lower bounds (GT/GTE).

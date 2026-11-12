@@ -135,6 +135,12 @@ type ReconcileInput struct {
 	// when Pods and ByInstance are empty.
 	AuthoritativePods *ComponentPodSnapshot
 
+	// CachedPods is the Component's pods as the cache listed them for this
+	// pass, shared by the plan's observation, the create pass and the
+	// adapter's status publication; a reader after a pod write of the pass
+	// takes the list again. Nil lists on every read.
+	CachedPods *CachedPodList
+
 	// FinalizeInstanceResources removes optional per-Instance resources after
 	// the authoritative Pod snapshot is empty. It reports complete only after
 	// those resources are authoritatively absent.
@@ -327,6 +333,11 @@ type ReconcileInput struct {
 	// (lifecycle.gangDomainFullGracePeriod); zero or negative
 	// leaves such a hold on UnschedulableGrace.
 	GangDomainFullGrace time.Duration
+	// SchedulingRetry bounds the writes that ask the scheduler again for a
+	// pod of a multi-pod Instance left Pending with no node. Operator
+	// config (lifecycle.schedulingRetry); nil leaves such a pod to the
+	// scheduler's own queue and to the attempt's deadline.
+	SchedulingRetry *SchedulingRetryPolicy
 
 	// AbandonedReplacementGrace is the termination grace a rollout gives a
 	// replacement pod it abandons before the pod ever carried the serving
@@ -472,6 +483,14 @@ type InstanceMutation struct {
 	// batch supplies one; removals are confirmed by authoritative absence.
 	Postcondition func(*InstanceStatus) bool
 	OnCommit      func(previous, current *InstanceStatus)
+	// UnchangedOnCopy reports that the caller applied Mutate to the row as
+	// the pass holds it and nothing changed. A batch whose every mutation
+	// says so, with no retry record to move, has nothing to write: the
+	// writer answers it without a live read and without running Mutate
+	// again. The pass's copy carries every row written in the pass, so the
+	// live rows can differ from it only by a write the cache has not shown
+	// yet, which the next pass reads.
+	UnchangedOnCopy bool
 }
 
 // DispositionDeps carries the operator-config inputs and adapter hooks
@@ -521,6 +540,13 @@ type ForceDeletePolicy struct {
 	// LastTransitionTime, or the Node object gone) before the
 	// escalation may act.
 	NodeUnreachableThreshold time.Duration
+	// SkipGracePeriodOnUnreachableNode lets a pod go before its deletion
+	// deadline plus OverdueSlack once its node's kubelet has stopped
+	// reporting (NodeReady Unknown or the unreachable taint) for at least
+	// NodeUnreachableThreshold, counted from the later of the two when the
+	// node shows both. A node that is gone, or whose kubelet still posts
+	// NodeReady, keeps the pod waiting either way.
+	SkipGracePeriodOnUnreachableNode bool
 }
 
 // RequeueIntervals paces the passes that must re-check progress no watch
@@ -560,19 +586,34 @@ type MigrationAuditPolicy struct {
 	Window time.Duration
 }
 
-// GangScheduleTimeoutClamp bounds the ScheduleTimeoutSeconds a multi-pod
-// Instance's PodGroup derives from InstanceReadyTimeout, so gang
-// admission releases an infeasible attempt on a cluster-wide schedule
-// rather than on whatever readiness ceiling a Component happens to set.
-// Config-driven (chart values → inferenceservice-config); nil means
-// unconfigured and the derived value is passed through. Both durations
-// are > 0 and Min <= Max when the clamp is non-nil (config validation
-// rejects anything else).
+// SchedulingRetryPolicy bounds how the controller asks the scheduler again
+// for a pod of a multi-pod Instance that stays Pending with no node while
+// its attempt is open. After is how long the pod may wait for a node,
+// measured from its creation or from the scheduler's last PodScheduled
+// ruling, before the first write; the k-th write waits k times as long.
+// MaxAttempts caps the writes per pod. Config-driven
+// (lifecycle.schedulingRetry); nil means unconfigured and no pod is ever
+// written for it. Both fields are positive when the policy is non-nil
+// (config validation rejects anything else).
+type SchedulingRetryPolicy struct {
+	After       time.Duration
+	MaxAttempts int32
+}
+
+// GangScheduleTimeoutClamp is the range of ScheduleTimeoutSeconds the gang
+// scheduler accepts. A multi-pod Instance's PodGroup carries the placement
+// grace (ReconcileInput.UnschedulableGrace) as its timeout, so the scheduler
+// and OME give up on an unplaceable gang together; a grace outside this
+// range is raised to Min or lowered to Max, and the two clocks then part by
+// the difference. Config-driven (chart values → inferenceservice-config);
+// nil means unconfigured and the grace is passed through as it is. Both
+// durations are > 0 and Min <= Max when the clamp is non-nil (config
+// validation rejects anything else).
 type GangScheduleTimeoutClamp struct {
-	// Min is the floor the derived timeout is raised to, and the value a
-	// Component with no usable InstanceReadyTimeout gets.
+	// Min is the floor a positive grace is raised to. A zero grace is not
+	// raised: it leaves the field unset, since OME then has no clock either.
 	Min time.Duration
-	// Max is the ceiling the derived timeout is lowered to.
+	// Max is the ceiling the grace is lowered to.
 	Max time.Duration
 }
 
@@ -585,6 +626,16 @@ func (r *ReconcileInput) Now() time.Time {
 		return r.Clock.Now()
 	}
 	return time.Now()
+}
+
+// AuditOwner is the object the Component's audit record (the ConfigMap of
+// moves, node exclusions and force deletes) hangs off, with its kind: the
+// record owner the adapter set, else the owner object itself.
+func (in *ReconcileInput) AuditOwner() (client.Object, schema.GroupVersionKind) {
+	if in.LedgerOwner != nil {
+		return in.LedgerOwner, in.LedgerOwnerGVK
+	}
+	return in.OwnerObject, in.OwnerGVK
 }
 
 // SurgeIndexAllocator is the pass's allocator of surge indexes, or, for a

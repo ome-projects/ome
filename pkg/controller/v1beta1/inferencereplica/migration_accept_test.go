@@ -668,6 +668,9 @@ func TestSyncMigrationEntries_SameNameReplacementAborts(t *testing.T) {
 	replacement := original.DeepCopy()
 	replacement.UID = "replacement-uid"
 	replacement.Status.Migrations = []v1beta1.MigrationStatus{acceptedEntry("u-1")}
+	// The copy carries a record, so the sync reads the replica live and
+	// finds the replacement there.
+	original.Status.Migrations = []v1beta1.MigrationStatus{acceptedEntry("u-0")}
 	r, c := newReconciler(t, replacement)
 	key := types.NamespacedName{Name: replacement.Name, Namespace: replacement.Namespace}
 	before := &v1beta1.InferenceReplica{}
@@ -1099,4 +1102,23 @@ func TestConsumeMigrationRequests_SourcePodRecreatedBeforeConsumption(t *testing
 	if len(pods.Items) != 1 {
 		t.Fatalf("acceptance created pods: got %d, want only the successor source", len(pods.Items))
 	}
+}
+
+// TestMigrationRecordCopiesItsHintList: the engine's copy of a record shares
+// no memory with the stored one, and an empty hint list reads as none, in
+// both directions.
+func TestMigrationRecordCopiesItsHintList(t *testing.T) {
+	g := gomega.NewWithT(t)
+	stored := acceptedEntry("u-hints")
+	stored.HintTargetNodes = []string{"node-b", "node-c"}
+	record := migrationToWorkload(stored)
+	record.HintTargetNodes[0] = "changed"
+	g.Expect(stored.HintTargetNodes).To(gomega.Equal([]string{"node-b", "node-c"}), "the engine's copy must not share the stored list")
+	back := migrationFromWorkload(record)
+	back.HintTargetNodes[1] = "changed"
+	g.Expect(record.HintTargetNodes).To(gomega.Equal([]string{"changed", "node-c"}), "the stored copy must not share the engine's list")
+
+	stored.HintTargetNodes = []string{}
+	g.Expect(migrationToWorkload(stored).HintTargetNodes).To(gomega.BeNil(), "an empty hint list reads as none")
+	g.Expect(migrationFromWorkload(workloadtypes.MigrationRecord{HintTargetNodes: []string{}}).HintTargetNodes).To(gomega.BeNil())
 }

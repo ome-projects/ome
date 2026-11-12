@@ -46,7 +46,13 @@ package types
 //	                           RejectionReasonInvalidPodSpec). No node
 //	                           ever sees the pod, so placement is
 //	                           irrelevant; only a corrected revision is
-//	                           admissible.
+//	                           admissible. One exception: a repair that
+//	                           rebuilds the revision the Instance already
+//	                           ran reads the refusal as the cluster's
+//	                           answer (a webhook, a policy), not the
+//	                           revision's, and retries on its own
+//	                           schedule without charging the block
+//	                           (ops.refusedCreateReadingOf).
 //
 // EXCLUDED — ambiguous scope (could be the revision OR the
 // device/node): RunContainerError, CreateContainerError, and the
@@ -90,16 +96,27 @@ func IsWorkloadCausedReason(reason string) bool {
 	return ok
 }
 
-// RepairWaitsOnWorkload reports whether the row is a Restart parked at
-// Failed on a workload-caused failure. The kubelet retries such a cause
-// in place and a fresh pod set would wedge on it identically, so the
-// retry ladder owes the park no re-arm: the row stays Failed with its
-// reason until the configuration or image is fixed, and resumes on its
-// own once the kubelet starts the pod.
+// KubeletRetriesInPlace reports whether reason is a workload-caused
+// waiting reason the kubelet keeps retrying on the pod it was seen on: an
+// image pull or a container config the pod template names. An apiserver
+// refusal of the pod object (RejectionReasonInvalidPodSpec) made no pod,
+// so nothing retries it in place.
+func KubeletRetriesInPlace(reason string) bool {
+	return IsWorkloadCausedReason(reason) && reason != RejectionReasonInvalidPodSpec
+}
+
+// RepairWaitsOnWorkload reports whether the row is a Restart stopped at
+// Failed on a cause the kubelet retries in place (KubeletRetriesInPlace).
+// A fresh pod set would stop on such a cause identically, so the retry
+// schedule owes it no new attempt: the row stays Failed with its reason
+// until the configuration or image is fixed, and resumes on its own once
+// the kubelet starts the pod. A repair whose rebuild create the apiserver
+// refused is not held this way: no pod exists to retry, so the repair's
+// own schedule retries the create.
 func RepairWaitsOnWorkload(s *InstanceStatus) bool {
 	return s != nil && s.Phase == InstancePhaseFailed &&
 		s.Operation != nil && s.Operation.Type == InstanceOperationRestart &&
-		s.LastFailure != nil && IsWorkloadCausedReason(s.LastFailure.Reason)
+		s.LastFailure != nil && KubeletRetriesInPlace(s.LastFailure.Reason)
 }
 
 // environmentCausedReasons are the failure reasons under which the

@@ -2,6 +2,7 @@ package components
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -19,6 +20,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	"sigs.k8s.io/ome/pkg/render"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 )
 
 func TestCoordinatorFollowerDefaultAutoscalerOwnership(t *testing.T) {
@@ -199,7 +201,7 @@ func TestUpdatePodSpecNodeSelector(t *testing.T) {
 			}
 
 			// Call the function
-			UpdatePodSpecNodeSelector(b, isvc, podSpec, "")
+			render.UpdatePodSpecNodeSelector(&b.Piece, isvc, podSpec, "")
 
 			// Verify the result
 			if !tt.expectNodeSelector {
@@ -262,7 +264,7 @@ func TestUpdatePodSpecNodeSelectorWithoutModel(t *testing.T) {
 	}
 	podSpec := &v1.PodSpec{}
 
-	UpdatePodSpecNodeSelector(b, isvc, podSpec, v1beta1.EngineComponent)
+	render.UpdatePodSpecNodeSelector(&b.Piece, isvc, podSpec, v1beta1.EngineComponent)
 
 	g.Expect(podSpec.NodeSelector).To(gomega.Equal(map[string]string{
 		"accelerator": "gpu",
@@ -297,8 +299,8 @@ func TestUpdateModelMountsSkipShardedModel(t *testing.T) {
 	container := &v1.Container{}
 	podSpec := &v1.PodSpec{}
 
-	UpdateVolumeMounts(b, isvc, container, objectMeta)
-	UpdatePodSpecVolumes(b, isvc, podSpec, objectMeta)
+	render.UpdateVolumeMounts(&b.Piece, isvc, container, objectMeta)
+	render.UpdatePodSpecVolumes(&b.Piece, isvc, podSpec, objectMeta)
 
 	g.Expect(container.VolumeMounts).To(gomega.BeEmpty())
 	g.Expect(podSpec.Volumes).To(gomega.BeEmpty())
@@ -341,7 +343,7 @@ func TestProcessBaseLabels(t *testing.T) {
 		"custom-label": "custom-value",
 	}
 
-	labels, err := ProcessBaseLabels(b, isvc, v1beta1.EngineComponent, existingLabels)
+	labels, err := render.ProcessBaseLabels(&b.Piece, isvc, v1beta1.EngineComponent, existingLabels)
 	g.Expect(err).To(gomega.BeNil())
 
 	// Check expected labels
@@ -406,7 +408,7 @@ func TestProcessBaseAnnotationsFTStrategy(t *testing.T) {
 			var annotations map[string]string
 			var err error
 			g.Expect(func() {
-				annotations, err = ProcessBaseAnnotations(mkFields(tt.hyperParameters), isvc, map[string]string{})
+				annotations, err = render.ProcessBaseAnnotations(&mkFields(tt.hyperParameters).Piece, isvc, map[string]string{})
 			}).NotTo(gomega.Panic())
 			if tt.wantErr {
 				g.Expect(err).To(gomega.HaveOccurred())
@@ -439,7 +441,7 @@ func TestProcessBaseLabelsNonStringStrategy(t *testing.T) {
 
 	var err error
 	g.Expect(func() {
-		_, err = ProcessBaseLabels(b, isvc, v1beta1.EngineComponent, nil)
+		_, err = render.ProcessBaseLabels(&b.Piece, isvc, v1beta1.EngineComponent, nil)
 	}).NotTo(gomega.Panic())
 	g.Expect(err).To(gomega.HaveOccurred())
 }
@@ -461,7 +463,7 @@ func TestProcessComponentLabelsDoesNotMutateISVCLabels(t *testing.T) {
 		},
 	}
 
-	labels, err := ProcessComponentLabels(b, isvc, v1beta1.EngineComponent, nil)
+	labels, err := render.ProcessComponentLabels(&b.Piece, isvc, v1beta1.EngineComponent, nil)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(labels).To(gomega.HaveKeyWithValue("user-label", "user-value"))
 	g.Expect(labels).To(gomega.HaveKey(constants.OMEComponentLabel))
@@ -484,7 +486,7 @@ func TestProcessComponentAnnotationsReservesInPlaceImageTransition(t *testing.T)
 		"example.com/component": "keep",
 	}
 
-	annotations, err := ProcessComponentAnnotations(b, isvc, component)
+	annotations, err := render.ProcessComponentAnnotations(&b.Piece, isvc, component)
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 	g.Expect(annotations).NotTo(gomega.HaveKey(constants.InferenceServiceInPlaceImageTransitionAnnotationKey))
 	g.Expect(annotations).To(gomega.HaveKeyWithValue("example.com/isvc", "keep"))
@@ -612,5 +614,47 @@ func TestUpdateComponentStatusLeanModel(t *testing.T) {
 			g.Expect(engineStatus.ScaleTargetRef.APIVersion).To(gomega.Equal("apps/v1"))
 			g.Expect(engineStatus.ScaleTargetRef.Kind).To(gomega.Equal("Deployment"))
 		})
+	}
+}
+
+// TestUpdateComponentStatus_OMENativePodsAreNotListed holds which modes list
+// the pods for the model-loading state. RawDeployment pods and MultiNode
+// leaders carry the app label the list asks for, so those modes list once.
+// An OMENative pod carries the workload's ome.io labels and never the app
+// label, so the list, which would return nothing, is not made, and the state
+// reads Pending with the load in progress, Ready service or not.
+func TestUpdateComponentStatus_OMENativePodsAreNotListed(t *testing.T) {
+	for _, tt := range []struct {
+		mode      constants.DeploymentModeType
+		wantLists int
+	}{
+		{mode: constants.RawDeployment, wantLists: 1},
+		{mode: constants.MultiNode, wantLists: 1},
+		{mode: constants.OMENative, wantLists: 0},
+	} {
+		for _, ready := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/ready=%t", tt.mode, ready), func(t *testing.T) {
+				g := gomega.NewGomegaWithT(t)
+				podLists := fakeclient.CountingVerb(fakeclient.List).OnKind(&v1.PodList{})
+				b := &BaseComponentFields{
+					Piece:         render.Piece{DeploymentMode: tt.mode, Log: logr.Discard()},
+					Client:        componentClient(t, podLists),
+					StatusManager: status.NewStatusReconciler(),
+				}
+				isvc := modelStatusServiceObject(modelStatusShape{mode: tt.mode, instances: 1})
+				if !ready {
+					isvc.Status.Conditions = nil
+				}
+				objectMeta := metav1.ObjectMeta{Name: render.ComponentName(isvc, v1beta1.EngineComponent), Namespace: isvc.Namespace}
+				g.Expect(UpdateComponentStatus(b, isvc, v1beta1.EngineComponent, objectMeta, &isvc.Spec.Engine.ComponentExtensionSpec)).To(gomega.Succeed())
+				g.Expect(podLists.Count()).To(gomega.Equal(tt.wantLists))
+				if tt.mode != constants.OMENative {
+					return
+				}
+				g.Expect(isvc.Status.ModelStatus.TransitionStatus).To(gomega.Equal(v1beta1.InProgress))
+				g.Expect(isvc.Status.ModelStatus.ModelRevisionStates.TargetModelState).To(gomega.Equal(v1beta1.Pending))
+				g.Expect(isvc.Status.ModelStatus.ModelCopies).To(gomega.BeNil())
+			})
+		}
 	}
 }

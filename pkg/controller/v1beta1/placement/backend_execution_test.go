@@ -161,7 +161,7 @@ func TestBackendWriteRevalidatesInputs(t *testing.T) {
 						tt.edit(t, f)
 					}
 					if planned {
-						err = f.reconciler.placePlannedOn(ctx, f.source, f.source.Status.Placement.Candidates[0])
+						err = f.reconciler.placePlannedMember(ctx, f.source, f.source.Status.Placement.Candidates[0], false, nil)
 					} else {
 						err = f.reconciler.placeOn(ctx, "member-a", f.source, false)
 					}

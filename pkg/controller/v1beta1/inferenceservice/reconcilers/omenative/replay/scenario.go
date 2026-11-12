@@ -3,7 +3,6 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -16,6 +15,17 @@ import (
 // declares in its vocabulary. It moves the injected clock and touches nothing
 // else, so it belongs to the harness rather than to a machine's vocabulary.
 const ClockAdvance = "clock.advance"
+
+// PeerServicesCreated is the other event id no machine declares: the
+// replica controller's pass of a Component creating, before it renders a
+// pod, the two per-revision Services of every serving peer's roll target,
+// as that controller does on every pass (a pod it renders names them by
+// revision). The lane does not run the replica controller, so the event
+// stands in for that write; it moves no machine, so it belongs to the
+// harness rather than to a machine's vocabulary. `component` names the
+// replica whose pass runs; absent, every member's pass runs in Component
+// order.
+const PeerServicesCreated = "replica.peerServicesCreated"
 
 // Vocabulary is the set of event ids, variants and cell ids a scenario may
 // cite: the union of what the run, coordination, canary and revision
@@ -69,6 +79,24 @@ type ServiceState struct {
 	RevisionProtocols map[string]string `json:"revisionProtocols,omitempty"`
 	// Annotations are the service's operator annotations at the start.
 	Annotations map[string]string `json:"annotations,omitempty"`
+	// Runtime is the ServingRuntime the service names (spec.runtime). A
+	// Component that declares no image renders the runtime's piece and
+	// follows its edits.
+	Runtime *RuntimeState `json:"runtime,omitempty"`
+}
+
+// RuntimeState is the ClusterServingRuntime a service names: the image
+// every piece of it renders, and whether the service follows the live
+// runtime or the revision recorded for it.
+type RuntimeState struct {
+	// Name is spec.runtime.name; the fixture name when empty.
+	Name string `json:"name,omitempty"`
+	// Image is the container image every piece of the runtime renders.
+	Image string `json:"image"`
+	// AutoSync is spec.runtime.autoSync: unset or true, the service renders
+	// the live runtime on every pass; false, it renders the revision
+	// recorded for it and reads a live edit as drift.
+	AutoSync *bool `json:"autoSync,omitempty"`
 }
 
 // ComponentState is one Component's declaration.
@@ -76,8 +104,11 @@ type ComponentState struct {
 	// Replicas is the Component's minReplicas, the steady Instance count.
 	Replicas int32 `json:"replicas"`
 	// Image is the single container image the Component's template renders;
-	// a revision is named by the image whose template mints it.
-	Image string `json:"image"`
+	// a revision is named by the image whose template mints it. Empty on a
+	// service that names a runtime: the Component renders the runtime's
+	// piece. Set, the service's own image wins and a runtime edit does not
+	// reach the Component.
+	Image string `json:"image,omitempty"`
 	// Partition is the user's lifecycle.updateStrategy.rollingUpdate.partition.
 	Partition *int32 `json:"partition,omitempty"`
 }
@@ -187,6 +218,11 @@ type EventArgs struct {
 	// replacement gang is a row of its own beside its source until the old
 	// gang leaves, as the engine publishes a gang surge.
 	Replacement *int32 `json:"replacement,omitempty"`
+	// Ordinal is the ordinal of the pod a surge creates; the default is 1.
+	// A surge of an Instance whose serving pod already holds ordinal 1,
+	// as after an earlier promotion, names 0 so the two pods keep
+	// different names.
+	Ordinal *int32 `json:"ordinal,omitempty"`
 	// Protocol is the pairing protocol the revision a push mints carries;
 	// spec.rollout.pairingProtocol moves to it.
 	Protocol string `json:"protocol,omitempty"`
@@ -209,13 +245,14 @@ type EventArgs struct {
 	ListedAfter string `json:"listedAfter,omitempty"`
 	// Slack pushes the clock past a deadline rather than exactly onto it.
 	Slack string `json:"slack,omitempty"`
+	// LeaseWait is how long the new manager waits for the leader
+	// Lease before its first pass; ctrl.crash moves the clock by it.
+	LeaseWait string `json:"leaseWait,omitempty"`
 	// Outcome is a member's staged answer to the metric gate: pass, fail
 	// or inconclusive.
 	Outcome string `json:"outcome,omitempty"`
 	// Name names a RolloutPolicy.
 	Name string `json:"name,omitempty"`
-	// Steps is the traffic ladder of a policy or inline canary body edit.
-	Steps []int32 `json:"steps,omitempty"`
 	// Groups replaces spec.rollout.groups on a plan edit.
 	Groups []v1beta1.RolloutGroup `json:"groups,omitempty"`
 	// Trailing is how many Instances still trail the target.
@@ -226,9 +263,16 @@ type EventArgs struct {
 	Lag string `json:"lag,omitempty"`
 	// Attempts is the failed attempts a member's Held retry record counts.
 	Attempts int32 `json:"attempts,omitempty"`
-	// Verb and Resource scope an armed apiserver refusal.
-	Verb     string `json:"verb,omitempty"`
-	Resource string `json:"resource,omitempty"`
+	// Waiting is the token an open attempt waits on in the cluster, as the
+	// hold pass writes it on the row's operation (Unschedulable); it stands
+	// until the pod is Ready or the attempt ends.
+	Waiting string `json:"waiting,omitempty"`
+	// Reason is the admission webhook's answer to a refused runtime edit,
+	// or the reason a failed attempt's last failure records on its row
+	// (member.failed, member.surgeFailed): a failure the environment caused
+	// (Unschedulable) counts nothing on the member's retry record, any
+	// other is one the schedule counted.
+	Reason string `json:"reason,omitempty"`
 }
 
 // UnmarshalJSON accepts the one-key mapping form the timeline uses, a
@@ -330,10 +374,16 @@ func (s *Scenario) validate(vocab Vocabulary) error {
 	if len(s.Initial.Service.Components) == 0 {
 		return fmt.Errorf("replay: %s: the service declares no Component", s.Scenario)
 	}
-	for name := range s.Initial.Service.Components {
+	for name, cs := range s.Initial.Service.Components {
 		if !knownComponent(name) {
 			return fmt.Errorf("replay: %s: component %q is not engine, decoder or router", s.Scenario, name)
 		}
+		if cs.Image == "" && s.Initial.Service.Runtime == nil {
+			return fmt.Errorf("replay: %s: component %s declares no image and the service names no runtime to render", s.Scenario, name)
+		}
+	}
+	if runtime := s.Initial.Service.Runtime; runtime != nil && runtime.Image == "" {
+		return fmt.Errorf("replay: %s: the runtime declares no image", s.Scenario)
 	}
 	for name := range s.Initial.Replicas {
 		if _, ok := s.Initial.Service.Components[name]; !ok {
@@ -372,6 +422,12 @@ func validateEvent(scenario string, tick int, ev TimelineEvent, vocab Vocabulary
 		}
 		if ev.Args.Duration == "" {
 			return fmt.Errorf("replay: %s tick %d: %s needs a duration", scenario, tick, ClockAdvance)
+		}
+		return nil
+	}
+	if ev.ID == PeerServicesCreated {
+		if ev.Variant != "" {
+			return fmt.Errorf("replay: %s tick %d: %s takes no variant", scenario, tick, PeerServicesCreated)
 		}
 		return nil
 	}
@@ -414,15 +470,4 @@ func ParseDuration(field, value string) (time.Duration, error) {
 		return 0, fmt.Errorf("replay: %s: %w", field, err)
 	}
 	return d, nil
-}
-
-// SortedEventIDs returns the event ids the driver can stage.
-func SortedEventIDs() []string {
-	out := make([]string, 0, len(eventAppliers)+1)
-	out = append(out, ClockAdvance)
-	for id := range eventAppliers {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
 }

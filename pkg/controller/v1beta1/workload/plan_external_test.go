@@ -19,7 +19,8 @@ import (
 // while another surge is already counted. The source carries the Surge
 // step for as long as the replacement gang exists — through the
 // marker's own retirement — so the request waits for the pair to
-// resolve rather than stacking a second lot of extra capacity.
+// resolve rather than stacking a second lot of extra capacity, and the
+// plan selects it as waiting for the roll so the pass names the wait.
 func TestPlan_MigrationRequestWaitsForAGangSurgeToResolve(t *testing.T) {
 	for _, step := range []string{
 		types.UpdateStepGangSurgeTarget,
@@ -48,8 +49,9 @@ func TestPlan_MigrationRequestWaitsForAGangSurgeToResolve(t *testing.T) {
 			surgePod.Labels[query.LabelRevisionHash] = query.RevisionFromName(gangPairTarget).Hash()
 			d := planTargetOrFail(t, in, plan, target, planSnapshot(in, map[int32][]*corev1.Pod{0: {sourcePod}, 1: {surgePod}}))
 
-			if a := findAction(d, workload.ActionMigrate); a != nil {
-				t.Fatalf("a migration was driven while the gang surge is in flight: %+v", a.Migration)
+			if a := findAction(d, workload.ActionMigrate); a == nil || a.Migration == nil || a.Migration.Head != nil ||
+				a.Migration.WaitingForRoll == nil || a.Migration.WaitingForRoll.RequestUUID != "request-a" {
+				t.Fatalf("the record must wait for the roll, not be driven, while the gang surge is in flight: %+v", a)
 			}
 
 			// Counter-case: the same record with no surge counted is
@@ -64,7 +66,7 @@ func TestPlan_MigrationRequestWaitsForAGangSurgeToResolve(t *testing.T) {
 			}
 			free.MigrationMode = types.MigrationModeSurge
 			d = planTargetOrFail(t, in, free, target, planSnapshot(in, map[int32][]*corev1.Pod{0: {sourcePod}}))
-			if findAction(d, workload.ActionMigrate) == nil {
+			if a := findAction(d, workload.ActionMigrate); a == nil || a.Migration == nil || a.Migration.Head == nil {
 				t.Fatalf("with no surge counted the same record must be driven; got %v", actionKinds(d))
 			}
 		})
@@ -75,7 +77,8 @@ func TestPlan_MigrationRequestWaitsForAGangSurgeToResolve(t *testing.T) {
 // migration adds one more surge Instance, so it is not driven while a
 // SurgeThenDrain cycle is already counted — at either of its steps. The
 // request waits in its record rather than stacking a second lot of extra
-// capacity on the Component.
+// capacity on the Component, selected as waiting for the roll so the
+// pass names the wait on it.
 func TestPlan_MigrationRequestWaitsForASurgeCycleToResolve(t *testing.T) {
 	for _, step := range []string{types.UpdateStepSurge, types.UpdateStepSurgeDrain} {
 		t.Run(step, func(t *testing.T) {
@@ -102,8 +105,9 @@ func TestPlan_MigrationRequestWaitsForASurgeCycleToResolve(t *testing.T) {
 			d := planTargetOrFail(t, in, plan, target,
 				planSnapshot(in, map[int32][]*corev1.Pod{0: {sourcePod}, 1: {surgePod}}))
 
-			if a := findAction(d, workload.ActionMigrate); a != nil {
-				t.Fatalf("a migration was driven while the surge is in flight: %+v", a.Migration)
+			if a := findAction(d, workload.ActionMigrate); a == nil || a.Migration == nil || a.Migration.Head != nil ||
+				a.Migration.WaitingForRoll == nil || a.Migration.WaitingForRoll.RequestUUID != "request-a" {
+				t.Fatalf("the record must wait for the roll, not be driven, while the surge is in flight: %+v", a)
 			}
 		})
 	}
@@ -244,5 +248,86 @@ func TestBuildPlan_ExpiredMoveReleasesTheExtraBesideAFailedAttempt(t *testing.T)
 	}
 	if diff := cmp.Diff([]int32{3}, workload.ScaleDownExtras(rows, plan)); diff != "" {
 		t.Fatalf("the released replacement must be the extra, not the Failed attempt whose pod still runs (-want +got):\n%s", diff)
+	}
+}
+
+// A scale-down keeps a source whose SurgeThenDrain replacement is coming
+// up ahead of every steady row: removing it throws the replacement's
+// progress away, and the steady Instance kept in its place still owes a
+// surge and a drain. The highest Instances with no replacement coming up
+// leave instead, and the source stays until its surge finishes. A source
+// whose target revision the retry schedule holds has no replacement
+// coming up and ranks as any other row.
+func TestBuildPlan_ScaleDownKeepsTheSourceWhoseReplacementIsComingUp(t *testing.T) {
+	const running, pushed = "svc-engine-aaaaaaaa", "svc-engine-bbbbbbbb"
+	ready := func(idx int32, rev string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseReady, RunningRevision: rev, PodCount: 1, ServingPodCount: 1}
+	}
+	surging := func(idx int32, step string) types.InstanceStatus {
+		return types.InstanceStatus{Index: idx, Phase: types.InstancePhaseUpdating, RunningRevision: running, TargetRevision: pushed,
+			PodCount: 2, ServingPodCount: 1,
+			Operation: &types.InstanceOperation{Type: types.InstanceOperationUpdate, Step: step, TargetRevision: pushed, Strategy: types.UpdateStrategySurgeThenDrain}}
+	}
+	fleet := func(count int32, rolling map[int32]string) []types.InstanceStatus {
+		rows := make([]types.InstanceStatus, 0, count)
+		for idx := int32(0); idx < count; idx++ {
+			if step, surges := rolling[idx]; surges {
+				rows = append(rows, surging(idx, step))
+				continue
+			}
+			rows = append(rows, ready(idx, running))
+		}
+		return rows
+	}
+	indices := func(from, to int32) []int32 {
+		out := make([]int32, 0, to-from+1)
+		for idx := from; idx <= to; idx++ {
+			out = append(out, idx)
+		}
+		return out
+	}
+	held := []types.RetryBlock{{TargetRevision: pushed, State: types.RetryBlockHeld}}
+	cases := []struct {
+		name     string
+		rows     []types.InstanceStatus
+		blocks   []types.RetryBlock
+		cordoned map[int32]struct{}
+		replicas int32
+		extras   []int32
+		kept     []int32
+	}{
+		{name: "8 engines, the replacement of Instance 7 is coming up, the count drops to 6: Instances 5 and 6 leave",
+			rows: fleet(8, map[int32]string{7: types.UpdateStepSurge}), replicas: 6, extras: []int32{5, 6}, kept: []int32{0, 1, 2, 3, 4, 7}},
+		{name: "the replacement of Instance 7 is serving and its old pod drains: the same two leave",
+			rows: fleet(8, map[int32]string{7: types.UpdateStepSurgeDrain}), replicas: 6, extras: []int32{5, 6}, kept: []int32{0, 1, 2, 3, 4, 7}},
+		{name: "16 engines, the replacements of Instances 2 and 3 are coming up, the count drops to 8: Instances 8 to 15 leave",
+			rows: fleet(16, map[int32]string{2: types.UpdateStepSurge, 3: types.UpdateStepSurge}), replicas: 8, extras: indices(8, 15), kept: []int32{0, 1, 2, 3, 4, 5, 6, 7}},
+		{name: "the surge finished after the drop: Instance 7 stays on the new revision and the count holds at 6",
+			rows: append(fleet(5, nil), ready(7, pushed)), replicas: 6, kept: []int32{0, 1, 2, 3, 4, 7}},
+		{name: "the count drops below the sources whose replacement is coming up: the lowest of them stays",
+			rows: fleet(8, map[int32]string{6: types.UpdateStepSurge, 7: types.UpdateStepSurge}), replicas: 1, extras: []int32{0, 1, 2, 3, 4, 5, 7}, kept: []int32{6}},
+		{name: "a source whose target revision is held has no replacement coming up: it leaves before a steady row",
+			rows: fleet(8, map[int32]string{7: types.UpdateStepSurge}), blocks: held, replicas: 6, extras: []int32{6, 7}, kept: []int32{0, 1, 2, 3, 4, 5}},
+		{name: "a source on a cordoned node keeps its place while its replacement is coming up",
+			rows: fleet(8, map[int32]string{7: types.UpdateStepSurge}), cordoned: map[int32]struct{}{7: {}}, replicas: 6, extras: []int32{5, 6}, kept: []int32{0, 1, 2, 3, 4, 7}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			observed := types.WorkloadObservedState{InstanceStatuses: tc.rows, RetryBlocks: tc.blocks, CordonedInstances: tc.cordoned}
+			plan, err := workload.BuildPlan(types.ComponentEngine, types.WorkloadDesiredSpec{Replicas: tc.replicas}, observed)
+			if err != nil {
+				t.Fatalf("BuildPlan: %v", err)
+			}
+			if diff := cmp.Diff(tc.extras, workload.ScaleDownExtras(tc.rows, plan)); diff != "" {
+				t.Fatalf("the scale-down must remove the highest Instances with no replacement coming up (-want +got):\n%s", diff)
+			}
+			kept := make([]int32, 0, len(plan.Instances))
+			for _, inst := range plan.Instances {
+				kept = append(kept, inst.Index)
+			}
+			if diff := cmp.Diff(tc.kept, kept); diff != "" {
+				t.Fatalf("the plan must keep the source whose replacement is coming up (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

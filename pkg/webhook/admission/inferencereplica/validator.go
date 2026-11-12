@@ -5,7 +5,7 @@
 // InferenceService controller owner reference or spec.parentRef; only the
 // InferenceService controller may write its spec, and anyone RBAC admits
 // may still change its metadata (the migration, release-held and
-// reset-instances mailboxes are annotations). A standalone replica carries
+// reset-instances requests are annotations). A standalone replica carries
 // neither and is governed by RBAC, except for the placement fields
 // placementExecution and placementReplicaLimit, which only the controller
 // may set, and for a few settings nothing acts on without an
@@ -39,9 +39,9 @@
 // The controller is recognized by the identity configured in the
 // inferenceReplica block of inferenceservice-config (a ServiceAccount
 // username or a group). With no identity configured the webhook falls back
-// to the ome.io/controller-write=true annotation the projector stamps,
+// to the ome.io/controller-write=true annotation the projector writes,
 // which is a convention rather than a boundary; a composer's write on a
-// replica it does not project carries no such stamp, so in that mode no
+// replica it does not project carries no such annotation, so in that mode no
 // InferenceService takes or releases rollout control on a referenced
 // replica. An update that keeps the spec, installs no controller owner
 // reference and leaves ome.io/composed-fields unchanged is decided without
@@ -460,51 +460,12 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 	default:
 		return admission.Allowed("")
 	}
-
-	newObj := &v1beta1.InferenceReplica{}
-	if err := v.Decoder.Decode(req, newObj); err != nil {
-		log.Error(err, "Failed to decode InferenceReplica",
-			"namespace", req.Namespace, "name", req.Name)
+	w, err := v.decodeWrite(req)
+	if err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
 	}
-
-	var oldObj *v1beta1.InferenceReplica
-	if req.Operation == admissionv1.Update {
-		oldObj = &v1beta1.InferenceReplica{}
-		if err := v.Decoder.DecodeRaw(req.OldObject, oldObj); err != nil {
-			log.Error(err, "Failed to decode old InferenceReplica",
-				"namespace", req.Namespace, "name", req.Name)
-			return admission.Errored(http.StatusBadRequest, err)
-		}
-	}
-	w := newWrite(req, oldObj, newObj)
-	if oldObj == nil {
-		// The component picks the runtime piece, the pod label and the
-		// workload role; a value that names no role would run with none.
-		// It is immutable, so checking the create covers every update.
-		if _, ok := v1beta1.RoleOf(newObj.Spec.Component); !ok {
-			return deny(w, fmt.Sprintf("spec.component %q is not a role: use one of %s", newObj.Spec.Component, roleNames()))
-		}
-	}
-	if oldObj != nil {
-		if !reflect.DeepEqual(oldObj.Spec.ParentRef, newObj.Spec.ParentRef) {
-			return deny(w, "spec.parentRef is immutable")
-		}
-		if oldObj.Spec.Component != newObj.Spec.Component {
-			return deny(w, "spec.component is immutable")
-		}
-		// An update that keeps the spec, installs no controller owner
-		// reference and leaves the composed-fields annotation unchanged is
-		// decided without the identity: a finalizer change, a label or
-		// annotation edit and the garbage collector's owner reference patches
-		// must pass this fail-closed webhook even when the config is
-		// unreadable. The unchanged spec is not re-checked.
-		if !specChanged(oldObj.Spec, newObj.Spec) && !controllerRefInstalled(oldObj, newObj) && !composedFieldsChanged(oldObj, newObj) {
-			if !w.projected && migrationRequested(oldObj, newObj) {
-				return denyStandaloneMigration(w)
-			}
-			return admission.Allowed("metadata-only update")
-		}
+	if resp, decided := decidedWithoutIdentity(w); decided {
+		return resp
 	}
 
 	// Only creates and the updates that change the spec, install a
@@ -516,23 +477,97 @@ func (v *Validator) Handle(ctx context.Context, req admission.Request) admission
 			"namespace", req.Namespace, "name", req.Name)
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-	w.who = actorFor(identity, req.UserInfo, newObj)
+	w.who = actorFor(identity, req.UserInfo, w.obj)
 	if resp := v.admit(ctx, w); !resp.Allowed {
 		return resp
 	}
+	return v.admitShape(ctx, w)
+}
 
+// decidedWithoutIdentity answers the writes that need no requester identity:
+// a create naming a component that is no role is refused, an update that
+// changes an immutable field is refused, and a metadata-only update is
+// allowed, unless it asks a standalone replica to migrate.
+func decidedWithoutIdentity(w write) (admission.Response, bool) {
+	if w.create() {
+		// The component picks the runtime piece, the pod label and the
+		// workload role; a value that names no role would run with none.
+		// It is immutable, so checking the create covers every update.
+		if _, ok := v1beta1.RoleOf(w.obj.Spec.Component); !ok {
+			return deny(w, fmt.Sprintf("spec.component %q is not a role: use one of %s", w.obj.Spec.Component, roleNames())), true
+		}
+		return admission.Response{}, false
+	}
+	if field := immutableFieldChanged(w); field != "" {
+		return deny(w, field+" is immutable"), true
+	}
+	if !metadataOnlyUpdate(w) {
+		return admission.Response{}, false
+	}
+	if !w.projected && migrationRequested(w.old, w.obj) {
+		return denyStandaloneMigration(w), true
+	}
+	return admission.Allowed("metadata-only update"), true
+}
+
+// admitShape runs the shape checks that hold for every writer, then the TPU
+// slice check. The controller withholds the pods of an Instance that cannot
+// fill a provisioned slice, so such runners would leave every Instance they
+// reach without pods; rejecting them leaves the replica as it was.
+func (v *Validator) admitShape(ctx context.Context, w write) admission.Response {
 	for _, check := range shapeChecks {
-		if err := check(newObj); err != nil {
+		if err := check(w.obj); err != nil {
 			return deny(w, err.Error())
 		}
 	}
-	// The controller withholds the pods of an Instance that cannot fill a
-	// provisioned slice, so such runners would leave every Instance they
-	// reach without pods. Rejecting them leaves the IR as it was.
-	if err := v.validateIRTPUSlices(ctx, oldObj, newObj); err != nil {
+	if err := v.validateIRTPUSlices(ctx, w.old, w.obj); err != nil {
 		return deny(w, err.Error())
 	}
 	return admission.Allowed("")
+}
+
+// decodeWrite decodes the object written and, on update, the object before
+// it, into one write. A body that does not decode fails the request.
+func (v *Validator) decodeWrite(req admission.Request) (write, error) {
+	newObj := &v1beta1.InferenceReplica{}
+	if err := v.Decoder.Decode(req, newObj); err != nil {
+		log.Error(err, "Failed to decode InferenceReplica",
+			"namespace", req.Namespace, "name", req.Name)
+		return write{}, err
+	}
+	var oldObj *v1beta1.InferenceReplica
+	if req.Operation == admissionv1.Update {
+		oldObj = &v1beta1.InferenceReplica{}
+		if err := v.Decoder.DecodeRaw(req.OldObject, oldObj); err != nil {
+			log.Error(err, "Failed to decode old InferenceReplica",
+				"namespace", req.Namespace, "name", req.Name)
+			return write{}, err
+		}
+	}
+	return newWrite(req, oldObj, newObj), nil
+}
+
+// immutableFieldChanged names the first immutable spec field an update
+// changes, spec.parentRef before spec.component, or returns "" when the
+// update keeps both.
+func immutableFieldChanged(w write) string {
+	switch {
+	case !reflect.DeepEqual(w.old.Spec.ParentRef, w.obj.Spec.ParentRef):
+		return "spec.parentRef"
+	case w.old.Spec.Component != w.obj.Spec.Component:
+		return "spec.component"
+	}
+	return ""
+}
+
+// metadataOnlyUpdate reports an update that keeps the spec, installs no
+// controller owner reference and leaves the composed-fields annotation
+// unchanged. Such a write is decided without the identity: a finalizer
+// change, a label or annotation edit and the garbage collector's owner
+// reference patches must pass this fail-closed webhook even when the config
+// is unreadable. The unchanged spec is not re-checked.
+func metadataOnlyUpdate(w write) bool {
+	return !specChanged(w.old.Spec, w.obj.Spec) && !controllerRefInstalled(w.old, w.obj) && !composedFieldsChanged(w.old, w.obj)
 }
 
 // roleNames lists every role's name in the order of v1beta1.Roles.
@@ -551,14 +586,10 @@ var shapeChecks = []func(*v1beta1.InferenceReplica) error{
 	validateIRRunnerVolumes,
 }
 
-// validateIRAutoscaler runs the shared Autoscaler shape check against
-// an IR's projected Autoscaler block. The IR spec carries its own
-// Replicas field (not a ComponentExtensionSpec); we pass it as the
-// effective MinReplicas floor for the KEDA idle-vs-min check. Calls
-// validation.ValidateAutoscaler directly — the
-// (*ComponentAutoscaler, *int) signature accepts this shape without
-// synthesizing a parent ComponentExtensionSpec. Shared with the
-// InferenceService and ServingRuntime webhooks.
+// validateIRAutoscaler applies the autoscaler shape check the
+// InferenceService and ServingRuntime webhooks share, with spec.replicas
+// as the minimum replica count the KEDA idle-versus-minimum rule compares
+// against.
 func validateIRAutoscaler(ir *v1beta1.InferenceReplica) error {
 	if ir == nil {
 		return nil
@@ -571,19 +602,15 @@ func validateIRAutoscaler(ir *v1beta1.InferenceReplica) error {
 	return validation.ValidateAutoscaler(ir.Spec.Autoscaler, minPtr)
 }
 
-// validateIRPacing checks that Pacing.Partition <= effective Replicas.
-// An over-Partition (Partition > Replicas) silently holds every
-// Instance back forever — the rollout engine treats Partition as a
-// per-index threshold and freezes any Instance with index < Partition,
-// so Partition >= Replicas freezes the whole replica set. Matches the
-// effective-Replicas default used by convert.desiredFromIR (nil or 0
-// → 1).
+// validateIRPacing refuses a partition above the effective replica count.
+// The engine holds back every Instance whose index is below the partition,
+// so a partition above the count would hold the whole set back forever.
+// The effective count reads as the converter reads it: nil or 0 is 1.
 func validateIRPacing(ir *v1beta1.InferenceReplica) error {
 	if ir == nil || ir.Spec.Pacing == nil || ir.Spec.Pacing.Partition == nil {
 		return nil
 	}
 	partition := *ir.Spec.Pacing.Partition
-	// Match convert.desiredFromIR's defaulting: nil OR *r == 0 → 1.
 	replicas := int32(1)
 	if ir.Spec.Replicas != nil && *ir.Spec.Replicas > 0 {
 		replicas = *ir.Spec.Replicas
@@ -597,18 +624,11 @@ func validateIRPacing(ir *v1beta1.InferenceReplica) error {
 	return nil
 }
 
-// validateIRRunnerVolumes checks every Runner's fully-rendered pod
-// template so that each container/initContainer volumeMount references a
-// volume declared in that same pod spec. The IR webhook sees the final
-// rendered leader+worker templates, so this is the most precise place to
-// catch a dangling mount before it reaches the apiserver at pod-create
-// time (where it fails as "spec.containers[i].volumeMounts[j].name: Not
-// found: <name>" and surfaces only as a buried reconcile error). Names
-// the runner, container, and missing volume so the operator can fix the
-// runtime spec — including the multi-node hint, since a dshm/shared
-// volume must be declared under engineConfig.leader.volumes /
-// engineConfig.worker.volumes for the leader+worker templates that mount
-// it.
+// validateIRRunnerVolumes checks that every volumeMount of every runner's
+// rendered pod template names a volume the same pod spec declares. The
+// webhook sees the final leader and worker templates, so a dangling mount
+// is refused here, with the runner, the container and the volume named,
+// rather than at pod creation inside a reconcile error.
 func validateIRRunnerVolumes(ir *v1beta1.InferenceReplica) error {
 	if ir == nil {
 		return nil
@@ -636,9 +656,9 @@ func validateIRRunnerVolumes(ir *v1beta1.InferenceReplica) error {
 	return nil
 }
 
-// validateContainerVolumeMounts verifies every volumeMount in the given
-// containers resolves to a name in `declared`. Returns a message naming
-// the runner, container, and missing volume on the first violation.
+// validateContainerVolumeMounts checks that every volumeMount of the
+// containers names a declared volume, and names the runner, the container
+// and the missing volume of the first one that does not.
 func validateContainerVolumeMounts(
 	runnerName string, containers []corev1.Container, declared map[string]struct{},
 ) error {

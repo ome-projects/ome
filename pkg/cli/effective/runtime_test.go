@@ -418,7 +418,7 @@ func TestObserveDeclaredInheritanceClassifiesParentReadFailure(t *testing.T) {
 
 func TestResolveLiveMirrorsExplicitRuntimeValidation(t *testing.T) {
 	compatibilityErr := &runtimeselector.RuntimeCompatibilityError{
-		RuntimeName: "runtime", ModelName: "llama", ModelFormat: "safetensors", Reason: "untrusted raw mismatch details",
+		RuntimeName: "runtime", ModelName: "llama", Reason: "untrusted raw mismatch details",
 	}
 	hardErr := &runtimeselector.ModelValidationError{Field: "modelFormat.name", Message: "required"}
 	runtimeSpec := &v1beta1.ServingRuntimeSpec{EngineConfig: &v1beta1.EngineSpec{}}

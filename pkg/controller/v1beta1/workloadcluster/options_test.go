@@ -13,13 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/rest"
-	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -228,48 +226,6 @@ func TestEstablishWatch_TimeoutDoesNotWaitForClientCancellation(t *testing.T) {
 	require.ErrorIs(t, err, errWatchEstablishTimeout)
 	assert.Less(t, time.Since(started), 500*time.Millisecond)
 	close(release)
-}
-
-// TestManager_EstablishWatch_NotConnected: a cluster with no client returns
-// (nil,false,nil) rather than erroring.
-func TestManager_EstablishWatch_NotConnected(t *testing.T) {
-	m := NewManager(fakeclient.Scheme(t))
-	w, generation, connected, err := m.EstablishWatch(context.Background(), "nope", &corev1.PodList{}, 1)
-	require.NoError(t, err)
-	assert.False(t, connected)
-	assert.Nil(t, w)
-	assert.Zero(t, generation)
-}
-
-// TestManager_EstablishWatch_TimesOut wires a connected blocking client and a
-// tiny establish timeout so the establish half of the backoff fires.
-func TestManager_EstablishWatch_TimesOut(t *testing.T) {
-	m := NewManager(fakeclient.Scheme(t))
-	m.SetReconnectBackoff(reconnectBackoff{
-		establishInitial: 20 * time.Millisecond,
-		establishMax:     20 * time.Millisecond,
-		establishFactor:  2,
-		retryMax:         DefaultReconnectRetryMax,
-	})
-	m.newClient = func(_ context.Context, _ []byte, _ *runtime.Scheme) (SelectivelyCachingClient, context.CancelFunc, error) {
-		return &blockingCachingClient{WithWatch: fakeclient.New(t, fakeclient.WithInterceptors(interceptor.Funcs{Watch: watchBlocksUntilCanceled}))}, func() {}, nil
-	}
-	require.NoError(t, m.Connect(context.Background(), "c1", []byte("kc")))
-
-	_, generation, connected, err := m.EstablishWatch(context.Background(), "c1", &corev1.PodList{}, 1)
-	assert.True(t, connected)
-	require.ErrorIs(t, err, errWatchEstablishTimeout)
-	assert.NotZero(t, generation)
-}
-
-// blockingCachingClient adapts a client whose Watch blocks to SelectivelyCachingClient
-// (its Watch blocks; AddCacheEventHandler is unused by these tests).
-type blockingCachingClient struct {
-	client.WithWatch
-}
-
-func (b *blockingCachingClient) AddCacheEventHandler(context.Context, client.Object, toolscache.ResourceEventHandler) (toolscache.ResourceEventHandlerRegistration, error) {
-	return nil, nil
 }
 
 // --- functional options -----------------------------------------------------

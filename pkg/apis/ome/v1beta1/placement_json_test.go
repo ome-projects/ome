@@ -17,7 +17,7 @@ func TestPlacementJSONPreservesExplicitRestrictions(t *testing.T) {
 		{name: "null affinity", data: `{"policy":"ClusterAffinity","mode":"Single","clusterAffinity":null}`, want: `{"policy":"ClusterAffinity","mode":"Single","clusterAffinity":[]}`},
 		{name: "omitted packing", data: `{"policy":"ClusterAffinity","mode":"Split","split":{"replicas":3}}`, want: `{"policy":"ClusterAffinity","mode":"Split","split":{"replicas":3}}`, affinityNil: true},
 		{name: "explicit surge zero", data: `{"policy":"ClusterAffinity","mode":"Split","maxSurge":0}`, want: `{"policy":"ClusterAffinity","mode":"Split","maxSurge":0}`, affinityNil: true},
-		{name: "component weights", data: `{"policy":"ClusterAffinity","mode":"Split","clusterAffinity":[{"weights":{"engine":2,"decoder":1,"router":3},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]}`, want: `{"policy":"ClusterAffinity","mode":"Split","clusterAffinity":[{"weights":{"engine":2,"decoder":1,"router":3},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]}`},
+		{name: "component weights", data: `{"policy":"ClusterAffinity","mode":"Split","clusterAffinity":[{"weights":{"engine":{"min":2},"decoder":{"min":1},"router":{"min":3}},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]}`, want: `{"policy":"ClusterAffinity","mode":"Split","clusterAffinity":[{"weights":{"engine":{"min":2},"decoder":{"min":1},"router":{"min":3}},"matchFields":[{"key":"metadata.name","operator":"In","values":["cluster-a"]}]}]}`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var placement PlacementSpec

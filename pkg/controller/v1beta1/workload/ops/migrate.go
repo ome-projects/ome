@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -35,23 +35,11 @@ func MigrateRequeueInterval(input workload.ReconcileInput) time.Duration {
 	return input.Requeue.Operation
 }
 
-// ledgerOwnerObject / ledgerOwnerGVK resolve the object that owns the
-// migration audit-ledger ConfigMap. The IR caller sets input.LedgerOwner
-// to the parent ISVC (so the ledger + the operator's migration-request
-// annotation share the user-facing resource while the IR owns the pods);
-// every other caller leaves it nil and the ledger lives on OwnerObject.
-func ledgerOwnerObject(input workload.ReconcileInput) client.Object {
-	if input.LedgerOwner != nil {
-		return input.LedgerOwner
-	}
-	return input.OwnerObject
-}
-
-func ledgerOwnerGVK(input workload.ReconcileInput) schema.GroupVersionKind {
-	if input.LedgerOwner != nil {
-		return input.LedgerOwnerGVK
-	}
-	return input.OwnerGVK
+// persistMigrationHistory writes the move's audit history to the
+// ConfigMap of the owner that keeps it.
+func persistMigrationHistory(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, history *audit.Ledger) error {
+	owner, ownerGVK := input.AuditOwner()
+	return audit.PersistLedgerForOwner(ctx, deps.Client, owner, ownerGVK, history)
 }
 
 // Migrate drives one move one step further. The move is the record in
@@ -70,16 +58,18 @@ func ledgerOwnerGVK(input workload.ReconcileInput) schema.GroupVersionKind {
 // ends by itself (the Component pausing new surges, a source Failed at
 // its running revision with its repair stopped) is named on the record,
 // which stays Accepted and goes on once the cause clears. The move
-// binds to the Instance: a source rebuilt off the request's node since
-// the request leaves the node it runs on, and a source a gang roll
-// rebuilt under another index is followed there by the record
+// binds to the Instance: a source a gang roll rebuilt under another
+// index is followed there by the record
 // (followHandoffForPendingMigrations) and waits while that index is
-// still the roll's (replacementClaimsIndex).
+// still the roll's (replacementClaimsIndex), and a source rebuilt off
+// the request's node since the request has already done what the
+// request asked, so the request closes Completed with no replacement
+// built (completeWithoutMoving).
 //
 // Then, pass by pass: the surge index is the lowest unused, written to
 // the record first, then the pair's rows (source Migrating, surge
 // Creating) and the history's Started row; the surge is created from
-// the source's running revision with the overlay off the node the move
+// the revision the pair records, with the overlay off the node the move
 // leaves; the pass waits until the surge is ContainersReady, in
 // rotation and available, lets it serve and records SurgeReady; the
 // source leaves traffic, the record reads Draining, and the source is
@@ -88,8 +78,18 @@ func ledgerOwnerGVK(input workload.ReconcileInput) schema.GroupVersionKind {
 // written and the record closed, in that order, so a crash in the tail
 // re-runs steps that are safe to repeat.
 //
+// The revision the pair records is decided once, when the pair is
+// written, and carried as the target revision of both rows' operations:
+// the roll's target when the roll could take the source (a target the
+// source does not run, the Component not paused, the target's retry
+// record not holding, the partition not holding the Instance), so the
+// Instance is built once and the roll finds it done; otherwise the
+// operations name no revision and the surge runs what the source runs.
+// A target that moves after the pair is written does not retarget the
+// surge.
+//
 // A multi-pod Instance moves as a whole: the surge copies the source's
-// runner layout and worker template from its running revision; a gang
+// runner layout and worker template from the revision the pair records; a gang
 // surge waits one pass after its rows are written so the PodGroup pass
 // creates the surge's PodGroup before the gang's pods render; the node
 // to leave is the member the request names, else the routable member's;
@@ -101,9 +101,10 @@ func ledgerOwnerGVK(input workload.ReconcileInput) schema.GroupVersionKind {
 //     goes on to the next pass without a requeue from the migration
 //     branch.
 //   - done=false, accepted=true: the move is in flight (the record owns
-//     its pair); the caller must requeue and must not fall through to
-//     the update and create passes, which refuse a row the move owns on
-//     their own.
+//     its pair); the caller must requeue. The update and create passes
+//     refuse a row the move owns on their own, so the caller lets them
+//     run beside a move that waits on its source teardown and ends the
+//     pass on every other move in flight.
 //   - done=false, accepted=false: the move waits without taking the
 //     pair (a fresh request whose source is not steady Ready because of
 //     an update, repair or create in flight, or a wait named on the
@@ -124,6 +125,7 @@ func Migrate(ctx context.Context, deps workload.Deps, input workload.ReconcileIn
 		return true, true, nil
 	}
 	_, err = runMigrationPhases(ctx, []migrationPhase{
+		move.startDeadlineAfterRoll,
 		move.waitForPlacementPause,
 		move.loadHistory,
 		move.resumePair,
@@ -202,8 +204,8 @@ type migrationPass struct {
 
 	sourcePods []*corev1.Pod
 	surgePods  []*corev1.Pod
-	// surgeRevision is the source's running revision, which the surge
-	// renders, with its stored template; surgePlan is the surge Instance
+	// surgeRevision is the revision the surge renders
+	// (replacementRevisionName), with its stored template; surgePlan is the surge Instance
 	// as the plan would list it, with the overlay that keeps it off the
 	// node the move leaves; surgePodNames are the pod names it asks for.
 	surgeRevision *appsv1.ControllerRevision
@@ -249,6 +251,21 @@ func newMigrationPass(deps workload.Deps, input workload.ReconcileInput, plan wo
 	}, nil
 }
 
+// startDeadlineAfterRoll ends the wait of a request the plan held back
+// while a roll's surge replacements were in flight. The plan drives such
+// a request only once no surge is in flight, so a record that still reads
+// as waiting for the roll has its deadline measured again from now, ahead
+// of every other wait a pass could name on it.
+func (m *migrationPass) startDeadlineAfterRoll(ctx context.Context) (bool, error) {
+	if m.record.SurgeAllocated() || !migrationWaitedForRoll(m.record) {
+		return false, nil
+	}
+	if err := startMigrationDeadlineAfterRoll(ctx, m.input, m.record, m.plan.InstanceReadyTimeout); err != nil {
+		return false, fmt.Errorf("Migrate: start the deadline after the roll (uuid=%s): %w", m.requestUUID, err)
+	}
+	return false, nil
+}
+
 // waitForPlacementPause holds a request that has no surge yet while the
 // Component pauses new surges. Placement owns the pause: the record
 // names it as what the move waits on, and the move allocates once the
@@ -267,7 +284,8 @@ func (m *migrationPass) waitForPlacementPause(ctx context.Context) (bool, error)
 // writes to as history; the record in status.migrations, not this, is
 // what a move resumes from.
 func (m *migrationPass) loadHistory(ctx context.Context) (bool, error) {
-	history, err := audit.LoadLedgerForOwner(ctx, m.deps.Reader(), ledgerOwnerObject(m.input))
+	owner, _ := m.input.AuditOwner()
+	history, err := audit.LoadLedgerForOwner(ctx, m.deps.Reader(), owner)
 	if err != nil {
 		return false, fmt.Errorf("Migrate: load audit ledger: %w", err)
 	}
@@ -295,8 +313,9 @@ func (m *migrationPass) resumePair(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	m.pairWrittenThisPass = m.surge == nil
+	recorded := m.operationRevision()
 	if m.input.ApplyInstanceMutationsWithRetryBlock != nil {
-		confirmed, err := establishMigrationPair(ctx, m.input, m.source, m.surge, m.requestUUID, m.surgeIdx, m.plan.InstanceReadyTimeout)
+		confirmed, err := establishMigrationPair(ctx, m.input, m.source, m.surge, m.requestUUID, m.surgeIdx, recorded, m.plan.InstanceReadyTimeout)
 		if err != nil {
 			return false, fmt.Errorf("Migrate: ensure migration pair: %w", err)
 		}
@@ -306,10 +325,10 @@ func (m *migrationPass) resumePair(ctx context.Context) (bool, error) {
 		m.pairConfirmed = true
 		return false, nil
 	}
-	if err := patchInstanceStatusMigrating(ctx, m.input, m.sourceIdx, m.surgeIdx, m.requestUUID, m.plan.InstanceReadyTimeout); err != nil {
+	if err := patchInstanceStatusMigrating(ctx, m.input, m.sourceIdx, m.surgeIdx, m.requestUUID, recorded, m.plan.InstanceReadyTimeout); err != nil {
 		return false, fmt.Errorf("Migrate: ensure source stamp (instance=%d): %w", m.sourceIdx, err)
 	}
-	if err := patchInstanceStatusMigrationSurge(ctx, m.input, m.surgeIdx, m.sourceIdx, m.requestUUID, m.plan.InstanceReadyTimeout); err != nil {
+	if err := patchInstanceStatusMigrationSurge(ctx, m.input, m.surgeIdx, m.sourceIdx, m.requestUUID, recorded, m.plan.InstanceReadyTimeout); err != nil {
 		return false, fmt.Errorf("Migrate: ensure surge stamp (instance=%d): %w", m.surgeIdx, err)
 	}
 	return false, nil
@@ -318,10 +337,11 @@ func (m *migrationPass) resumePair(ctx context.Context) (bool, error) {
 // admitFreshRequest takes a record that has no surge yet through the
 // admission phases, in order: refuse a source that cannot move, wait for
 // a steady source, name the node to leave, check the request against the
-// migration caps, check the overlay before any row is written, allocate
-// the surge and write the record, write the pair's rows, record the
-// acceptance. A record with a surge index was admitted on an earlier
-// pass. The pass ends with the first phase that stops.
+// migration caps, decide the replacement's revision and check the
+// overlay before any row is written, allocate the surge and write the
+// record, write the pair's rows, record the acceptance. A record with a
+// surge index was admitted on an earlier pass. The pass ends with the
+// first phase that stops.
 func (m *migrationPass) admitFreshRequest(ctx context.Context) (bool, error) {
 	if m.record.SurgeAllocated() {
 		return false, nil
@@ -331,7 +351,7 @@ func (m *migrationPass) admitFreshRequest(ctx context.Context) (bool, error) {
 		m.waitForSteadySource,
 		m.resolveNodeToLeave,
 		m.admitUnderCapacity,
-		m.checkOverlayBeforeWriting,
+		m.resolveReplacementRevision,
 		m.allocateSurge,
 		m.writePair,
 		m.recordAccepted,
@@ -379,12 +399,15 @@ func (m *migrationPass) waitForSteadySource(ctx context.Context) (bool, error) {
 	return replacementClaimsIndex(m.input.ObservedState.InstanceStatuses, m.sourceIdx), nil
 }
 
-// resolveNodeToLeave names the node the move leaves: the request's node
-// while the source still sits there, else the node the Instance was
-// rebuilt on since the request. The request is corrected so the overlay,
-// the history row and every later pass name the node the Instance leaves.
-// A source pod with no node yet defers the pass without taking the pair;
-// a source that names no node to leave is refused.
+// resolveNodeToLeave names the node the move leaves: the node the request
+// names, while the source still sits there. A source that has already
+// left that node (a roll, a repair or a node loss rebuilt it elsewhere
+// since the request) has nothing left to move, so the request is complete
+// as it stands and no replacement is built (completeWithoutMoving). A
+// request that names no node binds to the node the Instance runs on, so
+// the overlay, the history row and every later pass name it. A source pod
+// with no node yet defers the pass without taking the pair; a source that
+// names no node to leave is refused.
 func (m *migrationPass) resolveNodeToLeave(ctx context.Context) (bool, error) {
 	leaving, wait, rejection, err := resolveSourceNode(ctx, m.deps, m.input, m.plan, m.sourceIdx, m.req.FromNode)
 	switch {
@@ -396,6 +419,8 @@ func (m *migrationPass) resolveNodeToLeave(ctx context.Context) (bool, error) {
 		workload.RecordWarning(m.deps.Recorder, workload.EventTarget(m.input), workload.EventReasonMigrationFromNodeMismatch,
 			"OMENative migration uuid=%s rejected: %s", m.requestUUID, rejection)
 		return m.reject(ctx, rejection)
+	case m.req.FromNode != "" && leaving != m.req.FromNode:
+		return m.completeWithoutMoving(ctx, leaving)
 	case leaving != m.req.FromNode:
 		workload.RecordNormal(m.deps.Recorder, workload.EventTarget(m.input), workload.EventReasonMigrationFromNodeMismatch,
 			"OMENative migration uuid=%s: request.FromNode=%s does not match observed source node=%s; %s leaves %s",
@@ -403,6 +428,39 @@ func (m *migrationPass) resolveNodeToLeave(ctx context.Context) (bool, error) {
 		m.req.FromNode = leaving
 	}
 	return false, nil
+}
+
+// completeWithoutMoving closes a request its Instance has already
+// satisfied by leaving the node the request names, before the move took
+// it up: the history row and the record close Completed naming that node
+// and the node the Instance runs on (runningOn), one Normal event says so,
+// and the pass ends with the request answered. The source row is not
+// written, since the move never claimed it, and no surge is allocated.
+// History first, as every close: a crash between the two writes leaves
+// the record open and the next pass closes it the same way.
+func (m *migrationPass) completeWithoutMoving(ctx context.Context, runningOn string) (bool, error) {
+	outcome := fmt.Sprintf("%s already left %s and runs on %s; nothing to move",
+		workload.InstanceKey(m.input.Key.Component, m.sourceIdx), m.req.FromNode, runningOn)
+	m.history.UpsertEntry(audit.NewTerminalEntry(*m.history.InFlightEntryOrSeed(m.requestUUID, m.req, ledgerSurgeIndex(m.record)), audit.PhaseCompleted, outcome))
+	if err := persistMigrationHistory(ctx, m.deps, m.input, m.history); err != nil {
+		return false, fmt.Errorf("Migrate: persist Completed history (%s): %w", outcome, err)
+	}
+	if err := m.input.MutateMigration(ctx, m.requestUUID, func(record *workload.MigrationRecord) bool {
+		if record.Phase.Terminal() {
+			return false
+		}
+		record.Phase = workload.MigrationPhaseCompleted
+		record.Message = outcome
+		now := metav1.NewTime(m.deps.Now())
+		record.CompletedAt = &now
+		return true
+	}); err != nil {
+		return false, fmt.Errorf("Migrate: record Phase=Completed (uuid=%s): %w", m.requestUUID, err)
+	}
+	workload.RecordNormal(m.deps.Recorder, workload.EventTarget(m.input), workload.EventReasonMigrationCompleted,
+		"OMENative migration uuid=%s complete: %s", m.requestUUID, outcome)
+	m.done, m.accepted = true, true
+	return true, nil
 }
 
 // admitUnderCapacity checks the request against the operator's migration
@@ -433,30 +491,84 @@ func (m *migrationPass) admitUnderCapacity(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// checkOverlayBeforeWriting reads the source's running revision and
-// refuses, before any row is written, a surge whose node affinity the
-// overlay would contradict, on the leader and on a gang's worker
-// template alike. A refusal after the rows were written would leave the
-// source Migrating until the deadline cleanup, with the rejection out of
-// the requester's sight. A revision not recorded yet, or already gone,
-// defers the pass without taking the pair.
-func (m *migrationPass) checkOverlayBeforeWriting(ctx context.Context) (bool, error) {
-	_, payload, err := surgeRevisionAndSpec(ctx, m.deps, m.input, m.sourceIdx)
+// resolveReplacementRevision reads the revision the replacement renders
+// (replacementRevisionName) and refuses, before any row is written, a
+// surge whose node affinity the overlay would contradict, on the leader
+// and on a gang's worker template alike. A refusal after the rows were
+// written would leave the source Migrating until the deadline cleanup,
+// with the rejection out of the requester's sight. A revision not
+// recorded yet, or already gone, defers the pass without taking the pair.
+func (m *migrationPass) resolveReplacementRevision(ctx context.Context) (bool, error) {
+	rev, payload, err := storedRevisionAndSpec(ctx, m.deps, m.input, m.replacementRevisionName())
 	if err != nil {
 		return false, fmt.Errorf("Migrate: resolve surge revision: %w", err)
 	}
-	if payload == nil {
+	if rev == nil || payload == nil {
 		return true, nil
 	}
 	if m.overlayConflicts(payload.PodSpec, payload.WorkerPodSpec) {
 		return m.rejectOverlayConflict(ctx)
 	}
+	m.surgeRevision, m.surgePayload = rev, payload
 	return false, nil
 }
 
+// replacementRevisionName names the revision the replacement renders.
+// Once the pair is written, the source row's operation is the answer: the revision
+// it names, else the source's running revision. Before that, the roll
+// decides: a source the roll would take (rollTakesSource) is replaced on
+// the roll's target, so one build serves the move and the roll; any other
+// source is replaced on what it runs. Empty while the source has no row
+// or no recorded revision.
+func (m *migrationPass) replacementRevisionName() string {
+	if m.source == nil {
+		return ""
+	}
+	if op := m.source.Operation; op != nil && op.Type == workload.InstanceOperationMigrate && op.RequestUUID == m.requestUUID {
+		if op.TargetRevision != "" {
+			return op.TargetRevision
+		}
+		return m.source.RunningRevision
+	}
+	if m.rollTakesSource() {
+		return m.target.Name
+	}
+	return m.source.RunningRevision
+}
+
+// rollTakesSource reports whether the roll would take the source from
+// where it stands: the Component has a roll target the source does not
+// run, the roll could start on it (rollTargetOpen: the Component not
+// paused, the target's retry record not Held) and the partition does not
+// hold the Instance (RollHeldIndices). A Backoff block paces the roll's
+// start without holding it, so a move during one builds on the target
+// instead of waiting out the schedule: the source keeps serving until its
+// replacement is up, so nothing is down while the target proves itself.
+// A source the roll holds, or a roll that cannot start, keeps the
+// Instance on the revision it runs, and so does its move.
+func (m *migrationPass) rollTakesSource() bool {
+	if m.source == nil || m.target == nil || m.source.RunningRevision == "" || m.source.RunningRevision == m.target.Name {
+		return false
+	}
+	return rollTargetOpen(m.input, m.plan, m.target) && !RollHeldIndices(m.input, m.plan, m.target)[m.sourceIdx]
+}
+
+// operationRevision is what the pair's operations carry as their target
+// revision: the replacement's revision when it is not the source's
+// running one, else empty, which every reader takes as the source's
+// running revision.
+func (m *migrationPass) operationRevision() string {
+	name := m.replacementRevisionName()
+	if m.source == nil || name == m.source.RunningRevision {
+		return ""
+	}
+	return name
+}
+
 // allocateSurge takes the lowest free Instance index for the surge and
-// writes it to the record first, with the node the move leaves and the
-// time execution starts, which the capacity caps count from. The record
+// writes it to the record first, with the node the move leaves, the
+// revision the replacement renders when it is the roll's, and the time
+// execution starts, which the capacity caps count from. The record
 // is what a later pass resumes from: a crash after this write resumes
 // with the index and writes the pair's rows again, where the reverse
 // order would leave a written source behind the fresh-request checks
@@ -465,6 +577,10 @@ func (m *migrationPass) allocateSurge(ctx context.Context) (bool, error) {
 	m.surgeIdx = workload.AllocateSurgeIndex(m.input.ObservedState.InstanceStatuses)
 	allocated := m.surgeIdx
 	leaving := m.req.FromNode
+	message := "surge allocated; waiting for surge pods"
+	if recorded := m.operationRevision(); recorded != "" {
+		message = fmt.Sprintf("surge allocated on the roll's target revision %s; waiting for surge pods", recorded)
+	}
 	if err := m.input.MutateMigration(ctx, m.requestUUID, func(record *workload.MigrationRecord) bool {
 		if record.SurgeInstance != nil && *record.SurgeInstance == allocated &&
 			workload.MigrationPhaseAtOrPast(record.Phase, workload.MigrationPhaseSurgePending) {
@@ -479,7 +595,7 @@ func (m *migrationPass) allocateSurge(ctx context.Context) (bool, error) {
 		if !workload.MigrationPhaseAtOrPast(record.Phase, workload.MigrationPhaseSurgePending) {
 			record.Phase = workload.MigrationPhaseSurgePending
 		}
-		record.Message = "surge allocated; waiting for surge pods"
+		record.Message = message
 		return true
 	}); err != nil {
 		return false, fmt.Errorf("Migrate: record surge allocation (uuid=%s): %w", m.requestUUID, err)
@@ -490,12 +606,14 @@ func (m *migrationPass) allocateSurge(ctx context.Context) (bool, error) {
 
 // writePair writes the pair's two rows: the source Migrating with the
 // surge index on its operation, the surge Creating with the source's
-// index on its own, so the pair reads from either side. On the batch
+// index on its own, both naming the replacement's revision when it is
+// the roll's, so the pair reads from either side. On the batch
 // path the write is fenced on both rows and the pass stops when they no
 // longer read as it saw them.
 func (m *migrationPass) writePair(ctx context.Context) (bool, error) {
+	recorded := m.operationRevision()
 	if m.input.ApplyInstanceMutationsWithRetryBlock != nil {
-		confirmed, err := establishMigrationPair(ctx, m.input, m.source, nil, m.requestUUID, m.surgeIdx, m.plan.InstanceReadyTimeout)
+		confirmed, err := establishMigrationPair(ctx, m.input, m.source, nil, m.requestUUID, m.surgeIdx, recorded, m.plan.InstanceReadyTimeout)
 		if err != nil {
 			return false, fmt.Errorf("Migrate: stamp migration pair: %w", err)
 		}
@@ -505,10 +623,10 @@ func (m *migrationPass) writePair(ctx context.Context) (bool, error) {
 		m.pairConfirmed = true
 		return false, nil
 	}
-	if err := patchInstanceStatusMigrating(ctx, m.input, m.sourceIdx, m.surgeIdx, m.requestUUID, m.plan.InstanceReadyTimeout); err != nil {
+	if err := patchInstanceStatusMigrating(ctx, m.input, m.sourceIdx, m.surgeIdx, m.requestUUID, recorded, m.plan.InstanceReadyTimeout); err != nil {
 		return false, fmt.Errorf("Migrate: stamp source status (instance=%d): %w", m.sourceIdx, err)
 	}
-	if err := patchInstanceStatusMigrationSurge(ctx, m.input, m.surgeIdx, m.sourceIdx, m.requestUUID, m.plan.InstanceReadyTimeout); err != nil {
+	if err := patchInstanceStatusMigrationSurge(ctx, m.input, m.surgeIdx, m.sourceIdx, m.requestUUID, recorded, m.plan.InstanceReadyTimeout); err != nil {
 		return false, fmt.Errorf("Migrate: stamp surge status (instance=%d): %w", m.surgeIdx, err)
 	}
 	return false, nil
@@ -520,7 +638,7 @@ func (m *migrationPass) writePair(ctx context.Context) (bool, error) {
 // rows and the history written, the pass owns the move.
 func (m *migrationPass) recordAccepted(ctx context.Context) (bool, error) {
 	m.history.UpsertEntry(audit.NewStartedEntry(m.req, m.requestUUID, m.surgeIdx))
-	if err := audit.PersistLedgerForOwner(ctx, m.deps.Client, ledgerOwnerObject(m.input), ledgerOwnerGVK(m.input), m.history); err != nil {
+	if err := persistMigrationHistory(ctx, m.deps, m.input, m.history); err != nil {
 		return false, fmt.Errorf("Migrate: persist Started ledger: %w", err)
 	}
 	workload.RecordNormal(m.deps.Recorder, workload.EventTarget(m.input), workload.EventReasonMigrationRequestAccepted,
@@ -612,7 +730,7 @@ func (m *migrationPass) confirmRetainedPair(ctx context.Context) (bool, error) {
 	if m.source == nil {
 		return confirmMigrationCompletionPair(ctx, m.input, m.sourceIdx, m.surge)
 	}
-	return confirmMigrationDrainPair(ctx, m.input, m.source, m.surge, m.requestUUID, m.surgeIdx, m.source.RunningRevision, true)
+	return confirmMigrationDrainPair(ctx, m.input, m.source, m.surge, m.requestUUID, m.surgeIdx, m.replacementRevisionName(), true)
 }
 
 // endOnSurgeThatCannotStart closes the move once a surge pod sits in a
@@ -650,23 +768,21 @@ func (m *migrationPass) confirmPairBeforeEffects(ctx context.Context) (bool, err
 	if m.input.ApplyInstanceMutationsWithRetryBlock == nil || m.pairConfirmed {
 		return false, nil
 	}
-	targetRevision := ""
-	if m.source != nil {
-		targetRevision = m.source.RunningRevision
-	}
-	confirmed, err := confirmMigrationDrainPair(ctx, m.input, m.source, m.surge, m.requestUUID, m.surgeIdx, targetRevision, len(m.sourcePods) == 0)
+	confirmed, err := confirmMigrationDrainPair(ctx, m.input, m.source, m.surge, m.requestUUID, m.surgeIdx, m.replacementRevisionName(), len(m.sourcePods) == 0)
 	if err != nil {
 		return false, fmt.Errorf("Migrate: confirm migration pair before effects: %w", err)
 	}
 	return !confirmed, nil
 }
 
-// resolveSurgeRevision reads the source's running revision and its
-// stored template: a move changes placement, not the template, so the
-// surge runs what the source runs, leader and worker templates alike. A
-// source with no running revision yet waits.
+// resolveSurgeRevision reads the revision the pair records
+// (replacementRevisionName) and its stored template, leader and worker
+// templates alike: the roll's target for a move admitted while the roll
+// could take the source, else the source's running revision, since a
+// move on its own changes placement, not the template. A source with no
+// recorded revision yet waits.
 func (m *migrationPass) resolveSurgeRevision(ctx context.Context) (bool, error) {
-	rev, payload, err := surgeRevisionAndSpec(ctx, m.deps, m.input, m.sourceIdx)
+	rev, payload, err := storedRevisionAndSpec(ctx, m.deps, m.input, m.replacementRevisionName())
 	if err != nil {
 		return false, fmt.Errorf("Migrate: resolve surge revision: %w", err)
 	}
@@ -1111,7 +1227,7 @@ func completeMigrationTail(
 	runningRevision string,
 ) error {
 	ledger.UpsertEntry(audit.NewTerminalEntry(*ledger.InFlightEntryOrSeed(requestUUID, req, surgeIdx), audit.PhaseCompleted, "migrated"))
-	if err := audit.PersistLedgerForOwner(ctx, deps.Client, ledgerOwnerObject(input), ledgerOwnerGVK(input), ledger); err != nil {
+	if err := persistMigrationHistory(ctx, deps, input, ledger); err != nil {
 		return fmt.Errorf("Migrate: persist Completed ledger: %w", err)
 	}
 	completedMsg := fmt.Sprintf("migrated to instance=%d", surgeIdx)
@@ -1134,8 +1250,9 @@ func completeMigrationTail(
 }
 
 // establishMigrationPair writes the pair's two rows through the batch
-// writer when the rows still read as a pair this pass may write; it
-// reports whether the write landed.
+// writer when the rows still read as a pair this pass may write, both
+// naming revisionName when the replacement renders a revision other than
+// the source's; it reports whether the write landed.
 func establishMigrationPair(
 	ctx context.Context,
 	input workload.ReconcileInput,
@@ -1143,12 +1260,13 @@ func establishMigrationPair(
 	surge *workload.InstanceStatus,
 	requestUUID string,
 	surgeIdx int32,
+	revisionName string,
 	timeout time.Duration,
 ) (bool, error) {
 	if !migrationPairStampable(source, surge, requestUUID, surgeIdx) {
 		return false, nil
 	}
-	return status.StartMigration(ctx, input, source, surge, requestUUID, surgeIdx, timeout)
+	return status.StartMigration(ctx, input, source, surge, requestUUID, surgeIdx, revisionName, timeout)
 }
 
 // migrationPairStampable reports whether the pair's rows may be written:
@@ -1555,14 +1673,13 @@ func advanceMigrationPhase(ctx context.Context, input workload.ReconcileInput, u
 }
 
 // resolveSourceNode live-reads the source pods and names the node the
-// surge is kept off. A request binds to the Instance; its FromNode is
-// where the requester saw it. A source still on FromNode leaves it. A
-// source rebuilt elsewhere since the request (a roll, a repair, a node
-// loss) leaves the node it runs on now, so the overlay never excludes a
-// node the Instance already left while leaving it free to land where the
-// Instance actually is. For a gang, FromNode names the member to
-// relocate off, and when no member sits there any more the routable
-// member's node stands in, since the whole gang moves anyway.
+// source runs on, read against FromNode, the node the requester saw it
+// on: FromNode itself while a source pod still sits there, else the node
+// the source runs on now, which the caller reads as a move already made
+// when the request named a node and as the node to leave when it named
+// none. For a gang, FromNode names the member to relocate off, and when
+// no member sits there any more the routable member's node is the
+// answer.
 //
 // Returns (node, defer, rejection, err): defer while a source pod is
 // unscheduled or every source pod is Terminating; rejection for the
@@ -1690,6 +1807,116 @@ func recordMigrationWait(ctx context.Context, input workload.ReconcileInput, ent
 // allowance, and nothing the move does ends that.
 const migrationPausedMessage = "waiting for the placement pause to lift: placement execution holds new surge allocations"
 
+// migrationWaitsForRollPrefix opens the message a fresh record carries
+// while a roll's surge replacement is in flight. The prefix is the
+// record's own word that its deadline stands still: the expiry and the
+// drive read it to start the deadline again once no surge replacement is
+// in flight.
+const migrationWaitsForRollPrefix = "waiting for the roll"
+
+// migrationWaitsForRollMessage names the roll a fresh record waits for,
+// by the revision its surge replacements move to when the rows record
+// one.
+func migrationWaitsForRollMessage(revision string) string {
+	to := ""
+	if revision != "" {
+		to = " to revision " + revision
+	}
+	return migrationWaitsForRollPrefix + to + ": a surge replacement of the roll is in flight and the move would surge one more Instance; the move starts on the first pass with no surge replacement in flight and its deadline runs from then"
+}
+
+// migrationWaitedForRoll reports a record still carrying the wait for a
+// roll on its message.
+func migrationWaitedForRoll(entry *workload.MigrationRecord) bool {
+	return entry != nil && strings.HasPrefix(entry.Message, migrationWaitsForRollPrefix)
+}
+
+// MigrationWaitsForRoll reports whether a record must wait for the roll:
+// it has no surge index yet, and a surge replacement of the roll is in
+// flight on the Component, so starting the move would surge one more
+// Instance beside the roll's. The plan holds such a record back from the
+// drive and the expiry leaves its deadline still for as long as this
+// holds.
+func MigrationWaitsForRoll(record workload.MigrationRecord, statuses []workload.InstanceStatus) bool {
+	if record.SurgeAllocated() {
+		return false
+	}
+	for i := range statuses {
+		if workload.SurgeReplacementInFlight(&statuses[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// rollRevisionOfSurges is the revision the in-flight surge replacements
+// move to, or empty when no surging row records one.
+func rollRevisionOfSurges(statuses []workload.InstanceStatus) string {
+	for i := range statuses {
+		if workload.SurgeReplacementInFlight(&statuses[i]) && statuses[i].Operation.TargetRevision != "" {
+			return statuses[i].Operation.TargetRevision
+		}
+	}
+	return ""
+}
+
+// RecordMigrationWaitForRoll writes on the fresh record for requestUUID
+// that it waits for the roll whose surge replacements are in flight. The
+// record stays Accepted and its deadline stands still; the write and its
+// one Normal MigrationDeferred event happen on the pass the wait opens,
+// as for every other wait a fresh record names.
+func RecordMigrationWaitForRoll(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, requestUUID string) error {
+	if input.MutateMigration == nil {
+		return fmt.Errorf("RecordMigrationWaitForRoll: MutateMigration not wired (uuid=%s)", requestUUID)
+	}
+	entry := workload.FindMigrationRecord(input.ObservedState.Migrations, requestUUID)
+	if entry == nil || entry.Phase.Terminal() || entry.SurgeAllocated() {
+		return nil
+	}
+	return deferMigration(ctx, deps, input, entry,
+		migrationWaitsForRollMessage(rollRevisionOfSurges(input.ObservedState.InstanceStatuses)), false)
+}
+
+// startMigrationDeadlineAfterRoll ends a record's wait for a roll. The
+// record keeps the window it was accepted with (its deadline less its
+// start time) and measures it again from now; a record that recorded no
+// window takes the plan's ready timeout, and a record with no deadline
+// keeps having none. The wait leaves the message, so the next wait the
+// drive names, or the allocation, writes over an empty one. The write is
+// edge-triggered on the wait: a stale copy of a record another pass has
+// already released applies nothing.
+func startMigrationDeadlineAfterRoll(ctx context.Context, input workload.ReconcileInput, entry *workload.MigrationRecord, readyTimeout time.Duration) error {
+	if input.MutateMigration == nil {
+		return fmt.Errorf("MutateMigration not wired")
+	}
+	window := entry.Deadline.Sub(entry.StartedAt.Time)
+	if window <= 0 {
+		window = readyTimeout
+	}
+	now := input.Now()
+	released := false
+	if err := input.MutateMigration(ctx, entry.RequestUUID, func(m *workload.MigrationRecord) bool {
+		if m.Phase.Terminal() || !migrationWaitedForRoll(m) {
+			return false
+		}
+		m.Message = ""
+		if !m.Deadline.IsZero() {
+			m.Deadline = metav1.NewTime(now.Add(window))
+		}
+		released = true
+		return true
+	}); err != nil {
+		return err
+	}
+	if released {
+		entry.Message = ""
+		if !entry.Deadline.IsZero() {
+			entry.Deadline = metav1.NewTime(now.Add(window))
+		}
+	}
+	return nil
+}
+
 // deferMigration records why a fresh record is deferred when no
 // operation in flight on its source will end the wait by itself: the
 // record carries the cause until it clears, so an expiry can name it,
@@ -1794,7 +2021,7 @@ func writeMigrationCapacityCondition(ctx context.Context, input workload.Reconci
 func failMigration(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, ledger *audit.Ledger, req *audit.MigrationRequest, uuid, reason string) (bool, error) {
 	surgeIdx := ledgerSurgeIndex(workload.FindMigrationRecord(input.ObservedState.Migrations, uuid))
 	ledger.UpsertEntry(audit.NewTerminalEntry(*ledger.InFlightEntryOrSeed(uuid, req, surgeIdx), audit.PhaseFailed, reason))
-	if err := audit.PersistLedgerForOwner(ctx, deps.Client, ledgerOwnerObject(input), ledgerOwnerGVK(input), ledger); err != nil {
+	if err := persistMigrationHistory(ctx, deps, input, ledger); err != nil {
 		return false, fmt.Errorf("Migrate: persist Failed ledger (%s): %w", reason, err)
 	}
 	if err := input.MutateMigration(ctx, uuid, func(m *workload.MigrationRecord) bool {
@@ -1830,48 +2057,48 @@ func isMultiPodInstance(plan workload.ComponentPlan, sourceIdx int32) bool {
 	return false
 }
 
-// surgeRevisionAndSpec returns the source's RunningRevision CR and its
-// stored payload: the leader (single-pod) PodSpec, the worker PodSpec
+// storedRevisionAndSpec returns the ControllerRevision named name and
+// its stored payload: the leader (single-pod) PodSpec, the worker PodSpec
 // for a gang, the template metadata and the pairing protocol. (nil, nil,
-// nil) means no recorded RunningRevision yet OR the CR was deleted —
-// caller retries.
+// nil) means no name is recorded yet OR the CR was deleted — caller
+// retries.
 //
-// Reads the source's running revision from input.ObservedState; fetches
-// the CR via deps.Reader() (live read) so a stale cache doesn't return
-// a deleted CR as still-present.
-func surgeRevisionAndSpec(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, sourceIdx int32) (*appsv1.ControllerRevision, *revision.DataPayload, error) {
-	source := input.ObservedState.Instance(sourceIdx)
-	if source == nil || source.RunningRevision == "" {
+// Fetches the CR via deps.Reader() (live read) so a stale cache doesn't
+// return a deleted CR as still-present.
+func storedRevisionAndSpec(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, name string) (*appsv1.ControllerRevision, *revision.DataPayload, error) {
+	if name == "" {
 		return nil, nil, nil
 	}
 	cr := &appsv1.ControllerRevision{}
-	if err := deps.Reader().Get(ctx, client.ObjectKey{Namespace: input.Key.Namespace, Name: source.RunningRevision}, cr); err != nil {
+	if err := deps.Reader().Get(ctx, client.ObjectKey{Namespace: input.Key.Namespace, Name: name}, cr); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil, nil, nil
 		}
-		return nil, nil, fmt.Errorf("get source CR %s: %w", source.RunningRevision, err)
+		return nil, nil, fmt.Errorf("get source CR %s: %w", name, err)
 	}
 	var payload revision.DataPayload
 	if err := json.Unmarshal(cr.Data.Raw, &payload); err != nil {
 		return nil, nil, fmt.Errorf("unmarshal source CR data: %w", err)
 	}
 	if payload.PodSpec == nil {
-		return nil, nil, fmt.Errorf("source CR %s missing podSpec payload", source.RunningRevision)
+		return nil, nil, fmt.Errorf("source CR %s missing podSpec payload", name)
 	}
 	return cr, &payload, nil
 }
 
 // patchInstanceStatusMigrating writes the source row Migrating; the
-// operation's SurgeIndex points forward at the surge.
-func patchInstanceStatusMigrating(ctx context.Context, input workload.ReconcileInput, idx, surgeIdx int32, uuid string, timeout time.Duration) error {
-	return status.StampMigrationPin(ctx, input, idx, surgeIdx, status.MigrationRoleSource, uuid, timeout)
+// operation's SurgeIndex points forward at the surge and its
+// TargetRevision names the replacement's revision when it is the roll's.
+func patchInstanceStatusMigrating(ctx context.Context, input workload.ReconcileInput, idx, surgeIdx int32, uuid, revisionName string, timeout time.Duration) error {
+	return status.StampMigrationPin(ctx, input, idx, surgeIdx, status.MigrationRoleSource, uuid, revisionName, timeout)
 }
 
 // patchInstanceStatusMigrationSurge writes the surge row Creating; its
-// SurgeIndex points back at the source, so the pair reads from either
-// side.
-func patchInstanceStatusMigrationSurge(ctx context.Context, input workload.ReconcileInput, surgeIdx, sourceIdx int32, uuid string, timeout time.Duration) error {
-	return status.StampMigrationPin(ctx, input, surgeIdx, sourceIdx, status.MigrationRoleSurge, uuid, timeout)
+// SurgeIndex points back at the source and its TargetRevision names the
+// replacement's revision when it is the roll's, so the pair reads from
+// either side.
+func patchInstanceStatusMigrationSurge(ctx context.Context, input workload.ReconcileInput, surgeIdx, sourceIdx int32, uuid, revisionName string, timeout time.Duration) error {
+	return status.StampMigrationPin(ctx, input, surgeIdx, sourceIdx, status.MigrationRoleSurge, uuid, revisionName, timeout)
 }
 
 // drainServiceForPod is query.RoutedServiceForPod under the name the

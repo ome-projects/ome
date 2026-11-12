@@ -472,7 +472,32 @@ func calculateCapabilityScore(
 	return score
 }
 
-// getTFLOPSForPrecision extracts TFLOPS value for given precision
+// computeFigure is one compute figure an AcceleratorClass states, with the
+// precision names it answers for.
+type computeFigure struct {
+	precision string
+	alias     string
+	value     *int64
+}
+
+// computeFigures lists the class's compute figures in the order precision
+// names are matched: fp32, fp16, int8 (which also answers fp8), int4.
+func computeFigures(perf *v1beta1.AcceleratorPerformance) [4]computeFigure {
+	return [4]computeFigure{
+		{precision: "fp32", value: perf.Fp32Tflops},
+		{precision: "fp16", value: perf.Fp16Tflops},
+		{precision: "int8", alias: "fp8", value: perf.Int8Tops},
+		{precision: "int4", value: perf.Int4Tops},
+	}
+}
+
+// answers reports whether the figure is the one a precision name asks for.
+func (f computeFigure) answers(precision string) bool {
+	return precision == f.precision || (f.alias != "" && precision == f.alias)
+}
+
+// getTFLOPSForPrecision is the figure the class states for a precision, or 0
+// when it states none or the precision is unknown.
 func getTFLOPSForPrecision(
 	perf *v1beta1.AcceleratorPerformance,
 	precision string,
@@ -480,50 +505,25 @@ func getTFLOPSForPrecision(
 	if perf == nil {
 		return 0
 	}
-
-	switch strings.ToLower(precision) {
-	case "fp32":
-		if perf.Fp32Tflops != nil {
-			return *perf.Fp32Tflops
-		}
-	case "fp16":
-		if perf.Fp16Tflops != nil {
-			return *perf.Fp16Tflops
-		}
-	case "int8", "fp8":
-		if perf.Int8Tops != nil {
-			return *perf.Int8Tops
-		}
-	case "int4":
-		if perf.Int4Tops != nil {
-			return *perf.Int4Tops
+	wanted := strings.ToLower(precision)
+	for _, figure := range computeFigures(perf) {
+		if figure.answers(wanted) && figure.value != nil {
+			return *figure.value
 		}
 	}
-
 	return 0
 }
 
-// getMaxTFLOPS returns the maximum TFLOPS across all precisions
-// Used when no precision preference is specified
+// getMaxTFLOPS is the largest figure the class states at any precision, or 0.
 func getMaxTFLOPS(perf *v1beta1.AcceleratorPerformance) int64 {
 	if perf == nil {
 		return 0
 	}
-
 	maxTFLOPS := int64(0)
-
-	if perf.Fp32Tflops != nil && *perf.Fp32Tflops > maxTFLOPS {
-		maxTFLOPS = *perf.Fp32Tflops
+	for _, figure := range computeFigures(perf) {
+		if figure.value != nil && *figure.value > maxTFLOPS {
+			maxTFLOPS = *figure.value
+		}
 	}
-	if perf.Fp16Tflops != nil && *perf.Fp16Tflops > maxTFLOPS {
-		maxTFLOPS = *perf.Fp16Tflops
-	}
-	if perf.Int8Tops != nil && *perf.Int8Tops > maxTFLOPS {
-		maxTFLOPS = *perf.Int8Tops
-	}
-	if perf.Int4Tops != nil && *perf.Int4Tops > maxTFLOPS {
-		maxTFLOPS = *perf.Int4Tops
-	}
-
 	return maxTFLOPS
 }

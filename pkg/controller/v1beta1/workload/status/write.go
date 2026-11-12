@@ -121,6 +121,36 @@ func (w *guardedWrite) commit(
 	return writeOutcome(err, w.committed || w.confirmed)
 }
 
+// promote is the write that ends a replacement roll: mutation moves the
+// replacement's row Ready on revision under the guard the caller set, and
+// once that write has landed the revision's retry record is pruned, as
+// every promote onto a revision prunes it. Reports whether this pass
+// promoted; a write another pass got ahead of promotes nothing and prunes
+// nothing.
+func (w *guardedWrite) promote(ctx context.Context, input types.ReconcileInput, mutation types.InstanceMutation, revision string) (bool, error) {
+	mutation.OnCommit = w.recordCommit
+	promoted, err := w.commit(ctx, input, []types.InstanceMutation{mutation}, "", nil)
+	if err != nil || !promoted {
+		return false, err
+	}
+	if err := RetryBlockPruneOnPromote(ctx, input, revision); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// promotedRow reports whether row is read, promoted onto revision: the
+// same identity as the row read, Ready on revision, with no
+// target revision and no operation left.
+func promotedRow(row, read *types.InstanceStatus, revision string) bool {
+	return row != nil && row.Index == read.Index &&
+		row.Incarnation == read.Incarnation &&
+		row.ActiveOrdinal == read.ActiveOrdinal &&
+		row.Phase == types.InstancePhaseReady &&
+		row.RunningRevision == revision &&
+		row.TargetRevision == "" && row.Operation == nil
+}
+
 // guardHolds runs guard against the fresh rows, writes nothing, and
 // reports whether the guard passed. A write with an effect outside the
 // status between its decision and its commit asks this first, so the

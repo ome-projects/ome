@@ -13,8 +13,8 @@ import (
 // Unknown says the node stopped reporting, not that the pod died, so the
 // name may not be recycled: a kubelet that comes back could still be
 // running the container. The wait ends when the pod leaves the phase or
-// disappears, or when the force-delete sweep's node-death evidence
-// proves no kubelet is left to run it.
+// disappears, or when the force-delete sweep removes it because its node
+// is gone or has been unreachable or NotReady for the policy's threshold.
 //
 // ENVIRONMENT-CAUSED: a silent node says nothing about the pod template,
 // so the token never charges a revision's retry ladder.

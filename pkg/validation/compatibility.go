@@ -269,22 +269,34 @@ func CompareDiffusionPipeline(model *v1beta1.DiffusionPipelineSpec, format *v1be
 	if format == nil {
 		return true, ""
 	}
-
 	if model == nil {
 		return false, "diffusion pipeline required by runtime but not specified in model"
 	}
-
-	if format.ClassName != nil {
-		if model.ClassName == nil || *format.ClassName != *model.ClassName {
-			modelClassName := "<nil>"
-			if model.ClassName != nil {
-				modelClassName = *model.ClassName
-			}
-			return false, fmt.Sprintf("pipeline class mismatch (model=%s, runtime=%s)",
-				modelClassName, *format.ClassName)
-		}
+	if ok, reason := comparePipelineClass(model.ClassName, format.ClassName); !ok {
+		return false, reason
 	}
+	if ok, reason := compareNamedPipelineComponents(model, format); !ok {
+		return false, reason
+	}
+	return compareAdditionalPipelineComponents(model.AdditionalComponents, format.AdditionalComponents)
+}
 
+// comparePipelineClass requires the model to name the pipeline class a format
+// names; a format that names none fits every model.
+func comparePipelineClass(model, format *string) (bool, string) {
+	if format == nil || (model != nil && *format == *model) {
+		return true, ""
+	}
+	modelClassName := "<nil>"
+	if model != nil {
+		modelClassName = *model
+	}
+	return false, fmt.Sprintf("pipeline class mismatch (model=%s, runtime=%s)", modelClassName, *format)
+}
+
+// compareNamedPipelineComponents compares the five named components in the
+// order their mismatches are reported.
+func compareNamedPipelineComponents(model, format *v1beta1.DiffusionPipelineSpec) (bool, string) {
 	componentChecks := []struct {
 		name          string
 		model, format *v1beta1.DiffusionComponentSpec
@@ -295,29 +307,33 @@ func CompareDiffusionPipeline(model *v1beta1.DiffusionPipelineSpec, format *v1be
 		{name: "transformer", model: model.Transformer, format: format.Transformer},
 		{name: "vae", model: model.VAE, format: format.VAE},
 	}
-
 	for _, check := range componentChecks {
 		if ok, reason := compareDiffusionComponent(check.name, check.model, check.format); !ok {
 			return false, reason
 		}
 	}
+	return true, ""
+}
 
-	if len(format.AdditionalComponents) > 0 {
-		if len(model.AdditionalComponents) == 0 {
-			return false, "diffusion pipeline missing required additional components"
+// compareAdditionalPipelineComponents requires every additional component a
+// format names to be in the model and to match it.
+func compareAdditionalPipelineComponents(model, format map[string]v1beta1.DiffusionComponentSpec) (bool, string) {
+	if len(format) == 0 {
+		return true, ""
+	}
+	if len(model) == 0 {
+		return false, "diffusion pipeline missing required additional components"
+	}
+	for key, formatComponent := range format {
+		modelComponent, exists := model[key]
+		if !exists {
+			return false, fmt.Sprintf("diffusion component %s missing in model", key)
 		}
-		for key, formatComponent := range format.AdditionalComponents {
-			modelComponent, exists := model.AdditionalComponents[key]
-			if !exists {
-				return false, fmt.Sprintf("diffusion component %s missing in model", key)
-			}
-			runtimeComponent := formatComponent
-			if ok, reason := compareDiffusionComponent(key, &modelComponent, &runtimeComponent); !ok {
-				return false, reason
-			}
+		runtimeComponent := formatComponent
+		if ok, reason := compareDiffusionComponent(key, &modelComponent, &runtimeComponent); !ok {
+			return false, reason
 		}
 	}
-
 	return true, ""
 }
 
@@ -368,14 +384,11 @@ func FormatSupportsModelCacheProvider(format v1beta1.SupportedModelFormat, provi
 // does not fit a format under the named provider.
 func ModelCacheProviderMismatchReason(provider string, format v1beta1.SupportedModelFormat) string {
 	provider = strings.TrimSpace(provider)
-	if len(format.ModelCacheProviders) == 0 {
-		if provider == "" {
-			return "no model cache provider is configured for sharded model loading"
-		}
-		return fmt.Sprintf("runtime format does not support model cache provider %q", provider)
-	}
 	if provider == "" {
 		return "no model cache provider is configured for sharded model loading"
+	}
+	if len(format.ModelCacheProviders) == 0 {
+		return fmt.Sprintf("runtime format does not support model cache provider %q", provider)
 	}
 
 	supported := make([]string, 0, len(format.ModelCacheProviders))

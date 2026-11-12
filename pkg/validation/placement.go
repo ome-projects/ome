@@ -3,7 +3,6 @@ package validation
 import (
 	"errors"
 	"fmt"
-	"slices"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -15,12 +14,9 @@ import (
 // ComponentAffinity policy is told where per-component weights live.
 const placementPolicyRemedy = "the ComponentAffinity policy was removed, set each component's weight in the weights block of each clusterAffinity term"
 
-// These match the messages of the CEL rules on PlacementSpec, so a client sees
-// the same text from the API server and from admission.
-const (
-	ratioMixedFormMessage = "clusterAffinity weights use either default/engine/decoder/router or the *Replicas ratios, not both"
-	ratioSplitMessage     = "*Replicas ratios are allowed only in Split and replace spec.placement.split; remove split"
-)
+// ratioSplitMessage matches the message of the CEL rule on PlacementSpec, so a
+// client sees the same text from the API server and from admission.
+const ratioSplitMessage = "clusterAffinity weights are allowed only in Split and replace spec.placement.split; remove split"
 
 // ErrAcceptedPlanRequiresClusterAffinity refuses a service that holds an
 // accepted placement plan while its spec selects another policy.
@@ -58,19 +54,15 @@ func ValidatePlacement(spec *v1beta1.InferenceServiceSpec) error {
 	return validateComponentWeights(spec)
 }
 
-// ValidateRatioForm refuses a source that mixes the integer weight keys with
-// the *Replicas ratio keys on any terms, and a ratio source outside Split or
-// beside spec.placement.split. It mirrors the two CRD rules on PlacementSpec
-// and returns nil for a nil placement.
+// ValidateRatioForm refuses a source whose terms set weights outside Split or
+// beside spec.placement.split. It mirrors the CRD rule on PlacementSpec and
+// returns nil for a nil placement.
 func ValidateRatioForm(p *v1beta1.PlacementSpec) error {
-	if p == nil || !affinity.UsesRatios(p.ClusterAffinity) {
+	if p == nil {
 		return nil
 	}
-	if slices.ContainsFunc(p.ClusterAffinity, func(t v1beta1.ClusterAffinityTerm) bool {
-		w := t.Weights
-		return w != nil && (w.Default != nil || w.Engine != nil || w.Decoder != nil || w.Router != nil)
-	}) {
-		return errors.New(ratioMixedFormMessage)
+	if !affinity.UsesRatios(p.ClusterAffinity) {
+		return nil
 	}
 	if p.Mode != v1beta1.PlacementModeSplit || p.Split != nil {
 		return errors.New(ratioSplitMessage)
@@ -95,8 +87,9 @@ func validateSplit(p *v1beta1.PlacementSpec, split bool) error {
 }
 
 // validateSplitCeilings requires every component split.maxPerCluster caps to
-// be declared, and a router cap only where Split divides the routers; an
-// undivided router keeps the source's own bounds on every cluster.
+// be declared, and a router cap only in Split, the one mode that divides the
+// routers of a source with a split block; SplitByCapacity keeps the source's
+// own router bounds on every cluster.
 func validateSplitCeilings(spec *v1beta1.InferenceServiceSpec) error {
 	p := spec.Placement
 	if p.Split == nil || p.Split.MaxPerCluster == nil {
@@ -115,7 +108,7 @@ func validateSplitCeilings(spec *v1beta1.InferenceServiceSpec) error {
 			return fmt.Errorf("spec.placement.split.maxPerCluster.%s names a component the service does not declare", key.component)
 		}
 	}
-	if c.Router != nil && (p.Mode != v1beta1.PlacementModeSplit || !affinity.DividesRouters(p.ClusterAffinity)) {
+	if c.Router != nil && p.Mode != v1beta1.PlacementModeSplit {
 		return fmt.Errorf("spec.placement.split.maxPerCluster.router applies only when Split divides the routers")
 	}
 	return nil
@@ -138,9 +131,6 @@ func validateComponentWeights(spec *v1beta1.InferenceServiceSpec) error {
 			{component: "engine", set: term.Weights.Engine != nil, declared: spec.Engine != nil},
 			{component: "decoder", set: term.Weights.Decoder != nil, declared: spec.Decoder != nil},
 			{component: "router", set: term.Weights.Router != nil, declared: spec.Router != nil},
-			{component: "engineReplicas", set: term.Weights.EngineReplicas != nil, declared: spec.Engine != nil},
-			{component: "decoderReplicas", set: term.Weights.DecoderReplicas != nil, declared: spec.Decoder != nil},
-			{component: "routerReplicas", set: term.Weights.RouterReplicas != nil, declared: spec.Router != nil},
 		} {
 			if weight.set && !weight.declared {
 				return fmt.Errorf("spec.placement.clusterAffinity[%d].weights.%s names a component the service does not declare", i, weight.component)
@@ -148,9 +138,6 @@ func validateComponentWeights(spec *v1beta1.InferenceServiceSpec) error {
 		}
 	}
 	if spec.Router != nil && spec.Placement.Mode == v1beta1.PlacementModeSplit && affinity.DividesRouters(terms) && (spec.Router.MinReplicas == nil || *spec.Router.MinReplicas <= 0) {
-		if affinity.UsesRatios(terms) {
-			return fmt.Errorf("Split divides router.minReplicas across clusters when a term sets weights.defaultReplicas or weights.routerReplicas; set a positive router.minReplicas")
-		}
 		return fmt.Errorf("Split divides router.minReplicas across clusters when no term sets weights, or when a term sets weights.default or weights.router; set a positive router.minReplicas")
 	}
 	return nil

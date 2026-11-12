@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	knapis "knative.dev/pkg/apis"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -156,8 +157,8 @@ func TestAggregateIRStatus_OMENative_CopiesStatusFromIR(t *testing.T) {
 	g.Expect(om.LabelSelector).To(gomega.ContainSubstring("component=engine"))
 	g.Expect(om.CollisionCount).NotTo(gomega.BeNil())
 	g.Expect(*om.CollisionCount).To(gomega.Equal(int32(0)))
-	// Per-Instance detail is deliberately NOT projected onto the ISVC summary;
-	// the authoritative source is the IR, read via ComponentIRStatus.
+	// Per-Instance detail is not projected onto the ISVC summary: consumers
+	// read the rows off the replica through DecodedComponentIRFor.
 	g.Expect(om.Conditions).To(gomega.HaveLen(1))
 	g.Expect(om.Conditions[0].Type).To(gomega.Equal("Available"))
 
@@ -686,8 +687,8 @@ func TestAggregateIRStatus_ObservedGenerationTracksParentStamp(t *testing.T) {
 // aliasing guard for the fields the projector still copies. The
 // CollisionCount pointer must be a fresh allocation so downstream
 // mutations of the ISVC summary don't clobber the IR's source-of-truth.
-// (Per-Instance detail is not projected onto the summary — the IR is read
-// directly via ComponentIRStatus.)
+// (Per-Instance detail is not projected onto the summary: consumers read
+// the rows off the replica through DecodedComponentIRFor.)
 func TestIrStatusToComponentStatus_DeepCopiesCollisionCount(t *testing.T) {
 	g := gomega.NewWithT(t)
 	ir := &v1beta1.InferenceReplica{
@@ -705,4 +706,116 @@ func TestIrStatusToComponentStatus_DeepCopiesCollisionCount(t *testing.T) {
 	*out.CollisionCount = 99
 	g.Expect(*ir.Status.CollisionCount).To(gomega.Equal(int32(5)),
 		"mutating the output CollisionCount must NOT alias back to the IR")
+}
+
+// decoderIR returns a decoder replica of the given size with the given number
+// of Instances serving; the rest never came up.
+func decoderIR(parentName, namespace string, replicas, serving int32) *v1beta1.InferenceReplica {
+	cc := int32(0)
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       parentName + "-decoder",
+			Namespace:  namespace,
+			Generation: 1,
+			Annotations: map[string]string{
+				constants.InferenceReplicaControllerWriteAnnotationKey:  constants.InferenceReplicaControllerWriteAnnotationVal,
+				constants.InferenceReplicaParentGenerationAnnotationKey: "1",
+			},
+		},
+		Spec: v1beta1.InferenceReplicaSpec{
+			ParentRef: &v1beta1.ParentReference{Name: parentName},
+			Component: v1beta1.DecoderComponent,
+			Replicas:  &replicas,
+		},
+		Status: v1beta1.InferenceReplicaStatus{
+			ObservedGeneration:   1,
+			Replicas:             replicas,
+			ReadyReplicas:        serving,
+			ServingReplicas:      serving,
+			AvailableReplicas:    serving,
+			UpdatedReplicas:      replicas,
+			UpdatedReadyReplicas: serving,
+			CurrentRevision:      parentName + "-decoder-def456",
+			UpdateRevision:       parentName + "-decoder-def456",
+			CollisionCount:       &cc,
+			LabelSelector:        "ome.io/inferenceservice=" + parentName + ",component=decoder,ome.io/managed-by=OMENative",
+		},
+	}
+	for i := int32(0); i < replicas; i++ {
+		row := v1beta1.OMENativeInstanceStatus{Index: i, Incarnation: 1, Phase: v1beta1.OMENativeInstancePending, PodCount: 1}
+		if i < serving {
+			row.Phase = v1beta1.OMENativeInstanceReady
+			row.ReadyPodCount, row.ServingPodCount, row.AvailablePodCount = 1, 1, 1
+		}
+		ir.Status.InstanceStatuses = append(ir.Status.InstanceStatuses, row)
+	}
+	return ir
+}
+
+// TestAggregateIRStatus_ReadyWaitsForTheDecoder: 12 engines serve beside 8
+// decoders whose image cannot be pulled. The route is up, but the engine side
+// alone does not make the service Ready. The service is not Ready until
+// the decoders serve, and Ready says which Component it waits on.
+func TestAggregateIRStatus_ReadyWaitsForTheDecoder(t *testing.T) {
+	g := gomega.NewWithT(t)
+	isvc := baselineISVC("llama", "prod")
+	engines, decoders := 12, 8
+	isvc.Spec.Engine.MinReplicas = &engines
+	isvc.Spec.Decoder = &v1beta1.DecoderSpec{
+		ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &decoders},
+	}
+	// The ingress reconciler already reported the route up on an earlier pass.
+	isvc.Status.SetCondition(v1beta1.IngressReady, &knapis.Condition{Type: v1beta1.IngressReady, Status: corev1.ConditionTrue, Reason: "IngressDisabled"})
+
+	c := fakeclient.New(t,
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}),
+		fakeclient.WithObjects(isvc, liveIR("llama", "prod", 12), decoderIR("llama", "prod", 8, 0)))
+	componentModes := map[v1beta1.ComponentType]constants.DeploymentModeType{
+		v1beta1.EngineComponent:  constants.OMENative,
+		v1beta1.DecoderComponent: constants.OMENative,
+	}
+	g.Expect(AggregateIRStatus(context.Background(), c, c, isvc, componentModes)).To(gomega.Succeed())
+
+	got := &v1beta1.InferenceService{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, got)).To(gomega.Succeed())
+	g.Expect(got.Status.GetCondition(v1beta1.EngineReady).Status).To(gomega.Equal(corev1.ConditionTrue), "12 of 12 engines serve")
+	decoderCond := got.Status.GetCondition(v1beta1.DecoderReady)
+	g.Expect(decoderCond).NotTo(gomega.BeNil())
+	g.Expect(decoderCond.Status).To(gomega.Equal(corev1.ConditionFalse), "0 of 8 decoders serve")
+
+	ready := got.Status.GetCondition(knapis.ConditionReady)
+	g.Expect(ready).NotTo(gomega.BeNil())
+	g.Expect(ready.Status).To(gomega.Equal(corev1.ConditionFalse),
+		"the service cannot answer a request while no decoder serves, so it must not read Ready")
+	g.Expect(ready.Reason).To(gomega.Equal(decoderCond.Reason), "Ready names the Component it waits on")
+	g.Expect(ready.Message).To(gomega.Equal(decoderCond.Message))
+	g.Expect(isvc.Status.IsReady()).To(gomega.BeFalse(), "the pass's own copy must agree with what was written")
+
+	// Once the decoders serve, the same pass reads the service Ready.
+	fresh := decoderIR("llama", "prod", 8, 8)
+	live := &v1beta1.InferenceReplica{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: fresh.Name, Namespace: fresh.Namespace}, live)).To(gomega.Succeed())
+	live.Status = fresh.Status
+	g.Expect(c.Status().Update(context.Background(), live)).To(gomega.Succeed())
+	g.Expect(AggregateIRStatus(context.Background(), c, c, isvc, componentModes)).To(gomega.Succeed())
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, got)).To(gomega.Succeed())
+	g.Expect(got.Status.IsReady()).To(gomega.BeTrue(), "every declared Component serves and the route is up")
+}
+
+// TestAggregateIRStatus_EngineOnlyServiceReadsReadyOnTheEngine: a service with
+// no decoder or router keeps reading Ready on its engine and its route alone.
+func TestAggregateIRStatus_EngineOnlyServiceReadsReadyOnTheEngine(t *testing.T) {
+	g := gomega.NewWithT(t)
+	isvc := baselineISVC("llama", "prod")
+	isvc.Status.SetCondition(v1beta1.IngressReady, &knapis.Condition{Type: v1beta1.IngressReady, Status: corev1.ConditionTrue, Reason: "IngressDisabled"})
+	c := fakeclient.New(t,
+		fakeclient.WithStatusSubresource(&v1beta1.InferenceService{}, &v1beta1.InferenceReplica{}),
+		fakeclient.WithObjects(isvc, liveIR("llama", "prod", 2)))
+	g.Expect(AggregateIRStatus(context.Background(), c, c, isvc, engineOMENativeModes)).To(gomega.Succeed())
+
+	got := &v1beta1.InferenceService{}
+	g.Expect(c.Get(context.Background(), types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, got)).To(gomega.Succeed())
+	g.Expect(got.Status.IsReady()).To(gomega.BeTrue())
+	g.Expect(got.Status.GetCondition(v1beta1.DecoderReady)).To(gomega.BeNil())
+	g.Expect(got.Status.GetCondition(v1beta1.RouterReady)).To(gomega.BeNil())
 }

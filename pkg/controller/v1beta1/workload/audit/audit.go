@@ -1,5 +1,5 @@
-// Package audit owns the per-owner migration ledger persisted as a
-// ConfigMap. The ledger lives outside the controller process so UUID
+// Package audit owns the per-owner migration record, the Ledger, persisted
+// as a ConfigMap. The record lives outside the controller process so UUID
 // dedup, in-flight resume, and capacity gating survive controller
 // restarts and requester retries.
 //
@@ -8,7 +8,7 @@
 // ValidateCapacity reads) and is owner-agnostic — callers pass the
 // owner metav1.Object and its GroupVersionKind explicitly, so this
 // package does not import the project's v1beta1 type set. The
-// "ome.io/managed-by=OMENative" label it stamps on the ConfigMap
+// "ome.io/managed-by=OMENative" label it writes on the ConfigMap
 // matches the value other workload subpackages use; the owner-specific
 // GVK is passed through from the adapter rather than recomputed here.
 package audit
@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -33,8 +34,7 @@ import (
 const (
 	// MigrationRequestAnnotationPrefix is the canonical key prefix a migration
 	// requester uses to write migration requests onto the InferenceService. The
-	// suffix is the request UUID and is what's recorded in the audit
-	// ledger for dedup.
+	// suffix is the request UUID and is what the Ledger records for dedup.
 	MigrationRequestAnnotationPrefix = "ome.io/migration-request-v1-"
 
 	// SchemaV1 is the only schemaVersion currently understood. Requests
@@ -42,8 +42,8 @@ const (
 	SchemaV1 = "v1"
 
 	// ConfigMapNameSuffix is appended to the owner name to form the audit
-	// ConfigMap name. One CM per owner keeps blast radius small and
-	// matches the parent's namespace + lifecycle automatically via
+	// ConfigMap name. One ConfigMap per owner keeps a write to one owner's
+	// record, and follows the owner's namespace and lifecycle through the
 	// OwnerReference cascade.
 	ConfigMapNameSuffix = "-ome-migration-audit"
 
@@ -56,10 +56,10 @@ const (
 	PhaseCompleted = "Completed"
 	PhaseFailed    = "Failed"
 
-	// labelManagedBy / managedByValue are stamped on the audit
+	// labelManagedBy / managedByValue are written on the audit
 	// ConfigMap so cluster-side selectors (and the controller's own
-	// label-based queries) recognize it as OMENative-owned. Duplicated
-	// from render.go's constants — same string, same intent.
+	// label-based queries) recognize it as OMENative-owned. The same
+	// string the renderer writes on the objects it owns.
 	labelManagedBy = "ome.io/managed-by"
 	managedByValue = "OMENative"
 )
@@ -84,7 +84,7 @@ type MigrationRequest struct {
 	RequestedBy     string   `json:"requested_by,omitempty"`
 }
 
-// Entry is one row of the per-owner migration ledger. Stored in the
+// Entry is one row of the per-owner migration record. Stored in the
 // audit ConfigMap; persists across controller restarts so UUID dedup
 // outlives the in-memory expectations cache.
 type Entry struct {
@@ -95,13 +95,13 @@ type Entry struct {
 	Phase          string `json:"phase"`
 	Reason         string `json:"reason,omitempty"`
 	FromNode       string `json:"fromNode,omitempty"`
-	// Revision is the ControllerRevision an AutoRecover directive's
-	// attempt was converging toward. The node exclusion the directive
-	// projects binds rebuilds at that revision only; a directive with no
+	// Revision is the ControllerRevision an AutoRecover record's
+	// attempt was converging toward. The node exclusion the record
+	// projects binds rebuilds at that revision only; a record with no
 	// revision keeps its place in the budget and the audit trail but
 	// excludes nothing.
 	Revision string `json:"revision,omitempty"`
-	// Released marks an AutoRecover directive whose exclusion was let go:
+	// Released marks an AutoRecover record whose exclusion was let go:
 	// a rebuild rendered with it found no node with room. The entry keeps
 	// its place in the budget and the audit trail but excludes nothing.
 	Released bool `json:"released,omitempty"`
@@ -135,16 +135,16 @@ func (e Entry) InFlight() bool {
 }
 
 // Ledger is the in-memory shape of the audit ConfigMap's history.json
-// payload.
+// payload: the owner's migration record.
 type Ledger struct {
 	Entries []Entry `json:"entries"`
 
-	// loadedResourceVersion pins persists to the ConfigMap state this
-	// ledger was loaded from. PersistLedgerForOwner writes against it so
-	// a concurrent writer (sibling IR on the shared parent CM) surfaces
-	// as a 409 for the caller's reconcile/retry loop to reload and
-	// re-apply, instead of being silently blob-overwritten. Empty means
-	// the ConfigMap did not exist at load time.
+	// loadedResourceVersion is the ConfigMap revision this record was
+	// loaded from. PersistLedgerForOwner writes against it so a concurrent
+	// writer (a sibling IR on the shared parent ConfigMap) surfaces as a
+	// 409 for the caller's reconcile/retry loop to reload and re-apply,
+	// instead of being silently overwritten. Empty means the ConfigMap did
+	// not exist at load time.
 	loadedResourceVersion string
 }
 
@@ -183,9 +183,9 @@ func ConfigMapNameForOwner(owner metav1.Object) string {
 }
 
 // LoadLedgerForOwner fetches the per-owner audit ConfigMap and parses
-// its history.json payload. Returns an empty ledger (and no error) when
+// its history.json payload. Returns an empty record (and no error) when
 // the ConfigMap doesn't exist yet — first migration on this owner.
-// The returned ledger remembers the ConfigMap revision it was loaded
+// The returned record remembers the ConfigMap revision it was loaded
 // at; PersistLedgerForOwner writes against that revision (CAS).
 // Owner is held as metav1.Object so this helper is owner-agnostic; the
 // ISVC adapter and the IR adapter use the same persistence path.
@@ -210,7 +210,7 @@ func LoadLedgerForOwner(ctx context.Context, reads client.Reader, owner metav1.O
 	return &l, nil
 }
 
-// HasCompletedOrFailedRequest reports whether the ledger already
+// HasCompletedOrFailedRequest reports whether the record already
 // terminally records this UUID as a MIGRATION. Both Completed and
 // Failed are terminal — a re-delivered request with the same UUID is a
 // no-op regardless of outcome. ForceDelete rows share the RequestUUID
@@ -220,39 +220,29 @@ func LoadLedgerForOwner(ctx context.Context, reads client.Reader, owner metav1.O
 // positive reason match) because migration rows carry the requester's
 // free-form Reason, often empty.
 func (l *Ledger) HasCompletedOrFailedRequest(uuid string) bool {
-	for _, e := range l.Entries {
-		if e.RequestUUID != uuid || e.Reason == ReasonForceDelete {
-			continue
-		}
-		if e.Terminal() {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(l.Entries, func(e Entry) bool {
+		return e.RequestUUID == uuid && e.Reason != ReasonForceDelete && e.Terminal()
+	})
 }
 
 // InFlightEntry returns a copy of the in-progress entry for uuid, or
-// nil when the ledger has no Started-but-not-yet-terminal entry for
+// nil when the record has no Started-but-not-yet-terminal entry for
 // this UUID. Used by the migration state machine to resume across
 // reconciles. A copy — not an interior pointer — because trim and
 // UpsertEntry compact Entries in place, which would re-point an
 // aliasing pointer at a different row; write changes back through
 // UpsertEntry.
 func (l *Ledger) InFlightEntry(uuid string) *Entry {
-	for i := range l.Entries {
-		if l.Entries[i].RequestUUID != uuid {
-			continue
-		}
-		if l.Entries[i].InFlight() {
-			e := l.Entries[i]
-			return &e
-		}
+	i := slices.IndexFunc(l.Entries, func(e Entry) bool { return e.RequestUUID == uuid && e.InFlight() })
+	if i < 0 {
+		return nil
 	}
-	return nil
+	e := l.Entries[i]
+	return &e
 }
 
 // InFlightEntryOrSeed returns the in-flight Started entry, synthesizing
-// one if missing — covers the case where the ledger was lost between
+// one if missing — covers the case where the record was lost between
 // writes. Keeps the terminal append in Migrate's tail simple.
 func (l *Ledger) InFlightEntryOrSeed(uuid string, req *MigrationRequest, surgeIdx int32) *Entry {
 	if e := l.InFlightEntry(uuid); e != nil {
@@ -263,7 +253,7 @@ func (l *Ledger) InFlightEntryOrSeed(uuid string, req *MigrationRequest, surgeId
 }
 
 // maxTerminalEntries caps the number of terminal (Completed / Failed)
-// entries the ledger retains. ConfigMaps are capped at 1 MiB; a terminal
+// entries the record retains. ConfigMaps are capped at 1 MiB; a terminal
 // entry is ~280 bytes, so ~3700 entries fit and 200 is well clear of the
 // cap while still preserving plenty of dedup history. In-flight Started
 // entries are NEVER truncated — dropping them would lose the resume
@@ -272,63 +262,56 @@ const maxTerminalEntries = 200
 
 // UpsertEntry adds the entry if its UUID is new, or replaces the
 // existing same-UUID entry in place. Last-writer-wins on Phase / Outcome
-// for the lifetime of one migration. After mutation the ledger is
-// ring-buffer-trimmed: every Started entry is kept, and only the most
-// recent maxTerminalEntries terminal entries survive.
+// for the lifetime of one migration. After mutation the record is
+// trimmed: every Started entry is kept, and only the most recent
+// maxTerminalEntries terminal entries survive.
 func (l *Ledger) UpsertEntry(entry Entry) {
-	for i := range l.Entries {
-		if l.Entries[i].RequestUUID == entry.RequestUUID {
-			l.Entries[i] = entry
-			l.trim()
-			return
-		}
+	i := slices.IndexFunc(l.Entries, func(e Entry) bool { return e.RequestUUID == entry.RequestUUID })
+	if i >= 0 {
+		l.Entries[i] = entry
+	} else {
+		l.Entries = append(l.Entries, entry)
 	}
-	l.Entries = append(l.Entries, entry)
 	l.trim()
 }
 
-// trim drops the oldest terminal entries when the count exceeds the
-// configured cap. Started entries are protected — losing one would
-// strand an in-flight migration that crashed before its destructive
-// step recorded a terminal Completed/Failed row.
+// trim drops the oldest terminal entries when their count exceeds the
+// cap. Started entries are kept: losing one would strand an in-flight
+// migration that crashed before its destructive step recorded a
+// terminal Completed/Failed row.
 func (l *Ledger) trim() {
-	var terminal []int
-	for i, e := range l.Entries {
+	terminal := 0
+	for _, e := range l.Entries {
 		if e.Terminal() {
-			terminal = append(terminal, i)
+			terminal++
 		}
 	}
-	overflow := len(terminal) - maxTerminalEntries
+	overflow := terminal - maxTerminalEntries
 	if overflow <= 0 {
 		return
 	}
-	drop := make(map[int]struct{}, overflow)
-	for _, i := range terminal[:overflow] {
-		drop[i] = struct{}{}
-	}
-	kept := l.Entries[:0]
-	for i, e := range l.Entries {
-		if _, gone := drop[i]; gone {
-			continue
+	l.Entries = slices.DeleteFunc(l.Entries, func(e Entry) bool {
+		if overflow == 0 || !e.Terminal() {
+			return false
 		}
-		kept = append(kept, e)
-	}
-	l.Entries = kept
+		overflow--
+		return true
+	})
 }
 
-// PersistLedgerForOwner writes the ledger back to the per-owner audit
-// ConfigMap. Creates the CM on first call stamped with the OMENative-
-// managed-by label + a controller OwnerReference back to the owner so
+// PersistLedgerForOwner writes the record back to the per-owner audit
+// ConfigMap. Creates the ConfigMap on first call with the OMENative
+// managed-by label and a controller OwnerReference back to the owner, so
 // the cluster GC sweeps it when the owner is deleted.
 //
-// Writes are compare-and-swap against the ConfigMap state the ledger
+// Writes are compare-and-swap against the ConfigMap state the record
 // was loaded from: a concurrent writer's persist (or a create race)
 // returns a Conflict error instead of silently erasing the other
 // writer's entries. Callers inherit the retry via their reconcile
 // requeue (or an explicit retry.RetryOnConflict around load+mutate+
 // persist): reload, re-apply the mutation, persist again. A successful
-// persist re-pins the ledger to the written revision, so sequential
-// persists of the same in-memory ledger within one pass keep working.
+// persist moves the record to the written revision, so sequential
+// persists of the same in-memory record within one pass keep working.
 //
 // Owner is held as metav1.Object and the OwnerReference GVK is passed
 // explicitly so the workload package stays free of CRD-specific imports;
@@ -346,53 +329,69 @@ func PersistLedgerForOwner(
 	}
 	key := client.ObjectKey{Namespace: owner.GetNamespace(), Name: ConfigMapNameForOwner(owner)}
 
+	var written string
 	if l.loadedResourceVersion == "" {
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:            key.Name,
-				Namespace:       key.Namespace,
-				Labels:          map[string]string{labelManagedBy: managedByValue},
-				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, gvk)},
-			},
-			Data: map[string]string{LedgerKey: string(raw)},
-		}
-		if err := c.Create(ctx, cm); err != nil {
-			if apierrors.IsAlreadyExists(err) {
-				return apierrors.NewConflict(corev1.Resource("configmaps"), key.Name,
-					fmt.Errorf("audit configmap created concurrently since ledger load"))
-			}
-			return fmt.Errorf("create audit configmap %s: %w", key.Name, err)
-		}
-		l.loadedResourceVersion = cm.ResourceVersion
-		return nil
+		written, err = createLedgerConfigMap(ctx, c, owner, gvk, key, raw)
+	} else {
+		written, err = updateLedgerConfigMap(ctx, c, owner, gvk, key, raw, l.loadedResourceVersion)
 	}
+	if err != nil {
+		return err
+	}
+	l.loadedResourceVersion = written
+	return nil
+}
 
+// createLedgerConfigMap creates the audit ConfigMap for a record loaded
+// when none existed and returns the written revision. A ConfigMap that
+// appeared since the load is a Conflict: the caller reloads.
+func createLedgerConfigMap(ctx context.Context, c client.Client, owner metav1.Object, gvk schema.GroupVersionKind, key client.ObjectKey, raw []byte) (string, error) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            key.Name,
+			Namespace:       key.Namespace,
+			Labels:          map[string]string{labelManagedBy: managedByValue},
+			OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(owner, gvk)},
+		},
+		Data: map[string]string{LedgerKey: string(raw)},
+	}
+	if err := c.Create(ctx, cm); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			return "", apierrors.NewConflict(corev1.Resource("configmaps"), key.Name,
+				fmt.Errorf("audit configmap created concurrently since ledger load"))
+		}
+		return "", fmt.Errorf("create audit configmap %s: %w", key.Name, err)
+	}
+	return cm.ResourceVersion, nil
+}
+
+// updateLedgerConfigMap writes the record into the live ConfigMap against
+// the revision it was loaded at and returns the written revision. A
+// ConfigMap deleted since the load (the owner's teardown cascade) is a
+// Conflict: a reload decides whether recreating it is still meaningful.
+func updateLedgerConfigMap(ctx context.Context, c client.Client, owner metav1.Object, gvk schema.GroupVersionKind, key client.ObjectKey, raw []byte, loadedResourceVersion string) (string, error) {
 	cm := &corev1.ConfigMap{}
 	if err := c.Get(ctx, key, cm); err != nil {
 		if apierrors.IsNotFound(err) {
-			// Deleted since load (owner teardown cascade); a reload
-			// decides whether recreating is still meaningful.
-			return apierrors.NewConflict(corev1.Resource("configmaps"), key.Name,
+			return "", apierrors.NewConflict(corev1.Resource("configmaps"), key.Name,
 				fmt.Errorf("audit configmap deleted since ledger load"))
 		}
-		return fmt.Errorf("get audit configmap %s: %w", key.Name, err)
+		return "", fmt.Errorf("get audit configmap %s: %w", key.Name, err)
 	}
 	if cm.Data == nil {
 		cm.Data = map[string]string{}
 	}
 	cm.Data[LedgerKey] = string(raw)
-	// Claim ownership when we land on a pre-existing CM without our
-	// controller ref; without this we'd happily write to a CM the
-	// cluster GC won't sweep when the owner is deleted.
+	// A pre-existing ConfigMap without our controller ref is claimed, or
+	// the cluster GC would never sweep it when the owner is deleted.
 	claimControllerRef(ctx, cm, owner, gvk)
-	// CAS anchor: write against the revision the ledger was loaded at,
-	// not whatever Get just returned.
-	cm.ResourceVersion = l.loadedResourceVersion
+	// The write is against the revision the record was loaded at, not
+	// whatever Get just returned.
+	cm.ResourceVersion = loadedResourceVersion
 	if err := c.Update(ctx, cm); err != nil {
-		return fmt.Errorf("update audit configmap %s: %w", key.Name, err)
+		return "", fmt.Errorf("update audit configmap %s: %w", key.Name, err)
 	}
-	l.loadedResourceVersion = cm.ResourceVersion
-	return nil
+	return cm.ResourceVersion, nil
 }
 
 // claimControllerRef ensures the ConfigMap carries exactly one
@@ -433,7 +432,7 @@ func hasControllerRefForOwner(obj metav1.Object, owner metav1.Object) bool {
 	return false
 }
 
-// NewStartedEntry constructs a freshly-Started ledger row from a
+// NewStartedEntry constructs a freshly-Started row from a
 // validated request. StartedAt prefers req.RequestedAt so duration
 // graphs (CompletedAt - StartedAt) reflect the requester's accept-time rather
 // than the controller's processing-time; falls back to now when the
@@ -482,14 +481,14 @@ func NewTerminalEntry(prev Entry, phase, outcome string) Entry {
 //
 //   - in-flight = non-terminal records whose surge is ALLOCATED
 //     (SurgeInstance set). Terminal records (Completed / Failed /
-//     Relocated) free their slot structurally — the wedged-Started-row
-//     capacity leak cannot exist.
+//     Relocated) free their slot by their phase alone, whether or not
+//     their surge index was cleared.
 //   - per-window = records of ANY phase with AllocatedAt inside the
 //     policy's trailing window. A nil AllocatedAt (queued, or an Auto
 //     record that never allocates a surge) never counts.
 //
 // The two caps are independent — either tripping rejects the request.
-// `now` is injected so tests can pin a deterministic time and walk the
+// `now` is injected so tests can fix a deterministic time and walk the
 // trailing window past the relevant records.
 //
 // A nil policy (no lifecycle.audit) is not admissible: the caps are the
@@ -500,10 +499,20 @@ func ValidateCapacity(policy *types.MigrationAuditPolicy, records []types.Migrat
 	if policy == nil {
 		return false, "migration capacity policy unconfigured (no lifecycle.audit)"
 	}
-	inFlight := int32(0)
-	allocatedInWindow := int32(0)
-	windowStart := now.Add(-policy.Window)
+	inFlight, allocatedInWindow := otherWork(records, requestUUID, now.Add(-policy.Window))
+	if inFlight >= policy.MaxInFlight {
+		return false, fmt.Sprintf("in-flight migration cap reached (%d/%d)", inFlight, policy.MaxInFlight)
+	}
+	if allocatedInWindow >= policy.MaxPerWindow {
+		return false, fmt.Sprintf("migration rate cap reached (%d/%d in the last %s)", allocatedInWindow, policy.MaxPerWindow, policy.Window)
+	}
+	return true, ""
+}
 
+// otherWork counts, over every record but the request's own, the
+// migrations in flight with a surge allocated and the records allocated
+// after windowStart.
+func otherWork(records []types.MigrationRecord, requestUUID string, windowStart time.Time) (inFlight, allocatedInWindow int32) {
 	for i := range records {
 		r := &records[i]
 		if r.RequestUUID == requestUUID {
@@ -516,18 +525,11 @@ func ValidateCapacity(policy *types.MigrationAuditPolicy, records []types.Migrat
 			allocatedInWindow++
 		}
 	}
-
-	if inFlight >= policy.MaxInFlight {
-		return false, fmt.Sprintf("in-flight migration cap reached (%d/%d)", inFlight, policy.MaxInFlight)
-	}
-	if allocatedInWindow >= policy.MaxPerWindow {
-		return false, fmt.Sprintf("migration rate cap reached (%d/%d in the last %s)", allocatedInWindow, policy.MaxPerWindow, policy.Window)
-	}
-	return true, ""
+	return inFlight, allocatedInWindow
 }
 
 // parseTime parses the RFC3339-formatted StartedAt / CompletedAt strings
-// the audit ledger uses; the layout also accepts fractional seconds when
+// the record uses; the layout also accepts fractional seconds when
 // parsing. Returns (zero, false) on parse error so the caller can choose
 // to skip rather than treat a malformed timestamp as "very old" or "very
 // recent".

@@ -70,67 +70,104 @@ func ParseOMENativeStatusConfig(configMap *v1.ConfigMap) (*OMENativeStatusConfig
 }
 
 func decodeOMENativeStatusConfig(raw string) (*OMENativeStatusConfig, error) {
-	decoder := json.NewDecoder(strings.NewReader(raw))
-	if err := expectDelim(decoder, '{'); err != nil {
+	fields, err := readOMENativeStatusFields(json.NewDecoder(strings.NewReader(raw)))
+	if err != nil {
 		return nil, err
 	}
-	var (
-		encoding *string
-		bound    *int64
-	)
+	return fields.config()
+}
+
+// omenativeStatusFields is the block as written, each field present or
+// absent, before the values are checked against each other.
+type omenativeStatusFields struct {
+	encoding *string
+	bound    *int64
+}
+
+// readOMENativeStatusFields reads one JSON object holding the block's fields
+// and nothing else: no unknown or repeated field, nothing after the closing
+// brace.
+func readOMENativeStatusFields(decoder *json.Decoder) (omenativeStatusFields, error) {
+	var fields omenativeStatusFields
+	if err := expectDelim(decoder, '{'); err != nil {
+		return fields, err
+	}
 	seen := map[string]struct{}{}
 	for decoder.More() {
-		token, err := decoder.Token()
+		key, err := readFieldName(decoder, seen)
 		if err != nil {
-			return nil, fmt.Errorf("malformed JSON object: %w", err)
+			return fields, err
 		}
-		key, ok := token.(string)
-		if !ok {
-			return nil, fmt.Errorf("malformed JSON object: expected a field name, got %v", token)
-		}
-		if _, dup := seen[key]; dup {
-			return nil, fmt.Errorf("duplicate field %q", key)
-		}
-		seen[key] = struct{}{}
-		switch key {
-		case omenativeStatusEncodingField:
-			var value string
-			if err := decoder.Decode(&value); err != nil {
-				return nil, fmt.Errorf("%s must be a string: %w", key, err)
-			}
-			encoding = &value
-		case omenativeStatusBoundField:
-			var value int64
-			if err := decoder.Decode(&value); err != nil {
-				return nil, fmt.Errorf("%s must be a positive integer: %w", key, err)
-			}
-			bound = &value
-		default:
-			return nil, fmt.Errorf("unknown field %q", key)
+		if err := fields.read(decoder, key); err != nil {
+			return fields, err
 		}
 	}
 	if err := expectDelim(decoder, '}'); err != nil {
-		return nil, err
+		return fields, err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		return nil, errors.New("trailing data after the JSON object")
+		return fields, errors.New("trailing data after the JSON object")
 	}
+	return fields, nil
+}
 
-	if encoding == nil {
+// readFieldName reads the next field name of the object and refuses one
+// read before.
+func readFieldName(decoder *json.Decoder, seen map[string]struct{}) (string, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return "", fmt.Errorf("malformed JSON object: %w", err)
+	}
+	key, ok := token.(string)
+	if !ok {
+		return "", fmt.Errorf("malformed JSON object: expected a field name, got %v", token)
+	}
+	if _, dup := seen[key]; dup {
+		return "", fmt.Errorf("duplicate field %q", key)
+	}
+	seen[key] = struct{}{}
+	return key, nil
+}
+
+// read decodes the value of one field into its place; an unknown field is
+// refused.
+func (f *omenativeStatusFields) read(decoder *json.Decoder, key string) error {
+	switch key {
+	case omenativeStatusEncodingField:
+		var value string
+		if err := decoder.Decode(&value); err != nil {
+			return fmt.Errorf("%s must be a string: %w", key, err)
+		}
+		f.encoding = &value
+	case omenativeStatusBoundField:
+		var value int64
+		if err := decoder.Decode(&value); err != nil {
+			return fmt.Errorf("%s must be a positive integer: %w", key, err)
+		}
+		f.bound = &value
+	default:
+		return fmt.Errorf("unknown field %q", key)
+	}
+	return nil
+}
+
+// config checks the fields against each other: the encoding is required and
+// must be one the status writer targets, a bound present must be positive,
+// and ColumnarV2 requires the bound.
+func (f omenativeStatusFields) config() (*OMENativeStatusConfig, error) {
+	if f.encoding == nil {
 		return nil, fmt.Errorf("%s is required (%s or %s)", omenativeStatusEncodingField, irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2)
 	}
-	target := irstatus.Encoding(*encoding)
-	switch target {
-	case irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2:
-	default:
-		return nil, fmt.Errorf("%s %q is not supported; use %s or %s", omenativeStatusEncodingField, *encoding, irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2)
+	target := irstatus.Encoding(*f.encoding)
+	if target != irstatus.EncodingDenseV1 && target != irstatus.EncodingColumnarV2 {
+		return nil, fmt.Errorf("%s %q is not supported; use %s or %s", omenativeStatusEncodingField, *f.encoding, irstatus.EncodingDenseV1, irstatus.EncodingColumnarV2)
 	}
 	cfg := &OMENativeStatusConfig{InstanceStatusEncoding: target}
-	if bound != nil {
-		if *bound <= 0 {
-			return nil, fmt.Errorf("%s must be a positive integer, got %d", omenativeStatusBoundField, *bound)
+	if f.bound != nil {
+		if *f.bound <= 0 {
+			return nil, fmt.Errorf("%s must be a positive integer, got %d", omenativeStatusBoundField, *f.bound)
 		}
-		value := uint64(*bound)
+		value := uint64(*f.bound)
 		cfg.MaxDecodedInstances = &value
 	}
 	if target == irstatus.EncodingColumnarV2 && cfg.MaxDecodedInstances == nil {

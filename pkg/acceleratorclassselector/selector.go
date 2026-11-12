@@ -11,7 +11,6 @@ import (
 
 // defaultSelector is the default implementation of the Selector interface.
 type defaultSelector struct {
-	config  *Config
 	fetcher AcceleratorFetcher
 }
 
@@ -24,126 +23,135 @@ func New(client client.Client) Selector {
 // NewWithConfig creates a new Selector with the provided configuration.
 func NewWithConfig(config *Config) Selector {
 	return &defaultSelector{
-		config:  config,
 		fetcher: NewDefaultAcceleratorFetcher(config.Client),
 	}
 }
 
-// FetchAcceleratorClass fetches a specific accelerator class by name.
-func (s *defaultSelector) FetchAcceleratorClass(ctx context.Context, name string) (*v1beta1.AcceleratorClass, bool, error) {
-	return s.fetcher.GetAcceleratorClass(ctx, name)
-}
-
-// GetAcceleratorClass selects the best accelerator class for a given inference service, runtime, and component.
-// This is a convenience function that implements the original simple selection logic.
-// The selection follows this priority order:
-//  1. If runtime doesn't contain AcceleratorRequirements, return nil
-//  2. If runtime contains AcceleratorRequirements:
-//     a. For engine component: check if engine has AcceleratorOverride with AcceleratorClass
-//     b. For decoder component: check if decoder has AcceleratorOverride with AcceleratorClass
-//     c. If component doesn't have AcceleratorOverride, check if InferenceService has AcceleratorSelector with AcceleratorClass
-//     d. If InferenceService doesn't have AcceleratorClass in AcceleratorSelector, check if InferenceService has AcceleratorSelector with Policy
-//     e. Otherwise, won't provide AcceleratorClass
+// GetAcceleratorClass selects the accelerator class for one component of an
+// InferenceService on a runtime: nil when the runtime states no accelerator
+// requirements or nothing names or chooses a class, else the requested class
+// read by name; a name no class carries is an AcceleratorNotFoundError.
 func (s *defaultSelector) GetAcceleratorClass(ctx context.Context, isvc *v1beta1.InferenceService, runtime *v1beta1.ServingRuntimeSpec, component v1beta1.ComponentType) (*v1beta1.AcceleratorClass, string, error) {
-	logger := log.FromContext(ctx)
-	acName := ""
-	// 1. If runtime doesn't contain AcceleratorRequirements, return nil
 	if runtime == nil || runtime.AcceleratorRequirements == nil || runtime.AcceleratorRequirements.AcceleratorClasses == nil {
 		return nil, "", nil
 	}
-	logger.V(1).Info("Selecting accelerator class", "isvc", isvc.Name, "component", component)
-
-	if len(runtime.AcceleratorRequirements.AcceleratorClasses) > 0 {
-		// get accelerator class by name if specified.
-		if acceleratorClass := s.getAcceleratorClassByName(isvc, component); acceleratorClass != nil {
-			acName = *acceleratorClass
-		}
-		// if accelerator class didn't have name specified, try to get accelerator class by policy
-		// if policy is not specified, will skip getting acceleratorClass by policy
-		if acName == "" {
-			acceleratorPolicy := s.getComponentAcceleratorPolicy(isvc, component)
-			if acceleratorPolicy == "" {
-				logger.V(1).Info("No acceleratorClass name or policy set for component", "component", component, "inferenceService", isvc.Name)
-				return nil, "", nil
-			}
-			acceleratorClass, err := s.getAcceleratorClassByPolicy(ctx, isvc, runtime, acceleratorPolicy)
-			if err != nil {
-				return nil, "", err
-			}
-			if acceleratorClass != nil {
-				acName = *acceleratorClass
-			}
-		}
+	log.FromContext(ctx).V(1).Info("Selecting accelerator class", "isvc", isvc.Name, "component", component)
+	name, err := s.requestedClassName(ctx, isvc, runtime, component)
+	if err != nil || name == "" {
+		return nil, "", err
 	}
-
-	// fetch and return the selected accelerator class
-	if acName != "" {
-		ac, found, err := s.fetcher.GetAcceleratorClass(ctx, acName)
-		if err != nil {
-			logger.Error(err, "Failed to fetch accelerator class", "name", acName)
-			return nil, acName, err
-		}
-		if !found {
-			return nil, acName, &AcceleratorNotFoundError{AcceleratorClassName: acName}
-		}
-		return ac, acName, nil
-	}
-	return nil, "", nil
+	return s.fetchNamed(ctx, name)
 }
 
-// getAcceleratorClassByName checks for component-specific AcceleratorOverride or InferenceService-level AcceleratorSelector
-func (s *defaultSelector) getAcceleratorClassByName(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *string {
-	// Use the component-specific AcceleratorOverride as the default.
-	if acceleratorClass := s.getComponentAcceleratorOverride(isvc, component); acceleratorClass != nil {
-		return acceleratorClass
+// requestedClassName is the class the spec asks for the component: the name
+// its override or the service's selector states, else the class the stated
+// policy chooses among the runtime's candidates under the stated constraints.
+// "" when the runtime lists no classes or nothing names or chooses one.
+func (s *defaultSelector) requestedClassName(ctx context.Context, isvc *v1beta1.InferenceService, runtime *v1beta1.ServingRuntimeSpec, component v1beta1.ComponentType) (string, error) {
+	if len(runtime.AcceleratorRequirements.AcceleratorClasses) == 0 {
+		return "", nil
 	}
-
-	// Check InferenceService-level AcceleratorSelector if specified
-	if acceleratorClass := s.getInferenceServiceAcceleratorClass(isvc); acceleratorClass != nil {
-		return acceleratorClass
+	selectors := selectorsOf(isvc, component)
+	if name := statedClassName(selectors); name != nil && *name != "" {
+		return *name, nil
 	}
+	policy := statedPolicy(selectors)
+	if policy == "" {
+		log.FromContext(ctx).V(1).Info("No acceleratorClass name or policy set for component", "component", component, "inferenceService", isvc.Name)
+		return "", nil
+	}
+	chosen, err := s.getAcceleratorClassByPolicy(ctx, runtime, policy, statedConstraints(selectors))
+	if err != nil || chosen == nil {
+		return "", err
+	}
+	return *chosen, nil
+}
 
+// fetchNamed reads the class the spec asked for by name.
+func (s *defaultSelector) fetchNamed(ctx context.Context, name string) (*v1beta1.AcceleratorClass, string, error) {
+	ac, found, err := s.fetcher.GetAcceleratorClass(ctx, name)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to fetch accelerator class", "name", name)
+		return nil, name, err
+	}
+	if !found {
+		return nil, name, &AcceleratorNotFoundError{AcceleratorClassName: name}
+	}
+	return ac, name, nil
+}
+
+// selectorsOf lists the selectors that speak for the component, the most
+// specific first: the component's own override, then the service's selector.
+func selectorsOf(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) []*v1beta1.AcceleratorSelector {
+	if isvc == nil {
+		return nil
+	}
+	var selectors []*v1beta1.AcceleratorSelector
+	if view := v1beta1.SpecOf(&isvc.Spec, component); view != nil && view.AcceleratorOverride != nil {
+		selectors = append(selectors, view.AcceleratorOverride)
+	}
+	if isvc.Spec.AcceleratorSelector != nil {
+		selectors = append(selectors, isvc.Spec.AcceleratorSelector)
+	}
+	return selectors
+}
+
+// statedClassName is the class name of the first selector that states one,
+// nil when none does.
+func statedClassName(selectors []*v1beta1.AcceleratorSelector) *string {
+	for _, selector := range selectors {
+		if selector.AcceleratorClass != nil {
+			return selector.AcceleratorClass
+		}
+	}
 	return nil
 }
 
-// getAcceleratorClassByPolicy selects an accelerator class based on the specified policy
-// It fetches candidates from runtime.AcceleratorClasses, filters by InferenceService constraints,
-// and applies the policy's chooser.
-func (s *defaultSelector) getAcceleratorClassByPolicy(ctx context.Context, isvc *v1beta1.InferenceService, runtime *v1beta1.ServingRuntimeSpec, acceleratorPolicy v1beta1.AcceleratorSelectionPolicy) (*string, error) {
-	logger := log.FromContext(ctx)
-
-	// Return nil if policy is empty
-	if acceleratorPolicy == "" {
-		return nil, nil
+// statedPolicy is the selection policy of the first selector that states one,
+// "" when none does.
+func statedPolicy(selectors []*v1beta1.AcceleratorSelector) v1beta1.AcceleratorSelectionPolicy {
+	for _, selector := range selectors {
+		if selector.Policy != "" {
+			return selector.Policy
+		}
 	}
+	return ""
+}
 
-	// Fetch candidates from runtime.AcceleratorClasses (candidate pool).
-	// A read failure must fail the selection (and the reconcile) rather than
-	// silently render the component without its accelerator configuration.
-	candidates, err := s.getCandidateAccelerators(ctx, runtime)
+// statedConstraints is the constraints block of the first selector that
+// states one, nil when none does. The block is taken whole: an override's
+// block replaces the service's, it is not merged with it.
+func statedConstraints(selectors []*v1beta1.AcceleratorSelector) *v1beta1.AcceleratorConstraints {
+	for _, selector := range selectors {
+		if selector.Constraints != nil {
+			return selector.Constraints
+		}
+	}
+	return nil
+}
+
+// getAcceleratorClassByPolicy chooses among the runtime's classes under the
+// policy: the candidates are read, those the constraints exclude are dropped,
+// and the policy's chooser picks one against the same constraints. Nil when
+// none remains or the policy is unknown. A read failure fails the selection,
+// and with it the reconcile, rather than rendering the component without its
+// accelerator.
+func (s *defaultSelector) getAcceleratorClassByPolicy(ctx context.Context, runtime *v1beta1.ServingRuntimeSpec, acceleratorPolicy v1beta1.AcceleratorSelectionPolicy, constraints *v1beta1.AcceleratorConstraints) (*string, error) {
+	logger := log.FromContext(ctx)
+	candidates, err := candidatesFromNames(ctx, s.fetcher, runtime.AcceleratorRequirements.AcceleratorClasses)
 	if err != nil {
 		return nil, err
 	}
-
 	if len(candidates) == 0 {
 		logger.V(1).Info("No accelerator candidates available")
 		return nil, nil
 	}
 
-	// Get constraints from InferenceService
-	var constraints *v1beta1.AcceleratorConstraints
-	if isvc.Spec.AcceleratorSelector != nil {
-		constraints = isvc.Spec.AcceleratorSelector.Constraints
-	}
-
-	// Filter candidates by InferenceService constraints
 	validCandidates := filterCandidates(ctx, candidates, constraints)
-
 	if len(validCandidates) == 0 {
 		logger.V(1).Info("No candidates passed filtering", "policy", acceleratorPolicy)
 		return nil, nil
 	}
-
 	logger.V(1).Info("Candidates after filtering", "count", len(validCandidates), "policy", acceleratorPolicy)
 
 	choose, known := policies[acceleratorPolicy]
@@ -151,79 +159,6 @@ func (s *defaultSelector) getAcceleratorClassByPolicy(ctx context.Context, isvc 
 		return nil, nil
 	}
 	return choose(ctx, validCandidates, constraints), nil
-}
-
-// getComponentAcceleratorOverride checks if the specified component has an AcceleratorOverride with AcceleratorClass
-func (s *defaultSelector) getComponentAcceleratorOverride(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *string {
-	if override := componentAcceleratorOverride(isvc, component); override != nil {
-		return override.AcceleratorClass
-	}
-	return nil
-}
-
-// componentAcceleratorOverride is the AcceleratorOverride the InferenceService
-// sets on the component's own block, nil when it sets none or the component
-// has no such field.
-func componentAcceleratorOverride(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) *v1beta1.AcceleratorSelector {
-	if isvc == nil {
-		return nil
-	}
-	if view := v1beta1.SpecOf(&isvc.Spec, component); view != nil {
-		return view.AcceleratorOverride
-	}
-	return nil
-}
-
-// getInferenceServiceAcceleratorClass checks if the InferenceService has an AcceleratorSelector with AcceleratorClass
-func (s *defaultSelector) getInferenceServiceAcceleratorClass(isvc *v1beta1.InferenceService) *string {
-	if isvc == nil ||
-		isvc.Spec.AcceleratorSelector == nil ||
-		isvc.Spec.AcceleratorSelector.AcceleratorClass == nil {
-		return nil
-	}
-
-	return isvc.Spec.AcceleratorSelector.AcceleratorClass
-}
-
-// getComponentAcceleratorPolicy is the effective AcceleratorSelectionPolicy for the component:
-// its AcceleratorOverride's policy first, then the InferenceService-level AcceleratorSelector's,
-// and "" when neither states one.
-func (s *defaultSelector) getComponentAcceleratorPolicy(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) v1beta1.AcceleratorSelectionPolicy {
-	if isvc == nil {
-		return ""
-	}
-
-	// Check component-specific AcceleratorOverride by first
-	if override := componentAcceleratorOverride(isvc, component); override != nil && override.Policy != "" {
-		return override.Policy
-	}
-
-	// if component-specific AcceleratorOverride not found, check InferenceService-level AcceleratorSelector
-	if isvc.Spec.AcceleratorSelector != nil &&
-		isvc.Spec.AcceleratorSelector.Policy != "" {
-		return isvc.Spec.AcceleratorSelector.Policy
-	}
-
-	return ""
-}
-
-// getCandidateAccelerators fetches AcceleratorClass candidates from runtime.AcceleratorClasses
-func (s *defaultSelector) getCandidateAccelerators(ctx context.Context, runtime *v1beta1.ServingRuntimeSpec) ([]v1beta1.AcceleratorClass, error) {
-	logger := log.FromContext(ctx)
-
-	if runtime == nil || runtime.AcceleratorRequirements == nil || len(runtime.AcceleratorRequirements.AcceleratorClasses) == 0 {
-		logger.V(1).Info("No accelerator classes in runtime requirements")
-		return nil, nil
-	}
-
-	// Fetch all candidates from the runtime's accelerator class list
-	candidates, err := candidatesFromNames(ctx, s.fetcher, runtime.AcceleratorRequirements.AcceleratorClasses)
-	if err != nil {
-		return nil, err
-	}
-
-	logger.V(1).Info("Fetched candidate accelerators", "count", len(candidates))
-	return candidates, nil
 }
 
 // chooser applies one selection policy to the candidates that passed the constraints and
@@ -242,7 +177,7 @@ var policies = map[v1beta1.AcceleratorSelectionPolicy]chooser{
 	v1beta1.FirstAvailablePolicy: selectFirstAvailable,
 }
 
-// precisionPreference reads the service's preferred precisions, nil when it states none.
+// precisionPreference reads the constraints' preferred precisions, nil when they state none.
 func precisionPreference(constraints *v1beta1.AcceleratorConstraints) []string {
 	if constraints == nil {
 		return nil

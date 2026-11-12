@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/clock"
 	clocktesting "k8s.io/utils/clock/testing"
@@ -76,7 +75,7 @@ func newTestPollerWithRuntime(
 	maxResponseBytes int64,
 ) *CapacityPoller {
 	t.Helper()
-	poller, err := NewCapacityPoller(executor, client, clk, maxResponseBytes, logr.Discard())
+	poller, err := NewCapacityPoller(executor, client, clk, maxResponseBytes)
 	if err != nil {
 		t.Fatalf("NewCapacityPoller() error = %v", err)
 	}
@@ -145,7 +144,7 @@ func TestNewCapacityPoller_NilDependencyOrNonPositiveBound_ReturnsError(t *testi
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewCapacityPoller(tt.executor, tt.client, tt.clock, tt.maxBytes, logr.Discard())
+			_, err := NewCapacityPoller(tt.executor, tt.client, tt.clock, tt.maxBytes)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
 				t.Fatalf("NewCapacityPoller() error = %v, want containing %q", err, tt.wantErrSub)
 			}
@@ -158,9 +157,9 @@ func TestCapacityPoller_AcceptsAFreshReport(t *testing.T) {
 	p := newTestPoller(t)
 	config := testCapacityConfig()
 
-	got, reason := p.pollOne(context.Background(), testCapacityTarget("cluster-a", srv.URL), config)
+	got, _, reason := p.pollOneDetailed(context.Background(), testCapacityTarget("cluster-a", srv.URL), config)
 	if got == nil {
-		t.Fatalf("pollOne returned no report: %s", reason)
+		t.Fatalf("the poll returned no report: %s", reason)
 	}
 	if *got != 3 {
 		t.Fatalf("servable = %v, want 3", *got)
@@ -176,7 +175,7 @@ func TestCapacityPoller_AcceptsAReportOfZero(t *testing.T) {
 	srv := capacityServer(t, http.StatusOK, freshReport(0))
 	p := newTestPoller(t)
 
-	got, reason := p.pollOne(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
+	got, _, reason := p.pollOneDetailed(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
 	if got == nil {
 		t.Fatalf("a report of zero was discarded: %s", reason)
 	}
@@ -192,7 +191,7 @@ func TestCapacityPoller_CeilingReadsOnlyTheServableField(t *testing.T) {
 	srv := capacityServer(t, http.StatusOK, body)
 	p := newTestPoller(t)
 
-	got, reason := p.pollOne(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
+	got, _, reason := p.pollOneDetailed(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
 	if got == nil {
 		t.Fatalf("report discarded: %s", reason)
 	}
@@ -235,7 +234,7 @@ func TestCapacityPoller_FailsOpenOnEveryBadAnswer(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			srv := capacityServer(t, tt.status, tt.body)
 			p := newTestPoller(t)
-			got, reason := p.pollOne(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
+			got, _, reason := p.pollOneDetailed(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
 			if got != nil {
 				t.Fatalf("report = %v, want nil (fail open to the plan)", *got)
 			}
@@ -288,7 +287,7 @@ func TestCapacityPoller_ResponseCompletingAfterDeadlineFallsOpen(t *testing.T) {
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	reported, reason := poller.pollOne(ctx, testCapacityTarget("cluster-a", "https://cluster-a.example"), testCapacityConfig())
+	reported, _, reason := poller.pollOneDetailed(ctx, testCapacityTarget("cluster-a", "https://cluster-a.example"), testCapacityConfig())
 	if reported != nil {
 		t.Fatalf("late response produced report %v, want nil", *reported)
 	}
@@ -303,7 +302,7 @@ func TestCapacityPoller_UnreachableEndpointFallsOpen(t *testing.T) {
 	srv.Close()
 
 	p := newTestPoller(t)
-	got, reason := p.pollOne(context.Background(), testCapacityTarget("cluster-a", url), testCapacityConfig())
+	got, _, reason := p.pollOneDetailed(context.Background(), testCapacityTarget("cluster-a", url), testCapacityConfig())
 	if got != nil {
 		t.Fatalf("report = %v from an unreachable endpoint, want nil", *got)
 	}
@@ -642,12 +641,11 @@ func TestCapacityPoller_BodyIsBounded(t *testing.T) {
 		NewObserverClient(),
 		clocktesting.NewFakeClock(capacityTestNow),
 		int64(len(body)-1),
-		logr.Discard(),
 	)
 	if err != nil {
 		t.Fatalf("NewCapacityPoller() error = %v", err)
 	}
-	got, reason := p.pollOne(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
+	got, _, reason := p.pollOneDetailed(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
 	if got != nil {
 		t.Fatalf("oversized body produced a report %v, want nil", *got)
 	}
@@ -668,13 +666,12 @@ func TestCapacityPoller_AcceptsBodyAtConfiguredLimit(t *testing.T) {
 		NewObserverClient(),
 		clocktesting.NewFakeClock(capacityTestNow),
 		int64(len(body)),
-		logr.Discard(),
 	)
 	if err != nil {
 		t.Fatalf("NewCapacityPoller() error = %v", err)
 	}
 
-	got, reason := p.pollOne(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
+	got, _, reason := p.pollOneDetailed(context.Background(), testCapacityTarget("cluster-a", srv.URL), testCapacityConfig())
 	if got == nil || *got != 2 {
 		t.Fatalf("report at exact limit = %v, want 2; reason = %q", got, reason)
 	}

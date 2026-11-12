@@ -1927,7 +1927,7 @@ func TestGetTargetServicePort(t *testing.T) {
 			expectError:  true,
 		},
 		{
-			name: "raw deployment mode - service with no ports uses default",
+			name: "raw deployment mode - service with no ports is an error",
 			isvc: &v1beta1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-isvc",
@@ -1948,8 +1948,8 @@ func TestGetTargetServicePort(t *testing.T) {
 					},
 				},
 			},
-			expectedPort: constants.CommonISVCPort,
-			expectError:  false,
+			expectedPort: 0,
+			expectError:  true,
 		},
 	}
 
@@ -1962,7 +1962,7 @@ func TestGetTargetServicePort(t *testing.T) {
 			}
 			fakeClient := fakeclient.New(t, fakeclient.WithObjects(objs...))
 
-			port, err := GetTargetServicePort(context.Background(), fakeClient, tt.isvc)
+			port, err := TargetServicePort(context.Background(), fakeClient, tt.isvc, tt.isvc.Spec.Router != nil)
 
 			if tt.expectError {
 				assert.Error(t, err)
@@ -1974,7 +1974,7 @@ func TestGetTargetServicePort(t *testing.T) {
 	}
 }
 
-func TestGetTargetServicePort_ServiceNameResolution(t *testing.T) {
+func TestTargetServicePort_ServiceNameResolution(t *testing.T) {
 	// Test that the correct service names are used based on mode and router presence
 	tests := []struct {
 		name                string
@@ -2027,7 +2027,7 @@ func TestGetTargetServicePort_ServiceNameResolution(t *testing.T) {
 
 			fakeClient := fakeclient.New(t, fakeclient.WithObjects(svc))
 
-			port, err := GetTargetServicePort(context.Background(), fakeClient, tt.isvc)
+			port, err := TargetServicePort(context.Background(), fakeClient, tt.isvc, tt.isvc.Spec.Router != nil)
 
 			assert.NoError(t, err)
 			assert.Equal(t, int32(9999), port, "Should find the service with expected name: %s", tt.expectedServiceName)

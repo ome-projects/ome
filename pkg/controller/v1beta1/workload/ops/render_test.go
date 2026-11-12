@@ -23,30 +23,20 @@ var testISVCGVK = v1beta1.SchemeGroupVersion.WithKind("InferenceService")
 
 // testKey produces the ISVC-form workload.Key the render path consumes:
 // Namespace + OwnerName from the ISVC, Component cast across the type
-// boundary, SelectorLabels = the OMENative pod-selector trio.
+// boundary.
 func testKey(isvc *v1beta1.InferenceService, component workload.ComponentType) workload.Key {
 	return workload.Key{
 		Namespace: isvc.Namespace,
 		Component: component,
 		OwnerName: isvc.Name,
-		SelectorLabels: map[string]string{
-			constants.InferenceServicePodLabelKey: isvc.Name,
-			constants.OMEComponentLabel:           string(component),
-			query.LabelManagedBy:                  query.ManagedByOMENative,
-		},
 	}
 }
 
-// testRender wraps Render with the (isvc, podSpec, plan, inst, runner,
-// ordinal) signature test bodies use directly, deriving the
-// owner/key/hook arguments from the ISVC under test.
+// testRender renders with no pod-template metadata and no revision hash,
+// the (isvc, podSpec, plan, inst, runner, ordinal) shape most test bodies
+// use; a nil isvc is passed through to exercise the nil-owner refusal.
 func testRender(isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, ordinal int32) (*corev1.Pod, error) {
-	if isvc == nil {
-		// Tests rely on Render rejecting a nil owner — pass nil
-		// through to exercise that branch.
-		return Render(nil, testISVCGVK, workload.Key{}, podSpec, plan, inst, runner, ordinal, nil)
-	}
-	return Render(isvc, testISVCGVK, testKey(isvc, plan.Component), podSpec, plan, inst, runner, ordinal, nil)
+	return testRenderWithRevision(isvc, podSpec, nil, plan, inst, runner, ordinal, "")
 }
 
 // testRenderWithRevision wraps RenderWithRevision with the (isvc,
@@ -276,19 +266,6 @@ func TestRenderWithRevision_EmptyHashOmitsRevisionLabel(t *testing.T) {
 	}
 	if _, present := pod.Labels[query.LabelRevisionHash]; present {
 		t.Errorf("%s should be absent when hash is empty, got: %+v", query.LabelRevisionHash, pod.Labels)
-	}
-}
-
-func TestRender_DelegatesToRenderWithRevisionEmptyHash(t *testing.T) {
-	// Render() is the back-compat entry point and must produce the same
-	// pod as testRenderWithRevision(..., "") — i.e., no revision-hash label.
-	plan, inst, runner := singlePodPlan()
-	pod, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runner, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, present := pod.Labels[query.LabelRevisionHash]; present {
-		t.Errorf("Render() must omit %s; got pod labels: %+v", query.LabelRevisionHash, pod.Labels)
 	}
 }
 

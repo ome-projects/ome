@@ -25,10 +25,11 @@ import (
 // stuck-Terminating pod. Until it is free the step withholds its create,
 // and the wait an operator reads off the row is the hold pass's
 // (holds/nodeunknown.go). The Create pass runs the sweep over every
-// planned Instance at every scope it builds at, so a serving Instance
-// whose node dies is rebuilt elsewhere by the ordinary missing-pod paths
-// once the names are freed, whether or not another Instance's roll or
-// repair is in flight.
+// planned Instance at every scope it builds at, a paused Component
+// included, so a serving Instance whose node dies is rebuilt elsewhere by
+// the ordinary missing-pod paths once the names are freed, whether or not
+// another Instance's roll or repair is in flight; under a pause the
+// rebuild follows the pause's own rule for a lost pod.
 
 // targetPodNameSet is the desired names as the evidence reading takes
 // them.
@@ -127,16 +128,25 @@ func sweepUnknownPhasePod(ctx context.Context, deps workload.Deps, input workloa
 // builds at. A Ready Instance whose pods sit on a lost node has no
 // attempt of its own to free them, so this is the one reader every such
 // pod has, and a pass narrowed to the indices it may build for (a roll
-// or a repair in flight elsewhere) must still free the names of the
-// others, or one Instance's wait would keep every other Instance on the
-// lost node. Returns the Instances the pass must leave alone this time
-// round and the earliest policy boundary among them.
+// or a repair in flight elsewhere, or an operator pause) must still free
+// the names of the others, or one Instance's wait, or the pause, would
+// keep every other Instance on the lost node. Returns the Instances the
+// pass must leave alone this time round and the earliest policy boundary
+// among them.
+//
+// An Instance's target names are read only when one of its pods has no
+// report from its kubelet: the sweep has nothing to find among pods that
+// report, and at rest that is every pod of the Component.
 func recoverUnknownPhaseInstances(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, byInstance map[int32][]*corev1.Pod) (map[int32]bool, time.Time, error) {
 	var held map[int32]bool
 	var nextEvidenceAt time.Time
 	for _, inst := range plan.Instances {
+		pods := byInstance[inst.Index]
+		if !evidence.AnyUnreportedPod(pods, input.ForceDelete) {
+			continue
+		}
 		holding, at, err := recoverUnknownPhaseTargets(ctx, deps, input, inst.Index,
-			byInstance[inst.Index], expectedPodNamesForInstance(input, plan, inst))
+			pods, expectedPodNamesForInstance(input, plan, inst))
 		if err != nil {
 			return nil, time.Time{}, fmt.Errorf("Create: recover unknown-phase pods (instance=%d): %w", inst.Index, err)
 		}

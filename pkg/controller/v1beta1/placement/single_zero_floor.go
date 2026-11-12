@@ -30,7 +30,7 @@ func positiveMovementFloor(policy *v1beta1.PlacementHomePolicy) error {
 	if policy == nil {
 		return nil
 	}
-	if _, err := protocol.ValidatePositiveReplicaFloors(policy.ReplicaFloors); err != nil {
+	if err := protocol.ValidatePositiveReplicaFloors(policy.ReplicaFloors); err != nil {
 		return fmt.Errorf("%w: %v", errPositiveMovementFloor, err)
 	}
 	return nil

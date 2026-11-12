@@ -35,12 +35,7 @@ func (w *ClusterServingRuntimeWrapper) Obj() *v1beta1.ClusterServingRuntime {
 	return &w.ClusterServingRuntime
 }
 
-func (w *ClusterServingRuntimeWrapper) Clone() *ClusterServingRuntimeWrapper {
-	return &ClusterServingRuntimeWrapper{ClusterServingRuntime: *w.ClusterServingRuntime.DeepCopy()}
-}
-
-// SupportsModelFormat / SupportsArchitecture / Disabled / Container
-// mirror the namespaced ServingRuntime setters.
+// SupportsModelFormat mirrors the namespaced ServingRuntime setter.
 
 func (w *ClusterServingRuntimeWrapper) SupportsModelFormat(formatName string, autoSelect bool, priority int32) *ClusterServingRuntimeWrapper {
 	auto := autoSelect
@@ -51,21 +46,6 @@ func (w *ClusterServingRuntimeWrapper) SupportsModelFormat(formatName string, au
 		ModelFramework: defaultModelFramework(),
 		AutoSelect:     &auto,
 		Priority:       &prio,
-	})
-	return w
-}
-
-func (w *ClusterServingRuntimeWrapper) SupportsArchitecture(arch string, autoSelect bool, priority int32) *ClusterServingRuntimeWrapper {
-	auto := autoSelect
-	prio := priority
-	a := arch
-	w.Spec.SupportedModelFormats = append(w.Spec.SupportedModelFormats, v1beta1.SupportedModelFormat{
-		Name:              arch,
-		ModelFormat:       &v1beta1.ModelFormat{Name: arch},
-		ModelFramework:    defaultModelFramework(),
-		ModelArchitecture: &a,
-		AutoSelect:        &auto,
-		Priority:          &prio,
 	})
 	return w
 }
@@ -94,11 +74,6 @@ func defaultModelFramework() *v1beta1.ModelFrameworkSpec {
 func (w *ClusterServingRuntimeWrapper) Disabled(d bool) *ClusterServingRuntimeWrapper {
 	val := d
 	w.Spec.Disabled = &val
-	return w
-}
-
-func (w *ClusterServingRuntimeWrapper) Container(c corev1.Container) *ClusterServingRuntimeWrapper {
-	w.Spec.Containers = append(w.Spec.Containers, c)
 	return w
 }
 

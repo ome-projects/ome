@@ -92,8 +92,8 @@ func init() {
 }
 
 // RecordAutoMigrationTriggered increments the auto-migration counter
-// when the deadline disposition records a relocation directive
-// (terminal AutoRecover ledger entry) for an Instance whose attempt
+// when the deadline decision records a relocation directive
+// (a terminal AutoRecover record) for an Instance whose attempt
 // expired via the config-driven stuckPodGracePeriod fast path or the
 // instanceReadyTimeout backstop.
 func RecordAutoMigrationTriggered(namespace, isvc, component, reason string) {
@@ -159,8 +159,8 @@ func RecordMixedPairing(namespace, isvc, group string) {
 
 // RecordRatioGateBypassed increments the bypass counter when the
 // OMENative ops dispatcher admits an in-place start (InPlaceIfPossible /
-// InPlaceOnly) past the RatioBalanced serving-capacity band; the
-// new-revision lockstep still ran for it. See EventReasonRatioGateBypassed
+// InPlaceOnly) past the RatioBalanced serving-capacity tolerance; the
+// version-progress check between the two sides still ran for it. See EventReasonRatioGateBypassed
 // for the rationale.
 func RecordRatioGateBypassed(component, strategy string) {
 	if component == "" || strategy == "" {

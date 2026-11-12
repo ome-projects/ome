@@ -22,7 +22,7 @@ import (
 // finished its move to v2 and runs a v2 pod alone; the other engines still
 // serve v1, the first of them with a v3 replacement that is not Ready yet.
 // The last decoder Instance is mid-surge: its v1 source and its v2
-// replacement both serve, pinned to the v2 revision. engineOnV2 false keeps
+// replacement both serve, set to the v2 revision. engineOnV2 false keeps
 // that last engine on v1, so no engine serves v2 at all.
 func secondChangeFleet(isvc *v1beta1.InferenceService, engines, decoders int, engineOnV2 bool) []client.Object {
 	lastEngine, lastDecoder := engines-1, decoders-1
@@ -116,7 +116,7 @@ func TestEvaluatePairingDrain_SecondChange_HandOverIsJudgedOnThePinnedCohort(t *
 // pairs with that replacement and nothing else, so taking it out leaves no
 // pair at all and the drain is held. At 6x2 the engine on v2 is the sixth
 // pairable engine Instance and loses its only partner: five of six, under
-// a floor of six, so the drain is held on the floor. When no engine serves
+// a pairable minimum of six, so the drain is held on it. When no engine serves
 // v2 the replacement partners nothing yet and may leave.
 func TestEvaluatePairingDrain_SecondChange_WithdrawingThePartnerReplacementIsHeld(t *testing.T) {
 	isvc := pairingISVC("v3")

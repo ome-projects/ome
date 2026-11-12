@@ -1286,7 +1286,7 @@ var offTargetStrategies = []struct {
 
 // offTargetCrashHarness converges replicas Instances on v1 under the
 // named strategy, budget and restart policy, with the runner container
-// named as production names it so container-restart evidence is read.
+// named as the renderer names it so container-restart evidence is read.
 func offTargetCrashHarness(t *testing.T, gang bool, strategy workloadtypes.UpdateStrategyType, surge, unavail int32, policy workloadtypes.RestartPolicy, replicas int32) *recoveryHarness {
 	t.Helper()
 	h := newRecoveryHarnessFor(t, gang, constants.MainContainerName)
@@ -1410,11 +1410,11 @@ func TestReconcile_OffTargetCrash_RollsForwardAcrossTheMatrix(t *testing.T) {
 // TestReconcile_OffTargetCrash_StartIsAdmittedLikeAnyOther pins the
 // admission of the broken Instance's roll: it is a fresh start like its
 // peers', paced by the same per-Component budget, and the coordination
-// gate is consulted for it exactly as for a dark Failed row — not on a
-// non-surge strategy, where the crash-looping pod set serves nothing and
-// the gate already counts the outage, and once on a surge strategy, where
-// the replacement genuinely adds a pod. The same gate stands in for a
-// coordination group: every start that opens is admitted through it.
+// gate is consulted for it exactly as for a dark Failed row, which is not
+// at all, under a surge as under a recreate: the crash-looping pod set
+// serves nothing and the gate already counts the outage. The same gate
+// stands in for a coordination group: every other start that opens is
+// admitted through it.
 func TestReconcile_OffTargetCrash_StartIsAdmittedLikeAnyOther(t *testing.T) {
 	const replicas = 3
 	for _, sc := range offTargetStrategies[:2] {
@@ -1434,12 +1434,10 @@ func TestReconcile_OffTargetCrash_StartIsAdmittedLikeAnyOther(t *testing.T) {
 				h.dumpState("after the bump")
 				t.Fatalf("the Component never settled on the fixed revision")
 			}
-			want := replicas
-			if sc.strategy != workloadtypes.UpdateStrategySurgeThenDrain {
-				// The broken Instance serves nothing: its recreate opens no
-				// new unavailability and skips the consult.
-				want = replicas - 1
-			}
+			// The broken Instance serves nothing: its start opens no new
+			// unavailability and skips the consult, whatever adds or
+			// removes its pods.
+			want := replicas - 1
 			if consults != want {
 				t.Fatalf("gate consults = %d, want %d", consults, want)
 			}
@@ -4942,5 +4940,151 @@ func TestRepairRetryDue_RecordInBackoffForTheRevisionTheInstanceServed_RebuildSt
 	}
 	if b := h.findBlock(pushed.Name); b != nil {
 		t.Errorf("the promote onto %s must remove its record, got %+v", pushed.Name, b)
+	}
+}
+
+// TestRepair_RefusedRebuildOfTheServedRevision_RetriesOnTheRepairsSchedule:
+// a gang that served version 1 for three hours loses its worker. The
+// repair drains the leader, and a validating webhook refuses the first
+// rebuild create as an invalid pod spec. Version 1 served, so no retry
+// block is written for it: the repair keeps its attempt at Failed with the
+// refusal as its failure, nothing is created before its schedule comes due
+// one minute later, and the create then goes through. The gang is Ready
+// again on version 1 with no operator action and no exhausted-retries
+// warning.
+func TestRepair_RefusedRebuildOfTheServedRevision_RetriesOnTheRepairsSchedule(t *testing.T) {
+	h := newRecoveryHarness(t, true)
+	h.recorder = record.NewFakeRecorder(256)
+	policy := workloadtypes.RestartPolicyRecreateInstance
+	h.lifecycle.RestartPolicy = &policy
+	h.retryPolicy = &workloadtypes.RetryPolicy{MaxAttempts: 3, InitialDelay: time.Minute, MaxDelay: 10 * time.Minute, Multiplier: 2}
+	h.driveToReadyOnV1()
+	h.clk.Step(3 * time.Hour)
+	served := *h.instance(0)
+
+	noBlock := func() {
+		if b := h.findBlock(h.revV1.Name); b != nil {
+			t.Fatalf("version 1 charged on its retry block %+v: the revision served, so a refusal of its rebuild is not its failure", b)
+		}
+	}
+	h.refuseCreates = 1
+	h.loseRunner(0, "worker")
+	refused := func() bool {
+		s := h.instance(0)
+		return s != nil && s.Phase == workloadtypes.InstancePhaseFailed && s.Operation != nil &&
+			s.Operation.Type == workloadtypes.InstanceOperationRestart &&
+			s.LastFailure != nil && s.LastFailure.Reason == workloadtypes.RejectionReasonInvalidPodSpec
+	}
+	if !h.runWithInvariant(40, refused, noBlock) {
+		h.dumpState("refused rebuild")
+		t.Fatalf("the refused rebuild never left the repair waiting at Failed with the refusal as its failure")
+	}
+	stopped := *h.instance(0)
+	due := stopped.LastFailure.Time.Add(time.Minute)
+	if n := len(h.podsOf(0)); n != 0 {
+		t.Fatalf("%d pod(s) stand after the refusal, want none: the refused create made none", n)
+	}
+
+	// Nothing rebuilds the gang before the repair's schedule comes due.
+	nothingEarly := func() {
+		noBlock()
+		if h.clk.Now().Before(due) && len(h.podsOf(0)) != 0 {
+			t.Fatalf("pods created at %s, before the repair's retry at %s", h.clk.Now().Format(time.TimeOnly), due.Format(time.TimeOnly))
+		}
+	}
+	retried := func() bool {
+		s := h.instance(0)
+		return s != nil && s.Incarnation > stopped.Incarnation
+	}
+	if !h.runWithInvariant(40, retried, nothingEarly) {
+		h.dumpState("repair retry")
+		t.Fatalf("the repair never issued its create again")
+	}
+	if !h.runWithInvariant(40, func() bool { return servingReady(h, 0, 2) }, noBlock) {
+		h.dumpState("rebuilt gang")
+		t.Fatalf("the gang never came back Ready on version 1")
+	}
+	got := h.instance(0)
+	if got.RunningRevision != h.revV1.Name || got.Incarnation != served.Incarnation+2 {
+		t.Fatalf("row = %+v, want Ready on %s at incarnation=%d: one rebuild opened the repair and one retried it", got, h.revV1.Name, served.Incarnation+2)
+	}
+	if n := eventCount(h, string(workloadtypes.EventReasonRepairRetriesExhausted)); n != 0 {
+		t.Errorf("RepairRetriesExhausted events = %d, want none: one refusal spends one retry, not the whole schedule", n)
+	}
+	if n := eventCount(h, "the repair retries on its own schedule"); n != 1 {
+		t.Errorf("InstanceRejected events saying the repair retries on its own schedule = %d, want 1", n)
+	}
+	if n := eventCount(h, "(attempt 1) after"); n != 1 {
+		t.Errorf("RestartTriggered events for the second attempt = %d, want 1", n)
+	}
+}
+
+// TestReconcile_CrashLoopRepair_HeldBesideAnInstanceUpOnlyBetweenItsCrashes:
+// two leader+worker gangs under a per-Component unavailability budget of
+// one and restart policy None. Gang 1's worker waits in CrashLoopBackOff
+// past the grace while its leader serves, so its repair takes a serving
+// pod offline and asks the budget. Gang 0's leader keeps dying and the
+// kubelet restarts it in place; its latest run is Ready again for 5 s of
+// the 60 s window the grace sets, so gang 0 is one Instance down already:
+// the repair of gang 1 is held and the hold names gang 0 and its window.
+// The budget counts the Instance about to crash again as a repair in
+// flight, not by phase alone. Once gang 0's
+// leader has held Ready for the window the repair opens.
+func TestReconcile_CrashLoopRepair_HeldBesideAnInstanceUpOnlyBetweenItsCrashes(t *testing.T) {
+	cases := []struct {
+		name          string
+		readyAgainFor time.Duration
+		held          bool
+	}{
+		{name: "Ready again for 5 s of the 60 s window", readyAgainFor: 5 * time.Second, held: true},
+		{name: "Ready again for the whole window", readyAgainFor: 90 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now()
+			one := intstr.FromInt32(1)
+			in, plan, waiting := crashLoopRepairFixture(t, 2, &one)
+			clk := clocktesting.NewFakeClock(now)
+			in.Clock = clk
+			in.DesiredSpec.MultiPod = true
+			for idx := range plan.Instances {
+				plan.Instances[idx].Runners = []workloadtypes.RunnerPlan{{Name: "leader", Size: 1}, {Name: "worker", Size: 1}}
+				in.ObservedState.InstanceStatuses[idx].PodCount = 2
+				in.ObservedState.InstanceStatuses[idx].ReadySince = &metav1.Time{Time: now.Add(-10 * time.Minute)}
+			}
+			restartedLeader := gangPod(restartedEnginePod(0, now, tc.readyAgainFor, ""), "leader")
+			pods := []client.Object{
+				restartedLeader, gangPod(servingEnginePod(0), "worker"),
+				gangPod(servingEnginePod(1), "leader"), gangPod(waiting[1].(*corev1.Pod), "worker"),
+			}
+			c := fake.NewClientBuilder().WithScheme(makeScheme(t)).WithObjects(pods...).Build()
+			store := installRepairStore(&in)
+			rec := record.NewFakeRecorder(16)
+			deps := workloadtypes.Deps{Client: c, APIReader: c, Recorder: rec, Expectations: workloadtypes.NewExpectations(), Clock: clk}
+
+			result, err := workload.Reconcile(ctx, deps, in, plan, crashLoopRepairTarget())
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if tc.held {
+				if got := countRestarting(store, 2); got != 0 {
+					t.Fatalf("repairs opened = %d, want 0: gang 0 is up only between its crashes, so gang 1's serving leader stays in rotation", got)
+				}
+				if result.RequeueAfter <= 0 {
+					t.Errorf("result = %+v, want a requeue: the window elapsing raises no watch event", result)
+				}
+				assertRepairHeld(t, rec, "per-Component unavailability budget 1 exhausted (would become 2); Instance 0 not serving (pod "+
+					restartedLeader.Name+" restarted again since Ready, Ready again for less than the 60s window")
+				return
+			}
+			if got := countRestarting(store, 2); got != 1 {
+				t.Fatalf("repairs opened = %d, want 1 once gang 0 has held Ready for the window", got)
+			}
+			if s := store.status(1); s == nil || s.Phase != workloadtypes.InstancePhaseRestarting {
+				t.Fatalf("gang 1 = %+v, want its repair open", s)
+			}
+			assertNoRepairHeld(t, rec)
+		})
 	}
 }

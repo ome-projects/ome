@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-04",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "Re-recorded: the sweep reads the history through the informer cache first and lists it live only when the cached history shows revisions over the limit, where every deletion is decided on the live list. A history at rest costs one cache list (a deep copy per revision) and no live list: 18 allocations for a history of one revision and 78 for one of eleven, against 115 and 825 with the live list on every pass (the fake apiserver's JSON decode of every revision), as recorded before the change.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "one-revision/allocations": 18,
+    "one-revision/revision-cache-lists": 1,
+    "one-revision/revision-live-lists": 0,
+    "ten-kept/allocations": 78,
+    "ten-kept/revision-cache-lists": 1,
+    "ten-kept/revision-live-lists": 0
+  }
+}

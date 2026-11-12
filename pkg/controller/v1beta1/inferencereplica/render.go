@@ -84,20 +84,41 @@ func (r *Reconciler) renderFromRefs(ctx context.Context, ir *v1beta1.InferenceRe
 		return nil, &renderBlocked{Reason: ReasonRenderFailed,
 			Message: "this controller is not configured to render from modelRef or runtimeRef"}
 	}
+	cfg, deploy, err := r.renderingConfig()
+	if err != nil {
+		return nil, err
+	}
+	// The role inputs take an accelerator class selector; over a shell that
+	// names no class it picks none and reads no AcceleratorClass.
+	in := render.Inputs{Service: serviceShell(ir), Client: r.Client, Runtimes: r.RuntimeSelector, Accelerators: acceleratorclassselector.New(r.Client), Config: cfg, Log: ctrl.LoggerFrom(ctx)}
+	res, err := r.resolveRefsRuntime(ctx, ir, in)
+	if err != nil {
+		return nil, err
+	}
+	return renderRefsPiece(ctx, in, res, ir.Spec.Component, deploy)
+}
+
+// renderingConfig reads the operator blocks a render from refs takes, in
+// one order: the InferenceService configuration and the deploy defaults. A
+// block that does not load is an error the caller retries, named after the
+// block.
+func (r *Reconciler) renderingConfig() (*controllerconfig.InferenceServicesConfig, *controllerconfig.DeployConfig, error) {
 	cfg, err := controllerconfig.NewInferenceServicesConfigCached(r.ConfigCache, r.Clientset)
 	if err != nil {
-		return nil, fmt.Errorf("load rendering config: %w", err)
+		return nil, nil, fmt.Errorf("load rendering config: %w", err)
 	}
 	deploy, err := controllerconfig.NewDeployConfigCached(r.ConfigCache, r.Clientset)
 	if err != nil {
-		return nil, fmt.Errorf("load deploy config: %w", err)
+		return nil, nil, fmt.Errorf("load deploy config: %w", err)
 	}
+	return cfg, deploy, nil
+}
 
-	log := ctrl.LoggerFrom(ctx)
-	shell := serviceShell(ir)
-	// The role inputs take an accelerator class selector; over a shell that
-	// names no class it picks none and reads no AcceleratorClass.
-	in := render.Inputs{Service: shell, Client: r.Client, Runtimes: r.RuntimeSelector, Accelerators: acceleratorclassselector.New(r.Client), Config: cfg, Log: log}
+// resolveRefsRuntime resolves the replica's model and runtime. A named
+// runtime that does not declare the model is reported with a Warning event
+// and still renders; an auto-selected runtime is logged; a runtime without
+// the replica's piece is a block.
+func (r *Reconciler) resolveRefsRuntime(ctx context.Context, ir *v1beta1.InferenceReplica, in render.Inputs) (*render.Resolved, error) {
 	res, err := render.Resolve(ctx, in)
 	if err != nil {
 		return nil, classifyResolveError(err)
@@ -108,24 +129,42 @@ func (r *Reconciler) renderFromRefs(ctx context.Context, ir *v1beta1.InferenceRe
 			res.RuntimeName, ir.Spec.ModelRef.Name, res.CompatibilityAdvisory)
 	}
 	if !res.UserSpecifiedRuntime {
-		log.V(1).Info("Auto-selected runtime", "runtime", res.RuntimeName, "model", ir.Spec.ModelRef.Name)
+		in.Log.V(1).Info("Auto-selected runtime", "runtime", res.RuntimeName, "model", ir.Spec.ModelRef.Name)
 	}
-	if !render.RuntimeDeclaresPiece(res.Runtime, ir.Spec.Component) {
-		kind := runtimeselector.KindServingRuntime
-		if res.RuntimeIsCluster {
-			kind = runtimeselector.KindClusterServingRuntime
-		}
-		return nil, &renderBlocked{Reason: ReasonRuntimePieceMissing,
-			Message: fmt.Sprintf("%s %q has no %s piece; a %s replica cannot render from it", kind, res.RuntimeName, ir.Spec.Component, ir.Spec.Component)}
+	if blocked := runtimePieceMissing(res, ir.Spec.Component); blocked != nil {
+		return nil, blocked
 	}
-	if err := render.PrepareRole(res, ir.Spec.Component, shell.Spec.DeploymentMode, deploy); err != nil {
+	return res, nil
+}
+
+// runtimePieceMissing is the block for a resolved runtime that declares no
+// piece for component c, naming the runtime by its kind; nil when the
+// runtime declares the piece.
+func runtimePieceMissing(res *render.Resolved, c v1beta1.ComponentType) *renderBlocked {
+	if render.RuntimeDeclaresPiece(res.Runtime, c) {
+		return nil
+	}
+	kind := runtimeselector.KindServingRuntime
+	if res.RuntimeIsCluster {
+		kind = runtimeselector.KindClusterServingRuntime
+	}
+	return &renderBlocked{Reason: ReasonRuntimePieceMissing,
+		Message: fmt.Sprintf("%s %q has no %s piece; a %s replica cannot render from it", kind, res.RuntimeName, c, c)}
+}
+
+// renderRefsPiece prepares component c's role with the deploy defaults and
+// renders its piece of the resolved runtime into the runner list. A role
+// that cannot be prepared is a block; a render failure is classified so a
+// transient one is retried.
+func renderRefsPiece(ctx context.Context, in render.Inputs, res *render.Resolved, c v1beta1.ComponentType, deploy *controllerconfig.DeployConfig) ([]v1beta1.Runner, error) {
+	if err := render.PrepareRole(res, c, in.Service.Spec.DeploymentMode, deploy); err != nil {
 		return nil, &renderBlocked{Reason: ReasonRenderFailed, Message: err.Error()}
 	}
-	piece, _, err := res.Piece(ctx, in, ir.Spec.Component)
+	piece, _, err := res.Piece(ctx, in, c)
 	if err != nil {
 		return nil, classifyRenderError(err)
 	}
-	rendered, err := render.RenderComponent(ctx, piece, shell, res.Specs, ir.Spec.Component)
+	rendered, err := render.RenderComponent(ctx, piece, in.Service, res.Specs, c)
 	if err != nil {
 		return nil, classifyRenderError(err)
 	}
@@ -212,9 +251,11 @@ func (r *Reconciler) reportRenderBlocked(ctx context.Context, ir *v1beta1.Infere
 // renderer: when the InferenceService declares a rollout, every rendered
 // pod gets the OME_<PEER>_ENDPOINT variable of each serving peer and, through
 // peerRevision, the per-revision endpoint of the peer revision the pod is
-// paired with. A nil peerRevision names only the revision-agnostic
-// endpoints. The hook is nil when the InferenceService declares no rollout.
-func ISVCRenderHook(isvc *v1beta1.InferenceService, peerRevision coordination.PeerRevisionFunc) workloadtypes.RenderHook {
+// paired with. clusterDomain is the cluster's DNS domain from the operator
+// configuration (ingress.clusterDomain); empty renders the namespaced short
+// names. A nil peerRevision names only the revision-agnostic endpoints. The
+// hook is nil when the InferenceService declares no rollout.
+func ISVCRenderHook(isvc *v1beta1.InferenceService, clusterDomain string, peerRevision coordination.PeerRevisionFunc) workloadtypes.RenderHook {
 	// Peer-env applies whenever the ISVC declares a rollout (any groups); skip
 	// the hook otherwise. Membership is serving topology (below), not grouping.
 	if !coordination.PeerEnvDeclared(isvc) {
@@ -243,6 +284,6 @@ func ISVCRenderHook(isvc *v1beta1.InferenceService, peerRevision coordination.Pe
 				return peerRevision(peer, revisionHash)
 			}
 		}
-		coordination.InjectPeerEnv(pod, isvc, peers, revisionHashFor)
+		coordination.InjectPeerEnv(pod, isvc, clusterDomain, peers, revisionHashFor)
 	}
 }

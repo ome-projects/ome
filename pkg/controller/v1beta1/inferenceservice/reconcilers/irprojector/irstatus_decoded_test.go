@@ -75,9 +75,9 @@ func TestDecodedComponentIRAgreesAcrossEncodings(t *testing.T) {
 		t.Fatal("decoded object must carry the dense logical shape only")
 	}
 
-	status, err := DecodedComponentIRStatus(ctx, irstatus.NewReader(columnar, decoder), "prod", "svc", v1beta1.EngineComponent)
-	if err != nil || !equality.Semantic.DeepEqual(status.InstanceStatuses, rows) {
-		t.Fatalf("DecodedComponentIRStatus rows = %+v (err %v), want %+v", status, err, rows)
+	ir, _, err := DecodedComponentIRFor(ctx, irstatus.NewReader(columnar, decoder), projectedService("prod", "svc"), v1beta1.EngineComponent)
+	if err != nil || ir == nil || !equality.Semantic.DeepEqual(ir.Status.InstanceStatuses, rows) {
+		t.Fatalf("DecodedComponentIRFor rows = %+v (err %v), want %+v", ir, err, rows)
 	}
 }
 
@@ -90,8 +90,8 @@ func TestDecodedComponentIRAbsentAndNilReader(t *testing.T) {
 	if ir, _, err := DecodedComponentIR(ctx, irstatus.NewReader(empty, irstatus.NewDecoder(4)), "prod", "svc", v1beta1.EngineComponent); ir != nil || err != nil {
 		t.Fatalf("missing IR must be (nil, nil), got ir=%v err=%v", ir, err)
 	}
-	if status, err := DecodedComponentIRStatus(ctx, empty, "prod", "svc", v1beta1.EngineComponent); status != nil || err != nil {
-		t.Fatalf("missing IR status must be (nil, nil), got %v err=%v", status, err)
+	if ir, _, err := DecodedComponentIRFor(ctx, empty, projectedService("prod", "svc"), v1beta1.EngineComponent); ir != nil || err != nil {
+		t.Fatalf("missing IR must be (nil, nil) through the role reader too, got %v err=%v", ir, err)
 	}
 }
 

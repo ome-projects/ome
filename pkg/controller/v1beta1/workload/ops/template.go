@@ -27,6 +27,11 @@ type podTemplate struct {
 	workerPodSpec   *corev1.PodSpec
 	meta            *metav1.ObjectMeta
 	pairingProtocol string
+	// refusal is what a permanent apiserver refusal of a pod rendered from
+	// this template means for the attempt that creates it. The zero value
+	// ends the attempt and charges the revision; a repair rebuilding the
+	// revision the Instance already ran sets refusalIsTheRepairsToRetry.
+	refusal refusedCreateReading
 }
 
 // desiredTemplate is the Component's current template, stamped with rev.

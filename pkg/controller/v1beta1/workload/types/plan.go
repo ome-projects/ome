@@ -56,10 +56,11 @@ type ComponentPlan struct {
 	// operations open with no deadline.
 	InstanceReadyTimeout time.Duration
 
-	// GangScheduleTimeout bounds the per-PodGroup schedule timeout that a
-	// multi-pod Instance derives from InstanceReadyTimeout. Operator
-	// config (lifecycle.gangScheduleTimeout); nil means unconfigured and
-	// the derived value reaches the scheduler unclamped.
+	// GangScheduleTimeout is the range of PodGroup schedule timeouts the
+	// gang scheduler accepts; the placement grace a multi-pod Instance's
+	// PodGroup carries as its timeout is kept inside it. Operator config
+	// (lifecycle.gangScheduleTimeout); nil means unconfigured and the
+	// grace reaches the scheduler as it is.
 	GangScheduleTimeout *GangScheduleTimeoutClamp
 
 	// MinReadySeconds is how long a newly Ready pod must stay Ready before
@@ -131,23 +132,72 @@ type ComponentPlan struct {
 // RunnersFor returns the Runner layout Instance inst renders at revision
 // rev: the roll target's layout at the width rev recorded, when the plan
 // knows it, else as the target renders it. A plan built without a target
-// layout answers with the Instance's own entry.
+// layout answers with the Instance's own entry. The layout is the plan's
+// own when rev changes no width in it and a copy at rev's width otherwise,
+// so a caller reads it and never writes into it.
 func (p ComponentPlan) RunnersFor(inst InstancePlan, rev string) []RunnerPlan {
-	base := p.Runners
+	base := p.layoutFor(inst)
 	if len(base) == 0 {
-		base = inst.Runners
+		return nil
+	}
+	size, known := p.workerSizeAt(rev)
+	if !known || !workerOfAnotherWidth(base, size) {
+		return base
 	}
 	out := append([]RunnerPlan(nil), base...)
-	size, known := p.WorkerSizeByRevision[rev]
-	if rev == "" || !known {
-		return out
-	}
 	for i := range out {
 		if out[i].Name == RunnerWorker {
 			out[i].Size = size
 		}
 	}
 	return out
+}
+
+// workerOfAnotherWidth reports whether a worker of layout runs at a width
+// other than size, so that the layout at size is another layout.
+func workerOfAnotherWidth(layout []RunnerPlan, size int32) bool {
+	for _, runner := range layout {
+		if runner.Name == RunnerWorker && runner.Size != size {
+			return true
+		}
+	}
+	return false
+}
+
+// TotalPodsFor returns how many pods Instance inst renders at revision
+// rev: the pods of the layout RunnersFor builds, counted without building
+// it. The update selection reads it for every Instance on every pass.
+func (p ComponentPlan) TotalPodsFor(inst InstancePlan, rev string) int32 {
+	size, known := p.workerSizeAt(rev)
+	var total int32
+	for _, runner := range p.layoutFor(inst) {
+		if known && runner.Name == RunnerWorker {
+			total += size
+			continue
+		}
+		total += runner.Size
+	}
+	return total
+}
+
+// layoutFor is the layout RunnersFor and TotalPodsFor read for inst: the
+// roll target's, or the Instance's own entry when the plan carries none.
+func (p ComponentPlan) layoutFor(inst InstancePlan) []RunnerPlan {
+	if len(p.Runners) == 0 {
+		return inst.Runners
+	}
+	return p.Runners
+}
+
+// workerSizeAt is the worker count revision rev recorded, and whether the
+// plan knows it; a layout rendered at a revision it does not know keeps
+// its own width.
+func (p ComponentPlan) workerSizeAt(rev string) (int32, bool) {
+	if rev == "" {
+		return 0, false
+	}
+	size, known := p.WorkerSizeByRevision[rev]
+	return size, known
 }
 
 // TopologyKeyForInstance returns the live-safe topology contract for an
@@ -269,11 +319,15 @@ func (i InstancePlan) TotalPods() int32 {
 // on the same index, and when that one replacement became Ready every
 // source sharing it would drain at once. The rows are read once, on the
 // first ask, and every index below from is taken, so the surges of a pass
-// pay one pass over the indexes in all.
+// pay one pass over the indexes in all. The indexes claimed through this
+// allocator are kept apart: the plan was computed without their rows, so
+// a fresh Instance the plan placed on one of them must wait for the next
+// pass.
 type SurgeIndexAllocator struct {
-	rows  []InstanceStatus
-	taken map[int32]struct{}
-	from  int32
+	rows    []InstanceStatus
+	taken   map[int32]struct{}
+	claimed map[int32]struct{}
+	from    int32
 }
 
 // NewSurgeIndexAllocator is the allocator over rows, which it reads when
@@ -299,6 +353,16 @@ func (a *SurgeIndexAllocator) Next() int32 {
 func (a *SurgeIndexAllocator) Claim(idx int32) {
 	a.read()
 	a.taken[idx] = struct{}{}
+	if a.claimed == nil {
+		a.claimed = map[int32]struct{}{}
+	}
+	a.claimed[idx] = struct{}{}
+}
+
+// Claimed is the set of indexes the surges of this pass took through
+// Claim; nil when none did.
+func (a *SurgeIndexAllocator) Claimed() map[int32]struct{} {
+	return a.claimed
 }
 
 // read builds the taken set from the rows once: every row's index and

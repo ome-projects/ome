@@ -25,12 +25,21 @@ import (
 // held name being freed by the force-delete sweep, its replacement not
 // yet created or not yet refused by the scheduler) keeps it. It is
 // retired once every pod the attempt asks for counts as placed
-// (attemptPlaced), or once the attempt ends.
+// (attemptPlaced), or once the attempt ends. A pass that sees neither wait
+// but a pod of the attempt behind a scheduling gate retires it too. A queue
+// may evict the attempt's pods, and OME then creates them behind the gate
+// again. Time behind the gate is not a refusal, so the next refusal starts
+// a fresh wait. A pod still refused beside a gated one keeps the start, so
+// the grace still ends a gang that a queue admitted only in part.
 //
 // A scheduler wait alone records nothing: with no name held, the grace is
 // measured from the unplaceable pod's own PodScheduled transition, as
 // before. A member the grace ended and rebuilt then waits on its own
-// clock.
+// clock. The exception is a refused pod whose PodScheduled time may be its
+// creation behind a queue's gate. That time says nothing about the
+// refusal, so the first pass that sees the refusal records the start. The
+// start lives on the operation because the wait's record never replaces a
+// container's exit record that the row keeps on LastFailure.
 type placementWait struct {
 	// since is the start to record; nil records nothing.
 	since *metav1.Time
@@ -48,8 +57,9 @@ type placementWait struct {
 // attempt, which waits on its own clock.
 //
 // The scheduler's wait carries its own start, the PodScheduled
-// transition. A held name carries none: the held pod's creation can be
-// days old, so its start is now.
+// transition, unless that time may be the pod's creation behind a queue's
+// gate. A held name carries none: the held pod's creation can be days
+// old. A wait with no start of its own starts now.
 func decidePlacementWait(ctx context.Context, in PassInput, row Row, readings []reading) (placementWait, error) {
 	if row.Excluded {
 		return placementWait{}, nil
@@ -62,7 +72,7 @@ func decidePlacementWait(ctx context.Context, in PassInput, row Row, readings []
 		// The attempt ended; the write that ended it retired the start.
 		return placementWait{}, nil
 	}
-	if drainSourceEnded(in.Rows, row.Status) {
+	if drainSourceEnded(in.Rows, *row.Status) {
 		return placementWait{clear: recorded != nil}, nil
 	}
 	scheduler, node, tracked := placementReadings(row, readings)
@@ -70,7 +80,7 @@ func decidePlacementWait(ctx context.Context, in PassInput, row Row, readings []
 		return placementWait{}, nil
 	}
 	if scheduler.waiting || node.waiting {
-		if recorded != nil || !node.waiting {
+		if recorded != nil || !(node.waiting || scheduler.startsWhenSeen) {
 			return placementWait{}, nil
 		}
 		since := metav1.NewTime(in.Input.Now())
@@ -81,6 +91,10 @@ func decidePlacementWait(ctx context.Context, in PassInput, row Row, readings []
 	}
 	if recorded == nil {
 		return placementWait{}, nil
+	}
+	gated, err := admissionGated(ctx, in, row)
+	if err != nil || gated {
+		return placementWait{clear: gated}, err
 	}
 	placed, err := attemptPlaced(ctx, in, row, node.nodeLost)
 	if err != nil || !placed {
@@ -161,6 +175,22 @@ func drainSourceEnded(rows []Row, replacement types.InstanceStatus) bool {
 		}
 	}
 	return false
+}
+
+// admissionGated reports whether a pod of the row is held back by an
+// admission scheduling gate. A pod being deleted is no longer part of the
+// attempt and does not count.
+func admissionGated(ctx context.Context, in PassInput, row Row) (bool, error) {
+	own, _, err := in.rowPods(ctx, row)
+	if err != nil {
+		return false, err
+	}
+	for _, pod := range own {
+		if types.PodAdmissionGated(pod) && pod.DeletionTimestamp == nil {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // attemptPlaced reports whether every pod the row's plan asks for exists,

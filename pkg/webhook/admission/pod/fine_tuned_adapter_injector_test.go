@@ -466,3 +466,24 @@ func newErrPathFineTunedAdapterPod(weightName string) *v1.Pod {
 func errPathStringPtr(value string) *string {
 	return &value
 }
+
+// A FineTunedWeight whose URI names no bucket, or no object behind the
+// trailing slash, is refused at admission; the adapter container could not
+// download anything from it.
+func TestInjectFineTunedAdapter_EmptyBucketOrObjectPathIsRefused(t *testing.T) {
+	for name, uri := range map[string]string{
+		"empty bucket":      "oci://n/example-ns/b//o/adapters/test-adapter",
+		"empty object path": "oci://n/example-ns/b/example-bucket/o/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cl := fakeClientWithWeight(t, "test-weight", uri)
+			injector := newTestFineTunedAdapterInjector(t, cl, "InstancePrincipal")
+			pod := adapterTestPod("test-weight", nil)
+
+			err := injector.InjectFineTunedAdapter(pod)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), uri)
+			assert.Empty(t, pod.Spec.InitContainers)
+		})
+	}
+}

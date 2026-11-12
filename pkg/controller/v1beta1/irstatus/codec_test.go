@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,12 +20,14 @@ const testLimit = 5000
 func TestRoundTripPreservesEveryRetainedField(t *testing.T) {
 	t.Parallel()
 	fixtures := map[string][]v1beta1.OMENativeInstanceStatus{
-		"full feature":   fullFeatureRows(),
-		"wire example":   wireExampleRows(),
-		"representative": representativeRows(1000),
-		"uniform":        uniformRows(2000),
-		"mass failure":   massFailureRows(),
-		"single row":     uniformRows(1),
+		"full feature":    fullFeatureRows(),
+		"wire example":    wireExampleRows(),
+		"representative":  representativeRows(1000),
+		"uniform":         uniformRows(2000),
+		"readySince":      readySinceRows(1000),
+		"readySince gang": readySinceGangRows(300, 8),
+		"mass failure":    massFailureRows(),
+		"single row":      uniformRows(1),
 	}
 	for name, rows := range fixtures {
 		t.Run(name, func(t *testing.T) {
@@ -70,6 +73,11 @@ func TestDecodedRowsShareNothingWithThePayload(t *testing.T) {
 			*entry.ReadySince = fixtureTimePlus(48 * time.Hour)
 		}
 	}
+	if columns.ReadySinceBase == nil || len(columns.ReadySinceOffsets) == 0 {
+		t.Fatal("the fixture's readySince is not in the readySince columns")
+	}
+	*columns.ReadySinceBase = fixtureTimePlus(48 * time.Hour)
+	columns.ReadySinceOffsets[0] = 7
 	assertRowsEqual(t, rows, decoded)
 }
 
@@ -398,9 +406,10 @@ func TestExplicitEmptyConditionsNormalizeLikeDenseV1(t *testing.T) {
 	rows[0].Conditions = []metav1.Condition{}
 	rows[1].Conditions = []metav1.Condition{}
 	rows[1].ReadySince = &fixtureTime
+	rows[1].Announced = []string{"GangPodGroupRebuilt@1"}
 	columns := mustEncode(t, rows, testLimit)
-	if len(columns.Entries) != 1 || columns.Entries[0].Index != 1 || columns.Entries[0].Conditions != nil {
-		t.Fatalf("empty conditions must not create or populate an entry: %+v", columns.Entries)
+	if len(columns.Entries) != 1 || columns.Entries[0].Index != 1 || columns.Entries[0].Conditions != nil || columns.Entries[0].ReadySince != nil {
+		t.Fatalf("empty conditions must not create or populate an entry, and the readySince columns carry the time: %+v", columns.Entries)
 	}
 	decoded := mustDecode(t, columns, testLimit)
 	assertRowsEqual(t, rows, decoded)
@@ -410,27 +419,27 @@ func TestExplicitEmptyConditionsNormalizeLikeDenseV1(t *testing.T) {
 }
 
 // rowFieldDispositions is the codec's disposition for every JSON field of a
-// dense row. A new row field must be added here with its column, its entry
-// placement, or an explicit not-stored decision.
-var rowFieldDispositions = map[string]string{
-	"index":             "members",
-	"incarnation":       "incarnations",
-	"phase":             "phases",
-	"runningRevision":   "runningRevisions",
-	"targetRevision":    "targetRevisions",
-	"podCount":          "podCounts",
-	"readyPodCount":     "not stored",
-	"servingPodCount":   "servingPodCounts",
-	"availablePodCount": "availablePodCounts",
-	"scheduledPodCount": "not stored",
-	"admitted":          "admitted",
-	"nodesOccupied":     "not stored",
-	"conditions":        "entries",
-	"readySince":        "entries",
-	"operation":         "entries",
-	"activeOrdinal":     "activeOrdinalOne",
-	"lastFailure":       "entries",
-	"announced":         "entries",
+// dense row: the columns that store it, its entry placement, or an explicit
+// not-stored decision. A new row field must be added here.
+var rowFieldDispositions = map[string][]string{
+	"index":             {"members"},
+	"incarnation":       {"incarnations"},
+	"phase":             {"phases"},
+	"runningRevision":   {"runningRevisions"},
+	"targetRevision":    {"targetRevisions"},
+	"podCount":          {"podCounts"},
+	"readyPodCount":     {"not stored"},
+	"servingPodCount":   {"servingPodCounts"},
+	"availablePodCount": {"availablePodCounts"},
+	"scheduledPodCount": {"not stored"},
+	"admitted":          {"admitted"},
+	"nodesOccupied":     {"not stored"},
+	"conditions":        {"entries"},
+	"readySince":        {"readySinceBase", "readySinceIndexes", "readySinceOffsets", "entries"},
+	"operation":         {"entries"},
+	"activeOrdinal":     {"activeOrdinalOne"},
+	"lastFailure":       {"entries"},
+	"announced":         {"entries"},
 }
 
 func TestEveryRowFieldHasACodecDisposition(t *testing.T) {
@@ -462,8 +471,10 @@ func TestEveryRowFieldHasACodecDisposition(t *testing.T) {
 	}
 
 	targets := make(map[string]bool)
-	for _, target := range rowFieldDispositions {
-		targets[target] = true
+	for _, places := range rowFieldDispositions {
+		for _, target := range places {
+			targets[target] = true
+		}
 	}
 	for _, name := range jsonNames(reflect.TypeOf(v1beta1.InstanceStatusColumns{})) {
 		if name != "rowOrder" && !targets[name] {
@@ -471,7 +482,7 @@ func TestEveryRowFieldHasACodecDisposition(t *testing.T) {
 		}
 	}
 	for _, name := range jsonNames(reflect.TypeOf(v1beta1.InstanceStatusEntry{})) {
-		if name != "index" && rowFieldDispositions[name] != "entries" {
+		if name != "index" && !slices.Contains(rowFieldDispositions[name], "entries") {
 			t.Errorf("entry field %q is not an entry-disposition row field", name)
 		}
 	}

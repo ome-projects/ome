@@ -6,10 +6,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/rollout"
 )
 
 // Tests for RepinPending: a run is pinned and the repin annotation is
@@ -28,6 +30,9 @@ func TestTheRepinVerbIsConsumedBeforeTheRunIsJudged(t *testing.T) {
 		// whose group is edited to a rolling update.
 		canary bool
 		apply  func(t *testing.T, isvc *v1beta1.InferenceService) []runtime.Object
+		// modes is the deployment modes the pass after the plan reread reads; nil
+		// reads every member as OMENative.
+		modes map[v1beta1.ComponentType]constants.DeploymentModeType
 		// after is what the pass after the repin does.
 		after func(t *testing.T, isvc *v1beta1.InferenceService, out Outcome)
 	}
@@ -136,7 +141,7 @@ func TestTheRepinVerbIsConsumedBeforeTheRunIsJudged(t *testing.T) {
 			name: "coord.staged",
 			apply: func(t *testing.T, isvc *v1beta1.InferenceService) []runtime.Object {
 				setCoordinationPhase(isvc, v1beta1.CoordinationPhaseStaged)
-				return []runtime.Object{stragglingIR(newRev)}
+				return []runtime.Object{stagedIR()}
 			},
 			after: closes(v1beta1.RolloutRunCompleted),
 		},
@@ -167,6 +172,19 @@ func TestTheRepinVerbIsConsumedBeforeTheRunIsJudged(t *testing.T) {
 				return []runtime.Object{divergedIR(oldRev, newRev)}
 			},
 			after: stillPinned,
+		},
+		{
+			// The engine leaves the mode with the plan reread written in the same
+			// pass: the verb is read first and the plan replaced with the
+			// decoder group that took the engine's place; the next pass
+			// reads the engine as departed and closes the run.
+			name: "spec.modeSwitch", canary: true,
+			apply: func(t *testing.T, isvc *v1beta1.InferenceService) []runtime.Object {
+				isvc.Spec.Rollout.Groups = []v1beta1.RolloutGroup{{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, Canary: canaryBody(25, 100)}}
+				return []runtime.Object{divergedIR(oldRev, newRev), settledDecoderIR(decoderCurrentRev)}
+			},
+			modes: modesWith(v1beta1.EngineComponent),
+			after: closes(v1beta1.RolloutRunSuperseded),
 		},
 	}
 	for _, s := range stories {
@@ -199,7 +217,11 @@ func TestTheRepinVerbIsConsumedBeforeTheRunIsJudged(t *testing.T) {
 			if isvc.Status.Rollout.LastRun != nil {
 				t.Fatalf("the repin pass closed or retargeted the run: %+v", isvc.Status.Rollout.LastRun)
 			}
-			s.after(t, isvc, passAt(t, isvc, time.Unix(3000, 0), objects...))
+			after, _ := passWith(t, isvc, func(in *Inputs) {
+				in.Now = time.Unix(3000, 0)
+				in.ComponentDeploymentModes = s.modes
+			}, objects...)
+			s.after(t, isvc, after)
 		})
 	}
 }
@@ -326,4 +348,108 @@ func TestARepinPinsTheBodyThatResolvesAgain(t *testing.T) {
 		t.Fatalf("pinned body = %+v, want the body that resolved again", run.Plan.Groups[0].Group.Canary)
 	}
 	requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+}
+
+// twoCanaryUnits is a router unit and an engine unit, each its own canary
+// group with the given step lists, declared Concurrent.
+func twoCanaryUnits(router, engine *v1beta1.GroupCanary) *v1beta1.InferenceService {
+	one := 1
+	ordering := v1beta1.RolloutGroupOrderingConcurrent
+	return &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "llm-a", Namespace: "ns"},
+		Spec: v1beta1.InferenceServiceSpec{
+			Engine: &v1beta1.EngineSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &one}},
+			Router: &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &one}},
+			Rollout: &v1beta1.RolloutSpec{
+				GroupOrdering: &ordering,
+				Groups: []v1beta1.RolloutGroup{
+					{Components: []v1beta1.ComponentType{v1beta1.RouterComponent}, Canary: router},
+					{Components: []v1beta1.ComponentType{v1beta1.EngineComponent}, Canary: engine},
+				},
+			},
+		},
+	}
+}
+
+// setUnitRecord writes a unit's record and its primary's phase.
+func setUnitRecord(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, phase v1beta1.RolloutPhase, cs *v1beta1.CanaryStatus) {
+	if isvc.Status.Components == nil {
+		isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
+	}
+	status := isvc.Status.Components[c]
+	status.RolloutPhase = phase
+	status.Canary = cs
+	isvc.Status.Components[c] = status
+}
+
+// A plan verb clamps every canary unit against the list that unit ran
+// under. Two units holding records whose lists shrink to a single 100
+// percent step are both held before the raise; a router sitting the run out
+// under a two-step list does not make an engine at the third step of its
+// four-step list read as finished.
+func TestAPlanReloadClampsEachCanaryUnitAgainstItsOwnList(t *testing.T) {
+	router, engine := v1beta1.RouterComponent, v1beta1.EngineComponent
+	type want struct {
+		step int32
+		hold bool
+	}
+	for _, tc := range []struct {
+		name       string
+		routerIR   *v1beta1.InferenceReplica
+		router     *v1beta1.CanaryStatus
+		editRouter *v1beta1.GroupCanary
+		editEngine *v1beta1.GroupCanary
+		engine     v1beta1.CanaryStatus
+		wantRouter *want
+		wantEngine want
+	}{
+		{
+			name:       "two units with records are each held before their own raise",
+			routerIR:   namedIR("llm-a-router", routerStableRev, routerNewRev),
+			router:     &v1beta1.CanaryStatus{CurrentStep: 0, ObservedTrafficWeight: 50},
+			editRouter: canaryBody(100),
+			editEngine: canaryBody(10, 100),
+			engine:     v1beta1.CanaryStatus{CurrentStep: 1, ObservedTrafficWeight: 30},
+			wantRouter: &want{step: 0, hold: true},
+			wantEngine: want{step: 1, hold: true},
+		},
+		{
+			name:       "a router sitting the run out leaves the engine's third step where it is",
+			routerIR:   namedIR("llm-a-router", routerStableRev, routerStableRev),
+			editRouter: canaryBody(20, 100),
+			editEngine: canaryBody(10, 30, 60, 100),
+			engine:     v1beta1.CanaryStatus{CurrentStep: 2, ObservedTrafficWeight: 60},
+			wantEngine: want{step: 2, hold: false},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := twoCanaryUnits(canaryBody(50, 100), canaryBody(10, 30, 60, 100))
+			engineIR := namedIR("llm-a-engine", engineStableRev, engineNewRev)
+			if out := pass(t, isvc, tc.routerIR, engineIR); !out.Opened {
+				t.Fatalf("fixture: %+v, want an open", out)
+			}
+			if tc.router != nil {
+				tc.router.CanaryRevisionHash, tc.router.StableRevisionHash = hashOf(t, routerNewRev), hashOf(t, routerStableRev)
+				setUnitRecord(isvc, router, v1beta1.RolloutPhasePaused, tc.router)
+			}
+			cs := tc.engine
+			cs.CanaryRevisionHash, cs.StableRevisionHash = hashOf(t, engineNewRev), hashOf(t, engineStableRev)
+			setUnitRecord(isvc, engine, v1beta1.RolloutPhasePaused, &cs)
+			isvc.Spec.Rollout.Groups[0].Canary, isvc.Spec.Rollout.Groups[1].Canary = tc.editRouter, tc.editEngine
+			annotate(isvc, constants.RolloutRepinAnnotation, "now")
+			if out := pass(t, isvc, tc.routerIR, engineIR); !out.StateChanged {
+				t.Fatalf("the plan verb must apply: %+v", out)
+			}
+			got := rollout.CanaryStatusFor(&isvc.Status, engine)
+			if got.CurrentStep != tc.wantEngine.step || got.PreStepHold != tc.wantEngine.hold {
+				t.Errorf("engine step %d hold %v, want step %d hold %v", got.CurrentStep, got.PreStepHold, tc.wantEngine.step, tc.wantEngine.hold)
+			}
+			if tc.wantRouter != nil {
+				got := rollout.CanaryStatusFor(&isvc.Status, router)
+				if got.CurrentStep != tc.wantRouter.step || got.PreStepHold != tc.wantRouter.hold {
+					t.Errorf("router step %d hold %v, want step %d hold %v", got.CurrentStep, got.PreStepHold, tc.wantRouter.step, tc.wantRouter.hold)
+				}
+			}
+		})
+	}
 }

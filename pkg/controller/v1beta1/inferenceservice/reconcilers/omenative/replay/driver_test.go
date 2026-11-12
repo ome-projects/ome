@@ -155,3 +155,67 @@ func TestStaleStatusKeepsTheLastPublication(t *testing.T) {
 		t.Fatalf("unknown lag: %v", err)
 	}
 }
+
+const restartWalk = `scenario: restart
+cells: ["run/example-cell"]
+initial:
+  service:
+    components:
+      engine: {replicas: 2, image: registry.example.com/runtime:v1}
+    groups:
+      - components: [engine]
+        blueGreen: {}
+  config: {requeue: 10s}
+timeline:
+  - tick: 1
+    note: settled
+  - tick: 2
+    events:
+      - spec.revision[new]: {component: engine, image: registry.example.com/runtime:v2}
+  - tick: 3
+    events:
+      - ctrl.resync
+  - tick: 4
+    events:
+      - ctrl.crash: {leaseWait: 1m}
+  - tick: 5
+    events:
+      - ctrl.crash
+`
+
+// A manager restart between two passes changes nothing the run layer
+// reads: the replacement finds the same recorded run under the same id
+// and opens nothing again, and the Lease wait is the only mark the restart leaves,
+// on the clock.
+func TestAManagerRestartResumesTheRunFromStatus(t *testing.T) {
+	s, err := Parse([]byte(restartWalk), Vocabulary{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace, err := Run(context.Background(), s, Options{})
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, trace)
+	}
+	for _, want := range []string{
+		"tick=3 run outcome=opened stateChanged=true",
+		"tick=4 apply ctrl.crash leaseWait=1m0s now=t+1m0s",
+		"tick=5 apply ctrl.crash now=t+1m0s",
+	} {
+		if !strings.Contains(trace, want) {
+			t.Errorf("trace lacks %q\n%s", want, trace)
+		}
+	}
+	recordedRuns := map[string]string{}
+	for _, line := range strings.Split(trace, "\n") {
+		tick, rest, _ := strings.Cut(line, " ")
+		if strings.HasPrefix(rest, "run active id=") {
+			recordedRuns[tick] = rest
+		}
+		if strings.HasPrefix(rest, "run outcome=opened") && tick != "tick=3" {
+			t.Errorf("the run opened again on %s\n%s", tick, trace)
+		}
+	}
+	if recordedRuns["tick=3"] == "" || recordedRuns["tick=4"] != recordedRuns["tick=3"] || recordedRuns["tick=5"] != recordedRuns["tick=3"] {
+		t.Fatalf("the recorded run changed across the restart: %v\n%s", recordedRuns, trace)
+	}
+}

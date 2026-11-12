@@ -12,6 +12,7 @@ import (
 	"go.uber.org/fx"
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica"
+	"sigs.k8s.io/ome/pkg/agentconfig"
 	"sigs.k8s.io/ome/pkg/constants"
 )
 
@@ -37,7 +38,7 @@ func TestConfigProviderPassesArtifactReuseEnvironmentOverrideToReplicaConfig(t *
 	)
 	require.NoError(t, app.Err())
 
-	config, err := replica.NewReplicaConfig(replica.WithViper(configuredViper))
+	config, err := agentconfig.Load(configuredViper, replica.Config{})
 	require.NoError(t, err)
 	assert.True(t, config.TargetArtifactReuseAllowed)
 }
@@ -73,7 +74,7 @@ func TestConfigProviderLeavesArtifactReuseDisabledWithoutEnvironmentOverride(t *
 	)
 	require.NoError(t, app.Err())
 
-	config, err := replica.NewReplicaConfig(replica.WithViper(configuredViper))
+	config, err := agentconfig.Load(configuredViper, replica.Config{})
 	require.NoError(t, err)
 	assert.False(t, config.TargetArtifactReuseAllowed)
 }

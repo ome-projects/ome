@@ -1,0 +1,43 @@
+{{- /*
+  The Split plan validator plans each ClusterAffinity Split service across
+  the WorkloadClusters registered on the control plane and refuses one the
+  placer would hold. Only the control plane holds those registrations and
+  serves this handler, so the config renders under that role alone.
+  failurePolicy Ignore admits every write while the webhook is unreachable,
+  so an outage of the handler never blocks the control plane.
+*/ -}}
+{{- if eq .Values.ome.multicluster.role "control-plane" }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  creationTimestamp: null
+  name: inferenceservice-splitplan.ome.io
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/serving-cert
+webhooks:
+  - clientConfig:
+      caBundle: Cg==
+      service:
+        name: ome-webhook-server-service
+        namespace: {{ .Release.Namespace }}
+        path: /validate-ome-io-v1beta1-inferenceservice-splitplan
+    failurePolicy: Ignore
+    name: inferenceservice.ome-webhook-server.splitplan-validator
+    sideEffects: None
+    admissionReviewVersions: ["v1"]
+    # Objects already being deleted skip admission, so finalizer removal
+    # never waits on the plan check.
+    matchConditions:
+      - name: skip-deletion
+        expression: "!has(object.metadata.deletionTimestamp)"
+    rules:
+      - apiGroups:
+          - ome.io
+        apiVersions:
+          - v1beta1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - inferenceservices
+{{- end }}

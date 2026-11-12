@@ -69,7 +69,7 @@ func TestCheckPairing_CanaryGroupHoldsTheLastOldEngineUntilATargetDecoderServes(
 	}
 }
 
-// The drain-time twin: under the same canary group the engine's old pod
+// The drain-time counterpart: under the same canary group the engine's old pod
 // stays in rotation while its replacement serves proto-b and no decoder
 // does, and leaves once one serves.
 func TestEvaluatePairingDrain_CanaryGroupKeepsTheOldEnginePodUntilATargetDecoderServes(t *testing.T) {
@@ -127,28 +127,32 @@ func TestCheckPairing_CanaryGroupPairableMinimumIsTheComponentsOwnBudget(t *test
 	}
 }
 
-// A canary unit is not batched, so the gate reads no side named first and
-// orders a pair down to one Instance each itself: the decoder's rebuild
-// waits while the engine's surge keeps the pair, under the chart's
-// decoder-first setting too. The same pair in a blueGreen group is ordered
-// by the batch step, and the gate lets the named side go first.
-func TestCheckPairing_CanaryGroupReadsNoFirstSide(t *testing.T) {
+// A pairing-protocol change under a canary group that lists engine and
+// decoder is ordered the way a blueGreen group's is: the batch step moves
+// the named side first inside every batch, so the pairing gate lets the
+// named decoder's rebuild go first while the engine's surge keeps the pair,
+// under the chart's decoder-first setting, in both group kinds. With no
+// side named the gate orders a pair down to one Instance each itself: the
+// decoder's rebuild waits while the engine's surge keeps the pair.
+func TestCheckPairing_CanaryGroupReadsTheFirstSideLikeABlueGreenGroup(t *testing.T) {
 	objs := []client.Object{
 		withLifecycle(pairingIR("prod", "llama", v1beta1.EngineComponent, servingInstances("llama", v1beta1.EngineComponent, "ea")), 1, v1beta1.UpdateStrategySurgeThenDrain, 0),
 		pairingCR("prod", "llama", v1beta1.EngineComponent, "ea", "proto-a"),
 		withLifecycle(pairingIR("prod", "llama", v1beta1.DecoderComponent, servingInstances("llama", v1beta1.DecoderComponent, "da")), 1, v1beta1.UpdateStrategyRecreatePod, 1),
 		pairingCR("prod", "llama", v1beta1.DecoderComponent, "da", "proto-a"),
 	}
-	ask := func(isvc *v1beta1.InferenceService) (bool, string) {
-		gate := pairingGateWith(t, isvc, v1beta1.DecoderComponent, keepRatioDecoderFirst(5), objs...)
+	ask := func(isvc *v1beta1.InferenceService, defaults GroupDefaults) (bool, string) {
+		gate := pairingGateWith(t, isvc, v1beta1.DecoderComponent, defaults, objs...)
 		return gate.CheckPairing("llama-decoder-da", workloadtypes.UpdateStrategyRecreatePod, 0, 0)
 	}
-	if ok, reason := ask(pairingISVC("proto-b")); !ok {
-		t.Fatalf("blueGreen group: the batch step orders the sides, so the named decoder goes first; got held (%s)", reason)
+	for name, isvc := range map[string]*v1beta1.InferenceService{"blueGreen group": pairingISVC("proto-b"), "canary group": canaryPairingISVC("proto-b")} {
+		if ok, reason := ask(isvc, keepRatioDecoderFirst(5)); !ok {
+			t.Fatalf("%s: the batch step orders the sides, so the named decoder goes first; got held (%s)", name, reason)
+		}
 	}
-	ok, reason := ask(canaryPairingISVC("proto-b"))
+	ok, reason := ask(canaryPairingISVC("proto-b"), keepRatio(5))
 	if ok {
-		t.Fatalf("canary group: the decoder's rebuild must wait for the engine's surge; got allowed (%s)", reason)
+		t.Fatalf("canary group, no side named: the decoder's rebuild must wait for the engine's surge; got allowed (%s)", reason)
 	}
 	if !strings.Contains(reason, "the engine surges, keeping its pod in rotation") {
 		t.Errorf("the hold must say the engine's surge keeps the pair: %s", reason)

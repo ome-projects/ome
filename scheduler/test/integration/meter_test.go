@@ -14,23 +14,23 @@ import (
 	"k8s.io/component-base/metrics/legacyregistry"
 )
 
-// discardedPodMarker is the scheduler's log line for a pod its queue popped
+// discardedPodLogLine is the scheduler's log line for a pod its queue popped
 // while an older copy of the same pod was still in flight. The newer copy is
 // dropped, and once the older one is done the pod is in no queue at all. The
 // scheduler exports no metric for it, so the suite counts the log line.
-const discardedPodMarker = "The same pod is tracked in multiple places in the scheduler"
+const discardedPodLogLine = "The same pod is tracked in multiple places in the scheduler"
 
 // logCounter forwards scheduler log output and counts the lines that carry a
-// marker, so a test can assert on a log line it has no metric for.
+// pattern, so a test can assert on a log line it has no metric for.
 type logCounter struct {
-	out    io.Writer
-	marker []byte
-	mu     sync.Mutex
-	count  int64
+	out     io.Writer
+	pattern []byte
+	mu      sync.Mutex
+	count   int64
 }
 
 func (c *logCounter) Write(p []byte) (int, error) {
-	if n := bytes.Count(p, c.marker); n > 0 {
+	if n := bytes.Count(p, c.pattern); n > 0 {
 		c.mu.Lock()
 		c.count += int64(n)
 		c.mu.Unlock()

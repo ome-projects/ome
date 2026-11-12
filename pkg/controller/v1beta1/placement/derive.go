@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -27,8 +28,22 @@ import (
 // no LocalQueueAnnotation; with neither set the queue label is left unstamped.
 func DeriveISVC(src *v1beta1.InferenceService, controlPlaneID, localQueue string) *v1beta1.InferenceService {
 	d := src.DeepCopy()
+	clearControlPlaneState(d)
+	setOriginLabels(d, src.UID, controlPlaneID)
+	stripControlPlaneAnnotations(d)
+	if src.Spec.Placement.UsesClusterAffinity() {
+		d.Annotations[constants.PlacementPolicy] = string(v1beta1.PlacementPolicyClusterAffinity)
+	}
+	if queue := derivedQueue(src, localQueue); queue != "" {
+		setQueueLabelOnComponents(&d.Spec, queue)
+	}
+	return d
+}
 
-	// Clear server-side / control-plane state.
+// clearControlPlaneState removes what the control plane's apiserver owns
+// (identity, generation, lifecycle and status) and the two spec blocks only
+// the control plane reconciles, routing and placement.
+func clearControlPlaneState(d *v1beta1.InferenceService) {
 	d.ResourceVersion = ""
 	d.UID = ""
 	d.Generation = 0
@@ -40,63 +55,73 @@ func DeriveISVC(src *v1beta1.InferenceService, controlPlaneID, localQueue string
 	d.Status = v1beta1.InferenceServiceStatus{}
 	d.Spec.Routing = nil
 	d.Spec.Placement = nil
+}
 
-	// Resolve queue name: per-ISVC annotation, then the operator-configured queue.
-	queue := src.Annotations[LocalQueueAnnotation]
-	if queue == "" {
-		queue = localQueue
-	}
-
-	// Add origin markers.
+// setOriginLabels records the source's UID as a label and an annotation and,
+// when the operator configured one, the control plane's identity, so a GC
+// sweep over a shared workload cluster removes only the derived objects this
+// control plane made. An empty id leaves that label unset.
+func setOriginLabels(d *v1beta1.InferenceService, sourceUID types.UID, controlPlaneID string) {
 	if d.Labels == nil {
 		d.Labels = make(map[string]string)
 	}
-	d.Labels[PlacementOriginLabel] = string(src.UID)
-	// Stamp the control-plane identity so GC across shared workload clusters can
-	// tell our deriveds apart from another control plane's. Config-driven, no
-	// in-code default: an empty id leaves the label unset (single-CP behavior).
+	d.Labels[PlacementOriginLabel] = string(sourceUID)
 	if controlPlaneID != "" {
 		d.Labels[PlacementControlPlaneLabel] = controlPlaneID
 	}
 	if d.Annotations == nil {
 		d.Annotations = make(map[string]string)
 	}
-	d.Annotations[PlacementOriginUIDAnnotation] = string(src.UID)
-	// Strip control-plane-only directives so they do not ride along to the
-	// worker: the placement selectors, the rollout operator verbs, and the
-	// source's GitOps bookkeeping.
+	d.Annotations[PlacementOriginUIDAnnotation] = string(sourceUID)
+}
+
+// stripControlPlaneAnnotations drops the directives only the control plane
+// reads: the placement selectors, the rollout operator verbs, the placement
+// policy and the annotation families of the source's deployer and of the
+// routing publisher. The worker reconciler must not act on them.
+func stripControlPlaneAnnotations(d *v1beta1.InferenceService) {
 	for _, k := range controlPlaneOnlyAnnotations {
 		delete(d.Annotations, k)
 	}
 	delete(d.Annotations, constants.PlacementPolicy)
-	if src.Spec.Placement.UsesClusterAffinity() {
-		d.Annotations[constants.PlacementPolicy] = string(v1beta1.PlacementPolicyClusterAffinity)
-	}
 	for k := range d.Annotations {
-		for _, p := range controlPlaneOnlyAnnotationPrefixes {
-			if strings.HasPrefix(k, p) {
-				delete(d.Annotations, k)
-				break
-			}
+		if hasControlPlaneOnlyPrefix(k) {
+			delete(d.Annotations, k)
 		}
 	}
+}
 
-	// Stamp Kueue gating on each component. An unresolved queue leaves the label
-	// off — the queue names an operator-provisioned resource, so there is no
-	// in-code default to guess.
-	if queue != "" {
-		if d.Spec.Engine != nil {
-			stampQueue(&d.Spec.Engine.ComponentExtensionSpec, queue)
-		}
-		if d.Spec.Decoder != nil {
-			stampQueue(&d.Spec.Decoder.ComponentExtensionSpec, queue)
-		}
-		if d.Spec.Router != nil {
-			stampQueue(&d.Spec.Router.ComponentExtensionSpec, queue)
+func hasControlPlaneOnlyPrefix(key string) bool {
+	for _, p := range controlPlaneOnlyAnnotationPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
 		}
 	}
+	return false
+}
 
-	return d
+// derivedQueue is the Kueue queue the derived workload joins: the source's
+// annotation first, then the operator-configured queue. The queue names a
+// resource the operator provisioned, so with neither set it is empty.
+func derivedQueue(src *v1beta1.InferenceService, localQueue string) string {
+	if queue := src.Annotations[LocalQueueAnnotation]; queue != "" {
+		return queue
+	}
+	return localQueue
+}
+
+// setQueueLabelOnComponents puts the queue label on the pod metadata of the
+// engine, the decoder and the router, whichever the spec declares.
+func setQueueLabelOnComponents(spec *v1beta1.InferenceServiceSpec, queue string) {
+	if spec.Engine != nil {
+		stampQueue(&spec.Engine.ComponentExtensionSpec, queue)
+	}
+	if spec.Decoder != nil {
+		stampQueue(&spec.Decoder.ComponentExtensionSpec, queue)
+	}
+	if spec.Router != nil {
+		stampQueue(&spec.Router.ComponentExtensionSpec, queue)
+	}
 }
 
 // inflateRolloutGroups rewrites every ref-carrying rollout group on a derived

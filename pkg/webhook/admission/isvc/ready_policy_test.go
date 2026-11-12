@@ -264,3 +264,28 @@ func TestValidateUpdate_MultiPodReadyPolicyNoneRatchet(t *testing.T) {
 		})
 	}
 }
+
+// TestMultiPodReadyPolicyNoneComponents_ReadsEveryDeclaredRole locks the
+// walk over the role table: every declared role is read in the order of
+// v1beta1.Roles, and only a role with a declared Leader+Worker pair is
+// named. The encoder and the router declare none, so None on them is
+// admitted: at one pod per replica None and AllPodReady agree.
+func TestMultiPodReadyPolicyNoneComponents_ReadsEveryDeclaredRole(t *testing.T) {
+	none := readyPolicyPtr(v1beta1.InstanceReadyPolicyNone)
+	runner := &v1beta1.RunnerSpec{Container: v1.Container{Image: "runtime-image:v1"}}
+	lifecycleNone := v1beta1.ComponentExtensionSpec{Lifecycle: &v1beta1.LifecycleSpec{ReadyPolicy: none}}
+	size := 2
+	isvc := readyPolicyISVC(func(isvc *v1beta1.InferenceService) {
+		isvc.Annotations = map[string]string{constants.DeploymentMode: string(constants.OMENative)}
+		isvc.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: lifecycleNone, Runner: runner.DeepCopy()}
+		isvc.Spec.Encoder = &v1beta1.EncoderSpec{ComponentExtensionSpec: lifecycleNone, Runner: runner.DeepCopy()}
+		isvc.Spec.Decoder = &v1beta1.DecoderSpec{
+			ComponentExtensionSpec: lifecycleNone,
+			Leader:                 &v1beta1.LeaderSpec{Runner: runner.DeepCopy()},
+			Worker:                 &v1beta1.WorkerSpec{Size: &size, Runner: runner.DeepCopy()},
+		}
+		isvc.Spec.Engine = multiPodEngine(2, none)
+	})
+
+	assert.Equal(t, []string{"engine", "decoder"}, multiPodReadyPolicyNoneComponents(isvc))
+}

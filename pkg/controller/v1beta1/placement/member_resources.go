@@ -35,139 +35,252 @@ type memberPodSlot struct {
 // countMemberResources counts whole physical instances and durable surge slots
 // without treating a pending or terminating Pod as released capacity.
 func countMemberResources(ir *v1beta1.InferenceReplica, pods []corev1.Pod, gangSizes map[string]int32) (memberResourceCount, error) {
-	var out memberResourceCount
+	if err := checkMemberShape(ir); err != nil {
+		return memberResourceCount{}, err
+	}
+	live, err := occupiedMemberSlots(ir, pods)
+	if err != nil {
+		return memberResourceCount{}, err
+	}
+	rows, err := memberRows(ir)
+	if err != nil {
+		return memberResourceCount{}, err
+	}
+	reserved, err := countMemberReservations(ir, rows, live.slots)
+	if err != nil {
+		return memberResourceCount{}, err
+	}
+	return memberResourceCount{
+		Occupied: live.occupied,
+		Reserved: reserved,
+		Ready:    min(countReadyMemberRows(ir, live.byIndex, gangSizes), ir.Status.ReadyReplicas),
+	}, nil
+}
+
+// checkMemberShape refuses a member the count cannot trust: one without an
+// identity or a runner shape, a runner of unresolved size, or a negative
+// ready count.
+func checkMemberShape(ir *v1beta1.InferenceReplica) error {
 	if ir == nil || ir.UID == "" || len(ir.Spec.Runners) == 0 {
-		return out, fmt.Errorf("physical accounting requires an identified component and runner shape")
+		return fmt.Errorf("physical accounting requires an identified component and runner shape")
 	}
 	for _, runner := range ir.Spec.Runners {
 		if runner.Size <= 0 {
-			return out, fmt.Errorf("component runner size is unresolved")
+			return fmt.Errorf("component runner size is unresolved")
 		}
 	}
 	if ir.Status.ReadyReplicas < 0 {
-		return out, fmt.Errorf("component ready count is negative")
+		return fmt.Errorf("component ready count is negative")
 	}
-	slots := map[memberPodSlot][]*corev1.Pod{}
-	byIndex := map[int32][]*corev1.Pod{}
+	return nil
+}
+
+// memberPods are the live pods of one member: by slot, where a gang's pods
+// share one slot, and by instance index, with the whole replicas they occupy.
+type memberPods struct {
+	slots    map[memberPodSlot][]*corev1.Pod
+	byIndex  map[int32][]*corev1.Pod
+	occupied int32
+}
+
+// occupiedMemberSlots files every pod the member controls under its slot. A
+// pod outside the member's control, or without an identity, is an error.
+func occupiedMemberSlots(ir *v1beta1.InferenceReplica, pods []corev1.Pod) (memberPods, error) {
+	live := memberPods{slots: map[memberPodSlot][]*corev1.Pod{}, byIndex: map[int32][]*corev1.Pod{}}
 	for i := range pods {
 		pod := &pods[i]
-		owner := metav1.GetControllerOf(pod)
-		if owner == nil || owner.UID != ir.UID || owner.Kind != "InferenceReplica" || owner.APIVersion != v1beta1.SchemeGroupVersion.String() || pod.UID == "" {
-			return out, fmt.Errorf("pod %q has unverified component ownership", pod.Name)
+		if !controlledByMember(metav1.GetControllerOf(pod), ir) || pod.UID == "" {
+			return live, fmt.Errorf("pod %q has unverified component ownership", pod.Name)
 		}
 		slot, err := memberSlot(pod)
 		if err != nil {
-			return out, err
+			return live, err
 		}
-		byIndex[slot.Index] = append(byIndex[slot.Index], pod)
-		// PodGroup identity survives changes to the component's desired shape.
-		// An incomplete gang still occupies one whole replica.
-		if slot.Group != "" {
-			slot.Ordinal = 0
+		if err := live.add(slot, pod); err != nil {
+			return live, err
 		}
-		if slot.Group == "" || len(slots[slot]) == 0 {
-			if out.Occupied == math.MaxInt32 {
-				return out, fmt.Errorf("physical replica count exceeds int32")
-			}
-			out.Occupied++
-		}
-		slots[slot] = append(slots[slot], pod)
 	}
-	rows := map[int32]v1beta1.OMENativeInstanceStatus{}
+	return live, nil
+}
+
+// add files the pod under its slot and its index. A gang's pods share one
+// slot, so PodGroup identity survives changes to the component's desired shape
+// and an incomplete gang still occupies one whole replica.
+func (m *memberPods) add(slot memberPodSlot, pod *corev1.Pod) error {
+	m.byIndex[slot.Index] = append(m.byIndex[slot.Index], pod)
+	if slot.Group != "" {
+		slot.Ordinal = 0
+	}
+	if slot.Group == "" || len(m.slots[slot]) == 0 {
+		if m.occupied == math.MaxInt32 {
+			return fmt.Errorf("physical replica count exceeds int32")
+		}
+		m.occupied++
+	}
+	m.slots[slot] = append(m.slots[slot], pod)
+	return nil
+}
+
+// controlledByMember reports whether owner is the member's own controller
+// reference: its UID, its kind and its API version.
+func controlledByMember(owner *metav1.OwnerReference, ir *v1beta1.InferenceReplica) bool {
+	return owner != nil && owner.UID == ir.UID && owner.Kind == "InferenceReplica" && owner.APIVersion == v1beta1.SchemeGroupVersion.String()
+}
+
+// memberRows indexes the member's instance rows; an index that repeats is an
+// error.
+func memberRows(ir *v1beta1.InferenceReplica) (map[int32]v1beta1.OMENativeInstanceStatus, error) {
+	rows := make(map[int32]v1beta1.OMENativeInstanceStatus, len(ir.Status.InstanceStatuses))
 	for _, row := range ir.Status.InstanceStatuses {
 		if _, duplicate := rows[row.Index]; duplicate {
-			return out, fmt.Errorf("component contains duplicate instance %d", row.Index)
+			return nil, fmt.Errorf("component contains duplicate instance %d", row.Index)
 		}
 		rows[row.Index] = row
-		// A steady row and an exact live Pod cohort provide readiness credit.
-		// In-flight operations keep their occupancy without promising replacement
-		// readiness from a cached aggregate or a partially materialized gang.
-		live := byIndex[row.Index]
-		if row.Phase != v1beta1.OMENativeInstanceReady || !row.Admitted || row.Operation != nil || row.PodCount <= 0 || int64(len(live)) != int64(row.PodCount) || row.ServingPodCount != row.PodCount {
-			continue
-		}
-		ready := true
-		for _, pod := range live {
-			slot, _ := memberSlot(pod)
-			expected := int32(1)
-			if slot.Group != "" {
-				expected = gangSizes[slot.Group]
-			}
-			ready = ready && expected > 0 && int64(len(live)) == int64(expected)
-			ready = ready && slot.Incarnation == row.Incarnation && slot.Revision == query.RevisionHashFromControllerRevisionName(row.RunningRevision) && livePodReady(pod)
-		}
-		if ready {
-			out.Ready++
+	}
+	return rows, nil
+}
+
+// countReadyMemberRows counts the rows whose live pods prove readiness. An
+// operation under way keeps its occupancy without promising replacement
+// readiness from a cached aggregate or a partly built gang.
+func countReadyMemberRows(ir *v1beta1.InferenceReplica, byIndex map[int32][]*corev1.Pod, gangSizes map[string]int32) int32 {
+	var ready int32
+	for _, row := range ir.Status.InstanceStatuses {
+		if memberRowReady(row, byIndex[row.Index], gangSizes) {
+			ready++
 		}
 	}
-	reservations := map[memberPodSlot]struct{}{}
-	reserve := func(index int32, incarnation int64, ordinal int32, revision string, gang bool) error {
-		hash := query.RevisionHashFromControllerRevisionName(revision)
-		if index < 0 || incarnation < 0 || hash == "" {
-			return fmt.Errorf("surge reservation has unresolved instance identity or revision")
-		}
-		slot := memberPodSlot{Index: index, Incarnation: incarnation, Ordinal: ordinal, Revision: hash}
-		for physical := range slots {
-			if physical.Index == index && physical.Incarnation == incarnation && physical.Revision == hash && (gang || physical.Ordinal == ordinal) {
-				return nil
-			}
-		}
-		reservations[slot] = struct{}{}
-		return nil
+	return ready
+}
+
+// memberRowReady reports whether a row's live pods prove it ready: a steady,
+// admitted row with no operation, whose live pods are exactly its cohort and
+// a whole gang where it has one, each Ready and serving on the row's own
+// attempt and revision.
+func memberRowReady(row v1beta1.OMENativeInstanceStatus, live []*corev1.Pod, gangSizes map[string]int32) bool {
+	if row.Phase != v1beta1.OMENativeInstanceReady || !row.Admitted || row.Operation != nil || row.PodCount <= 0 || int64(len(live)) != int64(row.PodCount) || row.ServingPodCount != row.PodCount {
+		return false
 	}
-	for _, row := range rows {
+	revision := query.RevisionHashFromControllerRevisionName(row.RunningRevision)
+	for _, pod := range live {
+		slot, _ := memberSlot(pod)
+		expected := int32(1)
+		if slot.Group != "" {
+			expected = gangSizes[slot.Group]
+		}
+		if expected <= 0 || int64(len(live)) != int64(expected) {
+			return false
+		}
+		if slot.Incarnation != row.Incarnation || slot.Revision != revision || !livePodReady(pod) {
+			return false
+		}
+	}
+	return true
+}
+
+// memberReservations are the surge slots the member's update and migration
+// rows hold that no live pod fills yet.
+type memberReservations struct {
+	rows map[int32]v1beta1.OMENativeInstanceStatus
+	live map[memberPodSlot][]*corev1.Pod
+	held map[memberPodSlot]struct{}
+}
+
+// countMemberReservations counts the surge slots the member's rows reserve:
+// one per surging update and per migration under way, unless a live pod
+// already fills the slot.
+func countMemberReservations(ir *v1beta1.InferenceReplica, rows map[int32]v1beta1.OMENativeInstanceStatus, live map[memberPodSlot][]*corev1.Pod) (int32, error) {
+	reservations := memberReservations{rows: rows, live: live, held: map[memberPodSlot]struct{}{}}
+	if err := reservations.reserveUpdateSurges(); err != nil {
+		return 0, err
+	}
+	if err := reservations.reserveMigrationSurges(ir.Status.Migrations); err != nil {
+		return 0, err
+	}
+	if len(reservations.held) > math.MaxInt32 {
+		return 0, fmt.Errorf("surge reservations exceed int32")
+	}
+	return int32(len(reservations.held)), nil
+}
+
+// reserve holds the slot unless a live pod of the same instance, attempt and
+// revision (any ordinal for a gang) already fills it.
+func (r *memberReservations) reserve(index int32, incarnation int64, ordinal int32, revision string, gang bool) error {
+	hash := query.RevisionHashFromControllerRevisionName(revision)
+	if index < 0 || incarnation < 0 || hash == "" {
+		return fmt.Errorf("surge reservation has unresolved instance identity or revision")
+	}
+	slot := memberPodSlot{Index: index, Incarnation: incarnation, Ordinal: ordinal, Revision: hash}
+	for physical := range r.live {
+		if physical.Index == index && physical.Incarnation == incarnation && physical.Revision == hash && (gang || physical.Ordinal == ordinal) {
+			return nil
+		}
+	}
+	r.held[slot] = struct{}{}
+	return nil
+}
+
+// reserveUpdateSurges reserves the slot of every row whose update is in a
+// surge step: the gang target's slot when the update names one, else the
+// row's other pod ordinal.
+func (r *memberReservations) reserveUpdateSurges() error {
+	for _, row := range r.rows {
 		op := row.Operation
-		if op == nil || op.Type != v1beta1.InstanceOperationUpdate {
-			continue
-		}
-		if op.Step != workloadtypes.UpdateStepSurge && op.Step != workloadtypes.UpdateStepSurgeDrain && op.Step != workloadtypes.UpdateStepSurgeDrainSettle {
+		if op == nil || op.Type != v1beta1.InstanceOperationUpdate || !surgeStep(op.Step) {
 			continue
 		}
 		if op.SurgeIndex != nil {
-			target, exists := rows[*op.SurgeIndex]
+			target, exists := r.rows[*op.SurgeIndex]
 			if !exists {
-				return out, fmt.Errorf("surge reservation has no target instance")
+				return fmt.Errorf("surge reservation has no target instance")
 			}
-			if err := reserve(*op.SurgeIndex, target.Incarnation, 0, op.TargetRevision, true); err != nil {
-				return out, err
+			if err := r.reserve(*op.SurgeIndex, target.Incarnation, 0, op.TargetRevision, true); err != nil {
+				return err
 			}
-		} else {
-			if row.ActiveOrdinal < 0 || row.ActiveOrdinal > 1 {
-				return out, fmt.Errorf("surge reservation has unresolved pod slot")
-			}
-			if err := reserve(row.Index, row.Incarnation, 1-row.ActiveOrdinal, op.TargetRevision, false); err != nil {
-				return out, err
-			}
+			continue
+		}
+		if row.ActiveOrdinal < 0 || row.ActiveOrdinal > 1 {
+			return fmt.Errorf("surge reservation has unresolved pod slot")
+		}
+		if err := r.reserve(row.Index, row.Incarnation, 1-row.ActiveOrdinal, op.TargetRevision, false); err != nil {
+			return err
 		}
 	}
-	for _, migration := range ir.Status.Migrations {
+	return nil
+}
+
+// surgeStep reports whether an update step holds a surge slot.
+func surgeStep(step string) bool {
+	return step == workloadtypes.UpdateStepSurge || step == workloadtypes.UpdateStepSurgeDrain || step == workloadtypes.UpdateStepSurgeDrainSettle
+}
+
+// reserveMigrationSurges reserves the target slot of every migration under
+// way. An accepted migration without a target holds nothing yet; any other
+// active migration without one is an error.
+func (r *memberReservations) reserveMigrationSurges(migrations []v1beta1.MigrationStatus) error {
+	for _, migration := range migrations {
 		if migration.Phase.Terminal() {
 			continue
 		}
 		if migration.SurgeInstance == nil || *migration.SurgeInstance < 0 {
 			if migration.Phase != v1beta1.MigrationPhaseAccepted {
-				return out, fmt.Errorf("active migration has no surge identity")
+				return fmt.Errorf("active migration has no surge identity")
 			}
 			continue
 		}
-		target, exists := rows[*migration.SurgeInstance]
+		target, exists := r.rows[*migration.SurgeInstance]
 		if !exists {
-			return out, fmt.Errorf("migration reservation has no target instance")
+			return fmt.Errorf("migration reservation has no target instance")
 		}
 		revision := target.RunningRevision
 		if revision == "" {
-			revision = rows[migration.SourceInstance].RunningRevision
+			revision = r.rows[migration.SourceInstance].RunningRevision
 		}
-		if err := reserve(*migration.SurgeInstance, target.Incarnation, target.ActiveOrdinal, revision, true); err != nil {
-			return out, err
+		if err := r.reserve(*migration.SurgeInstance, target.Incarnation, target.ActiveOrdinal, revision, true); err != nil {
+			return err
 		}
 	}
-	if len(reservations) > math.MaxInt32 {
-		return out, fmt.Errorf("surge reservations exceed int32")
-	}
-	out.Reserved = int32(len(reservations))
-	out.Ready = min(out.Ready, ir.Status.ReadyReplicas)
-	return out, nil
+	return nil
 }
 
 // memberGangSizes reads the expected shape carried by each live gang, which
@@ -196,8 +309,7 @@ func memberGangSizes(ctx context.Context, reads client.Reader, ir *v1beta1.Infer
 				return nil, err
 			}
 		}
-		owner := metav1.GetControllerOf(group)
-		if group.GetUID() == "" || !group.GetDeletionTimestamp().IsZero() || owner == nil || owner.UID != ir.UID || owner.Kind != "InferenceReplica" || owner.APIVersion != v1beta1.SchemeGroupVersion.String() {
+		if group.GetUID() == "" || !group.GetDeletionTimestamp().IsZero() || !controlledByMember(metav1.GetControllerOf(group), ir) {
 			return nil, fmt.Errorf("gang %q has unverified component identity", name)
 		}
 		size, found, err := unstructured.NestedInt64(group.Object, "spec", "minMember")
@@ -210,7 +322,7 @@ func memberGangSizes(ctx context.Context, reads client.Reader, ir *v1beta1.Infer
 }
 
 // listMemberGangs indexes the component's gangs by name through the service
-// and component labels their creator stamps on every PodGroup.
+// and component labels their creator sets on every PodGroup.
 func listMemberGangs(ctx context.Context, reads client.Reader, ir *v1beta1.InferenceReplica) (map[string]*unstructured.Unstructured, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(schedulingv1alpha1.SchemeGroupVersion.WithKind(constants.PodGroupKind + "List"))

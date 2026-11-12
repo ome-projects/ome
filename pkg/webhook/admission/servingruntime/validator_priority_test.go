@@ -2,12 +2,16 @@ package servingruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"testing"
 
 	"github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
 	"sigs.k8s.io/ome/pkg/validation"
 )
 
@@ -242,4 +246,58 @@ func TestValidator_SpecOnlyChecksRunWithNoExistingRuntimes(t *testing.T) {
 		g.Expect(resp.Allowed).To(gomega.BeFalse(), "one format at two priorities is refused with no other runtime in the namespace")
 		g.Expect(resp.Result.Message).To(gomega.ContainSubstring("safetensors"))
 	})
+}
+
+// A namespaced runtime's refusals name the runtime and its namespace.
+func TestServingRuntimeValidator_RefusalsNameTheNamespace(t *testing.T) {
+	t.Run("priority tie with a peer", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		peer := servingRuntime("rt-a", "team-a", withFormat("safetensors"), withPriority(1))
+		resp := newServingRuntimeValidator(t, peer).Handle(context.Background(),
+			createReq(t, servingRuntime("rt-b", "team-a", withFormat("safetensors"), withPriority(1))))
+
+		g.Expect(resp.Allowed).To(gomega.BeFalse())
+		g.Expect(resp.Result.Message).To(gomega.Equal(fmt.Sprintf(InvalidPriorityServingRuntimeError,
+			fmt.Sprintf(InvalidPriorityError, "safetensors"), "rt-a", "rt-b", "team-a")))
+	})
+
+	t.Run("one format at two priorities", func(t *testing.T) {
+		g := gomega.NewWithT(t)
+		conflicting := withFormats(autoSelectedFormat("safetensors", 1), autoSelectedFormat("safetensors", 2))
+		resp := newServingRuntimeValidator(t).Handle(context.Background(),
+			createReq(t, servingRuntime("rt-solo", "team-a", conflicting)))
+
+		g.Expect(resp.Allowed).To(gomega.BeFalse())
+		g.Expect(resp.Result.Message).To(gomega.HaveSuffix(" under the servingruntime rt-solo"))
+	})
+}
+
+// A disabled runtime is admitted without the peer and shape rules: it takes
+// no part in auto-selection, so a priority tie with a peer is no conflict.
+func TestValidator_DisabledRuntimeSkipsPeerRules(t *testing.T) {
+	g := gomega.NewWithT(t)
+	peer := servingRuntime("rt-a", "team-a", withFormat("safetensors"), withPriority(1))
+	resp := newServingRuntimeValidator(t, peer).Handle(context.Background(),
+		createReq(t, servingRuntime("rt-b", "team-a", withFormat("safetensors"), withPriority(1), withDisabled(true))))
+
+	g.Expect(resp.Allowed).To(gomega.BeTrue(), "a disabled runtime is admitted; got refusal: %v", resp.Result)
+}
+
+// The spec-only rules run before the peers are read, so a spec refusal
+// stands even when the peer read fails.
+func TestValidator_SpecRulesRunBeforeThePeerRead(t *testing.T) {
+	g := gomega.NewWithT(t)
+	refusing := fakeclient.New(t, fakeclient.FailingVerb(fakeclient.List, fakeclient.EveryCall, errors.New("list refused")))
+	validator := &ServingRuntimeValidator{Client: refusing, Decoder: newDecoder(t)}
+	withCapacityEndpoint := func(_ *metav1.ObjectMeta, spec *v1beta1.ServingRuntimeSpec) {
+		spec.RouterConfig = &v1beta1.RouterSpec{CapacityEndpoint: &v1beta1.RouterCapacityEndpoint{}}
+	}
+
+	resp := validator.Handle(context.Background(), createReq(t, servingRuntime("rt-a", "team-a", withCapacityEndpoint)))
+	g.Expect(resp.Allowed).To(gomega.BeFalse())
+	g.Expect(resp.Result.Code).To(gomega.Equal(int32(http.StatusForbidden)), "a spec refusal, not the failed read; got %v", resp.Result)
+	g.Expect(resp.Result.Message).To(gomega.ContainSubstring("capacityEndpoint"))
+
+	resp = validator.Handle(context.Background(), createReq(t, servingRuntime("rt-a", "team-a")))
+	g.Expect(resp.Result.Code).To(gomega.Equal(int32(http.StatusInternalServerError)), "a clean spec reaches the peer read; got %v", resp.Result)
 }

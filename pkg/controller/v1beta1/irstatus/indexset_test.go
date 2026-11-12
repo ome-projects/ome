@@ -47,12 +47,8 @@ func TestParseIndexSetCanonicalInputs(t *testing.T) {
 				}
 			}
 			if len(test.wantValues) > 0 && test.wantCardinality == uint64(len(test.wantValues)) {
-				values, valuesErr := set.Values(test.limit)
-				if valuesErr != nil {
-					t.Fatalf("Values() error = %v", valuesErr)
-				}
-				if !reflect.DeepEqual(values, test.wantValues) {
-					t.Fatalf("Values() = %v, want %v", values, test.wantValues)
+				if values := valuesOf(set); !reflect.DeepEqual(values, test.wantValues) {
+					t.Fatalf("members = %v, want %v", values, test.wantValues)
 				}
 			}
 		})
@@ -172,10 +168,7 @@ func TestIndexSetExhaustiveSmallDomainRoundTrip(t *testing.T) {
 		if err != nil {
 			t.Fatalf("mask %012b parse %q error = %v", mask, encoded, err)
 		}
-		values, err := parsed.Values(uint64(len(indices)))
-		if err != nil {
-			t.Fatalf("mask %012b Values() error = %v", mask, err)
-		}
+		values := valuesOf(parsed)
 		sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
 		if !reflect.DeepEqual(values, indices) {
 			t.Fatalf("mask %012b values = %v, want %v", mask, values, indices)
@@ -198,20 +191,6 @@ func TestIndexSetSubset(t *testing.T) {
 	}
 	if !empty.IsSubsetOf(members) || !empty.IsSubsetOf(empty) {
 		t.Fatal("empty set must be a subset")
-	}
-}
-
-func TestIndexSetEqual(t *testing.T) {
-	t.Parallel()
-
-	left := mustParseIndexSet(t, "0,2", 2)
-	equal := mustParseIndexSet(t, "0,2", 2)
-	sameCardinality := mustParseIndexSet(t, "1,3", 2)
-	if !left.Equal(equal) {
-		t.Fatal("identical sets are not equal")
-	}
-	if left.Equal(sameCardinality) {
-		t.Fatal("different sets with the same cardinality are equal")
 	}
 }
 
@@ -244,17 +223,6 @@ func TestIndexSetSubsetExhaustiveSmallDomain(t *testing.T) {
 	}
 }
 
-func TestIndexSetValuesChecksBoundBeforeExpansion(t *testing.T) {
-	t.Parallel()
-
-	set := mustParseIndexSet(t, "0-1000000", 1000001)
-	values, err := set.Values(1000000)
-	if values != nil {
-		t.Fatalf("Values() returned %d values after bound failure", len(values))
-	}
-	assertCodecReason(t, err, ErrorReasonCardinalityLimit)
-}
-
 func TestIndexSetContainsBoundaries(t *testing.T) {
 	t.Parallel()
 
@@ -278,4 +246,11 @@ func mustParseIndexSet(t *testing.T, raw string, limit uint64) indexSet {
 		t.Fatalf("parseIndexSet(%q, %d) error = %v", raw, limit, err)
 	}
 	return set
+}
+
+// valuesOf lists the set's members in ascending order.
+func valuesOf(set indexSet) []int32 {
+	values := make([]int32, 0, set.Cardinality())
+	set.forEach(func(value int32) { values = append(values, value) })
+	return values
 }

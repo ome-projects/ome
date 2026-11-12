@@ -17,15 +17,15 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 var log = ctrl.Log.WithName("LWSReconciler")
 
 type LWSReconciler struct {
-	client       client.Client
-	scheme       *runtime.Scheme
-	LWS          *lws.LeaderWorkerSet
-	ComponentExt *v1beta1.ComponentExtensionSpec
+	client client.Client
+	scheme *runtime.Scheme
+	LWS    *lws.LeaderWorkerSet
 }
 
 func NewLWSReconciler(client client.Client,
@@ -36,10 +36,9 @@ func NewLWSReconciler(client client.Client,
 	componentExt *v1beta1.ComponentExtensionSpec,
 	componentMeta metav1.ObjectMeta) *LWSReconciler {
 	return &LWSReconciler{
-		client:       client,
-		scheme:       scheme,
-		LWS:          createLWS(headPod, workerPod, workerSize, componentExt, componentMeta),
-		ComponentExt: componentExt,
+		client: client,
+		scheme: scheme,
+		LWS:    createLWS(headPod, workerPod, workerSize, componentExt, componentMeta),
 	}
 }
 
@@ -56,6 +55,10 @@ func createLWS(headPod *corev1.PodSpec,
 	headPodMeta.Labels["app"] = constants.GetRawServiceLabel(componentMeta.Name)
 	utils.SetPodLabelsFromAnnotations(headPodMeta)
 	utils.SetPodLabelsFromAnnotations(workerPodMeta)
+	// The LeaderWorkerSet carries the component's object metadata whole; its
+	// pod templates take only the annotations that belong on a pod.
+	headPodMeta.Annotations = render.PodTemplateAnnotations(headPodMeta.Annotations, componentExt.Annotations)
+	workerPodMeta.Annotations = render.PodTemplateAnnotations(workerPodMeta.Annotations, componentExt.Annotations)
 
 	// Need to remove Prometheus annotations for workerPods as workerPods don't expose endpoints
 	abandonedWorkerPodAnnotations := []string{

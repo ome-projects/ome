@@ -354,18 +354,30 @@ func (p *publisherPass) stopWhenInactive(context.Context) (bool, error) {
 }
 
 // readOwner reads the owning InferenceService through the uncached reader
-// and checks the map's provenance against it. A failed read retries; an
-// invalid binding is rejected.
+// and checks the map's provenance against it. A failed read retries, a map
+// behind its owner waits for its rewrite, and an invalid binding is rejected.
 func (p *publisherPass) readOwner(ctx context.Context) (bool, error) {
 	owner, err := p.reconciler.owner(ctx, p.trafficMap)
 	if err != nil {
-		if errors.Is(err, errTrafficMapPublisherOwnerRead) {
+		switch {
+		case errors.Is(err, errTrafficMapPublisherOwnerRead):
 			return p.end(p.reconciler.retryFailure(ctx, p.trafficMap, trafficMapPublisherReasonInvalidOwner, err))
+		case errors.Is(err, errTrafficMapPublisherOwnerAhead):
+			return p.waitForRewrite(err)
 		}
 		return p.end(p.reconciler.reject(ctx, p.trafficMap, trafficMapPublisherReasonInvalidOwner, err))
 	}
 	p.owner = owner
 	return true, nil
+}
+
+// waitForRewrite ends the pass without a status write. The map was derived
+// from an older owner generation; the routing controller's rewrite is a spec
+// change this controller watches, so the next pass follows it.
+func (p *publisherPass) waitForRewrite(cause error) (bool, error) {
+	p.reconciler.Log.Info("TrafficMap waits for the rewrite that follows its owner's newer generation",
+		"trafficMap", client.ObjectKeyFromObject(p.trafficMap), "detail", cause.Error())
+	return p.end(p.reconciler.successResult(), nil)
 }
 
 // stopForInactiveOwner marks the map unpublished and ends the pass when its
@@ -415,9 +427,13 @@ func (p *publisherPass) claimRecordIsOurs() bool {
 // resolveOptions merges the installation's options with the service's inline
 // ones through the publisher.
 func (p *publisherPass) resolveOptions(ctx context.Context) (bool, error) {
+	serviceOptions, err := routingPublisherOptions(p.owner)
+	if err != nil {
+		return p.end(p.reconciler.reject(ctx, p.trafficMap, trafficMapPublisherReasonInvalidOptions, err))
+	}
 	effectiveOptions, err := p.reconciler.Publisher.ResolveOptions(
 		clonePublisherOptions(p.reconciler.GlobalOptions),
-		clonePublisherOptions(routingPublisherOptions(p.owner)),
+		serviceOptions,
 	)
 	if err != nil {
 		return p.end(p.reconciler.reject(ctx, p.trafficMap, trafficMapPublisherReasonInvalidOptions, err))
@@ -514,13 +530,16 @@ func (p *publisherPass) preflightStateless(ctx context.Context) (bool, error) {
 }
 
 // endPreEffectFailure ends the pass after the fresh-state check before any
-// external effect failed: a changed map requeues, a failed owner read
-// retries, a changed source or publisher is rejected, a terminal claim
-// problem is rejected, and any other failure retries.
+// external effect failed: a changed map requeues, an owner that moved ahead
+// of the map waits for the rewrite, a failed owner read retries, a changed
+// source or publisher is rejected, a terminal claim problem is rejected, and
+// any other failure retries.
 func (p *publisherPass) endPreEffectFailure(ctx context.Context, err error) (bool, error) {
 	switch {
 	case errors.Is(err, errTrafficMapPublisherPlanStale):
 		return p.end(ctrl.Result{Requeue: true}, nil)
+	case errors.Is(err, errTrafficMapPublisherOwnerAhead):
+		return p.waitForRewrite(err)
 	case errors.Is(err, errTrafficMapPublisherOwnerRead):
 		return p.end(p.reconciler.retryFailure(ctx, p.trafficMap, trafficMapPublisherReasonInvalidOwner, err))
 	case errors.Is(err, errTrafficMapPublisherSourceChanged):
@@ -755,13 +774,27 @@ func (r *TrafficMapPublisherReconciler) readTrafficMapOwner(
 	if err := validatePublisherSourceUID(trafficMap, owner.UID); err != nil {
 		return nil, err
 	}
-	if trafficMap.Spec.ObservedISVCGeneration != owner.Generation {
-		return nil, fmt.Errorf(
-			"%w: TrafficMap observed InferenceService generation %d does not match owner generation %d",
-			errTrafficMapPublisherOwnerInvalid, trafficMap.Spec.ObservedISVCGeneration, owner.Generation,
-		)
+	if err := checkObservedOwnerGeneration(trafficMap, owner); err != nil {
+		return nil, err
 	}
 	return owner, nil
+}
+
+// checkObservedOwnerGeneration compares the owner generation the map was
+// derived from with the live owner's. A map behind its owner waits for the
+// routing controller's rewrite; a map ahead of its owner was derived from an
+// object this owner never was and is rejected.
+func checkObservedOwnerGeneration(trafficMap *v1beta1.TrafficMap, owner *v1beta1.InferenceService) error {
+	observed := trafficMap.Spec.ObservedISVCGeneration
+	switch {
+	case observed < owner.Generation:
+		return fmt.Errorf("%w: TrafficMap observed InferenceService generation %d, owner generation is %d",
+			errTrafficMapPublisherOwnerAhead, observed, owner.Generation)
+	case observed > owner.Generation:
+		return fmt.Errorf("%w: TrafficMap observed InferenceService generation %d is ahead of owner generation %d",
+			errTrafficMapPublisherOwnerInvalid, observed, owner.Generation)
+	}
+	return nil
 }
 
 func publisherOwnerActive(owner *v1beta1.InferenceService) bool {
@@ -776,7 +809,7 @@ func (r *TrafficMapPublisherReconciler) validateLivePublisherOwner(
 ) (*v1beta1.InferenceService, error) {
 	owner, err := r.readTrafficMapOwner(ctx, trafficMap)
 	if err != nil {
-		if errors.Is(err, errTrafficMapPublisherOwnerRead) {
+		if errors.Is(err, errTrafficMapPublisherOwnerRead) || errors.Is(err, errTrafficMapPublisherOwnerAhead) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("%w: %v", errTrafficMapPublisherSourceChanged, err)
@@ -841,6 +874,10 @@ func (r *TrafficMapPublisherReconciler) ensureFinalizer(
 	return added, err
 }
 
+// preclaim writes the claims this pass may touch into the map's claim record
+// from fresh state, before any external effect, and decides whether a retained
+// positive plan is replayed. A write that conflicts is retried on a fresh read;
+// a map that moved under the pass is stale. claimAttempt.run lists the steps.
 func (r *TrafficMapPublisherReconciler) preclaim(
 	ctx context.Context,
 	trafficMap *v1beta1.TrafficMap,
@@ -848,142 +885,238 @@ func (r *TrafficMapPublisherReconciler) preclaim(
 	desiredClaims []string,
 	capture *TrafficMapPublishPlanCapture,
 ) (*trafficMapPublicationPreparation, error) {
-	key := client.ObjectKeyFromObject(trafficMap)
 	var preparation *trafficMapPublicationPreparation
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		live := &v1beta1.TrafficMap{}
-		if err := r.APIReader.Get(ctx, key, live); err != nil {
-			return fmt.Errorf("%w: read TrafficMap %s before claiming targets: %w",
-				errTrafficMapPublisherOwnerRead, key, err)
-		}
-		if live.UID != trafficMap.UID {
-			return fmt.Errorf("%w: TrafficMap %s was replaced while claiming publisher targets",
-				errTrafficMapPublisherSourceChanged, key)
-		}
-		if live.Generation != trafficMap.Generation || !live.DeletionTimestamp.IsZero() {
-			return errTrafficMapPublisherPlanStale
-		}
-		liveOwner, err := r.validateLivePublisherOwner(ctx, live, owner)
-		if err != nil {
-			return err
-		}
-		if !controllerutil.ContainsFinalizer(live, TrafficMapPublisherFinalizer) {
-			return errTrafficMapPublisherPlanStale
-		}
-
-		journal, err := normalizedPublisherJournal(live.Status.Publisher, r.Publisher.Name())
-		if err != nil {
-			return &terminalPublisherError{err: err}
-		}
-		existing := journal.ClaimedTargets
-
-		if capture != nil && !capture.Withdrawn &&
-			!trafficMapPlanCapturePositive(capture) &&
-			capture.NoPositivePlanPolicy == TrafficMapNoPositivePlanPolicyRetainLastPositive {
-			eligible, known := trafficMapFallbackEligibilityWithAllHomesUnready(
-				live, liveOwner, capture.AllowAllHomesUnreadyFallback,
-			)
-			if !known {
-				if err := r.patchPublisherStatus(ctx, live, func(status *v1beta1.TrafficMapStatus) error {
-					setTrafficMapPublicationConditions(
-						status, live.Generation, metav1.ConditionUnknown,
-						trafficMapPublisherReasonEligibilityUnknown,
-						"TrafficMap fallback eligibility cannot be determined from fresh status",
-					)
-					return nil
-				}); err != nil {
-					return err
-				}
-				return errTrafficMapPublisherEligibilityUnknown
-			}
-			allHomesUnready := eligible && capture.AllowAllHomesUnreadyFallback &&
-				trafficMapRoutableReason(live) == v1beta1.TrafficMapReasonAllHomesUnready
-			claimsCompatible := publisherClaimsReplayCompatible(desiredClaims, existing)
-			validateLastPositive := validateTrafficMapLastPositive
-			if allHomesUnready {
-				claimsCompatible = publisherClaimsReplayCompatibleForAllHomesUnready(
-					desiredClaims, existing, journal.LastPositive,
-				)
-				validateLastPositive = validateTrafficMapLastPositiveFromEarlierGeneration
-			}
-			if eligible && claimsCompatible && validateLastPositive(
-				journal.LastPositive, existing, liveOwner.Generation,
-				capture.PlanCompatibilityDigest, live.Generation,
-			) == nil {
-				if err := r.rejectClaimCollisions(ctx, live, existing); err != nil {
-					return err
-				}
-				preparation = &trafficMapPublicationPreparation{
-					previousClaims: slices.Clone(existing),
-					expectedClaims: slices.Clone(existing),
-					useFallback:    true,
-					lastPositive:   copyTrafficMapLastPositive(journal.LastPositive),
-				}
-				return r.patchPublisherStatus(ctx, live, func(status *v1beta1.TrafficMapStatus) error {
-					status.Publisher = copyTrafficMapPublisherJournal(journal)
-					setTrafficMapPublicationConditions(
-						status, live.Generation, metav1.ConditionUnknown,
-						v1beta1.TrafficMapReasonPublicationTransitioning,
-						"TrafficMap publisher is transitioning to a retained positive plan",
-					)
-					return nil
-				})
-			}
-		}
-
-		union := publisherClaimUnion(existing, desiredClaims)
-		if len(union) > v1beta1.MaxTrafficMapPublisherTargets {
-			return &terminalPublisherError{err: fmt.Errorf(
-				"publisher claim union has %d targets, maximum is %d",
-				len(union), v1beta1.MaxTrafficMapPublisherTargets)}
-		}
-		if err := r.rejectClaimCollisions(ctx, live, union); err != nil {
-			return err
-		}
-
-		keepLastPositive := false
-		if capture != nil && !capture.Withdrawn && trafficMapPlanCapturePositive(capture) {
-			keepLastPositive = slices.Equal(existing, desiredClaims) && validateTrafficMapLastPositive(
-				journal.LastPositive, union, liveOwner.Generation,
-				capture.PlanCompatibilityDigest, live.Generation,
-			) == nil
-			if !keepLastPositive && capture.AllowAllHomesUnreadyFallback {
-				keepLastPositive = publisherClaimsReplayCompatibleForAllHomesUnready(
-					desiredClaims, existing, journal.LastPositive,
-				) && validateTrafficMapLastPositiveFromEarlierGeneration(
-					journal.LastPositive, existing, liveOwner.Generation,
-					capture.PlanCompatibilityDigest, live.Generation,
-				) == nil
-			}
-		}
-		lastPositive := journal.LastPositive
-		if !keepLastPositive {
-			lastPositive = nil
-		}
-		preparation = &trafficMapPublicationPreparation{
-			previousClaims: slices.Clone(existing),
-			expectedClaims: slices.Clone(union),
-			lastPositive:   copyTrafficMapLastPositive(lastPositive),
-		}
-		return r.patchPublisherStatus(ctx, live, func(status *v1beta1.TrafficMapStatus) error {
-			status.Publisher = &v1beta1.TrafficMapPublisherStatus{
-				PublisherName:         r.Publisher.Name(),
-				ClaimedTargets:        slices.Clone(union),
-				ObservedOptionsDigest: journal.ObservedOptionsDigest,
-				LastPositive:          copyTrafficMapLastPositive(lastPositive),
-			}
-			setTrafficMapPublicationConditions(
-				status, live.Generation, metav1.ConditionUnknown,
-				v1beta1.TrafficMapReasonPublicationTransitioning,
-				"TrafficMap publisher is applying the current plan",
-			)
-			return nil
-		})
+		attempt := &claimAttempt{reconciler: r, trafficMap: trafficMap, owner: owner, desiredClaims: desiredClaims, capture: capture}
+		var err error
+		preparation, err = attempt.run(ctx)
+		return err
 	})
 	if errors.Is(err, errTrafficMapPublisherPlanStale) {
 		return nil, errTrafficMapPublisherPlanStale
 	}
 	return preparation, err
+}
+
+// claimAttempt is one attempt of preclaim: the map, owner and plan the pass
+// read, the live map and owner this attempt reads, and the claim record it
+// found on the live map.
+type claimAttempt struct {
+	reconciler    *TrafficMapPublisherReconciler
+	trafficMap    *v1beta1.TrafficMap
+	owner         *v1beta1.InferenceService
+	desiredClaims []string
+	// capture is the publisher-neutral view of the plan; nil for a publisher
+	// without retained-plan fallback.
+	capture *TrafficMapPublishPlanCapture
+	// live is the map as the apiserver holds it now, liveOwner its owner.
+	live      *v1beta1.TrafficMap
+	liveOwner *v1beta1.InferenceService
+	// journal is the live map's claim record for this publisher; existing are
+	// the claims it holds.
+	journal  *v1beta1.TrafficMapPublisherStatus
+	existing []string
+}
+
+// run reads fresh state, replays the retained plan when its rules allow it,
+// and otherwise claims the current plan.
+func (a *claimAttempt) run(ctx context.Context) (*trafficMapPublicationPreparation, error) {
+	if err := a.readFreshState(ctx); err != nil {
+		return nil, err
+	}
+	if preparation, decided, err := a.replayRetainedPlan(ctx); decided {
+		return preparation, err
+	}
+	return a.claimCurrentPlan(ctx)
+}
+
+// readFreshState reads the map live and checks that the pass still speaks of
+// the same map, owner and claim record: a replaced map or a changed owner is
+// a source change; a moved generation, a deletion or a missing finalizer is
+// stale; a record another publisher owns is terminal.
+func (a *claimAttempt) readFreshState(ctx context.Context) error {
+	key := client.ObjectKeyFromObject(a.trafficMap)
+	live := &v1beta1.TrafficMap{}
+	if err := a.reconciler.APIReader.Get(ctx, key, live); err != nil {
+		return fmt.Errorf("%w: read TrafficMap %s before claiming targets: %w",
+			errTrafficMapPublisherOwnerRead, key, err)
+	}
+	if live.UID != a.trafficMap.UID {
+		return fmt.Errorf("%w: TrafficMap %s was replaced while claiming publisher targets",
+			errTrafficMapPublisherSourceChanged, key)
+	}
+	if live.Generation != a.trafficMap.Generation || !live.DeletionTimestamp.IsZero() {
+		return errTrafficMapPublisherPlanStale
+	}
+	liveOwner, err := a.reconciler.validateLivePublisherOwner(ctx, live, a.owner)
+	if err != nil {
+		return err
+	}
+	if !controllerutil.ContainsFinalizer(live, TrafficMapPublisherFinalizer) {
+		return errTrafficMapPublisherPlanStale
+	}
+	journal, err := normalizedPublisherJournal(live.Status.Publisher, a.reconciler.Publisher.Name())
+	if err != nil {
+		return &terminalPublisherError{err: err}
+	}
+	a.live, a.liveOwner, a.journal, a.existing = live, liveOwner, journal, journal.ClaimedTargets
+	return nil
+}
+
+// replayRetainedPlan decides whether the retained positive plan replaces a
+// current plan that has no positive weight: the publisher asks to retain it,
+// the placement is known lost, the claims are compatible and the retained
+// plan is still valid. It reports whether it decided the attempt: with the
+// replay prepared and recorded, or with an unknown eligibility written.
+func (a *claimAttempt) replayRetainedPlan(ctx context.Context) (*trafficMapPublicationPreparation, bool, error) {
+	if !a.asksToRetain() {
+		return nil, false, nil
+	}
+	eligible, known := trafficMapFallbackEligibilityWithAllHomesUnready(a.live, a.liveOwner, a.capture.AllowAllHomesUnreadyFallback)
+	if !known {
+		return nil, true, a.writeEligibilityUnknown(ctx)
+	}
+	if !eligible || !a.retainedPlanReplays() {
+		return nil, false, nil
+	}
+	if err := a.reconciler.rejectClaimCollisions(ctx, a.live, a.existing); err != nil {
+		return nil, true, err
+	}
+	preparation := &trafficMapPublicationPreparation{
+		previousClaims: slices.Clone(a.existing),
+		expectedClaims: slices.Clone(a.existing),
+		useFallback:    true,
+		lastPositive:   copyTrafficMapLastPositive(a.journal.LastPositive),
+	}
+	return preparation, true, a.recordReplay(ctx)
+}
+
+// asksToRetain reports a current plan with no positive weight whose publisher
+// asks for the last positive one instead.
+func (a *claimAttempt) asksToRetain() bool {
+	return a.capture != nil && !a.capture.Withdrawn &&
+		!trafficMapPlanCapturePositive(a.capture) &&
+		a.capture.NoPositivePlanPolicy == TrafficMapNoPositivePlanPolicyRetainLastPositive
+}
+
+// noMemberServes reports that the routing table found no serving member and
+// the publisher opted into replaying through that state.
+func (a *claimAttempt) noMemberServes() bool {
+	return a.capture.AllowAllHomesUnreadyFallback &&
+		trafficMapRoutableReason(a.live) == v1beta1.TrafficMapReasonAllHomesUnready
+}
+
+// retainedPlanReplays reports that the recorded claims may serve the current
+// plan through the retained plan: the current claims are none or equal to the
+// recorded ones and the plan is valid for this source generation; while no
+// member serves, a subset whose omitted targets carry no weight, valid from
+// an earlier source generation too.
+func (a *claimAttempt) retainedPlanReplays() bool {
+	compatible := publisherClaimsReplayCompatible(a.desiredClaims, a.existing)
+	validate := validateTrafficMapLastPositive
+	if a.noMemberServes() {
+		compatible = publisherClaimsReplayCompatibleForAllHomesUnready(a.desiredClaims, a.existing, a.journal.LastPositive)
+		validate = validateTrafficMapLastPositiveFromEarlierGeneration
+	}
+	return compatible && validate(
+		a.journal.LastPositive, a.existing, a.liveOwner.Generation,
+		a.capture.PlanCompatibilityDigest, a.live.Generation,
+	) == nil
+}
+
+// writeEligibilityUnknown writes the Unknown publication conditions and ends
+// the attempt without an effect: a source status that lags its spec cannot
+// tell a lost placement from one still being written.
+func (a *claimAttempt) writeEligibilityUnknown(ctx context.Context) error {
+	err := a.reconciler.patchPublisherStatus(ctx, a.live, func(status *v1beta1.TrafficMapStatus) error {
+		setTrafficMapPublicationConditions(
+			status, a.live.Generation, metav1.ConditionUnknown,
+			trafficMapPublisherReasonEligibilityUnknown,
+			"TrafficMap fallback eligibility cannot be determined from fresh status",
+		)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return errTrafficMapPublisherEligibilityUnknown
+}
+
+// recordReplay writes the claim record as it is with the transitioning
+// conditions: the retained plan's claims are the ones this pass touches.
+func (a *claimAttempt) recordReplay(ctx context.Context) error {
+	return a.reconciler.patchPublisherStatus(ctx, a.live, func(status *v1beta1.TrafficMapStatus) error {
+		status.Publisher = copyTrafficMapPublisherJournal(a.journal)
+		setTrafficMapPublicationConditions(
+			status, a.live.Generation, metav1.ConditionUnknown,
+			v1beta1.TrafficMapReasonPublicationTransitioning,
+			"TrafficMap publisher is transitioning to a retained positive plan",
+		)
+		return nil
+	})
+}
+
+// claimCurrentPlan records the union of the recorded and the planned claims,
+// at most the publisher target limit and none claimed by another map, keeps
+// the retained plan only while a positive plan still matches it, and writes
+// the transitioning conditions.
+func (a *claimAttempt) claimCurrentPlan(ctx context.Context) (*trafficMapPublicationPreparation, error) {
+	union := publisherClaimUnion(a.existing, a.desiredClaims)
+	if len(union) > v1beta1.MaxTrafficMapPublisherTargets {
+		return nil, &terminalPublisherError{err: fmt.Errorf(
+			"publisher claim union has %d targets, maximum is %d",
+			len(union), v1beta1.MaxTrafficMapPublisherTargets)}
+	}
+	if err := a.reconciler.rejectClaimCollisions(ctx, a.live, union); err != nil {
+		return nil, err
+	}
+	var lastPositive *v1beta1.TrafficMapPublisherLastPositive
+	if a.keepsRetainedPlan(union) {
+		lastPositive = a.journal.LastPositive
+	}
+	preparation := &trafficMapPublicationPreparation{
+		previousClaims: slices.Clone(a.existing),
+		expectedClaims: slices.Clone(union),
+		lastPositive:   copyTrafficMapLastPositive(lastPositive),
+	}
+	err := a.reconciler.patchPublisherStatus(ctx, a.live, func(status *v1beta1.TrafficMapStatus) error {
+		status.Publisher = &v1beta1.TrafficMapPublisherStatus{
+			PublisherName:         a.reconciler.Publisher.Name(),
+			ClaimedTargets:        slices.Clone(union),
+			ObservedOptionsDigest: a.journal.ObservedOptionsDigest,
+			LastPositive:          copyTrafficMapLastPositive(lastPositive),
+		}
+		setTrafficMapPublicationConditions(
+			status, a.live.Generation, metav1.ConditionUnknown,
+			v1beta1.TrafficMapReasonPublicationTransitioning,
+			"TrafficMap publisher is applying the current plan",
+		)
+		return nil
+	})
+	return preparation, err
+}
+
+// keepsRetainedPlan reports that the retained plan stays beside a positive
+// current plan: the claims are unchanged and the plan is valid for this source
+// generation, or, with the publisher's opt-in, the current claims are a
+// compatible subset and the plan is valid from an earlier source generation.
+func (a *claimAttempt) keepsRetainedPlan(union []string) bool {
+	if a.capture == nil || a.capture.Withdrawn || !trafficMapPlanCapturePositive(a.capture) {
+		return false
+	}
+	keep := slices.Equal(a.existing, a.desiredClaims) && validateTrafficMapLastPositive(
+		a.journal.LastPositive, union, a.liveOwner.Generation,
+		a.capture.PlanCompatibilityDigest, a.live.Generation,
+	) == nil
+	if !keep && a.capture.AllowAllHomesUnreadyFallback {
+		keep = publisherClaimsReplayCompatibleForAllHomesUnready(
+			a.desiredClaims, a.existing, a.journal.LastPositive,
+		) && validateTrafficMapLastPositiveFromEarlierGeneration(
+			a.journal.LastPositive, a.existing, a.liveOwner.Generation,
+			a.capture.PlanCompatibilityDigest, a.live.Generation,
+		) == nil
+	}
+	return keep
 }
 
 func (r *TrafficMapPublisherReconciler) markTransitioning(
@@ -2213,6 +2346,7 @@ var (
 	errTrafficMapPublisherChanged            = errors.New("TrafficMap publisher changed while claims remain")
 	errTrafficMapPublisherSourceChanged      = errors.New("TrafficMap source provenance changed during reconciliation")
 	errTrafficMapPublisherOwnerInvalid       = errors.New("TrafficMap owner binding is invalid")
+	errTrafficMapPublisherOwnerAhead         = errors.New("TrafficMap owner generation is ahead of the map")
 	errTrafficMapPublisherOwnerRead          = errors.New("TrafficMap owner state read failed")
 	errTrafficMapPublisherEligibilityUnknown = errors.New("TrafficMap fallback eligibility is unknown")
 )
@@ -2397,11 +2531,29 @@ func trafficMapRoutableReason(trafficMap *v1beta1.TrafficMap) string {
 	return condition.Reason
 }
 
-func routingPublisherOptions(owner *v1beta1.InferenceService) map[string]string {
-	if owner == nil || owner.Spec.Routing == nil || owner.Spec.Routing.Publisher == nil {
-		return nil
+// routingPublisherOptions returns a copy of the service's publisher options:
+// spec.routing.publisher.options together with the options its
+// ome.io/routing-publisher.<option> annotations set. The annotations are
+// checked here, under the limits of the spec field, because the control plane
+// runs no InferenceService admission webhook.
+func routingPublisherOptions(owner *v1beta1.InferenceService) (map[string]string, error) {
+	if owner == nil {
+		return map[string]string{}, nil
 	}
-	return owner.Spec.Routing.Publisher.Options
+	if err := validation.ValidateRoutingPublisherOptionAnnotations(owner.Annotations, &owner.Spec); err != nil {
+		return nil, err
+	}
+	var specOptions map[string]string
+	if owner.Spec.Routing != nil && owner.Spec.Routing.Publisher != nil {
+		specOptions = owner.Spec.Routing.Publisher.Options
+	}
+	options := clonePublisherOptions(specOptions)
+	for key, value := range owner.Annotations {
+		if option, found := strings.CutPrefix(key, constants.RoutingPublisherOptionAnnotationPrefix); found {
+			options[option] = value
+		}
+	}
+	return options, nil
 }
 
 func copyTrafficMapGatewayRef(ref *v1beta1.TrafficMapGatewayRef) *v1beta1.TrafficMapGatewayRef {

@@ -1,0 +1,28 @@
+{
+  "recordedOn": {
+    "date": "2026-11-10",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The pass groups the Component's listed pods by the index their PodGroup name spells and cuts every gang's bucket from one array, and every record carries the name its pods already carry, so the grouping and the records cost three allocations per pod list whatever the gang count: 1,297 to 3 at 160 gangs of eight, 4,265 to 3 at 500, 11,847 to 3 at 1,725 gangs of two. Every record points at the pass's one set of readings, the clients, the input, the plan and the inventory, and at its entry in the plan, instead of carrying a copy of each, so a record is 80 bytes where it was 568: the bytes 110,464 to 25728 at 160 gangs of eight, 323,584 to 77824 at 500, 1,026,048 to 182272 at 1,725 gangs of two; what remains is the records, the pods' array and the count per gang, and a gang with no pod listed still formats its name. The surge callback's write of one gang at rest, the groups and the pods brought with the call, costs the pods it keeps under the gang's name, the reading it records and, since the records point at shared readings, one allocation holding the callback's own readings beside its record: 5 to 6 allocations and 1,136 to 1776 B at 160 gangs of eight, 6 to 7 and 1,152 to 1792 at 500, 6 to 7 and 1,112 to 1752 at 1,725 gangs of two. The pass's setup over the plan is held beside the records: 10 allocations and 28,464 bytes at 160 gangs of eight, 10 and 95,536 at 500, 14 and 264,192 at 1,725 gangs of two, which is the plan's gangs copied into a slice of the pass's own (96 bytes a gang), the map that finds a gang's position by its index and the map of the keys to publish; at 1,725 gangs the position map's two tables split at random in one setup in ten, five allocations more, so the smallest of the measured calls is the reading. The setup keeps no copy of the plan: the gangs are pointers at the plan's own entries, and a gang's position is found in a slice by its index, a map kept for an index at or above the plan's count alone: 10 to 7 allocations and 28,464 to 9,176 bytes at 160 gangs of eight, 10 to 7 and 95,536 to 34,008 at 500, 14 to 9 and 264,192 to 76,416 at 1,725 gangs of two; what remains is the pass, the pointers, the slice and the map of the keys to publish.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "160x8/records/allocations": 3,
+    "160x8/records/bytes": 25728,
+    "160x8/setup/allocations": 7,
+    "160x8/setup/bytes": 9176,
+    "160x8/surge-write/allocations": 6,
+    "160x8/surge-write/bytes": 1776,
+    "1725x2/records/allocations": 3,
+    "1725x2/records/bytes": 182272,
+    "1725x2/setup/allocations": 9,
+    "1725x2/setup/bytes": 76416,
+    "1725x2/surge-write/allocations": 7,
+    "1725x2/surge-write/bytes": 1752,
+    "500x8/records/allocations": 3,
+    "500x8/records/bytes": 77824,
+    "500x8/setup/allocations": 7,
+    "500x8/setup/bytes": 34008,
+    "500x8/surge-write/allocations": 7,
+    "500x8/surge-write/bytes": 1792
+  }
+}

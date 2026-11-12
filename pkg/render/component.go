@@ -11,10 +11,7 @@ import (
 // projector copies onto the replica beside the runners.
 type Rendered struct {
 	Templates
-	ComponentExt      *v1beta1.ComponentExtensionSpec
-	TopologyKey       *string
-	TopologySpread    *v1beta1.TopologySpreadPolicy
-	TopologySpreadKey *string
+	ComponentExt *v1beta1.ComponentExtensionSpec
 }
 
 // Runners is the runner list an InferenceReplica stores for the component. It

@@ -5,9 +5,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
+	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -33,16 +39,26 @@ type RatioState struct {
 	// one. Recovery never adds serving capacity beyond this shape.
 	Desired map[v1beta1.ComponentType]int32
 
-	// NewPods maps Component → number of new-revision pods (i.e.,
-	// pods on the target ControllerRevision) as of this reconcile. The
-	// serving-capacity band projects against Serving (live traffic
-	// capacity), but the new-revision lockstep (outpacesPeerProgress)
-	// reads NewPods: a surge rotates its replacement in before the source
-	// drains, and a drain-first roll with a budget of one has its
-	// replacement back before the next drain, so serving holds at the
-	// original N for every Component under every strategy and only
-	// rollout progress can pace the leading Component.
+	// NewPods maps Component → number of Instances that have landed on the
+	// target ControllerRevision (the replica's updatedReplicas) as of this
+	// reconcile. The serving-capacity band projects against Serving (live
+	// traffic capacity), but the new-revision lockstep (outpacesPeerProgress)
+	// reads NewPods, and OpenAttempts for the Component it paces: a surge
+	// rotates its replacement in before the source drains, and a drain-first
+	// roll with a budget of one has its replacement back before the next
+	// drain, so serving holds at the original N for every Component under
+	// every strategy and only rollout progress can pace the leading Component.
 	NewPods map[v1beta1.ComponentType]int32
+
+	// OpenAttempts maps Component → number of Instances whose move to the
+	// target has started and not landed: the rows carrying an open update
+	// attempt toward it. A start is written on its row before the next
+	// start is consulted, so the rows carry the starts of this pass too and
+	// the in-flight counts the stale counters need are not added here. The
+	// lockstep counts them as the Component's own progress beside NewPods,
+	// so a start is decided on the picture after every move under way; a
+	// peer is credited only with what has landed. A nil map reads as 0.
+	OpenAttempts map[v1beta1.ComponentType]int32
 
 	// Serving maps Component → number of pods CURRENTLY in the load
 	// balancer's rotation (serving gate True AND containers Ready),
@@ -81,6 +97,16 @@ type RatioState struct {
 	// in-flight), which is the correct default for the surge path and
 	// for unit callers that don't populate it.
 	InFlightUnavail map[v1beta1.ComponentType]int32
+
+	// HeldStillPeer is the pairing peer the pairing gates hold still for
+	// the start under decision: its open attempts are surges whose old pods
+	// the drain-time gate keeps, or every start it could open is held, so
+	// it moves only once this Component has. The lockstep does not pace a
+	// Component by such a peer, as the batch step does not wait on one;
+	// the serving band still reads the peer's capacity. Empty when no
+	// peer is held still, which is every start outside a pairing-protocol
+	// change.
+	HeldStillPeer v1beta1.ComponentType
 }
 
 // RatioDecision is the answer for "may we surge new-revision pods for
@@ -163,9 +189,10 @@ func EvaluateSurge(pacing v1beta1.CoordinationPacing, state RatioState, componen
 		// a budget of one each drain projects N-1:N, inside any band wider
 		// than a pod, and the replacement is back before the next drain, so
 		// the band alone lets the fast Component finish its roll while its
-		// peer lags. The Component already running ahead of a peer by more
-		// than the band waits; the lagging one proceeds, so nothing deadlocks.
-		if outpacesPeerProgress(state.progressReference(), state.NewPods, component, band) {
+		// peer lags. A Component whose drain would carry it past its
+		// allowance ahead of a peer waits; the lagging one proceeds, so the
+		// pair never waits on itself.
+		if outpacesPeerProgress(state.lockstepReference(), state.NewPods, state.OpenAttempts, component, *pacing.RatioTolerancePercent) {
 			return RatioDecision{
 				AllowedSurgeDelta: 0,
 				SkewRejected:      true,
@@ -239,12 +266,12 @@ func EvaluateSurge(pacing v1beta1.CoordinationPacing, state RatioState, componen
 	// entire roll while decoder still lags, and their per-Instance readiness
 	// dips fall out of alignment, so the live ready-capacity ratio sits
 	// skewed (engine 2 : decoder 1) for the whole gap. Hold the Component
-	// whose new-revision rollout is already running ahead of a peer's:
-	// refuse to START another surge when this Component's rollout fraction
-	// already outpaces a peer's beyond the band. A Component that is level
-	// with (or behind) every peer always proceeds, so the pair advances in
-	// lockstep and never deadlocks.
-	if outpacesPeerProgress(state.progressReference(), state.NewPods, component, band) {
+	// whose new-revision rollout would run ahead of a peer's: refuse to
+	// START another surge when it would carry this Component's progress
+	// past its allowance ahead of a peer. A Component that is level with
+	// (or behind) every peer always proceeds, so the pair advances in
+	// lockstep and never waits on itself.
+	if outpacesPeerProgress(state.lockstepReference(), state.NewPods, state.OpenAttempts, component, *pacing.RatioTolerancePercent) {
 		held := RatioDecision{
 			AllowedSurgeDelta: 0,
 			SkewRejected:      true,
@@ -411,18 +438,18 @@ func recoverySurgeAllowed(state RatioState, serving map[v1beta1.ComponentType]in
 	return true
 }
 
-// outpacesPeerProgress reports whether `component` is ALREADY rolling
-// ahead of a peer by more than the tolerance band — the signal to hold it
-// from starting yet another new-revision step, whatever the step does to
-// serving capacity: a surge, the drain that starts a replacement, or an
-// in-place patch of the same pod. It is the lockstep guard the
-// serving-capacity band cannot supply: live serving holds at the original N
-// for every Component under every strategy (a surge rotates its replacement
-// IN before the source drains OUT; a drain-first roll has its replacement
-// back before the next drain; an in-place patch returns the same pod), so
-// the capacity math never registers a skew and never paces the leading
-// Component — engine outruns decoder and the live ready-capacity ratio
-// drifts off band for the whole gap.
+// outpacesPeerProgress reports whether one more new-revision step of
+// `component` would carry it ahead of a still-rolling peer by more than its
+// allowance — the signal to hold it from starting that step, whatever the
+// step does to serving capacity: a surge, the drain that starts a
+// replacement, or an in-place patch of the same pod. It is the lockstep
+// guard the serving-capacity band cannot supply: live serving holds at the
+// original N for every Component under every strategy (a surge rotates its
+// replacement IN before the source drains OUT; a drain-first roll has its
+// replacement back before the next drain; an in-place patch returns the
+// same pod), so the capacity math never registers a skew and never paces
+// the leading Component — engine outruns decoder and the live
+// ready-capacity ratio drifts off band for the whole gap.
 //
 // Progress is measured as the rollout FRACTION new[c]/reference[c], the
 // reference being the Instance count the Component's spec asks for now
@@ -431,37 +458,38 @@ func recoverySurgeAllowed(state RatioState, serving map[v1beta1.ComponentType]in
 // 2 new : 1 new, not 2 new : 2 new) and a side resized mid-roll is measured
 // against the count it rolls toward. A peer whose new-revision Instances
 // reach its current desired count has finished and paces nobody, so a side
-// resized below its start count can finish. The tolerance band is read as
-// an allowed lead in fraction units, mirroring the serving band's "± band
-// of the reference ratio" semantic.
+// resized below its start count can finish.
 //
-// The comparison is on CURRENT progress (before this step), not projected:
-// a roll advances in whole-Instance steps, so a Component leaving a tie
-// unavoidably takes a transient one-Instance lead. Gating on the projected
-// post-step lead would deny that first step and deadlock a roll that can
-// only proceed by stepping (the same wedge the serving-side tiebreakers
-// exist to avoid). Gating on the CURRENT lead instead lets a level-or-
-// behind Component take the minimal step, but holds a Component that is
-// already out front. Properties:
-//   - No deadlock: a Component level with or behind every still-rolling
-//     peer always proceeds, so the slowest peer is never blocked.
+// The gate projects the step it is about to admit: the Component's progress
+// after the step is the Instances that have landed (newPods), the attempts
+// open on its rows toward the target, the starts of this pass among them
+// (open), and the step itself; a peer is credited only with what has
+// landed. The lead that projection stands past the peer's share, in the
+// Component's own Instances, may not exceed its allowance
+// (lockstepAllowance): the tolerance of its own count rounded up to a whole
+// Instance, at least one, since a roll advances in whole Instances.
+// Properties:
+//   - No hold with no way out: a Component level with or behind every
+//     still-rolling peer always proceeds, so the slowest peer is never
+//     blocked.
 //   - No false hold at the finish: a peer that has fully rolled does not
 //     constrain, so the trailing Component's final steps aren't blocked.
 //   - First step always allowed: at 0 new : 0 new neither side leads.
+//   - Never past the allowance by the gate's own doing: a pass admits
+//     starts up to the allowance ahead of the peer and no more, however
+//     wide the budget and however far the status counters trail the rows.
 //
 // A Component alone in its group (no peer with a positive reference) is
-// never outpacing anyone — returns false. A nil newPods map reads as
-// all-zero (no progress yet), the correct default for the first reconcile
-// and for unit callers that don't populate it.
-func outpacesPeerProgress(reference, newPods map[v1beta1.ComponentType]int32, component v1beta1.ComponentType, band float64) bool {
-	if band < 0 {
-		band = 0
-	}
+// never outpacing anyone — returns false. Nil newPods and open maps read
+// as all-zero (no progress yet), the correct default for the first
+// reconcile and for unit callers that don't populate them.
+func outpacesPeerProgress(reference, newPods, open map[v1beta1.ComponentType]int32, component v1beta1.ComponentType, tolerancePercent int32) bool {
 	refC := reference[component]
 	if refC <= 0 {
 		return false
 	}
-	fracC := float64(newPods[component]) / float64(refC)
+	afterStep := int64(newPods[component]) + int64(open[component]) + 1
+	allowance := lockstepAllowance(tolerancePercent, refC)
 	for peer, refP := range reference {
 		if peer == component || refP <= 0 {
 			continue
@@ -471,12 +499,31 @@ func outpacesPeerProgress(reference, newPods map[v1beta1.ComponentType]int32, co
 		if newPods[peer] >= refP {
 			continue
 		}
-		peerFrac := float64(newPods[peer]) / float64(refP)
-		if fracC-peerFrac > band {
+		// The lead in the Component's Instances is afterStep less the peer's
+		// share scaled to the Component's count; both sides are multiplied
+		// by the peer's count so the comparison stays in integers.
+		lead := afterStep*int64(refP) - int64(newPods[peer])*int64(refC)
+		if lead > allowance*int64(refP) {
 			return true
 		}
 	}
 	return false
+}
+
+// lockstepAllowance is how many Instances a Component may stand ahead of a
+// peer's share on the new revision: the tolerance of its own count, rounded
+// up to a whole Instance, at least one, so a Component level with its peer
+// always has its step even where one Instance is wider than the tolerance.
+func lockstepAllowance(tolerancePercent, count int32) int64 {
+	if tolerancePercent < 0 {
+		tolerancePercent = 0
+	}
+	return max(1, ceilDiv(int64(tolerancePercent)*int64(count), 100))
+}
+
+// ceilDiv is n / d rounded up, for n >= 0 and d > 0.
+func ceilDiv(n, d int64) int64 {
+	return (n + d - 1) / d
 }
 
 // progressReference is the count each member's roll is measured against by
@@ -501,20 +548,40 @@ func (s RatioState) progressReference() map[v1beta1.ComponentType]int32 {
 	return out
 }
 
+// lockstepReference is progressReference without the pairing peer the
+// pairing gates hold still: that peer moves only once this Component has,
+// so it paces this Component's roll no more than a finished peer does.
+func (s RatioState) lockstepReference() map[v1beta1.ComponentType]int32 {
+	reference := s.progressReference()
+	if s.HeldStillPeer == "" {
+		return reference
+	}
+	if _, held := reference[s.HeldStillPeer]; !held {
+		return reference
+	}
+	out := make(map[v1beta1.ComponentType]int32, len(reference))
+	for c, n := range reference {
+		if c != s.HeldStillPeer {
+			out[c] = n
+		}
+	}
+	return out
+}
+
 // LockstepHold answers the ratio gate for a step that leaves serving
 // capacity unchanged: an in-place patch returns the same pod, so there is
 // no capacity change to project against the band, but the Instance still
 // moves to the new revision, so the new-revision lockstep applies. It
-// reports held=true, with the operator-visible reason, when `component`
-// already runs ahead of a still-rolling peer by more than the tolerance.
+// reports held=true, with the operator-visible reason, when the patch would
+// carry `component`, counting the moves it has under way, past its
+// allowance ahead of a still-rolling peer.
 // The same preconditions as EvaluateSurge admit the step outright: a group
 // without RatioBalanced pacing, a single member, or no resolved tolerance.
 func LockstepHold(pacing v1beta1.CoordinationPacing, state RatioState, component v1beta1.ComponentType) (held bool, reason string) {
 	if pacing.Type != v1beta1.CoordinationPacingRatioBalanced || len(state.Original) <= 1 || pacing.RatioTolerancePercent == nil {
 		return false, ""
 	}
-	band := float64(*pacing.RatioTolerancePercent) / 100.0
-	if outpacesPeerProgress(state.progressReference(), state.NewPods, component, band) {
+	if outpacesPeerProgress(state.lockstepReference(), state.NewPods, state.OpenAttempts, component, *pacing.RatioTolerancePercent) {
 		return true, "in-place update would outpace peer new-revision rollout past tolerance"
 	}
 	return false, ""
@@ -687,6 +754,22 @@ func surgeInFlight(statuses []v1beta1.OMENativeInstanceStatus) int32 {
 	return n
 }
 
+// openAttempts counts a replica's Instances whose move toward target has
+// started and not landed, each row read as the batch step reads it
+// (classifyBatchRow): an attempt stays on the row from the start that
+// writes it to the promote; one the batch step reads as ended (Failed, or
+// set aside without serving) is not under way, and a row on the target
+// has landed.
+func openAttempts(rows []v1beta1.OMENativeInstanceStatus, target string) int32 {
+	var n int32
+	for i := range rows {
+		if classifyBatchRow(&rows[i], target) == batchRowOpen {
+			n++
+		}
+	}
+	return n
+}
+
 // servingSurgePeakInFlight counts a Component's in-flight gang-surge TARGET
 // Instances whose replacement gang is serving WHILE its paired source gang is
 // also still serving — the transient PEAK that inflates ServingReplicas above
@@ -731,6 +814,14 @@ func servingSurgePeakInFlight(statuses []v1beta1.OMENativeInstanceStatus) int32 
 	return n
 }
 
+// servingInstanceCount counts a Component's Instances in rotation: the serving
+// rows the replica publishes, a replacement gang serving beside its source
+// counted once with that source. The budgets and the ratio rule read the
+// fleet in Instances, so an open gang surge never reads as capacity.
+func servingInstanceCount(summary *v1beta1.InferenceReplicaStatus) int32 {
+	return max(summary.ServingReplicas-servingSurgePeakInFlight(summary.InstanceStatuses), 0)
+}
+
 // CheckRatio is the consumer side of RatioBalanced pacing. The
 // dispatcher calls ResolveGateContext once per per-Instance tick and
 // threads the resulting context into each gate via CheckRatio /
@@ -760,15 +851,17 @@ func servingSurgePeakInFlight(statuses []v1beta1.OMENativeInstanceStatus) int32 
 // pods it has already pulled from rotation. IR status reflects the prior pass,
 // so both fresh tallies participate in the decision.
 func (ctx GateContext) CheckRatio(inFlightSurge, inFlightUnavail, projDelta int32) (allowed bool, reason string) {
-	allowed, reason, _ = ctx.checkRatio(inFlightSurge, inFlightUnavail, projDelta)
+	allowed, reason, _ = ctx.checkRatio(inFlightSurge, inFlightUnavail, projDelta, "")
 	return allowed, reason
 }
 
 // checkRatio is CheckRatio with the band's own reading of an admitted step:
 // outsideTolerance is true when the step was admitted although no single
 // step of the Component fits the tolerance at the group's shape, so the
-// caller can say so on the service.
-func (ctx GateContext) checkRatio(inFlightSurge, inFlightUnavail, projDelta int32) (allowed bool, reason string, outsideTolerance bool) {
+// caller can say so on the service. heldStillPeer is the pairing peer the
+// pairing gate holds still for this start, which the lockstep does not
+// pace by; empty when there is none.
+func (ctx GateContext) checkRatio(inFlightSurge, inFlightUnavail, projDelta int32, heldStillPeer v1beta1.ComponentType) (allowed bool, reason string, outsideTolerance bool) {
 	if ctx.ShortCircuit {
 		return true, ctx.ShortReason, false
 	}
@@ -776,6 +869,7 @@ func (ctx GateContext) checkRatio(inFlightSurge, inFlightUnavail, projDelta int3
 	if decided {
 		return allowed, reason, false
 	}
+	state.HeldStillPeer = heldStillPeer
 	// projDelta is the projected per-pod transient capacity change for THIS
 	// update step, set by the strategy-aware caller:
 	//   - SurgeThenDrain → +1: a new pod is created and goes Ready BEFORE
@@ -796,13 +890,15 @@ func (ctx GateContext) checkRatio(inFlightSurge, inFlightUnavail, projDelta int3
 	return false, decision.Reason, false
 }
 
-// CheckRatioLockstep is the ratio gate for an in-place start, which keeps
+// checkRatioLockstep is the ratio gate for an in-place start, which keeps
 // the pod and so its serving capacity: the serving-capacity band is waived
 // (there is no capacity change to project, and projecting a -1 loss would
 // over-block the smaller Component of a pair for good) while the
 // new-revision lockstep still applies, since the patched Instance moves to
 // the new revision like any other. Same prelude and reads as CheckRatio.
-func (ctx GateContext) CheckRatioLockstep() (allowed bool, reason string) {
+// heldStillPeer is the pairing peer the pairing gate holds still, empty
+// when there is none: the lockstep does not pace the start by that peer.
+func (ctx GateContext) checkRatioLockstep(heldStillPeer v1beta1.ComponentType) (allowed bool, reason string) {
 	if ctx.ShortCircuit {
 		return true, ctx.ShortReason
 	}
@@ -810,6 +906,7 @@ func (ctx GateContext) CheckRatioLockstep() (allowed bool, reason string) {
 	if decided {
 		return allowed, reason
 	}
+	state.HeldStillPeer = heldStillPeer
 	if held, why := LockstepHold(ctx.Group.Pacing, state, ctx.Component); held {
 		return false, why
 	}
@@ -839,6 +936,7 @@ func (ctx GateContext) ratioState(inFlightSurge, inFlightUnavail int32) (state R
 		Current:          make(map[v1beta1.ComponentType]int32, len(group.Components)),
 		Desired:          make(map[v1beta1.ComponentType]int32, len(group.Components)),
 		NewPods:          make(map[v1beta1.ComponentType]int32, len(group.Components)),
+		OpenAttempts:     make(map[v1beta1.ComponentType]int32, len(group.Components)),
 		Serving:          make(map[v1beta1.ComponentType]int32, len(group.Components)),
 		RecoveryEligible: make(map[v1beta1.ComponentType]bool, len(group.Components)),
 		Creating:         make(map[v1beta1.ComponentType]int32, len(group.Components)),
@@ -891,24 +989,22 @@ func (ctx GateContext) ratioState(inFlightSurge, inFlightUnavail int32) (state R
 		state.Current[c] = summary.Replicas
 		state.Desired[c] = desired
 		state.NewPods[c] = summary.UpdatedReplicas
-		// Serving is what the band check projects against — live
-		// traffic capacity, not rollout progress.
-		// Net out the transient gang-surge PEAK (replacement gang
-		// serving beside the not-yet-drained source) so a multi-node
-		// Component is gated at its STEADY serving, exactly like a
-		// single-pod Component whose surge flip is atomic. Without this
-		// a gang's N+1 peak is mistaken for durable capacity and the
-		// gate authorizes a drain that settles the ratio out of band.
-		serving := summary.ServingReplicas - servingSurgePeakInFlight(summary.InstanceStatuses)
-		if serving < 0 {
-			serving = 0
-		}
+		// Serving is what the band check projects against: live traffic
+		// capacity in Instances, not rollout progress.
+		serving := servingInstanceCount(summary)
 		state.Serving[c] = serving
 		state.RecoveryEligible[c] = desired > 0 && serving < desired
 		state.Creating[c] = creatingInstances(summary.InstanceStatuses)
 		state.InFlightSurge[c] = surgeInFlight(summary.InstanceStatuses)
 		// Operation-tracked in-flight drains (fresh; see RatioState doc).
 		state.InFlightUnavail[c] = unavailableInFlight(summary.InstanceStatuses)
+		// Moves under way toward the revision the member's roll moves to;
+		// the acting Component's toward the one this pass moves it to.
+		target := rollTarget(ir)
+		if c == component && ctx.TargetRevision != nil {
+			target = ctx.TargetRevision.Name
+		}
+		state.OpenAttempts[c] = openAttempts(summary.InstanceStatuses, target)
 	}
 	if !recoveryObservable {
 		clear(state.RecoveryEligible)
@@ -954,12 +1050,19 @@ func (ctx GateContext) ratioState(inFlightSurge, inFlightUnavail int32) (state R
 //     count the Component's spec asks for (desiredInstanceCount), the
 //     same base currentUnavailable is read against.
 //
-// Counts pods serving traffic (ServingReplicas), NOT pods with merely
-// running containers (ReadyReplicas). The two diverge during in-place
-// updates: kubelet still reports ContainersReady while the controller
-// has flipped the serving gate to False; using ReadyReplicas would
-// mislead the gate into letting every pod get pulled from traffic at
-// once.
+// Counts Instances serving traffic (servingInstanceCount: the serving rows,
+// a replacement gang serving beside its source counted once with it), NOT
+// pods with merely running containers (ReadyReplicas). The two diverge
+// during in-place updates: kubelet still reports ContainersReady while the
+// controller has flipped the serving gate to False; using ReadyReplicas
+// would mislead the gate into letting every pod get pulled from traffic at
+// once. The published count carries an Instance as serving whenever its
+// pods were in rotation at the last status write, a crash-looping one
+// between two of its crashes included, so the gate also reads the
+// Component's pods now: an Instance the counters carry as serving whose
+// routed pod restarted or was rebuilt and has not held Ready for the
+// proven window since, or with an attempt opened since the write, counts
+// as out of rotation too, and the hold names it (servingInstancesDown).
 //
 // Honest semantic: with MaxUnavailable=0 and an update strategy that
 // requires drain-first (in-place, recreate without surge), this gate
@@ -971,12 +1074,15 @@ func (ctx GateContext) CheckUnavailability(inFlightDelta int32) (allowed bool, r
 		return true, ctx.ShortReason
 	}
 
-	// Read the replica: its spec for the desired count, its top-level
-	// counters for the Instances in rotation; no row is read. Only a
-	// genuinely missing IR is "no observation yet" (allow); a read error
-	// fails closed so a transient apiserver blip can't disable the
-	// unavailability budget and authorize a mass drain.
-	ir, err := irprojector.ComponentIRFor(ctx.Ctx, ctx.Reads, ctx.ISVC, ctx.Component)
+	// Read the replica: its spec for the desired count and the window, its
+	// counters and rows for the Instances in rotation at the last status
+	// write, its rows beside the live pods for the Instances those counters
+	// carry as serving that are down now, and its rows to name, on a hold,
+	// the Instances that count as out of rotation. Only a genuinely missing
+	// IR is "no observation yet" (allow); a read error fails closed so a
+	// transient apiserver blip can't disable the unavailability budget and
+	// authorize a mass drain.
+	ir, _, err := irprojector.DecodedComponentIRFor(ctx.Ctx, ctx.Reads, ctx.ISVC, ctx.Component)
 	if err != nil {
 		return false, fmt.Sprintf("cannot read %s IR status, failing closed: %v", ctx.Component, err)
 	}
@@ -986,24 +1092,98 @@ func (ctx GateContext) CheckUnavailability(inFlightDelta int32) (allowed bool, r
 	}
 
 	desired := desiredInstanceCount(ir)
-	// ServingReplicas (in-load-balancer count) NOT ReadyReplicas
-	// (containers-running count) — in-place drain flips serving=False
-	// before kubelet sees a container restart, so ReadyReplicas would
-	// still report all pods Ready while half are actually out of rotation.
-	currentUnavailable := desired - ir.Status.ServingReplicas
-	if currentUnavailable < 0 {
-		currentUnavailable = 0
+	// The Instances out of rotation are the count the spec asks for less
+	// the Instances serving traffic, not merely running containers: an
+	// in-place drain takes a pod out of rotation before the kubelet sees a
+	// restart, and a replacement gang serving beside its source is one
+	// Instance with that source. A replica that records no count is read
+	// over its rows on both sides, the replacement row among them.
+	serving := servingInstanceCount(&ir.Status)
+	if !specRecordsInstanceCount(ir) {
+		serving = ir.Status.ServingReplicas
 	}
-	if inFlightDelta < 0 {
-		inFlightDelta = 0
+	currentUnavailable := max(desired-serving, 0)
+	down, notServing, err := ctx.servingInstancesDown(ir)
+	if err != nil {
+		return false, fmt.Sprintf("cannot list %s pods, failing closed: %v", ctx.Component, err)
 	}
+	currentUnavailable += int32(len(down))
+	inFlightDelta = max(inFlightDelta, 0)
 	budget := MaxUnavailableBudget(ctx.Group.Pacing, desired)
-	projected := currentUnavailable + inFlightDelta + 1
-	if projected > budget {
-		return false, fmt.Sprintf("unavailable budget %d exhausted (current %d, in-flight %d, would become %d)",
-			budget, currentUnavailable, inFlightDelta, projected)
+	if currentUnavailable+inFlightDelta+1 > budget {
+		// The hold names the Instances the count stands for, by ordinal and
+		// with why: a scale-up's Instances still being created, an Instance
+		// down beside the roll, one up only between its crashes. The numbers
+		// alone read as a budget spent by nothing the operator can see.
+		return false, UnavailableBudgetHold(budget, currentUnavailable, inFlightDelta,
+			unavailableInstancesClause(ir.Status.InstanceStatuses, desired, podsPerInstance(ir)), notServing)
 	}
 	return true, "within unavailable budget"
+}
+
+// UnavailableBudgetHold is the Budget hold's text on the group's
+// unavailability budget: the budget, the Instances out of rotation now, the
+// starts of this pass and what one more would make, then the clause naming
+// the Instances the published rows count as out of rotation
+// (unavailableInstancesClause, empty when they count none), then every
+// Instance the counters carry as serving while its own pods say it is
+// down, each with why (workloadops.ServingInstancesDown).
+func UnavailableBudgetHold(budget, current, inFlight int32, rowsClause string, notServing []string) string {
+	reason := fmt.Sprintf("unavailable budget %d exhausted (current %d, in-flight %d, would become %d)%s",
+		budget, current, inFlight, current+inFlight+1, rowsClause)
+	if len(notServing) > 0 {
+		reason += "; " + strings.Join(notServing, "; ")
+	}
+	return reason
+}
+
+// servingInstancesDown lists the Instances the replica's counters carry as
+// serving whose own pods, read now, say otherwise: a routed pod that
+// restarted or was rebuilt and has not held Ready for the proven window
+// since, or one that left rotation since the counters were written
+// (workloadops.ServingInstancesDown, the reading the Component's own
+// budget takes). The window is the Component's minReadySeconds or the
+// operator's grace for a pod the kubelet keeps restarting, whichever is
+// longer; the pods are the ones the caller handed the gate for the pass,
+// else they are listed under the Component's replica prefix through the
+// reader the gate reads the replica with. A replica with no rows has nothing
+// to read.
+func (ctx GateContext) servingInstancesDown(ir *v1beta1.InferenceReplica) ([]int32, []string, error) {
+	if len(ir.Status.InstanceStatuses) == 0 {
+		return nil, nil, nil
+	}
+	rows := make([]workloadtypes.InstanceStatus, 0, len(ir.Status.InstanceStatuses))
+	for i := range ir.Status.InstanceStatuses {
+		rows = append(rows, v1beta1convert.InstanceStatusToWorkload(ir.Status.InstanceStatuses[i]))
+	}
+	pods, err := ctx.componentPods()
+	if err != nil {
+		return nil, nil, err
+	}
+	byInstance := make(map[int32][]*corev1.Pod, len(rows))
+	for _, pod := range pods {
+		if idx, ok := query.InstanceIdxFromLabels(pod); ok {
+			byInstance[idx] = append(byInstance[idx], pod)
+		}
+	}
+	perInstance := podsPerInstance(ir)
+	window := workloadops.ProvenWindowSeconds(ir.Spec.MinReadySeconds, ctx.Defaults.ProvingGrace)
+	target, born := "", time.Time{}
+	if ctx.TargetRevision != nil {
+		target, born = ctx.TargetRevision.Name, ctx.TargetRevision.CreationTimestamp.Time
+	}
+	indices, reasons, _ := workloadops.ServingInstancesDown(rows, byInstance,
+		func(*workloadtypes.InstanceStatus) int32 { return perInstance }, target, born, window, time.Now())
+	return indices, reasons, nil
+}
+
+// componentPods is the Component's own pods the unavailability gate reads:
+// the pass's list when the caller handed one, else a list through the reader.
+func (ctx GateContext) componentPods() ([]*corev1.Pod, error) {
+	if ctx.ComponentPods != nil {
+		return ctx.ComponentPods()
+	}
+	return query.ListOMENativePodsByName(ctx.Ctx, ctx.Reads, ctx.ISVC.Namespace, prefixFor(ctx.ISVC, ctx.Component), v1beta1convert.ComponentTypeToWorkload(ctx.Component), false)
 }
 
 // desiredInstanceCount is the Instance count a Component's spec asks for,
@@ -1013,13 +1193,19 @@ func (ctx GateContext) CheckUnavailability(inFlightDelta int32) (allowed bool, r
 // overstate the fleet by one per open gang surge. A replica that records no
 // count is sized by its rows, and one with neither by a single Instance.
 func desiredInstanceCount(ir *v1beta1.InferenceReplica) int32 {
-	if ir.Spec.Replicas != nil && *ir.Spec.Replicas > 0 {
+	if specRecordsInstanceCount(ir) {
 		return *ir.Spec.Replicas
 	}
 	if ir.Status.Replicas > 0 {
 		return ir.Status.Replicas
 	}
 	return 1
+}
+
+// specRecordsInstanceCount says whether the replica's spec asks for a
+// positive Instance count.
+func specRecordsInstanceCount(ir *v1beta1.InferenceReplica) bool {
+	return ir.Spec.Replicas != nil && *ir.Spec.Replicas > 0
 }
 
 // CheckSurge is the surge-side dual of CheckUnavailability.

@@ -14,30 +14,6 @@ import (
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// Render builds the corev1.Pod for one ordinal of one Runner of one
-// Instance, derived from a shared rendered PodSpec template. Equivalent
-// to RenderWithRevision with revisionHash="" — kept as a back-compat
-// entry point for tests and callers that don't have a target revision
-// in scope.
-//
-// Owner reference comes from owner + ownerGVK; the workload key seeds
-// label/selector composition (key.SelectorLabels carries the
-// {ome.io/inferenceservice, component, managed-by} trio adapters
-// populate at construction time).
-func Render(
-	owner client.Object,
-	ownerGVK schema.GroupVersionKind,
-	key workload.Key,
-	podSpec *corev1.PodSpec,
-	plan workload.ComponentPlan,
-	inst workload.InstancePlan,
-	runner workload.RunnerPlan,
-	ordinal int32,
-	hook workload.RenderHook,
-) (*corev1.Pod, error) {
-	return RenderWithRevision(owner, ownerGVK, key, podSpec, nil, plan, inst, runner, ordinal, "", hook)
-}
-
 // RenderWithRevision builds the corev1.Pod for one ordinal of one
 // Runner of one Instance, stamping ome.io/revision-hash with
 // revisionHash so per-revision Services can select the pod.

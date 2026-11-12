@@ -9,8 +9,8 @@ import (
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
-// rejectedISVC is a canary unit whose ladder rejected the new revision, with
-// the primary reporting the given phase and no run pinned: the state a
+// rejectedISVC is a canary unit whose steps rejected the new revision, with
+// the primary reporting the given phase and no run recorded: the state a
 // status loss leaves behind during or after the revert.
 func rejectedISVC(t *testing.T, phase v1beta1.RolloutPhase) *v1beta1.InferenceService {
 	t.Helper()
@@ -46,9 +46,9 @@ func passOver(t *testing.T, isvc *v1beta1.InferenceService, ir *v1beta1.Inferenc
 }
 
 // A run lost while a canary unit is rolling back is adopted in place. The
-// revert is an update the plan gate admits only under a pinned run, and the
+// revert is an update the plan gate admits only under a recorded run, and the
 // rejected target opens no run of its own, so without adoption the rejected
-// pods would never drain. The adopted run pins the rejected revision, which
+// pods would never drain. The adopted run records the rejected revision, which
 // is what lets it close RolledBack once the revert completes; the settled
 // hold then opens nothing.
 func TestRunLostWhileRollingBackIsAdopted(t *testing.T) {
@@ -65,21 +65,21 @@ func TestRunLostWhileRollingBackIsAdopted(t *testing.T) {
 	}
 	active := isvc.Status.Rollout.ActiveRun
 	if active == nil {
-		t.Fatal("no run pinned after the adopted open")
+		t.Fatal("no run recorded after the adopted open")
 	}
 	if engine := pinnedTargetFor(t, active, v1beta1.EngineComponent); engine.Revision != hashOf(t, newRev) || engine.StableRevision != hashOf(t, oldRev) {
-		t.Fatalf("adopted pin = %+v, want the rejected revision %s over stable %s", engine, hashOf(t, newRev), hashOf(t, oldRev))
+		t.Fatalf("adopted record = %+v, want the rejected revision %s over stable %s", engine, hashOf(t, newRev), hashOf(t, oldRev))
 	}
 	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent); cs.RolledBackRevisionHash != hashOf(t, newRev) || cs.CurrentStep != 0 {
 		t.Fatalf("adoption touched the canary state: %+v", cs)
 	}
 
-	// The straggler rolls back under the adopted run, which stays pinned.
+	// The straggler rolls back under the adopted run, which stays recorded.
 	reverting := irPublished(t, oldRev, newRev, []workloadtypes.InstanceStatus{
 		rowOn(0, oldRev), rowRollingTo(1, newRev, oldRev),
 	})
 	if out := passOver(t, isvc, reverting); out.StateChanged || isvc.Status.Rollout.ActiveRun == nil || isvc.Status.Rollout.ActiveRun.RunID != active.RunID {
-		t.Fatalf("the adopted run did not stay pinned through the revert: outcome %+v, rollout %+v", out, isvc.Status.Rollout)
+		t.Fatalf("the adopted run did not stay recorded through the revert: outcome %+v, rollout %+v", out, isvc.Status.Rollout)
 	}
 
 	// The rejected pods are gone: the executor reports RolledBack and the

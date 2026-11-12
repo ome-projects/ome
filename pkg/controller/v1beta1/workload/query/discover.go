@@ -106,6 +106,23 @@ func indexUnavailable(err error) bool {
 // helper stays owner-agnostic so the workload pipeline can call it from
 // either adapter path.
 func ListOMENativePodsByName(ctx context.Context, c client.Reader, namespace, isvcName string, component workload.ComponentType, useIndex bool) ([]*corev1.Pod, error) {
+	return listOMENativePodsByName(ctx, c, namespace, isvcName, component, useIndex)
+}
+
+// ListCachedOMENativePodsByName is ListOMENativePodsByName over the cached
+// client's own pods: the cache hands out the objects it holds instead of a
+// deep copy of each, which on a large Component is most of what the list costs.
+// For a caller that reads the pods during one pass, writes nothing through
+// them and keeps none of them past it; a caller that must change a pod
+// takes its own copy first. The cache's field index is used, as for every
+// cached read.
+func ListCachedOMENativePodsByName(ctx context.Context, c client.Reader, namespace, isvcName string, component workload.ComponentType) ([]*corev1.Pod, error) {
+	return listOMENativePodsByName(ctx, c, namespace, isvcName, component, true, client.UnsafeDisableDeepCopy)
+}
+
+// listOMENativePodsByName is the one list behind the two forms above; extra
+// is added to every list it makes, the index path and the label path alike.
+func listOMENativePodsByName(ctx context.Context, c client.Reader, namespace, isvcName string, component workload.ComponentType, useIndex bool, extra ...client.ListOption) ([]*corev1.Pod, error) {
 	pods := &corev1.PodList{}
 	if useIndex {
 		// Fast path: cache field index keyed on (isvc, component). Avoids
@@ -113,8 +130,9 @@ func ListOMENativePodsByName(ctx context.Context, c client.Reader, namespace, is
 		// to the label selector only if the index is somehow missing (e.g.
 		// an index-less fake client in tests) — both return the identical
 		// set.
-		err := c.List(ctx, pods, client.InNamespace(namespace),
-			client.MatchingFields{OMENativePodIndexField: OMENativePodIndexValue(isvcName, component)})
+		opts := append([]client.ListOption{client.InNamespace(namespace),
+			client.MatchingFields{OMENativePodIndexField: OMENativePodIndexValue(isvcName, component)}}, extra...)
+		err := c.List(ctx, pods, opts...)
 		if err == nil {
 			return collectPods(pods), nil
 		}
@@ -131,7 +149,8 @@ func ListOMENativePodsByName(ctx context.Context, c client.Reader, namespace, is
 		constants.OMEComponentLabel:           string(component),
 		LabelManagedBy:                        ManagedByOMENative,
 	})
-	if err := c.List(ctx, pods, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: sel}); err != nil {
+	opts := append([]client.ListOption{client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: sel}}, extra...)
+	if err := c.List(ctx, pods, opts...); err != nil {
 		return nil, err
 	}
 	return collectPods(pods), nil
@@ -206,18 +225,113 @@ func LiveListPodsForComponent(ctx context.Context, reader client.Reader, namespa
 }
 
 // BucketPodsByInstanceIdx groups pods by their ome.io/instance-index
-// label. Pods missing the label are dropped — they were never created
-// by OMENative.
+// label, each bucket in list order. Pods missing the label are dropped:
+// they were never created by OMENative. A caller that grows one bucket
+// reaches no other: when the indexes are dense, as a Component's are, the
+// buckets are cut from one array, each at its own length; otherwise each
+// bucket is its own (bucketOneAtATime).
 func BucketPodsByInstanceIdx(pods []*corev1.Pod) map[int32][]*corev1.Pod {
+	indexes, span := readIndexLabels(pods)
+	if !span.dense(len(pods)) {
+		return bucketOneAtATime(pods, indexes)
+	}
+	counts := make([]int32, span.width())
+	distinct := 0
+	for _, reading := range indexes {
+		if !reading.set {
+			continue
+		}
+		count := &counts[span.slot(reading.index)]
+		if *count == 0 {
+			distinct++
+		}
+		*count++
+	}
+	by := make(map[int32][]*corev1.Pod, distinct)
+	backing := make([]*corev1.Pod, span.labelled)
+	next := 0
+	for slot, count := range counts {
+		if count == 0 {
+			continue
+		}
+		by[span.first+int32(slot)] = backing[next : next : next+int(count)]
+		next += int(count)
+	}
+	for i, pod := range pods {
+		if reading := indexes[i]; reading.set {
+			by[reading.index] = append(by[reading.index], pod)
+		}
+	}
+	return by
+}
+
+// bucketOneAtATime groups the pods with one append per pod: the form for
+// a list whose indexes lie too far apart to count in a slice.
+func bucketOneAtATime(pods []*corev1.Pod, indexes []indexLabelReading) map[int32][]*corev1.Pod {
 	by := make(map[int32][]*corev1.Pod)
-	for _, pod := range pods {
+	for i, pod := range pods {
+		if reading := indexes[i]; reading.set {
+			by[reading.index] = append(by[reading.index], pod)
+		}
+	}
+	return by
+}
+
+// indexLabelReading is one pod's ome.io/instance-index label as read:
+// the index, and whether the label was present and well-formed.
+type indexLabelReading struct {
+	index int32
+	set   bool
+}
+
+// indexSpan is the range of indexes a list's labelled pods carry, and how
+// many pods carry one.
+type indexSpan struct {
+	first, last int32
+	labelled    int
+}
+
+// readIndexLabels reads every pod's index label once, and the span of the
+// indexes read.
+func readIndexLabels(pods []*corev1.Pod) ([]indexLabelReading, indexSpan) {
+	indexes := make([]indexLabelReading, len(pods))
+	var span indexSpan
+	for i, pod := range pods {
 		idx, ok := InstanceIdxFromLabels(pod)
+		indexes[i] = indexLabelReading{index: idx, set: ok}
 		if !ok {
 			continue
 		}
-		by[idx] = append(by[idx], pod)
+		if span.labelled == 0 || idx < span.first {
+			span.first = idx
+		}
+		if span.labelled == 0 || idx > span.last {
+			span.last = idx
+		}
+		span.labelled++
 	}
-	return by
+	return indexes, span
+}
+
+// width is how many indexes the span covers; zero when no pod is labelled.
+func (s indexSpan) width() int64 {
+	if s.labelled == 0 {
+		return 0
+	}
+	return int64(s.last) - int64(s.first) + 1
+}
+
+// dense reports whether the indexes can be counted in a slice: they cover
+// no more than twice as many indexes as the list has pods. A Component's
+// indexes run from zero with few gaps, so its lists are dense whatever
+// its size.
+func (s indexSpan) dense(pods int) bool {
+	return s.width() <= 2*int64(pods)
+}
+
+// slot is the index's position in a count slice over the span.
+func (s indexSpan) slot(idx int32) int64 {
+	return int64(idx) - int64(s.first)
 }
 
 // IndexPodsByName returns a name -> *Pod lookup. Used by Create's
@@ -393,6 +507,18 @@ func ExcludeTerminalPods(pods []*corev1.Pod) []*corev1.Pod {
 	return out
 }
 
+// LivePodCount is the number of pods ExcludeTerminalPods keeps, counted
+// without the list: the pods outside a terminal phase.
+func LivePodCount(pods []*corev1.Pod) int {
+	live := 0
+	for _, pod := range pods {
+		if pod != nil && !IsTerminalPod(pod) {
+			live++
+		}
+	}
+	return live
+}
+
 // podCountsForPromote reports whether a pod may vouch for the set a promote
 // or hand-over is judged on: neither a terminal pod nor one being deleted is
 // a member, so a set relying on either is short and waits.
@@ -418,6 +544,18 @@ func AllPodsRuntimeReady(pods []*corev1.Pod) bool {
 		}
 	}
 	return true
+}
+
+// AnyPodRuntimeReady reports whether at least one pod has the ContainersReady
+// PodCondition, read by AllPodsRuntimeReady's rule: a terminal pod or one
+// being deleted is never runtime-ready. Empty input returns false.
+func AnyPodRuntimeReady(pods []*corev1.Pod) bool {
+	for _, pod := range pods {
+		if podCountsForPromote(pod) && podreadiness.IsContainersReady(pod) {
+			return true
+		}
+	}
+	return false
 }
 
 // PodSetPromotable reports whether a pod set clears the one bar every path

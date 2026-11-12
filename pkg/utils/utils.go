@@ -85,33 +85,6 @@ func AppendVolumeIfNotExists(slice []v1.Volume, volume v1.Volume) []v1.Volume {
 	return append(slice, volume)
 }
 
-// IsGPUEnabled reports whether requirements declares any of acceleratorResources
-// in its Limits (Requests is intentionally not consulted — this predates
-// acceleratorResources and only ever checked Limits, so that is preserved
-// rather than widened when generalizing to multiple resource names).
-//
-// acceleratorResources is the operator-configured list of extended resource
-// names that count as an accelerator (inferenceservice-config ConfigMap's
-// "acceleratorResources" key — see
-// controllerconfig.InferenceServicesConfig.AcceleratorResourceNames). There is
-// NO in-code default list: an empty/nil acceleratorResources means the config
-// is absent, and this falls back to recognizing only
-// constants.NvidiaGPUResourceType — the single resource name this function
-// checked before acceleratorResources existed — so an unconfigured cluster's
-// behavior is unchanged on upgrade.
-func IsGPUEnabled(requirements v1.ResourceRequirements, acceleratorResources []string) bool {
-	names := acceleratorResources
-	if len(names) == 0 {
-		names = []string{constants.NvidiaGPUResourceType}
-	}
-	for _, name := range names {
-		if _, ok := requirements.Limits[v1.ResourceName(name)]; ok {
-			return true
-		}
-	}
-	return false
-}
-
 // PodRequestsAccelerator reports whether any container of spec, init containers
 // included, names one of acceleratorResources in its Requests or Limits. An empty
 // acceleratorResources matches nothing: there is no default resource name.

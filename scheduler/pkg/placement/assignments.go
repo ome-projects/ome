@@ -19,7 +19,7 @@ import (
 // has committed to its domain but not yet filled. A gang's members arrive one
 // scheduling cycle at a time, so between choosing a domain and completing there
 // is a window where the gang's future members' capacity is unclaimed; without a
-// reservation a second gang can best-fit into it and strand the first (which
+// reservation a second gang can best-fit into it and leave the first short of nodes (which
 // then times out and re-plans). The reservation closes that window; it drains
 // to zero via Place as members become real occupancy, so the live snapshot's
 // own accounting is never double-counted.
@@ -308,14 +308,14 @@ func (p *DomainAssignments) GetOwned(group string) (domain Domain, id uint64, re
 // GetOwnedBy returns a commitment and whether it belongs to owner. The two
 // booleans distinguish an absent assignment from a stale same-name owner's
 // assignment.
-func (p *DomainAssignments) GetOwnedBy(group, owner string) (domain Domain, id uint64, remaining int, found, ownerMatch bool) {
+func (p *DomainAssignments) GetOwnedBy(group, owner string) (domain Domain, id uint64, found, ownerMatch bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	c, found := p.byGroup[group]
 	if !found {
-		return Domain{}, 0, 0, false, false
+		return Domain{}, 0, false, false
 	}
-	return c.domain, c.id, c.remaining, true, c.owner == owner
+	return c.domain, c.id, true, c.owner == owner
 }
 
 // Owners returns the owner identity recorded for every live commitment.

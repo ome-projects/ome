@@ -123,7 +123,7 @@ func TestPollOne_ReportBodies_AcceptsWeightsRejectsStaleOrMalformed(t *testing.T
 			}))
 			defer srv.Close()
 			poller := newTestPoller(t)
-			value, reason := poller.pollOne(context.Background(), testCapacityTarget("a", srv.URL), policy.Capacity)
+			value, _, reason := poller.pollOneDetailed(context.Background(), testCapacityTarget("a", srv.URL), policy.Capacity)
 			assert.Equal(t, tc.want, value)
 			assert.Equal(t, tc.want == nil, reason != "")
 		})

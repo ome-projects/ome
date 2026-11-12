@@ -21,7 +21,7 @@ func dividedRouterSource(routers int, routerWeights map[string]int32) *v1beta1.I
 	source.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: ptr.To(routers), MaxReplicas: 8}}
 	for i, name := range []string{"member-a", "member-b"} {
 		if weight, set := routerWeights[name]; set {
-			source.Spec.Placement.ClusterAffinity[i].Weights.Router = ptr.To(weight)
+			source.Spec.Placement.ClusterAffinity[i].Weights.Router = &v1beta1.ReplicaRatio{Min: ptr.To(weight)}
 		}
 	}
 	return source
@@ -57,7 +57,7 @@ func routerFloors(t *testing.T, source *v1beta1.InferenceService) (map[string]in
 	candidates := settledCandidates(proposal.Assignments)
 	out := map[string]int32{}
 	for _, candidate := range candidates {
-		floors, err := splitMemberFloors(source, candidates, candidate, nil)
+		floors, err := memberMinimumsFor(source, candidates, candidate, nil)
 		if err != nil {
 			t.Fatalf("%s: %v", candidate.Cluster, err)
 		}
@@ -108,10 +108,10 @@ func TestDividedRouterFloors(t *testing.T) {
 			return withoutWeights(dividedRouterSource(1, nil))
 		}, wantErr: "router minimum 1 cannot give each of the 2"},
 		{name: "split replicas scale the router minimum in the declared ratio", source: func() *v1beta1.InferenceService {
-			source := dividedRouterSource(4, map[string]int32{"member-a": 3, "member-b": 1})
+			source := withoutWeights(dividedRouterSource(4, nil))
 			source.Spec.Placement.Split = &v1beta1.SplitSpec{Replicas: ptr.To[int32](8)}
 			return source
-		}, want: map[string]int32{"member-a": 6, "member-b": 2}},
+		}, want: map[string]int32{"member-a": 4, "member-b": 4}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := routerFloors(t, tt.source())
@@ -138,8 +138,7 @@ func TestDividedRouterMemberBounds(t *testing.T) {
 		ceiling    int32
 		want       map[string][2]int
 	}{
-		{name: "routers are pinned at their share", want: map[string][2]int{"member-a": {2, 2}, "member-b": {1, 1}}},
-		{name: "a local ceiling scales by the router ratio", ceiling: 3, want: map[string][2]int{"member-a": {2, 3}, "member-b": {1, 3}}},
+		{name: "weighted routers divide the router maxReplicas by their max ratios", want: map[string][2]int{"member-a": {2, 4}, "member-b": {1, 4}}},
 		{name: "routers without weights are fixed at their share", unweighted: true, want: map[string][2]int{"member-a": {2, 2}, "member-b": {1, 1}}},
 		{name: "routers without weights scale a local ceiling by the router ratio", unweighted: true, ceiling: 3, want: map[string][2]int{"member-a": {2, 3}, "member-b": {1, 3}}},
 	} {

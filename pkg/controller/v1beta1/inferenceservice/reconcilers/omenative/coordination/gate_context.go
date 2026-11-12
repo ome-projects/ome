@@ -4,6 +4,7 @@ import (
 	"context"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -47,10 +48,10 @@ type GateContext struct {
 	ShortReason string
 
 	// Hold is the fail-closed inverse of ShortCircuit: the Component belongs
-	// to a declared rollout group but no run has pinned an effective plan
-	// (the run is opening this pass, or the plan is parked unresolvable), so
+	// to a declared rollout group but no run has recorded an effective plan
+	// (the run is opening this pass, or the plan is held as unresolvable), so
 	// updates must be DENIED. Without it, the window between a target
-	// divergence and the pin — or a park — would roll the Component forward
+	// divergence and the recorded plan — or a hold — would roll the Component forward
 	// on a plan nothing validated, silently skipping its declared gates.
 	Hold bool
 
@@ -67,9 +68,15 @@ type GateContext struct {
 	// fallback to the ISVC's copied LifecycleStatus.
 	Reads client.Reader
 
+	// ComponentPods hands the unavailability gate the Component's own pods
+	// for the pass, so a pass that consults the gate for several Instances
+	// lists them once; nil, and the gate lists them through Reads at each
+	// consult.
+	ComponentPods PodSource
+
 	// TargetRevision is the ControllerRevision the Component's Instances
 	// move to in this pass: the rollback revision while a rollback is
-	// pinned, else the spec target. The pairing gate reads the target
+	// recorded, else the spec target. The pairing gate reads the target
 	// cohort's protocol from it, so a revert is simulated toward the stable
 	// cohort even while the live spec field still names the rejected one.
 	// Nil fails the pairing gate closed.
@@ -80,16 +87,39 @@ type GateContext struct {
 	// tolerance from them.
 	Defaults GroupDefaults
 
-	// CanaryUnit is true when Component belongs to no coordination group
-	// but to a canary group that lists both the engine and the decoder.
-	// The canary executor stages such a unit's capacity through each
-	// member's partition and each member's own budget paces its starts;
-	// Group carries the unit's members so the two pairing gates keep each
-	// side's pairable minimum during a pairing-protocol change, the way
-	// they do for a blueGreen group. No other coordination gate reads the
-	// unit.
-	CanaryUnit bool
+	// Scope says which gates read Group.
+	Scope GroupScope
 }
+
+// GroupScope is which gates read a GateContext's Group.
+type GroupScope uint8
+
+const (
+	// CoordinationGroup is the Component's coordination group; every gate
+	// reads it.
+	CoordinationGroup GroupScope = iota
+	// CanaryUnit is a canary group that lists both the engine and the
+	// decoder, read by the batch step and the two pairing gates: the canary
+	// executor stages the unit's capacity through each member's partition
+	// and each member's own budget paces its starts; the operator's default
+	// pacing stands in for the pacing block a canary group does not carry,
+	// so the batch step paces the two sides' starts inside a step and under
+	// a revert, and the pairing gates keep each side's pairable minimum
+	// under its own budget during a pairing-protocol change, the way they
+	// do for a blueGreen group. No other coordination gate reads the unit.
+	CanaryUnit
+	// RecordedGroupPairing is a rolling or blue-green group the open run
+	// recorded over the engine and the decoder that shares no member with
+	// any spec group any more, read by the two pairing gates alone: its
+	// members roll on their own budgets, and a pairing-protocol change in
+	// flight keeps the pairable minimum the run opened with until the run
+	// closes.
+	RecordedGroupPairing
+)
+
+// PodSource answers the Component's pods, the same set on every call within
+// a pass.
+type PodSource func() ([]*corev1.Pod, error)
 
 // ResolveGateContext walks the shared prelude every Check*Gate runs:
 //
@@ -97,8 +127,12 @@ type GateContext struct {
 //   - no coordination block   → short-circuit with "no coordination block"
 //   - Component in no group   → short-circuit with "component not in any coord group"
 //   - Component in a canary group that lists the engine and the decoder
-//     → the unit's members as the group, flagged CanaryUnit, for the
-//     pairing gates alone
+//     → the unit's members as the group, scoped CanaryUnit, for the batch
+//     step and the pairing gates
+//   - Component in a recorded rolling or blue-green group over the engine
+//     and the decoder that the spec no longer declares
+//     → the recorded group, scoped RecordedGroupPairing, for the pairing
+//     gates alone
 //   - otherwise               → return the resolved group, ready for per-gate logic
 //
 // Returns a GateContext that subsequent CheckRatio / CheckSurge /
@@ -141,8 +175,12 @@ func ResolveGateContextWithDefaults(ctx context.Context, reads client.Reader, is
 		}
 	}
 	// The hold above covers every unpinned state of a grouped Component, so
-	// the view read here is the pinned plan, which needs no observed policies.
-	effective := rollout.Effective(isvc, rollout.Policies{})
+	// the view read here is the recorded plan, which needs no observed
+	// policies; the members are the recorded ones, while a group's ratio
+	// rule, a rolling group's budgets and the group's presence come from
+	// the spec as it is now, so an edit of those reaches the next start and
+	// a changed member list waits for the next run.
+	effective := rollout.EffectiveCoordination(isvc, rollout.Policies{})
 	groups := ResolveGroups(effective, defaults)
 	if group, ok := MembershipFor(groups, component); ok {
 		return GateContext{
@@ -156,13 +194,24 @@ func ResolveGateContextWithDefaults(ctx context.Context, reads client.Reader, is
 	}
 	if unit, ok := canaryUnitGroup(effective, component, defaults); ok {
 		return GateContext{
-			ISVC:       isvc,
-			Component:  component,
-			Group:      unit,
-			CanaryUnit: true,
-			Ctx:        ctx,
-			Reads:      reads,
-			Defaults:   defaults,
+			ISVC:      isvc,
+			Component: component,
+			Group:     unit,
+			Scope:     CanaryUnit,
+			Ctx:       ctx,
+			Reads:     reads,
+			Defaults:  defaults,
+		}
+	}
+	if group, ok := recordedPairingGroup(isvc, component, defaults); ok {
+		return GateContext{
+			ISVC:      isvc,
+			Component: component,
+			Group:     group,
+			Scope:     RecordedGroupPairing,
+			Ctx:       ctx,
+			Reads:     reads,
+			Defaults:  defaults,
 		}
 	}
 	reason := "component not in any coord group"
@@ -179,12 +228,30 @@ func ResolveGateContextWithDefaults(ctx context.Context, reads client.Reader, is
 	}
 }
 
+// recordedPairingGroup is the rolling or blue-green group the open run
+// recorded over component, resolved as recorded, when the spec no longer
+// declares a group sharing a member with it and the recorded group lists
+// both the engine and the decoder. A pairing-protocol change in flight
+// keeps the pairable minimum the run opened with until the run closes,
+// whatever the operator did to the group meanwhile.
+func recordedPairingGroup(isvc *v1beta1.InferenceService, component v1beta1.ComponentType, defaults GroupDefaults) (ResolvedGroup, bool) {
+	if isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
+		return ResolvedGroup{}, false
+	}
+	recorded := ResolveGroups(rollout.Effective(isvc, rollout.Policies{}), defaults)
+	group, ok := MembershipFor(recorded, component)
+	if !ok || !groupPairsEngineAndDecoder(group) {
+		return ResolvedGroup{}, false
+	}
+	return group, true
+}
+
 // planHold is the fail-closed plan gate: a Component in ANY declared rollout
 // group (raw spec membership — canary and ref-only groups included, which the
 // coordination-only ResolveGroups deliberately excludes) may not take updates
-// until a run pins the effective plan. This is the load-bearing ordering
-// invariant of the run model: between a target divergence and the pin
-// (different loops), and while a plan is parked unresolvable, the gate holds
+// until a run records the effective plan. This is the load-bearing ordering
+// invariant of the run model: between a target divergence and the recorded plan
+// (different loops), and while a plan is held as unresolvable, the gate holds
 // — otherwise a ref-only group would roll forward as if it were a bare
 // blueGreen, skipping its declared gates.
 func planHold(isvc *v1beta1.InferenceService, component v1beta1.ComponentType) (bool, string) {

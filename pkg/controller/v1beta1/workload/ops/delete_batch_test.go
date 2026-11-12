@@ -2647,3 +2647,142 @@ func TestDeleteBatchTakesACreateRefusedOrphan(t *testing.T) {
 		})
 	}
 }
+
+// rowWriterOver hands the wave a single-row writer over the store's rows,
+// the way the adapter's MutateInstance writes one row, so a message said
+// once is remembered between passes.
+func rowWriterOver(store *deleteMutationStore) func(context.Context, int32, func(*workload.InstanceStatus) bool) error {
+	return func(_ context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
+		row, found := store.statuses[idx]
+		if !found {
+			return nil
+		}
+		if mutate(&row) {
+			store.statuses[idx] = row
+			store.writes++
+		}
+		return nil
+	}
+}
+
+// A serving Instance the scale retires waits while the Instance the plan
+// keeps is being rebuilt by the roll: the wave admits nothing on its
+// account and holds no wave open, says so once, and takes the Instance on
+// the first pass after the kept one serves. An extra that serves nothing
+// is taken at once, a rebuild toward a held revision holds nobody, a kept
+// Instance broken outside the roll is the repair's and holds nobody, and
+// a row the delete verb already owns is taken, not held.
+func TestDeleteBatchServingExtraWaitsForTheRebuildTheScaleKeeps(t *testing.T) {
+	const v1, v2 = "engine-v1aaaaaa", "engine-v2bbbbbb"
+	rebuilding := workload.InstanceStatus{
+		Index: 0, Incarnation: 2, Phase: workload.InstancePhaseUpdating, RunningRevision: v1, TargetRevision: v2,
+		Operation: &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, Step: workload.UpdateStepDrain, TargetRevision: v2},
+	}
+	rebuilt := workload.InstanceStatus{Index: 0, Incarnation: 2, Phase: workload.InstancePhaseReady, RunningRevision: v2, PodCount: 1, ServingPodCount: 1}
+	serving := workload.InstanceStatus{Index: 1, Incarnation: 1, Phase: workload.InstancePhaseReady, RunningRevision: v1, PodCount: 1, ServingPodCount: 1}
+	plan := deleteBatchPlan()
+	plan.Instances = []workload.InstancePlan{{Index: 0, Incarnation: 2}}
+
+	run := func(t *testing.T, store *deleteMutationStore, rec *record.FakeRecorder, statuses []workload.InstanceStatus, blocks []workload.RetryBlock, pods map[int32][]*corev1.Pod) DeleteBatchResult {
+		t.Helper()
+		objects := make([]client.Object, 0, 2)
+		for _, bucket := range pods {
+			for _, pod := range bucket {
+				objects = append(objects, pod.DeepCopy())
+			}
+		}
+		c := fake.NewClientBuilder().WithScheme(deleteBatchScheme(t)).WithObjects(objects...).Build()
+		input := deleteBatchInput(deleteBatchOwner(), statuses)
+		input.ObservedState.RetryBlocks = blocks
+		input.ApplyInstanceMutationsWithRetryBlock = store.apply
+		input.MutateInstance = rowWriterOver(store)
+		result, err := DeleteBatch(context.Background(), workload.Deps{Client: c, Recorder: rec, Expectations: workload.NewExpectations()}, input, plan, []int32{1}, pods)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	servingPods := map[int32][]*corev1.Pod{0: {deleteFailurePod(0, false, v2)}, 1: {deleteFailurePod(1, true, v1)}}
+
+	t.Run("waits, says so once, then takes the Instance", func(t *testing.T) {
+		statuses := []workload.InstanceStatus{rebuilding, serving}
+		store := newDeleteMutationStore(deleteBatchOwner(), statuses)
+		rec := record.NewFakeRecorder(16)
+		for pass := 0; pass < 2; pass++ {
+			observed := []workload.InstanceStatus{rebuilding, store.statuses[1]}
+			result := run(t, store, rec, observed, nil, servingPods)
+			if result.InProgress || result.ImmediateRequeue || result.WaitingOnRebuild != 1 {
+				t.Fatalf("pass %d: result = %+v, want nothing in progress and Instance 1 waiting", pass, result)
+			}
+			if deleteOwned(store.statuses[1]) {
+				t.Fatalf("pass %d: the serving Instance was admitted while the kept one is rebuilt: %+v", pass, store.statuses[1])
+			}
+		}
+		events := overdueDrainEvents(rec)
+		if len(events) != 1 || !strings.Contains(events[0], string(workload.EventReasonScaleDownWaitsForRebuild)) ||
+			!strings.Contains(events[0], "instance=1") || !strings.Contains(events[0], "instance=0") || !strings.Contains(events[0], v2) {
+			t.Fatalf("events = %v, want one ScaleDownWaitsForRebuild naming both Instances and the revision", events)
+		}
+		if store.writes != 1 {
+			t.Fatalf("row writes = %d, want 1 (the message, said once)", store.writes)
+		}
+		// Once the kept Instance is promoted and serves, the retired one is taken.
+		store.statuses[0] = rebuilt
+		bothServing := map[int32][]*corev1.Pod{0: {deleteFailurePod(0, true, v2)}, 1: {deleteFailurePod(1, true, v1)}}
+		result := run(t, store, rec, []workload.InstanceStatus{rebuilt, store.statuses[1]}, nil, bothServing)
+		if !result.ImmediateRequeue || result.WaitingOnRebuild != 0 || !deleteOwned(store.statuses[1]) {
+			t.Fatalf("once the kept Instance serves the wave must admit the retired one: result=%+v row=%+v", result, store.statuses[1])
+		}
+	})
+	t.Run("an extra that serves nothing is taken at once", func(t *testing.T) {
+		statuses := []workload.InstanceStatus{rebuilding, serving}
+		store := newDeleteMutationStore(deleteBatchOwner(), statuses)
+		pods := map[int32][]*corev1.Pod{0: {deleteFailurePod(0, false, v2)}, 1: {deleteFailurePod(1, false, v1)}}
+		result := run(t, store, record.NewFakeRecorder(16), statuses, nil, pods)
+		if !result.ImmediateRequeue || result.WaitingOnRebuild != 0 || !deleteOwned(store.statuses[1]) {
+			t.Fatalf("result=%+v row=%+v, want the extra admitted", result, store.statuses[1])
+		}
+	})
+	t.Run("a rebuild toward a held revision holds nobody", func(t *testing.T) {
+		statuses := []workload.InstanceStatus{rebuilding, serving}
+		store := newDeleteMutationStore(deleteBatchOwner(), statuses)
+		held := []workload.RetryBlock{{TargetRevision: v2, State: workload.RetryBlockHeld, AttemptsStarted: 3}}
+		result := run(t, store, record.NewFakeRecorder(16), statuses, held, servingPods)
+		if !result.ImmediateRequeue || result.WaitingOnRebuild != 0 || !deleteOwned(store.statuses[1]) {
+			t.Fatalf("result=%+v row=%+v, want the extra admitted", result, store.statuses[1])
+		}
+	})
+	t.Run("a kept Instance promoted and broken since is the repair's and holds nobody", func(t *testing.T) {
+		statuses := []workload.InstanceStatus{rebuilt, serving}
+		store := newDeleteMutationStore(deleteBatchOwner(), statuses)
+		result := run(t, store, record.NewFakeRecorder(16), statuses, nil, servingPods)
+		if !result.ImmediateRequeue || result.WaitingOnRebuild != 0 || !deleteOwned(store.statuses[1]) {
+			t.Fatalf("result=%+v row=%+v, want the extra admitted", result, store.statuses[1])
+		}
+	})
+	t.Run("a row the delete verb already owns is taken, not held", func(t *testing.T) {
+		draining := serving
+		draining.Phase = workload.InstancePhaseDeleting
+		draining.Operation = &workload.InstanceOperation{ID: "delete-1", Type: workload.InstanceOperationDelete, Step: "Drain"}
+		input := deleteBatchInput(deleteBatchOwner(), []workload.InstanceStatus{rebuilding, draining})
+		wait := splitRetirementWait(input, plan, []int32{1}, servingPods)
+		if len(wait.taken) != 1 || wait.taken[0] != 1 || len(wait.waiting) != 0 || wait.kept != 0 {
+			t.Fatalf("taken=%v waiting=%v kept=%d, want the draining row taken and nothing waiting", wait.taken, wait.waiting, wait.kept)
+		}
+	})
+	t.Run("a kept Instance that is itself an extra holds nobody", func(t *testing.T) {
+		// Teardown hands the wave every row; a rebuild among them is on its way out too.
+		statuses := []workload.InstanceStatus{rebuilding, serving}
+		store := newDeleteMutationStore(deleteBatchOwner(), statuses)
+		c := fake.NewClientBuilder().WithScheme(deleteBatchScheme(t)).WithObjects(servingPods[0][0].DeepCopy(), servingPods[1][0].DeepCopy()).Build()
+		input := deleteBatchInput(deleteBatchOwner(), statuses)
+		input.ApplyInstanceMutationsWithRetryBlock = store.apply
+		result, err := DeleteBatch(context.Background(), workload.Deps{Client: c, Expectations: workload.NewExpectations()}, input, plan, []int32{0, 1}, servingPods)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.ImmediateRequeue || result.WaitingOnRebuild != 0 || !deleteOwned(store.statuses[0]) || !deleteOwned(store.statuses[1]) {
+			t.Fatalf("result=%+v rows=%+v, want both admitted", result, store.statuses)
+		}
+	})
+}

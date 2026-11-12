@@ -68,7 +68,7 @@ func EffectivePartition(lifecycle *v1beta1.LifecycleSpec, pacing *v1beta1.Infere
 // IRPartition returns the effective partition carried on an
 // InferenceReplica spec (see EffectivePartition), or 0 (the API-defined
 // "update every Instance" value) when the IR is nil or no partition is
-// set. Shared by ComponentIRPartition and callers that already hold the
+// set. Shared by ComponentIRPartitionFor and callers that already hold the
 // IR object.
 func IRPartition(ir *v1beta1.InferenceReplica) int32 {
 	if ir == nil {
@@ -81,16 +81,10 @@ func IRPartition(ir *v1beta1.InferenceReplica) int32 {
 	return *p
 }
 
-// ComponentIRStatus returns the authoritative InferenceReplica status for one
-// Component of an ISVC, read via the supplied reader. The full-object reader
-// owns missing and error semantics so status-only consumers share the same
-// behavior as consumers that also need desired spec state.
-func ComponentIRStatus(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
-	return statusOf(ComponentIR(ctx, reads, namespace, isvcName, c))
-}
-
-// ComponentIRStatusFor is ComponentIRStatus for whichever replica serves
-// role c on the service, projected or referenced.
+// ComponentIRStatusFor returns the status of the InferenceReplica serving
+// role c on the service, projected or referenced, read via the supplied
+// reader. The full-object reader owns the missing and error semantics, so a
+// status-only consumer behaves like one that also needs the spec.
 func ComponentIRStatusFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
 	return statusOf(ComponentIRFor(ctx, reads, isvc, c))
 }
@@ -108,8 +102,8 @@ func statusOf(ir *v1beta1.InferenceReplica, err error) (*v1beta1.InferenceReplic
 // that inspect per-Instance rows: the object is returned in the dense
 // logical shape, decoded with the Decoder carried by reads, together with
 // the encoding it was stored in. A malformed or unbounded ColumnarV2 payload
-// is an error, never an empty row set. ComponentIR and ComponentIRStatus stay
-// raw for callers that read only spec, metadata, or top-level status.
+// is an error, never an empty row set. ComponentIR and ComponentIRStatusFor
+// stay raw for callers that read only spec, metadata, or top-level status.
 func DecodedComponentIR(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
 	return decodedComponentIRAt(ctx, reads, types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)})
 }
@@ -142,41 +136,21 @@ func decodedComponentIRAt(ctx context.Context, reads client.Reader, key types.Na
 	return ir, encoding, nil
 }
 
-// DecodedComponentIRStatus returns the decoded status of one Component's
-// InferenceReplica, or nil when the IR does not exist yet.
-func DecodedComponentIRStatus(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
-	ir, _, err := DecodedComponentIR(ctx, reads, namespace, isvcName, c)
-	return statusOf(ir, err)
-}
-
-// DecodedComponentIRStatusFor is DecodedComponentIRStatus for whichever
-// replica serves role c on the service, projected or referenced.
-func DecodedComponentIRStatusFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplicaStatus, error) {
-	ir, _, err := DecodedComponentIRFor(ctx, reads, isvc, c)
-	return statusOf(ir, err)
-}
-
-// ComponentIRPartition returns the effective partition for one Component
-// of an ISVC, read from the projected InferenceReplica spec (the projected
-// spec.pacing.partition, else the user's
-// spec.lifecycle.updateStrategy.rollingUpdate.partition). The IR spec
-// carries the merged ISVC↔runtime lifecycle, so this is the partition the
-// workload controller actually stages Instances at — including a partition
-// inherited from the ServingRuntime, which the raw ISVC spec never shows.
-// Coordination MUST read this value rather than re-deriving it from the
-// unmerged ISVC: a raw-spec read reports partition 0 for a runtime-staged
-// Component and treats its held Instances as an incomplete rollout forever.
+// ComponentIRPartitionFor returns the effective partition of the
+// InferenceReplica serving role c on the service, projected or referenced,
+// read from the replica spec (the projected spec.pacing.partition, else the
+// user's spec.lifecycle.updateStrategy.rollingUpdate.partition). The IR spec
+// carries the merged ISVC and runtime lifecycle, so this is the partition the
+// workload controller holds Instances at, a partition inherited from the
+// ServingRuntime included, which the raw ISVC spec never shows. Coordination
+// reads this value rather than re-deriving it from the unmerged ISVC: a
+// raw-spec read reports partition 0 for a runtime-staged Component and treats
+// its held Instances as an incomplete rollout forever.
 //
 // Returns 0 when the IR does not exist yet or no partition is set (the
 // API-defined "update every Instance" value). Any other read failure is
 // returned as a wrapped error so safety gates can fail closed instead of
 // mistaking a flaky read for "no partition".
-func ComponentIRPartition(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (int32, error) {
-	return partitionOf(ComponentIR(ctx, reads, namespace, isvcName, c))
-}
-
-// ComponentIRPartitionFor is ComponentIRPartition for whichever replica
-// serves role c on the service, projected or referenced.
 func ComponentIRPartitionFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (int32, error) {
 	return partitionOf(ComponentIRFor(ctx, reads, isvc, c))
 }
@@ -190,19 +164,29 @@ func partitionOf(ir *v1beta1.InferenceReplica, err error) (int32, error) {
 	return IRPartition(ir), nil
 }
 
-// HeldRetryBlock reads a replica status's retry record for revision when
-// that record is Held: the attempts at the revision are spent and no fresh
-// start opens on it until a new revision or an operator release.
-func HeldRetryBlock(status *v1beta1.InferenceReplicaStatus, revision string) (v1beta1.RetryBlock, bool) {
+// RetryBlockFor reads a replica status's retry record for revision,
+// whatever its state; false when the revision carries none.
+func RetryBlockFor(status *v1beta1.InferenceReplicaStatus, revision string) (v1beta1.RetryBlock, bool) {
 	if status == nil || revision == "" {
 		return v1beta1.RetryBlock{}, false
 	}
 	for i := range status.RetryBlocks {
-		if b := &status.RetryBlocks[i]; b.TargetRevision == revision && b.State == v1beta1.RetryBlockHeld {
+		if b := &status.RetryBlocks[i]; b.TargetRevision == revision {
 			return *b.DeepCopy(), true
 		}
 	}
 	return v1beta1.RetryBlock{}, false
+}
+
+// HeldRetryBlock reads a replica status's retry record for revision when
+// that record is Held: the attempts at the revision are spent and no fresh
+// start opens on it until a new revision or an operator release.
+func HeldRetryBlock(status *v1beta1.InferenceReplicaStatus, revision string) (v1beta1.RetryBlock, bool) {
+	block, ok := RetryBlockFor(status, revision)
+	if !ok || block.State != v1beta1.RetryBlockHeld {
+		return v1beta1.RetryBlock{}, false
+	}
+	return block, true
 }
 
 // HeldUpdateReason is the hold text a Held retry record reads as; every

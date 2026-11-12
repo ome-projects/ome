@@ -117,7 +117,7 @@ func TestResolveDeclaredComponents(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(tt.want, got.Components()); diff != "" {
+			if diff := cmp.Diff(tt.want, declaredComponents(got)); diff != "" {
 				t.Errorf("runtime created an undeclared component:\n%s", diff)
 			}
 		})
@@ -256,31 +256,27 @@ func TestResolveReadErrors(t *testing.T) {
 	}
 }
 
+// Resolve reads the referenced cluster runtime twice: once to resolve it and
+// once in the final dependency check. A runtime whose resourceVersion differs
+// between those two reads is refused.
 func TestResolveInputChurn(t *testing.T) {
-	for _, tt := range []struct {
-		name       string
-		changeRead int
-	}{
-		{name: "between runtime reads", changeRead: 2},
-		{name: "during final dependency check", changeRead: 3},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			f := newRuntimeFixture()
-			calls := 0
-			cl := fixtureClient(t, f, fakeclient.EditedRead(func(csr *v1beta1.ClusterServingRuntime) {
-				calls++
-				if calls >= tt.changeRead {
-					csr.SetResourceVersion("changed")
-				}
-			}))
-			got, err := (Resolver{Client: cl}).Resolve(t.Context(), f.service, nil)
-			if diff := cmp.Diff(true, err != nil); diff != "" {
-				t.Error(diff)
-			}
-			if got != nil {
-				t.Fatal("changing runtime returned a resolution")
-			}
-		})
+	f := newRuntimeFixture()
+	calls := 0
+	cl := fixtureClient(t, f, fakeclient.EditedRead(func(csr *v1beta1.ClusterServingRuntime) {
+		calls++
+		if calls >= 2 {
+			csr.SetResourceVersion("changed")
+		}
+	}))
+	got, err := (Resolver{Client: cl}).Resolve(t.Context(), f.service, nil)
+	if diff := cmp.Diff(true, err != nil); diff != "" {
+		t.Error(diff)
+	}
+	if got != nil {
+		t.Fatal("changing runtime returned a resolution")
+	}
+	if diff := cmp.Diff(2, calls); diff != "" {
+		t.Errorf("runtime reads during Resolve:\n%s", diff)
 	}
 }
 

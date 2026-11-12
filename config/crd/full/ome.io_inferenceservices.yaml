@@ -28360,10 +28360,6 @@ spec:
                             minProperties: 1
                             properties:
                               decoder:
-                                format: int32
-                                minimum: 1
-                                type: integer
-                              decoderReplicas:
                                 properties:
                                   max:
                                     format: int32
@@ -28375,10 +28371,6 @@ spec:
                                     type: integer
                                 type: object
                               default:
-                                format: int32
-                                minimum: 1
-                                type: integer
-                              defaultReplicas:
                                 properties:
                                   max:
                                     format: int32
@@ -28390,10 +28382,6 @@ spec:
                                     type: integer
                                 type: object
                               engine:
-                                format: int32
-                                minimum: 1
-                                type: integer
-                              engineReplicas:
                                 properties:
                                   max:
                                     format: int32
@@ -28405,10 +28393,6 @@ spec:
                                     type: integer
                                 type: object
                               router:
-                                format: int32
-                                minimum: 1
-                                type: integer
-                              routerReplicas:
                                 properties:
                                   max:
                                     format: int32
@@ -28483,10 +28467,8 @@ spec:
                   x-kubernetes-validations:
                     - message: replacementTimeout requires Single placement
                       rule: '!has(self.replacementTimeout) || (has(self.policy) && self.policy == ''ClusterAffinity'' && has(self.mode) && self.mode == ''Single'')'
-                    - message: clusterAffinity weights use either default/engine/decoder/router or the *Replicas ratios, not both
-                      rule: '!has(self.clusterAffinity) || !(self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) && self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.default) || has(t.weights.engine) || has(t.weights.decoder) || has(t.weights.router))))'
-                    - message: '*Replicas ratios are allowed only in Split and replace spec.placement.split; remove split'
-                      rule: '!has(self.clusterAffinity) || !self.clusterAffinity.exists(t, has(t.weights) && (has(t.weights.defaultReplicas) || has(t.weights.engineReplicas) || has(t.weights.decoderReplicas) || has(t.weights.routerReplicas))) || (self.mode == ''Split'' && !has(self.split))'
+                    - message: clusterAffinity weights are allowed only in Split and replace spec.placement.split; remove split
+                      rule: '!has(self.clusterAffinity) || !self.clusterAffinity.exists(t, has(t.weights)) || (self.mode == ''Split'' && !has(self.split))'
                 replicaRefs:
                   properties:
                     decoder:
@@ -33392,6 +33374,7 @@ spec:
                             - CapacityTimeout
                             - AnalysisStalled
                             - StableRevisionMissing
+                            - PhaseWritten
                           type: string
                         time:
                           format: date-time
@@ -33443,6 +33426,9 @@ spec:
                     rolledBackRevisionHash:
                       type: string
                     stableRevisionHash:
+                      type: string
+                    stableSideShortSince:
+                      format: date-time
                       type: string
                     stepEnteredTime:
                       format: date-time
@@ -33583,6 +33569,7 @@ spec:
                                   - CapacityTimeout
                                   - AnalysisStalled
                                   - StableRevisionMissing
+                                  - PhaseWritten
                                 type: string
                               time:
                                 format: date-time
@@ -33634,6 +33621,9 @@ spec:
                           rolledBackRevisionHash:
                             type: string
                           stableRevisionHash:
+                            type: string
+                          stableSideShortSince:
+                            format: date-time
                             type: string
                           stepEnteredTime:
                             format: date-time
@@ -34800,6 +34790,8 @@ spec:
                             - RolledBack
                             - Superseded
                           type: string
+                        runID:
+                          type: string
                         targetRevisions:
                           items:
                             properties:
@@ -34978,6 +34970,8 @@ spec:
                               - type: string
                             pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                             x-kubernetes-int-or-string: true
+                          released:
+                            type: boolean
                           target:
                             format: int32
                             type: integer

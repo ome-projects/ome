@@ -3,7 +3,6 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -82,6 +81,18 @@ type Initial struct {
 	// Migrations seeds the owner's status.migrations records, which a
 	// seeded Migrate operation resumes from.
 	Migrations []MigrationSpec `json:"migrations,omitempty"`
+	// Quota is the namespace's ResourceQuota on the pod count, enforced
+	// for the whole run the way admission enforces one: every pod standing
+	// in the cluster counts against it, a create past it is refused in the
+	// apiserver's words, and the engine reads it where it would read a
+	// real one. The pods a scenario seeds are the driver's own hand and
+	// are never refused.
+	Quota *QuotaSpec `json:"quota,omitempty"`
+}
+
+// QuotaSpec is the pod count a scenario's namespace quota admits.
+type QuotaSpec struct {
+	Pods int32 `json:"pods"`
 }
 
 // SpecState is the part of the owner spec a scenario edits. It is the
@@ -117,9 +128,13 @@ type SpecState struct {
 	// int-or-percent string ("1", "25%"). Empty leaves the engine default.
 	MaxUnavailable string `json:"maxUnavailable,omitempty"`
 	MaxSurge       string `json:"maxSurge,omitempty"`
-	// Partition is rollingUpdate.partition, the canary hold: Instances
+	// Partition is rollingUpdate.partition, the user's own hold: Instances
 	// below it keep their revision. Unset leaves the engine default.
 	Partition *int32 `json:"partition,omitempty"`
+	// CanaryPartition is the partition a canary step projects on the
+	// Component (spec.pacing.partition), read ahead of the user's own.
+	// Unset leaves no step hold.
+	CanaryPartition *int32 `json:"canaryPartition,omitempty"`
 	// InstanceReadyTimeout bounds a newly created Instance becoming Ready
 	// and is what an operation deadline is derived from.
 	InstanceReadyTimeout string `json:"instanceReadyTimeout,omitempty"`
@@ -159,12 +174,20 @@ type ConfigState struct {
 	RequeueOperation         string `json:"requeueOperation,omitempty"`
 	RequeueGate              string `json:"requeueGate,omitempty"`
 	ScaleDownRequeueInterval string `json:"scaleDownRequeueInterval,omitempty"`
-	StuckPodGrace            string `json:"stuckPodGrace,omitempty"`
-	UnschedulableGrace       string `json:"unschedulableGrace,omitempty"`
+	// ScaleDownPodBatchSize bounds one scale-down wave in pods, an integer
+	// or a percent of the desired pods, as the manager's flag does; empty
+	// leaves the wave unbounded.
+	ScaleDownPodBatchSize string `json:"scaleDownPodBatchSize,omitempty"`
+	StuckPodGrace         string `json:"stuckPodGrace,omitempty"`
+	UnschedulableGrace    string `json:"unschedulableGrace,omitempty"`
 	// GangDomainFullGrace is lifecycle.gangDomainFullGracePeriod, the shorter
 	// grace for a gang held to a topology domain that cannot take it.
 	// Unset leaves such a hold on UnschedulableGrace.
 	GangDomainFullGrace string `json:"gangDomainFullGrace,omitempty"`
+	// SchedulingRetry is lifecycle.schedulingRetry: the wait before a gang
+	// pod left Pending with no node is written so the scheduler looks at
+	// it again, and the cap on those writes. Unset never writes one.
+	SchedulingRetry *SchedulingRetry `json:"schedulingRetry,omitempty"`
 	// AbandonedReplacementGrace is lifecycle.abandonedReplacementGracePeriod,
 	// the termination grace of a replacement abandoned before it served.
 	// Unset leaves such a pod its own grace.
@@ -214,6 +237,12 @@ type ForceDelete struct {
 	NodeUnreachableThreshold string `json:"nodeUnreachableThreshold"`
 }
 
+// SchedulingRetry is lifecycle.schedulingRetry as a scenario writes it.
+type SchedulingRetry struct {
+	After       string `json:"after"`
+	MaxAttempts int32  `json:"maxAttempts"`
+}
+
 // RowSpec seeds one persisted InstanceStatus, with or without an
 // operation in flight. A revision field names a revision the way
 // spec.rollbackTarget does: "current" is the revision the initial spec
@@ -236,7 +265,9 @@ type RowSpec struct {
 // as a controller restarted mid-operation would find it. Instants are
 // offsets from the scenario start; a deadline left empty is derived from
 // startedAt and the spec's instanceReadyTimeout, as the engine's own
-// stamps derive it.
+// stamps derive it. A Failed row keeps its operation without a deadline
+// or a placement wait, as the engine writes it, so a seed sets neither on
+// one.
 type OperationSpec struct {
 	Type string `json:"type"`
 	Step string `json:"step"`
@@ -344,13 +375,16 @@ type TimelineEvent struct {
 // the subset it reads in eventArgKeys, and the parser rejects an event
 // carrying anything outside that subset.
 type EventArgs struct {
-	Pod       *PodRef `json:"pod,omitempty"`
-	Duration  string  `json:"duration,omitempty"`
-	Image     string  `json:"image,omitempty"`
-	To        *int32  `json:"to,omitempty"`
-	Count     int     `json:"count,omitempty"`
-	Container string  `json:"container,omitempty"`
-	Message   string  `json:"message,omitempty"`
+	Pod      *PodRef `json:"pod,omitempty"`
+	Duration string  `json:"duration,omitempty"`
+	Image    string  `json:"image,omitempty"`
+	To       *int32  `json:"to,omitempty"`
+	// Canary marks a spec.partition edit as the canary step's projected
+	// partition rather than the user's rollingUpdate.partition.
+	Canary    bool   `json:"canary,omitempty"`
+	Count     int    `json:"count,omitempty"`
+	Container string `json:"container,omitempty"`
+	Message   string `json:"message,omitempty"`
 	// Termination is how a pod.containerRestart shows the run that ended:
 	// empty, the kubelet has published its termination beside the new
 	// run's start; "unpublished", the pass reads the new run's start
@@ -361,6 +395,11 @@ type EventArgs struct {
 	// template edit a spec.revision makes when the edit is not an image
 	// rewrite.
 	Env map[string]string `json:"env,omitempty"`
+	// RenderedFrom says what moved the template on a spec.revision: empty,
+	// a write of the replica's own spec, which moves its generation;
+	// "runtime", an edit of the runtime a replica names (spec.runtimeRef)
+	// and renders from, which moves the template and nothing else.
+	RenderedFrom string `json:"renderedFrom,omitempty"`
 	// Labels and Annotations rewrite the pod template's metadata: the
 	// edit spec.annotationOnly makes, or, for an annotation the hasher
 	// reads as intent, the template edit a spec.revision makes.
@@ -379,8 +418,16 @@ type EventArgs struct {
 	// observation lands is a property of the scenario, not a default the
 	// harness is entitled to invent.
 	Slack string `json:"slack,omitempty"`
-	// Strategy is the new lifecycle.updateStrategy of a spec.strategy edit.
-	Strategy string `json:"strategy,omitempty"`
+	// LeaseWait is how long the new manager waits for the leader
+	// Lease before its first pass; ctrl.crash moves the clock by it.
+	LeaseWait string `json:"leaseWait,omitempty"`
+	// Strategy is the new lifecycle.updateStrategy type of a spec.strategy
+	// edit. MaxSurge and MaxUnavailable are its new rollingUpdate budgets,
+	// spelled as the owner spec spells them: a count or a percent. An edit
+	// names the type, one budget, or any of the three together.
+	Strategy       string `json:"strategy,omitempty"`
+	MaxSurge       string `json:"maxSurge,omitempty"`
+	MaxUnavailable string `json:"maxUnavailable,omitempty"`
 	// Instance names the Instance index a migration request is made
 	// against.
 	Instance *int32 `json:"instance,omitempty"`
@@ -499,23 +546,26 @@ var eventArgKeys = map[string][]string{
 	"api.throttled":            {"verb", "resource", "count", "retryAfter"},
 	"api.namespaceTerminating": {"verb", "resource", "count"},
 	"api.conflict":             {"verb", "resource", "count", "write"},
-	"spec.revision":            {"image", "env", "annotations"},
+	"api.admissionUnavailable": {"verb", "resource", "count"},
+	"spec.revision":            {"image", "env", "annotations", "renderedFrom"},
 	"spec.annotationOnly":      {"labels", "annotations"},
-	"spec.strategy":            {"strategy"},
+	"spec.strategy":            {"strategy", "maxSurge", "maxUnavailable"},
 	"spec.replicasUp":          {"to"},
 	"spec.replicasDown":        {"to"},
 	"spec.gangWidth":           {"to"},
-	"spec.partition":           {"to"},
+	"spec.partition":           {"to", "canary"},
 	"spec.rollbackTarget":      {"image"},
 	"gate.deny":                {"pod", "message"},
 	"gate.allow":               {"pod"},
 	"spec.policyTuning":        {"value"},
 	"spec.migrateRequest":      {"instance", "fromNode", "uuid", "reason"},
+	"pod.nodeCordoned":         {"pod"},
 	"config.changed":           {"config"},
 	"gang.podGroup":            {"instance"},
 	"timer.operationDeadline":  {"slack"},
 	"timer.minReady":           {"slack"},
 	"timer.expectationsTTL":    {"slack"},
+	"ctrl.crash":               {"leaseWait"},
 	"timer.stuckPodGrace":      {"slack"},
 	"timer.retryAt":            {"slack"},
 	"timer.repairRetry":        {"slack"},
@@ -645,16 +695,4 @@ func ParseDuration(field, value string) (time.Duration, error) {
 		return 0, fmt.Errorf("replay: %s: %w", field, err)
 	}
 	return d, nil
-}
-
-// SortedEventIDs returns the event ids the driver can apply, for the
-// error message a scenario author reads when one is missing.
-func SortedEventIDs() []string {
-	out := make([]string, 0, len(eventAppliers)+1)
-	out = append(out, ClockAdvance)
-	for id := range eventAppliers {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
 }

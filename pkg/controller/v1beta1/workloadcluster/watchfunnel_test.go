@@ -288,8 +288,9 @@ func TestFunnel_WatchClusterRegistersHandlerAndPushes(t *testing.T) {
 	m.newClient = func(_ context.Context, _ []byte, _ *runtime.Scheme) (SelectivelyCachingClient, context.CancelFunc, error) {
 		return fc, func() {}, nil
 	}
-	// Retry/establish backoff with no establish wait so EstablishWatch returns
-	// immediately; retry is irrelevant on the success path.
+	// The cache-handler loop reads no reconnect backoff: it re-checks the
+	// connection at the resync cadence (10 ms below) and the shared informer
+	// owns the network watch. Nothing in this test consults the values set here.
 	m.SetReconnectBackoff(reconnectBackoff{
 		establishInitial: time.Second, establishMax: time.Second, establishFactor: 2,
 		retryInitial: time.Millisecond, retryMax: time.Millisecond,

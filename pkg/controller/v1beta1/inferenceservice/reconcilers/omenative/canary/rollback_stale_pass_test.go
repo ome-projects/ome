@@ -38,6 +38,9 @@ type passSim struct {
 	specWrites map[v1beta1.ComponentType]int
 	// members are the Components whose partition the pass projects.
 	members []v1beta1.ComponentType
+	// sampler answers the metric gate when set; nil runs every analysis
+	// step with no sampler.
+	sampler stepSampler
 }
 
 const (
@@ -267,7 +270,7 @@ func (s *passSim) pass(name string, stale bool) {
 	}
 	if out.Opened {
 		for _, g := range rollout.CanaryGroups(working, rollout.Policies{}) {
-			if err := BindRun(ctx, s.c, working, g, out.Adopted); err != nil {
+			if err := BindRun(ctx, s.c, working, g, RunOpen{Adopted: out.Adopted, Closed: out.Closed}); err != nil {
 				s.t.Fatalf("%s: bind run: %v", name, err)
 			}
 		}
@@ -283,7 +286,7 @@ func (s *passSim) pass(name string, stale bool) {
 	}
 	syncInstanceRows(s.t, s.c, working, s.members...)
 	res, err := Dispatch(ctx, DispatchDeps{
-		Client: s.c, Reader: s.c, ISVC: working, Now: s.now, Requeue: reconcileRequeue,
+		Client: s.c, Reader: s.c, ISVC: working, Now: s.now, Requeue: reconcileRequeue, StepSampler: s.sampler, Base: base,
 		ComponentRunnerPorts: canaryRunnerPorts(), Group: rollout.CanaryGroup(working, rollout.Policies{}),
 	})
 	if err != nil {

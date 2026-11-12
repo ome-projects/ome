@@ -158,10 +158,10 @@ func TestResolveDisabledRuntime(t *testing.T) {
 			in := f.inputs(t)
 			in.Runtime, in.RuntimeName, in.RuntimeIsCluster = supplied.Runtime, supplied.RuntimeName, supplied.RuntimeIsCluster
 			res, err := Resolve(t.Context(), in)
-			if res != nil || !runtimeselector.IsRuntimeDisabledError(err) {
+			var disabled *runtimeselector.RuntimeDisabledError
+			if res != nil || !errors.As(err, &disabled) {
 				t.Fatalf("resolution = %v, %v; want a RuntimeDisabledError", res, err)
 			}
-			disabled := err.(*runtimeselector.RuntimeDisabledError)
 			if diff := cmp.Diff([]any{"runtime-a", true}, []any{disabled.RuntimeName, disabled.IsCluster}); diff != "" {
 				t.Errorf("disabled runtime identity (-want +got):\n%s", diff)
 			}
@@ -182,7 +182,7 @@ func TestResolveShardedModelNotReady(t *testing.T) {
 	f := newResolveFixture()
 	f.sharded()
 	for name, resolve := range map[string]func(Inputs) error{
-		"ResolveModel": func(in Inputs) error { _, _, _, err := ResolveModel(t.Context(), in); return err },
+		"ResolveModel": func(in Inputs) error { _, _, err := ResolveModel(t.Context(), in); return err },
 		"Resolve":      func(in Inputs) error { _, err := Resolve(t.Context(), in); return err },
 	} {
 		t.Run(name, func(t *testing.T) {

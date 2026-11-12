@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -12,7 +13,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -42,11 +42,6 @@ var irGVK = v1beta1.SchemeGroupVersion.WithKind("InferenceReplica")
 // ledger lives on the user-facing ISVC, not the IR.
 var isvcGVK = v1beta1.SchemeGroupVersion.WithKind("InferenceService")
 
-// IRGVK returns the InferenceReplica GroupVersionKind. Exposed so
-// the reconciler can pass it directly to revision/podgroup helpers
-// without re-deriving it from the scheme.
-func IRGVK() schema.GroupVersionKind { return irGVK }
-
 // buildReconcileInput projects (IR.Spec, IR.Status) onto a
 // workload.ReconcileInput so the workload dispatcher can drive the
 // per-Instance pipeline without taking on a backward import to
@@ -59,9 +54,7 @@ func IRGVK() schema.GroupVersionKind { return irGVK }
 // OwnerName is ir.NamePrefix(): the parent InferenceService name for a
 // projected replica, the replica's own name for a standalone one. Pod
 // names (<prefix>-<component>-<idx>-<runner>-<ord>), Service names and
-// the HPA scale-selector formula all key off it. The SelectorLabels are
-// the OMENative trio (name prefix, component, managed-by) the renderer
-// stamps on every pod.
+// the HPA scale-selector formula all key off it.
 //
 // EventTarget defaults to the parent ISVC when the caller passes a
 // non-nil parent (so user-facing event streams stay coherent under
@@ -166,6 +159,9 @@ func (r *Reconciler) buildReconcileInput(ctx context.Context, ir *v1beta1.Infere
 		// Shorter window for a gang held to a domain that cannot take it.
 		// Zero (unconfigured) leaves such a hold on UnschedulableGrace.
 		GangDomainFullGrace: settings.GangDomainFull,
+		// The writes that ask the scheduler again for a gang pod left
+		// Pending with no node. Nil (unconfigured) never writes one.
+		SchedulingRetry: settings.SchedulingRetry,
 		// Termination grace of a replacement a rollout abandons before it
 		// ever served. Zero (unconfigured) leaves such a pod its own grace.
 		AbandonedReplacementGrace: settings.AbandonedReplacement,
@@ -251,9 +247,12 @@ func (r *Reconciler) wireCoordinationGates(ctx context.Context, input *workloadt
 	if parent != nil {
 		// The gates read peer Component status, which must be live:
 		// cross-Component coordination against a cache-lagged peer would
-		// admit a rollout the peer's real state forbids.
+		// admit a rollout the peer's real state forbids. The Component's own
+		// pods are the cache's, as its own budget reads them, listed once
+		// for every consult of the pass.
+		componentPods := podsOncePerPass(func() ([]*corev1.Pod, error) { return listComponentPods(ctx, r.Client, ir) })
 		input.UpdateGate = func(fromRevision string, strategy workloadtypes.UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (bool, workloadtypes.RolloutHoldGate, string) {
-			allowed, gate, reason := coordination.EvaluateUpdateGate(ctx, r.liveReader(), parent, ir.Spec.Component, fromRevision, target, r.Recorder, coordDefaults, strategy, inFlightSurge, inFlightUnavail)
+			allowed, gate, reason := coordination.EvaluateUpdateGateWithPods(ctx, r.liveReader(), parent, ir.Spec.Component, fromRevision, target, r.Recorder, coordDefaults, strategy, inFlightSurge, inFlightUnavail, componentPods)
 			return allowed, workloadtypes.RolloutHoldGate(gate), reason
 		}
 		// The pin alone, for the starts the workload admits without the
@@ -287,6 +286,28 @@ func (r *Reconciler) wireCoordinationGates(ctx context.Context, input *workloadt
 			}
 			return true, "", ""
 		}
+	}
+}
+
+// podsOncePerPass lists the pods on the first call and answers that list to
+// every later call; a list that failed is retried on the next call.
+func podsOncePerPass(list func() ([]*corev1.Pod, error)) coordination.PodSource {
+	var (
+		mu     sync.Mutex
+		pods   []*corev1.Pod
+		listed bool
+	)
+	return func() ([]*corev1.Pod, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !listed {
+			got, err := list()
+			if err != nil {
+				return nil, err
+			}
+			pods, listed = got, true
+		}
+		return pods, nil
 	}
 }
 
@@ -391,10 +412,9 @@ func desiredFromIR(ir *v1beta1.InferenceReplica, runners []v1beta1.Runner) workl
 		replicas = min(replicas, *ir.Spec.PlacementReplicaLimit)
 	}
 	// Pacing.Partition is the rollout-control partition the engine's
-	// update hold reads ahead of the user's Lifecycle partition;
-	// Pacing.MaxUnavailable is copied but has no producer and no reader
-	// (see WorkloadPacing). Pacing.RollbackToRevision is handled in
-	// reconciler.go.
+	// update hold reads ahead of the user's Lifecycle partition.
+	// Pacing.MaxUnavailable is reserved in the API and carried nowhere;
+	// Pacing.RollbackToRevision is handled in reconciler.go.
 	desired := workloadtypes.WorkloadDesiredSpec{
 		Replicas:          replicas,
 		AllowZeroReplicas: protocol.HasZeroReplicaFloor(ir.Spec.PlacementExecution, ir.Spec.Component),
@@ -416,10 +436,7 @@ func desiredFromIR(ir *v1beta1.InferenceReplica, runners []v1beta1.Runner) workl
 		desired.PairingProtocol = *ir.Spec.PairingProtocol
 	}
 	if ir.Spec.Pacing != nil {
-		desired.Pacing = &workloadtypes.WorkloadPacing{
-			Partition:      ir.Spec.Pacing.Partition,
-			MaxUnavailable: ir.Spec.Pacing.MaxUnavailable,
-		}
+		desired.Pacing = &workloadtypes.WorkloadPacing{Partition: ir.Spec.Pacing.Partition}
 	}
 	if ir.Spec.Lifecycle != nil {
 		desired.Lifecycle = v1beta1convert.LifecycleSpecToWorkload(*ir.Spec.Lifecycle)
@@ -475,13 +492,11 @@ func runnersFromIR(runners []v1beta1.Runner) []workloadtypes.Runner {
 // transition timestamps.
 func observedFromIR(ir *v1beta1.InferenceReplica) workloadtypes.WorkloadObservedState {
 	return workloadtypes.WorkloadObservedState{
-		ObservedGeneration: ir.Status.ObservedGeneration,
-		CollisionCount:     ir.Status.CollisionCount,
-		CurrentRevision:    ir.Status.CurrentRevision,
-		UpdateRevision:     ir.Status.UpdateRevision,
-		InstanceStatuses:   v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses),
-		RetryBlocks:        retryBlocksFromIR(ir),
-		Migrations:         migrationsFromIR(ir),
+		CurrentRevision:  ir.Status.CurrentRevision,
+		UpdateRevision:   ir.Status.UpdateRevision,
+		InstanceStatuses: v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses),
+		RetryBlocks:      retryBlocksFromIR(ir),
+		Migrations:       migrationsFromIR(ir),
 	}
 }
 
@@ -527,9 +542,7 @@ func retryBlockFromWorkload(w workloadtypes.RetryBlock) v1beta1.RetryBlock {
 	}
 }
 
-// buildKey is the IR-side workload.Key projection. The SelectorLabels
-// are the OMENative trio (name prefix, component, managed-by) the
-// workload renderer stamps on every pod it creates.
+// buildKey is the IR-side workload.Key projection.
 //
 // OwnerName is ir.NamePrefix(): the parent InferenceService name for a
 // projected replica, the replica's own name for a standalone one.
@@ -537,15 +550,9 @@ func retryBlockFromWorkload(w workloadtypes.RetryBlock) v1beta1.RetryBlock {
 // irRevisionKey derives revision names from the same prefix.
 func buildKey(ir *v1beta1.InferenceReplica) workloadtypes.Key {
 	return workloadtypes.Key{
-		Namespace:   ir.Namespace,
-		Component:   v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
-		OwnerName:   ir.NamePrefix(),
-		OwnerLabels: ir.Labels,
-		SelectorLabels: map[string]string{
-			constants.InferenceServicePodLabelKey: ir.NamePrefix(),
-			constants.OMEComponentLabel:           string(ir.Spec.Component),
-			query.LabelManagedBy:                  query.ManagedByOMENative,
-		},
+		Namespace: ir.Namespace,
+		Component: v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component),
+		OwnerName: ir.NamePrefix(),
 	}
 }
 
@@ -671,7 +678,9 @@ func buildApplyInstanceMutationsWithRetryBlock(writer statusWriter, ir *v1beta1.
 // through an instanceBatchWrite, writes the copy, and reads back the rows
 // the apiserver stored for the caller's copy and the commit callbacks. The
 // rows of the API object are read and written here alone; the record works
-// on copies.
+// on copies. A batch whose every mutation the caller found unchanged on the
+// pass's copy, with no retry record to move, has nothing to write and makes
+// no attempt: no live read, no Mutate call, no commit callback.
 func buildApplyInstanceMutationsWithRetryBlockFromReader(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica, historyLimit *int32) func(ctx context.Context, muts []workloadtypes.InstanceMutation, targetRevision string, mutateRetryBlock func(*workloadtypes.RetryBlock) workloadtypes.RetryBlockDisposition) error {
 	key := client.ObjectKeyFromObject(ir)
 	ownerUID := ir.UID
@@ -679,7 +688,7 @@ func buildApplyInstanceMutationsWithRetryBlockFromReader(writer statusWriter, re
 		if err := validateInstanceMutations(muts); err != nil {
 			return err
 		}
-		if len(muts) == 0 && mutateRetryBlock == nil {
+		if mutateRetryBlock == nil && everyMutationUnchangedOnCopy(muts) {
 			return nil
 		}
 		write := &instanceBatchWrite{mutations: muts, targetRevision: targetRevision, mutateRetryBlock: mutateRetryBlock, historyLimit: historyLimit}
@@ -736,6 +745,20 @@ func buildApplyInstanceMutationsWithRetryBlockFromReader(writer statusWriter, re
 		})
 		return write.finish(err, ir)
 	}
+}
+
+// everyMutationUnchangedOnCopy reports whether the caller found every
+// mutation of the batch unchanged on the pass's copy of its row; an empty
+// batch is one. Such a batch has nothing to write: the copy carries every
+// row this controller wrote, so the live rows can differ from it only by a
+// write the cache has not shown yet, which the next pass reads.
+func everyMutationUnchangedOnCopy(muts []workloadtypes.InstanceMutation) bool {
+	for i := range muts {
+		if !muts[i].UnchangedOnCopy {
+			return false
+		}
+	}
+	return true
 }
 
 // validateInstanceMutations rejects a batch whose shape the write cannot
@@ -1241,7 +1264,8 @@ func mirrorInstanceStatuses(ir *v1beta1.InferenceReplica, statuses []v1beta1.OME
 //     between crashes), withdrawn while it names targetName but an
 //     Instance still runs another revision, the shape a rollback onto the
 //     last promoted revision leaves behind, and restored to targetName
-//     once every Instance is back on the revision it was withdrawn from,
+//     once every Instance is back on the revision it was withdrawn from
+//     and no attempt a pass still drives is open on any of them,
 //     which the CurrentRevisionWithdrawn condition records beside the
 //     empty current and this write raises or clears with it;
 //   - the rows are read beside the revision their pods carry (podReader,
@@ -1255,10 +1279,6 @@ func mirrorInstanceStatuses(ir *v1beta1.InferenceReplica, statuses []v1beta1.OME
 // in-memory IR so the deferred aggregator's Ready computation and the
 // reconciler's promotion log observe the post-write value.
 func buildPromoteCurrentRevision(writer statusWriter, reads, podReader client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, targetName string) error {
-	key := client.ObjectKeyFromObject(ir)
-	ownerUID := ir.UID
-	ownerGeneration := ir.Generation
-	templateHash := templateHashOf(ir)
 	return func(ctx context.Context, targetName string) error {
 		if targetName == "" {
 			return nil
@@ -1267,54 +1287,85 @@ func buildPromoteCurrentRevision(writer statusWriter, reads, podReader client.Re
 		if err != nil {
 			return err
 		}
-		var committed string
-		wrote := false
-		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			committed, wrote = "", false
-			fresh := &v1beta1.InferenceReplica{}
-			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					return workloadtypes.ErrStatusOwnerGone
-				}
-				return fmt.Errorf("re-read IR: %w", err)
-			}
-			if ownerUID == "" || fresh.UID != ownerUID {
-				return workloadtypes.ErrStatusOwnerGone
-			}
-			if fresh.Generation != ownerGeneration && specChangedSincePlanned(ir, fresh) {
-				return workloadtypes.ErrStatusMutationPrecondition
-			}
-			insts := v1beta1convert.InstanceStatusSliceToWorkload(fresh.Status.InstanceStatuses)
-			withdrawn := withdrawnRevisionFor(&fresh.Status)
-			recorded := fresh.Status.CurrentRevision
-			want := workloadstatus.CurrentRevisionFor(insts, recorded, targetName, retryBlocksFromIR(fresh), withdrawn, pods)
-			if want == recorded {
-				return nil
-			}
-			fresh.Status.UpdateRevision = targetName
-			fresh.Status.ObservedTemplateHash = templateHash
-			fresh.Status.CurrentRevision = want
-			recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, recorded)
-			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
-				if apierrors.IsNotFound(err) {
-					return workloadtypes.ErrStatusOwnerGone
-				}
-				return fmt.Errorf("update IR status: %w", err)
-			}
-			committed, wrote = want, true
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-		if wrote && ir != nil {
-			ir.Status.UpdateRevision = targetName
-			ir.Status.ObservedTemplateHash = templateHash
-			ir.Status.CurrentRevision = committed
-		}
+		return promoteCurrentRevisionOverPods(ctx, writer, reads, ir, targetName, pods)
+	}
+}
+
+// promoteCurrentRevisionOverPods is the promotion of buildPromoteCurrentRevision
+// over pods the caller read. The end of a pass lists the Component's pods
+// once and hands them to the promotion and to the publication, so both
+// decide from the same pods. An empty targetName promotes nothing.
+func promoteCurrentRevisionOverPods(ctx context.Context, writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica, targetName string, pods workloadstatus.PodRevisions) error {
+	if targetName == "" {
 		return nil
 	}
+	// The pass's copy carries every row and revision this controller wrote.
+	// When it already names the revision its rows, its retry records and
+	// the pods call for, the live object needs no write, and nothing is
+	// read; a copy behind a write of this controller is read again by the
+	// pass that write's event brings.
+	if currentRevisionWanted(ir, targetName, pods) == ir.Status.CurrentRevision {
+		return nil
+	}
+	key := client.ObjectKeyFromObject(ir)
+	ownerUID := ir.UID
+	ownerGeneration := ir.Generation
+	templateHash := templateHashOf(ir)
+	var committed string
+	wrote := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		committed, wrote = "", false
+		fresh := &v1beta1.InferenceReplica{}
+		source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return workloadtypes.ErrStatusOwnerGone
+			}
+			return fmt.Errorf("re-read IR: %w", err)
+		}
+		if ownerUID == "" || fresh.UID != ownerUID {
+			return workloadtypes.ErrStatusOwnerGone
+		}
+		if fresh.Generation != ownerGeneration && specChangedSincePlanned(ir, fresh) {
+			return workloadtypes.ErrStatusMutationPrecondition
+		}
+		withdrawn := withdrawnRevisionFor(&fresh.Status)
+		recorded := fresh.Status.CurrentRevision
+		want := currentRevisionWanted(fresh, targetName, pods)
+		if want == recorded {
+			return nil
+		}
+		fresh.Status.UpdateRevision = targetName
+		fresh.Status.ObservedTemplateHash = templateHash
+		fresh.Status.CurrentRevision = want
+		recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, recorded, writer.now())
+		if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
+			if apierrors.IsNotFound(err) {
+				return workloadtypes.ErrStatusOwnerGone
+			}
+			return fmt.Errorf("update IR status: %w", err)
+		}
+		committed, wrote = want, true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if wrote && ir != nil {
+		ir.Status.UpdateRevision = targetName
+		ir.Status.ObservedTemplateHash = templateHash
+		ir.Status.CurrentRevision = committed
+	}
+	return nil
+}
+
+// currentRevisionWanted is the current revision the rows and the retry
+// records of ir, the revision its status records a rollback from, and the
+// revision each Instance's pods carry say its status should name, with
+// targetName as the roll target.
+func currentRevisionWanted(ir *v1beta1.InferenceReplica, targetName string, pods workloadstatus.PodRevisions) string {
+	insts := v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses)
+	return workloadstatus.CurrentRevisionFor(insts, ir.Status.CurrentRevision, targetName, retryBlocksFromIR(ir), withdrawnRevisionFor(&ir.Status), pods)
 }
 
 // buildRecordUpdateRevision writes status.updateRevision ahead of the pass
@@ -1329,36 +1380,37 @@ func buildPromoteCurrentRevision(writer statusWriter, reads, podReader client.Re
 // from status.CurrentRevisionFor over the fresh rows and the revision their
 // pods carry (podReader, the cached client), so no stored status reads
 // current equal to update while an Instance runs, or is pinned to, another revision.
-func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, targetName string) error {
+// The counters that depend on the target are written in the same write: the
+// Instances on the new revision and those of them with at least their desired
+// pod count Ready, read over the pods the publication counts (a pod bound to a
+// Node that no longer exists is gone for both), so no reader sees the counts
+// made against the previous target beside the new name.
+func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Reader, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, nodes workloadtypes.NodePresence) func(ctx context.Context, targetName string) error {
 	key := client.ObjectKeyFromObject(ir)
-	ownerUID := ir.UID
-	ownerGeneration := ir.Generation
 	templateHash := templateHashOf(ir)
+	desiredByIdx := workloadstatus.DesiredPodCountByInstance(plan)
 	return func(ctx context.Context, targetName string) error {
 		if targetName == "" {
 			return nil
 		}
-		pods, err := podRevisionsFor(ctx, podReader, ir)
+		componentPods, err := listComponentPods(ctx, podReader, ir)
 		if err != nil {
 			return err
 		}
+		if componentPods, _, err = query.SplitPodsOnMissingNodes(ctx, nodes, componentPods); err != nil {
+			return err
+		}
+		podsByInstance := query.BucketPodsByInstanceIdx(componentPods)
+		pods := workloadstatus.PodRevisionsByInstance(podsByInstance)
 		var committedCurrent string
+		var committedUpdated, committedUpdatedReady int32
 		wrote := false
 		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			committedCurrent, wrote = "", false
-			fresh := &v1beta1.InferenceReplica{}
-			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
+			committedUpdated, committedUpdatedReady = 0, 0
+			fresh, source, err := freshCopyForRecord(ctx, reads, key, ir)
 			if err != nil {
-				if apierrors.IsNotFound(err) {
-					return workloadtypes.ErrStatusOwnerGone
-				}
-				return fmt.Errorf("re-read IR: %w", err)
-			}
-			if ownerUID == "" || fresh.UID != ownerUID {
-				return workloadtypes.ErrStatusOwnerGone
-			}
-			if fresh.Generation != ownerGeneration && specChangedSincePlanned(ir, fresh) {
-				return workloadtypes.ErrStatusMutationPrecondition
+				return err
 			}
 			if fresh.Status.UpdateRevision == targetName && fresh.Status.ObservedTemplateHash == templateHash {
 				return nil
@@ -1367,10 +1419,13 @@ func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Read
 			withdrawn := withdrawnRevisionFor(&fresh.Status)
 			recorded := fresh.Status.CurrentRevision
 			current := workloadstatus.CurrentRevisionFor(insts, recorded, targetName, retryBlocksFromIR(fresh), withdrawn, pods)
+			updated, updatedReady := instancesOnRevision(insts, targetName, podsByInstance, desiredByIdx)
 			fresh.Status.UpdateRevision = targetName
 			fresh.Status.ObservedTemplateHash = templateHash
 			fresh.Status.CurrentRevision = current
-			recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, recorded)
+			fresh.Status.UpdatedReplicas = updated
+			fresh.Status.UpdatedReadyReplicas = updatedReady
+			recordCurrentRevisionWithdrawal(&fresh.Status, withdrawn, recorded, writer.now())
 			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
 				if apierrors.IsNotFound(err) {
 					return workloadtypes.ErrStatusOwnerGone
@@ -1378,6 +1433,7 @@ func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Read
 				return fmt.Errorf("update IR status: %w", err)
 			}
 			committedCurrent, wrote = current, true
+			committedUpdated, committedUpdatedReady = updated, updatedReady
 			return nil
 		})
 		if err != nil {
@@ -1388,10 +1444,59 @@ func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Read
 			ir.Status.ObservedTemplateHash = templateHash
 			if wrote {
 				ir.Status.CurrentRevision = committedCurrent
+				ir.Status.UpdatedReplicas = committedUpdated
+				ir.Status.UpdatedReadyReplicas = committedUpdatedReady
 			}
 		}
 		return nil
 	}
+}
+
+// freshCopyForRecord re-reads the replica for the target record under its
+// two preconditions: the object is the one the pass planned against, and
+// no spec change the pass did not see has landed since the plan.
+func freshCopyForRecord(ctx context.Context, reads client.Reader, key client.ObjectKey, planned *v1beta1.InferenceReplica) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
+	fresh := &v1beta1.InferenceReplica{}
+	source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, "", workloadtypes.ErrStatusOwnerGone
+		}
+		return nil, "", fmt.Errorf("re-read IR: %w", err)
+	}
+	if planned.UID == "" || fresh.UID != planned.UID {
+		return nil, "", workloadtypes.ErrStatusOwnerGone
+	}
+	if fresh.Generation != planned.Generation && specChangedSincePlanned(planned, fresh) {
+		return nil, "", workloadtypes.ErrStatusMutationPrecondition
+	}
+	return fresh, source, nil
+}
+
+// instancesOnRevision counts the rows that rest on the named revision and,
+// among them, the Instances with at least their desired pod count
+// ContainersReady: the updated counters of a status that names that
+// revision as its target, by the publication's own rule. A stored row
+// carries no readiness (the publication clears the pod-derived fields
+// before every write), so readiness is read from the live pods; the desired
+// size is the plan's, as the publication reads it, and the live pod count
+// for an Instance the plan does not name.
+func instancesOnRevision(insts []workloadtypes.InstanceStatus, revisionName string, podsByInstance map[int32][]*corev1.Pod, desiredByIdx map[int32]int32) (int32, int32) {
+	rev := query.RevisionFromName(revisionName)
+	var on, ready int32
+	for i := range insts {
+		row := &insts[i]
+		if !workloadstatus.RowOnRevision(row, rev) {
+			continue
+		}
+		on++
+		live := query.ExcludeTerminalPods(podsByInstance[row.Index])
+		total := int32(len(live))
+		if workloadstatus.InstanceMeetsThreshold(total, workloadstatus.CountReadyPods(live), workloadstatus.DesiredFor(desiredByIdx, row.Index, total)) {
+			ready++
+		}
+	}
+	return on, ready
 }
 
 // templateHashOf is the pod-template hash the projector wrote on a
@@ -1403,11 +1508,35 @@ func templateHashOf(ir *v1beta1.InferenceReplica) string {
 // podRevisionsFor lists the Component's pods through the cache, as the
 // publication does, and reads the revision each Instance's pods carry.
 func podRevisionsFor(ctx context.Context, c client.Reader, ir *v1beta1.InferenceReplica) (workloadstatus.PodRevisions, error) {
+	pods, err := listComponentPods(ctx, c, ir)
+	if err != nil {
+		return nil, err
+	}
+	return podRevisionsOf(pods), nil
+}
+
+// listComponentPods is the one cached list of the Component's pods a
+// reader of pods takes: the reader is the cache, which serves it through
+// the OMENative pod index.
+func listComponentPods(ctx context.Context, c client.Reader, ir *v1beta1.InferenceReplica) ([]*corev1.Pod, error) {
 	pods, err := query.ListOMENativePodsByName(ctx, c, ir.Namespace, ir.NamePrefix(), v1beta1convert.ComponentTypeToWorkload(ir.Spec.Component), true)
 	if err != nil {
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
-	return workloadstatus.PodRevisionsByInstance(query.BucketPodsByInstanceIdx(pods)), nil
+	return pods, nil
+}
+
+// componentPodLister is listComponentPods as the pass's cached pod list
+// takes it.
+func componentPodLister(c client.Reader, ir *v1beta1.InferenceReplica) func(context.Context) ([]*corev1.Pod, error) {
+	return func(ctx context.Context) ([]*corev1.Pod, error) {
+		return listComponentPods(ctx, c, ir)
+	}
+}
+
+// podRevisionsOf reads the revision each Instance's pods carry.
+func podRevisionsOf(pods []*corev1.Pod) workloadstatus.PodRevisions {
+	return workloadstatus.PodRevisionsByInstance(query.BucketPodsByInstanceIdx(pods))
 }
 
 // buildMutateRetryBlock wraps the workload-typed RetryBlock mutate
@@ -1617,11 +1746,16 @@ func buildRemoveInstance(writer statusWriter, reads client.Reader, ir *v1beta1.I
 // buildWriteAggregateCondition wraps the IR-side per-Component
 // condition writer as the workload.ReconcileInput.WriteAggregateCondition
 // callback. The closure merges cond into IR.Status.Conditions under
-// retry.RetryOnConflict so LastTransitionTime only bumps on a real
+// retry.RetryOnConflict so LastTransitionTime moves only on a real
 // transition and concurrent reconciles can't lose the write to each
-// other. Today this surface is exercised only by the workload-side
-// gang reconciler (GangSchedulingUnavailable); the IR controller
-// inherits it for free.
+// other. A condition that names no transition time transitions at the
+// pass's clock; the merge never reads the wall clock.
+//
+// The pass's copy decides first: it carries every condition this
+// controller wrote, this pass's writes included, so a condition it already
+// records as asked is written nowhere and nothing is read live. Any other
+// answer is decided on the live object, and the condition it commits is
+// mirrored onto the copy for the rest of the pass.
 func buildWriteAggregateCondition(writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica) func(ctx context.Context, cond metav1.Condition) error {
 	key := client.ObjectKeyFromObject(ir)
 	ownerUID := ir.UID
@@ -1629,7 +1763,15 @@ func buildWriteAggregateCondition(writer statusWriter, reads client.Reader, ir *
 		if writer.Client == nil || ir == nil {
 			return fmt.Errorf("buildWriteAggregateCondition: nil client or IR")
 		}
-		return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if conditionRecorded(ir.Status.Conditions, cond) {
+			return nil
+		}
+		if cond.LastTransitionTime.IsZero() {
+			cond.LastTransitionTime = metav1.NewTime(writer.now())
+		}
+		var committed *metav1.Condition
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			committed = nil
 			fresh := &v1beta1.InferenceReplica{}
 			source, err := irstatus.GetDecoded(ctx, reads, key, fresh)
 			if err != nil {
@@ -1641,23 +1783,37 @@ func buildWriteAggregateCondition(writer statusWriter, reads client.Reader, ir *
 			if ownerUID == "" || fresh.UID != ownerUID {
 				return workloadtypes.ErrStatusOwnerGone
 			}
-			// No-op short-circuit so we don't bump ResourceVersion every
-			// reconcile when nothing changed.
-			if existing := apimeta.FindStatusCondition(fresh.Status.Conditions, cond.Type); existing != nil &&
-				existing.Status == cond.Status &&
-				existing.Reason == cond.Reason &&
-				existing.ObservedGeneration == cond.ObservedGeneration &&
-				existing.Message == cond.Message {
-				return nil
-			}
-			apimeta.SetStatusCondition(&fresh.Status.Conditions, cond)
-			if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
-				if apierrors.IsNotFound(err) {
-					return workloadtypes.ErrStatusOwnerGone
+			if !conditionRecorded(fresh.Status.Conditions, cond) {
+				apimeta.SetStatusCondition(&fresh.Status.Conditions, cond)
+				if err := updateInferenceReplicaStatus(ctx, writer, fresh, source); err != nil {
+					if apierrors.IsNotFound(err) {
+						return workloadtypes.ErrStatusOwnerGone
+					}
+					return fmt.Errorf("update IR status: %w", err)
 				}
-				return fmt.Errorf("update IR status: %w", err)
 			}
+			committed = apimeta.FindStatusCondition(fresh.Status.Conditions, cond.Type)
 			return nil
 		})
+		if err != nil {
+			return err
+		}
+		if committed != nil {
+			apimeta.SetStatusCondition(&ir.Status.Conditions, *committed)
+		}
+		return nil
 	}
+}
+
+// conditionRecorded reports whether conditions already carry cond as
+// asked: the same status, reason, message and observed generation. The
+// transition time is the recorded one and does not count, so an unchanged
+// condition never moves ResourceVersion.
+func conditionRecorded(conditions []metav1.Condition, cond metav1.Condition) bool {
+	existing := apimeta.FindStatusCondition(conditions, cond.Type)
+	return existing != nil &&
+		existing.Status == cond.Status &&
+		existing.Reason == cond.Reason &&
+		existing.ObservedGeneration == cond.ObservedGeneration &&
+		existing.Message == cond.Message
 }

@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/placement/capacity"
@@ -14,7 +13,6 @@ import (
 // ReplicaTemplates are the component's rendered templates before workload
 // projection and pod admission. Deployment mode determines whether workers run.
 type ReplicaTemplates struct {
-	ObjectMeta metav1.ObjectMeta
 	Primary    *corev1.PodSpec
 	Worker     *corev1.PodSpec
 	WorkerSize int
@@ -23,7 +21,7 @@ type ReplicaTemplates struct {
 // ReplicaTemplatesFrom carries the library's rendered templates into the
 // shape PodSets measures.
 func ReplicaTemplatesFrom(t render.Templates) ReplicaTemplates {
-	return ReplicaTemplates{ObjectMeta: t.ObjectMeta, Primary: t.Primary, Worker: t.Worker, WorkerSize: t.WorkerSize}
+	return ReplicaTemplates{Primary: t.Primary, Worker: t.Worker, WorkerSize: t.WorkerSize}
 }
 
 // PodSets describes one complete replica under the component's resolved mode.

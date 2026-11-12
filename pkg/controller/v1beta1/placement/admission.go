@@ -18,9 +18,38 @@ import (
 // admission against live Pods. Missing components have no admission credit;
 // unreadable inventories hold placement as unknown.
 func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService) (map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, error) {
+	out, claims, err := readComponentReplicas(ctx, reads, isvc)
+	if err != nil {
+		return nil, err
+	}
+	if len(claims) == 0 {
+		return out, nil
+	}
+	// Pods are listed after every component snapshot, so a claimed cohort is
+	// verified against an inventory at least as current as the claim.
+	pods, err := listMemberPods(ctx, reads, isvc)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range declaredComponents(isvc) {
+		ir, claimed := claims[c]
+		if !claimed {
+			continue
+		}
+		if out[c], err = verifiedComponentAdmission(ctx, reads, ir, pods); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// readComponentReplicas reads each declared component once and returns its
+// status by component, nil for a component that does not exist, beside the
+// replicas that claim admission or readiness. Such a claim is verified
+// against the pod inventory, so the replica must name the service as its
+// controller.
+func readComponentReplicas(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService) (map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus, map[v1beta1.ComponentType]*v1beta1.InferenceReplica, error) {
 	out := make(map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus)
-	// Each component is read once; that snapshot carries the ownership and
-	// rows its admission is verified from.
 	claims := map[v1beta1.ComponentType]*v1beta1.InferenceReplica{}
 	for _, c := range declaredComponents(isvc) {
 		// The predicates below inspect per-Instance rows, so the status is
@@ -28,27 +57,41 @@ func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1
 		// is a read error and holds the placement like any other read failure.
 		ir, _, err := irprojector.DecodedComponentIRFor(ctx, reads, isvc, c)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if ir == nil {
 			out[c] = nil
 			continue
 		}
 		out[c] = &ir.Status
-		if !componentHasAdmittedInstance(&ir.Status) && ir.Status.ReadyReplicas == 0 {
+		if !claimsAdmission(&ir.Status) {
 			continue
 		}
-		owner := metav1.GetControllerOf(ir)
-		if isvc.UID == "" || owner == nil || owner.UID != isvc.UID || owner.Kind != "InferenceService" || owner.APIVersion != v1beta1.SchemeGroupVersion.String() {
-			return nil, fmt.Errorf("component %q has unverified service ownership", ir.Name)
+		if !controlledByService(ir, isvc) {
+			return nil, nil, fmt.Errorf("component %q has unverified service ownership", ir.Name)
 		}
 		claims[c] = ir
 	}
-	if len(claims) == 0 {
-		return out, nil
-	}
-	// Pods are listed after every component snapshot, so a claimed cohort is
-	// verified against an inventory at least as current as the claim.
+	return out, claims, nil
+}
+
+// claimsAdmission reports a status that credits an admitted Instance or a
+// ready replica; the credit counts only once live pods confirm it.
+func claimsAdmission(st *v1beta1.InferenceReplicaStatus) bool {
+	return componentHasAdmittedInstance(st) || st.ReadyReplicas != 0
+}
+
+// controlledByService reports whether ir names isvc as its controller by UID,
+// kind and API version. A service without a UID controls nothing.
+func controlledByService(ir *v1beta1.InferenceReplica, isvc *v1beta1.InferenceService) bool {
+	owner := metav1.GetControllerOf(ir)
+	return isvc.UID != "" && owner != nil && owner.UID == isvc.UID &&
+		owner.Kind == "InferenceService" && owner.APIVersion == v1beta1.SchemeGroupVersion.String()
+}
+
+// listMemberPods lists the service's pods on the member. A list the server
+// cut short cannot verify any cohort and is refused.
+func listMemberPods(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService) ([]corev1.Pod, error) {
 	pods := &corev1.PodList{}
 	if err := reads.List(ctx, pods, client.InNamespace(isvc.Namespace), client.MatchingLabels{constants.InferenceServicePodLabelKey: isvc.Name}); err != nil {
 		return nil, err
@@ -56,48 +99,35 @@ func componentIRStatuses(ctx context.Context, reads client.Reader, isvc *v1beta1
 	if pods.Continue != "" {
 		return nil, fmt.Errorf("member pod inventory is incomplete")
 	}
-	for _, c := range declaredComponents(isvc) {
-		ir, claimed := claims[c]
-		if !claimed {
-			continue
-		}
-		owned := []corev1.Pod{}
-		for _, pod := range pods.Items {
-			if owner := metav1.GetControllerOf(&pod); owner != nil && owner.UID == ir.UID {
-				owned = append(owned, pod)
-			}
-		}
-		gangSizes, err := memberGangSizes(ctx, reads, ir, owned)
-		if err != nil {
-			return nil, err
-		}
-		out[c], err = verifiedMemberAdmission(ir, owned, gangSizes)
-		if err != nil {
-			return nil, err
+	return pods.Items, nil
+}
+
+// verifiedComponentAdmission limits a claiming replica's status to the
+// admission and readiness its own pods, complete gangs included, confirm.
+func verifiedComponentAdmission(ctx context.Context, reads client.Reader, ir *v1beta1.InferenceReplica, pods []corev1.Pod) (*v1beta1.InferenceReplicaStatus, error) {
+	owned := podsControlledBy(pods, ir)
+	gangSizes, err := memberGangSizes(ctx, reads, ir, owned)
+	if err != nil {
+		return nil, err
+	}
+	return verifiedMemberAdmission(ir, owned, gangSizes)
+}
+
+// podsControlledBy returns the pods whose controller is ir.
+func podsControlledBy(pods []corev1.Pod, ir *v1beta1.InferenceReplica) []corev1.Pod {
+	owned := []corev1.Pod{}
+	for _, pod := range pods {
+		if owner := metav1.GetControllerOf(&pod); owner != nil && owner.UID == ir.UID {
+			owned = append(owned, pod)
 		}
 	}
-	return out, nil
+	return owned
 }
 
 // instanceStatusReader pairs a member-cluster reader with this controller's
 // row decoder so componentIRStatuses decodes under the configured bound.
 func (r *Reconciler) instanceStatusReader(reads client.Reader) client.Reader {
 	return irstatus.NewReader(reads, r.InstanceStatusDecoder)
-}
-
-// AnyInstanceAdmitted reports whether any component of the (derived) ISVC has at
-// least one Instance that has left the Kueue admission gate. Retained as a
-// low-level predicate (and for single-component callers); the placement
-// winner uses AllComponentsAdmitted, which is correct for multi-component (PD)
-// services. `statuses` is the authoritative per-component IR status assembled by
-// componentIRStatuses.
-func AnyInstanceAdmitted(statuses map[v1beta1.ComponentType]*v1beta1.InferenceReplicaStatus) bool {
-	for _, st := range statuses {
-		if componentHasAdmittedInstance(st) {
-			return true
-		}
-	}
-	return false
 }
 
 // AllComponentsAdmitted reports whether EVERY component the derived ISVC declares

@@ -154,7 +154,6 @@ func TestNewLWSReconciler(t *testing.T) {
 	assert.Equal(t, client, reconciler.client)
 	assert.Equal(t, scheme, reconciler.scheme)
 	assert.NotNil(t, reconciler.LWS)
-	assert.Equal(t, componentExt, reconciler.ComponentExt)
 
 	// Verify the LWS is properly created
 	assert.Equal(t, constants.LWSName(componentMeta.Name), reconciler.LWS.Name)
@@ -543,9 +542,9 @@ func TestCreateLWS(t *testing.T) {
 							Labels: map[string]string{
 								"app": "test-isvc",
 							},
-							Annotations: map[string]string{
-								"annotation": "value",
-							},
+							// The templates take no annotation the Component does not
+							// declare; the object metadata above keeps it.
+							Annotations: map[string]string{},
 						},
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{
@@ -571,9 +570,9 @@ func TestCreateLWS(t *testing.T) {
 							Labels: map[string]string{
 								"app": "test-isvc",
 							},
-							Annotations: map[string]string{
-								"annotation": "value",
-							},
+							// The templates take no annotation the Component does not
+							// declare; the object metadata above keeps it.
+							Annotations: map[string]string{},
 						},
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{
@@ -791,4 +790,45 @@ func TestCreateLWS(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCreateLWSTemplatesCarryDeclaredAndOMEAnnotationsOnly shows which
+// annotations of the component metadata reach the leader and worker pod
+// templates: a key the Component declares, OME's own keys and the pod-level
+// prefixes do; a service annotation the Component does not declare stays on
+// the LeaderWorkerSet's own metadata only.
+func TestCreateLWSTemplatesCarryDeclaredAndOMEAnnotationsOnly(t *testing.T) {
+	componentMeta := metav1.ObjectMeta{
+		Name:      "service-engine",
+		Namespace: "team-a",
+		Labels:    map[string]string{"app": "service-engine"},
+		Annotations: map[string]string{
+			"editor.example.com/write-counter": "1",
+			"ome.io/local-queue":               "queue-a",
+			"k8s.grafana.com/scrape":           "true",
+			"example.com/declared":             "component",
+		},
+	}
+	componentExt := &v1beta1.ComponentExtensionSpec{Annotations: map[string]string{"example.com/declared": "component"}}
+	podSpec := func() *corev1.PodSpec {
+		return &corev1.PodSpec{Containers: []corev1.Container{{Name: "runner", Image: "example.com/serving:v1"}}}
+	}
+
+	set := createLWS(podSpec(), podSpec(), 2, componentExt, componentMeta)
+
+	for name, got := range map[string]map[string]string{
+		"leader": set.Spec.LeaderWorkerTemplate.LeaderTemplate.Annotations,
+		"worker": set.Spec.LeaderWorkerTemplate.WorkerTemplate.Annotations,
+	} {
+		for key, want := range map[string]string{
+			"ome.io/local-queue":     "queue-a",
+			"k8s.grafana.com/scrape": "true",
+			"example.com/declared":   "component",
+		} {
+			assert.Equal(t, want, got[key], "%s template annotation %s", name, key)
+		}
+		value, ok := got["editor.example.com/write-counter"]
+		assert.False(t, ok, "a service annotation the Component does not declare reached the %s template: %q", name, value)
+	}
+	assert.Equal(t, "1", set.Annotations["editor.example.com/write-counter"], "the LeaderWorkerSet's own metadata keeps the service annotation")
 }

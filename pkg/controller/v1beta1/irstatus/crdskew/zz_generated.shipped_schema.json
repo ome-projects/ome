@@ -1,0 +1,3265 @@
+{
+ "kinds": {
+  "AcceleratorClass": 30,
+  "AcceleratorQuota": 53,
+  "AutoscalerPolicy": 78,
+  "BaseModel": 88,
+  "BenchmarkJob": 161,
+  "ClusterBaseModel": 88,
+  "ClusterServingRuntime": 231,
+  "FineTunedWeight": 233,
+  "InferenceReplica": 268,
+  "InferenceService": 369,
+  "RolloutPolicy": 372,
+  "ServingRuntime": 231,
+  "TrafficMap": 384,
+  "WorkloadCluster": 389
+ },
+ "nodes": [
+  {},
+  {
+   "items": 0
+  },
+  {
+   "properties": {
+    "averageMillis": 0,
+    "maximumMillis": 0
+   }
+  },
+  {
+   "properties": {
+    "fp16Tflops": 0,
+    "fp32Tflops": 0,
+    "int4Tops": 0,
+    "int8Tops": 0,
+    "latency": 2
+   }
+  },
+  {
+   "properties": {
+    "clockSpeedMHz": 0,
+    "computeCapability": 0,
+    "features": 1,
+    "levelZeroVersion": 0,
+    "memoryBandwidthGBps": 0,
+    "memoryGB": 0,
+    "performance": 3
+   }
+  },
+  {
+   "properties": {
+    "perHour": 0,
+    "perMillionTokens": 0,
+    "spotPerHour": 0,
+    "tier": 0
+   }
+  },
+  {
+   "properties": {
+    "key": 0,
+    "operator": 0,
+    "values": 1
+   }
+  },
+  {
+   "items": 6
+  },
+  {
+   "properties": {
+    "matchExpressions": 7,
+    "matchFields": 7
+   }
+  },
+  {
+   "properties": {
+    "preference": 8,
+    "weight": 0
+   }
+  },
+  {
+   "items": 9
+  },
+  {
+   "items": 8
+  },
+  {
+   "properties": {
+    "nodeSelectorTerms": 11
+   }
+  },
+  {
+   "properties": {
+    "preferredDuringSchedulingIgnoredDuringExecution": 10,
+    "requiredDuringSchedulingIgnoredDuringExecution": 12
+   }
+  },
+  {
+   "additionalProperties": 0
+  },
+  {
+   "properties": {
+    "matchExpressions": 7,
+    "matchLabels": 14
+   }
+  },
+  {
+   "properties": {
+    "labelSelector": 15,
+    "matchLabelKeys": 1,
+    "mismatchLabelKeys": 1,
+    "namespaceSelector": 15,
+    "namespaces": 1,
+    "topologyKey": 0
+   }
+  },
+  {
+   "properties": {
+    "podAffinityTerm": 16,
+    "weight": 0
+   }
+  },
+  {
+   "items": 17
+  },
+  {
+   "items": 16
+  },
+  {
+   "properties": {
+    "preferredDuringSchedulingIgnoredDuringExecution": 18,
+    "requiredDuringSchedulingIgnoredDuringExecution": 19
+   }
+  },
+  {
+   "properties": {
+    "nodeAffinity": 13,
+    "podAffinity": 20,
+    "podAntiAffinity": 20
+   }
+  },
+  {
+   "properties": {
+    "affinity": 21,
+    "deviceIDs": 1,
+    "nodeSelector": 14,
+    "pciVendorID": 0
+   }
+  },
+  {
+   "properties": {
+    "kueueResourceFlavor": 0,
+    "volcanoGPUType": 0
+   }
+  },
+  {
+   "properties": {
+    "divisible": 0,
+    "name": 0,
+    "quantity": 0
+   }
+  },
+  {
+   "items": 24
+  },
+  {
+   "properties": {
+    "capabilities": 4,
+    "cost": 5,
+    "discovery": 22,
+    "family": 0,
+    "integration": 23,
+    "model": 0,
+    "resources": 25,
+    "vendor": 0
+   }
+  },
+  {
+   "properties": {
+    "lastTransitionTime": 0,
+    "message": 0,
+    "observedGeneration": 0,
+    "reason": 0,
+    "status": 0,
+    "type": 0
+   }
+  },
+  {
+   "items": 27
+  },
+  {
+   "properties": {
+    "availableAccelerators": 0,
+    "availableNodes": 0,
+    "conditions": 28,
+    "lastUpdated": 0,
+    "nodes": 1,
+    "totalAccelerators": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 26,
+    "status": 29
+   }
+  },
+  {
+   "properties": {
+    "cluster": 0,
+    "nominal": 0
+   }
+  },
+  {
+   "items": 31
+  },
+  {
+   "properties": {
+    "borrowingLimit": 0,
+    "lendingLimit": 0,
+    "nominal": 0,
+    "perCluster": 32,
+    "policy": 0,
+    "resourceFlavor": 0,
+    "resourceName": 0
+   }
+  },
+  {
+   "items": 33
+  },
+  {
+   "properties": {
+    "policy": 0
+   }
+  },
+  {
+   "properties": {
+    "name": 0
+   }
+  },
+  {
+   "properties": {
+    "maxPriorityThreshold": 0,
+    "policy": 0
+   }
+  },
+  {
+   "properties": {
+    "borrowWithinCohort": 37,
+    "reclaimWithinCohort": 0,
+    "withinClusterQueue": 0
+   }
+  },
+  {
+   "properties": {
+    "budgets": 34,
+    "distribution": 35,
+    "parentRef": 36,
+    "preemption": 38,
+    "priorityTier": 0,
+    "role": 0
+   }
+  },
+  {
+   "properties": {
+    "admitted": 0,
+    "borrowed": 0,
+    "cluster": 0,
+    "nominal": 0,
+    "reserved": 0
+   }
+  },
+  {
+   "items": 40
+  },
+  {
+   "properties": {
+    "admitted": 0,
+    "borrowed": 0,
+    "nominal": 0,
+    "perCluster": 41,
+    "reserved": 0,
+    "resourceFlavor": 0,
+    "resourceName": 0
+   }
+  },
+  {
+   "items": 42
+  },
+  {
+   "properties": {
+    "complete": 0,
+    "flavorSetHash": 0,
+    "flavorUID": 0,
+    "nodeLabels": 14
+   }
+  },
+  {
+   "properties": {
+    "allocatable": 0,
+    "attribution": 44,
+    "cluster": 0,
+    "clusterUID": 0,
+    "highWaterMark": 0,
+    "observedAt": 0,
+    "reportAvailable": 0,
+    "reportResourceVersion": 0,
+    "reportUID": 0
+   }
+  },
+  {
+   "items": 45
+  },
+  {
+   "properties": {
+    "allocatable": 0,
+    "attribution": 44,
+    "highWaterMark": 0,
+    "observedAt": 0,
+    "perCluster": 46,
+    "resourceFlavor": 0,
+    "resourceName": 0
+   }
+  },
+  {
+   "items": 47
+  },
+  {
+   "properties": {
+    "appliedGeneration": 0,
+    "appliedTime": 0,
+    "cluster": 0,
+    "materializedGeneration": 0,
+    "message": 0
+   }
+  },
+  {
+   "items": 49
+  },
+  {
+   "properties": {
+    "frozen": 0,
+    "frozenAt": 0,
+    "lastAppliedGeneration": 0,
+    "lastAppliedTime": 0,
+    "reason": 0
+   }
+  },
+  {
+   "properties": {
+    "budgets": 43,
+    "capacity": 48,
+    "clusters": 50,
+    "conditions": 28,
+    "materialization": 51,
+    "observedGeneration": 0,
+    "parent": 0,
+    "sourceGeneration": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 39,
+    "status": 52
+   }
+  },
+  {
+   "properties": {
+    "periodSeconds": 0,
+    "type": 0,
+    "value": 0
+   }
+  },
+  {
+   "items": 54
+  },
+  {
+   "properties": {
+    "policies": 55,
+    "selectPolicy": 0,
+    "stabilizationWindowSeconds": 0,
+    "tolerance": 0
+   }
+  },
+  {
+   "properties": {
+    "scaleDown": 56,
+    "scaleUp": 56
+   }
+  },
+  {
+   "properties": {
+    "averageUtilization": 0,
+    "averageValue": 0,
+    "type": 0,
+    "value": 0
+   }
+  },
+  {
+   "properties": {
+    "container": 0,
+    "name": 0,
+    "target": 58
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "selector": 15
+   }
+  },
+  {
+   "properties": {
+    "metric": 60,
+    "target": 58
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "name": 0
+   }
+  },
+  {
+   "properties": {
+    "describedObject": 62,
+    "metric": 60,
+    "target": 58
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "target": 58
+   }
+  },
+  {
+   "properties": {
+    "containerResource": 59,
+    "external": 61,
+    "object": 63,
+    "pods": 61,
+    "resource": 64,
+    "type": 0
+   }
+  },
+  {
+   "items": 65
+  },
+  {
+   "properties": {
+    "behavior": 57,
+    "metrics": 66
+   }
+  },
+  {
+   "properties": {
+    "behavior": 57,
+    "name": 0
+   }
+  },
+  {
+   "properties": {
+    "activationTarget": 0,
+    "formula": 0,
+    "metricType": 0,
+    "target": 0
+   }
+  },
+  {
+   "properties": {
+    "horizontalPodAutoscalerConfig": 68,
+    "restoreToOriginalReplicaCount": 0,
+    "scalingModifiers": 69
+   }
+  },
+  {
+   "properties": {
+    "fromComponent": 0,
+    "value": 0
+   }
+  },
+  {
+   "properties": {
+    "failureThreshold": 0,
+    "replicas": 71
+   }
+  },
+  {
+   "properties": {
+    "metadata": 14,
+    "metricType": 0,
+    "providerRef": 36,
+    "queryReturnsDesiredReplicas": 0,
+    "type": 0
+   }
+  },
+  {
+   "items": 73
+  },
+  {
+   "properties": {
+    "advanced": 70,
+    "cooldownPeriod": 0,
+    "fallback": 72,
+    "idleReplicaCount": 0,
+    "pollingInterval": 0,
+    "triggers": 74
+   }
+  },
+  {
+   "properties": {
+    "class": 0,
+    "enforcement": 0,
+    "hpa": 67,
+    "keda": 75
+   }
+  },
+  {
+   "properties": {
+    "attachedComponents": 0,
+    "conditions": 28,
+    "observedGeneration": 0,
+    "portableDigest": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 76,
+    "status": 77
+   }
+  },
+  {
+   "properties": {
+    "library": 0,
+    "type": 0
+   }
+  },
+  {
+   "additionalProperties": 79
+  },
+  {
+   "properties": {
+    "additionalComponents": 80,
+    "className": 0,
+    "scheduler": 79,
+    "textEncoder": 79,
+    "tokenizer": 79,
+    "transformer": 79,
+    "vae": 79
+   }
+  },
+  {
+   "x-kubernetes-preserve-unknown-fields": true
+  },
+  {
+   "properties": {
+    "name": 0,
+    "operator": 0,
+    "version": 0,
+    "weight": 0
+   }
+  },
+  {
+   "properties": {
+    "downloadPolicy": 0,
+    "key": 0,
+    "nodeAffinity": 13,
+    "nodeSelector": 14,
+    "parameters": 14,
+    "path": 0,
+    "schemaPath": 0,
+    "storageUri": 0
+   }
+  },
+  {
+   "properties": {
+    "additionalMetadata": 14,
+    "apiCapabilities": 1,
+    "compartmentID": 0,
+    "diffusionPipeline": 81,
+    "disabled": 0,
+    "displayName": 0,
+    "distribution": 0,
+    "maxTokens": 0,
+    "modelArchitecture": 0,
+    "modelCapabilities": 1,
+    "modelConfiguration": 82,
+    "modelFormat": 83,
+    "modelFramework": 83,
+    "modelParameterSize": 0,
+    "modelType": 0,
+    "quantization": 0,
+    "servingMode": 1,
+    "storage": 84,
+    "vendor": 0,
+    "version": 0
+   }
+  },
+  {
+   "properties": {
+    "backend": 0,
+    "sourceUri": 0
+   }
+  },
+  {
+   "properties": {
+    "cache": 86,
+    "conditions": 28,
+    "lastReconcileTime": 0,
+    "lifecycle": 0,
+    "nodesFailed": 1,
+    "nodesReady": 1,
+    "observedGeneration": 0,
+    "state": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 85,
+    "status": 87
+   }
+  },
+  {
+   "properties": {
+    "apiFormat": 0,
+    "modelName": 0,
+    "url": 0
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "namespace": 0
+   }
+  },
+  {
+   "properties": {
+    "endpoint": 89,
+    "inferenceService": 90
+   }
+  },
+  {
+   "properties": {
+    "key": 0,
+    "name": 0,
+    "optional": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "fieldPath": 0
+   }
+  },
+  {
+   "properties": {
+    "key": 0,
+    "optional": 0,
+    "path": 0,
+    "volumeName": 0
+   }
+  },
+  {
+   "properties": {
+    "containerName": 0,
+    "divisor": 0,
+    "resource": 0
+   }
+  },
+  {
+   "properties": {
+    "configMapKeyRef": 92,
+    "fieldRef": 93,
+    "fileKeyRef": 94,
+    "resourceFieldRef": 95,
+    "secretKeyRef": 92
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "value": 0,
+    "valueFrom": 96
+   }
+  },
+  {
+   "items": 97
+  },
+  {
+   "properties": {
+    "name": 0,
+    "optional": 0
+   }
+  },
+  {
+   "properties": {
+    "configMapRef": 99,
+    "prefix": 0,
+    "secretRef": 99
+   }
+  },
+  {
+   "items": 100
+  },
+  {
+   "properties": {
+    "name": 0,
+    "request": 0
+   }
+  },
+  {
+   "items": 102
+  },
+  {
+   "properties": {
+    "claims": 103,
+    "limits": 14,
+    "requests": 14
+   }
+  },
+  {
+   "properties": {
+    "effect": 0,
+    "key": 0,
+    "operator": 0,
+    "tolerationSeconds": 0,
+    "value": 0
+   }
+  },
+  {
+   "items": 105
+  },
+  {
+   "properties": {
+    "mountPath": 0,
+    "mountPropagation": 0,
+    "name": 0,
+    "readOnly": 0,
+    "recursiveReadOnly": 0,
+    "subPath": 0,
+    "subPathExpr": 0
+   }
+  },
+  {
+   "items": 107
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "partition": 0,
+    "readOnly": 0,
+    "volumeID": 0
+   }
+  },
+  {
+   "properties": {
+    "cachingMode": 0,
+    "diskName": 0,
+    "diskURI": 0,
+    "fsType": 0,
+    "kind": 0,
+    "readOnly": 0
+   }
+  },
+  {
+   "properties": {
+    "readOnly": 0,
+    "secretName": 0,
+    "shareName": 0
+   }
+  },
+  {
+   "properties": {
+    "monitors": 1,
+    "path": 0,
+    "readOnly": 0,
+    "secretFile": 0,
+    "secretRef": 36,
+    "user": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "readOnly": 0,
+    "secretRef": 36,
+    "volumeID": 0
+   }
+  },
+  {
+   "properties": {
+    "key": 0,
+    "mode": 0,
+    "path": 0
+   }
+  },
+  {
+   "items": 114
+  },
+  {
+   "properties": {
+    "defaultMode": 0,
+    "items": 115,
+    "name": 0,
+    "optional": 0
+   }
+  },
+  {
+   "properties": {
+    "driver": 0,
+    "fsType": 0,
+    "nodePublishSecretRef": 36,
+    "readOnly": 0,
+    "volumeAttributes": 14
+   }
+  },
+  {
+   "properties": {
+    "fieldRef": 93,
+    "mode": 0,
+    "path": 0,
+    "resourceFieldRef": 95
+   }
+  },
+  {
+   "items": 118
+  },
+  {
+   "properties": {
+    "defaultMode": 0,
+    "items": 119
+   }
+  },
+  {
+   "properties": {
+    "medium": 0,
+    "sizeLimit": 0
+   }
+  },
+  {
+   "properties": {
+    "apiGroup": 0,
+    "kind": 0,
+    "name": 0
+   }
+  },
+  {
+   "properties": {
+    "apiGroup": 0,
+    "kind": 0,
+    "name": 0,
+    "namespace": 0
+   }
+  },
+  {
+   "properties": {
+    "limits": 14,
+    "requests": 14
+   }
+  },
+  {
+   "properties": {
+    "accessModes": 1,
+    "dataSource": 122,
+    "dataSourceRef": 123,
+    "resources": 124,
+    "selector": 15,
+    "storageClassName": 0,
+    "volumeAttributesClassName": 0,
+    "volumeMode": 0,
+    "volumeName": 0
+   }
+  },
+  {
+   "properties": {
+    "metadata": 0,
+    "spec": 125
+   }
+  },
+  {
+   "properties": {
+    "volumeClaimTemplate": 126
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "lun": 0,
+    "readOnly": 0,
+    "targetWWNs": 1,
+    "wwids": 1
+   }
+  },
+  {
+   "properties": {
+    "driver": 0,
+    "fsType": 0,
+    "options": 14,
+    "readOnly": 0,
+    "secretRef": 36
+   }
+  },
+  {
+   "properties": {
+    "datasetName": 0,
+    "datasetUUID": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "partition": 0,
+    "pdName": 0,
+    "readOnly": 0
+   }
+  },
+  {
+   "properties": {
+    "directory": 0,
+    "repository": 0,
+    "revision": 0
+   }
+  },
+  {
+   "properties": {
+    "endpoints": 0,
+    "path": 0,
+    "readOnly": 0
+   }
+  },
+  {
+   "properties": {
+    "path": 0,
+    "type": 0
+   }
+  },
+  {
+   "properties": {
+    "pullPolicy": 0,
+    "reference": 0
+   }
+  },
+  {
+   "properties": {
+    "chapAuthDiscovery": 0,
+    "chapAuthSession": 0,
+    "fsType": 0,
+    "initiatorName": 0,
+    "iqn": 0,
+    "iscsiInterface": 0,
+    "lun": 0,
+    "portals": 1,
+    "readOnly": 0,
+    "secretRef": 36,
+    "targetPortal": 0
+   }
+  },
+  {
+   "properties": {
+    "path": 0,
+    "readOnly": 0,
+    "server": 0
+   }
+  },
+  {
+   "properties": {
+    "claimName": 0,
+    "readOnly": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "pdID": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "readOnly": 0,
+    "volumeID": 0
+   }
+  },
+  {
+   "properties": {
+    "labelSelector": 15,
+    "name": 0,
+    "optional": 0,
+    "path": 0,
+    "signerName": 0
+   }
+  },
+  {
+   "properties": {
+    "items": 115,
+    "name": 0,
+    "optional": 0
+   }
+  },
+  {
+   "properties": {
+    "items": 119
+   }
+  },
+  {
+   "properties": {
+    "certificateChainPath": 0,
+    "credentialBundlePath": 0,
+    "keyPath": 0,
+    "keyType": 0,
+    "maxExpirationSeconds": 0,
+    "signerName": 0,
+    "userAnnotations": 14
+   }
+  },
+  {
+   "properties": {
+    "audience": 0,
+    "expirationSeconds": 0,
+    "path": 0
+   }
+  },
+  {
+   "properties": {
+    "clusterTrustBundle": 141,
+    "configMap": 142,
+    "downwardAPI": 143,
+    "podCertificate": 144,
+    "secret": 142,
+    "serviceAccountToken": 145
+   }
+  },
+  {
+   "items": 146
+  },
+  {
+   "properties": {
+    "defaultMode": 0,
+    "sources": 147
+   }
+  },
+  {
+   "properties": {
+    "group": 0,
+    "readOnly": 0,
+    "registry": 0,
+    "tenant": 0,
+    "user": 0,
+    "volume": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "image": 0,
+    "keyring": 0,
+    "monitors": 1,
+    "pool": 0,
+    "readOnly": 0,
+    "secretRef": 36,
+    "user": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "gateway": 0,
+    "protectionDomain": 0,
+    "readOnly": 0,
+    "secretRef": 36,
+    "sslEnabled": 0,
+    "storageMode": 0,
+    "storagePool": 0,
+    "system": 0,
+    "volumeName": 0
+   }
+  },
+  {
+   "properties": {
+    "defaultMode": 0,
+    "items": 115,
+    "optional": 0,
+    "secretName": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "readOnly": 0,
+    "secretRef": 36,
+    "volumeName": 0,
+    "volumeNamespace": 0
+   }
+  },
+  {
+   "properties": {
+    "fsType": 0,
+    "storagePolicyID": 0,
+    "storagePolicyName": 0,
+    "volumePath": 0
+   }
+  },
+  {
+   "properties": {
+    "awsElasticBlockStore": 109,
+    "azureDisk": 110,
+    "azureFile": 111,
+    "cephfs": 112,
+    "cinder": 113,
+    "configMap": 116,
+    "csi": 117,
+    "downwardAPI": 120,
+    "emptyDir": 121,
+    "ephemeral": 127,
+    "fc": 128,
+    "flexVolume": 129,
+    "flocker": 130,
+    "gcePersistentDisk": 131,
+    "gitRepo": 132,
+    "glusterfs": 133,
+    "hostPath": 134,
+    "image": 135,
+    "iscsi": 136,
+    "name": 0,
+    "nfs": 137,
+    "persistentVolumeClaim": 138,
+    "photonPersistentDisk": 139,
+    "portworxVolume": 140,
+    "projected": 148,
+    "quobyte": 149,
+    "rbd": 150,
+    "scaleIO": 151,
+    "secret": 152,
+    "storageos": 153,
+    "vsphereVolume": 154
+   }
+  },
+  {
+   "items": 155
+  },
+  {
+   "properties": {
+    "affinity": 21,
+    "env": 98,
+    "envFrom": 101,
+    "image": 0,
+    "nodeSelector": 14,
+    "resources": 104,
+    "tolerations": 106,
+    "volumeMounts": 108,
+    "volumes": 156
+   }
+  },
+  {
+   "properties": {
+    "engine": 0,
+    "gpuCount": 0,
+    "gpuType": 0,
+    "version": 0
+   }
+  },
+  {
+   "properties": {
+    "additionalRequestParams": 14,
+    "dataset": 84,
+    "endpoint": 91,
+    "huggingFaceSecretReference": 36,
+    "maxRequestsPerIteration": 0,
+    "maxTimePerIteration": 0,
+    "numConcurrency": 1,
+    "outputLocation": 84,
+    "podOverride": 157,
+    "resultFolderName": 0,
+    "serviceMetadata": 158,
+    "task": 0,
+    "trafficScenarios": 1
+   }
+  },
+  {
+   "properties": {
+    "completionTime": 0,
+    "details": 0,
+    "failureMessage": 0,
+    "lastReconcileTime": 0,
+    "startTime": 0,
+    "state": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 159,
+    "status": 160
+   }
+  },
+  {
+   "properties": {
+    "acceleratorClasses": 1,
+    "minArchitectureVersion": 0,
+    "minComputePerformanceTFLOPS": 0,
+    "minMemory": 0,
+    "preferredPrecisions": 1,
+    "requiredFeatures": 1
+   }
+  },
+  {
+   "properties": {
+    "command": 1
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "value": 0
+   }
+  },
+  {
+   "items": 164
+  },
+  {
+   "properties": {
+    "host": 0,
+    "httpHeaders": 165,
+    "path": 0,
+    "port": 0,
+    "scheme": 0
+   }
+  },
+  {
+   "properties": {
+    "seconds": 0
+   }
+  },
+  {
+   "properties": {
+    "host": 0,
+    "port": 0
+   }
+  },
+  {
+   "properties": {
+    "exec": 163,
+    "httpGet": 166,
+    "sleep": 167,
+    "tcpSocket": 168
+   }
+  },
+  {
+   "properties": {
+    "postStart": 169,
+    "preStop": 169,
+    "stopSignal": 0
+   }
+  },
+  {
+   "properties": {
+    "port": 0,
+    "service": 0
+   }
+  },
+  {
+   "properties": {
+    "exec": 163,
+    "failureThreshold": 0,
+    "grpc": 171,
+    "httpGet": 166,
+    "initialDelaySeconds": 0,
+    "periodSeconds": 0,
+    "successThreshold": 0,
+    "tcpSocket": 168,
+    "terminationGracePeriodSeconds": 0,
+    "timeoutSeconds": 0
+   }
+  },
+  {
+   "properties": {
+    "containerPort": 0,
+    "hostIP": 0,
+    "hostPort": 0,
+    "name": 0,
+    "protocol": 0
+   }
+  },
+  {
+   "items": 173
+  },
+  {
+   "properties": {
+    "resourceName": 0,
+    "restartPolicy": 0
+   }
+  },
+  {
+   "items": 175
+  },
+  {
+   "properties": {
+    "operator": 0,
+    "values": 1
+   }
+  },
+  {
+   "properties": {
+    "action": 0,
+    "exitCodes": 177
+   }
+  },
+  {
+   "items": 178
+  },
+  {
+   "properties": {
+    "localhostProfile": 0,
+    "type": 0
+   }
+  },
+  {
+   "properties": {
+    "add": 1,
+    "drop": 1
+   }
+  },
+  {
+   "properties": {
+    "level": 0,
+    "role": 0,
+    "type": 0,
+    "user": 0
+   }
+  },
+  {
+   "properties": {
+    "gmsaCredentialSpec": 0,
+    "gmsaCredentialSpecName": 0,
+    "hostProcess": 0,
+    "runAsUserName": 0
+   }
+  },
+  {
+   "properties": {
+    "allowPrivilegeEscalation": 0,
+    "appArmorProfile": 180,
+    "capabilities": 181,
+    "privileged": 0,
+    "procMount": 0,
+    "readOnlyRootFilesystem": 0,
+    "runAsGroup": 0,
+    "runAsNonRoot": 0,
+    "runAsUser": 0,
+    "seLinuxOptions": 182,
+    "seccompProfile": 180,
+    "windowsOptions": 183
+   }
+  },
+  {
+   "properties": {
+    "devicePath": 0,
+    "name": 0
+   }
+  },
+  {
+   "items": 185
+  },
+  {
+   "properties": {
+    "args": 1,
+    "command": 1,
+    "env": 98,
+    "envFrom": 101,
+    "image": 0,
+    "imagePullPolicy": 0,
+    "lifecycle": 170,
+    "livenessProbe": 172,
+    "name": 0,
+    "ports": 174,
+    "readinessProbe": 172,
+    "resizePolicy": 176,
+    "resources": 104,
+    "restartPolicy": 0,
+    "restartPolicyRules": 179,
+    "securityContext": 184,
+    "startupProbe": 172,
+    "stdin": 0,
+    "stdinOnce": 0,
+    "terminationMessagePath": 0,
+    "terminationMessagePolicy": 0,
+    "tty": 0,
+    "volumeDevices": 186,
+    "volumeMounts": 108,
+    "workingDir": 0
+   }
+  },
+  {
+   "items": 187
+  },
+  {
+   "properties": {
+    "architectureFamilies": 1,
+    "excludedClasses": 1,
+    "maxMemory": 0,
+    "minArchitectureVersion": 0,
+    "minComputePerformanceTFLOPS": 0,
+    "minMemory": 0,
+    "preferredPrecisions": 1,
+    "requiredFeatures": 1
+   }
+  },
+  {
+   "properties": {
+    "acceleratorClass": 0,
+    "constraints": 189,
+    "policy": 0
+   }
+  },
+  {
+   "properties": {
+    "behavior": 0,
+    "failureThreshold": 0,
+    "replicas": 0
+   }
+  },
+  {
+   "properties": {
+    "kind": 0,
+    "name": 0
+   }
+  },
+  {
+   "properties": {
+    "authenticationRef": 192,
+    "metadata": 14,
+    "metricType": 0,
+    "name": 0,
+    "type": 0,
+    "useCachedMetrics": 0
+   }
+  },
+  {
+   "items": 193
+  },
+  {
+   "properties": {
+    "advanced": 70,
+    "cooldownPeriod": 0,
+    "fallback": 191,
+    "idleReplicaCount": 0,
+    "pollingInterval": 0,
+    "triggers": 194
+   }
+  },
+  {
+   "properties": {
+    "class": 0,
+    "hpa": 67,
+    "keda": 195
+   }
+  },
+  {
+   "properties": {
+    "maxSurge": 0,
+    "maxUnavailable": 0
+   }
+  },
+  {
+   "properties": {
+    "rollingUpdate": 197,
+    "type": 0
+   }
+  },
+  {
+   "properties": {
+    "nameservers": 1,
+    "options": 165,
+    "searches": 1
+   }
+  },
+  {
+   "properties": {
+    "hostnames": 1,
+    "ip": 0
+   }
+  },
+  {
+   "items": 200
+  },
+  {
+   "items": 36
+  },
+  {
+   "properties": {
+    "conditionType": 0
+   }
+  },
+  {
+   "items": 203
+  },
+  {
+   "properties": {
+    "name": 0,
+    "resourceClaimName": 0,
+    "resourceClaimTemplateName": 0
+   }
+  },
+  {
+   "items": 205
+  },
+  {
+   "properties": {
+    "appArmorProfile": 180,
+    "fsGroup": 0,
+    "fsGroupChangePolicy": 0,
+    "runAsGroup": 0,
+    "runAsNonRoot": 0,
+    "runAsUser": 0,
+    "seLinuxChangePolicy": 0,
+    "seLinuxOptions": 182,
+    "seccompProfile": 180,
+    "supplementalGroups": 1,
+    "supplementalGroupsPolicy": 0,
+    "sysctls": 165,
+    "windowsOptions": 183
+   }
+  },
+  {
+   "properties": {
+    "labelSelector": 15,
+    "matchLabelKeys": 1,
+    "maxSkew": 0,
+    "minDomains": 0,
+    "nodeAffinityPolicy": 0,
+    "nodeTaintsPolicy": 0,
+    "topologyKey": 0,
+    "whenUnsatisfiable": 0
+   }
+  },
+  {
+   "items": 208
+  },
+  {
+   "properties": {
+    "activeDeadlineSeconds": 0,
+    "affinity": 21,
+    "automountServiceAccountToken": 0,
+    "containers": 188,
+    "dnsConfig": 199,
+    "dnsPolicy": 0,
+    "enableServiceLinks": 0,
+    "hostAliases": 201,
+    "hostIPC": 0,
+    "hostNetwork": 0,
+    "hostPID": 0,
+    "hostUsers": 0,
+    "hostname": 0,
+    "imagePullSecrets": 202,
+    "initContainers": 188,
+    "nodeName": 0,
+    "nodeSelector": 14,
+    "os": 36,
+    "overhead": 14,
+    "preemptionPolicy": 0,
+    "priority": 0,
+    "priorityClassName": 0,
+    "readinessGates": 204,
+    "resourceClaims": 206,
+    "restartPolicy": 0,
+    "runner": 187,
+    "runtimeClassName": 0,
+    "schedulerName": 0,
+    "schedulingGates": 202,
+    "securityContext": 207,
+    "serviceAccount": 0,
+    "serviceAccountName": 0,
+    "setHostnameAsFQDN": 0,
+    "shareProcessNamespace": 0,
+    "subdomain": 0,
+    "terminationGracePeriodSeconds": 0,
+    "tolerations": 106,
+    "topologySpreadConstraints": 209,
+    "volumes": 156
+   }
+  },
+  {
+   "properties": {
+    "mode": 0
+   }
+  },
+  {
+   "properties": {
+    "gracePeriodSeconds": 0,
+    "markNotReadyDuringLifecycle": 0
+   }
+  },
+  {
+   "properties": {
+    "maxSurge": 0,
+    "maxUnavailable": 0,
+    "partition": 0
+   }
+  },
+  {
+   "properties": {
+    "inPlaceUpdateStrategy": 212,
+    "rollingUpdate": 213,
+    "type": 0
+   }
+  },
+  {
+   "properties": {
+    "instanceReadyTimeout": 0,
+    "migrationPolicy": 211,
+    "minReadySeconds": 0,
+    "readyPolicy": 0,
+    "restartPolicy": 0,
+    "updateStrategy": 214
+   }
+  },
+  {
+   "properties": {
+    "activeDeadlineSeconds": 0,
+    "affinity": 21,
+    "automountServiceAccountToken": 0,
+    "containers": 188,
+    "dnsConfig": 199,
+    "dnsPolicy": 0,
+    "enableServiceLinks": 0,
+    "hostAliases": 201,
+    "hostIPC": 0,
+    "hostNetwork": 0,
+    "hostPID": 0,
+    "hostUsers": 0,
+    "hostname": 0,
+    "imagePullSecrets": 202,
+    "initContainers": 188,
+    "nodeName": 0,
+    "nodeSelector": 14,
+    "os": 36,
+    "overhead": 14,
+    "preemptionPolicy": 0,
+    "priority": 0,
+    "priorityClassName": 0,
+    "readinessGates": 204,
+    "resourceClaims": 206,
+    "restartPolicy": 0,
+    "runner": 187,
+    "runtimeClassName": 0,
+    "schedulerName": 0,
+    "schedulingGates": 202,
+    "securityContext": 207,
+    "serviceAccount": 0,
+    "serviceAccountName": 0,
+    "setHostnameAsFQDN": 0,
+    "shareProcessNamespace": 0,
+    "size": 0,
+    "subdomain": 0,
+    "terminationGracePeriodSeconds": 0,
+    "tolerations": 106,
+    "topologySpreadConstraints": 209,
+    "volumes": 156
+   }
+  },
+  {
+   "properties": {
+    "acceleratorOverride": 190,
+    "activeDeadlineSeconds": 0,
+    "affinity": 21,
+    "annotations": 14,
+    "automountServiceAccountToken": 0,
+    "autoscaler": 196,
+    "autoscalerPolicyRef": 192,
+    "containers": 188,
+    "deploymentStrategy": 198,
+    "dnsConfig": 199,
+    "dnsPolicy": 0,
+    "enableServiceLinks": 0,
+    "hostAliases": 201,
+    "hostIPC": 0,
+    "hostNetwork": 0,
+    "hostPID": 0,
+    "hostUsers": 0,
+    "hostname": 0,
+    "imagePullSecrets": 202,
+    "initContainers": 188,
+    "labels": 14,
+    "leader": 210,
+    "lifecycle": 215,
+    "maxReplicas": 0,
+    "maxUnavailable": 0,
+    "minAvailable": 0,
+    "minReplicas": 0,
+    "nodeName": 0,
+    "nodeSelector": 14,
+    "os": 36,
+    "overhead": 14,
+    "preemptionPolicy": 0,
+    "priority": 0,
+    "priorityClassName": 0,
+    "readinessGates": 204,
+    "resourceClaims": 206,
+    "restartPolicy": 0,
+    "runner": 187,
+    "runtimeClassName": 0,
+    "schedulerName": 0,
+    "schedulingGates": 202,
+    "securityContext": 207,
+    "serviceAccount": 0,
+    "serviceAccountName": 0,
+    "servicePortAppProtocols": 14,
+    "setHostnameAsFQDN": 0,
+    "shareProcessNamespace": 0,
+    "subdomain": 0,
+    "terminationGracePeriodSeconds": 0,
+    "timeoutSeconds": 0,
+    "tolerations": 106,
+    "topologyKey": 0,
+    "topologySpread": 0,
+    "topologySpreadConstraints": 209,
+    "topologySpreadKey": 0,
+    "volumes": 156,
+    "worker": 216
+   }
+  },
+  {
+   "properties": {
+    "acceleratorOverride": 190,
+    "activeDeadlineSeconds": 0,
+    "affinity": 21,
+    "annotations": 14,
+    "automountServiceAccountToken": 0,
+    "autoscaler": 196,
+    "autoscalerPolicyRef": 192,
+    "containers": 188,
+    "deploymentStrategy": 198,
+    "dnsConfig": 199,
+    "dnsPolicy": 0,
+    "enableServiceLinks": 0,
+    "hostAliases": 201,
+    "hostIPC": 0,
+    "hostNetwork": 0,
+    "hostPID": 0,
+    "hostUsers": 0,
+    "hostname": 0,
+    "imagePullSecrets": 202,
+    "initContainers": 188,
+    "labels": 14,
+    "lifecycle": 215,
+    "maxReplicas": 0,
+    "maxUnavailable": 0,
+    "minAvailable": 0,
+    "minReplicas": 0,
+    "nodeName": 0,
+    "nodeSelector": 14,
+    "os": 36,
+    "overhead": 14,
+    "preemptionPolicy": 0,
+    "priority": 0,
+    "priorityClassName": 0,
+    "readinessGates": 204,
+    "resourceClaims": 206,
+    "restartPolicy": 0,
+    "runner": 187,
+    "runtimeClassName": 0,
+    "schedulerName": 0,
+    "schedulingGates": 202,
+    "securityContext": 207,
+    "serviceAccount": 0,
+    "serviceAccountName": 0,
+    "servicePortAppProtocols": 14,
+    "setHostnameAsFQDN": 0,
+    "shareProcessNamespace": 0,
+    "subdomain": 0,
+    "terminationGracePeriodSeconds": 0,
+    "timeoutSeconds": 0,
+    "tolerations": 106,
+    "topologySpread": 0,
+    "topologySpreadConstraints": 209,
+    "topologySpreadKey": 0,
+    "volumes": 156
+   }
+  },
+  {
+   "properties": {
+    "max": 0,
+    "min": 0
+   }
+  },
+  {
+   "properties": {
+    "path": 0,
+    "port": 0
+   }
+  },
+  {
+   "properties": {
+    "activeDeadlineSeconds": 0,
+    "affinity": 21,
+    "annotations": 14,
+    "automountServiceAccountToken": 0,
+    "autoscaler": 196,
+    "autoscalerPolicyRef": 192,
+    "capacityEndpoint": 220,
+    "config": 14,
+    "containers": 188,
+    "deploymentStrategy": 198,
+    "dnsConfig": 199,
+    "dnsPolicy": 0,
+    "enableServiceLinks": 0,
+    "hostAliases": 201,
+    "hostIPC": 0,
+    "hostNetwork": 0,
+    "hostPID": 0,
+    "hostUsers": 0,
+    "hostname": 0,
+    "imagePullSecrets": 202,
+    "initContainers": 188,
+    "labels": 14,
+    "lifecycle": 215,
+    "maxReplicas": 0,
+    "maxUnavailable": 0,
+    "minAvailable": 0,
+    "minReplicas": 0,
+    "nodeName": 0,
+    "nodeSelector": 14,
+    "os": 36,
+    "overhead": 14,
+    "preemptionPolicy": 0,
+    "priority": 0,
+    "priorityClassName": 0,
+    "readinessGates": 204,
+    "resourceClaims": 206,
+    "restartPolicy": 0,
+    "runner": 187,
+    "runtimeClassName": 0,
+    "schedulerName": 0,
+    "schedulingGates": 202,
+    "securityContext": 207,
+    "serviceAccount": 0,
+    "serviceAccountName": 0,
+    "servicePortAppProtocols": 14,
+    "setHostnameAsFQDN": 0,
+    "shareProcessNamespace": 0,
+    "subdomain": 0,
+    "terminationGracePeriodSeconds": 0,
+    "timeoutSeconds": 0,
+    "tolerations": 106,
+    "topologySpreadConstraints": 209,
+    "volumes": 156
+   }
+  },
+  {
+   "properties": {
+    "anchor": 0,
+    "ratios": 14
+   }
+  },
+  {
+   "properties": {
+    "mode": 0,
+    "proportional": 222
+   }
+  },
+  {
+   "properties": {
+    "dataParallelSize": 0,
+    "pipelineParallelSize": 0,
+    "tensorParallelSize": 0
+   }
+  },
+  {
+   "properties": {
+    "environmentOverride": 14,
+    "minMemoryPerBillionParams": 0,
+    "runtimeArgsOverride": 1,
+    "tensorParallelismOverride": 224
+   }
+  },
+  {
+   "additionalProperties": 225
+  },
+  {
+   "properties": {
+    "acceleratorConfig": 226,
+    "autoSelect": 0,
+    "diffusionPipeline": 81,
+    "modelArchitecture": 0,
+    "modelCacheProviders": 1,
+    "modelFormat": 83,
+    "modelFramework": 83,
+    "modelType": 0,
+    "name": 0,
+    "priority": 0,
+    "quantization": 0,
+    "version": 0
+   }
+  },
+  {
+   "items": 227
+  },
+  {
+   "properties": {
+    "acceleratorRequirements": 162,
+    "affinity": 21,
+    "annotations": 14,
+    "containers": 188,
+    "decoderConfig": 217,
+    "disabled": 0,
+    "dnsPolicy": 0,
+    "encoderConfig": 218,
+    "engineConfig": 217,
+    "hostIPC": 0,
+    "hostNetwork": 0,
+    "imagePullSecrets": 202,
+    "labels": 14,
+    "modelSizeRange": 219,
+    "nodeSelector": 14,
+    "protocolVersions": 1,
+    "routerConfig": 221,
+    "scalingPolicy": 223,
+    "schedulerName": 0,
+    "supportedModelFormats": 228,
+    "tolerations": 106,
+    "volumes": 156
+   }
+  },
+  {
+   "properties": {
+    "conditions": 28,
+    "inheritanceChain": 1
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 229,
+    "status": 230
+   }
+  },
+  {
+   "properties": {
+    "baseModelRef": 90,
+    "compartmentID": 0,
+    "configuration": 82,
+    "disabled": 0,
+    "displayName": 0,
+    "hyperParameters": 82,
+    "modelType": 0,
+    "storage": 84,
+    "trainingJobRef": 90,
+    "vendor": 0,
+    "version": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 232,
+    "status": 87
+   }
+  },
+  {
+   "items": 122
+  },
+  {
+   "properties": {
+    "apiGroup": 0,
+    "fineTunedWeights": 1,
+    "kind": 0,
+    "name": 0,
+    "overlays": 234
+   }
+  },
+  {
+   "properties": {
+    "maxUnavailable": 0,
+    "partition": 0,
+    "rollbackToRevision": 0
+   }
+  },
+  {
+   "properties": {
+    "component": 0,
+    "renderingHash": 0
+   }
+  },
+  {
+   "items": 237
+  },
+  {
+   "properties": {
+    "components": 238,
+    "fingerprint": 0
+   }
+  },
+  {
+   "properties": {
+    "component": 0,
+    "replicas": 0
+   }
+  },
+  {
+   "items": 240
+  },
+  {
+   "properties": {
+    "clusterUID": 0,
+    "demand": 239,
+    "pauseSurge": 0,
+    "planID": 0,
+    "replicaFloors": 241,
+    "revision": 0,
+    "sourceUID": 0
+   }
+  },
+  {
+   "properties": {
+    "annotations": 14,
+    "labels": 14
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "podGroup": 0,
+    "podGroupReplicaKey": 0
+   }
+  },
+  {
+   "properties": {
+    "activeDeadlineSeconds": 0,
+    "affinity": 21,
+    "automountServiceAccountToken": 0,
+    "containers": 188,
+    "dnsConfig": 199,
+    "dnsPolicy": 0,
+    "enableServiceLinks": 0,
+    "hostAliases": 201,
+    "hostIPC": 0,
+    "hostNetwork": 0,
+    "hostPID": 0,
+    "hostUsers": 0,
+    "hostname": 0,
+    "hostnameOverride": 0,
+    "imagePullSecrets": 202,
+    "initContainers": 188,
+    "nodeName": 0,
+    "nodeSelector": 14,
+    "os": 36,
+    "overhead": 14,
+    "preemptionPolicy": 0,
+    "priority": 0,
+    "priorityClassName": 0,
+    "readinessGates": 204,
+    "resourceClaims": 206,
+    "resources": 104,
+    "restartPolicy": 0,
+    "runtimeClassName": 0,
+    "schedulerName": 0,
+    "schedulingGates": 202,
+    "securityContext": 207,
+    "serviceAccount": 0,
+    "serviceAccountName": 0,
+    "setHostnameAsFQDN": 0,
+    "shareProcessNamespace": 0,
+    "subdomain": 0,
+    "terminationGracePeriodSeconds": 0,
+    "tolerations": 106,
+    "topologySpreadConstraints": 209,
+    "volumes": 156,
+    "workloadRef": 244
+   }
+  },
+  {
+   "properties": {
+    "metadata": 243,
+    "spec": 245
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "size": 0,
+    "template": 246
+   }
+  },
+  {
+   "items": 247
+  },
+  {
+   "properties": {
+    "apiGroup": 0,
+    "autoSync": 0,
+    "kind": 0,
+    "name": 0,
+    "revision": 0
+   }
+  },
+  {
+   "properties": {
+    "autoscaler": 196,
+    "component": 0,
+    "lifecycle": 215,
+    "minReadySeconds": 0,
+    "modelRef": 235,
+    "pacing": 236,
+    "pairingProtocol": 0,
+    "parentRef": 36,
+    "pauseMode": 0,
+    "paused": 0,
+    "placementExecution": 242,
+    "placementReplicaLimit": 0,
+    "replicas": 0,
+    "revisionHistoryLimit": 0,
+    "runners": 248,
+    "runtimeRef": 249,
+    "topologyKey": 0,
+    "topologySpread": 0,
+    "topologySpreadKey": 0
+   }
+  },
+  {
+   "properties": {
+    "indexes": 0,
+    "value": 0
+   }
+  },
+  {
+   "items": 251
+  },
+  {
+   "properties": {
+    "containerName": 0,
+    "exitCode": 0,
+    "message": 0,
+    "podName": 0,
+    "reason": 0,
+    "time": 0
+   }
+  },
+  {
+   "properties": {
+    "capacityRefusedAt": 0,
+    "deadline": 0,
+    "fromNode": 0,
+    "hintTargetNodes": 1,
+    "id": 0,
+    "lastProgressAt": 0,
+    "placementWaitSince": 0,
+    "reason": 0,
+    "requestUUID": 0,
+    "retryCount": 0,
+    "startedAt": 0,
+    "step": 0,
+    "strategy": 0,
+    "surgeIndex": 0,
+    "targetRevision": 0,
+    "type": 0,
+    "waiting": 0
+   }
+  },
+  {
+   "properties": {
+    "announced": 1,
+    "conditions": 28,
+    "index": 0,
+    "lastFailure": 253,
+    "operation": 254,
+    "readySince": 0
+   }
+  },
+  {
+   "items": 255
+  },
+  {
+   "properties": {
+    "activeOrdinalOne": 0,
+    "admitted": 0,
+    "availablePodCounts": 252,
+    "entries": 256,
+    "incarnations": 252,
+    "members": 0,
+    "phases": 252,
+    "podCounts": 252,
+    "readySinceBase": 0,
+    "readySinceIndexes": 0,
+    "readySinceOffsets": 1,
+    "rowOrder": 1,
+    "runningRevisions": 252,
+    "servingPodCounts": 252,
+    "targetRevisions": 252
+   }
+  },
+  {
+   "properties": {
+    "activeOrdinal": 0,
+    "admitted": 0,
+    "announced": 1,
+    "availablePodCount": 0,
+    "conditions": 28,
+    "incarnation": 0,
+    "index": 0,
+    "lastFailure": 253,
+    "nodesOccupied": 1,
+    "operation": 254,
+    "phase": 0,
+    "podCount": 0,
+    "readyPodCount": 0,
+    "readySince": 0,
+    "runningRevision": 0,
+    "scheduledPodCount": 0,
+    "servingPodCount": 0,
+    "targetRevision": 0
+   }
+  },
+  {
+   "items": 258
+  },
+  {
+   "properties": {
+    "allocatedAt": 0,
+    "attempt": 0,
+    "completedAt": 0,
+    "deadline": 0,
+    "fromNode": 0,
+    "hintTargetNodes": 1,
+    "message": 0,
+    "phase": 0,
+    "reason": 0,
+    "requestUUID": 0,
+    "sourceInstance": 0,
+    "startedAt": 0,
+    "succeeded": 0,
+    "surgeInstance": 0,
+    "trigger": 0
+   }
+  },
+  {
+   "items": 260
+  },
+  {
+   "properties": {
+    "attemptsStarted": 0,
+    "firstFailureAt": 0,
+    "lastFailureAt": 0,
+    "nextRetryAt": 0,
+    "reason": 0,
+    "state": 0,
+    "targetRevision": 0
+   }
+  },
+  {
+   "items": 262
+  },
+  {
+   "properties": {
+    "gate": 0,
+    "reason": 0,
+    "since": 0,
+    "target": 0
+   }
+  },
+  {
+   "properties": {
+    "latestRevision": 0,
+    "pairingProtocol": 0,
+    "percent": 0,
+    "revisionName": 0,
+    "tag": 0
+   }
+  },
+  {
+   "items": 265
+  },
+  {
+   "properties": {
+    "availableReplicas": 0,
+    "collisionCount": 0,
+    "conditions": 28,
+    "coordinationGroupRef": 0,
+    "currentRevision": 0,
+    "instanceStatusColumns": 257,
+    "instanceStatusEncoding": 0,
+    "instanceStatuses": 259,
+    "labelSelector": 0,
+    "migrations": 261,
+    "observedGeneration": 0,
+    "observedTemplateHash": 0,
+    "placementObservedGeneration": 0,
+    "readyReplicas": 0,
+    "replicas": 0,
+    "retryBlocks": 263,
+    "rolloutHold": 264,
+    "servingReplicas": 0,
+    "traffic": 266,
+    "updateRevision": 0,
+    "updatedReadyReplicas": 0,
+    "updatedReplicas": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 250,
+    "status": 267
+   }
+  },
+  {
+   "properties": {
+    "decoder": 219,
+    "default": 219,
+    "engine": 219,
+    "router": 219
+   }
+  },
+  {
+   "properties": {
+    "matchExpressions": 7,
+    "matchFields": 7,
+    "weights": 269
+   }
+  },
+  {
+   "items": 270
+  },
+  {
+   "properties": {
+    "decoder": 0,
+    "default": 0,
+    "engine": 0,
+    "router": 0
+   }
+  },
+  {
+   "properties": {
+    "maxPerCluster": 272,
+    "replicas": 0
+   }
+  },
+  {
+   "properties": {
+    "clusterAffinity": 271,
+    "maxSurge": 0,
+    "mode": 0,
+    "policy": 0,
+    "replacementTimeout": 0,
+    "split": 273
+   }
+  },
+  {
+   "properties": {
+    "decoder": 1,
+    "engine": 1,
+    "router": 1
+   }
+  },
+  {
+   "properties": {
+    "authRef": 92,
+    "headers": 14,
+    "providerRef": 36,
+    "serverAddress": 0
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "operator": 0,
+    "query": 0,
+    "threshold": 0
+   }
+  },
+  {
+   "items": 277
+  },
+  {
+   "properties": {
+    "failureLimit": 0,
+    "initialDelay": 0,
+    "interval": 0,
+    "metrics": 278,
+    "onInconclusive": 0
+   }
+  },
+  {
+   "properties": {
+    "duration": 0
+   }
+  },
+  {
+   "properties": {
+    "analysis": 279,
+    "capacity": 0,
+    "pause": 280,
+    "traffic": 0
+   }
+  },
+  {
+   "items": 281
+  },
+  {
+   "properties": {
+    "prometheus": 276,
+    "readyTimeout": 0,
+    "scaleDownDelaySeconds": 0,
+    "steps": 282
+   }
+  },
+  {
+   "properties": {
+    "tolerance": 0
+   }
+  },
+  {
+   "properties": {
+    "kind": 0,
+    "name": 0,
+    "progression": 0
+   }
+  },
+  {
+   "properties": {
+    "blueGreen": 0,
+    "canary": 283,
+    "components": 1,
+    "maintainRatio": 284,
+    "order": 1,
+    "policyRef": 285,
+    "rollingUpdate": 197,
+    "soak": 0
+   }
+  },
+  {
+   "items": 286
+  },
+  {
+   "properties": {
+    "groupOrdering": 0,
+    "groups": 287,
+    "pairingProtocol": 0
+   }
+  },
+  {
+   "properties": {
+    "disabled": 0,
+    "format": 0,
+    "maxAge": 0,
+    "method": 0,
+    "mode": 0,
+    "options": 14,
+    "path": 0,
+    "period": 0,
+    "quorum": 0,
+    "samples": 0,
+    "timeout": 0
+   }
+  },
+  {
+   "properties": {
+    "acceptStatuses": 1,
+    "allFailedPolicy": 0,
+    "disabled": 0,
+    "failureThreshold": 0,
+    "gateStatuses": 1,
+    "method": 0,
+    "path": 0,
+    "period": 0,
+    "successThreshold": 0,
+    "timeout": 0
+   }
+  },
+  {
+   "properties": {
+    "options": 14
+   }
+  },
+  {
+   "properties": {
+    "capacity": 289,
+    "capacityFactors": 14,
+    "enabled": 0,
+    "probe": 290,
+    "publisher": 291
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "ttlSeconds": 0
+   }
+  },
+  {
+   "properties": {
+    "cookie": 293,
+    "headers": 202,
+    "type": 0
+   }
+  },
+  {
+   "properties": {
+    "headers": 202,
+    "type": 0
+   }
+  },
+  {
+   "properties": {
+    "algorithm": 0,
+    "consistentHash": 294,
+    "endpointOverride": 295
+   }
+  },
+  {
+   "properties": {
+    "acceleratorSelector": 190,
+    "decoder": 217,
+    "deploymentMode": 0,
+    "encoder": 218,
+    "engine": 217,
+    "model": 235,
+    "placement": 274,
+    "replicaRefs": 275,
+    "rollout": 288,
+    "router": 221,
+    "routing": 292,
+    "runtime": 249,
+    "scalingPolicy": 223,
+    "traffic": 296,
+    "ttlSecondsAfterCreation": 0
+   }
+  },
+  {
+   "properties": {
+    "CACerts": 0,
+    "audience": 0,
+    "name": 0,
+    "url": 0
+   }
+  },
+  {
+   "items": 298
+  },
+  {
+   "properties": {
+    "reason": 0,
+    "time": 0
+   }
+  },
+  {
+   "properties": {
+    "message": 0,
+    "name": 0,
+    "operator": 0,
+    "passed": 0,
+    "threshold": 0,
+    "time": 0,
+    "value": 0
+   }
+  },
+  {
+   "items": 301
+  },
+  {
+   "properties": {
+    "analysisFailedChecks": 0,
+    "canaryRevisionHash": 0,
+    "capacityWaitSince": 0,
+    "currentStep": 0,
+    "failed": 300,
+    "lastConclusiveEvaluationTime": 0,
+    "lastEvaluationTime": 0,
+    "metricResults": 302,
+    "observedTrafficWeight": 0,
+    "preStepHold": 0,
+    "promotedThrough": 0,
+    "rollbackRequested": 0,
+    "rolledBackRevisionHash": 0,
+    "stableRevisionHash": 0,
+    "stableSideShortSince": 0,
+    "stepEnteredTime": 0,
+    "targetID": 0
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "observedGeneration": 0,
+    "portableDigest": 0,
+    "resolvedDigest": 0
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "portableDigest": 0,
+    "wouldRenderDigest": 0
+   }
+  },
+  {
+   "properties": {
+    "class": 0,
+    "conditions": 28,
+    "currentReplicas": 0,
+    "desiredReplicas": 0,
+    "lastScaleTime": 0,
+    "managedBy": 0,
+    "policy": 304,
+    "shadowedPolicyRef": 305,
+    "specSource": 0
+   }
+  },
+  {
+   "properties": {
+    "availableReplicas": 0,
+    "collisionCount": 0,
+    "conditions": 28,
+    "currentRevision": 0,
+    "labelSelector": 0,
+    "observedGeneration": 0,
+    "readyReplicas": 0,
+    "replicas": 0,
+    "rolloutHold": 264,
+    "servingReplicas": 0,
+    "updateRevision": 0,
+    "updatedReadyReplicas": 0,
+    "updatedReplicas": 0
+   }
+  },
+  {
+   "properties": {
+    "acceleratorClass": 0,
+    "nodeSelector": 14,
+    "reason": 0,
+    "resourceRequests": 14
+   }
+  },
+  {
+   "properties": {
+    "address": 298,
+    "autoscaler": 306,
+    "canary": 303,
+    "latestReadyRevision": 0,
+    "latestRolledoutRevision": 0,
+    "lifecycle": 307,
+    "previousRolledoutRevision": 0,
+    "restURL": 0,
+    "rolloutPhase": 0,
+    "scaleTargetRef": 62,
+    "selectedAccelerator": 308,
+    "traffic": 266,
+    "url": 0
+   }
+  },
+  {
+   "additionalProperties": 309
+  },
+  {
+   "properties": {
+    "lastTransitionTime": 0,
+    "message": 0,
+    "reason": 0,
+    "severity": 0,
+    "status": 0,
+    "type": 0
+   }
+  },
+  {
+   "items": 311
+  },
+  {
+   "properties": {
+    "at": 0,
+    "message": 0
+   }
+  },
+  {
+   "items": 313
+  },
+  {
+   "properties": {
+    "completedAt": 0,
+    "component": 0,
+    "events": 314,
+    "id": 0,
+    "instance": 0,
+    "mode": 0,
+    "outcomeReason": 0,
+    "phase": 0,
+    "reason": 0,
+    "replacementInstance": 0,
+    "requestedAt": 0,
+    "requestedBy": 0,
+    "startedAt": 0
+   }
+  },
+  {
+   "items": 315
+  },
+  {
+   "properties": {
+    "exitCode": 0,
+    "location": 0,
+    "message": 0,
+    "modelRevisionName": 0,
+    "reason": 0,
+    "time": 0
+   }
+  },
+  {
+   "properties": {
+    "failedCopies": 0,
+    "totalCopies": 0
+   }
+  },
+  {
+   "properties": {
+    "activeModelState": 0,
+    "targetModelState": 0
+   }
+  },
+  {
+   "properties": {
+    "lastFailureInfo": 317,
+    "modelCopies": 318,
+    "modelRevisionStates": 319,
+    "transitionStatus": 0
+   }
+  },
+  {
+   "properties": {
+    "distribution": 0,
+    "envVar": 0,
+    "mountPath": 0,
+    "name": 0
+   }
+  },
+  {
+   "items": 321
+  },
+  {
+   "properties": {
+    "allocatable": 0,
+    "attribution": 44,
+    "demand": 0,
+    "observedAt": 0,
+    "reportResourceVersion": 0,
+    "reportUID": 0,
+    "resourceFlavor": 0,
+    "resourceName": 0
+   }
+  },
+  {
+   "items": 323
+  },
+  {
+   "properties": {
+    "demandContract": 239,
+    "demandFingerprint": 0,
+    "pools": 324,
+    "replicas": 0
+   }
+  },
+  {
+   "properties": {
+    "component": 0,
+    "maxWeight": 0,
+    "minWeight": 0,
+    "weight": 0
+   }
+  },
+  {
+   "items": 326
+  },
+  {
+   "properties": {
+    "inputDigest": 0,
+    "replicaFloors": 241
+   }
+  },
+  {
+   "properties": {
+    "capacity": 325,
+    "clusterUID": 0,
+    "componentMatches": 327,
+    "currentHome": 328,
+    "currentReplicas": 0,
+    "desiredHome": 328,
+    "desiredReplicas": 0,
+    "drainRequested": 0,
+    "homeInputsPending": 0,
+    "inventoryPending": 0,
+    "matched": 0,
+    "matchingTerms": 1,
+    "maxWeight": 0,
+    "minWeight": 0,
+    "originalReplicas": 0,
+    "raceCandidate": 0,
+    "replacementStartedAt": 0,
+    "weight": 0
+   }
+  },
+  {
+   "properties": {
+    "ready": 0,
+    "resolvedDigest": 0
+   }
+  },
+  {
+   "additionalProperties": 330
+  },
+  {
+   "properties": {
+    "name": 0,
+    "portableDigest": 0
+   }
+  },
+  {
+   "items": 332
+  },
+  {
+   "properties": {
+    "components": 331,
+    "policies": 333,
+    "ready": 0
+   }
+  },
+  {
+   "properties": {
+    "component": 0,
+    "current": 0,
+    "desired": 0
+   }
+  },
+  {
+   "items": 335
+  },
+  {
+   "properties": {
+    "policyName": 0,
+    "portableDigest": 0,
+    "source": 0
+   }
+  },
+  {
+   "items": 337
+  },
+  {
+   "properties": {
+    "digest": 0,
+    "outcome": 0
+   }
+  },
+  {
+   "properties": {
+    "activeGroups": 338,
+    "activeRunID": 0,
+    "lastRun": 339
+   }
+  },
+  {
+   "properties": {
+    "admittedReplicas": 0,
+    "allocation": 329,
+    "appliedPlanID": 0,
+    "autoscaling": 334,
+    "cluster": 0,
+    "componentFloors": 336,
+    "endpoint": 0,
+    "observationFailingSince": 0,
+    "observationKnown": 0,
+    "phase": 0,
+    "readyReplicas": 0,
+    "rollout": 340
+   }
+  },
+  {
+   "items": 341
+  },
+  {
+   "properties": {
+    "cursor": 0,
+    "selected": 0
+   }
+  },
+  {
+   "properties": {
+    "adoptionDigest": 0,
+    "assignedReplicas": 0,
+    "id": 0,
+    "inputDigest": 0,
+    "mode": 0,
+    "observedGeneration": 0,
+    "originalUnassignedReplicas": 0,
+    "pauseSurge": 0,
+    "requestedReplicas": 0,
+    "revision": 0,
+    "singleMove": 343,
+    "sourceUID": 0,
+    "unassignedReplicas": 0,
+    "winner": 0
+   }
+  },
+  {
+   "properties": {
+    "candidates": 342,
+    "cluster": 0,
+    "endpoint": 0,
+    "phase": 0,
+    "plan": 344
+   }
+  },
+  {
+   "properties": {
+    "group": 286,
+    "policyGeneration": 0,
+    "policyRef": 285,
+    "portableDigest": 0,
+    "source": 0
+   }
+  },
+  {
+   "items": 346
+  },
+  {
+   "properties": {
+    "groups": 347
+   }
+  },
+  {
+   "properties": {
+    "component": 0,
+    "revision": 0,
+    "stableRevision": 0
+   }
+  },
+  {
+   "items": 349
+  },
+  {
+   "properties": {
+    "openedAt": 0,
+    "pinnedAt": 0,
+    "plan": 348,
+    "runID": 0,
+    "targetRevisions": 350
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "wouldPinDigest": 0
+   }
+  },
+  {
+   "properties": {
+    "index": 0,
+    "observedDigest": 0,
+    "policyRef": 285,
+    "shadowedPolicyRef": 352,
+    "source": 0
+   }
+  },
+  {
+   "items": 353
+  },
+  {
+   "properties": {
+    "policyRef": 285,
+    "portableDigest": 0,
+    "source": 0
+   }
+  },
+  {
+   "items": 355
+  },
+  {
+   "properties": {
+    "closedAt": 0,
+    "groups": 356,
+    "openedAt": 0,
+    "outcome": 0,
+    "runID": 0,
+    "targetRevisions": 350
+   }
+  },
+  {
+   "properties": {
+    "activeRun": 351,
+    "groups": 354,
+    "lastRun": 357
+   }
+  },
+  {
+   "properties": {
+    "at": 0,
+    "component": 0
+   }
+  },
+  {
+   "properties": {
+    "current": 14,
+    "newPods": 14,
+    "original": 14
+   }
+  },
+  {
+   "properties": {
+    "components": 1,
+    "compositePhase": 0,
+    "currentComponent": 0,
+    "lastTransitionTime": 0,
+    "memberFinished": 359,
+    "memberNotReady": 0,
+    "message": 0,
+    "mixedPairing": 0,
+    "name": 0,
+    "observedRatio": 360,
+    "observedSurge": 0,
+    "order": 1,
+    "phase": 0,
+    "policy": 0,
+    "previousComponent": 0,
+    "surgeHeldByRatio": 0
+   }
+  },
+  {
+   "items": 361
+  },
+  {
+   "properties": {
+    "groups": 362
+   }
+  },
+  {
+   "properties": {
+    "clamped": 0,
+    "component": 0,
+    "current": 0,
+    "ratio": 0,
+    "released": 0,
+    "target": 0
+   }
+  },
+  {
+   "items": 364
+  },
+  {
+   "properties": {
+    "anchor": 0,
+    "anchorDesired": 0,
+    "conditions": 28,
+    "followers": 365,
+    "mode": 0,
+    "source": 0
+   }
+  },
+  {
+   "properties": {
+    "algorithm": 0,
+    "backendPolicyResource": 62,
+    "conditions": 28,
+    "targetedHTTPRoutes": 1
+   }
+  },
+  {
+   "properties": {
+    "address": 298,
+    "addresses": 299,
+    "annotations": 14,
+    "canary": 303,
+    "components": 310,
+    "conditions": 312,
+    "lastRuntimeSyncToken": 0,
+    "migrationHistory": 316,
+    "modelStatus": 320,
+    "mountedOverlays": 322,
+    "observedGeneration": 0,
+    "pinnedRevisionName": 0,
+    "placement": 345,
+    "rollout": 358,
+    "rolloutCoordination": 363,
+    "scalingPolicy": 366,
+    "traffic": 367,
+    "url": 0
+   },
+   "x-kubernetes-preserve-unknown-fields": true
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 297,
+    "status": 368
+   }
+  },
+  {
+   "properties": {
+    "blueGreen": 0,
+    "canary": 283,
+    "rollingUpdate": 197
+   }
+  },
+  {
+   "properties": {
+    "attachedGroups": 0,
+    "conditions": 28,
+    "observedGeneration": 0,
+    "portableDigest": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 370,
+    "status": 371
+   }
+  },
+  {
+   "properties": {
+    "allocated": 0,
+    "factor": 0,
+    "fallbackReason": 0,
+    "ready": 0,
+    "reported": 0,
+    "reportedWeight": 0,
+    "source": 0
+   }
+  },
+  {
+   "properties": {
+    "consecutiveFailures": 0,
+    "gated": 0,
+    "lastProbeTime": 0,
+    "message": 0,
+    "policyDigest": 0,
+    "result": 0
+   }
+  },
+  {
+   "properties": {
+    "capacity": 373,
+    "cluster": 0,
+    "drainRefs": 1,
+    "endpoint": 0,
+    "healthy": 0,
+    "probe": 374,
+    "weight": 0
+   }
+  },
+  {
+   "items": 375
+  },
+  {
+   "properties": {
+    "capacityMode": 0,
+    "entries": 376,
+    "mode": 0,
+    "observedISVCGeneration": 0,
+    "placementPlanID": 0,
+    "service": 0
+   }
+  },
+  {
+   "properties": {
+    "group": 0,
+    "kind": 0,
+    "name": 0,
+    "namespace": 0
+   }
+  },
+  {
+   "properties": {
+    "target": 0,
+    "weight": 0
+   }
+  },
+  {
+   "items": 379
+  },
+  {
+   "properties": {
+    "observedISVCGeneration": 0,
+    "planCompatibilityDigest": 0,
+    "targets": 380,
+    "trafficMapGeneration": 0
+   }
+  },
+  {
+   "properties": {
+    "claimedTargets": 1,
+    "lastPositive": 381,
+    "observedOptionsDigest": 0,
+    "publisherName": 0
+   }
+  },
+  {
+   "properties": {
+    "conditions": 28,
+    "gatewayRef": 378,
+    "observedTrafficMapGeneration": 0,
+    "published": 0,
+    "publisher": 382,
+    "sourceUID": 0
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 377,
+    "status": 383
+   }
+  },
+  {
+   "properties": {
+    "key": 0,
+    "secretRef": 90
+   }
+  },
+  {
+   "properties": {
+    "clusterProfileRef": 36,
+    "kubeConfig": 385
+   }
+  },
+  {
+   "properties": {
+    "clusterSource": 386
+   }
+  },
+  {
+   "properties": {
+    "conditions": 28
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 387,
+    "status": 388
+   }
+  }
+ ]
+}

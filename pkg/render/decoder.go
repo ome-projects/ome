@@ -36,8 +36,7 @@ func RenderDecoder(ctx context.Context, p *Piece, service *v1beta1.InferenceServ
 		return Rendered{}, err
 	}
 	t := Templates{ObjectMeta: meta, Primary: primary, Worker: worker, WorkerSize: DecoderWorkerSize(spec), MultiPod: DecoderIsMultiPod(spec)}
-	return Rendered{Templates: t, ComponentExt: &spec.ComponentExtensionSpec,
-		TopologyKey: spec.TopologyKey, TopologySpread: spec.TopologySpread, TopologySpreadKey: spec.TopologySpreadKey}, nil
+	return Rendered{Templates: t, ComponentExt: &spec.ComponentExtensionSpec}, nil
 }
 
 // DecoderUsesLeaderTemplate reports whether the decoder sources its primary
@@ -94,7 +93,7 @@ func DecoderPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta1.Deco
 	}
 
 	// Merge the runner container into the pod spec.
-	podSpec, err := (&PodSpecReconciler{Log: p.Log}).ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
+	podSpec, err := (&PodSpecReconciler{}).ReconcilePodSpec(isvc, objectMeta, &basePodSpec, runnerSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +131,7 @@ func DecoderWorkerPodSpec(p *Piece, isvc *v1beta1.InferenceService, spec *v1beta
 	}
 
 	// Merge the worker runner container into the worker pod spec.
-	workerPodSpec, err := (&PodSpecReconciler{Log: p.Log}).ReconcileWorkerPodSpec(isvc, objectMeta, &spec.Worker.PodSpec, workerRunner)
+	workerPodSpec, err := (&PodSpecReconciler{}).ReconcileWorkerPodSpec(isvc, objectMeta, &spec.Worker.PodSpec, workerRunner)
 	if err != nil {
 		return nil, err
 	}

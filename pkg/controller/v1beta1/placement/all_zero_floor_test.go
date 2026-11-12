@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -417,6 +418,134 @@ func TestAllZeroFloorHoldKeepsIdleMembersPlaced(t *testing.T) {
 				if diff := cmp.Diff(v1beta1.PlacementPhasePlaced, got.Status.Placement.Phase); diff != "" {
 					t.Fatalf("pass %d demoted the idle member while held (-want +got):\n%s", pass, diff)
 				}
+			}
+		})
+	}
+}
+
+// TestAllZeroMinimumPathRefusalsAndMovementTriggers holds what the
+// zero-minimum path refuses, with the text the hold carries, and which inputs
+// send a proposal down the movement path instead of taking its desired
+// policies: a requested drain, a retained member the intent does not select,
+// and, once the inventory is complete, a new member that asks for replicas.
+// The movement path refuses a zero desired policy, so each trigger shows as
+// that refusal where the idle path would take the policy.
+func TestAllZeroMinimumPathRefusalsAndMovementTriggers(t *testing.T) {
+	policy := func(digest string, replicas int32) *v1beta1.PlacementHomePolicy {
+		return &v1beta1.PlacementHomePolicy{InputDigest: digest, ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: replicas}}}
+	}
+	member := func(edit func(*v1beta1.CandidateAllocationStatus)) v1beta1.CandidateAllocationStatus {
+		a := v1beta1.CandidateAllocationStatus{Matched: true, ClusterUID: "member-a-uid", CurrentHome: policy("intent", 2), DesiredHome: policy("intent", 0), OriginalReplicas: 2, CurrentReplicas: 2}
+		if edit != nil {
+			edit(&a)
+		}
+		return a
+	}
+	newMember := func(desiredReplicas int32) func(*v1beta1.CandidateAllocationStatus) {
+		return func(a *v1beta1.CandidateAllocationStatus) {
+			a.CurrentHome, a.OriginalReplicas, a.CurrentReplicas, a.DesiredReplicas = nil, 0, 0, desiredReplicas
+		}
+	}
+	// The movement path's refusal of a zero engine minimum, built from the
+	// errors it wraps so the text is read from the code, not repeated here.
+	zeroEngine := protocol.ValidatePositiveReplicaFloors(policy("intent", 0).ReplicaFloors)
+	positiveEngineMinimum := errPositiveMovementFloor.Error() + ": " + zeroEngine.Error()
+	for _, tt := range []struct {
+		name        string
+		adoption    string
+		noPlan      bool
+		pause       bool
+		member      v1beta1.CandidateAllocationStatus
+		wantErr     string
+		wantCurrent *v1beta1.PlacementHomePolicy
+	}{
+		{name: "a paused surge cannot take a zero minimum", pause: true, member: member(nil), wantErr: errPositiveMovementFloor.Error()},
+		{name: "an inventory taken under other intent must complete first", adoption: "stale", member: member(nil), wantErr: "inventory must complete before changing placement intent"},
+		{name: "an inventory under the current intent still adopts", adoption: "intent", member: member(nil), wantCurrent: policy("intent", 0)},
+		{name: "before any plan an inventory under other intent still adopts", adoption: "stale", noPlan: true, member: member(nil), wantCurrent: policy("intent", 0)},
+		{name: "an unmatched member with a pending inventory is refused", member: member(func(a *v1beta1.CandidateAllocationStatus) { a.Matched, a.InventoryPending = false, true }), wantErr: "inventory is unresolved"},
+		{name: "a requested drain moves instead of scaling to zero", member: member(func(a *v1beta1.CandidateAllocationStatus) { a.DrainRequested = true }), wantErr: positiveEngineMinimum},
+		{name: "a retained member outside the selection moves", member: member(func(a *v1beta1.CandidateAllocationStatus) { a.Matched = false }), wantErr: positiveEngineMinimum},
+		{name: "a new member asking for replicas moves once the inventory is complete", member: member(newMember(1)), wantErr: positiveEngineMinimum},
+		{name: "a new member asking for no replicas takes its policy", member: member(newMember(0)), wantCurrent: policy("intent", 0)},
+		{name: "a new member asking for replicas is adopted before any plan", noPlan: true, member: member(newMember(1)), wantCurrent: policy("intent", 0)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			proposal := plan.Proposal{Mode: v1beta1.PlacementModeAll, InputDigest: "intent", AdoptionDigest: tt.adoption, PauseSurge: tt.pause, Assignments: map[string]v1beta1.CandidateAllocationStatus{"member-a": tt.member}}
+			source := srcISVCMode(v1beta1.PlacementModeAll, "")
+			if !tt.noPlan {
+				source.Status.Placement = &v1beta1.PlacementStatus{Plan: &v1beta1.PlacementPlanStatus{Mode: v1beta1.PlacementModeAll}}
+			}
+			refresh, err := (&Reconciler{}).prepareAllZeroFloors(t.Context(), source, &proposal)
+			if refresh {
+				t.Fatal("no member policy was refreshed from a member")
+			}
+			// The two inventory refusals are matched on their tail; the opening
+			// word is the code's own and is not repeated here.
+			got := ""
+			if err != nil {
+				got = err.Error()
+			}
+			if !strings.HasSuffix(got, tt.wantErr) || (tt.wantErr == "" && got != "") {
+				t.Fatalf("refusal: want %q, got %q", tt.wantErr, got)
+			}
+			if tt.wantErr != "" {
+				return
+			}
+			if diff := cmp.Diff(tt.wantCurrent, proposal.Assignments["member-a"].CurrentHome); diff != "" {
+				t.Fatalf("current policy (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestAllZeroMinimumPathTakesOnlyResolvedMatchedPolicies holds which desired
+// policies the idle path takes as current: the member's inputs and inventory
+// are resolved, the member is matched, and the policy was resolved for the
+// current intent. A taken policy brings its replica count; only a retained
+// member's authored change rewrites the original count.
+func TestAllZeroMinimumPathTakesOnlyResolvedMatchedPolicies(t *testing.T) {
+	policy := func(digest string, replicas int32) *v1beta1.PlacementHomePolicy {
+		return &v1beta1.PlacementHomePolicy{InputDigest: digest, ReplicaFloors: []v1beta1.PlacementComponentFloor{{Component: v1beta1.EngineComponent, Replicas: replicas}}}
+	}
+	retained := v1beta1.CandidateAllocationStatus{Matched: true, ClusterUID: "member-a-uid", CurrentHome: policy("intent", 0), DesiredHome: policy("intent", 3), OriginalReplicas: 1, CurrentReplicas: 1, DesiredReplicas: 3}
+	added := v1beta1.CandidateAllocationStatus{Matched: true, ClusterUID: "member-a-uid", DesiredHome: policy("intent", 0), OriginalReplicas: 5, CurrentReplicas: 1}
+	taken := func(a v1beta1.CandidateAllocationStatus, original int32) v1beta1.CandidateAllocationStatus {
+		a.CurrentHome, a.CurrentReplicas, a.OriginalReplicas = a.DesiredHome.DeepCopy(), a.DesiredReplicas, original
+		return a
+	}
+	for _, tt := range []struct {
+		name string
+		edit func(*v1beta1.CandidateAllocationStatus)
+		give v1beta1.CandidateAllocationStatus
+		want func(v1beta1.CandidateAllocationStatus) v1beta1.CandidateAllocationStatus
+	}{
+		{name: "a pending inventory keeps the current policy", give: retained, edit: func(a *v1beta1.CandidateAllocationStatus) { a.InventoryPending = true }},
+		{name: "pending member inputs keep the current policy", give: retained, edit: func(a *v1beta1.CandidateAllocationStatus) { a.HomeInputsPending = true }},
+		{name: "an unmatched new member takes no policy", give: added, edit: func(a *v1beta1.CandidateAllocationStatus) { a.Matched = false }},
+		{name: "no desired policy keeps the current one", give: retained, edit: func(a *v1beta1.CandidateAllocationStatus) { a.DesiredHome = nil }},
+		{name: "a desired policy of other intent keeps the current one", give: retained, edit: func(a *v1beta1.CandidateAllocationStatus) { a.DesiredHome.InputDigest = "other" }},
+		{name: "a retained member takes the policy and its count", give: retained, want: func(a v1beta1.CandidateAllocationStatus) v1beta1.CandidateAllocationStatus { return taken(a, 3) }},
+		{name: "a new member takes the policy and keeps its original count", give: added, want: func(a v1beta1.CandidateAllocationStatus) v1beta1.CandidateAllocationStatus { return taken(a, 5) }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			give := *tt.give.DeepCopy()
+			if tt.edit != nil {
+				tt.edit(&give)
+			}
+			want := *give.DeepCopy()
+			if tt.want != nil {
+				want = tt.want(want)
+			}
+			proposal := plan.Proposal{Mode: v1beta1.PlacementModeAll, InputDigest: "intent", Assignments: map[string]v1beta1.CandidateAllocationStatus{"member-a": give}}
+			source := srcISVCMode(v1beta1.PlacementModeAll, "")
+			source.Status.Placement = &v1beta1.PlacementStatus{Plan: &v1beta1.PlacementPlanStatus{Mode: v1beta1.PlacementModeAll}}
+			refresh, err := (&Reconciler{}).prepareAllZeroFloors(t.Context(), source, &proposal)
+			if err != nil || refresh {
+				t.Fatalf("idle path: refresh=%t err=%v", refresh, err)
+			}
+			if diff := cmp.Diff(want, proposal.Assignments["member-a"]); diff != "" {
+				t.Fatalf("assignment (-want +got):\n%s", diff)
 			}
 		})
 	}

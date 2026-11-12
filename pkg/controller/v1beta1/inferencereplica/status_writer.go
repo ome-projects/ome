@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -50,20 +52,39 @@ const tooLargeInternalErrorMarker = "request is too large"
 // statusWriter is the single InferenceReplica status persistence boundary:
 // the client that performs the status write, the decoder that returns the
 // API-confirmed object to the dense logical shape, the configured write
-// target that selects the representation of every write, and the recorder
-// for write-rejection events.
+// target that selects the representation of every write, the form the
+// served schema stores each readySince in, the recorder for
+// write-rejection events, and the pass's clock, which gives every
+// condition the writer persists its transition time.
 type statusWriter struct {
 	client.Client
-	decoder  irstatus.Decoder
-	target   irstatus.Encoding
-	recorder record.EventRecorder
+	decoder    irstatus.Decoder
+	target     irstatus.Encoding
+	readySince irstatus.ReadySinceForm
+	recorder   record.EventRecorder
+	clock      clock.PassiveClock
 }
 
-// statusWriter binds this reconciler's client, row decoder, write target, and
-// recorder into the persistence boundary every status mutation closure
-// writes through.
+// statusWriter binds this reconciler's client, row decoder, write target,
+// readySince form, recorder and clock into the persistence boundary every
+// status mutation closure writes through.
 func (r *Reconciler) statusWriter() statusWriter {
-	return statusWriter{Client: r.Client, decoder: r.InstanceStatusDecoder, target: r.InstanceStatusTarget, recorder: r.Recorder}
+	return statusWriter{Client: r.Client, decoder: r.InstanceStatusDecoder, target: r.InstanceStatusTarget, readySince: r.ReadySinceForm, recorder: r.Recorder, clock: r.Clock}
+}
+
+// now is the writer's reading of the pass's clock, the time a condition it
+// writes transitions at.
+func (w statusWriter) now() time.Time {
+	return clockNow(w.clock)
+}
+
+// clockNow reads c, or the wall clock when no clock is wired (mirrors
+// ReconcileInput.Now).
+func clockNow(c clock.PassiveClock) time.Time {
+	if c != nil {
+		return c.Now()
+	}
+	return time.Now()
 }
 
 // updateInferenceReplicaStatus persists a logical status mutation. source is
@@ -118,7 +139,7 @@ func (w statusWriter) selectCandidate(ir *v1beta1.InferenceReplica) (*irstatus.C
 		}
 		return candidate, nil
 	case irstatus.EncodingColumnarV2:
-		selection, err := irstatus.SelectCandidate(&ir.Status, w.decoder.MaxDecodedInstances())
+		selection, err := irstatus.SelectCandidateStoring(&ir.Status, w.decoder.MaxDecodedInstances(), w.readySince)
 		if err != nil {
 			return nil, undecodedWriteError(ir, err)
 		}

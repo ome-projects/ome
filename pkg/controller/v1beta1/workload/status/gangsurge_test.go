@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -441,5 +442,53 @@ func TestResetGangSurgeSourceAndRemoveMarker_NeverPromotedSourceEndsFailed(t *te
 	}
 	if got.LastFailure == nil || got.LastFailure.Reason != types.PodGroupOwnershipConflictReason {
 		t.Fatalf("LastFailure = %+v, want kept", got.LastFailure)
+	}
+}
+
+// A gang surge source whose replacement gang lost members after it took
+// over serving is written Failed with its surge kept and no deadline on it,
+// as every Failed row with an operation; the step, the surge index and the
+// retry count stay and the loss is recorded. The next attempt runs under a
+// deadline of its own from its start.
+func TestReplacementLost_CarriesNoDeadline(t *testing.T) {
+	now := metav1.NewTime(time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC))
+	surgeIndex := int32(2)
+	waitSince := metav1.NewTime(now.Add(-time.Minute))
+	row := types.InstanceStatus{Index: 0, Incarnation: 1, Phase: types.InstancePhaseUpdating, RunningRevision: "rev-a", TargetRevision: "rev-b", Operation: &types.InstanceOperation{
+		ID: "update-0-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepSurgeDrain, TargetRevision: "rev-b", SurgeIndex: &surgeIndex, RetryCount: 1,
+		StartedAt: now, LastProgressAt: now, Deadline: metav1.NewTime(now.Add(30 * time.Minute)), PlacementWaitSince: &waitSince}}
+	before := *row.Operation
+	termination := &types.InstanceTermination{Reason: "ReplacementLost", Message: "replacement gang (surge-index=2) lost 1 of 2 member(s) after it took over serving", Time: now}
+	if !StampReplacementLost(termination)(&row) || row.Phase != types.InstancePhaseFailed || row.Operation == nil {
+		t.Fatalf("row = %+v, want Failed with the surge kept", row)
+	}
+	if !row.Operation.Deadline.IsZero() {
+		t.Errorf("deadline = %v, want none on a Failed row", row.Operation.Deadline)
+	}
+	if row.Operation.PlacementWaitSince != nil {
+		t.Errorf("placement wait = %v, want none left on the ended attempt", row.Operation.PlacementWaitSince)
+	}
+	if row.Operation.ID != before.ID || row.Operation.Step != before.Step || row.Operation.RetryCount != before.RetryCount ||
+		row.Operation.SurgeIndex == nil || *row.Operation.SurgeIndex != surgeIndex || row.LastFailure == nil || row.LastFailure.Reason != termination.Reason {
+		t.Errorf("operation = %+v, want %+v with the loss recorded", *row.Operation, before)
+	}
+
+	later := now.Add(5 * time.Minute)
+	input := types.ReconcileInput{
+		Clock: clocktesting.NewFakeClock(later),
+		MutateInstance: func(_ context.Context, _ int32, mutate func(*types.InstanceStatus) bool) error {
+			mutate(&row)
+			return nil
+		},
+	}
+	started, err := RearmGangSurgeRebuild(context.Background(), input, &row, nil, 30*time.Minute)
+	if err != nil || !started || row.Phase != types.InstancePhaseUpdating || row.Operation == nil {
+		t.Fatalf("next attempt: started=%t err=%v row=%+v, want Updating at the drain step", started, err, row)
+	}
+	if want := metav1.NewTime(later.Add(30 * time.Minute)); !row.Operation.Deadline.Equal(&want) || !row.Operation.StartedAt.Equal(&metav1.Time{Time: later}) {
+		t.Errorf("next attempt: started %v deadline %v, want started %v with a full timeout from then %v", row.Operation.StartedAt, row.Operation.Deadline, later, want)
+	}
+	if row.Operation.RetryCount != before.RetryCount+1 {
+		t.Errorf("next attempt: retry count = %d, want %d", row.Operation.RetryCount, before.RetryCount+1)
 	}
 }

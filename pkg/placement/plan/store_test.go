@@ -376,7 +376,7 @@ func TestPersistMinWeightKeepsPlanIdentity(t *testing.T) {
 		t.Fatalf("adding MinWeight rewrote the stored plan (-first +again):\n%s", diff)
 	}
 
-	// Integer-form identity must not change: a different plan ID gives every
+	// A stored plan's identity must not change: a different plan ID gives every
 	// stored plan a new revision on upgrade.
 	const wantID = "eca69b41b0fd94e78a3a13d55c357d8ccfb2bffb20af3a9d264604114f33d623.1"
 	if first.Status.Placement.Plan.ID != wantID {

@@ -12,7 +12,6 @@ import (
 )
 
 var _ Component = &Encoder{}
-var _ ComponentConfig = &Encoder{}
 
 // Encoder reconciles resources for the encoder component: the pods that turn
 // a request's images or audio into embeddings the engine reads. It runs the
@@ -63,30 +62,4 @@ func (e *Encoder) role() pairedRole {
 			return render.RenderEncoder(ctx, p, isvc, spec)
 		},
 	}
-}
-
-// GetComponentType implements ComponentConfig interface
-func (e *Encoder) GetComponentType() v1beta1.ComponentType {
-	return v1beta1.EncoderComponent
-}
-
-// GetComponentSpec implements ComponentConfig interface
-func (e *Encoder) GetComponentSpec() *v1beta1.ComponentExtensionSpec {
-	if e.encoderSpec == nil {
-		return nil
-	}
-	return &e.encoderSpec.ComponentExtensionSpec
-}
-
-// GetServiceSuffix implements ComponentConfig interface
-func (e *Encoder) GetServiceSuffix() string {
-	return "-" + string(v1beta1.EncoderComponent)
-}
-
-// ValidateSpec implements ComponentConfig interface
-func (e *Encoder) ValidateSpec() error {
-	if e.encoderSpec == nil {
-		return errors.New("encoder spec is nil")
-	}
-	return nil
 }

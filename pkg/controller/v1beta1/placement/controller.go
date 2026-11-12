@@ -17,7 +17,6 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/retry"
@@ -111,7 +110,6 @@ type ClusterClients interface {
 // watch funnel, with a poll fallback (the Requeue cadence).
 type Reconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
 	Log      logr.Logger
 	Clusters ClusterClients
 	// APIReader is the live (uncached) reader used to re-read the control-plane
@@ -1199,7 +1197,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts ...ConvergeOption) 
 	// Register the field index that marks ISVCs declaring placement requirements,
 	// so a cluster change lists only those (not every cached ISVC) before the
 	// per-ISVC candidate check in isvcsForClusterChange.
-	if err := registerPlacementEligibleIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
+	if err := RegisterPlacementEligibleIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
 		return err
 	}
 	b := ctrl.NewControllerManagedBy(mgr).
@@ -1334,11 +1332,11 @@ func IsPlacementEligible(isvc *v1beta1.InferenceService) bool {
 	return requirements || selector
 }
 
-// registerPlacementEligibleIndex installs placementEligibleIndexField on the
-// supplied indexer (mgr.GetFieldIndexer()). Call once during manager setup,
-// before Start, so isvcsForClusterChange resolves fan-out-eligible ISVCs through
-// the index instead of scanning every cached InferenceService.
-func registerPlacementEligibleIndex(ctx context.Context, indexer client.FieldIndexer) error {
+// RegisterPlacementEligibleIndex installs the index that lists the
+// InferenceServices declaring placement requirements. It runs before the
+// cache starts, so isvcsForClusterChange resolves them through the index
+// instead of scanning every cached InferenceService.
+func RegisterPlacementEligibleIndex(ctx context.Context, indexer client.FieldIndexer) error {
 	return indexer.IndexField(ctx, &v1beta1.InferenceService{}, placementEligibleIndexField, placementEligibleIndexExtractor)
 }
 

@@ -253,7 +253,7 @@ func mkZeroServingRatioFixture() *v1beta1.InferenceService {
 	isvc := mkSymmetricRatioFixture(25)
 	maxSurge := intstr.FromInt32(4)
 	isvc.Spec.Rollout.Groups[0].RollingUpdate.MaxSurge = &maxSurge
-	pinActiveRun(isvc) // re-pin: the surge-budget edit must be part of the pinned plan
+	pinActiveRun(isvc) // re-pin so the recorded plan carries the surge budget the fixture declares
 	isvc.Status.RolloutCoordination.Groups[0].ObservedRatio.Original = map[v1beta1.ComponentType]int32{
 		v1beta1.EngineComponent:  8,
 		v1beta1.DecoderComponent: 8,

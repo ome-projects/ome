@@ -312,7 +312,7 @@ func TestDispose_PinnedCreateUsesAttemptRevisionAfterCorrectiveEdit(t *testing.T
 	}
 }
 
-func TestDispose_UnpinnedCreateDoesNotChargeCorrectiveRevision(t *testing.T) {
+func TestDispose_CreateWithoutTargetRevisionDoesNotChargeCorrectiveRevision(t *testing.T) {
 	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	fc := clocktesting.NewFakeClock(t0)
 	insts := []types.InstanceStatus{{
@@ -343,14 +343,14 @@ func TestDispose_UnpinnedCreateDoesNotChargeCorrectiveRevision(t *testing.T) {
 	}
 }
 
-// TestDispose_SupersededLeftover_DoesNotPoisonCorrectiveRevision pins the
+// TestDispose_ReplacedRevisionLeftover_DoesNotPoisonCorrectiveRevision pins the
 // superseded-leftover guard: after a corrective edit retargets an instance to a new
 // revision, the prior failed attempt's bad pod can linger in its drain
 // window. Attributing that pod's failure to the freshly-stamped
 // Operation.TargetRevision would record a RetryBlock against the GOOD
 // corrective revision and wedge recovery. A cause pod whose revision-hash
 // is not the target's must be skipped: no block, no instance mutation.
-func TestDispose_SupersededLeftover_DoesNotPoisonCorrectiveRevision(t *testing.T) {
+func TestDispose_ReplacedRevisionLeftover_DoesNotPoisonCorrectiveRevision(t *testing.T) {
 	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	fc := clocktesting.NewFakeClock(t0)
 	insts := []types.InstanceStatus{{
@@ -843,13 +843,13 @@ func TestDispose_RelocationDirective_ReplayDedup(t *testing.T) {
 	}
 }
 
-// TestDispose_RelocationDirective_AffinityPinDisposesTerminal: an
+// TestDispose_RelocationDirective_RequiredNodeAffinityDisposesTerminal: an
 // instance whose template REQUIRES the suspect node (required
 // In[node-a] pin) must not receive a relocation directive — the
 // exclusion would render In[node-a] AND NotIn[node-a] permanently
 // Pending. The disposition takes the terminal branch instead. A pin
 // that still permits another host records normally.
-func TestDispose_RelocationDirective_AffinityPinDisposesTerminal(t *testing.T) {
+func TestDispose_RelocationDirective_RequiredNodeAffinityDisposesTerminal(t *testing.T) {
 	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	pinnedSpec := func(hosts ...string) *corev1.PodSpec {
 		return &corev1.PodSpec{
@@ -981,7 +981,7 @@ func TestDispose_Terminal(t *testing.T) {
 // whichever branch classified it and whether the end would have parked
 // or cleared the attempt. A row re-opened under another attempt is not
 // the observed attempt's to end either (the wave it earns is pinned by
-// TestDispose_AttemptReopenedSinceObservedIsNotParked).
+// TestDispose_AttemptReopenedSinceObservedIsNotHeld).
 func TestDispose_RowThatMovedOnSinceTheObservationIsLeftAlone(t *testing.T) {
 	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	observed := types.InstanceStatus{
@@ -1110,7 +1110,7 @@ func TestBuildPlan_ThreadsExcludedNodes(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Escalator integration: the fast stuck-pod escalator and the deadline
 // backstop route disposable attempts through the disposition (not the
-// old bare stamps), while the gang path keeps today's Failed-with-Op
+// old bare stamps), while the gang path keeps the current Failed-with-Op
 // behavior (pinned in deadline_test.go / escalation_external_test.go).
 // ---------------------------------------------------------------------------
 
@@ -1734,7 +1734,7 @@ func TestDispose_RelocationDirective_DoesNotCountOnTheLadder(t *testing.T) {
 	}
 }
 
-// TestDispose_RelocationBudgetRunsOutBeforeTheLadderHolds pins the whole
+// TestDispose_RelocationBudgetRunsOutBeforeTheRetryScheduleHolds pins the whole
 // ladder for a revision that serves on a sibling yet is refused a start
 // on every node this Instance is tried on, with auto-migration on: the
 // relocation branch spends autoMigrate.maxAttempts first, each wave
@@ -1743,7 +1743,7 @@ func TestDispose_RelocationDirective_DoesNotCountOnTheLadder(t *testing.T) {
 // updateRetry.maxAttempts like any other failure. A revision that
 // failed on that many nodes in a row was not the node's fault; one held
 // wrongly is released by the operator with the release annotation.
-func TestDispose_RelocationBudgetRunsOutBeforeTheLadderHolds(t *testing.T) {
+func TestDispose_RelocationBudgetRunsOutBeforeTheRetryScheduleHolds(t *testing.T) {
 	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	fc := clocktesting.NewFakeClock(t0)
 	c := fakeLedgerClient(t)
@@ -1797,11 +1797,11 @@ func TestDispose_RelocationBudgetRunsOutBeforeTheLadderHolds(t *testing.T) {
 	}
 }
 
-// TestDispose_Terminal_SupersededLeftoverDoesNotChargeTheTarget pins the
+// TestDispose_Terminal_ReplacedRevisionLeftoverDoesNotChargeTheTarget pins the
 // same guard branch 1 applies: when the only evidence is a pod on a
 // known, different revision than the attempt's target, the wave charges
 // nothing — the corrective revision must not inherit the leftover's crash.
-func TestDispose_Terminal_SupersededLeftoverDoesNotChargeTheTarget(t *testing.T) {
+func TestDispose_Terminal_ReplacedRevisionLeftoverDoesNotChargeTheTarget(t *testing.T) {
 	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	fc := clocktesting.NewFakeClock(t0)
 	insts, input, rec := stuckSurgeAttempt(fc, "own-engine-newgood", ladderPolicy(), nil)
@@ -2526,7 +2526,7 @@ func TestDispose_LiveSetParksTheAttempt(t *testing.T) {
 // the same one - is neither parked with the old attempt's wait nor
 // cleared: a fresh attempt is not the disposition's to end. The wave is
 // still counted on the expired attempt's revision.
-func TestDispose_AttemptReopenedSinceObservedIsNotParked(t *testing.T) {
+func TestDispose_AttemptReopenedSinceObservedIsNotHeld(t *testing.T) {
 	ladder := &types.RetryPolicy{MaxAttempts: 3, InitialDelay: time.Minute, MaxDelay: 30 * time.Minute, Multiplier: 2}
 	t0 := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {

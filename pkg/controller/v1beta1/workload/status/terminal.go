@@ -107,7 +107,9 @@ func FinalizeAndRemove(
 //
 // A record already naming this failure is kept, time included, when the
 // dead pod is no newer than it: the same pod is seen again on every pass
-// until its delete lands, while a same-name replacement starts afresh.
+// until its delete lands, while a same-name replacement starts afresh. A
+// record naming a container that ran and ended is kept over a pod that
+// never ran (containerExitOutranks).
 func RecordRecycleAttempt(
 	ctx context.Context,
 	input types.ReconcileInput,
@@ -127,13 +129,23 @@ func RecordRecycleAttempt(
 		op.LastProgressAt = now
 		s.Operation = &op
 		recycle = op.RetryCount
-		if termination != nil && !sameDeadPodFailure(s.LastFailure, termination, born) {
+		if termination != nil && !sameDeadPodFailure(s.LastFailure, termination, born) &&
+			!containerExitOutranks(s.LastFailure, termination) {
 			captured := *termination
 			s.LastFailure = &captured
 		}
 		return true
 	})
 	return recycle, err
+}
+
+// containerExitOutranks reports whether recorded names a container that
+// ran and ended while fresh names none. The exit is the failure the
+// attempt answers, and the rebuilt set's next death is read against it;
+// a pod the kubelet refused or evicted before any container ran says
+// nothing about why the set died, so its record does not replace it.
+func containerExitOutranks(recorded, fresh *types.InstanceTermination) bool {
+	return recorded != nil && recorded.ContainerName != "" && fresh.ContainerName == ""
 }
 
 // sameDeadPodFailure reports whether recorded already names the failure

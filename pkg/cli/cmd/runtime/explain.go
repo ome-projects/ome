@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/spf13/cobra"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -150,11 +149,23 @@ func (o *explainOptions) Run(ctx context.Context, f factory.Factory) error {
 	table := printers.Table{Headers: []string{"RUNTIME", "SCOPE", "COMPATIBLE", "PRIORITY", "WEIGHT", "REASON"}}
 	for _, m := range matches {
 		matched[runtimeKey{m.Name, m.IsCluster}] = true
+		// The selector's own choice of format gives the row its priority
+		// and the format's share of the score; a full match has no reason
+		// to show.
+		format := selector.GetSupportedModelFormat(ctx, m.Spec, modelSpec, false)
+		priority := int64(cfg.DefaultPriority)
+		if format != nil && format.Priority != nil {
+			priority = int64(*format.Priority)
+		}
+		var weight int64
+		if format != nil {
+			weight = scorerImpl.CalculateFormatScore(modelSpec, *format, priority)
+		}
 		table.Rows = append(table.Rows, []string{
 			m.Name, scopeLabel(m.IsCluster), "Yes",
-			fmt.Sprintf("%d", m.MatchDetails.Priority),
-			fmt.Sprintf("%d", m.MatchDetails.Weight),
-			printers.OrDash(strings.Join(m.MatchDetails.Reasons, "; ")),
+			fmt.Sprintf("%d", priority),
+			fmt.Sprintf("%d", weight),
+			"-",
 		})
 	}
 	for _, c := range candidates {
@@ -255,14 +266,15 @@ func evaluateReason(
 	if !hasAutoSelectFormat(spec) {
 		return "supports the model but has no supportedModelFormats[].autoSelect=true entry, so automatic selection skips it (pin it explicitly via spec.runtime.name instead)"
 	}
-	if !report.MatchDetails.AutoSelectEnabled {
+	format := matchingFormat(spec, model)
+	if format == nil || format.AutoSelect == nil || !*format.AutoSelect {
 		return fmt.Sprintf(
 			"matching format %s is not autoSelect-enabled (a different supportedModelFormats entry on this runtime has autoSelect=true, but not the one that matches this model)",
 			matchingFormatName(spec, model))
 	}
 
 	if score, scoreErr := scorer.CalculateScore(spec, model); scoreErr == nil && score <= 0 {
-		if report.MatchDetails.Priority == 0 {
+		if format.Priority != nil && *format.Priority == 0 {
 			return "auto-select score is 0 (format priority 0)"
 		}
 		return "auto-select score is 0"
@@ -293,12 +305,22 @@ func hasAutoSelectFormat(spec *v1beta1.ServingRuntimeSpec) bool {
 // the REASON text specific -- the compatible/incompatible verdict itself
 // always comes from matcher.GetCompatibilityDetails, never from this lookup.
 func matchingFormatName(spec *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec) string {
-	for _, format := range spec.SupportedModelFormats {
-		if format.ModelFormat != nil && format.ModelFormat.Name == model.ModelFormat.Name {
-			return format.ModelFormat.Name
-		}
+	if format := matchingFormat(spec, model); format != nil {
+		return format.ModelFormat.Name
 	}
 	return model.ModelFormat.Name
+}
+
+// matchingFormat returns the supportedModelFormats entry whose
+// ModelFormat.Name equals the model's, or nil when no entry does.
+func matchingFormat(spec *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec) *v1beta1.SupportedModelFormat {
+	for i := range spec.SupportedModelFormats {
+		format := &spec.SupportedModelFormats[i]
+		if format.ModelFormat != nil && format.ModelFormat.Name == model.ModelFormat.Name {
+			return format
+		}
+	}
+	return nil
 }
 
 func scopeLabel(isCluster bool) string {

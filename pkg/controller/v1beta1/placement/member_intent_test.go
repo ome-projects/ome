@@ -59,7 +59,7 @@ func TestReconcileSplitMemberKeepsConcreteReplicaPolicy(t *testing.T) {
 	}
 	r, cp := newPlacer(scheme, clusters, source, readyWC("cluster-a", map[string]string{"accelerator": "test"}))
 	for range 2 {
-		err := r.placePlannedOn(ctx, source, source.Status.Placement.Candidates[0])
+		err := r.placePlannedMember(ctx, source, source.Status.Placement.Candidates[0], false, nil)
 		require.NoError(t, err)
 		got := &v1beta1.InferenceService{}
 		require.NoError(t, worker.Get(ctx, req().NamespacedName, got))

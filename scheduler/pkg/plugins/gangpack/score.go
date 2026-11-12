@@ -136,16 +136,5 @@ func (g *GangPack) NormalizeScore(_ context.Context, _ framework.CycleState, _ *
 }
 
 func readDomainPackState(state framework.CycleState) *domainPackState {
-	if state == nil {
-		return nil
-	}
-	v, err := state.Read(preScoreStateKey)
-	if err != nil {
-		return nil
-	}
-	s, ok := v.(*domainPackState)
-	if !ok {
-		return nil
-	}
-	return s
+	return cycleStateValue[domainPackState](state, preScoreStateKey)
 }

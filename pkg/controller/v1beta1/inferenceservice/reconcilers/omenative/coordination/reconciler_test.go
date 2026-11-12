@@ -1437,7 +1437,7 @@ func TestBuildGroupObservation_PartitionFromProjectedIRSpec(t *testing.T) {
 func TestBuildComponentObservation_FailedPropagatesThroughBlueGreen(t *testing.T) {
 	// End-to-end: a Failed Instance flows through buildComponentObservation
 	// into the BlueGreen state machine, which returns Phase=Failed for
-	// the group. The bad_image_kind KIND spec pins the same path end to end.
+	// the group. The cluster-level suite pins the same path end to end.
 	g := ResolvedGroup{
 		Name:       "0",
 		Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent},

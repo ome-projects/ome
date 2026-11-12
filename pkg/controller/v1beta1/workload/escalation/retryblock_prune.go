@@ -101,7 +101,8 @@ func PruneSupersededRetryBlocks(ctx context.Context, input types.ReconcileInput,
 // target revision arrives or an operator releases it.
 //
 // A crash of a promoted pod set counts on the revision's ladder, and its
-// rebuild promotes without pruning the block (status.StampReady), so this
+// rebuild promotes without pruning the block (the create pass releases a
+// target's record only when a row first converges on it), so this
 // is where a crash that never came back costs its one attempt and clears,
 // while a loop, whose rebuilt pods never hold the window, exhausts the
 // ladder. With no window configured no row outlives a failure by time,

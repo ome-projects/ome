@@ -1,6 +1,8 @@
 package v1beta1
 
 import (
+	"slices"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -142,6 +144,12 @@ type FollowerScalingStatus struct {
 	// Clamped is true when the follower's minReplicas or a declared
 	// maxReplicas moved the target; the Ready condition names the bound.
 	Clamped bool `json:"clamped,omitempty"`
+	// Released is true for a Component that stopped following and declares
+	// autoscaler class None: Current is the count it keeps and Target the
+	// count its minReplicas names. The record ends when that minReplicas is
+	// edited, an autoscaler takes the count, or a policy names the Component
+	// again.
+	Released bool `json:"released,omitempty"`
 }
 
 // MountedOverlay records one overlay the controller wired into the
@@ -221,10 +229,14 @@ type ComponentStatusSpec struct {
 	// +ome:since=v1.3
 	PreviousRolledoutRevision string `json:"previousRolledoutRevision,omitempty"`
 
-	// Traffic reports per-revision traffic weights for this
-	// Component. Each entry corresponds to one revision currently
-	// receiving traffic. The HTTPRoute builder reads this to
-	// emit weighted backendRefs.
+	// Traffic reports per-revision traffic weights for this Component: one
+	// entry per revision currently receiving traffic, naming its
+	// per-revision Service. On the Gateway API HTTPRoutes OME renders, the
+	// entries are programmed as weighted backendRefs on those Services, so
+	// these percentages and the weights the gateway applies are one value.
+	// A Kubernetes Ingress cannot express backend weights, and a route OME
+	// does not render is programmed by whoever owns it; under those
+	// providers the entries are the contract that router consumes.
 	// +optional
 	// +listType=map
 	// +listMapKey=revisionName
@@ -273,7 +285,7 @@ type ComponentStatusSpec struct {
 // one revision of one Component. RevisionName is the per-revision
 // Service name produced by OMENative's coordination layer (e.g.
 // `llama-engine-rev-abc123`), which the HTTPRoute builder
-// consumes directly as a backend reference.
+// consumes directly as a weighted backend reference.
 type ComponentTrafficTarget struct {
 	// RevisionName is the per-revision Service name for this target.
 	RevisionName string `json:"revisionName"`
@@ -340,7 +352,7 @@ const (
 	// DecoderReady is set when decoder pods are ready.
 	DecoderReady apis.ConditionType = "DecoderReady"
 	// EncoderReady is set when encoder pods are ready. Like DecoderReady, it
-	// is not part of the aggregate Ready condition.
+	// gates the aggregate Ready condition while the encoder is declared.
 	EncoderReady apis.ConditionType = "EncoderReady"
 	// RouterReady is set when router has reported readiness.
 	RouterReady apis.ConditionType = "RouterReady"
@@ -352,11 +364,43 @@ const (
 	OverlaysReady apis.ConditionType = "OverlaysReady"
 	// RuntimeReady is False with reason=RuntimeNotFound when the ISVC's
 	// spec.runtime (or the auto-selected runtime) cannot be resolved.
-	// Advisory only — NOT a dependent of the aggregate Ready condition
-	// (conditionSet), so a currently-serving ISVC whose spec is edited to
-	// point at a missing runtime stays Ready=True on its running pods; only
-	// the new spec is withheld until the runtime exists.
+	// Advisory only — NOT a dependent of the aggregate Ready condition, so a
+	// currently-serving ISVC whose spec is edited to point at a missing
+	// runtime stays Ready=True on its running pods; only the new spec is
+	// withheld until the runtime exists.
 	RuntimeReady apis.ConditionType = "RuntimeReady"
+	// TrafficIntentReady reports whether the configured route provider can
+	// express the InferenceService's per-revision traffic intent (a canary's
+	// traffic percentages on the externally routed unit). True when the
+	// provider declares every capability the intent needs; Unknown when the
+	// provider declares no capabilities, so the intent is applied unverified;
+	// False when a declared provider lacks one — a rollout run is then held
+	// rather than started with the intent dropped. Advisory only — NOT a
+	// dependent of the aggregate Ready condition. Written only once the spec
+	// has carried such intent.
+	TrafficIntentReady apis.ConditionType = "TrafficIntentReady"
+	// CRDSchemaCurrent is False, with the CRDs and fields in the message,
+	// while a CRD of this API group lacks a field this release of the
+	// manager knows: the apiserver drops such a field from every write.
+	// True once every CRD is current again. Advisory only, not a dependent
+	// of Ready, and absent on a cluster whose CRDs never lagged.
+	CRDSchemaCurrent apis.ConditionType = "CRDSchemaCurrent"
+)
+
+// Reasons for the TrafficIntentReady condition.
+const (
+	// TrafficIntentReasonSupported: the provider declares every capability
+	// the intent needs.
+	TrafficIntentReasonSupported = "Supported"
+	// TrafficIntentReasonCapabilitiesUnknown: the provider declares no
+	// capability set; the intent is applied unverified.
+	TrafficIntentReasonCapabilitiesUnknown = "RouteProviderCapabilitiesUnknown"
+	// TrafficIntentReasonUnsupported: the provider declares a capability set
+	// that lacks one the intent needs.
+	TrafficIntentReasonUnsupported = "RouteProviderUnsupported"
+	// TrafficIntentReasonNoIntent: the spec carries no per-revision traffic
+	// intent, after having reported one.
+	TrafficIntentReasonNoIntent = "NoIntent"
 )
 
 type ModelStatus struct {
@@ -491,51 +535,109 @@ type FailureInfo struct {
 	ExitCode int32 `json:"exitCode,omitempty"`
 }
 
-// InferenceService component conditions
-// The workload-cluster Ready condition is managed by the conditionSet, which
-// requires IngressReady. Component-specific ready conditions (EngineReady,
-// DecoderReady) are managed separately. On a multi-cluster control-plane source,
-// the placement controller directly projects serving readiness into Ready.
-var conditionSet = apis.NewLivingConditionSet(
-	IngressReady,
-	EngineReady,
-)
+// optionalComponentReadyConditions are the ready conditions of the roles a
+// service may declare beside its engine, in the order of Roles.
+var optionalComponentReadyConditions = readyConditionsBesideTheEngine()
+
+func readyConditionsBesideTheEngine() []apis.ConditionType {
+	var conditions []apis.ConditionType
+	for _, r := range Roles {
+		if r.Type != EngineComponent {
+			conditions = append(conditions, r.ReadyCondition)
+		}
+	}
+	return conditions
+}
+
+// readyConditionSet is the living condition set behind Ready on a workload
+// cluster: Ready is True only while IngressReady, EngineReady and the ready
+// condition of every other declared Component are True. A decoder, encoder or
+// router counts as declared while its condition is on the status or is the one
+// being written; the controller removes the condition when the Component
+// leaves the spec. On a multi-cluster control-plane source, the placement
+// controller writes Ready from serving readiness through a condition set of
+// its own.
+func (ss *InferenceServiceStatus) readyConditionSet(writing apis.ConditionType) apis.ConditionSet {
+	dependents := []apis.ConditionType{IngressReady, EngineReady}
+	for _, t := range optionalComponentReadyConditions {
+		if t == writing || ss.Status.GetCondition(t) != nil {
+			dependents = append(dependents, t)
+		}
+	}
+	return apis.NewLivingConditionSet(dependents...)
+}
 
 var _ apis.ConditionsAccessor = (*InferenceServiceStatus)(nil)
 
 // IsReady returns the overall readiness for the inference service.
 func (ss *InferenceServiceStatus) IsReady() bool {
-	return conditionSet.Manage(ss).IsHappy()
+	return ss.readyConditionSet("").Manage(ss).IsHappy()
 }
 
 // GetCondition returns the condition by name.
 func (ss *InferenceServiceStatus) GetCondition(t apis.ConditionType) *apis.Condition {
-	return conditionSet.Manage(ss).GetCondition(t)
+	return ss.Status.GetCondition(t)
 }
 
 // IsConditionReady returns the readiness for a given condition
 func (ss *InferenceServiceStatus) IsConditionReady(t apis.ConditionType) bool {
-	condition := conditionSet.Manage(ss).GetCondition(t)
+	condition := ss.GetCondition(t)
 	return condition != nil && condition.Status == v1.ConditionTrue
 }
 
 // IsConditionUnknown returns if a given condition is Unknown
 func (ss *InferenceServiceStatus) IsConditionUnknown(t apis.ConditionType) bool {
-	condition := conditionSet.Manage(ss).GetCondition(t)
+	condition := ss.GetCondition(t)
 	return condition == nil || condition.Status == v1.ConditionUnknown
 }
 
-// SetCondition sets a condition on the status using the conditionSet
+// adoptComponentReadyConditions gives every Component ready condition on the
+// status the severity of a dependent of Ready. The condition set derives Ready
+// from the conditions with that severity, and a condition written while its
+// Component did not gate Ready carries the advisory one.
+func (ss *InferenceServiceStatus) adoptComponentReadyConditions() {
+	conditions := ss.Status.GetConditions()
+	for i := range conditions {
+		if conditions[i].Severity != apis.ConditionSeverityError && slices.Contains(optionalComponentReadyConditions, conditions[i].Type) {
+			conditions[i].Severity = apis.ConditionSeverityError
+		}
+	}
+	ss.Status.SetConditions(conditions)
+}
+
+// RemoveCondition drops a condition and reads Ready again from the conditions
+// that remain, so a Component that left the spec stops gating Ready.
+func (ss *InferenceServiceStatus) RemoveCondition(t apis.ConditionType) {
+	ss.adoptComponentReadyConditions()
+	conditions := ss.Status.GetConditions()
+	kept := make(apis.Conditions, 0, len(conditions))
+	for _, c := range conditions {
+		if c.Type != t {
+			kept = append(kept, c)
+		}
+	}
+	if len(kept) == len(conditions) {
+		return
+	}
+	ss.Status.SetConditions(kept)
+	if ss.GetCondition(apis.ConditionReady) != nil {
+		// Marking Ready itself re-reads its dependents: it stays True only
+		// while none of them is False or Unknown.
+		ss.readyConditionSet("").Manage(ss).MarkTrue(apis.ConditionReady)
+	}
+}
+
+// SetCondition sets a condition on the status and re-derives Ready from it.
 func (ss *InferenceServiceStatus) SetCondition(conditionType apis.ConditionType, condition *apis.Condition) {
+	ss.adoptComponentReadyConditions()
+	manager := ss.readyConditionSet(conditionType).Manage(ss)
 	switch {
 	case condition == nil:
 	case condition.Status == v1.ConditionUnknown:
-		conditionSet.Manage(ss).MarkUnknown(conditionType, condition.Reason, condition.Message)
+		manager.MarkUnknown(conditionType, condition.Reason, condition.Message)
 	case condition.Status == v1.ConditionTrue:
 		// If reason or message are provided, we need to set them directly since MarkTrue doesn't support them
 		if condition.Reason != "" || condition.Message != "" {
-			// Get the condition manager to access the underlying conditions
-			manager := conditionSet.Manage(ss)
 			// First mark it true to set the basic state
 			manager.MarkTrue(conditionType)
 			// Then directly set the reason and message by finding and updating the condition
@@ -549,10 +651,10 @@ func (ss *InferenceServiceStatus) SetCondition(conditionType apis.ConditionType,
 				}
 			}
 		} else {
-			conditionSet.Manage(ss).MarkTrue(conditionType)
+			manager.MarkTrue(conditionType)
 		}
 	case condition.Status == v1.ConditionFalse:
-		conditionSet.Manage(ss).MarkFalse(conditionType, condition.Reason, condition.Message)
+		manager.MarkFalse(conditionType, condition.Reason, condition.Message)
 	}
 }
 

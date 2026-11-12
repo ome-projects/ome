@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -20,6 +21,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
@@ -49,6 +51,19 @@ func fdPolicy() *workload.ForceDeletePolicy {
 		OverdueSlack:             2 * time.Minute,
 		NodeUnreachableThreshold: 5 * time.Minute,
 	}
+}
+
+// fdSkipGracePolicy is fdPolicy with SkipGracePeriodOnUnreachableNode set.
+func fdSkipGracePolicy() *workload.ForceDeletePolicy {
+	policy := fdPolicy()
+	policy.SkipGracePeriodOnUnreachableNode = true
+	return policy
+}
+
+// fdClassify classifies pod at fdNow with c as both the cache and the
+// API server, as the escalation reads them once the cache has caught up.
+func fdClassify(c client.Reader, pod *corev1.Pod, policy *workload.ForceDeletePolicy) evidence.TerminatingResult {
+	return evidence.StuckTerminating(context.Background(), workload.NodeReaders{Cache: c, Live: c}, pod, policy, fdNow)
 }
 
 // fdFakeClient builds a fake client with the schemes the force-delete
@@ -214,7 +229,7 @@ func fdCountEvents(events []string, reason workload.EventReason) int {
 	return n
 }
 
-func fdLedgerEntries(t *testing.T, c client.Client, isvc *v1beta1.InferenceService) []audit.Entry {
+func fdAuditEntries(t *testing.T, c client.Client, isvc *v1beta1.InferenceService) []audit.Entry {
 	t.Helper()
 	ledger, err := audit.LoadLedgerForOwner(context.Background(), c, isvc)
 	if err != nil {
@@ -248,6 +263,18 @@ func TestForceDeleteRequeueTracksExactPolicyBoundaries(t *testing.T) {
 		want := fdNow.Add(time.Minute + time.Nanosecond)
 		if !next.Equal(want) || nodeGets != 0 {
 			t.Fatalf("next/node reads = %s/%d, want %s/0", next, nodeGets, want)
+		}
+	})
+
+	t.Run("node unreachable threshold inside the grace period, grace skipped", func(t *testing.T) {
+		pod := fdTerminatingPod("young-unreachable-in-grace", "node-a", fdNow.Add(9*time.Minute))
+		c := fdFakeClient(t, nil, fdNodeNotReady("node-a", 2*time.Minute))
+		next, err := escalateStuckTerminatingWithDeadline(context.Background(), workload.Deps{Client: c}, fdInput(isvc, fdSkipGracePolicy()), pod, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := fdNow.Add(3 * time.Minute); !next.Equal(want) {
+			t.Fatalf("next = %s, want %s, when the node has been unreachable for the threshold", next, want)
 		}
 	})
 
@@ -336,8 +363,8 @@ func TestForceDelete_NilPolicy_NoNodeReadsNoAction(t *testing.T) {
 	if err := escalateStuckTerminating(context.Background(), workload.Deps{Client: c}, fdInput(isvc, nil), pod, 0); err != nil {
 		t.Fatalf("escalate: %v", err)
 	}
-	// evidence helper with nil policy: NotConfigured before any read.
-	if res := evidence.StuckTerminating(context.Background(), c, pod, nil, fdNow); res.Kind != evidence.NotConfigured {
+	// the classifier with nil policy: NotConfigured before any read.
+	if res := fdClassify(c, pod, nil); res.Kind != evidence.NotConfigured {
 		t.Errorf("evidence kind: got %s want not-configured", res.Kind)
 	}
 	if nodeGets != 0 {
@@ -360,7 +387,7 @@ func TestForceDelete_WithinOwnGrace_NodeGone_Untouched(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod)) // node NOT seeded → NotFound if read
 	isvc := fdISVC("llama")
 
-	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	res := fdClassify(c, pod, fdPolicy())
 	if res.Kind != evidence.WithinGrace {
 		t.Errorf("evidence kind: got %s want within-grace", res.Kind)
 	}
@@ -374,8 +401,189 @@ func TestForceDelete_WithinOwnGrace_NodeGone_Untouched(t *testing.T) {
 	// Boundary: exactly at DeletionTimestamp+OverdueSlack is still
 	// within grace (predicate requires now strictly after).
 	boundary := fdTerminatingPod("wedge-1", "gone-node", fdNow.Add(-fdPolicy().OverdueSlack))
-	if res := evidence.StuckTerminating(context.Background(), c, boundary, fdPolicy(), fdNow); res.Kind != evidence.WithinGrace {
+	if res := fdClassify(c, boundary, fdPolicy()); res.Kind != evidence.WithinGrace {
 		t.Errorf("boundary evidence kind: got %s want within-grace", res.Kind)
+	}
+}
+
+// Invariant 2b: with SkipGracePeriodOnUnreachableNode, a pod inside its
+// own grace window goes at once when its node has been unreachable for
+// the threshold, and the event says how long before its own deletion
+// deadline it went. Without the switch the same pod waits, and no Node
+// is read for it.
+func TestForceDelete_InsideGrace_UnreachableNodeSkipsTheGracePeriod(t *testing.T) {
+	pod := fdTerminatingPod("drain-0", "lost-node", fdNow.Add(9*time.Minute))
+	for _, tc := range []struct {
+		name      string
+		policy    *workload.ForceDeletePolicy
+		deleted   bool
+		nodeReads int
+	}{
+		{name: "grace skipped", policy: fdSkipGracePolicy(), deleted: true, nodeReads: 2},
+		{name: "grace kept", policy: fdPolicy()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var deletes []recordedDeleteOpts
+			funcs := fdDeleteRecorder(&deletes)
+			nodeReads := 0
+			funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Node); ok {
+					nodeReads++
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			}
+			c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeUnreachable("lost-node", tc.policy.NodeUnreachableThreshold))
+			rec := record.NewFakeRecorder(16)
+
+			next, err := escalateStuckTerminatingWithDeadline(context.Background(), workload.Deps{Client: c, Recorder: rec}, fdInput(fdISVC("llama"), tc.policy), pod, 0)
+			if err != nil {
+				t.Fatalf("escalate: %v", err)
+			}
+			// One Client stands for both the cache and the API server here,
+			// so the screening read and the confirming read both land on it.
+			if nodeReads != tc.nodeReads {
+				t.Errorf("node reads: got %d want %d", nodeReads, tc.nodeReads)
+			}
+			events := fdDrainEvents(rec)
+			if !tc.deleted {
+				if want := pod.DeletionTimestamp.Add(tc.policy.OverdueSlack + time.Nanosecond); len(deletes) != 0 || len(events) != 0 || !next.Equal(want) {
+					t.Fatalf("deletes=%v events=%v next=%v, want nothing done until %v", deletes, events, next, want)
+				}
+				return
+			}
+			if len(deletes) != 1 || deletes[0].grace == nil || *deletes[0].grace != 0 || deletes[0].uid == nil || *deletes[0].uid != pod.UID {
+				t.Fatalf("deletes = %+v, want one grace-zero delete under the pod's UID", deletes)
+			}
+			if len(events) != 1 || !strings.Contains(events[0], "evidence=node-unreachable-taint, 9m0s before the pod's own deletion deadline") {
+				t.Errorf("events = %v, want one PodForceDeleted saying how long before its deadline the pod went", events)
+			}
+			if !next.IsZero() {
+				t.Errorf("next: got %v want zero, the pod is gone", next)
+			}
+		})
+	}
+}
+
+// Invariant 2c: inside the grace window the cached Node screens the pod
+// and the live Node decides. A Client cache that lags behind the API
+// server in either direction can delay the force-delete, never cause it,
+// and a node the cache shows reporting costs no API call.
+func TestForceDelete_InsideGrace_CacheScreensAndTheLiveNodeDecides(t *testing.T) {
+	pod := fdTerminatingPod("drain-0", "node-a", fdNow.Add(9*time.Minute))
+	threshold := fdSkipGracePolicy().NodeUnreachableThreshold
+	for _, tc := range []struct {
+		name         string
+		cached, live *corev1.Node
+		liveReads    int
+	}{
+		{name: "both copies report Ready", cached: fdNodeReady("node-a"), live: fdNodeReady("node-a")},
+		{name: "the cache still shows Ready", cached: fdNodeReady("node-a"), live: fdNodeUnreachable("node-a", threshold)},
+		{name: "the cache still shows the node unreachable", cached: fdNodeUnreachable("node-a", threshold), live: fdNodeReady("node-a"), liveReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var deletes []recordedDeleteOpts
+			cacheFuncs := fdDeleteRecorder(&deletes)
+			liveReads := 0
+			liveFuncs := interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Node); ok {
+					liveReads++
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			}}
+			deps := workload.Deps{
+				Client:    fdFakeClient(t, &cacheFuncs, fdStoredCopy(pod), tc.cached),
+				APIReader: fdFakeClient(t, &liveFuncs, fdStoredCopy(pod), tc.live),
+			}
+
+			next, err := escalateStuckTerminatingWithDeadline(context.Background(), deps, fdInput(fdISVC("llama"), fdSkipGracePolicy()), pod, 0)
+			if err != nil {
+				t.Fatalf("escalate: %v", err)
+			}
+			if len(deletes) != 0 || liveReads != tc.liveReads {
+				t.Fatalf("deletes=%v live node reads=%d, want no delete and %d live read(s)", deletes, liveReads, tc.liveReads)
+			}
+			if want := pod.DeletionTimestamp.Add(fdPolicy().OverdueSlack + time.Nanosecond); !next.Equal(want) {
+				t.Errorf("next = %v, want the end of the grace period %v", next, want)
+			}
+		})
+	}
+}
+
+// Invariant 2d: the PodForceDeleted event names what the node shows and
+// how far the pod was from its own deletion deadline. Past the deadline
+// plus the slack, the text is the same with the switch on or off, and
+// NodeReady Unknown reads node-not-ready. Before that, only the switch
+// lets the pod go, and the text says OME did not wait. There NodeReady
+// Unknown reads node-ready-unknown, so an early force-delete never names
+// the NotReady that keeps a pod waiting.
+func TestForceDelete_EventNamesTheNodeStateAndTheDeadline(t *testing.T) {
+	threshold := fdPolicy().NodeUnreachableThreshold
+	insideGrace := fdNow.Add(9 * time.Minute)
+	insideSlack := fdNow.Add(-time.Minute)
+	const (
+		waited = "force-deleted stuck-Terminating pod drain-0 on node lost-node (evidence="
+		early  = "force-deleted Terminating pod drain-0 on node lost-node without waiting for its deletion deadline plus overdueSlack, because skipGracePeriodOnUnreachableNode is set (evidence="
+	)
+	for _, tc := range []struct {
+		name     string
+		policy   *workload.ForceDeletePolicy
+		deadline time.Time
+		node     *corev1.Node
+		suffix   string
+	}{
+		{"past the deadline plus the slack, grace kept", fdPolicy(), overdueTS, fdNodeNotReady("lost-node", threshold), waited + "node-not-ready, 10m0s past the pod's own deletion deadline)"},
+		{"past the deadline plus the slack, grace skipped", fdSkipGracePolicy(), overdueTS, fdNodeNotReady("lost-node", threshold), waited + "node-not-ready, 10m0s past the pod's own deletion deadline)"},
+		{"past the deadline inside the slack, grace skipped", fdSkipGracePolicy(), insideSlack, fdNodeNotReady("lost-node", threshold), early + "node-ready-unknown, 1m0s past the pod's own deletion deadline)"},
+		{"exactly at the deadline, grace skipped", fdSkipGracePolicy(), fdNow, fdNodeNotReady("lost-node", threshold), early + "node-ready-unknown, 0s past the pod's own deletion deadline)"},
+		{"inside the grace period, NodeReady Unknown", fdSkipGracePolicy(), insideGrace, fdNodeNotReady("lost-node", threshold), early + "node-ready-unknown, 9m0s before the pod's own deletion deadline)"},
+		{"inside the grace period, unreachable taint", fdSkipGracePolicy(), insideGrace, fdNodeUnreachable("lost-node", threshold), early + "node-unreachable-taint, 9m0s before the pod's own deletion deadline)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := fdTerminatingPod("drain-0", "lost-node", tc.deadline)
+			c := fdFakeClient(t, nil, fdStoredCopy(pod), tc.node)
+			rec := record.NewFakeRecorder(4)
+			if _, err := escalateStuckTerminatingWithDeadline(context.Background(), workload.Deps{Client: c, Recorder: rec}, fdInput(fdISVC("llama"), tc.policy), pod, 0); err != nil {
+				t.Fatalf("escalate: %v", err)
+			}
+			if events := fdDrainEvents(rec); len(events) != 1 || !strings.HasSuffix(events[0], tc.suffix) {
+				t.Errorf("events = %v, want one PodForceDeleted ending %q", events, tc.suffix)
+			}
+		})
+	}
+}
+
+// Invariant 2e: a Node read that fails inside the grace period keeps the
+// pod waiting for its deletion deadline plus the slack, and does not fail
+// the pass. OME logs it at verbosity 1 with the pod, the node and the
+// error, so an operator can see why the grace period was not skipped.
+func TestForceDelete_InsideGrace_FailedNodeReadIsLoggedAndThePodWaits(t *testing.T) {
+	var logged strings.Builder
+	ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) {
+		logged.WriteString(prefix + " " + args + "\n")
+	}, funcr.Options{Verbosity: 1}))
+	pod := fdTerminatingPod("drain-0", "lost-node", fdNow.Add(9*time.Minute))
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Node); ok {
+			return errors.New("cache not synced")
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeUnreachable("lost-node", 10*time.Minute))
+
+	next, err := escalateStuckTerminatingWithDeadline(ctx, workload.Deps{Client: c, Recorder: record.NewFakeRecorder(4)}, fdInput(fdISVC("llama"), fdSkipGracePolicy()), pod, 0)
+	if err != nil {
+		t.Fatalf("escalate: %v, want the pod kept waiting and the pass not failed", err)
+	}
+	if want := pod.DeletionTimestamp.Add(fdPolicy().OverdueSlack + time.Nanosecond); len(deletes) != 0 || !next.Equal(want) {
+		t.Fatalf("deletes=%v next=%v, want no delete and the pod waiting until %v", deletes, next, want)
+	}
+	out := logged.String()
+	for _, want := range []string{"could not be read", `"pod"="drain-0"`, `"node"="lost-node"`, `"error"="cache not synced"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log %q lacks %q", out, want)
+		}
 	}
 }
 
@@ -388,7 +596,7 @@ func TestForceDelete_Overdue_NodeReady_Untouched(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeReady("healthy-node"))
 	isvc := fdISVC("llama")
 
-	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	res := fdClassify(c, pod, fdPolicy())
 	if res.Kind != evidence.NodeHealthy {
 		t.Errorf("evidence kind: got %s want node-healthy", res.Kind)
 	}
@@ -413,7 +621,7 @@ func TestForceDelete_Overdue_EvidenceYoungerThanThreshold_Untouched(t *testing.T
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeNotReady("dying-node", 2*time.Minute))
 	isvc := fdISVC("llama")
 
-	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	res := fdClassify(c, pod, fdPolicy())
 	if res.Kind != evidence.NodeNotDeadLongEnough {
 		t.Errorf("evidence kind: got %s want node-not-dead-long-enough", res.Kind)
 	}
@@ -426,7 +634,7 @@ func TestForceDelete_Overdue_EvidenceYoungerThanThreshold_Untouched(t *testing.T
 
 	// Young taint (2m < 5m threshold) on a separate client.
 	cTaint := fdFakeClient(t, nil, fdNodeUnreachable("dying-node", 2*time.Minute))
-	if res := evidence.StuckTerminating(context.Background(), cTaint, pod, fdPolicy(), fdNow); res.Kind != evidence.NodeNotDeadLongEnough {
+	if res := fdClassify(cTaint, pod, fdPolicy()); res.Kind != evidence.NodeNotDeadLongEnough {
 		t.Errorf("young-taint evidence kind: got %s want node-not-dead-long-enough", res.Kind)
 	}
 	// Taint with nil TimeAdded can't prove the threshold elapsed.
@@ -434,7 +642,7 @@ func TestForceDelete_Overdue_EvidenceYoungerThanThreshold_Untouched(t *testing.T
 	nilAdded.Spec.Taints[0].TimeAdded = nil
 	nilAdded.Status.Conditions[0].LastTransitionTime = metav1.NewTime(fdNow.Add(-time.Minute))
 	cNil := fdFakeClient(t, nil, nilAdded)
-	if res := evidence.StuckTerminating(context.Background(), cNil, pod, fdPolicy(), fdNow); res.Kind != evidence.NodeNotDeadLongEnough {
+	if res := fdClassify(cNil, pod, fdPolicy()); res.Kind != evidence.NodeNotDeadLongEnough {
 		t.Errorf("nil-TimeAdded evidence kind: got %s want node-not-dead-long-enough", res.Kind)
 	}
 }
@@ -449,7 +657,7 @@ func TestForceDelete_Overdue_OldUnreachableTaint_DeletedWithOptions(t *testing.T
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), fdNodeUnreachable("dead-node", 10*time.Minute))
 	isvc := fdISVC("llama")
 
-	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	res := fdClassify(c, pod, fdPolicy())
 	if res.Kind != evidence.NodeUnreachableTaint {
 		t.Fatalf("evidence kind: got %s want node-unreachable-taint", res.Kind)
 	}
@@ -500,7 +708,7 @@ func TestForceDelete_StaleTaintOnRecoveredNode_ReadyTrueVetoes(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod), node)
 	isvc := fdISVC("llama")
 
-	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	res := fdClassify(c, pod, fdPolicy())
 	if res.Kind != evidence.NodeHealthy {
 		t.Errorf("evidence kind: got %s want node-healthy (Ready=True must veto the stale taint)", res.Kind)
 	}
@@ -517,7 +725,7 @@ func TestForceDelete_StaleTaintOnRecoveredNode_ReadyTrueVetoes(t *testing.T) {
 	// Companion: same-age taint, Ready=Unknown just as old — the genuine
 	// dead node. Still actionable.
 	cDead := fdFakeClient(t, nil, fdNodeUnreachable("recovered-node", 10*time.Minute))
-	if res := evidence.StuckTerminating(context.Background(), cDead, pod, fdPolicy(), fdNow); res.Kind != evidence.NodeUnreachableTaint {
+	if res := fdClassify(cDead, pod, fdPolicy()); res.Kind != evidence.NodeUnreachableTaint {
 		t.Errorf("dead-node evidence kind: got %s want node-unreachable-taint", res.Kind)
 	}
 }
@@ -530,7 +738,7 @@ func TestForceDelete_Overdue_NodeGone_Deleted(t *testing.T) {
 	c := fdFakeClient(t, &funcs, fdStoredCopy(pod)) // no node object
 	isvc := fdISVC("llama")
 
-	res := evidence.StuckTerminating(context.Background(), c, pod, fdPolicy(), fdNow)
+	res := fdClassify(c, pod, fdPolicy())
 	if res.Kind != evidence.NodeGone {
 		t.Fatalf("evidence kind: got %s want node-gone", res.Kind)
 	}
@@ -544,13 +752,13 @@ func TestForceDelete_Overdue_NodeGone_Deleted(t *testing.T) {
 	// Overdue + NotReady long enough is the third actionable branch.
 	pod2 := fdTerminatingPod("wedge-1", "notready-node", overdueTS)
 	c2 := fdFakeClient(t, nil, fdNodeNotReady("notready-node", 10*time.Minute))
-	if res := evidence.StuckTerminating(context.Background(), c2, pod2, fdPolicy(), fdNow); res.Kind != evidence.NodeNotReady {
+	if res := fdClassify(c2, pod2, fdPolicy()); res.Kind != evidence.NodeNotReady {
 		t.Errorf("evidence kind: got %s want node-not-ready", res.Kind)
 	}
 
 	// Unscheduled pod: nothing to prove dead — never actionable.
 	pod3 := fdTerminatingPod("wedge-2", "", overdueTS)
-	if res := evidence.StuckTerminating(context.Background(), c2, pod3, fdPolicy(), fdNow); res.Kind != evidence.Unscheduled {
+	if res := fdClassify(c2, pod3, fdPolicy()); res.Kind != evidence.Unscheduled {
 		t.Errorf("evidence kind: got %s want unscheduled", res.Kind)
 	}
 }
@@ -581,7 +789,7 @@ func TestForceDelete_ForeignFinalizer_ReportOnceNoSpam(t *testing.T) {
 	if n := fdCountEvents(events, workload.EventReasonPodDeleteBlockedByFinalizer); n != 1 {
 		t.Errorf("finalizer warnings: got %d want 1 (events=%v)", n, events)
 	}
-	entries := fdLedgerEntries(t, c, isvc)
+	entries := fdAuditEntries(t, c, isvc)
 	if len(entries) != 1 {
 		t.Fatalf("ledger entries: got %d want 1", len(entries))
 	}
@@ -594,7 +802,7 @@ func TestForceDelete_ForeignFinalizer_ReportOnceNoSpam(t *testing.T) {
 
 // Invariant 8: UID-precondition conflict and pod-already-gone are both
 // success — the wedge object is gone or a successor exists; no error,
-// no event, no ledger entry.
+// no event, no audit row.
 func TestForceDelete_PreconditionConflictAndNotFound_Success(t *testing.T) {
 	isvc := fdISVC("llama")
 	pod := fdTerminatingPod("wedge-0", "gone-node", overdueTS)
@@ -614,7 +822,7 @@ func TestForceDelete_PreconditionConflictAndNotFound_Success(t *testing.T) {
 	if events := fdDrainEvents(recConflict); len(events) != 0 {
 		t.Errorf("conflict path events: %v", events)
 	}
-	if entries := fdLedgerEntries(t, cConflict, isvc); len(entries) != 0 {
+	if entries := fdAuditEntries(t, cConflict, isvc); len(entries) != 0 {
 		t.Errorf("conflict path ledger entries: %d", len(entries))
 	}
 
@@ -627,7 +835,7 @@ func TestForceDelete_PreconditionConflictAndNotFound_Success(t *testing.T) {
 	if events := fdDrainEvents(recGone); len(events) != 0 {
 		t.Errorf("NotFound path events: %v", events)
 	}
-	if entries := fdLedgerEntries(t, cGone, isvc); len(entries) != 0 {
+	if entries := fdAuditEntries(t, cGone, isvc); len(entries) != 0 {
 		t.Errorf("NotFound path ledger entries: %d", len(entries))
 	}
 }
@@ -657,7 +865,7 @@ func TestForceDelete_ActionRecordsOnce_NoDoubleLedgerOnReplay(t *testing.T) {
 	if n := fdCountEvents(events, workload.EventReasonPodForceDeleted); n != 1 {
 		t.Errorf("PodForceDeleted events: got %d want 1 (events=%v)", n, events)
 	}
-	entries := fdLedgerEntries(t, c, isvc)
+	entries := fdAuditEntries(t, c, isvc)
 	if len(entries) != 1 {
 		t.Fatalf("ledger entries: got %d want 1: %+v", len(entries), entries)
 	}
@@ -1174,8 +1382,167 @@ func TestForceDelete_LedgerCreateRefused_PodGoneAndRowLost(t *testing.T) {
 			if n := fdCountEvents(fdDrainEvents(rec), workload.EventReasonPodForceDeleted); n != 1 {
 				t.Errorf("PodForceDeleted events: got %d want 1", n)
 			}
-			if entries := fdLedgerEntries(t, c, isvc); len(entries) != 0 {
+			if entries := fdAuditEntries(t, c, isvc); len(entries) != 0 {
 				t.Errorf("ledger entries = %+v, want none: the refused row is not written again", entries)
+			}
+		})
+	}
+}
+
+// fdNeverRanPod fabricates a pod the scheduler bound to node that its
+// kubelet has run nothing of: Pending with no container status, as a
+// kubelet that stopped before the first start leaves it.
+func fdNeverRanPod(name, node, uid string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "prod", UID: k8stypes.UID(uid)},
+		Spec:       corev1.PodSpec{NodeName: node, Containers: []corev1.Container{{Name: "main", Image: "test:v1"}}},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+}
+
+// A repair's rebuilt pod that never ran a container is removed once the
+// node under it has read unreachable or NotReady for the policy's
+// threshold: grace zero under the pod's UID, an event that says the pod
+// never ran and what the node reads, and an audit row. A pod whose node is
+// inside the threshold waits until the node comes of age, a pod on a node
+// that posts Ready waits, a pod whose Node object is missing is not this
+// rule's (it has no age to measure), and a pod that ran a container keeps
+// its name whatever its node reads.
+func TestForceDeleteNeverRanPods_RemovesOnlyPodsThatNeverRanOnALostNode(t *testing.T) {
+	threshold := fdPolicy().NodeUnreachableThreshold
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+
+	notReady := fdNeverRanPod("rebuilt-0", "lost-node", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001")
+	young := fdNeverRanPod("rebuilt-1", "young-node", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0002")
+	gone := fdNeverRanPod("rebuilt-2", "gone-node", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0003")
+	ran := fdNeverRanPod("rebuilt-3", "lost-node", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0004")
+	ran.Status.Phase = corev1.PodRunning
+	ran.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "main", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}
+	live := fdNeverRanPod("rebuilt-4", "live-node", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0005")
+
+	isvc := fdISVC("llama")
+	c := fdFakeClient(t, &funcs, notReady, young, gone, ran, live,
+		fdNodeNotReady("lost-node", threshold), fdNodeNotReady("young-node", threshold/2), fdNodeReady("live-node"))
+	rec := record.NewFakeRecorder(8)
+
+	removed, nextAt, err := forceDeleteNeverRanPodsOnNodeDeath(context.Background(), workload.Deps{Client: c, Recorder: rec},
+		fdInput(isvc, fdPolicy()), 0, []*corev1.Pod{notReady, young, gone, ran, live})
+	if err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if !removed {
+		t.Fatalf("removed = false, want true")
+	}
+	if want := fdNow.Add(threshold / 2); !nextAt.Equal(want) {
+		t.Errorf("nextAt = %v, want %v, when the young node comes of age", nextAt, want)
+	}
+	var names []string
+	for _, d := range deletes {
+		names = append(names, d.name)
+		if d.grace == nil || *d.grace != 0 || d.uid == nil {
+			t.Errorf("delete of %s: grace %v uid %v, want grace 0 under the pod's UID", d.name, d.grace, d.uid)
+		}
+	}
+	if strings.Join(names, ",") != "rebuilt-0" {
+		t.Fatalf("deleted %v, want rebuilt-0 alone (NotReady past the threshold)", names)
+	}
+	want := "force-deleted pod rebuilt-0, which never ran a container, because node lost-node has read NotReady for at least 5m0s (reading=node-not-ready); the repair rebuilds it on another node"
+	if events := fdDrainEvents(rec); len(events) != 1 || !strings.Contains(events[0], want) {
+		t.Errorf("events = %q, want one PodForceDeleted containing %q", events, want)
+	}
+	if entries := fdAuditEntries(t, c, isvc); len(entries) != 1 {
+		t.Errorf("audit rows = %d, want 1", len(entries))
+	}
+}
+
+// Without a force-delete policy no Node is read and no pod is touched: a
+// pod that never ran waits for its kubelet like any other.
+func TestForceDeleteNeverRanPods_NilPolicyReadsNothing(t *testing.T) {
+	nodeGets := 0
+	var deletes []recordedDeleteOpts
+	funcs := fdDeleteRecorder(&deletes)
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*corev1.Node); ok {
+			nodeGets++
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	pod := fdNeverRanPod("rebuilt-0", "gone-node", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001")
+	c := fdFakeClient(t, &funcs, pod)
+	removed, nextAt, err := forceDeleteNeverRanPodsOnNodeDeath(context.Background(), workload.Deps{Client: c}, fdInput(fdISVC("llama"), nil), 0, []*corev1.Pod{pod})
+	if err != nil || removed || !nextAt.IsZero() {
+		t.Fatalf("removed=%v nextAt=%v err=%v, want nothing removed, no requeue and no error", removed, nextAt, err)
+	}
+	if nodeGets != 0 || len(deletes) != 0 {
+		t.Errorf("node reads %d, deletes %d, want 0 and 0", nodeGets, len(deletes))
+	}
+}
+
+// A repair visits a rebuilt pod that has not started on every pass, so
+// the node under it is read from the informer cache and the live reader
+// is asked only once the cache shows the threshold passed. A node the
+// cache shows Ready, or NotReady for less than the threshold, costs no
+// live read and the pod stays, with the next pass asked for when the
+// cache's reading can change; a node the cache shows NotReady for the
+// threshold costs one live read, and the live copy decides: it agrees
+// and the pod goes, with its event and audit row, or it reports Ready
+// and the pod stays.
+func TestForceDeleteNeverRanPods_CacheScreensAndTheLiveNodeDecides(t *testing.T) {
+	threshold := fdPolicy().NodeUnreachableThreshold
+	for _, tc := range []struct {
+		name         string
+		cached, live *corev1.Node
+		liveReads    int
+		removed      bool
+		nextAt       time.Time
+	}{
+		{name: "the cache shows the node Ready", cached: fdNodeReady("node-a"), live: fdNodeNotReady("node-a", threshold), nextAt: fdNow.Add(threshold)},
+		{name: "the cache shows the node NotReady inside the threshold", cached: fdNodeNotReady("node-a", threshold/2), live: fdNodeNotReady("node-a", threshold), nextAt: fdNow.Add(threshold / 2)},
+		{name: "the cache shows the threshold passed and the live node agrees", cached: fdNodeNotReady("node-a", threshold), live: fdNodeNotReady("node-a", threshold), liveReads: 1, removed: true},
+		{name: "the cache shows the threshold passed and the live node reports Ready", cached: fdNodeNotReady("node-a", threshold), live: fdNodeReady("node-a"), liveReads: 1, nextAt: fdNow.Add(threshold)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := fdNeverRanPod("rebuilt-0", "node-a", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001")
+			var deletes []recordedDeleteOpts
+			cacheFuncs := fdDeleteRecorder(&deletes)
+			liveReads := 0
+			liveFuncs := interceptor.Funcs{Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*corev1.Node); ok {
+					liveReads++
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			}}
+			isvc := fdISVC("llama")
+			rec := record.NewFakeRecorder(4)
+			deps := workload.Deps{
+				Client:    fdFakeClient(t, &cacheFuncs, pod, tc.cached),
+				APIReader: fdFakeClient(t, &liveFuncs, tc.live),
+				Recorder:  rec,
+			}
+
+			removed, nextAt, err := forceDeleteNeverRanPodsOnNodeDeath(context.Background(), deps, fdInput(isvc, fdPolicy()), 0, []*corev1.Pod{pod})
+			if err != nil {
+				t.Fatalf("remove: %v", err)
+			}
+			if liveReads != tc.liveReads {
+				t.Errorf("live node reads = %d, want %d", liveReads, tc.liveReads)
+			}
+			if removed != tc.removed || (len(deletes) == 1) != tc.removed {
+				t.Errorf("removed = %v with deletes %v, want removed %v", removed, deletes, tc.removed)
+			}
+			if !nextAt.Equal(tc.nextAt) {
+				t.Errorf("nextAt = %v, want %v", nextAt, tc.nextAt)
+			}
+			wantEvents, wantRows := 0, 0
+			if tc.removed {
+				wantEvents, wantRows = 1, 1
+			}
+			if events := fdDrainEvents(rec); len(events) != wantEvents {
+				t.Errorf("events = %q, want %d", events, wantEvents)
+			}
+			if rows := fdAuditEntries(t, deps.Client, isvc); len(rows) != wantRows {
+				t.Errorf("audit rows = %d, want %d", len(rows), wantRows)
 			}
 		})
 	}

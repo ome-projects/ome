@@ -2,9 +2,6 @@ package replicator
 
 import (
 	"path/filepath"
-	"time"
-
-	"sigs.k8s.io/ome/pkg/xet"
 
 	"sigs.k8s.io/ome/internal/ome-agent/replica/common"
 	"sigs.k8s.io/ome/pkg/logging"
@@ -12,25 +9,15 @@ import (
 
 type HFToPVCReplicator struct {
 	Logger           logging.Interface
-	Config           HFToPVCReplicatorConfig
+	Dependencies     Dependencies
 	ReplicationInput common.ReplicationInput
-}
-
-type HFToPVCReplicatorConfig struct {
-	LocalPath                      string
-	HubClient                      *xet.Client
-	HFDownloadTimeout              time.Duration
-	HFDownloadStaleProgressTimeout time.Duration
 }
 
 func (r *HFToPVCReplicator) Replicate(objects []common.ReplicationObject) error {
 	r.Logger.Info("Starting replication to target")
 
-	targetDirPath := filepath.Join(r.Config.LocalPath, r.ReplicationInput.Target.Prefix)
-	downloadPath, err := downloadFromHFFunc(r.ReplicationInput, r.Config.HubClient, targetDirPath, hfDownloadOptions{
-		DownloadTimeout:      r.Config.HFDownloadTimeout,
-		StaleProgressTimeout: r.Config.HFDownloadStaleProgressTimeout,
-	}, r.Logger)
+	targetDirPath := filepath.Join(r.Dependencies.LocalPath, r.ReplicationInput.Target.Prefix)
+	downloadPath, err := downloadFromHF(r.ReplicationInput, r.Dependencies, targetDirPath, r.Logger)
 	if err != nil {
 		r.Logger.Errorf("Failed to download model %s from HuggingFace: %v", r.ReplicationInput.Source.BucketName, err)
 		return err

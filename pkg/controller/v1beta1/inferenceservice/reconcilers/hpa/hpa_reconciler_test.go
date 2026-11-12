@@ -10,13 +10,12 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"knative.dev/pkg/ptr"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/ownedscaler"
 	"sigs.k8s.io/ome/pkg/utils/testing/fakeclient"
-	"sigs.k8s.io/ome/pkg/webhook/admission/isvc"
 )
 
 // TestCreateHPAFromComponentExt exercises the Raw Deployment path: the
@@ -84,7 +83,7 @@ func TestCreateHPAFromComponentExt(t *testing.T) {
 				},
 			},
 			componentExt: &v1beta1.ComponentExtensionSpec{
-				MinReplicas: isvc.GetIntReference(2),
+				MinReplicas: ptr.To(2),
 				MaxReplicas: 5,
 				Autoscaler: &v1beta1.ComponentAutoscaler{
 					Class: v1beta1.AutoscalerHPA,
@@ -110,7 +109,7 @@ func TestCreateHPAFromComponentExt(t *testing.T) {
 		"predictorAutoscalerCPU50": {
 			objectMeta: metav1.ObjectMeta{},
 			componentExt: &v1beta1.ComponentExtensionSpec{
-				MinReplicas: isvc.GetIntReference(5),
+				MinReplicas: ptr.To(5),
 				MaxReplicas: 10,
 				Autoscaler: &v1beta1.ComponentAutoscaler{
 					Class: v1beta1.AutoscalerHPA,
@@ -123,7 +122,7 @@ func TestCreateHPAFromComponentExt(t *testing.T) {
 		"invalidinputhpa": {
 			objectMeta: metav1.ObjectMeta{},
 			componentExt: &v1beta1.ComponentExtensionSpec{
-				MinReplicas: isvc.GetIntReference(0),
+				MinReplicas: ptr.To(0),
 				MaxReplicas: -10,
 				Autoscaler: &v1beta1.ComponentAutoscaler{
 					Class: v1beta1.AutoscalerHPA,
@@ -141,7 +140,7 @@ func TestCreateHPAFromComponentExt(t *testing.T) {
 			},
 			// No Autoscaler block — annotation drives the metric.
 			componentExt: &v1beta1.ComponentExtensionSpec{
-				MinReplicas: isvc.GetIntReference(1),
+				MinReplicas: ptr.To(1),
 				MaxReplicas: 3,
 			},
 		},
@@ -414,7 +413,7 @@ func TestCreateHPA_ComponentExtShim_Identical(t *testing.T) {
 	}
 	utilization := int32(55)
 	componentExt := &v1beta1.ComponentExtensionSpec{
-		MinReplicas: isvc.GetIntReference(3),
+		MinReplicas: ptr.To(3),
 		MaxReplicas: 7,
 		Autoscaler: &v1beta1.ComponentAutoscaler{
 			Class: v1beta1.AutoscalerHPA,
@@ -479,70 +478,70 @@ func TestMatchesComparesManagedMetadataSpecAndController(t *testing.T) {
 
 	assert.False(t, kind.Matches(
 		&autoscalingv2.HorizontalPodAutoscaler{
-			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
-			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(4)},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](4)},
 		}))
 
 	assert.False(t, kind.Matches(
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{constants.AutoscalerClass: "hpa"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{constants.AutoscalerClass: "external"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		}))
 
 	assert.False(t, kind.Matches(
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{constants.AutoscalerClass: "external"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		}))
 
 	assert.True(t, kind.Matches(
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{constants.AutoscalerClass: "hpa"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{constants.AutoscalerClass: "hpa"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		}))
 
 	assert.True(t, kind.Matches(
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		}))
 
 	assert.False(t, kind.Matches(
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"unrelated": "true"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{"unrelated": "false"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		}))
 
 	assert.False(t, kind.Matches(
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"component": "engine"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"component": "decoder"}},
-			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		}))
 
 	assert.True(t, kind.Matches(
@@ -551,7 +550,7 @@ func TestMatchesComparesManagedMetadataSpecAndController(t *testing.T) {
 				Labels:      map[string]string{"component": "engine"},
 				Annotations: map[string]string{"example.com/managed": "true"},
 			},
-			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		},
 		&autoscalingv2.HorizontalPodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{
@@ -564,7 +563,7 @@ func TestMatchesComparesManagedMetadataSpecAndController(t *testing.T) {
 					"example.com/injected": "keep",
 				},
 			},
-			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.Int32(3)},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{MinReplicas: ptr.To[int32](3)},
 		}))
 
 	controller := true
@@ -716,7 +715,7 @@ func TestMatchesIgnoresServerDefaultedBehavior(t *testing.T) {
 
 	baseSpec := func(behavior *autoscalingv2.HorizontalPodAutoscalerBehavior) autoscalingv2.HorizontalPodAutoscalerSpec {
 		return autoscalingv2.HorizontalPodAutoscalerSpec{
-			MinReplicas: ptr.Int32(1),
+			MinReplicas: ptr.To[int32](1),
 			MaxReplicas: 5,
 			Behavior:    behavior,
 		}
@@ -742,7 +741,7 @@ func TestMatchesIgnoresServerDefaultedBehavior(t *testing.T) {
 		desired := &autoscalingv2.HorizontalPodAutoscaler{Spec: baseSpec(nil)}
 		existing := &autoscalingv2.HorizontalPodAutoscaler{
 			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
-				MinReplicas: ptr.Int32(2), // drift
+				MinReplicas: ptr.To[int32](2), // drift
 				MaxReplicas: 5,
 				Behavior:    serverDefaulted,
 			},
@@ -755,7 +754,7 @@ func TestMatchesIgnoresServerDefaultedBehavior(t *testing.T) {
 		desired := &autoscalingv2.HorizontalPodAutoscaler{Spec: baseSpec(serverDefaulted)}
 		existing := &autoscalingv2.HorizontalPodAutoscaler{
 			Spec: baseSpec(&autoscalingv2.HorizontalPodAutoscalerBehavior{
-				ScaleDown: &autoscalingv2.HPAScalingRules{StabilizationWindowSeconds: ptr.Int32(60)},
+				ScaleDown: &autoscalingv2.HPAScalingRules{StabilizationWindowSeconds: ptr.To[int32](60)},
 			}),
 		}
 		assert.False(t, kind.Matches(desired, existing),

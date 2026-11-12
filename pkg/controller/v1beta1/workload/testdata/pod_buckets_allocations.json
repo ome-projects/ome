@@ -1,0 +1,34 @@
+{
+  "recordedOn": {
+    "date": "2026-11-09",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The readers of a pass's pods at rest, at 1,000 and 4,000 single-pod Instances, 160 gangs of eight and 1,725 gangs of two: the plan's observation over a list no reader of the pass has read yet, which buckets the pods by Instance (query.BucketPodsByInstanceIdx) and keeps the observation's own records, 16 / 28 / 14 / 16 allocations and 103 KB / 410 KB / 31 KB / 146 KB; the create pass over the list the observation read, which buckets the list again and keeps its records of every Instance's finish, 32 / 48 / 28 / 34 allocations and 483 KB / 1.93 MB / 95 KB / 811 KB; and the two in the order a pass runs them over a list no reader has read yet, 48 / 76 / 42 / 50 allocations and 585 KB / 2.34 MB / 127 KB / 957 KB. Every row is Ready on the spec revision with its pods serving, so the create pass lists nothing and writes nothing; its batch of finishes, every one unchanged on the pass's copy, is answered with no attempt, as the controller's writer answers it. Re-recorded with the pass's list handing its buckets to every reader that asks for the same list: the create pass reads the buckets the observation built instead of bucketing the list again, 32 / 48 / 28 / 34 to 23 / 27 / 21 / 25 allocations and 483 KB / 1.93 MB / 95 KB / 811 KB to 380 KB / 1.52 MB / 64 KB / 665 KB, and the two readers over a fresh list bucket it once, 48 / 76 / 42 / 50 to 39 / 55 / 35 / 41 allocations and 585 KB / 2.34 MB / 127 KB / 957 KB to 483 KB / 1.93 MB / 95 KB / 811 KB; the observation stands as recorded but for the 16 bytes of the list's record of its buckets.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/create-pass/allocations": 23,
+    "1000x1/create-pass/bytes": 379984,
+    "1000x1/observation-then-create-pass/allocations": 39,
+    "1000x1/observation-then-create-pass/bytes": 482688,
+    "1000x1/observation/allocations": 16,
+    "1000x1/observation/bytes": 102704,
+    "160x8/create-pass/allocations": 21,
+    "160x8/create-pass/bytes": 63824,
+    "160x8/observation-then-create-pass/allocations": 35,
+    "160x8/observation-then-create-pass/bytes": 95320,
+    "160x8/observation/allocations": 14,
+    "160x8/observation/bytes": 31496,
+    "1725x2/create-pass/allocations": 25,
+    "1725x2/create-pass/bytes": 664656,
+    "1725x2/observation-then-create-pass/allocations": 41,
+    "1725x2/observation-then-create-pass/bytes": 811136,
+    "1725x2/observation/allocations": 16,
+    "1725x2/observation/bytes": 146480,
+    "4000x1/create-pass/allocations": 27,
+    "4000x1/create-pass/bytes": 1524816,
+    "4000x1/observation-then-create-pass/allocations": 55,
+    "4000x1/observation-then-create-pass/bytes": 1934960,
+    "4000x1/observation/allocations": 28,
+    "4000x1/observation/bytes": 410144
+  }
+}

@@ -82,6 +82,9 @@ type options struct {
 	// leaderElectionTiming is supplied by the chart, because the margin a leader
 	// needs depends on the apiserver latency of the cluster.
 	leaderElectionTiming leaderelection.Timing
+	// leaderElectionReleaseOnCancel gives up the leader lease at the end of a
+	// graceful stop, so a standby takes over without waiting for it to expire.
+	leaderElectionReleaseOnCancel bool
 	// maxTreeDepth bounds a node's distance from the root, in edges. Zero
 	// disables the check rather than assuming a bound.
 	maxTreeDepth int
@@ -127,7 +130,39 @@ type options struct {
 	webhookConfigName      string
 	caName                 string
 	caOrganization         string
+	clusterDomain          string
 	zapOpts                zap.Options
+}
+
+// validateLeaderElectionTiming refuses a leader election the elector would
+// reject, or one under which a stopping leader's release could let two quota
+// managers act at once (leaderelection.Settings).
+func (o *options) validateLeaderElectionTiming() error {
+	return leaderelection.Settings{
+		Enabled:         o.enableLeaderElection,
+		ReleaseOnCancel: o.leaderElectionReleaseOnCancel,
+		Timing:          o.leaderElectionTiming,
+	}.Validate()
+}
+
+// managerOptions is the controller-runtime configuration the flags describe.
+func (o *options) managerOptions() ctrl.Options {
+	mgrOpts := ctrl.Options{
+		Scheme:                        scheme,
+		Metrics:                       metricsserver.Options{BindAddress: o.metricsAddr},
+		HealthProbeBindAddress:        o.probeAddr,
+		LeaderElection:                o.enableLeaderElection,
+		LeaderElectionID:              o.leaderElectionID,
+		LeaderElectionReleaseOnCancel: o.leaderElectionReleaseOnCancel,
+	}
+	o.leaderElectionTiming.Apply(&mgrOpts)
+	if o.enableWebhook {
+		mgrOpts.WebhookServer = webhook.NewServer(webhook.Options{
+			Port:    o.webhookPort,
+			CertDir: o.webhookCertDir,
+		})
+	}
+	return mgrOpts
 }
 
 func main() {
@@ -159,6 +194,7 @@ func main() {
 	flag.StringVar(&opts.leaderElectionID, "leader-election-id", opts.leaderElectionID,
 		"Name of the leader-election lock.")
 	opts.leaderElectionTiming.BindFlags(flag.CommandLine)
+	leaderelection.BindReleaseOnCancel(flag.CommandLine, &opts.leaderElectionReleaseOnCancel)
 	flag.IntVar(&opts.maxTreeDepth, "max-tree-depth", opts.maxTreeDepth,
 		"Greatest permitted distance from the root, in edges (the root is 0, a top-tier grouping "+
 			"is 1). 0 disables the depth check rather than assuming a bound.")
@@ -256,6 +292,10 @@ func main() {
 		"ValidatingWebhookConfiguration to inject the generated caBundle into.")
 	flag.StringVar(&opts.caName, "ca-name", opts.caName,
 		"Common name of the generated CA.")
+	flag.StringVar(&opts.clusterDomain, "cluster-domain", opts.clusterDomain,
+		"The cluster's DNS domain (\"cluster.local\" on most clusters). The internally managed "+
+			"webhook certificate then also covers the fully qualified <service>.<namespace>.svc.<domain> "+
+			"name. No built-in value: empty covers only <service>.<namespace>.svc, the name the apiserver dials.")
 	flag.StringVar(&opts.caOrganization, "ca-organization", opts.caOrganization,
 		"Organization of the generated CA.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
@@ -263,7 +303,7 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts.zapOpts)))
 
-	if err := opts.leaderElectionTiming.Validate(); err != nil {
+	if err := opts.validateLeaderElectionTiming(); err != nil {
 		setupLog.Error(err, "bad flag")
 		os.Exit(1)
 	}
@@ -292,12 +332,16 @@ func main() {
 		CertDir:           opts.webhookCertDir,
 		CAName:            opts.caName,
 		CAOrganization:    opts.caOrganization,
+		ClusterDomain:     opts.clusterDomain,
 	}
 	internalCerts := opts.enableWebhook && opts.internalCertManagement
 	if internalCerts {
 		setupLog.Info("Setting up internal cert management",
 			"secret", opts.certSecretName, "service", opts.webhookServiceName,
 			"webhookConfig", opts.webhookConfigName)
+		if opts.clusterDomain == "" {
+			setupLog.Info("--cluster-domain is not set; the webhook certificate covers only <service>.<namespace>.svc, not a fully qualified name")
+		}
 		// Before the real manager, not on it. The controllers that manager runs
 		// write through this component's own fail-closed webhook, so starting
 		// them against a webhook whose certificate does not exist yet turns the
@@ -309,21 +353,7 @@ func main() {
 		}
 	}
 
-	mgrOpts := ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: opts.metricsAddr},
-		HealthProbeBindAddress: opts.probeAddr,
-		LeaderElection:         opts.enableLeaderElection,
-		LeaderElectionID:       opts.leaderElectionID,
-	}
-	opts.leaderElectionTiming.Apply(&mgrOpts)
-	if opts.enableWebhook {
-		mgrOpts.WebhookServer = webhook.NewServer(webhook.Options{
-			Port:    opts.webhookPort,
-			CertDir: opts.webhookCertDir,
-		})
-	}
-	mgr, err := ctrl.NewManager(kubeConfig, mgrOpts)
+	mgr, err := ctrl.NewManager(kubeConfig, opts.managerOptions())
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)

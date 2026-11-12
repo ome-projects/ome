@@ -1,9 +1,6 @@
 package v1beta1testing
 
 import (
-	"fmt"
-
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -35,21 +32,9 @@ func MakeAcceleratorClass(name string) *AcceleratorClassWrapper {
 
 func (w *AcceleratorClassWrapper) Obj() *v1beta1.AcceleratorClass { return &w.AcceleratorClass }
 
-func (w *AcceleratorClassWrapper) Clone() *AcceleratorClassWrapper {
-	return &AcceleratorClassWrapper{AcceleratorClass: *w.AcceleratorClass.DeepCopy()}
-}
-
-// Vendor / Family / Model are pass-through metadata setters.
+// Vendor is a pass-through metadata setter.
 func (w *AcceleratorClassWrapper) Vendor(v string) *AcceleratorClassWrapper {
 	w.Spec.Vendor = v
-	return w
-}
-func (w *AcceleratorClassWrapper) Family(f string) *AcceleratorClassWrapper {
-	w.Spec.Family = f
-	return w
-}
-func (w *AcceleratorClassWrapper) Model(m string) *AcceleratorClassWrapper {
-	w.Spec.Model = m
 	return w
 }
 
@@ -59,17 +44,6 @@ func (w *AcceleratorClassWrapper) DiscoveryNodeSelector(k, v string) *Accelerato
 		w.Spec.Discovery.NodeSelector = map[string]string{}
 	}
 	w.Spec.Discovery.NodeSelector[k] = v
-	return w
-}
-
-// MemoryGB sets spec.Capabilities.MemoryGB by parsing the supplied
-// integer as a Quantity (e.g. MemoryGB(80) → "80Gi"). Feeds the
-// selector's memory-fit scoring and constraint filtering; the
-// controller's node-match filter keys on spec.resources[] presence in
-// node capacity, not on this field.
-func (w *AcceleratorClassWrapper) MemoryGB(gb int64) *AcceleratorClassWrapper {
-	q := resource.MustParse(fmt.Sprintf("%dGi", gb))
-	w.Spec.Capabilities.MemoryGB = &q
 	return w
 }
 

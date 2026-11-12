@@ -28,7 +28,7 @@ import (
 // holds exactly one gang (scaleNodesPerDomain == scaleGangSize) and there are
 // exactly as many gangs as domains. BestFit therefore has to spread the gangs one
 // per domain; the capacity reservation is what prevents two gangs racing into the
-// same domain and stranding a loser. If the plugin ever over-committed a domain,
+// same domain and leaving one short of nodes. If the plugin ever over-committed a domain,
 // some gang would be short a node and never fully bind — the wall-clock wait would
 // time out and fail, and the per-domain occupancy assertion below would trip.
 //
@@ -116,7 +116,7 @@ func TestScaleManyGangsAcrossManyDomains(t *testing.T) {
 
 	// One PodGroup per gang: minMember = gangSize, domain label declared via the
 	// topology-key annotation. Generous gate timeout — completion, not a timeout, is
-	// what a healthy run observes; a stranded (over-committed) gang would still fail
+	// what a healthy run observes; a gang short of a node (over-commit) would still fail
 	// via the never-binds wall-clock wait below.
 	pgTimeout := int32(schedTimeout.Seconds()) + 60
 	for gi := 0; gi < gangs; gi++ {
@@ -150,7 +150,7 @@ func TestScaleManyGangsAcrossManyDomains(t *testing.T) {
 	// waitForPodBound is per-pod; at scale we fan it out with a bounded worker pool
 	// so the poll loop itself doesn't serialize into the wall-clock measurement.
 	// Each worker records the node its pod bound to; a failure to bind within
-	// schedTimeout fails the test (the strand a domain over-commit would produce).
+	// schedTimeout fails the test (the shortfall a domain over-commit would produce).
 	type result struct {
 		gang int
 		node string
@@ -176,7 +176,7 @@ func TestScaleManyGangsAcrossManyDomains(t *testing.T) {
 				if !ok {
 					failMu.Lock()
 					if firstFail == nil {
-						firstFail = fmt.Errorf("pod %s/%s never bound within %s (possible domain over-commit / stranded gang)", ns, name, schedTimeout)
+						firstFail = fmt.Errorf("pod %s/%s never bound within %s (possible domain over-commit, a gang short of a node)", ns, name, schedTimeout)
 					}
 					failMu.Unlock()
 					continue

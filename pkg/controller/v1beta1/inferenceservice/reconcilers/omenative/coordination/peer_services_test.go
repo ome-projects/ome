@@ -54,7 +54,7 @@ func TestServingPortsFromRunners(t *testing.T) {
 	}
 }
 
-// TestCreatePerRevisionServicesIfAbsent_CreatesBothThenLeavesThem pins the
+// TestCreatePerRevisionServicesIfAbsent_CreatesBothThenLeavesThem checks the
 // create-before-pods path: both halves of the pair are created for a
 // revision with no pods, selected by revision hash only, and a second call
 // leaves an existing (drifted) Service exactly as found.
@@ -62,7 +62,7 @@ func TestCreatePerRevisionServicesIfAbsent_CreatesBothThenLeavesThem(t *testing.
 	isvc := testISVC()
 	c := fakeClient()
 	routing := RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}
-	if err := CreatePerRevisionServicesIfAbsent(context.Background(), c, isvc, v1beta1.DecoderComponent, "dec1", routing, runnerPorts()); err != nil {
+	if err := CreatePerRevisionServicesIfAbsent(context.Background(), c, isvc, v1beta1.DecoderComponent, "dec1", routing, runnerPorts(), nil); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	names := PerRevisionServiceNames(isvc.Name, v1beta1.DecoderComponent, "dec1")
@@ -71,7 +71,7 @@ func TestCreatePerRevisionServicesIfAbsent_CreatesBothThenLeavesThem(t *testing.
 		t.Fatalf("routing Service must exist before any pod: %v", err)
 	}
 	if routingSvc.Spec.Selector[query.LabelRevisionHash] != "dec1" {
-		t.Errorf("routing selector must pin the revision hash, got %v", routingSvc.Spec.Selector)
+		t.Errorf("routing selector must select the revision hash, got %v", routingSvc.Spec.Selector)
 	}
 	if routingSvc.Spec.Selector[query.LabelRunner] != string(v1beta1.RunnerNameLeader) || routingSvc.Spec.Selector[query.LabelPodOrdinal] != "0" {
 		t.Errorf("routing selector must honor the leader/ordinal shape, got %v", routingSvc.Spec.Selector)
@@ -92,7 +92,7 @@ func TestCreatePerRevisionServicesIfAbsent_CreatesBothThenLeavesThem(t *testing.
 	if err := c.Update(context.Background(), routingSvc); err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if err := CreatePerRevisionServicesIfAbsent(context.Background(), c, isvc, v1beta1.DecoderComponent, "dec1", routing, runnerPorts()); err != nil {
+	if err := CreatePerRevisionServicesIfAbsent(context.Background(), c, isvc, v1beta1.DecoderComponent, "dec1", routing, runnerPorts(), nil); err != nil {
 		t.Fatalf("second create: %v", err)
 	}
 	after := &corev1.Service{}
@@ -110,7 +110,7 @@ func TestCreatePerRevisionServicesIfAbsent_CreatesBothThenLeavesThem(t *testing.
 func TestCreatePerRevisionServicesIfAbsent_NoPortSkipsRoutingOnly(t *testing.T) {
 	isvc := testISVC()
 	c := fakeClient()
-	if err := CreatePerRevisionServicesIfAbsent(context.Background(), c, isvc, v1beta1.DecoderComponent, "dec1", RevisionRoutingSelector{}, nil); err != nil {
+	if err := CreatePerRevisionServicesIfAbsent(context.Background(), c, isvc, v1beta1.DecoderComponent, "dec1", RevisionRoutingSelector{}, nil, nil); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	names := PerRevisionServiceNames(isvc.Name, v1beta1.DecoderComponent, "dec1")
@@ -122,13 +122,13 @@ func TestCreatePerRevisionServicesIfAbsent_NoPortSkipsRoutingOnly(t *testing.T) 
 	}
 }
 
-// TestCreatePerRevisionServicesIfAbsent_NilInputs pins the no-op contract
+// TestCreatePerRevisionServicesIfAbsent_NilInputs checks the no-op contract
 // for an empty hash and the error for a nil client.
 func TestCreatePerRevisionServicesIfAbsent_NilInputs(t *testing.T) {
-	if err := CreatePerRevisionServicesIfAbsent(context.Background(), fakeClient(), testISVC(), v1beta1.DecoderComponent, "", RevisionRoutingSelector{}, nil); err != nil {
+	if err := CreatePerRevisionServicesIfAbsent(context.Background(), fakeClient(), testISVC(), v1beta1.DecoderComponent, "", RevisionRoutingSelector{}, nil, nil); err != nil {
 		t.Errorf("empty hash must be a no-op, got %v", err)
 	}
-	if err := CreatePerRevisionServicesIfAbsent(context.Background(), nil, testISVC(), v1beta1.DecoderComponent, "h", RevisionRoutingSelector{}, nil); err == nil {
+	if err := CreatePerRevisionServicesIfAbsent(context.Background(), nil, testISVC(), v1beta1.DecoderComponent, "h", RevisionRoutingSelector{}, nil, nil); err == nil {
 		t.Error("nil client must error")
 	}
 }

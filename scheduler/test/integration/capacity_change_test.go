@@ -30,12 +30,12 @@ func setNodeGPU(t *testing.T, tc *testContext, name string, gpus int64) {
 	}
 }
 
-// TestBurstUnderPartialCapacityThenRestore covers the partial-capacity wedge: a
+// TestBurstUnderPartialCapacityThenRestore covers a burst under partial capacity: a
 // gang burst arrives while only SOME domains have accelerator capacity (the rest
 // at zero — a device-plugin/informer lag on a real cluster). The gangs that fit place;
 // the rest wait as no-fit. Then the missing capacity is restored. Every gang must
 // converge — the empty domains are now usable and there are exactly enough for the
-// waiting gangs. A regression wedges the waiting gangs (assigned to a domain they
+// waiting gangs. A regression never binds the waiting gangs (assigned to a domain they
 // can't use, or blocked by leaked reservations) even though capacity is now free.
 //
 // Shape: `domains` domains x `gangSize` nodes, one gang per domain; half the domains
@@ -95,7 +95,7 @@ func TestBurstUnderPartialCapacityThenRestore(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Let the burst settle against partial capacity: ~half the gangs place.
+	// Let the burst finish against partial capacity: ~half the gangs place.
 	time.Sleep(8 * time.Second)
 	placed := boundCount(tc, ns, "cc-p-")
 	t.Logf("after partial-capacity burst: %d/%d pods bound (expect ~%d = %d gangs)", placed, gangs*gangSize, half*gangSize, half)
@@ -126,7 +126,7 @@ func TestBurstUnderPartialCapacityThenRestore(t *testing.T) {
 				if _, ok := pollPodBound(tc, ns, podName(gi, mi), time.Until(deadline)); !ok {
 					mu.Lock()
 					if firstFail == nil {
-						firstFail = fmt.Errorf("pod %s never bound after capacity restore (wedge)", podName(gi, mi))
+						firstFail = fmt.Errorf("pod %s never bound after capacity restore", podName(gi, mi))
 					}
 					mu.Unlock()
 				}

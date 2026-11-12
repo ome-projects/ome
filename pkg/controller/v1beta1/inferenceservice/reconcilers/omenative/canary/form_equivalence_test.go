@@ -19,7 +19,7 @@ import (
 // run's life and under every operator verb: it reads a resolved body, so
 // nothing it decides can depend on the form the operator declared.
 
-// executorForm is one declaration of the same canary ladder.
+// executorForm is one declaration of the same canary.
 type executorForm struct {
 	name   string
 	isvc   *v1beta1.InferenceService
@@ -39,9 +39,9 @@ func executorForms() []executorForm {
 	return []executorForm{{name: "inline", isvc: inline}, {name: "referenced", isvc: referenced, policy: policy}}
 }
 
-// pinComposedRun pins the form's resolved group as the active run, the way
+// recordComposedRun records the form's resolved group as the active run, the way
 // the run layer does: a referenced body is composed onto the group first.
-func pinComposedRun(t *testing.T, f executorForm, targets ...v1beta1.RolloutRunTarget) *v1beta1.RolloutGroup {
+func recordComposedRun(t *testing.T, f executorForm, targets ...v1beta1.RolloutRunTarget) *v1beta1.RolloutGroup {
 	t.Helper()
 	var spec *v1beta1.RolloutPolicySpec
 	source := v1beta1.RolloutPlanSourceInline
@@ -72,7 +72,7 @@ var executorPhases = []struct {
 	name  string
 	apply func(t *testing.T, f executorForm, in *ReconcileInputs)
 }{
-	// A ladder serving its first split with no run pinned: the state a lost
+	// A canary serving its first split with no run recorded: the state a lost
 	// run leaves behind.
 	{"no run", func(t *testing.T, f executorForm, in *ReconcileInputs) {
 		rollout.SetCanaryStatusFor(&f.isvc.Status, v1beta1.EngineComponent, servingFirstSplit())
@@ -83,7 +83,7 @@ var executorPhases = []struct {
 	{"open run", func(t *testing.T, f executorForm, in *ReconcileInputs) {
 		rollout.SetCanaryStatusFor(&f.isvc.Status, v1beta1.EngineComponent, servingFirstSplit())
 		setPhase(f.isvc, v1beta1.EngineComponent, v1beta1.RolloutPhasePaused)
-		g := pinComposedRun(t, f, v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: "old"})
+		g := recordComposedRun(t, f, v1beta1.RolloutRunTarget{Component: v1beta1.EngineComponent, Revision: "new", StableRevision: "old"})
 		in.PerRevisionPods = map[string]int32{"new": 2, "old": 2}
 		in.RunActive = true
 		in.TargetID = activeCanaryTargetID(f.isvc, g)
@@ -164,11 +164,11 @@ func TestReconcile_ReferencedCanaryDecidesLikeInline(t *testing.T) {
 					decisions[f.name], readings[f.name] = decide(t, f.isvc, in)
 				}
 				if readings["inline"] != readings["referenced"] {
-					t.Fatalf("the referenced canary decided differently from its inline twin\ninline:\n%s\nreferenced:\n%s", readings["inline"], readings["referenced"])
+					t.Fatalf("the referenced canary decided differently from its inline form\ninline:\n%s\nreferenced:\n%s", readings["inline"], readings["referenced"])
 				}
-				// The comparison is not vacuous: the inline twin runs its ladder.
+				// The comparison is not vacuous: the inline form runs its steps.
 				if !decisions["inline"].Result.Active {
-					t.Fatalf("the inline twin must drive its ladder, got %+v", decisions["inline"].Result)
+					t.Fatalf("the inline form must drive its steps, got %+v", decisions["inline"].Result)
 				}
 			})
 		}
@@ -232,10 +232,10 @@ func TestProjection_ReferencedCanaryProjectsLikeInline(t *testing.T) {
 				}
 			}
 			if readings["inline"] != readings["referenced"] {
-				t.Fatalf("the referenced canary projects differently from its inline twin\ninline:     %s\nreferenced: %s", readings["inline"], readings["referenced"])
+				t.Fatalf("the referenced canary projects differently from its inline form\ninline:     %s\nreferenced: %s", readings["inline"], readings["referenced"])
 			}
 			if !inline.Active || inline.Step == nil {
-				t.Fatalf("the inline twin must project a step partition, got %s", readings["inline"])
+				t.Fatalf("the inline form must project a step partition, got %s", readings["inline"])
 			}
 		})
 	}

@@ -6,7 +6,6 @@ import (
 	"github.com/go-logr/logr"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,7 +31,6 @@ import (
 type InheritanceReconciler struct {
 	client.Client
 	Log      logr.Logger
-	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 }
 

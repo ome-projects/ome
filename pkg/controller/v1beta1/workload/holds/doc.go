@@ -8,29 +8,34 @@
 // a pod write, the scheduler finding no placement, a PodGroup name
 // still being collected, a node that stopped reporting a pod whose name
 // the operation needs, capacity a provisioner has not readied for a pod
-// the operation withholds, a surge whose source left the rotation, an
+// the operation withholds, a surge whose source left the rotation, a
+// retired replacement gang whose members are still terminating, an
 // operator pause. Each records itself as a short token on Waiting, which
-// is what parks the InstanceReadyTimeout clock and what the escalation
+// is what stops the InstanceReadyTimeout clock and what the escalation
 // pass reads to leave the row alone. The quota wait alone has a second
 // carrier: the refusal is an apiserver answer the create site records
 // on the operation, the token is written from that record on the next
-// pass, and the deadline parks on either — so the clock stops on the
+// pass, and the deadline stops on either, so the clock stops on the
 // pass admission said no and stays stopped while the token lingers. The
 // admission wait is the other answer no later pass can re-ask for: the
 // write site records it as the token itself, with the apiserver's words
-// as evidence, and releases it once a write goes through.
+// as evidence, and releases it once a write goes through. The retired
+// replacement's wait is recorded the same way, from the retirement's
+// delete site, and ends with the operation when the pair ends; the pass
+// releases it only under a pause, which keeps the pair from ending, once
+// no retired member stands.
 //
-// Two rules make that safe with eight writers:
+// Two rules make that safe with nine writers:
 //
 //   - RECORD EARLY. The pass runs once per observed row at the top of the
 //     pass, before any verb pass: every token is written as soon as its
 //     condition is observed, releases before records, so a row that
 //     stops waiting on one authority and starts waiting on another does
-//     it inside one pass. Left unheld for even one pass, the parking
+//     it inside one pass. Left unheld for even one pass, the deadline
 //     step reads the empty token as admission and restarts a whole
 //     InstanceReadyTimeout.
 //   - ACT AT THE BOUNDARY. Recording a token decides nothing about the
-//     step in flight. Whether the owner abandons its step now or
+//     step in flight. Whether the owner stops its step now or
 //     finishes it first is the ownership table's Interruptible answer
 //     (types.Interruptible), never this package's.
 //

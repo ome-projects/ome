@@ -52,6 +52,32 @@ func NewGatewayAddressResolver(clusters RemoteClusterClients) *GatewayAddressRes
 // authoritative Gateway status and can produce cluster-local synthetic DNS
 // answers instead of the advertised data-plane address.
 func (r *GatewayAddressResolver) Resolve(ctx context.Context, isvc *v1beta1.InferenceService, cluster ServingCluster) ([]BackendAddress, error) {
+	remote, err := r.remoteClient(cluster)
+	if err != nil {
+		return nil, err
+	}
+	route := &gatewayapiv1.HTTPRoute{}
+	key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}
+	if err := remote.Get(ctx, key, route); err != nil {
+		return nil, fmt.Errorf("read serving HTTPRoute %s/%s on cluster %q: %w", key.Namespace, key.Name, cluster.Cluster, err)
+	}
+	gwKey, err := servingGatewayKey(route, cluster)
+	if err != nil {
+		return nil, err
+	}
+	gateway := &gatewayapiv1.Gateway{}
+	if err := remote.Get(ctx, gwKey, gateway); err != nil {
+		return nil, fmt.Errorf("read serving Gateway %s/%s on cluster %q: %w", gwKey.Namespace, gwKey.Name, cluster.Cluster, err)
+	}
+	addresses := ipAddressesOf(gateway.Status.Addresses)
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("serving Gateway %s/%s on cluster %q has no IP status addresses", gwKey.Namespace, gwKey.Name, cluster.Cluster)
+	}
+	return addresses, nil
+}
+
+// remoteClient is the connected client of the serving cluster.
+func (r *GatewayAddressResolver) remoteClient(cluster ServingCluster) (workloadcluster.SelectivelyCachingClient, error) {
 	if r == nil || r.clusters == nil {
 		return nil, fmt.Errorf("resolve backend addresses for cluster %q: workload-cluster clients are not configured", cluster.Cluster)
 	}
@@ -59,30 +85,30 @@ func (r *GatewayAddressResolver) Resolve(ctx context.Context, isvc *v1beta1.Infe
 	if !ok {
 		return nil, fmt.Errorf("resolve backend addresses for cluster %q: workload cluster is not connected", cluster.Cluster)
 	}
+	return remote, nil
+}
 
-	route := &gatewayapiv1.HTTPRoute{}
-	key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}
-	if err := remote.Get(ctx, key, route); err != nil {
-		return nil, fmt.Errorf("read serving HTTPRoute %s/%s on cluster %q: %w", key.Namespace, key.Name, cluster.Cluster, err)
-	}
+// servingGatewayKey names the Gateway the route's parent for the cluster's
+// backend host points at; a parent without a namespace means the route's own.
+func servingGatewayKey(route *gatewayapiv1.HTTPRoute, cluster ServingCluster) (types.NamespacedName, error) {
 	parent, err := gatewayParentForHost(route, cluster.BackendHost)
 	if err != nil {
-		return nil, fmt.Errorf("resolve serving Gateway for host %q on cluster %q: %w", cluster.BackendHost, cluster.Cluster, err)
+		return types.NamespacedName{}, fmt.Errorf("resolve serving Gateway for host %q on cluster %q: %w", cluster.BackendHost, cluster.Cluster, err)
 	}
-
 	gwNamespace := route.Namespace
 	if parent.Namespace != nil && *parent.Namespace != "" {
 		gwNamespace = string(*parent.Namespace)
 	}
-	gateway := &gatewayapiv1.Gateway{}
-	gwKey := types.NamespacedName{Namespace: gwNamespace, Name: string(parent.Name)}
-	if err := remote.Get(ctx, gwKey, gateway); err != nil {
-		return nil, fmt.Errorf("read serving Gateway %s/%s on cluster %q: %w", gwKey.Namespace, gwKey.Name, cluster.Cluster, err)
-	}
+	return types.NamespacedName{Namespace: gwNamespace, Name: string(parent.Name)}, nil
+}
 
-	addresses := make([]BackendAddress, 0, len(gateway.Status.Addresses))
-	seen := make(map[BackendAddress]struct{}, len(gateway.Status.Addresses))
-	for _, statusAddress := range gateway.Status.Addresses {
+// ipAddressesOf keeps the status addresses of the IP type (or of no type)
+// that parse as an address, in canonical form, each once, ordered by family
+// and then by address.
+func ipAddressesOf(statusAddresses []gatewayapiv1.GatewayStatusAddress) []BackendAddress {
+	addresses := make([]BackendAddress, 0, len(statusAddresses))
+	seen := make(map[BackendAddress]struct{}, len(statusAddresses))
+	for _, statusAddress := range statusAddresses {
 		if statusAddress.Type != nil && *statusAddress.Type != gatewayapiv1.IPAddressType {
 			continue
 		}
@@ -101,16 +127,13 @@ func (r *GatewayAddressResolver) Resolve(ctx context.Context, isvc *v1beta1.Infe
 		seen[resolved] = struct{}{}
 		addresses = append(addresses, resolved)
 	}
-	if len(addresses) == 0 {
-		return nil, fmt.Errorf("serving Gateway %s/%s on cluster %q has no IP status addresses", gwKey.Namespace, gwKey.Name, cluster.Cluster)
-	}
 	sort.Slice(addresses, func(i, j int) bool {
 		if addresses[i].Type != addresses[j].Type {
 			return addresses[i].Type < addresses[j].Type
 		}
 		return addresses[i].Address < addresses[j].Address
 	})
-	return addresses, nil
+	return addresses
 }
 
 // gatewayParentForHost selects the generated route's parent Gateway for a

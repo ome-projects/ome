@@ -1114,3 +1114,62 @@ func TestModelToReplicas(t *testing.T) {
 		})
 	}
 }
+
+// A Node deleted under the pods of two replicas names each replica once,
+// through the pods' controller references; a pod of another controller
+// and a pod on another node name nothing.
+func TestReplicasOnNode_NamesEachReplicaWithAPodOnTheDeletedNodeOnce(t *testing.T) {
+	isController := true
+	owned := func(name, node, owner string) *corev1.Pod {
+		pod := managedPod()
+		pod.Name = name
+		pod.Spec.NodeName = node
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: v1beta1.SchemeGroupVersion.String(), Kind: "InferenceReplica",
+			Name: owner, UID: types.UID(owner), Controller: &isController,
+		}}
+		return pod
+	}
+	jobPod := owned("job-0", "node-gone", "job-a")
+	jobPod.OwnerReferences[0].APIVersion, jobPod.OwnerReferences[0].Kind = "batch/v1", "Job"
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(
+			owned("a-engine-0", "node-gone", "a-engine"),
+			owned("a-engine-1", "node-gone", "a-engine"),
+			owned("b-decoder-0", "node-gone", "b-decoder"),
+			owned("a-engine-2", "node-live", "a-engine"),
+			jobPod,
+		).
+		WithIndex(&corev1.Pod{}, query.PodNodeNameField, query.PodNodeNameIndexExtractor).
+		Build()
+	r := &Reconciler{Client: c, Log: logr.Discard()}
+
+	reqs := r.replicasOnNode(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-gone"}})
+	got := make([]string, 0, len(reqs))
+	for _, req := range reqs {
+		got = append(got, req.Namespace+"/"+req.Name)
+	}
+	sort.Strings(got)
+	want := []string{"ns/a-engine", "ns/b-decoder"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("replicasOnNode = %v, want %v", got, want)
+	}
+	if reqs := r.replicasOnNode(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-empty"}}); len(reqs) != 0 {
+		t.Fatalf("a node with no managed pod names %d replicas, want none", len(reqs))
+	}
+	if reqs := r.replicasOnNode(context.Background(), managedPod()); len(reqs) != 0 {
+		t.Fatalf("an object that is not a Node names %d replicas, want none", len(reqs))
+	}
+}
+
+// The predicate lets a Node's deletion through and nothing else.
+func TestNodeDeletePredicate_PassesOnlyDeletions(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+	p := nodeDeletePredicate()
+	if !p.Delete(event.DeleteEvent{Object: node}) {
+		t.Fatalf("a deletion must enqueue")
+	}
+	if p.Create(event.CreateEvent{Object: node}) || p.Update(event.UpdateEvent{ObjectOld: node, ObjectNew: node}) || p.Generic(event.GenericEvent{Object: node}) {
+		t.Fatalf("a Node's other events must not enqueue")
+	}
+}

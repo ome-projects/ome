@@ -4,15 +4,21 @@ import (
 	"testing"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/rollout"
 )
 
-// The fixtures, events and readers of the grid rows about the stable side of
+// The fixtures, events and readers of the cases about the stable side of
 // a split: a stable pod retired by the staging or lost, a pod lost while the
 // operator's pause holds the unit, a resume while the fleet already stands
-// past the first step, and a push landing before the cutover. Whether a
-// split's weight should move with the capacity that serves it is not decided
-// yet; each row records the current behaviour and is updated when it changes.
+// past the first step (it continues at the final step, whose next pass
+// opens the drain), and a push landing before the cutover. The unit has
+// one stable side: a member whose stable revision has no serving pod left
+// moves the whole unit's remainder onto the canary revision, the other
+// member's with it, while the canary revision serves on every member.
+// Whether a split's weight should move with the capacity that serves it
+// while a stable pod still serves is left open; those rows record the
+// current behaviour.
 
 func init() {
 	for id, reader := range map[string]func(t *testing.T, isvc *v1beta1.InferenceService){
@@ -22,15 +28,18 @@ func init() {
 		"canary/Staging[final,serving]/stableGone":                 splitStandsAtHalf,
 		"canary/Staging[final,serving]/stableGone[last]":           splitAllOnCanary,
 		"canary/Staging[final,pd]/stableGone":                      splitKeeps,
-		"canary/Staging[final,pd]/stableGone[last]":                engineAloneOnCanary,
+		"canary/Staging[final,pd]/stableGone[last]":                unitAllOnCanary,
+		"canary/Staging[final,pd12]/stableGone":                    splitStandsAtSixtyForty,
+		"canary/Staging[final,pd12]/stableGone[last]":              unitAllOnCanary,
+		"canary/Staging[final,pd12]/stableGone[decoderLast]":       unitAllOnCanary,
 		"canary/Serving/stableGone":                                splitStandsAtHalf,
 		"canary/Serving/stableGone[last]":                          splitAllOnCanary,
 		"canary/Serving[T]/stableGone":                             splitStandsAtHalf,
 		"canary/Serving[T]/stableGone[last]":                       splitAllOnCanary,
 		"canary/Serving[A]/stableGone":                             splitStandsAtHalf,
 		"canary/Serving[A]/stableGone[last]":                       splitAllOnCanary,
-		"canary/Serving[pd]/stableGone[last]":                      engineAloneOnCanary,
-		"canary/Serving[pd]/stableGone[decoderLast]":               decoderAloneOnCanary,
+		"canary/Serving[pd]/stableGone[last]":                      unitAllOnCanary,
+		"canary/Serving[pd]/stableGone[decoderLast]":               unitAllOnCanary,
 		"canary/PreHold/stableGone":                                splitStandsAtHalf,
 		"canary/PreHold/stableGone[last]":                          splitAllOnCanary,
 		"canary/Draining[retiring]/stableGone":                     splitAllOnCanary,
@@ -38,7 +47,10 @@ func init() {
 		"canary/Draining[M,retiring]/stableGone":                   splitAllOnCanary,
 		"canary/Draining[M]/stableGone[last]":                      splitAllOnCanary,
 		"canary/RollingBack/stableGone":                            splitAllOnStable,
+		"canary/RollingBack/stableGone[last]":                      splitAllOnCanary,
 		"canary/RolledBack/stableGone":                             splitAllOnStable,
+		"canary/Failed/stableGone[last]":                           splitAllOnCanary,
+		"canary/Failed[stableMissing]/stableGone[last]":            splitAllOnCanary,
 		"canary/Serving[paused]/capacityDropped":                   splitStandsAtHalfUnclocked,
 		"canary/Serving[T,paused]/capacityDropped":                 splitStandsAtHalfUnclocked,
 		"canary/Serving[A,paused]/capacityDropped":                 splitStandsAtHalfUnclocked,
@@ -47,8 +59,8 @@ func init() {
 		"canary/Serving[pd,paused]/capacityDropped":                splitKeeps,
 		"canary/Draining[paused]/capacityDropped":                  splitAllOnCanaryUnclocked,
 		"canary/Draining[M,paused]/capacityDropped":                splitAllOnCanaryUnclocked,
-		"canary/Failed[fleetAhead]/resume[nextPass]":               splitStandsAtHalf,
-		"canary/Failed[stableMissing,fleetAhead]/resume[nextPass]": splitStandsAtHalf,
+		"canary/Failed[fleetAhead]/resume[nextPass]":               splitAllOnCanary,
+		"canary/Failed[stableMissing,fleetAhead]/resume[nextPass]": splitAllOnCanary,
 		"canary/Draining[pd]/newTarget":                            splitsOnTheHeldStable,
 	} {
 		cellAlso[id] = reader
@@ -144,6 +156,58 @@ func evRolledBackStablePodsGone(_ *v1beta1.InferenceService, in *ReconcileInputs
 	in.PerRevisionPods = map[string]int32{}
 }
 
+// fixtureStagingFinalPD12 is the reference shape at its final step's
+// staging: 12 prefill and 8 decode under 10/30/60/100 manual steps, the
+// first three steps served and promoted in turn. The engine has 9
+// Instances serving version 2, one rebuilding and two still on version 1
+// (the held one and one the roll has not taken yet); the decoder has 5 on
+// version 2, two rebuilding and its held one on version 1. The step before
+// left 60 percent on version 2 and 40 on version 1 on both members.
+func fixtureStagingFinalPD12(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
+	isvc, in := pdUnit(fourStepManual(), nil, map[string]int32{"new": 2, "old": 10})
+	in.DesiredReplicas = 12
+	decoderServesAt(&in, 1, 7, 8, true)
+	mustReconcile(t, isvc, in) // step 0 serves 10 percent under its manual hold
+	for _, staged := range []struct{ engineNew, engineOld, decoderNew, decoderOld int32 }{{4, 8, 3, 5}, {8, 4, 5, 3}} {
+		annotate(isvc, constants.RolloutPromoteAnnotation, "new")
+		mustReconcile(t, isvc, in) // the promote advances; the next step stages
+		delete(isvc.Annotations, constants.RolloutPromoteAnnotation)
+		in.PerRevisionPods = map[string]int32{"new": staged.engineNew, "old": staged.engineOld}
+		decoderServesAt(&in, staged.decoderNew, staged.decoderOld, 8, true)
+		mustReconcile(t, isvc, in) // the step's capacity stands and its split serves
+	}
+	annotate(isvc, constants.RolloutPromoteAnnotation, "new")
+	mustReconcile(t, isvc, in) // the promote advances to the final step
+	delete(isvc.Annotations, constants.RolloutPromoteAnnotation)
+	in.PerRevisionPods = map[string]int32{"new": 9, "old": 2}
+	decoderServesAt(&in, 5, 1, 8, false)
+	mustReconcile(t, isvc, in) // the final step waits on both members; the 60/40 split stands
+	return isvc, in
+}
+
+// decoderServesAt is decoderServes for a decoder scaled to desired.
+func decoderServesAt(in *ReconcileInputs, canary, stable, desired int32, met bool) {
+	decoderServes(in, canary, stable, met)
+	m := in.Secondaries[v1beta1.DecoderComponent]
+	m.DesiredReplicas = desired
+	in.Secondaries[v1beta1.DecoderComponent] = m
+}
+
+// The reference shape's stable pods at its final step, read off each
+// member's own replica: one of the engine's two version 1 pods leaves,
+// both leave, or the decoder's held version 1 pod leaves.
+func evEngineStablePodGonePD12(_ *v1beta1.InferenceService, in *ReconcileInputs) {
+	in.PerRevisionPods = map[string]int32{"new": 9, "old": 1}
+	decoderServesAt(in, 5, 1, 8, false)
+}
+func evEngineStablePodsGonePD12(_ *v1beta1.InferenceService, in *ReconcileInputs) {
+	in.PerRevisionPods = map[string]int32{"new": 9}
+	decoderServesAt(in, 5, 1, 8, false)
+}
+func evDecoderStablePodsGonePD12(_ *v1beta1.InferenceService, in *ReconcileInputs) {
+	decoderServesAt(in, 5, 0, 8, false)
+}
+
 // The prefill/decode unit's stable pods, read off each member's own replica.
 func evEngineStablePodsGone(_ *v1beta1.InferenceService, in *ReconcileInputs) {
 	in.PerRevisionPods = map[string]int32{"new": 2}
@@ -158,8 +222,8 @@ func evDecoderStablePodGoneShort(_ *v1beta1.InferenceService, in *ReconcileInput
 	decoderServes(in, 2, 1, false)
 }
 
-// evResumeOwnThenPass: the resume starts the unit over at step 0 and the pass
-// under test is the first one the step machine runs from the new record.
+// evResumeOwnThenPass: the resume re-enters the steps and the pass under
+// test is the first one the step machine runs from the new record.
 func evResumeOwnThenPass(isvc *v1beta1.InferenceService, in *ReconcileInputs) {
 	evResumeOwn(isvc, in)
 	reconcileOnce(isvc, in)
@@ -225,25 +289,29 @@ func splitAllOnCanaryUnclocked(t *testing.T, isvc *v1beta1.InferenceService) {
 	waitCleared(t, isvc)
 }
 
-// engineAloneOnCanary reads the engine's split wholly on its canary revision
-// while the decoder keeps the step's split on its own pods: the stable side
-// of a split is read per member.
-func engineAloneOnCanary(t *testing.T, isvc *v1beta1.InferenceService) {
+// unitAllOnCanary reads both members' splits wholly on their canary
+// revision: the unit has one stable side, so a member whose stable revision
+// has no serving pod moves the whole unit's remainder, the other member's
+// with it, and no request is split between a version 2 engine and a
+// version 1 decoder.
+func unitAllOnCanary(t *testing.T, isvc *v1beta1.InferenceService) {
 	t.Helper()
 	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"new": {percent: 100, protocol: pdCanaryProtocol, latest: true}})
-	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{
-		"decnew": {percent: 50, protocol: pdCanaryProtocol, latest: true},
-		"decold": {percent: 50, protocol: pdStableProtocol},
-	})
+	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{"decnew": {percent: 100, protocol: pdCanaryProtocol, latest: true}})
 }
 
-func decoderAloneOnCanary(t *testing.T, isvc *v1beta1.InferenceService) {
+// splitStandsAtSixtyForty reads the reference shape's third step split
+// standing on both members.
+func splitStandsAtSixtyForty(t *testing.T, isvc *v1beta1.InferenceService) {
 	t.Helper()
 	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{
-		"new": {percent: 50, protocol: pdCanaryProtocol, latest: true},
-		"old": {percent: 50, protocol: pdStableProtocol},
+		"new": {percent: 60, protocol: pdCanaryProtocol, latest: true},
+		"old": {percent: 40, protocol: pdStableProtocol},
 	})
-	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{"decnew": {percent: 100, protocol: pdCanaryProtocol, latest: true}})
+	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{
+		"decnew": {percent: 60, protocol: pdCanaryProtocol, latest: true},
+		"decold": {percent: 40, protocol: pdStableProtocol},
+	})
 }
 
 // splitsOnTheHeldStable reads both members' splits wholly on their stable
@@ -256,58 +324,88 @@ func splitsOnTheHeldStable(t *testing.T, isvc *v1beta1.InferenceService) {
 	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{"decold": {percent: 100, protocol: pdStableProtocol}})
 }
 
+// noServingPodCase is one grid row about a split and a revision with no
+// serving pod: the fixture and event that make the picture, the member and
+// revision that must serve no pod, the percent the member's traffic names
+// for that revision after the pass, and the percent on readOn when the row
+// names one.
+type noServingPodCase struct {
+	id      string
+	fixture func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs)
+	event   func(isvc *v1beta1.InferenceService, in *ReconcileInputs)
+	state   rollout.CanaryState
+	comp    v1beta1.ComponentType
+	hash    string
+	weight  int32
+	why     string
+	readOn  string
+	readsAs int32
+}
+
+func runNoServingPodCase(t *testing.T, c noServingPodCase) {
+	t.Helper()
+	isvc, in := c.fixture(t)
+	c.event(isvc, &in)
+	mustReconcile(t, isvc, in)
+	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
+	steps := len(isvc.Spec.Rollout.Groups[0].Canary.Steps)
+	if got := rollout.StateOf(cs, phaseOf(isvc), steps); got != c.state {
+		t.Fatalf("state %q, want %q", got, c.state)
+	}
+	serving := in.PerRevisionPods
+	if c.comp != v1beta1.EngineComponent {
+		serving = in.GroupReadyPerRevisionPods[c.comp]
+	}
+	if serving[c.hash] != 0 {
+		t.Fatalf("the picture is wrong: %s must serve no pod of %q, got %v", c.comp, c.hash, serving)
+	}
+	if got := weightOn(isvc, c.comp, c.hash); got != c.weight {
+		t.Fatalf("%s sends %d percent to %q, which has no serving pod; the decided reading is %d: %s", c.comp, got, c.hash, c.weight, c.why)
+	}
+	if c.readOn != "" {
+		if got := weightOn(isvc, c.comp, c.readOn); got != c.readsAs {
+			t.Fatalf("%s sends %d percent to %q, want %d: %s", c.comp, got, c.readOn, c.readsAs, c.why)
+		}
+	}
+}
+
 // TestTheSplitStandsOnARevisionWithNoServingPod reads the cells where the
 // executor leaves a weighted target on a revision none of the member's pods
 // serve, which the grid's own pass check refuses: a step's split under the
-// operator's pause with every canary pod lost, and a hold that does not
-// rewrite its split when the last stable pod leaves. Whether the share should
-// move is not decided yet; each case records the current behaviour and is
-// updated when it changes.
+// operator's pause with every canary pod lost, where the paused pass writes
+// nothing and whether the share should move is left open, and a
+// settled revert with nothing serving on either side, where there is
+// nothing to move the traffic onto. The paused cases record the current
+// behaviour.
 func TestTheSplitStandsOnARevisionWithNoServingPod(t *testing.T) {
-	cases := []struct {
-		id      string
-		fixture func(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs)
-		event   func(isvc *v1beta1.InferenceService, in *ReconcileInputs)
-		state   rollout.CanaryState
-		comp    v1beta1.ComponentType
-		hash    string
-		weight  int32
-		why     string
-	}{
-		{"Serving[paused]/capacityDropped[allLost]", fixtureServingManualPaused, evCanaryPodsAllLost, rollout.CanaryStateServing,
-			v1beta1.EngineComponent, "new", 50, "the paused pass writes nothing, so the step's share stays on the canary revision while no pod of it serves"},
-		{"Serving[pd,paused]/capacityDropped[allLost]", fixtureServingManualPDPaused, evDecoderCapacityLost, rollout.CanaryStateServing,
-			v1beta1.DecoderComponent, "decnew", 50, "the paused pass writes nothing, so the decoder's share stays on its canary revision while no pod of it serves"},
-		{"Failed[release]/stableGone[last]", fixtureFailedAtTheRelease, evStablePodsGone, rollout.CanaryStateFailed,
-			v1beta1.EngineComponent, "old", 100, "the stopped unit does not rewrite the split it returned to the stable revision when the last stable pod leaves"},
-		{"RollingBack/stableGone[last]", fixtureRollingBack, evStablePodsGone, rollout.CanaryStateRollingBack,
-			v1beta1.EngineComponent, "old", 100, "the revert moves traffic only onto capacity that serves and leaves the split as it stands while the stable revision has no pod"},
-		{"RolledBack/stableGone[last]", fixtureRolledBack, evRolledBackStablePodsGone, rollout.CanaryStateRolledBack,
-			v1beta1.EngineComponent, "old", 100, "the settled hold writes the stable split again only while a stable pod serves"},
-		{"Failed[stableMissing]/stableGone[last]", fixtureFailedStableMissing, evStablePodsGone, rollout.CanaryStateFailed,
-			v1beta1.EngineComponent, "old", 100, "the stopped unit neither drains nor rewrites the split the revert left"},
+	cases := []noServingPodCase{
+		{id: "Serving[paused]/capacityDropped[allLost]", fixture: fixtureServingManualPaused, event: evCanaryPodsAllLost, state: rollout.CanaryStateServing,
+			comp: v1beta1.EngineComponent, hash: "new", weight: 50, why: "the paused pass writes nothing, so the step's share stays on the canary revision while no pod of it serves"},
+		{id: "Serving[pd,paused]/capacityDropped[allLost]", fixture: fixtureServingManualPDPaused, event: evDecoderCapacityLost, state: rollout.CanaryStateServing,
+			comp: v1beta1.DecoderComponent, hash: "decnew", weight: 50, why: "the paused pass writes nothing, so the decoder's share stays on its canary revision while no pod of it serves"},
+		{id: "RolledBack/stableGone[last]", fixture: fixtureRolledBack, event: evRolledBackStablePodsGone, state: rollout.CanaryStateRolledBack,
+			comp: v1beta1.EngineComponent, hash: "old", weight: 100, why: "nothing serves on either side after the revert, so the settled hold has nothing to move the traffic onto and the 100 percent stands until a stable pod serves again"},
 	}
 	for _, c := range cases {
-		t.Run(c.id, func(t *testing.T) {
-			isvc, in := c.fixture(t)
-			c.event(isvc, &in)
-			mustReconcile(t, isvc, in)
-			cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
-			steps := len(isvc.Spec.Rollout.Groups[0].Canary.Steps)
-			if got := rollout.StateOf(cs, phaseOf(isvc), steps); got != c.state {
-				t.Fatalf("state %q, want %q", got, c.state)
-			}
-			serving := in.PerRevisionPods
-			if c.comp != v1beta1.EngineComponent {
-				serving = in.GroupReadyPerRevisionPods[c.comp]
-			}
-			if serving[c.hash] != 0 {
-				t.Fatalf("the picture is wrong: %s must serve no pod of %q, got %v", c.comp, c.hash, serving)
-			}
-			if got := weightOn(isvc, c.comp, c.hash); got != c.weight {
-				t.Fatalf("%s sends %d percent to %q, which has no serving pod; the current behaviour is %d: %s; update this case when it changes", c.comp, got, c.hash, c.weight, c.why)
-			}
-		})
+		t.Run(c.id, func(t *testing.T) { runNoServingPodCase(t, c) })
+	}
+}
+
+// TestTheSplitFollowsTheServingPods reads the cells where a stable revision
+// loses its last serving pod while the other revision serves, under a stop
+// and under a revert: the member's traffic goes to the revision that
+// serves, so no share names a revision with nothing behind it.
+func TestTheSplitFollowsTheServingPods(t *testing.T) {
+	cases := []noServingPodCase{
+		{id: "Failed[release]/stableGone[last]", fixture: fixtureFailedAtTheRelease, event: evStablePodsGone, state: rollout.CanaryStateFailed,
+			comp: v1beta1.EngineComponent, hash: "old", weight: 0, readOn: "new", readsAs: 100, why: "the stopped unit's traffic goes to the canary pods that serve when the last stable pod leaves"},
+		{id: "RollingBack/stableGone[last]", fixture: fixtureRollingBack, event: evStablePodsGone, state: rollout.CanaryStateRollingBack,
+			comp: v1beta1.EngineComponent, hash: "old", weight: 0, readOn: "new", readsAs: 100, why: "the revert rests the traffic on the rejected pods that serve while the stable revision has none"},
+		{id: "Failed[stableMissing]/stableGone[last]", fixture: fixtureFailedStableMissing, event: evStablePodsGone, state: rollout.CanaryStateFailed,
+			comp: v1beta1.EngineComponent, hash: "old", weight: 0, readOn: "new", readsAs: 100, why: "the stopped unit's traffic goes to the rejected pods that serve when the last stable pod leaves"},
+	}
+	for _, c := range cases {
+		t.Run(c.id, func(t *testing.T) { runNoServingPodCase(t, c) })
 	}
 }
 

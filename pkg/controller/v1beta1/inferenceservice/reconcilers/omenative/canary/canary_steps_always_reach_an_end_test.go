@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,9 +73,10 @@ const (
 	gateRowRecreating                    // the old pods are gone; new pods build toward target
 	gateRowSurging                       // the old pods serve while a replacement builds toward target
 	gateRowCreating                      // a new Instance builds toward target
+	gateRowShort                         // a gang short of one pod: the rest serve while the workload rebuilds it on rev
 )
 
-var gateRowKindNames = [...]string{"", "lost", "recreate", "surge", "create"}
+var gateRowKindNames = [...]string{"", "lost", "recreate", "surge", "create", "short"}
 
 type gateRow struct {
 	kind   gateRowKind
@@ -162,6 +164,11 @@ func (m gateMemberState) String() string {
 // one run.
 type gateBudgets struct {
 	lostPods, lostFlushes, scales, pushes, edits, removals, rollbacks, pauses, forces, resumes int8
+	// nodeLosses is nodes lost, each taking one Instance of every member;
+	// memberLosses is gang members lost; resizes is resizes of one side,
+	// both sides or the ratio; analysisFails and analysisGaps are the
+	// answers of the metrics source that breach or go unreadable.
+	nodeLosses, memberLosses, resizes, analysisFails, analysisGaps int8
 }
 
 // gateConfig is one configuration under exploration.
@@ -172,6 +179,13 @@ type gateConfig struct {
 	steps          []v1beta1.RolloutGroupStep
 	scaleDownDelay int32
 	budgets        gateBudgets
+	// follower makes the decoder's count follow the engine's under a
+	// proportional scaling policy, written beside the engine's resize as
+	// the scaling coordinator writes it.
+	follower bool
+	// rolling puts the members under one rollingUpdate group with no
+	// canary, so coordination owns their revision records.
+	rolling bool
 }
 
 func (c gateConfig) String() string {
@@ -179,7 +193,11 @@ func (c gateConfig) String() string {
 	for _, m := range c.members {
 		parts = append(parts, m.String())
 	}
-	return fmt.Sprintf("%s steps=%s drain=%ds", strings.Join(parts, " "), c.stepsName, c.scaleDownDelay)
+	s := fmt.Sprintf("%s steps=%s drain=%ds", strings.Join(parts, " "), c.stepsName, c.scaleDownDelay)
+	if c.follower {
+		s += " follower=decoder"
+	}
+	return s
 }
 
 // gateMove is one thing the world or the operator does between two passes.
@@ -192,10 +210,12 @@ type gateMove struct {
 
 func (m gateMove) String() string {
 	switch m.kind {
-	case "serve", "podloss":
+	case "serve", "podloss", "memberloss":
 		return fmt.Sprintf("%s member %d row %d", m.kind, m.member, m.idx)
-	case "scale":
-		return fmt.Sprintf("scale member %d by %+d", m.member, m.delta)
+	case "scale", "resize":
+		return fmt.Sprintf("%s member %d by %+d", m.kind, m.member, m.delta)
+	case "nodeloss":
+		return gateNodeName(m.idx) + " lost"
 	}
 	return m.kind
 }
@@ -216,7 +236,18 @@ type gateState struct {
 	removed          bool
 	unsettled        bool
 	reopened         string
-	path             []gateMove
+	// reusedRun is a run id opened again after a run with that id closed;
+	// it is read at the state where it happened and not carried on.
+	reusedRun string
+	path      []gateMove
+	// sample is the standing answer of the metrics source.
+	sample gateSample
+	// passEvents are the events the last pass recorded, the hold text an
+	// operator reads beside the status.
+	passEvents []string
+	// history is the revision model's part of the state: each member's
+	// ControllerRevisions and replica identity; nil for the canary model.
+	history *gateHistory
 }
 
 func (st *gateState) clone() *gateState {
@@ -233,6 +264,9 @@ func (st *gateState) clone() *gateState {
 		removed:          st.removed,
 		reopened:         st.reopened,
 		path:             append([]gateMove(nil), st.path...),
+		sample:           st.sample,
+		passEvents:       append([]string(nil), st.passEvents...),
+		history:          st.history.clone(),
 	}
 	for i, m := range st.members {
 		m.rows = append([]gateRow(nil), m.rows...)
@@ -264,6 +298,8 @@ type gateWorld struct {
 	scheme *runtime.Scheme
 	// passes counts controller passes; dispatches the canary dispatches in them.
 	passes, dispatches int
+	// ext is what another model adds to this world; nil for the canary model.
+	ext *gateExtension
 }
 
 func newGateWorld(t *testing.T, cfg gateConfig, scheme *runtime.Scheme) *gateWorld {
@@ -295,11 +331,20 @@ func gateISVC(cfg gateConfig) *v1beta1.InferenceService {
 			isvc.Spec.Router = &v1beta1.RouterSpec{ComponentExtensionSpec: ext}
 		}
 	}
-	canary := &v1beta1.GroupCanary{Steps: append([]v1beta1.RolloutGroupStep(nil), cfg.steps...)}
-	if cfg.scaleDownDelay > 0 {
-		canary.ScaleDownDelaySeconds = ptr.To(cfg.scaleDownDelay)
+	group := v1beta1.RolloutGroup{Components: comps}
+	if cfg.rolling {
+		group.RollingUpdate = &v1beta1.GroupRollingUpdate{}
+	} else {
+		canary := &v1beta1.GroupCanary{Steps: append([]v1beta1.RolloutGroupStep(nil), cfg.steps...)}
+		if cfg.scaleDownDelay > 0 {
+			canary.ScaleDownDelaySeconds = ptr.To(cfg.scaleDownDelay)
+		}
+		group.Canary = canary
 	}
-	isvc.Spec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{{Components: comps, Canary: canary}}}
+	isvc.Spec.Rollout = &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{group}}
+	if cfg.follower {
+		gateFollowerPolicy(isvc, cfg)
+	}
 	return isvc
 }
 
@@ -320,6 +365,9 @@ func (w *gateWorld) initial() *gateState {
 		}
 		st.members[i] = gateMemberState{rows: rows, desired: m.desired, updateRev: gateRevisions[1], current: gateRevisions[0], generation: 1}
 	}
+	if w.ext != nil && w.ext.initial != nil {
+		w.ext.initial(w, st)
+	}
 	return st
 }
 
@@ -333,6 +381,10 @@ func gateRunners(gang int32) []v1beta1.Runner {
 // rollup publishes each member's current revision the way the replica's
 // status does: the revision every Instance serves, once they all serve one.
 func (w *gateWorld) rollup(st *gateState) {
+	if w.ext != nil && w.ext.rollup != nil {
+		w.ext.rollup(w, st)
+		return
+	}
 	for i := range st.members {
 		m := &st.members[i]
 		shared := ""
@@ -372,7 +424,9 @@ func (w *gateWorld) replica(st *gateState, i int) *v1beta1.InferenceReplica {
 		}
 	}
 	r.Status.ObservedGeneration = m.generation
-	r.Status.CurrentRevision = gateRevisionName(cfg.comp, m.current)
+	if m.current != "" {
+		r.Status.CurrentRevision = gateRevisionName(cfg.comp, m.current)
+	}
 	r.Status.UpdateRevision = gateRevisionName(cfg.comp, m.updateRev)
 	r.Status.Replicas = int32(len(m.rows))
 	attempt := func(step string) *v1beta1.InstanceOperation {
@@ -398,6 +452,10 @@ func (w *gateWorld) replica(st *gateState, i int) *v1beta1.InferenceReplica {
 		case gateRowCreating:
 			rs.Phase, rs.TargetRevision, rs.PodCount = v1beta1.OMENativeInstanceCreating, gateRevisionName(cfg.comp, row.target), cfg.gang
 			rs.Operation = &v1beta1.InstanceOperation{ID: "create", Type: v1beta1.InstanceOperationCreate}
+		case gateRowShort:
+			rs.Phase, rs.RunningRevision = v1beta1.OMENativeInstanceRestarting, gateRevisionName(cfg.comp, row.rev)
+			rs.PodCount, rs.ReadyPodCount, rs.ServingPodCount, rs.AvailablePodCount = cfg.gang, cfg.gang-1, cfg.gang-1, cfg.gang-1
+			rs.Operation = &v1beta1.InstanceOperation{ID: "repair", Type: v1beta1.InstanceOperationRestart}
 		}
 		if row.serving() {
 			ready++
@@ -411,36 +469,48 @@ func (w *gateWorld) replica(st *gateState, i int) *v1beta1.InferenceReplica {
 	return r
 }
 
+// gateInstancePods are the pods of one Instance as the kubelet reports
+// them: count pods of a gang-sized Instance on one revision, named after
+// the service, the Component, the Instance index and the runner, Ready or
+// not; the suffix tells a replacement's pods from the old ones.
+func gateInstancePods(ns, service string, comp v1beta1.ComponentType, idx int, gang, count int32, rev, suffix string, ready bool) []runtime.Object {
+	var out []runtime.Object
+	for ordinal := int32(0); ordinal < count; ordinal++ {
+		runner := v1beta1.RunnerNameDefault
+		if gang > 1 {
+			runner = v1beta1.RunnerNameWorker
+			if ordinal == 0 {
+				runner = v1beta1.RunnerNameLeader
+			}
+		}
+		name := fmt.Sprintf("%s-%s-%d-%s-%d%s", service, comp, idx, runner, ordinal, suffix)
+		pod := canaryRunnerPod(ns, service, string(comp), rev, name, runner, strconv.Itoa(int(ordinal)))
+		pod.Labels[query.LabelInstanceIdx] = strconv.Itoa(idx)
+		if !ready {
+			pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+		}
+		out = append(out, pod)
+	}
+	return out
+}
+
 // pods are one Instance's pods as the kubelet reports them.
 func (w *gateWorld) pods(i, idx int, row gateRow) []runtime.Object {
 	cfg := w.cfg.members[i]
 	var out []runtime.Object
-	add := func(rev, suffix string, ready bool) {
-		for ordinal := int32(0); ordinal < cfg.gang; ordinal++ {
-			runner := v1beta1.RunnerNameDefault
-			if cfg.gang > 1 {
-				runner = v1beta1.RunnerNameWorker
-				if ordinal == 0 {
-					runner = v1beta1.RunnerNameLeader
-				}
-			}
-			name := fmt.Sprintf("%s-%s-%d-%s-%d%s", gateService, cfg.comp, idx, runner, ordinal, suffix)
-			pod := canaryRunnerPod(gateNamespace, gateService, string(cfg.comp), rev, name, runner, strconv.Itoa(int(ordinal)))
-			pod.Labels[query.LabelInstanceIdx] = strconv.Itoa(idx)
-			if !ready {
-				pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
-			}
-			out = append(out, pod)
-		}
+	add := func(rev, suffix string, ready bool, count int32) {
+		out = append(out, gateInstancePods(gateNamespace, gateService, cfg.comp, idx, cfg.gang, count, rev, suffix, ready)...)
 	}
 	switch row.kind {
 	case gateRowServing:
-		add(row.rev, "", true)
+		add(row.rev, "", true, cfg.gang)
 	case gateRowRecreating, gateRowCreating:
-		add(row.target, "", false)
+		add(row.target, "", false, cfg.gang)
 	case gateRowSurging:
-		add(row.rev, "", true)
-		add(row.target, "-s", false)
+		add(row.rev, "", true, cfg.gang)
+		add(row.target, "-s", false, cfg.gang)
+	case gateRowShort:
+		add(row.rev, "", true, cfg.gang-1)
 	}
 	return out
 }
@@ -448,6 +518,9 @@ func (w *gateWorld) pods(i, idx int, row gateRow) []runtime.Object {
 // objects are everything the pass reads: the service, each member's replica
 // and pods, and every revision of every member.
 func (w *gateWorld) objects(st *gateState) []runtime.Object {
+	if w.ext != nil && w.ext.objects != nil {
+		return w.ext.objects(w, st)
+	}
 	objs := []runtime.Object{st.isvc.DeepCopy()}
 	for i, cfg := range w.cfg.members {
 		objs = append(objs, w.replica(st, i))
@@ -474,10 +547,7 @@ func (w *gateWorld) client(st *gateState) client.Client {
 func (w *gateWorld) workloadStep(st *gateState, i int) {
 	cfg := w.cfg.members[i]
 	m := &st.members[i]
-	target := m.updateRev
-	if m.rollbackTo != "" {
-		target = query.RevisionFromName(m.rollbackTo).Hash()
-	}
+	target := w.buildTarget(st, i)
 	var partition int32
 	switch {
 	case m.partition != nil:
@@ -509,7 +579,7 @@ func (w *gateWorld) workloadStep(st *gateState, i int) {
 		switch {
 		case cfg.surges() && r.kind == gateRowSurging:
 			inFlight++
-		case !cfg.surges() && (r.kind == gateRowRecreating || r.kind == gateRowLost):
+		case !cfg.surges() && (r.kind == gateRowRecreating || r.kind == gateRowLost || r.kind == gateRowShort):
 			inFlight++
 		}
 	}
@@ -528,6 +598,32 @@ func (w *gateWorld) workloadStep(st *gateState, i int) {
 		r.target = target
 		inFlight++
 	}
+}
+
+// buildTarget is the revision a member's workload builds toward: the
+// rollback target its replica carries, resolved against the replica's
+// history when the extension holds one (a target outside the history
+// leaves the workload on the spec), else the spec.
+func (w *gateWorld) buildTarget(st *gateState, i int) string {
+	m := st.members[i]
+	if m.rollbackTo == "" {
+		return m.updateRev
+	}
+	if w.ext != nil && w.ext.rollbackTarget != nil {
+		if hash := w.ext.rollbackTarget(w, st, i); hash != "" {
+			return hash
+		}
+		return m.updateRev
+	}
+	return query.RevisionFromName(m.rollbackTo).Hash()
+}
+
+// extraMoves are the extension's moves, none for the canary model.
+func (w *gateWorld) extraMoves(st *gateState) []gateMove {
+	if w.ext == nil || w.ext.moves == nil {
+		return nil
+	}
+	return w.ext.moves(w, st)
 }
 
 // activeRunID is the open run's id, empty when none is open.
@@ -559,7 +655,9 @@ func (w *gateWorld) pass(st *gateState) {
 	isvc := st.isvc
 	c := w.client(st)
 	before := activeRunID(isvc)
-	out, err := rolloutrun.Reconcile(w.ctx, rolloutrun.Inputs{Client: c, Reader: c, ISVC: isvc, Now: st.now})
+	events := &gateEvents{}
+	sampler := &gateSampler{st: st}
+	out, err := rolloutrun.Reconcile(w.ctx, rolloutrun.Inputs{Client: c, Reader: c, Recorder: events, ISVC: isvc, Now: st.now})
 	if err != nil {
 		w.fail("run layer: %v (state %s)", err, st)
 	}
@@ -567,7 +665,7 @@ func (w *gateWorld) pass(st *gateState) {
 	policies := out.Policies
 	if out.Opened {
 		for _, g := range rollout.CanaryGroups(isvc, policies) {
-			if err := BindRun(w.ctx, c, isvc, g, out.Adopted); err != nil {
+			if err := BindRun(w.ctx, c, isvc, g, RunOpen{Adopted: out.Adopted, Closed: out.Closed}); err != nil {
 				w.fail("bind run: %v", err)
 			}
 		}
@@ -596,17 +694,25 @@ func (w *gateWorld) pass(st *gateState) {
 	c = w.client(st)
 	for _, g := range rollout.CanaryGroups(isvc, policies) {
 		if _, err := Dispatch(w.ctx, DispatchDeps{
-			Client: c, Reader: c, ISVC: isvc, Policies: policies, Now: st.now,
+			Client: c, Reader: c, Recorder: events, ISVC: isvc, Policies: policies, Now: st.now,
 			DefaultReadyTimeout: cellReadyTimeout, Requeue: reconcileRequeue, ParkedRequeue: failedRequeue,
 			ComponentRunnerPorts: canaryRunnerPorts(), Group: g,
+			StepSampler: sampler, BundledPrometheusAddress: gatePrometheusAddress,
 		}); err != nil {
 			w.fail("dispatch: %v (state %s)", err, st)
 		}
 		w.dispatches++
 	}
+	st.passEvents = events.messages
+	if sampler.answered && (st.sample.failing || st.sample.gap) {
+		st.sample.reads++
+	}
 	// The controller drops the record and the phase of a unit no group names
 	// any more, as it does after the dispatch.
 	ReleaseUndeclaredUnits(isvc, policies)
+	if w.ext != nil && w.ext.afterPass != nil {
+		w.ext.afterPass(w, st, c, isvc, policies)
+	}
 	for i, cfg := range w.cfg.members {
 		r := &v1beta1.InferenceReplica{}
 		if err := c.Get(w.ctx, irprojector.RoleReplicaKey(isvc, cfg.comp), r); err != nil {
@@ -624,6 +730,13 @@ func (w *gateWorld) pass(st *gateState) {
 	after := activeRunID(isvc)
 	if before != "" && before != after {
 		st.closes[before]++
+	}
+	if after != "" && after != before && st.closes[after] > 0 {
+		// The id is the hash of the targets, the plan and the second the
+		// run opened in, so a run opened in the same second as the close
+		// of one toward the same targets carries the same id.
+		st.reusedRun = after
+		delete(st.closes, after)
 	}
 	if after != "" && after != before && isvc.Status.Rollout.LastRun != nil {
 		last := isvc.Status.Rollout.LastRun
@@ -685,6 +798,7 @@ func (w *gateWorld) deadlines(st *gateState) []time.Time {
 		if step.Pause != nil && step.Pause.Duration != nil {
 			out = append(out, cs.StepEnteredTime.Add(step.Pause.Duration.Duration))
 		}
+		out = append(out, gateAnalysisDeadlines(cs, step)...)
 		if delay := u.group.Canary.ScaleDownDelaySeconds; int(cs.CurrentStep) == len(steps)-1 && delay != nil && *delay > 0 {
 			out = append(out, cs.StepEnteredTime.Add(time.Duration(*delay)*time.Second))
 		}
@@ -782,7 +896,10 @@ func (st *gateState) key() string {
 		}
 		b.WriteString(";")
 	}
-	fmt.Fprintf(&b, "budgets:%+v;flush:%t;", st.budgets, st.lostFlushPending)
+	fmt.Fprintf(&b, "budgets:%+v;flush:%t;sample:%s;", st.budgets, st.lostFlushPending, st.sample)
+	if st.history != nil {
+		b.WriteString(st.history.key(st))
+	}
 	return b.String()
 }
 
@@ -854,7 +971,7 @@ func (w *gateWorld) progressMoves(st *gateState) []gateMove {
 			}
 			last[r.kind] = idx
 		}
-		for _, kind := range []gateRowKind{gateRowRecreating, gateRowSurging, gateRowCreating, gateRowLost} {
+		for _, kind := range []gateRowKind{gateRowRecreating, gateRowSurging, gateRowCreating, gateRowLost, gateRowShort} {
 			if idx, ok := first[kind]; ok {
 				out = append(out, gateMove{kind: "serve", member: i, idx: idx})
 				if last[kind] != idx {
@@ -866,12 +983,17 @@ func (w *gateWorld) progressMoves(st *gateState) []gateMove {
 	if _, ok := w.nextDeadline(st); ok {
 		out = append(out, gateMove{kind: "clock-next"}, gateMove{kind: "clock-all"})
 	}
+	// The world mends a breaching or unreadable metrics source once the gate
+	// has read it: one unreadable sample, or breaches up to the step's limit.
+	if (st.sample.gap && st.sample.reads >= 1) || (st.sample.failing && st.sample.reads >= 2) {
+		out = append(out, gateMove{kind: "analysis-recover"})
+	}
 	return out
 }
 
 // releaseMoves are the operator verbs a hold names as its way out: a promote
 // at a gate, the end of a pause, a resume of a Failed or rolled-back unit, a
-// rollback of a Failed unit, and the repin the drift condition points at.
+// rollback of a Failed unit, and the plan reread the drift condition points at.
 // The exploration spends budgets on the resume and the rollback; the
 // classification of a quiet state asks for them regardless, since a budget
 // is the model's bound and not a hold.
@@ -891,13 +1013,19 @@ func (w *gateWorld) releaseMoves(st *gateState, full, ignoreBudget bool) []gateM
 		}
 		_, promoting := ann[constants.RolloutPromoteAnnotation]
 		switch u.state {
-		case rollout.CanaryStateServing, rollout.CanaryStatePreHold, rollout.CanaryStateDraining:
-			if !promoting {
+		case rollout.CanaryStateServing, rollout.CanaryStatePreHold, rollout.CanaryStateDraining, rollout.CanaryStateStaging:
+			if !promoting && (u.state != rollout.CanaryStateStaging || full || ignoreBudget) {
 				out = append(out, gateMove{kind: "promote"})
 			}
-		case rollout.CanaryStateStaging:
-			if full && !promoting {
-				out = append(out, gateMove{kind: "promote"})
+			// The classification asks every verb a live step answers to:
+			// the forced promote and the rollback beside the promote.
+			if ignoreBudget {
+				if _, forcing := ann[constants.RolloutPromoteForceAnnotation]; !forcing {
+					out = append(out, gateMove{kind: "force"})
+				}
+				if u.record.RolledBackRevisionHash == "" {
+					out = append(out, gateMove{kind: "rollback"})
+				}
 			}
 		case rollout.CanaryStateFailed, rollout.CanaryStateRolledBack:
 			if _, resuming := ann[constants.RolloutResumeAnnotation]; !resuming && budgets.resumes > 0 {
@@ -984,7 +1112,7 @@ func (w *gateWorld) adverseMoves(st *gateState) []gateMove {
 			out = append(out, gateMove{kind: "remove"})
 		}
 	}
-	return out
+	return append(out, w.faultMoves(st)...)
 }
 
 // apply makes one move and lets the controller settle on it.
@@ -998,7 +1126,7 @@ func (w *gateWorld) apply(st *gateState, mv gateMove) *gateState {
 		switch r.kind {
 		case gateRowRecreating, gateRowSurging, gateRowCreating:
 			r.kind, r.rev, r.target = gateRowServing, r.target, ""
-		case gateRowLost:
+		case gateRowLost, gateRowShort:
 			r.kind = gateRowServing
 		}
 	case "clock-next":
@@ -1055,10 +1183,7 @@ func (w *gateWorld) apply(st *gateState, mv gateMove) *gateState {
 		if mv.delta < 0 {
 			m.rows = m.rows[:len(m.rows)+int(mv.delta)]
 		} else {
-			target := m.updateRev
-			if m.rollbackTo != "" {
-				target = query.RevisionFromName(m.rollbackTo).Hash()
-			}
+			target := w.buildTarget(next, mv.member)
 			for k := int32(0); k < mv.delta; k++ {
 				m.rows = append(m.rows, gateRow{kind: gateRowCreating, target: target})
 			}
@@ -1085,6 +1210,10 @@ func (w *gateWorld) apply(st *gateState, mv gateMove) *gateState {
 		next.removed = true
 		isvc.Spec.Rollout = nil
 		isvc.Generation++
+	default:
+		if w.ext == nil || w.ext.apply == nil || !w.ext.apply(w, next, mv) {
+			w.applyFault(next, mv)
+		}
 	}
 	w.settle(next)
 	return next
@@ -1101,8 +1230,14 @@ type gateFinding struct {
 func (w *gateWorld) servingOn(st *gateState, i int, hash string) int32 {
 	var n int32
 	for _, r := range st.members[i].rows {
-		if r.serving() && r.rev == hash {
+		if r.rev != hash {
+			continue
+		}
+		switch {
+		case r.serving():
 			n += w.cfg.members[i].gang
+		case r.kind == gateRowShort:
+			n += w.cfg.members[i].gang - 1
 		}
 	}
 	return n
@@ -1113,6 +1248,9 @@ func (w *gateWorld) check(st *gateState, full bool) []gateFinding {
 	var out []gateFinding
 	add := func(class, format string, args ...any) {
 		out = append(out, gateFinding{class: class, message: fmt.Sprintf(format, args...), state: st})
+	}
+	if w.ext != nil && w.ext.check != nil {
+		out = append(out, w.ext.check(w, st)...)
 	}
 	if st.unsettled {
 		add("unsettled", "the controller kept changing its status for eight passes with no move in between")
@@ -1125,16 +1263,30 @@ func (w *gateWorld) check(st *gateState, full bool) []gateFinding {
 	if st.reopened != "" {
 		add("reopen-after-complete", "a run opened toward %s right after the run that closed Completed on the same targets", st.reopened)
 	}
-	// (a) traffic names only revisions that serve. A rollback and a Failed
-	// hold keep the last split they wrote, and a member with nothing in
-	// rotation keeps the step's weight; both are a split that names an unserving
-	// revision, not decided yet. A member whose own canary pod serves
-	// while its split rests on a revision it has no pod on is reported apart.
+	if st.reusedRun != "" {
+		add("run-id-reused", "run %s opened again in the second a run with that id closed, toward the same targets under the same plan", st.reusedRun)
+	}
+	// (a) traffic names only revisions that serve. A member with nothing in
+	// rotation keeps the step's weight, and a unit under the operator's pause
+	// has its pass write nothing; both are a split that names an unserving
+	// revision and are reported apart. A rollback or a Failed hold moves a
+	// stable share with no pod behind it onto the revision that serves, so a
+	// split left on an empty stable revision under a hold fails, as does one
+	// on a member that keeps no stable Instance; a stopped canary whose
+	// canary pod is lost keeps the step's share on the canary revision until
+	// the workload rebuilds the pod, which is reported apart.
+	// After the done mark the cutover names the target alone until it lands,
+	// which is reported apart.
+	paused, _ := constants.RolloutPauseState(st.isvc.Annotations)
 	held := false
+	heldStable := map[string]bool{}
 	for _, u := range w.units(st) {
 		switch u.state {
 		case rollout.CanaryStateFailed, rollout.CanaryStateRollingBack, rollout.CanaryStateRolledBack:
 			held = true
+			if u.record != nil {
+				heldStable[u.record.StableRevisionHash] = true
+			}
 		}
 	}
 	for i, cfg := range w.cfg.members {
@@ -1161,8 +1313,14 @@ func (w *gateWorld) check(st *gateState, full bool) []gateFinding {
 				switch {
 				case total == 0:
 					class = "traffic-empty-revision-nothing-serves"
+				case paused:
+					class = "traffic-empty-revision-under-a-pause"
+				case held && heldStable[hash]:
+					class = "traffic-empty-stable-revision-under-a-hold"
 				case held:
-					class = "traffic-empty-revision-under-a-hold"
+					class = "traffic-empty-canary-revision-under-a-hold"
+				case w.unitDone(st, cfg.comp):
+					class = "traffic-empty-revision-after-cutover"
 				case heldFloor(st.members[i].desired) == 0 && len(w.cfg.members) > 1:
 					class = "known-single-router-traffic"
 				}
@@ -1171,9 +1329,9 @@ func (w *gateWorld) check(st *gateState, full bool) []gateFinding {
 		}
 	}
 	// (b) the held share of the fleet is what the step asks for. After a
-	// scale the created Instances run the canary revision, and after a
-	// resume the step counter returns to 0 while the Instances a later step
-	// moved stay where they are; both are reported under their own names.
+	// scale the created Instances run the canary revision; after a resume
+	// the unit continues at a step whose staged count covers the fleet.
+	// Both pictures are named apart.
 	suffix := ""
 	switch {
 	case st.scaled:
@@ -1198,7 +1356,11 @@ func (w *gateWorld) check(st *gateState, full bool) []gateFinding {
 				switch {
 				case r.rev == cs.CanaryRevisionHash || (r.inFlight() && r.target == cs.CanaryRevisionHash):
 					onCanary++
-				case r.kind == gateRowServing || r.kind == gateRowLost || r.kind == gateRowSurging:
+				case r.kind == gateRowServing || r.kind == gateRowLost || r.kind == gateRowSurging || r.kind == gateRowShort:
+					kept++
+				case r.kind == gateRowCreating && r.target != "":
+					// A first build toward a revision other than the canary's
+					// is kept off the canary revision by the attempt itself.
 					kept++
 				}
 			}
@@ -1218,7 +1380,21 @@ func (w *gateWorld) check(st *gateState, full bool) []gateFinding {
 			}
 		}
 	}
-	// (d) the run reaches an end: not finished, nothing moves on its own, and
+	// (d) a capacity wait with nothing coming up never ends on its own: no
+	// Instance is building, lost or short on any member, the rollout is not
+	// paused, and a live unit still records the wait.
+	if paused, _ := constants.RolloutPauseState(st.isvc.Annotations); !paused && !w.anythingComingUp(st) {
+		for _, u := range w.units(st) {
+			if u.record == nil || u.record.CapacityWaitSince == nil {
+				continue
+			}
+			switch u.state {
+			case rollout.CanaryStateStaging, rollout.CanaryStateServing, rollout.CanaryStatePreHold, rollout.CanaryStateDraining:
+				add("capacity-never-arrives", "%s records a capacity wait at step %d with no Instance building, lost or short on any member: %s", u.primary, u.record.CurrentStep, st)
+			}
+		}
+	}
+	// (e) the run reaches an end: not finished, nothing moves on its own, and
 	// no hold names a way out that works. An end is counted by how the last
 	// run closed.
 	if w.finished(st) {
@@ -1309,6 +1485,9 @@ func (w *gateWorld) classifyQuiet(st *gateState, full bool) (string, string) {
 		return "no-way-out", description + " | rows: " + st.String()
 	}
 	sort.Strings(ways)
+	if named, reading := w.holdNamed(st); !named {
+		return "hold-unnamed", fmt.Sprintf("the wait is not named in the status (%s); ways out: %s | %s | rows: %s", reading, strings.Join(ways, "+"), description, st)
+	}
 	class := "hold-" + strings.Join(ways, "+")
 	for _, u := range w.units(st) {
 		if u.state == rollout.CanaryStateFailed {
@@ -1330,6 +1509,11 @@ type gateReport struct {
 
 func (w *gateWorld) record(rep *gateReport, st *gateState, full bool) {
 	for _, f := range w.check(st, full) {
+		if w.ext != nil && w.ext.fold != nil {
+			if known := w.ext.fold(w, f); known != "" {
+				f.class = known
+			}
+		}
 		rep.counts[f.class]++
 		if _, ok := rep.findings[f.class]; !ok {
 			rep.findings[f.class] = f
@@ -1365,6 +1549,7 @@ func (w *gateWorld) explore(maxStates, maxDepth int, full bool) gateReport {
 		}
 		moves := append(w.progressMoves(st), w.releaseMoves(st, full, false)...)
 		moves = append(moves, w.adverseMoves(st)...)
+		moves = append(moves, w.extraMoves(st)...)
 		for _, mv := range moves {
 			child := w.apply(st, mv)
 			k := w.clockKey(child)
@@ -1392,7 +1577,7 @@ func (w *gateWorld) randomRuns(rep *gateReport, seed int64, runs, maxDepth int, 
 				break
 			}
 			forward := append(w.progressMoves(st), w.releaseMoves(st, full, false)...)
-			adverse := w.adverseMoves(st)
+			adverse := append(w.adverseMoves(st), w.extraMoves(st)...)
 			if len(forward) == 0 && len(adverse) == 0 {
 				break
 			}
@@ -1509,6 +1694,17 @@ func gateStepList(name string) []v1beta1.RolloutGroupStep {
 			{Capacity: intstr.FromString("50%"), Traffic: 50, Pause: timed()},
 			{Capacity: intstr.FromString("100%"), Traffic: 100},
 		}
+	case "two-analysis":
+		return []v1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("50%"), Traffic: 50, Pause: gateBake(), Analysis: gateAnalysis(nil)},
+			{Capacity: intstr.FromString("100%"), Traffic: 100},
+		}
+	case "three-analysis":
+		return []v1beta1.RolloutGroupStep{
+			{Capacity: intstr.FromString("25%"), Traffic: 0, Pause: manual},
+			{Capacity: intstr.FromString("50%"), Traffic: 50, Pause: gateBake(), Analysis: gateAnalysis(ptr.To(v1beta1.OnInconclusiveRollbackOnStall))},
+			{Capacity: intstr.FromString("100%"), Traffic: 100, Pause: gateBake(), Analysis: gateAnalysis(ptr.To(v1beta1.OnInconclusiveRollback))},
+		}
 	}
 	panic("unknown step list " + name)
 }
@@ -1558,10 +1754,10 @@ func gateDefaultBudgets(full bool) gateBudgets {
 }
 
 // gateConfigs lists the configurations to explore: every shape under both
-// strategies and the chart's 10 percent budget with the reference step
+// strategies at a 10 percent budget with the reference step
 // lists, then a seeded sample over the whole space.
-// gateConfigFor is one configuration: a shape under one strategy at the
-// chart's 10 percent budget, one step list, one drain window, and an
+// gateConfigFor is one configuration: a shape under one strategy at a
+// 10 percent budget, one step list, one drain window, and an
 // operator partition beside the canary when given.
 func gateConfigFor(shape gateShape, strategy v1beta1.UpdateStrategyType, stepsName string, drain int32, partition *int32, full bool) gateConfig {
 	cfg := gateConfig{stepsName: stepsName, steps: gateStepList(stepsName), scaleDownDelay: drain, budgets: gateDefaultBudgets(full)}
@@ -1655,11 +1851,14 @@ func gateConfigs(full bool) []gateConfig {
 }
 
 // gateKnownClasses are the readings the explorer reports without failing,
-// each in words: one sub-case of a split that names an unserving revision,
-// which is not decided yet; the picture below records the current
-// behaviour.
+// each in words: the splits that name an unserving revision by rule, and the
+// run id reused within one second.
 var gateKnownClasses = map[string]string{
-	"known-single-router-traffic": "a member that keeps no stable Instance has its split held on the previous revision, which has no pod of it, while a sibling's canary Instances come up (a split naming an unserving revision; not decided yet)",
+	"traffic-empty-revision-under-a-pause":       "the operator's pause holds the pass, which writes no traffic, so a member whose one Instance rolled to the pushed revision keeps the split the pause found on the revision the pod left (a paused step's split is left open)",
+	"traffic-empty-revision-nothing-serves":      "a member with nothing in rotation keeps the step's weight: a loss with nothing to move onto is the workload's repair, not a traffic decision",
+	"traffic-empty-canary-revision-under-a-hold": "a stopped canary whose canary pod is lost keeps the step's share on the canary revision until the workload rebuilds the pod: the stop leaves the split where it stood, and only an empty stable revision moves it (left open)",
+	"traffic-empty-revision-after-cutover":       "after the done mark the cutover names the target alone and is not rewritten; a member whose target pods are lost while the old pod of its last surging Instance still serves sends its traffic to a revision with no pod (a split naming an unserving revision; left open)",
+	"run-id-reused":                              "a run opened in the same second as the close of a run toward the same targets under the same plan carries the same id, so events name two runs alike (the id is a hash of the targets, the plan and the opening second; left open)",
 }
 
 // gateExplore explores every configuration keep admits and reports each
@@ -1671,19 +1870,42 @@ var gateKnownClasses = map[string]string{
 // after it completed, a straight run that reaches no end, and a controller
 // that does not settle. Known holds, the known class above, a split under
 // a hold or with nothing serving, and a scale or a resume under a step are
-// reported only; those readings are not decided yet.
+// reported only; those readings are left open.
 func gateExplore(t *testing.T, keep func(gateConfig) bool) {
 	t.Helper()
-	full := os.Getenv("OME_CANARY_HUNT") == "full"
-	maxStates, maxDepth, runs := 36, 60, 2
-	if full {
-		maxStates, maxDepth, runs = 80, 100, 3
-	}
 	var configs []gateConfig
-	for _, cfg := range gateConfigs(full) {
+	for _, cfg := range gateConfigs(os.Getenv("OME_CANARY_HUNT") == "full") {
 		if keep(cfg) {
 			configs = append(configs, cfg)
 		}
+	}
+	gateExploreConfigs(t, configs)
+}
+
+// gateExploreConfigs explores the given configurations; see gateExplore.
+// OME_CANARY_HUNT_ONLY keeps the configurations whose name contains one of
+// its comma-separated parts, to replay a finding.
+func gateExploreConfigs(t *testing.T, configs []gateConfig) {
+	t.Helper()
+	// Every pass builds a fake API from the whole fleet; the garbage of those
+	// builds dominates the run, so the collector is given more room.
+	defer debug.SetGCPercent(debug.SetGCPercent(400))
+	full := os.Getenv("OME_CANARY_HUNT") == "full"
+	if only := os.Getenv("OME_CANARY_HUNT_ONLY"); only != "" {
+		var kept []gateConfig
+		for _, cfg := range configs {
+			for _, part := range strings.Split(only, ",") {
+				if part != "" && strings.Contains(cfg.name, part) {
+					kept = append(kept, cfg)
+					break
+				}
+			}
+		}
+		configs = kept
+	}
+	maxStates, maxDepth, runs := 36, 60, 2
+	if full {
+		maxStates, maxDepth, runs = 80, 100, 3
 	}
 	totals := map[string]int{}
 	var states, passes, dispatches, allRuns int
@@ -1694,40 +1916,8 @@ func gateExplore(t *testing.T, keep func(gateConfig) bool) {
 	examples := map[string][]example{}
 	configsWith := map[string]int{}
 	started := time.Now()
-	// Configurations run side by side, a bounded few at a time, each in its
-	// own world; the reports are read back in configuration order.
-	type result struct {
-		rep              gateReport
-		passes, dispatch int
-		failure          string
-	}
-	results := make([]result, len(configs))
 	scheme := canaryScheme(t)
-	workers := make(chan struct{}, gateWorkers())
-	var wg sync.WaitGroup
-	for n := range configs {
-		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
-			workers <- struct{}{}
-			defer func() { <-workers }()
-			w := newGateWorld(t, configs[n], scheme)
-			res := result{}
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						res.failure = fmt.Sprint(r)
-					}
-				}()
-				res.rep = w.explore(maxStates, maxDepth, full)
-				w.straightRun(&res.rep, 4*maxDepth, full)
-				w.randomRuns(&res.rep, 1, runs, 4*maxDepth, full)
-			}()
-			res.passes, res.dispatch = w.passes, w.dispatches
-			results[n] = res
-		}(n)
-	}
-	wg.Wait()
+	results := gateRunConfigs(configs, func(n int) *gateWorld { return newGateWorld(t, configs[n], scheme) }, gateRunBounds{states: maxStates, depth: maxDepth, runs: runs, probe: true, full: full}, gateWorkers())
 	for n, cfg := range configs {
 		res := results[n]
 		rep := res.rep
@@ -1754,6 +1944,11 @@ func gateExplore(t *testing.T, keep func(gateConfig) bool) {
 			totals[class] += c
 		}
 		for class, f := range rep.findings {
+			if known := gateKnownFindingFor(cfg, f); known != "" {
+				totals[known] += rep.counts[class]
+				totals[class] -= rep.counts[class]
+				class = known
+			}
 			configsWith[class]++
 			if len(examples[class]) < 8 {
 				examples[class] = append(examples[class], example{cfg: cfg, finding: f})
@@ -1761,14 +1956,18 @@ func gateExplore(t *testing.T, keep func(gateConfig) bool) {
 		}
 	}
 	classes := make([]string, 0, len(totals))
-	for class := range totals {
-		classes = append(classes, class)
+	for class, n := range totals {
+		if n > 0 {
+			classes = append(classes, class)
+		}
 	}
 	sort.Strings(classes)
 	t.Logf("%d configurations, %d states, %d random runs, %d controller passes, %d canary dispatches, %s", len(configs), states, allRuns, passes, dispatches, time.Since(started).Round(time.Second))
 	for _, class := range classes {
 		if known, ok := gateKnownClasses[class]; ok {
 			t.Logf("%s: %d states across %d configurations: %s", class, totals[class], configsWith[class], known)
+		} else if why := gateKnownFindingWhy(class); why != "" {
+			t.Logf("%s: %d states across %d configurations: %s", class, totals[class], configsWith[class], why)
 		} else {
 			t.Logf("%s: %d states across %d configurations", class, totals[class], configsWith[class])
 		}
@@ -1776,10 +1975,63 @@ func gateExplore(t *testing.T, keep func(gateConfig) bool) {
 			t.Logf("  [%s]\n    %s\n    path: %s\n    state: %s", ex.cfg.name, ex.finding.message, gatePath(ex.finding.state), ex.finding.state)
 		}
 		switch class {
-		case "no-way-out", "rollback-target-left-behind", "traffic-empty-revision", "held-short", "share-exceeded", "run-closed-twice", "reopen-after-complete", "unsettled", "depth", "model-error":
+		case "no-way-out", "hold-unnamed", "capacity-never-arrives", "rollback-target-left-behind", "traffic-empty-revision", "traffic-empty-stable-revision-under-a-hold",
+			"known-single-router-traffic", "held-short", "share-exceeded", "run-closed-twice", "reopen-after-complete", "unsettled", "depth", "model-error":
 			t.Errorf("%s: %d states (first: %s: %s)", class, totals[class], examples[class][0].cfg.name, examples[class][0].finding.message)
 		}
 	}
+}
+
+// gateRunBounds are the bounds of one configuration's exploration: the
+// breadth-first walk's states and depth, the random runs, and whether the
+// operator's moves are probed at every moment of the straight run.
+type gateRunBounds struct {
+	states, depth, runs int
+	probe, full         bool
+}
+
+// gateRunResult is one configuration's exploration as its worker left it; a
+// panic inside the world is its failure.
+type gateRunResult struct {
+	rep              gateReport
+	passes, dispatch int
+	failure          string
+}
+
+// gateRunConfigs explores every configuration side by side, workers at a
+// time, each in its own world built by newWorld, and returns the reports in
+// configuration order.
+func gateRunConfigs(configs []gateConfig, newWorld func(n int) *gateWorld, bounds gateRunBounds, workers int) []gateRunResult {
+	results := make([]gateRunResult, len(configs))
+	lanes := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	for n := range configs {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			lanes <- struct{}{}
+			defer func() { <-lanes }()
+			w := newWorld(n)
+			res := gateRunResult{}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						res.failure = fmt.Sprint(r)
+					}
+				}()
+				res.rep = w.explore(bounds.states, bounds.depth, bounds.full)
+				w.straightRun(&res.rep, 4*bounds.depth, bounds.full)
+				if bounds.probe {
+					w.probeMoments(&res.rep, 4*bounds.depth, bounds.full)
+				}
+				w.randomRuns(&res.rep, 1, bounds.runs, 4*bounds.depth, bounds.full)
+			}()
+			res.passes, res.dispatch = w.passes, w.dispatches
+			results[n] = res
+		}(n)
+	}
+	wg.Wait()
+	return results
 }
 
 // TestCanarySteps_SingleEngineRunsReachAnEnd explores a canary over one
@@ -1837,7 +2089,7 @@ func (w *gateWorld) runPasses(st *gateState, n int) *gateState {
 // run keeps, as designed, and reads Stable. The run layer judges a run whose
 // groups left the spec by the members it recorded, so the run closes
 // Completed on its own and the unit's record and phase go with the group.
-// A repin issued while such a run is still open closes it at once, as the
+// A plan reread issued while such a run is still open closes it at once, as the
 // drift condition says.
 func TestCanarySteps_RemovingTheRolloutBlockMidRunStillLetsTheRunClose(t *testing.T) {
 	w := newGateWorld(t, gateConfigFor(gateShapeNamed("engine4"), v1beta1.UpdateStrategyRecreatePod, "two-manual", 0, nil, false), canaryScheme(t))
@@ -1866,14 +2118,14 @@ func TestCanarySteps_RemovingTheRolloutBlockMidRunStillLetsTheRunClose(t *testin
 			t.Errorf("engine row %d stands at %s, want version 2 serving", idx, r)
 		}
 	}
-	// The repin the drift condition names closes a run that has not finished.
+	// The plan reread the drift condition names closes a run that has not finished.
 	st = w.initial()
 	w.settle(st)
 	st = w.serveAll(st)
 	st = w.apply(st, gateMove{kind: "remove"})
 	drift := st.isvc.Status.GetCondition(apis.ConditionType(v1beta1.RolloutPlanDriftCondition))
 	if drift == nil || drift.Status != corev1.ConditionTrue || !strings.Contains(drift.Message, constants.RolloutRepinAnnotation) {
-		t.Fatalf("the picture is wrong: the drift condition must point at the repin, got %+v", drift)
+		t.Fatalf("the picture is wrong: the drift condition must point at the plan reread, got %+v", drift)
 	}
 	st = w.apply(st, gateMove{kind: "repin"})
 	st = w.runPasses(st, 3)
@@ -1882,7 +2134,7 @@ func TestCanarySteps_RemovingTheRolloutBlockMidRunStillLetsTheRunClose(t *testin
 			constants.RolloutRepinAnnotation, st.isvc.Annotations[constants.RolloutRepinAnnotation], w.describe(st))
 	}
 	if _, ok := st.isvc.Annotations[constants.RolloutRepinAnnotation]; ok {
-		t.Errorf("the repin annotation was not removed with the close (%s)", w.describe(st))
+		t.Errorf("the plan-reread annotation was not removed with the close (%s)", w.describe(st))
 	}
 }
 
@@ -1928,19 +2180,16 @@ func TestCanarySteps_RemovingTheCanaryAfterARollbackReleasesTheRollbackTarget(t 
 	}
 }
 
-// TestCanarySteps_ASingleRouterKeepsItsSplitOnThePreviousRevisionWhileTheSecondariesComeUp
-// is the third finding, recorded as the engine reads it today. A router of
-// one Instance fronts 6 prefill and 2 decode in one canary group; the first
-// canary completes, so the router's traffic names version 2 alone. The
-// operator pushes version 3. The router has no Instance to keep on version
-// 2, so it rolls at once, and the engine and decoder canary Instances are
-// still coming up. The router's one pod serves version 3, and the hold on
-// the capacity gate keeps its split on version 2, which has no router pod
-// left, for as long as the other members' canary Instances take to come
-// up. This is a sub-case of a split that names an unserving revision, which
-// is not decided yet; this test records the current behaviour and is
-// updated when it changes.
-func TestCanarySteps_ASingleRouterKeepsItsSplitOnThePreviousRevisionWhileTheSecondariesComeUp(t *testing.T) {
+// TestCanarySteps_ASingleRouterSendsItsTrafficToItsOwnPodWhileTheSecondariesComeUp
+// holds that traffic follows the pods that serve. A
+// router of one Instance fronts 6 prefill and 2 decode in one canary group;
+// the first canary completes, so the router's traffic names version 2
+// alone. The operator pushes version 3. The router has no Instance to keep
+// on version 2, so it rolls at once, and the engine and decoder canary
+// Instances are still coming up. The router's one pod serves version 3 and
+// its traffic names that pod, not version 2, which has no router pod left,
+// for as long as the other members' canary Instances take to come up.
+func TestCanarySteps_ASingleRouterSendsItsTrafficToItsOwnPodWhileTheSecondariesComeUp(t *testing.T) {
 	w := newGateWorld(t, gateConfigFor(gateShapeNamed("pd6:2+router1"), v1beta1.UpdateStrategyRecreatePod, "two-manual", 0, nil, false), canaryScheme(t))
 	st := w.initial()
 	w.settle(st)
@@ -1962,14 +2211,17 @@ func TestCanarySteps_ASingleRouterKeepsItsSplitOnThePreviousRevisionWhileTheSeco
 		t.Fatalf("the picture is wrong: the unit must be staging its secondaries, got %s", w.describe(st))
 	}
 	previous := coordination.PerRevisionServiceName(gateService, v1beta1.RouterComponent, gateRevisions[1])
-	var onPrevious int32
+	own := coordination.PerRevisionServiceName(gateService, v1beta1.RouterComponent, gateRevisions[2])
+	var onPrevious, onOwn int32
 	for _, target := range st.isvc.Status.Components[v1beta1.RouterComponent].Traffic {
-		if target.RevisionName == previous {
+		switch target.RevisionName {
+		case previous:
 			onPrevious = target.Percent
+		case own:
+			onOwn = target.Percent
 		}
 	}
-	if onPrevious != 100 {
-		t.Fatalf("the router's split follows its own pod now (version 2 carries %d percent); the current behaviour keeps 100 percent on version 2, and this test is updated when it changes", onPrevious)
+	if onPrevious != 0 || onOwn != 100 {
+		t.Fatalf("the router's traffic must follow its one serving pod: version 3 carries %d percent and version 2, with no router pod, %d percent", onOwn, onPrevious)
 	}
-	t.Logf("known-single-router-traffic: %s (the router's one pod serves version 3 and its traffic sends %d percent to version 2)", gateKnownClasses["known-single-router-traffic"], onPrevious)
 }

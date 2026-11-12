@@ -60,8 +60,7 @@ var (
 
 // Model agent Constants
 const (
-	AgentConfigMapKeyName = "agent"
-	TensorRTLLM           = "tensorrtllm"
+	TensorRTLLM = "tensorrtllm"
 )
 
 // InferenceService Annotations
@@ -167,20 +166,16 @@ var (
 	// Cleared if the revision becomes referenced again before then.
 	RuntimeRevisionGCEligibleSinceKey = OMEAPIGroupName + "/gc-eligible-since"
 
-	DefaultPrometheusPath                    = "/metrics"
-	QueueProxyAggregatePrometheusMetricsPort = 9088
-	DefaultPodPrometheusPort                 = "9091"
-	ModelCategoryAnnotation                  = "models.ome.io/category"
+	ModelCategoryAnnotation = "models.ome.io/category"
 
 	// Ingress Configuration Overrides
-	IngressDomainTemplate          = OMEAPIGroupName + "/ingress-domain-template"
-	IngressDomain                  = OMEAPIGroupName + "/ingress-domain"
-	IngressAdditionalDomains       = OMEAPIGroupName + "/ingress-additional-domains"
-	IngressURLScheme               = OMEAPIGroupName + "/ingress-url-scheme"
-	IngressPathTemplate            = OMEAPIGroupName + "/ingress-path-template"
-	IngressDisableIstioVirtualHost = OMEAPIGroupName + "/ingress-disable-istio-virtualhost"
-	IngressDisableCreation         = OMEAPIGroupName + "/ingress-disable-creation"
-	IngressConsistentHashHeaders   = OMEAPIGroupName + "/ingress-consistent-hash-headers"
+	IngressDomainTemplate        = OMEAPIGroupName + "/ingress-domain-template"
+	IngressDomain                = OMEAPIGroupName + "/ingress-domain"
+	IngressAdditionalDomains     = OMEAPIGroupName + "/ingress-additional-domains"
+	IngressURLScheme             = OMEAPIGroupName + "/ingress-url-scheme"
+	IngressPathTemplate          = OMEAPIGroupName + "/ingress-path-template"
+	IngressDisableCreation       = OMEAPIGroupName + "/ingress-disable-creation"
+	IngressConsistentHashHeaders = OMEAPIGroupName + "/ingress-consistent-hash-headers"
 	// Gateway/host selection overrides (per-ISVC; mirror the cluster ingress config
 	// so a single ISVC can target a different gateway or host scheme).
 	IngressGatewayOverride    = OMEAPIGroupName + "/ingress-gateway"
@@ -280,13 +275,16 @@ var (
 	InferenceServiceInternalAnnotationsPrefix           = "internal." + OMEAPIGroupName
 	StorageInitializerSourceUriInternalAnnotationKey    = InferenceServiceInternalAnnotationsPrefix + "/storage-initializer-sourceuri"
 	InferenceServiceInPlaceImageTransitionAnnotationKey = InferenceServiceInternalAnnotationsPrefix + "/in-place-image-transition"
+	// InferenceServicePodSchedulingRetryAnnotationKey is written on a pod of
+	// a multi-pod Instance each time the controller asks the scheduler to
+	// look at it again; its value records how many times it has done so.
+	InferenceServicePodSchedulingRetryAnnotationKey = InferenceServiceInternalAnnotationsPrefix + "/scheduling-retry"
 )
 
 // ome networking constants
 const (
 	NetworkVisibility      = "networking.ome.io/visibility"
 	ClusterLocalVisibility = "cluster-local"
-	ClusterLocalDomain     = "svc.cluster.local"
 	IsvcNameHeader         = "OMe-Isvc-Name"
 	IsvcNamespaceHeader    = "OME-Isvc-Namespace"
 )
@@ -371,8 +369,6 @@ const (
 
 type InferenceServiceComponent string
 
-type InferenceServiceVerb string
-
 type InferenceServiceProtocol string
 
 // VisibilityLabel is the cluster-local visibility marker. OME does not
@@ -407,6 +403,10 @@ const (
 // Labels to put on kservice
 const (
 	OMEComponentLabel = "component"
+	// ExternalServiceComponent is the component label value of the Service
+	// that fronts an InferenceService from outside the cluster; it belongs
+	// to no role.
+	ExternalServiceComponent = "external-service"
 )
 
 // Labels for TrainedModel
@@ -448,9 +448,6 @@ const (
 	LLamaVllmFTServingServedModelNamePrefix = "/data"
 )
 
-// DefaultModelLocalMountPath is where models will be mounted by the storage-initializer
-const DefaultModelLocalMountPath = "/mnt/models"
-
 var (
 	ServiceAnnotationDisallowedList = []string{
 		StorageInitializerSourceUriInternalAnnotationKey,
@@ -471,6 +468,8 @@ var (
 	// PodOnlyAnnotationPrefixes contains annotation prefixes (or exact keys) that should only
 	// be applied to Pods, not to Services. These are typically used for pod-level configurations
 	// like monitoring, networking interfaces, container injection, and other pod-specific settings.
+	// A service-level annotation under one of them reaches the pod template, as OME's own
+	// keys do; other service-level annotations the Component does not declare stay off the pods.
 	//
 	// Entries can be either:
 	// - Prefix patterns ending with "/" (e.g., "k8s.grafana.com/") - matches all annotations with this prefix
@@ -660,10 +659,6 @@ func (e InferenceServiceComponent) String() string {
 	return string(e)
 }
 
-func (v InferenceServiceVerb) String() string {
-	return string(v)
-}
-
 func getEnvOrDefault(key string, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
@@ -671,12 +666,14 @@ func getEnvOrDefault(key string, fallback string) string {
 	return fallback
 }
 
+// ModelConfigNamePrefix starts the name of every model ConfigMap.
+const ModelConfigNamePrefix = "modelconfig-"
+
+// ModelConfigName is the name of the ConfigMap that holds a service's model
+// entries: the prefix and the whole service name, so two services never
+// share one, kept within the length Kubernetes allows a ConfigMap name.
 func ModelConfigName(isvcName string) string {
-	var maxLen = 20
-	if len(isvcName) > maxLen {
-		isvcName = isvcName[len(isvcName)-maxLen:]
-	}
-	return fmt.Sprintf("modelconfig-%s", isvcName)
+	return TruncateNameWithPrefix(isvcName, ModelConfigNamePrefix, k8svalidation.DNS1123SubdomainMaxLength)
 }
 
 func LWSName(componentName string) string {
@@ -699,6 +696,18 @@ func DecoderServiceName(name string) string {
 
 func EngineServiceName(name string) string {
 	return name + "-engine"
+}
+
+// ServiceHostname is the in-cluster DNS name of a Service. With a cluster
+// domain it is the full "<name>.<namespace>.svc.<clusterDomain>"; without
+// one it is the namespaced short name "<name>.<namespace>", which a pod's
+// DNS search path still resolves. The domain comes from configuration; the
+// binary carries no built-in value.
+func ServiceHostname(name, namespace, clusterDomain string) string {
+	if clusterDomain == "" {
+		return name + "." + namespace
+	}
+	return name + "." + namespace + ".svc." + clusterDomain
 }
 
 // Kubernetes naming constraints

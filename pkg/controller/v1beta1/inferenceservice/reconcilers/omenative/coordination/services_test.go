@@ -37,7 +37,7 @@ func TestPerRevisionHeadlessServiceName(t *testing.T) {
 
 func TestBuildPerRevisionRoutingService_Properties(t *testing.T) {
 	isvc := testISVC()
-	svc, err := BuildPerRevisionRoutingService(isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	svc, err := BuildPerRevisionRoutingService(isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestBuildPerRevisionServices_ReferencedRole(t *testing.T) {
 	isvc := testISVC()
 	isvc.Spec.ReplicaRefs = &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}, Decoder: []string{"pool-d"}}
 
-	routing, err := BuildPerRevisionRoutingService(isvc, v1beta1.DecoderComponent, "abc", RevisionRoutingSelector{}, runnerPorts())
+	routing, err := BuildPerRevisionRoutingService(isvc, v1beta1.DecoderComponent, "abc", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("routing: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestBuildPerRevisionServices_ReferencedRole(t *testing.T) {
 	checkSelector(t, headless.Spec.Selector, "pool-d", "decoder", "abc")
 	checkOwnerRef(t, headless, isvc)
 
-	projected, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "abc", RevisionRoutingSelector{}, runnerPorts())
+	projected, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "abc", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("projected routing: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestEnsurePerRevisionServices_ReferencedRole(t *testing.T) {
 	c := fakeClient()
 	isvc := testISVC()
 	isvc.Spec.ReplicaRefs = &v1beta1.ReplicaRefs{Engine: []string{"pool-a"}, Decoder: []string{"pool-d"}}
-	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.DecoderComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.DecoderComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestEnsurePerRevisionServices_ReferencedRole(t *testing.T) {
 
 func TestBuildPerRevisionRoutingService_LeaderAndOrdinalFilters(t *testing.T) {
 	isvc := testISVC()
-	svc, err := BuildPerRevisionRoutingService(isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts())
+	svc, err := BuildPerRevisionRoutingService(isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestBuildPerRevisionRoutingService_LeaderAndOrdinalFilters(t *testing.T) {
 }
 
 func TestBuildPerRevisionRoutingService_WithoutOrdinalMatchesLeader(t *testing.T) {
-	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true}, runnerPorts())
+	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestBuildPerRevisionRoutingService_WithoutOrdinalMatchesLeader(t *testing.T
 }
 
 func TestBuildPerRevisionRoutingService_WithOrdinalMatchesLeaderOnly(t *testing.T) {
-	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts())
+	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestBuildPerRevisionRoutingService_WithOrdinalMatchesLeaderOnly(t *testing.
 }
 
 func TestBuildPerRevisionRoutingService_SinglePodSelectorsStayBroad(t *testing.T) {
-	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestBuildPerRevisionRoutingService_SinglePodSelectorsStayBroad(t *testing.T
 }
 
 func TestBuildPerRevisionRoutingService_OrdinalWithoutLeaderStaysBroad(t *testing.T) {
-	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{PodOrdinal: true}, runnerPorts())
+	svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{PodOrdinal: true}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestBuildPerRevisionHeadlessService_Properties(t *testing.T) {
 		t.Errorf("headless must publish not-ready addresses")
 	}
 	checkSelector(t, svc.Spec.Selector, "llama-70b", "engine", "hash1")
-	// Headless Service NEVER pins the leader selector — workers must
+	// The headless Service never narrows its selector to the leader: workers must
 	// stay discoverable for peer DNS during distributed init.
 	for _, key := range []string{query.LabelRunner, query.LabelPodOrdinal} {
 		if _, ok := svc.Spec.Selector[key]; ok {
@@ -243,13 +243,13 @@ func TestBuildPerRevisionHeadlessService_Properties(t *testing.T) {
 }
 
 func TestBuildPerRevisionRoutingService_RejectsNilISVC(t *testing.T) {
-	if _, err := BuildPerRevisionRoutingService(nil, v1beta1.EngineComponent, "hash", RevisionRoutingSelector{}, runnerPorts()); err == nil {
+	if _, err := BuildPerRevisionRoutingService(nil, v1beta1.EngineComponent, "hash", RevisionRoutingSelector{}, runnerPorts(), nil); err == nil {
 		t.Errorf("nil ISVC: want error")
 	}
 }
 
 func TestBuildPerRevisionRoutingService_RejectsEmptyHash(t *testing.T) {
-	if _, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "", RevisionRoutingSelector{}, runnerPorts()); err == nil {
+	if _, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "", RevisionRoutingSelector{}, runnerPorts(), nil); err == nil {
 		t.Errorf("empty hash: want error")
 	}
 }
@@ -297,7 +297,7 @@ func TestBuildPerRevisionRoutingService_PublishesRunnerServingPort(t *testing.T)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, tc.ports)
+			svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, tc.ports, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -325,7 +325,7 @@ func TestBuildPerRevisionRoutingService_PublishesRunnerServingPort(t *testing.T)
 // published on an invented number.
 func TestBuildPerRevisionRoutingService_NoDeclaredPort(t *testing.T) {
 	for _, ports := range [][]corev1.ContainerPort{nil, {}} {
-		svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, ports)
+		svc, err := BuildPerRevisionRoutingService(testISVC(), v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, ports, nil)
 		if !errors.Is(err, ErrNoServingPort) {
 			t.Errorf("ports=%v: got err %v want ErrNoServingPort", ports, err)
 		}
@@ -338,7 +338,7 @@ func TestBuildPerRevisionRoutingService_NoDeclaredPort(t *testing.T) {
 func TestEnsurePerRevisionServices_Idempotent(t *testing.T) {
 	c := fakeClient()
 	isvc := testISVC()
-	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("first ensure: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestEnsurePerRevisionServices_Idempotent(t *testing.T) {
 		t.Errorf("names: got %+v", out)
 	}
 	// Second call must not error and must not double-create.
-	out2, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	out2, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("second ensure: %v", err)
 	}
@@ -371,10 +371,33 @@ func TestEnsurePerRevisionServices_Idempotent(t *testing.T) {
 	}
 }
 
+// The ensure path creates the headless Service with no cluster IP. A
+// headless Service that got one would answer per-pod DNS with a single
+// address and break peer discovery for every gang; the None the builder
+// renders must reach the create, since an update cannot set it afterwards.
+func TestEnsurePerRevisionServices_CreatesTheHeadlessServiceWithoutAClusterIP(t *testing.T) {
+	c := fakeClient()
+	isvc := testISVC()
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
+	if err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+	headless := &corev1.Service{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: out.HeadlessName}, headless); err != nil {
+		t.Fatalf("headless service: %v", err)
+	}
+	if headless.Spec.ClusterIP != corev1.ClusterIPNone {
+		t.Errorf("headless ClusterIP after create: got %q want None", headless.Spec.ClusterIP)
+	}
+	if !headless.Spec.PublishNotReadyAddresses {
+		t.Errorf("headless Service must publish not-ready addresses")
+	}
+}
+
 func TestEnsurePerRevisionServices_LeaderFiltersApplyOnlyToRouting(t *testing.T) {
 	c := fakeClient()
 	isvc := testISVC()
-	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts())
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -413,7 +436,7 @@ func TestEnsurePerRevisionServices_UpdatesBroadSelectorWithoutClearingClusterIP(
 	ctx := context.Background()
 	c := fakeClient()
 	isvc := testISVC()
-	out, err := EnsurePerRevisionServices(ctx, c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	out, err := EnsurePerRevisionServices(ctx, c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("initial ensure: %v", err)
 	}
@@ -429,7 +452,7 @@ func TestEnsurePerRevisionServices_UpdatesBroadSelectorWithoutClearingClusterIP(
 		t.Fatalf("set allocated ClusterIP: %v", err)
 	}
 
-	if _, err := EnsurePerRevisionServices(ctx, c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts()); err != nil {
+	if _, err := EnsurePerRevisionServices(ctx, c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{LeaderOnly: true, PodOrdinal: true}, runnerPorts(), nil); err != nil {
 		t.Fatalf("leader-only ensure: %v", err)
 	}
 	if err := c.Get(ctx, key, routing); err != nil {
@@ -449,7 +472,7 @@ func TestEnsurePerRevisionServices_UpdatesBroadSelectorWithoutClearingClusterIP(
 	}
 }
 
-func TestEnsurePerRevisionServices_WithoutOrdinalPinsLeaderOnly(t *testing.T) {
+func TestEnsurePerRevisionServices_WithoutOrdinalSelectsTheLeaderOnly(t *testing.T) {
 	c := fakeClient()
 	isvc := testISVC()
 	out, err := EnsurePerRevisionServices(
@@ -460,6 +483,7 @@ func TestEnsurePerRevisionServices_WithoutOrdinalPinsLeaderOnly(t *testing.T) {
 		"hash1",
 		RevisionRoutingSelector{LeaderOnly: true},
 		runnerPorts(),
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
@@ -482,7 +506,7 @@ func TestEnsurePerRevisionServices_WithoutOrdinalPinsLeaderOnly(t *testing.T) {
 }
 
 func TestEnsurePerRevisionServices_NilClientErrors(t *testing.T) {
-	_, err := EnsurePerRevisionServices(context.Background(), nil, testISVC(), v1beta1.EngineComponent, "hash", RevisionRoutingSelector{}, runnerPorts())
+	_, err := EnsurePerRevisionServices(context.Background(), nil, testISVC(), v1beta1.EngineComponent, "hash", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err == nil {
 		t.Errorf("nil client: want error")
 	}
@@ -494,7 +518,7 @@ func TestEnsurePerRevisionServices_NilClientErrors(t *testing.T) {
 func TestEnsurePerRevisionServices_NoDeclaredPortSkipsRoutingKeepsHeadless(t *testing.T) {
 	c := fakeClient()
 	isvc := testISVC()
-	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, nil)
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, nil, nil)
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
@@ -515,7 +539,7 @@ func TestEnsurePerRevisionServices_NoDeclaredPortSkipsRoutingKeepsHeadless(t *te
 func TestGCPerRevisionServices_DeletesBoth(t *testing.T) {
 	c := fakeClient()
 	isvc := testISVC()
-	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts())
+	out, err := EnsurePerRevisionServices(context.Background(), c, isvc, v1beta1.EngineComponent, "hash1", RevisionRoutingSelector{}, runnerPorts(), nil)
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}

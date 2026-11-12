@@ -15,6 +15,7 @@ package status
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -48,7 +49,7 @@ const (
 	GatewayAcceptanceRejected
 )
 
-// algorithmDefault is the value Build stamps into
+// algorithmDefault is the value Build writes into
 // TrafficStatus.Algorithm when the operator did not pick an
 // algorithm. Surfaced verbatim so operators reading the status can
 // distinguish "OME defaulted" from any concrete algorithm name.
@@ -69,7 +70,7 @@ type BuildArgs struct {
 	HasIntent bool
 
 	// Algorithm is the operator-declared load-balancing algorithm
-	// (e.g. "RoundRobin"), or "" when unset. Build stamps "Default"
+	// (e.g. "RoundRobin"), or "" when unset. Build writes "Default"
 	// into TrafficStatus.Algorithm in the empty case so operators
 	// can distinguish "OME defaulted" from any concrete algorithm.
 	// Caller resolves this from the intent's typed core so Build does
@@ -92,7 +93,7 @@ type BuildArgs struct {
 	Passthroughs []string
 
 	// TranslateErr is the error from Translator.Translate. When
-	// non-nil it supersedes every other branch and produces a
+	// non-nil it outranks every other branch and produces a
 	// BackendPolicyReady=False condition with reason
 	// TranslationFailed (or ConflictingPolicy if ConflictDetected).
 	TranslateErr error
@@ -101,7 +102,7 @@ type BuildArgs struct {
 	// a pre-existing backend policy that isn't owned by this ISVC
 	// (hand-authored, or owned by a different controller). When true,
 	// the BackendPolicyReady condition is False with reason
-	// ConflictingPolicy and message ConflictMessage. Supersedes
+	// ConflictingPolicy and message ConflictMessage. Outranks
 	// TranslateErr's TranslationFailed branch.
 	ConflictDetected bool
 	ConflictMessage  string
@@ -141,7 +142,7 @@ type BuildArgs struct {
 	UnsupportedFields []string
 
 	// ObservedGeneration is the InferenceService.metadata.generation
-	// observed when this reconcile started. Stamped into the
+	// observed when this reconcile started. Written into the
 	// condition so operators can correlate status with spec.
 	ObservedGeneration int64
 
@@ -164,28 +165,33 @@ func Build(args BuildArgs) *v1beta1.TrafficStatus {
 	}
 
 	out := &v1beta1.TrafficStatus{
-		Algorithm: algorithmFor(args.Algorithm),
+		Algorithm:             algorithmFor(args.Algorithm),
+		BackendPolicyResource: policyRef(args.EmittedPolicy),
+		Conditions:            []metav1.Condition{buildReadyCondition(args)},
 	}
-
-	if args.EmittedPolicy != nil {
-		gvk := args.EmittedPolicy.GetObjectKind().GroupVersionKind()
-		out.BackendPolicyResource = &v1beta1.BackendPolicyRef{
-			APIVersion: gvk.GroupVersion().String(),
-			Kind:       gvk.Kind,
-			Name:       args.EmittedPolicy.GetName(),
-		}
-		// Defensive copy so a caller mutating TargetedRoutes after
-		// the call doesn't smuggle changes into the written status.
-		if len(args.TargetedRoutes) > 0 {
-			out.TargetedHTTPRoutes = append(make([]string, 0, len(args.TargetedRoutes)), args.TargetedRoutes...)
-		}
+	// A copy, so a caller mutating TargetedRoutes after the call does
+	// not change the written status.
+	if args.EmittedPolicy != nil && len(args.TargetedRoutes) > 0 {
+		out.TargetedHTTPRoutes = slices.Clone(args.TargetedRoutes)
 	}
-
-	out.Conditions = []metav1.Condition{buildReadyCondition(args)}
 	if cond, ok := buildUnsupportedFieldsCondition(args); ok {
 		out.Conditions = append(out.Conditions, cond)
 	}
 	return out
+}
+
+// policyRef names the emitted policy by API version, kind and name; nil
+// when nothing was emitted.
+func policyRef(emitted client.Object) *v1beta1.BackendPolicyRef {
+	if emitted == nil {
+		return nil
+	}
+	gvk := emitted.GetObjectKind().GroupVersionKind()
+	return &v1beta1.BackendPolicyRef{
+		APIVersion: gvk.GroupVersion().String(),
+		Kind:       gvk.Kind,
+		Name:       emitted.GetName(),
+	}
 }
 
 // buildUnsupportedFieldsCondition returns the
@@ -196,15 +202,33 @@ func Build(args BuildArgs) *v1beta1.TrafficStatus {
 // TranslationFailed) and listing the dropped keys would be redundant
 // noise.
 func buildUnsupportedFieldsCondition(args BuildArgs) (metav1.Condition, bool) {
-	if len(args.UnsupportedAnnotations) == 0 && len(args.UnsupportedFields) == 0 {
+	if !reportsDropped(args) {
 		return metav1.Condition{}, false
 	}
-	if args.TranslateErr != nil {
-		return metav1.Condition{}, false
-	}
-	if args.TranslatorName == NoopTranslatorName {
-		return metav1.Condition{}, false
-	}
+	return metav1.Condition{
+		Type:               v1beta1.TrafficConditionBackendPolicyUnsupportedFields,
+		Status:             metav1.ConditionTrue,
+		Reason:             v1beta1.TrafficReasonUnsupportedField,
+		LastTransitionTime: args.Now,
+		ObservedGeneration: args.ObservedGeneration,
+		Message: fmt.Sprintf(
+			"translator %q does not honor %s",
+			args.TranslatorName, strings.Join(droppedParts(args), "; "),
+		),
+	}, true
+}
+
+// reportsDropped reports whether something was dropped and no other
+// condition explains it: the noop translator and a failed translation
+// already say why nothing took effect.
+func reportsDropped(args BuildArgs) bool {
+	dropped := len(args.UnsupportedAnnotations) > 0 || len(args.UnsupportedFields) > 0
+	return dropped && args.TranslateErr == nil && args.TranslatorName != NoopTranslatorName
+}
+
+// droppedParts names the dropped typed fields, then the dropped
+// annotations, each with its count.
+func droppedParts(args BuildArgs) []string {
 	var parts []string
 	if len(args.UnsupportedFields) > 0 {
 		parts = append(parts, fmt.Sprintf(
@@ -218,70 +242,64 @@ func buildUnsupportedFieldsCondition(args BuildArgs) (metav1.Condition, bool) {
 			len(args.UnsupportedAnnotations), args.UnsupportedAnnotations,
 		))
 	}
-	return metav1.Condition{
-		Type:               v1beta1.TrafficConditionBackendPolicyUnsupportedFields,
-		Status:             metav1.ConditionTrue,
-		Reason:             v1beta1.TrafficReasonUnsupportedField,
-		LastTransitionTime: args.Now,
-		ObservedGeneration: args.ObservedGeneration,
-		Message: fmt.Sprintf(
-			"translator %q does not honor %s",
-			args.TranslatorName, strings.Join(parts, "; "),
-		),
-	}, true
+	return parts
 }
 
+// buildReadyCondition is the BackendPolicyReady condition: False on a
+// conflict, a failed translation or the noop translator, Unknown while
+// nothing was emitted or the gateway has not answered, True once the
+// gateway accepted the policy.
 func buildReadyCondition(args BuildArgs) metav1.Condition {
-	cond := metav1.Condition{
+	outcome := readyOutcome(args)
+	return metav1.Condition{
 		Type:               v1beta1.TrafficConditionBackendPolicyReady,
+		Status:             outcome.status,
+		Reason:             outcome.reason,
+		Message:            outcome.message,
 		LastTransitionTime: args.Now,
 		ObservedGeneration: args.ObservedGeneration,
 	}
+}
 
+// conditionOutcome is the status, reason and message of one condition.
+type conditionOutcome struct {
+	status  metav1.ConditionStatus
+	reason  string
+	message string
+}
+
+// readyOutcome reads the pass in the order its reasons outrank each
+// other: a conflict, a failed translation, the noop translator, no
+// emitted policy, then the gateway's acceptance of the applied policy.
+func readyOutcome(args BuildArgs) conditionOutcome {
 	switch {
 	case args.ConflictDetected:
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = v1beta1.TrafficReasonConflictingPolicy
-		cond.Message = args.ConflictMessage
-
+		return conditionOutcome{metav1.ConditionFalse, v1beta1.TrafficReasonConflictingPolicy, args.ConflictMessage}
 	case args.TranslateErr != nil:
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = v1beta1.TrafficReasonTranslationFailed
-		cond.Message = args.TranslateErr.Error()
-
+		return conditionOutcome{metav1.ConditionFalse, v1beta1.TrafficReasonTranslationFailed, args.TranslateErr.Error()}
 	case args.TranslatorName == NoopTranslatorName:
-		cond.Status = metav1.ConditionFalse
-		cond.Reason = v1beta1.TrafficReasonNoTranslatorAvailable
-		cond.Message = "no Gateway-implementation backend policy CRD installed; traffic intent ignored"
-
+		return conditionOutcome{metav1.ConditionFalse, v1beta1.TrafficReasonNoTranslatorAvailable,
+			"no Gateway-implementation backend policy CRD installed; traffic intent ignored"}
 	case args.EmittedPolicy == nil:
-		// Translator ran without error but produced no resource. Pending
-		// is the honest answer; a translator that wants to refuse on
-		// principle returns an error instead.
-		cond.Status = metav1.ConditionUnknown
-		cond.Reason = v1beta1.TrafficReasonPending
-		cond.Message = "translator did not emit a backend policy resource"
-
-	default:
-		// Policy was applied. The gateway controller's acceptance
-		// signal (if any) drives the final condition.
-		switch args.GatewayAcceptance {
-		case GatewayAcceptanceAccepted:
-			cond.Status = metav1.ConditionTrue
-			cond.Reason = v1beta1.TrafficReasonAcceptedByGateway
-			cond.Message = acceptedMessage(args)
-		case GatewayAcceptanceRejected:
-			cond.Status = metav1.ConditionFalse
-			cond.Reason = v1beta1.TrafficReasonGatewayRejected
-			cond.Message = rejectedMessage(args)
-		default: // GatewayAcceptancePending
-			cond.Status = metav1.ConditionUnknown
-			cond.Reason = v1beta1.TrafficReasonPending
-			cond.Message = passthroughMessage(args.Passthroughs)
-		}
+		// A translator that ran without error and emitted nothing is
+		// pending; one that refuses on principle returns an error.
+		return conditionOutcome{metav1.ConditionUnknown, v1beta1.TrafficReasonPending,
+			"translator did not emit a backend policy resource"}
 	}
+	return acceptanceOutcome(args)
+}
 
-	return cond
+// acceptanceOutcome reads the gateway controller's answer on an applied
+// policy; no answer yet is Pending.
+func acceptanceOutcome(args BuildArgs) conditionOutcome {
+	switch args.GatewayAcceptance {
+	case GatewayAcceptanceAccepted:
+		return conditionOutcome{metav1.ConditionTrue, v1beta1.TrafficReasonAcceptedByGateway, acceptedMessage(args)}
+	case GatewayAcceptanceRejected:
+		return conditionOutcome{metav1.ConditionFalse, v1beta1.TrafficReasonGatewayRejected, rejectedMessage(args)}
+	default:
+		return conditionOutcome{metav1.ConditionUnknown, v1beta1.TrafficReasonPending, passthroughMessage(args.Passthroughs)}
+	}
 }
 
 func acceptedMessage(args BuildArgs) string {

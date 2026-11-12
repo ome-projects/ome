@@ -59,7 +59,9 @@ const (
 	// RejectionReasonInvalidPodSpec marks a 422 Invalid on a pod create
 	// or patch. WORKLOAD-CAUSED: the rejected field belongs to the pod
 	// template, which travels with the revision, so it charges the
-	// revision's retry ladder (see workloadCausedWaitingReasons).
+	// revision's retry record (see workloadCausedWaitingReasons), except
+	// under a repair rebuilding the revision the Instance already ran,
+	// which retries on its own schedule with no revision charged.
 	RejectionReasonInvalidPodSpec = "InvalidPodSpec"
 	// RejectionReasonNamespaceTerminating marks a create refused because
 	// the namespace is being deleted. ENVIRONMENT-CAUSED: no revision

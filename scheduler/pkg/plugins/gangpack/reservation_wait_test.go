@@ -44,7 +44,7 @@ func twoGangsOneDomain() (g *GangPack, h *fakeHandle, nodes []framework.NodeInfo
 }
 
 // rejectForReservedDomain runs PreFilter for every member and requires each to
-// be parked because the domain that has room for it is reserved.
+// be held because the domain that has room for it is reserved.
 func rejectForReservedDomain(t *testing.T, g *GangPack, nodes []framework.NodeInfo, members [2]*v1.Pod) {
 	t.Helper()
 	for _, member := range members {
@@ -56,9 +56,9 @@ func rejectForReservedDomain(t *testing.T, g *GangPack, nodes []framework.NodeIn
 }
 
 // TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain: a gang whose only
-// fitting domain is held by another gang's outstanding reservation is parked in
+// fitting domain is held by another gang's outstanding reservation is left unschedulable by
 // PreFilter. No cluster event follows the holder's last member landing, so the
-// plugin itself must wake the parked members when the reservation drains; their
+// plugin itself must wake the held members when the reservation drains; their
 // retry then plans into the domain.
 func TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain(t *testing.T) {
 	ctx := context.Background()
@@ -71,7 +71,7 @@ func TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain(t *testing.T
 	}
 
 	// The second gang finds room in the snapshot, but every domain with room is
-	// reserved: both members park.
+	// reserved: both members are held.
 	reservedBefore := counterValue(t, gangAssignmentTotal.WithLabelValues("reserved"))
 	noFitBefore := counterValue(t, gangAssignmentTotal.WithLabelValues("no_fit"))
 	rejectForReservedDomain(t, g, nodes, second)
@@ -79,7 +79,7 @@ func TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain(t *testing.T
 		t.Fatalf("activate calls while the domain is reserved = %d, want 0", h.activateCalls)
 	}
 
-	// The leader lands: one slot stays reserved, so the parked gang stays parked.
+	// The leader lands: one slot stays reserved, so the held gang stays held.
 	if st := g.Reserve(ctx, leaderState, first[0], "a1"); !st.IsSuccess() {
 		t.Fatalf("first gang leader Reserve = %v, want Success", st)
 	}
@@ -87,7 +87,7 @@ func TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain(t *testing.T
 		t.Fatalf("activate calls with a slot still reserved = %d, want 0", h.activateCalls)
 	}
 
-	// The worker lands and drains the reservation: exactly the parked members
+	// The worker lands and drains the reservation: exactly the held members
 	// are woken, in one activation.
 	assumed := []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "8"), first[0]), nodeInfo(gpuNode("a2", "a", "8"))}
 	workerState := newCycleState()
@@ -107,7 +107,7 @@ func TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain(t *testing.T
 		}
 	}
 	if len(h.activated) != len(second) {
-		t.Fatalf("activated = %v, want only the parked members", h.activated)
+		t.Fatalf("activated = %v, want only the held members", h.activated)
 	}
 	if d := counterValue(t, gangActivationTotal.WithLabelValues(activationTriggerReservationReleased)) - activationsBefore; d != 1 {
 		t.Fatalf("reservation_released activation counter delta = %v, want 1", d)
@@ -122,9 +122,9 @@ func TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain(t *testing.T
 
 	// The retry plans into the domain: the first gang's members are ordinary
 	// occupancy now, and the nodes still have room for the second gang.
-	settled := []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "8"), first[0]), nodeInfo(gpuNode("a2", "a", "8"), first[1])}
+	afterDrain := []framework.NodeInfo{nodeInfo(gpuNode("a1", "a", "8"), first[0]), nodeInfo(gpuNode("a2", "a", "8"), first[1])}
 	state := newCycleState()
-	if _, st := g.PreFilter(ctx, state, second[0], settled); !st.IsSuccess() {
+	if _, st := g.PreFilter(ctx, state, second[0], afterDrain); !st.IsSuccess() {
 		t.Fatalf("second gang PreFilter after the drain = %v, want Success", st)
 	}
 	if assignment := readAssignment(state); assignment == nil || assignment.domain != "a" {
@@ -137,13 +137,13 @@ func TestReserve_ReservationDrains_ActivatesGangHeldOutOfThatDomain(t *testing.T
 		t.Fatalf("second gang leader Reserve = %v, want Success", st)
 	}
 	if h.activateCalls != 1 {
-		t.Fatalf("activate calls after a drain with nobody parked = %d, want still 1", h.activateCalls)
+		t.Fatalf("activate calls after a drain with nobody held = %d, want still 1", h.activateCalls)
 	}
 }
 
 // TestUnreserve_ReservationReleased_ActivatesGangHeldOutOfThatDomain: the holder never
 // completes and its attempt is unwound, so the reservation is released rather
-// than drained. The parked gang is woken by the release and its retry plans
+// than drained. The held gang is woken by the release and its retry plans
 // into the domain.
 func TestUnreserve_ReservationReleased_ActivatesGangHeldOutOfThatDomain(t *testing.T) {
 	ctx := context.Background()
@@ -219,7 +219,7 @@ func TestReserve_UnrelatedReservationDrains_DoesNotActivateCapacityNoFitGang(t *
 
 // TestAssignGangDomain_StaleAssignmentReplanned_ActivatesPodsHeldOutOfOldDomain: dropping a stale assignment also
 // releases the reservation that kept other pods out of that domain, so the
-// pods parked on it are woken like on any other release.
+// pods held out of it are woken like on any other release.
 func TestAssignGangDomain_StaleAssignmentReplanned_ActivatesPodsHeldOutOfOldDomain(t *testing.T) {
 	ctx := context.Background()
 	h := &fakeHandle{}
@@ -250,6 +250,6 @@ func TestAssignGangDomain_StaleAssignmentReplanned_ActivatesPodsHeldOutOfOldDoma
 		t.Fatalf("re-planned assignment = %q,%v, want b,true", d, ok)
 	}
 	if h.activated[string(standalone.UID)] != standalone {
-		t.Fatalf("activated = %v, want the pod parked on the released domain", h.activated)
+		t.Fatalf("activated = %v, want the pod held out of the released domain", h.activated)
 	}
 }

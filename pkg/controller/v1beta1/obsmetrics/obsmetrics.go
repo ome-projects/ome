@@ -234,6 +234,17 @@ var (
 		},
 		[]string{"from", "to"},
 	)
+
+	// irStatusReadySinceColumnsMissing counts the readySince columns the
+	// installed InferenceReplica CRD lacked when the manager started. While
+	// it is above zero every status write stores each Instance's Ready time
+	// in its own entry, the larger form, until a start finds the columns.
+	irStatusReadySinceColumnsMissing = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "ome_omenative_ir_status_readysince_columns_missing",
+			Help: "Number of readySince columns (readySinceBase, readySinceIndexes, readySinceOffsets) the installed InferenceReplica CRD lacked when the manager started; above zero, every status write keeps each Instance's Ready time in its per-Instance entry until a manager start finds the columns.",
+		},
+	)
 )
 
 func init() {
@@ -251,7 +262,14 @@ func init() {
 		irStatusWritesTotal,
 		irStatusCodecErrorsTotal,
 		irStatusConversionsTotal,
+		irStatusReadySinceColumnsMissing,
 	)
+}
+
+// SetIRStatusReadySinceColumnsMissing publishes how many readySince columns
+// the installed InferenceReplica CRD lacks, read once at manager start.
+func SetIRStatusReadySinceColumnsMissing(count int) {
+	irStatusReadySinceColumnsMissing.Set(float64(max(count, 0)))
 }
 
 // SetIRStatusBytes publishes the serialized status size of one InferenceReplica

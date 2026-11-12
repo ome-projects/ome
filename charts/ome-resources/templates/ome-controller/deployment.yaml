@@ -92,6 +92,9 @@ spec:
         - "--leader-elect-renew-deadline={{ .renewDeadline }}"
         - "--leader-elect-retry-period={{ .retryPeriod }}"
         {{- end }}
+        {{- if .releaseOnCancel }}
+        - "--leader-elect-release-on-cancel"
+        {{- end }}
         {{- end }}
         {{- if .Values.ome.multicluster.enabled }}
         - "--enable-multicluster"
@@ -149,7 +152,9 @@ spec:
         {{- with .Values.ome.controller.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      terminationGracePeriodSeconds: 10
+      {{- if not (kindIs "invalid" .Values.ome.controller.managerTerminationGracePeriodSeconds) }}
+      terminationGracePeriodSeconds: {{ .Values.ome.controller.managerTerminationGracePeriodSeconds }}
+      {{- end }}
       volumes:
       - name: cert
         secret:

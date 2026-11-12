@@ -385,30 +385,30 @@ func TestServingStable(t *testing.T) {
 
 func TestMemberWeights(t *testing.T) {
 	bumped := bumpedDecoder()
-	if w := memberWeights(bumped, 30, true, nil); len(w) != 2 ||
+	if w := memberWeights(bumped, 30, bothSidesServe, nil); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 30 || !w[0].LatestRevision || w[0].PairingProtocol != pdCanaryProtocol ||
 		w[1].RevisionHash != "decold" || w[1].Percent != 70 || w[1].LatestRevision || w[1].PairingProtocol != pdStableProtocol {
 		t.Fatalf("a bumped member splits like the primary, got %+v", w)
 	}
-	if w := memberWeights(bumped, 30, true, map[string]int32{"decnew": 1, "decmid": 1}); len(w) != 2 ||
+	if w := memberWeights(bumped, 30, bothSidesServe, map[string]int32{"decnew": 1, "decmid": 1}); len(w) != 2 ||
 		w[0].RevisionHash != "decnew" || w[0].Percent != 30 ||
 		w[1].RevisionHash != "decmid" || w[1].Percent != 70 || w[1].LatestRevision || w[1].PairingProtocol != "" {
 		t.Fatalf("a member whose stable revision serves nothing splits onto the revision serving in its place, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "d", StableRevisionHash: "d", CanaryPairingProtocol: "p"}, 30, true, nil); len(w) != 1 ||
+	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "d", StableRevisionHash: "d", CanaryPairingProtocol: "p"}, 30, bothSidesServe, nil); len(w) != 1 ||
 		w[0].RevisionHash != "d" || w[0].Percent != 100 || !w[0].LatestRevision || w[0].PairingProtocol != "p" {
 		t.Fatalf("an unbumped member serves its revision alone, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "decnew"}, 30, true, nil); len(w) != 1 || w[0].RevisionHash != "decnew" || w[0].Percent != 100 {
+	if w := memberWeights(MemberRevisions{CanaryRevisionHash: "decnew"}, 30, bothSidesServe, nil); len(w) != 1 || w[0].RevisionHash != "decnew" || w[0].Percent != 100 {
 		t.Fatalf("a member with no stable revision serves its target alone, got %+v", w)
 	}
-	if w := memberWeights(MemberRevisions{StableRevisionHash: "decold"}, 30, true, nil); w != nil {
+	if w := memberWeights(MemberRevisions{StableRevisionHash: "decold"}, 30, bothSidesServe, nil); w != nil {
 		t.Fatalf("a member with no target has no weights, got %+v", w)
 	}
-	if w := memberStableWeights(bumped); len(w) != 1 || w[0].RevisionHash != "decold" || w[0].Percent != 100 || w[0].LatestRevision || w[0].PairingProtocol != pdStableProtocol {
+	if w := stableAlone(memberSide{target: "decnew", stable: "decold", stableProtocol: pdStableProtocol}); len(w) != 1 || w[0].RevisionHash != "decold" || w[0].Percent != 100 || w[0].LatestRevision || w[0].PairingProtocol != pdStableProtocol {
 		t.Fatalf("a rolled-back member returns to its stable revision, got %+v", w)
 	}
-	if w := memberStableWeights(MemberRevisions{CanaryRevisionHash: "decnew"}); w != nil {
+	if w := stableAlone(memberSide{target: "decnew"}); w != nil {
 		t.Fatalf("a member with no stable revision has nothing to return to, got %+v", w)
 	}
 }

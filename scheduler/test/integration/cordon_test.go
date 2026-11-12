@@ -9,14 +9,14 @@ import (
 	schedutil "sigs.k8s.io/scheduler-plugins/test/util"
 )
 
-// TestGangAvoidsCordonedDomain covers the cordoned-domain wedge: a domain's
+// TestGangAvoidsCordonedDomain covers the cordoned domain: a domain's
 // nodes keep their accelerator capacity but become unschedulable (cordoned) —
 // as a drain or an autoscaler cordon does. The gang must land in a schedulable
 // domain, not take the cordoned one.
 //
 // The guarded failure mode: if freeByDomain counted cordoned nodes as free,
 // Choose could take the cordoned domain; the framework's NodeUnschedulable Filter
-// would then reject every node in it, and the gang would wedge there forever
+// would then reject every node in it, and the gang would wait there forever
 // (assignmentStale keeps the assignment because the domain still looks free) while the
 // schedulable domain sat unused.
 //

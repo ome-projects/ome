@@ -125,6 +125,8 @@ type ModelPackStorageComponents struct {
 
 // ParseOCIStorageURI parses an OCI storage URI and returns its components
 // Format: oci://n/{namespace}/b/{bucket}/o/{object_path}
+// The bucket and the object path must both be named; the namespace may be
+// empty, since the object store fills it from the tenancy.
 func ParseOCIStorageURI(uri string) (*OCIStorageComponents, error) {
 	if !strings.HasPrefix(uri, OCIStoragePrefix) {
 		return nil, fmt.Errorf("invalid OCI storage URI format: missing %s prefix", OCIStoragePrefix)
@@ -135,11 +137,24 @@ func ParseOCIStorageURI(uri string) (*OCIStorageComponents, error) {
 		return nil, fmt.Errorf("invalid OCI storage URI format. Expected: oci://n/{namespace}/b/{bucket}/o/{object_path}")
 	}
 
-	return &OCIStorageComponents{
+	components := &OCIStorageComponents{
 		Namespace: parts[1],
 		Bucket:    parts[3],
 		Prefix:    strings.Join(parts[5:], "/"),
-	}, nil
+	}
+	if components.Bucket == "" {
+		return nil, errNoBucket(uri)
+	}
+	if components.Prefix == "" {
+		return nil, fmt.Errorf("the OCI storage URI %s names no object path after /o/", uri)
+	}
+	return components, nil
+}
+
+// errNoBucket refuses an OCI URI whose bucket segment is empty: no object
+// store call can run without a bucket.
+func errNoBucket(uri string) error {
+	return fmt.Errorf("the OCI storage URI %s names no bucket", uri)
 }
 
 // ParsePVCStorageURI parses a PVC storage URI and returns its components
@@ -538,7 +553,9 @@ func validator[T any](parse func(string) (*T, error)) func(string) error {
 // prefix it carries. A row without an objectURI builder is a scheme the agent
 // cannot read.
 var schemes = []scheme{
-	{prefix: OCIStoragePrefix, storageType: StorageTypeOCI, validate: validator(ParseOCIStorageURI), objectURI: ociObjectURI},
+	// The OCI check is the agent's own parser, so every form the agent can
+	// read passes validation and every form it cannot read fails it.
+	{prefix: OCIStoragePrefix, storageType: StorageTypeOCI, validate: validator(ociObjectURI), objectURI: ociObjectURI},
 	{prefix: PVCStoragePrefix, storageType: StorageTypePVC, validate: validator(ParsePVCStorageURI), objectURI: pvcObjectURI},
 	{prefix: VendorStoragePrefix, storageType: StorageTypeVendor, validate: validator(ParseVendorStorageURI)},
 	{prefix: HuggingFaceStoragePrefix, storageType: StorageTypeHuggingFace, validate: validator(ParseHuggingFaceStorageURI), objectURI: huggingFaceObjectURI},
@@ -579,6 +596,7 @@ func ValidateStorageURI(uri string) error {
 // Example URI formats:
 // - oci://namespace@region/bucket/prefix
 // - oci://n/namespace/b/bucket/o/prefix
+// - oci://bucket/prefix
 // - hf://model-id[@branch]
 func NewObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 	s, err := schemeOf(uriStr)
@@ -644,84 +662,68 @@ func huggingFaceObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
 	}, nil
 }
 
-// ociObjectURI maps an OCI URI onto the agent's ObjectURI.
-func ociObjectURI(uriStr string) (*ociobjectstore.ObjectURI, error) {
-	if !strings.HasPrefix(uriStr, OCIStoragePrefix) {
+// ociObjectURI maps an OCI URI onto the agent's ObjectURI. It reads
+// oci://n/namespace/b/bucket/o/prefix, oci://namespace@region/bucket/prefix
+// and oci://bucket/prefix; every form must name a bucket, and an empty prefix
+// names the whole bucket.
+func ociObjectURI(uri string) (*ociobjectstore.ObjectURI, error) {
+	if !strings.HasPrefix(uri, OCIStoragePrefix) {
 		return nil, fmt.Errorf("URI must start with '%s'", OCIStoragePrefix)
 	}
+	rest := strings.TrimPrefix(uri, OCIStoragePrefix)
 
-	// Remove the scheme
-	uriStr = strings.TrimPrefix(uriStr, "oci://")
-
-	// Check for the OCI specific format: n/namespace/b/bucket/o/prefix
-	if strings.HasPrefix(uriStr, "n/") {
-		// Format: n/namespace/b/bucket/o/prefix
-		parts := strings.Split(uriStr, "/")
-		if len(parts) < 5 || parts[0] != "n" || parts[2] != "b" {
-			return nil, fmt.Errorf("invalid OCI URI format, expected 'oci://n/namespace/b/bucket/o/prefix': %s", uriStr)
-		}
-
-		namespace := parts[1]
-		bucketName := parts[3]
-
-		// The segment before the object prefix must be "o"
-		if len(parts) > 4 && parts[4] != "o" {
-			return nil, fmt.Errorf("invalid OCI URI format, expected 'oci://n/namespace/b/bucket/o/prefix': %s", uriStr)
-		}
-
-		// Extract object prefix (everything after "o/")
-		var prefix string
-		if len(parts) > 5 && parts[4] == "o" {
-			prefix = strings.Join(parts[5:], "/")
-		}
-
-		return &ociobjectstore.ObjectURI{
-			Namespace:  namespace,
-			BucketName: bucketName,
-			Prefix:     prefix,
-		}, nil
-	}
-
-	// Handle different standard formats (from previous fix)
-	var namespace, region, bucketName, prefix string
-
-	// Check if we have a namespace@region format
-	if strings.Contains(uriStr, "@") {
-		parts := strings.SplitN(uriStr, "@", 2)
-		namespace = parts[0]
-
-		// Split the rest into region and bucket/prefix
-		remainingParts := strings.SplitN(parts[1], "/", 2)
-		region = remainingParts[0]
-
-		if len(remainingParts) > 1 {
-			// Split remaining into bucket and prefix
-			bucketPrefixParts := strings.SplitN(remainingParts[1], "/", 2)
-			bucketName = bucketPrefixParts[0]
-
-			if len(bucketPrefixParts) > 1 {
-				prefix = bucketPrefixParts[1]
-			}
+	var objectURI *ociobjectstore.ObjectURI
+	if strings.HasPrefix(rest, "n/") {
+		var err error
+		if objectURI, err = labeledOCIObjectURI(rest); err != nil {
+			return nil, err
 		}
 	} else {
-		// Handle simpler oci://bucket/prefix format
-		parts := strings.SplitN(uriStr, "/", 2)
-		bucketName = parts[0]
+		objectURI = shortFormOCIObjectURI(rest)
+	}
+	if objectURI.BucketName == "" {
+		return nil, errNoBucket(uri)
+	}
+	return objectURI, nil
+}
 
-		if len(parts) > 1 {
-			prefix = parts[1]
+// labeledOCIObjectURI reads the n/namespace/b/bucket/o/prefix form, given the
+// part after the scheme.
+func labeledOCIObjectURI(rest string) (*ociobjectstore.ObjectURI, error) {
+	parts := strings.Split(rest, "/")
+	if len(parts) < 5 || parts[0] != "n" || parts[2] != "b" || parts[4] != "o" {
+		return nil, fmt.Errorf("invalid OCI URI format, expected 'oci://n/namespace/b/bucket/o/prefix': %s", rest)
+	}
+	return &ociobjectstore.ObjectURI{
+		Namespace:  parts[1],
+		BucketName: parts[3],
+		Prefix:     strings.Join(parts[5:], "/"),
+	}, nil
+}
+
+// shortFormOCIObjectURI reads the namespace@region/bucket/prefix and the
+// bucket/prefix forms, given the part after the scheme; the bucket comes back
+// empty when the URI names none, for the caller to refuse.
+func shortFormOCIObjectURI(rest string) *ociobjectstore.ObjectURI {
+	var namespace, region string
+	if strings.Contains(rest, "@") {
+		namespaceAndRest := strings.SplitN(rest, "@", 2)
+		namespace = namespaceAndRest[0]
+		regionAndRest := strings.SplitN(namespaceAndRest[1], "/", 2)
+		region = regionAndRest[0]
+		rest = ""
+		if len(regionAndRest) > 1 {
+			rest = regionAndRest[1]
 		}
 	}
-
-	// Ensure we have at least a bucket name
-	if bucketName == "" {
-		return nil, fmt.Errorf("invalid URI format, missing bucket name: %s", uriStr)
-	}
-
-	return &ociobjectstore.ObjectURI{
+	bucketAndPrefix := strings.SplitN(rest, "/", 2)
+	objectURI := &ociobjectstore.ObjectURI{
 		Namespace:  namespace,
-		BucketName: bucketName,
-		Prefix:     prefix,
+		BucketName: bucketAndPrefix[0],
 		Region:     region,
-	}, nil
+	}
+	if len(bucketAndPrefix) > 1 {
+		objectURI.Prefix = bucketAndPrefix[1]
+	}
+	return objectURI
 }

@@ -1,5 +1,5 @@
 // Package trafficdrain defines the versioned InferenceService annotation used
-// for durable, manual route-arm drains.
+// for durable, manual per-cluster traffic holds.
 package trafficdrain
 
 import (
@@ -13,8 +13,8 @@ import (
 )
 
 // Override is one independently removable operator hold. ID is the key in the
-// annotation's top-level JSON object; Cluster selects the TrafficMap arm and
-// Reason records why the hold exists.
+// annotation's top-level JSON object; Cluster names the member cluster the hold
+// applies to and Reason records why the hold exists.
 type Override struct {
 	ID      string
 	Cluster string
@@ -40,43 +40,20 @@ func FromAnnotations(annotations map[string]string) ([]Override, error) {
 // by ID so TrafficMap output is deterministic regardless of JSON member order.
 func Parse(raw string) ([]Override, error) {
 	decoder := json.NewDecoder(strings.NewReader(raw))
-	start, err := decoder.Token()
-	if err != nil {
-		return nil, fmt.Errorf("decode top-level object: %w", err)
-	}
-	if delim, ok := start.(json.Delim); !ok || delim != '{' {
-		return nil, fmt.Errorf("top-level value must be a JSON object keyed by override ID")
-	}
-
-	seen := make(map[string]struct{})
 	overrides := make([]Override, 0)
-	for decoder.More() {
-		token, err := decoder.Token()
-		if err != nil {
-			return nil, fmt.Errorf("decode override ID: %w", err)
-		}
-		id, ok := token.(string)
-		if !ok {
-			return nil, fmt.Errorf("override ID must be a JSON object key")
-		}
+	err := readObject(decoder, topLevelErrors, func(id string) error {
 		if err := validateText("override ID", id); err != nil {
-			return nil, err
+			return err
 		}
-		if _, duplicate := seen[id]; duplicate {
-			return nil, fmt.Errorf("duplicate override ID %q", id)
-		}
-		seen[id] = struct{}{}
-
 		override, err := decodeOverride(decoder, id)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		overrides = append(overrides, override)
-	}
-	if end, err := decoder.Token(); err != nil {
-		return nil, fmt.Errorf("close top-level object: %w", err)
-	} else if delim, ok := end.(json.Delim); !ok || delim != '}' {
-		return nil, fmt.Errorf("top-level value must end with a JSON object")
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	if token, err := decoder.Token(); err != io.EOF {
 		if err != nil {
@@ -89,34 +66,14 @@ func Parse(raw string) ([]Override, error) {
 	return overrides, nil
 }
 
+// decodeOverride reads one override object: its cluster and reason, each a
+// string, no other field, and neither blank.
 func decodeOverride(decoder *json.Decoder, id string) (Override, error) {
-	start, err := decoder.Token()
-	if err != nil {
-		return Override{}, fmt.Errorf("override %q: decode object: %w", id, err)
-	}
-	if delim, ok := start.(json.Delim); !ok || delim != '{' {
-		return Override{}, fmt.Errorf("override %q must be a JSON object", id)
-	}
-
 	override := Override{ID: id}
-	seen := make(map[string]struct{})
-	for decoder.More() {
-		token, err := decoder.Token()
-		if err != nil {
-			return Override{}, fmt.Errorf("override %q: decode field: %w", id, err)
-		}
-		field, ok := token.(string)
-		if !ok {
-			return Override{}, fmt.Errorf("override %q field name must be a string", id)
-		}
-		if _, duplicate := seen[field]; duplicate {
-			return Override{}, fmt.Errorf("override %q has duplicate field %q", id, field)
-		}
-		seen[field] = struct{}{}
-
+	err := readObject(decoder, overrideErrors(id), func(field string) error {
 		var value string
 		if err := decoder.Decode(&value); err != nil {
-			return Override{}, fmt.Errorf("override %q field %q must be a string: %w", id, field, err)
+			return fmt.Errorf("override %q field %q must be a string: %w", id, field, err)
 		}
 		switch field {
 		case "cluster":
@@ -124,15 +81,13 @@ func decodeOverride(decoder *json.Decoder, id string) (Override, error) {
 		case "reason":
 			override.Reason = value
 		default:
-			return Override{}, fmt.Errorf("override %q has unknown field %q", id, field)
+			return fmt.Errorf("override %q has unknown field %q", id, field)
 		}
+		return nil
+	})
+	if err != nil {
+		return Override{}, err
 	}
-	if end, err := decoder.Token(); err != nil {
-		return Override{}, fmt.Errorf("override %q: close object: %w", id, err)
-	} else if delim, ok := end.(json.Delim); !ok || delim != '}' {
-		return Override{}, fmt.Errorf("override %q must end with a JSON object", id)
-	}
-
 	if err := validateText(fmt.Sprintf("override %q cluster", id), override.Cluster); err != nil {
 		return Override{}, err
 	}
@@ -140,6 +95,81 @@ func decodeOverride(decoder *json.Decoder, id string) (Override, error) {
 		return Override{}, err
 	}
 	return override, nil
+}
+
+// objectErrors are the errors one object level reports, worded for that level.
+type objectErrors struct {
+	open         func(err error) error
+	notObject    func() error
+	key          func(err error) error
+	keyNotString func() error
+	duplicateKey func(key string) error
+	close        func(err error) error
+	notClosed    func() error
+}
+
+// topLevelErrors word the errors of the annotation's outer object, whose
+// keys are override IDs.
+var topLevelErrors = objectErrors{
+	open:         func(err error) error { return fmt.Errorf("decode top-level object: %w", err) },
+	notObject:    func() error { return fmt.Errorf("top-level value must be a JSON object keyed by override ID") },
+	key:          func(err error) error { return fmt.Errorf("decode override ID: %w", err) },
+	keyNotString: func() error { return fmt.Errorf("override ID must be a JSON object key") },
+	duplicateKey: func(key string) error { return fmt.Errorf("duplicate override ID %q", key) },
+	close:        func(err error) error { return fmt.Errorf("close top-level object: %w", err) },
+	notClosed:    func() error { return fmt.Errorf("top-level value must end with a JSON object") },
+}
+
+// overrideErrors word the errors of one override's object, whose keys are its
+// fields.
+func overrideErrors(id string) objectErrors {
+	return objectErrors{
+		open:         func(err error) error { return fmt.Errorf("override %q: decode object: %w", id, err) },
+		notObject:    func() error { return fmt.Errorf("override %q must be a JSON object", id) },
+		key:          func(err error) error { return fmt.Errorf("override %q: decode field: %w", id, err) },
+		keyNotString: func() error { return fmt.Errorf("override %q field name must be a string", id) },
+		duplicateKey: func(key string) error { return fmt.Errorf("override %q has duplicate field %q", id, key) },
+		close:        func(err error) error { return fmt.Errorf("override %q: close object: %w", id, err) },
+		notClosed:    func() error { return fmt.Errorf("override %q must end with a JSON object", id) },
+	}
+}
+
+// readObject reads one JSON object from the decoder: the opening brace, every
+// member through member(key) once the key is known to be a new string, and
+// the closing brace. A key that repeats is an error; errs words each error
+// for the object's level.
+func readObject(decoder *json.Decoder, errs objectErrors, member func(key string) error) error {
+	start, err := decoder.Token()
+	if err != nil {
+		return errs.open(err)
+	}
+	if delim, ok := start.(json.Delim); !ok || delim != '{' {
+		return errs.notObject()
+	}
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return errs.key(err)
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errs.keyNotString()
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return errs.duplicateKey(key)
+		}
+		seen[key] = struct{}{}
+		if err := member(key); err != nil {
+			return err
+		}
+	}
+	if end, err := decoder.Token(); err != nil {
+		return errs.close(err)
+	} else if delim, ok := end.(json.Delim); !ok || delim != '}' {
+		return errs.notClosed()
+	}
+	return nil
 }
 
 func validateText(field, value string) error {

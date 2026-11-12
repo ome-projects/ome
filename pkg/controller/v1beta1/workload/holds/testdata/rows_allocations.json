@@ -1,0 +1,18 @@
+{
+  "recordedOn": {
+    "date": "2026-11-06",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "Building the hold pass's rows over a Component at rest (RowsForPlan over every observed row, as every pass builds them ahead of the hold pass), at 1,000 and 4,000 single-pod Instances, 160 gangs of a leader and seven workers and 1,725 gangs of a leader and one worker; every row Ready on the spec revision with every pod serving and the plan covering every row. Each row reads the observed row in place, 24 bytes per row beside the two maps of the plan's entries and pod counts by index, which are most of the bytes left. Before, each row carried its own copy of the observed row: 277,152 / 1,092,224 / 48,208 / 432,800 bytes at the four shapes with the same 11 / 35 / 7 / 11 allocations, recorded on the same day and machine.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "1000x1/rows/allocations": 11,
+    "1000x1/rows/bytes": 88736,
+    "160x8/rows/allocations": 7,
+    "160x8/rows/bytes": 12624,
+    "1725x2/rows/allocations": 11,
+    "1725x2/rows/bytes": 113312,
+    "4000x1/rows/allocations": 35,
+    "4000x1/rows/bytes": 354944
+  }
+}

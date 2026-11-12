@@ -177,6 +177,41 @@ func TestPerComponentMaxUnavailableBudget_Percent(t *testing.T) {
 	}
 }
 
+// TestPerComponentBudgets_PercentRoundsUpWhereItDoesNotDivide holds the
+// count a percent resolves to on every Instance count it does not divide
+// evenly: N times the percent over 100, rounded up and clamped to N, the
+// same for maxSurge and maxUnavailable. The round-up is what keeps a small
+// percent from resolving to zero, which would be a roll that never starts.
+func TestPerComponentBudgets_PercentRoundsUpWhereItDoesNotDivide(t *testing.T) {
+	percents := []int{10, 25, 34, 50}
+	counts := map[int32][4]int32{
+		3:  {1, 1, 2, 2},
+		5:  {1, 2, 2, 3},
+		7:  {1, 2, 3, 4},
+		9:  {1, 3, 4, 5},
+		11: {2, 3, 4, 6},
+		13: {2, 4, 5, 7},
+	}
+	for _, replicas := range slices.Sorted(maps.Keys(counts)) {
+		for i, pct := range percents {
+			want := counts[replicas][i]
+			value := intOrStringStr(fmt.Sprintf("%d%%", pct))
+			t.Run(fmt.Sprintf("maxSurge %d%% of %d is %d", pct, replicas, want), func(t *testing.T) {
+				got := escalation.PerComponentMaxSurgeBudget(&types.RollingUpdate{MaxSurge: value}, replicas)
+				if got != want {
+					t.Errorf("got %d, want %d", got, want)
+				}
+			})
+			t.Run(fmt.Sprintf("maxUnavailable %d%% of %d is %d", pct, replicas, want), func(t *testing.T) {
+				got := escalation.PerComponentMaxUnavailableBudget(&types.RollingUpdate{MaxUnavailable: value}, replicas)
+				if got != want {
+					t.Errorf("got %d, want %d", got, want)
+				}
+			})
+		}
+	}
+}
+
 // TestCurrentSurgeInFlight verifies the per-Instance step-set counter
 // the dispatcher feeds into the budget projection. Only surge lifecycle
 // steps contribute; other ops (Drain, InPlace) don't add

@@ -12,6 +12,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
@@ -98,6 +99,53 @@ func recordSurgeKeptForPairing(deps workload.Deps, input workload.ReconcileInput
 	workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonSurgeKeptForPairing,
 		"OMENative %s keeps its serving replacement on withdrawn revision %s in rotation, promotes to that revision, and only then rolls toward %s: %s",
 		workload.InstanceKey(input.Key.Component, idx), pinned, target, reason)
+}
+
+// admittedInPlaceRevision is the revision an open in-place attempt finishes
+// on when the roll target has moved to a revision of another pairing
+// protocol while a pod of the Instance serves: the revision the attempt
+// opened with, which the coordination gate admitted the patch onto, with
+// its stored pod template. The pod keeps the protocol its partners serve,
+// and the newer protocol is the next start, which the gate admits once a
+// partner serves it. nil when the attempt follows the target as any other
+// retarget does: no in-place attempt is open, the attempt opened on the
+// target, the pod set is out of rotation, either revision names no
+// protocol or both name the same one, or the attempt's revision is gone.
+func admittedInPlaceRevision(ctx context.Context, reads client.Reader, input workload.ReconcileInput, observed *workload.InstanceStatus, target *appsv1.ControllerRevision, pods []*corev1.Pod) (*appsv1.ControllerRevision, *corev1.PodSpec, error) {
+	if workload.StateOf(observed) != workload.StateUpdateInPlace {
+		return nil, nil, nil
+	}
+	opened := observed.Operation.TargetRevision
+	if opened == "" || opened == target.Name || status.CountServingPods(pods) == 0 {
+		return nil, nil, nil
+	}
+	cr := &appsv1.ControllerRevision{}
+	if err := reads.Get(ctx, client.ObjectKey{Namespace: input.Key.Namespace, Name: opened}, cr); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("get ControllerRevision %s: %w", opened, err)
+	}
+	admitted, newer := revision.PairingProtocolFromRevision(cr), revision.PairingProtocolFromRevision(target)
+	if admitted == "" || newer == "" || admitted == newer {
+		return nil, nil, nil
+	}
+	payload, err := loadControllerRevisionPayload(cr)
+	if err != nil {
+		return nil, nil, err
+	}
+	if payload == nil || payload.PodSpec == nil {
+		return nil, nil, nil
+	}
+	return cr, payload.PodSpec, nil
+}
+
+// recordInPlaceKeptForPairing says once, as the Instance promotes, why an
+// in-place attempt finished onto a revision the roll target has moved past.
+func recordInPlaceKeptForPairing(deps workload.Deps, input workload.ReconcileInput, idx int32, admitted, target *appsv1.ControllerRevision) {
+	workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonInPlaceKeptForPairing,
+		"OMENative %s keeps its pod on revision %s, whose pairing protocol %q the coordination gate admitted the patch onto, promotes to that revision, and only then rolls toward %s on pairing protocol %q",
+		workload.InstanceKey(input.Key.Component, idx), admitted.Name, revision.PairingProtocolFromRevision(admitted), target.Name, revision.PairingProtocolFromRevision(target))
 }
 
 func surgeWindowApplies(s *workload.InstanceStatus) bool {
@@ -205,6 +253,21 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 		return surgeUpdate(ctx, deps, input, plan, inst, target, pods)
 	}
 
+	// An in-place attempt the coordination gate admitted onto one pairing
+	// protocol finishes on the revision it opened with while its pod
+	// serves, even when the roll target has moved on to another protocol
+	// (admittedInPlaceRevision): the pod keeps the protocol its partners
+	// serve, and the newer protocol is the next start, which the gate
+	// admits once a partner serves it.
+	rollTarget := target
+	admitted, admittedSpec, err := admittedInPlaceRevision(ctx, deps.Reader(), input, observed, target, pods)
+	if err != nil {
+		return false, fmt.Errorf("Update: resolve the revision the in-place attempt opened with (instance=%d): %w", inst.Index, err)
+	}
+	if admitted != nil {
+		target, targetSpec = admitted, admittedSpec
+	}
+
 	// Eligibility compares against the recorded running revision, NOT the
 	// live pod. Live pods carry apiserver-defaulted fields and Render
 	// overlays (hostname/subdomain/serving gate); byte-comparing those
@@ -277,7 +340,16 @@ func UpdateWithPods(ctx context.Context, deps workload.Deps, input workload.Reco
 	// promotes the surge index (gang) on completion.
 	switch mode {
 	case updateModeInPlace:
-		return inPlaceUpdate(ctx, deps, input, plan, inst, target, targetSpec, pods)
+		done, err := inPlaceUpdate(ctx, deps, input, plan, inst, target, targetSpec, pods)
+		if err != nil || admitted == nil {
+			return done, err
+		}
+		// The promote onto the admitted revision is not the roll's end: the
+		// next pass starts toward the roll target through the gate.
+		if done {
+			recordInPlaceKeptForPairing(deps, input, inst.Index, admitted, rollTarget)
+		}
+		return false, nil
 	case updateModeRecreate:
 		return recreateUpdate(ctx, deps, input, plan, inst, target, pods)
 	case updateModeSurge:
@@ -495,6 +567,21 @@ func RevisionPodSpec(ctx context.Context, reads client.Reader, namespace, name s
 	return payload.PodSpec, nil
 }
 
+// RevisionNumber returns the number of the named ControllerRevision, read
+// through reads. The revisions of one workload are numbered in the order
+// they were minted (revision.EnsureControllerRevision), so a smaller
+// number is an older revision. found is false when the revision is gone.
+func RevisionNumber(ctx context.Context, reads client.Reader, namespace, name string) (number int64, found bool, err error) {
+	cr := &appsv1.ControllerRevision{}
+	if err := reads.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cr); err != nil {
+		if apierrors.IsNotFound(err) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("get CR %s: %w", name, err)
+	}
+	return cr.Revision, true, nil
+}
+
 // loadRevisionPayload reads the named ControllerRevision through reads and
 // decodes its payload. (nil, nil) when the revision is gone.
 func loadRevisionPayload(ctx context.Context, reads client.Reader, namespace, name string) (*revision.DataPayload, error) {
@@ -537,35 +624,26 @@ func podSpecWithoutImages(spec *corev1.PodSpec) ([]byte, error) {
 	return json.Marshal(clone)
 }
 
-// DetectUpdateTrigger fires when the Instance is mid-update, or when
+// DetectUpdateTriggerWithPods fires when the Instance is mid-update, or when
 // Phase=Ready and a pod's PodSpec hashes to a non-target revision.
 // Creating / Deleting / Restarting / Migrating are not interruptible.
 // The Migrate-owned suppression is explicit because a just-promoted
 // surge briefly carries RunningRevision=sourceRev while the post-
-// promote scale-down pass runs — without the guard the spec-bump that
+// promote scale-down pass runs; without the guard the spec push that
 // triggered the migration would race the surge promote.
 //
-// Exported for the workload reconcile loop (workload/reconcile.go)
-// which iterates Instances and consults this before invoking Update.
-//
-// Self-lists only on the slow path (empty RunningRevision). The
-// reconcile loop's per-Instance update pass calls DetectUpdateTriggerWithPods
-// with the Instance's pods from a single per-Component cached List +
-// bucket, so the rare per-pod fallback doesn't cost one List per Instance.
+// The update pass evaluates the trigger itself through EvaluateUpdateTrigger
+// over the pods it already holds and applies the effects in its own order
+// (plan_decision.go, pass_update.go). This function is the one-call form,
+// the evaluation with its two effects, for a caller that holds a client and
+// no selection pass. instancePods are this Instance's pods, read by the
+// paths that need them (an empty RunningRevision, and a Failed row claiming
+// no verb on its own revision), already filtered to inst.Index; a nil slice
+// means "not pre-listed", and the function then lists on the fallback path.
 //
 // retryAfter > 0 means the trigger was denied by a not-yet-due Backoff
 // RetryBlock for the current target; re-evaluate then. 0 otherwise
 // (including Held, which has no time bound).
-func DetectUpdateTrigger(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, target *appsv1.ControllerRevision) (trigger bool, retryAfter time.Duration, err error) {
-	return DetectUpdateTriggerWithPods(ctx, deps, input, plan, inst, target, nil)
-}
-
-// DetectUpdateTriggerWithPods is DetectUpdateTrigger with this Instance's
-// pods supplied by the caller for the empty-RunningRevision fallback path.
-// instancePods must already be filtered to inst.Index. A nil slice means
-// "not pre-listed"; the function then self-lists on the fallback path,
-// preserving the standalone DetectUpdateTrigger contract. Semantics are
-// otherwise identical.
 //
 // Composition of the pure evaluation (EvaluateUpdateTrigger) with its
 // two effects: the fallback self-list and the AdoptRevision backfill
@@ -581,7 +659,7 @@ func DetectUpdateTriggerWithPods(ctx context.Context, deps workload.Deps, input 
 			}
 			pods = filterPodsByInstance(all, inst.Index)
 		}
-		dec = evaluateUpdateTriggerPods(pods, target)
+		dec = evaluateUpdateTriggerPods(input.ObservedState.Instance(inst.Index), pods, target)
 	}
 	if dec.AdoptRevision {
 		if err := BackfillRunningRevision(ctx, input, inst.Index, target.Name); err != nil {
@@ -643,19 +721,20 @@ func PartitionHeldIndices(partition *int32, input workload.ReconcileInput, plann
 // EvaluateUpdateTrigger is the pure update-trigger evaluation: no
 // client reads, no status writes. instancePods must already be
 // filtered to inst.Index (nil is an empty pod set); they are consulted
-// only on the empty-RunningRevision fallback path. The clock is read
-// through input.Now.
+// only when the status alone does not decide (evaluateUpdateTriggerFast).
+// The clock is read through input.Now.
 func EvaluateUpdateTrigger(input workload.ReconcileInput, inst workload.InstancePlan, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) UpdateTriggerDecision {
 	dec, needPods := evaluateUpdateTriggerFast(input, inst, target)
 	if !needPods {
 		return dec
 	}
-	return evaluateUpdateTriggerPods(instancePods, target)
+	return evaluateUpdateTriggerPods(input.ObservedState.Instance(inst.Index), instancePods, target)
 }
 
 // evaluateUpdateTriggerFast runs the status-only portion of the
 // update-trigger evaluation. needPods=true means the fast paths did not
-// decide (empty RunningRevision) and the caller must run
+// decide (an empty RunningRevision, or a Failed row claiming no verb on
+// the revision it targets) and the caller must run
 // evaluateUpdateTriggerPods over the Instance's pods.
 func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.InstancePlan, target *appsv1.ControllerRevision) (dec UpdateTriggerDecision, needPods bool) {
 	s := input.ObservedState.Instance(inst.Index)
@@ -725,15 +804,27 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 		return UpdateTriggerDecision{Trigger: true}, false
 	}
 	if s.RunningRevision == target.Name {
-		return UpdateTriggerDecision{}, false
+		// A Failed row claiming no verb on the revision it targets may
+		// still hold the set of an attempt the placement grace ended;
+		// only the pods show it.
+		return UpdateTriggerDecision{}, failedRowClaimsNoVerb(s)
 	}
 	// Empty RunningRevision — fall back to the per-pod diff.
 	return UpdateTriggerDecision{}, true
 }
 
-// evaluateUpdateTriggerPods runs the empty-RunningRevision fallback:
-// the per-pod revision check against the target, and the AdoptRevision
-// selection.
+// failedRowClaimsNoVerb reports a Failed row whose operation claims no
+// verb: the shape an ended attempt and the operator reset both leave
+// behind, which the Create pass opens a fresh start on and the roll reads
+// for a set an ended attempt left live.
+func failedRowClaimsNoVerb(s *workload.InstanceStatus) bool {
+	return workload.StateOf(s) == workload.StateFailed && workload.ClaimOf(s) == workload.OwnerNone
+}
+
+// evaluateUpdateTriggerPods reads the Instance's pods where the status
+// alone does not decide: the per-pod revision check against the target
+// and the AdoptRevision selection for an empty RunningRevision, and the
+// refused set of an ended attempt for a Failed row on its own revision.
 //
 // A pod's revision is its ome.io/revision-hash label — the identity
 // every other pass reads, and the only one that can be right here. The
@@ -746,7 +837,19 @@ func evaluateUpdateTriggerFast(input workload.ReconcileInput, inst workload.Inst
 // Exactly one shape is adopted: every pod on the target revision and
 // runtime-ready. Every other shape takes the roll, so a Failed row keeps
 // the recovery its strategy and disposition give it.
-func evaluateUpdateTriggerPods(pods []*corev1.Pod, target *appsv1.ControllerRevision) UpdateTriggerDecision {
+func evaluateUpdateTriggerPods(s *workload.InstanceStatus, pods []*corev1.Pod, target *appsv1.ControllerRevision) UpdateTriggerDecision {
+	// A Failed row on the revision it targets is read for one shape: a
+	// live pod of that revision the scheduler still refuses is the set of
+	// a recreate attempt the placement grace ended, which no other pass
+	// rebuilds (the Create pass waits for it to run), so the roll opens a
+	// fresh attempt at the same revision over it, as it does on a push.
+	// Every other set of such a row is the Create pass's to prove and
+	// promote, and a refused pod of a replaced revision beside it is the
+	// sweep's, not a reason to rebuild the set.
+	if s.RunningRevision != "" && s.RunningRevision == target.Name {
+		refused, _, _ := workload.FirstUnschedulablePod(rolledSetPods(target.Name, pods))
+		return UpdateTriggerDecision{Trigger: refused != nil}
+	}
 	// An empty pod set proves nothing in either direction; the Create
 	// and demotion passes own a row with no pods.
 	if len(pods) == 0 {
@@ -1069,7 +1172,9 @@ func RebuildAnswersFailure(pod *corev1.Pod, failure *workload.InstanceTerminatio
 // set that is up only between its crashes never holds Ready for the
 // window; a loop is the crash-loop repair's to rebuild or park. The reason
 // names what holds the slot, for the pass to log; it is empty when nothing
-// does.
+// does. A row that records no entry into Ready places no restart against
+// one, so any restart on the pod's record holds the slot the same way
+// until the pod has held Ready for the window (restartComeback).
 func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revisionBorn time.Time, pods []*corev1.Pod, desired, window int32, now time.Time) (bool, time.Duration, string) {
 	if row == nil || target == "" || row.RunningRevision != target {
 		return false, 0, ""
@@ -1080,22 +1185,10 @@ func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revis
 	own := rolledSetPods(target, pods)
 	held, wait, reason := false, time.Duration(0), ""
 	for _, pod := range own {
-		comeback := ""
-		if RebuiltAfterFailure(pod, row.LastFailure, revisionBorn, window) {
-			comeback = fmt.Sprintf("pod %s rebuilt after the failure recorded at %s", pod.Name, row.LastFailure.Time.UTC().Format(time.RFC3339))
-		}
-		if _, restarted := RunnerRestartedSinceReady(pod, row.ReadySince); restarted {
-			comeback = fmt.Sprintf("pod %s restarted since Ready", pod.Name)
-			if RunnerRestartedAgainSinceReady(pod, row.ReadySince) {
-				comeback = fmt.Sprintf("pod %s restarted again since Ready", pod.Name)
-			}
-		}
-		if comeback != "" {
-			if available, remaining := podreadiness.IsPodAvailable(pod, window, now); !available {
-				held = true
-				wait = max(wait, remaining)
-				reason = fmt.Sprintf("%s, Ready again for less than the %ds window (%s left)", comeback, window, remaining.Round(time.Second))
-			}
+		if unproven, remaining, why := podComeback(pod, row, revisionBorn, window, now); unproven {
+			held = true
+			wait = max(wait, remaining)
+			reason = why
 		}
 	}
 	if held {
@@ -1105,6 +1198,59 @@ func RolledInstanceNotServing(row *workload.InstanceStatus, target string, revis
 		return true, 0, fmt.Sprintf("pod set not fully serving (%d of %d pods on the revision)", len(own), desired)
 	}
 	return false, 0, ""
+}
+
+// podComeback reports a pod the budgets read as come back rather than
+// serving on: rebuilt inside the window of the failure the row records
+// (RebuiltAfterFailure), or restarted since the row entered Ready, or
+// restarted at all on a row that records no entry into Ready
+// (restartComeback). Such a pod serves again only once it has held Ready
+// for window seconds (podreadiness.IsPodAvailable): until then held is
+// true, remaining is how long that is, and reason names the pod and what
+// it came back from. A pod that never came back, or that has held Ready
+// for the window since, reads false.
+func podComeback(pod *corev1.Pod, row *workload.InstanceStatus, revisionBorn time.Time, window int32, now time.Time) (held bool, remaining time.Duration, reason string) {
+	comeback := ""
+	if RebuiltAfterFailure(pod, row.LastFailure, revisionBorn, window) {
+		comeback = fmt.Sprintf("pod %s rebuilt after the failure recorded at %s", pod.Name, row.LastFailure.Time.UTC().Format(time.RFC3339))
+	}
+	if restarted := restartComeback(pod, row.ReadySince); restarted != "" {
+		comeback = restarted
+	}
+	if comeback == "" {
+		return false, 0, ""
+	}
+	available, remaining := podreadiness.IsPodAvailable(pod, window, now)
+	if available {
+		return false, 0, ""
+	}
+	return true, remaining, fmt.Sprintf("%s, Ready again for less than the %ds window (%s left)", comeback, window, remaining.Round(time.Second))
+}
+
+// restartComeback names a runner the budgets read as come back rather
+// than serving on; empty when it is read off its serving state alone.
+// With the row's Ready anchor it is a restart since the row entered Ready
+// (RunnerRestartedSinceReady), restarted again when the run before the
+// last had itself begun after that entry (RunnerRestartedAgainSinceReady).
+// A row with no anchor places no restart against its entry into Ready, so
+// any restart on the pod's record is one (RunnerRestartedOnRecord): the
+// runner is proven by its current run alone, and a crash loop reads as
+// down between its crashes whether or not the row records when it
+// entered Ready.
+func restartComeback(pod *corev1.Pod, readySince *metav1.Time) string {
+	if readySince == nil || readySince.IsZero() {
+		if RunnerRestartedOnRecord(pod) {
+			return fmt.Sprintf("pod %s restarted, with no record of when the Instance entered Ready", pod.Name)
+		}
+		return ""
+	}
+	if _, restarted := RunnerRestartedSinceReady(pod, readySince); !restarted {
+		return ""
+	}
+	if RunnerRestartedAgainSinceReady(pod, readySince) {
+		return fmt.Sprintf("pod %s restarted again since Ready", pod.Name)
+	}
+	return fmt.Sprintf("pod %s restarted since Ready", pod.Name)
 }
 
 // RolledSetInRotation reports whether the pod set an Instance runs on
@@ -1119,18 +1265,39 @@ func RolledSetInRotation(target string, pods []*corev1.Pod, desired int32) bool 
 }
 
 // rolledSetPods is the pod set an Instance runs on target as the roll
-// reads it: the live pods carrying that revision, or no revision at all.
+// reads it: the live pods carrying that revision, or no revision at all,
+// in list order. A list whose every pod is a member is the set itself,
+// which is what an Instance at rest hands the roll on every pass; the
+// readers of the set read it and never write to it.
 func rolledSetPods(target string, pods []*corev1.Pod) []*corev1.Pod {
 	targetRev := query.RevisionFromName(target)
-	own := make([]*corev1.Pod, 0, len(pods))
-	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
+	for i, pod := range pods {
+		if !memberOfRolledSet(pod, targetRev) {
+			return rolledSetPodsFrom(pods, i, targetRev)
 		}
-		if podRev := query.RevisionFromPod(pod); !podRev.IsZero() && !podRev.Same(targetRev) {
-			continue
+	}
+	return pods
+}
+
+// memberOfRolledSet reports a live pod of the set an Instance runs on
+// targetRev: one carrying that revision, or no revision at all.
+func memberOfRolledSet(pod *corev1.Pod, targetRev query.RevisionID) bool {
+	if pod == nil || pod.DeletionTimestamp != nil {
+		return false
+	}
+	podRev := query.RevisionFromPod(pod)
+	return podRev.IsZero() || podRev.Same(targetRev)
+}
+
+// rolledSetPodsFrom is the members of pods in a list of their own, when
+// every pod before the one at left is a member and that one is not.
+func rolledSetPodsFrom(pods []*corev1.Pod, left int, targetRev query.RevisionID) []*corev1.Pod {
+	own := make([]*corev1.Pod, 0, len(pods)-1)
+	own = append(own, pods[:left]...)
+	for _, pod := range pods[left+1:] {
+		if memberOfRolledSet(pod, targetRev) {
+			own = append(own, pod)
 		}
-		own = append(own, pod)
 	}
 	return own
 }
@@ -1209,10 +1376,7 @@ func RolledInstanceCrashed(row *workload.InstanceStatus, target string, revision
 	}
 	targetRev := query.RevisionFromName(target)
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		if podRev := query.RevisionFromPod(pod); !podRev.IsZero() && !podRev.Same(targetRev) {
+		if !memberOfRolledSet(pod, targetRev) {
 			continue
 		}
 		if _, restarted := RunnerRestartedSinceReady(pod, row.ReadySince); restarted || RebuiltAfterFailure(pod, row.LastFailure, revisionBorn, window) {
@@ -1235,13 +1399,14 @@ func RolledInstanceCrashed(row *workload.InstanceStatus, target string, revision
 // own). A routed pod whose runner restarted since the row entered Ready,
 // or that was rebuilt inside the window of the failure the row records,
 // serves only once it has held Ready again for window seconds, so a crash
-// loop read between two of its crashes counts as down. The rows the roll
-// already accounts for read false: a row on target
-// (RolledInstanceNotServing), a row carrying an Update attempt, in flight,
-// Failed or stopped by the retry schedule (an attempt in flight is
-// anchored as such and a stopped one holds no slot), a gang surge
-// replacement another row drives, a row a migration owns, and a row being
-// deleted. The duration is how long until a pod Ready again clears the
+// loop read between two of its crashes counts as down; a row that records
+// no entry into Ready reads any restart on the pod's record the same way
+// (restartComeback). The rows the roll already accounts for read false: a
+// row on target (RolledInstanceNotServing), a row carrying an Update
+// attempt, in flight, Failed or stopped by the retry schedule (an attempt
+// in flight is anchored as such and a stopped one holds no slot), a gang
+// surge replacement another row drives, a row a migration owns, and a row
+// being deleted. The duration is how long until a pod Ready again clears the
 // window, zero when only a watch event changes the reading; the reason
 // names what holds the slot, for the pass to log.
 func InstanceNotServingOutsideRoll(row *workload.InstanceStatus, target string, pods []*corev1.Pod, window int32, now time.Time) (bool, time.Duration, string) {
@@ -1257,8 +1422,28 @@ func InstanceNotServingOutsideRoll(row *workload.InstanceStatus, target string, 
 	if op := row.Operation; op != nil && (op.Type == workload.InstanceOperationUpdate || op.Type == workload.InstanceOperationDelete) {
 		return false, 0, ""
 	}
+	inRotation, _, wait, reason := routedRotation(row, pods, time.Time{}, window, now)
+	if inRotation {
+		return false, 0, ""
+	}
+	if reason != "" {
+		return true, wait, reason
+	}
+	return true, 0, "no routed pod in rotation"
+}
+
+// routedRotation reads the routed pods of the revision row runs by the
+// Component's own bar. inRotation is true when one of them is Ready and
+// serving and, if it came back, has held Ready for the window since
+// (podComeback); unproven counts the ones Ready and serving only as a
+// comeback inside the window; wait is the longest such window left and
+// reason names what holds it. revisionBorn is the birth of the revision row
+// runs when the caller knows it: a failure recorded before it belongs to the
+// set the Instance ran on an earlier revision and is not placed
+// (RebuildAnswersFailure), so a corrected push's fresh set is read by its
+// serving state; zero places every failure the row records.
+func routedRotation(row *workload.InstanceStatus, pods []*corev1.Pod, revisionBorn time.Time, window int32, now time.Time) (inRotation bool, unproven int, wait time.Duration, reason string) {
 	running := query.RevisionFromName(row.RunningRevision)
-	inRotation, wait, reason := false, time.Duration(0), ""
 	for _, pod := range pods {
 		if pod == nil || pod.DeletionTimestamp != nil || query.IsTerminalPod(pod) || !query.RoutedRunner(pod) {
 			continue
@@ -1269,29 +1454,110 @@ func InstanceNotServingOutsideRoll(row *workload.InstanceStatus, target string, 
 		if !podreadiness.ReadyAndServing(pod) {
 			continue
 		}
-		comeback := ""
-		if RebuiltAfterFailure(pod, row.LastFailure, time.Time{}, window) {
-			comeback = fmt.Sprintf("pod %s rebuilt after the failure recorded at %s", pod.Name, row.LastFailure.Time.UTC().Format(time.RFC3339))
-		}
-		if _, restarted := RunnerRestartedSinceReady(pod, row.ReadySince); restarted {
-			comeback = fmt.Sprintf("pod %s restarted since Ready", pod.Name)
-		}
-		if comeback != "" {
-			if available, remaining := podreadiness.IsPodAvailable(pod, window, now); !available {
-				wait = max(wait, remaining)
-				reason = fmt.Sprintf("%s, Ready again for less than the %ds window (%s left)", comeback, window, remaining.Round(time.Second))
-				continue
-			}
+		if held, remaining, why := podComeback(pod, row, revisionBorn, window, now); held {
+			unproven++
+			wait = max(wait, remaining)
+			reason = why
+			continue
 		}
 		inRotation = true
 	}
-	if inRotation {
+	return inRotation, unproven, wait, reason
+}
+
+// InstanceServingUnproven reports a Ready Instance whose routed pods in
+// rotation are all comebacks that have not held Ready for the window: up
+// between its crashes and nothing more. The published serving count
+// carries such an Instance as serving while the Component's own bar reads
+// it as down, so a drain-first start on it is not put to the group's
+// unavailability gate, which counts it already (ServingInstancesDown), and
+// the repair budget counts it beside the attempts in flight. The duration
+// is how long until the longest window clears; the reason names the pod
+// and what it came back from, for a hold to carry.
+func InstanceServingUnproven(row *workload.InstanceStatus, pods []*corev1.Pod, window int32, now time.Time) (bool, time.Duration, string) {
+	if row == nil || row.Phase != workload.InstancePhaseReady {
 		return false, 0, ""
 	}
-	if reason != "" {
-		return true, wait, reason
+	inRotation, unproven, wait, reason := routedRotation(row, pods, time.Time{}, window, now)
+	if inRotation || unproven == 0 {
+		return false, 0, ""
 	}
-	return true, 0, "no routed pod in rotation"
+	return true, wait, reason
+}
+
+// ServingInstancesDown lists, in row order, the Instances a published
+// serving count carries as serving (status.InstanceMeetsThreshold on the
+// row's own counters, the rule ServingReplicas is published by) that are
+// down all the same: an attempt opened on the row since the counters were
+// written takes its pods out of rotation (attemptLeavingRotation), or the
+// row's routed pods are in rotation only as comebacks that have not held
+// Ready for the window (InstanceServingUnproven). A count out of rotation
+// read off the published counters misses exactly these, so the group's
+// unavailability gate adds them to its own. A pod that left rotation with
+// no attempt on its row is not listed: the published count reads it one
+// write later, and a start this pass opened on it is the caller's own
+// within-pass delta, which would count it twice. Each reason names the
+// Instance and why, for a hold to carry; wait is how long until a window
+// clears, zero when none is open. desiredPods is the pod count a row's
+// Instance serves at, the published rule's threshold. target names the
+// revision the roll moves to and targetBorn its birth: a row already on it
+// reads its failure record as the roll does (RolledInstanceNotServing), a
+// death older than the target belonging to the set it ran on the revision
+// before, so a gang repaired on the old revision and then rolled is read
+// off its serving state; a row on any other revision places every failure
+// it records, as InstanceNotServingOutsideRoll does. An empty target reads
+// every row that way.
+func ServingInstancesDown(rows []workload.InstanceStatus, pods map[int32][]*corev1.Pod, desiredPods func(row *workload.InstanceStatus) int32, target string, targetBorn time.Time, window int32, now time.Time) (indices []int32, reasons []string, wait time.Duration) {
+	for i := range rows {
+		row := &rows[i]
+		if !status.InstanceMeetsThreshold(row.PodCount, row.ServingPodCount, desiredPods(row)) {
+			continue
+		}
+		if why := attemptLeavingRotation(row); why != "" {
+			indices = append(indices, row.Index)
+			reasons = append(reasons, fmt.Sprintf("Instance %d not serving (%s)", row.Index, why))
+			continue
+		}
+		if row.Phase != workload.InstancePhaseReady {
+			continue
+		}
+		born := time.Time{}
+		if target != "" && row.RunningRevision == target {
+			born = targetBorn
+		}
+		inRotation, unproven, remaining, why := routedRotation(row, pods[row.Index], born, window, now)
+		if inRotation || unproven == 0 {
+			continue
+		}
+		indices = append(indices, row.Index)
+		reasons = append(reasons, fmt.Sprintf("Instance %d not serving (%s)", row.Index, why))
+		wait = max(wait, remaining)
+	}
+	return indices, reasons, wait
+}
+
+// attemptLeavingRotation names an attempt in flight on row that takes its
+// pods out of rotation, empty when none is: a repair, which deletes the
+// set and rebuilds it, or an update at a drain-first or in-place step,
+// whose pod leaves the serving gate as the step opens. A surge keeps its
+// old pod in rotation until its replacement serves, and a stopped attempt
+// moves nothing, so neither is named.
+func attemptLeavingRotation(row *workload.InstanceStatus) string {
+	switch row.Phase {
+	case workload.InstancePhaseRestarting:
+		return "a repair in flight rebuilds its pods"
+	case workload.InstancePhaseUpdating:
+		op := row.Operation
+		if op == nil || op.Type != workload.InstanceOperationUpdate {
+			return ""
+		}
+		switch op.Step {
+		case workload.UpdateStepSurge, workload.UpdateStepSurgeDrain, workload.UpdateStepSurgeDrainSettle, workload.UpdateStepGangSurgeTarget, workload.UpdateStepParked:
+			return ""
+		}
+		return "an update attempt in flight takes its pods out of rotation"
+	}
+	return ""
 }
 
 // Wreckage is per-instance rollout debris keyed to a SUPERSEDED
@@ -1325,6 +1591,13 @@ func InstanceNotServingOutsideRoll(row *workload.InstanceStatus, target string, 
 // scale-down), and transient phases (Creating / Deleting / Restarting
 // are not interruptible).
 func EvaluateWreckage(s *workload.InstanceStatus, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) bool {
+	return leftoversOfAReplacedRevision(s, target, instancePods)
+}
+
+// leftoversOfAReplacedRevision reports a settled row that still carries
+// pods of a revision it is not converging to, or a gang source whose kept
+// surge targets one: what the cleanup removes.
+func leftoversOfAReplacedRevision(s *workload.InstanceStatus, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) bool {
 	if s == nil || target == nil {
 		return false
 	}
@@ -1340,6 +1613,60 @@ func EvaluateWreckage(s *workload.InstanceStatus, target *appsv1.ControllerRevis
 		return true
 	}
 	return len(alienRevisionPods(s, target.Name, instancePods)) > 0
+}
+
+// HeldInstanceCleanup reports what the roll's partition does not keep on an
+// Instance it holds. The partition keeps the Instance on the revision it
+// serves and nothing else: a replacement built toward a revision the roll
+// has since left is removed from beside the serving source, and once it is
+// gone the Failed row it left behind returns to Ready on the revision it
+// serves. A failed attempt toward the roll target is left as it is: its
+// retry is a start on the Instance, which the partition refuses, and the
+// hold the roll reports names it (HeldInstanceKeepsAFailedAttempt).
+func HeldInstanceCleanup(s *workload.InstanceStatus, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) bool {
+	if leftoversOfAReplacedRevision(s, target, instancePods) {
+		return true
+	}
+	return target != nil && failedAttemptOfALeftRevision(s, target.Name) && anyPodOfRevisionStanding(instancePods, s.RunningRevision)
+}
+
+// HeldInstanceKeepsAFailedAttempt reports a Failed row the partition holds
+// whose attempt was toward the roll target and left a pod standing: the
+// serving source beside a failed replacement, or the recreated set that
+// never served once the source is gone. Either is a failed attempt the
+// roll still wants, which only a start on the Instance replaces, and which
+// the partition keeps from starting. A row with no pod left is the create
+// pass's to rebuild and is not read here.
+func HeldInstanceKeepsAFailedAttempt(s *workload.InstanceStatus, target *appsv1.ControllerRevision, instancePods []*corev1.Pod) bool {
+	if s == nil || target == nil || s.Phase != workload.InstancePhaseFailed || workload.ClaimOf(s) != workload.OwnerNone {
+		return false
+	}
+	if s.RunningRevision == "" || s.RunningRevision == target.Name || s.TargetRevision != target.Name {
+		return false
+	}
+	return anyPodOfRevisionStanding(instancePods, s.RunningRevision) || anyPodOfRevisionStanding(instancePods, target.Name)
+}
+
+// failedAttemptOfALeftRevision reports a Failed row with no operation whose
+// recorded target is neither the revision it runs nor the roll target: the
+// attempt it ended was toward a revision the roll has since left.
+func failedAttemptOfALeftRevision(s *workload.InstanceStatus, targetName string) bool {
+	if s == nil || s.Phase != workload.InstancePhaseFailed || s.Operation != nil {
+		return false
+	}
+	return s.RunningRevision != "" && s.RunningRevision != targetName &&
+		s.TargetRevision != "" && s.TargetRevision != s.RunningRevision && s.TargetRevision != targetName
+}
+
+// anyPodOfRevisionStanding reports a pod of rev that is not on its way out.
+func anyPodOfRevisionStanding(pods []*corev1.Pod, rev string) bool {
+	want := query.RevisionFromName(rev)
+	for _, pod := range pods {
+		if pod != nil && pod.DeletionTimestamp == nil && query.RevisionFromPod(pod).Same(want) {
+			return true
+		}
+	}
+	return false
 }
 
 // failedGangSurgeContinuation reports the gang wreckage shape: a source
@@ -1429,10 +1756,37 @@ func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.Rec
 	}
 
 	aliens := alienRevisionPods(s, target.Name, instancePods)
-	if len(aliens) == 0 {
-		return true, nil
+	if len(aliens) > 0 {
+		return deleteSupersededRevisionPods(ctx, deps, input, inst.Index, aliens, target.Name)
 	}
-	return deleteSupersededRevisionPods(ctx, deps, input, inst.Index, aliens, target.Name)
+	// An Instance the partition holds rests on the revision it serves: once
+	// the replacement of a revision the roll has left is gone, the Failed
+	// row it left returns to Ready there. The roll may not take a held
+	// Instance, so no attempt of the roll's would write that row.
+	if failedAttemptOfALeftRevision(s, target.Name) && RollHeldIndices(input, plan, target)[inst.Index] &&
+		anyPodOfRevisionStanding(instancePods, s.RunningRevision) {
+		return false, returnHeldSourceToItsRevision(ctx, deps, input, inst.Index, s.RunningRevision, s.TargetRevision)
+	}
+	return true, nil
+}
+
+// returnHeldSourceToItsRevision writes a held Instance's Failed row Ready on
+// the revision its source serves, after the replacement of a revision the
+// roll has left is gone.
+func returnHeldSourceToItsRevision(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, runningRev, leftRev string) error {
+	// The promote's write and its other half, the running revision's retry
+	// record prune.
+	ready := status.ReadyOnRevisionMutation(idx, runningRev, input.Now())
+	if err := input.MutateInstance(ctx, ready.Index, ready.Mutate); err != nil {
+		return fmt.Errorf("return held source to its revision (instance=%d): %w", idx, err)
+	}
+	if err := status.RetryBlockPruneOnPromote(ctx, input, runningRev); err != nil {
+		return fmt.Errorf("prune the retry record of revision %s (instance=%d): %w", runningRev, idx, err)
+	}
+	workload.RecordNormal(deps.Recorder, workload.EventTarget(input), workload.EventReasonSurgeAbandoned,
+		"OMENative %s stays on revision %s, which the partition holds it on; its failed replacement toward %s, which no push asks for, is gone",
+		workload.InstanceKey(input.Key.Component, idx), runningRev, leftRev)
+	return nil
 }
 
 // unrouteServingPods takes the pods of idx that are still in rotation out of

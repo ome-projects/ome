@@ -1263,9 +1263,8 @@ func TestRevisionHash_OwnerUIDPartitionsTheNameSpace(t *testing.T) {
 // UIDs (simulating delete-and-recreate after cascade GC) must land at
 // distinct CR names so the new owner gets a fresh ControllerRevision
 // history rather than reusing the predecessor's. This is the unit-test
-// analog of the KIND spec lifecycle_kind_test.go:301
-// "delete + recreate same-name ISVC produces a fresh ControllerRevision"
-// — the unit form runs against the fake client so it doesn't depend on
+// analog of the cluster-level case "delete + recreate same-name ISVC
+// produces a fresh ControllerRevision" — the unit form runs against the fake client so it doesn't depend on
 // real cascade-GC timing.
 func TestEnsureControllerRevision_RecreateProducesDistinctCRName(t *testing.T) {
 	oldISVC := minimalISVC("recreate-isvc", "prod", 1)
@@ -1436,7 +1435,7 @@ func TestCollectLiveRevisionNames_UnionAcrossInstanceStatuses(t *testing.T) {
 		{Index: 2, RunningRevision: "rev-current", TargetRevision: "rev-update"},
 		{Index: 3, RunningRevision: "", TargetRevision: ""},
 	}
-	got := CollectLiveRevisionNames("rev-current", "rev-update", instances)
+	got := LiveRevisionNames("rev-current", "rev-update", RowRevisions(instances))
 	want := map[string]bool{
 		"rev-current":    true,
 		"rev-update":     true,
@@ -1453,10 +1452,10 @@ func TestCollectLiveRevisionNames_UnionAcrossInstanceStatuses(t *testing.T) {
 }
 
 func TestCollectLiveRevisionNames_HandlesNilStatus(t *testing.T) {
-	if got := CollectLiveRevisionNames("", "", nil); got != nil {
+	if got := LiveRevisionNames("", "", RowRevisions(nil)); got != nil {
 		t.Errorf("expected nil for empty (no live names), got %v", got)
 	}
-	if got := CollectLiveRevisionNames("", "", []workload.InstanceStatus{}); got != nil {
+	if got := LiveRevisionNames("", "", RowRevisions([]workload.InstanceStatus{})); got != nil {
 		t.Errorf("expected nil for empty status (no live names), got %v", got)
 	}
 }
@@ -1465,7 +1464,7 @@ func TestCollectLiveRevisionNames_DropsEmpty(t *testing.T) {
 	instances := []workload.InstanceStatus{
 		{Index: 0, RunningRevision: "", TargetRevision: ""},
 	}
-	got := CollectLiveRevisionNames("", "rev-a", instances)
+	got := LiveRevisionNames("", "rev-a", RowRevisions(instances))
 	if len(got) != 1 || got[0] != "rev-a" {
 		t.Errorf("expected only [rev-a], got %v", got)
 	}
@@ -1723,7 +1722,7 @@ func TestEnsureControllerRevision_StampsPairingAnnotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hash: %v", err)
 	}
-	cr, collision, err := EnsureControllerRevisionFromHash(context.Background(), c, c, isvc, testISVCGVK, key, hash, raw)
+	cr, collision, err := EnsureControllerRevisionFromHash(context.Background(), c, c, isvc, testISVCGVK, key, hash, raw, nil)
 	if err != nil || collision {
 		t.Fatalf("ensure: err=%v collision=%v", err, collision)
 	}
@@ -1740,7 +1739,7 @@ func TestEnsureControllerRevision_StampsPairingAnnotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hash2: %v", err)
 	}
-	cr2, _, err := EnsureControllerRevisionFromHash(context.Background(), c, c, isvc, testISVCGVK, key, hash2, raw2)
+	cr2, _, err := EnsureControllerRevisionFromHash(context.Background(), c, c, isvc, testISVCGVK, key, hash2, raw2, nil)
 	if err != nil {
 		t.Fatalf("ensure2: %v", err)
 	}
@@ -1996,7 +1995,7 @@ func adoptionFixture(t *testing.T) (client.Client, client.Object, Key, Template)
 		t.Fatal(err)
 	}
 	c := newFakeClientWithApps(t, isvc)
-	if _, collision, err := EnsureControllerRevisionFromHash(context.Background(), c, c, isvc, testISVCGVK, key, hashFree, rawFree); err != nil || collision {
+	if _, collision, err := EnsureControllerRevisionFromHash(context.Background(), c, c, isvc, testISVCGVK, key, hashFree, rawFree, nil); err != nil || collision {
 		t.Fatalf("mint the width-free revision: err=%v collision=%v", err, collision)
 	}
 	return c, isvc, key, tmpl
@@ -2044,7 +2043,7 @@ func TestAdoptRevisionWithoutWidth(t *testing.T) {
 		}
 	}
 	adopt := func(target string, obs func(string) (int32, bool)) (*appsv1.ControllerRevision, error) {
-		return AdoptRevisionWithoutWidth(ctx, c, c, owner, key, hash, twin, tmpl.WorkerSize, target, obs)
+		return AdoptRevisionWithoutWidth(ctx, c, c, owner, nil, key, hash, twin, tmpl.WorkerSize, target, obs)
 	}
 
 	if got, err := adopt("", observed(0, false)); err != nil || got == nil || got.Name != freeName {
@@ -2066,14 +2065,14 @@ func TestAdoptRevisionWithoutWidth(t *testing.T) {
 	moved.PodSpec = &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "llama:v2"}}}
 	movedHash, _, _ := HashTemplate(moved, nil, owner.GetUID())
 	movedTwin, _, _ := WidthFreeTwinOf(moved, nil, owner.GetUID())
-	if got, err := AdoptRevisionWithoutWidth(ctx, c, c, owner, key, movedHash, movedTwin, moved.WorkerSize, "", observed(0, false)); err != nil || got != nil {
+	if got, err := AdoptRevisionWithoutWidth(ctx, c, c, owner, nil, key, movedHash, movedTwin, moved.WorkerSize, "", observed(0, false)); err != nil || got != nil {
 		t.Fatalf("a template change has no width-free twin to adopt: got %v err %v", got, err)
 	}
 	other := minimalISVC("other", "prod", 1)
-	if got, err := AdoptRevisionWithoutWidth(ctx, c, c, other, key, hash, twin, tmpl.WorkerSize, "", observed(0, false)); err != nil || got != nil {
+	if got, err := AdoptRevisionWithoutWidth(ctx, c, c, other, nil, key, hash, twin, tmpl.WorkerSize, "", observed(0, false)); err != nil || got != nil {
 		t.Fatalf("a revision owned by another object is not adopted: got %v err %v", got, err)
 	}
-	if _, collision, err := EnsureControllerRevisionFromHash(ctx, c, c, owner, testISVCGVK, key, hash, raw); err != nil || collision {
+	if _, collision, err := EnsureControllerRevisionFromHash(ctx, c, c, owner, testISVCGVK, key, hash, raw, nil); err != nil || collision {
 		t.Fatalf("mint the hashed revision: err=%v collision=%v", err, collision)
 	}
 	if got, err := adopt("", observed(0, false)); err != nil || got != nil {
@@ -2101,7 +2100,7 @@ func TestAdoptRevisionWithoutWidth_ReadsLiveOnlyUntilTheStatusNamesTheTwin(t *te
 	live := &countingReader{Reader: c}
 	matching := func(string) (int32, bool) { return 2, true }
 
-	got, err := AdoptRevisionWithoutWidth(ctx, c, live, owner, key, hash, twin, tmpl.WorkerSize, "", matching)
+	got, err := AdoptRevisionWithoutWidth(ctx, c, live, owner, nil, key, hash, twin, tmpl.WorkerSize, "", matching)
 	if err != nil || got == nil || got.Name != freeName {
 		t.Fatalf("first adoption: got %v err %v", got, err)
 	}
@@ -2109,7 +2108,7 @@ func TestAdoptRevisionWithoutWidth_ReadsLiveOnlyUntilTheStatusNamesTheTwin(t *te
 		t.Fatalf("the first adoption confirms the hashed name and the twin live, once each: %d live reads", live.gets)
 	}
 	for pass := 0; pass < 3; pass++ {
-		got, err := AdoptRevisionWithoutWidth(ctx, c, live, owner, key, hash, twin, tmpl.WorkerSize, freeName, matching)
+		got, err := AdoptRevisionWithoutWidth(ctx, c, live, owner, nil, key, hash, twin, tmpl.WorkerSize, freeName, matching)
 		if err != nil || got == nil || got.Name != freeName {
 			t.Fatalf("pass %d: got %v err %v", pass, got, err)
 		}
@@ -2117,7 +2116,7 @@ func TestAdoptRevisionWithoutWidth_ReadsLiveOnlyUntilTheStatusNamesTheTwin(t *te
 	if live.gets != 2 {
 		t.Fatalf("once the status names the twin, adoption reads nothing live: %d live reads after three passes", live.gets)
 	}
-	if got, err := AdoptRevisionWithoutWidth(ctx, c, live, owner, key, hash, twin, tmpl.WorkerSize, freeName, func(string) (int32, bool) { return 3, true }); err != nil || got != nil {
+	if got, err := AdoptRevisionWithoutWidth(ctx, c, live, owner, nil, key, hash, twin, tmpl.WorkerSize, freeName, func(string) (int32, bool) { return 3, true }); err != nil || got != nil {
 		t.Fatalf("a width the gangs do not run mints from the cached decision: got %v err %v", got, err)
 	}
 	if live.gets != 2 {

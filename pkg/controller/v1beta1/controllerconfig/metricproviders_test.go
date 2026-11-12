@@ -174,19 +174,15 @@ func TestParseAutoscalerPolicyConfig_ProviderKeys_TopLevelWinsNestedAloneResolve
 	})
 }
 
-// TestNewMetricProvidersConfig_PlainAndCachedLoaders_ReadTheConfigMap verifies the clientset-backed loaders
-// resolve through the shared ConfigMap fetch (uncached and TTL-cached paths).
-func TestNewMetricProvidersConfig_PlainAndCachedLoaders_ReadTheConfigMap(t *testing.T) {
+// TestNewMetricProvidersConfigCached_DisabledCacheReadsTheConfigMap verifies the clientset-backed loader
+// resolves through the shared ConfigMap fetch when caching is disabled.
+func TestNewMetricProvidersConfigCached_DisabledCacheReadsTheConfigMap(t *testing.T) {
 	clientset, gets := countingClientset(t, map[string]string{
 		MetricProvidersConfigName: `{"p": {"serverAddress": "http://prometheus.monitoring.svc:9090"}}`,
 	})
 
-	got, err := NewMetricProvidersConfig(clientset)
-	require.NoError(t, err)
-	assert.Equal(t, "http://prometheus.monitoring.svc:9090", got["p"].ServerAddress)
-
 	cache := NewConfigCache(0) // disabled cache falls through to live GETs
-	got, err = NewMetricProvidersConfigCached(cache, clientset)
+	got, err := NewMetricProvidersConfigCached(cache, clientset)
 	require.NoError(t, err)
 	assert.Equal(t, "http://prometheus.monitoring.svc:9090", got["p"].ServerAddress)
 	assert.Positive(t, atomic.LoadInt64(gets))

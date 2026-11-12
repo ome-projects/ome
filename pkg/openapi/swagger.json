@@ -17,7 +17,7 @@
       ],
       "properties": {
         "borrowingLimit": {
-          "description": "BorrowingLimit is how far above its share this leaf may burst by borrowing idle sibling capacity, passed through to Kueue. Unset, this leaf does not borrow: nominal is its ceiling, and the materialized queue carries an explicit limit of zero to say so, because the enforcement backend reads an absent limit as unbounded.\n\nBorrowing is cluster-local, so setting it turns nominal from a ceiling into a floor plus overage, and the relaxed ceiling is reported in status.\n\nWARNING: overage is not currently reclaimable. This plane sets no preemption policy, so a borrower holds what it took until its own work finishes -- a leaf that bursts can leave a sibling waiting for the share that sibling was guaranteed. Leaves only.",
+          "description": "BorrowingLimit is how far above its share this leaf may burst by borrowing idle sibling capacity, passed through to Kueue. Unset, this leaf does not borrow: nominal is its ceiling, and the materialized queue carries an explicit limit of zero to say so, because the enforcement backend reads an absent limit as unbounded.\n\nBorrowing is cluster-local, so setting it turns nominal from a ceiling into a floor plus overage, and the relaxed ceiling is reported in status.\n\nAn owner's preemption.reclaimWithinCohort policy controls whether it can evict borrowers to recover its share. Without reclamation, an owner may wait until borrowed workloads finish. Leaves only.",
           "$ref": "#/definitions/resource.Quantity"
         },
         "lendingLimit": {
@@ -696,6 +696,21 @@
         }
       }
     },
+    "v1beta1.AcceleratorQuotaBorrowWithinCohort": {
+      "description": "AcceleratorQuotaBorrowWithinCohort configures preemption when an incoming workload needs borrowed quota rather than its queue's own entitlement.",
+      "type": "object",
+      "properties": {
+        "maxPriorityThreshold": {
+          "description": "MaxPriorityThreshold limits borrowing-driven preemption to workloads whose priority is at most this value. It has no effect when Policy is Never. Unset adds no threshold beyond the policy's priority comparison.",
+          "type": "integer",
+          "format": "int32"
+        },
+        "policy": {
+          "description": "Policy permits eviction of lower-priority borrowers when LowerPriority. Unset keeps Kueue's Never default.",
+          "type": "string"
+        }
+      }
+    },
     "v1beta1.AcceleratorQuotaClusterStatus": {
       "description": "AcceleratorQuotaClusterStatus is one workload cluster's projection state, reported where the tree is authored.",
       "type": "object",
@@ -804,6 +819,24 @@
         }
       }
     },
+    "v1beta1.AcceleratorQuotaPreemption": {
+      "description": "AcceleratorQuotaPreemption configures Kueue preemption for one ClusterQueue. These policies authorize evictions for incoming workloads in this queue. They do not protect its running workloads from another queue's reclamation.",
+      "type": "object",
+      "properties": {
+        "borrowWithinCohort": {
+          "description": "BorrowWithinCohort permits eviction to obtain borrowed quota. Ordinary borrowing of idle quota does not require this. Kueue does not support borrowing-driven preemption with Fair Sharing enabled.",
+          "$ref": "#/definitions/v1beta1.AcceleratorQuotaBorrowWithinCohort"
+        },
+        "reclaimWithinCohort": {
+          "description": "ReclaimWithinCohort permits eviction of eligible borrowers to recover this queue's entitlement. Any ignores the selected workload's priority; LowerPriority requires a lower-priority workload. Unset keeps Kueue's Never default.",
+          "type": "string"
+        },
+        "withinClusterQueue": {
+          "description": "WithinClusterQueue permits eviction inside this queue. LowerPriority requires a lower-priority workload; LowerOrNewerEqualPriority also permits newer equal-priority workloads. Unset keeps Kueue's Never default.",
+          "type": "string"
+        }
+      }
+    },
     "v1beta1.AcceleratorQuotaSpec": {
       "description": "AcceleratorQuotaSpec is one node's declared position in the tree and, for a leaf, its budget.\n\nThe rules below are same-object shape checks only. Everything needing the rest of the tree — parent resolution, cycles, depth, containment, fleet-wide namespace uniqueness, role transitions — is enforced by the validating webhook at admission and re-checked by the controller at reconcile, which is the authority. Structural checks here are also stripped from the minimal CRD variant, so they are convenience, never the durable tier.",
       "type": "object",
@@ -831,6 +864,10 @@
         "parentRef": {
           "description": "ParentRef is the edge to this node's parent. Every node sets it except the single reserved root. It is mutable: re-parenting updates the materialized ClusterQueue's cohort in place, so the queue, its LocalQueues, and its admitted workloads all survive.",
           "$ref": "#/definitions/v1beta1.AcceleratorQuotaParentRef"
+        },
+        "preemption": {
+          "description": "Preemption controls when this leaf's pending workloads may evict other workloads. The settings apply to its ClusterQueue on every member. Unset fields keep Kueue's defaults, which disable preemption.",
+          "$ref": "#/definitions/v1beta1.AcceleratorQuotaPreemption"
         },
         "priorityTier": {
           "description": "PriorityTier names the WorkloadPriorityClass stamped on this leaf's workloads. It is a default, not a partition: a workload declaring its own priority keeps it, and the leaf's ClusterQueue admits mixed priorities. OME references the class and does not create it. Capped at AcceleratorQuotaMaxNameLength because it is stamped into a label value.",
@@ -1652,7 +1689,7 @@
       ],
       "properties": {
         "reason": {
-          "description": "Reason names the gate that gave up.",
+          "description": "Reason names the gate that gave up, or the write that stopped the unit.",
           "type": "string",
           "default": ""
         },
@@ -1714,7 +1751,7 @@
           "x-kubernetes-list-type": "map"
         },
         "observedTrafficWeight": {
-          "description": "ObservedTrafficWeight is the external traffic weight currently programmed for the canary revision (mirrors the active step's TrafficWeight once applied).",
+          "description": "ObservedTrafficWeight is the external traffic weight currently programmed for the canary revision (mirrors the active step's TrafficWeight once applied). It is the weight written to the Component's traffic targets; whether the gateway has accepted the route carrying it is reported by the IngressReady condition.",
           "type": "integer",
           "format": "int32",
           "default": 0
@@ -1738,6 +1775,10 @@
         "stableRevisionHash": {
           "description": "StableRevisionHash is the revision hash that was serving as stable when the canary began — the rollback target. It is preserved across mid-canary retargets so a rollback always returns to the pre-canary stable revision, never to a partially-rolled intermediate. Cleared when the canary completes (the canary revision becomes the new stable).",
           "type": "string"
+        },
+        "stableSideShortSince": {
+          "description": "StableSideShortSince is when the executor first read the stable side short under the split the current step serves: a member runs fewer Ready Instances on its stable revision than the step keeps there, at least one, so the canary revision carries a larger share of the Ready capacity than the split's weight. The event CanaryStableSideShort is recorded on the pass that sets it, not on every pass it stands. Cleared when every member's stable side is whole again, when no Ready Instance is left on a stable side (the split itself moves then), and when the split moves on: a step advance, the cutover, a hold, a stop, a rollback, a start toward a new target.",
+          "$ref": "#/definitions/v1.Time"
         },
         "stepEnteredTime": {
           "description": "StepEnteredTime is when CurrentStep was entered. Auto promotion measures Pause.Duration from this timestamp.",
@@ -1824,7 +1865,7 @@
           "x-kubernetes-list-type": "set"
         },
         "maxWeight": {
-          "description": "MaxWeight is the primary component's summed max ratio. It is set only when the source uses the *Replicas ratio form.",
+          "description": "MaxWeight is the primary component's summed max ratio. It is set only when the affinity terms set weights.",
           "type": "integer",
           "format": "int64"
         },
@@ -2089,49 +2130,29 @@
           "x-kubernetes-list-type": "atomic"
         },
         "weights": {
-          "description": "Weights sets each component's replica weight on the clusters this term matches, and is permitted only for static Split. If any term gives a component a weight, the weights of matching terms add and a term that gives none contributes one. Weights are ratios, so they have no upper bound. With no weights on any term, every matched cluster weighs one and routers are divided, as a default weight of one on every term would.",
+          "description": "Weights sets each component's replica ratio on the clusters this term matches, and is permitted only for static Split without a split block. If any term gives a component a ratio, the ratios of matching terms add and a term that gives none contributes {min: 1, max: 1}. With no weights on any term, every matched cluster weighs one and routers are divided.",
           "$ref": "#/definitions/v1beta1.ClusterAffinityWeights"
         }
       }
     },
     "v1beta1.ClusterAffinityWeights": {
-      "description": "ClusterAffinityWeights holds one term's weight per component. The engine takes engine, then default. The decoder takes decoder, then default, then the engine's weight. The router takes router, then default, then the engine's weight. Routers are divided across clusters unless the terms set weights that name only the engine or decoder; then every cluster runs the full router policy. The integer keys and the *Replicas ratio keys are two forms of the same weights; one placement uses only one form.",
+      "description": "ClusterAffinityWeights holds one term's replica ratio per component. The engine takes engine, then default. The decoder takes decoder, then default, then the engine's ratio. The router takes router, then default, then the engine's ratio. Routers are divided across clusters unless the terms name only the engine or decoder; then every cluster runs the full router policy.",
       "type": "object",
       "properties": {
         "decoder": {
-          "description": "Decoder is the decoder's weight.",
-          "type": "integer",
-          "format": "int32"
-        },
-        "decoderReplicas": {
-          "description": "DecoderReplicas is the ratio form of decoder.",
+          "description": "Decoder is the decoder's ratio.",
           "$ref": "#/definitions/v1beta1.ReplicaRatio"
         },
         "default": {
-          "description": "Default is the weight of every component this term does not name. Setting it on any term divides router.minReplicas across the clusters, as router does.",
-          "type": "integer",
-          "format": "int32"
-        },
-        "defaultReplicas": {
-          "description": "DefaultReplicas is the ratio form of default. It applies to every component this term does not name.",
+          "description": "Default is the ratio of every component this term does not name. Setting it on any term divides router.minReplicas across the clusters, as router does.",
           "$ref": "#/definitions/v1beta1.ReplicaRatio"
         },
         "engine": {
-          "description": "Engine is the engine's weight.",
-          "type": "integer",
-          "format": "int32"
-        },
-        "engineReplicas": {
-          "description": "EngineReplicas is the ratio form of engine.",
+          "description": "Engine is the engine's ratio.",
           "$ref": "#/definitions/v1beta1.ReplicaRatio"
         },
         "router": {
-          "description": "Router is the router's weight. Setting it or default on any term divides router.minReplicas across the clusters, as setting no weights does; weights that name only the engine or decoder keep the full router policy on every cluster.",
-          "type": "integer",
-          "format": "int32"
-        },
-        "routerReplicas": {
-          "description": "RouterReplicas is the ratio form of router.",
+          "description": "Router is the router's ratio. Setting it or default on any term divides router.minReplicas across the clusters, as setting no weights does; ratios that name only the engine or decoder keep the full router policy on every cluster.",
           "$ref": "#/definitions/v1beta1.ReplicaRatio"
         }
       }
@@ -2307,7 +2328,7 @@
           "default": ""
         },
         "maxWeight": {
-          "description": "MaxWeight is the component's summed max ratio. It is set only when the source uses the *Replicas ratio form.",
+          "description": "MaxWeight is the component's summed max ratio. It is set only when the affinity terms set weights.",
           "type": "integer",
           "format": "int64"
         },
@@ -2515,7 +2536,7 @@
           "$ref": "#/definitions/v1beta1.AcceleratorSelection"
         },
         "traffic": {
-          "description": "Traffic reports per-revision traffic weights for this Component. Each entry corresponds to one revision currently receiving traffic. The HTTPRoute builder reads this to emit weighted backendRefs.",
+          "description": "Traffic reports per-revision traffic weights for this Component: one entry per revision currently receiving traffic, naming its per-revision Service. On the Gateway API HTTPRoutes OME renders, the entries are programmed as weighted backendRefs on those Services, so these percentages and the weights the gateway applies are one value. A Kubernetes Ingress cannot express backend weights, and a route OME does not render is programmed by whoever owns it; under those providers the entries are the contract that router consumes.",
           "type": "array",
           "items": {
             "default": {},
@@ -2533,7 +2554,7 @@
       }
     },
     "v1beta1.ComponentTrafficTarget": {
-      "description": "ComponentTrafficTarget describes the percentage of traffic routed to one revision of one Component. RevisionName is the per-revision Service name produced by OMENative's coordination layer (e.g. `llama-engine-rev-abc123`), which the HTTPRoute builder consumes directly as a backend reference.",
+      "description": "ComponentTrafficTarget describes the percentage of traffic routed to one revision of one Component. RevisionName is the per-revision Service name produced by OMENative's coordination layer (e.g. `llama-engine-rev-abc123`), which the HTTPRoute builder consumes directly as a weighted backend reference.",
       "type": "object",
       "required": [
         "revisionName",
@@ -2620,7 +2641,7 @@
       "type": "object",
       "properties": {
         "acceleratorOverride": {
-          "description": "AcceleratorOverride allows overriding the global accelerator selection for this component",
+          "description": "AcceleratorOverride allows overriding the global accelerator selection for this component. Each field set here, the class name, the policy or the constraints block, replaces the same field of spec.acceleratorSelector; a field left unset is read from spec.acceleratorSelector. An empty constraints block clears the service's constraints for this component.",
           "$ref": "#/definitions/v1beta1.AcceleratorSelector"
         },
         "activeDeadlineSeconds": {
@@ -3038,7 +3059,7 @@
       "type": "object",
       "properties": {
         "acceleratorOverride": {
-          "description": "AcceleratorOverride allows overriding the global accelerator selection for this component",
+          "description": "AcceleratorOverride allows overriding the global accelerator selection for this component. Each field set here, the class name, the policy or the constraints block, replaces the same field of spec.acceleratorSelector; a field left unset is read from spec.acceleratorSelector. An empty constraints block clears the service's constraints for this component.",
           "$ref": "#/definitions/v1beta1.AcceleratorSelector"
         },
         "activeDeadlineSeconds": {
@@ -3452,7 +3473,7 @@
       "type": "object",
       "properties": {
         "acceleratorOverride": {
-          "description": "AcceleratorOverride allows overriding the global accelerator selection for this component",
+          "description": "AcceleratorOverride allows overriding the global accelerator selection for this component. Each field set here, the class name, the policy or the constraints block, replaces the same field of spec.acceleratorSelector; a field left unset is read from spec.acceleratorSelector. An empty constraints block clears the service's constraints for this component.",
           "$ref": "#/definitions/v1beta1.AcceleratorSelector"
         },
         "activeDeadlineSeconds": {
@@ -3998,6 +4019,10 @@
         },
         "ratio": {
           "$ref": "#/definitions/resource.Quantity"
+        },
+        "released": {
+          "description": "Released is true for a Component that stopped following and declares autoscaler class None: Current is the count it keeps and Target the count its minReplicas names. The record ends when that minReplicas is edited, an autoscaler takes the count, or a policy names the Component again.",
+          "type": "boolean"
         },
         "target": {
           "description": "Target is the anchor's desired count times the ratio, rounded up, after the follower's own bounds.",
@@ -4786,7 +4811,7 @@
       }
     },
     "v1beta1.InstanceStatusColumns": {
-      "description": "InstanceStatusColumns is the ColumnarV2 representation of the per-Instance rows. A value shared by many Instances is stored once against the index set of the Instances that carry it; records that are rare or unique per Instance stay keyed by index in entries.\n\nAn index set is a string of comma-separated decimal terms, each a single index or a closed \"first-last\" range, for example \"0-8,10-114,116\". The canonical form is the only accepted one: terms are strictly ascending, disjoint, and nonadjacent (adjacent terms are merged), a range has first \u003c last, indices are nonnegative int32 values without leading zeros, and there is no whitespace, sign, empty term, or trailing comma.\n\nMembers is the complete row set; every other index set is a subset of it. Within one column the group index sets are pairwise disjoint and the groups are in canonical value order: bytewise for phases and revisions, signed numeric for incarnations and counts. A member absent from every group of an optional column takes that column's documented default.",
+      "description": "InstanceStatusColumns is the ColumnarV2 representation of the per-Instance rows. A value shared by many Instances is stored once against the index set of the Instances that carry it; records that are rare or unique per Instance stay keyed by index in entries.\n\nAn index set is a string of comma-separated decimal terms, each a single index or a closed \"first-last\" range, for example \"0-8,10-114,116\". The canonical form is the only accepted one: terms are strictly ascending, disjoint, and nonadjacent (adjacent terms are merged), a range has first \u003c last, indices are nonnegative int32 values without leading zeros, and there is no whitespace, sign, empty term, or trailing comma.\n\nMembers is the complete row set; every other index set is a subset of it. Within one column the group index sets are pairwise disjoint and the groups are in canonical value order: bytewise for phases and revisions, signed numeric for incarnations and counts. A member absent from every group of an optional column takes that column's documented default.\n\nThe time an Instance became Ready is stored once per Instance either way: as an offset in whole seconds from one base time, in readySinceBase, readySinceIndexes and readySinceOffsets, or, in a payload without those three, as the readySince of the Instance's entry.",
       "type": "object",
       "required": [
         "members",
@@ -4811,7 +4836,7 @@
           "x-kubernetes-list-type": "atomic"
         },
         "entries": {
-          "description": "Entries carries the per-Instance records that are not grouped: conditions, readySince, operation, and lastFailure. At most one entry per member, in ascending index order, each carrying at least one of those records. A member without an entry has none of them.",
+          "description": "Entries carries the per-Instance records that have no column of their own and, in a payload without the readySince columns, each Instance's readySince. At most one entry per member, in ascending index order, each carrying at least one of those records. A member without an entry has none of them.",
           "type": "array",
           "items": {
             "default": {},
@@ -4848,6 +4873,24 @@
           "items": {
             "default": {},
             "$ref": "#/definitions/v1beta1.InstanceStatusCountGroup"
+          },
+          "x-kubernetes-list-type": "atomic"
+        },
+        "readySinceBase": {
+          "description": "ReadySinceBase is the earliest readySince among the Instances of readySinceIndexes. Each of those Instances became Ready at this time plus its value of readySinceOffsets. Present exactly when readySinceIndexes and readySinceOffsets are present. A manager whose served schema lacks any of the three columns stores each readySince in its Instance's entry instead, and no time is lost. A manager built without the three readySince columns reads every Instance as having no readySince and removes the columns on its first status write; the validation rule accepts that write, so the apiserver cannot refuse it. A rollback to such a build keeps the times only by writing every object as DenseV1 first, the rule the representation union follows.",
+          "$ref": "#/definitions/v1.Time"
+        },
+        "readySinceIndexes": {
+          "description": "ReadySinceIndexes is the index set of the Instances whose readySince the three readySince columns carry. When the columns are present, a member outside this set has no readySince and no entry carries one. A manager built without the three columns removes them on its first status write, and no validation rule refuses it; see readySinceBase.",
+          "type": "string"
+        },
+        "readySinceOffsets": {
+          "description": "ReadySinceOffsets lists, for the Instances of readySinceIndexes in ascending index order, the whole seconds from readySinceBase to the time each became Ready. The earliest Instance's offset is 0. A manager built without the three columns removes them on its first status write, and no validation rule refuses it; see readySinceBase.",
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int32",
+            "default": 0
           },
           "x-kubernetes-list-type": "atomic"
         },
@@ -4954,7 +4997,7 @@
           "$ref": "#/definitions/v1beta1.InstanceOperation"
         },
         "readySince": {
-          "description": "ReadySince is the Instance's readySince.",
+          "description": "ReadySince is the Instance's readySince in a payload without the readySince columns. A payload with those columns carries every readySince there, and no entry carries one.",
           "$ref": "#/definitions/v1.Time"
         }
       }
@@ -6211,7 +6254,7 @@
           "format": "int32"
         },
         "servingPodCount": {
-          "description": "ServingPodCount is the number of pods that are BOTH ContainersReady AND have serving=True on the controller-managed readiness gate — i.e., pods actually in the load balancer rotation. Diverges from ReadyPodCount whenever the controller flips the serving gate (in-place updates, drain steps, etc.). MaxUnavailable budgets are computed against the serving count, not the ready count, so that \"missing from traffic\" reflects reality.",
+          "description": "ServingPodCount is the number of this Instance's pods whose Ready condition is True and whose controller-managed readiness gate reads serving=True. On a gang it counts every such pod, workers included, although only the leader is routed; it is 0 when no routed pod serves, however many workers keep the gate. The rollout gates and budgets read an Instance as serving only when this count reaches its pod count, so an Instance short one pod is unavailable to them.",
           "type": "integer",
           "format": "int32"
         },
@@ -7014,7 +7057,7 @@
           "default": ""
         },
         "ratios": {
-          "description": "Ratios maps each follower Component to its replica ratio relative to the anchor. A ratio of 1.0 means parity; 0.25 means one follower per four anchor replicas (rounded up). Components not listed scale independently. A follower's minReplicas is a floor on the count it is given. Its maxReplicas, when set, is a ceiling; a follower that sets none has no ceiling of its own, and the anchor's bounds cap its count. The status reports a follower as clamped when either bound moved its target.",
+          "description": "Ratios maps each follower Component to its replica ratio relative to the anchor. A ratio of 1.0 means parity; 0.25 means one follower per four anchor replicas (rounded up). Components not listed scale independently. A follower's minReplicas is a floor on the count it is given. Its maxReplicas, when set, is a ceiling; a follower that sets none has no ceiling of its own, and the anchor's bounds cap its count. The status reports a follower as clamped when either bound moved its target. A follower taken out of the ratios, or every follower when the policy is removed, keeps the count it carries: its own autoscaler owns the count when it has one; with autoscaler class None the status reports it as released and the count stands until its minReplicas is edited.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/definitions/resource.Quantity"
@@ -7689,7 +7732,7 @@
           "$ref": "#/definitions/v1.Time"
         },
         "plan": {
-          "description": "Plan is the effective groups list, frozen for this run. Executors index it — never the live spec — while the run is open.",
+          "description": "Plan is the effective groups list, frozen for this run. Executors index it — never the live spec — while the run is open; the coordination gates read a group's ratio rule, a rolling group's budgets and the group's presence from the live spec.",
           "default": {},
           "$ref": "#/definitions/v1beta1.RolloutRunPlan"
         },
@@ -7804,6 +7847,10 @@
           "type": "string",
           "default": ""
         },
+        "runID": {
+          "description": "RunID is the id the run carried while it was open. The next run folds it into its own id, so two runs of one service never share an id even when one closes and the next opens within the same second.",
+          "type": "string"
+        },
         "targetRevisions": {
           "description": "TargetRevisions retains each Component's target and stable revision so a rolled-back hold has an exact per-Component identity after ActiveRun is dropped.",
           "type": "array",
@@ -7857,7 +7904,7 @@
           "x-kubernetes-list-type": "atomic"
         },
         "pairingProtocol": {
-          "description": "PairingProtocol declares the engine↔decoder wire-compatibility contract for prefill-decode pairing (e.g. a KV-transfer protocol generation, such as \"nixl-v2\"). It is an opaque, operator-owned token compared only for equality; bump it ONLY when the engine↔decoder wire contract breaks. The value rides each engine and decoder revision: changing it mints new revisions for both Components (a rollout), stamps ome.io/pairing-protocol on their pods and per-revision Services, and is published on each traffic target so routing pairs only engine and decoder revisions whose values are equal. Empty or unset pairs with anything, so setting or clearing the token is upgrade-neutral. Changing it between two non-empty values requires engine and decoder to roll as one blueGreen or canary group. While the service declares an encoder, whose revisions carry the token too, and in the edit that removes it, the value may only stay the same or be cleared.",
+          "description": "PairingProtocol declares the engine↔decoder wire-compatibility contract for prefill-decode pairing (e.g. a KV-transfer protocol generation, such as \"nixl-v2\"). It is an opaque, operator-owned token compared only for equality; bump it ONLY when the engine↔decoder wire contract breaks. The value rides each engine and decoder revision: changing it mints new revisions for both Components (a rollout), stamps ome.io/pairing-protocol on their pods and per-revision Services, and is published on each traffic target so routing pairs only engine and decoder revisions whose values are equal. Empty or unset pairs with anything, so setting or clearing the token is upgrade-neutral. Changing it between two non-empty values requires one rollout group listing both engine and decoder (rollingUpdate, blueGreen or canary), so the two sides roll together and a pairable pair keeps serving through the transition. While the service declares an encoder, whose revisions carry the token too, and in the edit that removes it, the value may only stay the same or be cleared.",
           "type": "string"
         }
       }

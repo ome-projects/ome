@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-04",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "The confirmation of a replica's spec revision at rest, as every replica pass makes it, for a single-pod Component and a gang of a leader and seven workers: one read of the ControllerRevision from the cache (a deep copy) and the retention, the payload and the scope owner checked on it. No live read, no write. Before the confirmation decided on the cached copy it read the revision live once (the fake apiserver's JSON decode of the object): 92 allocations for the single-pod Component and 103 for the gang, one live read each.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "gang/1+7/allocations": 12,
+    "gang/1+7/revision-cache-reads": 1,
+    "gang/1+7/revision-live-reads": 0,
+    "single/allocations": 10,
+    "single/revision-cache-reads": 1,
+    "single/revision-live-reads": 0
+  }
+}

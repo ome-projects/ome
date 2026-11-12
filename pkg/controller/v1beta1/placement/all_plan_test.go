@@ -300,7 +300,7 @@ func TestAllInventoryRecoveryAcceptsRetarget(t *testing.T) {
 			if err := f.reconciler.Create(t.Context(), wc); err != nil {
 				t.Fatal(err)
 			}
-			worker := emptyWorker(f.reconciler.Scheme)
+			worker := emptyWorker(f.reconciler.Scheme())
 			f.connections.m[wc.Name] = workloadcluster.NewNeverCachingClient(worker)
 			held := f.reconcile(t)
 			if diff := cmp.Diff(original, held.Status.Placement.Plan.AdoptionDigest); diff != "" {

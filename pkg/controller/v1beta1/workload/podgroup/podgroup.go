@@ -40,10 +40,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -86,11 +89,14 @@ func IsMultiPodInstance(inst workload.InstancePlan) bool {
 // members).
 //
 // Spec.MinMember = TotalPods(inst) — every leader + worker pod must be
-// schedulable for the gang to land. Spec.ScheduleTimeoutSeconds comes from
-// InstanceReadyTimeout, bounded by plan.GangScheduleTimeout when the
-// operator configured one. When plan.TopologyKey is set, the PodGroup
-// advertises that same configured key through
-// query.AnnotationTopologyKey.
+// schedulable for the gang to land. Spec.ScheduleTimeoutSeconds is the
+// placement grace (unschedulableGrace, the operator's
+// lifecycle.unschedulableGracePeriod): the scheduler stops waiting for the
+// gang in the same moment OME ends the attempt, so the two clocks never
+// fire apart. plan.GangScheduleTimeout bounds it to the range the
+// scheduler accepts when the operator configured one. When
+// plan.TopologyKey is set, the PodGroup advertises that same configured
+// key through query.AnnotationTopologyKey.
 //
 // Pure compute, no I/O.
 //
@@ -101,7 +107,7 @@ func IsMultiPodInstance(inst workload.InstancePlan) bool {
 // name would double the component (e.g. PodGroup "svc-engine-engine-0") and
 // never match the pods' "svc-engine-0" label → "PodGroup not found". owner is
 // still used for the OwnerReference (GC) and namespace.
-func BuildPodGroup(owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, inst workload.InstancePlan) (*schedulingv1alpha1.PodGroup, error) {
+func BuildPodGroup(owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, unschedulableGrace time.Duration, inst workload.InstancePlan) (*schedulingv1alpha1.PodGroup, error) {
 	if owner == nil {
 		return nil, fmt.Errorf("BuildPodGroup: nil owner")
 	}
@@ -110,7 +116,7 @@ func BuildPodGroup(owner client.Object, ownerGVK schema.GroupVersionKind, ownerN
 	}
 
 	minMember := inst.TotalPods()
-	timeout, bounded := scheduleTimeoutSeconds(plan)
+	timeout, bounded := scheduleTimeoutSeconds(unschedulableGrace, plan.GangScheduleTimeout)
 
 	labels := podGroupLabels(ownerName, plan.Component, inst.Index)
 	var annotations map[string]string
@@ -137,30 +143,32 @@ func BuildPodGroup(owner client.Object, ownerGVK schema.GroupVersionKind, ownerN
 	}, nil
 }
 
-// scheduleTimeoutSeconds derives the gang's ScheduleTimeoutSeconds from
-// the Component's InstanceReadyTimeout and bounds it with the operator's
-// clamp. ok=false means the field stays unset, which leaves the timeout
-// to the scheduler's own default: that is what an unconfigured clamp
-// gives a Component whose InstanceReadyTimeout is unusable as a gang
-// deadline, since there is no in-code window to fall back on.
-func scheduleTimeoutSeconds(plan workload.ComponentPlan) (seconds int32, ok bool) {
-	derived := int32(plan.InstanceReadyTimeout.Seconds())
-	clamp := plan.GangScheduleTimeout
-	if clamp == nil {
-		return derived, derived > 0
+// scheduleTimeoutSeconds is the gang's ScheduleTimeoutSeconds: the placement
+// grace, raised to the minimum or lowered to the maximum of the operator's
+// bounds when the grace falls outside what the scheduler accepts. ok=false
+// means the field stays unset, which leaves the wait to the scheduler's own
+// default: that is what a zero grace gives, since OME then has no clock on
+// the placement either and there is no in-code window to fall back on.
+func scheduleTimeoutSeconds(grace time.Duration, bounds *workload.GangScheduleTimeoutClamp) (seconds int32, ok bool) {
+	if grace <= 0 {
+		return 0, false
 	}
-	minSeconds := int32(clamp.Min.Seconds())
-	maxSeconds := int32(clamp.Max.Seconds())
-	if derived <= 0 || derived < minSeconds {
+	seconds = int32(grace.Seconds())
+	if bounds == nil {
+		return seconds, seconds > 0
+	}
+	minSeconds := int32(bounds.Min.Seconds())
+	maxSeconds := int32(bounds.Max.Seconds())
+	if seconds < minSeconds {
 		return minSeconds, true
 	}
-	if derived > maxSeconds {
+	if seconds > maxSeconds {
 		return maxSeconds, true
 	}
-	return derived, true
+	return seconds, true
 }
 
-// podGroupLabels are the Component-scoped labels stamped on every
+// podGroupLabels are the Component-scoped labels written on every
 // PodGroup. Matches the headless Service selector trio so an operator
 // looking at the parent Service can pivot to the gang via the same keys.
 func podGroupLabels(isvcName string, component workload.ComponentType, instanceIdx int32) map[string]string {
@@ -172,117 +180,331 @@ func podGroupLabels(isvcName string, component workload.ComponentType, instanceI
 	}
 }
 
-// EnsurePodGroupForPods creates or reconciles the PodGroup of one multi-pod
-// Instance and returns its effective topology key. Idempotent; a single-pod
-// Instance is a no-op. The PodGroup must exist before any of the Instance's
-// pods, or the coscheduler sees pods naming an unknown group and schedules
-// them one by one. pods are the live pods that reference the group: pod
-// affinity is immutable, so while they exist the group's topology annotation
-// must describe their rendered topology, not a newer Component spec, and only
-// once the group is empty may the desired topology advance. reader is the
-// live reader for that proof (nil means c): cached pod or PodGroup state must
-// not advance the contract while pods of the previous revision still exist.
-func EnsurePodGroupForPods(ctx context.Context, c client.Client, reader client.Reader, owner client.Object, ownerGVK schema.GroupVersionKind, ownerName string, plan workload.ComponentPlan, inst workload.InstancePlan, pods []*corev1.Pod) (string, error) {
-	if c == nil {
-		return "", fmt.Errorf("EnsurePodGroup: nil client")
-	}
-	if reader == nil {
-		reader = c
-	}
-	if !IsMultiPodInstance(inst) {
-		return "", nil
-	}
-	desired, err := BuildPodGroup(owner, ownerGVK, ownerName, plan, inst)
-	if err != nil {
-		return "", fmt.Errorf("EnsurePodGroup: build desired: %w", err)
-	}
-
-	// Steady-state fast path: the PodGroup spec is a pure function of
-	// (owner, component, index, MinMember, topology contract) and changes only
-	// when one of those desired fields changes. Read the live copy first and skip
-	// the write path when the reconciled fields already match. At ~O(gangs) per
-	// reconcile across thousands of pods this trims the per-gang work to a single
-	// read on the common no-drift path. Cache miss or any drift falls through
-	// to a direct create/update below using the live-read object and resource
-	// version, so a stale cached Get cannot suppress a topology correction.
-	existing := &schedulingv1alpha1.PodGroup{}
-	getErr := reader.Get(ctx, client.ObjectKeyFromObject(desired), existing)
-	if getErr != nil && !apierrors.IsNotFound(getErr) {
-		// Surface the read failure directly: falling through would run the
-		// topology proof without the existing annotation and misreport a
-		// transient Get error as an unprovable-topology error.
-		return "", fmt.Errorf("EnsurePodGroup: get %s/%s: %w", desired.Namespace, desired.Name, getErr)
-	}
-	key, _, err := EnsurePodGroupForPodsFromObservation(ctx, c, owner, ownerGVK, ownerName,
-		plan, inst, pods, existing, getErr == nil)
-	return key, err
+// TopologyKeyOf is the topology key a group records; "" when it records
+// none.
+func TopologyKeyOf(group *schedulingv1alpha1.PodGroup) string {
+	return group.Annotations[query.AnnotationTopologyKey]
 }
 
-// EnsurePodGroupForPodsFromObservation reconciles one PodGroup from an
-// authoritative inventory entry supplied by the caller. It performs no GET;
-// this is the one-LIST path used when a Component has many gangs.
-//
-// A foreign same-named object is a collision, never an adoption candidate. A
-// terminating owned object is also not success: its name cannot safely be
-// reused until an authoritative inventory reports it absent. The reconciled
-// object is returned so a caller can overlay same-pass writes on that inventory.
-func EnsurePodGroupForPodsFromObservation(
-	ctx context.Context,
-	c client.Client,
+// WriteNeeded reports whether WritePodGroup would send desired: its name is
+// free, or the owned fields of the object at the name differ from it.
+func WriteNeeded(desired, existing *schedulingv1alpha1.PodGroup, found bool) bool {
+	return !found || drifted(desired, existing)
+}
+
+// GroupSettled reports whether the object at a gang's name is already the
+// group DesiredPodGroup would build, read against the plan field by field
+// without building it: the occupant is this owner's and not terminating,
+// its owned fields carry the plan's values, and its topology key is the
+// one its pods prove, or the one it records when they prove none. A
+// settled group needs no write, and TopologyKeyOf reads the same key off
+// it as off the built group. Any other object, one DesiredPodGroup refuses
+// among them, reads as unsettled, and the build path then reports why. The
+// pass asks it for every gang on every pass, so it allocates nothing.
+func GroupSettled(
 	owner client.Object,
 	ownerGVK schema.GroupVersionKind,
 	ownerName string,
 	plan workload.ComponentPlan,
+	unschedulableGrace time.Duration,
 	inst workload.InstancePlan,
 	pods []*corev1.Pod,
 	existing *schedulingv1alpha1.PodGroup,
 	found bool,
-) (string, *schedulingv1alpha1.PodGroup, error) {
-	if c == nil {
-		return "", nil, fmt.Errorf("EnsurePodGroup: nil client")
+) bool {
+	if owner == nil || !found || existing == nil || !IsMultiPodInstance(inst) ||
+		!ControlledByUID(existing, owner.GetUID()) || existing.DeletionTimestamp != nil {
+		return false
 	}
-	if !IsMultiPodInstance(inst) {
-		return "", nil, nil
+	if existing.Spec.MinMember != inst.TotalPods() ||
+		!timeoutSettled(existing.Spec.ScheduleTimeoutSeconds, unschedulableGrace, plan.GangScheduleTimeout) {
+		return false
 	}
-	desired, err := BuildPodGroup(owner, ownerGVK, ownerName, plan, inst)
+	index := indexText(inst.Index)
+	return labelsSettled(existing.Labels, ownerName, plan.Component, &index) &&
+		controllerReferenceSettled(existing.OwnerReferences, owner, ownerGVK) &&
+		topologySettled(existing, plan.TopologyKeyForInstance(inst.Index), ownerName, plan.Component, &index, pods)
+}
+
+// timeoutSettled reports whether a group's timeout is the one the grace
+// and the bounds give: none when the grace is zero, else that value.
+func timeoutSettled(got *int32, grace time.Duration, bounds *workload.GangScheduleTimeoutClamp) bool {
+	want, bounded := scheduleTimeoutSeconds(grace, bounds)
+	if !bounded || got == nil {
+		return !bounded && got == nil
+	}
+	return *got == want
+}
+
+// instanceIndexText is the decimal text of an Instance index, as the
+// labels of pods and groups spell it, held without allocating.
+type instanceIndexText struct {
+	buf [11]byte
+	n   int
+}
+
+func indexText(index int32) instanceIndexText {
+	var t instanceIndexText
+	t.n = len(strconv.AppendInt(t.buf[:0], int64(index), 10))
+	return t
+}
+
+// is reports whether s spells this index exactly: "01" is not "1".
+func (t *instanceIndexText) is(s string) bool {
+	return string(t.buf[:t.n]) == s
+}
+
+// podGroupLabelCount is how many labels podGroupLabels writes; a group
+// carrying any other label is not settled.
+var podGroupLabelCount = len(podGroupLabels("", "", 0))
+
+// labelsSettled reports whether labels are exactly the ones podGroupLabels
+// writes for the gang.
+func labelsSettled(labels map[string]string, ownerName string, component workload.ComponentType, index *instanceIndexText) bool {
+	if len(labels) != podGroupLabelCount {
+		return false
+	}
+	got, ok := labels[query.LabelInstanceIdx]
+	return ok && index.is(got) &&
+		labelIs(labels, constants.InferenceServicePodLabelKey, ownerName) &&
+		labelIs(labels, constants.OMEComponentLabel, string(component)) &&
+		labelIs(labels, query.LabelManagedBy, query.ManagedByOMENative)
+}
+
+// labelIs reports whether labels carry key with exactly value.
+func labelIs(labels map[string]string, key, value string) bool {
+	got, ok := labels[key]
+	return ok && got == value
+}
+
+// controllerReferenceSettled reports whether refs is the one controller
+// reference BuildPodGroup writes, field by field.
+func controllerReferenceSettled(refs []metav1.OwnerReference, owner client.Object, ownerGVK schema.GroupVersionKind) bool {
+	if len(refs) != 1 {
+		return false
+	}
+	ref := &refs[0]
+	return apiVersionIs(ref.APIVersion, ownerGVK.GroupVersion()) &&
+		ref.Kind == ownerGVK.Kind &&
+		ref.Name == owner.GetName() &&
+		ref.UID == owner.GetUID() &&
+		flagIs(ref.Controller, true) &&
+		flagIs(ref.BlockOwnerDeletion, true)
+}
+
+// apiVersionIs reports whether got spells gv, "group/version" or the bare
+// version of the core group, without building the text.
+func apiVersionIs(got string, gv schema.GroupVersion) bool {
+	if gv.Group == "" {
+		return got == gv.Version
+	}
+	group, version, slashed := strings.Cut(got, "/")
+	return slashed && group == gv.Group && version == gv.Version
+}
+
+// flagIs reports whether an optional flag is present with value.
+func flagIs(flag *bool, value bool) bool {
+	return flag != nil && *flag == value
+}
+
+// topologySettled reports whether the key a group records is the one
+// DesiredPodGroup would give it: the plan's when the gang has no pods;
+// else the key the pods prove, the recorded key itself when they prove
+// none and one is recorded, and no key when they prove none and the plan
+// asks for none. Pods on two keys, and a plan key neither the pods nor
+// the group can prove, settle nothing: the build path reports them.
+func topologySettled(existing *schedulingv1alpha1.PodGroup, planKey, ownerName string, component workload.ComponentType, index *instanceIndexText, pods []*corev1.Pod) bool {
+	recorded, set := existing.Annotations[query.AnnotationTopologyKey]
+	if len(pods) == 0 {
+		return set == (planKey != "") && recorded == planKey
+	}
+	keys := provenTopologyKey(ownerName, component, index, pods)
+	switch {
+	case keys.conflict():
+		return false
+	case keys.proven:
+		return set && recorded == keys.key
+	case set && recorded != "":
+		return true
+	case planKey != "":
+		return false
+	}
+	return !set
+}
+
+// topologyKeys is what the generated worker-to-leader terms of some pods
+// say about a gang's topology key: the one key they name, none, or two or
+// more, which no PodGroup can describe. Naming keys that agree allocates
+// nothing; the keys are collected, for the error that names every one of
+// them, only once two disagree.
+type topologyKeys struct {
+	key    string
+	proven bool
+	// disputed is every distinct key named, kept from the first key that
+	// differed from key on; nil while the terms agree.
+	disputed []string
+}
+
+// name records one key a generated term carries.
+func (k *topologyKeys) name(key string) {
+	switch {
+	case !k.proven:
+		k.key, k.proven = key, true
+	case k.disputed == nil && key == k.key:
+	default:
+		if k.disputed == nil {
+			k.disputed = []string{k.key}
+		}
+		if !slices.Contains(k.disputed, key) {
+			k.disputed = append(k.disputed, key)
+		}
+	}
+}
+
+// conflict reports whether the terms named two or more keys.
+func (k *topologyKeys) conflict() bool {
+	return k.disputed != nil
+}
+
+// result is the key the terms prove, none, or the error naming every key
+// in dispute, sorted.
+func (k *topologyKeys) result() (string, bool, error) {
+	if k.conflict() {
+		slices.Sort(k.disputed)
+		return "", false, fmt.Errorf("conflicting live topology keys: %v", k.disputed)
+	}
+	return k.key, k.proven, nil
+}
+
+// generatedTerm reads one required affinity term of a worker as the term
+// the renderer writes: the topology key it names and the index of the
+// leader its selector names. ok is false for a term with no key, or one
+// whose selector does not name a leader of the owner and the Component by
+// equality, which a hand-written term never does.
+func generatedTerm(term *corev1.PodAffinityTerm, ownerName string, component workload.ComponentType) (key, index string, ok bool) {
+	if term.TopologyKey == "" {
+		return "", "", false
+	}
+	index, ok = leaderIndexSelected(term.LabelSelector, ownerName, component)
+	return term.TopologyKey, index, ok
+}
+
+// provenTopologyKey is what the pods of one Instance prove about its key:
+// a term counts when it follows that Instance's leader, whatever index
+// label the pod carries.
+func provenTopologyKey(ownerName string, component workload.ComponentType, index *instanceIndexText, pods []*corev1.Pod) topologyKeys {
+	var keys topologyKeys
+	for _, pod := range pods {
+		terms := workerAffinityTerms(pod)
+		for i := range terms {
+			if key, selected, ok := generatedTerm(&terms[i], ownerName, component); ok && index.is(selected) {
+				keys.name(key)
+			}
+		}
+	}
+	return keys
+}
+
+// ownLeaderTopologyKey is what the pods of a whole Component prove: a term
+// counts when it follows the leader of the Instance the pod's own index
+// label names, and a pod with no index label counts for nothing.
+func ownLeaderTopologyKey(ownerName string, component workload.ComponentType, pods []*corev1.Pod) topologyKeys {
+	var keys topologyKeys
+	for _, pod := range pods {
+		terms := workerAffinityTerms(pod)
+		if len(terms) == 0 {
+			continue
+		}
+		own := pod.Labels[query.LabelInstanceIdx]
+		if own == "" {
+			continue
+		}
+		for i := range terms {
+			if key, selected, ok := generatedTerm(&terms[i], ownerName, component); ok && selected == own {
+				keys.name(key)
+			}
+		}
+	}
+	return keys
+}
+
+// DesiredPodGroup is the PodGroup one gang needs: the plan's group carrying
+// the topology key its pods prove, or the key the existing group records
+// when the pods prove none. An occupant this owner cannot write is refused
+// before any topology is read. A caller that decides whether to write and
+// then writes builds the group once and hands it to WriteNeeded and
+// WritePodGroup.
+func DesiredPodGroup(
+	owner client.Object,
+	ownerGVK schema.GroupVersionKind,
+	ownerName string,
+	plan workload.ComponentPlan,
+	unschedulableGrace time.Duration,
+	inst workload.InstancePlan,
+	pods []*corev1.Pod,
+	existing *schedulingv1alpha1.PodGroup,
+	found bool,
+) (*schedulingv1alpha1.PodGroup, error) {
+	desired, err := BuildPodGroup(owner, ownerGVK, ownerName, plan, unschedulableGrace, inst)
 	if err != nil {
-		return "", nil, fmt.Errorf("EnsurePodGroup: build desired: %w", err)
+		return nil, fmt.Errorf("EnsurePodGroup: build desired: %w", err)
 	}
 	if found {
-		if existing == nil {
-			return "", nil, fmt.Errorf("EnsurePodGroup: observed %s/%s as present with a nil object", desired.Namespace, desired.Name)
-		}
-		if !ControlledByUID(existing, owner.GetUID()) {
-			return "", nil, fmt.Errorf("%w: %s/%s", ErrPodGroupOwnershipConflict, existing.Namespace, existing.Name)
-		}
-		if existing.DeletionTimestamp != nil {
-			return "", nil, fmt.Errorf("%w: %s/%s", ErrPodGroupTerminating, existing.Namespace, existing.Name)
+		if err := writableOccupant(desired, existing, owner.GetUID()); err != nil {
+			return nil, err
 		}
 	}
 	if len(pods) > 0 {
 		if err := reconcileDesiredTopologyWithLivePods(desired, existing, found, ownerName, plan.Component, inst.Index, pods); err != nil {
-			return "", nil, fmt.Errorf("EnsurePodGroup: reconcile live topology: %w", err)
+			return nil, fmt.Errorf("EnsurePodGroup: reconcile live topology: %w", err)
 		}
 	}
-	if found {
-		if podGroupMatches(existing, desired) {
-			return desired.Annotations[query.AnnotationTopologyKey], existing, nil
-		}
-		target := existing.DeepCopy()
-		target.Labels = desired.Labels
-		target.OwnerReferences = desired.OwnerReferences
-		reconcileTopologyKeyAnnotation(target, desired)
-		target.Spec.MinMember = desired.Spec.MinMember
-		target.Spec.ScheduleTimeoutSeconds = desired.Spec.ScheduleTimeoutSeconds
-		if err := c.Update(ctx, target); err != nil {
-			return "", nil, fmt.Errorf("EnsurePodGroup: update %s/%s: %w", target.Namespace, target.Name, err)
-		}
-		return desired.Annotations[query.AnnotationTopologyKey], target, nil
+	return desired, nil
+}
+
+// writableOccupant checks the object found at the desired name: it must be
+// this owner's and not on its way out. Another owner's object is a
+// collision, never an adoption candidate; a terminating one keeps the name
+// until an authoritative inventory reports it absent.
+func writableOccupant(desired, existing *schedulingv1alpha1.PodGroup, ownerUID types.UID) error {
+	if existing == nil {
+		return fmt.Errorf("EnsurePodGroup: observed %s/%s as present with a nil object", desired.Namespace, desired.Name)
 	}
-	if err := c.Create(ctx, desired); err != nil {
-		return "", nil, fmt.Errorf("EnsurePodGroup: create %s/%s: %w", desired.Namespace, desired.Name, err)
+	if !ControlledByUID(existing, ownerUID) {
+		return fmt.Errorf("%w: %s/%s", ErrPodGroupOwnershipConflict, existing.Namespace, existing.Name)
 	}
-	return desired.Annotations[query.AnnotationTopologyKey], desired, nil
+	if existing.DeletionTimestamp != nil {
+		return fmt.Errorf("%w: %s/%s", ErrPodGroupTerminating, existing.Namespace, existing.Name)
+	}
+	return nil
+}
+
+// WritePodGroup creates desired when its name is free, else brings the
+// owned fields of the object at the name to desired's values, writing
+// only on drift. It returns the object as written, or the existing one
+// when nothing drifted.
+func WritePodGroup(ctx context.Context, c client.Client, desired, existing *schedulingv1alpha1.PodGroup, found bool) (*schedulingv1alpha1.PodGroup, error) {
+	if !found {
+		if err := c.Create(ctx, desired); err != nil {
+			return nil, fmt.Errorf("EnsurePodGroup: create %s/%s: %w", desired.Namespace, desired.Name, err)
+		}
+		return desired, nil
+	}
+	if !drifted(desired, existing) {
+		return existing, nil
+	}
+	target := existing.DeepCopy()
+	ownedFieldsOf(desired).applyTo(target)
+	if err := c.Update(ctx, target); err != nil {
+		return nil, fmt.Errorf("EnsurePodGroup: update %s/%s: %w", target.Namespace, target.Name, err)
+	}
+	return target, nil
+}
+
+// drifted reports whether the owned fields of the object at the name differ
+// from the desired group's.
+func drifted(desired, existing *schedulingv1alpha1.PodGroup) bool {
+	return !ownedFieldsOf(desired).equal(ownedFieldsOf(existing))
 }
 
 // ControlledByUID reports whether obj's controller OwnerReference names the
@@ -313,7 +535,7 @@ func EffectiveTopologyKeyForPods(desiredKey, ownerName string, component workloa
 	if len(pods) == 0 {
 		return desiredKey, nil
 	}
-	key, ok, err := topologyKeyFromLivePods(ownerName, component, instanceIdx, pods)
+	key, ok, err := TopologyKeyProvenByPods(ownerName, component, instanceIdx, pods)
 	if err != nil {
 		return "", err
 	}
@@ -326,54 +548,51 @@ func EffectiveTopologyKeyForPods(desiredKey, ownerName string, component workloa
 	return "", nil
 }
 
-// GeneratedTopologyKeyFromPods extracts the single topology key used by OME's
-// generated worker-to-leader affinity across the supplied pods. Each accepted
-// term must select the worker pod's own Instance leader. Hand-written affinity
-// is deliberately ignored because it may describe an unrelated relationship.
+// GeneratedTopologyKeyFromPods is the one topology key the generated
+// worker-to-leader affinity of the supplied pods follows: each term counted
+// selects the leader of the worker's own Instance. Hand-written affinity is
+// ignored, since it may describe an unrelated relationship. ok is false
+// when no term counts; the error names the keys of a gang split across
+// two or more.
 func GeneratedTopologyKeyFromPods(ownerName string, component workload.ComponentType, pods []*corev1.Pod) (string, bool, error) {
-	return generatedTopologyKey(ownerName, component, pods, func(pod *corev1.Pod) string {
-		return pod.Labels[query.LabelInstanceIdx]
-	})
+	keys := ownLeaderTopologyKey(ownerName, component, pods)
+	return keys.result()
 }
 
-// topologyKeyFromLivePods is GeneratedTopologyKeyFromPods for the pods of one
-// Instance: every accepted term must select that Instance's leader, whatever
-// index label the pod carries.
-func topologyKeyFromLivePods(ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod) (string, bool, error) {
-	wantIndex := fmt.Sprintf("%d", instanceIdx)
-	return generatedTopologyKey(ownerName, component, pods, func(*corev1.Pod) string { return wantIndex })
+// TopologyKeyProvenByPods is GeneratedTopologyKeyFromPods for the pods of one
+// Instance: every term counted must select that Instance's leader, whatever
+// index label the pod carries. ok is false when no worker among the pods
+// carries the generated term; the error is two workers on different keys.
+// The reading allocates nothing while the terms agree.
+func TopologyKeyProvenByPods(ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod) (string, bool, error) {
+	index := indexText(instanceIdx)
+	keys := provenTopologyKey(ownerName, component, &index, pods)
+	return keys.result()
 }
 
-// generatedTopologyKey collects the topology keys of the worker-to-leader
-// affinity terms OME generates, where leaderIndex names the Instance whose
-// leader a pod's term must select (empty skips the pod), and reduces them to
-// one key.
-func generatedTopologyKey(ownerName string, component workload.ComponentType, pods []*corev1.Pod, leaderIndex func(*corev1.Pod) string) (string, bool, error) {
-	keys := make(map[string]struct{})
-	for _, pod := range pods {
-		if pod == nil || pod.Labels[query.LabelRunner] != workload.RunnerWorker ||
-			pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAffinity == nil {
-			continue
-		}
-		wantIndex := leaderIndex(pod)
-		if wantIndex == "" {
-			continue
-		}
-		for i := range pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-			term := &pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[i]
-			if term.TopologyKey == "" || term.LabelSelector == nil {
-				continue
-			}
-			labels := term.LabelSelector.MatchLabels
-			if labels[constants.InferenceServicePodLabelKey] == ownerName &&
-				labels[constants.OMEComponentLabel] == string(component) &&
-				labels[query.LabelInstanceIdx] == wantIndex &&
-				labels[query.LabelRunner] == workload.RunnerLeader {
-				keys[term.TopologyKey] = struct{}{}
-			}
-		}
+// workerAffinityTerms are the required pod-affinity terms of a worker pod.
+// A leader, a pod without pod affinity and a nil pod have none: only a
+// worker carries the generated term that names its leader.
+func workerAffinityTerms(pod *corev1.Pod) []corev1.PodAffinityTerm {
+	if pod == nil || pod.Labels[query.LabelRunner] != workload.RunnerWorker ||
+		pod.Spec.Affinity == nil || pod.Spec.Affinity.PodAffinity == nil {
+		return nil
 	}
-	return uniqueTopologyKey(keys)
+	return pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+}
+
+// leaderIndexSelected is the Instance index a term's selector names, "" for
+// none, and whether the term otherwise selects a leader pod the way the
+// renderer writes it: the owner, the Component and the leader runner, each
+// by equality.
+func leaderIndexSelected(selector *metav1.LabelSelector, ownerName string, component workload.ComponentType) (index string, ok bool) {
+	if selector == nil {
+		return "", false
+	}
+	labels := selector.MatchLabels
+	return labels[query.LabelInstanceIdx], labels[constants.InferenceServicePodLabelKey] == ownerName &&
+		labels[constants.OMEComponentLabel] == string(component) &&
+		labels[query.LabelRunner] == workload.RunnerLeader
 }
 
 // reconcileDesiredTopologyWithLivePods aligns desired metadata with immutable
@@ -382,7 +601,7 @@ func generatedTopologyKey(ownerName string, component workload.ComponentType, po
 // trusted. Arbitrary user affinity may express a different relationship and
 // must never be promoted into the gang scheduler's topology contract.
 func reconcileDesiredTopologyWithLivePods(desired, existing *schedulingv1alpha1.PodGroup, existingFound bool, ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod) error {
-	key, ok, err := topologyKeyFromLivePods(ownerName, component, instanceIdx, pods)
+	key, ok, err := TopologyKeyProvenByPods(ownerName, component, instanceIdx, pods)
 	if err != nil {
 		return err
 	}
@@ -420,65 +639,97 @@ func setTopologyKeyAnnotation(pg *schedulingv1alpha1.PodGroup, value string, pre
 	pg.Annotations[query.AnnotationTopologyKey] = value
 }
 
-func uniqueTopologyKey(keys map[string]struct{}) (string, bool, error) {
-	switch len(keys) {
-	case 0:
-		return "", false, nil
-	case 1:
-		for key := range keys {
-			return key, true, nil
+// ownedFields are the PodGroup fields this controller writes. Everything
+// else on the object, other annotations above all, belongs to whoever put
+// it there and survives an update.
+type ownedFields struct {
+	Labels                 map[string]string
+	OwnerReferences        []metav1.OwnerReference
+	TopologyKey            string
+	TopologyKeySet         bool
+	MinMember              int32
+	ScheduleTimeoutSeconds *int32
+}
+
+// ownedFieldsOf reads the owned fields off a built or an observed PodGroup.
+func ownedFieldsOf(pg *schedulingv1alpha1.PodGroup) ownedFields {
+	key, set := pg.Annotations[query.AnnotationTopologyKey]
+	return ownedFields{
+		Labels:                 pg.Labels,
+		OwnerReferences:        pg.OwnerReferences,
+		TopologyKey:            key,
+		TopologyKeySet:         set,
+		MinMember:              pg.Spec.MinMember,
+		ScheduleTimeoutSeconds: pg.Spec.ScheduleTimeoutSeconds,
+	}
+}
+
+// equal reads the six owned fields one by one under the rule the
+// apiserver's semantic compare applies: a nil label map or owner list
+// equals an empty one, and a timeout or a flag set on one side alone is a
+// difference. The owned fields hold no time and no quantity. The pass asks
+// it for every gang on every pass, so it reads the fields directly rather
+// than through a reflection walk that copies every leaf on the way.
+func (f ownedFields) equal(other ownedFields) bool {
+	return maps.Equal(f.Labels, other.Labels) &&
+		ownerReferencesEqual(f.OwnerReferences, other.OwnerReferences) &&
+		f.TopologyKey == other.TopologyKey &&
+		f.TopologyKeySet == other.TopologyKeySet &&
+		f.MinMember == other.MinMember &&
+		int32PointersEqual(f.ScheduleTimeoutSeconds, other.ScheduleTimeoutSeconds)
+}
+
+// ownerReferencesEqual reads two owner reference lists in order; a nil
+// list and an empty one are the same.
+func ownerReferencesEqual(a, b []metav1.OwnerReference) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !ownerReferenceEqual(&a[i], &b[i]) {
+			return false
 		}
-	default:
-		return "", false, fmt.Errorf("conflicting live topology keys: %v", sortedTopologyKeys(keys))
 	}
-	panic("unreachable")
+	return true
 }
 
-func sortedTopologyKeys(keys map[string]struct{}) []string {
-	out := make([]string, 0, len(keys))
-	for key := range keys {
-		out = append(out, key)
-	}
-	sort.Strings(out)
-	return out
+// ownerReferenceEqual reads every field of an owner reference. A field
+// added to the reference type is read here too: the compare's contract
+// test changes every leaf of the owned fields one at a time and fails on a
+// field this function does not read.
+func ownerReferenceEqual(a, b *metav1.OwnerReference) bool {
+	return a.APIVersion == b.APIVersion &&
+		a.Kind == b.Kind &&
+		a.Name == b.Name &&
+		a.UID == b.UID &&
+		boolPointersEqual(a.Controller, b.Controller) &&
+		boolPointersEqual(a.BlockOwnerDeletion, b.BlockOwnerDeletion)
 }
 
-// podGroupMatches reports whether the cached PodGroup already carries
-// the exact fields the EnsurePodGroup mutate closure reconciles —
-// Labels, OwnerReferences, the controller-owned topology-key annotation,
-// Spec.MinMember, and Spec.ScheduleTimeoutSeconds. Unrelated annotations are
-// deliberately ignored and preserved.
-// Returning true lets EnsurePodGroup skip the write on the
-// no-drift steady-state path. Must stay in lockstep with the mutate
-// closure: any field that closure writes must be compared here, or a
-// drift on it would be silently dropped.
-func podGroupMatches(existing, desired *schedulingv1alpha1.PodGroup) bool {
-	if existing.Spec.MinMember != desired.Spec.MinMember {
-		return false
+// boolPointersEqual reads two optional flags; both absent is equal.
+func boolPointersEqual(a, b *bool) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
 	}
-	if !equality.Semantic.DeepEqual(existing.Spec.ScheduleTimeoutSeconds, desired.Spec.ScheduleTimeoutSeconds) {
-		return false
-	}
-	if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
-		return false
-	}
-	if !topologyKeyAnnotationMatches(existing, desired) {
-		return false
-	}
-	return equality.Semantic.DeepEqual(existing.OwnerReferences, desired.OwnerReferences)
+	return *a == *b
 }
 
-// reconcileTopologyKeyAnnotation owns only query.AnnotationTopologyKey. Other
-// annotations may be written by users or admission and must survive updates.
-func reconcileTopologyKeyAnnotation(target, desired *schedulingv1alpha1.PodGroup) {
-	value, want := desired.Annotations[query.AnnotationTopologyKey]
-	setTopologyKeyAnnotation(target, value, want)
+// int32PointersEqual reads two optional counts; both absent is equal.
+func int32PointersEqual(a, b *int32) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
-func topologyKeyAnnotationMatches(existing, desired *schedulingv1alpha1.PodGroup) bool {
-	existingValue, existingHas := existing.Annotations[query.AnnotationTopologyKey]
-	desiredValue, desiredHas := desired.Annotations[query.AnnotationTopologyKey]
-	return existingHas == desiredHas && existingValue == desiredValue
+// applyTo writes the owned fields onto pg and leaves the rest of the object
+// as it is.
+func (f ownedFields) applyTo(pg *schedulingv1alpha1.PodGroup) {
+	pg.Labels = f.Labels
+	pg.OwnerReferences = f.OwnerReferences
+	setTopologyKeyAnnotation(pg, f.TopologyKey, f.TopologyKeySet)
+	pg.Spec.MinMember = f.MinMember
+	pg.Spec.ScheduleTimeoutSeconds = f.ScheduleTimeoutSeconds
 }
 
 // FinalizeObservedPodGroup deletes an observed PodGroup with a UID precondition.

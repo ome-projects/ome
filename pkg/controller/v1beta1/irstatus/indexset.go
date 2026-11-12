@@ -1,7 +1,9 @@
 package irstatus
 
 import (
+	"cmp"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -37,6 +39,9 @@ func parseIndexSet(raw string, maxCardinality uint64) (indexSet, error) {
 	return set, nil
 }
 
+// scanIndexSet walks the terms of raw, "0-7,9,12-14", checks that they are
+// canonical and bounded by maxCardinality, and reports the cardinality and
+// the term count. visit, when set, receives every interval in term order.
 func scanIndexSet(raw string, maxCardinality uint64, visit func(indexInterval)) (uint64, int, error) {
 	if raw == "" {
 		return 0, 0, newCodecError(ErrorReasonRangeSyntax)
@@ -45,56 +50,73 @@ func scanIndexSet(raw string, maxCardinality uint64, visit func(indexInterval)) 
 		return 0, 0, newCodecError(ErrorReasonCardinalityLimit)
 	}
 
-	var cardinality uint64
-	var previous indexInterval
-	hasPrevious := false
-	termCount := 0
-	for termStart := 0; termStart < len(raw); {
-		termEnd := strings.IndexByte(raw[termStart:], ',')
-		if termEnd < 0 {
-			termEnd = len(raw)
-		} else {
-			termEnd += termStart
+	var scan indexSetScan
+	for rest, last := raw, false; !last; {
+		var term string
+		var err error
+		if term, rest, last, err = nextTerm(rest); err != nil {
+			return 0, 0, err
 		}
-		if termEnd == termStart {
-			return 0, 0, newCodecError(ErrorReasonRangeSyntax)
-		}
-
-		interval, err := parseIndexInterval(raw[termStart:termEnd])
+		interval, err := parseIndexInterval(term)
 		if err != nil {
 			return 0, 0, err
 		}
-		if hasPrevious {
-			switch {
-			case interval.first <= previous.last:
-				return 0, 0, newCodecError(ErrorReasonRangeOrder)
-			case previous.last != math.MaxInt32 && interval.first == previous.last+1:
-				return 0, 0, newCodecError(ErrorReasonCanonicalOrder)
-			}
+		if err := scan.accept(interval, maxCardinality); err != nil {
+			return 0, 0, err
 		}
-
-		width := uint64(interval.last) - uint64(interval.first) + 1
-		nextCardinality := cardinality + width
-		if nextCardinality > maxCardinality {
-			return 0, 0, newCodecError(ErrorReasonCardinalityLimit)
-		}
-		cardinality = nextCardinality
-		termCount++
-		previous = interval
-		hasPrevious = true
 		if visit != nil {
 			visit(interval)
 		}
+	}
+	return scan.cardinality, scan.terms, nil
+}
 
-		if termEnd == len(raw) {
-			break
-		}
-		termStart = termEnd + 1
-		if termStart == len(raw) {
-			return 0, 0, newCodecError(ErrorReasonRangeSyntax)
+// nextTerm splits the first comma-separated term off rest and reports
+// whether it was the last one. An empty term, which a leading, doubled or
+// trailing comma leaves, is a syntax error.
+func nextTerm(rest string) (term, remainder string, last bool, err error) {
+	comma := strings.IndexByte(rest, ',')
+	if comma < 0 {
+		term, last = rest, true
+	} else {
+		term, remainder = rest[:comma], rest[comma+1:]
+	}
+	if term == "" {
+		return "", "", false, newCodecError(ErrorReasonRangeSyntax)
+	}
+	return term, remainder, last, nil
+}
+
+// indexSetScan is the running state of one scan: the terms accepted so far,
+// their cardinality, and the last interval the next one must follow.
+type indexSetScan struct {
+	cardinality uint64
+	terms       int
+	previous    indexInterval
+	hasPrevious bool
+}
+
+// accept checks interval against the previous one and the bound, then
+// counts it. The interval must start after the previous one ends and not
+// right after it, since adjacent intervals are one term in canonical form,
+// and the running cardinality may not pass maxCardinality.
+func (s *indexSetScan) accept(interval indexInterval, maxCardinality uint64) error {
+	if s.hasPrevious {
+		switch {
+		case interval.first <= s.previous.last:
+			return newCodecError(ErrorReasonRangeOrder)
+		case s.previous.last != math.MaxInt32 && interval.first == s.previous.last+1:
+			return newCodecError(ErrorReasonCanonicalOrder)
 		}
 	}
-	return cardinality, termCount, nil
+	width := uint64(interval.last) - uint64(interval.first) + 1
+	if s.cardinality+width > maxCardinality {
+		return newCodecError(ErrorReasonCardinalityLimit)
+	}
+	s.cardinality += width
+	s.terms++
+	s.previous, s.hasPrevious = interval, true
+	return nil
 }
 
 func parseIndexInterval(term string) (indexInterval, error) {
@@ -157,7 +179,7 @@ func indexSetFromIndices(indices []int32, maxCardinality uint64) (indexSet, erro
 		}
 	}
 	ordered := append([]int32(nil), indices...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	slices.Sort(ordered)
 
 	set := indexSet{cardinality: uint64(len(ordered))}
 	for _, index := range ordered {
@@ -188,18 +210,6 @@ func encodeIndexSet(indices []int32, maxCardinality uint64) (string, error) {
 
 func (s indexSet) Cardinality() uint64 {
 	return s.cardinality
-}
-
-func (s indexSet) Equal(other indexSet) bool {
-	if s.cardinality != other.cardinality || len(s.intervals) != len(other.intervals) {
-		return false
-	}
-	for i := range s.intervals {
-		if s.intervals[i] != other.intervals[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func (s indexSet) Contains(index int32) bool {
@@ -271,29 +281,13 @@ func disjointIndexSets(sets []indexSet) bool {
 	for _, set := range sets {
 		pooled = append(pooled, set.intervals...)
 	}
-	sort.Slice(pooled, func(i, j int) bool { return pooled[i].first < pooled[j].first })
+	slices.SortFunc(pooled, func(a, b indexInterval) int { return cmp.Compare(a.first, b.first) })
 	for i := 1; i < len(pooled); i++ {
 		if pooled[i].first <= pooled[i-1].last {
 			return false
 		}
 	}
 	return true
-}
-
-func (s indexSet) Values(maxCardinality uint64) ([]int32, error) {
-	if maxCardinality == 0 || s.cardinality > maxCardinality {
-		return nil, newCodecError(ErrorReasonCardinalityLimit)
-	}
-	maxInt := uint64(^uint(0) >> 1)
-	if s.cardinality > maxInt {
-		return nil, newCodecError(ErrorReasonRangeOverflow)
-	}
-
-	values := make([]int32, 0, int(s.cardinality))
-	s.forEach(func(value int32) {
-		values = append(values, value)
-	})
-	return values, nil
 }
 
 func (s indexSet) forEach(visit func(int32)) {
@@ -307,16 +301,21 @@ func (s indexSet) forEach(visit func(int32)) {
 	}
 }
 
+// String spells the set as the terms the wire carries, "0-7,9,12-14". Each
+// number is written into the builder's own buffer, so a set of many short
+// terms costs a few allocations rather than one per number.
 func (s indexSet) String() string {
 	var result strings.Builder
+	result.Grow(12 * len(s.intervals))
+	var digits [11]byte
 	for i, interval := range s.intervals {
 		if i > 0 {
 			result.WriteByte(',')
 		}
-		result.WriteString(strconv.FormatInt(int64(interval.first), 10))
+		result.Write(strconv.AppendInt(digits[:0], int64(interval.first), 10))
 		if interval.first != interval.last {
 			result.WriteByte('-')
-			result.WriteString(strconv.FormatInt(int64(interval.last), 10))
+			result.Write(strconv.AppendInt(digits[:0], int64(interval.last), 10))
 		}
 	}
 	return result.String()

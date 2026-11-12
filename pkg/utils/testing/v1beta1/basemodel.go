@@ -53,12 +53,6 @@ func MakeBaseModel(name, namespace string) *BaseModelWrapper {
 // Obj returns the underlying API type pointer.
 func (w *BaseModelWrapper) Obj() *v1beta1.BaseModel { return &w.BaseModel }
 
-// Clone returns a deep copy wrapped, useful when the same baseline
-// needs minor variations across subtests.
-func (w *BaseModelWrapper) Clone() *BaseModelWrapper {
-	return &BaseModelWrapper{BaseModel: *w.BaseModel.DeepCopy()}
-}
-
 // StorageURI sets spec.Storage.StorageUri.
 func (w *BaseModelWrapper) StorageURI(uri string) *BaseModelWrapper {
 	if w.Spec.Storage == nil {

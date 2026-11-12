@@ -13,7 +13,7 @@ import (
 // Lifecycle summary. Used by the controller reconcile tests that seed a derived
 // ISVC on a worker cluster; the per-instance data lives on the paired
 // InferenceReplica (see irWithPhases), which the predicate reads via
-// ComponentIRStatus. The variadic arg exists only for call-site symmetry with
+// DecodedComponentIRFor. The variadic arg exists only for call-site symmetry with
 // irWithPhases; it does not populate the ISVC.
 func isvcWithPhases(component v1beta1.ComponentType, _ ...v1beta1.OMENativeInstancePhase) *v1beta1.InferenceService {
 	isvc := &v1beta1.InferenceService{
@@ -41,7 +41,7 @@ func phaseStatusMap(component v1beta1.ComponentType, phases ...v1beta1.OMENative
 
 // irWithPhases builds an InferenceReplica named "svc-<component>" in "prod"
 // whose status carries instances at the given phases, for seeding on a worker
-// fake client so the reconcile reads it via ComponentIRStatus.
+// fake client so the reconcile reads it via DecodedComponentIRFor.
 func irWithPhases(component v1beta1.ComponentType, phases ...v1beta1.OMENativeInstancePhase) *v1beta1.InferenceReplica {
 	insts := make([]v1beta1.OMENativeInstanceStatus, len(phases))
 	for i, p := range phases {

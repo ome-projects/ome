@@ -5,11 +5,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	isvcutils "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 func pvcOverlay(name, ns, pvcName, subPath string) isvcutils.ResolvedOverlay {
@@ -17,7 +17,6 @@ func pvcOverlay(name, ns, pvcName, subPath string) isvcutils.ResolvedOverlay {
 	return isvcutils.ResolvedOverlay{
 		Ref:  v1beta1.ModelOverlayRef{Name: name},
 		Spec: &v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{StorageUri: &uri}},
-		Meta: &metav1.ObjectMeta{Name: name},
 	}
 }
 
@@ -29,7 +28,6 @@ func shardedOverlay(name, uri string) isvcutils.ResolvedOverlay {
 			Distribution: &dist,
 			Storage:      &v1beta1.StorageSpec{StorageUri: &uri},
 		},
-		Meta: &metav1.ObjectMeta{Name: name},
 	}
 }
 
@@ -37,7 +35,6 @@ func perNodeOverlay(name, hostPath string) isvcutils.ResolvedOverlay {
 	return isvcutils.ResolvedOverlay{
 		Ref:  v1beta1.ModelOverlayRef{Name: name},
 		Spec: &v1beta1.BaseModelSpec{Storage: &v1beta1.StorageSpec{Path: &hostPath}},
-		Meta: &metav1.ObjectMeta{Name: name},
 	}
 }
 
@@ -56,7 +53,7 @@ func TestAppendOverlayVolumes(t *testing.T) {
 		skippedOverlay("foo-gone", "not found"),
 	}
 	pod := &corev1.PodSpec{}
-	AppendOverlayVolumes(nil, overlays, pod)
+	render.AppendOverlayVolumes(nil, overlays, pod)
 
 	assert.Len(t, pod.Volumes, 2, "expect PVC + PerNode volumes, no Sharded, no skipped")
 	var sawPVC, sawHost bool
@@ -83,7 +80,7 @@ func TestAppendOverlayVolumeMounts(t *testing.T) {
 		perNodeOverlay("foo-pernode", "/mnt/models/foo"),
 	}
 	c := &corev1.Container{}
-	AppendOverlayVolumeMounts(nil, overlays, c)
+	render.AppendOverlayVolumeMounts(nil, overlays, c)
 
 	assert.Len(t, c.VolumeMounts, 2, "Sharded contributes no mount")
 
@@ -109,7 +106,7 @@ func TestAppendOverlayEnvVars(t *testing.T) {
 		skippedOverlay("foo-gone", "not found"),
 	}
 	c := &corev1.Container{}
-	AppendOverlayEnvVars(nil, overlays, c)
+	render.AppendOverlayEnvVars(nil, overlays, c)
 
 	envs := map[string]string{}
 	for _, e := range c.Env {
@@ -141,7 +138,7 @@ func TestAnyOverlayIsSharded(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, AnyOverlayIsSharded(tc.in))
+			assert.Equal(t, tc.want, render.AnyOverlayIsSharded(tc.in))
 		})
 	}
 }
@@ -188,7 +185,7 @@ func TestAppendOverlayEnvVars_PreservesExisting(t *testing.T) {
 	c := &corev1.Container{
 		Env: []corev1.EnvVar{{Name: "OVERLAY_FOO_MODEL_PATH", Value: "user-set"}},
 	}
-	AppendOverlayEnvVars(nil, []isvcutils.ResolvedOverlay{
+	render.AppendOverlayEnvVars(nil, []isvcutils.ResolvedOverlay{
 		pvcOverlay("foo", "ns", "pvc", "p"),
 	}, c)
 	var got string

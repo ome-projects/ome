@@ -59,9 +59,11 @@ func TestDesiredSplitPlanUsesMatchedSet(t *testing.T) {
 			s.Spec.Placement.Mode = v1beta1.PlacementModeSplitByCapacity
 		}, invalid: true},
 		{name: "weighted floor", mutate: func(s *v1beta1.InferenceService, _ []v1beta1.WorkloadCluster) {
+			s.Spec.Placement.Split = nil
+			s.Spec.Engine.MinReplicas = ptr.To(18)
 			s.Spec.Placement.ClusterAffinity = nil
 			for i, name := range []string{"member-a", "member-b", "member-c"} {
-				s.Spec.Placement.ClusterAffinity = append(s.Spec.Placement.ClusterAffinity, v1beta1.ClusterAffinityTerm{Weights: &v1beta1.ClusterAffinityWeights{Engine: ptr.To([]int32{3, 1, 2}[i])}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}})
+				s.Spec.Placement.ClusterAffinity = append(s.Spec.Placement.ClusterAffinity, v1beta1.ClusterAffinityTerm{Weights: &v1beta1.ClusterAffinityWeights{Engine: &v1beta1.ReplicaRatio{Min: ptr.To([]int32{3, 1, 2}[i])}}, MatchFields: []v1beta1.ClusterSelectorRequirement{{Key: "metadata.name", Operator: corev1.NodeSelectorOpIn, Values: []string{name}}}})
 			}
 		}, want: map[string]int32{"member-a": 9, "member-b": 3, "member-c": 6}},
 	} {

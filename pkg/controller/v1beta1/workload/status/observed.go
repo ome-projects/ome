@@ -133,24 +133,6 @@ func ReleaseWaiting(ctx context.Context, input types.ReconcileInput, idx int32, 
 	})
 }
 
-// RecordLastFailure stamps the row's LastFailure with the captured
-// termination. Idempotent: a no-op when an identical record is already
-// stored, so a repeated first pass — a status conflict retried — does
-// not churn the field.
-func RecordLastFailure(ctx context.Context, input types.ReconcileInput, idx int32, t *types.InstanceTermination) error {
-	if t == nil {
-		return nil
-	}
-	return input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
-		if sameFailureIdentity(s.LastFailure, t) {
-			return false
-		}
-		captured := *t
-		s.LastFailure = &captured
-		return true
-	})
-}
-
 // RecordDatedFailure stamps the row's LastFailure with the captured
 // termination, dated as captured: a stored record that differs only in
 // its time is rewritten, so a reader anchored on the time (a crash of

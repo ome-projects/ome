@@ -3,21 +3,19 @@
 // A management plane authors one nominal for the whole fleet, but a workload
 // cluster can only enforce a number of its own: Kueue's nominalQuota is
 // per-cluster, so the fleet total has to be resolved into shares before it can
-// be projected. This is that resolution, and nothing else — no I/O, no
-// knowledge of clusters beyond the names and weights it is handed.
+// be projected. This is that resolution and nothing else: no I/O, no knowledge
+// of clusters beyond the names and weights it is handed.
 //
-// The one contract that matters is that the shares sum to the total EXACTLY.
-// A split that loses a chip to rounding silently shrinks the fleet's usable
-// capacity; one that gains a chip lets the fleet admit more than an admin
-// authorized, which is the failure the whole tree exists to prevent. Both are
-// invisible in any single cluster's status, so neither would be noticed from
-// the outside.
+// The shares sum to the total exactly. A split that loses a chip to rounding
+// silently shrinks the fleet's usable capacity; one that gains a chip lets the
+// fleet admit more than an admin authorized. Both are invisible in any single
+// cluster's status.
 //
-// Exactness rules out floating point and rules out truncating division. The
-// method here is largest-remainder: give every cluster its floor, then hand the
-// units that division could not place to whoever was closest to earning one.
+// Exactness rules out floating point and truncating division. The method is
+// largest remainder: every cluster takes its whole quotient, and the units that
+// division could not place go to whoever was closest to earning one.
 // Arithmetic is on inf.Dec rather than int64 because a budget may name any
-// resource — cpu carries milli precision, and memory in binary units overflows
+// resource: cpu carries milli precision, and memory in binary units overflows
 // MilliValue long before it overflows a cluster.
 package shares
 
@@ -48,10 +46,10 @@ type Share struct {
 // Proportional splits total across clusters in proportion to their weights.
 //
 // The result sums to total exactly, is ordered by cluster name, and is a
-// function of the inputs alone — the same inputs always produce the same split,
-// including which clusters receive the remainder. Determinism is not cosmetic:
-// a split that reshuffled between reconciles would rewrite every projected CR
-// and re-materialize every ClusterQueue in the fleet for no reason.
+// function of the inputs alone: the same inputs always produce the same split,
+// including which clusters receive the remainder. A split that reshuffled
+// between reconciles would rewrite every projected CR and re-materialize every
+// ClusterQueue in the fleet for no reason.
 //
 // Shares come back in the unit the total was written in: a budget of 4 splits
 // into whole numbers, a budget of 4000m into thousandths. That is the only
@@ -59,109 +57,126 @@ type Share struct {
 // getting it wrong writes a fractional accelerator quota that admits nothing.
 //
 // A total of zero is a valid split into zeroes; a cluster of zero weight is a
-// valid share of zero. What cannot be resolved is a basis that is entirely
-// zero — nothing to be proportional to — and that is an error rather than an
-// even split, because an even split is a different policy the admin did not ask
-// for.
+// valid share of zero. A basis that is entirely zero has nothing to be
+// proportional to and is an error rather than an even split, because an even
+// split is a different policy the admin did not ask for.
 func Proportional(total resource.Quantity, weights []Weight) ([]Share, error) {
+	if err := validateWeights(total, weights); err != nil {
+		return nil, err
+	}
+	scale := decScale(total)
+	basis, err := alignedBasis(weights)
+	if err != nil {
+		return nil, err
+	}
+	assigned := basis.apportion(unitsAt(total, scale))
+	out := make([]Share, len(weights))
+	for i, w := range weights {
+		out[i] = Share{Cluster: w.Cluster, Nominal: quantityAt(assigned[i], scale, total.Format)}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Cluster < out[b].Cluster })
+	return out, nil
+}
+
+// validateWeights refuses an empty cluster list, a negative total, an unnamed
+// or repeated cluster and a negative capacity: the first problem in input order.
+func validateWeights(total resource.Quantity, weights []Weight) error {
 	if len(weights) == 0 {
-		return nil, fmt.Errorf("no clusters to split across")
+		return fmt.Errorf("no clusters to split across")
 	}
 	if total.Sign() < 0 {
-		return nil, fmt.Errorf("total %s is negative", total.String())
+		return fmt.Errorf("total %s is negative", total.String())
 	}
-
 	seen := make(map[string]struct{}, len(weights))
 	for _, w := range weights {
 		if w.Cluster == "" {
-			return nil, fmt.Errorf("a weight carries no cluster name")
+			return fmt.Errorf("a weight carries no cluster name")
 		}
 		if _, dup := seen[w.Cluster]; dup {
-			return nil, fmt.Errorf("cluster %s appears twice", w.Cluster)
+			return fmt.Errorf("cluster %s appears twice", w.Cluster)
 		}
 		seen[w.Cluster] = struct{}{}
 		if w.Capacity.Sign() < 0 {
-			return nil, fmt.Errorf("cluster %s has negative capacity %s", w.Cluster, w.Capacity.String())
+			return fmt.Errorf("cluster %s has negative capacity %s", w.Cluster, w.Capacity.String())
 		}
 	}
+	return nil
+}
 
-	// The unit of the answer is the unit the admin wrote the budget in, and the
-	// weights do not get a vote. They set the ratio only, and a ratio is
-	// scale-free, so aligning them among themselves is enough.
-	//
-	// This is what keeps an indivisible resource indivisible. Four chips over
-	// three clusters is 2/1/1, never 1.33 each: a fractional accelerator is a
-	// number Kueue will store and no pod can ever be admitted against. An
-	// operator who wants a finer split writes a finer budget — 4000m — and gets
-	// thousandths, which is the right answer for cpu and the wrong one for
-	// silicon. Only the person writing the budget knows which they have.
-	scale := decScale(total)
-	units := unitsAt(total, scale)
+// basis is the weights as whole numbers at one common scale, with their sum.
+//
+// The weights set the ratio only, and a ratio is scale-free, so aligning them
+// among themselves is enough; the answer keeps the unit the budget was written
+// in. That is what keeps an indivisible resource indivisible: four chips over
+// three clusters is 2/1/1, never 1.33 each. An operator who wants a finer
+// split writes a finer budget, 4000m, and gets thousandths.
+type basis struct {
+	clusters []string
+	units    []*big.Int
+	sum      *big.Int
+}
 
+// alignedBasis renders every weight at the largest scale any weight needs, so
+// nothing is rounded. A basis that sums to zero is an error.
+func alignedBasis(weights []Weight) (basis, error) {
 	weightScale := int32(0)
 	for _, w := range weights {
 		if s := decScale(w.Capacity); s > weightScale {
 			weightScale = s
 		}
 	}
-	basis := new(big.Int)
-	weighted := make([]*big.Int, len(weights))
+	b := basis{clusters: make([]string, len(weights)), units: make([]*big.Int, len(weights)), sum: new(big.Int)}
 	for i, w := range weights {
-		weighted[i] = unitsAt(w.Capacity, weightScale)
-		basis.Add(basis, weighted[i])
+		b.clusters[i] = w.Cluster
+		b.units[i] = unitsAt(w.Capacity, weightScale)
+		b.sum.Add(b.sum, b.units[i])
 	}
-	if basis.Sign() == 0 {
-		return nil, fmt.Errorf("every cluster reports zero capacity, so there is nothing to be proportional to")
+	if b.sum.Sign() == 0 {
+		return basis{}, fmt.Errorf("every cluster reports zero capacity, so there is nothing to be proportional to")
 	}
+	return b, nil
+}
 
-	// Floor first, remainders second. floor_i = total*w_i/basis leaves at most
-	// len(weights)-1 units unplaced, which is what the pass below hands out.
-	type portion struct {
-		index     int
-		remainder *big.Int
-	}
-	assigned := make([]*big.Int, len(weights))
+// portion is one cluster's place in the remainder pass: its index and the
+// remainder its whole quotient left behind.
+type portion struct {
+	index     int
+	remainder *big.Int
+}
+
+// apportion splits units by largest remainder. Every cluster takes its whole
+// quotient units*weight/sum, which leaves at most one unit per cluster
+// unplaced; those go one each to the largest remainders. An exact tie goes to
+// the lexicographically first cluster, so the result is a function of the
+// inputs and not of slice order.
+func (b basis) apportion(units *big.Int) []*big.Int {
+	assigned := make([]*big.Int, len(b.units))
 	placed := new(big.Int)
-	portions := make([]portion, len(weights))
-	for i := range weights {
-		product := new(big.Int).Mul(units, weighted[i])
-		quotient, remainder := new(big.Int).QuoRem(product, basis, new(big.Int))
+	portions := make([]portion, len(b.units))
+	for i, weight := range b.units {
+		product := new(big.Int).Mul(units, weight)
+		quotient, remainder := new(big.Int).QuoRem(product, b.sum, new(big.Int))
 		assigned[i] = quotient
 		placed.Add(placed, quotient)
 		portions[i] = portion{index: i, remainder: remainder}
 	}
-
-	// Largest remainder wins, and an exact tie goes to the lexicographically
-	// first cluster. The tiebreak exists only to make the result a function of
-	// the inputs: without it the winner would depend on slice order, and a
-	// caller that listed its clusters differently would rewrite the fleet.
-	sort.Slice(portions, func(a, b int) bool {
-		if c := portions[a].remainder.Cmp(portions[b].remainder); c != 0 {
+	sort.Slice(portions, func(x, y int) bool {
+		if c := portions[x].remainder.Cmp(portions[y].remainder); c != 0 {
 			return c > 0
 		}
-		return weights[portions[a].index].Cluster < weights[portions[b].index].Cluster
+		return b.clusters[portions[x].index] < b.clusters[portions[y].index]
 	})
-
 	one := big.NewInt(1)
 	for leftover := new(big.Int).Sub(units, placed); leftover.Sign() > 0; leftover.Sub(leftover, one) {
 		i := portions[0].index
 		portions = portions[1:]
 		assigned[i].Add(assigned[i], one)
 	}
-
-	out := make([]Share, len(weights))
-	for i, w := range weights {
-		out[i] = Share{
-			Cluster: w.Cluster,
-			Nominal: quantityAt(assigned[i], scale, total.Format),
-		}
-	}
-	sort.Slice(out, func(a, b int) bool { return out[a].Cluster < out[b].Cluster })
-	return out, nil
+	return assigned
 }
 
 // Sum adds shares up, so a caller can check an Explicit split against the total
-// the admin wrote. Explicit needs no apportionment, only that verdict.
+// the admin wrote. Explicit needs no apportionment, only that check.
 func Sum(shares []Share) resource.Quantity {
 	total := resource.Quantity{}
 	for _, s := range shares {

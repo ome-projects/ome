@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/utils"
+	"sigs.k8s.io/ome/pkg/render"
 )
 
 var log = logf.Log.WithName("DeploymentReconciler")
@@ -94,6 +95,11 @@ func createRawDeployment(componentMeta metav1.ObjectMeta,
 	}
 	podMetadata.Labels[constants.RawDeploymentAppLabel] = constants.GetRawServiceLabel(componentMeta.Name)
 	utils.SetPodLabelsFromAnnotations(&podMetadata)
+	// The Deployment carries the component's object metadata whole; its pod
+	// template takes only the annotations that belong on a pod, so a rewrite
+	// of a service annotation leaves the template, and the ReplicaSet behind
+	// it, alone.
+	podMetadata.Annotations = render.PodTemplateAnnotations(podMetadata.Annotations, componentExt.Annotations)
 	setDefaultPodSpec(podSpec)
 
 	deployment := &appsv1.Deployment{

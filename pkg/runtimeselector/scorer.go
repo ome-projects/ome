@@ -18,30 +18,39 @@ func NewDefaultRuntimeScorer(config *Config) RuntimeScorer {
 	}
 }
 
-// CalculateScore picks the best-scoring supported format on the runtime.
-// Only a format marked autoSelect: true counts: a format that leaves the
-// mark unset is not offered for automatic selection. Each format contributes
-// (modelFormat.weight + modelFramework.weight) * priority; zero weights fall
-// back to the global defaults in Config.
+// CalculateScore is the runtime's score in automatic selection: the best
+// score among the formats marked autoSelect: true, each at its own priority
+// (the configured default when it sets none), or 0 when none fits the model.
 func (s *DefaultRuntimeScorer) CalculateScore(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec) (int64, error) {
-	var maxScore int64 = 0
+	_, score := bestFormat(s, runtime, model, false, s.config.DefaultPriority)
+	return score, nil
+}
 
-	for _, supportedFormat := range runtime.SupportedModelFormats {
-		if validation.ModelRequiresCacheProvider(model) && !validation.FormatSupportsModelCacheProvider(supportedFormat, s.config.ModelCacheProvider) {
-			continue
+// bestFormat is the one format match behind the ranking and the rendered
+// format, so a pod renders with the format that gave its runtime the score.
+// In automatic selection only a format marked autoSelect: true counts, each
+// at its own priority (defaultPriority when it sets none). For a runtime the
+// service named (userSpecifiedRuntime) every format counts at
+// defaultPriority: naming the runtime overrides the priorities. It returns
+// the highest-scoring format with its score. The first of equal scores wins.
+// When no format scores above zero the score is 0 and the format is the zero
+// value.
+func bestFormat(scorer RuntimeScorer, runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, userSpecifiedRuntime bool, defaultPriority int32) (v1beta1.SupportedModelFormat, int64) {
+	var best v1beta1.SupportedModelFormat
+	var bestScore int64
+	for _, format := range runtime.SupportedModelFormats {
+		priority := int64(defaultPriority)
+		if !userSpecifiedRuntime {
+			if !autoSelectEnabled(format) {
+				continue
+			}
+			priority = formatPriority(format, defaultPriority)
 		}
-
-		if !autoSelectEnabled(supportedFormat) {
-			continue
-		}
-
-		score := s.CalculateFormatScore(model, supportedFormat, formatPriority(supportedFormat, s.config.DefaultPriority))
-		if score > maxScore {
-			maxScore = score
+		if score := scorer.CalculateFormatScore(model, format, priority); score > bestScore {
+			best, bestScore = format, score
 		}
 	}
-
-	return maxScore, nil
+	return best, bestScore
 }
 
 // autoSelectEnabled reports whether the format is offered for automatic
@@ -97,64 +106,61 @@ func (s *DefaultRuntimeScorer) CompareRuntimes(r1, r2 RuntimeMatch, model *v1bet
 	return 0
 }
 
+// CalculateFormatScore is one supported format's score for the model at the
+// given priority: the format weight plus the framework weight (the configured
+// defaults for a zero weight), times the priority, or 0 when the format does
+// not fit the model.
 func (s *DefaultRuntimeScorer) CalculateFormatScore(model *v1beta1.BaseModelSpec, supportedFormat v1beta1.SupportedModelFormat, priority int64) int64 {
 	if validation.ModelRequiresCacheProvider(model) && !validation.FormatSupportsModelCacheProvider(supportedFormat, s.config.ModelCacheProvider) {
 		return 0
 	}
-
-	modelFormatMatches := false
-	if supportedFormat.ModelFormat != nil {
-		if supportedFormat.ModelFormat.Name != model.ModelFormat.Name {
+	var score int64
+	if format := supportedFormat.ModelFormat; format != nil {
+		want := versionedName{name: format.Name, version: format.Version, operator: format.Operator, weight: format.Weight}
+		if !want.fits(model.ModelFormat.Name, model.ModelFormat.Version) {
 			return 0
 		}
-		if supportedFormat.ModelFormat.Version != nil && model.ModelFormat.Version != nil {
-			modelFormatMatches = s.compareVersions(supportedFormat.ModelFormat, &model.ModelFormat)
-			if !modelFormatMatches {
-				return 0
-			}
-		} else {
-			modelFormatMatches = true
-		}
+		score += want.score(s.config.ModelFormatWeight, priority)
 	}
-
-	modelFrameworkMatches := false
-	if supportedFormat.ModelFramework != nil && model.ModelFramework != nil {
-		if supportedFormat.ModelFramework.Name != model.ModelFramework.Name {
+	framework := supportedFormat.ModelFramework
+	switch {
+	case framework == nil && model.ModelFramework == nil:
+		// Neither side names a framework: the format alone decides.
+	case framework == nil || model.ModelFramework == nil:
+		return 0
+	default:
+		want := versionedName{name: framework.Name, version: framework.Version, operator: framework.Operator, weight: framework.Weight}
+		if !want.fits(model.ModelFramework.Name, model.ModelFramework.Version) {
 			return 0
 		}
-		if supportedFormat.ModelFramework.Version != nil && model.ModelFramework.Version != nil {
-			modelFrameworkMatches = s.compareFrameworkVersions(supportedFormat.ModelFramework, model.ModelFramework)
-			if !modelFrameworkMatches {
-				return 0
-			}
-		} else {
-			modelFrameworkMatches = true
-		}
+		score += want.score(s.config.ModelFrameworkWeight, priority)
 	}
+	return score
+}
 
-	if (modelFormatMatches || supportedFormat.ModelFormat == nil) &&
-		(modelFrameworkMatches || (supportedFormat.ModelFramework == nil && model.ModelFramework == nil)) {
+// versionedName is what a supported format's modelFormat or modelFramework
+// entry asks of the model: a name, a version under the entry's operator, and
+// the weight a match earns.
+type versionedName struct {
+	name     string
+	version  *string
+	operator *v1beta1.RuntimeSelectorOperator
+	weight   int64
+}
 
-		var currentScore int64 = 0
-		if modelFormatMatches && supportedFormat.ModelFormat != nil {
-			weight := supportedFormat.ModelFormat.Weight
-			if weight == 0 {
-				weight = s.config.ModelFormatWeight
-			}
-			currentScore += weight * priority
-		}
-		if modelFrameworkMatches && supportedFormat.ModelFramework != nil {
-			weight := supportedFormat.ModelFramework.Weight
-			if weight == 0 {
-				weight = s.config.ModelFrameworkWeight
-			}
-			currentScore += weight * priority
-		}
+// fits reports whether the model's name and version satisfy the entry.
+func (v versionedName) fits(name string, version *string) bool {
+	return v.name == name && versionsMatch(version, v.version, v.operator)
+}
 
-		return currentScore
+// score is the entry's weight, or the default when it sets none, times the
+// priority.
+func (v versionedName) score(defaultWeight, priority int64) int64 {
+	weight := v.weight
+	if weight == 0 {
+		weight = defaultWeight
 	}
-
-	return 0
+	return weight * priority
 }
 
 // calculateSizeScore is the sum-of-distances of the model size from each
@@ -181,10 +187,12 @@ func (s *DefaultRuntimeScorer) calculateSizeScore(runtime RuntimeMatch, model *v
 	return distance
 }
 
-func (s *DefaultRuntimeScorer) compareVersions(supportedFormat *v1beta1.ModelFormat, modelFormat *v1beta1.ModelFormat) bool {
-	return validation.VersionsMatch(*modelFormat.Version, *supportedFormat.Version, supportedFormat.Operator)
-}
-
-func (s *DefaultRuntimeScorer) compareFrameworkVersions(supportedFramework *v1beta1.ModelFrameworkSpec, modelFramework *v1beta1.ModelFrameworkSpec) bool {
-	return validation.VersionsMatch(*modelFramework.Version, *supportedFramework.Version, supportedFramework.Operator)
+// versionsMatch is the version rule of a supported format's modelFormat and
+// modelFramework entries: a version either side leaves unset matches, and two
+// set versions match under the runtime's operator (Equal when it names none).
+func versionsMatch(modelVersion, supportedVersion *string, operator *v1beta1.RuntimeSelectorOperator) bool {
+	if modelVersion == nil || supportedVersion == nil {
+		return true
+	}
+	return validation.VersionsMatch(*modelVersion, *supportedVersion, operator)
 }

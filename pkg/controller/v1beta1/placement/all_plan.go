@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/placement/affinity"
 	"sigs.k8s.io/ome/pkg/placement/plan"
 	"sigs.k8s.io/ome/pkg/placement/protocol"
 	"sigs.k8s.io/ome/pkg/placement/resolution"
@@ -57,30 +58,42 @@ func acceptAllLocalMinimums(proposal *plan.Proposal) {
 		return
 	}
 	for _, a := range proposal.Assignments {
-		if a.InventoryPending || a.HomeInputsPending || a.DrainRequested {
-			return
-		}
-		if !a.Matched {
-			if a.CurrentHome != nil || a.CurrentReplicas != 0 {
-				return
-			}
-			continue
-		}
-		if a.CurrentHome == nil || a.DesiredHome == nil || a.DesiredHome.InputDigest != proposal.InputDigest {
-			return
-		}
-		if a.DesiredReplicas > a.CurrentReplicas || componentMinimumRaised(a.CurrentHome, a.DesiredHome) {
+		if !staysWithoutGrowing(a, proposal.InputDigest) {
 			return
 		}
 	}
 	for name, a := range proposal.Assignments {
-		if !a.Matched || a.CurrentReplicas == a.DesiredReplicas {
-			continue
+		if a.Matched && a.CurrentReplicas != a.DesiredReplicas {
+			proposal.Assignments[name] = withMinimumsTaken(a)
 		}
-		a.CurrentHome = a.DesiredHome.DeepCopy()
-		a.CurrentReplicas, a.OriginalReplicas = a.DesiredReplicas, a.DesiredReplicas
-		proposal.Assignments[name] = a
 	}
+}
+
+// staysWithoutGrowing reports whether a member keeps its place in the plan
+// and asks for no more than it holds: it is not being inventoried, waiting
+// for its inputs or draining; an unmatched member has nothing left; a matched
+// member has a resolved policy at the plan's inputs that raises neither its
+// count nor any component's minimum.
+func staysWithoutGrowing(a v1beta1.CandidateAllocationStatus, inputDigest string) bool {
+	if a.InventoryPending || a.HomeInputsPending || a.DrainRequested {
+		return false
+	}
+	if !a.Matched {
+		return a.CurrentHome == nil && a.CurrentReplicas == 0
+	}
+	if a.CurrentHome == nil || a.DesiredHome == nil || a.DesiredHome.InputDigest != inputDigest {
+		return false
+	}
+	return a.DesiredReplicas <= a.CurrentReplicas && !componentMinimumRaised(a.CurrentHome, a.DesiredHome)
+}
+
+// withMinimumsTaken is the member with its new minimums as its current
+// allocation: its own copy of the resolved policy, and the new count as what
+// it runs and as where its change began.
+func withMinimumsTaken(a v1beta1.CandidateAllocationStatus) v1beta1.CandidateAllocationStatus {
+	a.CurrentHome = a.DesiredHome.DeepCopy()
+	a.CurrentReplicas, a.OriginalReplicas = a.DesiredReplicas, a.DesiredReplicas
+	return a
 }
 
 // componentMinimumRaised reports whether desired adds a component or raises
@@ -102,100 +115,35 @@ func componentMinimumRaised(current, desired *v1beta1.PlacementHomePolicy) bool 
 // cannot be resolved stay pending; their causes are returned for the status.
 func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceService, clusters []v1beta1.WorkloadCluster, eligible []string) (plan.Proposal, []string, error) {
 	out := plan.Proposal{Mode: v1beta1.PlacementModeAll, Assignments: map[string]v1beta1.CandidateAllocationStatus{}}
-	var holds []string
 	selector, err := placementSelector(source)
 	if err != nil {
 		return out, nil, err
 	}
-	matched := map[string]types.UID{}
-	terms := map[string][]int32{}
-	registered := map[string]types.UID{}
-	for i := range clusters {
-		cluster := &clusters[i]
-		if cluster.UID == "" || cluster.Name == "" || registered[cluster.Name] != "" {
-			return out, nil, fmt.Errorf("home inventory requires distinct identified registrations")
-		}
-		registered[cluster.Name] = cluster.UID
-		if match, ok := selector.Match(cluster); ok && cluster.DeletionTimestamp.IsZero() {
-			matched[cluster.Name], terms[cluster.Name] = cluster.UID, match.TermIndexes
-		}
-	}
-	encoded, err := json.Marshal(struct {
-		Spec                v1beta1.InferenceServiceSpec
-		Labels, Annotations map[string]string
-		Members             map[string]types.UID
-	}{source.Spec, source.Labels, planIntentAnnotations(source.Annotations), matched})
+	inventory, err := allRegistrations(clusters, selector)
 	if err != nil {
 		return out, nil, err
 	}
-	digest := sha256.Sum256(encoded)
-	out.InputDigest = hex.EncodeToString(digest[:])
-	initial := source.Status.Placement == nil || source.Status.Placement.Plan == nil
-	if !initial {
-		previous := source.Status.Placement.Plan
-		if previous.SourceUID != source.UID || previous.Mode != v1beta1.PlacementModeAll {
-			return out, nil, fmt.Errorf("standing allocation must be reconciled in its accepted placement mode")
-		}
-		out.AdoptionDigest, out.PauseSurge = previous.AdoptionDigest, previous.PauseSurge
-		for _, candidate := range source.Status.Placement.Candidates {
-			if candidate.Allocation == nil {
-				return out, nil, fmt.Errorf("standing home %q has no allocation authority", candidate.Cluster)
-			}
-			out.Assignments[candidate.Cluster] = *candidate.Allocation.DeepCopy()
-		}
-	} else {
-		out.AdoptionDigest = out.InputDigest
-		for _, candidate := range standingPlacementCandidates(source) {
-			if registered[candidate.Cluster] == "" {
-				return out, nil, fmt.Errorf("standing home %q has no identified registration", candidate.Cluster)
-			}
-		}
-		// A member write may precede its first successful source status write.
-		for name, uid := range registered {
-			out.Assignments[name] = v1beta1.CandidateAllocationStatus{ClusterUID: uid, InventoryPending: true}
-		}
+	out.InputDigest, err = allInputDigest(source, inventory.matched)
+	if err != nil {
+		return out, nil, err
 	}
-	for name, uid := range matched {
-		a, exists := out.Assignments[name]
-		if exists && a.ClusterUID != uid {
-			return out, nil, fmt.Errorf("home %q registration identity changed", name)
-		}
-		if !exists {
-			a = v1beta1.CandidateAllocationStatus{ClusterUID: uid, InventoryPending: true}
-		}
-		out.Assignments[name] = a
+	if err := carryStandingAllAssignments(source, inventory.registered, &out); err != nil {
+		return out, nil, err
+	}
+	if err := assignMatchedMembers(inventory.matched, out.Assignments); err != nil {
+		return out, nil, err
 	}
 	desired, err := r.derivedFor(source)
 	if err != nil {
 		return out, nil, err
 	}
+	var holds []string
 	pending := false
+	adopting := out.AdoptionDigest != ""
 	for _, name := range slices.Sorted(maps.Keys(out.Assignments)) {
-		a := out.Assignments[name]
-		a.MatchingTerms = terms[name]
-		a.Matched = matched[name] != ""
-		a.HomeInputsPending = a.Matched
-		if matched[name] == "" {
-			a.DesiredHome, a.DesiredReplicas = nil, 0
-		}
-		if a.InventoryPending {
-			err = r.adoptAllModeMember(ctx, source, name, &a, out.InputDigest, out.AdoptionDigest != "")
-			if err != nil {
-				r.Log.V(1).Info("home inventory is pending", "cluster", name, "error", err)
-			}
-		}
-		if matched[name] != "" && slices.Contains(eligible, name) {
-			cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
-			policy, resolveErr := r.resolveFullPolicy(cctx, source, desired, name, a.ClusterUID, out.InputDigest)
-			cancel()
-			if resolveErr == nil {
-				a.HomeInputsPending = false
-				a.DesiredHome = policy
-				a.DesiredReplicas, _ = protocol.ValidateReplicaFloors(policy.ReplicaFloors)
-			} else {
-				r.Log.V(1).Info("home policy is unresolved", "cluster", name, "error", resolveErr)
-				holds = append(holds, fmt.Sprintf("home policy is unresolved on %s: %v", name, resolveErr))
-			}
+		a, hold := r.resolveAllAssignment(ctx, source, desired, name, out.Assignments[name], inventory, eligible, out.InputDigest, adopting)
+		if hold != "" {
+			holds = append(holds, hold)
 		}
 		pending = pending || a.InventoryPending || a.HomeInputsPending
 		out.Assignments[name] = a
@@ -204,27 +152,152 @@ func (r *Reconciler) allProposal(ctx context.Context, source *v1beta1.InferenceS
 		out.AdoptionDigest = ""
 	}
 	if pending && out.AdoptionDigest == out.InputDigest {
-		// Unknown unmatched members may still serve. They prevent interpreting new
-		// members as initial additive provisioning rather than a replacement move.
-		additive := true
-		for name, a := range out.Assignments {
-			if matched[name] == "" && (a.InventoryPending || a.CurrentHome != nil) {
-				additive = false
-			}
-			if a.CurrentReplicas > a.DesiredReplicas {
-				additive = false
-			}
-		}
-		if additive {
-			for name, a := range out.Assignments {
-				if !a.InventoryPending && !a.HomeInputsPending && a.CurrentHome == nil && a.DesiredHome != nil && a.DesiredHome.InputDigest == out.InputDigest {
-					a.CurrentHome, a.CurrentReplicas = a.DesiredHome.DeepCopy(), a.DesiredReplicas
-					out.Assignments[name] = a
-				}
-			}
-		}
+		acceptAdditiveProvisioning(&out, inventory.matched)
 	}
 	return out, holds, nil
+}
+
+// allInventory is what the registrations say about the clusters: every
+// identified registration, the matched members with their UIDs, and the
+// affinity terms each matched member satisfied.
+type allInventory struct {
+	registered map[string]types.UID
+	matched    map[string]types.UID
+	terms      map[string][]int32
+}
+
+// allRegistrations reads the inventory; a nameless, unidentified or repeated
+// registration refuses the plan. A registration being deleted matches nothing.
+func allRegistrations(clusters []v1beta1.WorkloadCluster, selector *affinity.Selector) (allInventory, error) {
+	inventory := allInventory{registered: map[string]types.UID{}, matched: map[string]types.UID{}, terms: map[string][]int32{}}
+	for i := range clusters {
+		cluster := &clusters[i]
+		if cluster.UID == "" || cluster.Name == "" || inventory.registered[cluster.Name] != "" {
+			return inventory, fmt.Errorf("home inventory requires distinct identified registrations")
+		}
+		inventory.registered[cluster.Name] = cluster.UID
+		if match, ok := selector.Match(cluster); ok && cluster.DeletionTimestamp.IsZero() {
+			inventory.matched[cluster.Name], inventory.terms[cluster.Name] = cluster.UID, match.TermIndexes
+		}
+	}
+	return inventory, nil
+}
+
+// allInputDigest names the plan's inputs: the spec, the labels, the intent
+// annotations and the matched members.
+func allInputDigest(source *v1beta1.InferenceService, matched map[string]types.UID) (string, error) {
+	encoded, err := json.Marshal(struct {
+		Spec                v1beta1.InferenceServiceSpec
+		Labels, Annotations map[string]string
+		Members             map[string]types.UID
+	}{source.Spec, source.Labels, planIntentAnnotations(source.Annotations), matched})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+// carryStandingAllAssignments seeds the assignments. An accepted plan of this
+// source in All mode carries its allocations, adoption digest and pause over.
+// A first plan inventories every registration before it allocates, and
+// refuses a standing member whose registration is unknown.
+func carryStandingAllAssignments(source *v1beta1.InferenceService, registered map[string]types.UID, out *plan.Proposal) error {
+	if source.Status.Placement != nil && source.Status.Placement.Plan != nil {
+		previous := source.Status.Placement.Plan
+		if previous.SourceUID != source.UID || previous.Mode != v1beta1.PlacementModeAll {
+			return fmt.Errorf("standing allocation must be reconciled in its accepted placement mode")
+		}
+		out.AdoptionDigest, out.PauseSurge = previous.AdoptionDigest, previous.PauseSurge
+		for _, candidate := range source.Status.Placement.Candidates {
+			if candidate.Allocation == nil {
+				return fmt.Errorf("standing home %q has no allocation authority", candidate.Cluster)
+			}
+			out.Assignments[candidate.Cluster] = *candidate.Allocation.DeepCopy()
+		}
+		return nil
+	}
+	out.AdoptionDigest = out.InputDigest
+	for _, candidate := range standingPlacementCandidates(source) {
+		if registered[candidate.Cluster] == "" {
+			return fmt.Errorf("standing home %q has no identified registration", candidate.Cluster)
+		}
+	}
+	// A member write may precede its first successful source status write.
+	for name, uid := range registered {
+		out.Assignments[name] = v1beta1.CandidateAllocationStatus{ClusterUID: uid, InventoryPending: true}
+	}
+	return nil
+}
+
+// assignMatchedMembers gives every matched member an assignment, keeping the
+// one it has; a member whose registration changed identity refuses the plan.
+func assignMatchedMembers(matched map[string]types.UID, assignments map[string]v1beta1.CandidateAllocationStatus) error {
+	for name, uid := range matched {
+		a, exists := assignments[name]
+		if exists && a.ClusterUID != uid {
+			return fmt.Errorf("home %q registration identity changed", name)
+		}
+		if !exists {
+			a = v1beta1.CandidateAllocationStatus{ClusterUID: uid, InventoryPending: true}
+		}
+		assignments[name] = a
+	}
+	return nil
+}
+
+// resolveAllAssignment settles one member's assignment for the pass: it
+// records the matched terms, inventories a member the plan has not adopted,
+// and resolves a matched eligible member's policy. A resolution that fails
+// leaves the member waiting for its inputs and names the cause.
+func (r *Reconciler) resolveAllAssignment(ctx context.Context, source, desired *v1beta1.InferenceService, name string, a v1beta1.CandidateAllocationStatus, inventory allInventory, eligible []string, digest string, adopting bool) (v1beta1.CandidateAllocationStatus, string) {
+	a.MatchingTerms = inventory.terms[name]
+	a.Matched = inventory.matched[name] != ""
+	a.HomeInputsPending = a.Matched
+	if inventory.matched[name] == "" {
+		a.DesiredHome, a.DesiredReplicas = nil, 0
+	}
+	if a.InventoryPending {
+		if err := r.adoptAllModeMember(ctx, source, name, &a, digest, adopting); err != nil {
+			r.Log.V(1).Info("home inventory is pending", "cluster", name, "error", err)
+		}
+	}
+	if inventory.matched[name] == "" || !slices.Contains(eligible, name) {
+		return a, ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, r.placeTimeout())
+	policy, resolveErr := r.resolveFullPolicy(cctx, source, desired, name, a.ClusterUID, digest)
+	cancel()
+	if resolveErr != nil {
+		r.Log.V(1).Info("home policy is unresolved", "cluster", name, "error", resolveErr)
+		return a, fmt.Sprintf("home policy is unresolved on %s: %v", name, resolveErr)
+	}
+	a.HomeInputsPending = false
+	a.DesiredHome = policy
+	a.DesiredReplicas, _ = protocol.ValidateReplicaFloors(policy.ReplicaFloors)
+	return a, ""
+}
+
+// acceptAdditiveProvisioning takes a first plan's resolved members as their
+// own current allocation when no unmatched member may still serve and no
+// member shrinks: new members then read as an addition, not a replacement
+// move. An unmatched member still being inventoried or holding a policy may
+// serve, so it keeps the move reading.
+func acceptAdditiveProvisioning(out *plan.Proposal, matched map[string]types.UID) {
+	for name, a := range out.Assignments {
+		if matched[name] == "" && (a.InventoryPending || a.CurrentHome != nil) {
+			return
+		}
+		if a.CurrentReplicas > a.DesiredReplicas {
+			return
+		}
+	}
+	for name, a := range out.Assignments {
+		if !a.InventoryPending && !a.HomeInputsPending && a.CurrentHome == nil && a.DesiredHome != nil && a.DesiredHome.InputDigest == out.InputDigest {
+			a.CurrentHome, a.CurrentReplicas = a.DesiredHome.DeepCopy(), a.DesiredReplicas
+			out.Assignments[name] = a
+		}
+	}
 }
 
 func (r *Reconciler) resolveFullPolicy(ctx context.Context, source, desired *v1beta1.InferenceService, name string, uid types.UID, digest string) (*v1beta1.PlacementHomePolicy, error) {
@@ -240,7 +313,7 @@ func (r *Reconciler) resolveFullPolicy(ctx context.Context, source, desired *v1b
 	} else if !isOurDerived(member, source) {
 		return nil, fmt.Errorf("home is not owned by this source")
 	}
-	_, floors, err := (resolution.Resolver{Client: cl, OperatorNamespace: r.MemberOperatorNamespace}).ResolveHome(ctx, desired, member)
+	_, floors, err := (resolution.Resolver{Client: cl, OperatorNamespace: r.MemberOperatorNamespace}).ResolveAssignedCluster(ctx, desired, member)
 	if err != nil {
 		return nil, err
 	}

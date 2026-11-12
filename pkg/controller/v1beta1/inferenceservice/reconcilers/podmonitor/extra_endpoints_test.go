@@ -63,7 +63,7 @@ func TestParseExtraEndpoints(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ParseExtraEndpoints(tt.annotations)
+			got := ParseExtraEndpoints(tt.annotations, "10s")
 			require.Len(t, got, len(tt.want))
 			for i := range tt.want {
 				require.NotNil(t, got[i].Port, "port[%d] must be non-nil", i)
@@ -80,7 +80,7 @@ func TestParseExtraEndpoints(t *testing.T) {
 func TestParseExtraEndpoints_DistinctPointers(t *testing.T) {
 	got := ParseExtraEndpoints(map[string]string{
 		constants.ExtraPodMetricsEndpointsAnnotationKey: "http:/a,metrics:/b",
-	})
+	}, "10s")
 	require.Len(t, got, 2)
 	require.NotSame(t, got[0].Port, got[1].Port)
 	assert.Equal(t, "http", *got[0].Port)

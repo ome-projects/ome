@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/holds"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
@@ -200,7 +201,7 @@ func (r *gangSurgeRoll) resumeFromRows(ctx context.Context, deps workload.Deps, 
 		return r.restoreReplacementRow(ctx, deps, input)
 	}
 	if !status.GangSurgeTargetClaimMatches(r.replacement, r.revision) && !r.promoted {
-		if _, err := resetGangSurgeSourceAfterTargetConflict(ctx, input, r.source, r.replacement); err != nil {
+		if err := resetGangSurgeSourceAfterTargetConflict(ctx, input, r.source, r.replacement); err != nil {
 			return false, fmt.Errorf("reset gang surge with occupied target (source=%d target=%d): %w", r.sourceIdx, r.surgeIdx, err)
 		}
 		return false, nil
@@ -211,8 +212,7 @@ func (r *gangSurgeRoll) resumeFromRows(ctx context.Context, deps workload.Deps, 
 	if !r.startingSurge && !r.promoted && r.replacement.Operation != nil &&
 		r.replacement.Operation.Step == workload.UpdateStepGangSurgeTargetCleanup {
 		if r.revision != r.target.Name {
-			_, err := endWithdrawnGangSurge(ctx, deps, input, r.plan, r.source, r.surgeIdx)
-			return false, err
+			return false, endWithdrawnGangSurge(ctx, deps, input, r.plan, r.source, r.surgeIdx)
 		}
 		_, err := holdLostGangSurge(ctx, deps, input, r.plan, r.source, r.surgeIdx, r.revision)
 		return false, err
@@ -258,7 +258,7 @@ func (r *gangSurgeRoll) restoreReplacementRow(ctx context.Context, deps workload
 		cleanup = !keep
 	}
 	if cleanup && (input.ApplyInstanceMutationsWithRetryBlock != nil || input.FinalizeInstanceResources != nil) {
-		if _, err := restoreGangSurgeTargetCleanup(ctx, input, r.source, r.surgeIdx, r.revision, r.plan.InstanceReadyTimeout); err != nil {
+		if err := restoreGangSurgeTargetCleanup(ctx, input, r.source, r.surgeIdx, r.revision, r.plan.InstanceReadyTimeout); err != nil {
 			return false, fmt.Errorf("restore gang surge target cleanup marker (instance=%d): %w", r.surgeIdx, err)
 		}
 	} else if _, err := status.RestoreGangSurgeTarget(ctx, input, r.source, r.surgeIdx, r.revision, r.plan.InstanceReadyTimeout); err != nil {
@@ -282,7 +282,7 @@ func (r *gangSurgeRoll) acceptPromotedReplacement(ctx context.Context, deps work
 		if !r.startingSurge {
 			return false, nil
 		}
-		if _, err := resetGangSurgeSourceAfterTargetConflict(ctx, input, r.source, r.replacement); err != nil {
+		if err := resetGangSurgeSourceAfterTargetConflict(ctx, input, r.source, r.replacement); err != nil {
 			return false, fmt.Errorf("reset gang surge with occupied promoted target (source=%d target=%d): %w", r.sourceIdx, r.surgeIdx, err)
 		}
 		return false, nil
@@ -425,8 +425,7 @@ func (r *gangSurgeRoll) createMissingMembers(ctx context.Context, deps workload.
 	rearm := false
 	if !r.startingSurge && !r.promoted {
 		if r.revision != r.target.Name {
-			_, err := endWithdrawnGangSurge(ctx, deps, input, r.plan, r.source, r.surgeIdx)
-			return false, err
+			return false, endWithdrawnGangSurge(ctx, deps, input, r.plan, r.source, r.surgeIdx)
 		}
 		recycled := recycledMembers(r.source, missing)
 		create, after, err := rebuildLostReplacement(ctx, deps, input, r.plan, r.source, r.replacement, r.surgeIdx, r.revision, recycled, len(r.replacementPods), size)
@@ -807,12 +806,13 @@ func resetGangSurgeSourceAfterTargetConflict(
 	input workload.ReconcileInput,
 	source *workload.InstanceStatus,
 	target *workload.InstanceStatus,
-) (bool, error) {
+) error {
 	if source == nil || target == nil || !gangSurgeSourceOwnsRemoval(source, target.Index) ||
 		status.GangSurgeTargetClaimMatches(target, source.Operation.TargetRevision) {
-		return false, nil
+		return nil
 	}
-	return status.ResetGangSurgeSource(ctx, input, source, target)
+	_, err := status.ResetGangSurgeSource(ctx, input, source, target)
+	return err
 }
 
 func cloneInstanceTopologyKeys(in map[int32]string) map[int32]string {
@@ -899,7 +899,7 @@ func (e *gangSurgeEnding) claimReplacementCleanup(ctx context.Context, _ workloa
 			return false, nil
 		}
 		if e.replacement == nil {
-			if _, err := restoreGangSurgeTargetCleanup(
+			if err := restoreGangSurgeTargetCleanup(
 				ctx, input, e.source, e.surgeIdx, e.source.Operation.TargetRevision, e.plan.InstanceReadyTimeout,
 			); err != nil {
 				return false, fmt.Errorf("restore gang surge target cleanup marker (instance=%d): %w", e.surgeIdx, err)
@@ -924,10 +924,11 @@ func (e *gangSurgeEnding) claimReplacementCleanup(ctx context.Context, _ workloa
 
 // deleteReplacementPods takes the retired replacement's members out of
 // rotation and deletes them under the retired-replacement grace. The source
-// keeps its surge step and its budget slot until they are gone. A member
-// whose write the apiserver refused is left as the refusal left it until the
-// revision in force admits a fresh attempt. The pass stops while any member
-// stands.
+// keeps its surge step and its budget slot until they are gone, and while
+// they terminate both rows of the pair carry the waiting token that names
+// the wait. A member whose write the apiserver refused is left as the
+// refusal left it until the revision in force admits a fresh attempt. The
+// pass stops while any member stands.
 func (e *gangSurgeEnding) deleteReplacementPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput) (bool, error) {
 	ns, owner, comp := input.Key.Namespace, input.Key.OwnerName, e.plan.Component
 	pods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), ns, owner, comp, e.surgeIdx)
@@ -968,15 +969,33 @@ func (e *gangSurgeEnding) deleteReplacementPods(ctx context.Context, deps worklo
 			return false, fmt.Errorf("delete failed surge pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 	}
-	return false, nil
+	return false, e.recordMembersTerminating(ctx, input)
+}
+
+// recordMembersTerminating records on the source's kept surge and on the
+// replacement's cleanup step that the retired members are terminating, so
+// a reader of either row sees what the pair waits for until it ends.
+func (e *gangSurgeEnding) recordMembersTerminating(ctx context.Context, input workload.ReconcileInput) error {
+	for _, idx := range []int32{e.sourceIdx, e.surgeIdx} {
+		if err := holds.RecordRetiredReplacementTerminating(ctx, input, e.plan, idx); err != nil {
+			return fmt.Errorf("record retired replacement wait (instance=%d): %w", idx, err)
+		}
+	}
+	return nil
 }
 
 // writePairEnd removes the replacement's row and leaves the source as the
-// ending says. The guarded path commits both in one write, so a missing row
-// can never be read as an interrupted claim and written back as live work.
-// The plain path removes the row, then writes the source Failed when the
-// revision holds, else charges the revision and resets the source.
+// ending says. The source's drain hold goes first, so a source still
+// standing serves again on the revision it runs the moment the pair is
+// written off, whether the revision holds or a fresh roll follows. The
+// guarded path commits both rows in one write, so a missing row can never
+// be read as an interrupted claim and written back as live work. The plain
+// path removes the row, then writes the source Failed when the revision
+// holds, else charges the revision and resets the source.
 func (e *gangSurgeEnding) writePairEnd(ctx context.Context, deps workload.Deps, input workload.ReconcileInput) (bool, error) {
+	if _, err := releaseGangSourceDrainHold(ctx, deps, input, e.plan, e.sourceIdx); err != nil {
+		return false, err
+	}
 	if e.guarded {
 		complete, err := finalizeAndResetAbandonedGangSurge(ctx, deps, input, e)
 		if err != nil {
@@ -1062,12 +1081,13 @@ func restoreGangSurgeTargetCleanup(
 	surgeIdx int32,
 	targetRevision string,
 	timeout time.Duration,
-) (bool, error) {
+) error {
 	if source == nil || !gangSurgeSourceOwnsRemoval(source, surgeIdx) ||
 		source.Operation.TargetRevision != targetRevision {
-		return false, nil
+		return nil
 	}
-	return status.RestoreGangSurgeTargetCleanup(ctx, input, source, surgeIdx, targetRevision, timeout)
+	_, err := status.RestoreGangSurgeTargetCleanup(ctx, input, source, surgeIdx, targetRevision, timeout)
+	return err
 }
 
 // finalizeAndResetAbandonedGangSurge is the guarded path's one write: the
@@ -1338,26 +1358,44 @@ func holdLostGangSurge(ctx context.Context, deps workload.Deps, input workload.R
 // rotation on the revision the roll is back on; with no source pod standing
 // it re-enters as the Create pass's fresh start at the target. Multi-pass,
 // through the ending's own phases.
-func endWithdrawnGangSurge(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, src *workload.InstanceStatus, surgeIdx int32) (bool, error) {
-	ns, owner, comp := input.Key.Namespace, input.Key.OwnerName, plan.Component
-	sourcePods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), ns, owner, comp, src.Index)
+func endWithdrawnGangSurge(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, src *workload.InstanceStatus, surgeIdx int32) error {
+	standing, err := releaseGangSourceDrainHold(ctx, deps, input, plan, src.Index)
 	if err != nil {
-		return false, fmt.Errorf("list source gang pods for the withdrawn surge (instance=%d): %w", src.Index, err)
+		return err
 	}
-	hold := podreadiness.Message{UserAgent: podreadiness.WriterUpdateSurgeDrain, Key: gangSurgeDrainKey(src.Index)}
+	sourceRunningRev := src.RunningRevision
+	if standing == 0 {
+		sourceRunningRev = ""
+	}
+	_, err = abandonFailedGangSurge(ctx, deps, input, plan, src.Index, surgeIdx, sourceRunningRev, "", "", workload.CauseUnattributed, gangSurgeEnd{withdrawn: true})
+	return err
+}
+
+// releaseGangSourceDrainHold returns the standing members of a gang surge's
+// source to rotation: the drain step took them out behind a serving
+// replacement gang, and a pair that ends leaves no replacement to serve for
+// them. The members are read live, since the pass's list predates the
+// deletes the ending issued. A member on its way out is left alone; one
+// that carries no hold is skipped. Reports how many members stand.
+func releaseGangSourceDrainHold(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, sourceIdx int32) (int, error) {
+	ns, owner, comp := input.Key.Namespace, input.Key.OwnerName, plan.Component
+	sourcePods, err := query.LiveListPodsForInstance(ctx, deps.Reader(), ns, owner, comp, sourceIdx)
+	if err != nil {
+		return 0, fmt.Errorf("list the source gang's pods at the end of its surge (instance=%d): %w", sourceIdx, err)
+	}
+	hold := podreadiness.Message{UserAgent: podreadiness.WriterUpdateSurgeDrain, Key: gangSurgeDrainKey(sourceIdx)}
 	standing := 0
 	for _, pod := range sourcePods {
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
 		standing++
+		if !podreadiness.ContainsNotReadyKey(pod, hold) {
+			continue
+		}
 		if err := podreadiness.RemoveNotReadyKeyIgnoreNotFound(ctx, deps.Client, deps.Reader(), pod, hold); err != nil {
-			return false, fmt.Errorf("lift the drain hold of source pod %s/%s: %w", pod.Namespace, pod.Name, err)
+			return 0, fmt.Errorf("return source pod %s/%s to rotation: %w", pod.Namespace, pod.Name, err)
 		}
 	}
-	sourceRunningRev := src.RunningRevision
-	if standing == 0 {
-		sourceRunningRev = ""
-	}
-	return abandonFailedGangSurge(ctx, deps, input, plan, src.Index, surgeIdx, sourceRunningRev, "", "", workload.CauseUnattributed, gangSurgeEnd{withdrawn: true})
+	return standing, nil
 }

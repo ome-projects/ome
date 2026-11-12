@@ -367,7 +367,11 @@ type EngineSpec struct {
 	// +ome:since=v1.3
 	TopologySpreadKey *string `json:"topologySpreadKey,omitempty"`
 
-	// AcceleratorOverride allows overriding the global accelerator selection for this component
+	// AcceleratorOverride allows overriding the global accelerator selection for this component.
+	// Each field set here, the class name, the policy or the constraints block,
+	// replaces the same field of spec.acceleratorSelector; a field left unset is
+	// read from spec.acceleratorSelector. An empty constraints block clears the
+	// service's constraints for this component.
 	// +optional
 	AcceleratorOverride *AcceleratorSelector `json:"acceleratorOverride,omitempty"`
 }
@@ -466,7 +470,11 @@ type DecoderSpec struct {
 	// +ome:since=v1.3
 	TopologySpreadKey *string `json:"topologySpreadKey,omitempty"`
 
-	// AcceleratorOverride allows overriding the global accelerator selection for this component
+	// AcceleratorOverride allows overriding the global accelerator selection for this component.
+	// Each field set here, the class name, the policy or the constraints block,
+	// replaces the same field of spec.acceleratorSelector; a field left unset is
+	// read from spec.acceleratorSelector. An empty constraints block clears the
+	// service's constraints for this component.
 	// +optional
 	AcceleratorOverride *AcceleratorSelector `json:"acceleratorOverride,omitempty"`
 }
@@ -511,7 +519,11 @@ type EncoderSpec struct {
 	// +optional
 	TopologySpreadKey *string `json:"topologySpreadKey,omitempty"`
 
-	// AcceleratorOverride allows overriding the global accelerator selection for this component
+	// AcceleratorOverride allows overriding the global accelerator selection for this component.
+	// Each field set here, the class name, the policy or the constraints block,
+	// replaces the same field of spec.acceleratorSelector; a field left unset is
+	// read from spec.acceleratorSelector. An empty constraints block clears the
+	// service's constraints for this component.
 	// +optional
 	AcceleratorOverride *AcceleratorSelector `json:"acceleratorOverride,omitempty"`
 }

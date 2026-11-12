@@ -45,7 +45,11 @@ import (
 // write outcome, discarding the availability wake. ir is the replica as the
 // pass began, so its rows are the Instances the pass started with.
 func writeStatus(r *Reconciler, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, target *appsv1.ControllerRevision, holdObserved bool, hold *workloadtypes.RolloutHold) error {
-	_, err := r.aggregateAndWriteStatus(context.Background(), ir, plan, target, holdObserved, hold, instanceIndices(ir.Status.InstanceStatuses))
+	pods, err := listComponentPods(context.Background(), r.Client, ir)
+	if err != nil {
+		return err
+	}
+	_, err = r.aggregateAndWriteStatus(context.Background(), ir, pods, nil, plan, target, nil, holdObserved, hold, instanceIndices(ir.Status.InstanceStatuses))
 	return err
 }
 
@@ -192,7 +196,9 @@ func TestAggregateAndWriteStatusPersistsCompactRowsAndMirrorsCurrentObservations
 	}}
 	pod := podForIR(ir, 0, "default", 0, true, true)
 	pod.Spec.NodeName = "node-a"
-	r, stored := newReconciler(t, ir, pod)
+	// The Node the pod is bound to exists: a pod on a Node the cluster does
+	// not hold is gone for the counters.
+	r, stored := newReconciler(t, ir, pod, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}})
 	statusWrites := 0
 	r.Client = interceptor.NewClient(stored.(client.WithWatch), interceptor.Funcs{
 		SubResourceUpdate: func(ctx context.Context, c client.Client, subresource string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
@@ -1233,10 +1239,11 @@ func TestAggregateAndWriteStatus_ExcludedAnnotationValueChangeLands(t *testing.T
 
 // liveReadsThroughPromotion is how many InferenceReplica reads reach the
 // authoritative reader up to and including the CurrentRevision promotion:
-// the migration-entry sync, the aggregate-condition write, the update
-// revision record, then promotion. Every conflict-retry closure re-reads
-// its base live, so promotion is not the first live read.
-const liveReadsThroughPromotion = 4
+// the migration-entry sync, the aggregate-condition write and the update
+// revision record. A conflict-retry closure re-reads its base live only
+// when the pass's copy calls for a write; the promotion over a copy that
+// already names its current revision reads nothing.
+const liveReadsThroughPromotion = 3
 
 type firstIRGenerationReader struct {
 	client.Reader
@@ -3535,10 +3542,11 @@ func TestIRLabelSelectorStringForAStandaloneReplica(t *testing.T) {
 // read back as the recorded update revision only while it stands.
 func TestCurrentRevisionWithdrawalRecord(t *testing.T) {
 	const prior, next = "llama-engine-aaaaaaaa", "llama-engine-bbbbbbbb"
+	at := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 	withdrawn := func() *v1beta1.InferenceReplicaStatus {
 		st := &v1beta1.InferenceReplicaStatus{CurrentRevision: prior, UpdateRevision: prior}
 		st.CurrentRevision = ""
-		recordCurrentRevisionWithdrawal(st, "", prior)
+		recordCurrentRevisionWithdrawal(st, "", prior, at)
 		return st
 	}
 	cases := []struct {
@@ -3549,26 +3557,26 @@ func TestCurrentRevisionWithdrawalRecord(t *testing.T) {
 		{"the withdrawing write raises the record and reads it back as the update revision", withdrawn, prior},
 		{"a later write with the pair unchanged keeps it", func() *v1beta1.InferenceReplicaStatus {
 			st := withdrawn()
-			recordCurrentRevisionWithdrawal(st, withdrawnRevisionFor(st), "")
+			recordCurrentRevisionWithdrawal(st, withdrawnRevisionFor(st), "", at)
 			return st
 		}, prior},
 		{"the write that moves the update revision on removes it", func() *v1beta1.InferenceReplicaStatus {
 			st := withdrawn()
 			before := withdrawnRevisionFor(st)
 			st.UpdateRevision = next
-			recordCurrentRevisionWithdrawal(st, before, "")
+			recordCurrentRevisionWithdrawal(st, before, "", at)
 			return st
 		}, ""},
 		{"the write that records a current revision again removes it", func() *v1beta1.InferenceReplicaStatus {
 			st := withdrawn()
 			before := withdrawnRevisionFor(st)
 			st.CurrentRevision = prior
-			recordCurrentRevisionWithdrawal(st, before, "")
+			recordCurrentRevisionWithdrawal(st, before, "", at)
 			return st
 		}, ""},
 		{"a current revision that was never recorded is no withdrawal", func() *v1beta1.InferenceReplicaStatus {
 			st := &v1beta1.InferenceReplicaStatus{UpdateRevision: prior}
-			recordCurrentRevisionWithdrawal(st, "", "")
+			recordCurrentRevisionWithdrawal(st, "", "", at)
 			return st
 		}, ""},
 	}

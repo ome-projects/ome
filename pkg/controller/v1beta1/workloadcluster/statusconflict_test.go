@@ -72,7 +72,7 @@ func TestFinishStatusWriteOutcome(t *testing.T) {
 				opts = append(opts, fakeclient.FailingVerb(fakeclient.StatusUpdate, fakeclient.EveryCall, tc.updateErr))
 			}
 			c := fakeclient.New(t, opts...)
-			r := &Reconciler{Client: c, Scheme: s, Log: log.Log}
+			r := &Reconciler{Client: c, Log: log.Log}
 
 			got, err := r.finish(context.Background(), wc, DefaultHealthInterval)
 

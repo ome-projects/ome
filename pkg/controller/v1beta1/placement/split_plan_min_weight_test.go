@@ -66,22 +66,28 @@ func TestDesiredSplitPlanRecomputesStoredMinWeight(t *testing.T) {
 	requireMinWeightEqualsWeight(t, proposal.Assignments)
 }
 
-// TestSplitInputDigestExcludesMinWeight checks the exact input digest of integer-form
-// sources. Integer-form identity must not change: a different digest re-plans
-// every stored integer-form service on upgrade.
+// TestSplitInputDigestExcludesMinWeight checks the exact input digest of
+// unweighted and weighted sources. Their identity must not change: a different
+// digest re-plans every stored service on upgrade.
 func TestSplitInputDigestExcludesMinWeight(t *testing.T) {
-	engineWeights := srcISVCSplit("accelerator=gpu-a", 6)
-	engineWeights.Spec.Placement.ClusterAffinity = weightedAffinity(map[string]int32{"member-a": 2, "member-b": 1})
+	engineRatios := ratioSplitSource(4, nil)
+	engineRatios.Spec.Decoder = nil
+	engineRatios.Spec.Engine.MaxReplicas = 12
+	engineRatios.Spec.Placement.ClusterAffinity = weightedTermsOn(map[string]v1beta1.ClusterAffinityWeights{
+		"member-a": {Engine: ratio(2, 3)}, "member-b": {Engine: ratio(1, 1)},
+	})
+	componentRatios := ratioSplitSource(4, ptr.To(12))
+	componentRatios.Spec.Engine.MaxReplicas, componentRatios.Spec.Decoder.MaxReplicas = 12, 24
+	componentRatios.Spec.Placement.ClusterAffinity = weightedTermsOn(map[string]v1beta1.ClusterAffinityWeights{
+		"member-a": {Default: ratio(2, 1), Decoder: ratio(1, 2)}, "member-b": {Default: ratio(1, 1), Decoder: ratio(3, 1)},
+	})
 	for name, tt := range map[string]struct {
 		source *v1beta1.InferenceService
 		want   string
 	}{
-		"no weights":     {srcISVCSplit("accelerator=gpu-a", 6), "579355844133b8e6a0383138cb6cec3894ce7a5560991e7357175c69446150f0"},
-		"engine weights": {engineWeights, "e1d893b7f8200fcd5d721091023fccf630c980dcf65de82223ce31ea909bc618"},
-		"engine and decoder weights": {
-			componentSplitSource(4, 12, map[string]int32{"member-a": 2, "member-b": 1}, map[string]int32{"member-a": 1, "member-b": 3}),
-			"0eb7d96da117d8603b81e529b78ca666b7043ec627b94fe6f72bc69bf79336df",
-		},
+		"no weights":                 {srcISVCSplit("accelerator=gpu-a", 6), "579355844133b8e6a0383138cb6cec3894ce7a5560991e7357175c69446150f0"},
+		"engine ratios":              {engineRatios, "e5da61127f2d9487bd6f73c9ad1b0ce8c42e35bfbd07e20366c18eca9e18fcc2"},
+		"default and decoder ratios": {componentRatios, "eea2b71730bd8a610f36f58386983997adc45d3eed7814b5f984a7b8bb7a15d0"},
 	} {
 		proposal, err := desiredSplitPlan(tt.source, twoMembers(), nil)
 		if err != nil {

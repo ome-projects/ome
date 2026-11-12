@@ -78,22 +78,19 @@ type Reader struct {
 // stale, or incompatible input rejects the whole reading, including partial
 // results. The caller retains its last accepted placement plan on error.
 func (r Reader) Read(ctx context.Context, matched []v1beta1.WorkloadCluster, demands map[string]Demand, now time.Time) (map[string]Sample, error) {
-	if r.Client == nil || r.RootName == "" || r.MaxAge <= 0 || now.IsZero() {
+	if !r.configured(now) {
 		return nil, fmt.Errorf("capacity reader requires a client, root name, positive maximum age, and current time")
 	}
 	out := make(map[string]Sample, len(matched))
 	if len(matched) == 0 {
 		return out, nil
 	}
-	var root v1beta1.AcceleratorQuota
-	if err := r.Client.Get(ctx, client.ObjectKey{Name: r.RootName}, &root); err != nil {
-		return nil, fmt.Errorf("read fleet capacity: %w", err)
-	}
-	if root.UID == "" || !root.DeletionTimestamp.IsZero() || root.Spec.ParentRef != nil || root.Spec.Role != v1beta1.AcceleratorQuotaRoleCohort {
-		return nil, fmt.Errorf("fleet capacity root is not an identified live root")
+	root, err := r.liveRoot(ctx)
+	if err != nil {
+		return nil, err
 	}
 	for _, cluster := range matched {
-		if cluster.Name == "" || cluster.UID == "" || !cluster.DeletionTimestamp.IsZero() {
+		if !identifiedLiveRegistration(cluster) {
 			return nil, fmt.Errorf("capacity requires an identified live registration for cluster %q", cluster.Name)
 		}
 		if _, duplicate := out[cluster.Name]; duplicate {
@@ -106,6 +103,31 @@ func (r Reader) Read(ctx context.Context, matched []v1beta1.WorkloadCluster, dem
 		out[cluster.Name] = sample
 	}
 	return out, nil
+}
+
+// configured reports whether the reader has what a reading needs: a client,
+// the root's name, a positive maximum age and the current time.
+func (r Reader) configured(now time.Time) bool {
+	return r.Client != nil && r.RootName != "" && r.MaxAge > 0 && !now.IsZero()
+}
+
+// liveRoot reads the fleet capacity root once per reading and requires it to
+// be an identified, live cohort root with no parent.
+func (r Reader) liveRoot(ctx context.Context) (*v1beta1.AcceleratorQuota, error) {
+	root := &v1beta1.AcceleratorQuota{}
+	if err := r.Client.Get(ctx, client.ObjectKey{Name: r.RootName}, root); err != nil {
+		return nil, fmt.Errorf("read fleet capacity: %w", err)
+	}
+	if root.UID == "" || !root.DeletionTimestamp.IsZero() || root.Spec.ParentRef != nil || root.Spec.Role != v1beta1.AcceleratorQuotaRoleCohort {
+		return nil, fmt.Errorf("fleet capacity root is not an identified live root")
+	}
+	return root, nil
+}
+
+// identifiedLiveRegistration reports whether a matched registration is named,
+// identified by a UID and not being deleted.
+func identifiedLiveRegistration(cluster v1beta1.WorkloadCluster) bool {
+	return cluster.Name != "" && cluster.UID != "" && cluster.DeletionTimestamp.IsZero()
 }
 
 // pair keys pools and report rows by accelerator resource and hardware flavor.
@@ -135,6 +157,7 @@ func normalize(cluster v1beta1.WorkloadCluster, demand Demand, reports []v1beta1
 	}
 	reading := clusterReading{clusterUID: cluster.UID, rows: clusterRows(reports, cluster.Name), now: now, maxAge: maxAge}
 	sample := Sample{ClusterUID: cluster.UID, DemandFingerprint: demand.Fingerprint, Weight: math.MaxInt64}
+	var first *v1beta1.AcceleratorClusterCapacityStatus
 	for _, key := range sortedKeys(pools) {
 		pool := pools[key]
 		required, exact := wholeUnits(pool.Quantity)
@@ -150,8 +173,11 @@ func normalize(cluster v1beta1.WorkloadCluster, demand Demand, reports []v1beta1
 			return Sample{}, fmt.Errorf("allocatable for %s/%s must be nonnegative whole units within int64", key.resource, key.flavor)
 		}
 		available *= units
-		if len(sample.Pools) > 0 && (sample.Pools[0].ReportUID != row.ReportUID || sample.Pools[0].ReportResourceVersion != row.ReportResourceVersion || sample.Pools[0].Attribution.FlavorSetHash != row.Attribution.FlavorSetHash) {
+		if first != nil && !sameReport(first, row) {
 			return Sample{}, fmt.Errorf("required pools belong to different source reports or attribution mappings")
+		}
+		if first == nil {
+			first = row
 		}
 		sample.Weight = min(sample.Weight, available/required)
 		sample.Pools = append(sample.Pools, Evidence{
@@ -161,6 +187,13 @@ func normalize(cluster v1beta1.WorkloadCluster, demand Demand, reports []v1beta1
 		})
 	}
 	return sample, nil
+}
+
+// sameReport reports whether two rows come from the same report, at the same
+// version and under the same attribution mapping.
+func sameReport(a, b *v1beta1.AcceleratorClusterCapacityStatus) bool {
+	return a.ReportUID == b.ReportUID && a.ReportResourceVersion == b.ReportResourceVersion &&
+		a.Attribution.FlavorSetHash == b.Attribution.FlavorSetHash
 }
 
 // combinePools sums the demand of pools that share a resource and flavor.

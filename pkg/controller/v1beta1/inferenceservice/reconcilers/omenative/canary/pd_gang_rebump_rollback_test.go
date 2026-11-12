@@ -88,7 +88,7 @@ func newPDGangUnit(t *testing.T, name string) *pdGangUnit {
 	return u
 }
 
-// pdGangTargets is the run's pinned pair per member: the router stays on
+// pdGangTargets is the run's recorded pair per member: the router stays on
 // its one revision, the engine and the decoder are pushed from the starting
 // revision to rev.
 func pdGangTargets(rev string) []v1beta1.RolloutRunTarget {
@@ -171,7 +171,7 @@ func (u *pdGangUnit) rollbackTarget(comp v1beta1.ComponentType) string {
 }
 
 // push re-targets the unit the way the run layer and the controller do: the
-// active run is superseded by a fresh one toward rev that carries the
+// active run is replaced by a fresh one toward rev that carries the
 // starting revision as the stable of every pushed member, each pushed
 // member's replica reports the new target, and the bind resets the unit
 // before the executor's pass.
@@ -188,7 +188,7 @@ func (u *pdGangUnit) push(rev string, crRevision int64) {
 			u.t.Fatal(err)
 		}
 	}
-	if err := BindRun(u.ctx, u.c, u.isvc, u.deps.Group, false); err != nil {
+	if err := BindRun(u.ctx, u.c, u.isvc, u.deps.Group, RunOpen{}); err != nil {
 		u.t.Fatal(err)
 	}
 }
@@ -217,7 +217,7 @@ func TestDispatch_PDGangUnitPushedAgainAtTheFirstStepThenRolledBack(t *testing.T
 	}
 	u.dispatch("retargeted")
 	if cs := u.status(); cs.CurrentStep != 0 || cs.RolledBackRevisionHash != "" || u.phase() != v1beta1.RolloutPhasePending {
-		t.Fatalf("the third version re-arms the unit at step 0 with no capacity yet, got phase=%q status=%+v", u.phase(), cs)
+		t.Fatalf("the third version starts the unit again at step 0 with no capacity yet, got phase=%q status=%+v", u.phase(), cs)
 	}
 	for _, comp := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
 		if got := u.rollbackTarget(comp); got != "" {
@@ -226,7 +226,7 @@ func TestDispatch_PDGangUnitPushedAgainAtTheFirstStepThenRolledBack(t *testing.T
 	}
 
 	// The fourth version lands while the third is still forming: the
-	// workload withdraws the third version's replacement and a new one forms
+	// workload removes the third version's replacement and a new one forms
 	// toward the fourth version at the same index.
 	u.push("v4", 4)
 	for _, comp := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
@@ -235,7 +235,7 @@ func TestDispatch_PDGangUnitPushedAgainAtTheFirstStepThenRolledBack(t *testing.T
 	}
 	u.dispatch("retargeted again")
 	if cs := u.status(); cs.CurrentStep != 0 || cs.RolledBackRevisionHash != "" || u.phase() != v1beta1.RolloutPhasePending {
-		t.Fatalf("the fourth version re-arms the unit at step 0 with no capacity yet, got phase=%q status=%+v", u.phase(), cs)
+		t.Fatalf("the fourth version starts the unit again at step 0 with no capacity yet, got phase=%q status=%+v", u.phase(), cs)
 	}
 
 	annotateStored(t, u.c, u.isvc, constants.RolloutRollbackAnnotation, "true")
@@ -253,7 +253,7 @@ func TestDispatch_PDGangUnitPushedAgainAtTheFirstStepThenRolledBack(t *testing.T
 		t.Fatalf("the router, never pushed, is pointed at its own revision, got %q", got)
 	}
 
-	// The workload withdraws the forming fourth-version gangs and rolls the
+	// The workload removes the forming fourth-version gangs and rolls the
 	// second-version gangs back; while any gang is off the starting version
 	// the revert is still in flight.
 	for _, comp := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
@@ -282,7 +282,7 @@ func TestDispatch_PDGangUnitPushedAgainAtTheFirstStepThenRolledBack(t *testing.T
 			t.Fatalf("%s must record the starting version as rolled out after the revert, got %q", comp, got)
 		}
 	}
-	// The hold stands on the next pass: nothing re-arms toward a rejected
+	// The hold stands on the next pass: nothing starts again toward a rejected
 	// version and the request stays spent.
 	u.dispatch("held")
 	if cs := u.status(); u.phase() != v1beta1.RolloutPhaseRolledBack || cs.RolledBackRevisionHash == "" {

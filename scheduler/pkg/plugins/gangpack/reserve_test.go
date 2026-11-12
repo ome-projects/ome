@@ -21,7 +21,7 @@ func TestReserve_PodWithoutGangState_Succeeds(t *testing.T) {
 
 // TestReserve_EachMemberLands_DrainsOneSlotUntilDomainFrees: reserving a gang member (it just got a real node)
 // drains one whole node from its domain reservation, so the capacity another gang
-// sees frees up in step — the hand-off from reserved to placed.
+// sees frees up in step — the switch from reserved to placed.
 func TestReserve_EachMemberLands_DrainsOneSlotUntilDomainFrees(t *testing.T) {
 	g := &GangPack{
 		assignments: placement.New(),

@@ -54,13 +54,13 @@ RawDeployment contributes its primary pod. OMENative and MultiNode gangs
 contribute a leader and the resolved worker count. A declared leader/worker pair
 with size omitted resolves to one worker under the member's defaulting helper.
 Incomplete gangs and unsupported deployment modes return no unit. Component
-replica floors do not affect the per-replica demand fingerprint.
+replica counts do not affect the per-replica demand fingerprint.
 
 RuntimeClass overhead, node selectors, and tolerations are resolved explicitly;
-conflicting authored values return an error. The returned templates otherwise
-precede workload projection and pod admission. Model readiness selectors remain
-in the templates. Aggregate hardware weights do not establish that these
-scheduling constraints can be satisfied.
+conflicting authored values return an error. The rendered templates otherwise
+precede workload projection and pod admission and reach the result only as pod
+sets and demand; model readiness selectors stay in them. Aggregate hardware
+weights do not establish that these scheduling constraints can be satisfied.
 
 `ResolvedUnit.Check` verifies the identified read inputs. Resource versions and
 AcceleratorClass status participate in that check, but do not change the demand
@@ -88,5 +88,5 @@ and version to the capacity reader's fleet evidence, revalidate dependencies and
 registration identity, and prove the member's actual applied/admitted demand.
 The resolver does not infer other admission mutations or prove that a member has
 refreshed its configuration. Placement uses this resolver for member preflight,
-full-home floors, and capacity demand. Local service reconciliation uses its
+full-policy member counts, and capacity demand. Local service reconciliation uses its
 existing path.

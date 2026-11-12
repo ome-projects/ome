@@ -78,3 +78,35 @@ func FindRetryBlock(blocks []RetryBlock, targetRevision string) *RetryBlock {
 	}
 	return nil
 }
+
+// RowOnFailingRevision reports whether the row stands on a revision the
+// retry schedule reads as failing: the revision its attempt converges
+// to, else the one it runs, carries a Held or Backoff RetryBlock (a
+// failed attempt no later attempt has answered) or an attempt in flight
+// that answers a crash this row remembers of its promoted set
+// (RemembersCrash). A revision with no block is sound whatever the row's
+// failure record says: that record also names expired migrations and
+// overdue drains, which say nothing about the revision.
+func RowOnFailingRevision(s *InstanceStatus, blocks []RetryBlock) bool {
+	if s == nil {
+		return false
+	}
+	rev := s.TargetRevision
+	if rev == "" {
+		rev = s.RunningRevision
+	}
+	if rev == "" {
+		return false
+	}
+	b := FindRetryBlock(blocks, rev)
+	if b == nil {
+		return false
+	}
+	switch b.State {
+	case RetryBlockHeld, RetryBlockBackoff:
+		return true
+	case RetryBlockRetryInProgress:
+		return RemembersCrash(s)
+	}
+	return false
+}

@@ -42,6 +42,8 @@ func TestDeriveISVC(t *testing.T) {
 		},
 	}
 
+	src.Annotations[constants.RoutingPublisherOptionAnnotationPrefix+"routingClass"] = "premium"
+
 	d := DeriveISVC(src, "cp-east", "")
 
 	// identity preserved (worker addresses it by the same name/ns).
@@ -67,7 +69,7 @@ func TestDeriveISVC(t *testing.T) {
 	// placement selectors and the rollout operator verbs.
 	for _, k := range []string{
 		AcceleratorRequirementsAnnotation, ClusterSelectorAnnotation,
-		constants.TrafficDrainAnnotation,
+		constants.TrafficDrainAnnotation, constants.RoutingPublisherOptionAnnotationPrefix + "routingClass",
 		constants.RolloutPromoteAnnotation, constants.RolloutPromoteForceAnnotation, constants.RolloutRollbackAnnotation,
 	} {
 		_, has := d.Annotations[k]
@@ -229,4 +231,108 @@ func TestDeriveISVC_LocalQueuePrecedence(t *testing.T) {
 	annotated.Annotations = map[string]string{LocalQueueAnnotation: "per-isvc"}
 	assert.Equal(t, "per-isvc", queueOf(DeriveISVC(annotated, "", "gpu-queue")),
 		"per-ISVC annotation must beat the configured queue")
+}
+
+// TestDeriveISVC_RoutingPublisherOption_MemberUnchanged derives a member from
+// a source with and without the option. The option stays on the source, and
+// both members are identical.
+func TestDeriveISVC_RoutingPublisherOption_MemberUnchanged(t *testing.T) {
+	source := srcISVCMode(v1beta1.PlacementModeSplit, "")
+	source.Annotations = map[string]string{constants.NetworkVisibility: "cluster-local"}
+	withOption := withRoutingPublisherOption(source)
+	member := DeriveISVC(withOption, "cp-east", "serving-lq")
+	if value, present := member.Annotations[routingPublisherOptionKey]; present {
+		t.Fatalf("the option %q reached the member", value)
+	}
+	if diff := cmp.Diff(DeriveISVC(source, "cp-east", "serving-lq"), member); diff != "" {
+		t.Fatalf("the option changed the member (-without +with):\n%s", diff)
+	}
+	if withOption.Annotations[routingPublisherOptionKey] != "premium" {
+		t.Fatal("deriving a member removed the option from the source")
+	}
+}
+
+// A derived copy carries none of the source's server-side state, status or
+// control-plane-only spec; the worker cluster's apiserver assigns its own.
+func TestDeriveISVC_CarriesNoServerSideStateOrStatus(t *testing.T) {
+	now := metav1.Now()
+	src := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc", Namespace: "prod", UID: "uid-123", ResourceVersion: "999", Generation: 7,
+			CreationTimestamp: now, DeletionTimestamp: &now,
+			OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "ConfigMap", Name: "owner", UID: "owner-uid"}},
+			Finalizers:      []string{"ome.io/placement"},
+			ManagedFields:   []metav1.ManagedFieldsEntry{{Manager: "ome", Operation: metav1.ManagedFieldsOperationApply}},
+		},
+		Spec: v1beta1.InferenceServiceSpec{
+			Engine:    &v1beta1.EngineSpec{},
+			Placement: &v1beta1.PlacementSpec{Mode: v1beta1.PlacementModeAll},
+			Routing:   &v1beta1.RoutingSpec{},
+		},
+	}
+	src.Status.ObservedGeneration = 7
+
+	want := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "svc", Namespace: "prod",
+			Labels:      map[string]string{PlacementOriginLabel: "uid-123"},
+			Annotations: map[string]string{PlacementOriginUIDAnnotation: "uid-123"},
+		},
+		Spec: v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}},
+	}
+	if diff := cmp.Diff(want, DeriveISVC(src, "", "")); diff != "" {
+		t.Fatalf("derived copy (-want +got):\n%s", diff)
+	}
+}
+
+// The placement-policy annotation of a derived copy says what the source spec
+// says: written when the spec uses cluster affinity, absent otherwise, whatever
+// the source's own annotation held.
+func TestDeriveISVC_PlacementPolicyAnnotationFollowsTheSpec(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		placement *v1beta1.PlacementSpec
+		annotated string
+		want      string
+	}{
+		{name: "cluster affinity, no annotation", placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity}, want: "ClusterAffinity"},
+		{name: "cluster affinity, annotation of another value", placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicyClusterAffinity}, annotated: "other", want: "ClusterAffinity"},
+		{name: "another policy, stale annotation", placement: &v1beta1.PlacementSpec{Policy: v1beta1.PlacementPolicy("Other")}, annotated: "ClusterAffinity", want: ""},
+		{name: "no placement, stale annotation", annotated: "ClusterAffinity", want: ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			src := &v1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "uid-1"},
+				Spec:       v1beta1.InferenceServiceSpec{Engine: &v1beta1.EngineSpec{}, Placement: tt.placement},
+			}
+			if tt.annotated != "" {
+				src.Annotations = map[string]string{constants.PlacementPolicy: tt.annotated}
+			}
+			got, present := DeriveISVC(src, "", "").Annotations[constants.PlacementPolicy]
+			if got != tt.want || present != (tt.want != "") {
+				t.Fatalf("placement-policy annotation = %q (present %t), want %q", got, present, tt.want)
+			}
+		})
+	}
+}
+
+// The queue label reaches the pods of every component the derived copy
+// declares: the engine, the decoder and the router.
+func TestDeriveISVC_QueueLabelReachesTheRouter(t *testing.T) {
+	src := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod", UID: "uid-1"},
+		Spec: v1beta1.InferenceServiceSpec{
+			Engine: &v1beta1.EngineSpec{}, Decoder: &v1beta1.DecoderSpec{}, Router: &v1beta1.RouterSpec{},
+		},
+	}
+	d := DeriveISVC(src, "", "gpu-queue")
+	for name, labels := range map[string]map[string]string{
+		"engine":  d.Spec.Engine.Labels,
+		"decoder": d.Spec.Decoder.Labels,
+		"router":  d.Spec.Router.Labels,
+	} {
+		if got := labels[constants.KueueQueueLabelKey]; got != "gpu-queue" {
+			t.Errorf("%s queue label = %q, want gpu-queue", name, got)
+		}
+	}
 }

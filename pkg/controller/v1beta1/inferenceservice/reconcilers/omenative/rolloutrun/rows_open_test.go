@@ -34,7 +34,7 @@ func openInlineCanary(t *testing.T) (*v1beta1.InferenceService, *v1beta1.Inferen
 	return isvc, ir
 }
 
-// adoptInlineCanary pins a run around a unit found mid-ladder with no pin.
+// adoptInlineCanary opens a run around a unit found short of its last step with no run on record.
 func adoptInlineCanary(t *testing.T) (*v1beta1.InferenceService, *v1beta1.InferenceReplica) {
 	t.Helper()
 	isvc, ir := isvcFixture(inlineCanary()), divergedIR(oldRev, newRev)
@@ -154,7 +154,7 @@ func TestAPinnedRunContinuesOnItsPin(t *testing.T) {
 			},
 			check: func(t *testing.T, isvc *v1beta1.InferenceService, out Outcome, events []string) {
 				if !emptyOutcome(out) || isvc.Status.Rollout.LastRun != nil {
-					t.Fatalf("outcome = %+v lastRun = %+v, want the pin kept with no decision", out, isvc.Status.Rollout.LastRun)
+					t.Fatalf("outcome = %+v lastRun = %+v, want the run kept with no decision", out, isvc.Status.Rollout.LastRun)
 				}
 			},
 		},
@@ -575,7 +575,7 @@ func TestAnAdoptedRunClosesOnceItsUnitIsDone(t *testing.T) {
 	id := isvc.Status.Rollout.ActiveRun.RunID
 
 	if out := pass(t, isvc, settledIR(newRev)); out.StateChanged {
-		t.Fatalf("ir.converged under a ladder mid-flight closed the run: %+v", out)
+		t.Fatalf("ir.converged under a canary mid-flight closed the run: %+v", out)
 	}
 	requireSameRun(t, isvc, id)
 
@@ -721,27 +721,118 @@ func TestARolledBackCloseKeepsAStableLessMembersRecordAsTheDispatchLeftIt(t *tes
 	}
 }
 
-// A run whose only recorded member left the OMENative mode stays open until
-// a repin. The engine rolls to version 2 under a blueGreen run; the operator
-// switches the engine to another deployment mode and, as admission requires
-// of a member that is not OMENative, takes it out of the rollout group in
-// the same write. The cleanup deletes the engine's replica and clears its
-// OMENative status, the three revision fields with it, and the pin keeps
-// naming the engine. The run layer reads the engine as a member with no
-// replica, never retargeted and never converged: the run stays pinned, and
-// the decoder group that took the engine's place is inert, its diverged
-// member opens nothing. Today the drift view compares progression bodies by
-// group index, so the swap of members under an unchanged body reads InSync,
-// and a repin to that plan is pure cleanup: the annotation goes and the run
-// stays. Only once the operator changes the progression body does a repin
-// replace the pinned groups under the same run; the next pass closes the
-// run Completed, since the new plan pins no recorded member, and the pass
-// after opens a run for the decoder. The record's shape under the pin does
-// not change the reading: the run layer reads none of the history, so a
-// pinned stable the history carries, no stable, and a stable the history
-// does not carry are held the same way.
-func TestARunStaysOpenAfterItsOnlyMemberLeftTheMode(t *testing.T) {
-	const decoderCurrent, decoderTarget = "llm-a-decoder-dddddddd", "llm-a-decoder-eeeeeeee"
+// modesWith is the deployment-mode map the controller resolves for a pass:
+// the engine and the decoder in the OMENative mode, except the Components
+// named as left, which run as RawDeployment.
+func modesWith(left ...v1beta1.ComponentType) map[v1beta1.ComponentType]constants.DeploymentModeType {
+	modes := map[v1beta1.ComponentType]constants.DeploymentModeType{
+		v1beta1.EngineComponent:  constants.OMENative,
+		v1beta1.DecoderComponent: constants.OMENative,
+	}
+	for _, c := range left {
+		modes[c] = constants.RawDeployment
+	}
+	return modes
+}
+
+// passUnderModes is a pass that reads the given deployment modes.
+func passUnderModes(t *testing.T, isvc *v1beta1.InferenceService, modes map[v1beta1.ComponentType]constants.DeploymentModeType, objects ...runtime.Object) (Outcome, []string) {
+	t.Helper()
+	return passWith(t, isvc, func(in *Inputs) { in.ComponentDeploymentModes = modes }, objects...)
+}
+
+// withDecoder declares a decoder beside the fixture's engine.
+func withDecoder(isvc *v1beta1.InferenceService) *v1beta1.InferenceService {
+	one := 1
+	isvc.Spec.Decoder = &v1beta1.DecoderSpec{ComponentExtensionSpec: v1beta1.ComponentExtensionSpec{MinReplicas: &one}}
+	return isvc
+}
+
+const decoderCurrentRev, decoderTargetRev = "llm-a-decoder-dddddddd", "llm-a-decoder-eeeeeeee"
+
+// pairStart opens a run over an engine and a decoder in one group, both
+// diverged: fresh over a blueGreen group, or adopted around the engine's
+// canary record short of its last step.
+type pairStart func(t *testing.T) (*v1beta1.InferenceService, *v1beta1.InferenceReplica, *v1beta1.InferenceReplica)
+
+var pairStarts = map[string]pairStart{
+	"Open": func(t *testing.T) (*v1beta1.InferenceService, *v1beta1.InferenceReplica, *v1beta1.InferenceReplica) {
+		t.Helper()
+		isvc := withDecoder(isvcFixture(v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}}))
+		engine, decoder := divergedIR(oldRev, newRev), divergedDecoderIR()
+		if out := pass(t, isvc, engine, decoder); !out.Opened || out.Adopted {
+			t.Fatalf("fixture: %+v, want a fresh open", out)
+		}
+		return isvc, engine, decoder
+	},
+	"Adopted": func(t *testing.T) (*v1beta1.InferenceService, *v1beta1.InferenceReplica, *v1beta1.InferenceReplica) {
+		t.Helper()
+		isvc := withDecoder(isvcFixture(v1beta1.RolloutGroup{Components: []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent}, Canary: canaryBody(10, 100)}))
+		setEngineUnit(isvc, v1beta1.RolloutPhaseCanarying, midLadderRecord(t))
+		engine, decoder := divergedIR(oldRev, newRev), divergedDecoderIR()
+		if out := pass(t, isvc, engine, decoder); !out.Opened || !out.Adopted {
+			t.Fatalf("fixture: %+v, want an adopted open", out)
+		}
+		return isvc, engine, decoder
+	},
+}
+
+// divergedDecoderIR is the decoder's replica with its target moved off its
+// current revision and nothing rolled yet.
+func divergedDecoderIR() *v1beta1.InferenceReplica {
+	ir := namedIR("llm-a-decoder", decoderCurrentRev, decoderTargetRev)
+	ir.Status.Replicas, ir.Status.UpdatedReplicas = 2, 0
+	return ir
+}
+
+// settledDecoderIR is the decoder's replica resting on one revision.
+func settledDecoderIR(rev string) *v1beta1.InferenceReplica {
+	ir := namedIR("llm-a-decoder", rev, rev)
+	ir.Status.Replicas, ir.Status.UpdatedReplicas = 2, 2
+	return ir
+}
+
+// engineConverged is the engine's replica settled on newRev; under a canary
+// start the unit's record reads done and the phase Stable, as the executor
+// leaves them once the cutover lands.
+func engineConverged(t *testing.T, isvc *v1beta1.InferenceService) *v1beta1.InferenceReplica {
+	t.Helper()
+	if cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent); cs != nil {
+		cs.CurrentStep = 2
+		setEngineUnit(isvc, v1beta1.RolloutPhaseStable, cs)
+	}
+	return settledIR(newRev)
+}
+
+// requireClosed checks that no run is open and the last run closed with
+// the outcome.
+func requireClosed(t *testing.T, isvc *v1beta1.InferenceService, outcome v1beta1.RolloutRunOutcome) *v1beta1.RolloutRunRecord {
+	t.Helper()
+	if v1beta1.RolloutRunActive(isvc) {
+		t.Fatalf("a run is still open: %+v", isvc.Status.Rollout.ActiveRun)
+	}
+	last := isvc.Status.Rollout.LastRun
+	if last == nil || last.Outcome != outcome {
+		t.Fatalf("lastRun = %+v, want %s", last, outcome)
+	}
+	return last
+}
+
+// A run whose only recorded member leaves the OMENative mode closes. The
+// engine rolls to version 2 under a run; the operator switches the engine
+// to another deployment mode and, as admission requires of a member that
+// is not OMENative, takes it out of the rollout group in the same write,
+// putting a decoder group in its place. Nothing of the engine can retarget
+// or converge again: the cleanup deletes its replica. So the run layer
+// reads the engine as departed from the deployment modes resolved for the
+// pass and closes the run as replaced on that pass, ahead of the cleanup
+// and without reading the engine's replica. The record's shape under the
+// run does not change the reading: a stable the history carries, no
+// stable, and a stable the history does not carry close the same way, as
+// does a run adopted around the engine's canary. The next pass finds
+// nothing to roll, and the decoder's own push then opens the decoder
+// group's run.
+func TestARunClosesOnceItsOnlyMemberLeftTheMode(t *testing.T) {
 	const unretainedRev = "llm-a-engine-0badc0de"
 	firstRollout := func() *v1beta1.InferenceReplica {
 		ir := irFixture("", newRev)
@@ -749,24 +840,29 @@ func TestARunStaysOpenAfterItsOnlyMemberLeftTheMode(t *testing.T) {
 		return ir
 	}
 	shapes := []struct {
-		name   string
-		open   func(isvc *v1beta1.InferenceService) *v1beta1.InferenceReplica
-		stable string
+		name    string
+		group   v1beta1.RolloutGroup
+		open    func(isvc *v1beta1.InferenceService) *v1beta1.InferenceReplica
+		stable  string
+		adopted bool
 	}{
 		{
-			name:   "a pinned stable the history carries",
+			name:   "Open/a stable the history carries",
+			group:  inlineBlueGreen(),
 			open:   func(*v1beta1.InferenceService) *v1beta1.InferenceReplica { return divergedIR(oldRev, newRev) },
 			stable: hashOf(t, oldRev),
 		},
 		{
 			// The engine's first rollout: no current revision and nothing on record.
-			name:   "no stable",
+			name:   "Open/no stable",
+			group:  inlineBlueGreen(),
 			open:   func(*v1beta1.InferenceService) *v1beta1.InferenceReplica { return firstRollout() },
 			stable: "",
 		},
 		{
 			// No current revision; the record names a hash no ControllerRevision carries.
-			name: "a stable the history does not carry",
+			name:  "Open/a stable the history does not carry",
+			group: inlineBlueGreen(),
 			open: func(isvc *v1beta1.InferenceService) *v1beta1.InferenceReplica {
 				isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{
 					v1beta1.EngineComponent: {LatestRolledoutRevision: unretainedRev},
@@ -775,68 +871,163 @@ func TestARunStaysOpenAfterItsOnlyMemberLeftTheMode(t *testing.T) {
 			},
 			stable: hashOf(t, unretainedRev),
 		},
+		{
+			name:  "Adopted",
+			group: inlineCanary(),
+			open: func(isvc *v1beta1.InferenceService) *v1beta1.InferenceReplica {
+				setEngineUnit(isvc, v1beta1.RolloutPhaseCanarying, midLadderRecord(t))
+				return divergedIR(oldRev, newRev)
+			},
+			stable:  hashOf(t, oldRev),
+			adopted: true,
+		},
 	}
 	for _, shape := range shapes {
 		t.Run(shape.name, func(t *testing.T) {
-			isvc := isvcFixture(inlineBlueGreen())
-			if out := pass(t, isvc, shape.open(isvc)); !out.Opened {
-				t.Fatalf("fixture: %+v, want a fresh open", out)
+			isvc := withDecoder(isvcFixture(shape.group))
+			engine := shape.open(isvc)
+			if out := pass(t, isvc, engine); !out.Opened || out.Adopted != shape.adopted {
+				t.Fatalf("fixture: %+v, want an open with adopted=%v", out, shape.adopted)
 			}
 			id := requirePinned(t, isvc).RunID
 			if got := pinnedTargetFor(t, requirePinned(t, isvc), v1beta1.EngineComponent); got.Revision != hashOf(t, newRev) || got.StableRevision != shape.stable {
-				t.Fatalf("fixture pinned %+v, want %s over stable %q", got, hashOf(t, newRev), shape.stable)
+				t.Fatalf("fixture recorded %+v, want %s over stable %q", got, hashOf(t, newRev), shape.stable)
 			}
-			// The engine leaves the mode: it is taken out of the rollout group
-			// and a decoder group takes its place, its replica is deleted and
-			// its OMENative status is cleared.
+			// The engine leaves the mode: taken out of the rollout group, a
+			// decoder group in its place. The run layer runs ahead of the
+			// cleanup, so the engine's replica and status are still there.
 			isvc.Spec.Rollout.Groups = []v1beta1.RolloutGroup{{Components: []v1beta1.ComponentType{v1beta1.DecoderComponent}, BlueGreen: &v1beta1.GroupBlueGreen{}}}
+			decoder := settledDecoderIR(decoderCurrentRev)
+			out, events := passUnderModes(t, isvc, modesWith(v1beta1.EngineComponent), engine, decoder)
+			if !out.StateChanged || out.Opened || out.Parked {
+				t.Fatalf("the switch pass: outcome = %+v, want the run closed", out)
+			}
+			last := requireClosed(t, isvc, v1beta1.RolloutRunSuperseded)
+			if got := pinnedRevision(last.TargetRevisions, v1beta1.EngineComponent); got != hashOf(t, newRev) {
+				t.Fatalf("the record names the engine at %q, want %s", got, hashOf(t, newRev))
+			}
+			requireNoRun(t, isvc, v1beta1.RolloutPlanReasonNoRun)
+			requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+			if !hasEvent(events, EventRunClosed) || !hasEvent(events, "left the OMENative mode") {
+				t.Fatalf("events = %v, want the close naming the engine that left the mode", events)
+			}
+			// The cleanup deletes the engine's replica and clears its status.
 			if isvc.Status.Components == nil {
 				isvc.Status.Components = map[v1beta1.ComponentType]v1beta1.ComponentStatusSpec{}
 			}
 			isvc.Status.Components[v1beta1.EngineComponent] = v1beta1.ComponentStatusSpec{}
-			decoder := namedIR("llm-a-decoder", decoderCurrent, decoderTarget)
-			for i := 1; i <= 2; i++ {
-				out := pass(t, isvc, decoder)
-				if out.Opened || out.StateChanged || out.Parked {
-					t.Fatalf("pass %d after the mode switch: outcome = %+v, want the run left open", i, out)
-				}
-				if got := pinnedTargetFor(t, requireSameRun(t, isvc, id), v1beta1.EngineComponent); got.Revision != hashOf(t, newRev) || got.StableRevision != shape.stable {
-					t.Fatalf("pass %d moved the engine's pin: %+v", i, got)
-				}
-				// The swap of members under an unchanged body is no drift today.
-				requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+			// The pass after the close finds nothing to roll: the decoder's
+			// pair agrees and no record is left to adopt.
+			if out, _ := passUnderModes(t, isvc, modesWith(v1beta1.EngineComponent), decoder); !emptyOutcome(out) || v1beta1.RolloutRunActive(isvc) {
+				t.Fatalf("the pass after the close: outcome = %+v, want nothing opened", out)
 			}
-			// A repin to the same body is pure cleanup: the run stays as it is.
+			if id == "" || isvc.Status.Rollout.LastRun.Outcome != v1beta1.RolloutRunSuperseded {
+				t.Fatalf("the close was rewritten: %+v", isvc.Status.Rollout.LastRun)
+			}
+			// The decoder's push opens the decoder group's own run.
+			if out, _ := passUnderModes(t, isvc, modesWith(v1beta1.EngineComponent), divergedDecoderIR()); !out.Opened {
+				t.Fatalf("the decoder's push: outcome = %+v, want a run opened for the decoder", out)
+			}
+			run := requirePinned(t, isvc)
+			if run.RunID == id || len(run.TargetRevisions) != 1 {
+				t.Fatalf("the fresh run = %+v, want a new run over the decoder alone", run)
+			}
+			if got := pinnedTargetFor(t, run, v1beta1.DecoderComponent); got.Revision != hashOf(t, decoderTargetRev) || got.StableRevision != hashOf(t, decoderCurrentRev) {
+				t.Fatalf("the fresh run records %+v, want the decoder at %s over %s", got, hashOf(t, decoderTargetRev), hashOf(t, decoderCurrentRev))
+			}
+		})
+	}
+}
+
+// A run with two recorded members is decided on the one that stays in the
+// mode. The engine and the decoder roll to version 2 in one group; the
+// operator switches the decoder to another deployment mode and takes it
+// out of the group. The run stays open under drift, since the group lost a
+// member, and the decoder is read neither for freshness nor for the close:
+// its replica, still being deleted with a projection generation behind the
+// service, holds no pass. Once the engine converges the run closes
+// Completed.
+func TestARunIsDecidedOnTheMembersThatStayedInTheMode(t *testing.T) {
+	for name, start := range pairStarts {
+		t.Run(name, func(t *testing.T) {
+			isvc, engine, decoder := start(t)
+			id := requirePinned(t, isvc).RunID
+			isvc.Spec.Rollout.Groups[0].Components = []v1beta1.ComponentType{v1beta1.EngineComponent}
+			isvc.Generation = 3
+			decoder.Annotations = map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: "2"}
+			out, _ := passUnderModes(t, isvc, modesWith(v1beta1.DecoderComponent), engine, decoder)
+			if out.StateChanged || out.Opened || out.RequeueAfter != 0 {
+				t.Fatalf("the switch pass: outcome = %+v, want the run kept with no wait on the decoder", out)
+			}
+			requireSameRun(t, isvc, id)
+			requireDrift(t, isvc, corev1.ConditionTrue, v1beta1.RolloutPlanDriftReasonSpecNewerThanRun)
+			// The engine converges; the decoder is not waited on.
+			out, _ = passUnderModes(t, isvc, modesWith(v1beta1.DecoderComponent), engineConverged(t, isvc), decoder)
+			if !out.StateChanged || out.Opened {
+				t.Fatalf("the engine's convergence: outcome = %+v, want the run closed", out)
+			}
+			requireClosed(t, isvc, v1beta1.RolloutRunCompleted)
+		})
+	}
+}
+
+// A group whose members change under an unchanged progression body is
+// drift, and a plan reread takes it. The engine and the decoder roll to
+// version 2 in one group; the operator takes the decoder out of the group,
+// both still OMENative. The digests cover the bodies alone, so the drift
+// reads the members: RolloutPlanDrift names the members before and after.
+// A plan reread replaces the plan under the same run with the members the
+// spec names now, and the decoder, in no recorded group any more, is no
+// longer read: the run closes Completed once the engine converges, and the
+// decoder's divergence, in no group, opens nothing.
+func TestAMemberSwapUnderAnUnchangedBodyIsDriftAndAPlanRereadTakesIt(t *testing.T) {
+	for name, start := range pairStarts {
+		t.Run(name, func(t *testing.T) {
+			isvc, engine, decoder := start(t)
+			run := requirePinned(t, isvc)
+			id, recordedAt, oldDigest := run.RunID, run.PinnedAt, run.Plan.Groups[0].PortableDigest
+			isvc.Spec.Rollout.Groups[0].Components = []v1beta1.ComponentType{v1beta1.EngineComponent}
+			out, _ := passUnderModes(t, isvc, modesWith(), engine, decoder)
+			if out.StateChanged || out.Opened {
+				t.Fatalf("the swap: outcome = %+v, want the run kept under drift", out)
+			}
+			requireSameRun(t, isvc, id)
+			requireDrift(t, isvc, corev1.ConditionTrue, v1beta1.RolloutPlanDriftReasonSpecNewerThanRun)
+			if msg := driftCondition(isvc).Message; !strings.Contains(msg, "members changed from [engine, decoder] to [engine]") {
+				t.Fatalf("drift message = %q, want the members before and after", msg)
+			}
+			// A plan reread takes the swap: the plan is replaced under the same run.
 			annotate(isvc, constants.RolloutRepinAnnotation, "now")
-			if out := passAt(t, isvc, time.Unix(2000, 0), decoder); out.StateChanged || out.Opened {
-				t.Fatalf("repin to the same body: outcome = %+v, want nothing changed", out)
+			out, events := passWith(t, isvc, func(in *Inputs) {
+				in.Now = time.Unix(2000, 0)
+				in.ComponentDeploymentModes = modesWith()
+			}, engine, decoder)
+			if !out.StateChanged || out.Opened {
+				t.Fatalf("the plan reread: outcome = %+v, want the plan replaced", out)
 			}
 			if _, still := isvc.Annotations[constants.RolloutRepinAnnotation]; still {
-				t.Fatal("the cleanup repin left its annotation")
+				t.Fatal("the plan reread left its annotation")
 			}
-			requireSameRun(t, isvc, id)
-			// The way out today: a changed progression body, which the drift
-			// view reports, then a repin, which the next pass closes Completed,
-			// and the pass after opens the decoder's run.
-			isvc.Spec.Rollout.Groups[0].BlueGreen = nil
-			isvc.Spec.Rollout.Groups[0].RollingUpdate = &v1beta1.GroupRollingUpdate{}
-			if out := pass(t, isvc, decoder); out.StateChanged || out.Opened {
-				t.Fatalf("the body edit: outcome = %+v, want the run left open under drift", out)
+			run = requireSameRun(t, isvc, id)
+			if !run.PinnedAt.After(recordedAt.Time) || run.Plan.Groups[0].PortableDigest != oldDigest || !sameMembers(run.Plan.Groups[0].Group.Components, []v1beta1.ComponentType{v1beta1.EngineComponent}) {
+				t.Fatalf("run = %+v, want the same body recorded again over the engine alone", run)
 			}
-			requireDrift(t, isvc, corev1.ConditionTrue, v1beta1.RolloutPlanDriftReasonSpecNewerThanRun)
-			annotate(isvc, constants.RolloutRepinAnnotation, "now")
-			if out := passAt(t, isvc, time.Unix(3000, 0), decoder); !out.StateChanged || out.Opened {
-				t.Fatalf("repin to the new body: outcome = %+v, want the plan replaced under the same run", out)
+			if !hasEvent(events, EventPlanRepinned) || !hasEvent(events, "members are now groups[0]=[engine]") {
+				t.Fatalf("events = %v, want the plan reread naming the members", events)
 			}
-			requireSameRun(t, isvc, id)
-			if out := pass(t, isvc, decoder); !out.StateChanged || v1beta1.RolloutRunActive(isvc) || isvc.Status.Rollout.LastRun == nil || isvc.Status.Rollout.LastRun.Outcome != v1beta1.RolloutRunCompleted {
-				t.Fatalf("the pass after the repin: outcome = %+v, last run %+v, want the run closed Completed", out, isvc.Status.Rollout.LastRun)
+			if out, _ := passUnderModes(t, isvc, modesWith(), engine, decoder); out.StateChanged || out.Opened {
+				t.Fatalf("the pass after the plan reread: outcome = %+v, want the run kept", out)
 			}
-			if out := pass(t, isvc, decoder); !out.Opened {
-				t.Fatalf("the pass after the close: outcome = %+v, want a run opened for the decoder", out)
+			requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+			// The engine converges: the decoder, in no recorded group, is not waited on.
+			out, _ = passUnderModes(t, isvc, modesWith(), engineConverged(t, isvc), decoder)
+			if !out.StateChanged || out.Opened {
+				t.Fatalf("the engine's convergence: outcome = %+v, want the run closed", out)
 			}
-			if got := pinnedTargetFor(t, requirePinned(t, isvc), v1beta1.DecoderComponent); got.Revision != hashOf(t, decoderTarget) {
-				t.Fatalf("the fresh run pins %+v, want the decoder at %s", got, hashOf(t, decoderTarget))
+			requireClosed(t, isvc, v1beta1.RolloutRunCompleted)
+			// The decoder diverges in no group: nothing opens for it.
+			if out, _ := passUnderModes(t, isvc, modesWith(), settledIR(newRev), decoder); out.Opened || v1beta1.RolloutRunActive(isvc) {
+				t.Fatalf("the pass after the close: outcome = %+v, want nothing opened for an ungrouped decoder", out)
 			}
 		})
 	}
@@ -1065,4 +1256,16 @@ func TestASequentialPlanWithNoBodiesReadsAnEditedBodyAsDriftUntilTheReread(t *te
 		t.Fatalf("the pass after the reread: outcome = %+v, want nothing decided", out)
 	}
 	requireDrift(t, isvc, corev1.ConditionFalse, v1beta1.RolloutPlanDriftReasonInSync)
+}
+
+// A member still in the OMENative mode whose replica is missing keeps the
+// run open: the projector recreates the replica, and only a member that
+// left the mode is read as departed.
+func TestAMissingReplicaOfAMemberStillInTheModeKeepsTheRunOpen(t *testing.T) {
+	isvc, _ := openInlineCanary(t)
+	id := requirePinned(t, isvc).RunID
+	if out, _ := passUnderModes(t, isvc, modesWith()); !emptyOutcome(out) || isvc.Status.Rollout.LastRun != nil {
+		t.Fatalf("outcome = %+v lastRun = %+v, want the run kept with no decision", out, isvc.Status.Rollout.LastRun)
+	}
+	requireSameRun(t, isvc, id)
 }

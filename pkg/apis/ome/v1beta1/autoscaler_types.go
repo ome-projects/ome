@@ -144,7 +144,11 @@ type ProportionalPolicy struct {
 	// A follower's minReplicas is a floor on the count it is given. Its
 	// maxReplicas, when set, is a ceiling; a follower that sets none has no
 	// ceiling of its own, and the anchor's bounds cap its count. The status
-	// reports a follower as clamped when either bound moved its target.
+	// reports a follower as clamped when either bound moved its target. A
+	// follower taken out of the ratios, or every follower when the policy is
+	// removed, keeps the count it carries: its own autoscaler owns the count
+	// when it has one; with autoscaler class None the status reports it as
+	// released and the count stands until its minReplicas is edited.
 	// +optional
 	Ratios map[ComponentType]resource.Quantity `json:"ratios,omitempty"`
 }

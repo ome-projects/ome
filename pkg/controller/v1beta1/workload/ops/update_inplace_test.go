@@ -28,6 +28,8 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
+	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -1906,5 +1908,179 @@ func TestUpdateInPlace_RevertBeforeTheForwardPatchIsRecordedRemovesItsAnnotation
 	}
 	if value, present := getPod().Annotations[annotationKey]; present {
 		t.Fatalf("the pod is Ready on version 1 and still carries version 2's template annotation %s=%s", annotationKey, value)
+	}
+}
+
+// pairingRevision stores a ControllerRevision of the given name whose
+// payload records spec under the given pairing protocol, the shape the
+// adapter mints for a prefill or decoder of a service whose rollout names
+// one.
+func pairingRevision(t *testing.T, c client.Client, isvc *v1beta1.InferenceService, name, protocol string, spec *corev1.PodSpec) *appsv1.ControllerRevision {
+	t.Helper()
+	raw, err := json.Marshal(revision.DataPayload{PodSpec: spec, PairingProtocol: &protocol})
+	if err != nil {
+		t.Fatalf("marshal revision payload: %v", err)
+	}
+	cr := &appsv1.ControllerRevision{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: isvc.Namespace},
+		Data:       runtime.RawExtension{Raw: raw},
+	}
+	if err := c.Create(context.Background(), cr); err != nil {
+		t.Fatalf("create ControllerRevision %s: %v", name, err)
+	}
+	return cr
+}
+
+// A pairing-protocol change patches a prefill in place. The coordination
+// gate admits the patch once a decoder serves the new protocol, the pod is
+// relabelled onto it and serves beside that decoder, and the promote lands
+// on a later pass. When the spec names another protocol before that pass,
+// the attempt finishes on the revision the gate admitted and the Instance
+// rolls toward the newer protocol from there, through the gate again: a
+// pod moved straight to the newer protocol would serve beside no decoder
+// of it (on a one-by-one service, until the decoder's next replacement
+// serves). The same holds for a change taken back to the
+// first protocol. A retarget that keeps the protocol, and one over a pod
+// out of rotation, follow the target as every retarget does.
+func TestUpdateWithPods_InPlaceRetargetAcrossPairingProtocolsFinishesOnTheAdmittedRevision(t *testing.T) {
+	const running, admitted = "llama-70b-engine-v1hash", "llama-70b-engine-v2hash"
+	spec := legacyTargetSpecImage("test:v1")
+	cases := []struct {
+		name string
+		// target is the roll target of the pass, minted by the case.
+		target func(t *testing.T, c client.Client, isvc *v1beta1.InferenceService) (*appsv1.ControllerRevision, *corev1.PodSpec)
+		// serving is whether the pod relabelled onto the admitted revision
+		// is in rotation when the pass runs.
+		serving bool
+		// keepsAdmitted is whether the attempt finishes on the admitted
+		// revision; else it follows the target.
+		keepsAdmitted bool
+	}{
+		{
+			name: "a third protocol",
+			target: func(t *testing.T, c client.Client, isvc *v1beta1.InferenceService) (*appsv1.ControllerRevision, *corev1.PodSpec) {
+				return pairingRevision(t, c, isvc, "llama-70b-engine-v3hash", "pair-v3", spec), spec
+			},
+			serving:       true,
+			keepsAdmitted: true,
+		},
+		{
+			name: "back to the first protocol",
+			target: func(t *testing.T, c client.Client, isvc *v1beta1.InferenceService) (*appsv1.ControllerRevision, *corev1.PodSpec) {
+				cr := &appsv1.ControllerRevision{}
+				if err := c.Get(context.Background(), client.ObjectKey{Namespace: isvc.Namespace, Name: running}, cr); err != nil {
+					t.Fatalf("get the running revision: %v", err)
+				}
+				return cr, spec
+			},
+			serving:       true,
+			keepsAdmitted: true,
+		},
+		{
+			name: "a new image under the same protocol",
+			target: func(t *testing.T, c client.Client, isvc *v1beta1.InferenceService) (*appsv1.ControllerRevision, *corev1.PodSpec) {
+				newer := legacyTargetSpecImage("test:v2")
+				return pairingRevision(t, c, isvc, "llama-70b-engine-v3hash", "pair-v2", newer), newer
+			},
+			serving: true,
+		},
+		{
+			name: "a third protocol over a pod out of rotation",
+			target: func(t *testing.T, c client.Client, isvc *v1beta1.InferenceService) (*appsv1.ControllerRevision, *corev1.PodSpec) {
+				return pairingRevision(t, c, isvc, "llama-70b-engine-v3hash", "pair-v3", spec), spec
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			legacyResetExpectations(t)
+			isvc, ir := fixture.ServiceWithReadyInstance("llama-70b", "prod", 1)
+			isvc.Spec.Engine.ComponentExtensionSpec.Lifecycle = &v1beta1.LifecycleSpec{
+				UpdateStrategy: &v1beta1.UpdateStrategy{Type: v1beta1.UpdateStrategyInPlaceIfPossible},
+			}
+			// The attempt the gate admitted: opened on the pair-v2 revision,
+			// its pod already relabelled onto it.
+			row := &ir.Status.InstanceStatuses[0]
+			row.Phase = v1beta1.OMENativeInstanceUpdating
+			row.RunningRevision, row.TargetRevision = running, admitted
+			row.PodCount, row.ServingPodCount = 1, 1
+			row.Operation = &v1beta1.InstanceOperation{
+				ID:             "update-0-1",
+				Type:           v1beta1.InstanceOperationUpdate,
+				Step:           workload.UpdateStepInPlace,
+				TargetRevision: admitted,
+				Strategy:       string(v1beta1.UpdateStrategyInPlaceIfPossible),
+				StartedAt:      metav1.NewTime(time.Now().Add(-time.Minute)),
+				LastProgressAt: metav1.NewTime(time.Now().Add(-time.Minute)),
+				Deadline:       metav1.NewTime(time.Now().Add(29 * time.Minute)),
+			}
+			pod := legacyRunningPodAtRevision(isvc, 0, 1, "test:v1")
+			pod.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(admitted)
+			pod.Labels[query.LabelPairingProtocol] = "pair-v2"
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "main", Image: "test:v1", Ready: true}}
+			if !tc.serving {
+				for i := range pod.Status.Conditions {
+					if pod.Status.Conditions[i].Type == query.ServingConditionType || pod.Status.Conditions[i].Type == corev1.PodReady {
+						pod.Status.Conditions[i].Status = corev1.ConditionFalse
+					}
+				}
+			}
+			c := legacyNewFakeClient(t, isvc, ir, pod)
+			pairingRevision(t, c, isvc, running, "pair-v1", spec)
+			pairingRevision(t, c, isvc, admitted, "pair-v2", spec)
+			target, targetSpec := tc.target(t, c, isvc)
+
+			in := legacyTestInput(isvc, c, workload.ComponentEngine)
+			in.ObservedState.UpdateRevision = target.Name
+			rec := record.NewFakeRecorder(16)
+			deps := legacyTestDeps(c)
+			deps.Recorder = rec
+			plan := legacyComponentPlan(workload.UpdateStrategyInPlaceIfPossible, nil)
+			done, err := UpdateWithPods(context.Background(), deps, in, plan, plan.Instances[0], target, targetSpec, []*corev1.Pod{pod})
+			if err != nil {
+				t.Fatalf("UpdateWithPods: %v", err)
+			}
+			if done {
+				t.Fatalf("the roll toward %s is not done", target.Name)
+			}
+
+			stored := legacyInstanceStatusesOnIR(c, isvc, workload.ComponentEngine)[0]
+			fresh := &corev1.Pod{}
+			if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), fresh); err != nil {
+				t.Fatalf("get pod: %v", err)
+			}
+			var events []string
+			for len(rec.Events) > 0 {
+				events = append(events, <-rec.Events)
+			}
+			kept := false
+			for _, e := range events {
+				if strings.Contains(e, string(workload.EventReasonInPlaceKeptForPairing)) {
+					kept = true
+				}
+			}
+			if !tc.keepsAdmitted {
+				if stored.Operation == nil || stored.Operation.TargetRevision != target.Name {
+					t.Fatalf("the attempt must follow the target %s: row %+v", target.Name, stored)
+				}
+				if kept {
+					t.Fatalf("no revision was kept for pairing: %v", events)
+				}
+				return
+			}
+			if stored.Phase != v1beta1.OMENativeInstanceReady || stored.RunningRevision != admitted || stored.Operation != nil {
+				t.Fatalf("the attempt must finish on the admitted revision %s and promote: phase=%s running=%s operation=%+v",
+					admitted, stored.Phase, stored.RunningRevision, stored.Operation)
+			}
+			if got := fresh.Labels[query.LabelPairingProtocol]; got != "pair-v2" {
+				t.Fatalf("the pod must keep the protocol the gate admitted it onto, pair-v2, until the gate admits the next one: %q", got)
+			}
+			if got, want := fresh.Labels[query.LabelRevisionHash], query.RevisionHashFromControllerRevisionName(admitted); got != want {
+				t.Fatalf("the pod must stay on the admitted revision %s: label %q", want, got)
+			}
+			if !kept {
+				t.Fatalf("the pass must say why the Instance promotes onto a revision the spec no longer names: %v", events)
+			}
+		})
 	}
 }

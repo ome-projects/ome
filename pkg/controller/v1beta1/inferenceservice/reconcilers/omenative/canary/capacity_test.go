@@ -41,14 +41,14 @@ func TestDesiredReplicas(t *testing.T) {
 	}
 }
 
-// rearmedFinalStep is an engine canary re-armed onto a fixed image after its
-// first target parked on an image that never started: the run toward the
-// fixed revision is pinned, the ladder sits at its final step with the first
+// freshStartFinalStep is an engine canary started again onto a fixed image after its
+// first target stopped on an image that never started: the run toward the
+// fixed revision is recorded, the canary sits at its final step with the first
 // step's split still programmed, the capacity wait began longer ago than the
 // plan's ready timeout, and the replica has rolled every Instance onto the
 // fixed revision and promoted it. lagging is how many of those Instances'
 // pods the pod view does not yet report Ready.
-func rearmedFinalStep(t *testing.T, name string, lagging int) (*v1beta1.InferenceService, DispatchDeps) {
+func freshStartFinalStep(t *testing.T, name string, lagging int) (*v1beta1.InferenceService, DispatchDeps) {
 	t.Helper()
 	ns := "default"
 	const replicas = 8
@@ -98,7 +98,7 @@ func rearmedFinalStep(t *testing.T, name string, lagging int) (*v1beta1.Inferenc
 			RunningRevision: engineIR.Status.UpdateRevision, PodCount: 1, ServingPodCount: 1, AvailablePodCount: 1,
 		}
 		// The Instances the first target surged keep its failure on record
-		// and serve from the surge ordinal.
+		// and serve from the surge pod's slot (index 1).
 		ordinal := "0"
 		if i >= replicas/2 {
 			ordinal = "1"
@@ -121,7 +121,7 @@ func rearmedFinalStep(t *testing.T, name string, lagging int) (*v1beta1.Inferenc
 }
 
 // expectFinalStepCutover asserts one pass moved the final step's traffic
-// onto the canary revision without parking, and that the drain window then
+// onto the canary revision without stopping, and that the drain window then
 // completes the canary.
 func expectFinalStepCutover(t *testing.T, isvc *v1beta1.InferenceService, deps DispatchDeps) {
 	t.Helper()
@@ -131,7 +131,7 @@ func expectFinalStepCutover(t *testing.T, isvc *v1beta1.InferenceService, deps D
 	}
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.Failed != nil {
-		t.Fatalf("a replica serving every Instance on the canary revision must not park, got %+v", cs.Failed)
+		t.Fatalf("a replica serving every Instance on the canary revision must not stop, got %+v", cs.Failed)
 	}
 	if got := phaseOf(isvc); got != v1beta1.RolloutPhasePromoting {
 		t.Fatalf("the final step must shift traffic onto the canary revision, got phase %q", got)
@@ -221,7 +221,7 @@ func TestDispatch_RowsOnePassBehindReadyPodsWakeAtTheStepCadence(t *testing.T) {
 // before the fleet finished rolling. A capacity timeout is a verdict on
 // capacity that never arrived, never on capacity that is serving.
 func TestDispatch_FullyRolledReplicaCutsOverAtTheFinalStep(t *testing.T) {
-	isvc, deps := rearmedFinalStep(t, "rearm", 0)
+	isvc, deps := freshStartFinalStep(t, "again", 0)
 	expectFinalStepCutover(t, isvc, deps)
 }
 
@@ -230,7 +230,7 @@ func TestDispatch_FullyRolledReplicaCutsOverAtTheFinalStep(t *testing.T) {
 // folded the last surge pods' readiness gates neither holds the step nor
 // spends the capacity budget on capacity that is already serving.
 func TestDispatch_FinalStepCountsServingInstancesOverALaggingPodView(t *testing.T) {
-	isvc, deps := rearmedFinalStep(t, "rearm-lag", 2)
+	isvc, deps := freshStartFinalStep(t, "again-lag", 2)
 	expectFinalStepCutover(t, isvc, deps)
 }
 
@@ -239,7 +239,7 @@ func TestDispatch_FinalStepCountsServingInstancesOverALaggingPodView(t *testing.
 // and no pre-canary identity.
 func finishedUnit(t *testing.T, name string) (*v1beta1.InferenceService, DispatchDeps) {
 	t.Helper()
-	isvc, deps := rearmedFinalStep(t, name, 0)
+	isvc, deps := freshStartFinalStep(t, name, 0)
 	expectFinalStepCutover(t, isvc, deps)
 	isvc.Status.Rollout.LastRun = &v1beta1.RolloutRunRecord{
 		Outcome:         v1beta1.RolloutRunCompleted,
@@ -272,7 +272,7 @@ func expectFinishedUnitUntouched(t *testing.T, isvc *v1beta1.InferenceService, o
 // as the done sentinel on the next pass: nothing re-runs, the stable identity
 // stays dropped and the pass asks for nothing more.
 func TestDispatch_FinishedUnitReadsANegativeStepBackAsTheSentinel(t *testing.T) {
-	isvc, deps := finishedUnit(t, "rearm-neg")
+	isvc, deps := finishedUnit(t, "again-neg")
 	rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent).CurrentStep = -1
 	out, err := Dispatch(context.Background(), deps)
 	if err != nil {
@@ -285,7 +285,7 @@ func TestDispatch_FinishedUnitReadsANegativeStepBackAsTheSentinel(t *testing.T) 
 // unit's record is dropped again on the next pass, with no second completion:
 // the record reads finished and the pass asks for nothing more.
 func TestDispatch_FinishedUnitDropsAWrittenStableIdentity(t *testing.T) {
-	isvc, deps := finishedUnit(t, "rearm-ident")
+	isvc, deps := finishedUnit(t, "again-ident")
 	rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent).StableRevisionHash = "fixed"
 	before := isvc.Status.Components[v1beta1.EngineComponent].PreviousRolledoutRevision
 	out, err := Dispatch(context.Background(), deps)

@@ -25,8 +25,6 @@
 package usage
 
 import (
-	"sort"
-
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"sigs.k8s.io/ome/pkg/quota/tree"
@@ -71,7 +69,8 @@ type Total struct {
 //
 // Admitted and Reserved sum freely: each leaf's figure is disjoint from its
 // siblings', because a leaf is the only thing that holds quota. Borrowed does
-// not sum — see below.
+// not sum: a leaf reports the backend's own figure, and a node above a leaf
+// reports what it holds above its own nominal (borrowedAboveNominal).
 func Roll(t *tree.Tree, leaves map[string]map[Key]Observed) map[string]map[Key]Total {
 	if t == nil || len(leaves) == 0 {
 		return nil
@@ -79,43 +78,45 @@ func Roll(t *tree.Tree, leaves map[string]map[Key]Observed) map[string]map[Key]T
 
 	out := make(map[string]map[Key]Total)
 	for _, node := range t.Nodes() {
-		name := node.Name()
-
-		var totals map[Key]Total
-		for _, d := range t.Subtree(name) {
-			if !d.IsLeaf() {
-				continue
-			}
-			for key, o := range leaves[d.Name()] {
-				if totals == nil {
-					totals = make(map[Key]Total)
-				}
-				agg := totals[key]
-				add(&agg.Admitted, o.Admitted)
-				add(&agg.Reserved, o.Reserved)
-				if node.IsLeaf() {
-					// A leaf reports the backend's own borrowed figure. Above a
-					// leaf the number is recomputed rather than summed: a loan
-					// between two siblings inside this subtree is internal to
-					// it, and adding the children's figures would report the
-					// subtree as borrowing from outside itself when it is not.
-					add(&agg.Borrowed, o.Borrowed)
-				}
-				totals[key] = agg
-			}
-		}
+		totals := subtreeTotals(t, node, leaves)
 		if totals == nil {
 			continue
 		}
 		if !node.IsLeaf() {
 			borrowedAboveNominal(node, totals)
 		}
-		out[name] = totals
+		out[node.Name()] = totals
 	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// subtreeTotals sums the readings of the leaves under node, nil when none has
+// one. Only a leaf carries the backend's borrowed figure: a loan between two
+// siblings is internal to the subtree above them, so summing the children's
+// figures would report that subtree as borrowing from outside itself.
+func subtreeTotals(t *tree.Tree, node *tree.Node, leaves map[string]map[Key]Observed) map[Key]Total {
+	var totals map[Key]Total
+	for _, d := range t.Subtree(node.Name()) {
+		if !d.IsLeaf() {
+			continue
+		}
+		for key, o := range leaves[d.Name()] {
+			if totals == nil {
+				totals = make(map[Key]Total)
+			}
+			agg := totals[key]
+			add(&agg.Admitted, o.Admitted)
+			add(&agg.Reserved, o.Reserved)
+			if node.IsLeaf() {
+				add(&agg.Borrowed, o.Borrowed)
+			}
+			totals[key] = agg
+		}
+	}
+	return totals
 }
 
 // borrowedAboveNominal recomputes an internal node's borrowed figure as the
@@ -130,22 +131,22 @@ func borrowedAboveNominal(node *tree.Node, totals map[Key]Total) {
 		nominal[Key{ResourceName: b.ResourceName, ResourceFlavor: b.ResourceFlavor}] = b.Nominal
 	}
 	for key, t := range totals {
-		n, authored := nominal[key]
-		if !authored {
-			t.Borrowed = resource.Quantity{}
-			totals[key] = t
-			continue
+		t.Borrowed = resource.Quantity{}
+		if n, authored := nominal[key]; authored {
+			t.Borrowed = overage(t.Admitted, n)
 		}
-		over := t.Admitted.DeepCopy()
-		over.Sub(n)
-		if over.Sign() <= 0 {
-			t.Borrowed = resource.Quantity{}
-			totals[key] = t
-			continue
-		}
-		t.Borrowed = over
 		totals[key] = t
 	}
+}
+
+// overage is how far admitted stands above nominal, zero when it does not.
+func overage(admitted resource.Quantity, nominal resource.Quantity) resource.Quantity {
+	over := admitted.DeepCopy()
+	over.Sub(nominal)
+	if over.Sign() <= 0 {
+		return resource.Quantity{}
+	}
+	return over
 }
 
 // add accumulates into dst without mutating src, which belongs to the caller.
@@ -155,20 +156,4 @@ func add(dst *resource.Quantity, src resource.Quantity) {
 		return
 	}
 	dst.Add(src)
-}
-
-// SortedKeys orders a node's pairs so two rolls of the same tree produce the
-// same status and an idle fleet does not rewrite it every pass.
-func SortedKeys(totals map[Key]Total) []Key {
-	out := make([]Key, 0, len(totals))
-	for k := range totals {
-		out = append(out, k)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].ResourceName != out[j].ResourceName {
-			return out[i].ResourceName < out[j].ResourceName
-		}
-		return out[i].ResourceFlavor < out[j].ResourceFlavor
-	})
-	return out
 }

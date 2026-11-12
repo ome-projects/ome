@@ -9,28 +9,6 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-func TestValidateServingRuntimeAnnotations(t *testing.T) {
-	scenarios := map[string]struct {
-		spec    v1beta1.ServingRuntimeSpec
-		matcher gomega.OmegaMatcher
-	}{
-		"When chainsaw inject annotation is not set then it should return nil": {
-			spec: v1beta1.ServingRuntimeSpec{
-				ServingRuntimePodSpec: v1beta1.ServingRuntimePodSpec{},
-			},
-			matcher: gomega.BeNil(),
-		},
-	}
-
-	for name, scenario := range scenarios {
-		t.Run(name, func(t *testing.T) {
-			g := gomega.NewGomegaWithT(t)
-			err := validateServingRuntimeAnnotations(&scenario.spec)
-			g.Expect(err).To(scenario.matcher)
-		})
-	}
-}
-
 func TestAreModelSizeRangesEqual(t *testing.T) {
 	testcases := []struct {
 		name     string
@@ -79,29 +57,6 @@ func TestAreModelSizeRangesEqual(t *testing.T) {
 	}
 }
 
-func TestSRValidateAnnotations(t *testing.T) {
-	testcases := []struct {
-		name        string
-		annotations map[string]string
-		expected    gomega.OmegaMatcher
-	}{
-		{name: "No annotations", annotations: nil, expected: gomega.BeNil()},
-		{name: "Empty annotations", annotations: map[string]string{}, expected: gomega.BeNil()},
-		{name: "Valid annotations", annotations: map[string]string{"some-key": "some-value"}, expected: gomega.BeNil()},
-	}
-
-	for _, tc := range testcases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := gomega.NewGomegaWithT(t)
-			spec := &v1beta1.ServingRuntimeSpec{
-				ServingRuntimePodSpec: v1beta1.ServingRuntimePodSpec{Annotations: tc.annotations},
-			}
-			err := validateServingRuntimeAnnotations(spec)
-			g.Expect(err).To(tc.expected)
-		})
-	}
-}
-
 func TestContains(t *testing.T) {
 	testcases := []struct {
 		name     string
@@ -119,32 +74,6 @@ func TestContains(t *testing.T) {
 			g := gomega.NewGomegaWithT(t)
 			result := contains(tc.slice, tc.element)
 			g.Expect(result).To(gomega.Equal(tc.expected))
-		})
-	}
-}
-
-// The annotation check accepts every annotation today, the chainsaw one
-// included.
-func TestValidateServingRuntimeAnnotationsComplete(t *testing.T) {
-	testcases := []struct {
-		name        string
-		annotations map[string]string
-		expected    gomega.OmegaMatcher
-	}{
-		{name: "No annotations", annotations: nil, expected: gomega.BeNil()},
-		{name: "Empty annotations", annotations: map[string]string{}, expected: gomega.BeNil()},
-		{name: "Valid annotations", annotations: map[string]string{"some-key": "some-value"}, expected: gomega.BeNil()},
-		{name: "Chainsaw annotation - not implemented yet", annotations: map[string]string{"chainsaw.inject": "true"}, expected: gomega.BeNil()},
-	}
-
-	for _, tc := range testcases {
-		t.Run(tc.name, func(t *testing.T) {
-			g := gomega.NewGomegaWithT(t)
-			spec := &v1beta1.ServingRuntimeSpec{
-				ServingRuntimePodSpec: v1beta1.ServingRuntimePodSpec{Annotations: tc.annotations},
-			}
-			err := validateServingRuntimeAnnotations(spec)
-			g.Expect(err).To(tc.expected)
 		})
 	}
 }

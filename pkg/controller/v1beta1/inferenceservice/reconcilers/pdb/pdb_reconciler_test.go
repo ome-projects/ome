@@ -135,7 +135,7 @@ func TestPDBReconcilerCreateUsesExplicitRequest(t *testing.T) {
 			request.ObjectMeta.Annotations = map[string]string{"example.com/note": "keep"}
 			request.ObjectMeta.OwnerReferences = []metav1.OwnerReference{observerRef()}
 
-			obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+			obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 			require.NoError(t, err)
 			require.NotNil(t, obj)
 
@@ -264,7 +264,7 @@ func TestPDBReconcilerRejectsInvalidRequest(t *testing.T) {
 			request := testRequest()
 			tt.mutate(&request)
 
-			obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+			obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 			assert.Nil(t, obj)
 			assert.ErrorContains(t, err, tt.message)
 			assert.Zero(t, calls.gets.Count())
@@ -308,7 +308,7 @@ func TestPDBReconcilerCreateSanitizesMetadata(t *testing.T) {
 			},
 		}))
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	require.NoError(t, err)
 	require.NotNil(t, obj)
 	require.NotNil(t, created)
@@ -334,7 +334,7 @@ func TestPDBReconcilerOwnedEqualDoesNotWrite(t *testing.T) {
 	baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 	cl, calls := countedClient(t, baseClient)
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	require.NoError(t, err)
 	require.NotNil(t, obj)
 	assert.Zero(t, calls.creates.Count())
@@ -381,7 +381,7 @@ func TestPDBReconcilerPreflightRejectsUnavailableObjectWithoutWrites(t *testing.
 			baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 			cl, calls := countedClient(t, baseClient)
 
-			err := NewPDBReconciler(cl, scheme).Preflight(context.Background(), request)
+			err := NewPDBReconcilerWithReader(cl, nil, scheme).Preflight(context.Background(), request)
 			tt.assertError(t, err)
 			assert.Equal(t, 1, calls.gets.Count())
 			assert.Zero(t, calls.creates.Count())
@@ -398,7 +398,7 @@ func TestPDBReconcilerPreflightSkipsLookupWithoutDesiredBudget(t *testing.T) {
 	request.Selector = nil
 	cl, calls := countedClient(t, fakeclient.New(t, fakeclient.WithScheme(scheme)))
 
-	require.NoError(t, NewPDBReconciler(cl, scheme).Preflight(context.Background(), request))
+	require.NoError(t, NewPDBReconcilerWithReader(cl, nil, scheme).Preflight(context.Background(), request))
 	assert.Zero(t, calls.gets.Count())
 	assert.Zero(t, calls.creates.Count())
 	assert.Zero(t, calls.updates.Count())
@@ -462,7 +462,7 @@ func TestPDBReconcilerDefersSelectorCutoverUntilTargetIsReady(t *testing.T) {
 			request.Budget = tt.budget
 			request.CutoverFromSelector = originalRequest.Selector
 
-			obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+			obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 			require.NoError(t, err)
 			require.NotNil(t, obj)
 			assert.Equal(t, originalRequest.Selector, obj.Spec.Selector.MatchLabels)
@@ -470,7 +470,7 @@ func TestPDBReconcilerDefersSelectorCutoverUntilTargetIsReady(t *testing.T) {
 			assert.Zero(t, calls.deletes.Count())
 
 			request.SelectorCutoverReady = true
-			obj, err = NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+			obj, err = NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 			require.NoError(t, err)
 			if tt.budget == nil {
 				assert.Nil(t, obj)
@@ -495,7 +495,7 @@ func TestPDBReconcilerRepairsUnexpectedSelectorDriftBeforeTargetReady(t *testing
 	baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 	cl, calls := countedClient(t, baseClient)
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	require.NoError(t, err)
 	require.NotNil(t, obj)
 	assert.Equal(t, request.Selector, obj.Spec.Selector.MatchLabels)
@@ -513,7 +513,7 @@ func TestPDBReconcilerDesiredPresentRejectsTerminatingOwnedPDB(t *testing.T) {
 	baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 	cl, calls := countedClient(t, baseClient)
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	assert.Nil(t, obj)
 	assert.ErrorContains(t, err, "terminating")
 	assert.Zero(t, calls.creates.Count())
@@ -555,7 +555,7 @@ func TestPDBReconcilerOwnedDriftPreservesUnmanagedFields(t *testing.T) {
 	baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 	cl, calls := countedClient(t, baseClient)
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	require.NoError(t, err)
 	require.NotNil(t, obj)
 	assert.Equal(t, 1, calls.updates.Count())
@@ -590,7 +590,7 @@ func TestPDBReconcilerNormalizesSameUIDControllerReference(t *testing.T) {
 	baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 	cl, calls := countedClient(t, baseClient)
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	require.NoError(t, err)
 	require.NotNil(t, obj)
 	assert.Equal(t, 1, calls.updates.Count())
@@ -626,7 +626,7 @@ func TestPDBReconcilerDesiredPresentRejectsForeignPDB(t *testing.T) {
 			baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 			cl, calls := countedClient(t, baseClient)
 
-			_, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+			_, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 			assert.True(t, apierrors.IsConflict(err), "error = %v", err)
 			assert.Zero(t, calls.creates.Count())
 			assert.Zero(t, calls.updates.Count())
@@ -663,7 +663,7 @@ func TestPDBReconcilerDesiredAbsentPreservesForeignPDB(t *testing.T) {
 			baseClient := fakeclient.New(t, fakeclient.WithScheme(scheme), fakeclient.WithObjects(existing))
 			cl, calls := countedClient(t, baseClient)
 
-			obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+			obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 			require.NoError(t, err)
 			require.NotNil(t, obj)
 			assert.Equal(t, existing.UID, obj.UID)
@@ -680,7 +680,7 @@ func TestPDBReconcilerDesiredAbsentNotFoundIsNoOp(t *testing.T) {
 	request.Budget = nil
 	request.Selector = nil
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	require.NoError(t, err)
 	assert.Nil(t, obj)
 	assert.Equal(t, 1, calls.gets.Count())
@@ -715,7 +715,7 @@ func TestPDBReconcilerDesiredAbsentDeletesOwnedWithPreconditions(t *testing.T) {
 			},
 		}))
 
-	obj, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	obj, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	require.NoError(t, err)
 	assert.Nil(t, obj)
 	assert.Equal(t, 1, deleteCalls)
@@ -772,7 +772,7 @@ func TestPDBReconcilerOperationFailuresPropagate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			scheme := fakeclient.Scheme(t)
 			cl, request := tt.prepare(t, scheme)
-			_, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+			_, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 			assert.ErrorContains(t, err, tt.marker.Error())
 		})
 	}
@@ -798,7 +798,7 @@ func TestPDBReconcilerUpdateConflictPreservesConcurrentState(t *testing.T) {
 			},
 		}))
 
-	_, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	_, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	assert.True(t, apierrors.IsConflict(err), "error = %v", err)
 
 	got := &policyv1.PodDisruptionBudget{}
@@ -828,7 +828,7 @@ func TestPDBReconcilerDeleteConflictPreservesOwnerHandoff(t *testing.T) {
 			},
 		}))
 
-	_, err := NewPDBReconciler(cl, scheme).Reconcile(context.Background(), request)
+	_, err := NewPDBReconcilerWithReader(cl, nil, scheme).Reconcile(context.Background(), request)
 	assert.True(t, apierrors.IsConflict(err), "error = %v", err)
 
 	got := &policyv1.PodDisruptionBudget{}

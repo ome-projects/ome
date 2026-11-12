@@ -121,10 +121,11 @@ func TestInferenceReplicaCRD_ColumnSchema(t *testing.T) {
 	assertIndexSetString("members", columns.Properties["members"])
 	assertIndexSetString("admitted", columns.Properties["admitted"])
 	assertIndexSetString("activeOrdinalOne", columns.Properties["activeOrdinalOne"])
+	assertIndexSetString("readySinceIndexes", columns.Properties["readySinceIndexes"])
 
 	for _, name := range []string{
 		"rowOrder", "phases", "runningRevisions", "targetRevisions", "incarnations",
-		"podCounts", "servingPodCounts", "availablePodCounts", "entries",
+		"podCounts", "servingPodCounts", "availablePodCounts", "readySinceOffsets", "entries",
 	} {
 		props, ok := columns.Properties[name]
 		if !ok {
@@ -137,6 +138,16 @@ func TestInferenceReplicaCRD_ColumnSchema(t *testing.T) {
 	rowOrder := columns.Properties["rowOrder"]
 	if rowOrder.Items == nil || rowOrder.Items.Schema == nil || rowOrder.Items.Schema.Format != "int32" || rowOrder.Items.Schema.Minimum == nil || *rowOrder.Items.Schema.Minimum != 0 {
 		t.Error("rowOrder items must be int32 with minimum 0")
+	}
+	offsets := columns.Properties["readySinceOffsets"]
+	if offsets.Items == nil || offsets.Items.Schema == nil || offsets.Items.Schema.Format != "int32" || offsets.Items.Schema.Minimum == nil || *offsets.Items.Schema.Minimum != 0 {
+		t.Error("readySinceOffsets items must be int32 with minimum 0")
+	}
+	if base := columns.Properties["readySinceBase"]; base.Type != "string" || base.Format != "date-time" {
+		t.Errorf("readySinceBase = (%q, %q), want a date-time string", base.Type, base.Format)
+	}
+	if len(columns.XValidations) != 1 || columns.XValidations[0].Rule != "has(self.readySinceBase) == has(self.readySinceIndexes) && has(self.readySinceIndexes) == has(self.readySinceOffsets)" {
+		t.Errorf("instanceStatusColumns rules = %v, want the one that keeps the readySince columns together", columns.XValidations)
 	}
 
 	phaseItem := assertGroupItems("phases", columns.Properties["phases"], "string", "")

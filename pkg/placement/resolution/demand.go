@@ -47,32 +47,50 @@ func (r Resolver) ResolveDemand(ctx context.Context, desired, standing *v1beta1.
 	if err := reads.Get(ctx, client.ObjectKey{Name: rootName}, root); err != nil {
 		return nil, err
 	}
-	_, projected := root.Labels[v1beta1.AcceleratorQuotaOriginLabel]
-	if projected || root.Spec.ParentRef != nil || root.Spec.Role != v1beta1.AcceleratorQuotaRoleCohort {
+	if !isLocalRoot(root) {
 		return nil, fmt.Errorf("capacity report is not a local quota root")
 	}
 	var catalog kueuev1beta2.ResourceFlavorList
 	if err := reads.List(ctx, &catalog); err != nil {
 		return nil, err
 	}
-	flavors := make([]quotacapacity.Flavor, 0, len(catalog.Items))
-	for _, flavor := range catalog.Items {
-		flavors = append(flavors, quotacapacity.Flavor{Name: flavor.Name, UID: flavor.UID, NodeLabels: flavor.Spec.NodeLabels})
-	}
-	demand, err := capacity.AttributeUnit(unit.Demand, flavors, root.Status.Capacity)
+	demand, err := capacity.AttributeUnit(unit.Demand, flavorCatalog(catalog.Items), root.Status.Capacity)
 	if err != nil {
 		return nil, err
 	}
 	out := &ResolvedDemand{Unit: unit, Demand: demand, Report: *root.ObjectMeta.DeepCopy()}
 	out.Hardware = root.DeepCopy().Status.Capacity
-	out.Contract = &v1beta1.PlacementDemandContract{Fingerprint: demand.Fingerprint}
-	for _, component := range []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1.DecoderComponent} {
-		if hash, exists := unit.Rendering[component]; exists {
-			out.Contract.Components = append(out.Contract.Components, v1beta1.PlacementComponentDemand{Component: component, RenderingHash: hash})
-		}
-	}
+	out.Contract = demandContract(unit, demand)
 	if err := out.Check(ctx); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// isLocalRoot reports whether the quota is the member's own capacity root: a
+// cohort without a parent that no other cluster projected.
+func isLocalRoot(root *v1beta1.AcceleratorQuota) bool {
+	_, projected := root.Labels[v1beta1.AcceleratorQuotaOriginLabel]
+	return !projected && root.Spec.ParentRef == nil && root.Spec.Role == v1beta1.AcceleratorQuotaRoleCohort
+}
+
+// flavorCatalog is the member's ResourceFlavors as the attribution reads them.
+func flavorCatalog(items []kueuev1beta2.ResourceFlavor) []quotacapacity.Flavor {
+	flavors := make([]quotacapacity.Flavor, 0, len(items))
+	for _, flavor := range items {
+		flavors = append(flavors, quotacapacity.Flavor{Name: flavor.Name, UID: flavor.UID, NodeLabels: flavor.Spec.NodeLabels})
+	}
+	return flavors
+}
+
+// demandContract records the attributed demand's fingerprint and the rendering
+// hash of each placed component in role order, the engine before the decoder.
+func demandContract(unit *ResolvedUnit, demand capacity.Demand) *v1beta1.PlacementDemandContract {
+	contract := &v1beta1.PlacementDemandContract{Fingerprint: demand.Fingerprint}
+	for _, role := range v1beta1.Roles {
+		if hash, exists := unit.Rendering[role.Type]; exists {
+			contract.Components = append(contract.Components, v1beta1.PlacementComponentDemand{Component: role.Type, RenderingHash: hash})
+		}
+	}
+	return contract
 }

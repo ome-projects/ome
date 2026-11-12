@@ -122,279 +122,85 @@ func TestGetFirstPod(t *testing.T) {
 	}
 }
 
-func TestGetDeploymentCondition(t *testing.T) {
+// A Deployment's report is its Available condition and its observed
+// generation; a Deployment without that condition reports the zero condition.
+func TestDeploymentReport(t *testing.T) {
+	available := appsv1.DeploymentCondition{
+		Type:    appsv1.DeploymentAvailable,
+		Status:  corev1.ConditionTrue,
+		Reason:  "MinimumReplicasAvailable",
+		Message: "Deployment has minimum availability.",
+	}
+	progressing := appsv1.DeploymentCondition{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "NewReplicaSetAvailable"}
 	tests := []struct {
-		name          string
-		deployment    *appsv1.Deployment
-		conditionType appsv1.DeploymentConditionType
-		expected      *apis.Condition
+		name       string
+		conditions []appsv1.DeploymentCondition
+		expected   apis.Condition
 	}{
 		{
-			name: "deployment with available condition",
-			deployment: &appsv1.Deployment{
-				Status: appsv1.DeploymentStatus{
-					Conditions: []appsv1.DeploymentCondition{
-						{
-							Type:    appsv1.DeploymentAvailable,
-							Status:  corev1.ConditionTrue,
-							Reason:  "MinimumReplicasAvailable",
-							Message: "Deployment has minimum availability.",
-						},
-					},
-				},
-			},
-			conditionType: appsv1.DeploymentAvailable,
-			expected: &apis.Condition{
-				Type:    apis.ConditionType(appsv1.DeploymentAvailable),
-				Status:  corev1.ConditionTrue,
-				Reason:  "MinimumReplicasAvailable",
-				Message: "Deployment has minimum availability.",
-			},
+			name:       "available among other conditions",
+			conditions: []appsv1.DeploymentCondition{progressing, available},
+			expected:   apis.Condition{Type: "Available", Status: corev1.ConditionTrue, Reason: "MinimumReplicasAvailable", Message: "Deployment has minimum availability."},
 		},
 		{
-			name: "deployment with progressing condition",
-			deployment: &appsv1.Deployment{
-				Status: appsv1.DeploymentStatus{
-					Conditions: []appsv1.DeploymentCondition{
-						{
-							Type:    appsv1.DeploymentProgressing,
-							Status:  corev1.ConditionTrue,
-							Reason:  "NewReplicaSetAvailable",
-							Message: "ReplicaSet has successfully progressed.",
-						},
-					},
-				},
-			},
-			conditionType: appsv1.DeploymentProgressing,
-			expected: &apis.Condition{
-				Type:    apis.ConditionType(appsv1.DeploymentProgressing),
-				Status:  corev1.ConditionTrue,
-				Reason:  "NewReplicaSetAvailable",
-				Message: "ReplicaSet has successfully progressed.",
-			},
+			name:       "no available condition",
+			conditions: []appsv1.DeploymentCondition{progressing},
 		},
 		{
-			name: "deployment with replica failure condition",
-			deployment: &appsv1.Deployment{
-				Status: appsv1.DeploymentStatus{
-					Conditions: []appsv1.DeploymentCondition{
-						{
-							Type:    appsv1.DeploymentReplicaFailure,
-							Status:  corev1.ConditionTrue,
-							Reason:  "FailedCreate",
-							Message: "pods \"test-pod-\" is forbidden: exceeded quota",
-						},
-					},
-				},
-			},
-			conditionType: appsv1.DeploymentReplicaFailure,
-			expected: &apis.Condition{
-				Type:    apis.ConditionType(appsv1.DeploymentReplicaFailure),
-				Status:  corev1.ConditionTrue,
-				Reason:  "FailedCreate",
-				Message: "pods \"test-pod-\" is forbidden: exceeded quota",
-			},
-		},
-		{
-			name: "deployment without requested condition",
-			deployment: &appsv1.Deployment{
-				Status: appsv1.DeploymentStatus{
-					Conditions: []appsv1.DeploymentCondition{
-						{
-							Type:   appsv1.DeploymentProgressing,
-							Status: corev1.ConditionTrue,
-						},
-					},
-				},
-			},
-			conditionType: appsv1.DeploymentAvailable,
-			expected: &apis.Condition{
-				Type: "",
-			},
+			name: "no conditions",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
-			result := manager.getDeploymentCondition(tt.deployment, tt.conditionType)
+			deployment := &appsv1.Deployment{Status: appsv1.DeploymentStatus{ObservedGeneration: 7, Conditions: tt.conditions}}
+			report := deploymentReport(deployment)
 
-			assert.Equal(t, tt.expected.Type, result.Type)
-			assert.Equal(t, tt.expected.Status, result.Status)
-			assert.Equal(t, tt.expected.Reason, result.Reason)
-			assert.Equal(t, tt.expected.Message, result.Message)
+			assert.Equal(t, int64(7), report.generation)
+			assert.Equal(t, tt.expected, report.available)
 		})
 	}
 }
 
-func TestGetLWSConditions(t *testing.T) {
+// A LeaderWorkerSet's report is its Available condition and its generation;
+// a set without that condition reports the zero condition.
+func TestLeaderWorkerSetReport(t *testing.T) {
+	available := metav1.Condition{
+		Type:    string(lwsspec.LeaderWorkerSetAvailable),
+		Status:  metav1.ConditionTrue,
+		Reason:  "AllReplicasReady",
+		Message: "All replicas are ready",
+	}
+	progressing := metav1.Condition{Type: "Progressing", Status: metav1.ConditionTrue, Reason: "ReplicaSetUpdated"}
 	tests := []struct {
-		name          string
-		lws           *lwsspec.LeaderWorkerSet
-		conditionType lwsspec.LeaderWorkerSetConditionType
-		expected      *apis.Condition
+		name       string
+		conditions []metav1.Condition
+		expected   apis.Condition
 	}{
 		{
-			name: "LWS with available condition",
-			lws: &lwsspec.LeaderWorkerSet{
-				Status: lwsspec.LeaderWorkerSetStatus{
-					Conditions: []metav1.Condition{
-						{
-							Type:    string(lwsspec.LeaderWorkerSetAvailable),
-							Status:  metav1.ConditionTrue,
-							Reason:  "AllReplicasReady",
-							Message: "All replicas are ready",
-						},
-					},
-				},
-			},
-			conditionType: lwsspec.LeaderWorkerSetAvailable,
-			expected: &apis.Condition{
-				Type:    apis.ConditionType(lwsspec.LeaderWorkerSetAvailable),
-				Status:  corev1.ConditionTrue,
-				Reason:  "AllReplicasReady",
-				Message: "All replicas are ready",
-			},
+			name:       "available among other conditions",
+			conditions: []metav1.Condition{progressing, available},
+			expected:   apis.Condition{Type: "Available", Status: corev1.ConditionTrue, Reason: "AllReplicasReady", Message: "All replicas are ready"},
 		},
 		{
-			name: "LWS with progressing condition",
-			lws: &lwsspec.LeaderWorkerSet{
-				Status: lwsspec.LeaderWorkerSetStatus{
-					Conditions: []metav1.Condition{
-						{
-							Type:    "Progressing",
-							Status:  metav1.ConditionTrue,
-							Reason:  "ReplicaSetUpdated",
-							Message: "ReplicaSet is being updated",
-						},
-					},
-				},
-			},
-			conditionType: "Progressing",
-			expected: &apis.Condition{
-				Type:    apis.ConditionType("Progressing"),
-				Status:  corev1.ConditionTrue,
-				Reason:  "ReplicaSetUpdated",
-				Message: "ReplicaSet is being updated",
-			},
+			name:       "no available condition",
+			conditions: []metav1.Condition{progressing},
 		},
 		{
-			name: "LWS without requested condition",
-			lws: &lwsspec.LeaderWorkerSet{
-				Status: lwsspec.LeaderWorkerSetStatus{
-					Conditions: []metav1.Condition{
-						{
-							Type:   "Progressing",
-							Status: metav1.ConditionTrue,
-						},
-					},
-				},
-			},
-			conditionType: lwsspec.LeaderWorkerSetAvailable,
-			expected: &apis.Condition{
-				Type: "",
-			},
+			name: "no conditions",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
-			result := manager.getLWSConditions(tt.lws, tt.conditionType)
+			lws := &lwsspec.LeaderWorkerSet{Status: lwsspec.LeaderWorkerSetStatus{Conditions: tt.conditions}}
+			lws.Generation = 7
+			report := leaderWorkerSetReport(lws)
 
-			assert.Equal(t, tt.expected.Type, result.Type)
-			assert.Equal(t, tt.expected.Status, result.Status)
-			assert.Equal(t, tt.expected.Reason, result.Reason)
-			assert.Equal(t, tt.expected.Message, result.Message)
+			assert.Equal(t, int64(7), report.generation)
+			assert.Equal(t, tt.expected, report.available)
 		})
 	}
-}
-
-func TestSetCondition(t *testing.T) {
-	tests := []struct {
-		name          string
-		status        *v1beta1.InferenceServiceStatus
-		conditionType apis.ConditionType
-		condition     *apis.Condition
-		shouldSet     bool
-	}{
-		{
-			name:          "set condition true",
-			status:        &v1beta1.InferenceServiceStatus{},
-			conditionType: v1beta1.EngineReady,
-			condition: &apis.Condition{
-				Type:   v1beta1.EngineReady,
-				Status: corev1.ConditionTrue,
-				Reason: "Ready",
-			},
-			shouldSet: true,
-		},
-		{
-			name:          "set condition false",
-			status:        &v1beta1.InferenceServiceStatus{},
-			conditionType: v1beta1.EngineReady,
-			condition: &apis.Condition{
-				Type:   v1beta1.EngineReady,
-				Status: corev1.ConditionFalse,
-				Reason: "NotReady",
-			},
-			shouldSet: true,
-		},
-		{
-			name:          "set condition unknown",
-			status:        &v1beta1.InferenceServiceStatus{},
-			conditionType: v1beta1.EngineReady,
-			condition: &apis.Condition{
-				Type:   v1beta1.EngineReady,
-				Status: corev1.ConditionUnknown,
-				Reason: "Unknown",
-			},
-			shouldSet: true,
-		},
-		{
-			name:          "set condition true with reason and message",
-			status:        &v1beta1.InferenceServiceStatus{},
-			conditionType: v1beta1.EngineReady,
-			condition: &apis.Condition{
-				Type:    v1beta1.EngineReady,
-				Status:  corev1.ConditionTrue,
-				Reason:  "Ready",
-				Message: "Predictor is ready",
-			},
-			shouldSet: true,
-		},
-		{
-			name:          "nil condition",
-			status:        &v1beta1.InferenceServiceStatus{},
-			conditionType: v1beta1.EngineReady,
-			condition:     nil,
-			shouldSet:     false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			manager := NewStatusReconciler()
-			manager.setCondition(tt.status, tt.conditionType, tt.condition)
-
-			if tt.shouldSet {
-				condition := tt.status.GetCondition(tt.conditionType)
-				assert.NotNil(t, condition)
-				assert.Equal(t, tt.condition.Status, condition.Status)
-				assert.Equal(t, tt.condition.Reason, condition.Reason)
-				assert.Equal(t, tt.condition.Message, condition.Message)
-			}
-		})
-	}
-}
-
-func TestGetReadyConditionsMap(t *testing.T) {
-	manager := NewStatusReconciler()
-	conditionsMap := manager.getReadyConditionsMap()
-
-	assert.NotNil(t, conditionsMap)
-	assert.Equal(t, v1beta1.EngineReady, conditionsMap[v1beta1.EngineComponent])
-	assert.Equal(t, v1beta1.DecoderReady, conditionsMap[v1beta1.DecoderComponent])
 }
 
 func TestCheckContainerStatuses(t *testing.T) {

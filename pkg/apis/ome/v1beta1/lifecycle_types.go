@@ -85,8 +85,8 @@ type LifecycleStatus struct {
 	// NOTE: per-Instance detail (InstanceStatuses) is intentionally NOT
 	// mirrored here. The authoritative source of truth is the owning
 	// InferenceReplica's status; the ISVC carries only this aggregated
-	// summary. In-cluster consumers read the IR directly via
-	// irprojector.ComponentIRStatus.
+	// summary. In-cluster consumers read the IR directly through the
+	// irprojector role readers (ComponentIRStatusFor, DecodedComponentIRFor).
 }
 
 // RolloutHoldGate names the layer that most recently denied a
@@ -200,13 +200,13 @@ type OMENativeInstanceStatus struct {
 	// +optional
 	ReadyPodCount int32 `json:"readyPodCount,omitempty"`
 
-	// ServingPodCount is the number of pods that are BOTH ContainersReady
-	// AND have serving=True on the controller-managed readiness gate —
-	// i.e., pods actually in the load balancer rotation. Diverges from
-	// ReadyPodCount whenever the controller flips the serving gate
-	// (in-place updates, drain steps, etc.). MaxUnavailable budgets are
-	// computed against the serving count, not the ready count, so that
-	// "missing from traffic" reflects reality.
+	// ServingPodCount is the number of this Instance's pods whose Ready
+	// condition is True and whose controller-managed readiness gate reads
+	// serving=True. On a gang it counts every such pod, workers included,
+	// although only the leader is routed; it is 0 when no routed pod serves,
+	// however many workers keep the gate. The rollout gates and budgets read
+	// an Instance as serving only when this count reaches its pod count, so
+	// an Instance short one pod is unavailable to them.
 	// +optional
 	ServingPodCount int32 `json:"servingPodCount,omitempty"`
 

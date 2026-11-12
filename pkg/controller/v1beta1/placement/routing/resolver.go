@@ -158,33 +158,72 @@ func capacityOverride(routing *v1beta1.RoutingSpec) *CapacityConfig {
 	return &override
 }
 
+// blockResolver names what the probe and capacity resolvers do differently:
+// the block the InferenceService wrote by itself, the operator's copy of the
+// block, the override read from the spec, the observer limit the block must
+// respect and its digest. resolve runs the one sequence they share.
+type blockResolver[T policyBlock] struct {
+	// own is the InferenceService's block by itself, nil when it says nothing.
+	own      func(*v1beta1.RoutingSpec) *v1beta1.RoutingSpec
+	operator func(Config) T
+	override func(*v1beta1.RoutingSpec) *T
+	limits   func(ObserverConfig, T) error
+	digest   func(T) (string, error)
+}
+
+// resolve checks the InferenceService's own block alone, so a fault in the
+// other block never fails this one, then applies it to the operator's block.
+func (b blockResolver[T]) resolve(global Config, spec *v1beta1.InferenceServiceSpec) (effectiveBlock[T], error) {
+	routing := routingSpecOf(spec)
+	if own := b.own(routing); own != nil {
+		if err := validation.ValidateRouting(&v1beta1.InferenceServiceSpec{Routing: own}); err != nil {
+			return effectiveBlock[T]{}, err
+		}
+	}
+	return resolveBlock(
+		routingEnabledFor(global, routing),
+		b.operator(global),
+		b.override(routing),
+		func(block T) error { return b.limits(global.Observer, block) },
+		b.digest,
+	)
+}
+
+var probeResolver = blockResolver[ProbeConfig]{
+	own: func(routing *v1beta1.RoutingSpec) *v1beta1.RoutingSpec {
+		if routing == nil || routing.Probe == nil {
+			return nil
+		}
+		return &v1beta1.RoutingSpec{Probe: routing.Probe}
+	},
+	operator: func(global Config) ProbeConfig { return cloneProbeConfig(global.Probe) },
+	override: probeOverride,
+	limits:   ObserverConfig.probeLimits,
+	digest:   probePolicyDigest,
+}
+
+var capacityResolver = blockResolver[CapacityConfig]{
+	own: func(routing *v1beta1.RoutingSpec) *v1beta1.RoutingSpec {
+		if routing == nil || routing.Capacity == nil {
+			return nil
+		}
+		return &v1beta1.RoutingSpec{Capacity: routing.Capacity}
+	},
+	operator: func(global Config) CapacityConfig { return cloneCapacityConfig(global.Capacity) },
+	override: capacityOverride,
+	limits:   ObserverConfig.capacityLimits,
+	digest:   capacityPolicyDigest,
+}
+
 // ResolveProbePolicy resolves only the probe portion of an InferenceService's
 // routing policy. Capacity and publisher overrides are independent and do not
 // participate in probe resolution.
 func ResolveProbePolicy(global Config, spec *v1beta1.InferenceServiceSpec) (ResolvedProbePolicy, error) {
-	routing := routingSpecOf(spec)
-	if routing != nil && routing.Probe != nil {
-		if err := validation.ValidateRouting(&v1beta1.InferenceServiceSpec{
-			Routing: &v1beta1.RoutingSpec{Probe: routing.Probe},
-		}); err != nil {
-			return ResolvedProbePolicy{}, err
-		}
-	}
-	resolved, err := resolveBlock(
-		routingEnabledFor(global, routing),
-		cloneProbeConfig(global.Probe),
-		probeOverride(routing),
-		global.Observer.probeLimits,
-		probePolicyDigest,
-	)
+	resolved, err := probeResolver.resolve(global, spec)
 	if err != nil {
 		return ResolvedProbePolicy{}, err
 	}
-	return ResolvedProbePolicy{
-		Enabled:      resolved.Enabled,
-		Probe:        resolved.Block,
-		PolicyDigest: resolved.Digest,
-	}, nil
+	return ResolvedProbePolicy{Enabled: resolved.Enabled, Probe: resolved.Block, PolicyDigest: resolved.Digest}, nil
 }
 
 type probePolicyDigestPayload struct {
@@ -224,29 +263,11 @@ func probePolicyDigest(probe ProbeConfig) (string, error) {
 // InferenceService's routing policy. Probe and publisher overrides are
 // independent and do not participate in capacity resolution.
 func ResolveCapacityPolicy(global Config, spec *v1beta1.InferenceServiceSpec) (ResolvedCapacityPolicy, error) {
-	routing := routingSpecOf(spec)
-	if routing != nil && routing.Capacity != nil {
-		if err := validation.ValidateRouting(&v1beta1.InferenceServiceSpec{
-			Routing: &v1beta1.RoutingSpec{Capacity: routing.Capacity},
-		}); err != nil {
-			return ResolvedCapacityPolicy{}, err
-		}
-	}
-	resolved, err := resolveBlock(
-		routingEnabledFor(global, routing),
-		cloneCapacityConfig(global.Capacity),
-		capacityOverride(routing),
-		global.Observer.capacityLimits,
-		capacityPolicyDigest,
-	)
+	resolved, err := capacityResolver.resolve(global, spec)
 	if err != nil {
 		return ResolvedCapacityPolicy{}, err
 	}
-	return ResolvedCapacityPolicy{
-		Enabled:      resolved.Enabled,
-		Capacity:     resolved.Block,
-		PolicyDigest: resolved.Digest,
-	}, nil
+	return ResolvedCapacityPolicy{Enabled: resolved.Enabled, Capacity: resolved.Block, PolicyDigest: resolved.Digest}, nil
 }
 
 type capacityPolicyOption struct {
@@ -354,7 +375,20 @@ func ResolveConfig(
 	if !resolved.Enabled {
 		return resolved, nil
 	}
+	if err := applyBlockOverrides(&resolved, routing); err != nil {
+		return Config{}, err
+	}
+	if err := applyPublisherOptions(&resolved, global, routing, resolvePublisherOptions); err != nil {
+		return Config{}, err
+	}
+	return resolved, nil
+}
 
+// applyBlockOverrides replaces the operator's probe and capacity blocks with
+// the ones the InferenceService wrote and checks the result. A fault in a
+// block the service wrote is reported under "spec."; one in a block it
+// inherited names the operator's configuration.
+func applyBlockOverrides(resolved *Config, routing *v1beta1.RoutingSpec) error {
 	probe, capacity := probeOverride(routing), capacityOverride(routing)
 	if probe != nil {
 		resolved.Probe = *probe
@@ -362,19 +396,31 @@ func ResolveConfig(
 	if capacity != nil {
 		resolved.Capacity = *capacity
 	}
-	if err := resolved.Validate(); err != nil {
-		var configErr *configValidationError
-		fromSpec := errors.As(err, &configErr) &&
-			((configErr.section == "probe" && probe != nil) ||
-				(configErr.section == "capacity" && capacity != nil))
-		return Config{}, inSpec(err, fromSpec)
+	err := resolved.Validate()
+	if err == nil {
+		return nil
 	}
+	var configErr *configValidationError
+	fromSpec := errors.As(err, &configErr) &&
+		((configErr.section == "probe" && probe != nil) ||
+			(configErr.section == "capacity" && capacity != nil))
+	return inSpec(err, fromSpec)
+}
 
+// applyPublisherOptions merges the InferenceService's publisher options
+// through the publisher's own resolver. A publisher without one refuses
+// per-InferenceService options.
+func applyPublisherOptions(
+	resolved *Config,
+	global Config,
+	routing *v1beta1.RoutingSpec,
+	resolvePublisherOptions PublisherOptionsResolver,
+) error {
 	if routing.Publisher == nil || len(routing.Publisher.Options) == 0 {
-		return resolved, nil
+		return nil
 	}
 	if resolvePublisherOptions == nil {
-		return Config{}, fmt.Errorf(
+		return fmt.Errorf(
 			"spec.routing.publisher.options cannot be set because the selected publisher does not support per-InferenceService options")
 	}
 	options, err := resolvePublisherOptions(
@@ -382,11 +428,10 @@ func ResolveConfig(
 		maps.Clone(routing.Publisher.Options),
 	)
 	if err != nil {
-		return Config{}, fmt.Errorf("spec.routing.publisher.options: %w", err)
+		return fmt.Errorf("spec.routing.publisher.options: %w", err)
 	}
 	resolved.Publisher.Options = maps.Clone(options)
-
-	return resolved, nil
+	return nil
 }
 
 func cloneConfig(in Config) Config {

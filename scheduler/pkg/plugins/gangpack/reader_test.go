@@ -90,7 +90,7 @@ func TestInformerReaderGet_PresentMissingOrNilPodGroup_FoundOnlyWhenPresent(t *t
 
 // TestPlacementChanged_SpecLabelOrAnnotationEdit_TrueStatusOnlyFalse: only edits to the facts placement reads — spec,
 // annotations, labels — count as a change. Status and metadata-only writes do
-// not, so a controller refreshing status cannot wake parked members through the
+// not, so a controller refreshing status cannot wake held members through the
 // backoff-bypassing activation.
 func TestPlacementChanged_SpecLabelOrAnnotationEdit_TrueStatusOnlyFalse(t *testing.T) {
 	base := func() *schedv1alpha1.PodGroup {

@@ -147,70 +147,80 @@ func (r *Reconciler) bootstrapRootEvery(ctx context.Context, every time.Duration
 // two planes would fight over one object with last-writer-wins. Splitting them
 // across spec and status lets both write the same CR indefinitely.
 func (r *Reconciler) reconcileCapacity(ctx context.Context, root *v1beta1.AcceleratorQuota) error {
-	var nodes corev1.NodeList
-	if err := r.APIReader.List(ctx, &nodes); err != nil {
-		return fmt.Errorf("listing nodes: %w", err)
-	}
-
-	flavors, err := r.flavors(ctx)
+	observed, flavors, err := r.observeCapacity(ctx)
 	if err != nil {
 		return err
 	}
+	now := metav1.Now()
+	updated := root.DeepCopy()
+	updated.Status.Capacity = r.capacityRows(root.Status.Capacity, observed, flavors, now)
+	if equalCapacity(root.Status.Capacity, updated.Status.Capacity) &&
+		!capacityReportDue(root.Status.Capacity, now.Time, r.Capacity.ReportInterval) {
+		return nil
+	}
+	if err := r.Status().Patch(ctx, updated, client.MergeFrom(root)); err != nil && !goneOrRewritten(err) {
+		return fmt.Errorf("writing root capacity: %w", err)
+	}
+	return nil
+}
 
+// observeCapacity lists the nodes and the flavors, sums the accelerators per
+// pool and publishes the raw observation to the capacity gauges.
+func (r *Reconciler) observeCapacity(ctx context.Context) (capacity.Result, []capacity.Flavor, error) {
+	var nodes corev1.NodeList
+	if err := r.APIReader.List(ctx, &nodes); err != nil {
+		return capacity.Result{}, nil, fmt.Errorf("listing nodes: %w", err)
+	}
+	flavors, err := r.flavors(ctx)
+	if err != nil {
+		return capacity.Result{}, nil, err
+	}
 	observed, err := capacity.Sum(nodes.Items, flavors, capacity.Options{
 		AcceleratorResources: r.Capacity.Resources,
 	})
 	if err != nil {
-		return fmt.Errorf("summing node capacity: %w", err)
+		return capacity.Result{}, nil, fmt.Errorf("summing node capacity: %w", err)
 	}
-
 	// Publish before merging. mergeCapacity folds the observation into the
 	// high-water marks and only the merged figure reaches status, so the
 	// unattributed slice and the raw node counts have no other reader.
 	recordCapacity(observed)
+	return observed, flavors, nil
+}
 
-	now := metav1.Now()
-	updated := root.DeepCopy()
+// capacityRows folds the observation into the marks the root carries,
+// attributes every pool, adds a first observation of each pool without nodes
+// and orders the rows by resource and flavor.
+func (r *Reconciler) capacityRows(previous []v1beta1.AcceleratorCapacityStatus, observed capacity.Result, flavors []capacity.Flavor, now metav1.Time) []v1beta1.AcceleratorCapacityStatus {
 	samples, attribution := attributeCapacity(observed, flavors, r.Capacity.Resources)
-	updated.Status.Capacity = mergeCapacity(
-		root.Status.Capacity, observed.Capacities, r.Capacity.HysteresisPercent, now)
+	rows := mergeCapacity(previous, observed.Capacities, r.Capacity.HysteresisPercent, now)
 	recorded := map[string]bool{}
-	for i := range updated.Status.Capacity {
-		sample := &updated.Status.Capacity[i]
-		key := budgetKey(sample.ResourceName, sample.ResourceFlavor)
+	for i := range rows {
+		key := budgetKey(rows[i].ResourceName, rows[i].ResourceFlavor)
 		recorded[key] = true
-		sample.Attribution = attribution[key]
+		rows[i].Attribution = attribution[key]
 	}
 	// Add first observations of empty pools after high-water tracking; a pool
 	// without nodes must retain the quota tracker's established historical mark.
 	for _, sample := range samples {
 		key := budgetKey(sample.ResourceName, sample.ResourceFlavor)
 		if !recorded[key] {
-			updated.Status.Capacity = append(updated.Status.Capacity, v1beta1.AcceleratorCapacityStatus{
+			rows = append(rows, v1beta1.AcceleratorCapacityStatus{
 				ResourceName: sample.ResourceName, ResourceFlavor: sample.ResourceFlavor,
 				ObservedAt: now.DeepCopy(), Attribution: attribution[key],
 			})
 		}
 	}
-	slices.SortFunc(updated.Status.Capacity, func(a, b v1beta1.AcceleratorCapacityStatus) int {
-		if order := cmp.Compare(a.ResourceName, b.ResourceName); order != 0 {
-			return order
-		}
-		return cmp.Compare(a.ResourceFlavor, b.ResourceFlavor)
-	})
+	slices.SortFunc(rows, compareCapacityRows)
+	return rows
+}
 
-	if equalCapacity(root.Status.Capacity, updated.Status.Capacity) &&
-		!capacityReportDue(root.Status.Capacity, now.Time, r.Capacity.ReportInterval) {
-		return nil
+// compareCapacityRows orders capacity rows by resource name, then flavor.
+func compareCapacityRows(a, b v1beta1.AcceleratorCapacityStatus) int {
+	if order := cmp.Compare(a.ResourceName, b.ResourceName); order != 0 {
+		return order
 	}
-	if err := r.Status().Patch(ctx, updated, client.MergeFrom(root)); err != nil {
-		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-			// The root was rewritten mid-pass; the next reconcile samples again.
-			return nil
-		}
-		return fmt.Errorf("writing root capacity: %w", err)
-	}
-	return nil
+	return cmp.Compare(a.ResourceFlavor, b.ResourceFlavor)
 }
 
 // capacityReportDue refreshes only completed samples. A failed read cannot
@@ -300,19 +310,16 @@ func mergeCapacity(
 // sample. Including it would rewrite the root's status on every pass and spin
 // the watch that triggered the pass.
 func equalCapacity(a, b []v1beta1.AcceleratorCapacityStatus) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].ResourceName != b[i].ResourceName ||
-			a[i].ResourceFlavor != b[i].ResourceFlavor ||
-			a[i].Allocatable.Cmp(b[i].Allocatable) != 0 ||
-			a[i].HighWaterMark.Cmp(b[i].HighWaterMark) != 0 ||
-			!apiequality.Semantic.DeepEqual(a[i].Attribution, b[i].Attribution) {
-			return false
-		}
-	}
-	return true
+	return slices.EqualFunc(a, b, sameCapacity)
+}
+
+// sameCapacity compares one pool's row, ObservedAt excluded.
+func sameCapacity(x, y v1beta1.AcceleratorCapacityStatus) bool {
+	return x.ResourceName == y.ResourceName &&
+		x.ResourceFlavor == y.ResourceFlavor &&
+		x.Allocatable.Cmp(y.Allocatable) == 0 &&
+		x.HighWaterMark.Cmp(y.HighWaterMark) == 0 &&
+		apiequality.Semantic.DeepEqual(x.Attribution, y.Attribution)
 }
 
 // nodeCapacityChanged reports whether an update could change the derived total.

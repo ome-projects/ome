@@ -133,3 +133,104 @@ func TestGatewayParentForHost_ParentOfUnsupportedGroup_ReturnsError(t *testing.T
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported group")
 }
+
+// resolveGatewayAddresses resolves the backend host of a route whose one
+// parent names gateway, both held by cluster-a.
+func resolveGatewayAddresses(t *testing.T, host string, parent gatewayapiv1.ParentReference, gateway *gatewayapiv1.Gateway) ([]BackendAddress, error) {
+	t.Helper()
+	route := &gatewayapiv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "prod"},
+		Spec: gatewayapiv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayapiv1.CommonRouteSpec{ParentRefs: []gatewayapiv1.ParentReference{parent}},
+			Hostnames:       []gatewayapiv1.Hostname{gatewayapiv1.Hostname(host)},
+		},
+	}
+	resolver := NewGatewayAddressResolver(fakeRemoteClusterClients{"cluster-a": remoteClient(t, route, gateway)})
+	return resolver.Resolve(context.Background(), testISVC(), ServingCluster{Cluster: "cluster-a", BackendHost: host})
+}
+
+// The resolver keeps the Gateway's IP status addresses and nothing else: a
+// value under the Hostname or Named type, a value that is no address and a
+// repeat are dropped, padding is trimmed, and a Gateway without one IP
+// address is refused.
+func TestGatewayAddressResolver_AddressShapes_KeepsOnlyDistinctIPAddresses(t *testing.T) {
+	ipType, hostnameType, namedType := gatewayapiv1.IPAddressType, gatewayapiv1.HostnameAddressType, gatewayapiv1.NamedAddressType
+	ipv4 := BackendAddress{Address: "192.0.2.21", Type: discoveryv1.AddressTypeIPv4}
+	for name, tt := range map[string]struct {
+		statuses []gatewayapiv1.GatewayStatusAddress
+		want     []BackendAddress
+		wantErr  string
+	}{
+		"padding and the long IPv6 form": {
+			statuses: []gatewayapiv1.GatewayStatusAddress{{Value: " 192.0.2.21 "}, {Type: &ipType, Value: "2001:0db8:0:0::20"}},
+			want:     []BackendAddress{ipv4, {Address: "2001:db8::20", Type: discoveryv1.AddressTypeIPv6}},
+		},
+		"an IP under the Hostname type": {
+			statuses: []gatewayapiv1.GatewayStatusAddress{{Type: &hostnameType, Value: "192.0.2.20"}, {Value: "192.0.2.21"}},
+			want:     []BackendAddress{ipv4},
+		},
+		"an IP under the Named type": {
+			statuses: []gatewayapiv1.GatewayStatusAddress{{Type: &namedType, Value: "192.0.2.20"}, {Value: "192.0.2.21"}},
+			want:     []BackendAddress{ipv4},
+		},
+		"values that are no address": {
+			statuses: []gatewayapiv1.GatewayStatusAddress{{Value: "300.1.1.1"}, {Value: "gateway.example"}, {Value: ""}, {Value: "192.0.2.21"}},
+			want:     []BackendAddress{ipv4},
+		},
+		"the same address twice": {
+			statuses: []gatewayapiv1.GatewayStatusAddress{{Value: "192.0.2.21"}, {Type: &ipType, Value: "192.0.2.21"}},
+			want:     []BackendAddress{ipv4},
+		},
+		"only a hostname": {
+			statuses: []gatewayapiv1.GatewayStatusAddress{{Type: &hostnameType, Value: "gateway.example"}},
+			wantErr:  `serving Gateway prod/gw on cluster "cluster-a" has no IP status addresses`,
+		},
+		"no status address": {
+			wantErr: `serving Gateway prod/gw on cluster "cluster-a" has no IP status addresses`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			gateway := &gatewayapiv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "prod"},
+				Status:     gatewayapiv1.GatewayStatus{Addresses: tt.statuses},
+			}
+			got, err := resolveGatewayAddresses(t, "svc.example", gatewayapiv1.ParentReference{Name: "gw"}, gateway)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("Resolve() error = %v, want %q", err, tt.wantErr)
+				}
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// A parent reference whose namespace is the empty string names a Gateway in
+// the route's namespace, as a parent without a namespace does.
+func TestGatewayAddressResolver_EmptyParentNamespace_ReadsTheRouteNamespace(t *testing.T) {
+	empty := gatewayapiv1.Namespace("")
+	gateway := &gatewayapiv1.Gateway{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "prod"},
+		Status:     gatewayapiv1.GatewayStatus{Addresses: []gatewayapiv1.GatewayStatusAddress{{Value: "192.0.2.1"}}},
+	}
+	got, err := resolveGatewayAddresses(t, "svc.example", gatewayapiv1.ParentReference{Name: "gw", Namespace: &empty}, gateway)
+	require.NoError(t, err)
+	assert.Equal(t, []BackendAddress{{Address: "192.0.2.1", Type: discoveryv1.AddressTypeIPv4}}, got)
+}
+
+// A resolver without workload-cluster clients, and a nil resolver, refuse
+// every cluster with a text that says the clients are not configured.
+func TestGatewayAddressResolver_NoClusterClients_RefusesWithText(t *testing.T) {
+	var nilResolver *GatewayAddressResolver
+	want := `resolve backend addresses for cluster "cluster-a": workload-cluster clients are not configured`
+	for name, resolver := range map[string]*GatewayAddressResolver{"no clients": NewGatewayAddressResolver(nil), "nil resolver": nilResolver} {
+		t.Run(name, func(t *testing.T) {
+			_, err := resolver.Resolve(context.Background(), testISVC(), ServingCluster{Cluster: "cluster-a", BackendHost: "svc.example"})
+			if err == nil || err.Error() != want {
+				t.Fatalf("Resolve() error = %v, want %q", err, want)
+			}
+		})
+	}
+}

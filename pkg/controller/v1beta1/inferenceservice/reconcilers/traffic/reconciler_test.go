@@ -2,16 +2,21 @@ package traffic
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/traffic/status"
@@ -81,9 +86,75 @@ func (s *stubTranslator) ObserveAcceptance(obj client.Object) AcceptanceObservat
 func newReconcilerWithStub(t *testing.T, tr *stubTranslator, seed ...client.Object) (*Reconciler, client.Client) {
 	t.Helper()
 	c := fakeclient.New(t, fakeclient.WithObjects(seed...))
+	return newReconcilerOn(t, tr, c), c
+}
+
+// newReconcilerOn builds the reconciler over a client the test shaped.
+func newReconcilerOn(t *testing.T, tr *stubTranslator, c client.Client) *Reconciler {
+	t.Helper()
 	r := NewReconciler(c, c.Scheme(), tr)
 	r.now = func() metav1.Time { return fixedNow }
-	return r, c
+	return r
+}
+
+// handAuthoredPolicy is a policy with OME's name and no controller
+// reference, as an operator writes by hand, beside the one OME emits.
+func handAuthoredPolicy() (existing, desired *corev1.ConfigMap) {
+	existing = &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "isvc-btp",
+			Namespace:       "default",
+			ResourceVersion: "1",
+		},
+		Data: map[string]string{"mock": "handauthored"},
+	}
+	desired = &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "isvc-btp", Namespace: "default"},
+		Data:       map[string]string{"mock": "would-have-been-ome"},
+	}
+	return existing, desired
+}
+
+// requirePolicyData fails the test unless the stored policy carries want.
+func requirePolicyData(t *testing.T, c client.Client, want string) {
+	t.Helper()
+	stored := &corev1.ConfigMap{}
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "isvc-btp"}, stored); err != nil {
+		t.Fatalf("policy missing: %v", err)
+	}
+	if stored.Data["mock"] != want {
+		t.Fatalf("policy data = %q, want %q: %+v", stored.Data["mock"], want, stored.Data)
+	}
+}
+
+// readTargets records a copy of every object handed to Get before the
+// store answers, so a test sees what the reconciler asked to fill in.
+func readTargets(into *[]client.Object) interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			*into = append(*into, obj.DeepCopyObject().(client.Object))
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+
+// liveTypedRead answers Get the way a typed read straight from the API
+// server does: the server's JSON is decoded into the object as handed
+// in, so a field the server did not send keeps whatever was there.
+func liveTypedRead() interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			live := obj.DeepCopyObject().(client.Object)
+			if err := c.Get(ctx, key, live, opts...); err != nil {
+				return err
+			}
+			raw, err := json.Marshal(live)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(raw, obj)
+		},
+	}
 }
 
 func newISVC(name string) *v1beta1.InferenceService {
@@ -230,18 +301,7 @@ func TestReconcile_ConflictingPolicy_RefusesOverwriteAndSurfacesReason(t *testin
 	// hand-authored BTP. Reconcile must refuse to Update and surface
 	// BackendPolicyReady=False/ConflictingPolicy (alpha-phase coexistence
 	// behavior).
-	existing := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "isvc-btp",
-			Namespace:       "default",
-			ResourceVersion: "1",
-		},
-		Data: map[string]string{"mock": "handauthored"},
-	}
-	desired := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "isvc-btp", Namespace: "default"},
-		Data:       map[string]string{"mock": "would-have-been-ome"},
-	}
+	existing, desired := handAuthoredPolicy()
 	tr := &stubTranslator{name: "envoy-gateway", respObj: desired}
 	r, c := newReconcilerWithStub(t, tr, existing)
 
@@ -267,12 +327,100 @@ func TestReconcile_ConflictingPolicy_RefusesOverwriteAndSurfacesReason(t *testin
 	}
 
 	// Existing object MUST NOT have been overwritten.
-	preserved := &corev1.ConfigMap{}
-	if err := c.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: "isvc-btp"}, preserved); err != nil {
-		t.Fatalf("existing policy missing: %v", err)
+	requirePolicyData(t, c, "handauthored")
+}
+
+func TestReconcile_HandAuthoredPolicy_LiveTypedRead_StillRefusesOverwrite(t *testing.T) {
+	// A hand-authored policy has no owner reference, so the server's
+	// JSON carries none. A typed read straight from the API server
+	// decodes into the object handed in; had that object carried OME's
+	// own controller reference, the policy would read as OME's and the
+	// operator's policy would be overwritten.
+	existing, desired := handAuthoredPolicy()
+	tr := &stubTranslator{name: "envoy-gateway", respObj: desired}
+	c := fakeclient.New(t, fakeclient.WithObjects(existing), fakeclient.WithInterceptors(liveTypedRead()))
+	r := newReconcilerOn(t, tr, c)
+
+	isvc := newISVC("isvc")
+	isvc.UID = "isvc-uid"
+	isvc.Spec.Traffic = &v1beta1.TrafficSpec{Algorithm: ptrAlg(v1beta1.LoadBalancingTypeRoundRobin)}
+
+	_, err := r.Reconcile(context.Background(), isvc, []string{"isvc"})
+	if !errors.Is(err, ErrConflictingPolicy) {
+		t.Fatalf("err = %v, want ErrConflictingPolicy", err)
 	}
-	if preserved.Data["mock"] != "handauthored" {
-		t.Fatalf("ConflictingPolicy guard overwrote a hand-authored policy: %+v", preserved.Data)
+	requirePolicyData(t, c, "handauthored")
+}
+
+func TestReconcile_ReadTargetCarriesOnlyKindNameAndNamespace(t *testing.T) {
+	// The object handed to Get starts empty. A read that finds nothing
+	// leaves it empty, and a read that finds the live object shows only
+	// what the server sent, never the desired owner, labels or data.
+	desired := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "isvc-btp", Namespace: "default", Labels: map[string]string{"app": "isvc"}},
+		Data:       map[string]string{"mock": "policy"},
+	}
+	tr := &stubTranslator{name: "envoy-gateway", respObj: desired}
+	var targets []client.Object
+	c := fakeclient.New(t, fakeclient.WithInterceptors(readTargets(&targets)))
+	r := newReconcilerOn(t, tr, c)
+
+	isvc := newISVC("isvc")
+	isvc.Spec.Traffic = &v1beta1.TrafficSpec{Algorithm: ptrAlg(v1beta1.LoadBalancingTypeRoundRobin)}
+	if _, err := r.Reconcile(context.Background(), isvc, []string{"isvc"}); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+
+	// The first read finds nothing and precedes the Create; the second
+	// reads the gateway's acceptance of what was created.
+	if len(targets) != 2 {
+		t.Fatalf("recorded %d reads of the policy, want 2", len(targets))
+	}
+	for i, target := range targets {
+		cm, ok := target.(*corev1.ConfigMap)
+		if !ok {
+			t.Fatalf("read %d: target is %T, want *corev1.ConfigMap", i, target)
+		}
+		if cm.Name != "isvc-btp" || cm.Namespace != "default" {
+			t.Fatalf("read %d: target named %s/%s, want default/isvc-btp", i, cm.Namespace, cm.Name)
+		}
+		if len(cm.OwnerReferences) != 0 || len(cm.Labels) != 0 || len(cm.Data) != 0 {
+			t.Fatalf("read %d: target carries the desired object's fields before the read: owners=%v labels=%v data=%v",
+				i, cm.OwnerReferences, cm.Labels, cm.Data)
+		}
+	}
+}
+
+func TestFetchTarget_Unstructured_KeepsOnlyKindNameAndNamespace(t *testing.T) {
+	// The real translators emit unstructured policies. The read target
+	// must be the same Go type with the same kind, or the client cannot
+	// read it and the translator cannot interpret what it read.
+	kind := schema.GroupVersionKind{Group: "policy.example.com", Version: "v1", Kind: "BackendPolicy"}
+	desired := &unstructured.Unstructured{}
+	desired.SetGroupVersionKind(kind)
+	desired.SetName("isvc-btp")
+	desired.SetNamespace("default")
+	desired.SetLabels(map[string]string{"app": "isvc"})
+	desired.SetOwnerReferences([]metav1.OwnerReference{{Kind: "InferenceService", Name: "isvc"}})
+	if err := unstructured.SetNestedField(desired.Object, "RoundRobin", "spec", "loadBalancer", "type"); err != nil {
+		t.Fatalf("set spec: %v", err)
+	}
+
+	got, ok := fetchTarget(desired, client.ObjectKey{Namespace: "default", Name: "isvc-btp"})
+	if !ok {
+		t.Fatalf("fetchTarget refused an unstructured object")
+	}
+	u, isUnstructured := got.(*unstructured.Unstructured)
+	if !isUnstructured {
+		t.Fatalf("target is %T, want *unstructured.Unstructured", got)
+	}
+	want := map[string]interface{}{
+		"apiVersion": "policy.example.com/v1",
+		"kind":       "BackendPolicy",
+		"metadata":   map[string]interface{}{"name": "isvc-btp", "namespace": "default"},
+	}
+	if u.GroupVersionKind() != kind || !reflect.DeepEqual(u.Object, want) {
+		t.Fatalf("target = %v, want only kind, name and namespace: %v", u.Object, want)
 	}
 }
 

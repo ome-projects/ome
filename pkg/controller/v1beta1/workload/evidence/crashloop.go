@@ -82,15 +82,8 @@ func CrashLoopWedgedPodOn(input types.ReconcileInput, s *types.InstanceStatus, e
 	if query.PodSetFullyServing(pods, expected) {
 		return nil, "", 0
 	}
-	own := query.RevisionFromName(rev)
+	members := liveOnRevision(pods, query.RevisionFromName(rev))
 	now := input.Now()
-	var members []*corev1.Pod
-	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil || !podOnRevision(pod, own) {
-			continue
-		}
-		members = append(members, pod)
-	}
 	var graceLeft time.Duration
 	earliest := func(left time.Duration) {
 		if left > 0 && (graceLeft == 0 || left < graceLeft) {
@@ -139,23 +132,63 @@ func podOutOfService(pod *corev1.Pod, now time.Time, grace time.Duration) bool {
 // no service and a worker that is not has no wedge to show: the verdict
 // rests on the routed members alone.
 func PodSetServesNothing(pods []*corev1.Pod, now time.Time, grace time.Duration) bool {
-	live := 0
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		live++
-		if query.IsTerminalPod(pod) || !query.RoutedRunner(pod) {
-			continue
-		}
-		if podreadiness.ReadyAndServing(pod) {
-			return false
-		}
-		if !podOutOfService(pod, now, grace) {
+		if podRoutedMember(pod) && (podreadiness.ReadyAndServing(pod) || !podOutOfService(pod, now, grace)) {
 			return false
 		}
 	}
-	return live > 0
+	return countLive(pods) > 0
+}
+
+// podLive reports a pod of a set that is present and not being deleted.
+func podLive(pod *corev1.Pod) bool {
+	return pod != nil && pod.DeletionTimestamp == nil
+}
+
+// podPresent reports a live pod not in a terminal phase: a pod the serving
+// count reads.
+func podPresent(pod *corev1.Pod) bool {
+	return podLive(pod) && !query.IsTerminalPod(pod)
+}
+
+// podRoutedMember reports a present pod that can be in rotation: a member of
+// the routing Service. A gang serves through its leader and its workers are
+// never routed, so a worker's readiness proves nothing about service.
+func podRoutedMember(pod *corev1.Pod) bool {
+	return podPresent(pod) && query.RoutedRunner(pod)
+}
+
+// countLive counts the live pods of a set.
+func countLive(pods []*corev1.Pod) int {
+	live := 0
+	for _, pod := range pods {
+		if podLive(pod) {
+			live++
+		}
+	}
+	return live
+}
+
+// countPresent counts the present pods of a set.
+func countPresent(pods []*corev1.Pod) int {
+	present := 0
+	for _, pod := range pods {
+		if podPresent(pod) {
+			present++
+		}
+	}
+	return present
+}
+
+// liveOnRevision lists the live pods of a set that belong to rev.
+func liveOnRevision(pods []*corev1.Pod, rev query.RevisionID) []*corev1.Pod {
+	var members []*corev1.Pod
+	for _, pod := range pods {
+		if podLive(pod) && podOnRevision(pod, rev) {
+			members = append(members, pod)
+		}
+	}
+	return members
 }
 
 // PodSetLost reports whether nothing of a pod set is left that could
@@ -168,12 +201,7 @@ func PodSetServesNothing(pods []*corev1.Pod, now time.Time, grace time.Duration)
 // a set out of rotation (PodSetOutOfRotation) is. A missing pod has no
 // wait that resolves on its own, so no grace applies.
 func PodSetLost(pods []*corev1.Pod) bool {
-	for _, pod := range pods {
-		if pod != nil && pod.DeletionTimestamp == nil && !query.IsTerminalPod(pod) {
-			return false
-		}
-	}
-	return true
+	return countPresent(pods) == 0
 }
 
 // PodSetOutOfRotation reports whether a non-empty pod set has no routed pod
@@ -185,20 +213,12 @@ func PodSetLost(pods []*corev1.Pod) bool {
 // its start as a free one would, so the budgets and the gate keep the graced
 // reading. A gang reads its routed members alone, as PodSetServesNothing does.
 func PodSetOutOfRotation(pods []*corev1.Pod) bool {
-	live := 0
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		live++
-		if query.IsTerminalPod(pod) || !query.RoutedRunner(pod) {
-			continue
-		}
-		if podreadiness.ReadyAndServing(pod) {
+		if podRoutedMember(pod) && podreadiness.ReadyAndServing(pod) {
 			return false
 		}
 	}
-	return live > 0
+	return countLive(pods) > 0
 }
 
 // PodSetDarkOnReadiness reports whether a non-empty pod set is dark on its
@@ -208,13 +228,9 @@ func PodSetOutOfRotation(pods []*corev1.Pod) bool {
 // drained, which PodSetServesNothing cannot tell from the drain. A gang
 // reads its routed members alone, as PodSetServesNothing does.
 func PodSetDarkOnReadiness(pods []*corev1.Pod, now time.Time, grace time.Duration) bool {
-	live, routed := 0, 0
+	routed := 0
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil {
-			continue
-		}
-		live++
-		if query.IsTerminalPod(pod) || !query.RoutedRunner(pod) {
+		if !podRoutedMember(pod) {
 			continue
 		}
 		routed++
@@ -222,7 +238,7 @@ func PodSetDarkOnReadiness(pods []*corev1.Pod, now time.Time, grace time.Duratio
 			return false
 		}
 	}
-	return live > 0 && routed > 0
+	return routed > 0 && countLive(pods) > 0
 }
 
 // PodSetUnavailableOnParkedMember reports whether a pod set is out of
@@ -238,9 +254,9 @@ func PodSetDarkOnReadiness(pods []*corev1.Pod, now time.Time, grace time.Duratio
 // resolve, so the set keeps the consult.
 func PodSetUnavailableOnParkedMember(pods []*corev1.Pod, desired int32, now time.Time, grace time.Duration) bool {
 	var serving int32
-	parked := false
+	outOfService := false
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil || query.IsTerminalPod(pod) {
+		if !podPresent(pod) {
 			continue
 		}
 		if podreadiness.ReadyAndServing(pod) {
@@ -248,10 +264,10 @@ func PodSetUnavailableOnParkedMember(pods []*corev1.Pod, desired int32, now time
 			continue
 		}
 		if podOutOfService(pod, now, grace) {
-			parked = true
+			outOfService = true
 		}
 	}
-	return parked && serving < desired
+	return outOfService && serving < desired
 }
 
 // PodSetShortOfMember reports whether a pod set is out of the
@@ -264,13 +280,7 @@ func PodSetUnavailableOnParkedMember(pods []*corev1.Pod, desired int32, now time
 // count. A missing pod has no wait that resolves on its own, so no grace
 // applies; a set with no live pod left is read by PodSetLost.
 func PodSetShortOfMember(pods []*corev1.Pod, desired int32) bool {
-	var live int32
-	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp != nil || query.IsTerminalPod(pod) {
-			continue
-		}
-		live++
-	}
+	live := int32(countPresent(pods))
 	return live > 0 && live < desired
 }
 

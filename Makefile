@@ -194,6 +194,7 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 	@# the Helm release record stays far below its 1 MiB Secret limit. The
 	@# rendered CRDs equal config/crd/full; the ome-crd render test enforces it.
 	@$(GO_CMD) run ./cmd/crd-gen helmchart --out charts/ome-crd/templates --partials _schemas.tpl --min-bytes 2048 config/crd/full/ome.io_*.yaml
+	@$(GO_CMD) run ./cmd/crd-gen shippedschema --out pkg/controller/v1beta1/irstatus/crdskew/zz_generated.shipped_schema.json config/crd/full/ome.io_*.yaml
 	@cp config/rbac/role.yaml charts/ome-resources/templates/ome-controller/rbac/role.yaml
 	@# The policy CRD templates are Helm-gated (each feature installs
 	@# CRD + controller + webhook together); the generator writes plain
@@ -690,9 +691,10 @@ TEST_ENV = \
 # $(2): Output suffix (e.g., cmd, pkg, internal)
 # $(3): Optional suffix for filename (e.g., -no-xet)
 # go test stops one package after 10 minutes unless told otherwise. The
-# in-process rollout models and the replay goldens run close to that on a
-# two-core runner; this budget covers them with room to grow.
-GO_TEST_TIMEOUT ?= 30m
+# slowest package decides: the in-process rollout models of the
+# InferenceService and workload packages run near an hour on a shared
+# runner; this budget covers them with room to grow.
+GO_TEST_TIMEOUT ?= 120m
 
 define run_go_test
 	@echo "🧪 Running $(2) tests $(3)..."

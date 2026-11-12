@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
@@ -928,7 +929,7 @@ func TestReconcile_SinglePodInPlaceDiffIsGatedAsRecreate(t *testing.T) {
 
 // inPlaceOnlyHarness converges replicas single-pod Instances on v1 under
 // InPlaceOnly with the given unavailability budget and restart policy,
-// with the runner container named as production names it so container
+// with the runner container named as the renderer names it so container
 // restart evidence is read.
 func inPlaceOnlyHarness(t *testing.T, replicas int32, maxUnavailable intstr.IntOrString, policy types.RestartPolicy) *recoveryHarness {
 	t.Helper()
@@ -2897,10 +2898,103 @@ func TestReconcile_CrashLoopingStableInstanceHoldsTheRollBetweenItsCrashes(t *te
 
 			if tc.held {
 				requireBudgetHoldOnServingInstance(t, f, 3)
+				requireHoldNames(t, f.lastHold(), "Instance 0 not serving (pod ", "restarted since Ready, Ready again for less than the 30s window")
 				return
 			}
 			requireStartAdmitted(t, f, 3)
 		})
+	}
+}
+
+// restartedEnginePod is the pod of a single-pod engine Instance whose
+// runner the kubelet restarted three times, the last run Ready again for
+// readyAgainFor; rev relabels it onto another revision when not empty.
+func restartedEnginePod(idx int32, now time.Time, readyAgainFor time.Duration, rev string) *corev1.Pod {
+	pod := servingEnginePod(idx)
+	if rev != "" {
+		pod.Labels[query.LabelRevisionHash] = rev
+	}
+	pod.CreationTimestamp = metav1.NewTime(now.Add(-time.Hour))
+	readyAgain := now.Add(-readyAgainFor)
+	pod.Status.ContainerStatuses[0].RestartCount = 3
+	pod.Status.ContainerStatuses[0].State = corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(readyAgain.Add(-2 * time.Second))}}
+	pod.Status.ContainerStatuses[0].LastTerminationState = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+		ExitCode: 137, Reason: "Error",
+		StartedAt:  metav1.NewTime(readyAgain.Add(-20 * time.Second)),
+		FinishedAt: metav1.NewTime(readyAgain.Add(-3 * time.Second)),
+	}}
+	for i := range pod.Status.Conditions {
+		switch pod.Status.Conditions[i].Type {
+		case corev1.ContainersReady, corev1.PodReady:
+			pod.Status.Conditions[i].LastTransitionTime = metav1.NewTime(readyAgain)
+		}
+	}
+	return pod
+}
+
+// TestReconcile_CrashLoopingInstanceWithNoReadyAnchorHoldsTheRoll: 4
+// engines under RecreatePod with 1 Instance allowed down and restart
+// policy None; one Instance's runner dies every few seconds and the
+// kubelet restarts it, and its row records no time of entry into Ready (a
+// row written before the engine kept one). The pod's own record shows the
+// restarts, so the Instance counts as down until it has held Ready for the
+// window: a canary step's start on a serving Instance is denied while the
+// held Instance is Ready again for 5 s of a 30 s window, and so is the
+// drain-first start of a revert while that Instance sits on the revision
+// the revert returns to. Once the pod has held Ready for the window the
+// start is admitted.
+func TestReconcile_CrashLoopingInstanceWithNoReadyAnchorHoldsTheRoll(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name          string
+		onTarget      bool
+		readyAgainFor time.Duration
+		held          bool
+		// named is what the hold says about the crash-looping Instance.
+		named []string
+	}{
+		{name: "held by a canary step, Ready again for 5 s of a 30 s window", readyAgainFor: 5 * time.Second, held: true,
+			named: []string{"Instance 0 not serving (pod ", "restarted, with no record of when the Instance entered Ready, Ready again for less than the 30s window"}},
+		{name: "held by a canary step, Ready again for the whole window", readyAgainFor: 40 * time.Second},
+		{name: "on the revision a revert returns to, Ready again for 5 s of a 30 s window", onTarget: true, readyAgainFor: 5 * time.Second, held: true,
+			named: []string{"Instance 3 on revision "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := []types.InstanceStatus{servingRow(0), servingRow(1), servingRow(2), servingRow(3)}
+			var f *terminatingSurgeFixture
+			start := int32(3)
+			if tc.onTarget {
+				rows[3].RunningRevision = "llama-70b-engine-newtarget"
+				f = budgetFixture(t, rows, 4, []int32{0, 1, 2}, restartedEnginePod(3, now, tc.readyAgainFor, "newtarget"))
+				start = 0
+			} else {
+				f = budgetFixture(t, rows, 4, []int32{1, 2, 3}, restartedEnginePod(0, now, tc.readyAgainFor, ""))
+				partition := int32(3)
+				f.in.DesiredSpec.Pacing = &types.WorkloadPacing{Partition: &partition}
+			}
+			f.plan.MinReadySeconds = 30
+
+			f.pass()
+
+			if tc.held {
+				requireBudgetHoldOnServingInstance(t, f, start)
+				requireHoldNames(t, f.lastHold(), tc.named...)
+				return
+			}
+			requireStartAdmitted(t, f, start)
+		})
+	}
+}
+
+// requireHoldNames requires the hold's reason to carry every text given,
+// so the Instance a budget counts is named for the operator.
+func requireHoldNames(t *testing.T, hold *types.RolloutHold, texts ...string) {
+	t.Helper()
+	for _, text := range texts {
+		if hold == nil || !strings.Contains(hold.Reason, text) {
+			t.Fatalf("the hold must name %q, got %+v", text, hold)
+		}
 	}
 }
 
@@ -3130,4 +3224,253 @@ func TestReconcile_FailedGangSurge_StrategyEditRecreateAnswersToTheBudget(t *tes
 		h.dumpState("corrective push")
 		t.Fatalf("the recreate of gang 0 never opened once gang 1 served the fix; last hold %+v", h.lastHold())
 	}
+}
+
+// TestReconcile_InPlaceRetargetAcrossPairingProtocolsGoesThroughTheGate: a
+// prefill patched in place changes its pairing protocol twice, one pass
+// apart. The coordination gate admits the first patch (a decoder serves
+// the new protocol) and the pod is relabelled onto it; the spec then names
+// a third protocol before the promote. The attempt finishes on the
+// revision the gate admitted, with the pod still on that protocol, and the
+// third protocol is a fresh start the gate is asked about with the
+// admitted revision as the one the pod runs; a denial leaves the pod on the
+// admitted protocol, an admission moves it on. The gate is never bypassed
+// by the retarget: a pod moved straight to the third protocol would serve
+// beside no decoder of it.
+func TestReconcile_InPlaceRetargetAcrossPairingProtocolsGoesThroughTheGate(t *testing.T) {
+	scheme := makeScheme(t)
+	spec := &corev1.PodSpec{Containers: []corev1.Container{{Name: "main", Image: "test:v1"}}}
+	revisionOn := func(hash, protocol string) *appsv1.ControllerRevision {
+		raw, err := json.Marshal(revision.DataPayload{PodSpec: spec, PairingProtocol: &protocol})
+		if err != nil {
+			t.Fatalf("marshal revision %s: %v", hash, err)
+		}
+		cr := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine-" + hash, Namespace: "prod"}}
+		cr.Data.Raw = raw
+		return cr
+	}
+	first, second, third := revisionOn("firsthash", "pair-v1"), revisionOn("secondhash", "pair-v2"), revisionOn("thirdhash", "pair-v3")
+	labels := testfixture.PodLabels("llama-70b", types.ComponentEngine, 0, "default", 1, 0)
+	labels[query.LabelRevisionHash] = "firsthash"
+	labels[query.LabelPairingProtocol] = "pair-v1"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "llama-70b-engine-0-default-0",
+			Namespace: "prod",
+			Labels:    labels,
+		},
+		Spec: *spec.DeepCopy(),
+		Status: corev1.PodStatus{
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.ContainersReady, Status: corev1.ConditionTrue},
+				{Type: query.ServingConditionType, Status: corev1.ConditionTrue},
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
+			ContainerStatuses: []corev1.ContainerStatus{{Name: "main", Image: "test:v1", Ready: true}},
+		},
+	}
+	ir := &v1beta1.InferenceReplica{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b-engine", Namespace: "prod"},
+		Status: v1beta1.InferenceReplicaStatus{InstanceStatuses: []v1beta1.OMENativeInstanceStatus{
+			{Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstanceReady, RunningRevision: first.Name, PodCount: 1, ServingPodCount: 1},
+		}},
+	}
+	live := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&v1beta1.InferenceReplica{}).
+		WithObjects(first, second, third, ir, pod).
+		Build()
+	deps := types.Deps{Client: live, APIReader: live}
+	plan := types.ComponentPlan{
+		Component: types.ComponentEngine,
+		Replicas:  1,
+		Instances: []types.InstancePlan{
+			{Index: 0, Incarnation: 1, Runners: []types.RunnerPlan{{Name: "default", Size: 1}}},
+		},
+		InstanceReadyTimeout: 30 * time.Minute,
+		UpdateStrategy: types.UpdateStrategy{
+			Type:          types.UpdateStrategyInPlaceIfPossible,
+			RollingUpdate: &types.RollingUpdate{MaxUnavailable: intOrStringInt(1)},
+		},
+	}
+
+	// The gate records the revision each fresh start is consulted with and
+	// answers as the decoder side allows: a partner serves the admitted
+	// protocol, and none serves the third one until the test says so.
+	var consulted []string
+	var lastHold *types.RolloutHold
+	thirdServedByADecoder := false
+	pass := func(target *appsv1.ControllerRevision) {
+		t.Helper()
+		in := minimalInput(t)
+		in.DesiredSpec.PodSpec = spec
+		isvc := in.OwnerObject.(*v1beta1.InferenceService)
+		current := &v1beta1.InferenceReplica{}
+		if err := live.Get(context.Background(), client.ObjectKeyFromObject(ir), current); err != nil {
+			t.Fatalf("get InferenceReplica: %v", err)
+		}
+		for _, status := range current.Status.InstanceStatuses {
+			in.ObservedState.InstanceStatuses = append(in.ObservedState.InstanceStatuses, v1beta1convert.InstanceStatusToWorkload(status))
+		}
+		in.MutateInstance = roundTripMutateInstance(live, isvc, types.ComponentEngine)
+		in.UpdateGate = func(fromRevision string, _ types.UpdateStrategyType, _, _ int32) (bool, types.RolloutHoldGate, string) {
+			consulted = append(consulted, fromRevision)
+			if target == third && !thirdServedByADecoder {
+				return false, types.RolloutHoldGatePairing, "no serving decoder runs cohort pair-v3 yet"
+			}
+			return true, "", ""
+		}
+		in.RecordRolloutHold = func(hold *types.RolloutHold) { lastHold = hold }
+		if _, err := workload.Reconcile(context.Background(), deps, in, plan, target); err != nil {
+			t.Fatalf("Reconcile toward %s: %v", target.Name, err)
+		}
+	}
+	podReads := func() (protocol, hash string) {
+		t.Helper()
+		got := &corev1.Pod{}
+		if err := live.Get(context.Background(), client.ObjectKeyFromObject(pod), got); err != nil {
+			t.Fatalf("get pod: %v", err)
+		}
+		return got.Labels[query.LabelPairingProtocol], got.Labels[query.LabelRevisionHash]
+	}
+	row := func() *v1beta1.OMENativeInstanceStatus {
+		t.Helper()
+		status := instanceStatusByIndex(live, &v1beta1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "llama-70b", Namespace: "prod"}}, v1beta1.EngineComponent, 0)
+		if status == nil {
+			t.Fatalf("instance 0 status not found")
+		}
+		return status
+	}
+
+	// The first change: the gate admits the patch toward pair-v2 and the pod
+	// is relabelled onto it.
+	pass(second)
+	if !slices.Equal(consulted, []string{first.Name}) {
+		t.Fatalf("the first patch is consulted with the revision the pod runs: %v", consulted)
+	}
+	if protocol, hash := podReads(); protocol != "pair-v2" || hash != "secondhash" {
+		t.Fatalf("the admitted patch relabels the pod onto pair-v2: protocol=%q hash=%q", protocol, hash)
+	}
+	if s := row(); s.Phase != v1beta1.OMENativeInstanceUpdating || s.Operation == nil || s.Operation.TargetRevision != second.Name {
+		t.Fatalf("the attempt is open toward the admitted revision: %+v", s)
+	}
+
+	// The second change lands before the promote: the attempt finishes on
+	// the admitted revision and the pod keeps pair-v2.
+	pass(third)
+	if protocol, hash := podReads(); protocol != "pair-v2" || hash != "secondhash" {
+		t.Fatalf("the pod must keep the protocol the gate admitted it onto until the gate admits the next one: protocol=%q hash=%q", protocol, hash)
+	}
+	if s := row(); s.Phase != v1beta1.OMENativeInstanceReady || s.RunningRevision != second.Name {
+		t.Fatalf("the attempt must promote onto the admitted revision: phase=%s running=%s operation=%+v", s.Phase, s.RunningRevision, s.Operation)
+	}
+	if len(consulted) != 1 {
+		t.Fatalf("finishing the admitted attempt is not a start: consulted %v", consulted)
+	}
+
+	// The third protocol is a fresh start: consulted with the admitted
+	// revision as the one the pod runs, held while no decoder serves it.
+	pass(third)
+	if !slices.Equal(consulted, []string{first.Name, second.Name}) {
+		t.Fatalf("the start toward pair-v3 is consulted with the admitted revision: %v", consulted)
+	}
+	if lastHold == nil || lastHold.Gate != types.RolloutHoldGatePairing {
+		t.Fatalf("the start toward pair-v3 is held under the Pairing gate: %+v", lastHold)
+	}
+	if protocol, _ := podReads(); protocol != "pair-v2" {
+		t.Fatalf("a held start moves nothing: protocol=%q", protocol)
+	}
+
+	// A decoder serves pair-v3: the start is admitted and the pod moves on.
+	thirdServedByADecoder = true
+	pass(third)
+	if protocol, hash := podReads(); protocol != "pair-v3" || hash != "thirdhash" {
+		t.Fatalf("the admitted start relabels the pod onto pair-v3: protocol=%q hash=%q", protocol, hash)
+	}
+	pass(third)
+	if s := row(); s.Phase != v1beta1.OMENativeInstanceReady || s.RunningRevision != third.Name {
+		t.Fatalf("the Instance promotes onto pair-v3: phase=%s running=%s", s.Phase, s.RunningRevision)
+	}
+}
+
+// TestReconcile_BudgetTwo_ServingUnprovenStartIsCountedOnce: 4 engines
+// serve version 1 under RecreatePod in one rollingUpdate group that allows
+// 2 Instances down, the Component's own maxUnavailable 2 as well, restart
+// policy None and a 60 s window. The kubelet restarted Instance 0's runner
+// and it is Ready again for 5 s, so the group's gate counts Instance 0 as
+// down on its own. Version 2 is pushed. The start on Instance 0 opens with
+// no consult and charges the gate nothing; the one consult of the pass,
+// for Instance 1, carries no start in flight and is admitted beside
+// Instance 0, so 2 Instances roll under a budget of 2. Instances 2 and 3
+// wait on the Component's budget.
+func TestReconcile_BudgetTwo_ServingUnprovenStartIsCountedOnce(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	two := intstr.FromInt32(2)
+	in, plan, _ := crashLoopRepairFixture(t, 4, &two)
+	clk := clocktesting.NewFakeClock(now)
+	in.Clock = clk
+	plan.MinReadySeconds = 30
+	for idx := range in.ObservedState.InstanceStatuses {
+		in.ObservedState.InstanceStatuses[idx].ServingPodCount = 1
+		in.ObservedState.InstanceStatuses[idx].ReadySince = &metav1.Time{Time: now.Add(-10 * time.Minute)}
+	}
+	pods := []*corev1.Pod{restartedEnginePod(0, now, 5*time.Second, ""), servingEnginePod(1), servingEnginePod(2), servingEnginePod(3)}
+	isvc := rollingGroupISVC(two)
+	in.OwnerObject, in.EventTarget = isvc, isvc
+	replica := publishedEngineReplica(in, 4, 4)
+	replica.Spec.MinReadySeconds = 30
+	objects := []client.Object{isvc, replica}
+	for _, pod := range pods {
+		objects = append(objects, pod)
+	}
+	c := fake.NewClientBuilder().WithScheme(makeScheme(t)).WithObjects(objects...).Build()
+	target := updateTarget()
+	var consults []int32
+	in.UpdateGate = func(from string, strategy types.UpdateStrategyType, surge, unavail int32) (bool, types.RolloutHoldGate, string) {
+		consults = append(consults, unavail)
+		// The adapter hands the gate one pod list for the whole pass.
+		allowed, held, reason := coordination.EvaluateUpdateGateWithPods(ctx, c, isvc, v1beta1.EngineComponent, from, target, nil,
+			coordination.GroupDefaults{ProvingGrace: in.StuckPodGrace}, strategy, surge, unavail, func() ([]*corev1.Pod, error) { return pods, nil })
+		return allowed, types.RolloutHoldGate(held), reason
+	}
+	store := installRepairStore(&in)
+	deps := types.Deps{Client: c, APIReader: c, Recorder: record.NewFakeRecorder(16), Expectations: types.NewExpectations(), Clock: clk}
+
+	if _, err := workload.Reconcile(ctx, deps, in, plan, target); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var started []int32
+	for idx := int32(0); idx < 4; idx++ {
+		if s := store.status(idx); s != nil && s.Phase == types.InstancePhaseUpdating {
+			started = append(started, idx)
+		}
+	}
+	if !slices.Equal(started, []int32{0, 1}) {
+		t.Fatalf("starts opened on Instances %v, want [0 1]: the start on Instance 0 must not spend the group budget twice", started)
+	}
+	if !slices.Equal(consults, []int32{0}) {
+		t.Fatalf("gate consults carried in-flight %v, want one consult carrying 0: the start on Instance 0 is not put to the gate and charges it nothing", consults)
+	}
+}
+
+// rollingGroupISVC is a service whose one rollingUpdate group holds the
+// engine alone, allows no surge and maxUnavailable Instances down, with a
+// run open on that plan.
+func rollingGroupISVC(maxUnavailable intstr.IntOrString) *v1beta1.InferenceService {
+	zero := intstr.FromInt32(0)
+	group := v1beta1.RolloutGroup{
+		Components:    []v1beta1.ComponentType{v1beta1.EngineComponent},
+		RollingUpdate: &v1beta1.GroupRollingUpdate{MaxSurge: &zero, MaxUnavailable: &maxUnavailable},
+	}
+	isvc := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "llama-70b", Namespace: "prod", UID: "uid-1"},
+		Spec:       v1beta1.InferenceServiceSpec{Rollout: &v1beta1.RolloutSpec{Groups: []v1beta1.RolloutGroup{group}}},
+	}
+	isvc.Status.Rollout = &v1beta1.RolloutStatus{ActiveRun: &v1beta1.RolloutRun{
+		RunID:    "run-1",
+		OpenedAt: metav1.Now(),
+		Plan:     v1beta1.RolloutRunPlan{Groups: []v1beta1.RolloutRunGroup{{Source: v1beta1.RolloutPlanSourceInline, Group: group}}},
+	}}
+	return isvc
 }

@@ -68,17 +68,12 @@ func GetValueFromRawExtension(raw runtime.RawExtension, key string) (interface{}
 	return val, nil
 }
 
-// GetTargetServicePort returns the port of the target service (router or engine).
-// For raw deployment mode, it uses RouterServiceName/EngineServiceName.
-// Returns the Service's first port, or constants.CommonISVCPort when the
-// Service declares none; a Service that cannot be read is an error.
-func GetTargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService) (int32, error) {
-	return TargetServicePort(ctx, c, isvc, isvc.Spec.Router != nil)
-}
-
-// TargetServicePort is GetTargetServicePort with the entrypoint spelled out:
-// the router's Service when hasRouter, else the engine's. Callers that serve
-// a role through a referenced replica have no spec.router to test.
+// TargetServicePort returns the port of the Service that fronts the
+// InferenceService: the router's Service when hasRouter, else the engine's.
+// The caller says which, since a role served through a referenced replica
+// has no spec.router to test. Returns the Service's first port; a Service
+// that cannot be read, or that declares no port, is an error, so a caller
+// never names a port the Service does not declare.
 func TargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.InferenceService, hasRouter bool) (int32, error) {
 	serviceName := constants.EngineServiceName(isvc.Name)
 	if hasRouter {
@@ -88,7 +83,10 @@ func TargetServicePort(ctx context.Context, c client.Client, isvc *v1beta1.Infer
 	if err != nil {
 		return 0, err
 	}
-	return firstPort(ports, constants.CommonISVCPort), nil
+	if len(ports) == 0 {
+		return 0, fmt.Errorf("service %s/%s declares no port", isvc.Namespace, serviceName)
+	}
+	return ports[0].Port, nil
 }
 
 // servicePorts reads the ports of the named Service. Service names are
@@ -128,6 +126,20 @@ func MergedRunnerPorts(specs v1beta1.RoleSpecs) map[v1beta1.ComponentType][]core
 		if ports := runnerContainerPorts(runner, containers); len(ports) > 0 {
 			out[view.Type] = ports
 		}
+	}
+	return out
+}
+
+// MergedServicePortAppProtocols returns each Component's ServicePortAppProtocols
+// from the merged spec its stable Service is built from, so a runtime's
+// declarations count. A Component that declares nothing is left out.
+func MergedServicePortAppProtocols(specs v1beta1.RoleSpecs) map[v1beta1.ComponentType]map[string]string {
+	out := make(map[v1beta1.ComponentType]map[string]string, len(v1beta1.Roles))
+	for _, view := range specs.Declared() {
+		if view.Extension == nil || len(view.Extension.ServicePortAppProtocols) == 0 {
+			continue
+		}
+		out[view.Type] = view.Extension.ServicePortAppProtocols
 	}
 	return out
 }

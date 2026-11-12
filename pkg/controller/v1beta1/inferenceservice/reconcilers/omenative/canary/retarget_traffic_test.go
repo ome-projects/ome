@@ -11,7 +11,7 @@ import (
 
 // A traffic target names a revision only while that revision has a serving
 // pod. Two transitions can leave a split standing over pods that are gone: a
-// re-target of a live ladder, whose superseded canary is replaced under its
+// re-target of a canary in flight, whose replaced canary is rebuilt under its
 // weight while the new revision stages, and a re-target from the done
 // sentinel, whose pre-canary stable has rolled onto the finished canary by
 // the time the new step's remainder is written. The stories below walk the
@@ -45,7 +45,7 @@ func expectStaging(t *testing.T, isvc *v1beta1.InferenceService, steps int) {
 	}
 }
 
-// twoReplicaSplit is the manual two-step ladder on a two-replica Component
+// twoReplicaSplit is the manual two-step canary on a two-replica Component
 // at its first step: one instance held on the stable revision, one serving
 // the canary, the split programmed under the manual hold.
 func twoReplicaSplit(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
@@ -62,8 +62,8 @@ func twoReplicaSplit(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) 
 	return isvc, in
 }
 
-// A re-target while the split serves: the superseded canary's weight returns
-// to the stable revision on the pass that re-arms, stays there while that
+// A re-target while the split serves: the replaced canary's weight returns
+// to the stable revision on the pass that starts again, stays there while that
 // canary's only pod is replaced and the new revision is not yet Ready, and
 // the new step's gate restores the split on the revision that now serves.
 func TestReconcile_RetargetMidSplitReturnsTrafficToStable(t *testing.T) {
@@ -75,7 +75,7 @@ func TestReconcile_RetargetMidSplitReturnsTrafficToStable(t *testing.T) {
 	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"old": {percent: 100}})
 	expectTrafficServes(t, isvc, v1beta1.EngineComponent, in.PerRevisionPods)
 
-	// The superseded canary's pod is replaced; its replacement is not Ready.
+	// The replaced canary's pod is rebuilt; its replacement is not Ready.
 	in.PerRevisionPods = map[string]int32{"old": 1}
 	mustReconcile(t, isvc, in)
 	expectStaging(t, isvc, 2)
@@ -112,7 +112,7 @@ func setPDReadyPods(in *ReconcileInputs, engine, decoder map[string]int32) {
 	}
 }
 
-// The same re-target in a two-member unit: every member's superseded weight
+// The same re-target in a two-member unit: every member's replaced weight
 // returns to its own stable revision, the whole unit waits for every
 // member's new capacity, and the gate restores every member's split.
 func TestReconcile_RetargetMidSplitReturnsEveryMemberToStable(t *testing.T) {
@@ -141,7 +141,7 @@ func TestReconcile_RetargetMidSplitReturnsEveryMemberToStable(t *testing.T) {
 	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"old": {percent: 100}})
 	expectTargets(t, isvc, v1beta1.DecoderComponent, map[string]trafficWant{"decold": {percent: 100}})
 
-	// The superseded pods of both members are replaced before anything new is Ready.
+	// The replaced pods of both members are rebuilt before anything new is Ready.
 	setPDReadyPods(&in, map[string]int32{"old": 1}, map[string]int32{"decold": 1})
 	mustReconcile(t, isvc, in)
 	expectTrafficServes(t, isvc, v1beta1.EngineComponent, in.PerRevisionPods)
@@ -165,9 +165,9 @@ func TestReconcile_RetargetMidSplitReturnsEveryMemberToStable(t *testing.T) {
 	expectTrafficServes(t, isvc, v1beta1.DecoderComponent, in.GroupReadyPerRevisionPods[v1beta1.DecoderComponent])
 }
 
-// doneRollingTwoReplicas drives the two-replica ladder to its done sentinel:
+// doneRollingTwoReplicas drives the two-replica canary to its done sentinel:
 // the final step shifted 100% onto the canary with no drain window, the
-// floor is released and its instance, still serving the pre-canary stable,
+// kept stable instance is released and, still serving the pre-canary stable,
 // has begun its roll.
 func doneRollingTwoReplicas(t *testing.T) (*v1beta1.InferenceService, ReconcileInputs) {
 	t.Helper()
@@ -179,14 +179,14 @@ func doneRollingTwoReplicas(t *testing.T) (*v1beta1.InferenceService, ReconcileI
 	res := mustReconcile(t, isvc, in)
 	cs := rollout.CanaryStatusFor(&isvc.Status, v1beta1.EngineComponent)
 	if cs.CurrentStep != 2 || phaseOf(isvc) != v1beta1.RolloutPhasePromoting || res.Complete {
-		t.Fatalf("the final step must set the done sentinel with the floor still rolling, got step %d phase %q res %+v", cs.CurrentStep, phaseOf(isvc), res)
+		t.Fatalf("the final step must set the done sentinel with the kept stable instance still rolling, got step %d phase %q res %+v", cs.CurrentStep, phaseOf(isvc), res)
 	}
 	expectTargets(t, isvc, v1beta1.EngineComponent, map[string]trafficWant{"new": {percent: 100, latest: true}})
 	return isvc, in
 }
 
-// A re-target from the done sentinel: the released floor rolls onto the
-// finished canary, so nothing serves the pre-canary stable the new ladder
+// A re-target from the done sentinel: the released stable instance rolls onto the
+// finished canary, so nothing serves the pre-canary stable the new canary
 // still records as its rollback target. The new step's remainder is written
 // on the revision that serves in that stable's place, and the identity the
 // rollback returns to is left as it is.
@@ -197,12 +197,12 @@ func TestReconcile_RetargetAfterCutoverSplitsOnTheRevisionThatServes(t *testing.
 		afterRetarget map[string]trafficWant
 	}{
 		{
-			name:          "the floor has finished rolling when the target lands",
+			name:          "the kept stable instance has finished rolling when the target lands",
 			atRetarget:    map[string]int32{"new": 2},
 			afterRetarget: map[string]trafficWant{"new": {percent: 100}},
 		},
 		{
-			name:          "the floor is still rolling when the target lands",
+			name:          "the kept stable instance is still rolling when the target lands",
 			atRetarget:    map[string]int32{"new": 1, "old": 1},
 			afterRetarget: map[string]trafficWant{"old": {percent: 100}},
 		},
@@ -217,7 +217,7 @@ func TestReconcile_RetargetAfterCutoverSplitsOnTheRevisionThatServes(t *testing.
 			expectTargets(t, isvc, v1beta1.EngineComponent, tc.afterRetarget)
 			expectTrafficServes(t, isvc, v1beta1.EngineComponent, in.PerRevisionPods)
 
-			// The floor's roll lands: nothing serves the pre-canary stable, so
+			// The kept stable instance's roll lands: nothing serves the pre-canary stable, so
 			// the finished canary carries the whole remainder in its place.
 			in.PerRevisionPods = map[string]int32{"new": 2}
 			mustReconcile(t, isvc, in)

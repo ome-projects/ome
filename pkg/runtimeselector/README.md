@@ -69,9 +69,6 @@ Handles compatibility checking:
 
 ```go
 type RuntimeMatcher interface {
-    // Check basic compatibility
-    IsCompatible(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (bool, error)
-
     // Get detailed compatibility report
     GetCompatibilityDetails(runtime *v1beta1.ServingRuntimeSpec, model *v1beta1.BaseModelSpec, isvc *v1beta1.InferenceService, runtimeName string) (*CompatibilityReport, error)
 }
@@ -295,7 +292,6 @@ if runtimeselector.IsRuntimeCompatibilityError(err) {
     log.Error(err, "Runtime incompatible",
         "runtime", e.RuntimeName,
         "model", e.ModelName,
-        "format", e.ModelFormat,
         "reason", e.Reason)
 }
 ```
@@ -579,25 +575,10 @@ If runtime selection is slow:
 
 1. **Enable caching**: Ensure watches are configured for runtime resources
 2. **Check for excessive runtimes**: Large numbers of runtimes can slow selection
-3. **Review logging**: Disable detailed logging in production
-   ```go
-   config := &runtimeselector.Config{
-       EnableDetailedLogging: false,  // Disable in production
-   }
-   ```
 
 ### Debugging Tips
 
-Enable detailed logging to see selection logic:
-
-```go
-config := &runtimeselector.Config{
-    Client:                mgr.GetClient(),
-    EnableDetailedLogging: true,
-    DefaultPriority:       1,
-}
-selector := runtimeselector.NewWithConfig(config)
-```
+The selector logs its selection steps through the logger the controller manager hands it; raise the manager's log verbosity to see them.
 
 Check compatibility details programmatically:
 
@@ -611,9 +592,6 @@ for _, runtime := range runtimes {
     log.Info("Compatible runtime found",
         "name", runtime.Name,
         "score", runtime.Score,
-        "isCluster", runtime.IsCluster,
-        "formatMatch", runtime.MatchDetails.FormatMatch,
-        "frameworkMatch", runtime.MatchDetails.FrameworkMatch,
-        "priority", runtime.MatchDetails.Priority)
+        "isCluster", runtime.IsCluster)
 }
 ```

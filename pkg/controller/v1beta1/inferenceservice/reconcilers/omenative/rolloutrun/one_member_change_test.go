@@ -6,10 +6,10 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// A rollingUpdate group whose members change one at a time. The run pins
+// A rollingUpdate group whose members change one at a time. The run records
 // every member: a changed one at its new target, an unchanged one at the
 // revision it already runs. The run closes once every member rests on its
-// pin, which an unchanged member does from the start.
+// record, which an unchanged member does from the start.
 
 const (
 	decoderRev    = "llm-a-decoder-dddddddd"
@@ -44,16 +44,16 @@ func requireTarget(t *testing.T, targets []v1beta1.RolloutRunTarget, comp v1beta
 			continue
 		}
 		if target.Revision != revision || target.StableRevision != stable {
-			t.Fatalf("%s pinned at %+v, want revision %q with stable %q", comp, target, revision, stable)
+			t.Fatalf("%s recorded at %+v, want revision %q with stable %q", comp, target, revision, stable)
 		}
 		return
 	}
 	t.Fatalf("no %s target among %+v", comp, targets)
 }
 
-// Only the engine's template changed: the run pins the decoder at the
+// Only the engine's template changed: the run records the decoder at the
 // revision it runs, stays open while the engine rolls, and closes Completed
-// once the engine's pair agrees with its pin and every Instance is updated,
+// once the engine's pair agrees with its record and every Instance is updated,
 // the decoder never having moved.
 func TestOneMemberChangeOpensARunThatPinsTheOtherAtItsOwnRevision(t *testing.T) {
 	isvc := isvcFixture(pdRollingGroup())
@@ -83,10 +83,10 @@ func TestOneMemberChangeOpensARunThatPinsTheOtherAtItsOwnRevision(t *testing.T) 
 }
 
 // The decoder's template changes while the engine is still rolling toward
-// its own target. The pinned run closes Superseded and a fresh one opens in
+// its own target. The recorded run closes Superseded and a fresh one opens in
 // the same pass: the engine keeps its in-flight target and its stable, the
-// decoder is pinned at its new target with the revision it runs as stable,
-// and the fresh run closes only when both rest on their pins.
+// decoder is recorded at its new target with the revision it runs as stable,
+// and the fresh run closes only when both rest on their records.
 func TestASecondMemberChangeMidRollKeepsTheFirstMembersTarget(t *testing.T) {
 	isvc := isvcFixture(pdRollingGroup())
 	if out := pass(t, isvc, divergedIR(oldRev, newRev), decoderIR(decoderRev, decoderRev, 2, 2)); !out.Opened {
@@ -100,7 +100,7 @@ func TestASecondMemberChangeMidRollKeepsTheFirstMembersTarget(t *testing.T) {
 	}
 	run := requirePinned(t, isvc)
 	if run.RunID == first {
-		t.Fatal("the decoder's new target must supersede the engine's run, not continue it")
+		t.Fatal("the decoder's new target must replace the engine's run, not continue it")
 	}
 	if last := isvc.Status.Rollout.LastRun; last == nil || last.Outcome != v1beta1.RolloutRunSuperseded {
 		t.Fatalf("lastRun = %+v, want the first run closed Superseded", last)

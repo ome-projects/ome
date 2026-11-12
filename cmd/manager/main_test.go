@@ -24,6 +24,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -33,6 +34,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/controllerconfig"
+	"sigs.k8s.io/ome/pkg/webhook/admission/splitplan"
 )
 
 // withArgs gives a test its own flag set and arguments for GetOptions and
@@ -143,6 +145,74 @@ func TestGetOptionsLeaderElectionTiming(t *testing.T) {
 	assert.Equal(t, 40*time.Second, o.leaderElectionTiming.RenewDeadline)
 	assert.Equal(t, 8*time.Second, o.leaderElectionTiming.RetryPeriod)
 	assert.NoError(t, o.leaderElectionTiming.Validate())
+}
+
+func TestManagerOptionsLeaderElectionReleaseOnCancel(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "the manager option is off without the flag", args: []string{"cmd", "--leader-elect"}},
+		{name: "the flag turns the manager option on", args: []string{"cmd", "--leader-elect", "--leader-elect-release-on-cancel"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withArgs(t, tt.args...)
+
+			opts := (&startup{options: GetOptions()}).managerOptions(cache.Options{})
+			t.Cleanup(opts.EventBroadcaster.Shutdown) //nolint:staticcheck // managerOptions starts the broadcaster the manager would own
+			assert.Equal(t, tt.want, opts.LeaderElectionReleaseOnCancel)
+		})
+	}
+}
+
+func TestValidateLeaderElectionTimingWithReleaseOnCancel(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{
+			name: "start-up goes on when the lease outlasts a request timeout, retry and twice renew",
+			args: []string{"cmd", "--leader-elect", "--leader-elect-release-on-cancel",
+				"--leader-elect-lease-duration=120s", "--leader-elect-renew-deadline=40s", "--leader-elect-retry-period=8s"},
+			want: true,
+		},
+		{
+			name: "start-up stops when the lease does not outlast a request timeout, retry and twice renew",
+			args: []string{"cmd", "--leader-elect", "--leader-elect-release-on-cancel",
+				"--leader-elect-lease-duration=60s", "--leader-elect-renew-deadline=40s", "--leader-elect-retry-period=8s"},
+		},
+		{
+			name: "start-up stops when the timing flags are unset",
+			args: []string{"cmd", "--leader-elect", "--leader-elect-release-on-cancel"},
+		},
+		{
+			name: "start-up goes on without the flag at a timing the flag would refuse",
+			args: []string{"cmd", "--leader-elect",
+				"--leader-elect-lease-duration=60s", "--leader-elect-renew-deadline=40s", "--leader-elect-retry-period=8s"},
+			want: true,
+		},
+		{
+			name: "start-up goes on with leader election off, the release flag set and no timing",
+			args: []string{"cmd", "--leader-elect-release-on-cancel"},
+			want: true,
+		},
+		{
+			name: "start-up goes on with leader election off at a timing the release would refuse",
+			args: []string{"cmd", "--leader-elect-release-on-cancel",
+				"--leader-elect-lease-duration=60s", "--leader-elect-renew-deadline=40s", "--leader-elect-retry-period=8s"},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withArgs(t, tt.args...)
+
+			assert.Equal(t, tt.want, (&startup{options: GetOptions()}).validateLeaderElectionTiming())
+		})
+	}
 }
 
 func TestGetOptionsKubeAPIRateLimits(t *testing.T) {
@@ -322,6 +392,11 @@ func TestDeclaredWebhooksAreRegistered(t *testing.T) {
 		if path, isLit := call.Args[0].(*ast.BasicLit); isLit && selector.Sel.Name == "Register" && isWebhookServer(selector.X) {
 			registered[strings.Trim(path.Value, `"`)] = true
 		}
+		if named, isNamed := call.Args[0].(*ast.SelectorExpr); isNamed && selector.Sel.Name == "Register" && isWebhookServer(selector.X) {
+			if path, known := namedWebhookPaths[exprName(named)]; known {
+				registered[path] = true
+			}
+		}
 		if selector.Sel.Name == "NewWebhookManagedBy" && len(call.Args) == 2 {
 			// controller-runtime derives the validator path from the registered v1beta1 type.
 			if object, ok := call.Args[1].(*ast.UnaryExpr); ok {
@@ -350,6 +425,20 @@ func TestDeclaredWebhooksAreRegistered(t *testing.T) {
 		}
 	}
 	require.NotZero(t, declared, "no webhook paths found in the manifests")
+}
+
+// namedWebhookPaths resolves the path constants main.go registers by name
+// instead of by string literal.
+var namedWebhookPaths = map[string]string{
+	"splitplan.ValidatorPath": splitplan.ValidatorPath,
+}
+
+// exprName renders a package-qualified selector such as splitplan.ValidatorPath.
+func exprName(expr *ast.SelectorExpr) string {
+	if pkg, ok := expr.X.(*ast.Ident); ok {
+		return pkg.Name + "." + expr.Sel.Name
+	}
+	return expr.Sel.Name
 }
 
 // isWebhookServer reports whether expr is the webhook server a registration

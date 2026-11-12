@@ -141,6 +141,38 @@ spec:
                 required:
                 - name
                 type: object
+              preemption:
+                properties:
+                  borrowWithinCohort:
+                    properties:
+                      maxPriorityThreshold:
+                        format: int32
+                        type: integer
+                      policy:
+                        enum:
+                        - Never
+                        - LowerPriority
+                        type: string
+                    type: object
+                  reclaimWithinCohort:
+                    enum:
+                    - Never
+                    - LowerPriority
+                    - Any
+                    type: string
+                  withinClusterQueue:
+                    enum:
+                    - Never
+                    - LowerPriority
+                    - LowerOrNewerEqualPriority
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: borrowWithinCohort.policy LowerPriority requires reclaimWithinCohort
+                    Any or LowerPriority
+                  rule: '!has(self.borrowWithinCohort) || !has(self.borrowWithinCohort.policy)
+                    || self.borrowWithinCohort.policy != ''LowerPriority'' || (has(self.reclaimWithinCohort)
+                    && self.reclaimWithinCohort in [''Any'', ''LowerPriority''])'
               priorityTier:
                 maxLength: 63
                 pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
@@ -160,6 +192,8 @@ spec:
             - message: a Cohort node must not set priorityTier or distribution; no
                 workload binds to a grouping
               rule: self.role != 'Cohort' || (!has(self.priorityTier) && !has(self.distribution))
+            - message: only a ClusterQueue node may set preemption
+              rule: self.role == 'ClusterQueue' || !has(self.preemption)
             - message: a Cohort node's budgets carry only resourceName, resourceFlavor,
                 and nominal
               rule: self.role != 'Cohort' || !has(self.budgets) || self.budgets.all(b,

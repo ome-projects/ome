@@ -10,7 +10,7 @@ import (
 
 // RatioDrainDefaults carries the operator-configured fills the drain
 // feasibility rule reads, so admission judges a group as the rollout will
-// run it. Both come from the operator ConfigMap, read once at startup.
+// run it. All three come from the operator ConfigMap, read once at startup.
 type RatioDrainDefaults struct {
 	// TolerancePercent fills a group that sets maintainRatio but omits its
 	// tolerance (the coordination block). Nil means no default is
@@ -21,6 +21,12 @@ type RatioDrainDefaults struct {
 	// projects the Instance count. Nil means unconfigured, and an unset
 	// count then resolves to the API default of one.
 	MinReplicas *int
+	// UpdateStrategyTypes fills a Component that declares no update strategy
+	// type (the deploy.updateStrategy block), keyed by Component, the fill
+	// the reconciler applies before the rollout reads the strategy. A
+	// Component with no fill rolls as the rollout rolls an unset strategy:
+	// SurgeThenDrain.
+	UpdateStrategyTypes map[v1beta1.ComponentType]v1beta1.UpdateStrategyType
 }
 
 // ValidateRatioDrainFeasibility rejects a maintainRatio group whose drain-first
@@ -41,8 +47,8 @@ type RatioDrainDefaults struct {
 // router does not decide that. The ratio check is never consulted for a
 // drain of such a group, so nothing here refuses it (batchStepGoverns). The
 // refusal stays for a group whose engine or decoder patches single pods in
-// place or leaves its strategy unset beside a drain-first member, and for a
-// group that lacks one of the two.
+// place beside a drain-first member, and for a group that lacks one of the
+// two.
 //
 // The operator's prefillDecodeRoll.keepRatio setting widens the batch step to
 // every path of a group that lists both the engine and the decoder, counts a
@@ -54,9 +60,10 @@ type RatioDrainDefaults struct {
 // in-place strategy on a Component whose Instances are multi-node gangs (an
 // in-place update rebuilds the whole gang, and the ratio check reads the
 // rebuild as a drain). SurgeThenDrain members and single-pod in-place members
-// add or keep capacity and are not checked. An unset strategy is not classified
-// here: it resolves through the runtime and operator config, which admission
-// does not read.
+// add or keep capacity and are not checked. A member that declares no
+// strategy rolls by the operator's configured fill for its Component, else as
+// SurgeThenDrain, the rollout's reading of an unset strategy; a strategy the
+// ServingRuntime supplies is not read here.
 //
 // Replicas are read the way the rollout sizes a member: minReplicas when set
 // and positive, else maxReplicas when set, else the count the reconciler
@@ -77,7 +84,7 @@ func ValidateRatioDrainFeasibility(spec *v1beta1.InferenceServiceSpec, defaults 
 		if tolerance == nil {
 			continue
 		}
-		members := ratioGroupMembers(spec, g.Components, defaults.MinReplicas)
+		members := ratioGroupMembers(spec, g.Components, defaults)
 		if len(members) < 2 || batchStepGoverns(members) {
 			continue
 		}
@@ -105,15 +112,15 @@ type ratioMember struct {
 }
 
 // steps reports whether the batch step counts the member's starts: it rolls
-// drain-first or surges. A member with no declared strategy, or one that
-// patches single pods in place, does not step at admission.
+// drain-first or surges. A member that patches single pods in place does not
+// step.
 func (m ratioMember) steps() bool { return m.drainFirst != "" || m.surges }
 
 // batchStepGoverns reports whether the rollout paces the group by the batch
 // step rather than the ratio check: the group lists both the engine and the
 // decoder, and each of them steps; a router does not decide it. It is the
-// admission reading of the engine's rule, taken from the declared strategies
-// and shapes rather than the replicas; a group that lists both is never the
+// admission reading of the engine's rule, taken from the strategies the
+// members roll by and their shapes rather than the replicas; a group that lists both is never the
 // Sequential chain, which the engine also leaves out.
 func batchStepGoverns(members []ratioMember) bool {
 	var engine, decoder bool
@@ -167,8 +174,9 @@ func waysOut(ways ...string) string {
 }
 
 // ratioGroupMembers lists the group's distinct declared Components, in
-// declaration order, each at the replica count the rollout would size it at.
-func ratioGroupMembers(spec *v1beta1.InferenceServiceSpec, components []v1beta1.ComponentType, defaultMinReplicas *int) []ratioMember {
+// declaration order, each at the replica count the rollout would size it at
+// and under the update strategy it would roll by.
+func ratioGroupMembers(spec *v1beta1.InferenceServiceSpec, components []v1beta1.ComponentType, defaults RatioDrainDefaults) []ratioMember {
 	seen := make(map[v1beta1.ComponentType]struct{}, len(components))
 	members := make([]ratioMember, 0, len(components))
 	for _, c := range components {
@@ -176,12 +184,12 @@ func ratioGroupMembers(spec *v1beta1.InferenceServiceSpec, components []v1beta1.
 			continue
 		}
 		seen[c] = struct{}{}
-		replicas := componentReplicaBasis(spec, c, defaultMinReplicas)
+		replicas := componentReplicaBasis(spec, c, defaults.MinReplicas)
 		if replicas <= 0 {
 			continue
 		}
-		strategy, gang := componentUpdateShape(spec, c)
-		m := ratioMember{component: c, replicas: replicas, unit: "pod", surges: strategy == v1beta1.UpdateStrategySurgeThenDrain}
+		strategy, gang := componentUpdateShape(spec, c, defaults.UpdateStrategyTypes)
+		m := ratioMember{component: c, replicas: replicas, unit: "pod", surges: surgeStrategy(strategy)}
 		if gang {
 			m.unit = "gang"
 		}
@@ -303,9 +311,18 @@ func componentReplicaBasis(spec *v1beta1.InferenceServiceSpec, c v1beta1.Compone
 	return int32(constants.DefaultMinReplicas)
 }
 
-// componentUpdateShape reports the Component's declared update strategy
-// (empty when unset) and whether its Instances are multi-pod gangs.
-func componentUpdateShape(spec *v1beta1.InferenceServiceSpec, c v1beta1.ComponentType) (v1beta1.UpdateStrategyType, bool) {
+// surgeStrategy reports whether the strategy brings new pods up before any
+// old pod leaves: SurgeThenDrain, or no strategy at all, which the rollout
+// runs as SurgeThenDrain.
+func surgeStrategy(strategy v1beta1.UpdateStrategyType) bool {
+	return strategy == v1beta1.UpdateStrategySurgeThenDrain || strategy == ""
+}
+
+// componentUpdateShape reports the update strategy the Component rolls by
+// and whether its Instances are multi-pod gangs. The strategy is the declared
+// one, else the operator's fill for the Component, else empty, which the
+// rollout runs as SurgeThenDrain.
+func componentUpdateShape(spec *v1beta1.InferenceServiceSpec, c v1beta1.ComponentType, fills map[v1beta1.ComponentType]v1beta1.UpdateStrategyType) (v1beta1.UpdateStrategyType, bool) {
 	role := declaredRoles(spec).find(c)
 	if role == nil {
 		return "", false
@@ -313,6 +330,9 @@ func componentUpdateShape(spec *v1beta1.InferenceServiceSpec, c v1beta1.Componen
 	var strategy v1beta1.UpdateStrategyType
 	if lc := role.extension.Lifecycle; lc != nil && lc.UpdateStrategy != nil {
 		strategy = lc.UpdateStrategy.Type
+	}
+	if strategy == "" {
+		strategy = fills[c]
 	}
 	return strategy, DeclaredMultiPod(role.leader, role.worker)
 }
