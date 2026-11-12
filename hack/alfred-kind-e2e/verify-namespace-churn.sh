@@ -242,9 +242,9 @@ done
 # fenced by the hold-4 pre-release snapshot and the payload's creation time.
 jq -e --slurpfile e "$artifact_dir/evidence.json" --slurpfile h "$artifact_dir/handoff-evidence.json" '
   $e[0] as $e | $h[0] as $h |
-  all(.[];.metadata.uid==$e.ownerUID) and
   [.[]|.metadata.annotations // {}|to_entries[]|
     select(.key|startswith("ome.io/migration-request-v1-"))] as $a |
+  all(.[];.metadata.uid==$e.ownerUID) and
   ($a|length)>0 and ($a|unique_by([.key,.value])|length)==1 and
   ([$a[].key]|unique)==[$h.request.annotationKey] and
   all($a[]; (.value|fromjson)==$h.request.payload)' \
