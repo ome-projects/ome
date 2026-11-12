@@ -77,6 +77,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-
 
+      - name: Build the xet library
+        if: matrix.test-suite == 'unit'
+        # make test vets before it builds the library; a restored
+        # pkg/xet/target may hold an archive with LLVM bitcode, which
+        # go vet refuses to link, so build (and strip) it first.
+        run: make xet-build
+
       - name: Run unit tests
         if: matrix.test-suite == 'unit'
         run: |
@@ -186,6 +193,12 @@ jobs:
           key: ${{ runner.os }}-rust-${{ hashFiles('pkg/xet/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-rust-
+
+      - name: Strip the cached xet library
+        if: matrix.image == 'ome-agent-image'
+        # A restored pkg/xet/target may hold an archive built before the
+        # Makefile stripped its LLVM bitcode; go vet refuses to link one.
+        run: make xet-build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
