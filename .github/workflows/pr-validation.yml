@@ -78,12 +78,30 @@ jobs:
             });
 
   test-and-build:
-    name: Test and Build
+    name: Test and Build (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # The in-process rollout models of the InferenceService and workload
-    # packages run near an hour each on a shared runner (see GO_TEST_TIMEOUT).
+    # The in-process rollout models are CPU-bound and scale with cores; on a
+    # four-core runner the whole suite needs several hours, so the heaviest
+    # packages run in shards of their own (make test-packages).
     timeout-minutes: 180
-    # Remove dependency so tests always run independently
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: workload
+            packages: ./pkg/controller/v1beta1/workload/...
+          - shard: coordination
+            packages: ./pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/...
+          - shard: canary-scaling
+            packages: >-
+              ./pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/canary/...
+              ./pkg/controller/v1beta1/inferenceservice/reconcilers/scaling/...
+              ./pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/rolloutrun/...
+          - shard: rest
+            packages: ''
+    env:
+      # The packages the other shards run, dropped from the rest shard.
+      HEAVY_PACKAGES: pkg/controller/v1beta1/workload|reconcilers/omenative/coordination|reconcilers/omenative/canary|reconcilers/scaling|reconcilers/omenative/rolloutrun
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -118,14 +136,66 @@ jobs:
             ${{ runner.os }}-rust-
 
       - name: Build the xet library
-        # make test vets before it builds the library; a restored
-        # pkg/xet/target may hold an archive with LLVM bitcode, which
-        # go vet refuses to link, so build (and strip) it first.
+        # The shard vets and builds before it tests; a restored pkg/xet/target
+        # may hold an archive with LLVM bitcode, which go vet refuses to link,
+        # so build (and strip) it first.
         run: make xet-build
+
+      - name: Vet
+        if: matrix.shard == 'rest'
+        run: make fmt vet
 
       - name: Run tests
         run: |
-          make test
+          if [ "${{ matrix.shard }}" = rest ]; then
+            make test-packages TEST_SHARD=rest TEST_EXCLUDE="$HEAVY_PACKAGES"
+          else
+            make test-packages TEST_SHARD="${{ matrix.shard }}" TEST_PACKAGES="${{ matrix.packages }}"
+          fi
+
+      - name: Upload the shard's coverage profile
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-${{ matrix.shard }}
+          path: coverage-${{ matrix.shard }}.out
+          retention-days: 7
+
+      - name: Build binaries
+        if: matrix.shard == 'rest'
+        run: |
+          make ome-manager
+          make model-agent
+
+  coverage:
+    name: Coverage
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: Download the shard profiles
+        uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-*
+          path: profiles
+          merge-multiple: true
+
+      - name: Assemble one profile per package group
+        # The shards test disjoint packages, so their blocks never overlap and
+        # make coverage reads the three group profiles it always has.
+        run: |
+          module="$(go list -m)"
+          for group in cmd pkg internal; do
+            { echo "mode: atomic"; grep -h -v '^mode:' profiles/*.out | grep "^${module}/${group}/" || true; } > "coverage-${group}.out"
+          done
 
       - name: Check coverage threshold
         run: |
@@ -139,13 +209,10 @@ jobs:
         with:
           name: coverage-report
           path: |
-            coverage-*.out
+            coverage-cmd.out
+            coverage-pkg.out
+            coverage-internal.out
           retention-days: 7
-
-      - name: Build binaries
-        run: |
-          make ome-manager
-          make model-agent
 
   cli-cross-compile:
     name: CLI cross-compile (CGO_ENABLED=0)
@@ -357,7 +424,7 @@ jobs:
   summary:
     name: PR Validation Summary
     runs-on: ubuntu-latest
-    needs: [pre-commit-checks, test-and-build, cli-cross-compile, docker-validation, lint, generate-drift]
+    needs: [pre-commit-checks, test-and-build, coverage, cli-cross-compile, docker-validation, lint, generate-drift]
     if: always()
     steps:
       - name: PR Status Summary
@@ -371,6 +438,7 @@ jobs:
             const jobs = {
               'pre-commit-checks': '${{ needs.pre-commit-checks.result }}',
               'test-and-build': '${{ needs.test-and-build.result }}',
+              'coverage': '${{ needs.coverage.result }}',
               'cli-cross-compile': '${{ needs.cli-cross-compile.result }}',
               'docker-validation': '${{ needs.docker-validation.result }}',
               'lint': '${{ needs.lint.result }}',

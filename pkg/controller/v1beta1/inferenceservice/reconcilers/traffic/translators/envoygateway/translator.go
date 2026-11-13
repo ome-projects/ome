@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -390,49 +391,78 @@ func applyCircuitBreaker(btp *unstructured.Unstructured, cb *traffic.CircuitBrea
 	return nil
 }
 
+// applyRetry writes the retry intent under spec.retry: the attempt count,
+// the per-try timeout, and the retry-on tokens split into triggers and
+// status codes. A field the intent leaves unset is not written.
 func applyRetry(btp *unstructured.Unstructured, r *traffic.RetryIntent) error {
-	if r.Attempts != nil {
-		if err := unstructured.SetNestedField(
-			btp.Object, int64(*r.Attempts),
-			"spec", "retry", "numRetries",
-		); err != nil {
-			return fmt.Errorf("set retry.numRetries: %w", err)
-		}
+	if err := setRetryAttempts(btp, r.Attempts); err != nil {
+		return err
 	}
-	if r.PerTryTimeout != nil {
-		if err := unstructured.SetNestedField(
-			btp.Object, r.PerTryTimeout.String(),
-			"spec", "retry", "perRetry", "timeout",
-		); err != nil {
-			return fmt.Errorf("set retry.perRetry.timeout: %w", err)
-		}
+	if err := setRetryPerTryTimeout(btp, r.PerTryTimeout); err != nil {
+		return err
 	}
-	if len(r.RetryOn) > 0 {
-		triggers, codes := splitRetryOnTokens(r.RetryOn)
-		if len(triggers) > 0 {
-			items := make([]interface{}, 0, len(triggers))
-			for _, t := range triggers {
-				items = append(items, t)
-			}
-			if err := unstructured.SetNestedSlice(
-				btp.Object, items,
-				"spec", "retry", "retryOn", "triggers",
-			); err != nil {
-				return fmt.Errorf("set retry.retryOn.triggers: %w", err)
-			}
-		}
-		if len(codes) > 0 {
-			items := make([]interface{}, 0, len(codes))
-			for _, c := range codes {
-				items = append(items, int64(c))
-			}
-			if err := unstructured.SetNestedSlice(
-				btp.Object, items,
-				"spec", "retry", "retryOn", "httpStatusCodes",
-			); err != nil {
-				return fmt.Errorf("set retry.retryOn.httpStatusCodes: %w", err)
-			}
-		}
+	if len(r.RetryOn) == 0 {
+		return nil
+	}
+	triggers, codes := splitRetryOnTokens(r.RetryOn)
+	if err := setRetryTriggers(btp, triggers); err != nil {
+		return err
+	}
+	return setRetryStatusCodes(btp, codes)
+}
+
+// setRetryAttempts writes the attempt count as spec.retry.numRetries; nil
+// leaves the field unwritten.
+func setRetryAttempts(btp *unstructured.Unstructured, attempts *int32) error {
+	if attempts == nil {
+		return nil
+	}
+	if err := unstructured.SetNestedField(btp.Object, int64(*attempts), "spec", "retry", "numRetries"); err != nil {
+		return fmt.Errorf("set retry.numRetries: %w", err)
+	}
+	return nil
+}
+
+// setRetryPerTryTimeout writes the per-try timeout as a duration string
+// under spec.retry.perRetry.timeout; nil leaves the field unwritten.
+func setRetryPerTryTimeout(btp *unstructured.Unstructured, timeout *time.Duration) error {
+	if timeout == nil {
+		return nil
+	}
+	if err := unstructured.SetNestedField(btp.Object, timeout.String(), "spec", "retry", "perRetry", "timeout"); err != nil {
+		return fmt.Errorf("set retry.perRetry.timeout: %w", err)
+	}
+	return nil
+}
+
+// setRetryTriggers writes the string tokens as spec.retry.retryOn.triggers;
+// an empty list leaves the field unwritten.
+func setRetryTriggers(btp *unstructured.Unstructured, triggers []string) error {
+	if len(triggers) == 0 {
+		return nil
+	}
+	items := make([]interface{}, 0, len(triggers))
+	for _, t := range triggers {
+		items = append(items, t)
+	}
+	if err := unstructured.SetNestedSlice(btp.Object, items, "spec", "retry", "retryOn", "triggers"); err != nil {
+		return fmt.Errorf("set retry.retryOn.triggers: %w", err)
+	}
+	return nil
+}
+
+// setRetryStatusCodes writes the numeric tokens as
+// spec.retry.retryOn.httpStatusCodes; an empty list leaves the field unwritten.
+func setRetryStatusCodes(btp *unstructured.Unstructured, codes []int32) error {
+	if len(codes) == 0 {
+		return nil
+	}
+	items := make([]interface{}, 0, len(codes))
+	for _, c := range codes {
+		items = append(items, int64(c))
+	}
+	if err := unstructured.SetNestedSlice(btp.Object, items, "spec", "retry", "retryOn", "httpStatusCodes"); err != nil {
+		return fmt.Errorf("set retry.retryOn.httpStatusCodes: %w", err)
 	}
 	return nil
 }

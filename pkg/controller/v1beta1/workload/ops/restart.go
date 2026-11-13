@@ -2079,54 +2079,87 @@ func anyInFlightAttemptAt(input workload.ReconcileInput, rev string) bool {
 // the ladder does not read the row.
 func countCrashOnLadder(ctx context.Context, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, s *workload.InstanceStatus, pods []*corev1.Pod) (bool, string, error) {
 	rebuilds := crashRebuildWarranted(input, plan, s, inst.TotalPods(), pods)
-	l := readCrashLadder(input, s, inst.TotalPods(), pods, rebuilds)
-	if l == nil {
+	reading := readCrashLadder(input, s, inst.TotalPods(), pods, rebuilds)
+	if reading == nil {
 		return false, "", nil
 	}
 	now := metav1.NewTime(input.Now())
-	termination := runnerCrashTermination(l.crash, now)
-	// The block is written before the row: a pass that ends between the
-	// two re-enters here with the crash not yet remembered, and the block
-	// records nothing twice while it counts the wave.
-	if l.record {
-		if err := workload.RecordUpdateFailureInRetryBlockAt(ctx, input, l.rev, l.crash.reason, workload.FailureCauseOf(l.crash.reason), now); err != nil {
-			return false, "", fmt.Errorf("count crash on retry ladder (instance=%d, rev=%s): %w", inst.Index, l.rev, err)
-		}
+	termination := runnerCrashTermination(reading.crash, now)
+	if err := recordCrashOnRevision(ctx, input, inst.Index, reading, now); err != nil {
+		return false, "", err
 	}
-	if l.remember || l.record {
-		if err := rememberCrash(ctx, input, inst.Index, termination, now); err != nil {
-			return false, "", fmt.Errorf("remember crash on the row (instance=%d): %w", inst.Index, err)
-		}
+	if err := rememberCrashOnRow(ctx, input, inst.Index, reading, termination, now); err != nil {
+		return false, "", err
 	}
 	if !rebuilds {
 		return true, "", nil
 	}
-	if l.held {
-		if !l.parks {
-			if err := status.RecordCrashLoopNote(ctx, input, inst.Index, CrashLoopServingNote); err != nil {
-				return false, "", fmt.Errorf("name the crash loop on the row (instance=%d): %w", inst.Index, err)
-			}
-			return true, "", nil
-		}
-		if err := status.StampFailed(ctx, input, inst.Index, termination); err != nil {
-			return false, "", fmt.Errorf("stamp Failed under held retry ladder (instance=%d): %w", inst.Index, err)
-		}
-		// The park lands again on every crash of a set that serves between
-		// them; the warning is owed once per pod set.
-		announced, err := status.Announce(ctx, input, inst.Index, workload.EventReasonInstanceFailed)
-		if err != nil {
-			return false, "", fmt.Errorf("announce the park under held retry ladder (instance=%d): %w", inst.Index, err)
-		}
-		if announced && input.WarnInstanceFailed != nil {
-			input.WarnInstanceFailed(inst.Index, l.crash.pod.Name,
-				fmt.Sprintf("%s: crash after promotion; revision %s held after %d failed attempts", l.crash.reason, l.rev, l.attempts))
+	if reading.held {
+		if err := settleHeldCrash(ctx, input, inst.Index, reading, termination); err != nil {
+			return false, "", err
 		}
 		return true, "", nil
 	}
-	if !l.open {
+	if !reading.open {
 		return true, "", nil
 	}
-	return false, l.rev, nil
+	return false, reading.rev, nil
+}
+
+// recordCrashOnRevision counts a crash the revision's record does not count
+// yet. The record is written before the row: a pass that ends between the
+// two re-enters with the crash not yet remembered, and the record counts
+// nothing twice while it counts the wave.
+func recordCrashOnRevision(ctx context.Context, input workload.ReconcileInput, idx int32, reading *crashLoopLadder, now metav1.Time) error {
+	if !reading.record {
+		return nil
+	}
+	if err := workload.RecordUpdateFailureInRetryBlockAt(ctx, input, reading.rev, reading.crash.reason, workload.FailureCauseOf(reading.crash.reason), now); err != nil {
+		return fmt.Errorf("count crash on retry ladder (instance=%d, rev=%s): %w", idx, reading.rev, err)
+	}
+	return nil
+}
+
+// rememberCrashOnRow dates the crash on the row at the pass that counts it:
+// at its first sighting, and again when the record counts it.
+func rememberCrashOnRow(ctx context.Context, input workload.ReconcileInput, idx int32, reading *crashLoopLadder, termination *workload.InstanceTermination, now metav1.Time) error {
+	if !reading.remember && !reading.record {
+		return nil
+	}
+	if err := rememberCrash(ctx, input, idx, termination, now); err != nil {
+		return fmt.Errorf("remember crash on the row (instance=%d): %w", idx, err)
+	}
+	return nil
+}
+
+// settleHeldCrash is a crash on a revision the record holds: a set that
+// serves again is named on the row, and a set that is down is written
+// Failed with one InstanceFailed warning per pod set.
+func settleHeldCrash(ctx context.Context, input workload.ReconcileInput, idx int32, reading *crashLoopLadder, termination *workload.InstanceTermination) error {
+	if !reading.parks {
+		if err := status.RecordCrashLoopNote(ctx, input, idx, CrashLoopServingNote); err != nil {
+			return fmt.Errorf("name the crash loop on the row (instance=%d): %w", idx, err)
+		}
+		return nil
+	}
+	if err := status.StampFailed(ctx, input, idx, termination); err != nil {
+		return fmt.Errorf("stamp Failed under held retry ladder (instance=%d): %w", idx, err)
+	}
+	return warnHeldCrashOnce(ctx, input, idx, reading)
+}
+
+// warnHeldCrashOnce delivers the InstanceFailed warning once per pod set:
+// the hold lands again on every crash of a set that serves between them.
+func warnHeldCrashOnce(ctx context.Context, input workload.ReconcileInput, idx int32, reading *crashLoopLadder) error {
+	announced, err := status.Announce(ctx, input, idx, workload.EventReasonInstanceFailed)
+	if err != nil {
+		return fmt.Errorf("announce the park under held retry ladder (instance=%d): %w", idx, err)
+	}
+	if announced && input.WarnInstanceFailed != nil {
+		input.WarnInstanceFailed(idx, reading.crash.pod.Name,
+			fmt.Sprintf("%s: crash after promotion; revision %s held after %d failed attempts", reading.crash.reason, reading.rev, reading.attempts))
+	}
+	return nil
 }
 
 // RestartOpensRepair reports whether a restart selection for inst would
