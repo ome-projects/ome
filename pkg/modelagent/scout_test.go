@@ -1567,19 +1567,19 @@ func TestUpdateBaseModel_NoDuplicateTaskOnPolicyOnlyChange(t *testing.T) {
 			description:   "Metadata touches preserve DownloadOverride so local MD5 validation can redownload corrupted files",
 		},
 		{
-			name: "annotation touch still triggers manual refresh - exactly 1 task",
+			name: "repair annotation touch triggers DownloadOverride - exactly 1 task",
 			oldModel: func() *v1beta1.BaseModel {
 				model := newBaseModel("model-7", v1beta1.ReuseIfExists, "oci://bucket/model")
-				model.Annotations = map[string]string{"refresh": "old"}
+				model.Annotations = map[string]string{"ome.io/repair-request": "old"}
 				return model
 			}(),
 			newModel: func() *v1beta1.BaseModel {
 				model := newBaseModel("model-7", v1beta1.ReuseIfExists, "oci://bucket/model")
-				model.Annotations = map[string]string{"refresh": "new"}
+				model.Annotations = map[string]string{"ome.io/repair-request": "new"}
 				return model
 			}(),
 			expectedTasks: 1,
-			description:   "Annotation touches preserve DownloadOverride so local MD5 validation can redownload corrupted files",
+			description:   "Repair annotation touches trigger DownloadOverride so local MD5 validation can redownload corrupted files",
 		},
 	}
 
@@ -1709,19 +1709,19 @@ func TestUpdateClusterBaseModel_NoDuplicateTaskOnPolicyOnlyChange(t *testing.T) 
 			description:   "Metadata touches preserve DownloadOverride so local MD5 validation can redownload corrupted files",
 		},
 		{
-			name: "annotation touch still triggers manual refresh - exactly 1 task",
+			name: "repair annotation touch triggers DownloadOverride - exactly 1 task",
 			oldModel: func() *v1beta1.ClusterBaseModel {
 				model := newClusterBaseModel("cbm-6", v1beta1.ReuseIfExists, "oci://bucket/model")
-				model.Annotations = map[string]string{"refresh": "old"}
+				model.Annotations = map[string]string{"ome.io/repair-request": "old"}
 				return model
 			}(),
 			newModel: func() *v1beta1.ClusterBaseModel {
 				model := newClusterBaseModel("cbm-6", v1beta1.ReuseIfExists, "oci://bucket/model")
-				model.Annotations = map[string]string{"refresh": "new"}
+				model.Annotations = map[string]string{"ome.io/repair-request": "new"}
 				return model
 			}(),
 			expectedTasks: 1,
-			description:   "Annotation touches preserve DownloadOverride so local MD5 validation can redownload corrupted files",
+			description:   "Repair annotation touches trigger DownloadOverride so local MD5 validation can redownload corrupted files",
 		},
 	}
 

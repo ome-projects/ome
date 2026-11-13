@@ -126,7 +126,26 @@ See [Ingress administration](/ome/docs/administration/ingress) for usage details
 
 | Annotation                           | Description                                                                                     |
 |--------------------------------------|-------------------------------------------------------------------------------------------------|
-| `ome.oracle.com/skip-config-parsing` | Set on a BaseModel/ClusterBaseModel to skip automatic model-config parsing by the model agent.  |
+| `ome.oracle.com/skip-config-parsing` | Set on a BaseModel/ClusterBaseModel to skip automatic model-config parsing by the model agent. Changing it alone does not trigger DownloadOverride; to reprocess an existing model immediately, also [request model repair](#requesting-model-repair). |
+
+### Requesting model repair
+
+On BaseModel and ClusterBaseModel, adding, changing, or removing an annotation
+whose key starts with `ome.io/repair` requests DownloadOverride. For example:
+
+```sh
+kubectl annotate basemodel <name> -n <namespace> ome.io/repair-request="<new-value>" --overwrite
+kubectl annotate clusterbasemodel <name> ome.io/repair-request="<new-value>" --overwrite
+```
+
+Use a different value for each new request. Keeping the same value does not
+request another DownloadOverride. Matching is case-sensitive.
+
+Other annotation changes no longer trigger DownloadOverride. Operators who
+previously touched an arbitrary annotation to request repair must use this
+prefix instead. Label, storage configuration, and download policy behavior
+remains unchanged. DownloadOverride runs the existing validation and download
+flow; it does not necessarily download every file again.
 
 ## Labels
 
