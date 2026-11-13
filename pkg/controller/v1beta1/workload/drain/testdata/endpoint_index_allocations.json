@@ -1,0 +1,32 @@
+{
+  "recordedOn": {
+    "date": "2026-11-12",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "First recording: the index a Batcher builds of one routed Service's EndpointSlices (indexEndpoints) the first time a pass reads the Service, per reference shape: the pods the Service still routes to and the pods eligible for new traffic. The coordination pass builds it once per routed Service on every pass; the drain and rotation gates build it for the pods of an attempt in flight. The index is two sets of two maps grown from nothing, so its cost is per endpoint: 98 allocations and 1.56 MB at 4,000 endpoints, 46 and 382 KB at 1,000 and at 1,725, 28 and 43 KB at 160; a quarter shape under a roll at ten percent (a tenth leaving, a tenth coming up) 41 and 284 KB. The slices are built in memory, 100 endpoints per slice as the endpoints controller writes them; nothing is read.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "engine/1000x1/allocations": 46,
+    "engine/1000x1/bytes": 382064,
+    "engine/1000x1/rolling/allocations": 41,
+    "engine/1000x1/rolling/bytes": 283680,
+    "engine/160x8/allocations": 28,
+    "engine/160x8/bytes": 43344,
+    "engine/1725x2/allocations": 46,
+    "engine/1725x2/bytes": 382064,
+    "engine/4000x1/allocations": 98,
+    "engine/4000x1/bytes": 1562672,
+    "prefill-decode/12:8/decoder/allocations": 6,
+    "prefill-decode/12:8/decoder/bytes": 896,
+    "prefill-decode/12:8/engine/allocations": 12,
+    "prefill-decode/12:8/engine/bytes": 2384,
+    "prefill-decode/12:8/router/allocations": 6,
+    "prefill-decode/12:8/router/bytes": 896,
+    "prefill-decode/30:10/decoder/allocations": 12,
+    "prefill-decode/30:10/decoder/bytes": 2384,
+    "prefill-decode/30:10/engine/allocations": 20,
+    "prefill-decode/30:10/engine/bytes": 10704,
+    "prefill-decode/30:10/router/allocations": 6,
+    "prefill-decode/30:10/router/bytes": 896
+  }
+}

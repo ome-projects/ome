@@ -431,6 +431,14 @@ func (w *resumeWorld) staggerHook() {
 	if !w.rcfg.staggered {
 		return
 	}
+	staggerWorkerPlacement(w.scaleWorld)
+}
+
+// staggerWorkerPlacement is the default scheduler's timing on a world: a
+// worker the kubelet has not seen yet is refused by the scheduler model
+// for one tick, and a worker it refused once is placed on the next, so a
+// gang's members come up one tick apart.
+func staggerWorkerPlacement(w *scaleWorld) {
 	for _, s := range w.sides {
 		if s.h.workers == 0 {
 			continue

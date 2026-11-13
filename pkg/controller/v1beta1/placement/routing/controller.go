@@ -81,17 +81,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 	if !found {
-		r.Prober.Forget(req.NamespacedName)
-		r.Capacity.Forget(req.NamespacedName)
-		deleteCapacityFallbackMetric(req.Namespace, req.Name)
-		deleteTrafficMapEntryMetrics(req.Namespace, req.Name)
+		r.forgetService(req)
 		return reapResult(r.reapSourceAbsentTrafficMap(ctx, req.NamespacedName))
 	}
 	if !isvc.DeletionTimestamp.IsZero() {
-		r.Prober.Forget(req.NamespacedName)
-		r.Capacity.Forget(req.NamespacedName)
-		deleteCapacityFallbackMetric(req.Namespace, req.Name)
-		deleteTrafficMapEntryMetrics(req.Namespace, req.Name)
+		r.forgetService(req)
 		return reapResult(r.reap(ctx, isvc))
 	}
 
@@ -102,102 +96,177 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// A TrafficMap-backed publisher uses its finalizer as the teardown handshake:
 	// retain the map until external state is withdrawn and the source is released.
 	if !routingEnabled(r.Config, isvc) || !placementcontroller.IsPlacementEligible(isvc) {
-		r.Prober.Forget(req.NamespacedName)
-		r.Capacity.Forget(req.NamespacedName)
-		deleteCapacityFallbackMetric(req.Namespace, req.Name)
-		deleteTrafficMapEntryMetrics(req.Namespace, req.Name)
+		r.forgetService(req)
 		return reapResult(r.reap(ctx, isvc))
 	}
 
+	if err := validateRoutingIntent(isvc); err != nil {
+		return ctrl.Result{}, err
+	}
+	pass := routingPass{req: req, isvc: isvc}
+	pass.overrides, err = trafficdrain.FromAnnotations(isvc.Annotations)
+	if err != nil {
+		return ctrl.Result{}, r.reportUnreadableOverrides(ctx, isvc, err)
+	}
+	pass.policies, err = r.resolveObservationPolicies(isvc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	pass.persisted, err = r.ownedTrafficMap(ctx, isvc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.observeEndpoints(ctx, pass); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.publishTable(ctx, pass); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.nextObservation(pass), nil
+}
+
+// routingPass is one pass's view of a service that routing serves: the
+// request, the service, its drain overrides, its effective observation
+// policies and the map it owns.
+type routingPass struct {
+	req       ctrl.Request
+	isvc      *v1beta1.InferenceService
+	overrides []trafficdrain.Override
+	policies  observationPolicies
+	persisted *v1beta1.TrafficMap
+}
+
+// observationPolicies is the service's effective probe and capacity
+// policies with the targets each observes.
+type observationPolicies struct {
+	probe           ResolvedProbePolicy
+	capacity        ResolvedCapacityPolicy
+	probeTargets    []Target
+	capacityTargets []Target
+}
+
+// forgetService drops what the observers and the metrics hold for a service
+// that leaves routing: its probe and capacity state, and its series.
+func (r *Reconciler) forgetService(req ctrl.Request) {
+	r.Prober.Forget(req.NamespacedName)
+	r.Capacity.Forget(req.NamespacedName)
+	deleteCapacityFallbackMetric(req.Namespace, req.Name)
+	deleteTrafficMapEntryMetrics(req.Namespace, req.Name)
+}
+
+// validateRoutingIntent refuses a placement intent or a routing policy the
+// pass cannot act on.
+func validateRoutingIntent(isvc *v1beta1.InferenceService) error {
 	if err := validation.ValidatePlacementIntent(isvc); err != nil {
-		return ctrl.Result{}, fmt.Errorf("validate placement intent: %w", err)
+		return fmt.Errorf("validate placement intent: %w", err)
 	}
 	if err := validation.ValidateRouting(&isvc.Spec); err != nil {
-		return ctrl.Result{}, fmt.Errorf("validate routing policy: %w", err)
+		return fmt.Errorf("validate routing policy: %w", err)
 	}
+	return nil
+}
 
-	overrides, err := trafficdrain.FromAnnotations(isvc.Annotations)
-	if err != nil {
-		// Keep the last valid map: treating malformed intent as absent could restore
-		// traffic during a drain. No admission webhook checks the value on the control
-		// plane, so OverrideActive on an existing map reports the parse error.
-		parseErr := fmt.Errorf("parse %s: %w", constants.TrafficDrainAnnotation, err)
-		if statusErr := r.setInvalidOverrideStatus(ctx, isvc, parseErr); statusErr != nil {
-			return ctrl.Result{}, errors.Join(parseErr, statusErr)
-		}
-		return ctrl.Result{}, parseErr
+// reportUnreadableOverrides keeps the last valid map and reports an
+// unreadable traffic-drain annotation on it: treating malformed intent as
+// absent could restore traffic during a drain, and no admission webhook
+// checks the value on the control plane. The error returned is the parse
+// error, joined with the report's own error when the report fails.
+func (r *Reconciler) reportUnreadableOverrides(ctx context.Context, isvc *v1beta1.InferenceService, cause error) error {
+	parseErr := fmt.Errorf("parse %s: %w", constants.TrafficDrainAnnotation, cause)
+	if statusErr := r.setInvalidOverrideStatus(ctx, isvc, parseErr); statusErr != nil {
+		return errors.Join(parseErr, statusErr)
 	}
+	return parseErr
+}
 
+// resolveObservationPolicies resolves the probe policy, then the capacity
+// policy, and the targets each observes.
+func (r *Reconciler) resolveObservationPolicies(isvc *v1beta1.InferenceService) (observationPolicies, error) {
 	probePolicy, err := ResolveProbePolicy(r.Config, &isvc.Spec)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("resolve probe policy: %w", err)
+		return observationPolicies{}, fmt.Errorf("resolve probe policy: %w", err)
 	}
 	capacityPolicy, err := ResolveCapacityPolicy(r.Config, &isvc.Spec)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("resolve capacity policy: %w", err)
+		return observationPolicies{}, fmt.Errorf("resolve capacity policy: %w", err)
 	}
-	probeTargets := targetsForInferenceService(isvc, probePolicy.PolicyDigest)
-	capacityTargets := targetsForInferenceService(isvc, "")
-	persisted, err := r.ownedTrafficMap(ctx, isvc)
-	if err != nil {
-		return ctrl.Result{}, err
+	return observationPolicies{
+		probe:           probePolicy,
+		capacity:        capacityPolicy,
+		probeTargets:    targetsForInferenceService(isvc, probePolicy.PolicyDigest),
+		capacityTargets: targetsForInferenceService(isvc, ""),
+	}, nil
+}
+
+// observeEndpoints runs the wired observers for the service, the prober
+// before the capacity poller. An enabled policy needs its observer wired.
+func (r *Reconciler) observeEndpoints(ctx context.Context, pass routingPass) error {
+	if pass.policies.probe.IsEnabled() && r.Prober == nil {
+		return fmt.Errorf("endpoint probing is enabled but no prober is configured")
 	}
-	if probePolicy.IsEnabled() && r.Prober == nil {
-		return ctrl.Result{}, fmt.Errorf("endpoint probing is enabled but no prober is configured")
-	}
-	if capacityPolicy.IsEnabled() && r.Capacity == nil {
-		return ctrl.Result{}, fmt.Errorf("capacity polling is enabled but no poller is configured")
+	if pass.policies.capacity.IsEnabled() && r.Capacity == nil {
+		return fmt.Errorf("capacity polling is enabled but no poller is configured")
 	}
 	if r.Prober != nil {
-		_, err = r.Prober.Reconcile(ctx, ProbeReconcileRequest{
-			OwnerUID:  isvc.UID,
-			Map:       req.NamespacedName,
-			Policy:    probePolicy,
-			Targets:   probeTargets,
-			Persisted: persisted,
+		_, err := r.Prober.Reconcile(ctx, ProbeReconcileRequest{
+			OwnerUID:  pass.isvc.UID,
+			Map:       pass.req.NamespacedName,
+			Policy:    pass.policies.probe,
+			Targets:   pass.policies.probeTargets,
+			Persisted: pass.persisted,
 		})
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("reconcile endpoint probes: %w", err)
+			return fmt.Errorf("reconcile endpoint probes: %w", err)
 		}
 	}
 	if r.Capacity != nil {
-		_, err = r.Capacity.Reconcile(ctx, CapacityReconcileRequest{
-			OwnerUID: isvc.UID,
-			Map:      req.NamespacedName,
-			Policy:   capacityPolicy,
-			Targets:  capacityTargets,
+		_, err := r.Capacity.Reconcile(ctx, CapacityReconcileRequest{
+			OwnerUID: pass.isvc.UID,
+			Map:      pass.req.NamespacedName,
+			Policy:   pass.policies.capacity,
+			Targets:  pass.policies.capacityTargets,
 		})
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("reconcile endpoint capacity: %w", err)
+			return fmt.Errorf("reconcile endpoint capacity: %w", err)
 		}
 	}
+	return nil
+}
 
-	// Unroutable is a state of the map, not a reason to remove it: build the
-	// table (possibly empty) and let the condition carry the explanation.
-	spec, status, reason := buildSpec(isvc, probePolicy, capacityPolicy, r.Prober, r.Capacity, overrides...)
-	if err := r.apply(ctx, isvc, spec); err != nil {
-		return ctrl.Result{}, err
+// publishTable writes the routing table, then its conditions, then the
+// fallback series. Unroutable is a state of the map, not a reason to remove
+// it: the table may be empty and the condition carries the explanation.
+func (r *Reconciler) publishTable(ctx context.Context, pass routingPass) error {
+	spec, status, reason := buildSpec(pass.isvc, pass.policies.probe, pass.policies.capacity, r.Prober, r.Capacity, pass.overrides...)
+	if err := r.apply(ctx, pass.isvc, spec); err != nil {
+		return err
 	}
-	if err := r.setRoutingStatus(ctx, isvc, status, reason, capacityPolicy.IsEnabled(), overrides...); err != nil {
-		return ctrl.Result{}, err
+	if err := r.setRoutingStatus(ctx, pass.isvc, status, reason, pass.policies.capacity.IsEnabled(), pass.overrides...); err != nil {
+		return err
 	}
-	recordCapacityFallbackMetric(isvc.Namespace, isvc.Name, capacityPolicy.IsEnabled(), spec)
+	recordCapacityFallbackMetric(pass.isvc.Namespace, pass.isvc.Name, pass.policies.capacity.IsEnabled(), spec)
+	return nil
+}
+
+// nextObservation is the requeue the earliest enabled observation deadline
+// asks for; an observer with no target asks for none.
+func (r *Reconciler) nextObservation(pass routingPass) ctrl.Result {
 	var probeRequeueAfter time.Duration
-	if r.Prober != nil && probePolicy.IsEnabled() && len(probeTargets) > 0 {
+	if r.Prober != nil && pass.policies.probe.IsEnabled() && len(pass.policies.probeTargets) > 0 {
 		probeRequeueAfter = r.Prober.nextDelay(
-			isvc.UID, req.NamespacedName, probeTargets, r.Prober.Clock.Now(),
+			pass.isvc.UID, pass.req.NamespacedName, pass.policies.probeTargets, r.Prober.Clock.Now(),
 		)
 	}
 	var capacityRequeueAfter time.Duration
-	if r.Capacity != nil && capacityPolicy.IsEnabled() && len(capacityTargets) > 0 {
+	if r.Capacity != nil && pass.policies.capacity.IsEnabled() && len(pass.policies.capacityTargets) > 0 {
 		capacityRequeueAfter = r.Capacity.nextDelay(
-			isvc.UID, req.NamespacedName, capacityTargets, capacityPolicy, r.Capacity.Clock.Now(),
+			pass.isvc.UID, pass.req.NamespacedName, pass.policies.capacityTargets, pass.policies.capacity, r.Capacity.Clock.Now(),
 		)
 	}
 	return observationRequeueResult(
-		probePolicy.IsEnabled(), len(probeTargets), probeRequeueAfter,
-		capacityPolicy.IsEnabled(), len(capacityTargets), capacityRequeueAfter,
-	), nil
+		pass.policies.probe.IsEnabled(), len(pass.policies.probeTargets), probeRequeueAfter,
+		pass.policies.capacity.IsEnabled(), len(pass.policies.capacityTargets), capacityRequeueAfter,
+	)
 }
 
 func observationRequeueResult(

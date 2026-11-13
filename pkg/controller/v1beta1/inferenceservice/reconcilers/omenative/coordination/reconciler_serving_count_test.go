@@ -41,12 +41,6 @@ type countedPod struct {
 	state  podState
 }
 
-var (
-	single = v1beta1.RunnerNameDefault
-	leader = v1beta1.RunnerNameLeader
-	worker = v1beta1.RunnerNameWorker
-)
-
 // servingCountPods builds the table's pods; pods of one Instance get
 // distinct names.
 func servingCountPods(isvc *v1beta1.InferenceService, specs []countedPod) []*corev1.Pod {
@@ -104,6 +98,7 @@ func servingCountRows() []struct {
 	pods []countedPod
 	want map[string]int32
 } {
+	single, leader, worker := v1beta1.RunnerNameDefault, v1beta1.RunnerNameLeader, v1beta1.RunnerNameWorker
 	return []struct {
 		name string
 		pods []countedPod
@@ -165,7 +160,7 @@ func TestServingPodsByRevision_CountsAPodWhenItsInstancesRoutedPodServes(t *test
 func TestServingPodsByRevision_AgreesWithTheRuleOnRandomLists(t *testing.T) {
 	isvc := testOMENativeISVC()
 	hashes := []string{"a", "b"}
-	runners := []v1beta1.RunnerName{single, leader, worker}
+	runners := []v1beta1.RunnerName{v1beta1.RunnerNameDefault, v1beta1.RunnerNameLeader, v1beta1.RunnerNameWorker}
 	states := []podState{podServing, podNotReady, podPending, podDeleting, podHeldOut, podWithoutRevision}
 	r := rand.New(rand.NewPCG(44, 4000))
 	for round := 0; round < 3000; round++ {

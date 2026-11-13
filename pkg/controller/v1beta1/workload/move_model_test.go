@@ -326,6 +326,17 @@ type moveWorld struct {
 	// landed counts the verbs landed in this probe; the first one marks
 	// every Instance's builds.
 	landed int
+	// unnamedClass, when set, names an unnamed wait by a scene a model
+	// built on this world knows; empty leaves the reading to this file.
+	unnamedClass func(s *scaleSide, rec workloadtypes.MigrationRecord) string
+	// overdueClass, when set, names a record past its deadline by a scene
+	// a model built on this world knows; empty leaves the reading to this
+	// file.
+	overdueClass func(s *scaleSide, rec workloadtypes.MigrationRecord) string
+	// failedClass, when set, names a record closed Failed by a scene a
+	// model built on this world knows; empty leaves the reading to this
+	// file.
+	failedClass func(s *scaleSide, rec workloadtypes.MigrationRecord) string
 	// probes, skipped and mticks count the configuration's work.
 	probes, skipped, mticks int
 }
@@ -813,7 +824,10 @@ func (w *moveWorld) readOverdue(s *scaleSide, rec workloadtypes.MigrationRecord,
 		return
 	}
 	class := "move-past-its-deadline-still-open"
-	if strings.Contains(rec.Message, "source teardown") {
+	switch {
+	case w.overdueClass != nil && w.overdueClass(s, rec) != "":
+		class = w.overdueClass(s, rec)
+	case strings.Contains(rec.Message, "source teardown"):
 		class = "move-past-its-deadline-waiting-on-its-source-teardown"
 	}
 	w.note(class, "the move %s stands %s past its deadline in phase %s with the text %q: %s", rec.RequestUUID, now.Sub(rec.Deadline.Time).Round(time.Second), rec.Phase, rec.Message, w.picture())
@@ -839,6 +853,8 @@ func (w *moveWorld) readUnnamedWait(s *scaleSide, rec workloadtypes.MigrationRec
 	class := "move-waits-unnamed"
 	f := w.factsOf(rec.RequestUUID)
 	switch {
+	case w.unnamedClass != nil && w.unnamedClass(s, rec) != "":
+		class = w.unnamedClass(s, rec)
 	case f != nil && f.surgeInFlight:
 		class = "move-waits-unnamed-behind-the-rolls-surges"
 	case f != nil && f.paused && len(w.lostNodes[s]) > 0:
@@ -904,6 +920,8 @@ func (w *moveWorld) readCompletion(s *scaleSide, rec workloadtypes.MigrationReco
 		}
 	case workloadtypes.MigrationPhaseFailed:
 		switch {
+		case w.failedClass != nil && w.failedClass(s, rec) != "":
+			w.note(w.failedClass(s, rec), "the move %s closed Failed: %s: %s", rec.RequestUUID, rec.Message, w.picture())
 		case strings.Contains(rec.Message, "which is held after its attempts"):
 			w.note("move-refused-source-revision-held", "the move %s was refused: %s", rec.RequestUUID, rec.Message)
 		case strings.Contains(rec.Message, "has not started"):
