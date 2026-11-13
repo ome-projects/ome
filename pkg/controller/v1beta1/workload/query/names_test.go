@@ -10,6 +10,35 @@ import (
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
+// TestPodHostname covers the per-incarnation pod hostname: the plain
+// <pod-name>-i<incarnation> form within the DNS-label limit, the bounded
+// {hash}-{suffix} form beyond it, and cross-incarnation distinctness in
+// both regimes — the property that keeps a rebuilt Instance's peer DNS
+// from resolving to the previous incarnation's pods.
+func TestPodHostname(t *testing.T) {
+	const max = validation.DNS1123LabelMaxLength // 63
+
+	short1 := PodHostname("llama-70b-engine-0-leader-0", 1)
+	if short1 != "llama-70b-engine-0-leader-0-i1" {
+		t.Errorf("short name: got %q want llama-70b-engine-0-leader-0-i1", short1)
+	}
+	if short2 := PodHostname("llama-70b-engine-0-leader-0", 2); short2 == short1 {
+		t.Errorf("short names of two incarnations collide at %q", short1)
+	}
+
+	longPod := strings.Repeat("a", 49) + "-engine-0-leader-0" // 67 chars, over the limit
+	long1 := PodHostname(longPod, 1)
+	if len(long1) != max {
+		t.Errorf("long name: got %d chars %q, want exactly %d", len(long1), long1, max)
+	}
+	if errs := validation.IsDNS1123Label(long1); len(errs) > 0 {
+		t.Errorf("long name %q is not a DNS1123 label: %v", long1, errs)
+	}
+	if long2 := PodHostname(longPod, 2); long2 == long1 {
+		t.Errorf("truncated names of two incarnations collide at %q", long1)
+	}
+}
+
 // TestPerRevisionServiceName_Bounded covers the DNS1035 63-char guard on
 // per-revision Service names. Unbounded, the headless variant of a long
 // isvc name reaches 66 chars, which the apiserver rejects — hot-looping

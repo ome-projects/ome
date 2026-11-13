@@ -21,7 +21,9 @@ import (
 // The returned Pod carries:
 //   - stable name <key.Name>-<inst-idx>-<runner>-<ordinal>
 //   - hostname + subdomain so peer DNS resolves under the Component's
-//     headless service
+//     headless service; multi-pod Instances fold the Instance
+//     incarnation into the hostname (query.PodHostname) so peer DNS
+//     never resolves to a previous incarnation's still-terminating pod
 //   - the workload labels (ome.io/inferenceservice / component /
 //     instance-index / instance-incarnation / runner / managed-by /
 //     pod-ordinal), plus ome.io/revision-hash when revisionHash is
@@ -120,7 +122,7 @@ func RenderWithRevision(
 		Spec: *podSpec.DeepCopy(),
 	}
 
-	pod.Spec.Hostname = name
+	pod.Spec.Hostname = podHostname(name, inst)
 	pod.Spec.Subdomain = subdomain
 	// Dedup the ome.io/serving gate when the user template / ServingRuntime
 	// already declared it. Kubelet ANDs all gates into PodReady, so two
@@ -569,19 +571,37 @@ func instancePodRank(inst workload.InstancePlan, runner workload.RunnerPlan, ord
 	return offset + ordinal
 }
 
+// podHostname returns the spec.hostname Render stamps on one pod of the
+// Instance. Pods of a multi-pod Instance — the only pods OME publishes
+// peer DNS names for (OME_LEADER_ADDRESS, the TPU peer host list) —
+// carry the Instance incarnation in their hostname via query.PodHostname,
+// so a peer-DNS lookup can never resolve to a previous incarnation's
+// pod: the old pod may still be draining while the headless Service
+// publishes its not-ready address, and the bare pod name is deliberately
+// stable across rebuilds. Single-pod Instances keep hostname == pod
+// name: nothing addresses them by peer DNS.
+func podHostname(name string, inst workload.InstancePlan) string {
+	if inst.TotalPods() <= 1 {
+		return name
+	}
+	return query.PodHostname(name, inst.Incarnation)
+}
+
 // leaderAddressForInstance returns the peer-DNS address of the Instance's
 // leader pod, or "" when the Instance has no "leader" Runner (single-pod
 // "default" layout). The address is the SHORT form
-// `<leader-pod-name>.<headless-service-name>` — the pod's DNS search
+// `<leader-hostname>.<headless-service-name>` — the pod's DNS search
 // path appends `.<ns>.svc.<cluster-domain>` at resolution time, so this
 // resolves the same as the fully-qualified
-// `<pod>.<headless>.<ns>.svc.cluster.local` form without the controller
-// needing to discover the cluster's actual DNS domain.
+// `<hostname>.<headless>.<ns>.svc.cluster.local` form without the
+// controller needing to discover the cluster's actual DNS domain. The
+// leader hostname carries the Instance incarnation (podHostname), so the
+// address always names the current incarnation's leader.
 func leaderAddressForInstance(isvcName string, component workload.ComponentType, inst workload.InstancePlan) string {
 	for _, r := range inst.Runners {
 		if r.Name == workload.RunnerLeader {
 			return fmt.Sprintf("%s.%s",
-				query.PodName(isvcName, component, inst.Index, "leader", 0),
+				podHostname(query.PodName(isvcName, component, inst.Index, "leader", 0), inst),
 				query.HeadlessServiceName(isvcName, component),
 			)
 		}
@@ -636,14 +656,16 @@ func instancePeerHostnames(isvcName string, component workload.ComponentType, in
 
 // buildInstancePeerHostnames computes the Instance's ordered peer-DNS host
 // list from its Runners (the uncached path). Exported within the package so
-// the gang-render loop can prime inst.PeerHostnames once per gang.
+// the gang-render loop can prime inst.PeerHostnames once per gang. Each entry
+// is the pod's per-incarnation spec.hostname under the Component's headless
+// Service, matching what Render stamps on the pods themselves.
 func buildInstancePeerHostnames(isvcName string, component workload.ComponentType, inst workload.InstancePlan) []string {
 	headless := query.HeadlessServiceName(isvcName, component)
 	var hosts []string
 	for _, r := range inst.Runners {
 		for o := int32(0); o < r.Size; o++ {
 			hosts = append(hosts, fmt.Sprintf("%s.%s",
-				query.PodName(isvcName, component, inst.Index, r.Name, o), headless))
+				podHostname(query.PodName(isvcName, component, inst.Index, r.Name, o), inst), headless))
 		}
 	}
 	return hosts

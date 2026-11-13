@@ -14970,7 +14970,7 @@ func schema_pkg_apis_ome_v1beta1_Runner(ref common.ReferenceCallback) common.Ope
 					},
 					"template": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Template is the fully-rendered pod template for this Runner. Labels include ome.io/runner=<name>. The InferenceReplica controller stamps OME_RUNNER (leader|worker|default) and, for non-leader pods, OME_LEADER_ADDRESS (short-form DNS, matching LWS conventions) onto the rendered pod at create.",
+							Description: "Template is the fully-rendered pod template for this Runner. Labels include ome.io/runner=<name>. The InferenceReplica controller stamps OME_RUNNER (leader|worker|default) and, for pods of a multi-pod Instance, OME_LEADER_ADDRESS (short-form DNS of the leader pod's per-incarnation hostname, matching LWS conventions) onto the rendered pod at create.",
 							Default:     map[string]interface{}{},
 							Ref:         ref("k8s.io/api/core/v1.PodTemplateSpec"),
 						},

@@ -52,6 +52,32 @@ func PodName(isvc string, component workload.ComponentType, instanceIdx int32, r
 	return name.String()
 }
 
+// PodHostname returns the spec.hostname of one pod of a multi-pod
+// Instance: the pod name with the Instance's incarnation appended —
+// <pod-name>-i<incarnation> — bounded to the DNS label limit a
+// spec.hostname must satisfy. Pod names repeat across an Instance
+// rebuild on purpose (Create matches desired pods to existing ones by
+// name), but the Component's headless Service publishes not-ready
+// addresses, so a bare pod name keeps resolving to the previous
+// incarnation's pod while that pod drains. Folding the incarnation
+// into the hostname makes every DNS name OME hands out point at the
+// current incarnation's pods alone: a peer lookup either fails (the
+// current incarnation's pod does not exist yet, so the caller retries)
+// or returns a pod of the current incarnation, never an older one.
+//
+// The bound uses the same shared helper as the Service and PodGroup
+// names: names within the limit pass through unchanged; longer names
+// take the deterministic {hash}-{suffix} form, whose hash covers the
+// incarnation, so two incarnations of one pod name never collide even
+// under truncation. The hostname is never parsed back to a pod name —
+// EndpointSlice consumers match on TargetRef — so truncation loses no
+// lookup path.
+func PodHostname(podName string, incarnation int64) string {
+	return constants.TruncateNameWithMaxLength(
+		fmt.Sprintf("%s-i%d", podName, incarnation),
+		validation.DNS1123LabelMaxLength)
+}
+
 // PodNameIs reports whether name is PodName(isvc, component, instanceIdx,
 // runner, ordinal), read piece by piece against the name as it stands. The
 // Create pass compares every pod of a Component with the names its
