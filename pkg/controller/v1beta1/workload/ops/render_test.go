@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -436,9 +437,10 @@ func TestRender_OMEEnvVarsInEveryContainer(t *testing.T) {
 // OME_LEADER_ADDRESS points at itself so leader-side code that reads the
 // var to identify the gang head sees the same value as workers.
 //
-// Address shape: short form <pod-name>.<headless-service>; cluster DNS
-// search path resolves it the same as the fully qualified
-// <pod>.<headless>.<ns>.svc.<cluster-domain>.
+// Address shape: short form <pod-hostname>.<headless-service>, the
+// hostname carrying the Instance incarnation; cluster DNS search path
+// resolves it the same as the fully qualified
+// <hostname>.<headless>.<ns>.svc.<cluster-domain>.
 func TestRender_MultiPod_LeaderEnvVarsForLeader(t *testing.T) {
 	plan, inst, runners := multiPodPlan(2)
 	leader := runners[0]
@@ -451,7 +453,7 @@ func TestRender_MultiPod_LeaderEnvVarsForLeader(t *testing.T) {
 		"OME_RUNNER":             "leader",
 		"OME_RUNNER_SIZE":        "1",
 		"OME_RUNNER_INDEX":       "0",
-		"OME_LEADER_ADDRESS":     "llama-70b-engine-0-leader-0.llama-70b-engine-headless",
+		"OME_LEADER_ADDRESS":     "llama-70b-engine-0-leader-0-i1.llama-70b-engine-headless",
 		"OME_INSTANCE_INDEX":     "0",
 		"OME_COMPONENT":          "engine",
 		"OME_INSTANCE_SUBDOMAIN": "llama-70b-engine-0",
@@ -482,7 +484,7 @@ func TestRender_MultiPod_LeaderAddressOnWorker(t *testing.T) {
 
 	for i, pod := range []*corev1.Pod{pod0, pod1} {
 		got := envByName(pod.Spec.Containers[0].Env)
-		if got["OME_LEADER_ADDRESS"] != "llama-70b-engine-0-leader-0.llama-70b-engine-headless" {
+		if got["OME_LEADER_ADDRESS"] != "llama-70b-engine-0-leader-0-i1.llama-70b-engine-headless" {
 			t.Errorf("worker %d OME_LEADER_ADDRESS: got %q", i, got["OME_LEADER_ADDRESS"])
 		}
 		if got["OME_RUNNER"] != "worker" {
@@ -586,13 +588,162 @@ func TestRender_MultiPod_LeaderAddressPerInstance(t *testing.T) {
 
 	got0 := envByName(pod0Worker.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
 	got1 := envByName(pod1Worker.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
-	want0 := "llama-70b-engine-0-leader-0.llama-70b-engine-headless"
-	want1 := "llama-70b-engine-1-leader-0.llama-70b-engine-headless"
+	want0 := "llama-70b-engine-0-leader-0-i1.llama-70b-engine-headless"
+	want1 := "llama-70b-engine-1-leader-0-i1.llama-70b-engine-headless"
 	if got0 != want0 {
 		t.Errorf("inst0 worker OME_LEADER_ADDRESS: got %q want %q", got0, want0)
 	}
 	if got1 != want1 {
 		t.Errorf("inst1 worker OME_LEADER_ADDRESS: got %q want %q", got1, want1)
+	}
+}
+
+// TestRender_MultiPod_HostnameUniquePerIncarnation pins the stale-leader-DNS
+// fix: two incarnations of the same Instance render the SAME pod names (Create
+// matches desired pods to existing ones by name) but DIFFERENT hostnames, so
+// the leader's peer-DNS identity dies with its incarnation. A worker created
+// for incarnation N+1 can never resolve OME_LEADER_ADDRESS to incarnation N's
+// still-terminating leader.
+func TestRender_MultiPod_HostnameUniquePerIncarnation(t *testing.T) {
+	plan, inst, runners := multiPodPlan(1)
+	rebuilt := inst
+	rebuilt.Incarnation = 2
+
+	leader1, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[0], 0)
+	if err != nil {
+		t.Fatalf("incarnation 1 leader: %v", err)
+	}
+	leader2, err := testRender(basicISVC(), basicPodSpec(), plan, rebuilt, runners[0], 0)
+	if err != nil {
+		t.Fatalf("incarnation 2 leader: %v", err)
+	}
+
+	if leader1.Name != leader2.Name {
+		t.Errorf("pod names must stay stable across incarnations: %q vs %q", leader1.Name, leader2.Name)
+	}
+	if leader1.Spec.Hostname == leader2.Spec.Hostname {
+		t.Errorf("hostnames must differ across incarnations: both %q", leader1.Spec.Hostname)
+	}
+	if want := "llama-70b-engine-0-leader-0-i1"; leader1.Spec.Hostname != want {
+		t.Errorf("incarnation 1 leader hostname: got %q want %q", leader1.Spec.Hostname, want)
+	}
+	if want := "llama-70b-engine-0-leader-0-i2"; leader2.Spec.Hostname != want {
+		t.Errorf("incarnation 2 leader hostname: got %q want %q", leader2.Spec.Hostname, want)
+	}
+
+	worker1, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[1], 0)
+	if err != nil {
+		t.Fatalf("incarnation 1 worker: %v", err)
+	}
+	worker2, err := testRender(basicISVC(), basicPodSpec(), plan, rebuilt, runners[1], 0)
+	if err != nil {
+		t.Fatalf("incarnation 2 worker: %v", err)
+	}
+	addr1 := envByName(worker1.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
+	addr2 := envByName(worker2.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
+	if addr1 == addr2 {
+		t.Errorf("OME_LEADER_ADDRESS must differ across incarnations: both %q", addr1)
+	}
+}
+
+// TestRender_MultiPod_LeaderAddressMatchesLeaderHostname pins the DNS
+// contract: a worker's OME_LEADER_ADDRESS is exactly
+// <leader spec.hostname>.<leader spec.subdomain>, so the name the worker
+// resolves is the name the leader pod actually publishes.
+func TestRender_MultiPod_LeaderAddressMatchesLeaderHostname(t *testing.T) {
+	plan, inst, runners := multiPodPlan(2)
+
+	leader, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[0], 0)
+	if err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+	want := leader.Spec.Hostname + "." + leader.Spec.Subdomain
+	for _, ordinal := range []int32{0, 1} {
+		worker, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[1], ordinal)
+		if err != nil {
+			t.Fatalf("worker %d: %v", ordinal, err)
+		}
+		if got := envByName(worker.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]; got != want {
+			t.Errorf("worker %d OME_LEADER_ADDRESS: got %q want %q (= leader hostname.subdomain)", ordinal, got, want)
+		}
+	}
+}
+
+// TestRender_MultiPod_TPUHostnamesMatchPodHostnames pins that every entry of
+// the TPU peer host list is the rendered pod's own
+// <spec.hostname>.<spec.subdomain>, so the mesh JAX/libtpu builds resolves to
+// the pods of THIS incarnation.
+func TestRender_MultiPod_TPUHostnamesMatchPodHostnames(t *testing.T) {
+	plan, inst, runners := multiPodPlan(2) // 1 leader + 2 workers = 3-host slice
+
+	var pods []*corev1.Pod
+	for _, rc := range []struct {
+		runner  workload.RunnerPlan
+		ordinal int32
+	}{{runners[0], 0}, {runners[1], 0}, {runners[1], 1}} {
+		pod, err := testRender(basicISVC(), tpuPodSpec(), plan, inst, rc.runner, rc.ordinal)
+		if err != nil {
+			t.Fatalf("render %s/%d: %v", rc.runner.Name, rc.ordinal, err)
+		}
+		pods = append(pods, pod)
+	}
+
+	var want []string
+	for _, p := range pods {
+		want = append(want, p.Spec.Hostname+"."+p.Spec.Subdomain)
+	}
+	wantJoined := strings.Join(want, ",")
+	for _, p := range pods {
+		if got := envByName(p.Spec.Containers[0].Env)["TPU_WORKER_HOSTNAMES"]; got != wantJoined {
+			t.Errorf("pod %s TPU_WORKER_HOSTNAMES: got %q want %q", p.Name, got, wantJoined)
+		}
+	}
+}
+
+// TestRender_MultiPod_HostnameBoundedLongName pins that the per-incarnation
+// hostname stays a valid DNS label of at most 63 characters when the pod name
+// is already near the limit: the suffix must never push a create past the
+// apiserver's spec.hostname validation, and the truncated form must still
+// differ across incarnations and match OME_LEADER_ADDRESS.
+func TestRender_MultiPod_HostnameBoundedLongName(t *testing.T) {
+	isvc := basicISVC()
+	isvc.Name = strings.Repeat("a", 49) // pod name is 49+len("-engine-0-leader-0")=67 > 63
+
+	plan, inst, runners := multiPodPlan(1)
+	leader, err := testRender(isvc, basicPodSpec(), plan, inst, runners[0], 0)
+	if err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+	if len(leader.Name) <= 63 {
+		t.Fatalf("test needs a pod name over the hostname limit, got %d chars", len(leader.Name))
+	}
+	if len(leader.Spec.Hostname) > 63 {
+		t.Errorf("hostname over the 63-char DNS label limit: %d chars: %q", len(leader.Spec.Hostname), leader.Spec.Hostname)
+	}
+	if errs := k8svalidation.IsDNS1123Label(leader.Spec.Hostname); len(errs) > 0 {
+		t.Errorf("hostname %q is not a valid DNS1123 label: %v", leader.Spec.Hostname, errs)
+	}
+
+	rebuilt := inst
+	rebuilt.Incarnation = 2
+	leader2, err := testRender(isvc, basicPodSpec(), plan, rebuilt, runners[0], 0)
+	if err != nil {
+		t.Fatalf("incarnation 2 leader: %v", err)
+	}
+	if leader2.Spec.Hostname == leader.Spec.Hostname {
+		t.Errorf("truncated hostnames must still differ across incarnations: both %q", leader.Spec.Hostname)
+	}
+	if len(leader2.Spec.Hostname) > 63 {
+		t.Errorf("incarnation 2 hostname over the limit: %d chars: %q", len(leader2.Spec.Hostname), leader2.Spec.Hostname)
+	}
+
+	worker, err := testRender(isvc, basicPodSpec(), plan, inst, runners[1], 0)
+	if err != nil {
+		t.Fatalf("worker: %v", err)
+	}
+	if got, want := envByName(worker.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"],
+		leader.Spec.Hostname+"."+leader.Spec.Subdomain; got != want {
+		t.Errorf("worker OME_LEADER_ADDRESS: got %q want %q", got, want)
 	}
 }
 
@@ -635,10 +786,10 @@ func TestRender_MultiPod_TPUTopologyEnv(t *testing.T) {
 	plan, inst, runners := multiPodPlan(1) // 1 leader + 1 worker = 2-host slice
 	leader, worker := runners[0], runners[1]
 
-	wantHosts := "llama-70b-engine-0-leader-0.llama-70b-engine-headless," +
-		"llama-70b-engine-0-worker-0.llama-70b-engine-headless"
-	wantAddrs := "llama-70b-engine-0-leader-0.llama-70b-engine-headless:8476," +
-		"llama-70b-engine-0-worker-0.llama-70b-engine-headless:8476"
+	wantHosts := "llama-70b-engine-0-leader-0-i1.llama-70b-engine-headless," +
+		"llama-70b-engine-0-worker-0-i1.llama-70b-engine-headless"
+	wantAddrs := "llama-70b-engine-0-leader-0-i1.llama-70b-engine-headless:8476," +
+		"llama-70b-engine-0-worker-0-i1.llama-70b-engine-headless:8476"
 
 	lpod, err := testRender(basicISVC(), tpuPodSpec(), plan, inst, leader, 0)
 	if err != nil {

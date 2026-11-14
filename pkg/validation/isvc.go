@@ -44,10 +44,11 @@ const (
 	// ReasonLeaderSizeMustBeOne rejects user attempts to scale the
 	// leader Runner above 1. The leader is fixed at size=1: the
 	// OME_LEADER_ADDRESS contract resolves to a single
-	// <isvc>-<comp>-<inst>-leader-0 FQDN, so multiple leaders would
-	// produce ambiguous DNS. LeaderSpec has no explicit Size field
-	// today (enforced by type); this validator is a forward-looking
-	// guard in case the API surface evolves.
+	// <isvc>-<comp>-<inst>-leader-0-i<incarnation> FQDN (the leader
+	// pod's per-incarnation hostname under the headless Service), so
+	// multiple leaders would produce ambiguous DNS. LeaderSpec has no
+	// explicit Size field today (enforced by type); this validator is a
+	// forward-looking guard in case the API surface evolves.
 	ReasonLeaderSizeMustBeOne = "LeaderSizeMustBeOne"
 
 	// ReasonMultiPodLeanModelNeedsRunner rejects lean (no spec.model,
@@ -130,8 +131,9 @@ func validateLeaderWorkerPairing(component string, leader *v1beta1.LeaderSpec, w
 // ValidateLeaderSize enforces that no Component sets a leader Runner
 // size greater than 1. The leader is fixed at size=1: the
 // OME_LEADER_ADDRESS env var that workers (and the leader itself)
-// consult resolves to <isvc>-<comp>-<inst>-leader-0; a second leader
-// pod would shadow the DNS contract and break tensor-parallel
+// consult resolves to the leader pod's per-incarnation hostname
+// <isvc>-<comp>-<inst>-leader-0-i<incarnation>; a second leader pod
+// would shadow the DNS contract and break tensor-parallel
 // initialization.
 //
 // LeaderSpec has no explicit Size field today, so this validator is
