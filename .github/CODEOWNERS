@@ -3,7 +3,7 @@
 
 # These owners will be the default owners for everything in the repo
 # unless a later match takes precedence
-*       @slin1237
+*       @slin1237 @CatherineSue @fanyang-real @Huang-Wei
 
 # .devcontainer
 /.devcontainer/ @slin1237
@@ -16,13 +16,13 @@
 /charts/ @slin1237 @XinyueZhang369
 
 # cmd
-/cmd/ @slin1237 @pallasathena92 @beiguo218 @op109lvb @fanyang-real @Huang-Wei
+/cmd/ @slin1237 @pallasathena92 @beiguo218 @op109lvb @fanyang-real @Huang-Wei @CatherineSue
 
 # config
-/config/ @slin1237 @CatherineSue @XinyueZhang369
+/config/ @slin1237 @CatherineSue @XinyueZhang369 @CatherineSue
 
 # dockerfiles
-/dockerfiles/ @slin1237 @pallasathena92 @beiguo218
+/dockerfiles/ @slin1237 @pallasathena92 @beiguo218 @CatherineSue
 
 # hack
 /hack/ @slin1237
@@ -31,31 +31,31 @@
 /internal/ @slin1237 @pallasathena92 @beiguo218 @op109lvb
 
 # oeps (OME Enhancement Proposals)
-/oeps/ @slin1237
+/oeps/ @slin1237 @CatherineSue @fanyang-real @Huang-Wei
 
 # pkg
-/pkg/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/acceleratorclassselector/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/afero/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/apis/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
-/pkg/auth/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/acceleratorclassselector/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/afero/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/apis/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/auth/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
 /pkg/auth/aws/ @slin1237 @fanyang-real @Huang-Wei
 /pkg/auth/azure/ @slin1237 @fanyang-real @Huang-Wei
 /pkg/auth/gcp/ @slin1237 @fanyang-real @Huang-Wei
 /pkg/auth/oci/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/configutils/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/constants/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/controller/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/controller/v1beta1/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/controller/v1beta1/acceleratorclass/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/controller/v1beta1/basemodel/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/controller/v1beta1/benchmark/ @slin1237 @CatherineSue @fanyang-real @Huang-Wei
-/pkg/controller/v1beta1/controllerconfig/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/controller/v1beta1/inferenceservice/ @slin1237 @CatherineSue @YouNeedCryDear @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/configutils/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/constants/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/controller/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/controller/v1beta1/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/controller/v1beta1/acceleratorclass/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/controller/v1beta1/basemodel/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/controller/v1beta1/benchmark/ @slin1237 @CatherineSue @fanyang-real @Huang-Wei @CatherineSue
+/pkg/controller/v1beta1/controllerconfig/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
+/pkg/controller/v1beta1/inferenceservice/ @slin1237 @CatherineSue @YouNeedCryDear @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei @CatherineSue
 
-/pkg/hfutil/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
+/pkg/hfutil/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei @CatherineSue
 /pkg/imds/ @slin1237 @fanyang-real @Huang-Wei
-/pkg/logging/ @slin1237 @fanyang-real @Huang-Wei
+/pkg/logging/ @slin1237 @fanyang-real @Huang-Wei @CatherineSue
 /pkg/modelagent/ @slin1237 @pallasathena92 @beiguo218 @truddy0 @op109lvb @fanyang-real @Huang-Wei
 /pkg/modelver/ @slin1237 @pallasathena92 @beiguo218 @fanyang-real @Huang-Wei
 /pkg/ociobjectstore/ @slin1237 @pallasathena92 @speedmancs @op109lvb @davidsnahm @heymrbox @frankzhouhr @beiguo218 @fanyang-real @Huang-Wei
