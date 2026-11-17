@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -280,14 +281,18 @@ func TestRunRefusesIncompleteInputs(t *testing.T) {
 
 func TestRunReportsAManagerThatExitsBeforeItListens(t *testing.T) {
 	dir := t.TempDir()
+	falseCommand, err := exec.LookPath("false")
+	if err != nil {
+		t.Fatal(err)
+	}
 	flags := lockInputs(t, dir, lockRevision, "ome", lockImage)
 	if err := os.Symlink(filepath.Join(testRepository(t), "config"), filepath.Join(dir, "config")); err != nil {
 		t.Fatal(err)
 	}
 	writeTestObjects(t, filepath.Join(dir, "configmap.yaml"), &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]any{"name": "lock"}}})
-	flags["assets"], flags["manager-command"], flags["timeout"], flags["identity-ttl"] = os.Getenv("KUBEBUILDER_ASSETS"), "/bin/false", "3m", "10m"
-	err := lockRun(t, flags)
+	flags["assets"], flags["manager-command"], flags["timeout"], flags["identity-ttl"] = os.Getenv("KUBEBUILDER_ASSETS"), falseCommand, "3m", "10m"
+	err = lockRun(t, flags)
 	if err == nil || !strings.HasPrefix(err.Error(), "prebuilt manager exited: ") || !strings.HasSuffix(err.Error(), "; see manager.log") {
 		t.Fatalf("a manager that exited before it listened: %v", err)
 	}

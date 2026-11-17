@@ -7,6 +7,13 @@ TARGET_DIR = target/$(if $(RUST_TARGET),$(RUST_TARGET)/,)release
 # The operating system the archive is built for: the target triple when
 # cross-compiling, the host otherwise.
 TARGET_OS = $(if $(RUST_TARGET),$(if $(findstring apple-darwin,$(RUST_TARGET)),Darwin,Linux),$(shell uname -s))
+# Apple's bitcode_strip uses linker options unsupported by newer linkers.
+# Avoid producing embedded bitcode on Darwin instead of stripping it afterward.
+# This includes published Darwin libraries: disabling LTO may increase their
+# size or reduce performance; opt-level=3 remains enabled. Linux keeps LTO.
+ifeq ($(TARGET_OS),Darwin)
+CARGO_BUILD_ENV = CARGO_PROFILE_RELEASE_LTO=false RUSTFLAGS="$(RUSTFLAGS) -C embed-bitcode=no"
+endif
 # cargo hard-links $(TARGET_DIR)/libxet.a to the copy under deps/; both are
 # listed so each copy is clean whether or not the strip tool keeps the link.
 XET_ARCHIVES = $(TARGET_DIR)/libxet.a $(TARGET_DIR)/deps/libxet.a
@@ -17,26 +24,20 @@ all: build
 # Build the Rust library and Go bindings
 build:
 	@echo "Building Rust library..."
-	cargo build --release $(if $(RUST_TARGET),--target $(RUST_TARGET))
+	$(CARGO_BUILD_ENV) cargo build --release $(if $(RUST_TARGET),--target $(RUST_TARGET))
+ifneq ($(TARGET_OS),Darwin)
 	@echo "Removing LLVM bitcode from the static library..."
 	@# An LTO build keeps a copy of every object's LLVM bitcode in the archive
-	@# (ELF sections .llvmbc and .llvmcmd, Mach-O segment __LLVM). The Go
+	@# (ELF sections .llvmbc and .llvmcmd). The Go
 	@# toolchain refuses to link a cgo archive that carries them, so they are
 	@# removed from the finished library before Go sees it. The machine code
 	@# is complete without them.
 	@for lib in $(XET_ARCHIVES); do \
 		[ -f "$$lib" ] || continue; \
-		if [ "$(TARGET_OS)" = Darwin ]; then \
-			if xcrun -f bitcode_strip >/dev/null 2>&1; then \
-				{ xcrun bitcode_strip -r "$$lib" -o "$$lib.nolto" && mv "$$lib.nolto" "$$lib"; } || exit 1; \
-			else \
-				echo "bitcode_strip not found: $$lib keeps its __LLVM segment and Go may refuse to link it"; \
-			fi; \
-		else \
-			command -v objcopy >/dev/null || { echo "objcopy (binutils) is required to remove the LTO sections from $$lib"; exit 1; }; \
-			objcopy --remove-section .llvmbc --remove-section .llvmcmd "$$lib" || exit 1; \
-		fi; \
+		command -v objcopy >/dev/null || { echo "objcopy (binutils) is required to remove the LTO sections from $$lib"; exit 1; }; \
+		objcopy --remove-section .llvmbc --remove-section .llvmcmd "$$lib" || exit 1; \
 	done
+endif
 	@echo "Copying static library..."
 	@if [ -z "$(RUST_TARGET)" ]; then \
 		cp target/release/libxet.a . 2>/dev/null || cp target/release/libxet.dylib . 2>/dev/null || true; \
