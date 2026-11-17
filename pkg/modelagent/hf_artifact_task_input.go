@@ -20,6 +20,18 @@ func isDirectHfReuseEligible(task *GopherTask, spec *v1beta1.StorageSpec) bool {
 		!isHfArtifactShapeFiltered(task)
 }
 
+// Restoration includes Direct HF policies, while retaining the actual model
+// shape exclusion for periodic tasks that bypass Scout's task-local filter.
+func isDirectHfRestoreEligible(task *GopherTask, spec *v1beta1.StorageSpec) bool {
+	if task == nil || spec == nil || spec.StorageUri == nil || !strings.HasPrefix(*spec.StorageUri, "hf://") ||
+		spec.Path == nil || *spec.Path == "" || isHfArtifactShapeFiltered(task) {
+		return false
+	}
+	model := taskModelSpec(task)
+	modelType, hasType := model.AdditionalMetadata["type"]
+	return model.ModelFormat.Name != constants.TensorRTLLM || hasType && modelType != string(constants.ServingBaseModel)
+}
+
 func isHfArtifactShapeFiltered(task *GopherTask) bool {
 	filter := task.TensorRTLLMShapeFilter
 	return filter != nil && filter.IsTensorrtLLMModel && filter.ModelType == string(constants.ServingBaseModel)
