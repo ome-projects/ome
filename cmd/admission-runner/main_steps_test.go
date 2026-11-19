@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -140,8 +141,12 @@ func TestManagerArgumentsAndEnvironment(t *testing.T) {
 
 func TestStartManagerReportsAManagerThatExited(t *testing.T) {
 	dir := t.TempDir()
+	falseCommand, err := exec.LookPath("false")
+	if err != nil {
+		t.Fatal(err)
+	}
 	f := completeRunnerFlags()
-	f.command, f.output = "/bin/false", filepath.Join(dir, "report.json")
+	f.command, f.output = falseCommand, filepath.Join(dir, "report.json")
 	port, err := freeLoopbackPort("127.0.0.1")
 	if err != nil {
 		t.Fatal(err)
