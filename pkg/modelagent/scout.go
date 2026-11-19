@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -440,7 +441,7 @@ func (w *Scout) updateBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldBaseModel.Labels, newBaseModel.Labels},
-		{"Annotations", oldBaseModel.Annotations, newBaseModel.Annotations},
+		{"RepairAnnotations", repairAnnotations(oldBaseModel.Annotations), repairAnnotations(newBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldBaseModel.Spec), downloadOverrideInputsFromSpec(newBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -497,7 +498,7 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 
 	hasChanges, err := hasDownloadOverrideChanges([]downloadOverrideChangeCandidate{
 		{"Labels", oldClusterBaseModel.Labels, newClusterBaseModel.Labels},
-		{"Annotations", oldClusterBaseModel.Annotations, newClusterBaseModel.Annotations},
+		{"RepairAnnotations", repairAnnotations(oldClusterBaseModel.Annotations), repairAnnotations(newClusterBaseModel.Annotations)},
 		{"DownloadOverrideInputs", downloadOverrideInputsFromSpec(oldClusterBaseModel.Spec), downloadOverrideInputsFromSpec(newClusterBaseModel.Spec)},
 	}, ignorePlacementAndPolicy)
 	if err != nil {
@@ -509,6 +510,17 @@ func (w *Scout) updateClusterBaseModel(old, new interface{}) {
 		w.logger.Infof("ClusterBaseModel %s need refresh", newClusterBaseModel.GetName())
 		w.generateDownloadOverrideTaskBasedOnClusterBaseModel(newClusterBaseModel)
 	}
+}
+
+// repairAnnotations selects explicit repair signals without modifying informer metadata.
+func repairAnnotations(annotations map[string]string) map[string]string {
+	repair := make(map[string]string)
+	for key, value := range annotations {
+		if strings.HasPrefix(key, constants.ModelRepairAnnotationPrefix) {
+			repair[key] = value
+		}
+	}
+	return repair
 }
 
 func hasDownloadOverrideChanges(candidates []downloadOverrideChangeCandidate, opts ...cmp.Option) (bool, error) {

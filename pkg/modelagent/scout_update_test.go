@@ -131,7 +131,7 @@ func TestScoutUpdateAffinityPreservesRefreshAndDeletion(t *testing.T) {
 				new.Labels = map[string]string{"refresh": "1"}
 			}, DownloadOverride},
 			{"annotation_refresh", func(old, new *v1beta1.BaseModel) {
-				new.Annotations = map[string]string{"refresh": "1"}
+				new.Annotations = map[string]string{"ome.io/repair-request": "1"}
 			}, DownloadOverride},
 			{"label_refresh_without_reuse_policy", func(old, new *v1beta1.BaseModel) {
 				old.Spec.Storage.DownloadPolicy = nil
@@ -141,7 +141,7 @@ func TestScoutUpdateAffinityPreservesRefreshAndDeletion(t *testing.T) {
 			{"annotation_refresh_without_reuse_policy", func(old, new *v1beta1.BaseModel) {
 				old.Spec.Storage.DownloadPolicy = nil
 				new.Spec.Storage.DownloadPolicy = nil
-				new.Annotations = map[string]string{"refresh": "1"}
+				new.Annotations = map[string]string{"ome.io/repair-request": "1"}
 			}, DownloadOverride},
 			{"newly_eligible_with_source_change", func(old, new *v1beta1.BaseModel) {
 				old.Spec.Storage.NodeAffinity = scoutTestNodeAffinity("other-node")
@@ -155,7 +155,7 @@ func TestScoutUpdateAffinityPreservesRefreshAndDeletion(t *testing.T) {
 			{"still_ineligible_with_annotation_change", func(old, new *v1beta1.BaseModel) {
 				old.Spec.Storage.NodeAffinity = scoutTestNodeAffinity("other-node")
 				new.Spec.Storage.NodeAffinity = scoutTestNodeAffinity("another-node")
-				new.Annotations = map[string]string{"refresh": "1"}
+				new.Annotations = map[string]string{"ome.io/repair-request": "1"}
 			}, ""},
 			{"matching_affinity_but_selector_excludes_node", func(old, new *v1beta1.BaseModel) {
 				old.Spec.Storage.NodeAffinity = scoutTestNodeAffinity("other-node")
@@ -378,5 +378,43 @@ func checkScoutUpdateTask(t *testing.T, scout *Scout, tasks chan *GopherTask, cl
 			modelType = value
 		}
 		assert.Equal(t, modelType, task.TensorRTLLMShapeFilter.ModelType)
+	}
+}
+
+func TestScoutUpdateRepairAnnotations(t *testing.T) {
+	for _, cluster := range []bool{false, true} {
+		kind := "BaseModel"
+		if cluster {
+			kind = "ClusterBaseModel"
+		}
+		for _, tc := range []struct {
+			name     string
+			old, new map[string]string
+			want     GopherTaskType
+		}{
+			{"unrelated_added", nil, map[string]string{"note": "new"}, ""},
+			{"unrelated_changed", map[string]string{"note": "old"}, map[string]string{"note": "new"}, ""},
+			{"unrelated_removed", map[string]string{"note": "old"}, nil, ""},
+			{"empty_map", nil, map[string]string{}, ""},
+			{"repair_added", nil, map[string]string{"ome.io/repair-request": "1"}, DownloadOverride},
+			{"repair_changed", map[string]string{"ome.io/repair-request": "1"}, map[string]string{"ome.io/repair-request": "2"}, DownloadOverride},
+			{"repair_removed", map[string]string{"ome.io/repair-request": "1"}, nil, DownloadOverride},
+			{"repair_unchanged", map[string]string{"ome.io/repair-request": "1"}, map[string]string{"ome.io/repair-request": "1"}, ""},
+			{"unrelated_changed_with_repair", map[string]string{"ome.io/repair": "1", "note": "old"}, map[string]string{"ome.io/repair": "1", "note": "new"}, ""},
+			{"prefix_exact", nil, map[string]string{"ome.io/repair": "1"}, DownloadOverride},
+			{"wrong_case", nil, map[string]string{"ome.io/Repair": "1"}, ""},
+			{"repair_and_unrelated_changed", map[string]string{"ome.io/repair-request": "1", "note": "old"}, map[string]string{"ome.io/repair-request": "2", "note": "new"}, DownloadOverride},
+			{"wrong_domain", nil, map[string]string{"other.io/repair": "1"}, ""},
+			{"unqualified", nil, map[string]string{"repair": "1"}, ""},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				scout, tasks := newScoutForUpdateTest(t)
+				old := newBaseModel("model", v1beta1.ReuseIfExists, "oci://n/ns/b/models/o/model")
+				old.Annotations = tc.old
+				new := old.DeepCopy()
+				new.Annotations = tc.new
+				checkScoutUpdateTask(t, scout, tasks, cluster, old, new, tc.want)
+			})
+		}
 	}
 }

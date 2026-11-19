@@ -63,6 +63,9 @@ const (
 	TensorRTLLM = "tensorrtllm"
 )
 
+// ModelRepairAnnotationPrefix identifies annotations whose changes request DownloadOverride.
+var ModelRepairAnnotationPrefix = OMEAPIGroupName + "/repair"
+
 // InferenceService Annotations
 var (
 	DeploymentMode                          = OMEAPIGroupName + "/deploymentMode"

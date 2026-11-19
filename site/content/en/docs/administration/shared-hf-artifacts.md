@@ -245,10 +245,12 @@ the ordinary download behavior at their `path`:
 
 Switching a shared model back to `AlwaysDownload`, or changing its source or
 `path`, detaches it first — its reference and symlink are removed under the
-same rules as deletion — before the ordinary download proceeds. Changing the
-pinned revision or `hf-model-sha` is an identity change: the model detaches
-from the old parent and downloads (or reuses) a parent for the new commit
-SHA.
+same rules as deletion — before the ordinary download proceeds. When the model
+is reprocessed, changing the pinned revision or `hf-model-sha` is an identity
+change: the model detaches from the old parent and downloads (or reuses) a
+parent for the new commit SHA. Changing only `hf-model-id` or `hf-model-sha`
+does not trigger DownloadOverride. To apply an annotation-only identity change
+immediately, also [request model repair](/ome/docs/reference/labels-and-annotations/#requesting-model-repair).
 
 For the full storage API, see the
 [BaseModel concept](/ome/docs/concepts/base_model) and the
