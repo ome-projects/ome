@@ -105,10 +105,9 @@ func UpdateEnvVariables(p *Piece, isvc *v1beta1.InferenceService, container *cor
 	if p.SupportedModelFormat != nil && p.SupportedModelFormat.AcceleratorConfig != nil && p.AcceleratorClassName != "" {
 		acceleratorConfig := p.SupportedModelFormat.GetAcceleratorConfig(p.AcceleratorClassName)
 		if acceleratorConfig != nil {
-			envOverride := acceleratorConfig.EnvironmentOverride
-			for envName, envVar := range envOverride {
-				isvcutils.UpdateEnvVars(container, &corev1.EnvVar{
-					Name: envName, Value: envVar})
+			// Keep map-derived additions stable without moving existing entries.
+			for _, envVar := range ConfigEnvVars(acceleratorConfig.EnvironmentOverride) {
+				isvcutils.UpdateEnvVars(container, &envVar)
 			}
 		}
 	}
