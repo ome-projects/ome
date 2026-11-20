@@ -227,7 +227,9 @@ func visionRule(hf HuggingFaceModel) []Capability {
 
 func asrRule(hf HuggingFaceModel) []Capability {
 	arch := hf.GetArchitecture()
-	if hasAnySuffix(arch, "ForCTC", "ForSpeechToText") ||
+	if strings.EqualFold(hf.GetModelType(), "cohere_asr") ||
+		strings.EqualFold(arch, "CohereAsrForConditionalGeneration") ||
+		hasAnySuffix(arch, "ForCTC", "ForSpeechToText") ||
 		arch == "WhisperForConditionalGeneration" {
 		return []Capability{CapabilityAudioToText}
 	}
