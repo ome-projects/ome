@@ -51,9 +51,9 @@ func isDirectFileTask(task *GopherTask) bool {
 	return err == nil && isDirectFileStorageType(kind)
 }
 
-// Shared tasks and Direct file tasks use the same per-model task coordinator.
+// Eviction, Shared tasks, and Direct file tasks use the same per-model coordinator.
 func usesArtifactTaskCoordinator(task *GopherTask) bool {
-	return task.SharedArtifact || isDirectFileTask(task)
+	return task.TaskType == Evict || task.SharedArtifact || isDirectFileTask(task)
 }
 
 func (s *Gopher) tryLockDirectModelPath(ctx context.Context, path string) (bool, error) {

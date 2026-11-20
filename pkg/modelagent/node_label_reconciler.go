@@ -24,6 +24,8 @@ type NodeLabelOp struct {
 	ModelStateOnNode ModelStateOnNode
 	BaseModel        *v1beta1.BaseModel
 	ClusterBaseModel *v1beta1.ClusterBaseModel
+	// Scoped to one publication; recheck live intent inside every Ready retry.
+	validateReady func() error
 }
 
 // NodeLabelReconciler handles updating node labels œwith model status information
@@ -90,6 +92,9 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	// First get the node to check existing labels
 	node, err := n.kubeClient.CoreV1().Nodes().Get(context.TODO(), n.nodeName, metav1.GetOptions{})
 	if err != nil {
+		if op.ModelStateOnNode == Ready && op.validateReady != nil {
+			return err
+		}
 		if errors.IsNotFound(err) {
 			// Node doesn't exist, log warning and return nil to avoid retries
 			n.logger.Warnf("Node %s not found, skipping node labeling for %s: %v", n.nodeName, modelInfo, err)
@@ -98,6 +103,12 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 		// For other errors, log and return error for possible retry
 		n.logger.Errorf("Error checking node %s existence for %s: %v", n.nodeName, modelInfo, err)
 		return err
+	}
+
+	if op.ModelStateOnNode == Ready && op.validateReady != nil {
+		if err := op.validateReady(); err != nil {
+			return err
+		}
 	}
 
 	// Check current labels - make idempotent based on operation type
@@ -144,6 +155,9 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 	)
 	if err != nil {
 		// Check for specific error types and handle them gracefully
+		if op.ModelStateOnNode == Ready && op.validateReady != nil {
+			return err
+		}
 		if errors.IsNotFound(err) {
 			// Node disappeared after our initial check
 			n.logger.Warnf("Node %s not found during patch operation for %s, skipping", n.nodeName, modelInfo)

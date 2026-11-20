@@ -143,7 +143,7 @@ func (s *Gopher) beginTask(task *GopherTask) (context.Context, func(bool), bool,
 		attempt := s.taskTracker.beginLegacyTask(key, cancel)
 		return ctx, func(bool) { s.taskTracker.finishLegacyTask(attempt); cancel() }, true, nil
 	}
-	if task.TaskType == Delete {
+	if task.TaskType == Delete || task.TaskType == Evict {
 		attempt, outcome := s.taskTracker.beginDelete(key, task.Sequence)
 		if outcome != gopherTaskProceed {
 			err := s.requeueTaskOnWait(task, outcome)
