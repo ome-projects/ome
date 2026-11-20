@@ -437,7 +437,14 @@ func TestSharedEvictionWaitsForExistingDownload(t *testing.T) {
 			return false, os.WriteFile(filepath.Join(input.Parent.LocalPath, "late-weights"), []byte("late"), 0600)
 		}, nil)
 	}()
-	writer := <-started
+	var writer context.Context
+	select {
+	case writer = <-started:
+	case err := <-done:
+		t.Fatalf("download exited before acquiring its lock: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("download did not acquire its lock before the timeout")
+	}
 	_, err = s.omeClient.OmeV1beta1().BaseModels(model.Namespace).Update(context.Background(), eviction.BaseModel, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	require.NoError(t, s.processTask(eviction))

@@ -108,6 +108,21 @@ func (tracker *gopherTaskTracker) finishDownload(attempt *gopherDownloadAttempt)
 	}
 }
 
+// supersedeDeleteBarrier transfers queued cleanup intent to a real Delete.
+// Active cleanup retains its attempt until all its work has finished; replacing
+// its reserved sequence prevents an abandoned retry from blocking the Delete.
+func (tracker *gopherTaskTracker) supersedeDeleteBarrier(modelUID string, sequence uint64) {
+	if modelUID == "" || sequence == 0 {
+		return
+	}
+	tracker.mutex.Lock()
+	defer tracker.mutex.Unlock()
+	state := tracker.modelStateLocked(modelUID)
+	if sequence > state.newestDownloadSequence && sequence > state.finishedDeleteSequence && sequence > state.deleteSequence {
+		state.deleteSequence = sequence
+	}
+}
+
 // beginDelete reserves the barrier before cancelling older active work. Wait
 // is nonblocking: callers use their bounded requeue policy, never a fixed sleep.
 // A non-nil attempt must be finished even when the result is Wait. A nil attempt
@@ -211,6 +226,11 @@ func (tracker *gopherTaskTracker) finishDelete(attempt *gopherDeleteAttempt, kee
 		return
 	}
 	state.deleteAttempt = nil
+	if state.deleteSequence != attempt.sequence {
+		// A real Delete superseded this cleanup while it was active. Its
+		// reservation survives even if this attempt scheduled another retry.
+		return
+	}
 	if keepBarrier {
 		return
 	}

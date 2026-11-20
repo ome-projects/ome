@@ -523,6 +523,9 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 	return retry.OnError(retry.DefaultRetry, func(err error) bool {
 		return errors.IsConflict(err) || errors.IsAlreadyExists(err)
 	}, func() error {
+		if err := validateArtifactRestore(ctx); err != nil {
+			return err
+		}
 		if err := validateArtifactCleanup(ctx); err != nil {
 			return err
 		}
@@ -553,6 +556,9 @@ func (c *ConfigMapReconciler) mutateConfigMapWithModelUIDLocked(ctx context.Cont
 			return err
 		}
 		if changed || restored {
+			if err := validateArtifactRestore(ctx); err != nil {
+				return err
+			}
 			if err := validateArtifactCleanup(ctx); err != nil {
 				return err
 			}
