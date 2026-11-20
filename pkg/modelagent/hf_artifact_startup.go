@@ -66,7 +66,7 @@ func (s *hfArtifactStartup) recover(ctx context.Context) error {
 			continue
 		}
 		if parent.Status == HfArtifactStatusUpdating && parent.LockID != "" {
-			unlock, acquired, err := s.handler.tryParentFileOperation(parent, hfArtifactParentStoreRoot(parent))
+			unlock, acquired, err := s.handler.tryParentFileOperation(ctx, parent, hfArtifactParentStoreRoot(parent))
 			if err != nil {
 				s.deferred[key] = parent
 				s.pending[key] = false
@@ -158,7 +158,7 @@ func (s *hfArtifactStartup) recoverParentAtPath(ctx context.Context, key, path s
 		}
 		s.deferred[key] = expected
 	}
-	unlock, acquired, err := s.handler.tryParentFileOperation(expected, hfArtifactParentStoreRoot(expected))
+	unlock, acquired, err := s.handler.tryParentFileOperation(ctx, expected, hfArtifactParentStoreRoot(expected))
 	if err != nil {
 		return err
 	}

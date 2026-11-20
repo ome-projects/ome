@@ -135,7 +135,7 @@ func TestGopherHfArtifactDeleteRejectsSupersededInvalidatedUID(t *testing.T) {
 			task.TaskType, task.SharedArtifact = Delete, true
 			replacement := task.BaseModel.DeepCopy()
 			replacement.UID = "replacement-uid"
-			unlock, acquired, err := h.tryArtifactOperation(input)
+			unlock, acquired, err := h.tryArtifactOperation(context.Background(), input)
 			require.NoError(t, err)
 			require.True(t, acquired)
 			_, err = h.repository.removeModelReference(ctx, input.Parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath, true)

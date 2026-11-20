@@ -243,15 +243,23 @@ ordinary models borrowing the paths, and pending cleanups can keep files
 resident; `Evicted` acknowledges release of this model's ownership, not that
 every shared byte was removed.
 
-Eviction requires persisted Shared ownership. Missing or unsupported ownership
-fails explicitly and preserves files. Failed readiness withdrawal or ownership
-lookups also block cleanup. Interrupted cleanup resumes at its recorded paths;
+Shared eviction follows the persisted relationship, independently of download policy.
+When no artifact ownership is recorded and the destination is absent, the agent
+can acknowledge `Evicted` without deleting files. Otherwise, missing or unsupported
+ownership fails explicitly and preserves any existing unrecorded directory.
+Failed readiness withdrawal or ownership lookups also block cleanup. Interrupted cleanup resumes at its recorded paths;
 do not edit cleanup records or delete lock files. Existing downloads cannot
 publish this model as Ready while `Evicted` remains requested.
 
-Before requesting eviction, ensure no other Model CR uses the same target
-`storage.path`. Different model paths may still share an artifact parent; eviction
-releases only this model's reference and retains files needed by other references.
+### Out of scope
+
+Shared eviction and rehydration do not support:
+
+- Changing an existing Model CR's `storage.path` as part of eviction or rehydration.
+- Evicting a model while another Model CR uses the same target `storage.path`.
+
+Different model paths may still share an artifact parent; eviction releases only
+this model's reference and retains files needed by other references.
 
 Choose eviction only after deciding that serving workloads no longer require
 this model. The agent checks local file ownership, not Pods or serving demand.

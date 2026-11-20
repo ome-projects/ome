@@ -144,7 +144,7 @@ func TestDirectHfSourceCleanupErrorPreventsResolution(t *testing.T) {
 	require.NoError(t, runTestHfArtifactDownload(handler, input))
 	_, err := handler.repository.removeModelReference(context.Background(), input.Parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath, true)
 	require.NoError(t, err)
-	unlock, acquired, err := handler.tryArtifactOperation(input)
+	unlock, acquired, err := handler.tryArtifactOperation(context.Background(), input)
 	require.NoError(t, err)
 	require.True(t, acquired)
 	defer unlock()
