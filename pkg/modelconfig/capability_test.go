@@ -267,17 +267,46 @@ func TestClassifyCapabilities_Vision(t *testing.T) {
 
 func TestClassifyCapabilities_ASR(t *testing.T) {
 	cases := []struct {
-		arch string
-		want []Capability
+		name      string
+		modelType string
+		arch      string
+		want      []Capability
 	}{
-		{"WhisperForConditionalGeneration", []Capability{CapabilityAudioToText}},
-		{"Wav2Vec2ForCTC", []Capability{CapabilityAudioToText}},
-		{"HubertForCTC", []Capability{CapabilityAudioToText}},
-		{"SeamlessM4TForSpeechToText", []Capability{CapabilityAudioToText}},
+		{
+			name: "Cohere ASR architecture",
+			arch: "CohereAsrForConditionalGeneration",
+			want: []Capability{CapabilityAudioToText},
+		},
+		{
+			name:      "Cohere ASR model type fallback",
+			modelType: "cohere_asr",
+			arch:      "CustomConditionalGeneration",
+			want:      []Capability{CapabilityAudioToText},
+		},
+		{
+			name: "Whisper architecture",
+			arch: "WhisperForConditionalGeneration",
+			want: []Capability{CapabilityAudioToText},
+		},
+		{
+			name: "Wav2Vec2 architecture",
+			arch: "Wav2Vec2ForCTC",
+			want: []Capability{CapabilityAudioToText},
+		},
+		{
+			name: "HuBERT architecture",
+			arch: "HubertForCTC",
+			want: []Capability{CapabilityAudioToText},
+		},
+		{
+			name: "speech-to-text suffix",
+			arch: "SeamlessM4TForSpeechToText",
+			want: []Capability{CapabilityAudioToText},
+		},
 	}
 	for _, tc := range cases {
-		t.Run(tc.arch, func(t *testing.T) {
-			m := &stubModel{architecture: tc.arch}
+		t.Run(tc.name, func(t *testing.T) {
+			m := &stubModel{modelType: tc.modelType, architecture: tc.arch}
 			if got := classifyCapabilities(m); !equalCaps(got, tc.want) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
@@ -331,6 +360,11 @@ func TestClassifyCapabilities_Default(t *testing.T) {
 			name: "unknown model with no recognized signal => Unknown",
 			m:    &stubModel{modelType: "foo", architecture: "Foo"},
 			want: []Capability{CapabilityUnknown},
+		},
+		{
+			name: "Cohere text generation remains TextToText",
+			m:    &stubModel{modelType: "cohere", architecture: "CohereForCausalLM"},
+			want: []Capability{CapabilityTextToText},
 		},
 	}
 	for _, tc := range cases {
