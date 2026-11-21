@@ -1,0 +1,76 @@
+# tpu-defrag.sh creates this runtime and the InferenceService below twice
+# (tpu-a, tpu-b). Each Instance is one pod on its own OME-provisioned 2x2x1
+# slice, one host of a virtual TPU7x node.
+apiVersion: ome.io/v1beta1
+kind: ClusterServingRuntime
+metadata:
+  name: alfred-e2e-tpu-runtime
+spec:
+  disabled: false
+  supportedModelFormats:
+  - name: alfred-e2e-tpu-safetensors
+    modelFormat:
+      name: safetensors
+    modelFramework:
+      name: transformers
+    modelArchitecture: LlamaForCausalLM
+    autoSelect: false
+  engineConfig:
+    terminationGracePeriodSeconds: 3
+    nodeSelector:
+      alfred-e2e/virtual-tpu: "true"
+      cloud.google.com/gke-tpu-accelerator: tpu7x
+      cloud.google.com/gke-tpu-topology: 2x2x1
+    tolerations:
+    - key: alfred-e2e/virtual-tpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+    runner:
+      name: ome-container
+      image: registry.k8s.io/pause:3.10
+      ports:
+      - name: http1
+        containerPort: 8080
+      resources:
+        requests:
+          cpu: 10m
+          memory: 16Mi
+          google.com/tpu: "4"
+        limits:
+          cpu: 10m
+          memory: 16Mi
+          google.com/tpu: "4"
+---
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: tpu-a
+  namespace: alfred-e2e-tpu
+  annotations:
+    alfred.ome.io/movable: "true"
+spec:
+  deploymentMode: OMENative
+  runtime:
+    name: alfred-e2e-tpu-runtime
+  engine:
+    terminationGracePeriodSeconds: 3
+    minReplicas: 1
+    maxReplicas: 1
+    schedulerName: alfred-default-scheduler
+    annotations:
+      ome.io/tpu-slice-provisioning: "true"
+    lifecycle:
+      instanceReadyTimeout: 2m0s
+      migrationPolicy:
+        mode: Auto
+      readyPolicy: AllPodReady
+      restartPolicy: RecreateInstanceOnPodRestart
+      updateStrategy:
+        type: SurgeThenDrain
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 0
+        inPlaceUpdateStrategy:
+          gracePeriodSeconds: 0
+          markNotReadyDuringLifecycle: true

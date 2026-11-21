@@ -22,6 +22,10 @@ func TestNewRegistersEverySeries(t *testing.T) {
 	m.PendingPodCount.Set(1)
 	m.PendingPodGPURequirements.WithLabelValues("8").Set(1)
 	m.SurgeHeadroomGPUs.WithLabelValues("h100").Set(5)
+	m.TPUFreePartitions.WithLabelValues("pod-a", "4x4x4").Set(2)
+	m.TPUPackingBound.WithLabelValues("pod-a", "4x4x4").Set(5)
+	m.TPUDrains.WithLabelValues("completed").Inc()
+	m.TPUFencedHosts.Set(16)
 	m.RecommendationsProduced.WithLabelValues("defragmentation", "prod/svc", "engine", "fragmentation", "true").Inc()
 	m.RecommendationsAccepted.WithLabelValues("defragmentation", "prod/svc", "engine").Inc()
 	m.RecommendationsRejected.WithLabelValues("defragmentation", "prod/svc", "engine", "Cooldown").Inc()
@@ -42,7 +46,7 @@ func TestNewRegistersEverySeries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const wantFamilies = 23
+	const wantFamilies = 27
 	if len(families) != wantFamilies {
 		t.Fatalf("registered %d metric families, want %d", len(families), wantFamilies)
 	}

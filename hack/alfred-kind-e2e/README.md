@@ -336,8 +336,60 @@ Run offline harness checks with:
 
 ```bash
 for test in hack/alfred-kind-e2e/*_test.sh; do bash "$test" || exit; done
-go test ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/ir-status ./hack/alfred-kind-e2e/simulator-barrier
+go test ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/ir-status ./hack/alfred-kind-e2e/simulator-barrier \
+  ./hack/alfred-kind-e2e/slice-provider
 ```
+
+## TPU partition defragmentation
+
+`tpu-defrag.sh` exercises the TPU defragmentation policy (OEP-0008.1) with the
+real Alfred, OME manager and scheduler. It needs no GPU fixture and leaves the
+GPU nodes untouched:
+
+```bash
+bash hack/alfred-kind-e2e/tpu-defrag.sh
+```
+
+The runner creates eight virtual TPU7x hosts in one TPU pod, labelled with
+GKE's partition labels: two 2x2x4 partitions (hosts 0-3 and 4-7), four 2x2x2
+and eight 2x2x1. Their KWOK stages are the harness's pod lifecycle stages,
+re-scoped to these hosts. OME provisions each Instance its own 2x2x1 slice
+through an `accelerator.gke.io` Slice. kind has no GKE slice provider, so
+`slice-provider` stands in for it, running on the host for the scenario's
+duration. It places each Slice on a wholly free partition of its topology with
+the slice scheduler's best fit, skipping cordoned hosts as a slice scheduler
+that filters on partition taints does. It labels the hosts, reports the Slice
+`ACTIVE`, and removes the labels once the Slice is deleted. It does nothing
+else; migration requests come only from Alfred and migration status only from
+the OME controllers.
+
+`tpu-a` lands on host 0. With hosts 1-3 briefly cordoned by the runner,
+`tpu-b` lands on host 4, so each 2x2x4 has one busy host and neither is wholly
+free. A pass requires, in order:
+
+- after the runner enables `policies.tpuDefragmentation` (target 2x2x4,
+  `minGap: 1`) in an always-open window, Alfred fences hosts 0-3 of one drain;
+- the watch on both InferenceServices observes exactly one migration request,
+  on `tpu-a`, from host 0 with reason `TPUFragmentation`, made at least
+  `fenceSettleSeconds` after the fence; OME reports it `Completed`;
+- the replacement is `tpu-a`'s only ready pod, on a host outside the fence;
+- Alfred removes every fence and cordon, and its metrics report one completed
+  drain and one whole free 2x2x4 in the TPU pod;
+- three further decision cycles fence nothing, `tpu-b` keeps its pod, and no
+  other request appears.
+
+The harness baseline already carries what this needs and is inert for the GPU
+scenarios: the stand-in Slice CRD, the manager's `tpuSliceProvisioning`
+(only the TPU hosts carry its provision-only label), and Alfred with
+`tpuSliceMigrationEnabled` and `defragmentationFence.enabled`. The policy stays
+disabled except during this run. Cleanup restores the original Alfred values
+first, which ends any open drain, then deletes the fixture, waits for OME to
+release every slice, and removes the TPU hosts and stages. A failed run
+retains its fixture and evidence under `${STATE_DIR}/artifacts/`.
+
+This tests Alfred's planning, fencing, dispatch and release against real OME
+slice provisioning and migration. It does not test GKE's partition-tree
+controller, the real slice scheduler, or multi-host slices.
 
 ## Alfred-only change boundary
 

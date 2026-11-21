@@ -81,6 +81,13 @@ migration:
 maintenanceCordon:
   enabled: false
 
+# Operator opt-in that lets execute mode cordon the TPU partitions the TPU
+# defragmentation policy drains and uncordon them when the drain ends. Grants
+# node get/patch in a separate ClusterRole and passes
+# --enable-defragmentation-fence. Alfred uncordons only nodes it fenced.
+defragmentationFence:
+  enabled: false
+
 # Alfred's policy configuration, rendered verbatim
 # into <configMapName>'s config.yaml and hot-reloaded by every replica. A
 # config that fails schema validation is rejected at reload and the
@@ -153,6 +160,20 @@ alfredConfig:
         #   taint: {key: maintenance.example.com/patching, value: "true", effect: NoSchedule}
         # - name: patching-condition
         #   condition: {type: Patching, status: "True"}
+    # TPU partition defragmentation: empties sparsely used partitions of the
+    # largest target shape so whole free ones exist for large slices. It needs
+    # tpuSliceMigrationEnabled, and in execute mode maintenanceWindows and
+    # defragmentationFence.enabled. See OEP-0008.1.
+    tpuDefragmentation:
+      enabled: false
+      targetShapes: ["4x4x4", "2x2x4"]
+      minGap: 2
+      maxDrainPartitions: 4
+      maxBusyHostsPerPartition: 8
+      maxMovesPerWorkloadPerDrain: 4
+      drainDeadlineMinutes: 240
+      fenceSettleSeconds: 60
+      fenceFailureBackoffMinutes: 1440
 
   # Per-workload defaults; alfred.ome.io/* annotations on an
   # InferenceService win over these.

@@ -22,6 +22,14 @@ type Metrics struct {
 	PendingPodGPURequirements *prometheus.GaugeVec // size
 	SurgeHeadroomGPUs         *prometheus.GaugeVec // pool
 
+	// TPU partition gauges, published from the snapshot whether or not the
+	// TPU defragmentation policy is enabled.
+	TPUFreePartitions *prometheus.GaugeVec // tpu_pod, shape
+	TPUPackingBound   *prometheus.GaugeVec // tpu_pod, shape
+	// TPU defragmentation fencer series.
+	TPUDrains      *prometheus.CounterVec // outcome
+	TPUFencedHosts prometheus.Gauge
+
 	// Recommendation / migration counters (Reporter-only).
 	RecommendationsProduced *prometheus.CounterVec // policy, workload, component, reason, executable
 	RecommendationsAccepted *prometheus.CounterVec // policy, workload, component
@@ -85,6 +93,23 @@ func New(reg prometheus.Registerer) *Metrics {
 			Name: "alfred_surge_headroom_gpus",
 			Help: "Largest replacement footprint that could surge right now per pool; 0 means surge-shaped migration is infeasible.",
 		}, []string{"pool"}),
+
+		TPUFreePartitions: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "alfred_tpu_free_partitions",
+			Help: "Whole free TPU partitions of each shape per TPU pod: every host healthy, schedulable and holding no slice.",
+		}, []string{"tpu_pod", "shape"}),
+		TPUPackingBound: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "alfred_tpu_packing_bound",
+			Help: "Whole free TPU partitions of each shape the TPU pod would hold if its free hosts were packed perfectly.",
+		}, []string{"tpu_pod", "shape"}),
+		TPUDrains: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "alfred_tpu_drains_total",
+			Help: "TPU defragmentation drains that ended, by outcome.",
+		}, []string{"outcome"}),
+		TPUFencedHosts: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "alfred_tpu_fenced_hosts",
+			Help: "Nodes carrying the TPU defragmentation fence annotation. Non-zero outside a drain means a leaked cordon.",
+		}),
 
 		RecommendationsProduced: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "alfred_recommendations_produced_total",

@@ -188,10 +188,10 @@ func projectRow(w recommendationWire) (reportv1.AlfredRecommendation, bool) {
 	if w.FromNode != "" && len(validation.IsDNS1123Subdomain(w.FromNode)) != 0 {
 		return r, false
 	}
-	if !oneOf(w.Component, "engine", "decoder", "router") || !oneOf(w.Policy, "defragmentation", "nodehealth", "migration-dispatch") || !oneOf(w.Reason, "Fragmentation", "NodeUnhealthy", "NodeMaintenance", "RemediationSignal") {
+	if !oneOf(w.Component, "engine", "decoder", "router") || !oneOf(w.Policy, "defragmentation", "nodehealth", "tpudefragmentation", "migration-dispatch") || !oneOf(w.Reason, "Fragmentation", "NodeUnhealthy", "NodeMaintenance", "RemediationSignal", "TPUFragmentation") {
 		return r, false
 	}
-	if !oneOf(w.AdvisoryReason, "", "NoSurgeHeadroom", "VolumePinned", "LWSMigrationUnsupported", "RawDeploymentMigrationUnsupported", "OMENativeUnavailable", "OMENativeObservationInvalid", "OMENativeStateIneligible", "NonExecutableObservedFragmentation", "MigrationSurfaceDisabled", "ModelUnresolved") || !validReject(w.RejectReason) || !validDispatchReason(w.DispatchReason) {
+	if !oneOf(w.AdvisoryReason, "", "NoSurgeHeadroom", "VolumePinned", "LWSMigrationUnsupported", "RawDeploymentMigrationUnsupported", "OMENativeUnavailable", "OMENativeObservationInvalid", "OMENativeStateIneligible", "NonExecutableObservedFragmentation", "MigrationSurfaceDisabled", "ModelUnresolved", "AcceleratorPlacementUnmodeled", "NoTPUSliceCapacity", "TPUDrainPlanned", "TPUDrainFenceSettling") || !validReject(w.RejectReason) || !validDispatchReason(w.DispatchReason) {
 		return r, false
 	}
 	class := "Unverifiable"

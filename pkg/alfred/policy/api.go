@@ -25,6 +25,9 @@ const (
 	ReasonNodeUnhealthy     = "NodeUnhealthy"
 	ReasonNodeMaintenance   = "NodeMaintenance"
 	ReasonRemediationSignal = "RemediationSignal"
+	// ReasonTPUFragmentation moves an Instance off a TPU partition that the
+	// TPU defragmentation policy is emptying.
+	ReasonTPUFragmentation = "TPUFragmentation"
 )
 
 // Advisory reasons: why an emitted Candidate is not executable. Advisory
@@ -72,6 +75,12 @@ const (
 	// slice, but no free healthy partition of its topology exists on nodes
 	// Alfred accepts as a destination.
 	AdvisoryNoTPUSliceCapacity = "NoTPUSliceCapacity"
+	// AdvisoryTPUDrainPlanned: the TPU defragmentation policy would empty
+	// the partition this Instance occupies, but has not fenced it.
+	AdvisoryTPUDrainPlanned = "TPUDrainPlanned"
+	// AdvisoryTPUDrainFenceSettling: the partition is fenced, but the fence
+	// is incomplete or has not stood for the settle interval yet.
+	AdvisoryTPUDrainFenceSettling = "TPUDrainFenceSettling"
 )
 
 // ComponentWideInstance marks a Candidate that addresses a whole component

@@ -18,6 +18,11 @@ tolerations:
 affinity: {}
 topologySpreadConstraints: []
 
+# The fencer acts only while policies.tpuDefragmentation is enabled, which
+# only the tpu-defrag scenario does.
+defragmentationFence:
+  enabled: true
+
 simulation:
   configMapName: alfred-simulation
   timeout: 10s
@@ -52,6 +57,16 @@ alfredConfig:
           "4": 0.2
           "8": 0.6
         pendingUrgencyTauMinutes: 1
+    tpuDefragmentation:
+      enabled: false
+      targetShapes: ["2x2x4"]
+      minGap: 1
+      maxDrainPartitions: 1
+      maxBusyHostsPerPartition: 1
+      maxMovesPerWorkloadPerDrain: 1
+      drainDeadlineMinutes: 15
+      fenceSettleSeconds: 10
+      fenceFailureBackoffMinutes: 5
     nodeHealth:
       enabled: true
       aggressiveness: balanced
@@ -73,6 +88,7 @@ alfredConfig:
 
   rawDeploymentMigrationEnabled: false
   omenativeMigrationEnabled: true
+  tpuSliceMigrationEnabled: true
   lwsRecommendationsEnabled: true
 
   recommendationsConfigMapEnabled: true

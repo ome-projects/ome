@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/alfred/policy"
+	"sigs.k8s.io/ome/pkg/alfred/policy/tpudefrag"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
@@ -248,5 +249,32 @@ func TestDispatchWithoutSimulatorSubmitsOnlyTPUSliceMoves(t *testing.T) {
 	_, decisions := d.Execute(context.Background(), snap, []policy.Candidate{c}, cfg, a)
 	if got := decisionFor(t, decisions, "prod/a"); got.DispatchStatus != "withheld" || got.DispatchReason != "SimulationUnavailable" || cl.patches != 0 {
 		t.Fatalf("a move that needs a simulation must be withheld without a simulator: %+v patches=%d", got, cl.patches)
+	}
+}
+
+// TestDispatcherJournalsTPUDefragmentationMovesUnderTheirPolicy checks a TPU
+// defragmentation move is submitted without simulation, carries its reason,
+// and a restarted leader recovers its policy from the journal so the prepared
+// request is replayed against the same policy.
+func TestDispatcherJournalsTPUDefragmentationMovesUnderTheirPolicy(t *testing.T) {
+	d, cl, snap, c, cfg, a := dispatchFixture(t, false)
+	c = tpuSliceCandidate(c)
+	c.Policy, c.Reason = tpudefrag.PolicyName, policy.ReasonTPUFragmentation
+	d.Policies = []policy.Policy{&stubPolicy{out: []policy.Candidate{c}}}
+	d.Simulator = nil
+	_, decisions := d.Execute(context.Background(), snap, []policy.Candidate{c}, cfg, a)
+	if got := decisionFor(t, decisions, "prod/a"); got.DispatchStatus != "submitted" || cl.patches != 1 {
+		t.Fatalf("TPU defragmentation move was not submitted: %+v patches=%d", got, cl.patches)
+	}
+	_, j, err := loadDispatchJournal(context.Background(), cl.Client, "ome")
+	if err != nil || len(j.Entries) != 1 {
+		t.Fatalf("bad durable state: %+v %v", j, err)
+	}
+	req, err := requestForEntry(j.Entries[0])
+	if err != nil || req.Reason != policy.ReasonTPUFragmentation {
+		t.Fatalf("request reason = %+v %v", req, err)
+	}
+	if got := entryCandidate(j.Entries[0]); got.Policy != tpudefrag.PolicyName || got.Reason != policy.ReasonTPUFragmentation {
+		t.Fatalf("journal entry maps to policy %q reason %q", got.Policy, got.Reason)
 	}
 }
