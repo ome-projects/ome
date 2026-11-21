@@ -4,7 +4,7 @@
 ARG BASE_IMAGE=oraclelinux:10-slim
 
 # Build the alfred binary (pure Go — no Rust/XET, CGO disabled)
-FROM golang:1.26 AS builder
+FROM golang:1.27 AS builder
 
 # Build arguments for cross-compilation
 ARG TARGETOS
