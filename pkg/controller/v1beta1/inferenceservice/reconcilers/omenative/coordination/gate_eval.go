@@ -2,6 +2,7 @@ package coordination
 
 import (
 	"context"
+	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -9,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -264,6 +266,29 @@ func EvaluatePlanGate(isvc *v1beta1.InferenceService, component v1beta1.Componen
 	}
 	if held, reason := planHold(isvc, component); held {
 		return false, v1beta1.RolloutHoldGatePlan, reason
+	}
+	return true, "", ""
+}
+
+// EvaluateReplicaPlanGate is the plan gate as a replica's own pass asks
+// it. It holds what EvaluatePlanGate holds, and it holds a grouped
+// Component while the service has changed and the changed spec has not
+// reached the replica (SpecTrailsService): the roll target in hand may be
+// one the operator has already replaced, so no start is made toward it.
+// The hold ends with the projector's next write, which carries the
+// service's generation. The reason names both generations and sends the
+// reader to the service, whose controller owes that write.
+func EvaluateReplicaPlanGate(isvc *v1beta1.InferenceService, ir *v1beta1.InferenceReplica) (allowed bool, gate v1beta1.RolloutHoldGate, denyReason string) {
+	if isvc == nil || ir == nil {
+		return true, "", ""
+	}
+	if allowed, gate, denyReason = EvaluatePlanGate(isvc, ir.Spec.Component); !allowed {
+		return allowed, gate, denyReason
+	}
+	if isvc.Spec.Rollout != nil && specGroupMember(isvc.Spec.Rollout, ir.Spec.Component) && SpecTrailsService(isvc, ir) {
+		return false, v1beta1.RolloutHoldGatePlan, fmt.Sprintf(
+			"the service changed (generation %d) and this replica still holds the spec written for generation %s: no update starts until the service controller writes the changed spec to this replica (if this hold stays, look at the service's conditions and events)",
+			isvc.Generation, ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey])
 	}
 	return true, "", ""
 }

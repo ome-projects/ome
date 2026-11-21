@@ -3168,14 +3168,14 @@ func TestGangSurgeUpdate_SupersededSurge_PairingHoldKeepsTheReplacementGang(t *t
 	}
 }
 
-// A gang surge that promotes its replacement rebinds every move still
-// pending on its source to the replacement's index before the source is
-// removed, and says so once per move. A move already executing, a
-// terminal one and a move of another Instance are left as they are.
-func TestGangSurge_PromotionRebindsPendingMovesToTheReplacement(t *testing.T) {
+// promoteGangSurgeBesideMoves runs the promote pass of a gang surge that
+// rebuilt Instance 0 as surgeIdx, beside the given move records, and
+// returns the records as the pass left them by uuid, how many rows the
+// pass had removed when it last rebound a record, and the pass's events.
+func promoteGangSurgeBesideMoves(t *testing.T, surgeIdx int32, records []workload.MigrationRecord) (map[string]workload.MigrationRecord, int, []string) {
+	t.Helper()
 	legacyResetExpectations(t)
 	const isvcName, ns = "gang-c", "test-ns"
-	surgeIdx := int32(2)
 	mkReadyPod := func(runner string) *corev1.Pod {
 		pod := gangSurgePod(isvcName, ns, surgeIdx, runner, "newrev")
 		pod.Status.Conditions = []corev1.PodCondition{
@@ -3213,13 +3213,6 @@ func TestGangSurge_PromotionRebindsPendingMovesToTheReplacement(t *testing.T) {
 			},
 		},
 	}
-	executingSurge := int32(1)
-	records := []workload.MigrationRecord{
-		{RequestUUID: "pending", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 0, FromNode: "node-a"},
-		{RequestUUID: "executing", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseSurgePending, SourceInstance: 0, SurgeInstance: &executingSurge},
-		{RequestUUID: "done", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseCompleted, SourceInstance: 0},
-		{RequestUUID: "other", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 1},
-	}
 	input.ObservedState.Migrations = append([]workload.MigrationRecord(nil), records...)
 	removedAtRebind := -1
 	input.MutateMigration = func(_ context.Context, uuid string, mutate func(*workload.MigrationRecord) bool) error {
@@ -3250,12 +3243,28 @@ func TestGangSurge_PromotionRebindsPendingMovesToTheReplacement(t *testing.T) {
 	if !done || len(removed) != 1 || removed[0] != 0 {
 		t.Fatalf("expected the promote pass to finish and remove the source: done=%v removed=%v", done, removed)
 	}
-	if removedAtRebind != 0 {
-		t.Fatalf("the pending move must be rebound before the source is removed; removed %d rows at the time", removedAtRebind)
-	}
 	byUUID := map[string]workload.MigrationRecord{}
 	for _, r := range records {
 		byUUID[r.RequestUUID] = r
+	}
+	return byUUID, removedAtRebind, drainRecorderEvents(rec)
+}
+
+// A gang surge that promotes its replacement rebinds every move still
+// pending on its source to the replacement's index before the source is
+// removed, and says so once per move. A move already executing, a
+// terminal one and a move of another Instance are left as they are.
+func TestGangSurge_PromotionRebindsPendingMovesToTheReplacement(t *testing.T) {
+	surgeIdx := int32(2)
+	executingSurge := int32(1)
+	byUUID, removedAtRebind, events := promoteGangSurgeBesideMoves(t, surgeIdx, []workload.MigrationRecord{
+		{RequestUUID: "pending", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 0, FromNode: "node-a"},
+		{RequestUUID: "executing", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseSurgePending, SourceInstance: 0, SurgeInstance: &executingSurge},
+		{RequestUUID: "done", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseCompleted, SourceInstance: 0},
+		{RequestUUID: "other", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 1},
+	})
+	if removedAtRebind != 0 {
+		t.Fatalf("the pending move must be rebound before the source is removed; removed %d rows at the time", removedAtRebind)
 	}
 	if got := byUUID["pending"]; got.SourceInstance != surgeIdx || got.Phase != workload.MigrationPhaseAccepted || got.SurgeInstance != nil || got.FromNode != "node-a" {
 		t.Errorf("the pending move must follow the Instance to index %d, otherwise untouched; got %+v", surgeIdx, got)
@@ -3269,15 +3278,32 @@ func TestGangSurge_PromotionRebindsPendingMovesToTheReplacement(t *testing.T) {
 	if got := byUUID["other"]; got.SourceInstance != 1 {
 		t.Errorf("a move of another Instance is left as it is; got %+v", got)
 	}
-	events := drainRecorderEvents(rec)
-	rebound := 0
-	for _, e := range events {
-		if strings.Contains(e, string(workload.EventReasonMigrationSourceRebuilt)) {
-			rebound++
-		}
-	}
-	if rebound != 1 {
+	if rebound := countEventsWithReason(events, workload.EventReasonMigrationSourceRebuilt); rebound != 1 {
 		t.Errorf("one event names the rebound move; got %d in %v", rebound, events)
+	}
+}
+
+// A pending move that names the roll as what it waits for follows the
+// rebuilt Instance and keeps that word on its record: the wait's text is
+// what measures the move's window again once the roll's surges end, so a
+// note of the follow in its place would start the move with the time the
+// wait spent. A pending move that names no wait takes the note.
+func TestGangSurge_PromotionKeepsAPendingMovesWaitForTheRoll(t *testing.T) {
+	surgeIdx := int32(2)
+	waiting := migrationWaitsForRollMessage("gang-c-engine-newrev")
+	byUUID, _, events := promoteGangSurgeBesideMoves(t, surgeIdx, []workload.MigrationRecord{
+		{RequestUUID: "waiting", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 0, FromNode: "node-a", Message: waiting},
+		{RequestUUID: "quiet", Trigger: workload.MigrationTriggerManual, Phase: workload.MigrationPhaseAccepted, SourceInstance: 0, FromNode: "node-b"},
+	})
+	got := byUUID["waiting"]
+	if got.SourceInstance != surgeIdx || got.Message != waiting || !migrationWaitedForRoll(&got) {
+		t.Errorf("a move waiting for the roll follows the Instance to index %d and keeps its wait; got %+v", surgeIdx, got)
+	}
+	if got := byUUID["quiet"]; got.SourceInstance != surgeIdx || !strings.Contains(got.Message, "following the Instance rebuilt as instance=2") {
+		t.Errorf("a move naming no wait follows the Instance to index %d and takes the note of the follow; got %+v", surgeIdx, got)
+	}
+	if rebound := countEventsWithReason(events, workload.EventReasonMigrationSourceRebuilt); rebound != 2 {
+		t.Errorf("one event per followed move; got %d in %v", rebound, events)
 	}
 }
 

@@ -93,4 +93,16 @@ const (
 	// short member's counts and shares. It is not recorded again while the
 	// dip stands under the same step's split.
 	EventReasonCanaryStableSideShort = "CanaryStableSideShort"
+	// EventReasonRolloutForceStarted is recorded when ome.io/rollout-force-mode
+	// starts a force on the open run: it names the mode, the run, both
+	// revisions and the operator's reason.
+	EventReasonRolloutForceStarted = "RolloutForceStarted"
+	// EventReasonRolloutForceEnded is recorded when a force ends, with how it
+	// ended and how long it ran.
+	EventReasonRolloutForceEnded = "RolloutForceEnded"
+	// EventReasonRolloutForceRefused is recorded when the executor removes a
+	// force request it cannot start: no open run, another run named, a
+	// rollback in flight, a canary past its last step, or no forceComplete
+	// configuration.
+	EventReasonRolloutForceRefused = "RolloutForceRefused"
 )

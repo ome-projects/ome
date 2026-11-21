@@ -112,19 +112,22 @@ func CountScheduledPods(pods []*corev1.Pod) int32 {
 // AvailabilityWindow is the Ready-age requirement layered on EndpointSlice
 // membership when counting Available pods. MinReadySeconds is the
 // Component's window; Now is the reconcile's clock reading. A zero window
-// leaves rotation membership as the whole rule.
+// makes Available the same as Ready and in rotation.
 type AvailabilityWindow struct {
 	MinReadySeconds int32
 	Now             time.Time
 }
 
 // CountAvailablePods returns the number of pods that are in rotation
-// (named in availableByName, the AvailablePodSet result) and, under a
-// positive window, have been Ready for at least MinReadySeconds. The
-// duration is how long until the earliest in-rotation pod still inside the
-// window becomes Available (0 when none is pending): the counters it feeds
-// change at that instant without any watch event, so the caller schedules
-// its next reconcile from it.
+// (named in availableByName, the AvailablePodSet result) and Ready, under a
+// positive window for at least MinReadySeconds. Membership alone is not
+// enough: the Component's headless Service publishes not-ready addresses
+// for peer discovery, so its EndpointSlices mark every live pod Ready
+// whatever the pod's own Ready condition reads. The duration is how long
+// until the earliest in-rotation pod still inside the window becomes
+// Available (0 when none is pending): the counters it feeds change at that
+// instant without any watch event, so the caller schedules its next
+// reconcile from it.
 func CountAvailablePods(pods []*corev1.Pod, availableByName map[string]struct{}, window AvailabilityWindow) (int32, time.Duration) {
 	var n int32
 	var nextAvailableIn time.Duration
@@ -132,12 +135,10 @@ func CountAvailablePods(pods []*corev1.Pod, availableByName map[string]struct{},
 		if _, ok := availableByName[p.Name]; !ok {
 			continue
 		}
-		if window.MinReadySeconds > 0 {
-			available, remaining := podreadiness.IsPodAvailable(p, window.MinReadySeconds, window.Now)
-			if !available {
-				nextAvailableIn = types.EarliestPositive(nextAvailableIn, remaining)
-				continue
-			}
+		available, remaining := podreadiness.IsPodAvailable(p, window.MinReadySeconds, window.Now)
+		if !available {
+			nextAvailableIn = types.EarliestPositive(nextAvailableIn, remaining)
+			continue
 		}
 		n++
 	}
@@ -178,34 +179,6 @@ func AppendUniqueNodes(names []string, pods []*corev1.Pod) (nodes, grown []strin
 	return names[start:len(names):len(names)], names
 }
 
-// DesiredPodCountByInstance maps each planned Instance index to its
-// desired canonical pod count (sum of Runner sizes). Returns nil for
-// an empty plan so callers fall back to the observed PodCount
-// comparison (during scale-down with stale status entries).
-func DesiredPodCountByInstance(plan types.ComponentPlan) map[int32]int32 {
-	if len(plan.Instances) == 0 {
-		return nil
-	}
-	out := make(map[int32]int32, len(plan.Instances))
-	for _, inst := range plan.Instances {
-		out[inst.Index] = inst.TotalPods()
-	}
-	return out
-}
-
-// DesiredFor returns the desired pod count for idx — the plan entry's
-// value when present, otherwise the observed PodCount (no plan info ⇒
-// use the observed count, for stale-status scale-down Instances).
-func DesiredFor(desiredByIdx map[int32]int32, idx int32, observedPodCount int32) int32 {
-	if desiredByIdx == nil {
-		return observedPodCount
-	}
-	if d, ok := desiredByIdx[idx]; ok {
-		return d
-	}
-	return observedPodCount
-}
-
 // InstanceMeetsThreshold classifies an Instance when at least its desired pod
 // count satisfies the relevant Ready, Serving, or Available predicate.
 //
@@ -213,8 +186,9 @@ func DesiredFor(desiredByIdx map[int32]int32, idx int32, observedPodCount int32)
 // mid-surge Instances as not-Ready the whole time the +1 surge pod is
 // starting up — the visible serving dip we explicitly want to avoid.
 //
-// desired falls back to observedPodCount when the plan has no entry
-// for this index (scale-down with stale status).
+// desired is the plan's count for the Instance (ComponentPlan.DesiredPodsFor),
+// which falls back to observedPodCount when the plan has no entry for this
+// index (scale-down with stale status).
 func InstanceMeetsThreshold(observedPodCount, observedSatisfying, desired int32) bool {
 	if observedPodCount == 0 {
 		return false
@@ -332,19 +306,49 @@ func RolloutComplete(insts []types.InstanceStatus, targetRevName string) bool {
 // attempts failed stays unlanded. Any other row shape leaves current as
 // recorded, so a repair on the current revision never moves it.
 func CurrentRevisionFor(insts []types.InstanceStatus, current, update string, blocks []types.RetryBlock, withdrawn string, pods PodRevisions) string {
+	return currentRevisionFor(insts, current, update, blocks, withdrawn, &podRevisionSource{revisions: pods, read: true})
+}
+
+// CurrentRevisionOverPods is CurrentRevisionFor over the Component's pods
+// bucketed by Instance index. The revision each pod carries is read from
+// its labels only when a rule asks for it; the two rules that decide from
+// the rows alone, which settle a pass at rest, read no pod.
+func CurrentRevisionOverPods(insts []types.InstanceStatus, current, update string, blocks []types.RetryBlock, withdrawn string, byInstance map[int32][]*corev1.Pod) string {
+	return currentRevisionFor(insts, current, update, blocks, withdrawn, &podRevisionSource{byInstance: byInstance})
+}
+
+// currentRevisionFor is the rule list of CurrentRevisionFor; pods hands the
+// two rules that read the pods their revisions.
+func currentRevisionFor(insts []types.InstanceStatus, current, update string, blocks []types.RetryBlock, withdrawn string, pods *podRevisionSource) string {
 	if update == "" {
 		return current
 	}
 	if RolloutComplete(insts, update) && types.FindRetryBlock(blocks, update) == nil {
 		return update
 	}
-	if current == update && anyInstanceOffRevision(insts, update, pods) {
+	if current == update && anyInstanceOffRevision(insts, update, pods.get()) {
 		return ""
 	}
-	if current == "" && withdrawn != "" && withdrawn == update && !anyAttemptInFlight(insts) && !anyInstanceOffRevision(insts, update, pods) {
+	if current == "" && withdrawn != "" && withdrawn == update && !anyAttemptInFlight(insts) && !anyInstanceOffRevision(insts, update, pods.get()) {
 		return update
 	}
 	return current
+}
+
+// podRevisionSource hands a rule the revisions the live pods carry: the
+// map it was given, or the map read from the pods' buckets the first time
+// a rule asks for it.
+type podRevisionSource struct {
+	byInstance map[int32][]*corev1.Pod
+	revisions  PodRevisions
+	read       bool
+}
+
+func (s *podRevisionSource) get() PodRevisions {
+	if !s.read {
+		s.revisions, s.read = PodRevisionsByInstance(s.byInstance), true
+	}
+	return s.revisions
 }
 
 // WithdrawnRevisionAfter is the revision a write leaves current withdrawn

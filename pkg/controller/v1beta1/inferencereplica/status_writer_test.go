@@ -749,7 +749,7 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "computeRetryBlockRolloutHold", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "computeDrainOverdueCondition", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/status.go", "computeReadyCondition", read(1), decodedObjectRows, rows)
-	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.Reconcile", read(2), decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.reconcileLive", read(2), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "replicaPass.installStatusPublication", read(1), decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.reconcileRelocationDirectives", accessCounts{reads: 3, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.stampAutoRelocationSuccess", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
@@ -770,10 +770,11 @@ func TestInferenceReplicaStatusReadInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/inferencereplica/status_repair.go", "validateRepairReplacement", accessCounts{writes: 1}, breakGlassRepair, rows)
 
 	// Remote readers: coordination and placement consume the object that
-	// irprojector.DecodedComponentIR(Status) returned.
+	// irprojector.DecodedComponentIRFor returned.
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "GateContext.pairingVerdict", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "attemptOpen", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "pairingPicture.heldStill", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "pairingPicture.letSurgePodsGo", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "sideComingUp", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing.go", "gangReplacementServes", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination/pairing_drain.go", "pinnedCohort", accessCounts{reads: 1, readWrites: 1}, decodedObjectRows, rows)
@@ -878,7 +879,7 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/irstatus/statusrepair/repair.go", "Run", "Get", 1, breakGlassRepairRead)
 
 	// InferenceReplica reconciler pass-through reads.
-	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.Reconcile", "Get", 1, passThroughSpecMetadata+" (finalizer add rejected: re-read DeletionTimestamp)")
+	approve("pkg/controller/v1beta1/inferencereplica/reconciler.go", "Reconciler.reconcileLive", "Get", 1, passThroughSpecMetadata+" (finalizer add rejected: re-read DeletionTimestamp)")
 	approve("pkg/controller/v1beta1/inferencereplica/teardown.go", "Reconciler.removeTeardownFinalizer", "Get", 1, passThroughSpecMetadata+" (finalizer removal)")
 	approve("pkg/controller/v1beta1/inferencereplica/release_held.go", "Reconciler.consumeReleaseHeldRequest", "Get", 1, passThroughSpecMetadata+" (annotation consumption)")
 	approve("pkg/controller/v1beta1/inferencereplica/reset_instances.go", "Reconciler.consumeResetInstancesRequest", "Get", 1, passThroughSpecMetadata+" (annotation consumption)")
@@ -898,7 +899,7 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 	approve("pkg/controller/v1beta1/workload/testfixture/revision.go", "SeedRunningRevisionWithMeta", "Get", 1, engineTestFixtureStore)
 
 	// ISVC-side raw accessors and their callers.
-	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/irstatus_read.go", "componentIRAt", "Get", 1, passThroughTopLevelStatus+" (raw accessor behind ComponentIR and ComponentIRFor, for callers that inspect no rows)")
+	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/irstatus_read.go", "componentIRAt", "Get", 1, passThroughTopLevelStatus+" (raw accessor behind ComponentIRFor, for callers that inspect no rows)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/status.go", "aggregateOneComponent", "Get", 1, passThroughTopLevelStatus+" (counters, revisions, RolloutHold, Conditions mirrored onto the ISVC)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/projector.go", "projectOnLive", "Get", 1, passThroughSpecMetadata+" (spec projection)")
 	approve("pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector/projector.go", "cachedCopyAtRest", "Get", 1, passThroughSpecMetadata+" (spec projection decided on the cached copy)")
@@ -969,7 +970,7 @@ func TestInferenceReplicaFetchInventory(t *testing.T) {
 func TestInferenceReplicaDecodedReadsCarryADecoder(t *testing.T) {
 	decodedAccessors := map[string]map[string]bool{
 		codecPackagePath:     {decodedAccessor: true, decodedCopyAccessor: true},
-		projectorPackagePath: {"DecodedComponentIR": true, "DecodedComponentIRFor": true, "decodedComponentIRAt": true},
+		projectorPackagePath: {"DecodedComponentIRFor": true, "decodedComponentIRAt": true},
 	}
 	inv := loadStatusInventory(t)
 	calls := 0

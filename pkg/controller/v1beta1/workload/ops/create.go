@@ -93,8 +93,21 @@ func CreateFreshIndicesOutside(ctx context.Context, deps workload.Deps, input wo
 		if _, ok := opened[idx]; ok {
 			return false
 		}
-		return surgeFreeIndex(input, idx, target, heldByRoll[idx]) || promotedSetShortOfAMember(input, plan, idx, pods, target)
+		return surgeFreeIndex(input, idx, target, heldByRoll[idx]) || stoppedAttemptGoneOnTheTarget(input, idx, pods, target) ||
+			promotedSetShortOfAMember(input, plan, idx, pods, target)
 	})
+}
+
+// stoppedAttemptGoneOnTheTarget reports a row on the roll target that
+// keeps an Update its deadline stopped, with no live pod left: the fresh
+// start createFreshStart reads. The roll never re-opens a row that already
+// records the target, and the row holds a slot in the roll's budget, so
+// the fresh scope reaches it as it reaches a podless Failed row on the
+// target; otherwise the roll waits on a slot only this rebuild frees.
+func stoppedAttemptGoneOnTheTarget(input workload.ReconcileInput, idx int32, pods []*corev1.Pod, target *appsv1.ControllerRevision) bool {
+	s := input.ObservedState.Instance(idx)
+	return target != nil && s != nil && s.RunningRevision == target.Name &&
+		workload.OperationParked(s.Operation) && query.LivePodCount(pods) == 0
 }
 
 // CreateCommittedIndices runs the Create pass for ONLY the Instance
@@ -241,6 +254,9 @@ func createFiltered(ctx context.Context, deps workload.Deps, input workload.Reco
 type createStartAction struct {
 	instance workload.InstancePlan
 	missing  []podTarget
+	// existing are the Instance's pods as the pass read them; the missing
+	// pods are made beside them and take the hostnames they answer to.
+	existing []*corev1.Pod
 	// terminal holds the dead pods still occupying missing targets' names;
 	// they are recycled before the targets can be created.
 	terminal []*corev1.Pod
@@ -628,31 +644,72 @@ func (c *createCandidate) retireOnOlderRevision(context.Context) (bool, error) {
 // refillTakesTheTarget reports whether a promoted Instance's whole-set
 // refill at the revision it served is moved onto the roll's target: the
 // Component is not paused, the roll's partition does not hold the Instance
-// (RollHeldIndices), and the target carries no retry record. A target whose
-// last attempt failed is not one to move a refill onto: the refill finishes
-// on the revision it ran, as a lost row is rebuilt there under a roll held
-// on its target, and the roll takes the Instance once its schedule admits a
-// start.
+// (RollHeldIndices), the target carries no retry record, and the plan gate
+// admits a start on the target (planGateAdmits). A target whose last
+// attempt failed is not one to move a refill onto, and neither is one no
+// recorded plan lets the roll start: the refill finishes on the revision
+// it ran, as a lost row is rebuilt there under a roll held on its target
+// or a held plan gate, and the roll takes the Instance once a start is
+// admitted.
 func (c *createCandidate) refillTakesTheTarget() bool {
 	p := c.pass
 	return p.target != nil && !p.plan.Paused && !p.heldByRoll[c.index] &&
-		workload.FindRetryBlock(p.input.ObservedState.RetryBlocks, p.target.Name) == nil
+		workload.FindRetryBlock(p.input.ObservedState.RetryBlocks, p.target.Name) == nil &&
+		planGateAdmits(p.input)
 }
 
-// removeLeftoverPods deletes what the attempt this one replaced left behind:
-// pods that hold the names the attempt needs and carry a revision it does
-// not converge to.
+// removeLeftoverPods deletes what an earlier attempt left behind. Pods that
+// hold the names the attempt needs and carry a revision it does not
+// converge to are deleted and the Instance waits for the pass that sees
+// them gone. Pods of a committed attempt that hold no name of its set and
+// carry another revision, the replacement a failed surge left at the other
+// ordinal, are deleted and the decision goes on: the finish is read on the
+// set alone and never waits on them.
 func (c *createCandidate) removeLeftoverPods(ctx context.Context) (bool, error) {
 	p := c.pass
-	stale := retiredAttemptPods(p.input, c.index, c.existing, p.target)
-	if len(stale) == 0 {
+	if stale := retiredAttemptPods(p.input, c.index, c.existing, p.target); len(stale) > 0 {
+		if _, err := deleteSupersededRevisionPods(ctx, p.deps, p.input, c.index, stale, p.target.Name); err != nil {
+			return false, err
+		}
+		p.allReady = false
+		return false, nil
+	}
+	leftovers := c.surgeLeftoverPods()
+	if len(leftovers) == 0 {
 		return true, nil
 	}
-	if _, err := deleteSupersededRevisionPods(ctx, p.deps, p.input, c.index, stale, p.target.Name); err != nil {
+	if _, err := deleteSupersededRevisionPods(ctx, p.deps, p.input, c.index, leftovers, c.revision); err != nil {
 		return false, err
 	}
 	p.allReady = false
-	return false, nil
+	return true, nil
+}
+
+// surgeLeftoverPods lists the pods of a committed attempt's Instance that
+// hold no name of its set and carry a revision other than the one the
+// attempt renders: the replacement a failed surge left at the other
+// ordinal, which no attempt will take up once the attempt that built it
+// has ended. Read for a committed attempt only, since an uncommitted start
+// reads the revision it renders off the pods that stand (createRevision).
+func (c *createCandidate) surgeLeftoverPods() []*corev1.Pod {
+	if workload.StateOf(c.observed) != workload.StateCreateCreatePods {
+		return nil
+	}
+	rendered := query.RevisionFromName(c.revision)
+	if rendered.IsZero() {
+		return nil
+	}
+	var leftovers []*corev1.Pod
+	for _, pod := range c.existing {
+		if pod == nil || pod.DeletionTimestamp != nil || c.desired.holds(pod.Name) {
+			continue
+		}
+		if rev := query.RevisionFromPod(pod); rev.IsZero() || rev.Same(rendered) {
+			continue
+		}
+		leftovers = append(leftovers, pod)
+	}
+	return leftovers
 }
 
 // planStart decides the start of an Instance short of its pod set: the retry
@@ -691,6 +748,7 @@ func (c *createCandidate) startAction() *createStartAction {
 	action := &createStartAction{
 		instance:      c.inst,
 		missing:       c.missing,
+		existing:      c.existing,
 		terminal:      terminalTargetPods(c.existing, c.missing),
 		revision:      c.revision,
 		firstCreate:   c.observed == nil,
@@ -712,16 +770,17 @@ func (c *createCandidate) rowCopy() *workload.InstanceStatus {
 	return &row
 }
 
-// adoptFailedRow reads a Failed row that holds every pod it expects on the
-// pods at its active ordinals: it is promoted only through
-// failedRowAdoptable; any other Failed row is the roll's or the retry
-// record's.
+// adoptFailedRow reads the row on the pods at the names its set asks for
+// (podsAtTargets): a pod of the Instance at another name is one a surge
+// left behind, and it neither holds the finish back nor gets the serving
+// gate. A Failed row that holds every pod it expects is promoted only
+// through failedRowAdoptable; any other Failed row is the roll's or the
+// retry record's.
 func (c *createCandidate) adoptFailedRow(context.Context) (bool, error) {
-	c.podSet = c.existing
+	c.podSet = podsAtTargets(c.existing, c.desired)
 	if workload.StateOf(c.observed) != workload.StateFailed {
 		return true, nil
 	}
-	c.podSet = podsAtTargets(c.existing, c.desired)
 	if failedRowAdoptable(c.pass.input, c.observed, c.podSet, c.pass.target, c.pass.heldByRoll[c.index]) {
 		return true, nil
 	}
@@ -976,7 +1035,7 @@ func processStartActions(
 			}
 			continue
 		}
-		if _, err := createMissingPods(ctx, deps, input, plan, action.instance, action.instance.Index, action.missing, tmpl); err != nil {
+		if _, err := createMissingPods(ctx, deps, input, plan, action.instance, action.instance.Index, action.missing, action.existing, tmpl); err != nil {
 			rejection, classified := asPodRejection(err)
 			switch {
 			case classified && rejection.rejection.Class == workload.APIRejectionThrottled:
@@ -1441,10 +1500,12 @@ func failedRowAdoptable(input workload.ReconcileInput, row *workload.InstanceSta
 }
 
 // podsAtTargets is the subset of existing holding one of the set's names:
-// the pods at the Instance's active ordinals, the set a promote is decided
-// on. A pod at another ordinal is a surge's the row left behind. A list
-// whose every pod holds such a name is handed back as it is; its readers
-// read the pods and never write through the list.
+// the pods at the Instance's active ordinals, the set every finish is
+// decided on. A pod at another ordinal is a surge's the row left behind,
+// such as the replacement of a failed attempt that stands until the next
+// attempt or a scale-down removes it. A list whose every pod holds such a
+// name is handed back as it is; its readers read the pods and never write
+// through the list.
 func podsAtTargets(existing []*corev1.Pod, set podSetNames) []*corev1.Pod {
 	for i, pod := range existing {
 		if pod == nil || !set.holds(pod.Name) {
@@ -1474,8 +1535,9 @@ func podsAtTargetsCut(existing []*corev1.Pod, set podSetNames, members int) []*c
 // and pins: a committed attempt's pin; else the running revision, for a refill
 // beside live pods of it, an Instance the roll's partition holds, or a
 // promoted Instance that lost every pod while the roll is held on its
-// target; else, for an Instance that has run no revision while a canary
-// step holds the Component, the step's stable revision; else the target.
+// target or the plan gate admits no start on it; else, for an Instance
+// that has run no revision while a canary step holds the Component, the
+// step's stable revision; else the target.
 func createRevision(input workload.ReconcileInput, idx int32, existing []*corev1.Pod, target *appsv1.ControllerRevision, heldByRoll bool) string {
 	s := input.ObservedState.Instance(idx)
 	if s != nil && s.Operation != nil && s.Operation.Type == workload.InstanceOperationCreate && s.Operation.TargetRevision != "" {
@@ -1486,12 +1548,14 @@ func createRevision(input workload.ReconcileInput, idx int32, existing []*corev1
 	// update pass's job, and the roll may not take a held Instance. A
 	// promoted Instance that lost every pod is rebuilt at the target, unless
 	// the roll is held on that target by its retry schedule
-	// (rollHeldOnItsTarget): a rebuild there would wait on the schedule or
-	// fail as the last attempt did, so the Instance is rebuilt on the
-	// revision it ran, as a repair rebuilds it, and the roll takes it once
-	// the schedule admits a start.
+	// (rollHeldOnItsTarget) or the plan gate admits no start on it
+	// (planGateAdmits): a rebuild there would wait on the schedule, fail as
+	// the last attempt did, or put the Instance on a revision no recorded
+	// plan lets the roll start, so the Instance is rebuilt on the revision
+	// it ran, as a repair rebuilds it, and the roll takes it once a start
+	// is admitted.
 	if s != nil && s.RunningRevision != "" && (heldByRoll || query.LivePodCount(existing) > 0 ||
-		(lostPromotedRow(s, existing) && rollHeldOnItsTarget(input, target))) {
+		(lostPromotedRow(s, existing) && (rollHeldOnItsTarget(input, target) || !planGateAdmits(input)))) {
 		return s.RunningRevision
 	}
 	// An Instance that has run no revision and has no live pod is built on
@@ -1988,7 +2052,10 @@ func activeOrdinalForInstance(input workload.ReconcileInput, idx int32) int32 {
 // createMissingPods renders and creates targets, owning the per-pod
 // ExpectCreates bookkeeping: idx is the expectations bucket (inst.Index for
 // the Create pass and for a repair's rebuild), and callers must not call
-// ExpectCreates themselves. tmpl pairs the template the pods render from
+// ExpectCreates themselves. standing are the pods the set already has: the
+// targets are made beside them and take the hostnames the live ones answer
+// to (query.ReadPodSetHostnames), so every peer address in the set names a
+// hostname that exists. tmpl pairs the template the pods render from
 // with the revision they are labelled with: a non-zero revision lands on
 // ome.io/revision-hash so per-revision Services can select the pod, names
 // the revision a rejection is charged against, and says what a permanent
@@ -2003,7 +2070,7 @@ func activeOrdinalForInstance(input workload.ReconcileInput, idx int32) int32 {
 // target, warn of a gang worker with no co-location rule, record the
 // expectation and create, and answer a refusal; last, release the waits a
 // refused pass left on the row.
-func createMissingPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, targets []podTarget, tmpl podTemplate) (int, error) {
+func createMissingPods(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, targets []podTarget, standing []*corev1.Pod, tmpl podTemplate) (int, error) {
 	if len(targets) == 0 {
 		return 0, nil
 	}
@@ -2024,7 +2091,7 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 	if err != nil || !ready {
 		return 0, err
 	}
-	set := newPodSetCreate(deps, input, plan, inst, idx, tmpl)
+	set := newPodSetCreate(deps, input, plan, inst, idx, standing, tmpl)
 	pods, err := set.renderAll(ctx, targets, selectors)
 	if err != nil {
 		return 0, err
@@ -2049,8 +2116,8 @@ func createMissingPods(ctx context.Context, deps workload.Deps, input workload.R
 
 // podSetCreate is the creation of one Instance's missing pods: the template
 // and revision every pod renders, the plan carrying that revision's pairing
-// protocol, the gang's peer host list built once, and the expectations
-// bucket the creates are counted in.
+// protocol, the gang's hostnames and peer host list read once, and the
+// expectations bucket the creates are counted in.
 type podSetCreate struct {
 	deps  workload.Deps
 	input workload.ReconcileInput
@@ -2058,8 +2125,11 @@ type podSetCreate struct {
 	// renderPlan is plan with the pairing protocol of the revision being
 	// rendered, which is part of the revision and not of the plan's current
 	// template.
-	renderPlan   workload.ComponentPlan
-	inst         workload.InstancePlan
+	renderPlan workload.ComponentPlan
+	inst       workload.InstancePlan
+	// hostnames is what the live pods the set already has answer to; every
+	// pod made here is rendered to fit them.
+	hostnames    query.PodSetHostnames
 	idx          int32
 	tmpl         podTemplate
 	revisionHash string
@@ -2072,15 +2142,23 @@ type podSetCreate struct {
 	members []*corev1.Pod
 }
 
-func newPodSetCreate(deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, tmpl podTemplate) *podSetCreate {
+func newPodSetCreate(deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, inst workload.InstancePlan, idx int32, standing []*corev1.Pod, tmpl podTemplate) *podSetCreate {
 	renderPlan := plan
 	renderPlan.PairingProtocol = tmpl.pairingProtocol
-	// The gang's peer-DNS host list is the same for every pod of the
-	// Instance, so it is built once here rather than once per pod inside
-	// Render. inst is a value copy, so the list stays with this create. A
-	// single-pod Instance has no peers.
-	if inst.PeerHostnames == nil && inst.TotalPods() > 1 {
-		inst.PeerHostnames = buildInstancePeerHostnames(input.Key.OwnerName, plan.Component, inst)
+	// A gang's pods address each other by hostname, and a pod set keeps
+	// the hostnames it started with: the pods made here take the hostnames
+	// the live pods of the set answer to, whatever count the row has moved
+	// to since, and a set with no live pod is built at inst's recreation
+	// count. The peer-DNS host list is the same for every pod of the
+	// Instance, so it is built once here, from that reading, rather than
+	// once per pod inside Render. inst is a value copy, so the list stays
+	// with this create. A single-pod Instance has no peers.
+	var hostnames query.PodSetHostnames
+	if inst.TotalPods() > 1 {
+		hostnames = query.ReadPodSetHostnames(standing)
+		if inst.PeerHostnames == nil {
+			inst.PeerHostnames = buildInstancePeerHostnames(input.Key.OwnerName, plan.Component, inst, hostnames)
+		}
 	}
 	return &podSetCreate{
 		deps:         deps,
@@ -2088,6 +2166,7 @@ func newPodSetCreate(deps workload.Deps, input workload.ReconcileInput, plan wor
 		plan:         plan,
 		renderPlan:   renderPlan,
 		inst:         inst,
+		hostnames:    hostnames,
 		idx:          idx,
 		tmpl:         tmpl,
 		revisionHash: tmpl.revision.Hash(),
@@ -2126,6 +2205,7 @@ func (s *podSetCreate) render(ctx context.Context, t podTarget, selector map[str
 		s.tmpl.meta,
 		s.renderPlan,
 		s.inst,
+		s.hostnames,
 		t.Runner,
 		t.Ordinal,
 		s.revisionHash,

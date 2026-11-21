@@ -9,11 +9,11 @@
   "ClusterServingRuntime": 232,
   "FineTunedWeight": 234,
   "InferenceReplica": 269,
-  "InferenceService": 370,
-  "RolloutPolicy": 373,
+  "InferenceService": 371,
+  "RolloutPolicy": 374,
   "ServingRuntime": 232,
-  "TrafficMap": 385,
-  "WorkloadCluster": 390
+  "TrafficMap": 386,
+  "WorkloadCluster": 391
  },
  "nodes": [
   {},
@@ -1626,6 +1626,7 @@
   {
    "properties": {
     "instanceReadyTimeout": 0,
+    "leaderGoneGracePeriod": 0,
     "migrationPolicy": 212,
     "minReadySeconds": 0,
     "readyPolicy": 0,
@@ -2569,6 +2570,17 @@
   },
   {
    "properties": {
+    "canaryRevisionHash": 0,
+    "endReason": 0,
+    "endedAt": 0,
+    "mode": 0,
+    "reason": 0,
+    "runID": 0,
+    "startedAt": 0
+   }
+  },
+  {
+   "properties": {
     "message": 0,
     "name": 0,
     "operator": 0,
@@ -2579,7 +2591,7 @@
    }
   },
   {
-   "items": 302
+   "items": 303
   },
   {
    "properties": {
@@ -2588,9 +2600,10 @@
     "capacityWaitSince": 0,
     "currentStep": 0,
     "failed": 301,
+    "forced": 302,
     "lastConclusiveEvaluationTime": 0,
     "lastEvaluationTime": 0,
-    "metricResults": 303,
+    "metricResults": 304,
     "observedTrafficWeight": 0,
     "preStepHold": 0,
     "promotedThrough": 0,
@@ -2625,8 +2638,8 @@
     "desiredReplicas": 0,
     "lastScaleTime": 0,
     "managedBy": 0,
-    "policy": 305,
-    "shadowedPolicyRef": 306,
+    "policy": 306,
+    "shadowedPolicyRef": 307,
     "specSource": 0
    }
   },
@@ -2658,22 +2671,22 @@
   {
    "properties": {
     "address": 299,
-    "autoscaler": 307,
-    "canary": 304,
+    "autoscaler": 308,
+    "canary": 305,
     "latestReadyRevision": 0,
     "latestRolledoutRevision": 0,
-    "lifecycle": 308,
+    "lifecycle": 309,
     "previousRolledoutRevision": 0,
     "restURL": 0,
     "rolloutPhase": 0,
     "scaleTargetRef": 62,
-    "selectedAccelerator": 309,
+    "selectedAccelerator": 310,
     "traffic": 267,
     "url": 0
    }
   },
   {
-   "additionalProperties": 310
+   "additionalProperties": 311
   },
   {
    "properties": {
@@ -2686,7 +2699,7 @@
    }
   },
   {
-   "items": 312
+   "items": 313
   },
   {
    "properties": {
@@ -2695,13 +2708,13 @@
    }
   },
   {
-   "items": 314
+   "items": 315
   },
   {
    "properties": {
     "completedAt": 0,
     "component": 0,
-    "events": 315,
+    "events": 316,
     "id": 0,
     "instance": 0,
     "mode": 0,
@@ -2715,7 +2728,7 @@
    }
   },
   {
-   "items": 316
+   "items": 317
   },
   {
    "properties": {
@@ -2741,9 +2754,9 @@
   },
   {
    "properties": {
-    "lastFailureInfo": 318,
-    "modelCopies": 319,
-    "modelRevisionStates": 320,
+    "lastFailureInfo": 319,
+    "modelCopies": 320,
+    "modelRevisionStates": 321,
     "transitionStatus": 0
    }
   },
@@ -2756,7 +2769,7 @@
    }
   },
   {
-   "items": 322
+   "items": 323
   },
   {
    "properties": {
@@ -2771,13 +2784,13 @@
    }
   },
   {
-   "items": 324
+   "items": 325
   },
   {
    "properties": {
     "demandContract": 240,
     "demandFingerprint": 0,
-    "pools": 325,
+    "pools": 326,
     "replicas": 0
    }
   },
@@ -2790,7 +2803,7 @@
    }
   },
   {
-   "items": 327
+   "items": 328
   },
   {
    "properties": {
@@ -2800,12 +2813,12 @@
   },
   {
    "properties": {
-    "capacity": 326,
+    "capacity": 327,
     "clusterUID": 0,
-    "componentMatches": 328,
-    "currentHome": 329,
+    "componentMatches": 329,
+    "currentHome": 330,
     "currentReplicas": 0,
-    "desiredHome": 329,
+    "desiredHome": 330,
     "desiredReplicas": 0,
     "drainRequested": 0,
     "homeInputsPending": 0,
@@ -2827,7 +2840,7 @@
    }
   },
   {
-   "additionalProperties": 331
+   "additionalProperties": 332
   },
   {
    "properties": {
@@ -2836,12 +2849,12 @@
    }
   },
   {
-   "items": 333
+   "items": 334
   },
   {
    "properties": {
-    "components": 332,
-    "policies": 334,
+    "components": 333,
+    "policies": 335,
     "ready": 0
    }
   },
@@ -2853,7 +2866,7 @@
    }
   },
   {
-   "items": 336
+   "items": 337
   },
   {
    "properties": {
@@ -2863,7 +2876,7 @@
    }
   },
   {
-   "items": 338
+   "items": 339
   },
   {
    "properties": {
@@ -2873,29 +2886,29 @@
   },
   {
    "properties": {
-    "activeGroups": 339,
+    "activeGroups": 340,
     "activeRunID": 0,
-    "lastRun": 340
+    "lastRun": 341
    }
   },
   {
    "properties": {
     "admittedReplicas": 0,
-    "allocation": 330,
+    "allocation": 331,
     "appliedPlanID": 0,
-    "autoscaling": 335,
+    "autoscaling": 336,
     "cluster": 0,
-    "componentFloors": 337,
+    "componentFloors": 338,
     "endpoint": 0,
     "observationFailingSince": 0,
     "observationKnown": 0,
     "phase": 0,
     "readyReplicas": 0,
-    "rollout": 341
+    "rollout": 342
    }
   },
   {
-   "items": 342
+   "items": 343
   },
   {
    "properties": {
@@ -2915,7 +2928,7 @@
     "pauseSurge": 0,
     "requestedReplicas": 0,
     "revision": 0,
-    "singleMove": 344,
+    "singleMove": 345,
     "sourceUID": 0,
     "unassignedReplicas": 0,
     "winner": 0
@@ -2923,11 +2936,11 @@
   },
   {
    "properties": {
-    "candidates": 343,
+    "candidates": 344,
     "cluster": 0,
     "endpoint": 0,
     "phase": 0,
-    "plan": 345
+    "plan": 346
    }
   },
   {
@@ -2940,11 +2953,11 @@
    }
   },
   {
-   "items": 347
+   "items": 348
   },
   {
    "properties": {
-    "groups": 348
+    "groups": 349
    }
   },
   {
@@ -2955,15 +2968,15 @@
    }
   },
   {
-   "items": 350
+   "items": 351
   },
   {
    "properties": {
     "openedAt": 0,
     "pinnedAt": 0,
-    "plan": 349,
+    "plan": 350,
     "runID": 0,
-    "targetRevisions": 351
+    "targetRevisions": 352
    }
   },
   {
@@ -2977,12 +2990,12 @@
     "index": 0,
     "observedDigest": 0,
     "policyRef": 286,
-    "shadowedPolicyRef": 353,
+    "shadowedPolicyRef": 354,
     "source": 0
    }
   },
   {
-   "items": 354
+   "items": 355
   },
   {
    "properties": {
@@ -2992,23 +3005,23 @@
    }
   },
   {
-   "items": 356
+   "items": 357
   },
   {
    "properties": {
     "closedAt": 0,
-    "groups": 357,
+    "groups": 358,
     "openedAt": 0,
     "outcome": 0,
     "runID": 0,
-    "targetRevisions": 351
+    "targetRevisions": 352
    }
   },
   {
    "properties": {
-    "activeRun": 352,
-    "groups": 355,
-    "lastRun": 358
+    "activeRun": 353,
+    "groups": 356,
+    "lastRun": 359
    }
   },
   {
@@ -3030,12 +3043,12 @@
     "compositePhase": 0,
     "currentComponent": 0,
     "lastTransitionTime": 0,
-    "memberFinished": 360,
+    "memberFinished": 361,
     "memberNotReady": 0,
     "message": 0,
     "mixedPairing": 0,
     "name": 0,
-    "observedRatio": 361,
+    "observedRatio": 362,
     "observedSurge": 0,
     "order": 1,
     "phase": 0,
@@ -3045,11 +3058,11 @@
    }
   },
   {
-   "items": 362
+   "items": 363
   },
   {
    "properties": {
-    "groups": 363
+    "groups": 364
    }
   },
   {
@@ -3063,14 +3076,14 @@
    }
   },
   {
-   "items": 365
+   "items": 366
   },
   {
    "properties": {
     "anchor": 0,
     "anchorDesired": 0,
     "conditions": 28,
-    "followers": 366,
+    "followers": 367,
     "mode": 0,
     "source": 0
    }
@@ -3088,20 +3101,20 @@
     "address": 299,
     "addresses": 300,
     "annotations": 14,
-    "canary": 304,
-    "components": 311,
-    "conditions": 313,
+    "canary": 305,
+    "components": 312,
+    "conditions": 314,
     "lastRuntimeSyncToken": 0,
-    "migrationHistory": 317,
-    "modelStatus": 321,
-    "mountedOverlays": 323,
+    "migrationHistory": 318,
+    "modelStatus": 322,
+    "mountedOverlays": 324,
     "observedGeneration": 0,
     "pinnedRevisionName": 0,
-    "placement": 346,
-    "rollout": 359,
-    "rolloutCoordination": 364,
-    "scalingPolicy": 367,
-    "traffic": 368,
+    "placement": 347,
+    "rollout": 360,
+    "rolloutCoordination": 365,
+    "scalingPolicy": 368,
+    "traffic": 369,
     "url": 0
    },
    "x-kubernetes-preserve-unknown-fields": true
@@ -3112,7 +3125,7 @@
     "kind": 0,
     "metadata": 0,
     "spec": 298,
-    "status": 369
+    "status": 370
    }
   },
   {
@@ -3135,8 +3148,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 371,
-    "status": 372
+    "spec": 372,
+    "status": 373
    }
   },
   {
@@ -3162,22 +3175,22 @@
   },
   {
    "properties": {
-    "capacity": 374,
+    "capacity": 375,
     "cluster": 0,
     "drainRefs": 1,
     "endpoint": 0,
     "healthy": 0,
-    "probe": 375,
+    "probe": 376,
     "weight": 0
    }
   },
   {
-   "items": 376
+   "items": 377
   },
   {
    "properties": {
     "capacityMode": 0,
-    "entries": 377,
+    "entries": 378,
     "mode": 0,
     "observedISVCGeneration": 0,
     "placementPlanID": 0,
@@ -3199,20 +3212,20 @@
    }
   },
   {
-   "items": 380
+   "items": 381
   },
   {
    "properties": {
     "observedISVCGeneration": 0,
     "planCompatibilityDigest": 0,
-    "targets": 381,
+    "targets": 382,
     "trafficMapGeneration": 0
    }
   },
   {
    "properties": {
     "claimedTargets": 1,
-    "lastPositive": 382,
+    "lastPositive": 383,
     "observedOptionsDigest": 0,
     "publisherName": 0
    }
@@ -3220,10 +3233,10 @@
   {
    "properties": {
     "conditions": 28,
-    "gatewayRef": 379,
+    "gatewayRef": 380,
     "observedTrafficMapGeneration": 0,
     "published": 0,
-    "publisher": 383,
+    "publisher": 384,
     "sourceUID": 0
    }
   },
@@ -3232,8 +3245,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 378,
-    "status": 384
+    "spec": 379,
+    "status": 385
    }
   },
   {
@@ -3245,12 +3258,12 @@
   {
    "properties": {
     "clusterProfileRef": 36,
-    "kubeConfig": 386
+    "kubeConfig": 387
    }
   },
   {
    "properties": {
-    "clusterSource": 387
+    "clusterSource": 388
    }
   },
   {
@@ -3263,8 +3276,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 388,
-    "status": 389
+    "spec": 389,
+    "status": 390
    }
   }
  ]

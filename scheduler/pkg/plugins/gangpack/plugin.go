@@ -75,6 +75,11 @@ type GangPack struct {
 	// The next attempt excludes them until every feasible domain has been tried.
 	failedMu      sync.Mutex
 	failedDomains map[string]sets.Set[placement.Domain]
+	// maxPreemptionsInFlight caps the gangs waiting at once for a domain that
+	// preemption is freeing. Zero leaves preemption off (see preemption.go).
+	maxPreemptionsInFlight int
+	// now reads the clock that times preemption holds; nil reads time.Now.
+	now func() time.Time
 }
 
 // Interface assertions.
@@ -115,6 +120,7 @@ func New(ctx context.Context, obj runtime.Object, h framework.Handle) (framework
 		podGroupTopologyKeyAnnotation:  args.PodGroupTopologyKeyAnnotation,
 		unsupportedPlacementGroupLabel: args.UnsupportedPlacementGroupLabel,
 		standaloneDomainPacking:        args.standaloneDomainPackingEnabled(),
+		maxPreemptionsInFlight:         args.maxPreemptionsInFlight(),
 		assignments:                    placement.New(),
 		pgReader:                       reader,
 		podLister:                      podLister,
@@ -220,6 +226,9 @@ type gangCycle struct {
 	free          topology.FreeByDomain
 	// assignment is the domain the gang is committed to, nil until chosen.
 	assignment *assignmentState
+	// noRoom records that no domain has room for the gang, reserved or not:
+	// the one rejection evicting lower-priority work can cure.
+	noRoom bool
 }
 
 // assignGangDomain is the decision core, split out so it is unit-testable with
@@ -256,6 +265,9 @@ func (g *GangPack) assignGangDomain(state framework.CycleState, nodes []framewor
 	if cycle.assignment == nil {
 		if status := g.chooseDomain(cycle); status != nil {
 			klog.V(4).InfoS("gangpack.assignGangDomain.no_fit", "gang", gang.key, "status", status.Message())
+			if cycle.noRoom && g.maxPreemptionsInFlight > 0 {
+				state.Write(noRoomStateKey, &noRoomState{gang: gang, nodes: nodes, view: cycle.view, members: cycle.members, need: cycle.need})
+			}
 			return nil, status
 		}
 	}
@@ -392,11 +404,16 @@ func (c *gangCycle) trace() {
 // assignment the gang can no longer use is dropped and the gang plans again:
 // the domain vanished, or it filled before any member landed there (see
 // assignmentStale). A domain that already holds a member is kept even while it
-// cannot fit the rest; the member waits for room there. The assignment inherits
-// the planner's answer on whether any other domain could take the gang, so a
-// veto here is judged the same way.
+// cannot fit the rest; the member waits for room there. An assignment that
+// counts members the gang has lost is dropped once the domain has room for
+// them (see membersLeft). The assignment inherits the planner's answer on
+// whether any other domain could take the gang, so a veto here is judged the
+// same way.
 func (g *GangPack) followAssignment(c *gangCycle) *framework.Status {
 	gang, domain := c.gang, c.assignment.domain
+	if status, waiting := g.waitForHeldDomain(c); waiting {
+		return status
+	}
 	if assignmentStale(c.planningNodes, c.placed.count, c.free, c.need, domain) {
 		// Releasing also returns the assignment's leaked capacity reservation,
 		// which may be what kept other pods out of the domain, so they are
@@ -404,27 +421,57 @@ func (g *GangPack) followAssignment(c *gangCycle) *framework.Status {
 		if g.assignments.Release(gang.key, c.assignment.commitment, nil) {
 			g.activateReservationBlocked()
 		}
-		gangAssignmentTotal.WithLabelValues("stale_replan").Inc()
-		assignedGroups.Set(float64(g.assignments.Len()))
-		c.assignment = nil
-		c.measureRoom()
-		klog.V(4).InfoS("gangpack.assignGangDomain.stale_replan", "gang", gang.key, "releasedDomain", domain)
+		g.planAgain(c)
 		return nil
 	}
 	if c.placed.count > 0 && c.free[domain] < c.need {
 		return framework.NewStatus(framework.Unschedulable,
 			"pinned domain "+domain+" cannot fit all remaining gang members "+gang.key)
 	}
+	if g.membersLeft(c) {
+		// The assignment holds no room, so dropping it frees none and no pod
+		// is requeued.
+		g.assignments.Release(gang.key, c.assignment.commitment, nil)
+		g.planAgain(c)
+		return nil
+	}
 	c.assignment.soleFit = g.assignments.SoleFit(gang.key, c.assignment.commitment)
 	return nil
 }
 
+// planAgain leaves the cycle without an assignment after followAssignment
+// released the gang's, so chooseDomain plans the gang afresh. It counts the
+// re-plan and measures the room again, without the released assignment.
+func (g *GangPack) planAgain(c *gangCycle) {
+	released := c.assignment.domain
+	gangAssignmentTotal.WithLabelValues("stale_replan").Inc()
+	assignedGroups.Set(float64(g.assignments.Len()))
+	c.assignment = nil
+	c.measureRoom()
+	klog.V(4).InfoS("gangpack.assignGangDomain.stale_replan", "gang", c.gang.key, "releasedDomain", released)
+}
+
+// membersLeft reports whether the commitment counts members the gang has
+// lost. A commitment with every slot placed holds no room and leaves the gate
+// open, so a member that follows it binds alone. When the gang has more than
+// the member at hand still to place, the commitment is dropped and the gang
+// is planned again, in the domain of the members it kept if any. Room is then
+// reserved for every member still to place, and they wait at the gate
+// together. followAssignment asks only once the domain has room for those
+// members, so a gang that cannot place them keeps its commitment and reserves
+// nothing. A gang short of one member keeps its commitment as well, because
+// that member completes it.
+func (g *GangPack) membersLeft(c *gangCycle) bool {
+	return c.need > 1 && g.assignments.Committed(c.gang.key, c.assignment.commitment)
+}
+
 // chooseDomain commits a gang without an assignment to a domain: it adopts the
-// domain of any already-placed members (failover lost the assignment), else
-// best-fits a fresh one. It records the assignment and the placement metric.
-// The status is Unschedulable only when the gang fits in no domain. The
-// assignment's soleFit reports that no other domain free of reservations could
-// take the gang, so a veto in this one has nothing left to re-plan into.
+// domain of any already-placed members, else best-fits a fresh one. It records
+// the assignment and the placement metric. The status is Unschedulable only
+// when the gang fits in no domain, and such a gang records no assignment, so
+// it reserves nothing. The assignment's soleFit reports that no other domain
+// free of reservations could take the gang, so a veto in this one has nothing
+// left to re-plan into.
 //
 // Room the snapshot has but Choose withholds belongs to another gang's
 // outstanding reservation. That reservation draining or unwinding produces no
@@ -435,14 +482,17 @@ func (g *GangPack) chooseDomain(c *gangCycle) *framework.Status {
 	gang := c.gang
 	if d, count := c.placed.domain, c.placed.count; count > 0 {
 		// Rebuild from ground truth: the gang lives where its members already are.
-		remaining := gang.minMember - count
-		id := g.assignments.Set(gang.placementGang(), d, remaining, c.view.names(d))
-		gangAssignmentTotal.WithLabelValues("adopted").Inc()
-		assignedGroups.Set(float64(g.assignments.Len()))
+		// A gang that cannot place the rest there records nothing: a reservation
+		// made for a refused member would close the domain with no member at
+		// the gate, so no timeout would end it.
 		if c.free[d] < c.need {
 			return framework.NewStatus(framework.Unschedulable,
 				"adopted domain "+d+" cannot fit remaining gang members "+gang.key)
 		}
+		remaining := gang.minMember - count
+		id := g.assignments.Set(gang.placementGang(), d, remaining, c.view.names(d))
+		gangAssignmentTotal.WithLabelValues("adopted").Inc()
+		assignedGroups.Set(float64(g.assignments.Len()))
 		c.assignment = &assignmentState{domain: d, topologyKey: gang.topologyKey, gang: gang, commitment: id, soleFit: true}
 		return nil
 	}
@@ -475,6 +525,7 @@ func (g *GangPack) noDomainFits(c *gangCycle) *framework.Status {
 			"no domain has room for gang "+c.gang.key+": every fitting domain is reserved for a forming gang")
 	}
 	gangAssignmentTotal.WithLabelValues("no_fit").Inc()
+	c.noRoom = true
 	return framework.NewStatus(framework.Unschedulable, "no domain has room for gang "+c.gang.key)
 }
 

@@ -126,7 +126,8 @@ func Reconcile(ctx context.Context, deps types.Deps, input types.ReconcileInput,
 
 // Execute applies the Decision: the removal of the pods the observation
 // read as bound to a Node that no longer exists, the force-delete sweep
-// over every Terminating pod of the Component, the hold pass, then the
+// over every Terminating pod of the Component, the shorter grace for the
+// pods of a gang whose leader has gone, the hold pass, then the
 // op-pass action loop, then the end-of-pass bookkeeping
 // (endOfPassBookkeeping). A scale-down status commit is a pass boundary
 // because it invalidates the plan. While an admitted wave is polling,
@@ -174,9 +175,16 @@ func Execute(ctx context.Context, deps types.Deps, input types.ReconcileInput, p
 	// error; it is appended, and the pass fails on it so the backoff
 	// supplies another reading.
 	sweepAt, sweepErr := sweepStuckTerminatingPods(ctx, deps, input, plan, snapshot.CachedPods)
+	// The pods of a multi-pod Instance left terminating after their leader
+	// pod has gone take the configured shorter grace next, from the same
+	// memoized list and under the sweep's error rule.
+	graceErr := shortenGraceAfterLeaderGone(ctx, deps, input, plan, snapshot.CachedPods)
 	res, err := executeDecision(ctx, deps, input, plan, target, snapshot, decision)
 	if sweepErr != nil {
 		err = errors.Join(err, sweepErr)
+	}
+	if graceErr != nil {
+		err = errors.Join(err, graceErr)
 	}
 	return wakeForPolicyBoundary(requeueAfterFreedPods(res, freed), input.Now(), sweepAt), err
 }
@@ -301,6 +309,25 @@ func sweepStuckTerminatingPods(ctx context.Context, deps types.Deps, input types
 		return at, fmt.Errorf("workload.Reconcile: force-delete sweep (component=%s): %w", plan.Component, err)
 	}
 	return at, nil
+}
+
+// shortenGraceAfterLeaderGone is the Component-wide step that shortens the
+// termination grace of the pods of a multi-pod Instance left terminating
+// once their leader pod has gone, over the pass's one memoized pod read,
+// whichever operation deleted them. With lifecycle.leaderGoneGracePeriod
+// unset nothing is read.
+func shortenGraceAfterLeaderGone(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan, pods func(context.Context) (map[int32][]*corev1.Pod, error)) error {
+	if _, set := input.DesiredSpec.Lifecycle.LeaderGoneGrace(); !set {
+		return nil
+	}
+	byIdx, err := pods(ctx)
+	if err != nil {
+		return fmt.Errorf("workload.Reconcile: list pods for the leader-gone grace (component=%s): %w", plan.Component, err)
+	}
+	if err := workloadops.ShortenGraceAfterLeaderGone(ctx, deps, input, byIdx); err != nil {
+		return fmt.Errorf("workload.Reconcile: leader-gone grace (component=%s): %w", plan.Component, err)
+	}
+	return nil
 }
 
 // wakeForPolicyBoundary folds the sweep's next policy boundary into the
@@ -690,7 +717,8 @@ func scaleDownResult(input types.ReconcileInput, outcome workloadops.DeleteBatch
 // escalation through lifecycle.forceDelete for the rows it drives, and the
 // force-delete sweep covers a pod of an index with no row left, from the
 // live read the wave already took, so no pod holds the teardown open
-// past the policy's boundary.
+// past the policy's boundary. The pods of a gang whose leader has gone take
+// their shorter grace from the same read.
 func reconcileTeardown(ctx context.Context, deps types.Deps, input types.ReconcileInput, plan types.ComponentPlan) (ctrl.Result, error) {
 	extras := TeardownExtras(input.ObservedState.InstanceStatuses)
 	snapshot := NewObservedSnapshot(deps, input, plan.Component, input.ObservedState.InstanceStatuses)
@@ -707,7 +735,8 @@ func reconcileTeardown(ctx context.Context, deps types.Deps, input types.Reconci
 	}
 	res, _, _ := scaleDownResult(input, outcome)
 	sweepAt, sweepErr := sweepStuckTerminatingPods(ctx, deps, input, plan, snapshot.LivePods)
-	return wakeForPolicyBoundary(requeueAfterFreedPods(res, freed), input.Now(), sweepAt), sweepErr
+	graceErr := shortenGraceAfterLeaderGone(ctx, deps, input, plan, snapshot.LivePods)
+	return wakeForPolicyBoundary(requeueAfterFreedPods(res, freed), input.Now(), sweepAt), errors.Join(sweepErr, graceErr)
 }
 
 func scaleDownPollResult(input types.ReconcileInput, policyRequeueAfter time.Duration, policyDeadlineDue bool) ctrl.Result {
@@ -754,16 +783,10 @@ func deleteExtraInstances(ctx context.Context, deps types.Deps, input types.Reco
 // surge — is not extra, so it is not scale-down-deleted out from under
 // Migrate.
 func ScaleDownExtras(observed []types.InstanceStatus, plan types.ComponentPlan) []int32 {
-	planned := make(map[int32]struct{}, len(plan.Instances))
-	for _, inst := range plan.Instances {
-		planned[inst.Index] = struct{}{}
-	}
 	var extras []int32
-	for _, row := range observed {
-		if _, inPlan := planned[row.Index]; inPlan {
-			continue
-		}
-		if migrationPinned(&row) {
+	for i := range observed {
+		row := &observed[i]
+		if plan.InstanceAt(row.Index) != nil || migrationPinned(row) {
 			continue
 		}
 		extras = append(extras, row.Index)

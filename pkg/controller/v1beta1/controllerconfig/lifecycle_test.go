@@ -897,6 +897,75 @@ func TestLifecycleConfig_ToAbandonedReplacementGracePeriod(t *testing.T) {
 	}
 }
 
+// TestLifecycleConfig_ToGangRestartGracePeriod checks the validation
+// contract for the grace of a restarted gang's old pods: a configured
+// duration parses, an absent key or block yields zero (unconfigured, not
+// an error), and a non-positive or unparsable value is an error the caller
+// treats as unconfigured.
+func TestLifecycleConfig_ToGangRestartGracePeriod(t *testing.T) {
+	cases := []struct {
+		name    string
+		doc     string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "configured value parses", doc: `{"gangRestartGracePeriod":"30s"}`, want: 30 * time.Second},
+		{name: "sub-second value parses", doc: `{"gangRestartGracePeriod":"1500ms"}`, want: 1500 * time.Millisecond},
+		{name: "absent key yields zero", doc: `{}`},
+		{name: "empty value yields zero", doc: `{"gangRestartGracePeriod":""}`},
+		{name: "unparsable value is an error", doc: `{"gangRestartGracePeriod":"soon"}`, wantErr: true},
+		{name: "zero is an error", doc: `{"gangRestartGracePeriod":"0s"}`, wantErr: true},
+		{name: "negative is an error", doc: `{"gangRestartGracePeriod":"-5s"}`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg LifecycleConfig
+			require.NoError(t, json.Unmarshal([]byte(tc.doc), &cfg))
+			grace, err := cfg.ToGangRestartGracePeriod()
+			if tc.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tc.want, grace)
+		})
+	}
+
+	t.Run("nil receiver yields zero, no error", func(t *testing.T) {
+		var cfg *LifecycleConfig
+		grace, err := cfg.ToGangRestartGracePeriod()
+		require.NoError(t, err)
+		assert.Equal(t, time.Duration(0), grace)
+	})
+}
+
+// TestLifecycleConfig_KueuePodGroupsEnabled checks the Kueue pod-group switch:
+// only an explicit true turns it on, and an absent key, an explicit false or
+// no lifecycle block at all leave each queued pod its own Kueue Workload.
+func TestLifecycleConfig_KueuePodGroupsEnabled(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+		want bool
+	}{
+		{name: "true turns it on", doc: `{"kueuePodGroups":true}`, want: true},
+		{name: "false leaves it off", doc: `{"kueuePodGroups":false}`},
+		{name: "absent key leaves it off", doc: `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg LifecycleConfig
+			require.NoError(t, json.Unmarshal([]byte(tc.doc), &cfg))
+			assert.Equal(t, tc.want, cfg.KueuePodGroupsEnabled())
+		})
+	}
+
+	t.Run("nil receiver leaves it off", func(t *testing.T) {
+		var cfg *LifecycleConfig
+		assert.False(t, cfg.KueuePodGroupsEnabled())
+	})
+}
+
 // TestGangScheduleTimeoutConfig_ToClamp pins the validation contract for
 // the gang admission bounds: a configured pair parses, an absent block
 // yields a nil clamp (the derived timeout passes through), and any

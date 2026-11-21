@@ -56,7 +56,7 @@ require (
 	sigs.k8s.io/controller-runtime v0.24.1
 	sigs.k8s.io/gateway-api v1.6.2
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730
-	sigs.k8s.io/kueue v0.19.2
+	sigs.k8s.io/kueue v0.19.13
 	sigs.k8s.io/lws v0.9.0
 	sigs.k8s.io/scheduler-plugins v0.34.7
 	sigs.k8s.io/yaml v1.6.0
@@ -201,7 +201,7 @@ require (
 // rendered queries are validated by the 2.54 parser.
 replace github.com/prometheus/prometheus => github.com/prometheus/prometheus v0.54.0
 
-// Kueue v0.19.2 declares k8s.io/api v0.36.2, but nothing it compiles here needs
+// The Kueue pin declares k8s.io/api v0.36.2, but nothing it compiles here needs
 // a 1.36 symbol; that requirement is what MVS selects, not what the source
 // demands. Go has no upper-bound constraint, so replace is the only way to hold
 // the staging set at the 1.35 client-go line this module targets. Two

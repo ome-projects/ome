@@ -218,6 +218,13 @@ type Params struct {
 	// stable side.
 	RollbackToRevision string
 
+	// UpdateStrategyOverride replaces the Component's update strategy on the
+	// replica while a canary force needs another one: a disruptive force
+	// replaces every Instance at once. The revision hash does not cover the
+	// strategy, so the override starts no new revision. nil projects the
+	// Component's own strategy.
+	UpdateStrategyOverride *v1beta1.UpdateStrategy
+
 	// ResolvedAutoscaler is the authoritative per-Component
 	// ComponentAutoscaler the autoscaler.ResolveComponentAutoscaler
 	// helper picked from the ISVC → runtime → default chain. The
@@ -472,7 +479,7 @@ func projectionBase(ir *v1beta1.InferenceReplica) *v1beta1.InferenceReplica {
 // derives its pod, Service and revision names from the InferenceService
 // name (its NamePrefix), so this name is a routing identifier that keeps
 // kubectl output grouped per Component. The InferenceService controller
-// also finds its projected replicas by this name (ComponentIR).
+// also finds its projected replicas by this name (ComponentIRFor).
 func InferenceReplicaName(isvcName string, component v1beta1.ComponentType) string {
 	return isvcName + "-" + string(component)
 }
@@ -615,6 +622,12 @@ func projectWorkload(ir *v1beta1.InferenceReplica, p Params) {
 	ir.Spec.Replicas = desiredReplicas(ir, p)
 	ir.Spec.Runners = runnersFromParams(p)
 	ir.Spec.Lifecycle = lifecycleFromComponentExt(p.ComponentExt)
+	if p.UpdateStrategyOverride != nil {
+		if ir.Spec.Lifecycle == nil {
+			ir.Spec.Lifecycle = &v1beta1.LifecycleSpec{}
+		}
+		ir.Spec.Lifecycle.UpdateStrategy = p.UpdateStrategyOverride.DeepCopy()
+	}
 	ir.Spec.MinReadySeconds = minReadySecondsFromComponentExt(p.ComponentExt)
 }
 

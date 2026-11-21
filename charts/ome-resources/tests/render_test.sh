@@ -529,6 +529,24 @@ fi
 grep -Fq '"scaleDownPodBatchSize":100' <<<"${repair_batch_omitted}" ||
   fail "omitting the repair batch size unexpectedly removed the scale-down Pod batch size"
 
+if grep -Fq 'kueuePodGroups' <<<"${controller_config}"; then
+  fail "Kueue pod groups were rendered although the chart leaves them unset"
+fi
+kueue_pod_groups_on="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.lifecycle.kueuePodGroups=true \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"kueuePodGroups":true' <<<"${kueue_pod_groups_on}" ||
+  fail "turning Kueue pod groups on did not render the setting"
+grep -Fq '"scaleDownPodBatchSize":100' <<<"${kueue_pod_groups_on}" ||
+  fail "turning Kueue pod groups on unexpectedly removed the scale-down Pod batch size"
+kueue_pod_groups_off="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.controller.lifecycle.kueuePodGroups=false \
+  --show-only templates/ome-controller/configmap.yaml)"
+grep -Fq '"kueuePodGroups":false' <<<"${kueue_pod_groups_off}" ||
+  fail "an explicit false for Kueue pod groups was not rendered"
+
 if grep -Fq 'forceDelete' <<<"${controller_config}"; then
   fail "the force-delete policy was rendered although the chart leaves it unset"
 fi

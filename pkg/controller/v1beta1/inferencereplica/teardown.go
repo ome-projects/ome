@@ -129,7 +129,8 @@ func (r *Reconciler) reconcileTeardown(ctx context.Context, log logr.Logger, ir 
 
 	// Desired-spec content is irrelevant under Teardown (the planned
 	// index set is treated as empty); the input/plan only need to be
-	// well-formed so Delete can read Key/Component/InstanceReadyTimeout.
+	// well-formed so Delete can read Key/Component/InstanceReadyTimeout and
+	// the leader-gone step can read lifecycle.leaderGoneGracePeriod.
 	// The same-target update retry policy is nil: the Update pass never
 	// runs in teardown, and neither does the escalation pass (zero
 	// escalation windows / zero relocation budget — wedge escalation

@@ -17,6 +17,9 @@
 package types
 
 import (
+	"math"
+	"time"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -298,7 +301,7 @@ type InstanceStatus struct {
 	// nothing and publishes 0, whatever its workers read: a gang whose
 	// leader is gone counts 0.
 	ServingPodCount int32
-	// AvailablePodCount counts pods in rotation on the Component's
+	// AvailablePodCount counts Ready pods in rotation on the Component's
 	// headless Service that, when MinReadySeconds is set, have been Ready
 	// for at least that long.
 	AvailablePodCount int32
@@ -425,10 +428,38 @@ type Lifecycle struct {
 	// operations open with no deadline.
 	InstanceReadyTimeout *metav1.Duration
 
+	// LeaderGoneGracePeriod is the termination grace left to the worker
+	// pods of a multi-pod Instance that are terminating once the
+	// Instance's leader pod is gone. nil leaves every pod its own grace:
+	// no operator-configured value stands in for it.
+	LeaderGoneGracePeriod *metav1.Duration
+
 	// MigrationPolicy controls whether and how OMENative honors a
 	// migration request annotation for this Component. nil falls back
 	// to the Auto default.
 	MigrationPolicy *MigrationPolicy
+}
+
+// LeaderGoneGrace is LeaderGoneGracePeriod as a duration, and false when the
+// field is unset or not above zero. Admission refuses a value that is not
+// above zero, and one that reaches the engine all the same reads as unset,
+// so this field never has a pod deleted with a grace of zero.
+func (l Lifecycle) LeaderGoneGrace() (time.Duration, bool) {
+	if l.LeaderGoneGracePeriod == nil || l.LeaderGoneGracePeriod.Duration <= 0 {
+		return 0, false
+	}
+	return l.LeaderGoneGracePeriod.Duration, true
+}
+
+// LeaderGoneGraceSeconds is LeaderGoneGrace in whole seconds, the unit a
+// pod's termination grace is counted in. A fraction of a second counts as a
+// whole second, so no value above zero reads as a grace of zero.
+func (l Lifecycle) LeaderGoneGraceSeconds() (int64, bool) {
+	grace, set := l.LeaderGoneGrace()
+	if !set {
+		return 0, false
+	}
+	return int64(math.Ceil(grace.Seconds())), true
 }
 
 // UpdateStrategy is the workload-owned mirror of the v1beta1

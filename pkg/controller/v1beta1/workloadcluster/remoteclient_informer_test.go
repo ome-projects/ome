@@ -71,7 +71,13 @@ func TestMemberInformersReadAndObserveChanges(t *testing.T) {
 					_ = encoder.Encode(&metav1.APIResourceList{TypeMeta: metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"}, GroupVersion: "ome.io/v1beta1", APIResources: resources})
 					return
 				}
-				resource := strings.TrimPrefix(r.URL.Path, "/apis/ome.io/v1beta1/")
+				// Only ome.io API paths can read ome.io objects. Any local process can
+				// dial this ephemeral port, so requests to other paths are not counted.
+				resource, omeAPI := strings.CutPrefix(r.URL.Path, "/apis/ome.io/v1beta1/")
+				if !omeAPI {
+					http.NotFound(w, r)
+					return
+				}
 				obj, ok := objects[resource]
 				if !ok {
 					individualGets.Add(1)

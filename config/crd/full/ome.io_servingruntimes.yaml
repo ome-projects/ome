@@ -7552,6 +7552,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:
@@ -15718,6 +15723,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:
@@ -23876,6 +23886,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:
@@ -32048,6 +32063,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:

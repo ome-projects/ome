@@ -58,6 +58,28 @@ assert_contains '              podGroupSyncTimeoutSeconds: 30'
 assert_contains '              gcIntervalSeconds: 60'
 assert_contains '              standaloneDomainPacking: true'
 
+# Gang preemption is off unless enabled, and needs the built-in preemptor off.
+assert_absent '              preemption:'
+preempting="$("${helm_bin}" template ome-scheduler "${chart_dir}" \
+  --kube-version "${kube_version}" \
+  --set scheduler.plugin.preemption.enabled=true \
+  --set scheduler.plugin.preemption.maxInFlight=2)"
+grep -Fq $'              standaloneDomainPacking: true\n              preemption:\n                maxInFlight: 2' <<<"${preempting}" \
+  || fail "enabled gang preemption was not rendered into the plugin arguments"
+grep -Fq '              - name: DefaultPreemption' <<<"${preempting}" \
+  || fail "built-in DefaultPreemption was not disabled beside gang preemption"
+if "${helm_bin}" template ome-scheduler "${chart_dir}" \
+  --kube-version "${kube_version}" \
+  --set scheduler.plugin.preemption.enabled=true \
+  --set scheduler.disablePreemption=false >/dev/null 2>&1; then
+  fail "gang preemption rendered beside the built-in preemptor"
+fi
+if "${helm_bin}" template ome-scheduler "${chart_dir}" \
+  --kube-version "${kube_version}" \
+  --set scheduler.plugin.preemption.maxInFlight=0 >/dev/null 2>&1; then
+  fail "zero preemptions in flight unexpectedly passed values schema validation"
+fi
+
 # Node sampling is profile-scoped and opt-in: absent by default (upstream's
 # adaptive band), rendered as a sibling of schedulerName when configured.
 assert_absent 'percentageOfNodesToScore'

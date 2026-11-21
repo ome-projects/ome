@@ -102,7 +102,7 @@ spec:
                     type: string
                 type: object
               decoder:
-{{- include "ome-crd.schema.f8a6c3ee73a4" . | nindent 16 }}
+{{- include "ome-crd.schema.d899cc2d59bf" . | nindent 16 }}
               deploymentMode:
                 enum:
                 - OMENative
@@ -277,6 +277,13 @@ spec:
                     properties:
                       instanceReadyTimeout:
                         type: string
+                      leaderGoneGracePeriod:
+                        type: string
+                        x-kubernetes-validations:
+                        - message: leaderGoneGracePeriod must be above 0s, for example
+                            30s. Leave it unset to keep the termination grace each
+                            pod has.
+                          rule: duration(self) > duration('0s')
                       migrationPolicy:
                         properties:
                           mode:
@@ -609,7 +616,7 @@ spec:
 {{- include "ome-crd.schema.f929430e068e" . | nindent 20 }}
                 type: object
               engine:
-{{- include "ome-crd.schema.f8a6c3ee73a4" . | nindent 16 }}
+{{- include "ome-crd.schema.d899cc2d59bf" . | nindent 16 }}
               model:
                 properties:
                   apiGroup:
@@ -1001,6 +1008,13 @@ spec:
                     properties:
                       instanceReadyTimeout:
                         type: string
+                      leaderGoneGracePeriod:
+                        type: string
+                        x-kubernetes-validations:
+                        - message: leaderGoneGracePeriod must be above 0s, for example
+                            30s. Leave it unset to keep the termination grace each
+                            pod has.
+                          rule: duration(self) > duration('0s')
                       migrationPolicy:
                         properties:
                           mode:
@@ -1677,6 +1691,41 @@ spec:
                     required:
                     - reason
                     type: object
+                  forced:
+                    properties:
+                      canaryRevisionHash:
+                        type: string
+                      endReason:
+                        enum:
+                        - Completed
+                        - Crash
+                        - RolledBack
+                        - RunClosed
+                        - Paused
+                        - Removed
+                        - Changed
+                        - Expired
+                        type: string
+                      endedAt:
+                        format: date-time
+                        type: string
+                      mode:
+                        enum:
+                        - Disruptive
+                        type: string
+                      reason:
+                        type: string
+                      runID:
+                        type: string
+                      startedAt:
+                        format: date-time
+                        type: string
+                    required:
+                    - mode
+                    - reason
+                    - runID
+                    - startedAt
+                    type: object
                   lastConclusiveEvaluationTime:
                     format: date-time
                     type: string
@@ -1871,6 +1920,41 @@ spec:
                               type: string
                           required:
                           - reason
+                          type: object
+                        forced:
+                          properties:
+                            canaryRevisionHash:
+                              type: string
+                            endReason:
+                              enum:
+                              - Completed
+                              - Crash
+                              - RolledBack
+                              - RunClosed
+                              - Paused
+                              - Removed
+                              - Changed
+                              - Expired
+                              type: string
+                            endedAt:
+                              format: date-time
+                              type: string
+                            mode:
+                              enum:
+                              - Disruptive
+                              type: string
+                            reason:
+                              type: string
+                            runID:
+                              type: string
+                            startedAt:
+                              format: date-time
+                              type: string
+                          required:
+                          - mode
+                          - reason
+                          - runID
+                          - startedAt
                           type: object
                         lastConclusiveEvaluationTime:
                           format: date-time

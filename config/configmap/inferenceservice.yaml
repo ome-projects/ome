@@ -127,12 +127,19 @@ data:
   # 4:2, 6:3, 8:4, 9:5, 11:6, 12:7, 12:8 under a tolerance of 20 (up to 1.33
   # decode Instances off 3:2) and 2:1, 3:2, 5:3, 6:4, 8:5, 9:6, 11:7, 12:8
   # under 5, instead of running 10:5. A batch that cannot fit shrinks, and at
-  # least one Instance moves per batch. firstSide names the side that moves first
-  # inside every batch, engine or decoder: the other side's moves of the batch
-  # are admitted once the named side's new Instances serve. Name the side that
-  # takes longer to come back, so one side is down at a time and both return
-  # close together; any other value is rejected. The binary has NO built-in
-  # rules: omit a field, or the block, and that rule is off.
+  # least one Instance moves per batch. firstSide, when set to engine or decoder,
+  # names the side that moves first inside every batch: the other side's moves
+  # of the batch wait until the named side's new Instances serve. It is unset
+  # here, so both sides start each batch together; setting it roughly doubles
+  # each batch. Any other value is rejected. The binary has NO built-in rules:
+  # omit a field, or the block, and that rule is off.
+  #
+  # kueuePodGroups, when true, puts the pods of a multi-pod Instance that carry
+  # a Kueue queue label into one Kueue pod group: Kueue admits the leader and
+  # its workers together and evicts them together. It is unset here, so each
+  # pod is its own Kueue Workload. It applies to pods created after it is set.
+  # The controller needs get and delete on workloads.kueue.x-k8s.io for the
+  # groups it releases.
   lifecycle: |-
     {
       "scaleUpPodBatchSize": 100,
@@ -140,7 +147,7 @@ data:
       "scaleDownRequeueInterval": "5s",
       "repairBatchSize": 10,
       "instanceReadyTimeout": "30m",
-      "prefillDecodeRoll": {"keepRatio": true, "firstSide": "decoder"}
+      "prefillDecodeRoll": {"keepRatio": true}
     }
 
   # How many Kubernetes Events the manager may record about one object before

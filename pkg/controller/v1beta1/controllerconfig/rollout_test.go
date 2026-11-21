@@ -135,3 +135,21 @@ func TestNewRolloutConfig_PlainAndCachedLoaders_ReadTheConfigMap(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2048, cfg.MaxPinnedPlanBytes)
 }
+
+// A cluster opts into canary forces by configuring their limit; without the
+// block every force is refused.
+func TestParseRolloutConfig_ForceComplete(t *testing.T) {
+	cfg, err := parseRolloutConfig(&v1.ConfigMap{Data: map[string]string{RolloutConfigName: `{"forceComplete": {"maxDuration": "6h"}}`}})
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ForceComplete)
+	assert.Equal(t, 6*time.Hour, cfg.ForceComplete.MaxDuration)
+
+	// An absent block, or one without a valid time limit, turns the force off
+	// and leaves the rest of the rollout config loading.
+	for _, data := range []string{`{}`, `{"forceComplete": {}}`, `{"forceComplete": {"maxDuration": "0s"}}`,
+		`{"forceComplete": {"maxDuration": "6 h"}}`, `{"canaryRequeue": "10s", "forceComplete": {"maxDuration": ""}}`} {
+		cfg, err = parseRolloutConfig(&v1.ConfigMap{Data: map[string]string{RolloutConfigName: data}})
+		require.NoError(t, err, data)
+		assert.Nil(t, cfg.ForceComplete, data)
+	}
+}

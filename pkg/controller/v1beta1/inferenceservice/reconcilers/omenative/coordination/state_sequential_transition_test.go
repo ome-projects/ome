@@ -225,6 +225,16 @@ var sequentialRows = []sequentialRow{
 			v1beta1.DecoderComponent, earlier(11*time.Minute)),
 	},
 	{
+		name:    "the next member starts when the wait has elapsed exactly",
+		wait:    tenMinutes,
+		order:   decoderEngine,
+		members: []ComponentObservation{settledOn(v1beta1.DecoderComponent, "rev2"), rollingTo(v1beta1.EngineComponent, 2, 0, 0)},
+		record:  MemberFinish{Component: v1beta1.DecoderComponent, At: earlier(tenMinutes)},
+		want: withFinish(
+			rolls(v1beta1.EngineComponent, v1beta1.CoordinationPhaseSurging, "creating new-revision pods", v1beta1.DecoderComponent),
+			v1beta1.DecoderComponent, earlier(tenMinutes)),
+	},
+	{
 		name:             "the next member holds while the finished member is not Ready within the wait",
 		wait:             tenMinutes,
 		order:            decoderEngine,
@@ -232,6 +242,15 @@ var sequentialRows = []sequentialRow{
 		record:           MemberFinish{Component: v1beta1.DecoderComponent, At: earlier(4 * time.Minute)},
 		want:             heldBy(withFinish(awaits(v1beta1.EngineComponent, v1beta1.DecoderComponent), v1beta1.DecoderComponent, earlier(4*time.Minute)), v1beta1.DecoderComponent),
 		wantMessageParts: []string{"Sequential ", ": decoder not Ready; 6m0s remaining before engine starts, once decoder is Ready"},
+	},
+	{
+		name:             "the next member holds with no time remaining while the finished member is not Ready at the end of the wait",
+		wait:             tenMinutes,
+		order:            decoderEngine,
+		members:          []ComponentObservation{darkened(settledOn(v1beta1.DecoderComponent, "rev2")), rollingTo(v1beta1.EngineComponent, 2, 0, 0)},
+		record:           MemberFinish{Component: v1beta1.DecoderComponent, At: earlier(tenMinutes)},
+		want:             heldBy(withFinish(awaits(v1beta1.EngineComponent, v1beta1.DecoderComponent), v1beta1.DecoderComponent, earlier(tenMinutes)), v1beta1.DecoderComponent),
+		wantMessageParts: []string{"Sequential ", ": decoder not Ready; engine starts once decoder is Ready"},
 	},
 	{
 		name:             "the next member holds while the finished member is not Ready after the wait",
@@ -286,6 +305,15 @@ var sequentialRows = []sequentialRow{
 		wait:             tenMinutes,
 		order:            decoderEngine,
 		want:             GroupTransition{Phase: v1beta1.CoordinationPhaseIdle, CompositePhase: "Idle"},
+		wantMessageParts: []string{"Sequential group awaiting first Component spec ", ""},
+	},
+	{
+		name:             "a group waiting for its first change keeps the record of a done later member",
+		wait:             tenMinutes,
+		order:            decoderEngine,
+		members:          []ComponentObservation{settledOn(v1beta1.EngineComponent, "rev2")},
+		record:           MemberFinish{Component: v1beta1.EngineComponent, At: earlier(time.Minute)},
+		want:             withFinish(GroupTransition{Phase: v1beta1.CoordinationPhaseIdle, CompositePhase: "Idle"}, v1beta1.EngineComponent, earlier(time.Minute)),
 		wantMessageParts: []string{"Sequential group awaiting first Component spec ", ""},
 	},
 	{

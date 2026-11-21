@@ -218,3 +218,21 @@ func CanaryOwnedComponents(isvc *v1beta1.InferenceService) map[v1beta1.Component
 	}
 	return owned
 }
+
+// RunStartsCanary reports whether the open run starts a canary on group g, by
+// the rule the run binding applies: the group has steps, its primary has a
+// recorded target that moves from a known earlier revision, and the run moves
+// one of its members. A first rollout has no earlier revision, so it is not a
+// canary; nor is a run that records no target for the primary.
+func RunStartsCanary(isvc *v1beta1.InferenceService, g *v1beta1.RolloutGroup) bool {
+	if g == nil || g.Canary == nil || len(g.Canary.Steps) == 0 || !v1beta1.RolloutRunActive(isvc) {
+		return false
+	}
+	primary := PrimaryOf(g)
+	for _, t := range isvc.Status.Rollout.ActiveRun.TargetRevisions {
+		if t.Component == primary {
+			return t.Revision != "" && t.StableRevision != "" && v1beta1.RolloutRunRetargets(isvc, g.Components)
+		}
+	}
+	return false
+}

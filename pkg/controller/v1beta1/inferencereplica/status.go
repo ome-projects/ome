@@ -241,7 +241,6 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 	publication := statusPublication{
 		plan:             plan,
 		target:           target,
-		desiredByIdx:     workloadstatus.DesiredPodCountByInstance(plan),
 		pods:             workload.NewCachedSelectorPodObservation(pods, byInstance),
 		availableByPod:   availableByPod,
 		templateHash:     templateHashOf(ir),
@@ -273,7 +272,6 @@ func (r *Reconciler) aggregateAndWriteStatus(ctx context.Context, ir *v1beta1.In
 type statusPublication struct {
 	plan             workloadtypes.ComponentPlan
 	target           *appsv1.ControllerRevision
-	desiredByIdx     map[int32]int32
 	pods             workload.PodObservation
 	availableByPod   map[string]struct{}
 	templateHash     string
@@ -455,7 +453,7 @@ func (r *Reconciler) computePublication(ir *v1beta1.InferenceReplica, p statusPu
 	if p.target != nil {
 		targetName = p.target.Name
 	}
-	publication, counters, err := observation.TakeInlineV1Publication(p.desiredByIdx, targetName)
+	publication, counters, err := observation.TakeInlineV1Publication(p.plan, targetName)
 	if err != nil {
 		return nil, workload.ComponentCounters{}, fmt.Errorf("aggregateAndWriteStatus: consume publication observation: %w", err)
 	}

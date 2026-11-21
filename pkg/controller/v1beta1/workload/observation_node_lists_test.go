@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -34,7 +35,7 @@ func publishOverPods(t *testing.T, rows []types.InstanceStatus, byInstance map[i
 	if err != nil {
 		t.Fatalf("NewOwnedPublicationObservation: %v", err)
 	}
-	published, _, err := observation.TakeInlineV1Publication(desired, target)
+	published, _, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(desired), target)
 	if err != nil {
 		t.Fatalf("TakeInlineV1Publication: %v", err)
 	}

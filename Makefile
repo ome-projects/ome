@@ -59,7 +59,7 @@ CRD_OPTIONS ?= "crd:maxDescLen=0"
 OME_ENABLE_SELF_SIGNED_CA ?= false
 
 # ENVTEST K8s version configuration
-ENVTEST_K8S_VERSION = 1.30
+ENVTEST_K8S_VERSION = 1.35
 
 # Image configuration for success and error scenarios
 SUCCESS_200_ISVC_IMG ?= success-200-isvc
@@ -686,6 +686,17 @@ TEST_ENV = \
 	DYLD_LIBRARY_PATH="$(XET_LIB_PATH):$$DYLD_LIBRARY_PATH" \
 	GOTOOLCHAIN=$(GOTOOLCHAIN)
 
+# The Go runtime samples heap allocations for its memory profile, and at every
+# collection it walks one record for each sampled call path. A test binary
+# gathers records for as long as it runs, and its collections slow down until
+# most of its CPU goes to that walk. No unit test reads the profile, so the
+# unit tests run their test binaries with the sampling off. `GO_TEST_GODEBUG=`
+# gives the Go default back. A GODEBUG of the caller's environment is kept,
+# and it wins where both name a setting.
+GO_TEST_GODEBUG ?= memprofilerate=0
+go_test_comma := ,
+go_test_godebug = $(if $(strip $(GO_TEST_GODEBUG)),GODEBUG=$(strip $(GO_TEST_GODEBUG))$(if $(strip $(GODEBUG)),$(go_test_comma)$(strip $(GODEBUG))))
+
 # --- Reusable Test Macro ---
 # $(1): Package list variable
 # $(2): Output suffix (e.g., cmd, pkg, internal)
@@ -698,7 +709,7 @@ GO_TEST_TIMEOUT ?= 120m
 
 define run_go_test
 	@echo "🧪 Running $(2) tests $(3)..."
-	@$(TEST_ENV) $(GO_CMD) test -timeout $(GO_TEST_TIMEOUT) $(1) \
+	@$(TEST_ENV) $(go_test_godebug) $(GO_CMD) test -timeout $(GO_TEST_TIMEOUT) $(1) \
 		-coverprofile=coverage-$(2)$(3).out.tmp \
 		--covermode=atomic
 	@grep -v -E $(EXCLUDE_PATTERNS) coverage-$(2)$(3).out.tmp > coverage-$(2)$(3).out

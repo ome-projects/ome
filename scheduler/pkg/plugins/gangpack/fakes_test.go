@@ -4,7 +4,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/klog/v2"
 	"k8s.io/kube-scheduler/framework"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
@@ -44,8 +46,8 @@ func (w *fakeWaitingPod) Reject(string, string) { w.rejected = true }
 
 // fakeHandle is a minimal framework.Handle exposing the waiting-pod lookup and
 // rejection the gate uses, the iteration the unwind uses, the informer factory
-// and kubeconfig New reads, plus a node snapshot some tests build, which the
-// plugin does not read. The embedded nil Handle satisfies the rest.
+// and kubeconfig New reads, the node snapshot, client and event recorder
+// preemption reads. The embedded nil Handle satisfies the rest.
 type fakeHandle struct {
 	framework.Handle
 	waiting         []framework.WaitingPod
@@ -54,7 +56,13 @@ type fakeHandle struct {
 	activateCalls   int
 	informerFactory informers.SharedInformerFactory
 	kubeConfig      *rest.Config
+	clientSet       clientset.Interface
+	recorder        events.EventRecorder
 }
+
+func (h *fakeHandle) ClientSet() clientset.Interface { return h.clientSet }
+
+func (h *fakeHandle) EventRecorder() events.EventRecorder { return h.recorder }
 
 // GetWaitingPod finds a waiting pod by UID, as the framework's map does; a
 // pod without a UID is never found.

@@ -11,7 +11,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/drain"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -121,19 +120,14 @@ func (r *Result) record(idx int32, token string) {
 // covers its index and the observed count otherwise, and excluded marks
 // the leaving Instances the scale-down has not admitted yet.
 func RowsForPlan(plan types.ComponentPlan, statuses []types.InstanceStatus, excluded map[int32]struct{}) []Row {
-	desiredByIdx := status.DesiredPodCountByInstance(plan)
-	planned := make(map[int32]*types.InstancePlan, len(plan.Instances))
-	for i := range plan.Instances {
-		planned[plan.Instances[i].Index] = &plan.Instances[i]
-	}
 	rows := make([]Row, 0, len(statuses))
 	for i := range statuses {
 		row := &statuses[i]
 		_, skip := excluded[row.Index]
 		rows = append(rows, Row{
 			Status:   row,
-			Desired:  status.DesiredFor(desiredByIdx, row.Index, row.PodCount),
-			Instance: planned[row.Index],
+			Desired:  plan.DesiredPodsFor(row.Index, row.PodCount),
+			Instance: plan.InstanceAt(row.Index),
 			Excluded: skip,
 		})
 	}

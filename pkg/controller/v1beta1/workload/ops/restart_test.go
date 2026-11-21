@@ -2708,10 +2708,16 @@ func TestRepairYieldsToTarget(t *testing.T) {
 		// candidate of a one-Instance plan.
 		pacing    *int32
 		partition *int32
-		want      bool
+		// planHeld makes the plan gate deny every start: no run records the
+		// plan, or the plan does not resolve. The yield reads no plan gate:
+		// the row is left to the roll, whose admission reports the plan's
+		// hold.
+		planHeld bool
+		want     bool
 	}{
 		{name: "Ready on the target is repaired", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: sameTarget, want: false},
 		{name: "Ready off the target yields", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, want: true},
+		{name: "a target the plan gate holds is still the roll's", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, planHeld: true, want: true},
 		{name: "a paused Component keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target, paused: true, want: false},
 		{name: "a target the RetryBlock holds keeps the repair", row: &workload.InstanceStatus{Phase: workload.InstancePhaseReady, RunningRevision: running}, target: target,
 			blocks: []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockHeld}}, want: false},
@@ -2754,6 +2760,9 @@ func TestRepairYieldsToTarget(t *testing.T) {
 				plan.Instances = []workload.InstancePlan{inst}
 				plan.UpdateStrategy.RollingUpdate = &workload.RollingUpdate{Partition: tc.partition}
 				input.DesiredSpec.Pacing = &workload.WorkloadPacing{Partition: tc.pacing}
+			}
+			if tc.planHeld {
+				input.PlanGate = planGateHolding
 			}
 			if got := ops.RepairYieldsToTarget(input, plan, inst, tc.target, tc.pods); got != tc.want {
 				t.Fatalf("RepairYieldsToTarget = %v, want %v", got, tc.want)
@@ -2968,13 +2977,20 @@ func TestRestart_RendersTheStampedRevisionTemplate(t *testing.T) {
 	}
 }
 
+// planGateHolding is a plan gate that admits no start: no run records the
+// plan, or the plan does not resolve.
+func planGateHolding() (bool, workload.RolloutHoldGate, string) {
+	return false, workload.RolloutHoldGate(v1beta1.RolloutHoldGatePlan), "the plan gate admits no start: no run records the plan"
+}
+
 // TestRestart_RebuildWithNoPodYetFollowsTheTarget: an open repair whose
 // rebuild has created no pod yet renders the roll target when the row is
 // off it, and the row records the target first: the pods come back on the
 // target's image under the target's label and the row's running revision
 // names it, for a single pod and for both members of a gang. The rebuild
-// keeps the revision it stamped once a pod of its own exists, and when the
-// RetryBlock holds the target.
+// keeps the revision it stamped once a pod of its own exists, when the
+// RetryBlock holds the target, and while the plan gate admits no start on
+// the target.
 func TestRestart_RebuildWithNoPodYetFollowsTheTarget(t *testing.T) {
 	const (
 		runningImage = "registry.example.com/runtime:v1"
@@ -2983,13 +2999,16 @@ func TestRestart_RebuildWithNoPodYetFollowsTheTarget(t *testing.T) {
 	cases := []struct {
 		name string
 		gang bool
-		// held puts the target under a Held RetryBlock.
-		held    bool
-		follows bool
+		// held puts the target under a Held RetryBlock; planHeld makes the
+		// plan gate deny every start.
+		held     bool
+		planHeld bool
+		follows  bool
 	}{
 		{name: "single pod", follows: true},
 		{name: "gang", gang: true, follows: true},
 		{name: "target the RetryBlock holds", held: true},
+		{name: "target the plan gate holds", planHeld: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3013,6 +3032,9 @@ func TestRestart_RebuildWithNoPodYetFollowsTheTarget(t *testing.T) {
 			input.ObservedState.UpdateRevision = target.Name
 			if tc.held {
 				input.ObservedState.RetryBlocks = []workload.RetryBlock{{TargetRevision: target.Name, State: workload.RetryBlockHeld}}
+			}
+			if tc.planHeld {
+				input.PlanGate = planGateHolding
 			}
 			plan := buildPlanSinglePodEngineForRestart(c, isvc)
 			if tc.gang {

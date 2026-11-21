@@ -1186,13 +1186,16 @@ func invalidPodSpec(resource, name string) error {
 }
 
 // applySpecRevision edits the pod template, which mints a new target
-// revision. An image rewrite is the in-place-eligible edit; an environment
-// rewrite is the one an in-place strategy is not allowed to converge on,
-// and the two are spelled apart so a scenario says which kind of edit it
-// is making.
+// revision. An image rewrite is the in-place-eligible edit; a rewrite of
+// the environment or of the resource requests is one an in-place strategy
+// is not allowed to converge on, and the kinds are spelled apart so a
+// scenario says which kind of edit it is making.
 func applySpecRevision(ctx context.Context, d *driver, ev TimelineEvent) (string, error) {
-	if ev.Args.Image == "" && ev.Args.Env == nil && ev.Args.Annotations == nil {
-		return "", fmt.Errorf("replay: spec.revision needs a template edit: the new image, the new env, the new annotations, or several")
+	if ev.Args.Image == "" && ev.Args.Env == nil && ev.Args.Requests == nil && ev.Args.Annotations == nil {
+		return "", fmt.Errorf("replay: spec.revision needs a template edit: the new image, the new env, the new requests, the new annotations, or several")
+	}
+	if err := validRequests(ev.Args.Requests); err != nil {
+		return "", fmt.Errorf("replay: spec.revision: %w", err)
 	}
 	detail := ""
 	if ev.Args.Image != "" {
@@ -1202,6 +1205,10 @@ func applySpecRevision(ctx context.Context, d *driver, ev TimelineEvent) (string
 	if ev.Args.Env != nil {
 		d.spec.Env = ev.Args.Env
 		detail += "env=" + renderEnv(ev.Args.Env) + " "
+	}
+	if ev.Args.Requests != nil {
+		d.spec.Requests = ev.Args.Requests
+		detail += "requests=" + renderMap(ev.Args.Requests) + " "
 	}
 	if ev.Args.Annotations != nil {
 		d.spec.PodAnnotations = ev.Args.Annotations

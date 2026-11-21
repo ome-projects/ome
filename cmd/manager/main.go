@@ -403,6 +403,9 @@ type startup struct {
 	rolloutPolicyFound    bool
 	// rolloutMaxPlanBytes caps an inline plan or policy body; 0 is uncapped.
 	rolloutMaxPlanBytes int
+	// forceCompleteConfigured is whether the rollout.forceComplete block is
+	// present; admission refuses every canary force without it.
+	forceCompleteConfigured bool
 	// defaultRatioTolerancePercent is the tolerance a group that omits its own
 	// rolls with; nil when the operator configured none.
 	defaultRatioTolerancePercent *int32
@@ -848,6 +851,7 @@ func (s *startup) loadRolloutPlanCap() bool {
 		return true
 	}
 	s.rolloutMaxPlanBytes = config.MaxPinnedPlanBytes
+	s.forceCompleteConfigured = config.ForceComplete != nil
 	return true
 }
 
@@ -1351,6 +1355,8 @@ func (s *startup) inferenceServiceValidator() *isvc.InferenceServiceValidator {
 		RolloutPolicyEnabled:    s.rolloutPolicyFound,
 		// Inline plans and policy bodies share one size cap.
 		RolloutMaxPlanBytes: s.rolloutMaxPlanBytes,
+		// A canary force is refused unless the operator configured its limits.
+		ForceCompleteConfigured: s.forceCompleteConfigured,
 		// The tolerance the rollout resolves an omitted maintainRatio.tolerance
 		// to, so the drain-feasibility rule sees the group as it will run.
 		DefaultRatioTolerancePercent: s.defaultRatioTolerancePercent,

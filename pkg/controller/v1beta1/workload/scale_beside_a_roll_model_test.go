@@ -3,8 +3,10 @@ package workload_test
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math/rand"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -453,7 +455,7 @@ func newScaleWorld(t *testing.T, cfg scaleConfig) *scaleWorld {
 		t:             t,
 		cfg:           cfg,
 		ctx:           logr.NewContext(context.Background(), logr.Discard()),
-		clk:           clocktesting.NewFakeClock(time.Now()),
+		clk:           clocktesting.NewFakeClock(time.Now().Truncate(time.Second)), // status timestamps round-trip at second precision
 		maintainRatio: cfg.settings.maintainRatio,
 		canaryStep:    -1,
 		seen:          map[string]struct{}{},
@@ -1859,12 +1861,13 @@ func (w *scaleWorld) apply(mv scaleMove) {
 		w.sides[mv.side].h.losePods(mv.index)
 	case moveLoseNode:
 		// The node under the Instance's first placed pod; an Instance
-		// whose pods are not placed yet loses the node under any placed
-		// pod of its side. Every Instance with a pod on that node is hit.
+		// whose pods are not placed yet loses the node under the lowest
+		// Instance of its side with a placed pod, the same one on every
+		// run. Every Instance with a pod on that node is hit.
 		s := w.sides[mv.side]
 		byIndex := w.livePodsByIndex(s)
 		node := placedNode(byIndex[mv.index])
-		for idx := range byIndex {
+		for _, idx := range slices.Sorted(maps.Keys(byIndex)) {
 			if node != "" {
 				break
 			}
@@ -2794,4 +2797,65 @@ func TestScaleBesideARoll_ADecoderScaledToElevenOutrunsTheEngineUnderTheRatioRul
 		t.Fatalf("the picture moved: the two sides stayed within %.0f%% of each other after the scale; if the step now pairs the shares, remove the known class and this lock: %s", widest*100, w.picture())
 	}
 	t.Logf("after the scale the two sides' new-version shares drift %.0f%% apart with %d ratio holds on the decoder on the way: %s", widest*100, holds, w.picture())
+}
+
+// TestScaleBesideARoll_ANodeLossNamedForAnUnplacedInstanceTakesTheLowestPlacedInstancesNode
+// holds the model's own rule for a node loss named for an Instance whose
+// pods are not placed: the node lost is the one under the lowest Instance
+// of the side with a placed pod, so the state a lost node leaves is the
+// same on every run. Four prefill Instances each on a node of their own;
+// the cluster runs out of room, Instance 0's pod is lost and its rebuilt
+// pod waits unplaced; the loss named for Instance 0 takes Instance 1's node.
+func TestScaleBesideARoll_ANodeLossNamedForAnUnplacedInstanceTakesTheLowestPlacedInstancesNode(t *testing.T) {
+	recreate := workloadtypes.UpdateStrategyRecreatePod
+	cfg := scaleConfig{shape: scaleShape{4, 2, 1}, settings: scaleSettings{prefill: recreate, decode: recreate}}
+	w := newScaleWorld(t, cfg)
+	prefill := w.prefill()
+	prefill.h.addNodes(fmt.Sprintf("%s-node-%d", prefill.comp, len(prefill.h.nodeNames)))
+	w.reachIdle()
+	prefill.h.holdPlacement("no room")
+	w.apply(scaleMove{kind: moveLosePod, side: 0, index: 0})
+	var byIndex map[int32][]*corev1.Pod
+	for i := 0; i < 10; i++ {
+		w.tick()
+		byIndex = w.livePodsByIndex(prefill)
+		if len(byIndex[0]) > 0 && placedNode(byIndex[0]) == "" {
+			break
+		}
+	}
+	if len(byIndex[0]) == 0 || placedNode(byIndex[0]) != "" {
+		t.Fatalf("Instance 0's rebuilt pod is not waiting unplaced: %s", w.picture())
+	}
+	nodeOf := map[int32]string{}
+	for idx := int32(1); idx <= 3; idx++ {
+		nodeOf[idx] = placedNode(byIndex[idx])
+	}
+	if nodeOf[1] == "" || nodeOf[1] == nodeOf[2] || nodeOf[1] == nodeOf[3] || nodeOf[2] == nodeOf[3] {
+		t.Fatalf("the premise does not hold: Instances 1, 2 and 3 are not each on a node of their own: %v", nodeOf)
+	}
+	w.apply(scaleMove{kind: moveLoseNode, side: 0, index: 0})
+	for idx := int32(1); idx <= 3; idx++ {
+		want := corev1.ConditionTrue
+		if idx == 1 {
+			want = corev1.ConditionUnknown
+		}
+		if got := nodeReadyCondition(t, prefill, nodeOf[idx]); got != want {
+			t.Errorf("after a node loss named for the unplaced Instance 0, the node under Instance %d reads Ready %s, want %s", idx, got, want)
+		}
+	}
+}
+
+// nodeReadyCondition reads a node's Ready condition from the side's cluster.
+func nodeReadyCondition(t *testing.T, s *scaleSide, name string) corev1.ConditionStatus {
+	t.Helper()
+	node := &corev1.Node{}
+	if err := s.h.c.Get(s.h.ctx, client.ObjectKey{Name: name}, node); err != nil {
+		t.Fatalf("get node %s: %v", name, err)
+	}
+	for _, cond := range node.Status.Conditions {
+		if cond.Type == corev1.NodeReady {
+			return cond.Status
+		}
+	}
+	return ""
 }

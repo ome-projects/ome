@@ -254,6 +254,17 @@ const (
 	// the slack, the text also says that OME did not wait.
 	EventReasonPodForceDeleted EventReason = "PodForceDeleted"
 
+	// EventReasonLeaderGoneGraceShortened fires when the engine shortens the
+	// termination grace of the pods of a multi-pod Instance that are still
+	// terminating once the Instance's leader pod has gone
+	// (lifecycle.leaderGoneGracePeriod). Normal, not a failure: the pods
+	// were deleted already, and without their leader they cannot finish the
+	// work they hold. Names the pods, the grace they had and the grace asked
+	// for, and says when their kubelets stop them. One event per Instance and
+	// pass, and a second one for pods whose first delete is older than that
+	// grace, which the API server leaves a grace of one second.
+	EventReasonLeaderGoneGraceShortened EventReason = "LeaderGoneGraceShortened"
+
 	// EventReasonRepairHeld fires when a crash-loop repair is denied by
 	// the per-Component unavailability budget or the coordination gate
 	// and no other repair opened in the same pass. The Component stays
@@ -309,11 +320,14 @@ const (
 	// observation — so the event names the pod and the reason.
 	EventReasonMigrationSurgeWedged EventReason = "MigrationSurgeWedged"
 	// EventReasonMigrationParked is a Warning fired once when a Draining
-	// migration's source pods are all Terminating past their own deletion
-	// deadlines: the drive has issued every delete it owns and only the
-	// kubelet, a finalizer owner or the force-delete escalation can
-	// finish the teardown. The record keeps its phase and its serving
-	// surge, and later Manual requests dispatch ahead of it.
+	// migration's source pods have all stood Terminating past their own
+	// deletion deadlines for one operation requeue: the drive has issued
+	// every delete it owns and only the kubelet, a finalizer owner or the
+	// force-delete escalation can finish the teardown. A pod read right
+	// after its kubelet's last delete is also past its deletion deadline
+	// and is gone within the requeue, so it raises nothing. The record
+	// keeps its phase and its serving surge, and later Manual requests
+	// dispatch ahead of it.
 	EventReasonMigrationParked EventReason = "MigrationParked"
 	EventReasonRateLimited     EventReason = "RateLimited"
 	// EventReasonMigrationPolicyUnconfigured is a Warning fired when a

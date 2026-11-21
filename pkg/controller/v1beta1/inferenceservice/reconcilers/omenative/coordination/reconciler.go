@@ -55,9 +55,9 @@ type ReconcileInputs struct {
 	// correctness-critical reads. The coordination layer reads pods via
 	// Client and the EndpointSlices behind the traffic split through this
 	// reader, one list per routed Service per pass, so the split never
-	// moves a share onto a revision the data plane cannot reach yet; the
-	// canary capacity gate (canary.Dispatch -> ObservePerRevisionPods)
-	// reads its pods through it for the same reason.
+	// moves a share onto a revision the data plane cannot reach yet. The
+	// canary dispatch (canary.Dispatch) reads its pods through the cache as
+	// well, and its replicas and the service's record through this reader.
 	Reader client.Reader
 
 	// Recorder emits K8s Events for coordination transitions.
@@ -233,8 +233,8 @@ func Reconcile(ctx context.Context, in ReconcileInputs) (*Result, error) {
 		// Ensure runs EVERY reconcile — it is the self-heal path. A
 		// per-revision routing/headless Service deleted out-of-band must
 		// be recreated even when the live revision-hash set is unchanged;
-		// EnsurePerRevisionServices uses CreateOrUpdate, whose Gets are
-		// cache-served and cheap, and recreates a missing Service. Gating
+		// EnsurePerRevisionServices reads each Service from the cache, writes
+		// only when a field it owns differs, and recreates a missing Service. Gating
 		// ensure on revision-set convergence would let a deleted Service
 		// stay gone and strand the HTTPRoute on a dead backend. The revisions
 		// are walked in sorted order so a pass is repeatable.
@@ -425,9 +425,10 @@ func collectOMENativeComponents(modes map[v1beta1.ComponentType]constants.Deploy
 // The per-Component pod fetch routes through query.ListOMENativePodsByName so it
 // rides the OMENative Pod field index instead of scanning the whole informer
 // store per Component. useIndex MUST match the reader: pass true for the cached
-// client (coordination's own observe — it has the field index registered) and
-// false for the live API reader (canary capacity gate — the apiserver has no
-// custom Pod field selector). Both modes return the identical pod set; useIndex
+// client (coordination's own observe and the canary dispatch — it has the field
+// index registered) and false for a reader without the index (the live API
+// reader, which the apiserver gives no custom Pod field selector, or an
+// index-less fake). Both modes return the identical pod set; useIndex
 // only picks how the set is fetched. With the cached client the pods handed
 // back are the informer cache's own objects (listObservedPods): read them
 // during the pass, write nothing through them, keep none past the pass, and
@@ -512,6 +513,39 @@ func podReadyAndServing(pod *corev1.Pod) bool {
 	return false
 }
 
+// servingInstance is one Instance under one revision, the unit whose routed
+// pod decides whether its members serve.
+type servingInstance struct{ hash, index string }
+
+func servingInstanceOf(pod *corev1.Pod, hash string) servingInstance {
+	return servingInstance{hash: hash, index: pod.Labels[query.LabelInstanceIdx]}
+}
+
+// servingRevision is the revision a pod serves under: its revision hash
+// when podReadyAndServing holds, else "".
+func servingRevision(pod *corev1.Pod) string {
+	hash := pod.Labels[query.LabelRevisionHash]
+	if hash == "" || !podReadyAndServing(pod) {
+		return ""
+	}
+	return hash
+}
+
+// reachableInstances is the set of Instances a routed pod of pods serves
+// under; the count builds it once, when the first serving worker shows.
+func reachableInstances(pods []*corev1.Pod) map[servingInstance]struct{} {
+	set := make(map[servingInstance]struct{})
+	for _, pod := range pods {
+		if !query.RoutedRunner(pod) {
+			continue
+		}
+		if hash := servingRevision(pod); hash != "" {
+			set[servingInstanceOf(pod, hash)] = struct{}{}
+		}
+	}
+	return set
+}
+
 // servingPodsByRevision counts, per revision hash, the pods that serve
 // traffic: podReadyAndServing holds and their Instance can be reached. A
 // routing Service publishes a gang's leader and never a worker
@@ -521,25 +555,29 @@ func podReadyAndServing(pod *corev1.Pod) bool {
 // This is the count the Instance rows publish (workloadstatus.CountServingPods).
 // A revision with no serving pod has no entry, so both traffic writers
 // withhold its share and the revisions that serve carry it.
+//
+// A routed pod that serves counts by itself. A worker that serves counts
+// when a routed pod of its Instance serves, read off the set of those
+// Instances, built once over the whole list when the first serving worker
+// shows: a fleet of single pods builds nothing per pod, a fleet of gangs one
+// entry per serving gang, whatever order the list comes in.
 func servingPodsByRevision(pods []*corev1.Pod) map[string]int32 {
-	type instance struct{ hash, index string }
-	serving := make(map[instance]int32)
-	routed := make(map[instance]bool)
+	out := make(map[string]int32, 4)
+	var reachable map[servingInstance]struct{}
 	for _, pod := range pods {
-		hash := pod.Labels[query.LabelRevisionHash]
-		if hash == "" || !podReadyAndServing(pod) {
+		hash := servingRevision(pod)
+		if hash == "" {
 			continue
 		}
-		key := instance{hash: hash, index: pod.Labels[query.LabelInstanceIdx]}
-		serving[key]++
 		if query.RoutedRunner(pod) {
-			routed[key] = true
+			out[hash]++
+			continue
 		}
-	}
-	out := make(map[string]int32, 4)
-	for key, n := range serving {
-		if routed[key] {
-			out[key.hash] += n
+		if reachable == nil {
+			reachable = reachableInstances(pods)
+		}
+		if _, ok := reachable[servingInstanceOf(pod, hash)]; ok {
+			out[hash]++
 		}
 	}
 	return out

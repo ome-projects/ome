@@ -311,11 +311,11 @@ type ComponentCounters struct {
 // and the row publishes Failed again once the pods it runs stop serving.
 // Pods on any other revision, a replacement crash-looping or serving
 // between two crashes, are not read.
-func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]int32, targetRevName string) ([]types.InstanceStatus, ComponentCounters, error) {
+func (o *ComponentObservation) TakeInlineV1Publication(plan types.ComponentPlan, targetRevName string) ([]types.InstanceStatus, ComponentCounters, error) {
 	var counters ComponentCounters
 	target := query.RevisionFromName(targetRevName)
 	statuses, err := o.takeInlineV1Statuses(func(row *types.InstanceStatus, current status.InstanceCounters) {
-		desired := status.DesiredFor(desiredByIdx, row.Index, current.PodCount)
+		desired := plan.DesiredPodsFor(row.Index, current.PodCount)
 		if status.InstanceMeetsThreshold(current.PodCount, current.ReadyPodCount, desired) {
 			counters.ReadyReplicas++
 		}
@@ -339,7 +339,7 @@ func (o *ComponentObservation) TakeInlineV1Publication(desiredByIdx map[int32]in
 	for i := range statuses {
 		row := &statuses[i]
 		pods := o.pods.PodsForInstance(row.Index)
-		desired := status.DesiredFor(desiredByIdx, row.Index, row.PodCount)
+		desired := plan.DesiredPodsFor(row.Index, row.PodCount)
 		switch {
 		case status.DemotableReady(row):
 			switch {

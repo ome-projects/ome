@@ -131,8 +131,8 @@ func Run(ctx context.Context, in PassInput) error {
 
 // escalationPass is what one run of the pass reads once: the inputs, the
 // pods of every Instance, the holds the hold pass recorded, the clock, the
-// planned pod count per Instance, the current revision's hash, the
-// deadline decision's inputs, and the buffer of plain Failed writes.
+// current revision's hash, the deadline decision's inputs, and the buffer
+// of plain Failed writes.
 type escalationPass struct {
 	deps  types.Deps
 	input types.ReconcileInput
@@ -145,8 +145,6 @@ type escalationPass struct {
 	excluded map[int32]struct{}
 	held     holds.Result
 	now      time.Time
-	// desiredByInstance is the planned pod count per Instance index.
-	desiredByInstance map[int32]int32
 	// currentRevisionHash is the hash of the Component's current revision;
 	// a pod labelled with another hash belongs to a roll left behind.
 	currentRevisionHash string
@@ -170,7 +168,6 @@ func newEscalationPass(in PassInput, podsByInstance map[int32][]*corev1.Pod) *es
 		excluded:            in.Excluded,
 		held:                in.Held,
 		now:                 input.Now(),
-		desiredByInstance:   status.DesiredPodCountByInstance(in.Plan),
 		currentRevisionHash: query.RevisionFromName(input.ObservedState.CurrentRevision).Hash(),
 		deadlineDeps:        deadlineDeps,
 		failedWrites:        &failureStampBuffer{input: input},
@@ -224,7 +221,7 @@ func (p *escalationPass) readRow(row types.InstanceStatus) rowEscalation {
 		row:               row,
 		reading:           evidenceFor(&p.input.ObservedState, p.podsByInstance, row.Index, p.now, p.input.StuckPodGrace, attemptRevision),
 		pods:              evidence.PodsForStuckCheck(row, p.podsByInstance),
-		desiredPods:       status.DesiredFor(p.desiredByInstance, row.Index, row.PodCount),
+		desiredPods:       p.plan.DesiredPodsFor(row.Index, row.PodCount),
 		gang:              types.GangReadingFor(p.input, row),
 		attemptRevision:   attemptRevision,
 		unschedulableHold: p.held.Holding(row.Index, types.WaitingReasonUnschedulable),
@@ -746,7 +743,7 @@ func repairSetGone(ctx context.Context, deps types.Deps, input types.ReconcileIn
 	}
 	now := input.Now()
 	for _, pod := range pods {
-		if pod.DeletionTimestamp == nil || now.After(pod.DeletionTimestamp.Time) {
+		if pod.DeletionTimestamp == nil || now.After(query.DeletionDeadline(pod, input.DesiredSpec.Lifecycle)) {
 			return false, nil
 		}
 	}

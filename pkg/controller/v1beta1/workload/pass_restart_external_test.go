@@ -342,7 +342,7 @@ type repairSnapshot struct {
 // snapshot copies each map and slice by hand, so a field added to the
 // harness must be added there too; this count is what makes the test
 // say so instead of sharing state between branches.
-const recoveryHarnessFields = 97
+const recoveryHarnessFields = 98
 
 func copyHarnessCollections(dst, src *recoveryHarness) {
 	dst.mutateErr = cloneMap(src.mutateErr)

@@ -1460,7 +1460,7 @@ func (p *updateSelectionPass) countExtraPodSurge() {
 		return
 	}
 	now := p.input.Now()
-	p.selection.ExtraPodSurge = escalation.ExtraPodSurgeInFlight(p.plan, p.input.ObservedState.InstanceStatuses, p.pods, p.selection.RolledNotServing, now)
+	p.selection.ExtraPodSurge = escalation.ExtraPodSurgeInFlight(p.plan, p.input.ObservedState.InstanceStatuses, p.pods, p.selection.RolledNotServing, p.input.DesiredSpec.Lifecycle, now)
 	if !p.selection.ExtraPodSurge.NextRelease.IsZero() && anyFreshStart(p.selection.Items) {
 		p.input.PassWake.Observe(p.selection.ExtraPodSurge.NextRelease.Sub(now))
 	}
@@ -1552,7 +1552,10 @@ func replacesUnservingPodSet(input types.ReconcileInput, row *types.InstanceStat
 // from that seriality because the drive has nothing left to do for it
 // but wait, and a wait on a kubelet that missed its own deadline has no
 // bound of its own — held at the head it would starve every later
-// request for as long as the pod stays. The pods are read from the
+// request for as long as the pod stays. The head moves on as soon as
+// every source pod's deletion time is behind the clock, with no wait;
+// only the record's own drive waits one requeue before it tells the
+// operator the pods stay. The pods are read from the
 // snapshot's cache view: a stale reading costs a pass either way, since
 // the parked record's own drive re-lists live pods and the head is
 // re-selected on the next reconcile. Nil when there is no work.
@@ -1567,7 +1570,7 @@ func planMigrationDrive(ctx context.Context, input types.ReconcileInput, snapsho
 					return nil, fmt.Errorf("workload.Plan: observe pods for migration dispatch: %w", err)
 				}
 			}
-			if evidence.AllPodsTerminatingOverdue(pods[record.SourceInstance], input.Now()) {
+			if evidence.AllPodsTerminatingOverdue(pods[record.SourceInstance], input.DesiredSpec.Lifecycle, input.Now()) {
 				selection.Parked = append(selection.Parked, record)
 				continue
 			}

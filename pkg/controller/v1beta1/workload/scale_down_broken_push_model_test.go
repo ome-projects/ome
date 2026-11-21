@@ -1096,8 +1096,8 @@ var brokenPushExpectedEnds = map[string]bool{
 // knownPartitionHoldsFailedInstance is the known picture of this model.
 const knownPartitionHoldsFailedInstance = "known-partition-holds-the-failed-instance-named-by-the-hold"
 
-// knownBrokenPushClasses are the finding classes this model shows on main
-// today, each with the picture behind it. A finding in a known class is
+// knownBrokenPushClasses are the finding classes this model shows on the
+// current engine, each with the picture behind it. A finding in a known class is
 // reported and does not fail the run; a change of behaviour removes its entry and the
 // lock test that holds the picture.
 var knownBrokenPushClasses = map[string]string{

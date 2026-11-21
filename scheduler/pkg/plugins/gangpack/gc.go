@@ -51,6 +51,7 @@ func (g *GangPack) gcAssignments() {
 		return
 	}
 	g.pruneTemplatesIncomplete()
+	g.releaseExpiredHolds()
 	for group, owner := range g.assignments.Owners() {
 		stale := !live[group]
 		// A live pod label only identifies namespace/name. Compare the immutable

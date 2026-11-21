@@ -55,7 +55,7 @@ var (
 // where the worker cluster's reconciler would (re)interpret them: the
 // placement selectors (candidate selection is the control plane's job), the
 // traffic-drain override (one shared cross-cluster routing decision), the
-// rollout operator-verbs (promote/rollback/repin/resume advance one shared
+// rollout operator-verbs (promote/rollback/repin/resume/force advance one shared
 // rollout, owned by the control plane — a copy on every candidate would each
 // consume the verb, and the source's still-live copy would re-derive it onto
 // the member on the next sync, replaying it forever), the cleanup release
@@ -78,6 +78,9 @@ var controlPlaneOnlyAnnotations = []string{
 	constants.RolloutRollbackAnnotation,
 	constants.RolloutRepinAnnotation,
 	constants.RolloutResumeAnnotation,
+	constants.RolloutForceModeAnnotation,
+	constants.RolloutForceRunAnnotation,
+	constants.RolloutForceReasonAnnotation,
 	constants.PlacementReleaseCleanupWaitAnnotation,
 	constants.RolloutPlanSourceAnnotation,
 }

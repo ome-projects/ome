@@ -1973,3 +1973,23 @@ func TestBuildPlan_SettledGangsUnderACanaryStepKeepTheirOwnWidth(t *testing.T) {
 }
 
 func intPtr32(v int32) *int32 { return &v }
+
+// TestPlanExcludingRestartSelections_KeepsThePlansOrder: the plan the create
+// pass gets beside a restart lists the Instances that are not restarting in
+// the plan's own order, ascending by index. ComponentPlan.InstanceAt looks
+// an entry up by that order.
+func TestPlanExcludingRestartSelections_KeepsThePlansOrder(t *testing.T) {
+	plan := types.ComponentPlan{}
+	for index := int32(0); index < 6; index++ {
+		plan.Instances = append(plan.Instances, types.InstancePlan{Index: index})
+	}
+	restarts := []RestartSelection{{Instance: plan.Instances[4]}, {Instance: plan.Instances[1]}}
+
+	var kept []int32
+	for _, instance := range planExcludingRestartSelections(plan, restarts).Instances {
+		kept = append(kept, instance.Index)
+	}
+	if diff := cmp.Diff([]int32{0, 2, 3, 5}, kept); diff != "" {
+		t.Fatalf("the Instances the filtered plan lists (-want +got):\n%s", diff)
+	}
+}

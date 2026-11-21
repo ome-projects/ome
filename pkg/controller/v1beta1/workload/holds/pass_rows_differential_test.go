@@ -2,11 +2,11 @@ package holds
 
 import (
 	"math/rand/v2"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -22,17 +22,22 @@ type copiedRow struct {
 // rowsForPlanCopied is the build RowsForPlan replaces, kept here as the
 // reference.
 func rowsForPlanCopied(plan types.ComponentPlan, statuses []types.InstanceStatus, excluded map[int32]struct{}) []copiedRow {
-	desiredByIdx := status.DesiredPodCountByInstance(plan)
+	desiredByIdx := make(map[int32]int32, len(plan.Instances))
 	planned := make(map[int32]*types.InstancePlan, len(plan.Instances))
 	for i := range plan.Instances {
+		desiredByIdx[plan.Instances[i].Index] = plan.Instances[i].TotalPods()
 		planned[plan.Instances[i].Index] = &plan.Instances[i]
 	}
 	rows := make([]copiedRow, 0, len(statuses))
 	for _, row := range statuses {
 		_, skip := excluded[row.Index]
+		desired := row.PodCount
+		if d, ok := desiredByIdx[row.Index]; ok {
+			desired = d
+		}
 		rows = append(rows, copiedRow{
 			Status:   row,
-			Desired:  status.DesiredFor(desiredByIdx, row.Index, row.PodCount),
+			Desired:  desired,
 			Instance: planned[row.Index],
 			Excluded: skip,
 		})
@@ -40,15 +45,17 @@ func rowsForPlanCopied(plan types.ComponentPlan, statuses []types.InstanceStatus
 	return rows
 }
 
-// randomComponent is one plan over sparse indexes, the observed rows in any
-// order with repeated indexes, rows the plan covers or not in any phase with
-// any pod count and an operation on some, and the rows the scale-down holds
-// out.
+// randomComponent is one plan over sparse indexes, each named once and in
+// ascending order as a plan lists them, the observed rows in any order with
+// repeated indexes, rows the plan covers or not in any phase with any pod
+// count and an operation on some, and the rows the scale-down holds out.
 func randomComponent(rng *rand.Rand) (types.ComponentPlan, []types.InstanceStatus, map[int32]struct{}) {
 	phases := []types.InstancePhase{types.InstancePhaseReady, types.InstancePhaseCreating, types.InstancePhaseUpdating, types.InstancePhaseDeleting, types.InstancePhaseFailed, types.InstancePhaseRestarting}
 	plan := types.ComponentPlan{}
-	for i, n := 0, rng.IntN(13); i < n; i++ {
-		plan.Instances = append(plan.Instances, types.InstancePlan{Index: int32(rng.IntN(16)), Runners: []types.RunnerPlan{{Name: types.RunnerLeader, Size: 1}, {Name: types.RunnerWorker, Size: int32(rng.IntN(8))}}})
+	indexes := rng.Perm(16)[:rng.IntN(13)]
+	slices.Sort(indexes)
+	for _, idx := range indexes {
+		plan.Instances = append(plan.Instances, types.InstancePlan{Index: int32(idx), Runners: []types.RunnerPlan{{Name: types.RunnerLeader, Size: 1}, {Name: types.RunnerWorker, Size: int32(rng.IntN(8))}}})
 	}
 	var statuses []types.InstanceStatus
 	excluded := map[int32]struct{}{}

@@ -913,6 +913,39 @@ func TestCheckPairing_ServingSurgeReplacementCountsForItsCohort(t *testing.T) {
 	}
 }
 
+// A second revision inside one protocol. One engine surges with none
+// allowed out of pairing, and one decoder is patched in place. The
+// engine's replacement serves pair-v2 on the first revision of that
+// protocol when the operator pushes a second revision of it. The roll
+// removes a replacement of a revision it has left, and the drain-time gate
+// lets it go. The start-time gate counts the same replacement as the
+// partner of the decoder's patch and admits the patch. With both done the
+// engine serves pair-v1 only and the decoder pair-v2 only, until a new
+// replacement is up. The checks below hold the answers the gates give in this state.
+func TestCheckPairing_AReplacementTheRollRemovesCountsAsAPartner(t *testing.T) {
+	isvc := pairingISVC("pair-v2")
+	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
+	engines := sizedPairingIR("prod", "llama", eng, []v1beta1.OMENativeInstanceStatus{
+		surgingRow("llama", eng, 0, "v1", "v2", workloadtypes.UpdateStepSurge, 2),
+	}, v1beta1.UpdateStrategySurgeThenDrain, 1, 0)
+	objs := append(threeCohortCRs("pair-v2"), engines,
+		sizedPairingIR("prod", "llama", dec, servingInstances("llama", dec, "v1"), v1beta1.UpdateStrategyInPlaceIfPossible, 1, 1),
+		drainPod("llama", eng, "llama-engine-0-default-0", "default", "pair-v1", true),
+		drainPod("llama", eng, "llama-engine-0-default-1", "default", "pair-v2", true),
+		drainPod("llama", dec, "llama-decoder-0-default-0", "default", "pair-v1", true))
+
+	allowed, gate, reason := drainGate(t, isvc, eng, []string{"llama-engine-0-default-1"}, objs...)
+	t.Logf("the replacement leaving: allowed=%v gate=%q %s", allowed, gate, reason)
+	if !allowed {
+		t.Errorf("the drain-time gate lets the replacement of the revision before go: gate=%q %s", gate, reason)
+	}
+	ok, reason := pairingGate(t, isvc, dec, objs...).CheckPairing("llama-decoder-v1", workloadtypes.UpdateStrategyInPlaceIfPossible, 0, 0)
+	t.Logf("the decoder's patch: allowed=%v %s", ok, reason)
+	if !ok {
+		t.Errorf("the start-time gate admits the decoder's patch on the strength of that replacement: %s", reason)
+	}
+}
+
 // The source of a surge in flight stays in rotation and keeps pairing. Two
 // surging engines, none allowed out of pairing, the first mid-surge from
 // proto-a to proto-b with both pods serving, the second still on proto-a;

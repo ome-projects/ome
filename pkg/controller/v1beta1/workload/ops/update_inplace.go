@@ -104,7 +104,8 @@ func newInPlaceRoll(deps workload.Deps, input workload.ReconcileInput, plan work
 // phases below run in order, from the top on every pass; the row and the
 // pods found decide how far a pass gets:
 //
-//	open the attempt; remove a pod in a terminal phase; load the template;
+//	open the attempt; remove a pod in a terminal phase; free a pod on a
+//	node that stopped reporting; load the template;
 //	relabel a pod already on the target template; take the pods out of
 //	rotation; wait for them to drain; re-read the pods; patch them onto
 //	the target; confirm the kubelet runs the new images; mark the pods
@@ -117,6 +118,7 @@ func inPlaceUpdate(ctx context.Context, deps workload.Deps, input workload.Recon
 	return runInPlacePhases(ctx, []inPlacePhase{
 		roll.openAttempt,
 		roll.removeTerminalPods,
+		roll.freePodsOnNodesThatStoppedReporting,
 		roll.loadTemplate,
 		roll.relabelPodsOnTargetTemplate,
 		roll.takePodsOutOfRotation,
@@ -158,18 +160,42 @@ func (r *inPlaceRoll) recreateWhenNoPodStands(ctx context.Context) (bool, error)
 // the write is a no-op. The Incarnation stays: only the pods' images and
 // metadata move. A row the update pass owns is mid-roll; a row in Updating
 // only because a held attempt's pods serve is not, and the patch over it
-// is a first pass.
+// is a first pass. The first pass is the one whose write takes the row
+// into the roll, so a pass whose copy is behind that write records no
+// second start. The pass ends here, with no event and no pod touched,
+// when a new attempt would open on a row that no longer reads as the
+// pass's copy of it does: the pass was overtaken, and its pod list may be
+// as old as its copy. It reports why as the roll's hold, so a roll that
+// stands still on an old copy says so.
 func (r *inPlaceRoll) openAttempt(ctx context.Context) (bool, error) {
-	wasNotUpdating := workload.Owner(r.input.ObservedState.Instance(r.inst.Index)) != workload.OwnerUpdate
-	if err := status.StampUpdatingInPlace(ctx, r.input, r.inst.Index, r.target.Name, r.plan.UpdateStrategy.Type, r.plan.InstanceReadyTimeout); err != nil {
+	read := r.input.ObservedState.Instance(r.inst.Index)
+	entry, err := status.StampUpdatingInPlace(ctx, r.input, r.inst.Index, r.target.Name, r.plan.UpdateStrategy.Type, r.plan.InstanceReadyTimeout, read)
+	if err != nil {
 		return false, fmt.Errorf("patch status Updating (instance=%d): %w", r.inst.Index, err)
 	}
-	if wasNotUpdating {
+	if !entry.Open {
+		r.input.DrainHolds.Observe(oldCopyHold(r.inst.Index, r.target.Name))
+		return false, nil
+	}
+	if entry.Began {
 		workload.RecordNormal(r.deps.Recorder, workload.EventTarget(r.input), workload.EventReasonInPlaceUpdateStarted,
 			"OMENative %s in-place update to revision %s",
 			workload.InstanceKey(r.input.Key.Component, r.inst.Index), r.target.Name)
 	}
 	return true, nil
+}
+
+// oldCopyHold is the hold the pass reports for an Instance it left as it
+// is because its copy of the Instance's row is older than the row. A start
+// the pass admitted keeps its budget slot, so no other Instance starts in
+// its place and the gate named is the budget.
+func oldCopyHold(idx int32, targetName string) workload.RolloutHold {
+	return workload.RolloutHold{
+		Gate: workload.RolloutHoldGateBudget,
+		Reason: fmt.Sprintf("update to %s waits at Instance %d: the controller's copy of the Instance's status is older than the cluster's, and the controller reads the status again before it goes on",
+			targetName, idx),
+		Target: targetName,
+	}
 }
 
 // removeTerminalPods deletes a pod in a terminal phase and ends the pass:
@@ -183,6 +209,45 @@ func (r *inPlaceRoll) removeTerminalPods(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("recycle terminal pod (instance=%d): %w", r.inst.Index, err)
 	}
 	return !recycling, nil
+}
+
+// freePodsOnNodesThatStoppedReporting applies the force-delete policy's
+// node-death rule to the pods the attempt would patch or wait on: a pod
+// whose node has read unreachable or NotReady for the policy's threshold
+// is removed with grace zero (forceDeleteOnNodeDeath), and the pass ends;
+// the next pass finds no pod and re-resolves the roll to recreate
+// (recreateWhenNoPodStands). No patch reaches such a pod's kubelet, so a
+// patch would wait on it for good. The node is screened through the
+// informer cache (NodeDeathScreened), as the repair screens it, and the
+// live Node decides. With no policy nothing is read; a node short of the
+// threshold leaves the pod to the patch, which the pass's cadence reads
+// again; a Node the cluster no longer holds is the missing-node sweep's
+// to confirm, not this phase's.
+func (r *inPlaceRoll) freePodsOnNodesThatStoppedReporting(ctx context.Context) (bool, error) {
+	if r.input.ForceDelete == nil {
+		return true, nil
+	}
+	removed := false
+	for _, pod := range r.pods {
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		screened := evidence.NodeDeathScreened(ctx, r.deps.NodeReaders(), pod, r.input.ForceDelete, r.input.Now())
+		if screened.Kind == evidence.NodeReadError {
+			return false, nodeReadFailure(pod, screened.NodeName, screened.NodeReadErr)
+		}
+		if !screened.Kind.Actionable() || screened.Kind == evidence.NodeGone {
+			continue
+		}
+		kind, _, err := forceDeleteOnNodeDeath(ctx, r.deps, r.input, pod, r.inst.Index)
+		if err != nil {
+			return false, fmt.Errorf("free pod %s on a node that stopped reporting (instance=%d): %w", pod.Name, r.inst.Index, err)
+		}
+		if kind.Actionable() {
+			removed = true
+		}
+	}
+	return !removed, nil
 }
 
 // loadTemplate reads what the patch moves a pod onto: the target

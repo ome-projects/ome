@@ -106,25 +106,27 @@ type crashNode struct {
 
 // crashMemory is what the model remembers to compare two passes: each
 // row's set number, the sets of the crashing revision seen per Instance
-// and the attempt each was built in, the policy's one free rebuild, and
-// how many events it has read.
+// and the attempt each was built in, the attempts that started before
+// their backoff was due, the policy's one free rebuild, and how many
+// events it has read.
 type crashMemory struct {
-	setNumbers   map[int32]int64
-	targets      map[int32]string
-	setsSeen     map[int32]map[int64]bool
-	setsInWindow map[string]int
-	freeUsed     map[int32]bool
-	eventsAt     int
-	crashRev     string
+	setNumbers    map[int32]int64
+	targets       map[int32]string
+	setsSeen      map[int32]map[int64]bool
+	setsInWindow  map[string]int
+	earlyAttempts map[string]bool
+	freeUsed      map[int32]bool
+	eventsAt      int
+	crashRev      string
 }
 
 func newCrashMemory() crashMemory {
-	return crashMemory{setNumbers: map[int32]int64{}, targets: map[int32]string{}, setsSeen: map[int32]map[int64]bool{}, setsInWindow: map[string]int{}, freeUsed: map[int32]bool{}}
+	return crashMemory{setNumbers: map[int32]int64{}, targets: map[int32]string{}, setsSeen: map[int32]map[int64]bool{}, setsInWindow: map[string]int{}, earlyAttempts: map[string]bool{}, freeUsed: map[int32]bool{}}
 }
 
 func (m crashMemory) clone() crashMemory {
 	out := crashMemory{setNumbers: cloneMap(m.setNumbers), targets: cloneMap(m.targets), setsSeen: map[int32]map[int64]bool{}, setsInWindow: cloneMap(m.setsInWindow),
-		freeUsed: cloneMap(m.freeUsed), eventsAt: m.eventsAt, crashRev: m.crashRev}
+		earlyAttempts: cloneMap(m.earlyAttempts), freeUsed: cloneMap(m.freeUsed), eventsAt: m.eventsAt, crashRev: m.crashRev}
 	for idx, sets := range m.setsSeen {
 		out.setsSeen[idx] = cloneMap(sets)
 	}
@@ -141,6 +143,9 @@ func (m crashMemory) clone() crashMemory {
 // the Instances are rebuilt again and again instead of the record holding
 // after its attempts
 // (TestCrashLoopRetries_ACrashCountedBesideARepairOpenedStartsTheNextAttemptEarly).
+// Every set of such an attempt is this class, before and after its due
+// time; the window count runs for every set all the same, so the class
+// only names which counted sets belong to an attempt that started early.
 // The other two known classes are pictures this model reports and does
 // not fail on.
 const (
@@ -165,7 +170,7 @@ func (w *crashLoopWorld) stalePass(n *crashNode, h *recoveryHarness, rows []work
 	}
 	deps := workloadtypes.Deps{Client: h.cachedClient(), APIReader: h.c, Expectations: workloadtypes.NewExpectations()}
 	if h.recorder != nil {
-		deps.Recorder = h.recorder
+		deps.Recorder = h.eventSink()
 	}
 	in := h.buildInput()
 	in.ObservedState.InstanceStatuses = cloneTestInstanceStatuses(rows)
@@ -343,13 +348,15 @@ func (w *crashLoopWorld) classifySet(n *crashNode, h *recoveryHarness, idx int32
 	}
 	switch block.State {
 	case workloadtypes.RetryBlockRetryInProgress:
-		if attemptStartedEarly(block, h.clk.Now()) {
-			n.found = append(n.found, repairFinding{class: knownEarlyAttempt,
-				message: fmt.Sprintf("Instance %d got set number %d inside attempt %d, in progress %s before its backoff is due", idx, inc, block.AttemptsStarted, block.NextRetryAt.Sub(h.clk.Now()).Round(time.Second))})
-			return
-		}
 		key := fmt.Sprintf("attempt-%d:%d", block.AttemptsStarted, idx)
 		n.mem.setsInWindow[key]++
+		if attemptStartedEarly(block, h.clk.Now()) {
+			n.mem.earlyAttempts[key] = true
+		}
+		if n.mem.earlyAttempts[key] {
+			n.found = append(n.found, repairFinding{class: knownEarlyAttempt, message: earlyAttemptMessage(idx, inc, block, h.clk.Now())})
+			return
+		}
 		if n.mem.setsInWindow[key] > 1 {
 			n.found = append(n.found, repairFinding{class: classSecondSetInAttempt,
 				message: fmt.Sprintf("Instance %d got a second set (number %d) inside attempt %d of the crashing revision's retry record", idx, inc, block.AttemptsStarted)})
@@ -362,6 +369,15 @@ func (w *crashLoopWorld) classifySet(n *crashNode, h *recoveryHarness, idx int32
 		n.found = append(n.found, repairFinding{class: classSetOutsideAttempt,
 			message: fmt.Sprintf("Instance %d got set number %d of the crashing revision while its retry record waits in backoff (%d attempts)", idx, inc, block.AttemptsStarted)})
 	}
+}
+
+// earlyAttemptMessage names a set of an attempt that started before its
+// backoff was due, with the time still left when there is some.
+func earlyAttemptMessage(idx int32, inc int64, block *workloadtypes.RetryBlock, now time.Time) string {
+	if block.NextRetryAt != nil && now.Before(block.NextRetryAt.Time) {
+		return fmt.Sprintf("Instance %d got set number %d inside attempt %d, in progress %s before its backoff is due", idx, inc, block.AttemptsStarted, block.NextRetryAt.Sub(now).Round(time.Second))
+	}
+	return fmt.Sprintf("Instance %d got set number %d inside attempt %d, which started before its backoff was due", idx, inc, block.AttemptsStarted)
 }
 
 // attemptStartedEarly reports whether the record's attempt in progress

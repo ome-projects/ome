@@ -24,6 +24,38 @@ type Args struct {
 	// unassigned (non-gang) whole-node pods. Defaults to true when unset, and only
 	// takes effect when a pool-wide TopologyKey is configured.
 	StandaloneDomainPacking *bool `json:"standaloneDomainPacking,omitempty"`
+	// Preemption lets a gang that fits no domain free one by evicting whole
+	// lower-priority gangs and pods there. Unset leaves preemption off.
+	Preemption *PreemptionArgs `json:"preemption,omitempty"`
+}
+
+// PreemptionArgs configures gang preemption.
+type PreemptionArgs struct {
+	// MaxInFlight caps how many gangs may wait at once for a domain that
+	// preemption is freeing. Required, and at least 1.
+	MaxInFlight *int32 `json:"maxInFlight,omitempty"`
+}
+
+// check reports a preemption setting that cannot be used.
+func (p *PreemptionArgs) check() error {
+	if p == nil {
+		return nil
+	}
+	if p.MaxInFlight == nil {
+		return fmt.Errorf("preemption.maxInFlight must be configured when preemption is set")
+	}
+	if *p.MaxInFlight < 1 {
+		return fmt.Errorf("preemption.maxInFlight must be at least 1")
+	}
+	return nil
+}
+
+// maxPreemptionsInFlight is the configured cap, or zero when preemption is off.
+func (a Args) maxPreemptionsInFlight() int {
+	if a.Preemption == nil || a.Preemption.MaxInFlight == nil {
+		return 0
+	}
+	return int(*a.Preemption.MaxInFlight)
 }
 
 // standaloneDomainPackingEnabled reports the effective toggle: on unless the
@@ -91,6 +123,9 @@ func decodeArgs(obj runtime.Object) (Args, error) {
 		if err := seconds.check(); err != nil {
 			return Args{}, err
 		}
+	}
+	if err := args.Preemption.check(); err != nil {
+		return Args{}, err
 	}
 	return args, nil
 }

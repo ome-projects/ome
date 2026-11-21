@@ -431,21 +431,26 @@ func (c *cluster) writeDetail(before, after client.Object) string {
 }
 
 // irSpecDetail renders the projected fields of an InferenceReplica spec,
-// as a diff when a prior object is given.
+// as a diff when a prior object is given. The two lifecycle fields an
+// operator edits by themselves, the update strategy's type and the restart
+// policy, are rendered in a diff alone: a created replica carries what the
+// scenario declares.
 func irSpecDetail(before, after *v1beta1.InferenceReplica) string {
 	fields := func(ir *v1beta1.InferenceReplica) map[string]string {
 		if ir == nil {
 			return nil
 		}
 		out := map[string]string{
-			"image":      "nil",
-			"replicas":   int32PtrValue(ir.Spec.Replicas),
-			"partition":  "nil",
-			"rollbackTo": "nil",
-			"paused":     fmt.Sprint(ir.Spec.Paused),
-			"parentGen":  orNil(ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]),
-			"excluded":   orNil(ir.Annotations[constants.RevisionExcludedAnnotationKeysAnnotationKey]),
-			"generation": fmt.Sprint(ir.Generation),
+			"image":         "nil",
+			"replicas":      int32PtrValue(ir.Spec.Replicas),
+			"partition":     "nil",
+			"rollbackTo":    "nil",
+			"paused":        fmt.Sprint(ir.Spec.Paused),
+			"strategy":      "nil",
+			"restartPolicy": "nil",
+			"parentGen":     orNil(ir.Annotations[constants.InferenceReplicaParentGenerationAnnotationKey]),
+			"excluded":      orNil(ir.Annotations[constants.RevisionExcludedAnnotationKeysAnnotationKey]),
+			"generation":    fmt.Sprint(ir.Generation),
 		}
 		if len(ir.Spec.Runners) > 0 && len(ir.Spec.Runners[0].Template.Spec.Containers) > 0 {
 			out["image"] = ir.Spec.Runners[0].Template.Spec.Containers[0].Image
@@ -456,15 +461,26 @@ func irSpecDetail(before, after *v1beta1.InferenceReplica) string {
 				out["rollbackTo"] = *ir.Spec.Pacing.RollbackToRevision
 			}
 		}
+		if lifecycle := ir.Spec.Lifecycle; lifecycle != nil {
+			if lifecycle.UpdateStrategy != nil && lifecycle.UpdateStrategy.Type != "" {
+				out["strategy"] = string(lifecycle.UpdateStrategy.Type)
+			}
+			if lifecycle.RestartPolicy != nil {
+				out["restartPolicy"] = string(*lifecycle.RestartPolicy)
+			}
+		}
 		return out
 	}
-	order := []string{"image", "replicas", "partition", "rollbackTo", "paused", "parentGen", "excluded", "generation"}
+	order := []string{"image", "replicas", "partition", "rollbackTo", "paused", "strategy", "restartPolicy", "parentGen", "excluded", "generation"}
+	diffOnly := map[string]bool{"strategy": true, "restartPolicy": true}
 	to := fields(after)
 	from := fields(before)
 	parts := make([]string, 0, len(order))
 	for _, key := range order {
 		if from == nil {
-			parts = append(parts, key+"="+to[key])
+			if !diffOnly[key] {
+				parts = append(parts, key+"="+to[key])
+			}
 			continue
 		}
 		if from[key] != to[key] {

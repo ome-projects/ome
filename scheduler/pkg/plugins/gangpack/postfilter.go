@@ -21,10 +21,13 @@ import (
 // A member vetoed in a domain new to its gang is activated here while another
 // domain is untried: the vetoing filters register no event for a retry that only
 // the plugin's failed-domain memory changes, and waiting siblings cannot plan for it.
+//
+// A gang that holds no assignment because no domain has room may preempt
+// lower-priority work instead, when preemption is configured (see preemption.go).
 func (g *GangPack) PostFilter(ctx context.Context, state framework.CycleState, pod *v1.Pod, _ framework.NodeToStatusReader) (*framework.PostFilterResult, *framework.Status) {
 	assignment := readAssignment(state)
 	if assignment == nil {
-		return nil, framework.NewStatus(framework.Unschedulable)
+		return g.preempt(ctx, state, pod)
 	}
 	if _, newDomain := g.releaseAttempt(assignment, pod, true); newDomain && !assignment.soleFit && g.handle != nil {
 		gangActivationTotal.WithLabelValues(activationTriggerDomainFailed).Inc()

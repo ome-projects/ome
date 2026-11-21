@@ -312,7 +312,7 @@ func (r *recreateRoll) createMissingMembers(ctx context.Context) (bool, error) {
 	if !r.expectationsSatisfied() {
 		return true, nil
 	}
-	if _, err := createMissingPods(ctx, r.deps, r.input, r.plan, r.rebuilt, r.inst.Index, missing, desiredTemplate(r.input, r.plan, query.RevisionOf(r.target))); err != nil {
+	if _, err := createMissingPods(ctx, r.deps, r.input, r.plan, r.rebuilt, r.inst.Index, missing, r.newPods, desiredTemplate(r.input, r.plan, query.RevisionOf(r.target))); err != nil {
 		if createRejectionHandled(err) {
 			return true, nil
 		}

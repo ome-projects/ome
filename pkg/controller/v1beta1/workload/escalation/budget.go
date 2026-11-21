@@ -211,13 +211,14 @@ func (e ExtraPodSurge) TerminatingSlots() int32 {
 
 // ExtraPodSurgeInFlight counts, in surge slots, the pods beyond an
 // Instance's own pod count that the API still lists: a Terminating pod
-// until its DeletionTimestamp (the request time plus the pod's grace),
+// until its query.DeletionDeadline (the request time plus the pod's
+// grace, and later for a worker a later delete gave a shorter grace),
 // after which it stops counting, and a live extra pod for as long as it
 // exists. Buckets another anchor charges — a surge step, the index it
 // pins, a rolled-not-serving row — are never charged again. A bucket the
 // plan does not own is charged for its Terminating pods only: its live
 // pods are the scale-down's to retire.
-func ExtraPodSurgeInFlight(plan types.ComponentPlan, statuses []types.InstanceStatus, byInstance map[int32][]*corev1.Pod, rolled []int32, now time.Time) ExtraPodSurge {
+func ExtraPodSurgeInFlight(plan types.ComponentPlan, statuses []types.InstanceStatus, byInstance map[int32][]*corev1.Pod, rolled []int32, lifecycle types.Lifecycle, now time.Time) ExtraPodSurge {
 	charged := make(map[int32]struct{}, len(statuses))
 	runningRevision := make(map[int32]query.RevisionID, len(statuses))
 	for i := range statuses {
@@ -254,30 +255,9 @@ func ExtraPodSurgeInFlight(plan types.ComponentPlan, statuses []types.InstanceSt
 		if _, skip := charged[idx]; skip {
 			continue
 		}
-		var listed, terminating int32
-		var terminatingNames []string
-		var live []*corev1.Pod
-		var release time.Time
-		for _, pod := range byInstance[idx] {
-			if pod == nil {
-				continue
-			}
-			if pod.DeletionTimestamp != nil {
-				deadline := pod.DeletionTimestamp.Time
-				if now.After(deadline) {
-					continue
-				}
-				terminating++
-				terminatingNames = append(terminatingNames, pod.Name)
-				if release.IsZero() || deadline.Before(release) {
-					release = deadline
-				}
-			} else {
-				live = append(live, pod)
-			}
-			listed++
-		}
-		extra := listed - share[idx]
+		pods := countListedPods(byInstance[idx], lifecycle, now)
+		terminating, terminatingNames, live, release := int32(len(pods.terminating)), pods.terminating, pods.live, pods.release
+		extra := pods.count - share[idx]
 		if extra <= 0 {
 			continue
 		}
@@ -301,6 +281,45 @@ func ExtraPodSurgeInFlight(plan types.ComponentPlan, statuses []types.InstanceSt
 			out.LiveSlotsByInstance[idx] = slotsOf(liveCounted)
 			out.Live = append(out.Live, liveExtraPodNames(live, runningRevision[idx], liveCounted)...)
 		}
+	}
+	return out
+}
+
+// listedPods is what the API lists for one Instance, as the surge budget
+// counts it.
+type listedPods struct {
+	// count is every pod that counts: the live ones, and the Terminating
+	// ones that are not past their deletion deadline.
+	count int32
+	// terminating names the Terminating pods counted, and release is the
+	// earliest of their deletion deadlines.
+	terminating []string
+	release     time.Time
+	// live are the pods nobody deleted.
+	live []*corev1.Pod
+}
+
+// countListedPods reads the pods the API lists for one Instance. A
+// Terminating pod counts until its query.DeletionDeadline and not after.
+func countListedPods(pods []*corev1.Pod, lifecycle types.Lifecycle, now time.Time) listedPods {
+	var out listedPods
+	for _, pod := range pods {
+		if pod == nil {
+			continue
+		}
+		if pod.DeletionTimestamp != nil {
+			deadline := query.DeletionDeadline(pod, lifecycle)
+			if now.After(deadline) {
+				continue
+			}
+			out.terminating = append(out.terminating, pod.Name)
+			if out.release.IsZero() || deadline.Before(out.release) {
+				out.release = deadline
+			}
+		} else {
+			out.live = append(out.live, pod)
+		}
+		out.count++
 	}
 	return out
 }

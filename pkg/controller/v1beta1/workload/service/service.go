@@ -1,6 +1,9 @@
 // Package service owns the per-Component headless Service that gives
-// every workload-managed pod a stable peer-DNS FQDN of the form
-// `<pod-name>.<owner>-<component>-headless.<namespace>.svc.<cluster-domain>`.
+// every workload-managed pod a peer-DNS FQDN of the form
+// `<hostname>.<owner>-<component>-headless.<namespace>.svc.<cluster-domain>`.
+// The hostname is the pod's spec.hostname: the pod name for a single-pod
+// Instance, and the pod name followed by a recreation count for a pod of
+// a multi-pod Instance (query.PodHostname).
 //
 // Functions take `types.PerComponentServiceSpec` rather than an owner
 // CRD object so the workload tree stays free of the owner-CRD typed
@@ -21,9 +24,11 @@ import (
 )
 
 // buildHeadlessService produces the per-Component headless Service that
-// gives every workload-managed pod a stable FQDN of the form
+// gives every workload-managed pod an FQDN of the form
 //
-//	<pod-name>.<spec.Name>.<spec.Namespace>.svc.<cluster-domain>
+//	<hostname>.<spec.Name>.<spec.Namespace>.svc.<cluster-domain>
+//
+// where the hostname is the pod's spec.hostname.
 //
 // Properties:
 //   - ClusterIP=None — no kube-proxy load-balancing; DNS lookups return
@@ -61,7 +66,7 @@ func buildHeadlessService(spec types.PerComponentServiceSpec) (*corev1.Service, 
 			Selector:                 spec.Selector,
 			// Ports omitted by design: this Service exists for DNS-based
 			// peer discovery, not for kube-proxy routing. Each runtime
-			// resolves <pod-name>.<this-service>... and dials whatever
+			// resolves <hostname>.<this-service>... and dials whatever
 			// port it cares about. Adding a placeholder port would imply
 			// load-balanceable endpoints, which is the opposite of what
 			// the headless contract is for.

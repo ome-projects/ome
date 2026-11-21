@@ -80,8 +80,20 @@ needs no scheduler support: OME renders it as a standard leader-pod
 `topologySpreadConstraint`, whose hard (`DoNotSchedule`) form the retained
 PodTopologySpread Filter enforces — a best-fit assignment the constraint vetoes is
 released by PostFilter, remembered, and re-planned into a compatible domain
-(covered by `test/integration/spread_tsc_test.go`). Still ahead:
-topology-aware preemption.
+(covered by `test/integration/spread_tsc_test.go`).
+
+Gang preemption is opt-in through the plugin's `preemption` argument (the
+chart's `scheduler.plugin.preemption`); without it the plugin never evicts. When
+it is on, a gang that fits no domain for lack of room may free one: `PostFilter`
+picks the domain whose most important evicted gang ranks lowest, reserves it for the
+waiting gang, and deletes every pod of each lower-priority gang there (never
+part of a gang), plus lower-priority pods in no gang. The choice is the pure
+function in `pkg/preemption`. The reservation keeps other pods out while the
+evicted pods shut down. After a scheduler restart the plugin counts pods still
+shutting down as leaving, so it reserves the same domain again without new
+evictions. `preemption.maxInFlight` caps how many gangs may wait at once for a
+freed domain. Covered by the `TestGangPreemption*` cases in
+`test/integration/gangpack_test.go`.
 
 ## Version policy
 

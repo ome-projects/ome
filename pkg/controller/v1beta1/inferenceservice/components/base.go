@@ -67,10 +67,14 @@ type BaseComponentFields struct {
 	// RollbackToRevision is the stable revision this Component's canary unit
 	// keeps a side on, threaded from ComponentInputs to the projector for the
 	// replica it creates. Empty when the unit keeps no stable side.
-	RollbackToRevision  string
-	CoordinatorFollower bool
-	CoordinatorTarget   *int32
-	FollowerReleased    bool
+	RollbackToRevision string
+	// UpdateStrategyOverride replaces the Component's update strategy on its
+	// replica while a canary force needs another one, threaded from
+	// ComponentInputs to the projector. nil leaves the Component's own.
+	UpdateStrategyOverride *v1beta1.UpdateStrategy
+	CoordinatorFollower    bool
+	CoordinatorTarget      *int32
+	FollowerReleased       bool
 }
 
 // newBaseComponentFields is the ONE place BaseComponentFields is
@@ -104,6 +108,7 @@ func newBaseComponentFields(deps *ComponentDeps, in ComponentInputs, loggerName 
 		PolicyResolver:            in.PolicyResolver,
 		PacingPartition:           in.PacingPartition,
 		RollbackToRevision:        in.RollbackToRevision,
+		UpdateStrategyOverride:    in.UpdateStrategyOverride,
 		CoordinatorFollower:       in.CoordinatorFollower,
 		CoordinatorTarget:         in.CoordinatorTarget,
 		FollowerReleased:          in.FollowerReleased,

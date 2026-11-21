@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
@@ -11,7 +12,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/service"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/fieldequal"
 )
 
 // prefixFor is the name prefix of the replica serving role c: the service
@@ -510,37 +511,119 @@ func createServiceIfAbsent(ctx context.Context, c client.Client, w perRevisionSe
 	return nil
 }
 
-// ensureService creates the Service or patches an existing one back to the
-// desired shape. The ClusterIP and the type are set only at create: a
-// headless Service's ClusterIP is None and immutable after, so the patch
-// never tries to change it.
+// perRevisionServiceFields are the fields of a per-revision Service its
+// writer owns and sets on every pass. Everything else on the object (the
+// annotations, the cluster IP, the type after the create, the apiserver's
+// defaults, the status) belongs to whoever set it and survives a write.
+type perRevisionServiceFields struct {
+	Labels                   map[string]string
+	OwnerReferences          []metav1.OwnerReference
+	Selector                 map[string]string
+	Ports                    []corev1.ServicePort
+	PublishNotReadyAddresses bool
+}
+
+// perRevisionServiceFieldsOf reads the owned fields off a rendered or a
+// stored Service.
+func perRevisionServiceFieldsOf(svc *corev1.Service) perRevisionServiceFields {
+	return perRevisionServiceFields{
+		Labels:                   svc.Labels,
+		OwnerReferences:          svc.OwnerReferences,
+		Selector:                 svc.Spec.Selector,
+		Ports:                    svc.Spec.Ports,
+		PublishNotReadyAddresses: svc.Spec.PublishNotReadyAddresses,
+	}
+}
+
+// equal reads the five owned fields one by one under the rule of the
+// apiserver's semantic compare: a nil map or list equals an empty one, and
+// an app protocol set on one side alone is a difference. The writer asks it
+// for every Service of every live revision on every pass, so it reads the
+// fields directly rather than through a reflection walk over the whole
+// object.
+func (f perRevisionServiceFields) equal(other perRevisionServiceFields) bool {
+	return maps.Equal(f.Labels, other.Labels) &&
+		fieldequal.OwnerReferences(f.OwnerReferences, other.OwnerReferences) &&
+		maps.Equal(f.Selector, other.Selector) &&
+		servicePortsEqual(f.Ports, other.Ports) &&
+		f.PublishNotReadyAddresses == other.PublishNotReadyAddresses
+}
+
+// applyTo writes the owned fields onto a Service and leaves the rest as it
+// is.
+func (f perRevisionServiceFields) applyTo(svc *corev1.Service) {
+	svc.Labels = f.Labels
+	svc.OwnerReferences = f.OwnerReferences
+	svc.Spec.Selector = f.Selector
+	svc.Spec.Ports = f.Ports
+	svc.Spec.PublishNotReadyAddresses = f.PublishNotReadyAddresses
+}
+
+// servicePortsEqual reads two port lists in order, every field of each
+// port; a nil list and an empty one are the same.
+func servicePortsEqual(a, b []corev1.ServicePort) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !servicePortEqual(&a[i], &b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// servicePortEqual reads every field of a port, the target port by its
+// kind and both of its values. A field added to the type is read here too:
+// the compare's contract test changes every leaf of a port one at a time
+// and fails on a field this function skips.
+func servicePortEqual(a, b *corev1.ServicePort) bool {
+	return a.Name == b.Name &&
+		a.Protocol == b.Protocol &&
+		fieldequal.Pointers(a.AppProtocol, b.AppProtocol) &&
+		a.Port == b.Port &&
+		a.TargetPort == b.TargetPort &&
+		a.NodePort == b.NodePort
+}
+
+// ensureService reads the Service from the cache and writes only when an
+// owned field differs from the rendered one: a missing Service is created,
+// a drifted one is updated as read with the owned fields replaced. The type
+// and the cluster IP are set at create alone: a headless Service's
+// ClusterIP is None and immutable after, so an update never touches it.
 func ensureService(ctx context.Context, c client.Client, w perRevisionServiceWrite) error {
 	desired, err := w.desired()
 	if err != nil {
 		return fmt.Errorf("build per-revision service %s: %w", w.name, err)
 	}
+	owned := perRevisionServiceFieldsOf(desired)
 	target := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      desired.Name,
 			Namespace: desired.Namespace,
 		},
 	}
-	_, err = controllerutil.CreateOrUpdate(ctx, c, target, func() error {
-		if target.CreationTimestamp.IsZero() {
-			if w.headless {
-				target.Spec.ClusterIP = corev1.ClusterIPNone
-			}
-			target.Spec.Type = desired.Spec.Type
+	err = c.Get(ctx, client.ObjectKeyFromObject(target), target)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("get per-revision service %s/%s: %w", target.Namespace, target.Name, err)
+	}
+	if err == nil {
+		if owned.equal(perRevisionServiceFieldsOf(target)) {
+			return nil
 		}
-		target.Spec.PublishNotReadyAddresses = desired.Spec.PublishNotReadyAddresses
-		target.Spec.Selector = desired.Spec.Selector
-		target.Spec.Ports = desired.Spec.Ports
-		target.Labels = desired.Labels
-		target.OwnerReferences = desired.OwnerReferences
+		owned.applyTo(target)
+		if err := c.Update(ctx, target); err != nil {
+			return fmt.Errorf("update per-revision service %s/%s: %w", target.Namespace, target.Name, err)
+		}
 		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("CreateOrUpdate per-revision service %s/%s: %w", target.Namespace, target.Name, err)
+	}
+	if w.headless {
+		target.Spec.ClusterIP = corev1.ClusterIPNone
+	}
+	target.Spec.Type = desired.Spec.Type
+	owned.applyTo(target)
+	if err := c.Create(ctx, target); err != nil {
+		return fmt.Errorf("create per-revision service %s/%s: %w", target.Namespace, target.Name, err)
 	}
 	return nil
 }

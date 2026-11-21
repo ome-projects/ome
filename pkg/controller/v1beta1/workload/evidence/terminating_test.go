@@ -8,17 +8,23 @@ package evidence
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	ometesting "sigs.k8s.io/ome/pkg/utils/testing"
 )
 
 // TestAttemptSuspectNode: the suspect node is read off the attempt's own
@@ -128,7 +134,7 @@ func tReaders(r client.Reader) types.NodeReaders {
 
 // tClassify classifies one Terminating pod through readers at tNow.
 func tClassify(readers types.NodeReaders, pod *corev1.Pod, policy *types.ForceDeletePolicy) TerminatingResult {
-	return StuckTerminating(context.Background(), readers, pod, policy, tNow)
+	return StuckTerminating(context.Background(), readers, pod, policy, types.Lifecycle{}, tNow)
 }
 
 // tNodeReads counts the Node reads made through the reader it wraps, and
@@ -413,8 +419,50 @@ func TestAllPodsTerminatingOverdue(t *testing.T) {
 		{name: "a nil entry", pods: []*corev1.Pod{overdue, nil}, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := AllPodsTerminatingOverdue(tc.pods, tNow); got != tc.want {
+			if got := AllPodsTerminatingOverdue(tc.pods, types.Lifecycle{}, tNow); got != tc.want {
 				t.Fatalf("AllPodsTerminatingOverdue = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAllPodsTerminatingOverdueFor: a teardown reads as one nothing has
+// removed only when every pod in it has stood past its deletion time for
+// the whole wait. A pod read a moment after its deletion time moved is
+// not one yet. A wait of zero asks only for a deletion time behind the
+// clock.
+func TestAllPodsTerminatingOverdueFor(t *testing.T) {
+	const wait = 5 * time.Second
+	aMomentPast := tTerminatingPod("node-a", tNow.Add(-500*time.Millisecond))
+	shortOfTheWait := tTerminatingPod("node-a", tNow.Add(-wait+time.Millisecond))
+	theWaitPast := tTerminatingPod("node-a", tNow.Add(-wait))
+	minutesPast := tTerminatingPod("node-a", tNow.Add(-10*time.Minute))
+	inGrace := tTerminatingPod("node-a", tNow.Add(time.Minute))
+	atItsTime := tTerminatingPod("node-a", tNow)
+	running := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "running"}, Spec: corev1.PodSpec{NodeName: "node-a"}}
+	for _, tc := range []struct {
+		name string
+		pods []*corev1.Pod
+		wait time.Duration
+		want bool
+	}{
+		{name: "no pods", pods: nil, wait: wait, want: false},
+		{name: "a pod a moment past its deletion time", pods: []*corev1.Pod{aMomentPast}, wait: wait, want: false},
+		{name: "a pod one millisecond short of the wait", pods: []*corev1.Pod{shortOfTheWait}, wait: wait, want: false},
+		{name: "a pod past its deletion time by exactly the wait", pods: []*corev1.Pod{theWaitPast}, wait: wait, want: true},
+		{name: "a pod minutes past its deletion time", pods: []*corev1.Pod{minutesPast}, wait: wait, want: true},
+		{name: "every pod past the wait", pods: []*corev1.Pod{theWaitPast, minutesPast}, wait: wait, want: true},
+		{name: "one pod of two short of the wait", pods: []*corev1.Pod{minutesPast, shortOfTheWait}, wait: wait, want: false},
+		{name: "a pod inside its grace", pods: []*corev1.Pod{minutesPast, inGrace}, wait: wait, want: false},
+		{name: "a pod exactly at its deletion time", pods: []*corev1.Pod{atItsTime}, wait: wait, want: false},
+		{name: "a pod not Terminating", pods: []*corev1.Pod{minutesPast, running}, wait: wait, want: false},
+		{name: "a nil entry", pods: []*corev1.Pod{minutesPast, nil}, wait: wait, want: false},
+		{name: "no wait, a pod a moment past its deletion time", pods: []*corev1.Pod{aMomentPast}, wait: 0, want: true},
+		{name: "no wait, a pod exactly at its deletion time", pods: []*corev1.Pod{atItsTime}, wait: 0, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AllPodsTerminatingOverdueFor(tc.pods, types.Lifecycle{}, tNow, tc.wait); got != tc.want {
+				t.Fatalf("AllPodsTerminatingOverdueFor = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -579,7 +627,7 @@ func TestReadSilentPod(t *testing.T) {
 		{"terminating, overdue, the cache still shows a recovered node unreachable", quiet(corev1.PodUnknown, "recovered", &overdue), &skip, NodeHealthy, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := ReadUnreportedPod(context.Background(), readers, tc.pod, tc.policy, tNow)
+			got, err := ReadUnreportedPod(context.Background(), readers, tc.pod, tc.policy, types.Lifecycle{}, tNow)
 			if err != nil {
 				t.Fatalf("ReadUnreportedPod: %v", err)
 			}
@@ -836,6 +884,362 @@ func TestNodeDeathScreened(t *testing.T) {
 			}
 			if (got.NodeReadErr != nil) != (tc.cacheErr != nil) {
 				t.Errorf("NodeReadErr = %v, want one exactly when the cache fails (%v)", got.NodeReadErr, tc.cacheErr)
+			}
+		})
+	}
+}
+
+// The pod of the test below is the old pod of a move. OME deletes it with
+// the grace its template names, the kubelet stops it and frees what it
+// held, and the kubelet then removes it.
+const (
+	// oldPodGrace is the time the pod template gives a pod to stop.
+	oldPodGrace = 60 * time.Second
+	// oldPodStopsIn is how long the kubelet takes to stop the pod and
+	// clean up after it.
+	oldPodStopsIn = 2 * time.Second
+	// oldPodAnswerWait bounds every wait on the API server.
+	oldPodAnswerWait = time.Minute
+	// oldPodHolder is a finalizer another controller put on the pod.
+	oldPodHolder = "example.com/hold"
+	// oldPodRequeue is the operation requeue the chart sets: how long a
+	// pod stands past its deletion time before OME says it stays.
+	oldPodRequeue = 5 * time.Second
+)
+
+// TestAllPodsTerminatingOverdue_ReadsAPodBetweenTheTwoWritesOfItsLastDelete
+// asks a real API server what a pod looks like at the end of a healthy
+// teardown.
+//
+// A kubelet ends every teardown with one more delete call, with a grace
+// of zero and the pod's UID. The API server answers that call in two
+// writes. The first moves the pod's deletion time from 60 seconds ahead
+// to the present second and sets the grace to zero. The second removes
+// the pod. A watcher sees both writes. A pod that a finalizer holds
+// stays in the state the first write left.
+//
+// So a pod that used 2 of its 60 seconds reads, for a moment, as a pod
+// whose deletion time is behind the clock, and AllPodsTerminatingOverdue
+// reports it. AllPodsTerminatingOverdueFor, asked whether the pod has
+// stood there for a requeue, does not.
+//
+// The test needs the control plane binaries KUBEBUILDER_ASSETS names and
+// is skipped without them.
+func TestAllPodsTerminatingOverdue_ReadsAPodBetweenTheTwoWritesOfItsLastDelete(t *testing.T) {
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" {
+		t.Skip("KUBEBUILDER_ASSETS is unset: export KUBEBUILDER_ASSETS=\"$(bin/setup-envtest use <kubernetes-version> -p path)\"")
+	}
+	_, cfg := ometesting.StartOnBusyHost(t, func() *envtest.Environment { return &envtest.Environment{} })
+	api, err := client.NewWithWatch(cfg, client.Options{})
+	if err != nil {
+		t.Fatalf("build the client: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*oldPodAnswerWait)
+	defer cancel()
+
+	t.Run("a watcher sees the deletion time move before the pod is gone", func(t *testing.T) {
+		pod := createBoundPod(ctx, t, api, "old-pod-leaving")
+		events, err := api.Watch(ctx, &corev1.PodList{}, client.InNamespace(pod.Namespace), client.MatchingFields{"metadata.name": pod.Name})
+		if err != nil {
+			t.Fatalf("watch the pod: %v", err)
+		}
+		defer events.Stop()
+		asked := deleteAsTheEngineDoes(ctx, t, api, pod)
+		time.Sleep(oldPodStopsIn)
+		sendTheKubeletsLastDelete(ctx, t, api, pod)
+
+		rewritten := podBetweenTheTwoWrites(t, events)
+		requireDeletionTimeBehindTheClock(t, rewritten, asked)
+	})
+
+	t.Run("a pod that a finalizer holds stays as the first write left it", func(t *testing.T) {
+		pod := createBoundPod(ctx, t, api, "old-pod-held", oldPodHolder)
+		asked := deleteAsTheEngineDoes(ctx, t, api, pod)
+		time.Sleep(oldPodStopsIn)
+		sendTheKubeletsLastDelete(ctx, t, api, pod)
+
+		held := &corev1.Pod{}
+		if err := api.Get(ctx, client.ObjectKeyFromObject(pod), held); err != nil {
+			t.Fatalf("the finalizer keeps the pod after the last delete: %v", err)
+		}
+		requireDeletionTimeBehindTheClock(t, held, asked)
+
+		held.Finalizers = nil
+		if err := api.Update(ctx, held); err != nil {
+			t.Fatalf("release the finalizer: %v", err)
+		}
+		if err := api.Get(ctx, client.ObjectKeyFromObject(pod), &corev1.Pod{}); !apierrors.IsNotFound(err) {
+			t.Fatalf("the pod leaves with its finalizer: got %v, want not found", err)
+		}
+	})
+}
+
+// createBoundPod creates a pod bound to a node, with the template's grace
+// and the finalizers named. No kubelet runs it: the test plays the
+// kubelet's calls itself.
+func createBoundPod(ctx context.Context, t *testing.T, api client.Client, name string, finalizers ...string) *corev1.Pod {
+	t.Helper()
+	grace := int64(oldPodGrace / time.Second)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: metav1.NamespaceDefault, Name: name, Finalizers: finalizers},
+		Spec: corev1.PodSpec{
+			NodeName:                      "node-a",
+			TerminationGracePeriodSeconds: &grace,
+			Containers:                    []corev1.Container{{Name: "main", Image: "registry.example.com/runtime:v1"}},
+		},
+	}
+	if err := api.Create(ctx, pod); err != nil {
+		t.Fatalf("create pod %s: %v", name, err)
+	}
+	return pod
+}
+
+// deleteAsTheEngineDoes deletes the pod with no grace of its own, as the
+// move deletes its old pod, and reports when it asked. The API server
+// answers with the pod's own grace: the deletion time stands a whole
+// grace ahead, and the engine reads the pod as inside it.
+func deleteAsTheEngineDoes(ctx context.Context, t *testing.T, api client.Client, pod *corev1.Pod) time.Time {
+	t.Helper()
+	asked := time.Now()
+	if err := api.Delete(ctx, pod); err != nil {
+		t.Fatalf("delete pod %s: %v", pod.Name, err)
+	}
+	leaving := &corev1.Pod{}
+	if err := api.Get(ctx, client.ObjectKeyFromObject(pod), leaving); err != nil {
+		t.Fatalf("read pod %s after its delete: %v", pod.Name, err)
+	}
+	if leaving.DeletionTimestamp == nil || leaving.DeletionGracePeriodSeconds == nil {
+		t.Fatalf("a deleted pod carries a deletion time and a grace; got %v and %v", leaving.DeletionTimestamp, leaving.DeletionGracePeriodSeconds)
+	}
+	if got := time.Duration(*leaving.DeletionGracePeriodSeconds) * time.Second; got != oldPodGrace {
+		t.Fatalf("the first delete keeps the pod's own grace: got %s, want %s", got, oldPodGrace)
+	}
+	if ahead := leaving.DeletionTimestamp.Sub(asked); ahead < oldPodGrace-2*time.Second || ahead > oldPodGrace+2*time.Second {
+		t.Fatalf("the first delete sets the deletion time one grace ahead: it stands %s after the request, want about %s", ahead, oldPodGrace)
+	}
+	if AllPodsTerminatingOverdue([]*corev1.Pod{leaving}, types.Lifecycle{}, time.Now()) {
+		t.Fatalf("a pod inside its grace is not overdue; deletion time %s", leaving.DeletionTimestamp)
+	}
+	t.Logf("delete asked at %s: deletion time %s, grace %ds", asked.Format(time.RFC3339Nano), leaving.DeletionTimestamp.Format(time.RFC3339), *leaving.DeletionGracePeriodSeconds)
+	return asked
+}
+
+// sendTheKubeletsLastDelete sends what a kubelet sends once the pod has
+// stopped and its resources are freed: a delete with a grace of zero that
+// names the pod's UID.
+func sendTheKubeletsLastDelete(ctx context.Context, t *testing.T, api client.Client, pod *corev1.Pod) {
+	t.Helper()
+	uid := pod.UID
+	if err := api.Delete(ctx, pod, client.GracePeriodSeconds(0), client.Preconditions{UID: &uid}); err != nil {
+		t.Fatalf("the last delete of pod %s: %v", pod.Name, err)
+	}
+	t.Logf("last delete sent at %s", time.Now().Format(time.RFC3339Nano))
+}
+
+// podBetweenTheTwoWrites reads the watch until the pod is gone and
+// returns the pod as the write before the removal left it: still there,
+// with a grace of zero.
+func podBetweenTheTwoWrites(t *testing.T, events watch.Interface) *corev1.Pod {
+	t.Helper()
+	var rewritten *corev1.Pod
+	timeout := time.After(oldPodAnswerWait)
+	for {
+		select {
+		case event, open := <-events.ResultChan():
+			if !open {
+				t.Fatalf("the watch closed before the pod was gone")
+			}
+			pod, isPod := event.Object.(*corev1.Pod)
+			if !isPod {
+				t.Fatalf("the watch sent %T, want a pod", event.Object)
+			}
+			t.Logf("watch %s: %s", event.Type, deletionOf(pod))
+			if event.Type == watch.Modified && pod.DeletionGracePeriodSeconds != nil && *pod.DeletionGracePeriodSeconds == 0 {
+				rewritten = pod
+			}
+			if event.Type != watch.Deleted {
+				continue
+			}
+			if rewritten == nil {
+				t.Fatalf("the pod was removed with no write before it that set the grace to zero: the last delete was one write")
+			}
+			return rewritten
+		case <-timeout:
+			t.Fatalf("the pod was not removed within %s of its last delete", oldPodAnswerWait)
+		}
+	}
+}
+
+// deletionOf writes a pod's deletion time and grace for the test log.
+func deletionOf(pod *corev1.Pod) string {
+	if pod.DeletionTimestamp == nil || pod.DeletionGracePeriodSeconds == nil {
+		return "not deleted"
+	}
+	return fmt.Sprintf("deletion time %s, grace %ds", pod.DeletionTimestamp.Format(time.RFC3339), *pod.DeletionGracePeriodSeconds)
+}
+
+// requireDeletionTimeBehindTheClock fails unless the pod stands as the
+// first write of the last delete leaves it: a grace of zero, and a
+// deletion time no earlier than the second the engine asked and no later
+// than now. The engine's reading then takes a pod that used 2 of its 60
+// seconds for a pod past its deletion time, and not for one that has
+// stood past it for a requeue.
+func requireDeletionTimeBehindTheClock(t *testing.T, pod *corev1.Pod, asked time.Time) {
+	t.Helper()
+	now := time.Now()
+	if pod.DeletionTimestamp == nil || pod.DeletionGracePeriodSeconds == nil || *pod.DeletionGracePeriodSeconds != 0 {
+		t.Fatalf("the last delete leaves a deletion time and a grace of zero; got %v and %v", pod.DeletionTimestamp, pod.DeletionGracePeriodSeconds)
+	}
+	deletion := pod.DeletionTimestamp.Time
+	if deletion.Before(asked.Truncate(time.Second)) || deletion.After(now) {
+		t.Fatalf("the deletion time moved to %s: want it between the first request at %s and now, %s",
+			deletion.Format(time.RFC3339), asked.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	}
+	t.Logf("read at %s: deletion time %s, %s behind the clock, %s after the first request",
+		now.Format(time.RFC3339Nano), deletion.Format(time.RFC3339), now.Sub(deletion).Round(time.Millisecond), deletion.Sub(asked.Truncate(time.Second)))
+	if !AllPodsTerminatingOverdue([]*corev1.Pod{pod}, types.Lifecycle{}, now) {
+		t.Fatalf("the engine's reading takes the pod for one past its deletion time; deletion time %s, read at %s",
+			deletion.Format(time.RFC3339), now.Format(time.RFC3339Nano))
+	}
+	if AllPodsTerminatingOverdueFor([]*corev1.Pod{pod}, types.Lifecycle{}, now, oldPodRequeue) {
+		t.Fatalf("a pod read %s after its deletion time moved has not stood past it for a requeue of %s",
+			now.Sub(deletion).Round(time.Millisecond), oldPodRequeue)
+	}
+}
+
+// tLeaderGoneLifecycle is a replica's lifecycle with leaderGoneGracePeriod
+// at grace, and with the field unset when grace is zero.
+func tLeaderGoneLifecycle(grace time.Duration) types.Lifecycle {
+	if grace == 0 {
+		return types.Lifecycle{}
+	}
+	return types.Lifecycle{LeaderGoneGracePeriod: &metav1.Duration{Duration: grace}}
+}
+
+// tShortenedWorker is a Terminating worker on node-a that shows 30 s of the
+// 480 s its spec carries, the grace a delete after its first one named. Its
+// deletion time is deletionTime.
+func tShortenedWorker(deletionTime time.Time) *corev1.Pod {
+	own, shown := int64(480), int64(30)
+	pod := tTerminatingPod("node-a", deletionTime)
+	pod.Labels = map[string]string{query.LabelRunner: types.RunnerWorker}
+	pod.Spec.TerminationGracePeriodSeconds = &own
+	pod.DeletionGracePeriodSeconds = &shown
+	return pod
+}
+
+// TestAllPodsTerminatingOverdue_AShortenedWorkerIsReadOnItsKubeletsCount: a
+// worker shows 30 s of its 480 s. With lifecycle.leaderGoneGracePeriod at
+// 30 s it does not read as past its time until 30 s after the deletion time
+// the API server shows, and the wait of the second reading counts from
+// there. With the field unset both readings count from the deletion time.
+func TestAllPodsTerminatingOverdue_AShortenedWorkerIsReadOnItsKubeletsCount(t *testing.T) {
+	const wait = 5 * time.Second
+	cases := []struct {
+		name string
+		// past is how long ago the worker's deletion time was.
+		past       time.Duration
+		field      time.Duration
+		want       bool
+		wantWaited bool
+	}{
+		{name: "the field unset, 5 s past the deletion time", past: 5 * time.Second, want: true, wantWaited: true},
+		{name: "the field at 30 s, 5 s past the deletion time", past: 5 * time.Second, field: 30 * time.Second},
+		{name: "the field at 30 s, 30 s past the deletion time", past: 30 * time.Second, field: 30 * time.Second},
+		{name: "the field at 30 s, 31 s past the deletion time", past: 31 * time.Second, field: 30 * time.Second, want: true},
+		{name: "the field at 30 s, 35 s past the deletion time", past: 35 * time.Second, field: 30 * time.Second, want: true, wantWaited: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pods := []*corev1.Pod{tShortenedWorker(tNow.Add(-tc.past))}
+			lifecycle := tLeaderGoneLifecycle(tc.field)
+			if got := AllPodsTerminatingOverdue(pods, lifecycle, tNow); got != tc.want {
+				t.Errorf("AllPodsTerminatingOverdue = %v, want %v", got, tc.want)
+			}
+			if got := AllPodsTerminatingOverdueFor(pods, lifecycle, tNow, wait); got != tc.wantWaited {
+				t.Errorf("AllPodsTerminatingOverdueFor with a wait of %s = %v, want %v", wait, got, tc.wantWaited)
+			}
+		})
+	}
+}
+
+// TestForceDeleteReading_AShortenedWorkerIsReadOnItsKubeletsCount: a worker
+// shows 30 s of its 480 s and stands 20 s past the deletion time the API
+// server shows, on a node whose object is gone. The policy's slack is 10 s.
+// With lifecycle.leaderGoneGracePeriod unset the pod is past the slack and
+// the missing node decides. With the field at 30 s the pod is inside its
+// grace until 40 s after that deletion time, and the reading names that
+// instant for the next look. ReadUnreportedPod reads the same.
+func TestForceDeleteReading_AShortenedWorkerIsReadOnItsKubeletsCount(t *testing.T) {
+	policy := &types.ForceDeletePolicy{OverdueSlack: 10 * time.Second, NodeUnreachableThreshold: time.Minute}
+	deletionTime := tNow.Add(-20 * time.Second)
+	pod := tShortenedWorker(deletionTime)
+	readers := tReaders(tReader(t))
+
+	unset := StuckTerminating(context.Background(), readers, pod, policy, types.Lifecycle{}, tNow)
+	if unset.Kind != NodeGone {
+		t.Fatalf("with the field unset the reading is %s, want %s", unset.Kind, NodeGone)
+	}
+	set := StuckTerminating(context.Background(), readers, pod, policy, tLeaderGoneLifecycle(30*time.Second), tNow)
+	if set.Kind != WithinGrace {
+		t.Fatalf("with the field at 30 s the reading is %s, want %s", set.Kind, WithinGrace)
+	}
+	if want := deletionTime.Add(40*time.Second + time.Nanosecond); !set.RequeueAt.Equal(want) {
+		t.Fatalf("the next look is %s after the deletion time, want %s", set.RequeueAt.Sub(deletionTime), want.Sub(deletionTime))
+	}
+
+	for _, tc := range []struct {
+		name      string
+		lifecycle types.Lifecycle
+		want      TerminatingClass
+	}{
+		{name: "the field unset", want: NodeGone},
+		{name: "the field at 30 s", lifecycle: tLeaderGoneLifecycle(30 * time.Second), want: WithinGrace},
+	} {
+		got, err := ReadUnreportedPod(context.Background(), readers, pod, policy, tc.lifecycle, tNow)
+		if err != nil || got != tc.want {
+			t.Errorf("ReadUnreportedPod with %s = %s, %v, want %s", tc.name, got, err, tc.want)
+		}
+	}
+}
+
+// TestForceDeleteReading_OverdueCountsFromTheDeadlineTheReadingWaitedFor: a
+// worker shows 30 s of its 480 s, and the policy's slack is 10 s. With
+// lifecycle.leaderGoneGracePeriod at 30 s the reading waits until 40 s after
+// the deletion time the API server shows. At 45 s, on a node that is gone,
+// Overdue is 15 s: the time the reading waited past its deadline, where the
+// deletion time alone would say 45 s. A pod let go early on an unreachable
+// node, 20 s after that deletion time, reads 10 s short of its deadline. With
+// the field unset both count from the deletion time.
+func TestForceDeleteReading_OverdueCountsFromTheDeadlineTheReadingWaitedFor(t *testing.T) {
+	keep := &types.ForceDeletePolicy{OverdueSlack: 10 * time.Second, NodeUnreachableThreshold: time.Minute}
+	skip := &types.ForceDeletePolicy{OverdueSlack: 10 * time.Second, NodeUnreachableThreshold: time.Minute, SkipGracePeriodOnUnreachableNode: true}
+	gone := tReaders(tReader(t))
+	unreachable := tReaders(tReader(t, tNode("node-a", corev1.ConditionUnknown, 10*time.Minute, false)))
+	for _, tc := range []struct {
+		name    string
+		readers types.NodeReaders
+		policy  *types.ForceDeletePolicy
+		// past is how long ago the worker's deletion time was.
+		past    time.Duration
+		field   time.Duration
+		want    TerminatingClass
+		overdue time.Duration
+		skipped bool
+	}{
+		{name: "the field unset, the node gone, 45 s past the deletion time", readers: gone, policy: keep, past: 45 * time.Second, want: NodeGone, overdue: 45 * time.Second},
+		{name: "the field at 30 s, the node gone, 45 s past the deletion time", readers: gone, policy: keep, past: 45 * time.Second, field: 30 * time.Second, want: NodeGone, overdue: 15 * time.Second},
+		{name: "the field unset, the node unreachable, 5 s past the deletion time", readers: unreachable, policy: skip, past: 5 * time.Second, want: NodeReadyUnknown, overdue: 5 * time.Second, skipped: true},
+		{name: "the field at 30 s, the node unreachable, 20 s past the deletion time", readers: unreachable, policy: skip, past: 20 * time.Second, field: 30 * time.Second, want: NodeReadyUnknown, overdue: -10 * time.Second, skipped: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := tShortenedWorker(tNow.Add(-tc.past))
+			got := StuckTerminating(context.Background(), tc.readers, pod, tc.policy, tLeaderGoneLifecycle(tc.field), tNow)
+			if got.Kind != tc.want || got.GraceSkipped != tc.skipped {
+				t.Fatalf("the reading is %s with GraceSkipped %v, want %s with %v", got.Kind, got.GraceSkipped, tc.want, tc.skipped)
+			}
+			if got.Overdue != tc.overdue {
+				t.Fatalf("Overdue = %s, want %s", got.Overdue, tc.overdue)
 			}
 		})
 	}

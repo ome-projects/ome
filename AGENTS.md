@@ -11,7 +11,7 @@ OME (Open Model Engine) is a Kubernetes operator for serving Large Language Mode
 - `make test` — full unit-test suite with coverage. Runs `fmt`, `vet`, `manifests`, downloads envtest binaries, and builds the Rust `pkg/xet` library first (requires a Rust toolchain).
 - `make test-no-xet` — same suite but skips the Rust xet build and the `ome-agent` cmd tests. Use this when no Rust toolchain is available.
 - Single test: envtest-backed packages need `KUBEBUILDER_ASSETS`, e.g.
-  `KUBEBUILDER_ASSETS="$(./bin/setup-envtest use 1.30 -p path)" go test ./pkg/controller/... -run TestName`
+  `KUBEBUILDER_ASSETS="$(./bin/setup-envtest use 1.35 -p path)" go test ./pkg/controller/... -run TestName`
   (see the `TEST_ENV` block in the Makefile for the full environment). Pure-unit packages work with plain `go test ./pkg/<pkg>/... -run TestName`.
 - `make integration-test` — Ginkgo tests under `tests/`.
 - `make ci-lint` / `make lint-fix` — golangci-lint; `make fmt`, `make vet`, `make tidy` before submitting.

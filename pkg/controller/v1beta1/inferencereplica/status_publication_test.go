@@ -12,7 +12,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
-	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 )
 
 // probeShape is a replica of four single-pod Instances, small enough to
@@ -155,7 +154,6 @@ func TestDecidePublication_APublicationThatCannotBeBuiltCountsAsAFailedWrite(t *
 	publication := statusPublication{
 		plan:             f.plan,
 		target:           f.target,
-		desiredByIdx:     workloadstatus.DesiredPodCountByInstance(f.plan),
 		pods:             workload.NewAPIReaderSelectorPodObservation(f.pods, query.BucketPodsByInstanceIdx(f.pods)),
 		availableByPod:   map[string]struct{}{},
 		templateHash:     templateHashOf(f.passCopy),

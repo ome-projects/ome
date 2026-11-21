@@ -21,10 +21,11 @@ const (
 	RolloutHoldGatePairing    RolloutHoldGate = "Pairing"
 )
 
-// DrainHolds collects the drain-time holds the update ops observe in one
-// pass. A held drain is forward progress withheld rather than an admission
-// denial, so executeUpdatePass records the first one even when another
-// Instance progressed.
+// DrainHolds collects the holds the update ops observe in one pass: a
+// drain the gate held, and an in-place start the op did not make because
+// the pass's copy of the row is older than the row. Each is forward
+// progress withheld rather than an admission denial, so executeUpdatePass
+// records the first one even when another Instance progressed.
 type DrainHolds struct {
 	first *RolloutHold
 }

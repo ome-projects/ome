@@ -45,9 +45,9 @@ func testRender(isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, plan wo
 // signature test bodies use directly.
 func testRenderWithRevision(isvc *v1beta1.InferenceService, podSpec *corev1.PodSpec, meta *metav1.ObjectMeta, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, ordinal int32, revisionHash string) (*corev1.Pod, error) {
 	if isvc == nil {
-		return RenderWithRevision(nil, testISVCGVK, workload.Key{}, podSpec, meta, plan, inst, runner, ordinal, revisionHash, nil)
+		return RenderWithRevision(nil, testISVCGVK, workload.Key{}, podSpec, meta, plan, inst, query.PodSetHostnames{}, runner, ordinal, revisionHash, nil)
 	}
-	return RenderWithRevision(isvc, testISVCGVK, testKey(isvc, plan.Component), podSpec, meta, plan, inst, runner, ordinal, revisionHash, nil)
+	return RenderWithRevision(isvc, testISVCGVK, testKey(isvc, plan.Component), podSpec, meta, plan, inst, query.PodSetHostnames{}, runner, ordinal, revisionHash, nil)
 }
 
 func singlePodPlan() (workload.ComponentPlan, workload.InstancePlan, workload.RunnerPlan) {
@@ -275,6 +275,109 @@ func TestRenderWithRevision_EmptyHashOmitsRevisionLabel(t *testing.T) {
 // pod. Dropping either breaks PD runtimes that need multus IB annotations
 // (k8s.v1.cni.cncf.io/networks) to spin up. OME-mandatory labels still
 // win on collision so selectors keep working.
+// queuedMeta is pod-template metadata carrying a Kueue queue label.
+func queuedMeta() *metav1.ObjectMeta {
+	return &metav1.ObjectMeta{Labels: map[string]string{constants.KueueQueueLabelKey: "team-queue"}}
+}
+
+// TestRender_KueuePodGroup_JoinsEveryPodOfAQueuedGang checks the Kueue pod
+// group of a queued multi-pod Instance: with the setting on, the leader and
+// every worker share one group named after the Instance and its build, count
+// the whole gang, are marked serving and carry their runner as their role.
+func TestRender_KueuePodGroup_JoinsEveryPodOfAQueuedGang(t *testing.T) {
+	plan, inst, runners := multiPodPlan(2)
+	plan.KueuePodGroups = true
+	inst.Incarnation = 3
+
+	for _, tc := range []struct {
+		runner  workload.RunnerPlan
+		ordinal int32
+	}{{runners[0], 0}, {runners[1], 0}, {runners[1], 1}} {
+		pod, err := testRenderWithRevision(basicISVC(), basicPodSpec(), queuedMeta(), plan, inst, tc.runner, tc.ordinal, "")
+		if err != nil {
+			t.Fatalf("%s %d: %v", tc.runner.Name, tc.ordinal, err)
+		}
+		if got, want := pod.Labels[constants.KueuePodGroupNameLabelKey], "llama-70b-engine-0-3"; got != want {
+			t.Errorf("%s: Kueue pod group = %q, want %q", pod.Name, got, want)
+		}
+		wantAnns := map[string]string{
+			constants.KueuePodGroupTotalCountAnnotationKey: "3",
+			constants.KueuePodGroupServingAnnotationKey:    "true",
+			constants.KueuePodRoleAnnotationKey:            tc.runner.Name,
+		}
+		for key, want := range wantAnns {
+			if got := pod.Annotations[key]; got != want {
+				t.Errorf("%s: annotation %s = %q, want %q", pod.Name, key, got, want)
+			}
+		}
+	}
+}
+
+// TestRender_KueuePodGroup_RebuiltInstanceQueuesAsANewGroup checks that a
+// rebuilt Instance names a new group, so its pods never join the Workload of
+// the pods they replace.
+func TestRender_KueuePodGroup_RebuiltInstanceQueuesAsANewGroup(t *testing.T) {
+	plan, inst, runners := multiPodPlan(1)
+	plan.KueuePodGroups = true
+
+	first, err := testRenderWithRevision(basicISVC(), basicPodSpec(), queuedMeta(), plan, inst, runners[0], 0, "")
+	if err != nil {
+		t.Fatalf("first build: %v", err)
+	}
+	inst.Incarnation++
+	rebuilt, err := testRenderWithRevision(basicISVC(), basicPodSpec(), queuedMeta(), plan, inst, runners[0], 0, "")
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	before, after := first.Labels[constants.KueuePodGroupNameLabelKey], rebuilt.Labels[constants.KueuePodGroupNameLabelKey]
+	if before == "" || before == after {
+		t.Errorf("the first build and the rebuild must name different groups, got %q and %q", before, after)
+	}
+}
+
+// TestRender_KueuePodGroup_LeavesOtherPodsAlone checks where no Kueue pod group
+// is set: the setting off, a single-pod Instance, and a gang whose pods carry
+// no queue label all render without the group label or its annotations.
+func TestRender_KueuePodGroup_LeavesOtherPodsAlone(t *testing.T) {
+	gangPlan, gangInst, gangRunners := multiPodPlan(1)
+	singlePlan, singleInst, singleRunner := singlePodPlan()
+	singlePlan.KueuePodGroups = true
+	onPlan := gangPlan
+	onPlan.KueuePodGroups = true
+
+	cases := []struct {
+		name   string
+		plan   workload.ComponentPlan
+		inst   workload.InstancePlan
+		runner workload.RunnerPlan
+		meta   *metav1.ObjectMeta
+	}{
+		{name: "setting off", plan: gangPlan, inst: gangInst, runner: gangRunners[1], meta: queuedMeta()},
+		{name: "single-pod Instance", plan: singlePlan, inst: singleInst, runner: singleRunner, meta: queuedMeta()},
+		{name: "gang without a queue label", plan: onPlan, inst: gangInst, runner: gangRunners[1]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pod, err := testRenderWithRevision(basicISVC(), basicPodSpec(), tc.meta, tc.plan, tc.inst, tc.runner, 0, "")
+			if err != nil {
+				t.Fatalf("render: %v", err)
+			}
+			if got, present := pod.Labels[constants.KueuePodGroupNameLabelKey]; present {
+				t.Errorf("Kueue pod group label set to %q, want none", got)
+			}
+			for _, key := range []string{
+				constants.KueuePodGroupTotalCountAnnotationKey,
+				constants.KueuePodGroupServingAnnotationKey,
+				constants.KueuePodRoleAnnotationKey,
+			} {
+				if got, present := pod.Annotations[key]; present {
+					t.Errorf("annotation %s set to %q, want none", key, got)
+				}
+			}
+		})
+	}
+}
+
 func TestRenderWithRevision_PropagatesComponentMetaAnnotationsAndLabels(t *testing.T) {
 	plan, inst, runner := singlePodPlan()
 	meta := &metav1.ObjectMeta{
@@ -438,8 +541,8 @@ func TestRender_OMEEnvVarsInEveryContainer(t *testing.T) {
 // var to identify the gang head sees the same value as workers.
 //
 // Address shape: short form <pod-hostname>.<headless-service>, the
-// hostname carrying the Instance incarnation; cluster DNS search path
-// resolves it the same as the fully qualified
+// hostname carrying the Instance's recreation count. The cluster DNS search
+// path resolves it the same as the fully qualified
 // <hostname>.<headless>.<ns>.svc.<cluster-domain>.
 func TestRender_MultiPod_LeaderEnvVarsForLeader(t *testing.T) {
 	plan, inst, runners := multiPodPlan(2)
@@ -598,152 +701,200 @@ func TestRender_MultiPod_LeaderAddressPerInstance(t *testing.T) {
 	}
 }
 
-// TestRender_MultiPod_HostnameUniquePerIncarnation pins the stale-leader-DNS
-// fix: two incarnations of the same Instance render the SAME pod names (Create
-// matches desired pods to existing ones by name) but DIFFERENT hostnames, so
-// the leader's peer-DNS identity dies with its incarnation. A worker created
-// for incarnation N+1 can never resolve OME_LEADER_ADDRESS to incarnation N's
-// still-terminating leader.
-func TestRender_MultiPod_HostnameUniquePerIncarnation(t *testing.T) {
-	plan, inst, runners := multiPodPlan(1)
-	rebuilt := inst
-	rebuilt.Incarnation = 2
+// TestRender_MultiPod_PeerAddressesNameTheCurrentRebuild locks the peer-DNS
+// identity of a multi-pod Instance. Pod names stay the same across a
+// rebuild, because Create matches desired pods to existing ones by name,
+// so every address OME hands out must name the current rebuild on its
+// own: each pod's spec.hostname is <pod-name>-i<recreation count>, every
+// pod's OME_LEADER_ADDRESS is <leader hostname>.<headless Service>, and
+// the TPU peer host list is each pod's <hostname>.<subdomain> in gang-rank
+// order. A bare pod name is also the DNS name of the leader of the previous
+// rebuild, and a resolver that still holds an answer for it hands a worker
+// of the new rebuild the address of a pod that is gone.
+func TestRender_MultiPod_PeerAddressesNameTheCurrentRebuild(t *testing.T) {
+	plan, inst, runners := multiPodPlan(2) // 1 leader + 2 workers
+	inst.Incarnation = 2
+	plan.Instances = []workload.InstancePlan{inst}
 
-	leader1, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[0], 0)
-	if err != nil {
-		t.Fatalf("incarnation 1 leader: %v", err)
-	}
-	leader2, err := testRender(basicISVC(), basicPodSpec(), plan, rebuilt, runners[0], 0)
-	if err != nil {
-		t.Fatalf("incarnation 2 leader: %v", err)
-	}
-
-	if leader1.Name != leader2.Name {
-		t.Errorf("pod names must stay stable across incarnations: %q vs %q", leader1.Name, leader2.Name)
-	}
-	if leader1.Spec.Hostname == leader2.Spec.Hostname {
-		t.Errorf("hostnames must differ across incarnations: both %q", leader1.Spec.Hostname)
-	}
-	if want := "llama-70b-engine-0-leader-0-i1"; leader1.Spec.Hostname != want {
-		t.Errorf("incarnation 1 leader hostname: got %q want %q", leader1.Spec.Hostname, want)
-	}
-	if want := "llama-70b-engine-0-leader-0-i2"; leader2.Spec.Hostname != want {
-		t.Errorf("incarnation 2 leader hostname: got %q want %q", leader2.Spec.Hostname, want)
-	}
-
-	worker1, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[1], 0)
-	if err != nil {
-		t.Fatalf("incarnation 1 worker: %v", err)
-	}
-	worker2, err := testRender(basicISVC(), basicPodSpec(), plan, rebuilt, runners[1], 0)
-	if err != nil {
-		t.Fatalf("incarnation 2 worker: %v", err)
-	}
-	addr1 := envByName(worker1.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
-	addr2 := envByName(worker2.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
-	if addr1 == addr2 {
-		t.Errorf("OME_LEADER_ADDRESS must differ across incarnations: both %q", addr1)
-	}
-}
-
-// TestRender_MultiPod_LeaderAddressMatchesLeaderHostname pins the DNS
-// contract: a worker's OME_LEADER_ADDRESS is exactly
-// <leader spec.hostname>.<leader spec.subdomain>, so the name the worker
-// resolves is the name the leader pod actually publishes.
-func TestRender_MultiPod_LeaderAddressMatchesLeaderHostname(t *testing.T) {
-	plan, inst, runners := multiPodPlan(2)
-
-	leader, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[0], 0)
-	if err != nil {
-		t.Fatalf("leader: %v", err)
-	}
-	want := leader.Spec.Hostname + "." + leader.Spec.Subdomain
-	for _, ordinal := range []int32{0, 1} {
-		worker, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runners[1], ordinal)
-		if err != nil {
-			t.Fatalf("worker %d: %v", ordinal, err)
-		}
-		if got := envByName(worker.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]; got != want {
-			t.Errorf("worker %d OME_LEADER_ADDRESS: got %q want %q (= leader hostname.subdomain)", ordinal, got, want)
-		}
-	}
-}
-
-// TestRender_MultiPod_TPUHostnamesMatchPodHostnames pins that every entry of
-// the TPU peer host list is the rendered pod's own
-// <spec.hostname>.<spec.subdomain>, so the mesh JAX/libtpu builds resolves to
-// the pods of THIS incarnation.
-func TestRender_MultiPod_TPUHostnamesMatchPodHostnames(t *testing.T) {
-	plan, inst, runners := multiPodPlan(2) // 1 leader + 2 workers = 3-host slice
-
-	var pods []*corev1.Pod
-	for _, rc := range []struct {
+	members := []struct {
 		runner  workload.RunnerPlan
 		ordinal int32
-	}{{runners[0], 0}, {runners[1], 0}, {runners[1], 1}} {
-		pod, err := testRender(basicISVC(), tpuPodSpec(), plan, inst, rc.runner, rc.ordinal)
+	}{{runners[0], 0}, {runners[1], 0}, {runners[1], 1}}
+	var pods []*corev1.Pod
+	for _, m := range members {
+		pod, err := testRender(basicISVC(), tpuPodSpec(), plan, inst, m.runner, m.ordinal)
 		if err != nil {
-			t.Fatalf("render %s/%d: %v", rc.runner.Name, rc.ordinal, err)
+			t.Fatalf("render %s/%d: %v", m.runner.Name, m.ordinal, err)
 		}
 		pods = append(pods, pod)
 	}
 
-	var want []string
-	for _, p := range pods {
-		want = append(want, p.Spec.Hostname+"."+p.Spec.Subdomain)
+	const headless = "llama-70b-engine-headless"
+	wantNames := []string{"llama-70b-engine-0-leader-0", "llama-70b-engine-0-worker-0", "llama-70b-engine-0-worker-1"}
+	wantLeaderAddress := wantNames[0] + "-i2." + headless
+	wantHosts := make([]string, 0, len(wantNames))
+	wantAddrs := make([]string, 0, len(wantNames))
+	for _, name := range wantNames {
+		wantHosts = append(wantHosts, name+"-i2."+headless)
+		wantAddrs = append(wantAddrs, name+"-i2."+headless+":8476")
 	}
-	wantJoined := strings.Join(want, ",")
-	for _, p := range pods {
-		if got := envByName(p.Spec.Containers[0].Env)["TPU_WORKER_HOSTNAMES"]; got != wantJoined {
-			t.Errorf("pod %s TPU_WORKER_HOSTNAMES: got %q want %q", p.Name, got, wantJoined)
+	for i, pod := range pods {
+		if pod.Name != wantNames[i] {
+			t.Errorf("pod %d name: got %q want %q (names stay the same across rebuilds)", i, pod.Name, wantNames[i])
+		}
+		if want := wantNames[i] + "-i2"; pod.Spec.Hostname != want {
+			t.Errorf("pod %s hostname: got %q want %q", pod.Name, pod.Spec.Hostname, want)
+		}
+		if pod.Spec.Subdomain != headless {
+			t.Errorf("pod %s subdomain: got %q want %q", pod.Name, pod.Spec.Subdomain, headless)
+		}
+		env := envByName(pod.Spec.Containers[0].Env)
+		if got := env["OME_LEADER_ADDRESS"]; got != wantLeaderAddress {
+			t.Errorf("pod %s OME_LEADER_ADDRESS: got %q want %q", pod.Name, got, wantLeaderAddress)
+		}
+		if got, want := env["TPU_WORKER_HOSTNAMES"], strings.Join(wantHosts, ","); got != want {
+			t.Errorf("pod %s TPU_WORKER_HOSTNAMES: got %q want %q", pod.Name, got, want)
+		}
+		if got, want := env["TPU_PROCESS_ADDRESSES"], strings.Join(wantAddrs, ","); got != want {
+			t.Errorf("pod %s TPU_PROCESS_ADDRESSES: got %q want %q", pod.Name, got, want)
 		}
 	}
 }
 
-// TestRender_MultiPod_HostnameBoundedLongName pins that the per-incarnation
-// hostname stays a valid DNS label of at most 63 characters when the pod name
-// is already near the limit: the suffix must never push a create past the
-// apiserver's spec.hostname validation, and the truncated form must still
-// differ across incarnations and match OME_LEADER_ADDRESS.
-func TestRender_MultiPod_HostnameBoundedLongName(t *testing.T) {
+// TestRender_MultiPod_RebuildKeepsNamesAndChangesHostnames locks the two
+// facts together: the first and the second build of one Instance
+// (recreation counts 1 and 2) render the same pod names but different
+// hostnames and different leader addresses, so a pod of the new build
+// never resolves its leader's name to the pod of the old one.
+func TestRender_MultiPod_RebuildKeepsNamesAndChangesHostnames(t *testing.T) {
+	plan, inst, runners := multiPodPlan(1)
+	rebuilt := inst
+	rebuilt.Incarnation = 2
+
+	for _, runner := range runners {
+		before, err := testRender(basicISVC(), basicPodSpec(), plan, inst, runner, 0)
+		if err != nil {
+			t.Fatalf("first build %s: %v", runner.Name, err)
+		}
+		after, err := testRender(basicISVC(), basicPodSpec(), plan, rebuilt, runner, 0)
+		if err != nil {
+			t.Fatalf("second build %s: %v", runner.Name, err)
+		}
+		if before.Name != after.Name {
+			t.Errorf("%s pod name must stay the same across rebuilds: %q vs %q", runner.Name, before.Name, after.Name)
+		}
+		if before.Spec.Hostname == after.Spec.Hostname {
+			t.Errorf("%s hostname must differ across rebuilds: both %q", runner.Name, before.Spec.Hostname)
+		}
+		addrBefore := envByName(before.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
+		addrAfter := envByName(after.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
+		if addrBefore == addrAfter {
+			t.Errorf("%s OME_LEADER_ADDRESS must differ across rebuilds: both %q", runner.Name, addrBefore)
+		}
+	}
+}
+
+// TestRender_MultiPod_HostnameStaysADNSLabel locks the bound on the hostname
+// that carries the recreation count: a pod name already over the
+// 63-character limit a spec.hostname must meet still renders a valid DNS
+// label, the label still differs across rebuilds, and it is still the host
+// the workers' OME_LEADER_ADDRESS names, so the suffix never makes the
+// apiserver refuse a pod and never splits a gang from its leader.
+func TestRender_MultiPod_HostnameStaysADNSLabel(t *testing.T) {
 	isvc := basicISVC()
-	isvc.Name = strings.Repeat("a", 49) // pod name is 49+len("-engine-0-leader-0")=67 > 63
+	isvc.Name = strings.Repeat("a", 49) // pod name: 49 + len("-engine-0-leader-0") = 67 chars
 
 	plan, inst, runners := multiPodPlan(1)
 	leader, err := testRender(isvc, basicPodSpec(), plan, inst, runners[0], 0)
 	if err != nil {
 		t.Fatalf("leader: %v", err)
 	}
-	if len(leader.Name) <= 63 {
-		t.Fatalf("test needs a pod name over the hostname limit, got %d chars", len(leader.Name))
-	}
-	if len(leader.Spec.Hostname) > 63 {
-		t.Errorf("hostname over the 63-char DNS label limit: %d chars: %q", len(leader.Spec.Hostname), leader.Spec.Hostname)
+	if len(leader.Name) <= k8svalidation.DNS1123LabelMaxLength {
+		t.Fatalf("the test needs a pod name over the hostname limit, got %d chars", len(leader.Name))
 	}
 	if errs := k8svalidation.IsDNS1123Label(leader.Spec.Hostname); len(errs) > 0 {
-		t.Errorf("hostname %q is not a valid DNS1123 label: %v", leader.Spec.Hostname, errs)
+		t.Errorf("hostname %q (%d chars) is not a valid DNS label: %v", leader.Spec.Hostname, len(leader.Spec.Hostname), errs)
 	}
 
 	rebuilt := inst
 	rebuilt.Incarnation = 2
 	leader2, err := testRender(isvc, basicPodSpec(), plan, rebuilt, runners[0], 0)
 	if err != nil {
-		t.Fatalf("incarnation 2 leader: %v", err)
+		t.Fatalf("second build leader: %v", err)
+	}
+	if errs := k8svalidation.IsDNS1123Label(leader2.Spec.Hostname); len(errs) > 0 {
+		t.Errorf("second build hostname %q is not a valid DNS label: %v", leader2.Spec.Hostname, errs)
 	}
 	if leader2.Spec.Hostname == leader.Spec.Hostname {
-		t.Errorf("truncated hostnames must still differ across incarnations: both %q", leader.Spec.Hostname)
-	}
-	if len(leader2.Spec.Hostname) > 63 {
-		t.Errorf("incarnation 2 hostname over the limit: %d chars: %q", len(leader2.Spec.Hostname), leader2.Spec.Hostname)
+		t.Errorf("bounded hostnames must still differ across rebuilds: both %q", leader.Spec.Hostname)
 	}
 
 	worker, err := testRender(isvc, basicPodSpec(), plan, inst, runners[1], 0)
 	if err != nil {
 		t.Fatalf("worker: %v", err)
 	}
-	if got, want := envByName(worker.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"],
-		leader.Spec.Hostname+"."+leader.Spec.Subdomain; got != want {
-		t.Errorf("worker OME_LEADER_ADDRESS: got %q want %q", got, want)
+	got := envByName(worker.Spec.Containers[0].Env)["OME_LEADER_ADDRESS"]
+	if want := leader.Spec.Hostname + "." + leader.Spec.Subdomain; got != want {
+		t.Errorf("worker OME_LEADER_ADDRESS: got %q want %q (the leader's hostname.subdomain)", got, want)
+	}
+}
+
+// TestRender_MultiPod_PodMadeBesideLivePodsTakesTheirHostnames locks what
+// Render does with the reading of a set's live pods. The pod it renders
+// answers to the hostname those pods were given for it, and its leader
+// address and its TPU peer list name the hostnames they answer to: pod
+// names beside pods that answer to their pod names, and the count their
+// hostnames carry beside pods built at an earlier recreation count. The
+// pod's own count label stays the Instance's. A pod made beside such pods
+// then finds them, and they find it.
+func TestRender_MultiPod_PodMadeBesideLivePodsTakesTheirHostnames(t *testing.T) {
+	plan, inst, runners := multiPodPlan(2) // 1 leader + 2 workers
+	inst.Incarnation = 2
+	plan.Instances = []workload.InstancePlan{inst}
+
+	const headless = "llama-70b-engine-headless"
+	names := []string{"llama-70b-engine-0-leader-0", "llama-70b-engine-0-worker-0", "llama-70b-engine-0-worker-1"}
+	members := []struct {
+		runner  workload.RunnerPlan
+		ordinal int32
+	}{{runners[0], 0}, {runners[1], 0}, {runners[1], 1}}
+	for _, tc := range []struct {
+		name     string
+		hostname func(podName string) string
+	}{
+		{name: "the live leader answers to its pod name", hostname: func(podName string) string { return podName }},
+		{name: "the live leader's hostname carries count 1", hostname: func(podName string) string { return podName + "-i1" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			leader := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: names[0], Labels: map[string]string{query.LabelRunner: workload.RunnerLeader}},
+				Spec:       corev1.PodSpec{Hostname: tc.hostname(names[0])},
+			}
+			standing := query.ReadPodSetHostnames([]*corev1.Pod{leader})
+			wantHosts := make([]string, 0, len(names))
+			for _, name := range names {
+				wantHosts = append(wantHosts, tc.hostname(name)+"."+headless)
+			}
+			for i, m := range members {
+				pod, err := RenderWithRevision(basicISVC(), testISVCGVK, testKey(basicISVC(), plan.Component), tpuPodSpec(), nil, plan, inst, standing, m.runner, m.ordinal, "", nil)
+				if err != nil {
+					t.Fatalf("render %s/%d: %v", m.runner.Name, m.ordinal, err)
+				}
+				if want := tc.hostname(names[i]); pod.Spec.Hostname != want {
+					t.Errorf("pod %s hostname: got %q want %q", pod.Name, pod.Spec.Hostname, want)
+				}
+				if got := pod.Labels[query.LabelInstanceIncarnation]; got != "2" {
+					t.Errorf("pod %s count label: got %q want the Instance's count 2", pod.Name, got)
+				}
+				env := envByName(pod.Spec.Containers[0].Env)
+				if got := env["OME_LEADER_ADDRESS"]; got != wantHosts[0] {
+					t.Errorf("pod %s OME_LEADER_ADDRESS: got %q want %q", pod.Name, got, wantHosts[0])
+				}
+				if got, want := env["TPU_WORKER_HOSTNAMES"], strings.Join(wantHosts, ","); got != want {
+					t.Errorf("pod %s TPU_WORKER_HOSTNAMES: got %q want %q", pod.Name, got, want)
+				}
+			}
+		})
 	}
 }
 
@@ -832,12 +983,12 @@ func TestRender_TPUTopologyEnv_PrimedPeerHostnamesMatchUncached(t *testing.T) {
 
 	// Prime the cache exactly as createMissingPods does, once per gang.
 	primed := inst
-	primed.PeerHostnames = buildInstancePeerHostnames(basicISVC().Name, plan.Component, inst)
+	primed.PeerHostnames = buildInstancePeerHostnames(basicISVC().Name, plan.Component, inst, query.PodSetHostnames{})
 
 	// Sanity: priming must not change the computed list — it's the same
 	// derivation, just hoisted.
 	if got, want := strings.Join(primed.PeerHostnames, ","),
-		strings.Join(buildInstancePeerHostnames(basicISVC().Name, plan.Component, inst), ","); got != want {
+		strings.Join(buildInstancePeerHostnames(basicISVC().Name, plan.Component, inst, query.PodSetHostnames{}), ","); got != want {
 		t.Fatalf("primed list diverged from derivation: got %q want %q", got, want)
 	}
 

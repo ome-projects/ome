@@ -584,6 +584,7 @@ var shapeChecks = []func(*v1beta1.InferenceReplica) error{
 	validateIRAutoscaler,
 	validateIRPacing,
 	validateIRRunnerVolumes,
+	validateIRLifecycle,
 }
 
 // validateIRAutoscaler applies the autoscaler shape check the
@@ -622,6 +623,17 @@ func validateIRPacing(ir *v1beta1.InferenceReplica) error {
 			partition, replicas)
 	}
 	return nil
+}
+
+// validateIRLifecycle refuses a lifecycle.leaderGoneGracePeriod that is not
+// above zero. The engine hands the value to a pod as its termination grace.
+// A single-pod replica may carry the field: it has no leader, so nothing
+// reads the field there.
+func validateIRLifecycle(ir *v1beta1.InferenceReplica) error {
+	if ir == nil {
+		return nil
+	}
+	return validation.ValidateLeaderGoneGracePeriod("spec.lifecycle", ir.Spec.Lifecycle)
 }
 
 // validateIRRunnerVolumes checks that every volumeMount of every runner's

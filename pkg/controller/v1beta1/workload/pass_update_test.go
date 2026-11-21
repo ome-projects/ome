@@ -3474,3 +3474,112 @@ func rollingGroupISVC(maxUnavailable intstr.IntOrString) *v1beta1.InferenceServi
 	}}
 	return isvc
 }
+
+// firstBatchDown rolls h to the fixed revision behind a gate that admits
+// batch Instances at a time, until the first batch is out of rotation. It
+// returns the Instances of that batch.
+func firstBatchDown(t *testing.T, h *recoveryHarness, batch int32) []int32 {
+	t.Helper()
+	h.gate = func(string, types.UpdateStrategyType, int32, int32) (bool, types.RolloutHoldGate, string) {
+		if escalation.CurrentUnavailableInFlight(h.irStatuses()) >= batch {
+			return false, types.RolloutHoldGateBudget, "the batch is full"
+		}
+		return true, "", ""
+	}
+	h.setTarget(h.revFixed, fixedImage)
+	if !h.run(20, func() bool { return escalation.CurrentUnavailableInFlight(h.irStatuses()) == batch }) {
+		h.dumpState("first batch")
+		t.Fatalf("the first batch of %d Instances never went down", batch)
+	}
+	var down []int32
+	for _, row := range h.irStatuses() {
+		if row.Phase == types.InstancePhaseUpdating {
+			down = append(down, row.Index)
+		}
+	}
+	return down
+}
+
+// gateThatAdmitsEveryStart puts a gate in front of h that says yes to every
+// start. asks counts the times it is asked, and behind the times it is
+// asked while the row of an Instance in down does not name target yet.
+func gateThatAdmitsEveryStart(h *recoveryHarness, down []int32, target string) (asks, behind *int) {
+	asks, behind = new(int), new(int)
+	h.gate = func(string, types.UpdateStrategyType, int32, int32) (bool, types.RolloutHoldGate, string) {
+		*asks++
+		for _, idx := range down {
+			if row := h.instance(idx); row == nil || row.TargetRevision != target {
+				*behind++
+			}
+		}
+		return true, "", ""
+	}
+	return asks, behind
+}
+
+// rollStaysOnTheNewTarget fails the test when more Instances are out of
+// rotation than the budget allows. It also fails when a pod created since
+// movedAt runs another image than the new target's.
+func rollStaysOnTheNewTarget(t *testing.T, h *recoveryHarness, replicas, budget int32, movedAt time.Time, image string) {
+	t.Helper()
+	if out := replicas - h.servingInstances(); out > budget {
+		h.dumpState("over the budget")
+		t.Fatalf("%d Instances are out of rotation, and the budget is %d", out, budget)
+	}
+	for _, pod := range h.livePods() {
+		if !pod.CreationTimestamp.Time.Before(movedAt) && pod.Spec.Containers[0].Image != image {
+			h.dumpState("pod created off the new target")
+			t.Fatalf("pod %s was created on %s after the target moved to %s", pod.Name, pod.Spec.Containers[0].Image, image)
+		}
+	}
+}
+
+// TestReconcile_TargetMovesWithABatchDown_NoStartBeyondTheBudget: six
+// single-pod Instances roll by recreate, two at a time behind a rollout
+// group's gate. Both Instances of the first batch are down when the target
+// moves: on to a third revision, or back to the revision the fleet started
+// on. The pass that first sees the new target points both Instances at it
+// before it asks about any other start. From then on the gate says yes to
+// every start, and still no third Instance goes down: the Component's own
+// budget counts both as down, whichever revision their rows name. With one
+// slot left in that budget a second push asks the gate once, and both rows
+// name the new target when it is asked. Every pod created after the move
+// runs the new target, and the roll ends on it.
+func TestReconcile_TargetMovesWithABatchDown_NoStartBeyondTheBudget(t *testing.T) {
+	const replicas, batch = 6, 2
+	for _, tc := range []struct {
+		name   string
+		budget int32
+		back   bool
+		asks   int
+	}{
+		{name: "a second push with the budget full", budget: batch},
+		{name: "a second push with one slot left", budget: batch + 1, asks: 1},
+		{name: "a rollback with the budget full", budget: batch, back: true},
+		{name: "a rollback with one slot left", budget: batch + 1, back: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := offTargetCrashHarness(t, false, types.UpdateStrategyRecreatePod, 0, tc.budget, types.RestartPolicyRecreateInstance, replicas)
+			down := firstBatchDown(t, h, batch)
+			target, image := h.revV1, goodImage
+			if tc.back {
+				h.setTarget(target, image)
+			} else {
+				image = correctedImage
+				target = h.pushRevision(image)
+			}
+			movedAt := h.clk.Now()
+			asks, behind := gateThatAdmitsEveryStart(h, down, target.Name)
+			h.step()
+			if *asks != tc.asks || *behind != 0 {
+				h.dumpState("the pass that first saw the new target")
+				t.Fatalf("the pass that first saw the new target asked the gate %d time(s), want %d, and %d time(s) with the row of a down Instance still on the previous target", *asks, tc.asks, *behind)
+			}
+			done := func() bool { return h.settledOn(target, replicas) }
+			if !h.runWithInvariant(120, done, func() { rollStaysOnTheNewTarget(t, h, replicas, tc.budget, movedAt, image) }) {
+				h.dumpState("after the move")
+				t.Fatalf("the roll never ended on the new target: it holds on %+v", h.lastHold())
+			}
+		})
+	}
+}

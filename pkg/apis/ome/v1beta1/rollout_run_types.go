@@ -15,6 +15,8 @@
 package v1beta1
 
 import (
+	"slices"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -262,6 +264,40 @@ const (
 // holds (done sentinel, rolled-back, failed) never needs it.
 func RolloutRunActive(isvc *InferenceService) bool {
 	return isvc != nil && isvc.Status.Rollout != nil && isvc.Status.Rollout.ActiveRun != nil
+}
+
+// ActiveRolloutRunID is the ID of the service's open rollout run, empty when
+// none is open.
+func ActiveRolloutRunID(isvc *InferenceService) string {
+	if !RolloutRunActive(isvc) {
+		return ""
+	}
+	return isvc.Status.Rollout.ActiveRun.RunID
+}
+
+// RolloutRunRetargets reports whether the open run moves any of components
+// to a new revision. A run that records no target for any of them, or no
+// targets at all, counts as moving them, so a reader that cannot tell treats
+// the components as part of the run.
+func RolloutRunRetargets(isvc *InferenceService, components []ComponentType) bool {
+	if !RolloutRunActive(isvc) {
+		return true
+	}
+	targets := isvc.Status.Rollout.ActiveRun.TargetRevisions
+	if len(targets) == 0 {
+		return true
+	}
+	seen := false
+	for i := range targets {
+		if !slices.Contains(components, targets[i].Component) {
+			continue
+		}
+		seen = true
+		if targets[i].Revision != targets[i].StableRevision {
+			return true
+		}
+	}
+	return !seen
 }
 
 // AsRolloutSpec materializes the pinned plan as a RolloutSpec so existing

@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clocktesting "k8s.io/utils/clock/testing"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/utils/testing/allocbudget"
 )
@@ -85,7 +86,7 @@ func (f *conditionPromotionFixture) reportReadyTimeout(tb testing.TB) {
 // the end of the pass does before the status write.
 func (f *conditionPromotionFixture) promote(tb testing.TB) {
 	tb.Helper()
-	if err := promoteCurrentRevisionOverPods(context.Background(), f.reconciler.statusWriter(), f.reconciler.liveReader(), f.passCopy, f.target.Name, podRevisionsOf(f.pods)); err != nil {
+	if err := promoteCurrentRevisionOverPods(context.Background(), f.reconciler.statusWriter(), f.reconciler.liveReader(), f.passCopy, f.target.Name, query.BucketPodsByInstanceIdx(f.pods)); err != nil {
 		tb.Fatalf("promote the current revision: %v", err)
 	}
 }

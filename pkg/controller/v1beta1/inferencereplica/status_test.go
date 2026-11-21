@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/escalation"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -445,7 +446,7 @@ func TestReconcile_WakesWhenMinReadyWindowElapses(t *testing.T) {
 		g := gomega.NewWithT(t)
 		result, got := reconcile(t, 0, now.Add(-5*time.Second))
 		g.Expect(got.Status.AvailableReplicas).To(gomega.Equal(int32(1)),
-			"a zero window makes Available the same as in rotation")
+			"a zero window makes Available the same as Ready and in rotation")
 		g.Expect(result.RequeueAfter).To(gomega.BeZero())
 	})
 }
@@ -485,6 +486,51 @@ func TestAggregateStatus_AvailableReplicas_ZeroWhenSliceNotReady(t *testing.T) {
 		"ReadyReplicas counts the ContainersReady pod regardless of EndpointSlice state")
 	g.Expect(got.Status.AvailableReplicas).To(gomega.Equal(int32(0)),
 		"AvailableReplicas waits for EndpointSlice Ready=true (kube-proxy gate)")
+}
+
+// TestAggregateStatus_AvailableReplicas_ZeroWhenPodNotReadyOnHeadlessSlice
+// pins Available to the pod's own Ready condition. The Component's headless
+// Service publishes not-ready addresses for peer discovery, so the
+// EndpointSlice controller marks every live pod's endpoint Ready and reports
+// the pod's real readiness only as Serving. A pod still starting, or one
+// taken out of rotation, is not Available while its endpoint reads Ready.
+func TestAggregateStatus_AvailableReplicas_ZeroWhenPodNotReadyOnHeadlessSlice(t *testing.T) {
+	tests := []struct {
+		name      string
+		phase     v1beta1.OMENativeInstancePhase
+		ready     bool
+		wantReady int32
+	}{
+		{name: "pod still starting", phase: v1beta1.OMENativeInstanceCreating, ready: false, wantReady: 0},
+		{name: "pod out of rotation", phase: v1beta1.OMENativeInstanceReady, ready: true, wantReady: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			ir := baselineIR("llama-engine", "prod", 1)
+			ir.Status.InstanceStatuses = []v1beta1.OMENativeInstanceStatus{
+				{Index: 0, Incarnation: 1, Phase: test.phase, PodCount: 1, ActiveOrdinal: 0},
+			}
+			pod0 := podForIR(ir, 0, "default", 0, test.ready, false)
+			slice0 := sliceForIRPod(ir, pod0, true)
+			slice0.Endpoints[0].Conditions.Serving = ptr.To(false)
+			r, c := newReconciler(t, ir, pod0, slice0)
+
+			_, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
+			})
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+
+			got := &v1beta1.InferenceReplica{}
+			g.Expect(c.Get(context.Background(),
+				types.NamespacedName{Name: ir.Name, Namespace: ir.Namespace},
+				got)).To(gomega.Succeed())
+			g.Expect(got.Status.ReadyReplicas).To(gomega.Equal(test.wantReady),
+				"ReadyReplicas counts ContainersReady pods")
+			g.Expect(got.Status.AvailableReplicas).To(gomega.BeZero(),
+				"a pod whose Ready condition is not True is not Available, whatever its endpoint reads")
+		})
+	}
 }
 
 // TestAggregateStatus_ReadyCondition_TrueWhenAllReady_RolloutDone pins
@@ -2823,7 +2869,7 @@ func TestPublicationObservationMatchesInlineV1Projection(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewOwnedPublicationObservation: %v", err)
 			}
-			materialized, gotCounters, err := observation.TakeInlineV1Publication(test.desired, "rev-running")
+			materialized, gotCounters, err := observation.TakeInlineV1Publication(fixture.PlanWithDesiredPods(test.desired), "rev-running")
 			if err != nil {
 				t.Fatalf("TakeInlineV1Publication: %v", err)
 			}
@@ -2918,7 +2964,7 @@ func TestPublicationObservationMatchesInlineV1ProjectionAtScale(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewOwnedPublicationObservation: %v", err)
 			}
-			materialized, gotCounters, err := observation.TakeInlineV1Publication(desired, "rev-running")
+			materialized, gotCounters, err := observation.TakeInlineV1Publication(fixture.PlanWithDesiredPods(desired), "rev-running")
 			if err != nil {
 				t.Fatalf("TakeInlineV1Publication: %v", err)
 			}
@@ -3435,7 +3481,7 @@ func TestPublicationCounters_DeriveFromPodsNotPhases(t *testing.T) {
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
 	desired := map[int32]int32{0: 1, 1: 1, 2: 1}
-	_, counters, err := observation.TakeInlineV1Publication(desired, "rev-b")
+	_, counters, err := observation.TakeInlineV1Publication(fixture.PlanWithDesiredPods(desired), "rev-b")
 	g.Expect(err).NotTo(gomega.HaveOccurred())
 
 	g.Expect(counters.Replicas).To(gomega.Equal(int32(3)),

@@ -191,76 +191,94 @@ func TestRestorationConflictRecollectsCurrentRequest(t *testing.T) {
 	for _, cluster := range []bool{false, true} {
 		for _, change := range []string{"request", "model", "report", "matching-new-request"} {
 			t.Run(fmt.Sprintf("cluster=%t/%s", cluster, change), func(t *testing.T) {
-				obj, node := restorationModel(cluster), restorationNode("node-a")
-				entry := shared.ModelEntry{ModelUID: obj.GetUID(), Status: shared.ModelStatusReady, ArtifactRehydrationID: "restore-001"}
-				live := restorationClient(t, obj, node, restorationReport(t, obj, node, entry))
-				changed, lists := false, 0
-				c := interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
-					SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, current client.Object, opts ...client.SubResourceUpdateOption) error {
-						if !changed {
-							latest := obj.DeepCopyObject().(client.Object)
-							require.NoError(t, live.Get(ctx, client.ObjectKeyFromObject(obj), latest))
-							switch change {
-							case "request", "matching-new-request":
-								latest.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation] = "restore-002"
-								if change == "matching-new-request" {
-									cm := restorationReport(t, obj, node, entry)
-									require.NoError(t, live.Get(ctx, client.ObjectKeyFromObject(cm), cm))
-									entry.ArtifactRehydrationID = "restore-002"
-									cm.Data = restorationReport(t, obj, node, entry).Data
-									require.NoError(t, live.Update(ctx, cm))
-								}
-							case "model":
-								latest.SetUID("replacement")
-							case "report":
-								cm := restorationReport(t, obj, node, entry)
-								require.NoError(t, live.Get(ctx, client.ObjectKeyFromObject(cm), cm))
-								entry.Status = shared.ModelStatusFailed
-								cm.Data = restorationReport(t, obj, node, entry).Data
-								require.NoError(t, live.Update(ctx, cm))
-							}
-							require.NoError(t, live.Update(ctx, latest))
-							changed = true
-							return apierrors.NewConflict(schema.GroupResource{Resource: "models"}, obj.GetName(), fmt.Errorf("input changed"))
-						}
-						return c.SubResource(sub).Update(ctx, current, opts...)
-					},
-					List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-						if _, reports := list.(*corev1.ConfigMapList); reports {
-							lists++
-						}
-						return c.List(ctx, list, opts...)
-					},
-				})
-				err := ReconcileStatusFromConfigMaps(t.Context(), c, live, logr.Discard(), obj, cluster, "Model")
-				if change == "model" {
-					require.ErrorContains(t, err, "identity changed during reconciliation")
-				} else {
-					require.NoError(t, err)
-				}
-				require.True(t, changed)
-				require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))
-				_, status, err := shared.ModelSpecAndStatus(obj)
-				require.NoError(t, err)
-				if change == "matching-new-request" {
-					require.NotNil(t, status.Rehydration)
-					require.Equal(t, "restore-002", status.Rehydration.CompletedRequestID)
-					require.Equal(t, v1beta1.LifeCycleStateReady, status.State)
-				} else {
-					require.Nil(t, status.Rehydration, "superseded reports must not establish completion")
-				}
-				if change != "model" {
-					require.Equal(t, 2, lists, "a status conflict must refresh reports")
-				}
-				if change == "request" {
-					require.Equal(t, v1beta1.LifeCycleStateReady, status.State)
-					require.Equal(t, []string{"node-a"}, status.NodesReady)
-				}
-				if change == "report" {
-					require.Equal(t, v1beta1.LifeCycleStateFailed, status.State)
-				}
+				requireConflictRecollects(t, cluster, change)
 			})
 		}
+	}
+}
+
+// rewriteRestorationReport replaces the node's report with the given entry.
+func rewriteRestorationReport(ctx context.Context, t *testing.T, live client.Client, obj client.Object, node *corev1.Node, entry shared.ModelEntry) {
+	t.Helper()
+	cm := restorationReport(t, obj, node, entry)
+	data := cm.Data
+	require.NoError(t, live.Get(ctx, client.ObjectKeyFromObject(cm), cm))
+	cm.Data = data
+	require.NoError(t, live.Update(ctx, cm))
+}
+
+// changeRestorationInput changes the request, the Model or the node report
+// the way a writer that races the status update would.
+func changeRestorationInput(ctx context.Context, t *testing.T, live client.Client, obj client.Object, node *corev1.Node, entry *shared.ModelEntry, change string) {
+	t.Helper()
+	latest := obj.DeepCopyObject().(client.Object)
+	require.NoError(t, live.Get(ctx, client.ObjectKeyFromObject(obj), latest))
+	switch change {
+	case "request", "matching-new-request":
+		latest.GetAnnotations()[constants.ModelArtifactRehydrationIDAnnotation] = "restore-002"
+		if change == "matching-new-request" {
+			entry.ArtifactRehydrationID = "restore-002"
+			rewriteRestorationReport(ctx, t, live, obj, node, *entry)
+		}
+	case "model":
+		latest.SetUID("replacement")
+	case "report":
+		entry.Status = shared.ModelStatusFailed
+		rewriteRestorationReport(ctx, t, live, obj, node, *entry)
+	}
+	require.NoError(t, live.Update(ctx, latest))
+}
+
+// requireConflictRecollects changes one input, fails the first status update
+// with a conflict, and checks that the retry reads the reports again.
+func requireConflictRecollects(t *testing.T, cluster bool, change string) {
+	t.Helper()
+	obj, node := restorationModel(cluster), restorationNode("node-a")
+	entry := shared.ModelEntry{ModelUID: obj.GetUID(), Status: shared.ModelStatusReady, ArtifactRehydrationID: "restore-001"}
+	live := restorationClient(t, obj, node, restorationReport(t, obj, node, entry))
+	changed, lists := false, 0
+	c := interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, current client.Object, opts ...client.SubResourceUpdateOption) error {
+			if !changed {
+				changeRestorationInput(ctx, t, live, obj, node, &entry, change)
+				changed = true
+				return apierrors.NewConflict(schema.GroupResource{Resource: "models"}, obj.GetName(), fmt.Errorf("input changed"))
+			}
+			return c.SubResource(sub).Update(ctx, current, opts...)
+		},
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, reports := list.(*corev1.ConfigMapList); reports {
+				lists++
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	err := ReconcileStatusFromConfigMaps(t.Context(), c, live, logr.Discard(), obj, cluster, "Model")
+	if change == "model" {
+		require.ErrorContains(t, err, "identity changed during reconciliation")
+	} else {
+		require.NoError(t, err)
+	}
+	require.True(t, changed)
+	require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))
+	_, status, err := shared.ModelSpecAndStatus(obj)
+	require.NoError(t, err)
+	if change == "matching-new-request" {
+		require.NotNil(t, status.Rehydration)
+		require.Equal(t, "restore-002", status.Rehydration.CompletedRequestID)
+		require.Equal(t, v1beta1.LifeCycleStateReady, status.State)
+	} else {
+		require.Nil(t, status.Rehydration, "stale reports must not establish completion")
+	}
+	if change != "model" {
+		require.Equal(t, 2, lists, "a status conflict must refresh reports")
+	}
+	if change == "request" {
+		require.Equal(t, v1beta1.LifeCycleStateReady, status.State)
+		require.Equal(t, []string{"node-a"}, status.NodesReady)
+	}
+	if change == "report" {
+		require.Equal(t, v1beta1.LifeCycleStateFailed, status.State)
 	}
 }
 
@@ -306,50 +324,57 @@ func TestRestorationReadsReportsOnce(t *testing.T) {
 		for _, withConfig := range []bool{false, true} {
 			for _, withRequest := range []bool{false, true} {
 				t.Run(fmt.Sprintf("cluster=%t/config=%t/request=%t", cluster, withConfig, withRequest), func(t *testing.T) {
-					obj, node := restorationModel(cluster), restorationNode("node-a")
-					entry := shared.ModelEntry{ModelUID: obj.GetUID(), Status: shared.ModelStatusReady, ArtifactRehydrationID: "restore-001"}
-					if withConfig {
-						entry.Config = &shared.ModelConfig{ModelType: "test-type"}
-					}
-					if !withRequest {
-						obj.SetAnnotations(nil)
-					}
-					live := restorationClient(t, obj, node, restorationReport(t, obj, node, entry))
-					lists, nodeReads := 0, 0
-					c := interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
-						List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-							if _, reports := list.(*corev1.ConfigMapList); reports {
-								lists++
-							}
-							return c.List(ctx, list, opts...)
-						},
-					})
-					reader := interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
-						Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
-							if _, node := obj.(*corev1.Node); node {
-								nodeReads++
-							}
-							return c.Get(ctx, key, obj, opts...)
-						},
-					})
-					require.NoError(t, ReconcileStatusFromConfigMaps(t.Context(), c, reader, logr.Discard(), obj, cluster, "Model"))
-					require.Equal(t, 1, lists, "metadata and status must share the report read")
-					require.Zero(t, nodeReads, "completion must not add live Node reads")
-					require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))
-					spec, status, err := shared.ModelSpecAndStatus(obj)
-					require.NoError(t, err)
-					require.Equal(t, v1beta1.LifeCycleStateReady, status.State)
-					if withConfig {
-						require.Equal(t, "test-type", *spec.ModelType)
-					}
-					if withRequest {
-						require.Equal(t, "restore-001", status.Rehydration.CompletedRequestID)
-					} else {
-						require.Nil(t, status.Rehydration)
-					}
+					requireReportsReadOnce(t, cluster, withConfig, withRequest)
 				})
 			}
 		}
+	}
+}
+
+// requireReportsReadOnce reconciles one Ready report and checks that the
+// reports are listed once and that no Node is read from the live reader.
+func requireReportsReadOnce(t *testing.T, cluster, withConfig, withRequest bool) {
+	t.Helper()
+	obj, node := restorationModel(cluster), restorationNode("node-a")
+	entry := shared.ModelEntry{ModelUID: obj.GetUID(), Status: shared.ModelStatusReady, ArtifactRehydrationID: "restore-001"}
+	if withConfig {
+		entry.Config = &shared.ModelConfig{ModelType: "test-type"}
+	}
+	if !withRequest {
+		obj.SetAnnotations(nil)
+	}
+	live := restorationClient(t, obj, node, restorationReport(t, obj, node, entry))
+	lists, nodeReads := 0, 0
+	c := interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, reports := list.(*corev1.ConfigMapList); reports {
+				lists++
+			}
+			return c.List(ctx, list, opts...)
+		},
+	})
+	reader := interceptor.NewClient(live.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, node := obj.(*corev1.Node); node {
+				nodeReads++
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	require.NoError(t, ReconcileStatusFromConfigMaps(t.Context(), c, reader, logr.Discard(), obj, cluster, "Model"))
+	require.Equal(t, 1, lists, "metadata and status must share the report read")
+	require.Zero(t, nodeReads, "completion must not add live Node reads")
+	require.NoError(t, live.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))
+	spec, status, err := shared.ModelSpecAndStatus(obj)
+	require.NoError(t, err)
+	require.Equal(t, v1beta1.LifeCycleStateReady, status.State)
+	if withConfig {
+		require.Equal(t, "test-type", *spec.ModelType)
+	}
+	if withRequest {
+		require.Equal(t, "restore-001", status.Rehydration.CompletedRequestID)
+	} else {
+		require.Nil(t, status.Rehydration)
 	}
 }
 
@@ -370,7 +395,7 @@ func TestRestorationCompletionDoesNotReadLiveNode(t *testing.T) {
 				},
 			})
 			// Both initial acknowledgement and subsequent reconciles use the
-			// reports already filtered by orphan cleanup.
+			// reports that the cleanup of absent Nodes already filtered.
 			for range 2 {
 				require.NoError(t, ReconcileStatusFromConfigMaps(t.Context(), c, reader, logr.Discard(), obj, cluster, "Model"))
 				require.NoError(t, c.Get(t.Context(), client.ObjectKeyFromObject(obj), obj))

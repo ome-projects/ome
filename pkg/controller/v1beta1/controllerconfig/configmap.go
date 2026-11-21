@@ -695,12 +695,27 @@ type LifecycleConfig struct {
 	// in-code default: absence leaves every abandoned replacement its own
 	// grace.
 	AbandonedReplacementGracePeriod string `json:"abandonedReplacementGracePeriod,omitempty"`
+	// GangRestartGracePeriod is the termination grace a Restart gives the
+	// old pods of a multi-pod Instance it rebuilds. The restart has already
+	// taken them out of traffic, and without the member the gang lost they
+	// cannot finish the requests they hold. Their own
+	// terminationGracePeriodSeconds would otherwise keep the rebuilt pods,
+	// which reuse their names, waiting for that long. A duration string
+	// ("30s"). There is intentionally NO in-code default: absence leaves
+	// every old pod its own grace.
+	GangRestartGracePeriod string `json:"gangRestartGracePeriod,omitempty"`
 	// GangScheduleTimeout is the range of PodGroup schedule timeouts the
 	// gang scheduler accepts; the placement grace a gang's PodGroup
 	// carries as its timeout is kept inside it. Absence means no range —
 	// there are intentionally NO in-code bounds: the grace reaches the
 	// scheduler as it is.
 	GangScheduleTimeout *GangScheduleTimeoutConfig `json:"gangScheduleTimeout,omitempty"`
+	// KueuePodGroups, when true, puts the pods of a multi-pod Instance that
+	// carry a Kueue queue label into one Kueue pod group, so Kueue admits the
+	// Instance's pods together and evicts them together. Absent or false
+	// leaves each pod its own Kueue Workload. Applies to pods created after
+	// it is set.
+	KueuePodGroups *bool `json:"kueuePodGroups,omitempty"`
 	// Audit bounds migration admission against the owner's migration
 	// records, and how far back terminal records are kept in status.
 	// Absence means the caps do not exist, and since they are the only
@@ -1247,6 +1262,31 @@ func (c *LifecycleConfig) ToAbandonedReplacementGracePeriod() (time.Duration, er
 		return 0, fmt.Errorf("invalid lifecycle.abandonedReplacementGracePeriod: must be > 0, got %s", d)
 	}
 	return d, nil
+}
+
+// ToGangRestartGracePeriod validates and parses GangRestartGracePeriod. A
+// nil receiver or absent key is NOT an error — it means every old pod of a
+// restarted gang keeps its own grace, which the caller distinguishes from
+// invalid by the returned zero value.
+func (c *LifecycleConfig) ToGangRestartGracePeriod() (time.Duration, error) {
+	if c == nil || c.GangRestartGracePeriod == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(c.GangRestartGracePeriod)
+	if err != nil {
+		return 0, fmt.Errorf("invalid lifecycle.gangRestartGracePeriod %q: %w", c.GangRestartGracePeriod, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("invalid lifecycle.gangRestartGracePeriod: must be > 0, got %s", d)
+	}
+	return d, nil
+}
+
+// KueuePodGroupsEnabled reports whether KueuePodGroups is set to true. A nil
+// receiver or an absent key is off: each queued pod stays its own Kueue
+// Workload.
+func (c *LifecycleConfig) KueuePodGroupsEnabled() bool {
+	return c != nil && c.KueuePodGroups != nil && *c.KueuePodGroups
 }
 
 // Validate checks AutoMigrateConfig constraints.

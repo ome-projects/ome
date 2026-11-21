@@ -451,6 +451,10 @@ func LifecycleSpecToWorkload(v v1beta1.LifecycleSpec) workloadtypes.Lifecycle {
 		d := *v.InstanceReadyTimeout
 		out.InstanceReadyTimeout = &d
 	}
+	if v.LeaderGoneGracePeriod != nil {
+		d := *v.LeaderGoneGracePeriod
+		out.LeaderGoneGracePeriod = &d
+	}
 	if v.MigrationPolicy != nil {
 		out.MigrationPolicy = &workloadtypes.MigrationPolicy{
 			Mode: MigrationModeToWorkload(v.MigrationPolicy.Mode),

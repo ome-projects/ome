@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1375,8 +1376,9 @@ type recoveryHarness struct {
 	// the name production renders it under, so a harness driving that
 	// evidence renders that name.
 	container string
-	// recorder, when set, receives the pass's events; stepResult drains
-	// them into events after every pass so the buffer never fills.
+	// recorder, when set, receives the pass's events through eventSink,
+	// which moves them into events whenever the buffer is full; stepResult
+	// drains what is left after every pass.
 	recorder *record.FakeRecorder
 	events   []string
 	// gate, when set, is the coordination UpdateGate the passes consult
@@ -1493,6 +1495,12 @@ type recoveryHarness struct {
 	// model leaves their status exactly as it last wrote it, and the node
 	// lifecycle controller model sets their Ready condition False.
 	kubeletGone map[string]bool
+	// statusDeadlineStep, when set, runs the status pass's deadline step
+	// after every reconcile, as the InferenceReplica reconciler does: a
+	// row's InstanceReadyTimeout clock stops while a pause or an admission
+	// gate holds the Instance and starts again from the release, and an
+	// open move record's window is measured outside the pause.
+	statusDeadlineStep bool
 	// imageNameOnNode maps a spec image to the name the node's runtime
 	// reports for it: the node holds that image under a second reference
 	// (a retag, a mirror alias) and names the one it stored first.
@@ -2309,6 +2317,76 @@ func (h *recoveryHarness) drainEvents() {
 		default:
 			return
 		}
+	}
+}
+
+// eventSink is the recorder a pass hands the engine. The harness recorder
+// buffers a fixed number of events, and the pass that records one more
+// blocks with no failure. The sink moves the buffered events into events
+// whenever the buffer is full, so a pass records any number of events and
+// loses none.
+func (h *recoveryHarness) eventSink() record.EventRecorder {
+	return &drainingRecorder{h: h}
+}
+
+// drainingRecorder is the harness recorder with room made before every
+// event.
+type drainingRecorder struct {
+	h  *recoveryHarness
+	mu sync.Mutex
+}
+
+// makeRoom empties a full buffer into the harness's events.
+func (r *drainingRecorder) makeRoom() {
+	if len(r.h.recorder.Events) == cap(r.h.recorder.Events) {
+		r.h.drainEvents()
+	}
+}
+
+func (r *drainingRecorder) Event(object runtime.Object, eventtype, reason, message string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.makeRoom()
+	r.h.recorder.Event(object, eventtype, reason, message)
+}
+
+func (r *drainingRecorder) Eventf(object runtime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.makeRoom()
+	r.h.recorder.Eventf(object, eventtype, reason, messageFmt, args...)
+}
+
+func (r *drainingRecorder) AnnotatedEventf(object runtime.Object, annotations map[string]string, eventtype, reason, messageFmt string, args ...interface{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.makeRoom()
+	r.h.recorder.AnnotatedEventf(object, annotations, eventtype, reason, messageFmt, args...)
+}
+
+// TestRecoveryHarness_APassRecordsMoreEventsThanTheBufferHolds records five
+// events through the sink of a harness whose recorder buffers two. Every
+// event reaches the harness's list, in order, and the recording never
+// blocks.
+func TestRecoveryHarness_APassRecordsMoreEventsThanTheBufferHolds(t *testing.T) {
+	h := &recoveryHarness{recorder: record.NewFakeRecorder(2)}
+	sink := h.eventSink()
+	recorded := make(chan struct{})
+	go func() {
+		defer close(recorded)
+		for i := 0; i < 5; i++ {
+			sink.Eventf(nil, corev1.EventTypeNormal, "Recorded", "event %d", i)
+		}
+	}()
+	select {
+	case <-recorded:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("recording five events into a buffer of two blocked")
+	}
+	h.drainEvents()
+	want := []string{"Normal Recorded event 0", "Normal Recorded event 1", "Normal Recorded event 2", "Normal Recorded event 3", "Normal Recorded event 4"}
+	if !slices.Equal(h.events, want) {
+		t.Fatalf("the harness holds %q, want %q", h.events, want)
 	}
 }
 
@@ -3331,7 +3409,7 @@ func (h *recoveryHarness) pass() (ctrl.Result, error) {
 	}
 	deps := workloadtypes.Deps{Client: h.cachedClient(), APIReader: h.c, Expectations: workloadtypes.NewExpectations()}
 	if h.recorder != nil {
-		deps.Recorder = h.recorder
+		deps.Recorder = h.eventSink()
 	}
 	in := h.buildInput()
 	plan, err := workload.BuildPlan(h.component, h.desired, in.ObservedState)
@@ -3347,10 +3425,59 @@ func (h *recoveryHarness) pass() (ctrl.Result, error) {
 		return ctrl.Result{}, nil
 	}
 	h.publish(plan)
+	if h.statusDeadlineStep {
+		h.reconcileHeldDeadlines(plan)
+	}
 	if status.RolloutComplete(h.irStatuses(), h.target.Name) {
 		h.currentRevision = h.target.Name
 	}
 	return res, err
+}
+
+// reconcileHeldDeadlines is the status pass's deadline step: the rows with
+// an operation open are read against the holds the InferenceReplica
+// reconciler reads (a pod waiting on an admission gate, a gang surge
+// source through the surge row its attempt pods run in, every row under
+// a pause), a held row's clock stops and a released one starts again
+// from now; the open move records follow the pause the same way.
+func (h *recoveryHarness) reconcileHeldDeadlines(plan workloadtypes.ComponentPlan) {
+	h.t.Helper()
+	in := h.buildInput()
+	var rows []workloadtypes.InstanceStatus
+	for _, row := range in.ObservedState.InstanceStatuses {
+		if row.Operation != nil {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 0 && len(in.ObservedState.Migrations) == 0 {
+		return
+	}
+	held := map[int32]bool{}
+	for idx, pods := range query.BucketPodsByInstanceIdx(h.livePods()) {
+		for _, pod := range pods {
+			if workloadtypes.PodAdmissionGated(pod) {
+				held[idx] = true
+				break
+			}
+		}
+	}
+	for i := range rows {
+		op := rows[i].Operation
+		if op.Type == workloadtypes.InstanceOperationUpdate && op.SurgeIndex != nil && held[*op.SurgeIndex] {
+			held[rows[i].Index] = true
+		}
+	}
+	if plan.Paused {
+		for i := range rows {
+			held[rows[i].Index] = true
+		}
+	}
+	if err := escalation.ReconcileGatedDeadlines(h.ctx, in, rows, held, plan.InstanceReadyTimeout); err != nil {
+		h.t.Fatalf("ReconcileGatedDeadlines: %v", err)
+	}
+	if err := escalation.ReconcilePausedMigrationDeadlines(h.ctx, in, plan.Paused, plan.InstanceReadyTimeout); err != nil {
+		h.t.Fatalf("ReconcilePausedMigrationDeadlines: %v", err)
+	}
 }
 
 // cachedClient is the informer-backed client a pass reads through: the
@@ -3529,7 +3656,7 @@ func (h *recoveryHarness) publish(plan workloadtypes.ComponentPlan) {
 	if err != nil {
 		h.t.Fatalf("publish: build observation: %v", err)
 	}
-	publication, _, err := observation.TakeInlineV1Publication(status.DesiredPodCountByInstance(plan), h.target.Name)
+	publication, _, err := observation.TakeInlineV1Publication(plan, h.target.Name)
 	if err != nil {
 		h.t.Fatalf("publish: consume observation: %v", err)
 	}
@@ -6537,7 +6664,7 @@ func (h *recoveryHarness) publication() ([]workloadtypes.InstanceStatus, workloa
 	if err != nil {
 		h.t.Fatalf("publication observation: %v", err)
 	}
-	rows, counters, err := observation.TakeInlineV1Publication(status.DesiredPodCountByInstance(plan), h.target.Name)
+	rows, counters, err := observation.TakeInlineV1Publication(plan, h.target.Name)
 	if err != nil {
 		h.t.Fatalf("publication: %v", err)
 	}
@@ -12146,7 +12273,7 @@ func (h *recoveryHarness) componentCounters() workload.ComponentCounters {
 	if err != nil {
 		h.t.Fatalf("counters: build plan: %v", err)
 	}
-	_, counters, err := observation.TakeInlineV1Publication(status.DesiredPodCountByInstance(plan), h.target.Name)
+	_, counters, err := observation.TakeInlineV1Publication(plan, h.target.Name)
 	if err != nil {
 		h.t.Fatalf("counters: consume observation: %v", err)
 	}

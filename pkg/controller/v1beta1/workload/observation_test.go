@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -116,7 +117,7 @@ func TestPublicationObservationReusesOwnedRowsWithoutMutatingSource(t *testing.T
 	if _, err := observation.TakeInlineV1Statuses(); err == nil {
 		t.Fatal("publication observation was consumed twice")
 	}
-	if _, _, err := observation.TakeInlineV1Publication(nil, ""); err == nil {
+	if _, _, err := observation.TakeInlineV1Publication(types.ComponentPlan{}, ""); err == nil {
 		t.Fatal("publication counters accepted a consumed observation")
 	}
 }
@@ -148,7 +149,7 @@ func TestComponentObservationProvenanceAndEpochGuard(t *testing.T) {
 	if _, err := observation.InlineV1Statuses(); err == nil {
 		t.Fatal("decision observation materialized publication rows")
 	}
-	if _, _, err := observation.TakeInlineV1Publication(nil, ""); err == nil {
+	if _, _, err := observation.TakeInlineV1Publication(types.ComponentPlan{}, ""); err == nil {
 		t.Fatal("decision observation produced publication counters")
 	}
 	if !reflect.DeepEqual(observation.PersistedStatuses(), persisted) {
@@ -268,6 +269,7 @@ func BenchmarkPublicationObservationMaterialization(b *testing.B) {
 		}
 		pods := workload.NewCachedSelectorPodObservation(nil, byInstance)
 
+		plan := testfixture.PlanWithDesiredPods(desired)
 		b.Run(fmt.Sprintf("2000x%d/owned", podsPerInstance), func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
@@ -292,7 +294,7 @@ func BenchmarkPublicationObservationMaterialization(b *testing.B) {
 				if err != nil {
 					b.Fatal(err)
 				}
-				rows, counters, err := observation.TakeInlineV1Publication(desired, "revision-a")
+				rows, counters, err := observation.TakeInlineV1Publication(plan, "revision-a")
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -339,8 +341,9 @@ func BenchmarkPublicationObservationMaterialization(b *testing.B) {
 func legacyObservationComponentCounters(instances []types.InstanceStatus, desiredByIdx map[int32]int32, targetRevision string) workload.ComponentCounters {
 	counters := workload.ComponentCounters{Replicas: int32(len(instances))}
 	target := query.RevisionFromName(targetRevision)
+	plan := testfixture.PlanWithDesiredPods(desiredByIdx)
 	for _, instance := range instances {
-		desired := status.DesiredFor(desiredByIdx, instance.Index, instance.PodCount)
+		desired := plan.DesiredPodsFor(instance.Index, instance.PodCount)
 		if status.InstanceMeetsThreshold(instance.PodCount, instance.ReadyPodCount, desired) {
 			counters.ReadyReplicas++
 		}
@@ -627,7 +630,7 @@ func TestTakeInlineV1PublicationCountersIgnorePersistedObservationFields(t *test
 			if err != nil {
 				t.Fatalf("NewOwnedPublicationObservation: %v", err)
 			}
-			statuses, got, err := observation.TakeInlineV1Publication(desired, test.target)
+			statuses, got, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(desired), test.target)
 			if err != nil {
 				t.Fatalf("TakeInlineV1Publication: %v", err)
 			}
@@ -687,7 +690,7 @@ func TestTakeInlineV1PublicationUpdatedExcludesRowsPinnedOffTarget(t *testing.T)
 			if err != nil {
 				t.Fatalf("NewOwnedPublicationObservation: %v", err)
 			}
-			_, got, err := observation.TakeInlineV1Publication(map[int32]int32{0: 1, 1: 1, 2: 1}, test.target)
+			_, got, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(map[int32]int32{0: 1, 1: 1, 2: 1}), test.target)
 			if err != nil {
 				t.Fatalf("TakeInlineV1Publication: %v", err)
 			}
@@ -725,7 +728,7 @@ func TestTakeInlineV1PublicationDemotesReadyRowWithoutPods(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewOwnedPublicationObservation: %v", err)
 		}
-		statuses, counters, err := observation.TakeInlineV1Publication(map[int32]int32{0: 1, 1: 1, 2: 1}, "rev-a")
+		statuses, counters, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(map[int32]int32{0: 1, 1: 1, 2: 1}), "rev-a")
 		if err != nil {
 			t.Fatalf("TakeInlineV1Publication: %v", err)
 		}
@@ -821,7 +824,7 @@ func TestTakeInlineV1PublicationReadsRestartingOverAPodSetNotServing(t *testing.
 		if err != nil {
 			t.Fatalf("NewOwnedPublicationObservation: %v", err)
 		}
-		statuses, _, err := observation.TakeInlineV1Publication(desired, "rev-a")
+		statuses, _, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(desired), "rev-a")
 		if err != nil {
 			t.Fatalf("TakeInlineV1Publication: %v", err)
 		}
@@ -945,7 +948,7 @@ func TestTakeInlineV1PublicationReadsReadyOverAFailedAttemptWhileTheSourceServes
 		if err != nil {
 			t.Fatalf("NewOwnedPublicationObservation: %v", err)
 		}
-		statuses, _, err := observation.TakeInlineV1Publication(desired, targetRev)
+		statuses, _, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(desired), targetRev)
 		if err != nil {
 			t.Fatalf("TakeInlineV1Publication: %v", err)
 		}
@@ -1078,7 +1081,7 @@ func TestTakeInlineV1PublicationReadsReadyOverASurgeSourceWhoseReplacementCrashe
 		if err != nil {
 			t.Fatalf("NewOwnedPublicationObservation: %v", err)
 		}
-		statuses, _, err := observation.TakeInlineV1Publication(desired, targetRev)
+		statuses, _, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(desired), targetRev)
 		if err != nil {
 			t.Fatalf("TakeInlineV1Publication: %v", err)
 		}
@@ -1200,7 +1203,7 @@ func TestTakeInlineV1PublicationReadsAGangWithoutItsLeaderAsUnserving(t *testing
 	if err != nil {
 		t.Fatalf("NewOwnedPublicationObservation: %v", err)
 	}
-	statuses, counters, err := observation.TakeInlineV1Publication(map[int32]int32{0: 8, 1: 8, 2: 8}, "rev-a")
+	statuses, counters, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(map[int32]int32{0: 8, 1: 8, 2: 8}), "rev-a")
 	if err != nil {
 		t.Fatalf("TakeInlineV1Publication: %v", err)
 	}
@@ -1264,7 +1267,7 @@ func TestTakeInlineV1PublicationReadsRestartingWhenTheNodeRevokedReady(t *testin
 		if err != nil {
 			t.Fatalf("NewOwnedPublicationObservation: %v", err)
 		}
-		statuses, _, err := observation.TakeInlineV1Publication(desired, "rev-a")
+		statuses, _, err := observation.TakeInlineV1Publication(testfixture.PlanWithDesiredPods(desired), "rev-a")
 		if err != nil {
 			t.Fatalf("TakeInlineV1Publication: %v", err)
 		}
@@ -1349,6 +1352,7 @@ func fleetPublicationCases() []fleetPublicationCase {
 				available[pod.Name] = struct{}{}
 			}
 		}
+		plan := testfixture.PlanWithDesiredPods(desired)
 		for _, rowSet := range rowSets {
 			stored := rowSet.rows(s.instances)
 			for i := range stored {
@@ -1360,7 +1364,7 @@ func fleetPublicationCases() []fleetPublicationCase {
 				if err != nil {
 					tb.Fatal(err)
 				}
-				published, counters, err := observation.TakeInlineV1Publication(desired, irstatustest.Revision)
+				published, counters, err := observation.TakeInlineV1Publication(plan, irstatustest.Revision)
 				if err != nil {
 					tb.Fatal(err)
 				}

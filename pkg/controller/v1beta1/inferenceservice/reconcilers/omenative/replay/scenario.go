@@ -3,6 +3,7 @@ package replay
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +27,25 @@ const ClockAdvance = "clock.advance"
 // replica whose pass runs; absent, every member's pass runs in Component
 // order.
 const PeerServicesCreated = "replica.peerServicesCreated"
+
+// RecordSetBack is one more event id no machine declares: a write from
+// outside the controller that puts a Component's rolled-out record back on
+// the revision recorded before it, as a status restored from a backup or
+// patched by hand reads. No pass produces it and no cell names the
+// write; the cells a scenario cites are those of the record the next pass
+// finds.
+const RecordSetBack = "record.setBack"
+
+// StrategyEdit and RestartPolicyEdit are two more event ids no machine
+// declares: the operator's edit of one field of a Component's lifecycle
+// block, the update strategy's type or the restart policy. The template
+// does not move, so no revision is minted, and the engines read both fields
+// from the replica the next time they ask. The cells a scenario cites are
+// those of the state the tick's pass finds.
+const (
+	StrategyEdit      = "spec.strategy"
+	RestartPolicyEdit = "spec.restartPolicy"
+)
 
 // Vocabulary is the set of event ids, variants and cell ids a scenario may
 // cite: the union of what the run, coordination, canary and revision
@@ -111,6 +131,23 @@ type ComponentState struct {
 	Image string `json:"image,omitempty"`
 	// Partition is the user's lifecycle.updateStrategy.rollingUpdate.partition.
 	Partition *int32 `json:"partition,omitempty"`
+	// UpdateStrategy is the user's lifecycle.updateStrategy, in the API's
+	// own spelling: the type and both rollingUpdate budgets, maxSurge and
+	// maxUnavailable, as the service declares them for the Component. The
+	// projection writes it on the Component's replica, where the engine's
+	// gates read the side's own budgets: the pairing gates hold a side to
+	// its count less the stricter of its own maxUnavailable and the group's
+	// budget. Absent, the service declares no strategy and the replica
+	// carries none; a test that asks a gate then writes the strategy and the one
+	// budget it needs on its own copy of the replica. The partition
+	// stays in Partition, which spec.partition edits, and spec.strategy
+	// edits the type.
+	UpdateStrategy *v1beta1.UpdateStrategy `json:"updateStrategy,omitempty"`
+	// RestartPolicy is the user's lifecycle.restartPolicy: whether OMENative
+	// rebuilds a whole Instance when one of its pods restarts. Absent, the
+	// service declares none and the replica carries none.
+	// spec.restartPolicy edits it.
+	RestartPolicy *v1beta1.InstanceRestartPolicy `json:"restartPolicy,omitempty"`
 }
 
 // PolicySpec is one RolloutPolicy object.
@@ -218,10 +255,11 @@ type EventArgs struct {
 	// replacement gang is a row of its own beside its source until the old
 	// gang leaves, as the engine publishes a gang surge.
 	Replacement *int32 `json:"replacement,omitempty"`
-	// Ordinal is the ordinal of the pod a surge creates; the default is 1.
-	// A surge of an Instance whose serving pod already holds ordinal 1,
-	// as after an earlier promotion, names 0 so the two pods keep
-	// different names.
+	// Ordinal is the ordinal of the pod a surge creates. Absent, the pod
+	// takes the one of the engine's two slots, 0 and 1, that the
+	// Instance's own pod does not hold: 1 for a fresh Instance, 0 once a
+	// replacement serves at 1. Named, the ordinal is taken as written and
+	// must be free of the Instance's pods.
 	Ordinal *int32 `json:"ordinal,omitempty"`
 	// Protocol is the pairing protocol the revision a push mints carries;
 	// spec.rollout.pairingProtocol moves to it.
@@ -273,6 +311,18 @@ type EventArgs struct {
 	// (Unschedulable) counts nothing on the member's retry record, any
 	// other is one the schedule counted.
 	Reason string `json:"reason,omitempty"`
+	// Strategy is the update strategy type spec.strategy sets.
+	Strategy string `json:"strategy,omitempty"`
+	// Policy is the restart policy spec.restartPolicy sets.
+	Policy string `json:"policy,omitempty"`
+	// Unrecorded marks a failed attempt that the member's retry record does
+	// not count (member.failed, member.surgeFailed). The engine counts a gang
+	// surge once, when it gives the surge up: before that both rows of the
+	// pair read Failed with no record written. And it never counts a failed
+	// surge whose source started a newer attempt before the replacement was
+	// gone. The driver refuses the mark on a row outside a gang surge's pair:
+	// the engine counts every other failed attempt in the pass that writes it.
+	Unrecorded bool `json:"unrecorded,omitempty"`
 }
 
 // UnmarshalJSON accepts the one-key mapping form the timeline uses, a
@@ -381,6 +431,12 @@ func (s *Scenario) validate(vocab Vocabulary) error {
 		if cs.Image == "" && s.Initial.Service.Runtime == nil {
 			return fmt.Errorf("replay: %s: component %s declares no image and the service names no runtime to render", s.Scenario, name)
 		}
+		if us := cs.UpdateStrategy; us != nil && us.RollingUpdate != nil && us.RollingUpdate.Partition != nil {
+			return fmt.Errorf("replay: %s: component %s names a partition under updateStrategy; the component's partition field carries it, and spec.partition edits it", s.Scenario, name)
+		}
+		if rp := cs.RestartPolicy; rp != nil && !slices.Contains(restartPolicies, *rp) {
+			return fmt.Errorf("replay: %s: component %s declares the restart policy %q, which is not one of %v", s.Scenario, name, *rp, restartPolicies)
+		}
 	}
 	if runtime := s.Initial.Service.Runtime; runtime != nil && runtime.Image == "" {
 		return fmt.Errorf("replay: %s: the runtime declares no image", s.Scenario)
@@ -425,11 +481,14 @@ func validateEvent(scenario string, tick int, ev TimelineEvent, vocab Vocabulary
 		}
 		return nil
 	}
-	if ev.ID == PeerServicesCreated {
+	if ev.ID == PeerServicesCreated || ev.ID == RecordSetBack {
 		if ev.Variant != "" {
-			return fmt.Errorf("replay: %s tick %d: %s takes no variant", scenario, tick, PeerServicesCreated)
+			return fmt.Errorf("replay: %s tick %d: %s takes no variant", scenario, tick, ev.ID)
 		}
 		return nil
+	}
+	if ev.ID == StrategyEdit || ev.ID == RestartPolicyEdit {
+		return validateLifecycleEdit(scenario, tick, ev)
 	}
 	if vocab.Events != nil {
 		variants, declared := vocab.Events[ev.ID]

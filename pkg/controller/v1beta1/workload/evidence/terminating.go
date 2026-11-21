@@ -10,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -95,8 +96,9 @@ type TerminatingResult struct {
 	// RequeueAt is the next time-based evidence boundary or live recheck.
 	// Zero means progress depends on a resource event.
 	RequeueAt time.Time
-	// Overdue is how far past the pod's own DeletionTimestamp now is. It
-	// is negative for a pod still inside its own grace period.
+	// Overdue is how far now is past the pod's query.DeletionDeadline, the
+	// instant the reading waits for. It is negative for a pod that has not
+	// reached it.
 	Overdue time.Duration
 	// NodeReadErr carries a non-NotFound Node read failure for the caller
 	// to log: the one behind NodeReadError, or, on WithinGrace, the read
@@ -110,13 +112,14 @@ type TerminatingResult struct {
 
 // StuckTerminating classifies one Terminating pod for the force-delete
 // escalation, in this order: NotConfigured without a policy (no Node is
-// read); WithinGrace until DeletionTimestamp plus OverdueSlack has passed
-// (the timestamp already holds the pod's own grace period, so each pod
-// gets its own window), unless SkipGracePeriodOnUnreachableNode is set
+// read); WithinGrace until the pod's query.DeletionDeadline plus OverdueSlack
+// has passed (the deadline already holds the pod's own grace period, so
+// each pod gets its own window), unless
+// SkipGracePeriodOnUnreachableNode is set
 // and unreachableInsideGrace ends the wait early; ForeignFinalizers,
 // report-only, while finalizers remain, since a force-delete cannot
 // remove them; otherwise NodeDeath decides from the live node.
-func StuckTerminating(ctx context.Context, readers types.NodeReaders, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time) TerminatingResult {
+func StuckTerminating(ctx context.Context, readers types.NodeReaders, pod *corev1.Pod, policy *types.ForceDeletePolicy, lifecycle types.Lifecycle, now time.Time) TerminatingResult {
 	if policy == nil {
 		return TerminatingResult{Kind: NotConfigured}
 	}
@@ -125,17 +128,19 @@ func StuckTerminating(ctx context.Context, readers types.NodeReaders, pod *corev
 		// pass Terminating pods.
 		return TerminatingResult{Kind: WithinGrace}
 	}
-	overdueAt := pod.DeletionTimestamp.Add(policy.OverdueSlack)
+	overdueAt := query.DeletionDeadline(pod, lifecycle).Add(policy.OverdueSlack)
+	// overdue counts from the deadline itself, without the slack, so a text
+	// that carries it says how long the reading waited past the deadline.
+	overdue := now.Sub(overdueAt) + policy.OverdueSlack
 	if !now.After(overdueAt) {
 		// The policy is strictly "past" the deadline. One nanosecond is the
 		// smallest representable wake after equality, not a polling cadence.
 		res := TerminatingResult{Kind: WithinGrace, RequeueAt: overdueAt.Add(time.Nanosecond)}
 		if policy.SkipGracePeriodOnUnreachableNode {
-			return unreachableInsideGrace(ctx, readers, pod, policy, now, res)
+			return unreachableInsideGrace(ctx, readers, pod, policy, now, overdue, res)
 		}
 		return res
 	}
-	overdue := now.Sub(pod.DeletionTimestamp.Time)
 	if len(pod.Finalizers) > 0 {
 		return TerminatingResult{Kind: ForeignFinalizers, NodeName: pod.Spec.NodeName, Overdue: overdue}
 	}
@@ -150,8 +155,9 @@ func StuckTerminating(ctx context.Context, readers types.NodeReaders, pod *corev
 // decides. A pod held by finalizers or bound to no node, a node that is
 // gone or unreadable, and a node whose kubelet still reports all keep the
 // pod waiting. Signs younger than the threshold move the requeue to the
-// moment they come of age, if that is sooner.
-func unreachableInsideGrace(ctx context.Context, readers types.NodeReaders, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time, wait TerminatingResult) TerminatingResult {
+// moment they come of age, if that is sooner. overdue is carried through
+// for the caller's event text.
+func unreachableInsideGrace(ctx context.Context, readers types.NodeReaders, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time, overdue time.Duration, wait TerminatingResult) TerminatingResult {
 	if len(pod.Finalizers) > 0 || pod.Spec.NodeName == "" {
 		return wait
 	}
@@ -173,7 +179,7 @@ func unreachableInsideGrace(ctx context.Context, readers types.NodeReaders, pod 
 	if !kind.Actionable() {
 		return waitUntil(wait, at)
 	}
-	return TerminatingResult{Kind: kind, NodeName: live.Name, Overdue: now.Sub(pod.DeletionTimestamp.Time), GraceSkipped: true}
+	return TerminatingResult{Kind: kind, NodeName: live.Name, Overdue: overdue, GraceSkipped: true}
 }
 
 // waitAfterFailedRead keeps the pod waiting on a Node read that failed. A
@@ -382,20 +388,38 @@ func notReadySigns(node *corev1.Node) []nodeDeathSign {
 }
 
 // AllPodsTerminatingOverdue reports whether pods is non-empty and every
-// pod in it is Terminating past its own DeletionTimestamp — the deadline
-// the pod itself declared (its deletion request plus its own grace),
-// which a live kubelet meets within moments of it. A set in that state
-// is a teardown no further delete can move: the pods are already
-// deleted, and only their kubelet, a finalizer owner or the force-delete
-// escalation can remove them. No slack is applied, because nothing
-// destructive hangs on the reading — a teardown grazing its deadline on
-// a slow node reads as stalled for a pass and then completes.
-func AllPodsTerminatingOverdue(pods []*corev1.Pod, now time.Time) bool {
+// pod in it is Terminating with its query.DeletionDeadline behind now. A set
+// in that state is a teardown no further delete can move: every pod is
+// already deleted, and only its kubelet, a finalizer owner or the
+// force-delete escalation removes it.
+//
+// The reading does not say the pods are late. The apiserver sets a
+// pod's DeletionTimestamp one grace ahead when the pod is deleted. When
+// the kubelet has stopped the pod it sends a last delete, and the
+// apiserver moves the DeletionTimestamp to the present second in one
+// write and removes the pod in the next. A pod that stopped well inside
+// its grace reads as past its DeletionTimestamp between the two. A
+// caller that tells an operator the pods stay asks
+// AllPodsTerminatingOverdueFor.
+func AllPodsTerminatingOverdue(pods []*corev1.Pod, lifecycle types.Lifecycle, now time.Time) bool {
+	return AllPodsTerminatingOverdueFor(pods, lifecycle, now, 0)
+}
+
+// AllPodsTerminatingOverdueFor reports whether pods is non-empty and
+// every pod in it has stood Terminating past its query.DeletionDeadline for
+// at least wait. A pod on its way out is gone within moments of the
+// write that moved its DeletionTimestamp, so a pod that outlasts wait is
+// one nothing has removed. A wait of zero asks only that every
+// query.DeletionDeadline is behind now.
+func AllPodsTerminatingOverdueFor(pods []*corev1.Pod, lifecycle types.Lifecycle, now time.Time, wait time.Duration) bool {
 	if len(pods) == 0 {
 		return false
 	}
 	for _, pod := range pods {
-		if pod == nil || pod.DeletionTimestamp == nil || !now.After(pod.DeletionTimestamp.Time) {
+		if pod == nil || pod.DeletionTimestamp == nil {
+			return false
+		}
+		if past := now.Sub(query.DeletionDeadline(pod, lifecycle)); past <= 0 || past < wait {
 			return false
 		}
 	}
@@ -526,7 +550,7 @@ func AnyUnreportedPod(pods []*corev1.Pod, policy *types.ForceDeletePolicy) bool 
 // one already on its way out, NotConfigured when there is no policy to
 // read a Node under. A read error is returned rather than read as
 // "kept": the sweep fails the pass on it too.
-func ReadUnreportedPod(ctx context.Context, readers types.NodeReaders, pod *corev1.Pod, policy *types.ForceDeletePolicy, now time.Time) (TerminatingClass, error) {
+func ReadUnreportedPod(ctx context.Context, readers types.NodeReaders, pod *corev1.Pod, policy *types.ForceDeletePolicy, lifecycle types.Lifecycle, now time.Time) (TerminatingClass, error) {
 	if policy == nil || pod == nil {
 		return NotConfigured, nil
 	}
@@ -534,7 +558,7 @@ func ReadUnreportedPod(ctx context.Context, readers types.NodeReaders, pod *core
 	if pod.DeletionTimestamp == nil {
 		res = NodeDeath(ctx, readers.Live, pod, policy, now, 0)
 	} else {
-		res = StuckTerminating(ctx, readers, pod, policy, now)
+		res = StuckTerminating(ctx, readers, pod, policy, lifecycle, now)
 	}
 	if res.Kind == NodeReadError {
 		return res.Kind, fmt.Errorf("node-death evidence for pod %s: node %s read: %w", pod.Name, res.NodeName, res.NodeReadErr)

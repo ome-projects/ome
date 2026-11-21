@@ -48,7 +48,7 @@
         },
         "plugin": {
           "type": "object",
-          "required": ["topologyKey", "podGroupTopologyKeyAnnotation", "unsupportedPlacementGroupLabel", "defaultPermitTimeoutSeconds", "podGroupSyncTimeoutSeconds", "gcIntervalSeconds", "standaloneDomainPacking"],
+          "required": ["topologyKey", "podGroupTopologyKeyAnnotation", "unsupportedPlacementGroupLabel", "defaultPermitTimeoutSeconds", "podGroupSyncTimeoutSeconds", "gcIntervalSeconds", "standaloneDomainPacking", "preemption"],
           "properties": {
             "topologyKey": {"type": "string"},
             "podGroupTopologyKeyAnnotation": {"type": "string", "minLength": 1},
@@ -56,7 +56,16 @@
             "defaultPermitTimeoutSeconds": {"type": "integer", "minimum": 1},
             "podGroupSyncTimeoutSeconds": {"type": "integer", "minimum": 1},
             "gcIntervalSeconds": {"type": "integer", "minimum": 1},
-            "standaloneDomainPacking": {"type": "boolean"}
+            "standaloneDomainPacking": {"type": "boolean"},
+            "preemption": {
+              "type": "object",
+              "required": ["enabled", "maxInFlight"],
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {"type": "boolean"},
+                "maxInFlight": {"type": "integer", "minimum": 1}
+              }
+            }
           }
         },
         "percentageOfNodesToScore": {

@@ -142,6 +142,91 @@ type CanaryStatus struct {
 	// revert it asks for is the one that could not run.
 	// +optional
 	Failed *CanaryFailure `json:"failed,omitempty"`
+
+	// Forced records a force that drives the unit's open run to 100%
+	// (ome.io/rollout-force-mode): the mode, the reason, the run, and
+	// how it ended. Absent until a force applies to the unit. While it runs
+	// (no EndedAt) the unit has no timers or gates. An ended force keeps the
+	// record of what happened until the next force or a new run replaces it.
+	// +optional
+	Forced *CanaryForce `json:"forced,omitempty"`
+}
+
+// CanaryForce is one force on a canary run: the request and how it ended.
+type CanaryForce struct {
+	// Mode is how the force replaces the old Instances.
+	Mode CanaryForceMode `json:"mode"`
+
+	// Reason is the operator's reason, as given in ome.io/rollout-force-reason.
+	Reason string `json:"reason"`
+
+	// RunID is the rollout run the force applies to. A new run never
+	// inherits it.
+	RunID string `json:"runID"`
+
+	// CanaryRevisionHash is the canary revision the force drove. A crash on
+	// that canary may find no old Instance left; a later canary toward
+	// another revision is not affected by this force. It is cleared when the
+	// canary rolls back, since the rollback brings the old Instances back.
+	// +optional
+	CanaryRevisionHash string `json:"canaryRevisionHash,omitempty"`
+
+	// StartedAt is when the force first applied.
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// EndedAt is when the force ended; absent while it runs.
+	// +optional
+	EndedAt *metav1.Time `json:"endedAt,omitempty"`
+
+	// EndReason is how the force ended; empty while it runs.
+	// +optional
+	EndReason CanaryForceEndReason `json:"endReason,omitempty"`
+}
+
+// CanaryForceMode is how a force replaces the old Instances.
+// +kubebuilder:validation:Enum=Disruptive
+type CanaryForceMode string
+
+const (
+	// CanaryForceDisruptive replaces every old Instance of the canary group at
+	// once, ignoring the update strategy's budget; the service serves nothing
+	// until the new pods are Ready.
+	CanaryForceDisruptive CanaryForceMode = "Disruptive"
+)
+
+// CanaryForceEndReason is how a force ended.
+// +kubebuilder:validation:Enum=Completed;Crash;RolledBack;RunClosed;Paused;Removed;Changed;Expired
+type CanaryForceEndReason string
+
+const (
+	// CanaryForceCompleted: every Instance serves the new revision and the
+	// run completed.
+	CanaryForceCompleted CanaryForceEndReason = "Completed"
+	// CanaryForceEndedByCrash: a new pod kept dying after it served; the
+	// canary stopped as a crash stops it.
+	CanaryForceEndedByCrash CanaryForceEndReason = "Crash"
+	// CanaryForceEndedByRollback: an operator rolled back.
+	CanaryForceEndedByRollback CanaryForceEndReason = "RolledBack"
+	// CanaryForceEndedByRunClose: the rollout run the force named closed,
+	// for example because a new push opened a new run.
+	CanaryForceEndedByRunClose CanaryForceEndReason = "RunClosed"
+	// CanaryForceEndedByPause: an operator paused the rollout.
+	CanaryForceEndedByPause CanaryForceEndReason = "Paused"
+	// CanaryForceEndedByRemoval: the mode or run annotation was removed; the
+	// run continues as a normal canary from where it stands.
+	CanaryForceEndedByRemoval CanaryForceEndReason = "Removed"
+	// CanaryForceEndedByChange: the mode or run of the request changed while
+	// the force ran; the run continues as a normal canary from where it
+	// stands, and the changed request does not start a second force.
+	CanaryForceEndedByChange CanaryForceEndReason = "Changed"
+	// CanaryForceExpired: the configured time limit passed; the run continues
+	// as a normal canary from where it stands.
+	CanaryForceExpired CanaryForceEndReason = "Expired"
+)
+
+// Running reports whether the force is still in effect.
+func (f *CanaryForce) Running() bool {
+	return f != nil && f.EndedAt == nil
 }
 
 // AnalysisMetricResult is the last observed evaluation of one AnalysisMetric.

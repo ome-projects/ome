@@ -21,6 +21,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	isvcstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/v1beta1convert"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
@@ -415,6 +416,91 @@ func (d *driver) scaleUpImage(ctx context.Context, m *member) (string, error) {
 	return target, nil
 }
 
+// resize answers a new replica count as the replica controller does. The
+// engine's planner names the Instances the count keeps and the indexes it
+// adds (plannedIndexes), and the member follows it. A row the plan leaves
+// out goes with its pods, at once where the engine drains it over several
+// passes. An index the plan adds appears as a Create attempt with no pod
+// yet, the row the create pass writes for an Instance it has no row for: the
+// attempt names the revision the pass chooses (scaleUpImage), and the
+// running revision is recorded when the Instance is promoted Ready.
+func (d *driver) resize(ctx context.Context, m *member, replicas int32) error {
+	image, err := d.scaleUpImage(ctx, m)
+	if err != nil {
+		return err
+	}
+	planned, err := d.plannedIndexes(ctx, m, replicas)
+	if err != nil {
+		return err
+	}
+	keeps := make(map[int32]bool, len(planned))
+	for _, index := range planned {
+		keeps[index] = true
+	}
+	kept := m.rows[:0]
+	for _, row := range m.rows {
+		if keeps[row.index] {
+			kept = append(kept, row)
+			continue
+		}
+		m.removePodsOf(row.index)
+	}
+	m.rows = kept
+	for _, index := range planned {
+		if m.row(index) == nil {
+			m.rows = append(m.rows, creatingRow(index, image))
+		}
+	}
+	return nil
+}
+
+// plannedIndexes asks the engine's planner which Instance indexes a member
+// carries at a replica count. It calls the function the replica controller
+// calls on every pass (workload.BuildPlan), so the stand-in holds no order
+// of its own: a scale-down removes the Instances on a failing revision
+// first, then the ones that serve nothing, then the ones that serve another
+// revision than the roll target, and the highest index first among equals.
+// A scale-up takes the lowest free indexes. What the planner is told is the
+// stand-in's: the count of the scenario's event, rows rendered from the
+// member's state when the count lands (a Create attempt whose pod turned
+// Ready in the same tick still reads as an attempt), every single-pod
+// update at the surge step, one retry record for the spec's target, the
+// roll target the last service pass wrote on the replica, and no nodes. The
+// planner is asked once, at the event, where the engine asks on every pass.
+func (d *driver) plannedIndexes(ctx context.Context, m *member, replicas int32) ([]int32, error) {
+	rollTarget, err := d.rollTargetImage(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	rollTargetName, err := d.revisionName(ctx, m, rollTarget)
+	if err != nil {
+		return nil, err
+	}
+	target, err := d.revisionName(ctx, m, m.target)
+	if err != nil {
+		return nil, err
+	}
+	rows, _, err := d.publishedRows(ctx, m, target)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := workload.BuildPlan(v1beta1convert.ComponentTypeToWorkload(m.component),
+		types.WorkloadDesiredSpec{Replicas: replicas},
+		types.WorkloadObservedState{
+			RollTarget:       rollTargetName,
+			InstanceStatuses: v1beta1convert.InstanceStatusSliceToWorkload(rows),
+			RetryBlocks:      retryBlocksToWorkload(m.heldRecords(target)),
+		})
+	if err != nil {
+		return nil, fmt.Errorf("replay: plan %s at %d replicas: %w", m.component, replicas, err)
+	}
+	indexes := make([]int32, 0, len(plan.Instances))
+	for _, instance := range plan.Instances {
+		indexes = append(indexes, instance.Index)
+	}
+	return indexes, nil
+}
+
 // revisionHash is the hash of an image's revision, "" for no image.
 func (d *driver) revisionHash(ctx context.Context, m *member, image string) (string, error) {
 	name, err := d.revisionName(ctx, m, image)
@@ -452,7 +538,7 @@ func (d *driver) renderPod(ctx context.Context, m *member, p podState) (*corev1.
 	inst := types.InstancePlan{Index: p.index, Incarnation: 1, Runners: []types.RunnerPlan{{Name: defaultRunner, Size: 1}}}
 	runner := types.RunnerPlan{Name: defaultRunner, Size: 1}
 	pod, err := workloadops.RenderWithRevision(ir, v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"), d.workloadKey(m.component),
-		d.podTemplate(p.image), nil, plan, inst, runner, p.ordinal, hash, nil)
+		d.podTemplate(p.image), nil, plan, inst, query.PodSetHostnames{}, runner, p.ordinal, hash, nil)
 	if err != nil {
 		return nil, fmt.Errorf("replay: render pod: %w", err)
 	}
@@ -662,10 +748,13 @@ func (d *driver) syncEndpoints(ctx context.Context, m *member) error {
 // gang is built at, as the engine writes the pair; the replacement gang's
 // own row stands at the GangSurgeTarget step until the old gang leaves and
 // it is promoted in the source's place; a single-pod surge keeps the attempt
-// on its own row while the replacement stands beside the old pod.
+// on its own row while the replacement stands beside the old pod. A gang
+// surge's source that a recreate took, its own pod on the target revision
+// at its own index, publishes that attempt and no replacement index, as
+// the engine's row does from the pass that starts the recreate.
 func (m *member) publishedOperation(r rowState, phase v1beta1.OMENativeInstancePhase, running, rowTarget string) *v1beta1.InstanceOperation {
 	switch {
-	case r.replacement != nil:
+	case r.replacement != nil && m.podOn(r.index, r.target) == nil:
 		surgeIndex := *r.replacement
 		return &v1beta1.InstanceOperation{Type: v1beta1.InstanceOperationUpdate, Step: types.UpdateStepSurge, TargetRevision: rowTarget, SurgeIndex: &surgeIndex}
 	case r.replaces != nil:

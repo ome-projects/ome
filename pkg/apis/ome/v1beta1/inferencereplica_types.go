@@ -196,11 +196,14 @@ type InferenceReplicaSpec struct {
 	Runners []Runner `json:"runners,omitempty"`
 
 	// Lifecycle holds the OMENative lifecycle policies (RestartPolicy,
-	// UpdateStrategy, ReadyPolicy, InstanceReadyTimeout, MigrationPolicy).
+	// UpdateStrategy, ReadyPolicy, InstanceReadyTimeout,
+	// LeaderGoneGracePeriod, MigrationPolicy).
 	// An unset policy takes the fixed fallback its LifecycleSpec field
 	// names; an unset or zero instanceReadyTimeout falls back to the
 	// operator's lifecycle.instanceReadyTimeout on every replica, and with
-	// neither set operations open with no deadline. The operator's deploy
+	// neither set operations open with no deadline. An unset
+	// leaderGoneGracePeriod has no fallback on any replica: every pod keeps
+	// its own termination grace. The operator's deploy
 	// defaults are applied only to a projected replica, before the copy.
 	// lifecycle.minReadySeconds is not read on a replica and is rejected on
 	// a standalone one; set spec.minReadySeconds. On a projected replica
@@ -350,8 +353,11 @@ type Runner struct {
 	// Labels include ome.io/runner=<name>. The InferenceReplica
 	// controller stamps OME_RUNNER (leader|worker|default) and, for
 	// pods of a multi-pod Instance, OME_LEADER_ADDRESS (short-form
-	// DNS of the leader pod's per-incarnation hostname, matching LWS
-	// conventions) onto the rendered pod at create.
+	// DNS of the leader pod's hostname, matching LWS conventions)
+	// onto the rendered pod at create. The leader's hostname is its
+	// pod name followed by the recreation count its pod set was built
+	// at, or the pod name alone in a pod set whose pods already have
+	// that form.
 	Template corev1.PodTemplateSpec `json:"template"`
 }
 

@@ -58,6 +58,11 @@ func executeUpdatePass(ctx context.Context, deps types.Deps, input types.Reconci
 			return false, hold.Gate, hold.Reason
 		}
 	}
+	// The update ops report the holds they observe through the collector;
+	// a caller that wired none still has the pass report them.
+	if input.DrainHolds == nil {
+		input.DrainHolds = &types.DrainHolds{}
+	}
 	// Same memoized cached read Plan selected from — the pods handed to
 	// the Update op are the pods the selection read.
 	updateByInstance, listErr := snapshot.CachedPods(ctx)
@@ -152,8 +157,10 @@ func executeUpdatePass(ctx context.Context, deps types.Deps, input types.Reconci
 		// reports the hold.
 		firstDenial = nil
 	}
-	// A drain the gate held is progress held back, not an admission denial:
-	// it is reported even when another Instance moved this pass.
+	// A drain the gate held is progress held back, not an admission denial,
+	// and so is a start the op did not make on a copy of the row older than
+	// the row: either is reported even when another Instance moved this
+	// pass.
 	if hold := input.DrainHolds.First(); hold != nil {
 		firstDenial = hold
 	}

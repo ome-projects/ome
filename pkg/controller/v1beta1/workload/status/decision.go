@@ -435,11 +435,28 @@ func StampDeadline(ctx context.Context, input types.ReconcileInput, idx int32, d
 // on each of those turns would never be bounded by InstanceReadyTimeout
 // at all. An attempt parked after its disposition is nobody's and not in
 // flight: a new attempt opens over it with its own identity and deadline.
-func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx int32, targetRev string, strategy types.UpdateStrategyType, timeout time.Duration) error {
+//
+// read is the pass's copy of the row, the one the plan decided the start
+// or the continuation on. The copy comes from a cache that can be behind
+// the row. A live row already rolling toward targetRev goes on whatever
+// the copy reads: the row itself says the roll is open. Any other live row
+// gets a new attempt only while it still reads as the copy does. A row
+// another write moved since (promoted, taken by another operation, or
+// opened toward another revision) is left as it is, and the attempt is
+// reported not open: the caller touches no pod, and the next pass reads
+// the row as it is. A row that finished its roll is therefore never opened
+// again by a pass that read it before it finished. A pass that read no row
+// decided on an empty one.
+func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx int32, targetRev string, strategy types.UpdateStrategyType, timeout time.Duration, read *types.InstanceStatus) (InPlaceEntry, error) {
 	now := metav1.NewTime(input.Now())
+	if read == nil {
+		read = &types.InstanceStatus{Index: idx}
+	}
+	decidedOn := Capture(read)
 	var openSince *metav1.Time
+	var entry InPlaceEntry
 	err := input.MutateInstance(ctx, idx, func(s *types.InstanceStatus) bool {
-		openSince = nil
+		openSince, entry = nil, InPlaceEntry{Open: true}
 		inFlight := types.Owner(s) == types.OwnerUpdate && s.Operation.Type == types.InstanceOperationUpdate
 		if inFlight && s.Operation.Step == types.UpdateStepInPlace && s.TargetRevision == targetRev {
 			started := s.Operation.StartedAt
@@ -455,6 +472,11 @@ func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx i
 			s.Operation = &op
 			return true
 		}
+		if !decidedOn.Matches(*s) {
+			entry.Open = false
+			return false
+		}
+		entry.Began = types.Owner(s) != types.OwnerUpdate
 		s.Phase = types.InstancePhaseUpdating
 		s.TargetRevision = targetRev
 		s.Operation = &types.InstanceOperation{
@@ -470,9 +492,24 @@ func StampUpdatingInPlace(ctx context.Context, input types.ReconcileInput, idx i
 		return true
 	})
 	if err != nil {
-		return err
+		return InPlaceEntry{}, err
 	}
-	return entryStampAttemptStarted(ctx, input, targetRev, openSince)
+	if !entry.Open {
+		return entry, nil
+	}
+	return entry, entryStampAttemptStarted(ctx, input, targetRev, openSince)
+}
+
+// InPlaceEntry is what the write that opens an in-place attempt found on
+// the live row.
+type InPlaceEntry struct {
+	// Open reports that the row carries the attempt toward the target, so
+	// the pass may go on to the pods.
+	Open bool
+	// Began reports that this write took a row no update owned into the
+	// attempt. It is read off the live row inside the write: a pass whose
+	// copy is behind a start reports that start once, not again.
+	Began bool
 }
 
 // StampRecreating is the recreate entry point: bumps Incarnation (like

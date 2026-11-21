@@ -3,7 +3,6 @@ package workload_test
 import (
 	"fmt"
 	"math/rand"
-	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -71,8 +70,9 @@ const (
 	// gangWaitTicks is how long a probe lets a request stand before its
 	// second verb lands, so the record has been read by at least one pass.
 	gangWaitTicks = 2
-	// gangFollowText is the text the engine writes on a record it rebinds
-	// to the index a gang surge rebuilt its Instance under.
+	// gangFollowText is the note the engine writes on a record it rebinds
+	// to the index a gang surge rebuilt its Instance under, when the
+	// record names no wait of its own.
 	gangFollowText = "following the Instance rebuilt as"
 )
 
@@ -205,10 +205,10 @@ func (w *gangWorld) resetGangTrails() {
 	w.servedBuilds = map[types.UID]bool{}
 }
 
-// startGangProbe puts the world at a snapshot with every reading
-// cleared, the move model's and this file's.
-func (w *gangWorld) startGangProbe(snap *scaleSnapshot) {
-	w.startProbe(snap)
+// startProbe puts the world at a snapshot with every reading cleared,
+// the move model's and this file's.
+func (w *gangWorld) startProbe(snap *scaleSnapshot) {
+	w.moveWorld.startProbe(snap)
 	w.resetGangTrails()
 	w.passClock = w.clk.Now()
 }
@@ -512,7 +512,7 @@ func (w *gangWorld) readWindows(passClock time.Time) {
 		if moveWaitsForTheRoll(rec) {
 			trail.waited = true
 		}
-		if strings.Contains(rec.Message, gangFollowText) {
+		if rec.SourceInstance != req.source || strings.Contains(rec.Message, gangFollowText) {
 			trail.followed = true
 		}
 		window := s.h.lifecycle.InstanceReadyTimeout.Duration
@@ -950,31 +950,8 @@ func (w *gangWorld) explore(full bool, seed int64, runs int) {
 	}
 	w.reachIdle()
 	snaps := w.momentSnapshots(full)
-	for _, m := range gangMoments {
-		snap := snaps[m]
-		if snap == nil {
-			continue
-		}
-		for _, p := range w.probesAt(m, full) {
-			if w.mticks >= budget {
-				w.skipped++
-				continue
-			}
-			w.startGangProbe(snap)
-			w.path = append(w.path, "at "+m.String())
-			if !w.land(p) {
-				continue
-			}
-			w.probes++
-			settled := w.play(p)
-			if m == whenPaused && settled {
-				w.setPaused(false)
-				w.path = append(w.path, "resume")
-				settled = w.playOut()
-			}
-			w.finishProbe(settled)
-		}
-	}
+	probesAt := func(m moveMoment) []gangProbe { return w.probesAt(m, full) }
+	playProbesFromTheMoments(w.moveWorld, w, snaps, gangMoments, probesAt, budget)
 	w.randomRuns(snaps[whenIdle], seed, runs, budget)
 }
 
@@ -988,7 +965,7 @@ func (w *gangWorld) randomRuns(idle *scaleSnapshot, seed int64, runs, budget int
 			w.skipped++
 			continue
 		}
-		w.startGangProbe(idle)
+		w.startProbe(idle)
 		w.path = append(w.path, fmt.Sprintf("random run %d", run+1))
 		w.push(fixedImage)
 		w.probes++
@@ -1087,8 +1064,6 @@ var knownGangClasses = map[string]string{
 	"move-waits-unnamed-behind-the-move-in-flight-on-its-instance":    "a second request on an Instance whose first request is still moving it stands Accepted with no text until the first closes: the pass drives one record per Instance and says nothing on the one behind it: a queued request carries no text",
 	"move-past-its-accept-deadline-while-waiting-for-the-roll":        "a request waiting for the roll's surge replacements keeps the deadline it was accepted with on its record while the clock passes it: the deadline stands still for that wait and is measured again from the first pass with no surge in flight, as the text says",
 	"move-on-a-gang-the-scale-down-removes-refused-as-spanning-nodes": "a request on a gang the scale-down is removing is refused as a single pod whose pods span several nodes: the gang is out of the plan the scale-down built, so the move reads its shape as one pod; the refusal is right, its reason is not",
-	"move-starts-with-the-window-the-rolls-wait-spent":                "a request that named the roll as its wait and was then rebound to the index a gang surge rebuilt its Instance under loses the wait's text to the rebinding note, so the first pass with no surge in flight does not measure the window again and the move starts with the window the wait spent",
-	"move-expired-after-a-named-wait-while-following-the-gang-surge":  "the same record closed Failed at the deadline the wait had spent, since the expiry restarts the deadline only on a record whose text still names the roll",
 }
 
 // gangKnownClasses are every known class a run reads against: the
@@ -1101,126 +1076,20 @@ func gangKnownClasses() map[string]string {
 	return out
 }
 
-// gangResult is what one configuration's exploration found.
-type gangResult struct {
-	cfg                                               gangConfig
-	states, ticks, passes, gateCalls, probes, skipped int
-	counts                                            map[string]int
-	findings                                          map[string]scaleFinding
-	took                                              time.Duration
-}
-
-// gangExample is one configuration's first picture of a class.
-type gangExample struct {
-	cfg     gangConfig
-	finding scaleFinding
-}
-
-// gangTotals sums the results of a run and keeps the first pictures of
-// every class.
-type gangTotals struct {
-	states, ticks, passes, gateCalls, probes, skipped int
-	classes                                           map[string]int
-	configurations                                    map[string]int
-	examples                                          map[string][]gangExample
-}
-
-func (tot *gangTotals) add(res gangResult) {
-	tot.states += res.states
-	tot.ticks += res.ticks
-	tot.passes += res.passes
-	tot.gateCalls += res.gateCalls
-	tot.probes += res.probes
-	tot.skipped += res.skipped
-	for class, c := range res.counts {
-		tot.classes[class] += c
-	}
-	for class, f := range res.findings {
-		tot.configurations[class]++
-		if len(tot.examples[class]) < 6 {
-			tot.examples[class] = append(tot.examples[class], gangExample{cfg: res.cfg, finding: f})
-		}
-	}
-}
-
-// report logs every class with its first pictures and fails on a class
-// that is neither expected nor known.
-func (tot *gangTotals) report(t *testing.T, configs int, took time.Duration) {
+// exploreGangConfig explores one configuration and reports what it found.
+func exploreGangConfig(t *testing.T, cfg gangConfig, full bool, seed int64, runs int) probeResult[gangConfig] {
 	t.Helper()
-	known := gangKnownClasses()
-	classes := make([]string, 0, len(tot.classes))
-	for class := range tot.classes {
-		classes = append(classes, class)
-	}
-	sort.Strings(classes)
-	t.Logf("%d configurations, %d states, %d ticks, %d passes, %d gate questions, %d probes (%d skipped past the tick budget), %s", configs, tot.states, tot.ticks, tot.passes, tot.gateCalls, tot.probes, tot.skipped, took.Round(time.Second))
-	for _, class := range classes {
-		t.Logf("%s: %d states in %d configurations", class, tot.classes[class], tot.configurations[class])
-		if moveExpectedClasses[class] || gangExpectedClasses[class] {
-			continue
-		}
-		for _, ex := range tot.examples[class] {
-			t.Logf("  [%s]\n    %s\n    path: %s\n    state: %s", ex.cfg, ex.finding.message, ex.finding.path, ex.finding.state)
-		}
-		if text := known[class]; text != "" {
-			t.Logf("  known: %s", text)
-			continue
-		}
-		t.Errorf("%s: %d states (first: %s: %s)", class, tot.classes[class], tot.examples[class][0].cfg, tot.examples[class][0].finding.message)
-	}
-}
-
-// exploreGangConfig explores one configuration once a worker slot is
-// free and reports what it found.
-func exploreGangConfig(t *testing.T, cfg gangConfig, full bool, seed int64, runs int, admission chan struct{}) gangResult {
-	t.Helper()
-	admission <- struct{}{}
-	defer func() { <-admission }()
 	began := time.Now()
 	w := newGangWorld(t, cfg)
 	w.explore(full, seed, runs)
-	return gangResult{cfg: cfg, states: len(w.seen), ticks: w.ticks, passes: w.passes, gateCalls: w.gateCalls, probes: w.probes, skipped: w.skipped,
-		counts: w.counts, findings: w.findings, took: time.Since(began)}
+	return probeResultOf(w.moveWorld, cfg, began)
 }
 
 // gangExplore runs the model over the configurations keep admits, a
 // bounded number at a time in parallel, and reports every class.
 func gangExplore(t *testing.T, keep func(gangConfig) bool) {
 	t.Helper()
-	full := os.Getenv(moveGangFullEnv) == "full"
-	only := os.Getenv(moveGangOnlyEnv)
-	runs, workers := 1, 8
-	if full {
-		runs, workers = 4, gangWorkers
-	}
-	start := time.Now()
-	var configs []gangConfig
-	for _, cfg := range gangConfigs(full) {
-		if keep(cfg) && (only == "" || strings.Contains(cfg.String(), only)) {
-			configs = append(configs, cfg)
-		}
-	}
-	results := make([]gangResult, len(configs))
-	admission := make(chan struct{}, workers)
-	t.Run("configurations", func(t *testing.T) {
-		for i, cfg := range configs {
-			t.Run(strings.ReplaceAll(cfg.String(), "/", "_"), func(t *testing.T) {
-				t.Parallel()
-				results[i] = exploreGangConfig(t, cfg, full, int64(i+1), runs, admission)
-			})
-		}
-	})
-	tot := &gangTotals{classes: map[string]int{}, configurations: map[string]int{}, examples: map[string][]gangExample{}}
-	for n, res := range results {
-		tot.add(res)
-		var parts []string
-		for class, c := range res.counts {
-			parts = append(parts, fmt.Sprintf("%s=%d", class, c))
-		}
-		sort.Strings(parts)
-		t.Logf("config %d/%d [%s]: %d states, %d ticks, %d probes (%d skipped past the tick budget), %s: %s", n+1, len(configs), res.cfg, res.states, res.ticks, res.probes, res.skipped, res.took.Round(time.Second), strings.Join(parts, " "))
-	}
-	tot.report(t, len(configs), time.Since(start))
+	runModel(t, modelRun[gangConfig]{fullEnv: moveGangFullEnv, onlyEnv: moveGangOnlyEnv, runs: 1, fullRuns: 4, fullWorkers: gangWorkers, configs: gangConfigs, explore: exploreGangConfig, known: gangKnownClasses(), expected: gangExpectedClasses}, keep)
 }
 
 // TestMoveGang_EveryRequestOnAGangBesideAPushEndsOnTheInstance explores
@@ -1242,26 +1111,7 @@ func TestMoveGang_EveryRequestOnAGangBesideAPushEndsOnTheInstance(t *testing.T) 
 func playOneGangProbe(t *testing.T, cfg gangConfig, p gangProbe) *gangWorld {
 	t.Helper()
 	w := newGangWorld(t, cfg)
-	w.reachIdle()
-	snap := w.momentSnapshots(p.moment == whenHeld)[p.moment]
-	if snap == nil {
-		t.Fatalf("the roll never reached its %s moment", p.moment)
-	}
-	w.startGangProbe(snap)
-	w.path = append(w.path, "at "+p.moment.String())
-	if !w.land(p) {
-		t.Fatalf("no gang fits the probe %s; picture: %s", p, w.picture())
-	}
-	settled := w.play(p)
-	if p.moment == whenPaused && settled {
-		w.setPaused(false)
-		w.path = append(w.path, "resume")
-		settled = w.playOut()
-	}
-	w.finishProbe(settled)
-	if !settled {
-		t.Fatalf("the world never settled; picture: %s", w.picture())
-	}
+	playOneProbeFromTheMoment(t, w.moveWorld, w, p.moment, p, "gang")
 	return w
 }
 
@@ -1435,7 +1285,7 @@ func TestMoveGang_TheRollsSurgesAndTheMoveNeverClaimOneIndex(t *testing.T) {
 		t.Fatalf("the roll never reached its rotating moment")
 	}
 	for _, target := range []gangTarget{gangOpen, gangDone, gangBehind} {
-		w.startGangProbe(snap)
+		w.startProbe(snap)
 		w.path = append(w.path, "at rotating")
 		if !w.land(gangProbe{moment: whenRotating, verb: gangRequest, side: 0, target: target}) {
 			t.Fatalf("no gang fits the target %s; picture: %s", target, w.picture())
@@ -1473,7 +1323,7 @@ func TestMoveGang_ARequestOnAGangTheRollRebuildsInPlaceWaitsUnnamedUntilItIsRead
 	if snap == nil {
 		t.Fatalf("the roll never reached its rotating moment")
 	}
-	w.startGangProbe(snap)
+	w.startProbe(snap)
 	w.path = append(w.path, "at rotating")
 	if !w.land(gangProbe{moment: whenRotating, verb: gangRequest, side: 0, target: gangOpen}) {
 		t.Fatalf("no gang is being rebuilt; picture: %s", w.picture())
@@ -1545,26 +1395,24 @@ func (w *gangWorld) uncordonEveryNode(s *scaleSide) {
 	w.path = append(w.path, "every cordon is removed")
 }
 
-// TestMoveGang_ARequestThatFollowedItsGangStartsWithTheWindowTheRollsWaitSpent
-// holds the current deadline on two gangs of two under a surge of one, in
-// a cluster with room only on the nodes the gangs hold. Version 2 is
+// TestMoveGang_ARequestThatFollowedItsGangMeasuresItsWindowFromTheRollsRelease
+// holds the deadline on two gangs of two under a surge of one, in a
+// cluster with room only on the nodes the gangs hold. Version 2 is
 // pushed; the roll's copy of gang 0 comes up on the nodes gang 0 holds,
 // its leader on gang 0's leader's node, and the operator asks gang 0 off
 // that node while the copy comes up. The record names the roll as what
 // it waits for and says its window will run from the roll's release. The
 // copy serves, the old gang leaves, and the record follows the Instance
-// to the copy's index; the room is then opened again. On the first pass
-// with no surge in flight the Instance still sits on the node, so the
-// move starts: it starts with the window the wait spent, since the
-// rebinding note replaced the wait's text and only that text restarts
-// the window. A rule that starts the move with its whole window flips
-// the last check.
-func TestMoveGang_ARequestThatFollowedItsGangStartsWithTheWindowTheRollsWaitSpent(t *testing.T) {
+// to the copy's index and keeps its wait's word; the room is then opened
+// again. On the first pass with no surge in flight the Instance still
+// sits on the node, so the move starts with its whole window, measured
+// from that pass.
+func TestMoveGang_ARequestThatFollowedItsGangMeasuresItsWindowFromTheRollsRelease(t *testing.T) {
 	cfg := gangConfig{moveConfig: moveConfig{scaleConfig: scaleConfig{shape: scaleShape{2, 0, 2}, settings: scaleSettings{prefill: workloadtypes.UpdateStrategySurgeThenDrain, budget: "1"}}}}
 	w := newGangWorld(t, cfg)
 	w.reachIdle()
 	s := w.prefill()
-	w.startGangProbe(w.snapshot())
+	w.startProbe(w.snapshot())
 	var held []string
 	for _, pod := range s.h.livePods() {
 		held = append(held, pod.Spec.NodeName)
@@ -1619,11 +1467,11 @@ func TestMoveGang_ARequestThatFollowedItsGangStartsWithTheWindowTheRollsWaitSpen
 	if waited < scaleRollLeastStep {
 		t.Fatalf("the wait for the roll should span at least one tick for the reading to hold; it spanned %s", waited)
 	}
-	if !rec.Deadline.Time.Equal(rec.StartedAt.Add(window)) || left >= window {
-		t.Errorf("current deadline: the move starts with the window the wait spent, its deadline still the accept time plus %s; the deadline reads %s for a request accepted at %s, and the move started at %s with %s left", window, rec.Deadline.Time, rec.StartedAt.Time, startedAt, left)
+	if !rec.Deadline.After(rec.StartedAt.Add(window)) || left != window {
+		t.Errorf("the move should start with its whole %s window measured from the roll's release; the deadline reads %s for a request accepted at %s, and the move started at %s with %s left", window, rec.Deadline.Time, rec.StartedAt.Time, startedAt, left)
 	}
-	if n := w.counts["move-starts-with-the-window-the-rolls-wait-spent"]; n != 1 {
-		t.Errorf("the model should read the spent window once; classes %v", sortedFindingClasses(w.findings))
+	if n := w.counts["move-starts-with-the-window-the-rolls-wait-spent"]; n != 0 {
+		t.Errorf("the model should read no spent window; classes %v", sortedFindingClasses(w.findings))
 	}
 	t.Logf("the request waited %s for the roll and started with %s of its %s window", waited, left, window)
 }

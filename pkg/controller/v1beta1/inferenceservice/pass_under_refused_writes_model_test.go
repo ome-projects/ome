@@ -147,6 +147,8 @@ func strategyWord(strategy v1beta1.UpdateStrategyType) string {
 		return "surge"
 	case v1beta1.UpdateStrategyRecreatePod:
 		return "recreate"
+	case v1beta1.UpdateStrategyInPlaceIfPossible:
+		return "in-place"
 	}
 	return "unset"
 }
@@ -312,6 +314,9 @@ type refusedWorld struct {
 	scheduledAt map[string]int
 	// deletedAt is the tick a pod's deletion began, by pod name.
 	deletedAt map[string]int
+	// forceDeleted names the pods deleted with no grace period, which the
+	// apiserver removes without waiting for their kubelet.
+	forceDeleted map[string]bool
 	// created counts pods created since the world was made, for UIDs.
 	created int
 	// knownPods is the pod set the informer last delivered, by name.
@@ -357,6 +362,38 @@ type refusedWorld struct {
 	ticks, probes int
 	seen          map[string]bool
 	path          string
+
+	// ext is another model's extension of this world: its operator
+	// configuration, its kubelet rules and its readings. Nil leaves every
+	// rule of this file as it is.
+	ext *worldExtension
+}
+
+// worldExtension is what another model adds to the world: the data of the
+// operator ConfigMap, objects beside the service, a hand on each
+// Component's lifecycle spec, a kubelet rule tried before the default one,
+// how long a deleted pod stays, a reading at the end of every tick, and
+// the bookkeeping the snapshot carries. Every field is optional.
+type worldExtension struct {
+	configData map[string]string
+	objects    []client.Object
+	lifecycle  func(c v1beta1.ComponentType, lc *v1beta1.LifecycleSpec)
+	// advance answers true when it handled the pod; false hands the pod to
+	// the default kubelet rule.
+	advance func(w *refusedWorld, pod *corev1.Pod) bool
+	// letGoAfter is the ticks a deleted pod stays Terminating; nil means one.
+	letGoAfter func(pod *corev1.Pod) int
+	// endpoint is the endpoints controller's rule for one pod a Service
+	// selects: the endpoint it lists, or false when it lists none. Nil
+	// keeps the default rule.
+	endpoint func(svc *corev1.Service, pod *corev1.Pod) (discoveryv1.Endpoint, bool)
+	// afterPasses runs once the controllers of a tick have run and before
+	// the kubelet moves a pod, so a reading can tell what the controllers
+	// changed from what the cluster changed.
+	afterPasses func(w *refusedWorld)
+	observe     func(w *refusedWorld)
+	snapshot    func() any
+	restore     func(state any)
 }
 
 func (w *refusedWorld) components() []v1beta1.ComponentType {
@@ -406,6 +443,10 @@ func (w *refusedWorld) serviceSpec() v1beta1.InferenceServiceSpec {
 	decoder := &v1beta1.DecoderSpec{
 		Runner:                 refusedRunner(w.images[v1beta1.DecoderComponent]),
 		ComponentExtensionSpec: refusedExt(w.counts[v1beta1.DecoderComponent], w.cfg.settings.decode, 0),
+	}
+	if w.ext != nil && w.ext.lifecycle != nil {
+		w.ext.lifecycle(v1beta1.EngineComponent, engine.Lifecycle)
+		w.ext.lifecycle(v1beta1.DecoderComponent, decoder.Lifecycle)
 	}
 	if s.pods > 1 {
 		workers := int(s.pods - 1)
@@ -461,21 +502,29 @@ var refusedLogOnce sync.Once
 
 func newRefusedWorld(t *testing.T, cfg refusedConfig) *refusedWorld {
 	t.Helper()
+	return newRefusedWorldWithExtension(t, cfg, nil)
+}
+
+// newRefusedWorldWithExtension is newRefusedWorld with another model's
+// extension wired in before the cluster is built.
+func newRefusedWorldWithExtension(t *testing.T, cfg refusedConfig, ext *worldExtension) *refusedWorld {
+	t.Helper()
 	refusedLogOnce.Do(func() { ctrl.SetLogger(logr.Discard()) })
 	w := &refusedWorld{
-		t: t, cfg: cfg, ctx: context.Background(),
-		clock:       clocktesting.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
-		events:      &recordedEvents{},
-		refuse:      &refusals{},
-		scheduledAt: map[string]int{},
-		deletedAt:   map[string]int{},
-		knownPods:   map[string]expectationKey{},
-		newPods:     map[string]string{},
-		podImages:   map[string]string{},
-		everUp:      map[v1beta1.ComponentType]map[string]bool{},
-		findings:    map[string]refusedFinding{},
-		classes:     map[string]int{},
-		seen:        map[string]bool{},
+		t: t, cfg: cfg, ctx: context.Background(), ext: ext,
+		clock:        clocktesting.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)),
+		events:       &recordedEvents{},
+		refuse:       &refusals{},
+		scheduledAt:  map[string]int{},
+		deletedAt:    map[string]int{},
+		forceDeleted: map[string]bool{},
+		knownPods:    map[string]expectationKey{},
+		newPods:      map[string]string{},
+		podImages:    map[string]string{},
+		everUp:       map[v1beta1.ComponentType]map[string]bool{},
+		findings:     map[string]refusedFinding{},
+		classes:      map[string]int{},
+		seen:         map[string]bool{},
 		images: map[v1beta1.ComponentType]string{
 			v1beta1.EngineComponent: refusedImageV1, v1beta1.DecoderComponent: refusedImageV1, v1beta1.RouterComponent: refusedImageV1,
 		},
@@ -488,7 +537,11 @@ func newRefusedWorld(t *testing.T, cfg refusedConfig) *refusedWorld {
 		ObjectMeta: metav1.ObjectMeta{Name: refusedService, Namespace: refusedNamespace, UID: types.UID("svc-uid"), Generation: 1},
 		Spec:       w.serviceSpec(),
 	}
-	w.build([]client.Object{isvc, refusedServingRuntime(), refusedNode()})
+	objs := []client.Object{isvc, refusedServingRuntime(), refusedNode()}
+	if ext != nil {
+		objs = append(objs, ext.objects...)
+	}
+	w.build(objs)
 	return w
 }
 
@@ -513,9 +566,13 @@ func (w *refusedWorld) build(objs []client.Object) {
 		fakeclient.WithInterceptors(w.hooks()),
 	)
 	clientset := fake.NewClientset()
+	configData := map[string]string{}
+	if w.ext != nil && w.ext.configData != nil {
+		configData = w.ext.configData
+	}
 	if _, err := clientset.CoreV1().ConfigMaps("ome").Create(w.ctx, &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: "inferenceservice-config", Namespace: "ome"},
-		Data:       map[string]string{},
+		Data:       configData,
 	}, metav1.CreateOptions{}); err != nil {
 		w.t.Fatalf("config map: %v", err)
 	}
@@ -540,6 +597,12 @@ func (w *refusedWorld) build(objs []client.Object) {
 		Expectations:             workloadtypes.NewExpectationsWithClock(w.clock),
 		ScaleDownRequeueInterval: 30 * time.Second,
 		Clock:                    w.clock,
+	}
+	if w.ext != nil && w.ext.configData != nil {
+		// The replica controller reads the operator ConfigMap only when an
+		// extension wrote one: the retry schedule, the graces, the
+		// force-delete policy and the prefill/decode rules come from it.
+		w.replica.Clientset = clientset
 	}
 }
 
@@ -617,6 +680,11 @@ func (w *refusedWorld) onDelete(ctx context.Context, cl client.WithWatch, obj cl
 	if _, ok := obj.(*corev1.Pod); ok {
 		if _, seen := w.deletedAt[obj.GetName()]; !seen {
 			w.deletedAt[obj.GetName()] = w.tickNo
+		}
+		do := &client.DeleteOptions{}
+		do.ApplyOptions(opts)
+		if do.GracePeriodSeconds != nil && *do.GracePeriodSeconds == 0 {
+			w.forceDeleted[obj.GetName()] = true
 		}
 	}
 	return cl.Delete(ctx, obj, opts...)
@@ -777,9 +845,14 @@ func instanceKeyOf(pod *corev1.Pod) string {
 	return pod.Labels[constants.OMEComponentLabel] + "/" + pod.Labels[query.LabelInstanceIdx]
 }
 
-// letPodGo removes the kubelet finalizer one tick after the deletion began.
+// letPodGo removes the kubelet finalizer one tick after the deletion began,
+// or after the ticks the extension names.
 func (w *refusedWorld) letPodGo(pod *corev1.Pod) {
-	if w.tickNo <= w.deletedAt[pod.Name] {
+	after := 1
+	if w.ext != nil && w.ext.letGoAfter != nil {
+		after = w.ext.letGoAfter(pod)
+	}
+	if w.tickNo < w.deletedAt[pod.Name]+after {
 		return
 	}
 	pod.Finalizers = nil
@@ -787,13 +860,17 @@ func (w *refusedWorld) letPodGo(pod *corev1.Pod) {
 		w.t.Fatalf("let pod %s go: %v", pod.Name, err)
 	}
 	delete(w.deletedAt, pod.Name)
+	delete(w.forceDeleted, pod.Name)
 	delete(w.scheduledAt, pod.Name)
 }
 
 // advancePod places an unplaced pod, turns its containers Ready on the
 // configured timing, and folds the readiness gates into PodReady; one
-// status write carries what changed.
+// status write carries what changed. An extension's rule is asked first.
 func (w *refusedWorld) advancePod(pod *corev1.Pod) {
+	if w.ext != nil && w.ext.advance != nil && w.ext.advance(w, pod) {
+		return
+	}
 	changed := false
 	if pod.Spec.NodeName == "" {
 		pod.Spec.NodeName = "node-1"
@@ -899,14 +976,12 @@ func (w *refusedWorld) endpoints() {
 		var endpoints []discoveryv1.Endpoint
 		for j := range pods.Items {
 			pod := &pods.Items[j]
-			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || podCondition(pod, corev1.PodReady) != corev1.ConditionTrue || !selector.Matches(labels.Set(pod.Labels)) {
+			if !selector.Matches(labels.Set(pod.Labels)) {
 				continue
 			}
-			endpoints = append(endpoints, discoveryv1.Endpoint{
-				Addresses:  []string{"10.0.0.1"},
-				Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
-				TargetRef:  &corev1.ObjectReference{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
-			})
+			if endpoint, listed := w.endpointOf(svc, pod); listed {
+				endpoints = append(endpoints, endpoint)
+			}
 		}
 		sort.Slice(endpoints, func(a, b int) bool { return endpoints[a].TargetRef.Name < endpoints[b].TargetRef.Name })
 		slice := &discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: svc.Name + "-slice", Namespace: refusedNamespace}}
@@ -933,10 +1008,40 @@ func (w *refusedWorld) endpoints() {
 	}
 }
 
+// endpointOf is how the endpoints controller lists one pod a Service
+// selects: by the extension's rule when it has one, else a Running and
+// Ready pod that is not being deleted, listed Ready.
+func (w *refusedWorld) endpointOf(svc *corev1.Service, pod *corev1.Pod) (discoveryv1.Endpoint, bool) {
+	if w.ext != nil && w.ext.endpoint != nil {
+		return w.ext.endpoint(svc, pod)
+	}
+	if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning || podCondition(pod, corev1.PodReady) != corev1.ConditionTrue {
+		return discoveryv1.Endpoint{}, false
+	}
+	return discoveryv1.Endpoint{
+		Addresses:  []string{"10.0.0.1"},
+		Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+		TargetRef:  &corev1.ObjectReference{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
+	}, true
+}
+
+// endpointNames is a listing as the pods it names, each with the
+// conditions that differ from a plain Ready endpoint, so a listing that
+// keeps its pods and moves a condition reads as changed.
 func endpointNames(eps []discoveryv1.Endpoint) string {
 	names := make([]string, 0, len(eps))
 	for _, ep := range eps {
-		names = append(names, ep.TargetRef.Name)
+		name := ep.TargetRef.Name
+		if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
+			name += "/not-ready"
+		}
+		if ep.Conditions.Serving != nil && !*ep.Conditions.Serving {
+			name += "/not-serving"
+		}
+		if ep.Conditions.Terminating != nil && *ep.Conditions.Terminating {
+			name += "/terminating"
+		}
+		names = append(names, name)
 	}
 	return strings.Join(names, ",")
 }
@@ -953,6 +1058,9 @@ func (w *refusedWorld) tick() {
 	}
 	w.servicePass()
 	w.replicaPasses()
+	if w.ext != nil && w.ext.afterPasses != nil {
+		w.ext.afterPasses(w)
+	}
 	w.refuse.own(func() {
 		w.kubelet()
 		w.informer()
@@ -1111,6 +1219,8 @@ type refusedSnapshot struct {
 	counts      map[v1beta1.ComponentType]int32
 	partition   int32
 	strategies  [2]v1beta1.UpdateStrategyType
+	// ext is the extension's own bookkeeping at the instant.
+	ext any
 }
 
 // refusedListKinds are the kinds the two controllers and the model write.
@@ -1143,6 +1253,9 @@ func (w *refusedWorld) snapshot() *refusedSnapshot {
 	}
 	for k, v := range w.counts {
 		snap.counts[k] = v
+	}
+	if w.ext != nil && w.ext.snapshot != nil {
+		snap.ext = w.ext.snapshot()
 	}
 	for _, list := range refusedListKinds() {
 		if err := w.cli.List(w.ctx, list); err != nil {
@@ -1181,6 +1294,7 @@ func (w *refusedWorld) restore(snap *refusedSnapshot) {
 	w.created = snap.created
 	w.scheduledAt = copyIntMap(snap.scheduledAt)
 	w.deletedAt = copyIntMap(snap.deletedAt)
+	w.forceDeleted = map[string]bool{}
 	w.knownPods = map[string]expectationKey{}
 	for k, v := range snap.knownPods {
 		w.knownPods[k] = v
@@ -1205,6 +1319,9 @@ func (w *refusedWorld) restore(snap *refusedSnapshot) {
 	w.events = &recordedEvents{}
 	w.trace = nil
 	w.lastPassErr = nil
+	if w.ext != nil && w.ext.restore != nil {
+		w.ext.restore(snap.ext)
+	}
 	objs := make([]client.Object, 0, len(snap.objects))
 	for _, obj := range snap.objects {
 		objs = append(objs, obj.DeepCopyObject().(client.Object))
@@ -1422,6 +1539,9 @@ func (w *refusedWorld) observe() {
 	w.readRejected(r)
 	w.newPods = map[string]string{}
 	w.previous = r
+	if w.ext != nil && w.ext.observe != nil {
+		w.ext.observe(w)
+	}
 }
 
 // podCounts is one Component's pods at the end of a tick.
@@ -1564,7 +1684,7 @@ func (w *refusedWorld) readBudgets(c v1beta1.ComponentType, r *tickReading) {
 	if strategy == v1beta1.UpdateStrategySurgeThenDrain || (w.strategyEdited && c == v1beta1.EngineComponent) {
 		maxSurge = w.budgetOf(count)
 	}
-	if strategy == v1beta1.UpdateStrategyRecreatePod || (w.strategyEdited && c == v1beta1.EngineComponent) {
+	if strategy != v1beta1.UpdateStrategySurgeThenDrain || (w.strategyEdited && c == v1beta1.EngineComponent) {
 		maxUnavailable = w.budgetOf(count)
 	}
 	if r.down[c] > maxUnavailable {

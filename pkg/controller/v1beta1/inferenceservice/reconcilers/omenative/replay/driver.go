@@ -172,6 +172,11 @@ func cloneService(in ServiceState) ServiceState {
 			partition := *cs.Partition
 			cs.Partition = &partition
 		}
+		cs.UpdateStrategy = cs.UpdateStrategy.DeepCopy()
+		if cs.RestartPolicy != nil {
+			policy := *cs.RestartPolicy
+			cs.RestartPolicy = &policy
+		}
 		out.Components[name] = cs
 	}
 	for _, g := range in.Groups {
@@ -268,15 +273,37 @@ func (d *driver) liveService(ctx context.Context) (*v1beta1.InferenceService, er
 }
 
 // componentExt is the merged Component extension the projection and the
-// canary partition read for one Component.
+// canary partition read for one Component: its count, the restart policy
+// and the update strategy the scenario declares for it, and the user's
+// partition inside that strategy's rollingUpdate block. A Component that
+// declares none of the three carries no lifecycle block.
 func (d *driver) componentExt(c v1beta1.ComponentType) *v1beta1.ComponentExtensionSpec {
 	cs := d.service.Components[string(c)]
 	replicas := int(cs.Replicas)
 	ext := &v1beta1.ComponentExtensionSpec{MinReplicas: &replicas, MaxReplicas: replicas}
+	if cs.UpdateStrategy == nil && cs.Partition == nil && cs.RestartPolicy == nil {
+		return ext
+	}
+	ext.Lifecycle = &v1beta1.LifecycleSpec{}
+	if cs.RestartPolicy != nil {
+		policy := *cs.RestartPolicy
+		ext.Lifecycle.RestartPolicy = &policy
+	}
+	if cs.UpdateStrategy == nil && cs.Partition == nil {
+		return ext
+	}
+	strategy := &v1beta1.UpdateStrategy{}
+	if cs.UpdateStrategy != nil {
+		strategy = cs.UpdateStrategy.DeepCopy()
+	}
 	if cs.Partition != nil {
 		partition := *cs.Partition
-		ext.Lifecycle = &v1beta1.LifecycleSpec{UpdateStrategy: &v1beta1.UpdateStrategy{RollingUpdate: &v1beta1.RollingUpdate{Partition: &partition}}}
+		if strategy.RollingUpdate == nil {
+			strategy.RollingUpdate = &v1beta1.RollingUpdate{}
+		}
+		strategy.RollingUpdate.Partition = &partition
 	}
+	ext.Lifecycle.UpdateStrategy = strategy
 	return ext
 }
 
@@ -556,19 +583,20 @@ func (m *member) rowRunning(index int32) string {
 
 // project runs the production projector for one Component: the replica
 // spec the controller's component reconciler writes on every pass, with the
-// canary step's partition and the stable revision the Component's unit
-// keeps a side on.
+// canary step's partition, the stable revision the Component's unit keeps a
+// side on, and the update strategy a running canary force needs.
 func (d *driver) project(ctx context.Context, cached client.Client, live client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType, policies rollout.Policies) (*v1beta1.InferenceReplica, error) {
 	ir, err := irprojector.EnsureInferenceReplica(ctx, irprojector.Params{
-		ISVC:               isvc,
-		Component:          c,
-		ComponentExt:       d.componentExt(c),
-		ObjectMeta:         metav1.ObjectMeta{Labels: d.selectorLabels(c)},
-		PodSpec:            d.podTemplate(d.imageOf(c)),
-		PacingPartition:    d.partitionFor(isvc, policies, c),
-		RollbackToRevision: canary.StableSideTarget(isvc, policies, c),
-		Client:             cached,
-		Reader:             live,
+		ISVC:                   isvc,
+		Component:              c,
+		ComponentExt:           d.componentExt(c),
+		ObjectMeta:             metav1.ObjectMeta{Labels: d.selectorLabels(c)},
+		PodSpec:                d.podTemplate(d.imageOf(c)),
+		PacingPartition:        d.partitionFor(isvc, policies, c),
+		RollbackToRevision:     canary.StableSideTarget(isvc, policies, c),
+		UpdateStrategyOverride: canary.UpdateStrategyOverride(isvc, policies, c),
+		Client:                 cached,
+		Reader:                 live,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("replay: project %s: %w", c, err)

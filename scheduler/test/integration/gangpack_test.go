@@ -2,6 +2,8 @@ package integration
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -10,9 +12,14 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/component-base/metrics/legacyregistry"
+	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler"
 	schedconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	fwkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 
 	schedclientset "sigs.k8s.io/scheduler-plugins/pkg/generated/clientset/versioned"
@@ -37,6 +44,13 @@ func enableGangPack(p *schedconfig.Plugins) {
 // config so the profile carries our extension-point enrollment.
 func gangPackOptions(t *testing.T) []scheduler.Option {
 	t.Helper()
+	return gangPackOptionsCollectingEvery(t, 60)
+}
+
+// gangPackOptionsCollectingEvery is gangPackOptions with the plugin's periodic
+// release of gangs that have no pod left running every gcIntervalSeconds.
+func gangPackOptionsCollectingEvery(t *testing.T, gcIntervalSeconds int) []scheduler.Option {
+	t.Helper()
 	cfg, err := schedutil.NewDefaultSchedulerComponentConfig()
 	if err != nil {
 		t.Fatalf("default scheduler config: %v", err)
@@ -49,7 +63,7 @@ func gangPackOptions(t *testing.T) []scheduler.Option {
 			"unsupportedPlacementGroupLabel":"ome.io/placement-group",
 			"defaultPermitTimeoutSeconds":30,
 			"podGroupSyncTimeoutSeconds":5,
-			"gcIntervalSeconds":60
+			"gcIntervalSeconds":` + strconv.Itoa(gcIntervalSeconds) + `
 		}`)},
 	})
 	return []scheduler.Option{
@@ -643,4 +657,741 @@ func TestNoFitGangReschedulesWhenCapacityFrees(t *testing.T) {
 			t.Errorf("gang pod %s bound to %s, want rc1/rc2", name, node)
 		}
 	}
+}
+
+// heldBackGate keeps a pod out of the scheduler's queue until a test removes
+// it, as an admission queue does for a pod it has not let in yet.
+const heldBackGate = "testing.example/held-back"
+
+// gangOfEight names the pods of a gang of eight: a leader and
+// seven workers.
+func gangOfEight(prefix string) []string {
+	names := []string{prefix + "-leader-0"}
+	for worker := 0; worker < 7; worker++ {
+		names = append(names, fmt.Sprintf("%s-worker-%d", prefix, worker))
+	}
+	return names
+}
+
+// createGPUNodes creates count one-gpu nodes of the domain, named <prefix>-<n>.
+func createGPUNodes(t *testing.T, tc *testContext, prefix, domain string, count int) []string {
+	t.Helper()
+	names := make([]string, 0, count)
+	for n := 1; n <= count; n++ {
+		name := fmt.Sprintf("%s-%d", prefix, n)
+		if _, err := tc.ClientSet.CoreV1().Nodes().Create(tc.Ctx, makeGPUNode(name, domain, 1), metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create node %s: %v", name, err)
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+// createPodGroupOf creates a gang's PodGroup: members pods that land in one
+// domain, and timeout as the longest a member waits at the gate.
+func createPodGroupOf(t *testing.T, tc *testContext, ns, name string, members int32, timeout time.Duration) {
+	t.Helper()
+	pg := schedutil.MakePG(name, ns, members, nil, nil)
+	pg.Annotations = map[string]string{topologyKeyAnnotation: domainLabelKey}
+	seconds := int32(timeout.Seconds())
+	pg.Spec.ScheduleTimeoutSeconds = &seconds
+	if _, err := tc.SchedClient.SchedulingV1alpha1().PodGroups(ns).Create(tc.Ctx, pg, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create podgroup %s: %v", name, err)
+	}
+}
+
+// createGangPods creates the named members of the gang. The last heldBack of
+// them carry heldBackGate and are created first: the plugin plans a gang once
+// a member's cycle sees every pod of it, and a held-back pod has no cycle.
+func createGangPods(t *testing.T, tc *testContext, ns, pg string, names []string, heldBack int) {
+	t.Helper()
+	free := len(names) - heldBack
+	for _, i := range append(indexes(free, len(names)), indexes(0, free)...) {
+		pod := makeGangPod(names[i], ns, pg)
+		if i >= free {
+			pod.Spec.SchedulingGates = []v1.PodSchedulingGate{{Name: heldBackGate}}
+		}
+		if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, pod, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create pod %s: %v", names[i], err)
+		}
+	}
+}
+
+// indexes lists from, from+1, ... up to but not including to.
+func indexes(from, to int) []int {
+	out := make([]int, 0, to-from)
+	for i := from; i < to; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+// letIn removes heldBackGate from the named pods.
+func letIn(t *testing.T, tc *testContext, ns string, names []string) {
+	t.Helper()
+	pods := tc.ClientSet.CoreV1().Pods(ns)
+	for _, name := range names {
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			pod, err := pods.Get(tc.Ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			pod.Spec.SchedulingGates = nil
+			_, err = pods.Update(tc.Ctx, pod, metav1.UpdateOptions{})
+			return err
+		})
+		if err != nil {
+			t.Fatalf("remove the gate of pod %s: %v", name, err)
+		}
+	}
+}
+
+// boundNodes polls until every named pod is bound and returns each pod's node.
+func boundNodes(t *testing.T, tc *testContext, ns string, names []string, timeout time.Duration) map[string]string {
+	t.Helper()
+	nodes := make(map[string]string, len(names))
+	for _, name := range names {
+		nodes[name] = waitForPodBound(t, tc, ns, name, timeout)
+	}
+	return nodes
+}
+
+// boundNow returns the named pods that are bound to a node at this moment.
+func boundNow(t *testing.T, tc *testContext, ns string, names []string) []string {
+	t.Helper()
+	var bound []string
+	for _, name := range names {
+		pod, err := tc.ClientSet.CoreV1().Pods(ns).Get(tc.Ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get pod %s: %v", name, err)
+		}
+		if pod.Spec.NodeName != "" {
+			bound = append(bound, name)
+		}
+	}
+	return bound
+}
+
+// membersAtGate returns, for each pod of the namespace that waits at the gate,
+// the node the scheduler holds for it.
+func membersAtGate(tc *testContext, ns string) map[string]string {
+	held := map[string]string{}
+	for _, profile := range tc.Scheduler.Profiles {
+		profile.IterateOverWaitingPods(func(wp fwk.WaitingPod) {
+			if pod := wp.GetPod(); pod.Namespace == ns {
+				held[pod.Name] = pod.Spec.NodeName
+			}
+		})
+	}
+	return held
+}
+
+// waitForMembersAtGate polls until count pods of the namespace wait at the
+// gate, and returns the node held for each.
+func waitForMembersAtGate(t *testing.T, tc *testContext, ns string, count int, timeout time.Duration) map[string]string {
+	t.Helper()
+	var held map[string]string
+	err := wait.PollUntilContextTimeout(tc.Ctx, 50*time.Millisecond, timeout, true, func(context.Context) (bool, error) {
+		held = membersAtGate(tc, ns)
+		return len(held) == count, nil
+	})
+	if err != nil {
+		t.Fatalf("%d pod(s) wait at the gate, want %d: %v", len(held), count, err)
+	}
+	return held
+}
+
+// cachedPods is how many pods the scheduler's cache holds: the bound ones and
+// the ones it holds a node for at the gate.
+func cachedPods(t *testing.T, tc *testContext) int {
+	t.Helper()
+	count, err := tc.Scheduler.Cache.PodCount()
+	if err != nil {
+		t.Fatalf("count the scheduler's cached pods: %v", err)
+	}
+	return count
+}
+
+// waitForCachedPods polls until the scheduler's cache holds count pods, so the
+// next scheduling cycle plans on that state.
+func waitForCachedPods(t *testing.T, tc *testContext, count int, timeout time.Duration) {
+	t.Helper()
+	err := wait.PollUntilContextTimeout(tc.Ctx, 50*time.Millisecond, timeout, true, func(context.Context) (bool, error) {
+		return cachedPods(t, tc) == count, nil
+	})
+	if err != nil {
+		t.Fatalf("the scheduler's cache holds %d pod(s), want %d: %v", cachedPods(t, tc), count, err)
+	}
+}
+
+// deleteAtOnce deletes the named pods with no grace period: envtest runs no
+// kubelet, so a pod deleted with one would never leave.
+func deleteAtOnce(t *testing.T, tc *testContext, ns string, names []string) {
+	t.Helper()
+	zero := int64(0)
+	for _, name := range names {
+		if err := tc.ClientSet.CoreV1().Pods(ns).Delete(tc.Ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
+			t.Fatalf("delete pod %s: %v", name, err)
+		}
+	}
+}
+
+// nodeHeldByNone returns the first of the nodes that the scheduler holds for
+// no pod at the gate.
+func nodeHeldByNone(t *testing.T, nodes []string, atGate map[string]string) string {
+	t.Helper()
+	taken := map[string]bool{}
+	for _, node := range atGate {
+		taken[node] = true
+	}
+	for _, node := range nodes {
+		if !taken[node] {
+			return node
+		}
+	}
+	t.Fatalf("every node of %v is held for a pod at the gate", nodes)
+	return ""
+}
+
+// TestGangRebuiltWhileFiveMembersAreHeldBack: a gang of eight binds whole on
+// the eight nodes of its domain. Every pod of it is then deleted and created
+// again under the same PodGroup, as a restart of the whole gang does, and five
+// of the new pods are held back before the scheduler's queue. The plugin's
+// periodic release does not run in between: its period here is an hour.
+//
+// The plugin plans the rebuilt gang as a new one, so the three members the
+// scheduler can place wait at the gate and no pod of the gang is bound. Once
+// the five are let in, the gang binds whole.
+func TestGangRebuiltWhileFiveMembersAreHeldBack(t *testing.T) {
+	tc := startScheduler(t, globalKubeConfig, gangPackOptionsCollectingEvery(t, 3600)...)
+	defer tc.teardown(t)
+
+	const ns = "gang-rebuilt"
+	createNamespace(t, tc, ns)
+	idle := cachedPods(t, tc)
+	createGPUNodes(t, tc, "rb", "a", 8)
+	createPodGroupOf(t, tc, ns, "gang", 8, 2*time.Minute)
+	members := gangOfEight("rb")
+	createGangPods(t, tc, ns, "gang", members, 0)
+	boundNodes(t, tc, ns, members, time.Minute)
+
+	deleteAtOnce(t, tc, ns, members)
+	waitForCachedPods(t, tc, idle, 30*time.Second)
+	createGangPods(t, tc, ns, "gang", members, 5)
+
+	waitForMembersAtGate(t, tc, ns, 3, 30*time.Second)
+	if bound := boundNow(t, tc, ns, members); len(bound) != 0 {
+		t.Fatalf("pods of a gang with five members held back are bound: %v", bound)
+	}
+
+	letIn(t, tc, ns, members[3:])
+	boundNodes(t, tc, ns, members, time.Minute)
+}
+
+// TestGangFormingWhileAnotherSchedulersPodTakesItsRoom: a new gang of eight is
+// planned into domain a, whose eight nodes fit it exactly, while domain b has
+// nine. Three members are placed and wait at the gate, and five are held back
+// before the scheduler's queue. Another scheduler then binds a pod to a free
+// node of domain a, and the five are let in.
+//
+// The plugin refuses the five because domain a cannot take them all, and binds
+// nobody. The three keep their nodes until the gang's timeout passes. Then
+// the gang is planned again and binds whole in domain b, which had room for
+// it all along.
+func TestGangFormingWhileAnotherSchedulersPodTakesItsRoom(t *testing.T) {
+	tc := startScheduler(t, globalKubeConfig, gangPackOptions(t)...)
+	defer tc.teardown(t)
+
+	const (
+		ns          = "gang-room-lost"
+		gateTimeout = 15 * time.Second
+	)
+	createNamespace(t, tc, ns)
+	idle := cachedPods(t, tc)
+	exactFit := createGPUNodes(t, tc, "rl-a", "a", 8)
+	createGPUNodes(t, tc, "rl-b", "b", 9)
+	createPodGroupOf(t, tc, ns, "gang", 8, gateTimeout)
+	members := gangOfEight("rl")
+	createGangPods(t, tc, ns, "gang", members, 5)
+	atGate := waitForMembersAtGate(t, tc, ns, 3, 30*time.Second)
+	began := time.Now()
+
+	other := preBoundPod("rl-other", ns, nodeHeldByNone(t, exactFit, atGate))
+	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, other, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create the other scheduler's pod: %v", err)
+	}
+	waitForCachedPods(t, tc, idle+len(atGate)+1, 10*time.Second)
+	letIn(t, tc, ns, members[3:])
+	waitForPodRejected(t, tc, ns, members[3], "cannot fit all remaining gang members", 30*time.Second)
+	if bound := boundNow(t, tc, ns, members); len(bound) != 0 {
+		t.Fatalf("members bound while their gang's domain cannot take the rest: %v", bound)
+	}
+
+	waitForPodBound(t, tc, ns, members[0], 2*time.Minute)
+	held := time.Since(began)
+	if held < gateTimeout-2*time.Second {
+		t.Fatalf("a member bound %s after three reached the gate, before the gang's timeout of %s", held.Round(time.Millisecond), gateTimeout)
+	}
+	for name, node := range boundNodes(t, tc, ns, members, time.Minute) {
+		if domain := domainOfNode(t, tc, node); domain != "b" {
+			t.Errorf("pod %s bound to %s in domain %s, want domain b", name, node, domain)
+		}
+	}
+	t.Logf("three members held their nodes for %s before the gang bound whole in domain b (gang timeout %s)", held.Round(time.Millisecond), gateTimeout)
+}
+
+// createPod creates the pod in its namespace.
+func createPod(t *testing.T, tc *testContext, pod *v1.Pod) {
+	t.Helper()
+	if _, err := tc.ClientSet.CoreV1().Pods(pod.Namespace).Create(tc.Ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create pod %s: %v", pod.Name, err)
+	}
+}
+
+// TestGangThatKeepsThreeMembersHoldsRoomUntilItsTimeout: a gang of eight is
+// bound in a domain of nine nodes. Five of its members are deleted and created
+// again while three stay. One replacement is placed and waits at the gate, and
+// four are held back before the scheduler's queue. While it waits, the plugin
+// keeps the free nodes of the domain for the gang: a pod outside the gang is
+// refused with "node is reserved for a forming gang". Another scheduler then
+// binds two pods to free nodes, which leaves the domain too little room for
+// the four, and the plugin refuses them once they are let in.
+//
+// The room is held until the gang's timeout passes, and not beyond it. Then
+// the waiting replacement goes back and the pod outside the gang binds. The
+// plugin refuses the replacements again and holds nothing for them, so a
+// second pod outside the gang binds as well. No replacement is bound at any
+// time.
+func TestGangThatKeepsThreeMembersHoldsRoomUntilItsTimeout(t *testing.T) {
+	tc := startScheduler(t, globalKubeConfig, gangPackOptionsCollectingEvery(t, 3600)...)
+	defer tc.teardown(t)
+
+	const (
+		ns          = "gang-keeps-three"
+		gateTimeout = 10 * time.Second
+	)
+	createNamespace(t, tc, ns)
+	idle := cachedPods(t, tc)
+	nodes := createGPUNodes(t, tc, "kt", "a", 9)
+	createPodGroupOf(t, tc, ns, "gang", 8, gateTimeout)
+	members := gangOfEight("kt")
+	createGangPods(t, tc, ns, "gang", members, 0)
+	bound := boundNodes(t, tc, ns, members, time.Minute)
+
+	kept, replaced := members[:3], members[3:]
+	deleteAtOnce(t, tc, ns, replaced)
+	waitForCachedPods(t, tc, idle+len(kept), 30*time.Second)
+	createGangPods(t, tc, ns, "gang", replaced, 4)
+	taken := waitForMembersAtGate(t, tc, ns, 1, 30*time.Second)
+	began := time.Now()
+	for _, name := range kept {
+		taken[name] = bound[name]
+	}
+
+	createPod(t, tc, makeStandalonePod("kt-single-1", ns))
+	waitForPodRejected(t, tc, ns, "kt-single-1", "node is reserved for a forming gang", 30*time.Second)
+	for _, name := range []string{"kt-other-1", "kt-other-2"} {
+		taken[name] = nodeHeldByNone(t, nodes, taken)
+		createPod(t, tc, preBoundPod(name, ns, taken[name]))
+	}
+	waitForCachedPods(t, tc, idle+len(taken), 10*time.Second)
+	letIn(t, tc, ns, replaced[1:])
+	waitForPodRejected(t, tc, ns, replaced[1], "cannot fit all remaining gang members", 30*time.Second)
+
+	waitForPodBound(t, tc, ns, "kt-single-1", 2*time.Minute)
+	held := time.Since(began)
+	if held < gateTimeout-2*time.Second {
+		t.Fatalf("the pod outside the gang bound %s after the replacement reached the gate, before the gang's timeout of %s", held.Round(time.Millisecond), gateTimeout)
+	}
+	waitForPodRejected(t, tc, ns, replaced[1], "cannot fit remaining gang members", 30*time.Second)
+	createPod(t, tc, makeStandalonePod("kt-single-2", ns))
+	waitForPodBound(t, tc, ns, "kt-single-2", 30*time.Second)
+	if now := boundNow(t, tc, ns, replaced); len(now) != 0 {
+		t.Fatalf("replacements bound while their gang's domain cannot take them all: %v", now)
+	}
+	t.Logf("the plugin kept the domain's free nodes for the gang for %s, until the gang's timeout of %s passed", held.Round(time.Millisecond), gateTimeout)
+}
+
+// Priorities of the workloads in the gang preemption tests. The envtest API server runs
+// without the Priority admission plugin, so pods carry spec.priority directly.
+const (
+	lowPriority    int32 = 10
+	mediumPriority int32 = 50
+	highPriority   int32 = 100
+)
+
+// shutdownGrace is the grace period of an evicted pod that shuts down slowly. No
+// kubelet runs here, so such a pod stays until the test deletes it with grace
+// 0, playing the kubelet.
+const shutdownGrace int64 = 30
+
+// preemptionGateTimeout is the gangs' gate timeout: long enough that no gang
+// in the gang preemption tests times out and re-plans while a scenario runs.
+const preemptionGateTimeout = 120 * time.Second
+
+// gangPreemptionOptions builds the scheduler the ome-scheduler chart renders
+// for a pool with gang preemption: OMEGangPack at every extension point, the
+// built-in DefaultPreemption off, and a preemption block allowing maxInFlight
+// preemptions at once. maxInFlight 0 leaves the block out, which is the
+// chart's default: gang preemption off.
+func gangPreemptionOptions(t *testing.T, maxInFlight int) []scheduler.Option {
+	t.Helper()
+	cfg, err := schedutil.NewDefaultSchedulerComponentConfig()
+	if err != nil {
+		t.Fatalf("default scheduler config: %v", err)
+	}
+	plugins := cfg.Profiles[0].Plugins
+	enableGangPack(plugins)
+	plugins.PostFilter.Disabled = append(plugins.PostFilter.Disabled, schedconfig.Plugin{Name: names.DefaultPreemption})
+	preemption := ""
+	if maxInFlight > 0 {
+		preemption = `,"preemption":{"maxInFlight":` + strconv.Itoa(maxInFlight) + `}`
+	}
+	cfg.Profiles[0].PluginConfig = append(cfg.Profiles[0].PluginConfig, schedconfig.PluginConfig{
+		Name: gangpack.Name,
+		Args: &runtime.Unknown{Raw: []byte(`{
+			"podGroupTopologyKeyAnnotation":"` + topologyKeyAnnotation + `",
+			"defaultPermitTimeoutSeconds":30,
+			"podGroupSyncTimeoutSeconds":5,
+			"gcIntervalSeconds":60` + preemption + `
+		}`)},
+	})
+	return []scheduler.Option{
+		scheduler.WithProfiles(cfg.Profiles...),
+		scheduler.WithFrameworkOutOfTreeRegistry(fwkruntime.Registry{gangpack.Name: gangpack.New}),
+	}
+}
+
+// startPreemptionScheduler starts the scheduler and checks that OMEGangPack
+// runs at PostFilter and the built-in DefaultPreemption does not, so every
+// eviction a test sees is the plugin's. DynamicResources stays: its PostFilter
+// only releases resource claims, and no pod here has one.
+func startPreemptionScheduler(t *testing.T, maxInFlight int) *testContext {
+	t.Helper()
+	tc := startScheduler(t, globalKubeConfig, gangPreemptionOptions(t, maxInFlight)...)
+	for name, profile := range tc.Scheduler.Profiles {
+		enabled := map[string]bool{}
+		for _, p := range profile.ListPlugins().PostFilter.Enabled {
+			enabled[p.Name] = true
+		}
+		if !enabled[gangpack.Name] || enabled[names.DefaultPreemption] {
+			tc.teardown(t)
+			t.Fatalf("profile %s runs PostFilter plugins %v, want %s and not %s", name, keys(enabled), gangpack.Name, names.DefaultPreemption)
+		}
+	}
+	return tc
+}
+
+// createGang creates a PodGroup of minMember pods in the test's topology
+// dimension, then its pods named <name>-0 ... at the given priority and
+// grace period. It does not wait for them to bind.
+func createGang(t *testing.T, tc *testContext, ns, name string, minMember int, priority int32, grace int64) []string {
+	t.Helper()
+	createPodGroupOf(t, tc, ns, name, int32(minMember), preemptionGateTimeout)
+	var pods []string
+	for i := range minMember {
+		pod := makeGangPod(name+"-"+strconv.Itoa(i), ns, name)
+		pod.Spec.Priority = &priority
+		pod.Spec.TerminationGracePeriodSeconds = &grace
+		if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, pod, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("create pod %s: %v", pod.Name, err)
+		}
+		pods = append(pods, pod.Name)
+	}
+	return pods
+}
+
+// bindAll waits for every pod to bind and returns the one domain they share.
+func bindAll(t *testing.T, tc *testContext, ns string, pods []string) string {
+	t.Helper()
+	domains := map[string]bool{}
+	for _, name := range pods {
+		domains[domainOfNode(t, tc, waitForPodBound(t, tc, ns, name, 30*time.Second))] = true
+	}
+	if len(domains) != 1 {
+		t.Fatalf("pods %v landed in domains %v, want one", pods, keys(domains))
+	}
+	return keys(domains)[0]
+}
+
+// podUIDs reads each pod's UID, so a later check can tell a pod from one
+// recreated under its name.
+func podUIDs(t *testing.T, tc *testContext, ns string, pods []string) map[string]string {
+	t.Helper()
+	out := make(map[string]string, len(pods))
+	for _, name := range pods {
+		p, err := tc.ClientSet.CoreV1().Pods(ns).Get(tc.Ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get pod %s: %v", name, err)
+		}
+		out[name] = string(p.UID)
+	}
+	return out
+}
+
+// expectUntouched checks that every pod is still there under the same UID
+// and is not shutting down.
+func expectUntouched(t *testing.T, tc *testContext, ns string, uids map[string]string) {
+	t.Helper()
+	for name, uid := range uids {
+		p, err := tc.ClientSet.CoreV1().Pods(ns).Get(tc.Ctx, name, metav1.GetOptions{})
+		switch {
+		case err != nil:
+			t.Errorf("pod %s: %v, want it untouched", name, err)
+		case string(p.UID) != uid || p.DeletionTimestamp != nil:
+			t.Errorf("pod %s was evicted (uid %s, deletion %v), want it untouched", name, p.UID, p.DeletionTimestamp)
+		}
+	}
+}
+
+// waitForPodsGone polls until none of the pods exists.
+func waitForPodsGone(t *testing.T, tc *testContext, ns string, pods []string, timeout time.Duration) {
+	t.Helper()
+	err := wait.PollUntilContextTimeout(tc.Ctx, 200*time.Millisecond, timeout, true, func(ctx context.Context) (bool, error) {
+		for _, name := range pods {
+			if _, err := tc.ClientSet.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("pods %v were not all evicted: %v", pods, err)
+	}
+}
+
+// waitForPodsEvicting polls until every pod is shutting down, then checks that
+// the scheduler marked each one as evicted by its preemption.
+func waitForPodsEvicting(t *testing.T, tc *testContext, ns string, pods []string, timeout time.Duration) {
+	t.Helper()
+	err := wait.PollUntilContextTimeout(tc.Ctx, 200*time.Millisecond, timeout, true, func(ctx context.Context) (bool, error) {
+		for _, name := range pods {
+			p, err := tc.ClientSet.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+			if err != nil || p.DeletionTimestamp == nil {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		t.Fatalf("pods %v were not all evicted: %v", pods, err)
+	}
+	for _, name := range pods {
+		p, err := tc.ClientSet.CoreV1().Pods(ns).Get(tc.Ctx, name, metav1.GetOptions{})
+		if err != nil {
+			t.Fatalf("get pod %s: %v", name, err)
+		}
+		marked := false
+		for _, c := range p.Status.Conditions {
+			if c.Type == v1.DisruptionTarget && c.Status == v1.ConditionTrue && c.Reason == v1.PodReasonPreemptionByScheduler {
+				marked = true
+			}
+		}
+		if !marked {
+			t.Errorf("evicted pod %s carries no DisruptionTarget condition with reason %s", name, v1.PodReasonPreemptionByScheduler)
+		}
+	}
+}
+
+// finishShutdown deletes the pods with grace 0, as a kubelet does once their
+// containers have stopped.
+func finishShutdown(t *testing.T, tc *testContext, ns string, pods []string) {
+	t.Helper()
+	zero := int64(0)
+	for _, name := range pods {
+		err := tc.ClientSet.CoreV1().Pods(ns).Delete(tc.Ctx, name, metav1.DeleteOptions{GracePeriodSeconds: &zero})
+		if err != nil && !apierrors.IsNotFound(err) {
+			t.Fatalf("finish shutdown of %s: %v", name, err)
+		}
+	}
+}
+
+// preemptionDecisions reads the plugin's gang_preemption_total counter for one
+// result from the scheduler's registry, which every scheduler in this process
+// shares.
+func preemptionDecisions(t *testing.T, result string) float64 {
+	t.Helper()
+	families, err := legacyregistry.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != "ome_scheduler_gang_preemption_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "result" && label.GetValue() == result {
+					return metric.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// waitForPreemptionDecision polls until the counter for result is above before.
+func waitForPreemptionDecision(t *testing.T, tc *testContext, result string, before float64, timeout time.Duration) {
+	t.Helper()
+	err := wait.PollUntilContextTimeout(tc.Ctx, 100*time.Millisecond, timeout, true,
+		func(context.Context) (bool, error) { return preemptionDecisions(t, result) > before, nil })
+	if err != nil {
+		t.Fatalf("no %q preemption decision within %s: %v", result, timeout, err)
+	}
+}
+
+// createStandalonePod creates a one-accelerator pod in no gang at the given
+// priority.
+func createStandalonePod(t *testing.T, tc *testContext, ns, name string, priority int32) {
+	t.Helper()
+	pod := makeGangPod(name, ns, "")
+	delete(pod.Labels, podGroupLabel)
+	pod.Spec.Priority = &priority
+	if _, err := tc.ClientSet.CoreV1().Pods(ns).Create(tc.Ctx, pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create pod %s: %v", name, err)
+	}
+}
+
+// TestGangPreemptionFreesOneDomainForAHigherPriorityGang is a worked
+// example. Two domains of four one-accelerator nodes: one runs a
+// medium-priority gang of 4, the other two low-priority gangs of 2. A
+// high-priority gang of 4 fits neither. The scheduler evicts both low-priority
+// gangs, every pod of each, and the new gang binds in their domain. The
+// medium-priority gang keeps running untouched.
+func TestGangPreemptionFreesOneDomainForAHigherPriorityGang(t *testing.T) {
+	tc := startPreemptionScheduler(t, 1)
+	defer tc.teardown(t)
+
+	const ns = "gang-preempt"
+	createNamespace(t, tc, ns)
+	createGPUNodes(t, tc, "gp-a", "a", 4)
+	createGPUNodes(t, tc, "gp-b", "b", 4)
+
+	medium := createGang(t, tc, ns, "medium", 4, mediumPriority, 0)
+	mediumDomain := bindAll(t, tc, ns, medium)
+	lowA := createGang(t, tc, ns, "low-a", 2, lowPriority, 0)
+	lowB := createGang(t, tc, ns, "low-b", 2, lowPriority, 0)
+	lowDomain := bindAll(t, tc, ns, append(append([]string{}, lowA...), lowB...))
+	if lowDomain == mediumDomain {
+		t.Fatalf("setup: the low gangs share domain %s with the medium gang", lowDomain)
+	}
+	mediumUIDs := podUIDs(t, tc, ns, medium)
+
+	high := createGang(t, tc, ns, "high", 4, highPriority, 0)
+	waitForPodsGone(t, tc, ns, append(append([]string{}, lowA...), lowB...), 30*time.Second)
+	if got := bindAll(t, tc, ns, high); got != lowDomain {
+		t.Fatalf("high gang landed in domain %s, want the freed domain %s", got, lowDomain)
+	}
+	expectUntouched(t, tc, ns, mediumUIDs)
+}
+
+// TestGangPreemptionHoldsTheDomainWhileEvictedPodsShutDown: the freed domain has
+// one empty node and two nodes whose low-priority gang shuts down slowly. A
+// low-priority pod created meanwhile would fit the empty node, but the domain
+// is held for the high-priority gang, so it waits. When the evicted pods are gone,
+// the high-priority gang binds there and the low-priority pod is still
+// waiting.
+func TestGangPreemptionHoldsTheDomainWhileEvictedPodsShutDown(t *testing.T) {
+	tc := startPreemptionScheduler(t, 1)
+	defer tc.teardown(t)
+
+	const ns = "gang-preempt-hold"
+	createNamespace(t, tc, ns)
+	createGPUNodes(t, tc, "gh-a", "a", 3)
+	createGPUNodes(t, tc, "gh-b", "b", 3)
+
+	medium := createGang(t, tc, ns, "medium", 3, mediumPriority, 0)
+	mediumDomain := bindAll(t, tc, ns, medium)
+	low := createGang(t, tc, ns, "low", 2, lowPriority, shutdownGrace)
+	if got := bindAll(t, tc, ns, low); got == mediumDomain {
+		t.Fatalf("setup: the low gang shares domain %s with the medium gang", got)
+	}
+	mediumUIDs := podUIDs(t, tc, ns, medium)
+
+	high := createGang(t, tc, ns, "high", 3, highPriority, 0)
+	waitForPodsEvicting(t, tc, ns, low, 30*time.Second)
+
+	createStandalonePod(t, tc, ns, "intruder", lowPriority)
+	waitForPodRejected(t, tc, ns, "intruder", "reserved for a forming gang", 30*time.Second)
+
+	finishShutdown(t, tc, ns, low)
+	bindAll(t, tc, ns, high)
+	ensureNotBound(t, tc, ns, "intruder", 2*time.Second)
+	expectUntouched(t, tc, ns, mediumUIDs)
+}
+
+// TestGangPreemptionLeavesEqualPriorityGangsAlone: preemption runs only across
+// priorities. A gang at the same priority as the running gang waits, and
+// nothing is evicted.
+func TestGangPreemptionLeavesEqualPriorityGangsAlone(t *testing.T) {
+	waitingGangEvictsNothing(t, 1, "gang-preempt-equal", mediumPriority, mediumPriority, "no domain can be freed")
+}
+
+// TestGangPreemptionIsOffByDefault: without a preemption block the plugin
+// never evicts. A high-priority gang waits for capacity, exactly as the chart's
+// default scheduler does.
+func TestGangPreemptionIsOffByDefault(t *testing.T) {
+	waitingGangEvictsNothing(t, 0, "gang-preempt-off", lowPriority, highPriority, "no domain has room")
+}
+
+// waitingGangEvictsNothing fills one domain of two nodes with a running gang,
+// then creates a second gang that needs the same room. The second gang must be
+// rejected for reason and stay unbound, and the running gang must keep running.
+func waitingGangEvictsNothing(t *testing.T, maxInFlight int, ns string, runningPriority, waitingPriority int32, reason string) {
+	t.Helper()
+	tc := startPreemptionScheduler(t, maxInFlight)
+	defer tc.teardown(t)
+
+	createNamespace(t, tc, ns)
+	createGPUNodes(t, tc, ns+"-a", "a", 2)
+
+	running := createGang(t, tc, ns, "running", 2, runningPriority, 0)
+	bindAll(t, tc, ns, running)
+	uids := podUIDs(t, tc, ns, running)
+
+	waiting := createGang(t, tc, ns, "waiting", 2, waitingPriority, 0)
+	waitForPodRejected(t, tc, ns, waiting[0], reason, 30*time.Second)
+	ensureNotBound(t, tc, ns, waiting[0], 3*time.Second)
+	expectUntouched(t, tc, ns, uids)
+}
+
+// TestGangPreemptionSurvivesASchedulerRestart: the scheduler evicts a slow
+// low-priority gang and then restarts, losing the domain it held in memory. The
+// new scheduler counts the pods still shutting down as leaving, so it holds
+// the same domain again without evicting anyone new: the medium-priority gang
+// keeps running, a low-priority pod is kept out of the held domain, and the
+// high-priority gang binds there once the evicted pods are gone.
+func TestGangPreemptionSurvivesASchedulerRestart(t *testing.T) {
+	first := startPreemptionScheduler(t, 1)
+	defer first.teardown(t)
+
+	const ns = "gang-preempt-restart"
+	createNamespace(t, first, ns)
+	createGPUNodes(t, first, "gr-a", "a", 3)
+	createGPUNodes(t, first, "gr-b", "b", 3)
+
+	medium := createGang(t, first, ns, "medium", 3, mediumPriority, 0)
+	mediumDomain := bindAll(t, first, ns, medium)
+	low := createGang(t, first, ns, "low", 2, lowPriority, shutdownGrace)
+	if got := bindAll(t, first, ns, low); got == mediumDomain {
+		t.Fatalf("setup: the low gang shares domain %s with the medium gang", got)
+	}
+	mediumUIDs := podUIDs(t, first, ns, medium)
+
+	high := createGang(t, first, ns, "high", 3, highPriority, 0)
+	waitForPodsEvicting(t, first, ns, low, 30*time.Second)
+	first.stop(t)
+
+	heldBefore := preemptionDecisions(t, "held")
+	second := startPreemptionScheduler(t, 1)
+	defer second.teardown(t)
+	waitForPreemptionDecision(t, second, "held", heldBefore, 30*time.Second)
+
+	createStandalonePod(t, second, ns, "intruder", lowPriority)
+	waitForPodRejected(t, second, ns, "intruder", "reserved for a forming gang", 30*time.Second)
+
+	finishShutdown(t, second, ns, low)
+	bindAll(t, second, ns, high)
+	ensureNotBound(t, second, ns, "intruder", 2*time.Second)
+	expectUntouched(t, second, ns, mediumUIDs)
 }

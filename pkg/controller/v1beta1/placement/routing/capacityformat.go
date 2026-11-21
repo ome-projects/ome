@@ -37,11 +37,6 @@ type CapacityFormatPlugin struct {
 	// Validate rejects a configuration this format cannot serve, at startup
 	// rather than at the first poll.
 	Validate func(cfg CapacityConfig) error
-
-	// StampsOwnTime reports whether the producer timestamps its reading. When
-	// false, receipt time bounds retention after failures but cannot detect a
-	// frozen producer that keeps answering successfully.
-	StampsOwnTime bool
 }
 
 // capacityFormatRegistry holds the formats compiled into this binary.
@@ -102,9 +97,8 @@ func init() {
 	// lookup, validation and the "not registered" error path are the same for
 	// every format, including this one.
 	if err := RegisterCapacityFormat(FormatReport, CapacityFormatPlugin{
-		Decode:        decodeReport,
-		Validate:      validateReport,
-		StampsOwnTime: true,
+		Decode:   decodeReport,
+		Validate: validateReport,
 	}); err != nil {
 		panic(fmt.Sprintf("registering the built-in capacity format: %v", err))
 	}

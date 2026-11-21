@@ -38,15 +38,36 @@ type RolloutConfig struct {
 	// only an operator or a new target moves. Zero means unconfigured, with
 	// the same rate-limited fallback.
 	CanaryParkedRequeue time.Duration `json:"-"`
+
+	// ForceComplete tunes the force that drives one open canary run to 100%.
+	// Nil means the block is absent or has no valid maxDuration; admission and
+	// the executor then refuse every force, so a cluster that does not
+	// configure it sees no change.
+	ForceComplete *ForceCompleteConfig `json:"-"`
+}
+
+// +kubebuilder:object:generate=false
+// ForceCompleteConfig holds the force's limits. A block without a valid time
+// limit reads as absent, so no force runs on an unstated default.
+type ForceCompleteConfig struct {
+	// MaxDuration is the longest a force may run; past it the force ends and
+	// the run continues as a normal canary from where it stands.
+	MaxDuration time.Duration
 }
 
 // rolloutConfigJSON is the ConfigMap wire shape of the block: durations are
 // strings ("15m"), parsed at load.
 type rolloutConfigJSON struct {
-	MaxPinnedPlanBytes  int    `json:"maxPinnedPlanBytes,omitempty"`
-	DefaultReadyTimeout string `json:"defaultReadyTimeout,omitempty"`
-	CanaryRequeue       string `json:"canaryRequeue,omitempty"`
-	CanaryParkedRequeue string `json:"canaryParkedRequeue,omitempty"`
+	MaxPinnedPlanBytes  int                      `json:"maxPinnedPlanBytes,omitempty"`
+	DefaultReadyTimeout string                   `json:"defaultReadyTimeout,omitempty"`
+	CanaryRequeue       string                   `json:"canaryRequeue,omitempty"`
+	CanaryParkedRequeue string                   `json:"canaryParkedRequeue,omitempty"`
+	ForceComplete       *forceCompleteConfigJSON `json:"forceComplete,omitempty"`
+}
+
+// forceCompleteConfigJSON is the ConfigMap wire shape of the forceComplete block.
+type forceCompleteConfigJSON struct {
+	MaxDuration string `json:"maxDuration"`
 }
 
 // NewRolloutConfig loads the block once (startup paths).
@@ -62,7 +83,8 @@ func NewRolloutConfigCached(cache *ConfigCache, clientset kubernetes.Interface) 
 
 // parseRolloutConfig parses the block. An empty, malformed, or non-positive
 // duration reads as zero, "no configured default", rather than failing the
-// load. A negative maxPinnedPlanBytes can never be a sane cap, so it is a
+// load; a forceComplete block without a valid maxDuration reads as absent, so
+// every force is refused and nothing else in the block is affected. A negative maxPinnedPlanBytes can never be a sane cap, so it is a
 // config error surfaced at load time.
 func parseRolloutConfig(configMap *v1.ConfigMap) (*RolloutConfig, error) {
 	raw := &rolloutConfigJSON{}
@@ -76,5 +98,10 @@ func parseRolloutConfig(configMap *v1.ConfigMap) (*RolloutConfig, error) {
 	cfg.DefaultReadyTimeout = positiveDurationOrZero(raw.DefaultReadyTimeout)
 	cfg.CanaryRequeue = positiveDurationOrZero(raw.CanaryRequeue)
 	cfg.CanaryParkedRequeue = positiveDurationOrZero(raw.CanaryParkedRequeue)
+	if raw.ForceComplete != nil {
+		if maxDuration := positiveDurationOrZero(raw.ForceComplete.MaxDuration); maxDuration > 0 {
+			cfg.ForceComplete = &ForceCompleteConfig{MaxDuration: maxDuration}
+		}
+	}
 	return cfg, nil
 }

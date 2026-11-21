@@ -137,27 +137,48 @@ func sweepUnknownPhasePod(ctx context.Context, deps workload.Deps, input workloa
 // An Instance's target names are read only when one of its pods has no
 // report from its kubelet: the sweep has nothing to find among pods that
 // report, and at rest that is every pod of the Component.
+//
+// A pod of a planned Instance that never ran a container on a node the
+// policy proves gone is removed here too. A surge replacement, a
+// recreate's rebuilt pod, a gang member or a fresh Instance's pod bound
+// to a node whose kubelet stopped before it started reports nothing, so
+// no reading above frees its name, and the attempt that waits on it
+// would wait for good. The attempt builds the name again on a live node
+// once the delete is observed.
 func recoverUnknownPhaseInstances(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, plan workload.ComponentPlan, byInstance map[int32][]*corev1.Pod) (map[int32]bool, time.Time, error) {
 	var held map[int32]bool
 	var nextEvidenceAt time.Time
-	for _, inst := range plan.Instances {
-		pods := byInstance[inst.Index]
-		if !evidence.AnyUnreportedPod(pods, input.ForceDelete) {
-			continue
+	leaveAlone := func(idx int32) {
+		if held == nil {
+			held = make(map[int32]bool)
 		}
-		holding, at, err := recoverUnknownPhaseTargets(ctx, deps, input, inst.Index,
-			pods, expectedPodNamesForInstance(input, plan, inst))
-		if err != nil {
-			return nil, time.Time{}, fmt.Errorf("Create: recover unknown-phase pods (instance=%d): %w", inst.Index, err)
-		}
+		held[idx] = true
+	}
+	noteBoundary := func(at time.Time) {
 		if !at.IsZero() && (nextEvidenceAt.IsZero() || at.Before(nextEvidenceAt)) {
 			nextEvidenceAt = at
 		}
-		if holding {
-			if held == nil {
-				held = make(map[int32]bool)
+	}
+	for _, inst := range plan.Instances {
+		pods := byInstance[inst.Index]
+		if evidence.AnyUnreportedPod(pods, input.ForceDelete) {
+			holding, at, err := recoverUnknownPhaseTargets(ctx, deps, input, inst.Index,
+				pods, expectedPodNamesForInstance(input, plan, inst))
+			if err != nil {
+				return nil, time.Time{}, fmt.Errorf("Create: recover unknown-phase pods (instance=%d): %w", inst.Index, err)
 			}
-			held[inst.Index] = true
+			noteBoundary(at)
+			if holding {
+				leaveAlone(inst.Index)
+			}
+		}
+		removed, at, err := forceDeleteNeverRanPodsOnNodeDeath(ctx, deps, input, inst.Index, pods)
+		if err != nil {
+			return nil, time.Time{}, fmt.Errorf("Create: remove pods that never ran on a lost node (instance=%d): %w", inst.Index, err)
+		}
+		noteBoundary(at)
+		if removed {
+			leaveAlone(inst.Index)
 		}
 	}
 	return held, nextEvidenceAt, nil

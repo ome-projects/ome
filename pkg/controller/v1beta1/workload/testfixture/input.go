@@ -1,6 +1,7 @@
 package testfixture
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -88,4 +89,22 @@ func LeaderWorkerPlan(strategy types.UpdateStrategyType) types.ComponentPlan {
 func ResetExpectations(t *testing.T) {
 	t.Helper()
 	types.DefaultExpectations = types.NewExpectations()
+}
+
+// PlanWithDesiredPods is the plan whose Instances ask the pod counts given,
+// one default runner of that size each, in ascending index order as
+// BuildPlan lists them.
+func PlanWithDesiredPods(desired map[int32]int32) types.ComponentPlan {
+	indexes := make([]int32, 0, len(desired))
+	for idx := range desired {
+		indexes = append(indexes, idx)
+	}
+	slices.Sort(indexes)
+	plan := types.ComponentPlan{Replicas: int32(len(indexes))}
+	for _, idx := range indexes {
+		plan.Instances = append(plan.Instances, types.InstancePlan{
+			Index: idx, Incarnation: 1, Runners: []types.RunnerPlan{{Name: types.RunnerDefault, Size: desired[idx]}},
+		})
+	}
+	return plan
 }

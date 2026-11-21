@@ -212,6 +212,43 @@ func TestPerComponentBudgets_PercentRoundsUpWhereItDoesNotDivide(t *testing.T) {
 	}
 }
 
+// TestPerComponentBudgets_PercentOnFourAndEight holds the count 10, 25 and
+// 50 percent resolve to on four and eight Instances:
+// N times the percent over 100,
+// rounded up and clamped to N, the same for maxSurge and maxUnavailable. At
+// 10 percent both sizes round up to one, where rounding down would leave
+// zero and a roll that never starts; at 25 and 50 percent the step scales
+// with the size.
+func TestPerComponentBudgets_PercentOnFourAndEight(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		pct      string
+		replicas int32
+		want     int32
+	}{
+		{name: "10% of 4 is 1", pct: "10%", replicas: 4, want: 1},
+		{name: "25% of 4 is 1", pct: "25%", replicas: 4, want: 1},
+		{name: "50% of 4 is 2", pct: "50%", replicas: 4, want: 2},
+		{name: "10% of 8 is 1", pct: "10%", replicas: 8, want: 1},
+		{name: "25% of 8 is 2", pct: "25%", replicas: 8, want: 2},
+		{name: "50% of 8 is 4", pct: "50%", replicas: 8, want: 4},
+	} {
+		value := intOrStringStr(tc.pct)
+		t.Run("maxSurge "+tc.name, func(t *testing.T) {
+			got := escalation.PerComponentMaxSurgeBudget(&types.RollingUpdate{MaxSurge: value}, tc.replicas)
+			if got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+		t.Run("maxUnavailable "+tc.name, func(t *testing.T) {
+			got := escalation.PerComponentMaxUnavailableBudget(&types.RollingUpdate{MaxUnavailable: value}, tc.replicas)
+			if got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestCurrentSurgeInFlight verifies the per-Instance step-set counter
 // the dispatcher feeds into the budget projection. Only surge lifecycle
 // steps contribute; other ops (Drain, InPlace) don't add
@@ -1218,7 +1255,7 @@ func TestTerminatingSurgeInFlight(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := escalation.ExtraPodSurgeInFlight(tc.plan, tc.statuses, tc.pods, tc.rolled, now)
+			got := escalation.ExtraPodSurgeInFlight(tc.plan, tc.statuses, tc.pods, tc.rolled, types.Lifecycle{}, now)
 			if got.Slots != tc.wantSlots {
 				t.Errorf("slots = %d, want %d", got.Slots, tc.wantSlots)
 			}

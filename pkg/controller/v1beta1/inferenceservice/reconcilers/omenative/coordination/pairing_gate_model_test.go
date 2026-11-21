@@ -567,7 +567,10 @@ func pairingModelSettings() (off, chart, keep, first, ratio, ratioChart batchMod
 // eight, a router, a scaling policy, a rollout-block edit, the ratio rule,
 // and a side with none or one Instance allowed out of pairing. The 15:15
 // shape is covered by the change back, the late change, a gang and a
-// minimum pick; full mode samples every shape under every setting.
+// minimum pick; full mode samples every shape under every setting. The
+// small picks are 2 beside 1, 1 beside 2 and 2 beside 2, a surging side
+// with none allowed out of pairing beside a patched or rebuilt one: the
+// shapes on which the pairing gates hold each other after one move.
 func pairingModelBoundedPicks() []pairingPick {
 	recreate, surge, inPlace := v1beta1.UpdateStrategyRecreatePod, v1beta1.UpdateStrategySurgeThenDrain, v1beta1.UpdateStrategyInPlaceIfPossible
 	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
@@ -614,6 +617,9 @@ func pairingModelBoundedPicks() []pairingPick {
 		pick{family: "minimum", shape: [2]int32{12, 8}, es: recreate, ds: surge, setting: chart, repush: repushSecondChange, minimumSide: dec, minimumAt: "0"},
 		pick{family: "minimum", shape: [2]int32{15, 15}, es: surge, ds: recreate, setting: first, repush: repushLate, minimumSide: eng, minimumAt: "1"},
 		pick{family: "minimum", shape: [2]int32{12, 4}, es: surge, ds: surge, setting: off, repush: repushSecondChange, minimumSide: dec, minimumAt: "0"},
+		pick{family: "small", shape: [2]int32{2, 1}, es: surge, ds: inPlace, setting: off, repush: repushSecondChange, minimumSide: eng, minimumAt: "0"},
+		pick{family: "small", shape: [2]int32{1, 2}, es: inPlace, ds: surge, setting: keep, repush: repushSecondChange, minimumSide: dec, minimumAt: "0"},
+		pick{family: "small", shape: [2]int32{2, 2}, es: surge, ds: recreate, setting: chart, repush: repushSecondChange, minimumSide: eng, minimumAt: "0"},
 	)
 	return picks
 }
@@ -730,6 +736,10 @@ func pairingModelKnown() map[string]string {
 		"kept-replacements-wait-on-each-other-across-the-budget-and-the-batch-step":   "a gap: the same ring with the sides swapped: the engine's kept replacement spends its one surge slot and is kept for the decoder's Instances on the middle protocol, the decoder's kept replacement holds its own next batch and is kept for the engine's Instances on the first protocol; reached on the reference 12:8 shape, both surging under the chart's setting, after a scale of each side and a partition (TestPairingGates_KeptReplacementsWaitOnEachOtherOnTheReferenceShape holds the current picture)",
 		"pairing-gate-waits-on-the-batch-step":                                        "a gap: with a router in the group the ring runs through three members: the decoder's kept replacement is kept for the engine's Instances on the middle protocol, the engine's next batch waits for the router's batch, and the router's batch waits for the decoder's batch, which the kept replacement leaves unsettled, since the batch step waives a kept replacement for the pairing peer only, not for a third member (TestPairingGates_AKeptReplacementWaitsOnTheRouterThroughTheBatchStep holds the current picture)",
 		"pairing-gates-wait-on-each-other-across-the-batch-step-and-the-pairing-gate": "a gap: the two pairing gates hold each other across the surge budget: the engine's replacement on the last protocol is kept because no decoder serves it (the drain gate's first rule), the kept replacement spends the engine's one surge slot and holds its next batch, and every decoder step is held on the engine's pairable minimum since a decoder scaled down by its policy to two Instances partners half the engines; the cheapest-step rule sees an engine step the budget cannot open (TestPairingGates_ThePairingGatesHoldEachOtherAcrossTheSurgeBudget holds the current picture)",
+		"pairing-gates-wait-on-each-other-across-the-budget-and-the-pairing-gate":     "a gap: a surging engine with none allowed out of pairing keeps the old pod of its first surge, because no decoder serves the new protocol (the drain gate's first rule), and the kept surge spends the engine's one surge slot; every step of a decoder that is rebuilt or patched in place is held on the engine's pairable minimum; the cheapest-step rule reads the kept surge as in flight and admits nothing, so the roll stands after one protocol change at 2 engines beside 1 decoder patched in place, and after a third protocol at 2 engines beside 2 decoders rebuilt (TestPairingGates_AKeptSurgeAndThePairableMinimumStopARoll holds the current picture)",
+		"pairing-gates-wait-on-each-other-across-the-pairing-gate-and-the-budget":     "a gap: the same ring with the sides swapped, a surging decoder with none allowed out of pairing beside an engine that is rebuilt or patched in place (the test of the class above holds the current picture on the other side)",
+		"kept-replacements-wait-on-each-other-across-the-budget-and-no-hold":          "a gap: both sides surge with none allowed out of pairing, 2 engines beside 1 decoder, and a third protocol lands while the first change is half done: the decoder keeps both its pods, each the last partner of one engine, so it brings no pod on the last protocol, and the engine's replacement on the last protocol is kept and spends the engine's one surge slot (TestPairingGates_KeptReplacementsWaitOnEachOtherAtTwoBesideOne holds the current picture)",
+		"kept-replacements-wait-on-each-other-across-no-hold-and-the-budget":          "a gap: the same ring with the sides swapped, 1 engine beside 2 decoders (TestPairingGates_KeptReplacementsWaitOnEachOtherAtTwoBesideOne holds the current picture on the other side)",
 		"replacement-removed-below-the-pairable-minimum":                              "a gap: the drain gate's answer to a replacement leaving (the push moved the target, the attempt would start again) reads the other side's pairable minimum but not the leaving side's own, so a source whose protocol has no partner left stays alone and its side falls below its minimum (TestEvaluatePairingDrain_AReplacementRemovedAfterAPushBackIsNotChargedToItsOwnSide holds the current answer)",
 		"step-below-the-pairable-minimum-behind-the-counters":                         "the start-time gate reads the counters of the last status write, which do not yet count a promoted Instance's serving pods, and the world lets several promoted Instances stand uncounted at once; on the Instances the gate counts the step costs nothing, by the pods it strands the uncounted ones for the length of the step (the same one-write lag the batch-step model reads)",
 		"runs-ahead-of-a-peer-coming-up":                                              "the batch-step model's reading of a side opening a start while the other side's promoted Instances are not yet counted as serving, reached here with no push: after an edit of the rule's tolerance, and beside a side Held on a spent schedule with a gang member lost; the batch-step model owns it",
@@ -1017,6 +1027,75 @@ func TestPairingGates_ThePairingGatesHoldEachOtherAcrossTheSurgeBudget(t *testin
 	}
 	requireHold(t, cleared, eng, v1beta1.RolloutHoldGateRatio, "waits for engine batch", "the engine's next batch waits for its own kept replacement to settle")
 	requireHold(t, cleared, dec, v1beta1.RolloutHoldGatePairing, "of 9 (desired 12 minus maxUnavailable 3)", "every decoder step is held on the engine's pairable minimum")
+}
+
+// TestPairingGates_AKeptSurgeAndThePairableMinimumStopARoll is the same
+// ring with no scale and no policy, on the two smallest shapes that show
+// it. Two prefill surge one at a time with none allowed out of pairing.
+// The engine's first replacement on the new protocol serves and is kept,
+// because no decoder serves that protocol, and it spends the engine's one
+// surge slot. Every decoder step would leave one of two engines with a
+// partner, so the pairable minimum holds it. The cheapest-step rule reads
+// the kept replacement as in flight, admits nothing, and the roll stands.
+//
+// One decoder patched in place stands after a single protocol change. Two
+// decoders rebuilt one at a time stand after a third protocol: the first
+// change is half done, one Instance of each side on pair-v2 and one on
+// pair-v1, when the operator changes to pair-v3.
+func TestPairingGates_AKeptSurgeAndThePairableMinimumStopARoll(t *testing.T) {
+	surge, inPlace, recreate := v1beta1.UpdateStrategySurgeThenDrain, v1beta1.UpdateStrategyInPlaceIfPossible, v1beta1.UpdateStrategyRecreatePod
+	off, _, _, _, _, _ := pairingModelSettings()
+	for _, tc := range []struct {
+		name     string
+		decoders int32
+		strategy v1beta1.UpdateStrategyType
+		path     string
+		pushed   bool
+	}{
+		{name: "one change, 2 engines beside 1 decoder patched in place", decoders: 1, strategy: inPlace, path: "serve side 0 row 0"},
+		{
+			name: "a third protocol, 2 engines beside 2 decoders rebuilt", decoders: 2, strategy: recreate, pushed: true,
+			path: "serve side 1 row 0 -> serve side 1 row 0 -> serve side 0 row 0 -> push a further revision -> serve side 0 row 0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := outOfPairingOf(pairingModelConfig("small", [2]int32{2, tc.decoders}, surge, tc.strategy, off, 0, repushSecondChange), v1beta1.EngineComponent, "0")
+			w, st := huntReplay(t, cfg, tc.path)
+			cleared := requireStandstill(t, w, st, "pairing-gates-wait-on-each-other-across-the-budget-and-the-pairing-gate")
+			eng, dec := w.pairIndex()
+			if st.pushed != tc.pushed || cleared.sides[eng].count(huntReplacementHeld) != 1 || cleared.sides[dec].count(huntOld) != tc.decoders {
+				t.Fatalf("the engine keeps one replacement beside %d decoders at rest: %s", tc.decoders, cleared)
+			}
+			requireHold(t, cleared, eng, v1beta1.RolloutHoldGateBudget, "surge budget 1 exhausted", "the kept replacement spends the engine's one surge slot")
+			requireHold(t, cleared, dec, v1beta1.RolloutHoldGatePairing, "of 2 (desired 2 minus maxUnavailable 0)", "every decoder step is held on the engine's pairable minimum")
+		})
+	}
+}
+
+// TestPairingGates_KeptReplacementsWaitOnEachOtherAtTwoBesideOne is the
+// ring of two kept replacements on the smallest shape that shows it, with
+// no scale and no partition: 2 prefill beside 1 decode, both surging, none
+// allowed out of pairing, a third protocol while the first change is half
+// done. The decoder keeps both its pods: the old one is the partner of the
+// engine on pair-v1 and the new one of the engine on pair-v2. So no decoder
+// can come up on pair-v3, the engine's replacement on pair-v3 is kept, and
+// that replacement spends the engine's one surge slot.
+func TestPairingGates_KeptReplacementsWaitOnEachOtherAtTwoBesideOne(t *testing.T) {
+	surge := v1beta1.UpdateStrategySurgeThenDrain
+	off, _, _, _, _, _ := pairingModelSettings()
+	cfg := pairingModelConfig("small", [2]int32{2, 1}, surge, surge, off, 0, repushSecondChange)
+	cfg = outOfPairingOf(outOfPairingOf(cfg, v1beta1.EngineComponent, "0"), v1beta1.DecoderComponent, "0")
+	path := "serve side 0 row 0 -> serve side 1 row 0 -> release side 0 row 0 -> push a further revision -> serve side 0 row 0"
+	w, st := huntReplay(t, cfg, path)
+	cleared := requireStandstill(t, w, st, "kept-replacements-wait-on-each-other-across-the-budget-and-no-hold")
+	eng, dec := w.pairIndex()
+	if cleared.sides[eng].count(huntReplacementHeld) != 1 || cleared.sides[dec].count(huntReplacementHeld) != 1 {
+		t.Fatalf("each side keeps one replacement: %s", cleared)
+	}
+	requireHold(t, cleared, eng, v1beta1.RolloutHoldGateBudget, "surge budget 1 exhausted", "the kept replacement spends the engine's one surge slot")
+	if h := cleared.holds[dec]; h != nil {
+		t.Fatalf("the decoder's one Instance keeps both its pods, so it has no start to hold; got %s", h)
+	}
 }
 
 // TestEvaluatePairingDrain_AReplacementRemovedAfterAPushBackIsNotChargedToItsOwnSide

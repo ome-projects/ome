@@ -86,11 +86,18 @@ func TestPairingGates_SecondChangeOnOneByOne_PrefillWaitsForADecoderOfTheFinalPr
 	}
 
 	// The second change lands before the prefill's patch: the prefill is
-	// held, the old pod stays, and the replacement may leave.
+	// held, the old pod stays, and the replacement may leave. A replacement
+	// the roll leaves behind does not count, so the patch is answered on the
+	// pair that stays, as on the settled pair below: it waits behind the
+	// decoder's batch when the decoder is named first, and under the pairing
+	// gate when no side is.
 	second := pairingISVC("pair-v3")
 	objs = picture(second, "v1", "pair-v1", replacementOnV2, "pair-v2")
-	allowed, gate, reason = decoderFirstStart(t, second, chart, eng, workloadtypes.UpdateStrategyInPlaceIfPossible, objs...)
-	requireNoPairHold(allowed, gate, reason, "second change: no decoder serves pair-v3, so the prefill's patch to pair-v3 must wait")
+	if allowed, gate, reason := decoderFirstStart(t, second, chart, eng, workloadtypes.UpdateStrategyInPlaceIfPossible, objs...); allowed || gate != v1beta1.RolloutHoldGateRatio {
+		t.Fatalf("second change: no decoder serves pair-v3, so the prefill's patch to pair-v3 must wait for the decoder's first batch: allowed=%v gate=%q reason=%q", allowed, gate, reason)
+	}
+	allowed, gate, reason = decoderFirstStart(t, second, GroupDefaults{}, eng, workloadtypes.UpdateStrategyInPlaceIfPossible, objs...)
+	requireNoPairHold(allowed, gate, reason, "second change with no side named first: no decoder serves pair-v3, so the prefill's patch to pair-v3 must wait")
 	allowed, gate, reason = drainGate(t, second, dec, []string{oldPod}, objs...)
 	requireHeld(t, allowed, gate, reason, "second change: the replacement on pair-v2 has no partner, so the old decode pod stays")
 	if !strings.Contains(reason, `"pair-v2"`) {

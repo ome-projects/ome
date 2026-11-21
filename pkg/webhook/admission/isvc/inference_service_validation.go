@@ -92,6 +92,13 @@ type InferenceServiceValidator struct {
 	// here — are bounded by the same knob.
 	RolloutMaxPlanBytes int
 
+	// ForceCompleteConfigured is whether the rollout.forceComplete block of the
+	// operator ConfigMap is present with a valid time limit (read once at
+	// startup, as the other operator defaults here are; the executor reads the
+	// live block and refuses a force admission let through after the block
+	// was removed). Without it every canary force is refused.
+	ForceCompleteConfigured bool
+
 	// AutoscalerPolicyEnabled reports whether the AutoscalerPolicy CRD is
 	// installed and the feature is on. When false, any per-Component
 	// autoscalerPolicyRef is rejected outright — the resolver would hold
@@ -145,6 +152,9 @@ func (v *InferenceServiceValidator) ValidateCreate(ctx context.Context, isvc *v1
 	// old=nil: every migration-request annotation present at CREATE is
 	// an add and gets validated (parity with the update path).
 	if err := validateAddedMigrationRequests(nil, isvc); err != nil {
+		return nil, err
+	}
+	if _, err := v.validateForceRequest(nil, isvc); err != nil {
 		return nil, err
 	}
 	// old=nil: CREATE rejects every multi-pod OMENative Component that
@@ -228,10 +238,15 @@ func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc,
 	if err := validateMultiPodReadyPolicyNone(oldIsvc, isvc); err != nil {
 		return nil, err
 	}
+	forceWarnings, err := v.validateForceRequest(oldIsvc, isvc)
+	if err != nil {
+		return nil, err
+	}
 	warnings, err := v.validateInferenceService(ctx, isvc)
 	if err != nil {
 		return warnings, err
 	}
+	warnings = append(warnings, forceWarnings...)
 	// A change to some members of a rollingUpdate group and not others is
 	// admitted; the warning names the members that keep their revision.
 	warnings = append(warnings, validation.CoordinationUpdateWarnings(&oldIsvc.Spec, &isvc.Spec)...)

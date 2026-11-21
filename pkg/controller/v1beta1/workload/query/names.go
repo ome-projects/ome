@@ -52,30 +52,115 @@ func PodName(isvc string, component workload.ComponentType, instanceIdx int32, r
 	return name.String()
 }
 
+// hostnameCountMark is what PodHostname writes between the pod name and
+// the recreation count.
+const hostnameCountMark = "-i"
+
 // PodHostname returns the spec.hostname of one pod of a multi-pod
-// Instance: the pod name with the Instance's incarnation appended —
-// <pod-name>-i<incarnation> — bounded to the DNS label limit a
-// spec.hostname must satisfy. Pod names repeat across an Instance
-// rebuild on purpose (Create matches desired pods to existing ones by
-// name), but the Component's headless Service publishes not-ready
-// addresses, so a bare pod name keeps resolving to the previous
-// incarnation's pod while that pod drains. Folding the incarnation
-// into the hostname makes every DNS name OME hands out point at the
-// current incarnation's pods alone: a peer lookup either fails (the
-// current incarnation's pod does not exist yet, so the caller retries)
-// or returns a pod of the current incarnation, never an older one.
+// Instance: the pod name with a recreation count appended,
+// <pod-name>-i<count>, bounded to the DNS label limit a spec.hostname
+// must meet. Pod names repeat across a rebuild on purpose, since Create
+// matches desired pods to existing ones by name, and a hostname that is
+// the pod name alone gives the pods of a rebuilt set the DNS names of the
+// pods before them: a resolver that still holds an answer for such a name
+// hands a new pod the address of a pod that is gone. With the count in
+// the hostname, no DNS name of a set built at a new count has resolved to
+// anything before.
 //
-// The bound uses the same shared helper as the Service and PodGroup
-// names: names within the limit pass through unchanged; longer names
-// take the deterministic {hash}-{suffix} form, whose hash covers the
-// incarnation, so two incarnations of one pod name never collide even
-// under truncation. The hostname is never parsed back to a pod name —
-// EndpointSlice consumers match on TargetRef — so truncation loses no
-// lookup path.
-func PodHostname(podName string, incarnation int64) string {
+// The -i<count> suffix is part of the name format, as the pod name's own
+// <isvc>-<component>-<index>-<runner>-<ordinal> is: the pods of a set and
+// the addresses handed to them must spell it the same way, so it is
+// fixed here and read from no configuration.
+//
+// The bound is the shared helper behind the Service and PodGroup names:
+// a name within the limit passes through unchanged, a longer one takes
+// the {hash}-{suffix} form, and the hash covers the count, so two
+// rebuilds of one pod never collide. Both forms end in the count, which
+// is all ReadPodSetHostnames reads back off a hostname. Nothing parses
+// the hostname back to a pod name.
+func PodHostname(podName string, recreationCount int64) string {
 	return constants.TruncateNameWithMaxLength(
-		fmt.Sprintf("%s-i%d", podName, incarnation),
+		podName+hostnameCountMark+strconv.FormatInt(recreationCount, 10),
 		validation.DNS1123LabelMaxLength)
+}
+
+// PodSetHostnames is what the live pods of one multi-pod set answer to,
+// as ReadPodSetHostnames reads it: their pod names, or their pod names
+// followed by one recreation count. The zero value is a set with no live
+// pod.
+type PodSetHostnames struct {
+	// live says a live pod of the set was read. podNames then says the
+	// pod answers to its pod name; otherwise count is the recreation
+	// count its hostname ends in.
+	live     bool
+	podNames bool
+	count    int64
+}
+
+// ReadPodSetHostnames reads what the live pods of a multi-pod set answer
+// to. The pods of a set hold each other's addresses from the moment they
+// start, so a set keeps the hostnames it started with for as long as one
+// of its pods lives: a pod made beside the others must answer to the name
+// they were given for it, and be given the names they answer to. Both are
+// read off a live pod's own spec.hostname, which is its pod name or, from
+// PodHostname, ends in the count the set was built at. The pod's count
+// label is not asked, because it can differ: a pod made again beside pods
+// of an earlier count carries the row's count on its label and their
+// count in its hostname.
+//
+// The live pods of a set agree, since each was made beside the others.
+// Where they do not, the first of them by name decides, so every pass
+// reads the same answer. Pods in a terminal phase, the one pod of a
+// single-pod Instance, which always answers to its pod name, and a
+// hostname PodHostname did not write say nothing about the set.
+func ReadPodSetHostnames(pods []*corev1.Pod) PodSetHostnames {
+	var first *corev1.Pod
+	var read PodSetHostnames
+	for _, pod := range pods {
+		if pod == nil || IsTerminalPod(pod) || pod.Labels[LabelRunner] == workload.RunnerDefault {
+			continue
+		}
+		if first != nil && first.Name <= pod.Name {
+			continue
+		}
+		if hostnames, ok := hostnamesOfPod(pod); ok {
+			first, read = pod, hostnames
+		}
+	}
+	return read
+}
+
+// hostnamesOfPod reads one pod of a multi-pod set: its hostname is its pod
+// name, or it is the hostname PodHostname gives the pod at the count it
+// ends in.
+func hostnamesOfPod(pod *corev1.Pod) (PodSetHostnames, bool) {
+	if pod.Spec.Hostname == pod.Name {
+		return PodSetHostnames{live: true, podNames: true}, true
+	}
+	mark := strings.LastIndex(pod.Spec.Hostname, hostnameCountMark)
+	if mark < 0 {
+		return PodSetHostnames{}, false
+	}
+	count, err := strconv.ParseInt(pod.Spec.Hostname[mark+len(hostnameCountMark):], 10, 64)
+	if err != nil || PodHostname(pod.Name, count) != pod.Spec.Hostname {
+		return PodSetHostnames{}, false
+	}
+	return PodSetHostnames{live: true, count: count}, true
+}
+
+// Hostname returns the spec.hostname of the pod named podName in the set:
+// the form the set's live pods have, at the count their hostnames carry.
+// A set with no live pod is built whole, and its hostnames carry
+// recreationCount, the count it is built at.
+func (h PodSetHostnames) Hostname(podName string, recreationCount int64) string {
+	switch {
+	case !h.live:
+		return PodHostname(podName, recreationCount)
+	case h.podNames:
+		return podName
+	default:
+		return PodHostname(podName, h.count)
+	}
 }
 
 // PodNameIs reports whether name is PodName(isvc, component, instanceIdx,
@@ -206,6 +291,18 @@ func InstanceSubdomain(isvc string, component workload.ComponentType, instanceId
 func PodGroupName(isvc string, component workload.ComponentType, instanceIdx int32) string {
 	return constants.TruncateNameWithMaxLength(
 		fmt.Sprintf("%s-%s-%d", isvc, component, instanceIdx),
+		validation.LabelValueMaxLength)
+}
+
+// KueuePodGroupName returns the Kueue pod-group name of one build of a
+// multi-pod Instance: <isvc>-<component>-<idx>-<recreations>, bounded to the
+// 63-char label-value limit. Kueue names the group's Workload after it.
+// recreations counts how often the Instance was recreated, so a rebuilt
+// Instance queues as a new group, while a pod recreated inside the same build
+// rejoins its siblings' group and Kueue admits it as their replacement.
+func KueuePodGroupName(isvc string, component workload.ComponentType, instanceIdx int32, recreations int64) string {
+	return constants.TruncateNameWithMaxLength(
+		fmt.Sprintf("%s-%s-%d-%d", isvc, component, instanceIdx, recreations),
 		validation.LabelValueMaxLength)
 }
 

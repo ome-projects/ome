@@ -1,22 +1,22 @@
 {
   "recordedOn": {
-    "date": "2026-11-09",
+    "date": "2026-11-18",
     "machine": "linux/amd64, 192 cores, go1.26.7"
   },
-  "reason": "The readers of the pass's pods at the end of a pass over a replica at rest, at 1,000 and 4,000 Instances, each over the list the pass took and listing nothing: the current-revision promotion, which buckets the list by Instance (query.BucketPodsByInstanceIdx) to read the revision each Instance's pods carry and finds the current revision already the spec target, 2,018 / 8,042 allocations and 454 KB / 1.80 MB; the status write, which buckets the list again, publishes the counters it finds already published and writes nothing, 18,248 / 67,200 allocations and 1.81 MB / 6.60 MB; and the publication that runs both, 20,268 / 75,244 allocations and 2.26 MB / 8.40 MB. The band is 4 percent: one bucketing of the list is about 5 percent of the publication's bytes, and the golden holds how many times the end of the pass buckets its pods. Re-recorded with the pass's list handing its buckets to every reader that asks for the same list, so the promotion and the status write read the buckets the first reader of the list built: the promotion 2,018 / 8,042 to 2,009 / 8,021 allocations and 454 KB / 1.80 MB to 351 KB / 1.39 MB, the status write 18,248 / 67,200 to 18,239 / 67,179 allocations and 1.81 MB / 6.60 MB to 1.71 MB / 6.19 MB, the publication that runs both 20,268 / 75,244 to 20,250 / 75,202 allocations and 2.26 MB / 8.40 MB to 2.06 MB / 7.58 MB. Re-recorded with the publication building no list per Instance (status.AppendUniqueNodes cuts every row's node list from one array, the pods that report are read in place when none is left out, and the live pods are counted without a list), two allocations per Instance fewer in the status write and the pass tail: readySince/1000/status-write/allocations 18,239 \u2192 16,241, readySince/1000/status-write/bytes 1,707,312 \u2192 1,699,704, readySince/1000/pass-tail/allocations 20,250 \u2192 18,252, readySince/1000/pass-tail/bytes 2,058,824 \u2192 2,051,216, readySince/4000/status-write/allocations 67,179 \u2192 59,181, readySince/4000/status-write/bytes 6,189,632 \u2192 6,159,176, readySince/4000/pass-tail/allocations 75,202 \u2192 67,204, readySince/4000/pass-tail/bytes 7,578,888 \u2192 7,548,432; the other rows as recorded.",
+  "reason": "The readers of the pass's pods at the end of a pass over a replica at rest, at 1,000 and 4,000 Instances, each over the list the pass took and listing nothing: the current-revision promotion, which buckets the list by Instance (query.BucketPodsByInstanceIdx) to read the revision each Instance's pods carry and finds the current revision already the spec target, 2,018 / 8,042 allocations and 454 KB / 1.80 MB; the status write, which buckets the list again, publishes the counters it finds already published and writes nothing, 18,248 / 67,200 allocations and 1.81 MB / 6.60 MB; and the publication that runs both, 20,268 / 75,244 allocations and 2.26 MB / 8.40 MB. The band is 4 percent: one bucketing of the list is about 5 percent of the publication's bytes, and the golden holds how many times the end of the pass buckets its pods. Re-recorded with the pass's list handing its buckets to every reader that asks for the same list, so the promotion and the status write read the buckets the first reader of the list built: the promotion 2,018 / 8,042 to 2,009 / 8,021 allocations and 454 KB / 1.80 MB to 351 KB / 1.39 MB, the status write 18,248 / 67,200 to 18,239 / 67,179 allocations and 1.81 MB / 6.60 MB to 1.71 MB / 6.19 MB, the publication that runs both 20,268 / 75,244 to 20,250 / 75,202 allocations and 2.26 MB / 8.40 MB to 2.06 MB / 7.58 MB. Re-recorded with the publication building no list per Instance (status.AppendUniqueNodes cuts every row's node list from one array, the pods that report are read in place when none is left out, and the live pods are counted without a list), two allocations per Instance fewer in the status write and the pass tail: readySince/1000/status-write/allocations 18,239 → 16,241, readySince/1000/status-write/bytes 1,707,312 → 1,699,704, readySince/1000/pass-tail/allocations 20,250 → 18,252, readySince/1000/pass-tail/bytes 2,058,824 → 2,051,216, readySince/4000/status-write/allocations 67,179 → 59,181, readySince/4000/status-write/bytes 6,189,632 → 6,159,176, readySince/4000/pass-tail/allocations 75,202 → 67,204, readySince/4000/pass-tail/bytes 7,578,888 → 7,548,432; the other rows as recorded. Re-recorded with the promotion reading the revision each pod carries only when a rule needs it (at rest the rows decide alone and the map of every Instance's pod revisions is built only when a rule reads it): the promotion 2,009 / 8,021 → 2,002 / 8,002 allocations and 351 KB / 1.39 MB → 237 KB / 930 KB, the publication that runs both 18,252 / 67,204 → 18,245 / 67,185 allocations and 2.05 MB / 7.55 MB → 1.94 MB / 7.09 MB; the status write is unchanged. Re-recorded with the status write asking the plan for each row's desired pod count (ComponentPlan.DesiredPodsFor) in place of the table of counts by Instance index it built on every pass, 6 / 18 allocations and 19,072 / 76,144 B fewer in the status write and the pass tail: readySince/1000/status-write/allocations 16,241 → 16,235, readySince/1000/status-write/bytes 1,699,704 → 1,680,632, readySince/1000/pass-tail/allocations 18,245 → 18,239, readySince/1000/pass-tail/bytes 1,936,400 → 1,917,328, readySince/4000/status-write/allocations 59,181 → 59,163, readySince/4000/status-write/bytes 6,159,176 → 6,083,032, readySince/4000/pass-tail/allocations 67,185 → 67,167, readySince/4000/pass-tail/bytes 7,089,312 → 7,013,168; the promotion is unchanged.",
   "tolerancePercent": 4,
   "budgets": {
-    "readySince/1000/pass-tail/allocations": 18252,
-    "readySince/1000/pass-tail/bytes": 2051216,
-    "readySince/1000/promotion/allocations": 2009,
-    "readySince/1000/promotion/bytes": 351448,
-    "readySince/1000/status-write/allocations": 16241,
-    "readySince/1000/status-write/bytes": 1699704,
-    "readySince/4000/pass-tail/allocations": 67204,
-    "readySince/4000/pass-tail/bytes": 7548432,
-    "readySince/4000/promotion/allocations": 8021,
-    "readySince/4000/promotion/bytes": 1389192,
-    "readySince/4000/status-write/allocations": 59181,
-    "readySince/4000/status-write/bytes": 6159176
+    "readySince/1000/pass-tail/allocations": 18239,
+    "readySince/1000/pass-tail/bytes": 1917328,
+    "readySince/1000/promotion/allocations": 2002,
+    "readySince/1000/promotion/bytes": 236632,
+    "readySince/1000/status-write/allocations": 16235,
+    "readySince/1000/status-write/bytes": 1680632,
+    "readySince/4000/pass-tail/allocations": 67167,
+    "readySince/4000/pass-tail/bytes": 7013168,
+    "readySince/4000/promotion/allocations": 8002,
+    "readySince/4000/promotion/bytes": 930072,
+    "readySince/4000/status-write/allocations": 59163,
+    "readySince/4000/status-write/bytes": 6083032
   }
 }

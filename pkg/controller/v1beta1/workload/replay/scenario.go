@@ -113,11 +113,21 @@ type SpecState struct {
 	// by the name production renders it under, so a scenario driving a
 	// container restart has to render that name.
 	ContainerName string `json:"containerName,omitempty"`
+	// TerminationGracePeriodSeconds is the termination grace of the rendered
+	// pod template: how long a deleted pod may take to stop before its
+	// kubelet sends SIGKILL. Unset renders none, and a deleted pod is then
+	// past its deletion time from the instant of the request.
+	TerminationGracePeriodSeconds *int64 `json:"terminationGracePeriodSeconds,omitempty"`
 	// Env is the environment the rendered container carries. It is part
 	// of the pod template and therefore of the revision, and unlike the
 	// image it is not an in-place-eligible diff — which is what makes an
 	// InPlaceOnly rejection reachable.
 	Env map[string]string `json:"env,omitempty"`
+	// Requests are the resource requests the rendered container carries, by
+	// resource name, each an amount such as "4" or "8Gi". They are part of
+	// the pod template and therefore of the revision. A scenario that sets
+	// none renders a container that asks for nothing.
+	Requests map[string]string `json:"requests,omitempty"`
 	// PodLabels and PodAnnotations are the pod template's own metadata.
 	// They are hashed into the revision except for the keys the hasher
 	// derives rather than reads as intent, which is what makes an
@@ -135,6 +145,11 @@ type SpecState struct {
 	// Component (spec.pacing.partition), read ahead of the user's own.
 	// Unset leaves no step hold.
 	CanaryPartition *int32 `json:"canaryPartition,omitempty"`
+	// LeaderGoneGracePeriod is lifecycle.leaderGoneGracePeriod, the
+	// termination grace left to the workers of a multi-pod Instance that
+	// are still terminating once its leader pod has gone. Unset leaves each
+	// worker the grace it was deleted with.
+	LeaderGoneGracePeriod string `json:"leaderGoneGracePeriod,omitempty"`
 	// InstanceReadyTimeout bounds a newly created Instance becoming Ready
 	// and is what an operation deadline is derived from.
 	InstanceReadyTimeout string `json:"instanceReadyTimeout,omitempty"`
@@ -191,9 +206,13 @@ type ConfigState struct {
 	// AbandonedReplacementGrace is lifecycle.abandonedReplacementGracePeriod,
 	// the termination grace of a replacement abandoned before it served.
 	// Unset leaves such a pod its own grace.
-	AbandonedReplacementGrace string       `json:"abandonedReplacementGrace,omitempty"`
-	UpdateRetry               *RetrySpec   `json:"updateRetry,omitempty"`
-	ForceDelete               *ForceDelete `json:"forceDelete,omitempty"`
+	AbandonedReplacementGrace string `json:"abandonedReplacementGrace,omitempty"`
+	// GangRestartGrace is lifecycle.gangRestartGracePeriod, the termination
+	// grace a Restart gives the old pods of a multi-pod Instance it
+	// rebuilds. Unset leaves each pod its own grace.
+	GangRestartGrace string       `json:"gangRestartGrace,omitempty"`
+	UpdateRetry      *RetrySpec   `json:"updateRetry,omitempty"`
+	ForceDelete      *ForceDelete `json:"forceDelete,omitempty"`
 	// MigrationAudit bounds migration admission. Unset leaves the
 	// engine unconfigured, which holds every request rather than
 	// admitting it unbounded.
@@ -395,6 +414,10 @@ type EventArgs struct {
 	// template edit a spec.revision makes when the edit is not an image
 	// rewrite.
 	Env map[string]string `json:"env,omitempty"`
+	// Requests rewrites the rendered container's resource requests. It is
+	// the template edit a spec.revision makes when the template asks for
+	// another amount of a resource.
+	Requests map[string]string `json:"requests,omitempty"`
 	// RenderedFrom says what moved the template on a spec.revision: empty,
 	// a write of the replica's own spec, which moves its generation;
 	// "runtime", an edit of the runtime a replica names (spec.runtimeRef)
@@ -547,7 +570,7 @@ var eventArgKeys = map[string][]string{
 	"api.namespaceTerminating": {"verb", "resource", "count"},
 	"api.conflict":             {"verb", "resource", "count", "write"},
 	"api.admissionUnavailable": {"verb", "resource", "count"},
-	"spec.revision":            {"image", "env", "annotations", "renderedFrom"},
+	"spec.revision":            {"image", "env", "requests", "annotations", "renderedFrom"},
 	"spec.annotationOnly":      {"labels", "annotations"},
 	"spec.strategy":            {"strategy", "maxSurge", "maxUnavailable"},
 	"spec.replicasUp":          {"to"},
@@ -616,6 +639,9 @@ func (s *Scenario) validate(vocab Vocabulary) error {
 	}
 	if len(s.Timeline) == 0 {
 		return fmt.Errorf("replay: %s: empty timeline", s.Scenario)
+	}
+	if err := validRequests(s.Initial.Spec.Requests); err != nil {
+		return fmt.Errorf("replay: %s: initial.spec.requests: %w", s.Scenario, err)
 	}
 	if vocab.Arrows != nil {
 		for _, arrow := range s.Arrows {
